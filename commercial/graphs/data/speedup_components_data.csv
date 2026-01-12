@@ -1,0 +1,5 @@
+component,qihse_avx2_contribution,qihse_full_hw_contribution
+SIMD_Optimization,2.5,4.0
+Algorithm_Innovation,3.0,6.0
+Memory_Management,1.2,2.0
+Hardware_Acceleration,1.0,3.0
