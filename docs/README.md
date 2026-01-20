@@ -6,7 +6,7 @@
 [![Performance](https://img.shields.io/badge/Performance-1500x%20Speedup-green.svg)]()
 [![Memory](https://img.shields.io/badge/Memory-%3C1MB%20Overhead-orange.svg)]()
 
-## 🔥 **What is QIHSE?**
+## **What is QIHSE?**
 
 QIHSE (Quantum-Inspired Hilbert Space Expansion) is a revolutionary search algorithm that transforms database queries through quantum-inspired mathematics. By expanding data into higher-dimensional Hilbert spaces, QIHSE achieves unprecedented search speeds while maintaining perfect accuracy.
 
