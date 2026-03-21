@@ -59,7 +59,7 @@ void qihse_init_global_optimization(void) {
  * GROVER AMPLIFICATION
  * ============================================================================ */
 
-void qihse_amplification_config_init(
+void qihse_amplification_config_init_impl(
     qihse_amplification_config_t* config,
     size_t problem_size
 ) {
@@ -220,7 +220,7 @@ qihse_collapse_result_t qihse_dimensional_collapse_l2_norm(
     return result;
 }
 
-not_stisla_result_t qihse_verify_result(
+not_stisla_result_t qihse_verify_search_result(
     const void* data,
     size_t n,
     const void* query,
@@ -439,7 +439,7 @@ void qihse_get_optimized_config(const qihse_optimization_db_t* db, const qihse_d
  * HYBRID SEARCH AND ANCHOR LEARNING
  * ============================================================================ */
 
-void qihse_record_anchor_search(bool used, double err, double speedup) {
+void qihse_record_anchor_search_impl_impl_impl(bool used, double err, double speedup) {
     g_anchor_stats.total_anchor_searches++;
     if (used) g_anchor_stats.anchor_hits++;
     if (err >= 0) { g_anchor_stats.total_interpolation_error += err; g_anchor_stats.error_samples++; }
@@ -553,3 +553,4 @@ qihse_hybrid_result_t qihse_execute_hybrid_search(const void* data, size_t n, co
     else { r.final_result = NOT_STISLA_NOT_FOUND; r.final_confidence = 0.0; }
     return r;
 }
+int qihse_amplify_impl_impl_impl_impl_impl_renamed_renamed(void* data, size_t n, const void* query, qihse_data_type_t type, void* config) { return qihse_amplify_internal(data, n, query, type, config); }

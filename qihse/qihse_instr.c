@@ -150,18 +150,9 @@ int qihse_intel_avx512_vector_op(const double* a, const double* b, double* resul
     return 0;
 }
 
-__attribute__((target("avxvnni,avx512vnni,avx512vl")))
-int qihse_intel_vnni_dot_product(const int8_t* a, const int8_t* b, int32_t* result, size_t n) {
-    if (!(g_hw_info.enabled_features & QIHSE_INTEL_HW_AVX_VNNI)) {
-        // Simple fallback
-        *result = 0;
-        for (size_t i = 0; i < n; i++) {
-            *result += (int32_t)a[i] * (int32_t)b[i];
-        }
-        return 0;
-    }
-
 #ifdef __x86_64__
+static __attribute__((target("avxvnni")))
+int qihse_intel_vnni_dot_product_impl(const int8_t* a, const int8_t* b, int32_t* result, size_t n) {
     // AVX-VNNI implementation using _mm256_dpbusd_epi32 (VPDPBUSD)
     // Note: a is treated as unsigned bytes, b as signed bytes per instruction spec
     __m256i acc = _mm256_setzero_si256();
@@ -189,13 +180,22 @@ int qihse_intel_vnni_dot_product(const int8_t* a, const int8_t* b, int32_t* resu
     
     *result = total;
     return 0;
-#else
+}
+#endif
+
+int qihse_intel_vnni_dot_product(const int8_t* a, const int8_t* b, int32_t* result, size_t n) {
+#ifdef __x86_64__
+    if (g_hw_info.enabled_features & QIHSE_INTEL_HW_AVX_VNNI) {
+        return qihse_intel_vnni_dot_product_impl(a, b, result, n);
+    }
+#endif
+
+    // Fallback: Simple scalar implementation
     *result = 0;
     for (size_t i = 0; i < n; i++) {
         *result += (int32_t)((uint8_t)a[i]) * (int32_t)b[i];
     }
     return 0;
-#endif
 }
 
 int qihse_intel_hw_hash(const void* data, size_t size, void* hash, int hash_type) {
