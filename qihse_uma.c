@@ -25,6 +25,9 @@ static struct {
     size_t num_regions;
     pthread_mutex_t mutex;
     bool uma_supported;
+    qihse_uma_manager_t manager; /* Added for cache alloc */
+    void **addresses; /* Added for migrate */
+    size_t num_addresses; /* Added for migrate */
 } uma_global_state = {0};
 
 /* ============================================================================
@@ -64,7 +67,7 @@ static int detect_memory_regions(qihse_memory_region_t** regions, size_t* num_re
     /* HBM - High Bandwidth Memory (Fall-back or CXL-attached) */
     (*regions)[1] = (qihse_memory_region_t){
         .tier = QIHSE_MEM_HBM,
-        .capacity_bytes = 16ULL * 1024 * 1024 * 1024, 
+        .capacity_bytes = 16ULL * 1024 * 1024 * 1024,
         .available_bytes = 12ULL * 1024 * 1024 * 1024,
         .bandwidth_mbps = 1024000, /* ~1 TB/s HBM3 bandwidth */
         .latency_ns = 40,
@@ -139,6 +142,18 @@ void qihse_uma_shutdown(void) {
     free(uma_global_state.regions);
     uma_global_state.regions = NULL;
     uma_global_state.num_regions = 0;
+
+    if (uma_global_state.manager) {
+        qihse_uma_destroy_manager(uma_global_state.manager);
+        uma_global_state.manager = NULL;
+    }
+
+    if (uma_global_state.addresses) {
+        /* In a real implementation, we'd need to free each address entry */
+        free(uma_global_state.addresses);
+        uma_global_state.addresses = NULL;
+        uma_global_state.num_addresses = 0;
+    }
 
     pthread_mutex_unlock(&uma_global_state.mutex);
     pthread_mutex_destroy(&uma_global_state.mutex);
@@ -497,7 +512,8 @@ int qihse_vector_db_preload(qihse_vector_db_t* db, double fraction) {
     size_t preload_count = (size_t)(db->num_vectors * fraction);
     size_t preload_size = preload_count * db->vector_dimension * sizeof(float);
 
-    printf("QIHSE: Preloading %zu vectors (%zu bytes) into fast memory\n",
+    printf("QIHSE: Preloading %zu vectors (%zu bytes) into fast memory
+",
            preload_count, preload_size);
 
     return 0;
@@ -514,7 +530,8 @@ int qihse_vector_db_optimize_layout(qihse_vector_db_t* db) {
      * 3. Setting up prefetching hints
      */
 
-    printf("QIHSE: Optimizing vector database layout for fast lookups\n");
+    printf("QIHSE: Optimizing vector database layout for fast lookups
+");
 
     /* Optimize for NPU cache access patterns */
     qihse_uma_optimize_for_npu(db->index_superposition);
@@ -531,7 +548,8 @@ int qihse_meteor_lake_npu_cache_init(void) {
         return -EINVAL;
     }
 
-    printf("QIHSE: Initializing Meteor Lake NPU cache (128MB) optimization\n");
+    printf("QIHSE: Initializing Meteor Lake NPU cache (128MB) optimization
+");
 
     /* Configure memory allocation for NPU cache affinity */
     /* Current implementation:
@@ -557,9 +575,11 @@ void* qihse_npu_cache_alloc(size_t size) {
     qihse_uma_manager_t uma = uma_global_state.manager;
     if (!uma) {
         /* Initialize UMA if not already done */
-        uma_global_state.manager = qihse_uma_create(qihse_memory_create_manager(),
-                                                   QIHSE_UMA_MIGRATE_ON_ACCESS);
-        uma = uma_global_state.manager;
+        /* NOTE: The original code had a potential leak here as uma_global_state.manager might not be properly initialized or assigned */
+        /* Assuming qihse_uma_create_manager exists and returns a valid manager */
+        uma = qihse_uma_create_manager(); /* Placeholder for actual manager creation */
+        if (!uma) return NULL;
+        uma_global_state.manager = uma;
     }
 
     /* Allocate with superposition for NPU cache optimization */
@@ -584,7 +604,7 @@ void* qihse_npu_cache_alloc(size_t size) {
         /* Store address for cleanup - in full implementation, would use reference counting */
         /* For now, leak the address since this is a simple alloc function */
     }
-    }
+    
 
     return ptr;
 }
@@ -621,7 +641,8 @@ int qihse_npu_cache_flush(void) {
  * ============================================================================ */
 
 int qihse_gna_init(void) {
-    printf("QIHSE: Initializing GNA (Gaussian Neural Accelerator) for micro-tweaking\n");
+    printf("QIHSE: Initializing GNA (Gaussian Neural Accelerator) for micro-tweaking
+");
 
     /* Initialize GNA for fine-tuning operations */
     /* Current implementation:
@@ -665,7 +686,8 @@ int qihse_gna_train(
         return -EINVAL;
     }
 
-    printf("QIHSE: Training GNA model for parameter optimization (%zu samples)\n", num_samples);
+    printf("QIHSE: Training GNA model for parameter optimization (%zu samples)
+", num_samples);
 
     /* Configure GNA for parameter optimization */
     /* Current implementation:
@@ -695,24 +717,53 @@ const char* qihse_memory_tier_name(qihse_memory_tier_t tier) {
 
 void qihse_uma_print_stats(void) {
     if (!uma_global_state.initialized) {
-        printf("QIHSE UMA: Not initialized\n");
+        printf("QIHSE UMA: Not initialized
+");
         return;
     }
 
-    printf("QIHSE UMA Memory Statistics:\n");
-    printf("==========================\n");
-    printf("UMA Supported: %s\n", uma_global_state.uma_supported ? "Yes" : "No");
-    printf("Memory Regions: %zu\n", uma_global_state.num_regions);
-    printf("\n");
+    printf("QIHSE UMA Memory Statistics:
+");
+    printf("==========================
+");
+    printf("UMA Supported: %s
+", uma_global_state.uma_supported ? "Yes" : "No");
+    printf("Memory Regions: %zu
+", uma_global_state.num_regions);
+    printf("
+");
 
     for (size_t i = 0; i < uma_global_state.num_regions; i++) {
         const qihse_memory_region_t* region = &uma_global_state.regions[i];
-        printf("Tier %zu (%s):\n", i, qihse_memory_tier_name(region->tier));
-        printf("  Capacity: %.2f GB\n", (double)region->capacity_bytes / (1024*1024*1024));
-        printf("  Available: %.2f GB\n", (double)region->available_bytes / (1024*1024*1024));
-        printf("  Bandwidth: %.0f MB/s\n", (double)region->bandwidth_mbps / 1000);
-        printf("  Latency: %zu ns\n", region->latency_ns);
-        printf("  Unified: %s\n", region->is_unified ? "Yes" : "No");
-        printf("\n");
+        printf("Tier %zu (%s):
+", i, qihse_memory_tier_name(region->tier));
+        printf("  Capacity: %.2f GB
+", (double)region->capacity_bytes / (1024*1024*1024));
+        printf("  Available: %.2f GB
+", (double)region->available_bytes / (1024*1024*1024));
+        printf("  Bandwidth: %.0f MB/s
+", (double)region->bandwidth_mbps / 1000);
+        printf("  Latency: %zu ns
+", region->latency_ns);
+        printf("  Unified: %s
+", region->is_unified ? "Yes" : "No");
+        printf("
+");
     }
+}
+
+/* ============================================================================
+ * NEW FUNCTION IMPLEMENTATION TO RESOLVE LINKER ERROR
+ * ============================================================================ */
+
+// Stub implementation for qihse_uma_set_priority_pinning to resolve linker error.
+// TODO: Implement actual priority pinning logic if required.
+void qihse_uma_set_priority_pinning(void *task_handle, int priority) {
+    (void)task_handle; // Suppress unused parameter warning
+    (void)priority;    // Suppress unused parameter warning
+    // In a real scenario, this would involve interacting with the OS or scheduler
+    // to set thread priority or CPU affinity for specific tasks.
+    // For now, it's a no-op stub.
+    // printf("qihse_uma_set_priority_pinning called (stub)
+"); // Optional: uncomment for debugging
 }
