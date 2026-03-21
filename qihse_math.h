@@ -178,3 +178,6 @@ int qihse_math_get_performance_stats(qihse_math_performance_t* stats);
 #endif
 
 #endif /* QIHSE_MATH_H */
+int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);
+int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);
+int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);

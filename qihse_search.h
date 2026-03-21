@@ -30,7 +30,7 @@ void qihse_apply_diffusion(qihse_superposition_t* superposition);
 void qihse_verify_config_init(qihse_verify_config_t* config, double target_accuracy);
 qihse_collapse_result_t qihse_dimensional_collapse_l2_norm(
     const qihse_superposition_t* superposition);
-not_stisla_result_t qihse_verify_result(
+not_stisla_result_t qihse_verify_search_result(
     const void* data, size_t n, const void* query, qihse_data_type_t type,
     const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config);
 
@@ -177,3 +177,5 @@ extern qihse_optimization_db_t g_optimization_db;
 #endif
 
 #endif /* QIHSE_SEARCH_H */
+int qihse_amplify_internal(void* data, size_t n, const void* query, qihse_data_type_t type, void* config);
+int qihse_amplify(void* data, size_t n, const void* query, qihse_data_type_t type, void* config);

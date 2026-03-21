@@ -27,7 +27,7 @@ LDFLAGS=-ldl -lm -lpthread
 
 # MONOLITHIC CORE: Use qihse_core.c (complete impl) + qihse_hetero.c (compute pool)
 # DO NOT include split files that duplicate these (core/qihse.c, core/qihse_helpers.c, algorithm files)
-ABI_SOURCES=core/qihse_plugin.c qihse_core.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c
+ABI_SOURCES=core/qihse_plugin.c qihse_core.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c algorithms/qihse_superposition.c algorithms/qihse_rff.c algorithms/qihse_amplification.c
 ABI_HEADERS=core/qihse_abi.h core/qihse_plugin.h core/qihse_searchop.h qihse.h qihse_search.h qihse_math.h qihse_instr.h qihse_hetero.h
 
 # Algorithm files - EXCLUDED (already in qihse_core.c)
