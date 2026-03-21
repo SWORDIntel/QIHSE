@@ -7,26 +7,28 @@ CC=gcc
 # 1. CFLAGS_AVX2 - Works on most modern Intel/AMD CPUs (AVX2)
 # 2. CFLAGS_FULL - Requires AVX-512, AMX, VNNI capable CPU (Sapphire Rapids, etc.)
 
-CFLAGS_BASE=-std=c99 -Wall -Wextra -I. -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I../not_stisla/include -fPIC -lm -pthread -O3
+CFLAGS_BASE=-std=c99 -Wall -Wextra -I. -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I../../NOT_STISLA/include -fPIC -lm -pthread -D_GNU_SOURCE -O3
 
 # AVX2-only build (works on Core Ultra 7, etc.)
 CFLAGS_AVX2=$(CFLAGS_BASE) -mavx2 -mfma
 
 # Full AVX-512/VNNI build for A00 engineering board (no AMX - may not be stable on early samples)
-CFLAGS_FULL=$(CFLAGS_BASE) -mavx2 -mfma -mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vnni
+# Added -mavxvnni to address compilation error for VNNI instructions.
+CFLAGS_FULL=$(CFLAGS_BASE) -mavx2 -mfma -mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vnni -mavxvnni
 
 # Experimental: Full with AMX (uncomment if AMX is confirmed working)
 # CFLAGS_AMX=$(CFLAGS_FULL) -mamx-tile -mamx-int8 -mamx-bf16
 
 # Default to AVX2 (safe for most systems)
 CFLAGS=$(CFLAGS_AVX2)
+# CFLAGS=$(CFLAGS_FULL)
 
-LDFLAGS=-ldl -lm
+LDFLAGS=-ldl -lm -lpthread
 
 # MONOLITHIC CORE: Use qihse_core.c (complete impl) + qihse_hetero.c (compute pool)
 # DO NOT include split files that duplicate these (core/qihse.c, core/qihse_helpers.c, algorithm files)
-ABI_SOURCES=core/qihse_plugin.c qihse_core.c qihse_hetero.c
-ABI_HEADERS=core/qihse_abi.h core/qihse_plugin.h core/qihse_searchop.h qihse.h qihse_hetero.h
+ABI_SOURCES=core/qihse_plugin.c qihse_core.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c
+ABI_HEADERS=core/qihse_abi.h core/qihse_plugin.h core/qihse_searchop.h qihse.h qihse_search.h qihse_math.h qihse_instr.h qihse_hetero.h
 
 # Algorithm files - EXCLUDED (already in qihse_core.c)
 # Only include qihse_dimensions.c which has unique functions not in qihse_core.c
@@ -150,7 +152,7 @@ test: test_abi test_algorithms test_quantization test_verification test_ml test_
 # Benchmark target - MINIMAL build with only required files
 # qihse_core.c and qihse_hetero.c are monolithic and contain all needed functions
 BENCHMARK_SOURCES=qihse_benchmark_suite.c
-BENCHMARK_CORE=qihse_core.c qihse_hetero.c core/qihse_plugin.c
+BENCHMARK_CORE=qihse_core.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c core/qihse_plugin.c
 BENCHMARK_CPU=backends/cpu/qihse_cpu_detect.c backends/cpu/qihse_cpu_avx2.c backends/cpu/qihse_cpu_avx512.c
 # NOT_STISLA dependency (required by qihse_core.c)
 NOT_STISLA_SRC=../not_stisla/src/not_stisla.c
@@ -184,4 +186,3 @@ check: $(ALL_SOURCES) $(ALL_HEADERS) $(TEST_SOURCES)
 	@echo "Checking compilation..."
 	$(CC) $(CFLAGS) -fsyntax-only $(ALL_SOURCES) $(TEST_SOURCES)
 	@echo "Compilation check passed"
-

@@ -1,3 +1,7 @@
+#include <pthread.h>
+
+#include <pthread.h>
+
 /**
  * QIHSE UMA (Unified Memory Architecture) Memory Management
  *
