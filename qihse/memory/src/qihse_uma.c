@@ -132,34 +132,38 @@ qihse_uma_manager_t qihse_uma_create(
         return NULL;
     }
 
-    qihse_uma_manager_internal_t* uma = calloc(1, sizeof(qihse_uma_manager_internal_t));
+    qihse_uma_manager_enhanced_t* uma = calloc(1, sizeof(qihse_uma_manager_enhanced_t));
     if (!uma) {
         errno = ENOMEM;
         return NULL;
     }
 
-    uma->memory_manager = memory_manager;
-    uma->default_policy = migration_policy;
-    uma->max_addresses = 1024;
+    uma->base.memory_manager = memory_manager;
+    uma->base.default_policy = migration_policy;
+    uma->base.max_addresses = 1024;
+    uma->superposition_capacity = 1024;
+    uma->superposition_states = calloc(uma->superposition_capacity, sizeof(qihse_memory_superposition_state_t));
 
     /* Initialize atomics */
-    atomic_init(&uma->total_migrations, 0);
-    atomic_init(&uma->total_accesses, 0);
-    atomic_init(&uma->cache_hits, 0);
-    atomic_init(&uma->cache_misses, 0);
-    uma->avg_migration_time = 0.0;
+    atomic_init(&uma->base.total_migrations, 0);
+    atomic_init(&uma->base.total_accesses, 0);
+    atomic_init(&uma->base.cache_hits, 0);
+    atomic_init(&uma->base.cache_misses, 0);
+    uma->base.avg_migration_time = 0.0;
 
     /* Address tracking */
-    uma->addresses = calloc(uma->max_addresses, sizeof(qihse_uma_address_t*));
-    if (!uma->addresses) {
+    uma->base.addresses = calloc(uma->base.max_addresses, sizeof(qihse_uma_address_t*));
+    if (!uma->base.addresses) {
+        free(uma->superposition_states);
         free(uma);
         errno = ENOMEM;
         return NULL;
     }
 
     /* Initialize mutex */
-    if (pthread_mutex_init(&uma->address_mutex, NULL) != 0) {
-        free(uma->addresses);
+    if (pthread_mutex_init(&uma->base.address_mutex, NULL) != 0) {
+        free(uma->base.addresses);
+        free(uma->superposition_states);
         free(uma);
         errno = ENOMEM;
         return NULL;
@@ -171,7 +175,8 @@ qihse_uma_manager_t qihse_uma_create(
 void qihse_uma_destroy(qihse_uma_manager_t uma) {
     if (!uma) return;
 
-    qihse_uma_manager_internal_t* internal = (qihse_uma_manager_internal_t*)uma;
+    qihse_uma_manager_enhanced_t* enhanced = (qihse_uma_manager_enhanced_t*)uma;
+    qihse_uma_manager_internal_t* internal = &enhanced->base;
 
     /* Clean up tracked addresses */
     pthread_mutex_lock(&internal->address_mutex);
@@ -183,17 +188,22 @@ void qihse_uma_destroy(qihse_uma_manager_t uma) {
     pthread_mutex_unlock(&internal->address_mutex);
 
     /* Clean up preloaded vectors (Phase 2 feature) */
-    qihse_uma_manager_enhanced_t* enhanced = (qihse_uma_manager_enhanced_t*)uma;
     for (size_t i = 0; i < enhanced->preloaded_count; i++) {
         if (enhanced->preloaded_vectors[i]) {
             qihse_uma_free(uma, enhanced->preloaded_vectors[i]);
         }
     }
     free(enhanced->preloaded_vectors);
+    
+    if (enhanced->vector_preload && enhanced->vector_preload->db_path) {
+        free(enhanced->vector_preload->db_path);
+    }
+    free(enhanced->vector_preload);
+    free(enhanced->superposition_states);
 
     pthread_mutex_destroy(&internal->address_mutex);
     free(internal->addresses);
-    free(internal);
+    free(enhanced);
 }
 
 /* ============================================================================
@@ -595,10 +605,11 @@ bool qihse_uma_init_meteor_lake_npu_cache(qihse_meteor_lake_npu_cache_t* cache) 
         /* Standard Meteor Lake cache */
         cache->line_size_bytes = 64;         /* Standard cache lines */
         cache->associativity = 16;           /* Good associativity */
-        cache->hit_latency_ns = 10.0;        /* Balanced latency */
+        cache->hit_latency_ns = 8.0;         /* Optimized for MTL-P SRAM */
         cache->miss_penalty_ns = 150.0;      /* Standard penalty */
         cache->gna_workgroup_size = 32;      /* Standard workgroups */
-    } else if (cache->cache_size_mb >= 64) {
+    }
+ else if (cache->cache_size_mb >= 64) {
         /* Smaller cache - optimize for latency */
         cache->line_size_bytes = 32;         /* Smaller cache lines */
         cache->associativity = 8;            /* Lower associativity for speed */

@@ -49,40 +49,40 @@ static int detect_memory_regions(qihse_memory_region_t** regions, size_t* num_re
     *regions = calloc(*num_regions, sizeof(qihse_memory_region_t));
     if (!*regions) return -ENOMEM;
 
-    /* DRAM - Main System Memory */
+    /* DRAM - Main System Memory (Optimized for MTL-P LPDDR5x) */
     (*regions)[0] = (qihse_memory_region_t){
         .tier = QIHSE_MEM_DRAM,
         .capacity_bytes = get_total_system_memory(),
         .available_bytes = get_total_system_memory() / 2, /* Conservative estimate */
-        .bandwidth_mbps = 50000, /* ~50 GB/s typical DDR4/5 */
-        .latency_ns = 100, /* ~100ns typical DRAM latency */
+        .bandwidth_mbps = 120000, /* ~120 GB/s for MTL-P LPDDR5x-7500 dual-channel */
+        .latency_ns = 105, /* Typical LPDDR5x latency */
         .is_unified = true,
         .numa_node = 0,
-        .device_name = "System DRAM"
+        .device_name = "System DRAM (LPDDR5x)"
     };
 
-    /* HBM - High Bandwidth Memory */
+    /* HBM - High Bandwidth Memory (Fall-back or CXL-attached) */
     (*regions)[1] = (qihse_memory_region_t){
         .tier = QIHSE_MEM_HBM,
-        .capacity_bytes = 16ULL * 1024 * 1024 * 1024, /* 16GB HBM */
-        .available_bytes = 12ULL * 1024 * 1024 * 1024, /* 12GB available */
-        .bandwidth_mbps = 1000000, /* ~1 TB/s HBM bandwidth */
-        .latency_ns = 30, /* ~30ns HBM latency */
+        .capacity_bytes = 16ULL * 1024 * 1024 * 1024, 
+        .available_bytes = 12ULL * 1024 * 1024 * 1024,
+        .bandwidth_mbps = 1024000, /* ~1 TB/s HBM3 bandwidth */
+        .latency_ns = 40,
         .is_unified = true,
-        .numa_node = -1, /* GPU-specific */
-        .device_name = "High Bandwidth Memory"
+        .numa_node = -1,
+        .device_name = "HBM/CXL-Memory"
     };
 
-    /* NPU Cache - Meteor Lake 128MB */
+    /* NPU Cache - Meteor Lake 128MB (SRAM) */
     (*regions)[2] = (qihse_memory_region_t){
         .tier = QIHSE_MEM_NPU_CACHE,
         .capacity_bytes = 128ULL * 1024 * 1024, /* 128MB Meteor Lake NPU cache */
-        .available_bytes = 96ULL * 1024 * 1024, /* 96MB available (conservative) */
-        .bandwidth_mbps = 2000000, /* ~2 TB/s cache bandwidth */
-        .latency_ns = 5, /* ~5ns cache latency */
+        .available_bytes = 112ULL * 1024 * 1024, /* Increased available for MTL-P */
+        .bandwidth_mbps = 2048000, /* ~2 TB/s internal fabric bandwidth */
+        .latency_ns = 8, /* ~8ns SRAM access latency */
         .is_unified = true,
-        .numa_node = -1, /* NPU-specific */
-        .device_name = "Meteor Lake NPU Cache"
+        .numa_node = -1,
+        .device_name = "Meteor Lake NPU SRAM Cache"
     };
 
     /* GNA Cache - Fine-tuning cache */
