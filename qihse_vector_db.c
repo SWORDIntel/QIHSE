@@ -276,9 +276,13 @@ bool qihse_vector_db_add_vectors(
 
         /* Allocate metadata storage if needed */
         if (total_metadata_size > 0) {
+            size_t existing_meta_size = 0;
+            for (size_t i = 0; i < internal->total_vectors; i++) {
+                existing_meta_size += internal->metadata_sizes[i];
+            }
             internal->metadata_storage = qihse_uma_allocate_superposition(
                 internal->uma_manager,
-                total_metadata_size,
+                existing_meta_size + total_metadata_size,
                 (const int[]){0}, /* CPU device */
                 1,
                 internal->superposition_enabled ? internal->superposition_state : QIHSE_SUPERPOSITION_READY
@@ -286,6 +290,11 @@ bool qihse_vector_db_add_vectors(
         }
     } else {
         /* Need to expand storage - allocate new larger buffers */
+        size_t existing_meta_size = 0;
+        for (size_t i = 0; i < internal->total_vectors; i++) {
+            existing_meta_size += internal->metadata_sizes[i];
+        }
+
         qihse_uma_address_t* new_vector_storage = qihse_uma_allocate_superposition(
             internal->uma_manager,
             required_vector_size,
@@ -295,10 +304,10 @@ bool qihse_vector_db_add_vectors(
         );
 
         qihse_uma_address_t* new_metadata_storage = NULL;
-        if (total_metadata_size > 0) {
+        if (total_metadata_size > 0 || existing_meta_size > 0) {
             new_metadata_storage = qihse_uma_allocate_superposition(
                 internal->uma_manager,
-                total_metadata_size,
+                existing_meta_size + total_metadata_size,
                 (const int[]){0}, /* CPU device */
                 1,
                 internal->superposition_enabled ? internal->superposition_state : QIHSE_SUPERPOSITION_READY
@@ -492,12 +501,14 @@ int qihse_vector_db_search(
     }
 
     /* Sort results by score (highest first) */
-    for (size_t i = 0; i < found_results - 1; i++) {
-        for (size_t j = 0; j < found_results - i - 1; j++) {
-            if (temp_results[j].score < temp_results[j + 1].score) {
-                qihse_vector_result_t temp = temp_results[j];
-                temp_results[j] = temp_results[j + 1];
-                temp_results[j + 1] = temp;
+    if (found_results > 0) {
+        for (size_t i = 0; i < found_results - 1; i++) {
+            for (size_t j = 0; j < found_results - i - 1; j++) {
+                if (temp_results[j].score < temp_results[j + 1].score) {
+                    qihse_vector_result_t temp = temp_results[j];
+                    temp_results[j] = temp_results[j + 1];
+                    temp_results[j + 1] = temp;
+                }
             }
         }
     }
@@ -513,7 +524,7 @@ int qihse_vector_db_search(
             if (results[i].vector) {
                 void* storage_ptr = qihse_uma_access(internal->uma_manager, internal->vector_storage, 0);
                 if (storage_ptr) {
-                    float* source_vector = (float*)((char*)storage_ptr + internal->vector_offsets[i]);
+                    float* source_vector = (float*)((char*)storage_ptr + internal->vector_offsets[results[i].id]);
                     memcpy(results[i].vector, source_vector, query->vector_dims * sizeof(float));
                     qihse_uma_release(internal->uma_manager, internal->vector_storage, 0);
                 }
@@ -521,17 +532,17 @@ int qihse_vector_db_search(
         }
 
         /* Include metadata if requested and available */
-        if (query->include_metadata && internal->metadata_storage && internal->metadata_sizes[i] > 0) {
-            results[i].metadata = malloc(internal->metadata_sizes[i]);
+        if (query->include_metadata && internal->metadata_storage && internal->metadata_sizes[results[i].id] > 0) {
+            results[i].metadata = malloc(internal->metadata_sizes[results[i].id]);
             if (results[i].metadata) {
                 void* meta_ptr = qihse_uma_access(internal->uma_manager, internal->metadata_storage, 0);
                 if (meta_ptr) {
                     memcpy(results[i].metadata,
-                           (char*)meta_ptr + internal->metadata_offsets[i],
-                           internal->metadata_sizes[i]);
+                           (char*)meta_ptr + internal->metadata_offsets[results[i].id],
+                           internal->metadata_sizes[results[i].id]);
                     qihse_uma_release(internal->uma_manager, internal->metadata_storage, 0);
                 }
-                results[i].metadata_size = internal->metadata_sizes[i];
+                results[i].metadata_size = internal->metadata_sizes[results[i].id];
             }
         }
     }
