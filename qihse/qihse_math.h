@@ -85,7 +85,7 @@ void qihse_intel_shutdown(void);
 bool qihse_intel_backend_available(qihse_intel_backend_t backend);
 int qihse_intel_get_performance_stats(qihse_intel_performance_t* stats);
 int qihse_intel_set_frequency_scaling(double target_frequency_mhz);
-void* qihse_intel_optimize_memory_layout(void* data, size_t size, size_t alignment);
+void* qihse_intel_optimize_memory_layout(const void* data, size_t size, size_t alignment);
 
 /* ============================================================================
  * FORTRAN INTEGRATION

@@ -12,15 +12,13 @@
 #define M_PI acos(-1.0)
 #endif
 
-/* Forward declaration for structures used but not defined in accessible headers */
-/* These are assumed to be defined elsewhere or part of an external dependency */
-
+#include <pthread.h>
 
 /* ============================================================================
  * QIHSE-NOT_STISLA INTEGRATION: GLOBAL ANCHOR STATISTICS
  * ============================================================================ */
 
-struct {
+static struct {
     /* Anchor performance tracking */
     uint64_t total_anchor_searches;
     uint64_t anchor_hits;
@@ -39,20 +37,24 @@ struct {
     uint64_t speedup_samples;
 } g_anchor_stats = {0};
 
+static pthread_mutex_t g_anchor_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ============================================================================
  * SELF-OPTIMIZATION DATABASE
  * ============================================================================ */
 
 qihse_optimization_db_t g_optimization_db = {0};
-static bool g_optimization_initialized = false;
+static pthread_mutex_t g_optimization_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_optimization_once = PTHREAD_ONCE_INIT;
+
+static void qihse_init_global_optimization_impl(void) {
+    /* Initialize with reasonable defaults */
+    qihse_optimization_init(&g_optimization_db, 1000,
+                           "/tmp/qihse_optimization.db");
+}
 
 void qihse_init_global_optimization(void) {
-    if (!g_optimization_initialized) {
-        /* Initialize with reasonable defaults */
-        qihse_optimization_init(&g_optimization_db, 1000,
-                               "/tmp/qihse_optimization.db");
-        g_optimization_initialized = true;
-    }
+    pthread_once(&g_optimization_once, qihse_init_global_optimization_impl);
 }
 
 /* ============================================================================
@@ -220,7 +222,7 @@ qihse_collapse_result_t qihse_dimensional_collapse_l2_norm(
     return result;
 }
 
-not_stisla_result_t qihse_verify_search_result(
+not_stisla_result_t qihse_verify_result(
     const void* data,
     size_t n,
     const void* query,
@@ -409,7 +411,12 @@ static qihse_optimization_entry_t* qihse_get_or_create_entry(qihse_optimization_
 
 void qihse_record_performance(qihse_optimization_db_t* db, const qihse_data_signature_t* sig, qihse_pipeline_type_t ptype, size_t dims, double speedup, double conf) {
     if (!db || !db->enable_learning || !sig) return;
+    pthread_mutex_lock(&g_optimization_mutex);
     qihse_optimization_entry_t* e = qihse_get_or_create_entry(db, sig);
+    if (!e) {
+        pthread_mutex_unlock(&g_optimization_mutex);
+        return;
+    }
     double alpha = 0.1;
     e->avg_speedup = e->avg_speedup * (1.0 - alpha) + speedup * alpha;
     e->avg_confidence = e->avg_confidence * (1.0 - alpha) + conf * alpha;
@@ -420,10 +427,12 @@ void qihse_record_performance(qihse_optimization_db_t* db, const qihse_data_sign
     }
     e->last_updated = time(NULL);
     if (db->storage_path) qihse_save_optimization_db(db);
+    pthread_mutex_unlock(&g_optimization_mutex);
 }
 
 void qihse_get_optimized_config(const qihse_optimization_db_t* db, const qihse_data_signature_t* sig, qihse_config_t* config) {
     if (!db || !sig || !config) return;
+    pthread_mutex_lock(&g_optimization_mutex);
     qihse_optimization_entry_t* e = qihse_find_entry((qihse_optimization_db_t*)db, sig);
     if (e && e->samples >= 5) {
         config->use_parallel_pipelines = true;
@@ -433,6 +442,7 @@ void qihse_get_optimized_config(const qihse_optimization_db_t* db, const qihse_d
         config->auto_dimensions = true;
         config->use_parallel_pipelines = true;
     }
+    pthread_mutex_unlock(&g_optimization_mutex);
 }
 
 /* ============================================================================
@@ -440,40 +450,53 @@ void qihse_get_optimized_config(const qihse_optimization_db_t* db, const qihse_d
  * ============================================================================ */
 
 void qihse_record_anchor_search_impl_impl_impl(bool used, double err, double speedup) {
+    pthread_mutex_lock(&g_anchor_stats_mutex);
     g_anchor_stats.total_anchor_searches++;
     if (used) g_anchor_stats.anchor_hits++;
     if (err >= 0) { g_anchor_stats.total_interpolation_error += err; g_anchor_stats.error_samples++; }
     if (speedup > 0) { g_anchor_stats.total_anchor_speedup += speedup; g_anchor_stats.speedup_samples++; }
+    pthread_mutex_unlock(&g_anchor_stats_mutex);
 }
 
 void qihse_record_anchor_learning(size_t learned, size_t pruned) {
+    pthread_mutex_lock(&g_anchor_stats_mutex);
     g_anchor_stats.anchors_learned_total += learned;
     g_anchor_stats.anchors_pruned_total += pruned;
+    pthread_mutex_unlock(&g_anchor_stats_mutex);
 }
 
 void qihse_update_anchor_memory_stats(size_t mem, int wtype) {
+    pthread_mutex_lock(&g_anchor_stats_mutex);
     g_anchor_stats.current_anchor_memory_mb = mem;
     if (mem > g_anchor_stats.peak_anchor_memory_mb) g_anchor_stats.peak_anchor_memory_mb = mem;
     g_anchor_stats.last_detected_workload_type = wtype;
+    pthread_mutex_unlock(&g_anchor_stats_mutex);
 }
 
 void qihse_record_anchor_performance(qihse_optimization_db_t* db, const qihse_data_signature_t* sig, size_t count, double hit, double speedup, int wtype) {
     if (!db || !sig) return;
+    pthread_mutex_lock(&g_optimization_mutex);
     qihse_optimization_entry_t* e = qihse_get_or_create_entry(db, sig);
-    if (!e) return;
-    e->use_anchor_search = true;
-    e->optimal_anchor_count = count;
-    e->anchor_hit_rate = hit;
-    e->anchor_speedup = speedup;
-    e->workload_type = wtype;
-    e->last_updated = time(NULL);
-    e->samples++;
+    if (e) {
+        e->use_anchor_search = true;
+        e->optimal_anchor_count = count;
+        e->anchor_hit_rate = hit;
+        e->anchor_speedup = speedup;
+        e->workload_type = wtype;
+        e->last_updated = time(NULL);
+        e->samples++;
+    }
+    pthread_mutex_unlock(&g_optimization_mutex);
 }
 
 bool qihse_get_anchor_optimized_config(const qihse_optimization_db_t* db, const qihse_data_signature_t* sig, qihse_config_t* config) {
     if (!db || !sig || !config) return false;
+    pthread_mutex_lock(&g_optimization_mutex);
     qihse_optimization_entry_t* e = qihse_find_entry((qihse_optimization_db_t*)db, sig);
-    if (!e || !e->use_anchor_search || e->samples < 3) return false;
+    if (!e || !e->use_anchor_search || e->samples < 3) {
+        pthread_mutex_unlock(&g_optimization_mutex);
+        return false;
+    }
     config->anchor_config.max_anchors = e->optimal_anchor_count;
     config->anchor_config.workload_type = e->workload_type;
     config->anchor_config.enable_anchor_learning = true;
@@ -482,6 +505,7 @@ bool qihse_get_anchor_optimized_config(const qihse_optimization_db_t* db, const 
         default: config->anchor_config.chunk_size = 4; break;
     }
     config->anchor_config.enable_anchor_simd = (e->anchor_hit_rate > 0.7);
+    pthread_mutex_unlock(&g_optimization_mutex);
     return true;
 }
 

@@ -114,7 +114,7 @@ void qihse_verification_result_destroy(qihse_verification_result_t* result);
  * @param verification_result Output verification result
  * @return 0 on successful verification, negative error code on failure
  */
-int qihse_verify_result(
+int qihse_verify_result_advanced(
     const void* query,
     const void* result,
     const void* ground_truth,

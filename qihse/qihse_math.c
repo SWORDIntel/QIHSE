@@ -249,22 +249,16 @@ int qihse_intel_set_frequency_scaling(double target_frequency_mhz) {
     return 0;
 }
 
-void* qihse_intel_optimize_memory_layout(void* data, size_t size, size_t alignment) {
+void* qihse_intel_optimize_memory_layout(const void* data, size_t size, size_t alignment) {
     if (!data || size == 0) return NULL;
-
-    uintptr_t addr = (uintptr_t)data;
-    if ((addr & (alignment - 1)) == 0) {
-        return data;  /* Already aligned */
-    }
 
     void* aligned_data = NULL;
     if (posix_memalign(&aligned_data, alignment, size) == 0) {
         memcpy(aligned_data, data, size);
-        free(data);
         return aligned_data;
     }
 
-    return data;
+    return NULL;
 }
 
 /* ============================================================================

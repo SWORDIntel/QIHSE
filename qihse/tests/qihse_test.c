@@ -4,7 +4,7 @@
  * Simple functionality test for QIHSE heterogeneous search
  */
 
-#include "../include/qihse.h"
+#include "../qihse.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
