@@ -170,7 +170,7 @@ static int test_verification_functionality(void) {
     qihse_verification_result_t result;
     qihse_verification_result_init(&result);
 
-    int ret = qihse_verify_result(NULL, NULL, NULL, &config, &result);
+    int ret = qihse_verify_result_advanced(NULL, NULL, NULL, &config, &result);
     TEST_ASSERT_EQ(ret, -1, "Verification with NULL result should fail");
 
     qihse_verification_result_destroy(&result);

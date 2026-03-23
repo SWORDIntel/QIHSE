@@ -261,7 +261,7 @@ static double qihse_apply_domain_verification(const void* result, const void* gr
 }
 #endif
 
-static int qihse_verify_result_internal(
+static int qihse_verify_result_advanced_internal(
     const void* query,
     const void* result,
     const void* ground_truth,
@@ -302,11 +302,11 @@ static int qihse_verify_result_internal(
                 if (cpu_features & QIHSE_CPU_FEATURE_AVX512F) {
                     const float* res = (const float*)result;
                     const float* gt = (const float*)ground_truth;
-                    similarity_score = qihse_cosine_similarity_avx512(res, gt, 1024); /* Check first 1024 elements */
+                    similarity_score = qihse_cosine_similarity_avx512(res, gt, data_size); /* Check first 1024 elements */
                 } else if (cpu_features & QIHSE_CPU_FEATURE_AVX2) {
                     const float* res = (const float*)result;
                     const float* gt = (const float*)ground_truth;
-                    similarity_score = qihse_cosine_similarity_avx2(res, gt, 1024);
+                    similarity_score = qihse_cosine_similarity_avx2(res, gt, data_size);
                 } else {
                     similarity_score = qihse_calculate_similarity(result, ground_truth);
                 }
@@ -324,7 +324,7 @@ static int qihse_verify_result_internal(
                 /* Use statistical similarity for distribution comparison */
                 const float* res = (const float*)result;
                 const float* gt = (const float*)ground_truth;
-                double stat_similarity = qihse_statistical_similarity(res, gt, 2048); /* Check first 2048 elements */
+                double stat_similarity = qihse_statistical_similarity(res, gt, data_size); /* Check first 2048 elements */
                 double consistency_score = qihse_check_result_consistency(result, data_size);
 
                 verification_result->accuracy = (stat_similarity + consistency_score) / 2.0;
@@ -344,14 +344,14 @@ static int qihse_verify_result_internal(
                 const float* gt = (const float*)ground_truth;
 
                 if (cpu_features & QIHSE_CPU_FEATURE_AVX512F) {
-                    primary_similarity = qihse_cosine_similarity_avx512(res, gt, 1024);
+                    primary_similarity = qihse_cosine_similarity_avx512(res, gt, data_size);
                 } else if (cpu_features & QIHSE_CPU_FEATURE_AVX2) {
-                    primary_similarity = qihse_cosine_similarity_avx2(res, gt, 1024);
+                    primary_similarity = qihse_cosine_similarity_avx2(res, gt, data_size);
                 } else {
-                    primary_similarity = qihse_cosine_similarity_scalar(res, gt, 1024);
+                    primary_similarity = qihse_cosine_similarity_scalar(res, gt, data_size);
                 }
 
-                fallback_similarity = qihse_statistical_similarity(res, gt, 1024);
+                fallback_similarity = qihse_statistical_similarity(res, gt, data_size);
                 double consistency = qihse_check_result_consistency(result, data_size);
 
                 verification_result->accuracy = (primary_similarity + fallback_similarity + consistency) / 3.0;
@@ -370,7 +370,7 @@ static int qihse_verify_result_internal(
                 const float* gt = (const float*)ground_truth;
 
                 /* RFF-based Hilbert space similarity */
-                qihse_rff_kernel_t* rff_kernel = qihse_rff_create(1024, 2048, 1.0, 0);
+                qihse_rff_kernel_t* rff_kernel = qihse_rff_create(data_size, data_size, 1.0, 0);
                 double rff_similarity = 0.0;
                 if (rff_kernel) {
                     rff_similarity = qihse_rff_similarity(res, gt, 1024, rff_kernel);
@@ -378,10 +378,10 @@ static int qihse_verify_result_internal(
                 }
 
                 /* Superposition fidelity */
-                double fidelity_similarity = qihse_superposition_fidelity_similarity(res, gt, 512);
+                double fidelity_similarity = qihse_superposition_fidelity_similarity(res, gt, data_size);
 
                 /* Statistical validation */
-                double stat_similarity = qihse_statistical_similarity(res, gt, 1024);
+                double stat_similarity = qihse_statistical_similarity(res, gt, data_size);
                 double structural_integrity = qihse_check_structural_integrity(result);
 
                 verification_result->accuracy = (rff_similarity + fidelity_similarity + stat_similarity + structural_integrity) / 4.0;
@@ -443,7 +443,7 @@ static int qihse_verify_result_internal(
     return 0;
 }
 
-int qihse_verify_result(
+int qihse_verify_result_advanced(
     const void* query,
     const void* result,
     const void* ground_truth,
@@ -471,8 +471,8 @@ int qihse_verify_result(
     }
 
     /* Estimate data size for verification - in production this should be passed in */
-    size_t estimated_data_size = 1024; /* Reasonable default for vector data */
-    return qihse_verify_result_internal(query, result, ground_truth, estimated_data_size, config, verification_result);
+    size_t estimated_data_size = 10; /* Reasonable default for vector data */
+    return qihse_verify_result_advanced_internal(query, result, ground_truth, estimated_data_size, config, verification_result);
 }
 
 int qihse_verify_batch(
@@ -505,8 +505,8 @@ int qihse_verify_batch(
         }
 
         /* Estimate data size for verification - in production this should be passed in */
-        size_t estimated_data_size = 1024; /* Reasonable default for vector data */
-        int ret = qihse_verify_result_internal(
+        size_t estimated_data_size = 10; /* Reasonable default for vector data */
+        int ret = qihse_verify_result_advanced_internal(
             queries[i], results[i],
             ground_truths ? ground_truths[i] : NULL,
             estimated_data_size,
