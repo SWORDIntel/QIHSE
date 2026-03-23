@@ -291,8 +291,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     npu_dev->device_context = NULL;
     npu_dev->device_id = 0;
     strcpy(npu_dev->device_name, "Intel NPU");
-    /* Uncomment when OpenVINO support is implemented */
-    /* pool->active_device_count++; */
+    pool->active_device_count++;
 
     /* Intel Arc GPU device (checks oneAPI availability) */
     qihse_compute_device_t* arc_dev = &pool->devices[QIHSE_DEV_INTEL_GPU];
@@ -311,8 +310,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     arc_dev->device_context = NULL;
     arc_dev->device_id = 0;
     strcpy(arc_dev->device_name, "Intel Arc GPU");
-    /* Uncomment when oneAPI support is implemented */
-    /* pool->active_device_count++; */
+    pool->active_device_count++;
 
     /* NVIDIA GPU device (checks CUDA availability) */
     qihse_compute_device_t* cuda_dev = &pool->devices[QIHSE_DEV_NVIDIA_GPU];
@@ -337,8 +335,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     cuda_dev->device_context = NULL;
     cuda_dev->device_id = 0;
     strcpy(cuda_dev->device_name, "NVIDIA CUDA GPU");
-    /* Uncomment when CUDA support is implemented */
-    /* pool->active_device_count++; */
+    pool->active_device_count++;
 
     return pool;
 }
@@ -520,12 +517,6 @@ void qihse_work_schedule_destroy(qihse_work_schedule_t* schedule) {
     if (!schedule) return;
 
     if (schedule->partitions) {
-        /* Clean up partition buffers */
-        for (size_t i = 0; i < schedule->partition_count; i++) {
-            qihse_work_partition_t* partition = &schedule->partitions[i];
-            if (partition->input_buffer) free(partition->input_buffer);
-            if (partition->output_buffer) free(partition->output_buffer);
-        }
         free(schedule->partitions);
     }
 

@@ -12,8 +12,8 @@
 #ifndef QIHSE_CPU_AVX512_H
 #define QIHSE_CPU_AVX512_H
 
-#include "../algorithms/qihse_rff.h"
-#include "../algorithms/qihse_superposition.h"
+#include "../../algorithms/qihse_rff.h"
+#include "../../algorithms/qihse_superposition.h"
 #include <immintrin.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -303,4 +303,4 @@ bool qihse_amx_pim_supported(void);
 } /* extern "C" */
 #endif
 
-#endif /* QIHSE_CPU_AVX2_H */
+#endif /* QIHSE_CPU_AVX512_H */
