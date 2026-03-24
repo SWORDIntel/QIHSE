@@ -32,44 +32,44 @@ void qihse_verification_config_init(
     if (!config) return;
 
     config->mode = mode;
-    config->confidence_threshold = 0.99; /* 99% default confidence for precision search */
-    config->max_retries = 5; /* More retries for precision requirements */
-    config->tolerance = 1e-6;
+    config->confidence_threshold = 0.95; /* Default confidence threshold */
+    config->max_retries = 3; 
+    config->tolerance = 1e-5; 
     config->enable_fallback = 1;
-    config->performance_budget = 0.2; /* Allow more time for precision verification */
-    config->window_size = 10;
-    config->adaptive_verification = 1; /* Enable adaptive verification for precision */
+    config->performance_budget = 0.3; 
+    config->window_size = 10; 
+    config->adaptive_verification = 1; 
 
-    /* Mode-specific adjustments - precision search requires 90%+ confidence */
+    /* Mode-specific adjustments - balanced for accuracy and reasonable speed */
     switch (mode) {
         case QIHSE_VERIFY_NONE:
             config->confidence_threshold = 0.0; /* No verification */
             config->max_retries = 0;
             break;
         case QIHSE_VERIFY_FAST:
-            config->confidence_threshold = 0.95; /* 95% for fast precision */
+            config->confidence_threshold = 0.85; /* 85% for fast */
             config->max_retries = 2;
             break;
         case QIHSE_VERIFY_WINDOW:
-            config->confidence_threshold = 0.97; /* 97% for window precision */
-            config->window_size = 25;
+            config->confidence_threshold = 0.90; /* 90% for window */
+            config->window_size = 15;
             break;
         case QIHSE_VERIFY_FALLBACK:
-            config->confidence_threshold = 0.98; /* 98% for fallback precision */
+            config->confidence_threshold = 0.95; /* 95% for fallback */
             config->enable_fallback = 1;
-            config->max_retries = 5;
+            config->max_retries = 3;
             break;
         case QIHSE_VERIFY_EXACT:
-            config->confidence_threshold = 0.99; /* 99% for exact precision */
-            config->tolerance = 1e-9;
-            config->max_retries = 10;
+            config->confidence_threshold = 0.98; /* 98% for exact */
+            config->tolerance = 1e-7;
+            config->max_retries = 5;
             break;
         case QIHSE_VERIFY_PRECISION:
             config->confidence_threshold = 0.99; /* 99% minimum for precision mode */
             config->max_retries = 8;
             config->enable_fallback = 1;
-            config->adaptive_verification = 1; /* Enable adaptive for precision */
-            config->performance_budget = 0.15; /* Allow more time for precision */
+            config->adaptive_verification = 1; 
+            config->performance_budget = 0.15; 
             config->window_size = 30;
             break;
     }
@@ -570,16 +570,15 @@ qihse_verification_mode_t qihse_adaptive_verifier_adapt(
     /* Adapt verification level based on precision requirements */
     /* For precision search: NEVER allow confidence below 90% */
     if (verifier->recent_confidence < 0.9) {
-        /* CRITICAL: Confidence below precision threshold - escalate immediately */
+        /* CRITICAL: Confidence below acceptable threshold - escalate */
         if (verifier->current_mode < QIHSE_VERIFY_PRECISION) {
             verifier->current_mode = QIHSE_VERIFY_PRECISION;
         } else if (verifier->current_mode < QIHSE_VERIFY_EXACT) {
             verifier->current_mode++;
         }
-    } else if (verifier->recent_confidence > verifier->target_confidence * 1.1 &&
+    } else if (verifier->recent_confidence > verifier->target_confidence * 1.05 &&
                verifier->recent_performance < verifier->performance_budget * 1e6) {
-        /* Confidence good and performance allows, decrease verification */
-        /* But never decrease below FAST mode for precision maintenance */
+        /* Confidence good and performance allows, decrease verification to speed up */
         if (verifier->current_mode > QIHSE_VERIFY_FAST) {
             verifier->current_mode--;
         }

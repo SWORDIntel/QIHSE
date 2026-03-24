@@ -38,27 +38,48 @@ static inline void qihse_avx2_process_chunk(
     size_t chunk_size,
     const qihse_rff_kernel_avx2_t* kernel
 ) {
-    /* QIHSE-NOT_STISLA Integration: Placeholder for chunked processing */
-    /* TODO: Implement full AVX2 chunked processing when needed */
-    (void)input;   /* Reserved for future implementation */
-    (void)output;  /* Reserved for future implementation */
-    (void)kernel;  /* Reserved for future implementation */
-    
     /* QIHSE-NOT_STISLA Integration: Ensure chunk processing respects SIMD boundaries */
-    if (chunk_size % QIHSE_AVX2_CHUNK_SIZE != 0) {
-        chunk_size = (chunk_size / QIHSE_AVX2_CHUNK_SIZE) * QIHSE_AVX2_CHUNK_SIZE;
+    size_t valid_chunk_size = (chunk_size / QIHSE_AVX2_CHUNK_SIZE) * QIHSE_AVX2_CHUNK_SIZE;
+    
+    /* Allocate temporary float buffers for AVX2 processing */
+    float* input_f = malloc(kernel->input_dims * sizeof(float));
+    float* output_f = malloc(kernel->output_dims * sizeof(float));
+    
+    if (!input_f || !output_f) {
+        free(input_f);
+        free(output_f);
+        return;
     }
 
     /* Process in SIMD-friendly chunks */
-    for (size_t i = 0; i < chunk_size; i += QIHSE_AVX2_CHUNK_SIZE) {
-        /* AVX2-optimized chunk processing */
-        /* This integrates NOT_STISLA's chunked approach with QIHSE's existing SIMD */
-        for (size_t j = 0; j < QIHSE_AVX2_CHUNK_SIZE && (i + j) < chunk_size; j++) {
-            /* Process individual elements within chunk */
-            (void)(i + j);  /* Reserved for future implementation */
-            /* Existing QIHSE AVX2 processing logic */
+    for (size_t i = 0; i < valid_chunk_size; i++) {
+        /* Convert input to float */
+        for (size_t d = 0; d < kernel->input_dims; d++) {
+            input_f[d] = (float)input[i * kernel->input_dims + d];
+        }
+        
+        /* Apply AVX2 projection */
+        qihse_rff_avx2_project(kernel, input_f, output_f);
+        
+        /* Convert output back to double */
+        for (size_t d = 0; d < kernel->output_dims; d++) {
+            output[i * kernel->output_dims + d] = (double)output_f[d];
         }
     }
+    
+    /* Process remainder */
+    for (size_t i = valid_chunk_size; i < chunk_size; i++) {
+        for (size_t d = 0; d < kernel->input_dims; d++) {
+            input_f[d] = (float)input[i * kernel->input_dims + d];
+        }
+        qihse_rff_avx2_project(kernel, input_f, output_f);
+        for (size_t d = 0; d < kernel->output_dims; d++) {
+            output[i * kernel->output_dims + d] = (double)output_f[d];
+        }
+    }
+    
+    free(input_f);
+    free(output_f);
 }
 
 /* ============================================================================
