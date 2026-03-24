@@ -45,7 +45,7 @@ extern "C" {
 #define QUANTUM_HILBERT_DIMENSIONS 8        /* Higher-dimensional Hilbert space */
 #define QUANTUM_SUPERPOSITION_STATES 256    /* Parallel quantum state exploration */
 #define QUANTUM_AMPLIFICATION_ROUNDS 3      /* Grover-inspired amplitude amplification */
-#define QUANTUM_CONFIDENCE_THRESHOLD 0.85   /* Minimum confidence for quantum results */
+#define QUANTUM_CONFIDENCE_THRESHOLD 0.85   /* Adjustable: Minimum confidence for quantum results */
 #define QUANTUM_SEARCH_THRESHOLD 1024       /* Minimum array size for quantum search */
 
 /* ============================================================================
