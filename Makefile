@@ -17,6 +17,7 @@ SRCS=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c qihse
      algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
      backends/cpu/qihse_cpu_detect.c backends/cpu/qihse_cpu_avx2.c backends/cpu/qihse_cpu_avx512.c \
      backends/npu/qihse_npu_openvino.c \
+     backends/gpu/cuda/qihse_cuda_backend.c \
      memory/src/qihse_memory.c memory/src/qihse_hma.c memory/src/qihse_uma.c \
      ../not_stisla/src/not_stisla.c
 
