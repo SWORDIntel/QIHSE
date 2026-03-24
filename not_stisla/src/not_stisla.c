@@ -1694,9 +1694,16 @@ static void not_stisla_learn_anchor(not_stisla_anchor_table_t* table, int64_t va
 
 /* Enhanced chunked search with runtime SIMD detection (QIHSE-inspired) */
 static inline size_t not_stisla_chunked_search(const int64_t* arr, size_t n, int64_t key) {
-    /* For very small arrays, simple loop */
+    /* For very small arrays, simple loop with minimal unrolling for speed */
     if (n <= NOT_STISLA_CHUNK_SIZE) {
-        for (size_t i = 0; i < n; ++i) {
+        size_t i = 0;
+        for (; i + 3 < n; i += 4) {
+            if (arr[i] == key) return i;
+            if (arr[i+1] == key) return i+1;
+            if (arr[i+2] == key) return i+2;
+            if (arr[i+3] == key) return i+3;
+        }
+        for (; i < n; ++i) {
             if (arr[i] == key) return i;
         }
         return NOT_STISLA_NOT_FOUND;
@@ -1851,8 +1858,13 @@ static inline size_t not_stisla_anchor_lower(const not_stisla_anchor_table_t* ta
 static inline int64_t not_stisla_interpolate(int64_t l_val, int64_t r_val, size_t l_idx, size_t r_idx, int64_t key) {
     const size_t span = r_idx - l_idx;
 
-    if (r_val == l_val) {
+    if (r_val == l_val || span == 0) {
         return (int64_t)l_idx;
+    }
+
+    /* Fast path for small spans to avoid 128-bit division overhead */
+    if (span <= 128) {
+        return (int64_t)(l_idx + (span >> 1));
     }
 
     /* Use 128-bit arithmetic to prevent overflow */

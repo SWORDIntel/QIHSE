@@ -154,6 +154,7 @@ int qihse_adaptive_amplify(
     int max_rounds = config->max_rounds > 0 ? config->max_rounds :
                      (config->adaptive_rounds ? config->fixed_rounds : 10);
 
+
     for (int round = 0; round < max_rounds; round++) {
         qihse_apply_oracle(superposition, query, query_type, config->oracle_selectivity);
         qihse_apply_diffusion(superposition);
@@ -231,6 +232,11 @@ not_stisla_result_t qihse_verify_result(
     const qihse_verify_config_t* config
 ) {
     if (!data || !query || !collapse || !config) return NOT_STISLA_NOT_FOUND;
+
+    /* Optimistic early exit for extremely high confidence */
+    if (collapse->confidence > 0.95 && collapse->predicted_index < n) {
+        return collapse->predicted_index;
+    }
 
     if (config->mode == QIHSE_VERIFY_NONE ||
         (config->mode == QIHSE_VERIFY_FAST && collapse->confidence >= config->min_confidence)) {
