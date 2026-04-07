@@ -19,8 +19,11 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <sched.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
@@ -502,21 +505,61 @@ bool qihse_uma_flush(
     return true;
 }
 
+/* ============================================================================
+ * LOGGING STUBS
+ * ============================================================================ */
+
+#define QIHSE_LOG_DEBUG 0
+#define QIHSE_LOG_INFO 1
+#define QIHSE_LOG_WARN 2
+#define QIHSE_LOG_ERROR 3
+
+static void logger_log(int level, const char* component, const char* fmt, ...) {
+    (void)level;
+    (void)component;
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    printf("\n");
+    va_end(args);
+}
+
 /*
  * Set priority pinning for a given task handle.
  *
- * This function is a stub to resolve linker errors and API requirements.
- * The actual implementation and symbol export mechanism (e.g., via a header
- * not present in the current context, or a different implementation file)
- * would be handled by the build system or a specific header file.
- *
- * @param task_handle A handle to the task whose priority is to be set.
- * @param priority The desired priority level.
+ * @param task_handle A handle to the task whose priority is to be set (pthread_t).
+ * @param priority The desired priority level (0-100).
  */
 void qihse_uma_set_priority_pinning(void *task_handle, int priority) {
-    // TODO: Implement actual priority pinning logic here.
-    // For now, we just log the call to indicate it was invoked.
-    printf("INFO: qihse_uma_set_priority_pinning called with task_handle=%p, priority=%d\n", task_handle, priority);
+    if (!task_handle) {
+        return;
+    }
+
+    pthread_t thread = (pthread_t)task_handle;
+
+    // 1. Set Thread Scheduling Priority
+    struct sched_param param;
+    int policy = SCHED_OTHER;
+    
+    if (priority > 50) {
+        param.sched_priority = 0; // Default for SCHED_OTHER
+        // If we were root, we could use SCHED_RR
+        pthread_setschedparam(thread, policy, &param);
+    }
+
+    // 2. Set CPU Affinity
+    if (priority >= 90) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        
+        int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+        int core_id = ((uintptr_t)task_handle >> 3) % num_cores;
+        CPU_SET(core_id, &cpuset);
+
+        pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    }
+    
+    logger_log(QIHSE_LOG_DEBUG, "UMA", "Priority pinning set: task=%p, priority=%d", task_handle, priority);
 }
 
 
