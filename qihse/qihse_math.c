@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+/* #define _GNU_SOURCE */
 #include "qihse_math.h"
 #include "qihse_instr.h"
 #include <stdlib.h>
@@ -332,7 +332,59 @@ int qihse_fortran_gemm(const double* a, const double* b, double* c,
 
 int qihse_fortran_eigenvalues(const double* matrix, double* eigenvalues,
                              double* eigenvectors, size_t n) {
-    if (!g_fortran_initialized || !QIHSE_FORTRAN_AVAILABLE) return -ENOTSUP;
+    if (!g_fortran_initialized || !QIHSE_FORTRAN_AVAILABLE) {
+        /* Fallback: Power Iteration for dominant eigenvalue */
+        if (!matrix || !eigenvalues || !eigenvectors || n == 0) return -EINVAL;
+        
+        /* Initialize eigenvector guess */
+        for (size_t i = 0; i < n; i++) {
+            eigenvectors[i] = 1.0 / sqrt((double)n);
+        }
+        
+        double prev_lambda = 0.0;
+        double lambda = 0.0;
+        double* temp = (double*)malloc(n * sizeof(double));
+        
+        if (!temp) return -ENOMEM;
+        
+        for (int iter = 0; iter < 1000; iter++) {
+            /* temp = matrix * eigenvectors */
+            for (size_t i = 0; i < n; i++) {
+                temp[i] = 0.0;
+                for (size_t j = 0; j < n; j++) {
+                    temp[i] += matrix[i * n + j] * eigenvectors[j];
+                }
+            }
+            
+            /* lambda = eigenvectors^T * temp */
+            lambda = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                lambda += eigenvectors[i] * temp[i];
+            }
+            
+            /* Normalize new eigenvector */
+            double norm = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                norm += temp[i] * temp[i];
+            }
+            norm = sqrt(norm);
+            
+            if (norm > 0.0) {
+                for (size_t i = 0; i < n; i++) {
+                    eigenvectors[i] = temp[i] / norm;
+                }
+            }
+            
+            if (fabs(lambda - prev_lambda) < 1e-9) break;
+            prev_lambda = lambda;
+        }
+        
+        eigenvalues[0] = lambda;
+        for (size_t i = 1; i < n; i++) eigenvalues[i] = 0.0; /* Only dominant calculated in fallback */
+        
+        free(temp);
+        return 0;
+    }
 
 #ifdef QIHSE_ENABLE_FORTRAN
     uint64_t start_time = ns_now();
@@ -342,13 +394,7 @@ int qihse_fortran_eigenvalues(const double* matrix, double* eigenvalues,
     g_fortran_perf.eigenvalue_time = (double)(end_time - start_time) / 1e9;
     return 0;
 #else
-    if (eigenvalues && n > 0) {
-        eigenvalues[0] = 1.0;
-        for (size_t i = 1; i < n && i < 10; i++) {
-            eigenvalues[i] = eigenvalues[i-1] * 0.9;
-        }
-    }
-    return 0;
+    return -ENOTSUP; /* Should not reach here due to the if check above */
 #endif
 }
 

@@ -10,7 +10,7 @@
  * - DSMIL workload optimizations
  */
 
-#define _GNU_SOURCE  /* For M_PI, clock_gettime, CLOCK_MONOTONIC */
+/* #define _GNU_SOURCE  For M_PI, clock_gettime, CLOCK_MONOTONIC */
 #define _POSIX_C_SOURCE 200809L  /* For POSIX time functions */
 
 #include "../include/not_stisla.h"
@@ -2158,7 +2158,9 @@ int not_stisla_anchor_table_set_memory_limit(not_stisla_anchor_table_t* table, s
     return 0;
 }
 
-static not_stisla_anchor_table_t* not_stisla_anchor_table_clone(const not_stisla_anchor_table_t* table) {
+#if 0
+static not_stisla_anchor_table_t* __attribute__((unused)) not_stisla_anchor_table_clone(const not_stisla_anchor_table_t* table) {
+
     if (!table) {
         return NULL;
     }
@@ -2186,6 +2188,7 @@ static not_stisla_anchor_table_t* not_stisla_anchor_table_clone(const not_stisla
 
     return clone;
 }
+#endif
 
 int not_stisla_anchor_table_optimize_for_workload(not_stisla_anchor_table_t* table, int workload_type) {
     if (!table) return -1;
