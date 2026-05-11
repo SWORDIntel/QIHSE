@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+/* #define _GNU_SOURCE handled by Makefile */
 #include "qihse_search.h"
 #include "qihse_instr.h"
 #include <stdlib.h>
@@ -111,6 +111,8 @@ void qihse_apply_oracle(
     qihse_data_type_t type,
     double selectivity
 ) {
+    (void)query;
+    (void)type;
     for (size_t state = 0; state < superposition->num_states; state++) {
         double total_amplitude = 0.0;
         for (size_t dim = 0; dim < superposition->dims_per_state; dim++) {
@@ -274,6 +276,7 @@ not_stisla_result_t qihse_verify_result(
  * ============================================================================ */
 
 static int qihse_detect_workload_type_advanced(const void* data, size_t n, qihse_data_type_t data_type) {
+    (void)data_type;
     if (!data || n < 10) return 0;
     const int64_t* int_data = (const int64_t*)data;
     double mean_gap = 0.0;
@@ -313,6 +316,7 @@ int qihse_detect_workload_from_data(const void* data, size_t n, qihse_data_type_
  * ============================================================================ */
 
 size_t qihse_init_multires_search(qihse_resolution_config_t* configs, size_t max_configs, qihse_data_type_t data_type, size_t array_size) {
+    (void)data_type;
     if (!configs || max_configs == 0) return 0;
     size_t num = 0;
     if (num < max_configs) {
@@ -543,6 +547,7 @@ qihse_algorithm_selection_t qihse_select_algorithm(
     size_t array_size,
     int detected_workload
 ) {
+    (void)data_sig;
     qihse_algorithm_selection_t selection = QIHSE_ALGO_QUANTUM_ONLY;
     if (opt_entry && opt_entry->use_anchor_search && opt_entry->samples >= 3) {
         if (array_size > 10000 && opt_entry->anchor_speedup > 1.2) selection = QIHSE_ALGO_ANCHOR_ONLY;

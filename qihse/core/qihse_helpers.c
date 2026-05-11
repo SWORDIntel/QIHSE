@@ -36,8 +36,8 @@ int qihse_compute_optimal_dimensions(
 
 int qihse_config_init(
     qihse_config_t* config,
-    qihse_data_type_t data_type,
-    size_t array_size
+    qihse_data_type_t data_type __attribute__((unused)),
+    size_t array_size __attribute__((unused))
 ) {
     if (!config) return -EINVAL;
 
@@ -71,8 +71,8 @@ int qihse_config_init(
 size_t qihse_init_parallel_pipelines(
     qihse_pipeline_config_t* configs,
     size_t max_configs,
-    qihse_data_type_t data_type,
-    size_t array_size
+    qihse_data_type_t data_type __attribute__((unused)),
+    size_t array_size __attribute__((unused))
 ) {
     if (!configs || max_configs == 0) return 0;
     
