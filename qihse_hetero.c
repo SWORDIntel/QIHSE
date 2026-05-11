@@ -81,7 +81,7 @@ static int qihse_get_cpu_cores(void) {
  * DEVICE CALIBRATION MICRO-BENCHMARKS
  * ============================================================================ */
 
-static double qihse_benchmark_device_fp32(size_t batch_size, size_t dims) {
+static double qihse_benchmark_device_fp32(size_t batch_size, size_t dims __attribute__((unused))) {
     /* Benchmark FP32 matrix-vector multiply (simulating amplitude computation) */
     const size_t iterations = 1000;
     float* matrix = NULL;
@@ -134,7 +134,7 @@ static double qihse_benchmark_device_fp32(size_t batch_size, size_t dims) {
     return operations / elapsed / 1e12; /* TOPS */
 }
 
-static double qihse_benchmark_device_int8(size_t batch_size, size_t dims) {
+static double qihse_benchmark_device_int8(size_t batch_size, size_t dims __attribute__((unused))) {
     /* Benchmark INT8 dot products (simulating VNNI operations) */
     const size_t iterations = 1000;
     int8_t* matrix = NULL;
@@ -434,7 +434,7 @@ const char* qihse_device_capability_string(const qihse_compute_device_t* device)
 qihse_work_schedule_t* qihse_create_work_schedule(
     const qihse_compute_pool_t* pool,
     size_t total_candidates,
-    size_t dims
+    size_t dims __attribute__((unused))
 ) {
     if (!pool || total_candidates == 0) return NULL;
 
@@ -542,7 +542,7 @@ void qihse_rebalance_schedule(
 qihse_unified_buffer_t* qihse_alloc_unified(
     size_t size,
     qihse_device_type_t primary_device,
-    bool allow_peer_access
+    bool allow_peer_access __attribute__((unused))
 ) {
     qihse_unified_buffer_t* buffer = calloc(1, sizeof(qihse_unified_buffer_t));
     if (!buffer) return NULL;

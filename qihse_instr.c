@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+/* #define _GNU_SOURCE */
 #include "qihse_instr.h"
 #include <stdlib.h>
 #include <string.h>
@@ -203,20 +203,40 @@ int qihse_intel_hw_hash(const void* data, size_t size, void* hash, int hash_type
         return -ENOTSUP;
     }
 
-    /* Simplified SHA implementation */
+    /* Switch behavior based on hash_type parameter */
     uint32_t* output = (uint32_t*)hash;
     const uint8_t* input = (const uint8_t*)data;
+    uint32_t h = 0;
 
-    /* Simple hash for demonstration */
-    uint32_t h = 0x9e3779b9;
-    for (size_t i = 0; i < size; i++) {
-        h ^= input[i];
-        h = (h << 13) | (h >> 19);
-        h += 0x9e3779b9;
+    switch (hash_type) {
+        case 1: /* Simplified SHA-1 like */
+            h = 0x67452301;
+            for (size_t i = 0; i < size; i++) {
+                h ^= input[i];
+                h = (h << 5) | (h >> 27);
+                h += 0x9e3779b9;
+            }
+            break;
+        case 256: /* Simplified SHA-256 like */
+            h = 0x6a09e667;
+            for (size_t i = 0; i < size; i++) {
+                h ^= input[i];
+                h = (h << 13) | (h >> 19);
+                h += 0xbb67ae85;
+            }
+            break;
+        default: /* Default basic hash */
+            h = 0x9e3779b9;
+            for (size_t i = 0; i < size; i++) {
+                h ^= input[i];
+                h = (h << 13) | (h >> 19);
+                h += 0x9e3779b9;
+            }
+            break;
     }
 
     for (int i = 0; i < 8; i++) {
-        output[i] = h;
+        output[i] = h ^ (i * 0x01010101);
         h = (h << 7) | (h >> 25);
     }
 
@@ -233,7 +253,20 @@ void qihse_intel_prefetch(const void* addr, size_t size, int locality) {
     size_t step = g_hw_info.cache_line_size;
 
     for (size_t i = 0; i < size; i += step) {
-        __builtin_prefetch(ptr + i, 0, 3);  /* High temporal locality */
+        switch (locality) {
+            case 1: /* Low temporal locality */
+                __builtin_prefetch(ptr + i, 0, 0);
+                break;
+            case 2: /* Moderate temporal locality */
+                __builtin_prefetch(ptr + i, 0, 1);
+                break;
+            case 3: /* High temporal locality */
+                __builtin_prefetch(ptr + i, 0, 2);
+                break;
+            default: /* Highest temporal locality */
+                __builtin_prefetch(ptr + i, 0, 3);
+                break;
+        }
     }
 
     g_hw_perf.prefetch_requests += size / step;

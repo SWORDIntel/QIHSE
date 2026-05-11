@@ -560,7 +560,7 @@ bool qihse_vector_db_preload_similar(
     qihse_vector_db_t vdb,
     const float* query_vector,
     size_t vector_dims,
-    float preload_radius
+    float preload_radius __attribute__((unused))
 ) {
     if (!vdb || !query_vector || vector_dims == 0) {
         return false;

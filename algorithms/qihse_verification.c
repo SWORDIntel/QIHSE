@@ -430,7 +430,7 @@ static int qihse_verify_result_advanced_internal(
     if (verification_result->confidence < config->confidence_threshold) {
         verification_result->is_valid = 0;  /* REJECT - confidence too low */
         const char* error_msg = "Confidence below precision threshold";
-        verification_result->error_message = malloc(strlen(error_msg) + 1);
+        verification_result->error_message = calloc(1, strlen(error_msg) + 1);
         if (verification_result->error_message) {
             strcpy(verification_result->error_message, error_msg);
         }
@@ -462,7 +462,7 @@ int qihse_verify_result_advanced(
         verification_result->is_valid = 0;
         verification_result->confidence = 0.0;
         const char* error_msg = "QIHSE_VERIFY_NONE not allowed for precision search";
-        verification_result->error_message = malloc(strlen(error_msg) + 1);
+        verification_result->error_message = calloc(1, strlen(error_msg) + 1);
         if (verification_result->error_message) {
             strcpy(verification_result->error_message, error_msg);
         }
@@ -496,7 +496,7 @@ int qihse_verify_batch(
             verification_results[i].is_valid = 0;
             verification_results[i].confidence = 0.0;
             const char* error_msg = "QIHSE_VERIFY_NONE not allowed for precision search";
-            verification_results[i].error_message = malloc(strlen(error_msg) + 1);
+            verification_results[i].error_message = calloc(1, strlen(error_msg) + 1);
             if (verification_results[i].error_message) {
                 strcpy(verification_results[i].error_message, error_msg);
             }
@@ -770,7 +770,7 @@ char* qihse_export_verification_metrics_json(void) {
         "\"min_time_us\": %zu"
         "}";
 
-    char* json = malloc(512);
+    char* json = calloc(1, 512);
     if (!json) return NULL;
 
         snprintf(json, 512, json_template,
@@ -930,8 +930,8 @@ double qihse_rff_similarity(
     double* gt_rff = calloc(rff_kernel->output_dims, sizeof(double));
 
     /* Convert float to double for RFF projection */
-    double* result_double = malloc(data_size * sizeof(double));
-    double* gt_double = malloc(data_size * sizeof(double));
+    double* result_double = calloc(1, data_size * sizeof(double));
+    double* gt_double = calloc(1, data_size * sizeof(double));
     for (size_t i = 0; i < data_size; i++) {
         result_double[i] = (double)result[i];
         gt_double[i] = (double)ground_truth[i];
@@ -967,7 +967,8 @@ double qihse_superposition_fidelity_similarity(
 ) {
     /* Create superposition from result */
     qihse_superposition_t result_super;
-    double* result_double = malloc(data_size * sizeof(double));
+    double* result_double = calloc(1, data_size * sizeof(double));
+    if (!result_double) return 0.0;
     for (size_t i = 0; i < data_size; i++) {
         result_double[i] = (double)result[i];
     }
@@ -975,7 +976,11 @@ double qihse_superposition_fidelity_similarity(
 
     /* Create superposition from ground truth */
     qihse_superposition_t gt_super;
-    double* gt_double = malloc(data_size * sizeof(double));
+    double* gt_double = calloc(1, data_size * sizeof(double));
+    if (!gt_double) {
+        free(result_double);
+        return 0.0;
+    }
     for (size_t i = 0; i < data_size; i++) {
         gt_double[i] = (double)ground_truth[i];
     }
@@ -1039,14 +1044,20 @@ double qihse_grover_amplified_similarity(
 ) {
     /* Create superposition from result */
     qihse_superposition_t superposition;
-    double* result_double = malloc(data_size * sizeof(double));
+    double* result_double = calloc(1, data_size * sizeof(double));
+    if (!result_double) return 0.0;
     for (size_t i = 0; i < data_size; i++) {
         result_double[i] = (double)result[i];
     }
     qihse_create_superposition(result_double, data_size, data_size, &superposition);
 
     /* Identify target states (elements matching ground truth within threshold) */
-    size_t* target_indices = malloc(data_size * sizeof(size_t));
+    size_t* target_indices = calloc(1, data_size * sizeof(size_t));
+    if (!target_indices) {
+        free(result_double);
+        qihse_destroy_superposition(&superposition);
+        return 0.0;
+    }
     size_t num_targets = 0;
     for (size_t i = 0; i < data_size; i++) {
         double diff = fabs((double)result[i] - (double)ground_truth[i]);
