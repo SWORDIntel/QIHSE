@@ -453,7 +453,7 @@ static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb) {
     if (!vdb) {
         return;
     }
-    qihse_vdb_set_trinary_stale(vdb);
+    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
 }
 
 static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb) {
@@ -2182,6 +2182,11 @@ int qihse_vector_db_search(
     size_t i;
     size_t out_count = 0u;
 
+    if (query && query->use_trinary_candidates) {
+        return qihse_vector_db_search_trinary_candidates(vdb, query,
+                                                         query->candidate_count,
+                                                         results, max_results);
+    }
     if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
         query->vector_dims != vdb->vector_dims) {
         errno = EINVAL;
@@ -2205,6 +2210,9 @@ int qihse_vector_db_search(
         }
         score = qihse_vdb_cosine_similarity(query->query_vector, vector, vdb->vector_dims);
         if (score < query->similarity_threshold) {
+            continue;
+        }
+        if (out_count >= max_results && score <= results[max_results - 1u].score) {
             continue;
         }
         insert_at = out_count < max_results ? out_count : max_results - 1u;
@@ -2269,6 +2277,9 @@ static bool qihse_vdb_insert_exact_result(qihse_vector_db_t vdb,
     size_t insert_at;
     qihse_vector_result_t result;
 
+    if (*out_count >= result_limit && score <= results[result_limit - 1u].score) {
+        return true;
+    }
     insert_at = *out_count < result_limit ? *out_count : result_limit - 1u;
     while (insert_at > 0u && results[insert_at - 1u].score < score) {
         if (insert_at < result_limit) {

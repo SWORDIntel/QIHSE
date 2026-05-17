@@ -12,6 +12,8 @@
 #ifndef QIHSE_VECTOR_DB_H
 #define QIHSE_VECTOR_DB_H
 
+#define QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API 1
+
 #include "memory/include/qihse_uma.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -126,6 +128,8 @@ typedef struct qihse_vector_query_s {
     float similarity_threshold;     /* Minimum similarity threshold */
     bool include_vectors;           /* Include vector data in results */
     bool include_metadata;          /* Include metadata in results */
+    bool use_trinary_candidates;    /* Explicit opt-in trinary candidate path */
+    size_t candidate_count;         /* Trinary candidate count before rerank */
 } qihse_vector_query_t;
 
 /**
