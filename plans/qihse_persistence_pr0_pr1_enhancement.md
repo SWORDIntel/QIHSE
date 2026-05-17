@@ -1,10 +1,10 @@
-# QIHSE Persistence Enhancement Plan: PR-0 and PR-1
+# QIHSE Persistence Enhancement Plan: PR-0 through PR-2 Checkpoint
 
 ## Purpose
 
-This enhancement narrows `plans/qihse_persistence_layer.md` into the next implementable landing slice.
+This enhancement records the landed native persistence slice and the reboot-safe continuation path from it.
 
-The existing plan is directionally correct, but it now contains several future tracks: durable persistence, WAL recovery, mmap, trinary codec execution, Python bindings, and `not_stisla` integration. This plan isolates the work that should land first. After review, WAL replay, read-only mmap, and a derived trinary sidecar fit the native file-backed layout and should not be deferred completely.
+The existing plan is directionally correct, but it now contains several future tracks: durable persistence, WAL recovery, mmap, trinary codec execution, Python bindings, and native anchor-search integration. PR-0/PR-1 are complete. PR-2 has also landed the next WAL step: ADD/COMMIT records, previous-record offsets, and writable torn-tail truncation.
 
 Target outcome:
 
@@ -14,7 +14,7 @@ Target outcome:
 - QIHSE is treated as its own standalone native program, not as a Framewerx feature, plugin, ingestion helper, or downstream application component.
 - `not_stisla` is integrated only where it fits: scalar ID lookup over sorted keys.
 - The on-disk layout owns `vectors.qtri` now as a rebuildable tryte sidecar derived from authoritative float32 vectors.
-- WAL replay and read-only mmap reopen are part of the native persistence slice; Python storage remains out of scope.
+- WAL replay, read-only mmap reopen, ADD/COMMIT WAL records, previous-record offsets, and writable torn-tail truncation are part of the native persistence slice; Python storage remains out of scope.
 
 ## Resume Checkpoint
 
@@ -26,12 +26,13 @@ Current implementation state:
 
 - PR-0 anchor-search integration is implemented.
 - PR-1 native file-backed vector DB persistence is implemented.
+- PR-2 WAL/recovery hardening is implemented for ADD/COMMIT records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
 - `qihse/qihse_vector_db.c` was restored after a disk-full truncation and now contains the native persistence implementation.
 - `qihse_vector_db_create(..., db_path)` opens a file-backed native database.
 - `qihse_vector_db_open()` supports ephemeral, file-copy, read-only, and read-only mmap modes.
 - `qihse_vector_db_add_vectors()` appends a WAL ADD record and explicit COMMIT record before accepting file-backed writes.
 - `qihse_vector_db_flush()`, `checkpoint()`, and `compact()` rewrite the snapshot, regenerate `idmap.qid`, generate `vectors.qtri`, and clear `wal.qwal`.
-- Open replays valid WAL records newer than the committed snapshot generation.
+- Open replays valid committed WAL batches newer than the committed snapshot generation.
 - Writable open truncates torn or uncommitted WAL tails back to the last committed WAL boundary.
 - `vectors.qvec` remains authoritative; `vectors.qtri` is a derived tryte sidecar for the trinary path.
 - Missing or corrupt `vectors.qtri` does not block `FLOAT32` database open/search.
@@ -525,10 +526,31 @@ PR-1 is complete when:
 
 ## Follow-On Phases
 
-After PR-1:
+After PR-2:
 
-- PR-2: continue hardening WAL with broader malformed-tail/fuzz tests and optional backward-walk recovery. ADD/COMMIT records, previous-record offsets, and writable torn-tail truncation are implemented.
 - PR-3: extend mmap beyond read-only `vectors.qvec` into index, metadata, and ID map mapping where the access pattern warrants it.
 - PR-4: implement real row compaction, tombstones, delete/update semantics, and batch external-ID APIs.
-- PR-5: execute the trinary sidecar path: codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
+- PR-5: execute the trinary sidecar path: codec module, codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
 - PR-6: optional persisted anchor hints and optimizer statistics as rebuildable sidecars.
+
+## 3-Agent Continuation Split
+
+Use this split when resuming the remaining plan with multiple agents. QIHSE remains its own native program; none of these tasks should introduce Framewerx-specific persistence behavior.
+
+Agent 1: PR-3 mmap extension.
+
+- Map `index.qidx`, `metadata.qmeta`, and `idmap.qid` where that improves open/search/hydration behavior.
+- Keep writable mmap separate from read-only mapping until mutation and recovery semantics are explicit.
+- Preserve the current file-copy path as the compatibility fallback.
+
+Agent 2: PR-5 trinary codec module.
+
+- Move trinary sidecar logic behind a native codec module boundary.
+- Implement portable scalar tryte encode/query/scoring first, then add candidate-generation and exact-rerank benchmarks.
+- Keep `vectors.qvec` authoritative until pure trinary storage has recall, recovery, and migration tests.
+
+Agent 3: PR-4/PR-5/PR-6 remaining database work.
+
+- Add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
+- Add persisted anchor hints only as rebuildable sidecars after ID-map correctness and mmap behavior are stable.
+- Add optimizer statistics as explicit-format sidecars if they are needed; do not reuse native struct dumps.

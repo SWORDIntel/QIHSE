@@ -1,10 +1,51 @@
 # QIHSE Native File-Backed Persistence Plan
 
+## 0. Current Checkpoint and Reboot Resume
+
+Last updated: 2026-05-17.
+
+QIHSE is being developed here as its own standalone native program. Framewerx, RAG, ingestion scripts, and external applications are clients at most; they do not define the QIHSE persistence contract.
+
+Current landed state:
+
+- PR-0 is complete: NOT_STISLA-derived anchor-search usefulness is integrated as native QIHSE algorithm code under `qihse/algorithms/`; the independent top-level subsystem should not be restored.
+- PR-1 is complete: `db_path` creates a native file-backed vector database with durable snapshot files, row-index-correct hydration, `idmap.qid`, derived `vectors.qtri`, diagnostics, read-only reopen, and read-only mmap of clean vector snapshots.
+- PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
+
+Resume commands:
+
+```bash
+cd /home/john/FRAMEWERX/SWORDIntel_QIHSE
+git status --short
+cd qihse
+make test-persist
+rm -f tests/qihse_vector_db_persistence_test
+```
+
+Expected result:
+
+```text
+PASS all qihse vector DB persistence tests
+```
+
+Post-PR-2 continuation:
+
+- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior.
+- PR-4: add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
+- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
+- PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
+
+Recommended 3-agent split:
+
+- Agent 1 owns PR-3 mmap extension.
+- Agent 2 owns PR-5 trinary codec module and benchmarks.
+- Agent 3 owns PR-4 plus the remaining PR-5/PR-6 database sidecar and compaction work.
+
 ## 1. Background
 
-QIHSE should be treated as a standalone native database engine, not as an in-memory helper for a downstream application. The current vector DB implementation accepts `db_path` in `qihse_vector_db_create`, stores that path, and then keeps all vector and metadata state in process memory. That makes QIHSE fast for demos, but it is not yet a durable database: process exit, crash, or restart loses the index.
+QIHSE should be treated as a standalone native database engine, not as an in-memory helper for a downstream application. This plan started because the original vector DB implementation accepted `db_path` in `qihse_vector_db_create` but kept vector and metadata state in process memory. PR-1 corrected that oversight with native file-backed persistence.
 
-The persistence layer should therefore be native C and file-backed by design. `db_path` should become an actual on-disk database, with memory mapping and explicit commit semantics, rather than a path used only by an export/import snapshot utility.
+The persistence layer is therefore native C and file-backed by design. `db_path` is an actual on-disk database, with ongoing work focused on broader memory mapping, explicit mutation semantics, codec execution, and sidecar hardening.
 
 ## 2. Design Goals
 
@@ -655,24 +696,30 @@ If this repository's current CMake setup does not register tests with CTest, add
 - Python bindings use the native file-backed database.
 - Corrupt or partial files fail cleanly without undefined behavior.
 - Existing in-memory users are not forced to use disk persistence.
-- The design supports future `mmap` search without changing the public persistence contract.
+- The design supports broader `mmap` search without changing the public persistence contract.
 - The implementation has an explicit recovery story for every persistent file.
 - The on-disk format is versioned and suitable for compatibility fixtures in future releases.
 - Experimental encodings can be added without weakening the durability contract.
 - Trinary mode remains optional until benchmarks prove it is both fast and accurate enough for target workloads.
-- 
-- Continuation: actionable persistence plan
 
-The next plan revision should stop treating persistence as a giant “future database engine” project and land it in three real PRs:
+## 22. Post-PR-2 Continuation Plan
 
-PR-1: durable db_path with snapshot-style file-backed copy mode.
-PR-2: WAL/recovery.
-PR-3: mmap/zero-copy search.
+The plan no longer starts from an in-memory-only database. PR-0, PR-1, and PR-2 are implemented. Continue from the native QIHSE persistence layer that already has durable `db_path`, snapshot files, `idmap.qid`, derived `vectors.qtri`, read-only mmap for clean vector snapshots, ADD/COMMIT WAL records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
 
-Do not start with WAL, mmap, trinary, Python wrappers, or external DB-style abstractions. The repo currently has qihse_vector_db_create(), add_vectors(), search(), and related acceleration functions, but no native open/flush/checkpoint/close API. The current implementation copies db_path but still stores vectors/metadata in process memory. The attached plan correctly identifies native file-backed persistence as the target.
+The remaining work should be split into focused native QIHSE PRs:
 
-PR-1: make db_path actually durable
-Objective
+- PR-3: mmap/zero-copy extension for index, metadata, and ID-map files.
+- PR-4: tombstones, delete/update, batch external-ID APIs, and compaction.
+- PR-5: native trinary codec module, scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
+- PR-6: persisted anchor hints and optimizer statistics as rebuildable sidecars.
+
+Use a 3-agent split:
+
+- Agent 1: PR-3 mmap extension.
+- Agent 2: PR-5 trinary codec module and benchmarks.
+- Agent 3: remaining PR-4/PR-5/PR-6 database semantics, compaction, and sidecars.
+
+Historical PR-1 objective: make `db_path` actually durable.
 
 Make this work:
 
@@ -694,7 +741,7 @@ qihse_vector_db_t db2 = qihse_vector_db_create(
 
 qihse_vector_db_search(db2, &query, results, max_results);
 
-No export step. No Python storage. No .npz. No JSON. No WAL yet.
+No export step. No Python storage. No `.npz`. No JSON. WAL is now part of native QIHSE recovery and should be kept in the C persistence layer.
 
 1. Add persistence as storage mode, not backend
 
@@ -893,23 +940,21 @@ SRCS_BASE=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c 
 
 Do not hide missing persistence symbols inside qihse_exports.c. That file currently provides stub/missing symbols for wrapper expectations, not real database logic.
 
-5. PR-1 disk layout
+5. Landed PR-1/PR-2 disk layout
 
-Use the directory layout, but remove WAL and trinary from PR-1:
+The implemented layout includes authoritative float32 vectors, metadata, row index, ID map, WAL, and a derived trinary sidecar:
 
 <db_path>/
   MANIFEST
   vectors.qvec
+  vectors.qtri
   metadata.qmeta
   index.qidx
+  idmap.qid
+  wal.qwal
   LOCK
 
-Do not add these yet:
-
-wal.qwal
-vectors.qtri
-
-PR-1 should prove durable reopen/search first.
+`vectors.qvec`, `metadata.qmeta`, and `index.qidx` are authoritative. `idmap.qid` and `vectors.qtri` are rebuildable sidecars. `wal.qwal` is authoritative only for committed batches newer than the snapshot generation.
 
 6. File format for PR-1
 
@@ -966,9 +1011,9 @@ typedef struct qihse_manifest_s {
     uint64_t metadata_crc64;
     uint64_t index_crc64;
 } qihse_manifest_t;
-7. Two-slot manifest, no WAL yet
+7. Manifest and snapshot flush
 
-PR-1 should use two manifest slots to avoid torn manifest writes.
+The snapshot path should keep generation-stamped manifest validation so torn manifest writes are rejected or bypassed.
 
 MANIFEST:
   slot0
@@ -1004,7 +1049,7 @@ Flush logic:
 8. fsync db directory.
 9. dirty = false.
 
-This gives atomic snapshot behavior without WAL.
+This gives atomic snapshot behavior alongside WAL recovery for committed batches not yet checkpointed into the snapshot.
 
 8. File-backed copy mode first
 
@@ -1160,14 +1205,14 @@ cd qihse
 make clean
 make
 make test-persist
-PR-2: WAL and crash recovery
 
-Only after PR-1 passes.
+PR-2: WAL and crash recovery.
 
-Add:
+Status: implemented after PR-1. The WAL now has ADD and COMMIT records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
 
-wal.qwal
-WAL record header
+Implemented file: `wal.qwal`.
+
+WAL record header:
 typedef enum qihse_wal_record_type_e {
     QIHSE_WAL_BEGIN_ADD_BATCH = 1,
     QIHSE_WAL_VECTOR_BYTES    = 2,
@@ -1188,22 +1233,19 @@ typedef struct qihse_wal_record_header_s {
     uint64_t header_crc64;
 } qihse_wal_record_header_t;
 WAL write path
-1. Write BEGIN_ADD_BATCH.
-2. Write VECTOR_BYTES.
-3. Write METADATA_BYTES.
-4. Write INDEX_ROWS.
-5. fsync wal.qwal.
-6. Write COMMIT_BATCH.
-7. fsync wal.qwal.
-8. Apply data files.
-9. Publish manifest.
+1. Write the ADD payload record for the accepted batch.
+2. fsync `wal.qwal`.
+3. Write the COMMIT record that seals the batch.
+4. fsync `wal.qwal`.
+5. Apply the accepted mutation to the in-memory view.
+6. Publish data files on flush/checkpoint and clear checkpointed WAL bytes.
 WAL recovery path
 1. Load highest valid manifest slot.
 2. Scan WAL forward from manifest generation.
 3. Stop at first invalid/torn record.
 4. Replay only batches with valid COMMIT_BATCH.
-5. Ignore incomplete tail.
-6. Optionally truncate WAL after recovery.
+5. Ignore incomplete tail on read-only open.
+6. Truncate incomplete tail on writable open.
 
 Crash tests:
 
@@ -1213,7 +1255,7 @@ crash during manifest write -> older valid manifest slot used
 crash during checkpoint -> old data + WAL still recoverable
 PR-3: mmap mode
 
-Only after PR-2.
+Continue here after PR-2.
 
 Add UMA allocation kind. Current UMA address type has pointer, size, device, and residency metadata, but no allocation kind or file mapping ownership.
 
@@ -1263,9 +1305,9 @@ Search should support:
 
 FILE_BACKED_COPY  -> current UMA copy path
 FILE_BACKED_MMAP  -> mapped vectors/index/metadata
-Trinary stays after float32 persistence
+Trinary continues as a post-PR-2 codec path
 
-The uploaded plan’s trinary direction is useful, but it should not be in the first persistence landing.
+The trinary direction is useful, and the derived `vectors.qtri` sidecar now has an on-disk home. The next step is making it a native codec module with scoring and benchmarks, not making it authoritative by default.
 
 Correct order:
 
