@@ -12,9 +12,9 @@ Current landed state:
 - PR-1 is complete: `db_path` creates a native file-backed vector database with durable snapshot files, row-index-correct hydration, `idmap.qid`, derived `vectors.qtri`, diagnostics, read-only reopen, and read-only mmap of clean vector snapshots.
 - PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
 - PR-3 read-only mmap candidate work now covers `vectors.qvec`, `metadata.qmeta`, validated `idmap.qid`, and validated direct mapping of `index.qidx` for clean snapshots.
-- PR-4 public mutation API declarations are staged in `qihse/qihse_vector_db.h`; implementation, mutation WAL replay, tombstones, and real compaction remain.
-- PR-5 candidate work has started: a standalone native tryte codec exists with deterministic top-k candidate selection plus `make bench-trinary-codec`; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
-- Latest pushed checkpoint: `8b6defb` on `codex/qihse-file-persistence`.
+- PR-4 first implementation slice is complete: delete/update/upsert symbols are implemented, external-ID live-row rules work, read-only mutation rejection works, mutation state persists through normal snapshot flush/close, and executable persistence tests cover the behavior. Mutation WAL record formats and physical tombstone compaction remain.
+- PR-5 candidate work has started: standalone tryte top-k has `make bench-trinary-codec`, and DB-backed `vectors.qtri` candidate generation plus exact float32 rerank is covered by `make bench-trinary-db-candidate`. Full search-path integration, recall suites, and pure trinary storage remain.
+- Latest pushed checkpoint before this slice: `0fe36b0` on `codex/qihse-file-persistence`.
 
 Resume commands:
 
@@ -25,6 +25,7 @@ cd qihse
 make test-persist
 make test-trinary-codec
 make bench-trinary-codec
+make bench-trinary-db-candidate
 rm -f tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
 ```
 
@@ -35,20 +36,21 @@ PASS all qihse vector DB persistence tests
 PASS: top-k candidate selection
 PASS: top-k invalid tryte rejection
 rows=2048 dims=64 row_bytes=13 topk=8 iterations=64
+trinary_db_candidate_bench rows=2048 dims=64 qtri_row_bytes=13 candidates=64 topk=8 iterations=32
 ```
 
 Current continuation:
 
 - PR-3: validate the newly landed `index.qidx` mmap path under more corruption and compatibility cases, then decide whether UMA should wrap mapped rows directly or keep the current vector DB-owned mapping path.
-- PR-4: implement the staged delete/update/upsert APIs, tombstone behavior, mutation WAL replay, batch semantics, and real compaction.
-- PR-5: integrate the standalone tryte codec/top-k path into vector DB search as optional candidate generation with exact float32 rerank, then add recall and speed benchmarks.
+- PR-4: add mutation WAL replay/truncation records and implement physical tombstone compaction. The public delete/update/upsert API behavior is present.
+- PR-5: move the DB-backed tryte candidate benchmark path into optional vector DB search acceleration, then add recall and speed benchmark suites.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
 Recommended 3-agent split:
 
-- Agent 1 owns PR-4 mutation implementation in `qihse_vector_db.c`: delete/update/upsert, live-row rules, duplicate-ID handling, and read-only rejection.
-- Agent 2 owns PR-4 WAL/recovery and compaction: mutation WAL records, committed replay, torn-tail truncation, compacted snapshots, and executable persistence tests.
-- Agent 3 owns PR-5 trinary DB integration: optional tryte candidate generation from `vectors.qtri`, exact float32 rerank, recall/performance benchmarks, and plan updates.
+- Agent 1 owns PR-4 mutation WAL records and replay/truncation.
+- Agent 2 owns PR-4 physical compaction and post-compaction fixture tests.
+- Agent 3 owns PR-5 search-path integration and recall/performance benchmark suites.
 
 ## 1. Background
 
