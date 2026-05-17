@@ -69,11 +69,11 @@ int main(int argc, char* argv[]) {
         printf("📁 Results saved to: %s/\n", output_dir);
 
         /* Check if visualization script exists and can be run */
-        if (access("not_stisla/benchmarks/scripts/visualize_benchmarks.py", F_OK) == 0) {
+        if (access("benchmarks/scripts/visualize_benchmarks.py", F_OK) == 0) {
             printf("\n📊 Generating visualization charts...\n");
             char viz_cmd[1024];
             snprintf(viz_cmd, sizeof(viz_cmd),
-                    "python3 not_stisla/benchmarks/scripts/visualize_benchmarks.py %s/results.json --output-dir %s_charts",
+                    "python3 benchmarks/scripts/visualize_benchmarks.py %s/results.json --output-dir %s_charts",
                     output_dir, output_dir);
             int viz_ret = system(viz_cmd);
             if (viz_ret == 0) {
