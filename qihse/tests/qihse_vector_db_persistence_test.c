@@ -1584,23 +1584,16 @@ static bool test_compact_counts_after_delete_update_current_snapshot(void) {
                 "stats should be available after count compact");
     TEST_ASSERT(stats.live_vectors == 2u,
                 "compact should preserve two live logical rows");
-    TEST_ASSERT(stats.index_rows == 4u,
-                "current compact rewrites, but does not physically prune index rows yet");
+    TEST_ASSERT(stats.index_rows == stats.live_vectors,
+                "physical compact should prune tombstoned and superseded index rows");
     TEST_ASSERT(stats.idmap_valid, "compact should leave idmap valid");
     TEST_ASSERT(!stats.idmap_dirty, "compact should leave idmap clean");
     TEST_ASSERT(stats.idmap_rows == 2u,
                 "compact should rebuild idmap with live rows only");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
                 "compact should rebuild qtri as valid");
-    TEST_ASSERT(stats.trinary_rows == stats.index_rows,
-                "current qtri sidecar mirrors physical snapshot rows");
-
-    /*
-     * Future physical compaction should tighten these counts once
-     * qihse_vector_db_compact prunes tombstones and superseded rows:
-     *   stats.index_rows == stats.live_vectors
-     *   stats.trinary_rows == stats.live_vectors
-     */
+    TEST_ASSERT(stats.trinary_rows == stats.live_vectors,
+                "physical compact should rebuild qtri for live rows only");
 
     TEST_ASSERT(close_db(db), "database should close after count compact");
     remove_tree(path);
@@ -1736,8 +1729,8 @@ static bool test_compact_rewrites_qtri_sidecar_valid(void) {
                 "qtri should be valid after compact");
     TEST_ASSERT(stats.trinary_row_bytes == 2u,
                 "six-dimensional qtri rows should use two tryte bytes");
-    TEST_ASSERT(stats.trinary_rows == stats.index_rows,
-                "current qtri rows should mirror physical index rows");
+    TEST_ASSERT(stats.trinary_rows == stats.live_vectors,
+                "compacted qtri rows should mirror live rows");
 
     off_t qtri_size = 0;
     TEST_ASSERT(file_size_of(path, "vectors.qtri", &qtri_size),

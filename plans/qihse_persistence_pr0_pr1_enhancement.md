@@ -28,10 +28,10 @@ Current implementation state:
 - PR-1 native file-backed vector DB persistence is implemented.
 - PR-2 WAL/recovery hardening is implemented for ADD/COMMIT records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
 - PR-3 candidate work has started: read-only mmap mode maps `vectors.qvec`, `metadata.qmeta`, validated `idmap.qid`, and validated direct `index.qidx` rows for clean snapshots.
-- PR-4 mutation WAL is present: delete/update/upsert API symbols write committed WAL records, replay committed mutation batches newer than the snapshot, and writable open truncates torn/uncommitted mutation tails. Physical tombstone compaction remains pending.
-- PR-4 compaction fixture coverage is expanded for row/index/live/idmap counts, high unsigned IDs, valid `vectors.qtri` after compact, and stale/corrupt derived sidecar rebuild.
+- PR-4 physical compaction is present: delete/update/upsert API symbols write committed WAL records, replay committed mutation batches newer than the snapshot, writable open truncates torn/uncommitted mutation tails, and `compact()` rewrites live rows only before publishing the regenerated snapshot/sidecars.
+- PR-4 compaction fixture coverage now enforces row/index/live/idmap counts after physical pruning, high unsigned IDs, valid `vectors.qtri` after compact, and stale/corrupt derived sidecar rebuild.
 - PR-5 search-path benchmark scaffolding is present: standalone tryte top-k exists with `make bench-trinary-codec`, DB-backed candidate generation plus exact float32 rerank exists with `make bench-trinary-db-candidate`, and `make bench-trinary-search-path` compares full float32 DB search against trinary candidates plus rerank with recall/order/latency reporting.
-- Latest pushed checkpoint before this slice: `bf933cc` on `codex/qihse-file-persistence`.
+- Latest pushed checkpoint before this slice: `7df0e3e` on `codex/qihse-file-persistence`.
 - `qihse/qihse_vector_db.c` was restored after a disk-full truncation and now contains the native persistence implementation.
 - `qihse_vector_db_create(..., db_path)` opens a file-backed native database.
 - `qihse_vector_db_open()` supports ephemeral, file-copy, read-only, and read-only mmap modes.
@@ -545,14 +545,14 @@ PR-1 is complete when:
 - Read-only open can search but cannot mutate.
 - Native persistence diagnostics report generation, storage mode, ID-map rebuild state, and trinary sidecar status.
 - Python has not implemented any storage format.
-- Writable mmap, production vector DB trinary acceleration, pure trinary storage, physical compaction, and anchor persistence are still deferred.
+- Writable mmap, production vector DB trinary acceleration, pure trinary storage, compaction crash fixtures, and anchor persistence are still deferred.
 
 ## Follow-On Phases
 
 After the current checkpoint:
 
 - PR-3: harden mmap compatibility and corruption tests now that read-only `vectors.qvec`, `metadata.qmeta`, `idmap.qid`, and `index.qidx` mapping are present for clean snapshots.
-- PR-4: public delete/update/upsert API behavior and mutation WAL replay/truncation are implemented and covered by persistence tests; physical tombstone compaction remains.
+- PR-4: public delete/update/upsert API behavior, mutation WAL replay/truncation, and physical tombstone compaction are implemented and covered by persistence tests. Compaction crash/recovery fixtures remain.
 - PR-5: DB-backed candidate generation, exact rerank, and search-path benchmark scaffolding are present; production search-path acceleration, broader recall measurement, and optional pure trinary storage remain.
 - PR-6: optional persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
@@ -560,7 +560,7 @@ After the current checkpoint:
 
 PR-4 should make mutation explicit without changing QIHSE's program boundary. The public contract belongs to native QIHSE; Framewerx and other callers remain clients.
 
-Status: the public delete/update/upsert declarations are staged in `qihse/qihse_vector_db.h` and the native implementation is present in `qihse/qihse_vector_db.c`. Executable tests now cover delete, update, upsert, read-only rejection, compact-after-mutation search correctness, and unflushed mutation WAL replay. Physical tombstone compaction remains next.
+Status: the public delete/update/upsert declarations are staged in `qihse/qihse_vector_db.h` and the native implementation is present in `qihse/qihse_vector_db.c`. Executable tests now cover delete, update, upsert, read-only rejection, compact-after-mutation search correctness, unflushed mutation WAL replay, and physical compact row pruning.
 
 ### Public API
 
@@ -704,18 +704,18 @@ The persistence test file carries a compile-safe TODO backlog for these cases. C
 
 Use this split when resuming the remaining plan with multiple agents. QIHSE remains its own native program; none of these tasks should introduce Framewerx-specific persistence behavior.
 
-Agent 1: PR-4 physical compaction.
+Agent 1: PR-4 compaction crash fixtures.
 
-- Rewrite snapshot files with live rows only.
-- Preserve external IDs while assigning compact row offsets.
-- Regenerate `idmap.qid` and `vectors.qtri` from compact rows.
+- Add tmp-file and manifest-publication crash/recovery fixtures around compact.
+- Verify old generation remains authoritative when compact publication is incomplete.
+- Verify derived sidecars rebuild after compact interruption.
 - Keep compaction manual until stats-driven thresholds exist.
 
-Agent 2: PR-4 compaction recovery fixtures.
+Agent 2: PR-4 WAL-plus-compaction fixtures.
 
-- Add exact post-compaction row-count assertions once physical pruning lands.
-- Add crash/recovery fixtures around tmp files and manifest publication.
 - Add WAL-plus-compaction interaction tests.
+- Verify committed mutation WAL replay before compact, compact clearing checkpointed WAL, and no resurrection of pruned rows.
+- Fix any recovery bugs exposed by those tests.
 - Keep derived sidecar rebuild behavior explicit.
 
 Agent 3: PR-5 search-path trinary acceleration.
