@@ -55,6 +55,7 @@ make bench-trinary-db-candidate
 make bench-trinary-search-path
 make bench-trinary-search-sweep
 make bench-trinary-weighted-sweep
+make bench-trinary-magnitude-sweep
 ```
 
 Latest local result: all targets passed.
@@ -84,15 +85,23 @@ have different row-side magnitudes. The next trinary improvement should add a
 row-side magnitude signal, such as magnitude buckets, ternary-plus-scale rows,
 or learned per-row/per-dimension weights.
 
+`bench-trinary-magnitude-sweep` prototypes that row-side signal without changing
+the persisted store yet. It derives unsigned row magnitude buckets plus
+predecoded signed trits from the loaded snapshot, then scores candidates as
+`query_sign * row_sign * query_weight * row_bucket`. That proved the trinary
+direction: `magnitude_skew` and `near_tie` reached full recall/order at
+`top_k` candidates and beat float32 in the local benchmark. This should become
+a real file-backed derived sidecar after the prototype is hardened.
+
 ## Next Slice
 
 1. Make the opt-in trinary search path easier to use from native callers:
    document the API contract, expected `candidate_count`, and failure modes.
 2. Use the candidate-count sweep to pick sane default candidate ratios per
    dataset shape instead of a single fixed value.
-3. Prototype a row-side magnitude sidecar for trinary search:
-   magnitude buckets, ternary-plus-scale rows, or learned per-row/per-dimension
-   weights.
+3. Promote the magnitude prototype into a persisted derived sidecar:
+   compact row magnitude buckets plus predecoded signed trits, with manifest
+   validation and rebuild behavior matching `vectors.qtri`.
 4. Continue file persistence breadth:
    manifest publication hardening, more crash-recovery fixtures, and cleanup of
    legacy subsystem-shaped layout as QIHSE becomes a naturally integrated native

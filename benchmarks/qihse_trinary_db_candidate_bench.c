@@ -43,6 +43,12 @@ typedef struct qihse_bench_ranked_s {
     float score;
 } qihse_bench_ranked_t;
 
+typedef enum qihse_bench_score_mode_e {
+    QIHSE_BENCH_SCORE_SCALAR = 0,
+    QIHSE_BENCH_SCORE_WEIGHTED = 1,
+    QIHSE_BENCH_SCORE_MAGNITUDE = 2
+} qihse_bench_score_mode_t;
+
 static double qihse_bench_seconds(void) {
     struct timespec ts;
 
@@ -122,10 +128,28 @@ static int qihse_bench_sweep_enabled(void) {
     return value && strcmp(value, "1") == 0;
 }
 
-static int qihse_bench_weighted_score_enabled(void) {
+static qihse_bench_score_mode_t qihse_bench_score_mode(void) {
     const char* value = getenv("QIHSE_BENCH_TRINARY_SCORE");
 
-    return value && strcmp(value, "weighted") == 0;
+    if (value && strcmp(value, "weighted") == 0) {
+        return QIHSE_BENCH_SCORE_WEIGHTED;
+    }
+    if (value && strcmp(value, "magnitude") == 0) {
+        return QIHSE_BENCH_SCORE_MAGNITUDE;
+    }
+    return QIHSE_BENCH_SCORE_SCALAR;
+}
+
+static const char* qihse_bench_score_mode_name(qihse_bench_score_mode_t mode) {
+    switch (mode) {
+        case QIHSE_BENCH_SCORE_WEIGHTED:
+            return "weighted";
+        case QIHSE_BENCH_SCORE_MAGNITUDE:
+            return "magnitude";
+        case QIHSE_BENCH_SCORE_SCALAR:
+        default:
+            return "scalar";
+    }
 }
 
 static int32_t qihse_bench_weight_from_query(float value) {
@@ -137,6 +161,23 @@ static int32_t qihse_bench_weight_from_query(float value) {
     }
     weight = (int32_t)(magnitude * 100.0f + 0.5f);
     return weight > 0 ? weight : 1;
+}
+
+static uint8_t qihse_bench_magnitude_bucket(float value) {
+    float magnitude = fabsf(value);
+    int bucket;
+
+    if (magnitude <= 0.0f) {
+        return 0u;
+    }
+    bucket = (int)(magnitude * 100.0f + 0.5f);
+    if (bucket < 1) {
+        return 1u;
+    }
+    if (bucket > 255) {
+        return 255u;
+    }
+    return (uint8_t)bucket;
 }
 
 static void qihse_bench_fill_magnitude_skew(float* rows,
@@ -594,10 +635,151 @@ static int64_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
     return 0;
 }
 
+static int qihse_bench_build_magnitude_buckets(
+    const qihse_vector_store_snapshot_t* snapshot,
+    uint8_t* out_buckets) {
+    size_t row_index;
+
+    if (!snapshot || !out_buckets) {
+        errno = EINVAL;
+        return 0;
+    }
+    for (row_index = 0u; row_index < snapshot->row_count; row_index++) {
+        const qihse_index_row_t* row = snapshot->rows + row_index;
+        const float* vector =
+            qihse_bench_snapshot_vector_at(snapshot, row, QIHSE_BENCH_DIMS);
+        size_t dim;
+
+        if (!vector) {
+            errno = EINVAL;
+            return 0;
+        }
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            out_buckets[(row_index * QIHSE_BENCH_DIMS) + dim] =
+                qihse_bench_magnitude_bucket(vector[dim]);
+        }
+    }
+    return 1;
+}
+
+static int qihse_bench_build_signed_trits(const uint8_t* encoded_rows,
+                                          size_t row_count,
+                                          size_t dims,
+                                          int8_t* out_trits) {
+    size_t row_bytes;
+    size_t row;
+
+    if (!out_trits) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes)) {
+        return 0;
+    }
+    if (!encoded_rows && row_count != 0u && row_bytes != 0u) {
+        errno = EINVAL;
+        return 0;
+    }
+    for (row = 0u; row < row_count; row++) {
+        size_t dim = 0u;
+        size_t byte_index;
+
+        for (byte_index = 0u; byte_index < row_bytes; byte_index++) {
+            uint8_t trits[QIHSE_TRINARY_TRITS_PER_TRYTE];
+            size_t trit_index;
+
+            if (!qihse_trinary_tryte_unpack(encoded_rows[(row * row_bytes) + byte_index],
+                                            trits)) {
+                return 0;
+            }
+            for (trit_index = 0u; trit_index < QIHSE_TRINARY_TRITS_PER_TRYTE &&
+                                  dim < dims;
+                 trit_index++, dim++) {
+                uint8_t trit = trits[trit_index];
+                out_trits[(row * dims) + dim] =
+                    trit == 0u ? -1 : trit == 2u ? 1 : 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int qihse_bench_select_topk_magnitude(
+    const int8_t* row_trits,
+    const int8_t* query_trits,
+    const int32_t* dim_weights,
+    const uint8_t* magnitude_buckets,
+    size_t row_count,
+    size_t dims,
+    size_t* out_row_indexes,
+    int64_t* out_scores,
+    size_t max_results,
+    size_t* out_count) {
+    size_t selected = 0u;
+    size_t row;
+
+    if (!out_count) {
+        errno = EINVAL;
+        return 0;
+    }
+    *out_count = 0u;
+    if ((!row_trits || !query_trits || !dim_weights || !magnitude_buckets) &&
+        dims != 0u) {
+        errno = EINVAL;
+        return 0;
+    }
+    if ((!out_row_indexes || !out_scores) && max_results != 0u) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (row_count == 0u || max_results == 0u) {
+        return 1;
+    }
+
+    for (row = 0u; row < row_count; row++) {
+        int64_t score = 0;
+        size_t dim;
+        size_t insert_at;
+
+        for (dim = 0u; dim < dims; dim++) {
+            score += (int64_t)row_trits[(row * dims) + dim] *
+                     (int64_t)query_trits[dim] *
+                     (int64_t)dim_weights[dim] *
+                     (int64_t)magnitude_buckets[(row * dims) + dim];
+        }
+
+        insert_at = selected;
+        while (insert_at > 0u &&
+               (score > out_scores[insert_at - 1u] ||
+                (score == out_scores[insert_at - 1u] &&
+                 row < out_row_indexes[insert_at - 1u]))) {
+            insert_at--;
+        }
+        if (insert_at >= max_results) {
+            continue;
+        }
+        if (selected < max_results) {
+            selected++;
+        }
+        if (selected > insert_at + 1u) {
+            size_t move;
+            for (move = selected - 1u; move > insert_at; move--) {
+                out_row_indexes[move] = out_row_indexes[move - 1u];
+                out_scores[move] = out_scores[move - 1u];
+            }
+        }
+        out_row_indexes[insert_at] = row;
+        out_scores[insert_at] = score;
+    }
+
+    *out_count = selected;
+    return 1;
+}
+
 int main(void) {
     qihse_bench_dataset_t dataset = qihse_bench_dataset();
     const int sweep_enabled = qihse_bench_sweep_enabled();
-    const int weighted_score_enabled = qihse_bench_weighted_score_enabled();
+    const qihse_bench_score_mode_t score_mode = qihse_bench_score_mode();
     char* db_path = NULL;
     qihse_vector_db_t full_db = NULL;
     float* rows = NULL;
@@ -611,6 +793,9 @@ int main(void) {
     size_t* candidate_rows = NULL;
     int64_t* candidate_scores = NULL;
     int32_t* scalar_candidate_scores = NULL;
+    uint8_t* magnitude_buckets = NULL;
+    int8_t* row_trits = NULL;
+    int8_t query_trits[QIHSE_BENCH_DIMS];
     int32_t dim_weights[QIHSE_BENCH_DIMS];
     size_t candidate_count = 0u;
     qihse_bench_ranked_t reranked[QIHSE_BENCH_TOPK];
@@ -656,8 +841,11 @@ int main(void) {
     candidate_scores = (int64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_scores));
     scalar_candidate_scores =
         (int32_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*scalar_candidate_scores));
+    magnitude_buckets =
+        (uint8_t*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(*magnitude_buckets));
+    row_trits = (int8_t*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(*row_trits));
     if (!rows || !ids || !full_results || !candidate_rows || !candidate_scores ||
-        !scalar_candidate_scores) {
+        !scalar_candidate_scores || !magnitude_buckets || !row_trits) {
         perror("calloc");
         goto cleanup;
     }
@@ -708,6 +896,19 @@ int main(void) {
                                         encoded_query,
                                         sizeof(encoded_query))) {
         perror("qihse_trinary_tryte_encode_row");
+        goto cleanup;
+    }
+    if (score_mode == QIHSE_BENCH_SCORE_MAGNITUDE &&
+        (!qihse_bench_build_magnitude_buckets(&snapshot, magnitude_buckets) ||
+         !qihse_bench_build_signed_trits(snapshot.trinary,
+                                         snapshot.row_count,
+                                         QIHSE_BENCH_DIMS,
+                                         row_trits) ||
+         !qihse_bench_build_signed_trits(encoded_query,
+                                         1u,
+                                         QIHSE_BENCH_DIMS,
+                                         query_trits))) {
+        perror("build magnitude sidecar inputs");
         goto cleanup;
     }
 
@@ -774,7 +975,21 @@ int main(void) {
 
         select_start = qihse_bench_seconds();
         for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
-            if (weighted_score_enabled) {
+            if (score_mode == QIHSE_BENCH_SCORE_MAGNITUDE) {
+                if (!qihse_bench_select_topk_magnitude(row_trits,
+                                                       query_trits,
+                                                       dim_weights,
+                                                       magnitude_buckets,
+                                                       snapshot.row_count,
+                                                       QIHSE_BENCH_DIMS,
+                                                       candidate_rows,
+                                                       candidate_scores,
+                                                       candidate_limit,
+                                                       &candidate_count)) {
+                    perror("qihse_bench_select_topk_magnitude");
+                    goto cleanup;
+                }
+            } else if (score_mode == QIHSE_BENCH_SCORE_WEIGHTED) {
                 if (!qihse_trinary_tryte_select_topk_weighted(snapshot.trinary,
                                                               encoded_query,
                                                               dim_weights,
@@ -842,7 +1057,7 @@ int main(void) {
                "candidates=%zu topk=%u iterations=%u\n",
                sweep_enabled ? "trinary_search_path_sweep" : "trinary_search_path_bench",
                qihse_bench_dataset_name(dataset),
-               weighted_score_enabled ? "weighted" : "scalar",
+               qihse_bench_score_mode_name(score_mode),
                (unsigned)QIHSE_BENCH_ROWS,
                (unsigned)QIHSE_BENCH_DIMS,
                row_bytes,
@@ -902,6 +1117,8 @@ cleanup:
     }
     free(candidate_scores);
     free(scalar_candidate_scores);
+    free(magnitude_buckets);
+    free(row_trits);
     free(candidate_rows);
     free(ids);
     free(full_results);
