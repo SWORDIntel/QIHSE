@@ -29,9 +29,10 @@ Current implementation state:
 - `qihse/qihse_vector_db.c` was restored after a disk-full truncation and now contains the native persistence implementation.
 - `qihse_vector_db_create(..., db_path)` opens a file-backed native database.
 - `qihse_vector_db_open()` supports ephemeral, file-copy, read-only, and read-only mmap modes.
-- `qihse_vector_db_add_vectors()` appends a WAL record before accepting file-backed writes.
+- `qihse_vector_db_add_vectors()` appends a WAL ADD record and explicit COMMIT record before accepting file-backed writes.
 - `qihse_vector_db_flush()`, `checkpoint()`, and `compact()` rewrite the snapshot, regenerate `idmap.qid`, generate `vectors.qtri`, and clear `wal.qwal`.
 - Open replays valid WAL records newer than the committed snapshot generation.
+- Writable open truncates torn or uncommitted WAL tails back to the last committed WAL boundary.
 - `vectors.qvec` remains authoritative; `vectors.qtri` is a derived tryte sidecar for the trinary path.
 - Missing or corrupt `vectors.qtri` does not block `FLOAT32` database open/search.
 - Read-only mmap works only for clean snapshots without pending WAL.
@@ -78,7 +79,7 @@ PASS all qihse vector DB persistence tests
 
 If the build fails after reboot, inspect these areas first:
 
-- `qihse/qihse_vector_db.c`: WAL replay, mmap open, and trinary sidecar generation.
+- `qihse/qihse_vector_db.c`: WAL ADD/COMMIT replay, torn-tail truncation, mmap open, and trinary sidecar generation.
 - `qihse/persistence/`: snapshot file load/flush helpers and little-endian/checksum helpers.
 - `qihse/Makefile`: explicit `SRCS_BASE` must include the persistence helpers and `algorithms/qihse_anchor_search.c`.
 - Disk space: the previous interruption happened when the filesystem hit 100% and truncated `qihse/qihse_vector_db.c`.
@@ -477,14 +478,15 @@ Required test cases:
 3. Binary metadata survives restart byte-for-byte.
 4. `db_path == NULL` stays ephemeral.
 5. WAL replays an accepted add before snapshot flush.
-6. Read-only mmap reopen searches mapped vector file.
-7. Corrupt `vectors.qvec` magic fails open cleanly.
-8. Truncated `index.qidx` fails open cleanly.
-9. Read-only open can search but cannot mutate.
-10. Duplicate vector ID is rejected.
-11. Corrupt `idmap.qid` rebuilds without blocking vector search, including IDs above `INT64_MAX`.
-12. Missing `vectors.qtri` is accepted for `FLOAT32` databases.
-13. Corrupt `vectors.qtri` marks the sidecar unavailable but does not block open/search.
+6. Torn WAL tail is ignored and truncated on writable open.
+7. Read-only mmap reopen searches mapped vector file.
+8. Corrupt `vectors.qvec` magic fails open cleanly.
+9. Truncated `index.qidx` fails open cleanly.
+10. Read-only open can search but cannot mutate.
+11. Duplicate vector ID is rejected.
+12. Corrupt `idmap.qid` rebuilds without blocking vector search, including IDs above `INT64_MAX`.
+13. Missing `vectors.qtri` is accepted for `FLOAT32` databases.
+14. Corrupt `vectors.qtri` marks the sidecar unavailable but does not block open/search.
 
 Developer command:
 
@@ -525,7 +527,7 @@ PR-1 is complete when:
 
 After PR-1:
 
-- PR-2: harden WAL with explicit commit records, previous-record offsets, torn-tail truncation, and recovery tests for malformed WAL tails.
+- PR-2: continue hardening WAL with broader malformed-tail/fuzz tests and optional backward-walk recovery. ADD/COMMIT records, previous-record offsets, and writable torn-tail truncation are implemented.
 - PR-3: extend mmap beyond read-only `vectors.qvec` into index, metadata, and ID map mapping where the access pattern warrants it.
 - PR-4: implement real row compaction, tombstones, delete/update semantics, and batch external-ID APIs.
 - PR-5: execute the trinary sidecar path: codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
