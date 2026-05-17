@@ -108,6 +108,7 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void);
 static bool test_truncated_vectors_qvec_payload_rejected(void);
 static bool test_corrupt_metadata_qmeta_rejected(void);
 static bool test_truncated_metadata_qmeta_payload_rejected(void);
+static bool test_corrupt_index_qidx_magic_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
@@ -170,6 +171,8 @@ int main(void) {
          test_corrupt_metadata_qmeta_rejected},
         {"truncated metadata.qmeta payload fails open cleanly",
          test_truncated_metadata_qmeta_payload_rejected},
+        {"corrupt index.qidx magic fails open cleanly",
+         test_corrupt_index_qidx_magic_rejected},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
         {"truncated manifest fails open cleanly",
@@ -1333,6 +1336,40 @@ static bool test_truncated_metadata_qmeta_payload_rejected(void) {
         QIHSE_TEST_OPEN_FILE_BACKED
     );
     TEST_ASSERT(db == NULL, "truncated metadata.qmeta payload should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_corrupt_index_qidx_magic_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("corrupt_qidx");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.20f, 0.70f, 0.10f};
+    const char metadata[] = "index-corruption";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9014, metadata, sizeof(metadata)),
+                "insert before corrupting qidx should succeed");
+    TEST_ASSERT(close_db(db), "database should close before qidx corruption");
+
+    TEST_ASSERT(corrupt_file_byte(path, "index.qidx", 0, (uint8_t)'X'),
+                "test should corrupt index.qidx magic");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "corrupt index.qidx magic should fail open");
 
     remove_tree(path);
     free(path);

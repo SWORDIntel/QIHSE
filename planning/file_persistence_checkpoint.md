@@ -46,7 +46,8 @@ exact float32 reranking.
   publication after checkpoint and metadata payload corruption rejection through
   manifest CRC validation.
 - Authoritative-file boundary coverage now rejects truncated `vectors.qvec` and
-  `metadata.qmeta` payloads after a valid snapshot exists.
+  `metadata.qmeta` payloads plus corrupt `index.qidx` magic after a valid
+  snapshot exists.
 - Checkpoint recovery coverage now also ignores stale snapshot tmp outputs
   (`vectors.qvec.tmp`, `metadata.qmeta.tmp`, `index.qidx.tmp`, `idmap.qid.tmp`,
   `vectors.qtri.tmp`, and `vectors.qmag.tmp`) while reopening/searching the
@@ -149,8 +150,8 @@ Latest focused result after QIHSE-only recovery fixture slice:
 stale `MANIFEST.tmp` recovery fixtures.
 
 Latest focused result after authoritative-file boundary slice:
-`make test-persist` passed with new truncated `vectors.qvec` and
-`metadata.qmeta` payload rejection fixtures.
+`make test-persist` passed with truncated `vectors.qvec`, truncated
+`metadata.qmeta`, and corrupt `index.qidx` rejection fixtures.
 
 Latest focused result after checkpoint snapshot-tmp recovery slice:
 `make test-persist` passed with stale authoritative and derived sidecar tmp
@@ -226,4 +227,5 @@ weighted prototype qtri selectors.
    back into FRAMEWERX. `make check-upstream-workflow` now reports whether the
    current QIHSE tree is an upstream checkout or an imported FRAMEWERX copy.
 3. Continue file persistence breadth only after the benchmark runner is moving,
-   with additional authoritative-file corruption after a valid snapshot exists.
+   with remaining authoritative-file corruption focused on manifest/index
+   consistency fields after a valid snapshot exists.
