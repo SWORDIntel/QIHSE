@@ -111,7 +111,7 @@ static bool test_truncated_metadata_qmeta_payload_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
-static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void);
+static bool test_stale_snapshot_tmp_files_ignored_after_checkpoint(void);
 static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
@@ -176,8 +176,8 @@ int main(void) {
          test_truncated_manifest_rejected},
         {"stale MANIFEST.tmp is ignored after checkpoint",
          test_stale_manifest_tmp_ignored_after_checkpoint},
-        {"stale authoritative tmp files are ignored after checkpoint",
-         test_stale_authoritative_tmp_files_ignored_after_checkpoint},
+        {"stale snapshot tmp files are ignored after checkpoint",
+         test_stale_snapshot_tmp_files_ignored_after_checkpoint},
         {"manifest rejects impossible qmag metadata",
          test_manifest_rejects_impossible_qmag_shape},
         {"read-only open can search but rejects add_vectors",
@@ -1464,11 +1464,11 @@ static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
     return true;
 }
 
-static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void) {
+static bool test_stale_snapshot_tmp_files_ignored_after_checkpoint(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
-    char* path = make_temp_db_path("stale_authoritative_tmps");
+    char* path = make_temp_db_path("stale_snapshot_tmps");
     TEST_ASSERT(path != NULL, "temp db path should be created");
 
     const float first[] = {0.60f, 0.20f, 0.10f, 0.10f};
@@ -1505,6 +1505,12 @@ static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void) {
     TEST_ASSERT(write_file_payload(path, "idmap.qid.tmp",
                                    stale_payload, sizeof(stale_payload)),
                 "test should write stale idmap.qid tmp");
+    TEST_ASSERT(write_file_payload(path, "vectors.qtri.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale vectors.qtri tmp");
+    TEST_ASSERT(write_file_payload(path, "vectors.qmag.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale vectors.qmag tmp");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1512,19 +1518,23 @@ static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
     );
-    TEST_ASSERT(db != NULL, "stale authoritative tmp files should not block reopen");
+    TEST_ASSERT(db != NULL, "stale snapshot tmp files should not block reopen");
 
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available after stale authoritative tmp reopen");
+                "stats should be available after stale snapshot tmp reopen");
     TEST_ASSERT(stats.index_rows == 2u,
-                "stale authoritative tmp files should not change index rows");
+                "stale snapshot tmp files should not change index rows");
     TEST_ASSERT(stats.live_vectors == 2u,
-                "stale authoritative tmp files should not change live rows");
+                "stale snapshot tmp files should not change live rows");
     TEST_ASSERT(stats.idmap_valid,
-                "stale authoritative tmp files should not invalidate idmap");
+                "stale snapshot tmp files should not invalidate idmap");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "stale snapshot tmp files should not invalidate qtri");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "stale snapshot tmp files should not invalidate qmag");
     TEST_ASSERT(stats.wal_records_replayed == 0u,
-                "stale authoritative tmp files should not force WAL replay");
+                "stale snapshot tmp files should not force WAL replay");
 
     qihse_vector_result_t result;
     int count = search_one(db, second, ARRAY_LEN(second), true, true, &result);
@@ -1539,7 +1549,7 @@ static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db),
-                "read-only stale authoritative tmp database should close");
+                "read-only stale snapshot tmp database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

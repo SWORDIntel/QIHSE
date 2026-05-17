@@ -47,9 +47,10 @@ exact float32 reranking.
   manifest CRC validation.
 - Authoritative-file boundary coverage now rejects truncated `vectors.qvec` and
   `metadata.qmeta` payloads after a valid snapshot exists.
-- Checkpoint recovery coverage now also ignores stale authoritative file tmp
-  outputs (`vectors.qvec.tmp`, `metadata.qmeta.tmp`, `index.qidx.tmp`, and
-  `idmap.qid.tmp`) while reopening/searching the last valid published files.
+- Checkpoint recovery coverage now also ignores stale snapshot tmp outputs
+  (`vectors.qvec.tmp`, `metadata.qmeta.tmp`, `index.qidx.tmp`, `idmap.qid.tmp`,
+  `vectors.qtri.tmp`, and `vectors.qmag.tmp`) while reopening/searching the
+  last valid published files.
 - Native integration cleanup is tracked in
   `qihse/planning/native_integration_cleanup.md`.
 - Historical `SWORDIntel_QIHSE/plans/` material has been summarized into
@@ -151,9 +152,9 @@ Latest focused result after authoritative-file boundary slice:
 `make test-persist` passed with new truncated `vectors.qvec` and
 `metadata.qmeta` payload rejection fixtures.
 
-Latest focused result after checkpoint authoritative-tmp recovery slice:
-`make test-persist` passed with the new stale authoritative tmp recovery
-fixture.
+Latest focused result after checkpoint snapshot-tmp recovery slice:
+`make test-persist` passed with stale authoritative and derived sidecar tmp
+recovery covered after checkpoint.
 
 Latest trinary calibration decision:
 keep exact float32 as the default, keep `use_trinary_candidates` exact,
@@ -225,5 +226,4 @@ weighted prototype qtri selectors.
    back into FRAMEWERX. `make check-upstream-workflow` now reports whether the
    current QIHSE tree is an upstream checkout or an imported FRAMEWERX copy.
 3. Continue file persistence breadth only after the benchmark runner is moving,
-   with crash-recovery fixtures for interrupted multi-file publication windows
-   and additional authoritative-file corruption after a valid snapshot exists.
+   with additional authoritative-file corruption after a valid snapshot exists.
