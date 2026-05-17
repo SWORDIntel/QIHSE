@@ -36,7 +36,7 @@ PASS: top-k invalid tryte rejection
 Post-PR-2 continuation:
 
 - PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior. Vector, metadata, and ID-map mmap are present; index mmap remains.
-- PR-4: add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
+- PR-4: public delete/update/upsert API declarations are staged; tombstone behavior, mutation WAL replay, batch semantics, and real compaction remain.
 - PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Standalone tryte encoding/scoring/top-k is present; database search integration, exact rerank, and benchmarks remain.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
@@ -351,7 +351,9 @@ Even if delete/update APIs are added later, reserving tombstone and generation f
 
 PR-4 turns reserved tombstone fields into real database behavior. This is native QIHSE work only; Framewerx and application layers remain clients.
 
-Public API additions:
+Status: `qihse/qihse_vector_db.h` now stages the public delete/update/upsert declarations. `qihse_vector_db.c` does not implement them yet, so executable mutation tests remain gated behind the next implementation slice.
+
+Public API additions staged in `qihse/qihse_vector_db.h`:
 
 ```c
 bool qihse_vector_db_delete_by_id(
@@ -455,6 +457,8 @@ Compaction behavior:
 Compaction must be generation-safe: a crash before manifest publication leaves the old generation authoritative; a crash after manifest publication opens the new generation or fails cleanly on authoritative-file corruption.
 
 Required PR-4 tests:
+
+The persistence test file currently records this as a compile-safe TODO backlog. Enable real calls only after the mutation symbols are implemented.
 
 - Delete-by-ID removes a row from search and survives reopen.
 - Missing-ID delete is a clean no-op/failure and does not corrupt state.
@@ -840,7 +844,7 @@ The plan no longer starts from an in-memory-only database. PR-0, PR-1, and PR-2 
 The remaining work should be split into focused native QIHSE PRs:
 
 - PR-3: mmap/zero-copy extension for index, metadata, and ID-map files.
-- PR-4: tombstones, delete/update, batch external-ID APIs, and compaction.
+- PR-4: implement staged tombstone/delete/update/upsert APIs, mutation WAL records, batch semantics, and compaction.
 - PR-5: native trinary codec module, scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
 - PR-6: persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
