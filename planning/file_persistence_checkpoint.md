@@ -53,6 +53,7 @@ make test-trinary-codec
 make bench-trinary-codec
 make bench-trinary-db-candidate
 make bench-trinary-search-path
+make bench-trinary-search-sweep
 ```
 
 Latest local result: all targets passed.
@@ -63,12 +64,22 @@ The search-path benchmark currently reports perfect recall/order on `aligned`,
 show where pure sign matching is insufficient without larger candidates,
 weighted trits, magnitude bins, or a more expressive trinary scoring model.
 
+`bench-trinary-search-sweep` reruns the persisted trinary search-path benchmark
+with increasing candidate counts. It is the current tool for deciding whether a
+dataset needs wider candidate selection, a better trinary score, or both. The
+first sweep showed:
+
+- `aligned` and `banded`: full recall/order at `top_k` candidates.
+- `weighted`: full recall/order at 64 candidates.
+- `magnitude_skew` and `near_tie`: full recall/order at 128 candidates, but
+  slower than float32 on the current scalar trinary selector.
+
 ## Next Slice
 
 1. Make the opt-in trinary search path easier to use from native callers:
    document the API contract, expected `candidate_count`, and failure modes.
-2. Add a benchmark sweep over multiple candidate counts so the recall/speed
-   curve is visible instead of testing only one fixed candidate count.
+2. Use the candidate-count sweep to pick sane default candidate ratios per
+   dataset shape instead of a single fixed value.
 3. Explore trinary improvements without replacing float32 yet:
    weighted trits, magnitude buckets, ternary-plus-scale rows, or per-dimension
    learned weights.

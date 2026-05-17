@@ -116,6 +116,12 @@ static int qihse_bench_dataset_requires_perfect(qihse_bench_dataset_t dataset,
            candidate_count >= QIHSE_BENCH_ROWS;
 }
 
+static int qihse_bench_sweep_enabled(void) {
+    const char* value = getenv("QIHSE_BENCH_SWEEP");
+
+    return value && strcmp(value, "1") == 0;
+}
+
 static void qihse_bench_fill_magnitude_skew(float* rows,
                                             float* query,
                                             uint64_t* ids) {
@@ -573,6 +579,7 @@ static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
 
 int main(void) {
     qihse_bench_dataset_t dataset = qihse_bench_dataset();
+    const int sweep_enabled = qihse_bench_sweep_enabled();
     char* db_path = NULL;
     qihse_vector_db_t full_db = NULL;
     float* rows = NULL;
@@ -583,8 +590,8 @@ int main(void) {
     qihse_vector_result_t* full_results = NULL;
     qihse_vector_store_snapshot_t snapshot;
     size_t row_bytes = 0u;
-    size_t candidate_rows[QIHSE_BENCH_CANDIDATES] = {0u};
-    int32_t candidate_scores[QIHSE_BENCH_CANDIDATES] = {0};
+    size_t* candidate_rows = NULL;
+    int32_t* candidate_scores = NULL;
     size_t candidate_count = 0u;
     qihse_bench_ranked_t reranked[QIHSE_BENCH_TOPK];
     qihse_bench_ranked_t oracle[QIHSE_BENCH_TOPK];
@@ -605,13 +612,29 @@ int main(void) {
     volatile int64_t checksum = 0;
     size_t iter;
     size_t i;
+    size_t sweep_candidates[] = {
+        QIHSE_BENCH_TOPK,
+        16u,
+        32u,
+        64u,
+        128u,
+        256u,
+        512u,
+        1024u,
+        QIHSE_BENCH_ROWS
+    };
+    size_t sweep_len = sizeof(sweep_candidates) / sizeof(sweep_candidates[0]);
+    size_t candidate_passes = sweep_enabled ? sweep_len : 1u;
+    size_t pass;
     int exit_code = 1;
 
     memset(&snapshot, 0, sizeof(snapshot));
     rows = (float*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(float));
     ids = (uint64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*ids));
     full_results = (qihse_vector_result_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*full_results));
-    if (!rows || !ids || !full_results) {
+    candidate_rows = (size_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_rows));
+    candidate_scores = (int32_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_scores));
+    if (!rows || !ids || !full_results || !candidate_rows || !candidate_scores) {
         perror("calloc");
         goto cleanup;
     }
@@ -691,39 +714,6 @@ int main(void) {
     full_seconds = qihse_bench_seconds() - full_start;
     full_topk_count = full_count < QIHSE_BENCH_TOPK ? full_count : QIHSE_BENCH_TOPK;
 
-    select_start = qihse_bench_seconds();
-    for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
-        if (!qihse_trinary_tryte_select_topk(snapshot.trinary,
-                                             encoded_query,
-                                             snapshot.row_count,
-                                             QIHSE_BENCH_DIMS,
-                                             candidate_rows,
-                                             candidate_scores,
-                                             QIHSE_BENCH_CANDIDATES,
-                                             &candidate_count)) {
-            perror("qihse_trinary_tryte_select_topk");
-            goto cleanup;
-        }
-        checksum += (int64_t)candidate_rows[0] + (int64_t)candidate_scores[0];
-    }
-    select_seconds = qihse_bench_seconds() - select_start;
-
-    rerank_start = qihse_bench_seconds();
-    for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
-        if (!qihse_bench_exact_rank(&snapshot,
-                                    query,
-                                    candidate_rows,
-                                    candidate_count,
-                                    reranked,
-                                    QIHSE_BENCH_TOPK,
-                                    &reranked_count)) {
-            perror("candidate exact rerank");
-            goto cleanup;
-        }
-        checksum += (int64_t)reranked[0].row_index;
-    }
-    rerank_seconds = qihse_bench_seconds() - rerank_start;
-
     if (!qihse_bench_exact_rank(&snapshot,
                                 query,
                                 NULL,
@@ -735,60 +725,119 @@ int main(void) {
         goto cleanup;
     }
 
-    if (qihse_bench_dataset_requires_perfect(dataset, candidate_count) &&
-        !qihse_bench_verify_rerank(reranked, reranked_count, oracle, oracle_count)) {
-        goto cleanup;
-    }
+    for (pass = 0u; pass < candidate_passes; pass++) {
+        size_t candidate_limit = sweep_enabled
+            ? sweep_candidates[pass]
+            : QIHSE_BENCH_CANDIDATES;
 
-    recall_matches = qihse_bench_recall_matches(reranked,
-                                                reranked_count,
-                                                full_results,
-                                                full_topk_count);
-    ordered_matches = qihse_bench_ordered_matches(reranked,
-                                                  reranked_count,
-                                                  full_results,
-                                                  full_topk_count);
+        if (candidate_limit < QIHSE_BENCH_TOPK) {
+            candidate_limit = QIHSE_BENCH_TOPK;
+        }
+        if (candidate_limit > QIHSE_BENCH_ROWS) {
+            candidate_limit = QIHSE_BENCH_ROWS;
+        }
+        if (pass > 0u && candidate_limit == sweep_candidates[pass - 1u]) {
+            continue;
+        }
 
-    printf("trinary_search_path_bench dataset=%s rows=%u dims=%u qtri_row_bytes=%zu "
-           "candidates=%u topk=%u iterations=%u\n",
-           qihse_bench_dataset_name(dataset),
-           (unsigned)QIHSE_BENCH_ROWS,
-           (unsigned)QIHSE_BENCH_DIMS,
-           row_bytes,
-           (unsigned)QIHSE_BENCH_CANDIDATES,
-           (unsigned)QIHSE_BENCH_TOPK,
-           (unsigned)QIHSE_BENCH_ITERS);
-    printf("load_ms=%.3f full_float32_avg_us=%.3f trinary_select_avg_us=%.3f "
-           "exact_rerank_avg_us=%.3f trinary_rerank_avg_us=%.3f "
-           "speedup_vs_full=%.3fx recall_at_%u=%.3f ordered_at_%u=%.3f "
-           "perfect_expected=%s checksum=%lld\n",
-           load_seconds * 1000.0,
-           (full_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
-           (select_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
-           (rerank_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
-           ((select_seconds + rerank_seconds) * 1000000.0) /
-               (double)QIHSE_BENCH_ITERS,
-           full_seconds > 0.0 && (select_seconds + rerank_seconds) > 0.0
-               ? full_seconds / (select_seconds + rerank_seconds)
-               : 0.0,
-           (unsigned)QIHSE_BENCH_TOPK,
-           full_topk_count == 0u ? 0.0
-                                 : (double)recall_matches / (double)full_topk_count,
-           (unsigned)QIHSE_BENCH_TOPK,
-           full_topk_count == 0u ? 0.0
-                                 : (double)ordered_matches / (double)full_topk_count,
-           qihse_bench_dataset_requires_perfect(dataset, candidate_count) ? "yes" : "no",
-           (long long)checksum);
-    for (i = 0u; i < reranked_count; i++) {
-        printf("result[%zu] row=%zu id=%llu tri_score=%d exact_score=%.6f\n",
-               i,
-               reranked[i].row_index,
-               (unsigned long long)reranked[i].id,
-               qihse_bench_candidate_score_for_row(candidate_rows,
-                                                   candidate_scores,
-                                                   candidate_count,
-                                                   reranked[i].row_index),
-               reranked[i].score);
+        memset(candidate_rows, 0, QIHSE_BENCH_ROWS * sizeof(*candidate_rows));
+        memset(candidate_scores, 0, QIHSE_BENCH_ROWS * sizeof(*candidate_scores));
+
+        select_start = qihse_bench_seconds();
+        for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
+            if (!qihse_trinary_tryte_select_topk(snapshot.trinary,
+                                                 encoded_query,
+                                                 snapshot.row_count,
+                                                 QIHSE_BENCH_DIMS,
+                                                 candidate_rows,
+                                                 candidate_scores,
+                                                 candidate_limit,
+                                                 &candidate_count)) {
+                perror("qihse_trinary_tryte_select_topk");
+                goto cleanup;
+            }
+            checksum += (int64_t)candidate_rows[0] + (int64_t)candidate_scores[0];
+        }
+        select_seconds = qihse_bench_seconds() - select_start;
+
+        rerank_start = qihse_bench_seconds();
+        for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
+            if (!qihse_bench_exact_rank(&snapshot,
+                                        query,
+                                        candidate_rows,
+                                        candidate_count,
+                                        reranked,
+                                        QIHSE_BENCH_TOPK,
+                                        &reranked_count)) {
+                perror("candidate exact rerank");
+                goto cleanup;
+            }
+            checksum += (int64_t)reranked[0].row_index;
+        }
+        rerank_seconds = qihse_bench_seconds() - rerank_start;
+
+        if (!sweep_enabled &&
+            qihse_bench_dataset_requires_perfect(dataset, candidate_count) &&
+            !qihse_bench_verify_rerank(reranked, reranked_count, oracle, oracle_count)) {
+            goto cleanup;
+        }
+
+        recall_matches = qihse_bench_recall_matches(reranked,
+                                                    reranked_count,
+                                                    full_results,
+                                                    full_topk_count);
+        ordered_matches = qihse_bench_ordered_matches(reranked,
+                                                      reranked_count,
+                                                      full_results,
+                                                      full_topk_count);
+
+        printf("%s dataset=%s rows=%u dims=%u qtri_row_bytes=%zu "
+               "candidates=%zu topk=%u iterations=%u\n",
+               sweep_enabled ? "trinary_search_path_sweep" : "trinary_search_path_bench",
+               qihse_bench_dataset_name(dataset),
+               (unsigned)QIHSE_BENCH_ROWS,
+               (unsigned)QIHSE_BENCH_DIMS,
+               row_bytes,
+               candidate_limit,
+               (unsigned)QIHSE_BENCH_TOPK,
+               (unsigned)QIHSE_BENCH_ITERS);
+        printf("load_ms=%.3f full_float32_avg_us=%.3f trinary_select_avg_us=%.3f "
+               "exact_rerank_avg_us=%.3f trinary_rerank_avg_us=%.3f "
+               "speedup_vs_full=%.3fx recall_at_%u=%.3f ordered_at_%u=%.3f "
+               "perfect_required=%s checksum=%lld\n",
+               load_seconds * 1000.0,
+               (full_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
+               (select_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
+               (rerank_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
+               ((select_seconds + rerank_seconds) * 1000000.0) /
+                   (double)QIHSE_BENCH_ITERS,
+               full_seconds > 0.0 && (select_seconds + rerank_seconds) > 0.0
+                   ? full_seconds / (select_seconds + rerank_seconds)
+                   : 0.0,
+               (unsigned)QIHSE_BENCH_TOPK,
+               full_topk_count == 0u ? 0.0
+                                     : (double)recall_matches / (double)full_topk_count,
+               (unsigned)QIHSE_BENCH_TOPK,
+               full_topk_count == 0u ? 0.0
+                                     : (double)ordered_matches / (double)full_topk_count,
+               !sweep_enabled &&
+                       qihse_bench_dataset_requires_perfect(dataset, candidate_count)
+                   ? "yes"
+                   : "no",
+               (long long)checksum);
+        if (!sweep_enabled) {
+            for (i = 0u; i < reranked_count; i++) {
+                printf("result[%zu] row=%zu id=%llu tri_score=%d exact_score=%.6f\n",
+                       i,
+                       reranked[i].row_index,
+                       (unsigned long long)reranked[i].id,
+                       qihse_bench_candidate_score_for_row(candidate_rows,
+                                                           candidate_scores,
+                                                           candidate_count,
+                                                           reranked[i].row_index),
+                       reranked[i].score);
+            }
+        }
     }
 
     exit_code = 0;
@@ -802,6 +851,8 @@ cleanup:
         qihse_bench_remove_tree(db_path);
         free(db_path);
     }
+    free(candidate_scores);
+    free(candidate_rows);
     free(ids);
     free(full_results);
     free(rows);
