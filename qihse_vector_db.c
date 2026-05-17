@@ -2284,8 +2284,142 @@ bool qihse_vector_db_checkpoint(qihse_vector_db_t vdb) {
     return qihse_vector_db_flush(vdb);
 }
 
+static bool qihse_vdb_compact_live_rows(qihse_vector_db_t vdb) {
+    qihse_index_row_t* compact_rows = NULL;
+    uint8_t* compact_vectors = NULL;
+    uint8_t* compact_metadata = NULL;
+    size_t vector_row_bytes = 0u;
+    size_t compact_vector_bytes = 0u;
+    size_t compact_metadata_bytes = 0u;
+    size_t live_count = 0u;
+    size_t i;
+
+    if (!vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vdb->total_vectors == vdb->live_vectors && !vdb->idmap_dirty &&
+        vdb->trinary_status == QIHSE_VDB_TRINARY_VALID) {
+        return true;
+    }
+    if (vdb->vector_dims != 0u &&
+        !qihse_checked_mul_size(vdb->vector_dims, sizeof(float), &vector_row_bytes)) {
+        return false;
+    }
+    if (!qihse_checked_mul_size(vdb->live_vectors, vector_row_bytes,
+                                &compact_vector_bytes)) {
+        return false;
+    }
+    for (i = 0u; i < vdb->total_vectors; i++) {
+        const qihse_index_row_t* row = &vdb->rows[i];
+
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+            continue;
+        }
+        if (row->metadata_size > (uint64_t)SIZE_MAX ||
+            !qihse_checked_add_size(compact_metadata_bytes,
+                                    (size_t)row->metadata_size,
+                                    &compact_metadata_bytes)) {
+            return false;
+        }
+    }
+
+    compact_rows = (qihse_index_row_t*)calloc(vdb->live_vectors ? vdb->live_vectors : 1u,
+                                              sizeof(*compact_rows));
+    compact_vectors = (uint8_t*)malloc(compact_vector_bytes ? compact_vector_bytes : 1u);
+    compact_metadata = (uint8_t*)malloc(compact_metadata_bytes ? compact_metadata_bytes : 1u);
+    if (!compact_rows || !compact_vectors || !compact_metadata) {
+        free(compact_rows);
+        free(compact_vectors);
+        free(compact_metadata);
+        errno = ENOMEM;
+        return false;
+    }
+
+    compact_vector_bytes = 0u;
+    compact_metadata_bytes = 0u;
+    for (i = 0u; i < vdb->total_vectors; i++) {
+        const qihse_index_row_t* old_row = &vdb->rows[i];
+        qihse_index_row_t* new_row;
+        const float* vector;
+        const void* metadata;
+
+        if ((old_row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (old_row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+            continue;
+        }
+        vector = qihse_vdb_vector_at(vdb, old_row);
+        if (vector_row_bytes != 0u && !vector) {
+            free(compact_rows);
+            free(compact_vectors);
+            free(compact_metadata);
+            errno = EINVAL;
+            return false;
+        }
+        metadata = qihse_vdb_metadata_at(vdb, old_row);
+        if (old_row->metadata_size != 0u && !metadata) {
+            free(compact_rows);
+            free(compact_vectors);
+            free(compact_metadata);
+            errno = EINVAL;
+            return false;
+        }
+
+        new_row = &compact_rows[live_count];
+        *new_row = *old_row;
+        new_row->vector_offset = (uint64_t)compact_vector_bytes;
+        new_row->metadata_offset = (uint64_t)compact_metadata_bytes;
+        new_row->row_flags = QIHSE_ROW_F_LIVE;
+        new_row->reserved = 0u;
+
+        if (vector_row_bytes != 0u) {
+            memcpy(compact_vectors + compact_vector_bytes, vector, vector_row_bytes);
+            compact_vector_bytes += vector_row_bytes;
+        }
+        if (old_row->metadata_size != 0u) {
+            memcpy(compact_metadata + compact_metadata_bytes, metadata,
+                   (size_t)old_row->metadata_size);
+            compact_metadata_bytes += (size_t)old_row->metadata_size;
+        }
+        live_count++;
+    }
+    if (live_count != vdb->live_vectors) {
+        free(compact_rows);
+        free(compact_vectors);
+        free(compact_metadata);
+        errno = EINVAL;
+        return false;
+    }
+
+    free(vdb->rows);
+    free(vdb->vectors);
+    free(vdb->metadata);
+    free(vdb->idmap);
+    vdb->rows = compact_rows;
+    vdb->rows_capacity = live_count;
+    vdb->total_vectors = live_count;
+    vdb->vectors = compact_vectors;
+    vdb->vector_bytes_used = compact_vector_bytes;
+    vdb->vector_bytes_capacity = compact_vector_bytes;
+    vdb->metadata = compact_metadata;
+    vdb->metadata_bytes_used = compact_metadata_bytes;
+    vdb->metadata_bytes_capacity = compact_metadata_bytes;
+    vdb->idmap = NULL;
+    vdb->idmap_count = 0u;
+    vdb->idmap_valid = false;
+    vdb->idmap_dirty = true;
+    vdb->dirty = true;
+    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    vdb->trinary_rows = 0u;
+    return true;
+}
+
 bool qihse_vector_db_compact(qihse_vector_db_t vdb) {
     if (!qihse_vdb_ensure_writable(vdb)) {
+        return false;
+    }
+    if (!qihse_vdb_compact_live_rows(vdb)) {
         return false;
     }
     return qihse_vector_db_flush(vdb);
