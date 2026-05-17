@@ -104,6 +104,10 @@ static bool test_duplicate_vector_id_rejected(void);
 static bool test_corrupt_idmap_rebuilds_high_ids(void);
 static bool test_missing_vectors_qtri_accepted(void);
 static bool test_corrupt_vectors_qtri_accepted_and_reported(void);
+static bool test_trinary_candidate_search_matches_float32_top_ids(void);
+static bool test_default_search_ignores_missing_or_corrupt_qtri(void);
+static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void);
+static bool test_trinary_candidate_search_validates_counts(void);
 static bool test_delete_by_id_persists_across_reopen(void);
 static bool test_update_by_id_replaces_vector_and_metadata(void);
 static bool test_upsert_by_ids_reports_insert_and_update_counts(void);
@@ -148,6 +152,14 @@ int main(void) {
          test_missing_vectors_qtri_accepted},
         {"corrupt vectors.qtri is accepted but reported unavailable",
          test_corrupt_vectors_qtri_accepted_and_reported},
+        {"PR-5 qtri candidate search matches FLOAT32 top IDs",
+         test_trinary_candidate_search_matches_float32_top_ids},
+        {"PR-5 default search ignores missing/corrupt qtri",
+         test_default_search_ignores_missing_or_corrupt_qtri},
+        {"PR-5 opt-in qtri search rejects missing/corrupt qtri",
+         test_trinary_candidate_search_rejects_missing_or_corrupt_qtri},
+        {"PR-5 qtri candidate search validates candidate_count/top_k",
+         test_trinary_candidate_search_validates_counts},
         {"delete_by_id persists across reopen",
          test_delete_by_id_persists_across_reopen},
         {"update_by_id replaces vector and metadata",
@@ -1227,6 +1239,279 @@ static bool test_corrupt_vectors_qtri_accepted_and_reported(void) {
     env_destroy(&env);
     return true;
 }
+
+#if defined(QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API)
+static int search_many(qihse_vector_db_t vdb,
+                       const float* query_vector,
+                       size_t dims,
+                       size_t top_k,
+                       qihse_vector_result_t* results,
+                       size_t max_results) {
+    qihse_vector_query_t query = {
+        .query_vector = query_vector,
+        .vector_dims = dims,
+        .top_k = top_k,
+        .similarity_threshold = -1.0f,
+        .include_vectors = false,
+        .include_metadata = false,
+        .use_trinary_candidates = false,
+        .candidate_count = 0u,
+    };
+
+    return qihse_vector_db_search(vdb, &query, results, max_results);
+}
+
+static int search_many_qtri(qihse_vector_db_t vdb,
+                            const float* query_vector,
+                            size_t dims,
+                            size_t top_k,
+                            size_t candidate_count,
+                            qihse_vector_result_t* results,
+                            size_t max_results) {
+    qihse_vector_query_t query = {
+        .query_vector = query_vector,
+        .vector_dims = dims,
+        .top_k = top_k,
+        .similarity_threshold = -1.0f,
+        .include_vectors = false,
+        .include_metadata = false,
+        .use_trinary_candidates = true,
+        .candidate_count = candidate_count,
+    };
+
+    return qihse_vector_db_search(vdb, &query, results, max_results);
+}
+
+static bool create_sign_friendly_qtri_db(test_env_t* env, char** out_path) {
+    const float vectors[][6] = {
+        { 3.0f,  2.0f,  1.0f, -1.0f, -2.0f, -3.0f},
+        { 2.0f,  1.0f,  3.0f, -1.0f, -3.0f, -2.0f},
+        {-3.0f, -2.0f, -1.0f,  1.0f,  2.0f,  3.0f},
+        { 1.0f,  3.0f,  2.0f, -2.0f, -1.0f, -3.0f},
+        {-2.0f, -1.0f, -3.0f,  3.0f,  1.0f,  2.0f},
+    };
+    const uint64_t ids[] = {9101, 9102, 9103, 9104, 9105};
+
+    char* path = make_temp_db_path("pr5_qtri_search");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env->uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database for qtri search");
+    TEST_ASSERT(qihse_vector_db_add_vectors(db, &vectors[0][0], ARRAY_LEN(vectors),
+                                            ARRAY_LEN(vectors[0]), ids, NULL, NULL),
+                "sign-friendly fixture insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close and write qtri sidecar");
+
+    *out_path = path;
+    return true;
+}
+
+static bool test_trinary_candidate_search_matches_float32_top_ids(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "sign-friendly qtri DB fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "qtri fixture should reopen read-only");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available for qtri fixture");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "qtri fixture should have a valid sidecar");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t float32_results[3];
+    qihse_vector_result_t qtri_results[3];
+    memset(float32_results, 0, sizeof(float32_results));
+    memset(qtri_results, 0, sizeof(qtri_results));
+
+    int float32_count = search_many(db, query, ARRAY_LEN(query), 3u,
+                                    float32_results, ARRAY_LEN(float32_results));
+    int qtri_count = search_many_qtri(db, query, ARRAY_LEN(query), 3u, 5u,
+                                      qtri_results, ARRAY_LEN(qtri_results));
+    TEST_ASSERT(float32_count == 3, "FLOAT32 search should return top 3");
+    TEST_ASSERT(qtri_count == 3, "qtri candidate search should return top 3");
+    for (size_t i = 0; i < ARRAY_LEN(float32_results); i++) {
+        TEST_ASSERT(qtri_results[i].id == float32_results[i].id,
+                    "qtri candidate search should preserve FLOAT32 top ID order");
+    }
+
+    free_results(float32_results, ARRAY_LEN(float32_results));
+    free_results(qtri_results, ARRAY_LEN(qtri_results));
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only qtri fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_default_search_ignores_missing_or_corrupt_qtri(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "default-search missing/corrupt fixture should be created");
+
+    char qtri_path[512];
+    snprintf(qtri_path, sizeof(qtri_path), "%s/vectors.qtri", path);
+    TEST_ASSERT(unlink(qtri_path) == 0, "test should remove vectors.qtri");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "missing qtri should not block default open");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t result;
+    int count = search_many(db, query, ARRAY_LEN(query), 1u, &result, 1u);
+    TEST_ASSERT(count == 1, "default FLOAT32 search should work with missing qtri");
+    TEST_ASSERT(result.id == 9101, "default FLOAT32 search should return expected ID");
+    free_results(&result, 1u);
+    TEST_ASSERT(qihse_vector_db_close(db), "missing-qtri database should close");
+
+    const uint8_t invalid_tryte[] = {0xff, 0x00};
+    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
+                "test should write corrupt qtri sidecar");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "corrupt qtri should not block default open");
+    count = search_many(db, query, ARRAY_LEN(query), 1u, &result, 1u);
+    TEST_ASSERT(count == 1, "default FLOAT32 search should work with corrupt qtri");
+    TEST_ASSERT(result.id == 9101, "default FLOAT32 search should ignore corrupt qtri");
+    free_results(&result, 1u);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "corrupt-qtri database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "opt-in rejection fixture should be created");
+
+    char qtri_path[512];
+    snprintf(qtri_path, sizeof(qtri_path), "%s/vectors.qtri", path);
+    TEST_ASSERT(unlink(qtri_path) == 0, "test should remove vectors.qtri");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "missing qtri fixture should reopen");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t result;
+    int count = search_many_qtri(db, query, ARRAY_LEN(query), 1u, 3u, &result, 1u);
+    TEST_ASSERT(count < 0, "opt-in qtri search should reject missing qtri");
+    TEST_ASSERT(qihse_vector_db_close(db), "missing-qtri opt-in fixture should close");
+
+    const uint8_t invalid_tryte[] = {0xff, 0x00};
+    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
+                "test should write corrupt qtri sidecar");
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "corrupt qtri fixture should reopen");
+    count = search_many_qtri(db, query, ARRAY_LEN(query), 1u, 3u, &result, 1u);
+    TEST_ASSERT(count < 0, "opt-in qtri search should reject corrupt qtri");
+
+    TEST_ASSERT(qihse_vector_db_close(db), "corrupt-qtri opt-in fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_trinary_candidate_search_validates_counts(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "count-validation fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "count-validation fixture should reopen");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t results[3];
+    TEST_ASSERT(search_many_qtri(db, query, ARRAY_LEN(query), 0u, 3u,
+                                 results, ARRAY_LEN(results)) < 0,
+                "opt-in qtri search should reject top_k == 0");
+    TEST_ASSERT(search_many_qtri(db, query, ARRAY_LEN(query), 2u, 0u,
+                                 results, ARRAY_LEN(results)) < 0,
+                "opt-in qtri search should reject candidate_count == 0");
+    TEST_ASSERT(search_many_qtri(db, query, ARRAY_LEN(query), 3u, 2u,
+                                 results, ARRAY_LEN(results)) < 0,
+                "opt-in qtri search should reject candidate_count < top_k");
+    TEST_ASSERT(search_many_qtri(db, query, ARRAY_LEN(query), 3u, 5u,
+                                 results, 2u) < 0,
+                "opt-in qtri search should reject max_results < top_k");
+
+    TEST_ASSERT(qihse_vector_db_close(db), "count-validation fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+#else
+static bool pr5_trinary_search_api_unavailable(const char* test_name) {
+    printf("SKIP %s: QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API is not available in this branch\n",
+           test_name);
+    return true;
+}
+
+static bool test_trinary_candidate_search_matches_float32_top_ids(void) {
+    return pr5_trinary_search_api_unavailable("qtri candidate search parity");
+}
+
+static bool test_default_search_ignores_missing_or_corrupt_qtri(void) {
+    return pr5_trinary_search_api_unavailable("default search missing/corrupt qtri tolerance");
+}
+
+static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void) {
+    return pr5_trinary_search_api_unavailable("opt-in qtri missing/corrupt rejection");
+}
+
+static bool test_trinary_candidate_search_validates_counts(void) {
+    return pr5_trinary_search_api_unavailable("candidate_count/top_k validation");
+}
+#endif
 
 static bool test_delete_by_id_persists_across_reopen(void) {
     test_env_t env;

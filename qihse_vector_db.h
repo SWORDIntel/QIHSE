@@ -368,6 +368,29 @@ int qihse_vector_db_search(
 );
 
 /**
+ * Explicit opt-in trinary candidate search.
+ *
+ * This path uses a valid vectors.qtri sidecar only to choose candidate rows,
+ * then reranks those candidates against the authoritative float32 vectors.
+ * It fails instead of falling back when the sidecar is absent, corrupt, stale,
+ * or when candidate_count is smaller than query->top_k.
+ *
+ * @param vdb Vector database handle
+ * @param query Query parameters; query->top_k is the required result count
+ * @param candidate_count Number of trinary candidates to generate before rerank
+ * @param results Output array for exact-reranked float32 results
+ * @param max_results Capacity of results; must be at least query->top_k
+ * @return Number of results found, or negative on error
+ */
+int qihse_vector_db_search_trinary_candidates(
+    qihse_vector_db_t vdb,
+    const qihse_vector_query_t* query,
+    size_t candidate_count,
+    qihse_vector_result_t* results,
+    size_t max_results
+);
+
+/**
  * Pre-load vectors for instant access based on query pattern.
  *
  * @param vdb Vector database handle

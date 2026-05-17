@@ -13,16 +13,28 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef QIHSE_BENCH_ROWS
 #define QIHSE_BENCH_ROWS 2048u
+#endif
+#ifndef QIHSE_BENCH_DIMS
 #define QIHSE_BENCH_DIMS 64u
+#endif
+#ifndef QIHSE_BENCH_CANDIDATES
 #define QIHSE_BENCH_CANDIDATES 64u
+#endif
+#ifndef QIHSE_BENCH_TOPK
 #define QIHSE_BENCH_TOPK 8u
+#endif
+#ifndef QIHSE_BENCH_ITERS
 #define QIHSE_BENCH_ITERS 32u
+#endif
 
 typedef enum qihse_bench_dataset_e {
     QIHSE_BENCH_DATASET_ALIGNED = 0,
     QIHSE_BENCH_DATASET_BANDED = 1,
-    QIHSE_BENCH_DATASET_WEIGHTED = 2
+    QIHSE_BENCH_DATASET_WEIGHTED = 2,
+    QIHSE_BENCH_DATASET_MAGNITUDE_SKEW = 3,
+    QIHSE_BENCH_DATASET_NEAR_TIE = 4
 } qihse_bench_dataset_t;
 
 typedef struct qihse_bench_ranked_s {
@@ -58,6 +70,12 @@ static qihse_bench_dataset_t qihse_bench_dataset(void) {
     if (name && strcmp(name, "weighted") == 0) {
         return QIHSE_BENCH_DATASET_WEIGHTED;
     }
+    if (name && strcmp(name, "magnitude_skew") == 0) {
+        return QIHSE_BENCH_DATASET_MAGNITUDE_SKEW;
+    }
+    if (name && strcmp(name, "near_tie") == 0) {
+        return QIHSE_BENCH_DATASET_NEAR_TIE;
+    }
     return QIHSE_BENCH_DATASET_ALIGNED;
 }
 
@@ -67,6 +85,10 @@ static const char* qihse_bench_dataset_name(qihse_bench_dataset_t dataset) {
             return "banded";
         case QIHSE_BENCH_DATASET_WEIGHTED:
             return "weighted";
+        case QIHSE_BENCH_DATASET_MAGNITUDE_SKEW:
+            return "magnitude_skew";
+        case QIHSE_BENCH_DATASET_NEAR_TIE:
+            return "near_tie";
         case QIHSE_BENCH_DATASET_ALIGNED:
         default:
             return "aligned";
@@ -83,10 +105,101 @@ static float qihse_bench_query_value(qihse_bench_dataset_t dataset, size_t dim) 
     return (dim % 3u == 0u) ? 1.0f : -1.0f;
 }
 
+static int qihse_bench_dataset_is_hard(qihse_bench_dataset_t dataset) {
+    return dataset == QIHSE_BENCH_DATASET_MAGNITUDE_SKEW ||
+           dataset == QIHSE_BENCH_DATASET_NEAR_TIE;
+}
+
+static int qihse_bench_dataset_requires_perfect(qihse_bench_dataset_t dataset,
+                                                size_t candidate_count) {
+    return !qihse_bench_dataset_is_hard(dataset) ||
+           candidate_count >= QIHSE_BENCH_ROWS;
+}
+
+static void qihse_bench_fill_magnitude_skew(float* rows,
+                                            float* query,
+                                            uint64_t* ids) {
+    size_t row;
+    size_t dim;
+
+    for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+        float sign = (dim % 2u == 0u) ? 1.0f : -1.0f;
+        query[dim] = sign * (dim < 8u ? 10.0f : 0.1f);
+    }
+
+    for (row = 0u; row < QIHSE_BENCH_ROWS; row++) {
+        ids[row] = 3100000u + (uint64_t)row;
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            float sign = query[dim] > 0.0f ? 1.0f : -1.0f;
+            rows[(row * QIHSE_BENCH_DIMS) + dim] = -sign * 0.05f;
+        }
+    }
+
+    for (row = 0u; row < 96u && row < QIHSE_BENCH_ROWS; row++) {
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            float sign = query[dim] > 0.0f ? 1.0f : -1.0f;
+            rows[(row * QIHSE_BENCH_DIMS) + dim] = sign;
+        }
+    }
+
+    for (row = 0u; row < QIHSE_BENCH_TOPK && 256u + row < QIHSE_BENCH_ROWS; row++) {
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            float sign = query[dim] > 0.0f ? 1.0f : -1.0f;
+            if (dim < 8u) {
+                rows[((256u + row) * QIHSE_BENCH_DIMS) + dim] =
+                    sign * (10.0f - ((float)row * 0.01f));
+            } else {
+                rows[((256u + row) * QIHSE_BENCH_DIMS) + dim] = -sign * 0.1f;
+            }
+        }
+    }
+}
+
+static void qihse_bench_fill_near_tie(float* rows,
+                                      float* query,
+                                      uint64_t* ids) {
+    size_t row;
+    size_t dim;
+
+    for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+        query[dim] = 1.0f;
+    }
+
+    for (row = 0u; row < QIHSE_BENCH_ROWS; row++) {
+        ids[row] = 4100000u + (uint64_t)row;
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            rows[(row * QIHSE_BENCH_DIMS) + dim] = -1.0f;
+        }
+    }
+
+    for (row = 0u; row < 96u && row < QIHSE_BENCH_ROWS; row++) {
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            rows[(row * QIHSE_BENCH_DIMS) + dim] =
+                dim < 8u ? 0.70f : 1.0f;
+        }
+    }
+
+    for (row = 0u; row < QIHSE_BENCH_TOPK && 256u + row < QIHSE_BENCH_ROWS; row++) {
+        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
+            rows[((256u + row) * QIHSE_BENCH_DIMS) + dim] =
+                dim == row ? 1.0f - ((float)row * 0.001f) : 1.0f;
+        }
+    }
+}
+
 static void qihse_bench_fill_data(float* rows, float* query, uint64_t* ids) {
     qihse_bench_dataset_t dataset = qihse_bench_dataset();
     size_t row;
     size_t dim;
+
+    if (dataset == QIHSE_BENCH_DATASET_MAGNITUDE_SKEW) {
+        qihse_bench_fill_magnitude_skew(rows, query, ids);
+        return;
+    }
+    if (dataset == QIHSE_BENCH_DATASET_NEAR_TIE) {
+        qihse_bench_fill_near_tie(rows, query, ids);
+        return;
+    }
 
     for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
         query[dim] = qihse_bench_query_value(dataset, dim);
@@ -618,7 +731,11 @@ int main(void) {
                                 oracle,
                                 QIHSE_BENCH_TOPK,
                                 &oracle_count) ||
-        !qihse_bench_verify_full_search(full_results, full_count, oracle, oracle_count) ||
+        !qihse_bench_verify_full_search(full_results, full_count, oracle, oracle_count)) {
+        goto cleanup;
+    }
+
+    if (qihse_bench_dataset_requires_perfect(dataset, candidate_count) &&
         !qihse_bench_verify_rerank(reranked, reranked_count, oracle, oracle_count)) {
         goto cleanup;
     }
@@ -644,7 +761,7 @@ int main(void) {
     printf("load_ms=%.3f full_float32_avg_us=%.3f trinary_select_avg_us=%.3f "
            "exact_rerank_avg_us=%.3f trinary_rerank_avg_us=%.3f "
            "speedup_vs_full=%.3fx recall_at_%u=%.3f ordered_at_%u=%.3f "
-           "checksum=%lld\n",
+           "perfect_expected=%s checksum=%lld\n",
            load_seconds * 1000.0,
            (full_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
            (select_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
@@ -660,6 +777,7 @@ int main(void) {
            (unsigned)QIHSE_BENCH_TOPK,
            full_topk_count == 0u ? 0.0
                                  : (double)ordered_matches / (double)full_topk_count,
+           qihse_bench_dataset_requires_perfect(dataset, candidate_count) ? "yes" : "no",
            (long long)checksum);
     for (i = 0u; i < reranked_count; i++) {
         printf("result[%zu] row=%zu id=%llu tri_score=%d exact_score=%.6f\n",

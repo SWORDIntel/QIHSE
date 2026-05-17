@@ -4,6 +4,7 @@
 
 #include "qihse_vector_db.h"
 
+#include "codecs/qihse_trinary_tryte_codec.h"
 #include "persistence/qihse_file.h"
 #include "persistence/qihse_persist_format.h"
 #include "persistence/qihse_vector_store.h"
@@ -100,6 +101,8 @@ struct qihse_vector_db_s {
     qihse_vector_db_trinary_status_t trinary_status;
     uint64_t trinary_row_bytes;
     uint64_t trinary_rows;
+    uint8_t* trinary;
+    size_t trinary_bytes;
 
     bool hilbert_enabled;
     bool quantization_enabled;
@@ -124,6 +127,8 @@ typedef qihse_vdb_wal_add_t qihse_vdb_wal_vectors_t;
 static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
                                       size_t append_count,
                                       size_t metadata_bytes);
+static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb);
+static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb);
 
 static char* qihse_vdb_strdup(const char* s) {
     size_t len;
@@ -429,7 +434,7 @@ static size_t qihse_vdb_tombstone_live_id(qihse_vector_db_t vdb,
         vdb->idmap_valid = false;
         vdb->idmap_dirty = true;
         vdb->dirty = true;
-        vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+        qihse_vdb_set_trinary_stale(vdb);
     }
     return count;
 }
@@ -441,7 +446,23 @@ static void qihse_vdb_finish_mutation_generation(qihse_vector_db_t vdb, uint64_t
     vdb->dirty = true;
     vdb->idmap_valid = false;
     vdb->idmap_dirty = true;
-    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    qihse_vdb_set_trinary_stale(vdb);
+}
+
+static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb) {
+    if (!vdb) {
+        return;
+    }
+    qihse_vdb_set_trinary_stale(vdb);
+}
+
+static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb) {
+    if (!vdb) {
+        return;
+    }
+    free(vdb->trinary);
+    vdb->trinary = NULL;
+    vdb->trinary_bytes = 0u;
 }
 
 static const float* qihse_vdb_vector_at(const qihse_vector_db_t vdb, const qihse_index_row_t* row) {
@@ -1578,16 +1599,34 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
         return false;
     }
     qtri_exists = qihse_vdb_exists(vdb->db_path, QIHSE_VDB_TRINARY_NAME);
-    if (snapshot.trinary_valid) {
+    size_t expected_trinary_row_bytes = 0u;
+    bool trinary_shape_valid = vdb->vector_dims != 0u &&
+        qihse_trinary_tryte_row_bytes(vdb->vector_dims, &expected_trinary_row_bytes) &&
+        snapshot.manifest.trinary_row_bytes == (uint64_t)expected_trinary_row_bytes &&
+        snapshot.manifest.trinary_rows == (uint64_t)vdb->total_vectors;
+
+    if (snapshot.trinary_valid && trinary_shape_valid &&
+        snapshot.manifest.trinary_generation == vdb->committed_generation) {
         vdb->trinary_status = QIHSE_VDB_TRINARY_VALID;
         vdb->trinary_row_bytes = snapshot.manifest.trinary_row_bytes;
         vdb->trinary_rows = snapshot.manifest.trinary_rows;
+        vdb->trinary = snapshot.trinary;
+        vdb->trinary_bytes = snapshot.trinary_bytes;
+        snapshot.trinary = NULL;
+        snapshot.trinary_bytes = 0u;
+    } else if (snapshot.trinary_valid) {
+        vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+        vdb->trinary_row_bytes = snapshot.manifest.trinary_row_bytes;
+        vdb->trinary_rows = snapshot.manifest.trinary_rows;
+        qihse_vdb_clear_trinary_cache(vdb);
     } else if (qtri_exists) {
         vdb->trinary_status = QIHSE_VDB_TRINARY_CORRUPT;
         vdb->trinary_row_bytes = snapshot.manifest.trinary_row_bytes;
         vdb->trinary_rows = snapshot.manifest.trinary_rows;
+        qihse_vdb_clear_trinary_cache(vdb);
     } else {
         vdb->trinary_status = QIHSE_VDB_TRINARY_ABSENT;
+        qihse_vdb_clear_trinary_cache(vdb);
     }
     if (use_mmap && (vdb->vector_bytes_used != 0u || vdb->metadata_bytes_used != 0u)) {
         free(vdb->vectors);
@@ -2219,6 +2258,204 @@ int qihse_vector_db_search(
     return (int)out_count;
 }
 
+static bool qihse_vdb_insert_exact_result(qihse_vector_db_t vdb,
+                                          const qihse_vector_query_t* query,
+                                          const qihse_index_row_t* row,
+                                          const float* vector,
+                                          float score,
+                                          qihse_vector_result_t* results,
+                                          size_t result_limit,
+                                          size_t* out_count) {
+    size_t insert_at;
+    qihse_vector_result_t result;
+
+    insert_at = *out_count < result_limit ? *out_count : result_limit - 1u;
+    while (insert_at > 0u && results[insert_at - 1u].score < score) {
+        if (insert_at < result_limit) {
+            results[insert_at] = results[insert_at - 1u];
+        }
+        insert_at--;
+    }
+    if (insert_at >= result_limit) {
+        return true;
+    }
+
+    memset(&result, 0, sizeof(result));
+    result.id = row->vector_id;
+    result.score = score;
+    result.vector_dims = vdb->vector_dims;
+    if (query->include_vectors) {
+        size_t bytes = vdb->vector_dims * sizeof(float);
+        result.vector = (float*)malloc(bytes);
+        if (!result.vector) {
+            errno = ENOMEM;
+            return false;
+        }
+        memcpy(result.vector, vector, bytes);
+    }
+    if (query->include_metadata && row->metadata_size != 0u) {
+        const void* metadata = qihse_vdb_metadata_at(vdb, row);
+        if (!metadata || row->metadata_size > (uint64_t)SIZE_MAX) {
+            free(result.vector);
+            errno = EINVAL;
+            return false;
+        }
+        result.metadata = malloc((size_t)row->metadata_size);
+        if (!result.metadata) {
+            free(result.vector);
+            errno = ENOMEM;
+            return false;
+        }
+        memcpy(result.metadata, metadata, (size_t)row->metadata_size);
+        result.metadata_size = (size_t)row->metadata_size;
+    }
+    if (*out_count >= result_limit) {
+        free(results[result_limit - 1u].vector);
+        free(results[result_limit - 1u].metadata);
+    }
+    results[insert_at] = result;
+    if (*out_count < result_limit) {
+        (*out_count)++;
+    }
+    return true;
+}
+
+static void qihse_vdb_set_trinary_errno(qihse_vector_db_trinary_status_t status) {
+    switch (status) {
+        case QIHSE_VDB_TRINARY_ABSENT:
+            errno = ENOENT;
+            break;
+        case QIHSE_VDB_TRINARY_STALE:
+#ifdef ESTALE
+            errno = ESTALE;
+#else
+            errno = EINVAL;
+#endif
+            break;
+        case QIHSE_VDB_TRINARY_CORRUPT:
+            errno = EINVAL;
+            break;
+        case QIHSE_VDB_TRINARY_VALID:
+        default:
+            errno = EINVAL;
+            break;
+    }
+}
+
+int qihse_vector_db_search_trinary_candidates(
+    qihse_vector_db_t vdb,
+    const qihse_vector_query_t* query,
+    size_t candidate_count,
+    qihse_vector_result_t* results,
+    size_t max_results
+) {
+    uint8_t* encoded_query = NULL;
+    size_t* candidate_rows = NULL;
+    int32_t* candidate_scores = NULL;
+    size_t row_bytes = 0u;
+    size_t expected_trinary_bytes = 0u;
+    size_t candidate_out = 0u;
+    size_t out_count = 0u;
+    size_t top_k;
+    size_t i;
+
+    if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
+        query->vector_dims != vdb->vector_dims || query->top_k == 0u ||
+        query->top_k > max_results) {
+        errno = EINVAL;
+        return -1;
+    }
+    top_k = query->top_k;
+    if (candidate_count < top_k) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (vdb->trinary_status != QIHSE_VDB_TRINARY_VALID) {
+        qihse_vdb_set_trinary_errno(vdb->trinary_status);
+        return -1;
+    }
+    if (!qihse_trinary_tryte_row_bytes(vdb->vector_dims, &row_bytes) ||
+        vdb->trinary_rows > (uint64_t)SIZE_MAX ||
+        !qihse_checked_mul_size((size_t)vdb->trinary_rows, row_bytes,
+                                &expected_trinary_bytes) ||
+        vdb->trinary_row_bytes != (uint64_t)row_bytes ||
+        vdb->trinary_rows != (uint64_t)vdb->total_vectors ||
+        !vdb->trinary ||
+        vdb->trinary_bytes != expected_trinary_bytes) {
+        qihse_vdb_set_trinary_stale(vdb);
+#ifdef ESTALE
+        errno = ESTALE;
+#else
+        errno = EINVAL;
+#endif
+        return -1;
+    }
+
+    memset(results, 0, max_results * sizeof(*results));
+    encoded_query = (uint8_t*)malloc(row_bytes ? row_bytes : 1u);
+    candidate_rows = (size_t*)calloc(candidate_count ? candidate_count : 1u,
+                                     sizeof(*candidate_rows));
+    candidate_scores = (int32_t*)calloc(candidate_count ? candidate_count : 1u,
+                                        sizeof(*candidate_scores));
+    if (!encoded_query || !candidate_rows || !candidate_scores) {
+        free(encoded_query);
+        free(candidate_rows);
+        free(candidate_scores);
+        errno = ENOMEM;
+        return -1;
+    }
+    if (!qihse_trinary_tryte_encode_row(query->query_vector, vdb->vector_dims,
+                                        encoded_query, row_bytes) ||
+        !qihse_trinary_tryte_select_topk(vdb->trinary,
+                                         encoded_query,
+                                         (size_t)vdb->trinary_rows,
+                                         vdb->vector_dims,
+                                         candidate_rows,
+                                         candidate_scores,
+                                         candidate_count,
+                                         &candidate_out)) {
+        free(encoded_query);
+        free(candidate_rows);
+        free(candidate_scores);
+        return -1;
+    }
+
+    for (i = 0u; i < candidate_out; i++) {
+        const qihse_index_row_t* row;
+        const float* vector;
+        float score;
+
+        if (candidate_rows[i] >= vdb->total_vectors) {
+            continue;
+        }
+        row = &vdb->rows[candidate_rows[i]];
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+            continue;
+        }
+        vector = qihse_vdb_vector_at(vdb, row);
+        if (!vector) {
+            continue;
+        }
+        score = qihse_vdb_cosine_similarity(query->query_vector, vector, vdb->vector_dims);
+        if (score < query->similarity_threshold) {
+            continue;
+        }
+        if (!qihse_vdb_insert_exact_result(vdb, query, row, vector, score,
+                                           results, top_k, &out_count)) {
+            free(encoded_query);
+            free(candidate_rows);
+            free(candidate_scores);
+            return -1;
+        }
+    }
+
+    free(encoded_query);
+    free(candidate_rows);
+    free(candidate_scores);
+    return (int)out_count;
+}
+
 bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
     qihse_vector_store_flush_t flush;
     uint8_t* trinary = NULL;
@@ -2273,6 +2510,10 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
         vdb->idmap_dirty = false;
         vdb->idmap_valid = true;
         if (trinary_bytes != 0u) {
+            qihse_vdb_clear_trinary_cache(vdb);
+            vdb->trinary = trinary;
+            vdb->trinary_bytes = trinary_bytes;
+            trinary = NULL;
             vdb->trinary_status = QIHSE_VDB_TRINARY_VALID;
         }
     }
@@ -2410,7 +2651,7 @@ static bool qihse_vdb_compact_live_rows(qihse_vector_db_t vdb) {
     vdb->idmap_valid = false;
     vdb->idmap_dirty = true;
     vdb->dirty = true;
-    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    qihse_vdb_set_trinary_stale(vdb);
     vdb->trinary_rows = 0u;
     return true;
 }
@@ -2448,6 +2689,7 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     free(vdb->vectors);
     free(vdb->metadata);
     free(vdb->idmap);
+    free(vdb->trinary);
     free(vdb);
 }
 
