@@ -1,12 +1,14 @@
 # QIHSE File Persistence Checkpoint
 
-Date: 2026-05-17
+Date: 2026-05-18
 Branch: `master`
-Remote target: `gitlab/master`
+Remote target: `gitlab/master` (FRAMEWERX sync target)
 
 ## Current Direction
 
-QIHSE is being treated as its own native program inside the merged FRAMEWERX tree.
+QIHSE remains a native program with authoritative development in the upstream
+`https://github.com/SWORDIntel/QIHSE` repository. FRAMEWERX carries a downstream
+integrated copy under `qihse/` for product integration.
 The database layer is moving from in-memory-only behavior to file-backed
 persistence across vectors, indexes, id maps, WAL replay, compaction, and derived
 sidecars.
@@ -225,8 +227,8 @@ weighted prototype qtri selectors.
    summarized through the manifest-backed recall gate.
 2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
-   back into FRAMEWERX. `make check-upstream-workflow` now reports whether the
-   current QIHSE tree is an upstream checkout or an imported FRAMEWERX copy.
+   back into FRAMEWERX. For strict upstream validation from within `qihse/`, use
+   `make check-upstream-workflow-strict`.
 3. Continue file persistence breadth only after the benchmark runner is moving,
    with remaining authoritative-file corruption focused on manifest/index
    consistency fields after a valid snapshot exists.

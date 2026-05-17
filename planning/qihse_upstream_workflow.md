@@ -4,37 +4,37 @@ QIHSE is its own upstream program. The authoritative repository is:
 
 `https://github.com/SWORDIntel/QIHSE`
 
-FRAMEWERX can carry an integrated copy under `qihse/`, but that copy should be
-treated as an import target, not the long-term owner of QIHSE design decisions.
+FRAMEWERX carries an integrated copy under `qihse/`, but that copy is downstream
+of upstream decisions and should only be updated from stable upstream changes.
 
-## Current Bridge
+## Active Workflow (QIHSE-first)
 
-The current bridge is FRAMEWERX-driven:
+1. Make and validate QIHSE changes in `https://github.com/SWORDIntel/QIHSE`.
+2. Verify against `qihse/`-level validation targets in the upstream working tree.
+3. Push stable upstream changes to upstream master.
+4. Import or cherry-pick upstream updates into FRAMEWERX when the file-based
+   persistence work has stabilized.
 
-1. Make QIHSE changes under FRAMEWERX `qihse/`.
-2. Split the subtree.
-3. Push the split to `SWORDIntel/QIHSE`.
+## FRAMEWERX-aligned Validation
 
-That is acceptable for the current migration window, but it should not become
-the permanent workflow once the QIHSE benchmark runner and reference workload
-pipeline stabilize.
+When you are iterating inside FRAMEWERX `qihse/`, run:
 
-## Target Workflow
+- `cd qihse`
+- `make check-upstream-workflow` (or `make check` for the default)
+- `make validate-reference-workflow`
+- `make bench-reference-workloads`
+- `make sample-vxug-pdf-workload` when the local VXUG PDF corpus is available
+- `make bench-vxug-pdf-workload`
+- persistence tests for storage-layer changes
 
-1. Develop QIHSE changes directly in `SWORDIntel/QIHSE`.
-2. In this repository layout, run QIHSE-local validation from the `qihse/` subtree:
-   - `cd qihse`
-   - `make check` (runs `check-upstream-workflow`)
-   - `make check-upstream-workflow`
-   - `make validate-reference-workflow`
-   - `make bench-reference-workloads`
-   - `make sample-vxug-pdf-workload` when the FRAMEWERX VXUG PDF corpus is
-     available locally
-   - persistence tests for storage-layer changes
-   - `make bench-vxug-pdf-workload`
-3. Record benchmark summaries in QIHSE docs only after the runner is
-   repeatable and result files are generated outside git by default.
-4. Import the updated QIHSE state back into FRAMEWERX after upstream is stable.
+For direct upstream validation from the subtree root, use:
+
+```bash
+make check-upstream-workflow-strict
+```
+
+This fails unless the checkout is an upstream root with a `SWORDIntel/QIHSE`
+remote configured. Use it as a deliberate gate before tagging upstream PRs.
 
 ## Remaining Benchmark Workflow Work
 
@@ -46,14 +46,6 @@ pipeline stabilize.
 ## Workflow Check
 
 `make check-upstream-workflow` reports whether the current QIHSE root is a
-direct upstream checkout or an imported FRAMEWERX copy. In the same `qihse/`
-execution context, use:
-
-```bash
-python3 scripts/qihse_workflow_check.py --root . --strict-upstream
-```
-
-That mode fails unless the QIHSE root is the Git root and the checkout has a
-`SWORDIntel/QIHSE` remote. For `qihse/` subtree execution in FRAMEWERX,
-use `python3 scripts/qihse_workflow_check.py --root . --strict-upstream` only
-when intentionally validating an upstream checkout.
+direct upstream checkout or an imported FRAMEWERX copy.
+`make check-upstream-workflow-strict` adds the upstream-owner gate (`--strict-upstream`)
+and is useful before opening upstream PRs from a local workspace.
