@@ -45,6 +45,11 @@ exact float32 reranking.
 - Crash-recovery coverage now includes ignored interrupted `MANIFEST.tmp`
   publication after checkpoint and metadata payload corruption rejection through
   manifest CRC validation.
+- Authoritative-file boundary coverage now rejects truncated `vectors.qvec` and
+  `metadata.qmeta` payloads after a valid snapshot exists.
+- Checkpoint recovery coverage now also ignores stale authoritative file tmp
+  outputs (`vectors.qvec.tmp`, `metadata.qmeta.tmp`, `index.qidx.tmp`, and
+  `idmap.qid.tmp`) while reopening/searching the last valid published files.
 - Native integration cleanup is tracked in
   `qihse/planning/native_integration_cleanup.md`.
 - Historical `SWORDIntel_QIHSE/plans/` material has been summarized into
@@ -142,6 +147,19 @@ Latest focused result after QIHSE-only recovery fixture slice:
 `make test-persist` passed with new `metadata.qmeta` corruption rejection and
 stale `MANIFEST.tmp` recovery fixtures.
 
+Latest focused result after authoritative-file boundary slice:
+`make test-persist` passed with new truncated `vectors.qvec` and
+`metadata.qmeta` payload rejection fixtures.
+
+Latest focused result after checkpoint authoritative-tmp recovery slice:
+`make test-persist` passed with the new stale authoritative tmp recovery
+fixture.
+
+Latest trinary calibration decision:
+no candidate-pool multiplier changes until production-shaped embedding
+workloads exist. The current policy and tuning gates are documented in
+`qihse/benchmarks/reference_workloads.md`.
+
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
 `magnitude_skew` and `near_tie`. Those hard datasets are useful because they
@@ -184,4 +202,5 @@ weighted prototype qtri selectors.
    FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
    through `src/framewerx/evaluation/search_backend.py`.
 4. Use fresh sweep results to tune the candidate-pool resolver once more real
-   datasets exist; the current defaults are conservative and mode-aware.
+   datasets exist; the current defaults are conservative and mode-aware, and
+   synthetic-only multiplier tuning is intentionally deferred.

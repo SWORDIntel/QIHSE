@@ -100,10 +100,13 @@ static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_checkpoint_publishes_snapshot_and_clears_wal(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
+static bool test_truncated_vectors_qvec_payload_rejected(void);
 static bool test_corrupt_metadata_qmeta_rejected(void);
+static bool test_truncated_metadata_qmeta_payload_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
+static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void);
 static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
@@ -153,14 +156,20 @@ int main(void) {
          test_read_only_mmap_reopen_searches},
         {"corrupt vectors.qvec magic fails open cleanly",
          test_corrupt_vectors_qvec_magic_rejected},
+        {"truncated vectors.qvec payload fails open cleanly",
+         test_truncated_vectors_qvec_payload_rejected},
         {"corrupt metadata.qmeta fails open cleanly",
          test_corrupt_metadata_qmeta_rejected},
+        {"truncated metadata.qmeta payload fails open cleanly",
+         test_truncated_metadata_qmeta_payload_rejected},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
         {"truncated manifest fails open cleanly",
          test_truncated_manifest_rejected},
         {"stale MANIFEST.tmp is ignored after checkpoint",
          test_stale_manifest_tmp_ignored_after_checkpoint},
+        {"stale authoritative tmp files are ignored after checkpoint",
+         test_stale_authoritative_tmp_files_ignored_after_checkpoint},
         {"manifest rejects impossible qmag metadata",
          test_manifest_rejects_impossible_qmag_shape},
         {"read-only open can search but rejects add_vectors",
@@ -1099,6 +1108,48 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void) {
     return true;
 }
 
+static bool test_truncated_vectors_qvec_payload_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("truncated_qvec_payload");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vectors[][4] = {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+    };
+    const uint64_t ids[] = {9011, 9012};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(qihse_vector_db_add_vectors(db, &vectors[0][0], ARRAY_LEN(vectors),
+                                            ARRAY_LEN(vectors[0]), ids, NULL, NULL),
+                "insert before truncating qvec payload should succeed");
+    TEST_ASSERT(close_db(db), "database should close before qvec payload truncation");
+
+    off_t qvec_size = 0;
+    TEST_ASSERT(file_size_of(path, "vectors.qvec", &qvec_size),
+                "vectors.qvec size should be readable before truncation");
+    TEST_ASSERT(qvec_size > 1, "vectors.qvec should contain enough bytes to truncate");
+    TEST_ASSERT(truncate_file_to(path, "vectors.qvec", qvec_size - 1),
+                "test should truncate vectors.qvec payload");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "truncated vectors.qvec payload should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_corrupt_metadata_qmeta_rejected(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
@@ -1126,6 +1177,44 @@ static bool test_corrupt_metadata_qmeta_rejected(void) {
         QIHSE_TEST_OPEN_FILE_BACKED
     );
     TEST_ASSERT(db == NULL, "corrupt metadata.qmeta payload should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_truncated_metadata_qmeta_payload_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("truncated_qmeta_payload");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.75f, 0.50f, 0.25f};
+    const char metadata[] = "authoritative-metadata-truncated";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9013, metadata, sizeof(metadata)),
+                "insert before truncating metadata payload should succeed");
+    TEST_ASSERT(close_db(db), "database should close before metadata payload truncation");
+
+    off_t qmeta_size = 0;
+    TEST_ASSERT(file_size_of(path, "metadata.qmeta", &qmeta_size),
+                "metadata.qmeta size should be readable before truncation");
+    TEST_ASSERT(qmeta_size > 1, "metadata.qmeta should contain enough bytes to truncate");
+    TEST_ASSERT(truncate_file_to(path, "metadata.qmeta", qmeta_size - 1),
+                "test should truncate metadata.qmeta payload");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "truncated metadata.qmeta payload should fail open");
 
     remove_tree(path);
     free(path);
@@ -1251,6 +1340,88 @@ static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db), "read-only stale manifest tmp database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_stale_authoritative_tmp_files_ignored_after_checkpoint(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("stale_authoritative_tmps");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float first[] = {0.60f, 0.20f, 0.10f, 0.10f};
+    const float second[] = {0.10f, 0.20f, 0.60f, 0.10f};
+    const char first_metadata[] = "published-first";
+    const char second_metadata[] = "published-second";
+    const uint8_t stale_payload[] = {
+        'Q', 'I', 'H', 'S', 'E', '-', 'T', 'M', 'P',
+        0xde, 0xad, 0xbe, 0xef
+    };
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, first, ARRAY_LEN(first), 9011,
+                        first_metadata, sizeof(first_metadata)),
+                "first checkpoint tmp fixture insert should succeed");
+    TEST_ASSERT(add_one(db, second, ARRAY_LEN(second), 9012,
+                        second_metadata, sizeof(second_metadata)),
+                "second checkpoint tmp fixture insert should succeed");
+    TEST_ASSERT(qihse_vector_db_checkpoint(db),
+                "checkpoint should publish authoritative snapshot files");
+    TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
+
+    TEST_ASSERT(write_file_payload(path, "vectors.qvec.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale vectors.qvec tmp");
+    TEST_ASSERT(write_file_payload(path, "metadata.qmeta.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale metadata.qmeta tmp");
+    TEST_ASSERT(write_file_payload(path, "index.qidx.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale index.qidx tmp");
+    TEST_ASSERT(write_file_payload(path, "idmap.qid.tmp",
+                                   stale_payload, sizeof(stale_payload)),
+                "test should write stale idmap.qid tmp");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "stale authoritative tmp files should not block reopen");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after stale authoritative tmp reopen");
+    TEST_ASSERT(stats.index_rows == 2u,
+                "stale authoritative tmp files should not change index rows");
+    TEST_ASSERT(stats.live_vectors == 2u,
+                "stale authoritative tmp files should not change live rows");
+    TEST_ASSERT(stats.idmap_valid,
+                "stale authoritative tmp files should not invalidate idmap");
+    TEST_ASSERT(stats.wal_records_replayed == 0u,
+                "stale authoritative tmp files should not force WAL replay");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, second, ARRAY_LEN(second), true, true, &result);
+    TEST_ASSERT(count == 1, "published row should search despite stale tmp files");
+    TEST_ASSERT(result.id == 9012, "published row id should ignore stale tmp files");
+    TEST_ASSERT(vector_eq(result.vector, second, ARRAY_LEN(second)),
+                "published vector should ignore stale tmp files");
+    TEST_ASSERT(result.metadata_size == sizeof(second_metadata),
+                "published metadata size should ignore stale tmp files");
+    TEST_ASSERT(memcmp(result.metadata, second_metadata, sizeof(second_metadata)) == 0,
+                "published metadata should ignore stale tmp files");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db),
+                "read-only stale authoritative tmp database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
