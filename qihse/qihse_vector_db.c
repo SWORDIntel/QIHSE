@@ -27,6 +27,7 @@
 
 #define QIHSE_VDB_WAL_NAME "wal.qwal"
 #define QIHSE_VDB_VECTOR_NAME "vectors.qvec"
+#define QIHSE_VDB_METADATA_NAME "metadata.qmeta"
 #define QIHSE_VDB_TRINARY_NAME "vectors.qtri"
 #define QIHSE_VDB_MANIFEST_NAME "MANIFEST"
 
@@ -72,6 +73,9 @@ struct qihse_vector_db_s {
     int mmap_fd;
     void* mapped_vectors;
     size_t mapped_vector_bytes;
+    int metadata_mmap_fd;
+    void* mapped_metadata;
+    size_t mapped_metadata_bytes;
 
     qihse_vector_db_trinary_status_t trinary_status;
     uint64_t trinary_row_bytes;
@@ -186,7 +190,7 @@ static bool qihse_vdb_truncate_existing_file(const char* db_path, const char* na
 static void qihse_vdb_remove_snapshot_files(const char* db_path) {
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_MANIFEST_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_VECTOR_NAME);
-    (void)qihse_vdb_remove_file(db_path, "metadata.qmeta");
+    (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_METADATA_NAME);
     (void)qihse_vdb_remove_file(db_path, "index.qidx");
     (void)qihse_vdb_remove_file(db_path, "idmap.qid");
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_TRINARY_NAME);
@@ -294,16 +298,18 @@ static const float* qihse_vdb_vector_at(const qihse_vector_db_t vdb, const qihse
 }
 
 static const void* qihse_vdb_metadata_at(const qihse_vector_db_t vdb, const qihse_index_row_t* row) {
+    const uint8_t* base = vdb->mapped_metadata ? (const uint8_t*)vdb->mapped_metadata : vdb->metadata;
     uint64_t end;
 
     if (!row || row->metadata_size == 0u) {
         return NULL;
     }
-    if (!qihse_checked_add_u64(row->metadata_offset, row->metadata_size, &end) ||
+    if (!base ||
+        !qihse_checked_add_u64(row->metadata_offset, row->metadata_size, &end) ||
         end > (uint64_t)vdb->metadata_bytes_used) {
         return NULL;
     }
-    return vdb->metadata + row->metadata_offset;
+    return base + row->metadata_offset;
 }
 
 static float qihse_vdb_cosine_similarity(const float* a, const float* b, size_t dims) {
@@ -336,30 +342,65 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
         close(vdb->mmap_fd);
     }
     vdb->mmap_fd = -1;
+    if (vdb->mapped_metadata && vdb->mapped_metadata != MAP_FAILED) {
+        munmap(vdb->mapped_metadata, vdb->mapped_metadata_bytes);
+    }
+    vdb->mapped_metadata = NULL;
+    vdb->mapped_metadata_bytes = 0u;
+    if (vdb->metadata_mmap_fd >= 0) {
+        close(vdb->metadata_mmap_fd);
+    }
+    vdb->metadata_mmap_fd = -1;
+}
+
+static bool qihse_vdb_map_snapshot_file(qihse_vector_db_t vdb,
+                                        const char* name,
+                                        size_t bytes,
+                                        int* fd_out,
+                                        void** mapping_out) {
+    char path[PATH_MAX];
+    void* mapping;
+    int fd;
+
+    if (!vdb || !vdb->db_path || !name || !fd_out || !mapping_out) {
+        errno = EINVAL;
+        return false;
+    }
+    if (bytes == 0u) {
+        return true;
+    }
+    if (!qihse_vdb_path(path, vdb->db_path, name)) {
+        return false;
+    }
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    mapping = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapping == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    *fd_out = fd;
+    *mapping_out = mapping;
+    return true;
 }
 
 static bool qihse_vdb_map_vectors(qihse_vector_db_t vdb) {
-    char path[PATH_MAX];
-
-    if (!vdb || !vdb->db_path || vdb->vector_bytes_used == 0u) {
-        return true;
-    }
-    if (!qihse_vdb_path(path, vdb->db_path, QIHSE_VDB_VECTOR_NAME)) {
-        return false;
-    }
-    vdb->mmap_fd = open(path, O_RDONLY);
-    if (vdb->mmap_fd < 0) {
-        return false;
-    }
-    vdb->mapped_vectors = mmap(NULL, vdb->vector_bytes_used, PROT_READ, MAP_SHARED,
-                               vdb->mmap_fd, 0);
-    if (vdb->mapped_vectors == MAP_FAILED) {
-        vdb->mapped_vectors = NULL;
-        close(vdb->mmap_fd);
-        vdb->mmap_fd = -1;
+    if (!qihse_vdb_map_snapshot_file(vdb, QIHSE_VDB_VECTOR_NAME, vdb->vector_bytes_used,
+                                     &vdb->mmap_fd, &vdb->mapped_vectors)) {
         return false;
     }
     vdb->mapped_vector_bytes = vdb->vector_bytes_used;
+    return true;
+}
+
+static bool qihse_vdb_map_metadata(qihse_vector_db_t vdb) {
+    if (!qihse_vdb_map_snapshot_file(vdb, QIHSE_VDB_METADATA_NAME, vdb->metadata_bytes_used,
+                                     &vdb->metadata_mmap_fd, &vdb->mapped_metadata)) {
+        return false;
+    }
+    vdb->mapped_metadata_bytes = vdb->metadata_bytes_used;
     return true;
 }
 
@@ -994,7 +1035,7 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
     } else {
         vdb->trinary_status = QIHSE_VDB_TRINARY_ABSENT;
     }
-    if (use_mmap && vdb->vector_bytes_used != 0u) {
+    if (use_mmap && (vdb->vector_bytes_used != 0u || vdb->metadata_bytes_used != 0u)) {
         free(vdb->vectors);
         vdb->vectors = NULL;
         vdb->vector_bytes_capacity = 0u;
@@ -1002,6 +1043,13 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
             qihse_vector_store_snapshot_free(&snapshot);
             return false;
         }
+        if (!qihse_vdb_map_metadata(vdb)) {
+            qihse_vector_store_snapshot_free(&snapshot);
+            return false;
+        }
+        free(vdb->metadata);
+        vdb->metadata = NULL;
+        vdb->metadata_bytes_capacity = 0u;
     }
     qihse_vector_store_snapshot_free(&snapshot);
     return true;
@@ -1035,6 +1083,7 @@ qihse_vector_db_t qihse_vector_db_open(
     vdb->read_only = read_only;
     vdb->storage_mode = file_backed ? QIHSE_VDB_STORAGE_FILE_COPY : QIHSE_VDB_STORAGE_EPHEMERAL;
     vdb->mmap_fd = -1;
+    vdb->metadata_mmap_fd = -1;
     vdb->next_generation = 1u;
     vdb->wal_last_record_offset = QIHSE_VDB_WAL_NO_PREV;
     vdb->trinary_status = QIHSE_VDB_TRINARY_ABSENT;
