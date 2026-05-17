@@ -30,8 +30,8 @@ Current implementation state:
 - PR-3 candidate work has started: read-only mmap mode maps `vectors.qvec`, `metadata.qmeta`, validated `idmap.qid`, and validated direct `index.qidx` rows for clean snapshots.
 - PR-4 physical compaction is present: delete/update/upsert API symbols write committed WAL records, replay committed mutation batches newer than the snapshot, writable open truncates torn/uncommitted mutation tails, and `compact()` rewrites live rows only before publishing the regenerated snapshot/sidecars.
 - PR-4 compaction fixture coverage now enforces row/index/live/idmap counts after physical pruning, high unsigned IDs, valid `vectors.qtri` after compact, stale/corrupt derived sidecar rebuild, stale `.tmp` file ignore-on-open behavior, and WAL mutation compaction clearing WAL without resurrecting pruned rows.
-- PR-5 search-path benchmark scaffolding is present: standalone tryte top-k exists with `make bench-trinary-codec`, DB-backed candidate generation plus exact float32 rerank exists with `make bench-trinary-db-candidate`, and `make bench-trinary-search-path` compares full float32 DB search against trinary candidates plus rerank with recall/order/latency reporting.
-- Latest pushed checkpoint before this slice: `b8a37a3` on `codex/qihse-file-persistence`.
+- PR-5 search-path benchmark scaffolding is present: standalone tryte top-k exists with `make bench-trinary-codec`, DB-backed candidate generation plus exact float32 rerank exists with `make bench-trinary-db-candidate`, and `make bench-trinary-search-path` compares full float32 DB search against trinary candidates plus rerank across aligned, banded, and weighted deterministic datasets with recall/order/latency reporting.
+- Latest pushed checkpoint before this slice: `b87150a` on `codex/qihse-file-persistence`.
 - `qihse/qihse_vector_db.c` was restored after a disk-full truncation and now contains the native persistence implementation.
 - `qihse_vector_db_create(..., db_path)` opens a file-backed native database.
 - `qihse_vector_db_open()` supports ephemeral, file-copy, read-only, and read-only mmap modes.
@@ -553,7 +553,7 @@ After the current checkpoint:
 
 - PR-3: harden mmap compatibility and corruption tests now that read-only `vectors.qvec`, `metadata.qmeta`, `idmap.qid`, and `index.qidx` mapping are present for clean snapshots.
 - PR-4: public delete/update/upsert API behavior, mutation WAL replay/truncation, physical tombstone compaction, stale temp-file ignore behavior, and WAL-plus-compaction interactions are implemented and covered by persistence tests. Deeper manifest-publication crash fixtures can still be added.
-- PR-5: DB-backed candidate generation, exact rerank, and search-path benchmark scaffolding are present; production search-path acceleration, broader recall measurement, and optional pure trinary storage remain.
+- PR-5: DB-backed candidate generation, exact rerank, and three-dataset search-path benchmark scaffolding are present; production search-path acceleration, realistic recall measurement, and optional pure trinary storage remain.
 - PR-6: optional persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
 ## PR-4: Mutation and Compaction Plan
@@ -719,7 +719,7 @@ Agent 2: PR-5 search-path trinary acceleration.
 
 Agent 3: PR-5 recall/performance dataset expansion.
 
-- Add broader recall/performance datasets beyond the synthetic fixture.
+- Add realistic recall/performance datasets beyond the deterministic aligned/banded/weighted fixtures.
 - Keep reporting speed honestly; the current benchmark proves recall/order but not consistent speedup.
 - Keep `vectors.qvec` authoritative until pure trinary storage has recovery, migration, and recall tests.
 - Update plan state after production search-path acceleration lands.

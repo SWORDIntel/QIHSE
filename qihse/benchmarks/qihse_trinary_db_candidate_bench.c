@@ -19,6 +19,12 @@
 #define QIHSE_BENCH_TOPK 8u
 #define QIHSE_BENCH_ITERS 32u
 
+typedef enum qihse_bench_dataset_e {
+    QIHSE_BENCH_DATASET_ALIGNED = 0,
+    QIHSE_BENCH_DATASET_BANDED = 1,
+    QIHSE_BENCH_DATASET_WEIGHTED = 2
+} qihse_bench_dataset_t;
+
 typedef struct qihse_bench_ranked_s {
     size_t row_index;
     uint64_t id;
@@ -43,41 +49,78 @@ static uint32_t qihse_bench_mix32(uint32_t value) {
     return value;
 }
 
-static float qihse_bench_query_value(size_t dim) {
+static qihse_bench_dataset_t qihse_bench_dataset(void) {
+    const char* name = getenv("QIHSE_BENCH_DATASET");
+
+    if (name && strcmp(name, "banded") == 0) {
+        return QIHSE_BENCH_DATASET_BANDED;
+    }
+    if (name && strcmp(name, "weighted") == 0) {
+        return QIHSE_BENCH_DATASET_WEIGHTED;
+    }
+    return QIHSE_BENCH_DATASET_ALIGNED;
+}
+
+static const char* qihse_bench_dataset_name(qihse_bench_dataset_t dataset) {
+    switch (dataset) {
+        case QIHSE_BENCH_DATASET_BANDED:
+            return "banded";
+        case QIHSE_BENCH_DATASET_WEIGHTED:
+            return "weighted";
+        case QIHSE_BENCH_DATASET_ALIGNED:
+        default:
+            return "aligned";
+    }
+}
+
+static float qihse_bench_query_value(qihse_bench_dataset_t dataset, size_t dim) {
+    if (dataset == QIHSE_BENCH_DATASET_BANDED) {
+        return ((dim / 8u) % 2u == 0u) ? 1.0f : -1.0f;
+    }
+    if (dataset == QIHSE_BENCH_DATASET_WEIGHTED) {
+        return (dim % 5u == 0u || dim % 5u == 1u) ? 1.0f : -1.0f;
+    }
     return (dim % 3u == 0u) ? 1.0f : -1.0f;
 }
 
 static void qihse_bench_fill_data(float* rows, float* query, uint64_t* ids) {
+    qihse_bench_dataset_t dataset = qihse_bench_dataset();
     size_t row;
     size_t dim;
 
     for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
-        query[dim] = qihse_bench_query_value(dim);
+        query[dim] = qihse_bench_query_value(dataset, dim);
     }
 
     for (row = 0u; row < QIHSE_BENCH_ROWS; row++) {
-        ids[row] = 100000u + (uint64_t)row;
+        ids[row] = 100000u + ((uint64_t)dataset * 1000000u) + (uint64_t)row;
         for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
             uint32_t mixed = qihse_bench_mix32((uint32_t)((row + 17u) * 131u +
-                                                          (dim + 5u) * 977u));
-            uint32_t bucket = mixed % 5u;
+                                                          (dim + 5u) * 977u +
+                                                          ((uint32_t)dataset * 65537u)));
+            uint32_t bucket = mixed % (dataset == QIHSE_BENCH_DATASET_ALIGNED ? 5u : 7u);
             float value = 0.0f;
 
-            if (bucket == 0u || bucket == 1u) {
+            if (bucket == 0u || bucket == 1u ||
+                (dataset == QIHSE_BENCH_DATASET_WEIGHTED && bucket == 2u)) {
                 value = query[dim];
-            } else if (bucket == 2u || bucket == 3u) {
+            } else if (bucket == 2u || bucket == 3u || bucket == 4u) {
                 value = -query[dim];
+            }
+            if (dataset == QIHSE_BENCH_DATASET_WEIGHTED && value != 0.0f) {
+                value *= (dim % 7u == 0u) ? 2.0f : 0.75f;
             }
             rows[(row * QIHSE_BENCH_DIMS) + dim] = value;
         }
     }
 
     for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
-        rows[dim] = query[dim];
-        rows[QIHSE_BENCH_DIMS + dim] = dim == 7u ? 0.0f : query[dim];
-        rows[(2u * QIHSE_BENCH_DIMS) + dim] = dim == 11u ? -query[dim] : query[dim];
+        float scale = dataset == QIHSE_BENCH_DATASET_WEIGHTED && dim % 7u == 0u ? 2.0f : 1.0f;
+        rows[dim] = query[dim] * scale;
+        rows[QIHSE_BENCH_DIMS + dim] = dim == 7u ? 0.0f : query[dim] * scale;
+        rows[(2u * QIHSE_BENCH_DIMS) + dim] = dim == 11u ? -query[dim] : query[dim] * scale;
         rows[(3u * QIHSE_BENCH_DIMS) + dim] =
-            (dim == 13u || dim == 17u) ? -query[dim] : query[dim];
+            (dim == 13u || dim == 17u) ? -query[dim] : query[dim] * scale;
     }
 }
 
@@ -416,6 +459,7 @@ static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
 }
 
 int main(void) {
+    qihse_bench_dataset_t dataset = qihse_bench_dataset();
     char* db_path = NULL;
     qihse_vector_db_t full_db = NULL;
     float* rows = NULL;
@@ -588,8 +632,9 @@ int main(void) {
                                                   full_results,
                                                   full_topk_count);
 
-    printf("trinary_search_path_bench rows=%u dims=%u qtri_row_bytes=%zu "
+    printf("trinary_search_path_bench dataset=%s rows=%u dims=%u qtri_row_bytes=%zu "
            "candidates=%u topk=%u iterations=%u\n",
+           qihse_bench_dataset_name(dataset),
            (unsigned)QIHSE_BENCH_ROWS,
            (unsigned)QIHSE_BENCH_DIMS,
            row_bytes,

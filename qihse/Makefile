@@ -85,6 +85,8 @@ bench-trinary-search-path: lib
 	    benchmarks/qihse_trinary_db_candidate_bench.c \
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
+	QIHSE_BENCH_DATASET=banded LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
+	QIHSE_BENCH_DATASET=weighted LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
