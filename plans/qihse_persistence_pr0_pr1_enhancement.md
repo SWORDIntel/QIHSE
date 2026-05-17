@@ -1,10 +1,10 @@
-# QIHSE Persistence Enhancement Plan: PR-0 through PR-2 Checkpoint
+# QIHSE Persistence Enhancement Plan: Current Checkpoint
 
 ## Purpose
 
 This enhancement records the landed native persistence slice and the reboot-safe continuation path from it.
 
-The existing plan is directionally correct, but it now contains several future tracks: durable persistence, WAL recovery, mmap, trinary codec execution, Python bindings, and native anchor-search integration. PR-0/PR-1 are complete. PR-2 has also landed the next WAL step: ADD/COMMIT records, previous-record offsets, and writable torn-tail truncation.
+The existing plan is directionally correct, but it now contains several future tracks: durable persistence, WAL recovery, mmap, trinary codec execution, Python bindings, and native anchor-search integration. PR-0/PR-1 are complete. PR-2 has landed ADD/COMMIT WAL records, previous-record offsets, and writable torn-tail truncation. PR-3 and PR-5 candidate slices have started: clean read-only mmap now covers vectors, metadata, and ID map; the standalone trinary tryte codec now has deterministic top-k candidate selection.
 
 Target outcome:
 
@@ -27,8 +27,8 @@ Current implementation state:
 - PR-0 anchor-search integration is implemented.
 - PR-1 native file-backed vector DB persistence is implemented.
 - PR-2 WAL/recovery hardening is implemented for ADD/COMMIT records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
-- PR-3 candidate work has started: read-only mmap mode maps `metadata.qmeta` in addition to `vectors.qvec`; read-only mmap of `index.qidx` and `idmap.qid` is still pending.
-- PR-5 candidate work has started: a standalone native tryte codec exists; vector DB trinary search integration, candidate generation, rerank, and benchmarks are still pending.
+- PR-3 candidate work has started: read-only mmap mode maps `vectors.qvec`, `metadata.qmeta`, and validated `idmap.qid`; read-only mmap of `index.qidx` is still pending.
+- PR-5 candidate work has started: a standalone native tryte codec exists with deterministic top-k candidate selection; vector DB trinary search integration, exact rerank, and benchmarks are still pending.
 - `qihse/qihse_vector_db.c` was restored after a disk-full truncation and now contains the native persistence implementation.
 - `qihse_vector_db_create(..., db_path)` opens a file-backed native database.
 - `qihse_vector_db_open()` supports ephemeral, file-copy, read-only, and read-only mmap modes.
@@ -83,12 +83,14 @@ Expected verification result:
 
 ```text
 PASS all qihse vector DB persistence tests
-PASS all qihse trinary codec tests
+PASS: top-k candidate selection
+PASS: top-k invalid tryte rejection
 ```
 
 If the build fails after reboot, inspect these areas first:
 
-- `qihse/qihse_vector_db.c`: WAL ADD/COMMIT replay, torn-tail truncation, mmap open, and trinary sidecar generation.
+- `qihse/qihse_vector_db.c`: WAL ADD/COMMIT replay, torn-tail truncation, read-only mmap open for vectors/metadata/idmap, and trinary sidecar generation.
+- `qihse/codecs/qihse_trinary_tryte_codec.*`: tryte packing, validation, scalar scoring, and top-k candidate selection.
 - `qihse/persistence/`: snapshot file load/flush helpers and little-endian/checksum helpers.
 - `qihse/Makefile`: explicit `SRCS_BASE` must include the persistence helpers and `algorithms/qihse_anchor_search.c`.
 - Disk space: the previous interruption happened when the filesystem hit 100% and truncated `qihse/qihse_vector_db.c`.
@@ -530,15 +532,15 @@ PR-1 is complete when:
 - Read-only open can search but cannot mutate.
 - Native persistence diagnostics report generation, storage mode, ID-map rebuild state, and trinary sidecar status.
 - Python has not implemented any storage format.
-- Writable mmap, trinary scoring/pure trinary storage, and anchor persistence are still deferred.
+- Writable mmap, DB-level trinary search/rerank, pure trinary storage, and anchor persistence are still deferred.
 
 ## Follow-On Phases
 
-After PR-2:
+After the current checkpoint:
 
-- PR-3: extend mmap beyond read-only `vectors.qvec` into index, metadata, and ID map mapping where the access pattern warrants it. Candidate metadata mmap is present; index and ID-map mmap remain.
+- PR-3: extend mmap beyond read-only `vectors.qvec` into index, metadata, and ID map mapping where the access pattern warrants it. Vector, metadata, and ID-map mmap are present; index mmap remains.
 - PR-4: implement real row compaction, tombstones, delete/update semantics, and batch external-ID APIs.
-- PR-5: execute the trinary sidecar path: codec module, codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Candidate standalone tryte codec is present; vector DB integration and benchmarks remain.
+- PR-5: execute the trinary sidecar path: codec module, codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Standalone tryte encoding/scoring/top-k is present; vector DB integration, exact rerank, and benchmarks remain.
 - PR-6: optional persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
 ## PR-4: Mutation and Compaction Plan
@@ -690,15 +692,15 @@ Use this split when resuming the remaining plan with multiple agents. QIHSE rema
 Agent 1: PR-3 mmap extension.
 
 - Map `index.qidx`, `metadata.qmeta`, and `idmap.qid` where that improves open/search/hydration behavior.
-- Treat read-only `metadata.qmeta` mmap as already started; continue with index and ID-map mapping.
+- Treat read-only `vectors.qvec`, `metadata.qmeta`, and validated `idmap.qid` mmap as already started; continue with `index.qidx` mapping.
 - Keep writable mmap separate from read-only mapping until mutation and recovery semantics are explicit.
 - Preserve the current file-copy path as the compatibility fallback.
 
 Agent 2: PR-5 trinary codec module.
 
 - Move trinary sidecar logic behind a native codec module boundary.
-- Treat the standalone tryte codec as the candidate starting point; do not mark candidate generation or rerank complete until vector DB search uses it.
-- Implement portable scalar tryte encode/query/scoring first, then add candidate-generation and exact-rerank benchmarks.
+- Treat the standalone tryte codec and top-k selector as the candidate starting point; do not mark DB-level candidate generation or rerank complete until vector DB search uses it.
+- Integrate portable scalar tryte encode/scoring/top-k into DB-level candidate generation, then add exact-rerank benchmarks.
 - Keep `vectors.qvec` authoritative until pure trinary storage has recall, recovery, and migration tests.
 
 Agent 3: PR-4/PR-5/PR-6 remaining database work.
