@@ -1,4 +1,5 @@
 data/
+results/
 libqihse.so
 *.o
 *.gch

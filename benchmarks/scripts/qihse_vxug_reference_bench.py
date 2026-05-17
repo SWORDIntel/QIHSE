@@ -194,11 +194,12 @@ def run_mode(
     dims: int,
     top_k: int,
     iterations: int,
-) -> tuple[float, float, float]:
+) -> dict[str, Any]:
     result_array_type = QihseVectorResult * top_k
     matches = 0
     total = queries * top_k
     timings_us: list[float] = []
+    mismatches: list[dict[str, Any]] = []
 
     for _ in range(iterations):
         for query_index in range(queries):
@@ -227,13 +228,30 @@ def run_mode(
             timings_us.append(elapsed_us)
             if _ == 0:
                 expected = set(ground_truth[query_index][:top_k])
-                actual = {int(results[index].id) for index in range(top_k)}
+                actual_ids = [int(results[index].id) for index in range(top_k)]
+                actual = set(actual_ids)
                 matches += len(expected.intersection(actual))
+                if actual != expected:
+                    mismatches.append({
+                        "query": query_index,
+                        "expected": ground_truth[query_index][:top_k],
+                        "actual": actual_ids,
+                        "missing": sorted(expected.difference(actual)),
+                        "extra": sorted(actual.difference(expected)),
+                    })
 
     recall = matches / total if total else 0.0
     mean_us = statistics.fmean(timings_us) if timings_us else 0.0
     p95_us = sorted(timings_us)[max(0, int(len(timings_us) * 0.95) - 1)] if timings_us else 0.0
-    return recall, mean_us, p95_us
+    return {
+        "mode": mode_name,
+        "recall": recall,
+        "mean_us": mean_us,
+        "p95_us": p95_us,
+        "matches": matches,
+        "total": total,
+        "mismatches": mismatches,
+    }
 
 
 def reported_candidate_pool(mode_name: str, rows: int, dims: int, top_k: int) -> str:
@@ -257,6 +275,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--manifest", default="benchmarks/reference_workloads.json")
     parser.add_argument("--workload", default="vxug-pdf-sample")
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--output-json",
+        help="optional generated result JSON path; parent directory is created",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -282,6 +304,15 @@ def main(argv: list[str]) -> int:
             create_file_backed_db(lib, db_path, base_vectors, rows, dims)
             db = open_search_db(lib, db_path)
             try:
+                results_payload: dict[str, Any] = {
+                    "workload": args.workload,
+                    "rows": rows,
+                    "queries": queries,
+                    "dimensions": dims,
+                    "top_k": top_k,
+                    "iterations": args.iterations,
+                    "modes": [],
+                }
                 print(
                     f"{args.workload}: rows={rows} queries={queries} dims={dims} "
                     f"top_k={top_k} iterations={args.iterations}"
@@ -291,7 +322,7 @@ def main(argv: list[str]) -> int:
                     ("qtri", QIHSE_VDB_QUERY_TRINARY_SCALAR),
                     ("qmag", QIHSE_VDB_QUERY_TRINARY_MAGNITUDE),
                 ):
-                    recall, mean_us, p95_us = run_mode(
+                    mode_result = run_mode(
                         lib,
                         db,
                         mode_name,
@@ -303,11 +334,26 @@ def main(argv: list[str]) -> int:
                         top_k,
                         args.iterations,
                     )
+                    candidate_pool = reported_candidate_pool(mode_name, rows, dims, top_k)
+                    mode_result["candidate_pool"] = int(candidate_pool)
+                    results_payload["modes"].append(mode_result)
                     print(
-                        f"{mode_name}: recall@{top_k}={recall:.4f} "
-                        f"mean_us={mean_us:.3f} p95_us={p95_us:.3f} "
-                        f"candidate_pool={reported_candidate_pool(mode_name, rows, dims, top_k)}"
+                        f"{mode_name}: recall@{top_k}={mode_result['recall']:.4f} "
+                        f"mean_us={mode_result['mean_us']:.3f} "
+                        f"p95_us={mode_result['p95_us']:.3f} "
+                        f"candidate_pool={candidate_pool} "
+                        f"mismatches={len(mode_result['mismatches'])}"
                     )
+                if args.output_json:
+                    output_path = Path(args.output_json)
+                    if not output_path.is_absolute():
+                        output_path = root / output_path
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(
+                        json.dumps(results_payload, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    print(f"wrote {output_path}")
             finally:
                 lib.qihse_vector_db_destroy(db)
     except (OSError, RuntimeError, ValueError) as exc:

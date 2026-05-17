@@ -55,8 +55,9 @@ Execution plan:
 2. Run the same queries through exact float32, scalar `qtri`, and `qmag`.
    Record recall@10, latency, selected candidate count, rerank count, and
    mismatches.
-3. Store benchmark outputs as generated artifacts outside git by default. Only
-   promote summarized results into docs after the runner is repeatable.
+3. Store benchmark outputs under `results/` as generated artifacts outside git
+   by default. Only promote summarized results into docs after the runner is
+   repeatable.
 4. Add one larger SIFT-style workload with `fvecs` base/query vectors and
    `ivecs` ground truth. Use it as the first dataset large enough to justify
    any candidate-pool default change.

@@ -14,9 +14,9 @@ row counts.
 After `make sample-vxug-pdf-workload` generates the local VXUG PDF sample,
 `make bench-vxug-pdf-workload` loads the generated matrices into file-backed
 QIHSE and compares exact float32, scalar `qtri`, and `qmag` against the sample
-ground truth. The runner reports recall@10, latency, and selected candidate
-counts. Result files should remain generated artifacts outside git; only
-repeatable summaries belong in docs.
+ground truth. The runner reports recall@10, latency, selected candidate counts,
+and mismatch counts, and writes generated JSON under `results/`. Result files
+should remain outside git; only repeatable summaries belong in docs.
 
 The next larger calibration target is a SIFT-style workload using `fvecs`
 base/query vectors and `ivecs` ground truth. Do not change trinary default

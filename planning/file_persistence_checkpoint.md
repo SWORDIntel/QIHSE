@@ -208,14 +208,12 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Record VXUG runner output as generated data outside git by default. Promote
-   only summarized, repeatable results into benchmark docs.
-2. Add a larger SIFT-style workload using `fvecs` base/query vectors and
+1. Add a larger SIFT-style workload using `fvecs` base/query vectors and
    `ivecs` ground truth. Use it as the first real scale check before candidate
    defaults are changed.
-3. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
+2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
    back into FRAMEWERX.
-4. Continue file persistence breadth only after the benchmark runner is moving,
+3. Continue file persistence breadth only after the benchmark runner is moving,
    with crash-recovery fixtures for interrupted multi-file publication windows
    and additional authoritative-file corruption after a valid snapshot exists.

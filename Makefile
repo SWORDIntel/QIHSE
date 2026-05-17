@@ -130,7 +130,7 @@ sample-vxug-pdf-workload:
 
 bench-vxug-pdf-workload: lib
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
-	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root .
+	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root . --output-json results/vxug_pdf_sample/latest.json
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
