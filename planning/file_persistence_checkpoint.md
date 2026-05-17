@@ -39,8 +39,17 @@ exact float32 reranking.
 - Manifest/index loading rejects impossible snapshot metadata earlier,
   including malformed sidecar flags, mismatched qtri/qmag shapes, vector-byte
   inconsistencies, and invalid index row bounds.
+- Checkpoint boundary coverage now verifies that a published snapshot clears
+  dirty state, truncates `wal.qwal`, and reopens read-only without replaying old
+  WAL records.
 - Native integration cleanup is tracked in
   `qihse/planning/native_integration_cleanup.md`.
+- Historical `SWORDIntel_QIHSE/plans/` material has been summarized into
+  `qihse/planning/persistence_plan_migration.md`; the active checkpoint remains
+  this file.
+- Root `.gitignore` now covers generated QIHSE/native test executables and
+  precompiled headers going forward. Already tracked generated artifacts still
+  need an index-only cleanup pass.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -112,6 +121,9 @@ Latest focused result after candidate-policy/manifest-hardening slice:
 `make test-persist`, `make bench-trinary-db-candidate`, and
 `make bench-trinary-magnitude-sweep` passed.
 
+Latest focused result after checkpoint/metadata cleanup slice:
+`make test-persist` passed with the new checkpoint publication fixture.
+
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
 `magnitude_skew` and `near_tie`. Those hard datasets are useful because they
@@ -145,11 +157,20 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Continue file persistence breadth:
-   crash-recovery fixtures around manifest publication order, WAL/checkpoint
-   edges, and authoritative-file corruption.
-2. Start the native integration cleanup sequence:
-   metadata ignore coverage, generated-artifact inventory, and migration of any
-   still-current `SWORDIntel_QIHSE/plans/` material into `qihse/planning/`.
-3. Use fresh sweep results to tune the candidate-pool resolver once more real
+1. Continue file persistence breadth with crash-recovery fixtures that simulate
+   interrupted manifest publication and authoritative-file corruption after a
+   valid snapshot exists.
+2. Canonicalize runtime QIHSE loading onto the active `qihse/` root. Current
+   blockers for deleting `native/qihse/` include `fw_launcher.py`,
+   `src/framewerx/api/server.py`, `src/framewerx/state/qihse_wrapper.py`,
+   `src/framewerx/state/db.py`, `src/framewerx/workers/embedding_worker.py`,
+   `src/framewerx/hardware/discovery.py`, and
+   `src/framewerx/artifacts/hashing.py`.
+3. Do an index-only cleanup for tracked generated native artifacts listed in
+   `qihse/planning/native_integration_cleanup.md`; do not delete source trees
+   in the same change.
+4. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
+   FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
+   through `src/framewerx/evaluation/search_backend.py`.
+5. Use fresh sweep results to tune the candidate-pool resolver once more real
    datasets exist; the current defaults are conservative and mode-aware.

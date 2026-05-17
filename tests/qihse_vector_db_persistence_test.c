@@ -97,6 +97,7 @@ static bool test_null_db_path_ephemeral_searchable(void);
 static bool test_wal_replays_unflushed_add(void);
 static bool test_wal_replays_unflushed_delete_update_upsert(void);
 static bool test_torn_wal_tail_ignored_and_truncated(void);
+static bool test_checkpoint_publishes_snapshot_and_clears_wal(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
@@ -144,6 +145,8 @@ int main(void) {
          test_wal_replays_unflushed_delete_update_upsert},
         {"torn WAL tail is ignored and truncated on writable open",
          test_torn_wal_tail_ignored_and_truncated},
+        {"checkpoint publishes snapshot and clears WAL",
+         test_checkpoint_publishes_snapshot_and_clears_wal},
         {"read-only mmap reopen searches mapped vector file",
          test_read_only_mmap_reopen_searches},
         {"corrupt vectors.qvec magic fails open cleanly",
@@ -931,6 +934,78 @@ static bool test_torn_wal_tail_ignored_and_truncated(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db), "recovered database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_checkpoint_publishes_snapshot_and_clears_wal(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("checkpoint_clears_wal");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.125f, 0.250f, 0.500f, 1.000f};
+    const char metadata[] = "checkpoint-published";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 6161, metadata, sizeof(metadata)),
+                "checkpoint fixture insert should append WAL");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available before checkpoint");
+    TEST_ASSERT(stats.needs_flush, "uncheckpointed insert should need flush");
+    TEST_ASSERT(stats.wal_bytes_pending > 0u,
+                "uncheckpointed insert should have pending WAL bytes");
+
+    TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish snapshot");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after checkpoint");
+    TEST_ASSERT(!stats.needs_flush, "checkpoint should clear dirty snapshot state");
+    TEST_ASSERT(stats.wal_bytes_pending == 0u, "checkpoint should clear pending WAL bytes");
+    TEST_ASSERT(stats.index_rows == 1u, "checkpoint should publish one index row");
+    TEST_ASSERT(stats.live_vectors == 1u, "checkpoint should publish one live row");
+
+    off_t wal_size = -1;
+    TEST_ASSERT(file_size_of(path, "wal.qwal", &wal_size),
+                "WAL file should exist after checkpoint truncation");
+    TEST_ASSERT(wal_size == 0, "checkpoint should truncate WAL file to zero bytes");
+    TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "read-only reopen should accept checkpointed snapshot");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after checkpointed reopen");
+    TEST_ASSERT(stats.wal_records_replayed == 0u,
+                "checkpointed reopen should not replay old WAL records");
+    TEST_ASSERT(stats.wal_bytes_pending == 0u,
+                "checkpointed reopen should see an empty WAL");
+    TEST_ASSERT(stats.index_rows == 1u && stats.live_vectors == 1u,
+                "checkpointed snapshot should preserve row counts");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vector, ARRAY_LEN(vector), true, true, &result);
+    TEST_ASSERT(count == 1, "checkpointed row should be searchable");
+    TEST_ASSERT(result.id == 6161, "checkpointed row should preserve vector id");
+    TEST_ASSERT(vector_eq(result.vector, vector, ARRAY_LEN(vector)),
+                "checkpointed row should hydrate vector bytes");
+    TEST_ASSERT(result.metadata_size == sizeof(metadata),
+                "checkpointed metadata size should match");
+    TEST_ASSERT(memcmp(result.metadata, metadata, sizeof(metadata)) == 0,
+                "checkpointed metadata bytes should match");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only checkpointed database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

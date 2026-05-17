@@ -79,6 +79,75 @@ as an independent top-level subsystem for QIHSE work.
     pass: at minimum `make test-persist`, `make test-trinary-codec`, and the
     trinary search-path benchmarks listed in `file_persistence_checkpoint.md`.
 
+## Metadata/Docs Slice Findings
+
+Date: 2026-05-17
+
+- Added root `.gitignore` coverage for generated QIHSE native artifacts that
+  were missing from the repository metadata: precompiled headers (`*.gch`),
+  root-level QIHSE `test_*` executables while preserving `test_*.c` sources,
+  generated `qihse/tests/qihse_*_test` binaries while preserving their `.c`
+  sources, stale mirror equivalents under `SWORDIntel_QIHSE/qihse/` and
+  `native/qihse/`, and generated `native/not_stisla/test_*` binaries while
+  preserving `native/not_stisla/tests/test_*.c` sources.
+- Existing global rules already cover shared libraries, object files, static
+  archives, dynamic libraries, Windows binaries, Python bytecode, model
+  caches, and `native/llama-cpp-turboquant/build/`.
+- The ignore additions are forward-looking only for files already tracked by
+  Git. A later cleanup should remove generated artifacts from the index without
+  deleting source trees.
+- The old `SWORDIntel_QIHSE/plans/` material was summarized into
+  `qihse/planning/persistence_plan_migration.md`. The current active
+  persistence checkpoint remains `qihse/planning/file_persistence_checkpoint.md`.
+
+Tracked generated/stale artifact cleanup candidates found during this slice:
+
+- `qihse/qihse_hetero.h.gch`
+- `qihse/test_all_isa`
+- `qihse/test_amx_only`
+- `qihse/test_avx2_only`
+- `qihse/test_avx2_only_simple`
+- `qihse/test_avx512_direct`
+- `qihse/test_direct_execution`
+- `qihse/test_simple_exec`
+- `qihse/test_vnni_bench`
+- `qihse/test_vnni_only`
+- `qihse/tests/qihse_trinary_codec_test`
+- `native/qihse/qihse_hetero.h.gch`
+- `native/qihse/test_all_isa`
+- `native/qihse/test_amx_only`
+- `native/qihse/test_avx2_only`
+- `native/qihse/test_avx2_only_simple`
+- `native/qihse/test_avx512_direct`
+- `native/qihse/test_direct_execution`
+- `native/qihse/test_simple_exec`
+- `native/qihse/test_vnni_bench`
+- `native/qihse/test_vnni_only`
+- `SWORDIntel_QIHSE/qihse/qihse_hetero.h.gch`
+- `SWORDIntel_QIHSE/qihse/test_all_isa`
+- `SWORDIntel_QIHSE/qihse/test_amx_only`
+- `SWORDIntel_QIHSE/qihse/test_avx2_only`
+- `SWORDIntel_QIHSE/qihse/test_avx2_only_simple`
+- `SWORDIntel_QIHSE/qihse/test_avx512_direct`
+- `SWORDIntel_QIHSE/qihse/test_direct_execution`
+- `SWORDIntel_QIHSE/qihse/test_simple_exec`
+- `SWORDIntel_QIHSE/qihse/test_vnni_bench`
+- `SWORDIntel_QIHSE/qihse/test_vnni_only`
+- `native/not_stisla/test_auto_backend`
+- `native/not_stisla/test_avx2_fma`
+- `native/not_stisla/test_enhanced`
+- `native/not_stisla/test_fortran_backend`
+- `native/not_stisla/test_telemetry_processor_perf`
+
+Untracked generated/stale artifacts observed and already covered by existing
+ignore rules:
+
+- `qihse/libqihse.so`
+- `native/qihse/libqihse.so`
+- `SWORDIntel_QIHSE/qihse/libqihse.so`
+- `qihse/tests/qihse_vector_db_persistence_test` when built by
+  `make test-persist`
+
 ## Recommended Next Sequence
 
 1. Metadata-only pass: add `.gitignore` coverage for native generated outputs
