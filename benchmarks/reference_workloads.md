@@ -12,39 +12,26 @@
 
 #### Trinary Candidate Calibration
 
-The persisted trinary path is an explicit candidate generator followed by exact
-float32 reranking. It should be calibrated against real/reference embedding
-workloads before changing default candidate-pool multipliers.
+The persisted trinary path is an opt-in candidate generator followed by exact
+float32 reranking.
 
-Current default candidate policy:
+Current calibration rule:
 
-- Default search stays exact float32 unless a query opts into a trinary mode.
-- Legacy `use_trinary_candidates` uses `candidate_count` exactly as supplied.
-- Explicit scalar qtri mode defaults to a wider pool than qmag because it only
-  sees sign information.
-- Explicit qmag mode uses row-side magnitude buckets plus signs, then reranks
-  candidates against authoritative float32 vectors.
-- Both explicit modes increase default pool width for high-dimensional vectors
-  and inflate for tombstone density so live-row recall is not silently reduced.
+- Exact float32 remains the default unless a query opts into trinary mode.
+- Legacy `use_trinary_candidates` keeps using `candidate_count` exactly as
+  supplied.
+- `qtri` uses a wider default candidate pool than `qmag` because it only sees
+  sign information.
+- `qmag` uses row-side magnitude buckets plus signs, then reranks against the
+  authoritative float32 vectors.
 
-Current synthetic evidence:
+Calibration gate:
 
-- Scalar qtri performs well on aligned, banded, and weighted synthetic datasets.
-- Magnitude-sensitive synthetic datasets need wider candidate pools when using
-  scalar signs alone.
-- Query-side weighting without row-side magnitude did not fix the hard cases.
-- Persisted qmag is the current row-side magnitude signal and is the preferred
-  path for further validation.
-
-Tuning gate:
-
-- Do not tune scalar/qmag default multipliers only to satisfy handcrafted
-  synthetic hard cases.
-- Add or import production-shaped embedding workloads first, then compare
-  recall, latency, and float32 rerank cost across scalar qtri, qmag, and exact
-  float32.
-- Only change defaults when a reference workload shows a stable recall/latency
-  improvement rather than a one-dataset win.
+- Do not change default candidate-pool multipliers for synthetic-only cases.
+- Add production-shaped reference workloads first, then compare recall,
+  latency, and rerank cost across exact float32, scalar `qtri`, and `qmag`.
+- Only adjust defaults when a reference workload shows a stable improvement
+  across repeated runs.
 
 #### SIFT1M Benchmark (Computer Vision)
 ```python

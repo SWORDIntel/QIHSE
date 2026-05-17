@@ -111,6 +111,7 @@ static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
 static bool test_corrupt_idmap_rebuilds_high_ids(void);
+static bool test_invalid_idmap_row_index_rebuilds_on_reopen(void);
 static bool test_missing_vectors_qtri_accepted(void);
 static bool test_corrupt_vectors_qtri_accepted_and_reported(void);
 static bool test_trinary_candidate_search_matches_float32_top_ids(void);
@@ -178,6 +179,8 @@ int main(void) {
          test_duplicate_vector_id_rejected},
         {"corrupt idmap.qid rebuilds and high IDs survive",
          test_corrupt_idmap_rebuilds_high_ids},
+        {"invalid idmap row index rebuilds on reopen",
+         test_invalid_idmap_row_index_rebuilds_on_reopen},
         {"missing vectors.qtri accepted for FLOAT32 DB",
          test_missing_vectors_qtri_accepted},
         {"corrupt vectors.qtri is accepted but reported unavailable",
@@ -1585,6 +1588,63 @@ static bool test_corrupt_idmap_rebuilds_high_ids(void) {
     TEST_ASSERT(!stats.idmap_dirty, "idmap should be clean after flush");
     TEST_ASSERT(qihse_vector_db_close(db), "database should close after idmap rebuild");
 
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_invalid_idmap_row_index_rebuilds_on_reopen(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("invalid_idmap_row_index");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.0f, 1.0f, 0.0f};
+    const uint64_t id = 8123u;
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), id, NULL, 0),
+                "idmap row index fixture insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before idmap corruption");
+
+    uint8_t idmap_bytes[32u + 16u];
+    memset(idmap_bytes, 0, sizeof(idmap_bytes));
+    memcpy(idmap_bytes, "QIHSEQID", 8u);
+    test_write_u32le(idmap_bytes + 8u, 1u);
+    test_write_u32le(idmap_bytes + 12u, 16u);
+    test_write_u64le(idmap_bytes + 16u, 1u);
+    test_write_u64le(idmap_bytes + 32u, (uint64_t)(id ^ UINT64_C(0x8000000000000000)));
+    test_write_u64le(idmap_bytes + 40u, 1u);
+    test_write_u64le(idmap_bytes + 24u, test_fnv1a64(idmap_bytes + 32u, 16u));
+
+    TEST_ASSERT(write_file_payload(path, "idmap.qid", idmap_bytes, sizeof(idmap_bytes)),
+                "test should write an idmap.qid entry with an out-of-range row index");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "invalid idmap.qid should rebuild on reopen");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after invalid idmap reopen");
+    TEST_ASSERT(stats.idmap_valid, "invalid idmap should rebuild in memory");
+    TEST_ASSERT(!stats.idmap_dirty, "read-only invalid idmap reopen should stay clean");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vector, ARRAY_LEN(vector), false, false, &result);
+    TEST_ASSERT(count == 1, "row should remain searchable after invalid idmap reopen");
+    TEST_ASSERT(result.id == id, "row id should survive invalid idmap reopen");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only invalid-idmap database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

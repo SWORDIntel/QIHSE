@@ -156,9 +156,10 @@ Latest focused result after checkpoint authoritative-tmp recovery slice:
 fixture.
 
 Latest trinary calibration decision:
-no candidate-pool multiplier changes until production-shaped embedding
-workloads exist. The current policy and tuning gates are documented in
-`qihse/benchmarks/reference_workloads.md`.
+keep exact float32 as the default, keep `use_trinary_candidates` exact,
+keep `qtri` wider than `qmag`, and do not change the default multipliers until
+production-shaped reference workloads justify it. The canonical wording lives
+in `qihse/benchmarks/reference_workloads.md`.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
