@@ -46,6 +46,9 @@ Tracked workload manifest:
   against the manifest before accepting a dataset as calibration evidence.
 - `make sample-vxug-pdf-workload` builds the `vxug-pdf-sample` workload from
   the local FRAMEWERX VXUG PDF path and validates only that workload.
+- `make validate-reference-workflow` runs the manifest plan, the generated
+  `fvecs`/`ivecs` smoke workload, the VXUG benchmark gate, and persistence
+  tests sequentially.
 
 Execution plan:
 

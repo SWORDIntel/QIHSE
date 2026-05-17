@@ -47,7 +47,9 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload validate-reference-workflow
+
+.NOTPARALLEL: validate-reference-workflow
 
 all: lib
 
@@ -147,6 +149,8 @@ bench-reference-result-summary:
 
 bench-sift1m-workload: lib
 	$(MAKE) bench-reference-workload REFERENCE_WORKLOAD=sift1m
+
+validate-reference-workflow: bench-reference-workloads bench-reference-runner-smoke bench-vxug-pdf-workload test-persist
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \

@@ -10,6 +10,9 @@ from the QIHSE root to validate the manifest and print the current benchmark
 plan. Use `python3 benchmarks/scripts/qihse_reference_workloads.py --root .
 --inspect-files` after external datasets are present to validate dimensions and
 row counts.
+Run `make validate-reference-workflow` for the current sequential QIHSE
+reference workflow: manifest plan, mini `fvecs`/`ivecs` smoke, VXUG benchmark
+gate, and persistence tests.
 
 After `make sample-vxug-pdf-workload` generates the local VXUG PDF sample,
 `make bench-vxug-pdf-workload` loads the generated matrices into file-backed

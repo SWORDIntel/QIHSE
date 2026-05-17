@@ -175,6 +175,12 @@ workload. QIHSE GitHub should become the upstream-first workflow now that the
 runner path is in place; FRAMEWERX can import QIHSE updates after upstream
 validation.
 
+Latest reference workflow target:
+`make validate-reference-workflow` runs manifest validation, the generated
+`fvecs`/`ivecs` smoke workload, VXUG benchmark summary gate, and persistence
+tests sequentially. Use this instead of launching those Make targets in
+parallel, because they rebuild the shared library.
+
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
 `magnitude_skew` and `near_tie`. Those hard datasets are useful because they
