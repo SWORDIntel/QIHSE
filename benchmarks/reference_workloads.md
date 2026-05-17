@@ -94,7 +94,9 @@ workload_sift1m = {
 The manifest already declares the SIFT-style file paths and formats. Once the
 files are present under `data/sift1m/`, run `make bench-sift1m-workload` to use
 the same exact float32/scalar `qtri`/`qmag` runner and write generated JSON
-under `results/sift1m/`.
+under `results/sift1m/`. `make bench-reference-runner-smoke` covers the
+generic `fvecs`/`ivecs` runner path with a tiny generated workload when full
+SIFT data is not present.
 
 #### GIST1M Benchmark (Semantic Search)
 ```python

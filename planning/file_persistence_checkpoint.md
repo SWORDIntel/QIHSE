@@ -210,7 +210,9 @@ weighted prototype qtri selectors.
 
 1. Add or stage SIFT-style data files under `data/sift1m/`, then run
    `make bench-sift1m-workload`. The generic runner now supports `fvecs`,
-   `ivecs`, `f32_matrix`, and `u32_matrix` manifest entries.
+   `ivecs`, `f32_matrix`, and `u32_matrix` manifest entries, with
+   `make bench-reference-runner-smoke` covering the SIFT-style parser path
+   before full SIFT data is available.
 2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
    back into FRAMEWERX.

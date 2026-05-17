@@ -47,7 +47,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-sift1m-workload
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-sift1m-workload
 
 all: lib
 
@@ -124,6 +124,9 @@ bench-trinary-magnitude-sweep: lib
 
 bench-reference-workloads:
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --plan
+
+bench-reference-runner-smoke: lib
+	python3 benchmarks/scripts/qihse_reference_runner_smoke.py --root .
 
 sample-vxug-pdf-workload:
 	python3 benchmarks/scripts/qihse_pdf_text_sample.py --pdf "$(VXUG_PDF)" --out data/vxug_pdf_sample
