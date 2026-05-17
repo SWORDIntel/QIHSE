@@ -7,7 +7,9 @@
 Active trinary calibration workloads are tracked in
 `benchmarks/reference_workloads.json`. Run `make bench-reference-workloads`
 from the QIHSE root to validate the manifest and print the current benchmark
-plan.
+plan. Use `python3 benchmarks/scripts/qihse_reference_workloads.py --root .
+--inspect-files` after external datasets are present to validate dimensions and
+row counts.
 
 ---
 

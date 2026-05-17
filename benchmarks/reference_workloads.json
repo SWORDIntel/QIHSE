@@ -81,6 +81,11 @@
         "query_vectors": "data/sift1m/sift_query.fvecs",
         "ground_truth": "data/sift1m/sift_groundtruth.ivecs"
       },
+      "file_formats": {
+        "base_vectors": "fvecs",
+        "query_vectors": "fvecs",
+        "ground_truth": "ivecs"
+      },
       "acceptance": {
         "recall_at_10_floor": 0.95,
         "latency_p95_us_must_be_reported": true,
@@ -104,6 +109,11 @@
         "base_vectors": "data/text_embeddings/base.f32",
         "query_vectors": "data/text_embeddings/query.f32",
         "ground_truth": "data/text_embeddings/ground_truth.u32"
+      },
+      "file_formats": {
+        "base_vectors": "f32_matrix",
+        "query_vectors": "f32_matrix",
+        "ground_truth": "u32_matrix"
       },
       "acceptance": {
         "recall_at_10_floor": 0.95,

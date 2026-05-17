@@ -42,6 +42,8 @@ Tracked workload manifest:
 - External workloads are intentionally file-backed but not bundled. Use
   `python3 benchmarks/scripts/qihse_reference_workloads.py --root . --check-files`
   to verify local dataset availability before using them as tuning evidence.
+- Add `--inspect-files` to validate external vector dimensions and row counts
+  against the manifest before accepting a dataset as calibration evidence.
 
 #### SIFT1M Benchmark (Computer Vision)
 ```python

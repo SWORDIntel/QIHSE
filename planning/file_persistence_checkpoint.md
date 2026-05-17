@@ -162,7 +162,9 @@ production-shaped reference workloads justify it. The canonical wording lives
 in `qihse/benchmarks/reference_workloads.md`. The initial reference workload
 manifest is tracked at `qihse/benchmarks/reference_workloads.json`, with
 `make bench-reference-workloads` validating the manifest and printing the
-current benchmark plan.
+current benchmark plan. The manifest runner also supports `--inspect-files` for
+external dataset row-count and dimension validation before those datasets are
+used as tuning evidence.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on

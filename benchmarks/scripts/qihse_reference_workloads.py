@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import struct
 import json
 import os
 import sys
@@ -24,6 +25,90 @@ REQUIRED_WORKLOAD_FIELDS = {
 }
 
 
+SUPPORTED_FILE_FORMATS = {"fvecs", "ivecs", "f32_matrix", "u32_matrix"}
+
+
+def inspect_fvecs_or_ivecs(path: Path) -> tuple[int, int]:
+    count = 0
+    dims = -1
+    offset = 0
+    file_size = path.stat().st_size
+
+    with path.open("rb") as handle:
+        while offset < file_size:
+            header = handle.read(4)
+            if len(header) != 4:
+                raise ValueError(f"{path} has a truncated vector header")
+            (row_dims,) = struct.unpack("<i", header)
+            if row_dims <= 0:
+                raise ValueError(f"{path} has non-positive vector dimensions")
+            if dims < 0:
+                dims = row_dims
+            elif dims != row_dims:
+                raise ValueError(f"{path} has mixed vector dimensions")
+
+            payload_size = row_dims * 4
+            skipped = handle.seek(payload_size, os.SEEK_CUR)
+            offset = skipped
+            if offset > file_size:
+                raise ValueError(f"{path} has a truncated vector payload")
+            count += 1
+
+    if count == 0 or dims <= 0:
+        raise ValueError(f"{path} contains no vectors")
+    return count, dims
+
+
+def inspect_dense_matrix(path: Path, dims: int, scalar_bytes: int) -> tuple[int, int]:
+    file_size = path.stat().st_size
+    row_bytes = dims * scalar_bytes
+    if row_bytes <= 0:
+        raise ValueError(f"{path} has invalid row width")
+    if file_size == 0 or file_size % row_bytes != 0:
+        raise ValueError(f"{path} size is not divisible by row width")
+    return file_size // row_bytes, dims
+
+
+def inspect_workload_files(workload: dict[str, Any], root: Path) -> list[str]:
+    errors: list[str] = []
+    files = workload.get("files", {})
+    formats = workload.get("file_formats", {})
+    expected = {
+        "base_vectors": (workload["rows"], workload["dimensions"]),
+        "query_vectors": (workload["queries"], workload["dimensions"]),
+        "ground_truth": (workload["queries"], workload["top_k"]),
+    }
+
+    for label, relative in sorted(files.items()):
+        path = root / relative
+        file_format = formats.get(label)
+        expected_rows, expected_dims = expected.get(label, (None, None))
+        try:
+            if file_format in {"fvecs", "ivecs"}:
+                actual_rows, actual_dims = inspect_fvecs_or_ivecs(path)
+            elif file_format == "f32_matrix":
+                actual_rows, actual_dims = inspect_dense_matrix(path, int(expected_dims), 4)
+            elif file_format == "u32_matrix":
+                actual_rows, actual_dims = inspect_dense_matrix(path, int(expected_dims), 4)
+            else:
+                errors.append(f"{workload['name']}.{label} unsupported format: {file_format}")
+                continue
+        except (OSError, ValueError) as exc:
+            errors.append(f"{workload['name']}.{label} inspect failed: {exc}")
+            continue
+
+        if expected_rows is not None and actual_rows != expected_rows:
+            errors.append(
+                f"{workload['name']}.{label} rows {actual_rows} != expected {expected_rows}"
+            )
+        if expected_dims is not None and actual_dims != expected_dims:
+            errors.append(
+                f"{workload['name']}.{label} dims {actual_dims} != expected {expected_dims}"
+            )
+
+    return errors
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -32,7 +117,12 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
-def validate_manifest(manifest: dict[str, Any], root: Path, check_files: bool) -> list[str]:
+def validate_manifest(
+    manifest: dict[str, Any],
+    root: Path,
+    check_files: bool,
+    inspect_files: bool,
+) -> list[str]:
     errors: list[str] = []
     workloads = manifest.get("workloads")
 
@@ -81,16 +171,34 @@ def validate_manifest(manifest: dict[str, Any], root: Path, check_files: bool) -
             errors.append(f"{prefix}.acceptance must be a non-empty object")
 
         files = workload.get("files")
+        file_formats = workload.get("file_formats")
         if kind == "external":
             if not isinstance(files, dict) or not files:
                 errors.append(f"{prefix}.files must be present for external workloads")
-            elif check_files:
+            if not isinstance(file_formats, dict) or not file_formats:
+                errors.append(f"{prefix}.file_formats must be present for external workloads")
+            elif isinstance(files, dict):
+                for label in files:
+                    file_format = file_formats.get(label)
+                    if file_format not in SUPPORTED_FILE_FORMATS:
+                        errors.append(
+                            f"{prefix}.file_formats.{label} must be one of "
+                            f"{', '.join(sorted(SUPPORTED_FILE_FORMATS))}"
+                        )
+            if isinstance(files, dict) and check_files:
                 for label, relative in sorted(files.items()):
                     if not isinstance(relative, str) or not relative:
                         errors.append(f"{prefix}.files.{label} must be a non-empty path")
                         continue
                     if not (root / relative).exists():
                         errors.append(f"{prefix}.files.{label} missing: {relative}")
+            if (
+                isinstance(files, dict)
+                and isinstance(file_formats, dict)
+                and check_files
+                and inspect_files
+            ):
+                errors.extend(inspect_workload_files(workload, root))
 
     return errors
 
@@ -132,6 +240,11 @@ def main(argv: list[str]) -> int:
         help="also require external workload files to exist locally",
     )
     parser.add_argument(
+        "--inspect-files",
+        action="store_true",
+        help="inspect external file dimensions and row counts; implies --check-files",
+    )
+    parser.add_argument(
         "--plan",
         action="store_true",
         help="print the benchmark execution plan after validation",
@@ -145,7 +258,8 @@ def main(argv: list[str]) -> int:
 
     try:
         manifest = load_manifest(manifest_path)
-        errors = validate_manifest(manifest, root, args.check_files)
+        check_files = args.check_files or args.inspect_files
+        errors = validate_manifest(manifest, root, check_files, args.inspect_files)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"reference workload manifest error: {exc}", file=sys.stderr)
         return 1
