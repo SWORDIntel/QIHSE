@@ -317,3 +317,152 @@ bool qihse_trinary_tryte_select_topk(const uint8_t* encoded_rows,
     *out_count = selected;
     return true;
 }
+
+bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
+                                                 const uint8_t* rhs_trytes,
+                                                 const int32_t* dim_weights,
+                                                 size_t dims,
+                                                 int64_t* out_score) {
+    size_t row_bytes;
+    size_t byte_idx;
+    size_t seen_dims = 0u;
+    int64_t score = 0;
+
+    if (!out_score) {
+        errno = EINVAL;
+        return false;
+    }
+    if ((!dim_weights && dims != 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes)) {
+        return false;
+    }
+    if ((!lhs_trytes || !rhs_trytes) && row_bytes != 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_validate(lhs_trytes, row_bytes) ||
+        !qihse_trinary_tryte_validate(rhs_trytes, row_bytes)) {
+        return false;
+    }
+    for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
+        uint8_t lhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
+        uint8_t rhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
+        size_t trit_idx;
+
+        if (!qihse_trinary_tryte_unpack(lhs_trytes[byte_idx], lhs) ||
+            !qihse_trinary_tryte_unpack(rhs_trytes[byte_idx], rhs)) {
+            return false;
+        }
+        for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE &&
+                            seen_dims < dims;
+             trit_idx++, seen_dims++) {
+            if (dim_weights[seen_dims] < 0) {
+                errno = EINVAL;
+                return false;
+            }
+            score += (int64_t)(qihse_tryte_signed_trit(lhs[trit_idx]) *
+                               qihse_tryte_signed_trit(rhs[trit_idx])) *
+                     (int64_t)dim_weights[seen_dims];
+        }
+    }
+    *out_score = score;
+    return true;
+}
+
+static bool qihse_tryte_weighted_candidate_is_better(int64_t lhs_score,
+                                                     size_t lhs_row,
+                                                     int64_t rhs_score,
+                                                     size_t rhs_row) {
+    return lhs_score > rhs_score ||
+           (lhs_score == rhs_score && lhs_row < rhs_row);
+}
+
+bool qihse_trinary_tryte_select_topk_weighted(const uint8_t* encoded_rows,
+                                              const uint8_t* encoded_query,
+                                              const int32_t* dim_weights,
+                                              size_t row_count,
+                                              size_t dims,
+                                              size_t* out_row_indexes,
+                                              int64_t* out_scores,
+                                              size_t max_results,
+                                              size_t* out_count) {
+    size_t row_bytes;
+    size_t payload_bytes;
+    size_t selected = 0u;
+    size_t row;
+
+    if (!out_count) {
+        errno = EINVAL;
+        return false;
+    }
+    *out_count = 0u;
+    if ((!dim_weights && dims != 0u) ||
+        !qihse_trinary_tryte_row_bytes(dims, &row_bytes) ||
+        !qihse_tryte_checked_mul_size(row_count, row_bytes, &payload_bytes)) {
+        if (!dim_weights && dims != 0u) {
+            errno = EINVAL;
+        }
+        return false;
+    }
+    if ((!encoded_rows && payload_bytes != 0u) ||
+        (!encoded_query && row_bytes != 0u) ||
+        (!out_row_indexes && max_results != 0u) ||
+        (!out_scores && max_results != 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_validate(encoded_query, row_bytes) ||
+        !qihse_trinary_tryte_validate(encoded_rows, payload_bytes)) {
+        return false;
+    }
+    if (row_count == 0u || max_results == 0u) {
+        return true;
+    }
+
+    for (row = 0u; row < row_count; row++) {
+        const uint8_t* candidate = row_bytes == 0u
+                                       ? NULL
+                                       : encoded_rows + (row * row_bytes);
+        int64_t score = 0;
+        size_t insert_at;
+
+        if (!qihse_trinary_tryte_weighted_similarity_i64(candidate,
+                                                        encoded_query,
+                                                        dim_weights,
+                                                        dims,
+                                                        &score)) {
+            return false;
+        }
+
+        insert_at = selected;
+        while (insert_at > 0u &&
+               qihse_tryte_weighted_candidate_is_better(
+                   score,
+                   row,
+                   out_scores[insert_at - 1u],
+                   out_row_indexes[insert_at - 1u])) {
+            insert_at--;
+        }
+        if (insert_at >= max_results) {
+            continue;
+        }
+        if (selected < max_results) {
+            selected++;
+        }
+        if (selected > insert_at + 1u) {
+            size_t move;
+            for (move = selected - 1u; move > insert_at; move--) {
+                out_row_indexes[move] = out_row_indexes[move - 1u];
+                out_scores[move] = out_scores[move - 1u];
+            }
+        }
+        out_row_indexes[insert_at] = row;
+        out_scores[insert_at] = score;
+    }
+
+    *out_count = selected;
+    return true;
+}

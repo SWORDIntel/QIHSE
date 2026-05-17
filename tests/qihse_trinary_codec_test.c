@@ -127,6 +127,84 @@ static bool test_topk_candidate_selection(void) {
     return true;
 }
 
+static bool test_weighted_topk_candidate_selection(void) {
+    const float vectors[] = {
+        1.0f, -1.0f, -1.0f, -1.0f,
+        -1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, -1.0f, -1.0f,
+    };
+    const float query[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const int32_t weights[] = {10, 1, 1, 1};
+    uint8_t encoded[3] = {0u, 0u, 0u};
+    uint8_t encoded_query[1] = {0u};
+    size_t indexes[3] = {999u, 999u, 999u};
+    int64_t scores[3] = {-99, -99, -99};
+    size_t count = 999u;
+    int64_t score = 12345;
+
+    TEST_ASSERT(qihse_trinary_tryte_encode_matrix(vectors, 3u, 4u,
+                                                  encoded, sizeof(encoded)),
+                "weighted candidate matrix should encode");
+    TEST_ASSERT(qihse_trinary_tryte_encode_row(query, 4u,
+                                               encoded_query,
+                                               sizeof(encoded_query)),
+                "weighted query row should encode");
+    TEST_ASSERT(qihse_trinary_tryte_weighted_similarity_i64(encoded,
+                                                            encoded_query,
+                                                            weights,
+                                                            4u,
+                                                            &score),
+                "weighted similarity should score");
+    TEST_ASSERT(score == 7, "weighted similarity should emphasize important dimensions");
+    TEST_ASSERT(qihse_trinary_tryte_select_topk_weighted(encoded,
+                                                         encoded_query,
+                                                         weights,
+                                                         3u,
+                                                         4u,
+                                                         indexes,
+                                                         scores,
+                                                         3u,
+                                                         &count),
+                "weighted top-k selection should succeed");
+    TEST_ASSERT(count == 3u, "weighted top-k should fill requested result count");
+    TEST_ASSERT(indexes[0] == 2u && scores[0] == 9,
+                "weighted best candidate should win on important dimensions");
+    TEST_ASSERT(indexes[1] == 0u && scores[1] == 7,
+                "weighted second candidate should beat broad low-value match");
+    TEST_ASSERT(indexes[2] == 1u && scores[2] == -7,
+                "weighted lowest candidate should be last");
+    return true;
+}
+
+static bool test_weighted_topk_rejects_negative_weight(void) {
+    const float vector[] = {1.0f};
+    const float query[] = {1.0f};
+    const int32_t weights[] = {-1};
+    uint8_t encoded[1] = {0u};
+    uint8_t encoded_query[1] = {0u};
+    size_t index = 999u;
+    int64_t score = -99;
+    size_t count = 999u;
+
+    TEST_ASSERT(qihse_trinary_tryte_encode_row(vector, 1u, encoded, sizeof(encoded)),
+                "negative-weight candidate should encode");
+    TEST_ASSERT(qihse_trinary_tryte_encode_row(query, 1u, encoded_query, sizeof(encoded_query)),
+                "negative-weight query should encode");
+    TEST_ASSERT(!qihse_trinary_tryte_select_topk_weighted(encoded,
+                                                          encoded_query,
+                                                          weights,
+                                                          1u,
+                                                          1u,
+                                                          &index,
+                                                          &score,
+                                                          1u,
+                                                          &count),
+                "weighted top-k should reject negative dimension weights");
+    TEST_ASSERT(errno == EINVAL, "negative dimension weight should set EINVAL");
+    TEST_ASSERT(count == 0u, "negative dimension weight should clear out_count");
+    return true;
+}
+
 static bool test_topk_invalid_tryte_rejected(void) {
     uint8_t encoded[] = {0u, 243u, 0u};
     uint8_t query[] = {0u};
@@ -173,6 +251,8 @@ int main(void) {
         {"encode row padding", test_encode_row_padding},
         {"matrix and similarity", test_matrix_and_similarity},
         {"top-k candidate selection", test_topk_candidate_selection},
+        {"weighted top-k candidate selection", test_weighted_topk_candidate_selection},
+        {"weighted top-k negative weight rejection", test_weighted_topk_rejects_negative_weight},
         {"top-k invalid tryte rejection", test_topk_invalid_tryte_rejected},
     };
     size_t i;

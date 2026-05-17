@@ -122,6 +122,23 @@ static int qihse_bench_sweep_enabled(void) {
     return value && strcmp(value, "1") == 0;
 }
 
+static int qihse_bench_weighted_score_enabled(void) {
+    const char* value = getenv("QIHSE_BENCH_TRINARY_SCORE");
+
+    return value && strcmp(value, "weighted") == 0;
+}
+
+static int32_t qihse_bench_weight_from_query(float value) {
+    float magnitude = fabsf(value);
+    int32_t weight;
+
+    if (magnitude <= 0.0f) {
+        return 0;
+    }
+    weight = (int32_t)(magnitude * 100.0f + 0.5f);
+    return weight > 0 ? weight : 1;
+}
+
 static void qihse_bench_fill_magnitude_skew(float* rows,
                                             float* query,
                                             uint64_t* ids) {
@@ -563,8 +580,8 @@ static size_t qihse_bench_ordered_matches(const qihse_bench_ranked_t* reranked,
     return matches;
 }
 
-static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
-                                                   const int32_t* candidate_scores,
+static int64_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
+                                                   const int64_t* candidate_scores,
                                                    size_t candidate_count,
                                                    size_t row_index) {
     size_t i;
@@ -580,6 +597,7 @@ static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
 int main(void) {
     qihse_bench_dataset_t dataset = qihse_bench_dataset();
     const int sweep_enabled = qihse_bench_sweep_enabled();
+    const int weighted_score_enabled = qihse_bench_weighted_score_enabled();
     char* db_path = NULL;
     qihse_vector_db_t full_db = NULL;
     float* rows = NULL;
@@ -591,7 +609,9 @@ int main(void) {
     qihse_vector_store_snapshot_t snapshot;
     size_t row_bytes = 0u;
     size_t* candidate_rows = NULL;
-    int32_t* candidate_scores = NULL;
+    int64_t* candidate_scores = NULL;
+    int32_t* scalar_candidate_scores = NULL;
+    int32_t dim_weights[QIHSE_BENCH_DIMS];
     size_t candidate_count = 0u;
     qihse_bench_ranked_t reranked[QIHSE_BENCH_TOPK];
     qihse_bench_ranked_t oracle[QIHSE_BENCH_TOPK];
@@ -633,12 +653,18 @@ int main(void) {
     ids = (uint64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*ids));
     full_results = (qihse_vector_result_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*full_results));
     candidate_rows = (size_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_rows));
-    candidate_scores = (int32_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_scores));
-    if (!rows || !ids || !full_results || !candidate_rows || !candidate_scores) {
+    candidate_scores = (int64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_scores));
+    scalar_candidate_scores =
+        (int32_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*scalar_candidate_scores));
+    if (!rows || !ids || !full_results || !candidate_rows || !candidate_scores ||
+        !scalar_candidate_scores) {
         perror("calloc");
         goto cleanup;
     }
     qihse_bench_fill_data(rows, query, ids);
+    for (i = 0u; i < QIHSE_BENCH_DIMS; i++) {
+        dim_weights[i] = qihse_bench_weight_from_query(query[i]);
+    }
 
     db_path = qihse_bench_make_temp_db_path();
     if (!db_path) {
@@ -742,19 +768,40 @@ int main(void) {
 
         memset(candidate_rows, 0, QIHSE_BENCH_ROWS * sizeof(*candidate_rows));
         memset(candidate_scores, 0, QIHSE_BENCH_ROWS * sizeof(*candidate_scores));
+        memset(scalar_candidate_scores,
+               0,
+               QIHSE_BENCH_ROWS * sizeof(*scalar_candidate_scores));
 
         select_start = qihse_bench_seconds();
         for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
-            if (!qihse_trinary_tryte_select_topk(snapshot.trinary,
-                                                 encoded_query,
-                                                 snapshot.row_count,
-                                                 QIHSE_BENCH_DIMS,
-                                                 candidate_rows,
-                                                 candidate_scores,
-                                                 candidate_limit,
-                                                 &candidate_count)) {
-                perror("qihse_trinary_tryte_select_topk");
-                goto cleanup;
+            if (weighted_score_enabled) {
+                if (!qihse_trinary_tryte_select_topk_weighted(snapshot.trinary,
+                                                              encoded_query,
+                                                              dim_weights,
+                                                              snapshot.row_count,
+                                                              QIHSE_BENCH_DIMS,
+                                                              candidate_rows,
+                                                              candidate_scores,
+                                                              candidate_limit,
+                                                              &candidate_count)) {
+                    perror("qihse_trinary_tryte_select_topk_weighted");
+                    goto cleanup;
+                }
+            } else {
+                if (!qihse_trinary_tryte_select_topk(snapshot.trinary,
+                                                     encoded_query,
+                                                     snapshot.row_count,
+                                                     QIHSE_BENCH_DIMS,
+                                                     candidate_rows,
+                                                     scalar_candidate_scores,
+                                                     candidate_limit,
+                                                     &candidate_count)) {
+                    perror("qihse_trinary_tryte_select_topk");
+                    goto cleanup;
+                }
+                for (i = 0u; i < candidate_count; i++) {
+                    candidate_scores[i] = (int64_t)scalar_candidate_scores[i];
+                }
             }
             checksum += (int64_t)candidate_rows[0] + (int64_t)candidate_scores[0];
         }
@@ -791,10 +838,11 @@ int main(void) {
                                                       full_results,
                                                       full_topk_count);
 
-        printf("%s dataset=%s rows=%u dims=%u qtri_row_bytes=%zu "
+        printf("%s dataset=%s score=%s rows=%u dims=%u qtri_row_bytes=%zu "
                "candidates=%zu topk=%u iterations=%u\n",
                sweep_enabled ? "trinary_search_path_sweep" : "trinary_search_path_bench",
                qihse_bench_dataset_name(dataset),
+               weighted_score_enabled ? "weighted" : "scalar",
                (unsigned)QIHSE_BENCH_ROWS,
                (unsigned)QIHSE_BENCH_DIMS,
                row_bytes,
@@ -827,14 +875,15 @@ int main(void) {
                (long long)checksum);
         if (!sweep_enabled) {
             for (i = 0u; i < reranked_count; i++) {
-                printf("result[%zu] row=%zu id=%llu tri_score=%d exact_score=%.6f\n",
+                printf("result[%zu] row=%zu id=%llu tri_score=%lld exact_score=%.6f\n",
                        i,
                        reranked[i].row_index,
                        (unsigned long long)reranked[i].id,
-                       qihse_bench_candidate_score_for_row(candidate_rows,
-                                                           candidate_scores,
-                                                           candidate_count,
-                                                           reranked[i].row_index),
+                       (long long)qihse_bench_candidate_score_for_row(
+                           candidate_rows,
+                           candidate_scores,
+                           candidate_count,
+                           reranked[i].row_index),
                        reranked[i].score);
             }
         }
@@ -852,6 +901,7 @@ cleanup:
         free(db_path);
     }
     free(candidate_scores);
+    free(scalar_candidate_scores);
     free(candidate_rows);
     free(ids);
     free(full_results);

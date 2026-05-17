@@ -80,6 +80,35 @@ bool qihse_trinary_tryte_select_topk(const uint8_t* encoded_rows,
                                      size_t max_results,
                                      size_t* out_count);
 
+/*
+ * Weighted signed-trit dot product.
+ *
+ * dim_weights supplies one non-negative weight per real dimension. Padding
+ * trits are ignored through dims. This keeps the same compact tryte sidecar
+ * while letting callers bias candidate selection toward high-value dimensions.
+ */
+bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
+                                                 const uint8_t* rhs_trytes,
+                                                 const int32_t* dim_weights,
+                                                 size_t dims,
+                                                 int64_t* out_score);
+
+/*
+ * Deterministic weighted top-k candidate selection over encoded rows.
+ *
+ * Results are ordered by descending weighted signed-trit similarity score.
+ * Equal scores are ordered by lower row index first.
+ */
+bool qihse_trinary_tryte_select_topk_weighted(const uint8_t* encoded_rows,
+                                              const uint8_t* encoded_query,
+                                              const int32_t* dim_weights,
+                                              size_t row_count,
+                                              size_t dims,
+                                              size_t* out_row_indexes,
+                                              int64_t* out_scores,
+                                              size_t max_results,
+                                              size_t* out_count);
+
 #ifdef __cplusplus
 }
 #endif

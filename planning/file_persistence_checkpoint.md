@@ -54,6 +54,7 @@ make bench-trinary-codec
 make bench-trinary-db-candidate
 make bench-trinary-search-path
 make bench-trinary-search-sweep
+make bench-trinary-weighted-sweep
 ```
 
 Latest local result: all targets passed.
@@ -74,15 +75,24 @@ first sweep showed:
 - `magnitude_skew` and `near_tie`: full recall/order at 128 candidates, but
   slower than float32 on the current scalar trinary selector.
 
+`bench-trinary-weighted-sweep` uses the same `vectors.qtri` sidecar but weights
+signed-trit scores by query magnitude. That preserves the current file format
+and is useful for proving what the sidecar can and cannot express. The first
+weighted sweep did not improve the hard `magnitude_skew` or `near_tie` cases:
+query-side weights alone cannot distinguish rows that share the same signs but
+have different row-side magnitudes. The next trinary improvement should add a
+row-side magnitude signal, such as magnitude buckets, ternary-plus-scale rows,
+or learned per-row/per-dimension weights.
+
 ## Next Slice
 
 1. Make the opt-in trinary search path easier to use from native callers:
    document the API contract, expected `candidate_count`, and failure modes.
 2. Use the candidate-count sweep to pick sane default candidate ratios per
    dataset shape instead of a single fixed value.
-3. Explore trinary improvements without replacing float32 yet:
-   weighted trits, magnitude buckets, ternary-plus-scale rows, or per-dimension
-   learned weights.
+3. Prototype a row-side magnitude sidecar for trinary search:
+   magnitude buckets, ternary-plus-scale rows, or learned per-row/per-dimension
+   weights.
 4. Continue file persistence breadth:
    manifest publication hardening, more crash-recovery fixtures, and cleanup of
    legacy subsystem-shaped layout as QIHSE becomes a naturally integrated native
