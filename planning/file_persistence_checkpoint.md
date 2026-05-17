@@ -159,7 +159,10 @@ Latest trinary calibration decision:
 keep exact float32 as the default, keep `use_trinary_candidates` exact,
 keep `qtri` wider than `qmag`, and do not change the default multipliers until
 production-shaped reference workloads justify it. The canonical wording lives
-in `qihse/benchmarks/reference_workloads.md`.
+in `qihse/benchmarks/reference_workloads.md`. The initial reference workload
+manifest is tracked at `qihse/benchmarks/reference_workloads.json`, with
+`make bench-reference-workloads` validating the manifest and printing the
+current benchmark plan.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
@@ -202,6 +205,8 @@ weighted prototype qtri selectors.
 3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
    FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
    through `src/framewerx/evaluation/search_backend.py`.
-4. Use fresh sweep results to tune the candidate-pool resolver once more real
-   datasets exist; the current defaults are conservative and mode-aware, and
+4. Import at least one external reference workload from
+   `qihse/benchmarks/reference_workloads.json`, then use fresh sweep results to
+   tune the candidate-pool resolver if the workload shows stable recall/latency
+   improvement. The current defaults are conservative and mode-aware, and
    synthetic-only multiplier tuning is intentionally deferred.

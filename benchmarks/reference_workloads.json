@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "description": "Reference workload manifest for QIHSE trinary candidate calibration.",
+  "default_metrics": [
+    "recall_at_1",
+    "recall_at_10",
+    "latency_p50_us",
+    "latency_p95_us",
+    "rerank_candidates"
+  ],
+  "workloads": [
+    {
+      "name": "synthetic-aligned",
+      "kind": "synthetic",
+      "dataset": "aligned",
+      "dimensions": 64,
+      "rows": 2048,
+      "queries": 1,
+      "top_k": 8,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "acceptance": {
+        "recall_at_top_k": 1.0,
+        "order_must_match_float32": true
+      }
+    },
+    {
+      "name": "synthetic-banded",
+      "kind": "synthetic",
+      "dataset": "banded",
+      "dimensions": 64,
+      "rows": 2048,
+      "queries": 1,
+      "top_k": 8,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "acceptance": {
+        "recall_at_top_k": 1.0,
+        "order_must_match_float32": true
+      }
+    },
+    {
+      "name": "synthetic-weighted",
+      "kind": "synthetic",
+      "dataset": "weighted",
+      "dimensions": 64,
+      "rows": 2048,
+      "queries": 1,
+      "top_k": 8,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "acceptance": {
+        "recall_at_top_k": 1.0,
+        "order_must_match_float32": true
+      }
+    },
+    {
+      "name": "sift1m",
+      "kind": "external",
+      "dataset": "sift1m",
+      "dimensions": 128,
+      "rows": 1000000,
+      "queries": 10000,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/sift1m/sift_base.fvecs",
+        "query_vectors": "data/sift1m/sift_query.fvecs",
+        "ground_truth": "data/sift1m/sift_groundtruth.ivecs"
+      },
+      "acceptance": {
+        "recall_at_10_floor": 0.95,
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
+    },
+    {
+      "name": "text-embeddings-small",
+      "kind": "external",
+      "dataset": "text_embeddings",
+      "dimensions": 768,
+      "rows": 100000,
+      "queries": 1000,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/text_embeddings/base.f32",
+        "query_vectors": "data/text_embeddings/query.f32",
+        "ground_truth": "data/text_embeddings/ground_truth.u32"
+      },
+      "acceptance": {
+        "recall_at_10_floor": 0.95,
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
+    }
+  ]
+}

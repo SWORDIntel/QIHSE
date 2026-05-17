@@ -33,6 +33,16 @@ Calibration gate:
 - Only adjust defaults when a reference workload shows a stable improvement
   across repeated runs.
 
+Tracked workload manifest:
+
+- `benchmarks/reference_workloads.json` is the current source of truth for
+  calibration workloads.
+- `make bench-reference-workloads` validates the manifest and prints the
+  benchmark plan.
+- External workloads are intentionally file-backed but not bundled. Use
+  `python3 benchmarks/scripts/qihse_reference_workloads.py --root . --check-files`
+  to verify local dataset availability before using them as tuning evidence.
+
 #### SIFT1M Benchmark (Computer Vision)
 ```python
 # Dataset: 1M SIFT descriptors (128 dimensions)

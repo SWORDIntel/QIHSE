@@ -4,6 +4,11 @@
 
 **Purpose:** Establish credible performance claims through standardized, reproducible benchmarks that reflect real-world usage patterns.
 
+Active trinary calibration workloads are tracked in
+`benchmarks/reference_workloads.json`. Run `make bench-reference-workloads`
+from the QIHSE root to validate the manifest and print the current benchmark
+plan.
+
 ---
 
 ## Workload Categories
