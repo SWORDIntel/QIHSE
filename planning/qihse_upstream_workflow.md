@@ -22,7 +22,9 @@ pipeline stabilize.
 ## Target Workflow
 
 1. Develop QIHSE changes directly in `SWORDIntel/QIHSE`.
-2. Run QIHSE-local validation there:
+2. In this repository layout, run QIHSE-local validation from the `qihse/` subtree:
+   - `cd qihse`
+   - `make check` (runs `check-upstream-workflow`)
    - `make check-upstream-workflow`
    - `make validate-reference-workflow`
    - `make bench-reference-workloads`
@@ -44,12 +46,14 @@ pipeline stabilize.
 ## Workflow Check
 
 `make check-upstream-workflow` reports whether the current QIHSE root is a
-direct upstream checkout or an imported FRAMEWERX copy. In the upstream
-repository, use:
+direct upstream checkout or an imported FRAMEWERX copy. In the same `qihse/`
+execution context, use:
 
 ```bash
 python3 scripts/qihse_workflow_check.py --root . --strict-upstream
 ```
 
 That mode fails unless the QIHSE root is the Git root and the checkout has a
-`SWORDIntel/QIHSE` remote.
+`SWORDIntel/QIHSE` remote. For `qihse/` subtree execution in FRAMEWERX,
+use `python3 scripts/qihse_workflow_check.py --root . --strict-upstream` only
+when intentionally validating an upstream checkout.

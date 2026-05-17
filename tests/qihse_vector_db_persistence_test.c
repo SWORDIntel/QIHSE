@@ -109,6 +109,9 @@ static bool test_truncated_vectors_qvec_payload_rejected(void);
 static bool test_corrupt_metadata_qmeta_rejected(void);
 static bool test_truncated_metadata_qmeta_payload_rejected(void);
 static bool test_corrupt_index_qidx_magic_rejected(void);
+static bool test_corrupt_index_qidx_count_mismatch_rejected(void);
+static bool test_corrupt_index_qidx_row_bytes_rejected(void);
+static bool test_manifest_index_checksum_mismatch_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
@@ -173,6 +176,12 @@ int main(void) {
          test_truncated_metadata_qmeta_payload_rejected},
         {"corrupt index.qidx magic fails open cleanly",
          test_corrupt_index_qidx_magic_rejected},
+        {"index.qidx row-count mismatch rejects open",
+         test_corrupt_index_qidx_count_mismatch_rejected},
+        {"index.qidx row-bytes mismatch rejects open",
+         test_corrupt_index_qidx_row_bytes_rejected},
+        {"manifest/index checksum mismatch rejects open",
+         test_manifest_index_checksum_mismatch_rejected},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
         {"truncated manifest fails open cleanly",
@@ -1370,6 +1379,102 @@ static bool test_corrupt_index_qidx_magic_rejected(void) {
         QIHSE_TEST_OPEN_FILE_BACKED
     );
     TEST_ASSERT(db == NULL, "corrupt index.qidx magic should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_corrupt_index_qidx_count_mismatch_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("index_qidx_count_mismatch");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.7f, 0.1f, 0.2f};
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9015, NULL, 0),
+                "insert before index count mutation should succeed");
+    TEST_ASSERT(close_db(db), "database should close before index count corruption");
+
+    TEST_ASSERT(write_file_u64le_at(path, "index.qidx", 16, 2u),
+                "test should mutate index.qidx row-count");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "index.qidx row-count mismatch should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_corrupt_index_qidx_row_bytes_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("index_qidx_row_bytes");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.3f, 0.6f, 0.9f};
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9016, NULL, 0),
+                "insert before index row-bytes mutation should succeed");
+    TEST_ASSERT(close_db(db), "database should close before index row-bytes corruption");
+
+    TEST_ASSERT(corrupt_file_byte(path, "index.qidx", 12, 0xffu),
+                "test should corrupt index.qidx row-bytes field");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "index.qidx impossible row-bytes should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_manifest_index_checksum_mismatch_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("manifest_index_checksum_mismatch");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.5f, 0.4f, 0.1f};
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9017, NULL, 0),
+                "insert before manifest checksum mutation should succeed");
+    TEST_ASSERT(close_db(db), "database should close before manifest checksum mutation");
+
+    TEST_ASSERT(write_file_u64le_at(path, "MANIFEST", 56, 0u),
+                "test should mutate manifest index CRC64");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "manifest index checksum mismatch should fail open");
 
     remove_tree(path);
     free(path);

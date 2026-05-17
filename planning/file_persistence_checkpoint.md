@@ -216,7 +216,8 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Add or stage SIFT-style data files under `data/sift1m/`, then run
+1. Add or stage SIFT-style data files under `data/sift1m/`, or rely on the
+   local fallback fixture generator when those files are unavailable, then run
    `make bench-sift1m-workload`. The generic runner now supports `fvecs`,
    `ivecs`, `f32_matrix`, and `u32_matrix` manifest entries, with
    `make bench-reference-runner-smoke` covering the SIFT-style parser path
