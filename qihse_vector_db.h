@@ -90,6 +90,20 @@ typedef enum qihse_vector_db_magnitude_status_e {
     QIHSE_VDB_MAGNITUDE_CORRUPT = 3
 } qihse_vector_db_magnitude_status_t;
 
+/**
+ * Native search mode selector for qihse_vector_db_search().
+ *
+ * QIHSE_VDB_QUERY_FLOAT32 is the default and ignores optional trinary sidecars.
+ * QIHSE_VDB_QUERY_TRINARY_SCALAR uses vectors.qtri for sign-only candidate
+ * selection, then reranks the candidate rows against authoritative float32
+ * storage. QIHSE_VDB_QUERY_TRINARY_MAGNITUDE uses both vectors.qtri and
+ * vectors.qmag for magnitude-aware candidate selection before the same exact
+ * float32 rerank.
+ *
+ * Trinary modes are explicit caller opt-ins. They fail rather than falling
+ * back when required sidecars are absent, corrupt, stale, or internally
+ * inconsistent with the live float32 row count/dimensions.
+ */
 typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_FLOAT32 = 0,
     QIHSE_VDB_QUERY_TRINARY_SCALAR = 1,
@@ -139,6 +153,28 @@ typedef struct qihse_vector_result_s {
 
 /**
  * Vector database query parameters.
+ *
+ * Contract for qihse_vector_db_search():
+ *
+ * - query_mode == QIHSE_VDB_QUERY_FLOAT32, including zero-initialized queries,
+ *   performs exact float32 search and tolerates missing/corrupt/stale qtri or
+ *   qmag sidecars.
+ * - use_trinary_candidates is the legacy scalar opt-in. When true and
+ *   query_mode remains FLOAT32, candidate_count is used as-is and must be at
+ *   least top_k; there is no automatic pool default on this legacy path.
+ * - query_mode == QIHSE_VDB_QUERY_TRINARY_SCALAR uses candidate_pool_size when
+ *   non-zero, otherwise candidate_count, otherwise defaults to top_k * 8.
+ * - query_mode == QIHSE_VDB_QUERY_TRINARY_MAGNITUDE uses the same candidate
+ *   pool rule as TRINARY_SCALAR, then caps the pool to total_vectors.
+ * - Explicit trinary modes require top_k > 0 and top_k <= max_results. The
+ *   effective candidate pool must still be at least top_k after validation.
+ * - Missing qtri reports ENOENT; stale qtri reports ESTALE when available or
+ *   EINVAL otherwise; corrupt qtri reports EINVAL.
+ * - Missing qmag reports ENODATA when available or ENOENT otherwise; stale
+ *   qmag reports ESTALE when available or EINVAL otherwise; corrupt qmag
+ *   reports EINVAL. The current internal consistency check reports stale via
+ *   the trinary stale path when either qtri or qmag row/byte metadata no
+ *   longer matches the float32 store.
  */
 typedef struct qihse_vector_query_s {
     const float* query_vector;      /* Query vector */
@@ -149,8 +185,8 @@ typedef struct qihse_vector_query_s {
     bool include_metadata;          /* Include metadata in results */
     bool use_trinary_candidates;    /* Explicit opt-in trinary candidate path */
     size_t candidate_count;         /* Trinary candidate count before rerank */
-    qihse_vector_db_query_mode_t query_mode;
-    size_t candidate_pool_size;
+    qihse_vector_db_query_mode_t query_mode; /* Preferred search mode selector */
+    size_t candidate_pool_size;     /* Preferred trinary pool size override */
 } qihse_vector_query_t;
 
 /**
@@ -379,8 +415,12 @@ bool qihse_vector_db_upsert_by_ids(
 /**
  * Search vectors with QIHSE acceleration and instant access.
  *
+ * Default queries search authoritative float32 vectors. Trinary query modes
+ * use qtri/qmag only as candidate selectors and still return exact float32
+ * reranked results.
+ *
  * @param vdb Vector database handle
- * @param query Query parameters
+ * @param query Query parameters; see qihse_vector_query_t for trinary contract
  * @param results Output array for results
  * @param max_results Maximum number of results to return
  * @return Number of results found, or negative on error
@@ -393,12 +433,16 @@ int qihse_vector_db_search(
 );
 
 /**
- * Explicit opt-in trinary candidate search.
+ * Explicit opt-in legacy scalar trinary candidate search.
  *
  * This path uses a valid vectors.qtri sidecar only to choose candidate rows,
- * then reranks those candidates against the authoritative float32 vectors.
- * It fails instead of falling back when the sidecar is absent, corrupt, stale,
- * or when candidate_count is smaller than query->top_k.
+ * then reranks those candidates against the authoritative float32 vectors. It
+ * does not consult query->candidate_pool_size and does not synthesize a default
+ * candidate count; callers must pass candidate_count >= query->top_k.
+ *
+ * It fails instead of falling back when qtri is absent, corrupt, stale,
+ * internally inconsistent with float32 storage, or when candidate_count is
+ * smaller than query->top_k.
  *
  * @param vdb Vector database handle
  * @param query Query parameters; query->top_k is the required result count

@@ -163,23 +163,6 @@ static int32_t qihse_bench_weight_from_query(float value) {
     return weight > 0 ? weight : 1;
 }
 
-static uint8_t qihse_bench_magnitude_bucket(float value) {
-    float magnitude = fabsf(value);
-    int bucket;
-
-    if (magnitude <= 0.0f) {
-        return 0u;
-    }
-    bucket = (int)(magnitude * 100.0f + 0.5f);
-    if (bucket < 1) {
-        return 1u;
-    }
-    if (bucket > 255) {
-        return 255u;
-    }
-    return (uint8_t)bucket;
-}
-
 static void qihse_bench_fill_magnitude_skew(float* rows,
                                             float* query,
                                             uint64_t* ids) {
@@ -400,13 +383,17 @@ static int qihse_bench_verify_reopen_stats(const char* db_path) {
     }
     if (stats.encoding_id != QIHSE_ENCODING_FLOAT32 ||
         stats.trinary_status != QIHSE_VDB_TRINARY_VALID ||
-        stats.trinary_rows != QIHSE_BENCH_ROWS) {
+        stats.trinary_rows != QIHSE_BENCH_ROWS ||
+        stats.magnitude_status != QIHSE_VDB_MAGNITUDE_VALID ||
+        stats.magnitude_rows != QIHSE_BENCH_ROWS) {
         fprintf(stderr,
                 "unexpected persistence stats: encoding=%u trinary_status=%d "
-                "trinary_rows=%llu\n",
+                "trinary_rows=%llu magnitude_status=%d magnitude_rows=%llu\n",
                 (unsigned)stats.encoding_id,
                 (int)stats.trinary_status,
-                (unsigned long long)stats.trinary_rows);
+                (unsigned long long)stats.trinary_rows,
+                (int)stats.magnitude_status,
+                (unsigned long long)stats.magnitude_rows);
         qihse_vector_db_destroy(db);
         return 0;
     }
@@ -586,6 +573,45 @@ static int qihse_bench_verify_full_search(const qihse_vector_result_t* results,
     return 1;
 }
 
+static int qihse_bench_ranked_from_results(
+    const qihse_vector_store_snapshot_t* snapshot,
+    const qihse_vector_result_t* results,
+    size_t result_count,
+    qihse_bench_ranked_t* out,
+    size_t max_results,
+    size_t* out_count) {
+    size_t result_index;
+    size_t selected = 0u;
+
+    if (!snapshot || !results || !out || !out_count || max_results == 0u) {
+        errno = EINVAL;
+        return 0;
+    }
+    memset(out, 0, max_results * sizeof(*out));
+    for (result_index = 0u; result_index < result_count && selected < max_results;
+         result_index++) {
+        size_t row_index;
+        int found = 0;
+
+        for (row_index = 0u; row_index < snapshot->row_count; row_index++) {
+            if (snapshot->rows[row_index].vector_id == results[result_index].id) {
+                out[selected].row_index = row_index;
+                out[selected].id = results[result_index].id;
+                out[selected].score = results[result_index].score;
+                selected++;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            errno = ENOENT;
+            return 0;
+        }
+    }
+    *out_count = selected;
+    return 1;
+}
+
 static size_t qihse_bench_recall_matches(const qihse_bench_ranked_t* reranked,
                                          size_t reranked_count,
                                          const qihse_vector_result_t* full,
@@ -635,147 +661,6 @@ static int64_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
     return 0;
 }
 
-static int qihse_bench_build_magnitude_buckets(
-    const qihse_vector_store_snapshot_t* snapshot,
-    uint8_t* out_buckets) {
-    size_t row_index;
-
-    if (!snapshot || !out_buckets) {
-        errno = EINVAL;
-        return 0;
-    }
-    for (row_index = 0u; row_index < snapshot->row_count; row_index++) {
-        const qihse_index_row_t* row = snapshot->rows + row_index;
-        const float* vector =
-            qihse_bench_snapshot_vector_at(snapshot, row, QIHSE_BENCH_DIMS);
-        size_t dim;
-
-        if (!vector) {
-            errno = EINVAL;
-            return 0;
-        }
-        for (dim = 0u; dim < QIHSE_BENCH_DIMS; dim++) {
-            out_buckets[(row_index * QIHSE_BENCH_DIMS) + dim] =
-                qihse_bench_magnitude_bucket(vector[dim]);
-        }
-    }
-    return 1;
-}
-
-static int qihse_bench_build_signed_trits(const uint8_t* encoded_rows,
-                                          size_t row_count,
-                                          size_t dims,
-                                          int8_t* out_trits) {
-    size_t row_bytes;
-    size_t row;
-
-    if (!out_trits) {
-        errno = EINVAL;
-        return 0;
-    }
-    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes)) {
-        return 0;
-    }
-    if (!encoded_rows && row_count != 0u && row_bytes != 0u) {
-        errno = EINVAL;
-        return 0;
-    }
-    for (row = 0u; row < row_count; row++) {
-        size_t dim = 0u;
-        size_t byte_index;
-
-        for (byte_index = 0u; byte_index < row_bytes; byte_index++) {
-            uint8_t trits[QIHSE_TRINARY_TRITS_PER_TRYTE];
-            size_t trit_index;
-
-            if (!qihse_trinary_tryte_unpack(encoded_rows[(row * row_bytes) + byte_index],
-                                            trits)) {
-                return 0;
-            }
-            for (trit_index = 0u; trit_index < QIHSE_TRINARY_TRITS_PER_TRYTE &&
-                                  dim < dims;
-                 trit_index++, dim++) {
-                uint8_t trit = trits[trit_index];
-                out_trits[(row * dims) + dim] =
-                    trit == 0u ? -1 : trit == 2u ? 1 : 0;
-            }
-        }
-    }
-    return 1;
-}
-
-static int qihse_bench_select_topk_magnitude(
-    const int8_t* row_trits,
-    const int8_t* query_trits,
-    const int32_t* dim_weights,
-    const uint8_t* magnitude_buckets,
-    size_t row_count,
-    size_t dims,
-    size_t* out_row_indexes,
-    int64_t* out_scores,
-    size_t max_results,
-    size_t* out_count) {
-    size_t selected = 0u;
-    size_t row;
-
-    if (!out_count) {
-        errno = EINVAL;
-        return 0;
-    }
-    *out_count = 0u;
-    if ((!row_trits || !query_trits || !dim_weights || !magnitude_buckets) &&
-        dims != 0u) {
-        errno = EINVAL;
-        return 0;
-    }
-    if ((!out_row_indexes || !out_scores) && max_results != 0u) {
-        errno = EINVAL;
-        return 0;
-    }
-    if (row_count == 0u || max_results == 0u) {
-        return 1;
-    }
-
-    for (row = 0u; row < row_count; row++) {
-        int64_t score = 0;
-        size_t dim;
-        size_t insert_at;
-
-        for (dim = 0u; dim < dims; dim++) {
-            score += (int64_t)row_trits[(row * dims) + dim] *
-                     (int64_t)query_trits[dim] *
-                     (int64_t)dim_weights[dim] *
-                     (int64_t)magnitude_buckets[(row * dims) + dim];
-        }
-
-        insert_at = selected;
-        while (insert_at > 0u &&
-               (score > out_scores[insert_at - 1u] ||
-                (score == out_scores[insert_at - 1u] &&
-                 row < out_row_indexes[insert_at - 1u]))) {
-            insert_at--;
-        }
-        if (insert_at >= max_results) {
-            continue;
-        }
-        if (selected < max_results) {
-            selected++;
-        }
-        if (selected > insert_at + 1u) {
-            size_t move;
-            for (move = selected - 1u; move > insert_at; move--) {
-                out_row_indexes[move] = out_row_indexes[move - 1u];
-                out_scores[move] = out_scores[move - 1u];
-            }
-        }
-        out_row_indexes[insert_at] = row;
-        out_scores[insert_at] = score;
-    }
-
-    *out_count = selected;
-    return 1;
-}
-
 int main(void) {
     qihse_bench_dataset_t dataset = qihse_bench_dataset();
     const int sweep_enabled = qihse_bench_sweep_enabled();
@@ -787,15 +672,14 @@ int main(void) {
     float query[QIHSE_BENCH_DIMS];
     uint8_t encoded_query[(QIHSE_BENCH_DIMS + 4u) / 5u];
     qihse_vector_query_t full_query;
+    qihse_vector_query_t qmag_query;
     qihse_vector_result_t* full_results = NULL;
+    qihse_vector_result_t qmag_results[QIHSE_BENCH_TOPK];
     qihse_vector_store_snapshot_t snapshot;
     size_t row_bytes = 0u;
     size_t* candidate_rows = NULL;
     int64_t* candidate_scores = NULL;
     int32_t* scalar_candidate_scores = NULL;
-    uint8_t* magnitude_buckets = NULL;
-    int8_t* row_trits = NULL;
-    int8_t query_trits[QIHSE_BENCH_DIMS];
     int32_t dim_weights[QIHSE_BENCH_DIMS];
     size_t candidate_count = 0u;
     qihse_bench_ranked_t reranked[QIHSE_BENCH_TOPK];
@@ -841,11 +725,8 @@ int main(void) {
     candidate_scores = (int64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*candidate_scores));
     scalar_candidate_scores =
         (int32_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*scalar_candidate_scores));
-    magnitude_buckets =
-        (uint8_t*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(*magnitude_buckets));
-    row_trits = (int8_t*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(*row_trits));
     if (!rows || !ids || !full_results || !candidate_rows || !candidate_scores ||
-        !scalar_candidate_scores || !magnitude_buckets || !row_trits) {
+        !scalar_candidate_scores) {
         perror("calloc");
         goto cleanup;
     }
@@ -898,20 +779,6 @@ int main(void) {
         perror("qihse_trinary_tryte_encode_row");
         goto cleanup;
     }
-    if (score_mode == QIHSE_BENCH_SCORE_MAGNITUDE &&
-        (!qihse_bench_build_magnitude_buckets(&snapshot, magnitude_buckets) ||
-         !qihse_bench_build_signed_trits(snapshot.trinary,
-                                         snapshot.row_count,
-                                         QIHSE_BENCH_DIMS,
-                                         row_trits) ||
-         !qihse_bench_build_signed_trits(encoded_query,
-                                         1u,
-                                         QIHSE_BENCH_DIMS,
-                                         query_trits))) {
-        perror("build magnitude sidecar inputs");
-        goto cleanup;
-    }
-
     memset(&full_query, 0, sizeof(full_query));
     full_query.query_vector = query;
     full_query.vector_dims = QIHSE_BENCH_DIMS;
@@ -919,6 +786,15 @@ int main(void) {
     full_query.similarity_threshold = -1.0f;
     full_query.include_vectors = false;
     full_query.include_metadata = false;
+
+    memset(&qmag_query, 0, sizeof(qmag_query));
+    qmag_query.query_vector = query;
+    qmag_query.vector_dims = QIHSE_BENCH_DIMS;
+    qmag_query.top_k = QIHSE_BENCH_TOPK;
+    qmag_query.similarity_threshold = -1.0f;
+    qmag_query.include_vectors = false;
+    qmag_query.include_metadata = false;
+    qmag_query.query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE;
 
     full_start = qihse_bench_seconds();
     for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
@@ -976,19 +852,30 @@ int main(void) {
         select_start = qihse_bench_seconds();
         for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
             if (score_mode == QIHSE_BENCH_SCORE_MAGNITUDE) {
-                if (!qihse_bench_select_topk_magnitude(row_trits,
-                                                       query_trits,
-                                                       dim_weights,
-                                                       magnitude_buckets,
-                                                       snapshot.row_count,
-                                                       QIHSE_BENCH_DIMS,
-                                                       candidate_rows,
-                                                       candidate_scores,
-                                                       candidate_limit,
-                                                       &candidate_count)) {
-                    perror("qihse_bench_select_topk_magnitude");
+                int found;
+
+                qmag_query.candidate_pool_size = candidate_limit;
+                memset(qmag_results, 0, sizeof(qmag_results));
+                found = qihse_vector_db_search(full_db,
+                                               &qmag_query,
+                                               qmag_results,
+                                               QIHSE_BENCH_TOPK);
+                if (found < 0) {
+                    perror("qihse_vector_db_search qmag");
                     goto cleanup;
                 }
+                candidate_count = candidate_limit;
+                reranked_count = (size_t)found;
+                if (!qihse_bench_ranked_from_results(&snapshot,
+                                                     qmag_results,
+                                                     reranked_count,
+                                                     reranked,
+                                                     QIHSE_BENCH_TOPK,
+                                                     &reranked_count)) {
+                    perror("qihse_bench_ranked_from_results");
+                    goto cleanup;
+                }
+                checksum += reranked_count != 0u ? (int64_t)reranked[0].row_index : 0;
             } else if (score_mode == QIHSE_BENCH_SCORE_WEIGHTED) {
                 if (!qihse_trinary_tryte_select_topk_weighted(snapshot.trinary,
                                                               encoded_query,
@@ -1018,23 +905,27 @@ int main(void) {
                     candidate_scores[i] = (int64_t)scalar_candidate_scores[i];
                 }
             }
-            checksum += (int64_t)candidate_rows[0] + (int64_t)candidate_scores[0];
+            if (score_mode != QIHSE_BENCH_SCORE_MAGNITUDE) {
+                checksum += (int64_t)candidate_rows[0] + (int64_t)candidate_scores[0];
+            }
         }
         select_seconds = qihse_bench_seconds() - select_start;
 
         rerank_start = qihse_bench_seconds();
-        for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
-            if (!qihse_bench_exact_rank(&snapshot,
-                                        query,
-                                        candidate_rows,
-                                        candidate_count,
-                                        reranked,
-                                        QIHSE_BENCH_TOPK,
-                                        &reranked_count)) {
-                perror("candidate exact rerank");
-                goto cleanup;
+        if (score_mode != QIHSE_BENCH_SCORE_MAGNITUDE) {
+            for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
+                if (!qihse_bench_exact_rank(&snapshot,
+                                            query,
+                                            candidate_rows,
+                                            candidate_count,
+                                            reranked,
+                                            QIHSE_BENCH_TOPK,
+                                            &reranked_count)) {
+                    perror("candidate exact rerank");
+                    goto cleanup;
+                }
+                checksum += (int64_t)reranked[0].row_index;
             }
-            checksum += (int64_t)reranked[0].row_index;
         }
         rerank_seconds = qihse_bench_seconds() - rerank_start;
 
@@ -1053,23 +944,30 @@ int main(void) {
                                                       full_results,
                                                       full_topk_count);
 
-        printf("%s dataset=%s score=%s rows=%u dims=%u qtri_row_bytes=%zu "
+        printf("%s dataset=%s score=%s query_path=%s rows=%u dims=%u "
+               "qtri_row_bytes=%zu "
                "candidates=%zu topk=%u iterations=%u\n",
                sweep_enabled ? "trinary_search_path_sweep" : "trinary_search_path_bench",
                qihse_bench_dataset_name(dataset),
                qihse_bench_score_mode_name(score_mode),
+               score_mode == QIHSE_BENCH_SCORE_MAGNITUDE
+                   ? "persisted_qmag:qihse_vector_db_search"
+                   : "prototype_qtri_selector",
                (unsigned)QIHSE_BENCH_ROWS,
                (unsigned)QIHSE_BENCH_DIMS,
                row_bytes,
                candidate_limit,
                (unsigned)QIHSE_BENCH_TOPK,
                (unsigned)QIHSE_BENCH_ITERS);
-        printf("load_ms=%.3f full_float32_avg_us=%.3f trinary_select_avg_us=%.3f "
+        printf("load_ms=%.3f full_float32_avg_us=%.3f %s=%.3f "
                "exact_rerank_avg_us=%.3f trinary_rerank_avg_us=%.3f "
                "speedup_vs_full=%.3fx recall_at_%u=%.3f ordered_at_%u=%.3f "
                "perfect_required=%s checksum=%lld\n",
                load_seconds * 1000.0,
                (full_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
+               score_mode == QIHSE_BENCH_SCORE_MAGNITUDE
+                   ? "persisted_qmag_search_avg_us"
+                   : "trinary_select_avg_us",
                (select_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
                (rerank_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
                ((select_seconds + rerank_seconds) * 1000000.0) /
@@ -1090,16 +988,26 @@ int main(void) {
                (long long)checksum);
         if (!sweep_enabled) {
             for (i = 0u; i < reranked_count; i++) {
-                printf("result[%zu] row=%zu id=%llu tri_score=%lld exact_score=%.6f\n",
-                       i,
-                       reranked[i].row_index,
-                       (unsigned long long)reranked[i].id,
-                       (long long)qihse_bench_candidate_score_for_row(
-                           candidate_rows,
-                           candidate_scores,
-                           candidate_count,
-                           reranked[i].row_index),
-                       reranked[i].score);
+                if (score_mode == QIHSE_BENCH_SCORE_MAGNITUDE) {
+                    printf("result[%zu] row=%zu id=%llu qmag_score=persisted "
+                           "exact_score=%.6f\n",
+                           i,
+                           reranked[i].row_index,
+                           (unsigned long long)reranked[i].id,
+                           reranked[i].score);
+                } else {
+                    printf("result[%zu] row=%zu id=%llu tri_score=%lld "
+                           "exact_score=%.6f\n",
+                           i,
+                           reranked[i].row_index,
+                           (unsigned long long)reranked[i].id,
+                           (long long)qihse_bench_candidate_score_for_row(
+                               candidate_rows,
+                               candidate_scores,
+                               candidate_count,
+                               reranked[i].row_index),
+                           reranked[i].score);
+                }
             }
         }
     }
@@ -1117,8 +1025,6 @@ cleanup:
     }
     free(candidate_scores);
     free(scalar_candidate_scores);
-    free(magnitude_buckets);
-    free(row_trits);
     free(candidate_rows);
     free(ids);
     free(full_results);

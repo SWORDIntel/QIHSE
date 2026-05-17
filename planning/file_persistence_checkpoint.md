@@ -29,6 +29,11 @@ exact float32 reranking.
   independently from `vectors.qtri` in manifest stats/status.
 - Default float32 search tolerates missing/corrupt qmag; the explicit
   magnitude-backed trinary query mode fails clearly when qmag is unavailable.
+- The native caller contract for trinary query modes is documented in
+  `qihse/qihse_vector_db.h`.
+- The magnitude benchmark path now exercises the persisted
+  `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` query mode instead of the older
+  in-process qmag prototype selector.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -42,10 +47,19 @@ exact float32 reranking.
   - `candidate_pool_size`
 - Default `qihse_vector_db_search(...)` remains float32 unless the query opts
   into trinary candidates.
+- `query_mode == QIHSE_VDB_QUERY_FLOAT32` is the default, including
+  zero-initialized queries, and ignores qtri/qmag availability.
+- The legacy `use_trinary_candidates` path remains scalar qtri-only and uses
+  `candidate_count` exactly as supplied; callers must pass
+  `candidate_count >= top_k`.
+- `QIHSE_VDB_QUERY_TRINARY_SCALAR` uses `candidate_pool_size` when non-zero,
+  then `candidate_count`, then defaults to `top_k * 8`.
 - The trinary path requires a valid `vectors.qtri`, selects tryte candidates,
   then reranks against authoritative float32 vectors.
-- Missing, corrupt, stale, or mismatched `vectors.qtri` makes the opt-in path
-  fail clearly while default search continues normally.
+- Missing, corrupt, stale, or mismatched `vectors.qtri` makes explicit trinary
+  paths fail clearly while default search continues normally.
+- qtri failure errno contract: absent -> `ENOENT`, stale/mismatched -> `ESTALE`
+  when available or `EINVAL`, corrupt -> `EINVAL`.
 - Deterministic benchmark datasets now include aligned cases where trinary
   candidate search works well and adversarial cases where sign-only trinary
   loses recall/order to float32 magnitude detail.
@@ -61,6 +75,11 @@ exact float32 reranking.
 - `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` selects candidates with
   `query_sign * row_sign * query_weight * row_bucket`, then reranks the chosen
   candidates with authoritative float32 cosine similarity.
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` uses the same candidate-pool default as
+  scalar query mode and caps the pool to total vectors.
+- Magnitude mode requires both valid `vectors.qtri` and valid `vectors.qmag`.
+  qmag absence reports `ENODATA` when available or `ENOENT`; stale reports
+  `ESTALE` when available or `EINVAL`; corrupt reports `EINVAL`.
 - The legacy `use_trinary_candidates` scalar path remains backward-compatible.
 
 ## Verification Snapshot
@@ -106,22 +125,17 @@ have different row-side magnitudes. The next trinary improvement should add a
 row-side magnitude signal, such as magnitude buckets, ternary-plus-scale rows,
 or learned per-row/per-dimension weights.
 
-`bench-trinary-magnitude-sweep` originally prototyped that row-side signal
-without changing the persisted store. The same scoring idea now has a real
-file-backed sidecar via `vectors.qmag`; the benchmark should be updated next so
-it can compare the persisted query mode directly.
+`bench-trinary-magnitude-sweep` now exercises the real file-backed qmag query
+mode through `qihse_vector_db_search()` with
+`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`. Its output marks that path as
+`persisted_qmag:qihse_vector_db_search`, making it distinct from the scalar and
+weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Update the benchmark harness to exercise
-   `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` against persisted qmag instead of only
-   the in-process prototype.
-2. Make the opt-in trinary search path easier to use from native callers:
-   document the API contract, default candidate-pool behavior, and failure
-   modes.
-3. Use the candidate-count sweep to pick sane default candidate ratios per
+1. Use the candidate-count sweep to pick sane default candidate ratios per
    dataset shape instead of a single fixed value.
-4. Continue file persistence breadth:
+2. Continue file persistence breadth:
    manifest publication hardening, more crash-recovery fixtures, and cleanup of
    legacy subsystem-shaped layout as QIHSE becomes a naturally integrated native
    component.

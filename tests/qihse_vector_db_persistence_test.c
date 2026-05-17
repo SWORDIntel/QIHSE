@@ -110,6 +110,7 @@ static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void);
 static bool test_trinary_candidate_search_validates_counts(void);
 static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void);
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void);
+static bool test_old_128_byte_manifest_opens_with_qmag_absent(void);
 static bool test_delete_by_id_persists_across_reopen(void);
 static bool test_update_by_id_replaces_vector_and_metadata(void);
 static bool test_upsert_by_ids_reports_insert_and_update_counts(void);
@@ -166,6 +167,8 @@ int main(void) {
          test_qmag_sidecar_persists_and_magnitude_query_matches_float32},
         {"PR-6 default search ignores missing/corrupt qmag",
          test_default_search_ignores_missing_or_corrupt_qmag},
+        {"PR-6 old 128-byte manifest opens with qmag absent",
+         test_old_128_byte_manifest_opens_with_qmag_absent},
         {"delete_by_id persists across reopen",
          test_delete_by_id_persists_across_reopen},
         {"update_by_id replaces vector and metadata",
@@ -1641,6 +1644,60 @@ static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
     env_destroy(&env);
     return true;
 }
+
+static bool test_old_128_byte_manifest_opens_with_qmag_absent(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "old manifest qmag fixture should be created");
+
+    char qmag_path[512];
+    snprintf(qmag_path, sizeof(qmag_path), "%s/vectors.qmag", path);
+    TEST_ASSERT(unlink(qmag_path) == 0, "test should remove vectors.qmag");
+    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 128),
+                "test should truncate manifest to old 128-byte size");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "old 128-byte manifest should reopen read-only");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available for old manifest");
+    TEST_ASSERT(stats.index_rows == 5u, "old manifest should preserve index row count");
+    TEST_ASSERT(stats.live_vectors == 5u, "old manifest should preserve live row count");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "old manifest should preserve valid qtri stats");
+    TEST_ASSERT(stats.trinary_row_bytes == 2u,
+                "old manifest should preserve qtri row width");
+    TEST_ASSERT(stats.trinary_rows == 5u,
+                "old manifest should preserve qtri row count");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_ABSENT,
+                "old manifest should report qmag absent");
+    TEST_ASSERT(stats.magnitude_row_bytes == 0u,
+                "old manifest should not invent qmag row width");
+    TEST_ASSERT(stats.magnitude_rows == 0u,
+                "old manifest should not invent qmag rows");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t result;
+    int count = search_many(db, query, ARRAY_LEN(query), 1u, &result, 1u);
+    TEST_ASSERT(count == 1, "FLOAT32 search should work with old manifest and no qmag");
+    TEST_ASSERT(result.id == 9101, "old manifest search should return expected ID");
+    free_results(&result, 1u);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "old-manifest database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
 #else
 static bool pr5_trinary_search_api_unavailable(const char* test_name) {
     printf("SKIP %s: QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API is not available in this branch\n",
@@ -1670,6 +1727,10 @@ static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void)
 
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
     return pr5_trinary_search_api_unavailable("default search missing/corrupt qmag tolerance");
+}
+
+static bool test_old_128_byte_manifest_opens_with_qmag_absent(void) {
+    return pr5_trinary_search_api_unavailable("old manifest qmag compatibility");
 }
 #endif
 
@@ -2057,6 +2118,8 @@ static bool test_compact_counts_after_delete_update_current_snapshot(void) {
     TEST_ASSERT(stats.idmap_dirty, "idmap should be dirty after delete/update");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_STALE,
                 "qtri should be stale after delete/update");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_STALE,
+                "qmag should be stale after delete/update");
 
     TEST_ASSERT(qihse_vector_db_compact(db), "compact should succeed for count snapshot");
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
@@ -2073,6 +2136,10 @@ static bool test_compact_counts_after_delete_update_current_snapshot(void) {
                 "compact should rebuild qtri as valid");
     TEST_ASSERT(stats.trinary_rows == stats.live_vectors,
                 "physical compact should rebuild qtri for live rows only");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "compact should rebuild qmag as valid");
+    TEST_ASSERT(stats.magnitude_rows == stats.live_vectors,
+                "physical compact should rebuild qmag for live rows only");
 
     TEST_ASSERT(close_db(db), "database should close after count compact");
     remove_tree(path);
@@ -2200,22 +2267,35 @@ static bool test_compact_rewrites_qtri_sidecar_valid(void) {
                 "stats should be available before qtri compact");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_STALE,
                 "qtri should be stale after update");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_STALE,
+                "qmag should be stale after update");
 
-    TEST_ASSERT(qihse_vector_db_compact(db), "compact should rewrite qtri sidecar");
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should rewrite qtri/qmag sidecars");
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
                 "stats should be available after qtri compact");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
                 "qtri should be valid after compact");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "qmag should be valid after compact");
     TEST_ASSERT(stats.trinary_row_bytes == 2u,
                 "six-dimensional qtri rows should use two tryte bytes");
+    TEST_ASSERT(stats.magnitude_row_bytes == 6u,
+                "six-dimensional qmag rows should use six bytes");
     TEST_ASSERT(stats.trinary_rows == stats.live_vectors,
                 "compacted qtri rows should mirror live rows");
+    TEST_ASSERT(stats.magnitude_rows == stats.live_vectors,
+                "compacted qmag rows should mirror live rows");
 
     off_t qtri_size = 0;
     TEST_ASSERT(file_size_of(path, "vectors.qtri", &qtri_size),
                 "vectors.qtri size should be readable after compact");
     TEST_ASSERT(qtri_size == (off_t)(stats.trinary_row_bytes * stats.trinary_rows),
                 "vectors.qtri size should match raw tryte rows");
+    off_t qmag_size = 0;
+    TEST_ASSERT(file_size_of(path, "vectors.qmag", &qmag_size),
+                "vectors.qmag size should be readable after compact");
+    TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
+                "vectors.qmag size should match raw magnitude rows");
 
     TEST_ASSERT(close_db(db), "database should close after qtri compact");
 
@@ -2230,6 +2310,8 @@ static bool test_compact_rewrites_qtri_sidecar_valid(void) {
                 "stats should be available after qtri read-only reopen");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
                 "compacted qtri should remain valid across reopen");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "compacted qmag should remain valid across reopen");
     TEST_ASSERT(qihse_vector_db_close(db), "read-only qtri database should close");
 
     remove_tree(path);
@@ -2250,6 +2332,7 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
         {-1.0f, 1.0f, 0.0f, -1.0f, 1.0f},
     };
     const uint8_t invalid_tryte[] = {0xff, 0x00, 0x01};
+    const uint8_t corrupt_qmag[] = {0xde, 0xad, 0xbe, 0xef};
 
     qihse_vector_db_t db =
         qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
@@ -2264,6 +2347,8 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
                 "test should corrupt derived idmap sidecar");
     TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
                 "test should corrupt derived qtri sidecar");
+    TEST_ASSERT(write_file_payload(path, "vectors.qmag", corrupt_qmag, sizeof(corrupt_qmag)),
+                "test should corrupt derived qmag sidecar");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2280,6 +2365,8 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
     TEST_ASSERT(stats.idmap_dirty, "rebuilt idmap should be dirty before compact");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_CORRUPT,
                 "corrupt qtri should be reported before compact");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_CORRUPT,
+                "corrupt qmag should be reported before compact");
 
     TEST_ASSERT(qihse_vector_db_compact(db), "compact should rebuild corrupt sidecars");
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
@@ -2293,6 +2380,12 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
                 "five-dimensional qtri rows should use one tryte byte");
     TEST_ASSERT(stats.trinary_rows == 2u,
                 "compacted qtri should contain both physical rows");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "compacted qmag should be valid");
+    TEST_ASSERT(stats.magnitude_row_bytes == 5u,
+                "five-dimensional qmag rows should use five bytes");
+    TEST_ASSERT(stats.magnitude_rows == 2u,
+                "compacted qmag should contain both physical rows");
 
     TEST_ASSERT(close_db(db), "database should close after corrupt sidecar compact");
 
@@ -2308,6 +2401,8 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
     TEST_ASSERT(stats.idmap_valid, "rebuilt idmap should persist");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
                 "rebuilt qtri should persist");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "rebuilt qmag should persist");
 
     qihse_vector_result_t result;
     int count = search_one(db, vectors[1], ARRAY_LEN(vectors[1]), true, false, &result);
@@ -2357,6 +2452,8 @@ static bool test_compact_ignores_stale_tmp_files(void) {
                 "test should write stale idmap tmp");
     TEST_ASSERT(write_file_payload(path, "vectors.qtri.tmp", junk, sizeof(junk)),
                 "test should write stale qtri tmp");
+    TEST_ASSERT(write_file_payload(path, "vectors.qmag.tmp", junk, sizeof(junk)),
+                "test should write stale qmag tmp");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2374,6 +2471,8 @@ static bool test_compact_ignores_stale_tmp_files(void) {
     TEST_ASSERT(stats.idmap_valid, "stale tmp files should not invalidate idmap");
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
                 "stale tmp files should not invalidate qtri");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "stale tmp files should not invalidate qmag");
 
     qihse_vector_result_t result;
     int count = search_one(db, second, ARRAY_LEN(second), true, false, &result);
