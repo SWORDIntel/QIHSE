@@ -82,6 +82,7 @@ static bool float_eq(float a, float b);
 static bool vector_eq(const float* a, const float* b, size_t dims);
 static bool corrupt_file_byte(const char* dir, const char* name, off_t offset, uint8_t value);
 static bool truncate_file_to(const char* dir, const char* name, off_t size);
+static bool file_size_of(const char* dir, const char* name, off_t* out_size);
 static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size);
 
 static bool test_create_insert_close_reopen_search(void);
@@ -89,6 +90,7 @@ static bool test_sparse_ids_hydrate_vector_and_metadata(void);
 static bool test_binary_metadata_survives_restart(void);
 static bool test_null_db_path_ephemeral_searchable(void);
 static bool test_wal_replays_unflushed_add(void);
+static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
@@ -110,6 +112,8 @@ int main(void) {
          test_null_db_path_ephemeral_searchable},
         {"WAL replays an accepted add before snapshot flush",
          test_wal_replays_unflushed_add},
+        {"torn WAL tail is ignored and truncated on writable open",
+         test_torn_wal_tail_ignored_and_truncated},
         {"read-only mmap reopen searches mapped vector file",
          test_read_only_mmap_reopen_searches},
         {"corrupt vectors.qvec magic fails open cleanly",
@@ -351,6 +355,20 @@ static bool truncate_file_to(const char* dir, const char* name, off_t size) {
         return false;
     }
     return truncate(path, size) == 0;
+}
+
+static bool file_size_of(const char* dir, const char* name, off_t* out_size) {
+    char path[512];
+    struct stat st;
+
+    if (!out_size || !test_join_path(dir, name, path, sizeof(path))) {
+        return false;
+    }
+    if (stat(path, &st) != 0 || st.st_size < 0) {
+        return false;
+    }
+    *out_size = st.st_size;
+    return true;
 }
 
 static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size) {
@@ -605,6 +623,73 @@ static bool test_wal_replays_unflushed_add(void) {
     TEST_ASSERT(qihse_vector_db_close(recovered), "read-only recovered database should close");
     TEST_ASSERT(qihse_vector_db_close(writer), "writer close should checkpoint WAL into snapshot");
 
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_torn_wal_tail_ignored_and_truncated(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("wal_torn_tail");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float stable[] = {1.0f, 0.0f, 0.0f};
+    const float torn[] = {0.0f, 1.0f, 0.0f};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, stable, ARRAY_LEN(stable), 5150, NULL, 0),
+                "stable vector insert should succeed");
+    TEST_ASSERT(close_db(db), "stable snapshot should close");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "writer reopen should return a database");
+    TEST_ASSERT(add_one(db, torn, ARRAY_LEN(torn), 5151, NULL, 0),
+                "uncheckpointed vector should append WAL");
+    qihse_vector_db_destroy(db);
+
+    off_t wal_size = 0;
+    TEST_ASSERT(file_size_of(path, "wal.qwal", &wal_size), "WAL should exist before truncation");
+    TEST_ASSERT(wal_size > 1, "WAL should contain enough bytes to truncate");
+    TEST_ASSERT(truncate_file_to(path, "wal.qwal", wal_size - 1),
+                "test should create a torn WAL tail");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "writable open should recover by truncating torn WAL tail");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after torn WAL recovery");
+    TEST_ASSERT(stats.wal_records_replayed == 0,
+                "torn add should not be replayed without its complete commit record");
+    TEST_ASSERT(stats.wal_bytes_pending == 0,
+                "writable recovery should truncate the torn WAL tail");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, stable, ARRAY_LEN(stable), false, false, &result);
+    TEST_ASSERT(count == 1, "stable snapshot row should remain searchable");
+    TEST_ASSERT(result.id == 5150, "stable snapshot row should preserve id");
+    free_results(&result, 1);
+
+    count = search_one(db, torn, ARRAY_LEN(torn), false, false, &result);
+    TEST_ASSERT(count == 0, "torn WAL row should not be visible after recovery");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "recovered database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
