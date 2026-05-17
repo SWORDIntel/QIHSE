@@ -222,7 +222,8 @@ weighted prototype qtri selectors.
    summarized through the manifest-backed recall gate.
 2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
-   back into FRAMEWERX.
+   back into FRAMEWERX. `make check-upstream-workflow` now reports whether the
+   current QIHSE tree is an upstream checkout or an imported FRAMEWERX copy.
 3. Continue file persistence breadth only after the benchmark runner is moving,
    with crash-recovery fixtures for interrupted multi-file publication windows
    and additional authoritative-file corruption after a valid snapshot exists.

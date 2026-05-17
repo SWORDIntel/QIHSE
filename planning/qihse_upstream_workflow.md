@@ -23,6 +23,8 @@ pipeline stabilize.
 
 1. Develop QIHSE changes directly in `SWORDIntel/QIHSE`.
 2. Run QIHSE-local validation there:
+   - `make check-upstream-workflow`
+   - `make validate-reference-workflow`
    - `make bench-reference-workloads`
    - `make sample-vxug-pdf-workload` when the FRAMEWERX VXUG PDF corpus is
      available locally
@@ -34,11 +36,20 @@ pipeline stabilize.
 
 ## Remaining Benchmark Workflow Work
 
-1. Record repeatable VXUG runner summaries while keeping generated result
-   artifacts outside git by default.
-2. Record recall@10, latency, selected candidates, rerank count, and mismatch
-   details in a generated result artifact.
-3. Add a larger SIFT-style workload using `fvecs` and `ivecs` once local data
+1. Add a larger SIFT-style workload using `fvecs` and `ivecs` once local data
    is available.
-4. Tune default trinary candidate pools only after the VXUG sample and a larger
+2. Tune default trinary candidate pools only after the VXUG sample and a larger
    SIFT-style workload both provide stable evidence.
+
+## Workflow Check
+
+`make check-upstream-workflow` reports whether the current QIHSE root is a
+direct upstream checkout or an imported FRAMEWERX copy. In the upstream
+repository, use:
+
+```bash
+python3 scripts/qihse_workflow_check.py --root . --strict-upstream
+```
+
+That mode fails unless the QIHSE root is the Git root and the checkout has a
+`SWORDIntel/QIHSE` remote.
