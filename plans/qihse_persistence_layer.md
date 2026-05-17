@@ -11,8 +11,8 @@ Current landed state:
 - PR-0 is complete: NOT_STISLA-derived anchor-search usefulness is integrated as native QIHSE algorithm code under `qihse/algorithms/`; the independent top-level subsystem should not be restored.
 - PR-1 is complete: `db_path` creates a native file-backed vector database with durable snapshot files, row-index-correct hydration, `idmap.qid`, derived `vectors.qtri`, diagnostics, read-only reopen, and read-only mmap of clean vector snapshots.
 - PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
-- PR-3 candidate work has started: read-only mmap mode maps `metadata.qmeta` as well as `vectors.qvec`; read-only mmap of `index.qidx` and `idmap.qid` remains.
-- PR-5 candidate work has started: a standalone native tryte codec exists; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
+- PR-3 candidate work has started: read-only mmap mode maps `vectors.qvec`, `metadata.qmeta`, and validated `idmap.qid`; read-only mmap of `index.qidx` remains.
+- PR-5 candidate work has started: a standalone native tryte codec exists with deterministic top-k candidate selection; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
 
 Resume commands:
 
@@ -29,20 +29,21 @@ Expected result:
 
 ```text
 PASS all qihse vector DB persistence tests
-PASS all qihse trinary codec tests
+PASS: top-k candidate selection
+PASS: top-k invalid tryte rejection
 ```
 
 Post-PR-2 continuation:
 
-- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior. Metadata mmap is the first candidate slice; index and ID-map mmap remain.
+- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior. Vector, metadata, and ID-map mmap are present; index mmap remains.
 - PR-4: add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
-- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. The standalone tryte codec is the first candidate slice; database search integration remains.
+- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Standalone tryte encoding/scoring/top-k is present; database search integration, exact rerank, and benchmarks remain.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
 Recommended 3-agent split:
 
-- Agent 1 owns PR-3 mmap extension, continuing after metadata mmap with index and ID-map mmap.
-- Agent 2 owns PR-5 trinary codec integration and benchmarks, starting from the standalone tryte codec.
+- Agent 1 owns PR-3 mmap extension, continuing after vector/metadata/ID-map mmap with index mmap.
+- Agent 2 owns PR-5 trinary DB integration and benchmarks, starting from the standalone tryte codec and top-k selector.
 - Agent 3 owns PR-4 plus the remaining PR-5/PR-6 database sidecar and compaction work.
 
 ## 1. Background
