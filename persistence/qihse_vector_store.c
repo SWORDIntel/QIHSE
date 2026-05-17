@@ -184,6 +184,103 @@ static bool qihse_decode_file_header(const uint8_t in[QIHSE_FILE_HEADER_SIZE],
     return true;
 }
 
+static bool qihse_manifest_expected_trinary_row_bytes(uint32_t dims, uint64_t* out) {
+    if (!out) {
+        errno = EINVAL;
+        return false;
+    }
+    *out = ((uint64_t)dims + 4u) / 5u;
+    return true;
+}
+
+static bool qihse_manifest_validate_sidecar(uint32_t flags,
+                                            uint32_t allowed_flags,
+                                            uint32_t present_flag,
+                                            uint32_t valid_flag,
+                                            uint64_t generation,
+                                            uint64_t row_bytes,
+                                            uint64_t rows,
+                                            uint64_t crc64,
+                                            uint64_t expected_generation,
+                                            uint64_t expected_row_bytes,
+                                            uint64_t expected_rows) {
+    if ((flags & ~allowed_flags) != 0u ||
+        ((flags & valid_flag) != 0u && (flags & present_flag) == 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if ((flags & present_flag) == 0u) {
+        if (generation != 0u || row_bytes != 0u || rows != 0u || crc64 != 0u) {
+            errno = EINVAL;
+            return false;
+        }
+        return true;
+    }
+    if (generation != expected_generation ||
+        row_bytes != expected_row_bytes ||
+        rows != expected_rows) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_validate_manifest(const qihse_vector_store_manifest_t* m) {
+    uint64_t vector_row_bytes;
+    uint64_t expected_vector_bytes;
+    uint64_t expected_trinary_row_bytes;
+
+    if (!m) {
+        errno = EINVAL;
+        return false;
+    }
+    if (m->format_version != QIHSE_FORMAT_VERSION ||
+        m->encoding_id != QIHSE_VSTORE_ENCODING_FLOAT32 ||
+        m->encoding_version != QIHSE_VSTORE_ENCODING_VERSION ||
+        (m->row_count != 0u && m->vector_dims == 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_checked_mul_u64((uint64_t)m->vector_dims, (uint64_t)sizeof(float),
+                               &vector_row_bytes) ||
+        !qihse_checked_mul_u64(m->row_count, vector_row_bytes, &expected_vector_bytes) ||
+        m->vector_bytes != expected_vector_bytes ||
+        !qihse_manifest_expected_trinary_row_bytes(m->vector_dims,
+                                                   &expected_trinary_row_bytes)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_manifest_validate_sidecar(
+            m->trinary_flags,
+            QIHSE_VSTORE_TRI_PRESENT | QIHSE_VSTORE_TRI_VALID,
+            QIHSE_VSTORE_TRI_PRESENT,
+            QIHSE_VSTORE_TRI_VALID,
+            m->trinary_generation,
+            m->trinary_row_bytes,
+            m->trinary_rows,
+            m->trinary_crc64,
+            m->commit_generation,
+            expected_trinary_row_bytes,
+            m->row_count)) {
+        return false;
+    }
+    if (!qihse_manifest_validate_sidecar(
+            m->magnitude_flags,
+            QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID,
+            QIHSE_VSTORE_MAG_PRESENT,
+            QIHSE_VSTORE_MAG_VALID,
+            m->magnitude_generation,
+            m->magnitude_row_bytes,
+            m->magnitude_rows,
+            m->magnitude_crc64,
+            m->commit_generation,
+            (uint64_t)m->vector_dims,
+            m->row_count)) {
+        return false;
+    }
+    return true;
+}
+
 static void qihse_encode_manifest(uint8_t out[QIHSE_MANIFEST_SIZE],
                                   const qihse_vector_store_manifest_t* m) {
     memset(out, 0, QIHSE_MANIFEST_SIZE);
@@ -248,14 +345,7 @@ static bool qihse_decode_manifest(const uint8_t* in,
         m->magnitude_flags = qihse_le_read_u32(in + 160u);
     }
 
-    if (m->format_version != QIHSE_FORMAT_VERSION ||
-        m->encoding_id != QIHSE_VSTORE_ENCODING_FLOAT32 ||
-        m->encoding_version != QIHSE_VSTORE_ENCODING_VERSION) {
-        errno = EINVAL;
-        return false;
-    }
-
-    return true;
+    return qihse_validate_manifest(m);
 }
 
 static void qihse_encode_row(uint8_t out[QIHSE_INDEX_ROW_DISK_SIZE],
@@ -418,6 +508,40 @@ static bool qihse_load_raw_checked(const char* db_path,
     return true;
 }
 
+static bool qihse_validate_index_rows(const qihse_vector_store_manifest_t* manifest,
+                                      const qihse_index_row_t* rows,
+                                      size_t row_count) {
+    uint64_t vector_row_bytes;
+    size_t i;
+
+    if (!manifest || (!rows && row_count != 0u) ||
+        !qihse_checked_mul_u64((uint64_t)manifest->vector_dims,
+                               (uint64_t)sizeof(float),
+                               &vector_row_bytes)) {
+        errno = EINVAL;
+        return false;
+    }
+    for (i = 0u; i < row_count; i++) {
+        uint64_t vector_end;
+        uint64_t metadata_end;
+        const uint32_t allowed_flags = QIHSE_ROW_F_LIVE | QIHSE_ROW_F_TOMBSTONE;
+
+        if (rows[i].reserved != 0u ||
+            (rows[i].row_flags & ~allowed_flags) != 0u ||
+            rows[i].commit_generation > manifest->commit_generation ||
+            !qihse_checked_add_u64(rows[i].vector_offset, vector_row_bytes, &vector_end) ||
+            vector_end > manifest->vector_bytes ||
+            !qihse_checked_add_u64(rows[i].metadata_offset,
+                                   rows[i].metadata_size,
+                                   &metadata_end) ||
+            metadata_end > manifest->metadata_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool qihse_load_index(const char* db_path,
                              const qihse_vector_store_manifest_t* manifest,
                              qihse_index_row_t** out_rows,
@@ -463,6 +587,11 @@ static bool qihse_load_index(const char* db_path,
         for (i = 0u; i < row_count; i++) {
             qihse_decode_row(data + QIHSE_FILE_HEADER_SIZE + (i * QIHSE_INDEX_ROW_DISK_SIZE),
                              rows + i);
+        }
+        if (!qihse_validate_index_rows(manifest, rows, row_count)) {
+            free(rows);
+            free(data);
+            return false;
         }
     }
 

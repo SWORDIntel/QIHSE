@@ -162,10 +162,11 @@ typedef struct qihse_vector_result_s {
  * - use_trinary_candidates is the legacy scalar opt-in. When true and
  *   query_mode remains FLOAT32, candidate_count is used as-is and must be at
  *   least top_k; there is no automatic pool default on this legacy path.
- * - query_mode == QIHSE_VDB_QUERY_TRINARY_SCALAR uses candidate_pool_size when
- *   non-zero, otherwise candidate_count, otherwise defaults to top_k * 8.
- * - query_mode == QIHSE_VDB_QUERY_TRINARY_MAGNITUDE uses the same candidate
- *   pool rule as TRINARY_SCALAR, then caps the pool to total_vectors.
+ * - Explicit trinary modes use candidate_pool_size when non-zero, otherwise
+ *   candidate_count, otherwise an internal conservative default based on mode,
+ *   top_k, vector dimensions, and live/physical row density.
+ * - Explicit trinary candidate pools are capped to total_vectors after default
+ *   resolution. The effective pool must still be at least top_k.
  * - Explicit trinary modes require top_k > 0 and top_k <= max_results. The
  *   effective candidate pool must still be at least top_k after validation.
  * - Missing qtri reports ENOENT; stale qtri reports ESTALE when available or

@@ -83,6 +83,7 @@ static bool vector_eq(const float* a, const float* b, size_t dims);
 static bool corrupt_file_byte(const char* dir, const char* name, off_t offset, uint8_t value);
 static bool truncate_file_to(const char* dir, const char* name, off_t size);
 static bool file_size_of(const char* dir, const char* name, off_t* out_size);
+static bool write_file_u64le_at(const char* dir, const char* name, off_t offset, uint64_t value);
 static bool write_file_payload(const char* dir,
                                const char* name,
                                const uint8_t* payload,
@@ -99,6 +100,8 @@ static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
+static bool test_truncated_manifest_rejected(void);
+static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
 static bool test_corrupt_idmap_rebuilds_high_ids(void);
@@ -108,7 +111,9 @@ static bool test_trinary_candidate_search_matches_float32_top_ids(void);
 static bool test_default_search_ignores_missing_or_corrupt_qtri(void);
 static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void);
 static bool test_trinary_candidate_search_validates_counts(void);
+static bool test_explicit_scalar_default_candidate_pool_searches(void);
 static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void);
+static bool test_qmag_default_candidate_pool_searches(void);
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void);
 static bool test_old_128_byte_manifest_opens_with_qmag_absent(void);
 static bool test_delete_by_id_persists_across_reopen(void);
@@ -145,6 +150,10 @@ int main(void) {
          test_corrupt_vectors_qvec_magic_rejected},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
+        {"truncated manifest fails open cleanly",
+         test_truncated_manifest_rejected},
+        {"manifest rejects impossible qmag metadata",
+         test_manifest_rejects_impossible_qmag_shape},
         {"read-only open can search but rejects add_vectors",
          test_read_only_open_searches_and_rejects_add},
         {"duplicate vector_id rejected",
@@ -163,8 +172,12 @@ int main(void) {
          test_trinary_candidate_search_rejects_missing_or_corrupt_qtri},
         {"PR-5 qtri candidate search validates candidate_count/top_k",
          test_trinary_candidate_search_validates_counts},
+        {"explicit scalar default candidate pool searches",
+         test_explicit_scalar_default_candidate_pool_searches},
         {"PR-6 qmag sidecar persists and magnitude query matches FLOAT32",
          test_qmag_sidecar_persists_and_magnitude_query_matches_float32},
+        {"qmag default candidate pool searches",
+         test_qmag_default_candidate_pool_searches},
         {"PR-6 default search ignores missing/corrupt qmag",
          test_default_search_ignores_missing_or_corrupt_qmag},
         {"PR-6 old 128-byte manifest opens with qmag absent",
@@ -430,6 +443,25 @@ static bool file_size_of(const char* dir, const char* name, off_t* out_size) {
     }
     *out_size = st.st_size;
     return true;
+}
+
+static bool write_file_u64le_at(const char* dir, const char* name, off_t offset, uint64_t value) {
+    char path[512];
+    uint8_t bytes[8];
+
+    if (!test_join_path(dir, name, path, sizeof(path))) {
+        return false;
+    }
+    test_write_u64le(bytes, value);
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = pwrite(fd, bytes, sizeof(bytes), offset) == (ssize_t)sizeof(bytes);
+    if (ok) ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok;
 }
 
 static bool write_file_payload(const char* dir,
@@ -1018,6 +1050,70 @@ static bool test_truncated_index_qidx_rejected(void) {
     return true;
 }
 
+static bool test_truncated_manifest_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("truncated_manifest");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.0f, 1.0f, 0.0f};
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9003, NULL, 0),
+                "insert before truncating manifest should succeed");
+    TEST_ASSERT(close_db(db), "database should close before manifest truncation");
+
+    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 64),
+                "test should truncate manifest to an unsupported size");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "truncated manifest should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_manifest_rejects_impossible_qmag_shape(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("impossible_qmag_manifest");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {1.0f, -1.0f, 0.5f};
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9004, NULL, 0),
+                "insert before corrupting qmag manifest metadata should succeed");
+    TEST_ASSERT(close_db(db), "database should close before qmag manifest corruption");
+
+    TEST_ASSERT(write_file_u64le_at(path, "MANIFEST", 136, 2u),
+                "test should make qmag row bytes disagree with vector dimensions");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "impossible qmag manifest metadata should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_read_only_open_searches_and_rejects_add(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
@@ -1291,6 +1387,29 @@ static int search_many_qtri(qihse_vector_db_t vdb,
     return qihse_vector_db_search(vdb, &query, results, max_results);
 }
 
+static int search_many_qtri_scalar(qihse_vector_db_t vdb,
+                                   const float* query_vector,
+                                   size_t dims,
+                                   size_t top_k,
+                                   size_t candidate_pool_size,
+                                   size_t candidate_count,
+                                   qihse_vector_result_t* results,
+                                   size_t max_results) {
+    qihse_vector_query_t query = {
+        .query_vector = query_vector,
+        .vector_dims = dims,
+        .top_k = top_k,
+        .similarity_threshold = -1.0f,
+        .include_vectors = false,
+        .include_metadata = false,
+        .candidate_count = candidate_count,
+        .query_mode = QIHSE_VDB_QUERY_TRINARY_SCALAR,
+        .candidate_pool_size = candidate_pool_size,
+    };
+
+    return qihse_vector_db_search(vdb, &query, results, max_results);
+}
+
 static int search_many_qmag(qihse_vector_db_t vdb,
                             const float* query_vector,
                             size_t dims,
@@ -1520,6 +1639,50 @@ static bool test_trinary_candidate_search_validates_counts(void) {
     return true;
 }
 
+static bool test_explicit_scalar_default_candidate_pool_searches(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "scalar-default fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "scalar-default fixture should reopen");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t float32_results[3];
+    qihse_vector_result_t qtri_results[3];
+    memset(float32_results, 0, sizeof(float32_results));
+    memset(qtri_results, 0, sizeof(qtri_results));
+
+    int float32_count = search_many(db, query, ARRAY_LEN(query), 3u,
+                                    float32_results, ARRAY_LEN(float32_results));
+    int qtri_count = search_many_qtri_scalar(db, query, ARRAY_LEN(query), 3u,
+                                             0u, 0u, qtri_results,
+                                             ARRAY_LEN(qtri_results));
+    TEST_ASSERT(float32_count == 3, "FLOAT32 search should return top 3");
+    TEST_ASSERT(qtri_count == 3,
+                "explicit scalar mode should default candidate_pool_size == 0");
+    for (size_t i = 0; i < ARRAY_LEN(float32_results); i++) {
+        TEST_ASSERT(qtri_results[i].id == float32_results[i].id,
+                    "default scalar candidate pool should preserve top ID order");
+    }
+
+    free_results(float32_results, ARRAY_LEN(float32_results));
+    free_results(qtri_results, ARRAY_LEN(qtri_results));
+    TEST_ASSERT(qihse_vector_db_close(db), "scalar-default fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
@@ -1574,6 +1737,49 @@ static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void)
     free_results(float32_results, ARRAY_LEN(float32_results));
     free_results(qmag_results, ARRAY_LEN(qmag_results));
     TEST_ASSERT(qihse_vector_db_close(db), "read-only qmag fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_qmag_default_candidate_pool_searches(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "qmag-default fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "qmag-default fixture should reopen");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t float32_results[3];
+    qihse_vector_result_t qmag_results[3];
+    memset(float32_results, 0, sizeof(float32_results));
+    memset(qmag_results, 0, sizeof(qmag_results));
+
+    int float32_count = search_many(db, query, ARRAY_LEN(query), 3u,
+                                    float32_results, ARRAY_LEN(float32_results));
+    int qmag_count = search_many_qmag(db, query, ARRAY_LEN(query), 3u, 0u,
+                                      qmag_results, ARRAY_LEN(qmag_results));
+    TEST_ASSERT(float32_count == 3, "FLOAT32 search should return top 3");
+    TEST_ASSERT(qmag_count == 3,
+                "qmag mode should default candidate_pool_size == 0");
+    for (size_t i = 0; i < ARRAY_LEN(float32_results); i++) {
+        TEST_ASSERT(qmag_results[i].id == float32_results[i].id,
+                    "default qmag candidate pool should preserve top ID order");
+    }
+
+    free_results(float32_results, ARRAY_LEN(float32_results));
+    free_results(qmag_results, ARRAY_LEN(qmag_results));
+    TEST_ASSERT(qihse_vector_db_close(db), "qmag-default fixture should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1721,8 +1927,16 @@ static bool test_trinary_candidate_search_validates_counts(void) {
     return pr5_trinary_search_api_unavailable("candidate_count/top_k validation");
 }
 
+static bool test_explicit_scalar_default_candidate_pool_searches(void) {
+    return pr5_trinary_search_api_unavailable("explicit scalar default candidate pool");
+}
+
 static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void) {
     return pr5_trinary_search_api_unavailable("qmag persistence and candidate search parity");
+}
+
+static bool test_qmag_default_candidate_pool_searches(void) {
+    return pr5_trinary_search_api_unavailable("qmag default candidate pool");
 }
 
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {

@@ -53,7 +53,8 @@
 #define QIHSE_VDB_WAL_UPSERT 5u
 #define QIHSE_VDB_WAL_NO_PREV UINT64_MAX
 #define QIHSE_VDB_MAGNITUDE_ROW_BYTES 1u
-#define QIHSE_VDB_DEFAULT_CANDIDATE_MULTIPLIER 8u
+#define QIHSE_VDB_SCALAR_CANDIDATE_MULTIPLIER 12u
+#define QIHSE_VDB_MAGNITUDE_CANDIDATE_MULTIPLIER 8u
 
 struct qihse_vector_db_s {
     qihse_vector_db_backend_t backend;
@@ -139,6 +140,10 @@ static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb);
 static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb);
 static void qihse_vdb_set_magnitude_stale(qihse_vector_db_t vdb);
 static void qihse_vdb_clear_magnitude_cache(qihse_vector_db_t vdb);
+static bool qihse_vdb_resolve_candidate_pool(qihse_vector_db_t vdb,
+                                             const qihse_vector_query_t* query,
+                                             qihse_vector_db_query_mode_t mode,
+                                             size_t* out_candidate_count);
 static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
                                                          const qihse_vector_query_t* query,
                                                          qihse_vector_result_t* results,
@@ -299,6 +304,111 @@ static bool qihse_vdb_u64_to_size(uint64_t value, size_t* out) {
         return false;
     }
     *out = (size_t)value;
+    return true;
+}
+
+static bool qihse_vdb_mul_size_saturating(size_t a, size_t b, size_t* out) {
+    if (!out) {
+        errno = EINVAL;
+        return false;
+    }
+    if (a != 0u && b > SIZE_MAX / a) {
+        *out = SIZE_MAX;
+        return true;
+    }
+    *out = a * b;
+    return true;
+}
+
+static bool qihse_vdb_ceil_mul_div_saturating(size_t value,
+                                              size_t numerator,
+                                              size_t denominator,
+                                              size_t* out) {
+    size_t quotient;
+    size_t remainder;
+    size_t scaled_quotient;
+    size_t scaled_remainder;
+    size_t product;
+
+    if (!out || denominator == 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    quotient = value / denominator;
+    remainder = value % denominator;
+    if (quotient != 0u && numerator > SIZE_MAX / quotient) {
+        *out = SIZE_MAX;
+        return true;
+    }
+    scaled_quotient = quotient * numerator;
+    if (remainder == 0u) {
+        scaled_remainder = 0u;
+    } else if (numerator > SIZE_MAX / remainder) {
+        *out = SIZE_MAX;
+        return true;
+    } else {
+        product = remainder * numerator;
+        scaled_remainder = product / denominator +
+            ((product % denominator) != 0u ? 1u : 0u);
+    }
+    if (scaled_quotient > SIZE_MAX - scaled_remainder) {
+        *out = SIZE_MAX;
+        return true;
+    }
+    *out = scaled_quotient + scaled_remainder;
+    return true;
+}
+
+static bool qihse_vdb_resolve_candidate_pool(qihse_vector_db_t vdb,
+                                             const qihse_vector_query_t* query,
+                                             qihse_vector_db_query_mode_t mode,
+                                             size_t* out_candidate_count) {
+    size_t candidate_count;
+    size_t multiplier;
+
+    if (!vdb || !query || !out_candidate_count || query->top_k == 0u) {
+        errno = EINVAL;
+        return false;
+    }
+
+    candidate_count = query->candidate_pool_size ?
+        query->candidate_pool_size : query->candidate_count;
+    if (candidate_count == 0u) {
+        /*
+         * Defaults are intentionally conservative because qtri/qmag only
+         * choose a physical-row candidate set before exact float32 reranking.
+         * Scalar sign-only matching is noisier than magnitude-aware matching,
+         * high-dimensional rows need a wider pool, and tombstoned physical
+         * rows can occupy candidate slots before the live-row filter runs.
+         */
+        multiplier = mode == QIHSE_VDB_QUERY_TRINARY_MAGNITUDE ?
+            QIHSE_VDB_MAGNITUDE_CANDIDATE_MULTIPLIER :
+            QIHSE_VDB_SCALAR_CANDIDATE_MULTIPLIER;
+        if (vdb->vector_dims >= 1024u) {
+            multiplier += 8u;
+        } else if (vdb->vector_dims >= 256u) {
+            multiplier += 4u;
+        }
+        if (!qihse_vdb_mul_size_saturating(query->top_k, multiplier,
+                                           &candidate_count)) {
+            return false;
+        }
+        if (vdb->live_vectors != 0u && vdb->live_vectors < vdb->total_vectors &&
+            !qihse_vdb_ceil_mul_div_saturating(candidate_count,
+                                               vdb->total_vectors,
+                                               vdb->live_vectors,
+                                               &candidate_count)) {
+            return false;
+        }
+    }
+    if (candidate_count > vdb->total_vectors) {
+        candidate_count = vdb->total_vectors;
+    }
+    if (candidate_count < query->top_k) {
+        errno = EINVAL;
+        return false;
+    }
+    *out_candidate_count = candidate_count;
     return true;
 }
 
@@ -2303,11 +2413,11 @@ int qihse_vector_db_search(
                                                              results, max_results);
     }
     if (query && query->query_mode == QIHSE_VDB_QUERY_TRINARY_SCALAR) {
-        size_t candidate_count = query->candidate_pool_size ?
-            query->candidate_pool_size : query->candidate_count;
-        if (candidate_count == 0u && query->top_k != 0u &&
-            query->top_k <= SIZE_MAX / QIHSE_VDB_DEFAULT_CANDIDATE_MULTIPLIER) {
-            candidate_count = query->top_k * QIHSE_VDB_DEFAULT_CANDIDATE_MULTIPLIER;
+        size_t candidate_count;
+        if (!qihse_vdb_resolve_candidate_pool(vdb, query,
+                                              QIHSE_VDB_QUERY_TRINARY_SCALAR,
+                                              &candidate_count)) {
+            return -1;
         }
         return qihse_vector_db_search_trinary_candidates(vdb, query,
                                                          candidate_count,
@@ -2752,24 +2862,9 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
         return -1;
     }
     top_k = query->top_k;
-    candidate_count = query->candidate_pool_size ?
-        query->candidate_pool_size : query->candidate_count;
-    if (candidate_count == 0u) {
-        if (top_k > SIZE_MAX / QIHSE_VDB_DEFAULT_CANDIDATE_MULTIPLIER) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        candidate_count = top_k * QIHSE_VDB_DEFAULT_CANDIDATE_MULTIPLIER;
-    }
-    if (candidate_count < top_k) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (candidate_count > vdb->total_vectors) {
-        candidate_count = vdb->total_vectors;
-    }
-    if (candidate_count < top_k) {
-        errno = EINVAL;
+    if (!qihse_vdb_resolve_candidate_pool(vdb, query,
+                                          QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
+                                          &candidate_count)) {
         return -1;
     }
     if (vdb->trinary_status != QIHSE_VDB_TRINARY_VALID) {

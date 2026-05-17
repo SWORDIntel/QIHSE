@@ -34,6 +34,13 @@ exact float32 reranking.
 - The magnitude benchmark path now exercises the persisted
   `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` query mode instead of the older
   in-process qmag prototype selector.
+- Explicit trinary modes now use a conservative candidate-pool resolver instead
+  of one fixed `top_k * 8` fallback.
+- Manifest/index loading rejects impossible snapshot metadata earlier,
+  including malformed sidecar flags, mismatched qtri/qmag shapes, vector-byte
+  inconsistencies, and invalid index row bounds.
+- Native integration cleanup is tracked in
+  `qihse/planning/native_integration_cleanup.md`.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -53,7 +60,8 @@ exact float32 reranking.
   `candidate_count` exactly as supplied; callers must pass
   `candidate_count >= top_k`.
 - `QIHSE_VDB_QUERY_TRINARY_SCALAR` uses `candidate_pool_size` when non-zero,
-  then `candidate_count`, then defaults to `top_k * 8`.
+  then `candidate_count`, then an internal default based on mode, `top_k`,
+  vector dimensions, and live/physical row density.
 - The trinary path requires a valid `vectors.qtri`, selects tryte candidates,
   then reranks against authoritative float32 vectors.
 - Missing, corrupt, stale, or mismatched `vectors.qtri` makes explicit trinary
@@ -75,7 +83,7 @@ exact float32 reranking.
 - `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` selects candidates with
   `query_sign * row_sign * query_weight * row_bucket`, then reranks the chosen
   candidates with authoritative float32 cosine similarity.
-- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` uses the same candidate-pool default as
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` uses the same candidate-pool resolver as
   scalar query mode and caps the pool to total vectors.
 - Magnitude mode requires both valid `vectors.qtri` and valid `vectors.qmag`.
   qmag absence reports `ENODATA` when available or `ENOENT`; stale reports
@@ -99,6 +107,10 @@ make bench-trinary-magnitude-sweep
 
 Latest local result in this slice: all listed targets passed after the qmag
 integration.
+
+Latest focused result after candidate-policy/manifest-hardening slice:
+`make test-persist`, `make bench-trinary-db-candidate`, and
+`make bench-trinary-magnitude-sweep` passed.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
@@ -133,9 +145,11 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Use the candidate-count sweep to pick sane default candidate ratios per
-   dataset shape instead of a single fixed value.
-2. Continue file persistence breadth:
-   manifest publication hardening, more crash-recovery fixtures, and cleanup of
-   legacy subsystem-shaped layout as QIHSE becomes a naturally integrated native
-   component.
+1. Continue file persistence breadth:
+   crash-recovery fixtures around manifest publication order, WAL/checkpoint
+   edges, and authoritative-file corruption.
+2. Start the native integration cleanup sequence:
+   metadata ignore coverage, generated-artifact inventory, and migration of any
+   still-current `SWORDIntel_QIHSE/plans/` material into `qihse/planning/`.
+3. Use fresh sweep results to tune the candidate-pool resolver once more real
+   datasets exist; the current defaults are conservative and mode-aware.
