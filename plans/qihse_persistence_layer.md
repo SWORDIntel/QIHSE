@@ -11,8 +11,10 @@ Current landed state:
 - PR-0 is complete: NOT_STISLA-derived anchor-search usefulness is integrated as native QIHSE algorithm code under `qihse/algorithms/`; the independent top-level subsystem should not be restored.
 - PR-1 is complete: `db_path` creates a native file-backed vector database with durable snapshot files, row-index-correct hydration, `idmap.qid`, derived `vectors.qtri`, diagnostics, read-only reopen, and read-only mmap of clean vector snapshots.
 - PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
-- PR-3 candidate work has started: read-only mmap mode maps `vectors.qvec`, `metadata.qmeta`, and validated `idmap.qid`; read-only mmap of `index.qidx` remains.
-- PR-5 candidate work has started: a standalone native tryte codec exists with deterministic top-k candidate selection; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
+- PR-3 read-only mmap candidate work now covers `vectors.qvec`, `metadata.qmeta`, validated `idmap.qid`, and validated direct mapping of `index.qidx` for clean snapshots.
+- PR-4 public mutation API declarations are staged in `qihse/qihse_vector_db.h`; implementation, mutation WAL replay, tombstones, and real compaction remain.
+- PR-5 candidate work has started: a standalone native tryte codec exists with deterministic top-k candidate selection plus `make bench-trinary-codec`; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
+- Latest pushed checkpoint: `8b6defb` on `codex/qihse-file-persistence`.
 
 Resume commands:
 
@@ -22,6 +24,7 @@ git status --short
 cd qihse
 make test-persist
 make test-trinary-codec
+make bench-trinary-codec
 rm -f tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
 ```
 
@@ -31,20 +34,21 @@ Expected result:
 PASS all qihse vector DB persistence tests
 PASS: top-k candidate selection
 PASS: top-k invalid tryte rejection
+rows=2048 dims=64 row_bytes=13 topk=8 iterations=64
 ```
 
-Post-PR-2 continuation:
+Current continuation:
 
-- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior. Vector, metadata, and ID-map mmap are present; index mmap remains.
-- PR-4: public delete/update/upsert API declarations are staged; tombstone behavior, mutation WAL replay, batch semantics, and real compaction remain.
-- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Standalone tryte encoding/scoring/top-k is present; database search integration, exact rerank, and benchmarks remain.
+- PR-3: validate the newly landed `index.qidx` mmap path under more corruption and compatibility cases, then decide whether UMA should wrap mapped rows directly or keep the current vector DB-owned mapping path.
+- PR-4: implement the staged delete/update/upsert APIs, tombstone behavior, mutation WAL replay, batch semantics, and real compaction.
+- PR-5: integrate the standalone tryte codec/top-k path into vector DB search as optional candidate generation with exact float32 rerank, then add recall and speed benchmarks.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
 Recommended 3-agent split:
 
-- Agent 1 owns PR-3 mmap extension, continuing after vector/metadata/ID-map mmap with index mmap.
-- Agent 2 owns PR-5 trinary DB integration and benchmarks, starting from the standalone tryte codec and top-k selector.
-- Agent 3 owns PR-4 plus the remaining PR-5/PR-6 database sidecar and compaction work.
+- Agent 1 owns PR-4 mutation implementation in `qihse_vector_db.c`: delete/update/upsert, live-row rules, duplicate-ID handling, and read-only rejection.
+- Agent 2 owns PR-4 WAL/recovery and compaction: mutation WAL records, committed replay, torn-tail truncation, compacted snapshots, and executable persistence tests.
+- Agent 3 owns PR-5 trinary DB integration: optional tryte candidate generation from `vectors.qtri`, exact float32 rerank, recall/performance benchmarks, and plan updates.
 
 ## 1. Background
 
@@ -839,20 +843,20 @@ If this repository's current CMake setup does not register tests with CTest, add
 
 ## 22. Post-PR-2 Continuation Plan
 
-The plan no longer starts from an in-memory-only database. PR-0, PR-1, and PR-2 are implemented. Continue from the native QIHSE persistence layer that already has durable `db_path`, snapshot files, `idmap.qid`, derived `vectors.qtri`, read-only mmap for clean vector snapshots, ADD/COMMIT WAL records, previous-record offsets, committed-batch replay, and writable torn-tail truncation.
+The plan no longer starts from an in-memory-only database. PR-0, PR-1, and PR-2 are implemented. PR-3 mmap candidate work has moved past vector-only mapping and now includes validated read-only mapping for `vectors.qvec`, `metadata.qmeta`, `idmap.qid`, and `index.qidx` on clean snapshots. Continue from the native QIHSE persistence layer that already has durable `db_path`, snapshot files, `idmap.qid`, derived `vectors.qtri`, read-only mmap for clean snapshots, ADD/COMMIT WAL records, previous-record offsets, committed-batch replay, writable torn-tail truncation, staged mutation API declarations, and a standalone trinary top-k benchmark.
 
 The remaining work should be split into focused native QIHSE PRs:
 
-- PR-3: mmap/zero-copy extension for index, metadata, and ID-map files.
+- PR-3: harden mmap validation and compatibility tests, especially stale/corrupt `index.qidx`, row-layout compatibility, and fallback to file-copy mode.
 - PR-4: implement staged tombstone/delete/update/upsert APIs, mutation WAL records, batch semantics, and compaction.
-- PR-5: native trinary codec module, scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
+- PR-5: integrate native trinary top-k into vector DB candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
 - PR-6: persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
 Use a 3-agent split:
 
-- Agent 1: PR-3 mmap extension.
-- Agent 2: PR-5 trinary codec module and benchmarks.
-- Agent 3: remaining PR-4/PR-5/PR-6 database semantics, compaction, and sidecars.
+- Agent 1: PR-4 mutation API implementation and in-memory/live-row semantics.
+- Agent 2: PR-4 mutation WAL, replay, torn-tail truncation, compaction, and tests.
+- Agent 3: PR-5 vector DB trinary candidate generation, exact rerank, recall/performance benchmark targets, and sidecar validation.
 
 Historical PR-1 objective: make `db_path` actually durable.
 
@@ -1390,7 +1394,7 @@ crash during manifest write -> older valid manifest slot used
 crash during checkpoint -> old data + WAL still recoverable
 PR-3: mmap mode
 
-Continue here after PR-2.
+Status: read-only clean-snapshot mmap exists for vectors, metadata, validated ID-map, and validated direct `index.qidx` rows. The next PR-3 work is hardening and compatibility, not first mapping.
 
 Add UMA allocation kind. Current UMA address type has pointer, size, device, and residency metadata, but no allocation kind or file mapping ownership.
 
@@ -1440,9 +1444,9 @@ Search should support:
 
 FILE_BACKED_COPY  -> current UMA copy path
 FILE_BACKED_MMAP  -> mapped vectors/index/metadata
-Trinary continues as a post-PR-2 codec path
+Trinary continues as an optional post-PR-2 codec path
 
-The trinary direction is useful, and the derived `vectors.qtri` sidecar now has an on-disk home. The next step is making it a native codec module with scoring and benchmarks, not making it authoritative by default.
+The trinary direction is useful, and the derived `vectors.qtri` sidecar now has an on-disk home. A standalone native tryte codec, top-k selector, and benchmark target exist. The next step is wiring that path into vector DB search as optional candidate generation with exact float32 rerank, not making it authoritative by default.
 
 Correct order:
 
