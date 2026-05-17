@@ -13,9 +13,9 @@ Current landed state:
 - PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
 - PR-3 read-only mmap candidate work now covers `vectors.qvec`, `metadata.qmeta`, validated `idmap.qid`, and validated direct mapping of `index.qidx` for clean snapshots.
 - PR-4 physical compaction is complete for the current row model: `compact()` rewrites the in-memory table, vector blob, and metadata arena with live rows only, then publishes the compact snapshot and regenerated `idmap.qid`/`vectors.qtri` through the existing atomic flush path.
-- PR-4 compaction fixtures now verify compact-after-mutation row/index/idmap/trinary behavior, high-ID idmap consistency, and stale/corrupt derived sidecar rebuild.
+- PR-4 compaction fixtures now verify compact-after-mutation row/index/idmap/trinary behavior, high-ID idmap consistency, stale/corrupt derived sidecar rebuild, stale `.tmp` file ignore-on-open behavior, and WAL mutation compaction clearing WAL without resurrecting pruned rows.
 - PR-5 search-path benchmark scaffolding is present: `make bench-trinary-search-path` compares full float32 DB search against DB-backed `vectors.qtri` candidate selection plus exact float32 rerank and reports recall/order/latency. Pure trinary storage remains out of scope.
-- Latest pushed checkpoint before this slice: `7df0e3e` on `codex/qihse-file-persistence`.
+- Latest pushed checkpoint before this slice: `b8a37a3` on `codex/qihse-file-persistence`.
 
 Resume commands:
 
@@ -45,15 +45,15 @@ trinary_search_path_bench rows=2048 dims=64 qtri_row_bytes=13 candidates=64 topk
 Current continuation:
 
 - PR-3: validate the newly landed `index.qidx` mmap path under more corruption and compatibility cases, then decide whether UMA should wrap mapped rows directly or keep the current vector DB-owned mapping path.
-- PR-4: add compaction crash/recovery fixtures around tmp files, manifest publication, and WAL-plus-compaction interactions. Public mutation APIs, mutation WAL replay/truncation, and physical compaction are present.
+- PR-4: add deeper manifest-publication crash fixtures if needed. Public mutation APIs, mutation WAL replay/truncation, physical compaction, stale temp-file handling coverage, and WAL-plus-compaction interaction coverage are present.
 - PR-5: use the search-path benchmark to drive optional vector DB trinary acceleration. Current benchmark proves recall/order on the synthetic fixture and exposes latency variance; it is not yet a production search-path optimization.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
 Recommended 3-agent split:
 
-- Agent 1 owns PR-4 compaction crash/recovery fixtures.
-- Agent 2 owns WAL-plus-compaction interaction tests and any recovery fixes they expose.
-- Agent 3 owns PR-5 optional search-path acceleration and broader recall/performance datasets.
+- Agent 1 owns any remaining manifest-publication crash fixtures.
+- Agent 2 owns PR-5 optional search-path acceleration wiring.
+- Agent 3 owns broader recall/performance datasets for trinary candidate generation.
 
 ## 1. Background
 
