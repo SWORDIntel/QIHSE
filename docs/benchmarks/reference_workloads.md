@@ -21,7 +21,8 @@ should remain outside git; only repeatable summaries belong in docs.
 The next larger calibration target is a SIFT-style workload using `fvecs`
 base/query vectors and `ivecs` ground truth. Do not change trinary default
 candidate-pool multipliers until the VXUG sample and at least one larger
-reference workload provide stable evidence.
+reference workload provide stable evidence. When SIFT files are available under
+`data/sift1m/`, run `make bench-sift1m-workload`.
 
 QIHSE should move to an upstream-first workflow: develop and validate QIHSE in
 `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state back

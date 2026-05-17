@@ -91,6 +91,11 @@ workload_sift1m = {
 }
 ```
 
+The manifest already declares the SIFT-style file paths and formats. Once the
+files are present under `data/sift1m/`, run `make bench-sift1m-workload` to use
+the same exact float32/scalar `qtri`/`qmag` runner and write generated JSON
+under `results/sift1m/`.
+
 #### GIST1M Benchmark (Semantic Search)
 ```python
 # Dataset: 1M GIST descriptors (960 dimensions)

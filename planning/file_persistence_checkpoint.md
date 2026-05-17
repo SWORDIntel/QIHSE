@@ -208,9 +208,9 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Add a larger SIFT-style workload using `fvecs` base/query vectors and
-   `ivecs` ground truth. Use it as the first real scale check before candidate
-   defaults are changed.
+1. Add or stage SIFT-style data files under `data/sift1m/`, then run
+   `make bench-sift1m-workload`. The generic runner now supports `fvecs`,
+   `ivecs`, `f32_matrix`, and `u32_matrix` manifest entries.
 2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
    back into FRAMEWERX.

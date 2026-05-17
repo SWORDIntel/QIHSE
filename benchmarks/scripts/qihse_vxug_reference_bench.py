@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the VXUG PDF sample through QIHSE reference search modes."""
+"""Run a manifest-backed vector workload through QIHSE reference search modes."""
 
 from __future__ import annotations
 
@@ -85,6 +85,89 @@ def read_u32_matrix(path: Path, rows: int, dims: int) -> list[list[int]]:
         raise ValueError(f"{path} is {len(payload)} bytes, expected {expected_bytes}")
     values = struct.unpack(f"<{rows * dims}I", payload)
     return [list(values[index * dims:(index + 1) * dims]) for index in range(rows)]
+
+
+def read_fvecs(path: Path, rows: int, dims: int) -> list[float]:
+    vectors: list[float] = []
+    with path.open("rb") as handle:
+        for row in range(rows):
+            header = handle.read(4)
+            if len(header) != 4:
+                raise ValueError(f"{path} ended before fvecs row {row}")
+            (row_dims,) = struct.unpack("<i", header)
+            if row_dims != dims:
+                raise ValueError(f"{path} row {row} dims {row_dims}, expected {dims}")
+            payload = handle.read(dims * 4)
+            if len(payload) != dims * 4:
+                raise ValueError(f"{path} has truncated fvecs row {row}")
+            vectors.extend(struct.unpack(f"<{dims}f", payload))
+        if handle.read(1):
+            raise ValueError(f"{path} has extra bytes after {rows} fvecs rows")
+    return vectors
+
+
+def read_ivecs(path: Path, rows: int, top_k: int) -> list[list[int]]:
+    ground_truth: list[list[int]] = []
+    expected_dims: int | None = None
+    with path.open("rb") as handle:
+        for row in range(rows):
+            header = handle.read(4)
+            if len(header) != 4:
+                raise ValueError(f"{path} ended before ivecs row {row}")
+            (row_dims,) = struct.unpack("<i", header)
+            if row_dims < top_k:
+                raise ValueError(f"{path} row {row} dims {row_dims}, expected at least {top_k}")
+            if expected_dims is None:
+                expected_dims = row_dims
+            elif row_dims != expected_dims:
+                raise ValueError(f"{path} row {row} dims {row_dims}, expected {expected_dims}")
+            payload = handle.read(row_dims * 4)
+            if len(payload) != row_dims * 4:
+                raise ValueError(f"{path} has truncated ivecs row {row}")
+            ground_truth.append(list(struct.unpack(f"<{row_dims}i", payload))[:top_k])
+        if handle.read(1):
+            raise ValueError(f"{path} has extra bytes after {rows} ivecs rows")
+    return ground_truth
+
+
+def read_vectors(root: Path, workload: dict[str, Any]) -> tuple[list[float], list[float], list[list[int]]]:
+    rows = int(workload["rows"])
+    queries = int(workload["queries"])
+    dims = int(workload["dimensions"])
+    top_k = int(workload["top_k"])
+    files = workload["files"]
+    formats = workload["file_formats"]
+
+    base_path = root / files["base_vectors"]
+    query_path = root / files["query_vectors"]
+    ground_truth_path = root / files["ground_truth"]
+
+    base_format = formats["base_vectors"]
+    query_format = formats["query_vectors"]
+    truth_format = formats["ground_truth"]
+
+    if base_format == "f32_matrix":
+        base_vectors = read_f32_matrix(base_path, rows, dims)
+    elif base_format == "fvecs":
+        base_vectors = read_fvecs(base_path, rows, dims)
+    else:
+        raise ValueError(f"unsupported base vector format: {base_format}")
+
+    if query_format == "f32_matrix":
+        query_vectors = read_f32_matrix(query_path, queries, dims)
+    elif query_format == "fvecs":
+        query_vectors = read_fvecs(query_path, queries, dims)
+    else:
+        raise ValueError(f"unsupported query vector format: {query_format}")
+
+    if truth_format == "u32_matrix":
+        ground_truth = read_u32_matrix(ground_truth_path, queries, top_k)
+    elif truth_format == "ivecs":
+        ground_truth = read_ivecs(ground_truth_path, queries, top_k)
+    else:
+        raise ValueError(f"unsupported ground-truth format: {truth_format}")
+
+    return base_vectors, query_vectors, ground_truth
 
 
 def bind_qihse(lib_path: Path) -> ctypes.CDLL:
@@ -288,16 +371,13 @@ def main(argv: list[str]) -> int:
     rows = int(workload["rows"])
     queries = int(workload["queries"])
     top_k = int(workload["top_k"])
-    files = workload["files"]
 
     if args.iterations <= 0:
         print("iterations must be positive", file=sys.stderr)
         return 1
 
     try:
-        base_vectors = read_f32_matrix(root / files["base_vectors"], rows, dims)
-        query_vectors = read_f32_matrix(root / files["query_vectors"], queries, dims)
-        ground_truth = read_u32_matrix(root / files["ground_truth"], queries, top_k)
+        base_vectors, query_vectors, ground_truth = read_vectors(root, workload)
         lib = bind_qihse(root / "libqihse.so")
         with tempfile.TemporaryDirectory(prefix="qihse_vxug_bench_") as temp_dir:
             db_path = Path(temp_dir) / "db"
