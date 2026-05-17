@@ -46,7 +46,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads sample-vxug-pdf-workload
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads sample-vxug-pdf-workload bench-vxug-pdf-workload
 
 all: lib
 
@@ -127,6 +127,10 @@ bench-reference-workloads:
 sample-vxug-pdf-workload:
 	python3 benchmarks/scripts/qihse_pdf_text_sample.py --pdf "$(VXUG_PDF)" --out data/vxug_pdf_sample
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
+
+bench-vxug-pdf-workload: lib
+	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
+	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root .
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \

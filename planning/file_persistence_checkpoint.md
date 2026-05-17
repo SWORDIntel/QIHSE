@@ -166,6 +166,14 @@ current benchmark plan. The manifest runner also supports `--inspect-files` for
 external dataset row-count and dimension validation before those datasets are
 used as tuning evidence. The first local sample path is `vxug-pdf-sample`,
 generated from the FRAMEWERX VXUG PDF corpus with `make sample-vxug-pdf-workload`.
+The VXUG benchmark runner now loads the generated matrices into file-backed
+QIHSE and compares exact float32/scalar `qtri`/`qmag`. The first local result
+showed float32 recall@10 `1.0000`, qtri `0.9812`, and qmag `1.0000`; that is
+useful evidence for qmag, but not enough to change default candidate-pool
+policy. The next calibration step is a larger SIFT-style `fvecs`/`ivecs`
+workload. QIHSE GitHub should become the upstream-first workflow now that the
+runner path is in place; FRAMEWERX can import QIHSE updates after upstream
+validation.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
@@ -200,16 +208,14 @@ weighted prototype qtri selectors.
 
 ## Next Slice
 
-1. Continue file persistence breadth with crash-recovery fixtures that simulate
-   interrupted multi-file publication windows and additional authoritative-file
-   corruption after a valid snapshot exists.
-2. Keep QIHSE docs/tests/config pointed at active `qihse/`; treat remaining
-   stale-root mentions as planning provenance only.
-3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
-   FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
-   through `src/framewerx/evaluation/search_backend.py`.
-4. Add a benchmark runner that loads the generated `vxug-pdf-sample` vectors
-   into QIHSE, compares exact float32/qtri/qmag against its ground truth, and
-   reports recall/latency/rerank cost before tuning defaults. The current
-   defaults are conservative and mode-aware, and synthetic-only multiplier
-   tuning is intentionally deferred.
+1. Record VXUG runner output as generated data outside git by default. Promote
+   only summarized, repeatable results into benchmark docs.
+2. Add a larger SIFT-style workload using `fvecs` base/query vectors and
+   `ivecs` ground truth. Use it as the first real scale check before candidate
+   defaults are changed.
+3. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
+   `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
+   back into FRAMEWERX.
+4. Continue file persistence breadth only after the benchmark runner is moving,
+   with crash-recovery fixtures for interrupted multi-file publication windows
+   and additional authoritative-file corruption after a valid snapshot exists.

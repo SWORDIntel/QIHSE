@@ -11,6 +11,22 @@ plan. Use `python3 benchmarks/scripts/qihse_reference_workloads.py --root .
 --inspect-files` after external datasets are present to validate dimensions and
 row counts.
 
+After `make sample-vxug-pdf-workload` generates the local VXUG PDF sample,
+`make bench-vxug-pdf-workload` loads the generated matrices into file-backed
+QIHSE and compares exact float32, scalar `qtri`, and `qmag` against the sample
+ground truth. The runner reports recall@10, latency, and selected candidate
+counts. Result files should remain generated artifacts outside git; only
+repeatable summaries belong in docs.
+
+The next larger calibration target is a SIFT-style workload using `fvecs`
+base/query vectors and `ivecs` ground truth. Do not change trinary default
+candidate-pool multipliers until the VXUG sample and at least one larger
+reference workload provide stable evidence.
+
+QIHSE should move to an upstream-first workflow: develop and validate QIHSE in
+`https://github.com/SWORDIntel/QIHSE`, then import stable upstream state back
+into FRAMEWERX.
+
 ---
 
 ## Workload Categories

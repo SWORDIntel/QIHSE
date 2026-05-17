@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Run the VXUG PDF sample through QIHSE reference search modes."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import statistics
+import struct
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+QIHSE_VECTOR_DB_INMEMORY = 3
+QIHSE_VDB_OPEN_READ_ONLY = 1 << 1
+QIHSE_VDB_OPEN_FILE_BACKED = 1 << 3
+QIHSE_VDB_OPEN_MMAP = 1 << 4
+QIHSE_VDB_QUERY_FLOAT32 = 0
+QIHSE_VDB_QUERY_TRINARY_SCALAR = 1
+QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2
+QIHSE_SCALAR_CANDIDATE_MULTIPLIER = 12
+QIHSE_MAGNITUDE_CANDIDATE_MULTIPLIER = 8
+
+
+class QihseVectorResult(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("score", ctypes.c_float),
+        ("vector", ctypes.POINTER(ctypes.c_float)),
+        ("vector_dims", ctypes.c_size_t),
+        ("metadata", ctypes.c_void_p),
+        ("metadata_size", ctypes.c_size_t),
+    ]
+
+
+class QihseVectorQuery(ctypes.Structure):
+    _fields_ = [
+        ("query_vector", ctypes.POINTER(ctypes.c_float)),
+        ("vector_dims", ctypes.c_size_t),
+        ("top_k", ctypes.c_size_t),
+        ("similarity_threshold", ctypes.c_float),
+        ("include_vectors", ctypes.c_bool),
+        ("include_metadata", ctypes.c_bool),
+        ("use_trinary_candidates", ctypes.c_bool),
+        ("candidate_count", ctypes.c_size_t),
+        ("query_mode", ctypes.c_int),
+        ("candidate_pool_size", ctypes.c_size_t),
+    ]
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest root must be an object")
+    return manifest
+
+
+def find_workload(manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    workloads = manifest.get("workloads", [])
+    if not isinstance(workloads, list):
+        raise ValueError("manifest workloads must be a list")
+    for workload in workloads:
+        if isinstance(workload, dict) and workload.get("name") == name:
+            return workload
+    raise ValueError(f"workload not found: {name}")
+
+
+def read_f32_matrix(path: Path, rows: int, dims: int) -> list[float]:
+    expected_bytes = rows * dims * 4
+    payload = path.read_bytes()
+    if len(payload) != expected_bytes:
+        raise ValueError(f"{path} is {len(payload)} bytes, expected {expected_bytes}")
+    return list(struct.unpack(f"<{rows * dims}f", payload))
+
+
+def read_u32_matrix(path: Path, rows: int, dims: int) -> list[list[int]]:
+    expected_bytes = rows * dims * 4
+    payload = path.read_bytes()
+    if len(payload) != expected_bytes:
+        raise ValueError(f"{path} is {len(payload)} bytes, expected {expected_bytes}")
+    values = struct.unpack(f"<{rows * dims}I", payload)
+    return [list(values[index * dims:(index + 1) * dims]) for index in range(rows)]
+
+
+def bind_qihse(lib_path: Path) -> ctypes.CDLL:
+    lib = ctypes.CDLL(str(lib_path))
+
+    lib.qihse_vector_db_create.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p]
+    lib.qihse_vector_db_create.restype = ctypes.c_void_p
+
+    lib.qihse_vector_db_open.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    lib.qihse_vector_db_open.restype = ctypes.c_void_p
+
+    lib.qihse_vector_db_add_vectors.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.qihse_vector_db_add_vectors.restype = ctypes.c_bool
+
+    lib.qihse_vector_db_flush.argtypes = [ctypes.c_void_p]
+    lib.qihse_vector_db_flush.restype = ctypes.c_bool
+
+    lib.qihse_vector_db_close.argtypes = [ctypes.c_void_p]
+    lib.qihse_vector_db_close.restype = ctypes.c_bool
+
+    lib.qihse_vector_db_destroy.argtypes = [ctypes.c_void_p]
+    lib.qihse_vector_db_destroy.restype = None
+
+    lib.qihse_vector_db_search.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(QihseVectorQuery),
+        ctypes.POINTER(QihseVectorResult),
+        ctypes.c_size_t,
+    ]
+    lib.qihse_vector_db_search.restype = ctypes.c_int
+
+    return lib
+
+
+def create_file_backed_db(
+    lib: ctypes.CDLL,
+    db_path: Path,
+    base_vectors: list[float],
+    rows: int,
+    dims: int,
+) -> None:
+    vector_array = (ctypes.c_float * len(base_vectors))(*base_vectors)
+    ids = (ctypes.c_uint64 * rows)(*range(rows))
+    db = lib.qihse_vector_db_create(
+        QIHSE_VECTOR_DB_INMEMORY,
+        None,
+        str(db_path).encode("utf-8"),
+    )
+    if not db:
+        raise RuntimeError("qihse_vector_db_create failed")
+    closed = False
+    try:
+        if not lib.qihse_vector_db_add_vectors(
+            db,
+            vector_array,
+            rows,
+            dims,
+            ids,
+            None,
+            None,
+        ):
+            raise RuntimeError("qihse_vector_db_add_vectors failed")
+        if not lib.qihse_vector_db_flush(db):
+            raise RuntimeError("qihse_vector_db_flush failed")
+        if not lib.qihse_vector_db_close(db):
+            closed = True
+            raise RuntimeError("qihse_vector_db_close failed")
+        closed = True
+    finally:
+        if not closed:
+            lib.qihse_vector_db_destroy(db)
+
+
+def open_search_db(lib: ctypes.CDLL, db_path: Path) -> ctypes.c_void_p:
+    db = lib.qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        None,
+        str(db_path).encode("utf-8"),
+        QIHSE_VDB_OPEN_FILE_BACKED | QIHSE_VDB_OPEN_READ_ONLY | QIHSE_VDB_OPEN_MMAP,
+    )
+    if not db:
+        raise RuntimeError("qihse_vector_db_open failed")
+    return db
+
+
+def run_mode(
+    lib: ctypes.CDLL,
+    db: ctypes.c_void_p,
+    mode_name: str,
+    query_mode: int,
+    query_vectors: list[float],
+    ground_truth: list[list[int]],
+    queries: int,
+    dims: int,
+    top_k: int,
+    iterations: int,
+) -> tuple[float, float, float]:
+    result_array_type = QihseVectorResult * top_k
+    matches = 0
+    total = queries * top_k
+    timings_us: list[float] = []
+
+    for _ in range(iterations):
+        for query_index in range(queries):
+            offset = query_index * dims
+            query_array = (ctypes.c_float * dims)(*query_vectors[offset:offset + dims])
+            query = QihseVectorQuery(
+                query_vector=query_array,
+                vector_dims=dims,
+                top_k=top_k,
+                similarity_threshold=ctypes.c_float(-1.0),
+                include_vectors=False,
+                include_metadata=False,
+                use_trinary_candidates=False,
+                candidate_count=0,
+                query_mode=query_mode,
+                candidate_pool_size=0,
+            )
+            results = result_array_type()
+            start = time.perf_counter()
+            found = lib.qihse_vector_db_search(db, ctypes.byref(query), results, top_k)
+            elapsed_us = (time.perf_counter() - start) * 1_000_000.0
+            if found < 0:
+                raise RuntimeError(f"{mode_name} search failed")
+            if found < top_k:
+                raise RuntimeError(f"{mode_name} returned {found}, expected {top_k}")
+            timings_us.append(elapsed_us)
+            if _ == 0:
+                expected = set(ground_truth[query_index][:top_k])
+                actual = {int(results[index].id) for index in range(top_k)}
+                matches += len(expected.intersection(actual))
+
+    recall = matches / total if total else 0.0
+    mean_us = statistics.fmean(timings_us) if timings_us else 0.0
+    p95_us = sorted(timings_us)[max(0, int(len(timings_us) * 0.95) - 1)] if timings_us else 0.0
+    return recall, mean_us, p95_us
+
+
+def reported_candidate_pool(mode_name: str, rows: int, dims: int, top_k: int) -> str:
+    if mode_name == "float32":
+        return str(rows)
+    multiplier = (
+        QIHSE_MAGNITUDE_CANDIDATE_MULTIPLIER
+        if mode_name == "qmag"
+        else QIHSE_SCALAR_CANDIDATE_MULTIPLIER
+    )
+    if dims >= 1024:
+        multiplier += 8
+    elif dims >= 256:
+        multiplier += 4
+    return str(min(rows, top_k * multiplier))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=".", help="QIHSE root")
+    parser.add_argument("--manifest", default="benchmarks/reference_workloads.json")
+    parser.add_argument("--workload", default="vxug-pdf-sample")
+    parser.add_argument("--iterations", type=int, default=3)
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).resolve()
+    manifest = load_manifest(root / args.manifest)
+    workload = find_workload(manifest, args.workload)
+    dims = int(workload["dimensions"])
+    rows = int(workload["rows"])
+    queries = int(workload["queries"])
+    top_k = int(workload["top_k"])
+    files = workload["files"]
+
+    if args.iterations <= 0:
+        print("iterations must be positive", file=sys.stderr)
+        return 1
+
+    try:
+        base_vectors = read_f32_matrix(root / files["base_vectors"], rows, dims)
+        query_vectors = read_f32_matrix(root / files["query_vectors"], queries, dims)
+        ground_truth = read_u32_matrix(root / files["ground_truth"], queries, top_k)
+        lib = bind_qihse(root / "libqihse.so")
+        with tempfile.TemporaryDirectory(prefix="qihse_vxug_bench_") as temp_dir:
+            db_path = Path(temp_dir) / "db"
+            create_file_backed_db(lib, db_path, base_vectors, rows, dims)
+            db = open_search_db(lib, db_path)
+            try:
+                print(
+                    f"{args.workload}: rows={rows} queries={queries} dims={dims} "
+                    f"top_k={top_k} iterations={args.iterations}"
+                )
+                for mode_name, query_mode in (
+                    ("float32", QIHSE_VDB_QUERY_FLOAT32),
+                    ("qtri", QIHSE_VDB_QUERY_TRINARY_SCALAR),
+                    ("qmag", QIHSE_VDB_QUERY_TRINARY_MAGNITUDE),
+                ):
+                    recall, mean_us, p95_us = run_mode(
+                        lib,
+                        db,
+                        mode_name,
+                        query_mode,
+                        query_vectors,
+                        ground_truth,
+                        queries,
+                        dims,
+                        top_k,
+                        args.iterations,
+                    )
+                    print(
+                        f"{mode_name}: recall@{top_k}={recall:.4f} "
+                        f"mean_us={mean_us:.3f} p95_us={p95_us:.3f} "
+                        f"candidate_pool={reported_candidate_pool(mode_name, rows, dims, top_k)}"
+                    )
+            finally:
+                lib.qihse_vector_db_destroy(db)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

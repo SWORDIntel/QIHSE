@@ -47,6 +47,33 @@ Tracked workload manifest:
 - `make sample-vxug-pdf-workload` builds the `vxug-pdf-sample` workload from
   the local FRAMEWERX VXUG PDF path and validates only that workload.
 
+Execution plan:
+
+1. `make bench-vxug-pdf-workload` loads
+   `data/vxug_pdf_sample/base.f32`, `query.f32`, and `ground_truth.u32` into
+   a file-backed QIHSE vector database.
+2. Run the same queries through exact float32, scalar `qtri`, and `qmag`.
+   Record recall@10, latency, selected candidate count, rerank count, and
+   mismatches.
+3. Store benchmark outputs as generated artifacts outside git by default. Only
+   promote summarized results into docs after the runner is repeatable.
+4. Add one larger SIFT-style workload with `fvecs` base/query vectors and
+   `ivecs` ground truth. Use it as the first dataset large enough to justify
+   any candidate-pool default change.
+5. Treat QIHSE GitHub as the upstream working repository. FRAMEWERX should
+   import or mirror QIHSE after upstream changes land, not become the long-term
+   source of truth for QIHSE benchmark policy.
+
+Latest local VXUG sample result:
+
+- `float32`: recall@10 `1.0000`
+- `qtri`: recall@10 `0.9812`
+- `qmag`: recall@10 `1.0000`
+
+The first result supports the existing policy: `qmag` is the preferred trinary
+path for magnitude-sensitive text-derived vectors, but one small generated PDF
+sample is not enough to change default candidate-pool multipliers.
+
 #### SIFT1M Benchmark (Computer Vision)
 ```python
 # Dataset: 1M SIFT descriptors (128 dimensions)

@@ -88,6 +88,10 @@ static bool write_file_payload(const char* dir,
                                const char* name,
                                const uint8_t* payload,
                                size_t payload_size);
+static bool read_file_payload(const char* dir,
+                              const char* name,
+                              uint8_t** out_payload,
+                              size_t* out_payload_size);
 static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size);
 
 static bool test_create_insert_close_reopen_search(void);
@@ -98,6 +102,7 @@ static bool test_wal_replays_unflushed_add(void);
 static bool test_wal_replays_unflushed_delete_update_upsert(void);
 static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_checkpoint_publishes_snapshot_and_clears_wal(void);
+static bool test_checkpoint_ignores_stale_complete_wal(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
 static bool test_truncated_vectors_qvec_payload_rejected(void);
@@ -153,6 +158,8 @@ int main(void) {
          test_torn_wal_tail_ignored_and_truncated},
         {"checkpoint publishes snapshot and clears WAL",
          test_checkpoint_publishes_snapshot_and_clears_wal},
+        {"checkpointed snapshot ignores stale complete WAL",
+         test_checkpoint_ignores_stale_complete_wal},
         {"read-only mmap reopen searches mapped vector file",
          test_read_only_mmap_reopen_searches},
         {"corrupt vectors.qvec magic fails open cleanly",
@@ -507,6 +514,51 @@ static bool write_file_payload(const char* dir,
     if (ok) ok = fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
     return ok;
+}
+
+static bool read_file_payload(const char* dir,
+                              const char* name,
+                              uint8_t** out_payload,
+                              size_t* out_payload_size) {
+    char path[512];
+    struct stat st;
+    uint8_t* data = NULL;
+    int fd = -1;
+    bool ok = false;
+
+    if (!out_payload || !out_payload_size ||
+        !test_join_path(dir, name, path, sizeof(path))) {
+        return false;
+    }
+    *out_payload = NULL;
+    *out_payload_size = 0u;
+    if (stat(path, &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+    data = (uint8_t*)malloc((size_t)st.st_size ? (size_t)st.st_size : 1u);
+    if (!data) {
+        return false;
+    }
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        free(data);
+        return false;
+    }
+    ok = true;
+    if (st.st_size != 0) {
+        ok = read(fd, data, (size_t)st.st_size) == st.st_size;
+    }
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        free(data);
+        return false;
+    }
+    *out_payload = data;
+    *out_payload_size = (size_t)st.st_size;
+    return true;
 }
 
 static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size) {
@@ -1024,6 +1076,69 @@ static bool test_checkpoint_publishes_snapshot_and_clears_wal(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db), "read-only checkpointed database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_checkpoint_ignores_stale_complete_wal(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("checkpoint_stale_wal");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.875f, 0.500f, 0.250f, 0.125f};
+    const char metadata[] = "checkpoint-stale-wal";
+    uint8_t* stale_wal = NULL;
+    size_t stale_wal_size = 0u;
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 6171, metadata, sizeof(metadata)),
+                "checkpoint stale WAL fixture insert should append WAL");
+    TEST_ASSERT(read_file_payload(path, "wal.qwal", &stale_wal, &stale_wal_size),
+                "test should capture complete pre-checkpoint WAL");
+    TEST_ASSERT(stale_wal_size > 0u, "captured WAL should contain the insert record");
+
+    TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish snapshot");
+    TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
+    TEST_ASSERT(write_file_payload(path, "wal.qwal", stale_wal, stale_wal_size),
+                "test should restore stale complete WAL after checkpoint");
+    free(stale_wal);
+    stale_wal = NULL;
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "writable reopen should accept checkpoint plus stale WAL");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after stale WAL reopen");
+    TEST_ASSERT(stats.wal_records_replayed == 0u,
+                "stale complete WAL generation should not replay over checkpoint");
+    TEST_ASSERT(stats.index_rows == 1u, "stale WAL should not duplicate index rows");
+    TEST_ASSERT(stats.live_vectors == 1u, "stale WAL should not duplicate live rows");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vector, ARRAY_LEN(vector), true, true, &result);
+    TEST_ASSERT(count == 1, "checkpointed row should search despite stale WAL");
+    TEST_ASSERT(result.id == 6171, "checkpointed row id should survive stale WAL");
+    TEST_ASSERT(vector_eq(result.vector, vector, ARRAY_LEN(vector)),
+                "checkpointed vector should survive stale WAL");
+    TEST_ASSERT(result.metadata_size == sizeof(metadata),
+                "checkpointed metadata size should survive stale WAL");
+    TEST_ASSERT(memcmp(result.metadata, metadata, sizeof(metadata)) == 0,
+                "checkpointed metadata should survive stale WAL");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "stale-WAL database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
