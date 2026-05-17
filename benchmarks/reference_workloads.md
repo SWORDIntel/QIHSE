@@ -44,6 +44,8 @@ Tracked workload manifest:
   to verify local dataset availability before using them as tuning evidence.
 - Add `--inspect-files` to validate external vector dimensions and row counts
   against the manifest before accepting a dataset as calibration evidence.
+- `make sample-vxug-pdf-workload` builds the `vxug-pdf-sample` workload from
+  the local FRAMEWERX VXUG PDF path and validates only that workload.
 
 #### SIFT1M Benchmark (Computer Vision)
 ```python
@@ -88,6 +90,22 @@ workload_text_embeddings = {
     "dimensions": 768,
     "queries": 6_980,
     "evaluation": "MRR@10",  # Mean Reciprocal Rank
+}
+```
+
+#### VXUG PDF Text Sample
+```python
+# Dataset: local FRAMEWERX VXUG PDF text extraction
+# Default source: ../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf
+# Generated files: data/vxug_pdf_sample/{base.f32,query.f32,ground_truth.u32}
+
+workload_vxug_pdf_sample = {
+    "name": "vxug-pdf-sample",
+    "dataset_size": 256,
+    "dimensions": 256,
+    "queries": 16,
+    "top_k": 10,
+    "metrics": ["recall_at_10", "latency_p95_us", "rerank_candidates"]
 }
 ```
 

@@ -164,7 +164,8 @@ manifest is tracked at `qihse/benchmarks/reference_workloads.json`, with
 `make bench-reference-workloads` validating the manifest and printing the
 current benchmark plan. The manifest runner also supports `--inspect-files` for
 external dataset row-count and dimension validation before those datasets are
-used as tuning evidence.
+used as tuning evidence. The first local sample path is `vxug-pdf-sample`,
+generated from the FRAMEWERX VXUG PDF corpus with `make sample-vxug-pdf-workload`.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
@@ -207,8 +208,8 @@ weighted prototype qtri selectors.
 3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
    FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
    through `src/framewerx/evaluation/search_backend.py`.
-4. Import at least one external reference workload from
-   `qihse/benchmarks/reference_workloads.json`, then use fresh sweep results to
-   tune the candidate-pool resolver if the workload shows stable recall/latency
-   improvement. The current defaults are conservative and mode-aware, and
-   synthetic-only multiplier tuning is intentionally deferred.
+4. Add a benchmark runner that loads the generated `vxug-pdf-sample` vectors
+   into QIHSE, compares exact float32/qtri/qmag against its ground truth, and
+   reports recall/latency/rerank cost before tuning defaults. The current
+   defaults are conservative and mode-aware, and synthetic-only multiplier
+   tuning is intentionally deferred.

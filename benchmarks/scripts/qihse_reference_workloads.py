@@ -117,11 +117,22 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def selected_workloads(manifest: dict[str, Any], names: set[str] | None) -> list[Any]:
+    workloads = manifest.get("workloads")
+    if not isinstance(workloads, list) or names is None:
+        return workloads if isinstance(workloads, list) else []
+    return [
+        workload for workload in workloads
+        if isinstance(workload, dict) and workload.get("name") in names
+    ]
+
+
 def validate_manifest(
     manifest: dict[str, Any],
     root: Path,
     check_files: bool,
     inspect_files: bool,
+    workload_names: set[str] | None,
 ) -> list[str]:
     errors: list[str] = []
     workloads = manifest.get("workloads")
@@ -131,6 +142,16 @@ def validate_manifest(
     if not isinstance(workloads, list) or not workloads:
         errors.append("workloads must be a non-empty list")
         return errors
+    if workload_names is not None:
+        manifest_names = {
+            workload.get("name")
+            for workload in workloads
+            if isinstance(workload, dict)
+        }
+        missing_names = sorted(workload_names.difference(manifest_names))
+        if missing_names:
+            errors.append(f"unknown workloads: {', '.join(missing_names)}")
+        workloads = selected_workloads(manifest, workload_names)
 
     seen_names: set[str] = set()
     for index, workload in enumerate(workloads):
@@ -203,8 +224,8 @@ def validate_manifest(
     return errors
 
 
-def print_plan(manifest: dict[str, Any]) -> None:
-    for workload in manifest["workloads"]:
+def print_plan(manifest: dict[str, Any], workload_names: set[str] | None) -> None:
+    for workload in selected_workloads(manifest, workload_names):
         name = workload["name"]
         kind = workload["kind"]
         dims = workload["dimensions"]
@@ -249,6 +270,12 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="print the benchmark execution plan after validation",
     )
+    parser.add_argument(
+        "--workload",
+        action="append",
+        dest="workloads",
+        help="limit validation/plan output to a named workload; can be repeated",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -259,7 +286,14 @@ def main(argv: list[str]) -> int:
     try:
         manifest = load_manifest(manifest_path)
         check_files = args.check_files or args.inspect_files
-        errors = validate_manifest(manifest, root, check_files, args.inspect_files)
+        workload_names = set(args.workloads) if args.workloads else None
+        errors = validate_manifest(
+            manifest,
+            root,
+            check_files,
+            args.inspect_files,
+            workload_names,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"reference workload manifest error: {exc}", file=sys.stderr)
         return 1
@@ -271,10 +305,11 @@ def main(argv: list[str]) -> int:
 
     print(
         f"reference workload manifest OK: "
-        f"{len(manifest['workloads'])} workloads from {os.path.relpath(manifest_path, root)}"
+        f"{len(selected_workloads(manifest, workload_names))} workloads "
+        f"from {os.path.relpath(manifest_path, root)}"
     )
     if args.plan:
-        print_plan(manifest)
+        print_plan(manifest, workload_names)
     return 0
 
 

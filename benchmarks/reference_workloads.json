@@ -120,6 +120,40 @@
         "latency_p95_us_must_be_reported": true,
         "rerank_candidates_must_be_reported": true
       }
+    },
+    {
+      "name": "vxug-pdf-sample",
+      "kind": "external",
+      "dataset": "vxug_pdf_sample",
+      "dimensions": 256,
+      "rows": 256,
+      "queries": 16,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/vxug_pdf_sample/base.f32",
+        "query_vectors": "data/vxug_pdf_sample/query.f32",
+        "ground_truth": "data/vxug_pdf_sample/ground_truth.u32"
+      },
+      "file_formats": {
+        "base_vectors": "f32_matrix",
+        "query_vectors": "f32_matrix",
+        "ground_truth": "u32_matrix"
+      },
+      "source": {
+        "type": "pdf_text",
+        "default_framewerx_path": "../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf",
+        "builder": "benchmarks/scripts/qihse_pdf_text_sample.py"
+      },
+      "acceptance": {
+        "recall_at_10_floor": 0.95,
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
     }
   ]
 }

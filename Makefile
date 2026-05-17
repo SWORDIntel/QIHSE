@@ -15,6 +15,7 @@ QIHSE_ENABLE_AVX512?=0
 CFLAGS=$(CFLAGS_BASE)
 
 LDFLAGS=-ldl -lm -lpthread
+VXUG_PDF?=../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
@@ -45,7 +46,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads sample-vxug-pdf-workload
 
 all: lib
 
@@ -122,6 +123,10 @@ bench-trinary-magnitude-sweep: lib
 
 bench-reference-workloads:
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --plan
+
+sample-vxug-pdf-workload:
+	python3 benchmarks/scripts/qihse_pdf_text_sample.py --pdf "$(VXUG_PDF)" --out data/vxug_pdf_sample
+	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
