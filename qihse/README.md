@@ -8,7 +8,7 @@
 
 QIHSE is a revolutionary search algorithm that combines quantum-inspired mathematics, heterogeneous parallel computing, and self-optimizing machine learning to deliver **2-5x performance improvements** over traditional approaches while maintaining **99%+ accuracy** and **CNSA 2.0 compliance**.
 
-**QIHSE-NOT_STISLA Integration**: Enhanced with classical anchor-based optimizations for **15-25% additional speedup** on sorted data workloads, bringing total performance improvements to **3-7x** over traditional binary search.
+**Native Anchor Search**: Enhanced with classical anchor-based optimizations for **15-25% additional speedup** on sorted data workloads, bringing total performance improvements to **3-7x** over traditional binary search.
 
 ## 🏆 Key Features
 
@@ -24,7 +24,7 @@ QIHSE is a revolutionary search algorithm that combines quantum-inspired mathema
 - **Dynamic dimension calculation** based on workload characteristics
 - **Multi-level verification** with confidence-based accuracy guarantees
 
-### 🎯 **NOT_STISLA Integration - Classical Optimizations**
+### 🎯 **Native Anchor Search - Classical Optimizations**
 - **Anchor-based interpolation search** for sorted data workloads
 - **Memory-bounded anchor tables** with intelligent LRU pruning
 - **Runtime CPU feature detection** with signal-based SIMD testing
@@ -50,7 +50,7 @@ QIHSE is a revolutionary search algorithm that combines quantum-inspired mathema
 - **Commercial thresholds**: 10K+ QPS, <10ms P99, 95%+ recall@10
 - **Resource efficiency**: <2x memory usage, <80% CPU utilization
 
-### 🔄 **QIHSE-NOT_STISLA Integration Benefits**
+### 🔄 **Native Anchor Search Benefits**
 - **Intelligent Algorithm Selection**: Automatic choice between quantum-inspired, anchor-based, or hybrid approaches
 - **Memory-Bounded Anchor Management**: Prevents memory ballooning while maintaining performance
 - **Workload-Specific Optimization**: Tailored algorithms for telemetry, IDs, offsets, and event data

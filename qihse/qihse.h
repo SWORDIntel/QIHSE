@@ -28,7 +28,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include "qihse_hetero.h"
-#include "not_stisla.h"  /* For anchor table compatibility */
+#include "qihse_anchor_search.h"  /* Native QIHSE anchor-search compatibility */
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,7 +77,7 @@ extern "C" {
 #endif
 
 /* ============================================================================
- * QIHSE-NOT_STISLA INTEGRATION: ANCHOR-BASED OPTIMIZATIONS
+ * QIHSE NATIVE ANCHOR-BASED OPTIMIZATIONS
  * ============================================================================ */
 
 /* Anchor-based search configuration (integrated into QIHSE core) */
@@ -271,7 +271,7 @@ int qihse_compute_optimal_dimensions(
  * ============================================================================ */
 
 typedef struct qihse_config_s {
-    /* QIHSE-NOT_STISLA Integration: Anchor-based optimizations */
+    /* QIHSE native anchor-based optimizations */
     qihse_anchor_config_t anchor_config; /* Anchor search configuration */
 
     /* Dimension configuration */
@@ -404,7 +404,7 @@ typedef struct {
     double verification_rate;   /* % of results that needed verification */
     size_t classical_fallbacks; /* Number of classical fallbacks */
 
-    /* QIHSE-NOT_STISLA Integration: Enhanced anchor learning metrics */
+    /* QIHSE native anchor learning metrics */
     size_t anchors_learned;     /* New anchors learned */
     size_t anchors_pruned;      /* Anchors pruned due to memory limits */
     size_t anchor_table_size;   /* Current anchor table size */
@@ -412,7 +412,7 @@ typedef struct {
     double anchor_avg_error;    /* Average interpolation error */
     int detected_workload_type; /* Auto-detected workload type */
     double speedup_vs_binary;   /* Speedup vs binary search */
-    double speedup_vs_classical; /* Speedup vs classical NOT_STISLA */
+    double speedup_vs_classical; /* Speedup vs classical anchor search */
     double anchor_memory_usage_mb; /* Memory used by anchor tables */
 
     /* Resource usage */

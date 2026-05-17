@@ -37,8 +37,7 @@ QIHSE probes and utilizes every available compute resource on the system:
 
 ## 📂 Project Structure
 
-- **`qihse/`**: Core library source code, hardware backends, and Python bindings.
-- **`not_stisla/`**: Classical DSMIL search wrapper and integration layer.
+- **`qihse/`**: Core library source code, hardware backends, Python bindings, and native anchor-search algorithms.
 - **`build/bin/`**: Pre-compiled and natively built benchmark binaries.
 - **`docs/`**: Technical documentation and integration guides.
 - **`commercial/`**: ROI analysis, market strategy, and executive summaries.

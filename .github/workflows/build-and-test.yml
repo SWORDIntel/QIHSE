@@ -32,7 +32,7 @@ jobs:
     - name: Run Core Test Suite
       run: |
         cd qihse
-        gcc -Wall -Wextra -I. -I../not_stisla/include tests/qihse_test.c -L. -lqihse -lm -lpthread -o ci_test
+        gcc -Wall -Wextra -I. -I./algorithms tests/qihse_test.c -L. -lqihse -lm -lpthread -o ci_test
         LD_LIBRARY_PATH=. ./ci_test
         
     - name: Verify Graceful Fallback

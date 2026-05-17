@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-QIHSE Benchmark Visualization Script
+NOT_STISLA Benchmark Visualization Script
 
-Generates comprehensive charts and graphs from QIHSE benchmark results.
+Generates comprehensive charts and graphs from tuned/enhanced NOT_STISLA benchmark results.
 Supports multiple output formats and interactive visualizations.
 """
 
@@ -17,7 +17,7 @@ import argparse
 import sys
 from datetime import datetime
 
-class QIHSEBenchmarkVisualizer:
+class NotStislaBenchmarkVisualizer:
     def __init__(self, results_file):
         """Initialize visualizer with benchmark results"""
         self.results_file = Path(results_file)
@@ -46,7 +46,7 @@ class QIHSEBenchmarkVisualizer:
             self.df = pd.read_csv(self.results_file)
             # Convert to similar structure as JSON
             self.data = {
-                'qihse_version': 'Unknown',
+                'not_stisla_version': 'Unknown',
                 'timestamp': datetime.now().timestamp(),
                 'benchmarks': self.df.to_dict('records')
             }
@@ -67,23 +67,23 @@ class QIHSEBenchmarkVisualizer:
                                    bins=[0, 1000, 10000, 100000, 1000000, float('inf')],
                                    labels=['Tiny', 'Small', 'Medium', 'Large', 'Huge'])
 
-        # Speedup vs Binary Search
+        # Speedup vs baseline binary search
         sizes = []
-        qihse_speedups = []
-        classical_speedups = []
+        enhanced_speedups = []
+        core_speedups = []
 
         for _, row in df.iterrows():
-            if row['qihse_vs_binary'] > 0:
+            if row['enhanced_vs_binary'] > 0:
                 sizes.append(row['array_size'])
-                qihse_speedups.append(row['qihse_vs_binary'])
-                classical_speedups.append(row['classical_vs_binary'])
+                enhanced_speedups.append(row['enhanced_vs_binary'])
+                core_speedups.append(row['classical_vs_binary'])
 
-        ax1.scatter(sizes, qihse_speedups, alpha=0.7, s=50, label='QIHSE', color='#1f77b4')
-        ax1.scatter(sizes, classical_speedups, alpha=0.7, s=50, label='Classical NOT_STISLA', color='#ff7f0e')
+        ax1.scatter(sizes, enhanced_speedups, alpha=0.7, s=50, label='Tuned/Enhanced NOT_STISLA Search', color='#1f77b4')
+        ax1.scatter(sizes, core_speedups, alpha=0.7, s=50, label='NOT_STISLA Core Search', color='#ff7f0e')
         ax1.set_xscale('log')
         ax1.set_xlabel('Array Size (log scale)')
         ax1.set_ylabel('Speedup Factor')
-        ax1.set_title('Speedup vs Binary Search by Array Size')
+        ax1.set_title('Speedup vs Baseline Binary Search by Array Size')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
@@ -104,12 +104,12 @@ class QIHSEBenchmarkVisualizer:
         # Timing comparison
         if len(df) > 0:
             df_sorted = df.sort_values('array_size')
-            ax3.plot(df_sorted['array_size'], df_sorted['qihse_time_ns'],
-                    'o-', label='QIHSE', color='#1f77b4', linewidth=2)
+            ax3.plot(df_sorted['array_size'], df_sorted['enhanced_time_ns'],
+                    'o-', label='Tuned/Enhanced NOT_STISLA Search', color='#1f77b4', linewidth=2)
             ax3.plot(df_sorted['array_size'], df_sorted['classical_time_ns'],
-                    's-', label='Classical', color='#ff7f0e', linewidth=2)
+                    's-', label='NOT_STISLA Core Search', color='#ff7f0e', linewidth=2)
             ax3.plot(df_sorted['array_size'], df_sorted['binary_time_ns'],
-                    '^-', label='Binary', color='#2ca02c', linewidth=2)
+                    '^-', label='Baseline Binary Search', color='#2ca02c', linewidth=2)
             ax3.set_xscale('log')
             ax3.set_yscale('log')
             ax3.set_xlabel('Array Size (log scale)')
@@ -152,11 +152,11 @@ class QIHSEBenchmarkVisualizer:
             x = np.arange(len(df))
             width = 0.25
 
-            ax1.bar(x - width, df['qihse_vs_binary'], width, label='QIHSE vs Binary',
+            ax1.bar(x - width, df['enhanced_vs_binary'], width, label='Tuned/enhanced vs baseline',
                    alpha=0.8, color='#1f77b4')
-            ax1.bar(x, df['qihse_vs_classical'], width, label='QIHSE vs Classical',
+            ax1.bar(x, df['enhanced_vs_classical'], width, label='Tuned/enhanced vs core',
                    alpha=0.8, color='#ff7f0e')
-            ax1.bar(x + width, df['classical_vs_binary'], width, label='Classical vs Binary',
+            ax1.bar(x + width, df['classical_vs_binary'], width, label='Core vs baseline',
                    alpha=0.8, color='#2ca02c')
 
             ax1.set_xlabel('Benchmark')
@@ -187,21 +187,21 @@ class QIHSEBenchmarkVisualizer:
 
             # Fit power law for scaling analysis
             x = np.log(df_sorted['array_size'])
-            y_qihse = np.log(df_sorted['qihse_time_ns'])
-            y_classical = np.log(df_sorted['classical_time_ns'])
+            y_enhanced = np.log(df_sorted['enhanced_time_ns'])
+            y_core = np.log(df_sorted['classical_time_ns'])
             y_binary = np.log(df_sorted['binary_time_ns'])
 
             # Linear fits
-            qihse_fit = np.polyfit(x, y_qihse, 1)
-            classical_fit = np.polyfit(x, y_classical, 1)
+            enhanced_fit = np.polyfit(x, y_enhanced, 1)
+            core_fit = np.polyfit(x, y_core, 1)
             binary_fit = np.polyfit(x, y_binary, 1)
 
-            ax3.plot(df_sorted['array_size'], df_sorted['qihse_time_ns'], 'o',
-                    label=f'QIHSE (slope: {qihse_fit[0]:.2f})', color='#1f77b4')
+            ax3.plot(df_sorted['array_size'], df_sorted['enhanced_time_ns'], 'o',
+                    label=f'Tuned/Enhanced NOT_STISLA Search (slope: {enhanced_fit[0]:.2f})', color='#1f77b4')
             ax3.plot(df_sorted['array_size'], df_sorted['classical_time_ns'], 's',
-                    label=f'Classical (slope: {classical_fit[0]:.2f})', color='#ff7f0e')
+                    label=f'NOT_STISLA Core Search (slope: {core_fit[0]:.2f})', color='#ff7f0e')
             ax3.plot(df_sorted['array_size'], df_sorted['binary_time_ns'], '^',
-                    label=f'Binary (slope: {binary_fit[0]:.2f})', color='#2ca02c')
+                    label=f'Baseline Binary Search (slope: {binary_fit[0]:.2f})', color='#2ca02c')
 
             ax3.set_xscale('log')
             ax3.set_yscale('log')
@@ -249,7 +249,7 @@ class QIHSEBenchmarkVisualizer:
 
         # Add metadata
         if self.data:
-            fig.suptitle(f'QIHSE Benchmark Results - {self.data.get("qihse_version", "Unknown Version")}\n'
+            fig.suptitle(f'NOT_STISLA Benchmark Results - {self.data.get("not_stisla_version", "Unknown Version")}\n'
                         f'Generated: {datetime.fromtimestamp(self.data.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")}\n'
                         f'Total Benchmarks: {len(df)}', fontsize=12, y=0.98)
 
@@ -272,24 +272,24 @@ class QIHSEBenchmarkVisualizer:
             return
 
         print("\n" + "="*80)
-        print("QIHSE BENCHMARK SUMMARY STATISTICS")
+        print("NOT_STISLA BENCHMARK SUMMARY STATISTICS")
         print("="*80)
 
         print(f"Total benchmarks run: {len(df)}")
-        print(f"QIHSE version: {self.data.get('qihse_version', 'Unknown')}")
+        print(f"NOT_STISLA version: {self.data.get('not_stisla_version', 'Unknown')}")
         print(f"Timestamp: {datetime.fromtimestamp(self.data.get('timestamp', 0))}")
 
         # Performance statistics
         print(f"\nPERFORMANCE STATISTICS:")
-        print(f"Average QIHSE speedup vs binary: {df['qihse_vs_binary'].mean():.1f}x")
-        print(f"Average QIHSE speedup vs classical: {df['qihse_vs_classical'].mean():.1f}x")
+        print(f"Average tuned/enhanced NOT_STISLA speedup vs baseline: {df['enhanced_vs_binary'].mean():.1f}x")
+        print(f"Average tuned/enhanced NOT_STISLA speedup vs core search: {df['enhanced_vs_classical'].mean():.1f}x")
         print(f"Average accuracy: {df['accuracy_rate'].mean()*100:.2f}%")
 
         # Timing statistics
         print(f"\nTIMING STATISTICS (nanoseconds per operation):")
-        print(f"QIHSE average: {df['qihse_time_ns'].mean():.0f} ns")
-        print(f"Classical average: {df['classical_time_ns'].mean():.0f} ns")
-        print(f"Binary average: {df['binary_time_ns'].mean():.0f} ns")
+        print(f"Tuned/enhanced NOT_STISLA average: {df['enhanced_time_ns'].mean():.0f} ns")
+        print(f"NOT_STISLA core search average: {df['classical_time_ns'].mean():.0f} ns")
+        print(f"Baseline binary search average: {df['binary_time_ns'].mean():.0f} ns")
 
         # Hardware statistics
         if 'primary_accelerator' in df.columns:
@@ -314,7 +314,7 @@ class QIHSEBenchmarkVisualizer:
         print("="*80)
 
 def main():
-    parser = argparse.ArgumentParser(description='QIHSE Benchmark Visualization')
+    parser = argparse.ArgumentParser(description='NOT_STISLA Benchmark Visualization')
     parser.add_argument('input_file', help='Benchmark results file (.json or .csv)')
     parser.add_argument('--output-dir', default='charts', help='Output directory for charts')
     parser.add_argument('--format', choices=['png', 'pdf', 'svg'], default='png',
@@ -335,17 +335,17 @@ def main():
 
     try:
         # Initialize visualizer
-        viz = QIHSEBenchmarkVisualizer(args.input_file)
+        viz = NotStislaBenchmarkVisualizer(args.input_file)
 
         # Generate summary statistics
         viz.generate_summary_stats()
 
         # Generate speedup comparison chart
-        speedup_file = output_dir / f'qihse_speedup_comparison.{args.format}'
+        speedup_file = output_dir / f'not_stisla_speedup_comparison.{args.format}'
         viz.generate_speedup_comparison(str(speedup_file))
 
         # Generate detailed report
-        report_file = output_dir / f'qihse_detailed_report.{args.format}'
+        report_file = output_dir / f'not_stisla_detailed_report.{args.format}'
         viz.generate_detailed_report(str(report_file))
 
         print(f"\nCharts saved to: {output_dir}/")

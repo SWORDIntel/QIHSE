@@ -17,7 +17,7 @@
 
 #include "../include/qihse_memory.h"
 #include "../../orchestration/include/qihse_hetero.h"
-#include "../../not_stisla/include/not_stisla.h"
+#include "qihse_anchor_search.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>

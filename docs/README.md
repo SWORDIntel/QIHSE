@@ -17,4 +17,4 @@ Comprehensive documentation for the QIHSE search algorithm, hardware backends, a
 - **[Customer Value Proposition](customer/value-proposition.md)** - Use-case benefits.
 
 ---
-For implementation details, see the source code in `qihse/` and `not_stisla/`.
+For implementation details, see the source code in `qihse/`. The anchor-search utilities are integrated directly into QIHSE's native algorithm layer.

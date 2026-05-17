@@ -37,6 +37,74 @@ typedef enum qihse_vector_db_backend_e {
 } qihse_vector_db_backend_t;
 
 /**
+ * Native vector database storage mode.
+ *
+ * QIHSE persistence is a storage concern, not an external vector DB backend.
+ */
+typedef enum qihse_vector_db_storage_mode_e {
+    QIHSE_VDB_STORAGE_EPHEMERAL = 0,
+    QIHSE_VDB_STORAGE_FILE_COPY = 1,
+    QIHSE_VDB_STORAGE_FILE_MMAP = 2
+} qihse_vector_db_storage_mode_t;
+
+/**
+ * Native vector database open flags.
+ */
+typedef enum qihse_vector_db_open_flags_e {
+    QIHSE_VDB_OPEN_CREATE      = 1u << 0,
+    QIHSE_VDB_OPEN_READ_ONLY   = 1u << 1,
+    QIHSE_VDB_OPEN_TRUNCATE    = 1u << 2,
+    QIHSE_VDB_OPEN_FILE_BACKED = 1u << 3,
+    QIHSE_VDB_OPEN_MMAP        = 1u << 4
+} qihse_vector_db_open_flags_t;
+
+/**
+ * Native vector encoding identifiers reserved by the QIHSE file format.
+ */
+typedef enum qihse_vector_encoding_e {
+    QIHSE_ENCODING_FLOAT32 = 0x00000001u,
+    QIHSE_ENCODING_FLOAT32_TRINARY_2BIT = 0x00010001u,
+    QIHSE_ENCODING_FLOAT32_TRINARY_TRYTE = 0x00010002u,
+    QIHSE_ENCODING_TRINARY_TRYTE = 0x00010003u
+} qihse_vector_encoding_t;
+
+/**
+ * Status of the optional vectors.qtri sidecar.
+ */
+typedef enum qihse_vector_db_trinary_status_e {
+    QIHSE_VDB_TRINARY_ABSENT = 0,
+    QIHSE_VDB_TRINARY_VALID = 1,
+    QIHSE_VDB_TRINARY_STALE = 2,
+    QIHSE_VDB_TRINARY_CORRUPT = 3
+} qihse_vector_db_trinary_status_t;
+
+/**
+ * Native file-backed persistence diagnostics.
+ */
+typedef struct qihse_vector_db_persistence_stats_s {
+    qihse_vector_db_storage_mode_t storage_mode;
+    qihse_vector_encoding_t encoding_id;
+    uint32_t encoding_version;
+    bool read_only;
+    bool needs_flush;
+    uint64_t committed_generation;
+    uint64_t total_vectors;
+    uint64_t live_vectors;
+    uint64_t vector_dims;
+    uint64_t vector_bytes;
+    uint64_t metadata_bytes;
+    uint64_t index_rows;
+    bool idmap_valid;
+    bool idmap_dirty;
+    uint64_t idmap_rows;
+    uint64_t wal_bytes_pending;
+    uint64_t wal_records_replayed;
+    qihse_vector_db_trinary_status_t trinary_status;
+    uint64_t trinary_row_bytes;
+    uint64_t trinary_rows;
+} qihse_vector_db_persistence_stats_t;
+
+/**
  * Vector database search result.
  */
 typedef struct qihse_vector_result_s {
@@ -81,6 +149,69 @@ qihse_vector_db_t qihse_vector_db_create(
     qihse_vector_db_backend_t backend,
     qihse_uma_manager_t uma,
     const char* db_path
+);
+
+/**
+ * Open a native QIHSE vector database.
+ *
+ * @param backend Vector database backend to use for compatibility
+ * @param uma UMA manager for vector and metadata buffers
+ * @param db_path Path to QIHSE database directory (NULL for ephemeral)
+ * @param flags Open flags
+ * @return Vector database handle, or NULL on failure
+ */
+qihse_vector_db_t qihse_vector_db_open(
+    qihse_vector_db_backend_t backend,
+    qihse_uma_manager_t uma,
+    const char* db_path,
+    uint32_t flags
+);
+
+/**
+ * Flush accepted writes to durable storage.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_flush(qihse_vector_db_t vdb);
+
+/**
+ * Checkpoint durable state by flushing the current snapshot and clearing WAL
+ * records at or before the committed generation.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure or unsupported mode
+ */
+bool qihse_vector_db_checkpoint(qihse_vector_db_t vdb);
+
+/**
+ * Compact durable state. The current implementation rewrites the snapshot and
+ * derived sidecars; row-level tombstone compaction is reserved for a later
+ * storage-maintenance pass.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure or unsupported mode
+ */
+bool qihse_vector_db_compact(qihse_vector_db_t vdb);
+
+/**
+ * Flush and close a vector database handle.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_close(qihse_vector_db_t vdb);
+
+/**
+ * Get native file-backed persistence diagnostics.
+ *
+ * @param vdb Vector database handle
+ * @param stats Output persistence statistics
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_get_persistence_stats(
+    qihse_vector_db_t vdb,
+    qihse_vector_db_persistence_stats_t* stats
 );
 
 /**
