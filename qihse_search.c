@@ -569,18 +569,21 @@ qihse_optimization_entry_t* qihse_get_entry(qihse_optimization_db_t* db, const q
 
 qihse_hybrid_result_t qihse_execute_hybrid_search(const void* data, size_t n, const void* query, not_stisla_anchor_table_t* table, const qihse_config_t* config) {
     qihse_hybrid_result_t r = {0}; r.used_hybrid = true;
+    r.quantum_result = NOT_STISLA_NOT_FOUND;
+    r.anchor_result = NOT_STISLA_NOT_FOUND;
+    r.final_result = NOT_STISLA_NOT_FOUND;
     r.quantum_result = qihse_search(data, n, query, table, config);
-    /* Stubbing not_stisla_search as its definition is not found */
-    if (table) {
-        printf("INFO: Stubbing call to not_stisla_search as its definition is missing.\\n");
-        r.anchor_result = NOT_STISLA_NOT_FOUND; /* Default to not found */
-        /* Attempting to call with expected signature: const int64_t* data, size_t n, int64_t query, not_stisla_anchor_table_t* table, int arg */
-        /* The actual `query` type is `const void*`, casting to `int64_t*` for dereference */
-        /* The `arg` is hardcoded to 8 based on call site in qihse_core.c */
-        if (n > 0 && data != NULL && table != NULL) {
-             r.anchor_result = NOT_STISLA_NOT_FOUND; /* Assume it would return this if called */
-        }
+
+    if (data && n > 0 && query && table && config && config->data_type == QIHSE_TYPE_INT64) {
+        r.anchor_result = not_stisla_search(
+            (const int64_t*)data,
+            n,
+            *(const int64_t*)query,
+            table,
+            8
+        );
     }
+
     if (r.quantum_result != NOT_STISLA_NOT_FOUND && r.anchor_result != NOT_STISLA_NOT_FOUND) {
         r.final_result = r.quantum_result; r.final_confidence = (r.quantum_result == r.anchor_result) ? 0.9 : 0.7;
     } else if (r.quantum_result != NOT_STISLA_NOT_FOUND) { r.final_result = r.quantum_result; r.final_confidence = 0.8; }

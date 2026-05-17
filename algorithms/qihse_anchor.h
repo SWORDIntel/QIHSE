@@ -1,7 +1,7 @@
 /**
  * QIHSE Anchor-Based Interpolation Search Algorithm
  *
- * Integrates NOT_STISLA's anchor-based interpolation search into QIHSE
+ * Integrates native anchor-based interpolation search into QIHSE
  * for optimal performance on sorted data with learned interpolation points.
  *
  * Features:
@@ -16,7 +16,7 @@
 #define QIHSE_ANCHOR_H
 
 #include "../qihse.h"
-#include "../../not_stisla/include/not_stisla.h"
+#include "qihse_anchor_search.h"
 
 #ifdef __cplusplus
 extern "C" {
