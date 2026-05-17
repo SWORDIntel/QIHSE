@@ -248,6 +248,110 @@ bool qihse_vector_db_add_vectors(
 );
 
 /**
+ * Delete one live vector by external ID.
+ *
+ * PR-4 API surface only: implementations must reject read-only handles, mark
+ * the latest live row tombstoned, and preserve crash recovery through WAL.
+ *
+ * @param vdb Vector database handle
+ * @param vector_id External vector ID to delete
+ * @return true if a live vector was deleted, false on failure or missing ID
+ */
+bool qihse_vector_db_delete_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id
+);
+
+/**
+ * Delete multiple live vectors by external ID in one batch.
+ *
+ * @param vdb Vector database handle
+ * @param vector_ids External vector IDs to delete
+ * @param count Number of IDs
+ * @param deleted_count Optional output count of deleted live rows
+ * @return true if the batch completed, false on validation or storage failure
+ */
+bool qihse_vector_db_delete_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    size_t count,
+    size_t* deleted_count
+);
+
+/**
+ * Replace one live vector by external ID.
+ *
+ * PR-4 semantics are append-only: tombstone the previous live row and append a
+ * new live row with the same external ID.
+ *
+ * @param vdb Vector database handle
+ * @param vector_id External vector ID to update
+ * @param vector Replacement vector
+ * @param dims Replacement vector dimensions
+ * @param metadata Optional replacement metadata bytes
+ * @param metadata_size Replacement metadata size
+ * @return true if the vector was updated, false on failure or missing ID
+ */
+bool qihse_vector_db_update_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    const float* vector,
+    size_t dims,
+    const void* metadata,
+    size_t metadata_size
+);
+
+/**
+ * Replace multiple live vectors by external ID in one batch.
+ *
+ * @param vdb Vector database handle
+ * @param vector_ids External vector IDs to update
+ * @param vectors Contiguous replacement vectors
+ * @param count Number of vectors
+ * @param dims Dimension count per replacement vector
+ * @param metadata Optional replacement metadata pointers
+ * @param metadata_sizes Optional replacement metadata sizes
+ * @param updated_count Optional output count of updated live rows
+ * @return true if the batch completed, false on validation or storage failure
+ */
+bool qihse_vector_db_update_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* updated_count
+);
+
+/**
+ * Insert missing IDs and replace existing IDs in one committed batch.
+ *
+ * @param vdb Vector database handle
+ * @param vector_ids External vector IDs to insert or update
+ * @param vectors Contiguous source vectors
+ * @param count Number of vectors
+ * @param dims Dimension count per vector
+ * @param metadata Optional metadata pointers
+ * @param metadata_sizes Optional metadata sizes
+ * @param inserted_count Optional output count of inserted rows
+ * @param updated_count Optional output count of updated rows
+ * @return true if the batch completed, false on validation or storage failure
+ */
+bool qihse_vector_db_upsert_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* inserted_count,
+    size_t* updated_count
+);
+
+/**
  * Search vectors with QIHSE acceleration and instant access.
  *
  * @param vdb Vector database handle

@@ -539,7 +539,7 @@ PR-1 is complete when:
 After the current checkpoint:
 
 - PR-3: extend mmap beyond read-only `vectors.qvec` into index, metadata, and ID map mapping where the access pattern warrants it. Vector, metadata, and ID-map mmap are present; index mmap remains.
-- PR-4: implement real row compaction, tombstones, delete/update semantics, and batch external-ID APIs.
+- PR-4: public delete/update/upsert API declarations are staged in `qihse/qihse_vector_db.h`; implementation still needs real row compaction, tombstones, mutation WAL replay, and batch external-ID behavior.
 - PR-5: execute the trinary sidecar path: codec module, codec kernels, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. Standalone tryte encoding/scoring/top-k is present; vector DB integration, exact rerank, and benchmarks remain.
 - PR-6: optional persisted anchor hints and optimizer statistics as rebuildable sidecars.
 
@@ -547,9 +547,11 @@ After the current checkpoint:
 
 PR-4 should make mutation explicit without changing QIHSE's program boundary. The public contract belongs to native QIHSE; Framewerx and other callers remain clients.
 
+Status: the public delete/update/upsert declarations are now staged in `qihse/qihse_vector_db.h`. The vector DB implementation, WAL mutation records, compaction behavior, and executable tests remain next.
+
 ### Public API
 
-Add explicit external-ID mutation APIs to `qihse/qihse_vector_db.h`:
+The explicit external-ID mutation APIs are staged in `qihse/qihse_vector_db.h`:
 
 ```c
 bool qihse_vector_db_delete_by_id(
@@ -665,7 +667,7 @@ Crash rule: if compaction crashes before manifest publication, the old generatio
 
 ### Required Tests
 
-Add persistence tests for:
+The persistence test file carries a compile-safe TODO backlog for these cases. Convert the backlog to executable tests only after `qihse_vector_db.c` exports the mutation symbols:
 
 1. Delete-by-ID removes a row from search and survives close/reopen.
 2. Delete of a missing ID does not corrupt the database.
@@ -705,7 +707,7 @@ Agent 2: PR-5 trinary codec module.
 
 Agent 3: PR-4/PR-5/PR-6 remaining database work.
 
-- Add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
+- Implement the staged tombstone/delete/update/upsert APIs, mutation WAL records, and real compaction.
 - Start from the PR-4 API, row flag, WAL, compaction, and test plan above.
 - Add persisted anchor hints only as rebuildable sidecars after ID-map correctness and mmap behavior are stable.
 - Add optimizer statistics as explicit-format sidecars if they are needed; do not reuse native struct dumps.

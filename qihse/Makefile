@@ -45,7 +45,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec
 
 all: lib
 
@@ -66,6 +66,13 @@ test-trinary-codec:
 	    codecs/qihse_trinary_tryte_codec.c \
 	    $(LDFLAGS)
 	./tests/qihse_trinary_codec_test
+
+bench-trinary-codec:
+	$(CC) $(CFLAGS) -o /tmp/qihse_trinary_candidate_bench \
+	    benchmarks/qihse_trinary_candidate_bench.c \
+	    codecs/qihse_trinary_tryte_codec.c \
+	    $(LDFLAGS)
+	/tmp/qihse_trinary_candidate_bench
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
