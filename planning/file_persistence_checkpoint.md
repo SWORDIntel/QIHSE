@@ -212,7 +212,8 @@ weighted prototype qtri selectors.
    `make bench-sift1m-workload`. The generic runner now supports `fvecs`,
    `ivecs`, `f32_matrix`, and `u32_matrix` manifest entries, with
    `make bench-reference-runner-smoke` covering the SIFT-style parser path
-   before full SIFT data is available.
+   before full SIFT data is available. Generated benchmark JSON is now
+   summarized through the manifest-backed recall gate.
 2. Move toward a QIHSE-upstream-first workflow: develop and validate QIHSE in
    `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state
    back into FRAMEWERX.

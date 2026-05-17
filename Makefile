@@ -47,7 +47,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-sift1m-workload
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload
 
 all: lib
 
@@ -135,10 +135,15 @@ sample-vxug-pdf-workload:
 bench-vxug-pdf-workload: lib
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
 	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root . --output-json results/vxug_pdf_sample/latest.json
+	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload vxug-pdf-sample --result results/vxug_pdf_sample/latest.json
 
 bench-reference-workload: lib
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload $(REFERENCE_WORKLOAD) --inspect-files
 	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root . --workload $(REFERENCE_WORKLOAD) --output-json results/$(REFERENCE_WORKLOAD)/latest.json
+	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload $(REFERENCE_WORKLOAD) --result results/$(REFERENCE_WORKLOAD)/latest.json
+
+bench-reference-result-summary:
+	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload $(REFERENCE_WORKLOAD) --result results/$(REFERENCE_WORKLOAD)/latest.json
 
 bench-sift1m-workload: lib
 	$(MAKE) bench-reference-workload REFERENCE_WORKLOAD=sift1m

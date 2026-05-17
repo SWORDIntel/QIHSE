@@ -16,7 +16,8 @@ After `make sample-vxug-pdf-workload` generates the local VXUG PDF sample,
 QIHSE and compares exact float32, scalar `qtri`, and `qmag` against the sample
 ground truth. The runner reports recall@10, latency, selected candidate counts,
 and mismatch counts, and writes generated JSON under `results/`. Result files
-should remain outside git; only repeatable summaries belong in docs.
+should remain outside git; only repeatable summaries belong in docs. The
+summary gate reads generated JSON and applies the manifest recall floor.
 
 The next larger calibration target is a SIFT-style workload using `fvecs`
 base/query vectors and `ivecs` ground truth. Do not change trinary default

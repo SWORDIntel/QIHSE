@@ -57,7 +57,8 @@ Execution plan:
    mismatches.
 3. Store benchmark outputs under `results/` as generated artifacts outside git
    by default. Only promote summarized results into docs after the runner is
-   repeatable.
+   repeatable. `qihse_reference_result_summary.py` reads those generated JSON
+   files and applies the manifest recall floor for each mode.
 4. Add one larger SIFT-style workload with `fvecs` base/query vectors and
    `ivecs` ground truth. Use it as the first dataset large enough to justify
    any candidate-pool default change.
