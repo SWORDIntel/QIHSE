@@ -100,8 +100,10 @@ static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_checkpoint_publishes_snapshot_and_clears_wal(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
+static bool test_corrupt_metadata_qmeta_rejected(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
+static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
 static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
@@ -151,10 +153,14 @@ int main(void) {
          test_read_only_mmap_reopen_searches},
         {"corrupt vectors.qvec magic fails open cleanly",
          test_corrupt_vectors_qvec_magic_rejected},
+        {"corrupt metadata.qmeta fails open cleanly",
+         test_corrupt_metadata_qmeta_rejected},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
         {"truncated manifest fails open cleanly",
          test_truncated_manifest_rejected},
+        {"stale MANIFEST.tmp is ignored after checkpoint",
+         test_stale_manifest_tmp_ignored_after_checkpoint},
         {"manifest rejects impossible qmag metadata",
          test_manifest_rejects_impossible_qmag_shape},
         {"read-only open can search but rejects add_vectors",
@@ -1093,6 +1099,40 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void) {
     return true;
 }
 
+static bool test_corrupt_metadata_qmeta_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("corrupt_qmeta");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.25f, 0.50f, 0.75f};
+    const char metadata[] = "authoritative-metadata";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9005, metadata, sizeof(metadata)),
+                "insert before corrupting metadata should succeed");
+    TEST_ASSERT(close_db(db), "database should close before metadata corruption");
+
+    TEST_ASSERT(corrupt_file_byte(path, "metadata.qmeta", 0, (uint8_t)'X'),
+                "test should corrupt metadata.qmeta payload");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "corrupt metadata.qmeta payload should fail open");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_truncated_index_qidx_rejected(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
@@ -1151,6 +1191,66 @@ static bool test_truncated_manifest_rejected(void) {
     );
     TEST_ASSERT(db == NULL, "truncated manifest should fail open");
 
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("stale_manifest_tmp");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vector[] = {0.40f, 0.30f, 0.20f, 0.10f};
+    const char metadata[] = "manifest-tmp-ignored";
+    const uint8_t stale_manifest[] = {
+        'Q', 'I', 'H', 'S', 'E', 'M', 'A', 'N',
+        0xff, 0xff, 0xff, 0xff, 0xde, 0xad, 0xbe, 0xef
+    };
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9006, metadata, sizeof(metadata)),
+                "insert before checkpoint should succeed");
+    TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish valid manifest");
+    TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
+
+    TEST_ASSERT(write_file_payload(path, "MANIFEST.tmp", stale_manifest, sizeof(stale_manifest)),
+                "test should write interrupted manifest publication tmp file");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "stale MANIFEST.tmp should not block read-only reopen");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after stale manifest tmp reopen");
+    TEST_ASSERT(stats.index_rows == 1u, "stale manifest tmp should not change index rows");
+    TEST_ASSERT(stats.live_vectors == 1u, "stale manifest tmp should not change live rows");
+    TEST_ASSERT(stats.wal_records_replayed == 0u,
+                "stale manifest tmp should not force WAL replay");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vector, ARRAY_LEN(vector), true, true, &result);
+    TEST_ASSERT(count == 1, "checkpointed row should search despite stale manifest tmp");
+    TEST_ASSERT(result.id == 9006, "checkpointed row id should survive stale manifest tmp");
+    TEST_ASSERT(vector_eq(result.vector, vector, ARRAY_LEN(vector)),
+                "checkpointed vector should survive stale manifest tmp");
+    TEST_ASSERT(result.metadata_size == sizeof(metadata),
+                "checkpointed metadata size should survive stale manifest tmp");
+    TEST_ASSERT(memcmp(result.metadata, metadata, sizeof(metadata)) == 0,
+                "checkpointed metadata should survive stale manifest tmp");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only stale manifest tmp database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

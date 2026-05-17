@@ -42,6 +42,9 @@ exact float32 reranking.
 - Checkpoint boundary coverage now verifies that a published snapshot clears
   dirty state, truncates `wal.qwal`, and reopens read-only without replaying old
   WAL records.
+- Crash-recovery coverage now includes ignored interrupted `MANIFEST.tmp`
+  publication after checkpoint and metadata payload corruption rejection through
+  manifest CRC validation.
 - Native integration cleanup is tracked in
   `qihse/planning/native_integration_cleanup.md`.
 - Historical `SWORDIntel_QIHSE/plans/` material has been summarized into
@@ -135,6 +138,10 @@ Latest focused result after runtime canonicalization/index cleanup slice:
 `make test-persist`, Python compilation for touched runtime/test files, the
 launcher research-budget unit test, and QIHSE resolver smoke check passed.
 
+Latest focused result after QIHSE-only recovery fixture slice:
+`make test-persist` passed with new `metadata.qmeta` corruption rejection and
+stale `MANIFEST.tmp` recovery fixtures.
+
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
 `magnitude_skew` and `near_tie`. Those hard datasets are useful because they
@@ -169,8 +176,8 @@ weighted prototype qtri selectors.
 ## Next Slice
 
 1. Continue file persistence breadth with crash-recovery fixtures that simulate
-   interrupted manifest publication and authoritative-file corruption after a
-   valid snapshot exists.
+   interrupted multi-file publication windows and additional authoritative-file
+   corruption after a valid snapshot exists.
 2. Keep QIHSE docs/tests/config pointed at active `qihse/`; treat remaining
    stale-root mentions as planning provenance only.
 3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
