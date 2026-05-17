@@ -4,6 +4,11 @@ Date: 2026-05-17
 Branch: `master`
 Scope: planning and repository metadata inspection only; no production C or test edits.
 
+Status note: QIHSE source canonicalization points active development and runtime
+documentation at the top-level `qihse/` tree. Mentions of `native/qihse/` and
+`SWORDIntel_QIHSE/qihse/` below are intentionally historical, provenance, or
+transition-fallback references unless explicitly called out as remaining work.
+
 ## Integration Direction
 
 QIHSE is a native engine that lives inside this repository as source code, not a
@@ -197,9 +202,8 @@ Date: 2026-05-17
 
 FRAMEWERX runtime QIHSE loading now resolves the active top-level
 `qihse/libqihse.so` first through `src/framewerx/state/qihse_paths.py`.
-The legacy `native/qihse/libqihse.so` location remains a fallback during the
-transition so existing local builds are not stranded before stale mirror
-deletion.
+The legacy `native/qihse/libqihse.so` path is no longer a runtime fallback. It
+is not an active source root or a build input for new docs/tests/config.
 
 Updated runtime/config/test surfaces include:
 
@@ -227,17 +231,52 @@ ignore rules:
 - `qihse/tests/qihse_vector_db_persistence_test` when built by
   `make test-persist`
 
+## Docs/Tests/Config Stale-Root Follow-Through
+
+Date: 2026-05-17
+
+Searched the allowed docs/config/test surfaces for stale QIHSE roots after
+canonicalization: root guidance (`AGENTS.md`, `GEMINI.md`, `README.md`),
+QIHSE README/docs, `docs/`, `scripts/`, tracked `tests/`, `qihse/planning/`,
+and autoresearch documentation excluding generated reports.
+
+No active stale references remain in tracked tests, root docs, QIHSE docs, or
+autoresearch docs. The only remaining allowed-scope hits are in this planning
+file and `qihse/planning/file_persistence_checkpoint.md`, where they are
+intentional historical/provenance notes.
+
+A generated autoresearch report,
+`redteam/autoresearch/reports/TIER2_SELF_IMPROVEMENT_LATEST.json`, still quotes
+an older `search_backend.py` docstring containing `$BUGBOUNTY_ROOT/../QIHSE/...`
+paths. The source docstring has already been canonicalized to `qihse/` and
+`native/not_stisla/`, so the report is preserved as generated historical output.
+
+## Stale Mirror Root Removal
+
+Date: 2026-05-17
+
+Removed the stale QIHSE mirror roots from Git and the working tree:
+
+- `SWORDIntel_QIHSE/qihse/`
+- `native/qihse/`
+
+Pre-removal reference audit:
+
+- `rg` found no active FRAMEWERX runtime or test references to
+  `SWORDIntel_QIHSE/qihse` or `native/qihse` under `src/`, `tests/`,
+  `fw_launcher.py`, `autoresearch.sh`, or active `qihse/` files outside
+  planning notes.
+- The only non-planning sibling-script hit was
+  `SWORDIntel_QIHSE/scripts/verify_fallback.sh`, which uses a relative
+  `qihse/` path inside the stale `SWORDIntel_QIHSE` area. It was left untouched
+  because this cleanup was deletion-only for the mirror roots.
+- Top-level `qihse/` and `native/not_stisla/` were left untouched.
+
 ## Recommended Next Sequence
 
-1. Metadata-only pass: add `.gitignore` coverage for native generated outputs
-   and list currently tracked generated artifacts for removal in a later commit.
-2. Documentation pass: fold still-current `SWORDIntel_QIHSE/plans/` content
-   into `qihse/planning/` and retire the old absolute-path assumptions.
-3. Reference audit: search build scripts, Python adapters, and docs for
-   `SWORDIntel_QIHSE`, `native/qihse`, and direct `not_stisla` usage.
-4. Source-root cleanup: remove or quarantine stale QIHSE mirror trees only after
-   the reference audit is clean.
-5. NOT_STISLA cleanup: keep integrated anchor-search code under QIHSE, preserve
+1. Keep generated report snapshots as provenance unless regenerating the
+   autoresearch report set is part of a dedicated reporting pass.
+2. NOT_STISLA cleanup: keep integrated anchor-search code under QIHSE, preserve
    provenance notes, and remove independent subsystem expectations from QIHSE
    docs and build instructions.
 

@@ -50,9 +50,13 @@ exact float32 reranking.
 - Root `.gitignore` now covers generated QIHSE/native test executables and
   precompiled headers going forward. Previously tracked generated native
   artifacts have been removed from Git tracking with an index-only cleanup.
-- FRAMEWERX runtime loaders now resolve the active `qihse/libqihse.so` first,
-  with `native/qihse/libqihse.so` retained only as a fallback while stale
-  mirror deletion is staged.
+- FRAMEWERX runtime loaders now resolve the active `qihse/libqihse.so` without
+  a stale `native/qihse` fallback.
+- Docs/tests/config stale-root follow-through found no active tracked test or
+  docs references to the stale QIHSE roots outside intentional planning
+  provenance and transitional fallback notes.
+- The stale QIHSE mirror roots `native/qihse/` and `SWORDIntel_QIHSE/qihse/`
+  have been removed; active source remains top-level `qihse/`.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -167,9 +171,8 @@ weighted prototype qtri selectors.
 1. Continue file persistence breadth with crash-recovery fixtures that simulate
    interrupted manifest publication and authoritative-file corruption after a
    valid snapshot exists.
-2. Continue stale-root path cleanup in tests and docs, then delete or quarantine
-   `native/qihse/` and `SWORDIntel_QIHSE/qihse/` only after no active runtime or
-   test path depends on them.
+2. Keep QIHSE docs/tests/config pointed at active `qihse/`; treat remaining
+   stale-root mentions as planning provenance only.
 3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
    FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
    through `src/framewerx/evaluation/search_backend.py`.
