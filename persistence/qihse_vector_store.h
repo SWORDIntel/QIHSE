@@ -24,6 +24,8 @@ extern "C" {
 
 #define QIHSE_VSTORE_TRI_PRESENT 0x00000001u
 #define QIHSE_VSTORE_TRI_VALID   0x00000002u
+#define QIHSE_VSTORE_MAG_PRESENT 0x00000001u
+#define QIHSE_VSTORE_MAG_VALID   0x00000002u
 
 typedef struct qihse_index_row_s {
     uint64_t vector_id;
@@ -58,6 +60,11 @@ typedef struct qihse_vector_store_manifest_s {
     uint64_t trinary_rows;
     uint64_t trinary_crc64;
     uint32_t trinary_flags;
+    uint64_t magnitude_generation;
+    uint64_t magnitude_row_bytes;
+    uint64_t magnitude_rows;
+    uint64_t magnitude_crc64;
+    uint32_t magnitude_flags;
 } qihse_vector_store_manifest_t;
 
 typedef struct qihse_vector_store_snapshot_s {
@@ -72,8 +79,11 @@ typedef struct qihse_vector_store_snapshot_s {
     size_t idmap_count;
     uint8_t* trinary;
     size_t trinary_bytes;
+    uint8_t* magnitude;
+    size_t magnitude_bytes;
     bool idmap_valid;
     bool trinary_valid;
+    bool magnitude_valid;
 } qihse_vector_store_snapshot_t;
 
 typedef struct qihse_vector_store_flush_s {
@@ -92,6 +102,11 @@ typedef struct qihse_vector_store_flush_s {
     uint64_t trinary_generation;
     uint64_t trinary_row_bytes;
     uint32_t trinary_flags;
+    const void* magnitude;
+    size_t magnitude_bytes;
+    uint64_t magnitude_generation;
+    uint64_t magnitude_row_bytes;
+    uint32_t magnitude_flags;
 } qihse_vector_store_flush_t;
 
 bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t* out);
@@ -103,6 +118,7 @@ bool qihse_vector_store_build_idmap(const qihse_index_row_t* rows,
                                     qihse_idmap_entry_t** out_entries,
                                     size_t* out_count);
 bool qihse_vector_store_validate_trinary(const void* data, size_t size);
+bool qihse_vector_store_validate_magnitude(const void* data, size_t size);
 
 #ifdef __cplusplus
 } /* extern "C" */

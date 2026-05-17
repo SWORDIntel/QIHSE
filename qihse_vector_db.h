@@ -81,6 +81,22 @@ typedef enum qihse_vector_db_trinary_status_e {
 } qihse_vector_db_trinary_status_t;
 
 /**
+ * Status of the optional vectors.qmag magnitude sidecar.
+ */
+typedef enum qihse_vector_db_magnitude_status_e {
+    QIHSE_VDB_MAGNITUDE_ABSENT = 0,
+    QIHSE_VDB_MAGNITUDE_VALID = 1,
+    QIHSE_VDB_MAGNITUDE_STALE = 2,
+    QIHSE_VDB_MAGNITUDE_CORRUPT = 3
+} qihse_vector_db_magnitude_status_t;
+
+typedef enum qihse_vector_db_query_mode_e {
+    QIHSE_VDB_QUERY_FLOAT32 = 0,
+    QIHSE_VDB_QUERY_TRINARY_SCALAR = 1,
+    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2
+} qihse_vector_db_query_mode_t;
+
+/**
  * Native file-backed persistence diagnostics.
  */
 typedef struct qihse_vector_db_persistence_stats_s {
@@ -104,6 +120,9 @@ typedef struct qihse_vector_db_persistence_stats_s {
     qihse_vector_db_trinary_status_t trinary_status;
     uint64_t trinary_row_bytes;
     uint64_t trinary_rows;
+    qihse_vector_db_magnitude_status_t magnitude_status;
+    uint64_t magnitude_row_bytes;
+    uint64_t magnitude_rows;
 } qihse_vector_db_persistence_stats_t;
 
 /**
@@ -130,6 +149,8 @@ typedef struct qihse_vector_query_s {
     bool include_metadata;          /* Include metadata in results */
     bool use_trinary_candidates;    /* Explicit opt-in trinary candidate path */
     size_t candidate_count;         /* Trinary candidate count before rerank */
+    qihse_vector_db_query_mode_t query_mode;
+    size_t candidate_pool_size;
 } qihse_vector_query_t;
 
 /**

@@ -18,6 +18,7 @@
 #define QIHSE_LOCK_NAME "LOCK"
 #define QIHSE_VECTOR_NAME "vectors.qvec"
 #define QIHSE_TRINARY_NAME "vectors.qtri"
+#define QIHSE_MAGNITUDE_NAME "vectors.qmag"
 #define QIHSE_METADATA_NAME "metadata.qmeta"
 #define QIHSE_INDEX_NAME "index.qidx"
 #define QIHSE_IDMAP_NAME "idmap.qid"
@@ -28,7 +29,8 @@
 #define QIHSE_INDEX_MAGIC "QIHSEQIX"
 #define QIHSE_IDMAP_MAGIC "QIHSEQID"
 
-#define QIHSE_MANIFEST_SIZE 128u
+#define QIHSE_MANIFEST_V1_SIZE 128u
+#define QIHSE_MANIFEST_SIZE 192u
 #define QIHSE_FILE_HEADER_SIZE 32u
 #define QIHSE_FORMAT_VERSION 1u
 #define QIHSE_INDEX_ROW_DISK_SIZE 48u
@@ -203,11 +205,19 @@ static void qihse_encode_manifest(uint8_t out[QIHSE_MANIFEST_SIZE],
     qihse_le_write_u64(out + 104u, m->trinary_rows);
     qihse_le_write_u64(out + 112u, m->trinary_crc64);
     qihse_le_write_u32(out + 120u, m->trinary_flags);
+    qihse_le_write_u64(out + 128u, m->magnitude_generation);
+    qihse_le_write_u64(out + 136u, m->magnitude_row_bytes);
+    qihse_le_write_u64(out + 144u, m->magnitude_rows);
+    qihse_le_write_u64(out + 152u, m->magnitude_crc64);
+    qihse_le_write_u32(out + 160u, m->magnitude_flags);
 }
 
-static bool qihse_decode_manifest(const uint8_t in[QIHSE_MANIFEST_SIZE],
+static bool qihse_decode_manifest(const uint8_t* in,
+                                  size_t size,
                                   qihse_vector_store_manifest_t* m) {
-    if (!m || memcmp(in, QIHSE_MANIFEST_MAGIC, 8u) != 0) {
+    if (!in || !m ||
+        (size != QIHSE_MANIFEST_V1_SIZE && size != QIHSE_MANIFEST_SIZE) ||
+        memcmp(in, QIHSE_MANIFEST_MAGIC, 8u) != 0) {
         errno = EINVAL;
         return false;
     }
@@ -230,6 +240,13 @@ static bool qihse_decode_manifest(const uint8_t in[QIHSE_MANIFEST_SIZE],
     m->trinary_rows = qihse_le_read_u64(in + 104u);
     m->trinary_crc64 = qihse_le_read_u64(in + 112u);
     m->trinary_flags = qihse_le_read_u32(in + 120u);
+    if (size >= QIHSE_MANIFEST_SIZE) {
+        m->magnitude_generation = qihse_le_read_u64(in + 128u);
+        m->magnitude_row_bytes = qihse_le_read_u64(in + 136u);
+        m->magnitude_rows = qihse_le_read_u64(in + 144u);
+        m->magnitude_crc64 = qihse_le_read_u64(in + 152u);
+        m->magnitude_flags = qihse_le_read_u32(in + 160u);
+    }
 
     if (m->format_version != QIHSE_FORMAT_VERSION ||
         m->encoding_id != QIHSE_VSTORE_ENCODING_FLOAT32 ||
@@ -365,13 +382,13 @@ static bool qihse_load_manifest(const char* db_path, qihse_vector_store_manifest
     if (!qihse_read_file_alloc(path, &data, &size)) {
         return false;
     }
-    if (size != QIHSE_MANIFEST_SIZE) {
+    if (size != QIHSE_MANIFEST_V1_SIZE && size != QIHSE_MANIFEST_SIZE) {
         free(data);
         errno = EINVAL;
         return false;
     }
 
-    ok = qihse_decode_manifest(data, out);
+    ok = qihse_decode_manifest(data, size, out);
     free(data);
     return ok;
 }
@@ -553,6 +570,43 @@ static bool qihse_load_trinary_optional(const char* db_path,
     return true;
 }
 
+static bool qihse_load_magnitude_optional(const char* db_path,
+                                          const qihse_vector_store_manifest_t* manifest,
+                                          uint8_t** out,
+                                          size_t* out_size) {
+    char path[PATH_MAX];
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    uint64_t expected_size64;
+
+    *out = NULL;
+    *out_size = 0u;
+    if ((manifest->magnitude_flags & QIHSE_VSTORE_MAG_PRESENT) == 0u) {
+        return false;
+    }
+    if (!qihse_checked_mul_u64(manifest->magnitude_rows,
+                               manifest->magnitude_row_bytes,
+                               &expected_size64)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    if (!qihse_store_path(path, db_path, QIHSE_MAGNITUDE_NAME) ||
+        !qihse_read_file_alloc(path, &data, &size)) {
+        return false;
+    }
+    if ((uint64_t)size != expected_size64 ||
+        qihse_fnv1a64(data, size) != manifest->magnitude_crc64 ||
+        !qihse_vector_store_validate_magnitude(data, size)) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+
+    *out = data;
+    *out_size = size;
+    return true;
+}
+
 static int qihse_idmap_compare(const void* a, const void* b) {
     const qihse_idmap_entry_t* ea = (const qihse_idmap_entry_t*)a;
     const qihse_idmap_entry_t* eb = (const qihse_idmap_entry_t*)b;
@@ -588,6 +642,14 @@ bool qihse_vector_store_validate_trinary(const void* data, size_t size) {
             errno = EINVAL;
             return false;
         }
+    }
+    return true;
+}
+
+bool qihse_vector_store_validate_magnitude(const void* data, size_t size) {
+    if (!data && size != 0u) {
+        errno = EINVAL;
+        return false;
     }
     return true;
 }
@@ -680,6 +742,18 @@ bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t*
         snapshot.manifest.trinary_flags &= ~QIHSE_VSTORE_TRI_VALID;
     }
 
+    if (qihse_load_magnitude_optional(db_path, &snapshot.manifest,
+                                      &snapshot.magnitude, &snapshot.magnitude_bytes)) {
+        snapshot.magnitude_valid = true;
+        snapshot.manifest.magnitude_flags |= QIHSE_VSTORE_MAG_VALID;
+    } else {
+        snapshot.magnitude_valid = false;
+        free(snapshot.magnitude);
+        snapshot.magnitude = NULL;
+        snapshot.magnitude_bytes = 0u;
+        snapshot.manifest.magnitude_flags &= ~QIHSE_VSTORE_MAG_VALID;
+    }
+
     *out = snapshot;
     return true;
 }
@@ -705,7 +779,8 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         (!in->vectors && in->vector_bytes != 0u) ||
         (!in->metadata && in->metadata_bytes != 0u) ||
         (!in->idmap && in->idmap_count != 0u) ||
-        (!in->trinary && in->trinary_bytes != 0u)) {
+        (!in->trinary && in->trinary_bytes != 0u) ||
+        (!in->magnitude && in->magnitude_bytes != 0u)) {
         errno = EINVAL;
         return false;
     }
@@ -717,6 +792,19 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         if (!qihse_checked_mul_u64(in->trinary_row_bytes, (uint64_t)in->row_count,
                                    &expected_trinary_size) ||
             expected_trinary_size != (uint64_t)in->trinary_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    if (in->magnitude_bytes != 0u &&
+        !qihse_vector_store_validate_magnitude(in->magnitude, in->magnitude_bytes)) {
+        return false;
+    }
+    if (in->magnitude_bytes != 0u) {
+        uint64_t expected_magnitude_size;
+        if (!qihse_checked_mul_u64(in->magnitude_row_bytes, (uint64_t)in->row_count,
+                                   &expected_magnitude_size) ||
+            expected_magnitude_size != (uint64_t)in->magnitude_bytes) {
             errno = EINVAL;
             return false;
         }
@@ -763,6 +851,14 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         manifest.trinary_crc64 = qihse_fnv1a64(in->trinary, in->trinary_bytes);
         manifest.trinary_flags = in->trinary_flags | QIHSE_VSTORE_TRI_PRESENT | QIHSE_VSTORE_TRI_VALID;
     }
+    if (in->magnitude_bytes != 0u) {
+        manifest.magnitude_generation = in->magnitude_generation;
+        manifest.magnitude_row_bytes = in->magnitude_row_bytes;
+        manifest.magnitude_rows = (uint64_t)in->row_count;
+        manifest.magnitude_crc64 = qihse_fnv1a64(in->magnitude, in->magnitude_bytes);
+        manifest.magnitude_flags =
+            in->magnitude_flags | QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID;
+    }
     qihse_encode_manifest(manifest_data, &manifest);
 
     if (!qihse_write_file_atomic(db_path, QIHSE_VECTOR_NAME, in->vectors, in->vector_bytes) ||
@@ -773,6 +869,11 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
     }
     if (in->trinary_bytes != 0u &&
         !qihse_write_file_atomic(db_path, QIHSE_TRINARY_NAME, in->trinary, in->trinary_bytes)) {
+        goto done;
+    }
+    if (in->magnitude_bytes != 0u &&
+        !qihse_write_file_atomic(db_path, QIHSE_MAGNITUDE_NAME,
+                                 in->magnitude, in->magnitude_bytes)) {
         goto done;
     }
     if (!qihse_write_file_atomic(db_path, QIHSE_MANIFEST_NAME, manifest_data, sizeof(manifest_data))) {
@@ -800,5 +901,6 @@ void qihse_vector_store_snapshot_free(qihse_vector_store_snapshot_t* snapshot) {
     free(snapshot->metadata);
     free(snapshot->idmap);
     free(snapshot->trinary);
+    free(snapshot->magnitude);
     memset(snapshot, 0, sizeof(*snapshot));
 }

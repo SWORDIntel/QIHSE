@@ -108,6 +108,8 @@ static bool test_trinary_candidate_search_matches_float32_top_ids(void);
 static bool test_default_search_ignores_missing_or_corrupt_qtri(void);
 static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void);
 static bool test_trinary_candidate_search_validates_counts(void);
+static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void);
+static bool test_default_search_ignores_missing_or_corrupt_qmag(void);
 static bool test_delete_by_id_persists_across_reopen(void);
 static bool test_update_by_id_replaces_vector_and_metadata(void);
 static bool test_upsert_by_ids_reports_insert_and_update_counts(void);
@@ -160,6 +162,10 @@ int main(void) {
          test_trinary_candidate_search_rejects_missing_or_corrupt_qtri},
         {"PR-5 qtri candidate search validates candidate_count/top_k",
          test_trinary_candidate_search_validates_counts},
+        {"PR-6 qmag sidecar persists and magnitude query matches FLOAT32",
+         test_qmag_sidecar_persists_and_magnitude_query_matches_float32},
+        {"PR-6 default search ignores missing/corrupt qmag",
+         test_default_search_ignores_missing_or_corrupt_qmag},
         {"delete_by_id persists across reopen",
          test_delete_by_id_persists_across_reopen},
         {"update_by_id replaces vector and metadata",
@@ -1282,6 +1288,27 @@ static int search_many_qtri(qihse_vector_db_t vdb,
     return qihse_vector_db_search(vdb, &query, results, max_results);
 }
 
+static int search_many_qmag(qihse_vector_db_t vdb,
+                            const float* query_vector,
+                            size_t dims,
+                            size_t top_k,
+                            size_t candidate_count,
+                            qihse_vector_result_t* results,
+                            size_t max_results) {
+    qihse_vector_query_t query = {
+        .query_vector = query_vector,
+        .vector_dims = dims,
+        .top_k = top_k,
+        .similarity_threshold = -1.0f,
+        .include_vectors = false,
+        .include_metadata = false,
+        .query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
+        .candidate_pool_size = candidate_count,
+    };
+
+    return qihse_vector_db_search(vdb, &query, results, max_results);
+}
+
 static bool create_sign_friendly_qtri_db(test_env_t* env, char** out_path) {
     const float vectors[][6] = {
         { 3.0f,  2.0f,  1.0f, -1.0f, -2.0f, -3.0f},
@@ -1489,6 +1516,131 @@ static bool test_trinary_candidate_search_validates_counts(void) {
     env_destroy(&env);
     return true;
 }
+
+static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "qmag fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "qmag fixture should reopen read-only");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available for qmag fixture");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "qmag fixture should also have a valid qtri sidecar");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
+                "qmag fixture should have a valid magnitude sidecar");
+    TEST_ASSERT(stats.magnitude_row_bytes == 6u,
+                "six-dimensional qmag rows should use six bytes");
+    TEST_ASSERT(stats.magnitude_rows == 5u,
+                "qmag should contain all physical rows");
+
+    off_t qmag_size = 0;
+    TEST_ASSERT(file_size_of(path, "vectors.qmag", &qmag_size),
+                "vectors.qmag size should be readable");
+    TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
+                "vectors.qmag size should match raw magnitude rows");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t float32_results[3];
+    qihse_vector_result_t qmag_results[3];
+    memset(float32_results, 0, sizeof(float32_results));
+    memset(qmag_results, 0, sizeof(qmag_results));
+
+    int float32_count = search_many(db, query, ARRAY_LEN(query), 3u,
+                                    float32_results, ARRAY_LEN(float32_results));
+    int qmag_count = search_many_qmag(db, query, ARRAY_LEN(query), 3u, 5u,
+                                      qmag_results, ARRAY_LEN(qmag_results));
+    TEST_ASSERT(float32_count == 3, "FLOAT32 search should return top 3 for qmag fixture");
+    TEST_ASSERT(qmag_count == 3, "qmag candidate search should return top 3");
+    for (size_t i = 0; i < ARRAY_LEN(float32_results); i++) {
+        TEST_ASSERT(qmag_results[i].id == float32_results[i].id,
+                    "qmag candidate search should preserve FLOAT32 top ID order");
+    }
+
+    free_results(float32_results, ARRAY_LEN(float32_results));
+    free_results(qmag_results, ARRAY_LEN(qmag_results));
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only qmag fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = NULL;
+    TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
+                "default-search qmag fixture should be created");
+
+    char qmag_path[512];
+    snprintf(qmag_path, sizeof(qmag_path), "%s/vectors.qmag", path);
+    TEST_ASSERT(unlink(qmag_path) == 0, "test should remove vectors.qmag");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "missing qmag should not block default open");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available for missing qmag");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_ABSENT,
+                "missing qmag should be reported absent");
+
+    const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
+    qihse_vector_result_t result;
+    int count = search_many(db, query, ARRAY_LEN(query), 1u, &result, 1u);
+    TEST_ASSERT(count == 1, "default FLOAT32 search should work with missing qmag");
+    TEST_ASSERT(result.id == 9101, "default FLOAT32 search should return expected ID");
+    free_results(&result, 1u);
+    count = search_many_qmag(db, query, ARRAY_LEN(query), 1u, 5u, &result, 1u);
+    TEST_ASSERT(count < 0, "opt-in qmag search should reject missing qmag");
+    TEST_ASSERT(qihse_vector_db_close(db), "missing-qmag database should close");
+
+    const uint8_t corrupt_qmag[] = {0xff, 0x00};
+    TEST_ASSERT(write_file_payload(path, "vectors.qmag", corrupt_qmag, sizeof(corrupt_qmag)),
+                "test should write corrupt qmag sidecar");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "corrupt qmag should not block default open");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available for corrupt qmag");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_CORRUPT,
+                "corrupt qmag should be reported corrupt");
+    count = search_many(db, query, ARRAY_LEN(query), 1u, &result, 1u);
+    TEST_ASSERT(count == 1, "default FLOAT32 search should work with corrupt qmag");
+    TEST_ASSERT(result.id == 9101, "default FLOAT32 search should ignore corrupt qmag");
+    free_results(&result, 1u);
+    count = search_many_qmag(db, query, ARRAY_LEN(query), 1u, 5u, &result, 1u);
+    TEST_ASSERT(count < 0, "opt-in qmag search should reject corrupt qmag");
+
+    TEST_ASSERT(qihse_vector_db_close(db), "corrupt-qmag database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
 #else
 static bool pr5_trinary_search_api_unavailable(const char* test_name) {
     printf("SKIP %s: QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API is not available in this branch\n",
@@ -1510,6 +1662,14 @@ static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void) 
 
 static bool test_trinary_candidate_search_validates_counts(void) {
     return pr5_trinary_search_api_unavailable("candidate_count/top_k validation");
+}
+
+static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void) {
+    return pr5_trinary_search_api_unavailable("qmag persistence and candidate search parity");
+}
+
+static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
+    return pr5_trinary_search_api_unavailable("default search missing/corrupt qmag tolerance");
 }
 #endif
 

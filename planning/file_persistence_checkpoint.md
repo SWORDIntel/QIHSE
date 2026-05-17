@@ -13,7 +13,8 @@ sidecars.
 
 The trinary path remains active. It is not replacing authoritative float32
 storage yet; it is currently an opt-in candidate generator backed by
-`vectors.qtri`, followed by exact float32 reranking.
+`vectors.qtri` and, for the magnitude-aware path, `vectors.qmag`, followed by
+exact float32 reranking.
 
 ## Completed Persistence Work
 
@@ -24,6 +25,10 @@ storage yet; it is currently an opt-in candidate generator backed by
   and rebuilds derived sidecars.
 - `vectors.qtri` is generated as a derived trinary sidecar and stale/corrupt
   sidecars are detected without breaking default float32 search.
+- `vectors.qmag` is generated as a derived row-magnitude sidecar and is tracked
+  independently from `vectors.qtri` in manifest stats/status.
+- Default float32 search tolerates missing/corrupt qmag; the explicit
+  magnitude-backed trinary query mode fails clearly when qmag is unavailable.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -33,6 +38,8 @@ storage yet; it is currently an opt-in candidate generator backed by
 - `qihse_vector_query_t` now has:
   - `use_trinary_candidates`
   - `candidate_count`
+  - `query_mode`
+  - `candidate_pool_size`
 - Default `qihse_vector_db_search(...)` remains float32 unless the query opts
   into trinary candidates.
 - The trinary path requires a valid `vectors.qtri`, selects tryte candidates,
@@ -42,6 +49,19 @@ storage yet; it is currently an opt-in candidate generator backed by
 - Deterministic benchmark datasets now include aligned cases where trinary
   candidate search works well and adversarial cases where sign-only trinary
   loses recall/order to float32 magnitude detail.
+
+## Current PR-6 Magnitude Slice
+
+- `vectors.qmag` is persisted as one unsigned magnitude bucket byte per
+  vector dimension.
+- Manifest format v2 stores qmag generation, row bytes, row count, CRC, and
+  flags while still accepting the older manifest without qmag fields.
+- Flush, close, compact, truncate, load, stats, and destroy paths now carry the
+  qmag cache/sidecar lifecycle.
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` selects candidates with
+  `query_sign * row_sign * query_weight * row_bucket`, then reranks the chosen
+  candidates with authoritative float32 cosine similarity.
+- The legacy `use_trinary_candidates` scalar path remains backward-compatible.
 
 ## Verification Snapshot
 
@@ -58,7 +78,8 @@ make bench-trinary-weighted-sweep
 make bench-trinary-magnitude-sweep
 ```
 
-Latest local result: all targets passed.
+Latest local result in this slice: all listed targets passed after the qmag
+integration.
 
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
@@ -85,23 +106,21 @@ have different row-side magnitudes. The next trinary improvement should add a
 row-side magnitude signal, such as magnitude buckets, ternary-plus-scale rows,
 or learned per-row/per-dimension weights.
 
-`bench-trinary-magnitude-sweep` prototypes that row-side signal without changing
-the persisted store yet. It derives unsigned row magnitude buckets plus
-predecoded signed trits from the loaded snapshot, then scores candidates as
-`query_sign * row_sign * query_weight * row_bucket`. That proved the trinary
-direction: `magnitude_skew` and `near_tie` reached full recall/order at
-`top_k` candidates and beat float32 in the local benchmark. This should become
-a real file-backed derived sidecar after the prototype is hardened.
+`bench-trinary-magnitude-sweep` originally prototyped that row-side signal
+without changing the persisted store. The same scoring idea now has a real
+file-backed sidecar via `vectors.qmag`; the benchmark should be updated next so
+it can compare the persisted query mode directly.
 
 ## Next Slice
 
-1. Make the opt-in trinary search path easier to use from native callers:
-   document the API contract, expected `candidate_count`, and failure modes.
-2. Use the candidate-count sweep to pick sane default candidate ratios per
+1. Update the benchmark harness to exercise
+   `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` against persisted qmag instead of only
+   the in-process prototype.
+2. Make the opt-in trinary search path easier to use from native callers:
+   document the API contract, default candidate-pool behavior, and failure
+   modes.
+3. Use the candidate-count sweep to pick sane default candidate ratios per
    dataset shape instead of a single fixed value.
-3. Promote the magnitude prototype into a persisted derived sidecar:
-   compact row magnitude buckets plus predecoded signed trits, with manifest
-   validation and rebuild behavior matching `vectors.qtri`.
 4. Continue file persistence breadth:
    manifest publication hardening, more crash-recovery fixtures, and cleanup of
    legacy subsystem-shaped layout as QIHSE becomes a naturally integrated native
