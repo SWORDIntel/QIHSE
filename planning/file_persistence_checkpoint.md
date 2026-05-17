@@ -48,8 +48,11 @@ exact float32 reranking.
   `qihse/planning/persistence_plan_migration.md`; the active checkpoint remains
   this file.
 - Root `.gitignore` now covers generated QIHSE/native test executables and
-  precompiled headers going forward. Already tracked generated artifacts still
-  need an index-only cleanup pass.
+  precompiled headers going forward. Previously tracked generated native
+  artifacts have been removed from Git tracking with an index-only cleanup.
+- FRAMEWERX runtime loaders now resolve the active `qihse/libqihse.so` first,
+  with `native/qihse/libqihse.so` retained only as a fallback while stale
+  mirror deletion is staged.
 - QIHSE has been merged back to FRAMEWERX `master` and pushed through GitLab.
 
 ## Current PR-5 Trinary Slice
@@ -124,6 +127,10 @@ Latest focused result after candidate-policy/manifest-hardening slice:
 Latest focused result after checkpoint/metadata cleanup slice:
 `make test-persist` passed with the new checkpoint publication fixture.
 
+Latest focused result after runtime canonicalization/index cleanup slice:
+`make test-persist`, Python compilation for touched runtime/test files, the
+launcher research-budget unit test, and QIHSE resolver smoke check passed.
+
 The search-path benchmark currently reports perfect recall/order on `aligned`,
 `banded`, and `weighted`, and intentionally reports poor recall/order on
 `magnitude_skew` and `near_tie`. Those hard datasets are useful because they
@@ -160,17 +167,11 @@ weighted prototype qtri selectors.
 1. Continue file persistence breadth with crash-recovery fixtures that simulate
    interrupted manifest publication and authoritative-file corruption after a
    valid snapshot exists.
-2. Canonicalize runtime QIHSE loading onto the active `qihse/` root. Current
-   blockers for deleting `native/qihse/` include `fw_launcher.py`,
-   `src/framewerx/api/server.py`, `src/framewerx/state/qihse_wrapper.py`,
-   `src/framewerx/state/db.py`, `src/framewerx/workers/embedding_worker.py`,
-   `src/framewerx/hardware/discovery.py`, and
-   `src/framewerx/artifacts/hashing.py`.
-3. Do an index-only cleanup for tracked generated native artifacts listed in
-   `qihse/planning/native_integration_cleanup.md`; do not delete source trees
-   in the same change.
-4. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
+2. Continue stale-root path cleanup in tests and docs, then delete or quarantine
+   `native/qihse/` and `SWORDIntel_QIHSE/qihse/` only after no active runtime or
+   test path depends on them.
+3. Keep independent `native/not_stisla/` cleanup separate from QIHSE deletion:
    FRAMEWERX exploit/CVSS paths still load `native/not_stisla/libnot_stisla.so`
    through `src/framewerx/evaluation/search_backend.py`.
-5. Use fresh sweep results to tune the candidate-pool resolver once more real
+4. Use fresh sweep results to tune the candidate-pool resolver once more real
    datasets exist; the current defaults are conservative and mode-aware.

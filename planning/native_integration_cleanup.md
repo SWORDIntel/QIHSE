@@ -139,6 +139,85 @@ Tracked generated/stale artifact cleanup candidates found during this slice:
 - `native/not_stisla/test_fortran_backend`
 - `native/not_stisla/test_telemetry_processor_perf`
 
+## Index-Only Generated Artifact Cleanup
+
+Date: 2026-05-17
+
+Removed the tracked generated native artifacts listed above from the Git index
+with `git rm --cached`, leaving the working-tree files on disk where possible:
+
+- `qihse/qihse_hetero.h.gch`
+- `qihse/test_all_isa`
+- `qihse/test_amx_only`
+- `qihse/test_avx2_only`
+- `qihse/test_avx2_only_simple`
+- `qihse/test_avx512_direct`
+- `qihse/test_direct_execution`
+- `qihse/test_simple_exec`
+- `qihse/test_vnni_bench`
+- `qihse/test_vnni_only`
+- `qihse/tests/qihse_trinary_codec_test`
+- `native/qihse/qihse_hetero.h.gch`
+- `native/qihse/test_all_isa`
+- `native/qihse/test_amx_only`
+- `native/qihse/test_avx2_only`
+- `native/qihse/test_avx2_only_simple`
+- `native/qihse/test_avx512_direct`
+- `native/qihse/test_direct_execution`
+- `native/qihse/test_simple_exec`
+- `native/qihse/test_vnni_bench`
+- `native/qihse/test_vnni_only`
+- `SWORDIntel_QIHSE/qihse/qihse_hetero.h.gch`
+- `SWORDIntel_QIHSE/qihse/test_all_isa`
+- `SWORDIntel_QIHSE/qihse/test_amx_only`
+- `SWORDIntel_QIHSE/qihse/test_avx2_only`
+- `SWORDIntel_QIHSE/qihse/test_avx2_only_simple`
+- `SWORDIntel_QIHSE/qihse/test_avx512_direct`
+- `SWORDIntel_QIHSE/qihse/test_direct_execution`
+- `SWORDIntel_QIHSE/qihse/test_simple_exec`
+- `SWORDIntel_QIHSE/qihse/test_vnni_bench`
+- `SWORDIntel_QIHSE/qihse/test_vnni_only`
+- `native/not_stisla/test_auto_backend`
+- `native/not_stisla/test_avx2_fma`
+- `native/not_stisla/test_enhanced`
+- `native/not_stisla/test_fortran_backend`
+- `native/not_stisla/test_telemetry_processor_perf`
+
+What remains:
+
+- Generated files may still exist locally as ignored working-tree artifacts.
+- Source files and stale mirror source trees remain untouched. Python runtime
+  loaders have been canonicalized onto the active `qihse/` root.
+- Stale mirror deletion and any runtime path audit remain later, dedicated
+  cleanup passes.
+
+## Runtime Loader Canonicalization
+
+Date: 2026-05-17
+
+FRAMEWERX runtime QIHSE loading now resolves the active top-level
+`qihse/libqihse.so` first through `src/framewerx/state/qihse_paths.py`.
+The legacy `native/qihse/libqihse.so` location remains a fallback during the
+transition so existing local builds are not stranded before stale mirror
+deletion.
+
+Updated runtime/config/test surfaces include:
+
+- `fw_launcher.py`
+- `autoresearch.sh`
+- `src/framewerx/api/server.py`
+- `src/framewerx/artifacts/hashing.py`
+- `src/framewerx/cli/main.py`
+- `src/framewerx/hardware/discovery.py`
+- `src/framewerx/state/db.py`
+- `src/framewerx/state/qihse_wrapper.py`
+- `src/framewerx/workers/embedding_worker.py`
+- direct QIHSE path assumptions in `tests/`
+
+The remaining independent NOT_STISLA Python backend still intentionally points
+at `native/not_stisla/libnot_stisla.so` for exploit/CVSS index acceleration.
+Do not combine that cleanup with QIHSE stale mirror deletion.
+
 Untracked generated/stale artifacts observed and already covered by existing
 ignore rules:
 
