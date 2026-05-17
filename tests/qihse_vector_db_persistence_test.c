@@ -90,6 +90,7 @@ static bool test_sparse_ids_hydrate_vector_and_metadata(void);
 static bool test_binary_metadata_survives_restart(void);
 static bool test_null_db_path_ephemeral_searchable(void);
 static bool test_wal_replays_unflushed_add(void);
+static bool test_wal_replays_unflushed_delete_update_upsert(void);
 static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_read_only_mmap_reopen_searches(void);
 static bool test_corrupt_vectors_qvec_magic_rejected(void);
@@ -104,6 +105,10 @@ static bool test_update_by_id_replaces_vector_and_metadata(void);
 static bool test_upsert_by_ids_reports_insert_and_update_counts(void);
 static bool test_read_only_open_rejects_mutations(void);
 static bool test_compact_preserves_live_rows_after_mutations(void);
+static bool test_compact_counts_after_delete_update_current_snapshot(void);
+static bool test_compact_rebuilds_high_id_idmap_consistency(void);
+static bool test_compact_rewrites_qtri_sidecar_valid(void);
+static bool test_compact_rebuilds_corrupt_derived_sidecars(void);
 
 int main(void) {
     const test_case_t tests[] = {
@@ -117,6 +122,8 @@ int main(void) {
          test_null_db_path_ephemeral_searchable},
         {"WAL replays an accepted add before snapshot flush",
          test_wal_replays_unflushed_add},
+        {"WAL replays unflushed delete/update/upsert mutations",
+         test_wal_replays_unflushed_delete_update_upsert},
         {"torn WAL tail is ignored and truncated on writable open",
          test_torn_wal_tail_ignored_and_truncated},
         {"read-only mmap reopen searches mapped vector file",
@@ -145,6 +152,14 @@ int main(void) {
          test_read_only_open_rejects_mutations},
         {"compact preserves live rows after mutations",
          test_compact_preserves_live_rows_after_mutations},
+        {"compact reports delete/update row and index counts",
+         test_compact_counts_after_delete_update_current_snapshot},
+        {"compact rebuilds idmap consistently with high IDs",
+         test_compact_rebuilds_high_id_idmap_consistency},
+        {"compact rewrites a valid vectors.qtri sidecar",
+         test_compact_rewrites_qtri_sidecar_valid},
+        {"compact rebuilds stale/corrupt derived sidecars",
+         test_compact_rebuilds_corrupt_derived_sidecars},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(tests); i++) {
@@ -638,6 +653,130 @@ static bool test_wal_replays_unflushed_add(void) {
     TEST_ASSERT(qihse_vector_db_close(recovered), "read-only recovered database should close");
     TEST_ASSERT(qihse_vector_db_close(writer), "writer close should checkpoint WAL into snapshot");
 
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_wal_replays_unflushed_delete_update_upsert(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("wal_mutation_replay");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float deleted[] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float updated_old[] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const float upsert_old[] = {0.0f, 0.0f, 1.0f, 0.0f};
+    const float updated_new[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float upsert_vectors[][4] = {
+        {0.5f, 0.5f, 0.0f, 0.0f},
+        {0.0f, 0.5f, 0.5f, 0.0f},
+    };
+    const uint64_t upsert_ids[] = {9603, 9604};
+    const char updated_meta[] = "wal-updated";
+    const char upsert_update_meta[] = "wal-upsert-updated";
+    const char upsert_insert_meta[] = "wal-upsert-inserted";
+    const void* upsert_metas[] = {upsert_update_meta, upsert_insert_meta};
+    const size_t upsert_meta_sizes[] = {
+        sizeof(upsert_update_meta),
+        sizeof(upsert_insert_meta)
+    };
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, deleted, ARRAY_LEN(deleted), 9601, NULL, 0),
+                "delete target insert should succeed");
+    TEST_ASSERT(add_one(db, updated_old, ARRAY_LEN(updated_old), 9602, NULL, 0),
+                "update target insert should succeed");
+    TEST_ASSERT(add_one(db, upsert_old, ARRAY_LEN(upsert_old), 9603, NULL, 0),
+                "upsert target insert should succeed");
+    TEST_ASSERT(close_db(db), "base snapshot should close before WAL mutations");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "writer reopen should return a database");
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, 9601),
+                "delete mutation should append WAL");
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, 9602, updated_new,
+                                             ARRAY_LEN(updated_new),
+                                             updated_meta, sizeof(updated_meta)),
+                "update mutation should append WAL");
+    size_t inserted_count = 0;
+    size_t updated_count = 0;
+    TEST_ASSERT(qihse_vector_db_upsert_by_ids(db, upsert_ids, &upsert_vectors[0][0],
+                                              ARRAY_LEN(upsert_ids),
+                                              ARRAY_LEN(upsert_vectors[0]),
+                                              upsert_metas, upsert_meta_sizes,
+                                              &inserted_count, &updated_count),
+                "upsert mutation should append WAL");
+    TEST_ASSERT(inserted_count == 1 && updated_count == 1,
+                "upsert should report one insert and one update");
+    qihse_vector_db_destroy(db);
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "read-only open should replay mutation WAL");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "replayed mutation stats should be available");
+    TEST_ASSERT(stats.wal_records_replayed == 3,
+                "delete/update/upsert WAL records should replay");
+    TEST_ASSERT(stats.live_vectors == 3,
+                "mutation replay should expose three live rows");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, deleted, ARRAY_LEN(deleted), false, false, &result);
+    TEST_ASSERT(count == 0, "WAL-deleted row should not be searchable");
+
+    count = search_one(db, updated_old, ARRAY_LEN(updated_old), false, false, &result);
+    TEST_ASSERT(count == 0, "WAL-updated old vector should not be searchable");
+
+    count = search_one(db, updated_new, ARRAY_LEN(updated_new), true, true, &result);
+    TEST_ASSERT(count == 1, "WAL-updated new vector should be searchable");
+    TEST_ASSERT(result.id == 9602, "WAL update should preserve id");
+    TEST_ASSERT(vector_eq(result.vector, updated_new, ARRAY_LEN(updated_new)),
+                "WAL update should hydrate replacement vector");
+    TEST_ASSERT(result.metadata_size == sizeof(updated_meta),
+                "WAL update should hydrate replacement metadata size");
+    TEST_ASSERT(memcmp(result.metadata, updated_meta, sizeof(updated_meta)) == 0,
+                "WAL update should hydrate replacement metadata bytes");
+    free_results(&result, 1);
+
+    count = search_one(db, upsert_vectors[0], ARRAY_LEN(upsert_vectors[0]),
+                       true, true, &result);
+    TEST_ASSERT(count == 1, "WAL-upsert updated vector should be searchable");
+    TEST_ASSERT(result.id == 9603, "WAL upsert update should preserve id");
+    TEST_ASSERT(result.metadata_size == sizeof(upsert_update_meta),
+                "WAL upsert update metadata size should match");
+    TEST_ASSERT(memcmp(result.metadata, upsert_update_meta,
+                       sizeof(upsert_update_meta)) == 0,
+                "WAL upsert update metadata bytes should match");
+    free_results(&result, 1);
+
+    count = search_one(db, upsert_vectors[1], ARRAY_LEN(upsert_vectors[1]),
+                       true, true, &result);
+    TEST_ASSERT(count == 1, "WAL-upsert inserted vector should be searchable");
+    TEST_ASSERT(result.id == 9604, "WAL upsert insert should preserve id");
+    TEST_ASSERT(result.metadata_size == sizeof(upsert_insert_meta),
+                "WAL upsert insert metadata size should match");
+    TEST_ASSERT(memcmp(result.metadata, upsert_insert_meta,
+                       sizeof(upsert_insert_meta)) == 0,
+                "WAL upsert insert metadata bytes should match");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only replayed database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1388,6 +1527,325 @@ static bool test_compact_preserves_live_rows_after_mutations(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(close_db(db), "database should close after compact verification");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_compact_counts_after_delete_update_current_snapshot(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("compact_counts");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float deleted[] = {1.0f, 0.0f, 0.0f};
+    const float updated_original[] = {0.0f, 1.0f, 0.0f};
+    const float updated_replacement[] = {0.0f, 0.0f, 1.0f};
+    const float untouched[] = {0.5f, 0.5f, 0.0f};
+    const char updated_meta[] = "compact-counts-updated";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, deleted, ARRAY_LEN(deleted), 9501, NULL, 0),
+                "deleted count row insert should succeed");
+    TEST_ASSERT(add_one(db, updated_original, ARRAY_LEN(updated_original), 9502, NULL, 0),
+                "updated count row insert should succeed");
+    TEST_ASSERT(add_one(db, untouched, ARRAY_LEN(untouched), 9503, NULL, 0),
+                "untouched count row insert should succeed");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available before count mutations");
+    TEST_ASSERT(stats.live_vectors == 3u, "initial live count should include all rows");
+    TEST_ASSERT(stats.index_rows == 3u, "initial index row count should include all rows");
+
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, 9501),
+                "delete before count compact should succeed");
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, 9502, updated_replacement,
+                                             ARRAY_LEN(updated_replacement),
+                                             updated_meta, sizeof(updated_meta)),
+                "update before count compact should succeed");
+
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after count mutations");
+    TEST_ASSERT(stats.live_vectors == 2u,
+                "delete/update should leave two live logical rows");
+    TEST_ASSERT(stats.index_rows == 4u,
+                "current snapshot keeps tombstoned and replacement rows before compact");
+    TEST_ASSERT(stats.idmap_dirty, "idmap should be dirty after delete/update");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_STALE,
+                "qtri should be stale after delete/update");
+
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should succeed for count snapshot");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after count compact");
+    TEST_ASSERT(stats.live_vectors == 2u,
+                "compact should preserve two live logical rows");
+    TEST_ASSERT(stats.index_rows == 4u,
+                "current compact rewrites, but does not physically prune index rows yet");
+    TEST_ASSERT(stats.idmap_valid, "compact should leave idmap valid");
+    TEST_ASSERT(!stats.idmap_dirty, "compact should leave idmap clean");
+    TEST_ASSERT(stats.idmap_rows == 2u,
+                "compact should rebuild idmap with live rows only");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "compact should rebuild qtri as valid");
+    TEST_ASSERT(stats.trinary_rows == stats.index_rows,
+                "current qtri sidecar mirrors physical snapshot rows");
+
+    /*
+     * Future physical compaction should tighten these counts once
+     * qihse_vector_db_compact prunes tombstones and superseded rows:
+     *   stats.index_rows == stats.live_vectors
+     *   stats.trinary_rows == stats.live_vectors
+     */
+
+    TEST_ASSERT(close_db(db), "database should close after count compact");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_compact_rebuilds_high_id_idmap_consistency(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("compact_high_ids");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vectors[][4] = {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+    const float high_replacement[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const uint64_t ids[] = {
+        9601u,
+        UINT64_C(0x8000000000000101),
+        UINT64_MAX
+    };
+    const char high_meta[] = "high-id-compact";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(qihse_vector_db_add_vectors(db, &vectors[0][0], ARRAY_LEN(vectors),
+                                            ARRAY_LEN(vectors[0]), ids, NULL, NULL),
+                "high-ID compact fixture insert should succeed");
+
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, ids[0]),
+                "low-ID delete before compact should succeed");
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, ids[1], high_replacement,
+                                             ARRAY_LEN(high_replacement),
+                                             high_meta, sizeof(high_meta)),
+                "high-ID update before compact should succeed");
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should rebuild high-ID idmap");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after high-ID compact");
+    TEST_ASSERT(stats.idmap_valid, "high-ID idmap should be valid after compact");
+    TEST_ASSERT(!stats.idmap_dirty, "high-ID idmap should be clean after compact");
+    TEST_ASSERT(stats.idmap_rows == 2u, "high-ID idmap should contain live rows only");
+
+    TEST_ASSERT(close_db(db), "database should close after high-ID compact");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database after high-ID compact");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vectors[0], ARRAY_LEN(vectors[0]), false, false, &result);
+    TEST_ASSERT(count == 0, "deleted low-ID row should stay absent after compact");
+
+    count = search_one(db, high_replacement, ARRAY_LEN(high_replacement),
+                       true, true, &result);
+    TEST_ASSERT(count == 1, "updated high-ID row should search after compact");
+    TEST_ASSERT(result.id == ids[1], "updated ID above INT64_MAX should survive compact");
+    TEST_ASSERT(vector_eq(result.vector, high_replacement, ARRAY_LEN(high_replacement)),
+                "updated high-ID vector should hydrate after compact");
+    TEST_ASSERT(result.metadata_size == sizeof(high_meta),
+                "updated high-ID metadata size should survive compact");
+    TEST_ASSERT(memcmp(result.metadata, high_meta, sizeof(high_meta)) == 0,
+                "updated high-ID metadata should survive compact");
+    free_results(&result, 1);
+
+    count = search_one(db, vectors[2], ARRAY_LEN(vectors[2]), true, false, &result);
+    TEST_ASSERT(count == 1, "UINT64_MAX row should search after compact");
+    TEST_ASSERT(result.id == ids[2], "UINT64_MAX id should survive compact");
+    TEST_ASSERT(vector_eq(result.vector, vectors[2], ARRAY_LEN(vectors[2])),
+                "UINT64_MAX vector should hydrate after compact");
+    free_results(&result, 1);
+
+    TEST_ASSERT(close_db(db), "database should close after high-ID compact verification");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_compact_rewrites_qtri_sidecar_valid(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("compact_qtri_valid");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float original[] = {1.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f};
+    const float replacement[] = {-1.0f, 1.0f, 0.0f, -1.0f, 1.0f, 0.0f};
+    const float untouched[] = {0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, original, ARRAY_LEN(original), 9701, NULL, 0),
+                "qtri original row insert should succeed");
+    TEST_ASSERT(add_one(db, untouched, ARRAY_LEN(untouched), 9702, NULL, 0),
+                "qtri untouched row insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before qtri compact fixture");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database for qtri compact");
+
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, 9701, replacement,
+                                             ARRAY_LEN(replacement), NULL, 0),
+                "qtri update before compact should succeed");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available before qtri compact");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_STALE,
+                "qtri should be stale after update");
+
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should rewrite qtri sidecar");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after qtri compact");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "qtri should be valid after compact");
+    TEST_ASSERT(stats.trinary_row_bytes == 2u,
+                "six-dimensional qtri rows should use two tryte bytes");
+    TEST_ASSERT(stats.trinary_rows == stats.index_rows,
+                "current qtri rows should mirror physical index rows");
+
+    off_t qtri_size = 0;
+    TEST_ASSERT(file_size_of(path, "vectors.qtri", &qtri_size),
+                "vectors.qtri size should be readable after compact");
+    TEST_ASSERT(qtri_size == (off_t)(stats.trinary_row_bytes * stats.trinary_rows),
+                "vectors.qtri size should match raw tryte rows");
+
+    TEST_ASSERT(close_db(db), "database should close after qtri compact");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "read-only reopen should accept compacted qtri");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after qtri read-only reopen");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "compacted qtri should remain valid across reopen");
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only qtri database should close");
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("compact_corrupt_sidecars");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vectors[][5] = {
+        {1.0f, 0.0f, -1.0f, 1.0f, 0.0f},
+        {-1.0f, 1.0f, 0.0f, -1.0f, 1.0f},
+    };
+    const uint8_t invalid_tryte[] = {0xff, 0x00, 0x01};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vectors[0], ARRAY_LEN(vectors[0]), 9801, NULL, 0),
+                "first corrupt-sidecar fixture row insert should succeed");
+    TEST_ASSERT(add_one(db, vectors[1], ARRAY_LEN(vectors[1]), 9802, NULL, 0),
+                "second corrupt-sidecar fixture row insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before sidecar corruption");
+
+    TEST_ASSERT(corrupt_file_byte(path, "idmap.qid", 0, (uint8_t)'Z'),
+                "test should corrupt derived idmap sidecar");
+    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
+                "test should corrupt derived qtri sidecar");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "corrupt derived sidecars should reopen writable");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after corrupt sidecar reopen");
+    TEST_ASSERT(stats.idmap_valid, "corrupt idmap should rebuild in memory");
+    TEST_ASSERT(stats.idmap_dirty, "rebuilt idmap should be dirty before compact");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_CORRUPT,
+                "corrupt qtri should be reported before compact");
+
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should rebuild corrupt sidecars");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after corrupt sidecar compact");
+    TEST_ASSERT(stats.idmap_valid, "compacted idmap should be valid");
+    TEST_ASSERT(!stats.idmap_dirty, "compacted idmap should be clean");
+    TEST_ASSERT(stats.idmap_rows == 2u, "compacted idmap should contain live rows");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "compacted qtri should be valid");
+    TEST_ASSERT(stats.trinary_row_bytes == 1u,
+                "five-dimensional qtri rows should use one tryte byte");
+    TEST_ASSERT(stats.trinary_rows == 2u,
+                "compacted qtri should contain both physical rows");
+
+    TEST_ASSERT(close_db(db), "database should close after corrupt sidecar compact");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "read-only reopen should accept rebuilt sidecars");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after rebuilt sidecar reopen");
+    TEST_ASSERT(stats.idmap_valid, "rebuilt idmap should persist");
+    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
+                "rebuilt qtri should persist");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vectors[1], ARRAY_LEN(vectors[1]), true, false, &result);
+    TEST_ASSERT(count == 1, "row should search after derived sidecar rebuild");
+    TEST_ASSERT(result.id == 9802, "row id should survive derived sidecar rebuild");
+    TEST_ASSERT(vector_eq(result.vector, vectors[1], ARRAY_LEN(vectors[1])),
+                "row vector should survive derived sidecar rebuild");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only rebuilt-sidecar database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

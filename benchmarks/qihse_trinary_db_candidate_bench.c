@@ -337,6 +337,70 @@ static int qihse_bench_verify_rerank(const qihse_bench_ranked_t* reranked,
     return 1;
 }
 
+static int qihse_bench_verify_full_search(const qihse_vector_result_t* results,
+                                          size_t result_count,
+                                          const qihse_bench_ranked_t* oracle,
+                                          size_t oracle_count) {
+    size_t i;
+
+    if (result_count < QIHSE_BENCH_TOPK || oracle_count != QIHSE_BENCH_TOPK) {
+        fprintf(stderr,
+                "expected at least %u full-search rows and %u oracle rows, got %zu/%zu\n",
+                (unsigned)QIHSE_BENCH_TOPK,
+                (unsigned)QIHSE_BENCH_TOPK,
+                result_count,
+                oracle_count);
+        return 0;
+    }
+    for (i = 0u; i < QIHSE_BENCH_TOPK; i++) {
+        if (fabsf(results[i].score - oracle[i].score) > 0.000001f) {
+            fprintf(stderr,
+                    "full float32 search score mismatch at %zu: got %.6f, "
+                    "expected %.6f\n",
+                    i,
+                    results[i].score,
+                    oracle[i].score);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t qihse_bench_recall_matches(const qihse_bench_ranked_t* reranked,
+                                         size_t reranked_count,
+                                         const qihse_vector_result_t* full,
+                                         size_t full_count) {
+    size_t matches = 0u;
+    size_t i;
+
+    for (i = 0u; i < reranked_count; i++) {
+        size_t j;
+        for (j = 0u; j < full_count; j++) {
+            if (reranked[i].id == full[j].id) {
+                matches++;
+                break;
+            }
+        }
+    }
+    return matches;
+}
+
+static size_t qihse_bench_ordered_matches(const qihse_bench_ranked_t* reranked,
+                                          size_t reranked_count,
+                                          const qihse_vector_result_t* full,
+                                          size_t full_count) {
+    size_t limit = reranked_count < full_count ? reranked_count : full_count;
+    size_t matches = 0u;
+    size_t i;
+
+    for (i = 0u; i < limit; i++) {
+        if (reranked[i].id == full[i].id) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
 static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
                                                    const int32_t* candidate_scores,
                                                    size_t candidate_count,
@@ -353,10 +417,13 @@ static int32_t qihse_bench_candidate_score_for_row(const size_t* candidate_rows,
 
 int main(void) {
     char* db_path = NULL;
+    qihse_vector_db_t full_db = NULL;
     float* rows = NULL;
     uint64_t* ids = NULL;
     float query[QIHSE_BENCH_DIMS];
     uint8_t encoded_query[(QIHSE_BENCH_DIMS + 4u) / 5u];
+    qihse_vector_query_t full_query;
+    qihse_vector_result_t* full_results = NULL;
     qihse_vector_store_snapshot_t snapshot;
     size_t row_bytes = 0u;
     size_t candidate_rows[QIHSE_BENCH_CANDIDATES] = {0u};
@@ -364,14 +431,20 @@ int main(void) {
     size_t candidate_count = 0u;
     qihse_bench_ranked_t reranked[QIHSE_BENCH_TOPK];
     qihse_bench_ranked_t oracle[QIHSE_BENCH_TOPK];
+    size_t full_count = 0u;
+    size_t full_topk_count = 0u;
     size_t reranked_count = 0u;
     size_t oracle_count = 0u;
     double load_start;
     double load_seconds;
+    double full_start;
+    double full_seconds;
     double select_start;
     double select_seconds;
     double rerank_start;
     double rerank_seconds;
+    size_t recall_matches;
+    size_t ordered_matches;
     volatile int64_t checksum = 0;
     size_t iter;
     size_t i;
@@ -380,7 +453,8 @@ int main(void) {
     memset(&snapshot, 0, sizeof(snapshot));
     rows = (float*)calloc(QIHSE_BENCH_ROWS * QIHSE_BENCH_DIMS, sizeof(float));
     ids = (uint64_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*ids));
-    if (!rows || !ids) {
+    full_results = (qihse_vector_result_t*)calloc(QIHSE_BENCH_ROWS, sizeof(*full_results));
+    if (!rows || !ids || !full_results) {
         perror("calloc");
         goto cleanup;
     }
@@ -393,6 +467,17 @@ int main(void) {
     }
     if (!qihse_bench_create_persisted_db(db_path, rows, ids) ||
         !qihse_bench_verify_reopen_stats(db_path)) {
+        goto cleanup;
+    }
+
+    full_db = qihse_vector_db_open(QIHSE_VECTOR_DB_INMEMORY,
+                                   NULL,
+                                   db_path,
+                                   QIHSE_VDB_OPEN_FILE_BACKED |
+                                       QIHSE_VDB_OPEN_READ_ONLY |
+                                       QIHSE_VDB_OPEN_MMAP);
+    if (!full_db) {
+        perror("qihse_vector_db_open full-search read-only mmap");
         goto cleanup;
     }
 
@@ -419,6 +504,35 @@ int main(void) {
         perror("qihse_trinary_tryte_encode_row");
         goto cleanup;
     }
+
+    memset(&full_query, 0, sizeof(full_query));
+    full_query.query_vector = query;
+    full_query.vector_dims = QIHSE_BENCH_DIMS;
+    full_query.top_k = QIHSE_BENCH_ROWS;
+    full_query.similarity_threshold = -1.0f;
+    full_query.include_vectors = false;
+    full_query.include_metadata = false;
+
+    full_start = qihse_bench_seconds();
+    for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
+        int found;
+
+        memset(full_results, 0, QIHSE_BENCH_ROWS * sizeof(*full_results));
+        found = qihse_vector_db_search(full_db,
+                                       &full_query,
+                                       full_results,
+                                       QIHSE_BENCH_ROWS);
+        if (found < 0) {
+            perror("qihse_vector_db_search");
+            goto cleanup;
+        }
+        full_count = (size_t)found;
+        if (full_count != 0u) {
+            checksum += (int64_t)full_results[0].id;
+        }
+    }
+    full_seconds = qihse_bench_seconds() - full_start;
+    full_topk_count = full_count < QIHSE_BENCH_TOPK ? full_count : QIHSE_BENCH_TOPK;
 
     select_start = qihse_bench_seconds();
     for (iter = 0u; iter < QIHSE_BENCH_ITERS; iter++) {
@@ -460,11 +574,21 @@ int main(void) {
                                 oracle,
                                 QIHSE_BENCH_TOPK,
                                 &oracle_count) ||
+        !qihse_bench_verify_full_search(full_results, full_count, oracle, oracle_count) ||
         !qihse_bench_verify_rerank(reranked, reranked_count, oracle, oracle_count)) {
         goto cleanup;
     }
 
-    printf("trinary_db_candidate_bench rows=%u dims=%u qtri_row_bytes=%zu "
+    recall_matches = qihse_bench_recall_matches(reranked,
+                                                reranked_count,
+                                                full_results,
+                                                full_topk_count);
+    ordered_matches = qihse_bench_ordered_matches(reranked,
+                                                  reranked_count,
+                                                  full_results,
+                                                  full_topk_count);
+
+    printf("trinary_search_path_bench rows=%u dims=%u qtri_row_bytes=%zu "
            "candidates=%u topk=%u iterations=%u\n",
            (unsigned)QIHSE_BENCH_ROWS,
            (unsigned)QIHSE_BENCH_DIMS,
@@ -472,11 +596,25 @@ int main(void) {
            (unsigned)QIHSE_BENCH_CANDIDATES,
            (unsigned)QIHSE_BENCH_TOPK,
            (unsigned)QIHSE_BENCH_ITERS);
-    printf("load_ms=%.3f trinary_select_avg_us=%.3f exact_rerank_avg_us=%.3f "
+    printf("load_ms=%.3f full_float32_avg_us=%.3f trinary_select_avg_us=%.3f "
+           "exact_rerank_avg_us=%.3f trinary_rerank_avg_us=%.3f "
+           "speedup_vs_full=%.3fx recall_at_%u=%.3f ordered_at_%u=%.3f "
            "checksum=%lld\n",
            load_seconds * 1000.0,
+           (full_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
            (select_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
            (rerank_seconds * 1000000.0) / (double)QIHSE_BENCH_ITERS,
+           ((select_seconds + rerank_seconds) * 1000000.0) /
+               (double)QIHSE_BENCH_ITERS,
+           full_seconds > 0.0 && (select_seconds + rerank_seconds) > 0.0
+               ? full_seconds / (select_seconds + rerank_seconds)
+               : 0.0,
+           (unsigned)QIHSE_BENCH_TOPK,
+           full_topk_count == 0u ? 0.0
+                                 : (double)recall_matches / (double)full_topk_count,
+           (unsigned)QIHSE_BENCH_TOPK,
+           full_topk_count == 0u ? 0.0
+                                 : (double)ordered_matches / (double)full_topk_count,
            (long long)checksum);
     for (i = 0u; i < reranked_count; i++) {
         printf("result[%zu] row=%zu id=%llu tri_score=%d exact_score=%.6f\n",
@@ -493,12 +631,16 @@ int main(void) {
     exit_code = 0;
 
 cleanup:
+    if (full_db) {
+        (void)qihse_vector_db_close(full_db);
+    }
     qihse_vector_store_snapshot_free(&snapshot);
     if (db_path) {
         qihse_bench_remove_tree(db_path);
         free(db_path);
     }
     free(ids);
+    free(full_results);
     free(rows);
     return exit_code;
 }
