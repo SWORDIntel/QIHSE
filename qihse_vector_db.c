@@ -13,6 +13,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,13 +29,16 @@
 #define QIHSE_VDB_WAL_NAME "wal.qwal"
 #define QIHSE_VDB_VECTOR_NAME "vectors.qvec"
 #define QIHSE_VDB_METADATA_NAME "metadata.qmeta"
+#define QIHSE_VDB_INDEX_NAME "index.qidx"
 #define QIHSE_VDB_IDMAP_NAME "idmap.qid"
 #define QIHSE_VDB_TRINARY_NAME "vectors.qtri"
 #define QIHSE_VDB_MANIFEST_NAME "MANIFEST"
 
+#define QIHSE_VDB_INDEX_MAGIC "QIHSEQIX"
 #define QIHSE_VDB_IDMAP_MAGIC "QIHSEQID"
 #define QIHSE_VDB_FILE_HEADER_SIZE 32u
 #define QIHSE_VDB_FORMAT_VERSION 1u
+#define QIHSE_VDB_INDEX_ROW_DISK_SIZE 48u
 #define QIHSE_VDB_IDMAP_ENTRY_DISK_SIZE 16u
 
 #define QIHSE_VDB_WAL_MAGIC "QHWAL01\0"
@@ -82,6 +86,10 @@ struct qihse_vector_db_s {
     int metadata_mmap_fd;
     void* mapped_metadata;
     size_t mapped_metadata_bytes;
+    int index_mmap_fd;
+    void* mapped_index;
+    size_t mapped_index_bytes;
+    bool rows_are_mapped;
     int idmap_mmap_fd;
     void* mapped_idmap;
     size_t mapped_idmap_bytes;
@@ -200,7 +208,7 @@ static void qihse_vdb_remove_snapshot_files(const char* db_path) {
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_MANIFEST_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_VECTOR_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_METADATA_NAME);
-    (void)qihse_vdb_remove_file(db_path, "index.qidx");
+    (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_INDEX_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_IDMAP_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_TRINARY_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_WAL_NAME);
@@ -370,6 +378,20 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
         close(vdb->metadata_mmap_fd);
     }
     vdb->metadata_mmap_fd = -1;
+    if (vdb->rows_are_mapped) {
+        vdb->rows = NULL;
+        vdb->rows_capacity = 0u;
+        vdb->rows_are_mapped = false;
+    }
+    if (vdb->mapped_index && vdb->mapped_index != MAP_FAILED) {
+        munmap(vdb->mapped_index, vdb->mapped_index_bytes);
+    }
+    vdb->mapped_index = NULL;
+    vdb->mapped_index_bytes = 0u;
+    if (vdb->index_mmap_fd >= 0) {
+        close(vdb->index_mmap_fd);
+    }
+    vdb->index_mmap_fd = -1;
     if (vdb->mapped_idmap && vdb->mapped_idmap != MAP_FAILED) {
         munmap(vdb->mapped_idmap, vdb->mapped_idmap_bytes);
     }
@@ -429,6 +451,117 @@ static bool qihse_vdb_map_metadata(qihse_vector_db_t vdb) {
         return false;
     }
     vdb->mapped_metadata_bytes = vdb->metadata_bytes_used;
+    return true;
+}
+
+static bool qihse_vdb_index_rows_are_direct_mappable(void) {
+    const uint16_t endian = 1u;
+
+    return ((const uint8_t*)&endian)[0] == 1u &&
+           sizeof(qihse_index_row_t) == QIHSE_VDB_INDEX_ROW_DISK_SIZE &&
+           offsetof(qihse_index_row_t, vector_id) == 0u &&
+           offsetof(qihse_index_row_t, vector_offset) == 8u &&
+           offsetof(qihse_index_row_t, metadata_offset) == 16u &&
+           offsetof(qihse_index_row_t, metadata_size) == 24u &&
+           offsetof(qihse_index_row_t, commit_generation) == 32u &&
+           offsetof(qihse_index_row_t, row_flags) == 40u &&
+           offsetof(qihse_index_row_t, reserved) == 44u;
+}
+
+static bool qihse_vdb_validate_mapped_index(qihse_vector_db_t vdb,
+                                            const qihse_vector_store_manifest_t* manifest) {
+    const uint8_t* data = (const uint8_t*)vdb->mapped_index;
+    const uint8_t* payload;
+    uint64_t count64;
+    uint64_t crc64;
+    uint32_t row_bytes;
+    size_t row_count;
+    size_t payload_size;
+    size_t expected_size;
+    uint64_t vector_row_bytes;
+
+    if (!data || !manifest || vdb->mapped_index_bytes < QIHSE_VDB_FILE_HEADER_SIZE ||
+        memcmp(data, QIHSE_VDB_INDEX_MAGIC, 8u) != 0 ||
+        qihse_le_read_u32(data + 8u) != QIHSE_VDB_FORMAT_VERSION) {
+        errno = EINVAL;
+        return false;
+    }
+
+    row_bytes = qihse_le_read_u32(data + 12u);
+    count64 = qihse_le_read_u64(data + 16u);
+    crc64 = qihse_le_read_u64(data + 24u);
+    if (row_bytes != QIHSE_VDB_INDEX_ROW_DISK_SIZE ||
+        count64 != manifest->row_count ||
+        crc64 != manifest->index_crc64 ||
+        !qihse_vdb_u64_to_size(count64, &row_count) ||
+        !qihse_checked_mul_size(row_count, QIHSE_VDB_INDEX_ROW_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_VDB_FILE_HEADER_SIZE, payload_size, &expected_size) ||
+        expected_size != vdb->mapped_index_bytes ||
+        !qihse_checked_mul_u64((uint64_t)manifest->vector_dims, (uint64_t)sizeof(float),
+                               &vector_row_bytes)) {
+        errno = EINVAL;
+        return false;
+    }
+
+    payload = data + QIHSE_VDB_FILE_HEADER_SIZE;
+    if (qihse_fnv1a64(payload, payload_size) != crc64 ||
+        !qihse_vdb_index_rows_are_direct_mappable()) {
+        errno = EINVAL;
+        return false;
+    }
+
+    for (size_t i = 0u; i < row_count; i++) {
+        const uint8_t* row = payload + (i * QIHSE_VDB_INDEX_ROW_DISK_SIZE);
+        uint64_t vector_offset = qihse_le_read_u64(row + 8u);
+        uint64_t metadata_offset = qihse_le_read_u64(row + 16u);
+        uint64_t metadata_size = qihse_le_read_u64(row + 24u);
+        uint64_t vector_end;
+        uint64_t metadata_end;
+
+        if (!qihse_checked_add_u64(vector_offset, vector_row_bytes, &vector_end) ||
+            vector_end > manifest->vector_bytes ||
+            !qihse_checked_add_u64(metadata_offset, metadata_size, &metadata_end) ||
+            metadata_end > manifest->metadata_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool qihse_vdb_try_map_index(qihse_vector_db_t vdb,
+                                    const qihse_vector_store_manifest_t* manifest) {
+    size_t bytes;
+
+    if (!vdb || !manifest ||
+        !qihse_vdb_u64_to_size(qihse_vdb_file_size_or_zero(vdb->db_path, QIHSE_VDB_INDEX_NAME),
+                               &bytes) ||
+        bytes == 0u) {
+        return false;
+    }
+    if (!qihse_vdb_map_snapshot_file(vdb, QIHSE_VDB_INDEX_NAME, bytes,
+                                     &vdb->index_mmap_fd, &vdb->mapped_index)) {
+        return false;
+    }
+    vdb->mapped_index_bytes = bytes;
+    if (!qihse_vdb_validate_mapped_index(vdb, manifest)) {
+        if (vdb->mapped_index && vdb->mapped_index != MAP_FAILED) {
+            munmap(vdb->mapped_index, vdb->mapped_index_bytes);
+        }
+        vdb->mapped_index = NULL;
+        vdb->mapped_index_bytes = 0u;
+        if (vdb->index_mmap_fd >= 0) {
+            close(vdb->index_mmap_fd);
+        }
+        vdb->index_mmap_fd = -1;
+        return false;
+    }
+
+    free(vdb->rows);
+    vdb->rows = (qihse_index_row_t*)((uint8_t*)vdb->mapped_index + QIHSE_VDB_FILE_HEADER_SIZE);
+    vdb->rows_capacity = vdb->total_vectors;
+    vdb->rows_are_mapped = true;
     return true;
 }
 
@@ -1166,6 +1299,7 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
         free(vdb->metadata);
         vdb->metadata = NULL;
         vdb->metadata_bytes_capacity = 0u;
+        (void)qihse_vdb_try_map_index(vdb, &snapshot.manifest);
         (void)qihse_vdb_try_map_idmap(vdb, &snapshot.manifest);
     }
     qihse_vector_store_snapshot_free(&snapshot);
@@ -1201,6 +1335,7 @@ qihse_vector_db_t qihse_vector_db_open(
     vdb->storage_mode = file_backed ? QIHSE_VDB_STORAGE_FILE_COPY : QIHSE_VDB_STORAGE_EPHEMERAL;
     vdb->mmap_fd = -1;
     vdb->metadata_mmap_fd = -1;
+    vdb->index_mmap_fd = -1;
     vdb->idmap_mmap_fd = -1;
     vdb->next_generation = 1u;
     vdb->wal_last_record_offset = QIHSE_VDB_WAL_NO_PREV;

@@ -100,6 +100,24 @@ static bool test_corrupt_idmap_rebuilds_high_ids(void);
 static bool test_missing_vectors_qtri_accepted(void);
 static bool test_corrupt_vectors_qtri_accepted_and_reported(void);
 
+/*
+ * PR-4 mutation API test backlog.
+ *
+ * These remain comments until qihse_vector_db.c implements the public
+ * delete/update/upsert declarations. Adding real test calls before then would
+ * fail linking even though the header contract is intentionally staged.
+ *
+ * - delete_by_id removes the row from search and survives close/reopen.
+ * - delete_by_id on a missing ID returns false without corrupting state.
+ * - update_by_id replaces vector and metadata while preserving external ID.
+ * - batch delete/update/upsert report correct counts and reject duplicate IDs.
+ * - committed mutation WAL batches replay after crash before checkpoint.
+ * - torn mutation WAL tails are ignored and truncated on writable open.
+ * - idmap rebuild after mutation maps only the latest live row for each ID.
+ * - compact removes tombstoned/superseded rows and preserves live search.
+ * - read-only and read-only mmap opens reject delete/update/upsert/compact.
+ */
+
 int main(void) {
     const test_case_t tests[] = {
         {"create -> insert -> close -> reopen -> search",
