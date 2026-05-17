@@ -232,3 +232,55 @@ weighted prototype qtri selectors.
 3. Continue file persistence breadth only after the benchmark runner is moving,
    with remaining authoritative-file corruption focused on manifest/index
    consistency fields after a valid snapshot exists.
+
+## Milestone Checklist
+
+- Plan completion target (for this slice): **88%**
+- Overall completion method: counted milestone items below with explicit blockers and no
+  unresolved dependencies.
+
+### 1) File-backed persistence foundation
+
+- [x] `vectors.qvec` writes and durable snapshot publication (`checkpoint`)  
+- [x] `metadata.qmeta`, `index.qidx`, `idmap.qid`, `MANIFEST` persistence paths
+- [x] `MANIFEST` CRC validation and impossible manifest metadata rejection
+- [x] WAL replay + torn-tail truncation
+- [x] Read-only mapped reopen path and mutation rejection
+- [x] Delete/update/upsert persistence and compaction rewrite
+- [x] Derived sidecar rebuild behavior (`vectors.qtri`, `vectors.qmag`) after stale/corrupt inputs
+- [x] Corruption coverage for:
+  - truncated `vectors.qvec`
+  - truncated `metadata.qmeta`
+  - truncated `index.qidx`
+  - stale `*.tmp` snapshot artifacts
+- [ ] Long-tail consistency hardening (outstanding checks after valid snapshot):
+  - `index.qidx` row metadata consistency under cross-version migration
+  - manifest/index edge-case replay/fallback after partial compaction writes
+
+### 2) Test infrastructure and regression gate
+
+- [x] `make test-persist` gate passes on current branch
+- [x] `make validate-reference-workflow` passes from `qihse/`
+- [x] New corruption/fidelity tests added:
+  - index row-count mismatch
+  - index row-bytes mismatch
+  - manifest/index checksum mismatch
+- [x] `make check-upstream-workflow` and `make check-upstream-workflow-strict` targets
+- [ ] Full upstream PR validation loop automation from FRAMEWERX (still manual copy-sync)
+
+### 3) Reference workload and calibration runway
+
+- [x] VXUG sample benchmark path is stable and recall-gated
+- [x] SIFT1M missing-data fallback path implemented (`sift1m-fallback`)
+- [x] SIFT1M fallback generator integrated and documented
+- [x] Trinary candidate/magnitude sweeps capture production-oriented evidence
+- [ ] Add or stage full `data/sift1m/*` 1M-style dataset for non-fallback scale baseline
+- [ ] Close the full SIFT1M calibration loop (including rerun and candidate policy decision)
+
+### 4) Upstream-first ownership alignment
+
+- [x] Authoritative upstream repo recorded in planning/docs
+- [x] FRAMEWERX copy treated as downstream import target
+- [x] Strict upstream verification target added
+- [ ] Remove remaining legacy dependency language in all remaining planning docs
+- [ ] Finalize upstream-to-FRAMEWERX handoff cadence and enforcement policy
