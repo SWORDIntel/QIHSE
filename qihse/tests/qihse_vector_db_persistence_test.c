@@ -99,24 +99,11 @@ static bool test_duplicate_vector_id_rejected(void);
 static bool test_corrupt_idmap_rebuilds_high_ids(void);
 static bool test_missing_vectors_qtri_accepted(void);
 static bool test_corrupt_vectors_qtri_accepted_and_reported(void);
-
-/*
- * PR-4 mutation API test backlog.
- *
- * These remain comments until qihse_vector_db.c implements the public
- * delete/update/upsert declarations. Adding real test calls before then would
- * fail linking even though the header contract is intentionally staged.
- *
- * - delete_by_id removes the row from search and survives close/reopen.
- * - delete_by_id on a missing ID returns false without corrupting state.
- * - update_by_id replaces vector and metadata while preserving external ID.
- * - batch delete/update/upsert report correct counts and reject duplicate IDs.
- * - committed mutation WAL batches replay after crash before checkpoint.
- * - torn mutation WAL tails are ignored and truncated on writable open.
- * - idmap rebuild after mutation maps only the latest live row for each ID.
- * - compact removes tombstoned/superseded rows and preserves live search.
- * - read-only and read-only mmap opens reject delete/update/upsert/compact.
- */
+static bool test_delete_by_id_persists_across_reopen(void);
+static bool test_update_by_id_replaces_vector_and_metadata(void);
+static bool test_upsert_by_ids_reports_insert_and_update_counts(void);
+static bool test_read_only_open_rejects_mutations(void);
+static bool test_compact_preserves_live_rows_after_mutations(void);
 
 int main(void) {
     const test_case_t tests[] = {
@@ -148,6 +135,16 @@ int main(void) {
          test_missing_vectors_qtri_accepted},
         {"corrupt vectors.qtri is accepted but reported unavailable",
          test_corrupt_vectors_qtri_accepted_and_reported},
+        {"delete_by_id persists across reopen",
+         test_delete_by_id_persists_across_reopen},
+        {"update_by_id replaces vector and metadata",
+         test_update_by_id_replaces_vector_and_metadata},
+        {"upsert_by_ids reports insert/update counts",
+         test_upsert_by_ids_reports_insert_and_update_counts},
+        {"read-only open rejects mutation APIs",
+         test_read_only_open_rejects_mutations},
+        {"compact preserves live rows after mutations",
+         test_compact_preserves_live_rows_after_mutations},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(tests); i++) {
@@ -1052,6 +1049,345 @@ static bool test_corrupt_vectors_qtri_accepted_and_reported(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db), "read-only database should close after corrupt qtri check");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_delete_by_id_persists_across_reopen(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("delete_persists");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float deleted[] = {1.0f, 0.0f, 0.0f};
+    const float live[] = {0.0f, 1.0f, 0.0f};
+    const char deleted_meta[] = "deleted";
+    const char live_meta[] = "live";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, deleted, ARRAY_LEN(deleted), 9001,
+                        deleted_meta, sizeof(deleted_meta)),
+                "deleted-row insert should succeed");
+    TEST_ASSERT(add_one(db, live, ARRAY_LEN(live), 9002, live_meta, sizeof(live_meta)),
+                "live-row insert should succeed");
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, 9001), "delete_by_id should delete live row");
+    TEST_ASSERT(!qihse_vector_db_delete_by_id(db, 9001),
+                "delete_by_id should reject already deleted row");
+    TEST_ASSERT(close_db(db), "database should close after delete");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database after delete");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, deleted, ARRAY_LEN(deleted), true, true, &result);
+    TEST_ASSERT(count == 0, "deleted row should not be searchable after reopen");
+
+    count = search_one(db, live, ARRAY_LEN(live), true, true, &result);
+    TEST_ASSERT(count == 1, "live row should remain searchable after delete");
+    TEST_ASSERT(result.id == 9002, "live row id should survive delete");
+    TEST_ASSERT(vector_eq(result.vector, live, ARRAY_LEN(live)),
+                "live row vector should survive delete");
+    TEST_ASSERT(result.metadata_size == sizeof(live_meta), "live metadata size should survive");
+    TEST_ASSERT(memcmp(result.metadata, live_meta, sizeof(live_meta)) == 0,
+                "live metadata should survive delete");
+    free_results(&result, 1);
+
+    TEST_ASSERT(close_db(db), "database should close after delete verification");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_update_by_id_replaces_vector_and_metadata(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("update_replaces");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float original[] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float replacement[] = {0.0f, 0.0f, 1.0f, 0.0f};
+    const char original_meta[] = "original";
+    const uint8_t replacement_meta[] = {0x75, 0x70, 0x64, 0x00, 0xff, 0x42};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, original, ARRAY_LEN(original), 9101,
+                        original_meta, sizeof(original_meta)),
+                "original row insert should succeed");
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, 9101, replacement,
+                                             ARRAY_LEN(replacement),
+                                             replacement_meta,
+                                             sizeof(replacement_meta)),
+                "update_by_id should replace existing row");
+    TEST_ASSERT(!qihse_vector_db_update_by_id(db, 999999, replacement,
+                                              ARRAY_LEN(replacement),
+                                              replacement_meta,
+                                              sizeof(replacement_meta)),
+                "update_by_id should reject missing row");
+    TEST_ASSERT(close_db(db), "database should close after update");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database after update");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, original, ARRAY_LEN(original), false, false, &result);
+    TEST_ASSERT(count == 0, "original vector should not remain searchable after update");
+
+    count = search_one(db, replacement, ARRAY_LEN(replacement), true, true, &result);
+    TEST_ASSERT(count == 1, "replacement vector should be searchable after reopen");
+    TEST_ASSERT(result.id == 9101, "update should preserve external id");
+    TEST_ASSERT(vector_eq(result.vector, replacement, ARRAY_LEN(replacement)),
+                "update should hydrate replacement vector");
+    TEST_ASSERT(result.metadata_size == sizeof(replacement_meta),
+                "update should replace metadata size");
+    TEST_ASSERT(memcmp(result.metadata, replacement_meta, sizeof(replacement_meta)) == 0,
+                "update should replace metadata bytes");
+    free_results(&result, 1);
+
+    TEST_ASSERT(close_db(db), "database should close after update verification");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_upsert_by_ids_reports_insert_and_update_counts(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("upsert_counts");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float original[] = {1.0f, 0.0f, 0.0f};
+    const float upsert_vectors[][3] = {
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
+    const uint64_t ids[] = {9201, 9202};
+    const char updated_meta[] = "updated";
+    const char inserted_meta[] = "inserted";
+    const void* metas[] = {updated_meta, inserted_meta};
+    const size_t meta_sizes[] = {sizeof(updated_meta), sizeof(inserted_meta)};
+    size_t inserted_count = 777;
+    size_t updated_count = 777;
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, original, ARRAY_LEN(original), ids[0], NULL, 0),
+                "initial upsert target insert should succeed");
+
+    TEST_ASSERT(qihse_vector_db_upsert_by_ids(db, ids, &upsert_vectors[0][0],
+                                              ARRAY_LEN(ids),
+                                              ARRAY_LEN(upsert_vectors[0]),
+                                              metas, meta_sizes,
+                                              &inserted_count, &updated_count),
+                "upsert_by_ids should complete");
+    TEST_ASSERT(inserted_count == 1, "upsert should report one inserted row");
+    TEST_ASSERT(updated_count == 1, "upsert should report one updated row");
+    TEST_ASSERT(close_db(db), "database should close after upsert");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database after upsert");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, upsert_vectors[0], ARRAY_LEN(upsert_vectors[0]),
+                           true, true, &result);
+    TEST_ASSERT(count == 1, "updated upsert row should be searchable");
+    TEST_ASSERT(result.id == ids[0], "updated upsert row should preserve id");
+    TEST_ASSERT(vector_eq(result.vector, upsert_vectors[0], ARRAY_LEN(upsert_vectors[0])),
+                "updated upsert row should hydrate replacement vector");
+    TEST_ASSERT(result.metadata_size == sizeof(updated_meta),
+                "updated upsert metadata size should match");
+    TEST_ASSERT(memcmp(result.metadata, updated_meta, sizeof(updated_meta)) == 0,
+                "updated upsert metadata should match");
+    free_results(&result, 1);
+
+    count = search_one(db, upsert_vectors[1], ARRAY_LEN(upsert_vectors[1]),
+                       true, true, &result);
+    TEST_ASSERT(count == 1, "inserted upsert row should be searchable");
+    TEST_ASSERT(result.id == ids[1], "inserted upsert row should preserve id");
+    TEST_ASSERT(vector_eq(result.vector, upsert_vectors[1], ARRAY_LEN(upsert_vectors[1])),
+                "inserted upsert row should hydrate vector");
+    TEST_ASSERT(result.metadata_size == sizeof(inserted_meta),
+                "inserted upsert metadata size should match");
+    TEST_ASSERT(memcmp(result.metadata, inserted_meta, sizeof(inserted_meta)) == 0,
+                "inserted upsert metadata should match");
+    free_results(&result, 1);
+
+    count = search_one(db, original, ARRAY_LEN(original), false, false, &result);
+    TEST_ASSERT(count == 0, "original row should not remain searchable after upsert update");
+
+    TEST_ASSERT(close_db(db), "database should close after upsert verification");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_read_only_open_rejects_mutations(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("readonly_mutations");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float existing[] = {1.0f, 0.0f, 0.0f};
+    const float replacement[] = {0.0f, 1.0f, 0.0f};
+    const float upsert_vectors[][3] = {
+        {0.0f, 0.0f, 1.0f},
+        {0.5f, 0.5f, 0.0f},
+    };
+    const uint64_t upsert_ids[] = {9301, 9302};
+    const char metadata[] = "readonly-mutation";
+    size_t inserted_count = 123;
+    size_t updated_count = 456;
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, existing, ARRAY_LEN(existing), 9301, metadata, sizeof(metadata)),
+                "initial readonly mutation row insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before read-only mutation checks");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "read-only open should return a database");
+
+    TEST_ASSERT(!qihse_vector_db_delete_by_id(db, 9301),
+                "read-only delete_by_id should be rejected");
+    TEST_ASSERT(!qihse_vector_db_update_by_id(db, 9301, replacement,
+                                              ARRAY_LEN(replacement),
+                                              metadata, sizeof(metadata)),
+                "read-only update_by_id should be rejected");
+    TEST_ASSERT(!qihse_vector_db_upsert_by_ids(db, upsert_ids, &upsert_vectors[0][0],
+                                               ARRAY_LEN(upsert_ids),
+                                               ARRAY_LEN(upsert_vectors[0]),
+                                               NULL, NULL,
+                                               &inserted_count, &updated_count),
+                "read-only upsert_by_ids should be rejected");
+    TEST_ASSERT(!qihse_vector_db_compact(db), "read-only compact should be rejected");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, existing, ARRAY_LEN(existing), true, true, &result);
+    TEST_ASSERT(count == 1, "read-only rejected mutations should leave row searchable");
+    TEST_ASSERT(result.id == 9301, "read-only rejected mutations should preserve id");
+    TEST_ASSERT(vector_eq(result.vector, existing, ARRAY_LEN(existing)),
+                "read-only rejected mutations should preserve vector");
+    TEST_ASSERT(result.metadata_size == sizeof(metadata),
+                "read-only rejected mutations should preserve metadata size");
+    TEST_ASSERT(memcmp(result.metadata, metadata, sizeof(metadata)) == 0,
+                "read-only rejected mutations should preserve metadata bytes");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_compact_preserves_live_rows_after_mutations(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("compact_live_rows");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float deleted[] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float updated_original[] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const float updated_replacement[] = {0.0f, 0.0f, 1.0f, 0.0f};
+    const float untouched[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const char updated_meta[] = "updated-after-compact";
+    const char untouched_meta[] = "untouched-after-compact";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, deleted, ARRAY_LEN(deleted), 9401, NULL, 0),
+                "deleted compact row insert should succeed");
+    TEST_ASSERT(add_one(db, updated_original, ARRAY_LEN(updated_original), 9402, NULL, 0),
+                "updated compact row insert should succeed");
+    TEST_ASSERT(add_one(db, untouched, ARRAY_LEN(untouched), 9403,
+                        untouched_meta, sizeof(untouched_meta)),
+                "untouched compact row insert should succeed");
+
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, 9401),
+                "delete before compact should succeed");
+    TEST_ASSERT(qihse_vector_db_update_by_id(db, 9402, updated_replacement,
+                                             ARRAY_LEN(updated_replacement),
+                                             updated_meta, sizeof(updated_meta)),
+                "update before compact should succeed");
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should succeed after mutations");
+    TEST_ASSERT(close_db(db), "database should close after compact");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db != NULL, "reopen should return a database after compact");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, deleted, ARRAY_LEN(deleted), false, false, &result);
+    TEST_ASSERT(count == 0, "deleted row should remain absent after compact");
+
+    count = search_one(db, updated_original, ARRAY_LEN(updated_original), false, false, &result);
+    TEST_ASSERT(count == 0, "superseded row should remain absent after compact");
+
+    count = search_one(db, updated_replacement, ARRAY_LEN(updated_replacement),
+                       true, true, &result);
+    TEST_ASSERT(count == 1, "updated live row should survive compact");
+    TEST_ASSERT(result.id == 9402, "updated live row id should survive compact");
+    TEST_ASSERT(vector_eq(result.vector, updated_replacement,
+                          ARRAY_LEN(updated_replacement)),
+                "updated live row vector should survive compact");
+    TEST_ASSERT(result.metadata_size == sizeof(updated_meta),
+                "updated live row metadata size should survive compact");
+    TEST_ASSERT(memcmp(result.metadata, updated_meta, sizeof(updated_meta)) == 0,
+                "updated live row metadata should survive compact");
+    free_results(&result, 1);
+
+    count = search_one(db, untouched, ARRAY_LEN(untouched), true, true, &result);
+    TEST_ASSERT(count == 1, "untouched live row should survive compact");
+    TEST_ASSERT(result.id == 9403, "untouched live row id should survive compact");
+    TEST_ASSERT(vector_eq(result.vector, untouched, ARRAY_LEN(untouched)),
+                "untouched live row vector should survive compact");
+    TEST_ASSERT(result.metadata_size == sizeof(untouched_meta),
+                "untouched live row metadata size should survive compact");
+    TEST_ASSERT(memcmp(result.metadata, untouched_meta, sizeof(untouched_meta)) == 0,
+                "untouched live row metadata should survive compact");
+    free_results(&result, 1);
+
+    TEST_ASSERT(close_db(db), "database should close after compact verification");
     remove_tree(path);
     free(path);
     env_destroy(&env);

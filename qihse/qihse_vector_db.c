@@ -311,6 +311,130 @@ static bool qihse_vdb_id_exists(const qihse_vector_db_t vdb, uint64_t id) {
     return false;
 }
 
+static int64_t qihse_vdb_idmap_key(uint64_t id) {
+    return (int64_t)(id ^ UINT64_C(0x8000000000000000));
+}
+
+static bool qihse_vdb_ensure_writable(qihse_vector_db_t vdb) {
+    if (!vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vdb->read_only || vdb->mapped_vectors || vdb->rows_are_mapped ||
+        vdb->mapped_metadata || vdb->mapped_index || vdb->mapped_idmap) {
+        errno = EROFS;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_vdb_has_duplicate_ids(const uint64_t* ids, size_t count) {
+    size_t i;
+    size_t j;
+
+    if (!ids && count != 0u) {
+        errno = EINVAL;
+        return true;
+    }
+    for (i = 0u; i < count; i++) {
+        for (j = i + 1u; j < count; j++) {
+            if (ids[i] == ids[j]) {
+                errno = EEXIST;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool qihse_vdb_find_live_row_by_id(qihse_vector_db_t vdb,
+                                          uint64_t id,
+                                          size_t* out_row_index) {
+    int64_t key;
+    size_t lo;
+    size_t hi;
+    size_t found;
+    bool have_match = false;
+
+    if (!vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!vdb->idmap_valid && !qihse_vdb_rebuild_idmap(vdb, vdb->file_backed && !vdb->read_only)) {
+        return false;
+    }
+    key = qihse_vdb_idmap_key(id);
+    lo = 0u;
+    hi = vdb->idmap_count;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) / 2u);
+        if (vdb->idmap[mid].key < key) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    found = lo;
+    while (found < vdb->idmap_count && vdb->idmap[found].key == key) {
+        uint64_t row64 = vdb->idmap[found].row_index;
+        if (row64 < (uint64_t)vdb->total_vectors) {
+            size_t row_index = (size_t)row64;
+            qihse_index_row_t* row = &vdb->rows[row_index];
+            if (row->vector_id == id &&
+                (row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+                (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+                if (!have_match || (out_row_index && row_index > *out_row_index)) {
+                    if (out_row_index) {
+                        *out_row_index = row_index;
+                    }
+                    have_match = true;
+                }
+            }
+        }
+        found++;
+    }
+    if (!have_match) {
+        errno = ENOENT;
+    }
+    return have_match;
+}
+
+static size_t qihse_vdb_tombstone_live_id(qihse_vector_db_t vdb,
+                                          uint64_t id,
+                                          uint64_t generation) {
+    size_t count = 0u;
+    size_t i;
+
+    for (i = 0u; i < vdb->total_vectors; i++) {
+        qihse_index_row_t* row = &vdb->rows[i];
+        if (row->vector_id == id &&
+            (row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+            row->row_flags |= QIHSE_ROW_F_TOMBSTONE;
+            row->commit_generation = generation;
+            count++;
+        }
+    }
+    if (count != 0u) {
+        vdb->live_vectors -= count;
+        vdb->idmap_valid = false;
+        vdb->idmap_dirty = true;
+        vdb->dirty = true;
+        vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    }
+    return count;
+}
+
+static void qihse_vdb_finish_mutation_generation(qihse_vector_db_t vdb, uint64_t generation) {
+    if (generation >= vdb->next_generation) {
+        vdb->next_generation = generation + 1u;
+    }
+    vdb->dirty = true;
+    vdb->idmap_valid = false;
+    vdb->idmap_dirty = true;
+    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+}
+
 static const float* qihse_vdb_vector_at(const qihse_vector_db_t vdb, const qihse_index_row_t* row) {
     const uint8_t* base = vdb->mapped_vectors ? (const uint8_t*)vdb->mapped_vectors : vdb->vectors;
     uint64_t end;
@@ -1460,6 +1584,325 @@ bool qihse_vector_db_add_vectors(
     return qihse_vdb_apply_add(vdb, &add, true);
 }
 
+bool qihse_vector_db_delete_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id
+) {
+    size_t deleted = 0u;
+
+    if (!qihse_vector_db_delete_by_ids(vdb, &vector_id, 1u, &deleted)) {
+        return false;
+    }
+    if (deleted == 0u) {
+        errno = ENOENT;
+        return false;
+    }
+    return true;
+}
+
+bool qihse_vector_db_delete_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    size_t count,
+    size_t* deleted_count
+) {
+    uint64_t generation;
+    size_t deleted = 0u;
+    size_t i;
+
+    if (deleted_count) {
+        *deleted_count = 0u;
+    }
+    if (!qihse_vdb_ensure_writable(vdb)) {
+        return false;
+    }
+    if (count == 0u) {
+        return true;
+    }
+    if (!vector_ids || qihse_vdb_has_duplicate_ids(vector_ids, count)) {
+        if (!vector_ids) {
+            errno = EINVAL;
+        }
+        return false;
+    }
+    for (i = 0u; i < count; i++) {
+        size_t row_index = 0u;
+        if (!qihse_vdb_find_live_row_by_id(vdb, vector_ids[i], &row_index) && errno != ENOENT) {
+            return false;
+        }
+    }
+
+    generation = vdb->next_generation;
+    for (i = 0u; i < count; i++) {
+        deleted += qihse_vdb_tombstone_live_id(vdb, vector_ids[i], generation) != 0u ? 1u : 0u;
+    }
+    if (deleted != 0u) {
+        qihse_vdb_finish_mutation_generation(vdb, generation);
+    }
+    if (deleted_count) {
+        *deleted_count = deleted;
+    }
+    return true;
+}
+
+static bool qihse_vdb_validate_mutation_vectors(qihse_vector_db_t vdb,
+                                                const uint64_t* vector_ids,
+                                                const float* vectors,
+                                                size_t count,
+                                                size_t dims,
+                                                const void* const* metadata,
+                                                const size_t* metadata_sizes) {
+    size_t i;
+
+    if (!qihse_vdb_ensure_writable(vdb)) {
+        return false;
+    }
+    if (count == 0u) {
+        return true;
+    }
+    if (!vector_ids || !vectors || dims == 0u ||
+        qihse_vdb_has_duplicate_ids(vector_ids, count)) {
+        if (!vector_ids || !vectors || dims == 0u) {
+            errno = EINVAL;
+        }
+        return false;
+    }
+    if (vdb->vector_dims != 0u && vdb->vector_dims != dims) {
+        errno = EINVAL;
+        return false;
+    }
+    for (i = 0u; i < count; i++) {
+        if (metadata_sizes && metadata_sizes[i] != 0u && (!metadata || !metadata[i])) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
+                                      size_t append_count,
+                                      size_t metadata_bytes) {
+    size_t one_vector_bytes;
+    size_t vector_bytes;
+    size_t new_vector_used;
+    size_t new_metadata_used;
+
+    if (append_count == 0u) {
+        return true;
+    }
+    if (!qihse_checked_mul_size(vdb->vector_dims, sizeof(float), &one_vector_bytes) ||
+        !qihse_checked_mul_size(append_count, one_vector_bytes, &vector_bytes) ||
+        !qihse_checked_add_size(vdb->vector_bytes_used, vector_bytes, &new_vector_used) ||
+        !qihse_checked_add_size(vdb->metadata_bytes_used, metadata_bytes, &new_metadata_used) ||
+        !qihse_vdb_reserve_rows(vdb, vdb->total_vectors + append_count) ||
+        !qihse_vdb_reserve_bytes(&vdb->vectors, &vdb->vector_bytes_capacity, new_vector_used) ||
+        !qihse_vdb_reserve_bytes(&vdb->metadata, &vdb->metadata_bytes_capacity, new_metadata_used)) {
+        return false;
+    }
+    return true;
+}
+
+bool qihse_vector_db_update_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    const float* vector,
+    size_t dims,
+    const void* metadata,
+    size_t metadata_size
+) {
+    const void* metadata_items[1];
+    size_t metadata_sizes[1];
+    size_t updated = 0u;
+
+    metadata_items[0] = metadata;
+    metadata_sizes[0] = metadata_size;
+    if (!qihse_vector_db_update_by_ids(vdb, &vector_id, vector, 1u, dims,
+                                       metadata_size == 0u ? NULL : metadata_items,
+                                       metadata_size == 0u ? NULL : metadata_sizes,
+                                       &updated)) {
+        return false;
+    }
+    if (updated == 0u) {
+        errno = ENOENT;
+        return false;
+    }
+    return true;
+}
+
+bool qihse_vector_db_update_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* updated_count
+) {
+    bool* exists = NULL;
+    uint64_t generation;
+    size_t metadata_bytes = 0u;
+    size_t updated = 0u;
+    size_t i;
+
+    if (updated_count) {
+        *updated_count = 0u;
+    }
+    if (!qihse_vdb_validate_mutation_vectors(vdb, vector_ids, vectors, count, dims,
+                                             metadata, metadata_sizes)) {
+        return false;
+    }
+    if (count == 0u) {
+        return true;
+    }
+    if (vdb->vector_dims == 0u) {
+        errno = ENOENT;
+        return true;
+    }
+    exists = (bool*)calloc(count, sizeof(*exists));
+    if (!exists) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (i = 0u; i < count; i++) {
+        size_t row_index = 0u;
+        errno = 0;
+        exists[i] = qihse_vdb_find_live_row_by_id(vdb, vector_ids[i], &row_index);
+        if (!exists[i] && errno != ENOENT) {
+            free(exists);
+            return false;
+        }
+        if (exists[i]) {
+            size_t meta_size = metadata_sizes ? metadata_sizes[i] : 0u;
+            if (!qihse_checked_add_size(metadata_bytes, meta_size, &metadata_bytes)) {
+                free(exists);
+                return false;
+            }
+            updated++;
+        }
+    }
+    if (updated == 0u) {
+        free(exists);
+        if (updated_count) {
+            *updated_count = 0u;
+        }
+        return true;
+    }
+    if (!qihse_vdb_reserve_appends(vdb, updated, metadata_bytes)) {
+        free(exists);
+        return false;
+    }
+
+    generation = vdb->next_generation;
+    for (i = 0u; i < count; i++) {
+        if (!exists[i]) {
+            continue;
+        }
+        size_t meta_size = metadata_sizes ? metadata_sizes[i] : 0u;
+        const void* meta = metadata ? metadata[i] : NULL;
+        qihse_vdb_tombstone_live_id(vdb, vector_ids[i], generation);
+        if (!qihse_vdb_append_row(vdb, vector_ids[i], vectors + (i * dims),
+                                  meta, meta_size, generation)) {
+            free(exists);
+            return false;
+        }
+    }
+    qihse_vdb_finish_mutation_generation(vdb, generation);
+    free(exists);
+    if (updated_count) {
+        *updated_count = updated;
+    }
+    return true;
+}
+
+bool qihse_vector_db_upsert_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* inserted_count,
+    size_t* updated_count
+) {
+    bool* exists = NULL;
+    uint64_t generation;
+    size_t metadata_bytes = 0u;
+    size_t inserted = 0u;
+    size_t updated = 0u;
+    size_t i;
+
+    if (inserted_count) {
+        *inserted_count = 0u;
+    }
+    if (updated_count) {
+        *updated_count = 0u;
+    }
+    if (!qihse_vdb_validate_mutation_vectors(vdb, vector_ids, vectors, count, dims,
+                                             metadata, metadata_sizes)) {
+        return false;
+    }
+    if (count == 0u) {
+        return true;
+    }
+    if (vdb->vector_dims == 0u) {
+        vdb->vector_dims = dims;
+    }
+    exists = (bool*)calloc(count, sizeof(*exists));
+    if (!exists) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (i = 0u; i < count; i++) {
+        size_t row_index = 0u;
+        size_t meta_size = metadata_sizes ? metadata_sizes[i] : 0u;
+        errno = 0;
+        exists[i] = qihse_vdb_find_live_row_by_id(vdb, vector_ids[i], &row_index);
+        if (!exists[i] && errno != ENOENT) {
+            free(exists);
+            return false;
+        }
+        if (!qihse_checked_add_size(metadata_bytes, meta_size, &metadata_bytes)) {
+            free(exists);
+            return false;
+        }
+        if (exists[i]) {
+            updated++;
+        } else {
+            inserted++;
+        }
+    }
+    if (!qihse_vdb_reserve_appends(vdb, count, metadata_bytes)) {
+        free(exists);
+        return false;
+    }
+
+    generation = vdb->next_generation;
+    for (i = 0u; i < count; i++) {
+        size_t meta_size = metadata_sizes ? metadata_sizes[i] : 0u;
+        const void* meta = metadata ? metadata[i] : NULL;
+        if (exists[i]) {
+            qihse_vdb_tombstone_live_id(vdb, vector_ids[i], generation);
+        }
+        if (!qihse_vdb_append_row(vdb, vector_ids[i], vectors + (i * dims),
+                                  meta, meta_size, generation)) {
+            free(exists);
+            return false;
+        }
+    }
+    qihse_vdb_finish_mutation_generation(vdb, generation);
+    free(exists);
+    if (inserted_count) {
+        *inserted_count = inserted;
+    }
+    if (updated_count) {
+        *updated_count = updated;
+    }
+    return true;
+}
+
 int qihse_vector_db_search(
     qihse_vector_db_t vdb,
     const qihse_vector_query_t* query,
@@ -1611,6 +2054,9 @@ bool qihse_vector_db_checkpoint(qihse_vector_db_t vdb) {
 }
 
 bool qihse_vector_db_compact(qihse_vector_db_t vdb) {
+    if (!qihse_vdb_ensure_writable(vdb)) {
+        return false;
+    }
     return qihse_vector_db_flush(vdb);
 }
 
