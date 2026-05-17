@@ -18,6 +18,16 @@ LDFLAGS=-ldl -lm -lpthread
 VXUG_PDF?=../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf
 REFERENCE_WORKLOAD?=vxug-pdf-sample
 
+SIFT1M_BASE_DATA=data/sift1m/sift_base.fvecs
+SIFT1M_QUERY_DATA=data/sift1m/sift_query.fvecs
+SIFT1M_GROUND_TRUTH=data/sift1m/sift_groundtruth.ivecs
+SIFT1M_FALLBACK_WORKLOAD=sift1m-fallback
+SIFT1M_FALLBACK_DIR=data/sift1m/fallback
+SIFT1M_FALLBACK_ROWS=2048
+SIFT1M_FALLBACK_QUERIES=128
+SIFT1M_FALLBACK_DIMENSIONS=128
+SIFT1M_FALLBACK_TOP_K=10
+
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
 SRCS_BASE=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c qihse_vector_db.c qihse_exports.c \
@@ -47,7 +57,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload validate-reference-workflow check-upstream-workflow
+.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data validate-reference-workflow check-upstream-workflow check
 
 .NOTPARALLEL: validate-reference-workflow
 
@@ -144,13 +154,31 @@ bench-reference-workload: lib
 	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root . --workload $(REFERENCE_WORKLOAD) --output-json results/$(REFERENCE_WORKLOAD)/latest.json
 	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload $(REFERENCE_WORKLOAD) --result results/$(REFERENCE_WORKLOAD)/latest.json
 
+bench-sift1m-fallback-data:
+	python3 benchmarks/scripts/qihse_generate_sift1m_fixture.py \
+	    --out-dir $(SIFT1M_FALLBACK_DIR) \
+	    --rows $(SIFT1M_FALLBACK_ROWS) \
+	    --queries $(SIFT1M_FALLBACK_QUERIES) \
+	    --dimensions $(SIFT1M_FALLBACK_DIMENSIONS) \
+	    --top-k $(SIFT1M_FALLBACK_TOP_K) \
+	    --force
+
 bench-reference-result-summary:
 	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload $(REFERENCE_WORKLOAD) --result results/$(REFERENCE_WORKLOAD)/latest.json
 
 bench-sift1m-workload: lib
-	$(MAKE) bench-reference-workload REFERENCE_WORKLOAD=sift1m
+	@if [ -f "$(SIFT1M_BASE_DATA)" ] && [ -f "$(SIFT1M_QUERY_DATA)" ] && [ -f "$(SIFT1M_GROUND_TRUTH)" ]; then \
+	  echo "Using full SIFT1M dataset from data/sift1m/"; \
+	  $(MAKE) bench-reference-workload REFERENCE_WORKLOAD=sift1m; \
+	else \
+	  echo "SIFT1M files missing; generating lightweight deterministic fallback workload"; \
+	  $(MAKE) bench-sift1m-fallback-data; \
+	  $(MAKE) bench-reference-workload REFERENCE_WORKLOAD=$(SIFT1M_FALLBACK_WORKLOAD); \
+	fi
 
-validate-reference-workflow: bench-reference-workloads bench-reference-runner-smoke bench-vxug-pdf-workload test-persist
+validate-reference-workflow: bench-reference-workloads bench-reference-runner-smoke bench-vxug-pdf-workload bench-sift1m-workload test-persist
+
+check: check-upstream-workflow
 
 check-upstream-workflow:
 	python3 scripts/qihse_workflow_check.py --root .

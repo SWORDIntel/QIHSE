@@ -25,8 +25,23 @@ summary gate reads generated JSON and applies the manifest recall floor.
 The next larger calibration target is a SIFT-style workload using `fvecs`
 base/query vectors and `ivecs` ground truth. Do not change trinary default
 candidate-pool multipliers until the VXUG sample and at least one larger
-reference workload provide stable evidence. When SIFT files are available under
-`data/sift1m/`, run `make bench-sift1m-workload`.
+reference workload provide stable evidence. `make bench-sift1m-workload` now
+runs SIFT1M from `data/sift1m/` when available, or a deterministic fallback
+workload (`sift1m-fallback`) when the files are absent.
+Fallback fixtures are generated under `data/sift1m/fallback` and are used only
+for local validation, not as the 1M-scale calibration dataset.
+
+To regenerate the fallback fixture manually:
+
+```bash
+python3 benchmarks/scripts/qihse_generate_sift1m_fixture.py --force
+```
+
+To generate the staged fallback path explicitly:
+
+```bash
+make bench-sift1m-fallback-data
+```
 
 QIHSE should move to an upstream-first workflow: develop and validate QIHSE in
 `https://github.com/SWORDIntel/QIHSE`, then import stable upstream state back
