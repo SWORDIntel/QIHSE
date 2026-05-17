@@ -21,6 +21,7 @@ LDFLAGS=-ldl -lm -lpthread
 SRCS_BASE=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c qihse_vector_db.c qihse_exports.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
      algorithms/qihse_anchor_search.c \
+     codecs/qihse_trinary_tryte_codec.c \
      core/qihse_helpers.c core/qihse_plugin.c \
      algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
      backends/cpu/qihse_cpu_detect.c \
@@ -44,7 +45,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist
+.PHONY: all clean lib test-persist test-trinary-codec
 
 all: lib
 
@@ -59,6 +60,14 @@ test-persist: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_vector_db_persistence_test
 
+test-trinary-codec:
+	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
+	    tests/qihse_trinary_codec_test.c \
+	    codecs/qihse_trinary_tryte_codec.c \
+	    $(LDFLAGS)
+	./tests/qihse_trinary_codec_test
+
 clean:
-	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 tests/qihse_vector_db_persistence_test
+	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
+	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
 	@echo "Clean completed"
