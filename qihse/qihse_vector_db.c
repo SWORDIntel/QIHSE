@@ -46,6 +46,9 @@
 #define QIHSE_VDB_WAL_VERSION 1u
 #define QIHSE_VDB_WAL_ADD 1u
 #define QIHSE_VDB_WAL_COMMIT 2u
+#define QIHSE_VDB_WAL_DELETE 3u
+#define QIHSE_VDB_WAL_UPDATE 4u
+#define QIHSE_VDB_WAL_UPSERT 5u
 #define QIHSE_VDB_WAL_NO_PREV UINT64_MAX
 
 struct qihse_vector_db_s {
@@ -115,6 +118,12 @@ typedef struct qihse_vdb_wal_add_s {
     const void* const* metadata;
     const size_t* metadata_sizes;
 } qihse_vdb_wal_add_t;
+
+typedef qihse_vdb_wal_add_t qihse_vdb_wal_vectors_t;
+
+static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
+                                      size_t append_count,
+                                      size_t metadata_bytes);
 
 static char* qihse_vdb_strdup(const char* s) {
     size_t len;
@@ -939,7 +948,9 @@ static bool qihse_vdb_write_wal_record(qihse_vector_db_t vdb,
     return true;
 }
 
-static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_add_t* add) {
+static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
+                                        uint32_t type,
+                                        const qihse_vdb_wal_vectors_t* vectors_record) {
     char path[PATH_MAX];
     uint8_t fixed[32];
     uint8_t commit_payload[16];
@@ -951,24 +962,34 @@ static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_a
     size_t payload_size;
     size_t offset = 0u;
     size_t i;
-    uint64_t add_offset;
-    uint64_t add_crc;
+    uint64_t mutation_offset;
+    uint64_t mutation_crc;
     uint64_t commit_offset;
     int fd;
     bool ok = false;
 
-    if (!vdb || !vdb->db_path || !add) {
+    if (!vdb || !vdb->db_path || !vectors_record ||
+        (type != QIHSE_VDB_WAL_ADD && type != QIHSE_VDB_WAL_DELETE &&
+         type != QIHSE_VDB_WAL_UPDATE && type != QIHSE_VDB_WAL_UPSERT)) {
         errno = EINVAL;
         return false;
     }
-    if (!qihse_checked_mul_size((size_t)add->count, (size_t)add->dims, &vector_bytes) ||
-        !qihse_checked_mul_size(vector_bytes, sizeof(float), &vector_bytes) ||
-        !qihse_checked_mul_size((size_t)add->count, sizeof(uint64_t), &ids_bytes) ||
-        !qihse_checked_mul_size((size_t)add->count, sizeof(uint64_t), &sizes_bytes)) {
+    if ((type == QIHSE_VDB_WAL_DELETE && vectors_record->dims != 0u) ||
+        (type != QIHSE_VDB_WAL_DELETE &&
+         (!vectors_record->vectors || vectors_record->dims == 0u))) {
+        errno = EINVAL;
         return false;
     }
-    for (i = 0u; i < (size_t)add->count; i++) {
-        size_t meta_size = (add->metadata && add->metadata_sizes) ? add->metadata_sizes[i] : 0u;
+    if (!qihse_checked_mul_size((size_t)vectors_record->count,
+                                (size_t)vectors_record->dims, &vector_bytes) ||
+        !qihse_checked_mul_size(vector_bytes, sizeof(float), &vector_bytes) ||
+        !qihse_checked_mul_size((size_t)vectors_record->count, sizeof(uint64_t), &ids_bytes) ||
+        !qihse_checked_mul_size((size_t)vectors_record->count, sizeof(uint64_t), &sizes_bytes)) {
+        return false;
+    }
+    for (i = 0u; i < (size_t)vectors_record->count; i++) {
+        size_t meta_size = (vectors_record->metadata && vectors_record->metadata_sizes) ?
+                           vectors_record->metadata_sizes[i] : 0u;
         if (!qihse_checked_add_size(metadata_bytes, meta_size, &metadata_bytes)) {
             return false;
         }
@@ -985,28 +1006,34 @@ static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_a
         errno = ENOMEM;
         return false;
     }
-    qihse_le_write_u64(fixed + 0u, add->count);
-    qihse_le_write_u64(fixed + 8u, add->dims);
+    qihse_le_write_u64(fixed + 0u, vectors_record->count);
+    qihse_le_write_u64(fixed + 8u, vectors_record->dims);
     qihse_le_write_u64(fixed + 16u, (uint64_t)vector_bytes);
     qihse_le_write_u64(fixed + 24u, (uint64_t)metadata_bytes);
     memcpy(payload + offset, fixed, sizeof(fixed));
     offset += sizeof(fixed);
-    for (i = 0u; i < (size_t)add->count; i++) {
-        qihse_le_write_u64(payload + offset, add->ids ? add->ids[i] : vdb->next_auto_id + i);
-        offset += sizeof(uint64_t);
-    }
-    for (i = 0u; i < (size_t)add->count; i++) {
+    for (i = 0u; i < (size_t)vectors_record->count; i++) {
         qihse_le_write_u64(payload + offset,
-                           (uint64_t)((add->metadata && add->metadata_sizes) ?
-                                      add->metadata_sizes[i] : 0u));
+                           vectors_record->ids ? vectors_record->ids[i] :
+                           vdb->next_auto_id + i);
         offset += sizeof(uint64_t);
     }
-    memcpy(payload + offset, add->vectors, vector_bytes);
-    offset += vector_bytes;
-    for (i = 0u; i < (size_t)add->count; i++) {
-        size_t meta_size = (add->metadata && add->metadata_sizes) ? add->metadata_sizes[i] : 0u;
+    for (i = 0u; i < (size_t)vectors_record->count; i++) {
+        qihse_le_write_u64(payload + offset,
+                           (uint64_t)((vectors_record->metadata &&
+                                       vectors_record->metadata_sizes) ?
+                                      vectors_record->metadata_sizes[i] : 0u));
+        offset += sizeof(uint64_t);
+    }
+    if (vector_bytes != 0u) {
+        memcpy(payload + offset, vectors_record->vectors, vector_bytes);
+        offset += vector_bytes;
+    }
+    for (i = 0u; i < (size_t)vectors_record->count; i++) {
+        size_t meta_size = (vectors_record->metadata && vectors_record->metadata_sizes) ?
+                           vectors_record->metadata_sizes[i] : 0u;
         if (meta_size != 0u) {
-            memcpy(payload + offset, add->metadata[i], meta_size);
+            memcpy(payload + offset, vectors_record->metadata[i], meta_size);
             offset += meta_size;
         }
     }
@@ -1020,14 +1047,15 @@ static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_a
         free(payload);
         return false;
     }
-    ok = qihse_vdb_write_wal_record(vdb, fd, QIHSE_VDB_WAL_ADD, add->generation,
+    ok = qihse_vdb_write_wal_record(vdb, fd, type, vectors_record->generation,
                                     payload, payload_size, vdb->wal_last_record_offset,
-                                    &add_offset, &add_crc);
+                                    &mutation_offset, &mutation_crc);
     if (ok) {
-        qihse_le_write_u64(commit_payload + 0u, add_offset);
-        qihse_le_write_u64(commit_payload + 8u, add_crc);
-        ok = qihse_vdb_write_wal_record(vdb, fd, QIHSE_VDB_WAL_COMMIT, add->generation,
-                                        commit_payload, sizeof(commit_payload), add_offset,
+        qihse_le_write_u64(commit_payload + 0u, mutation_offset);
+        qihse_le_write_u64(commit_payload + 8u, mutation_crc);
+        ok = qihse_vdb_write_wal_record(vdb, fd, QIHSE_VDB_WAL_COMMIT,
+                                        vectors_record->generation,
+                                        commit_payload, sizeof(commit_payload), mutation_offset,
                                         &commit_offset, NULL);
     }
     if (ok) {
@@ -1045,11 +1073,144 @@ static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_a
     return ok;
 }
 
+static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_add_t* add) {
+    return qihse_vdb_write_wal_vectors(vdb, QIHSE_VDB_WAL_ADD, add);
+}
+
+static bool qihse_vdb_apply_delete_payload(qihse_vector_db_t vdb,
+                                           const qihse_vdb_wal_vectors_t* record) {
+    size_t deleted = 0u;
+
+    if (!vdb || !record || !record->ids || record->count == 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    for (size_t i = 0u; i < (size_t)record->count; i++) {
+        deleted += qihse_vdb_tombstone_live_id(vdb, record->ids[i],
+                                               record->generation) != 0u ? 1u : 0u;
+    }
+    if (deleted != 0u) {
+        qihse_vdb_finish_mutation_generation(vdb, record->generation);
+    }
+    return true;
+}
+
+static bool qihse_vdb_apply_update_payload(qihse_vector_db_t vdb,
+                                           const qihse_vdb_wal_vectors_t* record) {
+    bool* exists = NULL;
+    size_t metadata_bytes = 0u;
+    size_t updated = 0u;
+
+    if (!vdb || !record || !record->ids || !record->vectors || record->count == 0u ||
+        record->dims == 0u || record->dims > (uint64_t)SIZE_MAX ||
+        (vdb->vector_dims != 0u && vdb->vector_dims != (size_t)record->dims)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vdb->vector_dims == 0u) {
+        return true;
+    }
+    exists = (bool*)calloc((size_t)record->count, sizeof(*exists));
+    if (!exists) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (size_t i = 0u; i < (size_t)record->count; i++) {
+        size_t row_index = 0u;
+        size_t meta_size = record->metadata_sizes ? record->metadata_sizes[i] : 0u;
+        errno = 0;
+        exists[i] = qihse_vdb_find_live_row_by_id(vdb, record->ids[i], &row_index);
+        if (!exists[i] && errno != ENOENT) {
+            free(exists);
+            return false;
+        }
+        if (exists[i]) {
+            if (!qihse_checked_add_size(metadata_bytes, meta_size, &metadata_bytes)) {
+                free(exists);
+                return false;
+            }
+            updated++;
+        }
+    }
+    if (updated == 0u) {
+        free(exists);
+        return true;
+    }
+    if (!qihse_vdb_reserve_appends(vdb, updated, metadata_bytes)) {
+        free(exists);
+        return false;
+    }
+    for (size_t i = 0u; i < (size_t)record->count; i++) {
+        size_t meta_size;
+        const void* meta;
+
+        if (!exists[i]) {
+            continue;
+        }
+        meta_size = record->metadata_sizes ? record->metadata_sizes[i] : 0u;
+        meta = record->metadata ? record->metadata[i] : NULL;
+        qihse_vdb_tombstone_live_id(vdb, record->ids[i], record->generation);
+        if (!qihse_vdb_append_row(vdb, record->ids[i],
+                                  record->vectors + (i * (size_t)record->dims),
+                                  meta, meta_size, record->generation)) {
+            free(exists);
+            return false;
+        }
+    }
+    qihse_vdb_finish_mutation_generation(vdb, record->generation);
+    free(exists);
+    return true;
+}
+
+static bool qihse_vdb_apply_upsert_payload(qihse_vector_db_t vdb,
+                                           const qihse_vdb_wal_vectors_t* record) {
+    size_t metadata_bytes = 0u;
+
+    if (!vdb || !record || !record->ids || !record->vectors || record->count == 0u ||
+        record->dims == 0u || record->dims > (uint64_t)SIZE_MAX ||
+        (vdb->vector_dims != 0u && vdb->vector_dims != (size_t)record->dims)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vdb->vector_dims == 0u) {
+        vdb->vector_dims = (size_t)record->dims;
+    }
+    for (size_t i = 0u; i < (size_t)record->count; i++) {
+        size_t meta_size = record->metadata_sizes ? record->metadata_sizes[i] : 0u;
+        if (!qihse_checked_add_size(metadata_bytes, meta_size, &metadata_bytes)) {
+            return false;
+        }
+    }
+    if (!qihse_vdb_reserve_appends(vdb, (size_t)record->count, metadata_bytes)) {
+        return false;
+    }
+    for (size_t i = 0u; i < (size_t)record->count; i++) {
+        size_t row_index = 0u;
+        size_t meta_size = record->metadata_sizes ? record->metadata_sizes[i] : 0u;
+        const void* meta = record->metadata ? record->metadata[i] : NULL;
+
+        errno = 0;
+        if (qihse_vdb_find_live_row_by_id(vdb, record->ids[i], &row_index)) {
+            qihse_vdb_tombstone_live_id(vdb, record->ids[i], record->generation);
+        } else if (errno != ENOENT) {
+            return false;
+        }
+        if (!qihse_vdb_append_row(vdb, record->ids[i],
+                                  record->vectors + (i * (size_t)record->dims),
+                                  meta, meta_size, record->generation)) {
+            return false;
+        }
+    }
+    qihse_vdb_finish_mutation_generation(vdb, record->generation);
+    return true;
+}
+
 static bool qihse_vdb_replay_wal_payload(qihse_vector_db_t vdb,
+                                         uint32_t type,
                                          uint64_t generation,
                                          const uint8_t* payload,
                                          size_t payload_size) {
-    qihse_vdb_wal_add_t add;
+    qihse_vdb_wal_vectors_t record;
     uint64_t count;
     uint64_t dims;
     uint64_t vector_bytes;
@@ -1073,8 +1234,10 @@ static bool qihse_vdb_replay_wal_payload(qihse_vector_db_t vdb,
     vector_bytes = qihse_le_read_u64(payload + 16u);
     metadata_bytes = qihse_le_read_u64(payload + 24u);
     offset = 32u;
-    if (count == 0u || dims == 0u || count > (uint64_t)SIZE_MAX ||
-        dims > (uint64_t)SIZE_MAX ||
+    if (count == 0u || count > (uint64_t)SIZE_MAX || dims > (uint64_t)SIZE_MAX ||
+        (type == QIHSE_VDB_WAL_DELETE && (dims != 0u || vector_bytes != 0u ||
+                                          metadata_bytes != 0u)) ||
+        (type != QIHSE_VDB_WAL_DELETE && dims == 0u) ||
         !qihse_checked_mul_size((size_t)count, (size_t)dims, &calc_vector_bytes) ||
         !qihse_checked_mul_size(calc_vector_bytes, sizeof(float), &calc_vector_bytes) ||
         calc_vector_bytes != (size_t)vector_bytes ||
@@ -1128,15 +1291,26 @@ static bool qihse_vdb_replay_wal_payload(qihse_vector_db_t vdb,
         }
     }
 
-    memset(&add, 0, sizeof(add));
-    add.generation = generation;
-    add.count = count;
-    add.dims = dims;
-    add.ids = ids;
-    add.vectors = vectors;
-    add.metadata = metadata;
-    add.metadata_sizes = meta_sizes;
-    ok = qihse_vdb_apply_add(vdb, &add, true);
+    memset(&record, 0, sizeof(record));
+    record.generation = generation;
+    record.count = count;
+    record.dims = dims;
+    record.ids = ids;
+    record.vectors = vectors;
+    record.metadata = metadata;
+    record.metadata_sizes = meta_sizes;
+    if (type == QIHSE_VDB_WAL_ADD) {
+        ok = qihse_vdb_apply_add(vdb, &record, true);
+    } else if (type == QIHSE_VDB_WAL_DELETE) {
+        ok = qihse_vdb_apply_delete_payload(vdb, &record);
+    } else if (type == QIHSE_VDB_WAL_UPDATE) {
+        ok = qihse_vdb_apply_update_payload(vdb, &record);
+    } else if (type == QIHSE_VDB_WAL_UPSERT) {
+        ok = qihse_vdb_apply_upsert_payload(vdb, &record);
+    } else {
+        errno = EINVAL;
+        ok = false;
+    }
     if (ok) {
         vdb->wal_records_replayed++;
     }
@@ -1155,11 +1329,13 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
     uint64_t pending = 0u;
     uint64_t valid_end = 0u;
     uint64_t last_record_offset = QIHSE_VDB_WAL_NO_PREV;
-    uint8_t* pending_add = NULL;
-    size_t pending_add_size = 0u;
-    uint64_t pending_add_generation = 0u;
-    uint64_t pending_add_offset = 0u;
-    uint64_t pending_add_crc = 0u;
+    uint64_t valid_last_record_offset = QIHSE_VDB_WAL_NO_PREV;
+    uint8_t* pending_payload = NULL;
+    size_t pending_payload_size = 0u;
+    uint32_t pending_type = 0u;
+    uint64_t pending_generation = 0u;
+    uint64_t pending_offset = 0u;
+    uint64_t pending_crc = 0u;
 
     if (!vdb || !vdb->db_path || !qihse_vdb_path(path, vdb->db_path, QIHSE_VDB_WAL_NAME)) {
         return false;
@@ -1200,7 +1376,9 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
         crc = qihse_le_read_u64(header + 32u);
         prev_offset = qihse_le_read_u64(header + 40u);
         if (version != QIHSE_VDB_WAL_VERSION ||
-            (type != QIHSE_VDB_WAL_ADD && type != QIHSE_VDB_WAL_COMMIT) ||
+            (type != QIHSE_VDB_WAL_ADD && type != QIHSE_VDB_WAL_COMMIT &&
+             type != QIHSE_VDB_WAL_DELETE && type != QIHSE_VDB_WAL_UPDATE &&
+             type != QIHSE_VDB_WAL_UPSERT) ||
             payload_size64 > (uint64_t)SIZE_MAX ||
             (record_start != 0u && prev_offset != last_record_offset) ||
             (record_start == 0u && prev_offset != QIHSE_VDB_WAL_NO_PREV && prev_offset != 0u)) {
@@ -1208,7 +1386,7 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
         }
         payload = (uint8_t*)malloc((size_t)payload_size64 ? (size_t)payload_size64 : 1u);
         if (!payload) {
-            free(pending_add);
+            free(pending_payload);
             close(fd);
             errno = ENOMEM;
             return false;
@@ -1228,50 +1406,53 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
             free(payload);
             break;
         }
-        if (type == QIHSE_VDB_WAL_ADD) {
-            free(pending_add);
-            pending_add = payload;
-            pending_add_size = (size_t)payload_size64;
-            pending_add_generation = generation;
-            pending_add_offset = record_start;
-            pending_add_crc = crc;
+        if (type != QIHSE_VDB_WAL_COMMIT) {
+            free(pending_payload);
+            pending_payload = payload;
+            pending_payload_size = (size_t)payload_size64;
+            pending_type = type;
+            pending_generation = generation;
+            pending_offset = record_start;
+            pending_crc = crc;
             payload = NULL;
         } else {
-            uint64_t add_offset;
-            uint64_t add_crc;
+            uint64_t mutation_offset;
+            uint64_t mutation_crc;
 
-            if ((size_t)payload_size64 != 16u || !pending_add) {
+            if ((size_t)payload_size64 != 16u || !pending_payload) {
                 free(payload);
                 break;
             }
-            add_offset = qihse_le_read_u64(payload + 0u);
-            add_crc = qihse_le_read_u64(payload + 8u);
-            if (generation != pending_add_generation ||
-                add_offset != pending_add_offset ||
-                add_crc != pending_add_crc) {
+            mutation_offset = qihse_le_read_u64(payload + 0u);
+            mutation_crc = qihse_le_read_u64(payload + 8u);
+            if (generation != pending_generation ||
+                mutation_offset != pending_offset ||
+                mutation_crc != pending_crc) {
                 free(payload);
                 break;
             }
             ok = true;
             if (generation > vdb->committed_generation) {
-                ok = qihse_vdb_replay_wal_payload(vdb, generation,
-                                                  pending_add, pending_add_size);
+                ok = qihse_vdb_replay_wal_payload(vdb, pending_type, generation,
+                                                  pending_payload, pending_payload_size);
             }
-            free(pending_add);
-            pending_add = NULL;
-            pending_add_size = 0u;
+            free(pending_payload);
+            pending_payload = NULL;
+            pending_payload_size = 0u;
+            pending_type = 0u;
             if (!ok) {
                 free(payload);
                 close(fd);
                 return false;
             }
             valid_end = record_end;
+            valid_last_record_offset = record_start;
         }
         free(payload);
         last_record_offset = record_start;
         pending = record_end;
     }
-    free(pending_add);
+    free(pending_payload);
     if (pending != valid_end && !vdb->read_only) {
         if (!qihse_vdb_truncate_existing_file(vdb->db_path, QIHSE_VDB_WAL_NAME, valid_end)) {
             close(fd);
@@ -1280,7 +1461,7 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
     }
     close(fd);
     vdb->wal_bytes_pending = valid_end;
-    vdb->wal_last_record_offset = valid_end == 0u ? QIHSE_VDB_WAL_NO_PREV : last_record_offset;
+    vdb->wal_last_record_offset = valid_end == 0u ? QIHSE_VDB_WAL_NO_PREV : valid_last_record_offset;
     return true;
 }
 
@@ -1627,14 +1808,34 @@ bool qihse_vector_db_delete_by_ids(
     }
     for (i = 0u; i < count; i++) {
         size_t row_index = 0u;
-        if (!qihse_vdb_find_live_row_by_id(vdb, vector_ids[i], &row_index) && errno != ENOENT) {
+        bool found;
+        errno = 0;
+        found = qihse_vdb_find_live_row_by_id(vdb, vector_ids[i], &row_index);
+        if (!found && errno != ENOENT) {
             return false;
+        }
+        if (found) {
+            deleted++;
         }
     }
 
     generation = vdb->next_generation;
-    for (i = 0u; i < count; i++) {
-        deleted += qihse_vdb_tombstone_live_id(vdb, vector_ids[i], generation) != 0u ? 1u : 0u;
+    if (deleted != 0u && vdb->file_backed) {
+        qihse_vdb_wal_vectors_t record;
+        memset(&record, 0, sizeof(record));
+        record.generation = generation;
+        record.count = (uint64_t)count;
+        record.ids = vector_ids;
+        if (!qihse_vdb_write_wal_vectors(vdb, QIHSE_VDB_WAL_DELETE, &record)) {
+            return false;
+        }
+    }
+    if (deleted != 0u) {
+        deleted = 0u;
+        for (i = 0u; i < count; i++) {
+            deleted += qihse_vdb_tombstone_live_id(vdb, vector_ids[i],
+                                                   generation) != 0u ? 1u : 0u;
+        }
     }
     if (deleted != 0u) {
         qihse_vdb_finish_mutation_generation(vdb, generation);
@@ -1795,6 +1996,21 @@ bool qihse_vector_db_update_by_ids(
     }
 
     generation = vdb->next_generation;
+    if (vdb->file_backed) {
+        qihse_vdb_wal_vectors_t record;
+        memset(&record, 0, sizeof(record));
+        record.generation = generation;
+        record.count = (uint64_t)count;
+        record.dims = (uint64_t)dims;
+        record.ids = vector_ids;
+        record.vectors = vectors;
+        record.metadata = metadata;
+        record.metadata_sizes = metadata_sizes;
+        if (!qihse_vdb_write_wal_vectors(vdb, QIHSE_VDB_WAL_UPDATE, &record)) {
+            free(exists);
+            return false;
+        }
+    }
     for (i = 0u; i < count; i++) {
         if (!exists[i]) {
             continue;
@@ -1880,6 +2096,21 @@ bool qihse_vector_db_upsert_by_ids(
     }
 
     generation = vdb->next_generation;
+    if (vdb->file_backed) {
+        qihse_vdb_wal_vectors_t record;
+        memset(&record, 0, sizeof(record));
+        record.generation = generation;
+        record.count = (uint64_t)count;
+        record.dims = (uint64_t)dims;
+        record.ids = vector_ids;
+        record.vectors = vectors;
+        record.metadata = metadata;
+        record.metadata_sizes = metadata_sizes;
+        if (!qihse_vdb_write_wal_vectors(vdb, QIHSE_VDB_WAL_UPSERT, &record)) {
+            free(exists);
+            return false;
+        }
+    }
     for (i = 0u; i < count; i++) {
         size_t meta_size = metadata_sizes ? metadata_sizes[i] : 0u;
         const void* meta = metadata ? metadata[i] : NULL;
