@@ -84,6 +84,85 @@ static bool test_matrix_and_similarity(void) {
     return true;
 }
 
+static bool test_topk_candidate_selection(void) {
+    const float vectors[] = {
+        1.0f, 0.0f, -1.0f, 0.0f,
+        1.0f, 1.0f, -1.0f, 0.0f,
+        2.0f, 3.0f, -4.0f, 0.0f,
+        -1.0f, -1.0f, 1.0f, 0.0f,
+        1.0f, -1.0f, -1.0f, 0.0f,
+    };
+    const float query[] = {1.0f, 1.0f, -1.0f, 0.0f};
+    uint8_t encoded[5] = {0u, 0u, 0u, 0u, 0u};
+    uint8_t encoded_query[1] = {0u};
+    size_t indexes[4] = {999u, 999u, 999u, 999u};
+    int32_t scores[4] = {-99, -99, -99, -99};
+    size_t count = 999u;
+
+    TEST_ASSERT(qihse_trinary_tryte_encode_matrix(vectors, 5u, 4u,
+                                                  encoded, sizeof(encoded)),
+                "candidate matrix should encode");
+    TEST_ASSERT(qihse_trinary_tryte_encode_row(query, 4u,
+                                               encoded_query,
+                                               sizeof(encoded_query)),
+                "query row should encode");
+    TEST_ASSERT(qihse_trinary_tryte_select_topk(encoded,
+                                                encoded_query,
+                                                5u,
+                                                4u,
+                                                indexes,
+                                                scores,
+                                                4u,
+                                                &count),
+                "top-k selection should succeed");
+    TEST_ASSERT(count == 4u, "top-k should fill requested result count");
+    TEST_ASSERT(indexes[0] == 1u && scores[0] == 3,
+                "best candidate should be first exact match");
+    TEST_ASSERT(indexes[1] == 2u && scores[1] == 3,
+                "equal-score candidate should preserve lower row index first");
+    TEST_ASSERT(indexes[2] == 0u && scores[2] == 2,
+                "third candidate should be partial match");
+    TEST_ASSERT(indexes[3] == 4u && scores[3] == 1,
+                "fourth candidate should be next highest score");
+    return true;
+}
+
+static bool test_topk_invalid_tryte_rejected(void) {
+    uint8_t encoded[] = {0u, 243u, 0u};
+    uint8_t query[] = {0u};
+    size_t indexes[2] = {999u, 999u};
+    int32_t scores[2] = {-99, -99};
+    size_t count = 999u;
+
+    TEST_ASSERT(!qihse_trinary_tryte_select_topk(encoded,
+                                                 query,
+                                                 3u,
+                                                 5u,
+                                                 indexes,
+                                                 scores,
+                                                 2u,
+                                                 &count),
+                "top-k should reject invalid candidate trytes");
+    TEST_ASSERT(errno == EINVAL, "invalid candidate tryte should set EINVAL");
+    TEST_ASSERT(count == 0u, "invalid selection should clear out_count");
+
+    encoded[1] = 0u;
+    query[0] = 243u;
+    count = 999u;
+    TEST_ASSERT(!qihse_trinary_tryte_select_topk(encoded,
+                                                 query,
+                                                 3u,
+                                                 5u,
+                                                 indexes,
+                                                 scores,
+                                                 2u,
+                                                 &count),
+                "top-k should reject invalid query trytes");
+    TEST_ASSERT(errno == EINVAL, "invalid query tryte should set EINVAL");
+    TEST_ASSERT(count == 0u, "invalid query should clear out_count");
+    return true;
+}
+
 int main(void) {
     struct test_case {
         const char* name;
@@ -93,6 +172,8 @@ int main(void) {
         {"pack/unpack/validation", test_pack_unpack_and_validation},
         {"encode row padding", test_encode_row_padding},
         {"matrix and similarity", test_matrix_and_similarity},
+        {"top-k candidate selection", test_topk_candidate_selection},
+        {"top-k invalid tryte rejection", test_topk_invalid_tryte_rejected},
     };
     size_t i;
 

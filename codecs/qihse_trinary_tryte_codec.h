@@ -64,6 +64,22 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
                                         size_t dims,
                                         int32_t* out_score);
 
+/*
+ * Deterministic top-k candidate selection over encoded rows.
+ *
+ * Results are ordered by descending signed-trit similarity score. Equal scores
+ * are ordered by lower row index first. The output row indexes refer to the
+ * input row ordinal, not an external vector id.
+ */
+bool qihse_trinary_tryte_select_topk(const uint8_t* encoded_rows,
+                                     const uint8_t* encoded_query,
+                                     size_t row_count,
+                                     size_t dims,
+                                     size_t* out_row_indexes,
+                                     int32_t* out_scores,
+                                     size_t max_results,
+                                     size_t* out_count);
+
 #ifdef __cplusplus
 }
 #endif

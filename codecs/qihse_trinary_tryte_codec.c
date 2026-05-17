@@ -229,3 +229,91 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
     *out_score = score;
     return true;
 }
+
+static bool qihse_tryte_candidate_is_better(int32_t lhs_score,
+                                            size_t lhs_row,
+                                            int32_t rhs_score,
+                                            size_t rhs_row) {
+    return lhs_score > rhs_score ||
+           (lhs_score == rhs_score && lhs_row < rhs_row);
+}
+
+bool qihse_trinary_tryte_select_topk(const uint8_t* encoded_rows,
+                                     const uint8_t* encoded_query,
+                                     size_t row_count,
+                                     size_t dims,
+                                     size_t* out_row_indexes,
+                                     int32_t* out_scores,
+                                     size_t max_results,
+                                     size_t* out_count) {
+    size_t row_bytes;
+    size_t payload_bytes;
+    size_t selected = 0u;
+    size_t row;
+
+    if (!out_count) {
+        errno = EINVAL;
+        return false;
+    }
+    *out_count = 0u;
+    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes) ||
+        !qihse_tryte_checked_mul_size(row_count, row_bytes, &payload_bytes)) {
+        return false;
+    }
+    if ((!encoded_rows && payload_bytes != 0u) ||
+        (!encoded_query && row_bytes != 0u) ||
+        (!out_row_indexes && max_results != 0u) ||
+        (!out_scores && max_results != 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_validate(encoded_query, row_bytes) ||
+        !qihse_trinary_tryte_validate(encoded_rows, payload_bytes)) {
+        return false;
+    }
+    if (row_count == 0u || max_results == 0u) {
+        return true;
+    }
+
+    for (row = 0u; row < row_count; row++) {
+        const uint8_t* candidate = row_bytes == 0u
+                                       ? NULL
+                                       : encoded_rows + (row * row_bytes);
+        int32_t score = 0;
+        size_t insert_at;
+
+        if (!qihse_trinary_tryte_similarity_i32(candidate,
+                                               encoded_query,
+                                               dims,
+                                               &score)) {
+            return false;
+        }
+
+        insert_at = selected;
+        while (insert_at > 0u &&
+               qihse_tryte_candidate_is_better(score,
+                                                row,
+                                                out_scores[insert_at - 1u],
+                                                out_row_indexes[insert_at - 1u])) {
+            insert_at--;
+        }
+        if (insert_at >= max_results) {
+            continue;
+        }
+        if (selected < max_results) {
+            selected++;
+        }
+        if (selected > insert_at + 1u) {
+            size_t move;
+            for (move = selected - 1u; move > insert_at; move--) {
+                out_row_indexes[move] = out_row_indexes[move - 1u];
+                out_scores[move] = out_scores[move - 1u];
+            }
+        }
+        out_row_indexes[insert_at] = row;
+        out_scores[insert_at] = score;
+    }
+
+    *out_count = selected;
+    return true;
+}
