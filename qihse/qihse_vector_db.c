@@ -28,8 +28,14 @@
 #define QIHSE_VDB_WAL_NAME "wal.qwal"
 #define QIHSE_VDB_VECTOR_NAME "vectors.qvec"
 #define QIHSE_VDB_METADATA_NAME "metadata.qmeta"
+#define QIHSE_VDB_IDMAP_NAME "idmap.qid"
 #define QIHSE_VDB_TRINARY_NAME "vectors.qtri"
 #define QIHSE_VDB_MANIFEST_NAME "MANIFEST"
+
+#define QIHSE_VDB_IDMAP_MAGIC "QIHSEQID"
+#define QIHSE_VDB_FILE_HEADER_SIZE 32u
+#define QIHSE_VDB_FORMAT_VERSION 1u
+#define QIHSE_VDB_IDMAP_ENTRY_DISK_SIZE 16u
 
 #define QIHSE_VDB_WAL_MAGIC "QHWAL01\0"
 #define QIHSE_VDB_WAL_HEADER_SIZE 64u
@@ -76,6 +82,9 @@ struct qihse_vector_db_s {
     int metadata_mmap_fd;
     void* mapped_metadata;
     size_t mapped_metadata_bytes;
+    int idmap_mmap_fd;
+    void* mapped_idmap;
+    size_t mapped_idmap_bytes;
 
     qihse_vector_db_trinary_status_t trinary_status;
     uint64_t trinary_row_bytes;
@@ -192,7 +201,7 @@ static void qihse_vdb_remove_snapshot_files(const char* db_path) {
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_VECTOR_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_METADATA_NAME);
     (void)qihse_vdb_remove_file(db_path, "index.qidx");
-    (void)qihse_vdb_remove_file(db_path, "idmap.qid");
+    (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_IDMAP_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_TRINARY_NAME);
     (void)qihse_vdb_remove_file(db_path, QIHSE_VDB_WAL_NAME);
 }
@@ -259,6 +268,16 @@ static bool qihse_vdb_u64_to_size(uint64_t value, size_t* out) {
 static bool qihse_vdb_rebuild_idmap(qihse_vector_db_t vdb, bool mark_dirty) {
     qihse_idmap_entry_t* entries = NULL;
     size_t count = 0u;
+
+    if (vdb->mapped_idmap && vdb->mapped_idmap != MAP_FAILED) {
+        munmap(vdb->mapped_idmap, vdb->mapped_idmap_bytes);
+    }
+    vdb->mapped_idmap = NULL;
+    vdb->mapped_idmap_bytes = 0u;
+    if (vdb->idmap_mmap_fd >= 0) {
+        close(vdb->idmap_mmap_fd);
+    }
+    vdb->idmap_mmap_fd = -1;
 
     if (!qihse_vector_store_build_idmap(vdb->rows, vdb->total_vectors, &entries, &count)) {
         return false;
@@ -351,6 +370,15 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
         close(vdb->metadata_mmap_fd);
     }
     vdb->metadata_mmap_fd = -1;
+    if (vdb->mapped_idmap && vdb->mapped_idmap != MAP_FAILED) {
+        munmap(vdb->mapped_idmap, vdb->mapped_idmap_bytes);
+    }
+    vdb->mapped_idmap = NULL;
+    vdb->mapped_idmap_bytes = 0u;
+    if (vdb->idmap_mmap_fd >= 0) {
+        close(vdb->idmap_mmap_fd);
+    }
+    vdb->idmap_mmap_fd = -1;
 }
 
 static bool qihse_vdb_map_snapshot_file(qihse_vector_db_t vdb,
@@ -401,6 +429,94 @@ static bool qihse_vdb_map_metadata(qihse_vector_db_t vdb) {
         return false;
     }
     vdb->mapped_metadata_bytes = vdb->metadata_bytes_used;
+    return true;
+}
+
+static bool qihse_vdb_validate_mapped_idmap(qihse_vector_db_t vdb,
+                                            const qihse_vector_store_manifest_t* manifest) {
+    const uint8_t* data = (const uint8_t*)vdb->mapped_idmap;
+    const uint8_t* payload;
+    uint64_t count64;
+    uint64_t crc64;
+    uint32_t row_bytes;
+    size_t entry_count;
+    size_t payload_size;
+    size_t expected_size;
+    int64_t previous_key = INT64_MIN;
+
+    if (!data || !manifest || vdb->mapped_idmap_bytes < QIHSE_VDB_FILE_HEADER_SIZE ||
+        memcmp(data, QIHSE_VDB_IDMAP_MAGIC, 8u) != 0 ||
+        qihse_le_read_u32(data + 8u) != QIHSE_VDB_FORMAT_VERSION) {
+        errno = EINVAL;
+        return false;
+    }
+
+    row_bytes = qihse_le_read_u32(data + 12u);
+    count64 = qihse_le_read_u64(data + 16u);
+    crc64 = qihse_le_read_u64(data + 24u);
+    if (row_bytes != QIHSE_VDB_IDMAP_ENTRY_DISK_SIZE ||
+        crc64 != manifest->idmap_crc64 ||
+        !qihse_vdb_u64_to_size(count64, &entry_count) ||
+        !qihse_checked_mul_size(entry_count, QIHSE_VDB_IDMAP_ENTRY_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_VDB_FILE_HEADER_SIZE, payload_size, &expected_size) ||
+        expected_size != vdb->mapped_idmap_bytes) {
+        errno = EINVAL;
+        return false;
+    }
+
+    payload = data + QIHSE_VDB_FILE_HEADER_SIZE;
+    if (qihse_fnv1a64(payload, payload_size) != crc64) {
+        errno = EINVAL;
+        return false;
+    }
+    for (size_t i = 0u; i < entry_count; i++) {
+        const uint8_t* entry = payload + (i * QIHSE_VDB_IDMAP_ENTRY_DISK_SIZE);
+        int64_t key = (int64_t)qihse_le_read_u64(entry);
+        uint64_t row_index = qihse_le_read_u64(entry + 8u);
+
+        if ((i != 0u && previous_key > key) || row_index >= manifest->row_count) {
+            errno = EINVAL;
+            return false;
+        }
+        previous_key = key;
+    }
+
+    vdb->idmap_count = entry_count;
+    vdb->idmap_valid = true;
+    vdb->idmap_dirty = false;
+    return true;
+}
+
+static bool qihse_vdb_try_map_idmap(qihse_vector_db_t vdb,
+                                    const qihse_vector_store_manifest_t* manifest) {
+    size_t bytes;
+
+    if (!vdb || !manifest || !vdb->idmap_valid ||
+        !qihse_vdb_u64_to_size(qihse_vdb_file_size_or_zero(vdb->db_path, QIHSE_VDB_IDMAP_NAME),
+                               &bytes) ||
+        bytes == 0u) {
+        return false;
+    }
+    if (!qihse_vdb_map_snapshot_file(vdb, QIHSE_VDB_IDMAP_NAME, bytes,
+                                     &vdb->idmap_mmap_fd, &vdb->mapped_idmap)) {
+        return false;
+    }
+    vdb->mapped_idmap_bytes = bytes;
+    if (!qihse_vdb_validate_mapped_idmap(vdb, manifest)) {
+        if (vdb->mapped_idmap && vdb->mapped_idmap != MAP_FAILED) {
+            munmap(vdb->mapped_idmap, vdb->mapped_idmap_bytes);
+        }
+        vdb->mapped_idmap = NULL;
+        vdb->mapped_idmap_bytes = 0u;
+        if (vdb->idmap_mmap_fd >= 0) {
+            close(vdb->idmap_mmap_fd);
+        }
+        vdb->idmap_mmap_fd = -1;
+        return false;
+    }
+
+    free(vdb->idmap);
+    vdb->idmap = NULL;
     return true;
 }
 
@@ -1050,6 +1166,7 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
         free(vdb->metadata);
         vdb->metadata = NULL;
         vdb->metadata_bytes_capacity = 0u;
+        (void)qihse_vdb_try_map_idmap(vdb, &snapshot.manifest);
     }
     qihse_vector_store_snapshot_free(&snapshot);
     return true;
@@ -1084,6 +1201,7 @@ qihse_vector_db_t qihse_vector_db_open(
     vdb->storage_mode = file_backed ? QIHSE_VDB_STORAGE_FILE_COPY : QIHSE_VDB_STORAGE_EPHEMERAL;
     vdb->mmap_fd = -1;
     vdb->metadata_mmap_fd = -1;
+    vdb->idmap_mmap_fd = -1;
     vdb->next_generation = 1u;
     vdb->wal_last_record_offset = QIHSE_VDB_WAL_NO_PREV;
     vdb->trinary_status = QIHSE_VDB_TRINARY_ABSENT;

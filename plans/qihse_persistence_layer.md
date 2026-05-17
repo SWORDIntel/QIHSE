@@ -11,6 +11,8 @@ Current landed state:
 - PR-0 is complete: NOT_STISLA-derived anchor-search usefulness is integrated as native QIHSE algorithm code under `qihse/algorithms/`; the independent top-level subsystem should not be restored.
 - PR-1 is complete: `db_path` creates a native file-backed vector database with durable snapshot files, row-index-correct hydration, `idmap.qid`, derived `vectors.qtri`, diagnostics, read-only reopen, and read-only mmap of clean vector snapshots.
 - PR-2 is complete for the planned WAL structure: file-backed adds write ADD and COMMIT WAL records, records carry previous-record offsets, open replays committed batches newer than the snapshot, and writable open truncates torn or uncommitted WAL tails.
+- PR-3 candidate work has started: read-only mmap mode maps `metadata.qmeta` as well as `vectors.qvec`; read-only mmap of `index.qidx` and `idmap.qid` remains.
+- PR-5 candidate work has started: a standalone native tryte codec exists; vector DB trinary candidate generation, exact rerank, recall benchmarks, and pure trinary storage remain.
 
 Resume commands:
 
@@ -19,26 +21,28 @@ cd /home/john/FRAMEWERX/SWORDIntel_QIHSE
 git status --short
 cd qihse
 make test-persist
-rm -f tests/qihse_vector_db_persistence_test
+make test-trinary-codec
+rm -f tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
 ```
 
 Expected result:
 
 ```text
 PASS all qihse vector DB persistence tests
+PASS all qihse trinary codec tests
 ```
 
 Post-PR-2 continuation:
 
-- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior.
+- PR-3: extend mmap from read-only `vectors.qvec` into `index.qidx`, `metadata.qmeta`, and `idmap.qid` where mapping improves open/search/hydration behavior. Metadata mmap is the first candidate slice; index and ID-map mmap remain.
 - PR-4: add tombstones, delete/update semantics, batch external-ID APIs, and real compaction.
-- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage.
+- PR-5: move trinary sidecar behavior behind a native codec module, then add tryte scoring, candidate generation, exact rerank, recall benchmarks, and optional pure trinary storage. The standalone tryte codec is the first candidate slice; database search integration remains.
 - PR-6: add persisted anchor hints and optimizer statistics only as rebuildable, explicit-format sidecars.
 
 Recommended 3-agent split:
 
-- Agent 1 owns PR-3 mmap extension.
-- Agent 2 owns PR-5 trinary codec module and benchmarks.
+- Agent 1 owns PR-3 mmap extension, continuing after metadata mmap with index and ID-map mmap.
+- Agent 2 owns PR-5 trinary codec integration and benchmarks, starting from the standalone tryte codec.
 - Agent 3 owns PR-4 plus the remaining PR-5/PR-6 database sidecar and compaction work.
 
 ## 1. Background
@@ -341,6 +345,132 @@ The file-backed database needs predictable growth behavior:
 - Keep compaction generation-based so a crash during compaction leaves the old files usable.
 
 Even if delete/update APIs are added later, reserving tombstone and generation fields now avoids a format break.
+
+### PR-4 Mutation and Compaction Plan
+
+PR-4 turns reserved tombstone fields into real database behavior. This is native QIHSE work only; Framewerx and application layers remain clients.
+
+Public API additions:
+
+```c
+bool qihse_vector_db_delete_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id
+);
+
+bool qihse_vector_db_delete_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    size_t count,
+    size_t* deleted_count
+);
+
+bool qihse_vector_db_update_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    const float* vector,
+    size_t dims,
+    const void* metadata,
+    size_t metadata_size
+);
+
+bool qihse_vector_db_update_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* updated_count
+);
+
+bool qihse_vector_db_upsert_by_ids(
+    qihse_vector_db_t vdb,
+    const uint64_t* vector_ids,
+    const float* vectors,
+    size_t count,
+    size_t dims,
+    const void* const* metadata,
+    const size_t* metadata_sizes,
+    size_t* inserted_count,
+    size_t* updated_count
+);
+```
+
+Mutation semantics:
+
+- Delete marks the latest live row for an external `vector_id` tombstoned.
+- Update is append-only replacement: tombstone the old live row, append a new live row with the same external ID and new vector/metadata bytes.
+- Upsert updates existing IDs and inserts missing IDs in one committed batch.
+- Batch APIs expose counts and use one WAL commit boundary per batch.
+- Read-only and read-only mmap opens reject delete, update, upsert, and compact.
+
+Row flag behavior:
+
+```c
+#define QIHSE_ROW_F_LIVE       0x00000001u
+#define QIHSE_ROW_F_TOMBSTONE  0x00000002u
+#define QIHSE_ROW_F_SUPERSEDED 0x00000004u
+```
+
+Rules:
+
+- Search only scans rows with `QIHSE_ROW_F_LIVE`.
+- `idmap.qid` includes only live rows and maps each external ID to the latest live row index.
+- Delete clears live and sets tombstone.
+- Update clears live and sets tombstone plus superseded on the old row, then appends a new live row.
+- Duplicate live IDs are invalid; duplicate tombstoned historical IDs are allowed until compaction.
+
+WAL implications:
+
+```c
+QIHSE_WAL_DELETE_BATCH = 7,
+QIHSE_WAL_UPDATE_BATCH = 8,
+QIHSE_WAL_UPSERT_BATCH = 9,
+QIHSE_WAL_COMPACT_BEGIN = 10,
+QIHSE_WAL_COMPACT_COMMIT = 11
+```
+
+- DELETE payload stores count and external IDs.
+- UPDATE payload stores old row indexes, external IDs, vector bytes, metadata sizes, metadata bytes, and replacement row descriptors.
+- UPSERT payload stores the same data plus a per-row insert-or-replace operation flag.
+- Every mutation batch must still be followed by the existing COMMIT record with previous-record offset and payload checksum.
+- Recovery replays only fully committed mutation batches newer than the manifest generation.
+- Writable open truncates torn or uncommitted mutation tails just as it does for ADD.
+
+Compaction behavior:
+
+1. Require file-backed, non-read-only mode and take the write mutex.
+2. Build an old-row to compact-row remap from live rows only.
+3. Rewrite live vector rows into `vectors.qvec.tmp`.
+4. Rewrite live metadata into `metadata.qmeta.tmp`.
+5. Rewrite `index.qidx.tmp` with live rows only and fresh offsets.
+6. Rebuild `idmap.qid.tmp` from compact rows.
+7. Regenerate `vectors.qtri.tmp` from compact authoritative float32 vectors when the sidecar is enabled or already present.
+8. Fsync tmp files, rename them into place, then publish a new manifest generation.
+9. Clear checkpointed WAL bytes and update persistence stats.
+
+Compaction must be generation-safe: a crash before manifest publication leaves the old generation authoritative; a crash after manifest publication opens the new generation or fails cleanly on authoritative-file corruption.
+
+Required PR-4 tests:
+
+- Delete-by-ID removes a row from search and survives reopen.
+- Missing-ID delete is a clean no-op/failure and does not corrupt state.
+- Update-by-ID replaces vector and metadata while preserving the external ID.
+- Batch delete/update/upsert returns correct counts and rejects duplicate live IDs inside one batch.
+- WAL replays committed delete/update/upsert batches after crash before checkpoint.
+- Torn mutation WAL tails are ignored and truncated on writable open.
+- `idmap.qid` rebuild after mutation maps only latest live rows.
+- Compaction removes tombstoned/superseded rows and preserves live search results, metadata, high external IDs, generation order, and trinary sidecar status.
+- Read-only and read-only mmap opens reject all mutation and compaction APIs.
+
+Migration notes:
+
+- Existing PR-1/PR-2 databases contain only live rows; absent tombstone/superseded bits remain valid live rows.
+- If `row_flags` and `commit_generation` are already persisted, PR-4 should not require a format break.
+- Open should fail clearly on duplicate live IDs rather than selecting a winner.
+- Automatic compaction should wait for stats-driven thresholds; PR-4 should expose manual compaction first.
 
 ## 14. UMA Integration
 
