@@ -70,7 +70,7 @@ flowchart TB
     A[Client Process] --> B[Query Ingestion]
     A --> C[Vector Mutations]
     B --> D{qihse_vector_db_search}
-    D --> E[Exact float32 rerank path\n(default)]
+    D --> E[Exact float32 rerank path<br/>(default)]
     D --> F{Query mode}
     F -->|TRINARY_SCALAR| G[qtri sidecar shortlist]
     F -->|TRINARY_MAGNITUDE| H[qmag sidecar shortlist]
@@ -91,7 +91,7 @@ flowchart LR
     B -->|Create| C[Write WAL Records]
     B -->|Open Existing| D[Load Snapshot]
     D --> E[Replay WAL]
-    C --> F[Runtime Mutations\n(add/update/delete/upsert)]
+    C --> F[Runtime Mutations<br/>(add/update/delete/upsert)]
     E --> F
     F --> G[Flush]
     G --> H[Checkpoint Snapshot]
