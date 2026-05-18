@@ -1,9 +1,9 @@
-# QIHSE — Quantum Inspire Hilbert Space Expansion Search
+# QIHSE — Quantum Inspired Hilbert Space Expansion Search
 ## (QIHSE): Vector Search with Exactness Contracts and Performance Escape Hatches
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 
-QIHSE (Quantum Inspire Hilbert Space Expansion Search) is built for teams that want ANN performance without surrendering
+QIHSE (Quantum Inspired Hilbert Space Expansion Search) is built for teams that want ANN performance without surrendering
 correctness guarantees. The project is intentionally conservative in its default
 behavior and explicit about when it uses aggressive acceleration. In practice, this
 means you get a small number of clear knobs instead of implicit magic behavior.
@@ -21,7 +21,7 @@ file-backed lifecycle controls and a query path model designed around two rules:
 This gives you practical speedups in the common sparse/high-selectivity cases while
 preserving confidence that correctness has not been silently traded away.
 
-## Unique technical characteristics (plain-language)
+## Unique technical characteristics
 
 ### 1) Exactness-first query contract
 The default query mode returns results using float32 similarity for final ranking.
