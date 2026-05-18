@@ -29,6 +29,28 @@ That means no hidden approximation layer that can drift under the hood. When you
 request trinary or qmag modes, those are used as candidate selectors before the
 same exact rerank happens.
 
+### 1b) Trinary still wins where it should (and we test it, not guess)
+The trinary stack is tuned to win where candidate compression is most likely to help:
+- Sparse vectors with few active dimensions.
+- Small or moderate top-k pressure.
+- Stable live-row density and safe mismatch budgets.
+
+This is not a blanket claim. It is validated through the qmag policy sweep and
+reference workload gate:
+- The 100-case qmag sweep evaluates win/loss and quality signals per case, then
+  reports precision/recall/F1 and mean selected speedup for each policy.
+- Policy changes are accepted only when the sweep shows safe gains in those regimes.
+- The default path is still exact when uncertainty is high, so correctness is never
+  traded for speculation.
+
+Concrete local baseline sample (`make bench-vxug-pdf-workload`, single run):
+- `float32`: recall@10 `1.0000`
+- `qtri`: recall@10 `0.9812`
+- `qmag`: recall@10 `1.0000`
+
+So the trinary strategy is strongest where it matters most: low-density candidate
+selection shapes, with exact rerank and sidecar validity checks as guardrails.
+
 ### 2) Trinary and magnitude are first-class artifacts
 Trinary state is represented as persisted sidecar artifacts (`qtri` / `qmag`) tied to
 the vector store layout. QIHSE tracks whether these artifacts are valid, stale,
