@@ -1,7 +1,7 @@
 #include "qihse.h"
 
 const char* qihse_version(void) {
-    return "Quantum Inspire dHilbert Space Expansion Search";
+    return "Quantum Inspire Hilbert Space Expansion Search";
 }
 
 const char* qihse_build_info(void) {
