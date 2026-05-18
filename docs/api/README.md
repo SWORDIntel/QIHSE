@@ -14,6 +14,7 @@ This document provides comprehensive API documentation for the QIHSE (Quantum-In
 8. [Distributed Systems API](#distributed-systems-api)
 9. [Error Codes](#error-codes)
 10. [Data Types](#data-types)
+11. [Native Vector DB API](#native-vector-db-api)
 
 ## Core API
 
@@ -181,6 +182,46 @@ int qihse_search_range(qihse_search_context_t* ctx,
                        float* result_distances,
                        uint32_t* num_results);
 ```
+
+### Native Vector DB API
+
+The native QIHSE vector DB API provides trinary/qmag candidate modes and file-backed persistence.
+
+```c
+#include "qihse_vector_db.h"
+
+typedef enum qihse_vector_db_query_mode_e {
+    QIHSE_VDB_QUERY_FLOAT32 = 0,
+    QIHSE_VDB_QUERY_TRINARY_SCALAR = 1,
+    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2,
+    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS = 3,
+} qihse_vector_db_query_mode_t;
+
+qihse_vector_db_t qihse_vector_db_open(
+    qihse_vector_db_backend_t backend,
+    qihse_uma_manager_t uma,
+    const char* db_path,
+    uint32_t flags);
+
+int qihse_vector_db_search(
+    qihse_vector_db_t vdb,
+    const qihse_vector_query_t* query,
+    qihse_vector_result_t* results,
+    size_t max_results);
+```
+
+- `QIHSE_VDB_QUERY_FLOAT32` uses authoritative exact float32 search and ignores
+  sidecar failures.
+- `QIHSE_VDB_QUERY_TRINARY_SCALAR` and
+  `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` use sidecars for candidate reduction and
+  exact float32 rerank.
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS` uses qmag-only ordering for fast
+  approximate results; scores are qmag scores, not cosine.
+- Explicit trinary modes fail when sidecars are absent/corrupt/stale rather than
+  silently falling back.
+- `candidate_pool_size = 0` enables the safe default policy for qmag; qmag default
+  may still fall back to exact float32 when policy gates deny it.
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS` never falls back to exact float32.
 
 ### Graph Search Operations
 
