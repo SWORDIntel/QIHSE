@@ -55,6 +55,15 @@ memory planner modules:
   placement from workload, topology, target device, and placement policy.
 - `qihse_memory_migration_scheduler_*()` provides a deterministic caller-owned
   priority queue for predictive/background migration candidates.
+- `qihse_memory_maintenance_*()` now exposes caller-owned maintenance loops
+  (`start`, `snapshot`, `step`) that gather tracked-buffer candidates and execute
+  them through `qihse_memory_migration_scheduler_run`.
+- `qihse_memory_migration_decision_inspect()` exposes scheduler-like score
+  components and policy reasons for migration candidates without coupling callers
+  to scheduler internals. Rejection reasons are stable and split between explicit
+  causes (`invalid-arguments`, `not-migratable`, `already-placed`,
+  `below-score-threshold`, and generic `policy-reject`) while preserving planner
+  reason text in `plan_reason`.
 
 Implemented files:
 
@@ -77,16 +86,41 @@ Implemented files:
 - `memory/src/qihse_memory_migration_backend.c`
 - `memory/src/qihse_memory_migration_scheduler.c`
 
-Remaining architecture work: production integration of runtime attachment points and
-hardware-aware callback registration are now implemented as optional runtime
-plumbing:
+Architecture work previously tracked as remaining is now complete for:
 
 - `qihse_memory_migration_backend` now accepts callback registration for hardware
   DMA and device-copy movement backends.
 - `qihse_memory_migration_scheduler_run` drains scheduled candidates in
   caller-owned maintenance loops.
+- `qihse_memory_maintenance_start`, `qihse_memory_maintenance_snapshot`, and
+  `qihse_memory_maintenance_step` form the explicit maintenance API surface for
+  caller-driven deterministic candidate collection and execution.
 - Planner exposure remains intentionally API-modular so runtime hosts can choose
   poll or thread-based dispatch without forcing background threads from the core.
+  Candidate visibility is now available through
+  `qihse_memory_migration_decision_inspect()` and companion reason formatters.
+
+Completion tracking update:
+
+- The qmag/memory-planner items formerly treated as remaining are complete for
+  the documented Phase 2 architecture surface: workload analysis, host topology
+  probing, topology-aware recommendation, traceability, allocation fallback,
+  coherence, migration planning, backend abstraction, device placement,
+  scheduling, maintenance loops, and migration-decision inspection.
+- Open work should now be tracked as integration hardening rather than as
+  remaining Phase 2 planner architecture.
+
+## Next 3 highest-priority tickets
+
+1. Build and public API integration for host topology probing.
+   Wire the topology probe source/header into the standard build and expose the
+   API through the intended public include surface when code ownership permits.
+2. End-to-end memory-planner validation.
+   Add focused coverage for probed topology, placement recommendation,
+   allocation fallback, migration decision traces, and qmag-shaped workloads.
+3. Real migration backend and qmag telemetry attachment.
+   Attach hardware DMA/device-copy callbacks from accelerator APIs and persist
+   qmag planner metrics in trace/benchmark outputs.
 
 ---
 

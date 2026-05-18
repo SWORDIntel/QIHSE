@@ -144,6 +144,7 @@ static bool test_qmag_100_case_sparse_low_pressure_default_matches_float32(void)
 static bool test_qmag_100_case_explicit_pool_runs_when_default_falls_back(void);
 static bool test_qmag_low_active_low_top_k_default_policy_matches_float32(void);
 static bool test_qmag_high_top_k_default_policy_falls_back_to_float32(void);
+static bool test_qmag_default_policy_monotonic_active_and_top_k_boundaries(void);
 static bool test_explicit_qmag_pool_bypasses_default_performance_gate(void);
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void);
 static bool test_qmag_stale_reported_and_opt_in_rejected(void);
@@ -264,6 +265,8 @@ int main(void) {
          test_qmag_low_active_low_top_k_default_policy_matches_float32},
         {"qmag high-top_k default policy falls back to FLOAT32 results",
          test_qmag_high_top_k_default_policy_falls_back_to_float32},
+        {"qmag default policy is monotonic across active-dimension and top_k boundaries",
+         test_qmag_default_policy_monotonic_active_and_top_k_boundaries},
         {"explicit qmag pool bypasses default performance gate",
          test_explicit_qmag_pool_bypasses_default_performance_gate},
         {"PR-6 default search ignores missing/corrupt qmag",
@@ -3528,6 +3531,135 @@ static bool test_qmag_high_top_k_default_policy_falls_back_to_float32(void) {
     return true;
 }
 
+static bool test_qmag_default_policy_monotonic_active_and_top_k_boundaries(void) {
+    enum { DIMS = 64, TOP_K_LOW = 4, TOP_K_LOW_PRESSURE = 12,
+           TOP_K_HIGH_PRESSURE = 13 };
+    size_t idx;
+    test_env_t env;
+    TEST_ASSERT(env_init(&env),
+                "low-active monotonic policy fixture should initialize environment");
+
+    char* path = NULL;
+    TEST_ASSERT(create_low_active_qmag_policy_db(&env, &path),
+                "low-active monotonic policy fixture should be created");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY | QIHSE_TEST_OPEN_MMAP
+    );
+    TEST_ASSERT(db != NULL, "low-active monotonic policy fixture should reopen");
+
+    const float sparse_query[DIMS] = {10.0f};
+    float active_16_query[DIMS] = {0.0f};
+    float active_17_query[DIMS] = {0.0f};
+    float active_16_query_results[DIMS] = {0.0f};
+    for (idx = 0u; idx < 16u; idx++) {
+        active_16_query[idx] = 10.0f;
+    }
+    for (idx = 0u; idx < 17u; idx++) {
+        active_17_query[idx] = 10.0f;
+    }
+    for (idx = 0u; idx < 16u; idx++) {
+        active_16_query_results[idx] = 10.0f;
+    }
+
+    qihse_vector_result_t float32_sparse[TOP_K_LOW];
+    qihse_vector_result_t qmag_sparse[TOP_K_LOW];
+    qihse_vector_result_t float32_boundary[TOP_K_LOW];
+    qihse_vector_result_t qmag_boundary[TOP_K_LOW];
+    qihse_vector_result_t float32_low_pressure[TOP_K_LOW_PRESSURE];
+    qihse_vector_result_t qmag_low_pressure[TOP_K_LOW_PRESSURE];
+    qihse_vector_result_t float32_high_pressure[TOP_K_HIGH_PRESSURE];
+    qihse_vector_result_t qmag_high_pressure[TOP_K_HIGH_PRESSURE];
+    memset(float32_sparse, 0, sizeof(float32_sparse));
+    memset(qmag_sparse, 0, sizeof(qmag_sparse));
+    memset(float32_boundary, 0, sizeof(float32_boundary));
+    memset(qmag_boundary, 0, sizeof(qmag_boundary));
+    memset(float32_low_pressure, 0, sizeof(float32_low_pressure));
+    memset(qmag_low_pressure, 0, sizeof(qmag_low_pressure));
+    memset(float32_high_pressure, 0, sizeof(float32_high_pressure));
+    memset(qmag_high_pressure, 0, sizeof(qmag_high_pressure));
+
+    int float32_count = search_many(db, sparse_query, DIMS, TOP_K_LOW,
+                                   float32_sparse, ARRAY_LEN(float32_sparse));
+    int qmag_count = search_many_qmag(db, sparse_query, DIMS, TOP_K_LOW, 0u,
+                                      qmag_sparse, ARRAY_LEN(qmag_sparse));
+    TEST_ASSERT(float32_count == TOP_K_LOW,
+                "sparse low-active qmag policy search should return low-k");
+    TEST_ASSERT(qmag_count == TOP_K_LOW,
+                "default qmag low-active policy search should return low-k");
+    TEST_ASSERT(expect_same_result_ids(float32_sparse, qmag_sparse, TOP_K_LOW,
+                                      "low-active default policy should preserve IDs"),
+                "low-active default policy should preserve exact FLOAT32 IDs");
+
+    float32_count = search_many(db, active_16_query, DIMS, TOP_K_LOW,
+                                float32_boundary, ARRAY_LEN(float32_boundary));
+    qmag_count = search_many_qmag(db, active_16_query, DIMS, TOP_K_LOW, 0u,
+                                  qmag_boundary, ARRAY_LEN(qmag_boundary));
+    TEST_ASSERT(float32_count == TOP_K_LOW,
+                "boundary active-ratio qmag policy search should return low-k");
+    TEST_ASSERT(qmag_count == TOP_K_LOW,
+                "default qmag should return low-k at boundary active ratio");
+    TEST_ASSERT(expect_same_result_ids(float32_boundary, qmag_boundary, TOP_K_LOW,
+                                      "boundary active-ratio default policy should preserve IDs"),
+                "boundary active-ratio default policy should preserve exact FLOAT32 IDs");
+
+    float32_count = search_many(db, active_17_query, DIMS, TOP_K_LOW,
+                                float32_boundary, ARRAY_LEN(float32_boundary));
+    qmag_count = search_many_qmag(db, active_17_query, DIMS, TOP_K_LOW, 0u,
+                                  qmag_boundary, ARRAY_LEN(qmag_boundary));
+    TEST_ASSERT(float32_count == TOP_K_LOW,
+                "high-active fallback-shape qmag policy search should return low-k");
+    TEST_ASSERT(qmag_count == TOP_K_LOW,
+                "default qmag should still return low-k under active-pressure fallback");
+    TEST_ASSERT(expect_same_result_ids(float32_boundary, qmag_boundary, TOP_K_LOW,
+                                      "active-ratio fallback should preserve IDs"),
+                "active-ratio fallback should preserve exact FLOAT32 IDs");
+
+    float32_count = search_many(db, active_16_query_results, DIMS, TOP_K_LOW_PRESSURE,
+                                float32_low_pressure, ARRAY_LEN(float32_low_pressure));
+    qmag_count = search_many_qmag(db, active_16_query_results, DIMS, TOP_K_LOW_PRESSURE, 0u,
+                                  qmag_low_pressure,
+                                  ARRAY_LEN(qmag_low_pressure));
+    TEST_ASSERT(float32_count == TOP_K_LOW_PRESSURE,
+                "low top_k low-pressure qmag policy search should return low-pressure results");
+    TEST_ASSERT(qmag_count == TOP_K_LOW_PRESSURE,
+                "low-pressure default policy should return low-pressure results");
+    TEST_ASSERT(expect_same_result_ids(float32_low_pressure, qmag_low_pressure, TOP_K_LOW_PRESSURE,
+                                      "low-pressure default policy should preserve IDs"),
+                "low-pressure default policy should preserve exact FLOAT32 IDs");
+
+    float32_count = search_many(db, active_16_query_results, DIMS, TOP_K_HIGH_PRESSURE,
+                                float32_high_pressure, ARRAY_LEN(float32_high_pressure));
+    qmag_count = search_many_qmag(db, active_16_query_results, DIMS, TOP_K_HIGH_PRESSURE, 0u,
+                                  qmag_high_pressure,
+                                  ARRAY_LEN(qmag_high_pressure));
+    TEST_ASSERT(float32_count == TOP_K_HIGH_PRESSURE,
+                "high top_k should not be rejected by fallback policy path");
+    TEST_ASSERT(qmag_count == TOP_K_HIGH_PRESSURE,
+                "default qmag should still return high top_k fallback results");
+    TEST_ASSERT(expect_same_result_ids(float32_high_pressure, qmag_high_pressure,
+                                      TOP_K_HIGH_PRESSURE,
+                                      "top_k pressure fallback should preserve IDs"),
+                "top_k pressure fallback should preserve exact FLOAT32 IDs");
+
+    free_results(float32_sparse, ARRAY_LEN(float32_sparse));
+    free_results(qmag_sparse, ARRAY_LEN(qmag_sparse));
+    free_results(float32_boundary, ARRAY_LEN(float32_boundary));
+    free_results(qmag_boundary, ARRAY_LEN(qmag_boundary));
+    free_results(float32_low_pressure, ARRAY_LEN(float32_low_pressure));
+    free_results(qmag_low_pressure, ARRAY_LEN(qmag_low_pressure));
+    free_results(float32_high_pressure, ARRAY_LEN(float32_high_pressure));
+    free_results(qmag_high_pressure, ARRAY_LEN(qmag_high_pressure));
+    TEST_ASSERT(qihse_vector_db_close(db), "low-active monotonic policy fixture should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_explicit_qmag_pool_bypasses_default_performance_gate(void) {
     enum { DIMS = 64, TOP_K = 32 };
     test_env_t env;
@@ -4050,6 +4182,10 @@ static bool test_qmag_100_case_sparse_low_pressure_default_matches_float32(void)
 
 static bool test_qmag_100_case_explicit_pool_runs_when_default_falls_back(void) {
     return pr5_trinary_search_api_unavailable("qmag 100-case explicit pool fallback bypass");
+}
+
+static bool test_qmag_default_policy_monotonic_active_and_top_k_boundaries(void) {
+    return pr5_trinary_search_api_unavailable("qmag monotonic active/top_k boundary policy");
 }
 
 static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {

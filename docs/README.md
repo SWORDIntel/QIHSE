@@ -4,6 +4,17 @@
 
 **QIHSE (Quantum-Inspired Hilbert Space Expansion)** is a revolutionary, enterprise-grade search ecosystem that combines quantum-inspired mathematics, heterogeneous parallel computing, and self-optimizing machine learning to deliver **2-5x performance improvements** over traditional approaches while maintaining **99%+ accuracy** and **CNSA 2.0 compliance**.
 
+## File-Backed Persistence (How-To First)
+
+- Start here for durable vector storage: [docs/persistence/README.md](/fast/QIHSE/docs/persistence/README.md)
+- This is the implementation-first guide for:
+  - writing `vectors.qtri` and `vectors.qmag`
+  - snapshot/WAL durability and replay
+  - reopening and retrieving identical search results after restart
+- Recommended command path:
+  - `make persistence` (build + persistence regression test)
+  - `make validate-reference-workflow` (benchmark + persistence end-to-end)
+
 ## 🏆 System Capabilities
 
 ### ⚡ **Heterogeneous Parallel Computing**
@@ -19,8 +30,11 @@
 - **Multi-level verification** with configurable confidence thresholds (NONE/FAST/WINDOW/FALLBACK/EXACT/PRECISION)
 
 ### 🧱 **Persistence + Planner Runtime**
-- **Trinary codec persistence** for row-oriented checkpoint artifacts (`vectors.qtri`, `vectors.qmag`) and policy-aware recovery.
-- **Predictive migration scheduler** supports caller-driven draining (`qihse_memory_migration_scheduler_run`) for maintenance-style placement work.
+- **Trinary codec persistence** stores row-oriented checkpoint artifacts (`vectors.qtri`, `vectors.qmag`) and rebuilds runtime qmag candidate state from them; no separate dimension-major qmag artifact is persisted.
+- **Predictive maintenance API** provides caller-driven cycles through
+  `qihse_memory_maintenance_start`, `qihse_memory_maintenance_snapshot`, and
+  `qihse_memory_maintenance_step`, executed via
+  `qihse_memory_migration_scheduler_run` without implicit background threads.
 - **Backend callback API** exposes optional hardware DMA and device-copy hooks for future backend integrations.
 
 ### 🤖 **Self-Optimizing ML Engine**
@@ -84,6 +98,12 @@ Complete C API documentation including:
 - Usage examples and best practices
 - Data type definitions and enumerations
 
+### [🗄️ File-Backed Persistence](persistence/)
+File-backed trinary persistence and retrieval guide:
+- build/publish/reopen lifecycle
+- WAL replay and checkpoint behavior
+- exact-query fallback behavior when persistence artifacts are stale/corrupt
+
 ### [👥 User Guide](user/)
 Installation, configuration, and usage instructions:
 - Prerequisites and system requirements
@@ -91,6 +111,13 @@ Installation, configuration, and usage instructions:
 - Configuration options and tuning
 - Basic and advanced usage examples
 - Performance tuning and optimization
+
+### [🛠️ Usage How-Tos](usage/)
+Operational runbooks for the high-traffic implementation points:
+- Vector DB lifecycle and mutation flows
+- Trinary/qmag query modes and status handling
+- Caller-driven memory maintenance loops
+- Reference benchmark/validation workflows
 
 ### [🏗️ Architecture](architecture/)
 Technical deep-dive into system design:
@@ -128,8 +155,9 @@ Development resources and model specifications:
 
 ### [QMAG Default Policy](qmag-policy.md)
 Result-driven qmag fallback guidance from the 100-case loss-pattern sweep:
-- Default qmag falls back to exact float32 for small-row, dense/high-active, high-`top_k`, or high-rerank-pressure shapes.
-- Sparse, low-pressure defaults remain eligible for qmag when they preserve exact-equivalent results.
+- Default qmag uses dimension-mapped trinary+magnitude scoring only for low-pressure shapes: `live_rows >= 512`, `active_query_dims/vector_dims <= 1/4`, `top_k/live_rows <= 3/128`, and `effective_candidate_pool/live_rows <= 9/32`.
+- The default pool maps active dimensions to `top_k * 8`, `top_k * 10`, or `top_k * 12`, then caps to live rows before the policy gate.
+- Rejected default shapes fall back to exact float32 and preserve exact-equivalent results.
 - Explicit qmag pools remain caller-directed opt-ins and still execute after validation.
 
 ## 🚀 Quick Start

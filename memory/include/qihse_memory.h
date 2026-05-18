@@ -21,6 +21,8 @@
 /* Forward declarations */
 typedef enum qihse_device_type_e qihse_device_type_t;
 
+struct qihse_memory_migration_scheduler_s;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -105,6 +107,7 @@ typedef struct qihse_memory_topology_s {
 #define QIHSE_MEM_ZERO     (1u << 0)  /* Zero-initialize allocation */
 #define QIHSE_MEM_TRACKED  (1u << 1)  /* Track buffer in manager registry */
 #define QIHSE_MEM_SHARED   (1u << 2)  /* Shared across devices */
+#define QIHSE_MEMORY_MIGRATION_DECISION_REASON_SIZE 128u
 
 /* ============================================================================
  * MEMORY BUFFER MANAGEMENT
@@ -273,6 +276,141 @@ bool qihse_memory_prefetch(
     qihse_memory_manager_t manager,
     qihse_memory_buffer_t* buffer,
     int device
+);
+
+/**
+ * Migration decision outcome used by planner/scheduler visibility APIs.
+ */
+typedef enum qihse_memory_migration_decision_reason_e {
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_UNKNOWN = 0,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_ACCEPTED = 1,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_INVALID_ARGUMENTS = 2,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_NOT_MIGRATABLE = 3,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_ALREADY_PLACED = 4,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_POLICY_REJECT = 5,
+    QIHSE_MEMORY_MIGRATION_DECISION_REASON_BELOW_SCORE_THRESHOLD = 6
+} qihse_memory_migration_decision_reason_t;
+
+/**
+ * Internal scoring pieces used by migration scheduling.
+ */
+typedef struct qihse_memory_migration_scoring_breakdown_s {
+    double residency_component;
+    double access_component;
+    double coherence_component;
+    double target_component;
+    double policy_component;
+    double minimum_score;
+    uint64_t hot_access_threshold;
+} qihse_memory_migration_scoring_breakdown_t;
+
+/**
+ * Planner-facing migration decision detail for scheduler/policy debugging.
+ */
+typedef struct qihse_memory_migration_decision_s {
+    qihse_memory_buffer_t* buffer;
+    int target_device;
+    qihse_memory_type_t source_type;
+    qihse_memory_type_t target_type;
+
+    qihse_memory_migration_decision_reason_t reason;
+    bool accepted;
+    bool zero_copy;
+    bool copy_required;
+    bool preserves_coherence;
+
+    qihse_memory_migration_scoring_breakdown_t scoring;
+    double score;
+    char plan_reason[QIHSE_MEMORY_MIGRATION_DECISION_REASON_SIZE];
+} qihse_memory_migration_decision_t;
+
+/**
+ * Convert reason code to string.
+ */
+const char* qihse_memory_migration_decision_reason_name(
+    qihse_memory_migration_decision_reason_t reason
+);
+
+/**
+ * Inspect a migration candidate's scheduler/policy score and reason without
+ * enqueuing it.
+ *
+ * @param buffer Migration candidate
+ * @param target_device Target device
+ * @param target_type Target memory type
+ * @param out_decision Output decision trace
+ * @return true on successful inspection, false on invalid arguments
+ */
+bool qihse_memory_migration_decision_inspect(
+    const qihse_memory_buffer_t* buffer,
+    int target_device,
+    qihse_memory_type_t target_type,
+    qihse_memory_migration_decision_t* out_decision
+);
+
+/**
+ * Format a migration decision for structured logs and external diagnostics.
+ *
+ * @param buffer Output buffer
+ * @param buffer_size Output capacity
+ * @param decision Decision created by qihse_memory_migration_decision_inspect
+ * @return Number of characters written (excluding terminator)
+ */
+size_t qihse_memory_migration_decision_format(
+    char* buffer,
+    size_t buffer_size,
+    const qihse_memory_migration_decision_t* decision
+);
+
+/**
+ * Start (reset) a caller-owned maintenance pass over a migration scheduler.
+ *
+ * The maintenance surface remains caller-owned and explicit: no background
+ * worker threads are spawned by the core library.
+ *
+ * @param manager Memory manager
+ * @param scheduler Scheduler instance created by the caller
+ * @return true on successful start/reset, false on invalid arguments
+ */
+bool qihse_memory_maintenance_start(
+    qihse_memory_manager_t manager,
+    struct qihse_memory_migration_scheduler_s* scheduler
+);
+
+/**
+ * Build a deterministic maintenance candidate set from currently tracked buffers
+ * and enqueue them into the provided scheduler.
+ *
+ * Deterministic selection is based on tracked-buffer state: access_count,
+ * residency_score, and memory-type delta heuristics.
+ *
+ * @param manager Memory manager
+ * @param scheduler Scheduler to populate with migration candidates
+ * @param target_device Preferred target device for maintenance migrations
+ * @param max_candidates Maximum number of candidates to enqueue (0 means no explicit
+ * limit; scheduler capacity controls final stop)
+ * @return Number of candidates enqueued
+ */
+size_t qihse_memory_maintenance_snapshot(
+    qihse_memory_manager_t manager,
+    struct qihse_memory_migration_scheduler_s* scheduler,
+    int target_device,
+    size_t max_candidates
+);
+
+/**
+ * Execute one explicit maintenance step by draining up to max_tasks tasks from
+ * the populated migration scheduler.
+ *
+ * @param manager Memory manager
+ * @param scheduler Scheduler containing migration work
+ * @param max_tasks Max tasks to execute in this step
+ * @return Number of tasks successfully executed
+ */
+size_t qihse_memory_maintenance_step(
+    qihse_memory_manager_t manager,
+    struct qihse_memory_migration_scheduler_s* scheduler,
+    size_t max_tasks
 );
 
 /* ============================================================================

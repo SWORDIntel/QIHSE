@@ -1,9 +1,10 @@
 # QIHSE Finalization Plan
 
 ## 1) Scope
-This plan finalizes two required areas from the repository documentation:
+This plan finalizes repository completion tracking for:
 - Upstream-first workflow
 - Persistence model and deployment/state persistence obligations
+- Phase 2 qmag/memory-planner documentation state
 
 ## 2) Authoritative source references
 - Upstream-first workflow statement: [docs/benchmarks/reference_workloads.md:46-48](/fast/QIHSE/docs/benchmarks/reference_workloads.md)
@@ -25,6 +26,12 @@ This plan finalizes two required areas from the repository documentation:
   - Tier-2 entanglement fabric includes full problem state + replica storage.
   - Buffer metadata includes `qihse_memory_flags_t flags; // Access patterns, persistence`.
 
+- Phase 2 memory planner completion tracking: [docs/architecture/phase2_memory_planner.md](/fast/QIHSE/docs/architecture/phase2_memory_planner.md)
+  - Workload analysis, topology representation/probing, recommendation, traceability,
+    fallback allocation policy, coherence, migration planning/backend abstraction,
+    device placement, scheduler, maintenance, and migration-decision inspection are
+    tracked as implemented architecture work.
+
 ## 3) Finalization checklist
 - [x] Upstream-first workflow captured and referenced.
 - [x] Persistence requirements captured:
@@ -33,6 +40,10 @@ This plan finalizes two required areas from the repository documentation:
   - explicit persistence size example, and
   - telemetry/state persistence intent.
 - [x] Required docs locations recorded with line references.
+- [x] Phase 2 qmag/memory-planner completion state recorded as architecture-complete
+  for the currently documented planner surface.
+- [x] Remaining qmag/memory-planner work moved out of the completion checklist and
+  into explicitly ordered follow-up tickets.
 - [x] Optional cleanup:
   - Added a direct implementation note to source VXUG samples from `https://github.com/vxunderground/VXUG-Papers` (or any local equivalent path) in the workflow Makefile.
   - Added `.gitignore` protection for `VXUG-Papers/` to keep locally-cloned samples out of version control.
@@ -46,3 +57,15 @@ This plan finalizes two required areas from the repository documentation:
 
 ## 5) Closure rule
 After this document is committed, finalization is considered complete when this file is merged with a reviewer-approved commit that records no unrelated file changes.
+
+## 6) Next 3 highest-priority tickets
+
+1. Build and public API integration for host topology probing.
+   Add the topology probe source/header to the normal build and expose it through
+   the intended public include surface once code ownership allows non-doc edits.
+2. End-to-end memory-planner validation.
+   Add focused tests for probed topology, recommendation, allocation fallback,
+   migration decision traces, and qmag-shaped workloads.
+3. Real migration backend and qmag telemetry attachment.
+   Register hardware DMA/device-copy callbacks from actual accelerator APIs and
+   persist qmag planner metrics in trace/benchmark outputs.
