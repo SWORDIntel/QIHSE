@@ -1,20 +1,61 @@
-# QIHSE — Vector Search Engine for Fast, Correct, Persistent ANN
+# QIHSE — Vector Search with Exactness Contracts and Performance Escape Hatches
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 
-QIHSE is a C runtime that combines exact ANN correctness with optional trinary
-candidate acceleration, deterministic persistence, and a direct persistence model
-you can integrate in production code.
+QIHSE is built for teams that want ANN performance without surrendering
+correctness guarantees. The project is intentionally conservative in its default
+behavior and explicit about when it uses aggressive acceleration. In practice, this
+means you get a small number of clear knobs instead of implicit magic behavior.
 
-## Why this project
+## What makes QIHSE different
 
-- Exact float32 search is always the authority.
-- Trinary and magnitude artifacts are performance helpers, not correctness
-  shortcuts.
-- File-backed persistence is crash-aware through checkpoint + WAL replay.
-- Hardware path options are explicit in build and configuration.
+QIHSE is not “another ANN wrapper.” It is a native vector DB integration layer with
+file-backed lifecycle controls and a query path model designed around two rules:
 
-## Build in 30 seconds
+- **Always know what the engine is optimizing for.**
+  Exact float32 search is the default and authoritative result path.
+- **Only use approximations when they are explicitly requested and validated.**
+  Trinary-based acceleration is opt-in and enforced by explicit sidecar contracts.
+
+This gives you practical speedups in the common sparse/high-selectivity cases while
+preserving confidence that correctness has not been silently traded away.
+
+## Unique technical characteristics (plain-language)
+
+### 1) Exactness-first query contract
+The default query mode returns results using float32 similarity for final ranking.
+That means no hidden approximation layer that can drift under the hood. When you do
+request trinary or qmag modes, those are used as candidate selectors before the
+same exact rerank happens.
+
+### 2) Trinary and magnitude are first-class artifacts
+Trinary state is represented as persisted sidecar artifacts (`qtri` / `qmag`) tied to
+the vector store layout. QIHSE tracks whether these artifacts are valid, stale,
+absent, or corrupt, and surfaces that through the API instead of pretending all is
+well.
+
+### 3) Dimension-aware performance policy
+The qmag path is gated by a dimension-aware policy that weighs active query dimensions,
+`top_k` pressure, and live-row scale. Dense or high-pressure shapes fall back to exact
+execution by design. Explicit caller-provided pools remain possible for deliberate
+experiments, but the default gate is conservative.
+
+### 4) File-backed recovery that is boringly deterministic
+The persistence model is explicit: snapshot, WAL, replay, then continue. On restart,
+state is reconstructed before normal query service. This favors predictable recovery
+behavior over opaque startup side effects.
+
+### 5) Mutation model with lifecycle clarity
+Update/delete/upsert flows are mutation-friendly while keeping WAL-backed behavior
+straightforward to reason about. Lifecycle transitions are visible through persistence
+stats and checkpoint/compact operations.
+
+### 6) Caller-directed maintenance, no hidden daemon dependency
+Maintenance and scheduling calls are available and explicit. There is no requirement
+that hidden background threads be assumed for basic correctness; your host controls
+the maintenance cadence.
+
+## Build and run
 
 ```bash
 git clone https://github.com/SWORDIntel/QIHSE.git
@@ -22,12 +63,32 @@ cd QIHSE
 make all
 ```
 
-## 60-second integration sketch
+## Mermaid architecture snapshot
+
+```mermaid
+flowchart TB
+    A[Client Process] --> B[Query Ingestion]
+    A --> C[Vector Mutations]
+    B --> D{qihse_vector_db_search}
+    D --> E[Exact float32 rerank path\n(default)]
+    D --> F{Query mode}
+    F -->|TRINARY_SCALAR| G[qtri sidecar shortlist]
+    F -->|TRINARY_MAGNITUDE| H[qmag sidecar shortlist]
+    G --> E
+    H --> E
+    E --> I[Returned ranked results]
+    C --> J[WAL + snapshot metadata]
+    J --> K[checkpoint/compact]
+    K --> L[Restart-safe snapshot]
+    L --> D
+```
+
+## Quick integration picture (compact example)
 
 ```c
 qihse_vector_db_t db = qihse_vector_db_open(
     QIHSE_VECTOR_DB_AUTO,
-    NULL,
+    NULL,                      // UMA optional for simple flows
     "data/qihse_db",
     QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED
 );
@@ -38,59 +99,41 @@ qihse_vector_query_t q = {
     .top_k = 10,
     .query_mode = QIHSE_VDB_QUERY_FLOAT32
 };
-
 int got = qihse_vector_db_search(db, &q, results, 10);
+
 qihse_vector_db_flush(db);
 qihse_vector_db_checkpoint(db);
 qihse_vector_db_close(db);
 ```
 
-## What “fast mode” looks like
+Use trinary modes only when sidecars are available and your workload benefits:
+`QIHSE_VDB_QUERY_TRINARY_SCALAR` or
+`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`.
 
-Use trinary modes only when sidecars exist:
-- `QIHSE_VDB_QUERY_TRINARY_SCALAR`
-- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`
+## Core vector DB API surface
 
-Both still rerank with float32 for final result correctness.
+- Lifecycle: `qihse_vector_db_open`, `qihse_vector_db_close`, `qihse_vector_db_flush`,
+  `qihse_vector_db_checkpoint`, `qihse_vector_db_compact`, `qihse_vector_db_destroy`
+- Mutations: `qihse_vector_db_add_vectors`, `qihse_vector_db_update_by_id`,
+  `qihse_vector_db_delete_by_id`, `qihse_vector_db_upsert_by_ids`
+- Search: `qihse_vector_db_search`, `qihse_vector_db_search_trinary_candidates`
+- Runtime diagnostics: `qihse_vector_db_get_persistence_stats`
 
-## Developer-facing API surface
+## What to run before promoting a workload
 
-- `qihse_vector_db_open`
-- `qihse_vector_db_add_vectors`
-- `qihse_vector_db_update_by_id`
-- `qihse_vector_db_delete_by_id`
-- `qihse_vector_db_upsert_by_ids`
-- `qihse_vector_db_search`
-- `qihse_vector_db_search_trinary_candidates`
-- `qihse_vector_db_preload_similar`
-- `qihse_vector_db_get_persistence_stats`
-- `qihse_vector_db_flush`
-- `qihse_vector_db_checkpoint`
-- `qihse_vector_db_compact`
-- `qihse_vector_db_close`
+- `make test-persist`
+- `make test-trinary-codec`
+- `make benchmark`
+- `make bench-vxug-pdf-workload` (sample end-to-end flow)
+- `make bench-trinary-search-sweep` (acceleration shape behavior)
 
-## Production checks
+## Read this next
 
-- `make test-persist` validates persistence and WAL replay.
-- `make test-trinary-codec` validates codec and sidecar expectations.
-- `make benchmark` runs reference workload checks.
-- `make bench-vxug-pdf-workload` runs a practical end-to-end sample.
-
-## Runtime posture
-
-- Exact mode default, trinary mode opt-in.
-- Sidecar problems surface as explicit query failures.
-- Maintenance and migration controls are caller-driven.
-- Built for reproducibility over magic behavior.
-
-## Documentation
-
-- [docs/ONBOARDING.md](docs/ONBOARDING.md)
-- [docs/persistence/README.md](docs/persistence/README.md)
-- [docs/usage/](docs/usage/)
-- [docs/qmag-policy.md](docs/qmag-policy.md)
-- [docs/security/](docs/security/)
-- [docs/deployment/](docs/deployment/)
+- [docs/ONBOARDING.md](docs/ONBOARDING.md) for practical startup/runbook
+- [docs/persistence/README.md](docs/persistence/README.md) for durability model
+- [docs/qmag-policy.md](docs/qmag-policy.md) for default fast-path behavior
+- [docs/usage/](docs/usage/) for focused usage guides
+- [docs/security/](docs/security/) for policy and hardening notes
 
 ## License
 
