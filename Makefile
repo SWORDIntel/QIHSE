@@ -18,6 +18,7 @@ LDFLAGS=-ldl -lm -lpthread
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
+LIB_TARGET=libqihse.so
 
 SIFT1M_BASE_DATA=data/sift1m/sift_base.fvecs
 SIFT1M_QUERY_DATA=data/sift1m/sift_query.fvecs
@@ -62,17 +63,21 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check
-.PHONY: upstream-pr-loop
-
+.PHONY: all build clean pristine workspace workspace-clean lib persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
 .NOTPARALLEL: validate-reference-workflow
 
 all: lib
+build: lib
 
-lib: $(SRCS)
+lib: $(LIB_TARGET)
+
+$(LIB_TARGET): $(SRCS)
 	@echo "Building libqihse.so..."
-	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(SRCS) $(LDFLAGS)
+	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
 	@echo "Shared library build successful"
+
+persistence: test-persist
+persistence-check: test-persist
 
 test-persist: lib
 	$(CC) $(CFLAGS) -o tests/qihse_vector_db_persistence_test \
@@ -148,6 +153,39 @@ test-memory-migration-scheduler: lib
 	    tests/qihse_memory_migration_scheduler_test.c \
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_memory_migration_scheduler_test
+
+test-all-isa:
+	$(CC) $(CFLAGS) -o tests/test_all_isa tests/test_all_isa.c $(LDFLAGS)
+	./tests/test_all_isa
+
+test-vnni-bench:
+	$(CC) $(CFLAGS) -o tests/test_vnni_bench tests/test_vnni_bench.c \
+		-L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vnni_bench
+
+test-vnni-only:
+	$(CC) $(CFLAGS) -mavx2 -mfma -o tests/test_vnni_only tests/test_vnni_only.c $(LDFLAGS)
+	./tests/test_vnni_only
+
+test-avx2-only:
+	$(CC) $(CFLAGS) -mavx2 -mfma -o tests/test_avx2_only tests/test_avx2_only.c $(LDFLAGS)
+	./tests/test_avx2_only
+
+test-avx512-direct:
+	$(CC) $(CFLAGS) -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -o tests/test_avx512_direct tests/test_avx512_direct.c $(LDFLAGS)
+	./tests/test_avx512_direct
+
+test-amx-only:
+	$(CC) $(CFLAGS) -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_amx_only tests/test_amx_only.c $(LDFLAGS)
+	./tests/test_amx_only
+
+test-direct-execution:
+	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
+	./tests/test_direct_execution
+
+test-simple-exec:
+	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_simple_exec tests/test_simple_exec.c $(LDFLAGS)
+	./tests/test_simple_exec
 
 benchmark: validate-reference-workflow
 
@@ -323,8 +361,22 @@ check-upstream-workflow-strict:
 
 clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
-	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
+	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
+	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
+	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
+	    tests/test_direct_execution tests/test_simple_exec
 	@echo "Clean completed"
+
+workspace:
+	@sh scripts/bootstrap-workspace.sh
+	@echo "Workspace directories are ready."
+
+workspace-clean:
+	@sh scripts/bootstrap-workspace.sh --clean
+	@echo "Workspace directories removed."
+
+pristine: clean workspace-clean
+	@echo "Build artifacts and workspace artifacts removed."
 
 install: all
 	@install -d $(DESTDIR)/usr/local/lib $(DESTDIR)/usr/local/include/qihse
