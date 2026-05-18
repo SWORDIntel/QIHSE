@@ -150,6 +150,10 @@ Use trinary modes only when sidecars are available and your workload benefits:
 `QIHSE_VDB_QUERY_TRINARY_SCALAR` or
 `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`.
 
+For rawest speed (at the cost of recall guarantees), use:
+
+`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS`.
+
 ## Core vector DB API surface
 
 - Lifecycle: `qihse_vector_db_open`, `qihse_vector_db_close`, `qihse_vector_db_flush`,

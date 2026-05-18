@@ -98,7 +98,8 @@ typedef enum qihse_vector_db_magnitude_status_e {
  * selection, then reranks the candidate rows against authoritative float32
  * storage. QIHSE_VDB_QUERY_TRINARY_MAGNITUDE uses both vectors.qtri and
  * vectors.qmag for magnitude-aware candidate selection before the same exact
- * float32 rerank.
+ * float32 rerank. QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS skips float32
+ * rerank and returns qmag-ranked candidates directly.
  *
  * Trinary modes are explicit caller opt-ins. They fail rather than falling
  * back when required sidecars are absent, corrupt, stale, or internally
@@ -107,7 +108,8 @@ typedef enum qihse_vector_db_magnitude_status_e {
 typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_FLOAT32 = 0,
     QIHSE_VDB_QUERY_TRINARY_SCALAR = 1,
-    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2
+    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2,
+    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS = 3
 } qihse_vector_db_query_mode_t;
 
 /**
@@ -169,19 +171,26 @@ typedef struct qihse_vector_result_s {
  * - Explicit trinary candidate pools are capped after default resolution
  *   (scalar to total_vectors, qmag to live rows). The effective pool must
  *   still be at least top_k.
- * - Default-pool qmag is opportunistic: when its conservative policy gate
- *   rejects the query shape, including high active-dimension ratios, high
- *   top_k/live-row ratios, or high exact-rerank pool pressure,
- *   qihse_vector_db_search() falls back to exact float32 search.
- *   The default gate currently requires live_rows >= 512,
- *   active_query_dims/vector_dims <= 1/4, top_k/live_rows <= 3/128, and
- *   effective_candidate_pool/live_rows <= 9/32. The default qmag pool is
- *   top_k * 8 when active_query_dims/vector_dims <= 1/16, top_k * 10 when
- *   <= 1/8, and top_k * 12 otherwise, capped to live rows before the gate.
+ * - Default-pool qmag (TRINARY_MAGNITUDE) is opportunistic: when its
+ *   conservative policy gate rejects the query shape, including high
+ *   active-dimension ratios, high top_k/live-row ratios, or high exact-rerank
+ *   pool pressure, qihse_vector_db_search() falls back to exact float32 search.
+ *   Default-policy gates are dimension-aware and pressure-aware:
+ *   - sparse (<=1/32 active dims): top_k/live_rows <= 1/16 and
+ *     effective_candidate_pool/live_rows <= 1/4, qmag pool = top_k*4;
+ *   - light/medium (<=1/16 active dims): top_k/live_rows <= 3/128 and
+ *     effective_candidate_pool/live_rows <= 9/32, qmag pool = top_k*6;
+ *   - denser (<=1/8 active dims): top_k/live_rows <= 1/64 and
+ *     effective_candidate_pool/live_rows <= 1/8, qmag pool = top_k*8;
+ *   - >1/8 and <=1/4 active dims: denied by the 1/4 global sparsity gate.
+ *   These thresholds are chosen so fewer active dimensions route to a faster,
+ *   tighter default pool while preserving fallback to exact for denser cases.
  *   Caller-provided qmag pools remain explicit opt-ins and execute qmag
  *   search directly after normal pool and sidecar validation.
  * - Explicit trinary modes require top_k > 0 and top_k <= max_results. The
  *   effective candidate pool must still be at least top_k after validation.
+ * - QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS returns approximate qmag
+ *   ordering and writes qmag score (not cosine) into query results.
  * - Missing qtri reports ENOENT; stale qtri reports ESTALE when available or
  *   EINVAL otherwise; corrupt qtri reports EINVAL.
  * - Missing qmag reports ENODATA when available or ENOENT otherwise; stale
@@ -430,8 +439,8 @@ bool qihse_vector_db_upsert_by_ids(
  * Search vectors with QIHSE acceleration and instant access.
  *
  * Default queries search authoritative float32 vectors. Trinary query modes
- * use qtri/qmag only as candidate selectors and still return exact float32
- * reranked results.
+ * use qtri/qmag as candidate selectors and still return exact float32
+ * reranked results, except for QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS.
  *
  * @param vdb Vector database handle
  * @param query Query parameters; see qihse_vector_query_t for trinary contract
