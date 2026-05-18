@@ -284,3 +284,37 @@ weighted prototype qtri selectors.
 - [x] Strict upstream verification target added
 - [ ] Remove remaining legacy dependency language in all remaining planning docs
 - [ ] Finalize upstream-to-FRAMEWERX handoff cadence and enforcement policy
+
+## Next Slice Execution Plan
+
+Run in order:
+
+1) Close Long-tail persistence hardening gaps
+   - Add focused tests for cross-version `index.qidx` migration invariants and compaction partial-write fallbacks.
+   - Command target:
+     - Add new assertions in `qihse/tests/qihse_vector_db_persistence_test.c`.
+     - Validate: `make -C qihse test-persist`.
+
+2) Complete upstream automation slice
+   - Define and document upstream PR handoff in one command-driven sequence.
+   - Add a script or Make target to reduce FRAMEWERX copy-sync risk before PR creation.
+   - Command target:
+     - `make -C qihse check-upstream-workflow-strict` (in upstream subtree)
+     - `make -C qihse validate-reference-workflow`
+     - `make -C qihse test-persist`
+
+3) Run full SIFT1M calibration loop
+   - Stage full-scale dataset into `qihse/data/sift1m/` (`sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs`).
+   - Execute:
+     - `make -C qihse bench-sift1m-workload`
+     - `make -C qihse bench-reference-result-summary`
+   - Decide candidate policy only after rerun and evidence snapshot.
+
+4) Remove residual planning debt
+   - Scan planning docs for legacy dependency wording and update with upstream-first phrasing.
+   - Command target:
+     - `rg -n "legacy|FRAMEWERX-driven|manual copy-sync|SWORDIntel_QIHSE/qihse|upstream-first" qihse/planning`
+     - Address remaining hits.
+
+Acceptance:
+- This slice is done only when all unchecked items above are checked in the Milestone Checklist.
