@@ -101,9 +101,9 @@ typedef enum qihse_vector_db_magnitude_status_e {
  * float32 rerank. QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS skips float32
  * rerank and returns qmag-ranked candidates directly.
  *
- * Trinary modes are explicit caller opt-ins. They fail rather than falling
- * back when required sidecars are absent, corrupt, stale, or internally
- * inconsistent with the live float32 row count/dimensions.
+ * Trinary modes are explicit caller opt-ins. They fail rather than falling back
+ * when required sidecars are absent, corrupt, stale, or internally inconsistent
+ * with the live float32 row count/dimensions.
  */
 typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_FLOAT32 = 0,
@@ -158,7 +158,7 @@ typedef struct qihse_vector_result_s {
  *
  * Contract for qihse_vector_db_search():
  *
- * - query_mode == QIHSE_VDB_QUERY_FLOAT32, including zero-initialized queries,
+ * - `query_mode == QIHSE_VDB_QUERY_FLOAT32`, including zero-initialized queries,
  *   performs exact float32 search and tolerates missing/corrupt/stale qtri or
  *   qmag sidecars.
  * - use_trinary_candidates is the legacy scalar opt-in. When true and
@@ -198,6 +198,10 @@ typedef struct qihse_vector_result_s {
  *   reports EINVAL. The current internal consistency check reports stale via
  *   the trinary stale path when either qtri or qmag row/byte metadata no
  *   longer matches the float32 store.
+ * - For explicit `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`, candidate-pool defaults
+ *   are policy-gated; if policy denies the workload shape, the implementation
+ *   falls back to exact float32 search. `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS`
+ *   never auto-falls back.
  */
 typedef struct qihse_vector_query_s {
     const float* query_vector;      /* Query vector */
@@ -206,10 +210,10 @@ typedef struct qihse_vector_query_s {
     float similarity_threshold;     /* Minimum similarity threshold */
     bool include_vectors;           /* Include vector data in results */
     bool include_metadata;          /* Include metadata in results */
-    bool use_trinary_candidates;    /* Explicit opt-in trinary candidate path */
+    bool use_trinary_candidates;    /* Legacy scalar opt-in candidate path */
     size_t candidate_count;         /* Trinary candidate count before rerank */
     qihse_vector_db_query_mode_t query_mode; /* Preferred search mode selector */
-    size_t candidate_pool_size;     /* Preferred trinary pool size override */
+    size_t candidate_pool_size;     /* Trinary/qmag pool override for explicit modes */
 } qihse_vector_query_t;
 
 /**
@@ -438,9 +442,10 @@ bool qihse_vector_db_upsert_by_ids(
 /**
  * Search vectors with QIHSE acceleration and instant access.
  *
- * Default queries search authoritative float32 vectors. Trinary query modes
- * use qtri/qmag as candidate selectors and still return exact float32
- * reranked results, except for QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS.
+ * Default queries search authoritative float32 vectors. Trinary query modes use
+ * qtri/qmag as candidate selectors and normally return exact float32 reranked
+ * results, except for QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS which returns
+ * approximate qmag-only ordering for lowest-latency execution.
  *
  * @param vdb Vector database handle
  * @param query Query parameters; see qihse_vector_query_t for trinary contract
