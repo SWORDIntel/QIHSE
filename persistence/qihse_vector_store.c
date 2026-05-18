@@ -1,5 +1,6 @@
 #include "qihse_vector_store.h"
 
+#include "codecs/qihse_trinary_tryte_codec.h"
 #include "qihse_file.h"
 #include "qihse_persist_format.h"
 
@@ -688,7 +689,9 @@ static bool qihse_load_trinary_optional(const char* db_path,
     }
     if ((uint64_t)size != expected_size64 ||
         qihse_fnv1a64(data, size) != manifest->trinary_crc64 ||
-        !qihse_vector_store_validate_trinary(data, size)) {
+        !qihse_trinary_tryte_validate_payload(data,
+                                              (size_t)manifest->trinary_rows,
+                                              (size_t)manifest->vector_dims)) {
         free(data);
         errno = EINVAL;
         return false;
@@ -913,7 +916,10 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         errno = EINVAL;
         return false;
     }
-    if (in->trinary_bytes != 0u && !qihse_vector_store_validate_trinary(in->trinary, in->trinary_bytes)) {
+    if (in->trinary_bytes != 0u &&
+        !qihse_trinary_tryte_validate_payload(in->trinary,
+                                              in->row_count,
+                                              in->vector_dims)) {
         return false;
     }
     if (in->trinary_bytes != 0u) {

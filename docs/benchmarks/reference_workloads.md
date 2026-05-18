@@ -14,22 +14,106 @@ Run `make validate-reference-workflow` for the current sequential QIHSE
 reference workflow: manifest plan, mini `fvecs`/`ivecs` smoke, VXUG benchmark
 gate, and persistence tests.
 
+Deterministic sparse-active trinary/qmag fixtures are declared as
+`sparse-active-256x16` and `sparse-active-768x32` in the manifest. They keep
+workload size practical at 2048 rows, 128 queries, and `top_k=10`, while fixing
+query sparsity to 16 active dimensions for the 256-dimensional case and 32
+active dimensions for the 768-dimensional case.
+
+Generate and validate both sparse-active fixtures:
+
+```bash
+python3 benchmarks/scripts/qihse_generate_sparse_active_fixture.py --force
+python3 benchmarks/scripts/qihse_reference_workloads.py --root . \
+  --workload sparse-active-256x16 \
+  --workload sparse-active-768x32 \
+  --inspect-files --plan
+```
+
+Run them through exact float32, scalar `qtri`, and `qmag`:
+
+```bash
+make bench-reference-workload REFERENCE_WORKLOAD=sparse-active-256x16
+make bench-reference-workload REFERENCE_WORKLOAD=sparse-active-768x32
+```
+
+The runner writes generated JSON under `results/<workload>/latest.json` and
+reports recall@10, latency, active query dimensions, candidate path labels,
+reranked rows, and mismatch counts.
+
 After `make sample-vxug-pdf-workload` generates the local VXUG PDF sample,
 `make bench-vxug-pdf-workload` loads the generated matrices into file-backed
 QIHSE and compares exact float32, scalar `qtri`, and `qmag` against the sample
-ground truth. The runner reports recall@10, latency, selected candidate counts,
-and mismatch counts, and writes generated JSON under `results/`. Result files
-should remain outside git; only repeatable summaries belong in docs. The
-summary gate reads generated JSON and applies the manifest recall floor.
+ground truth. The runner reports recall@10, latency, requested candidate pool,
+effective candidate pool, active query dimensions, script-inferred candidate
+policy/path labels, reranked rows, and mismatch counts, and writes generated
+JSON under `results/`. Result files should remain outside git; only repeatable
+summaries belong in docs. The summary gate reads generated JSON, prints whether
+mismatches are `zero-required` or `reported-only`, and applies the manifest
+recall floor.
+
+### Persistence & Trinary File-Backed Storage Validation
+
+Persistent durability is part of normal validation, not an optional bonus:
+
+- `make test` runs the trinary codec regression suite and file-persistence smoke checks.
+- `make validate-reference-workflow` runs the full upstream-first sequence, including:
+  - manifest plan loading
+  - mini `fvecs`/`ivecs` smoke checks
+  - VXUG benchmark gate
+  - persistence/corruption-safety checks
+
+After benchmark commands, confirm:
+- `results/*/` contains generated payload summaries with no unexpected permission-only artifacts.
+- `results/reference-workloads/` contains deterministic manifest output.
+- no unexpected diffs in persisted state replay after restart/reload cycles.
+- `sift1m-fallback` has zero mismatches in every reported mode.
 
 The next larger calibration target is a SIFT-style workload using `fvecs`
-base/query vectors and `ivecs` ground truth. Do not change trinary default
-candidate-pool multipliers until the VXUG sample and at least one larger
-reference workload provide stable evidence. `make bench-sift1m-workload` now
-runs SIFT1M from `data/sift1m/` when available, or a deterministic fallback
-workload (`sift1m-fallback`) when the files are absent.
+base/query vectors and `ivecs` ground truth. Scalar `qtri` defaults to a
+full-row exact rerank after sidecar validation because sign-only matching can
+collapse dense non-negative vectors into large equal-score buckets. With no
+explicit candidate pool, `qtri` reports requested pool `0`, effective pool equal
+to row count, and reranked rows equal to row count. `qmag` remains the preferred
+fast trinary candidate path; with no explicit candidate pool it reports
+requested pool `0`, an inferred magnitude candidate pool, and reranked rows
+equal to that effective pool when the auto-policy selects qmag. The qmag
+auto-policy is intentionally conservative and correctness-preserving because it
+is a performance selector, not a correctness requirement: sparse low-active,
+low-`top_k` queries may use adaptive magnitude candidates, while dense,
+high-active-dimension, high-`top_k`, or high-rerank-pressure queries may fall
+back to exact float32 instead of forcing a risky shortlist. Explicit qmag
+candidate pools bypass this default performance gate and remain caller-directed
+opt-ins to the qmag shortlist path after sidecar and pool validation.
+Calibration decisions describe `qmag` as QIHSE dimension-mapped
+trinary+magnitude candidate scoring followed by exact float32 rerank whenever
+the policy or an explicit caller pool admits the candidate path. Do not loosen
+trinary candidate-pool policy until the VXUG sample and at least one larger
+reference workload provide stable evidence.
+
+`qmag` candidate scoring is live-row aware. Deleted rows, tombstones, and
+superseded update rows must not satisfy a small explicit candidate pool; the
+candidate walk must continue until enough live rows are available for exact
+float32 rerank or until live candidates are exhausted. This is especially
+important after restart and compaction, where persisted row-major `vectors.qtri`
+and `vectors.qmag` sidecars are revalidated and any runtime scoring cache must
+map candidates to current live rows only. Runtime dimension-major/decoded-sign
+caches can accelerate scoring over sparse active query dimensions, but those are
+in-memory execution aids, not additional persisted transposed sidecars.
+`make calibrate-sift1m-workload` now runs full SIFT1M when staged, otherwise
+falls back to the deterministic `sift1m-fallback` fixture and records a
+calibration policy JSON recommendation in
+`results/<workload>/calibration_decision.json`.
 Fallback fixtures are generated under `data/sift1m/fallback` and are used only
 for local validation, not as the 1M-scale calibration dataset.
+
+To force behavior:
+
+```bash
+make calibrate-sift1m-workload
+SIFT1M_CALIBRATION_SCOPE=full make calibrate-sift1m-workload
+SIFT1M_CALIBRATION_SCOPE=fallback make calibrate-sift1m-workload
+```
 
 To regenerate the fallback fixture manually:
 

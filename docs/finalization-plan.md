@@ -33,8 +33,9 @@ This plan finalizes two required areas from the repository documentation:
   - explicit persistence size example, and
   - telemetry/state persistence intent.
 - [x] Required docs locations recorded with line references.
-- [ ] Optional cleanup:
-  - Add any missing cross-links or a short “known environment limits” note for deployment path differences.
+- [x] Optional cleanup:
+  - Added a direct implementation note to source VXUG samples from `https://github.com/vxunderground/VXUG-Papers` (or any local equivalent path) in the workflow Makefile.
+  - Added `.gitignore` protection for `VXUG-Papers/` to keep locally-cloned samples out of version control.
 
 ## 4) Verification commands used
 - `git status --short`

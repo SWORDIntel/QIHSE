@@ -170,6 +170,21 @@ def read_vectors(root: Path, workload: dict[str, Any]) -> tuple[list[float], lis
     return base_vectors, query_vectors, ground_truth
 
 
+def active_query_dims(query_vectors: list[float], queries: int, dims: int) -> dict[str, float | int]:
+    counts: list[int] = []
+    for query_index in range(queries):
+        offset = query_index * dims
+        counts.append(
+            sum(1 for value in query_vectors[offset:offset + dims] if value != 0.0)
+        )
+    return {
+        "min": min(counts) if counts else 0,
+        "mean": statistics.fmean(counts) if counts else 0.0,
+        "max": max(counts) if counts else 0,
+        "total_dims": dims,
+    }
+
+
 def bind_qihse(lib_path: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(lib_path))
 
@@ -337,19 +352,36 @@ def run_mode(
     }
 
 
-def reported_candidate_pool(mode_name: str, rows: int, dims: int, top_k: int) -> str:
+def candidate_diagnostics(mode_name: str, rows: int, dims: int, top_k: int) -> dict[str, Any]:
+    requested_candidate_pool = 0
+    requested_candidate_count = 0
     if mode_name == "float32":
-        return str(rows)
-    multiplier = (
-        QIHSE_MAGNITUDE_CANDIDATE_MULTIPLIER
-        if mode_name == "qmag"
-        else QIHSE_SCALAR_CANDIDATE_MULTIPLIER
-    )
-    if dims >= 1024:
-        multiplier += 8
-    elif dims >= 256:
-        multiplier += 4
-    return str(min(rows, top_k * multiplier))
+        effective_candidate_pool = rows
+        policy = "exact_float32_all_rows"
+        path_label = "exact_float32_all_rows"
+    elif mode_name == "qtri":
+        effective_candidate_pool = rows
+        policy = "default_exact_rerank_all_rows"
+        path_label = "scalar_trinary_sign_full_rerank"
+    else:
+        multiplier = QIHSE_MAGNITUDE_CANDIDATE_MULTIPLIER
+        if dims >= 1024:
+            multiplier += 8
+        elif dims >= 256:
+            multiplier += 4
+        effective_candidate_pool = min(rows, top_k * multiplier)
+        policy = "default_magnitude_candidate_pool"
+        path_label = "qmag_dimension_mapped_trinary_magnitude_default_pool"
+    return {
+        "candidate_pool": effective_candidate_pool,
+        "requested_candidate_pool": requested_candidate_pool,
+        "requested_candidate_count": requested_candidate_count,
+        "effective_candidate_pool": effective_candidate_pool,
+        "reranked_rows": effective_candidate_pool,
+        "candidate_policy": policy,
+        "candidate_path_label": path_label,
+        "candidate_path_source": "script_inferred_from_query_mode",
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -378,6 +410,7 @@ def main(argv: list[str]) -> int:
 
     try:
         base_vectors, query_vectors, ground_truth = read_vectors(root, workload)
+        active_dims = active_query_dims(query_vectors, queries, dims)
         lib = bind_qihse(root / "libqihse.so")
         with tempfile.TemporaryDirectory(prefix="qihse_vxug_bench_") as temp_dir:
             db_path = Path(temp_dir) / "db"
@@ -391,11 +424,14 @@ def main(argv: list[str]) -> int:
                     "dimensions": dims,
                     "top_k": top_k,
                     "iterations": args.iterations,
+                    "active_query_dims": active_dims,
                     "modes": [],
                 }
                 print(
                     f"{args.workload}: rows={rows} queries={queries} dims={dims} "
-                    f"top_k={top_k} iterations={args.iterations}"
+                    f"top_k={top_k} iterations={args.iterations} "
+                    f"active_dims=min/{active_dims['min']} "
+                    f"mean/{active_dims['mean']:.1f} max/{active_dims['max']}"
                 )
                 for mode_name, query_mode in (
                     ("float32", QIHSE_VDB_QUERY_FLOAT32),
@@ -414,14 +450,18 @@ def main(argv: list[str]) -> int:
                         top_k,
                         args.iterations,
                     )
-                    candidate_pool = reported_candidate_pool(mode_name, rows, dims, top_k)
-                    mode_result["candidate_pool"] = int(candidate_pool)
+                    diagnostics = candidate_diagnostics(mode_name, rows, dims, top_k)
+                    mode_result.update(diagnostics)
                     results_payload["modes"].append(mode_result)
                     print(
                         f"{mode_name}: recall@{top_k}={mode_result['recall']:.4f} "
                         f"mean_us={mode_result['mean_us']:.3f} "
                         f"p95_us={mode_result['p95_us']:.3f} "
-                        f"candidate_pool={candidate_pool} "
+                        f"requested_pool={mode_result['requested_candidate_pool']} "
+                        f"effective_pool={mode_result['effective_candidate_pool']} "
+                        f"reranked_rows={mode_result['reranked_rows']} "
+                        f"candidate_policy={mode_result['candidate_policy']} "
+                        f"candidate_path={mode_result['candidate_path_label']} "
                         f"mismatches={len(mode_result['mismatches'])}"
                     )
                 if args.output_json:

@@ -29,6 +29,20 @@ static bool qihse_tryte_checked_mul_size(size_t a, size_t b, size_t* out) {
     return true;
 }
 
+static bool qihse_tryte_checked_add_i64(int64_t a, int64_t b, int64_t* out) {
+    if (!out) {
+        errno = EINVAL;
+        return false;
+    }
+    if ((b > 0 && a > INT64_MAX - b) ||
+        (b < 0 && a < INT64_MIN - b)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
 static int8_t qihse_tryte_signed_trit(uint8_t trit) {
     if (trit == 0u) {
         return -1;
@@ -39,9 +53,21 @@ static int8_t qihse_tryte_signed_trit(uint8_t trit) {
     return 0;
 }
 
+static bool qihse_tryte_weighted_dims_fit_i64(size_t dims) {
+    if (dims > (size_t)(INT64_MAX / (int64_t)INT32_MAX)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    return true;
+}
+
 bool qihse_trinary_tryte_row_bytes(size_t dims, size_t* out_row_bytes) {
     size_t padded;
 
+    if (!out_row_bytes) {
+        errno = EINVAL;
+        return false;
+    }
     if (!qihse_tryte_checked_add_size(dims,
                                       QIHSE_TRINARY_TRITS_PER_TRYTE - 1u,
                                       &padded)) {
@@ -119,6 +145,73 @@ bool qihse_trinary_tryte_validate(const uint8_t* payload, size_t payload_bytes) 
     for (i = 0u; i < payload_bytes; i++) {
         if (payload[i] > QIHSE_TRINARY_TRYTE_MAX) {
             errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool qihse_tryte_validate_row_padding(const uint8_t* row_trytes,
+                                             size_t dims,
+                                             size_t row_bytes) {
+    size_t used_trits = dims % QIHSE_TRINARY_TRITS_PER_TRYTE;
+    uint8_t trits[QIHSE_TRINARY_TRITS_PER_TRYTE];
+    size_t i;
+
+    if (row_bytes == 0u || used_trits == 0u) {
+        return true;
+    }
+    if (!qihse_trinary_tryte_unpack(row_trytes[row_bytes - 1u], trits)) {
+        return false;
+    }
+    for (i = used_trits; i < QIHSE_TRINARY_TRITS_PER_TRYTE; i++) {
+        if (trits[i] != 1u) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool qihse_trinary_tryte_validate_row(const uint8_t* row_trytes, size_t dims) {
+    size_t row_bytes;
+
+    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes)) {
+        return false;
+    }
+    if (!row_trytes && row_bytes != 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_validate(row_trytes, row_bytes)) {
+        return false;
+    }
+    return qihse_tryte_validate_row_padding(row_trytes, dims, row_bytes);
+}
+
+bool qihse_trinary_tryte_validate_payload(const uint8_t* payload,
+                                          size_t rows,
+                                          size_t dims) {
+    size_t row_bytes;
+    size_t payload_bytes;
+    size_t row;
+
+    if (!qihse_trinary_tryte_row_bytes(dims, &row_bytes) ||
+        !qihse_tryte_checked_mul_size(rows, row_bytes, &payload_bytes)) {
+        return false;
+    }
+    if (!payload && payload_bytes != 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_validate(payload, payload_bytes)) {
+        return false;
+    }
+    for (row = 0u; row < rows; row++) {
+        const uint8_t* row_trytes = row_bytes == 0u
+                                        ? NULL
+                                        : payload + (row * row_bytes);
+        if (!qihse_tryte_validate_row_padding(row_trytes, dims, row_bytes)) {
             return false;
         }
     }
@@ -206,8 +299,8 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
         errno = EINVAL;
         return false;
     }
-    if (!qihse_trinary_tryte_validate(lhs_trytes, row_bytes) ||
-        !qihse_trinary_tryte_validate(rhs_trytes, row_bytes)) {
+    if (!qihse_trinary_tryte_validate_row(lhs_trytes, dims) ||
+        !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
@@ -267,8 +360,8 @@ bool qihse_trinary_tryte_select_topk(const uint8_t* encoded_rows,
         errno = EINVAL;
         return false;
     }
-    if (!qihse_trinary_tryte_validate(encoded_query, row_bytes) ||
-        !qihse_trinary_tryte_validate(encoded_rows, payload_bytes)) {
+    if (!qihse_trinary_tryte_validate_row(encoded_query, dims) ||
+        !qihse_trinary_tryte_validate_payload(encoded_rows, row_count, dims)) {
         return false;
     }
     if (row_count == 0u || max_results == 0u) {
@@ -332,6 +425,9 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
         errno = EINVAL;
         return false;
     }
+    if (!qihse_tryte_weighted_dims_fit_i64(dims)) {
+        return false;
+    }
     if ((!dim_weights && dims != 0u)) {
         errno = EINVAL;
         return false;
@@ -343,8 +439,8 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
         errno = EINVAL;
         return false;
     }
-    if (!qihse_trinary_tryte_validate(lhs_trytes, row_bytes) ||
-        !qihse_trinary_tryte_validate(rhs_trytes, row_bytes)) {
+    if (!qihse_trinary_tryte_validate_row(lhs_trytes, dims) ||
+        !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
@@ -363,9 +459,16 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
                 errno = EINVAL;
                 return false;
             }
-            score += (int64_t)(qihse_tryte_signed_trit(lhs[trit_idx]) *
-                               qihse_tryte_signed_trit(rhs[trit_idx])) *
-                     (int64_t)dim_weights[seen_dims];
+            {
+                int64_t signed_product =
+                    (int64_t)(qihse_tryte_signed_trit(lhs[trit_idx]) *
+                              qihse_tryte_signed_trit(rhs[trit_idx]));
+                int64_t delta = signed_product * (int64_t)dim_weights[seen_dims];
+
+                if (!qihse_tryte_checked_add_i64(score, delta, &score)) {
+                    return false;
+                }
+            }
         }
     }
     *out_score = score;
@@ -399,6 +502,9 @@ bool qihse_trinary_tryte_select_topk_weighted(const uint8_t* encoded_rows,
         return false;
     }
     *out_count = 0u;
+    if (!qihse_tryte_weighted_dims_fit_i64(dims)) {
+        return false;
+    }
     if ((!dim_weights && dims != 0u) ||
         !qihse_trinary_tryte_row_bytes(dims, &row_bytes) ||
         !qihse_tryte_checked_mul_size(row_count, row_bytes, &payload_bytes)) {
@@ -414,8 +520,8 @@ bool qihse_trinary_tryte_select_topk_weighted(const uint8_t* encoded_rows,
         errno = EINVAL;
         return false;
     }
-    if (!qihse_trinary_tryte_validate(encoded_query, row_bytes) ||
-        !qihse_trinary_tryte_validate(encoded_rows, payload_bytes)) {
+    if (!qihse_trinary_tryte_validate_row(encoded_query, dims) ||
+        !qihse_trinary_tryte_validate_payload(encoded_rows, row_count, dims)) {
         return false;
     }
     if (row_count == 0u || max_results == 0u) {

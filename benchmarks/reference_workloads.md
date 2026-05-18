@@ -20,18 +20,43 @@ Current calibration rule:
 - Exact float32 remains the default unless a query opts into trinary mode.
 - Legacy `use_trinary_candidates` keeps using `candidate_count` exactly as
   supplied.
-- `qtri` uses a wider default candidate pool than `qmag` because it only sees
-  sign information.
+- `qtri` defaults to a full-row exact rerank after sidecar validation because
+  sign-only matching can collapse dense non-negative vectors into large
+  equal-score buckets. With no explicit candidate pool, the effective pool and
+  reranked row count are the full row count.
 - `qmag` uses row-side magnitude buckets plus signs, then reranks against the
-  authoritative float32 vectors.
+  authoritative float32 vectors. The intended acceleration layout keeps an
+  in-memory, dimension-major QIHSE qmag cache decoded from the row-side qmag
+  data so each query dimension can scan contiguous magnitude/sign bytes across
+  rows. Mutations invalidate this derived cache; delete, update, upsert, and
+  compact must rebuild or refresh it before any opt-in qmag candidate search can
+  use it. With no explicit candidate pool, `qmag` is the default fast trinary
+  candidate path and reports the inferred effective pool separately from the
+  requested query pool. The persisted format remains the authoritative row-side
+  vector snapshot and qmag data; no persisted dimension-major transposed qmag
+  sidecar is assumed or required. The benchmark runner labels this as
+  QIHSE dimension-mapped trinary+magnitude candidate scoring followed by exact
+  float32 rerank; the label is script-inferred from query mode, not a C ABI
+  field.
 
 Calibration gate:
 
-- Do not change default candidate-pool multipliers for synthetic-only cases.
+- Do not change default candidate-pool policy for synthetic-only cases.
 - Add production-shaped reference workloads first, then compare recall,
   latency, and rerank cost across exact float32, scalar `qtri`, and `qmag`.
 - Only adjust defaults when a reference workload shows a stable improvement
   across repeated runs.
+
+Sweep policy analysis:
+
+- Analyze the 100-case sweep with actual qmag effective pools using:
+  `python3 benchmarks/scripts/qihse_qmag_policy_analyzer.py results/sweep100/summary.json --results-dir results/sweep100 --top 20`
+- The analyzer prints ranked candidate policies plus a concise C-threshold
+  block. The C block rationalizes the best active-dimension and pool-pressure
+  findings to integer-friendly thresholds such as `1/4`, `1/32`, and `19/64`,
+  then reports expected selected cases, false positives, false negatives,
+  precision, recall, and mean selected qmag speedup if those thresholds are
+  used as the default qmag auto-policy.
 
 Tracked workload manifest:
 
@@ -49,6 +74,11 @@ Tracked workload manifest:
 - `make validate-reference-workflow` runs the manifest plan, the generated
   `fvecs`/`ivecs` smoke workload, the VXUG benchmark gate, and persistence
   tests sequentially.
+- `sift1m-fallback` rejects non-zero mismatches so scalar sign-collapse
+  regressions fail immediately.
+- `sparse-active-256x16` and `sparse-active-768x32` cover deterministic
+  sparse-query trinary/qmag workloads with 2048 rows, 128 queries, `top_k=10`,
+  and exact active query dimension counts of 16 and 32 respectively.
 
 Execution plan:
 
@@ -56,8 +86,9 @@ Execution plan:
    `data/vxug_pdf_sample/base.f32`, `query.f32`, and `ground_truth.u32` into
    a file-backed QIHSE vector database.
 2. Run the same queries through exact float32, scalar `qtri`, and `qmag`.
-   Record recall@10, latency, selected candidate count, rerank count, and
-   mismatches.
+   Record recall@10, latency, requested candidate pool, effective candidate
+   pool, reranked rows, active query dimensions, candidate policy/path label,
+   and mismatches.
 3. Store benchmark outputs under `results/` as generated artifacts outside git
    by default. Only promote summarized results into docs after the runner is
    repeatable. `qihse_reference_result_summary.py` reads those generated JSON
@@ -75,9 +106,44 @@ Latest local VXUG sample result:
 - `qtri`: recall@10 `0.9812`
 - `qmag`: recall@10 `1.0000`
 
-The first result supports the existing policy: `qmag` is the preferred trinary
-path for magnitude-sensitive text-derived vectors, but one small generated PDF
-sample is not enough to change default candidate-pool multipliers.
+The first result supports the existing policy: `qmag` is the preferred fast
+trinary path for magnitude-sensitive text-derived vectors, while scalar `qtri`
+keeps correctness by defaulting to a full-row rerank unless a caller provides an
+explicit candidate pool.
+
+#### Sparse-Active Trinary/QMAG Fixtures
+
+The sparse-active fixtures make the temporary sparse sweeps reproducible without
+ad hoc scripts. They generate deterministic `f32_matrix` base/query files and
+`u32_matrix` ground truth under `data/sparse_active/`.
+
+Representative manifest workloads:
+
+- `sparse-active-256x16`: 256 dimensions, 16 active query dimensions, 2048
+  rows, 128 queries, `top_k=10`.
+- `sparse-active-768x32`: 768 dimensions, 32 active query dimensions, 2048
+  rows, 128 queries, `top_k=10`.
+
+Generate and validate the fixtures:
+
+```bash
+python3 benchmarks/scripts/qihse_generate_sparse_active_fixture.py --force
+python3 benchmarks/scripts/qihse_reference_workloads.py --root . \
+  --workload sparse-active-256x16 \
+  --workload sparse-active-768x32 \
+  --inspect-files --plan
+```
+
+Run the benchmark modes through the existing manifest-backed runner:
+
+```bash
+make bench-reference-workload REFERENCE_WORKLOAD=sparse-active-256x16
+make bench-reference-workload REFERENCE_WORKLOAD=sparse-active-768x32
+```
+
+Each run compares exact float32, scalar `qtri`, and `qmag`, reports active query
+dimensions, candidate policy/path labels, reranked rows, recall@10, latency, and
+mismatch counts, and writes generated JSON under `results/<workload>/latest.json`.
 
 #### SIFT1M Benchmark (Computer Vision)
 ```python
@@ -102,7 +168,8 @@ under `results/sift1m/`.
 
 If full 1M data is unavailable, `make bench-sift1m-workload` now falls back to
 `sift1m-fallback`, reading deterministic vectors and ground truth from
-`data/sift1m/fallback/*`.
+`data/sift1m/fallback/*`. The fallback gate keeps the same recall floor as the
+full SIFT workload and rejects non-zero mismatches.
 
 To refresh the staged fallback fixture:
 
@@ -155,7 +222,16 @@ workload_vxug_pdf_sample = {
     "dimensions": 256,
     "queries": 16,
     "top_k": 10,
-    "metrics": ["recall_at_10", "latency_p95_us", "rerank_candidates"]
+  "metrics": [
+    "recall_at_10",
+    "latency_p95_us",
+    "active_query_dims",
+    "requested_candidate_pool",
+    "effective_candidate_pool",
+    "candidate_policy",
+    "candidate_path_label",
+    "reranked_rows"
+  ]
 }
 ```
 

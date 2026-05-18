@@ -93,17 +93,6 @@ sudo yum install -y openssl-devel numactl-devel hwloc-devel
 git clone <repository-url>
 cd qihse-breakthroughalgo
 
-# Configure build (enable optional components)
-./configure \
-    --enable-avx512 \
-    --enable-amx \
-    --enable-openvino \
-    --enable-cuda \
-    --enable-sycl \
-    --enable-distributed \
-    --enable-security \
-    --prefix=/usr/local
-
 # Build the system
 make -j$(nproc)
 

@@ -42,6 +42,19 @@ bool qihse_trinary_tryte_unpack(uint8_t tryte,
 
 bool qihse_trinary_tryte_validate(const uint8_t* payload, size_t payload_bytes);
 
+/*
+ * Shape-aware validation for encoded rows and row-major payloads.
+ *
+ * These helpers validate both tryte byte ranges and the neutral padding trits
+ * implied by dims. Generic payload validation only proves each byte is a valid
+ * tryte value; it cannot prove that unused final-byte trits are neutral.
+ */
+bool qihse_trinary_tryte_validate_row(const uint8_t* row_trytes, size_t dims);
+
+bool qihse_trinary_tryte_validate_payload(const uint8_t* payload,
+                                          size_t rows,
+                                          size_t dims);
+
 bool qihse_trinary_tryte_encode_row(const float* vector,
                                     size_t dims,
                                     uint8_t* out_trytes,

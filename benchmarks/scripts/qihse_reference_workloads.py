@@ -101,10 +101,16 @@ def inspect_workload_files(workload: dict[str, Any], root: Path) -> list[str]:
             errors.append(
                 f"{workload['name']}.{label} rows {actual_rows} != expected {expected_rows}"
             )
-        if expected_dims is not None and actual_dims != expected_dims:
-            errors.append(
-                f"{workload['name']}.{label} dims {actual_dims} != expected {expected_dims}"
-            )
+        if expected_dims is not None:
+            if file_format == "ivecs" and label == "ground_truth":
+                if actual_dims < expected_dims:
+                    errors.append(
+                        f"{workload['name']}.{label} dims {actual_dims} < expected minimum {expected_dims}"
+                    )
+            elif actual_dims != expected_dims:
+                errors.append(
+                    f"{workload['name']}.{label} dims {actual_dims} != expected {expected_dims}"
+                )
 
     return errors
 

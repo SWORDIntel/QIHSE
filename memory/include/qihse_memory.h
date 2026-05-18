@@ -57,6 +57,49 @@ typedef enum qihse_memory_access_e {
 } qihse_memory_access_t;
 
 /**
+ * Quantum-inspired workload phase for tier placement.
+ */
+typedef enum qihse_memory_phase_e {
+    QIHSE_MEMORY_PHASE_INIT = 0,          /* Initialization / bulk ingest */
+    QIHSE_MEMORY_PHASE_SUPERPOSITION = 1, /* Active state-vector work */
+    QIHSE_MEMORY_PHASE_INTERACTION = 2,   /* Coupling / interaction matrix work */
+    QIHSE_MEMORY_PHASE_AMPLIFICATION = 3, /* Iterative amplification */
+    QIHSE_MEMORY_PHASE_MEASUREMENT = 4,   /* Readout / result materialization */
+} qihse_memory_phase_t;
+
+/**
+ * Workload description used by the UMA/HMA placement planner.
+ */
+typedef struct qihse_memory_workload_analysis_s {
+    qihse_memory_access_t access_pattern; /* Dominant access pattern */
+    double read_write_ratio;              /* Reads per write; 0 means unknown */
+    size_t working_set_size;              /* Active bytes */
+    double temporal_locality;             /* 0..1 reuse score */
+    double spatial_locality;              /* 0..1 adjacency score */
+    size_t superposition_dims;            /* Active state dimensions */
+    double entanglement_density;          /* 0..1 correlation density */
+    qihse_memory_phase_t phase;           /* Current algorithm phase */
+} qihse_memory_workload_analysis_t;
+
+/**
+ * Capacity/latency model for HMA placement. Values may be approximate.
+ */
+typedef struct qihse_memory_tier_topology_s {
+    size_t capacity;             /* Tier capacity in bytes */
+    double bandwidth_gbps;       /* Estimated bandwidth */
+    double latency_ns;           /* Estimated latency */
+    bool coherent;               /* Hardware/software coherence available */
+} qihse_memory_tier_topology_t;
+
+typedef struct qihse_memory_topology_s {
+    qihse_memory_tier_topology_t superposition_buffer;
+    qihse_memory_tier_topology_t interaction_cache;
+    qihse_memory_tier_topology_t entanglement_fabric;
+    double inter_tier_bandwidth_gbps;
+    size_t numa_nodes;
+} qihse_memory_topology_t;
+
+/**
  * Memory allocation flags.
  */
 #define QIHSE_MEM_ZERO     (1u << 0)  /* Zero-initialize allocation */
@@ -91,6 +134,13 @@ typedef struct qihse_memory_buffer_s {
     uint64_t access_count;       /* Number of accesses */
     uint64_t last_access_time;    /* Last access timestamp */
     double residency_score;       /* Migration priority score */
+
+    /* Coherence tracking */
+    uint64_t coherence_version;           /* Current coherence version */
+    uint64_t coherence_last_read_version; /* Last read-observed version */
+    uint64_t coherence_last_write_version; /* Last write-produced version */
+    uint32_t coherence_state;             /* qihse_memory_coherence_state_t */
+    bool coherence_shared;                /* Shared clean residency */
 
     /* HMA integration */
     void* hma_metadata;           /* HMA-specific metadata */
@@ -303,6 +353,46 @@ void qihse_memory_set_policy(
  * @return Current policy
  */
 qihse_memory_policy_t qihse_memory_get_policy(qihse_memory_manager_t manager);
+
+/**
+ * Fill a conservative default HMA topology used when no hardware probe is
+ * available.
+ *
+ * @param topology Output topology
+ * @return true on success, false on invalid arguments
+ */
+bool qihse_memory_default_topology(qihse_memory_topology_t* topology);
+
+/**
+ * Recommend an HMA/UMA memory type for a workload. If topology is NULL, a
+ * conservative default topology is used.
+ *
+ * @param analysis Workload characteristics
+ * @param topology Optional hardware topology
+ * @param out_type Recommended memory type
+ * @return true on success, false on invalid arguments
+ */
+bool qihse_memory_recommend_type(
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    qihse_memory_type_t* out_type
+);
+
+/**
+ * Allocate a buffer using the workload-aware HMA placement planner.
+ *
+ * @param manager Memory manager
+ * @param analysis Workload characteristics used for placement
+ * @param topology Optional hardware topology; NULL uses defaults
+ * @param flags Allocation flags
+ * @return Allocated buffer, or NULL on failure
+ */
+qihse_memory_buffer_t* qihse_memory_allocate_for_workload(
+    qihse_memory_manager_t manager,
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    uint32_t flags
+);
 
 /* ============================================================================
  * UTILITY FUNCTIONS

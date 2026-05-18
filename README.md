@@ -12,6 +12,16 @@ QIHSE is a revolutionary search algorithm that combines quantum-inspired mathema
 
 ## 🏆 Key Features
 
+### ⚙️ **Trinary-Backed File Persistence**
+- **File-Persisted Trinary Codec** for durable index/state checkpoints using trinary-representation artifacts.
+- **Live-row-aware qmag scoring** uses trinary+magnitude sidecars for candidate selection while skipping deleted/tombstoned/superseded rows before exact rerank.
+- **Sparse active-dimension execution** lets runtime qmag caches score non-zero query dimensions efficiently; persisted sidecars remain row-oriented `vectors.qtri` and `vectors.qmag` artifacts.
+- **Conservative qmag auto-policy** is a performance selector, not a correctness requirement: default-pool qmag uses the magnitude candidate path only when the workload shape is expected to be beneficial; dense, high-active-dimension, high-`top_k`, or high-rerank-pressure queries can fall back to exact float32 while preserving result correctness. Explicit qmag candidate pools remain caller-directed opt-ins.
+- **100-case qmag policy guidance** is documented in [docs/qmag-policy.md](docs/qmag-policy.md): small-row and dense/high-active loss clusters fall back by default, sparse low-pressure shapes remain eligible, and explicit qmag pools still execute when requested.
+- **Runtime memory maintenance** now includes a caller-drained scheduler execution path (`qihse_memory_migration_scheduler_run`) and callback registration for hardware DMA/device-copy backends.
+- **Crash-safe restore** with restart-safe validation and integrity-oriented checks in the benchmark pipeline.
+- **Persistent workflows** validated through upstream persistence gates (`make test`, `make benchmark`).
+
 ### ⚡ **Heterogeneous Parallel Computing**
 - **Simultaneous execution** across CPU (AVX2/AVX-512/AMX), GPU (Intel Arc/NVIDIA), and NPU (Meteor Lake)
 - **True parallel processing** with advanced result aggregation
@@ -124,6 +134,7 @@ qihse_search_vector(ctx, query, 100, results, distances);
 | **[Architecture Overview](docs/architecture/)** | System architecture and design principles |
 | **[API Reference](docs/api/)** | Complete C API documentation |
 | **[User Guide](docs/user/)** | Installation, configuration, and usage |
+| **[Persistence & Trinary Storage](docs/benchmarks/reference_workloads.md)** | Trinary file persistence validation workflow and dataset-backed persistence checks |
 | **[Benchmark Results](docs/benchmarks/)** | Performance benchmarks and validation |
 | **[Security Guide](docs/security/)** | CNSA 2.0 compliance and security features |
 | **[Deployment Guide](docs/deployment/)** | Production deployment and clustering |
@@ -231,10 +242,11 @@ qihse/
 ### Build Targets
 ```bash
 make all           # Build all components
-make test          # Run comprehensive test suite
-make benchmark     # Run benchmark validation
+make test          # Run test-persist and test-trinary-codec
+make benchmark     # Run upstream validation workflow (workloads + persistence)
 make clean         # Clean build artifacts
-make install       # Install system libraries
+make install       # Install libqihse.so and qihse.h to /usr/local
+make check         # Validate FRAMEWERX import contract + root workflow
 ```
 
 ### Dependencies
