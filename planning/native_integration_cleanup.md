@@ -11,10 +11,11 @@ transition-fallback references unless explicitly called out as remaining work.
 
 ## Integration Direction
 
-QIHSE is a native engine that lives inside this repository as source code, not a
-FrameworkX-dependent subsystem. FRAMEWERX can call it through bindings, worker
-bridges, or state adapters, but FRAMEWERX should not define QIHSE's native
-layout, persistence contract, file format, build rules, or runtime lifecycle.
+QIHSE is a native engine that lives inside this repository as source code and is
+used by FRAMEWERX through adapters and worker boundaries. FRAMEWERX can call it
+through bindings, worker bridges, or state adapters, but should not define
+QIHSE's native layout, persistence contract, file format, build rules, or runtime
+lifecycle.
 
 The useful NOT_STISLA work should remain integrated into QIHSE where it serves
 QIHSE's native search model. In the current tree, that means retaining the

@@ -58,6 +58,7 @@ endif
 # or provided by qihse_exports.c stubs.
 
 .PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check
+.PHONY: upstream-pr-loop
 
 .NOTPARALLEL: validate-reference-workflow
 
@@ -177,6 +178,9 @@ bench-sift1m-workload: lib
 	fi
 
 validate-reference-workflow: bench-reference-workloads bench-reference-runner-smoke bench-vxug-pdf-workload bench-sift1m-workload test-persist
+
+upstream-pr-loop:
+	python3 scripts/qihse_upstream_pr_loop.py --source-root . $(if $(UPSTREAM_ROOT),--upstream-root $(UPSTREAM_ROOT))
 
 check: check-upstream-workflow
 

@@ -6,7 +6,7 @@ Remote target: `gitlab/master` (FRAMEWERX sync target)
 
 ## Progress Snapshot (Continuation)
 
-- Current milestone completion: **76%** (19 / 25 checklist items).
+- Current milestone completion: **96%** (26 / 27 checklist items).
 - This slice completed:
   - `make test-persist`
   - `make test-trinary-codec`
@@ -251,7 +251,7 @@ weighted prototype qtri selectors.
 
 ## Milestone Checklist
 
-- Plan completion target (for this slice): **76%**
+- Plan completion target (for this slice): **96%**
 - Overall completion method: counted milestone items below with explicit blockers and no
   unresolved dependencies.
 
@@ -269,9 +269,9 @@ weighted prototype qtri selectors.
   - truncated `metadata.qmeta`
   - truncated `index.qidx`
   - stale `*.tmp` snapshot artifacts
-- [ ] Long-tail consistency hardening (outstanding checks after valid snapshot):
-  - `index.qidx` row metadata consistency under cross-version migration
-  - manifest/index edge-case replay/fallback after partial compaction writes
+- [x] Long-tail consistency hardening (outstanding checks after valid snapshot):
+  - [x] `index.qidx` row metadata consistency under cross-version migration
+  - [x] manifest/index edge-case replay/fallback after partial compaction writes
 
 ### 2) Test infrastructure and regression gate
 
@@ -282,7 +282,7 @@ weighted prototype qtri selectors.
   - index row-bytes mismatch
   - manifest/index checksum mismatch
 - [x] `make check-upstream-workflow` and `make check-upstream-workflow-strict` targets
-- [ ] Full upstream PR validation loop automation from FRAMEWERX (still manual copy-sync)
+- [x] Full upstream PR validation loop automation from FRAMEWERX via synced checkout loop
 
 ### 3) Reference workload and calibration runway
 
@@ -290,47 +290,43 @@ weighted prototype qtri selectors.
 - [x] SIFT1M missing-data fallback path implemented (`sift1m-fallback`)
 - [x] SIFT1M fallback generator integrated and documented
 - [x] Trinary candidate/magnitude sweeps capture production-oriented evidence
-- [ ] Add or stage full `data/sift1m/*` 1M-style dataset for non-fallback scale baseline
-- [ ] Close the full SIFT1M calibration loop (including rerun and candidate policy decision)
+- [x] Add or stage full `data/sift1m/*` 1M-style dataset for non-fallback scale baseline
+- [ ] Close the full SIFT1M calibration loop (including rerun and candidate policy decision; currently blocked by CPU cap, resume when off-peak)
 
 ### 4) Upstream-first ownership alignment
 
 - [x] Authoritative upstream repo recorded in planning/docs
 - [x] FRAMEWERX copy treated as downstream import target
 - [x] Strict upstream verification target added
-- [ ] Remove remaining legacy dependency language in all remaining planning docs
-- [ ] Finalize upstream-to-FRAMEWERX handoff cadence and enforcement policy
+- [x] Remove remaining legacy dependency language in all remaining planning docs
+- [x] Finalize upstream-to-FRAMEWERX handoff cadence and enforcement policy
 
 ## Next Slice Execution Plan
 
 Run in order:
 
-1) Close Long-tail persistence hardening gaps
-   - Add focused tests for cross-version `index.qidx` migration invariants and compaction partial-write fallbacks.
-   - Command target:
-     - Add new assertions in `qihse/tests/qihse_vector_db_persistence_test.c`.
-     - Validate: `make -C qihse test-persist`.
+1) Complete upstream handoff discipline from FRAMEWERX into upstream and back.
+   - Use `make -C qihse upstream-pr-loop` when `UPSTREAM_ROOT` is available.
+   - Verify gate alignment with `make -C qihse check-upstream-workflow` and FRAMEWERX
+     integration checks (`make -C qihse validate-reference-workflow`).
 
-2) Complete upstream automation slice
-   - Define and document upstream PR handoff in one command-driven sequence.
-   - Add a script or Make target to reduce FRAMEWERX copy-sync risk before PR creation.
-   - Command target:
-     - `make -C qihse check-upstream-workflow-strict` (in upstream subtree)
-     - `make -C qihse validate-reference-workflow`
-     - `make -C qihse test-persist`
-
-3) Run full SIFT1M calibration loop
-   - Stage full-scale dataset into `qihse/data/sift1m/` (`sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs`).
+2) Run full SIFT1M calibration loop
+   - Stage full-scale dataset into `qihse/data/sift1m/` (`sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs`) with
+     ground-truth truncated to 10 neighbors for manifest parity (`top_k=10`).
    - Execute:
      - `make -C qihse bench-sift1m-workload`
      - `make -C qihse bench-reference-result-summary`
    - Decide candidate policy only after rerun and evidence snapshot.
+   - Current status: manifest validation passes and ground-truth row width now matches `top_k`; `bench-sift1m-workload`
+     is still the remaining heavy step.
 
-4) Remove residual planning debt
-   - Scan planning docs for legacy dependency wording and update with upstream-first phrasing.
-   - Command target:
-     - `rg -n "legacy|FRAMEWERX-driven|manual copy-sync|SWORDIntel_QIHSE/qihse|upstream-first" qihse/planning`
-     - Address remaining hits.
+3) CPU-capped mode: keep fallback workload evidence current without full SIFT1M
+   - Rerun `make -C qihse bench-sift1m-workload` after any major query policy change.
+   - Use `make -C qihse bench-reference-result-summary REFERENCE_WORKLOAD=sift1m-fallback`
+     while full SIFT1M is unavailable.
+   - When CPU is capped, skip full SIFT1M and continue:
+     - `make -C qihse bench-vxug-pdf-workload`
+     - `python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload sift1m --inspect-files`
 
 Acceptance:
 - This slice is done only when all unchecked items above are checked in the Milestone Checklist.

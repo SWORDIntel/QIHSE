@@ -111,7 +111,9 @@ static bool test_truncated_metadata_qmeta_payload_rejected(void);
 static bool test_corrupt_index_qidx_magic_rejected(void);
 static bool test_corrupt_index_qidx_count_mismatch_rejected(void);
 static bool test_corrupt_index_qidx_row_bytes_rejected(void);
+static bool test_legacy_manifest_index_row_mismatch_rejected(void);
 static bool test_manifest_index_checksum_mismatch_rejected(void);
+static bool test_partial_compaction_tmp_fallback_on_restart(void);
 static bool test_truncated_index_qidx_rejected(void);
 static bool test_truncated_manifest_rejected(void);
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void);
@@ -180,8 +182,12 @@ int main(void) {
          test_corrupt_index_qidx_count_mismatch_rejected},
         {"index.qidx row-bytes mismatch rejects open",
          test_corrupt_index_qidx_row_bytes_rejected},
+        {"legacy (128-byte) MANIFEST rejects mismatched index row metadata",
+         test_legacy_manifest_index_row_mismatch_rejected},
         {"manifest/index checksum mismatch rejects open",
          test_manifest_index_checksum_mismatch_rejected},
+        {"partial compaction write.tmp artifacts fall back to last valid snapshot",
+         test_partial_compaction_tmp_fallback_on_restart},
         {"truncated index.qidx fails open cleanly",
          test_truncated_index_qidx_rejected},
         {"truncated manifest fails open cleanly",
@@ -1450,6 +1456,79 @@ static bool test_corrupt_index_qidx_row_bytes_rejected(void) {
     return true;
 }
 
+static bool test_legacy_manifest_index_row_mismatch_rejected(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("legacy_manifest_index_row_mismatch");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vectors[][3] = {
+        {0.12f, 0.34f, 0.56f},
+        {0.78f, 0.90f, 0.11f},
+    };
+    const uint64_t ids[] = {9201, 9202};
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(qihse_vector_db_add_vectors(db, &vectors[0][0], ARRAY_LEN(vectors),
+                                            ARRAY_LEN(vectors[0]), ids, NULL, NULL),
+                "legacy manifest index-row fixture insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before legacy migration mutation");
+
+    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 128),
+                "test should convert snapshot to legacy 128-byte manifest");
+
+    uint8_t* index_payload = NULL;
+    size_t index_size = 0u;
+    TEST_ASSERT(read_file_payload(path, "index.qidx", &index_payload, &index_size),
+                "test should cache index payload before mutation");
+
+    TEST_ASSERT(write_file_u64le_at(path, "index.qidx", 16, 3u),
+                "test should mutate index.qidx row-count under legacy manifest");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED
+    );
+    TEST_ASSERT(db == NULL, "legacy manifest should reject index row-count mismatch");
+
+    TEST_ASSERT(write_file_payload(path, "index.qidx", index_payload, index_size),
+                "test should restore index payload after mismatch check");
+    free(index_payload);
+    index_payload = NULL;
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "restored legacy manifest snapshot should reopen");
+
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after legacy manifest restore");
+    TEST_ASSERT(stats.index_rows == 2u, "legacy snapshot should preserve row count");
+    TEST_ASSERT(stats.storage_mode == QIHSE_VDB_STORAGE_FILE_COPY,
+                "legacy reopen should use file-copy storage");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vectors[0], ARRAY_LEN(vectors[0]), false, false, &result);
+    TEST_ASSERT(count == 1, "legacy snapshot should remain searchable after restore");
+    TEST_ASSERT(result.id == 9201, "legacy snapshot search should return restored row");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "legacy restore database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
 static bool test_manifest_index_checksum_mismatch_rejected(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
@@ -1476,6 +1555,99 @@ static bool test_manifest_index_checksum_mismatch_rejected(void) {
     );
     TEST_ASSERT(db == NULL, "manifest index checksum mismatch should fail open");
 
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_partial_compaction_tmp_fallback_on_restart(void) {
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+
+    char* path = make_temp_db_path("partial_compaction_tmp_fallback");
+    TEST_ASSERT(path != NULL, "temp db path should be created");
+
+    const float vectors[][4] = {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+    const uint64_t ids[] = {9301, 9302, 9303};
+    const char metadata[] = "compaction-tmp-fallback";
+
+    qihse_vector_db_t db =
+        qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
+    TEST_ASSERT(db != NULL, "create should return a database");
+    TEST_ASSERT(add_one(db, vectors[0], ARRAY_LEN(vectors[0]), ids[0], metadata, sizeof(metadata)),
+                "partial-compaction row insert should succeed");
+    TEST_ASSERT(add_one(db, vectors[1], ARRAY_LEN(vectors[1]), ids[1], metadata, sizeof(metadata)),
+                "second partial-compaction row insert should succeed");
+    TEST_ASSERT(add_one(db, vectors[2], ARRAY_LEN(vectors[2]), ids[2], metadata, sizeof(metadata)),
+                "third partial-compaction row insert should succeed");
+    TEST_ASSERT(qihse_vector_db_delete_by_id(db, ids[1]),
+                "delete before compact should create compaction opportunity");
+
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should complete before tmp fallback simulation");
+    qihse_vector_db_persistence_stats_t stats;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available before partial tmp injection");
+    TEST_ASSERT(stats.index_rows == 2u,
+                "compacted partial fixture should preserve two live rows");
+    TEST_ASSERT(stats.live_vectors == 2u, "compacted partial fixture should keep two live rows");
+    TEST_ASSERT(close_db(db), "database should close before partial compaction tmp injection");
+
+    uint8_t* manifest_payload = NULL;
+    size_t manifest_size = 0u;
+    uint8_t* index_payload = NULL;
+    size_t index_size = 0u;
+    TEST_ASSERT(read_file_payload(path, "MANIFEST", &manifest_payload, &manifest_size),
+                "should read manifest for partial-compaction tmp fixture");
+    TEST_ASSERT(read_file_payload(path, "index.qidx", &index_payload, &index_size),
+                "should read index for partial-compaction tmp fixture");
+    TEST_ASSERT(write_file_payload(path, "MANIFEST.tmp", manifest_payload, manifest_size),
+                "test should write partial MANIFEST.tmp");
+    TEST_ASSERT(write_file_payload(path, "index.qidx.tmp", index_payload, index_size),
+                "test should write partial index.qidx.tmp");
+    TEST_ASSERT(manifest_size > 16u, "manifest should be long enough to truncate");
+    TEST_ASSERT(truncate_file_to(path, "MANIFEST.tmp", (off_t)(manifest_size / 2u)),
+                "test should create partial MANIFEST.tmp");
+    TEST_ASSERT(index_size > 16u, "index snapshot should be long enough to truncate");
+    TEST_ASSERT(truncate_file_to(path, "index.qidx.tmp", (off_t)(index_size / 2u)),
+                "test should create partial index.qidx.tmp");
+    free(manifest_payload);
+    free(index_payload);
+    manifest_payload = NULL;
+    index_payload = NULL;
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
+    );
+    TEST_ASSERT(db != NULL, "partial compaction tmp files should not block reopen");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
+                "stats should be available after partial tmp fallback reopen");
+    TEST_ASSERT(stats.index_rows == 2u, "fallback should keep compacted row count");
+    TEST_ASSERT(stats.live_vectors == 2u, "fallback should keep compacted live count");
+
+    qihse_vector_result_t result;
+    int count = search_one(db, vectors[0], ARRAY_LEN(vectors[0]), true, true, &result);
+    TEST_ASSERT(count == 1, "fallback should preserve compacted first row");
+    TEST_ASSERT(result.id == 9301, "fallback should preserve first live row id");
+    free_results(&result, 1);
+
+    count = search_one(db, vectors[1], ARRAY_LEN(vectors[1]), true, true, &result);
+    TEST_ASSERT(count == 0, "deleted row should remain deleted after compaction fallback");
+    free_results(&result, 1);
+
+    count = search_one(db, vectors[2], ARRAY_LEN(vectors[2]), true, true, &result);
+    TEST_ASSERT(count == 1, "fallback should preserve third live row");
+    TEST_ASSERT(result.id == 9303, "fallback should preserve third live row id");
+    free_results(&result, 1);
+
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only partial-compaction fallback database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
