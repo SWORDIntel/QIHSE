@@ -98,9 +98,20 @@ workload_sift1m = {
 The manifest already declares the SIFT-style file paths and formats. Once the
 files are present under `data/sift1m/`, run `make bench-sift1m-workload` to use
 the same exact float32/scalar `qtri`/`qmag` runner and write generated JSON
-under `results/sift1m/`. `make bench-reference-runner-smoke` covers the
-generic `fvecs`/`ivecs` runner path with a tiny generated workload when full
-SIFT data is not present.
+under `results/sift1m/`.
+
+If full 1M data is unavailable, `make bench-sift1m-workload` now falls back to
+`sift1m-fallback`, reading deterministic vectors and ground truth from
+`data/sift1m/fallback/*`.
+
+To refresh the staged fallback fixture:
+
+```bash
+python3 benchmarks/scripts/qihse_generate_sift1m_fixture.py --force
+```
+
+`make bench-reference-runner-smoke` covers the generic `fvecs`/`ivecs` parser
+path with a tiny generated workload when full SIFT data is not present.
 
 #### GIST1M Benchmark (Semantic Search)
 ```python
