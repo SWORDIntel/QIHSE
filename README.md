@@ -70,16 +70,16 @@ flowchart TB
     A[Client Process] --> B[Query Ingestion]
     A --> C[Vector Mutations]
     B --> D{qihse_vector_db_search}
-    D --> E[Exact float32 rerank path<br/>(default)]
+    D --> E["Exact float32 rerank path<br/>(default)"]
     D --> F{Query mode}
-    F -->|TRINARY_SCALAR| G[qtri sidecar shortlist]
-    F -->|TRINARY_MAGNITUDE| H[qmag sidecar shortlist]
+    F -->|TRINARY_SCALAR| G["qtri sidecar shortlist"]
+    F -->|TRINARY_MAGNITUDE| H["qmag sidecar shortlist"]
     G --> E
     H --> E
-    E --> I[Returned ranked results]
-    C --> J[WAL + snapshot metadata]
-    J --> K[checkpoint/compact]
-    K --> L[Restart-safe snapshot]
+    E --> I["Returned ranked results"]
+    C --> J["WAL + snapshot metadata"]
+    J --> K["checkpoint/compact"]
+    K --> L["Restart-safe snapshot"]
     L --> D
 ```
 
@@ -88,16 +88,16 @@ flowchart TB
 ```mermaid
 flowchart LR
     A[Open DB] --> B{Create or Open File-backed}
-    B -->|Create| C[Write WAL Records]
-    B -->|Open Existing| D[Load Snapshot]
-    D --> E[Replay WAL]
-    C --> F[Runtime Mutations<br/>(add/update/delete/upsert)]
+    B -->|Create| C["Write WAL Records"]
+    B -->|Open Existing| D["Load Snapshot"]
+    D --> E["Replay WAL"]
+    C --> F["Runtime Mutations<br/>(add / update / delete / upsert)"]
     E --> F
-    F --> G[Flush]
-    G --> H[Checkpoint Snapshot]
-    H --> I[Compact]
-    H --> J[Stats: trinary/qmag status]
-    I --> K[Crash/Restart]
+    F --> G["Flush"]
+    G --> H["Checkpoint Snapshot"]
+    H --> I["Compact"]
+    H --> J["Stats: trinary/qmag status"]
+    I --> K["Crash / Restart"]
     K --> D
 ```
 
@@ -144,6 +144,25 @@ Use trinary modes only when sidecars are available and your workload benefits:
 - `make benchmark`
 - `make bench-vxug-pdf-workload` (sample end-to-end flow)
 - `make bench-trinary-search-sweep` (acceleration shape behavior)
+
+## Native build helper (one-line entrypoint)
+
+Use the root helper to auto-detect SIMD and build an optimized native binary safely.
+
+```bash
+./build-native.sh
+make build-native
+./build-native.sh --avx2
+./build-native.sh --avx512 --allow-unsupported --cflags "-O3 -DNDEBUG"
+```
+
+If you need custom flags, create `./.qihse-build-flags` and set:
+
+```text
+QIHSE_TARGET_OVERRIDE=avx512
+QIHSE_CFLAGS_EXTRA=-march=native -O3 -flto
+QIHSE_BUILD_ALLOW_UNSUPPORTED=1
+```
 
 ## Read this next
 
