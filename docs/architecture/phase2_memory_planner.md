@@ -16,6 +16,78 @@
 3. **Create intelligent memory placement** and migration policies
 4. **Optimize memory access patterns** for quantum-inspired algorithms
 
+## Implementation status
+
+The workload-aware placement planner described below is implemented across the
+memory planner modules:
+
+- `qihse_memory_workload_analysis_t` captures access pattern, working set size,
+  locality, superposition dimensions, entanglement density, and algorithm phase.
+- `qihse_memory_topology_t` captures the three HMA tiers and inter-tier topology.
+- `qihse_memory_topology_probe()` probes Linux `/proc` and `/sys` host memory
+  topology with safe fallback defaults.
+- `qihse_memory_default_topology()` now prefers probed host topology and falls
+  back to conservative static capacities.
+- `qihse_memory_recommend_type()` maps a workload and optional topology to one
+  of `QIHSE_MEM_HMA_SUPERPOSITION`, `QIHSE_MEM_HMA_INTERACTION`, or
+  `QIHSE_MEM_HMA_ENTANGLEMENT`.
+- `qihse_memory_recommend_type_with_trace()` records the selected memory type,
+  reason code, and workload facts for planner observability.
+- `qihse_memory_allocate_for_workload()` now uses the allocation-policy fallback
+  order when the preferred tier allocation fails.
+- `qihse_memory_allocation_policy_*()` provides reusable fallback ordering and
+  per-memory-type accounting helpers.
+- `qihse_memory_coherence_*()` provides version/state tracking for coherent
+  reads, writes, invalidation, and migration transitions.
+- Live `qihse_memory_buffer_t` allocations now carry persistent coherence
+  version/state fields that are updated by allocation, copy, and zero-copy
+  migration paths.
+- `qihse_memory_migration_plan()` classifies migrations as zero-copy,
+  copy-required, or rejected; `qihse_memory_migrate()` now accepts coherent
+  zero-copy migrations instead of blindly flipping metadata.
+- `qihse_memory_migrate()` also performs generic copy-required migration for
+  host-backed device/unified buffers, preserving payload bytes while updating
+  placement accounting and coherence versions.
+- `qihse_memory_migration_backend_*()` provides an execution backend abstraction
+  for host memcpy today and explicit unsupported statuses for hardware DMA and
+  device-copy backends until real device APIs are attached.
+- `qihse_memory_device_placement_*()` scores host, CPU, and accelerator
+  placement from workload, topology, target device, and placement policy.
+- `qihse_memory_migration_scheduler_*()` provides a deterministic caller-owned
+  priority queue for predictive/background migration candidates.
+
+Implemented files:
+
+- `memory/include/qihse_memory.h`
+- `memory/include/qihse_memory_topology_probe.h`
+- `memory/include/qihse_memory_planner_trace.h`
+- `memory/include/qihse_memory_allocation_policy.h`
+- `memory/include/qihse_memory_coherence.h`
+- `memory/include/qihse_memory_migration_policy.h`
+- `memory/include/qihse_memory_device_placement.h`
+- `memory/include/qihse_memory_migration_backend.h`
+- `memory/include/qihse_memory_migration_scheduler.h`
+- `memory/src/qihse_memory.c`
+- `memory/src/qihse_memory_topology_probe.c`
+- `memory/src/qihse_memory_planner_trace.c`
+- `memory/src/qihse_memory_allocation_policy.c`
+- `memory/src/qihse_memory_coherence.c`
+- `memory/src/qihse_memory_migration_policy.c`
+- `memory/src/qihse_memory_device_placement.c`
+- `memory/src/qihse_memory_migration_backend.c`
+- `memory/src/qihse_memory_migration_scheduler.c`
+
+Remaining architecture work: production integration of runtime attachment points and
+hardware-aware callback registration are now implemented as optional runtime
+plumbing:
+
+- `qihse_memory_migration_backend` now accepts callback registration for hardware
+  DMA and device-copy movement backends.
+- `qihse_memory_migration_scheduler_run` drains scheduled candidates in
+  caller-owned maintenance loops.
+- Planner exposure remains intentionally API-modular so runtime hosts can choose
+  poll or thread-based dispatch without forcing background threads from the core.
+
 ---
 
 ## 1. UMA Architecture Overview

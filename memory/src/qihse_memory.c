@@ -16,6 +16,12 @@
 #endif
 
 #include "../include/qihse_memory.h"
+#include "../include/qihse_memory_allocation_policy.h"
+#include "../include/qihse_memory_coherence.h"
+#include "../include/qihse_memory_migration_backend.h"
+#include "../include/qihse_memory_migration_policy.h"
+#include "../include/qihse_memory_planner_trace.h"
+#include "../include/qihse_memory_topology_probe.h"
 #include "../../orchestration/include/qihse_hetero.h"
 #include "qihse_anchor_search.h"
 #include <stdlib.h>
@@ -130,6 +136,231 @@ const char* qihse_memory_type_string(qihse_memory_type_t mem_type) {
         case QIHSE_MEM_ANCHOR_WORKSPACE: return "ANCHOR_WORKSPACE";
         default: return "UNKNOWN";
     }
+}
+
+static bool qihse_memory_static_default_topology(qihse_memory_topology_t* topology) {
+    if (!topology) {
+        errno = EINVAL;
+        return false;
+    }
+
+    memset(topology, 0, sizeof(*topology));
+    topology->superposition_buffer.capacity = 128u * 1024u * 1024u;
+    topology->superposition_buffer.bandwidth_gbps = 1000.0;
+    topology->superposition_buffer.latency_ns = 10.0;
+    topology->superposition_buffer.coherent = true;
+
+    topology->interaction_cache.capacity = 64u * 1024u * 1024u;
+    topology->interaction_cache.bandwidth_gbps = 500.0;
+    topology->interaction_cache.latency_ns = 20.0;
+    topology->interaction_cache.coherent = true;
+
+    topology->entanglement_fabric.capacity = (size_t)1024u * 1024u * 1024u * 1024u;
+    topology->entanglement_fabric.bandwidth_gbps = 100.0;
+    topology->entanglement_fabric.latency_ns = 100.0;
+    topology->entanglement_fabric.coherent = true;
+
+    topology->inter_tier_bandwidth_gbps = 64.0;
+    topology->numa_nodes = 1u;
+    return true;
+}
+
+bool qihse_memory_default_topology(qihse_memory_topology_t* topology) {
+    if (!topology) {
+        errno = EINVAL;
+        return false;
+    }
+
+    if (qihse_memory_topology_probe(topology)) {
+        return true;
+    }
+
+    return qihse_memory_static_default_topology(topology);
+}
+
+static double qihse_memory_clamp_unit(double value) {
+    if (value < 0.0) {
+        return 0.0;
+    }
+    if (value > 1.0) {
+        return 1.0;
+    }
+    return value;
+}
+
+static bool qihse_memory_recommend_type_internal(
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    qihse_memory_type_t* out_type,
+    qihse_memory_planner_reason_t* out_reason
+) {
+    qihse_memory_topology_t default_topology;
+    const qihse_memory_topology_t* topo = topology;
+    double temporal;
+    double spatial;
+    double entanglement;
+
+    if (!analysis || !out_type) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!topo) {
+        if (!qihse_memory_default_topology(&default_topology)) {
+            return false;
+        }
+        topo = &default_topology;
+    }
+
+    temporal = qihse_memory_clamp_unit(analysis->temporal_locality);
+    spatial = qihse_memory_clamp_unit(analysis->spatial_locality);
+    entanglement = qihse_memory_clamp_unit(analysis->entanglement_density);
+
+    if (analysis->phase == QIHSE_MEMORY_PHASE_SUPERPOSITION &&
+        analysis->working_set_size <= topo->superposition_buffer.capacity) {
+        *out_type = QIHSE_MEM_HMA_SUPERPOSITION;
+        if (out_reason) {
+            *out_reason = QIHSE_MEMORY_PLANNER_REASON_SUPERPOSITION_PHASE;
+        }
+        return true;
+    }
+
+    if (analysis->phase == QIHSE_MEMORY_PHASE_INTERACTION &&
+        analysis->working_set_size <= topo->interaction_cache.capacity) {
+        *out_type = QIHSE_MEM_HMA_INTERACTION;
+        if (out_reason) {
+            *out_reason = QIHSE_MEMORY_PLANNER_REASON_INTERACTION_PHASE;
+        }
+        return true;
+    }
+
+    if (analysis->working_set_size > topo->interaction_cache.capacity ||
+        entanglement >= 0.50) {
+        *out_type = QIHSE_MEM_HMA_ENTANGLEMENT;
+        if (out_reason) {
+            *out_reason = QIHSE_MEMORY_PLANNER_REASON_ENTANGLEMENT_DENSE;
+        }
+        return true;
+    }
+
+    if (analysis->working_set_size <= topo->superposition_buffer.capacity &&
+        temporal >= 0.75 &&
+        analysis->superposition_dims != 0u) {
+        *out_type = QIHSE_MEM_HMA_SUPERPOSITION;
+        if (out_reason) {
+            *out_reason = QIHSE_MEMORY_PLANNER_REASON_LOCALITY_PREFERRED;
+        }
+        return true;
+    }
+
+    if (analysis->working_set_size <= topo->interaction_cache.capacity &&
+        (analysis->access_pattern == QIHSE_ACCESS_SIMD ||
+         analysis->access_pattern == QIHSE_ACCESS_BLOCKED ||
+         analysis->access_pattern == QIHSE_ACCESS_STRIDED ||
+         spatial >= 0.60 ||
+         analysis->read_write_ratio >= 2.0)) {
+        *out_type = QIHSE_MEM_HMA_INTERACTION;
+        if (out_reason) {
+            *out_reason = QIHSE_MEMORY_PLANNER_REASON_LOCALITY_PREFERRED;
+        }
+        return true;
+    }
+
+    *out_type = QIHSE_MEM_HMA_ENTANGLEMENT;
+    if (out_reason) {
+        *out_reason = QIHSE_MEMORY_PLANNER_REASON_FALLBACK;
+    }
+    return true;
+}
+
+bool qihse_memory_recommend_type(const qihse_memory_workload_analysis_t* analysis,
+                                 const qihse_memory_topology_t* topology,
+                                 qihse_memory_type_t* out_type) {
+    return qihse_memory_recommend_type_internal(analysis, topology, out_type, NULL);
+}
+
+bool qihse_memory_recommend_type_with_trace(
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    qihse_memory_type_t* out_type,
+    qihse_memory_planner_trace_t* trace
+) {
+    qihse_memory_planner_reason_t reason = QIHSE_MEMORY_PLANNER_REASON_UNKNOWN;
+    bool ok;
+
+    ok = qihse_memory_recommend_type_internal(analysis, topology, out_type, &reason);
+    if (trace) {
+        if (ok && out_type) {
+            (void)qihse_memory_planner_trace_record(trace, *out_type, reason, analysis);
+        } else {
+            qihse_memory_planner_trace_clear(trace);
+        }
+    }
+    return ok;
+}
+
+qihse_memory_buffer_t* qihse_memory_allocate_for_workload_traced(
+    qihse_memory_manager_t manager,
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    uint32_t flags,
+    qihse_memory_planner_trace_t* trace
+) {
+    qihse_memory_type_t mem_type;
+    qihse_memory_type_t fallback_types[QIHSE_MEMORY_ALLOCATION_POLICY_TYPE_COUNT];
+    size_t fallback_count;
+    size_t i;
+
+    if (!manager || !analysis || analysis->working_set_size == 0u) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (!qihse_memory_recommend_type_with_trace(analysis, topology, &mem_type, trace)) {
+        return NULL;
+    }
+
+    fallback_count = qihse_memory_allocation_policy_fallback_order(
+        mem_type,
+        fallback_types,
+        sizeof(fallback_types) / sizeof(fallback_types[0]));
+    if (fallback_count == 0u) {
+        fallback_types[0] = QIHSE_MEM_HOST;
+        fallback_count = 1u;
+    }
+
+    for (i = 0u; i < fallback_count; i++) {
+        qihse_memory_buffer_t* buffer = qihse_memory_allocate(
+            manager,
+            analysis->working_set_size,
+            fallback_types[i],
+            analysis->access_pattern,
+            flags);
+        if (buffer) {
+            if (trace && fallback_types[i] != mem_type) {
+                (void)qihse_memory_planner_trace_record(
+                    trace,
+                    fallback_types[i],
+                    QIHSE_MEMORY_PLANNER_REASON_FALLBACK,
+                    analysis);
+            }
+            return buffer;
+        }
+    }
+
+    return NULL;
+}
+
+qihse_memory_buffer_t* qihse_memory_allocate_for_workload(
+    qihse_memory_manager_t manager,
+    const qihse_memory_workload_analysis_t* analysis,
+    const qihse_memory_topology_t* topology,
+    uint32_t flags
+) {
+    return qihse_memory_allocate_for_workload_traced(
+        manager,
+        analysis,
+        topology,
+        flags,
+        NULL);
 }
 
 /* ============================================================================
@@ -256,6 +487,7 @@ qihse_memory_buffer_t* qihse_memory_allocate(
     buffer->flags = flags;
     buffer->preferred_device = 0; /* Default CPU device */
     buffer->is_migratable = true;
+    (void)qihse_memory_coherence_init_buffer(buffer);
 
     /* Allocate actual memory */
     void* data = NULL;
@@ -473,6 +705,19 @@ bool qihse_memory_copy(
     atomic_fetch_add(&dst->access_count, 1);
     atomic_fetch_add(&((qihse_memory_buffer_t*)src)->access_count, 1); /* Cast away const for statistics */
 
+    qihse_memory_coherence_record_t src_coherence;
+    qihse_memory_coherence_record_t dst_coherence;
+    qihse_memory_buffer_t* mutable_src = (qihse_memory_buffer_t*)src;
+
+    if (qihse_memory_coherence_load_buffer(mutable_src, &src_coherence) &&
+        qihse_memory_coherence_mark_read(&src_coherence)) {
+        (void)qihse_memory_coherence_apply_buffer(mutable_src, &src_coherence);
+    }
+    if (qihse_memory_coherence_load_buffer(dst, &dst_coherence) &&
+        qihse_memory_coherence_mark_write(&dst_coherence)) {
+        (void)qihse_memory_coherence_apply_buffer(dst, &dst_coherence);
+    }
+
     return true;
 }
 
@@ -482,26 +727,119 @@ bool qihse_memory_migrate(
     int target_device,
     qihse_memory_type_t target_type
 ) {
+    qihse_memory_type_t old_type;
+    size_t old_allocated_size;
+    size_t new_alignment;
+    size_t new_allocated_size;
+    void* new_data = NULL;
+    bool copy_required;
+
     if (!manager || !buffer) {
         return false;
     }
 
     qihse_memory_manager_internal_t* internal = (qihse_memory_manager_internal_t*)manager;
+    qihse_memory_migration_plan_t plan;
+    qihse_memory_coherence_record_t coherence;
 
-    /* Check if migration is possible */
-    if (!buffer->is_migratable) {
+    if (!qihse_memory_migration_plan(buffer, target_device, target_type, &plan) ||
+        plan.kind == QIHSE_MEMORY_MIGRATION_REJECT) {
         return false;
     }
 
-    if (!qihse_memory_is_accessible(target_type, target_device)) {
+    if (!qihse_memory_coherence_load_buffer(buffer, &coherence) ||
+        !qihse_memory_coherence_begin_migration(&coherence)) {
         return false;
     }
 
-    /* Migration is no-op in unified memory model */
-    /* Future: Implement device-specific migration when needed */
+    old_type = buffer->mem_type;
+    old_allocated_size = buffer->allocated_size;
+    copy_required = (plan.kind == QIHSE_MEMORY_MIGRATION_COPY_REQUIRED);
 
-    buffer->preferred_device = target_device;
-    buffer->mem_type = target_type;
+    if (copy_required) {
+        qihse_memory_migration_backend_request_t request;
+        qihse_memory_migration_backend_status_t backend_status;
+
+        new_alignment = qihse_memory_get_alignment(target_type);
+        new_allocated_size = ((buffer->logical_size + new_alignment - 1u) / new_alignment) * new_alignment;
+
+        if (posix_memalign(&new_data, new_alignment, new_allocated_size) != 0) {
+            return false;
+        }
+
+        request = qihse_memory_migration_backend_request(
+            new_data,
+            buffer->abi_buffer.data,
+            buffer->logical_size,
+            QIHSE_MEMORY_MIGRATION_BACKEND_HOST_MEMCPY);
+        request.source_type = buffer->mem_type;
+        request.target_type = target_type;
+        request.source_device = buffer->preferred_device;
+        request.target_device = target_device;
+
+        backend_status = qihse_memory_migration_backend_execute(&request);
+        if (backend_status != QIHSE_MEMORY_MIGRATION_BACKEND_OK) {
+            free(new_data);
+            return false;
+        }
+
+        if (new_allocated_size > buffer->logical_size) {
+            memset((char*)new_data + buffer->logical_size, 0, new_allocated_size - buffer->logical_size);
+        }
+    }
+
+    if (!qihse_memory_coherence_complete_migration(&coherence, target_type, target_device)) {
+        free(new_data);
+        return false;
+    }
+
+    if (copy_required) {
+        free(buffer->abi_buffer.data);
+        buffer->abi_buffer.data = new_data;
+        buffer->abi_buffer.size = new_allocated_size;
+        buffer->allocated_size = new_allocated_size;
+        buffer->alignment = new_alignment;
+
+        switch (old_type) {
+            case QIHSE_MEM_HOST:
+            case QIHSE_MEM_PINNED:
+            case QIHSE_MEM_ANCHOR_TABLE:
+            case QIHSE_MEM_ANCHOR_WORKSPACE:
+                atomic_fetch_sub(&internal->host_memory, old_allocated_size);
+                break;
+            case QIHSE_MEM_DEVICE:
+                atomic_fetch_sub(&internal->device_memory, old_allocated_size);
+                break;
+            case QIHSE_MEM_UNIFIED:
+            case QIHSE_MEM_HMA_SUPERPOSITION:
+            case QIHSE_MEM_HMA_INTERACTION:
+            case QIHSE_MEM_HMA_ENTANGLEMENT:
+                atomic_fetch_sub(&internal->unified_memory, old_allocated_size);
+                break;
+        }
+
+        switch (target_type) {
+            case QIHSE_MEM_HOST:
+            case QIHSE_MEM_PINNED:
+            case QIHSE_MEM_ANCHOR_TABLE:
+            case QIHSE_MEM_ANCHOR_WORKSPACE:
+                atomic_fetch_add(&internal->host_memory, buffer->allocated_size);
+                break;
+            case QIHSE_MEM_DEVICE:
+                atomic_fetch_add(&internal->device_memory, buffer->allocated_size);
+                break;
+            case QIHSE_MEM_UNIFIED:
+            case QIHSE_MEM_HMA_SUPERPOSITION:
+            case QIHSE_MEM_HMA_INTERACTION:
+            case QIHSE_MEM_HMA_ENTANGLEMENT:
+                atomic_fetch_add(&internal->unified_memory, buffer->allocated_size);
+                break;
+        }
+    }
+
+    if (!qihse_memory_coherence_apply_buffer(buffer, &coherence)) {
+        return false;
+    }
 
     atomic_fetch_add(&internal->total_migrations, 1);
 

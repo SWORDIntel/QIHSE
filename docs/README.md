@@ -18,6 +18,11 @@
 - **Dynamic dimension calculation** based on workload characteristics and performance optimization
 - **Multi-level verification** with configurable confidence thresholds (NONE/FAST/WINDOW/FALLBACK/EXACT/PRECISION)
 
+### 🧱 **Persistence + Planner Runtime**
+- **Trinary codec persistence** for row-oriented checkpoint artifacts (`vectors.qtri`, `vectors.qmag`) and policy-aware recovery.
+- **Predictive migration scheduler** supports caller-driven draining (`qihse_memory_migration_scheduler_run`) for maintenance-style placement work.
+- **Backend callback API** exposes optional hardware DMA and device-copy hooks for future backend integrations.
+
 ### 🤖 **Self-Optimizing ML Engine**
 - **Contextual bandits** for intelligent algorithm and backend selection
 - **Meta-learning (MAML)** for fast adaptation to new workload patterns with few-shot learning
@@ -120,6 +125,12 @@ Development resources and model specifications:
 - ML model architectures and training pipelines
 - Development setup and contribution guidelines
 - Code standards and testing procedures
+
+### [QMAG Default Policy](qmag-policy.md)
+Result-driven qmag fallback guidance from the 100-case loss-pattern sweep:
+- Default qmag falls back to exact float32 for small-row, dense/high-active, high-`top_k`, or high-rerank-pressure shapes.
+- Sparse, low-pressure defaults remain eligible for qmag when they preserve exact-equivalent results.
+- Explicit qmag pools remain caller-directed opt-ins and still execute after validation.
 
 ## 🚀 Quick Start
 

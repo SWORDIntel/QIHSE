@@ -163,10 +163,23 @@ typedef struct qihse_vector_result_s {
  *   query_mode remains FLOAT32, candidate_count is used as-is and must be at
  *   least top_k; there is no automatic pool default on this legacy path.
  * - Explicit trinary modes use candidate_pool_size when non-zero, otherwise
- *   candidate_count, otherwise an internal conservative default based on mode,
- *   top_k, vector dimensions, and live/physical row density.
- * - Explicit trinary candidate pools are capped to total_vectors after default
- *   resolution. The effective pool must still be at least top_k.
+ *   candidate_count. When both are zero, scalar qtri searches all physical
+ *   rows for correctness; qmag uses an internal conservative default based on
+ *   top_k, active query dimensions, and live rows.
+ * - Explicit trinary candidate pools are capped after default resolution
+ *   (scalar to total_vectors, qmag to live rows). The effective pool must
+ *   still be at least top_k.
+ * - Default-pool qmag is opportunistic: when its conservative policy gate
+ *   rejects the query shape, including high active-dimension ratios, high
+ *   top_k/live-row ratios, or high exact-rerank pool pressure,
+ *   qihse_vector_db_search() falls back to exact float32 search.
+ *   The default gate currently requires live_rows >= 512,
+ *   active_query_dims/vector_dims <= 1/4, top_k/live_rows <= 3/128, and
+ *   effective_candidate_pool/live_rows <= 9/32. The default qmag pool is
+ *   top_k * 8 when active_query_dims/vector_dims <= 1/16, top_k * 10 when
+ *   <= 1/8, and top_k * 12 otherwise, capped to live rows before the gate.
+ *   Caller-provided qmag pools remain explicit opt-ins and execute qmag
+ *   search directly after normal pool and sidecar validation.
  * - Explicit trinary modes require top_k > 0 and top_k <= max_results. The
  *   effective candidate pool must still be at least top_k after validation.
  * - Missing qtri reports ENOENT; stale qtri reports ESTALE when available or

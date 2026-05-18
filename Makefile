@@ -15,7 +15,8 @@ QIHSE_ENABLE_AVX512?=0
 CFLAGS=$(CFLAGS_BASE)
 
 LDFLAGS=-ldl -lm -lpthread
-VXUG_PDF?=../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf
+VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
+VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
 
 SIFT1M_BASE_DATA=data/sift1m/sift_base.fvecs
@@ -27,6 +28,7 @@ SIFT1M_FALLBACK_ROWS=2048
 SIFT1M_FALLBACK_QUERIES=128
 SIFT1M_FALLBACK_DIMENSIONS=128
 SIFT1M_FALLBACK_TOP_K=10
+SIFT1M_CALIBRATION_SCOPE?=auto
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
@@ -39,7 +41,10 @@ SRCS_BASE=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c 
      backends/cpu/qihse_cpu_detect.c \
      backends/npu/qihse_npu_openvino.c \
      backends/gpu/cuda/qihse_cuda_backend.c \
-     memory/src/qihse_memory.c memory/src/qihse_hma.c memory/src/qihse_uma.c
+     memory/src/qihse_memory.c memory/src/qihse_hma.c memory/src/qihse_uma.c \
+     memory/src/qihse_memory_topology_probe.c memory/src/qihse_memory_planner_trace.c memory/src/qihse_memory_allocation_policy.c \
+     memory/src/qihse_memory_coherence.c memory/src/qihse_memory_migration_policy.c \
+     memory/src/qihse_memory_device_placement.c memory/src/qihse_memory_migration_backend.c memory/src/qihse_memory_migration_scheduler.c
 
 SRCS=$(SRCS_BASE)
 
@@ -57,7 +62,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all clean lib test-persist test-trinary-codec bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check
+.PHONY: all clean lib test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check
 .PHONY: upstream-pr-loop
 
 .NOTPARALLEL: validate-reference-workflow
@@ -75,12 +80,88 @@ test-persist: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_vector_db_persistence_test
 
+test: test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
+
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
 	    tests/qihse_trinary_codec_test.c \
 	    codecs/qihse_trinary_tryte_codec.c \
 	    $(LDFLAGS)
 	./tests/qihse_trinary_codec_test
+
+test-memory-planner: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_planner_test \
+	    tests/qihse_memory_planner_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_planner_test
+
+test-memory-topology-probe: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_topology_probe_test \
+	    tests/qihse_memory_topology_probe_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_topology_probe_test
+
+test-memory-planner-trace: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_planner_trace_test \
+	    tests/qihse_memory_planner_trace_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_planner_trace_test
+
+test-memory-allocation-policy: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_allocation_policy_test \
+	    tests/qihse_memory_allocation_policy_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_allocation_policy_test
+
+test-memory-coherence: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_coherence_test \
+	    tests/qihse_memory_coherence_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_coherence_test
+
+test-memory-migration-policy: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_migration_policy_test \
+	    tests/qihse_memory_migration_policy_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_migration_policy_test
+
+test-memory-migration: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_migration_test \
+	    tests/qihse_memory_migration_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_migration_test
+
+test-memory-device-placement: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_device_placement_test \
+	    tests/qihse_memory_device_placement_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_device_placement_test
+
+test-memory-migration-backend: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_migration_backend_test \
+	    tests/qihse_memory_migration_backend_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_migration_backend_test
+
+test-memory-migration-scheduler: lib
+	$(CC) $(CFLAGS) -o tests/qihse_memory_migration_scheduler_test \
+	    tests/qihse_memory_migration_scheduler_test.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/qihse_memory_migration_scheduler_test
+
+benchmark: validate-reference-workflow
+
+dev-setup:
+	@echo "Checking required toolchain..."
+	@command -v gcc >/dev/null || { echo "Missing gcc"; exit 1; }
+	@command -v make >/dev/null || { echo "Missing make"; exit 1; }
+	@command -v python3 >/dev/null || { echo "Missing python3"; exit 1; }
+	@echo "Optional: install rust/oneAPI/CUDA/OpenVINO manually based on workload targets."
+	@echo "Use sudo for optional OS package install (intel-oneapi-basekit, libopenvino-dev, cuda)."
+
+docs:
+	@echo "No generated docs build target exists yet; docs are maintained in markdown under docs/."
+	@echo "Use 'find docs -name \"*.md\" | wc -l' to inspect documentation files."
 
 bench-trinary-codec:
 	$(CC) $(CFLAGS) -o /tmp/qihse_trinary_candidate_bench \
@@ -142,10 +223,33 @@ bench-reference-runner-smoke: lib
 	python3 benchmarks/scripts/qihse_reference_runner_smoke.py --root .
 
 sample-vxug-pdf-workload:
-	python3 benchmarks/scripts/qihse_pdf_text_sample.py --pdf "$(VXUG_PDF)" --out data/vxug_pdf_sample
+	@PDF_PATH="$(VXUG_PDF)"; \
+	if [ -z "$${PDF_PATH}" ] || [ ! -f "$${PDF_PATH}" ]; then \
+		if [ ! -d "$(VXUG_PDF_REPO)" ]; then \
+		  echo "Cloning VXUG papers repository to $(VXUG_PDF_REPO)..."; \
+		  git clone --depth 1 https://github.com/vxunderground/VXUG-Papers "$(VXUG_PDF_REPO)"; \
+		fi; \
+		if [ -z "$${PDF_PATH}" ]; then \
+		  if [ -f "$(VXUG_PDF_REPO)/Hells Gate/HellsGate.pdf" ]; then \
+		    PDF_PATH="$(VXUG_PDF_REPO)/Hells Gate/HellsGate.pdf"; \
+		  fi; \
+		fi; \
+		if [ -z "$${PDF_PATH}" ]; then \
+			PDF_PATH=$$(find "$(VXUG_PDF_REPO)" -type f -iname "HellsGate.pdf" | head -n 1); \
+		fi; \
+		if [ -z "$${PDF_PATH}" ]; then \
+			echo "No HellsGate.pdf found under $(VXUG_PDF_REPO)"; \
+			exit 1; \
+		fi; \
+		fi; \
+	python3 benchmarks/scripts/qihse_pdf_text_sample.py --pdf "$${PDF_PATH}" --out data/vxug_pdf_sample
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
 
-bench-vxug-pdf-workload: lib
+bench-vxug-pdf-workload: lib sample-vxug-pdf-workload
+	@if [ ! -f data/vxug_pdf_sample/base.f32 ] || [ ! -f data/vxug_pdf_sample/query.f32 ] || [ ! -f data/vxug_pdf_sample/ground_truth.u32 ]; then \
+		echo "bench-vxug-pdf-workload failed: vxug artifacts missing in data/vxug_pdf_sample"; \
+		exit 1; \
+	fi
 	python3 benchmarks/scripts/qihse_reference_workloads.py --root . --manifest benchmarks/reference_workloads.json --workload vxug-pdf-sample --inspect-files
 	python3 benchmarks/scripts/qihse_vxug_reference_bench.py --root . --output-json results/vxug_pdf_sample/latest.json
 	python3 benchmarks/scripts/qihse_reference_result_summary.py --root . --workload vxug-pdf-sample --result results/vxug_pdf_sample/latest.json
@@ -177,6 +281,33 @@ bench-sift1m-workload: lib
 	  $(MAKE) bench-reference-workload REFERENCE_WORKLOAD=$(SIFT1M_FALLBACK_WORKLOAD); \
 	fi
 
+calibrate-sift1m-workload: lib
+	@if [ "$(SIFT1M_CALIBRATION_SCOPE)" = "full" ]; then \
+	  if [ ! -f "$(SIFT1M_BASE_DATA)" ] || [ ! -f "$(SIFT1M_QUERY_DATA)" ] || [ ! -f "$(SIFT1M_GROUND_TRUTH)" ]; then \
+	    echo "Full SIFT1M scope requested but required files are missing"; \
+	    exit 1; \
+	  fi; \
+	  workload=sift1m; \
+	elif [ "$(SIFT1M_CALIBRATION_SCOPE)" = "fallback" ]; then \
+	  $(MAKE) bench-sift1m-fallback-data; \
+	  workload=$(SIFT1M_FALLBACK_WORKLOAD); \
+	else \
+	  if [ -f "$(SIFT1M_BASE_DATA)" ] && [ -f "$(SIFT1M_QUERY_DATA)" ] && [ -f "$(SIFT1M_GROUND_TRUTH)" ]; then \
+	    workload=sift1m; \
+	  else \
+	    echo "Full SIFT1M not available; using fallback workload automatically"; \
+	    $(MAKE) bench-sift1m-fallback-data; \
+	    workload=$(SIFT1M_FALLBACK_WORKLOAD); \
+	  fi; \
+	fi; \
+	echo "SIFT1M calibration workload=$${workload}"; \
+	$(MAKE) bench-reference-workload REFERENCE_WORKLOAD=$${workload}; \
+	$(MAKE) bench-reference-result-summary REFERENCE_WORKLOAD=$${workload}; \
+	python3 benchmarks/scripts/qihse_sift1m_calibration.py \
+	  --root . \
+	  --workload $${workload} \
+	  --result results/$${workload}/latest.json
+
 validate-reference-workflow: bench-reference-workloads bench-reference-runner-smoke bench-vxug-pdf-workload bench-sift1m-workload test-persist
 
 upstream-pr-loop:
@@ -194,3 +325,9 @@ clean:
 	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test
 	@echo "Clean completed"
+
+install: all
+	@install -d $(DESTDIR)/usr/local/lib $(DESTDIR)/usr/local/include/qihse
+	@install -m 644 libqihse.so $(DESTDIR)/usr/local/lib/libqihse.so
+	@install -m 644 qihse.h $(DESTDIR)/usr/local/include/qihse/qihse.h
+	@echo "Installed libqihse.so and qihse.h into $(DESTDIR)/usr/local"

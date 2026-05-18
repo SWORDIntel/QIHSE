@@ -53,8 +53,16 @@
 #define QIHSE_VDB_WAL_UPSERT 5u
 #define QIHSE_VDB_WAL_NO_PREV UINT64_MAX
 #define QIHSE_VDB_MAGNITUDE_ROW_BYTES 1u
+#define QIHSE_VDB_TRINARY_NEUTRAL_TRYTE 121u
 #define QIHSE_VDB_SCALAR_CANDIDATE_MULTIPLIER 12u
 #define QIHSE_VDB_MAGNITUDE_CANDIDATE_MULTIPLIER 8u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MIN_LIVE_ROWS 512u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_ACTIVE_NUM 1u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_ACTIVE_DEN 4u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_TOPK_NUM 3u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_TOPK_DEN 128u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_RERANK_NUM 9u
+#define QIHSE_VDB_MAGNITUDE_POLICY_MAX_RERANK_DEN 32u
 
 struct qihse_vector_db_s {
     qihse_vector_db_backend_t backend;
@@ -107,6 +115,14 @@ struct qihse_vector_db_s {
     uint64_t trinary_rows;
     uint8_t* trinary;
     size_t trinary_bytes;
+    int8_t* trinary_signs;
+    size_t trinary_sign_bytes;
+    int8_t* qmag_transposed_signs;
+    uint8_t* qmag_transposed_magnitude;
+    size_t* qmag_transposed_live_rows;
+    size_t qmag_transposed_bytes;
+    size_t qmag_transposed_rows;
+    size_t qmag_transposed_dims;
     qihse_vector_db_magnitude_status_t magnitude_status;
     uint64_t magnitude_row_bytes;
     uint64_t magnitude_rows;
@@ -133,17 +149,42 @@ typedef struct qihse_vdb_wal_add_s {
 
 typedef qihse_vdb_wal_add_t qihse_vdb_wal_vectors_t;
 
+typedef struct qihse_vdb_qmag_query_dim_s {
+    size_t dim;
+    size_t byte_idx;
+    uint8_t trit_idx;
+    int32_t signed_weight;
+} qihse_vdb_qmag_query_dim_t;
+
 static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
                                       size_t append_count,
                                       size_t metadata_bytes);
 static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb);
 static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb);
+static void qihse_vdb_clear_trinary_sign_cache(qihse_vector_db_t vdb);
+static void qihse_vdb_clear_qmag_transposed_cache(qihse_vector_db_t vdb);
+static bool qihse_vdb_ensure_trinary_sign_cache(qihse_vector_db_t vdb);
+static bool qihse_vdb_ensure_qmag_transposed_cache(qihse_vector_db_t vdb);
 static void qihse_vdb_set_magnitude_stale(qihse_vector_db_t vdb);
 static void qihse_vdb_clear_magnitude_cache(qihse_vector_db_t vdb);
 static bool qihse_vdb_resolve_candidate_pool(qihse_vector_db_t vdb,
                                              const qihse_vector_query_t* query,
                                              qihse_vector_db_query_mode_t mode,
                                              size_t* out_candidate_count);
+static bool qihse_vdb_resolve_qmag_candidate_pool(qihse_vector_db_t vdb,
+                                                  const qihse_vector_query_t* query,
+                                                  size_t active_dim_count,
+                                                  size_t* out_candidate_count);
+static bool qihse_vdb_qmag_policy_allows(size_t active_dim_count,
+                                         size_t vector_dims,
+                                         size_t candidate_count,
+                                         size_t live_rows,
+                                         size_t top_k);
+static int qihse_vdb_search_exact_rows(qihse_vector_db_t vdb,
+                                       const qihse_vector_query_t* query,
+                                       qihse_vector_result_t* results,
+                                       size_t max_results,
+                                       size_t result_limit);
 static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
                                                          const qihse_vector_query_t* query,
                                                          qihse_vector_result_t* results,
@@ -373,17 +414,24 @@ static bool qihse_vdb_resolve_candidate_pool(qihse_vector_db_t vdb,
 
     candidate_count = query->candidate_pool_size ?
         query->candidate_pool_size : query->candidate_count;
+    if (candidate_count == 0u && mode == QIHSE_VDB_QUERY_TRINARY_SCALAR) {
+        /*
+         * Scalar qtri only stores signs. Dense non-negative vector families
+         * such as SIFT can collapse to large equal-score buckets, so a small
+         * default candidate pool silently drops exact nearest neighbors before
+         * reranking. Keep explicit candidate_pool_size approximate, but make
+         * the default scalar mode correctness-preserving.
+         */
+        candidate_count = vdb->total_vectors;
+    }
     if (candidate_count == 0u) {
         /*
-         * Defaults are intentionally conservative because qtri/qmag only
-         * choose a physical-row candidate set before exact float32 reranking.
-         * Scalar sign-only matching is noisier than magnitude-aware matching,
-         * high-dimensional rows need a wider pool, and tombstoned physical
+         * Defaults are intentionally conservative because qmag only chooses a
+         * physical-row candidate set before exact float32 reranking.
+         * High-dimensional rows need a wider pool, and tombstoned physical
          * rows can occupy candidate slots before the live-row filter runs.
          */
-        multiplier = mode == QIHSE_VDB_QUERY_TRINARY_MAGNITUDE ?
-            QIHSE_VDB_MAGNITUDE_CANDIDATE_MULTIPLIER :
-            QIHSE_VDB_SCALAR_CANDIDATE_MULTIPLIER;
+        multiplier = QIHSE_VDB_MAGNITUDE_CANDIDATE_MULTIPLIER;
         if (vdb->vector_dims >= 1024u) {
             multiplier += 8u;
         } else if (vdb->vector_dims >= 256u) {
@@ -409,6 +457,109 @@ static bool qihse_vdb_resolve_candidate_pool(qihse_vector_db_t vdb,
         return false;
     }
     *out_candidate_count = candidate_count;
+    return true;
+}
+
+static bool qihse_vdb_ratio_lte(size_t numerator,
+                                size_t denominator,
+                                size_t max_numerator,
+                                size_t max_denominator) {
+    if (denominator == 0u || max_denominator == 0u) {
+        return false;
+    }
+    return ((long double)numerator * (long double)max_denominator) <=
+           ((long double)denominator * (long double)max_numerator);
+}
+
+static size_t qihse_vdb_qmag_default_multiplier(size_t active_dim_count,
+                                                size_t vector_dims) {
+    if (vector_dims != 0u &&
+        qihse_vdb_ratio_lte(active_dim_count, vector_dims, 1u, 16u)) {
+        return 8u;
+    }
+    if (vector_dims != 0u &&
+        qihse_vdb_ratio_lte(active_dim_count, vector_dims, 1u, 8u)) {
+        return 10u;
+    }
+    return 12u;
+}
+
+static bool qihse_vdb_resolve_qmag_candidate_pool(qihse_vector_db_t vdb,
+                                                  const qihse_vector_query_t* query,
+                                                  size_t active_dim_count,
+                                                  size_t* out_candidate_count) {
+    size_t candidate_count;
+    size_t live_rows;
+    bool default_pool;
+
+    if (!vdb || !query || !out_candidate_count || query->top_k == 0u ||
+        active_dim_count > vdb->vector_dims) {
+        errno = EINVAL;
+        return false;
+    }
+
+    live_rows = vdb->live_vectors;
+    candidate_count = query->candidate_pool_size ?
+        query->candidate_pool_size : query->candidate_count;
+    default_pool = candidate_count == 0u;
+
+    if (default_pool) {
+        size_t multiplier = qihse_vdb_qmag_default_multiplier(active_dim_count,
+                                                              vdb->vector_dims);
+        if (!qihse_vdb_mul_size_saturating(query->top_k, multiplier,
+                                           &candidate_count)) {
+            return false;
+        }
+    }
+
+    if (live_rows != 0u && candidate_count > live_rows) {
+        candidate_count = live_rows;
+    }
+    if (default_pool && live_rows >= query->top_k && candidate_count < query->top_k) {
+        candidate_count = query->top_k;
+    }
+    if (!default_pool && candidate_count < query->top_k) {
+        errno = EINVAL;
+        return false;
+    }
+
+    *out_candidate_count = candidate_count;
+    return true;
+}
+
+static bool qihse_vdb_qmag_policy_allows(size_t active_dim_count,
+                                         size_t vector_dims,
+                                         size_t candidate_count,
+                                         size_t live_rows,
+                                         size_t top_k) {
+    if (vector_dims == 0u || live_rows < QIHSE_VDB_MAGNITUDE_POLICY_MIN_LIVE_ROWS ||
+        candidate_count < top_k) {
+        return false;
+    }
+    if (!qihse_vdb_ratio_lte(active_dim_count,
+                             vector_dims,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_ACTIVE_NUM,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_ACTIVE_DEN)) {
+        return false;
+    }
+    /*
+     * Default-pool qmag is only an opportunistic accelerator. Keep it on the
+     * analyzer-backed low-pressure path: sparse-enough query dimensions,
+     * small requested result sets relative to live rows, then a bounded exact
+     * rerank pool after default expansion.
+     */
+    if (!qihse_vdb_ratio_lte(top_k,
+                             live_rows,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_TOPK_NUM,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_TOPK_DEN)) {
+        return false;
+    }
+    if (!qihse_vdb_ratio_lte(candidate_count,
+                             live_rows,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_RERANK_NUM,
+                             QIHSE_VDB_MAGNITUDE_POLICY_MAX_RERANK_DEN)) {
+        return false;
+    }
     return true;
 }
 
@@ -579,6 +730,7 @@ static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb) {
         return;
     }
     vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    qihse_vdb_clear_trinary_sign_cache(vdb);
     qihse_vdb_set_magnitude_stale(vdb);
 }
 
@@ -589,6 +741,17 @@ static void qihse_vdb_clear_trinary_cache(qihse_vector_db_t vdb) {
     free(vdb->trinary);
     vdb->trinary = NULL;
     vdb->trinary_bytes = 0u;
+    qihse_vdb_clear_trinary_sign_cache(vdb);
+}
+
+static void qihse_vdb_clear_trinary_sign_cache(qihse_vector_db_t vdb) {
+    if (!vdb) {
+        return;
+    }
+    free(vdb->trinary_signs);
+    vdb->trinary_signs = NULL;
+    vdb->trinary_sign_bytes = 0u;
+    qihse_vdb_clear_qmag_transposed_cache(vdb);
 }
 
 static void qihse_vdb_set_magnitude_stale(qihse_vector_db_t vdb) {
@@ -596,6 +759,7 @@ static void qihse_vdb_set_magnitude_stale(qihse_vector_db_t vdb) {
         return;
     }
     vdb->magnitude_status = QIHSE_VDB_MAGNITUDE_STALE;
+    qihse_vdb_clear_qmag_transposed_cache(vdb);
 }
 
 static void qihse_vdb_clear_magnitude_cache(qihse_vector_db_t vdb) {
@@ -605,6 +769,22 @@ static void qihse_vdb_clear_magnitude_cache(qihse_vector_db_t vdb) {
     free(vdb->magnitude);
     vdb->magnitude = NULL;
     vdb->magnitude_bytes = 0u;
+    qihse_vdb_clear_qmag_transposed_cache(vdb);
+}
+
+static void qihse_vdb_clear_qmag_transposed_cache(qihse_vector_db_t vdb) {
+    if (!vdb) {
+        return;
+    }
+    free(vdb->qmag_transposed_signs);
+    free(vdb->qmag_transposed_magnitude);
+    free(vdb->qmag_transposed_live_rows);
+    vdb->qmag_transposed_signs = NULL;
+    vdb->qmag_transposed_magnitude = NULL;
+    vdb->qmag_transposed_live_rows = NULL;
+    vdb->qmag_transposed_bytes = 0u;
+    vdb->qmag_transposed_rows = 0u;
+    vdb->qmag_transposed_dims = 0u;
 }
 
 static const float* qihse_vdb_vector_at(const qihse_vector_db_t vdb, const qihse_index_row_t* row) {
@@ -992,7 +1172,7 @@ static bool qihse_vdb_append_row(qihse_vector_db_t vdb,
     }
     vdb->idmap_valid = false;
     vdb->idmap_dirty = true;
-    vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
+    qihse_vdb_set_trinary_stale(vdb);
     return true;
 }
 
@@ -1628,27 +1808,6 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
     return true;
 }
 
-static uint8_t qihse_vdb_pack_trytes(const float* vector, size_t start, size_t dims) {
-    uint8_t value = 0u;
-    uint8_t place = 1u;
-    size_t j;
-
-    for (j = 0u; j < 5u; j++) {
-        size_t idx = start + j;
-        uint8_t trit = 1u;
-        if (idx < dims) {
-            if (vector[idx] < 0.0f) {
-                trit = 0u;
-            } else if (vector[idx] > 0.0f) {
-                trit = 2u;
-            }
-        }
-        value = (uint8_t)(value + trit * place);
-        place = (uint8_t)(place * 3u);
-    }
-    return value;
-}
-
 static uint8_t* qihse_vdb_build_trinary(qihse_vector_db_t vdb, size_t* out_size) {
     uint8_t* out;
     size_t row_bytes;
@@ -1668,18 +1827,21 @@ static uint8_t* qihse_vdb_build_trinary(qihse_vector_db_t vdb, size_t* out_size)
         errno = ENOMEM;
         return NULL;
     }
+    memset(out, QIHSE_VDB_TRINARY_NEUTRAL_TRYTE, total);
     for (row_idx = 0u; row_idx < vdb->total_vectors; row_idx++) {
         const qihse_index_row_t* row = &vdb->rows[row_idx];
         const float* vector = qihse_vdb_vector_at(vdb, row);
-        size_t byte_idx;
 
         if (!vector || (row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
-        for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
-            out[(row_idx * row_bytes) + byte_idx] =
-                qihse_vdb_pack_trytes(vector, byte_idx * 5u, vdb->vector_dims);
+        if (!qihse_trinary_tryte_encode_row(vector,
+                                            vdb->vector_dims,
+                                            out + (row_idx * row_bytes),
+                                            row_bytes)) {
+            free(out);
+            return NULL;
         }
     }
     *out_size = total;
@@ -2405,9 +2567,6 @@ int qihse_vector_db_search(
     qihse_vector_result_t* results,
     size_t max_results
 ) {
-    size_t i;
-    size_t out_count = 0u;
-
     if (query && query->query_mode == QIHSE_VDB_QUERY_TRINARY_MAGNITUDE) {
         return qihse_vdb_search_trinary_magnitude_candidates(vdb, query,
                                                              results, max_results);
@@ -2428,83 +2587,7 @@ int qihse_vector_db_search(
                                                          query->candidate_count,
                                                          results, max_results);
     }
-    if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
-        query->vector_dims != vdb->vector_dims) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(results, 0, max_results * sizeof(*results));
-
-    for (i = 0u; i < vdb->total_vectors; i++) {
-        const qihse_index_row_t* row = &vdb->rows[i];
-        const float* vector;
-        float score;
-        size_t insert_at;
-
-        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
-            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
-            continue;
-        }
-        vector = qihse_vdb_vector_at(vdb, row);
-        if (!vector) {
-            continue;
-        }
-        score = qihse_vdb_cosine_similarity(query->query_vector, vector, vdb->vector_dims);
-        if (score < query->similarity_threshold) {
-            continue;
-        }
-        if (out_count >= max_results && score <= results[max_results - 1u].score) {
-            continue;
-        }
-        insert_at = out_count < max_results ? out_count : max_results - 1u;
-        while (insert_at > 0u && results[insert_at - 1u].score < score) {
-            if (insert_at < max_results) {
-                results[insert_at] = results[insert_at - 1u];
-            }
-            insert_at--;
-        }
-        if (insert_at < max_results) {
-            qihse_vector_result_t result;
-            memset(&result, 0, sizeof(result));
-            result.id = row->vector_id;
-            result.score = score;
-            result.vector_dims = vdb->vector_dims;
-            if (query->include_vectors) {
-                size_t bytes = vdb->vector_dims * sizeof(float);
-                result.vector = (float*)malloc(bytes);
-                if (!result.vector) {
-                    errno = ENOMEM;
-                    return -1;
-                }
-                memcpy(result.vector, vector, bytes);
-            }
-            if (query->include_metadata && row->metadata_size != 0u) {
-                const void* metadata = qihse_vdb_metadata_at(vdb, row);
-                if (!metadata || row->metadata_size > (uint64_t)SIZE_MAX) {
-                    free(result.vector);
-                    errno = EINVAL;
-                    return -1;
-                }
-                result.metadata = malloc((size_t)row->metadata_size);
-                if (!result.metadata) {
-                    free(result.vector);
-                    errno = ENOMEM;
-                    return -1;
-                }
-                memcpy(result.metadata, metadata, (size_t)row->metadata_size);
-                result.metadata_size = (size_t)row->metadata_size;
-            }
-            if (out_count >= max_results) {
-                free(results[max_results - 1u].vector);
-                free(results[max_results - 1u].metadata);
-            }
-            results[insert_at] = result;
-        }
-        if (out_count < max_results) {
-            out_count++;
-        }
-    }
-    return (int)out_count;
+    return qihse_vdb_search_exact_rows(vdb, query, results, max_results, max_results);
 }
 
 static bool qihse_vdb_insert_exact_result(qihse_vector_db_t vdb,
@@ -2517,15 +2600,14 @@ static bool qihse_vdb_insert_exact_result(qihse_vector_db_t vdb,
                                           size_t* out_count) {
     size_t insert_at;
     qihse_vector_result_t result;
+    bool full;
 
     if (*out_count >= result_limit && score <= results[result_limit - 1u].score) {
         return true;
     }
     insert_at = *out_count < result_limit ? *out_count : result_limit - 1u;
+    full = *out_count >= result_limit;
     while (insert_at > 0u && results[insert_at - 1u].score < score) {
-        if (insert_at < result_limit) {
-            results[insert_at] = results[insert_at - 1u];
-        }
         insert_at--;
     }
     if (insert_at >= result_limit) {
@@ -2561,15 +2643,64 @@ static bool qihse_vdb_insert_exact_result(qihse_vector_db_t vdb,
         memcpy(result.metadata, metadata, (size_t)row->metadata_size);
         result.metadata_size = (size_t)row->metadata_size;
     }
-    if (*out_count >= result_limit) {
+    if (full) {
         free(results[result_limit - 1u].vector);
         free(results[result_limit - 1u].metadata);
+        memset(&results[result_limit - 1u], 0, sizeof(results[result_limit - 1u]));
+    }
+    if (full || *out_count > insert_at) {
+        size_t move_from = full ? result_limit - 1u : *out_count;
+        while (move_from > insert_at) {
+            results[move_from] = results[move_from - 1u];
+            move_from--;
+        }
     }
     results[insert_at] = result;
     if (*out_count < result_limit) {
         (*out_count)++;
     }
     return true;
+}
+
+static int qihse_vdb_search_exact_rows(qihse_vector_db_t vdb,
+                                       const qihse_vector_query_t* query,
+                                       qihse_vector_result_t* results,
+                                       size_t max_results,
+                                       size_t result_limit) {
+    size_t out_count = 0u;
+    size_t i;
+
+    if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
+        result_limit == 0u || result_limit > max_results ||
+        query->vector_dims != vdb->vector_dims) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(results, 0, max_results * sizeof(*results));
+
+    for (i = 0u; i < vdb->total_vectors; i++) {
+        const qihse_index_row_t* row = &vdb->rows[i];
+        const float* vector;
+        float score;
+
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+            continue;
+        }
+        vector = qihse_vdb_vector_at(vdb, row);
+        if (!vector) {
+            continue;
+        }
+        score = qihse_vdb_cosine_similarity(query->query_vector, vector, vdb->vector_dims);
+        if (score < query->similarity_threshold) {
+            continue;
+        }
+        if (!qihse_vdb_insert_exact_result(vdb, query, row, vector, score,
+                                           results, result_limit, &out_count)) {
+            return -1;
+        }
+    }
+    return (int)out_count;
 }
 
 static void qihse_vdb_set_trinary_errno(qihse_vector_db_trinary_status_t status) {
@@ -2668,6 +2799,9 @@ int qihse_vector_db_search_trinary_candidates(
 #endif
         return -1;
     }
+    if (candidate_count >= vdb->total_vectors) {
+        return qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+    }
 
     memset(results, 0, max_results * sizeof(*results));
     encoded_query = (uint8_t*)malloc(row_bytes ? row_bytes : 1u);
@@ -2744,6 +2878,179 @@ static int8_t qihse_vdb_signed_trit(uint8_t trit) {
     return 0;
 }
 
+static bool qihse_vdb_ensure_trinary_sign_cache(qihse_vector_db_t vdb) {
+    size_t row_bytes = 0u;
+    size_t expected_trinary_bytes = 0u;
+    size_t sign_bytes = 0u;
+    int8_t* signs;
+    size_t row_idx;
+
+    if (!vdb || vdb->trinary_status != QIHSE_VDB_TRINARY_VALID ||
+        !vdb->trinary || vdb->vector_dims == 0u ||
+        vdb->trinary_rows > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_trinary_tryte_row_bytes(vdb->vector_dims, &row_bytes) ||
+        !qihse_checked_mul_size((size_t)vdb->trinary_rows, row_bytes,
+                                &expected_trinary_bytes) ||
+        !qihse_checked_mul_size((size_t)vdb->trinary_rows, vdb->vector_dims,
+                                &sign_bytes) ||
+        vdb->trinary_row_bytes != (uint64_t)row_bytes ||
+        vdb->trinary_rows != (uint64_t)vdb->total_vectors ||
+        vdb->trinary_bytes != expected_trinary_bytes) {
+        qihse_vdb_set_trinary_stale(vdb);
+#ifdef ESTALE
+        errno = ESTALE;
+#else
+        errno = EINVAL;
+#endif
+        return false;
+    }
+    if (vdb->trinary_signs && vdb->trinary_sign_bytes == sign_bytes) {
+        return true;
+    }
+    signs = (int8_t*)malloc(sign_bytes ? sign_bytes : 1u);
+    if (!signs) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (row_idx = 0u; row_idx < (size_t)vdb->trinary_rows; row_idx++) {
+        const uint8_t* tri_row = vdb->trinary + (row_idx * row_bytes);
+        int8_t* sign_row = signs + (row_idx * vdb->vector_dims);
+        size_t dim = 0u;
+
+        while (dim < vdb->vector_dims) {
+            uint8_t tryte = tri_row[dim / QIHSE_TRINARY_TRITS_PER_TRYTE];
+            size_t trit_idx;
+
+            if (tryte > QIHSE_TRINARY_TRYTE_MAX) {
+                free(signs);
+                qihse_vdb_set_trinary_stale(vdb);
+                errno = EINVAL;
+                return false;
+            }
+            for (trit_idx = 0u;
+                 trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE && dim < vdb->vector_dims;
+                 trit_idx++, dim++) {
+                sign_row[dim] = qihse_vdb_signed_trit((uint8_t)(tryte % 3u));
+                tryte = (uint8_t)(tryte / 3u);
+            }
+        }
+    }
+    qihse_vdb_clear_trinary_sign_cache(vdb);
+    vdb->trinary_signs = signs;
+    vdb->trinary_sign_bytes = sign_bytes;
+    return true;
+}
+
+static bool qihse_vdb_ensure_qmag_transposed_cache(qihse_vector_db_t vdb) {
+    int8_t* signs = NULL;
+    uint8_t* magnitudes = NULL;
+    size_t* live_rows = NULL;
+    size_t physical_rows;
+    size_t live_rows_count = 0u;
+    size_t dims;
+    size_t cache_bytes = 0u;
+    size_t live_row_bytes = 0u;
+    size_t expected_magnitude_bytes = 0u;
+    size_t dim;
+    size_t row_idx;
+
+    if (!vdb || vdb->trinary_status != QIHSE_VDB_TRINARY_VALID ||
+        vdb->magnitude_status != QIHSE_VDB_MAGNITUDE_VALID ||
+        !vdb->magnitude || vdb->vector_dims == 0u ||
+        vdb->trinary_rows > (uint64_t)SIZE_MAX ||
+        vdb->magnitude_rows > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_checked_mul_size(vdb->live_vectors, sizeof(*live_rows),
+                                &live_row_bytes)) {
+        return false;
+    }
+    physical_rows = (size_t)vdb->trinary_rows;
+    dims = vdb->vector_dims;
+    if (vdb->magnitude_rows != vdb->trinary_rows ||
+        vdb->magnitude_row_bytes != (uint64_t)dims ||
+        !qihse_checked_mul_size(vdb->live_vectors, dims, &cache_bytes) ||
+        !qihse_checked_mul_size(physical_rows, (size_t)vdb->magnitude_row_bytes,
+                                &expected_magnitude_bytes) ||
+        vdb->magnitude_bytes != expected_magnitude_bytes) {
+        qihse_vdb_set_magnitude_stale(vdb);
+#ifdef ESTALE
+        errno = ESTALE;
+#else
+        errno = EINVAL;
+#endif
+        return false;
+    }
+    if (vdb->qmag_transposed_signs && vdb->qmag_transposed_magnitude &&
+        vdb->qmag_transposed_live_rows &&
+        vdb->qmag_transposed_bytes == cache_bytes &&
+        vdb->qmag_transposed_rows == vdb->live_vectors &&
+        vdb->qmag_transposed_dims == dims) {
+        return true;
+    }
+    if (!qihse_vdb_ensure_trinary_sign_cache(vdb)) {
+        return false;
+    }
+
+    live_rows = (size_t*)malloc(live_row_bytes ? live_row_bytes : 1u);
+    signs = (int8_t*)malloc(cache_bytes ? cache_bytes : 1u);
+    magnitudes = (uint8_t*)malloc(cache_bytes ? cache_bytes : 1u);
+    if (!live_rows || !signs || !magnitudes) {
+        free(live_rows);
+        free(signs);
+        free(magnitudes);
+        errno = ENOMEM;
+        return false;
+    }
+    for (row_idx = 0u; row_idx < physical_rows; row_idx++) {
+        const qihse_index_row_t* row = &vdb->rows[row_idx];
+
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+            continue;
+        }
+        if (live_rows_count >= vdb->live_vectors) {
+            free(live_rows);
+            free(signs);
+            free(magnitudes);
+            errno = EINVAL;
+            return false;
+        }
+        live_rows[live_rows_count++] = row_idx;
+    }
+    if (live_rows_count != vdb->live_vectors) {
+        free(live_rows);
+        free(signs);
+        free(magnitudes);
+        errno = EINVAL;
+        return false;
+    }
+    for (dim = 0u; dim < dims; dim++) {
+        int8_t* sign_col = signs + (dim * live_rows_count);
+        uint8_t* mag_col = magnitudes + (dim * live_rows_count);
+        size_t live_idx;
+
+        for (live_idx = 0u; live_idx < live_rows_count; live_idx++) {
+            row_idx = live_rows[live_idx];
+            sign_col[live_idx] = vdb->trinary_signs[(row_idx * dims) + dim];
+            mag_col[live_idx] = vdb->magnitude[(row_idx * (size_t)vdb->magnitude_row_bytes) + dim];
+        }
+    }
+
+    qihse_vdb_clear_qmag_transposed_cache(vdb);
+    vdb->qmag_transposed_signs = signs;
+    vdb->qmag_transposed_magnitude = magnitudes;
+    vdb->qmag_transposed_live_rows = live_rows;
+    vdb->qmag_transposed_bytes = cache_bytes;
+    vdb->qmag_transposed_rows = live_rows_count;
+    vdb->qmag_transposed_dims = dims;
+    return true;
+}
+
 static int32_t qihse_vdb_query_weight(float value) {
     float mag = fabsf(value);
     int32_t weight;
@@ -2761,79 +3068,143 @@ static int32_t qihse_vdb_query_weight(float value) {
     return weight;
 }
 
-static bool qihse_vdb_tryte_trit_at(const uint8_t* row, size_t dim, int8_t* out) {
-    size_t byte_idx = dim / 5u;
-    size_t trit_idx = dim % 5u;
-    uint8_t value = row[byte_idx];
-    size_t i;
-
-    if (!row || !out) {
-        errno = EINVAL;
-        return false;
-    }
-    for (i = 0u; i < trit_idx; i++) {
-        value = (uint8_t)(value / 3u);
-    }
-    *out = qihse_vdb_signed_trit((uint8_t)(value % 3u));
-    return true;
+static bool qihse_vdb_qmag_candidate_is_better(int64_t lhs_score,
+                                               size_t lhs_row,
+                                               int64_t rhs_score,
+                                               size_t rhs_row) {
+    return lhs_score > rhs_score ||
+           (lhs_score == rhs_score && lhs_row < rhs_row);
 }
 
-static bool qihse_vdb_select_topk_magnitude(const uint8_t* trinary,
-                                            size_t trinary_row_bytes,
-                                            const uint8_t* magnitude,
-                                            size_t magnitude_row_bytes,
-                                            const int8_t* query_signs,
-                                            const int32_t* query_weights,
-                                            size_t row_count,
+static bool qihse_vdb_qmag_candidate_is_worse(int64_t lhs_score,
+                                              size_t lhs_row,
+                                              int64_t rhs_score,
+                                              size_t rhs_row) {
+    return lhs_score < rhs_score ||
+           (lhs_score == rhs_score && lhs_row > rhs_row);
+}
+
+static void qihse_vdb_qmag_heap_swap(size_t* rows,
+                                     int64_t* scores,
+                                     size_t lhs,
+                                     size_t rhs) {
+    size_t row_tmp = rows[lhs];
+    int64_t score_tmp = scores[lhs];
+    rows[lhs] = rows[rhs];
+    scores[lhs] = scores[rhs];
+    rows[rhs] = row_tmp;
+    scores[rhs] = score_tmp;
+}
+
+static void qihse_vdb_qmag_heap_sift_up(size_t* rows,
+                                        int64_t* scores,
+                                        size_t index) {
+    while (index > 0u) {
+        size_t parent = (index - 1u) / 2u;
+        if (!qihse_vdb_qmag_candidate_is_worse(scores[index], rows[index],
+                                               scores[parent], rows[parent])) {
+            break;
+        }
+        qihse_vdb_qmag_heap_swap(rows, scores, index, parent);
+        index = parent;
+    }
+}
+
+static void qihse_vdb_qmag_heap_sift_down(size_t* rows,
+                                          int64_t* scores,
+                                          size_t count,
+                                          size_t index) {
+    for (;;) {
+        size_t left = (index * 2u) + 1u;
+        size_t right = left + 1u;
+        size_t worst = index;
+
+        if (left < count &&
+            qihse_vdb_qmag_candidate_is_worse(scores[left], rows[left],
+                                              scores[worst], rows[worst])) {
+            worst = left;
+        }
+        if (right < count &&
+            qihse_vdb_qmag_candidate_is_worse(scores[right], rows[right],
+                                              scores[worst], rows[worst])) {
+            worst = right;
+        }
+        if (worst == index) {
+            break;
+        }
+        qihse_vdb_qmag_heap_swap(rows, scores, index, worst);
+        index = worst;
+    }
+}
+
+static bool qihse_vdb_select_topk_magnitude_transposed(
+                                            const int8_t* transposed_signs,
+                                            const uint8_t* transposed_magnitude,
+                                            const size_t* physical_rows,
+                                            const qihse_vdb_qmag_query_dim_t* active_dims,
+                                            size_t active_dim_count,
                                             size_t dims,
+                                            size_t row_count,
                                             size_t* rows,
                                             int64_t* scores,
                                             size_t k,
                                             size_t* out_count) {
+    int64_t* row_scores = NULL;
     size_t count = 0u;
     size_t row_idx;
+    size_t active_idx;
 
-    if (!trinary || !magnitude || !query_signs || !query_weights || !rows ||
-        !scores || !out_count || k == 0u) {
+    if (!transposed_signs || !transposed_magnitude ||
+        (!active_dims && active_dim_count != 0u) || !rows || !scores ||
+        !out_count || k == 0u || active_dim_count > dims) {
         errno = EINVAL;
         return false;
     }
-    for (row_idx = 0u; row_idx < row_count; row_idx++) {
-        const uint8_t* tri_row = trinary + (row_idx * trinary_row_bytes);
-        const uint8_t* mag_row = magnitude + (row_idx * magnitude_row_bytes);
-        int64_t score = 0;
-        size_t dim;
-        size_t insert_at;
+    row_scores = (int64_t*)calloc(row_count ? row_count : 1u, sizeof(*row_scores));
+    if (!row_scores) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (active_idx = 0u; active_idx < active_dim_count; active_idx++) {
+        const qihse_vdb_qmag_query_dim_t* active = &active_dims[active_idx];
+        const int8_t* sign_col;
+        const uint8_t* mag_col;
 
-        for (dim = 0u; dim < dims; dim++) {
-            int8_t row_sign;
-            if (!qihse_vdb_tryte_trit_at(tri_row, dim, &row_sign)) {
-                return false;
+        if (active->dim >= dims) {
+            free(row_scores);
+            errno = EINVAL;
+            return false;
+        }
+        sign_col = transposed_signs + (active->dim * row_count);
+        mag_col = transposed_magnitude + (active->dim * row_count);
+        for (row_idx = 0u; row_idx < row_count; row_idx++) {
+            uint8_t row_mag = mag_col[row_idx];
+            int8_t row_sign = sign_col[row_idx];
+
+            if (row_mag != 0u && row_sign != 0) {
+                row_scores[row_idx] += (int64_t)active->signed_weight *
+                                       (int64_t)row_sign *
+                                       (int64_t)row_mag;
             }
-            score += (int64_t)query_signs[dim] *
-                     (int64_t)row_sign *
-                     (int64_t)query_weights[dim] *
-                     (int64_t)mag_row[dim];
-        }
-        if (count >= k && score <= scores[k - 1u]) {
-            continue;
-        }
-        insert_at = count < k ? count : k - 1u;
-        while (insert_at > 0u && scores[insert_at - 1u] < score) {
-            if (insert_at < k) {
-                rows[insert_at] = rows[insert_at - 1u];
-                scores[insert_at] = scores[insert_at - 1u];
-            }
-            insert_at--;
-        }
-        if (insert_at < k) {
-            rows[insert_at] = row_idx;
-            scores[insert_at] = score;
-        }
-        if (count < k) {
-            count++;
         }
     }
+    for (row_idx = 0u; row_idx < row_count; row_idx++) {
+        int64_t score = row_scores[row_idx];
+        size_t candidate_row = physical_rows ? physical_rows[row_idx] : row_idx;
+
+        if (count < k) {
+            rows[count] = candidate_row;
+            scores[count] = score;
+            qihse_vdb_qmag_heap_sift_up(rows, scores, count);
+            count++;
+        } else if (qihse_vdb_qmag_candidate_is_better(score, candidate_row,
+                                                      scores[0], rows[0])) {
+            rows[0] = candidate_row;
+            scores[0] = score;
+            qihse_vdb_qmag_heap_sift_down(rows, scores, count, 0u);
+        }
+    }
+    free(row_scores);
     *out_count = count;
     return true;
 }
@@ -2842,8 +3213,8 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
                                                          const qihse_vector_query_t* query,
                                                          qihse_vector_result_t* results,
                                                          size_t max_results) {
-    int8_t* query_signs = NULL;
-    int32_t* query_weights = NULL;
+    qihse_vdb_qmag_query_dim_t* active_dims = NULL;
+    size_t active_dim_count = 0u;
     size_t* candidate_rows = NULL;
     int64_t* candidate_scores = NULL;
     size_t row_bytes = 0u;
@@ -2854,6 +3225,7 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
     size_t out_count = 0u;
     size_t top_k;
     size_t i;
+    bool default_candidate_pool;
 
     if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
         query->vector_dims != vdb->vector_dims || query->top_k == 0u ||
@@ -2862,16 +3234,55 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
         return -1;
     }
     top_k = query->top_k;
-    if (!qihse_vdb_resolve_candidate_pool(vdb, query,
-                                          QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
-                                          &candidate_count)) {
+    default_candidate_pool = query->candidate_pool_size == 0u &&
+        query->candidate_count == 0u;
+    active_dims = (qihse_vdb_qmag_query_dim_t*)calloc(vdb->vector_dims ?
+                                                      vdb->vector_dims : 1u,
+                                                      sizeof(*active_dims));
+    if (!active_dims) {
+        errno = ENOMEM;
         return -1;
     }
+    for (i = 0u; i < vdb->vector_dims; i++) {
+        int8_t sign = query->query_vector[i] < 0.0f ? -1 :
+            (query->query_vector[i] > 0.0f ? 1 : 0);
+        int32_t weight = qihse_vdb_query_weight(query->query_vector[i]);
+
+        if (sign != 0 && weight != 0) {
+            qihse_vdb_qmag_query_dim_t* active = &active_dims[active_dim_count++];
+            active->dim = i;
+            active->byte_idx = i / QIHSE_TRINARY_TRITS_PER_TRYTE;
+            active->trit_idx = (uint8_t)(i % QIHSE_TRINARY_TRITS_PER_TRYTE);
+            active->signed_weight = (int32_t)sign * weight;
+        }
+    }
+    if (!qihse_vdb_resolve_qmag_candidate_pool(vdb, query, active_dim_count,
+                                               &candidate_count)) {
+        free(active_dims);
+        return -1;
+    }
+    if (default_candidate_pool &&
+        !qihse_vdb_qmag_policy_allows(active_dim_count,
+                                      vdb->vector_dims,
+                                      candidate_count,
+                                      vdb->live_vectors,
+                                      top_k)) {
+        free(active_dims);
+        /*
+         * qmag without a caller-selected pool is an opportunistic accelerator.
+         * If the policy says it is unlikely to win, preserve result semantics
+         * by using the authoritative exact float32 path. Caller-provided pools
+         * remain explicit opt-ins and keep the historical qmag search behavior.
+         */
+        return qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+    }
     if (vdb->trinary_status != QIHSE_VDB_TRINARY_VALID) {
+        free(active_dims);
         qihse_vdb_set_trinary_errno(vdb->trinary_status);
         return -1;
     }
     if (vdb->magnitude_status != QIHSE_VDB_MAGNITUDE_VALID) {
+        free(active_dims);
         qihse_vdb_set_magnitude_errno(vdb->magnitude_status);
         return -1;
     }
@@ -2895,46 +3306,36 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
 #else
         errno = EINVAL;
 #endif
+        free(active_dims);
         return -1;
     }
 
     memset(results, 0, max_results * sizeof(*results));
-    query_signs = (int8_t*)calloc(vdb->vector_dims ? vdb->vector_dims : 1u,
-                                  sizeof(*query_signs));
-    query_weights = (int32_t*)calloc(vdb->vector_dims ? vdb->vector_dims : 1u,
-                                     sizeof(*query_weights));
     candidate_rows = (size_t*)calloc(candidate_count ? candidate_count : 1u,
                                      sizeof(*candidate_rows));
     candidate_scores = (int64_t*)calloc(candidate_count ? candidate_count : 1u,
                                         sizeof(*candidate_scores));
-    if (!query_signs || !query_weights || !candidate_rows || !candidate_scores) {
-        free(query_signs);
-        free(query_weights);
+    if (!active_dims || !candidate_rows || !candidate_scores) {
+        free(active_dims);
         free(candidate_rows);
         free(candidate_scores);
         errno = ENOMEM;
         return -1;
     }
-    for (i = 0u; i < vdb->vector_dims; i++) {
-        query_signs[i] = query->query_vector[i] < 0.0f ? -1 :
-            (query->query_vector[i] > 0.0f ? 1 : 0);
-        query_weights[i] = qihse_vdb_query_weight(query->query_vector[i]);
-    }
 
-    if (!qihse_vdb_select_topk_magnitude(vdb->trinary,
-                                         (size_t)vdb->trinary_row_bytes,
-                                         vdb->magnitude,
-                                         (size_t)vdb->magnitude_row_bytes,
-                                         query_signs,
-                                         query_weights,
-                                         (size_t)vdb->trinary_rows,
-                                         vdb->vector_dims,
-                                         candidate_rows,
-                                         candidate_scores,
-                                         candidate_count,
-                                         &candidate_out)) {
-        free(query_signs);
-        free(query_weights);
+    if (!qihse_vdb_ensure_qmag_transposed_cache(vdb) ||
+        !qihse_vdb_select_topk_magnitude_transposed(vdb->qmag_transposed_signs,
+                                                    vdb->qmag_transposed_magnitude,
+                                                    vdb->qmag_transposed_live_rows,
+                                                    active_dims,
+                                                    active_dim_count,
+                                                    vdb->vector_dims,
+                                                    vdb->qmag_transposed_rows,
+                                                    candidate_rows,
+                                                    candidate_scores,
+                                                    candidate_count,
+                                                    &candidate_out)) {
+        free(active_dims);
         free(candidate_rows);
         free(candidate_scores);
         return -1;
@@ -2963,16 +3364,14 @@ static int qihse_vdb_search_trinary_magnitude_candidates(qihse_vector_db_t vdb,
         }
         if (!qihse_vdb_insert_exact_result(vdb, query, row, vector, score,
                                            results, top_k, &out_count)) {
-            free(query_signs);
-            free(query_weights);
+            free(active_dims);
             free(candidate_rows);
             free(candidate_scores);
             return -1;
         }
     }
 
-    free(query_signs);
-    free(query_weights);
+    free(active_dims);
     free(candidate_rows);
     free(candidate_scores);
     return (int)out_count;
@@ -3176,6 +3575,7 @@ static bool qihse_vdb_compact_live_rows(qihse_vector_db_t vdb) {
         return false;
     }
 
+    qihse_vdb_clear_qmag_transposed_cache(vdb);
     free(vdb->rows);
     free(vdb->vectors);
     free(vdb->metadata);
@@ -3234,6 +3634,9 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     free(vdb->metadata);
     free(vdb->idmap);
     free(vdb->trinary);
+    free(vdb->trinary_signs);
+    free(vdb->qmag_transposed_signs);
+    free(vdb->qmag_transposed_magnitude);
     free(vdb->magnitude);
     free(vdb);
 }

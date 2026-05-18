@@ -88,6 +88,7 @@
       },
       "acceptance": {
         "recall_at_10_floor": 0.95,
+        "mismatches_must_be_zero": true,
         "latency_p95_us_must_be_reported": true,
         "rerank_candidates_must_be_reported": true
       }
@@ -116,6 +117,82 @@
         "ground_truth": "ivecs"
       },
       "acceptance": {
+        "recall_at_10_floor": 0.95,
+        "mismatches_must_be_zero": true,
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
+    },
+    {
+      "name": "sparse-active-256x16",
+      "kind": "external",
+      "dataset": "sparse_active_256x16",
+      "dimensions": 256,
+      "rows": 2048,
+      "queries": 128,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/sparse_active/dims_256_active_16/base.f32",
+        "query_vectors": "data/sparse_active/dims_256_active_16/query.f32",
+        "ground_truth": "data/sparse_active/dims_256_active_16/ground_truth.u32"
+      },
+      "file_formats": {
+        "base_vectors": "f32_matrix",
+        "query_vectors": "f32_matrix",
+        "ground_truth": "u32_matrix"
+      },
+      "source": {
+        "type": "generated_sparse_active",
+        "builder": "benchmarks/scripts/qihse_generate_sparse_active_fixture.py",
+        "seed": 20260518,
+        "active_query_dimensions": 16,
+        "layout": "planted sparse positives plus low-amplitude sparse distractors"
+      },
+      "acceptance": {
+        "recall_at_10_floor": 1.0,
+        "mismatches_must_be_zero": true,
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
+    },
+    {
+      "name": "sparse-active-768x32",
+      "kind": "external",
+      "dataset": "sparse_active_768x32",
+      "dimensions": 768,
+      "rows": 2048,
+      "queries": 128,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/sparse_active/dims_768_active_32/base.f32",
+        "query_vectors": "data/sparse_active/dims_768_active_32/query.f32",
+        "ground_truth": "data/sparse_active/dims_768_active_32/ground_truth.u32"
+      },
+      "file_formats": {
+        "base_vectors": "f32_matrix",
+        "query_vectors": "f32_matrix",
+        "ground_truth": "u32_matrix"
+      },
+      "source": {
+        "type": "generated_sparse_active",
+        "builder": "benchmarks/scripts/qihse_generate_sparse_active_fixture.py",
+        "seed": 20260518,
+        "active_query_dimensions": 32,
+        "layout": "planted sparse positives plus low-amplitude sparse distractors"
+      },
+      "acceptance": {
+        "recall_at_10_floor": 1.0,
+        "mismatches_must_be_zero": true,
         "latency_p95_us_must_be_reported": true,
         "rerank_candidates_must_be_reported": true
       }
@@ -174,7 +251,7 @@
       },
       "source": {
         "type": "pdf_text",
-        "default_framewerx_path": "../exploits/vxunderground/VXUG-Papers/Hells Gate/HellsGate.pdf",
+        "default_framewerx_path": "./VXUG-Papers/Hells Gate/HellsGate.pdf",
         "builder": "benchmarks/scripts/qihse_pdf_text_sample.py"
       },
       "acceptance": {
