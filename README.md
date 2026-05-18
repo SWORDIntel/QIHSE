@@ -83,6 +83,24 @@ flowchart TB
     L --> D
 ```
 
+## Mermaid persistence lifecycle
+
+```mermaid
+flowchart LR
+    A[Open DB] --> B{Create or Open File-backed}
+    B -->|Create| C[Write WAL Records]
+    B -->|Open Existing| D[Load Snapshot]
+    D --> E[Replay WAL]
+    C --> F[Runtime Mutations\n(add/update/delete/upsert)]
+    E --> F
+    F --> G[Flush]
+    G --> H[Checkpoint Snapshot]
+    H --> I[Compact]
+    H --> J[Stats: trinary/qmag status]
+    I --> K[Crash/Restart]
+    K --> D
+```
+
 ## Quick integration picture (compact example)
 
 ```c
