@@ -93,6 +93,34 @@
       }
     },
     {
+      "name": "sift1m-fallback",
+      "kind": "external",
+      "dataset": "sift1m_fallback",
+      "dimensions": 128,
+      "rows": 2048,
+      "queries": 128,
+      "top_k": 10,
+      "required_modes": [
+        "float32",
+        "qtri",
+        "qmag"
+      ],
+      "files": {
+        "base_vectors": "data/sift1m/fallback/base.fvecs",
+        "query_vectors": "data/sift1m/fallback/query.fvecs",
+        "ground_truth": "data/sift1m/fallback/ground_truth.ivecs"
+      },
+      "file_formats": {
+        "base_vectors": "fvecs",
+        "query_vectors": "fvecs",
+        "ground_truth": "ivecs"
+      },
+      "acceptance": {
+        "latency_p95_us_must_be_reported": true,
+        "rerank_candidates_must_be_reported": true
+      }
+    },
+    {
       "name": "text-embeddings-small",
       "kind": "external",
       "dataset": "text_embeddings",
