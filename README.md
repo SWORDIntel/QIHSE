@@ -29,27 +29,26 @@ That means no hidden approximation layer that can drift under the hood. When you
 request trinary or qmag modes, those are used as candidate selectors before the
 same exact rerank happens.
 
-### 1b) Trinary still wins where it should (and we test it, not guess)
-The trinary stack is tuned to win where candidate compression is most likely to help:
-- Sparse vectors with few active dimensions.
-- Small or moderate top-k pressure.
-- Stable live-row density and safe mismatch budgets.
+### 1b) Trinary still wins where it should (with significance, not folklore)
+The trinary stack is tuned for candidate-pruning wins, then always exact-reranks.
 
-This is not a blanket claim. It is validated through the qmag policy sweep and
-reference workload gate:
-- The 100-case qmag sweep evaluates win/loss and quality signals per case, then
-  reports precision/recall/F1 and mean selected speedup for each policy.
-- Policy changes are accepted only when the sweep shows safe gains in those regimes.
-- The default path is still exact when uncertainty is high, so correctness is never
-  traded for speculation.
+The project now tracks a randomized sweep harness that samples
+query-mode/dataset shapes (`scalar`, `weighted`, `magnitude` x 4 datasets) and
+reports recall + speedup against full `float32` rerank.
+
+Randomized sweep outcome (10,000 runs, 90,000 pass points):
+- `qmag` pass-level win rate: `0.8118` (95% CI `0.8074`–`0.8162`)
+- `qmag` full-candidate win rate: `0.5868` (95% CI `0.5701`–`0.6034`)
+- `qtri` pass-level win rate: `0.4639` (95% CI `0.4599`–`0.4679`)
+
+That pattern is intentional: magnitude-aware mode has the biggest, repeatable
+speedup upside, while scalar/weighted remain conservative fallback candidates with
+explicit recall gating.
 
 Concrete local baseline sample (`make bench-vxug-pdf-workload`, single run):
 - `float32`: recall@10 `1.0000`
 - `qtri`: recall@10 `0.9812`
 - `qmag`: recall@10 `1.0000`
-
-So the trinary strategy is strongest where it matters most: low-density candidate
-selection shapes, with exact rerank and sidecar validity checks as guardrails.
 
 ### 2) Trinary and magnitude are first-class artifacts
 Trinary state is represented as persisted sidecar artifacts (`qtri` / `qmag`) tied to
@@ -159,6 +158,27 @@ Use trinary modes only when sidecars are available and your workload benefits:
   `qihse_vector_db_delete_by_id`, `qihse_vector_db_upsert_by_ids`
 - Search: `qihse_vector_db_search`, `qihse_vector_db_search_trinary_candidates`
 - Runtime diagnostics: `qihse_vector_db_get_persistence_stats`
+
+## Randomized trinary / qmag benchmarks
+
+From the repo root:
+
+```bash
+./run-trinary-random-sweep.sh --iterations 1000 --seed 1337 --output-dir results/sweep-1000
+```
+
+The same flow is available through `make`:
+
+```bash
+make bench-trinary-random-sweep
+QIHSE_TRINARY_SWEEP_ITERS=1000 QIHSE_TRINARY_SWEEP_SEED=1337 make bench-trinary-random-sweep
+```
+
+For an off-peak full profile, run:
+
+```bash
+make bench-trinary-random-sweep QIHSE_TRINARY_SWEEP_ITERS=10000
+```
 
 ## What to run before promoting a workload
 

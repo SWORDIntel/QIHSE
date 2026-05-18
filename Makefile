@@ -4,6 +4,7 @@
 CC=gcc
 
 CFLAGS_BASE=-std=c99 -Wall -Wextra -I. -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -fPIC -lm -pthread -D_GNU_SOURCE -O3
+QIHSE_CFLAGS_EXTRA?=
 
 # CPU-specific SIMD backend selection.
 # R320/E5-2450 v2 exposes AVX but not AVX2/FMA, so these must be off there.
@@ -12,7 +13,7 @@ CFLAGS_BASE=-std=c99 -Wall -Wextra -I. -I./core -I./algorithms -I./backends/cpu 
 QIHSE_ENABLE_AVX2?=0
 QIHSE_ENABLE_AVX512?=0
 
-CFLAGS=$(CFLAGS_BASE)
+CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
 LDFLAGS=-ldl -lm -lpthread
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
@@ -30,12 +31,16 @@ SIFT1M_FALLBACK_QUERIES=128
 SIFT1M_FALLBACK_DIMENSIONS=128
 SIFT1M_FALLBACK_TOP_K=10
 SIFT1M_CALIBRATION_SCOPE?=auto
+QIHSE_TRINARY_SWEEP_ITERS?=10000
+QIHSE_TRINARY_SWEEP_SEED?=
+QIHSE_TRINARY_SWEEP_OUTPUT_DIR?=results/sweep10000
+QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
 SRCS_BASE=core/qihse.c qihse_search.c qihse_math.c qihse_instr.c qihse_hetero.c qihse_vector_db.c qihse_exports.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
-     algorithms/qihse_anchor_search.c \
+     algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
      core/qihse_helpers.c core/qihse_plugin.c \
      algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
@@ -63,11 +68,14 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all build clean pristine workspace workspace-clean lib persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
+.PHONY: all build build-native clean pristine workspace workspace-clean lib persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
 .NOTPARALLEL: validate-reference-workflow
 
 all: lib
 build: lib
+
+build-native:
+	./build-native.sh
 
 lib: $(LIB_TARGET)
 
@@ -233,6 +241,13 @@ bench-trinary-search-sweep: lib
 	QIHSE_BENCH_SWEEP=1 QIHSE_BENCH_DATASET=weighted LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
 	QIHSE_BENCH_SWEEP=1 QIHSE_BENCH_DATASET=magnitude_skew LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
 	QIHSE_BENCH_SWEEP=1 QIHSE_BENCH_DATASET=near_tie LD_LIBRARY_PATH=. /tmp/qihse_trinary_search_path_bench
+
+bench-trinary-random-sweep: lib
+	./run-trinary-random-sweep.sh \
+	  --iterations $(QIHSE_TRINARY_SWEEP_ITERS) \
+	  --iters-per-pass $(QIHSE_TRINARY_SWEEP_BENCH_ITERS) \
+	  --output-dir $(QIHSE_TRINARY_SWEEP_OUTPUT_DIR) \
+	  $(if $(QIHSE_TRINARY_SWEEP_SEED),--seed $(QIHSE_TRINARY_SWEEP_SEED),)
 
 bench-trinary-weighted-sweep: lib
 	$(CC) $(CFLAGS) -o /tmp/qihse_trinary_search_path_bench \
