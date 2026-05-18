@@ -3,35 +3,10 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 ![Build: CI-Ready](https://img.shields.io/badge/Build-CI%20Ready-brightgreen.svg)
 
-QIHSE is a C runtime focused on high-throughput vector search with
-**exact-result-first semantics** and **optional trinary acceleration**.
+QIHSE is a C-first vector search runtime with exact float32 correctness by default and
+optional trinary/qmag acceleration where that is safe.
 
-It is built as a practical platform:
-- deterministic persistence pipeline
-- vector-only mutation APIs with explicit durability controls
-- optional hardware-aware execution scaffolding
-- reproducible benchmark and validation targets
-
-## What it does well today
-
-- **Correct first**: exact float32 search remains the default and always
-  produces authoritative results.
-- **Faster where it is safe**: trinary candidate search (`qtri`, `qmag`) can
-  route to a smaller candidate set and still rerank against float32 data.
-- **Restart-friendly persistence**: file-backed stores, WAL replay, checkpoints,
-  and compact cycles are implemented in the vector DB layer.
-- **Operational visibility**: persistence status, trinary health, and migration
-  helpers are exposed through dedicated APIs.
-
-## Core stack
-
-- Core search API in `qihse_search.*` and `qihse_vector_db.*`
-- UMA/HMA memory control in `memory/`
-- Trinary codec and sidecars in `codecs/` and `persistence/`
-- Device execution backends in `backends/` and orchestration in `orchestration/`
-- Benchmark and workflow scripts in `benchmarks/` and `benchmarks/scripts/`
-
-## Quick start
+## Build
 
 ```bash
 git clone https://github.com/SWORDIntel/QIHSE.git
@@ -39,108 +14,245 @@ cd QIHSE
 make all
 ```
 
-Build artifacts:
-- `libqihse.so` shared library
-- command-line and test executables from `make test` targets
-
-## Minimal usage pattern (vector DB persistence)
+## Code showcase: one-file integration pattern
 
 ```c
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdint.h>
+
 #include "qihse_vector_db.h"
 
-qihse_vector_db_t db = qihse_vector_db_open(
-    QIHSE_VECTOR_DB_AUTO,
-    NULL,                         // UMA manager is optional for simple local test flows
-    "/var/lib/qihse/db",
-    QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED
-);
+int main(void) {
+    const char* db_path = "data/qihse_db";
+    const size_t dims = 128;
+    const size_t batch = 4;
+    float vectors[] = {
+        /* 2 * 128 values */
+        0.0f, 1.0f,
+        /* ... fill all dims * batch values */
+    };
+    float query[] = {
+        /* 128 query floats */
+        0.1f,
+        /* ... */
+    };
+    uint64_t ids[] = {1001, 1002, 1003, 1004};
+    qihse_vector_result_t results[10];
 
-// Add vectors
-qihse_vector_db_add_vectors(db, vectors, num_vectors, dims, ids, NULL, NULL);
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_AUTO,
+        NULL,  // UMA can be wired in when you need cross-device placement.
+        db_path,
+        QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED
+    );
+    if (!db) {
+        perror("qihse_vector_db_open");
+        return 1;
+    }
 
-// Query exact results (safe default)
-qihse_vector_query_t q = {
-    .query_vector = query,
-    .vector_dims = dims,
-    .top_k = 10,
-    .include_vectors = true,
-    .include_metadata = true,
-    .query_mode = QIHSE_VDB_QUERY_FLOAT32
-};
-qihse_vector_db_search(db, &q, results, 10);
+    if (!qihse_vector_db_add_vectors(db, vectors, batch, dims, ids, NULL, NULL)) {
+        perror("qihse_vector_db_add_vectors");
+        qihse_vector_db_close(db);
+        return 1;
+    }
 
-// Persist and compact
-qihse_vector_db_flush(db);
-qihse_vector_db_checkpoint(db);
-qihse_vector_db_compact(db);
+    qihse_vector_query_t q = {
+        .query_vector = query,
+        .vector_dims = dims,
+        .top_k = 3,
+        .similarity_threshold = 0.0f,
+        .include_vectors = true,
+        .include_metadata = false,
+        .use_trinary_candidates = false,
+        .candidate_count = 0,
+        .query_mode = QIHSE_VDB_QUERY_FLOAT32,
+        .candidate_pool_size = 0
+    };
 
-qihse_vector_db_close(db);
+    int got = qihse_vector_db_search(db, &q, results, 10);
+    if (got < 0) {
+        perror("qihse_vector_db_search");
+        qihse_vector_db_close(db);
+        return 1;
+    }
+
+    for (int i = 0; i < got; ++i) {
+        printf("id=%llu score=%0.4f\n",
+               (unsigned long long)results[i].id,
+               results[i].score);
+    }
+
+    if (!qihse_vector_db_flush(db)) {
+        perror("qihse_vector_db_flush");
+    }
+    if (!qihse_vector_db_checkpoint(db)) {
+        perror("qihse_vector_db_checkpoint");
+    }
+    if (!qihse_vector_db_compact(db)) {
+        perror("qihse_vector_db_compact");
+    }
+
+    qihse_vector_db_close(db);
+    return 0;
+}
 ```
 
-For optional acceleration, set `query_mode` to trinary modes:
-- `QIHSE_VDB_QUERY_TRINARY_SCALAR`
-- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`
+## Code showcase: trinary and magnitude modes
 
-Both use trinary/qmag as candidate selectors and still return exact reranked
-float32 results.
+```c
+qihse_vector_query_t fast = {
+    .query_vector = query,
+    .vector_dims = 128,
+    .top_k = 20,
+    .query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
+    .candidate_pool_size = 640,
+    .candidate_count = 640,
+    .similarity_threshold = 0.25f,
+    .include_vectors = false,
+    .include_metadata = false,
+    .use_trinary_candidates = false
+};
 
-## Performance and validation surface
+int fast_found = qihse_vector_db_search(db, &fast, results, 20);
+```
 
-- `make test-persist`
-  - file-backed persistence tests and WAL recovery checks
-- `make test-trinary-codec`
-  - codec correctness
-- `make benchmark`
-  - reference workloads and persistence validation in one flow
-- `make bench-vxug-pdf-workload`
-  - sample VXUG-based end-to-end benchmark
-- `make bench-trinary-search-path`, `make bench-trinary-search-sweep`
-  - trinary mode behavior exploration
+```c
+qihse_vector_query_t scalar_only = {
+    .query_vector = query,
+    .vector_dims = 128,
+    .top_k = 16,
+    .query_mode = QIHSE_VDB_QUERY_TRINARY_SCALAR,
+    .include_vectors = false,
+    .include_metadata = false,
+    .use_trinary_candidates = false
+};
 
-## Runtime contract highlights
+int scalar_candidates = qihse_vector_db_search_trinary_candidates(
+    db,
+    &scalar_only,
+    400,    // must be >= top_k
+    results,
+    16
+);
+```
 
-- **Trinary sidecar behavior is explicit and strict**:
-  missing/stale/corrupt sidecars fail explicit trinary paths instead of silently
-  degrading query correctness.
-- **File-backed runs are replay-safe**:
-  durable state is rebuilt from snapshot + WAL before serving queries.
-- **Maintenance is caller-driven**:
-  migration and maintenance hooks are available without hidden always-on worker threads.
-- **No accidental lock-in**:
-  all major behavior knobs stay in C APIs and Makefile targets.
+Use these modes deliberately. Missing/stale/corrupt trinary artifacts fail explicitly rather than silently masking results.
 
-## Documentation
+## Code showcase: batch mutation API patterns
 
-- [docs/README.md](docs/README.md)
-- [docs/architecture/](docs/architecture/)
-- [docs/usage/](docs/usage/)
+```c
+uint64_t del_ids[] = {1001, 1003};
+size_t deleted = 0;
+if (!qihse_vector_db_delete_by_ids(db, del_ids, 2, &deleted)) {
+    perror("delete_by_ids");
+}
+printf("deleted=%zu\n", deleted);
+
+float updated[] = {
+    /* updated vector 1 */
+    0.5f, 0.6f,
+    /* ... */
+};
+uint64_t upd_ids[] = {1002};
+if (!qihse_vector_db_update_by_id(db, 1002, updated, 128, NULL, 0)) {
+    perror("update_by_id");
+}
+
+uint64_t up_ids[] = {2001, 2002, 1004};
+float up_vectors[] = {
+    /* three x 128 vectors */
+};
+qihse_vector_result_t* metas = NULL;
+size_t meta_sizes[] = {0, 0, 0};
+size_t inserted = 0, updated_count = 0;
+if (!qihse_vector_db_upsert_by_ids(
+        db,
+        up_ids,
+        up_vectors,
+        3,
+        128,
+        NULL,
+        meta_sizes,
+        &inserted,
+        &updated_count)) {
+    perror("upsert_by_ids");
+}
+printf("upsert inserted=%zu updated=%zu\n", inserted, updated_count);
+```
+
+## Code showcase: read runtime persistence state
+
+```c
+qihse_vector_db_persistence_stats_t st = {0};
+if (qihse_vector_db_get_persistence_stats(db, &st)) {
+    printf("storage_mode=%d\n", (int)st.storage_mode);
+    printf("encoding=0x%x\n", (unsigned)st.encoding_id);
+    printf("committed=%llu rows=%llu live=%llu\n",
+           (unsigned long long)st.committed_generation,
+           (unsigned long long)st.total_vectors,
+           (unsigned long long)st.live_vectors);
+    printf("trinary=%d qmag=%d\n",
+           (int)st.trinary_status,
+           (int)st.magnitude_status);
+    printf("wal_records_replayed=%llu wal_pending=%llu\n",
+           (unsigned long long)st.wal_records_replayed,
+           (unsigned long long)st.wal_bytes_pending);
+}
+```
+
+## Code showcase: controlled warm-up preloading
+
+```c
+if (!qihse_vector_db_preload_similar(
+        db,
+        query,
+        128,
+        0.85f)) {
+    perror("preload_similar");
+}
+```
+
+## Validation commands (copy/paste)
+
+```bash
+make test-persist
+make test-trinary-codec
+make bench-trinary-search-path
+make bench-trinary-search-sweep
+make bench-reference-workloads
+make benchmark
+```
+
+## Key API surface
+
+- `qihse_vector_db_open`
+- `qihse_vector_db_add_vectors`
+- `qihse_vector_db_update_by_id`
+- `qihse_vector_db_update_by_ids`
+- `qihse_vector_db_delete_by_id`
+- `qihse_vector_db_delete_by_ids`
+- `qihse_vector_db_upsert_by_ids`
+- `qihse_vector_db_search`
+- `qihse_vector_db_search_trinary_candidates`
+- `qihse_vector_db_preload_similar`
+- `qihse_vector_db_flush`
+- `qihse_vector_db_checkpoint`
+- `qihse_vector_db_compact`
+- `qihse_vector_db_get_persistence_stats`
+- `qihse_vector_db_close`
+- `qihse_vector_db_destroy`
+
+## Documentation pointers
+
+- [docs/ONBOARDING.md](docs/ONBOARDING.md)
 - [docs/persistence/README.md](docs/persistence/README.md)
 - [docs/qmag-policy.md](docs/qmag-policy.md)
-- [docs/security/](docs/security/)
+- [docs/usage/](docs/usage/)
 - [docs/deployment/](docs/deployment/)
-- [docs/ONBOARDING.md](docs/ONBOARDING.md)
-
-## Security notes
-
-QIHSE includes security-oriented primitives and configuration pathways for
-controlled environments. If you deploy for sensitive workloads, follow:
-- `docs/security/` for controls
-- platform-specific hardening in deployment docs
-
-## Build matrix note
-
-Targeted hardware flags are controlled by Make variables:
-- `make QIHSE_ENABLE_AVX2=1`
-- `make QIHSE_ENABLE_AVX512=1`
-
-Builds run with conservative defaults and can be expanded as needed.
+- [docs/security/](docs/security/)
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0
-or later — see [LICENSE](LICENSE).
-
-## Contributing
-
-See [docs/development/CONTRIBUTING.md](docs/development/CONTRIBUTING.md) and
-follow the existing docs-first contribution workflow.
+This project is AGPL-3.0-or-later. See [LICENSE](LICENSE).
