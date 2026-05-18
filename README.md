@@ -1,8 +1,9 @@
-# QIHSE — Vector Search with Exactness Contracts and Performance Escape Hatches
+# QIHSE — Quantum Inspire dHilbert Space Expansion Search
+## (QIHSE): Vector Search with Exactness Contracts and Performance Escape Hatches
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 
-QIHSE is built for teams that want ANN performance without surrendering
+QIHSE (Quantum Inspire dHilbert Space Expansion Search) is built for teams that want ANN performance without surrendering
 correctness guarantees. The project is intentionally conservative in its default
 behavior and explicit about when it uses aggressive acceleration. In practice, this
 means you get a small number of clear knobs instead of implicit magic behavior.
