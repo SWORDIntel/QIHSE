@@ -4,6 +4,22 @@ Date: 2026-05-18
 Branch: `master`
 Remote target: `gitlab/master` (FRAMEWERX sync target)
 
+## Progress Snapshot (Continuation)
+
+- Current milestone completion: **76%** (19 / 25 checklist items).
+- This slice completed:
+  - `make test-persist`
+  - `make test-trinary-codec`
+  - `make bench-trinary-codec`
+  - `make bench-trinary-db-candidate`
+  - `make bench-trinary-search-path`
+  - `make bench-trinary-search-sweep`
+  - `make bench-trinary-magnitude-sweep`
+  - `make bench-trinary-weighted-sweep`
+  - `make validate-reference-workflow`
+- `make check-upstream-workflow` reports imported-copy mode with no upstream remote in this FRAMEWERX tree.
+- `make bench-trinary-weighted-sweep` requires serial run if building artifacts in the same tree; running it concurrently with other `libqihse.so` rebuild targets can transiently produce a short-object race.
+
 ## Current Direction
 
 QIHSE remains a native program with authoritative development in the upstream
@@ -235,7 +251,7 @@ weighted prototype qtri selectors.
 
 ## Milestone Checklist
 
-- Plan completion target (for this slice): **88%**
+- Plan completion target (for this slice): **76%**
 - Overall completion method: counted milestone items below with explicit blockers and no
   unresolved dependencies.
 
