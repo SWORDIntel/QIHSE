@@ -1,11 +1,20 @@
-# QIHSE — Quantum-Inspired Hilbert Space Expansion
+# QIHSE — Vector Search Engine for Fast, Correct, Persistent ANN
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 
-QIHSE is a C runtime for vector search with exact float32 results by default and
-optional trinary acceleration (`qtri`/`qmag`) for candidate reduction.
+QIHSE is a C runtime that combines exact ANN correctness with optional trinary
+candidate acceleration, deterministic persistence, and a direct persistence model
+you can integrate in production code.
 
-## Build
+## Why this project
+
+- Exact float32 search is always the authority.
+- Trinary and magnitude artifacts are performance helpers, not correctness
+  shortcuts.
+- File-backed persistence is crash-aware through checkpoint + WAL replay.
+- Hardware path options are explicit in build and configuration.
+
+## Build in 30 seconds
 
 ```bash
 git clone https://github.com/SWORDIntel/QIHSE.git
@@ -13,7 +22,7 @@ cd QIHSE
 make all
 ```
 
-## Quick start
+## 60-second integration sketch
 
 ```c
 qihse_vector_db_t db = qihse_vector_db_open(
@@ -25,45 +34,63 @@ qihse_vector_db_t db = qihse_vector_db_open(
 
 qihse_vector_query_t q = {
     .query_vector = query,
-    .vector_dims = dims,
+    .vector_dims = 128,
     .top_k = 10,
     .query_mode = QIHSE_VDB_QUERY_FLOAT32
 };
+
 int got = qihse_vector_db_search(db, &q, results, 10);
+qihse_vector_db_flush(db);
+qihse_vector_db_checkpoint(db);
+qihse_vector_db_close(db);
 ```
 
-## Trinary mode note
+## What “fast mode” looks like
 
-Use `QIHSE_VDB_QUERY_TRINARY_SCALAR` or
-`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` when sidecar candidates are present.
-These modes are explicit opt-ins and still return exact reranked float32 results.
+Use trinary modes only when sidecars exist:
+- `QIHSE_VDB_QUERY_TRINARY_SCALAR`
+- `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`
 
-## Core API surface
+Both still rerank with float32 for final result correctness.
+
+## Developer-facing API surface
 
 - `qihse_vector_db_open`
 - `qihse_vector_db_add_vectors`
-- `qihse_vector_db_update_by_id`, `qihse_vector_db_delete_by_id`
+- `qihse_vector_db_update_by_id`
+- `qihse_vector_db_delete_by_id`
 - `qihse_vector_db_upsert_by_ids`
-- `qihse_vector_db_search`, `qihse_vector_db_search_trinary_candidates`
-- `qihse_vector_db_flush`, `qihse_vector_db_checkpoint`, `qihse_vector_db_compact`
-- `qihse_vector_db_get_persistence_stats`, `qihse_vector_db_close`
+- `qihse_vector_db_search`
+- `qihse_vector_db_search_trinary_candidates`
+- `qihse_vector_db_preload_similar`
+- `qihse_vector_db_get_persistence_stats`
+- `qihse_vector_db_flush`
+- `qihse_vector_db_checkpoint`
+- `qihse_vector_db_compact`
+- `qihse_vector_db_close`
 
-## Runtime checks
+## Production checks
 
-- Exact float32 search is the default and authoritative path.
-- File-backed opens load checkpoint + replay WAL before serving reads.
-- Trinary failures are explicit when sidecars are missing, stale, or corrupt.
-- Makefile targets:
-  - `make test-persist`
-  - `make test-trinary-codec`
-  - `make benchmark`
+- `make test-persist` validates persistence and WAL replay.
+- `make test-trinary-codec` validates codec and sidecar expectations.
+- `make benchmark` runs reference workload checks.
+- `make bench-vxug-pdf-workload` runs a practical end-to-end sample.
 
-## Docs
+## Runtime posture
+
+- Exact mode default, trinary mode opt-in.
+- Sidecar problems surface as explicit query failures.
+- Maintenance and migration controls are caller-driven.
+- Built for reproducibility over magic behavior.
+
+## Documentation
 
 - [docs/ONBOARDING.md](docs/ONBOARDING.md)
 - [docs/persistence/README.md](docs/persistence/README.md)
 - [docs/usage/](docs/usage/)
 - [docs/qmag-policy.md](docs/qmag-policy.md)
+- [docs/security/](docs/security/)
+- [docs/deployment/](docs/deployment/)
 
 ## License
 
