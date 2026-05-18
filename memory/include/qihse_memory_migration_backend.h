@@ -15,6 +15,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifndef QIHSE_MEMORY_MIGRATION_BACKEND_ENABLE_CUDA
+#ifdef QIHSE_ENABLE_CUDA_BACKEND
+#define QIHSE_MEMORY_MIGRATION_BACKEND_ENABLE_CUDA 1
+#else
+#define QIHSE_MEMORY_MIGRATION_BACKEND_ENABLE_CUDA 0
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -88,6 +96,18 @@ bool qihse_memory_migration_backend_register_copy_callback(
     qihse_memory_migration_backend_copy_fn callback,
     void* user_context
 );
+
+bool qihse_memory_migration_backend_lookup_copy_callback(
+    qihse_memory_migration_backend_t backend,
+    qihse_memory_migration_backend_copy_fn* callback,
+    void** user_context
+);
+
+bool qihse_memory_migration_backend_register_platform_backends(void);
+
+#if QIHSE_MEMORY_MIGRATION_BACKEND_ENABLE_CUDA
+bool qihse_memory_migration_backend_register_cuda_backends(void);
+#endif
 
 qihse_memory_migration_backend_request_t qihse_memory_migration_backend_request(
     void* dst,
