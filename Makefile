@@ -56,7 +56,7 @@ SRCS_BASE=core/qihse.c src/qihse_search.c src/qihse_math.c src/qihse_instr.c src
 SRCS=$(SRCS_BASE)
 
 ifeq ($(QIHSE_ENABLE_AVX2),1)
-CFLAGS += -mavx2 -mfma
+CFLAGS += -mavx2 -mfma -DQIHSE_ENABLE_AVX2=1
 SRCS += backends/cpu/qihse_cpu_avx2.c backends/cpu/qihse_cpu_distance_avx2.c
 endif
 
