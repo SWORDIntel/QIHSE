@@ -4,7 +4,12 @@ VXUG-Papers/
 libqihse.so
 *.o
 *.gch
+*.png
+*.pyc
+__pycache__/
 test_*
 !test_*.c
 tests/qihse_*_test
 !tests/qihse_*_test.c
+qihse_benchmark
+qihse_benchmark_*

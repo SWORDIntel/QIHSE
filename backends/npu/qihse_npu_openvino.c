@@ -616,10 +616,12 @@ void qihse_npu_shutdown(qihse_npu_context_t* context) {
 
     pthread_mutex_lock(&context->mutex);
 
-    /* Unload all models */
-    for (size_t i = 0; i < context->num_models; i++) {
-        if (context->models[i]) {
-            qihse_npu_unload_model(context, context->models[i]);
+    /* Snapshot model count and references while holding lock */
+    size_t num_models = context->num_models;
+    qihse_npu_model_t* models_snapshot = calloc(num_models, sizeof(qihse_npu_model_t));
+    if (models_snapshot) {
+        for (size_t i = 0; i < num_models; i++) {
+            models_snapshot[i] = context->models[i];
         }
     }
 
@@ -634,6 +636,26 @@ void qihse_npu_shutdown(qihse_npu_context_t* context) {
     }
 
     pthread_mutex_unlock(&context->mutex);
+
+    /* Unload all models without holding context->mutex
+     * (qihse_npu_unload_model acquires it internally) */
+    if (models_snapshot) {
+        for (size_t i = 0; i < num_models; i++) {
+            if (models_snapshot[i]) {
+                qihse_npu_unload_model(context, models_snapshot[i]);
+            }
+        }
+        free(models_snapshot);
+    } else {
+        /* Snapshot allocation failed: fall back to direct iteration.
+         * This is safe because we released context->mutex above,
+         * so qihse_npu_unload_model can acquire it for registry removal. */
+        for (size_t i = 0; i < num_models; i++) {
+            if (context->models[i]) {
+                qihse_npu_unload_model(context, context->models[i]);
+            }
+        }
+    }
     pthread_mutex_destroy(&context->mutex);
 
     /* Clean up UMA manager */
@@ -1165,24 +1187,22 @@ bool qihse_npu_set_batch_size(
     /* Reallocate input/output buffers for new batch size */
     for (size_t i = 0; i < model_internal->input_count; i++) {
         size_t new_size = model_internal->input_sizes[i] * batch_size;
-        if (model_internal->input_buffers[i]) {
-            free(model_internal->input_buffers[i]);
-        }
-        model_internal->input_buffers[i] = malloc(new_size);
-        if (!model_internal->input_buffers[i]) {
+        void* new_buf = malloc(new_size);
+        if (!new_buf) {
             return false;
         }
+        free(model_internal->input_buffers[i]);
+        model_internal->input_buffers[i] = new_buf;
     }
 
     for (size_t i = 0; i < model_internal->output_count; i++) {
         size_t new_size = model_internal->output_sizes[i] * batch_size;
-        if (model_internal->output_buffers[i]) {
-            free(model_internal->output_buffers[i]);
-        }
-        model_internal->output_buffers[i] = malloc(new_size);
-        if (!model_internal->output_buffers[i]) {
+        void* new_buf = malloc(new_size);
+        if (!new_buf) {
             return false;
         }
+        free(model_internal->output_buffers[i]);
+        model_internal->output_buffers[i] = new_buf;
     }
 
     return true;
@@ -1562,7 +1582,12 @@ int qihse_npu_pim_mv_init(
     mv->tile_size = tile_size;
 
     /* Allocate memory for matrix (transferred to NPU memory for PIM) */
-    size_t matrix_size = matrix_rows * matrix_cols * sizeof(float);
+    size_t matrix_size;
+    if (matrix_cols > SIZE_MAX / matrix_rows ||
+        matrix_rows * matrix_cols > SIZE_MAX / sizeof(float)) {
+        return -EOVERFLOW;
+    }
+    matrix_size = matrix_rows * matrix_cols * sizeof(float);
     mv->matrix_data = malloc(matrix_size);
     if (!mv->matrix_data) {
         return -ENOMEM;
@@ -1683,9 +1708,15 @@ int qihse_npu_pim_gemm_init(
     gemm->block_size = block_size;
 
     /* Allocate matrices in NPU memory for PIM operations */
-    gemm->matrix_a = malloc(M * K * sizeof(float));
-    gemm->matrix_b = malloc(K * N * sizeof(float));
-    gemm->matrix_c = calloc(M * N, sizeof(float)); /* Initialize to zero */
+    if (K > SIZE_MAX / M || (size_t)M * K > SIZE_MAX / sizeof(float) ||
+        N > SIZE_MAX / K || (size_t)K * N > SIZE_MAX / sizeof(float) ||
+        N > SIZE_MAX / M || (size_t)M * N > SIZE_MAX / sizeof(float)) {
+        qihse_npu_pim_gemm_destroy(gemm);
+        return -EOVERFLOW;
+    }
+    gemm->matrix_a = malloc((size_t)M * K * sizeof(float));
+    gemm->matrix_b = malloc((size_t)K * N * sizeof(float));
+    gemm->matrix_c = calloc((size_t)M * N, sizeof(float)); /* Initialize to zero */
 
     if (!gemm->matrix_a || !gemm->matrix_b || !gemm->matrix_c) {
         qihse_npu_pim_gemm_destroy(gemm);
@@ -1693,8 +1724,8 @@ int qihse_npu_pim_gemm_init(
     }
 
     /* Copy input matrices */
-    memcpy(gemm->matrix_a, matrix_a, M * K * sizeof(float));
-    memcpy(gemm->matrix_b, matrix_b, K * N * sizeof(float));
+    memcpy(gemm->matrix_a, matrix_a, (size_t)M * K * sizeof(float));
+    memcpy(gemm->matrix_b, matrix_b, (size_t)K * N * sizeof(float));
 
     /* Create PIM GEMM kernel */
     gemm->gemm_kernel = (void*)0xCAFEBABE; /* Placeholder for kernel handle */
@@ -1803,6 +1834,9 @@ void* qihse_npu_pim_alloc(size_t size, size_t alignment) {
 
     /* Allocate with PIM-aware alignment for optimal memory access patterns */
     /* Manual alignment since posix_memalign/aligned_alloc may not be available */
+    if (alignment == 0 || size > SIZE_MAX - alignment + 1) {
+        return NULL;
+    }
     size_t total_size = size + alignment - 1;
     void* raw_ptr = malloc(total_size);
     if (!raw_ptr) {
