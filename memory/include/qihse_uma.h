@@ -19,6 +19,19 @@ extern "C" {
 #endif
 
 /* ============================================================================
+ * MEMORY TIER HIERARCHY
+ * ============================================================================ */
+
+typedef enum {
+    QIHSE_MEM_DRAM,          /* Main system RAM */
+    QIHSE_MEM_HBM,           /* High Bandwidth Memory (GPU) */
+    QIHSE_MEM_NPU_CACHE,     /* NPU cache */
+    QIHSE_MEM_GNA_CACHE,     /* GNA cache */
+    QIHSE_MEM_OPTANE,        /* Intel Optane persistent memory */
+    QIHSE_MEM_CXL,           /* CXL-attached memory */
+} qihse_memory_tier_t;
+
+/* ============================================================================
  * UMA ABSTRACTIONS
  * ============================================================================ */
 
