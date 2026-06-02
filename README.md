@@ -1,266 +1,238 @@
-# QIHSE — Quantum Inspired Hilbert Space Expansion Search
-## Vector Search with Exactness Contracts and Performance Escape Hatches
+# QIHSE
+
+<div align="center">
+
+## Quantum-Inspired Hilbert Space Expansion Search
+
+### Exactness-first vector search with trinary candidate acceleration, file-backed recovery, and hardware-aware execution.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
-[![C](https://img.shields.io/badge/C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Quantum Inspired](https://img.shields.io/badge/Quantum%20Inspired-%E2%9C%A8-purple.svg)]()
+[![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![Python](https://img.shields.io/badge/Python-ctypes%20adapter-3776AB?logo=python&logoColor=white)](python/qihse.py)
+[![Vector Search](https://img.shields.io/badge/Vector%20Search-exactness--first-blueviolet)]()
+[![Trinary](https://img.shields.io/badge/Trinary-qtri%20%2B%20qmag-purple)]()
+[![Persistence](https://img.shields.io/badge/Persistence-WAL%20%2B%20snapshot-darkgreen)]()
 
-Most vector databases make a quiet deal with you: they will be fast, and you will stop asking whether the results are correct. QIHSE does not make that deal.
+</div>
 
-QIHSE was built for teams that have been burned by silent approximation drift — where a deployment that passed yesterday's tests starts returning subtly wrong top-k because someone tuned a parameter three layers down that you never knew existed. It treats correctness as the default, not an opt-in, and treats speed as something you earn by understanding your data shape, not something you buy with hidden trade-offs.
+---
 
-The core promise is simple: **exact float32 search is the only path that does not ask your permission.** Every acceleration layer — graph indexing, scalar quantization, binary compression, sparse inverted indices — is an explicit contract. You decide whether to engage it, the system validates that it is safe for your query shape, and the final ranking is still produced by the same authoritative distance computation that would have run if you had never turned the accelerator on at all. You get to have the conversation about speed *after* you have established that correctness is not on the table.
+## What this is
 
-## What makes QIHSE different
+**QIHSE** is a native C vector-search engine and technical showcase built around one rule:
 
-QIHSE is not “another ANN wrapper.” It is a native vector DB integration layer with
-file-backed lifecycle controls and a query path model designed around two rules:
+> **Approximation is allowed to propose candidates. It is not allowed to silently decide truth.**
 
-- **Always know what the engine is optimizing for.**
-  Exact float32 search is the default and authoritative result path.
-- **Only use approximations when they are explicitly requested and validated.**
-  Trinary-based acceleration is opt-in and enforced by explicit sidecar contracts.
+Most vector systems optimize for speed first and explain recall loss later. QIHSE reverses that. The default path is authoritative `float32` search. Accelerators such as trinary signatures, magnitude sidecars, graph traversal, INT8 quantization, sparse indexing, caching, and memory-tier placement are explicit execution layers around that contract.
 
-Most vector search libraries are designed around a single happy path: build an approximate index, query it, hope the recall is good enough. QIHSE is designed around a different assumption: you will eventually need to know *exactly* what the right answer is, and when that moment comes, the system should not have painted you into a corner.
+The result is a vector-search architecture that is interesting for three reasons:
 
-**Exactness is the default, not a debug mode.** Every query runs through float32 distance unless you explicitly ask for something else. The accelerators — graph indices, quantized sidecars, sparse inverted lists — are candidate *selectors*, not result *producers*. They narrow the field; the exact metric picks the winners. This means you can turn an accelerator on for speed, then turn it off for validation, and expect the same results.
+| Area | QIHSE position |
+|---|---|
+| **Correctness** | Exact `float32` ranking is the default, validation baseline, and final authority for normal accelerated paths. |
+| **Acceleration** | `qtri` and `qmag` sidecars reduce candidate pressure before exact rerank. Bypass mode exists, but it is explicit and approximate. |
+| **Persistence** | WAL, snapshots, manifests, sidecars, index files, and recovery stats are surfaced as first-class state rather than hidden background magic. |
+| **Systems work** | The repository includes C APIs, SIMD-aware CPU paths, file-backed storage, mmap/read-only modes, benchmark harnesses, memory hierarchy experiments, and reference workload tooling. |
 
-**Sidecars are first-class, not afterthoughts.** When you build a graph index or an INT8 quantization table, QIHSE tracks whether that artifact is valid, stale, or corrupt. It does not silently fall back to brute force because a sidecar disappeared. It tells you the sidecar is missing and lets you decide what to do.
+This is not a cosmetic ANN wrapper. It is an attempt to build a vector database core where the fast paths are visible, measurable, and reversible.
 
-**The query planner knows when to say no.** The graph index is fast, but it is not always the right tool. QIHSE gates accelerator selection based on query dimensionality, top-k pressure, and dataset scale. Dense queries against small collections do not get pushed through a graph just because one exists. The system falls back to exact search by design when the overhead would not pay off.
+---
 
-**Recovery is deterministic, not magical.** There is no background thread you are expected to trust. Snapshot, WAL, replay, checkpoint, compact — these are explicit operations you call when you are ready. If the process crashes, you know exactly what state you will find on restart because you decided when the last snapshot happened.
+## Why it exists
 
-## Unique technical characteristics
+Vector search has a bad habit: it becomes fast by making the wrong answer cheaper.
 
-### 1) Exactness-first query contract
-The default query mode returns results using float32 similarity for final ranking.
-That means no hidden approximation layer that can drift under the hood. When you do
-request trinary or qmag modes, those are used as candidate selectors before the
-same exact rerank happens.
+That may be acceptable for some recommendation systems. It is less acceptable for forensic retrieval, security search, document triage, or any workload where a false nearest-neighbor quietly changes the investigation. QIHSE treats vector search like a systems problem rather than a dashboard feature:
 
-### 1b) Trinary still wins where it should (with significance, not folklore)
-The trinary stack is tuned for candidate-pruning wins, then always exact-reranks.
+- establish an exact result path first;
+- add accelerators as explicit candidate selectors;
+- validate sidecars before trusting them;
+- expose recovery state;
+- benchmark workload shapes instead of claiming universal speedups;
+- let the caller decide when approximate bypass is acceptable.
 
-The project now tracks a randomized sweep harness that samples
-query-mode/dataset shapes (`scalar`, `weighted`, `magnitude` x 4 datasets) and
-reports recall + speedup against full `float32` rerank.
+That design is the point of the project.
 
-Randomized sweep outcome (10,000 runs, 90,000 pass points):
-- `qmag` pass-level win rate: `0.8118` (95% CI `0.8074`–`0.8162`)
-- `qmag` full-candidate win rate: `0.5868` (95% CI `0.5701`–`0.6034`)
-- `qtri` pass-level win rate: `0.4639` (95% CI `0.4599`–`0.4679`)
+---
 
-That pattern is intentional: magnitude-aware mode has the biggest, repeatable
-speedup upside, while scalar/weighted remain conservative fallback candidates with
-explicit recall gating.
-
-Concrete local baseline sample (`make bench-vxug-pdf-workload`, single run):
-- `float32`: recall@10 `1.0000`
-- `qtri`: recall@10 `0.9812`
-- `qmag`: recall@10 `1.0000`
-
-### 2) Trinary and magnitude are first-class artifacts
-Trinary state is represented as persisted sidecar artifacts (`qtri` / `qmag`) tied to
-the vector store layout. QIHSE tracks whether these artifacts are valid, stale,
-absent, or corrupt, and surfaces that through the API instead of pretending all is
-well.
-
-### 3) Dimension-aware performance policy
-The qmag path is gated by a dimension-aware policy that weighs active query dimensions,
-`top_k` pressure, and live-row scale. Dense or high-pressure shapes fall back to exact
-execution by design. Explicit caller-provided pools remain possible for deliberate
-experiments, but the default gate is conservative.
-
-### 4) File-backed recovery that is boringly deterministic
-The persistence model is explicit: snapshot, WAL, replay, then continue. On restart,
-state is reconstructed before normal query service. This favors predictable recovery
-behavior over opaque startup side effects.
-
-### 5) Mutation model with lifecycle clarity
-Update/delete/upsert flows are mutation-friendly while keeping WAL-backed behavior
-straightforward to reason about. Lifecycle transitions are visible through persistence
-stats and checkpoint/compact operations.
-
-### 6) Caller-directed maintenance, no hidden daemon dependency
-Maintenance and scheduling calls are available and explicit. There is no requirement
-that hidden background threads be assumed for basic correctness; your host controls
-the maintenance cadence.
-
-### 7) Hierarchical memory storage with automatic hot/cold tiering
-QIHSE tracks per-vector access frequency and temperature, then promotes frequently-accessed
-vectors to faster memory tiers (HBM, NPU cache) and demotes cold vectors to DRAM.
-Access tracking is automatic across all query paths (exact, graph, INT8, sparse).
-Tier assignments are persisted in a `vectors.qtier` sidecar and recovered on restart.
-Configuration via `.qihse.conf` or environment variables:
-- `memory.hot_threshold` / `QIHSE_MEMORY_HOT_THRESHOLD` (default: 100 accesses/sec)
-- `memory.cold_threshold` / `QIHSE_MEMORY_COLD_THRESHOLD` (default: 5 accesses/sec)
-- `memory.maintenance_interval` / `QIHSE_MEMORY_MAINTENANCE_INTERVAL` (queries between maintenance runs, 0 = explicit only)
-
-Run `qihse_vector_db_run_memory_maintenance(db)` explicitly, or let batch search auto-trigger it.
-
-## Build and run
-
-```bash
-git clone https://github.com/SWORDIntel/QIHSE.git
-cd QIHSE
-make all
-```
-
-## Mermaid architecture snapshot
+## Core idea in one diagram
 
 ```mermaid
 flowchart TB
-    A[Client Process] --> B[Query Ingestion]
-    A --> C[Vector Mutations]
-    A --> P[Python / CLI Bindings]
-    B --> D{qihse_vector_db_search}
-    D --> E["Exact float32 rerank path<br/>(default)"]
-    D --> F{Query mode}
-    F -->|TRINARY_SCALAR| G["qtri sidecar shortlist"]
-    F -->|TRINARY_MAGNITUDE| H["qmag sidecar shortlist"]
-    F -->|GRAPH| X["Graph index (HNSW)"]
-    F -->|INT8| Y["INT8 quantization"]
-    F -->|BINARY| Z["Binary quantization"]
-    F -->|SPARSE| W["Inverted index (BM25)"]
-    G --> E
-    H --> E
-    X --> E
-    Y --> E
-    Z --> E
-    W --> E
-    E --> I["Returned ranked results"]
-    I --> Q[Query Result Cache]
-    Q --> I
-    I --> T[Hierarchical Storage<br/>Hot/cold tiering]
-    T --> S[Tier sidecar .qtier]
-    S --> T
-    C --> J["WAL + snapshot metadata"]
-    J --> K["checkpoint/compact"]
-    K --> L["Restart-safe snapshot"]
-    L --> D
+    Q[Query Vector] --> P[Query Planner / Mode Selection]
+
+    P -->|default| F32[Authoritative float32 scan]
+    P -->|QIHSE_VDB_QUERY_TRINARY_SCALAR| QTRI[qtri sign sidecar candidates]
+    P -->|QIHSE_VDB_QUERY_TRINARY_MAGNITUDE| QMAG[qtri + qmag magnitude candidates]
+    P -->|QIHSE_VDB_QUERY_GRAPH| GRAPH[Graph candidate selector]
+    P -->|QIHSE_VDB_QUERY_INT8| INT8[INT8 quantized candidate selector]
+    P -->|QIHSE_VDB_QUERY_SPARSE| SPARSE[Sparse inverted index / BM25]
+
+    QTRI --> RERANK[Exact float32 rerank]
+    QMAG --> RERANK
+    GRAPH --> RERANK
+    INT8 --> RERANK
+    SPARSE --> RERANK
+    F32 --> RESULTS[Ranked results]
+    RERANK --> RESULTS
+
+    P -->|explicit bypass only| BYPASS[qmag direct ordering]
+    BYPASS --> APPROX[Approximate results]
+
+    RESULTS --> CACHE[Generation-aware result cache]
+    CACHE --> RESULTS
 ```
 
-## Mermaid persistence lifecycle
+The normal accelerated paths do **not** replace exact scoring. They reduce the search space, then hand the shortlist back to the exact scorer.
+
+---
+
+## Query modes
+
+| Mode | Purpose | Final ranking contract |
+|---|---|---|
+| `QIHSE_VDB_QUERY_FLOAT32` | Default exact search | Authoritative `float32` scoring. Tolerates missing/stale/corrupt sidecars. |
+| `QIHSE_VDB_QUERY_TRINARY_SCALAR` | Sign-only trinary shortlist via `vectors.qtri` | Candidate selection, then exact `float32` rerank. Fails if required sidecar is invalid. |
+| `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE` | Magnitude-aware shortlist via `vectors.qtri` + `vectors.qmag` | Candidate selection, then exact `float32` rerank. Conservative default policy may fall back to exact search. |
+| `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS` | Lowest-latency qmag ordering | Explicit approximate path. No automatic exact fallback. Scores are qmag scores, not cosine scores. |
+| `QIHSE_VDB_QUERY_GRAPH` | Graph-index candidate selection | Candidate selector path intended to feed exact rerank. |
+| `QIHSE_VDB_QUERY_INT8` | INT8 scalar quantization candidate selection | Candidate selector path intended to feed exact rerank. |
+| `QIHSE_VDB_QUERY_SPARSE` | Sparse inverted-index retrieval with BM25-style scoring | Sparse retrieval path for high-dimensional sparse inputs. |
+
+Additional API surface includes batch search, hybrid search with Reciprocal Rank Fusion, metadata filters, query cache controls, graph/index builders, INT8 builders, binary sidecar builders, sparse-index builders, explicit persistence controls, and memory-tier maintenance.
+
+---
+
+## Technical showcase highlights
+
+### 1. Exactness-first search contract
+
+The default query mode is exact `float32`. Accelerators are not smuggled into the query path. The caller chooses them.
+
+This matters because it gives every workload a ground truth. You can benchmark `qmag` against exact search, reject it for dense/high-pressure shapes, or use bypass mode when raw latency matters more than exact ranking.
+
+### 2. Trinary search that acts like an accelerator, not a hallucination engine
+
+QIHSE stores trinary and magnitude sidecars:
+
+- `vectors.qtri` — row-oriented trinary signatures;
+- `vectors.qmag` — row-aligned magnitude information;
+- transposed qmag caches for dimension-major scoring;
+- explicit sidecar status: absent, valid, stale, or corrupt.
+
+The normal trinary paths generate a candidate pool and then rerank against the original `float32` vectors. That is the key design distinction.
+
+### 3. qmag policy gates
+
+The qmag path is deliberately conservative. It considers live-row count, active query dimensions, `top_k` pressure, and effective rerank pressure. If the query shape is likely to erase qmag's advantage or risk shortlist loss, the default qmag policy falls back to exact search.
+
+Caller-provided pools remain possible for experiments, but they are treated as explicit opt-ins.
+
+### 4. File-backed lifecycle with visible state
+
+QIHSE is not just a RAM toy. The file-backed mode uses explicit durability operations and inspectable artifacts:
+
+```text
+my-index/
+├── MANIFEST
+├── wal.qwal
+├── vectors.qvec
+├── metadata.qmeta
+├── index.qidx
+├── idmap.qid
+├── vectors.qtri
+├── vectors.qmag
+├── index.qgraph
+├── vectors.qint8
+└── vectors.qtier
+```
+
+The model is intentionally boring: write, flush, checkpoint, compact, reopen, replay WAL if needed, validate sidecars, continue.
+
+Boring recovery is good engineering. Exciting recovery is usually data loss wearing a costume.
+
+### 5. Mutation-aware vector storage
+
+The API exposes insert, delete, update, and upsert flows. Updates are append-oriented: old live rows are tombstoned and replacement rows are added with the same external ID. The ID map, WAL, cache generation, and sidecar state move with those lifecycle transitions.
+
+### 6. Cache invalidation that is not hand-waved
+
+The result cache keys on query contents, `top_k`, metric choice, and generation. Mutations advance the cache generation so stale results do not survive writes.
+
+### 7. Multiple retrieval shapes
+
+QIHSE is not limited to one data model:
+
+- dense `float32` vectors;
+- trinary compressed signatures;
+- magnitude-aware trinary scoring;
+- graph candidate search;
+- INT8 scalar quantized candidates;
+- binary quantization sidecar support;
+- sparse inverted index support;
+- cosine, dot-product, and Euclidean scoring contracts.
+
+### 8. Hardware-aware execution
+
+The build system supports native C compilation, optional AVX2/AVX-512 paths, CPU distance backends, and experimental hooks for NPU/GPU-oriented work. The repository is structured for systems-level experimentation rather than API-only demonstration.
+
+### 9. Hierarchical memory experiments
+
+Recent work adds per-vector access tracking and tier metadata through `vectors.qtier`. Hot/cold vector temperature can be used to drive memory maintenance and placement behavior across faster/slower tiers.
+
+This is currently best understood as a systems research lane inside the repository: useful for exploring how retrieval engines behave when access frequency, device placement, and storage hierarchy become part of the query lifecycle.
+
+---
+
+## Persistence lifecycle
 
 ```mermaid
 flowchart LR
-    A[Open DB] --> B{Create or Open File-backed}
-    B -->|Create| C["Write WAL Records"]
-    B -->|Open Existing| D["Load Snapshot"]
-    D --> E["Replay WAL"]
-    C --> F["Runtime Mutations<br/>(add / update / delete / upsert)"]
+    A[Open DB] --> B{Mode}
+    B -->|Create| C[Initialize manifest + storage]
+    B -->|Open existing| D[Load manifest + snapshot]
+    D --> E[Replay WAL]
+    C --> F[Mutations]
     E --> F
-    F --> G["Flush"]
-    G --> H["Checkpoint Snapshot"]
-    H --> I["Compact"]
-    H --> J["Stats: trinary/qmag status"]
-    I --> K["Crash / Restart"]
-    K --> D
+    F --> G[Flush]
+    G --> H[Checkpoint]
+    H --> I[Rebuild / validate sidecars]
+    I --> J[Compact when requested]
+    J --> K[Close]
+    K --> L[Restart]
+    L --> D
+
+    I --> S1[qtri status]
+    I --> S2[qmag status]
+    I --> S3[graph status]
+    I --> S4[int8 status]
 ```
 
-## Quick integration picture (compact example)
+Persistence is caller-directed. There is no hidden daemon required for correctness. If a sidecar is missing, stale, or corrupt, QIHSE reports that state instead of pretending the accelerator is fine.
 
-```c
-qihse_vector_db_t db = qihse_vector_db_open(
-    QIHSE_VECTOR_DB_AUTO,
-    NULL,                      // UMA optional for simple flows
-    "data/qihse_db",
-    QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED
-);
+---
 
-qihse_vector_query_t q = {
-    .query_vector = query,
-    .vector_dims = 128,
-    .top_k = 10,
-    .query_mode = QIHSE_VDB_QUERY_FLOAT32
-};
-int got = qihse_vector_db_search(db, &q, results, 10);
-
-qihse_vector_db_flush(db);
-qihse_vector_db_checkpoint(db);
-qihse_vector_db_close(db);
-```
-
-Use trinary modes only when sidecars are available and your workload benefits:
-`QIHSE_VDB_QUERY_TRINARY_SCALAR` or
-`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE`.
-
-For rawest speed (at the cost of recall guarantees), use:
-
-`QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS`.
-
-## What is actually in the box
-
-**Distance computation that uses your silicon.** On modern x86 CPUs with AVX2, QIHSE automatically selects vectorized implementations of cosine similarity, dot product, and Euclidean distance. On older hardware, it falls back to scalar loops without any code changes or recompilation. You do not configure this. It is simply a property of the hardware you are running on.
-
-**A graph index that knows when it is not needed.** The HNSW-style graph index is built and persisted automatically, but it is not used for every query. The system evaluates query dimensionality, top-k pressure, and dataset size before deciding whether the graph will actually be faster than a brute-force scan. For small collections or dense high-dimensional queries, it falls back to exact search — not because the graph is broken, but because the math says brute force is cheaper. The graph state is persisted to `index.qgraph` and loaded on restart, but it is an accelerator, not a crutch.
-
-**Quantization that does not quantize your results.** INT8 scalar quantization stores per-dimension min/max scaling factors and compresses vectors to one byte per dimension. Binary quantization goes further, packing each dimension to a single bit. Both are used exclusively as candidate selectors: they produce a shortlist of promising rows, and then the exact float32 metric runs against that shortlist to produce the final ranking. The quantized artifacts are persisted sidecars (`vectors.qint8`, `vectors.qbinary`) and validated on load. If they are stale or corrupt, the system tells you, not your users.
-
-**Sparse vectors handled natively.** If your vectors are mostly zeros — think TF-IDF, think one-hot embeddings, think any high-dimensional space where most dimensions are inactive — QIHSE builds an inverted index with BM25 scoring. The sparse path is not an afterthought or a plugin. It is a first-class query mode, and sparse vectors coexist in the same database as dense ones.
-
-**A query cache with teeth.** Repeated identical queries are cached with FNV-1a hashing keyed on vector contents, top-k, and metric choice. The cache is invalidated automatically on any database mutation. There is no stale-cache bug where you delete a vector and still get it in results because the cache did not notice.
-
-**Configuration that respects your environment.** Drop a `.qihse.conf` in your working directory or home directory. Set `graph.M`, `cache.max_entries`, `search.default_k` — the usual suspects. Environment variables override file values for containerized deployments. No XML, no YAML, no ceremony.
-
-**Python and CLI interfaces.** The core is C, but you do not need to write C to use it. The Python bindings cover the full API, and the CLI tool handles database creation, bulk insertion, index building, and search from the shell.
-
-## Randomized trinary / qmag benchmarks
-
-From the repo root:
+## Build
 
 ```bash
-./scripts/run-trinary-random-sweep.sh --iterations 1000 --seed 1337 --output-dir results/sweep-1000
+git clone https://github.com/SWORDIntel/QIHSE.git && cd QIHSE && make all
 ```
 
-The same flow is available through `make`:
-
-```bash
-make bench-trinary-random-sweep
-QIHSE_TRINARY_SWEEP_ITERS=1000 QIHSE_TRINARY_SWEEP_SEED=1337 make bench-trinary-random-sweep
-```
-
-For an off-peak full profile, run:
-
-```bash
-make bench-trinary-random-sweep QIHSE_TRINARY_SWEEP_ITERS=10000
-```
-
-## What to run before promoting a workload
-
-- `make test-persist`
-- `make test-trinary-codec`
-- `make benchmark`
-- `make bench-vxug-pdf-workload` (sample end-to-end flow)
-- `make bench-trinary-search-sweep` (acceleration shape behavior)
-- `make bench-micro` (micro-benchmarks for all query paths)
-- `make bench-memory-hierarchy` (hot/cold tiering behavior)
-
-## Benchmark chart
-
-Run the micro-benchmarks and generate a comparison chart:
-
-```bash
-make bench-micro 2>&1 | tee /tmp/bench_results.txt
-python3 scripts/generate_benchmark_chart.py /tmp/bench_results.txt benchmarks/qihse_benchmark_chart.png
-```
-
-![Benchmark Chart](benchmarks/qihse_benchmark_chart.png)
-
-## Native build helper (one-line entrypoint)
-
-Use the build helper to auto-detect SIMD and build an optimized native binary safely.
+Native helper:
 
 ```bash
 ./scripts/build-native.sh
+```
+
+Optional native targets:
+
+```bash
 make build-native
 ./scripts/build-native.sh --avx2
 ./scripts/build-native.sh --avx512 --allow-unsupported --cflags "-O3 -DNDEBUG"
 ```
 
-If you need custom flags, create `./.qihse-build-flags` and set:
+Custom build flags can be placed in `./.qihse-build-flags`:
 
 ```text
 QIHSE_TARGET_OVERRIDE=avx512
@@ -268,16 +240,258 @@ QIHSE_CFLAGS_EXTRA=-march=native -O3 -flto
 QIHSE_BUILD_ALLOW_UNSUPPORTED=1
 ```
 
-## Read this next
+Minimum practical local toolchain:
 
-- [docs/ONBOARDING.md](docs/ONBOARDING.md) for practical startup/runbook
-- [docs/persistence/README.md](docs/persistence/README.md) for durability model
-- [docs/qmag-policy.md](docs/qmag-policy.md) for default fast-path behavior
-- [docs/usage/](docs/usage/) for focused usage guides
-- [docs/security/](docs/security/) for policy and hardening notes
+```bash
+make dev-setup
+```
 
-## License
+---
 
-**AGPL-3.0-or-later. This is strong copyleft. See [LICENSE](LICENSE) before any commercial use.**
+## Minimal C usage
 
-This project is published as a technical showcase and for home deployment if you so wish, bear me in mind if you want a world class database driving your fancy new framework. Failure to comply will be treated as copyright infringement and pursued to the full extent of the law.
+```c
+#include "qihse_vector_db.h"
+
+qihse_vector_db_t db = qihse_vector_db_open(
+    QIHSE_VECTOR_DB_AUTO,
+    NULL,
+    "data/qihse_db",
+    QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED
+);
+
+qihse_vector_query_t query = {
+    .query_vector = query_vec,
+    .vector_dims = 128,
+    .top_k = 10,
+    .similarity_threshold = 0.0f,
+    .include_vectors = false,
+    .include_metadata = false,
+    .query_mode = QIHSE_VDB_QUERY_FLOAT32,
+};
+
+qihse_vector_result_t results[10] = {0};
+int got = qihse_vector_db_search(db, &query, results, 10);
+
+qihse_vector_db_flush(db);
+qihse_vector_db_checkpoint(db);
+qihse_vector_db_close(db);
+```
+
+Switch to magnitude-aware candidate selection only when sidecars are valid and the workload benefits:
+
+```c
+query.query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE;
+query.candidate_pool_size = 0;  // enable conservative default policy
+```
+
+Use bypass mode only when you explicitly accept approximate qmag ordering:
+
+```c
+query.query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS;
+query.candidate_pool_size = 1024;
+```
+
+---
+
+## Benchmark and validation commands
+
+Core correctness and persistence:
+
+```bash
+make test-persist
+make test-trinary-codec
+```
+
+Reference workloads:
+
+```bash
+make bench-reference-workloads
+make bench-reference-runner-smoke
+make validate-reference-workflow
+```
+
+Vector-search behavior:
+
+```bash
+make bench-micro
+make bench-trinary-search-sweep
+make bench-trinary-random-sweep
+```
+
+VXUG PDF workload sample:
+
+```bash
+make bench-vxug-pdf-workload
+```
+
+SIFT1M workflow, with deterministic fallback data if the full dataset is not present:
+
+```bash
+make bench-sift1m-workload
+```
+
+Generate a benchmark chart:
+
+```bash
+make bench-micro 2>&1 | tee /tmp/bench_results.txt && python3 scripts/generate_benchmark_chart.py /tmp/bench_results.txt benchmarks/qihse_benchmark_chart.png
+```
+
+![Benchmark Chart](benchmarks/qihse_benchmark_chart.png)
+
+---
+
+## Current trinary / qmag benchmark snapshot
+
+Representative randomized sweep results currently tracked in the repository:
+
+| Path | Measurement | Result |
+|---|---:|---:|
+| `qmag` | pass-level win rate | `0.8118` with 95% CI `0.8074–0.8162` |
+| `qmag` | full-candidate win rate | `0.5868` with 95% CI `0.5701–0.6034` |
+| `qtri` | pass-level win rate | `0.4639` with 95% CI `0.4599–0.4679` |
+
+Representative local VXUG PDF workload sample:
+
+| Mode | recall@10 |
+|---|---:|
+| `float32` | `1.0000` |
+| `qtri` | `0.9812` |
+| `qmag` | `1.0000` |
+
+These are workload-specific numbers, not universal marketing claims. The important result is the shape: `qmag` can produce repeatable candidate-pruning wins, while exact search remains the validation anchor.
+
+Run your own sweep:
+
+```bash
+./scripts/run-trinary-random-sweep.sh --iterations 1000 --seed 1337 --output-dir results/sweep-1000
+```
+
+Or through `make`:
+
+```bash
+QIHSE_TRINARY_SWEEP_ITERS=1000 QIHSE_TRINARY_SWEEP_SEED=1337 make bench-trinary-random-sweep
+```
+
+---
+
+## API surface map
+
+```mermaid
+flowchart TB
+    subgraph Client[Caller API]
+        A1[qihse_vector_db_open]
+        A2[qihse_vector_db_add_vectors]
+        A3[delete / update / upsert]
+        A4[qihse_vector_db_search]
+        A5[batch search]
+        A6[hybrid RRF search]
+        A7[metadata filters]
+    end
+
+    subgraph Engine[Search Engine]
+        B1[float32 exact]
+        B2[qtri scalar]
+        B3[qmag magnitude]
+        B4[graph]
+        B5[INT8]
+        B6[sparse BM25]
+        B7[result cache]
+    end
+
+    subgraph Storage[Durability + Sidecars]
+        C1[MANIFEST]
+        C2[WAL]
+        C3[vectors]
+        C4[metadata]
+        C5[id map]
+        C6[qtri / qmag]
+        C7[qgraph / qint8 / qtier]
+    end
+
+    subgraph Maintenance[Caller-directed Maintenance]
+        D1[flush]
+        D2[checkpoint]
+        D3[compact]
+        D4[build graph]
+        D5[build int8]
+        D6[build binary]
+        D7[build sparse]
+        D8[memory maintenance]
+    end
+
+    Client --> Engine
+    Engine --> Storage
+    Maintenance --> Storage
+    Storage --> Engine
+```
+
+---
+
+## Repository orientation
+
+| Path | Purpose |
+|---|---|
+| `include/qihse_vector_db.h` | Public vector DB API surface. |
+| `src/qihse_vector_db.c` | Native vector DB implementation. |
+| `persistence/` | File format, WAL, snapshots, vector store mechanics. |
+| `codecs/` | Trinary codec work. |
+| `backends/cpu/` | CPU detection and distance implementations. |
+| `memory/` | UMA/HMA, migration policy, topology, memory-tier experiments. |
+| `benchmarks/` | Microbenchmarks, reference workloads, VXUG/SIFT workflows. |
+| `docs/` | API, onboarding, persistence, policy, usage, architecture notes. |
+| `python/qihse.py` | Minimal ctypes adapter for the shared library. |
+
+---
+
+## What this demonstrates
+
+QIHSE is a compact but dense showcase of systems engineering decisions:
+
+- C ABI design around a native vector DB handle;
+- explicit query contracts instead of hidden optimizer behavior;
+- sidecar validity tracking and stale/corrupt state handling;
+- WAL-backed mutation lifecycle;
+- append-oriented updates and tombstone-aware live rows;
+- cache generation invalidation;
+- candidate pruning with exact rerank;
+- benchmark-first tuning of acceleration paths;
+- hardware-aware compilation lanes;
+- memory hierarchy experiments;
+- reference workload automation.
+
+The interesting part is not only that it searches vectors. The interesting part is that it treats search speed, correctness, persistence, and hardware placement as one connected engineering problem.
+
+---
+
+## What it is not claiming
+
+- It is not claiming that every qmag query beats exact search.
+- It is not claiming approximate bypass is exact.
+- It is not claiming benchmark numbers transfer blindly to unrelated datasets.
+- It is not presenting itself as a managed cloud service or polished drop-in replacement for every vector database.
+- It is not hiding the cost of correctness behind a marketing graph.
+
+The project is stronger when it is honest: QIHSE is a technical showcase and research-grade engine for exactness-first vector retrieval with visible acceleration contracts.
+
+---
+
+## Read next
+
+- [docs/ONBOARDING.md](docs/ONBOARDING.md) — practical startup/runbook.
+- [docs/api/README.md](docs/api/README.md) — API reference.
+- [docs/persistence/README.md](docs/persistence/README.md) — durability model.
+- [docs/qmag-policy.md](docs/qmag-policy.md) — qmag candidate policy rationale.
+- [docs/usage/](docs/usage/) — focused usage guides.
+- [docs/security/](docs/security/) — security and hardening notes.
+- [benchmarks/reference_workloads.json](benchmarks/reference_workloads.json) — reference workload definitions.
+
+---
+
+## License and use
+
+QIHSE is licensed under **AGPL-3.0**. Read [LICENSE](LICENSE) before use.
+
+Personal, research, and compliant self-hosted use is welcome under the license. Commercial, proprietary, closed-source, hosted, or derivative use requires written permission or a separate license first.
+
+I am approachable: contact me before using QIHSE commercially and we can discuss terms. Unauthorized commercial use, relicensing, removal of attribution, or repackaging outside the license is not permitted and will be pursued to the maximum extent of the law.
