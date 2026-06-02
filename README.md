@@ -490,10 +490,8 @@ The project is stronger when it is honest: QIHSE is a technical showcase and res
 
 ## License and use
 
-QIHSE is distributed under the top-level repository license: **AGPL-3.0**. Read [LICENSE](LICENSE) before using, modifying, hosting, redistributing, or building derivative work from this repository.
+QIHSE is licensed under **AGPL-3.0**. Read [LICENSE](LICENSE) before use.
 
-This is strong copyleft. Network use, redistribution, modification, and derivative use carry obligations. Do not treat this repository as permissive code. If your intended use is proprietary, closed-source, commercial, hosted, or otherwise incompatible with AGPL compliance, obtain written permission or a separate license from the repository owner first.
+Personal, research, and compliant self-hosted use is welcome under the license. Commercial, proprietary, closed-source, hosted, or derivative use requires written permission or a separate license first.
 
-Unlicensed use outside the terms of the repository license is not authorized. Keep it clean: respect the license, attribute properly, and do not repackage the work as your own.
-
-**Release hygiene note:** if this repository is made broadly public, normalize any legacy per-file license boilerplate so the top-level licensing signal is unambiguous.
+I am approachable: contact me before using QIHSE commercially and we can discuss terms. Unauthorized commercial use, relicensing, removal of attribution, or repackaging outside the license is not permitted and will be pursued to the maximum extent of the law.
