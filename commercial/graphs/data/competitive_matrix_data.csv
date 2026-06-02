@@ -1,0 +1,6 @@
+technology,performance_speedup,cost_efficiency_points,category
+QIHSE_AVX2,7.0,29.0,QIHSE
+QIHSE_Full_HW,20.0,54.0,QIHSE
+ALEX,2.5,2.8,Learned_Index
+RAPIDS,7.5,3.0,GPU_Database
+SmartNIC,15.0,3.0,Specialized_HW

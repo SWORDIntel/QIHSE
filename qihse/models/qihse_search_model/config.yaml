@@ -1,0 +1,188 @@
+# QIHSE Model Training Configuration
+
+# Model Architecture Configuration
+model:
+  input_dim: 768                    # Input vector dimensionality (e.g., BERT embeddings)
+  rff_features: 512                 # Number of random Fourier features
+  kernel_type: "rbf"               # Kernel type: "rbf", "laplacian", "cauchy"
+  num_states: 10000                # Maximum superposition states
+  vector_dim: 128                  # Dimension per state vector
+  grover_iterations: 8             # Maximum Grover amplification iterations
+
+# Training Configuration
+training:
+  max_epochs: 100                  # Maximum training epochs
+  batch_size: 256                  # Training batch size
+  learning_rate: 0.001             # Initial learning rate
+  weight_decay: 1e-4               # Weight decay for regularization
+  margin: 0.2                      # Triplet loss margin
+  triplet_weight: 1.0              # Weight for triplet loss
+  param_weight: 0.1                # Weight for parameter prediction loss
+
+  # Learning rate scheduler
+  scheduler_t0: 10                 # Cosine annealing period
+  scheduler_t_mult: 2              # Period multiplier
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10                   # Epochs to wait before stopping
+
+  # Checkpointing
+  checkpoint_dir: "checkpoints"    # Directory for model checkpoints
+
+  # Hardware acceleration
+  accelerator: "auto"              # PyTorch Lightning accelerator
+  devices: "auto"                  # Number of devices
+  strategy: "auto"                 # Training strategy
+
+  # Progress and logging
+  progress_bar: true               # Enable progress bar
+
+# Data Configuration
+data:
+  train_samples: 1000000           # Number of training samples
+  val_samples: 100000              # Number of validation samples
+  num_workers: 8                   # Data loading workers
+
+# ML Optimization Configuration
+optimization:
+  num_arms: 10                     # Number of Thompson sampling arms
+  alpha: 1.0                       # Thompson sampling alpha
+  beta: 1.0                        # Thompson sampling beta
+  parameter_dims:                  # Parameter dimensions to optimize
+    - "precision"                  # Quantization precision
+    - "device"                     # Device selection
+    - "batch_size"                 # Batch size
+    - "rff_features"               # RFF feature count
+
+# Logging Configuration
+logging:
+  wandb:
+    enabled: true
+    project: "qihse-search-model"
+    entity: "dsmil-system"
+
+# Export Configuration
+export:
+  output_dir: "exported_model"      # Directory for exported model
+  quantization:
+    enabled: true
+    precision_levels: ["FP32", "FP16", "INT8", "INT4"]
+  device_targets: ["CPU", "NPU", "GPU"]
+
+# Evaluation Configuration
+evaluation:
+  benchmarks:
+    - name: "SIFT1M"
+      dataset: "sift"
+      dimensions: 128
+      num_queries: 10000
+      ground_truth: "sift_groundtruth.ivecs"
+
+    - name: "GIST1M"
+      dataset: "gist"
+      dimensions: 960
+      num_queries: 1000
+      ground_truth: "gist_groundtruth.ivecs"
+
+    - name: "MSMARCO"
+      dataset: "msmarco"
+      dimensions: 768
+      num_queries: 5000
+      ground_truth: "msmarco_dev_queries.tsv"
+
+  metrics:
+    - "recall@1"
+    - "recall@10"
+    - "recall@100"
+    - "ndcg@10"
+    - "ndcg@100"
+    - "qps"                        # Queries per second
+    - "latency_p50"                # 50th percentile latency
+    - "latency_p95"                # 95th percentile latency
+    - "latency_p99"                # 99th percentile latency
+
+# Hardware Configuration
+hardware:
+  cpu:
+    enabled: true
+    threads: 16
+    affinity: "numa"               # NUMA-aware scheduling
+
+  npu:
+    enabled: true
+    device: "NPU"                  # OpenVINO device name
+    batch_size: 16
+    precision: "FP16"
+
+  gpu:
+    enabled: true
+    device: 0                      # GPU device ID
+    memory_limit: 0.8              # Memory limit (fraction)
+    precision: "FP16"
+
+# Quantization Configuration
+quantization:
+  enabled: true
+  calibration:
+    samples: 10000                 # Calibration samples
+    method: "percentile"           # Calibration method
+    percentile: 99.9               # Percentile for clipping
+
+  precision_ladder:
+    - name: "FP32"
+      accuracy_threshold: 1.0      # 100% accuracy target
+      performance_multiplier: 1.0
+
+    - name: "FP16"
+      accuracy_threshold: 0.99     # 99% accuracy target
+      performance_multiplier: 2.0
+
+    - name: "INT8"
+      accuracy_threshold: 0.95     # 95% accuracy target
+      performance_multiplier: 4.0
+
+    - name: "INT4"
+      accuracy_threshold: 0.90     # 90% accuracy target
+      performance_multiplier: 8.0
+
+# Verification Configuration
+verification:
+  enabled: true
+  mode: "FAST"                     # Verification mode: NONE, FAST, WINDOW, FALLBACK, EXACT
+  sampling_rate: 0.01              # Fraction of queries to verify (1%)
+  tolerance: 0.05                  # Acceptable error tolerance
+  fallback_threshold: 0.1          # Threshold for fallback activation
+
+# Deployment Configuration
+deployment:
+  container:
+    enabled: true
+    base_image: "intel/oneapi:2023.0.0"
+    openvino_version: "2023.0.0"
+
+  kubernetes:
+    enabled: false
+    namespace: "qihse-system"
+    replicas: 3
+    resources:
+      limits:
+        cpu: "8"
+        memory: "32Gi"
+        intel.com/npu: "1"
+      requests:
+        cpu: "4"
+        memory: "16Gi"
+
+  monitoring:
+    enabled: true
+    prometheus_endpoint: "/metrics"
+    metrics_interval: 30           # Metrics collection interval (seconds)
+
+# Development Configuration
+development:
+  debug_mode: false
+  profile_memory: false
+  profile_performance: true
+  save_intermediates: false        # Save intermediate tensors for debugging
