@@ -263,7 +263,6 @@ def main_tui(stdscr):
 
 
 def main():
-    os.chdir(BUILD_DIR)
     # Ensure terminal is large enough
     try:
         return curses.wrapper(main_tui)
