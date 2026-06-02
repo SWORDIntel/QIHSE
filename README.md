@@ -1,5 +1,6 @@
-# QIHSE
-
+<p align="center">
+  <img src="docs/QIHSE.png" alt="QIHSE logo" width="720">
+</p>
 <div align="center">
 
 ## Quantum-Inspired Hilbert Space Expansion Search
