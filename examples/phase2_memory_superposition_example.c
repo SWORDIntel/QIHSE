@@ -11,9 +11,9 @@
  * integration for optimal performance in QIHSE search operations.
  */
 
-#include "../qihse.h"
+#include "qihse.h"
 #include "../memory/include/qihse_uma.h"
-#include "../qihse_vector_db.h"
+#include "qihse_vector_db.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

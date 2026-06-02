@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+qihse-db - Command-line interface for QIHSE vector database.
+
+Usage:
+    qihse-db create --dims 128 --path /data/mydb
+    qihse-db insert --db /data/mydb --vectors vectors.npy --ids ids.npy
+    qihse-db build-graph --db /data/mydb --M 16
+    qihse-db search --db /data/mydb --query query.npy --k 10
+    qihse-db stats --db /data/mydb
+"""
+
+import argparse
+import os
+import sys
+import numpy as np
+import time
+
+# Ensure libqihse.so is findable
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("LD_LIBRARY_PATH", _SCRIPT_DIR)
+
+# Add python/ to path so we can import qihse
+sys.path.insert(0, os.path.join(_SCRIPT_DIR, "python"))
+
+try:
+    import qihse
+except ImportError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    print("Build the shared library first: make lib", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_create(args):
+    if os.path.exists(args.path):
+        print(f"Error: path already exists: {args.path}", file=sys.stderr)
+        sys.exit(1)
+    db = qihse.VectorDB.create(args.path, dims=args.dims)
+    db.close()
+    print(f"Created VectorDB at {args.path} (dims={args.dims})")
+
+
+def cmd_insert(args):
+    vectors = np.load(args.vectors)
+    ids = None
+    if args.ids:
+        ids = np.load(args.ids).tolist()
+    db = qihse.VectorDB.open(args.db)
+    db.add_vectors(vectors, ids=ids)
+    db.flush()
+    db.close()
+    print(f"Inserted {len(vectors)} vectors into {args.db}")
+
+
+def cmd_build_graph(args):
+    db = qihse.VectorDB.open(args.db)
+    t0 = time.time()
+    db.build_graph(M=args.M, ef_construction=args.ef_construction)
+    elapsed = time.time() - t0
+    db.close()
+    print(f"Built graph index in {elapsed:.3f}s (M={args.M}, efConstruction={args.ef_construction})")
+
+
+def cmd_build_int8(args):
+    db = qihse.VectorDB.open(args.db)
+    t0 = time.time()
+    db.build_int8()
+    elapsed = time.time() - t0
+    db.close()
+    print(f"Built INT8 index in {elapsed:.3f}s")
+
+
+def cmd_search(args):
+    query = np.load(args.query)
+    if query.ndim == 2:
+        query = query[0]
+    db = qihse.VectorDB.open(args.db)
+    t0 = time.time()
+    results = db.search(query, k=args.k, metric=qihse.DistanceMetric[args.metric.upper()])
+    elapsed = time.time() - t0
+    db.close()
+    print(f"Search results (k={args.k}, metric={args.metric}, {elapsed*1000:.3f} ms):")
+    for r in results:
+        print(f"  id={r.id}  score={r.score:.6f}")
+
+
+def cmd_stats(args):
+    db = qihse.VectorDB.open(args.db)
+    # TODO: expose stats through Python wrapper
+    print(f"Stats for {args.db}:")
+    print(f"  dims: {db.dims}")
+    db.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="QIHSE Vector Database CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p = subparsers.add_parser("create", help="Create a new database")
+    p.add_argument("--path", required=True, help="Database directory path")
+    p.add_argument("--dims", type=int, required=True, help="Vector dimensions")
+
+    p = subparsers.add_parser("insert", help="Insert vectors into a database")
+    p.add_argument("--db", required=True, help="Database directory path")
+    p.add_argument("--vectors", required=True, help="NPY file with vectors (N x dims)")
+    p.add_argument("--ids", help="Optional NPY file with uint64 IDs")
+
+    p = subparsers.add_parser("build-graph", help="Build graph index sidecar")
+    p.add_argument("--db", required=True, help="Database directory path")
+    p.add_argument("--M", type=int, default=16, help="Max neighbors per node")
+    p.add_argument("--ef-construction", type=int, default=200, help="Beam width during build")
+
+    p = subparsers.add_parser("build-int8", help="Build INT8 quantization sidecar")
+    p.add_argument("--db", required=True, help="Database directory path")
+
+    p = subparsers.add_parser("search", help="Search nearest neighbors")
+    p.add_argument("--db", required=True, help="Database directory path")
+    p.add_argument("--query", required=True, help="NPY file with query vector")
+    p.add_argument("--k", type=int, default=10, help="Number of results")
+    p.add_argument("--metric", default="cosine", choices=["cosine", "euclidean", "dot"])
+
+    p = subparsers.add_parser("stats", help="Show database statistics")
+    p.add_argument("--db", required=True, help="Database directory path")
+
+    args = parser.parse_args()
+    globals()[f"cmd_{args.command.replace('-', '_')}"](args)
+
+
+if __name__ == "__main__":
+    main()

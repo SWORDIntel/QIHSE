@@ -1,3 +1,67 @@
+================================================================================
+                          NOTICE: COMMERCIAL COMPLIANCE POLICY
+================================================================================
+
+QIHSE is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+This license is INTENTIONALLY STRONG COPYLEFT. Read it carefully.
+
+TECHNICAL SHOWCASE STATUS
+-------------------------
+This repository is published as a technical demonstration of quantum-inspired
+vector search architecture. You are welcome to study, evaluate, and experiment
+with the code for research, educational, and non-commercial purposes.
+
+COMMERCIAL USE RESTRICTIONS
+---------------------------
+ANY commercial deployment, hosting-as-a-service, or internal production use of
+this software — in whole or in part — REQUIRES strict compliance with AGPL-3.0.
+Specifically, you MUST:
+
+  1. Provide the COMPLETE corresponding source code to ALL users who interact
+     with the software over a network (Section 13 of the AGPL).
+  2. License your ENTIRE combined work under AGPL-3.0 (Sections 4, 5).
+  3. Preserve ALL copyright notices, warranty disclaimers, and license terms
+     (Section 7).
+  4. Make the source available under the same terms — no additional restrictions,
+     no proprietary wrappers, no SaaS shell games.
+
+NON-COMPLIANCE CONSEQUENCES
+---------------------------
+Failure to comply with the above obligations constitutes COPYRIGHT INFRINGEMENT.
+The copyright holder reserves the right to pursue ALL available legal remedies,
+including but not limited to injunctive relief, statutory damages, and attorneys'
+fees. There will be NO WARNINGS. There will be NO SETTLEMENTS without full
+source publication. If you use this code commercially and fail to meet AGPL
+obligations, you WILL face enforcement action.
+
+THIS IS NOT A PERMISSIVE LICENSE. THIS IS NOT MIT. THIS IS NOT APACHE.
+This is AGPL-3.0. Act accordingly.
+
+COMMERCIAL LICENSING ALTERNATIVE
+----------------------------------
+If you wish to use QIHSE in a closed-source or commercial SaaS product WITHOUT
+releasing your entire codebase under AGPL-3.0, a commercial license is available.
+
+Standard commercial terms start at **25% of gross revenue** derived from the
+product or service incorporating this software, with annual true-ups and audit
+rights reserved. These terms are intentionally set high to encourage AGPL
+compliance. I am open to negotiation for genuine startups, non-profits, academic
+spin-outs, and serious commercial ventures — but you must reach out first.
+
+INTENTIONALLY UNREASONABLE COMPLIANCE PATH
+-------------------------------------------
+If you choose to comply with AGPL-3.0 rather than negotiate a commercial
+license, be aware that the copyright holder reserves the right to require that
+THEY be the primary recipient of the COMPLETE corresponding source code,
+INCLUDING all revisions, derivative works, and future modifications, delivered
+in full and without redaction. This path is deliberately designed to be more
+burdensome than a simple conversation. If you have a real use case, email me.
+
+Contact: intel@swordintelligence.airforce
+(Domain was a gift — not affiliated with any military organisation.)
+
+================================================================================
+
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 

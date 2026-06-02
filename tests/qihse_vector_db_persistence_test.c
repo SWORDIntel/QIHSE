@@ -4,7 +4,7 @@
 
 #include "../core/qihse_abi.h"
 #include "../memory/include/qihse_memory.h"
-#include "../qihse_vector_db.h"
+#include "qihse_vector_db.h"
 
 #include <dirent.h>
 #include <errno.h>

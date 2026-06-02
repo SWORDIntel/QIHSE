@@ -15,7 +15,7 @@
 #ifndef QIHSE_ANCHOR_H
 #define QIHSE_ANCHOR_H
 
-#include "../qihse.h"
+#include "qihse.h"
 #include "qihse_anchor_search.h"
 
 #ifdef __cplusplus
