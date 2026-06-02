@@ -1,28 +1,59 @@
+1d7849e 2026-06-02 On main: temp before history rewrite
+da68017 2026-06-02 index on main: eeb445d chore: track all files from merged branches (codex, framewerx, readme-showcase)
+cee0530 2026-06-02 Cascade snapshot 2026-06-02T10:53:38.616213342Z
+fac53bf 2026-06-02 Cascade snapshot 2026-06-02T10:53:38.616213342Z
+319f0d6 2026-06-02 chore: track all files from merged branches (codex, framewerx, readme-showcase)
+eeb445d 2026-06-02 chore: track all files from merged branches (codex, framewerx, readme-showcase)
+b2039a2 2026-06-02 Merge remote-tracking branch 'origin/codex/qihse-file-persistence'
 0a9126b 2026-06-02 Merge remote-tracking branch 'origin/codex/qihse-file-persistence'
+a3189aa 2026-06-02 Cascade snapshot 2026-06-02T09:47:01.631299873Z
 b7d6555 2026-06-02 Cascade snapshot 2026-06-02T09:47:01.631299873Z
 c88376a 2026-06-02 feat: hierarchical storage management with automatic hot/cold tiering
+29e3716 2026-06-02 feat: hierarchical storage management with automatic hot/cold tiering
 714e885 2026-05-18 Update README.md
+959cddb 2026-05-18 Update README.md
 5add142 2026-05-18 chore: include remaining docs, build, and runtime updates
+1f516f6 2026-05-18 chore: include remaining docs, build, and runtime updates
 1018390 2026-05-18 docs: finalize native vector DB API contracts and usage docs
+de7bc61 2026-05-18 docs: finalize native vector DB API contracts and usage docs
 122a2d4 2026-05-18 Add opt-in qmag bypass mode for approximate-only search
+fa78d7d 2026-05-18 Add opt-in qmag bypass mode for approximate-only search
 392648b 2026-05-18 Add randomized trinary sweep helper and docs
+5051fce 2026-05-18 Add randomized trinary sweep helper and docs
 76e6fa1 2026-05-18 docs: highlight statistically validated trinary win conditions
+5876c4a 2026-05-18 docs: highlight statistically validated trinary win conditions
 9ef5edc 2026-05-18 meta: fix project name typo Hilbert
+1050301 2026-05-18 meta: fix project name typo Hilbert
 de02991 2026-05-18 docs: expand README project name to Quantum Inspire dHilbert
+8d181d6 2026-05-18 docs: expand README project name to Quantum Inspire dHilbert
 52bdf95 2026-05-18 meta: set version string to full Quantum Inspire name
+18cc343 2026-05-18 meta: set version string to full Quantum Inspire name
 0cf86af 2026-05-18 docs: add native build helper and fix mermaid diagrams
+0e86081 2026-05-18 docs: add native build helper and fix mermaid diagrams
 78524f0 2026-05-18 build: add workspace bootstrap/cleanup targets for ignored artifacts
+edb1623 2026-05-18 build: add workspace bootstrap/cleanup targets for ignored artifacts
 33d8530 2026-05-18 docs: fix Mermaid line breaks for GitHub render
+a47ccb3 2026-05-18 docs: fix Mermaid line breaks for GitHub render
 c00084d 2026-05-18 docs: add mermaid persistence lifecycle diagram
+f0e59a8 2026-05-18 docs: add mermaid persistence lifecycle diagram
 e6b7e2b 2026-05-18 docs: add mermaid architecture snapshot to README
+f83432f 2026-05-18 docs: add mermaid architecture snapshot to README
 57c6b6c 2026-05-18 docs: balance README wow-factor with developer clarity
+690823f 2026-05-18 docs: balance README wow-factor with developer clarity
 66e368e 2026-05-18 docs: condense README to concise, non-dense format
+afcca16 2026-05-18 docs: condense README to concise, non-dense format
 9252996 2026-05-18 docs: expand README with stronger code showcase
+8441edd 2026-05-18 docs: expand README with stronger code showcase
 7a6e13b 2026-05-18 docs: rewrite README and switch to AGPL license
+9c2dd25 2026-05-18 docs: rewrite README and switch to AGPL license
 d9a3fb9 2026-05-18 chore: move root-level test executables into tests directory
+2c25be2 2026-05-18 chore: move root-level test executables into tests directory
 db004a2 2026-05-18 docs: advertise trinary persistence and finalize memory planner plumbing
+15d8eb8 2026-05-18 docs: advertise trinary persistence and finalize memory planner plumbing
 09247c6 2026-05-18 docs: add finalization plan for upstream and persistence
+2ce8720 2026-05-18 docs: add finalization plan for upstream and persistence
 afbe8ae 2026-05-18 Merge pull request #1 from SWORDIntel/framewerx-sync
+2c71820 2026-05-18 Merge pull request #1 from SWORDIntel/framewerx-sync
 2cdfa91 2026-05-18 Finalize qihse persistence workload and upstream handoff loop
 61be8c0 2026-05-18 docs: refresh persistence checkpoint status after continuation
 3ebcf54 2026-05-18 Add next-slice execution plan for remaining persistence milestones
@@ -56,52 +87,78 @@ ffdcbda 2026-05-17 Prototype QIHSE magnitude trinary scoring
 8389f67 2026-05-17 Add QIHSE trinary candidate sweep benchmark
 a81deb1 2026-05-17 Add opt-in QIHSE trinary search path
 cf464f4 2026-05-17 Merge QIHSE branch into FRAMEWERX master
+289ad66 2026-05-17 Expand QIHSE trinary search benchmark datasets
 b446538 2026-05-17 Expand QIHSE trinary search benchmark datasets
 5bf3d28 2026-05-17 Expand QIHSE trinary search benchmark datasets
+d1f292e 2026-05-17 Add QIHSE compaction recovery coverage
 b87150a 2026-05-17 Add QIHSE compaction recovery coverage
 ddec756 2026-05-17 Add QIHSE compaction recovery coverage
+20fe5dc 2026-05-17 Implement physical QIHSE compaction
 b8a37a3 2026-05-17 Implement physical QIHSE compaction
 1b4f3f3 2026-05-17 Implement physical QIHSE compaction
+8baa210 2026-05-17 Add mutation WAL replay and trinary search benchmark
 7df0e3e 2026-05-17 Add mutation WAL replay and trinary search benchmark
 a86a756 2026-05-17 Add mutation WAL replay and trinary search benchmark
+f6aef51 2026-05-17 Implement QIHSE mutation APIs and DB trinary benchmark
 bf933cc 2026-05-17 Implement QIHSE mutation APIs and DB trinary benchmark
 03f1f60 2026-05-17 Implement QIHSE mutation APIs and DB trinary benchmark
+bdac79c 2026-05-17 Update QIHSE persistence plan checkpoint
 0fe36b0 2026-05-17 Update QIHSE persistence plan checkpoint
 572ebf1 2026-05-17 Stage mutation APIs and extend mmap benchmarks
+53ee261 2026-05-17 Stage mutation APIs and extend mmap benchmarks
 8b6defb 2026-05-17 Stage mutation APIs and extend mmap benchmarks
+3aff570 2026-05-17 Update QIHSE persistence checkpoint
 45e9f1e 2026-05-17 Update QIHSE persistence checkpoint
 67be8a7 2026-05-17 Extend mmap and trinary candidate work
+a5f8a0a 2026-05-17 Extend mmap and trinary candidate work
 e194479 2026-05-17 Extend mmap and trinary candidate work
 9483006 2026-05-17 Continue QIHSE persistence roadmap
+bcf5473 2026-05-17 Continue QIHSE persistence roadmap
 c5c8cec 2026-05-17 Continue QIHSE persistence roadmap
 d12e59a 2026-05-17 Harden QIHSE WAL recovery
+a9de62d 2026-05-17 Harden QIHSE WAL recovery
 906e84b 2026-05-17 Harden QIHSE WAL recovery
 fb6b7b1 2026-05-17 Add native QIHSE file persistence
+985c719 2026-05-17 Add native QIHSE file persistence
 560d65a 2026-05-17 Add native QIHSE file persistence
 ffa291b 2026-05-11 Fix: Flesh out stubs, resolve unused parameter warnings, and fix calloc arguments in C core
+292a804 2026-05-11 Fix: Flesh out stubs, resolve unused parameter warnings, and fix calloc arguments in C core
 0a24811 2026-05-11 Fix: Flesh out stubs, resolve unused parameter warnings, and fix calloc arguments in C core
 fd5e422 2026-04-28 Make SIMD backends opt-in for native builds
+f0e43d2 2026-04-28 Make SIMD backends opt-in for native builds
 206e758 2026-04-28 Make SIMD backends opt-in for native builds
 5ec0563 2026-04-07 feat: implement actual priority pinning logic for Linux UMA
+8abf567 2026-04-07 feat: implement actual priority pinning logic for Linux UMA
 87ae9d9 2026-04-07 feat: implement actual priority pinning logic for Linux UMA
+3c98e40 2026-03-24 Include QIHSE PGP public key for secure verification
 dda32d7 2026-03-24 Include QIHSE PGP public key for secure verification
 c494b56 2026-03-24 Synchronize Makefile with CUDA backend and update binaries
+bcd1df6 2026-03-24 Synchronize Makefile with CUDA backend and update binaries
 977554b 2026-03-24 Synchronize Makefile with CUDA backend and update binaries
+fb37f8c 2026-03-24 Update documentation with 52x speedup results and finalize CI/CD infrastructure
 1991835 2026-03-24 Update documentation with 52x speedup results and finalize CI/CD infrastructure
 b85fb90 2026-03-24 Implement native accelerated hooks, industry benchmarks, and Python bindings
+4416780 2026-03-24 Implement native accelerated hooks, industry benchmarks, and Python bindings
 10a8be1 2026-03-24 Implement native accelerated hooks, industry benchmarks, and Python bindings
 8ce6a35 2026-03-24 Finalize QIHSE ecosystem: Consolidate documentation, implement AVX2 chunking, and tune accuracy/speed balance
+9025dfe 2026-03-24 Finalize QIHSE ecosystem: Consolidate documentation, implement AVX2 chunking, and tune accuracy/speed balance
 5455326 2026-03-24 Finalize QIHSE ecosystem: Consolidate documentation, implement AVX2 chunking, and tune accuracy/speed balance
 501e221 2026-03-23 Fix memory safety issues and integrate heterogeneous compute pipeline (NPU/GPU)
+a1f6f88 2026-03-23 Fix memory safety issues and integrate heterogeneous compute pipeline (NPU/GPU)
 c288351 2026-03-23 Fix memory safety issues and integrate heterogeneous compute pipeline (NPU/GPU)
 e24c709 2026-03-21 Native exports consolidation for Python ctypes compatibility
+fc715f3 2026-03-21 Native exports consolidation for Python ctypes compatibility
 1dcf12c 2026-03-21 Native exports consolidation for Python ctypes compatibility
 01e2fc1 2026-03-21 Final native reconciliation: Dynamic ISA dispatch, explicit exports for ctypes, and build cleanup
+8d0f235 2026-03-21 Final native reconciliation: Dynamic ISA dispatch, explicit exports for ctypes, and build cleanup
 34811d7 2026-03-21 Final native reconciliation: Dynamic ISA dispatch, explicit exports for ctypes, and build cleanup
 ac51596 2026-03-21 Modularize QIHSE core, add AVX-VNNI support, and fix ISA-specific crashes
+77fd2b1 2026-03-21 Modularize QIHSE core, add AVX-VNNI support, and fix ISA-specific crashes
 9d1b2f4 2026-03-21 Modularize QIHSE core, add AVX-VNNI support, and fix ISA-specific crashes
 772af2c 2026-03-21 Update UMA and vector DB behavior
+862ca4b 2026-03-21 Update UMA and vector DB behavior
 d7cd50e 2026-03-21 Update UMA and vector DB behavior
+34679d7 2026-01-20 Update README.md
 e4142d4 2026-01-20 Update README.md
 2bdc542 2026-01-12 Reorganize: Move QIHSE under libs/search_algorithms as parent directory
 baf8120 2026-01-12 Reorganize: Move QIHSE under libs/search_algorithms as parent directory

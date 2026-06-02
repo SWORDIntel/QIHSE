@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 
-BUILD_DIR = os.path.dirname(os.path.abspath(__file__))
+BUILD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
 # Configuration state
