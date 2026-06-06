@@ -3,7 +3,7 @@
 
 CC=gcc
 
-CFLAGS_BASE=-std=c99 -Wall -Wextra -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I/home/john/Documents/msnet/c -fPIC -lm -pthread -D_GNU_SOURCE -O3
+CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I/home/john/Documents/msnet/c -fPIC -lm -pthread -D_GNU_SOURCE -O3
 QIHSE_CFLAGS_EXTRA?=
 
 # CPU-specific SIMD backend selection.

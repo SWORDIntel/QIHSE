@@ -7,7 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-
+#include <sys/mman.h>
 struct qihse_event_stream {
     char *log_directory;
 };
@@ -33,17 +33,45 @@ void qihse_event_stream_destroy(qihse_event_stream_t* stream) {
 
 bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, const uint8_t* payload, size_t size) {
     if (!stream || !topic || !payload) return false;
+    if (size == 0) return true;
     
     char filepath[1024];
     snprintf(filepath, sizeof(filepath), "%s/%s.log", stream->log_directory, topic);
     
-    FILE* f = fopen(filepath, "ab");
-    if (!f) return false;
+    int fd = open(filepath, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return false;
     
-    size_t written = fwrite(payload, 1, size, f);
-    fclose(f);
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return false;
+    }
     
-    return written == size;
+    off_t old_size = st.st_size;
+    if (ftruncate(fd, old_size + size) < 0) {
+        close(fd);
+        return false;
+    }
+    
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    off_t pa_offset = old_size & ~(page_size - 1);
+    size_t map_size = size + (old_size - pa_offset);
+    
+    void* map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, pa_offset);
+    if (map == MAP_FAILED) {
+        if (ftruncate(fd, old_size) < 0) {
+            // Ignore ftruncate rollback error
+        }
+        close(fd);
+        return false;
+    }
+    
+    memcpy((char*)map + (old_size - pa_offset), payload, size);
+    
+    munmap(map, map_size);
+    close(fd);
+    
+    return true;
 }
 
 bool qihse_event_stream_consume_zero_copy(qihse_event_stream_t* stream, const char* topic, uint64_t offset, int network_socket_fd, size_t count) {

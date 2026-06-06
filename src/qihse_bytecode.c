@@ -49,8 +49,13 @@ bool qihse_bytecode_eval(const uint8_t* bytecode, const void* metadata) {
                 
                 // Scaffold: Read null-terminated string directly from bytecode
                 const char* str = (const char*)&bytecode[pc];
-                size_t len = strlen(str);
-                pc += len + 1; // Advance past the string and the null terminator
+                size_t len = strnlen(str, 4096);
+                pc += len;
+                if (str[len] == '\0') {
+                    pc += 1; // Advance past the null terminator
+                } else {
+                    return false; // Error: string exceeds maximum length or is not null-terminated
+                }
 
                 stack[sp].type = VAL_STR;
                 stack[sp].as.s = str;
