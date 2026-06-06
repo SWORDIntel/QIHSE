@@ -20,13 +20,67 @@ struct qihse_tsdb {
     
     qihse_padded_atomic_t head;
     qihse_padded_atomic_t tail;
+    
+    uint64_t ttl_ms;
 };
+
+typedef struct {
+    uint8_t* buf;
+    size_t bit_pos;
+    size_t max_bits;
+} bit_stream_t;
+
+static inline void bw_write(bit_stream_t* bw, uint64_t val, int bits) {
+    while (bits > 0) {
+        size_t byte_idx = bw->bit_pos / 8;
+        if (byte_idx >= bw->max_bits / 8) return;
+        int bit_idx = bw->bit_pos % 8;
+        int bits_to_write = 8 - bit_idx;
+        if (bits_to_write > bits) bits_to_write = bits;
+        
+        uint64_t mask = (1ULL << bits_to_write) - 1;
+        int shift = bits - bits_to_write;
+        uint64_t extracted = (shift == 64) ? 0 : ((val >> shift) & mask);
+        
+        bw->buf[byte_idx] |= (uint8_t)(extracted << (8 - bit_idx - bits_to_write));
+        
+        bw->bit_pos += bits_to_write;
+        bits -= bits_to_write;
+    }
+}
+
+static inline uint64_t br_read(bit_stream_t* br, int bits) {
+    uint64_t res = 0;
+    while (bits > 0) {
+        size_t byte_idx = br->bit_pos / 8;
+        if (byte_idx >= br->max_bits / 8) return res;
+        int bit_idx = br->bit_pos % 8;
+        int bits_to_read = 8 - bit_idx;
+        if (bits_to_read > bits) bits_to_read = bits;
+        
+        uint64_t mask = (1ULL << bits_to_read) - 1;
+        int shift = 8 - bit_idx - bits_to_read;
+        uint64_t extracted = (br->buf[byte_idx] >> shift) & mask;
+        
+        res = (res << bits_to_read) | extracted;
+        
+        br->bit_pos += bits_to_read;
+        bits -= bits_to_read;
+    }
+    return res;
+}
+
+static inline int64_t sign_extend(uint64_t val, int bits) {
+    uint64_t mask = 1ULL << (bits - 1);
+    return (int64_t)((val ^ mask) - mask);
+}
 
 qihse_tsdb_t* qihse_tsdb_create() {
     qihse_tsdb_t* tsdb = (qihse_tsdb_t*)malloc(sizeof(qihse_tsdb_t));
     if (tsdb) {
         tsdb->chunk_head = NULL;
         tsdb->chunk_tail = NULL;
+        tsdb->ttl_ms = 0;
         atomic_init(&tsdb->head.index, 0);
         atomic_init(&tsdb->tail.index, 0);
     }
@@ -65,26 +119,81 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
     new_chunk->series_id = tsdb->cache[start_idx].series_id;
     new_chunk->next = NULL;
     
+    bit_stream_t bs = { (uint8_t*)new_chunk->compressed_lanes, 0, sizeof(new_chunk->compressed_lanes) * 8 };
+    
     uint32_t count = 0;
-    while (tail < head && count < (16 * 256 / sizeof(double))) {
+    uint64_t t_prev = new_chunk->start_timestamp;
+    int64_t d_prev = 0;
+    uint64_t v_prev = 0;
+    int prev_lz = 0;
+    int prev_tz = 0;
+    
+    while (tail < head) {
         uint64_t idx = tail % QIHSE_RING_SIZE;
+        uint64_t t = tsdb->cache[idx].timestamp;
+        double v_d = tsdb->cache[idx].value;
+        uint64_t v;
+        memcpy(&v, &v_d, sizeof(double));
         
-        /* 
-         * Structure the data into the 16 independent 256-byte lanes.
-         * Establish the memory boundary writes to map to strided AVX-512 registers.
-         * Actual bit-twiddling (Gorilla XOR) is stubbed out.
-         */
-        uint8_t lane = count % 16;
-        size_t offset = (count / 16) * sizeof(double);
-        
-        if (offset + sizeof(double) <= 256) {
-            double val = tsdb->cache[idx].value;
-            memcpy(&new_chunk->compressed_lanes[lane][offset], &val, sizeof(double));
+        if (count == 0) {
+            bw_write(&bs, v, 64);
+            t_prev = t;
+            v_prev = v;
+        } else {
+            int64_t d = (int64_t)(t - t_prev);
+            int64_t dod = d - d_prev;
+            if (dod == 0) {
+                bw_write(&bs, 0, 1);
+            } else if (dod >= -63 && dod <= 64) {
+                bw_write(&bs, 2, 2);
+                bw_write(&bs, dod & 0x7F, 7);
+            } else if (dod >= -255 && dod <= 256) {
+                bw_write(&bs, 6, 3);
+                bw_write(&bs, dod & 0x1FF, 9);
+            } else if (dod >= -2047 && dod <= 2048) {
+                bw_write(&bs, 14, 4);
+                bw_write(&bs, dod & 0xFFF, 12);
+            } else {
+                bw_write(&bs, 15, 4);
+                bw_write(&bs, dod & 0xFFFFFFFF, 32);
+            }
+            t_prev = t;
+            d_prev = d;
+            
+            uint64_t xor_val = v ^ v_prev;
+            if (xor_val == 0) {
+                bw_write(&bs, 0, 1);
+            } else {
+                int lz = __builtin_clzll(xor_val);
+                int tz = __builtin_ctzll(xor_val);
+                if (lz >= 31) lz = 31;
+                
+                if (lz >= prev_lz && tz >= prev_tz) {
+                    bw_write(&bs, 2, 2);
+                    int len = 64 - prev_lz - prev_tz;
+                    bw_write(&bs, xor_val >> prev_tz, len);
+                } else {
+                    bw_write(&bs, 3, 2);
+                    bw_write(&bs, lz, 5);
+                    int len = 64 - lz - tz;
+                    if (len < 1) len = 1;
+                    if (len > 64) len = 64;
+                    bw_write(&bs, len - 1, 6);
+                    bw_write(&bs, xor_val >> tz, len);
+                    prev_lz = lz;
+                    prev_tz = tz;
+                }
+            }
+            v_prev = v;
         }
         
-        new_chunk->end_timestamp = tsdb->cache[idx].timestamp;
+        new_chunk->end_timestamp = t;
         tail++;
         count++;
+        
+        if (bs.bit_pos + 128 >= bs.max_bits) {
+            break;
+        }
     }
     
     new_chunk->count = count;
@@ -133,15 +242,65 @@ double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t 
             continue;
         }
         
-        /* TODO: Implement Gorilla XOR Unpacking here */
+        bit_stream_t bs = { (uint8_t*)curr->compressed_lanes, 0, sizeof(curr->compressed_lanes) * 8 };
+        uint64_t t_prev = curr->start_timestamp;
+        int64_t d_prev = 0;
+        uint64_t v_prev = 0;
+        int prev_lz = 0;
+        int prev_tz = 0;
+        
         for (uint32_t i = 0; i < curr->count; i++) {
-            uint8_t lane = i % 16;
-            size_t offset = (i / 16) * sizeof(double);
-            if (offset + sizeof(double) <= 256) {
-                double val;
-                memcpy(&val, &curr->compressed_lanes[lane][offset], sizeof(double));
-                /* Stub: adding all values since we lack timestamp unpacked per data point */
-                sum += val;
+            uint64_t t;
+            uint64_t v;
+            
+            if (i == 0) {
+                t = t_prev;
+                v = br_read(&bs, 64);
+                v_prev = v;
+            } else {
+                int64_t dod = 0;
+                if (br_read(&bs, 1) == 0) {
+                    dod = 0;
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 7), 7);
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 9), 9);
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 12), 12);
+                } else {
+                    dod = sign_extend(br_read(&bs, 32), 32);
+                }
+                
+                int64_t d = d_prev + dod;
+                t = t_prev + d;
+                t_prev = t;
+                d_prev = d;
+                
+                if (br_read(&bs, 1) == 0) {
+                    v = v_prev;
+                } else {
+                    if (br_read(&bs, 1) == 0) {
+                        int len = 64 - prev_lz - prev_tz;
+                        uint64_t xor_val = br_read(&bs, len);
+                        v = v_prev ^ (xor_val << prev_tz);
+                    } else {
+                        int lz = br_read(&bs, 5);
+                        int len = br_read(&bs, 6) + 1;
+                        uint64_t xor_val = br_read(&bs, len);
+                        int tz = 64 - lz - len;
+                        v = v_prev ^ (xor_val << tz);
+                        
+                        prev_lz = lz;
+                        prev_tz = tz;
+                    }
+                }
+                v_prev = v;
+            }
+            
+            if (t >= start_ts && t <= end_ts) {
+                double v_d;
+                memcpy(&v_d, &v, sizeof(double));
+                sum += v_d;
                 count++;
             }
         }
@@ -162,4 +321,35 @@ double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t 
     
     if (count == 0) return 0.0;
     return sum / (double)count;
+}
+
+void qihse_tsdb_set_ttl(qihse_tsdb_t* tsdb, uint64_t ttl_ms) {
+    if (tsdb) {
+        tsdb->ttl_ms = ttl_ms;
+    }
+}
+
+void qihse_tsdb_trim(qihse_tsdb_t* tsdb, uint64_t current_ts) {
+    if (!tsdb || tsdb->ttl_ms == 0) return;
+    
+    uint64_t expiry_ts = (current_ts > tsdb->ttl_ms) ? (current_ts - tsdb->ttl_ms) : 0;
+    
+    qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
+    
+    while (curr) {
+        if (curr->end_timestamp < expiry_ts) {
+            qihse_tsdb_chunk_t* to_free = curr;
+            curr = curr->next;
+            
+            if (tsdb->chunk_head == to_free) {
+                tsdb->chunk_head = curr;
+            }
+            if (tsdb->chunk_tail == to_free) {
+                tsdb->chunk_tail = NULL;
+            }
+            free(to_free);
+        } else {
+            break;
+        }
+    }
 }
