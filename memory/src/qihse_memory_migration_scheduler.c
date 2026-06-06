@@ -430,10 +430,14 @@ size_t qihse_memory_migration_scheduler_run(
             continue;
         }
 
-        requeue_candidate.buffer = task.buffer;
-        requeue_candidate.target_device = task.target_device;
-        requeue_candidate.target_type = task.target_type;
-        (void)qihse_memory_migration_scheduler_enqueue(scheduler, &requeue_candidate);
+        /* Apply failure penalty to prevent livelock */
+        task.buffer->residency_score *= 0.5;
+        if (task.buffer->residency_score > 0.1) {
+            requeue_candidate.buffer = task.buffer;
+            requeue_candidate.target_device = task.target_device;
+            requeue_candidate.target_type = task.target_type;
+            (void)qihse_memory_migration_scheduler_enqueue(scheduler, &requeue_candidate);
+        }
     }
 
     return executed;

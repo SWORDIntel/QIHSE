@@ -6,6 +6,7 @@ import ctypes
 import os
 import sys
 import numpy as np
+import threading
 from enum import IntEnum
 from typing import List, Optional, Tuple, Union
 
@@ -41,8 +42,8 @@ _VectorDB_p = ctypes.POINTER(_VectorDB)
 # ---------------------------------------------------------------------------
 class DistanceMetric(IntEnum):
     COSINE = 0
-    EUCLIDEAN = 1
-    DOT_PRODUCT = 2
+    DOT_PRODUCT = 1
+    EUCLIDEAN = 2
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +62,44 @@ _lib.qihse_vector_db_add_vectors.argtypes = [
     _VectorDB_p,
     ctypes.POINTER(ctypes.c_float),
     ctypes.c_size_t,
+    ctypes.c_size_t,
     ctypes.POINTER(ctypes.c_uint64),
     ctypes.POINTER(ctypes.c_void_p),
     ctypes.POINTER(ctypes.c_size_t),
 ]
 _lib.qihse_vector_db_add_vectors.restype = ctypes.c_bool
 
+class CVectorQuery(ctypes.Structure):
+    _fields_ = [
+        ("query_vector", ctypes.POINTER(ctypes.c_float)),
+        ("vector_dims", ctypes.c_size_t),
+        ("top_k", ctypes.c_size_t),
+        ("similarity_threshold", ctypes.c_float),
+        ("include_vectors", ctypes.c_bool),
+        ("include_metadata", ctypes.c_bool),
+        ("use_trinary_candidates", ctypes.c_bool),
+        ("candidate_count", ctypes.c_size_t),
+        ("query_mode", ctypes.c_int),
+        ("candidate_pool_size", ctypes.c_size_t),
+        ("distance_metric", ctypes.c_int),
+        ("metadata_filter", ctypes.c_void_p),
+        ("metadata_filter_opaque", ctypes.c_void_p),
+    ]
+
+class CVectorResult(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("score", ctypes.c_float),
+        ("vector", ctypes.POINTER(ctypes.c_float)),
+        ("vector_dims", ctypes.c_size_t),
+        ("metadata", ctypes.c_void_p),
+        ("metadata_size", ctypes.c_size_t),
+    ]
+
 _lib.qihse_vector_db_search.argtypes = [
     _VectorDB_p,
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_size_t,
-    ctypes.c_size_t,
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(CVectorQuery),
+    ctypes.POINTER(CVectorResult),
     ctypes.c_size_t,
 ]
 _lib.qihse_vector_db_search.restype = ctypes.c_int
@@ -84,19 +110,12 @@ _lib.qihse_vector_db_build_graph.restype = ctypes.c_bool
 _lib.qihse_vector_db_build_int8.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_build_int8.restype = ctypes.c_bool
 
-_lib.qihse_vector_db_get_persistence_stats.argtypes = [_VectorDB_p, ctypes.c_void_p]
-_lib.qihse_vector_db_get_persistence_stats.restype = ctypes.c_bool
-
 _lib.qihse_vector_db_flush.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_flush.restype = ctypes.c_bool
 
-_lib.qihse_vector_db_get_stats.argtypes = [_VectorDB_p, ctypes.c_void_p]
-_lib.qihse_vector_db_get_stats.restype = ctypes.c_bool
+_lib.qihse_start_pg_wire_server.argtypes = [_VectorDB_p, ctypes.c_uint16, ctypes.c_char_p]
+_lib.qihse_start_pg_wire_server.restype = ctypes.c_bool
 
-
-# ---------------------------------------------------------------------------
-# Python classes
-# ---------------------------------------------------------------------------
 class VectorResult:
     def __init__(self, id: int, score: float, vector: Optional[np.ndarray] = None):
         self.id = id
@@ -129,10 +148,10 @@ class VectorDB:
     def __init__(self, ptr: _VectorDB_p):
         self._ptr = ptr
         self._dims = 0
+        self._lock = threading.RLock()
 
     @staticmethod
     def create(path: str, dims: int) -> "VectorDB":
-        """Create a new file-backed vector database."""
         ptr = _lib.qihse_vector_db_create(0, None, path.encode("utf-8"))
         if not ptr:
             raise RuntimeError(f"Failed to create VectorDB at {path}")
@@ -142,7 +161,6 @@ class VectorDB:
 
     @staticmethod
     def open(path: str, read_only: bool = False) -> "VectorDB":
-        """Open an existing vector database."""
         flags = 0
         if read_only:
             flags |= 0x00000001
@@ -152,9 +170,10 @@ class VectorDB:
         return VectorDB(ptr)
 
     def close(self):
-        if self._ptr:
-            _lib.qihse_vector_db_destroy(self._ptr)
-            self._ptr = None
+        with self._lock:
+            if self._ptr:
+                _lib.qihse_vector_db_destroy(self._ptr)
+                self._ptr = None
 
     def __enter__(self):
         return self
@@ -165,39 +184,40 @@ class VectorDB:
     def add_vectors(
         self,
         vectors: np.ndarray,
-        ids: Optional[List[int]] = None,
-        metadata: Optional[List[bytes]] = None,
+        ids: Optional[list[int]] = None,
+        metadata: Optional[list[bytes]] = None,
     ) -> None:
-        """Add vectors to the database."""
-        vectors = np.asarray(vectors, dtype=np.float32)
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
-        n, dims = vectors.shape
-        self._dims = dims
-
-        ids_arr = None
-        if ids is not None:
-            ids_arr = (ctypes.c_uint64 * n)(*ids)
-
-        meta_ptrs = None
-        meta_sizes = None
-        if metadata is not None:
-            meta_ptrs = (ctypes.c_void_p * n)()
-            meta_sizes = (ctypes.c_size_t * n)()
-            for i, m in enumerate(metadata):
-                meta_ptrs[i] = ctypes.cast(ctypes.create_string_buffer(m), ctypes.c_void_p)
-                meta_sizes[i] = len(m)
-
-        ok = _lib.qihse_vector_db_add_vectors(
-            self._ptr,
-            vectors.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            n,
-            ids_arr,
-            meta_ptrs,
-            meta_sizes,
-        )
-        if not ok:
-            raise RuntimeError("Failed to add vectors")
+        with self._lock:
+            vectors = np.asarray(vectors, dtype=np.float32)
+            if vectors.ndim == 1:
+                vectors = vectors.reshape(1, -1)
+            n, dims = vectors.shape
+            self._dims = dims
+    
+            ids_arr = None
+            if ids is not None:
+                ids_arr = (ctypes.c_uint64 * n)(*ids)
+    
+            meta_ptrs = None
+            meta_sizes = None
+            if metadata is not None:
+                meta_ptrs = (ctypes.c_void_p * n)()
+                meta_sizes = (ctypes.c_size_t * n)()
+                for i, m in enumerate(metadata):
+                    meta_ptrs[i] = ctypes.cast(ctypes.create_string_buffer(m), ctypes.c_void_p)
+                    meta_sizes[i] = len(m)
+    
+            ok = _lib.qihse_vector_db_add_vectors(
+                self._ptr,
+                vectors.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                n,
+                dims,
+                ids_arr,
+                meta_ptrs,
+                meta_sizes,
+            )
+            if not ok:
+                raise RuntimeError("Failed to add vectors")
 
     def search(
         self,
@@ -205,57 +225,81 @@ class VectorDB:
         k: Optional[int] = None,
         metric: Optional[DistanceMetric] = None,
         include_vectors: bool = False,
-    ) -> List[VectorResult]:
-        """Search for nearest neighbors."""
-        if isinstance(query, VectorQuery):
-            qvec = query.vector
-            top_k = query.top_k
-            metric = query.metric
-            include_vectors = query.include_vectors
-        else:
-            qvec = np.asarray(query, dtype=np.float32)
-            top_k = k if k is not None else 10
-            metric = metric if metric is not None else DistanceMetric.COSINE
-
-        dims = len(qvec)
-        out_scores = (ctypes.c_float * top_k)()
-        out_ids = (ctypes.c_uint64 * top_k)()
-
-        count = _lib.qihse_vector_db_search(
-            self._ptr,
-            qvec.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            dims,
-            top_k,
-            int(metric),
-            out_scores,
-            top_k,
-        )
-        if count < 0:
-            raise RuntimeError("Search failed")
-
-        results = []
-        for i in range(count):
-            results.append(VectorResult(int(out_ids[i]), float(out_scores[i])))
-        return results
+    ) -> list[VectorResult]:
+        with self._lock:
+            if isinstance(query, VectorQuery):
+                qvec = query.vector
+                top_k = query.top_k
+                metric = query.metric
+                include_vectors = query.include_vectors
+            else:
+                qvec = np.asarray(query, dtype=np.float32)
+                top_k = k if k is not None else 10
+                metric = metric if metric is not None else DistanceMetric.COSINE
+    
+            dims = len(qvec)
+            
+            c_query = CVectorQuery()
+            c_query.query_vector = qvec.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            c_query.vector_dims = dims
+            c_query.top_k = top_k
+            c_query.similarity_threshold = 0.0
+            c_query.include_vectors = include_vectors
+            c_query.include_metadata = False
+            c_query.use_trinary_candidates = False
+            c_query.candidate_count = top_k * 2
+            c_query.query_mode = 4 # QIHSE_VDB_QUERY_GRAPH
+            c_query.candidate_pool_size = top_k * 20
+            c_query.distance_metric = metric.value
+            c_query.metadata_filter = None
+            c_query.metadata_filter_opaque = None
+            
+            out_results = (CVectorResult * top_k)()
+    
+            count = _lib.qihse_vector_db_search(
+                self._ptr,
+                ctypes.byref(c_query),
+                out_results,
+                top_k
+            )
+            if count < 0:
+                raise RuntimeError("Search failed")
+    
+            results = []
+            for i in range(count):
+                results.append(VectorResult(int(out_results[i].id), float(out_results[i].score)))
+            return results
 
     def build_graph(self, M: int = 16, ef_construction: int = 200) -> None:
         """Build the graph index sidecar."""
-        ok = _lib.qihse_vector_db_build_graph(self._ptr, M, ef_construction)
-        if not ok:
-            raise RuntimeError("Failed to build graph index")
+        with self._lock:
+            ok = _lib.qihse_vector_db_build_graph(self._ptr, M, ef_construction)
+            if not ok:
+                raise RuntimeError("Failed to build graph index")
 
     def build_int8(self) -> None:
         """Build the INT8 scalar quantization sidecar."""
-        ok = _lib.qihse_vector_db_build_int8(self._ptr)
-        if not ok:
-            raise RuntimeError("Failed to build INT8 index")
+        with self._lock:
+            ok = _lib.qihse_vector_db_build_int8(self._ptr)
+            if not ok:
+                raise RuntimeError("Failed to build INT8 index")
 
     def flush(self) -> None:
         """Persist all pending changes to disk."""
-        ok = _lib.qihse_vector_db_flush(self._ptr)
-        if not ok:
-            raise RuntimeError("Flush failed")
+        with self._lock:
+            ok = _lib.qihse_vector_db_flush(self._ptr)
+            if not ok:
+                raise RuntimeError("Flush failed")
 
     @property
     def dims(self) -> int:
         return self._dims
+
+    def start_pg_wire(self, port: int = 5432, bind_address: str = "127.0.0.1") -> bool:
+        """Starts the PG wire protocol server in the background."""
+        with self._lock:
+            return _lib.qihse_start_pg_wire_server(
+                self._ptr,
+                ctypes.c_uint16(port),
+                bind_address.encode("utf-8")
+            )

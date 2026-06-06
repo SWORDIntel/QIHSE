@@ -6,6 +6,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static const char* qihse_memory_access_name(qihse_memory_access_t access_pattern)
 {
@@ -212,6 +215,22 @@ bool qihse_memory_planner_trace_record(
         trace->reason_code,
         &trace->facts
     );
+
+    /* TICKET #3: QMAG Telemetry Attachment. Persist planner metrics to log securely. */
+    {
+        int fd = open("./qihse_qmag_telemetry.log", O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+        if (fd != -1) {
+            char log_buffer[512];
+            int len = snprintf(log_buffer, sizeof(log_buffer), 
+                "{\"timestamp\": %ld, \"trace\": \"%s\"}\n", 
+                (long)time(NULL), trace->reason);
+            if (len > 0 && len < (int)sizeof(log_buffer)) {
+                ssize_t ret = write(fd, log_buffer, len);
+                (void)ret; // Ignore error
+            }
+            close(fd);
+        }
+    }
 
     return true;
 }

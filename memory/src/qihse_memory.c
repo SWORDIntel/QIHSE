@@ -456,6 +456,7 @@ static qihse_memory_device_policy_t qihse_memory_maintenance_to_device_policy(
     }
 }
 
+#if 0
 static double qihse_memory_maintenance_type_rank(qihse_memory_type_t mem_type) {
     switch (mem_type) {
         case QIHSE_MEM_HOST:
@@ -478,6 +479,7 @@ static double qihse_memory_maintenance_type_rank(qihse_memory_type_t mem_type) {
             return 0.60;
     }
 }
+#endif
 
 static qihse_memory_type_t qihse_memory_maintenance_derive_target_type(
     qihse_memory_buffer_t* buffer,
@@ -536,6 +538,7 @@ static qihse_memory_type_t qihse_memory_maintenance_derive_target_type(
     }
 }
 
+#if 0
 static double qihse_memory_maintenance_pressure(
     const qihse_memory_buffer_t* buffer,
     qihse_memory_type_t target_type
@@ -555,6 +558,7 @@ static double qihse_memory_maintenance_pressure(
 
     return 0.55 * access_pressure + 0.25 * residency_pressure + 0.20 * type_pressure;
 }
+#endif
 
 static bool qihse_memory_recommend_type_internal(
     const qihse_memory_workload_analysis_t* analysis,
