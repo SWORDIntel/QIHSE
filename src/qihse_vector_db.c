@@ -408,7 +408,7 @@ static void qihse_vdb_int8_destroy(qihse_vector_db_t vdb);
 
 static bool qihse_vdb_graph_save(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     uint8_t* payload = NULL;
     size_t payload_size;
     size_t neighbors_bytes;
@@ -464,7 +464,7 @@ static bool qihse_vdb_graph_save(qihse_vector_db_t vdb) {
 
 static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     uint8_t* payload = NULL;
     size_t payload_size;
     size_t neighbors_bytes;
@@ -543,7 +543,7 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
 
 static bool qihse_vdb_tier_save(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     size_t tier_bytes;
     size_t count_bytes;
     size_t payload_size;
@@ -596,7 +596,7 @@ static bool qihse_vdb_tier_save(qihse_vector_db_t vdb) {
 
 static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     size_t tier_bytes;
     size_t count_bytes;
     size_t payload_size;
@@ -674,7 +674,7 @@ static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
 
 static bool qihse_vdb_int8_save(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     uint8_t* payload = NULL;
     size_t payload_size;
     size_t minmax_bytes;
@@ -727,7 +727,7 @@ static bool qihse_vdb_int8_save(qihse_vector_db_t vdb) {
 
 static bool qihse_vdb_int8_load(qihse_vector_db_t vdb) {
     char path[PATH_MAX];
-    uint8_t header[32];
+    uint8_t header[36];
     uint8_t* payload = NULL;
     size_t payload_size;
     size_t minmax_bytes;
@@ -3724,7 +3724,7 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
         free(payload);
         return false;
     }
-    fd = open(path, O_CREAT | O_WRONLY, 0666);
+    fd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0666);
     if (fd < 0) {
         free(payload);
         return false;

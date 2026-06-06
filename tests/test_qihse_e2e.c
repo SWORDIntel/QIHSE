@@ -21,7 +21,7 @@ int main() {
     assert(qihse_kv_set(kv, "test_key", "test_value"));
     char* val = qihse_kv_get(kv, "test_key");
     assert(val != NULL && strcmp(val, "test_value") == 0);
-
+    free(val);
     printf("  -> KV Store OK\n");
 
     /* 2. Columnar OLAP */
