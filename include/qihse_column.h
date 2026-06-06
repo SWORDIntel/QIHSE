@@ -59,6 +59,7 @@ void qihse_column_store_destroy(qihse_column_store_t* store);
 bool qihse_column_create(qihse_column_store_t* store, const char* name, qihse_column_type_t type);
 bool qihse_column_append_int64(qihse_column_store_t* store, const char* name, int64_t val);
 bool qihse_column_append_float32(qihse_column_store_t* store, const char* name, float val);
+bool qihse_column_append_string(qihse_column_store_t* store, const char* name, const char* val);
 
 /**
  * @brief SIMD-Accelerated Aggregation functions.
