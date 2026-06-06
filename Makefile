@@ -15,7 +15,7 @@ QIHSE_ENABLE_AVX512?=0
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
-LDFLAGS=-ldl -lm -lpthread -lcrypto
+LDFLAGS=-ldl -lm -lpthread
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
