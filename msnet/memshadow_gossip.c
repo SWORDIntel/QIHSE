@@ -624,6 +624,9 @@ int memshadow_gossip_manager_perform_anti_entropy(
 
     // For simplicity, this is a placeholder implementation
     // In a real implementation, this would compare message sets and return missing messages
+    (void)remote_message_ids;
+    (void)remote_count;
+
     *missing_messages = NULL;
     *missing_count = 0;
 

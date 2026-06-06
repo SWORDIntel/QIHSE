@@ -3480,7 +3480,7 @@ static bool test_qmag_low_active_low_top_k_default_policy_matches_float32(void) 
 }
 
 static bool test_qmag_high_top_k_default_policy_falls_back_to_float32(void) {
-    enum { DIMS = 64, TOP_K = 32 };
+    enum { DIMS = 64, TOP_K = 33 };
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 

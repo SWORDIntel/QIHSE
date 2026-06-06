@@ -11,6 +11,7 @@
 #if QIHSE_MEMORY_MIGRATION_BACKEND_ENABLE_CUDA
 #include <dlfcn.h>
 #endif
+#include <pthread.h>
 
 static qihse_memory_migration_backend_registry_t g_qihse_memory_migration_backend_registry;
 static bool g_qihse_memory_migration_backend_platform_backends_initialized = false;
@@ -36,10 +37,10 @@ typedef struct qihse_memory_migration_backend_cuda_copy_backend_s {
 } qihse_memory_migration_backend_cuda_copy_backend_t;
 
 static const char* const g_qihse_memory_migration_backend_cuda_lib_names[] = {
-    "libcudart.so",
-    "libcudart.so.12",
-    "libcudart.so.11.0",
-    "libcudart.so.11"
+    "/usr/local/cuda/lib64/libcudart.so",
+    "/usr/local/cuda/lib64/libcudart.so.12",
+    "/usr/local/cuda/lib64/libcudart.so.11.0",
+    "/usr/local/cuda/lib64/libcudart.so.11"
 };
 
 static qihse_memory_migration_backend_cuda_copy_backend_t
@@ -280,9 +281,14 @@ bool qihse_memory_migration_backend_lookup_copy_callback(
     return *callback != NULL;
 }
 
+static pthread_mutex_t g_qihse_memory_migration_backend_platform_backends_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 bool qihse_memory_migration_backend_register_platform_backends(void) {
+    pthread_mutex_lock(&g_qihse_memory_migration_backend_platform_backends_mutex);
     if (g_qihse_memory_migration_backend_platform_backends_initialized) {
-        return g_qihse_memory_migration_backend_platform_backends_registered;
+        bool registered = g_qihse_memory_migration_backend_platform_backends_registered;
+        pthread_mutex_unlock(&g_qihse_memory_migration_backend_platform_backends_mutex);
+        return registered;
     }
 
     bool registered = false;
@@ -295,6 +301,7 @@ bool qihse_memory_migration_backend_register_platform_backends(void) {
 
     g_qihse_memory_migration_backend_platform_backends_initialized = true;
     g_qihse_memory_migration_backend_platform_backends_registered = registered;
+    pthread_mutex_unlock(&g_qihse_memory_migration_backend_platform_backends_mutex);
     return registered;
 }
 

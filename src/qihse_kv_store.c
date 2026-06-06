@@ -59,7 +59,9 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
     }
 
     size_t out_size = 0;
-    void* old_val = qihse_trinary_trie_search(store->trie, key, &out_size);
+    /* Check if key already exists so the metadata TTL entry can be reset */
+    bool key_present = (qihse_trinary_trie_search(store->trie, key, &out_size) != NULL);
+    (void)key_present; /* Existence used below via the keys[] scan */
 
     char* dup_val = strdup(value);
     if (!dup_val) {
@@ -72,9 +74,7 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
         return false;
     }
 
-    if (old_val) {
-        free(old_val);
-    }
+    // Trie insert automatically frees the old value
     
     bool exists = false;
     for (size_t i = 0; i < store->num_keys; i++) {
@@ -105,6 +105,7 @@ char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
         return NULL;
     }
     
+    qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     if (!val) return NULL;
@@ -118,7 +119,6 @@ bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     if (val) {
-        free(val);
         bool deleted = qihse_trinary_trie_delete(store->trie, key);
         if (deleted) {
             for (size_t i = 0; i < store->num_keys; i++) {
@@ -140,6 +140,7 @@ bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
         return false;
     }
 
+    qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     return val != NULL;
@@ -167,7 +168,6 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
             size_t out_size = 0;
             void* val = qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
             if (val) {
-                free(val);
                 qihse_trinary_trie_delete(store->trie, store->keys[i].key);
             }
             

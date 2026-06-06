@@ -1,0 +1,7 @@
+{"timestamp": 1780757736, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780758310, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780761609, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780761942, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780762228, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780762233, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=sequential ws=4096 rw=8.00 tl=0.75 sl=0.90 dim"}
+{"timestamp": 1780762233, "trace": "selected=host reason=fallback workload=none"}

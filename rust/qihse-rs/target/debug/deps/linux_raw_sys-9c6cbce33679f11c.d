@@ -1,0 +1,11 @@
+/home/john/Documents/QIHSE/rust/qihse-rs/target/debug/deps/linux_raw_sys-9c6cbce33679f11c.d: /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/lib.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/elf.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/errno.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/general.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/ioctl.rs
+
+/home/john/Documents/QIHSE/rust/qihse-rs/target/debug/deps/liblinux_raw_sys-9c6cbce33679f11c.rlib: /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/lib.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/elf.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/errno.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/general.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/ioctl.rs
+
+/home/john/Documents/QIHSE/rust/qihse-rs/target/debug/deps/liblinux_raw_sys-9c6cbce33679f11c.rmeta: /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/lib.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/elf.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/errno.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/general.rs /home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/ioctl.rs
+
+/home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/lib.rs:
+/home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/elf.rs:
+/home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/errno.rs:
+/home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/general.rs:
+/home/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.4.15/src/x86_64/ioctl.rs:
