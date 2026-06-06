@@ -92,6 +92,7 @@ bool qihse_doc_store_insert_json(qihse_document_store_t* store, uint64_t doc_id,
             while (*ptr && *ptr != '"' && len < 1023) {
                 key_str[len++] = *ptr++;
             }
+            while (*ptr && *ptr != '"') ptr++;
             if (*ptr == '"') ptr++;
             
             // Skip whitespace
@@ -111,6 +112,7 @@ bool qihse_doc_store_insert_json(qihse_document_store_t* store, uint64_t doc_id,
                     while (*ptr && *ptr != '"' && vlen < 2047) {
                         val_str[vlen++] = *ptr++;
                     }
+                    while (*ptr && *ptr != '"') ptr++;
                     if (*ptr == '"') ptr++;
                 } else if (*ptr == '{' || *ptr == '[') {
                     // Nested structure, just let the main loop handle it
@@ -121,6 +123,8 @@ bool qihse_doc_store_insert_json(qihse_document_store_t* store, uint64_t doc_id,
                            *ptr != ' ' && *ptr != '\n' && *ptr != '\r' && vlen < 2047) {
                         val_str[vlen++] = *ptr++;
                     }
+                    while (*ptr && *ptr != ',' && *ptr != '}' && *ptr != ']' && 
+                           *ptr != ' ' && *ptr != '\n' && *ptr != '\r') ptr++;
                 }
                 
                 if (store->arena_head) {

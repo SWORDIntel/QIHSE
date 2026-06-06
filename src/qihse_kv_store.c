@@ -101,16 +101,6 @@ char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
         return NULL;
     }
     
-    uint64_t now = current_time_ms();
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            if (store->keys[i].expire_time_ms > 0 && store->keys[i].expire_time_ms <= now) {
-                return NULL;
-            }
-            break;
-        }
-    }
-
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     return (char*)val;
@@ -144,15 +134,7 @@ bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
     if (!store || !store->trie || !key) {
         return false;
     }
-    uint64_t now = current_time_ms();
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            if (store->keys[i].expire_time_ms > 0 && store->keys[i].expire_time_ms <= now) {
-                return false;
-            }
-            break;
-        }
-    }
+
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     return val != NULL;

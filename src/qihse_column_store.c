@@ -147,7 +147,6 @@ int64_t qihse_column_sum_int64(qihse_column_store_t* store, const char* name) {
         #pragma GCC ivdep
         #pragma GCC unroll 8
         for (size_t i = 0; i < count; i++) {
-            __builtin_prefetch((char*)chunk->data + i + 16, 0, 3);
             local_sum += data[i];
         }
         sum += local_sum;
@@ -168,10 +167,8 @@ float qihse_column_sum_float32(qihse_column_store_t* store, const char* name) {
         size_t count = chunk->count;
         
         float local_sum = 0.0f;
-        #pragma GCC ivdep
-        #pragma GCC unroll 8
+        #pragma omp simd reduction(+:local_sum)
         for (size_t i = 0; i < count; i++) {
-            __builtin_prefetch((char*)chunk->data + i + 16, 0, 3);
             local_sum += data[i];
         }
         sum += local_sum;
