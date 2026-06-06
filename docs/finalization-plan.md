@@ -66,15 +66,18 @@ After this document is committed, finalization is considered complete when this 
 - [x] **Phase 3 PostgreSQL Wire Protocol**: Completed. Full v3 server handshake and query cycle implemented (`qihse_pg_wire.c`).
 - [x] **Phase 3 JIT Bytecode Compiler**: Completed. Predicate push-down and WHERE clause AST-to-bytecode compilation fully implemented (`qihse_bytecode_compiler.c`).
 
-## 7) Next highest-priority tickets (Phase 4: Advanced Sub-Engines)
+## 7) Next highest-priority tickets (Phase 4: Advanced Sub-Engines & UWP (Current Target))
 
-1. **JIT Document Engine implementation**:
+- [x] **1. JIT Document Engine implementation**:
    Implement `src/qihse_document_store.c` based on `QIHSE_JIT_Document_Engine_Plan.md`. Create a schema-less BSON-like document store with dynamic indexing and JIT-compiled query filtering.
-2. **Columnar OLAP Engine implementation**:
+
+- [x] **2. Columnar OLAP Engine implementation**:
    Implement `src/qihse_column_store.c` based on `QIHSE_Columnar_OLAP_Plan.md`. Add vector-accelerated aggregations, dictionary encoding, and run-length encoding for analytics queries.
-3. **Full-Text Search Engine implementation**:
-   Implement `src/qihse_fts_index.c` based on `QIHSE_Full_Text_Search_Plan.md`. Introduce a reverse index with BM25 scoring and trigram matching for hybrid search.
-4. **Time-Series Engine implementation**:
+
+- [x] **3. Full-Text Search Engine implementation**:
+   Implement `src/qihse_fts_index.c` (BM25/Trigram reverse index). Ensure queries can fuzzy match string columns quickly.
+
+- [ ] **4. Time-Series Engine implementation**:
    Implement `src/qihse_timeseries.c` based on `QIHSE_TimeSeries_Engine_Plan.md`. Add Gorilla/XOR compression, windowed aggregation, and sliding expiry windows.
 5. **Unified Wire Protocol integration**:
    Wire all the newly constructed engines together under `src/qihse_uwp.c` so a single port can dynamically multiplex QQL (Query Language), SQL, and Redis/RESP requests.

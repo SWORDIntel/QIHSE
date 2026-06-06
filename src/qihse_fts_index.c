@@ -86,60 +86,73 @@ bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const cha
         } else {
             if (start) {
                 size_t tok_len = &p[i] - start;
-                char token[256];
+                char full_word[256];
                 if (tok_len > 255) tok_len = 255;
                 for (size_t j = 0; j < tok_len; j++) {
-                    token[j] = (char)tolower((unsigned char)start[j]);
+                    full_word[j] = (char)tolower((unsigned char)start[j]);
                 }
-                token[tok_len] = '\0';
+                full_word[tok_len] = '\0';
                 
-                size_t out_size;
-                posting_list_t** p_list_ptr = (posting_list_t**)qihse_trinary_trie_search(index->dictionary, token, &out_size);
-                posting_list_t* p_list;
-                if (!p_list_ptr) {
-                    p_list = (posting_list_t*)qihse_arena_alloc(index->arena, sizeof(posting_list_t));
-                    if (!p_list) return false;
-                    p_list->head = NULL;
-                    p_list->tail = NULL;
-                    p_list->document_frequency = 0;
-                    qihse_trinary_trie_insert(index->dictionary, token, &p_list, sizeof(posting_list_t*));
-                } else {
-                    p_list = *p_list_ptr;
-                }
-
-                doc_posting_t* doc_node = p_list->tail;
-                if (!doc_node || doc_node->doc_idx != doc_idx) {
-                    doc_node = (doc_posting_t*)qihse_arena_alloc(index->arena, sizeof(doc_posting_t));
-                    if (!doc_node) return false;
-                    doc_node->doc_idx = doc_idx;
-                    doc_node->term_frequency = 0;
-                    doc_node->capacity = 4;
-                    doc_node->positions = (uint32_t*)qihse_arena_alloc(index->arena, sizeof(uint32_t) * doc_node->capacity);
-                    doc_node->next = NULL;
-                    
-                    if (!p_list->head) {
-                        p_list->head = doc_node;
+                size_t num_trigrams = (tok_len < 3) ? 1 : (tok_len - 2);
+                for (size_t t = 0; t < num_trigrams; t++) {
+                    char token[4];
+                    if (tok_len < 3) {
+                        strcpy(token, full_word);
                     } else {
-                        p_list->tail->next = doc_node;
+                        token[0] = full_word[t];
+                        token[1] = full_word[t+1];
+                        token[2] = full_word[t+2];
+                        token[3] = '\0';
                     }
-                    p_list->tail = doc_node;
-                    p_list->document_frequency++;
-                }
+                    
+                    size_t out_size;
+                    posting_list_t** p_list_ptr = (posting_list_t**)qihse_trinary_trie_search(index->dictionary, token, &out_size);
+                    posting_list_t* p_list;
+                    if (!p_list_ptr) {
+                        p_list = (posting_list_t*)qihse_arena_alloc(index->arena, sizeof(posting_list_t));
+                        if (!p_list) return false;
+                        p_list->head = NULL;
+                        p_list->tail = NULL;
+                        p_list->document_frequency = 0;
+                        qihse_trinary_trie_insert(index->dictionary, token, &p_list, sizeof(posting_list_t*));
+                    } else {
+                        p_list = *p_list_ptr;
+                    }
 
-                if (doc_node->term_frequency >= doc_node->capacity) {
-                    uint32_t new_cap = doc_node->capacity * 2;
-                    uint32_t* new_pos = (uint32_t*)qihse_arena_alloc(index->arena, sizeof(uint32_t) * new_cap);
-                    if (!new_pos) return false;
-                    for (uint32_t k = 0; k < doc_node->term_frequency; k++) {
-                        new_pos[k] = doc_node->positions[k];
+                    doc_posting_t* doc_node = p_list->tail;
+                    if (!doc_node || doc_node->doc_idx != doc_idx) {
+                        doc_node = (doc_posting_t*)qihse_arena_alloc(index->arena, sizeof(doc_posting_t));
+                        if (!doc_node) return false;
+                        doc_node->doc_idx = doc_idx;
+                        doc_node->term_frequency = 0;
+                        doc_node->capacity = 4;
+                        doc_node->positions = (uint32_t*)qihse_arena_alloc(index->arena, sizeof(uint32_t) * doc_node->capacity);
+                        doc_node->next = NULL;
+                        
+                        if (!p_list->head) {
+                            p_list->head = doc_node;
+                        } else {
+                            p_list->tail->next = doc_node;
+                        }
+                        p_list->tail = doc_node;
+                        p_list->document_frequency++;
                     }
-                    doc_node->positions = new_pos;
-                    doc_node->capacity = new_cap;
+
+                    if (doc_node->term_frequency >= doc_node->capacity) {
+                        uint32_t new_cap = doc_node->capacity * 2;
+                        uint32_t* new_pos = (uint32_t*)qihse_arena_alloc(index->arena, sizeof(uint32_t) * new_cap);
+                        if (!new_pos) return false;
+                        for (uint32_t k = 0; k < doc_node->term_frequency; k++) {
+                            new_pos[k] = doc_node->positions[k];
+                        }
+                        doc_node->positions = new_pos;
+                        doc_node->capacity = new_cap;
+                    }
+                    doc_node->positions[doc_node->term_frequency++] = pos + t;
                 }
-                doc_node->positions[doc_node->term_frequency++] = pos;
                 
-                pos++;
-                doc_len++;
+                pos += tok_len;
+                doc_len += num_trigrams;
                 start = NULL;
             }
         }
@@ -178,32 +191,45 @@ int qihse_fts_search(qihse_fts_index_t* index, const char* query, qihse_fts_resu
         } else {
             if (start) {
                 size_t tok_len = &p[i] - start;
-                char token[256];
+                char full_word[256];
                 if (tok_len > 255) tok_len = 255;
                 for (size_t j = 0; j < tok_len; j++) {
-                    token[j] = (char)tolower((unsigned char)start[j]);
+                    full_word[j] = (char)tolower((unsigned char)start[j]);
                 }
-                token[tok_len] = '\0';
+                full_word[tok_len] = '\0';
                 
-                size_t out_size;
-                posting_list_t** p_list_ptr = (posting_list_t**)qihse_trinary_trie_search(index->dictionary, token, &out_size);
-                if (p_list_ptr) {
-                    posting_list_t* p_list = *p_list_ptr;
-                    uint32_t df = p_list->document_frequency;
-                    float idf = logf(((N - df + 0.5f) / (df + 0.5f)) + 1.0f);
-                    if (idf < 0.0f) idf = 0.0f;
+                size_t num_trigrams = (tok_len < 3) ? 1 : (tok_len - 2);
+                for (size_t t = 0; t < num_trigrams; t++) {
+                    char token[4];
+                    if (tok_len < 3) {
+                        strcpy(token, full_word);
+                    } else {
+                        token[0] = full_word[t];
+                        token[1] = full_word[t+1];
+                        token[2] = full_word[t+2];
+                        token[3] = '\0';
+                    }
+                    
+                    size_t out_size;
+                    posting_list_t** p_list_ptr = (posting_list_t**)qihse_trinary_trie_search(index->dictionary, token, &out_size);
+                    if (p_list_ptr) {
+                        posting_list_t* p_list = *p_list_ptr;
+                        uint32_t df = p_list->document_frequency;
+                        float idf = logf(((N - df + 0.5f) / (df + 0.5f)) + 1.0f);
+                        if (idf < 0.0f) idf = 0.0f;
 
-                    doc_posting_t* curr = p_list->head;
-                    while (curr) {
-                        uint32_t doc_idx = curr->doc_idx;
-                        uint32_t tf = curr->term_frequency;
-                        uint32_t doc_len = index->docs[doc_idx].length;
-                        
-                        float numerator = tf * (k1 + 1.0f);
-                        float denominator = tf + k1 * (1.0f - b + b * ((float)doc_len / avgdl));
-                        scores[doc_idx] += idf * (numerator / denominator);
-                        
-                        curr = curr->next;
+                        doc_posting_t* curr = p_list->head;
+                        while (curr) {
+                            uint32_t doc_idx = curr->doc_idx;
+                            uint32_t tf = curr->term_frequency;
+                            uint32_t doc_len = index->docs[doc_idx].length;
+                            
+                            float numerator = tf * (k1 + 1.0f);
+                            float denominator = tf + k1 * (1.0f - b + b * ((float)doc_len / avgdl));
+                            scores[doc_idx] += idf * (numerator / denominator);
+                            
+                            curr = curr->next;
+                        }
                     }
                 }
                 start = NULL;
