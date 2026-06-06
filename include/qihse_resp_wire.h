@@ -20,4 +20,10 @@
  */
 bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uint16_t port, const char* bind_address);
 
+/**
+ * Handles a RESP client connection synchronously on the given socket.
+ * Useful for multiplexing connections.
+ */
+void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb);
+
 #endif /* QIHSE_RESP_WIRE_H */
