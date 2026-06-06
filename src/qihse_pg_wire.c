@@ -470,12 +470,9 @@ typedef struct {
     void*  vdb;
 } pg_client_data_t;
 
-static void* pg_handle_client(void* arg) {
-    pg_client_data_t* cdata = (pg_client_data_t*)arg;
-    int    fd  = cdata->client_fd;
-    void*  vdb = cdata->vdb;
-    free(cdata);
+static void* pg_handle_client(void* arg);
 
+void qihse_pg_wire_handle_client(int fd, void* vdb) {
     /* Apply per-connection timeouts to guard against slow clients */
     struct timeval tv;
     tv.tv_sec  = 30;
@@ -490,7 +487,7 @@ static void* pg_handle_client(void* arg) {
     /* Phase 1: startup handshake */
     if (pg_do_startup(fd) < 0) {
         close(fd);
-        return NULL;
+        return;
     }
 
     /* Phase 2: message loop */
@@ -576,6 +573,14 @@ static void* pg_handle_client(void* arg) {
 
 done:
     close(fd);
+}
+
+static void* pg_handle_client(void* arg) {
+    pg_client_data_t* cdata = (pg_client_data_t*)arg;
+    int fd = cdata->client_fd;
+    void* vdb = cdata->vdb;
+    free(cdata);
+    qihse_pg_wire_handle_client(fd, vdb);
     return NULL;
 }
 

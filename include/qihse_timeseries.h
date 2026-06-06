@@ -53,4 +53,14 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb);
 
 double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts);
 
+/**
+ * @brief Set the TTL in milliseconds for old chunks.
+ */
+void qihse_tsdb_set_ttl(qihse_tsdb_t* tsdb, uint64_t ttl_ms);
+
+/**
+ * @brief Trims any completely expired chunks older than current_ts - ttl_ms.
+ */
+void qihse_tsdb_trim(qihse_tsdb_t* tsdb, uint64_t current_ts);
+
 #endif /* QIHSE_TIMESERIES_H */

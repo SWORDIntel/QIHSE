@@ -98,7 +98,7 @@ test-persist: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_vector_db_persistence_test
 
-test: test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
+test: test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
 
 test-bytecode: lib
 	$(CC) $(CFLAGS) -o tests/test_bytecode tests/test_bytecode.c -L. -lqihse $(LDFLAGS)
@@ -119,6 +119,10 @@ test-fts-engine: lib
 test-e2e: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_qihse_e2e
+
+test-timeseries: lib
+	$(CC) $(CFLAGS) -o tests/test_timeseries tests/test_timeseries.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_timeseries
 
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
@@ -422,7 +426,7 @@ clean:
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
-	    tests/test_direct_execution tests/test_simple_exec
+	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries
 	@echo "Clean completed"
 
 workspace:
