@@ -77,7 +77,7 @@ After this document is committed, finalization is considered complete when this 
 - [x] **3. Full-Text Search Engine implementation**:
    Implement `src/qihse_fts_index.c` (BM25/Trigram reverse index). Ensure queries can fuzzy match string columns quickly.
 
-- [ ] **4. Time-Series Engine implementation**:
+- [x] **4. Time-Series Engine implementation**:
    Implement `src/qihse_timeseries.c` based on `QIHSE_TimeSeries_Engine_Plan.md`. Add Gorilla/XOR compression, windowed aggregation, and sliding expiry windows.
 - [x] **5. Unified Wire Protocol integration**:
    Wire all the newly constructed engines together under `src/qihse_uwp.c` so a single port can dynamically multiplex QQL (Query Language), SQL, and Redis/RESP requests.
