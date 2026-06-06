@@ -1,8 +1,7 @@
 # QIHSE Onboarding Guide
 
 This guide gives the fastest path to use QIHSE with the most important runtime
-flows: vector DB lifecycle, trinary-backed search behavior, persistence recovery,
-caller-driven maintenance loops, and validation workflows.
+flows: multi-modal DB lifecycle (Vector, KV, Columnar, Time-Series, Document, Event Stream, Graph, FTS), Unified Wire Protocol (UWP) networking, trinary-backed search behavior, persistence recovery, caller-driven maintenance loops, and validation workflows.
 
 ## 1) Runtime stack and file-backed vector DB lifecycle
 
@@ -70,7 +69,20 @@ qihse_memory_manager_destroy(memory_manager);
 qihse_context_destroy(ctx);
 ```
 
-## 2) Trinary / qmag search usage
+## 2) Unified Wire Protocol (UWP) Server
+
+To run QIHSE over the network utilizing its zero-copy DMA and memory-aligned multiplexer, spin up the UWP server:
+
+```c
+#include "qihse_uwp.h"
+
+qihse_uwp_server_t* server = qihse_uwp_server_create(db, 8080, "0.0.0.0");
+qihse_uwp_server_start(server);
+```
+
+The UWP implementation uses detached pthreads and native socket timeouts to mitigate DoS (Slowloris) attacks, while bounding all metadata strings to strict array limits.
+
+## 3) Trinary / qmag search usage
 
 QIHSE keeps float32 authoritative. Trinary sidecars are for candidate filtering only.
 

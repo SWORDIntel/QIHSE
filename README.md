@@ -5,14 +5,13 @@
 
 ## Quantum-Inspired Hilbert Space Expansion Search
 
-### Exactness-first vector search with trinary candidate acceleration, file-backed recovery, and hardware-aware execution.
+### Exactness-first multi-modal database engine: Vector, Graph, KV, Document, Time-Series, Columnar, and Event Stream over a zero-copy Unified Wire Protocol (UWP).
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Python](https://img.shields.io/badge/Python-ctypes%20adapter-3776AB?logo=python&logoColor=white)](python/qihse.py)
 [![Vector Search](https://img.shields.io/badge/Vector%20Search-exactness--first-blueviolet)]()
-[![Trinary](https://img.shields.io/badge/Trinary-qtri%20%2B%20qmag-purple)]()
-[![Persistence](https://img.shields.io/badge/Persistence-WAL%20%2B%20snapshot-darkgreen)]()
+[![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen)]()
+[![UWP](https://img.shields.io/badge/UWP-Zero--Copy%20Wire%20Protocol-red)]()
 
 </div>
 
@@ -53,6 +52,25 @@ That may be acceptable for some recommendation systems. It is less acceptable fo
 - let the caller decide when approximate bypass is acceptable.
 
 That design is the point of the project.
+
+---
+
+## Multi-Modal Database Architecture
+
+QIHSE has evolved beyond a pure vector search engine into a fully fortified, multi-modal database system. It implements 8 distinct storage and compute engines, all interconnected via a custom **Unified Wire Protocol (UWP)** designed for zero-copy DMA and hardware-aligned execution:
+
+1. **Vector DB**: The exactness-first `float32` core with Trinary (`qtri`/`qmag`) sidecars.
+2. **Key-Value Store**: An O(k) Trinary Trie memory engine for instantaneous lock-free lookups.
+3. **Columnar OLAP**: An AVX-512 accelerated columnar engine utilizing strided OS page alignments.
+4. **Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing for massive temporal ingestion.
+5. **JIT Document Store**: A Hot/Cold tiered JSON document engine that compiles access patterns into JIT bytecode.
+6. **Event Stream**: A zero-copy append-only log engine utilizing native Linux `mmap` and `sendfile` DMA.
+7. **Graph DB**: Multi-hop traversal via Anchor/HNSW routing algorithms.
+8. **Full-Text Search**: Zero-copy lexical tokenization with native BM25 scoring.
+
+### Unified Wire Protocol (UWP)
+
+To drive these 8 engines over the network without trashing the CPU cache, QIHSE utilizes the **Unified Wire Protocol (UWP)**. UWP is a strictly binary, memory-aligned protocol that maps network packets directly to struct definitions. It uses `pthread` detachment, `SO_RCVTIMEO` kernel enforcement to block Slowloris attacks, and strict 64-bit boundaries to prevent overflow exploits.
 
 ---
 
@@ -214,6 +232,16 @@ Persistence is caller-directed. There is no hidden daemon required for correctne
 ---
 
 ## Build
+
+### Dependencies
+QIHSE requires the MSNET (`libmemshadow`) dependency for secure memory allocations and cryptographic operations.
+Ensure `msnet/c` is cloned and built locally, and `LD_LIBRARY_PATH` is configured:
+
+```bash
+export LD_LIBRARY_PATH=.:/path/to/msnet/c:$LD_LIBRARY_PATH
+```
+
+### Compilation
 
 ```bash
 git clone https://github.com/SWORDIntel/QIHSE.git && cd QIHSE && make all
