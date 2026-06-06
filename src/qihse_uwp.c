@@ -5,6 +5,9 @@
 #include "qihse_column.h"
 #include "qihse_timeseries.h"
 #include "qihse_event_stream.h"
+#include "qihse_pg_wire.h"
+#include "qihse_resp_wire.h"
+#include "qihse_qql_parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,8 +145,20 @@ static void* uwp_handle_client_thread(void* arg) {
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 
-    qihse_uwp_header_t header;
-    
+    uint8_t peek_buf[5];
+    ssize_t peek_len = recv(client_fd, peek_buf, 5, MSG_PEEK);
+    if (peek_len <= 0) goto cleanup;
+
+    if (peek_buf[0] == 0x00) {
+        qihse_pg_wire_handle_client(client_fd, ctx->vdb);
+        return NULL;
+    } else if (peek_buf[0] == '*' || peek_buf[0] == '$' || peek_buf[0] == '+' || peek_buf[0] == '-' || peek_buf[0] == ':') {
+        qihse_resp_handle_client(client_fd, ctx->kv, ctx->vdb);
+        return NULL;
+    } else if (peek_len == 5 && memcmp(peek_buf, "QIHSE", 5) == 0) {
+        /* QIHSE Native Protocol */
+        qihse_uwp_header_t header;
+
     while (1) {
         size_t header_read = 0;
         /* Robust TCP stream read */
@@ -180,6 +195,18 @@ static void* uwp_handle_client_thread(void* arg) {
         
         if (payload) {
             free(payload);
+        }
+    }
+    } else {
+        /* Assume QQL text query */
+        char qql_buf[8192];
+        ssize_t r = read(client_fd, qql_buf, sizeof(qql_buf) - 1);
+        if (r > 0) {
+            qql_buf[r] = '\0';
+            void* ast = qihse_parse_qql_to_ast(qql_buf);
+            (void)ast; /* Stub */
+            const char* reply = "QQL OK\n";
+            write(client_fd, reply, strlen(reply));
         }
     }
 

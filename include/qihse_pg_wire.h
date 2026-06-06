@@ -18,6 +18,12 @@ extern "C" {
  */
 bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_address);
 
+/**
+ * Handles a PostgreSQL client connection synchronously on the given socket.
+ * Useful for multiplexing connections.
+ */
+void qihse_pg_wire_handle_client(int client_fd, void* vdb);
+
 #ifdef __cplusplus
 }
 #endif

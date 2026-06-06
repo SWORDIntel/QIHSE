@@ -40,7 +40,7 @@ static int parse_resp_array(char* buf, char** args, int max_args) {
     return argc;
 }
 
-static void handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
+void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
     char buffer[65536];
     while (1) {
         ssize_t valread = read(client_fd, buffer, sizeof(buffer) - 1);
@@ -190,7 +190,7 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
             continue;
         }
 
-        handle_client(client_fd, store, vdb);
+        qihse_resp_handle_client(client_fd, store, vdb);
     }
 
     return true;
