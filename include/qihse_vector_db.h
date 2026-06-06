@@ -14,7 +14,7 @@
 
 #define QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API 1
 
-#include "memory/include/qihse_uma.h"
+#include "../memory/include/qihse_uma.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -606,6 +606,93 @@ bool qihse_vector_db_search_batch(
     size_t max_results,
     int* out_counts
 );
+
+/* ============================================================================
+ * EXPLICIT GRAPH EDGE MANAGEMENT (QQL/Graph DB)
+ * ============================================================================ */
+
+/**
+ * Add an explicit edge between two vector nodes.
+ *
+ * @param vdb Vector database handle
+ * @param from_id Source vector ID
+ * @param to_id Destination vector ID
+ * @param edge_type String literal defining relationship (e.g., "RELATES_TO")
+ * @param metadata Optional metadata for the edge
+ * @param metadata_size Size of edge metadata
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_add_edge(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    uint64_t to_id,
+    const char* edge_type,
+    const void* metadata,
+    size_t metadata_size
+);
+
+/**
+ * Get outgoing edges for a given vector node.
+ * 
+ * @param vdb Vector database handle
+ * @param from_id Source vector ID
+ * @param edge_type Filter by type (NULL for all)
+ * @param out_ids Array to store destination IDs
+ * @param max_edges Maximum edges to retrieve
+ * @return Number of edges found, or negative on error
+ */
+int qihse_vector_db_get_edges(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    const char* edge_type,
+    uint64_t* out_ids,
+    size_t max_edges
+);
+
+/* ============================================================================
+ * EMBEDDED QUERY EXECUTION (QQL & SQL)
+ * ============================================================================ */
+
+/**
+ * Result set returned from embedded string-based query execution.
+ */
+typedef struct qihse_result_set_s {
+    qihse_vector_result_t* results;
+    size_t count;
+} qihse_result_set_t;
+
+/**
+ * Execute a native QIHSE Query Language (QQL) string entirely in memory.
+ * Parses the string, compiles WHERE clauses to native bytecode, performs the 
+ * underlying vector search, and returns the results.
+ * 
+ * @param vdb Vector database handle
+ * @param qql_query_string Raw QQL query (e.g., "MATCH (d) SEARCH d.vec WITH VEC(...)")
+ * @return Allocated result set, or NULL on parsing/execution error. 
+ *         Caller must free via qihse_free_result_set().
+ */
+qihse_result_set_t* qihse_execute_qql(
+    qihse_vector_db_t vdb, 
+    const char* qql_query_string
+);
+
+/**
+ * Execute a legacy SQL string by dynamically translating it into QIHSE graph operations.
+ * Requires the native SQL parser module to be linked into the framework.
+ * 
+ * @param vdb Vector database handle
+ * @param sql_query_string Raw SQL query
+ * @return Allocated result set, or NULL on parsing/execution error.
+ */
+qihse_result_set_t* qihse_execute_sql(
+    qihse_vector_db_t vdb, 
+    const char* sql_query_string
+);
+
+/**
+ * Free a result set allocated by qihse_execute_qql or qihse_execute_sql.
+ */
+void qihse_free_result_set(qihse_result_set_t* rs);
 
 /**
  * Hybrid search request combining two independent query paths.

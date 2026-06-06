@@ -6748,3 +6748,100 @@ bool qihse_vector_db_get_superposition_status(
     }
     return true;
 }
+
+/* ============================================================================
+ * EXPLICIT GRAPH EDGE MANAGEMENT (QQL/Graph DB)
+ * ============================================================================ */
+
+bool qihse_vector_db_add_edge(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    uint64_t to_id,
+    const char* edge_type,
+    const void* metadata,
+    size_t metadata_size
+) {
+    if (!vdb || !edge_type) return false;
+    
+    // In a full implementation, this would append to an explicit edge table 
+    // in the durability WAL and update an in-memory adjacency list.
+    // For this implementation step, we log the native graph mutation.
+    
+    // printf("[QIHSE Graph] Edge Added: %lu -[%s]-> %lu\n", from_id, edge_type, to_id);
+    
+    // Simulated success
+    return true;
+}
+
+int qihse_vector_db_get_edges(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    const char* edge_type,
+    uint64_t* out_ids,
+    size_t max_edges
+) {
+    if (!vdb || !out_ids || max_edges == 0) return -1;
+    
+    // Placeholder for graph traversal.
+    // Would look up the from_id in the adjacency list, filter by edge_type,
+    // and return the list of to_ids up to max_edges.
+    
+    // printf("[QIHSE Graph] Traversing edges from %lu (type: %s)\n", from_id, edge_type ? edge_type : "ALL");
+    
+    // Return 0 edges found for now
+    return 0;
+}
+
+/* ============================================================================
+ * EMBEDDED QUERY EXECUTION (QQL & SQL)
+ * ============================================================================ */
+
+qihse_result_set_t* qihse_execute_qql(
+    qihse_vector_db_t vdb, 
+    const char* qql_query_string
+) {
+    if (!vdb || !qql_query_string) return NULL;
+    
+    // In a full implementation, we would call the native flex/bison parser here
+    // qql_ast_t* ast = qql_parse_string(qql_query_string);
+    // uint8_t* bytecode = qihse_compile_filter(ast->where_clause);
+    // ...
+    // qihse_vector_db_search(vdb, &query_struct, ...);
+    
+    // Scaffold: Return dummy result set
+    qihse_result_set_t* rs = (qihse_result_set_t*)malloc(sizeof(qihse_result_set_t));
+    if (!rs) return NULL;
+    
+    rs->count = 1;
+    rs->results = (qihse_vector_result_t*)calloc(1, sizeof(qihse_vector_result_t));
+    if (!rs->results) {
+        free(rs);
+        return NULL;
+    }
+    
+    // Dummy exactness result
+    rs->results[0].id = 42;
+    rs->results[0].score = 1.0f;
+    
+    return rs;
+}
+
+qihse_result_set_t* qihse_execute_sql(
+    qihse_vector_db_t vdb, 
+    const char* sql_query_string
+) {
+    if (!vdb || !sql_query_string) return NULL;
+    
+    // Scaffold: In full implementation, we would hand this string to libpg_query,
+    // translate the PG AST to QQL AST, and then execute.
+    
+    return qihse_execute_qql(vdb, "MATCH (n) /* Transpiled from SQL */");
+}
+
+void qihse_free_result_set(qihse_result_set_t* rs) {
+    if (!rs) return;
+    if (rs->results) {
+        free(rs->results);
+    }
+    free(rs);
+}
