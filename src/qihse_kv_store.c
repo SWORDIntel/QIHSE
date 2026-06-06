@@ -60,9 +60,6 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
 
     size_t out_size = 0;
     void* old_val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    if (old_val) {
-        free(old_val);
-    }
 
     char* dup_val = strdup(value);
     if (!dup_val) {
@@ -73,6 +70,10 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
     if (!result) {
         free(dup_val);
         return false;
+    }
+
+    if (old_val) {
+        free(old_val);
     }
     
     bool exists = false;
@@ -85,8 +86,11 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
     }
     if (!exists) {
         if (store->num_keys == store->capacity) {
-            store->capacity = store->capacity == 0 ? 16 : store->capacity * 2;
-            store->keys = (key_entry_t*)realloc(store->keys, store->capacity * sizeof(key_entry_t));
+            size_t new_capacity = store->capacity == 0 ? 16 : store->capacity * 2;
+            key_entry_t* new_keys = (key_entry_t*)realloc(store->keys, new_capacity * sizeof(key_entry_t));
+            if (!new_keys) return false;
+            store->capacity = new_capacity;
+            store->keys = new_keys;
         }
         store->keys[store->num_keys].key = strdup(key);
         store->keys[store->num_keys].expire_time_ms = 0;
@@ -103,7 +107,8 @@ char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
     
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    return (char*)val;
+    if (!val) return NULL;
+    return strdup((char*)val);
 }
 
 bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
@@ -190,6 +195,7 @@ int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
             fwrite(store->keys[i].key, 1, strlen(store->keys[i].key), f);
             fwrite(val, 1, strlen(val), f);
             fprintf(f, "\n");
+            free(val);
         }
     }
     fclose(f);

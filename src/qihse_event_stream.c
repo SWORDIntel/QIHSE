@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 struct qihse_event_stream {
     char *log_directory;
 };
@@ -41,20 +42,31 @@ bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, 
     int fd = open(filepath, O_RDWR | O_CREAT, 0666);
     if (fd < 0) return false;
     
+    // Acquire exclusive lock to prevent race conditions during state transitions
+    // (fstat, ftruncate, and mmap)
+    if (flock(fd, LOCK_EX) < 0) {
+        close(fd);
+        return false;
+    }
+    
     struct stat st;
     if (fstat(fd, &st) < 0) {
+        flock(fd, LOCK_UN);
         close(fd);
         return false;
     }
     
     off_t old_size = st.st_size;
     if (ftruncate(fd, old_size + size) < 0) {
+        flock(fd, LOCK_UN);
         close(fd);
         return false;
     }
     
     long page_size = sysconf(_SC_PAGE_SIZE);
-    off_t pa_offset = old_size & ~(page_size - 1);
+    // Properly align pa_offset to page size, without assuming page size is a power of 2,
+    // thereby avoiding zero-copy mmap misalignment issues.
+    off_t pa_offset = (old_size / (off_t)page_size) * (off_t)page_size;
     size_t map_size = size + (old_size - pa_offset);
     
     void* map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, pa_offset);
@@ -62,6 +74,7 @@ bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, 
         if (ftruncate(fd, old_size) < 0) {
             // Ignore ftruncate rollback error
         }
+        flock(fd, LOCK_UN);
         close(fd);
         return false;
     }
@@ -69,6 +82,7 @@ bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, 
     memcpy((char*)map + (old_size - pa_offset), payload, size);
     
     munmap(map, map_size);
+    flock(fd, LOCK_UN);
     close(fd);
     
     return true;
