@@ -65,4 +65,21 @@ void qihse_doc_store_destroy(qihse_document_store_t* store);
  */
 bool qihse_doc_store_insert_json(qihse_document_store_t* store, uint64_t doc_id, const char* json_payload);
 
+/**
+ * @brief Represents a list of matching document IDs returned by a query.
+ */
+typedef struct {
+    uint64_t* doc_ids;
+    size_t count;
+} qihse_document_result_t;
+
+/**
+ * @brief Execute a JIT-compiled query over the document store.
+ * The query is evaluated using the qihse_bytecode_compiler.
+ * @param store Document store instance.
+ * @param where_clause NUL-terminated SQL-like WHERE expression.
+ * @return A result structure containing matching document IDs. The caller must free doc_ids.
+ */
+qihse_document_result_t qihse_doc_store_query(qihse_document_store_t* store, const char* where_clause);
+
 #endif /* QIHSE_DOCUMENT_H */
