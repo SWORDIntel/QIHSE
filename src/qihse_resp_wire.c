@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 
-extern bool qihse_vector_db_insert(qihse_vector_db_t vdb, uint64_t id, const float* vector, size_t dims, const void* metadata, size_t metadata_size);
 
 
 
@@ -91,7 +90,7 @@ static void handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_d
                     for (int i = 0; i < dim; i++) {
                         vec[i] = atof(args[3 + i]);
                     }
-                    qihse_vector_db_insert(vdb, id, vec, dim, NULL, 0);
+                    qihse_vector_db_upsert_by_ids(vdb, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
                     const char* reply = "+OK\r\n";
                     write(client_fd, reply, strlen(reply));
                     free(vec);

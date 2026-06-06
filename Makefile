@@ -15,7 +15,7 @@ QIHSE_ENABLE_AVX512?=0
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
-LDFLAGS=-L/home/john/Documents/msnet/c -lmemshadow -ldl -lm -lpthread
+LDFLAGS=-L/home/john/Documents/msnet/c -lmemshadow -ldl -lm -lpthread -lcrypto
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -97,7 +97,11 @@ test-persist: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_vector_db_persistence_test
 
-test: test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
+test: test-e2e test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
+
+test-e2e: lib
+	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=.:/home/john/Documents/msnet/c ./tests/test_qihse_e2e
 
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
