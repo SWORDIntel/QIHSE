@@ -1,0 +1,60 @@
+agt -> gemini
+agy -> codex
+agy --continue --dangerously-skip-permissions -> set +o ignoreeof
+agy -> gemini
+agy --help -> agy --continue --dangerously-skip-permissions
+agy -> ls
+agy -> set +o ignoreeof
+cd .. -> agt
+cd .. -> agy
+cd.. -> dd ..
+cd /home/john/Documents/QIHSE/ -> ls
+cd /home/john/Documents/SMARTCON/ -> agy --help
+clear -> agl
+clear -> gemini
+code -> codex
+codex -> john
+codex -> nano /etc/resolv.conf
+codex -> ping 1.1.1.1
+codex -> sudo apt remove ufw
+gemin -> clear
+gemini -> agy
+gemini -> codex
+gemini -> gemin
+gemini --resume -> sudo ./live_viewer.sh
+gemini -> set +o ignoreeof
+gemini -> sudo apt remove transmission-remote*
+john -> code
+ls -> clear
+ls -> sudo ./launch-docs.sh
+nano /etc/resolv.conf -> sudo nano /etc/resolv.conf
+ping 1.1.1.1 -> sudo ping 1.1.1.1
+set +o ignoreeof -> set -o interactive-comments
+set -o interactive-comments -> set +o keyword
+set +o keyword -> set -o monitor
+set -o monitor -> set +o noclobber
+set +o noclobber -> set +o noexec
+set +o noexec -> set +o noglob
+set +o noglob -> set +o nolog
+set +o nolog -> set +o notify
+set +o notify -> set +o onecmd
+set +o onecmd -> set +o physical
+set +o physical -> set +o posix
+set +o posix -> set +o privileged
+set +o privileged -> set +o verbose
+set +o verbose -> set +o xtrace
+set +o xtrace -> gemini
+set +o xtrace -> gemini --resume
+set +o xtrace -> set +o ignoreeof
+set +o xtrace -> sudo ./launch-docs.sh
+sudo apt remove transmission-remote* -> sudo reboot
+sudo apt remove ufw -> test
+sudo ./launch-docs.sh -> agy
+sudo ./launch-docs.sh -> sudo ./launch.sh
+sudo ./launch.sh -> set +o ignoreeof
+sudo ./live_viewer.sh -> agy
+sudo nano /etc/resolv.conf -> codex
+sudo ping 1.1.1.1 -> sudo reboot
+sudo reboot -> agy
+sudo reboot -> set +o ignoreeof
+test -> codex
