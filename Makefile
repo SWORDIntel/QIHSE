@@ -40,7 +40,7 @@ QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
 SRCS_BASE=core/qihse.c src/qihse_search.c src/qihse_math.c src/qihse_instr.c src/qihse_hetero.c src/qihse_vector_db.c src/qihse_exports.c \
      src/qihse_recursive_search.c src/qihse_temporal.c src/qihse_fusion.c src/qihse_subscription.c src/qihse_cluster.c \
-     src/qihse_kv_store.c src/qihse_resp_wire.c algorithms/qihse_trinary_trie.c src/qihse_arena.c src/qihse_fts_index.c src/qihse_document_store.c src/qihse_column_store.c src/qihse_timeseries.c src/qihse_event_stream.c \
+     src/qihse_kv_store.c src/qihse_resp_wire.c src/qihse_uwp.c algorithms/qihse_trinary_trie.c src/qihse_arena.c src/qihse_fts_index.c src/qihse_document_store.c src/qihse_column_store.c src/qihse_timeseries.c src/qihse_event_stream.c \
      src/qihse_bytecode.c src/qihse_pg_wire.c src/qihse_qql_parser.c src/qihse_sql_parser.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
