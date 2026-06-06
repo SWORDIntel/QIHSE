@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple, Union
 
 # Find libqihse.so
 _LIB_PATHS = [
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libqihse.so"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
     os.path.join(os.getcwd(), "libqihse.so"),
     "libqihse.so",
 ]
