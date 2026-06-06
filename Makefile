@@ -3,7 +3,7 @@
 
 CC=gcc
 
-CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I/home/john/Documents/msnet/c -fPIC -lm -pthread -D_GNU_SOURCE -O3
+CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./msnet -fPIC -lm -pthread -D_GNU_SOURCE -O3
 QIHSE_CFLAGS_EXTRA?=
 
 # CPU-specific SIMD backend selection.
@@ -15,7 +15,7 @@ QIHSE_ENABLE_AVX512?=0
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
-LDFLAGS=-L/home/john/Documents/msnet/c -lmemshadow -ldl -lm -lpthread -lcrypto
+LDFLAGS=-ldl -lm -lpthread -lcrypto
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -54,7 +54,8 @@ SRCS_BASE=core/qihse.c src/qihse_search.c src/qihse_math.c src/qihse_instr.c src
      memory/src/qihse_memory.c memory/src/qihse_hma.c memory/src/qihse_uma.c \
      memory/src/qihse_memory_topology_probe.c memory/src/qihse_memory_planner_trace.c memory/src/qihse_memory_allocation_policy.c \
      memory/src/qihse_memory_coherence.c memory/src/qihse_memory_migration_policy.c \
-     memory/src/qihse_memory_device_placement.c memory/src/qihse_memory_migration_backend.c memory/src/qihse_memory_migration_scheduler.c
+     memory/src/qihse_memory_device_placement.c memory/src/qihse_memory_migration_backend.c memory/src/qihse_memory_migration_scheduler.c \
+     $(wildcard msnet/*.c)
 
 SRCS=$(SRCS_BASE)
 
@@ -101,7 +102,7 @@ test: test-e2e test-persist test-trinary-codec test-memory-planner test-memory-t
 
 test-e2e: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
-	LD_LIBRARY_PATH=.:/home/john/Documents/msnet/c ./tests/test_qihse_e2e
+	LD_LIBRARY_PATH=. ./tests/test_qihse_e2e
 
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \

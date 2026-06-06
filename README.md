@@ -233,14 +233,6 @@ Persistence is caller-directed. There is no hidden daemon required for correctne
 
 ## Build
 
-### Dependencies
-QIHSE requires the MSNET (`libmemshadow`) dependency for secure memory allocations and cryptographic operations.
-Ensure `msnet/c` is cloned and built locally, and `LD_LIBRARY_PATH` is configured:
-
-```bash
-export LD_LIBRARY_PATH=.:/path/to/msnet/c:$LD_LIBRARY_PATH
-```
-
 ### Compilation
 
 ```bash
