@@ -193,8 +193,12 @@ The native QIHSE vector DB API provides trinary/qmag candidate modes and file-ba
 typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_FLOAT32 = 0,
     QIHSE_VDB_QUERY_TRINARY_SCALAR = 1,
-    QIHSE_VDB_QUERY_TRINARY_MAGNITUDE = 2,
     QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS = 3,
+    QIHSE_VDB_QUERY_GRAPH = 4,
+    QIHSE_VDB_QUERY_INT8 = 5,
+    QIHSE_VDB_QUERY_SPARSE = 6,
+    QIHSE_VDB_QUERY_FP16 = 7,
+    QIHSE_VDB_QUERY_FP32 = 8,
 } qihse_vector_db_query_mode_t;
 
 qihse_vector_db_t qihse_vector_db_open(
@@ -208,6 +212,10 @@ int qihse_vector_db_search(
     const qihse_vector_query_t* query,
     qihse_vector_result_t* results,
     size_t max_results);
+
+// Build optional FP16 and FP32 explicit sidecars
+bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb);
+bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb);
 ```
 
 - `QIHSE_VDB_QUERY_FLOAT32` uses authoritative exact float32 search and ignores

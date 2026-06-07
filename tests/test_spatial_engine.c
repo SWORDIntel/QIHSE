@@ -48,9 +48,9 @@ int main() {
     
     // Create Users
     qihse_user_t* u_operator = qihse_auth_get_user(0);
-    qihse_user_t* u_unclass = qihse_auth_create_user(u_operator, 1, QIHSE_ROLE_ANALYST, QIHSE_CLASS_UNCLASSIFIED, QIHSE_SCI_NONE, "default_password");
-    qihse_user_t* u_secret  = qihse_auth_create_user(u_operator, 2, QIHSE_ROLE_ANALYST, QIHSE_CLASS_SECRET, QIHSE_SCI_NONE, "default_password");
-    qihse_user_t* u_ts_si   = qihse_auth_create_user(u_operator, 3, QIHSE_ROLE_ANALYST, QIHSE_CLASS_TOP_SECRET, QIHSE_SCI_SI, "default_password");
+    qihse_user_t* u_unclass = qihse_auth_create_user(u_operator, 1, QIHSE_ROLE_ANALYST, QIHSE_CLASS_UNCLASSIFIED, QIHSE_SCI_NONE, "default_password", true);
+    qihse_user_t* u_secret  = qihse_auth_create_user(u_operator, 2, QIHSE_ROLE_ANALYST, QIHSE_CLASS_SECRET, QIHSE_SCI_NONE, "default_password", true);
+    qihse_user_t* u_ts_si   = qihse_auth_create_user(u_operator, 3, QIHSE_ROLE_ANALYST, QIHSE_CLASS_TOP_SECRET, QIHSE_SCI_SI, "default_password", true);
 
     // Test query as UNCLASSIFIED User
     qihse_spatial_query_bbox_user(idx, bbox_dc, u_unclass, results, 100, &num_results);

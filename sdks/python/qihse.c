@@ -204,7 +204,7 @@ static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
         return NULL;
     }
     
-    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci, "default_password");
+    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci, "default_password", true);
     if (!success) {
         PyErr_SetString(PyExc_PermissionError, "Failed to create user (clearance or God-Mode violation).");
         return NULL;

@@ -1,0 +1,12 @@
+[Unit]
+Description=Monero AFK watcher
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/monero-afk-watch.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -111,6 +111,26 @@ typedef enum qihse_vector_db_int8_status_e {
 } qihse_vector_db_int8_status_t;
 
 /**
+ * Status of the optional FP16 quantization sidecar.
+ */
+typedef enum qihse_vector_db_fp16_status_e {
+    QIHSE_VDB_FP16_ABSENT = 0,
+    QIHSE_VDB_FP16_VALID = 1,
+    QIHSE_VDB_FP16_STALE = 2,
+    QIHSE_VDB_FP16_CORRUPT = 3
+} qihse_vector_db_fp16_status_t;
+
+/**
+ * Status of the optional explicit FP32 sidecar.
+ */
+typedef enum qihse_vector_db_fp32_status_e {
+    QIHSE_VDB_FP32_ABSENT = 0,
+    QIHSE_VDB_FP32_VALID = 1,
+    QIHSE_VDB_FP32_STALE = 2,
+    QIHSE_VDB_FP32_CORRUPT = 3
+} qihse_vector_db_fp32_status_t;
+
+/**
  * Status of the optional binary quantization sidecar (1 bit per dimension).
  */
 typedef enum qihse_vector_db_binary_status_e {
@@ -142,7 +162,9 @@ typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS = 3,
     QIHSE_VDB_QUERY_GRAPH = 4,           /* Graph index candidate selection */
     QIHSE_VDB_QUERY_INT8 = 5,            /* INT8 scalar quantization candidate selection */
-    QIHSE_VDB_QUERY_SPARSE = 6           /* Sparse inverted index (BM25) candidate selection */
+    QIHSE_VDB_QUERY_SPARSE = 6,          /* Sparse inverted index (BM25) candidate selection */
+    QIHSE_VDB_QUERY_FP16 = 7,            /* FP16 candidate selection */
+    QIHSE_VDB_QUERY_FP32 = 8             /* Explicit FP32 candidate selection */
 } qihse_vector_db_query_mode_t;
 
 /**
@@ -191,6 +213,12 @@ typedef struct qihse_vector_db_persistence_stats_s {
     qihse_vector_db_int8_status_t int8_status;
     uint64_t int8_rows;
     uint64_t int8_dims;
+    qihse_vector_db_fp16_status_t fp16_status;
+    uint64_t fp16_rows;
+    uint64_t fp16_dims;
+    qihse_vector_db_fp32_status_t fp32_status;
+    uint64_t fp32_rows;
+    uint64_t fp32_dims;
 } qihse_vector_db_persistence_stats_t;
 
 /**
@@ -749,6 +777,26 @@ bool qihse_vector_db_build_graph(
  * @return true on success, false on failure
  */
 bool qihse_vector_db_build_int8(
+    qihse_vector_db_t vdb
+);
+
+/**
+ * Build or rebuild the optional FP16 quantization sidecar.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_build_fp16(
+    qihse_vector_db_t vdb
+);
+
+/**
+ * Build or rebuild the optional explicit FP32 sidecar.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_build_fp32(
     qihse_vector_db_t vdb
 );
 
