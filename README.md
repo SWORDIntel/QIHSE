@@ -65,6 +65,7 @@ The engine acts as a hierarchical memory laboratory: per-vector access tracking 
 To keep this showcase clean, all intensive code examples, API usage, and benchmark commands live in our detailed documentation suite:
 
 - **[API Reference](docs/api/README.md)**: Comprehensive C API maps for Vector DB, UWP, KV Store, and Document components.
+- **[Python Native SDK](sdks/python/README.md)**: Zero-overhead Python bindings utilizing CPython to expose the engine, proxies, and Supernatural Auth Gates directly to Python space.
 - **[Persistence Model](docs/persistence/README.md)**: File formats, WAL structure, and engine durability.
 - **[Onboarding & Building](docs/ONBOARDING.md)**: Instructions for compiling, running test suites, and executing benchmark harnesses (`make test-persist`, `make bench-micro`, etc.).
 - **[Trinary Policy Rationale](docs/qmag-policy.md)**: The theory behind `qmag` candidate selection.
