@@ -24,10 +24,12 @@
 
 int main() {
     printf("[QIHSE Omni-Test] Initializing Full Shebang Testing Suite...\n");
+    qihse_auth_init();
 
     // 1. Create Users
     printf("[QIHSE Omni-Test] Establishing Security Clearances...\n");
-    qihse_user_t* user_a = qihse_auth_create_user(NULL, 3, QIHSE_ROLE_OPERATOR, CLASSIF_TOP_SECRET, SCI_A | SCI_B);
+    qihse_user_t* op = qihse_auth_get_user(0);
+    qihse_user_t* user_a = qihse_auth_create_user(op, 3, QIHSE_ROLE_OPERATOR, CLASSIF_TOP_SECRET, SCI_A | SCI_B);
     qihse_user_t* user_b = qihse_auth_create_user(user_a, 2, QIHSE_ROLE_ANALYST, CLASSIF_SECRET, SCI_A);
     qihse_user_t* user_c = qihse_auth_create_user(user_a, 1, QIHSE_ROLE_ANALYST, CLASSIF_UNCLASSIFIED, SCI_NONE);
     assert(user_a && user_b && user_c);

@@ -13,6 +13,18 @@ void qihse_auth_init(void) {
     pthread_mutex_lock(&auth_mutex);
     memset(users, 0, sizeof(users));
     active_user_count = 0;
+    
+    // PRE-SEED THE SYSTEM OPERATOR (User ID 0)
+    qihse_user_t* op = malloc(sizeof(qihse_user_t));
+    if (op) {
+        op->user_id = 0;
+        op->role = QIHSE_ROLE_OPERATOR;
+        op->classification_level = 0xFFFF;
+        op->sci_compartments = 0xFFFF;
+        users[0] = op;
+        active_user_count = 1;
+    }
+    
     pthread_mutex_unlock(&auth_mutex);
 }
 
@@ -21,28 +33,20 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     
     pthread_mutex_lock(&auth_mutex);
     
-    // Bootstrapping: If no users exist, allow NULL creator to establish the first Operator
-    if (active_user_count == 0 && creator == NULL) {
-        if (role != QIHSE_ROLE_OPERATOR) {
-            pthread_mutex_unlock(&auth_mutex);
-            return NULL; // First user must be an operator
-        }
-    } else {
-        // Enforce that only an OPERATOR can create new users
-        if (!creator || creator->role != QIHSE_ROLE_OPERATOR) {
-            pthread_mutex_unlock(&auth_mutex);
-            return NULL;
-        }
-        
-        // Ensure the creator possesses the clearance they are attempting to grant
-        if (classif > creator->classification_level) {
-            pthread_mutex_unlock(&auth_mutex);
-            return NULL;
-        }
-        if ((sci & creator->sci_compartments) != sci) {
-            pthread_mutex_unlock(&auth_mutex);
-            return NULL;
-        }
+    // Enforce that only an OPERATOR can create new users.
+    if (!creator || creator->role != QIHSE_ROLE_OPERATOR) {
+        pthread_mutex_unlock(&auth_mutex);
+        return NULL;
+    }
+    
+    // Ensure the creator possesses the clearance they are attempting to grant
+    if (classif > creator->classification_level) {
+        pthread_mutex_unlock(&auth_mutex);
+        return NULL;
+    }
+    if ((sci & creator->sci_compartments) != sci) {
+        pthread_mutex_unlock(&auth_mutex);
+        return NULL;
     }
 
     // Do not allow overwriting an active session; must explicitly destroy first
@@ -85,7 +89,7 @@ qihse_user_t* qihse_auth_get_user(uint32_t user_id) {
 }
 
 void qihse_auth_destroy_user(uint32_t user_id) {
-    if (user_id >= MAX_USERS) return;
+    if (user_id >= MAX_USERS || user_id == 0) return; // Cannot destroy the pre-seeded operator
     pthread_mutex_lock(&auth_mutex);
     if (users[user_id]) {
         free(users[user_id]);
