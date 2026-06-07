@@ -15,7 +15,7 @@ qihse_ext = Extension(
         '../../orchestration/include',
         '../../ml/include',
         '../../quantization/include',
-        '../../msnet'
+        '../../sync'
     ],
     library_dirs=['../../'],
     libraries=['qihse'],

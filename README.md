@@ -50,6 +50,20 @@ QIHSE seamlessly weaves together eight specialized compute engines to handle any
 
 To drive these engines without trashing the CPU cache, QIHSE invented the **Unified Wire Protocol (UWP)**. UWP is a strictly binary, memory-aligned protocol that maps incoming network packets *directly* to internal C structs. It employs `pthread` detachment and `SO_RCVTIMEO` kernel enforcement to block Slowloris attacks, ensuring data traverses the network into the engines with blistering, zero-copy efficiency.
 
+UWP routes these database families explicitly:
+
+| Target | Engine | Current command |
+| --- | --- | --- |
+| `0x01` | Key-Value Store | Set |
+| `0x02` | Vector DB | Upsert |
+| `0x03` | Document Store | Insert JSON |
+| `0x04` | Columnar Engine | Append float32 |
+| `0x05` | Time-Series DB | Insert point |
+| `0x06` | Graph Engine | Reserved target |
+| `0x07` | Event Stream | Append event |
+
+The QIHSE sync replication layer currently serializes KV set and vector set payloads over the internal cluster path while the remaining engines are served through UWP or their native APIs.
+
 ---
 
 ## Uncompromising Performance, Anywhere
