@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+
+#define LSM_MEMTABLE_MAX (8 * 1024 * 1024) // 8MB
 
 typedef struct {
     char* key;
@@ -14,6 +19,11 @@ struct qihse_kv_store {
     key_entry_t* keys;
     size_t num_keys;
     size_t capacity;
+    
+    // LSM-Tree Native Implementation
+    FILE* wal_fd;
+    size_t mem_usage;
+    int sstable_counter;
 };
 
 static uint64_t current_time_ms() {
@@ -22,59 +32,114 @@ static uint64_t current_time_ms() {
     return (uint64_t)(tv.tv_sec) * 1000 + (uint64_t)(tv.tv_usec) / 1000;
 }
 
+static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
+    if (store->num_keys == 0) return;
+    
+    char sst_path[256];
+    snprintf(sst_path, sizeof(sst_path), "sstable_%d.db", store->sstable_counter++);
+    
+    qihse_kv_save(store, sst_path);
+    
+    // Reset MemTable
+    qihse_trinary_trie_destroy(store->trie);
+    store->trie = qihse_trinary_trie_create();
+    for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
+    store->num_keys = 0;
+    store->mem_usage = 0;
+    
+    // Truncate WAL
+    if (store->wal_fd) fclose(store->wal_fd);
+    store->wal_fd = fopen("wal.log", "w");
+}
+
+static void recover_from_wal(qihse_kv_store_t* store) {
+    FILE* f = fopen("wal.log", "r");
+    if (!f) return;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "SET ", 4) == 0) {
+            char* space = strchr(line + 4, ' ');
+            if (space) {
+                *space = '\0';
+                char* key = line + 4;
+                char* val = space + 1;
+                val[strcspn(val, "\n")] = '\0';
+                qihse_kv_set(store, key, val);
+            }
+        } else if (strncmp(line, "DEL ", 4) == 0) {
+            char* key = line + 4;
+            key[strcspn(key, "\n")] = '\0';
+            qihse_kv_del(store, key);
+        }
+    }
+    fclose(f);
+}
+
 qihse_kv_store_t* qihse_kv_store_create() {
     qihse_kv_store_t* store = (qihse_kv_store_t*)malloc(sizeof(qihse_kv_store_t));
-    if (!store) {
-        return NULL;
-    }
+    if (!store) return NULL;
     store->trie = qihse_trinary_trie_create();
-    if (!store->trie) {
-        free(store);
-        return NULL;
-    }
+    if (!store->trie) { free(store); return NULL; }
     store->keys = NULL;
     store->num_keys = 0;
     store->capacity = 0;
+    
+    store->wal_fd = fopen("wal.log", "a");
+    store->mem_usage = 0;
+    store->sstable_counter = 0;
+    
+    // Discover highest sstable counter
+    DIR *d;
+    struct dirent *dir;
+    d = opendir(".");
+    if (d) {
+        while ((dir = readdir(d)) != NULL) {
+            if (strncmp(dir->d_name, "sstable_", 8) == 0) {
+                int id = atoi(dir->d_name + 8);
+                if (id >= store->sstable_counter) store->sstable_counter = id + 1;
+            }
+        }
+        closedir(d);
+    }
+    
+    // Recover WAL
+    recover_from_wal(store);
+    
     return store;
 }
 
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (store) {
-        if (store->trie) {
-            qihse_trinary_trie_destroy(store->trie);
-        }
-        for (size_t i = 0; i < store->num_keys; i++) {
-            free(store->keys[i].key);
-        }
-        if (store->keys) {
-            free(store->keys);
-        }
+        if (store->wal_fd) fclose(store->wal_fd);
+        if (store->trie) qihse_trinary_trie_destroy(store->trie);
+        for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
+        if (store->keys) free(store->keys);
         free(store);
     }
 }
 
 bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
-    if (!store || !store->trie || !key || !value) {
-        return false;
+    if (!store || !store->trie || !key || !value) return false;
+    
+    if (store->wal_fd) {
+        fprintf(store->wal_fd, "SET %s %s\n", key, value);
+        fflush(store->wal_fd);
     }
 
     size_t out_size = 0;
-    /* Check if key already exists so the metadata TTL entry can be reset */
-    bool key_present = (qihse_trinary_trie_search(store->trie, key, &out_size) != NULL);
-    (void)key_present; /* Existence used below via the keys[] scan */
-
+    qihse_trinary_trie_search(store->trie, key, &out_size);
     char* dup_val = strdup(value);
-    if (!dup_val) {
-        return false;
-    }
+    if (!dup_val) return false;
 
-    bool result = qihse_trinary_trie_insert(store->trie, key, dup_val, strlen(dup_val) + 1);
-    if (!result) {
+    if (!qihse_trinary_trie_insert(store->trie, key, dup_val, strlen(dup_val) + 1)) {
         free(dup_val);
         return false;
     }
 
-    // Trie insert automatically frees the old value
+    store->mem_usage += strlen(key) + strlen(value) + 16;
+    if (store->mem_usage > LSM_MEMTABLE_MAX) {
+        flush_memtable_to_sstable(store);
+    }
     
     bool exists = false;
     for (size_t i = 0; i < store->num_keys; i++) {
@@ -96,26 +161,59 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
         store->keys[store->num_keys].expire_time_ms = 0;
         store->num_keys++;
     }
-    
     return true;
 }
 
 char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
-    if (!store || !store->trie || !key) {
-        return NULL;
-    }
+    if (!store || !store->trie || !key) return NULL;
     
     qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    if (!val) return NULL;
-    return strdup((char*)val);
+    if (val) return strdup((char*)val);
+    
+    // LSM-Tree: Search SSTables (from newest to oldest)
+    for (int i = store->sstable_counter - 1; i >= 0; i--) {
+        char sst_path[256];
+        snprintf(sst_path, sizeof(sst_path), "sstable_%d.db", i);
+        FILE* f = fopen(sst_path, "r");
+        if (!f) continue;
+        
+        char header[256];
+        while (fgets(header, sizeof(header), f)) {
+            size_t key_len, val_len;
+            unsigned long long expire_time;
+            if (sscanf(header, "%zu %zu %llu", &key_len, &val_len, &expire_time) != 3) continue;
+            
+            char* f_key = (char*)malloc(key_len + 1);
+            char* f_val = (char*)malloc(val_len + 1);
+            if (fread(f_key, 1, key_len, f) != key_len) { free(f_key); free(f_val); break; }
+            f_key[key_len] = '\0';
+            if (fread(f_val, 1, val_len, f) != val_len) { free(f_key); free(f_val); break; }
+            f_val[val_len] = '\0';
+            fgetc(f);
+            
+            if (strcmp(f_key, key) == 0) {
+                free(f_key);
+                fclose(f);
+                return f_val; // Found in older SSTable
+            }
+            free(f_key);
+            free(f_val);
+        }
+        fclose(f);
+    }
+    return NULL;
 }
 
 bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
-    if (!store || !store->trie || !key) {
-        return false;
+    if (!store || !store->trie || !key) return false;
+    
+    if (store->wal_fd) {
+        fprintf(store->wal_fd, "DEL %s\n", key);
+        fflush(store->wal_fd);
     }
+
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     if (val) {
@@ -136,14 +234,12 @@ bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
 }
 
 bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
-    if (!store || !store->trie || !key) {
-        return false;
+    char* val = qihse_kv_get(store, key);
+    if (val) {
+        free(val);
+        return true;
     }
-
-    qihse_kv_sweep_expired(store);
-    size_t out_size = 0;
-    void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    return val != NULL;
+    return false;
 }
 
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms) {
@@ -182,20 +278,18 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
 
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath) return -1;
-    
     qihse_kv_sweep_expired(store);
-    
     FILE* f = fopen(filepath, "w");
     if (!f) return -1;
     
     for (size_t i = 0; i < store->num_keys; i++) {
-        char* val = qihse_kv_get(store, store->keys[i].key);
+        size_t out_size = 0;
+        char* val = (char*)qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
         if (val) {
             fprintf(f, "%zu %zu %llu\n", strlen(store->keys[i].key), strlen(val), (unsigned long long)store->keys[i].expire_time_ms);
             fwrite(store->keys[i].key, 1, strlen(store->keys[i].key), f);
             fwrite(val, 1, strlen(val), f);
             fprintf(f, "\n");
-            free(val);
         }
     }
     fclose(f);
@@ -204,7 +298,6 @@ int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
 
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath) return -1;
-    
     FILE* f = fopen(filepath, "r");
     if (!f) return -1;
     
@@ -212,24 +305,16 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
     while (fgets(header, sizeof(header), f)) {
         size_t key_len, val_len;
         unsigned long long expire_time;
-        if (sscanf(header, "%zu %zu %llu", &key_len, &val_len, &expire_time) != 3) {
-            continue;
-        }
+        if (sscanf(header, "%zu %zu %llu", &key_len, &val_len, &expire_time) != 3) continue;
         
         char* key = (char*)malloc(key_len + 1);
         char* val = (char*)malloc(val_len + 1);
-        if (!key || !val) {
-            free(key);
-            free(val);
-            break;
-        }
+        if (!key || !val) { free(key); free(val); break; }
         
         if (fread(key, 1, key_len, f) != key_len) { free(key); free(val); break; }
         key[key_len] = '\0';
-        
         if (fread(val, 1, val_len, f) != val_len) { free(key); free(val); break; }
         val[val_len] = '\0';
-        
         fgetc(f);
         
         qihse_kv_set(store, key, val);
@@ -241,14 +326,10 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
                 }
             }
         }
-        
         free(key);
         free(val);
     }
-    
     fclose(f);
-    
     qihse_kv_sweep_expired(store);
-    
     return 0;
 }
