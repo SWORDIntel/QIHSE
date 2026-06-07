@@ -12,7 +12,7 @@ int main() {
     assert(tsdb != NULL);
 
     qihse_auth_init();
-    qihse_user_t* u_operator = qihse_auth_create_user(4, QIHSE_ROLE_OPERATOR, 0, 0);
+    qihse_user_t* u_operator = qihse_auth_create_user(NULL, 4, QIHSE_ROLE_OPERATOR, 0, 0);
 
     printf("Inserting points...\n");
     for (int i = 0; i < 2500; i++) {
