@@ -23,7 +23,7 @@ static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     
     // Initialize engines natively in memory
     self->ctx->kv = qihse_kv_store_create();
-    self->ctx->vdb = qihse_vector_db_create(QIHSE_BACKEND_CPU, NULL, NULL);
+    self->ctx->vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
     self->ctx->doc = qihse_doc_store_create(self->ctx->kv);
     self->ctx->col = qihse_column_store_create();
     self->ctx->tsdb = qihse_tsdb_create();

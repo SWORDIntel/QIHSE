@@ -29,8 +29,10 @@ uint64_t qihse_spatial_encode_zorder(double lat, double lon) {
     double nlon = (lon + 180.0) / 360.0;
     
     // Clamp to [0, 1]
-    if (nlat < 0.0) nlat = 0.0; if (nlat > 1.0) nlat = 1.0;
-    if (nlon < 0.0) nlon = 0.0; if (nlon > 1.0) nlon = 1.0;
+    if (nlat < 0.0) nlat = 0.0;
+    if (nlat > 1.0) nlat = 1.0;
+    if (nlon < 0.0) nlon = 0.0;
+    if (nlon > 1.0) nlon = 1.0;
 
     uint32_t x = (uint32_t)(nlon * 0xFFFFFFFFull);
     uint32_t y = (uint32_t)(nlat * 0xFFFFFFFFull);
