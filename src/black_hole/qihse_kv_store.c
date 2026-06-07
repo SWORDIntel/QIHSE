@@ -175,12 +175,12 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         for (size_t i = 0; i < store->num_keys; i++) {
             if (strcmp(store->keys[i].key, key) == 0) {
                 if (user && !qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                    return NULL;
+                    val = NULL; // Masked: pretend it doesn't exist in MemTable
                 }
                 break;
             }
         }
-        return strdup((char*)val);
+        if (val) return strdup((char*)val);
     }
     
     // LSM-Tree: Search SSTables (from newest to oldest)
@@ -206,12 +206,13 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
             fgetc(f);
             
             if (strcmp(f_key, key) == 0) {
+                if (user && !qihse_auth_can_access(user, classif, sci)) {
+                    free(f_key);
+                    free(f_val);
+                    continue; // Masked: pretend it doesn't exist, keep searching to match "not found" timing
+                }
                 free(f_key);
                 fclose(f);
-                if (user && !qihse_auth_can_access(user, classif, sci)) {
-                    free(f_val);
-                    return NULL;
-                }
                 return f_val; // Found in older SSTable
             }
             free(f_key);
@@ -226,17 +227,20 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* u
     if (!store || !store->trie || !key) return false;
     
     // Check auth first
-    bool has_auth = true;
+    bool has_auth = false;
+    bool found = false;
     for (size_t i = 0; i < store->num_keys; i++) {
         if (strcmp(store->keys[i].key, key) == 0) {
-            if (user && !qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                has_auth = false;
+            found = true;
+            if (!user || qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                has_auth = true;
             }
             break;
         }
     }
     
-    if (!has_auth) return false;
+    // If it exists but we don't have auth, pretend we couldn't delete it because it doesn't exist
+    if (found && !has_auth) return false;
     
     if (store->wal_fd) {
         fprintf(store->wal_fd, "DEL %s\n", key);
@@ -276,15 +280,21 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
     if (!qihse_kv_exists_user(store, key, NULL)) return false;
 
     uint64_t now = current_time_ms();
+    bool has_auth = false;
+    bool found = false;
     for (size_t i = 0; i < store->num_keys; i++) {
         if (strcmp(store->keys[i].key, key) == 0) {
-            if (user && !qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                return false;
+            found = true;
+            if (!user || qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                has_auth = true;
+                store->keys[i].expire_time_ms = now + ttl_ms;
             }
-            store->keys[i].expire_time_ms = now + ttl_ms;
-            return true;
+            break;
         }
     }
+    
+    if (found && !has_auth) return false;
+    if (found && has_auth) return true;
     return false;
 }
 
