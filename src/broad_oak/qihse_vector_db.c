@@ -6490,11 +6490,17 @@ bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb) {
     size_t dims = vdb->vector_dims;
     size_t n_rows = vdb->total_vectors;
 
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(n_rows, dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(uint16_t), &alloc_bytes)) {
+        return false;
+    }
+
     if (vdb->fp16_vectors) {
         free(vdb->fp16_vectors);
     }
     
-    vdb->fp16_bytes = n_rows * dims * sizeof(uint16_t);
+    vdb->fp16_bytes = alloc_bytes;
     vdb->fp16_vectors = (uint16_t*)malloc(vdb->fp16_bytes);
     if (!vdb->fp16_vectors) return false;
     
@@ -6529,11 +6535,17 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
     size_t dims = vdb->vector_dims;
     size_t n_rows = vdb->total_vectors;
 
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(n_rows, dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(float), &alloc_bytes)) {
+        return false;
+    }
+
     if (vdb->fp32_vectors) {
         free(vdb->fp32_vectors);
     }
     
-    vdb->fp32_bytes = n_rows * dims * sizeof(float);
+    vdb->fp32_bytes = alloc_bytes;
     vdb->fp32_vectors = (float*)malloc(vdb->fp32_bytes);
     if (!vdb->fp32_vectors) return false;
     
