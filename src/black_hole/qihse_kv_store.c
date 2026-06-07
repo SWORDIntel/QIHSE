@@ -209,7 +209,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
                 if (user && !qihse_auth_can_access(user, classif, sci)) {
                     free(f_key);
                     free(f_val);
-                    continue; // Masked: pretend it doesn't exist, keep searching to match "not found" timing
+                    break; // Masked: pretend it doesn't exist, breaking out of this file parsing loop
                 }
                 free(f_key);
                 fclose(f);
