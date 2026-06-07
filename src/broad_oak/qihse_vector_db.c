@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "qihse_system_guard.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -4309,6 +4310,7 @@ qihse_vector_db_t qihse_vector_db_open(
     const char* db_path,
     uint32_t flags
 ) {
+    qihse_system_guard_profile();
     qihse_vector_db_t vdb;
     bool file_backed = db_path && ((flags & QIHSE_VDB_OPEN_FILE_BACKED) != 0u || db_path[0] != '\0');
     bool read_only = (flags & QIHSE_VDB_OPEN_READ_ONLY) != 0u;
@@ -4921,6 +4923,11 @@ int qihse_vector_db_search(
                                                          query->candidate_count,
                                                          results, max_results);
     } else {
+        size_t requested_bytes = (size_t)vdb->live_vectors * (size_t)vdb->vector_dims * sizeof(float);
+        if (!qihse_system_guard_check_operation(requested_bytes, true)) {
+            errno = ENOMEM;
+            return -1;
+        }
         ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, max_results);
     }
 
