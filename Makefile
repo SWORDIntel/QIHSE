@@ -40,10 +40,17 @@ QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
-SRCS_BASE=core/qihse.c src/qihse_search.c src/qihse_hnsw.c src/qihse_math.c src/qihse_instr.c src/qihse_hetero.c src/qihse_vector_db.c src/qihse_exports.c \
-     src/qihse_recursive_search.c src/qihse_temporal.c src/qihse_fusion.c src/qihse_subscription.c src/qihse_cluster.c \
-     src/qihse_kv_store.c src/qihse_resp_wire.c src/qihse_uwp.c algorithms/qihse_trinary_trie.c src/qihse_arena.c src/qihse_fts_index.c src/qihse_document_store.c src/qihse_column_store.c src/qihse_timeseries.c src/qihse_event_stream.c \
-     src/qihse_bytecode.c src/qihse_bytecode_compiler.c src/qihse_pg_wire.c src/qihse_qql_parser.c qql-grammar/src/parser.c vendor/tree-sitter/lib/src/lib.c src/qihse_sql_parser.c \
+SRCS_BASE = core/qihse.c \
+            src/optic_nerve/qihse_search.c src/optic_nerve/qihse_hnsw.c \
+            src/muscular/qihse_math.c src/muscular/qihse_instr.c src/muscular/qihse_hetero.c \
+            src/optic_nerve/qihse_vector_db.c src/qihse_exports.c src/optic_nerve/qihse_recursive_search.c \
+            src/tempora/qihse_temporal.c src/muscular/qihse_fusion.c src/quantum_insert/qihse_subscription.c src/quantum_insert/qihse_cluster.c \
+            src/nosey_smurf/qihse_kv_store.c src/quantum_insert/qihse_resp_wire.c src/quantum_insert/qihse_uwp.c \
+            algorithms/qihse_trinary_trie.c src/nosey_smurf/qihse_arena.c src/karma_police/qihse_fts_index.c src/karma_police/qihse_document_store.c \
+            src/karma_police/qihse_column_store.c src/tempora/qihse_timeseries.c src/tempora/qihse_event_stream.c \
+            src/mutant_broth/qihse_bytecode.c src/mutant_broth/qihse_bytecode_compiler.c \
+            src/quantum_insert/qihse_pg_wire.c src/mutant_broth/qihse_qql_parser.c qql-grammar/src/parser.c \
+            vendor/tree-sitter/lib/src/lib.c src/mutant_broth/qihse_sql_parser.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
