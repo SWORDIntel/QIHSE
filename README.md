@@ -53,8 +53,6 @@ QIHSE treats search like a low-level systems problem rather than a dashboard fea
 
 The engine acts as a hierarchical memory laboratory: per-vector access tracking (`vectors.qtier`) allows hot/cold temperatures to automatically drive memory maintenance across Unified (UMA) and Heterogeneous (HMA) Memory Architectures. 
 
-**Battle-Tested Scale:** The QIHSE candidate pruning layers (including Trinary signatures and KV LSM paths) are continually validated by autonomous generative test harnesses. The core engines reliably process continuous 100,000+ payload iterations with a 100% success rate, completely memory-stable.
-
 **And crucially, it degrades gracefully.** The build system natively supports AVX-512 and AVX2/FMA instructions for extreme parallel throughput. However, if your system lacks these features (like older Intel chips, ARM processors, or constrained VMs), QIHSE detects this at runtime and seamlessly falls back to highly optimized scalar math. **It works flawlessly on any system.**
 
 ---
