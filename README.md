@@ -91,7 +91,7 @@ The normal accelerated paths do **not** replace exact scoring. They reduce the s
 
 ## Performance & Hardware Awareness
 
-The build system supports native C compilation, AVX2/AVX-512 paths, CPU distance backends, and experimental hooks for NPU/GPU-oriented work. 
+The build system supports native C compilation, AVX2/AVX-512 paths, CPU distance backends, and experimental hooks for NPU/GPU-oriented work. **Crucially, QIHSE degrades gracefully:** if your system lacks AVX2, AVX-512, or FMA instructions (e.g., older Intel chips, ARM processors, or resource-constrained VMs), the engine automatically detects this at runtime and falls back to highly optimized scalar math. It runs everywhere.
 
 QIHSE acts as a hierarchical memory laboratory: per-vector access tracking and tier metadata (`vectors.qtier`) allow hot/cold vector temperature to drive memory maintenance and placement behavior across Unified Memory Architecture (UMA) and Heterogeneous Memory Architecture (HMA) environments.
 
