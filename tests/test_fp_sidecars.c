@@ -37,6 +37,18 @@ int main() {
         printf("[-] FAILED: build_fp32 accepted NULL\n");
         return 1;
     }
+    if (qihse_vector_db_build_fp8(NULL)) {
+        printf("[-] FAILED: build_fp8 accepted NULL\n");
+        return 1;
+    }
+    if (qihse_vector_db_build_fp4(NULL)) {
+        printf("[-] FAILED: build_fp4 accepted NULL\n");
+        return 1;
+    }
+    if (qihse_vector_db_build_int4(NULL)) {
+        printf("[-] FAILED: build_int4 accepted NULL\n");
+        return 1;
+    }
     printf("[+] NULL handling passed.\n");
 
     // 3. Build sidecars
@@ -53,6 +65,27 @@ int main() {
         return 1;
     }
     printf("[+] Built FP32 sidecar.\n");
+
+    ok = qihse_vector_db_build_fp8(vdb);
+    if (!ok) {
+        printf("[-] Failed to build FP8\n");
+        return 1;
+    }
+    printf("[+] Built FP8 sidecar.\n");
+
+    ok = qihse_vector_db_build_fp4(vdb);
+    if (!ok) {
+        printf("[-] Failed to build FP4\n");
+        return 1;
+    }
+    printf("[+] Built FP4 sidecar.\n");
+
+    ok = qihse_vector_db_build_int4(vdb);
+    if (!ok) {
+        printf("[-] Failed to build INT4\n");
+        return 1;
+    }
+    printf("[+] Built INT4 sidecar.\n");
 
     // 4. Test missing statuses (query should gracefully handle valid/invalid statuses)
     qihse_vector_query_t q;
@@ -73,18 +106,36 @@ int main() {
 
     q.query_mode = QIHSE_VDB_QUERY_FP32;
     n = qihse_vector_db_search(vdb, &q, res, 1);
-    if (n < 0) {
-        printf("[-] FP32 search failed: %d\n", n);
+    if (n < 0 || res[0].id != 1) {
+        printf("[-] FP32 search failed or wrong result\n");
         return 1;
     }
-    printf("[+] FP32 search returned %d results.\n", n);
-    
-    // Check results
-    if (res[0].id != 1) {
-        printf("[-] Expected vector ID 1, got %llu\n", (unsigned long long)res[0].id);
-        return 1;
-    }
+    printf("[+] FP32 search returned correct result.\n");
 
+    q.query_mode = QIHSE_VDB_QUERY_FP8;
+    n = qihse_vector_db_search(vdb, &q, res, 1);
+    if (n < 0 || res[0].id != 1) {
+        printf("[-] FP8 search failed or wrong result\n");
+        return 1;
+    }
+    printf("[+] FP8 search returned correct result.\n");
+
+    q.query_mode = QIHSE_VDB_QUERY_FP4;
+    n = qihse_vector_db_search(vdb, &q, res, 1);
+    if (n < 0 || res[0].id != 1) {
+        printf("[-] FP4 search failed or wrong result\n");
+        return 1;
+    }
+    printf("[+] FP4 search returned correct result.\n");
+
+    q.query_mode = QIHSE_VDB_QUERY_INT4;
+    n = qihse_vector_db_search(vdb, &q, res, 1);
+    if (n < 0 || res[0].id != 1) {
+        printf("[-] INT4 search failed or wrong result\n");
+        return 1;
+    }
+    printf("[+] INT4 search returned correct result.\n");
+    
     qihse_vector_db_destroy(vdb);
 
     printf("ALL TESTS PASSED.\n");
