@@ -215,11 +215,64 @@ cleanup:
     return NULL;
 }
 
+#include <liburing.h>
+
+#define URING_ENTRIES 1024
+#define URING_BUF_SIZE 8192
+
+typedef enum {
+    EVENT_ACCEPT = 0,
+    EVENT_READ,
+    EVENT_WRITE
+} uwp_event_type_t;
+
+typedef struct {
+    uwp_event_type_t type;
+    int fd;
+    qihse_uwp_context_t* ctx;
+    uint8_t buf[URING_BUF_SIZE];
+    size_t buf_len;
+} uwp_event_ctx_t;
+
+static void uwp_add_accept(struct io_uring *ring, int server_fd, qihse_uwp_context_t* uwp_ctx, struct sockaddr_in *client_addr, socklen_t *client_len) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    ev->type = EVENT_ACCEPT;
+    ev->fd = server_fd;
+    ev->ctx = uwp_ctx;
+    
+    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)client_addr, client_len, 0);
+    io_uring_sqe_set_data(sqe, ev);
+}
+
+static void uwp_add_read(struct io_uring *ring, int client_fd, qihse_uwp_context_t* uwp_ctx) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    ev->type = EVENT_READ;
+    ev->fd = client_fd;
+    ev->ctx = uwp_ctx;
+    
+    io_uring_prep_recv(sqe, client_fd, ev->buf, URING_BUF_SIZE, 0);
+    io_uring_sqe_set_data(sqe, ev);
+}
+
+static void uwp_add_write(struct io_uring *ring, int client_fd, const char* reply_str) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    ev->type = EVENT_WRITE;
+    ev->fd = client_fd;
+    ev->ctx = NULL; // not needed for write completion
+    ev->buf_len = strlen(reply_str);
+    memcpy(ev->buf, reply_str, ev->buf_len);
+    
+    io_uring_prep_send(sqe, client_fd, ev->buf, ev->buf_len, 0);
+    io_uring_sqe_set_data(sqe, ev);
+}
+
 bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address) {
-    int server_fd, client_fd;
+    int server_fd;
     struct sockaddr_in address;
     int opt = 1;
-    int addrlen = sizeof(address);
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
@@ -252,33 +305,64 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
         return false;
     }
 
-    printf("[QIHSE UWP] Multiplexer Online on %s:%d (Zero-Copy Binary Protocol)\n", 
+    printf("[QIHSE UWP] Multiplexer Online on %s:%d (Zero-Copy io_uring Network Engine)\n", 
            bind_address ? bind_address : "0.0.0.0", port);
 
-    while (1) {
-        if ((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept");
-            continue;
-        }
-
-        /* Spawn a thread per client to prevent one blocked connection from stalling the entire server */
-        client_thread_data_t* data = malloc(sizeof(client_thread_data_t));
-        if (!data) {
-            close(client_fd);
-            continue;
-        }
-        data->client_fd = client_fd;
-        data->ctx = ctx;
-
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, uwp_handle_client_thread, data) != 0) {
-            perror("pthread_create");
-            free(data);
-            close(client_fd);
-        } else {
-            pthread_detach(thread_id);
-        }
+    struct io_uring ring;
+    if (io_uring_queue_init(URING_ENTRIES, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        return false;
     }
 
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    uwp_add_accept(&ring, server_fd, ctx, &client_addr, &client_len);
+    io_uring_submit(&ring);
+
+    while (1) {
+        struct io_uring_cqe *cqe;
+        int ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            perror("io_uring_wait_cqe");
+            break;
+        }
+
+        uwp_event_ctx_t *ev = (uwp_event_ctx_t *)io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+
+        if (ev->type == EVENT_ACCEPT) {
+            uwp_add_accept(&ring, server_fd, ctx, &client_addr, &client_len);
+            if (res >= 0) {
+                uwp_add_read(&ring, res, ctx);
+            }
+            io_uring_submit(&ring);
+        } else if (ev->type == EVENT_READ) {
+            if (res <= 0) {
+                close(ev->fd);
+            } else {
+                ev->buf[res] = '\0';
+                
+                // Extremely simple dispatcher for the async loop:
+                if (res > 5 && memcmp(ev->buf, "QIHSE", 5) == 0) {
+                    qihse_uwp_header_t* header = (qihse_uwp_header_t*)ev->buf;
+                    uint8_t* payload = ev->buf + sizeof(qihse_uwp_header_t);
+                    uwp_route_payload(ev->fd, ev->ctx, header, payload);
+                } else {
+                    // QQL
+                    void* ast = qihse_parse_qql_to_ast((char*)ev->buf);
+                    (void)ast;
+                    uwp_add_write(&ring, ev->fd, "QQL OK\n");
+                    io_uring_submit(&ring);
+                }
+            }
+        } else if (ev->type == EVENT_WRITE) {
+            close(ev->fd);
+        }
+        free(ev);
+    }
+    
+    io_uring_queue_exit(&ring);
     return true;
 }
