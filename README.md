@@ -35,7 +35,7 @@ QIHSE seamlessly weaves together eight specialized compute engines to handle any
 1. **The Vector DB**: Acting as the optic nerve of the engine, it uses an exactness-first `float32` core. Accelerators like Trinary signatures (`qtri`/`qmag`), INT8 quantization, and sparse indexing act as execution layers that rapidly reduce the search space before an authoritative, exact rerank.
 2. **The Key-Value Store**: An O(k) Trinary Trie memory engine backed by native LSM-Trees and SSTable persistence for instantaneous, lock-free lookups.
 3. **The Document Store**: A JIT-compiled JSON document engine that translates hot access patterns directly into executing bytecode.
-4. **The Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing act as a tempora sink to absorb massive telemetry streams effortlessly.
+4. **The Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing act as a temporaӏ sink to absorb massive telemetry streams effortlessly.
 5. **The Columnar Engine**: An AVX-accelerated OLAP backend utilizing strided OS page alignments for massive aggregations and Run-Length Encoding sweeps.
 6. **The Graph Engine**: Multi-hop traversal routed dynamically via Anchor and HNSW algorithms.
 7. **The FTS Engine**: Zero-copy lexical tokenization with native BM25 scoring for pinpoint full-text search.
