@@ -10,6 +10,7 @@ extern "C" {
 
 // Define Roles
 #define QIHSE_ROLE_OPERATOR 0  // Full God-Mode Access
+#define QIHSE_ROLE_CHUCK    0  // Full God-Mode Access (Supernatural Alias)
 #define QIHSE_ROLE_ANALYST  1  // Restricted by Clearance & SCI
 #define QIHSE_ROLE_GUEST    2  // Unclassified Only
 
