@@ -11,7 +11,7 @@ int main() {
     // First run: insert data
     qihse_kv_store_t* store1 = qihse_kv_store_create();
     qihse_auth_init();
-    qihse_user_t* u_operator = qihse_auth_create_user(4, QIHSE_ROLE_OPERATOR, 0, 0);
+    qihse_user_t* u_operator = qihse_auth_create_user(NULL, 4, QIHSE_ROLE_OPERATOR, 0, 0);
 
     printf("[1] Writing key to WAL / MemTable...\n");
     qihse_kv_set(store1, "lsm_key", "survives_crash", 0, 0);

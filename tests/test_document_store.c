@@ -29,7 +29,7 @@ int main(void) {
     qihse_doc_store_insert_json(store, 1003, doc3);
 
     qihse_auth_init();
-    qihse_user_t* u_operator = qihse_auth_create_user(4, QIHSE_ROLE_OPERATOR, 0, 0);
+    qihse_user_t* u_operator = qihse_auth_create_user(NULL, 4, QIHSE_ROLE_OPERATOR, 0, 0);
 
     printf("Executing query: age >= 25 AND score > 80\n");
     qihse_document_result_t res = qihse_doc_store_query_user(store, "age >= 25 AND score > 80", u_operator);

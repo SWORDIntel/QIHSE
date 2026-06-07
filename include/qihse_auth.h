@@ -24,8 +24,8 @@ typedef struct qihse_user_s {
 // Global Auth Context (Simplification for simulation)
 void qihse_auth_init(void);
 
-// Create a user. Defaults to QIHSE_ROLE_OPERATOR with TOP_SECRET and all SCI if not specified.
-qihse_user_t* qihse_auth_create_user(uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci);
+// Create a user. Only an OPERATOR can create a user. If no users exist, passing NULL for creator establishes the first operator.
+qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci);
 
 qihse_user_t* qihse_auth_get_user(uint32_t user_id);
 
