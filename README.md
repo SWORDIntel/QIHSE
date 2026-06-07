@@ -81,6 +81,8 @@ This is not a gateway filter. The clearance check is the absolute **first mathem
 
 **[Read the full Security Architecture deep dive here.](docs/security/README.md)**
 
+> **TODO:** Implement an Immutable Audit Trail to cryptographically log all security-relevant access and clearance modifications.
+
 ---
 
 ## License and Use
