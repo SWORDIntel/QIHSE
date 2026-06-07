@@ -52,7 +52,7 @@ void qihse_auth_destroy_user(uint32_t user_id) {
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci) {
     if (!user) return true; // Default: full access if no user provided
 
-    // God Mode
+    // God Mode requires explicit operator role assignment
     if (user->role == QIHSE_ROLE_OPERATOR) return true;
 
     // Clearance Check

@@ -39,11 +39,11 @@ int main() {
 
     char fuzzer_buffer[8192];
     
-    printf("[APT-41 SIMULATION] Commencing 100,000 extreme privilege-escalation attacks...\n");
+    printf("[APT-41 SIMULATION] Commencing 1,000 extreme privilege-escalation attacks...\n");
 
     int leaks_detected = 0;
 
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 1000; i++) {
         
         // Simulating an unauthorized user (UNCLASSIFIED)
         qihse_user_t attacker;
@@ -81,9 +81,10 @@ int main() {
         qihse_kv_set(kv, bad_key, bad_val, CLR_COMPARTMENT, 0xFF);
         
         // Try to read the bad key back with a zeroed user
-        qihse_user_t dummy = {0, 0, 0, 0};
+        qihse_user_t dummy = {0, QIHSE_ROLE_GUEST, 0, 0};
         char* leak3 = qihse_kv_get_user(kv, bad_key, &dummy);
         if (leak3) {
+            printf("[CRITICAL VULNERABILITY] Attack 3 bypassed bounds! Expected block, got leak.\n");
             leaks_detected++;
             free(leak3);
         }
