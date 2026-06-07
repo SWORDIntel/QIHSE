@@ -3,7 +3,7 @@
 
 CC=gcc
 
-INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./msnet -I./vendor/tree-sitter/lib/include
+INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3
 QIHSE_CFLAGS_EXTRA?=
 
@@ -64,7 +64,7 @@ SRCS_BASE = core/qihse.c core/qihse_auth.c \
      memory/src/qihse_memory_topology_probe.c memory/src/qihse_memory_planner_trace.c memory/src/qihse_memory_allocation_policy.c \
      memory/src/qihse_memory_coherence.c memory/src/qihse_memory_migration_policy.c \
      memory/src/qihse_memory_device_placement.c memory/src/qihse_memory_migration_backend.c memory/src/qihse_memory_migration_scheduler.c \
-     $(wildcard msnet/*.c)
+     $(wildcard sync/*.c)
 
 SRCS=$(SRCS_BASE)
 

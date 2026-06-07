@@ -15,6 +15,23 @@
   - `make persistence` (build + persistence regression test)
   - `make validate-reference-workflow` (benchmark + persistence end-to-end)
 
+## Database Surface Coverage
+
+QIHSE documents and exposes the following database families:
+
+| Database family | Primary path | Notes |
+| --- | --- | --- |
+| Vector DB | Native API, UWP target `0x02`, sync replication | Exact `float32` rerank with trinary and quantized candidate filtering. |
+| Key-Value Store | Native API, UWP target `0x01`, sync replication | Trinary trie and LSM/SSTable-backed persistence. |
+| Document Store | Native API, UWP target `0x03` | JSON insertion and JIT document access paths. |
+| Time-Series DB | Native API, UWP target `0x05` | Series/timestamp/value point insertion. |
+| Columnar Engine | Native API, UWP target `0x04` | Float column append and OLAP-oriented storage. |
+| Graph Engine | Native API, UWP target `0x06` reserved | Traversal/search APIs are documented; the UWP target is reserved for routing. |
+| Full-Text Search | Native API | BM25/tokenized lexical search. |
+| Event Stream | Native API, UWP target `0x07` | Append-only topic event ingestion. |
+
+The internal QIHSE sync cluster path is intentionally narrower than UWP today: it replicates KV set and vector set payloads and rejects payloads without the QIHSE cluster magic guard.
+
 ## 🏆 System Capabilities
 
 ### ⚡ **Heterogeneous Parallel Computing**

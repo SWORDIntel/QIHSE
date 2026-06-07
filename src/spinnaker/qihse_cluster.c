@@ -5,7 +5,7 @@
 
 const uint8_t QIHSE_CLUSTER_MAGIC[QIHSE_CLUSTER_MAGIC_LEN] = {'Q','I','H','S','E'};
 
-static memshadow_gossip_manager_t* g_cluster_manager = NULL;
+static qihse_sync_manager_t* g_cluster_manager = NULL;
 static qihse_kv_store_t* g_kv = NULL;
 static qihse_vector_db_t g_vdb = NULL;
 
@@ -13,23 +13,23 @@ bool qihse_cluster_init(const char* node_id, qihse_kv_store_t* kv, qihse_vector_
     g_kv = kv;
     g_vdb = vdb;
     
-    int ret = memshadow_gossip_manager_init(&g_cluster_manager, node_id, 3, 1000);
+    int ret = qihse_sync_manager_init(&g_cluster_manager, node_id, 3, 1000);
     return (ret == 0);
 }
 
 bool qihse_cluster_join(const char* peer_ip, uint16_t peer_port) {
     if (!g_cluster_manager) return false;
     
-    memshadow_gossip_peer_t peer;
+    qihse_sync_peer_t peer;
     char peer_id[64];
     snprintf(peer_id, sizeof(peer_id), "%s:%u", peer_ip, peer_port);
     
-    if (memshadow_gossip_peer_init(&peer, peer_id, peer_ip, peer_port) != 0) {
+    if (qihse_sync_peer_init(&peer, peer_id, peer_ip, peer_port) != 0) {
         return false;
     }
     
-    if (memshadow_gossip_manager_add_peer(g_cluster_manager, peer) != 0) {
-        memshadow_gossip_peer_cleanup(&peer);
+    if (qihse_sync_manager_add_peer(g_cluster_manager, peer) != 0) {
+        qihse_sync_peer_cleanup(&peer);
         return false;
     }
     
@@ -59,7 +59,7 @@ void qihse_cluster_broadcast_kv_set(const char* key, const char* value) {
     offset += sizeof(uint32_t);
     memcpy(payload + offset, value, val_len);
     
-    memshadow_gossip_manager_broadcast_message(g_cluster_manager, GOSSIP_MSG_DATA_BROADCAST, payload, payload_size, 32);
+    qihse_sync_manager_broadcast_message(g_cluster_manager, QIHSE_SYNC_CMD_DATA_REPLICATE, payload, payload_size, 32);
     free(payload);
 }
 
@@ -81,7 +81,7 @@ void qihse_cluster_broadcast_vec_set(uint64_t id, const float* vector, size_t di
     offset += sizeof(uint32_t);
     memcpy(payload + offset, vector, dims * sizeof(float));
     
-    memshadow_gossip_manager_broadcast_message(g_cluster_manager, GOSSIP_MSG_DATA_BROADCAST, payload, payload_size, 32);
+    qihse_sync_manager_broadcast_message(g_cluster_manager, QIHSE_SYNC_CMD_DATA_REPLICATE, payload, payload_size, 32);
     free(payload);
 }
 
