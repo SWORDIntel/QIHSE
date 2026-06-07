@@ -350,6 +350,23 @@ double avg = qihse_tsdb_average_range_user(tsdb, start_ts, end_ts, u_operator);
 qihse_auth_destroy_user(1001);
 ```
 
+### Hardware Token Enforcement (YubiKey / FIDO2)
+
+By design, hardware token enforcement can be applied natively at the system level. 
+- **God-Mode Operators (Role 0)**: Strictly required to present a hardware token. There is no bypass for this policy.
+- **Analysts (Role 1)**: Strictly required to present a hardware token to access any data, including unclassified data.
+- **Configurability**: When creating a user via `qihse_auth_create_user`, an Operator can define whether that specific session/account mandates hardware token authentication via the `requires_hw_token` boolean. 
+
+### Password Policies
+
+Users can be instantiated with an optional password. The system will issue the following warning if the password fails complexity checks (< 6 characters), designed with military operational awareness in mind:
+
+> **[WARNING]** The password assigned to User ID X is pathetically weak (under 6 characters).
+> If an adversary is trying passwords at this terminal, you got bigger problems than a weak password.
+> If they are running brute force against it and nobody is there to stop them, your security is doing an outstanding job, keep at it.
+
+This ensures operators maintain realistic threat modeling. All passwords, regardless of length, are passed through a SHA-256 hash derivative and never stored in plaintext within the `qihse_user_t` state struct.
+
 ### Role-Based Access Control (RBAC)
 
 ```c
