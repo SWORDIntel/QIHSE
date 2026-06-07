@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     printf("[QIHSE SERVER] Initializing engines...\n");
 
     global_kv = qihse_kv_store_create();
-    global_vdb = qihse_vector_db_create(QIHSE_BACKEND_CPU, NULL, NULL);
+    global_vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
 
     if (!global_kv || !global_vdb) {
         fprintf(stderr, "Failed to initialize databases.\n");
