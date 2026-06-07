@@ -32,14 +32,14 @@ Everything is natively orchestrated. Fast paths are visible. Memory is strictly 
 
 QIHSE seamlessly weaves together eight specialized compute engines to handle any workload you can throw at it:
 
-1. **The Vector DB**: An exactness-first `float32` core. Accelerators like Trinary signatures (`qtri`/`qmag`), INT8 quantization, and sparse indexing act as execution layers that rapidly reduce the search space before an authoritative, exact rerank.
+1. **The Vector DB**: Acting as the optic nerve of the engine, it uses an exactness-first `float32` core. Accelerators like Trinary signatures (`qtri`/`qmag`), INT8 quantization, and sparse indexing act as execution layers that rapidly reduce the search space before an authoritative, exact rerank.
 2. **The Key-Value Store**: An O(k) Trinary Trie memory engine backed by native LSM-Trees and SSTable persistence for instantaneous, lock-free lookups.
 3. **The Document Store**: A JIT-compiled JSON document engine that translates hot access patterns directly into executing bytecode.
-4. **The Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing to absorb massive temporal telemetry streams effortlessly.
+4. **The Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing act as a tempora sink to absorb massive telemetry streams effortlessly.
 5. **The Columnar Engine**: An AVX-accelerated OLAP backend utilizing strided OS page alignments for massive aggregations and Run-Length Encoding sweeps.
 6. **The Graph Engine**: Multi-hop traversal routed dynamically via Anchor and HNSW algorithms.
 7. **The FTS Engine**: Zero-copy lexical tokenization with native BM25 scoring for pinpoint full-text search.
-8. **The Event Stream**: A raw, append-only log engine bypassing user-space entirely via Linux `mmap` and `sendfile` DMA.
+8. **The Event Stream**: A raw, append-only log engine bypassing user-space entirely via Linux `mmap` and `sendfile` DMA, effectively policing the karma of system events.
 
 ### Orchestrated by the UWP
 
@@ -78,7 +78,7 @@ To keep this showcase clean, all intensive code examples, API usage, and benchma
 
 However, for those building intelligence, defense, or ultra-secure forensic systems, QIHSE natively supports **US / Five Eyes / SCI compartmentation** woven directly into the low-level data plane. Every single record can carry a Classification Boundary and SCI bitmask. 
 
-This is not a gateway filter. The clearance check is the absolute **first mathematical operation** in the pipeline. If a user queries a key or vector they lack clearance for, the system executes an identical algorithmic path as if the data simply did not exist. There are zero timing leaks, and unauthorized users mathematically cannot deduce the existence of classified data. 
+This is not a gateway filter. The clearance check is the absolute **first mathematical operation** in the pipeline. Built with paranoia-level self-protections, if a user queries a key or vector they lack clearance for, the system executes an identical algorithmic path as if the data simply did not exist. There are zero timing leaks, and unauthorized users mathematically cannot deduce the existence of classified data. Even the most muscular network taps will see nothing but uniform algorithmic noise. 
 
 **[Read the full Security Architecture deep dive here.](docs/security/README.md)**
 
