@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdio.h>
 
 #define MAX_USERS 1024
 
@@ -89,7 +90,25 @@ qihse_user_t* qihse_auth_get_user(uint32_t user_id) {
 }
 
 void qihse_auth_destroy_user(uint32_t user_id) {
-    if (user_id >= MAX_USERS || user_id == 0) return; // Cannot destroy the pre-seeded operator
+    if (user_id >= MAX_USERS) return; 
+    
+    if (user_id == 0) {
+        printf("[WARNING] You are about to literally kill God.\n");
+        printf("You must have created roles that satisfy all your needed functions. Once God is dead, he ain't coming back.\n");
+        printf("If that is acceptable, I will load the Colt, bless the bullet, and we can fire away. (Y/N): ");
+        fflush(stdout);
+        char response[10];
+        if (fgets(response, sizeof(response), stdin) != NULL) {
+            if (response[0] != 'Y' && response[0] != 'y') {
+                printf("Crisis averted. The Operator lives.\n");
+                return;
+            }
+        } else {
+            return;
+        }
+        printf("Firing away...\n");
+    }
+    
     pthread_mutex_lock(&auth_mutex);
     if (users[user_id]) {
         free(users[user_id]);
