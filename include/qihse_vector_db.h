@@ -131,6 +131,36 @@ typedef enum qihse_vector_db_fp32_status_e {
 } qihse_vector_db_fp32_status_t;
 
 /**
+ * Status of the optional FP8 quantization sidecar.
+ */
+typedef enum qihse_vector_db_fp8_status_e {
+    QIHSE_VDB_FP8_ABSENT = 0,
+    QIHSE_VDB_FP8_VALID = 1,
+    QIHSE_VDB_FP8_STALE = 2,
+    QIHSE_VDB_FP8_CORRUPT = 3
+} qihse_vector_db_fp8_status_t;
+
+/**
+ * Status of the optional FP4 quantization sidecar.
+ */
+typedef enum qihse_vector_db_fp4_status_e {
+    QIHSE_VDB_FP4_ABSENT = 0,
+    QIHSE_VDB_FP4_VALID = 1,
+    QIHSE_VDB_FP4_STALE = 2,
+    QIHSE_VDB_FP4_CORRUPT = 3
+} qihse_vector_db_fp4_status_t;
+
+/**
+ * Status of the optional INT4 quantization sidecar.
+ */
+typedef enum qihse_vector_db_int4_status_e {
+    QIHSE_VDB_INT4_ABSENT = 0,
+    QIHSE_VDB_INT4_VALID = 1,
+    QIHSE_VDB_INT4_STALE = 2,
+    QIHSE_VDB_INT4_CORRUPT = 3
+} qihse_vector_db_int4_status_t;
+
+/**
  * Status of the optional binary quantization sidecar (1 bit per dimension).
  */
 typedef enum qihse_vector_db_binary_status_e {
@@ -164,7 +194,10 @@ typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_INT8 = 5,            /* INT8 scalar quantization candidate selection */
     QIHSE_VDB_QUERY_SPARSE = 6,          /* Sparse inverted index (BM25) candidate selection */
     QIHSE_VDB_QUERY_FP16 = 7,            /* FP16 candidate selection */
-    QIHSE_VDB_QUERY_FP32 = 8             /* Explicit FP32 candidate selection */
+    QIHSE_VDB_QUERY_FP32 = 8,            /* Explicit FP32 candidate selection */
+    QIHSE_VDB_QUERY_FP8 = 9,             /* FP8 candidate selection */
+    QIHSE_VDB_QUERY_FP4 = 10,            /* FP4 candidate selection */
+    QIHSE_VDB_QUERY_INT4 = 11            /* INT4 candidate selection */
 } qihse_vector_db_query_mode_t;
 
 /**
@@ -219,6 +252,15 @@ typedef struct qihse_vector_db_persistence_stats_s {
     qihse_vector_db_fp32_status_t fp32_status;
     uint64_t fp32_rows;
     uint64_t fp32_dims;
+    qihse_vector_db_fp8_status_t fp8_status;
+    uint64_t fp8_rows;
+    uint64_t fp8_dims;
+    qihse_vector_db_fp4_status_t fp4_status;
+    uint64_t fp4_rows;
+    uint64_t fp4_dims;
+    qihse_vector_db_int4_status_t int4_status;
+    uint64_t int4_rows;
+    uint64_t int4_dims;
 } qihse_vector_db_persistence_stats_t;
 
 /**
@@ -797,6 +839,36 @@ bool qihse_vector_db_build_fp16(
  * @return true on success, false on failure
  */
 bool qihse_vector_db_build_fp32(
+    qihse_vector_db_t vdb
+);
+
+/**
+ * Build or rebuild the optional FP8 sidecar.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_build_fp8(
+    qihse_vector_db_t vdb
+);
+
+/**
+ * Build or rebuild the optional FP4 sidecar.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_build_fp4(
+    qihse_vector_db_t vdb
+);
+
+/**
+ * Build or rebuild the optional INT4 sidecar.
+ *
+ * @param vdb Vector database handle
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_build_int4(
     qihse_vector_db_t vdb
 );
 

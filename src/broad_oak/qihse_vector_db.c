@@ -215,6 +215,27 @@ struct qihse_vector_db_s {
     size_t fp32_dims;
     size_t fp32_bytes;
 
+    /* FP8 quantization sidecar */
+    qihse_vector_db_fp8_status_t fp8_status;
+    uint8_t* fp8_vectors;         /* Flat FP8 vectors */
+    size_t fp8_rows;
+    size_t fp8_dims;
+    size_t fp8_bytes;
+
+    /* FP4 quantization sidecar */
+    qihse_vector_db_fp4_status_t fp4_status;
+    uint8_t* fp4_vectors;         /* Packed FP4 vectors: 2 dims per byte */
+    size_t fp4_rows;
+    size_t fp4_dims;
+    size_t fp4_bytes;
+
+    /* INT4 quantization sidecar */
+    qihse_vector_db_int4_status_t int4_status;
+    uint8_t* int4_vectors;        /* Packed INT4 vectors: 2 dims per byte */
+    size_t int4_rows;
+    size_t int4_dims;
+    size_t int4_bytes;
+
     /* Binary quantization sidecar (1 bit per dimension) */
     qihse_vector_db_binary_status_t binary_status;
     uint64_t* binary_vectors;      /* Packed bits: n_rows * ceil(dims/64) uint64_t */
@@ -4932,12 +4953,26 @@ int qihse_vector_db_search(
             return -1;
         }
         ret = qihse_vdb_search_sparse(vdb, query, results, max_results);
-    } else if (query && (query->query_mode == QIHSE_VDB_QUERY_FP16 || query->query_mode == QIHSE_VDB_QUERY_FP32)) {
+    } else if (query && (query->query_mode == QIHSE_VDB_QUERY_FP16 || query->query_mode == QIHSE_VDB_QUERY_FP32 || 
+                         query->query_mode == QIHSE_VDB_QUERY_FP8 || query->query_mode == QIHSE_VDB_QUERY_FP4 || 
+                         query->query_mode == QIHSE_VDB_QUERY_INT4)) {
         if (query->query_mode == QIHSE_VDB_QUERY_FP16 && vdb->fp16_status != QIHSE_VDB_FP16_VALID) {
             errno = ENOENT;
             return -1;
         }
         if (query->query_mode == QIHSE_VDB_QUERY_FP32 && vdb->fp32_status != QIHSE_VDB_FP32_VALID) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (query->query_mode == QIHSE_VDB_QUERY_FP8 && vdb->fp8_status != QIHSE_VDB_FP8_VALID) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (query->query_mode == QIHSE_VDB_QUERY_FP4 && vdb->fp4_status != QIHSE_VDB_FP4_VALID) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (query->query_mode == QIHSE_VDB_QUERY_INT4 && vdb->int4_status != QIHSE_VDB_INT4_VALID) {
             errno = ENOENT;
             return -1;
         }
@@ -6566,6 +6601,155 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
     return true;
 }
 
+bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
+    if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
+        return false;
+    }
+    size_t dims = vdb->vector_dims;
+    size_t n_rows = vdb->total_vectors;
+
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(n_rows, dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(uint8_t), &alloc_bytes)) {
+        return false;
+    }
+
+    if (vdb->fp8_vectors) {
+        free(vdb->fp8_vectors);
+    }
+    
+    vdb->fp8_bytes = alloc_bytes;
+    vdb->fp8_vectors = (uint8_t*)malloc(vdb->fp8_bytes);
+    if (!vdb->fp8_vectors) return false;
+    
+    for (size_t i = 0; i < n_rows; i++) {
+        const qihse_index_row_t* row = &vdb->rows[i];
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            for (size_t j = 0; j < dims; j++) {
+                uint32_t bits;
+                memcpy(&bits, &src[j], sizeof(float));
+                uint8_t fp8 = (bits >> 24) & 0x80;
+                fp8 |= ((bits >> 23) & 0x0F) << 3;
+                fp8 |= ((bits >> 20) & 0x07);
+                vdb->fp8_vectors[i * dims + j] = fp8;
+            }
+        } else {
+            memset(&vdb->fp8_vectors[i * dims], 0, dims * sizeof(uint8_t));
+        }
+    }
+    
+    vdb->fp8_rows = n_rows;
+    vdb->fp8_dims = dims;
+    vdb->fp8_status = QIHSE_VDB_FP8_VALID;
+    return true;
+}
+
+bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
+    if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
+        return false;
+    }
+    size_t dims = vdb->vector_dims;
+    size_t packed_dims = (dims + 1) / 2;
+    size_t n_rows = vdb->total_vectors;
+
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(n_rows, packed_dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(uint8_t), &alloc_bytes)) {
+        return false;
+    }
+
+    if (vdb->fp4_vectors) {
+        free(vdb->fp4_vectors);
+    }
+    
+    vdb->fp4_bytes = alloc_bytes;
+    vdb->fp4_vectors = (uint8_t*)malloc(vdb->fp4_bytes);
+    if (!vdb->fp4_vectors) return false;
+    
+    for (size_t i = 0; i < n_rows; i++) {
+        const qihse_index_row_t* row = &vdb->rows[i];
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            for (size_t j = 0; j < packed_dims; j++) {
+                uint8_t packed = 0;
+                for (int k = 0; k < 2; k++) {
+                    if (j * 2 + k < dims) {
+                        uint32_t bits;
+                        memcpy(&bits, &src[j * 2 + k], sizeof(float));
+                        uint8_t fp4 = (bits >> 28) & 0x08;
+                        fp4 |= ((bits >> 23) & 0x03) << 1;
+                        fp4 |= ((bits >> 22) & 0x01);
+                        packed |= (fp4 << (k * 4));
+                    }
+                }
+                vdb->fp4_vectors[i * packed_dims + j] = packed;
+            }
+        } else {
+            memset(&vdb->fp4_vectors[i * packed_dims], 0, packed_dims * sizeof(uint8_t));
+        }
+    }
+    
+    vdb->fp4_rows = n_rows;
+    vdb->fp4_dims = dims;
+    vdb->fp4_status = QIHSE_VDB_FP4_VALID;
+    return true;
+}
+
+bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
+    if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
+        return false;
+    }
+    size_t dims = vdb->vector_dims;
+    size_t packed_dims = (dims + 1) / 2;
+    size_t n_rows = vdb->total_vectors;
+
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(n_rows, packed_dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(uint8_t), &alloc_bytes)) {
+        return false;
+    }
+
+    if (vdb->int4_vectors) {
+        free(vdb->int4_vectors);
+    }
+    
+    vdb->int4_bytes = alloc_bytes;
+    vdb->int4_vectors = (uint8_t*)malloc(vdb->int4_bytes);
+    if (!vdb->int4_vectors) return false;
+    
+    for (size_t i = 0; i < n_rows; i++) {
+        const qihse_index_row_t* row = &vdb->rows[i];
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            for (size_t j = 0; j < packed_dims; j++) {
+                uint8_t packed = 0;
+                for (int k = 0; k < 2; k++) {
+                    if (j * 2 + k < dims) {
+                        float v = src[j * 2 + k];
+                        int val = (int)(v * 7.0f);
+                        if (val > 7) val = 7;
+                        if (val < -8) val = -8;
+                        uint8_t int4 = (uint8_t)(val & 0x0F);
+                        packed |= (int4 << (k * 4));
+                    }
+                }
+                vdb->int4_vectors[i * packed_dims + j] = packed;
+            }
+        } else {
+            memset(&vdb->int4_vectors[i * packed_dims], 0, packed_dims * sizeof(uint8_t));
+        }
+    }
+    
+    vdb->int4_rows = n_rows;
+    vdb->int4_dims = dims;
+    vdb->int4_status = QIHSE_VDB_INT4_VALID;
+    return true;
+}
+
 void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     if (!vdb) {
         return;
@@ -6589,6 +6773,9 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     qihse_vdb_int8_destroy(vdb);
     if (vdb->fp16_vectors) free(vdb->fp16_vectors);
     if (vdb->fp32_vectors) free(vdb->fp32_vectors);
+    if (vdb->fp8_vectors) free(vdb->fp8_vectors);
+    if (vdb->fp4_vectors) free(vdb->fp4_vectors);
+    if (vdb->int4_vectors) free(vdb->int4_vectors);
     qihse_vdb_binary_destroy(vdb);
     qihse_vdb_cache_destroy(vdb);
     qihse_vdb_sparse_index_destroy(vdb->sparse_index);
