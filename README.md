@@ -9,8 +9,12 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![Python](https://img.shields.io/badge/SDK-Python_Native-3776AB?logo=python&logoColor=white)]()
+[![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)]()
+[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512-00599C)]()
 [![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen)]()
 [![Security](https://img.shields.io/badge/Security-Cell--Level%20Clearance-red)]()
+[![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success)]()
 
 </div>
 
