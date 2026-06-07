@@ -5,7 +5,7 @@
 
 ## Quantum-Inspired Hilbert Space Expansion Search
 
-### Exactness-first multi-modal database engine: Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream over a zero-copy Unified Wire Protocol (UWP).
+### The only database ecosystem you will ever need. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
@@ -108,6 +108,9 @@ We have moved all intensive code examples, API usage, and benchmark commands out
 - **[Persistence Model](docs/persistence/README.md)**: File formats, WAL structure, and engine durability.
 - **[Onboarding & Building](docs/ONBOARDING.md)**: Instructions for compiling, running test suites, and executing benchmark harnesses (`make test-persist`, `make bench-micro`, etc.).
 - **[Trinary Policy Rationale](docs/qmag-policy.md)**: The theory behind `qmag` candidate selection.
+
+### Optional: Military-Grade Clearances
+Most users will never need to think about QIHSE's security layer—by default, the database grants full access so you can build fast. However, if your use case requires it, QIHSE natively supports US / Five Eyes / SCI compartmentation down to the cell level. **If you need it, it's there. If you don't, it stays out of your way.** Read more in the [Security Architecture](docs/security/README.md) documentation.
 
 ---
 
