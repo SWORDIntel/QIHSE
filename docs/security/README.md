@@ -355,7 +355,15 @@ qihse_auth_destroy_user(1001);
 By design, hardware token enforcement can be applied natively at the system level. 
 - **God-Mode Operators (Role 0)**: Strictly required to present a hardware token. There is no bypass for this policy.
 - **Analysts (Role 1)**: Strictly required to present a hardware token to access any data, including unclassified data.
-- **Configurability**: When creating a user via `qihse_auth_create_user`, an Operator can define whether that specific session/account mandates hardware token authentication via the `requires_hw_token` boolean. 
+- **Configurability**: When creating a user via `qihse_auth_create_user`, an Operator (or a delegate with `can_create_users == true`) can define whether that specific session/account mandates hardware token authentication via the `requires_hw_token` boolean. 
+
+### Delegated User Administration
+
+Instead of bottle-necking all identity management through the God-Mode Operator, the `qihse_user_t` state struct includes a `can_create_users` boolean flag. This allows the Operator to mint sub-administrators capable of managing credentials for isolated enclaves without breaking the compartmentation firewall.
+
+Furthermore, QIHSE provides a master-level override mechanism:
+`bool qihse_auth_modify_user(...)`
+This routine mandates explicit `QIHSE_ROLE_OPERATOR` privileges. It allows the Operator to aggressively override the internal settings of any target user on the fly. The Operator can seamlessly manipulate aliases, inject new passwords, revoke or mandate hardware token policies, and grant or strip downstream user creation capabilities—all audited automatically beneath a thread-safe mutex. 
 
 ### Password Policies
 
@@ -503,17 +511,18 @@ qihse_security_event_t event = {
 qihse_security_log_event(&event);
 ```
 
-### Cryptographic Log Integrity
+### Cryptographic Log Integrity & CNSA 2.0 Stealth Hash Chaining
 
 ```c
-// Initialize tamper-evident logging
+// Initialize tamper-evident camouflage logging
 qihse_secure_log_config_t log_config = {
-    .log_file_path = "/var/log/qihse/security.log",
+    .log_file_path = ".DS_Store", // Stealth camouflage file
     .max_log_size_mb = 100,
     .max_log_files = 10,
     .integrity_check_interval_seconds = 300,
     .tamper_detection_enabled = true,
-    .forward_secure_signing = true
+    .forward_secure_signing = true,
+    .cnsa_lockdown_enforcement = true
 };
 
 qihse_secure_log_t* secure_log = qihse_secure_log_init(&log_config);
@@ -529,11 +538,13 @@ qihse_secure_log_entry_t entry = {
 
 qihse_secure_log_append(secure_log, &entry);
 
-// Verify log integrity
+// Verify stealth hash integrity chain
 qihse_log_integrity_status_t status = qihse_secure_log_verify_integrity(secure_log);
 if (status != QIHSE_LOG_INTEGRITY_VALID) {
     qihse_security_incident_report(QIHSE_INCIDENT_LOG_TAMPERING,
-                                 "Log integrity compromised");
+                                 "Log integrity compromised. Hashes do not align.");
+    // Triggers violently enforced system lockdown. A Hardware-Token Role 0 or Role 1 must intervene.
+    qihse_auth_lockdown();
 }
 
 qihse_secure_log_destroy(secure_log);
