@@ -199,6 +199,9 @@ typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_SPARSE = 6,
     QIHSE_VDB_QUERY_FP16 = 7,
     QIHSE_VDB_QUERY_FP32 = 8,
+    QIHSE_VDB_QUERY_FP8 = 9,
+    QIHSE_VDB_QUERY_FP4 = 10,
+    QIHSE_VDB_QUERY_INT4 = 11,
 } qihse_vector_db_query_mode_t;
 
 qihse_vector_db_t qihse_vector_db_open(
@@ -213,9 +216,12 @@ int qihse_vector_db_search(
     qihse_vector_result_t* results,
     size_t max_results);
 
-// Build optional FP16 and FP32 explicit sidecars
+// Build optional low-precision and explicit sidecars
 bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb);
 bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb);
+bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb);
+bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb);
+bool qihse_vector_db_build_int4(qihse_vector_db_t vdb);
 ```
 
 - `QIHSE_VDB_QUERY_FLOAT32` uses authoritative exact float32 search and ignores
@@ -227,6 +233,7 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb);
   approximate results; scores are qmag scores, not cosine.
 - Explicit trinary modes fail when sidecars are absent/corrupt/stale rather than
   silently falling back.
+- **Security Note:** All native memory quantization builders (`FP8`, `FP4`, `INT4`, `INT8`, `FP16`) perform fully resilient `size_t` overflow assertions on payload allocation boundaries and have been thoroughly redteamed against `SIZE_MAX` memory and sub-byte array boundary corruption exploits.
 - `candidate_pool_size = 0` enables the safe default policy for qmag; qmag default
   may still fall back to exact float32 when policy gates deny it.
 - `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS` never falls back to exact float32.

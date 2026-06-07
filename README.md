@@ -37,7 +37,7 @@ Everything is natively orchestrated. Fast paths are visible. Memory is strictly 
 
 QIHSE seamlessly weaves together eight specialized compute engines to handle any workload you can throw at it:
 
-1. **The Vector DB**: Acting as the optic nerve of the engine, it uses an exactness-first `float32` core. Accelerators like Trinary signatures (`qtri`/`qmag`), INT8 quantization, and sparse indexing act as execution layers that rapidly reduce the search space before an authoritative, exact rerank.
+1. **The Vector DB**: Acting as the optic nerve of the engine, it uses an exactness-first `float32` core. Accelerators like Trinary signatures (`qtri`/`qmag`), multi-precision quantization (`FP16`, `FP8`, `FP4`, `INT8`, `INT4`), and sparse indexing act as execution layers that rapidly reduce the search space before an authoritative, exact rerank. *(Note: Our low-level multi-precision pipelines have been rigorously red-teamed against `SIZE_MAX` integer overflows and array boundary corruption attacks to ensure ironclad memory resilience).*
 2. **The Key-Value Store**: An O(k) Trinary Trie memory engine backed by native LSM-Trees and SSTable persistence for instantaneous, lock-free lookups.
 3. **The Document Store**: A JIT-compiled JSON document engine that translates hot access patterns directly into executing bytecode.
 4. **The Time-Series DB**: Lock-free ingress buffers paired with Gorilla XOR bit-packing act as a temporaӏ sink to absorb massive telemetry streams effortlessly.
