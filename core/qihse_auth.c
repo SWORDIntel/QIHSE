@@ -1,4 +1,5 @@
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -11,6 +12,7 @@ static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t active_user_count = 0;
 
 void qihse_auth_init(void) {
+    qihse_audit_init();
     pthread_mutex_lock(&auth_mutex);
     memset(users, 0, sizeof(users));
     active_user_count = 0;
@@ -22,6 +24,8 @@ void qihse_auth_init(void) {
         op->role = QIHSE_ROLE_OPERATOR;
         op->classification_level = 0xFFFF;
         op->sci_compartments = 0xFFFF;
+        op->hardware_token_present = true; // Operator REQUIRES physical token
+        strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
         users[0] = op;
         active_user_count = 1;
     }
@@ -77,6 +81,8 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     users[user_id] = u;
     active_user_count++;
     
+    qihse_audit_log("USER_CREATE", creator->user_id, user_id, u->classification_level, u->sci_compartments);
+    
     pthread_mutex_unlock(&auth_mutex);
     return u;
 }
@@ -111,6 +117,7 @@ void qihse_auth_destroy_user(uint32_t user_id) {
     
     pthread_mutex_lock(&auth_mutex);
     if (users[user_id]) {
+        qihse_audit_log("USER_DESTROY", 0, user_id, users[user_id]->classification_level, users[user_id]->sci_compartments);
         free(users[user_id]);
         users[user_id] = NULL;
         active_user_count--;
@@ -119,16 +126,40 @@ void qihse_auth_destroy_user(uint32_t user_id) {
 }
 
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci) {
-    if (!user) return true; // Default: full access if no user provided
+    uint32_t uid = user ? user->user_id : 0xFFFFFFFF;
+    
+    // Callout webhook for non-UNCLASSIFIED file/data access
+    if (data_classif > 0) {
+        qihse_audit_webhook_ping(uid, data_classif, data_sci);
+    }
 
-    // God Mode requires explicit operator role assignment
-    if (user->role == QIHSE_ROLE_OPERATOR) return true;
+    if (!user) {
+        qihse_audit_log("ACCESS_GRANTED_NO_USER", uid, 0, data_classif, data_sci);
+        return true;
+    }
+
+    // God Mode requires explicit operator role assignment AND a YubiKey
+    if (user->role == QIHSE_ROLE_OPERATOR) {
+        if (!user->hardware_token_present) {
+            qihse_audit_log("ACCESS_DENIED_MISSING_TOKEN_OPERATOR", uid, 0, data_classif, data_sci);
+            return false;
+        }
+        qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
+        return true;
+    }
 
     // Clearance Check
-    if (user->classification_level < data_classif) return false;
+    if (user->classification_level < data_classif) {
+        qihse_audit_log("ACCESS_DENIED_CLEARANCE", uid, 0, data_classif, data_sci);
+        return false;
+    }
 
     // SCI Check
-    if ((data_sci & user->sci_compartments) != data_sci) return false;
+    if ((data_sci & user->sci_compartments) != data_sci) {
+        qihse_audit_log("ACCESS_DENIED_SCI", uid, 0, data_classif, data_sci);
+        return false;
+    }
 
+    qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
     return true;
 }

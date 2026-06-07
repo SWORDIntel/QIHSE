@@ -19,7 +19,10 @@ typedef struct qihse_user_s {
     uint16_t role;
     uint16_t classification_level;
     uint16_t sci_compartments;
-    // ... potentially other fields
+    
+    // YubiKey / Hardware Token Auth
+    bool hardware_token_present;
+    char fido2_credential_id[64];
 } qihse_user_t;
 
 // Global Auth Context (Simplification for simulation)

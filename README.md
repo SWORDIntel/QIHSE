@@ -86,8 +86,11 @@ This is not a gateway filter. The clearance check is the absolute **first mathem
 
 **[Read the full Security Architecture deep dive here.](docs/security/README.md)**
 
-> **TODO:** Implement an Immutable Audit Trail to cryptographically log all security-relevant access and clearance modifications.
-> **TODO:** Add a callout webhook function that pings a specified external server upon every single non-UNCLASSIFIED file/data access.
+### Immutable Audit Trail & Telemetry
+QIHSE natively supports cryptographic logging for all security-relevant access and clearance modifications.
+- **Obfuscated & Immutable:** The engine stores an append-only, XOR-obfuscated binary hash chain in `.qihse_auth_cache.dat`. Each event hashes the *exact* hash of the prior log entry, ensuring that if any adversary tampers with the log or attempts to delete entries, the mathematical chain of hashes is permanently broken.
+- **Silent Callout Webhook:** Every time non-UNCLASSIFIED data is accessed, a pure C native raw TCP socket fires a silent HTTP POST payload to `http://127.0.0.1:8080/callout`. This happens natively without spawning external `curl` or shell processes, leaving absolutely zero trace in process execution audits (like Sysmon or Auditd).
+  - *Note:* You must update `qihse_audit.c` to point to your actual webhook listener URL. The payload format sent is: `{"event":"classified_access", "user_id":<UID>, "classif":<LEVEL>, "sci":<COMPARTMENTS>}`.
 
 ---
 
