@@ -92,7 +92,7 @@ build-native:
 	./scripts/build-native.sh
 
 server: lib
-	$(CC) $(CFLAGS) -o qihse-server src/qihse_server.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -o tests/qihse_server tests/qihse_server.c -L. -lqihse $(LDFLAGS)
 
 lib: $(LIB_TARGET)
 

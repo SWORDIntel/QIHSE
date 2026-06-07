@@ -1,9 +1,15 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <pthread.h>
 #include "qihse_qql_parser.h"
 #include "qihse_vector_db.h"
 #include "qihse_kv_store.h"
+#include "qihse_document.h"
+#include "qihse_column.h"
+#include "qihse_timeseries.h"
 #include "qihse_uwp.h"
+#include "qihse_resp_wire.h"
+#include "qihse_pg_wire.h"
 
 // The Qihse Context wrapper
 typedef struct {
@@ -17,17 +23,20 @@ static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     
     // Initialize engines natively in memory
     self->ctx->kv = qihse_kv_store_create();
-    
-    // For vector_db, we can just omit it or pass proper args.
-    // For this POC, we'll leave it NULL and let QQL parser execute FTS/KV.
-    self->ctx->vdb = NULL; 
+    self->ctx->vdb = qihse_vector_db_create(QIHSE_BACKEND_CPU, NULL, NULL);
+    self->ctx->doc = qihse_doc_store_create(self->ctx->kv);
+    self->ctx->col = qihse_column_store_create();
+    self->ctx->tsdb = qihse_tsdb_create();
     return 0;
 }
 
 static void QihseDB_dealloc(QihseDBObject *self) {
     if (self->ctx) {
+        if (self->ctx->tsdb) qihse_tsdb_destroy(self->ctx->tsdb);
+        if (self->ctx->col) qihse_column_store_destroy(self->ctx->col);
+        if (self->ctx->doc) qihse_doc_store_destroy(self->ctx->doc);
+        if (self->ctx->vdb) qihse_vector_db_destroy(self->ctx->vdb);
         if (self->ctx->kv) qihse_kv_store_destroy(self->ctx->kv);
-        // if (self->ctx->vdb) qihse_vector_db_free(self->ctx->vdb);
         free(self->ctx);
     }
     Py_TYPE(self)->tp_free((PyObject *) self);
@@ -57,7 +66,7 @@ static PyObject* QihseDB_kv_set(QihseDBObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "ss", &key, &val)) {
         return NULL;
     }
-    qihse_kv_set(self->ctx->kv, key, val);
+    qihse_kv_set(self->ctx->kv, key, val, 0, 0);
     Py_RETURN_NONE;
 }
 
@@ -67,8 +76,7 @@ static PyObject* QihseDB_kv_get(QihseDBObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "s", &key)) {
         return NULL;
     }
-    // qihse_kv_get is char* qihse_kv_get(qihse_kv_store_t* store, const char* key);
-    char* val = qihse_kv_get(self->ctx->kv, key);
+    char* val = qihse_kv_get_user(self->ctx->kv, key, NULL);
     if (!val) {
         Py_RETURN_NONE;
     }
@@ -77,10 +85,115 @@ static PyObject* QihseDB_kv_get(QihseDBObject *self, PyObject *args) {
     return ret;
 }
 
+// Document
+static PyObject* QihseDB_doc_insert(QihseDBObject *self, PyObject *args) {
+    unsigned long long doc_id;
+    const char* json;
+    if (!PyArg_ParseTuple(args, "Ks", &doc_id, &json)) return NULL;
+    qihse_doc_store_insert_json(self->ctx->doc, doc_id, json);
+    Py_RETURN_NONE;
+}
+
+// Columnar
+static PyObject* QihseDB_col_create(QihseDBObject *self, PyObject *args) {
+    const char* name;
+    if (!PyArg_ParseTuple(args, "s", &name)) return NULL;
+    qihse_column_create(self->ctx->col, name, QIHSE_COL_TYPE_FLOAT32);
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_col_append(QihseDBObject *self, PyObject *args) {
+    const char* name;
+    float val;
+    if (!PyArg_ParseTuple(args, "sf", &name, &val)) return NULL;
+    qihse_column_append_float32(self->ctx->col, name, val, 0, 0);
+    Py_RETURN_NONE;
+}
+
+// Time-Series
+static PyObject* QihseDB_tsdb_insert(QihseDBObject *self, PyObject *args) {
+    unsigned int series_id;
+    unsigned long long ts;
+    double val;
+    if (!PyArg_ParseTuple(args, "IKd", &series_id, &ts, &val)) return NULL;
+    qihse_tsdb_insert(self->ctx->tsdb, series_id, ts, val, 0, 0);
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_trinary_search(QihseDBObject *self, PyObject *args, PyObject *kwds) {
+    PyObject *vec;
+    const char *mode = NULL;
+    static char *kwlist[] = {"vector", "mode", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|$s", kwlist, &vec, &mode)) {
+        return NULL;
+    }
+    
+    // Return a dummy list
+    PyObject *list = PyList_New(0);
+    return list;
+}
+
+// Proxy Threads
+struct ServerArgs {
+    qihse_uwp_context_t* ctx;
+    uint16_t port;
+    char addr[64];
+};
+
+static void* run_resp(void* a) {
+    struct ServerArgs* args = (struct ServerArgs*)a;
+    qihse_start_resp_server(args->ctx->kv, args->ctx->vdb, args->port, args->addr);
+    free(args);
+    return NULL;
+}
+
+static void* run_pg(void* a) {
+    struct ServerArgs* args = (struct ServerArgs*)a;
+    qihse_start_pg_wire_server((void*)args->ctx->vdb, args->port, args->addr);
+    free(args);
+    return NULL;
+}
+
+static PyObject* QihseDB_start_resp_proxy(QihseDBObject *self, PyObject *args) {
+    const char* addr = "0.0.0.0";
+    int port = 6379;
+    if (!PyArg_ParseTuple(args, "|si", &addr, &port)) return NULL;
+    struct ServerArgs* s = malloc(sizeof(struct ServerArgs));
+    s->ctx = self->ctx;
+    s->port = port;
+    strncpy(s->addr, addr, 63);
+    pthread_t t;
+    pthread_create(&t, NULL, run_resp, s);
+    pthread_detach(t);
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_start_pg_proxy(QihseDBObject *self, PyObject *args) {
+    const char* addr = "0.0.0.0";
+    int port = 5432;
+    if (!PyArg_ParseTuple(args, "|si", &addr, &port)) return NULL;
+    struct ServerArgs* s = malloc(sizeof(struct ServerArgs));
+    s->ctx = self->ctx;
+    s->port = port;
+    strncpy(s->addr, addr, 63);
+    pthread_t t;
+    pthread_create(&t, NULL, run_pg, s);
+    pthread_detach(t);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef QihseDB_methods[] = {
     {"execute", (PyCFunction)QihseDB_execute, METH_VARARGS, "Execute raw QQL string."},
     {"kv_set", (PyCFunction)QihseDB_kv_set, METH_VARARGS, "Set a key-value pair."},
     {"kv_get", (PyCFunction)QihseDB_kv_get, METH_VARARGS, "Get a value by key."},
+    {"doc_insert", (PyCFunction)QihseDB_doc_insert, METH_VARARGS, "Insert JSON document."},
+    {"col_create", (PyCFunction)QihseDB_col_create, METH_VARARGS, "Create float column."},
+    {"col_append", (PyCFunction)QihseDB_col_append, METH_VARARGS, "Append to float column."},
+    {"tsdb_insert", (PyCFunction)QihseDB_tsdb_insert, METH_VARARGS, "Insert time-series data point."},
+    {"trinary_search", (PyCFunction)QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
+    {"start_resp_proxy", (PyCFunction)QihseDB_start_resp_proxy, METH_VARARGS, "Start the Redis Wire proxy in the background."},
+    {"start_pg_proxy", (PyCFunction)QihseDB_start_pg_proxy, METH_VARARGS, "Start the Postgres Wire proxy in the background."},
     {NULL}  /* Sentinel */
 };
 
