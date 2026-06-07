@@ -23,7 +23,7 @@ int main() {
     assert(op_access == true);
 
     // Create Analyst (User 1)
-    qihse_user_t* analyst = qihse_auth_create_user(operator, 1, QIHSE_ROLE_ANALYST, 5, 0);
+    qihse_user_t* analyst = qihse_auth_create_user(operator, 1, QIHSE_ROLE_ANALYST, 5, 0, "default_password");
     if (!analyst) {
         printf("Failed to create analyst.\n");
         return 1;
