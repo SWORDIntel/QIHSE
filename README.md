@@ -55,6 +55,9 @@ The engine acts as a hierarchical memory laboratory: per-vector access tracking 
 
 **And crucially, it degrades gracefully.** The build system natively supports AVX-512 and AVX2/FMA instructions for extreme parallel throughput. However, if your system lacks these features (like older Intel chips, ARM processors, or constrained VMs), QIHSE detects this at runtime and seamlessly falls back to highly optimized scalar math. **It works flawlessly on any system.**
 
+> **⚠️ TEMPORARY INFRASTRUCTURE ADVISORY**
+> Due to recent "hardware damage" to our lab clusters (we're blaming the NSA), direct access to NPU/GNA silicons and AVX-512 pipelines is currently unavailable. While these pathways are implemented, they are not currently fully tested, optimized, or fleshed out under the strict Omni-Test harness. We aim to have the silicon replaced and remedied shortly. In the meantime, the engine correctly and automatically routes all execution to the fully validated AVX2/FMA and scalar pipelines.
+
 ---
 
 ## Explore the Ecosystem
