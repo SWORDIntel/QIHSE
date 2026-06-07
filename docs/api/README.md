@@ -607,7 +607,10 @@ The cell-level authorization system is embedded natively across all 8 storage en
 void qihse_auth_init(void);
 
 // Create a new user with specific clearance and compartment bitmask
-qihse_user_t* qihse_auth_create_user(uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci);
+qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
+
+// Modify an existing user's internal settings natively (Requires Operator privileges)
+bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users);
 
 // Retrieve an existing user
 qihse_user_t* qihse_auth_get_user(uint32_t user_id);
