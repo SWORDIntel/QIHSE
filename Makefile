@@ -4,7 +4,7 @@
 CC=gcc
 
 INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include
-CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3
+CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 -I/usr/include/python3.13
 QIHSE_CFLAGS_EXTRA?=
 
 # CPU-specific SIMD backend selection.
@@ -16,7 +16,7 @@ QIHSE_ENABLE_AVX512?=0
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13
 TARGET_LDFLAGS = -ldl -lm -lpthread -luring
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
@@ -40,7 +40,7 @@ QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
-SRCS_BASE = core/qihse.c core/qihse_auth.c \
+SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.c \
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
