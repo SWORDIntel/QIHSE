@@ -22,6 +22,7 @@ typedef struct qihse_user_s {
     
     // YubiKey / Hardware Token Auth
     bool hardware_token_present;
+    bool requires_hardware_token; // Configurable at creation
     char fido2_credential_id[64];
 
     // Password Auth
@@ -32,7 +33,7 @@ typedef struct qihse_user_s {
 void qihse_auth_init(void);
 
 // Create a user. Only an OPERATOR can create a user. The system pre-seeds User ID 0 as the God-Mode Operator.
-qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password);
+qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
 
 qihse_user_t* qihse_auth_get_user(uint32_t user_id);
 

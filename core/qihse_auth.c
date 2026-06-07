@@ -42,6 +42,7 @@ void qihse_auth_init(void) {
         op->classification_level = 0xFFFF;
         op->sci_compartments = 0xFFFF;
         op->hardware_token_present = true; // Operator REQUIRES physical token
+        op->requires_hardware_token = true;
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
         compute_sha256_sim("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
         users[0] = op;
@@ -51,7 +52,7 @@ void qihse_auth_init(void) {
     pthread_mutex_unlock(&auth_mutex);
 }
 
-qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password) {
+qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token) {
     if (user_id >= MAX_USERS) return NULL;
     
     pthread_mutex_lock(&auth_mutex);
@@ -100,13 +101,15 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     if (plaintext_password) {
         if (strlen(plaintext_password) < 6) {
             printf("\n[WARNING] The password assigned to User ID %u is pathetically weak (under 6 characters).\n", user_id);
-            printf("          Assuming an adversary is not currently typing this at the terminal.\n");
-            printf("          Reminder: A weak password still beats a sticky note on the monitor.\n\n");
+            printf("          If an adversary is trying passwords at this terminal, you got bigger problems than a weak password.\n");
+            printf("          If they are running brute force against it and nobody is there to stop them, your security is doing an outstanding job, keep at it.\n\n");
         }
         compute_sha256_sim(plaintext_password, u->password_hash);
     } else {
         compute_sha256_sim("", u->password_hash);
     }
+    
+    u->requires_hardware_token = requires_hw_token;
 
     users[user_id] = u;
     active_user_count++;
@@ -168,12 +171,14 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
         return true;
     }
 
-    // God Mode requires explicit operator role assignment AND a YubiKey
+    // Hardware Token Enforcement configured per-user (e.g. Mandatory for Operator/Analyst)
+    if (user->requires_hardware_token && !user->hardware_token_present) {
+        qihse_audit_log("ACCESS_DENIED_MISSING_TOKEN", uid, 0, data_classif, data_sci);
+        return false;
+    }
+
+    // God Mode requires explicit operator role assignment
     if (user->role == QIHSE_ROLE_OPERATOR) {
-        if (!user->hardware_token_present) {
-            qihse_audit_log("ACCESS_DENIED_MISSING_TOKEN_OPERATOR", uid, 0, data_classif, data_sci);
-            return false;
-        }
         qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
         return true;
     }

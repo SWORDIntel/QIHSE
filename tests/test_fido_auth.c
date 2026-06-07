@@ -23,7 +23,7 @@ int main() {
     assert(op_access == true);
 
     // Create Analyst (User 1)
-    qihse_user_t* analyst = qihse_auth_create_user(operator, 1, QIHSE_ROLE_ANALYST, 5, 0, "default_password");
+    qihse_user_t* analyst = qihse_auth_create_user(operator, 1, QIHSE_ROLE_ANALYST, 5, 0, "default_password", true);
     if (!analyst) {
         printf("Failed to create analyst.\n");
         return 1;
@@ -33,13 +33,13 @@ int main() {
     // Analyst accessing Unclassified data (Classif 0) without token
     bool analyst_unclass = qihse_auth_can_access(analyst, 0, 0);
     printf("Analyst accessing Unclassified data (no token)... Granted: %d\n", analyst_unclass);
-    assert(analyst_unclass == true);
+    assert(analyst_unclass == false);
 
     // Analyst accessing Classified data (Classif 5) without token
-    // Should be GRANTED because tokens are only mandatory for Operator
+    // Should be DENIED because tokens are now mandatory for Analyst too
     bool analyst_class_no_token = qihse_auth_can_access(analyst, 5, 0);
     printf("Analyst accessing Classified data (no token)... Granted: %d\n", analyst_class_no_token);
-    assert(analyst_class_no_token == true);
+    assert(analyst_class_no_token == false);
 
     // Analyst accessing Classified data (Classif 5) with token
     analyst->hardware_token_present = true;
