@@ -304,7 +304,51 @@ if (ret != QIHSE_SUCCESS) {
 qihse_key_distribution_destroy(kd);
 ```
 
-## Access Control
+## Access Control & Security Clearances
+
+### System-Wide Cell-Level Authorization
+
+QIHSE implements a pervasive, military-grade classification and compartmentation system designed to mirror US/Five Eyes/SCI clearance levels. This cell-level authorization is embedded natively across all 8 storage engines (Vector, Document, Graph, KV, Columnar, Time-Series, Full-Text Search, and Event Stream) to ensure zero data leakage.
+
+Every record in QIHSE is tagged with a mandatory `classification` (uint16) and `sci_compartment` (uint16) bitmask. Access is verified dynamically at the engine level during query execution.
+
+#### Classification Levels
+- `QIHSE_CLASS_UNCLASSIFIED` (0)
+- `QIHSE_CLASS_RESTRICTED` (1)
+- `QIHSE_CLASS_CONFIDENTIAL` (2)
+- `QIHSE_CLASS_SECRET` (3)
+- `QIHSE_CLASS_TOP_SECRET` (4)
+
+#### Utilizing Cell-Level Authorization
+
+By default, if no `qihse_user_t` authentication context is provided (i.e., passed as `NULL`), the system defaults to **full access**. This ensures seamless out-of-the-box usage for users who do not require military-grade security clearances.
+
+```c
+#include "qihse_auth.h"
+
+// 1. Initialize the Auth sub-system
+qihse_auth_init();
+
+// 2. Create a user context with specific clearances
+// Example: Operator with TOP SECRET (4) clearance and SCI compartment access bitmask (0)
+qihse_user_t* u_operator = qihse_auth_create_user(
+    1001,                   // User ID
+    QIHSE_ROLE_OPERATOR,    // Role
+    QIHSE_CLASS_TOP_SECRET, // Max Classification Clearance
+    0                       // SCI Compartment Bitmask
+);
+
+// 3. Insert classified data into the system
+// E.g. Inserting into the Time-Series DB with SECRET classification
+qihse_tsdb_insert(tsdb, series_id, timestamp, value, QIHSE_CLASS_SECRET, 0);
+
+// 4. Querying automatically enforces constraints
+// Data exceeding the user's clearance is silently dropped from the query pipeline.
+double avg = qihse_tsdb_average_range_user(tsdb, start_ts, end_ts, u_operator);
+
+// 5. Cleanup
+qihse_auth_destroy_user(1001);
+```
 
 ### Role-Based Access Control (RBAC)
 

@@ -357,7 +357,8 @@ static void qihse_encode_row(uint8_t out[QIHSE_INDEX_ROW_DISK_SIZE],
     qihse_le_write_u64(out + 24u, row->metadata_size);
     qihse_le_write_u64(out + 32u, row->commit_generation);
     qihse_le_write_u32(out + 40u, row->row_flags);
-    qihse_le_write_u32(out + 44u, row->reserved);
+    uint32_t auth_bits = ((uint32_t)row->classification << 16) | (uint32_t)row->sci_compartment;
+    qihse_le_write_u32(out + 44u, auth_bits);
 }
 
 static void qihse_decode_row(const uint8_t in[QIHSE_INDEX_ROW_DISK_SIZE],
@@ -368,7 +369,9 @@ static void qihse_decode_row(const uint8_t in[QIHSE_INDEX_ROW_DISK_SIZE],
     row->metadata_size = qihse_le_read_u64(in + 24u);
     row->commit_generation = qihse_le_read_u64(in + 32u);
     row->row_flags = qihse_le_read_u32(in + 40u);
-    row->reserved = qihse_le_read_u32(in + 44u);
+    uint32_t auth_bits = qihse_le_read_u32(in + 44u);
+    row->classification = (uint16_t)(auth_bits >> 16);
+    row->sci_compartment = (uint16_t)(auth_bits & 0xFFFF);
 }
 
 static void qihse_encode_idmap(uint8_t out[QIHSE_IDMAP_ENTRY_DISK_SIZE],
@@ -527,7 +530,7 @@ static bool qihse_validate_index_rows(const qihse_vector_store_manifest_t* manif
         uint64_t metadata_end;
         const uint32_t allowed_flags = QIHSE_ROW_F_LIVE | QIHSE_ROW_F_TOMBSTONE;
 
-        if (rows[i].reserved != 0u ||
+        if (rows[i].classification > 4u ||
             (rows[i].row_flags & ~allowed_flags) != 0u ||
             rows[i].commit_generation > manifest->commit_generation ||
             !qihse_checked_add_u64(rows[i].vector_offset, vector_row_bytes, &vector_end) ||

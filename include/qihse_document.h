@@ -80,6 +80,7 @@ typedef struct {
  * @param where_clause NUL-terminated SQL-like WHERE expression.
  * @return A result structure containing matching document IDs. The caller must free doc_ids.
  */
-qihse_document_result_t qihse_doc_store_query(qihse_document_store_t* store, const char* where_clause);
+#include "qihse_auth.h"
+qihse_document_result_t qihse_doc_store_query_user(qihse_document_store_t* store, const char* where_clause, qihse_user_t* user);
 
 #endif /* QIHSE_DOCUMENT_H */

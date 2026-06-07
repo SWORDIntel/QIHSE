@@ -14,3 +14,11 @@
 {"timestamp": 1780764344, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
 {"timestamp": 1780764349, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=sequential ws=4096 rw=8.00 tl=0.75 sl=0.90 dim"}
 {"timestamp": 1780764349, "trace": "selected=host reason=fallback workload=none"}
+{"timestamp": 1780765166, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780765170, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=sequential ws=4096 rw=8.00 tl=0.75 sl=0.90 dim"}
+{"timestamp": 1780765170, "trace": "selected=host reason=fallback workload=none"}
+{"timestamp": 1780797977, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780797982, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=sequential ws=4096 rw=8.00 tl=0.75 sl=0.90 dim"}
+{"timestamp": 1780797982, "trace": "selected=host reason=fallback workload=none"}
+{"timestamp": 1780798869, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}
+{"timestamp": 1780799071, "trace": "selected=hma-superposition reason=superposition-phase phase=superposition access=random ws=0 rw=0.00 tl=0.00 sl=0.00 dims=0 ent"}

@@ -42,17 +42,10 @@ void qihse_fts_destroy(qihse_fts_index_t* index);
  * @param length Length of the text content.
  * @return true on success.
  */
-bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const char* text, size_t length);
+#include "qihse_auth.h"
 
-/**
- * @brief Searches the index using BM25 scoring.
- * Intersects posting lists and optionally verifies phrase positions.
- * @param index The FTS index.
- * @param query The search query string.
- * @param results Pre-allocated array to hold the top-K results.
- * @param top_k Maximum number of results to return.
- * @return The number of results found.
- */
-int qihse_fts_search(qihse_fts_index_t* index, const char* query, qihse_fts_result_t* results, int top_k);
+bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const char* text, size_t length, uint16_t classification, uint16_t sci_compartment);
+
+int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k);
 
 #endif /* QIHSE_FTS_H */

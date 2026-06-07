@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "qihse_fts.h"
+#include "qihse_auth.h"
 
 int main(void) {
     printf("Testing Full-Text Search (Trigram/BM25)...\n");
@@ -17,15 +18,18 @@ int main(void) {
     const char* doc2 = "A fast brown fox leaped over a sleeping dog";
     const char* doc3 = "The lazy dog was very sleepy today";
 
-    qihse_fts_add_document(index, 101, doc1, strlen(doc1));
-    qihse_fts_add_document(index, 102, doc2, strlen(doc2));
-    qihse_fts_add_document(index, 103, doc3, strlen(doc3));
+    qihse_auth_init();
+    qihse_user_t* u_operator = qihse_auth_create_user(4, QIHSE_ROLE_OPERATOR, 0, 0);
+
+    qihse_fts_add_document(index, 101, doc1, strlen(doc1), 0, 0);
+    qihse_fts_add_document(index, 102, doc2, strlen(doc2), 0, 0);
+    qihse_fts_add_document(index, 103, doc3, strlen(doc3), 0, 0);
 
     qihse_fts_result_t results[10];
     
     // 1. Exact Word Search
     printf("\nQuery: 'quick'\n");
-    int num = qihse_fts_search(index, "quick", results, 10);
+    int num = qihse_fts_search_user(index, "quick", u_operator, results, 10);
     bool pass1 = (num == 1 && results[0].doc_id == 101);
     printf("Hits: %d. Top hit doc_id: %llu (Expected: 101). %s\n", 
             num, num > 0 ? (unsigned long long)results[0].doc_id : 0, pass1 ? "PASS" : "FAIL");
@@ -34,7 +38,7 @@ int main(void) {
     // 'sleep' trigrams: sle, lee, eep. It will match 'sleeping' (doc2) and 'sleepy' (doc3)
     // But 'sleepy' has fewer words in the document, so BM25 might score doc3 higher due to length normalization.
     printf("\nQuery: 'sleep'\n");
-    num = qihse_fts_search(index, "sleep", results, 10);
+    num = qihse_fts_search_user(index, "sleep", u_operator, results, 10);
     bool pass2 = (num == 2);
     printf("Hits: %d (Expected: 2). %s\n", num, pass2 ? "PASS" : "FAIL");
     for (int i = 0; i < num; i++) {
@@ -43,7 +47,7 @@ int main(void) {
 
     // 3. Short Word Search
     printf("\nQuery: 'a'\n");
-    num = qihse_fts_search(index, "a", results, 10);
+    num = qihse_fts_search_user(index, "a", u_operator, results, 10);
     bool pass3 = false;
     if (num > 0 && results[0].doc_id == 102) {
         pass3 = true;

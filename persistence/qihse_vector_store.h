@@ -34,8 +34,21 @@ typedef struct qihse_index_row_s {
     uint64_t metadata_size;
     uint64_t commit_generation;
     uint32_t row_flags;
-    uint32_t reserved;
+    uint16_t classification;
+    uint16_t sci_compartment;
 } qihse_index_row_t;
+
+#define QIHSE_CLASS_UNCLASSIFIED 0
+#define QIHSE_CLASS_RESTRICTED 1
+#define QIHSE_CLASS_CONFIDENTIAL 2
+#define QIHSE_CLASS_SECRET 3
+#define QIHSE_CLASS_TOP_SECRET 4
+
+#define QIHSE_SCI_NONE 0x0000
+#define QIHSE_SCI_SI   0x0001
+#define QIHSE_SCI_TK   0x0002
+#define QIHSE_SCI_HCS  0x0004
+#define QIHSE_SCI_G    0x0008
 
 typedef struct qihse_idmap_entry_s {
     int64_t key;
