@@ -10,6 +10,7 @@
 #include "qihse_uwp.h"
 #include "qihse_resp_wire.h"
 #include "qihse_pg_wire.h"
+#include "qihse_auth.h"
 
 // The Qihse Context wrapper
 typedef struct {
@@ -20,6 +21,9 @@ typedef struct {
 static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     self->ctx = (qihse_uwp_context_t*)malloc(sizeof(qihse_uwp_context_t));
     memset(self->ctx, 0, sizeof(qihse_uwp_context_t));
+    
+    // Initialize Auth (creates User 0 God-Mode Operator)
+    qihse_auth_init();
     
     // Initialize engines natively in memory
     self->ctx->kv = qihse_kv_store_create();
@@ -183,6 +187,67 @@ static PyObject* QihseDB_start_pg_proxy(QihseDBObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
+    unsigned int creator_id;
+    unsigned int target_user_id;
+    unsigned int role;
+    unsigned int clearance;
+    unsigned int sci;
+    
+    if (!PyArg_ParseTuple(args, "IIIII", &creator_id, &target_user_id, &role, &clearance, &sci)) {
+        return NULL;
+    }
+    
+    qihse_user_t* creator = qihse_auth_get_user(creator_id);
+    if (!creator && target_user_id != 0) {
+        PyErr_SetString(PyExc_PermissionError, "Creator user does not exist or has insufficient privileges.");
+        return NULL;
+    }
+    
+    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci);
+    if (!success) {
+        PyErr_SetString(PyExc_PermissionError, "Failed to create user (clearance or God-Mode violation).");
+        return NULL;
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_auth_destroy_user(QihseDBObject *self, PyObject *args) {
+    unsigned int user_id;
+    if (!PyArg_ParseTuple(args, "I", &user_id)) {
+        return NULL;
+    }
+    
+    // Natively calls into qihse_auth_destroy_user. If user_id is 0, it will invoke
+    // the interactive Y/N prompt via stdin within the C space.
+    qihse_auth_destroy_user(user_id);
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_auth_can_access(QihseDBObject *self, PyObject *args) {
+    unsigned int user_id;
+    unsigned int req_clearance;
+    unsigned int req_sci;
+    
+    if (!PyArg_ParseTuple(args, "III", &user_id, &req_clearance, &req_sci)) {
+        return NULL;
+    }
+    
+    qihse_user_t* user = qihse_auth_get_user(user_id);
+    if (!user) {
+        Py_RETURN_FALSE;
+    }
+    
+    bool ok = qihse_auth_can_access(user, req_clearance, req_sci);
+    if (ok) {
+        Py_RETURN_TRUE;
+    } else {
+        Py_RETURN_FALSE;
+    }
+}
+
 static PyMethodDef QihseDB_methods[] = {
     {"execute", (PyCFunction)QihseDB_execute, METH_VARARGS, "Execute raw QQL string."},
     {"kv_set", (PyCFunction)QihseDB_kv_set, METH_VARARGS, "Set a key-value pair."},
@@ -194,6 +259,9 @@ static PyMethodDef QihseDB_methods[] = {
     {"trinary_search", (PyCFunction)QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
     {"start_resp_proxy", (PyCFunction)QihseDB_start_resp_proxy, METH_VARARGS, "Start the Redis Wire proxy in the background."},
     {"start_pg_proxy", (PyCFunction)QihseDB_start_pg_proxy, METH_VARARGS, "Start the Postgres Wire proxy in the background."},
+    {"auth_create_user", (PyCFunction)QihseDB_auth_create_user, METH_VARARGS, "Create a user with explicit clearance boundaries."},
+    {"auth_destroy_user", (PyCFunction)QihseDB_auth_destroy_user, METH_VARARGS, "Destroy a user (Warning: Destroying User 0 will trigger supernatural prompt)."},
+    {"auth_can_access", (PyCFunction)QihseDB_auth_can_access, METH_VARARGS, "Check if user has clearance to access a resource."},
     {NULL}  /* Sentinel */
 };
 
