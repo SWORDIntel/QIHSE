@@ -11,6 +11,23 @@ static qihse_user_t* users[MAX_USERS];
 static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t active_user_count = 0;
 
+// Simulate SHA-256 hashing for password storage
+static void compute_sha256_sim(const char *input, char *output) {
+    if (!input) {
+        strcpy(output, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); // empty string hash
+        return;
+    }
+    unsigned long long hash1 = 5381;
+    unsigned long long hash2 = 0xDEADBEEF;
+    int c;
+    while ((c = *input++)) {
+        hash1 = ((hash1 << 5) + hash1) + c; 
+        hash2 = hash2 ^ (c << 3);
+    }
+    snprintf(output, 65, "%016llx%016llx%016llx%016llx", 
+             hash1, hash2, hash1 ^ 0x1234567890ABCDEF, hash2 ^ 0xFEDCBA0987654321);
+}
+
 void qihse_auth_init(void) {
     qihse_audit_init();
     pthread_mutex_lock(&auth_mutex);
@@ -26,6 +43,7 @@ void qihse_auth_init(void) {
         op->sci_compartments = 0xFFFF;
         op->hardware_token_present = true; // Operator REQUIRES physical token
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
+        compute_sha256_sim("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
         users[0] = op;
         active_user_count = 1;
     }
@@ -33,7 +51,7 @@ void qihse_auth_init(void) {
     pthread_mutex_unlock(&auth_mutex);
 }
 
-qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci) {
+qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password) {
     if (user_id >= MAX_USERS) return NULL;
     
     pthread_mutex_lock(&auth_mutex);
@@ -76,6 +94,18 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     } else {
         u->classification_level = classif;
         u->sci_compartments = sci;
+    }
+
+    // Handle Password
+    if (plaintext_password) {
+        if (strlen(plaintext_password) < 6) {
+            printf("\n[WARNING] The password assigned to User ID %u is pathetically weak (under 6 characters).\n", user_id);
+            printf("          Assuming an adversary is not currently typing this at the terminal.\n");
+            printf("          Reminder: A weak password still beats a sticky note on the monitor.\n\n");
+        }
+        compute_sha256_sim(plaintext_password, u->password_hash);
+    } else {
+        compute_sha256_sim("", u->password_hash);
     }
 
     users[user_id] = u;

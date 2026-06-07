@@ -204,7 +204,7 @@ static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
         return NULL;
     }
     
-    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci);
+    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci, "default_password");
     if (!success) {
         PyErr_SetString(PyExc_PermissionError, "Failed to create user (clearance or God-Mode violation).");
         return NULL;
@@ -287,7 +287,8 @@ static struct PyModuleDef qihsemodule = {
 };
 
 PyMODINIT_FUNC PyInit_qihse(void) {
-    PyObject *m;
+    PyObject* m;
+    
     if (PyType_Ready(&QihseDBType) < 0)
         return NULL;
 
@@ -296,11 +297,15 @@ PyMODINIT_FUNC PyInit_qihse(void) {
         return NULL;
 
     Py_INCREF(&QihseDBType);
-    if (PyModule_AddObject(m, "Database", (PyObject *) &QihseDBType) < 0) {
+    if (PyModule_AddObject(m, "QihseDB", (PyObject *)&QihseDBType) < 0) {
         Py_DECREF(&QihseDBType);
         Py_DECREF(m);
         return NULL;
     }
 
     return m;
+}
+
+PyMODINIT_FUNC PyInit_libqihse(void) {
+    return PyInit_qihse();
 }
