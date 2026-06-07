@@ -1382,7 +1382,8 @@ bool qihse_memory_migration_decision_inspect(
     (void)strncpy(
         out_decision->plan_reason,
         plan.reason,
-        sizeof(out_decision->plan_reason) - 1u);
+        sizeof(out_decision->plan_reason) - 1);
+    out_decision->plan_reason[sizeof(out_decision->plan_reason) - 1] = '\0';
     out_decision->plan_reason[sizeof(out_decision->plan_reason) - 1u] = '\0';
 
     out_decision->source_type = plan.source_type;

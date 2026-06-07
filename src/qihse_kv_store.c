@@ -128,11 +128,7 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value) {
 
     size_t out_size = 0;
     qihse_trinary_trie_search(store->trie, key, &out_size);
-    char* dup_val = strdup(value);
-    if (!dup_val) return false;
-
-    if (!qihse_trinary_trie_insert(store->trie, key, dup_val, strlen(dup_val) + 1)) {
-        free(dup_val);
+    if (!qihse_trinary_trie_insert(store->trie, key, (void*)value, strlen(value) + 1)) {
         return false;
     }
 
