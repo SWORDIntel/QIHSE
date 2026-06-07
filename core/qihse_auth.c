@@ -43,6 +43,8 @@ void qihse_auth_init(void) {
         op->sci_compartments = 0xFFFF;
         op->hardware_token_present = true; // Operator REQUIRES physical token
         op->requires_hardware_token = true;
+        op->can_create_users = true;
+        strncpy(op->username, "GODMODE_OP", 64);
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
         compute_sha256_sim("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
         users[0] = op;
@@ -57,8 +59,8 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     
     pthread_mutex_lock(&auth_mutex);
     
-    // Enforce that only an OPERATOR can create new users.
-    if (!creator || creator->role != QIHSE_ROLE_OPERATOR) {
+    // Enforce that only an OPERATOR or delegated user can create new users.
+    if (!creator || (creator->role != QIHSE_ROLE_OPERATOR && !creator->can_create_users)) {
         pthread_mutex_unlock(&auth_mutex);
         return NULL;
     }
@@ -110,6 +112,8 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     }
     
     u->requires_hardware_token = requires_hw_token;
+    u->can_create_users = false;
+    snprintf(u->username, 64, "User_%u", user_id);
 
     users[user_id] = u;
     active_user_count++;
@@ -156,6 +160,43 @@ void qihse_auth_destroy_user(uint32_t user_id) {
         active_user_count--;
     }
     pthread_mutex_unlock(&auth_mutex);
+}
+
+bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users) {
+    if (!operator_user || operator_user->role != QIHSE_ROLE_OPERATOR) {
+        qihse_audit_log("USER_MODIFY_DENIED", operator_user ? operator_user->user_id : 0xFFFFFFFF, target_user_id, 0, 0);
+        return false;
+    }
+
+    if (target_user_id >= MAX_USERS) return false;
+
+    pthread_mutex_lock(&auth_mutex);
+    qihse_user_t* target = users[target_user_id];
+    if (!target) {
+        pthread_mutex_unlock(&auth_mutex);
+        return false;
+    }
+
+    if (new_username != NULL) {
+        strncpy(target->username, new_username, 63);
+        target->username[63] = '\0';
+    }
+
+    if (new_password != NULL) {
+        compute_sha256_sim(new_password, target->password_hash);
+    }
+
+    if (new_requires_hw_token != -1) {
+        target->requires_hardware_token = (new_requires_hw_token != 0);
+    }
+
+    if (new_can_create_users != -1) {
+        target->can_create_users = (new_can_create_users != 0);
+    }
+
+    qihse_audit_log("USER_MODIFY", operator_user->user_id, target_user_id, target->classification_level, target->sci_compartments);
+    pthread_mutex_unlock(&auth_mutex);
+    return true;
 }
 
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci) {
