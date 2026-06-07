@@ -19,7 +19,11 @@ typedef struct qihse_user_s {
     uint16_t role;
     uint16_t classification_level;
     uint16_t sci_compartments;
-    
+
+    // Identity & Permissions
+    char username[64];
+    bool can_create_users; // Operator can delegate user creation
+
     // YubiKey / Hardware Token Auth
     bool hardware_token_present;
     bool requires_hardware_token; // Configurable at creation
@@ -32,12 +36,16 @@ typedef struct qihse_user_s {
 // Global Auth Context (Simplification for simulation)
 void qihse_auth_init(void);
 
-// Create a user. Only an OPERATOR can create a user. The system pre-seeds User ID 0 as the God-Mode Operator.
+// Create a user. An OPERATOR or a user with `can_create_users` flag can create a user. The system pre-seeds User ID 0 as the God-Mode Operator.
 qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
 
 qihse_user_t* qihse_auth_get_user(uint32_t user_id);
 
 void qihse_auth_destroy_user(uint32_t user_id);
+
+// Operator can modify any user's settings, passwords, names, and hardware token mandates.
+// Use -1 for integers/booleans to indicate "do not change", and NULL for strings to indicate "do not change".
+bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users);
 
 // Check if a user can access a specific data row's clearance
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci);
