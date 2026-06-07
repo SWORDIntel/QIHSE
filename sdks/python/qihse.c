@@ -41,7 +41,11 @@ static PyObject* QihseDB_execute(QihseDBObject *self, PyObject *args) {
     }
     
     // Natively parse and execute QQL in C
-    qihse_parse_qql_to_ast(query);
+    void* result = qihse_parse_qql_to_ast(query);
+    if (!result) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to execute QQL query: syntax error");
+        return NULL;
+    }
     
     Py_RETURN_NONE;
 }

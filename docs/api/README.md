@@ -594,4 +594,45 @@ typedef struct qihse_result_s {
 } qihse_result_t;
 ```
 
+## Authorization API
+
+The cell-level authorization system is embedded natively across all 8 storage engines, enforcing US/Five Eyes/SCI style compartmentation. By default, if no user context is provided (`NULL` passed to `_user` functions), the system grants **full access**.
+
+### User Management and Initialization
+
+```c
+#include <qihse/qihse_auth.h>
+
+// Initialize the authorization sub-system
+void qihse_auth_init(void);
+
+// Create a new user with specific clearance and compartment bitmask
+qihse_user_t* qihse_auth_create_user(uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci);
+
+// Retrieve an existing user
+qihse_user_t* qihse_auth_get_user(uint32_t user_id);
+
+// Cleanup and destroy user
+void qihse_auth_destroy_user(uint32_t user_id);
+
+// Check if a user can access a specific classification and SCI compartment
+bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci);
+```
+
+### Authorization-Aware Data Operations
+Engine-specific operations use the `_user` suffix or accept `classification` / `sci_compartment` to propagate boundaries.
+
+```c
+// KV Store 
+bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint64_t expire_time_ms, uint16_t classification, uint16_t sci_compartment);
+char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
+
+// Time-Series Database
+bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestamp, double value, uint16_t classification, uint16_t sci_compartment);
+double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user);
+
+// Document Store
+qihse_doc_result_t* qihse_doc_query_user(qihse_doc_store_t* store, const char* query_str, qihse_user_t* user);
+```
+
 For complete API documentation including all function signatures, parameter descriptions, return values, and usage examples, see the individual header files in the `include/` directories of each component.

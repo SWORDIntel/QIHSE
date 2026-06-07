@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include "qihse_trinary_trie.h"
+#include "qihse_auth.h"
 
 /**
  * @brief Opaque handle for the QIHSE Key-Value Store.
@@ -28,7 +29,7 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store);
  * @param value Null-terminated string value.
  * @return true if successful, false otherwise.
  */
-bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value);
+bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment);
 
 /**
  * @brief Retrieves a value by key.
@@ -36,7 +37,7 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value);
  * @param key Null-terminated string key.
  * @return A newly allocated string containing the value, or NULL if not found. Caller must free().
  */
-char* qihse_kv_get(qihse_kv_store_t* store, const char* key);
+char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
 /**
  * @brief Deletes a key-value pair.
@@ -44,7 +45,7 @@ char* qihse_kv_get(qihse_kv_store_t* store, const char* key);
  * @param key Null-terminated string key.
  * @return true if the key was deleted, false if it did not exist.
  */
-bool qihse_kv_del(qihse_kv_store_t* store, const char* key);
+bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
 /**
  * @brief Checks if a key exists in the store.
@@ -52,7 +53,7 @@ bool qihse_kv_del(qihse_kv_store_t* store, const char* key);
  * @param key Null-terminated string key.
  * @return true if the key exists, false otherwise.
  */
-bool qihse_kv_exists(qihse_kv_store_t* store, const char* key);
+bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
 /* Phase 3: TTL and Persistence */
 /**
@@ -62,7 +63,7 @@ bool qihse_kv_exists(qihse_kv_store_t* store, const char* key);
  * @param ttl_ms Time-to-live in milliseconds.
  * @return true if the TTL was set, false if the key doesn't exist.
  */
-bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms);
+bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user);
 
 /**
  * @brief Sweeps the store and removes all expired keys.

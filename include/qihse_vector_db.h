@@ -277,6 +277,7 @@ typedef struct qihse_vector_query_s {
     qihse_distance_metric_t distance_metric; /* Distance metric for exact rerank */
     qihse_metadata_filter_fn_t metadata_filter; /* Optional pre-filter callback */
     void* metadata_filter_opaque;   /* Opaque context for metadata_filter */
+    struct qihse_user_s* user;      /* The user performing the query */
 } qihse_vector_query_t;
 
 /**

@@ -45,6 +45,8 @@ typedef struct __attribute__((aligned(4096))) qihse_column_chunk {
     uint32_t max_val;       /* Zone Map: maximum value for block skipping */
     
     void* data;             /* Points to the 4KB/2MB aligned contiguous payload */
+    uint16_t* classifications;
+    uint16_t* sci_compartments;
     struct qihse_column_chunk* next;
 } qihse_column_chunk_t;
 
@@ -56,17 +58,19 @@ typedef struct qihse_column_store qihse_column_store_t;
 qihse_column_store_t* qihse_column_store_create();
 void qihse_column_store_destroy(qihse_column_store_t* store);
 
+#include "qihse_auth.h"
+
 bool qihse_column_create(qihse_column_store_t* store, const char* name, qihse_column_type_t type);
-bool qihse_column_append_int64(qihse_column_store_t* store, const char* name, int64_t val);
-bool qihse_column_append_float32(qihse_column_store_t* store, const char* name, float val);
-bool qihse_column_append_string(qihse_column_store_t* store, const char* name, const char* val);
+bool qihse_column_append_int64(qihse_column_store_t* store, const char* name, int64_t val, uint16_t classification, uint16_t sci_compartment);
+bool qihse_column_append_float32(qihse_column_store_t* store, const char* name, float val, uint16_t classification, uint16_t sci_compartment);
+bool qihse_column_append_string(qihse_column_store_t* store, const char* name, const char* val, uint16_t classification, uint16_t sci_compartment);
 
 /**
  * @brief SIMD-Accelerated Aggregation functions.
  * Expected to utilize load-and-blend AVX-512 mechanics rather than masked loads,
  * combined with __builtin_prefetch for software-level L1 staging.
  */
-int64_t qihse_column_sum_int64(qihse_column_store_t* store, const char* name);
-float qihse_column_sum_float32(qihse_column_store_t* store, const char* name);
+int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* name, qihse_user_t* user);
+float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user);
 
 #endif /* QIHSE_COLUMN_H */

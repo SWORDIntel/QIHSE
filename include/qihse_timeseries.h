@@ -25,6 +25,8 @@ typedef struct __attribute__((aligned(4096))) qihse_tsdb_chunk {
     uint32_t count;
     uint64_t start_timestamp;
     uint64_t end_timestamp;
+    uint16_t classification;
+    uint16_t sci_compartment;
     
     /* 16 independent 256-byte lanes for vectorized AVX-512 Gorilla decompression */
     uint8_t compressed_lanes[16][256]; 
@@ -44,14 +46,15 @@ void qihse_tsdb_destroy(qihse_tsdb_t* tsdb);
  * @brief Ingest a data point bypassing POSIX sockets via DPDK or io_uring.
  * Drops String Tags immediately and uses the internal series_id.
  */
-bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestamp, double value);
+bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestamp, double value, uint16_t classification, uint16_t sci_compartment);
 
 /**
  * @brief Flushes bounded Out-of-Order (OoO) MemTables into the strided compression lanes.
  */
 void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb);
 
-double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts);
+#include "qihse_auth.h"
+double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user);
 
 /**
  * @brief Set the TTL in milliseconds for old chunks.
