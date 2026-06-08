@@ -104,7 +104,7 @@ static void* raft_event_loop(void* arg) {
             io_uring_sqe_set_data(sqe, (void*)1ULL);
             io_uring_submit(ring);
         } else if (token == 2ULL) { // TIMEOUT completed (Election Timeout)
-            time_t now = time(NULL);
+            (void)time(NULL); // suppress warning
             if (node->state == QIHSE_RAFT_FOLLOWER || node->state == QIHSE_RAFT_CANDIDATE) {
                 // Transition to CANDIDATE
                 node->state = QIHSE_RAFT_CANDIDATE;
@@ -152,6 +152,7 @@ void qihse_raft_stop(qihse_raft_node_t* node) {
 }
 
 bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_t len) {
+    (void)data;
     if (!node || node->state != QIHSE_RAFT_LEADER) {
         return false; // Can only append if LEADER
     }

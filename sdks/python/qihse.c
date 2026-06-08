@@ -19,6 +19,8 @@ typedef struct {
 } QihseDBObject;
 
 static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
+    (void)args;
+    (void)kwds;
     self->ctx = (qihse_uwp_context_t*)malloc(sizeof(qihse_uwp_context_t));
     memset(self->ctx, 0, sizeof(qihse_uwp_context_t));
     
@@ -48,6 +50,7 @@ static void QihseDB_dealloc(QihseDBObject *self) {
 
 // execute("SEARCH VECTOR...") Raw QQL
 static PyObject* QihseDB_execute(QihseDBObject *self, PyObject *args) {
+    (void)self;
     const char* query;
     if (!PyArg_ParseTuple(args, "s", &query)) {
         return NULL;
@@ -125,6 +128,7 @@ static PyObject* QihseDB_tsdb_insert(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_trinary_search(QihseDBObject *self, PyObject *args, PyObject *kwds) {
+    (void)self;
     PyObject *vec;
     const char *mode = NULL;
     static char *kwlist[] = {"vector", "mode", NULL};
@@ -188,6 +192,7 @@ static PyObject* QihseDB_start_pg_proxy(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
+    (void)self;
     unsigned int creator_id;
     unsigned int target_user_id;
     unsigned int role;
@@ -214,6 +219,7 @@ static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_auth_destroy_user(QihseDBObject *self, PyObject *args) {
+    (void)self;
     unsigned int user_id;
     if (!PyArg_ParseTuple(args, "I", &user_id)) {
         return NULL;
@@ -227,6 +233,7 @@ static PyObject* QihseDB_auth_destroy_user(QihseDBObject *self, PyObject *args) 
 }
 
 static PyObject* QihseDB_auth_can_access(QihseDBObject *self, PyObject *args) {
+    (void)self;
     unsigned int user_id;
     unsigned int req_clearance;
     unsigned int req_sci;
@@ -256,7 +263,7 @@ static PyMethodDef QihseDB_methods[] = {
     {"col_create", (PyCFunction)QihseDB_col_create, METH_VARARGS, "Create float column."},
     {"col_append", (PyCFunction)QihseDB_col_append, METH_VARARGS, "Append to float column."},
     {"tsdb_insert", (PyCFunction)QihseDB_tsdb_insert, METH_VARARGS, "Insert time-series data point."},
-    {"trinary_search", (PyCFunction)QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
+    {"trinary_search", (PyCFunction)(void(*)(void))QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
     {"start_resp_proxy", (PyCFunction)QihseDB_start_resp_proxy, METH_VARARGS, "Start the Redis Wire proxy in the background."},
     {"start_pg_proxy", (PyCFunction)QihseDB_start_pg_proxy, METH_VARARGS, "Start the Postgres Wire proxy in the background."},
     {"auth_create_user", (PyCFunction)QihseDB_auth_create_user, METH_VARARGS, "Create a user with explicit clearance boundaries."},
