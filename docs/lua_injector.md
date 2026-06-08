@@ -61,6 +61,94 @@ end
 return false -- Drop from candidate pool
 ```
 
+## Advanced Execution Examples
+
+The Lua environment is highly flexible. Below are three tactical examples demonstrating the power of zero-copy vector filtering.
+
+### Example 1: Multi-Dimensional Anomaly Detection (Threshold Gating)
+Analysts can use this to filter network packets or behavior profiles where multiple distinct features must simultaneously breach a threshold before the vector is considered a candidate.
+
+```lua
+local ffi = require("ffi")
+
+local vec_ptr, dims = ...
+local vec = ffi.cast("const float*", vec_ptr)
+
+local anomalous_features = 0
+
+-- Check specific vector dimensions representing distinct features:
+-- Index 14: Payload entropy
+-- Index 22: Connection duration deviation
+-- Index 31: Geo-velocity anomaly
+
+if vec[14] > 0.92 then anomalous_features = anomalous_features + 1 end
+if vec[22] > 3.50 then anomalous_features = anomalous_features + 1 end
+if vec[31] > 0.88 then anomalous_features = anomalous_features + 1 end
+
+-- Only return true if at least two critical features are anomalous
+return anomalous_features >= 2
+```
+
+### Example 2: Quantum-Inspired Temporal Masking
+This script masks out (ignores) certain dimensions of the vector during the hardware dot-product to dynamically adjust the search space without recalculating the entire index.
+
+```lua
+local ffi = require("ffi")
+
+local vec_ptr, dims = ...
+local vec = ffi.cast("float*", vec_ptr) -- Mutable cast for temporal masking
+
+-- Store original values
+local orig_10 = vec[10]
+local orig_11 = vec[11]
+
+-- Temporarily mask out dimensions 10 and 11 (e.g., ignoring daytime cyclic noise)
+vec[10] = 0.0
+vec[11] = 0.0
+
+-- Perform the hardware similarity check on the masked vector
+local similarity = qihse_hardware_dot_product(vec, dims)
+
+-- Restore the original memory state (Zero-copy integrity)
+vec[10] = orig_10
+vec[11] = orig_11
+
+-- Keep candidates with a similarity over 95%
+return similarity > 0.95
+```
+
+### Example 3: C2 Beacon Jitter Identification
+If a vector encodes the temporal jitter (delay variance) of a network connection, analysts can write mathematical logic directly into the database to identify specific threat actors.
+
+```lua
+local ffi = require("ffi")
+local math = require("math")
+
+local vec_ptr, dims = ...
+local vec = ffi.cast("const float*", vec_ptr)
+
+-- Assume dimensions 0 through 9 contain the delta times between the last 10 packets
+local mean = 0
+for i=0, 9 do
+    mean = mean + vec[i]
+end
+mean = mean / 10
+
+local variance = 0
+for i=0, 9 do
+    local diff = vec[i] - mean
+    variance = variance + (diff * diff)
+end
+variance = variance / 10
+
+-- A variance below 0.05 indicates highly programmatic, non-human timing (e.g. Cobalt Strike default jitter)
+if variance < 0.05 and mean > 10.0 and mean < 60.0 then
+    return true -- Flag as C2 Beacon
+end
+
+return false
+```
+
 ## Security Profile
 
 * **Isolation**: Every query thread receives its own dedicated `lua_State`. Memory leaks or crashes in one VM cannot physically corrupt another.
