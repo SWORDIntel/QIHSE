@@ -30,15 +30,18 @@ QIHSE combines quantum-inspired mathematics with classical optimizations to deli
 
 ### 🎯 **Key Innovations**
 - **Quantum-Inspired Algorithms**: Hilbert space expansion with Random Fourier Features
+- **TRITON Lua VM Injectors**: Zero-copy edge filtering with in-database LuaJIT sandboxing
 - **Intelligent Algorithm Selection**: Automatic quantum vs classical vs hybrid optimization
 - **Memory-Bounded Anchor Tables**: Predictable memory usage with LRU pruning
-- **Workload-Specific Tuning**: Optimized for telemetry, IDs, offsets, and events
+- **Multi-Protocol Wire Proxy**: Native compatibility with RESP (Redis) and PostgreSQL wire protocols
 - **Hardware Acceleration**: SIMD, GPU, NPU, and specialized processor support
 
-### 🔒 **Enterprise-Ready**
-- **CNSA 2.0 compliant** for mission-critical security
+### 🔒 **Enterprise-Ready & High Availability**
+- **Distributed Raft Consensus**: Non-blocking `io_uring` clustering for zero-downtime replication
+- **CNSA 2.0 compliant** for mission-critical security and post-quantum readiness
 - **99%+ accuracy** with confidence-based verification
 - **Production-tested** benchmark suite (SIFT1M, GIST1M, MS MARCO)
+- **Defense & Intelligence Suite**: Pre-compiled tactical modules for aerospace telemetry and SIGINT
 - **Standard infrastructure** - no specialized hardware required
 
 ---

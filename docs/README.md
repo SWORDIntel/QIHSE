@@ -158,8 +158,10 @@ Security architecture and CNSA 2.0 compliance:
 - Audit logging and monitoring
 - Threat mitigation and compliance verification
 
-### [🚀 Deployment](deployment/)
-Production deployment guides:
+### [🚀 Deployment & Commercial](deployment/)
+Production deployment guides and business analysis:
+- [Commercial Executive Summary](commercial/QIHSE_EXECUTIVE_SUMMARY.md)
+- [ROI & Market Strategy](commercial/README.md)
 - Single-node and cluster deployment
 - Cloud deployment (AWS, Azure)
 - Monitoring and observability
