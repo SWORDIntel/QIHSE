@@ -69,7 +69,7 @@ Available Plugins:
 * **`plugins/lua/gchq_actor_correlation.lua`**: Correlates zero-day payload structures, C2 jitter, and timezone entropy to accurately attribute Advanced Persistent Threat (APT) groups.
 * **`plugins/lua/cia_target_risk_calc.lua`**: Calculates the kinetic operational risk of a ground target by measuring geospatial distance to exfil routes, EMF shielding density, and drone coverage probability.
 * **`plugins/lua/nasa_trajectory_anomaly.lua`**: Evaluates Low Earth Orbit (LEO) telemetry vectors to instantaneously flag micro-meteoroid impacts or atmospheric orbital decay.
-* **`plugins/lua/nasa_kinetic_deorbit.lua`**: An advanced aerospace module that calculates the exact pitch/yaw/roll gyroscopic thruster burns required to intentionally deorbit a satellite into a kinetic intercept course with a hostile orbital asset.
+* **`plugins/lua/nasa_grav_slingshot_intercept.lua`**: An advanced aerospace module that calculates an instantaneous high-Delta-V intercept trajectory using a patched-conic gravitational assist (slingshot) around a celestial body. It utilizes planetary gravity fields and ephemeris data passed directly from the Vector Database.
 * **`plugins/lua/sigint_entropy_masking.lua`**: Detects covert steganographic exfiltration (e.g., XChaCha20 streams hiding inside standard TLS headers) by analyzing sub-band spectral entropy and packet inter-arrival phase shifts.
 
 To use a plugin, simply load the Lua source file and pass it to the `qihse_lua_sandbox_filter_vector` C-API execution context.
