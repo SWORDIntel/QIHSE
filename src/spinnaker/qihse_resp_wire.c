@@ -9,8 +9,20 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <pthread.h>
 
+typedef struct {
+    int client_fd;
+    qihse_kv_store_t* store;
+    qihse_vector_db_t vdb;
+} qihse_resp_client_ctx_t;
 
+void* qihse_resp_client_thread(void* arg) {
+    qihse_resp_client_ctx_t* ctx = (qihse_resp_client_ctx_t*)arg;
+    qihse_resp_handle_client(ctx->client_fd, ctx->store, ctx->vdb);
+    free(ctx);
+    return NULL;
+}
 
 
 static int parse_resp_array(char* buf, char** args, int max_args) {
@@ -81,6 +93,29 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             } else if (strcasecmp(args[0], "DEL") == 0 && argc >= 2) {
                 qihse_kv_del_user(store, args[1], NULL);
                 const char* reply = ":1\r\n";
+                write(client_fd, reply, strlen(reply));
+            } else if (strcasecmp(args[0], "MSET") == 0 && argc >= 3) {
+                for (int i = 1; i < argc - 1; i += 2) {
+                    qihse_kv_set(store, args[i], args[i+1], 0, 0);
+                }
+                const char* reply = "+OK\r\n";
+                write(client_fd, reply, strlen(reply));
+            } else if (strcasecmp(args[0], "MGET") == 0 && argc >= 2) {
+                char reply[65536];
+                int offset = snprintf(reply, sizeof(reply), "*%d\r\n", argc - 1);
+                for (int i = 1; i < argc; i++) {
+                    const char* val = qihse_kv_get_user(store, args[i], NULL);
+                    if (val) {
+                        offset += snprintf(reply + offset, sizeof(reply) - offset, "$%zu\r\n%s\r\n", strlen(val), val);
+                    } else {
+                        offset += snprintf(reply + offset, sizeof(reply) - offset, "$-1\r\n");
+                    }
+                }
+                write(client_fd, reply, offset);
+            } else if (strcasecmp(args[0], "INFO") == 0) {
+                const char* info = "# Server\r\nredis_version:7.0.0 (QIHSE Wire Proxy)\r\n# Memory\r\nused_memory_human:0B\r\n";
+                char reply[1024];
+                snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(info), info);
                 write(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSET") == 0 && argc >= 3) {
                 uint64_t id = strtoull(args[1], NULL, 10);
@@ -190,7 +225,19 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
             continue;
         }
 
-        qihse_resp_handle_client(client_fd, store, vdb);
+        qihse_resp_client_ctx_t* ctx = malloc(sizeof(qihse_resp_client_ctx_t));
+        ctx->client_fd = client_fd;
+        ctx->store = store;
+        ctx->vdb = vdb;
+        
+        pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, qihse_resp_client_thread, ctx) != 0) {
+            perror("pthread_create failed");
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        pthread_detach(thread_id);
     }
 
     return true;

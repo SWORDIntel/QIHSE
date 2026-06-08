@@ -44,7 +44,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
-            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c \
+            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c \
             src/black_hole/qihse_kv_store.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c \
