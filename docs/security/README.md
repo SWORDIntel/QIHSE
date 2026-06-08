@@ -24,32 +24,32 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 ┌─────────────────────────────────────────────────────────┐
 │                   EXTERNAL NETWORK                      │
 ├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
-│  │   Network   │  │   API       │  │ Application │     │
-│  │  Security   │  │  Security   │  │   Security  │     │
-│  │             │  │             │  │             │     │
-│  │ • Firewall  │  │ • AuthN     │  │ • Input      │     │
-│  │ • IDS/IPS   │  │ • AuthZ     │  │ • Validation │     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────  ┐     │
+│  │   Network   │  │   API       │  │ Application   │     │
+│  │  Security   │  │  Security   │  │   Security    │     │
+│  │             │  │             │  │               │     │
+│  │ • Firewall  │  │ • AuthN     │  │ • Input       │     │
+│  │ • IDS/IPS   │  │ • AuthZ     │  │ • Validation  │     │
 │  │ • TLS 1.3   │  │ • Rate      │  │ • Sanitization│     │
-│  │             │  │ • Limiting  │  │             │     │
-│  └─────────────┘  └─────────────┘  └─────────────┘     │
+│  │             │  │ • Limiting  │  │               │     │
+│  └─────────────┘  └─────────────┘  └─────────────  ┘     │
 ├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
-│  │   Data      │  │   System    │  │   Runtime   │     │
-│  │  Security   │  │  Security   │  │  Security   │     │
-│  │             │  │             │  │             │     │
-│  │ • Encryption│  │ • Secure    │  │ • ASLR      │     │
-│  │ • Integrity │  │ • Boot      │  │ • DEP       │     │
-│  │ • Backup    │  │ • Updates   │  │ • Stack     │     │
-│  │             │  │             │  │ • Protection│     │
-│  └─────────────┘  └─────────────┘  └─────────────┘     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────  ┐     │
+│  │   Data      │  │   System    │  │   Runtime     │     │
+│  │  Security   │  │  Security   │  │  Security     │     │
+│  │             │  │             │  │               │     │
+│  │ • Encryption│  │ • Secure    │  │ • ASLR        │     │
+│  │ • Integrity │  │ • Boot      │  │ • DEP         │     │
+│  │ • Backup    │  │ • Updates   │  │ • Stack       │     │
+│  │             │  │             │  │ • Protection  │     │
+│  └─────────────┘  └─────────────┘  └─────────────  ┘     │
 ├─────────────────────────────────────────────────────────┤
 │                 SECURE INFRASTRUCTURE                  │
 ├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
-│  │   CNSA 2.0  │  │   FIPS      │  │   Hardware  │     │
-│  │ Compliance  │  │ Validation  │  │  Security   │     │
-│  └─────────────┘  └─────────────┘  └─────────────┘     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────  ┐     │
+│  │   CNSA 2.0  │  │   FIPS      │  │   Hardware    │     │
+│  │ Compliance  │  │ Validation  │  │  Security     │     │
+│  └─────────────┘  └─────────────┘  └─────────────  ┘     │
 └─────────────────────────────────────────────────────────┘
 ```
 
