@@ -135,7 +135,7 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         fclose(f);
     }
     
-    strncpy(last_hash, new_hash, 128);
+    memcpy(last_hash, new_hash, 129);
     update_sneaky_state(last_hash);
     
     pthread_mutex_unlock(&audit_mutex);

@@ -31,7 +31,7 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     // 2. Establish Zero-Copy FFI (Foreign Function Interface) Bridge
     // We bind a global function 'qihse_avx512_dot' to simulate hardware intrinsics
     // In a full implementation, this uses LuaJIT's ffi.cdef to map the pointer directly.
-    luaL_dostring(sandbox->L,
+    (void)luaL_dostring(sandbox->L,
         "local ffi = require('ffi')\n"
         "ffi.cdef[[\n"
         "    double qihse_hardware_dot_product(const float* vec, size_t dims);\n"
