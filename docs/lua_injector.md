@@ -71,6 +71,7 @@ Available Plugins:
 * **`plugins/lua/nasa_trajectory_anomaly.lua`**: Evaluates Low Earth Orbit (LEO) telemetry vectors to instantaneously flag micro-meteoroid impacts or atmospheric orbital decay.
 * **`plugins/lua/nasa_grav_slingshot_intercept.lua`**: An advanced aerospace module that calculates an instantaneous high-Delta-V intercept trajectory using a patched-conic gravitational assist (slingshot) around a celestial body. It utilizes planetary gravity fields and ephemeris data passed directly from the Vector Database.
 * **`plugins/lua/sigint_entropy_masking.lua`**: Detects covert steganographic exfiltration (e.g., XChaCha20 streams hiding inside standard TLS headers) by analyzing sub-band spectral entropy and packet inter-arrival phase shifts.
+* **`plugins/lua/nsa_qkd_decoherence_tap.lua`**: A Quantum Key Distribution (QKD) eavesdropping module. It calculates whether a physical fiber-optic tap can be successfully executed without collapsing the photon wave-function beyond the target's natural Quantum Bit Error Rate (QBER) noise floor, effectively hiding the intercept behind environmental thermal noise.
 
 To use a plugin, simply load the Lua source file and pass it to the `qihse_lua_sandbox_filter_vector` C-API execution context.
 
