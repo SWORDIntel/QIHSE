@@ -3,7 +3,7 @@
 
 CC=gcc
 
-INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include
+INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 -I/usr/include/python3.13
 QIHSE_CFLAGS_EXTRA?=
 
@@ -16,8 +16,8 @@ QIHSE_ENABLE_AVX512?=0
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -44,7 +44,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
-            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c \
+            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c src/spinnaker/qihse_lua_injector.c \
             src/black_hole/qihse_kv_store.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c \
