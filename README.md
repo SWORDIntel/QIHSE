@@ -74,8 +74,6 @@ The engine acts as a hierarchical memory laboratory: per-vector access tracking 
 
 **And crucially, it degrades gracefully.** The build system natively supports AVX-512 and AVX2/FMA instructions for extreme parallel throughput. However, if your system lacks these features (like older Intel chips, ARM processors, or constrained VMs), QIHSE detects this at runtime and seamlessly falls back to highly optimized scalar math. **It works flawlessly on any system.**
 
-> **🔥 STRESS TEST CERTIFIED:** During the VectorReVamp Omni-Harness testing, a single pristine QIHSE DB instance sustained over **600,000 multi-pathway transactions in 90 seconds on a single thread** (processing 100,000 complete cycles across the KV, Document, Time-Series, Columnar, Vector, and Cell-Level Auth engines) without a single segfault, deadlock, or OOM error. It just took the phenomenal load without a beep.
-
 > **⚠️ TEMPORARY INFRASTRUCTURE ADVISORY**
 > Due to a recent "unfortunate incident" involving the primary testing laptop (we're totally blaming the NSA for this one 😉), direct access to NPU/GNA silicons and AVX-512 pipelines is currently unavailable. While these pathways are implemented, they are not currently fully tested, optimized, or fleshed out under the strict Omni-Test harness. A repair is currently planned for the laptop, so we will have these pathways fully remedied and verified soon! In the meantime, the engine correctly and automatically routes all execution to the fully validated AVX2/FMA and scalar pipelines.
 
@@ -88,6 +86,7 @@ To keep this showcase clean, all intensive code examples, API usage, and benchma
 - **[API Reference](docs/api/README.md)**: Comprehensive C API maps for Vector DB, UWP, KV Store, and Document components.
 - **[Python Native SDK](sdks/python/README.md)**: Zero-overhead Python bindings utilizing CPython to expose the engine, proxies, and Supernatural Auth Gates directly to Python space.
 - **[Persistence Model](docs/persistence/README.md)**: File formats, WAL structure, and engine durability.
+- **[Performance Benchmarks](docs/benchmarks.md)**: Deep dive into the VectorReVamp stress tests, throughput stats, and multi-threaded engine durability compared to other databases.
 - **[Onboarding & Building](docs/ONBOARDING.md)**: Instructions for compiling, running test suites, and executing benchmark harnesses (`make test-persist`, `make bench-micro`, etc.).
 - **[Trinary Policy Rationale](docs/qmag-policy.md)**: The theory behind `qmag` candidate selection.
 
