@@ -138,15 +138,16 @@ Operational runbooks for the high-traffic implementation points:
 
 ### [🏗️ Architecture](architecture/)
 Technical deep-dive into system design:
-- Whitepaper and technical specifications
+- [TRITON Lua Injector Architecture](architecture/lua_injector.md)
+- [QMAG Default Policy Guidance](architecture/qmag-policy.md)
 - Quantum-inspired algorithm details
 - Heterogeneous computing architecture
 - Memory hierarchy and coherence protocols
 
 ### [📊 Benchmarks](benchmarks/)
 Performance validation and benchmarking:
+- [Performance Benchmarks and Stress Tests](benchmarks/benchmarks.md)
 - Benchmark suite specifications
-- Performance results and metrics
 - Regression detection methodology
 - Enterprise validation procedures
 
@@ -166,16 +167,10 @@ Production deployment guides:
 
 ### [🔧 Development](development/)
 Development resources and model specifications:
+- [Finalization Plan](development/finalization-plan.md)
 - ML model architectures and training pipelines
 - Development setup and contribution guidelines
 - Code standards and testing procedures
-
-### [QMAG Default Policy](qmag-policy.md)
-Result-driven qmag fallback guidance from the 100-case loss-pattern sweep:
-- Default qmag uses dimension-mapped trinary+magnitude scoring only for low-pressure shapes: `live_rows >= 512`, `active_query_dims/vector_dims <= 1/4`, `top_k/live_rows <= 3/128`, and `effective_candidate_pool/live_rows <= 9/32`.
-- The default pool maps active dimensions to `top_k * 8`, `top_k * 10`, or `top_k * 12`, then caps to live rows before the policy gate.
-- Rejected default shapes fall back to exact float32 and preserve exact-equivalent results.
-- Explicit qmag pools remain caller-directed opt-ins and still execute after validation.
 
 ## 🚀 Quick Start
 
