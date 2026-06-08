@@ -5,9 +5,10 @@ local math = require("math")
 local vec_ptr, dims = ...
 local vec = ffi.cast("const float*", vec_ptr)
 
--- NASA KINETIC INTERCEPT: TEMPORAL PHASING MANEUVER
--- Calculates a multi-day orbital phasing intercept using non-impulsive gyroscopic thrust.
--- Accounts for J2 gravitational perturbations (Earth's oblateness) and temporal time-of-flight.
+-- NASA KINETIC INTERCEPT: NON-DESTRUCTIVE MISSION KILL (SPIN-OUT)
+-- Calculates a multi-day orbital phasing intercept designed NOT to vaporize the target,
+-- but to impart an unrecoverable angular momentum transfer (tumble), permanently exceeding 
+-- the target's Control Moment Gyroscope (CMG) saturation limits without creating a massive debris field.
 
 -- Constants
 local MU = 398600.4418            -- Earth's standard gravitational parameter (km^3/s^2)
@@ -18,73 +19,63 @@ local J2 = 0.00108263             -- Earth's J2 perturbation constant
 local target_time_of_flight = vec[0]   -- Days until desired impact window
 local target_time_seconds = target_time_of_flight * 86400.0
 
--- Target Asset Orbital Elements
-local target_a = vec[1] + RE           -- Target semi-major axis (km)
-local target_e = vec[2]                -- Target eccentricity
-local target_i = math.rad(vec[3])      -- Target inclination (radians)
-local target_raan = math.rad(vec[4])   -- Target Right Ascension of Ascending Node
+-- Target Asset Orbital Elements & Hardware Limits
+local target_a = vec[1] + RE           
+local target_e = vec[2]                
+local target_i = math.rad(vec[3])      
+local target_raan = math.rad(vec[4])   
+local target_cmg_saturation_limit = vec[5] -- Max N·m·s the target's reaction wheels can absorb
 
--- Our Asset Orbital Elements
-local current_a = vec[5] + RE
-local current_e = vec[6]
-local current_i = math.rad(vec[7])
-local current_raan = math.rad(vec[8])
+-- Our Asset Orbital Elements & Thruster Limits
+local current_a = vec[6] + RE
+local current_e = vec[7]
+local current_i = math.rad(vec[8])
+local current_raan = math.rad(vec[9])
+local current_mass = vec[10]            -- Mass in kg
+local available_thrust = vec[11]
 
-local current_mass = vec[9]            -- Mass in kg
-
--- Gyro Thruster Capabilities (Continuous non-impulsive thrust in N)
-local available_thrust = vec[10]
-
--- 1. Calculate Nodal Precession (J2 Perturbation) for both orbits over the Time of Flight
--- Real satellites drift over days; we must calculate exactly where their orbital planes will be.
+-- 1. Calculate Nodal Precession (J2 Perturbation)
 local function calc_nodal_precession_rate(a, e, i)
-    local n = math.sqrt(MU / math.pow(a, 3)) -- Mean motion
-    local p = a * (1 - e*e)                  -- Semi-latus rectum
-    -- d(Omega)/dt
+    local n = math.sqrt(MU / math.pow(a, 3))
+    local p = a * (1 - e*e)
     return -1.5 * n * J2 * math.pow(RE / p, 2) * math.cos(i)
 end
 
-local target_precession_rate = calc_nodal_precession_rate(target_a, target_e, target_i)
-local current_precession_rate = calc_nodal_precession_rate(current_a, current_e, current_i)
+local target_future_raan = target_raan + (calc_nodal_precession_rate(target_a, target_e, target_i) * target_time_seconds)
+local current_future_raan = current_raan + (calc_nodal_precession_rate(current_a, current_e, current_i) * target_time_seconds)
 
-local target_future_raan = target_raan + (target_precession_rate * target_time_seconds)
-local current_future_raan = current_raan + (current_precession_rate * target_time_seconds)
-
--- 2. Plane Change Calculation (To align the RAAN and Inclination at time of impact)
--- If the future planes don't intersect, we need a plane change maneuver.
+-- 2. Plane Change & Transfer Orbit Calculation
 local delta_i = target_i - current_i
 local delta_raan = target_future_raan - current_future_raan
 local plane_change_angle = math.acos(math.cos(current_i)*math.cos(target_i) + math.sin(current_i)*math.sin(target_i)*math.cos(delta_raan))
 
--- 3. Required Delta-V for combined Hohmann Transfer + Plane Change
 local current_v = math.sqrt(MU / current_a)
 local transfer_a = (current_a + target_a) / 2.0
 local v_transfer_periapsis = math.sqrt(MU * ((2.0 / current_a) - (1.0 / transfer_a)))
 
--- Approximate Delta-V required to enter transfer orbit and change plane simultaneously
 local required_delta_v = math.sqrt(current_v^2 + v_transfer_periapsis^2 - 2 * current_v * v_transfer_periapsis * math.cos(plane_change_angle))
 
--- 4. Thruster Capability Check
--- Can our continuous gyro thrusters generate this Delta-V over the timeframe?
--- F = ma -> a = F/m -> Delta-V = a * t
+-- 3. Thruster Capability Check
 local acceleration = available_thrust / current_mass
-local max_delta_v_possible = acceleration * (target_time_seconds * 0.5) -- Assuming we can only thrust half the time due to solar power limits
+local max_delta_v_possible = acceleration * (target_time_seconds * 0.5)
 
 if max_delta_v_possible < required_delta_v then
-    return false -- Insufficient thrust to match the target's temporal phase window
+    return false -- Insufficient thrust to match the temporal phase window
 end
 
--- 5. Impact Yield Calculation
--- Assuming a head-on or high-angle intercept, kinetic velocity is roughly the sum of their orbital velocities
-local target_v = math.sqrt(MU / target_a)
-local intercept_velocity = current_v + target_v -- Max theoretical closing speed in km/s
-local intercept_velocity_ms = intercept_velocity * 1000.0
+-- 4. Grazing Impact / Angular Momentum Transfer Calculation
+-- We do not want a head-on megajoule impact. We want a grazing vector (e.g. 5-10 m/s relative velocity).
+local grazing_velocity_ms = 8.5 
 
-local kinetic_yield_megajoules = 0.5 * current_mass * (intercept_velocity_ms * intercept_velocity_ms) / 1000000.0
+-- Angular momentum L = r x (m * v)
+-- Assuming impact at the extreme edge of the target's solar array (approx 5 meters from center of mass)
+local impact_radius_meters = 5.0
+local angular_momentum_imparted = impact_radius_meters * current_mass * grazing_velocity_ms
 
-if kinetic_yield_megajoules > 500.0 then
-    -- Telemetry indicates we can successfully drift into the target's exact spatial coordinates
-    -- after J2 orbital decay, with sufficient yield to destroy it.
+if angular_momentum_imparted > target_cmg_saturation_limit then
+    -- The kinetic tap will instantly saturate the target's reaction wheels.
+    -- The target will enter an unrecoverable tumble, lose solar pointing, and experience a permanent mission kill 
+    -- without generating a hazardous high-velocity debris cloud.
     return true
 end
 
