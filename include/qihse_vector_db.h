@@ -502,6 +502,29 @@ bool qihse_vector_db_add_vectors(
 );
 
 /**
+ * Add model storage weights directly into the specified quantization category (e.g. FP16, INT8, FP8, FP4, INT4).
+ * This API is optimized for ML model storage: it directly populates the corresponding sidecar
+ * memory buffers to avoid wasting time and memory, and auto-expands to the core FP32 representation
+ * for authoritative query routing.
+ *
+ * @param vdb Vector database handle
+ * @param category The quantization category (e.g., QIHSE_VDB_QUERY_FP8, QIHSE_VDB_QUERY_INT4)
+ * @param weights Raw byte array containing the weights in the specified format
+ * @param num_vectors Number of weight vectors
+ * @param vector_dims Dimension count per vector
+ * @param ids Array of vector IDs (NULL for auto-generated)
+ * @return true on success, false on failure
+ */
+bool qihse_vector_db_add_model_weights(
+    qihse_vector_db_t vdb,
+    qihse_vector_db_query_mode_t category,
+    const void* weights,
+    size_t num_vectors,
+    size_t vector_dims,
+    const uint64_t* ids
+);
+
+/**
  * Delete one live vector by external ID.
  *
  * PR-4 API surface only: implementations must reject read-only handles, mark

@@ -4520,6 +4520,102 @@ bool qihse_vector_db_add_vectors(
     return qihse_vdb_apply_add(vdb, &add, true);
 }
 
+bool qihse_vector_db_add_model_weights(
+    qihse_vector_db_t vdb,
+    qihse_vector_db_query_mode_t category,
+    const void* weights,
+    size_t num_vectors,
+    size_t vector_dims,
+    const uint64_t* ids
+) {
+    if (!vdb || !weights || num_vectors == 0 || vector_dims == 0) return false;
+
+    // First we must expand the weights into an FP32 array.
+    size_t alloc_bytes;
+    if (!qihse_checked_mul_size(num_vectors, vector_dims, &alloc_bytes) ||
+        !qihse_checked_mul_size(alloc_bytes, sizeof(float), &alloc_bytes)) {
+        return false;
+    }
+    
+    float* fp32_expanded = (float*)malloc(alloc_bytes);
+    if (!fp32_expanded) return false;
+
+    // Expand based on category
+    if (category == QIHSE_VDB_QUERY_FP32) {
+        memcpy(fp32_expanded, weights, alloc_bytes);
+    } else if (category == QIHSE_VDB_QUERY_FP16) {
+        const uint16_t* w16 = (const uint16_t*)weights;
+        for (size_t i = 0; i < num_vectors * vector_dims; i++) {
+            uint32_t f32 = ((w16[i] & 0x8000) << 16) | (((w16[i] & 0x7FFF) << 13) + (112 << 23));
+            memcpy(&fp32_expanded[i], &f32, sizeof(float));
+        }
+    } else if (category == QIHSE_VDB_QUERY_INT8) {
+        const int8_t* w8 = (const int8_t*)weights;
+        for (size_t i = 0; i < num_vectors * vector_dims; i++) {
+            fp32_expanded[i] = (float)w8[i] / 127.0f;
+        }
+    } else if (category == QIHSE_VDB_QUERY_FP8) {
+        const uint8_t* w8 = (const uint8_t*)weights;
+        for (size_t i = 0; i < num_vectors * vector_dims; i++) {
+            uint32_t f32 = ((w8[i] & 0x80) << 24) | (((w8[i] & 0x78) >> 3) << 23) | ((w8[i] & 0x07) << 20);
+            memcpy(&fp32_expanded[i], &f32, sizeof(float));
+        }
+    } else if (category == QIHSE_VDB_QUERY_FP4) {
+        const uint8_t* w4 = (const uint8_t*)weights;
+        size_t packed_dims = vector_dims / 2 + (vector_dims % 2);
+        for (size_t i = 0; i < num_vectors; i++) {
+            for (size_t j = 0; j < packed_dims; j++) {
+                uint8_t byte = w4[i * packed_dims + j];
+                for (int k = 0; k < 2; k++) {
+                    if (j * 2 + k < vector_dims) {
+                        uint8_t val = (byte >> (k * 4)) & 0x0F;
+                        uint32_t f32 = ((val & 0x08) << 28) | (((val & 0x06) >> 1) << 23) | ((val & 0x01) << 22);
+                        memcpy(&fp32_expanded[i * vector_dims + j * 2 + k], &f32, sizeof(float));
+                    }
+                }
+            }
+        }
+    } else if (category == QIHSE_VDB_QUERY_INT4) {
+        const uint8_t* w4 = (const uint8_t*)weights;
+        size_t packed_dims = vector_dims / 2 + (vector_dims % 2);
+        for (size_t i = 0; i < num_vectors; i++) {
+            for (size_t j = 0; j < packed_dims; j++) {
+                uint8_t byte = w4[i * packed_dims + j];
+                for (int k = 0; k < 2; k++) {
+                    if (j * 2 + k < vector_dims) {
+                        int8_t val = (int8_t)((byte >> (k * 4)) & 0x0F);
+                        if (val & 0x08) val |= 0xF0; // sign extend
+                        fp32_expanded[i * vector_dims + j * 2 + k] = (float)val / 7.0f;
+                    }
+                }
+            }
+        }
+    } else {
+        free(fp32_expanded);
+        return false;
+    }
+
+    // Call standard internal ingestion which handles metadata and IDs natively in FP32
+    bool ok = qihse_vector_db_add_vectors(vdb, fp32_expanded, num_vectors, vector_dims, ids, NULL, NULL);
+    free(fp32_expanded);
+    
+    // Explicitly rebuild only the target sidecar for efficiency, since the user already told us exactly
+    // which precision these weights were optimized for
+    if (ok) {
+        switch (category) {
+            case QIHSE_VDB_QUERY_FP32: qihse_vector_db_build_fp32(vdb); break;
+            case QIHSE_VDB_QUERY_FP16: qihse_vector_db_build_fp16(vdb); break;
+            case QIHSE_VDB_QUERY_INT8: qihse_vector_db_build_int8(vdb); break;
+            case QIHSE_VDB_QUERY_FP8:  qihse_vector_db_build_fp8(vdb); break;
+            case QIHSE_VDB_QUERY_FP4:  qihse_vector_db_build_fp4(vdb); break;
+            case QIHSE_VDB_QUERY_INT4: qihse_vector_db_build_int4(vdb); break;
+            default: break;
+        }
+    }
+    
+    return ok;
+}
+
 bool qihse_vector_db_delete_by_id(
     qihse_vector_db_t vdb,
     uint64_t vector_id
@@ -6651,7 +6747,7 @@ bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
         return false;
     }
     size_t dims = vdb->vector_dims;
-    size_t packed_dims = (dims + 1) / 2;
+    size_t packed_dims = dims / 2 + (dims % 2);
     size_t n_rows = vdb->total_vectors;
 
     size_t alloc_bytes;
@@ -6703,7 +6799,7 @@ bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
         return false;
     }
     size_t dims = vdb->vector_dims;
-    size_t packed_dims = (dims + 1) / 2;
+    size_t packed_dims = dims / 2 + (dims % 2);
     size_t n_rows = vdb->total_vectors;
 
     size_t alloc_bytes;
