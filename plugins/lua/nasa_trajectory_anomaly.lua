@@ -5,37 +5,51 @@ local math = require("math")
 local vec_ptr, dims = ...
 local vec = ffi.cast("const float*", vec_ptr)
 
--- NASA ORBITAL TRAJECTORY ANOMALY DETECTION
--- Analyzes telemetry vectors from Low Earth Orbit (LEO) assets to detect micro-meteoroid impacts or orbital decay
+-- NASA ORBITAL TRAJECTORY ANOMALY DETECTION: ADVERSARIAL MANEUVERS
+-- Analyzes highly precise orbital telemetry to detect if a satellite has been covertly hijacked 
+-- (e.g. an adversary burning Station Keeping fuel to reposition the asset for intelligence gathering).
 
--- Dims 0-2: Expected X, Y, Z velocity vectors
--- Dims 3-5: Actual X, Y, Z velocity vectors
--- Dims 6-8: Gyroscopic pitch, yaw, roll deviation
--- Dim 9: Thermal shielding variance
+-- Vector Dimensions 0-23 represent hourly Semi-Major Axis (SMA) telemetry readings over the last 24 hours (in km)
+-- Vector Dimension 24 is the expected atmospheric drag coefficient (Ballistic Coefficient)
+-- Vector Dimension 25 is the Solar Flux Index (F10.7) proxy for atmospheric density expansion
 
-local delta_vx = vec[3] - vec[0]
-local delta_vy = vec[4] - vec[1]
-local delta_vz = vec[5] - vec[2]
+local expected_drag_coeff = vec[24]
+local solar_flux_index = vec[25]
 
--- Calculate total velocity deviation vector magnitude
-local velocity_deviation = math.sqrt((delta_vx * delta_vx) + (delta_vy * delta_vy) + (delta_vz * delta_vz))
+-- 1. Calculate Expected Keplerian Orbital Decay (SMA loss per hour due to drag)
+-- High solar flux expands the atmosphere, increasing drag on LEO satellites
+local atmospheric_density_factor = 1.0 + (solar_flux_index * 0.005)
+local expected_hourly_sma_decay = expected_drag_coeff * atmospheric_density_factor
 
-local pitch_dev = math.abs(vec[6])
-local yaw_dev = math.abs(vec[7])
-local roll_dev = math.abs(vec[8])
+-- 2. Analyze the 24-hour telemetry window
+local abnormal_burn_detected = false
+local total_unaccounted_delta_v = 0.0
 
-local thermal_variance = vec[9]
-
--- Detection Condition A: Sudden Micro-Meteoroid Impact
--- Causes an instantaneous velocity deviation paired with immediate gyroscopic tumble
-if velocity_deviation > 5.0 and (pitch_dev > 2.5 or yaw_dev > 2.5 or roll_dev > 2.5) then
-    return true -- Flag for emergency collision avoidance / damage control
+for i = 1, 23 do
+    local previous_sma = vec[i-1]
+    local current_sma = vec[i]
+    
+    -- The actual change in altitude
+    local actual_sma_change = current_sma - previous_sma
+    
+    -- Subtract the expected decay. If the result is highly positive, the satellite increased altitude.
+    -- If it's highly negative, it dropped faster than orbital mechanics dictate.
+    local unaccounted_variance = actual_sma_change - (-expected_hourly_sma_decay)
+    
+    -- A threshold of 5 meters/hour variance is noise. 
+    -- Anything beyond that requires physical thruster activation.
+    if math.abs(unaccounted_variance) > 0.005 then 
+        total_unaccounted_delta_v = total_unaccounted_delta_v + math.abs(unaccounted_variance)
+        abnormal_burn_detected = true
+    end
 end
 
--- Detection Condition B: Atmospheric Drag / Orbital Decay
--- Gradual but consistent velocity loss paired with a rising thermal variance due to atmospheric friction
-if delta_vx < -1.0 and delta_vy < -1.0 and thermal_variance > 1.5 then
-    return true -- Flag for immediate thruster re-boost
+-- 3. Flag Covert Hijack or Spoofing
+-- If the satellite is executing micro-burns not scheduled in the Station Keeping manifest,
+-- it is likely being repositioned by an adversary for a new surveillance tasking, or intentionally dumped.
+if abnormal_burn_detected and total_unaccounted_delta_v > 0.05 then
+    -- Analyst logic: Unaccounted orbital energy exceeds 50 meters of uncommanded altitude shift.
+    return true -- Flag for immediate Command & Control (C2) cryptographic lockdown
 end
 
-return false -- Nominal trajectory
+return false
