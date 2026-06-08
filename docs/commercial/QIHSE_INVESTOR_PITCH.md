@@ -53,7 +53,8 @@
 **Performance Results:**
 - **29x speedup** vs binary search (AVX2-only)
 - **140x speedup** with AVX-512 + GPU acceleration
-- **99.5%+ accuracy** maintained
+- **Zero-Copy Edge Filtering** via the TRITON Lua VM Sandbox
+- **Consolidates Architecture** by natively replacing Redis and PostgreSQL workloads
 - **50-70% infrastructure cost reduction**
 
 ---
@@ -76,15 +77,16 @@
 
 ## Slide 5: Market Opportunity
 
-# $245B Total Addressable Market
+# $320B Total Addressable Market
 
 **Market Breakdown:**
-- **Database Market**: $80B (32.7%)
-- **Search Infrastructure**: $15B (6.1%)
-- **High-Performance Computing**: $50B (20.4%)
-- **Cloud Database Services**: $100B (40.8%)
+- **Database Market**: $80B 
+- **Search Infrastructure**: $15B 
+- **High-Performance Computing**: $50B 
+- **Defense & Intelligence (SIGINT/Aerospace)**: $75B
+- **Cloud Database Services**: $100B 
 
-**Serviceable Addressable Market: $59B**
+**Serviceable Addressable Market: $85B**
 - 60% of TAM addressable
 - 40% feasible to serve initially
 - **15-20% annual growth**
@@ -155,7 +157,8 @@
 - **Enterprise integration** demands specialized knowledge
 
 **Market Position:**
-- **First-mover advantage** in $59B SAM
+- **First-mover advantage** in an $85B SAM
+- **Defense-Ready Sovereign Capabilities** with Lua TRITON intelligence plugins
 - **Performance leadership** 3-5x better than alternatives
 - **Cost-efficiency advantage** over specialized solutions
 
