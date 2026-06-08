@@ -40,8 +40,8 @@ Pure Lua math is fast, but hardware-accelerated math is exponentially faster.
 ```lua
 local ffi = require("ffi")
 
--- Target vector to compare against (e.g., a known threat signature)
-local THREAT_SIGNATURE_WEIGHT = 0.85
+-- Target vector to compare against (e.g., a known user preference profile)
+local PREFERENCE_WEIGHT = 0.85
 
 -- The VM automatically receives (vec_ptr, dims) as arguments
 local vec_ptr, dims = ...
@@ -50,8 +50,8 @@ local vec_ptr, dims = ...
 local similarity = qihse_hardware_dot_product(vec_ptr, dims)
 
 -- 2. Custom logical filtering
-if similarity > THREAT_SIGNATURE_WEIGHT then
-    -- Analyst logic: If dimension 4 (e.g., specific packet length feature) is spiked
+if similarity > PREFERENCE_WEIGHT then
+    -- Analyst logic: If dimension 4 (e.g., price sensitivity feature) is high
     local float_array = ffi.cast("const float*", vec_ptr)
     if float_array[4] > 2.0 then
         return true -- Keep in candidate pool
@@ -65,8 +65,8 @@ return false -- Drop from candidate pool
 
 The Lua environment is highly flexible. Below are three tactical examples demonstrating the power of zero-copy vector filtering.
 
-### Example 1: Multi-Dimensional Anomaly Detection (Threshold Gating)
-Analysts can use this to filter network packets or behavior profiles where multiple distinct features must simultaneously breach a threshold before the vector is considered a candidate.
+### Example 1: E-Commerce Multi-Dimensional Filtering
+Use this script to filter product recommendations where multiple distinct user preferences must simultaneously breach a threshold before the product is shown to the user.
 
 ```lua
 local ffi = require("ffi")
@@ -74,23 +74,23 @@ local ffi = require("ffi")
 local vec_ptr, dims = ...
 local vec = ffi.cast("const float*", vec_ptr)
 
-local anomalous_features = 0
+local matching_preferences = 0
 
--- Check specific vector dimensions representing distinct features:
--- Index 14: Payload entropy
--- Index 22: Connection duration deviation
--- Index 31: Geo-velocity anomaly
+-- Check specific vector dimensions representing distinct product features:
+-- Index 14: Category affinity
+-- Index 22: Brand loyalty score
+-- Index 31: Discount sensitivity
 
-if vec[14] > 0.92 then anomalous_features = anomalous_features + 1 end
-if vec[22] > 3.50 then anomalous_features = anomalous_features + 1 end
-if vec[31] > 0.88 then anomalous_features = anomalous_features + 1 end
+if vec[14] > 0.92 then matching_preferences = matching_preferences + 1 end
+if vec[22] > 3.50 then matching_preferences = matching_preferences + 1 end
+if vec[31] > 0.88 then matching_preferences = matching_preferences + 1 end
 
--- Only return true if at least two critical features are anomalous
-return anomalous_features >= 2
+-- Only return true if at least two critical preferences match
+return matching_preferences >= 2
 ```
 
-### Example 2: Quantum-Inspired Temporal Masking
-This script masks out (ignores) certain dimensions of the vector during the hardware dot-product to dynamically adjust the search space without recalculating the entire index.
+### Example 2: Financial Anomaly Masking
+This script masks out (ignores) certain dimensions of the vector during the hardware dot-product to dynamically adjust the fraud detection search space without recalculating the entire index.
 
 ```lua
 local ffi = require("ffi")
@@ -102,11 +102,11 @@ local vec = ffi.cast("float*", vec_ptr) -- Mutable cast for temporal masking
 local orig_10 = vec[10]
 local orig_11 = vec[11]
 
--- Temporarily mask out dimensions 10 and 11 (e.g., ignoring daytime cyclic noise)
+-- Temporarily mask out dimensions 10 and 11 (e.g., ignoring seasonal transaction volume spikes)
 vec[10] = 0.0
 vec[11] = 0.0
 
--- Perform the hardware similarity check on the masked vector
+-- Perform the hardware similarity check on the masked vector against a known fraud profile
 local similarity = qihse_hardware_dot_product(vec, dims)
 
 -- Restore the original memory state (Zero-copy integrity)
@@ -117,8 +117,8 @@ vec[11] = orig_11
 return similarity > 0.95
 ```
 
-### Example 3: C2 Beacon Jitter Identification
-If a vector encodes the temporal jitter (delay variance) of a network connection, analysts can write mathematical logic directly into the database to identify specific threat actors.
+### Example 3: Sensor Data Jitter Analysis
+If a vector encodes the temporal variance of an IoT sensor (e.g. temperature readings), developers can write mathematical logic directly into the database to identify failing hardware.
 
 ```lua
 local ffi = require("ffi")
@@ -127,7 +127,7 @@ local math = require("math")
 local vec_ptr, dims = ...
 local vec = ffi.cast("const float*", vec_ptr)
 
--- Assume dimensions 0 through 9 contain the delta times between the last 10 packets
+-- Assume dimensions 0 through 9 contain the delta times between the last 10 sensor reads
 local mean = 0
 for i=0, 9 do
     mean = mean + vec[i]
@@ -141,9 +141,9 @@ for i=0, 9 do
 end
 variance = variance / 10
 
--- A variance below 0.05 indicates highly programmatic, non-human timing (e.g. Cobalt Strike default jitter)
+-- A variance below 0.05 indicates highly rigid, possibly stuck sensor polling hardware
 if variance < 0.05 and mean > 10.0 and mean < 60.0 then
-    return true -- Flag as C2 Beacon
+    return true -- Flag for maintenance
 end
 
 return false

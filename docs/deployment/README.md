@@ -86,22 +86,22 @@ This guide provides comprehensive instructions for deploying QIHSE in production
 │                External Network                 │
 ├─────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │
-│  │  Load       │  │  API       │  │  Auth   │  │
-│  │  Balancer   │  │  Gateway   │  │ Service │  │
-│  │  (TLS)      │  │  (mTLS)    │  │         │  │
+│  │  Load       │  │  API        │  │  Auth   │  │
+│  │  Balancer   │  │  Gateway    │  │ Service │  │
+│  │  (TLS)      │  │  (mTLS)     │  │         │  │
 │  └─────────────┘  └─────────────┘  └─────────┘  │
 ├─────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │
-│  │  QIHSE     │  │  Security   │  │  Audit  │  │
-│  │  Engine    │  │  Module     │  │ Service │  │
-│  │            │  │  (CNSA2)    │  │         │  │
+│  │  QIHSE      │  │  Security   │  │  Audit  │  │
+│  │  Engine     │  │  Module     │  │ Service │  │
+│  │             │  │  (CNSA2)    │  │         │  │
 │  └─────────────┘  └─────────────┘  └─────────┘  │
 ├─────────────────────────────────────────────────┤
 │                Internal Network                 │
 ├─────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │
-│  │  Monitoring │  │  Logging   │  │  Backup │  │
-│  │  Stack      │  │  System    │  │ Service │  │
+│  │  Monitoring │  │  Logging    │  │  Backup │  │
+│  │  Stack      │  │  System     │  │ Service │  │
 │  └─────────────┘  └─────────────┘  └─────────┘  │
 └─────────────────────────────────────────────────┘
 ```
