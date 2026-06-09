@@ -1,12 +1,31 @@
+# Root-level build artifacts and binaries
+/*.so
+/qihse-server
+/test_mldsa
+/fuzzer
+
+# Root-level patch/fix scripts (one-time use)
+/patch_*.py
+/fix_*.py
+
+# Root-level cache, logs, and temp files
 /qihse_qmag_telemetry.log
-/stress.py
 /wal.log
+/.qihse_auth_cache.dat
+/.DS_Store
+/__pycache__/
+
+# Root-level test data
 /sstable_*.db
 
+# GeoLite2 databases (large binaries, MaxMind license-restricted — download separately)
+# https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+/data/geolite2/
+
+# SDK Python artifacts
 /sdks/python/build/
 /sdks/python/*.so
 /sdks/python/sstable_*.db
 /sdks/python/wal.log
 /sdks/python/__pycache__/
 /sdks/python/test_python.py
-/.DS_Store

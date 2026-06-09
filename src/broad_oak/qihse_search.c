@@ -12,7 +12,10 @@
 #define M_PI acos(-1.0)
 #endif
 
+#include "qihse_platform.h"
+#ifndef _WIN32
 #include <pthread.h>
+#endif
 
 /* ============================================================================
  * QIHSE-NOT_STISLA INTEGRATION: GLOBAL ANCHOR STATISTICS

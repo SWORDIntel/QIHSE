@@ -45,9 +45,63 @@ typedef enum qihse_cpu_feature_e {
     QIHSE_CPU_FEATURE_AMX       = (1 << 12), /* Advanced Matrix Extensions */
     QIHSE_CPU_FEATURE_AMX_TILE  = (1 << 13), /* AMX Tile operations */
     QIHSE_CPU_FEATURE_AMX_INT8  = (1 << 14), /* AMX INT8 operations */
-    QIHSE_CPU_FEATURE_VNNI      = (1 << 15), /* Vector Neural Network Instructions */
-    QIHSE_CPU_FEATURE_AVX512VNNI = (1 << 16) /* AVX-512 VNNI */
+    QIHSE_CPU_FEATURE_VNNI       = (1 << 15), /* AVX-512 VNNI (512-bit) */
+    QIHSE_CPU_FEATURE_AVX512VNNI = (1 << 16), /* AVX-512 VNNI (alias) */
+    QIHSE_CPU_FEATURE_AVX_VNNI   = (1 << 17), /* AVX-VNNI: VEX vpdpbusd, no AVX-512 needed */
+    QIHSE_CPU_FEATURE_AMX_BF16   = (1 << 18)  /* AMX BFloat16 tile multiply */
 } qihse_cpu_feature_t;
+
+/* ============================================================================
+ * BUILD-TIME ISA GUARD MACROS
+ * ============================================================================
+ * These are set by the Makefile (-DQIHSE_ENABLE_xxx=1) and map directly onto
+ * compiler intrinsic availability.  Use these in source files to gate code
+ * that requires a specific ISA extension, e.g.:
+ *
+ *   #if QIHSE_HAS_AVX2
+ *   ... __m256 code ...
+ *   #endif
+ *
+ * The QIHSE_HAS_* forms normalise the Makefile flag with the compiler's own
+ * predefined macros, so the guard works even when the Makefile flag was not
+ * passed (e.g. direct compilation outside Make).
+ * ============================================================================ */
+
+#if defined(QIHSE_ENABLE_AVX2) && QIHSE_ENABLE_AVX2
+#  define QIHSE_HAS_AVX2      1
+#elif defined(__AVX2__)
+#  define QIHSE_HAS_AVX2      1
+#else
+#  define QIHSE_HAS_AVX2      0
+#endif
+
+#if defined(QIHSE_ENABLE_AVX512) && QIHSE_ENABLE_AVX512
+#  define QIHSE_HAS_AVX512    1
+#elif defined(__AVX512F__)
+#  define QIHSE_HAS_AVX512    1
+#else
+#  define QIHSE_HAS_AVX512    0
+#endif
+
+/* AVX-VNNI: VEX-encoded vpdpbusd/vpdpwssd (Alder Lake+, Zen4+).
+ * Distinct from AVX-512 VNNI — works in 256-bit mode without AVX-512. */
+#if defined(QIHSE_ENABLE_AVX_VNNI) && QIHSE_ENABLE_AVX_VNNI
+#  define QIHSE_HAS_AVX_VNNI  1
+#elif defined(__AVXVNNI__)
+#  define QIHSE_HAS_AVX_VNNI  1
+#else
+#  define QIHSE_HAS_AVX_VNNI  0
+#endif
+
+/* AMX: 2-D tile matrix multiply (Sapphire Rapids+).
+ * Requires arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILECFG) at runtime. */
+#if defined(QIHSE_ENABLE_AMX) && QIHSE_ENABLE_AMX
+#  define QIHSE_HAS_AMX       1
+#elif defined(__AMX_TILE__)
+#  define QIHSE_HAS_AMX       1
+#else
+#  define QIHSE_HAS_AMX       0
+#endif
 
 /* ============================================================================
  * CPU DETECTION RESULTS

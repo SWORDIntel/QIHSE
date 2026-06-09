@@ -33,6 +33,9 @@ int main() {
     qihse_user_t* user_b = qihse_auth_create_user(user_a, 2, QIHSE_ROLE_ANALYST, CLASSIF_SECRET, SCI_A, "default_password", true);
     qihse_user_t* user_c = qihse_auth_create_user(user_a, 1, QIHSE_ROLE_ANALYST, CLASSIF_UNCLASSIFIED, SCI_NONE, "default_password", true);
     assert(user_a && user_b && user_c);
+    user_a->hardware_token_present = true;
+    user_b->hardware_token_present = true;
+    user_c->hardware_token_present = true;
 
     // 2. KV Store + Clearance
     printf("[QIHSE Omni-Test] Testing KV Store with strict clearance masking...\n");

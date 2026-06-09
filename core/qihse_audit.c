@@ -4,6 +4,17 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#ifndef _WIN32
+#include <openssl/sha.h>
+#endif
+#ifndef _WIN32
+#include <openssl/evp.h>
+#endif
+#ifndef _WIN32
+#include <openssl/err.h>
+#endif
+
+static EVP_PKEY *audit_pkey = NULL;
 
 static pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char last_hash[129] = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"; // 96 chars for SHA-384
@@ -14,16 +25,14 @@ static char webhook_target[256] = ""; // Optional webhook
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
-// CNSA 2.0: SHA-384 simulated hash
-static void compute_sha384_sim(const char *input, char *output) {
-    unsigned long long hash = 5381;
-    int c;
-    while ((c = *input++)) {
-        hash = ((hash << 5) + hash) + c; 
+// CNSA 2.0: REAL SHA-384
+static void compute_sha384(const char *input, char *output) {
+    unsigned char hash[SHA384_DIGEST_LENGTH];
+    SHA384((const unsigned char*)input, strlen(input), hash);
+    for (int i = 0; i < SHA384_DIGEST_LENGTH; i++) {
+        sprintf(output + (i * 2), "%02x", hash[i]);
     }
-    // Expand to 96 chars to simulate SHA-384 structure
-    snprintf(output, 129, "%016llx%016llx%016llx%016llx%016llx%016llx", 
-             hash, hash ^ 0xDEADBEEF, hash ^ 0xCAFEBABE, hash, hash ^ 0x12345678, hash);
+    output[96] = '\0';
 }
 
 static void write_obfuscated(FILE *f, const char* buffer) {
@@ -101,6 +110,16 @@ void qihse_audit_set_webhook(const char* url) {
 
 void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
+    
+    // Generate ML-DSA-87 keys for signing the audit logs
+    if (!audit_pkey) {
+        audit_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-87");
+        if (!audit_pkey) {
+            fprintf(stderr, "[FATAL] Failed to initialize ML-DSA-87 PQC keys for audit log.\n");
+            abort();
+        }
+    }
+
     FILE *f = fopen(AUDIT_FILE, "ab");
     if (f) {
         write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
@@ -119,11 +138,22 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
              last_hash, (long)now, action, user_id, target_id, classif, sci);
              
     char new_hash[129];
-    compute_sha384_sim(buffer, new_hash);
+    compute_sha384(buffer, new_hash);
     
-    // Simulate ML-DSA-87 signature (4627 bytes) over the SHA-384 hash
-    char mldsa87_sig[MLDSA87_SIG_BYTES];
-    memset(mldsa87_sig, 0x42, sizeof(mldsa87_sig)); // Dummy signature bytes
+    // Real ML-DSA-87 signature over the SHA-384 hash
+    unsigned char mldsa87_sig[MLDSA87_SIG_BYTES];
+    size_t siglen = sizeof(mldsa87_sig);
+    memset(mldsa87_sig, 0, sizeof(mldsa87_sig));
+    
+    if (audit_pkey) {
+        EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+        if (mctx) {
+            if (EVP_DigestSignInit(mctx, NULL, NULL, NULL, audit_pkey) > 0) {
+                EVP_DigestSign(mctx, mldsa87_sig, &siglen, (const unsigned char*)new_hash, strlen(new_hash));
+            }
+            EVP_MD_CTX_free(mctx);
+        }
+    }
     
     FILE *f = fopen(AUDIT_FILE, "ab");
     if (f) {

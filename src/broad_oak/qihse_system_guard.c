@@ -12,15 +12,27 @@ static bool g_guard_initialized = false;
 void qihse_system_guard_profile(void) {
     if (g_guard_initialized) return;
 
+    #ifndef _WIN32
     long pages = sysconf(_SC_PHYS_PAGES);
+#else
+    long pages = 1024;
+#endif
+    #ifndef _WIN32
     long page_size = sysconf(_SC_PAGESIZE);
+#else
+    long page_size = 4096;
+#endif
     if (pages != -1 && page_size != -1) {
         g_system_ram_bytes = (size_t)pages * (size_t)page_size;
     } else {
         g_system_ram_bytes = 16ULL * 1024 * 1024 * 1024; // Fallback 16GB
     }
 
+    #ifndef _WIN32
     g_cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+    g_cpu_cores = 4;
+#endif
     if (g_cpu_cores <= 0) g_cpu_cores = 4;
 
     // Estimate memory bandwidth: ~15 GB/s baseline + 5 GB/s per core, cap at ~68 GB/s for DDR4

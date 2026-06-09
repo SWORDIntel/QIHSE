@@ -35,7 +35,9 @@
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
+#ifndef _WIN32
 #include <sys/mman.h>  /* For madvise (huge pages support) */
+#endif
 #include <stdio.h>     /* For CPU detection parsing */
 
 #if defined(__aarch64__)
@@ -1532,7 +1534,9 @@ size_t not_stisla_search_batch_c_optimized(const int64_t* arr,
 
     /* Apply Huge Page hint to current batch if large enough */
     if (num_items * sizeof(not_stisla_batch_item_t) > 1024 * 1024) {
+#ifndef _WIN32
         madvise(items, num_items * sizeof(not_stisla_batch_item_t), MADV_HUGEPAGE);
+#endif
     }
 
     /* Detect if queries are sorted */
@@ -1686,12 +1690,14 @@ int not_stisla_optimize_array_memory(const int64_t* arr, size_t n) {
      * This is critical for Meteor Lake-P fabric throughput.
      */
     if (array_size >= 1024 * 1024) {
+#ifndef _WIN32
         /* Force huge pages if possible */
         madvise((void*)arr, array_size, MADV_HUGEPAGE);
         /* Tell kernel we will scan this linearly (optimized read-ahead) */
         madvise((void*)arr, array_size, MADV_SEQUENTIAL);
         /* Lock pages in RAM to prevent swapping during tight search loops */
-        mlock((void*)arr, array_size); 
+        mlock((void*)arr, array_size);
+#endif
     }
 
     return 0;

@@ -74,7 +74,11 @@ static bool qihse_detect_avx2(void) {
 }
 
 static int qihse_get_cpu_cores(void) {
+    #ifndef _WIN32
     return sysconf(_SC_NPROCESSORS_ONLN);
+#else
+    return 4;
+#endif
 }
 
 /* ============================================================================

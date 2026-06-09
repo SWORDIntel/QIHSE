@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+
 /**
  * @brief The callback hook that LuaJIT triggers every N instructions.
  * If this fires, we kill the script to prevent an infinite loop.
@@ -79,3 +81,20 @@ int qihse_lua_sandbox_filter_vector(qihse_lua_sandbox_t* sandbox, const char* sc
     
     return result;
 }
+
+#else
+
+bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructions) {
+    if (sandbox) sandbox->active = false;
+    return false;
+}
+
+void qihse_lua_sandbox_destroy(qihse_lua_sandbox_t* sandbox) {
+    if (sandbox) sandbox->active = false;
+}
+
+int qihse_lua_sandbox_filter_vector(qihse_lua_sandbox_t* sandbox, const char* script, const float* vec_ptr, size_t dims) {
+    return 1; // dummy pass
+}
+
+#endif

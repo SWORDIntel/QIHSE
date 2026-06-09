@@ -1,7 +1,11 @@
 #include "qihse_cuda_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#else
+#include <windows.h>
+#endif
 #include <math.h>
 
 /* Function pointers for dynamic loading */
@@ -19,6 +23,15 @@ static cuda_compute_amplitudes_fn g_cuda_compute_amplitudes = NULL;
 int qihse_cuda_backend_available(void) {
     if (g_cuda_lib_handle) return 1;
     
+#ifdef _WIN32
+    g_cuda_lib_handle = LoadLibraryA("qihse_cuda.dll");
+    if (!g_cuda_lib_handle) return 0;
+    
+    g_cuda_init = (cuda_init_fn)GetProcAddress((HMODULE)g_cuda_lib_handle, "qihse_cuda_init");
+    g_cuda_cleanup = (cuda_cleanup_fn)GetProcAddress((HMODULE)g_cuda_lib_handle, "qihse_cuda_cleanup");
+    g_cuda_search = (cuda_search_fn)GetProcAddress((HMODULE)g_cuda_lib_handle, "qihse_cuda_search");
+    g_cuda_compute_amplitudes = (cuda_compute_amplitudes_fn)GetProcAddress((HMODULE)g_cuda_lib_handle, "qihse_cuda_compute_amplitudes");
+#else
     g_cuda_lib_handle = dlopen("libqihse_cuda.so", RTLD_LAZY);
     if (!g_cuda_lib_handle) return 0;
     
@@ -26,9 +39,14 @@ int qihse_cuda_backend_available(void) {
     g_cuda_cleanup = (cuda_cleanup_fn)dlsym(g_cuda_lib_handle, "qihse_cuda_cleanup");
     g_cuda_search = (cuda_search_fn)dlsym(g_cuda_lib_handle, "qihse_cuda_search");
     g_cuda_compute_amplitudes = (cuda_compute_amplitudes_fn)dlsym(g_cuda_lib_handle, "qihse_cuda_compute_amplitudes");
+#endif
     
     if (!g_cuda_init || !g_cuda_cleanup || !g_cuda_search) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)g_cuda_lib_handle);
+#else
         dlclose(g_cuda_lib_handle);
+#endif
         g_cuda_lib_handle = NULL;
         return 0;
     }

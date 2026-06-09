@@ -2,4 +2,5 @@
 #include "qihse_kv_store.h"
 #include "qihse_timeseries.h"
 #include "qihse_document.h"
+#include "qihse_trinary_trie.h"
 #include "qihse_uwp.h"

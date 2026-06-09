@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define QIHSE_PROBE_KIB 1024ull
 #define QIHSE_PROBE_MIB (1024ull * 1024ull)
@@ -139,7 +142,13 @@ static bool qihse_probe_sysconf_memory(uint64_t* total_bytes,
     long avail_pages;
     bool found = false;
 
+#ifdef _WIN32
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    page_size_long = sys_info.dwPageSize;
+#else
     page_size_long = sysconf(_SC_PAGESIZE);
+#endif
     if (page_size_long <= 0) {
         page_size_long = 4096;
     }
@@ -180,10 +189,16 @@ static bool qihse_probe_sysconf_memory(uint64_t* total_bytes,
 static size_t qihse_probe_online_cpus(void) {
     long cpus;
 
+#ifdef _WIN32
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    cpus = sys_info.dwNumberOfProcessors;
+#else
 #ifdef _SC_NPROCESSORS_ONLN
     cpus = sysconf(_SC_NPROCESSORS_ONLN);
 #else
     cpus = -1;
+#endif
 #endif
     return cpus > 0 ? (size_t)cpus : 1u;
 }

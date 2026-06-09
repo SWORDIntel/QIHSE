@@ -11,6 +11,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#ifndef _WIN32
+#include <openssl/evp.h>
+#include <openssl/err.h>
+#endif
 
 /* Helper functions */
 static char *strdup_safe(const char *str) {
@@ -187,44 +191,116 @@ int qihse_sync_manager_init(
     (*manager)->fan_out = fan_out > 0 ? fan_out : 3;
     (*manager)->gossip_interval_ms = gossip_interval_ms > 0 ? gossip_interval_ms : 1000;
     (*manager)->last_gossip_time = 0;
-    (*manager)->random_seed = (uint32_t)time(NULL);
+        (*manager)->random_seed = (uint32_t)time(NULL);
+        (*manager)->mldsa87_pkey = NULL;
 
-    if (!(*manager)->peers || !(*manager)->seen_messages || !(*manager)->seen_timestamps ||
-        !(*manager)->outgoing_queue) {
-        qihse_sync_manager_cleanup(*manager);
-        return -1;
-    }
-
-    return 0;
-}
-
-void qihse_sync_manager_cleanup(qihse_sync_manager_t *manager) {
-    if (manager) {
-        free(manager->node_id);
-
-        if (manager->peers) {
-            for (size_t i = 0; i < manager->peer_count; i++) {
-                qihse_sync_peer_cleanup(&manager->peers[i]);
-            }
-            free(manager->peers);
+        if (!(*manager)->peers || !(*manager)->seen_messages || !(*manager)->seen_timestamps ||
+            !(*manager)->outgoing_queue) {
+            qihse_sync_manager_cleanup(*manager);
+            return -1;
         }
 
-        free(manager->seen_messages);
-        free(manager->seen_timestamps);
-
-        if (manager->outgoing_queue) {
-            for (size_t i = 0; i < manager->outgoing_count; i++) {
-                qihse_sync_message_cleanup(&manager->outgoing_queue[i]);
-            }
-            free(manager->outgoing_queue);
-        }
-
-        memset(manager, 0, sizeof(qihse_sync_manager_t));
-        free(manager);
+        return 0;
     }
-}
 
-int qihse_sync_manager_add_peer(
+    void qihse_sync_manager_cleanup(qihse_sync_manager_t *manager) {
+        if (manager) {
+            free(manager->node_id);
+
+            if (manager->peers) {
+                for (size_t i = 0; i < manager->peer_count; i++) {
+                    qihse_sync_peer_cleanup(&manager->peers[i]);
+                }
+                free(manager->peers);
+            }
+
+            free(manager->seen_messages);
+            free(manager->seen_timestamps);
+
+            if (manager->outgoing_queue) {
+                for (size_t i = 0; i < manager->outgoing_count; i++) {
+                    qihse_sync_message_cleanup(&manager->outgoing_queue[i]);
+                }
+                free(manager->outgoing_queue);
+            }
+
+#ifndef _WIN32
+            if (manager->mldsa87_pkey) {
+                EVP_PKEY_free((EVP_PKEY*)manager->mldsa87_pkey);
+            }
+#endif
+
+            memset(manager, 0, sizeof(qihse_sync_manager_t));
+            free(manager);
+        }
+    }
+
+    static void sign_gossip_message(qihse_sync_manager_t *manager, qihse_sync_message_t *msg) {
+#ifndef _WIN32
+        if (!manager->mldsa87_pkey) {
+            msg->has_signature = false;
+            return;
+        }
+        
+        EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+        if (!mctx) return;
+        
+        if (EVP_DigestSignInit(mctx, NULL, NULL, NULL, (EVP_PKEY*)manager->mldsa87_pkey) > 0) {
+            EVP_DigestSignUpdate(mctx, msg->id, 16);
+            EVP_DigestSignUpdate(mctx, &msg->command_type, sizeof(msg->command_type));
+            if (msg->sender_id) {
+                EVP_DigestSignUpdate(mctx, msg->sender_id, strlen(msg->sender_id));
+            }
+            if (msg->payload && msg->payload_size > 0) {
+                EVP_DigestSignUpdate(mctx, msg->payload, msg->payload_size);
+            }
+            
+            size_t siglen = 4627;
+            if (EVP_DigestSignFinal(mctx, msg->mldsa87_signature, &siglen) > 0) {
+                msg->has_signature = true;
+            }
+        }
+        EVP_MD_CTX_free(mctx);
+#else
+        msg->has_signature = false;
+#endif
+    }
+
+    static bool verify_gossip_message(qihse_sync_manager_t *manager, const qihse_sync_message_t *msg) {
+#ifndef _WIN32
+        if (!manager->mldsa87_pkey) return true;
+        if (!msg->has_signature) return false;
+        
+        EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+        if (!mctx) return false;
+        
+        bool valid = false;
+        if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, (EVP_PKEY*)manager->mldsa87_pkey) > 0) {
+            EVP_DigestVerifyUpdate(mctx, msg->id, 16);
+            EVP_DigestVerifyUpdate(mctx, &msg->command_type, sizeof(msg->command_type));
+            if (msg->sender_id) {
+                EVP_DigestVerifyUpdate(mctx, msg->sender_id, strlen(msg->sender_id));
+            }
+            if (msg->payload && msg->payload_size > 0) {
+                EVP_DigestVerifyUpdate(mctx, msg->payload, msg->payload_size);
+            }
+            
+            if (EVP_DigestVerifyFinal(mctx, msg->mldsa87_signature, 4627) == 1) {
+                valid = true;
+            }
+        }
+        EVP_MD_CTX_free(mctx);
+        
+        if (!valid) {
+            printf("[SECURITY] Dropping forged/corrupted Gossip message. ML-DSA-87 Verification Failed!\n");
+        }
+        return valid;
+#else
+        return true;
+#endif
+    }
+
+    int qihse_sync_manager_add_peer(
     qihse_sync_manager_t *manager,
     qihse_sync_peer_t peer
 ) {
@@ -293,6 +369,13 @@ int qihse_sync_manager_broadcast_message(
 ) {
     if (!manager) return -1;
 
+    // TLS 1.3 maximum record size is 16384 bytes.
+    // ML-DSA-87 signature is 4627 bytes.
+    // Ensure total message size respects TLS bounds.
+    if (payload_size + 4627 + 256 > 16384) {
+        return -1; // Payload too large for single TLS record with PQC signature
+    }
+
     // Check if we have space in outgoing queue
     if (manager->outgoing_count >= manager->outgoing_capacity) {
         return -1; // Queue full
@@ -304,6 +387,9 @@ int qihse_sync_manager_broadcast_message(
         payload, payload_size, ttl) != 0) {
         return -1;
     }
+
+    // Sign the message using PQC if key is available
+    sign_gossip_message(manager, &message);
 
     // Mark as seen by us
     if (manager->seen_count < manager->seen_capacity) {
@@ -334,6 +420,12 @@ int qihse_sync_manager_receive_message(
             qihse_sync_message_cleanup(&message);
             return 0; // Duplicate, ignore
         }
+    }
+
+    // PQC Validation
+    if (!verify_gossip_message(manager, &message)) {
+        qihse_sync_message_cleanup(&message);
+        return -1; // Drop invalid signature
     }
 
     // Check if message is expired
@@ -615,20 +707,67 @@ void qihse_sync_manager_cleanup_old_messages(
 
 int qihse_sync_manager_perform_anti_entropy(
     qihse_sync_manager_t *manager,
-    const uint8_t (*remote_message_ids)[16],
-    size_t remote_count,
+    const uint8_t *remote_bloom_filter,
+    size_t filter_size,
     qihse_sync_message_t **missing_messages,
     size_t *missing_count
 ) {
     if (!manager || !missing_messages || !missing_count) return -1;
 
-    // For simplicity, this is a placeholder implementation
-    // In a real implementation, this would compare message sets and return missing messages
-    (void)remote_message_ids;
-    (void)remote_count;
-
     *missing_messages = NULL;
     *missing_count = 0;
+
+    if (!remote_bloom_filter || filter_size == 0 || manager->outgoing_count == 0) {
+        return 0;
+    }
+
+    qihse_sync_message_t *temp = calloc(manager->outgoing_count, sizeof(qihse_sync_message_t));
+    if (!temp) return -1;
+
+    size_t count = 0;
+    for (size_t i = 0; i < manager->outgoing_count; i++) {
+        const uint8_t *id = manager->outgoing_queue[i].id;
+        
+        uint32_t h1 = ((uint32_t)id[0] << 24) | ((uint32_t)id[1] << 16) | ((uint32_t)id[2] << 8) | id[3];
+        uint32_t h2 = ((uint32_t)id[4] << 24) | ((uint32_t)id[5] << 16) | ((uint32_t)id[6] << 8) | id[7];
+        uint32_t h3 = ((uint32_t)id[8] << 24) | ((uint32_t)id[9] << 16) | ((uint32_t)id[10] << 8) | id[11];
+        
+        size_t bits = filter_size * 8;
+        uint32_t bit1 = h1 % bits;
+        uint32_t bit2 = h2 % bits;
+        uint32_t bit3 = h3 % bits;
+        
+        bool present = (remote_bloom_filter[bit1 / 8] & (1 << (bit1 % 8))) &&
+                       (remote_bloom_filter[bit2 / 8] & (1 << (bit2 % 8))) &&
+                       (remote_bloom_filter[bit3 / 8] & (1 << (bit3 % 8)));
+                       
+        if (!present) {
+            qihse_sync_message_t *src = &manager->outgoing_queue[i];
+            qihse_sync_message_t *dst = &temp[count];
+            
+            memcpy(dst->id, src->id, 16);
+            dst->command_type = src->command_type;
+            dst->sender_id = src->sender_id ? strdup_safe(src->sender_id) : NULL;
+            dst->payload = src->payload_size > 0 ? memdup(src->payload, src->payload_size) : NULL;
+            dst->payload_size = src->payload_size;
+            dst->timestamp = src->timestamp;
+            dst->ttl = src->ttl;
+            dst->hop_count = src->hop_count;
+            dst->has_signature = src->has_signature;
+            if (dst->has_signature) {
+                memcpy(dst->mldsa87_signature, src->mldsa87_signature, 4627);
+            }
+            
+            count++;
+        }
+    }
+
+    if (count > 0) {
+        *missing_messages = temp;
+        *missing_count = count;
+    } else {
+        free(temp);
+    }
 
     return 0;
 }

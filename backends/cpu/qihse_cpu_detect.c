@@ -9,8 +9,12 @@
  */
 
 #include "qihse_cpu_detect.h"
+#ifdef _WIN32
+#include <intrin.h>
+#else
 #include <signal.h>
 #include <setjmp.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -24,12 +28,14 @@
  * RUNTIME CPU FEATURE TESTING
  * ============================================================================ */
 
+#ifndef _WIN32
 static sigjmp_buf cpu_test_jmp_buf;
 
 static void cpu_feature_signal_handler(int signo) {
     (void)signo;
     siglongjmp(cpu_test_jmp_buf, 1);
 }
+#endif
 
 static bool qihse_force_full_features(void) {
 #ifdef QIHSE_FORCE_FULL_FEATURES
@@ -44,6 +50,10 @@ static bool qihse_force_full_features(void) {
  * Execute the test function while trapping illegal/segfault signals.
  */
 static bool safe_execute_test(bool (*test_func)(void)) {
+#ifdef _WIN32
+    (void)test_func;
+    return false;
+#else
     struct sigaction sa, old_ill, old_segv;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = cpu_feature_signal_handler;
@@ -67,6 +77,7 @@ static bool safe_execute_test(bool (*test_func)(void)) {
     sigaction(SIGILL, &old_ill, NULL);
     sigaction(SIGSEGV, &old_segv, NULL);
     return false;
+#endif
 }
 
 /* ============================================================================
@@ -373,6 +384,51 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         return info;
     }
 
+#ifdef _WIN32
+    uint64_t features = QIHSE_CPU_FEATURE_NONE;
+    int cpuInfo[4];
+
+    __cpuid(cpuInfo, 1);
+    if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_SSE;
+    if (cpuInfo[3] & (1 << 26)) features |= QIHSE_CPU_FEATURE_SSE2;
+
+    bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
+    info.has_osxsave = osxsave;
+    info.has_avx_support = (cpuInfo[2] & (1 << 28)) != 0;
+
+    if (info.has_avx_support && osxsave) {
+        features |= QIHSE_CPU_FEATURE_AVX;
+        
+        __cpuidex(cpuInfo, 7, 0);
+        if (cpuInfo[1] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX2;
+        
+        info.has_avx512_support = (cpuInfo[1] & (1 << 16)) != 0;
+        if (info.has_avx512_support) {
+            features |= QIHSE_CPU_FEATURE_AVX512F;
+            if (cpuInfo[1] & (1 << 30)) features |= QIHSE_CPU_FEATURE_AVX512BW;
+            if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
+            if (cpuInfo[1] & (1 << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
+            if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+        }
+
+        if (cpuInfo[3] & (1 << 22)) {
+            features |= QIHSE_CPU_FEATURE_AMX;
+            features |= QIHSE_CPU_FEATURE_AMX_TILE;
+        }
+        if (cpuInfo[3] & (1 << 23)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
+        if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
+
+        if (cpuInfo[2] & (1 << 11)) {
+            features |= QIHSE_CPU_FEATURE_VNNI;
+        }
+
+        /* AVX-VNNI (leaf 7, sub-leaf 1, EAX bit 4) */
+        __cpuidex(cpuInfo, 7, 1);
+        if (cpuInfo[0] & (1 << 4)) features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+    }
+
+    info.features = features;
+#else
     /* Test each feature through actual execution */
     uint64_t features = QIHSE_CPU_FEATURE_NONE;
 
@@ -416,12 +472,27 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
     /* Test specialized features */
     if (safe_execute_test(qihse_cpu_test_amx)) {
         features |= QIHSE_CPU_FEATURE_AMX;
+        features |= QIHSE_CPU_FEATURE_AMX_TILE;
     }
     if (safe_execute_test(qihse_cpu_test_vnni)) {
         features |= QIHSE_CPU_FEATURE_VNNI;
     }
+    /* AVX-VNNI runtime test: attempt vpdpbusd ymm0,ymm0,ymm0 */
+    {
+        bool avx_vnni_ok = false;
+#if defined(__AVXVNNI__) || (defined(QIHSE_ENABLE_AVX_VNNI) && QIHSE_ENABLE_AVX_VNNI)
+        __asm__ volatile (
+            "vpdpbusd %%ymm1, %%ymm0, %%ymm0\n"
+            : : : "ymm0", "ymm1"
+        );
+        avx_vnni_ok = true;
+#endif
+        (void)avx_vnni_ok;
+        if (avx_vnni_ok) features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+    }
 
     info.features = features;
+#endif
     return info;
 }
 
@@ -444,8 +515,12 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_AVX512DQ: return "AVX-512DQ";
         case QIHSE_CPU_FEATURE_AVX512VL: return "AVX-512VL";
         case QIHSE_CPU_FEATURE_AMX: return "AMX";
-        case QIHSE_CPU_FEATURE_VNNI: return "VNNI";
+        case QIHSE_CPU_FEATURE_AMX_TILE: return "AMX-Tile";
+        case QIHSE_CPU_FEATURE_AMX_INT8: return "AMX-Int8";
+        case QIHSE_CPU_FEATURE_AMX_BF16: return "AMX-BF16";
+        case QIHSE_CPU_FEATURE_VNNI: return "AVX512-VNNI";
         case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512VNNI";
+        case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI";
         default: return "UNKNOWN";
     }
 }
@@ -460,9 +535,13 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_AVX512BW: return "AVX-512 Byte and Word Instructions";
         case QIHSE_CPU_FEATURE_AVX512DQ: return "AVX-512 Doubleword and Quadword Instructions";
         case QIHSE_CPU_FEATURE_AVX512VL: return "AVX-512 Vector Length Extensions";
-        case QIHSE_CPU_FEATURE_AMX: return "Advanced Matrix Extensions";
-        case QIHSE_CPU_FEATURE_VNNI: return "Vector Neural Network Instructions";
-        case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512 Vector Neural Network Instructions";
+        case QIHSE_CPU_FEATURE_AMX: return "Advanced Matrix Extensions (base)";
+        case QIHSE_CPU_FEATURE_AMX_TILE: return "AMX Tile memory operations";
+        case QIHSE_CPU_FEATURE_AMX_INT8: return "AMX INT8 tile multiply";
+        case QIHSE_CPU_FEATURE_AMX_BF16: return "AMX BFloat16 tile multiply";
+        case QIHSE_CPU_FEATURE_VNNI: return "AVX-512 Vector Neural Network Instructions";
+        case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512 VNNI (alias)";
+        case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI: VEX vpdpbusd/vpdpwssd (256-bit, no AVX-512)";
         default: return "Unknown CPU feature";
     }
 }

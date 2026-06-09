@@ -10,6 +10,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#endif
+
 static const char* qihse_memory_access_name(qihse_memory_access_t access_pattern)
 {
     switch (access_pattern) {

@@ -2,7 +2,14 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let qihse_path = "/home/john/Documents/QIHSE";
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let qihse_path = PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=native={}", qihse_path);
@@ -18,6 +25,10 @@ fn main() {
         .header("wrapper.h")
         // Add include path
         .clang_arg(format!("-I{}/include", qihse_path))
+        .clang_arg(format!("-I{}/algorithms", qihse_path))
+        .clang_arg(format!("-I{}/memory/include", qihse_path))
+        .clang_arg(format!("-I{}/core", qihse_path))
+        .clang_arg("-D_GNU_SOURCE")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

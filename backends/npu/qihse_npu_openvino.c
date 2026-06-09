@@ -16,12 +16,18 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <spawn.h>
+#endif
 #include <errno.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#else
+#include <windows.h>
+#endif
 #include <stdint.h>
 
 static uint64_t qihse_monotonic_ns(void) {
@@ -142,6 +148,7 @@ typedef struct npu_infer_request_s {
  */
 static void* npu_load_openvino_core(void) {
     /* Attempt to load OpenVINO through dynamic loading */
+#ifndef _WIN32
     void* handle = dlopen("libopenvino.so", RTLD_LAZY);
     if (!handle) {
         /* Try alternative library names */
@@ -151,21 +158,39 @@ static void* npu_load_openvino_core(void) {
         /* Try versioned libraries */
         handle = dlopen("libopenvino.so.2400", RTLD_LAZY);
     }
+#else
+    void* handle = LoadLibraryA("openvino.dll");
+    if (!handle) {
+        handle = LoadLibraryA("openvino_c.dll");
+    }
+#endif
     if (!handle) {
         return NULL; /* OpenVINO not available */
     }
 
     /* Try to get core creation function */
+#ifndef _WIN32
     void* (*create_core)(void) = dlsym(handle, "ov_core_create");
+#else
+    void* (*create_core)(void) = (void* (*)(void))GetProcAddress((HMODULE)handle, "ov_core_create");
+#endif
     if (!create_core) {
+#ifndef _WIN32
         dlclose(handle);
+#else
+        FreeLibrary((HMODULE)handle);
+#endif
         return NULL;
     }
 
     /* Create OpenVINO core */
     void* core = create_core();
     if (!core) {
+#ifndef _WIN32
         dlclose(handle);
+#else
+        FreeLibrary((HMODULE)handle);
+#endif
         return NULL;
     }
 
@@ -466,6 +491,7 @@ static bool npu_execute_inference(void* infer_request,
     argv[11] = NULL;
 
     /* Execute OpenVINO inference via userspace helper */
+#ifndef _WIN32
     pid_t pid = 0;
     int status = 0;
     ret = posix_spawn(&pid, argv[0], NULL, NULL, argv, envp);
@@ -478,6 +504,9 @@ static bool npu_execute_inference(void* infer_request,
             ret = EIO;
         }
     }
+#else
+    ret = ENOSYS;
+#endif
     if (ret != 0) {
         fprintf(stderr, "qihse: OpenVINO helper failed: %d\n", ret);
         goto cleanup;
@@ -1297,6 +1326,7 @@ bool qihse_npu_infer_batch(
         NULL
     };
 
+#ifndef _WIN32
     pid_t pid = 0;
     int status = 0;
     int ret = posix_spawn(&pid, argv[0], NULL, NULL, argv, envp);
@@ -1309,6 +1339,9 @@ bool qihse_npu_infer_batch(
             ret = EIO;
         }
     }
+#else
+    int ret = ENOSYS;
+#endif
 
     if (ret != 0) {
         fprintf(stderr, "qihse: Batch inference failed: %d\n", ret);
@@ -1495,6 +1528,7 @@ bool qihse_npu_finetune_gna(
     }
     fclose(helper_fp);
 
+#ifndef _WIN32
     pid_t pid = 0;
     int status = 0;
     int ret = posix_spawn(&pid, argv[0], NULL, NULL, argv, envp);
@@ -1507,6 +1541,9 @@ bool qihse_npu_finetune_gna(
             ret = EIO;
         }
     }
+#else
+    int ret = ENOSYS;
+#endif
 
     if (ret != 0) {
         fprintf(stderr, "qihse: GNA fine-tuning helper failed: %d\n", ret);

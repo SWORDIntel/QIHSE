@@ -1,3 +1,20 @@
+
+#ifdef _WIN32
+#include <malloc.h>
+#include <stdlib.h>
+#include <stdio.h>
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s=%s", name, value);
+    return _putenv(buf);
+}
+static inline int posix_memalign(void **memptr, size_t alignment, size_t size) {
+    *memptr = _aligned_malloc(size, alignment);
+    return (*memptr != NULL) ? 0 : 12; // ENOMEM
+}
+#endif
+
 /* #define _GNU_SOURCE */
 #include "qihse_math.h"
 #include "qihse_instr.h"

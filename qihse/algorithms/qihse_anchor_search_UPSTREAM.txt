@@ -1,4 +1,0 @@
-Native QIHSE anchor-search module derived from upstream NOT_STISLA.
-Upstream: https://github.com/SWORDIntel/NOT_STISLA.git
-Commit: cff7b206e79c623e493102465cd2487f3b99320b
-Integrated directly into qihse/algorithms; no independent NOT_STISLA subsystem remains.

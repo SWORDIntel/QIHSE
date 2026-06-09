@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/sendfile.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -99,7 +101,29 @@ bool qihse_event_stream_consume_zero_copy(qihse_event_stream_t* stream, const ch
     
     off_t offset_copy = (off_t)offset;
     
+#ifdef _WIN32
+    lseek(fd, offset_copy, SEEK_SET);
+    char buf[8192];
+    size_t remaining = count;
+    ssize_t sent = 0;
+    while (remaining > 0) {
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        ssize_t n = read(fd, buf, to_read);
+        if (n <= 0) {
+            if (sent == 0 && n < 0) sent = -1;
+            break;
+        }
+        ssize_t w = write(network_socket_fd, buf, n);
+        if (w <= 0) {
+            if (sent == 0) sent = -1;
+            break;
+        }
+        sent += w;
+        remaining -= w;
+    }
+#else
     ssize_t sent = sendfile(network_socket_fd, fd, &offset_copy, count);
+#endif
     
     close(fd);
     

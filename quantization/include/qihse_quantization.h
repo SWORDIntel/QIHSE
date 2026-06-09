@@ -9,6 +9,6 @@
 #ifndef QIHSE_INTERNAL_QUANTIZATION_H
 #define QIHSE_INTERNAL_QUANTIZATION_H
 
-#include "../../qihse/qihse_quantization.h"
+#include <qihse_quantization.h>
 
 #endif /* QIHSE_INTERNAL_QUANTIZATION_H */

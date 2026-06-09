@@ -1,3 +1,5 @@
+#include "qihse_platform.h"
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -17,7 +19,26 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#include <io.h>
+#include <windows.h>
+
+static HANDLE io_mutex = NULL;
+static void lock_io(void) {
+    if (!io_mutex) {
+        HANDLE m = CreateMutexA(NULL, FALSE, NULL);
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&io_mutex, (PVOID)m, NULL) != NULL) {
+            CloseHandle(m);
+        }
+    }
+    WaitForSingleObject(io_mutex, INFINITE);
+}
+static void unlock_io(void) {
+    ReleaseMutex(io_mutex);
+}
+#endif
 
 static bool qihse_file_offset_ok(uint64_t offset, off_t* out) {
     uint64_t max_off = (((uint64_t)1u) << ((sizeof(off_t) * CHAR_BIT) - 1u)) - 1u;
@@ -81,7 +102,11 @@ bool qihse_mkdir_p(const char* path, mode_t mode) {
     for (i = 1u; i < len; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
+            #ifndef _WIN32
             if (tmp[0] != '\0' && mkdir(tmp, mode) != 0 && errno != EEXIST) {
+#else
+            if (tmp[0] != '\0' && mkdir(tmp) != 0 && errno != EEXIST) {
+#endif
                 free(tmp);
                 return false;
             }
@@ -89,7 +114,11 @@ bool qihse_mkdir_p(const char* path, mode_t mode) {
         }
     }
 
+    #ifndef _WIN32
     if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+#else
+    if (mkdir(tmp) != 0 && errno != EEXIST) {
+#endif
         free(tmp);
         return false;
     }
@@ -150,7 +179,14 @@ bool qihse_file_pread_exact(qihse_file_t* file, void* buf, size_t size, uint64_t
         if (!qihse_file_offset_ok(offset + (uint64_t)done, &off)) {
             return false;
         }
+#ifdef _WIN32
+        lock_io();
+        lseek(file->fd, off, SEEK_SET);
+        n = read(file->fd, p + done, (unsigned int)(size - done));
+        unlock_io();
+#else
         n = pread(file->fd, p + done, size - done, off);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -186,7 +222,14 @@ bool qihse_file_pwrite_exact(qihse_file_t* file, const void* buf, size_t size, u
         if (!qihse_file_offset_ok(offset + (uint64_t)done, &off)) {
             return false;
         }
+#ifdef _WIN32
+        lock_io();
+        lseek(file->fd, off, SEEK_SET);
+        n = write(file->fd, p + done, (unsigned int)(size - done));
+        unlock_io();
+#else
         n = pwrite(file->fd, p + done, size - done, off);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -212,7 +255,11 @@ bool qihse_file_fsync(qihse_file_t* file) {
     }
 
     do {
+#ifdef _WIN32
+        rc = _commit(file->fd);
+#else
         rc = fsync(file->fd);
+#endif
     } while (rc != 0 && errno == EINTR);
 
     return rc == 0;
@@ -249,7 +296,11 @@ bool qihse_file_truncate(qihse_file_t* file, uint64_t size) {
         return false;
     }
 
+#ifdef _WIN32
+    return _chsize(file->fd, off) == 0;
+#else
     return ftruncate(file->fd, off) == 0;
+#endif
 }
 
 bool qihse_rename_file(const char* old_path, const char* new_path) {
@@ -261,6 +312,10 @@ bool qihse_rename_file(const char* old_path, const char* new_path) {
 }
 
 bool qihse_fsync_dir(const char* path) {
+#ifdef _WIN32
+    (void)path;
+    return true;
+#else
     int fd;
     int rc;
 
@@ -285,10 +340,13 @@ bool qihse_fsync_dir(const char* path) {
     }
 
     return rc == 0;
+#endif
 }
 
 bool qihse_lock_acquire(qihse_lock_t* lock, const char* path) {
+#ifndef _WIN32
     struct flock fl;
+#endif
 
     if (!lock || !path) {
         errno = EINVAL;
@@ -301,6 +359,7 @@ bool qihse_lock_acquire(qihse_lock_t* lock, const char* path) {
         return false;
     }
 
+#ifndef _WIN32
     memset(&fl, 0, sizeof(fl));
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
@@ -311,13 +370,16 @@ bool qihse_lock_acquire(qihse_lock_t* lock, const char* path) {
         qihse_file_close(&lock->file);
         return false;
     }
+#endif
 
     lock->held = true;
     return true;
 }
 
 bool qihse_lock_release(qihse_lock_t* lock) {
+#ifndef _WIN32
     struct flock fl;
+#endif
     bool ok = true;
 
     if (!lock) {
@@ -326,6 +388,7 @@ bool qihse_lock_release(qihse_lock_t* lock) {
     }
 
     if (lock->held && lock->file.fd != QIHSE_FILE_INVALID_FD) {
+#ifndef _WIN32
         memset(&fl, 0, sizeof(fl));
         fl.l_type = F_UNLCK;
         fl.l_whence = SEEK_SET;
@@ -334,6 +397,7 @@ bool qihse_lock_release(qihse_lock_t* lock) {
         if (fcntl(lock->file.fd, F_SETLK, &fl) != 0) {
             ok = false;
         }
+#endif
     }
 
     lock->held = false;

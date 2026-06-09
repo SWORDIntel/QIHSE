@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include "../broad_oak/qihse_quantum_defense.h"
 
 #define LSM_MEMTABLE_MAX (8 * 1024 * 1024) // 8MB
 
@@ -26,6 +27,7 @@ struct qihse_kv_store {
     FILE* wal_fd;
     size_t mem_usage;
     int sstable_counter;
+    qihse_quantum_defense_ctx_t* qdd_ctx;
 };
 
 static uint64_t current_time_ms() {
@@ -75,6 +77,18 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     fclose(f);
 }
 
+static void qihse_kv_seed_honeypot_bait(qihse_kv_store_t* store) {
+    if (!store) return;
+    
+    for (int i = 0; i < 256; i++) {
+        char bait_key[64];
+        char bait_val[128];
+        snprintf(bait_key, sizeof(bait_key), "_qdd_bait_%04d", i);
+        snprintf(bait_val, sizeof(bait_val), "CLASSIFIED_DECOY_DATA_%d", i);
+        qihse_kv_set(store, bait_key, bait_val, 3, 0xFF);
+    }
+}
+
 qihse_kv_store_t* qihse_kv_store_create() {
     qihse_kv_store_t* store = (qihse_kv_store_t*)malloc(sizeof(qihse_kv_store_t));
     if (!store) return NULL;
@@ -84,9 +98,10 @@ qihse_kv_store_t* qihse_kv_store_create() {
     store->num_keys = 0;
     store->capacity = 0;
     
-    store->wal_fd = fopen("wal.log", "a");
+    store->wal_fd = NULL;
     store->mem_usage = 0;
     store->sstable_counter = 0;
+    store->qdd_ctx = qihse_qdd_init();
     
     // Discover highest sstable counter
     DIR *d;
@@ -105,11 +120,17 @@ qihse_kv_store_t* qihse_kv_store_create() {
     // Recover WAL
     recover_from_wal(store);
     
+    // Seed honeypot bait keys for quantum defense
+    qihse_kv_seed_honeypot_bait(store);
+    
+    store->wal_fd = fopen("wal.log", "a");
+    
     return store;
 }
 
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (store) {
+        if (store->qdd_ctx) qihse_qdd_free(store->qdd_ctx);
         if (store->wal_fd) fclose(store->wal_fd);
         if (store->trie) qihse_trinary_trie_destroy(store->trie);
         for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
@@ -167,21 +188,41 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, u
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return NULL;
     
+    qihse_qdd_report_access(store->qdd_ctx, (uint64_t)(uintptr_t)key, "0.0.0.0");
+    
     qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
+    bool user_authorized = true;
+    
     if (val) {
         // Find auth info in memory
         for (size_t i = 0; i < store->num_keys; i++) {
             if (strcmp(store->keys[i].key, key) == 0) {
                 if (user && !qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                    user_authorized = false;
                     val = NULL; // Masked: pretend it doesn't exist in MemTable
                 }
                 break;
             }
         }
-        if (val) return strdup((char*)val);
     }
+    
+    if (user_authorized) {
+        qihse_qdd_response_tier_t tier = qihse_qdd_get_response_tier(store->qdd_ctx);
+        
+        if (tier == QIHSE_QDD_RESPONSE_THROTTLE) {
+            usleep(100000);
+        } else if (tier == QIHSE_QDD_RESPONSE_HONEYPOT) {
+            static char honeypot_buf[128];
+            qihse_qdd_generate_honeypot_response(honeypot_buf, sizeof(honeypot_buf));
+            return honeypot_buf;
+        } else if (tier == QIHSE_QDD_RESPONSE_ACTIVE) {
+            return NULL;
+        }
+    }
+    
+    if (val) return strdup((char*)val);
     
     // LSM-Tree: Search SSTables (from newest to oldest)
     for (int i = store->sstable_counter - 1; i >= 0; i--) {
@@ -375,4 +416,9 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
     fclose(f);
     qihse_kv_sweep_expired(store);
     return 0;
+}
+
+bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
+    if (!store || !store->qdd_ctx) return false;
+    return qihse_qdd_is_under_attack(store->qdd_ctx);
 }

@@ -72,6 +72,13 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store);
 
 /**
+ * @brief Checks if the store is under attack.
+ * @param store The KV store instance.
+ * @return true if the store is under attack, false otherwise.
+ */
+bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store);
+
+/**
  * @brief Saves the entire KV store to a file on disk.
  * @param store The KV store instance.
  * @param filepath Path to the output file.

@@ -804,6 +804,7 @@ double qihse_cosine_similarity_avx512(
 
     size_t simd_iters = data_size / 16;
     size_t remainder = data_size % 16;
+    (void)remainder;
 
     /* Process 16 elements at a time */
     for (size_t i = 0; i < simd_iters; i++) {
@@ -853,6 +854,7 @@ double qihse_cosine_similarity_avx2(
 
     size_t simd_iters = data_size / 8;
     size_t remainder = data_size % 8;
+    (void)remainder;
 
     /* Process 8 elements at a time */
     for (size_t i = 0; i < simd_iters; i++) {

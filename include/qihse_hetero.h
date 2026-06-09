@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <stdbool.h>
 
 /* Pthread support for threading */

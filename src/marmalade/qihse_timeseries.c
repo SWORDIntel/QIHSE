@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 #define QIHSE_RING_SIZE 4096
 
 struct qihse_tsdb {
@@ -109,7 +113,12 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
     if (head == tail) return;
     
     void* ptr = NULL;
+#ifdef _WIN32
+    ptr = _aligned_malloc(sizeof(qihse_tsdb_chunk_t), 4096);
+    if (!ptr) {
+#else
     if (posix_memalign(&ptr, 4096, sizeof(qihse_tsdb_chunk_t)) != 0) {
+#endif
         return;
     }
     

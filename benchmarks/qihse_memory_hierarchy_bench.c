@@ -37,11 +37,6 @@ int main(void) {
     uint64_t* ids;
     float query[128];
     qihse_vector_result_t results[10];
-    int count;
-    size_t hot_target_start = 100;
-    size_t hot_target_end = 200;
-    size_t hot_count = 0;
-    size_t cold_count = 0;
     uint64_t t0, t1;
 
     srand(42);
