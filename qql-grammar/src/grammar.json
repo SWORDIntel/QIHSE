@@ -100,6 +100,57 @@
               "members": [
                 {
                   "type": "PATTERN",
+                  "value": "JOIN",
+                  "flags": "i"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "join_table",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  }
+                },
+                {
+                  "type": "PATTERN",
+                  "value": "ON",
+                  "flags": "i"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "join_left",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  }
+                },
+                {
+                  "type": "STRING",
+                  "value": "="
+                },
+                {
+                  "type": "FIELD",
+                  "name": "join_right",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "PATTERN",
                   "value": "WHERE",
                   "flags": "i"
                 },
@@ -112,6 +163,38 @@
                   }
                 }
               ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "temporal",
+              "content": {
+                "type": "SYMBOL",
+                "name": "temporal_clause"
+              }
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "spatial",
+              "content": {
+                "type": "SYMBOL",
+                "name": "spatial_clause"
+              }
             },
             {
               "type": "BLANK"
@@ -147,6 +230,98 @@
         {
           "type": "STRING",
           "value": ";"
+        }
+      ]
+    },
+    "temporal_clause": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "PATTERN",
+          "value": "WITHIN",
+          "flags": "i"
+        },
+        {
+          "type": "PATTERN",
+          "value": "TIME",
+          "flags": "i"
+        },
+        {
+          "type": "FIELD",
+          "name": "start_time",
+          "content": {
+            "type": "SYMBOL",
+            "name": "string"
+          }
+        },
+        {
+          "type": "PATTERN",
+          "value": "TO",
+          "flags": "i"
+        },
+        {
+          "type": "FIELD",
+          "name": "end_time",
+          "content": {
+            "type": "SYMBOL",
+            "name": "string"
+          }
+        }
+      ]
+    },
+    "spatial_clause": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "PATTERN",
+          "value": "WITHIN",
+          "flags": "i"
+        },
+        {
+          "type": "PATTERN",
+          "value": "RADIUS",
+          "flags": "i"
+        },
+        {
+          "type": "FIELD",
+          "name": "radius",
+          "content": {
+            "type": "SYMBOL",
+            "name": "number"
+          }
+        },
+        {
+          "type": "PATTERN",
+          "value": "OF",
+          "flags": "i"
+        },
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "FIELD",
+          "name": "lat",
+          "content": {
+            "type": "SYMBOL",
+            "name": "number"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ","
+        },
+        {
+          "type": "FIELD",
+          "name": "lon",
+          "content": {
+            "type": "SYMBOL",
+            "name": "number"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ")"
         }
       ]
     },
@@ -376,7 +551,7 @@
     },
     "identifier": {
       "type": "PATTERN",
-      "value": "[a-zA-Z_][a-zA-Z0-9_]*"
+      "value": "[a-zA-Z_][a-zA-Z0-9_\\.]*"
     },
     "string": {
       "type": "CHOICE",

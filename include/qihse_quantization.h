@@ -24,6 +24,8 @@ typedef enum {
     QIHSE_QUANT_FP16,       /* 16-bit floating point */
     QIHSE_QUANT_BF16,       /* 16-bit bfloat16 */
     QIHSE_QUANT_FP32,       /* 32-bit floating point (no quantization) */
+    QIHSE_QUANT_TRINARY,    /* Packed 5-trits-per-byte (trytes) */
+    QIHSE_QUANT_PQ_8X8,     /* Product Quantization 8 sub-vectors x 8-bit centroids */
 } qihse_quantization_mode_t;
 
 /**

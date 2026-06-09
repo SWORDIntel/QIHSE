@@ -4,6 +4,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 typedef struct qihse_column_node {
     char* name;
     qihse_column_type_t type;
@@ -187,9 +191,16 @@ static bool append_value(qihse_column_store_t* store, const char* name, qihse_co
         }
         
         qihse_column_chunk_t* new_chunk = NULL;
+#ifdef _WIN32
+        new_chunk = (qihse_column_chunk_t*)_aligned_malloc(sizeof(qihse_column_chunk_t), 4096);
+        if (!new_chunk) {
+            return false;
+        }
+#else
         if (posix_memalign((void**)&new_chunk, 4096, sizeof(qihse_column_chunk_t)) != 0) {
             return false;
         }
+#endif
         
         new_chunk->type = expected_type;
         new_chunk->encoding = QIHSE_ENCODING_RAW;
@@ -200,16 +211,31 @@ static bool append_value(qihse_column_store_t* store, const char* name, qihse_co
         new_chunk->next = NULL;
         
         size_t elem_size = get_type_size(expected_type);
+#ifdef _WIN32
+        new_chunk->data = _aligned_malloc(elem_size * QIHSE_COLUMN_CHUNK_SIZE, 4096);
+        if (!new_chunk->data) {
+#else
         if (posix_memalign(&new_chunk->data, 4096, elem_size * QIHSE_COLUMN_CHUNK_SIZE) != 0) {
+#endif
             free(new_chunk);
             return false;
         }
+#ifdef _WIN32
+        new_chunk->classifications = (uint16_t*)_aligned_malloc(sizeof(uint16_t) * QIHSE_COLUMN_CHUNK_SIZE, 4096);
+        if (!new_chunk->classifications) {
+#else
         if (posix_memalign((void**)&new_chunk->classifications, 4096, sizeof(uint16_t) * QIHSE_COLUMN_CHUNK_SIZE) != 0) {
+#endif
             free(new_chunk->data);
             free(new_chunk);
             return false;
         }
+#ifdef _WIN32
+        new_chunk->sci_compartments = (uint16_t*)_aligned_malloc(sizeof(uint16_t) * QIHSE_COLUMN_CHUNK_SIZE, 4096);
+        if (!new_chunk->sci_compartments) {
+#else
         if (posix_memalign((void**)&new_chunk->sci_compartments, 4096, sizeof(uint16_t) * QIHSE_COLUMN_CHUNK_SIZE) != 0) {
+#endif
             free(new_chunk->classifications);
             free(new_chunk->data);
             free(new_chunk);

@@ -865,7 +865,12 @@ qihse_memory_buffer_t* qihse_memory_allocate(
 
     /* Allocate actual memory */
     void* data = NULL;
+#ifdef _WIN32
+    data = _aligned_malloc(buffer->allocated_size, alignment);
+    int alloc_result = (data != NULL) ? 0 : ENOMEM;
+#else
     int alloc_result = posix_memalign(&data, alignment, buffer->allocated_size);
+#endif
 
     if (alloc_result != 0) {
         free(buffer);
@@ -965,7 +970,11 @@ void qihse_memory_free(qihse_memory_manager_t manager, qihse_memory_buffer_t* bu
     atomic_fetch_add(&internal->total_frees, 1);
 
     /* Free actual memory */
+#ifdef _WIN32
+    _aligned_free(buffer->abi_buffer.data);
+#else
     free(buffer->abi_buffer.data);
+#endif
 
     /* Remove from tracking if present */
     pthread_mutex_lock(&internal->buffer_mutex);
@@ -996,7 +1005,12 @@ bool qihse_memory_resize(qihse_memory_manager_t manager, qihse_memory_buffer_t* 
     size_t new_allocated_size = ((new_size + alignment - 1) / alignment) * alignment;
 
     void* new_data = NULL;
+#ifdef _WIN32
+    new_data = _aligned_malloc(new_allocated_size, alignment);
+    int alloc_result = (new_data != NULL) ? 0 : ENOMEM;
+#else
     int alloc_result = posix_memalign(&new_data, alignment, new_allocated_size);
+#endif
 
     if (alloc_result != 0) {
         return false;
@@ -1012,7 +1026,11 @@ bool qihse_memory_resize(qihse_memory_manager_t manager, qihse_memory_buffer_t* 
     }
 
     /* Free old memory */
+#ifdef _WIN32
+    _aligned_free(buffer->abi_buffer.data);
+#else
     free(buffer->abi_buffer.data);
+#endif
 
     size_t old_allocated_size = buffer->allocated_size;
 
@@ -1137,7 +1155,12 @@ bool qihse_memory_migrate(
         new_alignment = qihse_memory_get_alignment(target_type);
         new_allocated_size = ((buffer->logical_size + new_alignment - 1u) / new_alignment) * new_alignment;
 
+#ifdef _WIN32
+        new_data = _aligned_malloc(new_allocated_size, new_alignment);
+        if (!new_data) {
+#else
         if (posix_memalign(&new_data, new_alignment, new_allocated_size) != 0) {
+#endif
             return false;
         }
 

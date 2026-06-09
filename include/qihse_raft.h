@@ -3,7 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#ifndef _WIN32
 #include <liburing.h>
+#endif
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
 
@@ -27,7 +29,9 @@ typedef struct qihse_raft_node_s {
     time_t last_heartbeat;
     
     // Networking
+#ifndef _WIN32
     struct io_uring ring;
+#endif
     int server_fd;
     uint16_t port;
     

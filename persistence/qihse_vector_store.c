@@ -1,3 +1,5 @@
+#include "qihse_platform.h"
+
 #include "qihse_vector_store.h"
 
 #include "codecs/qihse_trinary_tryte_codec.h"
@@ -9,7 +11,9 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096

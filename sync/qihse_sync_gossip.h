@@ -47,6 +47,10 @@ typedef struct {
     uint64_t timestamp;
     uint32_t ttl;
     uint32_t hop_count;
+    
+    /* Post-Quantum Signature (ML-DSA-87) */
+    uint8_t mldsa87_signature[4627];
+    bool has_signature;
 } qihse_sync_message_t;
 
 /* Gossip Manager */
@@ -66,6 +70,9 @@ typedef struct {
     uint64_t gossip_interval_ms;
     uint64_t last_gossip_time;
     uint32_t random_seed;
+    
+    /* PQC Keys */
+    void *mldsa87_pkey; /* EVP_PKEY* */
 } qihse_sync_manager_t;
 
 /* Gossip Statistics */
@@ -204,8 +211,8 @@ void qihse_sync_manager_cleanup_old_messages(
 /* Perform anti-entropy synchronization */
 int qihse_sync_manager_perform_anti_entropy(
     qihse_sync_manager_t *manager,
-    const uint8_t (*remote_message_ids)[16],
-    size_t remote_count,
+    const uint8_t *remote_bloom_filter,
+    size_t filter_size,
     qihse_sync_message_t **missing_messages,
     size_t *missing_count
 );

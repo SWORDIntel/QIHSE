@@ -7,17 +7,43 @@ INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 -I/usr/include/python3.13
 QIHSE_CFLAGS_EXTRA?=
 
-# CPU-specific SIMD backend selection.
-# R320/E5-2450 v2 exposes AVX but not AVX2/FMA, so these must be off there.
-# Enable on newer hosts with:
-#   make QIHSE_ENABLE_AVX2=1 QIHSE_ENABLE_AVX512=0
-QIHSE_ENABLE_AVX2?=0
-QIHSE_ENABLE_AVX512?=0
+# ---------------------------------------------------------------------------
+# CPU ISA feature flags
+# ---------------------------------------------------------------------------
+# Each flag defaults to auto-detect via compiler probe at make time.
+# Override on the command line or environment, e.g.:
+#   make QIHSE_ENABLE_AVX2=1 QIHSE_ENABLE_AVX512=0 QIHSE_ENABLE_AMX=0
+#
+# Hosts without a feature MUST set it to 0; the build will not crash but the
+# corresponding sources/flags are simply omitted.
+#
+# R320/E5-2450 v2: AVX only – AVX2, FMA, AVX-512, VNNI, AMX all absent.
+# Sapphire Rapids+: all features available.
+
+# ---- probe helpers ---------------------------------------------------------
+# Returns "1" if the compiler can assemble the given flag, "0" otherwise.
+cc_supports = $(shell echo 'int x;' | $(CC) $(1) -x c - -c -o /dev/null 2>/dev/null && echo 1 || echo 0)
+
+# ---- per-ISA defaults (auto-detect unless already set in env/CLI) ----------
+QIHSE_ENABLE_AVX2     ?= $(call cc_supports,-mavx2)
+QIHSE_ENABLE_AVX512   ?= $(call cc_supports,-mavx512f)
+QIHSE_ENABLE_AVX_VNNI ?= $(call cc_supports,-mavxvnni)
+QIHSE_ENABLE_AMX      ?= $(call cc_supports,-mamx-tile)
+
+# ---------------------------------------------------------------------------
+# Security & Audit Configuration
+# ---------------------------------------------------------------------------
+# Webhook URL for classified-access callouts (empty = disabled).
+# Set at build time: make QIHSE_AUDIT_WEBHOOK_URL="https://your.server:443/endpoint"
+QIHSE_AUDIT_WEBHOOK_URL?=
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
+ifdef QIHSE_AUDIT_WEBHOOK_URL
+CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
+endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -44,7 +70,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
-            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c src/spinnaker/qihse_lua_injector.c \
+            src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
             src/black_hole/qihse_kv_store.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c \
@@ -54,6 +80,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
+     quantization/src/qihse_quantization.c quantization/src/qihse_pq.c \
      core/qihse_helpers.c core/qihse_plugin.c \
      algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
      backends/cpu/qihse_cpu_detect.c \
@@ -64,18 +91,55 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
      memory/src/qihse_memory_topology_probe.c memory/src/qihse_memory_planner_trace.c memory/src/qihse_memory_allocation_policy.c \
      memory/src/qihse_memory_coherence.c memory/src/qihse_memory_migration_policy.c \
      memory/src/qihse_memory_device_placement.c memory/src/qihse_memory_migration_backend.c memory/src/qihse_memory_migration_scheduler.c \
+     src/networking/qihse_af_xdp.c src/broad_oak/qihse_quantum_defense.c src/broad_oak/qihse_mmdb.c \
      $(wildcard sync/*.c)
 
 SRCS=$(SRCS_BASE)
 
+ifeq ($(LIB_TARGET),qihse.dll)
+  SRCS := $(filter-out sdks/python/%, $(SRCS))
+  SRCS := $(filter-out vendor/tree-sitter/%, $(SRCS))
+  SRCS := $(filter-out src/networking/%, $(SRCS))
+  SRCS := $(filter-out backends/npu/%, $(SRCS))
+  SRCS := $(filter-out backends/gpu/%, $(SRCS))
+  SRCS := $(filter-out src/marmalade/%, $(SRCS))
+  SRCS := $(filter-out src/frieze/%, $(SRCS))
+  SRCS := $(filter-out src/tractable/%, $(SRCS))
+  SRCS := $(filter-out qql-grammar/src/parser.c, $(SRCS))
+  
+  SRCS := $(filter-out core/qihse_audit.c, $(SRCS))
+  SRCS := $(filter-out src/bombe/qihse_hetero.c, $(SRCS))
+  SRCS := $(filter-out src/broad_oak/qihse_quantum_defense.c, $(SRCS))
+  SRCS := $(filter-out src/broad_oak/qihse_mmdb.c, $(SRCS))
+  SRCS += src/windows_stubs.c
+  
+  LDFLAGS = -L. -lm -lpthread -lws2_32
+endif
+
+
 ifeq ($(QIHSE_ENABLE_AVX2),1)
 CFLAGS += -mavx2 -mfma -DQIHSE_ENABLE_AVX2=1
-SRCS += backends/cpu/qihse_cpu_avx2.c backends/cpu/qihse_cpu_distance_avx2.c
+SRCS += backends/cpu/qihse_cpu_avx2.c
 endif
 
 ifeq ($(QIHSE_ENABLE_AVX512),1)
-CFLAGS += -mavx512f -mavx512dq -mfma
+CFLAGS += -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -DQIHSE_ENABLE_AVX512=1
 SRCS += backends/cpu/qihse_cpu_avx512.c
+endif
+
+# AVX-VNNI: integer dot-product via 256-bit VEX-encoded vpdpbusd (Alder Lake+, Zen4+).
+# Distinct from AVX-512 VNNI. Requires AVX2 to be enabled as well.
+ifeq ($(QIHSE_ENABLE_AVX_VNNI),1)
+ifeq ($(QIHSE_ENABLE_AVX2),1)
+CFLAGS += -mavxvnni -DQIHSE_ENABLE_AVX_VNNI=1
+else
+$(warning QIHSE_ENABLE_AVX_VNNI=1 requires QIHSE_ENABLE_AVX2=1 -- AVX-VNNI disabled)
+endif
+endif
+
+# AMX: 2D tile matrix multiply (Sapphire Rapids+). Needs kernel tile-permission prctl.
+ifeq ($(QIHSE_ENABLE_AMX),1)
+CFLAGS += -mamx-tile -mamx-int8 -mamx-bf16 -DQIHSE_ENABLE_AMX=1
 endif
 
 # Note: core/qihse_plugin.c and algorithms/qihse_superposition.c etc are EXCLUDED 
@@ -97,9 +161,9 @@ server: lib
 lib: $(LIB_TARGET)
 
 $(LIB_TARGET): $(SRCS)
-	@echo "Building libqihse.so..."
+	@echo "Building $(LIB_TARGET)..."
 	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
-	@echo "Shared library build successful"
+	@echo "$(LIB_TARGET) build successful"
 
 persistence: test-persist
 persistence-check: test-persist
@@ -110,11 +174,15 @@ test-persist: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_vector_db_persistence_test
 
-test: test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler
+test: test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization
 
 test-bytecode: lib
 	$(CC) $(CFLAGS) -o tests/test_bytecode tests/test_bytecode.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_bytecode
+
+test-qql-parser: lib
+	$(CC) $(CFLAGS) -o tests/test_qql_parser tests/test_qql_parser.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_qql_parser
 
 test-document-store: lib
 	$(CC) $(CFLAGS) -o tests/test_document_store tests/test_document_store.c -L. -lqihse $(LDFLAGS)
@@ -139,6 +207,18 @@ test-omni: lib
 test-apt41:
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -g -fno-omit-frame-pointer -o tests/apt41_fuzzer tests/apt41_fuzzer.c -L. -lqihse $(LDFLAGS)
 	ASAN_OPTIONS=detect_leaks=1 LD_LIBRARY_PATH=. ./tests/apt41_fuzzer
+
+test-apt41-qql: lib
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -g -fno-omit-frame-pointer -o tests/apt41_qql_fuzzer tests/apt41_qql_fuzzer.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=detect_leaks=1 LD_LIBRARY_PATH=. ./tests/apt41_qql_fuzzer
+
+test-pq: lib
+	$(CC) $(CFLAGS) -o tests/test_qihse_pq tests/test_qihse_pq.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_qihse_pq
+
+test-quantization: lib
+	$(CC) $(CFLAGS) -o tests/test_quantization tests/test_quantization.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_quantization
 
 test-timeseries: lib
 	$(CC) $(CFLAGS) -o tests/test_timeseries tests/test_timeseries.c -L. -lqihse $(LDFLAGS)
@@ -227,7 +307,7 @@ test-vnni-bench:
 	LD_LIBRARY_PATH=. ./tests/test_vnni_bench
 
 test-vnni-only:
-	$(CC) $(CFLAGS) -mavx2 -mfma -o tests/test_vnni_only tests/test_vnni_only.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -mavx2 -mfma -mavxvnni -o tests/test_vnni_only tests/test_vnni_only.c $(LDFLAGS)
 	./tests/test_vnni_only
 
 test-avx2-only:
@@ -441,8 +521,17 @@ check-upstream-workflow:
 check-upstream-workflow-strict:
 	python3 scripts/qihse_workflow_check.py --root . --strict-upstream
 
+isa-info:
+	@echo "=== QIHSE ISA build-time detection ==="
+	@echo "  QIHSE_ENABLE_AVX2     = $(QIHSE_ENABLE_AVX2)"
+	@echo "  QIHSE_ENABLE_AVX512   = $(QIHSE_ENABLE_AVX512)"
+	@echo "  QIHSE_ENABLE_AVX_VNNI = $(QIHSE_ENABLE_AVX_VNNI)"
+	@echo "  QIHSE_ENABLE_AMX      = $(QIHSE_ENABLE_AMX)"
+	@echo "  CC                    = $(CC)"
+	@echo "  CFLAGS (ISA portion)  = $(filter -mavx% -mfma -mamx% -mfpmath%,$(CFLAGS))"
+
 clean:
-	rm -f *.o libqihse.so qihse_benchmark qihse_benchmark_a00 \
+	rm -f *.o libqihse.so qihse.dll qihse_benchmark qihse_benchmark_a00 \
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \

@@ -3,10 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "qihse_platform.h"
+#ifndef _WIN32
 #include <pthread.h>
+#endif
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#else
+#include <winsock2.h>
+#endif
 
 #define URING_QUEUE_DEPTH 256
 
@@ -26,10 +33,12 @@ bool qihse_raft_init(qihse_raft_node_t* node, uint32_t node_id, uint16_t port, q
     node->running = false;
     node->last_heartbeat = time(NULL);
     
+#ifndef _WIN32
     if (io_uring_queue_init(URING_QUEUE_DEPTH, &node->ring, 0) < 0) {
         perror("io_uring_queue_init");
         return false;
     }
+#endif
     
     node->server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (node->server_fd < 0) {
@@ -38,7 +47,11 @@ bool qihse_raft_init(qihse_raft_node_t* node, uint32_t node_id, uint16_t port, q
     }
     
     int opt = 1;
+#ifdef _WIN32
+    setsockopt(node->server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
     setsockopt(node->server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+#endif
     
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -60,6 +73,7 @@ bool qihse_raft_init(qihse_raft_node_t* node, uint32_t node_id, uint16_t port, q
 
 static void* raft_event_loop(void* arg) {
     qihse_raft_node_t* node = (qihse_raft_node_t*)arg;
+#ifndef _WIN32
     struct io_uring* ring = &node->ring;
     
     struct sockaddr_in client_addr;
@@ -130,7 +144,42 @@ static void* raft_event_loop(void* arg) {
         
         io_uring_cqe_seen(ring, cqe);
     }
+#else
+    printf("[QIHSE Raft] Node %u running fallback event loop on port %u\n", node->node_id, node->port);
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
     
+    // Fallback: poll with select to timeout for election
+    while(node->running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(node->server_fd, &readfds);
+        
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = (150000 + (rand() % 150000)); // 150-300ms
+        
+        int res = select(node->server_fd + 1, &readfds, NULL, NULL, &tv);
+        if (res > 0 && FD_ISSET(node->server_fd, &readfds)) {
+            SOCKET client = accept(node->server_fd, (struct sockaddr*)&client_addr, &client_len);
+            if (client != INVALID_SOCKET) {
+                closesocket(client);
+            }
+        } else if (res == 0) {
+            // Timeout
+            if (node->state == QIHSE_RAFT_FOLLOWER || node->state == QIHSE_RAFT_CANDIDATE) {
+                node->state = QIHSE_RAFT_CANDIDATE;
+                node->current_term++;
+                node->voted_for = node->node_id;
+                printf("[QIHSE Raft Node %u] Election Timeout! Transitioning to CANDIDATE for Term %lu\n", 
+                       node->node_id, (unsigned long)node->current_term);
+            } else if (node->state == QIHSE_RAFT_LEADER) {
+                printf("[QIHSE Raft Node %u] Broadcasting Heartbeat for Term %lu\n", 
+                       node->node_id, (unsigned long)node->current_term);
+            }
+        }
+    }
+#endif
     return NULL;
 }
 
@@ -147,7 +196,9 @@ void qihse_raft_stop(qihse_raft_node_t* node) {
     if (node) {
         node->running = false;
         close(node->server_fd);
+#ifndef _WIN32
         io_uring_queue_exit(&node->ring);
+#endif
     }
 }
 

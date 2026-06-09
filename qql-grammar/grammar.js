@@ -22,9 +22,26 @@ module.exports = grammar({
       )),
       /FROM/i,
       field('table', $.identifier),
+      optional(seq(/JOIN/i, field('join_table', $.identifier), /ON/i, field('join_left', $.identifier), '=', field('join_right', $.identifier))),
       optional(seq(/WHERE/i, field('condition', $.condition))),
+      optional(field('temporal', $.temporal_clause)),
+      optional(field('spatial', $.spatial_clause)),
       optional(seq(/LIMIT/i, field('limit', $.number))),
       ';'
+    ),
+
+    temporal_clause: $ => seq(
+      /WITHIN/i, /TIME/i,
+      field('start_time', $.string),
+      /TO/i,
+      field('end_time', $.string)
+    ),
+
+    spatial_clause: $ => seq(
+      /WITHIN/i, /RADIUS/i,
+      field('radius', $.number),
+      /OF/i,
+      '(', field('lat', $.number), ',', field('lon', $.number), ')'
     ),
 
     insert_statement: $ => seq(
@@ -52,7 +69,7 @@ module.exports = grammar({
       ']'
     ),
 
-    identifier: $ => /[a-zA-Z_][a-zA-Z0-9_]*/,
+    identifier: $ => /[a-zA-Z_][a-zA-Z0-9_\.]*/,
     
     string: $ => choice(
       seq('"', /[^"]*/, '"'),

@@ -81,7 +81,7 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
         return NULL;
     }
 
-    qihse_user_t* u = malloc(sizeof(qihse_user_t));
+    qihse_user_t* u = calloc(1, sizeof(qihse_user_t));
     if (!u) {
         pthread_mutex_unlock(&auth_mutex);
         return NULL;
@@ -220,7 +220,9 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
 
     // God Mode requires explicit operator role assignment
     if (user->role == QIHSE_ROLE_OPERATOR) {
-        qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
+        if (data_classif > 0) {
+            qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
+        }
         return true;
     }
 

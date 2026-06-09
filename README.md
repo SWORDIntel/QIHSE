@@ -9,7 +9,8 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Python](https://img.shields.io/badge/SDK-Python_Native-3776AB?logo=python&logoColor=white)]()
+[![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white)]()
+[![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=black)]()
 [![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)]()
 [![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512-00599C)]()
 [![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen)]()
@@ -64,6 +65,72 @@ UWP routes these database families explicitly:
 
 The QIHSE sync replication layer currently serializes KV set and vector set payloads over the internal cluster path while the remaining engines are served through UWP or their native APIs.
 
+### Database Surface at a Glance
+
+| Family | UWP Target | API Entry | Notes |
+|--------|------------|-----------|-------|
+| Vector DB | `0x02` | `qihse_vector_db_*` | Exact `float32` rerank with trinary (`qtri`/`qmag`) and quantized candidate filtering |
+| Key-Value Store | `0x01` | `qihse_kv_*` | Trinary trie + LSM/SSTable persistence |
+| Document Store | `0x03` | `qihse_document_*` | JSON insertion with JIT-compiled access paths |
+| Time-Series DB | `0x05` | `qihse_timeseries_*` | Gorilla XOR bit-packing, lock-free ingress |
+| Columnar Engine | `0x04` | `qihse_column_*` | AVX-accelerated OLAP, strided page alignment |
+| Graph Engine | `0x06` | `qihse_graph_*` | Anchor + HNSW multi-hop traversal (reserved target) |
+| Full-Text Search | Native | `qihse_fts_*` | BM25 lexical search, zero-copy tokenization |
+| Event Stream | `0x07` | `qihse_event_*` | `mmap`/`sendfile` DMA append-only log |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Storage["Database Surface"]
+        direction LR
+        VDB["Vector DB"]
+        KV["KV Store"]
+        DOC["Document Store"]
+        TS["Time-Series DB"]
+        COL["Columnar Engine"]
+        GRAPH["Graph Engine"]
+        FTS["Full-Text Search"]
+        EVT["Event Stream"]
+    end
+
+    subgraph ML["Self-Optimizing ML Engine"]
+        direction LR
+        BANDITS["Contextual Bandits"]
+        META["Meta-Learning (MAML)"]
+        ENERGY_ML["Energy-Aware Optimizer"]
+        COUNTER["Counterfactual Learning"]
+        RL["RL Discovery"]
+    end
+
+    subgraph Compute["Heterogeneous Compute Backends"]
+        direction LR
+        CPU["CPU SIMD<br/>AVX2 / AVX-512 / AMX / VNNI"]
+        NPU["NPU<br/>OpenVINO / PIM Tensor"]
+        GPU["GPU<br/>CUDA / SYCL / Intel Arc"]
+        MEM["Memory Subsystem<br/>UMA / HMA / Coherence"]
+        QALG["Quantum-Inspired<br/>RFF / Grover Amplification"]
+    end
+
+    subgraph Infra["Mission-Critical Infrastructure"]
+        direction LR
+        COH["Distributed Coherence"]
+        VER["Verification Modes"]
+        EMGT["Energy Management"]
+        BENCH["Benchmark Suite"]
+        SEC["Security<br/>CNSA 2.0"]
+        PER["Persistence Engine<br/>Trinary / WAL / Planner"]
+    end
+
+    Storage --> Compute
+    Compute --> ML
+    ML --> Compute
+    Compute --> Infra
+    Infra --> Compute
+```
+
 ---
 
 ## Uncompromising Performance, Anywhere
@@ -79,16 +146,94 @@ The engine acts as a hierarchical memory laboratory: per-vector access tracking 
 
 ---
 
+## Quick Start
+
+### Build
+
+```bash
+# Ubuntu / Debian prerequisites
+sudo apt install build-essential libssl-dev libnuma-dev libbpf-dev \
+                 libxdp-dev liburing-dev luajit libluajit-5.1-dev \
+                 libpython3-dev python3-dev clang
+
+# Build the shared library and all tests
+make clean && make
+
+# Run the full test suite
+make test
+
+# Run a specific benchmark
+make bench-micro
+```
+
+### Minimal C Example
+
+```c
+#include <qihse_vector_db.h>
+#include <stdio.h>
+
+int main() {
+    qihse_vector_db_t* db = qihse_vector_db_create(
+        QIHSE_VECTOR_DB_AUTO, NULL, "/tmp/qihse_demo");
+    if (!db) return 1;
+
+    float vector[128] = {0};
+    uint64_t id = 1;
+    qihse_vector_db_add_vectors(db, vector, 1, 128, &id, NULL, NULL);
+
+    qihse_vector_query_t q = {
+        .query_vector = vector,
+        .vector_dims = 128,
+        .top_k = 10,
+        .query_mode = QIHSE_VDB_QUERY_FLOAT32,
+        .distance_metric = QIHSE_DISTANCE_COSINE
+    };
+    qihse_vector_result_t results[10];
+    qihse_vector_db_search(db, &q, results, 10);
+
+    qihse_vector_db_close(db);
+    return 0;
+}
+```
+
+### Rust Example
+
+```rust
+use qihse_rs::{KVStore, TrinaryTrie, VectorDB, ffi};
+
+fn main() {
+    // Key-Value store (classification=0 → unclassified)
+    let kv = KVStore::new().unwrap();
+    kv.set("greeting", "hello", 0, 0);
+    assert_eq!(kv.get("greeting"), Some("hello".into()));
+
+    // Trinary Trie — raw byte values
+    let trie = TrinaryTrie::new().unwrap();
+    trie.insert("key", b"bytes");
+
+    // Vector DB — in-memory, cosine search
+    let db = VectorDB::new(ffi::qihse_vector_db_backend_e_QIHSE_VECTOR_DB_INMEMORY, None).unwrap();
+    db.add_vectors(&[1.0f32, 0.0, 0.0, 0.0], 4, Some(&[42u64]));
+    let hits = db.search(&[1.0, 0.0, 0.0, 0.0], 1,
+        ffi::qihse_vector_db_query_mode_e_QIHSE_VDB_QUERY_FLOAT32,
+        ffi::qihse_distance_metric_e_QIHSE_DISTANCE_COSINE);
+    println!("nearest: id={} score={:.4}", hits[0].id, hits[0].score);
+}
+```
+
+---
+
 ## Explore the Ecosystem
 
 To keep this showcase clean, all intensive code examples, API usage, and benchmark commands live in our detailed documentation suite:
 
-- **[API Reference](docs/api/README.md)**: Comprehensive C API maps for Vector DB, UWP, KV Store, and Document components.
-- **[Python Native SDK](sdks/python/README.md)**: Zero-overhead Python bindings utilizing CPython to expose the engine, proxies, and Supernatural Auth Gates directly to Python space.
+- **[API Reference](docs/api/)**: Comprehensive C API maps for all eight database families.
+- **[Python Native SDK](sdks/python/)**: Zero-overhead CPython bindings.
+- **[Rust SDK](rust/qihse-rs/)**: FFI bindings with safe wrappers (`KVStore`, `VectorDB`).
 - **[Persistence Model](docs/persistence/README.md)**: File formats, WAL structure, and engine durability.
-- **[Performance Benchmarks](docs/benchmarks.md)**: Deep dive into the VectorReVamp stress tests, throughput stats, and multi-threaded engine durability compared to other databases.
-- **[Onboarding & Building](docs/ONBOARDING.md)**: Instructions for compiling, running test suites, and executing benchmark harnesses (`make test-persist`, `make bench-micro`, etc.).
-- **[Trinary Policy Rationale](docs/qmag-policy.md)**: The theory behind `qmag` candidate selection.
+- **[Performance Benchmarks](docs/benchmarks/benchmarks.md)**: VectorReVamp stress tests and throughput stats.
+- **[Onboarding & Building](docs/ONBOARDING.md)**: Compile, test, and benchmark commands.
+- **[Trinary Policy Rationale](docs/architecture/qmag-policy.md)**: Theory behind `qmag` candidate selection.
 
 ---
 
@@ -105,8 +250,12 @@ This is not a gateway filter. The clearance check is the absolute **first mathem
 ### Immutable Audit Trail, CNSA 2.0 Integrity & Telemetry
 QIHSE natively supports cryptographic logging for all security-relevant access and clearance modifications.
 - **Stealth Integrity & CNSA 2.0 Lockdown:** To achieve CNSA 2.0 standard integrity checks, the engine stores an append-only, SHA-256 hash chain of the entire auth log state in a highly obfuscated camouflage file (`.DS_Store`). Every time the `qihse_auth.dat` log is modified, this stealth hash is updated. If an adversary tampers with the binary log, the engine will detect the hash mismatch immediately and violently lock down the entire execution process until a God-Mode Operator (Role 0) or Hardware-Token Analyst (Role 1) physically intervenes at the terminal to resume execution.
-- **Silent Callout Webhook:** Every time non-UNCLASSIFIED data is accessed, a pure C native raw TCP socket fires a silent HTTP POST payload to `http://127.0.0.1:8080/callout`. This happens natively without spawning external `curl` or shell processes, leaving absolutely zero trace in process execution audits (like Sysmon or Auditd). If no webhook listener is configured, the callout simply drops into the void—normal users won't even notice the feature exists.
-  - *Note:* You must update `qihse_audit.c` to point to your actual webhook listener URL and configure the expected data ingestion contract. The payload format sent is: `{"event":"classified_access", "user_id":<UID>, "classif":<LEVEL>, "sci":<COMPARTMENTS>}`.
+- **Silent Callout Webhook:** Every time non-UNCLASSIFIED data is accessed, a pure C native raw TCP socket fires a silent HTTPS POST payload to `https://192.0.2.1:443/callout`. This happens natively without spawning external `curl` or shell processes, leaving absolutely zero trace in process execution audits (like Sysmon or Auditd). If no webhook listener is configured, the callout simply drops into the void—normal users won't even notice the feature exists.
+  - *Note:* Configure the webhook URL either at **build time** via Makefile:
+    ```bash
+    make QIHSE_AUDIT_WEBHOOK_URL="https://your.server.com:443/endpoint"
+    ```
+    Or at **runtime** by calling `qihse_audit_set_webhook("https://your.server.com:443/endpoint")` during application initialization. The default is disabled (empty string). The payload format sent is: `{"event":"classified_access", "user_id":<UID>, "classif":<LEVEL>, "sci":<COMPARTMENTS>}`.
 
 ---
 

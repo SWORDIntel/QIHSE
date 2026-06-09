@@ -8,18 +8,41 @@
 #include "qihse_pg_wire.h"
 #include "qihse_resp_wire.h"
 #include "qihse_qql_parser.h"
+#ifndef _WIN32
+#include <liburing.h>
+#include "../networking/qihse_af_xdp.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+#ifndef _WIN32
 #include <endian.h>
+#else
+#include <winsock2.h>
+#define le32toh(x) (x)
+#define le64toh(x) (x)
+#define htole32(x) (x)
+#define htole64(x) (x)
+#endif
 #include <sys/time.h>
+#include "qihse_platform.h"
+#ifndef _WIN32
 #include <pthread.h>
+#endif
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp_header_t* header, uint8_t* payload) {
     /* Magic Byte Verification */
@@ -64,6 +87,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             break;
             
         case QIHSE_UWP_TARGET_DOC:
+#ifndef _WIN32
             if (header->command_opcode == 0x01 && ctx->doc) {
                 /* DOC SET: 8 byte ID, remaining is JSON string */
                 if (len < 9) break;
@@ -73,9 +97,11 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 const char* reply = "OK\n";
                 write(client_fd, reply, 3);
             }
+#endif
             break;
             
         case QIHSE_UWP_TARGET_COL:
+#ifndef _WIN32
             if (header->command_opcode == 0x01 && ctx->col) {
                 /* COL APPEND F32: string col name, float value */
                 if (len == 0) break;
@@ -90,9 +116,11 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 const char* reply = "OK\n";
                 write(client_fd, reply, 3);
             }
+#endif
             break;
             
         case QIHSE_UWP_TARGET_TSDB:
+#ifndef _WIN32
             if (header->command_opcode == 0x01 && ctx->tsdb) {
                 /* TSDB INSERT: 8 byte series, 8 byte ts, 8 byte double */
                 if (len < 24) break;
@@ -103,9 +131,11 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 const char* reply = "OK\n";
                 write(client_fd, reply, 3);
             }
+#endif
             break;
             
         case QIHSE_UWP_TARGET_STREAM:
+#ifndef _WIN32
             if (header->command_opcode == 0x01 && ctx->stream) {
                 /* STREAM APPEND: string topic, trailing payload */
                 if (len == 0) break;
@@ -119,6 +149,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 const char* reply = "OK\n";
                 write(client_fd, reply, 3);
             }
+#endif
             break;
             
         default:
@@ -129,7 +160,9 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
 
 
 
+#ifndef _WIN32
 #include <liburing.h>
+#endif
 
 #define URING_ENTRIES 1024
 #define URING_BUF_SIZE 8192
@@ -137,7 +170,8 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
 typedef enum {
     EVENT_ACCEPT = 0,
     EVENT_READ,
-    EVENT_WRITE
+    EVENT_WRITE,
+    EVENT_XDP_POLL
 } uwp_event_type_t;
 
 typedef struct {
@@ -148,6 +182,7 @@ typedef struct {
     size_t buf_len;
 } uwp_event_ctx_t;
 
+#ifndef _WIN32
 static void uwp_add_accept(struct io_uring *ring, int server_fd, qihse_uwp_context_t* uwp_ctx, struct sockaddr_in *client_addr, socklen_t *client_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
@@ -182,6 +217,7 @@ static void uwp_add_write(struct io_uring *ring, int client_fd, const char* repl
     io_uring_prep_send(sqe, client_fd, ev->buf, ev->buf_len, 0);
     io_uring_sqe_set_data(sqe, ev);
 }
+#endif
 
 bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address) {
     int server_fd;
@@ -193,7 +229,11 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
         return false;
     }
 
+#ifdef _WIN32
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt))) {
+#else
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+#endif
         perror("setsockopt");
         close(server_fd);
         return false;
@@ -222,6 +262,7 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
     printf("[QIHSE UWP] Multiplexer Online on %s:%d (Zero-Copy io_uring Network Engine)\n", 
            bind_address ? bind_address : "0.0.0.0", port);
 
+#ifndef _WIN32
     struct io_uring ring;
     if (io_uring_queue_init(URING_ENTRIES, &ring, 0) < 0) {
         perror("io_uring_queue_init");
@@ -232,6 +273,26 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
     socklen_t client_len = sizeof(client_addr);
 
     uwp_add_accept(&ring, server_fd, ctx, &client_addr, &client_len);
+    
+    struct qihse_af_xdp_ctx *xdp_ctx = NULL;
+    const char *xdp_iface = getenv("QIHSE_XDP_IFACE");
+    if (xdp_iface) {
+        xdp_ctx = qihse_af_xdp_init(xdp_iface);
+        if (xdp_ctx) {
+            int xdp_fd = qihse_af_xdp_get_fd(xdp_ctx);
+            if (xdp_fd >= 0) {
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+                ev->type = EVENT_XDP_POLL;
+                ev->fd = xdp_fd;
+                ev->ctx = ctx;
+                io_uring_prep_poll_add(sqe, xdp_fd, POLLIN);
+                io_uring_sqe_set_data(sqe, ev);
+                printf("[QIHSE UWP] AF_XDP socket registered in io_uring for %s\n", xdp_iface);
+            }
+        }
+    }
+
     io_uring_submit(&ring);
 
     while (1) {
@@ -265,18 +326,60 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
                     uwp_route_payload(ev->fd, ev->ctx, header, payload);
                 } else {
                     // QQL
+#ifndef _WIN32
                     void* ast = qihse_parse_qql_to_ast((char*)ev->buf);
                     (void)ast;
+#endif
                     uwp_add_write(&ring, ev->fd, "QQL OK\n");
                     io_uring_submit(&ring);
                 }
             }
         } else if (ev->type == EVENT_WRITE) {
             close(ev->fd);
+        } else if (ev->type == EVENT_XDP_POLL) {
+            if (xdp_ctx) {
+                qihse_af_xdp_poll(xdp_ctx, NULL, NULL);
+            }
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_poll_add(sqe, ev->fd, POLLIN);
+            io_uring_sqe_set_data(sqe, ev);
+            io_uring_submit(&ring);
+            continue;
         }
         free(ev);
     }
     
     io_uring_queue_exit(&ring);
+    if (xdp_ctx && xdp_iface) {
+        qihse_af_xdp_teardown(xdp_ctx, xdp_iface);
+    }
+#else
+    // Windows Fallback loop
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    char buf[8192];
+    
+    while(1) {
+        SOCKET client_sock = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_sock == INVALID_SOCKET) continue;
+        
+        int res = recv(client_sock, buf, sizeof(buf) - 1, 0);
+        if (res > 0) {
+            buf[res] = '\0';
+            if (res > 5 && memcmp(buf, "QIHSE", 5) == 0) {
+                qihse_uwp_header_t* header = (qihse_uwp_header_t*)buf;
+                uint8_t* payload = (uint8_t*)buf + sizeof(qihse_uwp_header_t);
+                uwp_route_payload(client_sock, ctx, header, payload);
+            } else {
+#ifndef _WIN32
+                void* ast = qihse_parse_qql_to_ast(buf);
+                (void)ast;
+#endif
+                send(client_sock, "QQL OK\n", 7, 0);
+            }
+        }
+        closesocket(client_sock);
+    }
+#endif
     return true;
 }

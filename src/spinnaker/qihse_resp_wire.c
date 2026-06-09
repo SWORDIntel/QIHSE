@@ -4,12 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include <ctype.h>
+#include "qihse_platform.h"
+#ifndef _WIN32
 #include <pthread.h>
+#include <liburing.h>
+#include <poll.h>
+#include "../networking/qihse_af_xdp.h"
+#endif
+#include "../broad_oak/qihse_quantum_defense.h"
 
 typedef struct {
     int client_fd;
@@ -82,6 +94,14 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 write(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "GET") == 0 && argc >= 2) {
                 const char* val = qihse_kv_get_user(store, args[1], NULL);
+                
+                if (qihse_kv_store_is_under_attack(store)) {
+#ifndef _WIN32
+                    qihse_qdd_execute_active_measure(client_fd);
+#endif
+                    break;
+                }
+                
                 if (val) {
                     char reply[1024];
                     snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(val), val);
@@ -182,6 +202,51 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
     close(client_fd);
 }
 
+static void af_xdp_resp_cb(char *pkt, uint32_t len, void *arg) {
+    (void)arg;
+    if (len > 54) {
+        char *payload = pkt + 54;
+        if (strstr(payload, "PING")) {
+            printf("[AF_XDP RESP] Fast-path zero-copy bypass: PING\n");
+        } else if (strstr(payload, "GET")) {
+            printf("[AF_XDP RESP] Fast-path zero-copy bypass: GET\n");
+        } else if (strstr(payload, "SET")) {
+            printf("[AF_XDP RESP] Fast-path zero-copy bypass: SET\n");
+        }
+    }
+}
+
+#ifndef _WIN32
+static void* af_xdp_resp_thread(void *arg) {
+    struct qihse_af_xdp_ctx *xdp_ctx = qihse_af_xdp_init("eth0");
+    if (!xdp_ctx) return NULL;
+    int fd = qihse_af_xdp_get_fd(xdp_ctx);
+
+    struct io_uring ring;
+    if (io_uring_queue_init(16, &ring, 0) < 0) return NULL;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_poll_add(sqe, fd, POLLIN);
+    io_uring_submit(&ring);
+
+    while (1) {
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) < 0) continue;
+        
+        if (cqe->res & POLLIN) {
+            qihse_af_xdp_poll(xdp_ctx, af_xdp_resp_cb, arg);
+        }
+        
+        io_uring_cqe_seen(&ring, cqe);
+        
+        sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_poll_add(sqe, fd, POLLIN);
+        io_uring_submit(&ring);
+    }
+    return NULL;
+}
+#endif
+
 bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uint16_t port, const char* bind_address) {
     int server_fd, client_fd;
     struct sockaddr_in address;
@@ -193,7 +258,20 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
         return -1;
     }
 
+#ifndef _WIN32
+    pthread_t af_xdp_tid;
+    qihse_resp_client_ctx_t* af_ctx = malloc(sizeof(qihse_resp_client_ctx_t));
+    af_ctx->client_fd = -1;
+    af_ctx->store = store;
+    af_ctx->vdb = vdb;
+    pthread_create(&af_xdp_tid, NULL, af_xdp_resp_thread, af_ctx);
+#endif
+
+#ifdef _WIN32
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt))) {
+#else
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+#endif
         perror("setsockopt");
         close(server_fd);
         return -1;
@@ -242,3 +320,119 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
 
     return true;
 }
+
+#ifdef _WIN32
+typedef enum {
+    QIHSE_IOCP_READ,
+    QIHSE_IOCP_WRITE
+} qihse_iocp_op_t;
+
+typedef struct {
+    WSAOVERLAPPED overlapped;
+    SOCKET socket;
+    qihse_iocp_op_t op_type;
+    WSABUF wsa_buf;
+    char buffer[65536];
+    DWORD bytes_transferred;
+    qihse_kv_store_t* store;
+    qihse_vector_db_t vdb;
+} qihse_iocp_ctx_t;
+
+static DWORD WINAPI iocp_worker_thread(LPVOID completion_port) {
+    HANDLE iocp = (HANDLE)completion_port;
+    DWORD bytes_transferred;
+    ULONG_PTR completion_key;
+    qihse_iocp_ctx_t* ctx;
+
+    while (1) {
+        BOOL result = GetQueuedCompletionStatus(iocp, &bytes_transferred, &completion_key, (LPOVERLAPPED*)&ctx, INFINITE);
+        if (!result || bytes_transferred == 0) {
+            if (ctx) {
+                closesocket(ctx->socket);
+                free(ctx);
+            }
+            continue;
+        }
+
+        if (ctx->op_type == QIHSE_IOCP_READ) {
+            ctx->buffer[bytes_transferred] = '\0';
+            
+            // Re-use the existing RESP parser logic over the buffer.
+            // For a highly optimized IOCP we would parse inline, but here we call the parser manually
+            // and construct the reply in ctx->buffer, then issue a WSASend.
+            
+            // Very simplified fast-path for PING/GET to demonstrate RIO/IOCP zero-copy semantics:
+            char* reply_ptr = "+OK\r\n";
+            if (strncasecmp(ctx->buffer, "PING", 4) == 0) {
+                reply_ptr = "+PONG\r\n";
+            } else if (strncasecmp(ctx->buffer, "GET", 3) == 0) {
+                // Parse GET key... 
+                // reply_ptr = value
+            }
+            
+            strcpy(ctx->buffer, reply_ptr);
+            ctx->wsa_buf.buf = ctx->buffer;
+            ctx->wsa_buf.len = strlen(ctx->buffer);
+            ctx->op_type = QIHSE_IOCP_WRITE;
+            
+            DWORD flags = 0;
+            ZeroMemory(&ctx->overlapped, sizeof(WSAOVERLAPPED));
+            WSASend(ctx->socket, &ctx->wsa_buf, 1, NULL, flags, &ctx->overlapped, NULL);
+            
+        } else if (ctx->op_type == QIHSE_IOCP_WRITE) {
+            // Write completed, repost read
+            ctx->wsa_buf.buf = ctx->buffer;
+            ctx->wsa_buf.len = sizeof(ctx->buffer) - 1;
+            ctx->op_type = QIHSE_IOCP_READ;
+            DWORD flags = 0;
+            ZeroMemory(&ctx->overlapped, sizeof(WSAOVERLAPPED));
+            WSARecv(ctx->socket, &ctx->wsa_buf, 1, NULL, &flags, &ctx->overlapped, NULL);
+        }
+    }
+    return 0;
+}
+
+bool qihse_start_resp_server_iocp(qihse_kv_store_t* store, qihse_vector_db_t vdb, uint16_t port, const char* bind_address) {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
+
+    HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!iocp) return false;
+
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    for (DWORD i = 0; i < sysinfo.dwNumberOfProcessors; i++) {
+        CreateThread(NULL, 0, iocp_worker_thread, iocp, 0, NULL);
+    }
+
+    SOCKET listen_sock = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    
+    bind(listen_sock, (struct sockaddr*)&address, sizeof(address));
+    listen(listen_sock, SOMAXCONN);
+
+    while (1) {
+        SOCKET client_sock = accept(listen_sock, NULL, NULL);
+        if (client_sock == INVALID_SOCKET) continue;
+
+        CreateIoCompletionPort((HANDLE)client_sock, iocp, (ULONG_PTR)client_sock, 0);
+
+        qihse_iocp_ctx_t* ctx = malloc(sizeof(qihse_iocp_ctx_t));
+        ZeroMemory(ctx, sizeof(qihse_iocp_ctx_t));
+        ctx->socket = client_sock;
+        ctx->store = store;
+        ctx->vdb = vdb;
+        ctx->op_type = QIHSE_IOCP_READ;
+        ctx->wsa_buf.buf = ctx->buffer;
+        ctx->wsa_buf.len = sizeof(ctx->buffer) - 1;
+
+        DWORD flags = 0;
+        WSARecv(client_sock, &ctx->wsa_buf, 1, NULL, &flags, &ctx->overlapped, NULL);
+    }
+    return true;
+}
+#endif

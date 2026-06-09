@@ -264,7 +264,8 @@ static int quantize_fp16(const float* input, uint16_t* output, size_t n,
     (void)params;
     for (size_t i = 0; i < n; i++) {
         // FP16 conversion with proper handling
-        uint32_t bits = *(uint32_t*)&input[i];
+        uint32_t bits;
+        memcpy(&bits, &input[i], sizeof(bits));
         uint16_t fp16 = (bits >> 16) & 0x8000; // Sign bit
         fp16 |= ((bits >> 13) & 0x3FF) << 0;  // Mantissa bits
         fp16 |= ((bits >> 23) & 0xFF) << 10;  // Exponent bits

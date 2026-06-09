@@ -8,6 +8,8 @@
 #include "qihse_resp_wire.h"
 #include "qihse_pg_wire.h"
 
+extern void qihse_start_http_telemetry_server(void);
+
 qihse_kv_store_t* global_kv;
 qihse_vector_db_t global_vdb;
 
@@ -44,6 +46,8 @@ int main(int argc, char** argv) {
     
     printf("[QIHSE SERVER] Spawning proxy threads...\n");
     
+    qihse_start_http_telemetry_server();
+
     if (pthread_create(&resp_t, NULL, resp_server_thread, NULL) != 0) {
         perror("Failed to start RESP server thread");
         return 1;

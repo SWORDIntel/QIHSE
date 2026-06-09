@@ -19,7 +19,9 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sched.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -538,6 +540,7 @@ void qihse_uma_set_priority_pinning(void *task_handle, int priority) {
     pthread_t thread = (pthread_t)task_handle;
 
     // 1. Set Thread Scheduling Priority
+#ifndef _WIN32
     struct sched_param param;
     int policy = SCHED_OTHER;
     
@@ -546,9 +549,11 @@ void qihse_uma_set_priority_pinning(void *task_handle, int priority) {
         // If we were root, we could use SCHED_RR
         pthread_setschedparam(thread, policy, &param);
     }
+#endif
 
     // 2. Set CPU Affinity
     if (priority >= 90) {
+#ifndef _WIN32
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         
@@ -557,6 +562,7 @@ void qihse_uma_set_priority_pinning(void *task_handle, int priority) {
         CPU_SET(core_id, &cpuset);
 
         pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+#endif
     }
     
     logger_log(QIHSE_LOG_DEBUG, "UMA", "Priority pinning set: task=%p, priority=%d", task_handle, priority);

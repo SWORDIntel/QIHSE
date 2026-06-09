@@ -11,19 +11,6 @@ local TRIT_NEG = -1
 local TRIT_ZERO = 0
 local TRIT_POS = 1
 
--- Constant-Time K3 Logic LUTs
--- Indexed by (trit + 2) to get 1, 2, 3
-local LUT_KAND = {
-    {-1, -1, -1}, -- -1 AND {-1, 0, 1}
-    {-1,  0,  0}, --  0 AND {-1, 0, 1}
-    {-1,  0,  1}, --  1 AND {-1, 0, 1}
-}
-local LUT_KOR = {
-    {-1,  0,  1}, -- -1 OR {-1, 0, 1}
-    { 0,  0,  1}, --  0 OR {-1, 0, 1}
-    { 1,  1,  1}, --  1 OR {-1, 0, 1}
-}
-local LUT_KNOT = {1, 0, -1} -- NOT {-1, 0, 1}
 local LUT_SBOX_27 = {13, 24, 7, 2, 19, 11, 20, 5, 15, 22, 1, 9, 17, 0, 26, 4, 14, 21, 6, 10, 3, 25, 8, 12, 16, 18, 23}
 M.active_sbox = LUT_SBOX_27
 
@@ -39,9 +26,9 @@ local function clamp_trit(t)
 end
 M.clamp_trit = clamp_trit
 
-function M.knot(a) return LUT_KNOT[clamp_trit(a) + 2] end
-function M.kand(a, b) return LUT_KAND[clamp_trit(a) + 2][clamp_trit(b) + 2] end
-function M.kor(a, b) return LUT_KOR[clamp_trit(a) + 2][clamp_trit(b) + 2] end
+function M.knot(a) return -clamp_trit(a) end
+function M.kand(a, b) return math.min(clamp_trit(a), clamp_trit(b)) end
+function M.kor(a, b) return math.max(clamp_trit(a), clamp_trit(b)) end
 
 function M.bnt(a)
     if a == 0 then return 0 end

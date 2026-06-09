@@ -1,3 +1,14 @@
+
+#ifdef _WIN32
+#include <io.h>
+#define fsync _commit
+#define MAP_FAILED ((void *)-1)
+#define PROT_READ 1
+#define MAP_SHARED 1
+static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) { return MAP_FAILED; }
+static inline int munmap(void *addr, size_t length) { return -1; }
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -25,7 +36,9 @@
 #include "qihse_system_guard.h"
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
@@ -399,7 +412,15 @@ static bool qihse_vdb_truncate_file(const char* db_path, const char* name) {
     if (fd < 0) {
         return false;
     }
+    #ifndef _WIN32
+    #ifndef _WIN32
     ok = fsync(fd) == 0;
+#else
+    ok = _commit(fd) == 0;
+#endif
+#else
+    ok = _commit(fd) == 0;
+#endif
     if (close(fd) != 0) {
         ok = false;
     }
@@ -418,7 +439,11 @@ static bool qihse_vdb_truncate_existing_file(const char* db_path, const char* na
     if (fd < 0) {
         return errno == ENOENT;
     }
+    #ifndef _WIN32
     ok = ftruncate(fd, (off_t)size) == 0 && fsync(fd) == 0;
+#else
+    ok = _chsize(fd, (long)size) == 0 && _commit(fd) == 0;
+#endif
     if (close(fd) != 0) {
         ok = false;
     }
@@ -3704,7 +3729,15 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
                                         &commit_offset, NULL);
     }
     if (ok) {
-        ok = fsync(fd) == 0;
+        #ifndef _WIN32
+    #ifndef _WIN32
+    ok = fsync(fd) == 0;
+#else
+    ok = _commit(fd) == 0;
+#endif
+#else
+    ok = _commit(fd) == 0;
+#endif
     }
     if (close(fd) != 0) {
         ok = false;
