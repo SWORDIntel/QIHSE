@@ -151,8 +151,7 @@ void qihse_qdd_report_access(qihse_quantum_defense_ctx_t* ctx, uint64_t target_i
     }
     
     uint64_t now = (uint64_t)time(NULL);
-    const char* key_ptr = (const char*)(uintptr_t)target_id;
-    uint64_t key_hash = qihse_qdd_fnv1a_hash(key_ptr);
+    uint64_t key_hash = target_id;
     ctx->access_history[ctx->head] = key_hash;
     ctx->access_timestamps[ctx->head] = now;
     

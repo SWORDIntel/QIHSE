@@ -77,7 +77,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c \
             src/spinnaker/qihse_pg_wire.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
             vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c \
-     persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c \
+     persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
      quantization/src/qihse_quantization.c quantization/src/qihse_pq.c \
@@ -150,7 +150,7 @@ endif
 .NOTPARALLEL: validate-reference-workflow
 
 all: lib server
-build: lib server
+build: lib server lib-ctypes
 
 build-native:
 	./scripts/build-native.sh
@@ -164,6 +164,11 @@ $(LIB_TARGET): $(SRCS)
 	@echo "Building $(LIB_TARGET)..."
 	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
 	@echo "$(LIB_TARGET) build successful"
+
+lib-ctypes: $(filter-out sdks/python/qihse.c,$(SRCS))
+	@echo "Building libqihse.so (ctypes, no Python extension)..."
+	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(LDFLAGS))
+	@echo "libqihse.so (ctypes) build successful"
 
 persistence: test-persist
 persistence-check: test-persist

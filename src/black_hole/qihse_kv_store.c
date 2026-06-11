@@ -123,7 +123,9 @@ qihse_kv_store_t* qihse_kv_store_create() {
     // Seed honeypot bait keys for quantum defense
     qihse_kv_seed_honeypot_bait(store);
     
-    store->wal_fd = fopen("wal.log", "a");
+    // Rotate WAL — start fresh, archive old log for debugging
+    rename("wal.log", "wal.log.old");
+    store->wal_fd = fopen("wal.log", "w");
     
     return store;
 }
@@ -188,7 +190,14 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, u
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return NULL;
     
-    qihse_qdd_report_access(store->qdd_ctx, (uint64_t)(uintptr_t)key, "0.0.0.0");
+    {
+        uint64_t key_hash = 14695981039346656037ULL;
+        for (const unsigned char* p = (const unsigned char*)key; *p; ++p) {
+            key_hash ^= (uint64_t)*p;
+            key_hash *= 1099511628211ULL;
+        }
+        qihse_qdd_report_access(store->qdd_ctx, key_hash, "0.0.0.0");
+    }
     
     qihse_kv_sweep_expired(store);
     size_t out_size = 0;
@@ -208,7 +217,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         }
     }
     
-    if (user_authorized) {
+    if (user_authorized && val) {
         qihse_qdd_response_tier_t tier = qihse_qdd_get_response_tier(store->qdd_ctx);
         
         if (tier == QIHSE_QDD_RESPONSE_THROTTLE) {
@@ -216,7 +225,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         } else if (tier == QIHSE_QDD_RESPONSE_HONEYPOT) {
             static char honeypot_buf[128];
             qihse_qdd_generate_honeypot_response(honeypot_buf, sizeof(honeypot_buf));
-            return honeypot_buf;
+            return strdup(honeypot_buf);
         } else if (tier == QIHSE_QDD_RESPONSE_ACTIVE) {
             return NULL;
         }
