@@ -90,12 +90,17 @@ QIHSE implements all CNSA 2.0 approved algorithms for higher assurance applicati
 - **AES-256-CBC** (legacy compatibility)
 
 #### **Digital Signatures**
-- **ECDSA P-384** (primary)
-- **RSA-3072** (minimum key size, transitional)
+- **ML-DSA-87** (primary post-quantum)
+- **ECDSA P-384** (legacy compatibility)
 
-#### **Key Exchange**
-- **ECDH P-384** (primary)
-- **DH-3072** (transitional)
+#### **Key Exchange / Encapsulation**
+- **ML-KEM-1024** (primary post-quantum)
+- **ECDH P-384** (legacy compatibility)
+
+#### **Data At Rest (.qdb Container)**
+- **AES-256-GCM** symmetric payload encryption
+- **ML-KEM-1024** symmetric key encapsulation (`SEC_KEY`)
+- **ML-DSA-87** manifest and payload signatures (`SEC_SIGNATURE`)
 
 #### **Hash Functions**
 - **SHA-384** (primary for HMAC)

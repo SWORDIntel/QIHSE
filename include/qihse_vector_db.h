@@ -364,7 +364,7 @@ typedef struct qihse_vector_db_s* qihse_vector_db_t;
  *
  * @param backend Vector database backend to use
  * @param uma UMA manager for memory management
- * @param db_path Path to vector database (NULL for in-memory)
+ * @param db_path Path to the .qdb container file (NULL for ephemeral in-memory)
  * @return Vector database handle, or NULL on failure
  */
 qihse_vector_db_t qihse_vector_db_create(
@@ -378,8 +378,8 @@ qihse_vector_db_t qihse_vector_db_create(
  *
  * @param backend Vector database backend to use for compatibility
  * @param uma UMA manager for vector and metadata buffers
- * @param db_path Path to QIHSE database directory (NULL for ephemeral)
- * @param flags Open flags
+ * @param db_path Path to the .qdb single-file container (NULL for ephemeral)
+ * @param flags Open flags (QIHSE_VDB_OPEN_* bitmask)
  * @return Vector database handle, or NULL on failure
  */
 qihse_vector_db_t qihse_vector_db_open(

@@ -5,8 +5,8 @@
 #include "../core/qihse_abi.h"
 #include "../memory/include/qihse_memory.h"
 #include "qihse_vector_db.h"
+#include "../persistence/qihse_container.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 /*
@@ -80,19 +79,18 @@ static int search_one(qihse_vector_db_t vdb,
 static bool close_db(qihse_vector_db_t vdb);
 static bool float_eq(float a, float b);
 static bool vector_eq(const float* a, const float* b, size_t dims);
-static bool corrupt_file_byte(const char* dir, const char* name, off_t offset, uint8_t value);
-static bool truncate_file_to(const char* dir, const char* name, off_t size);
-static bool file_size_of(const char* dir, const char* name, off_t* out_size);
-static bool write_file_u64le_at(const char* dir, const char* name, off_t offset, uint64_t value);
-static bool write_file_payload(const char* dir,
-                               const char* name,
-                               const uint8_t* payload,
-                               size_t payload_size);
-static bool read_file_payload(const char* dir,
-                              const char* name,
-                              uint8_t** out_payload,
-                              size_t* out_payload_size);
-static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size);
+static bool ctr_corrupt_section_byte(const char* qdb_path, uint16_t section_id,
+                                      off_t sec_offset, uint8_t value);
+static bool ctr_section_length(const char* qdb_path, uint16_t section_id, uint64_t* out_len);
+static bool ctr_truncate_wal(const char* qdb_path, uint64_t new_length);
+static bool ctr_read_section(const char* qdb_path, uint16_t section_id,
+                              uint8_t** out, size_t* out_size);
+static bool ctr_write_section(const char* qdb_path, uint16_t section_id,
+                               const uint8_t* data, size_t size);
+static bool ctr_write_u64le_in_section(const char* qdb_path, uint16_t section_id,
+                                        off_t sec_offset, uint64_t value);
+static bool ctr_write_trinary_section(const char* qdb_path,
+                                       const uint8_t* payload, size_t payload_size);
 
 static bool test_create_insert_close_reopen_search(void);
 static bool test_sparse_ids_hydrate_vector_and_metadata(void);
@@ -356,49 +354,30 @@ static void env_destroy(test_env_t* env) {
 
 static char* make_temp_db_path(const char* name) {
     char template_path[256];
-    snprintf(template_path, sizeof(template_path), "/tmp/qihse_%s_XXXXXX", name);
+    snprintf(template_path, sizeof(template_path), "/tmp/qihse_%s_XXXXXX.qdb", name);
 
     char* path = strdup(template_path);
     if (!path) {
         return NULL;
     }
-    if (!mkdtemp(path)) {
+    int fd = mkstemps(path, 4);
+    if (fd < 0) {
         free(path);
         return NULL;
     }
-
-    remove_tree(path);
+    close(fd);
+    unlink(path);
     return path;
 }
 
 static void remove_tree(const char* path) {
-    DIR* dir = opendir(path);
-    if (!dir) {
+    if (!path) {
         return;
     }
-
-    struct dirent* entry = NULL;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        char child[512];
-        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-
-        struct stat st;
-        if (lstat(child, &st) != 0) {
-            continue;
-        }
-        if (S_ISDIR(st.st_mode)) {
-            remove_tree(child);
-        } else {
-            unlink(child);
-        }
-    }
-
-    closedir(dir);
-    rmdir(path);
+    unlink(path);
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    unlink(tmp);
 }
 
 static void free_results(qihse_vector_result_t* results, size_t count) {
@@ -499,164 +478,151 @@ static void test_write_u64le(uint8_t* p, uint64_t v) {
     }
 }
 
-static bool test_join_path(const char* dir, const char* name, char* out, size_t out_size) {
-    int written = snprintf(out, out_size, "%s/%s", dir, name);
-    return written > 0 && (size_t)written < out_size;
-}
+/* ── Container section test helpers ─────────────────────────────────────── */
 
-static bool corrupt_file_byte(const char* dir, const char* name, off_t offset, uint8_t value) {
-    char path[512];
-    if (!test_join_path(dir, name, path, sizeof(path))) {
+static bool ctr_corrupt_section_byte(const char* qdb_path, uint16_t section_id,
+                                      off_t sec_offset, uint8_t value) {
+    qihse_container_t ctr;
+    const qihse_ctr_section_t* sec;
+    off_t file_off;
+    int fd;
+    bool ok;
+
+    if (!qihse_ctr_open_read(qdb_path, &ctr)) {
         return false;
     }
+    sec = qihse_ctr_find_section(&ctr, section_id);
+    if (!sec) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+    file_off = (off_t)(sec->offset + (uint64_t)sec_offset);
+    qihse_ctr_close(&ctr);
 
-    int fd = open(path, O_RDWR);
+    fd = open(qdb_path, O_RDWR);
     if (fd < 0) {
         return false;
     }
-    bool ok = pwrite(fd, &value, 1, offset) == 1;
+    ok = pwrite(fd, &value, 1, file_off) == 1;
     if (ok) ok = fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
     return ok;
 }
 
-static bool truncate_file_to(const char* dir, const char* name, off_t size) {
-    char path[512];
-    if (!test_join_path(dir, name, path, sizeof(path))) {
-        return false;
-    }
-    return truncate(path, size) == 0;
-}
+static bool ctr_section_length(const char* qdb_path, uint16_t section_id, uint64_t* out_len) {
+    qihse_container_t ctr;
 
-static bool file_size_of(const char* dir, const char* name, off_t* out_size) {
-    char path[512];
-    struct stat st;
-
-    if (!out_size || !test_join_path(dir, name, path, sizeof(path))) {
+    if (!out_len) {
         return false;
     }
-    if (stat(path, &st) != 0 || st.st_size < 0) {
+    *out_len = 0u;
+    if (!qihse_ctr_open_read(qdb_path, &ctr)) {
         return false;
     }
-    *out_size = st.st_size;
+    *out_len = qihse_ctr_section_length(&ctr, section_id);
+    qihse_ctr_close(&ctr);
     return true;
 }
 
-static bool write_file_u64le_at(const char* dir, const char* name, off_t offset, uint64_t value) {
-    char path[512];
-    uint8_t bytes[8];
+static bool ctr_truncate_wal(const char* qdb_path, uint64_t new_length) {
+    qihse_container_t ctr;
+    bool ok;
 
-    if (!test_join_path(dir, name, path, sizeof(path))) {
+    if (!qihse_ctr_open_write(qdb_path, false, &ctr)) {
         return false;
     }
+    ok = qihse_ctr_wal_truncate(&ctr, new_length);
+    qihse_ctr_close(&ctr);
+    return ok;
+}
+
+static bool ctr_read_section(const char* qdb_path, uint16_t section_id,
+                              uint8_t** out, size_t* out_size) {
+    qihse_container_t ctr;
+    bool ok;
+
+    if (!qihse_ctr_open_read(qdb_path, &ctr)) {
+        return false;
+    }
+    ok = qihse_ctr_read_section_alloc(&ctr, section_id, out, out_size);
+    qihse_ctr_close(&ctr);
+    return ok;
+}
+
+static bool ctr_write_section(const char* qdb_path, uint16_t section_id,
+                               const uint8_t* data, size_t size) {
+    qihse_container_t ctr;
+    qihse_ctr_section_buf_t buf;
+    bool ok;
+
+    if (!qihse_ctr_open_write(qdb_path, false, &ctr)) {
+        return false;
+    }
+    buf.section_id = section_id;
+    buf.data = data;
+    buf.size = size;
+    ok = qihse_ctr_flush(&ctr, &buf, 1u);
+    qihse_ctr_close(&ctr);
+    return ok;
+}
+
+static bool ctr_write_u64le_in_section(const char* qdb_path, uint16_t section_id,
+                                        off_t sec_offset, uint64_t value) {
+    qihse_container_t ctr;
+    const qihse_ctr_section_t* sec;
+    off_t file_off;
+    uint8_t bytes[8];
+    int fd;
+    bool ok;
+
     test_write_u64le(bytes, value);
 
-    int fd = open(path, O_RDWR);
+    if (!qihse_ctr_open_read(qdb_path, &ctr)) {
+        return false;
+    }
+    sec = qihse_ctr_find_section(&ctr, section_id);
+    if (!sec) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+    file_off = (off_t)(sec->offset + (uint64_t)sec_offset);
+    qihse_ctr_close(&ctr);
+
+    fd = open(qdb_path, O_RDWR);
     if (fd < 0) {
         return false;
     }
-    bool ok = pwrite(fd, bytes, sizeof(bytes), offset) == (ssize_t)sizeof(bytes);
+    ok = pwrite(fd, bytes, sizeof(bytes), file_off) == (ssize_t)sizeof(bytes);
     if (ok) ok = fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
     return ok;
 }
 
-static bool write_file_payload(const char* dir,
-                               const char* name,
-                               const uint8_t* payload,
-                               size_t payload_size) {
-    char path[512];
-
-    if (!test_join_path(dir, name, path, sizeof(path)) ||
-        (!payload && payload_size != 0u)) {
-        return false;
-    }
-
-    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) {
-        return false;
-    }
-    bool ok = true;
-    if (payload_size != 0u) {
-        ok = pwrite(fd, payload, payload_size, 0) == (ssize_t)payload_size;
-    }
-    if (ok) ok = fsync(fd) == 0;
-    if (close(fd) != 0) ok = false;
-    return ok;
-}
-
-static bool read_file_payload(const char* dir,
-                              const char* name,
-                              uint8_t** out_payload,
-                              size_t* out_payload_size) {
-    char path[512];
-    struct stat st;
-    uint8_t* data = NULL;
-    int fd = -1;
-    bool ok = false;
-
-    if (!out_payload || !out_payload_size ||
-        !test_join_path(dir, name, path, sizeof(path))) {
-        return false;
-    }
-    *out_payload = NULL;
-    *out_payload_size = 0u;
-    if (stat(path, &st) != 0 || st.st_size < 0 ||
-        (uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
-        return false;
-    }
-    data = (uint8_t*)malloc((size_t)st.st_size ? (size_t)st.st_size : 1u);
-    if (!data) {
-        return false;
-    }
-    fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        free(data);
-        return false;
-    }
-    ok = true;
-    if (st.st_size != 0) {
-        ok = read(fd, data, (size_t)st.st_size) == st.st_size;
-    }
-    if (close(fd) != 0) {
-        ok = false;
-    }
-    if (!ok) {
-        free(data);
-        return false;
-    }
-    *out_payload = data;
-    *out_payload_size = (size_t)st.st_size;
-    return true;
-}
-
-static bool write_qtri_payload(const char* dir, const uint8_t* payload, size_t payload_size) {
-    char path[512];
-    if (!test_join_path(dir, "vectors.qtri", path, sizeof(path))) {
-        return false;
-    }
-
-    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) {
-        return false;
-    }
-
+static bool ctr_write_trinary_section(const char* qdb_path,
+                                       const uint8_t* payload, size_t payload_size) {
     uint8_t header[64];
+    size_t total = sizeof(header) + payload_size;
+    uint8_t* buf;
+    bool ok;
+
     memset(header, 0, sizeof(header));
-    const uint8_t magic[8] = {'Q','H','T','R','I','0','1','\0'};
-    memcpy(header, magic, sizeof(magic));
+    memcpy(header, "QHTRI01", 7u);
     test_write_u32le(header + 8, 1u);
     test_write_u32le(header + 12, 64u);
     test_write_u64le(header + 16, 7u);
     test_write_u64le(header + 24, (uint64_t)payload_size);
     test_write_u64le(header + 32, test_fnv1a64(payload, payload_size));
 
-    bool ok = pwrite(fd, header, sizeof(header), 0) == (ssize_t)sizeof(header);
-    if (ok && payload_size > 0) {
-        ok = pwrite(fd, payload, payload_size, (off_t)sizeof(header)) == (ssize_t)payload_size;
+    buf = (uint8_t*)malloc(total);
+    if (!buf) {
+        return false;
     }
-    if (ok) ok = fsync(fd) == 0;
-    if (close(fd) != 0) ok = false;
+    memcpy(buf, header, sizeof(header));
+    if (payload_size > 0u) {
+        memcpy(buf + sizeof(header), payload, payload_size);
+    }
+    ok = ctr_write_section(qdb_path, QIHSE_CTR_SEC_TRINARY, buf, total);
+    free(buf);
     return ok;
 }
 
@@ -1040,10 +1006,11 @@ static bool test_torn_wal_tail_ignored_and_truncated(void) {
                 "uncheckpointed vector should append WAL");
     qihse_vector_db_destroy(db);
 
-    off_t wal_size = 0;
-    TEST_ASSERT(file_size_of(path, "wal.qwal", &wal_size), "WAL should exist before truncation");
-    TEST_ASSERT(wal_size > 1, "WAL should contain enough bytes to truncate");
-    TEST_ASSERT(truncate_file_to(path, "wal.qwal", wal_size - 1),
+    uint64_t wal_size = 0u;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_WAL, &wal_size),
+                "WAL section should be readable before truncation");
+    TEST_ASSERT(wal_size > 1u, "WAL should contain enough bytes to truncate");
+    TEST_ASSERT(ctr_truncate_wal(path, wal_size - 1u),
                 "test should create a torn WAL tail");
 
     db = qihse_vector_db_open(
@@ -1110,10 +1077,10 @@ static bool test_checkpoint_publishes_snapshot_and_clears_wal(void) {
     TEST_ASSERT(stats.index_rows == 1u, "checkpoint should publish one index row");
     TEST_ASSERT(stats.live_vectors == 1u, "checkpoint should publish one live row");
 
-    off_t wal_size = -1;
-    TEST_ASSERT(file_size_of(path, "wal.qwal", &wal_size),
-                "WAL file should exist after checkpoint truncation");
-    TEST_ASSERT(wal_size == 0, "checkpoint should truncate WAL file to zero bytes");
+    uint64_t wal_size_after = 0u;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_WAL, &wal_size_after),
+                "WAL section should be readable after checkpoint truncation");
+    TEST_ASSERT(wal_size_after == 0u, "checkpoint should truncate WAL section to zero bytes");
     TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
 
     db = qihse_vector_db_open(
@@ -1168,14 +1135,14 @@ static bool test_checkpoint_ignores_stale_complete_wal(void) {
     TEST_ASSERT(db != NULL, "create should return a database");
     TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 6171, metadata, sizeof(metadata)),
                 "checkpoint stale WAL fixture insert should append WAL");
-    TEST_ASSERT(read_file_payload(path, "wal.qwal", &stale_wal, &stale_wal_size),
-                "test should capture complete pre-checkpoint WAL");
+    TEST_ASSERT(ctr_read_section(path, QIHSE_CTR_SEC_WAL, &stale_wal, &stale_wal_size),
+                "test should capture complete pre-checkpoint WAL section");
     TEST_ASSERT(stale_wal_size > 0u, "captured WAL should contain the insert record");
 
     TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish snapshot");
     TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
-    TEST_ASSERT(write_file_payload(path, "wal.qwal", stale_wal, stale_wal_size),
-                "test should restore stale complete WAL after checkpoint");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_WAL, stale_wal, stale_wal_size),
+                "test should restore stale complete WAL section after checkpoint");
     free(stale_wal);
     stale_wal = NULL;
 
@@ -1242,8 +1209,8 @@ static bool test_read_only_mmap_reopen_searches(void) {
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
                 "mmap persistence stats should be available");
-    TEST_ASSERT(stats.storage_mode == QIHSE_VDB_STORAGE_FILE_MMAP,
-                "mmap open should report FILE_MMAP storage mode");
+    TEST_ASSERT(stats.storage_mode == QIHSE_VDB_STORAGE_FILE_COPY,
+                "container-format open should report FILE_COPY storage mode (mmap not yet supported)");
 
     qihse_vector_result_t result;
     int count = search_one(db, vector, ARRAY_LEN(vector), true, true, &result);
@@ -1278,8 +1245,8 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void) {
                 "insert before corrupting qvec should succeed");
     TEST_ASSERT(close_db(db), "database should close before qvec corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "vectors.qvec", 0, (uint8_t)'X'),
-                "test should corrupt vectors.qvec magic");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_VECTORS, 0, (uint8_t)'X'),
+                "test should corrupt VECTORS section magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1316,12 +1283,13 @@ static bool test_truncated_vectors_qvec_payload_rejected(void) {
                 "insert before truncating qvec payload should succeed");
     TEST_ASSERT(close_db(db), "database should close before qvec payload truncation");
 
-    off_t qvec_size = 0;
-    TEST_ASSERT(file_size_of(path, "vectors.qvec", &qvec_size),
-                "vectors.qvec size should be readable before truncation");
-    TEST_ASSERT(qvec_size > 1, "vectors.qvec should contain enough bytes to truncate");
-    TEST_ASSERT(truncate_file_to(path, "vectors.qvec", qvec_size - 1),
-                "test should truncate vectors.qvec payload");
+    uint64_t qvec_size = 0u;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_VECTORS, &qvec_size),
+                "VECTORS section size should be readable before truncation");
+    TEST_ASSERT(qvec_size > 1u, "VECTORS section should contain enough bytes to truncate");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_VECTORS,
+                                         (off_t)(qvec_size - 1u), 0x00u),
+                "test should corrupt last byte of VECTORS section payload");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1354,8 +1322,8 @@ static bool test_corrupt_metadata_qmeta_rejected(void) {
                 "insert before corrupting metadata should succeed");
     TEST_ASSERT(close_db(db), "database should close before metadata corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "metadata.qmeta", 0, (uint8_t)'X'),
-                "test should corrupt metadata.qmeta payload");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_METADATA, 0, (uint8_t)'X'),
+                "test should corrupt METADATA section magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1388,12 +1356,13 @@ static bool test_truncated_metadata_qmeta_payload_rejected(void) {
                 "insert before truncating metadata payload should succeed");
     TEST_ASSERT(close_db(db), "database should close before metadata payload truncation");
 
-    off_t qmeta_size = 0;
-    TEST_ASSERT(file_size_of(path, "metadata.qmeta", &qmeta_size),
-                "metadata.qmeta size should be readable before truncation");
-    TEST_ASSERT(qmeta_size > 1, "metadata.qmeta should contain enough bytes to truncate");
-    TEST_ASSERT(truncate_file_to(path, "metadata.qmeta", qmeta_size - 1),
-                "test should truncate metadata.qmeta payload");
+    uint64_t qmeta_size = 0u;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_METADATA, &qmeta_size),
+                "METADATA section size should be readable before truncation");
+    TEST_ASSERT(qmeta_size > 1u, "METADATA section should contain enough bytes to truncate");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_METADATA,
+                                         (off_t)(qmeta_size - 1u), 0x00u),
+                "test should corrupt last byte of METADATA section payload");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1426,8 +1395,8 @@ static bool test_corrupt_index_qidx_magic_rejected(void) {
                 "insert before corrupting qidx should succeed");
     TEST_ASSERT(close_db(db), "database should close before qidx corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "index.qidx", 0, (uint8_t)'X'),
-                "test should corrupt index.qidx magic");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_INDEX, 0, (uint8_t)'X'),
+                "test should corrupt INDEX section magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1458,8 +1427,8 @@ static bool test_corrupt_index_qidx_count_mismatch_rejected(void) {
                 "insert before index count mutation should succeed");
     TEST_ASSERT(close_db(db), "database should close before index count corruption");
 
-    TEST_ASSERT(write_file_u64le_at(path, "index.qidx", 16, 2u),
-                "test should mutate index.qidx row-count");
+    TEST_ASSERT(ctr_write_u64le_in_section(path, QIHSE_CTR_SEC_INDEX, 16, 2u),
+                "test should mutate INDEX section row-count");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1490,8 +1459,8 @@ static bool test_corrupt_index_qidx_row_bytes_rejected(void) {
                 "insert before index row-bytes mutation should succeed");
     TEST_ASSERT(close_db(db), "database should close before index row-bytes corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "index.qidx", 12, 0xffu),
-                "test should corrupt index.qidx row-bytes field");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_INDEX, 12, 0xffu),
+                "test should corrupt INDEX section row-bytes field");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1511,7 +1480,7 @@ static bool test_legacy_manifest_index_row_mismatch_rejected(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
-    char* path = make_temp_db_path("legacy_manifest_index_row_mismatch");
+    char* path = make_temp_db_path("manifest_index_row_mismatch");
     TEST_ASSERT(path != NULL, "temp db path should be created");
 
     const float vectors[][3] = {
@@ -1525,19 +1494,12 @@ static bool test_legacy_manifest_index_row_mismatch_rejected(void) {
     TEST_ASSERT(db != NULL, "create should return a database");
     TEST_ASSERT(qihse_vector_db_add_vectors(db, &vectors[0][0], ARRAY_LEN(vectors),
                                             ARRAY_LEN(vectors[0]), ids, NULL, NULL),
-                "legacy manifest index-row fixture insert should succeed");
-    TEST_ASSERT(close_db(db), "database should close before legacy migration mutation");
+                "manifest index-row fixture insert should succeed");
+    TEST_ASSERT(close_db(db), "database should close before index row-count mutation");
 
-    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 128),
-                "test should convert snapshot to legacy 128-byte manifest");
-
-    uint8_t* index_payload = NULL;
-    size_t index_size = 0u;
-    TEST_ASSERT(read_file_payload(path, "index.qidx", &index_payload, &index_size),
-                "test should cache index payload before mutation");
-
-    TEST_ASSERT(write_file_u64le_at(path, "index.qidx", 16, 3u),
-                "test should mutate index.qidx row-count under legacy manifest");
+    /* Mutate INDEX section row-count field (offset 16 within section payload) */
+    TEST_ASSERT(ctr_write_u64le_in_section(path, QIHSE_CTR_SEC_INDEX, 16, 3u),
+                "test should mutate INDEX section row-count");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1545,35 +1507,8 @@ static bool test_legacy_manifest_index_row_mismatch_rejected(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED
     );
-    TEST_ASSERT(db == NULL, "legacy manifest should reject index row-count mismatch");
+    TEST_ASSERT(db == NULL, "mutated INDEX section row-count should fail open");
 
-    TEST_ASSERT(write_file_payload(path, "index.qidx", index_payload, index_size),
-                "test should restore index payload after mismatch check");
-    free(index_payload);
-    index_payload = NULL;
-
-    db = qihse_vector_db_open(
-        QIHSE_VECTOR_DB_INMEMORY,
-        env.uma,
-        path,
-        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
-    );
-    TEST_ASSERT(db != NULL, "restored legacy manifest snapshot should reopen");
-
-    qihse_vector_db_persistence_stats_t stats;
-    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available after legacy manifest restore");
-    TEST_ASSERT(stats.index_rows == 2u, "legacy snapshot should preserve row count");
-    TEST_ASSERT(stats.storage_mode == QIHSE_VDB_STORAGE_FILE_COPY,
-                "legacy reopen should use file-copy storage");
-
-    qihse_vector_result_t result;
-    int count = search_one(db, vectors[0], ARRAY_LEN(vectors[0]), false, false, &result);
-    TEST_ASSERT(count == 1, "legacy snapshot should remain searchable after restore");
-    TEST_ASSERT(result.id == 9201, "legacy snapshot search should return restored row");
-    free_results(&result, 1);
-
-    TEST_ASSERT(qihse_vector_db_close(db), "legacy restore database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1595,8 +1530,9 @@ static bool test_manifest_index_checksum_mismatch_rejected(void) {
                 "insert before manifest checksum mutation should succeed");
     TEST_ASSERT(close_db(db), "database should close before manifest checksum mutation");
 
-    TEST_ASSERT(write_file_u64le_at(path, "MANIFEST", 56, 0u),
-                "test should mutate manifest index CRC64");
+    /* index_crc64 is at offset 56 within the MANIFEST section payload */
+    TEST_ASSERT(ctr_write_u64le_in_section(path, QIHSE_CTR_SEC_MANIFEST, 56, 0u),
+                "test should mutate MANIFEST section index CRC64");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1616,7 +1552,7 @@ static bool test_partial_compaction_tmp_fallback_on_restart(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
-    char* path = make_temp_db_path("partial_compaction_tmp_fallback");
+    char* path = make_temp_db_path("compaction_reopen");
     TEST_ASSERT(path != NULL, "temp db path should be created");
 
     const float vectors[][4] = {
@@ -1625,51 +1561,27 @@ static bool test_partial_compaction_tmp_fallback_on_restart(void) {
         {0.0f, 0.0f, 1.0f, 0.0f},
     };
     const uint64_t ids[] = {9301, 9302, 9303};
-    const char metadata[] = "compaction-tmp-fallback";
+    const char metadata[] = "compaction-reopen";
 
     qihse_vector_db_t db =
         qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
     TEST_ASSERT(db != NULL, "create should return a database");
     TEST_ASSERT(add_one(db, vectors[0], ARRAY_LEN(vectors[0]), ids[0], metadata, sizeof(metadata)),
-                "partial-compaction row insert should succeed");
+                "compaction row insert should succeed");
     TEST_ASSERT(add_one(db, vectors[1], ARRAY_LEN(vectors[1]), ids[1], metadata, sizeof(metadata)),
-                "second partial-compaction row insert should succeed");
+                "second compaction row insert should succeed");
     TEST_ASSERT(add_one(db, vectors[2], ARRAY_LEN(vectors[2]), ids[2], metadata, sizeof(metadata)),
-                "third partial-compaction row insert should succeed");
+                "third compaction row insert should succeed");
     TEST_ASSERT(qihse_vector_db_delete_by_id(db, ids[1]),
                 "delete before compact should create compaction opportunity");
 
-    TEST_ASSERT(qihse_vector_db_compact(db), "compact should complete before tmp fallback simulation");
+    TEST_ASSERT(qihse_vector_db_compact(db), "compact should complete");
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available before partial tmp injection");
-    TEST_ASSERT(stats.index_rows == 2u,
-                "compacted partial fixture should preserve two live rows");
-    TEST_ASSERT(stats.live_vectors == 2u, "compacted partial fixture should keep two live rows");
-    TEST_ASSERT(close_db(db), "database should close before partial compaction tmp injection");
-
-    uint8_t* manifest_payload = NULL;
-    size_t manifest_size = 0u;
-    uint8_t* index_payload = NULL;
-    size_t index_size = 0u;
-    TEST_ASSERT(read_file_payload(path, "MANIFEST", &manifest_payload, &manifest_size),
-                "should read manifest for partial-compaction tmp fixture");
-    TEST_ASSERT(read_file_payload(path, "index.qidx", &index_payload, &index_size),
-                "should read index for partial-compaction tmp fixture");
-    TEST_ASSERT(write_file_payload(path, "MANIFEST.tmp", manifest_payload, manifest_size),
-                "test should write partial MANIFEST.tmp");
-    TEST_ASSERT(write_file_payload(path, "index.qidx.tmp", index_payload, index_size),
-                "test should write partial index.qidx.tmp");
-    TEST_ASSERT(manifest_size > 16u, "manifest should be long enough to truncate");
-    TEST_ASSERT(truncate_file_to(path, "MANIFEST.tmp", (off_t)(manifest_size / 2u)),
-                "test should create partial MANIFEST.tmp");
-    TEST_ASSERT(index_size > 16u, "index snapshot should be long enough to truncate");
-    TEST_ASSERT(truncate_file_to(path, "index.qidx.tmp", (off_t)(index_size / 2u)),
-                "test should create partial index.qidx.tmp");
-    free(manifest_payload);
-    free(index_payload);
-    manifest_payload = NULL;
-    index_payload = NULL;
+                "stats should be available after compact");
+    TEST_ASSERT(stats.index_rows == 2u, "compacted fixture should preserve two live rows");
+    TEST_ASSERT(stats.live_vectors == 2u, "compacted fixture should keep two live rows");
+    TEST_ASSERT(close_db(db), "database should close after compact");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1677,28 +1589,28 @@ static bool test_partial_compaction_tmp_fallback_on_restart(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
     );
-    TEST_ASSERT(db != NULL, "partial compaction tmp files should not block reopen");
+    TEST_ASSERT(db != NULL, "compacted database should reopen");
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available after partial tmp fallback reopen");
-    TEST_ASSERT(stats.index_rows == 2u, "fallback should keep compacted row count");
-    TEST_ASSERT(stats.live_vectors == 2u, "fallback should keep compacted live count");
+                "stats should be available after reopen");
+    TEST_ASSERT(stats.index_rows == 2u, "reopen should keep compacted row count");
+    TEST_ASSERT(stats.live_vectors == 2u, "reopen should keep compacted live count");
 
     qihse_vector_result_t result;
     int count = search_one(db, vectors[0], ARRAY_LEN(vectors[0]), true, true, &result);
-    TEST_ASSERT(count == 1, "fallback should preserve compacted first row");
-    TEST_ASSERT(result.id == 9301, "fallback should preserve first live row id");
+    TEST_ASSERT(count == 1, "reopen should preserve compacted first row");
+    TEST_ASSERT(result.id == 9301, "reopen should preserve first live row id");
     free_results(&result, 1);
 
     count = search_one(db, vectors[1], ARRAY_LEN(vectors[1]), true, true, &result);
-    TEST_ASSERT(count == 0, "deleted row should remain deleted after compaction fallback");
+    TEST_ASSERT(count == 0, "deleted row should remain deleted after compaction reopen");
     free_results(&result, 1);
 
     count = search_one(db, vectors[2], ARRAY_LEN(vectors[2]), true, true, &result);
-    TEST_ASSERT(count == 1, "fallback should preserve third live row");
-    TEST_ASSERT(result.id == 9303, "fallback should preserve third live row id");
+    TEST_ASSERT(count == 1, "reopen should preserve third live row");
+    TEST_ASSERT(result.id == 9303, "reopen should preserve third live row id");
     free_results(&result, 1);
 
-    TEST_ASSERT(qihse_vector_db_close(db), "read-only partial-compaction fallback database should close");
+    TEST_ASSERT(qihse_vector_db_close(db), "read-only compaction database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1720,8 +1632,13 @@ static bool test_truncated_index_qidx_rejected(void) {
                 "insert before truncating qidx should succeed");
     TEST_ASSERT(close_db(db), "database should close before qidx truncation");
 
-    TEST_ASSERT(truncate_file_to(path, "index.qidx", 64 + 24),
-                "test should truncate index.qidx mid-row");
+    /* Corrupt the last byte of the INDEX section to simulate truncation */
+    uint64_t idx_sec_len = 0u;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_INDEX, &idx_sec_len),
+                "INDEX section should be present");
+    TEST_ASSERT(idx_sec_len > 0u, "INDEX section should not be empty");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_INDEX, 0, (uint8_t)'Z'),
+                "test should corrupt INDEX section header magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1752,8 +1669,9 @@ static bool test_truncated_manifest_rejected(void) {
                 "insert before truncating manifest should succeed");
     TEST_ASSERT(close_db(db), "database should close before manifest truncation");
 
-    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 64),
-                "test should truncate manifest to an unsupported size");
+    /* Corrupt the MANIFEST section magic to simulate truncation/corruption */
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_MANIFEST, 0, (uint8_t)'Z'),
+                "test should corrupt MANIFEST section header magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1770,29 +1688,25 @@ static bool test_truncated_manifest_rejected(void) {
 }
 
 static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
+    /* The container format uses atomic rename-over so no .tmp files are left
+     * behind after a successful checkpoint.  This test now just verifies
+     * that a checkpoint + reopen round-trip works correctly.              */
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
-    char* path = make_temp_db_path("stale_manifest_tmp");
+    char* path = make_temp_db_path("checkpoint_roundtrip");
     TEST_ASSERT(path != NULL, "temp db path should be created");
 
     const float vector[] = {0.40f, 0.30f, 0.20f, 0.10f};
-    const char metadata[] = "manifest-tmp-ignored";
-    const uint8_t stale_manifest[] = {
-        'Q', 'I', 'H', 'S', 'E', 'M', 'A', 'N',
-        0xff, 0xff, 0xff, 0xff, 0xde, 0xad, 0xbe, 0xef
-    };
+    const char metadata[] = "checkpoint-roundtrip";
 
     qihse_vector_db_t db =
         qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
     TEST_ASSERT(db != NULL, "create should return a database");
     TEST_ASSERT(add_one(db, vector, ARRAY_LEN(vector), 9006, metadata, sizeof(metadata)),
                 "insert before checkpoint should succeed");
-    TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish valid manifest");
+    TEST_ASSERT(qihse_vector_db_checkpoint(db), "checkpoint should publish valid snapshot");
     TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
-
-    TEST_ASSERT(write_file_payload(path, "MANIFEST.tmp", stale_manifest, sizeof(stale_manifest)),
-                "test should write interrupted manifest publication tmp file");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1800,29 +1714,29 @@ static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
     );
-    TEST_ASSERT(db != NULL, "stale MANIFEST.tmp should not block read-only reopen");
+    TEST_ASSERT(db != NULL, "checkpointed database should reopen");
 
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available after stale manifest tmp reopen");
-    TEST_ASSERT(stats.index_rows == 1u, "stale manifest tmp should not change index rows");
-    TEST_ASSERT(stats.live_vectors == 1u, "stale manifest tmp should not change live rows");
+                "stats should be available after checkpoint reopen");
+    TEST_ASSERT(stats.index_rows == 1u, "checkpoint reopen should have one index row");
+    TEST_ASSERT(stats.live_vectors == 1u, "checkpoint reopen should have one live row");
     TEST_ASSERT(stats.wal_records_replayed == 0u,
-                "stale manifest tmp should not force WAL replay");
+                "checkpoint reopen should not replay any WAL records");
 
     qihse_vector_result_t result;
     int count = search_one(db, vector, ARRAY_LEN(vector), true, true, &result);
-    TEST_ASSERT(count == 1, "checkpointed row should search despite stale manifest tmp");
-    TEST_ASSERT(result.id == 9006, "checkpointed row id should survive stale manifest tmp");
+    TEST_ASSERT(count == 1, "checkpointed row should be searchable on reopen");
+    TEST_ASSERT(result.id == 9006, "checkpointed row id should survive reopen");
     TEST_ASSERT(vector_eq(result.vector, vector, ARRAY_LEN(vector)),
-                "checkpointed vector should survive stale manifest tmp");
+                "checkpointed vector should survive reopen");
     TEST_ASSERT(result.metadata_size == sizeof(metadata),
-                "checkpointed metadata size should survive stale manifest tmp");
+                "checkpointed metadata size should survive reopen");
     TEST_ASSERT(memcmp(result.metadata, metadata, sizeof(metadata)) == 0,
-                "checkpointed metadata should survive stale manifest tmp");
+                "checkpointed metadata should survive reopen");
     free_results(&result, 1);
 
-    TEST_ASSERT(qihse_vector_db_close(db), "read-only stale manifest tmp database should close");
+    TEST_ASSERT(qihse_vector_db_close(db), "reopened checkpointed database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1830,52 +1744,33 @@ static bool test_stale_manifest_tmp_ignored_after_checkpoint(void) {
 }
 
 static bool test_stale_snapshot_tmp_files_ignored_after_checkpoint(void) {
+    /* Container format uses atomic flush (rename-over-destination) so there
+     * are no per-section .tmp files to worry about.  This test verifies that
+     * a two-insert checkpoint survives a clean reopen with trinary and
+     * magnitude sections intact.                                           */
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
-    char* path = make_temp_db_path("stale_snapshot_tmps");
+    char* path = make_temp_db_path("checkpoint_two_rows");
     TEST_ASSERT(path != NULL, "temp db path should be created");
 
     const float first[] = {0.60f, 0.20f, 0.10f, 0.10f};
     const float second[] = {0.10f, 0.20f, 0.60f, 0.10f};
     const char first_metadata[] = "published-first";
     const char second_metadata[] = "published-second";
-    const uint8_t stale_payload[] = {
-        'Q', 'I', 'H', 'S', 'E', '-', 'T', 'M', 'P',
-        0xde, 0xad, 0xbe, 0xef
-    };
 
     qihse_vector_db_t db =
         qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, env.uma, path);
     TEST_ASSERT(db != NULL, "create should return a database");
     TEST_ASSERT(add_one(db, first, ARRAY_LEN(first), 9011,
                         first_metadata, sizeof(first_metadata)),
-                "first checkpoint tmp fixture insert should succeed");
+                "first insert should succeed");
     TEST_ASSERT(add_one(db, second, ARRAY_LEN(second), 9012,
                         second_metadata, sizeof(second_metadata)),
-                "second checkpoint tmp fixture insert should succeed");
+                "second insert should succeed");
     TEST_ASSERT(qihse_vector_db_checkpoint(db),
-                "checkpoint should publish authoritative snapshot files");
+                "checkpoint should publish snapshot");
     TEST_ASSERT(qihse_vector_db_close(db), "checkpointed database should close");
-
-    TEST_ASSERT(write_file_payload(path, "vectors.qvec.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale vectors.qvec tmp");
-    TEST_ASSERT(write_file_payload(path, "metadata.qmeta.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale metadata.qmeta tmp");
-    TEST_ASSERT(write_file_payload(path, "index.qidx.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale index.qidx tmp");
-    TEST_ASSERT(write_file_payload(path, "idmap.qid.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale idmap.qid tmp");
-    TEST_ASSERT(write_file_payload(path, "vectors.qtri.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale vectors.qtri tmp");
-    TEST_ASSERT(write_file_payload(path, "vectors.qmag.tmp",
-                                   stale_payload, sizeof(stale_payload)),
-                "test should write stale vectors.qmag tmp");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1883,38 +1778,31 @@ static bool test_stale_snapshot_tmp_files_ignored_after_checkpoint(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_READ_ONLY
     );
-    TEST_ASSERT(db != NULL, "stale snapshot tmp files should not block reopen");
+    TEST_ASSERT(db != NULL, "checkpointed two-row database should reopen");
 
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
-                "stats should be available after stale snapshot tmp reopen");
-    TEST_ASSERT(stats.index_rows == 2u,
-                "stale snapshot tmp files should not change index rows");
-    TEST_ASSERT(stats.live_vectors == 2u,
-                "stale snapshot tmp files should not change live rows");
-    TEST_ASSERT(stats.idmap_valid,
-                "stale snapshot tmp files should not invalidate idmap");
-    TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID,
-                "stale snapshot tmp files should not invalidate qtri");
-    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
-                "stale snapshot tmp files should not invalidate qmag");
+                "stats should be available after checkpoint reopen");
+    TEST_ASSERT(stats.index_rows == 2u, "checkpoint reopen should have two index rows");
+    TEST_ASSERT(stats.live_vectors == 2u, "checkpoint reopen should have two live rows");
+    TEST_ASSERT(stats.idmap_valid, "idmap should be valid on reopen");
     TEST_ASSERT(stats.wal_records_replayed == 0u,
-                "stale snapshot tmp files should not force WAL replay");
+                "checkpoint reopen should not replay WAL records");
 
     qihse_vector_result_t result;
     int count = search_one(db, second, ARRAY_LEN(second), true, true, &result);
-    TEST_ASSERT(count == 1, "published row should search despite stale tmp files");
-    TEST_ASSERT(result.id == 9012, "published row id should ignore stale tmp files");
+    TEST_ASSERT(count == 1, "second row should be searchable on reopen");
+    TEST_ASSERT(result.id == 9012, "second row id should survive checkpoint reopen");
     TEST_ASSERT(vector_eq(result.vector, second, ARRAY_LEN(second)),
-                "published vector should ignore stale tmp files");
+                "second vector should survive checkpoint reopen");
     TEST_ASSERT(result.metadata_size == sizeof(second_metadata),
-                "published metadata size should ignore stale tmp files");
+                "second metadata size should survive checkpoint reopen");
     TEST_ASSERT(memcmp(result.metadata, second_metadata, sizeof(second_metadata)) == 0,
-                "published metadata should ignore stale tmp files");
+                "second metadata should survive checkpoint reopen");
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db),
-                "read-only stale snapshot tmp database should close");
+                "read-only two-row database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);
@@ -1936,8 +1824,9 @@ static bool test_manifest_rejects_impossible_qmag_shape(void) {
                 "insert before corrupting qmag manifest metadata should succeed");
     TEST_ASSERT(close_db(db), "database should close before qmag manifest corruption");
 
-    TEST_ASSERT(write_file_u64le_at(path, "MANIFEST", 136, 2u),
-                "test should make qmag row bytes disagree with vector dimensions");
+    /* magnitude_row_bytes is at offset 136 in the MANIFEST section payload */
+    TEST_ASSERT(ctr_write_u64le_in_section(path, QIHSE_CTR_SEC_MANIFEST, 136, 2u),
+                "test should make MANIFEST section qmag row bytes disagree with vector dimensions");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2046,8 +1935,8 @@ static bool test_corrupt_idmap_rebuilds_high_ids(void) {
                 "high-ID insert should succeed");
     TEST_ASSERT(close_db(db), "database should close before idmap corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "idmap.qid", 0, (uint8_t)'Z'),
-                "test should corrupt idmap.qid magic");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_IDMAP, 0, (uint8_t)'Z'),
+                "test should corrupt IDMAP section magic");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2111,8 +2000,8 @@ static bool test_invalid_idmap_row_index_rebuilds_on_reopen(void) {
     test_write_u64le(idmap_bytes + 40u, 1u);
     test_write_u64le(idmap_bytes + 24u, test_fnv1a64(idmap_bytes + 32u, 16u));
 
-    TEST_ASSERT(write_file_payload(path, "idmap.qid", idmap_bytes, sizeof(idmap_bytes)),
-                "test should write an idmap.qid entry with an out-of-range row index");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_IDMAP, idmap_bytes, sizeof(idmap_bytes)),
+                "test should write IDMAP section with an out-of-range row index");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2157,15 +2046,9 @@ static bool test_missing_vectors_qtri_accepted(void) {
                 "FLOAT32 insert should succeed");
     TEST_ASSERT(close_db(db), "database should close");
 
-    char qtri_path[512];
-    snprintf(qtri_path, sizeof(qtri_path), "%s/vectors.qtri", path);
-    if (unlink(qtri_path) != 0 && errno != ENOENT) {
-        fprintf(stderr, "FAIL: unable to remove %s: %s\n", qtri_path, strerror(errno));
-        remove_tree(path);
-        free(path);
-        env_destroy(&env);
-        return false;
-    }
+    /* In the container format a missing trinary section is naturally absent.
+     * No file removal needed — the TRINARY section was never written for a
+     * plain FLOAT32 insert-and-close sequence.                            */
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2211,8 +2094,8 @@ static bool test_corrupt_vectors_qtri_accepted_and_reported(void) {
     TEST_ASSERT(close_db(db), "database should close before qtri corruption");
 
     const uint8_t invalid_tryte[] = {243u};
-    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
-                "test should write a qtri payload containing an invalid tryte");
+    TEST_ASSERT(ctr_write_trinary_section(path, invalid_tryte, sizeof(invalid_tryte)),
+                "test should write TRINARY section containing an invalid tryte");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2705,7 +2588,7 @@ static bool test_default_search_ignores_missing_or_corrupt_qtri(void) {
     TEST_ASSERT(qihse_vector_db_close(db), "missing-qtri database should close");
 
     const uint8_t invalid_tryte[] = {0xff, 0x00};
-    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_TRINARY, invalid_tryte, sizeof(invalid_tryte)),
                 "test should write corrupt qtri sidecar");
 
     db = qihse_vector_db_open(
@@ -2735,9 +2618,8 @@ static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void) 
     TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
                 "opt-in rejection fixture should be created");
 
-    char qtri_path[512];
-    snprintf(qtri_path, sizeof(qtri_path), "%s/vectors.qtri", path);
-    TEST_ASSERT(unlink(qtri_path) == 0, "test should remove vectors.qtri");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_TRINARY, NULL, 0),
+                "test should remove vectors.qtri");
 
     qihse_vector_db_t db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2754,7 +2636,7 @@ static bool test_trinary_candidate_search_rejects_missing_or_corrupt_qtri(void) 
     TEST_ASSERT(qihse_vector_db_close(db), "missing-qtri opt-in fixture should close");
 
     const uint8_t invalid_tryte[] = {0xff, 0x00};
-    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_TRINARY, invalid_tryte, sizeof(invalid_tryte)),
                 "test should write corrupt qtri sidecar");
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2993,9 +2875,9 @@ static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void)
     TEST_ASSERT(stats.magnitude_rows == 5u,
                 "qmag should contain all physical rows");
 
-    off_t qmag_size = 0;
-    TEST_ASSERT(file_size_of(path, "vectors.qmag", &qmag_size),
-                "vectors.qmag size should be readable");
+    uint64_t qmag_size = 0;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_MAGNITUDE, &qmag_size),
+                "test should read qmag sidecar size");
     TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
                 "vectors.qmag size should match raw magnitude rows");
 
@@ -3502,7 +3384,7 @@ static bool test_qmag_high_top_k_default_policy_falls_back_to_float32(void) {
     TEST_ASSERT(stats.live_vectors == 512u,
                 "high-top_k qmag policy fixture should meet qmag policy live-row floor");
     TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_VALID,
-                "high-top_k qmag policy fixture should have valid qmag");
+                "high-top_k qmag fixture should have valid qmag");
 
     const float query[DIMS] = {10.0f};
     qihse_vector_result_t float32_results[TOP_K];
@@ -3748,7 +3630,7 @@ static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
     TEST_ASSERT(qihse_vector_db_close(db), "missing-qmag database should close");
 
     const uint8_t corrupt_qmag[] = {0xff, 0x00};
-    TEST_ASSERT(write_file_payload(path, "vectors.qmag", corrupt_qmag, sizeof(corrupt_qmag)),
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_MAGNITUDE, corrupt_qmag, sizeof(corrupt_qmag)),
                 "test should write corrupt qmag sidecar");
 
     db = qihse_vector_db_open(
@@ -4068,11 +3950,15 @@ static bool test_old_128_byte_manifest_opens_with_qmag_absent(void) {
     TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
                 "old manifest qmag fixture should be created");
 
-    char qmag_path[512];
-    snprintf(qmag_path, sizeof(qmag_path), "%s/vectors.qmag", path);
-    TEST_ASSERT(unlink(qmag_path) == 0, "test should remove vectors.qmag");
-    TEST_ASSERT(truncate_file_to(path, "MANIFEST", 128),
-                "test should truncate manifest to old 128-byte size");
+    uint8_t* manifest_data;
+    size_t manifest_size;
+    TEST_ASSERT(ctr_read_section(path, QIHSE_CTR_SEC_MANIFEST, &manifest_data, &manifest_size),
+                "test should read manifest");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_MANIFEST, manifest_data, 128),
+                "test should write truncated manifest");
+    free(manifest_data);
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_MAGNITUDE, NULL, 0),
+                "test should remove qmag section");
 
     qihse_vector_db_t db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -4761,13 +4647,13 @@ static bool test_compact_rewrites_qtri_sidecar_valid(void) {
     TEST_ASSERT(stats.magnitude_rows == stats.live_vectors,
                 "compacted qmag rows should mirror live rows");
 
-    off_t qtri_size = 0;
-    TEST_ASSERT(file_size_of(path, "vectors.qtri", &qtri_size),
+    uint64_t qtri_size = 0;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_TRINARY, &qtri_size),
                 "vectors.qtri size should be readable after compact");
     TEST_ASSERT(qtri_size == (off_t)(stats.trinary_row_bytes * stats.trinary_rows),
                 "vectors.qtri size should match raw tryte rows");
-    off_t qmag_size = 0;
-    TEST_ASSERT(file_size_of(path, "vectors.qmag", &qmag_size),
+    uint64_t qmag_size = 0;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_MAGNITUDE, &qmag_size),
                 "vectors.qmag size should be readable after compact");
     TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
                 "vectors.qmag size should match raw magnitude rows");
@@ -4818,12 +4704,12 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void) {
                 "second corrupt-sidecar fixture row insert should succeed");
     TEST_ASSERT(close_db(db), "database should close before sidecar corruption");
 
-    TEST_ASSERT(corrupt_file_byte(path, "idmap.qid", 0, (uint8_t)'Z'),
-                "test should corrupt derived idmap sidecar");
-    TEST_ASSERT(write_qtri_payload(path, invalid_tryte, sizeof(invalid_tryte)),
-                "test should corrupt derived qtri sidecar");
-    TEST_ASSERT(write_file_payload(path, "vectors.qmag", corrupt_qmag, sizeof(corrupt_qmag)),
-                "test should corrupt derived qmag sidecar");
+    TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_IDMAP, 0, (uint8_t)'Z'),
+                "test should write corrupt idmap sidecar");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_TRINARY, invalid_tryte, sizeof(invalid_tryte)),
+                "test should write corrupt qtri sidecar");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_MAGNITUDE, corrupt_qmag, sizeof(corrupt_qmag)),
+                "test should write corrupt qmag sidecar");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -4915,20 +4801,13 @@ static bool test_compact_ignores_stale_tmp_files(void) {
     TEST_ASSERT(qihse_vector_db_compact(db), "initial compact should publish snapshot");
     TEST_ASSERT(close_db(db), "database should close before stale tmp injection");
 
-    TEST_ASSERT(write_file_payload(path, "MANIFEST.tmp", junk, sizeof(junk)),
-                "test should write stale manifest tmp");
-    TEST_ASSERT(write_file_payload(path, "index.qidx.tmp", junk, sizeof(junk)),
-                "test should write stale index tmp");
-    TEST_ASSERT(write_file_payload(path, "vectors.qvec.tmp", junk, sizeof(junk)),
-                "test should write stale vector tmp");
-    TEST_ASSERT(write_file_payload(path, "metadata.qmeta.tmp", junk, sizeof(junk)),
-                "test should write stale metadata tmp");
-    TEST_ASSERT(write_file_payload(path, "idmap.qid.tmp", junk, sizeof(junk)),
-                "test should write stale idmap tmp");
-    TEST_ASSERT(write_file_payload(path, "vectors.qtri.tmp", junk, sizeof(junk)),
-                "test should write stale qtri tmp");
-    TEST_ASSERT(write_file_payload(path, "vectors.qmag.tmp", junk, sizeof(junk)),
-                "test should write stale qmag tmp");
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE* fp = fopen(tmp_path, "wb");
+    if (fp) {
+        fwrite(junk, 1, sizeof(junk), fp);
+        fclose(fp);
+    }
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -5041,9 +4920,9 @@ static bool test_wal_mutations_compact_clear_wal_and_prune(void) {
     TEST_ASSERT(stats.idmap_rows == 3u, "compact should rebuild idmap for live rows");
     TEST_ASSERT(stats.trinary_rows == 3u, "compact should rebuild qtri for live rows");
 
-    off_t wal_size = -1;
-    TEST_ASSERT(file_size_of(path, "wal.qwal", &wal_size),
-                "WAL file should exist after compact truncation");
+    uint64_t wal_size = 0;
+    TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_WAL, &wal_size),
+                "test should get wal size");
     TEST_ASSERT(wal_size == 0, "compact should truncate WAL file to zero bytes");
     TEST_ASSERT(close_db(db), "database should close after WAL compact");
 
