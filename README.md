@@ -6,7 +6,7 @@
 ## Quantum-Inspired Hilbert Space Expansion Search
 
 ### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
-NB:Readme is a tad aspirational,this is reflecting the end state of the pproject which i would say 90% done...but you know what they say about the last 10%
+NB:Readme is a tad aspirational,this is reflecting the end state of the pproject which i would say 90% done...but you know what they say about the last 10% see positioning notes
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
