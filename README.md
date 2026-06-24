@@ -22,6 +22,10 @@
 
 ---
 
+> **Positioning note:** This README is intentionally audacious and currently reads more like a full-scope manifesto than the final public positioning. The planned direction is captured in [POSITIONING_NOTES.md](POSITIONING_NOTES.md): separate stable, experimental, and planned claims; make benchmark/security evidence explicit; and tighten the language before the next serious push.
+
+---
+
 ## The Masterpiece of Data Architecture
 
 **QIHSE** is a native C database ecosystem and a systems engineering showcase built around a single, uncompromising rule:
