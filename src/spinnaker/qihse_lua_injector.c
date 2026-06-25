@@ -21,7 +21,11 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     if (!sandbox->L) return false;
     
     // Load standard libraries (math, string, table)
-    luaL_openlibs(sandbox->L);
+    /* Only load safe libraries — exclude io, os, debug, package */
+    luaL_requiref(sandbox->L, "math", luaopen_math, 1);
+    luaL_requiref(sandbox->L, "string", luaopen_string, 1);
+    luaL_requiref(sandbox->L, "table", luaopen_table, 1);
+    lua_pop(sandbox->L, 3);
     
     sandbox->active = true;
     sandbox->instruction_quota = max_instructions;

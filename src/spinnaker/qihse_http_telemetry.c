@@ -34,7 +34,7 @@ void* qihse_http_telemetry_thread(void* arg) {
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_addr.s_addr = inet_addr("127.0.0.1");
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return NULL;
@@ -69,7 +69,7 @@ void* qihse_http_telemetry_thread(void* arg) {
             char http_response[2048];
             snprintf(http_response, sizeof(http_response),
                      "HTTP/1.1 200 OK\r\n"
-                     "Access-Control-Allow-Origin: *\r\n"
+                     "Access-Control-Allow-Origin: http://localhost\r\n"
                      "Content-Type: application/json\r\n"
                      "Connection: close\r\n"
                      "Content-Length: %zu\r\n\r\n%s",

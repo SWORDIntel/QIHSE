@@ -1,0 +1,7 @@
+README.md
+qihse.c
+setup.py
+qihse.egg-info/PKG-INFO
+qihse.egg-info/SOURCES.txt
+qihse.egg-info/dependency_links.txt
+qihse.egg-info/top_level.txt

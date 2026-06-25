@@ -23,6 +23,7 @@
  * @param dims      The dimensionality of the vector.
  * @param hops      The number of recursive hops to perform (depth of traversal).
  * @param threshold The similarity distance threshold to define an implicit edge.
+ * @param user      Authenticated user used for every hop-level access check.
  * @return          Status code (0 for success, non-zero for error).
  */
 int qihse_search_recursive_implicit(
@@ -30,7 +31,8 @@ int qihse_search_recursive_implicit(
     const float *start_vec,
     size_t dims,
     int hops,
-    float threshold
+    float threshold,
+    struct qihse_user_s* user
 );
 
 #endif /* QIHSE_RECURSIVE_SEARCH_H */

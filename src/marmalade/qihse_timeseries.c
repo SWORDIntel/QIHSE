@@ -256,7 +256,7 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
             curr = curr->next;
             continue;
         }
-        if (user && !qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
+        if (!qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
             curr = curr->next;
             continue;
         }
@@ -332,7 +332,7 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
     
     for (uint64_t i = tail; i < head; i++) {
         uint64_t idx = i % QIHSE_RING_SIZE;
-        if (user && !qihse_auth_can_access(user, tsdb->cache[idx].classification, tsdb->cache[idx].sci_compartment)) {
+        if (!qihse_auth_can_access(user, tsdb->cache[idx].classification, tsdb->cache[idx].sci_compartment)) {
             continue;
         }
         if (tsdb->cache[idx].timestamp >= start_ts && tsdb->cache[idx].timestamp <= end_ts) {

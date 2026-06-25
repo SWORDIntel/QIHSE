@@ -54,16 +54,6 @@ static bool qihse_qdd_geoip_lookup_ctx(qihse_quantum_defense_ctx_t* ctx,
                                         char* out_city,    size_t city_len,
                                         char* out_asn,     size_t asn_len);
 
-static uint64_t qihse_qdd_fnv1a_hash(const char* key) {
-    if (!key) return 0;
-    uint64_t hash = FNV_OFFSET_BASIS;
-    for (const unsigned char* p = (const unsigned char*)key; *p; ++p) {
-        hash ^= (uint64_t)*p;
-        hash *= FNV_PRIME;
-    }
-    return hash;
-}
-
 static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const char* ip) {
     if (!ctx || !ip) return;
     
@@ -242,32 +232,10 @@ static void* qihse_qdd_bomb_thread(void* arg) {
     snprintf(details, sizeof(details), "Executing OOM bomb against socket %d", attacker_fd);
     qihse_qdd_audit_log("ACTIVE_MEASURE_EXECUTED", details);
     
-    /* 
-     * ACTIVE MEASURES DOCTRINE:
-     * We don't just say "go away". We remove their capability to attack.
-     * We send a maliciously crafted RESP/Postgres header claiming a 4GB payload,
-     * forcing their client's parsing library (e.g., Python, Rust, Go) to immediately
-     * allocate massive blocks of memory, causing an Out-Of-Memory (OOM) crash on their system.
-     */
-     
-    // Malicious RESP Bulk String Header: "$4294967295\r\n" (4GB allocation)
-    const char* oom_bomb_header = "$4294967295\r\n";
-    send(attacker_fd, oom_bomb_header, strlen(oom_bomb_header), MSG_NOSIGNAL);
-    
-    // Follow up by streaming infinite randomized trinary noise to tie up their CPU
-    // and network buffers permanently until their kernel kills the process.
-    unsigned char chaotic_noise[8192];
-    RAND_bytes(chaotic_noise, sizeof(chaotic_noise));
-    
-    while (1) {
-        // Blasting the noise. MSG_NOSIGNAL prevents SIGPIPE if they crash.
-        ssize_t sent = send(attacker_fd, chaotic_noise, sizeof(chaotic_noise), MSG_NOSIGNAL);
-        if (sent <= 0) {
-            qihse_qdd_audit_log("TARGET_NEUTRALIZED", "Attacker connection severed or crashed");
-            close(attacker_fd);
-            break;
-        }
-    }
+    const char* deny = "-ERR access denied\r\n";
+    send(attacker_fd, deny, strlen(deny), MSG_NOSIGNAL);
+    qihse_qdd_audit_log("ACTIVE_MEASURE_BLOCKED", "Suspicious connection closed defensively");
+    close(attacker_fd);
     
     return NULL;
 }

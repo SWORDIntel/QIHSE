@@ -27,14 +27,66 @@
 #endif
 #include <sys/stat.h>
 
+#ifndef _WIN32
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
+/* ── HMAC-SHA-384 key management ─────────────────────────────────── */
+
+static uint8_t s_hmac_key[32] = {0};
+static bool s_hmac_key_loaded = false;
+
+static bool load_hmac_key(void) {
+    if (s_hmac_key_loaded) return true;
+#ifndef _WIN32
+    FILE *kf = fopen(QIHSE_KEM_PRIVATE_KEY_FILE, "rb");
+    if (kf) {
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        if (mdctx && EVP_DigestInit_ex(mdctx, EVP_sha384(), NULL) > 0) {
+            uint8_t buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), kf)) > 0)
+                EVP_DigestUpdate(mdctx, buf, n);
+            unsigned char digest[SHA384_DIGEST_LENGTH];
+            unsigned int md_len = 0;
+            EVP_DigestFinal_ex(mdctx, digest, &md_len);
+            memcpy(s_hmac_key, digest, 32);
+            OPENSSL_cleanse(digest, sizeof(digest));
+            s_hmac_key_loaded = true;
+        }
+        if (mdctx) EVP_MD_CTX_free(mdctx);
+        fclose(kf);
+        return s_hmac_key_loaded;
+    }
+#endif
+    fprintf(stderr, "[CONTAINER WARNING] No KEM key file — HMAC integrity uses zero key (pre-prod mode).\n");
+    s_hmac_key_loaded = true;
+    return true;
+}
+
+static void compute_hmac_sha384(const void* data, size_t len, uint8_t out[48]) {
+#ifndef _WIN32
+    if (load_hmac_key()) {
+        unsigned int md_len = 48;
+        HMAC(EVP_sha384(), s_hmac_key, 32,
+             (const unsigned char*)data, len, out, &md_len);
+        return;
+    }
+#endif
+    memset(out, 0, 48);
+}
+
 /* ── Serialisation helpers ────────────────────────────────────────── */
 
 static void ctr_write_section_entry(uint8_t* p, const qihse_ctr_section_t* s) {
-    /* [u16 id][u16 flags][u32 reserved][u64 offset][u64 length][u64 crc64] */
+    /* [u16 id][u16 flags][u32 reserved][u64 offset][u64 length][48-byte hmac][8 pad] */
+    memset(p, 0, QIHSE_CTR_SECTION_ENTRY_SIZE);
     p[0] = (uint8_t)(s->section_id & 0xffu);
     p[1] = (uint8_t)((s->section_id >> 8) & 0xffu);
     p[2] = (uint8_t)(s->flags & 0xffu);
@@ -42,7 +94,7 @@ static void ctr_write_section_entry(uint8_t* p, const qihse_ctr_section_t* s) {
     qihse_le_write_u32(p + 4u, s->reserved);
     qihse_le_write_u64(p + 8u, s->offset);
     qihse_le_write_u64(p + 16u, s->length);
-    qihse_le_write_u64(p + 24u, s->crc64);
+    memcpy(p + 24u, s->hmac_sha384, 48u);
 }
 
 static void ctr_read_section_entry(const uint8_t* p, qihse_ctr_section_t* s) {
@@ -51,7 +103,7 @@ static void ctr_read_section_entry(const uint8_t* p, qihse_ctr_section_t* s) {
     s->reserved   = qihse_le_read_u32(p + 4u);
     s->offset     = qihse_le_read_u64(p + 8u);
     s->length     = qihse_le_read_u64(p + 16u);
-    s->crc64      = qihse_le_read_u64(p + 24u);
+    memcpy(s->hmac_sha384, p + 24u, 48u);
 }
 
 /* ── pread / pwrite wrappers ──────────────────────────────────────── */
@@ -97,13 +149,13 @@ static bool ctr_pwrite(int fd, const void* buf, size_t size, uint64_t offset) {
 /* ── File header encode / decode ──────────────────────────────────── */
 
 /*
- * Header layout (QIHSE_CTR_HEADER_SIZE = 64 bytes):
+ * Header layout (QIHSE_CTR_HEADER_SIZE = 80 bytes):
  *   [0..7]   magic "QIHSEQDB"
  *   [8..11]  version u32
  *   [12..15] flags u32
  *   [16..19] section_count u32
- *   [20..27] header_crc64 u64  (FNV-1a over bytes 0..19)
- *   [28..63] reserved
+ *   [20..67] header_hmac_sha384 (HMAC-SHA-384 over bytes 0..19)
+ *   [68..79] reserved
  */
 static void ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
                               uint32_t section_count) {
@@ -112,14 +164,14 @@ static void ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
     qihse_le_write_u32(hdr + 8u,  QIHSE_CTR_VERSION);
     qihse_le_write_u32(hdr + 12u, 0u); /* flags */
     qihse_le_write_u32(hdr + 16u, section_count);
-    uint64_t crc = qihse_fnv1a64(hdr, 20u);
-    qihse_le_write_u64(hdr + 20u, crc);
+    uint8_t hmac[48];
+    compute_hmac_sha384(hdr, 20u, hmac);
+    memcpy(hdr + 20u, hmac, 48u);
 }
 
 static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
                                uint32_t* section_count_out) {
-    uint64_t stored_crc;
-    uint64_t actual_crc;
+    uint8_t expected_hmac[48];
 
     if (memcmp(hdr, QIHSE_CTR_MAGIC, 8u) != 0) {
         errno = EINVAL;
@@ -129,10 +181,8 @@ static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
         errno = EINVAL;
         return false;
     }
-    stored_crc = qihse_le_read_u64(hdr + 20u);
-    /* Compute CRC over first 20 bytes (magic+version+flags+count) */
-    actual_crc = qihse_fnv1a64(hdr, 20u);
-    if (stored_crc != actual_crc) {
+    compute_hmac_sha384(hdr, 20u, expected_hmac);
+    if (memcmp(hdr + 20u, expected_hmac, 48u) != 0) {
         errno = EINVAL;
         return false;
     }
@@ -293,7 +343,7 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
     ctr->fd = -1;
 
     if (create) {
-        fd = open(path, O_RDWR | O_CREAT, 0666);
+        fd = open(path, O_RDWR | O_CREAT, 0600);
     } else {
         fd = open(path, O_RDWR);
     }
@@ -406,6 +456,7 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
 
     sec = qihse_ctr_find_section(ctr, section_id);
     if (!sec) {
+        printf("[DEBUG] section_id %u not found in container\\n", section_id);
         errno = ENOENT;
         return false;
     }
@@ -419,11 +470,14 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
         return false;
     }
     if (!ctr_pread(ctr->fd, buf, (size_t)sec->length, sec->offset)) {
+        printf("[DEBUG] ctr_pread failed for section %u\\n", section_id);
         free(buf);
         return false;
     }
-    crc = qihse_fnv1a64(buf, (size_t)sec->length);
-    if (crc != sec->crc64) {
+    uint8_t computed_hmac[48];
+    compute_hmac_sha384(buf, (size_t)sec->length, computed_hmac);
+    if (sec->section_id != QIHSE_CTR_SEC_WAL && memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
+        fprintf(stderr, "[CONTAINER] HMAC-SHA-384 mismatch for section %u\n", section_id);
         free(buf);
         errno = EINVAL;
         return false;
@@ -496,7 +550,7 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     memcpy(tmp_path, ctr->path, path_len);
     memcpy(tmp_path + path_len, ".tmp", 5u);
 
-    tmp_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    tmp_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (tmp_fd < 0) {
         return false;
     }
@@ -521,7 +575,7 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
         new_sections[new_count].reserved   = 0u;
         new_sections[new_count].offset     = write_offset;
         new_sections[new_count].length     = (uint64_t)b->size;
-        new_sections[new_count].crc64      = qihse_fnv1a64(b->data, b->size);
+        compute_hmac_sha384(b->data, b->size, new_sections[new_count].hmac_sha384);
         write_offset += (uint64_t)b->size;
         new_count++;
     }
@@ -573,7 +627,12 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     if (close(tmp_fd) != 0) { tmp_fd = -1; ok = false; goto out; }
     tmp_fd = -1;
 
-    if (rename(tmp_path, ctr->path) != 0) { ok = false; goto out; }
+    if (rename(tmp_path, ctr->path) == 0) {
+        ok = true;
+    } else {
+        ok = false;
+        goto out;
+    }
 
     /* Re-read the table into ctr from the live file (fd still valid for lock) */
     {

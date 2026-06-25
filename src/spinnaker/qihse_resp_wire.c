@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #else
@@ -37,23 +38,27 @@ void* qihse_resp_client_thread(void* arg) {
 }
 
 
-static int parse_resp_array(char* buf, char** args, int max_args) {
-    if (buf[0] != '*') return -1;
+static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args) {
+    if (buf_len == 0 || buf[0] != '*') return -1;
+    char *end = buf + buf_len;
     int argc = atoi(buf + 1);
-    if (argc > max_args) argc = max_args;
+    if (argc <= 0 || argc > max_args) return -1;
     
     char* p = strstr(buf, "\r\n");
     if (!p) return -1;
     p += 2;
     
     for (int i = 0; i < argc; i++) {
-        if (p[0] != '$') return -1;
+        if (p >= end || p[0] != '$') return -1;
         int len = atoi(p + 1);
+        if (len < 0 || len > 1024 * 1024) return -1;
         p = strstr(p, "\r\n");
         if (!p) return -1;
         p += 2;
         args[i] = p;
+        if (len > end - p) return -1;
         p += len;
+        if (p + 1 >= end) return -1;
         if (p[0] == '\r' && p[1] == '\n') {
             p[0] = '\0';
             p += 2;
@@ -65,7 +70,19 @@ static int parse_resp_array(char* buf, char** args, int max_args) {
 }
 
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
+#ifdef _WIN32
+    DWORD timeout = 30000;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
     char buffer[65536];
+    qihse_user_t* current_user = NULL;
     while (1) {
         ssize_t valread = read(client_fd, buffer, sizeof(buffer) - 1);
         if (valread <= 0) break;
@@ -75,7 +92,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
         int argc = 0;
         
         if (buffer[0] == '*') {
-            argc = parse_resp_array(buffer, args, 2048);
+            argc = parse_resp_array(buffer, valread, args, 2048);
         } else {
             char* token = strtok(buffer, " \r\n");
             while (token && argc < 2048) {
@@ -85,15 +102,35 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
         }
         
         if (argc > 0) {
+            // Require auth at every network protocol entrypoint
+            if (!current_user && strcasecmp(args[0], "AUTH") != 0 && strcasecmp(args[0], "PING") != 0) {
+                const char* reply = "-NOAUTH Authentication required.\r\n";
+                write(client_fd, reply, strlen(reply));
+                continue;
+            }
+
             if (strcasecmp(args[0], "PING") == 0) {
                 const char* reply = "+PONG\r\n";
                 write(client_fd, reply, strlen(reply));
+            } else if (strcasecmp(args[0], "AUTH") == 0 && argc >= 3) {
+                current_user = qihse_auth_authenticate(args[1], args[2]);
+                if (current_user) {
+                    const char* reply = "+OK\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else {
+                    const char* reply = "-ERR invalid credentials\r\n";
+                    write(client_fd, reply, strlen(reply));
+                }
             } else if (strcasecmp(args[0], "SET") == 0 && argc >= 3) {
-                qihse_kv_set(store, args[1], args[2], 0, 0);
-                const char* reply = "+OK\r\n";
-                write(client_fd, reply, strlen(reply));
+                if (qihse_kv_set_user(store, args[1], args[2], 0, 0, current_user)) {
+                    const char* reply = "+OK\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else {
+                    const char* reply = "-ERR Access denied or set failed\r\n";
+                    write(client_fd, reply, strlen(reply));
+                }
             } else if (strcasecmp(args[0], "GET") == 0 && argc >= 2) {
-                const char* val = qihse_kv_get_user(store, args[1], NULL);
+                const char* val = qihse_kv_get_user(store, args[1], current_user);
                 
                 if (qihse_kv_store_is_under_attack(store)) {
 #ifndef _WIN32
@@ -111,24 +148,49 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     write(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "DEL") == 0 && argc >= 2) {
-                qihse_kv_del_user(store, args[1], NULL);
-                const char* reply = ":1\r\n";
-                write(client_fd, reply, strlen(reply));
-            } else if (strcasecmp(args[0], "MSET") == 0 && argc >= 3) {
-                for (int i = 1; i < argc - 1; i += 2) {
-                    qihse_kv_set(store, args[i], args[i+1], 0, 0);
+                if (qihse_kv_del_user(store, args[1], current_user)) {
+                    const char* reply = ":1\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else {
+                    const char* reply = ":0\r\n";
+                    write(client_fd, reply, strlen(reply));
                 }
-                const char* reply = "+OK\r\n";
-                write(client_fd, reply, strlen(reply));
+            } else if (strcasecmp(args[0], "MSET") == 0 && argc >= 3) {
+                bool all_ok = true;
+                for (int i = 1; i < argc - 1; i += 2) {
+                    if (!qihse_kv_set_user(store, args[i], args[i+1], 0, 0, current_user)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if (all_ok) {
+                    const char* reply = "+OK\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else {
+                    const char* reply = "-ERR Access denied or set failed\r\n";
+                    write(client_fd, reply, strlen(reply));
+                }
             } else if (strcasecmp(args[0], "MGET") == 0 && argc >= 2) {
                 char reply[65536];
                 int offset = snprintf(reply, sizeof(reply), "*%d\r\n", argc - 1);
+                if (offset < 0) offset = 0;
                 for (int i = 1; i < argc; i++) {
-                    const char* val = qihse_kv_get_user(store, args[i], NULL);
+                    const char* val = qihse_kv_get_user(store, args[i], current_user);
+                    int remaining = sizeof(reply) - offset;
+                    if (remaining <= 0) break;
+                    int written;
                     if (val) {
-                        offset += snprintf(reply + offset, sizeof(reply) - offset, "$%zu\r\n%s\r\n", strlen(val), val);
+                        written = snprintf(reply + offset, remaining, "$%zu\r\n%s\r\n", strlen(val), val);
                     } else {
-                        offset += snprintf(reply + offset, sizeof(reply) - offset, "$-1\r\n");
+                        written = snprintf(reply + offset, remaining, "$-1\r\n");
+                    }
+                    if (written > 0) {
+                        if (written >= remaining) {
+                            offset += remaining - 1;
+                            break;
+                        } else {
+                            offset += written;
+                        }
                     }
                 }
                 write(client_fd, reply, offset);
@@ -140,7 +202,10 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             } else if (strcasecmp(args[0], "VECSET") == 0 && argc >= 3) {
                 uint64_t id = strtoull(args[1], NULL, 10);
                 int dim = atoi(args[2]);
-                if (argc >= 3 + dim) {
+                if (dim <= 0 || dim > 2048) {
+                    const char* reply = "-ERR invalid dimension\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
                         vec[i] = atof(args[3 + i]);
@@ -159,7 +224,10 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             } else if (strcasecmp(args[0], "VECSEARCH") == 0 && argc >= 3) {
                 int dim = atoi(args[1]);
                 int top_k = atoi(args[2]);
-                if (argc >= 3 + dim) {
+                if (dim <= 0 || dim > 2048 || top_k <= 0 || top_k > 1000) {
+                    const char* reply = "-ERR invalid parameters\r\n";
+                    write(client_fd, reply, strlen(reply));
+                } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
                         vec[i] = atof(args[3 + i]);
@@ -170,6 +238,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     query.vector_dims = dim;
                     query.top_k = top_k;
                     query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
+                    query.user = current_user;
                     
                     qihse_vector_result_t *results = malloc(top_k * sizeof(qihse_vector_result_t));
                     int found = qihse_vector_db_search(vdb, &query, results, top_k);
@@ -202,15 +271,24 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
     close(client_fd);
 }
 
+static bool qihse_mem_contains(const char* haystack, size_t haystack_len, const char* needle, size_t needle_len) {
+    if (!haystack || !needle || needle_len == 0 || haystack_len < needle_len) return false;
+    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+        if (memcmp(haystack + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
 static void af_xdp_resp_cb(char *pkt, uint32_t len, void *arg) {
     (void)arg;
     if (len > 54) {
         char *payload = pkt + 54;
-        if (strstr(payload, "PING")) {
+        size_t payload_len = (size_t)len - 54u;
+        if (qihse_mem_contains(payload, payload_len, "PING", 4)) {
             printf("[AF_XDP RESP] Fast-path zero-copy bypass: PING\n");
-        } else if (strstr(payload, "GET")) {
+        } else if (qihse_mem_contains(payload, payload_len, "GET", 3)) {
             printf("[AF_XDP RESP] Fast-path zero-copy bypass: GET\n");
-        } else if (strstr(payload, "SET")) {
+        } else if (qihse_mem_contains(payload, payload_len, "SET", 3)) {
             printf("[AF_XDP RESP] Fast-path zero-copy bypass: SET\n");
         }
     }
@@ -248,6 +326,12 @@ static void* af_xdp_resp_thread(void *arg) {
 #endif
 
 bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uint16_t port, const char* bind_address) {
+    if (qihse_auth_is_operator_password_default()) {
+        fprintf(stderr, "[FATAL SECURITY ERROR] Default operator password detected. "
+                        "You must rotate the default operator password before starting network services.\n");
+        return false;
+    }
+
     int server_fd, client_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -255,7 +339,7 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
-        return -1;
+        return false;
     }
 
 #ifndef _WIN32
@@ -274,27 +358,27 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
 #endif
         perror("setsockopt");
         close(server_fd);
-        return -1;
+        return false;
     }
 
     address.sin_family = AF_INET;
-    if (bind_address && bind_address[0] != '\0') {
-        address.sin_addr.s_addr = inet_addr(bind_address);
-    } else {
-        address.sin_addr.s_addr = INADDR_ANY;
+    const char* final_bind = bind_address;
+    if (!final_bind || strcmp(final_bind, "0.0.0.0") == 0 || final_bind[0] == '\0') {
+        final_bind = "127.0.0.1";
     }
+    address.sin_addr.s_addr = inet_addr(final_bind);
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
         close(server_fd);
-        return -1;
+        return false;
     }
 
     if (listen(server_fd, 10) < 0) {
         perror("listen");
         close(server_fd);
-        return -1;
+        return false;
     }
 
     while (1) {
@@ -370,7 +454,7 @@ static DWORD WINAPI iocp_worker_thread(LPVOID completion_port) {
                 // reply_ptr = value
             }
             
-            strcpy(ctx->buffer, reply_ptr);
+            strncpy(ctx->buffer, reply_ptr, sizeof(ctx->buffer) - 1);\n            ctx->buffer[sizeof(ctx->buffer) - 1] = '\0';
             ctx->wsa_buf.buf = ctx->buffer;
             ctx->wsa_buf.len = strlen(ctx->buffer);
             ctx->op_type = QIHSE_IOCP_WRITE;

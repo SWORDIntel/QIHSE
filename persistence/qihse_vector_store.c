@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -381,14 +382,16 @@ static bool qihse_load_raw_checked_ctr(const qihse_container_t* ctr,
                                        uint64_t expected_crc64,
                                        uint8_t** out,
                                        size_t* out_size) {
+    if (expected_size64 == 0) {
+        *out = NULL;
+        *out_size = 0;
+        return true;
+    }
     if (!qihse_ctr_read_section_alloc(ctr, section_id, out, out_size)) {
         return false;
     }
-    /* Section CRC is already verified by qihse_ctr_read_section_alloc;
-     * still check the manifest-recorded size/crc to detect cross-section
-     * inconsistencies (e.g. manifest written with different data). */
-    if ((uint64_t)*out_size != expected_size64 ||
-        qihse_fnv1a64(*out, *out_size) != expected_crc64) {
+    uint64_t actual_crc = qihse_fnv1a64(*out, *out_size);
+    if ((uint64_t)*out_size != expected_size64 || actual_crc != expected_crc64) {
         free(*out);
         *out = NULL;
         *out_size = 0u;
@@ -726,22 +729,26 @@ bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t*
     }
 
     if (!qihse_load_manifest_ctr(&ctr, &snapshot.manifest)) {
+        printf("[DEBUG] qihse_load_manifest_ctr failed\n");
         goto done;
     }
     if (!qihse_load_index_ctr(&ctr, &snapshot.manifest,
                               &snapshot.rows, &snapshot.row_count)) {
+        printf("[DEBUG] qihse_load_index_ctr failed\n");
         goto done;
     }
     if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_VECTORS,
                                     snapshot.manifest.vector_bytes,
                                     snapshot.manifest.vector_crc64,
                                     &snapshot.vectors, &snapshot.vector_bytes)) {
+        printf("[DEBUG] qihse_load_raw_checked_ctr SEC_VECTORS failed\n");
         goto done;
     }
     if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_METADATA,
                                     snapshot.manifest.metadata_bytes,
                                     snapshot.manifest.metadata_crc64,
                                     &snapshot.metadata, &snapshot.metadata_bytes)) {
+        printf("[DEBUG] qihse_load_raw_checked_ctr SEC_METADATA failed\n");
         goto done;
     }
 

@@ -355,7 +355,7 @@ bool qihse_lock_acquire(qihse_lock_t* lock, const char* path) {
 
     lock->file.fd = QIHSE_FILE_INVALID_FD;
     lock->held = false;
-    if (!qihse_file_open(&lock->file, path, O_RDWR | O_CREAT, 0666)) {
+    if (!qihse_file_open(&lock->file, path, O_RDWR | O_CREAT, 0600)) {
         return false;
     }
 

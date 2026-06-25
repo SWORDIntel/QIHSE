@@ -199,6 +199,18 @@ bool qihse_cpu_test_avx512vl(void) {
 #endif
 }
 
+bool qihse_cpu_test_avx_vnni(void) {
+#if defined(__AVXVNNI__) || (defined(QIHSE_ENABLE_AVX_VNNI) && QIHSE_ENABLE_AVX_VNNI)
+    __asm__ volatile (
+        "vpdpbusd %%ymm1, %%ymm0, %%ymm0\n"
+        : : : "ymm0", "ymm1"
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool qihse_cpu_test_amx(void) {
 #ifdef __AMX__
     /* AMX requires proper tile configuration and setup */
@@ -451,44 +463,45 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         }
     }
 
-    /* Test AVX-512 features (require OS support) */
-    info.has_avx512_support = safe_execute_test(qihse_cpu_test_avx512f);
-    if (info.has_avx512_support) {
-        features |= QIHSE_CPU_FEATURE_AVX512F;
-        if (safe_execute_test(qihse_cpu_test_avx512bw)) {
-            features |= QIHSE_CPU_FEATURE_AVX512BW;
-        }
-        if (safe_execute_test(qihse_cpu_test_avx512dq)) {
-            features |= QIHSE_CPU_FEATURE_AVX512DQ;
-        }
-        if (safe_execute_test(qihse_cpu_test_avx512vl)) {
-            features |= QIHSE_CPU_FEATURE_AVX512VL;
-        }
-        if (safe_execute_test(qihse_cpu_test_avx512vnni)) {
-            features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+    /* Test specialized features */
+    const char* avx512_env = getenv("QIHSE_ENABLE_AVX512");
+    if (!avx512_env || avx512_env[0] != '0') {
+        info.has_avx512_support = safe_execute_test(qihse_cpu_test_avx512f);
+        if (info.has_avx512_support) {
+            features |= QIHSE_CPU_FEATURE_AVX512F;
+            if (safe_execute_test(qihse_cpu_test_avx512bw)) {
+                features |= QIHSE_CPU_FEATURE_AVX512BW;
+            }
+            if (safe_execute_test(qihse_cpu_test_avx512dq)) {
+                features |= QIHSE_CPU_FEATURE_AVX512DQ;
+            }
+            if (safe_execute_test(qihse_cpu_test_avx512vl)) {
+                features |= QIHSE_CPU_FEATURE_AVX512VL;
+            }
+            if (safe_execute_test(qihse_cpu_test_avx512vnni)) {
+                features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+            }
         }
     }
 
-    /* Test specialized features */
-    if (safe_execute_test(qihse_cpu_test_amx)) {
-        features |= QIHSE_CPU_FEATURE_AMX;
-        features |= QIHSE_CPU_FEATURE_AMX_TILE;
+    const char* amx_env = getenv("QIHSE_ENABLE_AMX");
+    if (!amx_env || amx_env[0] != '0') {
+        if (safe_execute_test(qihse_cpu_test_amx)) {
+            features |= QIHSE_CPU_FEATURE_AMX;
+            features |= QIHSE_CPU_FEATURE_AMX_TILE;
+        }
     }
+
     if (safe_execute_test(qihse_cpu_test_vnni)) {
         features |= QIHSE_CPU_FEATURE_VNNI;
     }
+
     /* AVX-VNNI runtime test: attempt vpdpbusd ymm0,ymm0,ymm0 */
-    {
-        bool avx_vnni_ok = false;
-#if defined(__AVXVNNI__) || (defined(QIHSE_ENABLE_AVX_VNNI) && QIHSE_ENABLE_AVX_VNNI)
-        __asm__ volatile (
-            "vpdpbusd %%ymm1, %%ymm0, %%ymm0\n"
-            : : : "ymm0", "ymm1"
-        );
-        avx_vnni_ok = true;
-#endif
-        (void)avx_vnni_ok;
-        if (avx_vnni_ok) features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+    const char* avx_vnni_env = getenv("QIHSE_ENABLE_AVX_VNNI");
+    if (!avx_vnni_env || avx_vnni_env[0] != '0') {
+        if (safe_execute_test(qihse_cpu_test_avx_vnni)) {
+            features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+        }
     }
 
     info.features = features;

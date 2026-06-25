@@ -222,7 +222,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
         dev->numa_node = 0;
         dev->device_context = NULL;
         dev->device_id = 0;
-        strcpy(dev->device_name, "Intel AMX TMUL");
+        strncpy(dev->device_name, "Intel AMX TMUL", sizeof(dev->device_name) - 1);
         pool->active_device_count++;
     }
 
@@ -237,7 +237,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
         dev->numa_node = 0;
         dev->device_context = NULL;
         dev->device_id = 0;
-        strcpy(dev->device_name, "AVX512-VNNI INT8");
+        strncpy(dev->device_name, "AVX512-VNNI INT8", sizeof(dev->device_name) - 1);
         pool->active_device_count++;
     }
 
@@ -252,7 +252,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
         dev->numa_node = 0;
         dev->device_context = NULL;
         dev->device_id = 0;
-        strcpy(dev->device_name, "AVX-512 FP32");
+        strncpy(dev->device_name, "AVX-512 FP32", sizeof(dev->device_name) - 1);
         pool->active_device_count++;
     }
 
@@ -267,7 +267,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
         dev->numa_node = 0;
         dev->device_context = NULL;
         dev->device_id = 0;
-        strcpy(dev->device_name, "AVX2+FMA FP32");
+        strncpy(dev->device_name, "AVX2+FMA FP32", sizeof(dev->device_name) - 1);
         pool->active_device_count++;
     }
 
@@ -294,7 +294,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     npu_dev->numa_node = -1;
     npu_dev->device_context = NULL;
     npu_dev->device_id = 0;
-    strcpy(npu_dev->device_name, "Intel NPU");
+    strncpy(npu_dev->device_name, "Intel NPU", sizeof(npu_dev->device_name) - 1);
     pool->active_device_count++;
 
     /* Intel Arc GPU device (checks oneAPI availability) */
@@ -313,7 +313,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     arc_dev->numa_node = -1;
     arc_dev->device_context = NULL;
     arc_dev->device_id = 0;
-    strcpy(arc_dev->device_name, "Intel Arc GPU");
+    strncpy(arc_dev->device_name, "Intel Arc GPU", sizeof(arc_dev->device_name) - 1);
     pool->active_device_count++;
 
     /* NVIDIA GPU device (checks CUDA availability) */
@@ -338,7 +338,7 @@ qihse_compute_pool_t* qihse_compute_pool_init(void) {
     cuda_dev->numa_node = -1;
     cuda_dev->device_context = NULL;
     cuda_dev->device_id = 0;
-    strcpy(cuda_dev->device_name, "NVIDIA CUDA GPU");
+    strncpy(cuda_dev->device_name, "NVIDIA CUDA GPU", sizeof(cuda_dev->device_name) - 1);
     pool->active_device_count++;
 
     return pool;

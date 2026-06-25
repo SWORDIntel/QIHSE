@@ -224,10 +224,12 @@ test-fts-engine: lib
 
 test-e2e: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
+	rm -f qihse_integrity.chain*
 	LD_LIBRARY_PATH=. ./tests/test_qihse_e2e
 
 test-omni: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_omni tests/test_qihse_omni.c -L. -lqihse $(LDFLAGS)
+	rm -f qihse_integrity.chain*
 	LD_LIBRARY_PATH=. ./tests/test_qihse_omni
 
 test-apt41:

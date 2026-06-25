@@ -11,7 +11,7 @@
 # Root-level cache, logs, and temp files
 /qihse_qmag_telemetry.log
 /wal.log
-/.qihse_auth_cache.dat
+/qihse_audit.log
 /qihse_integrity.chain
 /.DS_Store
 /__pycache__/

@@ -500,7 +500,9 @@ int qihse_quantization_recommend_precision(
     recommendation->expected_compression_ratio = 4.0;
     recommendation->expected_speedup = 2.5;
     recommendation->expected_accuracy_loss = 0.02;
-    strcpy(recommendation->reasoning, "INT8 provides best balance of speed and accuracy");
+    strncpy(recommendation->reasoning, "INT8 provides best balance of speed and accuracy",
+            sizeof(recommendation->reasoning) - 1);
+    recommendation->reasoning[sizeof(recommendation->reasoning) - 1] = '\0';
 
     return 0;
 }
@@ -556,7 +558,9 @@ qihse_self_improvement_t* qihse_self_improvement_init(
     }
 
     /* Set improvement parameters */
-    strcpy(si->data_dir, data_dir ? data_dir : "./qihse_learning");
+    strncpy(si->data_dir, data_dir ? data_dir : "./qihse_learning",
+            sizeof(si->data_dir) - 1);
+    si->data_dir[sizeof(si->data_dir) - 1] = '\0';
     si->max_experience_samples = max_samples;
     si->improvement_threshold = 0.05; /* 5% improvement required */
     si->baseline_speedup = 1.0; /* Start with no improvement */

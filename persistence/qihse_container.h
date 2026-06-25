@@ -43,8 +43,8 @@ extern "C" {
 /* ── Layout constants ─────────────────────────────────────────────── */
 #define QIHSE_CTR_MAGIC         "QIHSEQDB"
 #define QIHSE_CTR_VERSION       1u
-#define QIHSE_CTR_HEADER_SIZE   64u
-#define QIHSE_CTR_SECTION_ENTRY_SIZE 32u
+#define QIHSE_CTR_HEADER_SIZE   80u
+#define QIHSE_CTR_SECTION_ENTRY_SIZE 80u
 #define QIHSE_CTR_MAX_SECTIONS  QIHSE_CTR_NUM_SECTIONS
 /* Table offset immediately follows the file header */
 #define QIHSE_CTR_TABLE_OFFSET  QIHSE_CTR_HEADER_SIZE
@@ -60,7 +60,7 @@ typedef struct qihse_ctr_section_s {
     uint32_t reserved;
     uint64_t offset;       /* Byte offset from start of file */
     uint64_t length;       /* Payload byte count */
-    uint64_t crc64;        /* FNV-1a-64 of payload */
+    uint8_t  hmac_sha384[48]; /* HMAC-SHA-384 of payload */
 } qihse_ctr_section_t;
 
 /*
@@ -108,7 +108,7 @@ const qihse_ctr_section_t* qihse_ctr_find_section(const qihse_container_t* ctr,
 /*
  * Allocate a buffer and read the full payload for section_id.
  * Sets *out and *out_size.  Caller must free(*out).
- * Returns false if the section is missing, empty, or fails CRC.
+ * Returns false if the section is missing, empty, or fails HMAC-SHA-384 verification.
  */
 bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
                                   uint16_t section_id,
@@ -154,9 +154,9 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
 
 /*
  * Append `size` bytes at the end of the WAL section, extending the
- * section.  Updates the section table entry (length only; CRC is
+ * section.  Updates the section table entry (length only; HMAC is
  * intentionally not maintained for the WAL — individual WAL records
- * carry their own CRC per the existing protocol).
+ * carry their own integrity per the existing protocol).
  * Does NOT fsync; caller is responsible.
  */
 bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size);

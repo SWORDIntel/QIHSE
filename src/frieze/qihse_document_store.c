@@ -222,7 +222,7 @@ qihse_document_result_t qihse_doc_store_query_user(qihse_document_store_t* store
         ctx.fields = curr->fields;
         ctx.num_fields = curr->num_fields;
 
-        if (user && !qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
+        if (!qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
             curr = curr->next;
             continue;
         }

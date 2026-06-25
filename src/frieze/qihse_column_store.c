@@ -70,7 +70,7 @@ bool qihse_column_create(qihse_column_store_t* store, const char* name, qihse_co
     qihse_column_node_t* new_col = (qihse_column_node_t*)calloc(1, sizeof(qihse_column_node_t));
     if (!new_col) return false;
     new_col->name = (char*)malloc(strlen(name) + 1);
-    if (new_col->name) strcpy(new_col->name, name);
+    if (new_col->name) memcpy(new_col->name, name, strlen(name) + 1);
     new_col->type = type;
     new_col->next = store->columns;
     store->columns = new_col;
@@ -314,7 +314,7 @@ int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* nam
                 int64_t val = data[i].val;
                 uint32_t run = data[i].run_length;
                 for (uint32_t r = 0; r < run; r++) {
-                    if (!user || qihse_auth_can_access(user, chunk->classifications[physical_idx], chunk->sci_compartments[physical_idx])) {
+                    if (qihse_auth_can_access(user, chunk->classifications[physical_idx], chunk->sci_compartments[physical_idx])) {
                         local_sum += val;
                     }
                     physical_idx++;
@@ -325,7 +325,7 @@ int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* nam
             size_t count = chunk->count;
             
             for (size_t i = 0; i < count; i++) {
-                if (!user || qihse_auth_can_access(user, chunk->classifications[i], chunk->sci_compartments[i])) {
+                if (qihse_auth_can_access(user, chunk->classifications[i], chunk->sci_compartments[i])) {
                     local_sum += data[i];
                 }
             }
@@ -356,7 +356,7 @@ float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* nam
                 float val = data[i].val;
                 uint32_t run = data[i].run_length;
                 for (uint32_t r = 0; r < run; r++) {
-                    if (!user || qihse_auth_can_access(user, chunk->classifications[physical_idx], chunk->sci_compartments[physical_idx])) {
+                    if (qihse_auth_can_access(user, chunk->classifications[physical_idx], chunk->sci_compartments[physical_idx])) {
                         local_sum += val;
                     }
                     physical_idx++;
@@ -367,7 +367,7 @@ float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* nam
             size_t count = chunk->count;
             
             for (size_t i = 0; i < count; i++) {
-                if (!user || qihse_auth_can_access(user, chunk->classifications[i], chunk->sci_compartments[i])) {
+                if (qihse_auth_can_access(user, chunk->classifications[i], chunk->sci_compartments[i])) {
                     local_sum += data[i];
                 }
             }

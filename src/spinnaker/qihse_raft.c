@@ -35,7 +35,8 @@ bool qihse_raft_init(qihse_raft_node_t* node, uint32_t node_id, uint16_t port, q
     node->vdb = vdb;
     node->running = false;
     node->last_heartbeat = time(NULL);
-    
+    srand((unsigned int)(time(NULL) ^ node->node_id ^ getpid()));
+
 #ifndef _WIN32
     if (io_uring_queue_init(URING_QUEUE_DEPTH, &node->ring, 0) < 0) {
         perror("io_uring_queue_init");
@@ -288,6 +289,7 @@ void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_
             }
         }
 #else
+        fprintf(stderr, "[QIHSE Raft Node %u] WARNING: AppendEntries accepted without signature verification (Windows build).\n", node->node_id);
         node->commit_index++;
         node->last_applied = node->commit_index;
 #endif

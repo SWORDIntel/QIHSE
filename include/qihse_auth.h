@@ -14,6 +14,9 @@ extern "C" {
 #define QIHSE_ROLE_ANALYST  1  // Restricted by Clearance & SCI
 #define QIHSE_ROLE_GUEST    2  // Unclassified Only
 
+#define QIHSE_AUTH_HASH_HEX_LEN 96
+#define QIHSE_AUTH_HASH_LEN (QIHSE_AUTH_HASH_HEX_LEN + 1)
+
 typedef struct qihse_user_s {
     uint32_t user_id;
     uint16_t role;
@@ -30,7 +33,7 @@ typedef struct qihse_user_s {
     char fido2_credential_id[64];
 
     // Password Auth
-    char password_hash[65]; // SHA-256 hash
+    char password_hash[QIHSE_AUTH_HASH_LEN]; // SHA-384 hex hash
 } qihse_user_t;
 
 // Global Auth Context (Simplification for simulation)
@@ -49,6 +52,10 @@ bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id
 
 // Check if a user can access a specific data row's clearance
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci);
+
+bool qihse_auth_is_operator_password_default(void);
+qihse_user_t* qihse_auth_authenticate(const char* username, const char* password);
+qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password);
 
 #ifdef __cplusplus
 }

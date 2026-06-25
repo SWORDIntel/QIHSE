@@ -1,10 +1,12 @@
 #include "qihse_audit.h"
+#include "qihse_auth.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
 #ifndef _WIN32
+#include <sys/stat.h>
 #include <openssl/sha.h>
 #endif
 #ifndef _WIN32
@@ -20,7 +22,7 @@ static pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char last_hash[129] = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"; // 96 chars for SHA-384
 static char webhook_target[256] = ""; // Optional audit notification endpoint
 
-#define AUDIT_FILE ".qihse_auth_cache.dat"
+#define AUDIT_FILE "qihse_audit.log"
 #define INTEGRITY_CHAIN_FILE "qihse_integrity.chain"
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
@@ -30,7 +32,7 @@ static void compute_sha384(const char *input, char *output) {
     unsigned char hash[SHA384_DIGEST_LENGTH];
     SHA384((const unsigned char*)input, strlen(input), hash);
     for (int i = 0; i < SHA384_DIGEST_LENGTH; i++) {
-        sprintf(output + (i * 2), "%02x", hash[i]);
+        snprintf(output + (i * 2), 3, "%02x", hash[i]);
     }
     output[96] = '\0';
 }
@@ -65,18 +67,26 @@ void qihse_audit_verify_integrity(void) {
                 
                 int attempts = 3;
                 while (attempts > 0) {
-                    printf("Enter Authorized Role ID (0 for Operator, 1 for Analyst): ");
+                    char username[64] = {0};
+                    char password[64] = {0};
+                    
+                    printf("Enter Authorized Operator/Analyst Username: ");
                     fflush(stdout);
-                    char input[16];
-                    if (fgets(input, sizeof(input), stdin) != NULL) {
-                        int role = atoi(input);
-                        if (role == 0 || role == 1) {
-                            printf("\n[AUTHENTICATED] Alert dismissed. Resuming execution under elevated risk protocol.\n\n");
-                            fclose(sf);
-                            return; // Alert dismissed, allow system to continue
-                        } else {
-                            printf("Invalid role or unauthorized rank.\n");
-                        }
+                    if (fgets(username, sizeof(username), stdin) == NULL) break;
+                    username[strcspn(username, "\r\n")] = '\0';
+                    
+                    printf("Enter Password: ");
+                    fflush(stdout);
+                    if (fgets(password, sizeof(password), stdin) == NULL) break;
+                    password[strcspn(password, "\r\n")] = '\0';
+                    
+                    qihse_user_t* user = qihse_auth_authenticate(username, password);
+                    if (user && (user->role == QIHSE_ROLE_OPERATOR || user->role == QIHSE_ROLE_ANALYST)) {
+                        printf("\n[AUTHENTICATED] Alert dismissed. Resuming execution under elevated risk protocol.\n\n");
+                        fclose(sf);
+                        return; // Alert dismissed, allow system to continue
+                    } else {
+                        printf("Authentication failed or unauthorized role.\n");
                     }
                     attempts--;
                 }
@@ -124,6 +134,7 @@ void qihse_audit_init(void) {
     if (f) {
         write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
         fclose(f);
+        chmod(AUDIT_FILE, 0600);
     }
     pthread_mutex_unlock(&audit_mutex);
     qihse_audit_verify_integrity();

@@ -11,20 +11,20 @@
 
 int qihse_amplify_internal(void* d, size_t n, const void* q, qihse_data_type_t t, void* c) { (void)d; (void)n; (void)q; (void)t; (void)c; return 0; }
 
-char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
-    return qihse_kv_get_user(store, key, NULL);
+char* qihse_kv_get(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    return qihse_kv_get_user(store, key, user);
 }
 
-bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
-    return qihse_kv_del_user(store, key, NULL);
+bool qihse_kv_del(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    return qihse_kv_del_user(store, key, user);
 }
 
-bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
-    return qihse_kv_exists_user(store, key, NULL);
+bool qihse_kv_exists(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    return qihse_kv_exists_user(store, key, user);
 }
 
-double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts) {
-    return qihse_tsdb_average_range_user(tsdb, start_ts, end_ts, NULL);
+double qihse_tsdb_average_range(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user) {
+    return qihse_tsdb_average_range_user(tsdb, start_ts, end_ts, user);
 }
 
 int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity) {
