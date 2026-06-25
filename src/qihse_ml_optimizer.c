@@ -12,6 +12,9 @@
 #include <time.h>
 #include <pthread.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <openssl/rand.h>
+#endif
 
 /* ============================================================================
  * NEURAL NETWORK IMPLEMENTATION
@@ -115,7 +118,13 @@ qihse_training_sample_t* qihse_generate_training_data(
     qihse_training_sample_t* samples = calloc(num_samples, sizeof(qihse_training_sample_t));
     if (!samples) return NULL;
 
-    srand(time(NULL));
+#ifndef _WIN32
+    unsigned char rand_seed[4];
+    if (RAND_bytes(rand_seed, 4) == 1) {
+        srand((unsigned int)(rand_seed[0] | (rand_seed[1] << 8) | (rand_seed[2] << 16) | (rand_seed[3] << 24)));
+    } else
+#endif
+        srand(time(NULL));
 
     for (size_t i = 0; i < num_samples; i++) {
         qihse_simulation_params_t params = *sim_params;
@@ -266,7 +275,13 @@ qihse_ml_optimizer_t* qihse_ml_optimizer_init(
         }
 
         /* Random initialization */
-        srand(time(NULL));
+#ifndef _WIN32
+        unsigned char nn_seed[4];
+        if (RAND_bytes(nn_seed, 4) == 1) {
+            srand((unsigned int)(nn_seed[0] | (nn_seed[1] << 8) | (nn_seed[2] << 16) | (nn_seed[3] << 24)));
+        } else
+#endif
+            srand(time(NULL));
         for (size_t j = 0; j < layer->output_size * layer->input_size; j++) {
             layer->weights[j] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
         }

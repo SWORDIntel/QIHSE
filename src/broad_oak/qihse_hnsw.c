@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#ifndef _WIN32
+#include <openssl/rand.h>
+#endif
 
 // Real distance function using user-provided callbacks
 static float real_dist_q(qihse_hnsw_index_t *index, const float *query, uint32_t node) {
@@ -317,7 +320,19 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
     (void)dim;
     if (!index) return;
 
-    double r = (double)rand() / (double)RAND_MAX;
+    double r;
+#ifndef _WIN32
+    unsigned char rand_buf[8];
+    if (RAND_bytes(rand_buf, 8) == 1) {
+        uint64_t rv = 0;
+        for (int i = 0; i < 8; i++) rv = (rv << 8) | rand_buf[i];
+        r = (double)(rv >> 11) / (double)(1ULL << 53);
+    } else {
+        r = (double)rand() / (double)RAND_MAX;
+    }
+#else
+    r = (double)rand() / (double)RAND_MAX;
+#endif
     if (r == 0.0) r = 0.000001;
     int l = (int)(-log(r) * index->params.mult);
 

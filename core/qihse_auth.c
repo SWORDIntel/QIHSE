@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 #define MAX_USERS 1024
 #define MAX_AUTH_ATTEMPTS 5
@@ -37,6 +41,7 @@ static void compute_sha384_hex(const char *input, char *output) {
         snprintf(output + (i * 2), 3, "%02x", hash[i]);
     }
     output[QIHSE_AUTH_HASH_HEX_LEN] = '\0';
+    OPENSSL_cleanse(hash, sizeof(hash));
 }
 
 void qihse_auth_init(void) {
@@ -52,12 +57,15 @@ void qihse_auth_init(void) {
         op->role = QIHSE_ROLE_OPERATOR;
         op->classification_level = 0xFFFF;
         op->sci_compartments = 0xFFFF;
-        op->hardware_token_present = true; // Operator REQUIRES physical token
+        op->hardware_token_present = true;
         op->requires_hardware_token = true;
         op->can_create_users = true;
         strncpy(op->username, "GODMODE_OP", 64);
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
         compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
+#ifndef _WIN32
+        mlock(op, sizeof(qihse_user_t));
+#endif
         users[0] = op;
         active_user_count = 1;
     }
@@ -140,6 +148,9 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
 
     users[user_id] = u;
     active_user_count++;
+#ifndef _WIN32
+    mlock(u, sizeof(qihse_user_t));
+#endif
     
     qihse_audit_log("USER_CREATE", creator->user_id, user_id, u->classification_level, u->sci_compartments);
     
@@ -178,6 +189,10 @@ void qihse_auth_destroy_user(uint32_t user_id) {
     pthread_mutex_lock(&auth_mutex);
     if (users[user_id]) {
         qihse_audit_log("USER_DESTROY", 0, user_id, users[user_id]->classification_level, users[user_id]->sci_compartments);
+        OPENSSL_cleanse(users[user_id], sizeof(qihse_user_t));
+#ifndef _WIN32
+        munlock(users[user_id], sizeof(qihse_user_t));
+#endif
         free(users[user_id]);
         users[user_id] = NULL;
         active_user_count--;

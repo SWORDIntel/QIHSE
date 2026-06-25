@@ -22,6 +22,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/mman.h>
 #else
 #include <io.h>
 #endif
@@ -31,6 +32,7 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #endif
 
 #ifndef PATH_MAX
@@ -41,6 +43,7 @@
 
 static uint8_t s_hmac_key[32] = {0};
 static bool s_hmac_key_loaded = false;
+static bool s_hmac_key_mlocked = false;
 
 static bool load_hmac_key(void) {
     if (s_hmac_key_loaded) return true;
@@ -58,6 +61,10 @@ static bool load_hmac_key(void) {
             EVP_DigestFinal_ex(mdctx, digest, &md_len);
             memcpy(s_hmac_key, digest, 32);
             OPENSSL_cleanse(digest, sizeof(digest));
+#ifndef _WIN32
+            mlock(s_hmac_key, 32);
+            s_hmac_key_mlocked = true;
+#endif
             s_hmac_key_loaded = true;
         }
         if (mdctx) EVP_MD_CTX_free(mdctx);
@@ -68,6 +75,19 @@ static bool load_hmac_key(void) {
     fprintf(stderr, "[CONTAINER WARNING] No KEM key file — HMAC integrity uses zero key (pre-prod mode).\n");
     s_hmac_key_loaded = true;
     return true;
+}
+
+static void qihse_ctr_cleanup_hmac_key(void) {
+    if (s_hmac_key_loaded) {
+        OPENSSL_cleanse(s_hmac_key, 32);
+#ifndef _WIN32
+        if (s_hmac_key_mlocked) {
+            munlock(s_hmac_key, 32);
+            s_hmac_key_mlocked = false;
+        }
+#endif
+        s_hmac_key_loaded = false;
+    }
 }
 
 static void compute_hmac_sha384(const void* data, size_t len, uint8_t out[48]) {
@@ -182,7 +202,7 @@ static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
         return false;
     }
     compute_hmac_sha384(hdr, 20u, expected_hmac);
-    if (memcmp(hdr + 20u, expected_hmac, 48u) != 0) {
+    if (CRYPTO_memcmp(hdr + 20u, expected_hmac, 48u) != 0) {
         errno = EINVAL;
         return false;
     }
@@ -497,7 +517,7 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
     }
     uint8_t computed_hmac[48];
     compute_hmac_sha384(buf, (size_t)sec->length, computed_hmac);
-    if (sec->section_id != QIHSE_CTR_SEC_WAL && memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
+    if (sec->section_id != QIHSE_CTR_SEC_WAL && CRYPTO_memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
         fprintf(stderr, "[CONTAINER] HMAC-SHA-384 mismatch for section %u\n", section_id);
         free(buf);
         errno = EINVAL;
