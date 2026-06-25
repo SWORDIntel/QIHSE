@@ -10,7 +10,12 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <signal.h>
 #define close_socket close
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
 #endif
 
 // To simulate backend load when the server is idle for the dashboard preview
@@ -47,7 +52,8 @@ void* qihse_http_telemetry_thread(void* arg) {
         if (client_socket < 0) continue;
 
         char buffer[1024] = {0};
-        recv(client_socket, buffer, 1024, 0);
+        int r = recv(client_socket, buffer, 1024, 0);
+        if (r <= 0) { close_socket(client_socket); continue; }
 
         if (strncmp(buffer, "GET", 3) == 0) {
             qihse_performance_stats_t stats;
@@ -75,7 +81,7 @@ void* qihse_http_telemetry_thread(void* arg) {
                      "Content-Length: %zu\r\n\r\n%s",
                      strlen(response_body), response_body);
 
-            send(client_socket, http_response, strlen(http_response), 0);
+            send(client_socket, http_response, strlen(http_response), MSG_NOSIGNAL);
         }
         close_socket(client_socket);
     }
