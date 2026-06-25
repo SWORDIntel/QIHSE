@@ -4396,6 +4396,15 @@ qihse_vector_db_t qihse_vector_db_open(
             /* Truncate == delete the container file to start fresh */
             unlink(vdb->db_path);
         }
+        
+        if (!read_only && create) {
+            /* Ensure the container file exists so WAL appends can succeed. */
+            qihse_container_t init_ctr;
+            if (qihse_ctr_open_write(vdb->db_path, true, &init_ctr)) {
+                qihse_ctr_close(&init_ctr);
+            }
+        }
+        
         {
             /* Check whether the container has a MANIFEST section */
             bool has_manifest = false;

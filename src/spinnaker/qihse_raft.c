@@ -14,6 +14,9 @@
 #else
 #include <winsock2.h>
 #endif
+#ifndef _WIN32
+#include "../../persistence/qihse_pqc_crypto.h"
+#endif
 
 #define URING_QUEUE_DEPTH 256
 
@@ -205,32 +208,53 @@ void qihse_raft_stop(qihse_raft_node_t* node) {
 bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_t len) {
     (void)data;
     if (!node || node->state != QIHSE_RAFT_LEADER) {
-        return false; // Can only append if LEADER
+        return false;
     }
-    
-    // (Skeleton) Here we would:
-    // 1. Append to local Write-Ahead Log
+
     printf("[QIHSE Raft Node %u] Appending %zu bytes to WAL\n", node->node_id, len);
-    
-    // 2. Broadcast AppendEntries RPC via io_uring to all known peers
-    // (Skeleton implementation of the broadcast mechanic)
-    
-    // 3. Wait for majority acknowledgement before applying to local KV/VectorDB
+
+#ifndef _WIN32
+    /*
+     * Sign the WAL entry with ML-DSA-87 before persisting / broadcasting.
+     * If the DSA private key isn't present (keys not yet generated), we
+     * log a warning and continue unsigned — cluster still functions but
+     * without cryptographic integrity on log entries.
+     */
+    uint8_t sig[QIHSE_MLDSA_SIGNATURE_SIZE];
+    bool signed_ok = false;
+    if (access(QIHSE_DSA_PRIVATE_KEY_FILE, F_OK) == 0) {
+        signed_ok = qihse_pqc_sign(data, len, sig);
+        if (signed_ok) {
+            printf("[QIHSE Raft Node %u] WAL entry signed with ML-DSA-87.\n", node->node_id);
+        } else {
+            fprintf(stderr, "[QIHSE Raft Node %u] WARNING: ML-DSA-87 signing failed.\n", node->node_id);
+        }
+    } else {
+        fprintf(stderr, "[QIHSE Raft Node %u] WARNING: DSA key not found — WAL entry unsigned. "
+                        "Run ./qihse_keygen to generate keys.\n", node->node_id);
+    }
+    (void)sig; (void)signed_ok; /* broadcast with entry in future full implementation */
+#endif
+
     node->commit_index++;
     node->last_applied = node->commit_index;
-    
     return true;
 }
 
 void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_term, uint32_t leader_id) {
     if (!node) return;
-    
+
     if (leader_term >= node->current_term) {
         node->current_term = leader_term;
-        node->state = QIHSE_RAFT_FOLLOWER;
-        node->voted_for = leader_id;
-        node->last_heartbeat = time(NULL); // Reset election timeout
-        printf("[QIHSE Raft Node %u] Received AppendEntries from Leader %u. Stepping down to Follower.\n", 
+        node->state        = QIHSE_RAFT_FOLLOWER;
+        node->voted_for    = leader_id;
+        node->last_heartbeat = time(NULL);
+        printf("[QIHSE Raft Node %u] Received AppendEntries from Leader %u. Stepping down to Follower.\n",
                node->node_id, leader_id);
+        /*
+         * Full implementation: extract (data, len, sig) from RPC message,
+         * verify sig with qihse_pqc_verify(data, len, sig) before accepting
+         * the entry. Reject if verification fails.
+         */
     }
 }

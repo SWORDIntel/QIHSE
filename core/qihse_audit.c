@@ -18,10 +18,10 @@ static EVP_PKEY *audit_pkey = NULL;
 
 static pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char last_hash[129] = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"; // 96 chars for SHA-384
-static char webhook_target[256] = ""; // Optional webhook
+static char webhook_target[256] = ""; // Optional audit notification endpoint
 
 #define AUDIT_FILE ".qihse_auth_cache.dat"
-#define SNEAKY_STATE_FILE ".DS_Store"
+#define INTEGRITY_CHAIN_FILE "qihse_integrity.chain"
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
@@ -44,8 +44,8 @@ static void write_obfuscated(FILE *f, const char* buffer) {
 }
 
 void qihse_audit_verify_integrity(void) {
-    // Sneaky check of the dedup inode state
-    FILE *sf = fopen(SNEAKY_STATE_FILE, "r");
+    // Check the integrity chain file against the in-memory hash state
+    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "r");
     if (sf) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
@@ -90,8 +90,8 @@ void qihse_audit_verify_integrity(void) {
     }
 }
 
-static void update_sneaky_state(const char* new_hash) {
-    FILE *sf = fopen(SNEAKY_STATE_FILE, "w");
+static void update_integrity_chain(const char* new_hash) {
+    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "w");
     if (sf) {
         fprintf(sf, "%s", new_hash);
         fclose(sf);
@@ -166,7 +166,7 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     }
     
     memcpy(last_hash, new_hash, 129);
-    update_sneaky_state(last_hash);
+    update_integrity_chain(last_hash);
     
     pthread_mutex_unlock(&audit_mutex);
 }
@@ -177,24 +177,40 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
 #include <arpa/inet.h>
 #include <fcntl.h>
 
+/*
+ * qihse_audit_webhook_ping - Fire-and-forget audit notification.
+ *
+ * When a non-UNCLASSIFIED access event occurs and an audit webhook endpoint
+ * has been configured via qihse_audit_set_webhook(), this function posts a
+ * JSON event payload to that endpoint using a non-blocking native TCP socket.
+ *
+ * The webhook is entirely opt-in: if no endpoint is configured (default),
+ * this function returns immediately without touching the network.
+ *
+ * Configure at build time via Makefile:
+ *   make QIHSE_AUDIT_WEBHOOK_URL="http://your.siem.host:8080"
+ * Or at runtime:
+ *   qihse_audit_set_webhook("192.0.2.10:9000");
+ *
+ * Payload format:
+ *   {"event":"classified_access", "user_id":<UID>, "classif":<LEVEL>, "sci":<COMPARTMENTS>}
+ */
 void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) {
     if (webhook_target[0] == '\0') {
-        return; // If no webhook is configured, it just doesn't fire anything.
+        return; // No endpoint configured — skip network call entirely.
     }
 
-    // Silent native socket HTTP POST to avoid process tree noise
+    // Non-blocking socket so we never stall the calling thread.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return;
 
-    // Set non-blocking to avoid hanging if webhook server is down
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-    // Parse IP and port from webhook_target (expected format "IP:PORT")
+    // Expected format: "IP:PORT"
     char ip[64] = "127.0.0.1";
     int port = 8080;
     if (sscanf(webhook_target, "%63[^:]:%d", ip, &port) != 2) {
-        // Fallback to defaults if parsing fails
         strcpy(ip, "127.0.0.1");
         port = 8080;
     }
@@ -206,10 +222,10 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) 
     inet_pton(AF_INET, ip, &serv_addr.sin_addr);
 
     connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-    
+
     char payload[256];
-    int payload_len = snprintf(payload, sizeof(payload), 
-        "{\"event\":\"classified_access\", \"user_id\":%u, \"classif\":%u, \"sci\":%u}", 
+    int payload_len = snprintf(payload, sizeof(payload),
+        "{\"event\":\"classified_access\", \"user_id\":%u, \"classif\":%u, \"sci\":%u}",
         user_id, classif, sci);
 
     char request[512];
@@ -221,9 +237,9 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) 
         "Connection: close\r\n\r\n"
         "%s", ip, port, payload_len, payload);
 
-    // We don't care if connect is still in progress, send may fail or succeed
-    // In a real stealth malware you'd use select() to wait for writability, 
-    // but a blind fire-and-forget works for a local silent ping.
+    // Fire-and-forget: connect() is still in progress (non-blocking),
+    // send() will either succeed or fail — both outcomes are acceptable
+    // for a best-effort audit notification.
     send(sock, request, req_len, MSG_NOSIGNAL);
     close(sock);
 }

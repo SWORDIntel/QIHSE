@@ -92,6 +92,34 @@ static PyObject* QihseDB_kv_get(QihseDBObject *self, PyObject *args) {
     return ret;
 }
 
+// ORM-style: db.kv_save("/path/to/file")
+static PyObject* QihseDB_kv_save(QihseDBObject *self, PyObject *args) {
+    const char* filepath;
+    if (!PyArg_ParseTuple(args, "s", &filepath)) {
+        return NULL;
+    }
+    int res = qihse_kv_save(self->ctx->kv, filepath);
+    if (res != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to save KV store to disk");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+// ORM-style: db.kv_load("/path/to/file")
+static PyObject* QihseDB_kv_load(QihseDBObject *self, PyObject *args) {
+    const char* filepath;
+    if (!PyArg_ParseTuple(args, "s", &filepath)) {
+        return NULL;
+    }
+    int res = qihse_kv_load(self->ctx->kv, filepath);
+    if (res != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to load KV store from disk");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 // Document
 static PyObject* QihseDB_doc_insert(QihseDBObject *self, PyObject *args) {
     unsigned long long doc_id;
@@ -125,6 +153,111 @@ static PyObject* QihseDB_tsdb_insert(QihseDBObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "IKd", &series_id, &ts, &val)) return NULL;
     qihse_tsdb_insert(self->ctx->tsdb, series_id, ts, val, 0, 0);
     Py_RETURN_NONE;
+}
+
+// Vector DB Native Operations
+static PyObject* QihseDB_vdb_open(QihseDBObject *self, PyObject *args) {
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+    if (self->ctx->vdb) {
+        qihse_vector_db_destroy(self->ctx->vdb);
+    }
+    uint32_t flags = (1u << 0) | (1u << 2) | (1u << 3); // CREATE | TRUNCATE | FILE_BACKED
+    self->ctx->vdb = qihse_vector_db_open(0, NULL, path, flags); // 0 = QIHSE_VECTOR_DB_AUTO
+    if (!self->ctx->vdb) {
+        PyErr_Format(PyExc_RuntimeError, "Failed to open vector DB: %s", strerror(errno));
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_vdb_flush(QihseDBObject *self, PyObject *args) {
+    (void)args;
+    if (!self->ctx->vdb) {
+        PyErr_SetString(PyExc_RuntimeError, "Vector DB is not open");
+        return NULL;
+    }
+    if (!qihse_vector_db_flush(self->ctx->vdb)) {
+        PyErr_Format(PyExc_RuntimeError, "Failed to flush vector DB: %s", strerror(errno));
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_vdb_checkpoint(QihseDBObject *self, PyObject *args) {
+    (void)args;
+    if (!self->ctx->vdb) {
+        PyErr_SetString(PyExc_RuntimeError, "Vector DB is not open");
+        return NULL;
+    }
+    if (!qihse_vector_db_checkpoint(self->ctx->vdb)) {
+        PyErr_Format(PyExc_RuntimeError, "Failed to checkpoint vector DB: %s", strerror(errno));
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_vdb_add(QihseDBObject *self, PyObject *args) {
+    PyObject* vec_list;
+    unsigned long long py_id;
+    if (!PyArg_ParseTuple(args, "KO", &py_id, &vec_list)) return NULL;
+    
+    if (!self->ctx->vdb) {
+        PyErr_SetString(PyExc_RuntimeError, "Vector DB is not open");
+        return NULL;
+    }
+    
+    uint64_t id = (uint64_t)py_id;
+    Py_ssize_t dims = PyList_Size(vec_list);
+    float* vector = NULL;
+    posix_memalign((void**)&vector, 64, dims * sizeof(float));
+    for (Py_ssize_t i = 0; i < dims; i++) {
+        vector[i] = (float)PyFloat_AsDouble(PyList_GetItem(vec_list, i));
+    }
+    
+    bool ok = qihse_vector_db_add_vectors(self->ctx->vdb, vector, 1, dims, &id, NULL, NULL);
+    free(vector);
+    
+    if (!ok) {
+        PyErr_Format(PyExc_RuntimeError, "Failed to add vector: %s", strerror(errno));
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* QihseDB_vdb_search(QihseDBObject *self, PyObject *args) {
+    PyObject* vec_list;
+    int limit;
+    if (!PyArg_ParseTuple(args, "Oi", &vec_list, &limit)) return NULL;
+    
+    Py_ssize_t dims = PyList_Size(vec_list);
+    float* vector = NULL;
+    posix_memalign((void**)&vector, 64, dims * sizeof(float));
+    for (Py_ssize_t i = 0; i < dims; i++) {
+        vector[i] = (float)PyFloat_AsDouble(PyList_GetItem(vec_list, i));
+    }
+    
+    qihse_vector_query_t q = {
+        .query_vector = vector,
+        .vector_dims = dims,
+        .top_k = limit,
+        .query_mode = QIHSE_VDB_QUERY_FLOAT32,
+        .distance_metric = QIHSE_DISTANCE_COSINE
+    };
+    
+    qihse_vector_result_t* results = malloc(limit * sizeof(qihse_vector_result_t));
+    int count = qihse_vector_db_search(self->ctx->vdb, &q, results, limit);
+    free(vector);
+    
+    PyObject* ret_list = PyList_New(count);
+    for (int i = 0; i < count; i++) {
+        PyObject* dict = PyDict_New();
+        PyDict_SetItemString(dict, "id", PyLong_FromUnsignedLongLong(results[i].id));
+        PyDict_SetItemString(dict, "score", PyFloat_FromDouble(results[i].score));
+        PyList_SetItem(ret_list, i, dict);
+    }
+    free(results);
+    return ret_list;
 }
 
 static PyObject* QihseDB_trinary_search(QihseDBObject *self, PyObject *args, PyObject *kwds) {
@@ -259,6 +392,8 @@ static PyMethodDef QihseDB_methods[] = {
     {"execute", (PyCFunction)QihseDB_execute, METH_VARARGS, "Execute raw QQL string."},
     {"kv_set", (PyCFunction)QihseDB_kv_set, METH_VARARGS, "Set a key-value pair."},
     {"kv_get", (PyCFunction)QihseDB_kv_get, METH_VARARGS, "Get a value by key."},
+    {"kv_save", (PyCFunction)QihseDB_kv_save, METH_VARARGS, "Save KV store to disk."},
+    {"kv_load", (PyCFunction)QihseDB_kv_load, METH_VARARGS, "Load KV store from disk."},
     {"doc_insert", (PyCFunction)QihseDB_doc_insert, METH_VARARGS, "Insert JSON document."},
     {"col_create", (PyCFunction)QihseDB_col_create, METH_VARARGS, "Create float column."},
     {"col_append", (PyCFunction)QihseDB_col_append, METH_VARARGS, "Append to float column."},
@@ -266,6 +401,11 @@ static PyMethodDef QihseDB_methods[] = {
     {"trinary_search", (PyCFunction)(void(*)(void))QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
     {"start_resp_proxy", (PyCFunction)QihseDB_start_resp_proxy, METH_VARARGS, "Start the Redis Wire proxy in the background."},
     {"start_pg_proxy", (PyCFunction)QihseDB_start_pg_proxy, METH_VARARGS, "Start the Postgres Wire proxy in the background."},
+    {"vdb_open", (PyCFunction)QihseDB_vdb_open, METH_VARARGS, "Open vector DB at path."},
+    {"vdb_flush", (PyCFunction)QihseDB_vdb_flush, METH_VARARGS, "Flush vector DB WAL."},
+    {"vdb_checkpoint", (PyCFunction)QihseDB_vdb_checkpoint, METH_VARARGS, "Checkpoint vector DB to disk."},
+    {"vdb_add", (PyCFunction)QihseDB_vdb_add, METH_VARARGS, "Add vector to DB."},
+    {"vdb_search", (PyCFunction)QihseDB_vdb_search, METH_VARARGS, "Search vector DB."},
     {"auth_create_user", (PyCFunction)QihseDB_auth_create_user, METH_VARARGS, "Create a user with explicit clearance boundaries."},
     {"auth_destroy_user", (PyCFunction)QihseDB_auth_destroy_user, METH_VARARGS, "Destroy a user (Warning: Destroying User 0 will trigger supernatural prompt)."},
     {"auth_can_access", (PyCFunction)QihseDB_auth_can_access, METH_VARARGS, "Check if user has clearance to access a resource."},
