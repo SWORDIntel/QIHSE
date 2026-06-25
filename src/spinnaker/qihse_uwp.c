@@ -161,6 +161,17 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
 void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_data, size_t len) {
     if (len < sizeof(qihse_uwp_header_t)) return;
     qihse_uwp_header_t* header = (qihse_uwp_header_t*)payload_data;
+    
+    // RED TEAM PATCH: Do not blindly trust the client-provided header length!
+    uint64_t claimed_len = le64toh(header->payload_length);
+    size_t physical_payload_len = len - sizeof(qihse_uwp_header_t);
+    
+    // The claimed length cannot exceed the physical bytes we actually received from XDP/socket.
+    if (claimed_len > physical_payload_len) {
+        // Drop malformed / malicious packet
+        return;
+    }
+    
     uint8_t* payload = (uint8_t*)payload_data + sizeof(qihse_uwp_header_t);
     uwp_route_payload(-1, ctx, header, payload);
 }
