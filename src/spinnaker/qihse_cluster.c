@@ -102,7 +102,7 @@ void qihse_cluster_receive_payload(const uint8_t* payload, size_t payload_size) 
         memcpy(&key_len, payload + offset, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         
-        if (offset + key_len > payload_size) return;
+        if (key_len > 1024 * 1024 || offset + key_len > payload_size) return;
         char* key = (char*)malloc(key_len + 1);
         if (!key) return;
         memcpy(key, payload + offset, key_len);
@@ -114,7 +114,7 @@ void qihse_cluster_receive_payload(const uint8_t* payload, size_t payload_size) 
         memcpy(&val_len, payload + offset, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         
-        if (offset + val_len > payload_size) { free(key); return; }
+        if (val_len > 16 * 1024 * 1024 || offset + val_len > payload_size) { free(key); return; }
         char* value = (char*)malloc(val_len + 1);
         if (!value) { free(key); return; }
         memcpy(value, payload + offset, val_len);
@@ -137,7 +137,7 @@ void qihse_cluster_receive_payload(const uint8_t* payload, size_t payload_size) 
         memcpy(&dim_u32, payload + offset, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         
-        if (dim_u32 > (SIZE_MAX / sizeof(float))) return;
+        if (dim_u32 > 4096 || dim_u32 > (SIZE_MAX / sizeof(float))) return;
         size_t vec_bytes = (size_t)dim_u32 * sizeof(float);
         if (offset + vec_bytes > payload_size) return;
         

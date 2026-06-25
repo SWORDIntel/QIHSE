@@ -237,6 +237,7 @@ typedef struct {
 static void uwp_add_accept(struct io_uring *ring, int server_fd, qihse_uwp_context_t* uwp_ctx, struct sockaddr_in *client_addr, socklen_t *client_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    if (!ev) return;
     ev->type = EVENT_ACCEPT;
     ev->fd = server_fd;
     ev->ctx = uwp_ctx;
@@ -249,6 +250,7 @@ static void uwp_add_accept(struct io_uring *ring, int server_fd, qihse_uwp_conte
 static void uwp_add_read(struct io_uring *ring, int client_fd, qihse_uwp_context_t* uwp_ctx, qihse_user_t* user) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    if (!ev) return;
     ev->type = EVENT_READ;
     ev->fd = client_fd;
     ev->ctx = uwp_ctx;
@@ -261,6 +263,7 @@ static void uwp_add_read(struct io_uring *ring, int client_fd, qihse_uwp_context
 static void uwp_add_write(struct io_uring *ring, int client_fd, const char* reply_str) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+    if (!ev) return;
     ev->type = EVENT_WRITE;
     ev->fd = client_fd;
     ev->ctx = NULL; // not needed for write completion
@@ -268,7 +271,7 @@ static void uwp_add_write(struct io_uring *ring, int client_fd, const char* repl
     ev->buf_len = strlen(reply_str);
     memcpy(ev->buf, reply_str, ev->buf_len);
     
-    io_uring_prep_send(sqe, client_fd, ev->buf, ev->buf_len, 0);
+    io_uring_prep_send(sqe, client_fd, ev->buf, ev->buf_len, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, ev);
 }
 #endif
@@ -343,6 +346,7 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
             if (xdp_fd >= 0) {
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
+                if (!ev) continue;
                 ev->type = EVENT_XDP_POLL;
                 ev->fd = xdp_fd;
                 ev->ctx = ctx;
