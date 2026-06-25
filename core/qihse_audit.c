@@ -279,7 +279,7 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) 
     char ip[64] = "127.0.0.1";
     int port = 8080;
     if (sscanf(webhook_target, "%63[^:]:%d", ip, &port) != 2) {
-        strcpy(ip, "127.0.0.1");
+        snprintf(ip, sizeof(ip), "127.0.0.1");
         port = 8080;
     }
 
