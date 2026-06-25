@@ -7,6 +7,8 @@
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <openssl/sha.h>
 #endif
 #ifndef _WIN32
@@ -46,8 +48,10 @@ static void write_obfuscated(FILE *f, const char* buffer) {
 }
 
 void qihse_audit_verify_integrity(void) {
-    // Check the integrity chain file against the in-memory hash state
-    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "r");
+#ifndef _WIN32
+    int sfd = open(INTEGRITY_CHAIN_FILE, O_RDONLY | O_NOFOLLOW);
+    if (sfd >= 0) {
+    FILE *sf = fdopen(sfd, "r");
     if (sf) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
@@ -97,15 +101,55 @@ void qihse_audit_verify_integrity(void) {
             }
         }
         fclose(sf);
+    } else {
+        close(sfd);
     }
+    }
+#else
+    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "r");
+    if (sf) {
+        char stored_hash[129];
+        if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
+            if (strncmp(stored_hash, last_hash, 96) != 0) {
+                printf("\n");
+                printf("======================================================================\n");
+                printf(" SYSTEM SECURITY ALERT: CRYPTOGRAPHIC INTEGRITY COMPROMISED\n");
+                printf("----------------------------------------------------------------------\n");
+                printf(" The internal CNSA 2.0 audit hash chain does not match the active state.\n");
+                printf(" This indicates unauthorized tampering, deletion, or corruption of the\n");
+                printf(" core security logging mechanism.\n");
+                printf("\n");
+                printf(" System lockdown initiated.\n");
+                printf(" To override this lockdown and dismiss the alert, an authorized\n");
+                printf(" Operator (Role 0) or Analyst (Role 1) must authenticate.\n");
+                printf("======================================================================\n");
+                abort();
+            }
+        }
+        fclose(sf);
+    }
+#endif
 }
 
 static void update_integrity_chain(const char* new_hash) {
+#ifndef _WIN32
+    int sfd = open(INTEGRITY_CHAIN_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (sfd >= 0) {
+        FILE *sf = fdopen(sfd, "w");
+        if (sf) {
+            fprintf(sf, "%s", new_hash);
+            fclose(sf);
+        } else {
+            close(sfd);
+        }
+    }
+#else
     FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "w");
     if (sf) {
         fprintf(sf, "%s", new_hash);
         fclose(sf);
     }
+#endif
 }
 
 void qihse_audit_set_webhook(const char* url) {
@@ -134,7 +178,9 @@ void qihse_audit_init(void) {
     if (f) {
         write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
         fclose(f);
+#ifndef _WIN32
         chmod(AUDIT_FILE, 0600);
+#endif
     }
     pthread_mutex_unlock(&audit_mutex);
     qihse_audit_verify_integrity();
@@ -166,15 +212,26 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         }
     }
     
+#ifndef _WIN32
+    int afd = open(AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (afd >= 0) {
+    FILE *f = fdopen(afd, "ab");
+#else
     FILE *f = fopen(AUDIT_FILE, "ab");
+#endif
     if (f) {
         char out_buf[2048];
         snprintf(out_buf, sizeof(out_buf), "%s|%s|SIG_MLDSA87_ATTACHED", buffer, new_hash);
         write_obfuscated(f, out_buf);
-        // We append the 4627 byte signature in the obfuscated stream natively
         for (int i = 0; i < MLDSA87_SIG_BYTES; i++) fputc(mldsa87_sig[i] ^ XOR_KEY, f);
         fclose(f);
+#ifndef _WIN32
+    } else {
+        close(afd);
     }
+#else
+    }
+#endif
     
     memcpy(last_hash, new_hash, 129);
     update_integrity_chain(last_hash);

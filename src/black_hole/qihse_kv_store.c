@@ -6,7 +6,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include "../broad_oak/qihse_quantum_defense.h"
+
+#define QIHSE_DATA_DIR "/var/lib/qihse/"
+#define WAL_PATH QIHSE_DATA_DIR "wal.log"
 
 #define LSM_MEMTABLE_MAX (8 * 1024 * 1024) // 8MB
 
@@ -53,11 +57,11 @@ static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
     
     // Truncate WAL
     if (store->wal_fd) fclose(store->wal_fd);
-    store->wal_fd = fopen("wal.log", "w");
+    store->wal_fd = fopen(WAL_PATH, "w");
 }
 
 static void recover_from_wal(qihse_kv_store_t* store) {
-    FILE* f = fopen("wal.log", "r");
+    FILE* f = fopen(WAL_PATH, "r");
     if (!f) return;
     char line[4096];
     while (fgets(line, sizeof(line), f)) {
@@ -124,8 +128,8 @@ qihse_kv_store_t* qihse_kv_store_create() {
     qihse_kv_seed_honeypot_bait(store);
     
     // Rotate WAL — start fresh, archive old log for debugging
-    rename("wal.log", "wal.log.old");
-    store->wal_fd = fopen("wal.log", "w");
+    rename(WAL_PATH, QIHSE_DATA_DIR "wal.log.old");
+    store->wal_fd = fopen(WAL_PATH, "w");
     
     return store;
 }
@@ -392,8 +396,10 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath) return -1;
     qihse_kv_sweep_expired(store);
-    FILE* f = fopen(filepath, "w");
-    if (!f) return -1;
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    FILE* f = fdopen(fd, "w");
+    if (!f) { close(fd); return -1; }
     
     for (size_t i = 0; i < store->num_keys; i++) {
         size_t out_size = 0;
@@ -411,8 +417,10 @@ int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
 
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath) return -1;
-    FILE* f = fopen(filepath, "r");
-    if (!f) return -1;
+    int fd = open(filepath, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    FILE* f = fdopen(fd, "r");
+    if (!f) { close(fd); return -1; }
     
     char header[256];
     while (fgets(header, sizeof(header), f)) {
