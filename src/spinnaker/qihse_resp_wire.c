@@ -75,6 +75,18 @@ static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args
     return argc;
 }
 
+static void resp_write_all(int fd, const char* buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        off += (size_t)w;
+    }
+}
+
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -115,29 +127,29 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             // Require auth at every network protocol entrypoint
             if (!current_user && strcasecmp(args[0], "AUTH") != 0 && strcasecmp(args[0], "PING") != 0) {
                 const char* reply = "-NOAUTH Authentication required.\r\n";
-                write(client_fd, reply, strlen(reply));
+                resp_write_all(client_fd, reply, strlen(reply));
                 continue;
             }
 
             if (strcasecmp(args[0], "PING") == 0) {
                 const char* reply = "+PONG\r\n";
-                write(client_fd, reply, strlen(reply));
+                resp_write_all(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "AUTH") == 0 && argc >= 3) {
                 current_user = qihse_auth_authenticate(args[1], args[2]);
                 if (current_user) {
                     const char* reply = "+OK\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else {
                     const char* reply = "-ERR invalid credentials\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "SET") == 0 && argc >= 3) {
                 if (qihse_kv_set_user(store, args[1], args[2], 0, 0, current_user)) {
                     const char* reply = "+OK\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else {
                     const char* reply = "-ERR Access denied or set failed\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "GET") == 0 && argc >= 2) {
                 const char* val = qihse_kv_get_user(store, args[1], current_user);
@@ -152,18 +164,18 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 if (val) {
                     char reply[1024];
                     snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(val), val);
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else {
                     const char* reply = "$-1\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "DEL") == 0 && argc >= 2) {
                 if (qihse_kv_del_user(store, args[1], current_user)) {
                     const char* reply = ":1\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else {
                     const char* reply = ":0\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "MSET") == 0 && argc >= 3) {
                 bool all_ok = true;
@@ -175,10 +187,10 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 }
                 if (all_ok) {
                     const char* reply = "+OK\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else {
                     const char* reply = "-ERR Access denied or set failed\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "MGET") == 0 && argc >= 2) {
                 char reply[65536];
@@ -203,18 +215,18 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                         }
                     }
                 }
-                write(client_fd, reply, offset);
+                resp_write_all(client_fd, reply, offset);
             } else if (strcasecmp(args[0], "INFO") == 0) {
                 const char* info = "# Server\r\nredis_version:7.0.0 (QIHSE Wire Proxy)\r\n# Memory\r\nused_memory_human:0B\r\n";
                 char reply[1024];
                 snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(info), info);
-                write(client_fd, reply, strlen(reply));
+                resp_write_all(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSET") == 0 && argc >= 3) {
                 uint64_t id = strtoull(args[1], NULL, 10);
                 int dim = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048) {
                     const char* reply = "-ERR invalid dimension\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
@@ -222,21 +234,21 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     }
                     qihse_vector_db_upsert_by_ids(vdb, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
                     const char* reply = "+OK\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                     free(vec);
                 } else {
                     const char* reply = "-ERR invalid VECSET format\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "VECGET") == 0 && argc >= 2) {
                 const char* reply = "-ERR VECGET not implemented\r\n";
-                write(client_fd, reply, strlen(reply));
+                resp_write_all(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSEARCH") == 0 && argc >= 3) {
                 int dim = (int)strtol(args[1], NULL, 10);
                 int top_k = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048 || top_k <= 0 || top_k > 1000) {
                     const char* reply = "-ERR invalid parameters\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
@@ -256,25 +268,25 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     if (found >= 0) {
                         char reply[1024];
                         snprintf(reply, sizeof(reply), "*%d\r\n", found);
-                        write(client_fd, reply, strlen(reply));
+                        resp_write_all(client_fd, reply, strlen(reply));
                         for (int i = 0; i < found; i++) {
                             char item[128];
                             snprintf(item, sizeof(item), ":%llu\r\n", (unsigned long long)results[i].id);
-                            write(client_fd, item, strlen(item));
+                            resp_write_all(client_fd, item, strlen(item));
                         }
                     } else {
                         const char* reply = "-ERR search failed\r\n";
-                        write(client_fd, reply, strlen(reply));
+                        resp_write_all(client_fd, reply, strlen(reply));
                     }
                     free(results);
                     free(vec);
                 } else {
                     const char* reply = "-ERR invalid VECSEARCH format\r\n";
-                    write(client_fd, reply, strlen(reply));
+                    resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else {
                 const char* reply = "-ERR unknown command\r\n";
-                write(client_fd, reply, strlen(reply));
+                resp_write_all(client_fd, reply, strlen(reply));
             }
         }
     }
