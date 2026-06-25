@@ -453,12 +453,19 @@ static bool verify_dsa_roundtrip(const char *priv_path, const char *pub_path) {
 bool qihse_pqc_keygen(const char *out_dir) {
     if (!out_dir) out_dir = ".";
 
-    /* Build file paths */
+    /* Build file paths — key file macros may be absolute paths */
     char kem_priv[512], kem_pub[512], dsa_priv[512], dsa_pub[512];
-    snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, QIHSE_KEM_PRIVATE_KEY_FILE);
-    snprintf(kem_pub,  sizeof(kem_pub),  "%s/%s", out_dir, QIHSE_KEM_PUBLIC_KEY_FILE);
-    snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, QIHSE_DSA_PRIVATE_KEY_FILE);
-    snprintf(dsa_pub,  sizeof(dsa_pub),  "%s/%s", out_dir, QIHSE_DSA_PUBLIC_KEY_FILE);
+    if (QIHSE_KEM_PRIVATE_KEY_FILE[0] == '/') {
+        snprintf(kem_priv, sizeof(kem_priv), "%s", QIHSE_KEM_PRIVATE_KEY_FILE);
+        snprintf(kem_pub,  sizeof(kem_pub),  "%s", QIHSE_KEM_PUBLIC_KEY_FILE);
+        snprintf(dsa_priv, sizeof(dsa_priv), "%s", QIHSE_DSA_PRIVATE_KEY_FILE);
+        snprintf(dsa_pub,  sizeof(dsa_pub),  "%s", QIHSE_DSA_PUBLIC_KEY_FILE);
+    } else {
+        snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, QIHSE_KEM_PRIVATE_KEY_FILE);
+        snprintf(kem_pub,  sizeof(kem_pub),  "%s/%s", out_dir, QIHSE_KEM_PUBLIC_KEY_FILE);
+        snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, QIHSE_DSA_PRIVATE_KEY_FILE);
+        snprintf(dsa_pub,  sizeof(dsa_pub),  "%s/%s", out_dir, QIHSE_DSA_PUBLIC_KEY_FILE);
+    }
 
     fprintf(stderr, "[QIHSE keygen] Output directory : %s\n", out_dir);
 

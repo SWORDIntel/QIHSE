@@ -17,15 +17,19 @@
 
 /* ── Key file locations ───────────────────────────────────────────────── */
 
+#define QIHSE_KEY_DIR "/etc/qihse/keys/"
+
 /* ML-KEM-1024: used for key encapsulation (at-rest AES key wrapping).
  * Generate with: scripts/qihse_keygen.sh  */
-#define QIHSE_KEM_PRIVATE_KEY_FILE  "qihse_kem_key.pem"
-#define QIHSE_KEM_PUBLIC_KEY_FILE   "qihse_kem_pub.pem"
+#define QIHSE_KEM_PRIVATE_KEY_FILE  QIHSE_KEY_DIR "qihse_kem_key.pem"
+#define QIHSE_KEM_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_kem_pub.pem"
 
 /* ML-DSA-87: used for signing container manifests and audit log entries.
  * Generate with: scripts/qihse_keygen.sh  */
-#define QIHSE_DSA_PRIVATE_KEY_FILE  "qihse_dsa_key.pem"
-#define QIHSE_DSA_PUBLIC_KEY_FILE   "qihse_dsa_pub.pem"
+#define QIHSE_DSA_PRIVATE_KEY_FILE  QIHSE_KEY_DIR "qihse_dsa_key.pem"
+#define QIHSE_DSA_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_dsa_pub.pem"
+
+#define QIHSE_TLS_CERT_FILE         QIHSE_KEY_DIR "qihse_dsa_cert.pem"
 
 /* ── Context ──────────────────────────────────────────────────────────── */
 
