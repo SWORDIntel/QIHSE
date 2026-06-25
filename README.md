@@ -8,15 +8,15 @@
 ### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
-[![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white)]()
-[![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=black)]()
-[![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)]()
-[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512-00599C)]()
-[![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen)]()
-[![Security](https://img.shields.io/badge/Security-Cell--Level%20Clearance-red)]()
-[![CNSA 2.0 Compliant](https://img.shields.io/badge/CNSA%202.0-Compliant-brightgreen.svg)]()
-[![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success)]()
+![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)
+![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)
+![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512-00599C)
+![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux)
+![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen)
+![CNSA 2.0 Compliant](https://img.shields.io/badge/Cryptography-CNSA%202.0-brightgreen.svg)
+![FIPS 140-3](https://img.shields.io/badge/Hardware-FIPS%20140--3-brightgreen.svg)
+![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success)
 
 </div>
 
