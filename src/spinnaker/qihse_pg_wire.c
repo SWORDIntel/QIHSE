@@ -54,6 +54,8 @@
 #ifndef _WIN32
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
 #else
 #define SSL_CTX void
 #define SSL void
@@ -63,6 +65,9 @@
 #include <poll.h>
 #endif
 #include "../networking/qihse_af_xdp.h"
+#ifndef _WIN32
+#include "../../persistence/qihse_pqc_crypto.h"
+#endif
 
 static SSL_CTX* global_pqc_ssl_ctx = NULL;
 static __thread SSL* current_ssl = NULL;
@@ -670,13 +675,31 @@ static void* pg_handle_client(void* arg) {
 
 static void af_xdp_pg_cb(char *pkt, uint32_t len, void *arg) {
     (void)arg;
-    if (len > 54) {
-        char *payload = pkt + 54;
-        if (strstr(payload, "SELECT 1")) {
-            printf("[AF_XDP PG] Fast-path zero-copy bypass: SELECT 1\n");
-        } else if (strstr(payload, "SELECT")) {
-            printf("[AF_XDP PG] Fast-path zero-copy bypass: SELECT\n");
+    /* Minimum: Ethernet(14) + IP(20) + TCP(20) = 54 bytes */
+    if (len < 54) return;
+
+    /* Skip to TCP payload: Ethernet(14) + IP header (ihl*4) + TCP header (doff*4) */
+    uint8_t *ip_hdr  = (uint8_t *)pkt + 14;
+    uint32_t ip_len  = (ip_hdr[0] & 0x0f) * 4;
+    uint8_t *tcp_hdr = ip_hdr + ip_len;
+    uint32_t tcp_len = ((tcp_hdr[12] >> 4) & 0x0f) * 4;
+    uint8_t *payload = tcp_hdr + tcp_len;
+    uint32_t payload_len = (uint32_t)(((uint8_t *)pkt + len) - payload);
+
+    if (payload_len < 5) return;
+
+    /* Identify protocol by payload content */
+    if (payload[0] == 'Q' && payload[1] == 'I' && payload[2] == 'H' &&
+        payload[3] == 'S' && payload[4] == 'E') {
+        /* UWP packet — 16-byte header already in payload */
+        if (payload_len >= 16) {
+            printf("[AF_XDP] Fast-path UWP: engine=0x%02x cmd=0x%02x len=%u\n",
+                   payload[6], payload[7], (unsigned)payload_len);
         }
+    } else {
+        /* PostgreSQL wire protocol — first byte is message type */
+        printf("[AF_XDP] Fast-path PG: msg_type='%c' payload_len=%u\n",
+               (char)payload[0], payload_len);
     }
 }
 
@@ -718,31 +741,40 @@ static void* af_xdp_pg_thread(void *arg) {
 
 bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_address) {
 #ifndef _WIN32
+    /* Load FIPS provider if available — all TLS ops go through validated module */
+    qihse_pqc_init_providers();
+
     if (!global_pqc_ssl_ctx) {
-        if (access("qihse_pqc_cert.pem", F_OK) != 0) {
-            printf("[PQC INIT] Generating native ML-DSA-87 certificates for the Quantum-Resistant TLS Proxy...\n");
-            int ret = system("openssl req -x509 -new -newkey ML-DSA-87 -keyout qihse_pqc_key.pem -out qihse_pqc_cert.pem -nodes -subj \"/CN=QIHSE PQC Autogen\" -days 365 2>/dev/null");
-            if (ret != 0) {
-                fprintf(stderr, "[WARNING] Failed to generate ML-DSA-87 certificates. Make sure OpenSSL 3.5+ is installed.\n");
-            }
+        /* Generate DSA key + self-signed cert if not present */
+        if (access(QIHSE_DSA_PRIVATE_KEY_FILE, F_OK) != 0) {
+            fprintf(stderr, "[PQC INIT] Generating ML-DSA-87 keypair...\n");
+            qihse_pqc_keygen(".");
+        }
+        if (access("qihse_dsa_cert.pem", F_OK) != 0) {
+            fprintf(stderr, "[PQC INIT] Generating self-signed ML-DSA-87 TLS certificate...\n");
+            int ret = system("openssl req -x509 -new "
+                             "-key " QIHSE_DSA_PRIVATE_KEY_FILE " "
+                             "-out qihse_dsa_cert.pem "
+                             "-nodes -subj \"/CN=QIHSE Cluster\" "
+                             "-days 3650 2>/dev/null");
+            if (ret != 0)
+                fprintf(stderr, "[WARNING] TLS cert generation failed. Continuing without TLS.\n");
         }
 
-        SSL_load_error_strings();
-        OpenSSL_add_ssl_algorithms();
         global_pqc_ssl_ctx = SSL_CTX_new(TLS_server_method());
         if (global_pqc_ssl_ctx) {
             SSL_CTX_set_min_proto_version(global_pqc_ssl_ctx, TLS1_3_VERSION);
             SSL_CTX_set1_groups_list(global_pqc_ssl_ctx, "mlkem1024");
             SSL_CTX_set1_sigalgs_list(global_pqc_ssl_ctx, "ML-DSA-87");
             SSL_CTX_set_ciphersuites(global_pqc_ssl_ctx, "TLS_AES_256_GCM_SHA384");
-            
-            if (SSL_CTX_use_certificate_file(global_pqc_ssl_ctx, "qihse_pqc_cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-                SSL_CTX_use_PrivateKey_file(global_pqc_ssl_ctx, "qihse_pqc_key.pem", SSL_FILETYPE_PEM) <= 0) {
-                fprintf(stderr, "Warning: Failed to load PQC cert/key. Running unencrypted.\n");
+
+            if (SSL_CTX_use_certificate_file(global_pqc_ssl_ctx, "qihse_dsa_cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+                SSL_CTX_use_PrivateKey_file(global_pqc_ssl_ctx, QIHSE_DSA_PRIVATE_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
+                fprintf(stderr, "[WARNING] Failed to load PQC cert/key. Running unencrypted.\n");
                 SSL_CTX_free(global_pqc_ssl_ctx);
                 global_pqc_ssl_ctx = NULL;
             } else {
-                printf("[PQC INIT] Successfully loaded ML-DSA-87 certificates. PG Proxy is strictly ML-KEM-1024 TLS 1.3 enforced.\n");
+                fprintf(stderr, "[PQC INIT] ML-KEM-1024 / ML-DSA-87 / AES-256-GCM-SHA384 TLS 1.3 active.\n");
             }
         }
     }

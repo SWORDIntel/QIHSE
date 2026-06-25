@@ -149,14 +149,35 @@ endif
 .PHONY: all build build-native clean pristine workspace workspace-clean lib persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
 .NOTPARALLEL: validate-reference-workflow
 
-all: lib server
-build: lib server lib-ctypes
+all: lib server keygen
+build: lib server lib-ctypes keygen
 
 build-native:
 	./scripts/build-native.sh
 
 server: lib
 	$(CC) $(CFLAGS) -o tests/qihse_server tests/qihse_server.c -L. -lqihse $(LDFLAGS)
+
+keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c
+	@echo "Building qihse_keygen..."
+	$(CC) -std=c99 -Wall -Wextra -O2 -fPIC \
+	    -I. -I./persistence -I./include \
+	    -o qihse_keygen \
+	    tools/qihse_keygen.c \
+	    persistence/qihse_pqc_crypto.c \
+	    -lssl -lcrypto -lpthread
+	@echo "qihse_keygen build successful"
+	@echo "  Usage: ./qihse_keygen [output-dir]"
+
+xdp-kern: src/networking/qihse_xdp_kern.c
+	@echo "Building eBPF XDP kernel object..."
+	clang -O2 -target bpf \
+	    -I/usr/include \
+	    -I/usr/include/x86_64-linux-gnu \
+	    -D__TARGET_ARCH_x86 \
+	    -c src/networking/qihse_xdp_kern.c \
+	    -o src/networking/qihse_xdp.o
+	@echo "qihse_xdp.o build successful"
 
 lib: $(LIB_TARGET)
 
@@ -537,6 +558,7 @@ isa-info:
 
 clean:
 	rm -f *.o libqihse.so qihse.dll qihse_benchmark qihse_benchmark_a00 \
+	    qihse_keygen \
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \

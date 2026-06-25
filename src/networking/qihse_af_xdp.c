@@ -82,7 +82,7 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
         .bind_flags = XDP_USE_NEED_WAKEUP,
     };
 
-    if (xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, 
+    if (xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem,
                            &ctx->rx_ring, &ctx->tx_ring, &xsk_cfg)) {
         fprintf(stderr, "Failed to create AF_XDP socket\n");
         xsk_umem__delete(ctx->umem);
@@ -99,7 +99,21 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
         xsk_ring_prod__submit(&ctx->fill_ring, XSK_RING_PROD__DEFAULT_NUM_DESCS);
     }
 
-    printf("[QIHSE eBPF] XDP Program attached to %s. AF_XDP socket bound.\n", ifname);
+    /* Register AF_XDP socket in the kernel XSKMAP so XDP_REDIRECT works */
+    struct bpf_object *bpf_obj = xdp_program__bpf_obj(ctx->prog);
+    struct bpf_map *xsk_map = bpf_object__find_map_by_name(bpf_obj, "xsks_map");
+    if (xsk_map) {
+        int xsk_map_fd = bpf_map__fd(xsk_map);
+        int sock_fd    = xsk_socket__fd(ctx->xsk);
+        uint32_t key   = 0; /* queue index 0 */
+        if (bpf_map_update_elem(xsk_map_fd, &key, &sock_fd, BPF_ANY) != 0) {
+            fprintf(stderr, "[QIHSE eBPF] Warning: failed to register socket in XSKMAP\n");
+        }
+    } else {
+        fprintf(stderr, "[QIHSE eBPF] Warning: xsks_map not found in BPF object\n");
+    }
+
+    printf("[QIHSE eBPF] XDP program attached to %s. AF_XDP socket registered.\n", ifname);
     return ctx;
 
 cleanup:
@@ -124,6 +138,20 @@ void qihse_af_xdp_teardown(struct qihse_af_xdp_ctx *ctx, const char *ifname) {
 int qihse_af_xdp_get_fd(struct qihse_af_xdp_ctx *ctx) {
     if (!ctx || !ctx->xsk) return -1;
     return xsk_socket__fd(ctx->xsk);
+}
+
+/*
+ * qihse_af_xdp_set_port - Configure a port in the kernel BPF port map.
+ * idx 0 = PG wire port, idx 1 = UWP port.
+ * Call after qihse_af_xdp_init().
+ */
+void qihse_af_xdp_set_port(struct qihse_af_xdp_ctx *ctx, uint32_t idx, uint32_t port) {
+    if (!ctx || !ctx->prog) return;
+    struct bpf_object *bpf_obj = xdp_program__bpf_obj(ctx->prog);
+    struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, "qihse_ports");
+    if (!map) return;
+    int fd = bpf_map__fd(map);
+    bpf_map_update_elem(fd, &idx, &port, BPF_ANY);
 }
 
 void qihse_af_xdp_poll(struct qihse_af_xdp_ctx *ctx, qihse_af_xdp_cb_t cb, void *arg) {

@@ -516,12 +516,12 @@ qihse_security_event_t event = {
 qihse_security_log_event(&event);
 ```
 
-### Cryptographic Log Integrity & CNSA 2.0 Stealth Hash Chaining
+### Cryptographic Log Integrity & Auditable Hash Chain
 
 ```c
-// Initialize tamper-evident camouflage logging
+// Initialize tamper-evident audit logging
 qihse_secure_log_config_t log_config = {
-    .log_file_path = ".DS_Store", // Stealth camouflage file
+    .log_file_path = "qihse_integrity.chain", // Primary integrity chain file
     .max_log_size_mb = 100,
     .max_log_files = 10,
     .integrity_check_interval_seconds = 300,
@@ -538,17 +538,18 @@ qihse_secure_log_entry_t entry = {
     .event_type = QIHSE_SECURITY_AUTH_SUCCESS,
     .user_id = "user123",
     .details = "User authenticated successfully",
-    .integrity_hash = NULL  // Will be computed automatically
+    .integrity_hash = NULL  // Computed automatically from the running hash chain
 };
 
 qihse_secure_log_append(secure_log, &entry);
 
-// Verify stealth hash integrity chain
+// Verify audit hash chain integrity
 qihse_log_integrity_status_t status = qihse_secure_log_verify_integrity(secure_log);
 if (status != QIHSE_LOG_INTEGRITY_VALID) {
     qihse_security_incident_report(QIHSE_INCIDENT_LOG_TAMPERING,
                                  "Log integrity compromised. Hashes do not align.");
-    // Triggers violently enforced system lockdown. A Hardware-Token Role 0 or Role 1 must intervene.
+    // Initiates authenticated lockdown: a Role 0 Operator or Role 1 Analyst
+    // must present credentials at the terminal to resume execution.
     qihse_auth_lockdown();
 }
 
