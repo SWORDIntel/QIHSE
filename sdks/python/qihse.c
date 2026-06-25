@@ -16,6 +16,7 @@
 typedef struct {
     PyObject_HEAD
     qihse_uwp_context_t* ctx;
+    qihse_user_t* current_user;
 } QihseDBObject;
 
 static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
@@ -33,6 +34,7 @@ static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     self->ctx->doc = qihse_doc_store_create(self->ctx->kv);
     self->ctx->col = qihse_column_store_create();
     self->ctx->tsdb = qihse_tsdb_create();
+    self->current_user = NULL;
     return 0;
 }
 
@@ -66,6 +68,21 @@ static PyObject* QihseDB_execute(QihseDBObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* QihseDB_authenticate(QihseDBObject *self, PyObject *args) {
+    const char* username;
+    const char* password;
+    if (!PyArg_ParseTuple(args, "ss", &username, &password)) {
+        return NULL;
+    }
+    self->current_user = qihse_auth_authenticate(username, password);
+    if (!self->current_user) {
+        PyErr_SetString(PyExc_RuntimeError, "Authentication failed");
+        return NULL;
+    }
+    self->ctx->user = self->current_user;
+    Py_RETURN_NONE;
+}
+
 // ORM-style: db.kv_set("foo", "bar")
 static PyObject* QihseDB_kv_set(QihseDBObject *self, PyObject *args) {
     const char* key;
@@ -73,7 +90,14 @@ static PyObject* QihseDB_kv_set(QihseDBObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "ss", &key, &val)) {
         return NULL;
     }
-    qihse_kv_set(self->ctx->kv, key, val, 0, 0);
+    if (!self->current_user) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
+        return NULL;
+    }
+    if (!qihse_kv_set_user(self->ctx->kv, key, val, 0, 0, self->current_user)) {
+        PyErr_SetString(PyExc_PermissionError, "Access denied or set failed");
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -83,7 +107,7 @@ static PyObject* QihseDB_kv_get(QihseDBObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "s", &key)) {
         return NULL;
     }
-    char* val = qihse_kv_get_user(self->ctx->kv, key, NULL);
+    char* val = qihse_kv_get_user(self->ctx->kv, key, self->current_user);
     if (!val) {
         Py_RETURN_NONE;
     }
@@ -125,6 +149,10 @@ static PyObject* QihseDB_doc_insert(QihseDBObject *self, PyObject *args) {
     unsigned long long doc_id;
     const char* json;
     if (!PyArg_ParseTuple(args, "Ks", &doc_id, &json)) return NULL;
+    if (!qihse_auth_can_access(self->current_user, 0, 0)) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
+        return NULL;
+    }
     qihse_doc_store_insert_json(self->ctx->doc, doc_id, json);
     Py_RETURN_NONE;
 }
@@ -141,6 +169,10 @@ static PyObject* QihseDB_col_append(QihseDBObject *self, PyObject *args) {
     const char* name;
     float val;
     if (!PyArg_ParseTuple(args, "sf", &name, &val)) return NULL;
+    if (!qihse_auth_can_access(self->current_user, 0, 0)) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
+        return NULL;
+    }
     qihse_column_append_float32(self->ctx->col, name, val, 0, 0);
     Py_RETURN_NONE;
 }
@@ -151,6 +183,10 @@ static PyObject* QihseDB_tsdb_insert(QihseDBObject *self, PyObject *args) {
     unsigned long long ts;
     double val;
     if (!PyArg_ParseTuple(args, "IKd", &series_id, &ts, &val)) return NULL;
+    if (!qihse_auth_can_access(self->current_user, 0, 0)) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
+        return NULL;
+    }
     qihse_tsdb_insert(self->ctx->tsdb, series_id, ts, val, 0, 0);
     Py_RETURN_NONE;
 }
@@ -175,6 +211,10 @@ static PyObject* QihseDB_vdb_flush(QihseDBObject *self, PyObject *args) {
     (void)args;
     if (!self->ctx->vdb) {
         PyErr_SetString(PyExc_RuntimeError, "Vector DB is not open");
+        return NULL;
+    }
+    if (!qihse_auth_can_access(self->current_user, 0, 0)) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
         return NULL;
     }
     if (!qihse_vector_db_flush(self->ctx->vdb)) {
@@ -204,6 +244,10 @@ static PyObject* QihseDB_vdb_add(QihseDBObject *self, PyObject *args) {
     
     if (!self->ctx->vdb) {
         PyErr_SetString(PyExc_RuntimeError, "Vector DB is not open");
+        return NULL;
+    }
+    if (!qihse_auth_can_access(self->current_user, 0, 0)) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
         return NULL;
     }
     
@@ -242,7 +286,8 @@ static PyObject* QihseDB_vdb_search(QihseDBObject *self, PyObject *args) {
         .vector_dims = dims,
         .top_k = limit,
         .query_mode = QIHSE_VDB_QUERY_FLOAT32,
-        .distance_metric = QIHSE_DISTANCE_COSINE
+        .distance_metric = QIHSE_DISTANCE_COSINE,
+        .user = self->current_user
     };
     
     qihse_vector_result_t* results = malloc(limit * sizeof(qihse_vector_result_t));
@@ -297,13 +342,14 @@ static void* run_pg(void* a) {
 }
 
 static PyObject* QihseDB_start_resp_proxy(QihseDBObject *self, PyObject *args) {
-    const char* addr = "0.0.0.0";
+    const char* addr = "127.0.0.1";
     int port = 6379;
     if (!PyArg_ParseTuple(args, "|si", &addr, &port)) return NULL;
     struct ServerArgs* s = malloc(sizeof(struct ServerArgs));
     s->ctx = self->ctx;
     s->port = port;
     strncpy(s->addr, addr, 63);
+    s->addr[63] = '\0';
     pthread_t t;
     pthread_create(&t, NULL, run_resp, s);
     pthread_detach(t);
@@ -311,13 +357,14 @@ static PyObject* QihseDB_start_resp_proxy(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_start_pg_proxy(QihseDBObject *self, PyObject *args) {
-    const char* addr = "0.0.0.0";
+    const char* addr = "127.0.0.1";
     int port = 5432;
     if (!PyArg_ParseTuple(args, "|si", &addr, &port)) return NULL;
     struct ServerArgs* s = malloc(sizeof(struct ServerArgs));
     s->ctx = self->ctx;
     s->port = port;
     strncpy(s->addr, addr, 63);
+    s->addr[63] = '\0';
     pthread_t t;
     pthread_create(&t, NULL, run_pg, s);
     pthread_detach(t);
@@ -325,24 +372,22 @@ static PyObject* QihseDB_start_pg_proxy(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
-    (void)self;
-    unsigned int creator_id;
     unsigned int target_user_id;
     unsigned int role;
     unsigned int clearance;
     unsigned int sci;
+    const char* password = "default_password";
     
-    if (!PyArg_ParseTuple(args, "IIIII", &creator_id, &target_user_id, &role, &clearance, &sci)) {
+    if (!PyArg_ParseTuple(args, "IIII|s", &target_user_id, &role, &clearance, &sci, &password)) {
         return NULL;
     }
     
-    qihse_user_t* creator = qihse_auth_get_user(creator_id);
-    if (!creator && target_user_id != 0) {
-        PyErr_SetString(PyExc_PermissionError, "Creator user does not exist or has insufficient privileges.");
+    if (!self->current_user) {
+        PyErr_SetString(PyExc_PermissionError, "Authentication required");
         return NULL;
     }
     
-    bool success = qihse_auth_create_user(creator, target_user_id, role, clearance, sci, "default_password", true);
+    bool success = qihse_auth_create_user(self->current_user, target_user_id, role, clearance, sci, password, true) != NULL;
     if (!success) {
         PyErr_SetString(PyExc_PermissionError, "Failed to create user (clearance or God-Mode violation).");
         return NULL;
@@ -352,9 +397,12 @@ static PyObject* QihseDB_auth_create_user(QihseDBObject *self, PyObject *args) {
 }
 
 static PyObject* QihseDB_auth_destroy_user(QihseDBObject *self, PyObject *args) {
-    (void)self;
     unsigned int user_id;
     if (!PyArg_ParseTuple(args, "I", &user_id)) {
+        return NULL;
+    }
+    if (!self->current_user || self->current_user->role != QIHSE_ROLE_OPERATOR) {
+        PyErr_SetString(PyExc_PermissionError, "Operator authentication required");
         return NULL;
     }
     
@@ -401,6 +449,7 @@ static PyMethodDef QihseDB_methods[] = {
     {"trinary_search", (PyCFunction)(void(*)(void))QihseDB_trinary_search, METH_VARARGS | METH_KEYWORDS, "Perform trinary search."},
     {"start_resp_proxy", (PyCFunction)QihseDB_start_resp_proxy, METH_VARARGS, "Start the Redis Wire proxy in the background."},
     {"start_pg_proxy", (PyCFunction)QihseDB_start_pg_proxy, METH_VARARGS, "Start the Postgres Wire proxy in the background."},
+    {"authenticate", (PyCFunction)QihseDB_authenticate, METH_VARARGS, "Authenticate with username and password"},
     {"vdb_open", (PyCFunction)QihseDB_vdb_open, METH_VARARGS, "Open vector DB at path."},
     {"vdb_flush", (PyCFunction)QihseDB_vdb_flush, METH_VARARGS, "Flush vector DB WAL."},
     {"vdb_checkpoint", (PyCFunction)QihseDB_vdb_checkpoint, METH_VARARGS, "Checkpoint vector DB to disk."},

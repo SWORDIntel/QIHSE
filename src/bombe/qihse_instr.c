@@ -6,6 +6,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 #ifdef __x86_64__
 #include <immintrin.h>
@@ -329,8 +331,14 @@ int qihse_power_set_mode(qihse_frequency_mode_t mode, double target_freq_mhz) {
     if (target_freq_mhz > 0.0) {
         /* Set specific frequency */
         snprintf(cmd, sizeof(cmd),
-                "cpufreq-set -f %.0fMHz 2>/dev/null || true",
-                target_freq_mhz);
+                "%.0f", target_freq_mhz);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("cpufreq-set", "cpufreq-set", "-f", cmd, "MHz", (char*)NULL);
+            _exit(1);
+        } else if (pid > 0) {
+            int status; waitpid(pid, &status, 0);
+        }
     } else {
         /* Set governor based on mode */
         const char* governor = "ondemand";
@@ -340,11 +348,14 @@ int qihse_power_set_mode(qihse_frequency_mode_t mode, double target_freq_mhz) {
             case QIHSE_FREQ_MODE_BALANCED: governor = "ondemand"; break;
             default: governor = "ondemand"; break;
         }
-        snprintf(cmd, sizeof(cmd),
-                "cpufreq-set -g %s 2>/dev/null || true", governor);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("cpufreq-set", "cpufreq-set", "-g", governor, (char*)NULL);
+            _exit(1);
+        } else if (pid > 0) {
+            int status; waitpid(pid, &status, 0);
+        }
     }
-
-    system(cmd);
     return 0;
 }
 
@@ -489,12 +500,11 @@ int qihse_power_set_budget(double budget_watts) {
 int qihse_power_set_turbo(bool enable) {
     g_power_config.enable_turbo = enable;
 
-    if (enable) {
-        /* Enable turbo boost */
-        system("echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true");
-    } else {
-        /* Disable turbo boost */
-        system("echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true");
+    const char *turbo_val = enable ? "1" : "0";
+    int fd = open("/sys/devices/system/cpu/intel_pstate/no_turbo", O_WRONLY);
+    if (fd >= 0) {
+        write(fd, turbo_val, 1);
+        close(fd);
     }
 
     return 0;

@@ -39,7 +39,9 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
         return NULL;
     }
 
-    ctx->prog = xdp_program__open_file("src/networking/qihse_xdp.o", "xdp", NULL);
+    const char *xdp_obj = getenv("QIHSE_XDP_OBJ");
+    if (!xdp_obj) xdp_obj = "/usr/local/lib/qihse/qihse_xdp.o";
+    ctx->prog = xdp_program__open_file(xdp_obj, "xdp", NULL);
     if (libxdp_get_error(ctx->prog)) {
         fprintf(stderr, "Failed to open XDP program\n");
         free(ctx);

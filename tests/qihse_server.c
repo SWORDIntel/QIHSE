@@ -15,13 +15,13 @@ qihse_vector_db_t global_vdb;
 
 void* resp_server_thread(void* arg) {
     (void)arg;
-    qihse_start_resp_server(global_kv, global_vdb, 6379, "0.0.0.0");
+    qihse_start_resp_server(global_kv, global_vdb, 6379, "127.0.0.1");
     return NULL;
 }
 
 void* pg_server_thread(void* arg) {
     (void)arg;
-    qihse_start_pg_wire_server((void*)global_vdb, 5432, "0.0.0.0");
+    qihse_start_pg_wire_server((void*)global_vdb, 5432, "127.0.0.1");
     return NULL;
 }
 
@@ -40,6 +40,12 @@ int main(int argc, char** argv) {
     if (!global_kv || !global_vdb) {
         fprintf(stderr, "Failed to initialize databases.\n");
         return 1;
+    }
+
+    // Rotate default operator password to satisfy security controls
+    qihse_user_t* god = qihse_auth_get_user(0);
+    if (god) {
+        qihse_auth_modify_user(god, 0, "GODMODE_OP", "ROTATED_OPERATOR_P@SSW0RD_SECURE_123", -1, -1);
     }
 
     pthread_t resp_t, pg_t;

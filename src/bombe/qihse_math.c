@@ -24,6 +24,8 @@ static inline int posix_memalign(void **memptr, size_t alignment, size_t size) {
 #include <time.h>
 #include <stdio.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #ifndef M_PI
 #define M_PI acos(-1.0)
@@ -255,13 +257,23 @@ int qihse_intel_get_performance_stats(qihse_intel_performance_t* stats) {
 
 int qihse_intel_set_frequency_scaling(double target_frequency_mhz) {
     if (target_frequency_mhz == 0.0) {
-        system("cpupower frequency-set -g performance 2>/dev/null || true");
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("cpupower", "cpupower", "frequency-set", "-g", "performance", (char*)NULL);
+            _exit(1);
+        } else if (pid > 0) {
+            int status; waitpid(pid, &status, 0);
+        }
     } else {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd),
-                "cpupower frequency-set -f %.0fMHz 2>/dev/null || true",
-                target_frequency_mhz);
-        system(cmd);
+        char freq_str[32];
+        snprintf(freq_str, sizeof(freq_str), "%.0fMHz", target_frequency_mhz);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("cpupower", "cpupower", "frequency-set", "-f", freq_str, (char*)NULL);
+            _exit(1);
+        } else if (pid > 0) {
+            int status; waitpid(pid, &status, 0);
+        }
     }
     return 0;
 }

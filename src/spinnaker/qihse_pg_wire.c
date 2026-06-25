@@ -44,6 +44,7 @@
 #endif
 #ifndef _WIN32
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <netinet/tcp.h>
 #endif
 #include "qihse_platform.h"
@@ -362,9 +363,13 @@ static void str_rtrim_semi(char* s) {
  * Handle a single Simple Query and emit the appropriate response sequence.
  * Returns 0 on success, -1 on fatal write error (caller should close).
  */
-static int pg_handle_query(int fd, void* vdb, const char* raw_query) {
+static int pg_handle_query(int fd, void* vdb, const char* raw_query, qihse_user_t* user) {
     /* Work on a mutable trimmed copy */
     char query[4096];
+    if (!user) {
+        if (pg_send_error(fd, "ERROR", "28000", "authentication required") < 0) return -1;
+        return pg_send_ready_for_query(fd);
+    }
     size_t qlen = strlen(raw_query);
     if (qlen >= sizeof(query)) qlen = sizeof(query) - 1;
     memcpy(query, raw_query, qlen);
@@ -457,27 +462,60 @@ static int pg_handle_query(int fd, void* vdb, const char* raw_query) {
  *   int32   protocol       (196608 = 3.0, or 80877103 = SSLRequest)
  *   cstring key, cstring value ... (pairs terminated by empty string)
  */
-static int pg_do_startup(int fd) {
+static int pg_send_auth_cleartext(int fd) {
+    uint8_t body[4] = {0, 0, 0, 3}; // method = 3 (CleartextPassword)
+    return pg_send_msg(fd, 'R', body, 4);
+}
+
+static qihse_user_t* pg_read_password_and_authenticate(int fd, const char* username) {
+    uint8_t tag;
+    if (pg_read_all(fd, &tag, 1) < 0) return NULL;
+    if (tag != 'p') return NULL; // Expected PasswordMessage
+    
+    uint8_t lenbuf[4];
+    if (pg_read_all(fd, lenbuf, 4) < 0) return NULL;
+    int32_t len = (int32_t)(((uint32_t)lenbuf[0] << 24) |
+                            ((uint32_t)lenbuf[1] << 16) |
+                            ((uint32_t)lenbuf[2] << 8)  |
+                            ((uint32_t)lenbuf[3]));
+    if (len < 4 || len > 1024) return NULL;
+    
+    size_t body_len = (size_t)(len - 4);
+    char* password = malloc(body_len + 1);
+    if (!password) return NULL;
+    if (pg_read_all(fd, password, body_len) < 0) {
+        free(password);
+        return NULL;
+    }
+    password[body_len] = '\0';
+    
+    // Check password
+    qihse_user_t* user = qihse_auth_authenticate(username, password);
+    free(password);
+    return user;
+}
+
+static qihse_user_t* pg_do_startup(int fd) {
     /* Read the 4-byte length field */
     uint8_t lenbuf[4];
-    if (pg_read_all(fd, lenbuf, 4) < 0) return -1;
+    if (pg_read_all(fd, lenbuf, 4) < 0) return NULL;
     int32_t total_len =
         (int32_t)(((uint32_t)lenbuf[0] << 24) |
                   ((uint32_t)lenbuf[1] << 16) |
                   ((uint32_t)lenbuf[2] << 8)  |
                   ((uint32_t)lenbuf[3]));
 
-    if (total_len < 8 || total_len > 65536) return -1;
+    if (total_len < 8 || total_len > 65536) return NULL;
 
     /* Read the remaining bytes (protocol version + key/value pairs) */
     size_t rest = (size_t)(total_len - 4);
     uint8_t* startup_buf = malloc(rest + 1);
-    if (!startup_buf) return -1;
+    if (!startup_buf) return NULL;
     startup_buf[rest] = '\0';
 
     if (pg_read_all(fd, startup_buf, rest) < 0) {
         free(startup_buf);
-        return -1;
+        return NULL;
     }
 
     /* Check for SSLRequest (protocol = 0x04D2162F = 80877103) */
@@ -485,14 +523,14 @@ static int pg_do_startup(int fd) {
                      ((uint32_t)startup_buf[1] << 16) |
                      ((uint32_t)startup_buf[2] << 8)  |
                      ((uint32_t)startup_buf[3]);
-    free(startup_buf);
 
     if (proto == 80877103U) {
+        free(startup_buf);
         /* SSLRequest */
 #ifndef _WIN32
         if (global_pqc_ssl_ctx) {
             uint8_t ssl_ok = 'S';
-            if (pg_write_all(fd, &ssl_ok, 1) < 0) return -1;
+            if (pg_write_all(fd, &ssl_ok, 1) < 0) return NULL;
             
             current_ssl = SSL_new(global_pqc_ssl_ctx);
             if (current_ssl) {
@@ -500,39 +538,88 @@ static int pg_do_startup(int fd) {
                 if (SSL_accept(current_ssl) <= 0) {
                     fprintf(stderr, "PQC SSL Handshake failed!\n");
                     ERR_print_errors_fp(stderr);
-                    return -1;
+                    return NULL;
                 }
                 printf("[PQC SECURE] Postgres proxy connection established using ML-KEM-1024 / ML-DSA-87 / SHA-384\n");
-                return 0; /* successfully handshaked, client will send next message */
+                return pg_do_startup(fd); /* successfully handshaked, recurse to read real startup message */
+            } else {
+                return NULL;
             }
         }
 #endif
-        uint8_t nossl = 'N';
-        if (pg_write_all(fd, &nossl, 1) < 0) return -1;
-        return pg_do_startup(fd); /* recurse once for real startup */
+        /* Reject cleartext fallback completely */
+        return NULL;
     }
 
     /* Protocol must be 3.0 (196608) */
-    if (proto != 196608U) return -1;
+    if (proto != 196608U) {
+        free(startup_buf);
+        return NULL;
+    }
+
+#ifndef _WIN32
+    if (!current_ssl) {
+        pg_send_error(fd, "FATAL", "08000", "SSL connection is required by the administrator");
+        free(startup_buf);
+        return NULL;
+    }
+#endif
+
+    // Parse the key-value pairs to find the username
+    char* username = NULL;
+    char* p_kv = (char*)(startup_buf + 4);
+    char* end_kv = (char*)(startup_buf + rest);
+    while (p_kv < end_kv && *p_kv != '\0') {
+        char* key = p_kv;
+        p_kv += strlen(key) + 1;
+        if (p_kv >= end_kv) break;
+        char* val = p_kv;
+        p_kv += strlen(val) + 1;
+        if (strcmp(key, "user") == 0) {
+            username = val;
+        }
+    }
+
+    if (!username) {
+        pg_send_error(fd, "FATAL", "28000", "no PostgreSQL user name specified in startup packet");
+        free(startup_buf);
+        return NULL;
+    }
+
+    // Request password
+    if (pg_send_auth_cleartext(fd) < 0) {
+        free(startup_buf);
+        return NULL;
+    }
+
+    qihse_user_t* user = pg_read_password_and_authenticate(fd, username);
+    free(startup_buf);
+
+    if (!user) {
+        pg_send_error(fd, "FATAL", "28P01", "password authentication failed");
+        return NULL;
+    }
 
     /* Send AuthenticationOk */
-    if (pg_send_auth_ok(fd) < 0) return -1;
+    if (pg_send_auth_ok(fd) < 0) return NULL;
 
     /* Mandatory parameter status messages that psql/libpq expect */
-    if (pg_send_parameter_status(fd, "server_version",    "14.0 (QIHSE)") < 0) return -1;
-    if (pg_send_parameter_status(fd, "client_encoding",   "UTF8") < 0) return -1;
-    if (pg_send_parameter_status(fd, "server_encoding",   "UTF8") < 0) return -1;
-    if (pg_send_parameter_status(fd, "DateStyle",         "ISO, MDY") < 0) return -1;
-    if (pg_send_parameter_status(fd, "TimeZone",          "UTC") < 0) return -1;
-    if (pg_send_parameter_status(fd, "integer_datetimes", "on") < 0) return -1;
-    if (pg_send_parameter_status(fd, "standard_conforming_strings", "on") < 0) return -1;
-    if (pg_send_parameter_status(fd, "IntervalStyle",     "postgres") < 0) return -1;
+    if (pg_send_parameter_status(fd, "server_version",    "14.0 (QIHSE)") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "client_encoding",   "UTF8") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "server_encoding",   "UTF8") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "DateStyle",         "ISO, MDY") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "TimeZone",          "UTC") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "integer_datetimes", "on") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "standard_conforming_strings", "on") < 0) return NULL;
+    if (pg_send_parameter_status(fd, "IntervalStyle",     "postgres") < 0) return NULL;
 
     /* BackendKeyData – use fixed values (no cancel support yet) */
-    if (pg_send_backend_key_data(fd, 1, 0) < 0) return -1;
+    if (pg_send_backend_key_data(fd, 1, 0) < 0) return NULL;
 
     /* ReadyForQuery */
-    return pg_send_ready_for_query(fd);
+    if (pg_send_ready_for_query(fd) < 0) return NULL;
+
+    return user;
 }
 
 /* ============================================================
@@ -569,7 +656,8 @@ void qihse_pg_wire_handle_client(int fd, void* vdb) {
 #endif
 
     /* Phase 1: startup handshake */
-    if (pg_do_startup(fd) < 0) {
+    qihse_user_t* current_user = pg_do_startup(fd);
+    if (!current_user) {
         close(fd);
         return;
     }
@@ -614,7 +702,7 @@ void qihse_pg_wire_handle_client(int fd, void* vdb) {
 
         case 'Q': { /* Simple Query */
             const char* query = body ? (const char*)body : "";
-            if (pg_handle_query(fd, vdb, query) < 0) {
+            if (pg_handle_query(fd, vdb, query, current_user) < 0) {
                 free(body);
                 goto done;
             }
@@ -692,19 +780,17 @@ static void af_xdp_pg_cb(char *pkt, uint32_t len, void *arg) {
     /* Identify protocol by payload content */
     if (payload[0] == 'Q' && payload[1] == 'I' && payload[2] == 'H' &&
         payload[3] == 'S' && payload[4] == 'E') {
-        /* UWP packet — 16-byte header already in payload */
+        /* UWP packets require the authenticated UWP TCP path. */
         if (payload_len >= 16) {
             printf("[AF_XDP] Fast-path UWP: engine=0x%02x cmd=0x%02x len=%u\n",
                    payload[6], payload[7], (unsigned)payload_len);
-            qihse_uwp_handle_payload((qihse_uwp_context_t*)arg, payload, payload_len);
         }
     } else {
         /* PostgreSQL wire protocol — first byte is message type */
         printf("[AF_XDP] Fast-path PG: msg_type='%c' payload_len=%u\n",
                (char)payload[0], payload_len);
-        if (payload[0] == 'Q' && payload_len >= 5) {
-            pg_handle_query(-1, arg, (const char*)(payload + 5));
-        }
+        /* XDP fast path must not execute queries without authentication.
+         * Require authenticated TCP connection for query execution. */
     }
 }
 
@@ -745,6 +831,12 @@ static void* af_xdp_pg_thread(void *arg) {
  * ============================================================ */
 
 bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_address) {
+    if (qihse_auth_is_operator_password_default()) {
+        fprintf(stderr, "[FATAL SECURITY ERROR] Default operator password detected. "
+                        "You must rotate the default operator password before starting network services.\n");
+        return false;
+    }
+
 #ifndef _WIN32
     /* Load FIPS provider if available — all TLS ops go through validated module */
     qihse_pqc_init_providers();
@@ -757,13 +849,22 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
         }
         if (access("qihse_dsa_cert.pem", F_OK) != 0) {
             fprintf(stderr, "[PQC INIT] Generating self-signed ML-DSA-87 TLS certificate...\n");
-            int ret = system("openssl req -x509 -new "
-                             "-key " QIHSE_DSA_PRIVATE_KEY_FILE " "
-                             "-out qihse_dsa_cert.pem "
-                             "-nodes -subj \"/CN=QIHSE Cluster\" "
-                             "-days 3650 2>/dev/null");
-            if (ret != 0)
-                fprintf(stderr, "[WARNING] TLS cert generation failed. Continuing without TLS.\n");
+            pid_t pid = fork();
+            if (pid == 0) {
+                execlp("openssl", "openssl", "req", "-x509", "-new",
+                       "-key", QIHSE_DSA_PRIVATE_KEY_FILE,
+                       "-out", "qihse_dsa_cert.pem",
+                       "-nodes", "-subj", "/CN=QIHSE Cluster",
+                       "-days", "3650", (char*)NULL);
+                _exit(1);
+            } else if (pid > 0) {
+                int status;
+                waitpid(pid, &status, 0);
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                    fprintf(stderr, "[WARNING] TLS cert generation failed. Continuing without TLS.\n");
+            } else {
+                fprintf(stderr, "[WARNING] fork() failed for TLS cert generation. Continuing without TLS.\n");
+            }
         }
 
         global_pqc_ssl_ctx = SSL_CTX_new(TLS_server_method());
@@ -775,9 +876,9 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
 
             if (SSL_CTX_use_certificate_file(global_pqc_ssl_ctx, "qihse_dsa_cert.pem", SSL_FILETYPE_PEM) <= 0 ||
                 SSL_CTX_use_PrivateKey_file(global_pqc_ssl_ctx, QIHSE_DSA_PRIVATE_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
-                fprintf(stderr, "[WARNING] Failed to load PQC cert/key. Running unencrypted.\n");
+                fprintf(stderr, "[FATAL] Failed to load PQC cert/key. Refusing to run unencrypted.\n");
                 SSL_CTX_free(global_pqc_ssl_ctx);
-                global_pqc_ssl_ctx = NULL;
+                return false;
             } else {
                 fprintf(stderr, "[PQC INIT] ML-KEM-1024 / ML-DSA-87 / AES-256-GCM-SHA384 TLS 1.3 active.\n");
             }
@@ -785,7 +886,7 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
     }
 #endif
 
-    if (!bind_address || bind_address[0] == '\0') {
+    if (!bind_address || bind_address[0] == '\0' || strcmp(bind_address, "0.0.0.0") == 0) {
         bind_address = "127.0.0.1";
     }
 

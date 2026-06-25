@@ -187,6 +187,27 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, u
     return true;
 }
 
+bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment, qihse_user_t* user) {
+    if (!store || !key) return false;
+    
+    // If the key already exists, check the user's access on the existing key first
+    for (size_t i = 0; i < store->num_keys; i++) {
+        if (strcmp(store->keys[i].key, key) == 0) {
+            if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                return false;
+            }
+            break;
+        }
+    }
+    
+    // Check if the user is authorized to create/set a key with the target classification
+    if (!qihse_auth_can_access(user, classification, sci_compartment)) {
+        return false;
+    }
+    
+    return qihse_kv_set(store, key, value, classification, sci_compartment);
+}
+
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return NULL;
     
@@ -208,7 +229,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         // Find auth info in memory
         for (size_t i = 0; i < store->num_keys; i++) {
             if (strcmp(store->keys[i].key, key) == 0) {
-                if (user && !qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
                     user_authorized = false;
                     val = NULL; // Masked: pretend it doesn't exist in MemTable
                 }
@@ -256,7 +277,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
             fgetc(f);
             
             if (strcmp(f_key, key) == 0) {
-                if (user && !qihse_auth_can_access(user, classif, sci)) {
+                if (!qihse_auth_can_access(user, classif, sci)) {
                     free(f_key);
                     free(f_val);
                     break; // Masked: pretend it doesn't exist, breaking out of this file parsing loop
@@ -282,7 +303,7 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* u
     for (size_t i = 0; i < store->num_keys; i++) {
         if (strcmp(store->keys[i].key, key) == 0) {
             found = true;
-            if (!user || qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+            if (qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
                 has_auth = true;
             }
             break;
@@ -327,7 +348,7 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t
 
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user) {
     if (!store || !key) return false;
-    if (!qihse_kv_exists_user(store, key, NULL)) return false;
+    if (!qihse_kv_exists_user(store, key, user)) return false;
 
     uint64_t now = current_time_ms();
     bool has_auth = false;
@@ -335,7 +356,7 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
     for (size_t i = 0; i < store->num_keys; i++) {
         if (strcmp(store->keys[i].key, key) == 0) {
             found = true;
-            if (!user || qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+            if (qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
                 has_auth = true;
                 store->keys[i].expire_time_ms = now + ttl_ms;
             }

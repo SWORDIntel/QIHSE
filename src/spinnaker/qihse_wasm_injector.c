@@ -17,9 +17,15 @@ bool qihse_wasm_sandbox_init(qihse_wasm_sandbox_t* sandbox,
 
     // Try to load Wasmtime or WAMR dynamically at runtime
     if (!g_wasm_lib_handle) {
-        g_wasm_lib_handle = dlopen("libwasmtime.so", RTLD_NOW | RTLD_GLOBAL);
+        g_wasm_lib_handle = dlopen("/usr/local/lib/libwasmtime.so", RTLD_NOW | RTLD_GLOBAL);
         if (!g_wasm_lib_handle) {
-            g_wasm_lib_handle = dlopen("libwasm3.so", RTLD_NOW | RTLD_GLOBAL);
+            g_wasm_lib_handle = dlopen("/usr/local/lib/libwasm3.so", RTLD_NOW | RTLD_GLOBAL);
+        }
+        if (!g_wasm_lib_handle) {
+            g_wasm_lib_handle = dlopen("/usr/lib/libwasmtime.so", RTLD_NOW | RTLD_GLOBAL);
+        }
+        if (!g_wasm_lib_handle) {
+            g_wasm_lib_handle = dlopen("/usr/lib/libwasm3.so", RTLD_NOW | RTLD_GLOBAL);
         }
     }
 

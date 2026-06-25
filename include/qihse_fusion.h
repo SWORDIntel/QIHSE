@@ -30,6 +30,7 @@ typedef struct {
     qihse_vector_query_t *queries; /* Array of vector queries */
     size_t num_queries;            /* Number of queries in the array */
     int top_k;                     /* Number of top results to return */
+    struct qihse_user_s* user;     /* User executing the multimodal query */
 } qihse_multimodal_request_t;
 
 /*

@@ -103,7 +103,8 @@ bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const cha
                 for (size_t t = 0; t < num_trigrams; t++) {
                     char token[4];
                     if (tok_len < 3) {
-                        strcpy(token, full_word);
+                        strncpy(token, full_word, 3);
+                        token[3] = '\0';
                     } else {
                         token[0] = full_word[t];
                         token[1] = full_word[t+1];
@@ -208,7 +209,8 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
                 for (size_t t = 0; t < num_trigrams; t++) {
                     char token[4];
                     if (tok_len < 3) {
-                        strcpy(token, full_word);
+                        strncpy(token, full_word, 3);
+                        token[3] = '\0';
                     } else {
                         token[0] = full_word[t];
                         token[1] = full_word[t+1];
@@ -249,7 +251,7 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
         float max_score = 0.0f;
         int best_idx = -1;
         for (uint32_t j = 0; j < index->doc_count; j++) {
-            if (user && !qihse_auth_can_access(user, index->docs[j].classification, index->docs[j].sci_compartment)) {
+            if (!qihse_auth_can_access(user, index->docs[j].classification, index->docs[j].sci_compartment)) {
                 continue;
             }
             if (scores[j] > max_score) {

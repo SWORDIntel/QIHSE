@@ -10,11 +10,11 @@ import threading
 from enum import IntEnum
 from typing import List, Optional, Tuple, Union
 
-# Find libqihse.so
+# Find libqihse.so — use absolute paths only to prevent CWD hijacking
 _LIB_PATHS = [
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
-    os.path.join(os.getcwd(), "libqihse.so"),
-    "libqihse.so",
+    "/usr/local/lib/libqihse.so",
+    "/usr/lib/libqihse.so",
 ]
 
 _lib = None

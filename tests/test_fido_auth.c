@@ -14,6 +14,8 @@ int main() {
         printf("Failed to get operator user.\n");
         return 1;
     }
+    // Rotate operator password to allow privileged operations
+    qihse_auth_modify_user(operator, 0, NULL, "SecureOpPass1!", -1, -1);
     printf("Operator retrieved. Hardware token present: %d, FIDO ID: %s\n", 
             operator->hardware_token_present, operator->fido2_credential_id);
 

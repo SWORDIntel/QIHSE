@@ -44,14 +44,45 @@
 #include <poll.h>
 #endif
 
-static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp_header_t* header, uint8_t* payload) {
+static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp_header_t* header, uint8_t* payload, size_t actual_payload_len, qihse_user_t** user_slot) {
     /* Magic Byte Verification */
     if (memcmp(header->magic, "QIHSE", 5) != 0) {
-        close(client_fd);
-        return;
+        if (client_fd >= 0) close(client_fd);
+        return false;
     }
 
     uint64_t len = le64toh(header->payload_length);
+    if (len > actual_payload_len) {
+        if (client_fd >= 0) close(client_fd);
+        return false;
+    }
+
+    if (header->target_engine == QIHSE_UWP_TARGET_AUTH && header->command_opcode == 0x01) {
+        if (!ctx || len == 0 || !user_slot) return false;
+        size_t username_len = strnlen((char*)payload, len);
+        if (username_len >= len - 1) return false;
+        char* username = (char*)payload;
+        char* password = username + username_len + 1;
+        size_t password_max_len = len - (username_len + 1);
+        if (strnlen(password, password_max_len) == password_max_len) return false;
+        *user_slot = qihse_auth_authenticate(username, password);
+        if (!*user_slot) {
+            const char* reply = "ERR_AUTH\n";
+            if (client_fd >= 0) write(client_fd, reply, strlen(reply));
+            return false;
+        }
+        const char* reply = "OK\n";
+        if (client_fd >= 0) write(client_fd, reply, 3);
+        return true;
+    }
+
+    qihse_user_t* current_user = (user_slot && *user_slot) ? *user_slot : NULL;
+    if (!ctx || !current_user) {
+        const char* reply = "ERR_AUTH\n";
+        if (client_fd >= 0) write(client_fd, reply, strlen(reply));
+        if (client_fd >= 0) close(client_fd);
+        return false;
+    }
     
     switch(header->target_engine) {
         case QIHSE_UWP_TARGET_KV:
@@ -62,7 +93,10 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 
                 char* key = (char*)payload;
                 char* val = key + key_len + 1;
-                qihse_kv_set(ctx->kv, key, val, 0, 0);
+                size_t val_max_len = len - (key_len + 1);
+                if (strnlen(val, val_max_len) == val_max_len) break; /* Missing null terminator for val */
+                
+                if (!qihse_kv_set_user(ctx->kv, key, val, 0, 0, current_user)) break;
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
             }
@@ -80,6 +114,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 if (len < expected_len) break;
 
                 float* vec = (float*)(payload + 12);
+                if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_vector_db_upsert_by_ids(ctx->vdb, &id, vec, 1, dims, NULL, NULL, NULL, NULL);
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
@@ -93,6 +128,9 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 if (len < 9) break;
                 uint64_t doc_id = le64toh(*(uint64_t*)payload);
                 char* json = (char*)(payload + 8);
+                size_t json_max_len = (size_t)(len - 8);
+                if (strnlen(json, json_max_len) == json_max_len) break; /* Missing null terminator */
+                if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_doc_store_insert_json(ctx->doc, doc_id, json);
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
@@ -112,6 +150,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
 
                 char* col_name = (char*)payload;
                 float* val = (float*)(payload + col_name_len + 1);
+                if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_column_append_float32(ctx->col, col_name, *val, 0, 0);
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
@@ -127,6 +166,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 uint64_t series = le64toh(*(uint64_t*)payload);
                 uint64_t ts = le64toh(*(uint64_t*)(payload + 8));
                 double val = *(double*)(payload + 16);
+                if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_tsdb_insert(ctx->tsdb, series, ts, val, 0, 0);
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
@@ -145,6 +185,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 char* topic = (char*)payload;
                 uint8_t* msg = (uint8_t*)(payload + topic_len + 1);
                 size_t msg_len = len - (topic_len + 1);
+                if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_event_stream_append(ctx->stream, topic, msg, msg_len);
                 const char* reply = "OK\n";
                 if (client_fd >= 0) write(client_fd, reply, 3);
@@ -156,24 +197,14 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             /* Unknown target, ignore */
             break;
     }
+    return false;
 }
 
 void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_data, size_t len) {
     if (len < sizeof(qihse_uwp_header_t)) return;
     qihse_uwp_header_t* header = (qihse_uwp_header_t*)payload_data;
-    
-    // RED TEAM PATCH: Do not blindly trust the client-provided header length!
-    uint64_t claimed_len = le64toh(header->payload_length);
-    size_t physical_payload_len = len - sizeof(qihse_uwp_header_t);
-    
-    // The claimed length cannot exceed the physical bytes we actually received from XDP/socket.
-    if (claimed_len > physical_payload_len) {
-        // Drop malformed / malicious packet
-        return;
-    }
-    
     uint8_t* payload = (uint8_t*)payload_data + sizeof(qihse_uwp_header_t);
-    uwp_route_payload(-1, ctx, header, payload);
+    uwp_route_payload(-1, ctx, header, payload, len - sizeof(qihse_uwp_header_t), NULL);
 }
 
 #ifndef _WIN32
@@ -194,6 +225,7 @@ typedef struct {
     uwp_event_type_t type;
     int fd;
     qihse_uwp_context_t* ctx;
+    qihse_user_t* user;
     uint8_t buf[URING_BUF_SIZE];
     size_t buf_len;
 } uwp_event_ctx_t;
@@ -205,17 +237,19 @@ static void uwp_add_accept(struct io_uring *ring, int server_fd, qihse_uwp_conte
     ev->type = EVENT_ACCEPT;
     ev->fd = server_fd;
     ev->ctx = uwp_ctx;
+    ev->user = NULL;
     
     io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)client_addr, client_len, 0);
     io_uring_sqe_set_data(sqe, ev);
 }
 
-static void uwp_add_read(struct io_uring *ring, int client_fd, qihse_uwp_context_t* uwp_ctx) {
+static void uwp_add_read(struct io_uring *ring, int client_fd, qihse_uwp_context_t* uwp_ctx, qihse_user_t* user) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
     ev->type = EVENT_READ;
     ev->fd = client_fd;
     ev->ctx = uwp_ctx;
+    ev->user = user;
     
     io_uring_prep_recv(sqe, client_fd, ev->buf, URING_BUF_SIZE, 0);
     io_uring_sqe_set_data(sqe, ev);
@@ -227,6 +261,7 @@ static void uwp_add_write(struct io_uring *ring, int client_fd, const char* repl
     ev->type = EVENT_WRITE;
     ev->fd = client_fd;
     ev->ctx = NULL; // not needed for write completion
+    ev->user = NULL;
     ev->buf_len = strlen(reply_str);
     memcpy(ev->buf, reply_str, ev->buf_len);
     
@@ -236,6 +271,12 @@ static void uwp_add_write(struct io_uring *ring, int client_fd, const char* repl
 #endif
 
 bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address) {
+    if (qihse_auth_is_operator_password_default()) {
+        fprintf(stderr, "[FATAL SECURITY ERROR] Default operator password detected. "
+                        "You must rotate the default operator password before starting network services.\n");
+        return false;
+    }
+
     int server_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -326,20 +367,41 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
         if (ev->type == EVENT_ACCEPT) {
             uwp_add_accept(&ring, server_fd, ctx, &client_addr, &client_len);
             if (res >= 0) {
-                uwp_add_read(&ring, res, ctx);
+                struct timeval tv;
+                tv.tv_sec = 30;
+                tv.tv_usec = 0;
+                setsockopt(res, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                setsockopt(res, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                uwp_add_read(&ring, res, ctx, NULL);
             }
             io_uring_submit(&ring);
         } else if (ev->type == EVENT_READ) {
             if (res <= 0) {
                 close(ev->fd);
             } else {
+                if (res >= (int)sizeof(ev->buf)) {
+                    close(ev->fd);
+                    free(ev);
+                    continue;
+                }
                 ev->buf[res] = '\0';
                 
                 // Extremely simple dispatcher for the async loop:
-                if (res > 5 && memcmp(ev->buf, "QIHSE", 5) == 0) {
+                if (res >= (int)sizeof(qihse_uwp_header_t) && memcmp(ev->buf, "QIHSE", 5) == 0) {
                     qihse_uwp_header_t* header = (qihse_uwp_header_t*)ev->buf;
-                    uint8_t* payload = ev->buf + sizeof(qihse_uwp_header_t);
-                    uwp_route_payload(ev->fd, ev->ctx, header, payload);
+                    uint64_t expected_len = le64toh(header->payload_length);
+                    if (res >= (int)(sizeof(qihse_uwp_header_t) + expected_len)) {
+                        uint8_t* payload = ev->buf + sizeof(qihse_uwp_header_t);
+                        if (uwp_route_payload(ev->fd, ev->ctx, header, payload, res - sizeof(qihse_uwp_header_t), &ev->user)) {
+                            uwp_add_read(&ring, ev->fd, ev->ctx, ev->user);
+                            io_uring_submit(&ring);
+                        } else {
+                            close(ev->fd);
+                        }
+                    } else {
+                        uwp_add_write(&ring, ev->fd, "ERR_SHORT\n");
+                        io_uring_submit(&ring);
+                    }
                 } else {
                     // QQL
 #ifndef _WIN32
@@ -382,10 +444,16 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
         int res = recv(client_sock, buf, sizeof(buf) - 1, 0);
         if (res > 0) {
             buf[res] = '\0';
-            if (res > 5 && memcmp(buf, "QIHSE", 5) == 0) {
+            if (res >= (int)sizeof(qihse_uwp_header_t) && memcmp(buf, "QIHSE", 5) == 0) {
                 qihse_uwp_header_t* header = (qihse_uwp_header_t*)buf;
-                uint8_t* payload = (uint8_t*)buf + sizeof(qihse_uwp_header_t);
-                uwp_route_payload(client_sock, ctx, header, payload);
+                uint64_t expected_len = le64toh(header->payload_length);
+                if (res >= (int)(sizeof(qihse_uwp_header_t) + expected_len)) {
+                    uint8_t* payload = (uint8_t*)buf + sizeof(qihse_uwp_header_t);
+                    qihse_user_t* current_user = NULL;
+                    uwp_route_payload(client_sock, ctx, header, payload, res - sizeof(qihse_uwp_header_t), &current_user);
+                } else {
+                    send(client_sock, "ERR_SHORT\n", 10, 0);
+                }
             } else {
 #ifndef _WIN32
                 void* ast = qihse_parse_qql_to_ast(buf);

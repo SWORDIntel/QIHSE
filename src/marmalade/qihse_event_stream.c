@@ -15,6 +15,15 @@ struct qihse_event_stream {
     char *log_directory;
 };
 
+static bool qihse_event_topic_is_safe(const char* topic) {
+    if (!topic || topic[0] == '\0') return false;
+    for (const char* p = topic; *p; ++p) {
+        if (*p == '/' || *p == '\\') return false;
+        if (*p == '.' && p[1] == '.') return false;
+    }
+    return true;
+}
+
 qihse_event_stream_t* qihse_event_stream_create(const char* log_directory) {
     if (!log_directory) return NULL;
     qihse_event_stream_t* stream = malloc(sizeof(qihse_event_stream_t));
@@ -36,6 +45,7 @@ void qihse_event_stream_destroy(qihse_event_stream_t* stream) {
 
 bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, const uint8_t* payload, size_t size) {
     if (!stream || !topic || !payload) return false;
+    if (!qihse_event_topic_is_safe(topic)) return false;
     if (size == 0) return true;
     
     char filepath[1024];
@@ -92,6 +102,7 @@ bool qihse_event_stream_append(qihse_event_stream_t* stream, const char* topic, 
 
 bool qihse_event_stream_consume_zero_copy(qihse_event_stream_t* stream, const char* topic, uint64_t offset, int network_socket_fd, size_t count) {
     if (!stream || !topic || network_socket_fd < 0) return false;
+    if (!qihse_event_topic_is_safe(topic)) return false;
     
     char filepath[1024];
     snprintf(filepath, sizeof(filepath), "%s/%s.log", stream->log_directory, topic);

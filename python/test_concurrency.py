@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import numpy as np
 import threading
 import time
@@ -9,7 +10,7 @@ from core import VectorDB, DistanceMetric, VectorQuery
 
 def main():
     # Remove old DB if exists
-    os.system("rm -rf test_db_concurrency")
+    shutil.rmtree("test_db_concurrency", ignore_errors=True)
     os.makedirs("test_db_concurrency", exist_ok=True)
     
     db = VectorDB.create("test_db_concurrency", dims=128)

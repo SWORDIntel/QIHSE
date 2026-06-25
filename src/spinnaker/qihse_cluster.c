@@ -67,6 +67,7 @@ void qihse_cluster_broadcast_vec_set(uint64_t id, const float* vector, size_t di
     if (!g_cluster_manager) return;
     
     uint32_t dim_u32 = (uint32_t)dims;
+    if (dims > (SIZE_MAX - 20) / sizeof(float)) return;
     size_t payload_size = 5 + 1 + sizeof(uint64_t) + sizeof(uint32_t) + dims * sizeof(float);
     uint8_t* payload = (uint8_t*)malloc(payload_size);
     if (!payload) return;
@@ -136,7 +137,8 @@ void qihse_cluster_receive_payload(const uint8_t* payload, size_t payload_size) 
         memcpy(&dim_u32, payload + offset, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         
-        size_t vec_bytes = dim_u32 * sizeof(float);
+        if (dim_u32 > (SIZE_MAX / sizeof(float))) return;
+        size_t vec_bytes = (size_t)dim_u32 * sizeof(float);
         if (offset + vec_bytes > payload_size) return;
         
         float* vector = (float*)malloc(vec_bytes);

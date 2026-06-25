@@ -29,6 +29,8 @@ int main() {
     // 1. Create Users
     printf("[QIHSE Omni-Test] Establishing Security Clearances...\n");
     qihse_user_t* op = qihse_auth_get_user(0);
+    // Rotate operator password to allow privileged operations
+    qihse_auth_modify_user(op, 0, NULL, "SecureOpPass1!", -1, -1);
     qihse_user_t* user_a = qihse_auth_create_user(op, 3, QIHSE_ROLE_OPERATOR, CLASSIF_TOP_SECRET, SCI_A | SCI_B, "default_password", true);
     qihse_user_t* user_b = qihse_auth_create_user(user_a, 2, QIHSE_ROLE_ANALYST, CLASSIF_SECRET, SCI_A, "default_password", true);
     qihse_user_t* user_c = qihse_auth_create_user(user_a, 1, QIHSE_ROLE_ANALYST, CLASSIF_UNCLASSIFIED, SCI_NONE, "default_password", true);

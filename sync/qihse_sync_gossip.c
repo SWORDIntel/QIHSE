@@ -14,6 +14,7 @@
 #ifndef _WIN32
 #include <openssl/evp.h>
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #endif
 
 /* Helper functions */
@@ -43,7 +44,9 @@ static uint32_t simple_rand(uint32_t *seed) {
 
 static void generate_uuid(uint8_t uuid[16]) {
     if (!uuid) return;
-
+#ifndef _WIN32
+    if (RAND_bytes(uuid, 16) == 1) return;
+#endif
     uint32_t seed = (uint32_t)time(NULL);
     for (int i = 0; i < 16; i++) {
         uuid[i] = (uint8_t)(simple_rand(&seed) % 256);
@@ -268,7 +271,13 @@ int qihse_sync_manager_init(
 
     static bool verify_gossip_message(qihse_sync_manager_t *manager, const qihse_sync_message_t *msg) {
 #ifndef _WIN32
-        if (!manager->mldsa87_pkey) return true;
+        if (!manager->mldsa87_pkey) {
+            if (msg->has_signature) {
+                fprintf(stderr, "[SECURITY] Dropping signed gossip message — no PQC key loaded to verify.\n");
+                return false;
+            }
+            return true;
+        }
         if (!msg->has_signature) return false;
         
         EVP_MD_CTX *mctx = EVP_MD_CTX_new();

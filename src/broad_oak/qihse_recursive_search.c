@@ -19,9 +19,10 @@ int qihse_search_recursive_implicit(
     const float *start_vec,
     size_t dims,
     int hops,
-    float threshold
+    float threshold,
+    struct qihse_user_s* user
 ) {
-    if (!vdb || !start_vec || dims == 0) {
+    if (!vdb || !start_vec || !user || dims == 0) {
         return -1;
     }
 
@@ -79,6 +80,7 @@ int qihse_search_recursive_implicit(
         query.include_metadata = false;
         query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
         query.distance_metric = QIHSE_DISTANCE_COSINE;
+        query.user = user;
 
         qihse_vector_result_t results[MAX_RESULTS_PER_HOP];
         int num_results = qihse_vector_db_search(vdb, &query, results, MAX_RESULTS_PER_HOP);

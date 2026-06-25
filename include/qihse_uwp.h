@@ -10,6 +10,7 @@
 #include "qihse_column.h"
 #include "qihse_timeseries.h"
 #include "qihse_event_stream.h"
+#include "qihse_auth.h"
 
 /* Unified Context holding all engine pointers */
 typedef struct {
@@ -19,6 +20,7 @@ typedef struct {
     qihse_column_store_t* col;
     qihse_tsdb_t* tsdb;
     qihse_event_stream_t* stream;
+    qihse_user_t* user;
 } qihse_uwp_context_t;
 
 /* 16-byte fixed width packed header */
@@ -31,6 +33,7 @@ typedef struct __attribute__((packed)) {
 } qihse_uwp_header_t;
 
 /* Subsystem Routing Opcodes */
+#define QIHSE_UWP_TARGET_AUTH    0x00
 #define QIHSE_UWP_TARGET_KV      0x01
 #define QIHSE_UWP_TARGET_VECTOR  0x02
 #define QIHSE_UWP_TARGET_DOC     0x03

@@ -4,28 +4,30 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <openssl/sha.h>
 
 #define MAX_USERS 1024
+#define MAX_AUTH_ATTEMPTS 5
+#define AUTH_LOCKOUT_SECONDS 300
+
+typedef struct {
+    uint32_t failed_count;
+    time_t lockout_until;
+} auth_rate_limit_t;
 
 static qihse_user_t* users[MAX_USERS];
 static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t active_user_count = 0;
+static auth_rate_limit_t rate_limits[MAX_USERS];
 
-// Simulate SHA-256 hashing for password storage
-static void compute_sha256_sim(const char *input, char *output) {
-    if (!input) {
-        strcpy(output, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); // empty string hash
-        return;
+static void compute_sha384_hex(const char *input, char *output) {
+    unsigned char hash[SHA384_DIGEST_LENGTH];
+    const unsigned char* data = (const unsigned char*)(input ? input : "");
+    SHA384(data, strlen((const char*)data), hash);
+    for (int i = 0; i < SHA384_DIGEST_LENGTH; i++) {
+        snprintf(output + (i * 2), 3, "%02x", hash[i]);
     }
-    unsigned long long hash1 = 5381;
-    unsigned long long hash2 = 0xDEADBEEF;
-    int c;
-    while ((c = *input++)) {
-        hash1 = ((hash1 << 5) + hash1) + c; 
-        hash2 = hash2 ^ (c << 3);
-    }
-    snprintf(output, 65, "%016llx%016llx%016llx%016llx", 
-             hash1, hash2, hash1 ^ 0x1234567890ABCDEF, hash2 ^ 0xFEDCBA0987654321);
+    output[QIHSE_AUTH_HASH_HEX_LEN] = '\0';
 }
 
 void qihse_auth_init(void) {
@@ -46,7 +48,7 @@ void qihse_auth_init(void) {
         op->can_create_users = true;
         strncpy(op->username, "GODMODE_OP", 64);
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 64);
-        compute_sha256_sim("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
+        compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", op->password_hash);
         users[0] = op;
         active_user_count = 1;
     }
@@ -58,6 +60,17 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     if (user_id >= MAX_USERS) return NULL;
     
     pthread_mutex_lock(&auth_mutex);
+    
+    // Check if operator password is still default (unless we are creating operator during init)
+    if (users[0] && user_id != 0) {
+        char default_hash[QIHSE_AUTH_HASH_LEN];
+        compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", default_hash);
+        if (strcmp(users[0]->password_hash, default_hash) == 0) {
+            printf("[SECURITY ERROR] Default operator password must be changed before creating users.\n");
+            pthread_mutex_unlock(&auth_mutex);
+            return NULL;
+        }
+    }
     
     // Enforce that only an OPERATOR or delegated user can create new users.
     if (!creator || (creator->role != QIHSE_ROLE_OPERATOR && !creator->can_create_users)) {
@@ -101,14 +114,15 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
 
     // Handle Password
     if (plaintext_password) {
-        if (strlen(plaintext_password) < 6) {
-            printf("\n[WARNING] The password assigned to User ID %u is pathetically weak (under 6 characters).\n", user_id);
-            printf("          If an adversary is trying passwords at this terminal, you got bigger problems than a weak password.\n");
-            printf("          If they are running brute force against it and nobody is there to stop them, your security is doing an outstanding job, keep at it.\n\n");
+        if (strlen(plaintext_password) < 12) {
+            fprintf(stderr, "[SECURITY ERROR] Password for User ID %u rejected: minimum 12 characters required.\n", user_id);
+            free(u);
+            pthread_mutex_unlock(&auth_mutex);
+            return NULL;
         }
-        compute_sha256_sim(plaintext_password, u->password_hash);
+        compute_sha384_hex(plaintext_password, u->password_hash);
     } else {
-        compute_sha256_sim("", u->password_hash);
+        compute_sha384_hex("", u->password_hash);
     }
     
     u->requires_hardware_token = requires_hw_token;
@@ -168,6 +182,11 @@ bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id
         return false;
     }
 
+    if (target_user_id != 0 && qihse_auth_is_operator_password_default()) {
+        printf("[SECURITY ERROR] Default operator password must be changed before modifying other users.\n");
+        return false;
+    }
+
     if (target_user_id >= MAX_USERS) return false;
 
     pthread_mutex_lock(&auth_mutex);
@@ -183,7 +202,7 @@ bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id
     }
 
     if (new_password != NULL) {
-        compute_sha256_sim(new_password, target->password_hash);
+        compute_sha384_hex(new_password, target->password_hash);
     }
 
     if (new_requires_hw_token != -1) {
@@ -208,8 +227,8 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
     }
 
     if (!user) {
-        qihse_audit_log("ACCESS_GRANTED_NO_USER", uid, 0, data_classif, data_sci);
-        return true;
+        qihse_audit_log("ACCESS_DENIED_NO_USER", uid, 0, data_classif, data_sci);
+        return false;
     }
 
     // Hardware Token Enforcement configured per-user (e.g. Mandatory for Operator/Analyst)
@@ -240,4 +259,71 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
 
     qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
     return true;
+}
+
+bool qihse_auth_is_operator_password_default(void) {
+    pthread_mutex_lock(&auth_mutex);
+    qihse_user_t* op = users[0];
+    if (!op) {
+        pthread_mutex_unlock(&auth_mutex);
+        return false;
+    }
+    char default_hash[QIHSE_AUTH_HASH_LEN];
+    compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", default_hash);
+    bool is_default = (strcmp(op->password_hash, default_hash) == 0);
+    pthread_mutex_unlock(&auth_mutex);
+    return is_default;
+}
+
+qihse_user_t* qihse_auth_authenticate(const char* username, const char* password) {
+    if (!username || !password) return NULL;
+    pthread_mutex_lock(&auth_mutex);
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (users[i] && strcmp(users[i]->username, username) == 0) {
+            time_t now = time(NULL);
+            if (rate_limits[i].lockout_until > now) {
+                fprintf(stderr, "[AUTH] User '%s' is locked out. Try again in %ld seconds.\n",
+                        username, (long)(rate_limits[i].lockout_until - now));
+                pthread_mutex_unlock(&auth_mutex);
+                return NULL;
+            }
+            char expected_hash[QIHSE_AUTH_HASH_LEN];
+            compute_sha384_hex(password, expected_hash);
+            if (strcmp(users[i]->password_hash, expected_hash) == 0) {
+                rate_limits[i].failed_count = 0;
+                rate_limits[i].lockout_until = 0;
+                qihse_user_t* u = users[i];
+                pthread_mutex_unlock(&auth_mutex);
+                return u;
+            } else {
+                rate_limits[i].failed_count++;
+                if (rate_limits[i].failed_count >= MAX_AUTH_ATTEMPTS) {
+                    rate_limits[i].lockout_until = now + AUTH_LOCKOUT_SECONDS;
+                    rate_limits[i].failed_count = 0;
+                    fprintf(stderr, "[AUTH] User '%s' locked out after %d failed attempts for %d seconds.\n",
+                            username, MAX_AUTH_ATTEMPTS, AUTH_LOCKOUT_SECONDS);
+                }
+                pthread_mutex_unlock(&auth_mutex);
+                return NULL;
+            }
+        }
+    }
+    pthread_mutex_unlock(&auth_mutex);
+    return NULL;
+}
+
+qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password) {
+    if (user_id >= MAX_USERS || !password) return NULL;
+    pthread_mutex_lock(&auth_mutex);
+    qihse_user_t* u = users[user_id];
+    if (u) {
+        char expected_hash[QIHSE_AUTH_HASH_LEN];
+        compute_sha384_hex(password, expected_hash);
+        if (strcmp(u->password_hash, expected_hash) == 0) {
+            pthread_mutex_unlock(&auth_mutex);
+            return u;
+        }
+    }
+    pthread_mutex_unlock(&auth_mutex);
+    return NULL;
 }
