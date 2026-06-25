@@ -26,6 +26,10 @@ static inline int posix_memalign(void **memptr, size_t alignment, size_t size) {
 #include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#ifndef _WIN32
+#include <openssl/rand.h>
+#endif
 
 #ifndef M_PI
 #define M_PI acos(-1.0)
@@ -67,7 +71,16 @@ qihse_rff_kernel_t* qihse_rff_create(
     }
 
     /* Initialize random number generator */
+#ifndef _WIN32
+    unsigned char rand_seed[4];
+    if (RAND_bytes(rand_seed, 4) == 1) {
+        srand((unsigned int)(rand_seed[0] | (rand_seed[1] << 8) | (rand_seed[2] << 16) | (rand_seed[3] << 24)));
+    } else {
+        srand(seed);
+    }
+#else
     srand(seed);
+#endif
 
     /* Generate random frequencies from Gaussian distribution */
     double sigma = sqrt(2.0 * gamma);  /* RBF kernel bandwidth */
