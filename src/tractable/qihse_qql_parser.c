@@ -175,9 +175,9 @@ qihse_qql_ast_t* qihse_parse_qql_to_ast(const char* qql) {
                     strncpy(r_str, qql + rs, rl < 31 ? rl : 31);
                     strncpy(lat_str, qql + lats, latl < 31 ? latl : 31);
                     strncpy(lon_str, qql + lons, lonl < 31 ? lonl : 31);
-                    ast->radius = atof(r_str);
-                    ast->lat = atof(lat_str);
-                    ast->lon = atof(lon_str);
+                    ast->radius = strtod(r_str, NULL);
+                    ast->lat = strtod(lat_str, NULL);
+                    ast->lon = strtod(lon_str, NULL);
                 }
             }
             
