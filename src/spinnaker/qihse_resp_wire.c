@@ -230,7 +230,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
-                        vec[i] = atof(args[3 + i]);
+                        vec[i] = strtof(args[3 + i], NULL);
                     }
                     qihse_vector_db_upsert_by_ids(vdb, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
                     const char* reply = "+OK\r\n";
@@ -252,7 +252,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
                     for (int i = 0; i < dim; i++) {
-                        vec[i] = atof(args[3 + i]);
+                        vec[i] = strtof(args[3 + i], NULL);
                     }
                     qihse_vector_query_t query;
                     memset(&query, 0, sizeof(query));

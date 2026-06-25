@@ -40,6 +40,12 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
     }
 
     const char *xdp_obj = getenv("QIHSE_XDP_OBJ");
+    if (xdp_obj) {
+        if (strstr(xdp_obj, "..") != NULL) {
+            fprintf(stderr, "[QIHSE] Rejected QIHSE_XDP_OBJ containing path traversal: %s\n", xdp_obj);
+            xdp_obj = NULL;
+        }
+    }
     if (!xdp_obj) xdp_obj = "/usr/local/lib/qihse/qihse_xdp.o";
     ctx->prog = xdp_program__open_file(xdp_obj, "xdp", NULL);
     if (libxdp_get_error(ctx->prog)) {

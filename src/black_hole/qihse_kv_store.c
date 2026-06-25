@@ -57,12 +57,25 @@ static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
     
     // Truncate WAL
     if (store->wal_fd) fclose(store->wal_fd);
+#ifndef _WIN32
+    int tfd = open(WAL_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (tfd >= 0) store->wal_fd = fdopen(tfd, "w");
+    else store->wal_fd = NULL;
+#else
     store->wal_fd = fopen(WAL_PATH, "w");
+#endif
 }
 
 static void recover_from_wal(qihse_kv_store_t* store) {
+#ifndef _WIN32
+    int wfd = open(WAL_PATH, O_RDONLY | O_NOFOLLOW);
+    if (wfd < 0) return;
+    FILE* f = fdopen(wfd, "r");
+    if (!f) { close(wfd); return; }
+#else
     FILE* f = fopen(WAL_PATH, "r");
     if (!f) return;
+#endif
     char line[4096];
     while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "SET ", 4) == 0) {
@@ -132,7 +145,13 @@ qihse_kv_store_t* qihse_kv_store_create() {
     
     // Rotate WAL — start fresh, archive old log for debugging
     rename(WAL_PATH, QIHSE_DATA_DIR "wal.log.old");
+#ifndef _WIN32
+    int rfd = open(WAL_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (rfd >= 0) store->wal_fd = fdopen(rfd, "w");
+    else store->wal_fd = NULL;
+#else
     store->wal_fd = fopen(WAL_PATH, "w");
+#endif
     
     return store;
 }
@@ -281,9 +300,11 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
             unsigned long long expire_time;
             unsigned int classif, sci;
             if (sscanf(header, "%zu %zu %llu %u %u", &key_len, &val_len, &expire_time, &classif, &sci) != 5) continue;
+            if (key_len > 1048576 || val_len > 16777216) continue;
             
             char* f_key = (char*)malloc(key_len + 1);
             char* f_val = (char*)malloc(val_len + 1);
+            if (!f_key || !f_val) { free(f_key); free(f_val); break; }
             if (fread(f_key, 1, key_len, f) != key_len) { free(f_key); free(f_val); break; }
             f_key[key_len] = '\0';
             if (fread(f_val, 1, val_len, f) != val_len) { free(f_key); free(f_val); break; }
@@ -438,6 +459,7 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
         unsigned long long expire_time;
         unsigned int classif, sci;
         if (sscanf(header, "%zu %zu %llu %u %u", &key_len, &val_len, &expire_time, &classif, &sci) != 5) continue;
+        if (key_len > 1048576 || val_len > 16777216) continue;
         
         char* key = (char*)malloc(key_len + 1);
         char* val = (char*)malloc(val_len + 1);
