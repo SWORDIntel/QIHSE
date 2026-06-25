@@ -22,6 +22,7 @@
 
 #include "qihse_pg_wire.h"
 #include "qihse_vector_db.h"
+#include "qihse_uwp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -695,11 +696,15 @@ static void af_xdp_pg_cb(char *pkt, uint32_t len, void *arg) {
         if (payload_len >= 16) {
             printf("[AF_XDP] Fast-path UWP: engine=0x%02x cmd=0x%02x len=%u\n",
                    payload[6], payload[7], (unsigned)payload_len);
+            qihse_uwp_handle_payload((qihse_uwp_context_t*)arg, payload, payload_len);
         }
     } else {
         /* PostgreSQL wire protocol — first byte is message type */
         printf("[AF_XDP] Fast-path PG: msg_type='%c' payload_len=%u\n",
                (char)payload[0], payload_len);
+        if (payload[0] == 'Q' && payload_len >= 5) {
+            pg_handle_query(-1, arg, (const char*)(payload + 5));
+        }
     }
 }
 
@@ -722,7 +727,7 @@ static void* af_xdp_pg_thread(void *arg) {
         if (io_uring_wait_cqe(&ring, &cqe) < 0) continue;
         
         if (cqe->res & POLLIN) {
-            qihse_af_xdp_poll(xdp_ctx, af_xdp_pg_cb, NULL);
+            qihse_af_xdp_poll(xdp_ctx, af_xdp_pg_cb, arg);
         }
         
         io_uring_cqe_seen(&ring, cqe);
@@ -786,7 +791,7 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
 
 #ifndef _WIN32
     pthread_t af_xdp_tid;
-    pthread_create(&af_xdp_tid, NULL, af_xdp_pg_thread, NULL);
+    pthread_create(&af_xdp_tid, NULL, af_xdp_pg_thread, vdb);
 #endif
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);

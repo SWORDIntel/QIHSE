@@ -15,6 +15,13 @@ typedef enum {
     QIHSE_RAFT_LEADER = 2
 } qihse_raft_state_t;
 
+#define QIHSE_MAX_PEERS 10
+
+typedef struct qihse_peer_addr_s {
+    char ip[64];
+    uint16_t port;
+} qihse_peer_addr_t;
+
 typedef struct qihse_raft_node_s {
     uint32_t node_id;
     qihse_raft_state_t state;
@@ -34,6 +41,9 @@ typedef struct qihse_raft_node_s {
 #endif
     int server_fd;
     uint16_t port;
+    
+    qihse_peer_addr_t peers[QIHSE_MAX_PEERS];
+    size_t num_peers;
     
     // Data stores
     qihse_kv_store_t* store;
@@ -66,6 +76,6 @@ bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_
 /**
  * Handle incoming AppendEntries RPCs from a Leader.
  */
-void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_term, uint32_t leader_id);
+void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_term, uint32_t leader_id, const uint8_t* data, size_t len, const uint8_t* sig);
 
 #endif /* QIHSE_RAFT_H */

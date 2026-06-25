@@ -64,7 +64,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 char* val = key + key_len + 1;
                 qihse_kv_set(ctx->kv, key, val, 0, 0);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
             break;
             
@@ -82,7 +82,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 float* vec = (float*)(payload + 12);
                 qihse_vector_db_upsert_by_ids(ctx->vdb, &id, vec, 1, dims, NULL, NULL, NULL, NULL);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
             break;
             
@@ -95,7 +95,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 char* json = (char*)(payload + 8);
                 qihse_doc_store_insert_json(ctx->doc, doc_id, json);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
 #endif
             break;
@@ -114,7 +114,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 float* val = (float*)(payload + col_name_len + 1);
                 qihse_column_append_float32(ctx->col, col_name, *val, 0, 0);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
 #endif
             break;
@@ -129,7 +129,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 double val = *(double*)(payload + 16);
                 qihse_tsdb_insert(ctx->tsdb, series, ts, val, 0, 0);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
 #endif
             break;
@@ -147,7 +147,7 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 size_t msg_len = len - (topic_len + 1);
                 qihse_event_stream_append(ctx->stream, topic, msg, msg_len);
                 const char* reply = "OK\n";
-                write(client_fd, reply, 3);
+                if (client_fd >= 0) write(client_fd, reply, 3);
             }
 #endif
             break;
@@ -158,7 +158,12 @@ static void uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
     }
 }
 
-
+void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_data, size_t len) {
+    if (len < sizeof(qihse_uwp_header_t)) return;
+    qihse_uwp_header_t* header = (qihse_uwp_header_t*)payload_data;
+    uint8_t* payload = (uint8_t*)payload_data + sizeof(qihse_uwp_header_t);
+    uwp_route_payload(-1, ctx, header, payload);
+}
 
 #ifndef _WIN32
 #include <liburing.h>
