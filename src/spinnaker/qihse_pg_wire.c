@@ -845,15 +845,15 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
         /* Generate DSA key + self-signed cert if not present */
         if (access(QIHSE_DSA_PRIVATE_KEY_FILE, F_OK) != 0) {
             fprintf(stderr, "[PQC INIT] Generating ML-DSA-87 keypair...\n");
-            qihse_pqc_keygen(".");
+            qihse_pqc_keygen("/etc/qihse/keys");
         }
-        if (access("qihse_dsa_cert.pem", F_OK) != 0) {
+        if (access(QIHSE_TLS_CERT_FILE, F_OK) != 0) {
             fprintf(stderr, "[PQC INIT] Generating self-signed ML-DSA-87 TLS certificate...\n");
             pid_t pid = fork();
             if (pid == 0) {
                 execlp("openssl", "openssl", "req", "-x509", "-new",
                        "-key", QIHSE_DSA_PRIVATE_KEY_FILE,
-                       "-out", "qihse_dsa_cert.pem",
+                       "-out", QIHSE_TLS_CERT_FILE,
                        "-nodes", "-subj", "/CN=QIHSE Cluster",
                        "-days", "3650", (char*)NULL);
                 _exit(1);
@@ -874,7 +874,10 @@ bool qihse_start_pg_wire_server(void* vdb, uint16_t port, const char* bind_addre
             SSL_CTX_set1_sigalgs_list(global_pqc_ssl_ctx, "ML-DSA-87");
             SSL_CTX_set_ciphersuites(global_pqc_ssl_ctx, "TLS_AES_256_GCM_SHA384");
 
-            if (SSL_CTX_use_certificate_file(global_pqc_ssl_ctx, "qihse_dsa_cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+            SSL_CTX_set_verify(global_pqc_ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+            SSL_CTX_set_verify_depth(global_pqc_ssl_ctx, 3);
+
+            if (SSL_CTX_use_certificate_file(global_pqc_ssl_ctx, QIHSE_TLS_CERT_FILE, SSL_FILETYPE_PEM) <= 0 ||
                 SSL_CTX_use_PrivateKey_file(global_pqc_ssl_ctx, QIHSE_DSA_PRIVATE_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
                 fprintf(stderr, "[FATAL] Failed to load PQC cert/key. Refusing to run unencrypted.\n");
                 SSL_CTX_free(global_pqc_ssl_ctx);
