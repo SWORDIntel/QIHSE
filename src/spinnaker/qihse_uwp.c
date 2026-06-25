@@ -35,6 +35,9 @@
 #define htole32(x) (x)
 #define htole64(x) (x)
 #endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #include <sys/time.h>
 #include "qihse_platform.h"
 #ifndef _WIN32
@@ -452,14 +455,14 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
                     qihse_user_t* current_user = NULL;
                     uwp_route_payload(client_sock, ctx, header, payload, res - sizeof(qihse_uwp_header_t), &current_user);
                 } else {
-                    send(client_sock, "ERR_SHORT\n", 10, 0);
+                    send(client_sock, "ERR_SHORT\n", 10, MSG_NOSIGNAL);
                 }
             } else {
 #ifndef _WIN32
                 void* ast = qihse_parse_qql_to_ast(buf);
                 (void)ast;
 #endif
-                send(client_sock, "QQL OK\n", 7, 0);
+                send(client_sock, "QQL OK\n", 7, MSG_NOSIGNAL);
             }
         }
         closesocket(client_sock);
