@@ -32,6 +32,8 @@ Before diving into the architecture, here is exactly what the top-level badges m
 *   **SIMD (AVX-512 / AVX2)**: The codebase is heavily vectorized. Vector database distance calculations and columnar aggregations use 512-bit or 256-bit wide CPU registers to process massive blocks of data in a single clock cycle, falling back safely to scalar execution if the hardware doesn't support it.
 *   **Zero Dependencies**: The core database engine requires no external daemons, no runtime interpreters, and no third-party libraries other than standard system headers (OpenSSL for crypto, libbpf for networking).
 
+> **Validation Status**: All next-generation roadmap features (CNSA 2.0 PQC keys, FIPS hardware acceleration, eBPF/XDP zero-copy dispatch, and Raft consensus UDP broadcast with ML-DSA-87 strict signature verification) have successfully passed full **End-to-End (E2E) integration testing**.
+
 ---
 
 > **Positioning note:** This README is intentionally audacious and currently reads more like a full-scope manifesto than the final public positioning. The planned direction is captured in [POSITIONING_NOTES.md](POSITIONING_NOTES.md): separate stable, experimental, and planned claims; make benchmark/security evidence explicit; and tighten the language before the next serious push.
