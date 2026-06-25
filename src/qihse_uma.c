@@ -8,6 +8,7 @@
 #include "../include/qihse_uma.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -16,6 +17,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <sys/sysinfo.h>
+#ifndef _WIN32
+#include <openssl/rand.h>
+#endif
 
 /* ============================================================================
  * GLOBAL STATE
@@ -690,7 +694,15 @@ int qihse_gna_micro_tweak(
 
     /* For now, generate small random tweaks */
     for (size_t i = 0; i < num_tweaks; i++) {
-        output_tweaks[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f; /* ±5% tweaks */
+#ifndef _WIN32
+        unsigned char tweak_buf[4];
+        if (RAND_bytes(tweak_buf, 4) == 1) {
+            uint32_t u;
+            memcpy(&u, tweak_buf, 4);
+            output_tweaks[i] = ((float)u / (float)UINT32_MAX - 0.5f) * 0.1f;
+        } else
+#endif
+            output_tweaks[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f; /* ±5% tweaks */
     }
 
     return 0;

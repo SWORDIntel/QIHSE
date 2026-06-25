@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <signal.h>
+#include <openssl/rand.h>
 #define close_socket close
 #endif
 
@@ -61,16 +62,38 @@ void* qihse_http_telemetry_thread(void* arg) {
             qihse_get_performance_stats(&stats);
             
             // Add some jitter to synthetic_ops to simulate live load since the server is likely idle
-            synthetic_ops += (rand() % 2000) - 1000;
+            unsigned char jitter[4];
+            int jitter_val = 0;
+#ifdef _WIN32
+            jitter_val = rand() % 2000;
+#else
+            if (RAND_bytes(jitter, 4) == 1) {
+                jitter_val = (jitter[0] | (jitter[1] << 8)) % 2000;
+            } else {
+                jitter_val = rand() % 2000;
+            }
+#endif
+            synthetic_ops += jitter_val - 1000;
             if (synthetic_ops < 10000) synthetic_ops = 10000;
 
             size_t current_qps = stats.total_operations > 0 ? stats.total_operations : synthetic_ops;
-            double current_latency = stats.total_operations > 0 ? ((stats.total_time_ns / stats.total_operations) / 1000000.0) : (1.2 + (rand() % 50) / 100.0);
+            double current_latency = stats.total_operations > 0 ? ((stats.total_time_ns / stats.total_operations) / 1000000.0) : (1.2 + (double)(jitter_val % 50) / 100.0);
 
             char response_body[1024];
+            unsigned char vec_jitter[2];
+            size_t vec_jitter_val = 0;
+#ifdef _WIN32
+            vec_jitter_val = rand() % 5000;
+#else
+            if (RAND_bytes(vec_jitter, 2) == 1) {
+                vec_jitter_val = (vec_jitter[0] | (vec_jitter[1] << 8)) % 5000;
+            } else {
+                vec_jitter_val = rand() % 5000;
+            }
+#endif
             snprintf(response_body, sizeof(response_body),
                      "{\"qps\": %zu, \"latency\": %.2f, \"active_vectors\": %zu}",
-                     current_qps, current_latency, (size_t)(1420000000 + (rand() % 5000)));
+                     current_qps, current_latency, (size_t)(1420000000 + vec_jitter_val));
 
             char http_response[2048];
             snprintf(http_response, sizeof(http_response),

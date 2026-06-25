@@ -142,7 +142,8 @@ qihse_qql_ast_t* qihse_parse_qql_to_ast(const char* qql) {
                 uint32_t l_len = ts_node_end_byte(limit_node) - l_start;
                 char limit_str[32] = {0};
                 strncpy(limit_str, qql + l_start, l_len < 31 ? l_len : 31);
-                ast->limit = atoi(limit_str);
+                ast->limit = (int)strtol(limit_str, NULL, 10);
+                if (ast->limit < 0) ast->limit = 10;
             }
             
             // Parse temporal clause
