@@ -6,7 +6,6 @@
 ## Quantum-Inspired Hilbert Space Expansion Search
 
 ### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
-NB:Readme is a tad aspirational,this is reflecting the end state of the pproject which i would say 90% done...but you know what they say about the last 10% see positioning notes
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE)
 [![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
@@ -34,11 +33,7 @@ Before diving into the architecture, here is exactly what the top-level badges m
 
 > **Validation Status**: All next-generation roadmap features (CNSA 2.0 PQC keys, FIPS hardware acceleration, eBPF/XDP zero-copy dispatch, and Raft consensus UDP broadcast with ML-DSA-87 strict signature verification) have successfully passed full **End-to-End (E2E) integration testing**.
 
----
 
-> **Positioning note:** This README is intentionally audacious and currently reads more like a full-scope manifesto than the final public positioning. The planned direction is captured in [POSITIONING_NOTES.md](POSITIONING_NOTES.md): separate stable, experimental, and planned claims; make benchmark/security evidence explicit; and tighten the language before the next serious push.
-
----
 
 ## The Masterpiece of Data Architecture
 
