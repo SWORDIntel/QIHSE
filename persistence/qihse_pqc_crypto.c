@@ -29,9 +29,11 @@
 #include <openssl/provider.h>
 #include <openssl/crypto.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* ── Provider initialisation ─────────────────────────────────────────── */
 
@@ -67,10 +69,20 @@ int qihse_pqc_init_providers(void) {
 /* ── Internal key helpers ────────────────────────────────────────────── */
 
 static EVP_PKEY *load_private_key(const char *path) {
+#ifndef _WIN32
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return NULL; }
+#else
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
         return NULL;
+#endif
     }
     EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
     fclose(f);
@@ -82,10 +94,20 @@ static EVP_PKEY *load_private_key(const char *path) {
 }
 
 static EVP_PKEY *load_public_key(const char *path) {
+#ifndef _WIN32
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return NULL; }
+#else
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
         return NULL;
+#endif
     }
     EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
     fclose(f);
@@ -213,7 +235,7 @@ size_t qihse_pqc_encrypt(qihse_pqc_ctx_t *ctx,
     memcpy(out_buffer, iv, sizeof(iv));
     uint8_t *out_ct = out_buffer + sizeof(iv);
 
-    if (EVP_EncryptUpdate(cctx, out_ct, &len, in_data, (int)in_len) != 1) goto err;
+    if (EVP_EncryptUpdate(cctx, out_ct, &len, in_data, (int)(in_len > INT_MAX ? INT_MAX : in_len)) != 1) goto err;
     ciphertext_len = (size_t)len;
 
     if (EVP_EncryptFinal_ex(cctx, out_ct + len, &len) != 1) goto err;
@@ -236,6 +258,7 @@ size_t qihse_pqc_decrypt(qihse_pqc_ctx_t *ctx,
                          uint8_t *out_buffer) {
     if (!ctx || !ctx->initialized || !in_data || !out_buffer) return 0;
     if (in_len <= QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE) return 0;
+    if (in_len > (size_t)INT_MAX + QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE) return 0;
 
     const uint8_t *iv         = in_data;
     const uint8_t *ciphertext = in_data + QIHSE_AES_GCM_IV_SIZE;
