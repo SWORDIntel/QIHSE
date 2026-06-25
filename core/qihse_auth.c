@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 
 #define MAX_USERS 1024
 #define MAX_AUTH_ATTEMPTS 5
@@ -19,6 +20,14 @@ static qihse_user_t* users[MAX_USERS];
 static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t active_user_count = 0;
 static auth_rate_limit_t rate_limits[MAX_USERS];
+
+static bool constant_time_compare(const char *a, const char *b, size_t len) {
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < len; i++) {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
 
 static void compute_sha384_hex(const char *input, char *output) {
     unsigned char hash[SHA384_DIGEST_LENGTH];
@@ -65,7 +74,7 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     if (users[0] && user_id != 0) {
         char default_hash[QIHSE_AUTH_HASH_LEN];
         compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", default_hash);
-        if (strcmp(users[0]->password_hash, default_hash) == 0) {
+        if (constant_time_compare(users[0]->password_hash, default_hash, QIHSE_AUTH_HASH_LEN)) {
             printf("[SECURITY ERROR] Default operator password must be changed before creating users.\n");
             pthread_mutex_unlock(&auth_mutex);
             return NULL;
@@ -270,7 +279,7 @@ bool qihse_auth_is_operator_password_default(void) {
     }
     char default_hash[QIHSE_AUTH_HASH_LEN];
     compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", default_hash);
-    bool is_default = (strcmp(op->password_hash, default_hash) == 0);
+    bool is_default = constant_time_compare(op->password_hash, default_hash, QIHSE_AUTH_HASH_LEN);
     pthread_mutex_unlock(&auth_mutex);
     return is_default;
 }
@@ -289,7 +298,7 @@ qihse_user_t* qihse_auth_authenticate(const char* username, const char* password
             }
             char expected_hash[QIHSE_AUTH_HASH_LEN];
             compute_sha384_hex(password, expected_hash);
-            if (strcmp(users[i]->password_hash, expected_hash) == 0) {
+            if (constant_time_compare(users[i]->password_hash, expected_hash, QIHSE_AUTH_HASH_LEN)) {
                 rate_limits[i].failed_count = 0;
                 rate_limits[i].lockout_until = 0;
                 qihse_user_t* u = users[i];
@@ -319,7 +328,7 @@ qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password)
     if (u) {
         char expected_hash[QIHSE_AUTH_HASH_LEN];
         compute_sha384_hex(password, expected_hash);
-        if (strcmp(u->password_hash, expected_hash) == 0) {
+        if (constant_time_compare(u->password_hash, expected_hash, QIHSE_AUTH_HASH_LEN)) {
             pthread_mutex_unlock(&auth_mutex);
             return u;
         }

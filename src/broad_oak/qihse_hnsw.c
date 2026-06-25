@@ -80,7 +80,9 @@ static void ensure_layer_capacity(qihse_hnsw_layer_t *layer, uint32_t node_id) {
         uint32_t new_cap = node_id + 1;
         if (new_cap < layer->links_capacity * 2) new_cap = layer->links_capacity * 2;
         if (new_cap < 16) new_cap = 16;
-        layer->links = (qihse_hnsw_links_t**)realloc(layer->links, new_cap * sizeof(qihse_hnsw_links_t*));
+        qihse_hnsw_links_t **new_links = (qihse_hnsw_links_t**)realloc(layer->links, new_cap * sizeof(qihse_hnsw_links_t*));
+        if (!new_links) return;
+        layer->links = new_links;
         for (uint32_t i = layer->links_capacity; i < new_cap; i++) {
             layer->links[i] = NULL;
         }
@@ -90,10 +92,17 @@ static void ensure_layer_capacity(qihse_hnsw_layer_t *layer, uint32_t node_id) {
 
 static qihse_hnsw_links_t* get_or_create_links(qihse_hnsw_layer_t *layer, uint32_t node_id, uint32_t M) {
     ensure_layer_capacity(layer, node_id);
+    if (node_id >= layer->links_capacity) return NULL;
     if (!layer->links[node_id]) {
         layer->links[node_id] = (qihse_hnsw_links_t*)calloc(1, sizeof(qihse_hnsw_links_t));
+        if (!layer->links[node_id]) return NULL;
         layer->links[node_id]->capacity = M;
         layer->links[node_id]->neighbors = (uint32_t*)malloc(M * sizeof(uint32_t));
+        if (!layer->links[node_id]->neighbors) {
+            free(layer->links[node_id]);
+            layer->links[node_id] = NULL;
+            return NULL;
+        }
     }
     return layer->links[node_id];
 }
@@ -104,6 +113,7 @@ static void add_link_and_prune(qihse_hnsw_index_t *index, int level, uint32_t fr
     if (!layer) return;
     
     qihse_hnsw_links_t *links = get_or_create_links(layer, from, M);
+    if (!links) return;
 
     for (uint32_t i = 0; i < links->count; i++) {
         if (links->neighbors[i] == to) return;
@@ -152,9 +162,11 @@ typedef struct {
 
 static visited_set_t* visited_set_create() {
     visited_set_t *set = (visited_set_t*)malloc(sizeof(visited_set_t));
+    if (!set) return NULL;
     set->capacity = 8192;
     set->count = 0;
     set->keys = (uint32_t*)calloc(set->capacity, sizeof(uint32_t));
+    if (!set->keys) { free(set); return NULL; }
     return set;
 }
 
@@ -208,13 +220,18 @@ static void mark_visited(visited_set_t *set, uint32_t node) {
 
 void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t ep, int ef, int level, uint32_t *results, size_t *num_results) {
     if (num_results) *num_results = 0;
-    if (!index || level > index->max_level || !index->layers[level]) return;
+    if (!index || level > index->max_level || level < 0 || ef <= 0 || !index->layers[level]) return;
     qihse_hnsw_layer_t *layer = index->layers[level];
 
     visited_set_t *vset = visited_set_create();
-    size_t cand_capacity = ef * 10;
+    if (!vset) return;
+    size_t cand_capacity = (size_t)ef * 10;
+    if (cand_capacity == 0) { visited_set_free(vset); return; }
     cand_t *candidates = (cand_t*)malloc(cand_capacity * sizeof(cand_t));
-    cand_t *top_candidates = (cand_t*)malloc(ef * sizeof(cand_t));
+    cand_t *top_candidates = (cand_t*)malloc((size_t)ef * sizeof(cand_t));
+    if (!candidates || !top_candidates) {
+        free(candidates); free(top_candidates); visited_set_free(vset); return;
+    }
     
     size_t cand_count = 0;
     size_t top_count = 0;
@@ -251,7 +268,9 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                     if (top_count < (size_t)ef || dist_e < max_top_dist) {
                         if (cand_count >= cand_capacity) {
                             cand_capacity *= 2;
-                            candidates = (cand_t*)realloc(candidates, cand_capacity * sizeof(cand_t));
+                            cand_t *new_cands = (cand_t*)realloc(candidates, cand_capacity * sizeof(cand_t));
+                            if (!new_cands) break;
+                            candidates = new_cands;
                         }
                         candidates[cand_count++] = (cand_t){e, dist_e};
                         

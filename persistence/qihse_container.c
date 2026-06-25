@@ -356,6 +356,27 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
         return false;
     }
 
+    /* TOCTOU mitigation: re-stat after acquiring lock to detect file replacement */
+    {
+        struct stat st_after_lock;
+        if (fstat(fd, &st_after_lock) != 0) {
+            ctr_lock_release(fd);
+            close(fd);
+            return false;
+        }
+        /* Verify the file hasn't been replaced between open() and flock() */
+        struct stat st_path;
+        if (stat(path, &st_path) == 0) {
+            if (st_path.st_dev != st_after_lock.st_dev ||
+                st_path.st_ino != st_after_lock.st_ino) {
+                ctr_lock_release(fd);
+                close(fd);
+                errno = EINVAL;
+                return false;
+            }
+        }
+    }
+
     {
         struct stat st;
         if (fstat(fd, &st) != 0) {

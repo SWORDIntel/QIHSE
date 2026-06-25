@@ -474,9 +474,10 @@ int qihse_sync_manager_receive_message(
                     memcpy(payload_str, message.payload, message.payload_size);
                     payload_str[message.payload_size] = '\0';
 
-                    char *peer_id = strtok(payload_str, ":");
-                    char *address = strtok(NULL, ":");
-                    char *port_str = strtok(NULL, ":");
+                    char *save_ptr = NULL;
+                    char *peer_id = strtok_r(payload_str, ":", &save_ptr);
+                    char *address = strtok_r(NULL, ":", &save_ptr);
+                    char *port_str = strtok_r(NULL, ":", &save_ptr);
 
                     if (peer_id && address && port_str) {
                         uint16_t port = (uint16_t)atoi(port_str);
