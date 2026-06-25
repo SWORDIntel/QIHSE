@@ -58,6 +58,7 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
+#include <openssl/crypto.h>
 #else
 #define SSL_CTX void
 #define SSL void
@@ -484,6 +485,7 @@ static qihse_user_t* pg_read_password_and_authenticate(int fd, const char* usern
     char* password = malloc(body_len + 1);
     if (!password) return NULL;
     if (pg_read_all(fd, password, body_len) < 0) {
+        OPENSSL_cleanse(password, body_len + 1);
         free(password);
         return NULL;
     }
@@ -491,6 +493,7 @@ static qihse_user_t* pg_read_password_and_authenticate(int fd, const char* usern
     
     // Check password
     qihse_user_t* user = qihse_auth_authenticate(username, password);
+    OPENSSL_cleanse(password, body_len + 1);
     free(password);
     return user;
 }
