@@ -47,6 +47,22 @@
 #include <poll.h>
 #endif
 
+static void uwp_write_all(int fd, const char* buf, size_t len) {
+    if (fd < 0) return;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+#ifdef EPIPE
+            if (errno == EPIPE) break;
+#endif
+            break;
+        }
+        off += (size_t)w;
+    }
+}
+
 static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp_header_t* header, uint8_t* payload, size_t actual_payload_len, qihse_user_t** user_slot) {
     /* Magic Byte Verification */
     if (memcmp(header->magic, "QIHSE", 5) != 0) {
@@ -71,18 +87,18 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
         *user_slot = qihse_auth_authenticate(username, password);
         if (!*user_slot) {
             const char* reply = "ERR_AUTH\n";
-            if (client_fd >= 0) write(client_fd, reply, strlen(reply));
+            uwp_write_all(client_fd, reply, strlen(reply));
             return false;
         }
         const char* reply = "OK\n";
-        if (client_fd >= 0) write(client_fd, reply, 3);
+        uwp_write_all(client_fd, reply, 3);
         return true;
     }
 
     qihse_user_t* current_user = (user_slot && *user_slot) ? *user_slot : NULL;
     if (!ctx || !current_user) {
         const char* reply = "ERR_AUTH\n";
-        if (client_fd >= 0) write(client_fd, reply, strlen(reply));
+        uwp_write_all(client_fd, reply, strlen(reply));
         if (client_fd >= 0) close(client_fd);
         return false;
     }
@@ -101,7 +117,7 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 
                 if (!qihse_kv_set_user(ctx->kv, key, val, 0, 0, current_user)) break;
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
             break;
             
@@ -109,9 +125,14 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             if (header->command_opcode == 0x01 && ctx->vdb) {
                 /* VDB SET: 8 byte ID, 4 byte dims, N floats */
                 if (len < 12) break;
-                uint64_t id = le64toh(*(uint64_t*)payload);
-                uint32_t dims = le32toh(*(uint32_t*)(payload + 8));
+                uint64_t id;
+                uint32_t dims;
+                memcpy(&id, payload, sizeof(uint64_t));
+                id = le64toh(id);
+                memcpy(&dims, payload + 8, sizeof(uint32_t));
+                dims = le32toh(dims);
                 
+                if (dims > 4096) break;
                 /* Check for integer overflow and validate boundaries */
                 uint64_t expected_len = 12 + ((uint64_t)dims * sizeof(float));
                 if (len < expected_len) break;
@@ -120,7 +141,7 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_vector_db_upsert_by_ids(ctx->vdb, &id, vec, 1, dims, NULL, NULL, NULL, NULL);
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
             break;
             
@@ -129,14 +150,16 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             if (header->command_opcode == 0x01 && ctx->doc) {
                 /* DOC SET: 8 byte ID, remaining is JSON string */
                 if (len < 9) break;
-                uint64_t doc_id = le64toh(*(uint64_t*)payload);
+                uint64_t doc_id;
+                memcpy(&doc_id, payload, sizeof(uint64_t));
+                doc_id = le64toh(doc_id);
                 char* json = (char*)(payload + 8);
                 size_t json_max_len = (size_t)(len - 8);
                 if (strnlen(json, json_max_len) == json_max_len) break; /* Missing null terminator */
                 if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_doc_store_insert_json(ctx->doc, doc_id, json);
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
 #endif
             break;
@@ -152,11 +175,12 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 if (len - (col_name_len + 1) < sizeof(float)) break;
 
                 char* col_name = (char*)payload;
-                float* val = (float*)(payload + col_name_len + 1);
+                float fv;
+                memcpy(&fv, payload + col_name_len + 1, sizeof(float));
                 if (!qihse_auth_can_access(current_user, 0, 0)) break;
-                qihse_column_append_float32(ctx->col, col_name, *val, 0, 0);
+                qihse_column_append_float32(ctx->col, col_name, fv, 0, 0);
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
 #endif
             break;
@@ -166,13 +190,17 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             if (header->command_opcode == 0x01 && ctx->tsdb) {
                 /* TSDB INSERT: 8 byte series, 8 byte ts, 8 byte double */
                 if (len < 24) break;
-                uint64_t series = le64toh(*(uint64_t*)payload);
-                uint64_t ts = le64toh(*(uint64_t*)(payload + 8));
-                double val = *(double*)(payload + 16);
+                uint64_t series, ts;
+                memcpy(&series, payload, sizeof(uint64_t));
+                series = le64toh(series);
+                memcpy(&ts, payload + 8, sizeof(uint64_t));
+                ts = le64toh(ts);
+                double dv;
+                memcpy(&dv, payload + 16, sizeof(double));
                 if (!qihse_auth_can_access(current_user, 0, 0)) break;
-                qihse_tsdb_insert(ctx->tsdb, series, ts, val, 0, 0);
+                qihse_tsdb_insert(ctx->tsdb, series, ts, dv, 0, 0);
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
 #endif
             break;
@@ -191,7 +219,7 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
                 if (!qihse_auth_can_access(current_user, 0, 0)) break;
                 qihse_event_stream_append(ctx->stream, topic, msg, msg_len);
                 const char* reply = "OK\n";
-                if (client_fd >= 0) write(client_fd, reply, 3);
+                uwp_write_all(client_fd, reply, 3);
             }
 #endif
             break;

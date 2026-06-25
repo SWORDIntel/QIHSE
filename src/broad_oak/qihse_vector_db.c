@@ -2348,7 +2348,7 @@ static void qihse_vdb_config_load(qihse_vdb_config_t* cfg) {
         fp = fopen(conf_file, "r");
     }
     if (!fp) {
-        fp = fopen(".qihse.conf", "r");
+        fp = fopen("/etc/qihse/qihse.conf", "r");
     }
     if (!fp) {
         const char* home = getenv("HOME");
