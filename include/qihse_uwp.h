@@ -49,4 +49,10 @@ typedef struct __attribute__((packed)) {
  */
 bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address);
 
+/**
+ * @brief Handle a raw payload bypassing the TCP server loop.
+ * Useful for the XDP fast path.
+ */
+void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload, size_t len);
+
 #endif /* QIHSE_UWP_H */

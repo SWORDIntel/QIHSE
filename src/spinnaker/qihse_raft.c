@@ -233,7 +233,33 @@ bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_
         fprintf(stderr, "[QIHSE Raft Node %u] WARNING: DSA key not found — WAL entry unsigned. "
                         "Run ./qihse_keygen to generate keys.\n", node->node_id);
     }
-    (void)sig; (void)signed_ok; /* broadcast with entry in future full implementation */
+    
+    if (signed_ok) {
+        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_sock >= 0) {
+            size_t payload_len = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(size_t) + QIHSE_MLDSA_SIGNATURE_SIZE + len;
+            uint8_t* payload = (uint8_t*)malloc(payload_len);
+            if (payload) {
+                uint8_t* ptr = payload;
+                memcpy(ptr, &node->current_term, sizeof(uint64_t)); ptr += sizeof(uint64_t);
+                memcpy(ptr, &node->node_id, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                memcpy(ptr, &len, sizeof(size_t)); ptr += sizeof(size_t);
+                memcpy(ptr, sig, QIHSE_MLDSA_SIGNATURE_SIZE); ptr += QIHSE_MLDSA_SIGNATURE_SIZE;
+                memcpy(ptr, data, len);
+                
+                for (size_t i = 0; i < node->num_peers; i++) {
+                    struct sockaddr_in peer_addr;
+                    memset(&peer_addr, 0, sizeof(peer_addr));
+                    peer_addr.sin_family = AF_INET;
+                    peer_addr.sin_port = htons(node->peers[i].port);
+                    inet_pton(AF_INET, node->peers[i].ip, &peer_addr.sin_addr);
+                    sendto(udp_sock, payload, payload_len, 0, (struct sockaddr*)&peer_addr, sizeof(peer_addr));
+                }
+                free(payload);
+            }
+            close(udp_sock);
+        }
+    }
 #endif
 
     node->commit_index++;
@@ -241,7 +267,7 @@ bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_
     return true;
 }
 
-void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_term, uint32_t leader_id) {
+void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_term, uint32_t leader_id, const uint8_t* data, size_t len, const uint8_t* sig) {
     if (!node) return;
 
     if (leader_term >= node->current_term) {
@@ -251,10 +277,19 @@ void qihse_raft_receive_append_entries(qihse_raft_node_t* node, uint64_t leader_
         node->last_heartbeat = time(NULL);
         printf("[QIHSE Raft Node %u] Received AppendEntries from Leader %u. Stepping down to Follower.\n",
                node->node_id, leader_id);
-        /*
-         * Full implementation: extract (data, len, sig) from RPC message,
-         * verify sig with qihse_pqc_verify(data, len, sig) before accepting
-         * the entry. Reject if verification fails.
-         */
+#ifndef _WIN32
+        if (sig && data && len > 0) {
+            if (qihse_pqc_verify(data, len, sig)) {
+                printf("[QIHSE Raft Node %u] ML-DSA-87 signature verified successfully. Accepting entry.\n", node->node_id);
+                node->commit_index++;
+                node->last_applied = node->commit_index;
+            } else {
+                printf("[QIHSE Raft Node %u] AppendEntries rejected: invalid ML-DSA-87 signature!\n", node->node_id);
+            }
+        }
+#else
+        node->commit_index++;
+        node->last_applied = node->commit_index;
+#endif
     }
 }
