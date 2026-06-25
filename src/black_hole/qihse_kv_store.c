@@ -44,7 +44,7 @@ static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
     if (store->num_keys == 0) return;
     
     char sst_path[256];
-    snprintf(sst_path, sizeof(sst_path), "sstable_%d.db", store->sstable_counter++);
+    snprintf(sst_path, sizeof(sst_path), QIHSE_DATA_DIR "sstable_%d.db", store->sstable_counter++);
     
     qihse_kv_save(store, sst_path);
     
@@ -110,11 +110,14 @@ qihse_kv_store_t* qihse_kv_store_create() {
     // Discover highest sstable counter
     DIR *d;
     struct dirent *dir;
-    d = opendir(".");
+    d = opendir(QIHSE_DATA_DIR);
     if (d) {
         while ((dir = readdir(d)) != NULL) {
             if (strncmp(dir->d_name, "sstable_", 8) == 0) {
-                int id = atoi(dir->d_name + 8);
+                char *endp;
+                long id = strtol(dir->d_name + 8, &endp, 10);
+                if (*endp != '\0') continue;
+                if (id < 0 || id > 1000000) continue;
                 if (id >= store->sstable_counter) store->sstable_counter = id + 1;
             }
         }
@@ -261,9 +264,16 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
     // LSM-Tree: Search SSTables (from newest to oldest)
     for (int i = store->sstable_counter - 1; i >= 0; i--) {
         char sst_path[256];
-        snprintf(sst_path, sizeof(sst_path), "sstable_%d.db", i);
+        snprintf(sst_path, sizeof(sst_path), QIHSE_DATA_DIR "sstable_%d.db", i);
+#ifndef _WIN32
+        int sfd = open(sst_path, O_RDONLY | O_NOFOLLOW);
+        if (sfd < 0) continue;
+        FILE* f = fdopen(sfd, "r");
+        if (!f) { close(sfd); continue; }
+#else
         FILE* f = fopen(sst_path, "r");
         if (!f) continue;
+#endif
         
         char header[256];
         while (fgets(header, sizeof(header), f)) {

@@ -503,7 +503,9 @@ int qihse_power_set_turbo(bool enable) {
     const char *turbo_val = enable ? "1" : "0";
     int fd = open("/sys/devices/system/cpu/intel_pstate/no_turbo", O_WRONLY);
     if (fd >= 0) {
-        write(fd, turbo_val, 1);
+        if (write(fd, turbo_val, 1) < 0) {
+            perror("qihse_power_set_turbo: write failed");
+        }
         close(fd);
     }
 

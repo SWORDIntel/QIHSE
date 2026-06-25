@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #ifndef M_PI
 #define M_PI acos(-1.0)
@@ -524,8 +525,15 @@ bool qihse_get_anchor_optimized_config(const qihse_optimization_db_t* db, const 
 
 int qihse_save_optimization_db(const qihse_optimization_db_t* db) {
     if (!db || !db->storage_path) return -EINVAL;
+#ifndef _WIN32
+    int fd = open(db->storage_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -errno;
+    FILE* fp = fdopen(fd, "wb");
+    if (!fp) { close(fd); return -errno; }
+#else
     FILE* fp = fopen(db->storage_path, "wb");
     if (!fp) return -errno;
+#endif
     uint32_t m = 0x51485345, v = 1;
     fwrite(&m, 4, 1, fp); fwrite(&v, 4, 1, fp); fwrite(&db->num_entries, sizeof(size_t), 1, fp);
     fwrite(db->entries, sizeof(qihse_optimization_entry_t), db->num_entries, fp);
@@ -534,8 +542,15 @@ int qihse_save_optimization_db(const qihse_optimization_db_t* db) {
 
 int qihse_load_optimization_db(qihse_optimization_db_t* db) {
     if (!db || !db->storage_path) return -EINVAL;
+#ifndef _WIN32
+    int fd = open(db->storage_path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -errno;
+    FILE* fp = fdopen(fd, "rb");
+    if (!fp) { close(fd); return -errno; }
+#else
     FILE* fp = fopen(db->storage_path, "rb");
     if (!fp) return -errno;
+#endif
     uint32_t m, v; size_t n;
     if (fread(&m, 4, 1, fp) != 1 || fread(&v, 4, 1, fp) != 1 || m != 0x51485345 || v != 1) { fclose(fp); return -EINVAL; }
     if (fread(&n, sizeof(size_t), 1, fp) != 1) { fclose(fp); return -EINVAL; }

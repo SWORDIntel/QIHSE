@@ -8,10 +8,12 @@
 #include "../include/qihse.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
 #include <errno.h>
+#include <fcntl.h>
 #ifndef _WIN32
 #include <openssl/rand.h>
 #endif
@@ -130,9 +132,24 @@ qihse_training_sample_t* qihse_generate_training_data(
         qihse_simulation_params_t params = *sim_params;
 
         /* Vary parameters for diverse training data */
-        params.array_size = sim_params->array_size * (0.5 + (double)rand() / RAND_MAX);
-        params.entropy = sim_params->entropy * (0.5 + (double)rand() / RAND_MAX);
-        params.gap_variance = sim_params->gap_variance * (0.5 + (double)rand() / RAND_MAX);
+        unsigned char var_buf[8];
+        double v1, v2, v3;
+#ifndef _WIN32
+        if (RAND_bytes(var_buf, 8) == 1) {
+            uint64_t u1, u2;
+            memcpy(&u1, var_buf, 4);
+            memcpy(&u2, var_buf + 4, 4);
+            v1 = 0.5 + (double)u1 / (double)UINT64_MAX;
+            v2 = 0.5 + (double)u2 / (double)UINT64_MAX;
+            uint32_t u3;
+            if (RAND_bytes(var_buf, 4) == 1) { memcpy(&u3, var_buf, 4); v3 = 0.5 + (double)u3 / (double)UINT32_MAX; }
+            else v3 = (double)rand() / RAND_MAX;
+        } else
+#endif
+        { v1 = (double)rand() / RAND_MAX; v2 = (double)rand() / RAND_MAX; v3 = (double)rand() / RAND_MAX; }
+        params.array_size = sim_params->array_size * v1;
+        params.entropy = sim_params->entropy * v2;
+        params.gap_variance = sim_params->gap_variance * v3;
 
         if (qihse_generate_sample(&params, &samples[i]) != 0) {
             free(samples);
@@ -283,7 +300,15 @@ qihse_ml_optimizer_t* qihse_ml_optimizer_init(
 #endif
             srand(time(NULL));
         for (size_t j = 0; j < layer->output_size * layer->input_size; j++) {
-            layer->weights[j] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+#ifndef _WIN32
+            unsigned char wbuf[4];
+            if (RAND_bytes(wbuf, 4) == 1) {
+                uint32_t u;
+                memcpy(&u, wbuf, 4);
+                layer->weights[j] = ((float)u / (float)UINT32_MAX - 0.5f) * 0.1f;
+            } else
+#endif
+                layer->weights[j] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
         }
         for (size_t j = 0; j < layer->output_size; j++) {
             layer->biases[j] = 0.0f;
@@ -678,8 +703,14 @@ int qihse_self_improvement_get_config(
 int qihse_ml_optimizer_save(const qihse_ml_optimizer_t* optimizer, const char* path) {
     if (!optimizer || !path) return -EINVAL;
 
+#ifndef _WIN32
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -errno;
+    FILE* fp = fdopen(fd, "wb");
+    if (!fp) { close(fd); return -errno; }
+#else
     FILE* fp = fopen(path, "wb");
-    if (!fp) return -errno;
+#endif
 
     /* Save model metadata */
     fwrite(&optimizer->nn_config, sizeof(qihse_nn_config_t), 1, fp);
@@ -701,8 +732,15 @@ int qihse_ml_optimizer_save(const qihse_ml_optimizer_t* optimizer, const char* p
 qihse_ml_optimizer_t* qihse_ml_optimizer_load(const char* path) {
     if (!path) return NULL;
 
+#ifndef _WIN32
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    FILE* fp = fdopen(fd, "rb");
+    if (!fp) { close(fd); return NULL; }
+#else
     FILE* fp = fopen(path, "rb");
     if (!fp) return NULL;
+#endif
 
     qihse_ml_optimizer_t* optimizer = calloc(1, sizeof(qihse_ml_optimizer_t));
     if (!optimizer) {

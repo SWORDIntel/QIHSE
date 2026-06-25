@@ -2345,7 +2345,11 @@ static void qihse_vdb_config_load(qihse_vdb_config_t* cfg) {
     memset(cfg, 0, sizeof(*cfg));
 
     if (conf_file) {
-        fp = fopen(conf_file, "r");
+        if (strstr(conf_file, "..") != NULL) {
+            fprintf(stderr, "[QIHSE] Rejected QIHSE_CONF_FILE containing path traversal: %s\n", conf_file);
+        } else {
+            fp = fopen(conf_file, "r");
+        }
     }
     if (!fp) {
         fp = fopen("/etc/qihse/qihse.conf", "r");

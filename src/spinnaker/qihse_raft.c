@@ -35,7 +35,13 @@ bool qihse_raft_init(qihse_raft_node_t* node, uint32_t node_id, uint16_t port, q
     node->vdb = vdb;
     node->running = false;
     node->last_heartbeat = time(NULL);
-    srand((unsigned int)(time(NULL) ^ node->node_id ^ getpid()));
+#ifndef _WIN32
+    unsigned char raft_seed[4];
+    if (RAND_bytes(raft_seed, 4) == 1) {
+        srand((unsigned int)(raft_seed[0] | (raft_seed[1] << 8) | (raft_seed[2] << 16) | (raft_seed[3] << 24)));
+    } else
+#endif
+        srand((unsigned int)(time(NULL) ^ node->node_id ^ getpid()));
 
 #ifndef _WIN32
     if (io_uring_queue_init(URING_QUEUE_DEPTH, &node->ring, 0) < 0) {

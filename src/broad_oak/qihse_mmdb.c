@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Internal helpers
@@ -456,7 +460,14 @@ static size_t mmdb_walk_tree(const qihse_mmdb_t* db,
 qihse_mmdb_t* qihse_mmdb_open(const char* path) {
     if (!path) return NULL;
 
+#ifndef _WIN32
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return NULL; }
+#else
     FILE* f = fopen(path, "rb");
+#endif
     if (!f) return NULL;
 
     fseek(f, 0, SEEK_END);

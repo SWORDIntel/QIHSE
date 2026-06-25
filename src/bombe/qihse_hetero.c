@@ -11,12 +11,16 @@
 #include "qihse_hetero.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <cpuid.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <openssl/rand.h>
+#endif
 
 #ifdef __linux__
 #include <malloc.h>  /* For posix_memalign */
@@ -104,11 +108,26 @@ static double qihse_benchmark_device_fp32(size_t batch_size, size_t dims __attri
     }
 
     /* Initialize with random data */
+    unsigned char rbuf[8];
     for (size_t i = 0; i < batch_size * dims; i++) {
-        matrix[i] = (float)rand() / RAND_MAX;
+#ifndef _WIN32
+        if (RAND_bytes(rbuf, 4) == 1) {
+            uint32_t u;
+            memcpy(&u, rbuf, 4);
+            matrix[i] = (float)u / (float)UINT32_MAX;
+        } else
+#endif
+            matrix[i] = (float)rand() / RAND_MAX;
     }
     for (size_t i = 0; i < dims; i++) {
-        vector[i] = (float)rand() / RAND_MAX;
+#ifndef _WIN32
+        if (RAND_bytes(rbuf, 4) == 1) {
+            uint32_t u;
+            memcpy(&u, rbuf, 4);
+            vector[i] = (float)u / (float)UINT32_MAX;
+        } else
+#endif
+            vector[i] = (float)rand() / RAND_MAX;
     }
 
     /* Time the computation */
@@ -158,10 +177,20 @@ static double qihse_benchmark_device_int8(size_t batch_size, size_t dims __attri
 
     /* Initialize with random data */
     for (size_t i = 0; i < batch_size * dims; i++) {
-        matrix[i] = (int8_t)(rand() % 256 - 128);
+#ifndef _WIN32
+        if (RAND_bytes(rbuf, 1) == 1) {
+            matrix[i] = (int8_t)(rbuf[0] - 128);
+        } else
+#endif
+            matrix[i] = (int8_t)(rand() % 256 - 128);
     }
     for (size_t i = 0; i < dims; i++) {
-        vector[i] = (int8_t)(rand() % 256 - 128);
+#ifndef _WIN32
+        if (RAND_bytes(rbuf, 1) == 1) {
+            vector[i] = (int8_t)(rbuf[0] - 128);
+        } else
+#endif
+            vector[i] = (int8_t)(rand() % 256 - 128);
     }
 
     /* Time the computation */
