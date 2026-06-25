@@ -4,12 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <signal.h>
 #else
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -41,8 +43,10 @@ void* qihse_resp_client_thread(void* arg) {
 static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args) {
     if (buf_len == 0 || buf[0] != '*') return -1;
     char *end = buf + buf_len;
-    int argc = atoi(buf + 1);
-    if (argc <= 0 || argc > max_args) return -1;
+    char *endptr = NULL;
+    long argc_l = strtol(buf + 1, &endptr, 10);
+    if (endptr == buf + 1 || argc_l <= 0 || argc_l > max_args) return -1;
+    int argc = (int)argc_l;
     
     char* p = strstr(buf, "\r\n");
     if (!p) return -1;
@@ -50,8 +54,10 @@ static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args
     
     for (int i = 0; i < argc; i++) {
         if (p >= end || p[0] != '$') return -1;
-        int len = atoi(p + 1);
-        if (len < 0 || len > 1024 * 1024) return -1;
+        char *len_endptr = NULL;
+        long len_l = strtol(p + 1, &len_endptr, 10);
+        if (len_endptr == p + 1 || len_l < 0 || len_l > 1024 * 1024) return -1;
+        int len = (int)len_l;
         p = strstr(p, "\r\n");
         if (!p) return -1;
         p += 2;
@@ -70,6 +76,9 @@ static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args
 }
 
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
 #ifdef _WIN32
     DWORD timeout = 30000;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -94,10 +103,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
         if (buffer[0] == '*') {
             argc = parse_resp_array(buffer, valread, args, 2048);
         } else {
-            char* token = strtok(buffer, " \r\n");
+            char* save_ptr = NULL;
+            char* token = strtok_r(buffer, " \r\n", &save_ptr);
             while (token && argc < 2048) {
                 args[argc++] = token;
-                token = strtok(NULL, " \r\n");
+                token = strtok_r(NULL, " \r\n", &save_ptr);
             }
         }
         
@@ -201,7 +211,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 write(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSET") == 0 && argc >= 3) {
                 uint64_t id = strtoull(args[1], NULL, 10);
-                int dim = atoi(args[2]);
+                int dim = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048) {
                     const char* reply = "-ERR invalid dimension\r\n";
                     write(client_fd, reply, strlen(reply));
@@ -222,8 +232,8 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 const char* reply = "-ERR VECGET not implemented\r\n";
                 write(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSEARCH") == 0 && argc >= 3) {
-                int dim = atoi(args[1]);
-                int top_k = atoi(args[2]);
+                int dim = (int)strtol(args[1], NULL, 10);
+                int top_k = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048 || top_k <= 0 || top_k > 1000) {
                     const char* reply = "-ERR invalid parameters\r\n";
                     write(client_fd, reply, strlen(reply));

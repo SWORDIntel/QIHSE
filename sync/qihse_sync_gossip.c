@@ -480,7 +480,10 @@ int qihse_sync_manager_receive_message(
                     char *port_str = strtok_r(NULL, ":", &save_ptr);
 
                     if (peer_id && address && port_str) {
-                        uint16_t port = (uint16_t)atoi(port_str);
+                        char *port_end = NULL;
+                        long port_l = strtol(port_str, &port_end, 10);
+                        if (port_end != port_str && port_l >= 1 && port_l <= 65535) {
+                        uint16_t port = (uint16_t)port_l;
 
                         // Check if we already know this peer
                         bool known = false;
@@ -496,6 +499,7 @@ int qihse_sync_manager_receive_message(
                             if (qihse_sync_peer_init(&new_peer, peer_id, address, port) == 0) {
                                 qihse_sync_manager_add_peer(manager, new_peer);
                             }
+                        }
                         }
                     }
 
