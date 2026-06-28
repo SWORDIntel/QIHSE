@@ -3,13 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "qihse_vector_db.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * qihse_vector_query_t:
+ * qihse_multimodal_query_t:
  * Represents a single vector query for a specific modality.
  */
 typedef struct {
@@ -17,7 +18,7 @@ typedef struct {
     size_t dim;            /* Dimensionality of the vector */
     const char *modality;  /* Name or identifier of the modality (e.g., "text", "image", "audio") */
     float weight;          /* Weight assigned to this modality for fusion */
-} qihse_vector_query_t;
+} qihse_multimodal_query_t;
 
 /*
  * qihse_multimodal_request_t:
@@ -27,20 +28,20 @@ typedef struct {
  * Native multi-modal fusion combines these queries.
  */
 typedef struct {
-    qihse_vector_query_t *queries; /* Array of vector queries */
+    qihse_multimodal_query_t *queries; /* Array of vector queries */
     size_t num_queries;            /* Number of queries in the array */
     int top_k;                     /* Number of top results to return */
     struct qihse_user_s* user;     /* User executing the multimodal query */
 } qihse_multimodal_request_t;
 
 /*
- * qihse_search_result_t:
- * Represents a single search result.
+ * qihse_fusion_result_t:
+ * Represents a single fused search result.
  */
 typedef struct {
     uint64_t id;    /* ID of the document/entity */
     float score;    /* Final fused score */
-} qihse_search_result_t;
+} qihse_fusion_result_t;
 
 /*
  * qihse_vector_db_search_multimodal:
@@ -56,7 +57,10 @@ typedef struct {
  * Returns: A pointer to an array of qihse_search_result_t of size `request->top_k` (or fewer if fewer results exist),
  *          or NULL on error. The caller is responsible for freeing the returned array.
  */
-qihse_search_result_t* qihse_vector_db_search_multimodal(const qihse_multimodal_request_t *request, size_t *out_num_results);
+qihse_fusion_result_t* qihse_vector_db_search_multimodal(
+    qihse_vector_db_t vdb,
+    const qihse_multimodal_request_t *request,
+    size_t *out_num_results);
 
 #ifdef __cplusplus
 }

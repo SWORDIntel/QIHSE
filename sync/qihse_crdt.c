@@ -75,11 +75,26 @@ void qihse_crdt_destroy(qihse_crdt_manager_t* manager) {
 bool qihse_crdt_upsert(qihse_crdt_manager_t* manager, const uint8_t vector_id[16], uint64_t timestamp, bool is_deleted, const uint8_t hash[48]) {
     if (!manager || !manager->dag_root) return false;
     
-    // Simplistic mapping: We should traverse down the Trinary DAG based on the vector_id bits.
-    // For this implementation, we will mock routing it to the root node's record list directly.
-    // A true Trinary DAG would route vector_id trits (-1, 0, 1) down to the leaves.
-    
+    /* Traverse the Trinary DAG based on vector_id bytes.
+     * Each byte determines the branch: <85 → left (trit -1), 85-170 → middle (trit 0), >170 → right (trit +1).
+     * We use the first 8 bytes for routing depth (8 levels), keeping the tree manageable. */
     qihse_trinary_dag_node_t* target = manager->dag_root;
+    for (int i = 0; i < 8; i++) {
+        uint8_t b = vector_id[i];
+        qihse_trinary_dag_node_t** child;
+        if (b < 85) {
+            child = &target->left;
+        } else if (b <= 170) {
+            child = &target->middle;
+        } else {
+            child = &target->right;
+        }
+        if (!*child) {
+            *child = create_dag_node();
+            if (!*child) return false;
+        }
+        target = *child;
+    }
     
     // LWW (Last-Writer-Wins) resolution with binary search for sorted insertion
     size_t left = 0, right = target->record_count;
@@ -110,7 +125,18 @@ bool qihse_crdt_upsert(qihse_crdt_manager_t* manager, const uint8_t vector_id[16
             target->records[pos].timestamp = timestamp;
             target->records[pos].is_deleted = is_deleted;
             memcpy(target->records[pos].payload_hash, hash, 48);
-            compute_node_hash(target); // Recompute Merkle Hash
+            /* Recompute Merkle hashes up the tree */
+            qihse_trinary_dag_node_t* path[9];
+            path[0] = manager->dag_root;
+            for (int i = 0; i < 8; i++) {
+                uint8_t b = vector_id[i];
+                if (b < 85) path[i + 1] = path[i] ? path[i]->left : NULL;
+                else if (b <= 170) path[i + 1] = path[i] ? path[i]->middle : NULL;
+                else path[i + 1] = path[i] ? path[i]->right : NULL;
+            }
+            for (int i = 8; i >= 0; i--) {
+                if (path[i]) compute_node_hash(path[i]);
+            }
             return true;
         }
         return false; // Incoming record is older, ignore.
@@ -127,7 +153,26 @@ bool qihse_crdt_upsert(qihse_crdt_manager_t* manager, const uint8_t vector_id[16
     memcpy(target->records[pos].payload_hash, hash, 48);
     target->record_count++;
     
-    compute_node_hash(target); // Recompute Merkle Hash
+    /* Recompute Merkle hashes from the target leaf up to the root */
+    /* We need to recompute all ancestors; since we don't store parent pointers,
+     * we recompute by re-traversing the path */
+    qihse_trinary_dag_node_t* path[9];
+    path[0] = manager->dag_root;
+    for (int i = 0; i < 8; i++) {
+        uint8_t b = vector_id[i];
+        if (b < 85) {
+            path[i + 1] = path[i]->left;
+        } else if (b <= 170) {
+            path[i + 1] = path[i]->middle;
+        } else {
+            path[i + 1] = path[i]->right;
+        }
+        if (!path[i + 1]) break;
+    }
+    /* Recompute from leaf upward */
+    for (int i = 8; i >= 0; i--) {
+        if (path[i]) compute_node_hash(path[i]);
+    }
     return true;
 }
 

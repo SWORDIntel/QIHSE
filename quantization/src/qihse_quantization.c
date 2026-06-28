@@ -12,6 +12,7 @@
 #include <time.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* ============================================================================
  * QUANTIZATION PIPELINE LIFECYCLE
@@ -290,8 +291,9 @@ int qihse_quantization_quantize(
     if (!float_input) return -ENOMEM;
 
     /* Convert input data to float format */
+    const float* input_floats = (const float*)input_data;
     for (size_t i = 0; i < input_size; i++) {
-        float_input[i] = (float)i; /* Placeholder conversion */
+        float_input[i] = input_floats[i];
     }
 
     /* Calculate output size */
@@ -388,12 +390,45 @@ int qihse_quantization_dequantize(
             case QIHSE_QUANT_INT8:
                 quantized_val = (float)((const int8_t*)quantized_data)[i];
                 break;
-            case QIHSE_QUANT_FP16:
-                /* Simplified FP16 to float conversion */
-                quantized_val = (float)i; /* Placeholder */
+            case QIHSE_QUANT_FP16: {
+                /* FP16 (IEEE 754 half-precision) to FP32 conversion */
+                uint16_t h = ((const uint16_t*)quantized_data)[i];
+                uint32_t sign = (h >> 15) & 0x1;
+                uint32_t exp = (h >> 10) & 0x1f;
+                uint32_t mant = h & 0x3ff;
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) {
+                        f = sign << 31;
+                    } else {
+                        /* Subnormal */
+                        int e = -1;
+                        do {
+                            e++;
+                            mant <<= 1;
+                        } while ((mant & 0x400) == 0);
+                        mant &= 0x3ff;
+                        f = (sign << 31) | ((127 - 15 - e) << 23) | (mant << 13);
+                    }
+                } else if (exp == 31) {
+                    /* Inf or NaN */
+                    f = (sign << 31) | (0xff << 23) | (mant << 13);
+                } else {
+                    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                }
+                memcpy(&quantized_val, &f, sizeof(float));
                 break;
+            }
+            case QIHSE_QUANT_BF16: {
+                /* BF16 to FP32: simply pad with zeros in the lower 16 bits */
+                uint16_t h = ((const uint16_t*)quantized_data)[i];
+                uint32_t f = ((uint32_t)h) << 16;
+                memcpy(&quantized_val, &f, sizeof(float));
+                break;
+            }
             default:
-                quantized_val = (float)i; /* Placeholder */
+                /* FP32: direct copy */
+                quantized_val = ((const float*)quantized_data)[i];
                 break;
         }
 
@@ -440,7 +475,9 @@ int qihse_npu_quantization_init(qihse_quantization_pipeline_t* pipeline) {
     pipeline->use_npu = true;
 
     /* Initialize NPU context for quantization operations */
-    pipeline->accelerator_context = calloc(1, sizeof(void*)); /* Placeholder */
+    /* Allocate a small context struct to track NPU state */
+    pipeline->accelerator_context = calloc(1, sizeof(struct { int initialized; int device_id; }));
+    if (!pipeline->accelerator_context) return -ENOMEM;
 
     return 0;
 }

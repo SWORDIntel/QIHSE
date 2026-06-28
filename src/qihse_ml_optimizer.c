@@ -80,30 +80,66 @@ static void nn_forward(neural_network_t* nn, const float* input, float* output) 
 
 /* Backpropagation */
 static void nn_backward(neural_network_t* nn, const float* target, const float* input) {
-    /* Simplified backpropagation for demonstration */
-    /* Computes gradients for optimization */
+    if (!nn || !target || !input || nn->num_layers == 0) return;
 
-    for (size_t layer_idx = nn->num_layers - 1; layer_idx < nn->num_layers; layer_idx--) {
-        nn_layer_t* layer = &nn->layers[layer_idx];
+    /* Allocate delta arrays for each layer */
+    float** deltas = (float**)calloc(nn->num_layers, sizeof(float*));
+    if (!deltas) return;
 
-        for (size_t i = 0; i < layer->output_size; i++) {
-            float error = target[i] - layer->activations[i];
-            float delta = error; /* Linear activation for output layer */
-
-            if (layer_idx > 0) {
-                delta *= relu_derivative(layer->activations[i]);
-            }
-
-            /* Update biases */
-            layer->biases[i] += nn->learning_rate * delta;
-
-            /* Update weights using gradient descent */
-            for (size_t j = 0; j < layer->input_size; j++) {
-                float input_val = (layer_idx == 0) ? input[j] : nn->layers[layer_idx - 1].activations[j];
-                layer->weights[i * layer->input_size + j] += nn->learning_rate * delta * input_val;
-            }
+    for (size_t i = 0; i < nn->num_layers; i++) {
+        deltas[i] = (float*)calloc(nn->layers[i].output_size, sizeof(float));
+        if (!deltas[i]) {
+            for (size_t j = 0; j < i; j++) free(deltas[j]);
+            free(deltas);
+            return;
         }
     }
+
+    /* Output layer: compute delta = (target - activation) * activation_derivative */
+    size_t out_layer = nn->num_layers - 1;
+    nn_layer_t* out = &nn->layers[out_layer];
+    for (size_t i = 0; i < out->output_size; i++) {
+        float error = target[i] - out->activations[i];
+        /* Output layer uses linear activation, derivative = 1 */
+        deltas[out_layer][i] = error;
+    }
+
+    /* Hidden layers: backpropagate deltas */
+    for (long layer_idx = (long)out_layer - 1; layer_idx >= 0; layer_idx--) {
+        nn_layer_t* layer = &nn->layers[layer_idx];
+        nn_layer_t* next = &nn->layers[layer_idx + 1];
+        for (size_t i = 0; i < layer->output_size; i++) {
+            float sum = 0.0f;
+            for (size_t j = 0; j < next->output_size; j++) {
+                sum += next->weights[j * next->input_size + i] * deltas[layer_idx + 1][j];
+            }
+            deltas[layer_idx][i] = sum * relu_derivative(layer->activations[i]);
+        }
+    }
+
+    /* Update weights and biases using gradient descent with momentum */
+    for (size_t layer_idx = 0; layer_idx < nn->num_layers; layer_idx++) {
+        nn_layer_t* layer = &nn->layers[layer_idx];
+        for (size_t i = 0; i < layer->output_size; i++) {
+            float delta = deltas[layer_idx][i];
+            for (size_t j = 0; j < layer->input_size; j++) {
+                float input_val = (layer_idx == 0) ? input[j] : nn->layers[layer_idx - 1].activations[j];
+                float grad = delta * input_val;
+                /* Momentum update */
+                if (layer->gradients) {
+                    float prev_grad = layer->gradients[i * layer->input_size + j];
+                    layer->gradients[i * layer->input_size + j] = grad;
+                    grad = grad + nn->momentum * prev_grad;
+                }
+                layer->weights[i * layer->input_size + j] += nn->learning_rate * grad;
+            }
+            layer->biases[i] += nn->learning_rate * delta;
+        }
+    }
+
+    /* Cleanup */
+    for (size_t i = 0; i < nn->num_layers; i++) free(deltas[i]);
+    free(deltas);
 }
 
 /* ============================================================================

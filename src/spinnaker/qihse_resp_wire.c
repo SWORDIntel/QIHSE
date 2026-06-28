@@ -241,8 +241,33 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "VECGET") == 0 && argc >= 2) {
-                const char* reply = "-ERR VECGET not implemented\r\n";
-                resp_write_all(client_fd, reply, strlen(reply));
+                uint64_t id = strtoull(args[1], NULL, 10);
+                size_t dims = qihse_vector_db_get_dims(vdb);
+                if (dims == 0) {
+                    const char* reply = "-ERR vector database not initialized\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                } else {
+                    float* vec = (float*)malloc(dims * sizeof(float));
+                    if (!vec) {
+                        const char* reply = "-ERR out of memory\r\n";
+                        resp_write_all(client_fd, reply, strlen(reply));
+                    } else if (qihse_vector_db_get_vector_by_id(vdb, id, vec, &dims)) {
+                        char header[64];
+                        snprintf(header, sizeof(header), "*%zu\r\n", dims);
+                        resp_write_all(client_fd, header, strlen(header));
+                        for (size_t i = 0; i < dims; i++) {
+                            char val[64];
+                            snprintf(val, sizeof(val), "$%zu\r\n%.6g\r\n",
+                                     (size_t)snprintf(NULL, 0, "%.6g", vec[i]),
+                                     vec[i]);
+                            resp_write_all(client_fd, val, strlen(val));
+                        }
+                    } else {
+                        const char* reply = "-ERR vector not found\r\n";
+                        resp_write_all(client_fd, reply, strlen(reply));
+                    }
+                    free(vec);
+                }
             } else if (strcasecmp(args[0], "VECSEARCH") == 0 && argc >= 3) {
                 int dim = (int)strtol(args[1], NULL, 10);
                 int top_k = (int)strtol(args[2], NULL, 10);

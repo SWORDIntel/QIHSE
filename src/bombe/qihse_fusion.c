@@ -1,4 +1,5 @@
 #include "qihse_fusion.h"
+#include "qihse_vector_db.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -33,23 +34,20 @@ static int compare_rrf_score_desc(const void *a, const void *b) {
  * qihse_vector_db_search_multimodal:
  * Executes multiple queries and fuses their results natively using Reciprocal Rank Fusion (RRF).
  */
-qihse_search_result_t* qihse_vector_db_search_multimodal(const qihse_multimodal_request_t *request, size_t *out_num_results) {
+qihse_fusion_result_t* qihse_vector_db_search_multimodal(
+    qihse_vector_db_t vdb,
+    const qihse_multimodal_request_t *request,
+    size_t *out_num_results) {
     if (!request || request->num_queries == 0 || request->top_k <= 0 || !out_num_results) {
         if (out_num_results) *out_num_results = 0;
         return NULL;
     }
 
-    printf("Executing native multi-modal search using RRF for %zu queries...\n", request->num_queries);
-
-    /* RRF constant k is typically around 60 */
     const float k_constant = 60.0f;
-    
-    /* We simulate collecting top-N results from each modality.
-       For a real implementation, this would call native ANN searches. */
-    size_t mock_top_n = (size_t)request->top_k * 2;
-    if (mock_top_n < 100) mock_top_n = 100;
+    size_t top_n = (size_t)request->top_k * 2;
+    if (top_n < 100) top_n = 100;
 
-    size_t total_alloc = request->num_queries * mock_top_n;
+    size_t total_alloc = request->num_queries * top_n;
     rrf_entry_t *all_entries = (rrf_entry_t *)calloc(total_alloc, sizeof(rrf_entry_t));
     if (!all_entries) {
         *out_num_results = 0;
@@ -59,25 +57,34 @@ qihse_search_result_t* qihse_vector_db_search_multimodal(const qihse_multimodal_
     size_t entry_count = 0;
 
     for (size_t i = 0; i < request->num_queries; ++i) {
-        printf(" - Query %zu: Modality '%s', Dim %zu, Weight %.2f\n", 
-               i, 
-               request->queries[i].modality ? request->queries[i].modality : "unknown", 
-               request->queries[i].dim, 
-               request->queries[i].weight);
-
         float weight = request->queries[i].weight > 0.0f ? request->queries[i].weight : 1.0f;
 
-        /* Simulate ANN results for this query */
-        for (size_t rank = 1; rank <= mock_top_n; ++rank) {
-            /* Generate somewhat overlapping mock document IDs across queries */
-            uint64_t doc_id = 1000 + ((rank * 7 + i * 13) % (mock_top_n / 2 + 1));
-            
-            /* Calculate RRF score for this rank */
-            float score = weight * (1.0f / (k_constant + (float)rank));
-            
-            all_entries[entry_count].id = doc_id;
-            all_entries[entry_count].rrf_score = score;
-            entry_count++;
+        if (vdb && request->queries[i].vector && request->queries[i].dim > 0) {
+            /* Real ANN search against the vector database */
+            qihse_vector_result_t* vdb_results = (qihse_vector_result_t*)calloc(top_n, sizeof(qihse_vector_result_t));
+            if (!vdb_results) continue;
+
+            qihse_vector_query_t query = {0};
+            query.query_vector = request->queries[i].vector;
+            query.vector_dims = request->queries[i].dim;
+            query.top_k = top_n;
+            query.similarity_threshold = 0.0f;
+            query.include_vectors = false;
+            query.include_metadata = false;
+
+            int found = qihse_vector_db_search(vdb, &query, vdb_results, top_n);
+
+            for (int rank = 0; rank < found && entry_count < total_alloc; rank++) {
+                float rrf_score = weight * (1.0f / (k_constant + (float)(rank + 1)));
+                all_entries[entry_count].id = vdb_results[rank].id;
+                all_entries[entry_count].rrf_score = rrf_score;
+                entry_count++;
+            }
+
+            free(vdb_results);
+        } else {
+            /* Fallback: no VDB or no query vector — skip this modality */
+            fprintf(stderr, "[QIHSE Fusion] Query %zu has no vector or VDB, skipping\n", i);
         }
     }
 
@@ -107,7 +114,7 @@ qihse_search_result_t* qihse_vector_db_search_multimodal(const qihse_multimodal_
         final_count = unique_count;
     }
 
-    qihse_search_result_t *results = (qihse_search_result_t *)calloc(final_count, sizeof(qihse_search_result_t));
+    qihse_fusion_result_t *results = (qihse_fusion_result_t *)calloc(final_count, sizeof(qihse_fusion_result_t));
     if (!results) {
         free(all_entries);
         *out_num_results = 0;
