@@ -3,7 +3,7 @@
 
 CC=gcc
 
-INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1
+INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 -I/usr/include/python3.13
 QIHSE_CFLAGS_EXTRA?=
 
@@ -42,8 +42,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lm3
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lm3
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample

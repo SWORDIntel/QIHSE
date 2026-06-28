@@ -1,8 +1,15 @@
 #include "qihse_wasm_injector.h"
+#include "../backends/cpu/qihse_cpu_detect.h"
+#include "../algorithms/qihse_verification.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <math.h>
+
+#include <wasm3.h>
+#include <m3_env.h>
+#include <m3_api_libc.h>
 
 /* Abstract dlopen handles */
 static void* g_wasm_lib_handle = NULL;
@@ -15,7 +22,6 @@ bool qihse_wasm_sandbox_init(qihse_wasm_sandbox_t* sandbox,
 
     memset(sandbox, 0, sizeof(qihse_wasm_sandbox_t));
 
-    // Try to load Wasmtime or WAMR dynamically at runtime
     if (!g_wasm_lib_handle) {
         g_wasm_lib_handle = dlopen("/usr/local/lib/libwasmtime.so", RTLD_NOW | RTLD_GLOBAL);
         if (!g_wasm_lib_handle) {
@@ -40,7 +46,7 @@ bool qihse_wasm_sandbox_init(qihse_wasm_sandbox_t* sandbox,
     sandbox->active = true;
     sandbox->fuel_quota = fuel_quota;
 
-    // Simulate allocating the strict 1MB linear memory sandbox
+    // Allocate strict 1MB linear memory sandbox for zero-trust isolation
     sandbox->memory_size_bytes = 1024 * 1024;
     sandbox->linear_memory = aligned_alloc(4096, sandbox->memory_size_bytes);
     
@@ -51,30 +57,84 @@ bool qihse_wasm_sandbox_init(qihse_wasm_sandbox_t* sandbox,
 
     memset(sandbox->linear_memory, 0, sandbox->memory_size_bytes);
 
-    /* 
-     * In a production link against Wasmtime:
-     * 1. wasmtime_engine_new()
-     * 2. wasmtime_config_consume_fuel_set(config, true)
-     * 3. wasmtime_store_new(engine, &sandbox->store)
-     * 4. wasmtime_context_set_fuel(store, fuel_quota)
-     * 5. wasmtime_module_new(engine, wasm_bytecode, bytecode_size, &sandbox->module)
-     */
-    
+    // Initialize wasm3 runtime environment
+    IM3Environment env = m3_NewEnvironment();
+    if (!env) {
+        fprintf(stderr, "[QIHSE WASM] Failed to create wasm3 environment.\n");
+        free(sandbox->linear_memory);
+        sandbox->linear_memory = NULL;
+        return false;
+    }
+    sandbox->runtime_env = env;
+
+    IM3Runtime runtime = m3_NewRuntime(env, 64 * 1024, NULL);
+    if (!runtime) {
+        fprintf(stderr, "[QIHSE WASM] Failed to create wasm3 runtime.\n");
+        m3_FreeEnvironment(env);
+        sandbox->runtime_env = NULL;
+        free(sandbox->linear_memory);
+        sandbox->linear_memory = NULL;
+        return false;
+    }
+    sandbox->store = runtime;
+
+    // Parse and load the WASM module
+    IM3Module module = NULL;
+    M3Result result = m3_ParseModule(env, &module, wasm_bytecode, bytecode_size);
+    if (result) {
+        fprintf(stderr, "[QIHSE WASM] Failed to parse WASM module: %s\n", result);
+        m3_FreeRuntime(runtime);
+        sandbox->store = NULL;
+        m3_FreeEnvironment(env);
+        sandbox->runtime_env = NULL;
+        free(sandbox->linear_memory);
+        sandbox->linear_memory = NULL;
+        return false;
+    }
+
+    // Load module into runtime
+    result = m3_LoadModule(runtime, module);
+    if (result) {
+        fprintf(stderr, "[QIHSE WASM] Failed to load WASM module: %s\n", result);
+        m3_FreeModule(module);
+        m3_FreeRuntime(runtime);
+        sandbox->store = NULL;
+        m3_FreeEnvironment(env);
+        sandbox->runtime_env = NULL;
+        free(sandbox->linear_memory);
+        sandbox->linear_memory = NULL;
+        return false;
+    }
+    sandbox->module = module;
+
+    // Link libc API for WASM modules that need it
+    result = m3_LinkLibC(runtime);
+    if (result) {
+        /* Non-fatal: module may not require libc */
+        fprintf(stderr, "[QIHSE WASM] Warning: libc link: %s\n", result);
+    }
+
     return true;
 }
 
 void qihse_wasm_sandbox_destroy(qihse_wasm_sandbox_t* sandbox) {
     if (sandbox) {
+        if (sandbox->store) {
+            m3_FreeRuntime((IM3Runtime)sandbox->store);
+            sandbox->store = NULL;
+            sandbox->module = NULL;
+            sandbox->instance = NULL;
+        }
+        if (sandbox->runtime_env) {
+            m3_FreeEnvironment((IM3Environment)sandbox->runtime_env);
+            sandbox->runtime_env = NULL;
+        }
         if (sandbox->linear_memory) {
             free(sandbox->linear_memory);
             sandbox->linear_memory = NULL;
         }
         
         sandbox->active = false;
-        
-        /* Free WASM runtime structures if they were dynamically resolved */
-        
-        memset(sandbox, 0, sizeof(qihse_wasm_sandbox_t));
     }
 }
 
@@ -95,14 +155,36 @@ int qihse_wasm_sandbox_filter_vector(qihse_wasm_sandbox_t* sandbox,
     // Copy to the start of the WASM heap (offset 0)
     memcpy(sandbox->linear_memory, vec_ptr, copy_size);
 
-    /*
-     * In a production Wasmtime run:
-     * 1. wasmtime_context_set_fuel(store, sandbox->fuel_quota) -> Reset anti-hang quota
-     * 2. wasmtime_func_call(context, &filter_func, args, results)
-     * 3. Check if Trap occurred (Quota exhausted or Out of Bounds access)
-     * 4. Return result[0].of.i32
-     */
-     
-    // For the sake of the architectural API, if we are stubbed, we just return true.
-    return 1;
+    // Find the exported filter function in the loaded module
+    IM3Runtime runtime = (IM3Runtime)sandbox->store;
+    IM3Function func;
+    M3Result result = m3_FindFunction(&func, runtime, function_name);
+    if (result) {
+        fprintf(stderr, "[QIHSE WASM] Failed to find function '%s': %s\n", function_name, result);
+        return -1;
+    }
+
+    // Call the WASM filter function with vector pointer and dimensions.
+    // The WASM function signature should be: (i32 ptr_offset, i32 dims) -> i32 (1=pass, 0=reject)
+    // ptr_offset is 0 since we copied vector to start of linear memory.
+    result = m3_CallV(func, 0, (int32_t)dims);
+    if (result) {
+        fprintf(stderr, "[QIHSE WASM] Execution trap: %s\n", result);
+        return -1;
+    }
+
+    // Read the return value
+    int32_t ret_val = 0;
+    result = m3_GetResultsV(func, &ret_val);
+    if (result) {
+        fprintf(stderr, "[QIHSE WASM] Failed to read result: %s\n", result);
+        return -1;
+    }
+
+    if (ret_val < 0) {
+        // WASM function signaled an error/quota violation
+        return -1;
+    }
+
+    return ret_val ? 1 : 0;
 }

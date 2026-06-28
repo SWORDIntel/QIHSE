@@ -236,8 +236,6 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         close(afd);
     }
 #endif
-    }
-#endif
     
     memcpy(last_hash, new_hash, 129);
     update_integrity_chain(last_hash);
