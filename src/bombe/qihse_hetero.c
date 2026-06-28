@@ -163,6 +163,7 @@ static double qihse_benchmark_device_int8(size_t batch_size, size_t dims __attri
     int8_t* matrix = NULL;
     int8_t* vector = NULL;
     int32_t* result = NULL;
+    unsigned char rbuf[8];
 
     matrix = malloc(batch_size * dims * sizeof(int8_t));
     vector = malloc(dims * sizeof(int8_t));

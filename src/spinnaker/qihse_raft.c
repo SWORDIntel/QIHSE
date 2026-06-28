@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/rand.h>
 #include "qihse_platform.h"
 #ifndef _WIN32
 #include <pthread.h>

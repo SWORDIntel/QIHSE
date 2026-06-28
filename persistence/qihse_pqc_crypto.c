@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <limits.h>
 
 /* ── Provider initialisation ─────────────────────────────────────────── */
@@ -70,16 +71,17 @@ int qihse_pqc_init_providers(void) {
 /* ── Internal key helpers ────────────────────────────────────────────── */
 
 static EVP_PKEY *load_private_key(const char *path) {
+    FILE *f = NULL;
 #ifndef _WIN32
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) {
         fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
         return NULL;
     }
-    FILE *f = fdopen(fd, "r");
+    f = fdopen(fd, "r");
     if (!f) { close(fd); return NULL; }
 #else
-    FILE *f = fopen(path, "r");
+    f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
         return NULL;
@@ -95,16 +97,17 @@ static EVP_PKEY *load_private_key(const char *path) {
 }
 
 static EVP_PKEY *load_public_key(const char *path) {
+    FILE *f = NULL;
 #ifndef _WIN32
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) {
         fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
         return NULL;
     }
-    FILE *f = fdopen(fd, "r");
+    f = fdopen(fd, "r");
     if (!f) { close(fd); return NULL; }
 #else
-    FILE *f = fopen(path, "r");
+    f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
         return NULL;

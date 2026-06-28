@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <lauxlib.h>
 
 #ifndef _WIN32
 
@@ -22,9 +23,15 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     
     // Load standard libraries (math, string, table)
     /* Only load safe libraries — exclude io, os, debug, package */
-    luaopen_math(sandbox->L); lua_settop(sandbox->L, 0);
-    luaopen_string(sandbox->L); lua_settop(sandbox->L, 0);
-    luaopen_table(sandbox->L); lua_settop(sandbox->L, 0);
+    lua_pushcfunction(sandbox->L, luaopen_math);
+    lua_call(sandbox->L, 0, 1);
+    lua_setglobal(sandbox->L, "math");
+    lua_pushcfunction(sandbox->L, luaopen_string);
+    lua_call(sandbox->L, 0, 1);
+    lua_setglobal(sandbox->L, "string");
+    lua_pushcfunction(sandbox->L, luaopen_table);
+    lua_call(sandbox->L, 0, 1);
+    lua_setglobal(sandbox->L, "table");
     
     sandbox->active = true;
     sandbox->instruction_quota = max_instructions;

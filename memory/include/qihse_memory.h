@@ -17,9 +17,9 @@
 #include <stddef.h>
 
 #include "../../core/qihse_abi.h"  /* Phase 0 ABI integration */
+#include "../../orchestration/include/qihse_hetero.h"  /* qihse_device_type_t */
 
 /* Forward declarations */
-typedef enum qihse_device_type_e qihse_device_type_t;
 
 struct qihse_memory_migration_scheduler_s;
 
