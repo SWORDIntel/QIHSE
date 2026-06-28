@@ -137,7 +137,7 @@ void qihse_cluster_receive_payload(const uint8_t* payload, size_t payload_size) 
         memcpy(&dim_u32, payload + offset, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         
-        if (dim_u32 > 4096 || dim_u32 > (SIZE_MAX / sizeof(float))) return;
+        if (dim_u32 > 4096) return;
         size_t vec_bytes = (size_t)dim_u32 * sizeof(float);
         if (offset + vec_bytes > payload_size) return;
         

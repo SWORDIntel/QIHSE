@@ -30,6 +30,7 @@
 #include <openssl/crypto.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -82,8 +83,8 @@ static EVP_PKEY *load_private_key(const char *path) {
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
         return NULL;
-#endif
     }
+#endif
     EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
     fclose(f);
     if (!pkey) {
@@ -107,8 +108,8 @@ static EVP_PKEY *load_public_key(const char *path) {
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
         return NULL;
-#endif
     }
+#endif
     EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
     fclose(f);
     if (!pkey) {

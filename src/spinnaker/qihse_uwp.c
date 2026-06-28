@@ -374,13 +374,16 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
             if (xdp_fd >= 0) {
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
-                if (!ev) continue;
-                ev->type = EVENT_XDP_POLL;
-                ev->fd = xdp_fd;
-                ev->ctx = ctx;
-                io_uring_prep_poll_add(sqe, xdp_fd, POLLIN);
-                io_uring_sqe_set_data(sqe, ev);
-                printf("[QIHSE UWP] AF_XDP socket registered in io_uring for %s\n", xdp_iface);
+                if (!ev) {
+                    fprintf(stderr, "[QIHSE UWP] malloc failed for XDP event ctx\n");
+                } else {
+                    ev->type = EVENT_XDP_POLL;
+                    ev->fd = xdp_fd;
+                    ev->ctx = ctx;
+                    io_uring_prep_poll_add(sqe, xdp_fd, POLLIN);
+                    io_uring_sqe_set_data(sqe, ev);
+                    printf("[QIHSE UWP] AF_XDP socket registered in io_uring for %s\n", xdp_iface);
+                }
             }
         }
     }

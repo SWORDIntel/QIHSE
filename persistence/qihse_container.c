@@ -469,6 +469,7 @@ void qihse_ctr_close(qihse_container_t* ctr) {
     ctr->path = NULL;
     ctr->locked = false;
     ctr->section_count = 0u;
+    qihse_ctr_cleanup_hmac_key();
 }
 
 const qihse_ctr_section_t* qihse_ctr_find_section(const qihse_container_t* ctr,
@@ -486,7 +487,6 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
                                   size_t* out_size) {
     const qihse_ctr_section_t* sec;
     uint8_t* buf;
-    uint64_t crc;
 
     if (!ctr || !out || !out_size) {
         errno = EINVAL;

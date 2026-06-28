@@ -16,6 +16,7 @@
 #endif
 #ifndef _WIN32
 #include "../../persistence/qihse_pqc_crypto.h"
+#include <openssl/rand.h>
 #endif
 
 #define URING_QUEUE_DEPTH 256
