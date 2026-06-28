@@ -176,6 +176,7 @@ static double qihse_benchmark_device_int8(size_t batch_size, size_t dims __attri
     }
 
     /* Initialize with random data */
+    unsigned char rbuf[1];
     for (size_t i = 0; i < batch_size * dims; i++) {
 #ifndef _WIN32
         if (RAND_bytes(rbuf, 1) == 1) {

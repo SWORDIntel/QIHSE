@@ -9,6 +9,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <openssl/sha.h>
 #endif
 #ifndef _WIN32
@@ -214,8 +217,10 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     
 #ifndef _WIN32
     int afd = open(AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    FILE *f = NULL;
     if (afd >= 0) {
-    FILE *f = fdopen(afd, "ab");
+        f = fdopen(afd, "ab");
+    }
 #else
     FILE *f = fopen(AUDIT_FILE, "ab");
 #endif
@@ -225,11 +230,10 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         write_obfuscated(f, out_buf);
         for (int i = 0; i < MLDSA87_SIG_BYTES; i++) fputc(mldsa87_sig[i] ^ XOR_KEY, f);
         fclose(f);
-#ifndef _WIN32
-    } else {
-        close(afd);
     }
-#else
+#ifndef _WIN32
+    if (afd >= 0 && !f) {
+        close(afd);
     }
 #endif
     
@@ -239,10 +243,6 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     pthread_mutex_unlock(&audit_mutex);
 }
 
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
 
 /*
