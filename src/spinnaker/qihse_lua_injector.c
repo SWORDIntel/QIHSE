@@ -1,8 +1,11 @@
 #include "qihse_lua_injector.h"
+#include "../backends/cpu/qihse_cpu_detect.h"
+#include "../algorithms/qihse_verification.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <lauxlib.h>
+#include <math.h>
 
 #ifndef _WIN32
 
@@ -41,15 +44,34 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     lua_sethook(sandbox->L, qihse_lua_quota_hook, LUA_MASKCOUNT, max_instructions);
     
     // 2. Establish Zero-Copy FFI (Foreign Function Interface) Bridge
-    // We bind a global function 'qihse_avx512_dot' to simulate hardware intrinsics
-    // In a full implementation, this uses LuaJIT's ffi.cdef to map the pointer directly.
-    (void)luaL_dostring(sandbox->L,
+    // Bind QIHSE SIMD-accelerated similarity functions via LuaJIT FFI so Lua
+    // filter scripts can call them directly on raw vector memory.
+    qihse_cpu_info_t cpu = qihse_cpu_detect();
+    const char* simd_func = "qihse_cosine_similarity_scalar";
+    if (cpu.features & QIHSE_CPU_FEATURE_AVX512F)
+        simd_func = "qihse_cosine_similarity_avx512";
+    else if (cpu.features & QIHSE_CPU_FEATURE_AVX2)
+        simd_func = "qihse_cosine_similarity_avx2";
+
+    char ffi_script[1024];
+    snprintf(ffi_script, sizeof(ffi_script),
         "local ffi = require('ffi')\n"
         "ffi.cdef[[\n"
-        "    double qihse_hardware_dot_product(const float* vec, size_t dims);\n"
+        "    double qihse_cosine_similarity_avx512(const float* a, const float* b, size_t n);\n"
+        "    double qihse_cosine_similarity_avx2(const float* a, const float* b, size_t n);\n"
+        "    double qihse_cosine_similarity_scalar(const float* a, const float* b, size_t n);\n"
+        "    typedef struct { float* ptr; size_t dims; } qihse_vec_ref;\n"
         "]]\n"
-    );
-    
+        "qihse_sim = ffi.C.%s\n"
+        "qihse_vec_ref = ffi.typeof('qihse_vec_ref')\n",
+        simd_func);
+
+    if (luaL_dostring(sandbox->L, ffi_script) != 0) {
+        fprintf(stderr, "[QIHSE Lua FFI] Failed to bind FFI: %s\n", lua_tostring(sandbox->L, -1));
+        lua_pop(sandbox->L, 1);
+        /* Non-fatal: scripts can still use lightuserdata fallback */
+    }
+
     return true;
 }
 
@@ -74,17 +96,34 @@ int qihse_lua_sandbox_filter_vector(qihse_lua_sandbox_t* sandbox, const char* sc
         return -1;
     }
     
-    // Push our Zero-Copy pointer (as light userdata) and dimension count
-    lua_pushlightuserdata(sandbox->L, (void*)vec_ptr);
-    lua_pushinteger(sandbox->L, dims);
-    
-    // Execute the script: 2 arguments (ptr, dims), 1 return value (boolean)
-    if (lua_pcall(sandbox->L, 2, 1, 0) != 0) {
-        fprintf(stderr, "[QIHSE Lua Sandbox Error] %s\n", lua_tostring(sandbox->L, -1));
-        lua_pop(sandbox->L, 1);
-        return -1; // -1 means quota violation or runtime error
+    // Push our Zero-Copy pointer as a FFI ctype (qihse_vec_ref) for direct
+    // memory access, plus dimension count as integer.
+    // The Lua script receives: qihse_vec_ref(ptr, dims), dims
+    lua_getglobal(sandbox->L, "qihse_vec_ref");
+    if (lua_isfunction(sandbox->L, -1) || lua_isuserdata(sandbox->L, -1)) {
+        // FFI path: construct qihse_vec_ref{ptr=vec_ptr, dims=dims}
+        lua_pushlightuserdata(sandbox->L, (void*)vec_ptr);
+        lua_pushinteger(sandbox->L, (lua_Integer)dims);
+        lua_call(sandbox->L, 2, 1);  /* qihse_vec_ref(ptr, dims) -> cdata */
+        lua_pushinteger(sandbox->L, (lua_Integer)dims);
+        // Execute: 2 args (vec_ref, dims), 1 return
+        if (lua_pcall(sandbox->L, 2, 1, 0) != 0) {
+            fprintf(stderr, "[QIHSE Lua Sandbox Error] %s\n", lua_tostring(sandbox->L, -1));
+            lua_pop(sandbox->L, 1);
+            return -1;
+        }
+    } else {
+        // Fallback path: light userdata + dims (for non-FFI environments)
+        lua_pop(sandbox->L, 1);  /* pop nil qihse_vec_ref */
+        lua_pushlightuserdata(sandbox->L, (void*)vec_ptr);
+        lua_pushinteger(sandbox->L, (lua_Integer)dims);
+        if (lua_pcall(sandbox->L, 2, 1, 0) != 0) {
+            fprintf(stderr, "[QIHSE Lua Sandbox Error] %s\n", lua_tostring(sandbox->L, -1));
+            lua_pop(sandbox->L, 1);
+            return -1;
+        }
     }
-    
+
     // Read the boolean return value
     int result = lua_toboolean(sandbox->L, -1);
     lua_pop(sandbox->L, 1);
