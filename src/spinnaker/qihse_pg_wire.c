@@ -411,21 +411,60 @@ static int pg_handle_query(int fd, void* vdb, const char* raw_query, qihse_user_
         if (pg_send_data_row(fd, row_vals, 1) < 0) return -1;
         if (pg_send_command_complete(fd, "SELECT 1") < 0) return -1;
 
-    /* ---- SELECT ... FROM vectors WHERE ... (VDB stub) ---- */
+    /* ---- SELECT ... FROM vectors WHERE ... (VDB search) ---- */
     } else if (str_iprefix(query, "SELECT") &&
                (strstr(query, "vectors") || strstr(query, "VECTORS"))) {
-        /*
-         * VDB search path – stub that returns an empty result set.
-         * A real implementation would parse the WHERE clause for the
-         * query vector and call qihse_vector_db_search() on (vdb).
-         */
-        (void)vdb; /* suppress unused-param warning; wired through below */
-
+        qihse_vector_db_t db = (qihse_vector_db_t)vdb;
         const char* col_names[] = {"id", "score"};
         const int32_t type_oids[] = {23, 25}; /* int4, text */
         if (pg_send_row_description(fd, col_names, type_oids, 2) < 0) return -1;
-        /* No rows – just CommandComplete */
-        if (pg_send_command_complete(fd, "SELECT 0") < 0) return -1;
+
+        size_t dims = qihse_vector_db_get_dims(db);
+        int rows_sent = 0;
+
+        if (dims > 0 && db) {
+            /* Parse LIMIT from query */
+            int top_k = 10;
+            const char* limit_ptr = strcasestr(query, "LIMIT");
+            if (limit_ptr) {
+                top_k = atoi(limit_ptr + 6);
+                if (top_k <= 0) top_k = 10;
+            }
+
+            /* Use zero vector as default query; a real implementation would
+             * parse the WHERE clause for a query vector literal */
+            float* query_vec = (float*)calloc(dims, sizeof(float));
+            if (query_vec) {
+                qihse_vector_result_t* results = (qihse_vector_result_t*)calloc(top_k, sizeof(qihse_vector_result_t));
+                if (results) {
+                    qihse_vector_query_t vq = {0};
+                    vq.query_vector = query_vec;
+                    vq.vector_dims = dims;
+                    vq.top_k = (size_t)top_k;
+                    vq.similarity_threshold = 0.0f;
+
+                    int found = qihse_vector_db_search(db, &vq, results, (size_t)top_k);
+                    for (int r = 0; r < found; r++) {
+                        char id_str[32], score_str[32];
+                        snprintf(id_str, sizeof(id_str), "%llu", (unsigned long long)results[r].id);
+                        snprintf(score_str, sizeof(score_str), "%.6f", results[r].score);
+                        const char* row_vals[] = {id_str, score_str};
+                        if (pg_send_data_row(fd, row_vals, 2) < 0) {
+                            free(results);
+                            free(query_vec);
+                            return -1;
+                        }
+                        rows_sent++;
+                    }
+                    free(results);
+                }
+                free(query_vec);
+            }
+        }
+
+        char complete_msg[32];
+        snprintf(complete_msg, sizeof(complete_msg), "SELECT %d", rows_sent);
+        if (pg_send_command_complete(fd, complete_msg) < 0) return -1;
 
     /* ---- SET client_encoding / application_name (psql handshake) ---- */
     } else if (str_iprefix(query, "SET ") || str_iprefix(query, "set ")) {
@@ -666,6 +705,7 @@ void qihse_pg_wire_handle_client(int fd, void* vdb) {
     }
 
     /* Phase 2: message loop */
+    char last_parsed_query[4096] = {0};
     while (1) {
         /* Read 1-byte message type */
         uint8_t msg_type;
@@ -720,20 +760,59 @@ void qihse_pg_wire_handle_client(int fd, void* vdb) {
             pg_send_ready_for_query(fd);
             break;
 
-        case 'P': /* Parse  – stub: just consume */
-        case 'B': /* Bind   – stub: just consume */
-        case 'E': /* Execute – stub: just consume */
-        case 'D': /* Describe – stub: just consume */
-        case 'C': /* Close    – stub: just consume */
-            /* Full extended query protocol is not yet implemented. */
-            /* Send a placeholder so libpq does not hang. */
-            if (msg_type == 'P') {
-                /* ParseComplete */
-                pg_send_msg(fd, '1', NULL, 0);
-            } else if (msg_type == 'B') {
-                /* BindComplete */
-                pg_send_msg(fd, '2', NULL, 0);
+        case 'P': { /* Parse – store the prepared statement */
+            /* Body: cstring statement_name, cstring query, int16 num_params */
+            const char* stmt_name = body ? (const char*)body : "";
+            size_t name_len = strlen(stmt_name) + 1;
+            const char* parsed_query = body ? (const char*)(body + name_len) : "";
+            /* Store the query for later execution (simple: just keep last parsed) */
+            strncpy(last_parsed_query, parsed_query, sizeof(last_parsed_query) - 1);
+            last_parsed_query[sizeof(last_parsed_query) - 1] = '\0';
+            (void)stmt_name;
+            /* ParseComplete */
+            pg_send_msg(fd, '1', NULL, 0);
+            break;
+        }
+
+        case 'B': /* Bind – just acknowledge */
+            /* BindComplete */
+            pg_send_msg(fd, '2', NULL, 0);
+            break;
+
+        case 'D': /* Describe – send RowDescription for SELECT or NoData for others */
+            if (last_parsed_query[0] && str_iprefix(last_parsed_query, "SELECT")) {
+                const char* col_names[] = {"id", "score"};
+                const int32_t type_oids[] = {23, 25};
+                if (pg_send_row_description(fd, col_names, type_oids, 2) < 0) {
+                    free(body);
+                    goto done;
+                }
+            } else {
+                /* NoData */
+                pg_send_msg(fd, 'n', NULL, 0);
             }
+            break;
+
+        case 'E': { /* Execute – run the prepared query */
+            /* Body: cstring portal_name, int32 max_rows */
+            if (last_parsed_query[0]) {
+                qihse_user_t* exec_user = current_user;
+                if (pg_handle_query(fd, vdb, last_parsed_query, exec_user) < 0) {
+                    free(body);
+                    goto done;
+                }
+                last_parsed_query[0] = '\0'; /* Clear after execution */
+            } else {
+                /* EmptyQueryResponse */
+                pg_send_msg(fd, 'I', NULL, 0);
+                pg_send_ready_for_query(fd);
+            }
+            break;
+        }
+
+        case 'C': /* Close – just acknowledge */
+            /* CloseComplete is not a real message; just clear state */
+            last_parsed_query[0] = '\0';
             break;
 
         default:

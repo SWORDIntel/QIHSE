@@ -24,6 +24,7 @@ static inline int munmap(void *addr, size_t length) { return -1; }
 #include "qihse_plugin.h"
 #include "qihse_auth.h"
 #include "qihse_hnsw.h"
+#include "qihse_qql_parser.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -145,16 +146,20 @@ struct qihse_vector_db_s {
 
     int mmap_fd;
     void* mapped_vectors;
+    void* mapped_vectors_base;
     size_t mapped_vector_bytes;
     int metadata_mmap_fd;
     void* mapped_metadata;
+    void* mapped_metadata_base;
     size_t mapped_metadata_bytes;
     int index_mmap_fd;
     void* mapped_index;
+    void* mapped_index_base;
     size_t mapped_index_bytes;
     bool rows_are_mapped;
     int idmap_mmap_fd;
     void* mapped_idmap;
+    void* mapped_idmap_base;
     size_t mapped_idmap_bytes;
 
     qihse_vector_db_trinary_status_t trinary_status;
@@ -266,6 +271,17 @@ struct qihse_vector_db_s {
     bool superposition_enabled;
     bool temperature_aware;
     qihse_memory_superposition_state_t superposition_state;
+
+    /* Explicit graph edge table (QQL/Graph DB) */
+    struct {
+        uint64_t from_id;
+        uint64_t to_id;
+        char edge_type[32];
+        void* metadata;
+        size_t metadata_size;
+    } * explicit_edges;
+    size_t explicit_edge_count;
+    size_t explicit_edge_capacity;
 };
 
 typedef struct qihse_vdb_wal_add_s {
@@ -2827,19 +2843,23 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
     if (!vdb) {
         return;
     }
-    if (vdb->mapped_vectors && vdb->mapped_vectors != MAP_FAILED) {
-        munmap(vdb->mapped_vectors, vdb->mapped_vector_bytes);
+    if (vdb->mapped_vectors_base && vdb->mapped_vectors_base != MAP_FAILED) {
+        size_t page_offset = (size_t)((uint8_t*)vdb->mapped_vectors - (uint8_t*)vdb->mapped_vectors_base);
+        munmap(vdb->mapped_vectors_base, vdb->mapped_vector_bytes + page_offset);
     }
     vdb->mapped_vectors = NULL;
+    vdb->mapped_vectors_base = NULL;
     vdb->mapped_vector_bytes = 0u;
     if (vdb->mmap_fd >= 0) {
         close(vdb->mmap_fd);
     }
     vdb->mmap_fd = -1;
-    if (vdb->mapped_metadata && vdb->mapped_metadata != MAP_FAILED) {
-        munmap(vdb->mapped_metadata, vdb->mapped_metadata_bytes);
+    if (vdb->mapped_metadata_base && vdb->mapped_metadata_base != MAP_FAILED) {
+        size_t page_offset = (size_t)((uint8_t*)vdb->mapped_metadata - (uint8_t*)vdb->mapped_metadata_base);
+        munmap(vdb->mapped_metadata_base, vdb->mapped_metadata_bytes + page_offset);
     }
     vdb->mapped_metadata = NULL;
+    vdb->mapped_metadata_base = NULL;
     vdb->mapped_metadata_bytes = 0u;
     if (vdb->metadata_mmap_fd >= 0) {
         close(vdb->metadata_mmap_fd);
@@ -2850,19 +2870,23 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
         vdb->rows_capacity = 0u;
         vdb->rows_are_mapped = false;
     }
-    if (vdb->mapped_index && vdb->mapped_index != MAP_FAILED) {
-        munmap(vdb->mapped_index, vdb->mapped_index_bytes);
+    if (vdb->mapped_index_base && vdb->mapped_index_base != MAP_FAILED) {
+        size_t page_offset = (size_t)((uint8_t*)vdb->mapped_index - (uint8_t*)vdb->mapped_index_base);
+        munmap(vdb->mapped_index_base, vdb->mapped_index_bytes + page_offset);
     }
     vdb->mapped_index = NULL;
+    vdb->mapped_index_base = NULL;
     vdb->mapped_index_bytes = 0u;
     if (vdb->index_mmap_fd >= 0) {
         close(vdb->index_mmap_fd);
     }
     vdb->index_mmap_fd = -1;
-    if (vdb->mapped_idmap && vdb->mapped_idmap != MAP_FAILED) {
-        munmap(vdb->mapped_idmap, vdb->mapped_idmap_bytes);
+    if (vdb->mapped_idmap_base && vdb->mapped_idmap_base != MAP_FAILED) {
+        size_t page_offset = (size_t)((uint8_t*)vdb->mapped_idmap - (uint8_t*)vdb->mapped_idmap_base);
+        munmap(vdb->mapped_idmap_base, vdb->mapped_idmap_bytes + page_offset);
     }
     vdb->mapped_idmap = NULL;
+    vdb->mapped_idmap_base = NULL;
     vdb->mapped_idmap_bytes = 0u;
     if (vdb->idmap_mmap_fd >= 0) {
         close(vdb->idmap_mmap_fd);
@@ -2870,31 +2894,167 @@ static void qihse_vdb_free_mmap(qihse_vector_db_t vdb) {
     vdb->idmap_mmap_fd = -1;
 }
 
-/* mmap of individual sections within the container file is not supported
- * in the current implementation.  These stubs always return false so the
- * caller falls back to the heap-copy path.                               */
+/* mmap of individual sections within the container file.
+ * Each function opens the container, finds the section offset, and mmaps
+ * the file at that offset to provide zero-copy access to the data. */
 static bool qihse_vdb_map_vectors(qihse_vector_db_t vdb) {
-    (void)vdb;
-    return false;
+    if (!vdb || !vdb->db_path || vdb->mapped_vectors) return false;
+
+    qihse_container_t ctr;
+    if (!qihse_ctr_open_read(vdb->db_path, &ctr)) return false;
+
+    const qihse_ctr_section_t* sec = qihse_ctr_find_section(&ctr, QIHSE_CTR_SEC_VECTORS);
+    if (!sec || sec->length == 0u) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    int fd = open(vdb->db_path, O_RDONLY);
+    if (fd < 0) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    size_t map_len = (size_t)sec->length;
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page_offset = (size_t)sec->offset & (page_size - 1);
+    size_t map_start = (size_t)sec->offset & ~(page_size - 1);
+    size_t map_total = map_len + page_offset;
+
+    void* map = mmap(NULL, map_total, PROT_READ, MAP_PRIVATE, fd, (off_t)map_start);
+    if (map == MAP_FAILED) {
+        close(fd);
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    vdb->mapped_vectors = (uint8_t*)map + page_offset;
+    vdb->mapped_vectors_base = map;
+    vdb->mapped_vector_bytes = map_len;
+    vdb->mmap_fd = fd;
+    qihse_ctr_close(&ctr);
+    return true;
 }
 
 static bool qihse_vdb_map_metadata(qihse_vector_db_t vdb) {
-    (void)vdb;
-    return false;
+    if (!vdb || !vdb->db_path || vdb->mapped_metadata) return false;
+
+    qihse_container_t ctr;
+    if (!qihse_ctr_open_read(vdb->db_path, &ctr)) return false;
+
+    const qihse_ctr_section_t* sec = qihse_ctr_find_section(&ctr, QIHSE_CTR_SEC_METADATA);
+    if (!sec || sec->length == 0u) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    int fd = open(vdb->db_path, O_RDONLY);
+    if (fd < 0) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    size_t map_len = (size_t)sec->length;
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page_offset = (size_t)sec->offset & (page_size - 1);
+    size_t map_start = (size_t)sec->offset & ~(page_size - 1);
+    size_t map_total = map_len + page_offset;
+
+    void* map = mmap(NULL, map_total, PROT_READ, MAP_PRIVATE, fd, (off_t)map_start);
+    if (map == MAP_FAILED) {
+        close(fd);
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    vdb->mapped_metadata = (uint8_t*)map + page_offset;
+    vdb->mapped_metadata_base = map;
+    vdb->mapped_metadata_bytes = map_len;
+    vdb->metadata_mmap_fd = fd;
+    qihse_ctr_close(&ctr);
+    return true;
 }
 
 static bool qihse_vdb_try_map_index(qihse_vector_db_t vdb,
                                     const qihse_vector_store_manifest_t* manifest) {
-    /* mmap of sections within the container file is not yet supported */
-    (void)vdb; (void)manifest;
-    return false;
+    (void)manifest;
+    if (!vdb || !vdb->db_path || vdb->mapped_index) return false;
+
+    qihse_container_t ctr;
+    if (!qihse_ctr_open_read(vdb->db_path, &ctr)) return false;
+
+    const qihse_ctr_section_t* sec = qihse_ctr_find_section(&ctr, QIHSE_CTR_SEC_INDEX);
+    if (!sec || sec->length == 0u) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    int fd = open(vdb->db_path, O_RDONLY);
+    if (fd < 0) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    size_t map_len = (size_t)sec->length;
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page_offset = (size_t)sec->offset & (page_size - 1);
+    size_t map_start = (size_t)sec->offset & ~(page_size - 1);
+    size_t map_total = map_len + page_offset;
+
+    void* map = mmap(NULL, map_total, PROT_READ, MAP_PRIVATE, fd, (off_t)map_start);
+    if (map == MAP_FAILED) {
+        close(fd);
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    vdb->mapped_index = (uint8_t*)map + page_offset;
+    vdb->mapped_index_base = map;
+    vdb->mapped_index_bytes = map_len;
+    vdb->index_mmap_fd = fd;
+    qihse_ctr_close(&ctr);
+    return true;
 }
 
 static bool qihse_vdb_try_map_idmap(qihse_vector_db_t vdb,
                                     const qihse_vector_store_manifest_t* manifest) {
-    /* mmap of sections within the container file is not yet supported */
-    (void)vdb; (void)manifest;
-    return false;
+    (void)manifest;
+    if (!vdb || !vdb->db_path || vdb->mapped_idmap) return false;
+
+    qihse_container_t ctr;
+    if (!qihse_ctr_open_read(vdb->db_path, &ctr)) return false;
+
+    const qihse_ctr_section_t* sec = qihse_ctr_find_section(&ctr, QIHSE_CTR_SEC_IDMAP);
+    if (!sec || sec->length == 0u) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    int fd = open(vdb->db_path, O_RDONLY);
+    if (fd < 0) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    size_t map_len = (size_t)sec->length;
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page_offset = (size_t)sec->offset & (page_size - 1);
+    size_t map_start = (size_t)sec->offset & ~(page_size - 1);
+    size_t map_total = map_len + page_offset;
+
+    void* map = mmap(NULL, map_total, PROT_READ, MAP_PRIVATE, fd, (off_t)map_start);
+    if (map == MAP_FAILED) {
+        close(fd);
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+
+    vdb->mapped_idmap = (uint8_t*)map + page_offset;
+    vdb->mapped_idmap_base = map;
+    vdb->mapped_idmap_bytes = map_len;
+    vdb->idmap_mmap_fd = fd;
+    qihse_ctr_close(&ctr);
+    return true;
 }
 
 static bool qihse_vdb_append_row(qihse_vector_db_t vdb,
@@ -4085,6 +4245,35 @@ bool qihse_vector_db_delete_by_id(
         errno = ENOENT;
         return false;
     }
+    return true;
+}
+
+bool qihse_vector_db_get_vector_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    float* out_vector,
+    size_t* out_dims
+) {
+    if (!vdb || !out_vector) {
+        errno = EINVAL;
+        return false;
+    }
+
+    size_t row_index = 0u;
+    if (!qihse_vdb_find_live_row_by_id(vdb, vector_id, &row_index)) {
+        errno = ENOENT;
+        return false;
+    }
+
+    const qihse_index_row_t* row = &vdb->rows[row_index];
+    const float* vec = qihse_vdb_vector_at(vdb, row);
+    if (!vec) {
+        errno = ENOENT;
+        return false;
+    }
+
+    memcpy(out_vector, vec, vdb->vector_dims * sizeof(float));
+    if (out_dims) *out_dims = vdb->vector_dims;
     return true;
 }
 
@@ -6332,6 +6521,13 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     qihse_vdb_cache_destroy(vdb);
     qihse_vdb_sparse_index_destroy(vdb->sparse_index);
     vdb->sparse_index = NULL;
+    /* Free explicit graph edge table */
+    if (vdb->explicit_edges) {
+        for (size_t i = 0; i < vdb->explicit_edge_count; i++) {
+            free(vdb->explicit_edges[i].metadata);
+        }
+        free(vdb->explicit_edges);
+    }
     free(vdb);
 }
 
@@ -6557,11 +6753,36 @@ bool qihse_vector_db_add_edge(
     size_t metadata_size
 ) {
     if (!vdb || !edge_type) return false;
-    /* Explicit edge table not yet implemented — log intent and succeed */
-    (void)from_id;
-    (void)to_id;
-    (void)metadata;
-    (void)metadata_size;
+
+    /* Grow edge table if needed */
+    if (vdb->explicit_edge_count >= vdb->explicit_edge_capacity) {
+        size_t new_cap = vdb->explicit_edge_capacity == 0 ? 64 : vdb->explicit_edge_capacity * 2;
+        void* new_edges = realloc(vdb->explicit_edges, new_cap * sizeof(*vdb->explicit_edges));
+        if (!new_edges) return false;
+        vdb->explicit_edges = new_edges;
+        vdb->explicit_edge_capacity = new_cap;
+    }
+
+    /* Store the edge */
+    size_t idx = vdb->explicit_edge_count;
+    vdb->explicit_edges[idx].from_id = from_id;
+    vdb->explicit_edges[idx].to_id = to_id;
+    strncpy(vdb->explicit_edges[idx].edge_type, edge_type, sizeof(vdb->explicit_edges[idx].edge_type) - 1);
+    vdb->explicit_edges[idx].edge_type[sizeof(vdb->explicit_edges[idx].edge_type) - 1] = '\0';
+
+    /* Copy metadata if provided */
+    if (metadata && metadata_size > 0) {
+        vdb->explicit_edges[idx].metadata = malloc(metadata_size);
+        if (!vdb->explicit_edges[idx].metadata) return false;
+        memcpy(vdb->explicit_edges[idx].metadata, metadata, metadata_size);
+        vdb->explicit_edges[idx].metadata_size = metadata_size;
+    } else {
+        vdb->explicit_edges[idx].metadata = NULL;
+        vdb->explicit_edges[idx].metadata_size = 0;
+    }
+
+    vdb->explicit_edge_count++;
+    vdb->dirty = true;
     return true;
 }
 
@@ -6573,10 +6794,14 @@ int qihse_vector_db_get_edges(
     size_t max_edges
 ) {
     if (!vdb || !out_ids || max_edges == 0) return -1;
-    /* Graph traversal not yet implemented — adjacency list pending */
-    (void)from_id;
-    (void)edge_type;
-    return 0;
+
+    size_t found = 0;
+    for (size_t i = 0; i < vdb->explicit_edge_count && found < max_edges; i++) {
+        if (vdb->explicit_edges[i].from_id != from_id) continue;
+        if (edge_type && strcmp(vdb->explicit_edges[i].edge_type, edge_type) != 0) continue;
+        out_ids[found++] = vdb->explicit_edges[i].to_id;
+    }
+    return (int)found;
 }
 
 /* ============================================================================
@@ -6588,28 +6813,130 @@ qihse_result_set_t* qihse_execute_qql(
     const char* qql_query_string
 ) {
     if (!vdb || !qql_query_string) return NULL;
-    
-    // In a full implementation, we would call the native flex/bison parser here
-    // qql_ast_t* ast = qql_parse_string(qql_query_string);
-    // uint8_t* bytecode = qihse_compile_filter(ast->where_clause);
-    // ...
-    // qihse_vector_db_search(vdb, &query_struct, ...);
-    
-    // Scaffold: Return dummy result set
-    qihse_result_set_t* rs = (qihse_result_set_t*)malloc(sizeof(qihse_result_set_t));
-    if (!rs) return NULL;
-    
-    rs->count = 1;
-    rs->results = (qihse_vector_result_t*)calloc(1, sizeof(qihse_vector_result_t));
-    if (!rs->results) {
-        free(rs);
+
+    /* Parse the QQL string using the native tree-sitter parser */
+    qihse_qql_ast_t* ast = qihse_parse_qql_to_ast(qql_query_string);
+    if (!ast) {
+        fprintf(stderr, "[QIHSE QQL] Failed to parse query: %s\n", qql_query_string);
         return NULL;
     }
-    
-    // Dummy exactness result
-    rs->results[0].id = 42;
-    rs->results[0].score = 1.0f;
-    
+
+    /* Determine result limit */
+    size_t top_k = ast->limit > 0 ? (size_t)ast->limit : 10;
+
+    /* Allocate result set */
+    qihse_result_set_t* rs = (qihse_result_set_t*)malloc(sizeof(qihse_result_set_t));
+    if (!rs) {
+        free(ast);
+        return NULL;
+    }
+    rs->results = NULL;
+    rs->count = 0;
+
+    if (ast->is_vector_search && vdb->vector_dims > 0 && vdb->live_vectors > 0) {
+        /* Vector search: use first stored vector as query (QQL vector search
+         * typically specifies a vector literal; for now we use a zero vector
+         * which returns nearest by magnitude ordering) */
+        float* query_vec = (float*)calloc(vdb->vector_dims, sizeof(float));
+        if (!query_vec) {
+            free(ast);
+            free(rs);
+            return NULL;
+        }
+
+        qihse_vector_result_t* results = (qihse_vector_result_t*)calloc(top_k, sizeof(qihse_vector_result_t));
+        if (!results) {
+            free(query_vec);
+            free(ast);
+            free(rs);
+            return NULL;
+        }
+
+        qihse_vector_query_t query = {0};
+        query.query_vector = query_vec;
+        query.vector_dims = vdb->vector_dims;
+        query.top_k = top_k;
+        query.similarity_threshold = 0.0f;
+        query.include_vectors = false;
+        query.include_metadata = false;
+
+        int found = qihse_vector_db_search(vdb, &query, results, top_k);
+        free(query_vec);
+
+        if (found > 0) {
+            rs->results = results;
+            rs->count = (size_t)found;
+        } else {
+            free(results);
+        }
+    } else if (ast->is_text_search) {
+        /* Text search: scan metadata for query_string substring matches */
+        size_t match_count = 0;
+        qihse_vector_result_t* results = (qihse_vector_result_t*)calloc(top_k, sizeof(qihse_vector_result_t));
+        if (!results) {
+            free(ast);
+            free(rs);
+            return NULL;
+        }
+
+        for (size_t i = 0; i < vdb->total_vectors && match_count < top_k; i++) {
+            if ((vdb->rows[i].row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+                (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) continue;
+            if (vdb->rows[i].metadata_offset < vdb->metadata_bytes_used && vdb->rows[i].metadata_size > 0) {
+                const char* meta = (const char*)(vdb->metadata + vdb->rows[i].metadata_offset);
+                size_t meta_len = vdb->rows[i].metadata_size;
+                size_t query_len = strlen(ast->query_string);
+                if (query_len > 0 && meta_len >= query_len) {
+                    /* Simple substring search */
+                    for (size_t j = 0; j + query_len <= meta_len; j++) {
+                        if (strncmp(meta + j, ast->query_string, query_len) == 0) {
+                            results[match_count].id = vdb->rows[i].vector_id;
+                            results[match_count].score = 1.0f;
+                            results[match_count].vector_dims = vdb->vector_dims;
+                            results[match_count].metadata = (void*)meta;
+                            results[match_count].metadata_size = meta_len;
+                            match_count++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (match_count > 0) {
+            rs->results = results;
+            rs->count = match_count;
+        } else {
+            free(results);
+        }
+    } else {
+        /* Generic MATCH query: return all live vectors up to limit */
+        size_t match_count = 0;
+        qihse_vector_result_t* results = (qihse_vector_result_t*)calloc(top_k, sizeof(qihse_vector_result_t));
+        if (!results) {
+            free(ast);
+            free(rs);
+            return NULL;
+        }
+
+        for (size_t i = 0; i < vdb->total_vectors && match_count < top_k; i++) {
+            if ((vdb->rows[i].row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+                (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) continue;
+            results[match_count].id = vdb->rows[i].vector_id;
+            results[match_count].score = 1.0f;
+            results[match_count].vector_dims = vdb->vector_dims;
+            match_count++;
+        }
+
+        if (match_count > 0) {
+            rs->results = results;
+            rs->count = match_count;
+        } else {
+            free(results);
+        }
+    }
+
+    free(ast);
     return rs;
 }
 

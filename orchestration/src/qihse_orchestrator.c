@@ -26,7 +26,7 @@
 #include <stdio.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+#define M_PI acos(-1.0)
 #endif
 
 #ifndef pr_debug
@@ -46,6 +46,7 @@
 typedef struct qihse_async_execution_s {
     qihse_work_batch_t batch;        /* Work batch being executed */
     qihse_device_type_t* partitions; /* Device assignments */
+    qihse_hetero_pool_t pool;        /* Hetero pool for execution */
     bool completed;                  /* Execution completed */
     int result;                      /* Execution result */
     double progress;                 /* Completion progress */
@@ -103,26 +104,26 @@ typedef struct qihse_orchestrator_s {
 static void* async_execution_thread(void* arg) {
     qihse_async_execution_t* execution = (qihse_async_execution_t*)arg;
 
-    /* Execute the partitioned work batch */
-    /* Execute on assigned device */
-    /* Future: Implement device-specific optimizations */
-
+    /* Phase 1: Partition (already done before thread start) */
     pthread_mutex_lock(&execution->mutex);
+    execution->progress = 0.25;
+    pthread_mutex_unlock(&execution->mutex);
 
-    /* Update progress tracking */
-    for (int i = 0; i <= 100; i += 10) {
-        execution->progress = i / 100.0;
-        pthread_mutex_unlock(&execution->mutex);
-        /* Perform work without sleep for faster execution */
-        volatile int dummy = 0;
-        for (int j = 0; j < 100000; j++) dummy += j; /* Busy wait */
-        pthread_mutex_lock(&execution->mutex);
+    /* Phase 2: Execute the work batch on the hetero pool */
+    int exec_result = 0;
+    if (execution->pool) {
+        exec_result = qihse_hetero_pool_execute_batch(execution->pool, &execution->batch);
     }
 
-    execution->result = 0; /* Success */
+    pthread_mutex_lock(&execution->mutex);
+    execution->progress = 0.75;
+    pthread_mutex_unlock(&execution->mutex);
+
+    /* Phase 3: Complete */
+    pthread_mutex_lock(&execution->mutex);
+    execution->result = exec_result;
     execution->completed = true;
     execution->progress = 1.0;
-
     pthread_mutex_unlock(&execution->mutex);
 
     return NULL;
@@ -284,10 +285,17 @@ static void* qihse_device_execution_thread(void* arg) {
         /* Extract results from the work batch outputs */
         size_t result_count = 0;
         for (size_t i = 0; i < ctx->work_batch.num_operations; i++) {
-            /* For now, create synthetic results - in real implementation,
-               results come from the work batch outputs */
-            ctx->result->results[result_count].confidence = 0.8 + ((float)rand() / RAND_MAX) * 0.2;
-            ctx->result->results[result_count].data_size = 128; /* Placeholder */
+            /* Use real output data from the work batch if available */
+            if (ctx->work_batch.outputs && ctx->work_batch.num_outputs &&
+                ctx->work_batch.outputs[i] && ctx->work_batch.num_outputs[i] > 0) {
+                ctx->result->results[result_count].data = ctx->work_batch.outputs[i];
+                ctx->result->results[result_count].data_size = ctx->work_batch.num_outputs[i];
+                ctx->result->results[result_count].confidence = 1.0;
+            } else {
+                ctx->result->results[result_count].confidence = 0.5;
+                ctx->result->results[result_count].data_size = 0;
+                ctx->result->results[result_count].data = NULL;
+            }
             result_count++;
         }
         ctx->result->num_results = result_count;
@@ -785,6 +793,7 @@ qihse_async_handle_t qihse_orchestrator_execute_async(
 
     /* Copy batch information */
     memcpy(&execution->batch, batch, sizeof(qihse_work_batch_t));
+    execution->pool = internal->pool;
 
     /* Allocate partitions */
     execution->partitions = calloc(batch->num_operations, sizeof(qihse_device_type_t));

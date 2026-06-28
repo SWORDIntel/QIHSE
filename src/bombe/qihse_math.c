@@ -455,14 +455,76 @@ int qihse_fortran_fft(const double* input, double* output,
     g_fortran_perf.fft_time = (double)(end_time - start_time) / 1e9;
     return 0;
 #else
-    for (size_t k = 0; k < size; k++) {
-        output[k] = 0.0;
-        for (size_t n = 0; n < size; n++) {
-            double angle = -2.0 * M_PI * (double)k * (double)n / (double)size;
-            if (direction < 0) angle = -angle;
-            output[k] += input[n] * cos(angle); // Simplified
+    /* Iterative radix-2 Cooley-Tukey FFT (O(n log n)) */
+    if (size == 0) return -EINVAL;
+
+    /* Check if size is power of 2 */
+    size_t sz = size;
+    bool is_pow2 = (sz & (sz - 1)) == 0;
+    if (!is_pow2) {
+        /* Fall back to DFT for non-power-of-2 sizes */
+        for (size_t k = 0; k < size; k++) {
+            output[k] = 0.0;
+            for (size_t n = 0; n < size; n++) {
+                double angle = -2.0 * M_PI * (double)k * (double)n / (double)size;
+                if (direction < 0) angle = -angle;
+                output[k] += input[n] * cos(angle);
+            }
+        }
+        return 0;
+    }
+
+    /* Bit-reversal permutation */
+    size_t n = size;
+    size_t bits = 0;
+    while ((1u << bits) < n) bits++;
+
+    /* Use separate real/imag arrays for the FFT computation */
+    double* re = (double*)malloc(n * sizeof(double));
+    double* im = (double*)malloc(n * sizeof(double));
+    if (!re || !im) {
+        free(re); free(im);
+        return -ENOMEM;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        size_t j = 0;
+        size_t x = i;
+        for (size_t b = 0; b < bits; b++) {
+            j = (j << 1) | (x & 1);
+            x >>= 1;
+        }
+        re[j] = input[i];
+        im[j] = 0.0;
+    }
+
+    /* Butterfly operations */
+    for (size_t len = 2; len <= n; len <<= 1) {
+        double angle_step = -2.0 * M_PI / (double)len;
+        if (direction < 0) angle_step = -angle_step;
+        size_t half_len = len >> 1;
+        for (size_t i = 0; i < n; i += len) {
+            for (size_t j = 0; j < half_len; j++) {
+                double angle = angle_step * (double)j;
+                double wr = cos(angle);
+                double wi = sin(angle);
+                double tr = re[i + j + half_len] * wr - im[i + j + half_len] * wi;
+                double ti = re[i + j + half_len] * wi + im[i + j + half_len] * wr;
+                re[i + j + half_len] = re[i + j] - tr;
+                im[i + j + half_len] = im[i + j] - ti;
+                re[i + j] += tr;
+                im[i + j] += ti;
+            }
         }
     }
+
+    /* Output magnitude (real part for real-valued input) */
+    for (size_t k = 0; k < n; k++) {
+        output[k] = re[k];
+    }
+
+    free(re);
+    free(im);
     return 0;
 #endif
 }

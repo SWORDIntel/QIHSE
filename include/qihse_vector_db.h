@@ -540,6 +540,22 @@ bool qihse_vector_db_delete_by_id(
 );
 
 /**
+ * Retrieve a single vector by external ID.
+ *
+ * @param vdb Vector database handle
+ * @param vector_id External vector ID to retrieve
+ * @param out_vector Output buffer for vector data (must be at least dims * sizeof(float))
+ * @param out_dims Optional output for vector dimensions
+ * @return true if found, false on failure or missing ID
+ */
+bool qihse_vector_db_get_vector_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    float* out_vector,
+    size_t* out_dims
+);
+
+/**
  * Delete multiple live vectors by external ID in one batch.
  *
  * @param vdb Vector database handle
@@ -787,6 +803,14 @@ qihse_result_set_t* qihse_execute_sql(
  * Free a result set allocated by qihse_execute_qql or qihse_execute_sql.
  */
 void qihse_free_result_set(qihse_result_set_t* rs);
+
+/**
+ * Get the vector dimensions of the database.
+ *
+ * @param vdb Vector database handle
+ * @return Vector dimensions, or 0 on error
+ */
+size_t qihse_vector_db_get_dims(qihse_vector_db_t vdb);
 
 /**
  * Hybrid search request combining two independent query paths.

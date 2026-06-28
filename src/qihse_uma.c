@@ -387,6 +387,24 @@ int qihse_uma_migrate(void* ptr, qihse_memory_tier_t from_tier, qihse_memory_tie
             for (size_t j = 0; j < addr->num_devices; j++) {
                 if (addr->device_views[j].device_ptr == ptr) {
                     /* Found the address - perform migration */
+
+                    /* Allocate destination memory in the target tier */
+                    void* dst_ptr = qihse_uma_alloc(addr->backing_buffer->abi_buffer.size, to_tier);
+                    if (dst_ptr) {
+                        /* Copy data from source tier to destination tier */
+                        memcpy(dst_ptr, addr->backing_buffer->abi_buffer.data,
+                               addr->backing_buffer->abi_buffer.size);
+
+                        /* Free the old allocation in the source tier */
+                        qihse_uma_free(addr->backing_buffer->abi_buffer.data);
+
+                        /* Update the backing buffer to point to the new allocation */
+                        addr->backing_buffer->abi_buffer.data = dst_ptr;
+
+                        /* Update the device view pointer */
+                        addr->device_views[j].device_ptr = dst_ptr;
+                    }
+
                     addr->current_resident = to_tier;
 
                     /* Update device view residency status */
@@ -396,9 +414,6 @@ int qihse_uma_migrate(void* ptr, qihse_memory_tier_t from_tier, qihse_memory_tie
 
                     /* Update migration statistics */
                     addr->migration_count++;
-
-                    /* In a full implementation, this would actually copy data between physical memory tiers */
-                    /* For now, we update metadata since all tiers share the same physical memory */
 
                     return 0;
                 }
@@ -599,10 +614,7 @@ void* qihse_npu_cache_alloc(size_t size) {
     /* Get or create UMA manager for NPU operations */
     qihse_uma_manager_t uma = uma_global_state.manager;
     if (!uma) {
-        /* Initialize UMA if not already done */
-        /* NOTE: The original code had a potential leak here as uma_global_state.manager might not be properly initialized or assigned */
-        /* Assuming qihse_uma_create_manager exists and returns a valid manager */
-        uma = qihse_uma_create_manager(); /* Placeholder for actual manager creation */
+        uma = qihse_uma_create(NULL, QIHSE_UMA_MIGRATE_ON_ACCESS);
         if (!uma) return NULL;
         uma_global_state.manager = uma;
     }
