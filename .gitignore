@@ -36,3 +36,4 @@
 /sdks/python/wal.log
 /sdks/python/__pycache__/
 /sdks/python/test_python.py
+.qihse_auth_cache.dat

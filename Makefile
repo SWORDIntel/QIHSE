@@ -42,8 +42,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lm3
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lm3
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp 
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp 
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
