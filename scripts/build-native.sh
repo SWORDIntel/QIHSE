@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="${QIHSE_BUILD_FLAGS_FILE:-$ROOT_DIR/.qihse-build-flags}"
 TARGET="auto"
 CFLAGS_EXTRA="${QIHSE_CFLAGS_EXTRA:--march=native -DNDEBUG}"

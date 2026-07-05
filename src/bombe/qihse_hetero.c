@@ -179,6 +179,7 @@ static double qihse_benchmark_device_int8(size_t batch_size, size_t dims __attri
     /* Initialize with random data */
     for (size_t i = 0; i < batch_size * dims; i++) {
 #ifndef _WIN32
+        unsigned char rbuf[1];
         if (RAND_bytes(rbuf, 1) == 1) {
             matrix[i] = (int8_t)(rbuf[0] - 128);
         } else

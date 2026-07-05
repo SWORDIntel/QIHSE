@@ -84,7 +84,10 @@ static EVP_PKEY *load_private_key(const char *path) {
     f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
+<<<<<<< Updated upstream
         return NULL;
+=======
+>>>>>>> Stashed changes
     }
 #endif
     EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
@@ -110,7 +113,10 @@ static EVP_PKEY *load_public_key(const char *path) {
     f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
+<<<<<<< Updated upstream
         return NULL;
+=======
+>>>>>>> Stashed changes
     }
 #endif
     EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
