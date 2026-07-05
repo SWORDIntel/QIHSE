@@ -21,6 +21,10 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "qihse_pqc_crypto.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
