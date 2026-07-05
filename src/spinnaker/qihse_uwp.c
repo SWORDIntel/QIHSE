@@ -374,13 +374,10 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
             if (xdp_fd >= 0) {
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
-<<<<<<< Updated upstream
                 if (!ev) {
                     fprintf(stderr, "[QIHSE UWP] malloc failed for XDP event ctx\n");
-                } else {
-=======
+                }
                 if (ev) {
->>>>>>> Stashed changes
                     ev->type = EVENT_XDP_POLL;
                     ev->fd = xdp_fd;
                     ev->ctx = ctx;

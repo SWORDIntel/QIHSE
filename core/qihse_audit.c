@@ -230,20 +230,11 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         write_obfuscated(f, out_buf);
         for (int i = 0; i < MLDSA87_SIG_BYTES; i++) fputc(mldsa87_sig[i] ^ XOR_KEY, f);
         fclose(f);
-<<<<<<< Updated upstream
     }
 #ifndef _WIN32
     if (afd >= 0 && !f) {
         close(afd);
     }
-=======
-    }
-#ifndef _WIN32
-    else {
-        close(afd);
-    }
-}
->>>>>>> Stashed changes
 #endif
     
     memcpy(last_hash, new_hash, 129);
