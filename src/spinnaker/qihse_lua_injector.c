@@ -25,6 +25,7 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     if (!sandbox->L) return false;
     
     // Load standard libraries (math, string, table)
+<<<<<<< Updated upstream
     /* Only load safe libraries — exclude io, os, debug, package */
     lua_pushcfunction(sandbox->L, luaopen_math);
     lua_call(sandbox->L, 0, 1);
@@ -35,6 +36,12 @@ bool qihse_lua_sandbox_init(qihse_lua_sandbox_t* sandbox, uint32_t max_instructi
     lua_pushcfunction(sandbox->L, luaopen_table);
     lua_call(sandbox->L, 0, 1);
     lua_setglobal(sandbox->L, "table");
+=======
+    lua_pushcfunction(sandbox->L, luaopen_math); lua_pushstring(sandbox->L, "math"); lua_call(sandbox->L, 1, 1);
+    lua_pushcfunction(sandbox->L, luaopen_string); lua_pushstring(sandbox->L, "string"); lua_call(sandbox->L, 1, 1);
+    lua_pushcfunction(sandbox->L, luaopen_table); lua_pushstring(sandbox->L, "table"); lua_call(sandbox->L, 1, 1);
+    lua_pop(sandbox->L, 3);
+>>>>>>> Stashed changes
     
     sandbox->active = true;
     sandbox->instruction_quota = max_instructions;

@@ -7,6 +7,7 @@
 #include "qihse_platform.h"
 #ifndef _WIN32
 #include <pthread.h>
+#include <openssl/rand.h>
 #endif
 #ifndef _WIN32
 #include <sys/socket.h>
