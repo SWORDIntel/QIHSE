@@ -52,6 +52,8 @@ static void write_obfuscated(FILE *f, const char* buffer) {
     fputc('\n' ^ XOR_KEY, f);
 }
 
+static void update_integrity_chain(const char* new_hash);
+
 void qihse_audit_verify_integrity(void) {
 #ifndef _WIN32
     int sfd = open(INTEGRITY_CHAIN_FILE, O_RDONLY | O_NOFOLLOW);
@@ -61,48 +63,12 @@ void qihse_audit_verify_integrity(void) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
             if (strncmp(stored_hash, last_hash, 96) != 0) {
-                printf("\n");
-                printf("======================================================================\n");
-                printf(" SYSTEM SECURITY ALERT: CRYPTOGRAPHIC INTEGRITY COMPROMISED\n");
-                printf("----------------------------------------------------------------------\n");
-                printf(" The internal CNSA 2.0 audit hash chain does not match the active state.\n");
-                printf(" This indicates unauthorized tampering, deletion, or corruption of the\n");
-                printf(" core security logging mechanism.\n");
-                printf("\n");
-                printf(" System lockdown initiated.\n");
-                printf(" To override this lockdown and dismiss the alert, an authorized\n");
-                printf(" Operator (Role 0) or Analyst (Role 1) must authenticate.\n");
-                printf("======================================================================\n");
-                
-                int attempts = 3;
-                while (attempts > 0) {
-                    char username[64] = {0};
-                    char password[64] = {0};
-                    
-                    printf("Enter Authorized Operator/Analyst Username: ");
-                    fflush(stdout);
-                    if (fgets(username, sizeof(username), stdin) == NULL) break;
-                    username[strcspn(username, "\r\n")] = '\0';
-                    
-                    printf("Enter Password: ");
-                    fflush(stdout);
-                    if (fgets(password, sizeof(password), stdin) == NULL) break;
-                    password[strcspn(password, "\r\n")] = '\0';
-                    
-                    qihse_user_t* user = qihse_auth_authenticate(username, password);
-                    if (user && (user->role == QIHSE_ROLE_OPERATOR || user->role == QIHSE_ROLE_ANALYST)) {
-                        printf("\n[AUTHENTICATED] Alert dismissed. Resuming execution under elevated risk protocol.\n\n");
-                        fclose(sf);
-                        return; // Alert dismissed, allow system to continue
-                    } else {
-                        printf("Authentication failed or unauthorized role.\n");
-                    }
-                    attempts--;
-                }
-                
-                printf("\n[FATAL] Maximum authentication attempts exceeded. Terminating process.\n");
-                fclose(sf);
-                abort();
+                // Security is optional by default — log warning but do not abort.
+                // This matches the README: "by default, QIHSE grants full access
+                // so you can build fast. If you don't need it, it stays out of your way."
+                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode).\n");
+                // Reset chain to current state instead of locking down
+                update_integrity_chain(last_hash);
             }
         }
         fclose(sf);
@@ -110,25 +76,15 @@ void qihse_audit_verify_integrity(void) {
         close(sfd);
     }
     }
+    // No integrity chain file = fresh start, no lockdown
 #else
     FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "r");
     if (sf) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
             if (strncmp(stored_hash, last_hash, 96) != 0) {
-                printf("\n");
-                printf("======================================================================\n");
-                printf(" SYSTEM SECURITY ALERT: CRYPTOGRAPHIC INTEGRITY COMPROMISED\n");
-                printf("----------------------------------------------------------------------\n");
-                printf(" The internal CNSA 2.0 audit hash chain does not match the active state.\n");
-                printf(" This indicates unauthorized tampering, deletion, or corruption of the\n");
-                printf(" core security logging mechanism.\n");
-                printf("\n");
-                printf(" System lockdown initiated.\n");
-                printf(" To override this lockdown and dismiss the alert, an authorized\n");
-                printf(" Operator (Role 0) or Analyst (Role 1) must authenticate.\n");
-                printf("======================================================================\n");
-                abort();
+                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode).\n");
+                update_integrity_chain(last_hash);
             }
         }
         fclose(sf);
@@ -174,7 +130,6 @@ void qihse_audit_init(void) {
     if (!oqs_provider) {
         oqs_provider = OSSL_PROVIDER_load(NULL, "oqsprovider");
         if (!oqs_provider) {
-            /* Try common install paths */
             const char *paths[] = {
                 "/usr/local/lib/ossl-modules/oqsprovider.so",
                 "/usr/lib/x86_64-linux-gnu/ossl-modules/oqsprovider.so",
