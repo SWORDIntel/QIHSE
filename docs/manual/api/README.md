@@ -645,6 +645,69 @@ Engine-specific operations use the `_user` suffix or accept `classification` / `
 bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint64_t expire_time_ms, uint16_t classification, uint16_t sci_compartment);
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
+// KV Store Bulk Load Mode — skips WAL, QDD, and per-key metadata for fast ingestion
+void qihse_kv_bulk_load_begin(qihse_kv_store_t* store);
+void qihse_kv_bulk_load_end(qihse_kv_store_t* store);
+
+// KV Store Save — uses trie iteration in bulk_load_mode for efficient serialization
+int qihse_kv_save(qihse_kv_store_t* store, const char* filepath);
+int qihse_kv_load(qihse_kv_store_t* store, const char* filepath);
+```
+
+### Trinary Trie Iterator
+
+The trinary trie supports a recursive callback iterator for efficient bulk traversal of all key-value pairs:
+
+```c
+#include "qihse_trinary_trie.h"
+
+// Callback type — return true to continue, false to stop iteration
+typedef bool (*qihse_trinary_trie_iter_cb)(const char* key, void* value, size_t value_size, void* user_data);
+
+// Iterate all key-value pairs in the trie, calling cb for each
+void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
+```
+
+**Usage Example:**
+```c
+// Count all keys in the trie
+static bool count_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    size_t* count = (size_t*)user_data;
+    (*count)++;
+    return true;  // continue iteration
+}
+
+size_t total = 0;
+qihse_trinary_trie_foreach(trie, count_cb, &total);
+printf("Total keys: %zu\n", total);
+```
+
+The iterator is used internally by `qihse_kv_save` in `bulk_load_mode` to serialize all key-value pairs without per-key metadata overhead.
+
+### Python SDK — KV Store Shard Operations
+
+The Python SDK (`qihse.KVStore`) provides high-level methods for IP shard management:
+
+```python
+from qihse import KVStore
+
+kv = KVStore()
+
+# Retrieve a shard blob (newline-separated IP list)
+ip_list = kv.get_shard("china_ips_shard_001.txt")
+
+# Check if an individual IP exists (ip: prefix keys)
+exists = kv.lookup_ip("1.2.3.4")
+
+# Record a scan finding (finding:<cve>:<ip>:<port> key)
+kv.record_finding({
+    "cve_id": "CVE-2026-1234",
+    "ip": "1.2.3.4",
+    "port": 443,
+    "severity": "critical"
+})
+```
+
 // Time-Series Database
 bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestamp, double value, uint16_t classification, uint16_t sci_compartment);
 double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user);

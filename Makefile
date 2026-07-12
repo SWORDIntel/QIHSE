@@ -208,12 +208,12 @@ oqs-provider: liboqs
 
 $(LIB_TARGET): $(SRCS)
 	@echo "Building $(LIB_TARGET)..."
-	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
+	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(filter-out -lqihse,$(LDFLAGS))
 	@echo "$(LIB_TARGET) build successful"
 
 lib-ctypes: $(filter-out sdks/python/qihse.c,$(SRCS))
 	@echo "Building libqihse.so (ctypes, no Python extension)..."
-	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(LDFLAGS))
+	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(filter-out -lqihse,$(LDFLAGS)))
 	@echo "libqihse.so (ctypes) build successful"
 
 persistence: test-persist

@@ -62,7 +62,7 @@ flowchart TB
 | Family | UWP Target | API Prefix | Notes |
 |--------|------------|------------|-------|
 | Vector DB | `0x02` | `qihse_vector_db_*` | Exact `float32` rerank with trinary (`qtri`/`qmag`) and quantized candidate filtering |
-| Key-Value Store | `0x01` | `qihse_kv_*` | Trinary trie + LSM/SSTable persistence |
+| Key-Value Store | `0x01` | `qihse_kv_*` | Trinary trie + LSM/SSTable persistence, bulk load mode, recursive trie iterator (`qihse_trinary_trie_foreach`) |
 | Document Store | `0x03` | `qihse_document_*` | JSON insertion with JIT-compiled access paths |
 | Time-Series DB | `0x05` | `qihse_timeseries_*` | Gorilla XOR bit-packing, lock-free ingress |
 | Columnar Engine | `0x04` | `qihse_column_*` | AVX-accelerated OLAP, strided page alignment |

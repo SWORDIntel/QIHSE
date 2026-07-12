@@ -1,4 +1,5 @@
 import ctypes
+import json
 from typing import Optional
 from .core import _lib
 
@@ -78,3 +79,19 @@ class KVStore:
 
     def load(self, filepath: str) -> bool:
         return _lib.qihse_kv_load(self._ptr, filepath.encode('utf-8')) == 0
+
+    def get_shard(self, shard_id: str) -> Optional[str]:
+        """Retrieve a shard blob by shard name."""
+        return self.get(f"shard:{shard_id}")
+
+    def lookup_ip(self, ip: str) -> bool:
+        """Check if an individual IP exists in the KV store."""
+        return self.exists(f"ip:{ip}")
+
+    def record_finding(self, finding: dict) -> bool:
+        """Record a scan finding to the KV store."""
+        cve = finding.get("cve_id", "unknown")
+        ip_addr = finding.get("ip", "unknown")
+        port = finding.get("port", "unknown")
+        key = f"finding:{cve}:{ip_addr}:{port}"
+        return self.set(key, json.dumps(finding))

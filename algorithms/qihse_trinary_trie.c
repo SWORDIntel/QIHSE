@@ -211,3 +211,23 @@ bool qihse_trinary_trie_delete(qihse_trinary_trie_t* trie, const char* key) {
     trie->root = delete_node(trie, trie->root, key, &deleted);
     return deleted;
 }
+
+static bool foreach_recursive(qihse_tst_node_t* node, char* buf, int depth, int buf_size,
+                              qihse_trinary_trie_iter_cb cb, void* user_data) {
+    if (!node) return true;
+    if (!foreach_recursive(node->left, buf, depth, buf_size, cb, user_data)) return false;
+    buf[depth] = node->c;
+    if (node->is_end) {
+        buf[depth + 1] = '\0';
+        if (!cb(buf, node->value, node->value_size, user_data)) return false;
+    }
+    if (!foreach_recursive(node->mid, buf, depth + 1, buf_size, cb, user_data)) return false;
+    if (!foreach_recursive(node->right, buf, depth, buf_size, cb, user_data)) return false;
+    return true;
+}
+
+void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data) {
+    if (!trie || !trie->root || !cb) return;
+    char buf[512];
+    foreach_recursive(trie->root, buf, 0, sizeof(buf) - 1, cb, user_data);
+}
