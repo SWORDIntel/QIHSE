@@ -199,6 +199,9 @@ oqs-provider: liboqs
 	cd vendor/oqs-provider && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
 			-DOPENSSL_ROOT_DIR=/usr \
+			-DOPENSSL_INCLUDE_DIR=/usr/include \
+			-DOPENSSL_CRYPTO_LIBRARY=/usr/lib/x86_64-linux-gnu/libcrypto.so \
+			-DOPENSSL_SSL_LIBRARY=/usr/lib/x86_64-linux-gnu/libssl.so \
 			-Dliboqs_DIR=/usr/local/lib/cmake/liboqs .. 2>&1 && \
 		ninja 2>&1 && ninja install 2>&1
 	@echo "oqs-provider build successful"

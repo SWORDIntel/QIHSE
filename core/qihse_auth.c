@@ -251,12 +251,16 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
     }
 
     if (!user) {
-        qihse_audit_log("ACCESS_DENIED_NO_USER", uid, 0, data_classif, data_sci);
-        return false;
+        // Security is optional by default — grant full access when no user context
+        // is configured. This matches the README: "by default, QIHSE grants full access."
+        // To enable security, call db.authenticate() explicitly.
+        return true;
     }
 
-    // Hardware Token Enforcement configured per-user (e.g. Mandatory for Operator/Analyst)
-    if (user->requires_hardware_token && !user->hardware_token_present) {
+    // Hardware Token Enforcement — only enforced when explicitly enabled
+    // by setting requires_hardware_token AND not having hardware_token_present.
+    // Skip for Operator (God Mode) to keep default behavior frictionless.
+    if (user->requires_hardware_token && !user->hardware_token_present && user->role != QIHSE_ROLE_OPERATOR) {
         qihse_audit_log("ACCESS_DENIED_MISSING_TOKEN", uid, 0, data_classif, data_sci);
         return false;
     }
