@@ -95,4 +95,8 @@ int qihse_kv_save(qihse_kv_store_t* store, const char* filepath);
  */
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath);
 
+/* Bulk load mode — skips WAL, QDD, and per-key metadata for fast ingestion */
+void qihse_kv_bulk_load_begin(qihse_kv_store_t* store);
+void qihse_kv_bulk_load_end(qihse_kv_store_t* store);
+
 #endif /* QIHSE_KV_STORE_H */

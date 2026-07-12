@@ -32,6 +32,7 @@ struct qihse_kv_store {
     size_t mem_usage;
     int sstable_counter;
     qihse_quantum_defense_ctx_t* qdd_ctx;
+    bool bulk_load_mode;
 };
 
 static uint64_t current_time_ms() {
@@ -51,7 +52,9 @@ static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
     // Reset MemTable
     qihse_trinary_trie_destroy(store->trie);
     store->trie = qihse_trinary_trie_create();
-    for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
+    if (!store->bulk_load_mode) {
+        for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
+    }
     store->num_keys = 0;
     store->mem_usage = 0;
     
@@ -170,47 +173,62 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
 bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment) {
     if (!store || !store->trie || !key || !value) return false;
     
-    if (store->wal_fd) {
+    if (store->wal_fd && !store->bulk_load_mode) {
         fprintf(store->wal_fd, "SET %s %s %u %u\n", key, value, (unsigned)classification, (unsigned)sci_compartment);
         fflush(store->wal_fd);
     }
 
-    size_t out_size = 0;
-    qihse_trinary_trie_search(store->trie, key, &out_size);
+    if (!store->bulk_load_mode) {
+        size_t out_size = 0;
+        qihse_trinary_trie_search(store->trie, key, &out_size);
+    }
     if (!qihse_trinary_trie_insert(store->trie, key, (void*)value, strlen(value) + 1)) {
         return false;
     }
 
     store->mem_usage += strlen(key) + strlen(value) + 16;
-    if (store->mem_usage > LSM_MEMTABLE_MAX) {
+    if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX) {
         flush_memtable_to_sstable(store);
     }
     
-    bool exists = false;
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            exists = true;
-            store->keys[i].expire_time_ms = 0;
-            store->keys[i].classification = classification;
-            store->keys[i].sci_compartment = sci_compartment;
-            break;
+    if (!store->bulk_load_mode) {
+        bool exists = false;
+        for (size_t i = 0; i < store->num_keys; i++) {
+            if (strcmp(store->keys[i].key, key) == 0) {
+                exists = true;
+                store->keys[i].expire_time_ms = 0;
+                store->keys[i].classification = classification;
+                store->keys[i].sci_compartment = sci_compartment;
+                break;
+            }
         }
-    }
-    if (!exists) {
-        if (store->num_keys == store->capacity) {
-            size_t new_capacity = store->capacity == 0 ? 16 : store->capacity * 2;
-            key_entry_t* new_keys = (key_entry_t*)realloc(store->keys, new_capacity * sizeof(key_entry_t));
-            if (!new_keys) return false;
-            store->capacity = new_capacity;
-            store->keys = new_keys;
+        if (!exists) {
+            if (store->num_keys == store->capacity) {
+                size_t new_capacity = store->capacity == 0 ? 16 : store->capacity * 2;
+                key_entry_t* new_keys = (key_entry_t*)realloc(store->keys, new_capacity * sizeof(key_entry_t));
+                if (!new_keys) return false;
+                store->capacity = new_capacity;
+                store->keys = new_keys;
+            }
+            store->keys[store->num_keys].key = strdup(key);
+            store->keys[store->num_keys].expire_time_ms = 0;
+            store->keys[store->num_keys].classification = classification;
+            store->keys[store->num_keys].sci_compartment = sci_compartment;
+            store->num_keys++;
         }
-        store->keys[store->num_keys].key = strdup(key);
-        store->keys[store->num_keys].expire_time_ms = 0;
-        store->keys[store->num_keys].classification = classification;
-        store->keys[store->num_keys].sci_compartment = sci_compartment;
+    } else {
+        /* Bulk load: skip per-key metadata tracking, just insert into trie */
         store->num_keys++;
     }
     return true;
+}
+
+void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
+    if (store) store->bulk_load_mode = true;
+}
+
+void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
+    if (store) store->bulk_load_mode = false;
 }
 
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment, qihse_user_t* user) {
@@ -424,22 +442,46 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
     }
 }
 
+typedef struct {
+    FILE* f;
+    size_t count;
+} bulk_save_ctx_t;
+
+static bool bulk_save_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    bulk_save_ctx_t* ctx = (bulk_save_ctx_t*)user_data;
+    if (!key || !value || !ctx->f) return true;
+    size_t klen = strlen(key);
+    size_t vlen = value_size > 0 ? value_size - 1 : 0;
+    fprintf(ctx->f, "%zu %zu 0 0 0\n", klen, vlen);
+    fwrite(key, 1, klen, ctx->f);
+    fwrite(value, 1, vlen, ctx->f);
+    fprintf(ctx->f, "\n");
+    ctx->count++;
+    return true;
+}
+
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath) return -1;
-    qihse_kv_sweep_expired(store);
+    if (!store->bulk_load_mode) qihse_kv_sweep_expired(store);
     int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     FILE* f = fdopen(fd, "w");
     if (!f) { close(fd); return -1; }
     
-    for (size_t i = 0; i < store->num_keys; i++) {
-        size_t out_size = 0;
-        char* val = (char*)qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
-        if (val) {
-            fprintf(f, "%zu %zu %llu %u %u\n", strlen(store->keys[i].key), strlen(val), (unsigned long long)store->keys[i].expire_time_ms, (unsigned)store->keys[i].classification, (unsigned)store->keys[i].sci_compartment);
-            fwrite(store->keys[i].key, 1, strlen(store->keys[i].key), f);
-            fwrite(val, 1, strlen(val), f);
-            fprintf(f, "\n");
+    if (store->bulk_load_mode || store->keys == NULL) {
+        /* Bulk mode: iterate trie via callback — write key/value pairs without metadata */
+        bulk_save_ctx_t ctx = { .f = f, .count = 0 };
+        qihse_trinary_trie_foreach(store->trie, bulk_save_callback, &ctx);
+    } else {
+        for (size_t i = 0; i < store->num_keys; i++) {
+            size_t out_size = 0;
+            char* val = (char*)qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
+            if (val) {
+                fprintf(f, "%zu %zu %llu %u %u\n", strlen(store->keys[i].key), strlen(val), (unsigned long long)store->keys[i].expire_time_ms, (unsigned)store->keys[i].classification, (unsigned)store->keys[i].sci_compartment);
+                fwrite(store->keys[i].key, 1, strlen(store->keys[i].key), f);
+                fwrite(val, 1, strlen(val), f);
+                fprintf(f, "\n");
+            }
         }
     }
     fclose(f);

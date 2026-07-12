@@ -49,4 +49,11 @@ void* qihse_trinary_trie_search(qihse_trinary_trie_t* trie, const char* key, siz
  */
 bool qihse_trinary_trie_delete(qihse_trinary_trie_t* trie, const char* key);
 
+/* Iterator callback — called for each key-value pair in the trie.
+ * Return true to continue iteration, false to stop. */
+typedef bool (*qihse_trinary_trie_iter_cb)(const char* key, void* value, size_t value_size, void* user_data);
+
+/* Iterate all key-value pairs in the trie, calling cb for each. */
+void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
+
 #endif /* QIHSE_TRINARY_TRIE_H */
