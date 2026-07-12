@@ -3,7 +3,7 @@
 
 CC=gcc
 
-INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include
+INCLUDES = -I. -I./include -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 -I/usr/include/python3.13
 QIHSE_CFLAGS_EXTRA?=
 
@@ -146,11 +146,11 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all build build-native clean pristine workspace workspace-clean lib persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
+.PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install dev-setup docs test-persist test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
 .NOTPARALLEL: validate-reference-workflow
 
-all: lib server keygen
-build: lib server lib-ctypes keygen
+all: liboqs oqs-provider lib server keygen
+build: liboqs oqs-provider lib server lib-ctypes keygen
 
 build-native:
 	./scripts/build-native.sh
@@ -179,14 +179,36 @@ xdp-kern: src/networking/qihse_xdp_kern.c
 	    -o src/networking/qihse_xdp.o
 	@echo "qihse_xdp.o build successful"
 
-lib: $(LIB_TARGET)
+lib: liboqs oqs-provider $(LIB_TARGET)
+
+# ---------------------------------------------------------------------------
+# liboqs — post-quantum cryptography library (submodule)
+# ---------------------------------------------------------------------------
+liboqs:
+	@echo "Building liboqs..."
+	cd vendor/liboqs && mkdir -p build && cd build && \
+		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DOQS_USE_OPENSSL=OFF .. 2>&1 && \
+		ninja 2>&1 && ninja install 2>&1
+	@echo "liboqs build successful"
+
+# ---------------------------------------------------------------------------
+# oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
+# ---------------------------------------------------------------------------
+oqs-provider: liboqs
+	@echo "Building oqs-provider..."
+	cd vendor/oqs-provider && mkdir -p build && cd build && \
+		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
+			-DOPENSSL_ROOT_DIR=/usr \
+			-Dliboqs_DIR=/usr/local/lib/cmake/liboqs .. 2>&1 && \
+		ninja 2>&1 && ninja install 2>&1
+	@echo "oqs-provider build successful"
 
 $(LIB_TARGET): $(SRCS)
 	@echo "Building $(LIB_TARGET)..."
 	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: $(filter-out sdks/python/qihse.c,$(SRCS))
+lib-ctypes: liboqs oqs-provider $(filter-out sdks/python/qihse.c,$(SRCS))
 	@echo "Building libqihse.so (ctypes, no Python extension)..."
 	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(LDFLAGS))
 	@echo "libqihse.so (ctypes) build successful"
@@ -565,6 +587,7 @@ clean:
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
 	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries
+	rm -rf vendor/liboqs/build vendor/oqs-provider/build
 	@echo "Clean completed"
 
 workspace:

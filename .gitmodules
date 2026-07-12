@@ -4,3 +4,9 @@
 [submodule "vendor/tree-sitter"]
 	path = vendor/tree-sitter
 	url = https://github.com/tree-sitter/tree-sitter.git
+[submodule "vendor/liboqs"]
+	path = vendor/liboqs
+	url = https://github.com/open-quantum-safe/liboqs.git
+[submodule "vendor/oqs-provider"]
+	path = vendor/oqs-provider
+	url = https://github.com/open-quantum-safe/oqs-provider.git
