@@ -179,7 +179,7 @@ xdp-kern: src/networking/qihse_xdp_kern.c
 	    -o src/networking/qihse_xdp.o
 	@echo "qihse_xdp.o build successful"
 
-lib: liboqs oqs-provider $(LIB_TARGET)
+lib: $(LIB_TARGET)
 
 # ---------------------------------------------------------------------------
 # liboqs — post-quantum cryptography library (submodule)
@@ -211,7 +211,7 @@ $(LIB_TARGET): $(SRCS)
 	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(LDFLAGS)
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: liboqs oqs-provider $(filter-out sdks/python/qihse.c,$(SRCS))
+lib-ctypes: $(filter-out sdks/python/qihse.c,$(SRCS))
 	@echo "Building libqihse.so (ctypes, no Python extension)..."
 	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(LDFLAGS))
 	@echo "libqihse.so (ctypes) build successful"
@@ -590,7 +590,6 @@ clean:
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
 	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries
-	rm -rf vendor/liboqs/build vendor/oqs-provider/build
 	@echo "Clean completed"
 
 workspace:

@@ -126,8 +126,10 @@ void qihse_audit_set_webhook(const char* url) {
 void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
     
-    /* Load the OQS provider for PQC algorithms (ML-DSA-87, ML-KEM-1024) */
-    if (!oqs_provider) {
+    /* Load the OQS provider for PQC algorithms (ML-DSA-87, ML-KEM-1024).
+     * Only attempt loading if QIHSE_ENABLE_PQC is set — some vCPUs crash
+     * on SIMD instructions in liboqs even with generic build. */
+    if (!oqs_provider && getenv("QIHSE_ENABLE_PQC")) {
         oqs_provider = OSSL_PROVIDER_load(NULL, "oqsprovider");
         if (!oqs_provider) {
             const char *paths[] = {
