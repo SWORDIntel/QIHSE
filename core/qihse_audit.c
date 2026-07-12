@@ -19,9 +19,11 @@
 #endif
 #ifndef _WIN32
 #include <openssl/err.h>
+#include <openssl/provider.h>
 #endif
 
 static EVP_PKEY *audit_pkey = NULL;
+static OSSL_PROVIDER *oqs_provider = NULL;
 
 static pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char last_hash[129] = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"; // 96 chars for SHA-384
@@ -168,18 +170,40 @@ void qihse_audit_set_webhook(const char* url) {
 void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
     
-    // Generate ML-DSA-87 keys for signing the audit logs
+    /* Load the OQS provider for PQC algorithms (ML-DSA-87, ML-KEM-1024) */
+    if (!oqs_provider) {
+        oqs_provider = OSSL_PROVIDER_load(NULL, "oqsprovider");
+        if (!oqs_provider) {
+            /* Try common install paths */
+            const char *paths[] = {
+                "/usr/local/lib/ossl-modules/oqsprovider.so",
+                "/usr/lib/x86_64-linux-gnu/ossl-modules/oqsprovider.so",
+                NULL
+            };
+            for (int i = 0; paths[i]; i++) {
+                oqs_provider = OSSL_PROVIDER_load(NULL, paths[i]);
+                if (oqs_provider) break;
+            }
+        }
+    }
+
+    /* Generate ML-DSA-87 keys for signing the audit logs */
     if (!audit_pkey) {
-        audit_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-87");
+        if (oqs_provider) {
+            audit_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-87");
+        }
         if (!audit_pkey) {
-            fprintf(stderr, "[FATAL] Failed to initialize ML-DSA-87 PQC keys for audit log.\n");
-            abort();
+            fprintf(stderr, "[WARN] ML-DSA-87 PQC unavailable, audit log will use SHA-384 hash chain only.\n");
         }
     }
 
     FILE *f = fopen(AUDIT_FILE, "ab");
     if (f) {
-        write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
+        if (audit_pkey) {
+            write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
+        } else {
+            write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 SHA-384 HASH CHAIN (PQC UNAVAILABLE)] ---");
+        }
         fclose(f);
 #ifndef _WIN32
         chmod(AUDIT_FILE, 0600);
