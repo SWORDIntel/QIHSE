@@ -69,6 +69,18 @@ _lib.qihse_vector_db_add_vectors.argtypes = [
 ]
 _lib.qihse_vector_db_add_vectors.restype = ctypes.c_bool
 
+_lib.qihse_auth_init.argtypes = []
+_lib.qihse_auth_init.restype = None
+_lib.qihse_auth_get_user.argtypes = [ctypes.c_uint32]
+_lib.qihse_auth_get_user.restype = ctypes.c_void_p
+
+# Vector search is authorization-aware. Initialize the process-local auth
+# context once and retain the pre-seeded operator for local SDK operations.
+_lib.qihse_auth_init()
+_local_sdk_user = _lib.qihse_auth_get_user(0)
+if not _local_sdk_user:
+    raise RuntimeError("QIHSE failed to initialize the local SDK auth context")
+
 class CVectorQuery(ctypes.Structure):
     _fields_ = [
         ("query_vector", ctypes.POINTER(ctypes.c_float)),
@@ -84,6 +96,7 @@ class CVectorQuery(ctypes.Structure):
         ("distance_metric", ctypes.c_int),
         ("metadata_filter", ctypes.c_void_p),
         ("metadata_filter_opaque", ctypes.c_void_p),
+        ("user", ctypes.c_void_p),
     ]
 
 class CVectorResult(ctypes.Structure):
@@ -253,6 +266,7 @@ class VectorDB:
             c_query.distance_metric = metric.value
             c_query.metadata_filter = None
             c_query.metadata_filter_opaque = None
+            c_query.user = _local_sdk_user
             
             out_results = (CVectorResult * top_k)()
     
