@@ -35,10 +35,11 @@ extern "C" {
 #define QIHSE_CTR_SEC_GRAPH     0x0009u
 #define QIHSE_CTR_SEC_INT8      0x000Au
 #define QIHSE_CTR_SEC_TIER      0x000Bu
+#define QIHSE_CTR_SEC_EDGES     0x000Cu
 #define QIHSE_CTR_SEC_KEY       0x1000u
 #define QIHSE_CTR_SEC_SIGNATURE 0x1001u
 
-#define QIHSE_CTR_NUM_SECTIONS  13u
+#define QIHSE_CTR_NUM_SECTIONS  14u
 
 /* ── Layout constants ─────────────────────────────────────────────── */
 #define QIHSE_CTR_MAGIC         "QIHSEQDB"
