@@ -31,6 +31,7 @@ static inline int munmap(void *addr, size_t length) { return -1; }
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,7 +68,23 @@ static inline int munmap(void *addr, size_t length) { return -1; }
 #define QIHSE_VDB_WAL_DELETE 3u
 #define QIHSE_VDB_WAL_UPDATE 4u
 #define QIHSE_VDB_WAL_UPSERT 5u
+#define QIHSE_VDB_WAL_EDGE_ADD 6u
+#define QIHSE_VDB_WAL_EDGE_REPLACE 7u
+#define QIHSE_VDB_WAL_EDGE_REMOVE 8u
 #define QIHSE_VDB_WAL_NO_PREV UINT64_MAX
+#define QIHSE_VDB_EDGE_MAGIC "QIHSEEDG"
+#define QIHSE_VDB_EDGE_VERSION 1u
+#define QIHSE_VDB_EDGE_HEADER_SIZE 72u
+#define QIHSE_VDB_EDGE_SOURCE_SIZE 24u
+#define QIHSE_VDB_EDGE_RECORD_SIZE 40u
+
+typedef struct qihse_vdb_edge_s {
+    uint64_t from_id;
+    uint64_t to_id;
+    char edge_type[QIHSE_EDGE_TYPE_MAX + 1u];
+    void* metadata;
+    size_t metadata_size;
+} qihse_vdb_edge_t;
 #define QIHSE_VDB_MAGNITUDE_ROW_BYTES 1u
 #define QIHSE_VDB_TRINARY_NEUTRAL_TRYTE 121u
 #define QIHSE_VDB_SCALAR_CANDIDATE_MULTIPLIER 12u
@@ -273,15 +290,12 @@ struct qihse_vector_db_s {
     qihse_memory_superposition_state_t superposition_state;
 
     /* Explicit graph edge table (QQL/Graph DB) */
-    struct {
-        uint64_t from_id;
-        uint64_t to_id;
-        char edge_type[32];
-        void* metadata;
-        size_t metadata_size;
-    } * explicit_edges;
+    qihse_vdb_edge_t* explicit_edges;
     size_t explicit_edge_count;
     size_t explicit_edge_capacity;
+    bool explicit_edges_dirty;
+    pthread_mutex_t explicit_edge_mutex;
+    bool explicit_edge_mutex_initialized;
 };
 
 typedef struct qihse_vdb_wal_add_s {
@@ -372,6 +386,390 @@ static void qihse_vdb_int8_destroy(qihse_vector_db_t vdb);
 static float qihse_vdb_euclidean_distance(const float* a, const float* b, size_t n);
 static const float* qihse_hnsw_vdb_get_vector(void* ctx, uint32_t node_id);
 static const float* qihse_vdb_vector_at(qihse_vector_db_t vdb, const qihse_index_row_t* row);
+static bool qihse_vdb_id_exists(const qihse_vector_db_t vdb, uint64_t id);
+
+static int qihse_vdb_edge_compare(const void* lhs, const void* rhs) {
+    const qihse_vdb_edge_t* a = (const qihse_vdb_edge_t*)lhs;
+    const qihse_vdb_edge_t* b = (const qihse_vdb_edge_t*)rhs;
+    int type_cmp;
+    if (a->from_id < b->from_id) return -1;
+    if (a->from_id > b->from_id) return 1;
+    type_cmp = strcmp(a->edge_type, b->edge_type);
+    if (type_cmp != 0) return type_cmp;
+    if (a->to_id < b->to_id) return -1;
+    if (a->to_id > b->to_id) return 1;
+    return 0;
+}
+
+static void qihse_vdb_edge_array_free(qihse_vdb_edge_t* edges, size_t count) {
+    size_t i;
+    if (!edges) return;
+    for (i = 0u; i < count; i++) free(edges[i].metadata);
+    free(edges);
+}
+
+static bool qihse_vdb_edge_type_valid(const char* edge_type) {
+    size_t len;
+    if (!edge_type) {
+        errno = EINVAL;
+        return false;
+    }
+    len = strnlen(edge_type, QIHSE_EDGE_TYPE_MAX + 2u);
+    if (len == 0u || len > QIHSE_EDGE_TYPE_MAX) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_vdb_edge_endpoints_valid(qihse_vector_db_t vdb,
+                                            uint64_t from_id,
+                                            uint64_t to_id) {
+    if (!qihse_vdb_id_exists(vdb, from_id) || !qihse_vdb_id_exists(vdb, to_id)) {
+        errno = ENOENT;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_vdb_edge_copy(qihse_vdb_edge_t* dst,
+                                const qihse_vdb_edge_t* src) {
+    *dst = *src;
+    dst->metadata = NULL;
+    if (src->metadata_size != 0u) {
+        dst->metadata = malloc(src->metadata_size);
+        if (!dst->metadata) {
+            errno = ENOMEM;
+            return false;
+        }
+        memcpy(dst->metadata, src->metadata, src->metadata_size);
+    }
+    return true;
+}
+
+static bool qihse_vdb_edge_from_input(qihse_vdb_edge_t* dst,
+                                      const qihse_edge_input_t* src) {
+    size_t type_len;
+    if (!src || !qihse_vdb_edge_type_valid(src->edge_type) ||
+        (src->metadata_size != 0u && !src->metadata)) {
+        errno = EINVAL;
+        return false;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->from_id = src->from_id;
+    dst->to_id = src->to_id;
+    type_len = strlen(src->edge_type);
+    memcpy(dst->edge_type, src->edge_type, type_len + 1u);
+    if (src->metadata_size != 0u) {
+        dst->metadata = malloc(src->metadata_size);
+        if (!dst->metadata) {
+            errno = ENOMEM;
+            return false;
+        }
+        memcpy(dst->metadata, src->metadata, src->metadata_size);
+        dst->metadata_size = src->metadata_size;
+    }
+    return true;
+}
+
+static ssize_t qihse_vdb_edge_find(const qihse_vdb_edge_t* edges,
+                                   size_t count,
+                                   uint64_t from_id,
+                                   uint64_t to_id,
+                                   const char* edge_type) {
+    size_t i;
+    for (i = 0u; i < count; i++) {
+        if (edges[i].from_id == from_id && edges[i].to_id == to_id &&
+            strcmp(edges[i].edge_type, edge_type) == 0) return (ssize_t)i;
+    }
+    return -1;
+}
+
+static bool qihse_vdb_edge_metadata_equal(const qihse_vdb_edge_t* edge,
+                                           const void* metadata,
+                                           size_t metadata_size) {
+    return edge->metadata_size == metadata_size &&
+           (metadata_size == 0u || memcmp(edge->metadata, metadata, metadata_size) == 0);
+}
+
+static bool qihse_vdb_stage_edge_mutation(qihse_vector_db_t vdb,
+                                          uint32_t op,
+                                          const qihse_edge_input_t* inputs,
+                                          size_t input_count,
+                                          qihse_vdb_edge_t** out_edges,
+                                          size_t* out_count,
+                                          size_t* changed_count) {
+    qihse_vdb_edge_t* staged;
+    size_t capacity;
+    size_t count = vdb->explicit_edge_count;
+    size_t changed = 0u;
+    size_t i;
+
+    if (!inputs || input_count == 0u || !out_edges || !out_count) {
+        errno = EINVAL;
+        return false;
+    }
+    if (input_count > SIZE_MAX - count) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    capacity = count + input_count;
+    staged = (qihse_vdb_edge_t*)calloc(capacity ? capacity : 1u, sizeof(*staged));
+    if (!staged) {
+        errno = ENOMEM;
+        return false;
+    }
+    for (i = 0u; i < count; i++) {
+        if (!qihse_vdb_edge_copy(&staged[i], &vdb->explicit_edges[i])) goto fail;
+    }
+    for (i = 0u; i < input_count; i++) {
+        ssize_t found;
+        if (!qihse_vdb_edge_type_valid(inputs[i].edge_type) ||
+            (inputs[i].metadata_size != 0u && !inputs[i].metadata) ||
+            !qihse_vdb_edge_endpoints_valid(vdb, inputs[i].from_id, inputs[i].to_id)) {
+            goto fail;
+        }
+        found = qihse_vdb_edge_find(staged, count, inputs[i].from_id,
+                                    inputs[i].to_id, inputs[i].edge_type);
+        if (op == QIHSE_VDB_WAL_EDGE_REMOVE) {
+            if (found >= 0) {
+                free(staged[found].metadata);
+                if ((size_t)found + 1u < count) {
+                    memmove(&staged[found], &staged[found + 1u],
+                            (count - (size_t)found - 1u) * sizeof(*staged));
+                }
+                count--;
+                memset(&staged[count], 0, sizeof(*staged));
+                changed++;
+            }
+        } else if (found >= 0) {
+            if (op == QIHSE_VDB_WAL_EDGE_REPLACE &&
+                !qihse_vdb_edge_metadata_equal(&staged[found], inputs[i].metadata,
+                                                inputs[i].metadata_size)) {
+                void* replacement = NULL;
+                if (inputs[i].metadata_size != 0u) {
+                    replacement = malloc(inputs[i].metadata_size);
+                    if (!replacement) { errno = ENOMEM; goto fail; }
+                    memcpy(replacement, inputs[i].metadata, inputs[i].metadata_size);
+                }
+                free(staged[found].metadata);
+                staged[found].metadata = replacement;
+                staged[found].metadata_size = inputs[i].metadata_size;
+                changed++;
+            }
+        } else {
+            if (op == QIHSE_VDB_WAL_EDGE_REPLACE) {
+                errno = ENOENT;
+                goto fail;
+            }
+            if (!qihse_vdb_edge_from_input(&staged[count], &inputs[i])) goto fail;
+            count++;
+            changed++;
+        }
+    }
+    qsort(staged, count, sizeof(*staged), qihse_vdb_edge_compare);
+    *out_edges = staged;
+    *out_count = count;
+    if (changed_count) *changed_count = changed;
+    return true;
+fail:
+    qihse_vdb_edge_array_free(staged, count);
+    return false;
+}
+
+static bool qihse_vdb_encode_edges(qihse_vector_db_t vdb,
+                                   uint8_t** out,
+                                   size_t* out_size) {
+    size_t source_count = 0u;
+    size_t string_bytes = 0u;
+    size_t source_bytes;
+    size_t record_bytes;
+    size_t total;
+    size_t i;
+    uint8_t* data;
+    size_t data_offset;
+    size_t source_index = 0u;
+
+    if (!vdb || !out || !out_size) { errno = EINVAL; return false; }
+    *out = NULL;
+    *out_size = 0u;
+    for (i = 0u; i < vdb->explicit_edge_count; i++) {
+        if (i == 0u || vdb->explicit_edges[i].from_id != vdb->explicit_edges[i - 1u].from_id)
+            source_count++;
+        if (!qihse_checked_add_size(string_bytes, strlen(vdb->explicit_edges[i].edge_type),
+                                    &string_bytes) ||
+            !qihse_checked_add_size(string_bytes, vdb->explicit_edges[i].metadata_size,
+                                    &string_bytes)) return false;
+    }
+    if (!qihse_checked_mul_size(source_count, QIHSE_VDB_EDGE_SOURCE_SIZE, &source_bytes) ||
+        !qihse_checked_mul_size(vdb->explicit_edge_count, QIHSE_VDB_EDGE_RECORD_SIZE,
+                                &record_bytes) ||
+        !qihse_checked_add_size(QIHSE_VDB_EDGE_HEADER_SIZE, source_bytes, &total) ||
+        !qihse_checked_add_size(total, record_bytes, &total) ||
+        !qihse_checked_add_size(total, string_bytes, &total)) return false;
+    data = (uint8_t*)calloc(total ? total : 1u, 1u);
+    if (!data) { errno = ENOMEM; return false; }
+    memcpy(data, QIHSE_VDB_EDGE_MAGIC, 8u);
+    qihse_le_write_u32(data + 8u, QIHSE_VDB_EDGE_VERSION);
+    qihse_le_write_u32(data + 12u, QIHSE_VDB_EDGE_HEADER_SIZE);
+    qihse_le_write_u64(data + 16u, vdb->next_generation ? vdb->next_generation - 1u : 0u);
+    qihse_le_write_u64(data + 24u, (uint64_t)source_count);
+    qihse_le_write_u64(data + 32u, (uint64_t)vdb->explicit_edge_count);
+    qihse_le_write_u64(data + 40u, QIHSE_VDB_EDGE_HEADER_SIZE);
+    qihse_le_write_u64(data + 48u, QIHSE_VDB_EDGE_HEADER_SIZE + (uint64_t)source_bytes);
+    qihse_le_write_u64(data + 56u, QIHSE_VDB_EDGE_HEADER_SIZE + (uint64_t)source_bytes +
+                                    (uint64_t)record_bytes);
+    data_offset = QIHSE_VDB_EDGE_HEADER_SIZE + source_bytes + record_bytes;
+    for (i = 0u; i < vdb->explicit_edge_count; i++) {
+        qihse_vdb_edge_t* edge = &vdb->explicit_edges[i];
+        uint8_t* record = data + QIHSE_VDB_EDGE_HEADER_SIZE + source_bytes +
+                          i * QIHSE_VDB_EDGE_RECORD_SIZE;
+        size_t type_len = strlen(edge->edge_type);
+        if (i == 0u || edge->from_id != vdb->explicit_edges[i - 1u].from_id) {
+            size_t end = i + 1u;
+            uint8_t* source = data + QIHSE_VDB_EDGE_HEADER_SIZE +
+                              source_index * QIHSE_VDB_EDGE_SOURCE_SIZE;
+            while (end < vdb->explicit_edge_count &&
+                   vdb->explicit_edges[end].from_id == edge->from_id) end++;
+            qihse_le_write_u64(source + 0u, edge->from_id);
+            qihse_le_write_u64(source + 8u, (uint64_t)i);
+            qihse_le_write_u64(source + 16u, (uint64_t)(end - i));
+            source_index++;
+        }
+        qihse_le_write_u64(record + 0u, edge->to_id);
+        qihse_le_write_u64(record + 8u, (uint64_t)data_offset);
+        qihse_le_write_u32(record + 16u, (uint32_t)type_len);
+        qihse_le_write_u64(record + 24u, (uint64_t)(data_offset + type_len));
+        qihse_le_write_u64(record + 32u, (uint64_t)edge->metadata_size);
+        memcpy(data + data_offset, edge->edge_type, type_len);
+        data_offset += type_len;
+        if (edge->metadata_size != 0u) {
+            memcpy(data + data_offset, edge->metadata, edge->metadata_size);
+            data_offset += edge->metadata_size;
+        }
+    }
+    qihse_le_write_u64(data + 64u,
+                        qihse_fnv1a64(data + QIHSE_VDB_EDGE_HEADER_SIZE,
+                                      total - QIHSE_VDB_EDGE_HEADER_SIZE));
+    *out = data;
+    *out_size = total;
+    return true;
+}
+
+static bool qihse_vdb_load_edges(qihse_vector_db_t vdb) {
+    qihse_container_t ctr;
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    uint64_t edge_count64 = 0u;
+    uint64_t source_count64 = 0u;
+    uint64_t source_offset = 0u;
+    uint64_t record_offset = 0u;
+    uint64_t data_offset = 0u;
+    qihse_vdb_edge_t* edges = NULL;
+    size_t i;
+    uint64_t expected_first = 0u;
+    bool ok = false;
+
+    if (!vdb || !vdb->db_path) { errno = EINVAL; return false; }
+    if (!qihse_ctr_open_read(vdb->db_path, &ctr)) return false;
+    if (!qihse_ctr_find_section(&ctr, QIHSE_CTR_SEC_EDGES)) {
+        qihse_ctr_close(&ctr);
+        return true;
+    }
+    if (!qihse_ctr_read_section_alloc(&ctr, QIHSE_CTR_SEC_EDGES, &data, &size)) {
+        qihse_ctr_close(&ctr);
+        return false;
+    }
+    qihse_ctr_close(&ctr);
+    if (size < QIHSE_VDB_EDGE_HEADER_SIZE ||
+        memcmp(data, QIHSE_VDB_EDGE_MAGIC, 8u) != 0 ||
+        qihse_le_read_u32(data + 8u) != QIHSE_VDB_EDGE_VERSION ||
+        qihse_le_read_u32(data + 12u) != QIHSE_VDB_EDGE_HEADER_SIZE ||
+        qihse_fnv1a64(data + QIHSE_VDB_EDGE_HEADER_SIZE,
+                      size - QIHSE_VDB_EDGE_HEADER_SIZE) != qihse_le_read_u64(data + 64u)) {
+        errno = EINVAL;
+        goto done;
+    }
+    source_count64 = qihse_le_read_u64(data + 24u);
+    edge_count64 = qihse_le_read_u64(data + 32u);
+    source_offset = qihse_le_read_u64(data + 40u);
+    record_offset = qihse_le_read_u64(data + 48u);
+    data_offset = qihse_le_read_u64(data + 56u);
+    if (source_count64 > SIZE_MAX || edge_count64 > SIZE_MAX ||
+        source_offset != QIHSE_VDB_EDGE_HEADER_SIZE ||
+        source_count64 > (size - (size_t)source_offset) / QIHSE_VDB_EDGE_SOURCE_SIZE ||
+        record_offset != source_offset + source_count64 * QIHSE_VDB_EDGE_SOURCE_SIZE ||
+        edge_count64 > (size - (size_t)record_offset) / QIHSE_VDB_EDGE_RECORD_SIZE ||
+        data_offset != record_offset + edge_count64 * QIHSE_VDB_EDGE_RECORD_SIZE ||
+        data_offset > size) {
+        errno = EINVAL;
+        goto done;
+    }
+    edges = (qihse_vdb_edge_t*)calloc(edge_count64 ? (size_t)edge_count64 : 1u,
+                                      sizeof(*edges));
+    if (!edges) { errno = ENOMEM; goto done; }
+    for (i = 0u; i < (size_t)source_count64; i++) {
+        const uint8_t* source = data + source_offset + i * QIHSE_VDB_EDGE_SOURCE_SIZE;
+        uint64_t from_id = qihse_le_read_u64(source + 0u);
+        uint64_t first = qihse_le_read_u64(source + 8u);
+        uint64_t count = qihse_le_read_u64(source + 16u);
+        size_t j;
+        if (count == 0u || first != expected_first || first > edge_count64 ||
+            count > edge_count64 - first ||
+            (i != 0u && from_id <= qihse_le_read_u64(
+                data + source_offset + (i - 1u) * QIHSE_VDB_EDGE_SOURCE_SIZE))) {
+            errno = EINVAL;
+            goto done;
+        }
+        expected_first = first + count;
+        for (j = (size_t)first; j < (size_t)(first + count); j++) {
+            const uint8_t* record = data + record_offset + j * QIHSE_VDB_EDGE_RECORD_SIZE;
+            uint64_t type_off = qihse_le_read_u64(record + 8u);
+            uint32_t type_len = qihse_le_read_u32(record + 16u);
+            uint64_t meta_off = qihse_le_read_u64(record + 24u);
+            uint64_t meta_len = qihse_le_read_u64(record + 32u);
+            if (type_len == 0u || type_len > QIHSE_EDGE_TYPE_MAX || type_off < data_offset ||
+                type_off > size || type_len > size - type_off || meta_off < data_offset ||
+                meta_off > size || meta_len > size - meta_off || meta_len > SIZE_MAX) {
+                errno = EINVAL;
+                goto done;
+            }
+            edges[j].from_id = from_id;
+            edges[j].to_id = qihse_le_read_u64(record + 0u);
+            memcpy(edges[j].edge_type, data + type_off, type_len);
+            edges[j].edge_type[type_len] = '\0';
+            if (meta_len != 0u) {
+                edges[j].metadata = malloc((size_t)meta_len);
+                if (!edges[j].metadata) { errno = ENOMEM; goto done; }
+                memcpy(edges[j].metadata, data + meta_off, (size_t)meta_len);
+                edges[j].metadata_size = (size_t)meta_len;
+            }
+        }
+    }
+    if (expected_first != edge_count64 ||
+        ((edge_count64 == 0u) != (source_count64 == 0u))) {
+        errno = EINVAL;
+        goto done;
+    }
+    if ((size_t)edge_count64 != 0u) {
+        for (i = 0u; i < (size_t)edge_count64; i++) {
+            if (!qihse_vdb_edge_endpoints_valid(vdb, edges[i].from_id, edges[i].to_id) ||
+                (i != 0u && qihse_vdb_edge_compare(&edges[i - 1u], &edges[i]) >= 0)) {
+                errno = EINVAL;
+                goto done;
+            }
+        }
+    }
+    vdb->explicit_edges = edges;
+    vdb->explicit_edge_count = (size_t)edge_count64;
+    vdb->explicit_edge_capacity = (size_t)edge_count64;
+    edges = NULL;
+    ok = true;
+done:
+    qihse_vdb_edge_array_free(edges, (size_t)(edge_count64 > SIZE_MAX ? 0u : edge_count64));
+    free(data);
+    return ok;
+}
 
 /* ============================================================================
  * GRAPH SIDECAR PERSISTENCE
@@ -3312,6 +3710,177 @@ static bool qihse_vdb_write_wal_add(qihse_vector_db_t vdb, const qihse_vdb_wal_a
     return qihse_vdb_write_wal_vectors(vdb, QIHSE_VDB_WAL_ADD, add);
 }
 
+static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
+                                     uint32_t type,
+                                     uint64_t generation,
+                                     const qihse_edge_input_t* edges,
+                                     size_t edge_count) {
+    uint8_t* payload = NULL;
+    size_t payload_size = sizeof(uint64_t);
+    size_t offset = 0u;
+    size_t i;
+    uint8_t mut_hdr[QIHSE_VDB_WAL_HEADER_SIZE];
+    uint8_t cmt_hdr[QIHSE_VDB_WAL_HEADER_SIZE];
+    uint8_t commit_payload[16];
+    uint64_t mut_crc;
+    uint64_t cmt_crc;
+    uint64_t mut_off;
+    uint64_t cmt_off;
+    size_t total_size;
+    uint8_t* wal_buf = NULL;
+    qihse_container_t ctr;
+    bool ok;
+
+    if (!vdb || !vdb->db_path || !edges || edge_count == 0u ||
+        (type != QIHSE_VDB_WAL_EDGE_ADD && type != QIHSE_VDB_WAL_EDGE_REPLACE &&
+         type != QIHSE_VDB_WAL_EDGE_REMOVE)) {
+        errno = EINVAL;
+        return false;
+    }
+    for (i = 0u; i < edge_count; i++) {
+        size_t type_len;
+        if (!qihse_vdb_edge_type_valid(edges[i].edge_type) ||
+            (edges[i].metadata_size != 0u && !edges[i].metadata)) return false;
+        type_len = strlen(edges[i].edge_type);
+        if (!qihse_checked_add_size(payload_size, 4u * sizeof(uint64_t), &payload_size) ||
+            !qihse_checked_add_size(payload_size, type_len, &payload_size) ||
+            !qihse_checked_add_size(payload_size, edges[i].metadata_size, &payload_size))
+            return false;
+    }
+    payload = (uint8_t*)malloc(payload_size);
+    if (!payload) { errno = ENOMEM; return false; }
+    qihse_le_write_u64(payload, (uint64_t)edge_count);
+    offset = sizeof(uint64_t);
+    for (i = 0u; i < edge_count; i++) {
+        size_t type_len = strlen(edges[i].edge_type);
+        qihse_le_write_u64(payload + offset + 0u, edges[i].from_id);
+        qihse_le_write_u64(payload + offset + 8u, edges[i].to_id);
+        qihse_le_write_u64(payload + offset + 16u, (uint64_t)type_len);
+        qihse_le_write_u64(payload + offset + 24u, (uint64_t)edges[i].metadata_size);
+        offset += 4u * sizeof(uint64_t);
+        memcpy(payload + offset, edges[i].edge_type, type_len);
+        offset += type_len;
+        if (edges[i].metadata_size != 0u) {
+            memcpy(payload + offset, edges[i].metadata, edges[i].metadata_size);
+            offset += edges[i].metadata_size;
+        }
+    }
+    mut_crc = qihse_fnv1a64(payload, payload_size);
+    memset(mut_hdr, 0, sizeof(mut_hdr));
+    memcpy(mut_hdr, QIHSE_VDB_WAL_MAGIC, 8u);
+    qihse_le_write_u32(mut_hdr + 8u, QIHSE_VDB_WAL_VERSION);
+    qihse_le_write_u32(mut_hdr + 12u, type);
+    qihse_le_write_u64(mut_hdr + 16u, generation);
+    qihse_le_write_u64(mut_hdr + 24u, (uint64_t)payload_size);
+    qihse_le_write_u64(mut_hdr + 32u, mut_crc);
+    qihse_le_write_u64(mut_hdr + 40u, vdb->wal_last_record_offset);
+    mut_off = vdb->wal_bytes_pending;
+    cmt_off = mut_off + QIHSE_VDB_WAL_HEADER_SIZE + (uint64_t)payload_size;
+    qihse_le_write_u64(commit_payload + 0u, mut_off);
+    qihse_le_write_u64(commit_payload + 8u, mut_crc);
+    cmt_crc = qihse_fnv1a64(commit_payload, sizeof(commit_payload));
+    memset(cmt_hdr, 0, sizeof(cmt_hdr));
+    memcpy(cmt_hdr, QIHSE_VDB_WAL_MAGIC, 8u);
+    qihse_le_write_u32(cmt_hdr + 8u, QIHSE_VDB_WAL_VERSION);
+    qihse_le_write_u32(cmt_hdr + 12u, QIHSE_VDB_WAL_COMMIT);
+    qihse_le_write_u64(cmt_hdr + 16u, generation);
+    qihse_le_write_u64(cmt_hdr + 24u, sizeof(commit_payload));
+    qihse_le_write_u64(cmt_hdr + 32u, cmt_crc);
+    qihse_le_write_u64(cmt_hdr + 40u, mut_off);
+    if (!qihse_checked_add_size(2u * QIHSE_VDB_WAL_HEADER_SIZE, payload_size,
+                                &total_size) ||
+        !qihse_checked_add_size(total_size, sizeof(commit_payload), &total_size)) {
+        free(payload);
+        return false;
+    }
+    wal_buf = (uint8_t*)malloc(total_size);
+    if (!wal_buf) { free(payload); errno = ENOMEM; return false; }
+    offset = 0u;
+    memcpy(wal_buf + offset, mut_hdr, sizeof(mut_hdr)); offset += sizeof(mut_hdr);
+    memcpy(wal_buf + offset, payload, payload_size); offset += payload_size;
+    memcpy(wal_buf + offset, cmt_hdr, sizeof(cmt_hdr)); offset += sizeof(cmt_hdr);
+    memcpy(wal_buf + offset, commit_payload, sizeof(commit_payload));
+    free(payload);
+    ok = qihse_ctr_open_write(vdb->db_path, false, &ctr);
+    if (ok) {
+        ok = qihse_ctr_wal_append(&ctr, wal_buf, total_size) && qihse_ctr_fsync(&ctr);
+        qihse_ctr_close(&ctr);
+    }
+    free(wal_buf);
+    if (ok) {
+        vdb->wal_bytes_pending += (uint64_t)total_size;
+        vdb->wal_last_record_offset = cmt_off;
+    }
+    return ok;
+}
+
+static bool qihse_vdb_apply_edge_wal_payload(qihse_vector_db_t vdb,
+                                              uint32_t type,
+                                              uint64_t generation,
+                                              const uint8_t* payload,
+                                              size_t payload_size) {
+    qihse_edge_input_t* inputs = NULL;
+    size_t count;
+    size_t offset = sizeof(uint64_t);
+    size_t i;
+    qihse_vdb_edge_t* staged = NULL;
+    size_t staged_count = 0u;
+    size_t changed = 0u;
+    bool ok = false;
+
+    if (!payload || payload_size < sizeof(uint64_t)) { errno = EINVAL; return false; }
+    if (!qihse_vdb_u64_to_size(qihse_le_read_u64(payload), &count) || count == 0u) return false;
+    inputs = (qihse_edge_input_t*)calloc(count, sizeof(*inputs));
+    if (!inputs) { errno = ENOMEM; return false; }
+    for (i = 0u; i < count; i++) {
+        uint64_t type_len64;
+        uint64_t meta_len64;
+        size_t type_len;
+        size_t meta_len;
+        char* type_copy;
+        if (payload_size - offset < 4u * sizeof(uint64_t)) { errno = EINVAL; goto done; }
+        inputs[i].from_id = qihse_le_read_u64(payload + offset + 0u);
+        inputs[i].to_id = qihse_le_read_u64(payload + offset + 8u);
+        type_len64 = qihse_le_read_u64(payload + offset + 16u);
+        meta_len64 = qihse_le_read_u64(payload + offset + 24u);
+        offset += 4u * sizeof(uint64_t);
+        if (!qihse_vdb_u64_to_size(type_len64, &type_len) ||
+            !qihse_vdb_u64_to_size(meta_len64, &meta_len) ||
+            type_len == 0u || type_len > QIHSE_EDGE_TYPE_MAX ||
+            type_len > payload_size - offset) { errno = EINVAL; goto done; }
+        type_copy = (char*)malloc(type_len + 1u);
+        if (!type_copy) { errno = ENOMEM; goto done; }
+        memcpy(type_copy, payload + offset, type_len);
+        type_copy[type_len] = '\0';
+        inputs[i].edge_type = type_copy;
+        offset += type_len;
+        if (meta_len > payload_size - offset) { errno = EINVAL; goto done; }
+        inputs[i].metadata = meta_len ? payload + offset : NULL;
+        inputs[i].metadata_size = meta_len;
+        offset += meta_len;
+    }
+    if (offset != payload_size ||
+        !qihse_vdb_stage_edge_mutation(vdb, type, inputs, count,
+                                       &staged, &staged_count, &changed)) goto done;
+    qihse_vdb_edge_array_free(vdb->explicit_edges, vdb->explicit_edge_count);
+    vdb->explicit_edges = staged;
+    vdb->explicit_edge_count = staged_count;
+    vdb->explicit_edge_capacity = staged_count;
+    vdb->explicit_edges_dirty = changed != 0u;
+    staged = NULL;
+    if (generation >= vdb->next_generation) vdb->next_generation = generation + 1u;
+    if (changed != 0u) vdb->dirty = true;
+    vdb->wal_records_replayed++;
+    ok = true;
+done:
+    if (inputs) {
+        for (i = 0u; i < count; i++) free((void*)inputs[i].edge_type);
+    }
+    free(inputs);
+    qihse_vdb_edge_array_free(staged, staged_count);
+    return ok;
+}
+
 static bool qihse_vdb_apply_delete_payload(qihse_vector_db_t vdb,
                                            const qihse_vdb_wal_vectors_t* record) {
     size_t deleted = 0u;
@@ -3459,6 +4028,12 @@ static bool qihse_vdb_replay_wal_payload(qihse_vector_db_t vdb,
     size_t calc_vector_bytes;
     size_t metadata_total = 0u;
     bool ok = false;
+
+    if (type == QIHSE_VDB_WAL_EDGE_ADD || type == QIHSE_VDB_WAL_EDGE_REPLACE ||
+        type == QIHSE_VDB_WAL_EDGE_REMOVE) {
+        return qihse_vdb_apply_edge_wal_payload(vdb, type, generation,
+                                                 payload, payload_size);
+    }
 
     if (!payload || payload_size < 32u) {
         errno = EINVAL;
@@ -3621,7 +4196,9 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
             if (version != QIHSE_VDB_WAL_VERSION ||
                 (type != QIHSE_VDB_WAL_ADD && type != QIHSE_VDB_WAL_COMMIT &&
                  type != QIHSE_VDB_WAL_DELETE && type != QIHSE_VDB_WAL_UPDATE &&
-                 type != QIHSE_VDB_WAL_UPSERT) ||
+                 type != QIHSE_VDB_WAL_UPSERT && type != QIHSE_VDB_WAL_EDGE_ADD &&
+                 type != QIHSE_VDB_WAL_EDGE_REPLACE &&
+                 type != QIHSE_VDB_WAL_EDGE_REMOVE) ||
                 payload_size64 > (uint64_t)SIZE_MAX ||
                 (record_start != 0u && prev_offset_val != last_record_offset) ||
                 (record_start == 0u && prev_offset_val != QIHSE_VDB_WAL_NO_PREV &&
@@ -3970,6 +4547,12 @@ qihse_vector_db_t qihse_vector_db_open(
     vdb->wal_last_record_offset = QIHSE_VDB_WAL_NO_PREV;
     vdb->trinary_status = QIHSE_VDB_TRINARY_ABSENT;
     vdb->magnitude_status = QIHSE_VDB_MAGNITUDE_ABSENT;
+    if (pthread_mutex_init(&vdb->explicit_edge_mutex, NULL) != 0) {
+        free(vdb);
+        errno = ENOMEM;
+        return NULL;
+    }
+    vdb->explicit_edge_mutex_initialized = true;
 
     /* Hierarchical storage defaults */
     vdb->memory_hot_threshold = 100.0;     /* 100 accesses per evaluation window = hot */
@@ -4015,6 +4598,10 @@ qihse_vector_db_t qihse_vector_db_open(
                     return NULL;
                 }
                 loaded = true;
+                if (!qihse_vdb_load_edges(vdb)) {
+                    qihse_vector_db_destroy(vdb);
+                    return NULL;
+                }
             } else if (!create && !has_wal) {
                 printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
                 qihse_vector_db_destroy(vdb);
@@ -4302,6 +4889,19 @@ bool qihse_vector_db_delete_by_ids(
         }
         return false;
     }
+    pthread_mutex_lock(&vdb->explicit_edge_mutex);
+    for (i = 0u; i < vdb->explicit_edge_count; i++) {
+        size_t id_index;
+        for (id_index = 0u; id_index < count; id_index++) {
+            if (vdb->explicit_edges[i].from_id == vector_ids[id_index] ||
+                vdb->explicit_edges[i].to_id == vector_ids[id_index]) {
+                pthread_mutex_unlock(&vdb->explicit_edge_mutex);
+                errno = EBUSY;
+                return false;
+            }
+        }
+    }
+    pthread_mutex_unlock(&vdb->explicit_edge_mutex);
     for (i = 0u; i < count; i++) {
         size_t row_index = 0u;
         bool found;
@@ -5972,8 +6572,11 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
     qihse_vector_store_flush_t flush;
     uint8_t* trinary = NULL;
     uint8_t* magnitude = NULL;
+    uint8_t* explicit_edges = NULL;
     size_t trinary_bytes = 0u;
     size_t magnitude_bytes = 0u;
+    size_t explicit_edges_bytes = 0u;
+    uint64_t explicit_edge_generation;
     bool ok;
 
     if (!vdb) {
@@ -6000,6 +6603,15 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
             return false;
         }
     }
+    pthread_mutex_lock(&vdb->explicit_edge_mutex);
+    explicit_edge_generation = vdb->next_generation ? vdb->next_generation - 1u : 0u;
+    ok = qihse_vdb_encode_edges(vdb, &explicit_edges, &explicit_edges_bytes);
+    pthread_mutex_unlock(&vdb->explicit_edge_mutex);
+    if (!ok) {
+        free(trinary);
+        free(magnitude);
+        return false;
+    }
     memset(&flush, 0, sizeof(flush));
     flush.vector_dims = (uint32_t)vdb->vector_dims;
     flush.commit_generation = vdb->next_generation ? vdb->next_generation - 1u : 0u;
@@ -6021,6 +6633,8 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
     flush.magnitude_generation = flush.commit_generation;
     flush.magnitude_row_bytes = vdb->magnitude_row_bytes;
     flush.magnitude_flags = QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID;
+    flush.explicit_edges = explicit_edges;
+    flush.explicit_edges_bytes = explicit_edges_bytes;
 
     ok = qihse_vector_store_flush(vdb->db_path, &flush);
     if (ok) {
@@ -6040,6 +6654,14 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
         vdb->idmap_dirty = false;
         qihse_vdb_tier_save(vdb);
         vdb->idmap_valid = true;
+        pthread_mutex_lock(&vdb->explicit_edge_mutex);
+        if ((vdb->next_generation ? vdb->next_generation - 1u : 0u) ==
+            explicit_edge_generation) {
+            vdb->explicit_edges_dirty = false;
+        } else {
+            vdb->dirty = true;
+        }
+        pthread_mutex_unlock(&vdb->explicit_edge_mutex);
         if (trinary_bytes != 0u) {
             qihse_vdb_clear_trinary_cache(vdb);
             vdb->trinary = trinary;
@@ -6063,6 +6685,7 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
     }
     free(trinary);
     free(magnitude);
+    free(explicit_edges);
     return ok;
 }
 
@@ -6522,11 +7145,9 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     qihse_vdb_sparse_index_destroy(vdb->sparse_index);
     vdb->sparse_index = NULL;
     /* Free explicit graph edge table */
-    if (vdb->explicit_edges) {
-        for (size_t i = 0; i < vdb->explicit_edge_count; i++) {
-            free(vdb->explicit_edges[i].metadata);
-        }
-        free(vdb->explicit_edges);
+    qihse_vdb_edge_array_free(vdb->explicit_edges, vdb->explicit_edge_count);
+    if (vdb->explicit_edge_mutex_initialized) {
+        pthread_mutex_destroy(&vdb->explicit_edge_mutex);
     }
     free(vdb);
 }
@@ -6752,38 +7373,130 @@ bool qihse_vector_db_add_edge(
     const void* metadata,
     size_t metadata_size
 ) {
-    if (!vdb || !edge_type) return false;
+    qihse_edge_input_t edge;
+    edge.from_id = from_id;
+    edge.to_id = to_id;
+    edge.edge_type = edge_type;
+    edge.metadata = metadata;
+    edge.metadata_size = metadata_size;
+    return qihse_vector_db_add_edges(vdb, &edge, 1u, NULL);
+}
 
-    /* Grow edge table if needed */
-    if (vdb->explicit_edge_count >= vdb->explicit_edge_capacity) {
-        size_t new_cap = vdb->explicit_edge_capacity == 0 ? 64 : vdb->explicit_edge_capacity * 2;
-        void* new_edges = realloc(vdb->explicit_edges, new_cap * sizeof(*vdb->explicit_edges));
-        if (!new_edges) return false;
-        vdb->explicit_edges = new_edges;
-        vdb->explicit_edge_capacity = new_cap;
+static bool qihse_vdb_mutate_edges(qihse_vector_db_t vdb,
+                                   uint32_t op,
+                                   const qihse_edge_input_t* edges,
+                                   size_t edge_count,
+                                   size_t* changed_count) {
+    qihse_vdb_edge_t* staged = NULL;
+    size_t staged_count = 0u;
+    size_t changed = 0u;
+    uint64_t generation;
+    bool ok = false;
+
+    if (changed_count) *changed_count = 0u;
+    if (!qihse_vdb_ensure_writable(vdb) || !edges || edge_count == 0u) {
+        if (edges == NULL || edge_count == 0u) errno = EINVAL;
+        return false;
     }
-
-    /* Store the edge */
-    size_t idx = vdb->explicit_edge_count;
-    vdb->explicit_edges[idx].from_id = from_id;
-    vdb->explicit_edges[idx].to_id = to_id;
-    strncpy(vdb->explicit_edges[idx].edge_type, edge_type, sizeof(vdb->explicit_edges[idx].edge_type) - 1);
-    vdb->explicit_edges[idx].edge_type[sizeof(vdb->explicit_edges[idx].edge_type) - 1] = '\0';
-
-    /* Copy metadata if provided */
-    if (metadata && metadata_size > 0) {
-        vdb->explicit_edges[idx].metadata = malloc(metadata_size);
-        if (!vdb->explicit_edges[idx].metadata) return false;
-        memcpy(vdb->explicit_edges[idx].metadata, metadata, metadata_size);
-        vdb->explicit_edges[idx].metadata_size = metadata_size;
-    } else {
-        vdb->explicit_edges[idx].metadata = NULL;
-        vdb->explicit_edges[idx].metadata_size = 0;
+    pthread_mutex_lock(&vdb->explicit_edge_mutex);
+    if (!qihse_vdb_stage_edge_mutation(vdb, op, edges, edge_count,
+                                       &staged, &staged_count, &changed)) goto done;
+    if (changed == 0u) {
+        ok = true;
+        goto done;
     }
-
-    vdb->explicit_edge_count++;
+    generation = vdb->next_generation;
+    if (vdb->file_backed &&
+        !qihse_vdb_write_edge_wal(vdb, op, generation, edges, edge_count)) goto done;
+    qihse_vdb_edge_array_free(vdb->explicit_edges, vdb->explicit_edge_count);
+    vdb->explicit_edges = staged;
+    vdb->explicit_edge_count = staged_count;
+    vdb->explicit_edge_capacity = staged_count;
+    staged = NULL;
+    vdb->next_generation = generation + 1u;
     vdb->dirty = true;
-    return true;
+    vdb->explicit_edges_dirty = true;
+    if (changed_count) *changed_count = changed;
+    ok = true;
+done:
+    qihse_vdb_edge_array_free(staged, staged_count);
+    pthread_mutex_unlock(&vdb->explicit_edge_mutex);
+    return ok;
+}
+
+bool qihse_vector_db_add_edges(qihse_vector_db_t vdb,
+                               const qihse_edge_input_t* edges,
+                               size_t edge_count,
+                               size_t* changed_count) {
+    return qihse_vdb_mutate_edges(vdb, QIHSE_VDB_WAL_EDGE_ADD, edges,
+                                  edge_count, changed_count);
+}
+
+bool qihse_vector_db_replace_edge(qihse_vector_db_t vdb,
+                                  uint64_t from_id,
+                                  uint64_t to_id,
+                                  const char* edge_type,
+                                  const void* metadata,
+                                  size_t metadata_size) {
+    qihse_edge_input_t edge;
+    edge.from_id = from_id;
+    edge.to_id = to_id;
+    edge.edge_type = edge_type;
+    edge.metadata = metadata;
+    edge.metadata_size = metadata_size;
+    return qihse_vdb_mutate_edges(vdb, QIHSE_VDB_WAL_EDGE_REPLACE, &edge, 1u, NULL);
+}
+
+bool qihse_vector_db_remove_edge(qihse_vector_db_t vdb,
+                                 uint64_t from_id,
+                                 uint64_t to_id,
+                                 const char* edge_type) {
+    qihse_edge_input_t edge;
+    edge.from_id = from_id;
+    edge.to_id = to_id;
+    edge.edge_type = edge_type;
+    edge.metadata = NULL;
+    edge.metadata_size = 0u;
+    return qihse_vdb_mutate_edges(vdb, QIHSE_VDB_WAL_EDGE_REMOVE, &edge, 1u, NULL);
+}
+
+static bool qihse_vdb_edge_matches(const qihse_vdb_edge_t* edge,
+                                   uint64_t node_id,
+                                   const char* edge_type,
+                                   qihse_edge_direction_t direction) {
+    bool direction_match =
+        (direction == QIHSE_EDGE_OUTGOING && edge->from_id == node_id) ||
+        (direction == QIHSE_EDGE_INCOMING && edge->to_id == node_id) ||
+        (direction == QIHSE_EDGE_BOTH &&
+         (edge->from_id == node_id || edge->to_id == node_id));
+    return direction_match && (!edge_type || strcmp(edge->edge_type, edge_type) == 0);
+}
+
+int qihse_vector_db_get_typed_neighbors(qihse_vector_db_t vdb,
+                                        uint64_t node_id,
+                                        const char* edge_type,
+                                        qihse_edge_direction_t direction,
+                                        uint64_t* out_ids,
+                                        size_t max_edges) {
+    size_t found = 0u;
+    size_t i;
+    if (!vdb || !out_ids || max_edges == 0u ||
+        direction < QIHSE_EDGE_OUTGOING || direction > QIHSE_EDGE_BOTH ||
+        (edge_type && !qihse_vdb_edge_type_valid(edge_type))) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!qihse_vdb_id_exists(vdb, node_id)) { errno = ENOENT; return -1; }
+    pthread_mutex_lock(&vdb->explicit_edge_mutex);
+    for (i = 0u; i < vdb->explicit_edge_count && found < max_edges; i++) {
+        qihse_vdb_edge_t* edge = &vdb->explicit_edges[i];
+        if (!qihse_vdb_edge_matches(edge, node_id, edge_type, direction)) continue;
+        out_ids[found++] = direction == QIHSE_EDGE_INCOMING ? edge->from_id :
+                           (direction == QIHSE_EDGE_BOTH && edge->to_id == node_id ?
+                            edge->from_id : edge->to_id);
+    }
+    pthread_mutex_unlock(&vdb->explicit_edge_mutex);
+    return (int)found;
 }
 
 int qihse_vector_db_get_edges(
@@ -6793,15 +7506,59 @@ int qihse_vector_db_get_edges(
     uint64_t* out_ids,
     size_t max_edges
 ) {
-    if (!vdb || !out_ids || max_edges == 0) return -1;
+    return qihse_vector_db_get_typed_neighbors(vdb, from_id, edge_type,
+                                                QIHSE_EDGE_OUTGOING,
+                                                out_ids, max_edges);
+}
 
-    size_t found = 0;
-    for (size_t i = 0; i < vdb->explicit_edge_count && found < max_edges; i++) {
-        if (vdb->explicit_edges[i].from_id != from_id) continue;
-        if (edge_type && strcmp(vdb->explicit_edges[i].edge_type, edge_type) != 0) continue;
-        out_ids[found++] = vdb->explicit_edges[i].to_id;
+int qihse_vector_db_get_edge_records(qihse_vector_db_t vdb,
+                                     uint64_t node_id,
+                                     const char* edge_type,
+                                     qihse_edge_direction_t direction,
+                                     qihse_edge_result_t* results,
+                                     size_t max_edges) {
+    size_t found = 0u;
+    size_t i;
+    if (!vdb || !results || max_edges == 0u ||
+        direction < QIHSE_EDGE_OUTGOING || direction > QIHSE_EDGE_BOTH ||
+        (edge_type && !qihse_vdb_edge_type_valid(edge_type))) {
+        errno = EINVAL;
+        return -1;
     }
+    if (!qihse_vdb_id_exists(vdb, node_id)) { errno = ENOENT; return -1; }
+    memset(results, 0, max_edges * sizeof(*results));
+    pthread_mutex_lock(&vdb->explicit_edge_mutex);
+    for (i = 0u; i < vdb->explicit_edge_count && found < max_edges; i++) {
+        qihse_vdb_edge_t* edge = &vdb->explicit_edges[i];
+        if (!qihse_vdb_edge_matches(edge, node_id, edge_type, direction)) continue;
+        results[found].from_id = edge->from_id;
+        results[found].to_id = edge->to_id;
+        memcpy(results[found].edge_type, edge->edge_type, sizeof(edge->edge_type));
+        if (edge->metadata_size != 0u) {
+            results[found].metadata = malloc(edge->metadata_size);
+            if (!results[found].metadata) {
+                pthread_mutex_unlock(&vdb->explicit_edge_mutex);
+                qihse_vector_db_free_edge_records(results, found);
+                errno = ENOMEM;
+                return -1;
+            }
+            memcpy(results[found].metadata, edge->metadata, edge->metadata_size);
+            results[found].metadata_size = edge->metadata_size;
+        }
+        found++;
+    }
+    pthread_mutex_unlock(&vdb->explicit_edge_mutex);
     return (int)found;
+}
+
+void qihse_vector_db_free_edge_records(qihse_edge_result_t* results, size_t count) {
+    size_t i;
+    if (!results) return;
+    for (i = 0u; i < count; i++) {
+        free(results[i].metadata);
+        results[i].metadata = NULL;
+        results[i].metadata_size = 0u;
+    }
 }
 
 /* ============================================================================

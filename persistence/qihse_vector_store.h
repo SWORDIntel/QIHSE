@@ -120,6 +120,8 @@ typedef struct qihse_vector_store_flush_s {
     uint64_t magnitude_generation;
     uint64_t magnitude_row_bytes;
     uint32_t magnitude_flags;
+    const void* explicit_edges;
+    size_t explicit_edges_bytes;
 } qihse_vector_store_flush_t;
 
 bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t* out);

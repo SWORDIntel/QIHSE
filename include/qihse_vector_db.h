@@ -532,6 +532,9 @@ bool qihse_vector_db_add_model_weights(
  *
  * @param vdb Vector database handle
  * @param vector_id External vector ID to delete
+ * Deletion fails with EBUSY while explicit edges reference the vector; remove
+ * those relationships first so every persisted edge retains valid endpoints.
+ *
  * @return true if a live vector was deleted, false on failure or missing ID
  */
 bool qihse_vector_db_delete_by_id(
@@ -721,6 +724,30 @@ bool qihse_vector_db_search_batch(
  * EXPLICIT GRAPH EDGE MANAGEMENT (QQL/Graph DB)
  * ============================================================================ */
 
+#define QIHSE_EDGE_TYPE_MAX 31u
+
+typedef enum qihse_edge_direction_e {
+    QIHSE_EDGE_OUTGOING = 0,
+    QIHSE_EDGE_INCOMING = 1,
+    QIHSE_EDGE_BOTH = 2
+} qihse_edge_direction_t;
+
+typedef struct qihse_edge_input_s {
+    uint64_t from_id;
+    uint64_t to_id;
+    const char* edge_type;
+    const void* metadata;
+    size_t metadata_size;
+} qihse_edge_input_t;
+
+typedef struct qihse_edge_result_s {
+    uint64_t from_id;
+    uint64_t to_id;
+    char edge_type[QIHSE_EDGE_TYPE_MAX + 1u];
+    void* metadata;
+    size_t metadata_size;
+} qihse_edge_result_t;
+
 /**
  * Add an explicit edge between two vector nodes.
  *
@@ -758,6 +785,55 @@ int qihse_vector_db_get_edges(
     uint64_t* out_ids,
     size_t max_edges
 );
+
+/** Add or idempotently retain a batch of typed edges. */
+bool qihse_vector_db_add_edges(
+    qihse_vector_db_t vdb,
+    const qihse_edge_input_t* edges,
+    size_t edge_count,
+    size_t* changed_count
+);
+
+/** Replace metadata on an existing typed edge. */
+bool qihse_vector_db_replace_edge(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    uint64_t to_id,
+    const char* edge_type,
+    const void* metadata,
+    size_t metadata_size
+);
+
+/** Remove an existing typed edge. Missing edges are idempotent success. */
+bool qihse_vector_db_remove_edge(
+    qihse_vector_db_t vdb,
+    uint64_t from_id,
+    uint64_t to_id,
+    const char* edge_type
+);
+
+/** Retrieve typed neighbors in the requested direction. */
+int qihse_vector_db_get_typed_neighbors(
+    qihse_vector_db_t vdb,
+    uint64_t node_id,
+    const char* edge_type,
+    qihse_edge_direction_t direction,
+    uint64_t* out_ids,
+    size_t max_edges
+);
+
+/** Retrieve edge records including owned metadata copies. */
+int qihse_vector_db_get_edge_records(
+    qihse_vector_db_t vdb,
+    uint64_t node_id,
+    const char* edge_type,
+    qihse_edge_direction_t direction,
+    qihse_edge_result_t* results,
+    size_t max_edges
+);
+
+/** Release metadata allocated by qihse_vector_db_get_edge_records. */
+void qihse_vector_db_free_edge_records(qihse_edge_result_t* results, size_t count);
 
 /* ============================================================================
  * EMBEDDED QUERY EXECUTION (QQL & SQL)
