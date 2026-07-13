@@ -16,6 +16,10 @@
 /.DS_Store
 /__pycache__/
 
+# Python bytecode and interpreter caches
+**/__pycache__/
+*.py[cod]
+
 # CNSA 2.0 PQC key material (generate with scripts/qihse_keygen.sh)
 /qihse_kem_key.pem
 /qihse_kem_pub.pem
