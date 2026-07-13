@@ -819,7 +819,8 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         (!in->metadata && in->metadata_bytes != 0u) ||
         (!in->idmap && in->idmap_count != 0u) ||
         (!in->trinary && in->trinary_bytes != 0u) ||
-        (!in->magnitude && in->magnitude_bytes != 0u)) {
+        (!in->magnitude && in->magnitude_bytes != 0u) ||
+        (!in->explicit_edges && in->explicit_edges_bytes != 0u)) {
         errno = EINVAL;
         return false;
     }
@@ -909,7 +910,7 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
     {
         /* Build the section buffer list for the atomic container flush.
          * Order: MANIFEST last so a partial write can be detected on reopen. */
-        qihse_ctr_section_buf_t bufs[8];
+        qihse_ctr_section_buf_t bufs[9];
         size_t nb = 0u;
         bufs[nb].section_id = QIHSE_CTR_SEC_VECTORS;
         bufs[nb].data       = in->vectors;
@@ -939,6 +940,10 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
             bufs[nb].size       = in->magnitude_bytes;
             nb++;
         }
+        bufs[nb].section_id = QIHSE_CTR_SEC_EDGES;
+        bufs[nb].data       = in->explicit_edges;
+        bufs[nb].size       = in->explicit_edges_bytes;
+        nb++;
         bufs[nb].section_id = QIHSE_CTR_SEC_MANIFEST;
         bufs[nb].data       = manifest_data;
         bufs[nb].size       = sizeof(manifest_data);
