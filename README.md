@@ -172,6 +172,21 @@ make test
 make bench-micro
 ```
 
+The repository also includes a unified Linux launcher for the common build,
+status, test, benchmark, database, and SDK workflows:
+
+```bash
+./qihse status
+./qihse build
+./qihse test
+./qihse db --help
+./qihse python
+```
+
+Run `./qihse --help` for the complete command list. The launcher delegates to
+the existing Make targets and scripts; it does not install a daemon or modify
+system configuration.
+
 ### Minimal C Example
 
 ```c

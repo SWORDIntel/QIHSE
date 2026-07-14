@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# QIHSE Launcher — Unified entry point for the QIHSE vector engine
+# Usage: ./qihse [command] [args...]
+#   ./qihse              — Show status (default)
+#   ./qihse build        — Build libqihse.so (auto-detect SIMD)
+#   ./qihse build-ctypes — Build ctypes-only variant (no Python extension)
+#   ./qihse build-native — Build via build-native.sh (full SIMD auto-detect)
+#   ./qihse build-tui    — Interactive build configuration TUI
+#   ./qihse test         — Run full test suite
+#   ./qihse bench        — Run benchmark suite
+#   ./qihse db           — QIHSE vector DB CLI
+#   ./qihse server       — Build and run the test server
+#   ./qihse keygen       — Build and run PQC key generator
+#   ./qihse demo         — Run Python SDK demo
+#   ./qihse python       — Start Python REPL with qihse importable
+#   ./qihse bootstrap    — Initialize workspace dirs
+#   ./qihse clean        — Remove build artifacts
+#   ./qihse pristine     — Deep clean (build + data + results)
+#   ./qihse isa-info     — Show CPU ISA detection and build flags
+#   ./qihse check        — Run upstream workflow checks
+#   ./qihse dev-setup    — Check required toolchain
+#   ./qihse version      — Show library version and build info
+#   ./qihse status       — Show build status, library info, and availability
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ $# -eq 0 ]]; then
+  set -- status
+fi
+exec python3 "${SCRIPT_DIR}/qihse_launcher.py" "$@"

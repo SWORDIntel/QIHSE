@@ -1,6 +1,7 @@
 # Root-level build artifacts and binaries
 /*.so
 /qihse-server
+/qihse_keygen
 /test_mldsa
 /fuzzer
 
@@ -11,10 +12,13 @@
 # Root-level cache, logs, and temp files
 /qihse_qmag_telemetry.log
 /wal.log
+/wal.log.old
 /qihse_audit.log
 /qihse_integrity.chain
 /.DS_Store
 /__pycache__/
+**/__pycache__/
+*.py[cod]
 
 # CNSA 2.0 PQC key material (generate with scripts/qihse_keygen.sh)
 /qihse_kem_key.pem
