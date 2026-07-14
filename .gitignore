@@ -20,6 +20,12 @@
 **/__pycache__/
 *.py[cod]
 
+# Local agent indexes, memory, and personal integration state
+/.devin/
+/.learn/
+/.qlearn/
+/memory-bank/
+
 # CNSA 2.0 PQC key material (generate with scripts/qihse_keygen.sh)
 /qihse_kem_key.pem
 /qihse_kem_pub.pem
