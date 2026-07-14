@@ -97,18 +97,6 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     fclose(f);
 }
 
-static void qihse_kv_seed_honeypot_bait(qihse_kv_store_t* store) {
-    if (!store) return;
-    
-    for (int i = 0; i < 256; i++) {
-        char bait_key[64];
-        char bait_val[128];
-        snprintf(bait_key, sizeof(bait_key), "_qdd_bait_%04d", i);
-        snprintf(bait_val, sizeof(bait_val), "CLASSIFIED_DECOY_DATA_%d", i);
-        qihse_kv_set(store, bait_key, bait_val, 3, 0xFF);
-    }
-}
-
 qihse_kv_store_t* qihse_kv_store_create() {
     qihse_kv_store_t* store = (qihse_kv_store_t*)malloc(sizeof(qihse_kv_store_t));
     if (!store) return NULL;
@@ -142,9 +130,6 @@ qihse_kv_store_t* qihse_kv_store_create() {
     
     // Recover WAL
     recover_from_wal(store);
-    
-    // Seed honeypot bait keys for quantum defense
-    qihse_kv_seed_honeypot_bait(store);
     
     // Rotate WAL — start fresh, archive old log for debugging
     rename(WAL_PATH, QIHSE_DATA_DIR "wal.log.old");
@@ -267,32 +252,16 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
     qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    bool user_authorized = true;
     
     if (val) {
         // Find auth info in memory
         for (size_t i = 0; i < store->num_keys; i++) {
             if (strcmp(store->keys[i].key, key) == 0) {
                 if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                    user_authorized = false;
                     val = NULL; // Masked: pretend it doesn't exist in MemTable
                 }
                 break;
             }
-        }
-    }
-    
-    if (user_authorized && val) {
-        qihse_qdd_response_tier_t tier = qihse_qdd_get_response_tier(store->qdd_ctx);
-        
-        if (tier == QIHSE_QDD_RESPONSE_THROTTLE) {
-            usleep(100000);
-        } else if (tier == QIHSE_QDD_RESPONSE_HONEYPOT) {
-            static char honeypot_buf[128];
-            qihse_qdd_generate_honeypot_response(honeypot_buf, sizeof(honeypot_buf));
-            return strdup(honeypot_buf);
-        } else if (tier == QIHSE_QDD_RESPONSE_ACTIVE) {
-            return NULL;
         }
     }
     
