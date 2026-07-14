@@ -10,25 +10,24 @@ QIHSE_CFLAGS_EXTRA?=
 # ---------------------------------------------------------------------------
 # CPU ISA feature flags
 # ---------------------------------------------------------------------------
-# Each flag defaults to auto-detect via compiler probe at make time.
+# Each flag defaults to auto-detect from the build host's advertised CPU flags.
 # Override on the command line or environment, e.g.:
 #   make QIHSE_ENABLE_AVX2=1 QIHSE_ENABLE_AVX512=0 QIHSE_ENABLE_AMX=0
 #
-# Hosts without a feature MUST set it to 0; the build will not crash but the
-# corresponding sources/flags are simply omitted.
+# Cross-builds may override each flag explicitly on the make command line.
 #
 # R320/E5-2450 v2: AVX only – AVX2, FMA, AVX-512, VNNI, AMX all absent.
 # Sapphire Rapids+: all features available.
 
-# ---- probe helpers ---------------------------------------------------------
-# Returns "1" if the compiler can assemble the given flag, "0" otherwise.
-cc_supports = $(shell echo 'int x;' | $(CC) $(1) -x c - -c -o /dev/null 2>/dev/null && echo 1 || echo 0)
+# ---- host feature helpers --------------------------------------------------
+HOST_CPU_FLAGS ?= $(shell awk -F: '/^flags/{sub(/^ /, "", $$2); print $$2; exit}' /proc/cpuinfo 2>/dev/null)
+cpu_has = $(if $(filter $(1),$(HOST_CPU_FLAGS)),1,0)
 
 # ---- per-ISA defaults (auto-detect unless already set in env/CLI) ----------
-QIHSE_ENABLE_AVX2     ?= $(call cc_supports,-mavx2)
-QIHSE_ENABLE_AVX512   ?= $(call cc_supports,-mavx512f)
-QIHSE_ENABLE_AVX_VNNI ?= $(call cc_supports,-mavxvnni)
-QIHSE_ENABLE_AMX      ?= $(call cc_supports,-mamx-tile)
+QIHSE_ENABLE_AVX2     ?= $(call cpu_has,avx2)
+QIHSE_ENABLE_AVX512   ?= $(if $(and $(filter avx512f,$(HOST_CPU_FLAGS)),$(filter avx512dq,$(HOST_CPU_FLAGS)),$(filter avx512bw,$(HOST_CPU_FLAGS)),$(filter avx512vl,$(HOST_CPU_FLAGS))),1,0)
+QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has,avx_vnni)
+QIHSE_ENABLE_AMX      ?= $(if $(and $(filter amx_tile,$(HOST_CPU_FLAGS)),$(filter amx_int8,$(HOST_CPU_FLAGS)),$(filter amx_bf16,$(HOST_CPU_FLAGS))),1,0)
 
 # ---------------------------------------------------------------------------
 # Security & Audit Configuration

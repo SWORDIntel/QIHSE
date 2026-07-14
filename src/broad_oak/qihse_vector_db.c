@@ -4524,13 +4524,11 @@ qihse_vector_db_t qihse_vector_db_open(
     bool loaded = false;
 
     if (use_mmap && !read_only) {
-        printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
         errno = EINVAL;
         return NULL;
     }
     vdb = (qihse_vector_db_t)calloc(1u, sizeof(*vdb));
     if (!vdb) {
-        printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
         errno = ENOMEM;
         return NULL;
     }
@@ -4593,7 +4591,6 @@ qihse_vector_db_t qihse_vector_db_open(
             }
             if (has_manifest) {
                 if (!qihse_vdb_load_snapshot(vdb, use_mmap)) {
-                    printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
                     qihse_vector_db_destroy(vdb);
                     return NULL;
                 }
@@ -4603,26 +4600,22 @@ qihse_vector_db_t qihse_vector_db_open(
                     return NULL;
                 }
             } else if (!create && !has_wal) {
-                printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
                 qihse_vector_db_destroy(vdb);
                 errno = ENOENT;
                 return NULL;
             }
             if (use_mmap && has_wal) {
-                printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
                 qihse_vector_db_destroy(vdb);
                 errno = ENOTSUP;
                 return NULL;
             }
         }
         if (!qihse_vdb_replay_wal(vdb)) {
-            printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
             qihse_vector_db_destroy(vdb);
             return NULL;
         }
         if (vdb->wal_records_replayed != 0u) {
             if (!qihse_vdb_rebuild_idmap(vdb, !read_only)) {
-                printf("DEBUG: qihse_vector_db_open failed at %d\n", __LINE__);
                 qihse_vector_db_destroy(vdb);
                 return NULL;
             }
