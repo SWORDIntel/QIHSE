@@ -43,8 +43,11 @@ void qihse_system_guard_profile(void) {
     
     g_guard_initialized = true;
     
-    printf("[QIHSE System Guard] Profiled hardware on startup: %d cores, %zu MB physical RAM. DDR Bandwidth Est: %zu MB/s\n", 
-           g_cpu_cores, g_system_ram_bytes / (1024 * 1024), g_memory_bandwidth_estimate_bps / (1024 * 1024));
+    fprintf(stderr,
+            "[QIHSE System Guard] Profiled hardware on startup: %d cores, "
+            "%zu MB physical RAM. DDR Bandwidth Est: %zu MB/s\n",
+            g_cpu_cores, g_system_ram_bytes / (1024 * 1024),
+            g_memory_bandwidth_estimate_bps / (1024 * 1024));
 }
 
 bool qihse_system_guard_check_operation(size_t required_bytes, bool is_brute_force) {
