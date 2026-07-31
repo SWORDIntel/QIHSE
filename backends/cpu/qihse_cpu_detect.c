@@ -388,6 +388,8 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                             QIHSE_CPU_FEATURE_AMX |
                             QIHSE_CPU_FEATURE_AMX_TILE |
                             QIHSE_CPU_FEATURE_AMX_INT8 |
+                            QIHSE_CPU_FEATURE_AMX_BF16 |
+                            QIHSE_CPU_FEATURE_AVX512BF16 |
                             QIHSE_CPU_FEATURE_VNNI;
         info.has_osxsave = true;
         info.has_avx_support = true;
@@ -421,22 +423,26 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
             if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
             if (cpuInfo[1] & (1 << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
             if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+            /* AVX-512 BF16: leaf 7 sub-leaf 1, EAX bit 5 */
+            /* AVX-512 BF16: leaf 7 sub-leaf 1, EAX bit 5 — checked below after sub-leaf 1 read */
         }
 
-        if (cpuInfo[3] & (1 << 22)) {
+        /* AMX features: leaf 7 sub-leaf 0, EDX bits 22/24/25 */
+        if (cpuInfo[3] & (1 << 24)) {
             features |= QIHSE_CPU_FEATURE_AMX;
             features |= QIHSE_CPU_FEATURE_AMX_TILE;
         }
-        if (cpuInfo[3] & (1 << 23)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
+        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
         if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
 
         if (cpuInfo[2] & (1 << 11)) {
             features |= QIHSE_CPU_FEATURE_VNNI;
         }
 
-        /* AVX-VNNI (leaf 7, sub-leaf 1, EAX bit 4) */
+        /* Leaf 7 sub-leaf 1: AVX-VNNI (EAX bit 4) and AVX-512 BF16 (EAX bit 5) */
         __cpuidex(cpuInfo, 7, 1);
         if (cpuInfo[0] & (1 << 4)) features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+        if (cpuInfo[0] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX512BF16;
     }
 
     info.features = features;
@@ -504,6 +510,27 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         }
     }
 
+    /* CPUID fallback for AMX and AVX-512 BF16 — these may fail runtime tests
+     * if the kernel hasn't enabled XCR0 tile support, even though the CPU
+     * supports them. Use CPUID as a secondary detection path. */
+    {
+        int cpuInfo[4];
+        __asm__ volatile("cpuid" : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]),
+                         "=c"(cpuInfo[2]), "=d"(cpuInfo[3]) : "a"(7), "c"(0));
+        /* AMX BF16: EDX bit 22, AMX TILE: EDX bit 24, AMX INT8: EDX bit 25 */
+        if (cpuInfo[3] & (1 << 24)) {
+            features |= QIHSE_CPU_FEATURE_AMX;
+            features |= QIHSE_CPU_FEATURE_AMX_TILE;
+        }
+        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
+        if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
+
+        /* Leaf 7 sub-leaf 1: AVX-512 BF16 (EAX bit 5) */
+        __asm__ volatile("cpuid" : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]),
+                         "=c"(cpuInfo[2]), "=d"(cpuInfo[3]) : "a"(7), "c"(1));
+        if (cpuInfo[0] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX512BF16;
+    }
+
     info.features = features;
 #endif
     return info;
@@ -534,6 +561,7 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_VNNI: return "AVX512-VNNI";
         case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512VNNI";
         case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI";
+        case QIHSE_CPU_FEATURE_AVX512BF16: return "AVX-512BF16";
         default: return "UNKNOWN";
     }
 }
@@ -555,6 +583,7 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_VNNI: return "AVX-512 Vector Neural Network Instructions";
         case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512 VNNI (alias)";
         case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI: VEX vpdpbusd/vpdpwssd (256-bit, no AVX-512)";
+        case QIHSE_CPU_FEATURE_AVX512BF16: return "AVX-512 BFloat16 (dpbf16ps)";
         default: return "Unknown CPU feature";
     }
 }
