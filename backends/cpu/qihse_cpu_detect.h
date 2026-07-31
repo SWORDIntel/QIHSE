@@ -48,7 +48,8 @@ typedef enum qihse_cpu_feature_e {
     QIHSE_CPU_FEATURE_VNNI       = (1 << 15), /* AVX-512 VNNI (512-bit) */
     QIHSE_CPU_FEATURE_AVX512VNNI = (1 << 16), /* AVX-512 VNNI (alias) */
     QIHSE_CPU_FEATURE_AVX_VNNI   = (1 << 17), /* AVX-VNNI: VEX vpdpbusd, no AVX-512 needed */
-    QIHSE_CPU_FEATURE_AMX_BF16   = (1 << 18)  /* AMX BFloat16 tile multiply */
+    QIHSE_CPU_FEATURE_AMX_BF16   = (1 << 18), /* AMX BFloat16 tile multiply */
+    QIHSE_CPU_FEATURE_AVX512BF16 = (1 << 19)  /* AVX-512 BFloat16 (dpbf16ps) */
 } qihse_cpu_feature_t;
 
 /* ============================================================================

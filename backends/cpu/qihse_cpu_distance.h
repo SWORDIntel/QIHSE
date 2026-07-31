@@ -29,6 +29,16 @@ float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims);
 float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims);
 float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims);
 
+/* AVX-512 implementations — 16 floats per instruction, 2x unrolled for ILP */
+float qihse_distance_cosine_avx512(const float* a, const float* b, size_t dims);
+float qihse_distance_dot_avx512(const float* a, const float* b, size_t dims);
+float qihse_distance_euclidean_avx512(const float* a, const float* b, size_t dims);
+
+/* Scalar implementations for benchmarking */
+float qihse_distance_cosine_scalar(const float* a, const float* b, size_t dims);
+float qihse_distance_dot_scalar(const float* a, const float* b, size_t dims);
+float qihse_distance_euclidean_scalar(const float* a, const float* b, size_t dims);
+
 #ifdef __cplusplus
 }
 #endif

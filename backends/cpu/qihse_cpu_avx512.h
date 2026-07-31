@@ -299,6 +299,41 @@ void qihse_amx_get_tile_info(size_t* tile_count, size_t* max_tile_rows, size_t* 
  */
 bool qihse_amx_pim_supported(void);
 
+/* ============================================================================
+ * AMX BF16 GEMM — Real tile intrinsics implementation
+ * ============================================================================ */
+
+/**
+ * Execute AMX PIM GEMM using real AMX BF16 tile intrinsics.
+ * Converts float32 inputs to BF16 on-the-fly, uses _tile_dpbf16ps.
+ * Only available on Sapphire Rapids+ with AMX-BF16 support.
+ *
+ * @param gemm AMX PIM GEMM operation instance
+ * @param result Output result matrix [M*N]
+ * @return 0 on success, negative error code on failure
+ */
+int qihse_amx_pim_gemm_execute_amx(
+    qihse_amx_pim_gemm_t* gemm,
+    float* result
+);
+
+/* ============================================================================
+ * AVX-512 BF16 Mixed-Precision Distance Functions
+ * 2x throughput vs float32 FMA (32 BF16 multiplies per instruction).
+ * ============================================================================ */
+
+float qihse_distance_dot_bf16(const float* a, const float* b, size_t dims);
+float qihse_distance_cosine_bf16(const float* a, const float* b, size_t dims);
+float qihse_distance_euclidean_bf16(const float* a, const float* b, size_t dims);
+
+/* ============================================================================
+ * AVX-512 VNNI INT8 Quantized Dot Product
+ * 4x throughput vs float32 (64 INT8 multiplies per instruction).
+ * For approximate nearest neighbor (ANN) with quantized vectors.
+ * ============================================================================ */
+
+int32_t qihse_distance_dot_int8(const float* a, const float* b, size_t dims);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
