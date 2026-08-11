@@ -260,6 +260,10 @@ static bool append_value(qihse_column_store_t* store, const char* name, qihse_co
     return true;
 }
 
+bool qihse_column_append_int32(qihse_column_store_t* store, const char* name, int32_t val, uint16_t classification, uint16_t sci_compartment) {
+    return append_value(store, name, QIHSE_COL_TYPE_INT32, &val, classification, sci_compartment);
+}
+
 bool qihse_column_append_int64(qihse_column_store_t* store, const char* name, int64_t val, uint16_t classification, uint16_t sci_compartment) {
     return append_value(store, name, QIHSE_COL_TYPE_INT64, &val, classification, sci_compartment);
 }
