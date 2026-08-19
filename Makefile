@@ -302,6 +302,10 @@ test-cluster-rebalance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_rebalance tests/test_cluster_rebalance.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_rebalance
 
+test-pg-wire-cluster: lib
+	$(CC) $(CFLAGS) -o tests/test_pg_wire_cluster tests/test_pg_wire_cluster.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_pg_wire_cluster
+
 test-kv-read-integrity: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_read_integrity tests/test_kv_read_integrity.c -L. -lqihse $(LDFLAGS)
 	rm -f qihse_integrity.chain*

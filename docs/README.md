@@ -103,6 +103,7 @@ Operational runbooks: vector DB mutation flows, memory maintenance loops, benchm
 
 ### [🏗️ Architecture & Plans](architecture/)
 - [Cluster Sharding Engine](architecture/cluster_sharding.md) — Redis-compatible 16,384-slot sharding, UDP gossip bus, Raft failover, RRF scatter-gather
+- [PostgreSQL Wire Protocol Sharded Catalogs](architecture/pgwire_sharded_catalogs.md)
 - [Automated Zero-Downtime Cluster Rebalancing](architecture/cluster_rebalancing.md)
 - [Distributed Multi-Engine Planner](architecture/distributed_query_planner.md)
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
