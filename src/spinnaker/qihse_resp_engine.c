@@ -1760,11 +1760,20 @@ static int qihse_resp_open_listener(qihse_resp_server_t* server) {
 
 static bool qihse_resp_accept_loop(qihse_resp_server_t* server) {
     while (__atomic_load_n(&server->running, __ATOMIC_ACQUIRE)) {
+        struct pollfd pfd;
+        pfd.fd = server->listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 50);
+        if (pr <= 0) {
+            if (pr < 0 && errno != EINTR) break;
+            continue;
+        }
         struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         int client_fd = accept(server->listen_fd, (struct sockaddr*)&peer, &peer_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             if (!__atomic_load_n(&server->running, __ATOMIC_ACQUIRE) || errno == EBADF || errno == EINVAL) break;
             continue;
         }
