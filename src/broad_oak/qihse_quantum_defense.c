@@ -37,6 +37,7 @@ struct qihse_quantum_defense_ctx_t {
     uint64_t access_history[QDD_HISTORY_SIZE];
     uint64_t access_timestamps[QDD_HISTORY_SIZE];
     uint32_t head;
+    uint32_t history_count;
     uint32_t threat_level; /* 0 to 100 */
     bool under_attack;
     qihse_qdd_ip_threat_t ip_threats[QDD_IP_CACHE_SIZE];
@@ -146,6 +147,7 @@ void qihse_qdd_report_access(qihse_quantum_defense_ctx_t* ctx, uint64_t target_i
     ctx->access_timestamps[ctx->head] = now;
     
     ctx->head = (ctx->head + 1) % QDD_HISTORY_SIZE;
+    if (ctx->history_count < QDD_HISTORY_SIZE) ctx->history_count++;
     
     /* 
      * Grover's Algorithm Detection Heuristic:
@@ -154,19 +156,24 @@ void qihse_qdd_report_access(qihse_quantum_defense_ctx_t* ctx, uint64_t target_i
      * Here, we analyze the access variance using a Trinary differential.
      */
     int equidistant_hits = 0;
-    for (int i = 0; i < 10; i++) {
-        uint32_t idx1 = (ctx->head - 1 - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
-        uint32_t idx2 = (ctx->head - 2 - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
+    uint32_t comparisons = ctx->history_count > 1 ? ctx->history_count - 1 : 0;
+    if (comparisons > 10) comparisons = 10;
+    for (uint32_t i = 0; i < comparisons; i++) {
+        uint32_t idx1 = (ctx->head - 1u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
+        uint32_t idx2 = (ctx->head - 2u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
         
         uint64_t diff = ctx->access_history[idx1] ^ ctx->access_history[idx2];
+        uint64_t time_delta = ctx->access_timestamps[idx1] >= ctx->access_timestamps[idx2]
+                                  ? ctx->access_timestamps[idx1] - ctx->access_timestamps[idx2]
+                                  : ctx->access_timestamps[idx2] - ctx->access_timestamps[idx1];
         
         /* If queries are exploring mathematically perfectly structured Hamming distances... */
-        if (__builtin_popcountll(diff) == 1 || diff == 0) {
+        if (__builtin_popcountll(diff) == 1 && time_delta <= 1u) {
             equidistant_hits++;
         }
     }
     
-    if (equidistant_hits > 6) {
+    if (comparisons >= 7 && equidistant_hits > 6) {
         ctx->threat_level += 15;
     } else if (ctx->threat_level > 0) {
         ctx->threat_level -= 1; // Decay

@@ -380,6 +380,64 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
     return true;
 }
 
+int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    if (!store || !store->trie || !key) return -2;
+    uint64_t now = current_time_ms();
+    size_t out_size = 0;
+    kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &out_size);
+    if (p) {
+        if (!qihse_auth_can_access(user, p->classification, p->sci_compartment)) return -2;
+        if (p->expire_time_ms == 0) return -1;
+        if (p->expire_time_ms <= now) {
+            qihse_trinary_trie_delete(store->trie, key);
+            return -2;
+        }
+        uint64_t remaining = p->expire_time_ms - now;
+        return remaining > INT64_MAX ? INT64_MAX : (int64_t)remaining;
+    }
+
+    const char* dir = get_qihse_data_dir();
+    for (int i = store->sstable_counter - 1; i >= 0; i--) {
+        char sst_path[256];
+        snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, i);
+#ifndef _WIN32
+        int sfd = open(sst_path, O_RDONLY | O_NOFOLLOW);
+        if (sfd < 0) continue;
+        FILE* f = fdopen(sfd, "r");
+        if (!f) { close(sfd); continue; }
+#else
+        FILE* f = fopen(sst_path, "r");
+        if (!f) continue;
+#endif
+        char header[256];
+        while (fgets(header, sizeof(header), f)) {
+            size_t key_len;
+            size_t val_len;
+            unsigned long long expire_time;
+            unsigned int classif;
+            unsigned int sci;
+            if (sscanf(header, "%zu %zu %llu %u %u", &key_len, &val_len, &expire_time, &classif, &sci) != 5) continue;
+            if (key_len > 1048576 || val_len > 16777216) break;
+            char* stored_key = (char*)malloc(key_len + 1u);
+            if (!stored_key) { fclose(f); return -2; }
+            if (fread(stored_key, 1, key_len, f) != key_len) { free(stored_key); break; }
+            stored_key[key_len] = '\0';
+            bool match = strcmp(stored_key, key) == 0;
+            free(stored_key);
+            if (fseek(f, (long)val_len + 1L, SEEK_CUR) != 0) break;
+            if (!match) continue;
+            fclose(f);
+            if (!qihse_auth_can_access(user, (uint16_t)classif, (uint16_t)sci)) return -2;
+            if (expire_time == 0) return -1;
+            if ((uint64_t)expire_time <= now) return -2;
+            uint64_t remaining = (uint64_t)expire_time - now;
+            return remaining > INT64_MAX ? INT64_MAX : (int64_t)remaining;
+        }
+        fclose(f);
+    }
+    return -2;
+}
+
 typedef struct {
     uint64_t now;
     qihse_trinary_trie_t* trie;

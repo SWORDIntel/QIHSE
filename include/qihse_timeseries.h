@@ -54,7 +54,15 @@ bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestam
 void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb);
 
 #include "qihse_auth.h"
+typedef enum {
+    QIHSE_TS_AGG_AVG = 0,
+    QIHSE_TS_AGG_SUM = 1,
+    QIHSE_TS_AGG_MIN = 2,
+    QIHSE_TS_AGG_MAX = 3
+} qihse_ts_aggregation_t;
+
 double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user);
+bool qihse_tsdb_aggregate_range_user(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t start_ts, uint64_t end_ts, qihse_ts_aggregation_t aggregation, qihse_user_t* user, double* out_value, uint64_t* out_count);
 
 /**
  * @brief Set the TTL in milliseconds for old chunks.

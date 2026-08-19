@@ -72,6 +72,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
             src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
+            src/spinnaker/qihse_crc16.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c \
             src/black_hole/qihse_kv_store.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
@@ -155,7 +156,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install dev-setup docs test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
+.PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install dev-setup docs redis-cluster-node bench-cluster-crc test-cluster-slot test-cluster-numa test-resp-cluster test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
 .NOTPARALLEL: validate-reference-workflow
 
 all: liboqs oqs-provider lib server keygen
@@ -166,6 +167,9 @@ build-native:
 
 server: lib
 	$(CC) $(CFLAGS) -o tests/qihse_server tests/qihse_server.c -L. -lqihse $(LDFLAGS)
+
+redis-cluster-node: lib
+	$(CC) $(CFLAGS) -o tests/qihse_cluster_node tests/qihse_cluster_node.c -L. -lqihse $(LDFLAGS)
 
 keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c
 	@echo "Building qihse_keygen..."
@@ -253,7 +257,19 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity
+test: test-cluster-slot test-cluster-numa test-resp-cluster test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity
+
+test-cluster-slot: lib
+	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_slot
+
+test-cluster-numa: lib
+	$(CC) $(CFLAGS) -o tests/test_cluster_numa tests/test_cluster_numa.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_numa
+
+test-resp-cluster: lib
+	$(CC) $(CFLAGS) -o tests/test_resp_cluster tests/test_resp_cluster.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_resp_cluster
 
 test-kv-read-integrity: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_read_integrity tests/test_kv_read_integrity.c -L. -lqihse $(LDFLAGS)
@@ -424,6 +440,10 @@ test-direct-execution:
 test-simple-exec:
 	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_simple_exec tests/test_simple_exec.c $(LDFLAGS)
 	./tests/test_simple_exec
+
+bench-cluster-crc: lib
+	$(CC) $(CFLAGS) -o benchmarks/qihse_cluster_crc_bench benchmarks/qihse_cluster_crc_bench.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./benchmarks/qihse_cluster_crc_bench
 
 bench-micro: lib
 	$(CC) $(CFLAGS) -o benchmarks/qihse_micro_bench \
