@@ -30,7 +30,6 @@
 *.py[cod]
 
 # Local agent indexes, memory, and personal integration state
-/.devin/
 /.learn/
 /.qlearn/
 /memory-bank/
