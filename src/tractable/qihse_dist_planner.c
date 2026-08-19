@@ -1,12 +1,17 @@
 #include "qihse_dist_planner.h"
+#include "qihse_cpu_detect.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>
+#include <dirent.h>
 
 struct qihse_dist_planner {
     qihse_cluster_topology_t* topo;
+    qihse_hw_profile_t* hw_profile;
+    bool owns_profile;
 };
 
 static uint64_t get_time_ns(void) {
@@ -24,6 +29,9 @@ qihse_dist_planner_t* qihse_dist_planner_create(qihse_cluster_topology_t* topo) 
 
 void qihse_dist_planner_destroy(qihse_dist_planner_t* planner) {
     if (planner) {
+        if (planner->owns_profile && planner->hw_profile) {
+            free(planner->hw_profile);
+        }
         free(planner);
     }
 }
@@ -98,6 +106,7 @@ qihse_dist_plan_t* qihse_dist_plan_query(qihse_dist_planner_t* planner, const ch
             task.task_type = QIHSE_TASK_KV_POINT;
         }
 
+        qihse_dist_planner_dispatch_backend(planner, &task);
         plan_add_task(plan, &task);
     } else {
         // Multi-shard scatter gather across all nodes in topology
@@ -126,6 +135,7 @@ qihse_dist_plan_t* qihse_dist_plan_query(qihse_dist_planner_t* planner, const ch
             } else {
                 task.task_type = QIHSE_TASK_DOC_FILTER;
             }
+            qihse_dist_planner_dispatch_backend(planner, &task);
             plan_add_task(plan, &task);
         }
     }
@@ -255,4 +265,233 @@ void qihse_dist_query_result_free(qihse_dist_query_result_t* result) {
         if (result->rows) free(result->rows);
         free(result);
     }
+}
+
+static size_t read_sysfs_size(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[64];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    fclose(f);
+    char* end = NULL;
+    double val = strtod(buf, &end);
+    if (end) {
+        if (*end == 'K' || *end == 'k') val *= 1024;
+        else if (*end == 'M' || *end == 'm') val *= 1024 * 1024;
+        else if (*end == 'G' || *end == 'g') val *= 1024 * 1024 * 1024;
+    }
+    return (size_t)val;
+}
+
+static void probe_host_cache(qihse_cache_topology_t* cache) {
+    memset(cache, 0, sizeof(*cache));
+    cache->cache_line_size = 64;
+    cache->l1_data_size = 32 * 1024;
+    cache->l2_size = 512 * 1024;
+    cache->l3_size = 16 * 1024 * 1024;
+    cache->numa_nodes = 1;
+
+    for (int i = 0; i < 8; i++) {
+        char p[256];
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        FILE* f = fopen(p, "r");
+        if (!f) continue;
+        int level = 0;
+        if (fscanf(f, "%d", &level) != 1) { fclose(f); continue; }
+        fclose(f);
+
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu0/cache/index%d/type", i);
+        f = fopen(p, "r");
+        char type[32] = "";
+        if (f) { fscanf(f, "%31s", type); fclose(f); }
+
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        size_t sz = read_sysfs_size(p);
+        if (sz > 0) {
+            if (level == 1 && (strcmp(type, "Data") == 0 || strcmp(type, "Unified") == 0)) {
+                cache->l1_data_size = sz;
+            } else if (level == 2) {
+                cache->l2_size = sz;
+            } else if (level == 3) {
+                cache->l3_size = sz;
+            }
+        }
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu0/cache/index%d/coherency_line_size", i);
+        f = fopen(p, "r");
+        if (f) {
+            uint32_t cls = 0;
+            if (fscanf(f, "%u", &cls) == 1 && cls > 0) cache->cache_line_size = cls;
+            fclose(f);
+        }
+    }
+
+    DIR* d = opendir("/sys/devices/system/node");
+    if (d) {
+        struct dirent* de;
+        uint32_t nodes = 0;
+        while ((de = readdir(d)) != NULL) {
+            if (strncmp(de->d_name, "node", 4) == 0 && de->d_name[4] >= '0' && de->d_name[4] <= '9') {
+                nodes++;
+            }
+        }
+        closedir(d);
+        if (nodes > 0) cache->numa_nodes = nodes;
+    }
+}
+
+qihse_hw_profile_t* qihse_hw_profile_create_from(uint64_t cpu_features, const qihse_cache_topology_t* cache, bool blas_available) {
+    qihse_hw_profile_t* p = (qihse_hw_profile_t*)calloc(1, sizeof(qihse_hw_profile_t));
+    if (!p) return NULL;
+    p->cpu_features = cpu_features;
+    if (cache) p->cache = *cache;
+    else probe_host_cache(&p->cache);
+
+    p->sse42_available = (cpu_features & QIHSE_CPU_FEATURE_SSE4_2) != 0;
+    p->avx2_available = (cpu_features & QIHSE_CPU_FEATURE_AVX2) != 0;
+    p->avx512_available = (cpu_features & (QIHSE_CPU_FEATURE_AVX512F | QIHSE_CPU_FEATURE_AVX512BW)) != 0;
+    p->blas_available = blas_available;
+
+    if (p->blas_available) p->preferred = QIHSE_HW_BACKEND_BLAS;
+    else if (p->avx512_available) p->preferred = QIHSE_HW_BACKEND_AVX512;
+    else if (p->avx2_available) p->preferred = QIHSE_HW_BACKEND_AVX2;
+    else if (p->sse42_available) p->preferred = QIHSE_HW_BACKEND_SSE42;
+    else p->preferred = QIHSE_HW_BACKEND_SCALAR;
+
+    return p;
+}
+
+qihse_hw_profile_t* qihse_hw_profile_create(void) {
+    qihse_cpu_info_t info = qihse_cpu_detect();
+    qihse_cache_topology_t cache;
+    probe_host_cache(&cache);
+    return qihse_hw_profile_create_from(info.features, &cache, false);
+}
+
+void qihse_hw_profile_destroy(qihse_hw_profile_t* profile) {
+    if (profile) free(profile);
+}
+
+void qihse_hw_profile_set_blas_available(qihse_hw_profile_t* profile, bool available) {
+    if (!profile) return;
+    profile->blas_available = available;
+    if (available) profile->preferred = QIHSE_HW_BACKEND_BLAS;
+    else if (profile->avx512_available) profile->preferred = QIHSE_HW_BACKEND_AVX512;
+    else if (profile->avx2_available) profile->preferred = QIHSE_HW_BACKEND_AVX2;
+    else if (profile->sse42_available) profile->preferred = QIHSE_HW_BACKEND_SSE42;
+    else profile->preferred = QIHSE_HW_BACKEND_SCALAR;
+}
+
+const char* qihse_hw_backend_name(qihse_hw_backend_t backend) {
+    switch (backend) {
+        case QIHSE_HW_BACKEND_SCALAR: return "scalar";
+        case QIHSE_HW_BACKEND_SSE42:  return "sse4.2";
+        case QIHSE_HW_BACKEND_AVX2:   return "avx2";
+        case QIHSE_HW_BACKEND_AVX512: return "avx512";
+        case QIHSE_HW_BACKEND_BLAS:   return "blas";
+        default: return "unknown";
+    }
+}
+
+qihse_hw_backend_t qihse_hw_select_backend(const qihse_hw_profile_t* profile, size_t payload_bytes, size_t vector_dims) {
+    (void)vector_dims;
+    if (!profile) return QIHSE_HW_BACKEND_SCALAR;
+
+    size_t l1 = profile->cache.l1_data_size ? profile->cache.l1_data_size : 32768;
+    size_t l2 = profile->cache.l2_size ? profile->cache.l2_size : 262144;
+    size_t l3 = profile->cache.l3_size ? profile->cache.l3_size : (4 * 1024 * 1024);
+
+    qihse_hw_backend_t target = QIHSE_HW_BACKEND_SCALAR;
+
+    if (profile->blas_available && payload_bytes >= l3) {
+        target = QIHSE_HW_BACKEND_BLAS;
+    } else if (payload_bytes >= l2) {
+        if (profile->avx512_available) target = QIHSE_HW_BACKEND_AVX512;
+        else if (profile->avx2_available) target = QIHSE_HW_BACKEND_AVX2;
+        else if (profile->sse42_available) target = QIHSE_HW_BACKEND_SSE42;
+        else target = QIHSE_HW_BACKEND_SCALAR;
+    } else if (payload_bytes >= l1) {
+        if (profile->avx2_available) target = QIHSE_HW_BACKEND_AVX2;
+        else if (profile->sse42_available) target = QIHSE_HW_BACKEND_SSE42;
+        else target = QIHSE_HW_BACKEND_SCALAR;
+    } else if (payload_bytes >= (l1 / 4)) {
+        if (profile->sse42_available) target = QIHSE_HW_BACKEND_SSE42;
+        else target = QIHSE_HW_BACKEND_SCALAR;
+    } else {
+        target = QIHSE_HW_BACKEND_SCALAR;
+    }
+
+    // Fallback if target backend not available
+    if (target == QIHSE_HW_BACKEND_BLAS && !profile->blas_available) {
+        target = profile->avx512_available ? QIHSE_HW_BACKEND_AVX512 :
+                 profile->avx2_available ? QIHSE_HW_BACKEND_AVX2 :
+                 profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
+    }
+    if (target == QIHSE_HW_BACKEND_AVX512 && !profile->avx512_available) {
+        target = profile->avx2_available ? QIHSE_HW_BACKEND_AVX2 :
+                 profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
+    }
+    if (target == QIHSE_HW_BACKEND_AVX2 && !profile->avx2_available) {
+        target = profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
+    }
+    if (target == QIHSE_HW_BACKEND_SSE42 && !profile->sse42_available) {
+        target = QIHSE_HW_BACKEND_SCALAR;
+    }
+
+    return target;
+}
+
+void qihse_dist_planner_set_hw_profile(qihse_dist_planner_t* planner, qihse_hw_profile_t* profile) {
+    if (!planner) return;
+    if (planner->owns_profile && planner->hw_profile) {
+        free(planner->hw_profile);
+    }
+    planner->hw_profile = profile;
+    planner->owns_profile = false;
+}
+
+qihse_hw_profile_t* qihse_dist_planner_get_hw_profile(const qihse_dist_planner_t* planner) {
+    return planner ? planner->hw_profile : NULL;
+}
+
+qihse_hw_backend_t qihse_dist_planner_dispatch_backend(qihse_dist_planner_t* planner, qihse_shard_task_t* task) {
+    if (!task) return QIHSE_HW_BACKEND_SCALAR;
+
+    if (task->estimated_payload_bytes == 0) {
+        switch (task->task_type) {
+            case QIHSE_TASK_KV_POINT:
+                task->estimated_payload_bytes = 64;
+                break;
+            case QIHSE_TASK_VECTOR_SEARCH: {
+                size_t dims = task->vector_dims ? task->vector_dims : 128;
+                size_t k = task->top_k ? task->top_k : 10;
+                task->estimated_payload_bytes = k * dims * sizeof(float);
+                break;
+            }
+            case QIHSE_TASK_TS_RANGE:
+                task->estimated_payload_bytes = 1000 * sizeof(double);
+                break;
+            case QIHSE_TASK_COL_SCAN:
+                task->estimated_payload_bytes = 10000 * sizeof(int64_t);
+                break;
+            case QIHSE_TASK_DOC_FILTER:
+                task->estimated_payload_bytes = 100 * 256;
+                break;
+            default:
+                task->estimated_payload_bytes = 1024;
+                break;
+        }
+    }
+
+    qihse_hw_profile_t* prof = planner ? planner->hw_profile : NULL;
+    qihse_hw_profile_t* temp_prof = NULL;
+    if (!prof) {
+        temp_prof = qihse_hw_profile_create();
+        prof = temp_prof;
+    }
+
+    qihse_hw_backend_t b = qihse_hw_select_backend(prof, task->estimated_payload_bytes, task->vector_dims ? task->vector_dims : 128);
+    task->selected_backend = b;
+
+    if (temp_prof) qihse_hw_profile_destroy(temp_prof);
+    return b;
 }

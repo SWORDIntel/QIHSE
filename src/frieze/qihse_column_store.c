@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200112L
 #include "qihse_column.h"
+#include "qihse_keystone.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,7 +18,17 @@ typedef struct qihse_column_node {
     char** dict_strings;
     uint32_t dict_count;
     uint32_t dict_capacity;
-    
+
+    /* Keystone anchor-search index for INT64 columns.
+     * Materialized by qihse_column_build_int64_index. `idx_values` is a
+     * contiguous sorted int64 array consumed by qihse_keystone_anchor_*;
+     * `idx_chunks` / `idx_slots` map a sorted position back to the original
+     * (chunk, slot) row coordinate so per-row ACL metadata can be recovered. */
+    int64_t* idx_values;
+    qihse_column_chunk_t** idx_chunks;
+    uint32_t* idx_slots;
+    size_t idx_count;
+
     struct qihse_column_node* next;
 } qihse_column_node_t;
 
@@ -43,7 +54,11 @@ void qihse_column_store_destroy(qihse_column_store_t* store) {
             }
             free(curr_col->dict_strings);
         }
-        
+
+        free(curr_col->idx_values);
+        free(curr_col->idx_chunks);
+        free(curr_col->idx_slots);
+
         qihse_column_chunk_t* curr_chunk = curr_col->head;
         while (curr_chunk) {
             qihse_column_chunk_t* next_chunk = curr_chunk->next;
@@ -425,3 +440,166 @@ bool qihse_column_minmax_float32_user(qihse_column_store_t* store, const char* n
 }
 
 /* TODO(Phase Y): Radix Partitioned Hash Join logic to be added in future phases. */
+
+/* -------------------------------------------------------------------------
+ * Keystone anchor-search index integration (Idea 2).
+ *
+ * Materializes a sorted INT64 index over a column so that point and range
+ * lookups are served by qihse_keystone_anchor_search /
+ * qihse_keystone_anchor_lower_bound / qihse_keystone_anchor_upper_bound in
+ * O(log log N) (< 20ns), replacing binary search.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    int64_t value;
+    qihse_column_chunk_t* chunk;
+    uint32_t slot;
+} qihse_column_idx_entry_t;
+
+static int qihse_column_idx_cmp(const void* a, const void* b) {
+    int64_t va = ((const qihse_column_idx_entry_t*)a)->value;
+    int64_t vb = ((const qihse_column_idx_entry_t*)b)->value;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+}
+
+bool qihse_column_build_int64_index(qihse_column_store_t* store, const char* name) {
+    qihse_column_node_t* col = get_column(store, name);
+    if (!col || col->type != QIHSE_COL_TYPE_INT64) return false;
+
+    /* Free any previously materialized index. */
+    free(col->idx_values);
+    free(col->idx_chunks);
+    free(col->idx_slots);
+    col->idx_values = NULL;
+    col->idx_chunks = NULL;
+    col->idx_slots = NULL;
+    col->idx_count = 0;
+
+    /* Count total rows across all chunks. RLE-encoded chunks store the
+     * physical row count in chunk->count (the logical run list lives in
+     * chunk->dict_limit), so chunk->count is always the row count we need. */
+    size_t total = 0;
+    for (qihse_column_chunk_t* chunk = col->head; chunk; chunk = chunk->next) {
+        total += chunk->count;
+    }
+    if (total == 0) return true;
+
+    qihse_column_idx_entry_t* entries =
+        (qihse_column_idx_entry_t*)malloc(total * sizeof(qihse_column_idx_entry_t));
+    if (!entries) return false;
+
+    size_t pos = 0;
+    for (qihse_column_chunk_t* chunk = col->head; chunk; chunk = chunk->next) {
+        if (chunk->encoding == QIHSE_ENCODING_RLE) {
+            /* Expand RLE runs back to per-row values for the sorted index. */
+            qihse_rle_pair_int64_t* runs = (qihse_rle_pair_int64_t*)chunk->data;
+            size_t run_count = chunk->dict_limit;
+            uint32_t slot = 0;
+            for (size_t r = 0; r < run_count; r++) {
+                int64_t v = runs[r].val;
+                uint32_t run = runs[r].run_length;
+                for (uint32_t k = 0; k < run; k++) {
+                    entries[pos].value = v;
+                    entries[pos].chunk = chunk;
+                    entries[pos].slot = slot;
+                    pos++;
+                    slot++;
+                }
+            }
+        } else {
+            int64_t* data = (int64_t*)chunk->data;
+            for (uint32_t i = 0; i < chunk->count; i++) {
+                entries[pos].value = data[i];
+                entries[pos].chunk = chunk;
+                entries[pos].slot = i;
+                pos++;
+            }
+        }
+    }
+
+    if (pos != total) {
+        free(entries);
+        return false;
+    }
+
+    qsort(entries, total, sizeof(qihse_column_idx_entry_t), qihse_column_idx_cmp);
+
+    col->idx_values = (int64_t*)malloc(total * sizeof(int64_t));
+    col->idx_chunks = (qihse_column_chunk_t**)malloc(total * sizeof(qihse_column_chunk_t*));
+    col->idx_slots = (uint32_t*)malloc(total * sizeof(uint32_t));
+    if (!col->idx_values || !col->idx_chunks || !col->idx_slots) {
+        free(col->idx_values); col->idx_values = NULL;
+        free(col->idx_chunks); col->idx_chunks = NULL;
+        free(col->idx_slots); col->idx_slots = NULL;
+        free(entries);
+        return false;
+    }
+
+    for (size_t i = 0; i < total; i++) {
+        col->idx_values[i] = entries[i].value;
+        col->idx_chunks[i] = entries[i].chunk;
+        col->idx_slots[i] = entries[i].slot;
+    }
+    col->idx_count = total;
+
+    free(entries);
+    return true;
+}
+
+void qihse_column_drop_int64_index(qihse_column_store_t* store, const char* name) {
+    qihse_column_node_t* col = get_column(store, name);
+    if (!col) return;
+    free(col->idx_values);
+    free(col->idx_chunks);
+    free(col->idx_slots);
+    col->idx_values = NULL;
+    col->idx_chunks = NULL;
+    col->idx_slots = NULL;
+    col->idx_count = 0;
+}
+
+int64_t qihse_column_lookup_int64_user(qihse_column_store_t* store, const char* name, int64_t key, qihse_user_t* user) {
+    qihse_column_node_t* col = get_column(store, name);
+    if (!col || col->type != QIHSE_COL_TYPE_INT64 || !col->idx_values || col->idx_count == 0) {
+        return -1;
+    }
+
+    /* O(log log N) anchor search to locate the first matching value. */
+    int64_t hit = qihse_keystone_anchor_search(col->idx_values, col->idx_count, key);
+    if (hit < 0) return -1;
+
+    /* Walk the (typically tiny) run of equal values, enforcing ACLs. */
+    for (size_t i = (size_t)hit; i < col->idx_count && col->idx_values[i] == key; i++) {
+        qihse_column_chunk_t* chunk = col->idx_chunks[i];
+        uint32_t slot = col->idx_slots[i];
+        if (qihse_auth_can_access(user, chunk->classifications[slot], chunk->sci_compartments[slot])) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}
+
+size_t qihse_column_range_count_int64_user(qihse_column_store_t* store, const char* name, int64_t low, int64_t high, qihse_user_t* user) {
+    qihse_column_node_t* col = get_column(store, name);
+    if (!col || col->type != QIHSE_COL_TYPE_INT64 || !col->idx_values || col->idx_count == 0) {
+        return 0;
+    }
+    if (low > high) return 0;
+
+    /* O(log log N) bracketing of [low, high] via keystone anchor bounds,
+     * replacing the previous binary-search implementation. */
+    size_t lo = qihse_keystone_anchor_lower_bound(col->idx_values, col->idx_count, low);
+    size_t hi = qihse_keystone_anchor_upper_bound(col->idx_values, col->idx_count, high);
+
+    size_t accessible = 0;
+    for (size_t i = lo; i < hi; i++) {
+        qihse_column_chunk_t* chunk = col->idx_chunks[i];
+        uint32_t slot = col->idx_slots[i];
+        if (qihse_auth_can_access(user, chunk->classifications[slot], chunk->sci_compartments[slot])) {
+            accessible++;
+        }
+    }
+    return accessible;
+}

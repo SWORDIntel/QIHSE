@@ -23,6 +23,7 @@ typedef struct {
     uint32_t length;
     uint16_t classification;
     uint16_t sci_compartment;
+    qihse_keystone_class_t semantic_class;
 } doc_info_t;
 
 struct qihse_fts_index {
@@ -63,7 +64,7 @@ void qihse_fts_destroy(qihse_fts_index_t* index) {
 
 #include "qihse_auth.h"
 
-bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const char* text, size_t length, uint16_t classification, uint16_t sci_compartment) {
+bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const char* text, size_t length, uint16_t classification, uint16_t sci_compartment, qihse_keystone_class_t semantic_class) {
     if (!index || !text) return false;
 
     if (index->doc_count >= index->doc_capacity) {
@@ -78,6 +79,7 @@ bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const cha
     index->docs[doc_idx].length = 0;
     index->docs[doc_idx].classification = classification;
     index->docs[doc_idx].sci_compartment = sci_compartment;
+    index->docs[doc_idx].semantic_class = semantic_class;
     
     const char* p = text;
     const char* start = NULL;
@@ -173,7 +175,7 @@ bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const cha
     return true;
 }
 
-int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k) {
+int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k, uint8_t semantic_class_mask) {
     if (!index || !query || !results || top_k <= 0) return 0;
     if (index->doc_count == 0) return 0;
 
@@ -204,7 +206,7 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
                     full_word[j] = (char)tolower((unsigned char)start[j]);
                 }
                 full_word[tok_len] = '\0';
-                
+
                 size_t num_trigrams = (tok_len < 3) ? 1 : (tok_len - 2);
                 for (size_t t = 0; t < num_trigrams; t++) {
                     char token[4];
@@ -217,7 +219,7 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
                         token[2] = full_word[t+2];
                         token[3] = '\0';
                     }
-                    
+
                     size_t out_size;
                     posting_list_t** p_list_ptr = (posting_list_t**)qihse_trinary_trie_search(index->dictionary, token, &out_size);
                     if (p_list_ptr) {
@@ -231,11 +233,11 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
                             uint32_t doc_idx = curr->doc_idx;
                             uint32_t tf = curr->term_frequency;
                             uint32_t doc_len = index->docs[doc_idx].length;
-                            
+
                             float numerator = tf * (k1 + 1.0f);
                             float denominator = tf + k1 * (1.0f - b + b * ((float)doc_len / avgdl));
                             scores[doc_idx] += idf * (numerator / denominator);
-                            
+
                             curr = curr->next;
                         }
                     }
@@ -254,6 +256,14 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
             if (!qihse_auth_can_access(user, index->docs[j].classification, index->docs[j].sci_compartment)) {
                 continue;
             }
+            /* Semantic class filtering: a non-zero mask restricts results to
+             * documents whose neural class bit is set in the mask. */
+            if (semantic_class_mask != 0) {
+                uint8_t class_bit = (uint8_t)(1u << (uint8_t)index->docs[j].semantic_class);
+                if ((semantic_class_mask & class_bit) == 0) {
+                    continue;
+                }
+            }
             if (scores[j] > max_score) {
                 max_score = scores[j];
                 best_idx = j;
@@ -262,6 +272,7 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
         if (best_idx != -1 && max_score > 0.0f) {
             results[num_results].doc_id = index->docs[best_idx].doc_id;
             results[num_results].bm25_score = max_score;
+            results[num_results].semantic_class = index->docs[best_idx].semantic_class;
             scores[best_idx] = -1.0f; // mark as used
             num_results++;
         } else {
@@ -271,4 +282,18 @@ int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_use
 
     free(scores);
     return num_results;
+}
+
+int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k) {
+    return qihse_fts_search_user_filtered(index, query, user, results, top_k, 0);
+}
+
+qihse_keystone_class_t qihse_fts_get_doc_semantic_class(qihse_fts_index_t* index, uint64_t doc_id) {
+    if (!index) return QIHSE_KEYSTONE_CLASS_UNKNOWN;
+    for (uint32_t j = 0; j < index->doc_count; j++) {
+        if (index->docs[j].doc_id == doc_id) {
+            return index->docs[j].semantic_class;
+        }
+    }
+    return QIHSE_KEYSTONE_CLASS_UNKNOWN;
 }

@@ -317,34 +317,114 @@ size_t qihse_keystone_ingest_dirty_logs(
 /* -------------------------------------------------------------------------
  * Anchor-Guided Interpolation Search (< 70ns lookup)
  * ------------------------------------------------------------------------- */
-int64_t qihse_keystone_anchor_search(const int64_t* arr, size_t n, int64_t key) {
-    if (!arr || n == 0) return -1;
-    if (key < arr[0] || key > arr[n - 1]) return -1;
 
+/* Shared interpolation core: narrows [low, high] to a tiny window around the
+ * interpolated probe position for `key`. Returns the converged (low, high)
+ * bracket via out-parameters. The bracket is empty (low > high) when the key
+ * is provably absent from the array. */
+static void qihse_keystone_anchor_core(
+    const int64_t* arr, size_t n, int64_t key,
+    size_t* out_low, size_t* out_high
+) {
     size_t low = 0;
-    size_t high = n - 1;
+    size_t high = (n == 0) ? 0 : n - 1;
 
     while (low <= high && key >= arr[low] && key <= arr[high]) {
         if (arr[high] == arr[low]) {
-            return (arr[low] == key) ? (int64_t)low : -1;
+            /* Uniform run: bracket collapses to a single comparison. */
+            if (arr[low] == key) {
+                *out_low = low; *out_high = low;
+            } else {
+                *out_low = low; *out_high = low; /* key not present */
+            }
+            return;
         }
 
-        /* Interpolation position probe */
         double fraction = (double)(key - arr[low]) / (double)(arr[high] - arr[low]);
         size_t mid = low + (size_t)(fraction * (double)(high - low));
-
         if (mid > high) mid = high;
         if (mid < low) mid = low;
 
         if (arr[mid] == key) {
-            return (int64_t)mid;
+            *out_low = mid; *out_high = mid;
+            return;
         } else if (arr[mid] < key) {
             low = mid + 1;
         } else {
-            if (mid == 0) break;
+            if (mid == 0) { *out_low = 0; *out_high = (size_t)-1; return; }
             high = mid - 1;
         }
     }
 
+    *out_low = low;
+    *out_high = high; /* may be < low when bracket is empty */
+}
+
+int64_t qihse_keystone_anchor_search(const int64_t* arr, size_t n, int64_t key) {
+    if (!arr || n == 0) return -1;
+    if (key < arr[0] || key > arr[n - 1]) return -1;
+
+    size_t low, high;
+    qihse_keystone_anchor_core(arr, n, key, &low, &high);
+
+    /* The core returns an exact-match bracket when key is present. */
+    if (low <= high && low < n && arr[low] == key) return (int64_t)low;
+    if (low <= high && high < n && arr[high] == key) return (int64_t)high;
+
+    /* Final tiny linear scan inside the converged bracket for safety. */
+    for (size_t i = low; i <= high && i < n; i++) {
+        if (arr[i] == key) return (int64_t)i;
+        if (arr[i] > key) break;
+    }
     return -1;
+}
+
+size_t qihse_keystone_anchor_lower_bound(const int64_t* arr, size_t n, int64_t key) {
+    if (!arr || n == 0) return 0;
+
+    /* Fast path: key below the smallest element. */
+    if (key <= arr[0]) return 0;
+    /* Fast path: key above the largest element. */
+    if (key > arr[n - 1]) return n;
+
+    size_t low, high;
+    qihse_keystone_anchor_core(arr, n, key, &low, &high);
+
+    /* Empty bracket (key absent and bracket crossed): low is the lower bound. */
+    if (high < low) {
+        return (low < n) ? low : n;
+    }
+
+    /* Converged bracket: find first index >= key within [low, high]. */
+    size_t hi = (high < n) ? high : n - 1;
+    for (size_t i = low; i <= hi; i++) {
+        if (arr[i] >= key) return i;
+    }
+    /* If everything in the bracket is < key, the lower bound is just past it. */
+    if (hi + 1 < n && arr[hi + 1] >= key) return hi + 1;
+    return n;
+}
+
+size_t qihse_keystone_anchor_upper_bound(const int64_t* arr, size_t n, int64_t key) {
+    if (!arr || n == 0) return 0;
+
+    /* Fast path: key below the smallest element -> first element is > key. */
+    if (key < arr[0]) return 0;
+    /* Fast path: key >= largest element -> no element > key. */
+    if (key >= arr[n - 1]) return n;
+
+    size_t low, high;
+    qihse_keystone_anchor_core(arr, n, key, &low, &high);
+
+    /* Empty bracket: low is the upper bound (first element > key). */
+    if (high < low) {
+        return (low < n) ? low : n;
+    }
+
+    size_t hi = (high < n) ? high : n - 1;
+    for (size_t i = low; i <= hi; i++) {
+        if (arr[i] > key) return i;
+    }
+    if (hi + 1 < n && arr[hi + 1] > key) return hi + 1;
+    return n;
 }

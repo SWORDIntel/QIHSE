@@ -1,4 +1,5 @@
 #include "qihse_hnsw.h"
+#include "qihse_keystone.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -12,6 +13,7 @@ static float real_dist_q(qihse_hnsw_index_t *index, const float *query, uint32_t
     if (!index || !index->params.get_vector_fn || !index->params.distance_fn) return 1e9f;
     const float* node_vec = index->params.get_vector_fn(index->params.user_context, node);
     if (!node_vec || !query) return 1e9f;
+    index->last_search_dist_calls++;
     return index->params.distance_fn(query, node_vec, index->params.dim);
 }
 
@@ -20,6 +22,7 @@ static float real_dist_n(qihse_hnsw_index_t *index, uint32_t n1, uint32_t n2) {
     const float* vec1 = index->params.get_vector_fn(index->params.user_context, n1);
     const float* vec2 = index->params.get_vector_fn(index->params.user_context, n2);
     if (!vec1 || !vec2) return 1e9f;
+    index->last_search_dist_calls++;
     return index->params.distance_fn(vec1, vec2, index->params.dim);
 }
 
@@ -320,6 +323,15 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
     (void)dim;
     if (!index) return;
 
+    /* Maintain the anchor projection table for Anchor-Guided Vector Proximity
+     * Seeding. Registered up-front so every insert path (including the very
+     * first node, which returns early below) is captured. Only populated when
+     * seeding has been enabled by the caller, so unaware callers pay zero
+     * overhead. */
+    if (index->anchor_seeding_enabled) {
+        qihse_hnsw_register_projection(index, node_id, vector, index->params.dim);
+    }
+
     double r;
 #ifndef _WIN32
     unsigned char rand_buf[8];
@@ -438,5 +450,186 @@ void hnsw_destroy(qihse_hnsw_index_t *index) {
         }
         free(index->layers);
     }
+    qihse_hnsw_anchor_destroy(index);
     free(index);
+}
+
+/* ===========================================================================
+ * Anchor-Guided Vector Proximity Seeding
+ * ---------------------------------------------------------------------------
+ * Each inserted vector is reduced to a 1D scalar projection (default: sum of
+ * components), scalar-quantized to int64, and inserted into a sorted anchor
+ * table. At query time the query's projection is used to probe the table via
+ * qihse_keystone_anchor_search (O(log log N) interpolation search). The
+ * matched node becomes the HNSW entry point, which is typically much closer
+ * to the query than the graph's default top-level enter_point, reducing the
+ * number of graph hops (distance evaluations) required during descent.
+ * ========================================================================= */
+
+#define QIHSE_HNSW_PROJ_SCALE 1000000.0
+
+int64_t qihse_hnsw_compute_projection(const float *v, size_t dim,
+                                       qihse_hnsw_projection_fn_t proj_fn) {
+    if (!v || dim == 0) return 0;
+    double p;
+    if (proj_fn) {
+        p = proj_fn(v, dim);
+    } else {
+        /* Default 1D projection: sum of components (dot product with the
+         * all-ones direction). Cheap, deterministic, and preserves a useful
+         * coarse ordering for clustered / low-entropy workloads. */
+        double acc = 0.0;
+        for (size_t i = 0; i < dim; i++) acc += (double)v[i];
+        p = acc;
+    }
+    /* Scalar-quantize to int64. Clamp to int64 range to keep the sorted
+     * table well-defined for the interpolation search. */
+    double scaled = p * QIHSE_HNSW_PROJ_SCALE;
+    if (scaled >= 9.2e18) return (int64_t)9223372036854775807LL;
+    if (scaled <= -9.2e18) return (int64_t)(-9223372036854775807LL - 1);
+    return (int64_t)scaled;
+}
+
+static int anchor_table_reserve(qihse_hnsw_index_t *index, size_t needed) {
+    if (needed <= index->anchor_capacity) return 0;
+    size_t new_cap = index->anchor_capacity ? index->anchor_capacity * 2 : 64;
+    while (new_cap < needed) new_cap *= 2;
+    int64_t *np = (int64_t*)realloc(index->anchor_projections, new_cap * sizeof(int64_t));
+    if (!np) return -1;
+    index->anchor_projections = np;
+    uint32_t *nn = (uint32_t*)realloc(index->anchor_node_ids, new_cap * sizeof(uint32_t));
+    if (!nn) return -1;
+    index->anchor_node_ids = nn;
+    index->anchor_capacity = new_cap;
+    return 0;
+}
+
+/* Insert (projection, node_id) into the sorted anchor table. If node_id is
+ * already present, its projection is refreshed in-place. */
+int qihse_hnsw_register_projection(qihse_hnsw_index_t *index, uint32_t node_id,
+                                    const float *vector, size_t dim) {
+    if (!index || !vector) return -1;
+    int64_t proj = qihse_hnsw_compute_projection(vector, dim,
+                                                  index->params.projection_fn);
+
+    /* Linear scan for an existing entry (node ids are unique; tables are
+     * modestly sized). Refresh in place if found. */
+    for (size_t i = 0; i < index->anchor_count; i++) {
+        if (index->anchor_node_ids[i] == node_id) {
+            if (index->anchor_projections[i] == proj) return 0;
+            /* Remove the stale entry; re-insert below to keep ordering. */
+            memmove(&index->anchor_projections[i], &index->anchor_projections[i + 1],
+                    (index->anchor_count - i - 1) * sizeof(int64_t));
+            memmove(&index->anchor_node_ids[i], &index->anchor_node_ids[i + 1],
+                    (index->anchor_count - i - 1) * sizeof(uint32_t));
+            index->anchor_count--;
+            break;
+        }
+    }
+
+    if (anchor_table_reserve(index, index->anchor_count + 1) != 0) return -1;
+
+    /* Binary search for the insertion position to keep ascending order. */
+    size_t lo = 0, hi = index->anchor_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (index->anchor_projections[mid] < proj) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < index->anchor_count) {
+        memmove(&index->anchor_projections[lo + 1], &index->anchor_projections[lo],
+                (index->anchor_count - lo) * sizeof(int64_t));
+        memmove(&index->anchor_node_ids[lo + 1], &index->anchor_node_ids[lo],
+                (index->anchor_count - lo) * sizeof(uint32_t));
+    }
+    index->anchor_projections[lo] = proj;
+    index->anchor_node_ids[lo] = node_id;
+    index->anchor_count++;
+    return 0;
+}
+
+void qihse_hnsw_enable_anchor_seeding(qihse_hnsw_index_t *index, bool enable) {
+    if (!index) return;
+    index->anchor_seeding_enabled = enable;
+}
+
+void qihse_hnsw_anchor_destroy(qihse_hnsw_index_t *index) {
+    if (!index) return;
+    free(index->anchor_projections);
+    free(index->anchor_node_ids);
+    index->anchor_projections = NULL;
+    index->anchor_node_ids = NULL;
+    index->anchor_count = 0;
+    index->anchor_capacity = 0;
+}
+
+/* Locate the index in the sorted anchor table whose projection is closest to
+ * `key`. Primary path: qihse_keystone_anchor_search for an exact hit (O(log
+ * log N)). On miss, fall back to a nearest-neighbour binary probe so we still
+ * return a useful seed vertex. Returns the table index, or (size_t)-1 if the
+ * table is empty. */
+static size_t anchor_nearest_index(qihse_hnsw_index_t *index, int64_t key) {
+    if (!index || index->anchor_count == 0) return (size_t)-1;
+
+    int64_t hit = qihse_keystone_anchor_search(index->anchor_projections,
+                                               index->anchor_count, key);
+    if (hit >= 0) return (size_t)hit;
+
+    /* Miss: binary search for the insertion point, then pick the closer of
+     * the two neighbours by absolute projection delta. */
+    size_t lo = 0, hi = index->anchor_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (index->anchor_projections[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    size_t best = lo;          /* first element >= key */
+    if (best == index->anchor_count) best = index->anchor_count - 1;
+    if (best > 0) {
+        uint64_t d_best = (uint64_t)llabs(index->anchor_projections[best] - key);
+        uint64_t d_prev = (uint64_t)llabs(index->anchor_projections[best - 1] - key);
+        if (d_prev < d_best) best = best - 1;
+    }
+    return best;
+}
+
+uint32_t qihse_hnsw_anchor_seed_entry(qihse_hnsw_index_t *index,
+                                       const float *query, size_t dim) {
+    if (!index) return 0;
+    if (!index->anchor_seeding_enabled || index->anchor_count == 0) {
+        return index->enter_point;
+    }
+    int64_t qproj = qihse_hnsw_compute_projection(query, dim,
+                                                   index->params.projection_fn);
+    size_t idx = anchor_nearest_index(index, qproj);
+    if (idx == (size_t)-1) return index->enter_point;
+    return index->anchor_node_ids[idx];
+}
+
+void qihse_hnsw_anchor_seed_search(qihse_hnsw_index_t *index,
+                                    const float *query, size_t dim,
+                                    uint32_t ef, uint32_t *results,
+                                    size_t *num_results) {
+    if (num_results) *num_results = 0;
+    if (!index || !query || !results || ef == 0) return;
+    if (index->num_nodes == 0 || index->max_level < 0) return;
+
+    index->last_search_dist_calls = 0;
+
+    uint32_t ep = qihse_hnsw_anchor_seed_entry(index, query, dim);
+
+    /* Descend from the top layer down to layer 1 with ef=1 to greedily walk
+     * toward the query, then run the full ef search at layer 0. This mirrors
+     * the standard HNSW search procedure but starts from the anchor-seeded
+     * entry point instead of index->enter_point. */
+    for (int lc = index->max_level; lc > 0; lc--) {
+        uint32_t closest = ep;
+        size_t num_closest = 0;
+        hnsw_search_layer(index, query, ep, 1, lc, &closest, &num_closest);
+        if (num_closest > 0) ep = closest;
+    }
+
+    size_t n = 0;
+    hnsw_search_layer(index, query, ep, (int)ef, 0, results, &n);
+    if (num_results) *num_results = n;
 }

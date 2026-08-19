@@ -266,4 +266,99 @@ bool qihse_af_xdp_extract_udp_payload(
     return true;
 }
 
+/* -------------------------------------------------------------------------
+ * Idea 3: AF_XDP Kernel-Bypass Zero-Copy Log Ingestion Pipeline.
+ *
+ * The on-UMEM payload pointer returned by the zero-copy TCP/UDP parsers is
+ * forwarded directly to qihse_keystone_ingest_dirty_logs() without any
+ * userspace memcpy. Keystone scans the UMEM frame in place and routes every
+ * extracted artifact into the Black Hole KV store across the 16,384 CRC16
+ * cluster hash slots.
+ * ------------------------------------------------------------------------- */
+size_t qihse_af_xdp_ingest_frame_zero_copy(
+    const void *raw_pkt, uint32_t raw_len,
+    qihse_kv_store_t *kv,
+    qihse_cluster_topology_t *topo,
+    uint16_t clearance,
+    uint16_t compartment
+) {
+    if (!raw_pkt || raw_len == 0 || !kv) return 0;
+
+    /* Try TCP first -- most stealer log streams are TCP. The payload pointer
+     * stays inside the caller's buffer (UMEM frame); no copy is performed. */
+    const char *tcp_payload = NULL;
+    uint32_t tcp_len = 0;
+    if (qihse_af_xdp_extract_tcp_payload(raw_pkt, raw_len,
+                                         &tcp_payload, &tcp_len,
+                                         NULL, NULL, NULL)) {
+        if (tcp_len > 0) {
+            return qihse_keystone_ingest_dirty_logs(kv, topo,
+                                                    tcp_payload, tcp_len,
+                                                    clearance, compartment);
+        }
+        return 0;
+    }
+
+    /* Fall back to UDP (e.g. Cluster Bus telemetry carrying dirty-log shards). */
+    const void *udp_payload = NULL;
+    uint32_t udp_len = 0;
+    if (qihse_af_xdp_extract_udp_payload(raw_pkt, raw_len,
+                                         &udp_payload, &udp_len,
+                                         NULL, NULL, NULL)) {
+        if (udp_len > 0) {
+            return qihse_keystone_ingest_dirty_logs(kv, topo,
+                                                    (const char *)udp_payload, udp_len,
+                                                    clearance, compartment);
+        }
+    }
+
+    return 0;
+}
+
+size_t qihse_af_xdp_ingest_keystone(struct qihse_af_xdp_ctx *ctx,
+                                    qihse_kv_store_t *kv,
+                                    qihse_cluster_topology_t *topo,
+                                    uint16_t clearance,
+                                    uint16_t compartment
+) {
+    if (!ctx || !ctx->xsk || !kv) return 0;
+
+    uint32_t idx_rx = 0;
+    unsigned int rcvd = xsk_ring_cons__peek(&ctx->rx_ring, 64, &idx_rx);
+    if (!rcvd) return 0;
+
+    /* Reserve matching fill-ring slots so we can recycle every UMEM frame
+     * back to the kernel immediately after in-place ingestion. */
+    uint32_t idx_fq = 0;
+    unsigned int reserved = xsk_ring_prod__reserve(&ctx->fill_ring, rcvd, &idx_fq);
+    if (reserved < rcvd) {
+        /* Unable to recycle all frames this round -- drop the batch and let
+         * the kernel keep ownership so we never leak fill-ring slots. */
+        xsk_ring_cons__release(&ctx->rx_ring, rcvd);
+        return 0;
+    }
+
+    size_t total_artifacts = 0;
+    for (unsigned int i = 0; i < rcvd; i++) {
+        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&ctx->rx_ring, idx_rx++);
+        uint64_t addr = desc->addr;
+        uint32_t len  = desc->len;
+
+        /* Zero-copy: hand the on-UMEM frame directly to Keystone. The pointer
+         * returned by xsk_umem__get_data() lives inside ctx->buffer; no
+         * intermediate copy is performed. */
+        const void *frame = xsk_umem__get_data(ctx->buffer, addr);
+        total_artifacts += qihse_af_xdp_ingest_frame_zero_copy(
+            frame, len, kv, topo, clearance, compartment);
+
+        /* Recycle the UMEM frame back onto the fill ring for kernel reuse. */
+        *xsk_ring_prod__fill_addr(&ctx->fill_ring, idx_fq++) = addr;
+    }
+
+    xsk_ring_prod__submit(&ctx->fill_ring, rcvd);
+    xsk_ring_cons__release(&ctx->rx_ring, rcvd);
+
+    return total_artifacts;
+}
+
 #endif /* _WIN32 */
