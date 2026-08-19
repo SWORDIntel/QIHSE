@@ -648,7 +648,12 @@ static int qihse_vfs_xOpen(sqlite3_vfs* pVfs,
 
     /* ── Resolve path ── */
     if (zName && zName[0] != '\0') {
-        if (!realpath(zName, f->path)) {
+        char* resolved = realpath(zName, NULL);
+        if (resolved) {
+            strncpy(f->path, resolved, sizeof(f->path) - 1);
+            f->path[sizeof(f->path) - 1] = '\0';
+            free(resolved);
+        } else {
             /*
              * realpath fails if the file does not yet exist.
              * For CREATE opens, fall back to the raw path (the directory
