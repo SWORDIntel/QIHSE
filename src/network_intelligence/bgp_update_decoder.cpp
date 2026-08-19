@@ -40,7 +40,7 @@ std::uint16_t read_u16(std::span<const std::uint8_t> bytes, std::size_t* offset,
   return value;
 }
 
-std::uint32_t read_asn(std::span<const std::uint8_t> bytes, std::size_t* offset,
+[[maybe_unused]] std::uint32_t read_asn(std::span<const std::uint8_t> bytes, std::size_t* offset,
                        std::size_t width) {
   if (*offset > bytes.size() || bytes.size() - *offset < width) {
     throw std::invalid_argument("BGP UPDATE AS path is truncated");
@@ -104,7 +104,7 @@ std::vector<std::string> parse_ipv6_prefixes(std::span<const std::uint8_t> bytes
   return prefixes;
 }
 
-void require_ipv6_unicast_family(const std::span<const std::uint8_t> payload,
+[[maybe_unused]] void require_ipv6_unicast_family(const std::span<const std::uint8_t> payload,
                                  const std::string_view attribute_name) {
   std::size_t offset = 0U;
   const auto afi = read_u16(payload, &offset, std::string(attribute_name) + " AFI");
@@ -114,7 +114,7 @@ void require_ipv6_unicast_family(const std::span<const std::uint8_t> payload,
   }
 }
 
-std::vector<std::string> parse_mp_reach_ipv6(const std::span<const std::uint8_t> payload) {
+[[maybe_unused]] std::vector<std::string> parse_mp_reach_ipv6(const std::span<const std::uint8_t> payload) {
   require_ipv6_unicast_family(payload, "MP_REACH_NLRI");
   std::size_t offset = 3U;
   if (offset >= payload.size()) {

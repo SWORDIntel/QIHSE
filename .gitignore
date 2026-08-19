@@ -1,5 +1,6 @@
-# Root-level build artifacts and binaries
-/*.so
+# Build artifacts and binaries
+*.so
+*.o
 /qihse-server
 /qihse_keygen
 /test_mldsa

@@ -47,10 +47,10 @@ float qihse_distance_euclidean_scalar(const float* a, const float* b, size_t dim
 }
 
 /* -------------------------------------------------------------------------- */
-/* Horizontal sum helper for __m256 — AVX2+FMA target, pure SSE reduce       */
+/* Horizontal sum helper for __m256 — AVX target, pure SSE reduce             */
 /* -------------------------------------------------------------------------- */
 #ifdef __x86_64__
-__attribute__((target("avx2,fma")))
+__attribute__((target("avx")))
 static float hsum256(__m256 v) {
     /* Fold 8 lanes to 4 */
     __m128 lo  = _mm256_castps256_ps128(v);
@@ -63,6 +63,64 @@ static float hsum256(__m256 v) {
     __m128 t2  = _mm_shuffle_ps(s2, s2, 0x1);
     __m128 s1  = _mm_add_ss(s2, t2);
     return _mm_cvtss_f32(s1);
+}
+
+/* -------------------------------------------------------------------------- */
+/* AVX (AVX1) implementations (Sandy Bridge / Ivy Bridge fallback)            */
+/* -------------------------------------------------------------------------- */
+__attribute__((target("avx")))
+float qihse_distance_dot_avx(const float* a, const float* b, size_t dims) {
+    __m256 acc = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= dims; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+    }
+    float result = hsum256(acc);
+    for (; i < dims; i++) result += a[i] * b[i];
+    return result;
+}
+
+__attribute__((target("avx")))
+float qihse_distance_cosine_avx(const float* a, const float* b, size_t dims) {
+    __m256 acc_dot = _mm256_setzero_ps();
+    __m256 acc_na  = _mm256_setzero_ps();
+    __m256 acc_nb  = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= dims; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc_dot = _mm256_add_ps(acc_dot, _mm256_mul_ps(va, vb));
+        acc_na  = _mm256_add_ps(acc_na, _mm256_mul_ps(va, va));
+        acc_nb  = _mm256_add_ps(acc_nb, _mm256_mul_ps(vb, vb));
+    }
+    float dot = hsum256(acc_dot), na = hsum256(acc_na), nb = hsum256(acc_nb);
+    for (; i < dims; i++) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    if (na <= 0.0f || nb <= 0.0f) return 0.0f;
+    return dot / (sqrtf(na) * sqrtf(nb));
+}
+
+__attribute__((target("avx")))
+float qihse_distance_euclidean_avx(const float* a, const float* b, size_t dims) {
+    __m256 acc = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= dims; i += 8) {
+        __m256 va   = _mm256_loadu_ps(a + i);
+        __m256 vb   = _mm256_loadu_ps(b + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+    }
+    float result = hsum256(acc);
+    for (; i < dims; i++) {
+        float d = a[i] - b[i];
+        result += d * d;
+    }
+    return sqrtf(result);
 }
 #endif
 
@@ -291,6 +349,13 @@ static void qihse_distance_init_once(void) {
         g_cosine_fn    = qihse_distance_cosine_avx2;
         g_dot_fn       = qihse_distance_dot_avx2;
         g_euclidean_fn = qihse_distance_euclidean_avx2;
+#ifdef __x86_64__
+    } else if (qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX)) {
+        /* AVX1 path — 8 floats per instruction without FMA (Sandy Bridge / Ivy Bridge fallback) */
+        g_cosine_fn    = qihse_distance_cosine_avx;
+        g_dot_fn       = qihse_distance_dot_avx;
+        g_euclidean_fn = qihse_distance_euclidean_avx;
+#endif
     } else {
         /* Scalar fallback — safe on any architecture */
         g_cosine_fn    = qihse_distance_cosine_scalar;

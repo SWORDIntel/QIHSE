@@ -208,14 +208,26 @@ oqs-provider: liboqs
 		ninja 2>&1 && ninja install 2>&1
 	@echo "oqs-provider build successful"
 
-$(LIB_TARGET): $(SRCS)
+CSRCS = $(filter %.c, $(SRCS))
+CXXSRCS = $(filter %.cpp, $(SRCS))
+COBJS = $(CSRCS:.c=.o)
+CXXOBJS = $(CXXSRCS:.cpp=.o)
+OBJS = $(COBJS) $(CXXOBJS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS_BASE) -c $< -o $@
+
+$(LIB_TARGET): $(OBJS)
 	@echo "Building $(LIB_TARGET)..."
-	$(CC) -shared -fPIC $(CFLAGS) -o $(LIB_TARGET) $(SRCS) $(filter-out -lqihse,$(LDFLAGS))
+	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS))
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: $(filter-out sdks/python/qihse.c,$(SRCS))
+lib-ctypes: $(filter-out sdks/python/qihse.o,$(OBJS))
 	@echo "Building libqihse.so (ctypes, no Python extension)..."
-	$(CC) -shared -fPIC $(CFLAGS) -o libqihse.so $(filter-out sdks/python/qihse.c,$(SRCS)) $(filter-out -lpython3.13,$(filter-out -lqihse,$(LDFLAGS)))
+	$(CXX) -shared -fPIC -o libqihse.so $(filter-out sdks/python/qihse.o,$(OBJS)) $(filter-out -lpython3.13,$(filter-out -lqihse,$(LDFLAGS)))
 	@echo "libqihse.so (ctypes) build successful"
 
 persistence: test-persist
@@ -606,7 +618,7 @@ isa-info:
 	@echo "  CFLAGS (ISA portion)  = $(filter -mavx% -mfma -mamx% -mfpmath%,$(CFLAGS))"
 
 clean:
-	rm -f *.o libqihse.so qihse.dll qihse_benchmark qihse_benchmark_a00 \
+	rm -f $(OBJS) *.o libqihse.so qihse.dll qihse_benchmark qihse_benchmark_a00 \
 	    qihse_keygen \
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
