@@ -101,7 +101,9 @@ Prerequisites, configuration options, tuning guidelines, and advanced usage patt
 ### [🛠️ Usage How-Tos](usage/)
 Operational runbooks: vector DB mutation flows, memory maintenance loops, benchmark workflows.
 
-### [🏗️ Architecture](architecture/)
+### [🏗️ Architecture & Plans](architecture/)
+- [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md)
+- [SQLite VFS Implementation Plan](qihse_sqlite_vfs_plan.md)
 - [TRITON Lua Injector](architecture/lua_injector.md)
 - [QMAG Policy](architecture/qmag-policy.md)
 - [Technical Whitepaper](architecture/qihse_whitepaper_v1.0.md)

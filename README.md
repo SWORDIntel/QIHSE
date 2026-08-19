@@ -132,6 +132,7 @@ make test
 All technical specifications, integration manuals, API definitions, and code examples are documented in [`docs/`](docs/):
 
 - 📖 **[System Architecture & Engine Overview](docs/architecture/system_overview.md)**: In-depth technical guide covering all 8 engines, UWP layout, and SIMD dispatch.
+- ⚡ **[Redis Cluster Sharding Plan](docs/plans/qihse_redis_cluster_sharding_plan.md)**: Native C99 multi-node clustering blueprint with 16,384 CRC16 hash slots and multi-model routing.
 - 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
 - 🐍 **[Python SDK Manual](sdks/python/)**: Native CPython bindings and integration guide.
