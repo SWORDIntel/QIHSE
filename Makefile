@@ -279,6 +279,10 @@ test-cluster-failover: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_failover tests/test_cluster_failover.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_failover
 
+test-af-xdp-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_af_xdp_resp tests/test_af_xdp_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_af_xdp_resp
+
 test-guard-throttle: lib
 	$(CC) $(CFLAGS) -o tests/test_guard_throttle tests/test_guard_throttle.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_guard_throttle

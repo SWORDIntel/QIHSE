@@ -7,9 +7,11 @@
  * Packet classification:
  *   TCP dst port 5432  (PostgreSQL wire)  → XDP_REDIRECT to AF_XDP socket
  *   TCP dst port 7432  (UWP default)      → XDP_REDIRECT to AF_XDP socket
- *   TCP payload bytes 0-4 == "QIHSE"      → XDP_REDIRECT (UWP on any port)
+ *   TCP dst port 6379  (RESP / Redis)     → XDP_REDIRECT to AF_XDP socket
+ *   UDP dst port 16379 (Cluster Bus)      → XDP_REDIRECT to AF_XDP socket
+ *   TCP/UDP payload bytes 0-4 == "QIHSE"  → XDP_REDIRECT (UWP / Cluster on any port)
  *   Packet too short to parse headers     → XDP_DROP (malformed, DDoS mitigation)
- *   Anything else                         → XDP_PASS  (kernel TCP stack)
+ *   Anything else                         → XDP_PASS  (kernel TCP/IP stack)
  *
  * SPDX-License-Identifier: GPL-2.0
  */
@@ -18,6 +20,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -37,25 +40,29 @@ struct {
 
 /*
  * qihse_ports: configurable port list set by userspace.
- * Index 0 = PG wire port (default 5432)
- * Index 1 = UWP port     (default 7432)
+ * Index 0 = PG wire port   (default 5432)
+ * Index 1 = UWP port       (default 7432)
+ * Index 2 = RESP wire port (default 6379)
+ * Index 3 = Cluster bus    (default 16379)
  */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key,   __u32);
     __type(value, __u32);
-    __uint(max_entries, 2);
+    __uint(max_entries, 4);
 } qihse_ports SEC(".maps");
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
-#define QIHSE_DEFAULT_PG_PORT   5432
-#define QIHSE_DEFAULT_UWP_PORT  7432
+#define QIHSE_DEFAULT_PG_PORT    5432
+#define QIHSE_DEFAULT_UWP_PORT   7432
+#define QIHSE_DEFAULT_RESP_PORT  6379
+#define QIHSE_DEFAULT_BUS_PORT   16379
 
-/* Minimum packet size: Ethernet (14) + IPv4 (20) + TCP (20) = 54 bytes */
-#define QIHSE_MIN_PKT_LEN 54
+/* Minimum packet size: Ethernet (14) + IPv4 (20) + UDP (8) = 42 bytes */
+#define QIHSE_MIN_PKT_LEN 42
 
-/* UWP magic: 'Q','I','H','S','E' */
+/* UWP / Cluster magic: 'Q','I','H','S','E' */
 #define UWP_MAGIC_0 'Q'
 #define UWP_MAGIC_1 'I'
 #define UWP_MAGIC_2 'H'
@@ -86,54 +93,64 @@ int qihse_xdp_prog(struct xdp_md *ctx) {
         return XDP_DROP;
 
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
-        return XDP_PASS; /* Not IPv4 — let kernel handle (IPv6, ARP, etc.) */
+        return XDP_PASS; /* Not IPv4 — let kernel handle */
 
     /* Parse IPv4 */
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_DROP;
 
-    if (ip->protocol != IPPROTO_TCP)
-        return XDP_PASS;
-
-    /* IPv4 header length (variable) */
     __u32 ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < 20)
         return XDP_DROP;
 
-    /* Parse TCP */
-    struct tcphdr *tcp = (void *)ip + ip_hdr_len;
-    if ((void *)(tcp + 1) > data_end)
-        return XDP_DROP;
-
-    __u16 dst_port = bpf_ntohs(tcp->dest);
-
     /* Retrieve configured ports */
-    __u32 pg_port  = get_port(0, QIHSE_DEFAULT_PG_PORT);
-    __u32 uwp_port = get_port(1, QIHSE_DEFAULT_UWP_PORT);
+    __u32 pg_port   = get_port(0, QIHSE_DEFAULT_PG_PORT);
+    __u32 uwp_port  = get_port(1, QIHSE_DEFAULT_UWP_PORT);
+    __u32 resp_port = get_port(2, QIHSE_DEFAULT_RESP_PORT);
+    __u32 bus_port  = get_port(3, QIHSE_DEFAULT_BUS_PORT);
 
-    int is_qihse_port = (dst_port == pg_port || dst_port == uwp_port);
+    /* 1. Handle TCP traffic (PG, UWP, RESP) */
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)ip + ip_hdr_len;
+        if ((void *)(tcp + 1) > data_end)
+            return XDP_DROP;
 
-    /* Check UWP magic bytes in TCP payload (if enough data) */
-    __u32 tcp_hdr_len = tcp->doff * 4;
-    if (tcp_hdr_len < 20)
-        return XDP_DROP;
+        __u16 dst_port = bpf_ntohs(tcp->dest);
+        int is_qihse_port = (dst_port == pg_port || dst_port == uwp_port || dst_port == resp_port);
 
-    __u8 *payload = (void *)tcp + tcp_hdr_len;
-    int has_uwp_magic = 0;
-    if ((void *)(payload + 5) <= data_end) {
-        has_uwp_magic = (payload[0] == UWP_MAGIC_0 &&
-                         payload[1] == UWP_MAGIC_1 &&
-                         payload[2] == UWP_MAGIC_2 &&
-                         payload[3] == UWP_MAGIC_3 &&
-                         payload[4] == UWP_MAGIC_4);
+        /* Check payload for UWP magic or RESP array prefix */
+        __u32 tcp_hdr_len = tcp->doff * 4;
+        if (tcp_hdr_len < 20)
+            return XDP_DROP;
+
+        __u8 *payload = (void *)tcp + tcp_hdr_len;
+        int has_qihse_magic = 0;
+        if ((void *)(payload + 5) <= data_end) {
+            has_qihse_magic = (payload[0] == UWP_MAGIC_0 &&
+                               payload[1] == UWP_MAGIC_1 &&
+                               payload[2] == UWP_MAGIC_2 &&
+                               payload[3] == UWP_MAGIC_3 &&
+                               payload[4] == UWP_MAGIC_4);
+        }
+
+        if (is_qihse_port || has_qihse_magic) {
+            __u32 queue_idx = ctx->rx_queue_index;
+            return bpf_redirect_map(&xsks_map, queue_idx, XDP_PASS);
+        }
     }
 
-    /* Redirect QIHSE traffic to AF_XDP fast path */
-    if (is_qihse_port || has_uwp_magic) {
-        __u32 queue_idx = ctx->rx_queue_index;
-        int rc = bpf_redirect_map(&xsks_map, queue_idx, XDP_PASS);
-        return rc;
+    /* 2. Handle UDP traffic (Cluster Bus Gossip) */
+    if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (void *)ip + ip_hdr_len;
+        if ((void *)(udp + 1) > data_end)
+            return XDP_DROP;
+
+        __u16 dst_port = bpf_ntohs(udp->dest);
+        if (dst_port == bus_port) {
+            __u32 queue_idx = ctx->rx_queue_index;
+            return bpf_redirect_map(&xsks_map, queue_idx, XDP_PASS);
+        }
     }
 
     return XDP_PASS;
