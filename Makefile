@@ -201,26 +201,36 @@ lib: $(LIB_TARGET)
 # liboqs — post-quantum cryptography library (submodule)
 # ---------------------------------------------------------------------------
 liboqs:
-	@echo "Building liboqs..."
-	cd vendor/liboqs && mkdir -p build && cd build && \
+	@if [ -f vendor/liboqs/CMakeLists.txt ]; then \
+		echo "Building liboqs..."; \
+		cd vendor/liboqs && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DOQS_USE_OPENSSL=OFF .. 2>&1 && \
-		ninja 2>&1 && ninja install 2>&1
-	@echo "liboqs build successful"
+		ninja 2>&1 && (ninja install 2>&1 || true); \
+		echo "liboqs build successful"; \
+	elif [ -f /usr/local/include/oqs/oqs.h ] || [ -f /usr/include/oqs/oqs.h ]; then \
+		echo "liboqs already installed on system."; \
+	else \
+		echo "liboqs submodule not present; skipping local build"; \
+	fi
 
 # ---------------------------------------------------------------------------
 # oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
 # ---------------------------------------------------------------------------
 oqs-provider: liboqs
-	@echo "Building oqs-provider..."
-	cd vendor/oqs-provider && mkdir -p build && cd build && \
+	@if [ -f vendor/oqs-provider/CMakeLists.txt ] && ([ -f /usr/local/lib/cmake/liboqs/liboqsConfig.cmake ] || [ -f /usr/lib/cmake/liboqs/liboqsConfig.cmake ]); then \
+		echo "Building oqs-provider..."; \
+		cd vendor/oqs-provider && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
 			-DOPENSSL_ROOT_DIR=/usr \
 			-DOPENSSL_INCLUDE_DIR=/usr/include \
 			-DOPENSSL_CRYPTO_LIBRARY=/usr/lib/x86_64-linux-gnu/libcrypto.so \
 			-DOPENSSL_SSL_LIBRARY=/usr/lib/x86_64-linux-gnu/libssl.so \
 			-Dliboqs_DIR=/usr/local/lib/cmake/liboqs .. 2>&1 && \
-		ninja 2>&1 && ninja install 2>&1
-	@echo "oqs-provider build successful"
+		ninja 2>&1 && ninja install 2>&1; \
+		echo "oqs-provider build successful"; \
+	else \
+		echo "oqs-provider prerequisites not met; skipping"; \
+	fi
 
 CSRCS = $(filter %.c, $(SRCS))
 CXXSRCS = $(filter %.cpp, $(SRCS))

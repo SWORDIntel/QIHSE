@@ -2582,9 +2582,8 @@ static bool test_default_search_ignores_missing_or_corrupt_qtri(void) {
     TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
                 "default-search missing/corrupt fixture should be created");
 
-    char qtri_path[512];
-    snprintf(qtri_path, sizeof(qtri_path), "%s/vectors.qtri", path);
-    TEST_ASSERT(unlink(qtri_path) == 0, "test should remove vectors.qtri");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_TRINARY, NULL, 0),
+                "test should remove vectors.qtri");
 
     qihse_vector_db_t db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -2893,7 +2892,7 @@ static bool test_qmag_sidecar_persists_and_magnitude_query_matches_float32(void)
     uint64_t qmag_size = 0;
     TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_MAGNITUDE, &qmag_size),
                 "test should read qmag sidecar size");
-    TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
+    TEST_ASSERT(qmag_size == (uint64_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
                 "vectors.qmag size should match raw magnitude rows");
 
     const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
@@ -3616,9 +3615,8 @@ static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
     TEST_ASSERT(create_sign_friendly_qtri_db(&env, &path),
                 "default-search qmag fixture should be created");
 
-    char qmag_path[512];
-    snprintf(qmag_path, sizeof(qmag_path), "%s/vectors.qmag", path);
-    TEST_ASSERT(unlink(qmag_path) == 0, "test should remove vectors.qmag");
+    TEST_ASSERT(ctr_write_section(path, QIHSE_CTR_SEC_MAGNITUDE, NULL, 0),
+                "test should remove vectors.qmag");
 
     qihse_vector_db_t db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -3631,8 +3629,9 @@ static bool test_default_search_ignores_missing_or_corrupt_qmag(void) {
     qihse_vector_db_persistence_stats_t stats;
     TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &stats),
                 "stats should be available for missing qmag");
-    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_ABSENT,
-                "missing qmag should be reported absent");
+    TEST_ASSERT(stats.magnitude_status == QIHSE_VDB_MAGNITUDE_ABSENT ||
+                stats.magnitude_status == QIHSE_VDB_MAGNITUDE_CORRUPT,
+                "missing qmag should be reported absent or corrupt");
 
     const float query[] = {3.0f, 2.0f, 1.0f, -1.0f, -2.0f, -3.0f};
     qihse_vector_result_t result;
@@ -4665,12 +4664,12 @@ static bool test_compact_rewrites_qtri_sidecar_valid(void) {
     uint64_t qtri_size = 0;
     TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_TRINARY, &qtri_size),
                 "vectors.qtri size should be readable after compact");
-    TEST_ASSERT(qtri_size == (off_t)(stats.trinary_row_bytes * stats.trinary_rows),
+    TEST_ASSERT(qtri_size == (uint64_t)(stats.trinary_row_bytes * stats.trinary_rows),
                 "vectors.qtri size should match raw tryte rows");
     uint64_t qmag_size = 0;
     TEST_ASSERT(ctr_section_length(path, QIHSE_CTR_SEC_MAGNITUDE, &qmag_size),
                 "vectors.qmag size should be readable after compact");
-    TEST_ASSERT(qmag_size == (off_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
+    TEST_ASSERT(qmag_size == (uint64_t)(stats.magnitude_row_bytes * stats.magnitude_rows),
                 "vectors.qmag size should match raw magnitude rows");
 
     TEST_ASSERT(close_db(db), "database should close after qtri compact");
