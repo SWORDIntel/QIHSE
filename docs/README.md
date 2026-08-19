@@ -102,10 +102,11 @@ Prerequisites, configuration options, tuning guidelines, and advanced usage patt
 Operational runbooks: vector DB mutation flows, memory maintenance loops, benchmark workflows.
 
 ### [🏗️ Architecture & Plans](architecture/)
+- [Cluster Sharding Engine](architecture/cluster_sharding.md) — Redis-compatible 16,384-slot sharding, UDP gossip bus, Raft failover, RRF scatter-gather
 - [Automated Zero-Downtime Cluster Rebalancing](architecture/cluster_rebalancing.md)
 - [Distributed Multi-Engine Planner](architecture/distributed_query_planner.md)
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
-- [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md)
+- [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md) — COMPLETE
 - [SQLite VFS Implementation Plan](qihse_sqlite_vfs_plan.md)
 - [TRITON Lua Injector](architecture/lua_injector.md)
 - [QMAG Policy](architecture/qmag-policy.md)
