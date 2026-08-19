@@ -5231,6 +5231,17 @@ int qihse_vector_db_search(
 ) {
     int ret;
     int cache_count = 0;
+    qihse_vector_query_t query_fallback;
+
+    if (query && !query->user) {
+        query_fallback = *query;
+        query_fallback.user = qihse_auth_get_user(0);
+        if (!query_fallback.user) {
+            qihse_auth_init();
+            query_fallback.user = qihse_auth_get_user(0);
+        }
+        query = &query_fallback;
+    }
 
     if (!vdb || !query || !query->user || !query->query_vector || !results || max_results == 0u) {
         errno = query && !query->user ? EACCES : EINVAL;

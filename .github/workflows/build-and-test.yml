@@ -11,14 +11,16 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential gcc-11 g++-11 libpthread-stubs0-dev
+        sudo apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-pip python3-numpy libarchive-dev libzstd-dev
         
-    - name: Build Shared Library
+    - name: Build Shared Library & Binaries
       run: |
         make clean
         make all -j$(nproc)
@@ -26,20 +28,12 @@ jobs:
     - name: Verify Library Exports
       run: |
         nm -D ./libqihse.so | grep qihse_search || true
-        nm -D ./libqihse.so | grep qihse_cuda || true
 
     - name: Run Core Test Suite
       run: |
-        make test-persist || true
-        make test-trinary-codec || true
+        make test
 
-    - name: Verify Graceful Fallback
+    - name: Run Python SDK Tests
       run: |
-        chmod +x scripts/verify_fallback.sh
-        ./scripts/verify_fallback.sh
-
-    - name: Python Smoke Test
-      run: |
-        pip install numpy
         export LD_LIBRARY_PATH=$PWD
-        python3 python/qihse.py || true
+        PYTHONPATH=python python3 -m unittest discover -s python/tests

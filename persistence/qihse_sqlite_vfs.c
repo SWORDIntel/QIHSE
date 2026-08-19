@@ -135,43 +135,43 @@ typedef struct qihse_vfs_file {
 /* ── I/O methods dispatch table (iVersion=1; WAL SHM added in iVersion=2) ── */
 
 static const sqlite3_io_methods qihse_io_methods = {
-    1,                              /* iVersion */
-    qihse_io_xClose,
-    qihse_io_xRead,
-    qihse_io_xWrite,
-    qihse_io_xTruncate,
-    qihse_io_xSync,
-    qihse_io_xFileSize,
-    qihse_io_xLock,
-    qihse_io_xUnlock,
-    qihse_io_xCheckReservedLock,
-    qihse_io_xFileControl,
-    qihse_io_xSectorSize,
-    qihse_io_xDeviceCharacteristics,
+    .iVersion               = 1,
+    .xClose                 = qihse_io_xClose,
+    .xRead                  = qihse_io_xRead,
+    .xWrite                 = qihse_io_xWrite,
+    .xTruncate              = qihse_io_xTruncate,
+    .xSync                  = qihse_io_xSync,
+    .xFileSize              = qihse_io_xFileSize,
+    .xLock                  = qihse_io_xLock,
+    .xUnlock                = qihse_io_xUnlock,
+    .xCheckReservedLock     = qihse_io_xCheckReservedLock,
+    .xFileControl           = qihse_io_xFileControl,
+    .xSectorSize            = qihse_io_xSectorSize,
+    .xDeviceCharacteristics = qihse_io_xDeviceCharacteristics,
 };
 
 /* ── VFS descriptor ──────────────────────────────────────────────────────── */
 
 static sqlite3_vfs qihse_vfs_desc = {
-    1,                              /* iVersion */
-    (int)sizeof(qihse_vfs_file_t),  /* szOsFile — SQLite allocates this */
-    PATH_MAX,                       /* mxPathname */
-    NULL,                           /* pNext — managed by SQLite */
-    QIHSE_VFS_NAME,                 /* zName */
-    NULL,                           /* pAppData */
-    qihse_vfs_xOpen,
-    qihse_vfs_xDelete,
-    qihse_vfs_xAccess,
-    qihse_vfs_xFullPathname,
-    qihse_vfs_xDlOpen,
-    qihse_vfs_xDlError,
-    qihse_vfs_xDlSym,
-    qihse_vfs_xDlClose,
-    qihse_vfs_xRandomness,
-    qihse_vfs_xSleep,
-    NULL,                           /* xCurrentTime (deprecated double form) */
-    qihse_vfs_xGetLastError,
-    qihse_vfs_xCurrentTimeInt64,    /* iVersion >= 2 field, safe in v1 slot */
+    .iVersion          = 1,
+    .szOsFile          = (int)sizeof(qihse_vfs_file_t),
+    .mxPathname        = PATH_MAX,
+    .pNext             = NULL,
+    .zName             = QIHSE_VFS_NAME,
+    .pAppData          = NULL,
+    .xOpen             = qihse_vfs_xOpen,
+    .xDelete           = qihse_vfs_xDelete,
+    .xAccess           = qihse_vfs_xAccess,
+    .xFullPathname     = qihse_vfs_xFullPathname,
+    .xDlOpen           = qihse_vfs_xDlOpen,
+    .xDlError          = qihse_vfs_xDlError,
+    .xDlSym            = qihse_vfs_xDlSym,
+    .xDlClose          = qihse_vfs_xDlClose,
+    .xRandomness       = qihse_vfs_xRandomness,
+    .xSleep            = qihse_vfs_xSleep,
+    .xCurrentTime      = NULL,
+    .xGetLastError     = qihse_vfs_xGetLastError,
+    .xCurrentTimeInt64 = qihse_vfs_xCurrentTimeInt64,
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
