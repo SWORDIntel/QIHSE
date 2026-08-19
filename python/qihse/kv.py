@@ -14,17 +14,17 @@ _lib.qihse_kv_store_create.restype = _KVStore_p
 _lib.qihse_kv_store_destroy.argtypes = [_KVStore_p]
 _lib.qihse_kv_store_destroy.restype = None
 
-_lib.qihse_kv_set.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_char_p]
+_lib.qihse_kv_set.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_uint16]
 _lib.qihse_kv_set.restype = ctypes.c_bool
 
-_lib.qihse_kv_get.argtypes = [_KVStore_p, ctypes.c_char_p]
-_lib.qihse_kv_get.restype = ctypes.POINTER(ctypes.c_char)
+_lib.qihse_kv_get_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
+_lib.qihse_kv_get_user.restype = ctypes.POINTER(ctypes.c_char)
 
-_lib.qihse_kv_del.argtypes = [_KVStore_p, ctypes.c_char_p]
-_lib.qihse_kv_del.restype = ctypes.c_bool
+_lib.qihse_kv_del_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
+_lib.qihse_kv_del_user.restype = ctypes.c_bool
 
-_lib.qihse_kv_exists.argtypes = [_KVStore_p, ctypes.c_char_p]
-_lib.qihse_kv_exists.restype = ctypes.c_bool
+_lib.qihse_kv_exists_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
+_lib.qihse_kv_exists_user.restype = ctypes.c_bool
 
 _lib.qihse_kv_expire.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_uint64]
 _lib.qihse_kv_expire.restype = ctypes.c_bool
@@ -52,27 +52,26 @@ class KVStore:
     def __exit__(self, *args):
         self.close()
 
-    def set(self, key: str, value: str) -> bool:
-        return _lib.qihse_kv_set(self._ptr, key.encode('utf-8'), value.encode('utf-8'))
+    def set(self, key: str, value: str, classification: int = 0, sci_compartment: int = 0) -> bool:
+        return bool(_lib.qihse_kv_set(self._ptr, key.encode('utf-8'), value.encode('utf-8'), int(classification), int(sci_compartment)))
 
-    def get(self, key: str) -> Optional[str]:
-        c_str_ptr = _lib.qihse_kv_get(self._ptr, key.encode('utf-8'))
+    def get(self, key: str, user=None) -> Optional[str]:
+        c_str_ptr = _lib.qihse_kv_get_user(self._ptr, key.encode('utf-8'), user)
         if not c_str_ptr:
             return None
         c_str = ctypes.cast(c_str_ptr, ctypes.c_char_p).value
-        # Use libc to free the malloc'd string returned by qihse_kv_get
         libc = ctypes.CDLL(None)
         libc.free(c_str_ptr)
-        return c_str.decode('utf-8')
+        return c_str.decode('utf-8') if c_str else None
 
-    def delete(self, key: str) -> bool:
-        return _lib.qihse_kv_del(self._ptr, key.encode('utf-8'))
+    def delete(self, key: str, user=None) -> bool:
+        return bool(_lib.qihse_kv_del_user(self._ptr, key.encode('utf-8'), user))
 
-    def exists(self, key: str) -> bool:
-        return _lib.qihse_kv_exists(self._ptr, key.encode('utf-8'))
+    def exists(self, key: str, user=None) -> bool:
+        return bool(_lib.qihse_kv_exists_user(self._ptr, key.encode('utf-8'), user))
         
     def expire(self, key: str, ttl_ms: int) -> bool:
-        return _lib.qihse_kv_expire(self._ptr, key.encode('utf-8'), ttl_ms)
+        return bool(_lib.qihse_kv_expire(self._ptr, key.encode('utf-8'), int(ttl_ms)))
         
     def save(self, filepath: str) -> bool:
         return _lib.qihse_kv_save(self._ptr, filepath.encode('utf-8')) == 0

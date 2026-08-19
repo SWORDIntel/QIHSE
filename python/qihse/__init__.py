@@ -22,15 +22,29 @@ Usage:
     doc = qihse.DocumentStore(kv)
     doc.insert_json(1, '{"user": "alice", "age": 30}')
     
-    # Event Stream (record-framed commit log with SHA-384 integrity)
-    es = qihse.EventStream("/tmp/qihse_events")
-    es.append("bgp_updates", b'{"prefix":"1.2.3.0/24","asn":64512}')
-    for record in es.iterate("bgp_updates"):
-        print(record.schema_id, record.payload)
-    es.truncate_torn_tail("bgp_updates")
+    # Full-Text Search (FTS) Index with Neural Semantic Classification
+    fts = qihse.FTSIndex()
+    fts.add_document(1, "pentagon classified intelligence document", semantic_class=qihse.KeystoneClass.GOVERNMENT)
+    results = fts.search("pentagon intelligence", top_k=5)
     
-    # Start Unified Wire Protocol Server
-    qihse.UWPServer.start(port=8080, bind_address="0.0.0.0", kv=kv, doc=doc, tsdb=ts)
+    # Neural Micro-Model Classification (260->64->6 Feedforward)
+    cls, name, conf = qihse.NeuralClassifier.classify("auth_failure admin@pentagon.af.mil token=TOPSECRET")
+    
+    # Keystone Spline Interpolation Anchor Search
+    idx = qihse.AnchorIndex.lower_bound(sorted_timestamps, 1600000000)
+    
+    # Hardware Backend Profiler
+    hw = qihse.HardwareProfiler.get_profile()
+    print(f"Active Backend: {hw.preferred_backend} (AVX={hw.avx}, AVX2={hw.avx2})")
+    
+    # Hybrid FTS + Vector RRF Multimodal Fusion
+    fused = qihse.MultimodalFusion.search(
+        vector_db=db,
+        vector_queries=[{"vector": qvec, "modality": "text", "weight": 1.0}],
+        fts_index=fts,
+        fts_query="defense credential alert",
+        semantic_mask=(1 << qihse.KeystoneClass.GOVERNMENT)
+    )
 """
 
 from .core import VectorDB, VectorQuery, VectorResult, DistanceMetric
@@ -39,9 +53,21 @@ from .timeseries import TimeSeriesDB
 from .document import DocumentStore
 from .event_stream import EventStream, EventRecord, Durability
 from .uwp import UWPServer
+from .neural import NeuralClassifier, KeystoneClass
+from .anchor import AnchorIndex
+from .hardware import HardwareProfiler, HardwareProfile
+from .fts import FTSIndex, FTSResult
+from .fusion import MultimodalFusion, FusionResult
 
-__all__ = ["VectorDB", "VectorQuery", "VectorResult", "DistanceMetric",
-           "KVStore", "TimeSeriesDB", "DocumentStore",
-           "EventStream", "EventRecord", "Durability",
-           "UWPServer"]
-__version__ = "0.2.0"
+__all__ = [
+    "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric",
+    "KVStore", "TimeSeriesDB", "DocumentStore",
+    "EventStream", "EventRecord", "Durability",
+    "UWPServer",
+    "NeuralClassifier", "KeystoneClass",
+    "AnchorIndex",
+    "HardwareProfiler", "HardwareProfile",
+    "FTSIndex", "FTSResult",
+    "MultimodalFusion", "FusionResult",
+]
+__version__ = "0.3.0"

@@ -21,6 +21,8 @@ class TestQIHSEEngines(unittest.TestCase):
 
     def test_kv_store(self):
         with KVStore() as kv:
+            kv.delete("key1")
+            kv.delete("key2")
             # Test set/get
             self.assertTrue(kv.set("key1", "value1"))
             self.assertEqual(kv.get("key1"), "value1")

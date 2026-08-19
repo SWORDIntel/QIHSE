@@ -86,6 +86,7 @@ class CVectorQuery(ctypes.Structure):
         ("distance_metric", ctypes.c_int),
         ("metadata_filter", ctypes.c_void_p),
         ("metadata_filter_opaque", ctypes.c_void_p),
+        ("user", ctypes.c_void_p),
     ]
 
 class CVectorResult(ctypes.Structure):
@@ -141,6 +142,17 @@ _lib.qihse_vector_db_build_int8.restype = ctypes.c_bool
 
 _lib.qihse_vector_db_flush.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_flush.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_get_dims.argtypes = [_VectorDB_p]
+_lib.qihse_vector_db_get_dims.restype = ctypes.c_size_t
+
+_lib.qihse_auth_init.argtypes = []
+_lib.qihse_auth_init.restype = ctypes.c_bool
+
+_lib.qihse_auth_get_user.argtypes = [ctypes.c_uint32]
+_lib.qihse_auth_get_user.restype = ctypes.c_void_p
+
+_lib.qihse_auth_init()
 
 _lib.qihse_start_pg_wire_server.argtypes = [_VectorDB_p, ctypes.c_uint16, ctypes.c_char_p]
 _lib.qihse_start_pg_wire_server.restype = ctypes.c_bool
@@ -284,6 +296,7 @@ class VectorDB:
             c_query.distance_metric = metric.value
             c_query.metadata_filter = None
             c_query.metadata_filter_opaque = None
+            c_query.user = _lib.qihse_auth_get_user(0)
             
             out_results = (CVectorResult * top_k)()
     
@@ -421,7 +434,12 @@ class VectorDB:
 
     @property
     def dims(self) -> int:
-        return self._dims
+        with self._lock:
+            if self._ptr:
+                d = _lib.qihse_vector_db_get_dims(self._ptr)
+                if d > 0:
+                    return int(d)
+            return self._dims
 
     def start_pg_wire(self, port: int = 5432, bind_address: str = "127.0.0.1") -> bool:
         """Starts the PG wire protocol server in the background."""

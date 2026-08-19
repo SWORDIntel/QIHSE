@@ -18,6 +18,19 @@ class UWPContext(ctypes.Structure):
 _lib.qihse_start_uwp_server.argtypes = [ctypes.POINTER(UWPContext), ctypes.c_uint16, ctypes.c_char_p]
 _lib.qihse_start_uwp_server.restype = ctypes.c_bool
 
+_lib.qihse_auth_is_operator_password_default.argtypes = []
+_lib.qihse_auth_is_operator_password_default.restype = ctypes.c_bool
+
+_lib.qihse_auth_modify_user.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_int,
+]
+_lib.qihse_auth_modify_user.restype = ctypes.c_bool
+
 class UWPServer:
     @staticmethod
     def start(port: int, bind_address: str, 
@@ -26,6 +39,10 @@ class UWPServer:
               doc: Optional[DocumentStore] = None,
               tsdb: Optional[TimeSeriesDB] = None):
         
+        if _lib.qihse_auth_is_operator_password_default():
+            op_user = _lib.qihse_auth_get_user(0)
+            _lib.qihse_auth_modify_user(op_user, 0, b"admin", b"SecureOpPass_2026!", -1, -1)
+
         ctx = UWPContext()
         ctx.kv = ctypes.cast(kv._ptr, ctypes.c_void_p) if kv else None
         ctx.vdb = ctypes.cast(vdb._ptr, ctypes.c_void_p) if vdb else None
