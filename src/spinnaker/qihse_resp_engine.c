@@ -1701,10 +1701,12 @@ static void qihse_resp_remove_client(qihse_resp_client_ctx_t* client) {
 
 static void* qihse_resp_client_main(void* argument) {
     qihse_resp_client_ctx_t* client = (qihse_resp_client_ctx_t*)argument;
-    qihse_resp_session_loop(client->server, client->fd);
+    qihse_resp_server_t* server = client->server;
+    int fd = client->fd;
+    qihse_resp_session_loop(server, fd);
+    shutdown(fd, SHUT_RDWR);
+    close_socket(fd);
     qihse_resp_remove_client(client);
-    shutdown(client->fd, SHUT_RDWR);
-    close_socket(client->fd);
     free(client);
     return NULL;
 }
