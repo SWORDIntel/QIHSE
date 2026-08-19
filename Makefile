@@ -79,7 +79,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/network_intelligence/bgp_route_probe.cpp src/network_intelligence/bgp_update_decoder.cpp src/network_intelligence/rpki_rtr_probe.cpp src/network_intelligence/rdap_probe.cpp src/network_intelligence/ptr_probe.cpp src/network_intelligence/route_helper.cpp \
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c \
             src/spinnaker/qihse_pg_wire.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
-            vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c \
+            vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
@@ -170,6 +170,9 @@ server: lib
 
 redis-cluster-node: lib
 	$(CC) $(CFLAGS) -o tests/qihse_cluster_node tests/qihse_cluster_node.c -L. -lqihse $(LDFLAGS)
+
+redis-cluster-bootstrap: lib
+	$(CC) $(CFLAGS) -o tests/qihse_cluster_bootstrap tests/qihse_cluster_bootstrap.c -L. -lqihse $(LDFLAGS)
 
 keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c
 	@echo "Building qihse_keygen..."
@@ -290,6 +293,10 @@ test-guard-throttle: lib
 test-cluster-scatter: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_scatter tests/test_cluster_scatter.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_scatter
+
+test-dist-planner: lib
+	$(CC) $(CFLAGS) -o tests/test_dist_planner tests/test_dist_planner.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_dist_planner
 
 test-kv-read-integrity: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_read_integrity tests/test_kv_read_integrity.c -L. -lqihse $(LDFLAGS)
