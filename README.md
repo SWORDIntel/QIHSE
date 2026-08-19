@@ -109,6 +109,62 @@ QIHSE treats performance as a low-level systems problem:
 
 ---
 
+## Python SDK Quickstart
+
+QIHSE provides a native CPython SDK (`pip install -e python`):
+
+```python
+import qihse
+import numpy as np
+
+# 1. Vector Database with Exact Math & HNSW
+with qihse.VectorDB.create("/tmp/mydb", dims=128) as db:
+    vecs = np.random.rand(100, 128).astype(np.float32)
+    db.add_vectors(vecs, ids=list(range(100)))
+    results = db.search(vecs[0], k=10)
+
+# 2. Key-Value Store with LSM-Trees & WAL
+with qihse.KVStore() as kv:
+    kv.set("sensor:01", "active_240v")
+    val = kv.get("sensor:01")
+
+# 3. Full-Text Search (BM25) with 6-Class Neural Filtering
+with qihse.FTSIndex() as fts:
+    fts.add_document(1, "pentagon classified defense alert", semantic_class=qihse.KeystoneClass.GOVERNMENT)
+    res = fts.search("defense alert", top_k=5)
+
+# 4. Neural Micro-Model Classification (260->64->6 Feedforward)
+cls, name, conf = qihse.NeuralClassifier.classify("auth_failure admin@pentagon.af.mil token=TOPSECRET")
+print(f"Detected: {name} ({conf*100:.1f}%)")
+
+# 5. Hybrid Multimodal Reciprocal Rank Fusion (RRF)
+fused = qihse.MultimodalFusion.search(
+    vector_db=db,
+    vector_queries=[{"vector": vecs[0], "modality": "text", "weight": 1.0}],
+    fts_index=fts,
+    fts_query="defense alert",
+    semantic_mask=(1 << qihse.KeystoneClass.GOVERNMENT),
+)
+```
+
+---
+
+## QIHSE + KEYSTONE 5-Pillar Performance Benchmarks
+
+Measured on host hardware (Intel Xeon E5-2407, AVX execution mode):
+
+| Pillar / Subsystem | QIHSE + KEYSTONE Measured | Industry Standard / Alternative | Competitive Advantage |
+| :--- | :--- | :--- | :--- |
+| **[1] Vector Graph Search** | **33,080 QPS** (p50: 27.9 µs)<br>Anchor-Seeded 1D Spline Projection | **FAISS HNSW (CPU)**: ~15,000 QPS (65 µs)<br>**pgvector (HNSW)**: ~2,000 QPS (500 µs) | **2.2x higher QPS** vs FAISS CPU<br>**16.5x higher QPS** vs pgvector |
+| **[2] Sorted Column / TSDB Search** | **3,510,610 lookups/s** (218 ns)<br>Keystone $O(\log \log N)$ Spline (18 ns best) | **C++ `std::lower_bound`**: 2,016,334 (447 ns)<br>**Postgres B-Tree**: ~600k lookups/s (1.2 µs) | **1.74x–2.0x faster** vs `std::lower_bound`<br>**5.5x faster** vs B+Tree pointer chasing |
+| **[3] Packet Ingest / Log Scan** | **141,865 pkts/sec** (34.6 MiB/s)<br>AF_XDP Kernel Bypass + In-Place UMEM Scan | **Linux BSD Socket + epoll**: ~25,000 pkts/s<br>**Redis Ingestion**: ~75,000 ops/s | **5.6x higher throughput** vs epoll<br>**1.9x higher throughput** vs Redis |
+| **[4] Neural Context Inference** | **370,749 infer/s** (2.55 µs)<br>Inlined Dense SAXPY C Kernel (260 $\to$ 64 $\to$ 6) | **ONNX Runtime (CPU)**: ~35,000 infer/s (28 µs)<br>**PyTorch LibTorch**: ~5,000 infer/s (200 µs) | **10.5x faster inference** vs ONNX Runtime<br>**74.0x faster** vs PyTorch LibTorch |
+| **[5] Hybrid Multimodal Search** | **1,838 queries/s** (501 µs)<br>In-Memory BM25 + HNSW + Neural Masking | **OpenSearch Hybrid**: ~120 QPS (8.3 ms)<br>**Weaviate Hybrid**: ~200 QPS (5.0 ms) | **16.5x lower latency** vs OpenSearch<br>**10.0x lower latency** vs Weaviate |
+
+> 📊 **Full Benchmark Details:** See [`docs/benchmarks/keystone_qihse_integrated_benchmarks.md`](docs/benchmarks/keystone_qihse_integrated_benchmarks.md) and [`docs/benchmarks/benchmarks.md`](docs/benchmarks/benchmarks.md).
+
+---
+
 ## Build & CLI Launcher
 
 ```bash
@@ -117,6 +173,9 @@ make clean && make
 
 # Run the test suite
 make test
+
+# Run joint integrated benchmark suite
+make bench-keystone-integrated
 
 # Launch the unified management CLI
 ./qihse status
@@ -132,10 +191,11 @@ make test
 All technical specifications, integration manuals, API definitions, and code examples are documented in [`docs/`](docs/):
 
 - 📖 **[System Architecture & Engine Overview](docs/architecture/system_overview.md)**: In-depth technical guide covering all 8 engines, UWP layout, and SIMD dispatch.
+- ⚡ **[QIHSE + KEYSTONE Integrated Benchmarks](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**: 5-pillar joint architecture report and comparative analysis.
 - ⚡ **[Redis Cluster Sharding Plan](docs/plans/qihse_redis_cluster_sharding_plan.md)**: Native C99 multi-node clustering blueprint with 16,384 CRC16 hash slots and multi-model routing.
 - 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
-- 🐍 **[Python SDK Manual](sdks/python/)**: Native CPython bindings and integration guide.
+- 🐍 **[Python SDK Manual](python/)**: Native CPython bindings and integration guide.
 - 🦀 **[Rust SDK Manual](rust/qihse-rs/)**: FFI safe wrappers (`KVStore`, `VectorDB`, `TrinaryTrie`).
 - 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and CNSA 2.0 PQC encryption.
 - 🛡️ **[Security Audit & Hardening Report](docs/security/hardening-report.md)**: Results from static analysis, memory audit, and file I/O hardening.
@@ -146,3 +206,4 @@ All technical specifications, integration manuals, API definitions, and code exa
 ## License
 
 QIHSE is licensed under **AGPL-3.0**. Read [LICENSE](LICENSE) before use.
+
