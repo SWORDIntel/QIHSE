@@ -659,7 +659,7 @@ endif
 # Standalone loadable extension target
 qihse_vfs.so: $(SRCS_VFS) persistence/qihse_file_posix.c libqihse.so
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $(SRCS_VFS) persistence/qihse_file_posix.c \
-	    -DSQLITE_CORE $$(pkg-config --cflags --libs sqlite3) -L. -lqihse -lssl -lcrypto -Wl,-rpath,'$$ORIGIN'
+	    $$(pkg-config --cflags --libs sqlite3) -L. -lqihse -lssl -lcrypto -Wl,-rpath,'$$ORIGIN'
 
 # Integration test target
 test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c

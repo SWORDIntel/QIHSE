@@ -27,14 +27,6 @@
 #  define _FILE_OFFSET_BITS 64
 #endif
 
-/*
- * SQLITE_CORE: we are compiled into the same binary as SQLite (or at least
- * linked against libsqlite3).  This makes SQLITE_EXTENSION_INIT2 a no-op.
- */
-#ifndef SQLITE_CORE
-#  define SQLITE_CORE
-#endif
-
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
