@@ -43,8 +43,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp 
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp 
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -229,13 +229,14 @@ OBJS = $(COBJS) $(CXXOBJS)
 
 $(LIB_TARGET): $(OBJS)
 	@echo "Building $(LIB_TARGET)..."
-	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS))
+	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS)) -lsqlite3
 	@echo "$(LIB_TARGET) build successful"
 
 lib-ctypes: $(filter-out sdks/python/qihse.o,$(OBJS))
-	@echo "Building libqihse.so (ctypes, no Python extension)..."
-	$(CXX) -shared -fPIC -o libqihse.so $(filter-out sdks/python/qihse.o,$(OBJS)) $(filter-out -lpython3.13,$(filter-out -lqihse,$(LDFLAGS)))
-	@echo "libqihse.so (ctypes) build successful"
+	@echo "Building libqihse.so..."
+	$(CXX) -shared -fPIC -o libqihse.so $(subst .c,.o,$(subst .cpp,.o,$(SRCS))) \
+	    -L. -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 $$(pkg-config --libs sqlite3)
+	@echo "libqihse.so build successful"
 
 persistence: test-persist
 persistence-check: test-persist
@@ -658,7 +659,7 @@ endif
 # Standalone loadable extension target
 qihse_vfs.so: $(SRCS_VFS) persistence/qihse_file_posix.c libqihse.so
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $(SRCS_VFS) persistence/qihse_file_posix.c \
-	    -DSQLITE_CORE $$(pkg-config --cflags --libs sqlite3) -L. -lqihse -lssl -lcrypto -Wl,-rpath,.
+	    -DSQLITE_CORE $$(pkg-config --cflags --libs sqlite3) -L. -lqihse -lssl -lcrypto -Wl,-rpath,'$$ORIGIN'
 
 # Integration test target
 test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c

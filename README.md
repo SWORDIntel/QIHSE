@@ -83,6 +83,7 @@ The QIHSE sync replication layer currently serializes KV set and vector set payl
 | Graph Engine | `0x06` | `qihse_graph_*` | Anchor + HNSW multi-hop traversal (reserved target) |
 | Full-Text Search | Native | `qihse_fts_*` | BM25 lexical search, zero-copy tokenization |
 | Event Stream | `0x07` | `qihse_event_*` | `mmap`/`sendfile` DMA append-only log |
+| SQLite VFS | Native | `qihse_sqlite_vfs` | Drop-in SQLite VFS backend powered by Black Hole KV & Marmalade Event Stream |
 
 ---
 
