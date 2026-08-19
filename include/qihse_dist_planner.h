@@ -36,9 +36,10 @@ typedef enum {
 typedef enum {
     QIHSE_HW_BACKEND_SCALAR = 0,
     QIHSE_HW_BACKEND_SSE42  = 1,
-    QIHSE_HW_BACKEND_AVX2   = 2,
-    QIHSE_HW_BACKEND_AVX512 = 3,
-    QIHSE_HW_BACKEND_BLAS   = 4
+    QIHSE_HW_BACKEND_AVX    = 2,
+    QIHSE_HW_BACKEND_AVX2   = 3,
+    QIHSE_HW_BACKEND_AVX512 = 4,
+    QIHSE_HW_BACKEND_BLAS   = 5
 } qihse_hw_backend_t;
 
 typedef struct {
@@ -53,6 +54,7 @@ typedef struct {
     uint64_t cpu_features;
     qihse_cache_topology_t cache;
     bool sse42_available;
+    bool avx_available;
     bool avx2_available;
     bool avx512_available;
     bool blas_available;

@@ -54,14 +54,15 @@ static void test_host_profile_autodetect(void) {
     if (p->blas_available)        assert(p->preferred == QIHSE_HW_BACKEND_BLAS);
     else if (p->avx512_available) assert(p->preferred == QIHSE_HW_BACKEND_AVX512);
     else if (p->avx2_available)   assert(p->preferred == QIHSE_HW_BACKEND_AVX2);
+    else if (p->avx_available)    assert(p->preferred == QIHSE_HW_BACKEND_AVX);
     else if (p->sse42_available)  assert(p->preferred == QIHSE_HW_BACKEND_SSE42);
     else                          assert(p->preferred == QIHSE_HW_BACKEND_SCALAR);
 
     printf("  -> cache_line=%d L1d=%zu L2=%zu L3=%zu numa=%d "
-           "avx2=%d avx512=%d sse42=%d blas=%d preferred=%s OK\n",
+           "avx=%d avx2=%d avx512=%d sse42=%d blas=%d preferred=%s OK\n",
            p->cache.cache_line_size, p->cache.l1_data_size, p->cache.l2_size,
            p->cache.l3_size, p->cache.numa_nodes,
-           p->avx2_available, p->avx512_available, p->sse42_available,
+           p->avx_available, p->avx2_available, p->avx512_available, p->sse42_available,
            p->blas_available, qihse_hw_backend_name(p->preferred));
 
     qihse_hw_profile_destroy(p);
@@ -306,6 +307,7 @@ static void test_backend_name_coverage(void) {
     printf("Testing backend name coverage...\n");
     assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_SCALAR), "scalar") == 0);
     assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_SSE42),  "sse4.2") == 0);
+    assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_AVX),    "avx")    == 0);
     assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_AVX2),   "avx2")   == 0);
     assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_AVX512), "avx512") == 0);
     assert(strcmp(qihse_hw_backend_name(QIHSE_HW_BACKEND_BLAS),   "blas")   == 0);

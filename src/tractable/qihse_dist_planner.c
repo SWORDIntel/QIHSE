@@ -346,14 +346,16 @@ qihse_hw_profile_t* qihse_hw_profile_create_from(uint64_t cpu_features, const qi
     if (cache) p->cache = *cache;
     else probe_host_cache(&p->cache);
 
-    p->sse42_available = (cpu_features & QIHSE_CPU_FEATURE_SSE4_2) != 0;
-    p->avx2_available = (cpu_features & QIHSE_CPU_FEATURE_AVX2) != 0;
+    p->sse42_available  = (cpu_features & QIHSE_CPU_FEATURE_SSE4_2) != 0;
+    p->avx_available    = (cpu_features & QIHSE_CPU_FEATURE_AVX) != 0;
+    p->avx2_available   = (cpu_features & QIHSE_CPU_FEATURE_AVX2) != 0;
     p->avx512_available = (cpu_features & (QIHSE_CPU_FEATURE_AVX512F | QIHSE_CPU_FEATURE_AVX512BW)) != 0;
-    p->blas_available = blas_available;
+    p->blas_available   = blas_available;
 
     if (p->blas_available) p->preferred = QIHSE_HW_BACKEND_BLAS;
     else if (p->avx512_available) p->preferred = QIHSE_HW_BACKEND_AVX512;
     else if (p->avx2_available) p->preferred = QIHSE_HW_BACKEND_AVX2;
+    else if (p->avx_available) p->preferred = QIHSE_HW_BACKEND_AVX;
     else if (p->sse42_available) p->preferred = QIHSE_HW_BACKEND_SSE42;
     else p->preferred = QIHSE_HW_BACKEND_SCALAR;
 
@@ -377,6 +379,7 @@ void qihse_hw_profile_set_blas_available(qihse_hw_profile_t* profile, bool avail
     if (available) profile->preferred = QIHSE_HW_BACKEND_BLAS;
     else if (profile->avx512_available) profile->preferred = QIHSE_HW_BACKEND_AVX512;
     else if (profile->avx2_available) profile->preferred = QIHSE_HW_BACKEND_AVX2;
+    else if (profile->avx_available) profile->preferred = QIHSE_HW_BACKEND_AVX;
     else if (profile->sse42_available) profile->preferred = QIHSE_HW_BACKEND_SSE42;
     else profile->preferred = QIHSE_HW_BACKEND_SCALAR;
 }
@@ -385,6 +388,7 @@ const char* qihse_hw_backend_name(qihse_hw_backend_t backend) {
     switch (backend) {
         case QIHSE_HW_BACKEND_SCALAR: return "scalar";
         case QIHSE_HW_BACKEND_SSE42:  return "sse4.2";
+        case QIHSE_HW_BACKEND_AVX:    return "avx";
         case QIHSE_HW_BACKEND_AVX2:   return "avx2";
         case QIHSE_HW_BACKEND_AVX512: return "avx512";
         case QIHSE_HW_BACKEND_BLAS:   return "blas";
@@ -407,10 +411,12 @@ qihse_hw_backend_t qihse_hw_select_backend(const qihse_hw_profile_t* profile, si
     } else if (payload_bytes >= l2) {
         if (profile->avx512_available) target = QIHSE_HW_BACKEND_AVX512;
         else if (profile->avx2_available) target = QIHSE_HW_BACKEND_AVX2;
+        else if (profile->avx_available) target = QIHSE_HW_BACKEND_AVX;
         else if (profile->sse42_available) target = QIHSE_HW_BACKEND_SSE42;
         else target = QIHSE_HW_BACKEND_SCALAR;
     } else if (payload_bytes >= l1) {
         if (profile->avx2_available) target = QIHSE_HW_BACKEND_AVX2;
+        else if (profile->avx_available) target = QIHSE_HW_BACKEND_AVX;
         else if (profile->sse42_available) target = QIHSE_HW_BACKEND_SSE42;
         else target = QIHSE_HW_BACKEND_SCALAR;
     } else if (payload_bytes >= (l1 / 4)) {
@@ -424,13 +430,19 @@ qihse_hw_backend_t qihse_hw_select_backend(const qihse_hw_profile_t* profile, si
     if (target == QIHSE_HW_BACKEND_BLAS && !profile->blas_available) {
         target = profile->avx512_available ? QIHSE_HW_BACKEND_AVX512 :
                  profile->avx2_available ? QIHSE_HW_BACKEND_AVX2 :
+                 profile->avx_available ? QIHSE_HW_BACKEND_AVX :
                  profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
     }
     if (target == QIHSE_HW_BACKEND_AVX512 && !profile->avx512_available) {
         target = profile->avx2_available ? QIHSE_HW_BACKEND_AVX2 :
+                 profile->avx_available ? QIHSE_HW_BACKEND_AVX :
                  profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
     }
     if (target == QIHSE_HW_BACKEND_AVX2 && !profile->avx2_available) {
+        target = profile->avx_available ? QIHSE_HW_BACKEND_AVX :
+                 profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
+    }
+    if (target == QIHSE_HW_BACKEND_AVX && !profile->avx_available) {
         target = profile->sse42_available ? QIHSE_HW_BACKEND_SSE42 : QIHSE_HW_BACKEND_SCALAR;
     }
     if (target == QIHSE_HW_BACKEND_SSE42 && !profile->sse42_available) {
