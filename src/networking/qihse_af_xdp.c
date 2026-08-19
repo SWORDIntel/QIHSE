@@ -6,11 +6,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 #include <xdp/libxdp.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <net/ethernet.h>
 #include <linux/if_link.h>
 
 #define NUM_FRAMES 4096
@@ -28,13 +34,13 @@ struct qihse_af_xdp_ctx {
 };
 
 struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
+    if (!ifname || strlen(ifname) == 0) return NULL;
     struct qihse_af_xdp_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
 
     /* 1. Load XDP program */
     int ifindex = if_nametoindex(ifname);
     if (!ifindex) {
-        perror("if_nametoindex");
         free(ctx);
         return NULL;
     }
@@ -48,14 +54,13 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
     }
     if (!xdp_obj) xdp_obj = "/usr/local/lib/qihse/qihse_xdp.o";
     ctx->prog = xdp_program__open_file(xdp_obj, "xdp", NULL);
-    if (libxdp_get_error(ctx->prog)) {
-        fprintf(stderr, "Failed to open XDP program\n");
+    if (!ctx->prog || libxdp_get_error(ctx->prog)) {
+        // Non-fatal if XDP object file is not installed on system; allow graceful fallback
         free(ctx);
         return NULL;
     }
 
     if (xdp_program__attach(ctx->prog, ifindex, XDP_MODE_SKB, 0)) {
-        fprintf(stderr, "Failed to attach XDP program\n");
         xdp_program__close(ctx->prog);
         free(ctx);
         return NULL;
@@ -63,7 +68,6 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
 
     /* 2. Setup UMEM */
     if (posix_memalign(&ctx->buffer, getpagesize(), NUM_FRAMES * FRAME_SIZE)) {
-        fprintf(stderr, "Failed to allocate buffer\n");
         goto cleanup;
     }
 
@@ -77,7 +81,6 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
 
     if (xsk_umem__create(&ctx->umem, ctx->buffer, NUM_FRAMES * FRAME_SIZE, 
                          &ctx->fill_ring, &ctx->comp_ring, &umem_cfg)) {
-        fprintf(stderr, "Failed to create UMEM\n");
         goto cleanup;
     }
 
@@ -92,7 +95,6 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
 
     if (xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem,
                            &ctx->rx_ring, &ctx->tx_ring, &xsk_cfg)) {
-        fprintf(stderr, "Failed to create AF_XDP socket\n");
         xsk_umem__delete(ctx->umem);
         goto cleanup;
     }
@@ -114,14 +116,9 @@ struct qihse_af_xdp_ctx *qihse_af_xdp_init(const char *ifname) {
         int xsk_map_fd = bpf_map__fd(xsk_map);
         int sock_fd    = xsk_socket__fd(ctx->xsk);
         uint32_t key   = 0; /* queue index 0 */
-        if (bpf_map_update_elem(xsk_map_fd, &key, &sock_fd, BPF_ANY) != 0) {
-            fprintf(stderr, "[QIHSE eBPF] Warning: failed to register socket in XSKMAP\n");
-        }
-    } else {
-        fprintf(stderr, "[QIHSE eBPF] Warning: xsks_map not found in BPF object\n");
+        bpf_map_update_elem(xsk_map_fd, &key, &sock_fd, BPF_ANY);
     }
 
-    printf("[QIHSE eBPF] XDP program attached to %s. AF_XDP socket registered.\n", ifname);
     return ctx;
 
 cleanup:
@@ -134,7 +131,7 @@ cleanup:
 
 void qihse_af_xdp_teardown(struct qihse_af_xdp_ctx *ctx, const char *ifname) {
     if (!ctx) return;
-    int ifindex = if_nametoindex(ifname);
+    int ifindex = ifname ? if_nametoindex(ifname) : 0;
     if (ctx->xsk) xsk_socket__delete(ctx->xsk);
     if (ctx->umem) xsk_umem__delete(ctx->umem);
     if (ctx->buffer) free(ctx->buffer);
@@ -148,18 +145,35 @@ int qihse_af_xdp_get_fd(struct qihse_af_xdp_ctx *ctx) {
     return xsk_socket__fd(ctx->xsk);
 }
 
-/*
- * qihse_af_xdp_set_port - Configure a port in the kernel BPF port map.
- * idx 0 = PG wire port, idx 1 = UWP port.
- * Call after qihse_af_xdp_init().
- */
 void qihse_af_xdp_set_port(struct qihse_af_xdp_ctx *ctx, uint32_t idx, uint32_t port) {
     if (!ctx || !ctx->prog) return;
     struct bpf_object *bpf_obj = xdp_program__bpf_obj(ctx->prog);
+    if (!bpf_obj) return;
     struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, "qihse_ports");
     if (!map) return;
     int fd = bpf_map__fd(map);
     bpf_map_update_elem(fd, &idx, &port, BPF_ANY);
+}
+
+bool qihse_af_xdp_send(struct qihse_af_xdp_ctx *ctx, const void *pkt, uint32_t len) {
+    if (!ctx || !ctx->xsk || !pkt || len == 0 || len > FRAME_SIZE) return false;
+
+    uint32_t idx_tx = 0;
+    if (xsk_ring_prod__reserve(&ctx->tx_ring, 1, &idx_tx) != 1) {
+        return false;
+    }
+
+    struct xdp_desc *desc = xsk_ring_prod__tx_desc(&ctx->tx_ring, idx_tx);
+    uint64_t addr = (uint64_t)idx_tx * FRAME_SIZE;
+    char *dest = xsk_umem__get_data(ctx->buffer, addr);
+    memcpy(dest, pkt, len);
+
+    desc->addr = addr;
+    desc->len = len;
+
+    xsk_ring_prod__submit(&ctx->tx_ring, 1);
+    sendto(xsk_socket__fd(ctx->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    return true;
 }
 
 void qihse_af_xdp_poll(struct qihse_af_xdp_ctx *ctx, qihse_af_xdp_cb_t cb, void *arg) {
@@ -172,7 +186,6 @@ void qihse_af_xdp_poll(struct qihse_af_xdp_ctx *ctx, qihse_af_xdp_cb_t cb, void 
     uint32_t idx_fq = 0;
     unsigned int ret = xsk_ring_prod__reserve(&ctx->fill_ring, rcvd, &idx_fq);
     if (ret < rcvd) {
-        // Drop logic if fill queue is full
         xsk_ring_cons__release(&ctx->rx_ring, rcvd);
         return;
     }
@@ -193,5 +206,64 @@ void qihse_af_xdp_poll(struct qihse_af_xdp_ctx *ctx, qihse_af_xdp_cb_t cb, void 
     xsk_ring_prod__submit(&ctx->fill_ring, rcvd);
     xsk_ring_cons__release(&ctx->rx_ring, rcvd);
 }
-#endif
 
+bool qihse_af_xdp_extract_tcp_payload(
+    const void *raw_pkt, uint32_t raw_len,
+    const char **out_payload, uint32_t *out_payload_len,
+    uint32_t *out_src_ip, uint16_t *out_src_port, uint16_t *out_dst_port) {
+    if (!raw_pkt || raw_len < 54) return false;
+
+    const uint8_t *p = (const uint8_t *)raw_pkt;
+    const struct ether_header *eth = (const struct ether_header *)p;
+    if (ntohs(eth->ether_type) != ETHERTYPE_IP) return false;
+
+    const struct ip *iph = (const struct ip *)(p + sizeof(struct ether_header));
+    uint32_t ip_hl = (uint32_t)iph->ip_hl * 4;
+    if (ip_hl < 20 || sizeof(struct ether_header) + ip_hl > raw_len) return false;
+    if (iph->ip_p != IPPROTO_TCP) return false;
+
+    const struct tcphdr *tcph = (const struct tcphdr *)(p + sizeof(struct ether_header) + ip_hl);
+    uint32_t tcp_hl = (uint32_t)tcph->doff * 4;
+    uint32_t hdr_total = sizeof(struct ether_header) + ip_hl + tcp_hl;
+    if (tcp_hl < 20 || hdr_total > raw_len) return false;
+
+    if (out_src_ip) *out_src_ip = ntohl(iph->ip_src.s_addr);
+    if (out_src_port) *out_src_port = ntohs(tcph->source);
+    if (out_dst_port) *out_dst_port = ntohs(tcph->dest);
+
+    if (out_payload) *out_payload = (const char *)(p + hdr_total);
+    if (out_payload_len) *out_payload_len = raw_len - hdr_total;
+
+    return true;
+}
+
+bool qihse_af_xdp_extract_udp_payload(
+    const void *raw_pkt, uint32_t raw_len,
+    const void **out_payload, uint32_t *out_payload_len,
+    uint32_t *out_src_ip, uint16_t *out_src_port, uint16_t *out_dst_port) {
+    if (!raw_pkt || raw_len < 42) return false;
+
+    const uint8_t *p = (const uint8_t *)raw_pkt;
+    const struct ether_header *eth = (const struct ether_header *)p;
+    if (ntohs(eth->ether_type) != ETHERTYPE_IP) return false;
+
+    const struct ip *iph = (const struct ip *)(p + sizeof(struct ether_header));
+    uint32_t ip_hl = (uint32_t)iph->ip_hl * 4;
+    if (ip_hl < 20 || sizeof(struct ether_header) + ip_hl > raw_len) return false;
+    if (iph->ip_p != IPPROTO_UDP) return false;
+
+    const struct udphdr *udph = (const struct udphdr *)(p + sizeof(struct ether_header) + ip_hl);
+    uint32_t hdr_total = sizeof(struct ether_header) + ip_hl + sizeof(struct udphdr);
+    if (hdr_total > raw_len) return false;
+
+    if (out_src_ip) *out_src_ip = ntohl(iph->ip_src.s_addr);
+    if (out_src_port) *out_src_port = ntohs(udph->source);
+    if (out_dst_port) *out_dst_port = ntohs(udph->dest);
+
+    if (out_payload) *out_payload = (const void *)(p + hdr_total);
+    if (out_payload_len) *out_payload_len = raw_len - hdr_total;
+
+    return true;
+}
+
+#endif /* _WIN32 */
