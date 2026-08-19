@@ -107,21 +107,6 @@ static ssize_t qihse_scatter_recv(int fd, uint8_t* buf, size_t cap, uint32_t tim
     return recv(fd, (char*)buf, cap, 0);
 }
 
-/* Build a RESP command array.  Returns a malloc'd buffer; caller frees. */
-static char* qihse_scatter_build_command(const char* cmd, const char* const* args, size_t nargs, size_t* out_len) {
-    /* Format: *N\r\n$len\r\ncmd\r\n$len\r\narg1\r\n... */
-    size_t total = 16 + strlen(cmd) + 4;
-    for (size_t i = 0; i < nargs; i++) total += 16 + strlen(args[i]);
-    char* buf = (char*)malloc(total);
-    if (!buf) return NULL;
-    int pos = snprintf(buf, total, "*%zu\r\n$%zu\r\n%s\r\n", nargs + 1, strlen(cmd), cmd);
-    for (size_t i = 0; i < nargs && pos < (int)total; i++) {
-        pos += snprintf(buf + pos, total - pos, "$%zu\r\n%s\r\n", strlen(args[i]), args[i]);
-    }
-    *out_len = (size_t)pos;
-    return buf;
-}
-
 /* Parse a RESP double from a buffer.  Returns true on success. */
 static bool qihse_scatter_parse_double(const uint8_t* buf, size_t len, double* out) {
     if (len < 4) return false;
@@ -150,24 +135,6 @@ static bool qihse_scatter_parse_double(const uint8_t* buf, size_t len, double* o
         memcpy(tmp, buf + i, blen);
         tmp[blen] = '\0';
         *out = strtod(tmp, NULL);
-        return true;
-    }
-    return false;
-}
-
-/* Parse a RESP integer from a buffer.  Returns true on success. */
-static bool qihse_scatter_parse_integer(const uint8_t* buf, size_t len, int64_t* out) {
-    if (len < 4) return false;
-    if (buf[0] == ':') {
-        *out = 0;
-        size_t i = 1;
-        bool neg = false;
-        if (i < len && buf[i] == '-') { neg = true; i++; }
-        while (i < len && buf[i] >= '0' && buf[i] <= '9') {
-            *out = *out * 10 + (buf[i] - '0');
-            i++;
-        }
-        if (neg) *out = -*out;
         return true;
     }
     return false;
@@ -451,7 +418,6 @@ bool qihse_cluster_scatter_ts_range(qihse_cluster_scatter_t* sg,
         default: agg_str = "AVG"; break;
     }
 
-    double merged_value = 0.0;
     uint64_t merged_count = 0;
     double min_val = 0.0;
     double max_val = 0.0;

@@ -2,6 +2,10 @@
 #include "qihse_resp_engine.h"
 #include "qihse_resp_cluster.h"
 #include "qihse_cluster_numa.h"
+#include "qihse_cluster_bus.h"
+#include "qihse_cluster_failover.h"
+#include "qihse_cluster_scatter.h"
+#include "qihse_crc16.h"
 #include "qihse_system_guard.h"
 #include "qihse_platform.h"
 #include <ctype.h>
@@ -89,6 +93,16 @@ struct qihse_resp_server {
     pthread_mutex_t vdb_lock;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
+    /* Phase 3: cluster bus + failover + guard throttling */
+    qihse_cluster_bus_t* bus;
+    qihse_cluster_failover_t* failover;
+    qihse_system_guard_window_t* guard_window;
+    bool owns_bus;
+    bool owns_failover;
+    bool owns_guard_window;
+    /* Phase 4: scatter-gather engine */
+    qihse_cluster_scatter_t* scatter;
+    bool owns_scatter;
 };
 
 typedef struct {
@@ -974,7 +988,7 @@ static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool scatter) {
     if (request->argc < 4 || !session->server->vdb) return !session->server->vdb ? qihse_resp_error(session, "ERR vector database is not configured") : qihse_resp_wrong_arity(session, scatter ? "vecscatter" : "vecsearch");
-    if (scatter && qihse_cluster_topology_nodes(session->server->topology, NULL, 0u) > 1u) return qihse_resp_error(session, "ERR distributed vector scatter transport is not configured");
+    if (scatter && !session->server->scatter && qihse_cluster_topology_nodes(session->server->topology, NULL, 0u) > 1u) return qihse_resp_error(session, "ERR distributed vector scatter transport is not configured");
     uint64_t dims_u64;
     uint64_t top_u64;
     if (!qihse_resp_parse_u64_arg(&request->argv[1], &dims_u64) || !qihse_resp_parse_u64_arg(&request->argv[2], &top_u64) || dims_u64 == 0 || dims_u64 > 65536u || top_u64 == 0 || top_u64 > 10000u) return qihse_resp_error(session, "ERR invalid vector search parameters");
@@ -1004,6 +1018,79 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
         free(results);
         return qihse_resp_error(session, "ERR invalid vector search format");
     }
+
+    /* Phase 4: VECSCATTER uses the scatter-gather engine to query all
+     * peer shards and merge results via Reciprocal Rank Fusion. */
+    if (scatter && session->server->scatter) {
+        /* First, search the local shard */
+        qihse_vector_query_t query;
+        memset(&query, 0, sizeof(query));
+        query.query_vector = vector;
+        query.vector_dims = dims;
+        query.top_k = top_k;
+        query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
+        query.user = session->user;
+        pthread_mutex_lock(&session->server->vdb_lock);
+        int local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
+        pthread_mutex_unlock(&session->server->vdb_lock);
+
+        /* Query remote peers and merge with RRF */
+        qihse_vector_result_t* remote_results = (qihse_vector_result_t*)calloc(top_k, sizeof(*remote_results));
+        if (!remote_results) {
+            free(vector);
+            free(results);
+            return qihse_resp_error(session, "OOM out of memory");
+        }
+        int remote_found = qihse_cluster_scatter_vecsearch(session->server->scatter,
+                                                           vector, dims, top_k, session->user,
+                                                           remote_results);
+        /* Merge local and remote results using RRF in-place */
+        if (local_found > 0 || remote_found > 0) {
+            typedef struct { uint64_t id; double rrf; float best; } rrf_t;
+            size_t total = (size_t)(local_found > 0 ? local_found : 0) + (size_t)(remote_found > 0 ? remote_found : 0);
+            rrf_t* table = (rrf_t*)calloc(total > 0 ? total : 1, sizeof(*table));
+            size_t tc = 0;
+            if (table) {
+                for (int r = 0; r < local_found; r++) {
+                    bool found = false;
+                    for (size_t j = 0; j < tc; j++) {
+                        if (table[j].id == results[r].id) { table[j].rrf += 1.0 / (double)(60u + (uint32_t)r); if (results[r].score > table[j].best) table[j].best = results[r].score; found = true; break; }
+                    }
+                    if (!found && tc < total) { table[tc].id = results[r].id; table[tc].rrf = 1.0 / (double)(60u + (uint32_t)r); table[tc].best = results[r].score; tc++; }
+                }
+                for (int r = 0; r < remote_found; r++) {
+                    bool found = false;
+                    for (size_t j = 0; j < tc; j++) {
+                        if (table[j].id == remote_results[r].id) { table[j].rrf += 1.0 / (double)(60u + (uint32_t)r); if (remote_results[r].score > table[j].best) table[j].best = remote_results[r].score; found = true; break; }
+                    }
+                    if (!found && tc < total) { table[tc].id = remote_results[r].id; table[tc].rrf = 1.0 / (double)(60u + (uint32_t)r); table[tc].best = remote_results[r].score; tc++; }
+                }
+                for (size_t i = 1; i < tc; i++) {
+                    rrf_t key = table[i];
+                    size_t j = i;
+                    while (j > 0 && table[j - 1].rrf < key.rrf) { table[j] = table[j - 1]; j--; }
+                    table[j] = key;
+                }
+                size_t output = tc < top_k ? tc : top_k;
+                for (size_t i = 0; i < output; i++) {
+                    results[i].id = table[i].id;
+                    results[i].score = table[i].best;
+                }
+                local_found = (int)output;
+                free(table);
+            }
+        }
+        free(remote_results);
+        bool response = local_found > 0 ? qihse_resp_array(session, (size_t)local_found) : qihse_resp_null(session);
+        for (int i = 0; response && i < local_found; i++) {
+            response = qihse_resp_array(session, 2u) && qihse_resp_integer(session, (int64_t)results[i].id) && qihse_resp_reply_double(session, results[i].score);
+        }
+        free(vector);
+        free(results);
+        return response;
+    }
+
+    /* Standard local-only VECSEARCH */
     qihse_vector_query_t query;
     memset(&query, 0, sizeof(query));
     query.query_vector = vector;
@@ -1379,6 +1466,23 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return qihse_resp_simple(session, "OK");
     }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    /* Phase 3: System Guard bus-saturation throttling for DENYOOM commands */
+    if (session->server->guard_window) {
+        size_t request_bytes = 0;
+        for (size_t i = 0; i < request->argc; i++) request_bytes += request->argv[i].len;
+        qihse_system_guard_window_record(session->server->guard_window, request_bytes);
+        if (!qihse_system_guard_window_safe(session->server->guard_window)) {
+            /* Allow readonly commands to proceed; reject write/DENYOOM commands */
+            bool is_write = qihse_resp_command_is(request, "SET") || qihse_resp_command_is(request, "SETEX") ||
+                qihse_resp_command_is(request, "PSETEX") || qihse_resp_command_is(request, "MSET") ||
+                qihse_resp_command_is(request, "DEL") || qihse_resp_command_is(request, "INCR") ||
+                qihse_resp_command_is(request, "DECR") || qihse_resp_command_is(request, "EXPIRE") ||
+                qihse_resp_command_is(request, "PEXPIRE") || qihse_resp_command_is(request, "MIGRATE") ||
+                qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "TS.ADD") ||
+                qihse_resp_command_is(request, "COL.APPEND");
+            if (is_write) return qihse_resp_error(session, "BUSY Bus saturation: try again later");
+        }
+    }
     if (qihse_resp_command_is(request, "ASKING")) {
         if (request->argc != 1) return qihse_resp_wrong_arity(session, "asking");
         session->asking = true;
@@ -1673,6 +1777,14 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->auth_required = true;
     config->require_full_coverage = true;
     config->numa_node_id = -1;
+    config->enable_bus = false;
+    config->enable_failover = false;
+    config->enable_guard_throttle = false;
+    config->xdp_interface = NULL;
+    config->guard_window_ms = 1000u;
+    config->guard_saturation_fraction = 0.8;
+    config->enable_scatter = false;
+    config->scatter_timeout_ms = 2000u;
 }
 
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
@@ -1766,6 +1878,61 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             return NULL;
         }
     }
+    /* Phase 3: create cluster bus if requested */
+    if (supplied->enable_bus) {
+        qihse_cluster_bus_config_t bus_cfg;
+        memset(&bus_cfg, 0, sizeof(bus_cfg));
+        bus_cfg.topology = server->topology;
+        bus_cfg.local_node_index = local;
+        bus_cfg.bus_port = server->bus_port;
+        bus_cfg.bind_address = supplied->bind_address;
+        bus_cfg.xdp_interface = supplied->xdp_interface;
+        server->bus = qihse_cluster_bus_create(&bus_cfg);
+        server->owns_bus = server->bus != NULL;
+    }
+    /* Phase 3: create failover coordinator if requested */
+    if (supplied->enable_failover) {
+        qihse_cluster_failover_config_t fo_cfg;
+        memset(&fo_cfg, 0, sizeof(fo_cfg));
+        fo_cfg.topology = server->topology;
+        fo_cfg.bus = server->bus;
+        fo_cfg.local_node_index = local;
+        fo_cfg.single_coordinator = false;
+        server->failover = qihse_cluster_failover_create(&fo_cfg);
+        server->owns_failover = server->failover != NULL;
+        /* Wire the failover callback into the bus by recreating it with
+         * the callback set. */
+        if (server->bus && server->failover) {
+            qihse_cluster_bus_config_t re_cfg;
+            memset(&re_cfg, 0, sizeof(re_cfg));
+            re_cfg.topology = server->topology;
+            re_cfg.local_node_index = local;
+            re_cfg.bus_port = server->bus_port;
+            re_cfg.bind_address = supplied->bind_address;
+            re_cfg.xdp_interface = supplied->xdp_interface;
+            re_cfg.on_fail = qihse_cluster_failover_on_fail_cb;
+            re_cfg.on_fail_user_data = server->failover;
+            qihse_cluster_bus_destroy(server->bus);
+            server->bus = qihse_cluster_bus_create(&re_cfg);
+            server->owns_bus = server->bus != NULL;
+        }
+    }
+    /* Phase 3: create system guard throttling window if requested */
+    if (supplied->enable_guard_throttle) {
+        server->guard_window = qihse_system_guard_window_create(
+            supplied->guard_window_ms, supplied->guard_saturation_fraction);
+        server->owns_guard_window = server->guard_window != NULL;
+    }
+    /* Phase 4: create scatter-gather engine if requested */
+    if (supplied->enable_scatter) {
+        qihse_cluster_scatter_config_t sg_cfg;
+        memset(&sg_cfg, 0, sizeof(sg_cfg));
+        sg_cfg.topology = server->topology;
+        sg_cfg.local_node_index = local;
+        sg_cfg.timeout_ms = supplied->scatter_timeout_ms;
+        server->scatter = qihse_cluster_scatter_create(&sg_cfg);
+        server->owns_scatter = server->scatter != NULL;
+    }
     return server;
 }
 
@@ -1801,6 +1968,8 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
     }
     server->accept_thread_started = true;
     pthread_mutex_unlock(&server->state_lock);
+    /* Phase 3: start cluster bus if present */
+    if (server->bus) qihse_cluster_bus_start(server->bus);
     return true;
 }
 
@@ -1853,11 +2022,17 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
     pthread_mutex_lock(&server->state_lock);
     while (server->active_clients > 0) pthread_cond_wait(&server->clients_drained, &server->state_lock);
     pthread_mutex_unlock(&server->state_lock);
+    /* Phase 3: stop cluster bus if present */
+    if (server->bus) qihse_cluster_bus_stop(server->bus);
 }
 
 void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (!server) return;
     qihse_resp_server_stop(server);
+    if (server->owns_failover && server->failover) qihse_cluster_failover_destroy(server->failover);
+    if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
+    if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
+    if (server->owns_scatter && server->scatter) qihse_cluster_scatter_destroy(server->scatter);
     if (server->owns_topology) qihse_cluster_topology_destroy(server->topology);
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
@@ -1874,6 +2049,22 @@ uint16_t qihse_resp_server_port(const qihse_resp_server_t* server) {
 
 qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server) {
     return server ? server->topology : NULL;
+}
+
+qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server) {
+    return server ? server->bus : NULL;
+}
+
+qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server) {
+    return server ? server->failover : NULL;
+}
+
+qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t* server) {
+    return server ? server->guard_window : NULL;
+}
+
+qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server) {
+    return server ? server->scatter : NULL;
 }
 
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd) {

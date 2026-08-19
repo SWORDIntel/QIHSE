@@ -9,6 +9,10 @@
 #include "qihse_timeseries.h"
 #include "qihse_column.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_cluster_bus.h"
+#include "qihse_cluster_failover.h"
+#include "qihse_cluster_scatter.h"
+#include "qihse_system_guard.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
 
@@ -31,6 +35,16 @@ typedef struct {
     bool pin_workers;
     bool strict_hardware_affinity;
     int numa_node_id;
+    /* Phase 3: cluster bus + failover + guard throttling */
+    bool enable_bus;
+    bool enable_failover;
+    bool enable_guard_throttle;
+    const char* xdp_interface;       /* NULL = standard UDP bus */
+    uint64_t guard_window_ms;        /* 0 = default 1000ms */
+    double guard_saturation_fraction; /* 0 = default 0.8 */
+    /* Phase 4: scatter-gather engine */
+    bool enable_scatter;
+    uint32_t scatter_timeout_ms;     /* 0 = default 2000ms */
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);
@@ -42,6 +56,10 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server);
 uint16_t qihse_resp_server_port(const qihse_resp_server_t* server);
 qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server);
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd);
+qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
+qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server);
+qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t* server);
+qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server);
 
 /**
  * @brief Starts a TCP server that listens for RESP (Redis Serialization Protocol) commands.
