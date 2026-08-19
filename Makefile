@@ -76,6 +76,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
             src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_raft.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
             src/spinnaker/qihse_crc16.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c src/spinnaker/qihse_cluster_bus.c src/spinnaker/qihse_cluster_failover.c src/spinnaker/qihse_cluster_scatter.c src/spinnaker/qihse_cluster_rebalance.c \
+            src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c \
             src/black_hole/qihse_kv_store.c src/black_hole/qihse_keystone.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
@@ -273,7 +274,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware
+test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware
 
 test-cluster-slot: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
@@ -318,6 +319,24 @@ test-dist-planner: lib
 test-dist-planner-hardware: lib
 	$(CC) $(CFLAGS) -o tests/test_dist_planner_hardware tests/test_dist_planner_hardware.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_dist_planner_hardware
+
+test-task-queue: lib
+	$(CC) $(CFLAGS) -o tests/test_task_queue tests/test_task_queue.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_task_queue
+
+test-task-worker: lib
+	$(CC) $(CFLAGS) -o tests/test_task_worker tests/test_task_worker.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_task_worker
+
+test-task-scheduler: lib
+	$(CC) $(CFLAGS) -o tests/test_task_scheduler tests/test_task_scheduler.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_task_scheduler
+
+test-task-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_task_resp tests/test_task_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_task_resp
+
+test-task: test-task-queue test-task-worker test-task-scheduler test-task-resp
 
 test-cluster-rebalance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_rebalance tests/test_cluster_rebalance.c -L. -lqihse $(LDFLAGS)

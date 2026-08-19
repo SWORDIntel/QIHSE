@@ -104,6 +104,13 @@ struct qihse_resp_server {
     /* Phase 4: scatter-gather engine */
     qihse_cluster_scatter_t* scatter;
     bool owns_scatter;
+    /* Task Queue Engine & Scheduler */
+    qihse_task_queue_t* task_queue;
+    bool owns_task_queue;
+    qihse_task_worker_pool_t* task_workers;
+    bool owns_task_workers;
+    qihse_task_scheduler_t* task_scheduler;
+    bool owns_task_scheduler;
 };
 
 typedef struct {
@@ -1492,6 +1499,423 @@ static bool qihse_resp_handle_keystone_classify(qihse_resp_session_t* session, c
     return qihse_resp_reply_double(session, (double)conf);
 }
 
+/* =========================================================================
+ * Task Queue and Scheduler Handlers (Celery-Equivalent RESP Extensions)
+ * ========================================================================= */
+
+static bool qihse_resp_handle_task_submit(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "SUBMIT")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem < 2 || rem > 3) return qihse_resp_wrong_arity(session, "task.submit");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* qname = qihse_resp_arg_text(&request->argv[offset]);
+    qihse_task_prio_t prio = QIHSE_TASK_PRIO_NORMAL;
+    size_t payload_idx = offset + 1;
+
+    if (rem == 3) {
+        char* prio_str = qihse_resp_arg_text(&request->argv[offset + 1]);
+        if (prio_str) {
+            qihse_task_parse_prio(prio_str, &prio);
+            free(prio_str);
+        }
+        payload_idx = offset + 2;
+    }
+
+    const uint8_t* payload = request->argv[payload_idx].data;
+    size_t payload_len = request->argv[payload_idx].len;
+    char task_id[QIHSE_TASK_ID_LEN + 1] = {0};
+
+    bool ok = qihse_task_submit(
+        session->server->task_queue,
+        qname,
+        prio,
+        payload,
+        payload_len,
+        NULL,
+        task_id,
+        sizeof(task_id)
+    );
+    free(qname);
+
+    if (ok) {
+        return qihse_resp_bulk_text(session, task_id);
+    }
+    return qihse_resp_error(session, "ERR failed to submit task");
+}
+
+static bool qihse_resp_handle_task_result(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RESULT")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem != 1) return qihse_resp_wrong_arity(session, "task.result");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* task_id = qihse_resp_arg_text(&request->argv[offset]);
+    if (!task_id) return qihse_resp_error(session, "ERR invalid task ID");
+
+    uint8_t* result = NULL;
+    size_t result_len = 0;
+    char error_buf[256] = {0};
+
+    bool ok = qihse_task_get_result(session->server->task_queue, task_id, &result, &result_len, error_buf, sizeof(error_buf));
+    if (ok) {
+        bool sent = qihse_resp_bulk(session, result, result_len);
+        if (result) free(result);
+        free(task_id);
+        return sent;
+    }
+
+    qihse_task_state_t state;
+    if (qihse_task_get_state(session->server->task_queue, task_id, &state)) {
+        free(task_id);
+        if (state == QIHSE_TASK_FAILURE || state == QIHSE_TASK_DEAD) {
+            char err_msg[300];
+            snprintf(err_msg, sizeof(err_msg), "ERR %s", error_buf[0] ? error_buf : "task failed");
+            return qihse_resp_error(session, err_msg);
+        }
+        if (state == QIHSE_TASK_CANCELLED) {
+            return qihse_resp_error(session, "ERR task was cancelled");
+        }
+        char status_err[64];
+        snprintf(status_err, sizeof(status_err), "%s", qihse_task_state_name(state));
+        return qihse_resp_error(session, status_err);
+    }
+
+    free(task_id);
+    return qihse_resp_error(session, "ERR task not found");
+}
+
+static bool qihse_resp_handle_task_status(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATUS")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem != 1) return qihse_resp_wrong_arity(session, "task.status");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* task_id = qihse_resp_arg_text(&request->argv[offset]);
+    if (!task_id) return qihse_resp_error(session, "ERR invalid task ID");
+
+    qihse_task_state_t state;
+    if (qihse_task_get_state(session->server->task_queue, task_id, &state)) {
+        free(task_id);
+        return qihse_resp_simple(session, qihse_task_state_name(state));
+    }
+    free(task_id);
+    return qihse_resp_error(session, "ERR task not found");
+}
+
+static bool qihse_resp_handle_task_cancel(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "CANCEL")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem != 1) return qihse_resp_wrong_arity(session, "task.cancel");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* task_id = qihse_resp_arg_text(&request->argv[offset]);
+    if (!task_id) return qihse_resp_error(session, "ERR invalid task ID");
+
+    bool ok = qihse_task_cancel(session->server->task_queue, task_id);
+    free(task_id);
+    return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR task not found or cannot be cancelled");
+}
+
+static bool qihse_resp_handle_task_retry(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RETRY")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem != 1) return qihse_resp_wrong_arity(session, "task.retry");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* task_id = qihse_resp_arg_text(&request->argv[offset]);
+    if (!task_id) return qihse_resp_error(session, "ERR invalid task ID");
+
+    bool ok = qihse_task_retry(session->server->task_queue, task_id);
+    free(task_id);
+    return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR task not found or not in retryable state");
+}
+
+static bool qihse_resp_handle_task_delete(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "DELETE")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (rem != 1) return qihse_resp_wrong_arity(session, "task.delete");
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* task_id = qihse_resp_arg_text(&request->argv[offset]);
+    if (!task_id) return qihse_resp_error(session, "ERR invalid task ID");
+
+    bool ok = qihse_task_delete(session->server->task_queue, task_id);
+    free(task_id);
+    return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR task not found");
+}
+
+static bool qihse_resp_handle_task_queue(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "QUEUE")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* qname = (rem >= 1) ? qihse_resp_arg_text(&request->argv[offset]) : NULL;
+
+    char** ids = NULL;
+    size_t count = 0;
+    bool ok = qihse_task_list_queue(session->server->task_queue, qname, &ids, &count);
+    if (qname) free(qname);
+
+    if (!ok) return qihse_resp_error(session, "ERR failed to list queue");
+
+    if (!qihse_resp_array(session, count)) {
+        qihse_task_free_id_list(ids, count);
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!qihse_resp_bulk_text(session, ids[i])) {
+            qihse_task_free_id_list(ids, count);
+            return false;
+        }
+    }
+    qihse_task_free_id_list(ids, count);
+    return true;
+}
+
+static bool qihse_resp_handle_task_stats(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    size_t offset = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATS")) {
+        offset = 2;
+    }
+    size_t rem = request->argc > offset ? request->argc - offset : 0;
+    if (!session->server->task_queue) return qihse_resp_error(session, "ERR task queue is not configured");
+
+    char* qname = (rem >= 1) ? qihse_resp_arg_text(&request->argv[offset]) : NULL;
+
+    qihse_task_stats_t stats;
+    bool ok = qihse_task_stats(session->server->task_queue, qname, &stats);
+    if (qname) free(qname);
+
+    if (!ok) return qihse_resp_error(session, "ERR failed to retrieve stats");
+
+    if (!qihse_resp_array(session, 16u)) return false;
+    if (!qihse_resp_bulk_text(session, "pending") || !qihse_resp_integer(session, (int64_t)stats.pending_count)) return false;
+    if (!qihse_resp_bulk_text(session, "started") || !qihse_resp_integer(session, (int64_t)stats.started_count)) return false;
+    if (!qihse_resp_bulk_text(session, "success") || !qihse_resp_integer(session, (int64_t)stats.success_count)) return false;
+    if (!qihse_resp_bulk_text(session, "failure") || !qihse_resp_integer(session, (int64_t)stats.failure_count)) return false;
+    if (!qihse_resp_bulk_text(session, "dead") || !qihse_resp_integer(session, (int64_t)stats.dead_count)) return false;
+    if (!qihse_resp_bulk_text(session, "cancelled") || !qihse_resp_integer(session, (int64_t)stats.cancelled_count)) return false;
+    if (!qihse_resp_bulk_text(session, "total_executed") || !qihse_resp_integer(session, (int64_t)stats.total_executed)) return false;
+    if (!qihse_resp_bulk_text(session, "avg_latency_ms") || !qihse_resp_reply_double(session, stats.avg_latency_ms)) return false;
+
+    return true;
+}
+
+static bool qihse_resp_handle_task_workers(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->task_workers) return qihse_resp_error(session, "ERR task worker pool is not configured");
+
+    size_t sub_idx = 1;
+    if (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "WORKERS")) {
+        sub_idx = 2;
+    } else if (qihse_resp_command_is(request, "TASK.WORKERS")) {
+        sub_idx = 1;
+    }
+
+    if (request->argc > sub_idx) {
+        if (qihse_resp_arg_equal(&request->argv[sub_idx], "PAUSE")) {
+            qihse_task_worker_pool_pause(session->server->task_workers);
+            return qihse_resp_simple(session, "OK");
+        }
+        if (qihse_resp_arg_equal(&request->argv[sub_idx], "RESUME")) {
+            qihse_task_worker_pool_resume(session->server->task_workers);
+            return qihse_resp_simple(session, "OK");
+        }
+        if (qihse_resp_arg_equal(&request->argv[sub_idx], "SET") && request->argc > sub_idx + 1) {
+            uint64_t new_count = 0;
+            if (!qihse_resp_parse_u64_arg(&request->argv[sub_idx + 1], &new_count) || new_count == 0) {
+                return qihse_resp_error(session, "ERR invalid worker count");
+            }
+            bool ok = qihse_task_worker_pool_set_count(session->server->task_workers, (uint32_t)new_count);
+            return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR failed to resize worker pool");
+        }
+    }
+
+    qihse_worker_info_t* info = NULL;
+    size_t count = 0;
+    if (!qihse_task_worker_pool_get_info(session->server->task_workers, &info, &count)) {
+        return qihse_resp_error(session, "ERR failed to get worker info");
+    }
+
+    if (!qihse_resp_array(session, count)) {
+        qihse_task_worker_pool_free_info(info);
+        return false;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (!qihse_resp_array(session, 16u)) {
+            qihse_task_worker_pool_free_info(info);
+            return false;
+        }
+        const char* st_name = "IDLE";
+        switch (info[i].state) {
+            case QIHSE_WORKER_BUSY: st_name = "BUSY"; break;
+            case QIHSE_WORKER_PAUSED: st_name = "PAUSED"; break;
+            case QIHSE_WORKER_STOPPING: st_name = "STOPPING"; break;
+            case QIHSE_WORKER_STOPPED: st_name = "STOPPED"; break;
+            default: st_name = "IDLE"; break;
+        }
+        if (!qihse_resp_bulk_text(session, "id") || !qihse_resp_integer(session, (int64_t)info[i].worker_id)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "state") || !qihse_resp_bulk_text(session, st_name)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "core") || !qihse_resp_integer(session, (int64_t)info[i].cpu_core_id)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "numa") || !qihse_resp_integer(session, (int64_t)info[i].numa_node_id)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "current_task") || !qihse_resp_bulk_text(session, info[i].current_task_id)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "completed") || !qihse_resp_integer(session, (int64_t)info[i].tasks_completed)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "failed") || !qihse_resp_integer(session, (int64_t)info[i].tasks_failed)) { qihse_task_worker_pool_free_info(info); return false; }
+        if (!qihse_resp_bulk_text(session, "uptime") || !qihse_resp_integer(session, (int64_t)info[i].uptime_seconds)) { qihse_task_worker_pool_free_info(info); return false; }
+    }
+
+    qihse_task_worker_pool_free_info(info);
+    return true;
+}
+
+static bool qihse_resp_handle_schedule(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->task_scheduler) return qihse_resp_error(session, "ERR task scheduler is not configured");
+
+    char* full_cmd = qihse_resp_arg_text(&request->argv[0]);
+    if (!full_cmd) return qihse_resp_error(session, "ERR invalid command");
+
+    char* subcmd = NULL;
+    size_t arg_offset = 1;
+
+    char* dot = strchr(full_cmd, '.');
+    if (dot) {
+        subcmd = strdup(dot + 1);
+        arg_offset = 1;
+    } else if (request->argc > 1) {
+        subcmd = qihse_resp_arg_text(&request->argv[1]);
+        arg_offset = 2;
+    }
+    free(full_cmd);
+
+    if (!subcmd) return qihse_resp_wrong_arity(session, "schedule");
+
+    if (strcasecmp(subcmd, "ADD") == 0) {
+        size_t rem = request->argc > arg_offset ? request->argc - arg_offset : 0;
+        if (rem < 4 || rem > 5) {
+            free(subcmd);
+            return qihse_resp_wrong_arity(session, "schedule.add");
+        }
+        char* sched_id = qihse_resp_arg_text(&request->argv[arg_offset]);
+        char* cron_expr = qihse_resp_arg_text(&request->argv[arg_offset + 1]);
+        char* qname = qihse_resp_arg_text(&request->argv[arg_offset + 2]);
+        qihse_task_prio_t prio = QIHSE_TASK_PRIO_NORMAL;
+        size_t payload_idx = arg_offset + 3;
+
+        if (rem == 5) {
+            char* prio_str = qihse_resp_arg_text(&request->argv[arg_offset + 3]);
+            if (prio_str) {
+                qihse_task_parse_prio(prio_str, &prio);
+                free(prio_str);
+            }
+            payload_idx = arg_offset + 4;
+        }
+
+        const uint8_t* payload = request->argv[payload_idx].data;
+        size_t payload_len = request->argv[payload_idx].len;
+
+        bool ok = qihse_task_scheduler_add(
+            session->server->task_scheduler,
+            sched_id,
+            cron_expr,
+            qname,
+            prio,
+            payload,
+            payload_len
+        );
+
+        free(sched_id);
+        free(cron_expr);
+        free(qname);
+        free(subcmd);
+
+        return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR failed to add schedule (invalid cron or duplicate)");
+    }
+
+    if (strcasecmp(subcmd, "REMOVE") == 0) {
+        if (request->argc <= arg_offset) {
+            free(subcmd);
+            return qihse_resp_wrong_arity(session, "schedule.remove");
+        }
+        char* sched_id = qihse_resp_arg_text(&request->argv[arg_offset]);
+        bool ok = qihse_task_scheduler_remove(session->server->task_scheduler, sched_id);
+        free(sched_id);
+        free(subcmd);
+        return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR schedule not found");
+    }
+
+    if (strcasecmp(subcmd, "LIST") == 0) {
+        char** ids = NULL;
+        size_t count = 0;
+        bool ok = qihse_task_scheduler_list(session->server->task_scheduler, &ids, &count);
+        free(subcmd);
+        if (!ok) return qihse_resp_error(session, "ERR failed to list schedules");
+
+        if (!qihse_resp_array(session, count)) {
+            qihse_task_scheduler_free_list(ids, count);
+            return false;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (!qihse_resp_bulk_text(session, ids[i])) {
+                qihse_task_scheduler_free_list(ids, count);
+                return false;
+            }
+        }
+        qihse_task_scheduler_free_list(ids, count);
+        return true;
+    }
+
+    if (strcasecmp(subcmd, "ENABLE") == 0 || strcasecmp(subcmd, "DISABLE") == 0) {
+        if (request->argc <= arg_offset) {
+            free(subcmd);
+            return qihse_resp_wrong_arity(session, "schedule.enable");
+        }
+        bool enable = (strcasecmp(subcmd, "ENABLE") == 0);
+        char* sched_id = qihse_resp_arg_text(&request->argv[arg_offset]);
+        bool ok = qihse_task_scheduler_enable(session->server->task_scheduler, sched_id, enable);
+        free(sched_id);
+        free(subcmd);
+        return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR schedule not found");
+    }
+
+    if (strcasecmp(subcmd, "NEXT") == 0) {
+        if (request->argc <= arg_offset) {
+            free(subcmd);
+            return qihse_resp_wrong_arity(session, "schedule.next");
+        }
+        char* sched_id = qihse_resp_arg_text(&request->argv[arg_offset]);
+        char iso_buf[64] = {0};
+        bool ok = qihse_task_scheduler_next_fire(session->server->task_scheduler, sched_id, iso_buf, sizeof(iso_buf));
+        free(sched_id);
+        free(subcmd);
+        return ok ? qihse_resp_simple(session, iso_buf) : qihse_resp_error(session, "ERR schedule not found or disabled");
+    }
+
+    free(subcmd);
+    return qihse_resp_error(session, "ERR unknown SCHEDULE subcommand");
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -1559,6 +1983,45 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
     if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
     if (qihse_resp_command_is(request, "KEYSTONE.CLASSIFY")) return qihse_resp_handle_keystone_classify(session, request);
+
+    /* TASK.* commands */
+    if (qihse_resp_command_is(request, "TASK.SUBMIT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "SUBMIT"))) {
+        return qihse_resp_handle_task_submit(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.RESULT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RESULT"))) {
+        return qihse_resp_handle_task_result(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.STATUS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATUS"))) {
+        return qihse_resp_handle_task_status(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.CANCEL") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "CANCEL"))) {
+        return qihse_resp_handle_task_cancel(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.RETRY") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RETRY"))) {
+        return qihse_resp_handle_task_retry(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.DELETE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "DELETE"))) {
+        return qihse_resp_handle_task_delete(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.QUEUE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "QUEUE"))) {
+        return qihse_resp_handle_task_queue(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.STATS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATS"))) {
+        return qihse_resp_handle_task_stats(session, request);
+    }
+    if (qihse_resp_command_is(request, "TASK.WORKERS") || qihse_resp_command_is(request, "TASK.WORKERS.PAUSE") ||
+        qihse_resp_command_is(request, "TASK.WORKERS.RESUME") || qihse_resp_command_is(request, "TASK.WORKERS.SET") ||
+        (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "WORKERS"))) {
+        return qihse_resp_handle_task_workers(session, request);
+    }
+
+    /* SCHEDULE.* commands */
+    if (qihse_resp_command_is(request, "SCHEDULE.ADD") || qihse_resp_command_is(request, "SCHEDULE.REMOVE") ||
+        qihse_resp_command_is(request, "SCHEDULE.LIST") || qihse_resp_command_is(request, "SCHEDULE.ENABLE") ||
+        qihse_resp_command_is(request, "SCHEDULE.DISABLE") || qihse_resp_command_is(request, "SCHEDULE.NEXT") ||
+        qihse_resp_command_is(request, "SCHEDULE")) {
+        return qihse_resp_handle_schedule(session, request);
+    }
 
     qihse_resp_keyset_t keys;
     qihse_resp_extract_keys(request, &keys);
@@ -1842,6 +2305,12 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->guard_saturation_fraction = 0.8;
     config->enable_scatter = false;
     config->scatter_timeout_ms = 2000u;
+    /* Task Queue & Scheduler */
+    config->enable_task_queue = true;
+    config->enable_task_workers = true;
+    config->task_worker_count = 0;
+    config->task_python_binary = "python3";
+    config->enable_task_scheduler = true;
 }
 
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
@@ -1990,6 +2459,48 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->scatter = qihse_cluster_scatter_create(&sg_cfg);
         server->owns_scatter = server->scatter != NULL;
     }
+    /* Task Queue & Scheduler initialization */
+    if (supplied->task_queue) {
+        server->task_queue = supplied->task_queue;
+        server->owns_task_queue = false;
+    } else if (supplied->enable_task_queue) {
+        qihse_task_queue_config_t tq_cfg;
+        tq_cfg.kv_store = server->store;
+        tq_cfg.event_stream = NULL;
+        tq_cfg.tsdb = server->tsdb;
+        tq_cfg.max_queue_capacity = 1000000u;
+        server->task_queue = qihse_task_queue_create(&tq_cfg);
+        server->owns_task_queue = (server->task_queue != NULL);
+    }
+
+    if (supplied->task_workers) {
+        server->task_workers = supplied->task_workers;
+        server->owns_task_workers = false;
+    } else if (supplied->enable_task_workers && server->task_queue) {
+        qihse_task_worker_pool_config_t wp_cfg;
+        qihse_task_worker_pool_config_init(&wp_cfg);
+        wp_cfg.queue = server->task_queue;
+        wp_cfg.worker_count = supplied->task_worker_count;
+        wp_cfg.pin_cores = server->pin_workers;
+        wp_cfg.numa_node_id = server->numa_node_id;
+        wp_cfg.python_binary = supplied->task_python_binary;
+        server->task_workers = qihse_task_worker_pool_create(&wp_cfg);
+        server->owns_task_workers = (server->task_workers != NULL);
+    }
+
+    if (supplied->task_scheduler) {
+        server->task_scheduler = supplied->task_scheduler;
+        server->owns_task_scheduler = false;
+    } else if (supplied->enable_task_scheduler && server->task_queue) {
+        qihse_task_scheduler_config_t ts_cfg;
+        qihse_task_scheduler_config_init(&ts_cfg);
+        ts_cfg.queue = server->task_queue;
+        ts_cfg.tsdb = server->tsdb;
+        ts_cfg.tick_ms = 10u;
+        server->task_scheduler = qihse_task_scheduler_create(&ts_cfg);
+        server->owns_task_scheduler = (server->task_scheduler != NULL);
+    }
+
     return server;
 }
 
@@ -2027,6 +2538,9 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
     pthread_mutex_unlock(&server->state_lock);
     /* Phase 3: start cluster bus if present */
     if (server->bus) qihse_cluster_bus_start(server->bus);
+    /* Start Task Workers & Scheduler */
+    if (server->task_workers) qihse_task_worker_pool_start(server->task_workers);
+    if (server->task_scheduler) qihse_task_scheduler_start(server->task_scheduler);
     return true;
 }
 
@@ -2052,6 +2566,9 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
     }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&server->state_lock);
+    /* Start Task Workers & Scheduler */
+    if (server->task_workers) qihse_task_worker_pool_start(server->task_workers);
+    if (server->task_scheduler) qihse_task_scheduler_start(server->task_scheduler);
     bool result = qihse_resp_accept_loop(server);
     qihse_resp_server_stop(server);
     return result;
@@ -2059,6 +2576,10 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
 
 void qihse_resp_server_stop(qihse_resp_server_t* server) {
     if (!server) return;
+    /* Stop Task Scheduler & Workers */
+    if (server->task_scheduler) qihse_task_scheduler_stop(server->task_scheduler);
+    if (server->task_workers) qihse_task_worker_pool_stop(server->task_workers);
+
     pthread_t accept_thread;
     bool join_accept = false;
     pthread_mutex_lock(&server->state_lock);
@@ -2086,6 +2607,9 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
 void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (!server) return;
     qihse_resp_server_stop(server);
+    if (server->owns_task_scheduler && server->task_scheduler) qihse_task_scheduler_destroy(server->task_scheduler);
+    if (server->owns_task_workers && server->task_workers) qihse_task_worker_pool_destroy(server->task_workers);
+    if (server->owns_task_queue && server->task_queue) qihse_task_queue_destroy(server->task_queue);
     if (server->owns_failover && server->failover) qihse_cluster_failover_destroy(server->failover);
     if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
     if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
@@ -2122,6 +2646,18 @@ qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t*
 
 qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server) {
     return server ? server->scatter : NULL;
+}
+
+qihse_task_queue_t* qihse_resp_server_task_queue(qihse_resp_server_t* server) {
+    return server ? server->task_queue : NULL;
+}
+
+qihse_task_worker_pool_t* qihse_resp_server_task_workers(qihse_resp_server_t* server) {
+    return server ? server->task_workers : NULL;
+}
+
+qihse_task_scheduler_t* qihse_resp_server_task_scheduler(qihse_resp_server_t* server) {
+    return server ? server->task_scheduler : NULL;
 }
 
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd) {

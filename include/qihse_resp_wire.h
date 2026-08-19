@@ -13,6 +13,9 @@
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_system_guard.h"
+#include "qihse_task_queue.h"
+#include "qihse_task_worker.h"
+#include "qihse_task_scheduler.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
 
@@ -45,6 +48,15 @@ typedef struct {
     /* Phase 4: scatter-gather engine */
     bool enable_scatter;
     uint32_t scatter_timeout_ms;     /* 0 = default 2000ms */
+    /* Task Queue Engine & Scheduler */
+    bool enable_task_queue;
+    bool enable_task_workers;
+    uint32_t task_worker_count;
+    const char* task_python_binary;
+    bool enable_task_scheduler;
+    qihse_task_queue_t* task_queue;
+    qihse_task_worker_pool_t* task_workers;
+    qihse_task_scheduler_t* task_scheduler;
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);
@@ -60,6 +72,9 @@ qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
 qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server);
 qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t* server);
 qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server);
+qihse_task_queue_t* qihse_resp_server_task_queue(qihse_resp_server_t* server);
+qihse_task_worker_pool_t* qihse_resp_server_task_workers(qihse_resp_server_t* server);
+qihse_task_scheduler_t* qihse_resp_server_task_scheduler(qihse_resp_server_t* server);
 
 /**
  * @brief Starts a TCP server that listens for RESP (Redis Serialization Protocol) commands.
