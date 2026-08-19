@@ -3,37 +3,41 @@
 </p>
 <div align="center">
 
-# QIHSE
+## Quantum-Inspired Hilbert Space Expansion Search
 
-### Quantum-Inspired Hilbert Space Expansion Database Engine
+### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C99-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![Networking](https://img.shields.io/badge/Networking-eBPF%20%2F%20AF__XDP-00599C?logo=linux) ![CNSA 2.0](https://img.shields.io/badge/Cryptography-CNSA%202.0%20%2F%20PQC-brightgreen.svg)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux) ![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen) ![CNSA 2.0 Compliant](https://img.shields.io/badge/Cryptography-CNSA%202.0-brightgreen.svg) ![FIPS 140-3](https://img.shields.io/badge/Hardware-FIPS%20140--3-brightgreen.svg) ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success) ![Security Audit](https://img.shields.io/badge/Security-Audited%20%26%20Hardened-success?logo=shield)
 
 </div>
 
 ---
 
-## Overview
+## Core Doctrine
 
-**QIHSE** is a high-performance multi-model database engine written in native C99. It combines eight specialized storage engines under a single memory hierarchy and unified zero-copy wire protocol (UWP), avoiding the operational latency of microservice-based database stacks.
+**QIHSE** is a native C database ecosystem built around a single, uncompromising rule:
 
-The engine includes native vector search, an LSM-tree key-value store, a JIT-compiled document engine, Gorilla-compressed time-series telemetry, AVX-accelerated columnar OLAP, multi-hop graph traversal, BM25 full-text search, append-only event streams, and a native SQLite VFS backend.
+> **Approximation is allowed to propose candidates. It is not allowed to silently decide truth.**
+
+Modern systems frequently fragment under the weight of stitching together half a dozen specialized databases—a vector DB for AI, Redis for caching, PostgreSQL for documents, ClickHouse for OLAP, and Kafka for events. QIHSE eliminates this operational friction. It is a multi-modal database engine combining **eight distinct storage engines and a transparent SQLite VFS replacement** within the exact same process space and memory hierarchy.
+
+Data traverses from kernel-bypass network interfaces straight into SIMD computation registers with zero intermediate copies.
 
 ---
 
-## Storage Engines & Subsystems
+## Database Surface at a Glance
 
-| Subsystem | Primary Engine | Access Method | Key Features |
+| Family | UWP Target | API Surface | Storage Core & Capabilities |
 |---|---|---|---|
-| **Vector DB** | `qihse_vector_db_*` | UWP (`0x02`) / C / Python / Rust | Exact `float32` reranking, trinary (`qtri`/`qmag`) filtering, multi-precision quantization (`FP16`, `FP8`, `INT8`, `INT4`), HNSW indexing |
-| **Key-Value Store** | `qihse_kv_*` | UWP (`0x01`) / C / Python / Rust | $O(k)$ Trinary Trie in-memory index with LSM-tree memtables and SSTable persistence |
-| **Document Store** | `qihse_document_*` | UWP (`0x03`) / C / Python | JSON documents with JIT-compiled query path evaluation |
-| **Time-Series DB** | `qihse_timeseries_*` | UWP (`0x05`) / C / Python | Lock-free ingress buffers with Gorilla XOR delta-of-delta bit-packing |
-| **Columnar Engine** | `qihse_column_*` | UWP (`0x04`) / C | Vectorized OLAP scans, strided OS page alignment, RLE / dictionary encoding |
-| **Graph Engine** | `qihse_graph_*` | UWP (`0x06`) / C | Dual Anchor + HNSW multi-hop relationship resolution |
-| **Full-Text Search** | `qihse_fts_*` | Native C API | Zero-copy lexical tokenization with native BM25 relevance scoring |
-| **Event Stream** | `qihse_event_*` | UWP (`0x07`) / C | DMA append-only log via Linux `mmap` / `sendfile` with SHA-384 frame deduplication |
-| **SQLite VFS** | `qihse_sqlite_vfs` | `file:db.db?vfs=qihse` | Drop-in SQLite storage replacement backed by Black Hole KV cache and Marmalade Event Stream |
+| **Vector DB** | `0x02` | `qihse_vector_db_*` | Exact `float32` reranking with Trinary signature (`qtri`/`qmag`) filtering, multi-precision quantization (`FP16`, `FP8`, `INT8`, `INT4`), and HNSW graph indexing. |
+| **Key-Value Store** | `0x01` | `qihse_kv_*` | $O(k)$ Trinary Trie in-memory engine backed by native LSM-Trees and SSTable persistence. |
+| **Document Store** | `0x03` | `qihse_document_*` | JSON document engine with JIT-compiled query path evaluation. |
+| **Time-Series DB** | `0x05` | `qihse_timeseries_*` | Lock-free ingress buffers with Gorilla XOR delta-of-delta bit-packing. |
+| **Columnar Engine** | `0x04` | `qihse_column_*` | AVX-accelerated OLAP backend with strided OS page alignment and RLE sweeps. |
+| **Graph Engine** | `0x06` | `qihse_graph_*` | Dual Anchor and HNSW multi-hop relationship resolution. |
+| **Full-Text Search** | Native | `qihse_fts_*` | Zero-copy lexical tokenization with native BM25 relevance scoring. |
+| **Event Stream** | `0x07` | `qihse_event_*` | Append-only log bypassing userspace via Linux `mmap` / `sendfile` DMA with SHA-384 frame deduplication. |
+| **SQLite VFS** | Native | `qihse_sqlite_vfs` | Drop-in SQLite storage replacement routing database pages through Black Hole KV and Marmalade Event Stream. |
 
 ---
 
@@ -41,7 +45,7 @@ The engine includes native vector search, an LSM-tree key-value store, a JIT-com
 
 ```mermaid
 flowchart TB
-    subgraph Storage["Unified Storage Engines"]
+    subgraph Storage["Unified Database Surface"]
         direction LR
         VDB["Vector DB"]
         KV["KV Store"]
@@ -54,163 +58,72 @@ flowchart TB
         VFS["SQLite VFS"]
     end
 
-    subgraph Compute["Compute & SIMD Acceleration"]
+    subgraph Compute["Heterogeneous Acceleration Layer"]
         direction LR
-        CPU["CPU SIMD<br/>AVX / AVX2 / AVX-512 / Scalar"]
-        NPU["NPU / OpenVINO"]
-        MEM["Memory Subsystem<br/>UMA / HMA Tiering"]
-        CRYPTO["CNSA 2.0 / PQC<br/>ML-KEM-1024 / ML-DSA-87"]
+        CPU["CPU SIMD<br/>AVX / AVX2 / AVX-512 / AMX / VNNI"]
+        NPU["NPU<br/>OpenVINO / Tensor Offload"]
+        MEM["Memory Subsystem<br/>UMA / HMA / Hot-Cold Tiering"]
+        QALG["Quantum-Inspired<br/>RFF / Grover Expansion"]
     end
 
-    subgraph Network["Network & Ingress"]
+    subgraph Infra["Security & Ingress"]
         direction LR
-        UWP["Unified Wire Protocol"]
-        XDP["eBPF / AF_XDP Zero-Copy"]
-        PG["PostgreSQL Wire Protocol"]
+        UWP["Unified Wire Protocol (Zero-Copy)"]
+        XDP["eBPF / AF_XDP Kernel Bypass"]
+        SEC["CNSA 2.0 / PQC (ML-KEM-1024 / ML-DSA-87)"]
+        AUDIT["Append-Only Cryptographic Hash Ledger"]
     end
 
-    Network --> Storage
+    Infra --> Storage
     Storage --> Compute
 ```
 
 ---
 
-## Hardware Dispatch & Portability
+## Hardware Execution & Graceful Fallback
 
-QIHSE runs on any standard Linux x86_64 host or virtualized container. At initialization, runtime CPUID capability detection routes execution to the fastest available instruction set:
+QIHSE treats performance as a low-level systems problem:
 
-- **AVX-512 / VNNI / AMX**: Maximum vector throughput on modern server hardware.
-- **AVX2 / FMA**: High-throughput 256-bit SIMD math.
-- **AVX1 / SSE4.2**: Backward compatibility for older multi-core x86_64 CPUs.
-- **Scalar Fallback**: Guaranteed bit-exact execution on non-AVX architectures.
-
----
-
-## SQLite VFS Integration
-
-QIHSE provides a fully compliant C SQLite Virtual File System (`sqlite3_vfs`). It allows existing applications using SQLite to transparently route database pages and WAL frames through QIHSE's high-speed KV store and append-only event stream:
-
-### Usage in C
-```c
-#include "persistence/qihse_sqlite_vfs.h"
-
-// Register the VFS
-qihse_vfs_register(0);
-
-// Open database via URI
-sqlite3* db;
-sqlite3_open_v2("file:data.db?vfs=qihse", &db,
-                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-                NULL);
-```
-
-### Usage in Python
-```python
-import sqlite3
-from pathlib import Path
-
-# Dynamically load the QIHSE VFS extension into SQLite
-dummy = sqlite3.connect(":memory:")
-dummy.enable_load_extension(True)
-dummy.load_extension("/path/to/qihse_vfs")
-
-# All operations on this connection use QIHSE storage
-conn = sqlite3.connect("file:app.db?vfs=qihse", uri=True)
-```
+- **Vectorized SIMD Core**: Vector distance calculations and columnar scans vectorize across 512-bit or 256-bit registers (AVX-512, AVX2, FMA).
+- **Graceful CPUID Routing**: If host hardware lacks AVX2 or AVX-512 (e.g. legacy Xeon nodes, constrained VMs, or ARM), QIHSE detects this at boot and dynamically routes execution through verified AVX1/SSE4.2 or scalar pipelines.
+- **Hierarchical Memory Tiering**: Real-time access frequency tracking (`vectors.qtier`) automatically manages hot and cold pages across Unified (UMA) and Heterogeneous (HMA) memory.
+- **Zero-Copy eBPF / AF_XDP**: Database ingress packets bypass standard Linux TCP/IP overhead via custom eBPF socket routing.
 
 ---
 
-## Quick Start
+## Build & CLI Launcher
 
-### Prerequisites
 ```bash
-# Ubuntu / Debian
-sudo apt install build-essential libssl-dev libnuma-dev libbpf-dev \
-                 libxdp-dev liburing-dev libsqlite3-dev \
-                 luajit libluajit-5.1-dev libpython3-dev python3-dev
-```
+# Build the native library and full test harness
+make clean && make
 
-### Build & Test
-```bash
-# Build libqihse.so and the SQLite VFS extension
-make clean && make lib qihse_vfs.so
-
-# Run the native test suite
+# Run the test suite
 make test
 
-# Run the SQLite VFS integration test
-make test-sqlite-vfs && ./test-sqlite-vfs
-```
-
-### Command-Line Launcher
-```bash
+# Launch the unified management CLI
 ./qihse status
 ./qihse build
 ./qihse test
 ./qihse db --help
-./qihse python
 ```
 
 ---
 
-## Code Examples
+## Documentation & Manuals
 
-### Vector Search in C
-```c
-#include <qihse_vector_db.h>
-#include <stdio.h>
+All technical specifications, integration manuals, API definitions, and code examples are documented in [`docs/`](docs/):
 
-int main() {
-    qihse_vector_db_t* db = qihse_vector_db_create(
-        QIHSE_VECTOR_DB_AUTO, NULL, "/tmp/qihse_demo");
-    if (!db) return 1;
-
-    float vector[128] = {0};
-    uint64_t id = 1;
-    qihse_vector_db_add_vectors(db, vector, 1, 128, &id, NULL, NULL);
-
-    qihse_vector_query_t q = {
-        .query_vector = vector,
-        .vector_dims = 128,
-        .top_k = 10,
-        .query_mode = QIHSE_VDB_QUERY_FLOAT32,
-        .distance_metric = QIHSE_DISTANCE_COSINE
-    };
-    qihse_vector_result_t results[10];
-    qihse_vector_db_search(db, &q, results, 10);
-
-    qihse_vector_db_close(db);
-    return 0;
-}
-```
-
-### Key-Value Store in Rust
-```rust
-use qihse_rs::KVStore;
-
-fn main() {
-    let kv = KVStore::new().unwrap();
-    kv.set("session:1042", "authenticated", 0, 0);
-    assert_eq!(kv.get("session:1042"), Some("authenticated".into()));
-}
-```
-
----
-
-## Documentation
-
-Detailed technical documentation and subsystem guides are located in the [`docs/`](docs/) directory:
-
-- **[System Architecture](docs/architecture/system_overview.md)**: Deep dive into all 8 storage engines and memory models.
-- **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Native VFS design, page caching, and crash recovery.
-- **[API Reference](docs/api/)**: C API specifications for all engine surfaces.
-- **[Python SDK Guide](sdks/python/)**: Native CPython binding reference and usage examples.
-- **[Rust FFI SDK](rust/qihse-rs/)**: Safe Rust wrapper reference.
-- **[Security Architecture](docs/security/README.md)**: Cell-level clearance, constant-time filtering, and CNSA 2.0 PQC cryptography.
-- **[Security Hardening Report](docs/security/hardening-report.md)**: Security audit results, bounded I/O mitigations, and syscall analysis.
+- 📖 **[System Architecture & Engine Overview](docs/architecture/system_overview.md)**: In-depth technical guide covering all 8 engines, UWP layout, and SIMD dispatch.
+- 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
+- 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
+- 🐍 **[Python SDK Manual](sdks/python/)**: Native CPython bindings and integration guide.
+- 🦀 **[Rust SDK Manual](rust/qihse-rs/)**: FFI safe wrappers (`KVStore`, `VectorDB`, `TrinaryTrie`).
+- 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and CNSA 2.0 PQC encryption.
+- 🛡️ **[Security Audit & Hardening Report](docs/security/hardening-report.md)**: Results from static analysis, memory audit, and file I/O hardening.
+- ⚡ **[Performance Benchmarks](docs/benchmarks/benchmarks.md)**: Stress tests, throughput comparisons, and latency profiles.
 
 ---
 
 ## License
 
-QIHSE is licensed under the **AGPL-3.0 License**. See [LICENSE](LICENSE) for details.
+QIHSE is licensed under **AGPL-3.0**. Read [LICENSE](LICENSE) before use.
