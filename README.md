@@ -17,7 +17,7 @@
 
 **QIHSE** is a native C database ecosystem built around a single, uncompromising rule:
 
-> **Approximation is allowed to propose candidates. It is not allowed to silently decide truth.**
+> **Approximations hunt the targets. Exact math dictates the truth.**
 
 Modern systems frequently fragment under the weight of stitching together half a dozen specialized databases—a vector DB for AI, Redis for caching, PostgreSQL for documents, ClickHouse for OLAP, and Kafka for events. QIHSE eliminates this operational friction. It is a multi-modal database engine combining **eight distinct storage engines and a transparent SQLite VFS replacement** within the exact same process space and memory hierarchy.
 
