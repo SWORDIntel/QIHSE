@@ -21,9 +21,9 @@ int main(void) {
     qihse_auth_init();
     qihse_user_t* u_operator = qihse_auth_get_user(0);
 
-    qihse_fts_add_document(index, 101, doc1, strlen(doc1), 0, 0);
-    qihse_fts_add_document(index, 102, doc2, strlen(doc2), 0, 0);
-    qihse_fts_add_document(index, 103, doc3, strlen(doc3), 0, 0);
+    qihse_fts_add_document(index, 101, doc1, strlen(doc1), 0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN);
+    qihse_fts_add_document(index, 102, doc2, strlen(doc2), 0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN);
+    qihse_fts_add_document(index, 103, doc3, strlen(doc3), 0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN);
 
     qihse_fts_result_t results[10];
     

@@ -90,6 +90,32 @@ const char* qihse_keystone_class_name(qihse_keystone_class_t cls);
  */
 int64_t qihse_keystone_anchor_search(const int64_t* arr, size_t n, int64_t key);
 
+/**
+ * Interpolation anchor-guided lower-bound for sorted 64-bit integer arrays.
+ * Returns the index of the first element >= key using the same O(log log N)
+ * interpolation core as qihse_keystone_anchor_search. Used for index range
+ * lookups (replacing binary search) in the Frieze Column Store and Marmalade
+ * Time-Series Engine.
+ *
+ * @param arr Sorted array of 64-bit integers.
+ * @param n Number of elements.
+ * @param key Target lower-bound value.
+ * @return Index of first element >= key, or n if all elements are < key.
+ */
+size_t qihse_keystone_anchor_lower_bound(const int64_t* arr, size_t n, int64_t key);
+
+/**
+ * Interpolation anchor-guided upper-bound for sorted 64-bit integer arrays.
+ * Returns the index of the first element > key using the same O(log log N)
+ * interpolation core as qihse_keystone_anchor_search.
+ *
+ * @param arr Sorted array of 64-bit integers.
+ * @param n Number of elements.
+ * @param key Target upper-bound value.
+ * @return Index of first element > key, or n if all elements are <= key.
+ */
+size_t qihse_keystone_anchor_upper_bound(const int64_t* arr, size_t n, int64_t key);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3,6 +3,7 @@
 #endif
 
 #include "qihse_timeseries.h"
+#include "qihse_keystone.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,7 +16,17 @@
 struct qihse_tsdb {
     qihse_tsdb_chunk_t* chunk_head;
     qihse_tsdb_chunk_t* chunk_tail;
-    
+
+    /* Keystone anchor-search chunk index (Idea 2).
+     * Parallel sorted array of per-chunk start_timestamps plus the matching
+     * chunk pointers, so range queries can use qihse_keystone_anchor_lower_bound
+     * to skip the linear chunk walk. Chunks are appended in monotonic time
+     * order by qihse_tsdb_compress_flush, so the array stays sorted. */
+    int64_t* chunk_starts;
+    qihse_tsdb_chunk_t** chunk_ptrs;
+    size_t chunk_index_count;
+    size_t chunk_index_cap;
+
     struct {
         uint32_t series_id;
         uint64_t timestamp;
@@ -23,10 +34,10 @@ struct qihse_tsdb {
         uint16_t classification;
         uint16_t sci_compartment;
     } cache[QIHSE_RING_SIZE];
-    
+
     qihse_padded_atomic_t head;
     qihse_padded_atomic_t tail;
-    
+
     uint64_t ttl_ms;
 };
 
@@ -86,6 +97,10 @@ qihse_tsdb_t* qihse_tsdb_create() {
     if (tsdb) {
         tsdb->chunk_head = NULL;
         tsdb->chunk_tail = NULL;
+        tsdb->chunk_starts = NULL;
+        tsdb->chunk_ptrs = NULL;
+        tsdb->chunk_index_count = 0;
+        tsdb->chunk_index_cap = 0;
         tsdb->ttl_ms = 0;
         atomic_init(&tsdb->head.index, 0);
         atomic_init(&tsdb->tail.index, 0);
@@ -101,6 +116,8 @@ void qihse_tsdb_destroy(qihse_tsdb_t* tsdb) {
         free(curr);
         curr = next;
     }
+    free(tsdb->chunk_starts);
+    free(tsdb->chunk_ptrs);
     free(tsdb);
 }
 
@@ -214,7 +231,7 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
     
     /* Update tail with atomic_fetch_add_explicit */
     atomic_fetch_add_explicit(&tsdb->tail.index, count, memory_order_release);
-    
+
     if (tsdb->chunk_tail) {
         tsdb->chunk_tail->next = new_chunk;
         tsdb->chunk_tail = new_chunk;
@@ -222,6 +239,31 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
         tsdb->chunk_head = new_chunk;
         tsdb->chunk_tail = new_chunk;
     }
+
+    /* Append to the keystone anchor chunk index. Chunks are flushed in
+     * monotonic time order, so the start_timestamp array stays sorted and
+     * qihse_keystone_anchor_lower_bound can be used for O(log log N) range
+     * lookup. */
+    if (tsdb->chunk_index_count >= tsdb->chunk_index_cap) {
+        size_t new_cap = (tsdb->chunk_index_cap == 0) ? 16 : tsdb->chunk_index_cap * 2;
+        int64_t* new_starts = (int64_t*)realloc(tsdb->chunk_starts, new_cap * sizeof(int64_t));
+        if (new_starts) {
+            tsdb->chunk_starts = new_starts;
+            qihse_tsdb_chunk_t** new_ptrs = (qihse_tsdb_chunk_t**)realloc(tsdb->chunk_ptrs, new_cap * sizeof(qihse_tsdb_chunk_t*));
+            if (new_ptrs) {
+                tsdb->chunk_ptrs = new_ptrs;
+                tsdb->chunk_index_cap = new_cap;
+            } else {
+                /* ptr array growth failed: keep old cap, skip this append. */
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    tsdb->chunk_starts[tsdb->chunk_index_count] = (int64_t)new_chunk->start_timestamp;
+    tsdb->chunk_ptrs[tsdb->chunk_index_count] = new_chunk;
+    tsdb->chunk_index_count++;
 }
 
 bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestamp, double value, uint16_t classification, uint16_t sci_compartment) {
@@ -247,32 +289,40 @@ bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestam
 __attribute__((target_clones("avx512f", "avx2", "default")))
 double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user) {
     if (!tsdb) return 0.0;
-    
+
     double sum = 0.0;
     uint32_t count = 0;
-    
-    qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
-    while (curr) {
-        if (curr->end_timestamp < start_ts || curr->start_timestamp > end_ts) {
-            curr = curr->next;
-            continue;
-        }
+
+    /* Keystone anchor-indexed chunk scan (Idea 2): O(log log N) lower_bound
+     * on the sorted per-chunk start_timestamp array lands us directly on the
+     * first chunk that may overlap [start_ts, end_ts], replacing the previous
+     * linear chunk walk / binary search. */
+    size_t chunk_total = tsdb->chunk_index_count;
+    size_t start_idx = 0;
+    if (chunk_total > 0 && tsdb->chunk_ptrs) {
+        start_idx = qihse_keystone_anchor_lower_bound(
+            tsdb->chunk_starts, chunk_total, (int64_t)start_ts);
+        if (start_idx > 0) start_idx--; /* the chunk containing start_ts may start before it */
+    }
+    for (size_t ci = start_idx; ci < chunk_total; ci++) {
+        qihse_tsdb_chunk_t* curr = tsdb->chunk_ptrs[ci];
+        if (curr->start_timestamp > end_ts) break; /* sorted: no further overlaps */
+        if (curr->end_timestamp < start_ts) continue;
         if (!qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
-            curr = curr->next;
             continue;
         }
-        
+
         bit_stream_t bs = { (uint8_t*)curr->compressed_lanes, 0, sizeof(curr->compressed_lanes) * 8 };
         uint64_t t_prev = curr->start_timestamp;
         int64_t d_prev = 0;
         uint64_t v_prev = 0;
         int prev_lz = 0;
         int prev_tz = 0;
-        
+
         for (uint32_t i = 0; i < curr->count; i++) {
             uint64_t t;
             uint64_t v;
-            
+
             if (i == 0) {
                 t = t_prev;
                 v = br_read(&bs, 64);
@@ -290,12 +340,12 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
                 } else {
                     dod = sign_extend(br_read(&bs, 32), 32);
                 }
-                
+
                 int64_t d = d_prev + dod;
                 t = t_prev + d;
                 t_prev = t;
                 d_prev = d;
-                
+
                 if (br_read(&bs, 1) == 0) {
                     v = v_prev;
                 } else {
@@ -309,14 +359,14 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
                         uint64_t xor_val = br_read(&bs, len);
                         int tz = 64 - lz - len;
                         v = v_prev ^ (xor_val << tz);
-                        
+
                         prev_lz = lz;
                         prev_tz = tz;
                     }
                 }
                 v_prev = v;
             }
-            
+
             if (t >= start_ts && t <= end_ts) {
                 double v_d;
                 memcpy(&v_d, &v, sizeof(double));
@@ -324,8 +374,6 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
                 count++;
             }
         }
-        
-        curr = curr->next;
     }
     
     uint64_t tail = atomic_load_explicit(&tsdb->tail.index, memory_order_acquire);
@@ -364,11 +412,21 @@ bool qihse_tsdb_aggregate_range_user(qihse_tsdb_t* tsdb, uint32_t series_id, uin
     double aggregate = 0.0;
     uint64_t count = 0;
 
-    qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
-    while (curr) {
-        if (curr->series_id != series_id || curr->end_timestamp < start_ts || curr->start_timestamp > end_ts ||
+    /* Keystone anchor-indexed chunk scan (Idea 2): O(log log N) lower_bound
+     * on the sorted per-chunk start_timestamp array replaces the linear chunk
+     * walk / binary search to find the first overlapping chunk. */
+    size_t chunk_total = tsdb->chunk_index_count;
+    size_t start_idx = 0;
+    if (chunk_total > 0 && tsdb->chunk_ptrs) {
+        start_idx = qihse_keystone_anchor_lower_bound(
+            tsdb->chunk_starts, chunk_total, (int64_t)start_ts);
+        if (start_idx > 0) start_idx--; /* the chunk containing start_ts may start before it */
+    }
+    for (size_t ci = start_idx; ci < chunk_total; ci++) {
+        qihse_tsdb_chunk_t* curr = tsdb->chunk_ptrs[ci];
+        if (curr->start_timestamp > end_ts) break; /* sorted: no further overlaps */
+        if (curr->series_id != series_id || curr->end_timestamp < start_ts ||
             !qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
-            curr = curr->next;
             continue;
         }
         bit_stream_t bs = { (uint8_t*)curr->compressed_lanes, 0, sizeof(curr->compressed_lanes) * 8 };
@@ -424,7 +482,6 @@ bool qihse_tsdb_aggregate_range_user(qihse_tsdb_t* tsdb, uint32_t series_id, uin
                 qihse_tsdb_aggregate_value(decoded, aggregation, &aggregate, &count);
             }
         }
-        curr = curr->next;
     }
 
     uint64_t tail = atomic_load_explicit(&tsdb->tail.index, memory_order_acquire);
@@ -459,6 +516,7 @@ void qihse_tsdb_trim(qihse_tsdb_t* tsdb, uint64_t current_ts) {
     uint64_t expiry_ts = (current_ts > tsdb->ttl_ms) ? (current_ts - tsdb->ttl_ms) : 0;
     
     qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
+    size_t trimmed_from_front = 0;
     
     while (curr) {
         if (curr->end_timestamp < expiry_ts) {
@@ -472,8 +530,34 @@ void qihse_tsdb_trim(qihse_tsdb_t* tsdb, uint64_t current_ts) {
                 tsdb->chunk_tail = NULL;
             }
             free(to_free);
+            trimmed_from_front++;
         } else {
             break;
         }
     }
+
+    /* Keep the keystone anchor chunk index consistent: drop the trimmed
+     * entries from the front of the sorted start_timestamp array. */
+    if (trimmed_from_front > 0 && trimmed_from_front <= tsdb->chunk_index_count) {
+        size_t remaining = tsdb->chunk_index_count - trimmed_from_front;
+        if (remaining > 0) {
+            memmove(tsdb->chunk_starts,
+                    tsdb->chunk_starts + trimmed_from_front,
+                    remaining * sizeof(int64_t));
+            memmove(tsdb->chunk_ptrs,
+                    tsdb->chunk_ptrs + trimmed_from_front,
+                    remaining * sizeof(qihse_tsdb_chunk_t*));
+        }
+        tsdb->chunk_index_count = remaining;
+    }
+}
+
+size_t qihse_tsdb_lookup_chunk_index(qihse_tsdb_t* tsdb, uint64_t target_ts) {
+    if (!tsdb || !tsdb->chunk_starts || tsdb->chunk_index_count == 0) return 0;
+    return qihse_keystone_anchor_lower_bound(
+        tsdb->chunk_starts, tsdb->chunk_index_count, (int64_t)target_ts);
+}
+
+size_t qihse_tsdb_chunk_index_size(qihse_tsdb_t* tsdb) {
+    return tsdb ? tsdb->chunk_index_count : 0;
 }

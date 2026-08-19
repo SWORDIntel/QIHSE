@@ -156,7 +156,7 @@ endif
 # because their functionality is already partially in qihse_math.c / qihse_search.c 
 # or provided by qihse_exports.c stubs.
 
-.PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install dev-setup docs redis-cluster-node bench-cluster-crc test-cluster-slot test-cluster-numa test-resp-cluster test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec
+.PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install dev-setup docs redis-cluster-node bench-cluster-crc test-cluster-slot test-cluster-numa test-resp-cluster test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec test-hnsw-anchor-seeding test-column-tsdb-anchor test-neural-fts-fusion test-af-xdp-keystone-ingest test-dist-planner-hardware
 .NOTPARALLEL: validate-reference-workflow
 
 all: liboqs oqs-provider lib server keygen
@@ -260,7 +260,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity
+test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware
 
 test-cluster-slot: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
@@ -286,6 +286,10 @@ test-af-xdp-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_af_xdp_resp tests/test_af_xdp_resp.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_af_xdp_resp
 
+test-af-xdp-keystone-ingest: lib
+	$(CC) $(CFLAGS) -o tests/test_af_xdp_keystone_ingest tests/test_af_xdp_keystone_ingest.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_af_xdp_keystone_ingest
+
 test-guard-throttle: lib
 	$(CC) $(CFLAGS) -o tests/test_guard_throttle tests/test_guard_throttle.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_guard_throttle
@@ -298,6 +302,10 @@ test-dist-planner: lib
 	$(CC) $(CFLAGS) -o tests/test_dist_planner tests/test_dist_planner.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_dist_planner
 
+test-dist-planner-hardware: lib
+	$(CC) $(CFLAGS) -o tests/test_dist_planner_hardware tests/test_dist_planner_hardware.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_dist_planner_hardware
+
 test-cluster-rebalance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_rebalance tests/test_cluster_rebalance.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_rebalance
@@ -309,6 +317,10 @@ test-pg-wire-cluster: lib
 test-keystone-qihse: lib
 	$(CC) $(CFLAGS) -o tests/test_keystone_qihse_integration tests/test_keystone_qihse_integration.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_keystone_qihse_integration
+
+test-hnsw-anchor-seeding: lib
+	$(CC) $(CFLAGS) -o tests/test_hnsw_anchor_seeding tests/test_hnsw_anchor_seeding.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_hnsw_anchor_seeding
 
 test-kv-read-integrity: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_read_integrity tests/test_kv_read_integrity.c -L. -lqihse $(LDFLAGS)
@@ -335,6 +347,10 @@ test-column-store: lib
 test-fts-engine: lib
 	$(CC) $(CFLAGS) -o tests/test_fts_engine tests/test_fts_engine.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fts_engine
+
+test-neural-fts-fusion: lib
+	$(CC) $(CFLAGS) -o tests/test_neural_fts_fusion tests/test_neural_fts_fusion.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_neural_fts_fusion
 
 test-e2e: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
@@ -365,6 +381,10 @@ test-quantization: lib
 test-timeseries: lib
 	$(CC) $(CFLAGS) -o tests/test_timeseries tests/test_timeseries.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_timeseries
+
+test-column-tsdb-anchor: lib
+	$(CC) $(CFLAGS) -o tests/test_column_tsdb_anchor tests/test_column_tsdb_anchor.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_column_tsdb_anchor
 
 test-event-stream: lib
 	$(CC) $(CFLAGS) -o tests/test_event_stream tests/qihse_event_stream_test.c -L. -lqihse $(LDFLAGS)
@@ -696,7 +716,8 @@ clean:
 	    tests/qihse_vector_db_persistence_test tests/qihse_trinary_codec_test \
 	    tests/test_all_isa tests/test_vnni_bench tests/test_vnni_only \
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
-	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries
+	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries \
+	    tests/test_column_tsdb_anchor
 	@echo "Clean completed"
 
 workspace:

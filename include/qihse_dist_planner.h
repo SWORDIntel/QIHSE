@@ -33,6 +33,32 @@ typedef enum {
     QIHSE_MERGE_AGGREGATE_AVG = 5     /* Metric averaging */
 } qihse_dist_merge_type_t;
 
+typedef enum {
+    QIHSE_HW_BACKEND_SCALAR = 0,
+    QIHSE_HW_BACKEND_SSE42  = 1,
+    QIHSE_HW_BACKEND_AVX2   = 2,
+    QIHSE_HW_BACKEND_AVX512 = 3,
+    QIHSE_HW_BACKEND_BLAS   = 4
+} qihse_hw_backend_t;
+
+typedef struct {
+    uint32_t cache_line_size;
+    size_t l1_data_size;
+    size_t l2_size;
+    size_t l3_size;
+    uint32_t numa_nodes;
+} qihse_cache_topology_t;
+
+typedef struct {
+    uint64_t cpu_features;
+    qihse_cache_topology_t cache;
+    bool sse42_available;
+    bool avx2_available;
+    bool avx512_available;
+    bool blas_available;
+    qihse_hw_backend_t preferred;
+} qihse_hw_profile_t;
+
 typedef struct {
     uint16_t node_index;
     uint16_t slot;
@@ -46,6 +72,8 @@ typedef struct {
     char filter_column[64];
     char filter_op[8];
     double filter_threshold;
+    qihse_hw_backend_t selected_backend;
+    size_t estimated_payload_bytes;
 } qihse_shard_task_t;
 
 typedef struct {
@@ -115,6 +143,18 @@ qihse_dist_query_result_t* qihse_dist_execute_plan(
  * @brief Frees a distributed query result.
  */
 void qihse_dist_query_result_free(qihse_dist_query_result_t* result);
+
+/* Adaptive Hardware Dispatcher API */
+qihse_hw_profile_t* qihse_hw_profile_create(void);
+qihse_hw_profile_t* qihse_hw_profile_create_from(uint64_t cpu_features, const qihse_cache_topology_t* cache, bool blas_available);
+void qihse_hw_profile_destroy(qihse_hw_profile_t* profile);
+void qihse_hw_profile_set_blas_available(qihse_hw_profile_t* profile, bool available);
+const char* qihse_hw_backend_name(qihse_hw_backend_t backend);
+qihse_hw_backend_t qihse_hw_select_backend(const qihse_hw_profile_t* profile, size_t payload_bytes, size_t vector_dims);
+
+void qihse_dist_planner_set_hw_profile(qihse_dist_planner_t* planner, qihse_hw_profile_t* profile);
+qihse_hw_profile_t* qihse_dist_planner_get_hw_profile(const qihse_dist_planner_t* planner);
+qihse_hw_backend_t qihse_dist_planner_dispatch_backend(qihse_dist_planner_t* planner, qihse_shard_task_t* task);
 
 #ifdef __cplusplus
 }

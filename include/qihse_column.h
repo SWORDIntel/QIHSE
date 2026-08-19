@@ -75,4 +75,59 @@ int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* nam
 float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user);
 bool qihse_column_minmax_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user, float* out_min, float* out_max);
 
+/**
+ * @brief Keystone anchor-search index integration.
+ *
+ * Builds a sorted INT64 index over an INT64 column so that point and range
+ * lookups can be served by qihse_keystone_anchor_search /
+ * qihse_keystone_anchor_lower_bound / qihse_keystone_anchor_upper_bound in
+ * O(log log N) (< 20ns) instead of binary search.
+ *
+ * The index materializes the column's INT64 values into a contiguous sorted
+ * array together with the original (chunk, offset) row coordinates, so the
+ * caller can recover per-row classification / SCI compartment metadata for
+ * access-controlled aggregation.
+ */
+
+/**
+ * @brief Materialize a sorted anchor index for an INT64 column.
+ *
+ * Walks every chunk of the named INT64 column, copies the (value, chunk, slot)
+ * tuples into a growable buffer, sorts by value, and stores the result on the
+ * column node. Subsequent qihse_column_lookup_int64_user /
+ * qihse_column_range_count_int64_user calls use this index via the keystone
+ * anchor search family.
+ *
+ * @param store Column store handle.
+ * @param name INT64 column name.
+ * @return true on success, false if the column does not exist or is not INT64.
+ */
+bool qihse_column_build_int64_index(qihse_column_store_t* store, const char* name);
+
+/**
+ * @brief Release any materialized anchor index for a column.
+ */
+void qihse_column_drop_int64_index(qihse_column_store_t* store, const char* name);
+
+/**
+ * @brief O(log log N) point lookup of an INT64 value via keystone anchor search.
+ *
+ * Requires qihse_column_build_int64_index to have been called. Returns the
+ * first accessible row whose value equals `key`, or -1 if no accessible row
+ * matches. Access control is enforced via qihse_auth_can_access.
+ *
+ * @return Row ordinal (>= 0) on hit, -1 on miss or error.
+ */
+int64_t qihse_column_lookup_int64_user(qihse_column_store_t* store, const char* name, int64_t key, qihse_user_t* user);
+
+/**
+ * @brief O(log log N) range count of accessible INT64 rows in [low, high].
+ *
+ * Uses qihse_keystone_anchor_lower_bound / qihse_keystone_anchor_upper_bound
+ * to bracket the range, then walks the (typically tiny) bracket verifying
+ * access control. Returns the number of accessible rows whose value lies in
+ * the inclusive range [low, high].
+ */
+size_t qihse_column_range_count_int64_user(qihse_column_store_t* store, const char* name, int64_t low, int64_t high, qihse_user_t* user);
+
 #endif /* QIHSE_COLUMN_H */
