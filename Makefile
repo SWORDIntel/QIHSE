@@ -96,6 +96,13 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
      src/networking/qihse_af_xdp.c src/broad_oak/qihse_quantum_defense.c src/broad_oak/qihse_mmdb.c \
      $(wildcard sync/*.c)
 
+# SQLite VFS sources
+SRCS_VFS = persistence/qihse_sqlite_vfs.c \
+           persistence/qihse_vfs_page_cache.c \
+           persistence/qihse_vfs_wal.c
+
+SRCS_BASE += $(SRCS_VFS)
+
 SRCS=$(SRCS_BASE)
 
 ifeq ($(LIB_TARGET),qihse.dll)
@@ -642,3 +649,18 @@ install: all
 	@install -m 644 libqihse.so $(DESTDIR)/usr/local/lib/libqihse.so
 	@install -m 644 qihse.h $(DESTDIR)/usr/local/include/qihse/qihse.h
 	@echo "Installed libqihse.so and qihse.h into $(DESTDIR)/usr/local"
+
+# Optional page-level encryption for SQLite VFS
+ifeq ($(QIHSE_VFS_ENCRYPT),1)
+CFLAGS += -DQIHSE_VFS_ENCRYPT=1
+endif
+
+# Standalone loadable extension target
+qihse_vfs.so: $(SRCS_VFS) persistence/qihse_file_posix.c libqihse.so
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $(SRCS_VFS) persistence/qihse_file_posix.c \
+	    -DSQLITE_CORE $$(pkg-config --cflags --libs sqlite3) -L. -lqihse -lssl -lcrypto -Wl,-rpath,.
+
+# Integration test target
+test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
+	$(CC) $(CFLAGS) -o $@ tests/test_sqlite_vfs.c ./qihse_vfs.so \
+	    -L. -lqihse $$(pkg-config --cflags --libs sqlite3) -Wl,-rpath,.
