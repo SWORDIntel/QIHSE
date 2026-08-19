@@ -257,7 +257,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity
+test: test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity
 
 test-cluster-slot: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
@@ -282,6 +282,10 @@ test-cluster-failover: lib
 test-guard-throttle: lib
 	$(CC) $(CFLAGS) -o tests/test_guard_throttle tests/test_guard_throttle.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_guard_throttle
+
+test-cluster-scatter: lib
+	$(CC) $(CFLAGS) -o tests/test_cluster_scatter tests/test_cluster_scatter.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_scatter
 
 test-kv-read-integrity: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_read_integrity tests/test_kv_read_integrity.c -L. -lqihse $(LDFLAGS)
