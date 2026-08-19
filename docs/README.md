@@ -102,6 +102,8 @@ Prerequisites, configuration options, tuning guidelines, and advanced usage patt
 Operational runbooks: vector DB mutation flows, memory maintenance loops, benchmark workflows.
 
 ### [🏗️ Architecture & Plans](architecture/)
+- [Distributed Multi-Engine Planner](architecture/distributed_query_planner.md)
+- [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md)
 - [SQLite VFS Implementation Plan](qihse_sqlite_vfs_plan.md)
 - [TRITON Lua Injector](architecture/lua_injector.md)
