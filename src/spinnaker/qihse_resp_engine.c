@@ -89,6 +89,13 @@ struct qihse_resp_server {
     pthread_mutex_t vdb_lock;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
+    /* Phase 3: cluster bus + failover + guard throttling */
+    qihse_cluster_bus_t* bus;
+    qihse_cluster_failover_t* failover;
+    qihse_system_guard_window_t* guard_window;
+    bool owns_bus;
+    bool owns_failover;
+    bool owns_guard_window;
 };
 
 typedef struct {
@@ -1410,6 +1417,24 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return qihse_resp_array(session, 0u);
     }
 
+    /* Phase 3: System Guard bus-saturation throttling for DENYOOM commands */
+    if (session->server->guard_window) {
+        size_t request_bytes = 0;
+        for (size_t i = 0; i < request->argc; i++) request_bytes += request->argv[i].len;
+        qihse_system_guard_window_record(session->server->guard_window, request_bytes);
+        if (!qihse_system_guard_window_safe(session->server->guard_window)) {
+            /* Allow readonly commands to proceed; reject write/DENYOOM commands */
+            bool is_write = qihse_resp_command_is(request, "SET") || qihse_resp_command_is(request, "SETEX") ||
+                            qihse_resp_command_is(request, "PSETEX") || qihse_resp_command_is(request, "MSET") ||
+                            qihse_resp_command_is(request, "DEL") || qihse_resp_command_is(request, "INCR") ||
+                            qihse_resp_command_is(request, "DECR") || qihse_resp_command_is(request, "EXPIRE") ||
+                            qihse_resp_command_is(request, "PEXPIRE") || qihse_resp_command_is(request, "MIGRATE") ||
+                            qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "TS.ADD") ||
+                            qihse_resp_command_is(request, "COL.APPEND");
+            if (is_write) return qihse_resp_error(session, "LOADING QIHSE system guard throttling: memory bus saturation detected");
+        }
+    }
+
     qihse_resp_keyset_t keys;
     qihse_resp_extract_keys(request, &keys);
     if (keys.count > 0 && !qihse_resp_route(session, request, &keys)) return true;
@@ -1673,6 +1698,12 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->auth_required = true;
     config->require_full_coverage = true;
     config->numa_node_id = -1;
+    config->enable_bus = false;
+    config->enable_failover = false;
+    config->enable_guard_throttle = false;
+    config->xdp_interface = NULL;
+    config->guard_window_ms = 1000u;
+    config->guard_saturation_fraction = 0.8;
 }
 
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
@@ -1766,6 +1797,51 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             return NULL;
         }
     }
+    /* Phase 3: create guard window if requested */
+    if (supplied->enable_guard_throttle) {
+        server->guard_window = qihse_system_guard_window_create(supplied->guard_window_ms,
+                                                                 supplied->guard_saturation_fraction);
+        server->owns_guard_window = server->guard_window != NULL;
+    }
+    /* Phase 3: create cluster bus if requested */
+    if (supplied->enable_bus) {
+        qihse_cluster_bus_config_t bus_cfg;
+        memset(&bus_cfg, 0, sizeof(bus_cfg));
+        bus_cfg.topology = server->topology;
+        bus_cfg.local_node_index = local;
+        bus_cfg.bus_port = server->bus_port;
+        bus_cfg.bind_address = supplied->bind_address;
+        bus_cfg.xdp_interface = supplied->xdp_interface;
+        server->bus = qihse_cluster_bus_create(&bus_cfg);
+        server->owns_bus = server->bus != NULL;
+    }
+    /* Phase 3: create failover coordinator if requested */
+    if (supplied->enable_failover) {
+        qihse_cluster_failover_config_t fo_cfg;
+        memset(&fo_cfg, 0, sizeof(fo_cfg));
+        fo_cfg.topology = server->topology;
+        fo_cfg.bus = server->bus;
+        fo_cfg.local_node_index = local;
+        fo_cfg.single_coordinator = false;
+        server->failover = qihse_cluster_failover_create(&fo_cfg);
+        server->owns_failover = server->failover != NULL;
+        /* Wire the failover callback into the bus by recreating it with
+         * the callback set. */
+        if (server->bus && server->failover) {
+            qihse_cluster_bus_config_t re_cfg;
+            memset(&re_cfg, 0, sizeof(re_cfg));
+            re_cfg.topology = server->topology;
+            re_cfg.local_node_index = local;
+            re_cfg.bus_port = server->bus_port;
+            re_cfg.bind_address = supplied->bind_address;
+            re_cfg.xdp_interface = supplied->xdp_interface;
+            re_cfg.on_fail = qihse_cluster_failover_on_fail_cb;
+            re_cfg.on_fail_user_data = server->failover;
+            qihse_cluster_bus_destroy(server->bus);
+            server->bus = qihse_cluster_bus_create(&re_cfg);
+            server->owns_bus = server->bus != NULL;
+        }
+    }
     return server;
 }
 
@@ -1800,6 +1876,8 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
         return false;
     }
     server->accept_thread_started = true;
+    /* Phase 3: start the cluster bus if present */
+    if (server->bus) qihse_cluster_bus_start(server->bus);
     pthread_mutex_unlock(&server->state_lock);
     return true;
 }
@@ -1833,6 +1911,8 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
 
 void qihse_resp_server_stop(qihse_resp_server_t* server) {
     if (!server) return;
+    /* Phase 3: stop the cluster bus first to prevent new topology updates */
+    if (server->bus) qihse_cluster_bus_stop(server->bus);
     pthread_t accept_thread;
     bool join_accept = false;
     pthread_mutex_lock(&server->state_lock);
@@ -1858,6 +1938,9 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
 void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (!server) return;
     qihse_resp_server_stop(server);
+    if (server->owns_failover && server->failover) qihse_cluster_failover_destroy(server->failover);
+    if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
+    if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
     if (server->owns_topology) qihse_cluster_topology_destroy(server->topology);
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
@@ -1874,6 +1957,18 @@ uint16_t qihse_resp_server_port(const qihse_resp_server_t* server) {
 
 qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server) {
     return server ? server->topology : NULL;
+}
+
+qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server) {
+    return server ? server->bus : NULL;
+}
+
+qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server) {
+    return server ? server->failover : NULL;
+}
+
+qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t* server) {
+    return server ? server->guard_window : NULL;
 }
 
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd) {
