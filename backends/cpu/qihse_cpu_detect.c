@@ -9,12 +9,6 @@
  */
 
 #include "qihse_cpu_detect.h"
-#ifdef _WIN32
-#include <intrin.h>
-#else
-#include <signal.h>
-#include <setjmp.h>
-#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -23,6 +17,27 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
+
+#ifdef _WIN32
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <signal.h>
+#include <setjmp.h>
+static inline void qihse_raw_cpuid(int cpuInfo[4], int leaf, int subleaf) {
+    __asm__ volatile("cpuid"
+                     : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]), "=c"(cpuInfo[2]), "=d"(cpuInfo[3])
+                     : "a"(leaf), "c"(subleaf));
+}
+static inline uint64_t qihse_xgetbv(uint32_t index) {
+    uint32_t eax, edx;
+    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(index));
+    return ((uint64_t)edx << 32) | eax;
+}
+#else
+#include <signal.h>
+#include <setjmp.h>
+#endif
 
 /* ============================================================================
  * RUNTIME CPU FEATURE TESTING
@@ -30,6 +45,7 @@
 
 #ifndef _WIN32
 static sigjmp_buf cpu_test_jmp_buf;
+static pthread_mutex_t cpu_test_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void cpu_feature_signal_handler(int signo) {
     (void)signo;
@@ -49,11 +65,12 @@ static bool qihse_force_full_features(void) {
 /**
  * Execute the test function while trapping illegal/segfault signals.
  */
-static bool safe_execute_test(bool (*test_func)(void)) {
+static __attribute__((unused)) bool safe_execute_test(bool (*test_func)(void)) {
 #ifdef _WIN32
     (void)test_func;
     return false;
 #else
+    pthread_mutex_lock(&cpu_test_mutex);
     struct sigaction sa, old_ill, old_segv;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = cpu_feature_signal_handler;
@@ -71,11 +88,13 @@ static bool safe_execute_test(bool (*test_func)(void)) {
         bool success = test_func();
         sigaction(SIGILL, &old_ill, NULL);
         sigaction(SIGSEGV, &old_segv, NULL);
+        pthread_mutex_unlock(&cpu_test_mutex);
         return success;
     }
 
     sigaction(SIGILL, &old_ill, NULL);
     sigaction(SIGSEGV, &old_segv, NULL);
+    pthread_mutex_unlock(&cpu_test_mutex);
     return false;
 #endif
 }
@@ -398,139 +417,96 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         return info;
     }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     uint64_t features = QIHSE_CPU_FEATURE_NONE;
-    int cpuInfo[4];
+    int cpuInfo[4] = {0};
 
-    __cpuid(cpuInfo, 1);
-    if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_SSE;
-    if (cpuInfo[3] & (1 << 26)) features |= QIHSE_CPU_FEATURE_SSE2;
+    qihse_raw_cpuid(cpuInfo, 0, 0);
+    int max_leaf = cpuInfo[0];
 
-    bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
-    info.has_osxsave = osxsave;
-    info.has_avx_support = (cpuInfo[2] & (1 << 28)) != 0;
+    if (max_leaf >= 1) {
+        qihse_raw_cpuid(cpuInfo, 1, 0);
+        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_SSE;
+        if (cpuInfo[3] & (1 << 26)) features |= QIHSE_CPU_FEATURE_SSE2;
+        if (cpuInfo[2] & (1 << 0))  features |= QIHSE_CPU_FEATURE_SSE3;
+        if (cpuInfo[2] & (1 << 9))  features |= QIHSE_CPU_FEATURE_SSSE3;
+        if (cpuInfo[2] & (1 << 19)) features |= QIHSE_CPU_FEATURE_SSE4_1;
+        if (cpuInfo[2] & (1 << 20)) features |= QIHSE_CPU_FEATURE_SSE4_2;
 
-    if (info.has_avx_support && osxsave) {
-        features |= QIHSE_CPU_FEATURE_AVX;
-        
-        __cpuidex(cpuInfo, 7, 0);
-        if (cpuInfo[1] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX2;
-        
-        info.has_avx512_support = (cpuInfo[1] & (1 << 16)) != 0;
-        if (info.has_avx512_support) {
-            features |= QIHSE_CPU_FEATURE_AVX512F;
-            if (cpuInfo[1] & (1 << 30)) features |= QIHSE_CPU_FEATURE_AVX512BW;
-            if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
-            if (cpuInfo[1] & (1 << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
-            if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
-            /* AVX-512 BF16: leaf 7 sub-leaf 1, EAX bit 5 */
-            /* AVX-512 BF16: leaf 7 sub-leaf 1, EAX bit 5 — checked below after sub-leaf 1 read */
+        bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
+        bool cpu_avx = (cpuInfo[2] & (1 << 28)) != 0;
+        info.has_osxsave = osxsave;
+
+        if (osxsave && cpu_avx) {
+            uint64_t xcr0 = 0;
+#ifdef _WIN32
+            xcr0 = _xgetbv(0);
+#else
+            xcr0 = qihse_xgetbv(0);
+#endif
+            /* Check if XMM (bit 1) and YMM (bit 2) are enabled by OS */
+            if ((xcr0 & 0x6) == 0x6) {
+                info.has_avx_support = true;
+                features |= QIHSE_CPU_FEATURE_AVX;
+
+                if (max_leaf >= 7) {
+                    qihse_raw_cpuid(cpuInfo, 7, 0);
+                    if (cpuInfo[1] & (1 << 5)) {
+                        features |= QIHSE_CPU_FEATURE_AVX2;
+                    }
+
+                    /* Check AVX512: Foundation (EBX bit 16), OS support for ZMM (bits 5, 6, 7) */
+                    bool cpu_avx512 = (cpuInfo[1] & (1 << 16)) != 0;
+                    bool os_avx512 = (xcr0 & 0xe6) == 0xe6;
+                    const char* avx512_env = getenv("QIHSE_ENABLE_AVX512");
+                    bool avx512_allowed = !avx512_env || avx512_env[0] != '0';
+
+                    if (cpu_avx512 && os_avx512 && avx512_allowed) {
+                        info.has_avx512_support = true;
+                        features |= QIHSE_CPU_FEATURE_AVX512F;
+                        if (cpuInfo[1] & (1 << 30)) features |= QIHSE_CPU_FEATURE_AVX512BW;
+                        if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
+                        if (cpuInfo[1] & (1 << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
+                        if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+                    }
+
+                    /* AMX features: leaf 7 sub-leaf 0, EDX bits 22/24/25 */
+                    const char* amx_env = getenv("QIHSE_ENABLE_AMX");
+                    bool amx_allowed = !amx_env || amx_env[0] != '0';
+                    if (amx_allowed) {
+                        if (cpuInfo[3] & (1 << 24)) {
+                            features |= QIHSE_CPU_FEATURE_AMX;
+                            features |= QIHSE_CPU_FEATURE_AMX_TILE;
+                        }
+                        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
+                        if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
+                    }
+
+                    if (cpuInfo[2] & (1 << 11)) {
+                        features |= QIHSE_CPU_FEATURE_VNNI;
+                    }
+
+                    /* Leaf 7 sub-leaf 1: AVX-VNNI (EAX bit 4) and AVX-512 BF16 (EAX bit 5) */
+                    qihse_raw_cpuid(cpuInfo, 7, 1);
+                    const char* avx_vnni_env = getenv("QIHSE_ENABLE_AVX_VNNI");
+                    bool avx_vnni_allowed = !avx_vnni_env || avx_vnni_env[0] != '0';
+                    if (avx_vnni_allowed && (cpuInfo[0] & (1 << 4))) {
+                        features |= QIHSE_CPU_FEATURE_AVX_VNNI;
+                    }
+                    if (avx512_allowed && os_avx512 && (cpuInfo[0] & (1 << 5))) {
+                        features |= QIHSE_CPU_FEATURE_AVX512BF16;
+                    }
+                }
+            }
         }
-
-        /* AMX features: leaf 7 sub-leaf 0, EDX bits 22/24/25 */
-        if (cpuInfo[3] & (1 << 24)) {
-            features |= QIHSE_CPU_FEATURE_AMX;
-            features |= QIHSE_CPU_FEATURE_AMX_TILE;
-        }
-        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
-        if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
-
-        if (cpuInfo[2] & (1 << 11)) {
-            features |= QIHSE_CPU_FEATURE_VNNI;
-        }
-
-        /* Leaf 7 sub-leaf 1: AVX-VNNI (EAX bit 4) and AVX-512 BF16 (EAX bit 5) */
-        __cpuidex(cpuInfo, 7, 1);
-        if (cpuInfo[0] & (1 << 4)) features |= QIHSE_CPU_FEATURE_AVX_VNNI;
-        if (cpuInfo[0] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX512BF16;
     }
 
     info.features = features;
 #else
-    /* Test each feature through actual execution */
+    /* Fallback for non-x86 architectures */
     uint64_t features = QIHSE_CPU_FEATURE_NONE;
-
-    /* Test SIMD features */
-    if (safe_execute_test(qihse_cpu_test_sse)) {
-        features |= QIHSE_CPU_FEATURE_SSE;
-    }
-    if (safe_execute_test(qihse_cpu_test_sse2)) {
-        features |= QIHSE_CPU_FEATURE_SSE2;
-    }
-
-    /* Test AVX features (require OS support) */
-    /* OSXSAVE is required for AVX - test by attempting AVX execution */
-    info.has_osxsave = safe_execute_test(qihse_cpu_test_avx);
-    info.has_avx_support = info.has_osxsave;
-    if (info.has_avx_support) {
-        features |= QIHSE_CPU_FEATURE_AVX;
-        if (safe_execute_test(qihse_cpu_test_avx2)) {
-            features |= QIHSE_CPU_FEATURE_AVX2;
-        }
-    }
-
-    /* Test specialized features */
-    const char* avx512_env = getenv("QIHSE_ENABLE_AVX512");
-    if (!avx512_env || avx512_env[0] != '0') {
-        info.has_avx512_support = safe_execute_test(qihse_cpu_test_avx512f);
-        if (info.has_avx512_support) {
-            features |= QIHSE_CPU_FEATURE_AVX512F;
-            if (safe_execute_test(qihse_cpu_test_avx512bw)) {
-                features |= QIHSE_CPU_FEATURE_AVX512BW;
-            }
-            if (safe_execute_test(qihse_cpu_test_avx512dq)) {
-                features |= QIHSE_CPU_FEATURE_AVX512DQ;
-            }
-            if (safe_execute_test(qihse_cpu_test_avx512vl)) {
-                features |= QIHSE_CPU_FEATURE_AVX512VL;
-            }
-            if (safe_execute_test(qihse_cpu_test_avx512vnni)) {
-                features |= QIHSE_CPU_FEATURE_AVX512VNNI;
-            }
-        }
-    }
-
-    const char* amx_env = getenv("QIHSE_ENABLE_AMX");
-    if (!amx_env || amx_env[0] != '0') {
-        if (safe_execute_test(qihse_cpu_test_amx)) {
-            features |= QIHSE_CPU_FEATURE_AMX;
-            features |= QIHSE_CPU_FEATURE_AMX_TILE;
-        }
-    }
-
-    if (safe_execute_test(qihse_cpu_test_vnni)) {
-        features |= QIHSE_CPU_FEATURE_VNNI;
-    }
-
-    /* AVX-VNNI runtime test: attempt vpdpbusd ymm0,ymm0,ymm0 */
-    const char* avx_vnni_env = getenv("QIHSE_ENABLE_AVX_VNNI");
-    if (!avx_vnni_env || avx_vnni_env[0] != '0') {
-        if (safe_execute_test(qihse_cpu_test_avx_vnni)) {
-            features |= QIHSE_CPU_FEATURE_AVX_VNNI;
-        }
-    }
-
-    /* CPUID fallback for AMX and AVX-512 BF16 — these may fail runtime tests
-     * if the kernel hasn't enabled XCR0 tile support, even though the CPU
-     * supports them. Use CPUID as a secondary detection path. */
-    {
-        int cpuInfo[4];
-        __asm__ volatile("cpuid" : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]),
-                         "=c"(cpuInfo[2]), "=d"(cpuInfo[3]) : "a"(7), "c"(0));
-        /* AMX BF16: EDX bit 22, AMX TILE: EDX bit 24, AMX INT8: EDX bit 25 */
-        if (cpuInfo[3] & (1 << 24)) {
-            features |= QIHSE_CPU_FEATURE_AMX;
-            features |= QIHSE_CPU_FEATURE_AMX_TILE;
-        }
-        if (cpuInfo[3] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AMX_INT8;
-        if (cpuInfo[3] & (1 << 22)) features |= QIHSE_CPU_FEATURE_AMX_BF16;
-
-        /* Leaf 7 sub-leaf 1: AVX-512 BF16 (EAX bit 5) */
-        __asm__ volatile("cpuid" : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]),
-                         "=c"(cpuInfo[2]), "=d"(cpuInfo[3]) : "a"(7), "c"(1));
-        if (cpuInfo[0] & (1 << 5)) features |= QIHSE_CPU_FEATURE_AVX512BF16;
-    }
-
+    if (safe_execute_test(qihse_cpu_test_sse)) features |= QIHSE_CPU_FEATURE_SSE;
+    if (safe_execute_test(qihse_cpu_test_sse2)) features |= QIHSE_CPU_FEATURE_SSE2;
     info.features = features;
 #endif
     return info;

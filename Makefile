@@ -208,7 +208,7 @@ liboqs:
 		echo "Building liboqs..."; \
 		cd vendor/liboqs && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DOQS_USE_OPENSSL=OFF .. 2>&1 && \
-		ninja 2>&1 && (ninja install 2>&1 || true); \
+		ninja 2>&1; (ninja install 2>&1 || true); \
 		echo "liboqs build successful"; \
 	elif [ -f /usr/local/include/oqs/oqs.h ] || [ -f /usr/include/oqs/oqs.h ]; then \
 		echo "liboqs already installed on system."; \
