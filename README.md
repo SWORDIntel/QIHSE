@@ -38,6 +38,7 @@ Data traverses from kernel-bypass network interfaces straight into SIMD computat
 | **Full-Text Search** | Native | `qihse_fts_*` | Zero-copy lexical tokenization with native BM25 relevance scoring. |
 | **Event Stream** | `0x07` | `qihse_event_*` | Append-only log bypassing userspace via Linux `mmap` / `sendfile` DMA with SHA-384 frame deduplication. |
 | **SQLite VFS** | Native | `qihse_sqlite_vfs` | Drop-in SQLite storage replacement routing database pages through Black Hole KV and Marmalade Event Stream. |
+| **Task Queue & Scheduler** | Native / RESP | `qihse_task_*` | Celery-equivalent distributed task queue with 4 priority levels, dedicated NUMA worker pool, 10ms timing wheel cron scheduler, and Celery-compatible Python SDK. |
 
 ---
 
@@ -145,6 +146,22 @@ fused = qihse.MultimodalFusion.search(
     fts_query="defense alert",
     semantic_mask=(1 << qihse.KeystoneClass.GOVERNMENT),
 )
+
+# 6. Celery-Equivalent Distributed Task Queue & Periodic Scheduler
+from qihse_task import task, TaskClient
+
+@task(queue="intel_pipeline", priority="HIGH", max_retries=3)
+def process_intel(entity_id, payload):
+    return {"status": "analyzed", "entity": entity_id}
+
+# Async task dispatch (.delay / .apply_async)
+handle = process_intel.delay("TARGET-801", {"geo": "LAT_LON"})
+print(f"Task submitted: {handle.id[:16]}... State: {handle.status}")
+result = handle.get(timeout=10.0) # -> {"status": "analyzed", ...}
+
+# Periodic cron task scheduling (Celery Beat replacement)
+client = TaskClient()
+client.schedule_add("nightly_recon", "0 2 * * *", "recon", {"func": "tasks.recon_sweep"})
 ```
 
 ---
@@ -192,6 +209,7 @@ All technical specifications, integration manuals, API definitions, and code exa
 
 - 📖 **[System Architecture & Engine Overview](docs/architecture/system_overview.md)**: In-depth technical guide covering all 8 engines, UWP layout, and SIMD dispatch.
 - ⚡ **[QIHSE + KEYSTONE Integrated Benchmarks](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**: 5-pillar joint architecture report and comparative analysis.
+- ⚡ **[Task Queue Engine Plan (Celery-Equivalent)](docs/plans/qihse_task_queue_plan.md)**: Distributed task queue architecture, 4 priority levels, dedicated NUMA worker pool, and periodic cron scheduling.
 - ⚡ **[Redis Cluster Sharding Plan](docs/plans/qihse_redis_cluster_sharding_plan.md)**: Native C99 multi-node clustering blueprint with 16,384 CRC16 hash slots and multi-model routing.
 - 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
