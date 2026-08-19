@@ -9,82 +9,111 @@
 #include <fcntl.h>
 #include "../broad_oak/qihse_quantum_defense.h"
 
-#define QIHSE_DATA_DIR "/var/lib/qihse/"
-#define WAL_PATH QIHSE_DATA_DIR "wal.log"
+#define LSM_MEMTABLE_MAX (512 * 1024)        // 512KB MemTable flush threshold
+#define WAL_BUFFER_FLUSH_THRESHOLD 65536     // 64KB write buffer
 
-#define LSM_MEMTABLE_MAX (8 * 1024 * 1024) // 8MB
-
+/* Optimized in-node KV payload combining value, auth classification, and expiry */
 typedef struct {
-    char* key;
-    uint64_t expire_time_ms;
     uint16_t classification;
     uint16_t sci_compartment;
-} key_entry_t;
+    uint64_t expire_time_ms;
+    char val[];
+} kv_payload_t;
 
 struct qihse_kv_store {
     qihse_trinary_trie_t* trie;
-    key_entry_t* keys;
-    size_t num_keys;
-    size_t capacity;
     
     // LSM-Tree Native Implementation
     FILE* wal_fd;
+    size_t wal_unflushed_bytes;
     size_t mem_usage;
     int sstable_counter;
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
 };
 
-static uint64_t current_time_ms() {
+static const char* get_qihse_data_dir(void) {
+    static char data_dir[256] = {0};
+    if (data_dir[0]) return data_dir;
+    
+    const char* env = getenv("QIHSE_DATA_DIR");
+    if (env && env[0]) {
+        snprintf(data_dir, sizeof(data_dir), "%s%s", env, env[strlen(env)-1] == '/' ? "" : "/");
+        return data_dir;
+    }
+    
+    if (access("/var/lib/qihse", W_OK | R_OK) == 0) {
+        strncpy(data_dir, "/var/lib/qihse/", sizeof(data_dir) - 1);
+        return data_dir;
+    }
+    
+    // Ensure fallback local directory exists
+    mkdir("data", 0755);
+    mkdir("data/qihse", 0755);
+    strncpy(data_dir, "data/qihse/", sizeof(data_dir) - 1);
+    return data_dir;
+}
+
+static inline uint64_t current_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)(tv.tv_sec) * 1000 + (uint64_t)(tv.tv_usec) / 1000;
 }
 
+static void flush_wal_buffer(qihse_kv_store_t* store) {
+    if (store && store->wal_fd && store->wal_unflushed_bytes > 0) {
+        fflush(store->wal_fd);
+        store->wal_unflushed_bytes = 0;
+    }
+}
+
 static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
-    if (store->num_keys == 0) return;
+    if (!store || !store->trie) return;
     
+    const char* dir = get_qihse_data_dir();
     char sst_path[256];
-    snprintf(sst_path, sizeof(sst_path), QIHSE_DATA_DIR "sstable_%d.db", store->sstable_counter++);
+    snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, store->sstable_counter++);
     
     qihse_kv_save(store, sst_path);
     
     // Reset MemTable
     qihse_trinary_trie_destroy(store->trie);
     store->trie = qihse_trinary_trie_create();
-    if (!store->bulk_load_mode) {
-        for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
-    }
-    store->num_keys = 0;
     store->mem_usage = 0;
+    store->wal_unflushed_bytes = 0;
     
     // Truncate WAL
     if (store->wal_fd) fclose(store->wal_fd);
+    char wal_path[256];
+    snprintf(wal_path, sizeof(wal_path), "%swal.log", dir);
 #ifndef _WIN32
-    int tfd = open(WAL_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    int tfd = open(wal_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (tfd >= 0) store->wal_fd = fdopen(tfd, "w");
     else store->wal_fd = NULL;
 #else
-    store->wal_fd = fopen(WAL_PATH, "w");
+    store->wal_fd = fopen(wal_path, "w");
 #endif
 }
 
 static void recover_from_wal(qihse_kv_store_t* store) {
+    const char* dir = get_qihse_data_dir();
+    char wal_path[256];
+    snprintf(wal_path, sizeof(wal_path), "%swal.log", dir);
 #ifndef _WIN32
-    int wfd = open(WAL_PATH, O_RDONLY | O_NOFOLLOW);
+    int wfd = open(wal_path, O_RDONLY | O_NOFOLLOW);
     if (wfd < 0) return;
     FILE* f = fdopen(wfd, "r");
     if (!f) { close(wfd); return; }
 #else
-    FILE* f = fopen(WAL_PATH, "r");
+    FILE* f = fopen(wal_path, "r");
     if (!f) return;
 #endif
     char line[4096];
     while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "SET ", 4) == 0) {
-            unsigned int classif, sci;
-            char key_buf[256], val_buf[256];
-            if (sscanf(line + 4, "%255s %255s %u %u", key_buf, val_buf, &classif, &sci) >= 2) {
+            unsigned int classif = 0, sci = 0;
+            char key_buf[256], val_buf[2048];
+            if (sscanf(line + 4, "%255s %2047s %u %u", key_buf, val_buf, &classif, &sci) >= 2) {
                 qihse_kv_set(store, key_buf, val_buf, classif, sci);
             }
         } else if (strncmp(line, "DEL ", 4) == 0) {
@@ -97,31 +126,30 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     fclose(f);
 }
 
-qihse_kv_store_t* qihse_kv_store_create() {
+qihse_kv_store_t* qihse_kv_store_create(void) {
     qihse_kv_store_t* store = (qihse_kv_store_t*)calloc(1, sizeof(qihse_kv_store_t));
     if (!store) return NULL;
     store->trie = qihse_trinary_trie_create();
     if (!store->trie) { free(store); return NULL; }
-    store->keys = NULL;
-    store->num_keys = 0;
-    store->capacity = 0;
     store->bulk_load_mode = false;
     
     store->wal_fd = NULL;
+    store->wal_unflushed_bytes = 0;
     store->mem_usage = 0;
     store->sstable_counter = 0;
     store->qdd_ctx = qihse_qdd_init();
     
+    const char* dir_path = get_qihse_data_dir();
+    
     // Discover highest sstable counter
-    DIR *d;
-    struct dirent *dir;
-    d = opendir(QIHSE_DATA_DIR);
+    DIR *d = opendir(dir_path);
     if (d) {
+        struct dirent *dir;
         while ((dir = readdir(d)) != NULL) {
             if (strncmp(dir->d_name, "sstable_", 8) == 0) {
                 char *endp;
                 long id = strtol(dir->d_name + 8, &endp, 10);
-                if (*endp != '\0') continue;
+                if (*endp != '.' && *endp != '\0') continue;
                 if (id < 0 || id > 1000000) continue;
                 if (id >= store->sstable_counter) store->sstable_counter = id + 1;
             }
@@ -133,13 +161,16 @@ qihse_kv_store_t* qihse_kv_store_create() {
     recover_from_wal(store);
     
     // Rotate WAL — start fresh, archive old log for debugging
-    rename(WAL_PATH, QIHSE_DATA_DIR "wal.log.old");
+    char wal_path[256], wal_old_path[256];
+    snprintf(wal_path, sizeof(wal_path), "%swal.log", dir_path);
+    snprintf(wal_old_path, sizeof(wal_old_path), "%swal.log.old", dir_path);
+    rename(wal_path, wal_old_path);
 #ifndef _WIN32
-    int rfd = open(WAL_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    int rfd = open(wal_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (rfd >= 0) store->wal_fd = fdopen(rfd, "w");
     else store->wal_fd = NULL;
 #else
-    store->wal_fd = fopen(WAL_PATH, "w");
+    store->wal_fd = fopen(wal_path, "w");
 #endif
     
     return store;
@@ -148,68 +179,51 @@ qihse_kv_store_t* qihse_kv_store_create() {
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (store) {
         if (store->qdd_ctx) qihse_qdd_free(store->qdd_ctx);
-        if (store->wal_fd) fclose(store->wal_fd);
-        if (store->trie) qihse_trinary_trie_destroy(store->trie);
-        if (store->keys) {
-            for (size_t i = 0; i < store->num_keys; i++) {
-                if (store->keys[i].key) free(store->keys[i].key);
-            }
-            free(store->keys);
+        if (store->wal_fd) {
+            flush_wal_buffer(store);
+            fclose(store->wal_fd);
         }
+        if (store->trie) qihse_trinary_trie_destroy(store->trie);
         free(store);
     }
 }
 
-bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment) {
+static bool qihse_kv_set_with_expiry(qihse_kv_store_t* store, const char* key, const char* value, uint64_t ttl_ms, uint16_t classification, uint16_t sci_compartment) {
     if (!store || !store->trie || !key || !value) return false;
     
+    // Buffered WAL logging
     if (store->wal_fd && !store->bulk_load_mode) {
-        fprintf(store->wal_fd, "SET %s %s %u %u\n", key, value, (unsigned)classification, (unsigned)sci_compartment);
-        fflush(store->wal_fd);
+        int written = fprintf(store->wal_fd, "SET %s %s %u %u\n", key, value, (unsigned)classification, (unsigned)sci_compartment);
+        if (written > 0) store->wal_unflushed_bytes += (size_t)written;
+        if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) {
+            flush_wal_buffer(store);
+        }
     }
 
-    if (!store->bulk_load_mode) {
-        size_t out_size = 0;
-        qihse_trinary_trie_search(store->trie, key, &out_size);
-    }
-    if (!qihse_trinary_trie_insert(store->trie, key, (void*)value, strlen(value) + 1)) {
-        return false;
-    }
+    size_t val_len = strlen(value);
+    size_t payload_len = sizeof(kv_payload_t) + val_len + 1;
+    kv_payload_t* payload = (kv_payload_t*)malloc(payload_len);
+    if (!payload) return false;
 
-    store->mem_usage += strlen(key) + strlen(value) + 16;
+    payload->classification = classification;
+    payload->sci_compartment = sci_compartment;
+    payload->expire_time_ms = ttl_ms > 0 ? current_time_ms() + ttl_ms : 0;
+    memcpy(payload->val, value, val_len + 1);
+
+    bool inserted = qihse_trinary_trie_insert(store->trie, key, payload, payload_len);
+    free(payload);
+    if (!inserted) return false;
+
+    store->mem_usage += strlen(key) + val_len + sizeof(kv_payload_t);
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX) {
         flush_memtable_to_sstable(store);
     }
     
-    if (!store->bulk_load_mode) {
-        bool exists = false;
-        for (size_t i = 0; i < store->num_keys; i++) {
-            if (strcmp(store->keys[i].key, key) == 0) {
-                exists = true;
-                store->keys[i].expire_time_ms = 0;
-                store->keys[i].classification = classification;
-                store->keys[i].sci_compartment = sci_compartment;
-                break;
-            }
-        }
-        if (!exists) {
-            if (store->num_keys == store->capacity) {
-                size_t new_capacity = store->capacity == 0 ? 16 : store->capacity * 2;
-                key_entry_t* new_keys = (key_entry_t*)realloc(store->keys, new_capacity * sizeof(key_entry_t));
-                if (!new_keys) return false;
-                store->capacity = new_capacity;
-                store->keys = new_keys;
-            }
-            store->keys[store->num_keys].key = strdup(key);
-            store->keys[store->num_keys].expire_time_ms = 0;
-            store->keys[store->num_keys].classification = classification;
-            store->keys[store->num_keys].sci_compartment = sci_compartment;
-            store->num_keys++;
-        }
-    } else {
-        /* Bulk load: skip per-key metadata tracking, just insert into trie */
-    }
     return true;
+}
+
+bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment) {
+    return qihse_kv_set_with_expiry(store, key, value, 0, classification, sci_compartment);
 }
 
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
@@ -217,30 +231,25 @@ void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
 }
 
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
-    if (store) store->bulk_load_mode = false;
+    if (store) {
+        store->bulk_load_mode = false;
+        flush_wal_buffer(store);
+    }
 }
 
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment, qihse_user_t* user) {
     if (!store || !key) return false;
     
-    // If the key already exists, check the user's access on the existing key first
-    if (!store->bulk_load_mode && store->keys) {
-        for (size_t i = 0; i < store->num_keys; i++) {
-            if (store->keys[i].key && strcmp(store->keys[i].key, key) == 0) {
-                if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                    return false;
-                }
-                break;
-            }
+    // Check access on existing key if present
+    size_t out_sz = 0;
+    kv_payload_t* existing = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &out_sz);
+    if (existing) {
+        if (!qihse_auth_can_access(user, existing->classification, existing->sci_compartment)) {
+            return false;
         }
     }
     
-    // Check if the user is authorized to create/set a key with the target classification
-    if (!qihse_auth_can_access(user, classification, sci_compartment)) {
-        return false;
-    }
-    
-    return qihse_kv_set(store, key, value, classification, sci_compartment);
+    return qihse_kv_set_with_expiry(store, key, value, 0, classification, sci_compartment);
 }
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
@@ -256,28 +265,27 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         qihse_qdd_report_access(store->qdd_ctx, key_hash, "0.0.0.0");
     }
     
-    if (!store->bulk_load_mode) qihse_kv_sweep_expired(store);
+    // Fast O(key_len) Trinary Trie point lookup
     size_t out_size = 0;
-    void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
+    kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &out_size);
     
-    if (val && !store->bulk_load_mode && store->keys) {
-        // Find auth info in memory
-        for (size_t i = 0; i < store->num_keys; i++) {
-            if (store->keys[i].key && strcmp(store->keys[i].key, key) == 0) {
-                if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                    val = NULL; // Masked: pretend it doesn't exist in MemTable
-                }
-                break;
-            }
+    if (p) {
+        uint64_t now = current_time_ms();
+        if (p->expire_time_ms > 0 && p->expire_time_ms <= now) {
+            qihse_trinary_trie_delete(store->trie, key);
+            return NULL;
         }
+        if (!qihse_auth_can_access(user, p->classification, p->sci_compartment)) {
+            return NULL; // Masked unauthorized
+        }
+        return strdup(p->val);
     }
     
-    if (val) return strdup((char*)val);
-    
-    // LSM-Tree: Search SSTables (from newest to oldest)
+    // LSM-Tree: Search SSTables (from newest to oldest on disk)
+    const char* dir = get_qihse_data_dir();
     for (int i = store->sstable_counter - 1; i >= 0; i--) {
         char sst_path[256];
-        snprintf(sst_path, sizeof(sst_path), QIHSE_DATA_DIR "sstable_%d.db", i);
+        snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, i);
 #ifndef _WIN32
         int sfd = open(sst_path, O_RDONLY | O_NOFOLLOW);
         if (sfd < 0) continue;
@@ -309,7 +317,7 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
                 if (!qihse_auth_can_access(user, classif, sci)) {
                     free(f_key);
                     free(f_val);
-                    break; // Masked: pretend it doesn't exist, breaking out of this file parsing loop
+                    break;
                 }
                 free(f_key);
                 fclose(f);
@@ -326,42 +334,24 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
 bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return false;
     
-    // Check auth first
-    bool has_auth = false;
-    bool found = false;
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            found = true;
-            if (qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                has_auth = true;
-            }
-            break;
+    size_t out_size = 0;
+    kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &out_size);
+    if (p) {
+        if (!qihse_auth_can_access(user, p->classification, p->sci_compartment)) {
+            return false;
         }
     }
     
-    // If it exists but we don't have auth, pretend we couldn't delete it because it doesn't exist
-    if (found && !has_auth) return false;
-    
-    if (store->wal_fd) {
-        fprintf(store->wal_fd, "DEL %s\n", key);
-        fflush(store->wal_fd);
+    if (store->wal_fd && !store->bulk_load_mode) {
+        int written = fprintf(store->wal_fd, "DEL %s\n", key);
+        if (written > 0) store->wal_unflushed_bytes += (size_t)written;
+        if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) {
+            flush_wal_buffer(store);
+        }
     }
 
-    size_t out_size = 0;
-    void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
-    if (val) {
-        bool deleted = qihse_trinary_trie_delete(store->trie, key);
-        if (deleted) {
-            for (size_t i = 0; i < store->num_keys; i++) {
-                if (strcmp(store->keys[i].key, key) == 0) {
-                    free(store->keys[i].key);
-                    store->keys[i] = store->keys[store->num_keys - 1];
-                    store->num_keys--;
-                    break;
-                }
-            }
-        }
-        return deleted;
+    if (p) {
+        return qihse_trinary_trie_delete(store->trie, key);
     }
     return false;
 }
@@ -376,90 +366,78 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t
 }
 
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user) {
-    if (!store || !key) return false;
-    if (!qihse_kv_exists_user(store, key, user)) return false;
+    if (!store || !store->trie || !key) return false;
 
-    uint64_t now = current_time_ms();
-    bool has_auth = false;
-    bool found = false;
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            found = true;
-            if (qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                has_auth = true;
-                store->keys[i].expire_time_ms = now + ttl_ms;
-            }
-            break;
-        }
+    size_t out_size = 0;
+    kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &out_size);
+    if (!p) return false;
+
+    if (!qihse_auth_can_access(user, p->classification, p->sci_compartment)) {
+        return false;
     }
     
-    if (found && !has_auth) return false;
-    if (found && has_auth) return true;
-    return false;
+    p->expire_time_ms = current_time_ms() + ttl_ms;
+    return true;
+}
+
+typedef struct {
+    uint64_t now;
+    qihse_trinary_trie_t* trie;
+    size_t expired_count;
+} sweep_ctx_t;
+
+static bool sweep_expired_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size;
+    sweep_ctx_t* ctx = (sweep_ctx_t*)user_data;
+    if (!key || !value || !ctx) return true;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (p->expire_time_ms > 0 && p->expire_time_ms <= ctx->now) {
+        qihse_trinary_trie_delete(ctx->trie, key);
+        ctx->expired_count++;
+    }
+    return true;
 }
 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
-    if (!store || store->bulk_load_mode || !store->keys || store->num_keys == 0) return;
-    uint64_t now = current_time_ms();
-    for (size_t i = 0; i < store->num_keys; ) {
-        if (store->keys[i].key && store->keys[i].expire_time_ms > 0 && store->keys[i].expire_time_ms <= now) {
-            size_t out_size = 0;
-            void* val = qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
-            if (val) {
-                qihse_trinary_trie_delete(store->trie, store->keys[i].key);
-            }
-            
-            free(store->keys[i].key);
-            store->keys[i] = store->keys[store->num_keys - 1];
-            store->num_keys--;
-        } else {
-            i++;
-        }
-    }
+    if (!store || !store->trie || store->bulk_load_mode) return;
+    sweep_ctx_t ctx = {
+        .now = current_time_ms(),
+        .trie = store->trie,
+        .expired_count = 0
+    };
+    qihse_trinary_trie_foreach(store->trie, sweep_expired_callback, &ctx);
 }
 
 typedef struct {
     FILE* f;
     size_t count;
-} bulk_save_ctx_t;
+} sstable_save_ctx_t;
 
-static bool bulk_save_callback(const char* key, void* value, size_t value_size, void* user_data) {
-    bulk_save_ctx_t* ctx = (bulk_save_ctx_t*)user_data;
+static bool sstable_save_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size;
+    sstable_save_ctx_t* ctx = (sstable_save_ctx_t*)user_data;
     if (!key || !value || !ctx->f) return true;
+    kv_payload_t* p = (kv_payload_t*)value;
     size_t klen = strlen(key);
-    size_t vlen = value_size > 0 ? value_size - 1 : 0;
-    fprintf(ctx->f, "%zu %zu 0 0 0\n", klen, vlen);
+    size_t vlen = strlen(p->val);
+    fprintf(ctx->f, "%zu %zu %llu %u %u\n", klen, vlen, (unsigned long long)p->expire_time_ms, (unsigned)p->classification, (unsigned)p->sci_compartment);
     fwrite(key, 1, klen, ctx->f);
-    fwrite(value, 1, vlen, ctx->f);
+    fwrite(p->val, 1, vlen, ctx->f);
     fprintf(ctx->f, "\n");
     ctx->count++;
     return true;
 }
 
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
-    if (!store || !filepath) return -1;
-    if (!store->bulk_load_mode) qihse_kv_sweep_expired(store);
+    if (!store || !filepath || !store->trie) return -1;
+    qihse_kv_sweep_expired(store);
     int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     FILE* f = fdopen(fd, "w");
     if (!f) { close(fd); return -1; }
     
-    if (store->bulk_load_mode || store->keys == NULL) {
-        /* Bulk mode: iterate trie via callback — write key/value pairs without metadata */
-        bulk_save_ctx_t ctx = { .f = f, .count = 0 };
-        qihse_trinary_trie_foreach(store->trie, bulk_save_callback, &ctx);
-    } else {
-        for (size_t i = 0; i < store->num_keys; i++) {
-            size_t out_size = 0;
-            char* val = (char*)qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
-            if (val) {
-                fprintf(f, "%zu %zu %llu %u %u\n", strlen(store->keys[i].key), strlen(val), (unsigned long long)store->keys[i].expire_time_ms, (unsigned)store->keys[i].classification, (unsigned)store->keys[i].sci_compartment);
-                fwrite(store->keys[i].key, 1, strlen(store->keys[i].key), f);
-                fwrite(val, 1, strlen(val), f);
-                fprintf(f, "\n");
-            }
-        }
-    }
+    sstable_save_ctx_t ctx = { .f = f, .count = 0 };
+    qihse_trinary_trie_foreach(store->trie, sstable_save_callback, &ctx);
     fclose(f);
     return 0;
 }
@@ -489,20 +467,16 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
         val[val_len] = '\0';
         fgetc(f);
         
-        qihse_kv_set(store, key, val, classif, sci);
-        if (expire_time > 0) {
-            for (size_t i = 0; i < store->num_keys; i++) {
-                if (strcmp(store->keys[i].key, key) == 0) {
-                    store->keys[i].expire_time_ms = (uint64_t)expire_time;
-                    break;
-                }
-            }
+        uint64_t ttl_ms = 0;
+        uint64_t now = current_time_ms();
+        if (expire_time > now) {
+            ttl_ms = expire_time - now;
         }
+        qihse_kv_set_with_expiry(store, key, val, ttl_ms, classif, sci);
         free(key);
         free(val);
     }
     fclose(f);
-    qihse_kv_sweep_expired(store);
     return 0;
 }
 

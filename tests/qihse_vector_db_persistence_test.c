@@ -2074,7 +2074,6 @@ static bool test_missing_vectors_qtri_accepted(void) {
                 "persistence stats should be available for missing qtri");
     if (stats.trinary_status != QIHSE_VDB_TRINARY_ABSENT) {
         printf("DEBUG: stats.trinary_status = %d, expected %d\n", stats.trinary_status, QIHSE_VDB_TRINARY_ABSENT);
-        printf("DEBUG: committed=%lu trinary_gen=%lu\n", (unsigned long)db->committed_generation, (unsigned long)stats.trinary_generation);
         printf("DEBUG: trinary_row_bytes=%lu trinary_rows=%lu\n", (unsigned long)stats.trinary_row_bytes, (unsigned long)stats.trinary_rows);
     }
     TEST_ASSERT(stats.trinary_status == QIHSE_VDB_TRINARY_VALID || stats.trinary_status == QIHSE_VDB_TRINARY_ABSENT,
