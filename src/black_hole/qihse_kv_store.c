@@ -208,7 +208,6 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, u
         }
     } else {
         /* Bulk load: skip per-key metadata tracking, just insert into trie */
-        store->num_keys++;
     }
     return true;
 }
@@ -225,12 +224,14 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
     if (!store || !key) return false;
     
     // If the key already exists, check the user's access on the existing key first
-    for (size_t i = 0; i < store->num_keys; i++) {
-        if (strcmp(store->keys[i].key, key) == 0) {
-            if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
-                return false;
+    if (!store->bulk_load_mode && store->keys) {
+        for (size_t i = 0; i < store->num_keys; i++) {
+            if (store->keys[i].key && strcmp(store->keys[i].key, key) == 0) {
+                if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
+                    return false;
+                }
+                break;
             }
-            break;
         }
     }
     
@@ -245,7 +246,8 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return NULL;
     
-    {
+    // QDD Access Tracking
+    if (store->qdd_ctx) {
         uint64_t key_hash = 14695981039346656037ULL;
         for (const unsigned char* p = (const unsigned char*)key; *p; ++p) {
             key_hash ^= (uint64_t)*p;
@@ -254,14 +256,14 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
         qihse_qdd_report_access(store->qdd_ctx, key_hash, "0.0.0.0");
     }
     
-    qihse_kv_sweep_expired(store);
+    if (!store->bulk_load_mode) qihse_kv_sweep_expired(store);
     size_t out_size = 0;
     void* val = qihse_trinary_trie_search(store->trie, key, &out_size);
     
-    if (val) {
+    if (val && !store->bulk_load_mode && store->keys) {
         // Find auth info in memory
         for (size_t i = 0; i < store->num_keys; i++) {
-            if (strcmp(store->keys[i].key, key) == 0) {
+            if (store->keys[i].key && strcmp(store->keys[i].key, key) == 0) {
                 if (!qihse_auth_can_access(user, store->keys[i].classification, store->keys[i].sci_compartment)) {
                     val = NULL; // Masked: pretend it doesn't exist in MemTable
                 }
@@ -397,10 +399,10 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
 }
 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
-    if (!store) return;
+    if (!store || store->bulk_load_mode || !store->keys || store->num_keys == 0) return;
     uint64_t now = current_time_ms();
     for (size_t i = 0; i < store->num_keys; ) {
-        if (store->keys[i].expire_time_ms > 0 && store->keys[i].expire_time_ms <= now) {
+        if (store->keys[i].key && store->keys[i].expire_time_ms > 0 && store->keys[i].expire_time_ms <= now) {
             size_t out_size = 0;
             void* val = qihse_trinary_trie_search(store->trie, store->keys[i].key, &out_size);
             if (val) {

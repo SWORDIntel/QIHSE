@@ -437,6 +437,12 @@ bench-memory-hierarchy: lib
 		-L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./benchmarks/qihse_memory_hierarchy_bench
 
+bench-hotpath: lib qihse_vfs.so
+	$(CC) $(CFLAGS) -o benchmarks/qihse_system_hotpath_bench \
+		benchmarks/qihse_system_hotpath_bench.c ./qihse_vfs.so \
+		-L. -lqihse $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=. ./benchmarks/qihse_system_hotpath_bench
+
 benchmark: validate-reference-workflow
 
 dev-setup:

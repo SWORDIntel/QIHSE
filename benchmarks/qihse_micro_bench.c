@@ -207,10 +207,6 @@ static void bench_exact_search(size_t n_rows, size_t dims, size_t n_queries, siz
 
     for (size_t i = 0; i < n_queries; i++) free(queries[i]);
     free(queries);
-    for (size_t i = 0; i < 10; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(vectors);
     free(ids);
@@ -291,10 +287,6 @@ static void bench_batch_search(size_t n_rows, size_t dims, size_t batch_size, si
     }
     free(qvecs);
     free(queries);
-    for (size_t i = 0; i < batch_size * 10; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(out_counts);
     free(vectors);
@@ -364,10 +356,6 @@ static void bench_hybrid_search(size_t n_rows, size_t dims, size_t top_k, size_t
     bench_samples_free(&s);
     free(qvec_a);
     free(qvec_b);
-    for (size_t i = 0; i < top_k; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(vectors);
     free(ids);
@@ -460,10 +448,6 @@ static void bench_metadata_filter(size_t n_rows, size_t dims, float match_rate, 
     bench_samples_free(&s_filtered);
     bench_samples_free(&s_unfiltered);
     free(qvec);
-    for (size_t i = 0; i < 10; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
 
 cleanup:
@@ -555,10 +539,6 @@ static void bench_trinary_candidate_selection(size_t n_rows, size_t dims, size_t
     bench_samples_free(&s_exact);
 
     free(qvec);
-    for (size_t i = 0; i < 10; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(vectors);
     free(ids);
@@ -629,10 +609,6 @@ static void bench_int8_search(size_t n_rows, size_t dims, size_t top_k, size_t i
 
     bench_samples_free(&s);
     free(qvec);
-    for (size_t i = 0; i < top_k; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(vectors);
     free(ids);
@@ -703,10 +679,6 @@ static void bench_graph_search(size_t n_rows, size_t dims, size_t top_k, size_t 
 
     bench_samples_free(&s);
     free(qvec);
-    for (size_t i = 0; i < top_k; i++) {
-        free(results[i].vector);
-        free(results[i].metadata);
-    }
     free(results);
     free(vectors);
     free(ids);
