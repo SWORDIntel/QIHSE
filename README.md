@@ -94,7 +94,7 @@ flowchart TB
     STREAM --> DISK
 ```
 
-> 🔍 **Granular Subsystem Architecture:** For full interconnect schematics, see the **[Comprehensive Subsystem Architecture Specification](docs/architecture/system_overview.md#5-comprehensive-subsystem-architecture)**.
+> 🔍 **Granular Subsystem Architecture:** For the complete full-page interconnect schematic, see the **[Full Subsystem Architecture Diagram](docs/diagrams/subsystem_architecture.md)**.
 
 ---
 
