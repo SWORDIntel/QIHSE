@@ -6,6 +6,7 @@
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
+#include "qihse_keystone.h"
 #include "qihse_system_guard.h"
 #include "qihse_platform.h"
 #include <ctype.h>
@@ -1450,6 +1451,47 @@ static bool qihse_resp_handle_migrate(qihse_resp_session_t* session, const qihse
     return qihse_resp_simple(session, "OK");
 }
 
+static bool qihse_resp_handle_keystone_ingest(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2 || request->argc > 4) return qihse_resp_wrong_arity(session, "keystone.ingest");
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    uint16_t clearance = 0;
+    uint16_t compartment = 0;
+    if (request->argc >= 3) {
+        uint64_t cl;
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl)) return qihse_resp_error(session, "ERR invalid clearance");
+        clearance = (uint16_t)cl;
+    }
+    if (request->argc >= 4) {
+        uint64_t cp;
+        if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp)) return qihse_resp_error(session, "ERR invalid compartment");
+        compartment = (uint16_t)cp;
+    }
+
+    pthread_mutex_lock(&session->server->kv_lock);
+    size_t count = qihse_keystone_ingest_dirty_logs(
+        session->server->store,
+        session->server->topology,
+        (const char*)request->argv[1].data,
+        request->argv[1].len,
+        clearance,
+        compartment
+    );
+    pthread_mutex_unlock(&session->server->kv_lock);
+    return qihse_resp_integer(session, (int64_t)count);
+}
+
+static bool qihse_resp_handle_keystone_classify(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "keystone.classify");
+    qihse_keystone_class_t cls = QIHSE_KEYSTONE_CLASS_UNKNOWN;
+    float conf = 0.0f;
+    int rc = qihse_keystone_classify_context((const char*)request->argv[1].data, request->argv[1].len, &cls, &conf);
+    if (rc != 0) return qihse_resp_error(session, "ERR classification failed");
+
+    if (!qihse_resp_array(session, 2u)) return false;
+    if (!qihse_resp_bulk_text(session, qihse_keystone_class_name(cls))) return false;
+    return qihse_resp_reply_double(session, (double)conf);
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -1479,7 +1521,7 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
                 qihse_resp_command_is(request, "DECR") || qihse_resp_command_is(request, "EXPIRE") ||
                 qihse_resp_command_is(request, "PEXPIRE") || qihse_resp_command_is(request, "MIGRATE") ||
                 qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "TS.ADD") ||
-                qihse_resp_command_is(request, "COL.APPEND");
+                qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "KEYSTONE.INGEST");
             if (is_write) return qihse_resp_error(session, "BUSY Bus saturation: try again later");
         }
     }
@@ -1513,6 +1555,10 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         if (!qihse_resp_array(session, 3u) || !qihse_resp_bulk_text(session, replica ? "slave" : "master") || !qihse_resp_integer(session, 0)) return false;
         return qihse_resp_array(session, 0u);
     }
+
+    /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
+    if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
+    if (qihse_resp_command_is(request, "KEYSTONE.CLASSIFY")) return qihse_resp_handle_keystone_classify(session, request);
 
     qihse_resp_keyset_t keys;
     qihse_resp_extract_keys(request, &keys);

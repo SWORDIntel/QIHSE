@@ -40,6 +40,10 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
  */
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
 
+static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
+    return qihse_kv_get_user(store, key, NULL);
+}
+
 /**
  * @brief Deletes a key-value pair.
  * @param store The KV store instance.
@@ -48,6 +52,10 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, struct qihse_u
  */
 bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
 
+static inline bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
+    return qihse_kv_del_user(store, key, NULL);
+}
+
 /**
  * @brief Checks if a key exists in the store.
  * @param store The KV store instance.
@@ -55,6 +63,10 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, struct qihse_us
  * @return true if the key exists, false otherwise.
  */
 bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
+
+static inline bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
+    return qihse_kv_exists_user(store, key, NULL);
+}
 
 /* Phase 3: TTL and Persistence */
 /**
