@@ -47,6 +47,8 @@ void qihse_column_store_destroy(qihse_column_store_t* store) {
         qihse_column_chunk_t* curr_chunk = curr_col->head;
         while (curr_chunk) {
             qihse_column_chunk_t* next_chunk = curr_chunk->next;
+            free(curr_chunk->sci_compartments);
+            free(curr_chunk->classifications);
             free(curr_chunk->data);
             free(curr_chunk);
             curr_chunk = next_chunk;
@@ -381,6 +383,45 @@ float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* nam
         chunk = chunk->next;
     }
     return sum;
+}
+
+bool qihse_column_minmax_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user, float* out_min, float* out_max) {
+    if (!out_min || !out_max) return false;
+    qihse_column_node_t* col = get_column(store, name);
+    if (!col || col->type != QIHSE_COL_TYPE_FLOAT32) return false;
+    bool found = false;
+    float minimum = 0.0f;
+    float maximum = 0.0f;
+    qihse_column_chunk_t* chunk = col->head;
+    while (chunk) {
+        if (chunk->encoding == QIHSE_ENCODING_RLE) {
+            qihse_rle_pair_float32_t* data = (qihse_rle_pair_float32_t*)chunk->data;
+            size_t physical_idx = 0;
+            for (size_t i = 0; i < chunk->dict_limit; i++) {
+                for (uint32_t run = 0; run < data[i].run_length; run++, physical_idx++) {
+                    if (!qihse_auth_can_access(user, chunk->classifications[physical_idx], chunk->sci_compartments[physical_idx])) continue;
+                    float value = data[i].val;
+                    if (!found || value < minimum) minimum = value;
+                    if (!found || value > maximum) maximum = value;
+                    found = true;
+                }
+            }
+        } else {
+            float* data = (float*)chunk->data;
+            for (size_t i = 0; i < chunk->count; i++) {
+                if (!qihse_auth_can_access(user, chunk->classifications[i], chunk->sci_compartments[i])) continue;
+                float value = data[i];
+                if (!found || value < minimum) minimum = value;
+                if (!found || value > maximum) maximum = value;
+                found = true;
+            }
+        }
+        chunk = chunk->next;
+    }
+    if (!found) return false;
+    *out_min = minimum;
+    *out_max = maximum;
+    return true;
 }
 
 /* TODO(Phase Y): Radix Partitioned Hash Join logic to be added in future phases. */

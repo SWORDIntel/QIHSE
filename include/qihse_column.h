@@ -73,5 +73,6 @@ bool qihse_column_append_string(qihse_column_store_t* store, const char* name, c
  */
 int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* name, qihse_user_t* user);
 float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user);
+bool qihse_column_minmax_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user, float* out_min, float* out_max);
 
 #endif /* QIHSE_COLUMN_H */

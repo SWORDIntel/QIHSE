@@ -143,6 +143,7 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
     
     while (tail < head) {
         uint64_t idx = tail % QIHSE_RING_SIZE;
+        if (count > 0 && tsdb->cache[idx].series_id != new_chunk->series_id) break;
         uint64_t t = tsdb->cache[idx].timestamp;
         double v_d = tsdb->cache[idx].value;
         uint64_t v;
@@ -343,6 +344,107 @@ double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint
     
     if (count == 0) return 0.0;
     return sum / (double)count;
+}
+
+static void qihse_tsdb_aggregate_value(double value, qihse_ts_aggregation_t aggregation, double* aggregate, uint64_t* count) {
+    if (*count == 0) {
+        *aggregate = value;
+    } else if (aggregation == QIHSE_TS_AGG_SUM || aggregation == QIHSE_TS_AGG_AVG) {
+        *aggregate += value;
+    } else if (aggregation == QIHSE_TS_AGG_MIN && value < *aggregate) {
+        *aggregate = value;
+    } else if (aggregation == QIHSE_TS_AGG_MAX && value > *aggregate) {
+        *aggregate = value;
+    }
+    (*count)++;
+}
+
+bool qihse_tsdb_aggregate_range_user(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t start_ts, uint64_t end_ts, qihse_ts_aggregation_t aggregation, qihse_user_t* user, double* out_value, uint64_t* out_count) {
+    if (!tsdb || !out_value || start_ts > end_ts || aggregation > QIHSE_TS_AGG_MAX) return false;
+    double aggregate = 0.0;
+    uint64_t count = 0;
+
+    qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
+    while (curr) {
+        if (curr->series_id != series_id || curr->end_timestamp < start_ts || curr->start_timestamp > end_ts ||
+            !qihse_auth_can_access(user, curr->classification, curr->sci_compartment)) {
+            curr = curr->next;
+            continue;
+        }
+        bit_stream_t bs = { (uint8_t*)curr->compressed_lanes, 0, sizeof(curr->compressed_lanes) * 8 };
+        uint64_t t_prev = curr->start_timestamp;
+        int64_t d_prev = 0;
+        uint64_t v_prev = 0;
+        int prev_lz = 0;
+        int prev_tz = 0;
+        for (uint32_t i = 0; i < curr->count; i++) {
+            uint64_t t;
+            uint64_t v;
+            if (i == 0) {
+                t = t_prev;
+                v = br_read(&bs, 64);
+                v_prev = v;
+            } else {
+                int64_t dod = 0;
+                if (br_read(&bs, 1) == 0) {
+                    dod = 0;
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 7), 7);
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 9), 9);
+                } else if (br_read(&bs, 1) == 0) {
+                    dod = sign_extend(br_read(&bs, 12), 12);
+                } else {
+                    dod = sign_extend(br_read(&bs, 32), 32);
+                }
+                int64_t d = d_prev + dod;
+                t = t_prev + d;
+                t_prev = t;
+                d_prev = d;
+                if (br_read(&bs, 1) == 0) {
+                    v = v_prev;
+                } else if (br_read(&bs, 1) == 0) {
+                    int len = 64 - prev_lz - prev_tz;
+                    uint64_t xor_val = br_read(&bs, len);
+                    v = v_prev ^ (xor_val << prev_tz);
+                } else {
+                    int lz = (int)br_read(&bs, 5);
+                    int len = (int)br_read(&bs, 6) + 1;
+                    uint64_t xor_val = br_read(&bs, len);
+                    int tz = 64 - lz - len;
+                    v = v_prev ^ (xor_val << tz);
+                    prev_lz = lz;
+                    prev_tz = tz;
+                }
+                v_prev = v;
+            }
+            if (t >= start_ts && t <= end_ts) {
+                double decoded;
+                memcpy(&decoded, &v, sizeof(decoded));
+                qihse_tsdb_aggregate_value(decoded, aggregation, &aggregate, &count);
+            }
+        }
+        curr = curr->next;
+    }
+
+    uint64_t tail = atomic_load_explicit(&tsdb->tail.index, memory_order_acquire);
+    uint64_t head = atomic_load_explicit(&tsdb->head.index, memory_order_acquire);
+    for (uint64_t i = tail; i < head; i++) {
+        uint64_t idx = i % QIHSE_RING_SIZE;
+        if (tsdb->cache[idx].series_id != series_id ||
+            !qihse_auth_can_access(user, tsdb->cache[idx].classification, tsdb->cache[idx].sci_compartment)) continue;
+        if (tsdb->cache[idx].timestamp >= start_ts && tsdb->cache[idx].timestamp <= end_ts) {
+            qihse_tsdb_aggregate_value(tsdb->cache[idx].value, aggregation, &aggregate, &count);
+        }
+    }
+    if (count == 0) {
+        if (out_count) *out_count = 0;
+        return false;
+    }
+    if (aggregation == QIHSE_TS_AGG_AVG) aggregate /= (double)count;
+    *out_value = aggregate;
+    if (out_count) *out_count = count;
+    return true;
 }
 
 void qihse_tsdb_set_ttl(qihse_tsdb_t* tsdb, uint64_t ttl_ms) {

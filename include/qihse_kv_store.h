@@ -65,6 +65,7 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, struct qihse
  * @return true if the TTL was set, false if the key doesn't exist.
  */
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, struct qihse_user_s* user);
+int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
 
 /**
  * @brief Sweeps the store and removes all expired keys.

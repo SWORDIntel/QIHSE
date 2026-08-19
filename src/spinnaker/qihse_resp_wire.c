@@ -1,4 +1,5 @@
 #include "qihse_resp_wire.h"
+#include "qihse_resp_engine.h"
 #include "qihse_vector_db.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +89,7 @@ static void resp_write_all(int fd, const char* buf, size_t len) {
 }
 
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
+    if (qihse_resp_engine_handle_legacy(client_fd, store, vdb)) return;
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -378,6 +380,8 @@ bool qihse_start_resp_server(qihse_kv_store_t* store, qihse_vector_db_t vdb, uin
                         "You must rotate the default operator password before starting network services.\n");
         return false;
     }
+
+    if (qihse_resp_engine_run_legacy(store, vdb, port, bind_address)) return true;
 
     int server_fd, client_fd;
     struct sockaddr_in address;
