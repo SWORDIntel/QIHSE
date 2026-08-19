@@ -188,13 +188,11 @@ float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims)
 /* -------------------------------------------------------------------------- */
 /* Horizontal sum helper for __m512 — AVX-512 reduce                          */
 /* -------------------------------------------------------------------------- */
-__attribute__((target("avx512f,avx512dq")))
+__attribute__((target("avx512f")))
 static float hsum512(__m512 v) {
-    /* Reduce 512→256 using extract + add */
     __m256 lo = _mm512_castps512_ps256(v);
-    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 hi = (__m256)_mm512_extractf64x4_pd(_mm512_castps_pd(v), 1);
     __m256 s256 = _mm256_add_ps(lo, hi);
-    /* Reuse AVX2 hsum for the 256-bit remainder */
     return hsum256(s256);
 }
 
@@ -337,20 +335,19 @@ static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static void qihse_distance_init_once(void) {
     qihse_cpu_info_t info = qihse_cpu_detect();
 
-    if (qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX512F)) {
+    if (info.has_avx512_support && qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX512F)) {
         /* AVX-512 + FMA path — 16 floats per instruction, 2x unrolled.
          * FMA is implied on all AVX-512 capable CPUs (Skylake-X+). */
         g_cosine_fn    = qihse_distance_cosine_avx512;
         g_dot_fn       = qihse_distance_dot_avx512;
         g_euclidean_fn = qihse_distance_euclidean_avx512;
-    } else if (qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX2) &&
-               qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX)) {
+    } else if (info.has_avx_support && qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX2)) {
         /* AVX2 + FMA path — 8 floats per instruction */
         g_cosine_fn    = qihse_distance_cosine_avx2;
         g_dot_fn       = qihse_distance_dot_avx2;
         g_euclidean_fn = qihse_distance_euclidean_avx2;
 #ifdef __x86_64__
-    } else if (qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX)) {
+    } else if (info.has_avx_support && qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX)) {
         /* AVX1 path — 8 floats per instruction without FMA (Sandy Bridge / Ivy Bridge fallback) */
         g_cosine_fn    = qihse_distance_cosine_avx;
         g_dot_fn       = qihse_distance_dot_avx;
