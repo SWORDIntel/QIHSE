@@ -187,7 +187,53 @@ Implements full support for cluster introspection:
 
 ---
 
-## 7. Step-by-Step Execution Plan
+## 7. Hardware Awareness & Zero-Overhead Execution
+
+QIHSE treats hardware as a first-class execution primitive. The sharded cluster engine interfaces directly with the host's underlying compute, memory, and networking topology:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        HOST HARDWARE TOPOLOGY                          │
+├───────────────────────────────────┬────────────────────────────────────┤
+│           NUMA NODE 0             │            NUMA NODE 1             │
+│  ┌─────────────────────────────┐  │  ┌─────────────────────────────┐   │
+│  │   CPU Cores 0..3 (AVX-512)  │  │  │   CPU Cores 4..7 (AVX-512)  │   │
+│  │   Shard 0 (Slots 0..8191)   │  │  │   Shard 1 (Slots 8192..16k) │   │
+│  │   • 2MB HugePages MemTable  │  │  │   • 2MB HugePages MemTable  │   │
+│  │   • AF_XDP Queue 0 (Rx/Tx)  │  │  │   • AF_XDP Queue 1 (Rx/Tx)  │   │
+│  └──────────────▲──────────────┘  │  └──────────────▲──────────────┘   │
+│                 │ Local DDR4 Bus  │                 │ Local DDR4 Bus   │
+│  ┌──────────────▼──────────────┐  │  ┌──────────────▼──────────────┐   │
+│  │   Local Socket 0 DRAM       │  │  │   Local Socket 1 DRAM       │   │
+│  └─────────────────────────────┘  │  └─────────────────────────────┘   │
+└─────────────────┬─────────────────┴─────────────────┬──────────────────┘
+                  │                                   │
+                  └──────── Hardware NIC (RSS) ───────┘
+```
+
+1. **Dynamic SIMD Instruction Dispatch (`qihse_cpu_detect.c`)**:
+   - The CRC16 hash slot algorithm uses PCLMULQDQ / AVX-512 hardware carry-less multiplication when available, processing 64 bytes per cycle.
+   - Vector queries (`VECSEARCH`, `VECGET`) vectorize across 512-bit registers (AVX-512) or 256-bit registers (AVX2), with automatic fallback on older Xeon/ARM architectures.
+
+2. **NUMA-Pinned Shard Workers & Socket Locality (`qihse_memory_topology_probe.c`)**:
+   - Each shard instance binds to a specific CPU core and NUMA memory node using `pthread_setaffinity_np()` and `set_mempolicy(MPOL_BIND)`.
+   - Eliminates cross-socket QPI/UPI interconnect latency and cache bounce.
+
+3. **2MB / 1GB HugePages Allocation (`qihse_hma.c`)**:
+   - Black Hole Trinary Trie nodes, LSM MemTables, and HNSW graph adjacency lists are allocated via `madvise(MADV_HUGEPAGE)` and anonymous `mmap` HugePages.
+   - Drastically reduces Translation Lookaside Buffer (TLB) misses under millions of concurrent point reads.
+
+4. **Zero-Copy Network Kernel Bypass (`qihse_af_xdp.c`)**:
+   - NIC Receive Side Scaling (RSS) hardware filters steer incoming TCP packets directly to the descriptor ring of the CPU core owning that hash slot.
+   - AF_XDP UMEM packet memory maps directly into QIHSE user space, bypassing the Linux kernel TCP/IP stack.
+
+5. **Runtime System Guard & Bandwidth Throttling (`qihse_system_guard.c`)**:
+   - Hardware profiling on boot calculates maximum safe RAM capacity (85% limit) and memory controller bandwidth ceiling.
+   - Automatically throttles or prevents cluster queries that would saturate 100% of the memory bus or provoke OS OOM kills.
+
+---
+
+## 8. Step-by-Step Execution Plan
 
 ```mermaid
 gantt
@@ -211,7 +257,7 @@ gantt
 ```
 
 ### Phase 1: Core Hash Slot Engine
-- Implement `qihse_crc16.c` using an aligned 256-entry lookup table.
+- Implement `qihse_crc16.c` using an aligned 256-entry lookup table and SIMD hardware acceleration.
 - Implement `{tag}` extraction according to Redis Cluster Specification section 4.
 - Build test harness `tests/test_cluster_slot.c` verifying 100% parity with Redis CRC16 test vectors.
 
@@ -239,9 +285,10 @@ gantt
 
 ---
 
-## 8. Verification & Acceptance Criteria
+## 9. Verification & Acceptance Criteria
 
 1. **Client Driver Compliance**: Standard Python `redis.cluster.RedisCluster` and Node.js `ioredis.Cluster` must connect, auto-discover all slots, and execute reads/writes with zero errors.
 2. **Deterministic Redirection**: `redis-cli -c -p 7000 set foo bar` must automatically follow `-MOVED` to the correct shard node without client failure.
 3. **Sub-Microsecond Latency**: Shard-local point gets must maintain $\le 500\text{ ns}$ p50 latency.
 4. **Zero Memory Leaks**: Full Valgrind and AddressSanitizer compliance on multi-node join, query, and shutdown sequences.
+
