@@ -102,6 +102,7 @@ Prerequisites, configuration options, tuning guidelines, and advanced usage patt
 Operational runbooks: vector DB mutation flows, memory maintenance loops, benchmark workflows.
 
 ### [🏗️ Architecture & Plans](architecture/)
+- [Automated Zero-Downtime Cluster Rebalancing](architecture/cluster_rebalancing.md)
 - [Distributed Multi-Engine Planner](architecture/distributed_query_planner.md)
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md)
