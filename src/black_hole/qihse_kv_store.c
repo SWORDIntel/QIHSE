@@ -98,13 +98,14 @@ static void recover_from_wal(qihse_kv_store_t* store) {
 }
 
 qihse_kv_store_t* qihse_kv_store_create() {
-    qihse_kv_store_t* store = (qihse_kv_store_t*)malloc(sizeof(qihse_kv_store_t));
+    qihse_kv_store_t* store = (qihse_kv_store_t*)calloc(1, sizeof(qihse_kv_store_t));
     if (!store) return NULL;
     store->trie = qihse_trinary_trie_create();
     if (!store->trie) { free(store); return NULL; }
     store->keys = NULL;
     store->num_keys = 0;
     store->capacity = 0;
+    store->bulk_load_mode = false;
     
     store->wal_fd = NULL;
     store->mem_usage = 0;
@@ -149,8 +150,12 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
         if (store->qdd_ctx) qihse_qdd_free(store->qdd_ctx);
         if (store->wal_fd) fclose(store->wal_fd);
         if (store->trie) qihse_trinary_trie_destroy(store->trie);
-        for (size_t i = 0; i < store->num_keys; i++) free(store->keys[i].key);
-        if (store->keys) free(store->keys);
+        if (store->keys) {
+            for (size_t i = 0; i < store->num_keys; i++) {
+                if (store->keys[i].key) free(store->keys[i].key);
+            }
+            free(store->keys);
+        }
         free(store);
     }
 }

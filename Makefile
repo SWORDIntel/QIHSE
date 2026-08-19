@@ -664,4 +664,4 @@ qihse_vfs.so: $(SRCS_VFS) persistence/qihse_file_posix.c libqihse.so
 # Integration test target
 test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 	$(CC) $(CFLAGS) -o $@ tests/test_sqlite_vfs.c ./qihse_vfs.so \
-	    -L. -lqihse $$(pkg-config --cflags --libs sqlite3) -Wl,-rpath,.
+	    -L. -lqihse $$(pkg-config --cflags --libs sqlite3) -Wl,-rpath,'$$ORIGIN'

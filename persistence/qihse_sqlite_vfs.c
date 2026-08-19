@@ -27,8 +27,7 @@
 #  define _FILE_OFFSET_BITS 64
 #endif
 
-#include <sqlite3ext.h>
-SQLITE_EXTENSION_INIT1
+#include <sqlite3.h>
 
 #include "qihse_sqlite_vfs.h"
 #include "qihse_vfs_page_cache.h"
@@ -930,24 +929,12 @@ void qihse_vfs_unregister(void)
 }
 
 /* ── Loadable extension entrypoint ───────────────────────────────────────── */
-
-/*
- * When libqihse.so is loaded via:
- *   sqlite3_load_extension(db, "./libqihse.so", NULL, &err)
- * or from the CLI:
- *   .load ./libqihse.so
- *
- * SQLite will call sqlite3_qihsevfs_init() automatically (it derives the
- * symbol name from the library filename prefix).
- */
-#ifndef SQLITE_CORE
 int sqlite3_qihsevfs_init(sqlite3* db,
                            char** pzErrMsg,
-                           const sqlite3_api_routines* pApi)
+                           const void* pApi)
 {
-    SQLITE_EXTENSION_INIT2(pApi);
     (void)db;
     (void)pzErrMsg;
+    (void)pApi;
     return qihse_vfs_register(0);
 }
-#endif
