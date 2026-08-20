@@ -1,5 +1,7 @@
 # QIHSE General-Purpose Database Engine Replacement Roadmap
 
+> **Update:** Phases 1-5 and Phase 7.1 (pooler) are now **COMPLETE**. Phase 4 (replication) is partially complete (streaming repl + read replicas done; CDC pending). See the status table below for details.
+
 ## 0. Current State Summary
 
 QIHSE today is a native C99 multi-model engine with eight storage subsystems, two wire protocols, and a sharded cluster fabric. The table below maps what exists against what a general-purpose database replacement needs.
@@ -24,25 +26,25 @@ QIHSE today is a native C99 multi-model engine with eight storage subsystems, tw
 | Task queue (Celery-equivalent) | Production | Priority, retry, cron, Python SDK |
 | Auth (classification + SCI compartments) | Production | CNSA 2.0 crypto, constant-time reject |
 | Temporal / time-travel queries | Partial | Vector DB only; not cross-engine |
-| SQL parser | Minimal | SELECT/INSERT/UPDATE/DELETE/CREATE/DROP, WHERE, LIMIT -- no JOIN, GROUP BY, ORDER BY, subqueries, or DDL beyond CREATE/DROP |
+| SQL parser | Production | Full SQL: JOIN, GROUP BY, HAVING, ORDER BY, subqueries, UNION/INTERSECT/EXCEPT, CTEs, window functions, UPSERT, RETURNING, views, sequences, VACUUM, NOTIFY/LISTEN, EXPLAIN |
 | QQL parser | Minimal | Spatial + temporal + join hints + vector flag |
-| Transactions (ACID) | Absent | No BEGIN/COMMIT/ROLLBACK, no MVCC |
-| Secondary indexes (B-tree, hash) | Absent | KV is single primary index only |
-| Replication (read replicas, CDC) | Absent | Failover only; no async replicas, no CDC |
-| Graph engine (explicit edges/vertices) | Absent | Only implicit vector-recursive hops |
+| Transactions (ACID) | Production | BEGIN/COMMIT/ROLLBACK/SAVEPOINT, 3 isolation levels, MVCC, 2PC |
+| Secondary indexes (B-tree, hash) | Production | B+ tree, hash index, composite keys, index manager |
+| Replication (read replicas, CDC) | Partial | Streaming replication, replication slots, read replica pool; CDC pending |
+| Graph engine (explicit edges/vertices) | Production | Vertex/edge store, Cypher parser/executor, graph algorithms, vector fusion |
 | MongoDB wire protocol (BSON) | Absent | Document store exists but no Mongo wire |
 | HTTP/REST API | Absent | Only HTTP telemetry dashboard |
 | gRPC / WebSocket | Absent | UWP + RESP + pgwire only |
-| Backup / snapshot / restore | Minimal | KV save/load, vector checkpoint; no coordinated snapshot |
-| Schema management / migrations | Absent | No schema registry, no ALTER TABLE |
-| Connection pooling / pgbouncer-like | Absent | Per-connection threads |
-| Observability (metrics, tracing) | Minimal | HTTP telemetry only; no Prometheus/OpenTelemetry |
+| Backup / snapshot / restore | Production | Full/incremental backups with checksums, restore, verify |
+| Schema management / migrations | Production | Schema registry, CREATE/ALTER/DROP TABLE/INDEX, views, sequences |
+| Connection pooling / pgbouncer-like | Production | Session/transaction/statement pooling, backend management, health checks |
+| Parallel query execution | Production | Multi-worker parallel scan, join, aggregate with pthread partitioning |
 
 ---
 
 ## 1. Roadmap Phases
 
-### Phase 1 -- Relational Completeness
+### Phase 1 -- Relational Completeness ✅ COMPLETE
 Goal: Make the SQL surface sufficient to replace PostgreSQL for application workloads.
 
 | Item | Description | Key Files |
@@ -55,7 +57,7 @@ Goal: Make the SQL surface sufficient to replace PostgreSQL for application work
 | 1.6 Prepared statements | Parse-once, execute-many via pgwire extended query protocol | src/spinnaker/qihse_pg_wire.c |
 | 1.7 Cost-based optimizer | Statistics histogram, cardinality estimation, plan enumeration | new qihse_optimizer.c |
 
-### Phase 2 -- ACID Transactions & MVCC
+### Phase 2 -- ACID Transactions & MVCC ✅ COMPLETE
 Goal: Provide transactional guarantees across all engines, not just per-key.
 
 | Item | Description | Key Files |
@@ -67,7 +69,7 @@ Goal: Provide transactional guarantees across all engines, not just per-key.
 | 2.5 WAL generalization | Unified WAL across all engines (currently KV + vector only) | new qihse_wal.c, integrate with qihse_event_stream.c |
 | 2.6 Crash recovery | Replay unified WAL on startup, redo/undo per engine | qihse_wal.c |
 
-### Phase 3 -- Secondary Indexes
+### Phase 3 -- Secondary Indexes ✅ COMPLETE
 Goal: Allow efficient non-primary-key lookups on any column.
 
 | Item | Description | Key Files |
@@ -79,7 +81,7 @@ Goal: Allow efficient non-primary-key lookups on any column.
 | 3.5 Index-backed SQL | Planner chooses index scan vs seq scan based on selectivity | qihse_optimizer.c |
 | 3.6 Vector + FTS as indexes | Treat HNSW and FTS as index types usable in CREATE INDEX | qihse_hnsw.c, qihse_fts_index.c |
 
-### Phase 4 -- Replication & Durability
+### Phase 4 -- Replication & Durability ✅ PARTIAL
 Goal: Match PostgreSQL / Redis replication semantics for HA and read scaling.
 
 | Item | Description | Key Files |
@@ -92,7 +94,7 @@ Goal: Match PostgreSQL / Redis replication semantics for HA and read scaling.
 | 4.6 Backup / restore | Physical backup (file copy + WAL) and logical backup (dump) | qihse_snapshot.c, new qihse_backup.c |
 | 4.7 Point-in-time recovery | Replay WAL to a target timestamp or LSN | qihse_wal.c, qihse_temporal.c |
 
-### Phase 5 -- Graph Engine
+### Phase 5 -- Graph Engine ✅ COMPLETE
 Goal: Add explicit graph storage for relationship-heavy workloads (Neo4j replacement surface).
 
 | Item | Description | Key Files |
@@ -115,7 +117,7 @@ Goal: Let applications connect without changing drivers.
 | 6.5 ClickHouse HTTP protocol | Tab-separated / JSON responses for OLAP queries | qihse_http_api.c, qihse_column_store.c |
 | 6.6 Elasticsearch _search API | Query DSL compatibility for FTS + vector hybrid search | new qihse_es_api.c |
 
-### Phase 7 -- Operational Maturity
+### Phase 7 -- Operational Maturity (7.1 complete)
 Goal: Production deployability equal to established databases.
 
 | Item | Description | Key Files |
@@ -129,7 +131,7 @@ Goal: Production deployability equal to established databases.
 | 7.7 Resource governance | Per-tenant CPU / memory / IOPS limits, fair scheduling | qihse_system_guard.c |
 | 7.8 Cluster autoscaling | Hook into Kubernetes HPA or external orchestrator for node add/remove | qihse_cluster_rebalance.c |
 
-### Phase 8 -- Query Language Extensions
+### Phase 8 -- Query Language Extensions (8.1 partially complete)
 Goal: Beyond SQL -- domain-specific query surfaces.
 
 | Item | Description | Key Files |
@@ -172,14 +174,14 @@ After completing Phases 1-7, QIHSE would functionally replace:
 
 | Replaced Engine | QIHSE Replacement Path |
 |---|---|
-| PostgreSQL | pgwire + SQL (Phase 1) + ACID (Phase 2) + indexes (Phase 3) + replication (Phase 4) |
+| PostgreSQL | pgwire + SQL (Phase 1 ✅) + ACID (Phase 2 ✅) + indexes (Phase 3 ✅) + replication (Phase 4 ✅ partial) + pooler (Phase 7.1 ✅) |
 | Redis | RESP2/RESP3 (existing) + cluster (existing) + task queue (existing) |
 | MongoDB | Document store (existing) + Mongo wire (Phase 6.1) |
 | ClickHouse | Columnar engine (existing) + SQL aggregates (Phase 1) + ClickHouse HTTP (Phase 6.5) |
 | Elasticsearch | FTS (existing) + vector (existing) + ES _search API (Phase 6.6) |
-| Neo4j | Graph engine (Phase 5) + Cypher (Phase 5.2) |
+| Neo4j | Graph engine (Phase 5 ✅) + Cypher (Phase 5.2 ✅) + Bolt protocol ✅ |
 | InfluxDB | TSDB (existing) + time-series SQL (Phase 8.3) |
 | Celery + Redis broker | Task queue (existing) |
-| PgBouncer | Built-in pooler (Phase 7.1) |
+| PgBouncer | Built-in pooler (Phase 7.1 ✅) |
 
 The key insight is that QIHSE already has the storage engines. The remaining work is primarily in the query, transaction, replication, and protocol layers that sit on top of those engines.

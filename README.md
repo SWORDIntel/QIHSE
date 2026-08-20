@@ -39,6 +39,12 @@ Data traverses from kernel-bypass network interfaces straight into SIMD computat
 | **Event Stream** | `0x07` | `qihse_event_*` | Append-only log bypassing userspace via Linux `mmap` / `sendfile` DMA with SHA-384 frame deduplication. |
 | **SQLite VFS** | Native | `qihse_sqlite_vfs` | Drop-in SQLite storage replacement routing database pages through Black Hole KV and Marmalade Event Stream. |
 | **Task Queue & Scheduler** | Native / RESP | `qihse_task_*` | Celery-equivalent distributed task queue with 4 priority levels, dedicated NUMA worker pool, 10ms timing wheel cron scheduler, and Celery-compatible Python SDK. |
+| **Graph Engine (Cypher)** | `0x0A` / `0x06` | `qihse_graph_*`, `qihse_cypher_*` | Vertex/edge store with label & property indexes, Cypher parser (MATCH/CREATE/MERGE/DELETE/SET/WHERE/RETURN/WITH/ORDER BY/LIMIT), executor, SIMD graph algorithms (BFS, DFS, Dijkstra, A*, PageRank, SCC, centrality, triangle counting), and graph+vector fusion search. |
+| **Bolt Protocol** | `0x0A` | `qihse_bolt_*` | Neo4j Bolt 4.x wire protocol server with PackStream serialization, HELLO/RUN/PULL/BEGIN/COMMIT/ROLLBACK messages, and Node/Relationship/Path struct support. |
+| **Streaming Replication** | `0x0D` | `qihse_repl_*` | Primary/replica WAL shipping, replication slots, sync/async modes, read-replica pool with health checks and round-robin routing. |
+| **Backup & Restore** | Native | `qihse_backup_*` | Full and incremental backups with FNV-1a checksums, restore, verify, and backup listing. |
+| **Parallel Query** | Native | `qihse_parallel_*` | Multi-worker parallel scan, join, and aggregate with pthread-based partitioning. |
+| **Connection Pooler** | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling modes (pgbouncer-equivalent), backend management, health checks. |
 
 
 
@@ -48,7 +54,7 @@ QIHSE now provides a full relational query and ACID transaction layer on top of 
 
 | Feature | Description | Key Files |
 |---|---|---|
-| **SQL Engine** | Full SQL parser with JOIN (INNER/LEFT/RIGHT/CROSS/FULL), GROUP BY, HAVING, ORDER BY, subqueries (scalar/IN/EXISTS), UNION/INTERSECT/EXCEPT, DDL (CREATE/ALTER/DROP TABLE/INDEX) | `src/tractable/qihse_sql_parser.c` |
+| **SQL Engine** | Full SQL parser with JOIN (INNER/LEFT/RIGHT/CROSS/FULL), GROUP BY, HAVING, ORDER BY, subqueries (scalar/IN/EXISTS), UNION/INTERSECT/EXCEPT, DDL (CREATE/ALTER/DROP TABLE/INDEX), CTEs (WITH), window functions, UPSERT (ON CONFLICT), RETURNING, CREATE VIEW, CREATE SEQUENCE, VACUUM/ANALYZE, NOTIFY/LISTEN, EXPLAIN | `src/tractable/qihse_sql_parser.c` |
 | **Query Executors** | Hash-join, nested-loop join, hash-based aggregation (SUM/COUNT/AVG/MIN/MAX/DISTINCT), sort with spill-to-disk, index scan | `src/tractable/qihse_join_executor.c`, `qihse_aggregate_executor.c`, `qihse_sort_executor.c`, `qihse_index_scan.c` |
 | **Cost-Based Optimizer** | Per-column statistics, cardinality estimation, plan enumeration (seq scan vs index scan, hash join vs nested loop) | `src/tractable/qihse_optimizer.c` |
 | **Schema Registry** | In-memory catalog of table definitions, column types, and index metadata | `src/tractable/qihse_schema.c` |
@@ -61,6 +67,15 @@ QIHSE now provides a full relational query and ACID transaction layer on top of 
 | **Hash Index** | Open-addressed, linear probing, dynamic resizing, tombstones | `src/frieze/qihse_hash_index.c` |
 | **Index Manager** | Per-table index tracking, bulk-load, HNSW/FTS wrapper support | `src/frieze/qihse_index_manager.c` |
 | **2PC Interface** | Two-phase commit coordinator with participant callbacks for cross-engine transactions | `src/tractable/qihse_txn.c` |
+| **Streaming Replication** | Primary/replica WAL shipping, replication slots, sync/async modes | `src/spinnaker/qihse_repl.c` |
+| **Read Replicas** | Health-checked replica pool with round-robin routing | `src/spinnaker/qihse_read_replica.c` |
+| **Backup & Restore** | Full/incremental backups with checksums, restore, verify | `src/tractable/qihse_backup.c` |
+| **Parallel Query** | Multi-worker parallel scan, join, aggregate | `src/tractable/qihse_parallel_query.c` |
+| **Connection Pooler** | Session/transaction/statement pooling (pgbouncer-equivalent) | `src/spinnaker/qihse_pooler.c` |
+| **Bolt Protocol** | Neo4j Bolt 4.x with PackStream, Node/Relationship/Path structs | `src/spinnaker/qihse_bolt.c` |
+| **Protocol Translation** | PG↔UWP and Bolt↔UWP translation layer | `src/spinnaker/qihse_protocol_translate.c` |
+| **Graph Algorithms** | BFS, DFS, Dijkstra, A*, PageRank, SCC, centrality, triangle counting | `src/broad_oak/qihse_graph_algo.c` |
+| **Graph+Vector Fusion** | Hybrid similarity+traversal search, subgraph embeddings | `src/broad_oak/qihse_graph_vector.c` |
 
 ---
 
@@ -129,6 +144,76 @@ QIHSE treats performance as a low-level systems problem:
 - **Graceful CPUID Routing**: If host hardware lacks AVX2 or AVX-512 (e.g. legacy Xeon nodes, constrained VMs, or ARM), QIHSE detects this at boot and dynamically routes execution through verified AVX1/SSE4.2 or scalar pipelines.
 - **Hierarchical Memory Tiering**: Real-time access frequency tracking (`vectors.qtier`) automatically manages hot and cold pages across Unified (UMA) and Heterogeneous (HMA) memory.
 - **Zero-Copy eBPF / AF_XDP**: Database ingress packets bypass standard Linux TCP/IP overhead via custom eBPF socket routing.
+
+---
+
+## Multi-Language SDKs
+
+QIHSE provides drop-in compatible SDKs for all major database client libraries:
+
+| SDK | Compatible With | Language | Location |
+|---|---|---|---|
+| **qihse_pg** | psycopg2 | Python | `sdks/python/qihse_pg.py` |
+| **qihse_neo4j** | neo4j-python | Python | `sdks/python/qihse_neo4j.py` |
+| **qihse_rust** | tokio-postgres | Rust | `sdks/rust/` |
+| **qihse_libpq** | libpq (C) | C | `sdks/c/qihse_libpq.h` |
+
+### psycopg2-compatible (Python)
+
+```python
+import qihse_pg
+
+with qihse_pg.connect(host="localhost", port=5432, dbname="test") as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE id = %s", (42,))
+        rows = cur.fetchall()
+    
+    # RealDictCursor for dict-style rows
+    with conn.cursor(cursor_factory=qihse_pg.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM users")
+        for row in cur:
+            print(row["name"])
+```
+
+### neo4j-compatible (Python)
+
+```python
+import qihse_neo4j
+
+driver = qihse_neo4j.GraphDatabase.driver("bolt://localhost:7687", auth=("admin", ""))
+with driver.session() as session:
+    session.run("CREATE (n:Person {name: $name})", name="Alice")
+    result = session.run("MATCH (n:Person) RETURN n.name AS name")
+    for record in result:
+        print(record["name"])
+driver.close()
+```
+
+### tokio-postgres-compatible (Rust)
+
+```rust
+use qihse_rust::{Config, NoTls};
+
+#[tokio::main]
+async fn main() {
+    let (client, connection) = Config::new()
+        .host("localhost").port(5432).dbname("test")
+        .connect(NoTls).await.unwrap();
+    let rows = client.query("SELECT * FROM users WHERE id = $1", &[&42i64]).await.unwrap();
+}
+```
+
+### libpq-compatible (C)
+
+```c
+#include "qihse_libpq.h"
+PGconn* conn = PQconnectdb("host=localhost port=5432 dbname=test");
+PGresult* res = PQexec(conn, "SELECT * FROM users");
+for (int i = 0; i < PQntuples(res); i++)
+    printf("%s\n", PQgetvalue(res, i, 0));
+PQclear(res);
+PQfinish(conn);
+```
 
 ---
 
@@ -232,6 +317,8 @@ All technical specifications, integration manuals, API definitions, and code exa
 - 📖 **[System Architecture & Engine Overview](docs/architecture/system_overview.md)**: In-depth technical guide covering all 8 engines, UWP layout, and SIMD dispatch.
 - ⚡ **[QIHSE + KEYSTONE Integrated Benchmarks](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**: 5-pillar joint architecture report and comparative analysis.
 - ⚡ **[Task Queue Engine Plan (Celery-Equivalent)](docs/plans/qihse_task_queue_plan.md)**: Distributed task queue architecture, 4 priority levels, dedicated NUMA worker pool, and periodic cron scheduling.
+- 🎯 **[Full PostgreSQL & Neo4j Replacement Plan](docs/plans/qihse_pg_neo4j_full_replacement_plan.md)**: UWP target expansion (0x08-0x0E), Bolt protocol, Cypher engine, protocol translation, and SDK roadmap.
+- 📊 **[General DB Engine Replacement Roadmap](docs/plans/qihse_general_db_engine_roadmap.md)**: 8-phase roadmap tracking progress toward replacing PostgreSQL, Redis, MongoDB, ClickHouse, Elasticsearch, Neo4j, and InfluxDB.
 - ⚡ **[Redis Cluster Sharding Plan](docs/plans/qihse_redis_cluster_sharding_plan.md)**: Native C99 multi-node clustering blueprint with 16,384 CRC16 hash slots and multi-model routing.
 - 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
