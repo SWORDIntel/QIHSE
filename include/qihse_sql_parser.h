@@ -12,33 +12,55 @@ extern "C" {
  * Statement types
  * ------------------------------------------------------------------------- */
 typedef enum {
-    QIHSE_SQL_SELECT   = 1,
-    QIHSE_SQL_INSERT   = 2,
-    QIHSE_SQL_UPDATE   = 3,
-    QIHSE_SQL_DELETE   = 4,
-    QIHSE_SQL_CREATE   = 5,
-    QIHSE_SQL_DROP     = 6,
-    QIHSE_SQL_ALTER    = 7,
-    QIHSE_SQL_UNION    = 8,
-    QIHSE_SQL_INTERSECT= 9,
-    QIHSE_SQL_EXCEPT   = 10,
-    QIHSE_SQL_UNKNOWN  = 0
+    QIHSE_SQL_SELECT          = 1,
+    QIHSE_SQL_INSERT          = 2,
+    QIHSE_SQL_UPDATE          = 3,
+    QIHSE_SQL_DELETE          = 4,
+    QIHSE_SQL_CREATE          = 5,
+    QIHSE_SQL_DROP            = 6,
+    QIHSE_SQL_ALTER           = 7,
+    QIHSE_SQL_UNION           = 8,
+    QIHSE_SQL_INTERSECT       = 9,
+    QIHSE_SQL_EXCEPT          = 10,
+    QIHSE_SQL_WITH            = 11,  /* CTE wrapper */
+    QIHSE_SQL_CREATE_VIEW     = 12,
+    QIHSE_SQL_DROP_VIEW       = 13,
+    QIHSE_SQL_CREATE_MATVIEW  = 14,
+    QIHSE_SQL_REFRESH         = 15,
+    QIHSE_SQL_CREATE_SEQ      = 16,
+    QIHSE_SQL_DROP_SEQ        = 17,
+    QIHSE_SQL_EXPLAIN         = 18,
+    QIHSE_SQL_VACUUM          = 19,
+    QIHSE_SQL_ANALYZE         = 20,
+    QIHSE_SQL_LISTEN          = 21,
+    QIHSE_SQL_NOTIFY          = 22,
+    QIHSE_SQL_DECLARE         = 23,
+    QIHSE_SQL_FETCH           = 24,
+    QIHSE_SQL_CLOSE           = 25,
+    QIHSE_SQL_UNKNOWN         = 0
 } qihse_sql_stmt_type_t;
 
 /* -------------------------------------------------------------------------
  * Column / data types for DDL
  * ------------------------------------------------------------------------- */
 typedef enum {
-    QIHSE_TYPE_UNKNOWN = 0,
-    QIHSE_TYPE_INT     = 1,
-    QIHSE_TYPE_BIGINT  = 2,
-    QIHSE_TYPE_FLOAT   = 3,
-    QIHSE_TYPE_DOUBLE  = 4,
-    QIHSE_TYPE_VARCHAR = 5,
-    QIHSE_TYPE_TEXT    = 6,
-    QIHSE_TYPE_BOOL    = 7,
-    QIHSE_TYPE_TIMESTAMP = 8,
-    QIHSE_TYPE_VECTOR  = 9
+    QIHSE_TYPE_UNKNOWN    = 0,
+    QIHSE_TYPE_INT        = 1,
+    QIHSE_TYPE_BIGINT     = 2,
+    QIHSE_TYPE_FLOAT      = 3,
+    QIHSE_TYPE_DOUBLE     = 4,
+    QIHSE_TYPE_VARCHAR    = 5,
+    QIHSE_TYPE_TEXT       = 6,
+    QIHSE_TYPE_BOOL       = 7,
+    QIHSE_TYPE_TIMESTAMP  = 8,
+    QIHSE_TYPE_VECTOR     = 9,
+    QIHSE_TYPE_SERIAL     = 10,
+    QIHSE_TYPE_BIGSERIAL  = 11,
+    QIHSE_TYPE_INT_ARRAY  = 12,
+    QIHSE_TYPE_FLOAT_ARRAY= 13,
+    QIHSE_TYPE_TEXT_ARRAY = 14,
+    QIHSE_TYPE_BOOL_ARRAY = 15,
+    QIHSE_TYPE_JSONB      = 16
 } qihse_sql_type_t;
 
 /* -------------------------------------------------------------------------
@@ -56,14 +78,44 @@ typedef enum {
  * Aggregate function kinds
  * ------------------------------------------------------------------------- */
 typedef enum {
-    QIHSE_AGG_NONE   = 0,
-    QIHSE_AGG_SUM    = 1,
-    QIHSE_AGG_COUNT  = 2,
-    QIHSE_AGG_AVG    = 3,
-    QIHSE_AGG_MIN    = 4,
-    QIHSE_AGG_MAX    = 5,
-    QIHSE_AGG_COUNT_STAR = 6
+    QIHSE_AGG_NONE       = 0,
+    QIHSE_AGG_SUM        = 1,
+    QIHSE_AGG_COUNT      = 2,
+    QIHSE_AGG_AVG        = 3,
+    QIHSE_AGG_MIN        = 4,
+    QIHSE_AGG_MAX        = 5,
+    QIHSE_AGG_COUNT_STAR = 6,
+    QIHSE_AGG_STRING_AGG = 7,
+    QIHSE_AGG_ARRAY_AGG  = 8,
+    QIHSE_AGG_BOOL_OR    = 9,
+    QIHSE_AGG_BOOL_AND   = 10
 } qihse_sql_agg_kind_t;
+
+/* -------------------------------------------------------------------------
+ * Window function kinds
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    QIHSE_WIN_NONE       = 0,
+    QIHSE_WIN_ROW_NUMBER = 1,
+    QIHSE_WIN_RANK       = 2,
+    QIHSE_WIN_DENSE_RANK = 3,
+    QIHSE_WIN_LAG        = 4,
+    QIHSE_WIN_LEAD       = 5,
+    QIHSE_WIN_SUM        = 6,
+    QIHSE_WIN_AVG        = 7,
+    QIHSE_WIN_COUNT      = 8,
+    QIHSE_WIN_MIN        = 9,
+    QIHSE_WIN_MAX        = 10
+} qihse_sql_win_kind_t;
+
+/* -------------------------------------------------------------------------
+ * Window frame modes
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    QIHSE_FRAME_NONE     = 0,
+    QIHSE_FRAME_ROWS     = 1,
+    QIHSE_FRAME_RANGE    = 2
+} qihse_sql_frame_mode_t;
 
 /* -------------------------------------------------------------------------
  * Set operation kinds (UNION / INTERSECT / EXCEPT)
@@ -86,6 +138,15 @@ typedef enum {
     QIHSE_SUBQ_EXISTS  = 4,  /* EXISTS (subquery) */
     QIHSE_SUBQ_NOT_EXISTS = 5
 } qihse_sql_subq_kind_t;
+
+/* -------------------------------------------------------------------------
+ * ON CONFLICT action kinds
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    QIHSE_CONFLICT_NONE    = 0,
+    QIHSE_CONFLICT_NOTHING = 1,
+    QIHSE_CONFLICT_UPDATE  = 2
+} qihse_sql_conflict_action_t;
 
 /* -------------------------------------------------------------------------
  * Basic structures
@@ -122,7 +183,28 @@ typedef struct {
 } qihse_sql_join_t;
 
 /* -------------------------------------------------------------------------
- * SELECT-list item (supports aggregates and aliases)
+ * Window specification (OVER clause)
+ * ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * ORDER BY item
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char* column_name;
+    int   ascending;   /* 1 = ASC, 0 = DESC */
+} qihse_sql_order_item_t;
+
+typedef struct {
+    char** partition_by;          /* PARTITION BY column names */
+    size_t num_partition_by;
+    qihse_sql_order_item_t* order_by;  /* ORDER BY within OVER */
+    size_t num_order_by;
+    qihse_sql_frame_mode_t frame_mode;
+    int frame_preceding;          /* N PRECEDING, -1 = UNBOUNDED */
+    int frame_following;          /* N FOLLOWING, -1 = UNBOUNDED */
+} qihse_sql_window_spec_t;
+
+/* -------------------------------------------------------------------------
+ * SELECT-list item (supports aggregates, aliases, window functions)
  * ------------------------------------------------------------------------- */
 typedef struct {
     char*  expr;            /* raw expression text (e.g. "a.x", "COUNT(*)") */
@@ -131,15 +213,13 @@ typedef struct {
     char*  agg_arg;         /* argument column for aggregate, or "*" for COUNT(*) */
     int    is_distinct;     /* DISTINCT applied to this item */
     struct qihse_sql_ast_s* scalar_subquery; /* scalar subquery in select list */
+    /* Window function support */
+    qihse_sql_win_kind_t win_kind;
+    char*  win_arg;         /* argument for LAG/LEAD/SUM/etc. */
+    int    win_offset;      /* LAG/LEAD offset (default 1) */
+    char*  win_default;     /* LAG/LEAD default value */
+    qihse_sql_window_spec_t* window;  /* OVER(...) spec; NULL if not window */
 } qihse_sql_select_item_t;
-
-/* -------------------------------------------------------------------------
- * ORDER BY item
- * ------------------------------------------------------------------------- */
-typedef struct {
-    char* column_name;
-    int   ascending;   /* 1 = ASC, 0 = DESC */
-} qihse_sql_order_item_t;
 
 /* -------------------------------------------------------------------------
  * GROUP BY / HAVING
@@ -151,7 +231,41 @@ typedef struct {
 } qihse_sql_group_by_t;
 
 /* -------------------------------------------------------------------------
- * DDL: column definition
+ * Foreign key constraint
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    QIHSE_FK_NO_ACTION = 0,
+    QIHSE_FK_CASCADE   = 1,
+    QIHSE_FK_SET_NULL  = 2,
+    QIHSE_FK_RESTRICT  = 3
+} qihse_sql_fk_action_t;
+
+typedef struct {
+    char** columns;              /* local columns */
+    size_t num_columns;
+    char*  ref_table;
+    char** ref_columns;
+    size_t num_ref_columns;
+    qihse_sql_fk_action_t on_delete;
+    qihse_sql_fk_action_t on_update;
+} qihse_sql_fk_t;
+
+/* -------------------------------------------------------------------------
+ * CHECK and UNIQUE table-level constraints
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char*  expr;                 /* CHECK expression text */
+    char*  name;                 /* optional constraint name */
+} qihse_sql_check_t;
+
+typedef struct {
+    char** columns;
+    size_t num_columns;
+    char*  name;                 /* optional constraint name */
+} qihse_sql_unique_t;
+
+/* -------------------------------------------------------------------------
+ * DDL: column definition (extended with FK / CHECK / SERIAL)
  * ------------------------------------------------------------------------- */
 typedef struct {
     char*             name;
@@ -160,6 +274,10 @@ typedef struct {
     int               not_null;
     int               is_primary_key;
     char*             default_expr; /* raw default expression (optional) */
+    int               is_unique;    /* column-level UNIQUE */
+    int               is_serial;    /* SERIAL / BIGSERIAL */
+    qihse_sql_fk_t*   fk;           /* column-level REFERENCES (optional) */
+    char*             check_expr;   /* column-level CHECK (optional) */
 } qihse_sql_column_def_t;
 
 typedef struct {
@@ -185,6 +303,65 @@ typedef struct {
     char*  new_name;        /* new name for RENAME */
     qihse_sql_column_def_t* add_column; /* for ADD COLUMN (owned) */
 } qihse_sql_alter_clause_t;
+
+/* -------------------------------------------------------------------------
+ * ON CONFLICT (UPSERT) clause
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    qihse_sql_conflict_action_t action;
+    char** conflict_columns;     /* conflict target columns */
+    size_t num_conflict_columns;
+    /* DO UPDATE SET col = expr, ... [WHERE expr] */
+    char** set_columns;
+    char** set_values;
+    size_t num_set;
+    char*  where_expr;           /* optional WHERE on the UPDATE */
+} qihse_sql_on_conflict_t;
+
+/* -------------------------------------------------------------------------
+ * RETURNING clause
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char** columns;     /* column names; NULL entry means "*" */
+    size_t num_columns;
+    int    is_star;     /* RETURNING * */
+} qihse_sql_returning_t;
+
+/* -------------------------------------------------------------------------
+ * CTE definition (WITH clause)
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char* name;                  /* CTE name */
+    int   recursive;             /* WITH RECURSIVE */
+    struct qihse_sql_ast_s* query; /* owned subquery AST */
+} qihse_sql_cte_def_t;
+
+typedef struct {
+    qihse_sql_cte_def_t* ctes;
+    size_t num_ctes;
+    struct qihse_sql_ast_s* body; /* main query (owned) */
+} qihse_sql_with_t;
+
+/* -------------------------------------------------------------------------
+ * Sequence definition (CREATE SEQUENCE)
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char* name;
+    int64_t start;
+    int64_t increment;
+    int64_t minvalue;
+    int64_t maxvalue;
+    int   cycle;          /* CYCLE / NO CYCLE */
+} qihse_sql_sequence_def_t;
+
+/* -------------------------------------------------------------------------
+ * Cursor definition (DECLARE)
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char* name;
+    struct qihse_sql_ast_s* query; /* owned */
+    int   scroll;          /* SCROLL / NO SCROLL */
+} qihse_sql_cursor_def_t;
 
 /* -------------------------------------------------------------------------
  * AST node
@@ -224,6 +401,63 @@ typedef struct qihse_sql_ast_s {
     /* ALTER TABLE */
     qihse_sql_alter_clause_t* alter_clause; /* owned */
 
+    /* CTE (WITH) */
+    qihse_sql_with_t* with_clause;      /* owned */
+
+    /* ON CONFLICT (UPSERT) */
+    qihse_sql_on_conflict_t* on_conflict; /* owned */
+
+    /* RETURNING */
+    qihse_sql_returning_t* returning;   /* owned */
+
+    /* Table-level constraints (CREATE TABLE) */
+    qihse_sql_fk_t*       fks;          /* array of FK constraints */
+    size_t num_fks;
+    qihse_sql_check_t*    checks;       /* array of CHECK constraints */
+    size_t num_checks;
+    qihse_sql_unique_t*   uniques;      /* array of UNIQUE constraints */
+    size_t num_uniques;
+
+    /* CREATE SEQUENCE */
+    qihse_sql_sequence_def_t* seq_def;  /* owned */
+
+    /* CREATE VIEW / MATERIALIZED VIEW */
+    char* view_name;                    /* view name */
+    struct qihse_sql_ast_s* view_query; /* owned SELECT AST for the view */
+
+    /* EXPLAIN / EXPLAIN ANALYZE */
+    int   explain_analyze;              /* 1 = EXPLAIN ANALYZE */
+    struct qihse_sql_ast_s* explain_query; /* owned query to explain */
+
+    /* VACUUM / ANALYZE target (NULL = all tables) */
+    char* vacuum_table;
+
+    /* LISTEN / NOTIFY */
+    char* notify_channel;
+    char* notify_payload;               /* NOTIFY payload (optional) */
+
+    /* DECLARE CURSOR */
+    qihse_sql_cursor_def_t* cursor_def; /* owned */
+
+    /* FETCH cursor */
+    char* fetch_cursor;
+    int   fetch_count;                  /* FETCH n; 0 = FETCH 1, -1 = FETCH ALL */
+
+    /* CLOSE cursor */
+    char* close_cursor;
+
+    /* INSERT specifics */
+    char** insert_columns;              /* column names for INSERT */
+    size_t num_insert_columns;
+    char*** insert_rows;                /* each row is array of value strings */
+    size_t num_insert_rows;
+    char*  insert_select_query;         /* raw INSERT ... SELECT text */
+
+    /* UPDATE specifics */
+    char** set_columns;
+    char** set_values;
+    size_t num_set;
+
     /* raw */
     char* raw_sql;
 } qihse_sql_ast_t;
@@ -243,6 +477,12 @@ const char* qihse_sql_join_type_name(qihse_sql_join_type_t j);
 
 /* Helper: convert aggregate kind to string name */
 const char* qihse_sql_agg_name(qihse_sql_agg_kind_t a);
+
+/* Helper: convert window kind to string name */
+const char* qihse_sql_win_name(qihse_sql_win_kind_t w);
+
+/* Helper: convert statement type to string name */
+const char* qihse_sql_stmt_name(qihse_sql_stmt_type_t s);
 
 #ifdef __cplusplus
 }

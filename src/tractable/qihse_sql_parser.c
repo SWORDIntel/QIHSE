@@ -837,6 +837,128 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
         return ast;
     }
 
+    /* CREATE [OR REPLACE] VIEW name AS select */
+    const char* view_after = match_kw(p, "VIEW");
+    if (view_after) {
+        p = view_after;
+        size_t vlen;
+        const char* vstart = read_identifier(p, &vlen);
+        ast->view_name = dup_token(vstart, vlen);
+        p = vstart + vlen;
+        p = skip_ws(p);
+        const char* as_after = match_kw(p, "AS");
+        if (as_after) {
+            p = as_after;
+            p = skip_ws(p);
+            /* Parse the SELECT query for the view */
+            ast->view_query = parse_select(&p);
+        }
+        ast->stmt_type = QIHSE_SQL_CREATE_VIEW;
+        *pp = p;
+        return ast;
+    }
+
+    /* CREATE [MATERIALIZED] VIEW name AS select */
+    const char* matview_after = match_kw(p, "MATERIALIZED");
+    if (matview_after) {
+        p = matview_after;
+        p = skip_ws(p);
+        const char* mv_after = match_kw(p, "VIEW");
+        if (mv_after) {
+            p = mv_after;
+            size_t vlen;
+            const char* vstart = read_identifier(p, &vlen);
+            ast->view_name = dup_token(vstart, vlen);
+            p = vstart + vlen;
+            p = skip_ws(p);
+            const char* as_after = match_kw(p, "AS");
+            if (as_after) {
+                p = as_after;
+                p = skip_ws(p);
+                ast->view_query = parse_select(&p);
+            }
+            ast->stmt_type = QIHSE_SQL_CREATE_MATVIEW;
+            *pp = p;
+            return ast;
+        }
+    }
+
+    /* CREATE SEQUENCE name [START WITH n] [INCREMENT BY n] [MINVALUE n] [MAXVALUE n] [CACHE n] [CYCLE|NO CYCLE] */
+    const char* seq_after = match_kw(p, "SEQUENCE");
+    if (seq_after) {
+        p = seq_after;
+        size_t slen;
+        const char* sstart = read_identifier(p, &slen);
+        ast->seq_def = (qihse_sql_sequence_def_t*)calloc(1, sizeof(qihse_sql_sequence_def_t));
+        ast->seq_def->name = dup_token(sstart, slen);
+        ast->seq_def->start = 1;
+        ast->seq_def->increment = 1;
+        ast->seq_def->minvalue = 1;
+        ast->seq_def->maxvalue = 9223372036854775807LL;
+        ast->seq_def->cycle = 0;
+        p = sstart + slen;
+        p = skip_ws(p);
+        /* Parse sequence options */
+        for (;;) {
+            const char* start_after = match_kw(p, "START");
+            if (start_after) {
+                p = start_after;
+                const char* with_after = match_kw(p, "WITH");
+                if (with_after) p = with_after;
+                p = skip_ws(p);
+                ast->seq_def->start = strtoll(p, NULL, 10);
+                while (*p && (isdigit((unsigned char)*p) || *p == '-' || *p == '+')) p++;
+                continue;
+            }
+            const char* inc_after = match_kw(p, "INCREMENT");
+            if (inc_after) {
+                p = inc_after;
+                const char* by_after = match_kw(p, "BY");
+                if (by_after) p = by_after;
+                p = skip_ws(p);
+                ast->seq_def->increment = strtoll(p, NULL, 10);
+                while (*p && (isdigit((unsigned char)*p) || *p == '-' || *p == '+')) p++;
+                continue;
+            }
+            const char* min_after = match_kw(p, "MINVALUE");
+            if (min_after) {
+                p = min_after;
+                p = skip_ws(p);
+                ast->seq_def->minvalue = strtoll(p, NULL, 10);
+                while (*p && (isdigit((unsigned char)*p) || *p == '-' || *p == '+')) p++;
+                continue;
+            }
+            const char* max_after = match_kw(p, "MAXVALUE");
+            if (max_after) {
+                p = max_after;
+                p = skip_ws(p);
+                ast->seq_def->maxvalue = strtoll(p, NULL, 10);
+                while (*p && (isdigit((unsigned char)*p) || *p == '-' || *p == '+')) p++;
+                continue;
+            }
+            const char* cache_after = match_kw(p, "CACHE");
+            if (cache_after) {
+                p = cache_after;
+                p = skip_ws(p);
+                ast->seq_def->increment = strtoll(p, NULL, 10);
+                while (*p && (isdigit((unsigned char)*p) || *p == '-' || *p == '+')) p++;
+                continue;
+            }
+            const char* cycle_after = match_kw(p, "CYCLE");
+            if (cycle_after) { p = cycle_after; ast->seq_def->cycle = 1; continue; }
+            const char* nocycle_after = match_kw(p, "NO");
+            if (nocycle_after) {
+                p = nocycle_after;
+                const char* cyc = match_kw(p, "CYCLE");
+                if (cyc) { p = cyc; ast->seq_def->cycle = 0; continue; }
+            }
+            break;
+        }
+        ast->stmt_type = QIHSE_SQL_CREATE_SEQ;
+        *pp = p;
+        return ast;
+    }
+
     /* CREATE TABLE name ( col defs ) */
     const char* tbl_after = match_kw(p, "TABLE");
     if (!tbl_after) { ast->stmt_type = QIHSE_SQL_UNKNOWN; *pp = p; return ast; }
@@ -1024,18 +1146,198 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
 
     if (strncasecmp(cur, "SELECT", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = parse_select(&cur);
-    } else if (strncasecmp(cur, "INSERT", 6) == 0) {
+    } else if (strncasecmp(cur, "INSERT", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_INSERT;
         ast->limit = -1; ast->offset = -1;
-    } else if (strncasecmp(cur, "UPDATE", 6) == 0) {
+        cur += 6;
+        cur = skip_ws(cur);
+        const char* into_after = match_kw(cur, "INTO");
+        if (into_after) cur = into_after;
+        cur = skip_ws(cur);
+        size_t tlen;
+        const char* tstart = read_identifier(cur, &tlen);
+        if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
+        cur = skip_ws(cur);
+        /* Optional column list */
+        if (*cur == '(') {
+            cur++;
+            size_t col_cap = 8;
+            ast->insert_columns = (char**)calloc(col_cap, sizeof(char*));
+            ast->num_insert_columns = 0;
+            for (;;) {
+                cur = skip_ws(cur);
+                size_t clen;
+                const char* cstart = read_identifier(cur, &clen);
+                if (clen == 0) break;
+                if (ast->num_insert_columns >= col_cap) {
+                    col_cap *= 2;
+                    ast->insert_columns = (char**)realloc(ast->insert_columns, col_cap * sizeof(char*));
+                }
+                ast->insert_columns[ast->num_insert_columns++] = dup_token(cstart, clen);
+                cur = cstart + clen;
+                cur = skip_ws(cur);
+                if (*cur == ',') { cur++; continue; }
+                if (*cur == ')') { cur++; break; }
+                break;
+            }
+        }
+        cur = skip_ws(cur);
+        /* VALUES or SELECT */
+        const char* values_after = match_kw(cur, "VALUES");
+        if (values_after) {
+            cur = values_after;
+            cur = skip_ws(cur);
+            size_t row_cap = 4;
+            ast->insert_rows = (char***)calloc(row_cap, sizeof(char**));
+            ast->num_insert_rows = 0;
+                        for (;;) {
+                cur = skip_ws(cur);
+                if (*cur != '(') break;
+                cur++;
+                size_t val_cap = 8;
+                char** values = (char**)calloc(val_cap, sizeof(char*));
+                size_t nvalues = 0;
+                for (;;) {
+                    cur = skip_ws(cur);
+                    if (*cur == ')') { cur++; break; }
+                    /* Parse a value token */
+                    const char* vstart = cur;
+                    if (*cur == '\'') {
+                        cur++;
+                        vstart = cur;
+                        while (*cur && *cur != '\'') cur++;
+                        if (*cur == '\'') { size_t vlen = (size_t)(cur - vstart); if (nvalues >= val_cap) { val_cap *= 2; values = (char**)realloc(values, val_cap * sizeof(char*)); } values[nvalues++] = dup_token(vstart, vlen); cur++; }
+                    } else {
+                        while (*cur && *cur != ',' && *cur != ')') cur++;
+                        size_t vlen = (size_t)(cur - vstart);
+                        while (vlen > 0 && isspace((unsigned char)vstart[vlen-1])) vlen--;
+                        if (nvalues >= val_cap) { val_cap *= 2; values = (char**)realloc(values, val_cap * sizeof(char*)); }
+                        values[nvalues++] = dup_token(vstart, vlen);
+                    }
+                    cur = skip_ws(cur);
+                    if (*cur == ',') { cur++; continue; }
+                    if (*cur == ')') { cur++; break; }
+                    break;
+                }
+                if (ast->num_insert_rows >= row_cap) {
+                    row_cap *= 2;
+                    ast->insert_rows = (char***)realloc(ast->insert_rows, row_cap * sizeof(char**));
+                                    }
+                ast->insert_rows[ast->num_insert_rows] = values;
+                                ast->num_insert_rows++;
+                cur = skip_ws(cur);
+                if (*cur != ',') break;
+                cur++;
+            }
+        }
+        cur = skip_ws(cur);
+        /* ON CONFLICT (UPSERT) */
+        const char* on_after = match_kw(cur, "ON");
+        if (on_after) {
+            const char* conflict_after = match_kw(on_after, "CONFLICT");
+            if (conflict_after) {
+                cur = conflict_after;
+                ast->on_conflict = (qihse_sql_on_conflict_t*)calloc(1, sizeof(qihse_sql_on_conflict_t));
+                ast->on_conflict->action = 1; /* DO UPDATE by default */
+                cur = skip_ws(cur);
+                if (*cur == '(') {
+                    cur++;
+                    size_t clen;
+                    const char* cstart = read_identifier(cur, &clen);
+                    if (clen > 0) { ast->on_conflict->conflict_columns = (char**)calloc(1, sizeof(char*)); ast->on_conflict->conflict_columns[0] = dup_token(cstart, clen); ast->on_conflict->num_conflict_columns = 1; cur = cstart + clen; }
+                    cur = skip_ws(cur);
+                    if (*cur == ')') cur++;
+                }
+                cur = skip_ws(cur);
+                const char* do_after = match_kw(cur, "DO");
+                if (do_after) {
+                    cur = do_after;
+                    cur = skip_ws(cur);
+                    const char* update_after = match_kw(cur, "UPDATE");
+                    const char* nothing_after = match_kw(cur, "NOTHING");
+                    if (nothing_after) { cur = nothing_after; ast->on_conflict->action = 2; }
+                    else if (update_after) { cur = update_after; ast->on_conflict->action = 1; }
+                }
+            }
+        }
+        cur = skip_ws(cur);
+        /* RETURNING */
+        const char* returning_after = match_kw(cur, "RETURNING");
+        if (returning_after) {
+            cur = returning_after;
+            cur = skip_ws(cur);
+            if (*cur == '*') {
+                ast->returning = (qihse_sql_returning_t*)calloc(1, sizeof(qihse_sql_returning_t));
+                ast->returning->is_star = 1;
+                cur++;
+            } else {
+                ast->returning = (qihse_sql_returning_t*)calloc(1, sizeof(qihse_sql_returning_t));
+                ast->returning->is_star = 0;
+                size_t ret_cap = 4;
+                ast->returning->columns = (char**)calloc(ret_cap, sizeof(char*));
+                ast->returning->num_columns = 0;
+                for (;;) {
+                    cur = skip_ws(cur);
+                    size_t clen;
+                    const char* cstart = read_identifier(cur, &clen);
+                    if (clen == 0) break;
+                    if (ast->returning->num_columns >= ret_cap) {
+                        ret_cap *= 2;
+                        ast->returning->columns = (char**)realloc(ast->returning->columns, ret_cap * sizeof(char*));
+                    }
+                    ast->returning->columns[ast->returning->num_columns++] = dup_token(cstart, clen);
+                    cur = cstart + clen;
+                    cur = skip_ws(cur);
+                    if (*cur == ',') { cur++; continue; }
+                    break;
+                }
+            }
+        }
+    } else if (strncasecmp(cur, "UPDATE", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_UPDATE;
         ast->limit = -1; ast->offset = -1;
-    } else if (strncasecmp(cur, "DELETE", 6) == 0) {
+        cur += 6;
+        cur = skip_ws(cur);
+        size_t tlen;
+        const char* tstart = read_identifier(cur, &tlen);
+        if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
+    } else if (strncasecmp(cur, "DELETE", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_DELETE;
         ast->limit = -1; ast->offset = -1;
+        cur += 6;
+        cur = skip_ws(cur);
+        const char* from_after = match_kw(cur, "FROM");
+        if (from_after) cur = from_after;
+        cur = skip_ws(cur);
+        size_t tlen;
+        const char* tstart = read_identifier(cur, &tlen);
+        if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
+        cur = skip_ws(cur);
+        /* WHERE */
+        const char* where_after = match_kw(cur, "WHERE");
+        if (where_after) {
+            cur = where_after;
+            const char* wstart = cur;
+            while (*cur && *cur != ';') cur++;
+            size_t wlen = (size_t)(cur - wstart);
+            while (wlen > 0 && isspace((unsigned char)wstart[wlen-1])) wlen--;
+            { ast->insert_select_query = dup_token(wstart, wlen); }
+        }
+        /* RETURNING */
+        cur = skip_ws(cur);
+        const char* returning_after = match_kw(cur, "RETURNING");
+        if (returning_after) {
+            cur = returning_after;
+            cur = skip_ws(cur);
+            if (*cur == '*') {
+                ast->returning = (qihse_sql_returning_t*)calloc(1, sizeof(qihse_sql_returning_t));
+                ast->returning->is_star = 1;
+                cur++;
+            }
+        }
     } else if (strncasecmp(cur, "CREATE", 6) == 0) {
         cur += 6;
         ast = parse_create(&cur);
@@ -1045,6 +1347,161 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
     } else if (strncasecmp(cur, "DROP", 4) == 0) {
         cur += 4;
         ast = parse_drop(&cur);
+    } else if (strncasecmp(cur, "WITH", 4) == 0 && !isalnum((unsigned char)cur[4]) && cur[4] != '_') {
+        /* CTE: WITH name AS (...) SELECT ... */
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_WITH;
+        ast->limit = -1; ast->offset = -1;
+        /* Skip WITH keyword and parse CTE definitions */
+        cur += 4;
+        cur = skip_ws(cur);
+        /* Parse CTE definitions: name AS (select) [, name AS (select)]* */
+        ast->with_clause = (qihse_sql_with_t*)calloc(1, sizeof(qihse_sql_with_t));
+        size_t cte_cap = 4;
+        ast->with_clause->ctes = (qihse_sql_cte_def_t*)calloc(cte_cap, sizeof(qihse_sql_cte_def_t));
+        ast->with_clause->num_ctes = 0;
+        for (;;) {
+            cur = skip_ws(cur);
+            /* Optional RECURSIVE */
+            const char* rec_after = match_kw(cur, "RECURSIVE");
+            if (rec_after) cur = rec_after;
+            cur = skip_ws(cur);
+            size_t id_len;
+            const char* id_start = read_identifier(cur, &id_len);
+            if (id_len == 0) break;
+            char* cte_name = dup_token(id_start, id_len);
+            cur = id_start + id_len;
+            cur = skip_ws(cur);
+            const char* as_after = match_kw(cur, "AS");
+            if (!as_after) { free(cte_name); break; }
+            cur = as_after;
+            cur = skip_ws(cur);
+            /* Skip the (select...) part - find matching paren */
+            if (*cur == '(') {
+                int depth = 0;
+                const char* sub_start = cur;
+                while (*cur) {
+                    if (*cur == '(') depth++;
+                    else if (*cur == ')') { depth--; if (depth == 0) { cur++; break; } }
+                    cur++;
+                }
+                if (ast->with_clause->num_ctes >= cte_cap) {
+                    cte_cap *= 2;
+                    ast->with_clause->ctes = (qihse_sql_cte_def_t*)realloc(ast->with_clause->ctes, cte_cap * sizeof(qihse_sql_cte_def_t));
+                }
+                ast->with_clause->ctes[ast->with_clause->num_ctes].name = cte_name;
+                ast->with_clause->ctes[ast->with_clause->num_ctes].query = NULL;
+                ast->with_clause->num_ctes++;
+            } else {
+                free(cte_name);
+                break;
+            }
+            cur = skip_ws(cur);
+            if (*cur != ',') break;
+            cur++;
+        }
+        /* Now parse the main SELECT */
+        cur = skip_ws(cur);
+        if (strncasecmp(cur, "SELECT", 6) == 0) {
+            qihse_sql_ast_t* sel = parse_select(&cur);
+            if (sel) {
+                /* Copy select fields into the WITH ast */
+                ast->num_select_items = sel->num_select_items;
+                ast->select_items = sel->select_items;
+                ast->table_name = sel->table_name;
+                ast->num_joins = sel->num_joins;
+                ast->joins = sel->joins;
+                ast->where_conditions = sel->where_conditions; ast->num_where_conditions = sel->num_where_conditions; sel->where_conditions = NULL; sel->num_where_conditions = 0;
+                ast->limit = sel->limit;
+                ast->offset = sel->offset;
+                free(sel);
+            }
+        }
+    } else if (strncasecmp(cur, "VACUUM", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_VACUUM;
+        ast->limit = -1; ast->offset = -1;
+        cur += 6;
+        cur = skip_ws(cur);
+        /* Optional ANALYZE */
+        const char* analyze_after = match_kw(cur, "ANALYZE");
+        if (analyze_after) { cur = analyze_after; cur = skip_ws(cur); }
+        /* Optional table name */
+        if (*cur && *cur != ';') {
+            size_t tlen;
+            const char* tstart = read_identifier(cur, &tlen);
+            if (tlen > 0) { ast->vacuum_table = dup_token(tstart, tlen); cur = tstart + tlen; }
+        }
+    } else if (strncasecmp(cur, "ANALYZE", 7) == 0 && !isalnum((unsigned char)cur[7]) && cur[7] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_ANALYZE;
+        ast->limit = -1; ast->offset = -1;
+        cur += 7;
+        cur = skip_ws(cur);
+        if (*cur && *cur != ';') {
+            size_t tlen;
+            const char* tstart = read_identifier(cur, &tlen);
+            if (tlen > 0) { ast->vacuum_table = dup_token(tstart, tlen); cur = tstart + tlen; }
+        }
+    } else if (strncasecmp(cur, "NOTIFY", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_NOTIFY;
+        ast->limit = -1; ast->offset = -1;
+        cur += 6;
+        cur = skip_ws(cur);
+        size_t clen;
+        const char* cstart = read_identifier(cur, &clen);
+        if (clen > 0) { ast->notify_channel = dup_token(cstart, clen); cur = cstart + clen; }
+        cur = skip_ws(cur);
+        if (*cur == ',') {
+            cur++;
+            cur = skip_ws(cur);
+            if (*cur == '\'') {
+                cur++;
+                const char* payload_start = cur;
+                while (*cur && *cur != '\'') cur++;
+                size_t plen = (size_t)(cur - payload_start);
+                ast->notify_payload = dup_token(payload_start, plen);
+                if (*cur == '\'') cur++;
+            }
+        }
+    } else if (strncasecmp(cur, "LISTEN", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_LISTEN;
+        ast->limit = -1; ast->offset = -1;
+        cur += 6;
+        cur = skip_ws(cur);
+        size_t clen;
+        const char* cstart = read_identifier(cur, &clen);
+        if (clen > 0) { ast->notify_channel = dup_token(cstart, clen); cur = cstart + clen; }
+    } else if (strncasecmp(cur, "UNLISTEN", 8) == 0 && !isalnum((unsigned char)cur[8]) && cur[8] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_LISTEN;
+        ast->limit = -1; ast->offset = -1;
+        cur += 8;
+        cur = skip_ws(cur);
+        size_t clen;
+        const char* cstart = read_identifier(cur, &clen);
+        if (clen > 0) { ast->notify_channel = dup_token(cstart, clen); cur = cstart + clen; }
+    } else if (strncasecmp(cur, "EXPLAIN", 7) == 0 && !isalnum((unsigned char)cur[7]) && cur[7] != '_') {
+        ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        ast->stmt_type = QIHSE_SQL_EXPLAIN;
+        ast->limit = -1; ast->offset = -1;
+        cur += 7;
+        cur = skip_ws(cur);
+        /* Optional ANALYZE after EXPLAIN */
+        const char* ea = match_kw(cur, "ANALYZE");
+        if (ea) cur = ea;
+        /* Parse the inner statement */
+        qihse_sql_ast_t* inner = parse_statement(cur);
+        if (inner) {
+            /* Copy relevant fields */
+            ast->table_name = inner->table_name;
+            ast->num_select_items = inner->num_select_items;
+            ast->select_items = inner->select_items;
+            ast->where_conditions = inner->where_conditions; ast->num_where_conditions = inner->num_where_conditions; inner->where_conditions = NULL; inner->num_where_conditions = 0;
+            free(inner);
+        }
     } else {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_UNKNOWN;
