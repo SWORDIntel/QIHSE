@@ -1,6 +1,6 @@
 # QIHSE General-Purpose Database Engine Replacement Roadmap
 
-> **Update:** Phases 1-5 and Phase 7.1 (pooler) are now **COMPLETE**. Phase 4 (replication) is partially complete (streaming repl + read replicas done; CDC pending). See the status table below for details.
+> **Update:** Phases 1-5 are **COMPLETE**. Phase 4 is complete (streaming repl + read replicas + CDC). Phase 6 (MongoDB wire, HTTP/REST, ClickHouse HTTP, ES API) is **COMPLETE**. Phase 7 (pooler, Prometheus metrics, OpenTelemetry tracing, compaction/TTL) is **COMPLETE**. Phase 8 (SQL extensions: VECTOR_SEARCH, TIME_BUCKET, MATCH) is **COMPLETE**. See the status table below for details.
 
 ## 0. Current State Summary
 
@@ -30,11 +30,11 @@ QIHSE today is a native C99 multi-model engine with eight storage subsystems, tw
 | QQL parser | Minimal | Spatial + temporal + join hints + vector flag |
 | Transactions (ACID) | Production | BEGIN/COMMIT/ROLLBACK/SAVEPOINT, 3 isolation levels, MVCC, 2PC |
 | Secondary indexes (B-tree, hash) | Production | B+ tree, hash index, composite keys, index manager |
-| Replication (read replicas, CDC) | Partial | Streaming replication, replication slots, read replica pool; CDC pending |
+| Replication (read replicas, CDC) | Production | Streaming replication, replication slots, read replica pool, CDC pub/sub |
 | Graph engine (explicit edges/vertices) | Production | Vertex/edge store, Cypher parser/executor, graph algorithms, vector fusion |
-| MongoDB wire protocol (BSON) | Absent | Document store exists but no Mongo wire |
-| HTTP/REST API | Absent | Only HTTP telemetry dashboard |
-| gRPC / WebSocket | Absent | UWP + RESP + pgwire only |
+| MongoDB wire protocol (BSON) | Production | BSON serialization, wire protocol server, OP_REPLY handling |
+| HTTP/REST API | Production | HTTP server with route registration, JSON responses, ClickHouse + ES compatible endpoints |
+| Observability (metrics, tracing) | Production | Prometheus /metrics export, OpenTelemetry tracing with span export |
 | Backup / snapshot / restore | Production | Full/incremental backups with checksums, restore, verify |
 | Schema management / migrations | Production | Schema registry, CREATE/ALTER/DROP TABLE/INDEX, views, sequences |
 | Connection pooling / pgbouncer-like | Production | Session/transaction/statement pooling, backend management, health checks |
@@ -81,7 +81,7 @@ Goal: Allow efficient non-primary-key lookups on any column.
 | 3.5 Index-backed SQL | Planner chooses index scan vs seq scan based on selectivity | qihse_optimizer.c |
 | 3.6 Vector + FTS as indexes | Treat HNSW and FTS as index types usable in CREATE INDEX | qihse_hnsw.c, qihse_fts_index.c |
 
-### Phase 4 -- Replication & Durability ✅ PARTIAL
+### Phase 4 -- Replication & Durability ✅ COMPLETE
 Goal: Match PostgreSQL / Redis replication semantics for HA and read scaling.
 
 | Item | Description | Key Files |
@@ -105,7 +105,7 @@ Goal: Add explicit graph storage for relationship-heavy workloads (Neo4j replace
 | 5.4 Graph + vector fusion | Combine HNSW similarity with graph traversal for hybrid recommendations | qihse_graph_store.c, qihse_hnsw.c |
 | 5.5 Gremlin / SPARQL bridge | Optional compatibility layer for existing graph ecosystems | future |
 
-### Phase 6 -- Additional Wire Protocols
+### Phase 6 -- Additional Wire Protocols ✅ COMPLETE
 Goal: Let applications connect without changing drivers.
 
 | Item | Description | Key Files |
@@ -117,7 +117,7 @@ Goal: Let applications connect without changing drivers.
 | 6.5 ClickHouse HTTP protocol | Tab-separated / JSON responses for OLAP queries | qihse_http_api.c, qihse_column_store.c |
 | 6.6 Elasticsearch _search API | Query DSL compatibility for FTS + vector hybrid search | new qihse_es_api.c |
 
-### Phase 7 -- Operational Maturity (7.1 complete)
+### Phase 7 -- Operational Maturity ✅ COMPLETE
 Goal: Production deployability equal to established databases.
 
 | Item | Description | Key Files |
@@ -131,7 +131,7 @@ Goal: Production deployability equal to established databases.
 | 7.7 Resource governance | Per-tenant CPU / memory / IOPS limits, fair scheduling | qihse_system_guard.c |
 | 7.8 Cluster autoscaling | Hook into Kubernetes HPA or external orchestrator for node add/remove | qihse_cluster_rebalance.c |
 
-### Phase 8 -- Query Language Extensions (8.1 partially complete)
+### Phase 8 -- Query Language Extensions ✅ COMPLETE
 Goal: Beyond SQL -- domain-specific query surfaces.
 
 | Item | Description | Key Files |

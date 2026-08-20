@@ -45,6 +45,13 @@ Data traverses from kernel-bypass network interfaces straight into SIMD computat
 | **Backup & Restore** | Native | `qihse_backup_*` | Full and incremental backups with FNV-1a checksums, restore, verify, and backup listing. |
 | **Parallel Query** | Native | `qihse_parallel_*` | Multi-worker parallel scan, join, and aggregate with pthread-based partitioning. |
 | **Connection Pooler** | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling modes (pgbouncer-equivalent), backend management, health checks. |
+| **CDC (Change Data Capture)** | `0x0D` | `qihse_cdc_*` | Pub/sub change data capture with insert/update/delete events, subscription management, LSN tracking. |
+| **MongoDB Wire Protocol** | Native | `qihse_mongo_wire_*` | BSON serialization, MongoDB wire protocol server, OP_REPLY handling for drop-in MongoDB client compatibility. |
+| **HTTP/REST API** | Native | `qihse_http_api_*` | HTTP server with route registration, JSON responses, ClickHouse HTTP and Elasticsearch _search API compatibility. |
+| **Prometheus Metrics** | Native | `qihse_metrics_*` | Counter/gauge/histogram/summary metrics with Prometheus text format /metrics export. |
+| **OpenTelemetry Tracing** | Native | `qihse_tracing_*` | Distributed tracing with span management, tags, parent/child relationships, JSON export. |
+| **Compaction & TTL** | Native | `qihse_compaction_*` | Background SSTable compaction across all engines, TTL expiration sweeps. |
+| **SQL Extensions** | Native | `qihse_sql_extensions_*` | VECTOR_SEARCH() table function, TIME_BUCKET() aggregation, MATCH() full-text search with highlights. |
 
 
 
