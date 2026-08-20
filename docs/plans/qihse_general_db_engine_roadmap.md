@@ -1,6 +1,16 @@
 # QIHSE General-Purpose Database Engine Replacement Roadmap
 
-> **Update:** Phases 1-5 are **COMPLETE**. Phase 4 is complete (streaming repl + read replicas + CDC). Phase 6 (MongoDB wire, HTTP/REST, ClickHouse HTTP, ES API) is **COMPLETE**. Phase 7 (pooler, Prometheus metrics, OpenTelemetry tracing, compaction/TTL) is **COMPLETE**. Phase 8 (SQL extensions: VECTOR_SEARCH, TIME_BUCKET, MATCH) is **COMPLETE**. See the status table below for details.
+> **Update:** Phases 1-8 are **COMPLETE**. Phase 9 (Database Equivalency Commands) is **COMPLETE** -- all 8 target databases now have comprehensive command interoperability:
+> - **Redis**: lists, hashes, sets, sorted sets, pub/sub, transactions (MULTI/EXEC), bitmaps, HyperLogLog, scripting, key management, server commands
+> - **MongoDB**: CRUD operations, query operators, aggregation pipeline, admin commands, BSON helpers, in-memory catalog
+> - **PostgreSQL**: TRUNCATE, BEGIN/COMMIT/ROLLBACK, COPY, GRANT/REVOKE, CASE/CAST, transaction control, DCL, utility commands, catalog views, window functions
+> - **PgBouncer**: SHOW/RELOAD/PAUSE/RESUME admin commands, pooling modes, authentication, statistics, config management
+> - **Elasticsearch**: query DSL parsing, aggregations, mappings, index management, cat API, cluster/nodes info, scroll, PIT, scripts, templates
+> - **InfluxDB**: InfluxQL parser, line protocol, HTTP API (/query, /write, /health, /ping)
+> - **ClickHouse**: MergeTree engines, materialized views, dictionaries, ClickHouse functions, ARRAY JOIN, FINAL, PREWHERE, SAMPLE, SETTINGS, system tables
+> - **Neo4j**: LOAD CSV, CALL procedures, constraints, indexes, database management, EXPLAIN/PROFILE, FOREACH
+>
+> See the status table below for details.
 
 ## 0. Current State Summary
 
@@ -174,14 +184,14 @@ After completing Phases 1-7, QIHSE would functionally replace:
 
 | Replaced Engine | QIHSE Replacement Path |
 |---|---|
-| PostgreSQL | pgwire + SQL (Phase 1 ✅) + ACID (Phase 2 ✅) + indexes (Phase 3 ✅) + replication (Phase 4 ✅ partial) + pooler (Phase 7.1 ✅) |
-| Redis | RESP2/RESP3 (existing) + cluster (existing) + task queue (existing) |
-| MongoDB | Document store (existing) + Mongo wire (Phase 6.1) |
-| ClickHouse | Columnar engine (existing) + SQL aggregates (Phase 1) + ClickHouse HTTP (Phase 6.5) |
-| Elasticsearch | FTS (existing) + vector (existing) + ES _search API (Phase 6.6) |
-| Neo4j | Graph engine (Phase 5 ✅) + Cypher (Phase 5.2 ✅) + Bolt protocol ✅ |
-| InfluxDB | TSDB (existing) + time-series SQL (Phase 8.3) |
+| PostgreSQL | pgwire + SQL (Phase 1 ✅) + ACID (Phase 2 ✅) + indexes (Phase 3 ✅) + replication (Phase 4 ✅) + pooler (Phase 7.1 ✅) + TRUNCATE/COPY/GRANT/REVOKE (Phase 9 ✅) |
+| Redis | RESP2/RESP3 (existing) + cluster (existing) + task queue (existing) + lists/hashes/sets/sorted sets/pub-sub/transactions/bitmaps/HLL/scripting (Phase 9 ✅) |
+| MongoDB | Document store (existing) + Mongo wire (Phase 6.1 ✅) + CRUD/query operators/aggregation/admin (Phase 9 ✅) |
+| ClickHouse | Columnar engine (existing) + SQL aggregates (Phase 1 ✅) + ClickHouse HTTP (Phase 6.5 ✅) + MergeTree/MV/dictionaries/system tables (Phase 9 ✅) |
+| Elasticsearch | FTS (existing) + vector (existing) + ES _search API (Phase 6.6 ✅) + query DSL/aggregations/mappings/cat API (Phase 9 ✅) |
+| Neo4j | Graph engine (Phase 5 ✅) + Cypher (Phase 5.2 ✅) + Bolt protocol ✅ + LOAD CSV/CALL/constraints/indexes (Phase 9 ✅) |
+| InfluxDB | TSDB (existing) + time-series SQL (Phase 8.3 ✅) + InfluxQL/line protocol/HTTP API (Phase 9 ✅) |
 | Celery + Redis broker | Task queue (existing) |
-| PgBouncer | Built-in pooler (Phase 7.1 ✅) |
+| PgBouncer | Built-in pooler (Phase 7.1 ✅) + admin commands/pooling modes/auth/stats (Phase 9 ✅) |
 
 The key insight is that QIHSE already has the storage engines. The remaining work is primarily in the query, transaction, replication, and protocol layers that sit on top of those engines.
