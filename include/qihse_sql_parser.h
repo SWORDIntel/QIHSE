@@ -37,6 +37,31 @@ typedef enum {
     QIHSE_SQL_DECLARE         = 23,
     QIHSE_SQL_FETCH           = 24,
     QIHSE_SQL_CLOSE           = 25,
+    /* Transaction control (TCL) */
+    QIHSE_SQL_BEGIN           = 26,
+    QIHSE_SQL_COMMIT          = 27,
+    QIHSE_SQL_ROLLBACK        = 28,
+    QIHSE_SQL_SAVEPOINT       = 29,
+    QIHSE_SQL_RELEASE         = 30,
+    QIHSE_SQL_SET_TXN         = 31,
+    /* Data Control Language (DCL) */
+    QIHSE_SQL_GRANT           = 32,
+    QIHSE_SQL_REVOKE          = 33,
+    QIHSE_SQL_CREATE_ROLE     = 34,
+    QIHSE_SQL_DROP_ROLE       = 35,
+    QIHSE_SQL_ALTER_ROLE      = 36,
+    /* Utility commands */
+    QIHSE_SQL_TRUNCATE        = 37,
+    QIHSE_SQL_COPY            = 38,
+    QIHSE_SQL_DISCARD         = 39,
+    QIHSE_SQL_RESET           = 40,
+    QIHSE_SQL_SET_PARAM       = 41,
+    QIHSE_SQL_SHOW            = 42,
+    QIHSE_SQL_DEALLOCATE      = 43,
+    QIHSE_SQL_PREPARE         = 44,
+    QIHSE_SQL_EXECUTE         = 45,
+    QIHSE_SQL_REINDEX         = 46,
+    QIHSE_SQL_CLUSTER         = 47,
     QIHSE_SQL_UNKNOWN         = 0
 } qihse_sql_stmt_type_t;
 
@@ -88,7 +113,13 @@ typedef enum {
     QIHSE_AGG_STRING_AGG = 7,
     QIHSE_AGG_ARRAY_AGG  = 8,
     QIHSE_AGG_BOOL_OR    = 9,
-    QIHSE_AGG_BOOL_AND   = 10
+    QIHSE_AGG_BOOL_AND   = 10,
+    QIHSE_AGG_VARIANCE   = 11,
+    QIHSE_AGG_STDDEV     = 12,
+    QIHSE_AGG_CORR       = 13,
+    QIHSE_AGG_COVAR_SAMP = 14,
+    QIHSE_AGG_COVAR_POP  = 15,
+    QIHSE_AGG_EVERY      = 16  /* alias for bool_and */
 } qihse_sql_agg_kind_t;
 
 /* -------------------------------------------------------------------------
@@ -105,7 +136,13 @@ typedef enum {
     QIHSE_WIN_AVG        = 7,
     QIHSE_WIN_COUNT      = 8,
     QIHSE_WIN_MIN        = 9,
-    QIHSE_WIN_MAX        = 10
+    QIHSE_WIN_MAX        = 10,
+    QIHSE_WIN_FIRST_VALUE= 11,
+    QIHSE_WIN_LAST_VALUE = 12,
+    QIHSE_WIN_NTH_VALUE  = 13,
+    QIHSE_WIN_NTILE      = 14,
+    QIHSE_WIN_PERCENT_RANK = 15,
+    QIHSE_WIN_CUME_DIST  = 16
 } qihse_sql_win_kind_t;
 
 /* -------------------------------------------------------------------------
@@ -364,6 +401,41 @@ typedef struct {
 } qihse_sql_cursor_def_t;
 
 /* -------------------------------------------------------------------------
+ * Generic utility command descriptor
+ *
+ * Used by transaction control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE),
+ * data control language (GRANT/REVOKE/CREATE ROLE/DROP ROLE/ALTER ROLE),
+ * and utility commands (TRUNCATE/COPY/DISCARD/RESET/SET/SHOW/DEALLOCATE/
+ * PREPARE/EXECUTE/REINDEX/CLUSTER).  These commands are mostly recognised
+ * and acknowledged; the fields below carry the parsed details.
+ * ------------------------------------------------------------------------- */
+typedef struct qihse_sql_util_s {
+    char*  name;        /* primary name: role, savepoint, param, cursor, table */
+    char*  value;       /* secondary value: password, param value, file path */
+    char*  name2;       /* secondary name: referenced table, target type */
+    char** list;        /* list of names/privileges (truncate tables, grant privs) */
+    size_t num_list;
+    char** list2;       /* second list (e.g. COPY column list, EXECUTE args) */
+    size_t num_list2;
+    int    flags;       /* command-specific flags (read-only, with-grant, cascade...) */
+    int    flags2;      /* additional flags (isolation level, direction...) */
+    struct qihse_sql_ast_s* subquery; /* COPY (SELECT...), PREPARE AS, DECLARE FOR */
+} qihse_sql_util_t;
+
+/* utility flag constants */
+#define QIHSE_UTIL_READ_ONLY      0x01
+#define QIHSE_UTIL_WITH_GRANT     0x02
+#define QIHSE_UTIL_CASCADE        0x04
+#define QIHSE_UTIL_RESTRICT       0x08
+#define QIHSE_UTIL_RESTART_ID     0x10
+#define QIHSE_UTIL_CONTINUE_ID    0x20
+#define QIHSE_UTIL_HOLD           0x40
+#define QIHSE_UTIL_ALL            0x80
+#define QIHSE_UTIL_VERBOSE        0x100
+#define QIHSE_UTIL_ANALYZE_FLAG   0x200
+#define QIHSE_UTIL_FROM           0x400  /* COPY FROM (import) vs TO (export) */
+
+/* -------------------------------------------------------------------------
  * AST node
  * ------------------------------------------------------------------------- */
 typedef struct qihse_sql_ast_s {
@@ -445,6 +517,9 @@ typedef struct qihse_sql_ast_s {
 
     /* CLOSE cursor */
     char* close_cursor;
+
+    /* Generic utility command (TCL / DCL / utility) */
+    qihse_sql_util_t* util;            /* owned */
 
     /* INSERT specifics */
     char** insert_columns;              /* column names for INSERT */

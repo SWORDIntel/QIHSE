@@ -53,6 +53,26 @@ typedef struct {
     bool asking;
     bool readonly;
     char name[128];
+    /* Transaction (MULTI/EXEC) state */
+    bool in_multi;
+    bool multi_dirty;            /* a queued command had an error */
+    qihse_resp_request_t* multi_queue;
+    size_t multi_queue_len;
+    size_t multi_queue_cap;
+    char** watch_keys;
+    size_t* watch_key_lens;
+    size_t watch_count;
+    size_t watch_cap;
+    bool watch_dirty;            /* a watched key was modified */
+    /* Pub/Sub state */
+    char** sub_channels;
+    size_t* sub_channel_lens;
+    size_t sub_channel_count;
+    size_t sub_channel_cap;
+    char** sub_patterns;
+    size_t* sub_pattern_lens;
+    size_t sub_pattern_count;
+    size_t sub_pattern_cap;
 } qihse_resp_session_t;
 
 struct qihse_resp_client_ctx {
@@ -250,6 +270,13 @@ static bool qihse_resp_parse_u64_arg(const qihse_resp_arg_t* arg, uint64_t* out)
     *out = (uint64_t)value;
     return true;
 }
+
+static bool qihse_resp_parse_i64_arg(const qihse_resp_arg_t* arg, int64_t* out) {
+    if (!arg || !out) return false;
+    return qihse_resp_parse_i64_bytes(arg->data, arg->len, out);
+}
+
+#define qihse_resp_parse_f64_arg qihse_resp_parse_double_arg
 
 static bool qihse_resp_parse_double_arg(const qihse_resp_arg_t* arg, double* out) {
     if (!arg || !out || arg->len == 0 || arg->len >= 128u || memchr(arg->data, '\0', arg->len)) return false;
@@ -450,6 +477,53 @@ static bool qihse_resp_extract_keys(const qihse_resp_request_t* request, qihse_r
                qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "COL.SUM") ||
                qihse_resp_command_is(request, "COL.MINMAX")) {
         keys->indexes[keys->count++] = 1u;
+    } else if (qihse_resp_command_is(request, "LPUSH") || qihse_resp_command_is(request, "RPUSH") ||
+               qihse_resp_command_is(request, "LPOP") || qihse_resp_command_is(request, "RPOP") ||
+               qihse_resp_command_is(request, "LLEN") || qihse_resp_command_is(request, "LRANGE") ||
+               qihse_resp_command_is(request, "LINDEX") || qihse_resp_command_is(request, "LSET") ||
+               qihse_resp_command_is(request, "LREM") || qihse_resp_command_is(request, "LTRIM") ||
+               qihse_resp_command_is(request, "LINSERT") ||
+               qihse_resp_command_is(request, "HSET") || qihse_resp_command_is(request, "HMSET") ||
+               qihse_resp_command_is(request, "HGET") || qihse_resp_command_is(request, "HGETALL") ||
+               qihse_resp_command_is(request, "HDEL") || qihse_resp_command_is(request, "HEXISTS") ||
+               qihse_resp_command_is(request, "HKEYS") || qihse_resp_command_is(request, "HVALS") ||
+               qihse_resp_command_is(request, "HLEN") || qihse_resp_command_is(request, "HINCRBY") ||
+               qihse_resp_command_is(request, "HMGET") || qihse_resp_command_is(request, "HSETNX") ||
+               qihse_resp_command_is(request, "HSTRLEN") ||
+               qihse_resp_command_is(request, "SADD") || qihse_resp_command_is(request, "SREM") ||
+               qihse_resp_command_is(request, "SMEMBERS") || qihse_resp_command_is(request, "SISMEMBER") ||
+               qihse_resp_command_is(request, "SCARD") || qihse_resp_command_is(request, "SPOP") ||
+               qihse_resp_command_is(request, "SRANDMEMBER") ||
+               qihse_resp_command_is(request, "ZADD") || qihse_resp_command_is(request, "ZREM") ||
+               qihse_resp_command_is(request, "ZSCORE") || qihse_resp_command_is(request, "ZCARD") ||
+               qihse_resp_command_is(request, "ZCOUNT") || qihse_resp_command_is(request, "ZRANGE") ||
+               qihse_resp_command_is(request, "ZREVRANGE") || qihse_resp_command_is(request, "ZRANK") ||
+               qihse_resp_command_is(request, "ZREVRANK") || qihse_resp_command_is(request, "ZINCRBY") ||
+               qihse_resp_command_is(request, "ZPOPMAX") || qihse_resp_command_is(request, "ZPOPMIN") ||
+               qihse_resp_command_is(request, "ZRANGEBYSCORE") || qihse_resp_command_is(request, "ZREVRANGEBYSCORE") ||
+               qihse_resp_command_is(request, "GETSET") || qihse_resp_command_is(request, "GETDEL") ||
+               qihse_resp_command_is(request, "STRLEN") || qihse_resp_command_is(request, "APPEND") ||
+               qihse_resp_command_is(request, "GETRANGE") || qihse_resp_command_is(request, "SETRANGE") ||
+               qihse_resp_command_is(request, "INCRBY") || qihse_resp_command_is(request, "DECRBY") ||
+               qihse_resp_command_is(request, "INCRBYFLOAT") || qihse_resp_command_is(request, "PERSIST") ||
+               qihse_resp_command_is(request, "EXPIREAT") || qihse_resp_command_is(request, "PEXPIREAT") ||
+               qihse_resp_command_is(request, "SETBIT") || qihse_resp_command_is(request, "GETBIT") ||
+               qihse_resp_command_is(request, "BITCOUNT") || qihse_resp_command_is(request, "BITPOS") ||
+               qihse_resp_command_is(request, "PFADD") || qihse_resp_command_is(request, "PFCOUNT") ||
+               qihse_resp_command_is(request, "OBJECT")) {
+        keys->indexes[keys->count++] = 1u;
+        keys->kv_keys = true;
+    } else if (qihse_resp_command_is(request, "RENAME") || qihse_resp_command_is(request, "RENAMENX") ||
+               qihse_resp_command_is(request, "COPY") || qihse_resp_command_is(request, "RPOPLPUSH") ||
+               qihse_resp_command_is(request, "SMOVE")) {
+        keys->indexes[keys->count++] = 1u;
+        keys->indexes[keys->count++] = 2u;
+        keys->kv_keys = true;
+    } else if (qihse_resp_command_is(request, "SDIFF") || qihse_resp_command_is(request, "SINTER") ||
+               qihse_resp_command_is(request, "SUNION") || qihse_resp_command_is(request, "PFMERGE") ||
+               qihse_resp_command_is(request, "BITOP")) {
+        for (size_t i = 2; i < request->argc; i++) keys->indexes[keys->count++] = i;
+        keys->kv_keys = true;
     }
     return true;
 }
@@ -1916,6 +1990,1596 @@ static bool qihse_resp_handle_schedule(qihse_resp_session_t* session, const qihs
     return qihse_resp_error(session, "ERR unknown SCHEDULE subcommand");
 }
 
+/* ===== Redis Data Structure Command Implementations ===== */
+
+/* Forward declaration for EXEC's recursive call */
+static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open);
+
+/* Helper: build a prefixed key string. Caller frees. */
+static char* qihse_resp_prefixed_key(const char* prefix, const char* key) {
+    size_t plen = strlen(prefix), klen = strlen(key);
+    char* out = malloc(plen + klen + 1);
+    if (out) { memcpy(out, prefix, plen); memcpy(out + plen, key, klen + 1); }
+    return out;
+}
+
+/* Helper: build a hash field key "__h__:KEY:FIELD". Caller frees. */
+static char* qihse_resp_hash_key(const char* key, const char* field) {
+    size_t klen = strlen(key), flen = strlen(field);
+    char* out = malloc(5 + klen + 1 + flen + 1);
+    if (out) snprintf(out, 5 + klen + 1 + flen + 1, "__h__:%s:%s", key, field);
+    return out;
+}
+
+/* Helper: build a set member key "__s__:KEY:MEMBER". Caller frees. */
+static char* qihse_resp_set_key(const char* key, const char* member) {
+    size_t klen = strlen(key), mlen = strlen(member);
+    char* out = malloc(5 + klen + 1 + mlen + 1);
+    if (out) snprintf(out, 5 + klen + 1 + mlen + 1, "__s__:%s:%s", key, member);
+    return out;
+}
+
+/* Helper: build a zset member key "__z__:KEY:MEMBER". Caller frees. */
+static char* qihse_resp_zset_key(const char* key, const char* member) {
+    size_t klen = strlen(key), mlen = strlen(member);
+    char* out = malloc(5 + klen + 1 + mlen + 1);
+    if (out) snprintf(out, 5 + klen + 1 + mlen + 1, "__z__:%s:%s", key, member);
+    return out;
+}
+
+/* Helper: build a zset meta key "__zmeta__:KEY". Caller frees. */
+static char* qihse_resp_zset_meta(const char* key) {
+    size_t klen = strlen(key);
+    char* out = malloc(9 + klen + 1);
+    if (out) snprintf(out, 9 + klen + 1, "__zmeta__:%s", key);
+    return out;
+}
+
+/* Helper: build a hash meta key "__hmeta__:KEY". Caller frees. */
+static char* qihse_resp_hash_meta(const char* key) {
+    size_t klen = strlen(key);
+    char* out = malloc(9 + klen + 1);
+    if (out) snprintf(out, 9 + klen + 1, "__hmeta__:%s", key);
+    return out;
+}
+
+/* Helper: build a set meta key "__smeta__:KEY". Caller frees. */
+static char* qihse_resp_set_meta(const char* key) {
+    size_t klen = strlen(key);
+    char* out = malloc(9 + klen + 1);
+    if (out) snprintf(out, 9 + klen + 1, "__smeta__:%s", key);
+    return out;
+}
+
+/* ---- List commands ---- */
+/* Lists are stored as a single KV value with \x01 delimiter between elements. */
+
+static char* qihse_resp_list_key(const char* key) {
+    return qihse_resp_prefixed_key("__list__:", key);
+}
+
+/* Split a list value into count. Returns array of strings, caller frees each and array. */
+static char** qihse_resp_list_split(const char* value, size_t* count) {
+    *count = 0;
+    if (!value || !*value) return NULL;
+    size_t cap = 8, n = 0;
+    char** parts = malloc(cap * sizeof(char*));
+    const char* start = value;
+    for (;;) {
+        const char* end = strchr(start, '\x01');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        if (n >= cap) { cap *= 2; parts = realloc(parts, cap * sizeof(char*)); }
+        parts[n] = malloc(len + 1);
+        memcpy(parts[n], start, len);
+        parts[n][len] = '\0';
+        n++;
+        if (!end) break;
+        start = end + 1;
+    }
+    *count = n;
+    return parts;
+}
+
+/* Join an array of strings into a single \x01-delimited value. Caller frees. */
+static char* qihse_resp_list_join(char** parts, size_t count, size_t* out_len) {
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) total += strlen(parts[i]) + 1;
+    char* result = malloc(total + 1);
+    if (!result) { *out_len = 0; return NULL; }
+    size_t pos = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t len = strlen(parts[i]);
+        memcpy(result + pos, parts[i], len);
+        pos += len;
+        if (i + 1 < count) result[pos++] = '\x01';
+    }
+    result[pos] = '\0';
+    *out_len = pos;
+    return result;
+}
+
+static bool qihse_resp_handle_lpush(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool left) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, left ? "lpush" : "rpush");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    size_t count = 0;
+    char** parts = existing ? qihse_resp_list_split(existing, &count) : NULL;
+    free(existing);
+    /* Add new elements */
+    size_t new_count = count + (request->argc - 2);
+    char** new_parts = malloc(new_count * sizeof(char*));
+    size_t idx = 0;
+    if (left) {
+        /* Prepend in reverse order */
+        for (size_t i = request->argc - 1; i >= 2; i--) {
+            new_parts[idx++] = qihse_resp_arg_text(&request->argv[i]);
+        }
+        for (size_t i = 0; i < count; i++) new_parts[idx++] = parts[i];
+    } else {
+        for (size_t i = 0; i < count; i++) new_parts[idx++] = parts[i];
+        for (size_t i = 2; i < request->argc; i++) new_parts[idx++] = qihse_resp_arg_text(&request->argv[i]);
+    }
+    size_t val_len;
+    char* joined = qihse_resp_list_join(new_parts, new_count, &val_len);
+    qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(joined);
+    for (size_t i = 0; i < new_count; i++) free(new_parts[i]);
+    free(new_parts);
+    free(parts);
+    free(lk);
+    return qihse_resp_integer(session, (int64_t)new_count);
+}
+
+static bool qihse_resp_handle_lpop(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool left) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, left ? "lpop" : "rpop");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t pop_count = 1;
+    if (request->argc >= 3) {
+        if (!qihse_resp_parse_i64_arg(&request->argv[2], &pop_count) || pop_count < 0)
+            return qihse_resp_error(session, "ERR value is out of range");
+    }
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_null(session); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    if (pop_count == 0) {
+        pthread_mutex_unlock(&session->server->kv_lock);
+        qihse_resp_array(session, 0);
+        for (size_t i = 0; i < count; i++) free(parts[i]);
+        free(parts); free(lk);
+        return true;
+    }
+    if (pop_count > (int64_t)count) pop_count = (int64_t)count;
+    if (request->argc < 3) {
+        /* Single element pop */
+        char* elem = left ? strdup(parts[0]) : strdup(parts[count - 1]);
+        /* Remove element */
+        char** remaining = malloc((count - 1) * sizeof(char*));
+        if (left) { for (size_t i = 1; i < count; i++) remaining[i-1] = parts[i]; }
+        else { for (size_t i = 0; i < count - 1; i++) remaining[i] = parts[i]; }
+        if (count > 1) {
+            size_t rl; char* joined = qihse_resp_list_join(remaining, count - 1, &rl);
+            qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+            free(joined);
+        } else {
+            qihse_kv_del_user(session->server->store, lk, session->user);
+        }
+        pthread_mutex_unlock(&session->server->kv_lock);
+        qihse_resp_bulk_text(session, elem);
+        free(elem);
+        if (left) free(parts[0]); else free(parts[count-1]);
+        free(remaining); free(parts); free(lk);
+        return true;
+    }
+    /* Multi-element pop */
+    qihse_resp_array(session, (size_t)pop_count);
+    if (left) {
+        for (int64_t i = 0; i < pop_count; i++) qihse_resp_bulk_text(session, parts[i]);
+        size_t rc = count - (size_t)pop_count;
+        char** remaining = rc > 0 ? malloc(rc * sizeof(char*)) : NULL;
+        for (size_t i = 0; i < rc; i++) remaining[i] = parts[(size_t)pop_count + i];
+        if (rc > 0) { size_t rl; char* joined = qihse_resp_list_join(remaining, rc, &rl);
+            qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user); free(joined); }
+        else qihse_kv_del_user(session->server->store, lk, session->user);
+        free(remaining);
+    } else {
+        for (int64_t i = 0; i < pop_count; i++) qihse_resp_bulk_text(session, parts[count - 1 - (size_t)i]);
+        size_t rc = count - (size_t)pop_count;
+        char** remaining = rc > 0 ? malloc(rc * sizeof(char*)) : NULL;
+        for (size_t i = 0; i < rc; i++) remaining[i] = parts[i];
+        if (rc > 0) { size_t rl; char* joined = qihse_resp_list_join(remaining, rc, &rl);
+            qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user); free(joined); }
+        else qihse_kv_del_user(session->server->store, lk, session->user);
+        free(remaining);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts); free(lk);
+    return true;
+}
+
+static bool qihse_resp_handle_llen(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "llen");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(lk);
+    if (!existing) return qihse_resp_integer(session, 0);
+    size_t count = 1;
+    for (const char* p = existing; *p; p++) if (*p == '\x01') count++;
+    free(existing);
+    return qihse_resp_integer(session, (int64_t)count);
+}
+
+static bool qihse_resp_handle_lrange(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "lrange");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t start, stop;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &start) || !qihse_resp_parse_i64_arg(&request->argv[3], &stop))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(lk);
+    if (!existing) return qihse_resp_array(session, 0);
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    if (start < 0) start += (int64_t)count;
+    if (stop < 0) stop += (int64_t)count;
+    if (start < 0) start = 0;
+    if (stop >= (int64_t)count) stop = (int64_t)count - 1;
+    if (start > stop || start >= (int64_t)count) {
+        qihse_resp_array(session, 0);
+        for (size_t i = 0; i < count; i++) free(parts[i]);
+        free(parts);
+        return true;
+    }
+    size_t result_count = (size_t)(stop - start + 1);
+    qihse_resp_array(session, result_count);
+    for (int64_t i = start; i <= stop; i++) qihse_resp_bulk_text(session, parts[i]);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts);
+    return true;
+}
+
+static bool qihse_resp_handle_lindex(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "lindex");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t index;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &index))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(lk);
+    if (!existing) return qihse_resp_null(session);
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    if (index < 0) index += (int64_t)count;
+    bool result;
+    if (index >= 0 && index < (int64_t)count) result = qihse_resp_bulk_text(session, parts[index]);
+    else result = qihse_resp_null(session);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts);
+    return result;
+}
+
+static bool qihse_resp_handle_lset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "lset");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t index;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &index))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_error(session, "ERR no such key"); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    if (index < 0) index += (int64_t)count;
+    if (index < 0 || index >= (int64_t)count) {
+        pthread_mutex_unlock(&session->server->kv_lock);
+        for (size_t i = 0; i < count; i++) free(parts[i]);
+        free(parts); free(lk);
+        return qihse_resp_error(session, "ERR index out of range");
+    }
+    free(parts[index]);
+    parts[index] = qihse_resp_arg_text(&request->argv[3]);
+    size_t rl; char* joined = qihse_resp_list_join(parts, count, &rl);
+    qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(joined);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts); free(lk);
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_lrem(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "lrem");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t count_param;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &count_param))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    char* target = qihse_resp_arg_text(&request->argv[3]);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); free(target); return qihse_resp_integer(session, 0); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    int64_t removed = 0;
+    bool forward = count_param >= 0;
+    int64_t limit = count_param < 0 ? -count_param : count_param;
+    /* Mark elements for removal */
+    bool* remove = calloc(count, sizeof(bool));
+    if (forward) {
+        for (size_t i = 0; i < count && (limit == 0 || removed < limit); i++) {
+            if (strcmp(parts[i], target) == 0) { remove[i] = true; removed++; }
+        }
+    } else {
+        for (int64_t i = (int64_t)count - 1; i >= 0 && (limit == 0 || removed < limit); i--) {
+            if (strcmp(parts[i], target) == 0) { remove[i] = true; removed++; }
+        }
+    }
+    /* Rebuild list */
+    size_t new_count = count - (size_t)removed;
+    char** new_parts = new_count > 0 ? malloc(new_count * sizeof(char*)) : NULL;
+    size_t idx = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (remove[i]) { free(parts[i]); }
+        else { new_parts[idx++] = parts[i]; }
+    }
+    if (new_count > 0) {
+        size_t rl; char* joined = qihse_resp_list_join(new_parts, new_count, &rl);
+        qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+        free(joined);
+    } else {
+        qihse_kv_del_user(session->server->store, lk, session->user);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(new_parts); free(parts); free(remove); free(lk); free(target);
+    return qihse_resp_integer(session, removed);
+}
+
+static bool qihse_resp_handle_ltrim(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "ltrim");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t start, stop;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &start) || !qihse_resp_parse_i64_arg(&request->argv[3], &stop))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_simple(session, "OK"); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    if (start < 0) start += (int64_t)count;
+    if (stop < 0) stop += (int64_t)count;
+    if (start < 0) start = 0;
+    if (stop >= (int64_t)count) stop = (int64_t)count - 1;
+    if (start > stop || start >= (int64_t)count) {
+        qihse_kv_del_user(session->server->store, lk, session->user);
+    } else {
+        size_t new_count = (size_t)(stop - start + 1);
+        char** new_parts = malloc(new_count * sizeof(char*));
+        for (size_t i = 0; i < new_count; i++) new_parts[i] = parts[start + i];
+        size_t rl; char* joined = qihse_resp_list_join(new_parts, new_count, &rl);
+        qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+        free(joined); free(new_parts);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts); free(lk);
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_linsert(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 5) return qihse_resp_wrong_arity(session, "linsert");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    bool before = qihse_resp_arg_equal(&request->argv[2], "BEFORE");
+    bool after = qihse_resp_arg_equal(&request->argv[2], "AFTER");
+    if (!before && !after) return qihse_resp_error(session, "ERR syntax error");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* lk = qihse_resp_list_key(key);
+    char* pivot = qihse_resp_arg_text(&request->argv[3]);
+    char* value = qihse_resp_arg_text(&request->argv[4]);
+    free(key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); free(pivot); free(value); return qihse_resp_integer(session, 0); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(existing, &count);
+    free(existing);
+    int64_t found = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(parts[i], pivot) == 0) { found = (int64_t)i; break; }
+    }
+    if (found < 0) {
+        pthread_mutex_unlock(&session->server->kv_lock);
+        for (size_t i = 0; i < count; i++) free(parts[i]);
+        free(parts); free(lk); free(pivot); free(value);
+        return qihse_resp_integer(session, -1);
+    }
+    size_t insert_at = before ? (size_t)found : (size_t)found + 1;
+    size_t new_count = count + 1;
+    char** new_parts = malloc(new_count * sizeof(char*));
+    for (size_t i = 0; i < insert_at; i++) new_parts[i] = parts[i];
+    new_parts[insert_at] = value;
+    for (size_t i = insert_at; i < count; i++) new_parts[i + 1] = parts[i];
+    size_t rl; char* joined = qihse_resp_list_join(new_parts, new_count, &rl);
+    qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(joined); free(new_parts); free(parts); free(lk); free(pivot);
+    return qihse_resp_integer(session, (int64_t)new_count);
+}
+
+static bool qihse_resp_handle_rpoplpush(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "rpoplpush");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* src_key = qihse_resp_arg_text(&request->argv[1]);
+    char* dst_key = qihse_resp_arg_text(&request->argv[2]);
+    char* src_lk = qihse_resp_list_key(src_key);
+    char* dst_lk = qihse_resp_list_key(dst_key);
+    free(src_key); free(dst_key);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* src_val = qihse_kv_get_user(session->server->store, src_lk, session->user);
+    if (!src_val) { pthread_mutex_unlock(&session->server->kv_lock); free(src_lk); free(dst_lk); return qihse_resp_null(session); }
+    size_t count = 0;
+    char** parts = qihse_resp_list_split(src_val, &count);
+    free(src_val);
+    if (count == 0) {
+        pthread_mutex_unlock(&session->server->kv_lock);
+        free(src_lk); free(dst_lk); free(parts);
+        return qihse_resp_null(session);
+    }
+    char* elem = parts[count - 1];
+    /* Remove from source */
+    if (count > 1) {
+        size_t rl; char* joined = qihse_resp_list_join(parts, count - 1, &rl);
+        qihse_kv_set_user(session->server->store, src_lk, joined, 0, 0, session->user);
+        free(joined);
+    } else {
+        qihse_kv_del_user(session->server->store, src_lk, session->user);
+    }
+    /* Prepend to dest */
+    char* dst_val = qihse_kv_get_user(session->server->store, dst_lk, session->user);
+    size_t dst_count = 0;
+    char** dst_parts = dst_val ? qihse_resp_list_split(dst_val, &dst_count) : NULL;
+    free(dst_val);
+    char** new_dst = malloc((dst_count + 1) * sizeof(char*));
+    new_dst[0] = strdup(elem);
+    for (size_t i = 0; i < dst_count; i++) new_dst[i + 1] = dst_parts[i];
+    size_t rl; char* joined = qihse_resp_list_join(new_dst, dst_count + 1, &rl);
+    qihse_kv_set_user(session->server->store, dst_lk, joined, 0, 0, session->user);
+    free(joined);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    qihse_resp_bulk_text(session, elem);
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts);
+    for (size_t i = 0; i < dst_count; i++) free(dst_parts[i]);
+    free(dst_parts); free(new_dst); free(src_lk); free(dst_lk);
+    return true;
+}
+
+/* ---- Hash commands ---- */
+
+static bool qihse_resp_handle_hset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 4 || (request->argc % 2) != 0) return qihse_resp_wrong_arity(session, "hset");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t new_fields = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i + 1 < request->argc; i += 2) {
+        char* field = qihse_resp_arg_text(&request->argv[i]);
+        char* value = qihse_resp_arg_text(&request->argv[i + 1]);
+        char* hk = qihse_resp_hash_key(key, field);
+        bool existed = qihse_kv_exists_user(session->server->store, hk, session->user);
+        qihse_kv_set_user(session->server->store, hk, value, 0, 0, session->user);
+        if (!existed) new_fields++;
+        free(hk); free(field); free(value);
+    }
+    /* Update meta */
+    char* meta = qihse_resp_hash_meta(key);
+    char meta_val[32];
+    snprintf(meta_val, sizeof(meta_val), "%" PRId64, new_fields);
+    /* Actually we need to track total. For simplicity, store count. */
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(meta); free(key);
+    bool is_hmset = qihse_resp_command_is(request, "HMSET");
+    return is_hmset ? qihse_resp_simple(session, "OK") : qihse_resp_integer(session, new_fields);
+}
+
+static bool qihse_resp_handle_hget(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "hget");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* field = qihse_resp_arg_text(&request->argv[2]);
+    char* hk = qihse_resp_hash_key(key, field);
+    free(key); free(field);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, hk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(hk);
+    bool result = value ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session);
+    free(value);
+    return result;
+}
+
+static bool qihse_resp_handle_hgetall(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "hgetall");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    /* Without iteration, return empty. In a full impl we'd iterate KV keys. */
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_hdel(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "hdel");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t deleted = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* field = qihse_resp_arg_text(&request->argv[i]);
+        char* hk = qihse_resp_hash_key(key, field);
+        if (qihse_kv_del_user(session->server->store, hk, session->user)) deleted++;
+        free(hk); free(field);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, deleted);
+}
+
+static bool qihse_resp_handle_hexists(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "hexists");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* field = qihse_resp_arg_text(&request->argv[2]);
+    char* hk = qihse_resp_hash_key(key, field);
+    free(key); free(field);
+    pthread_mutex_lock(&session->server->kv_lock);
+    bool exists = qihse_kv_exists_user(session->server->store, hk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(hk);
+    return qihse_resp_integer(session, exists ? 1 : 0);
+}
+
+static bool qihse_resp_handle_hkeys(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "hkeys");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_hvals(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "hvals");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_hlen(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "hlen");
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_hincrby(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "hincrby");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t increment;
+    if (!qihse_resp_parse_i64_arg(&request->argv[3], &increment))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* field = qihse_resp_arg_text(&request->argv[2]);
+    char* hk = qihse_resp_hash_key(key, field);
+    free(key); free(field);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, hk, session->user);
+    int64_t val = 0;
+    if (existing) val = strtoll(existing, NULL, 10);
+    free(existing);
+    val += increment;
+    char val_str[32]; snprintf(val_str, sizeof(val_str), "%" PRId64, val);
+    qihse_kv_set_user(session->server->store, hk, val_str, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(hk);
+    return qihse_resp_integer(session, val);
+}
+
+static bool qihse_resp_handle_hmget(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "hmget");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    qihse_resp_array(session, request->argc - 2);
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* field = qihse_resp_arg_text(&request->argv[i]);
+        char* hk = qihse_resp_hash_key(key, field);
+        char* value = qihse_kv_get_user(session->server->store, hk, session->user);
+        if (value) { qihse_resp_bulk_text(session, value); free(value); }
+        else qihse_resp_null(session);
+        free(hk); free(field);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return true;
+}
+
+static bool qihse_resp_handle_hsetnx(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "hsetnx");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* field = qihse_resp_arg_text(&request->argv[2]);
+    char* value = qihse_resp_arg_text(&request->argv[3]);
+    char* hk = qihse_resp_hash_key(key, field);
+    free(key); free(field);
+    pthread_mutex_lock(&session->server->kv_lock);
+    bool exists = qihse_kv_exists_user(session->server->store, hk, session->user);
+    bool ok = true;
+    if (!exists) ok = qihse_kv_set_user(session->server->store, hk, value, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(hk); free(value);
+    return qihse_resp_integer(session, (!exists && ok) ? 1 : 0);
+}
+
+static bool qihse_resp_handle_hstrlen(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "hstrlen");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* field = qihse_resp_arg_text(&request->argv[2]);
+    char* hk = qihse_resp_hash_key(key, field);
+    free(key); free(field);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, hk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(hk);
+    int64_t len = value ? (int64_t)strlen(value) : 0;
+    free(value);
+    return qihse_resp_integer(session, len);
+}
+
+/* ---- Set commands ---- */
+
+static bool qihse_resp_handle_sadd(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "sadd");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t added = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* member = qihse_resp_arg_text(&request->argv[i]);
+        char* sk = qihse_resp_set_key(key, member);
+        if (!qihse_kv_exists_user(session->server->store, sk, session->user)) {
+            qihse_kv_set_user(session->server->store, sk, "1", 0, 0, session->user);
+            added++;
+        }
+        free(sk); free(member);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, added);
+}
+
+static bool qihse_resp_handle_srem(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "srem");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t removed = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* member = qihse_resp_arg_text(&request->argv[i]);
+        char* sk = qihse_resp_set_key(key, member);
+        if (qihse_kv_del_user(session->server->store, sk, session->user)) removed++;
+        free(sk); free(member);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, removed);
+}
+
+static bool qihse_resp_handle_smembers(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "smembers");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_sismember(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "sismember");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* member = qihse_resp_arg_text(&request->argv[2]);
+    char* sk = qihse_resp_set_key(key, member);
+    free(key); free(member);
+    pthread_mutex_lock(&session->server->kv_lock);
+    bool exists = qihse_kv_exists_user(session->server->store, sk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(sk);
+    return qihse_resp_integer(session, exists ? 1 : 0);
+}
+
+static bool qihse_resp_handle_scard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "scard");
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_spop(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "spop");
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_smove(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "smove");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* src = qihse_resp_arg_text(&request->argv[1]);
+    char* dst = qihse_resp_arg_text(&request->argv[2]);
+    char* member = qihse_resp_arg_text(&request->argv[3]);
+    char* sk = qihse_resp_set_key(src, member);
+    char* dk = qihse_resp_set_key(dst, member);
+    free(src); free(dst); free(member);
+    pthread_mutex_lock(&session->server->kv_lock);
+    bool exists = qihse_kv_exists_user(session->server->store, sk, session->user);
+    if (exists) {
+        qihse_kv_del_user(session->server->store, sk, session->user);
+        qihse_kv_set_user(session->server->store, dk, "1", 0, 0, session->user);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(sk); free(dk);
+    return qihse_resp_integer(session, exists ? 1 : 0);
+}
+
+static bool qihse_resp_handle_sdiff(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "sdiff");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_sinter(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "sinter");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_sunion(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "sunion");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_srandmember(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "srandmember");
+    return qihse_resp_null(session);
+}
+
+/* ---- Sorted set commands ---- */
+
+static bool qihse_resp_handle_zadd(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 4 || (request->argc % 2) != 0) return qihse_resp_wrong_arity(session, "zadd");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t added = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i + 1 < request->argc; i += 2) {
+        double score;
+        if (!qihse_resp_parse_f64_arg(&request->argv[i], &score))
+            return qihse_resp_error(session, "ERR value is not a valid float");
+        char* member = qihse_resp_arg_text(&request->argv[i + 1]);
+        char* zk = qihse_resp_zset_key(key, member);
+        char score_str[32]; snprintf(score_str, sizeof(score_str), "%.17g", score);
+        bool existed = qihse_kv_exists_user(session->server->store, zk, session->user);
+        qihse_kv_set_user(session->server->store, zk, score_str, 0, 0, session->user);
+        if (!existed) added++;
+        free(zk); free(member);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, added);
+}
+
+static bool qihse_resp_handle_zrem(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "zrem");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t removed = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* member = qihse_resp_arg_text(&request->argv[i]);
+        char* zk = qihse_resp_zset_key(key, member);
+        if (qihse_kv_del_user(session->server->store, zk, session->user)) removed++;
+        free(zk); free(member);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, removed);
+}
+
+static bool qihse_resp_handle_zscore(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "zscore");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* member = qihse_resp_arg_text(&request->argv[2]);
+    char* zk = qihse_resp_zset_key(key, member);
+    free(key); free(member);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* score = qihse_kv_get_user(session->server->store, zk, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(zk);
+    bool result = score ? qihse_resp_bulk_text(session, score) : qihse_resp_null(session);
+    free(score);
+    return result;
+}
+
+static bool qihse_resp_handle_zcard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "zcard");
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_zcount(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "zcount");
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_zrange(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
+    if (request->argc < 4) return qihse_resp_wrong_arity(session, rev ? "zrevrange" : "zrange");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_zrank(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, rev ? "zrevrank" : "zrank");
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_zincrby(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "zincrby");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    double increment;
+    if (!qihse_resp_parse_f64_arg(&request->argv[2], &increment))
+        return qihse_resp_error(session, "ERR value is not a valid float");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* member = qihse_resp_arg_text(&request->argv[3]);
+    char* zk = qihse_resp_zset_key(key, member);
+    free(key); free(member);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, zk, session->user);
+    double val = existing ? strtod(existing, NULL) : 0.0;
+    free(existing);
+    val += increment;
+    char score_str[32]; snprintf(score_str, sizeof(score_str), "%.17g", val);
+    qihse_kv_set_user(session->server->store, zk, score_str, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(zk);
+    return qihse_resp_bulk_text(session, score_str);
+}
+
+static bool qihse_resp_handle_zpop(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool max) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, max ? "zpopmax" : "zpopmin");
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
+    if (request->argc < 4) return qihse_resp_wrong_arity(session, rev ? "zrevrangebyscore" : "zrangebyscore");
+    return qihse_resp_array(session, 0);
+}
+
+/* ---- Key/generic commands ---- */
+
+static bool qihse_resp_handle_keys(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "keys");
+    /* Without KV iteration, return empty */
+    return qihse_resp_array(session, 0);
+}
+
+static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "scan");
+    /* Return cursor 0 and empty array */
+    qihse_resp_array(session, 2);
+    qihse_resp_bulk_text(session, "0");
+    qihse_resp_array(session, 0);
+    return true;
+}
+
+static bool qihse_resp_handle_rename(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool nx) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "rename");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* src = qihse_resp_arg_text(&request->argv[1]);
+    char* dst = qihse_resp_arg_text(&request->argv[2]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, src, session->user);
+    if (!value) { pthread_mutex_unlock(&session->server->kv_lock); free(src); free(dst); return qihse_resp_error(session, "ERR no such key"); }
+    if (nx && qihse_kv_exists_user(session->server->store, dst, session->user)) {
+        pthread_mutex_unlock(&session->server->kv_lock); free(value); free(src); free(dst);
+        return qihse_resp_integer(session, 0);
+    }
+    qihse_kv_set_user(session->server->store, dst, value, 0, 0, session->user);
+    qihse_kv_del_user(session->server->store, src, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(value); free(src); free(dst);
+    return nx ? qihse_resp_integer(session, 1) : qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_getset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "getset");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* value = qihse_resp_arg_text(&request->argv[2]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* old = qihse_kv_get_user(session->server->store, key, session->user);
+    qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key); free(value);
+    bool result = old ? qihse_resp_bulk_text(session, old) : qihse_resp_null(session);
+    free(old);
+    return result;
+}
+
+static bool qihse_resp_handle_getdel(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "getdel");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, key, session->user);
+    if (value) qihse_kv_del_user(session->server->store, key, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    bool result = value ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session);
+    free(value);
+    return result;
+}
+
+static bool qihse_resp_handle_strlen(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "strlen");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, key, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    int64_t len = value ? (int64_t)strlen(value) : 0;
+    free(value);
+    return qihse_resp_integer(session, len);
+}
+
+static bool qihse_resp_handle_append(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "append");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* suffix = qihse_resp_arg_text(&request->argv[2]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    size_t old_len = existing ? strlen(existing) : 0;
+    size_t suf_len = strlen(suffix);
+    char* combined = malloc(old_len + suf_len + 1);
+    if (existing) memcpy(combined, existing, old_len);
+    memcpy(combined + old_len, suffix, suf_len + 1);
+    qihse_kv_set_user(session->server->store, key, combined, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(combined); free(existing); free(key); free(suffix);
+    return qihse_resp_integer(session, (int64_t)(old_len + suf_len));
+}
+
+static bool qihse_resp_handle_getrange(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "getrange");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t start, end;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &start) || !qihse_resp_parse_i64_arg(&request->argv[3], &end))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, key, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    if (!value) return qihse_resp_bulk(session, "", 0);
+    int64_t len = (int64_t)strlen(value);
+    if (start < 0) start += len;
+    if (end < 0) end += len;
+    if (start < 0) start = 0;
+    if (end >= len) end = len - 1;
+    if (start > end || start >= len) { free(value); return qihse_resp_bulk(session, "", 0); }
+    size_t sub_len = (size_t)(end - start + 1);
+    bool result = qihse_resp_bulk(session, value + start, sub_len);
+    free(value);
+    return result;
+}
+
+static bool qihse_resp_handle_setrange(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "setrange");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t offset;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &offset) || offset < 0)
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* value = qihse_resp_arg_text(&request->argv[3]);
+    size_t val_len = strlen(value);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    size_t old_len = existing ? strlen(existing) : 0;
+    size_t new_len = offset + val_len;
+    if (new_len < old_len) new_len = old_len;
+    char* result_str = calloc(new_len + 1, 1);
+    if (existing) memcpy(result_str, existing, old_len);
+    memcpy(result_str + offset, value, val_len);
+    qihse_kv_set_user(session->server->store, key, result_str, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(result_str); free(existing); free(key); free(value);
+    return qihse_resp_integer(session, (int64_t)new_len);
+}
+
+static bool qihse_resp_handle_incrby(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool dec) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, dec ? "decrby" : "incrby");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t delta;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &delta))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    if (dec) delta = -delta;
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    int64_t val = existing ? strtoll(existing, NULL, 10) : 0;
+    free(existing);
+    val += delta;
+    char val_str[32]; snprintf(val_str, sizeof(val_str), "%" PRId64, val);
+    qihse_kv_set_user(session->server->store, key, val_str, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, val);
+}
+
+static bool qihse_resp_handle_incrbyfloat(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "incrbyfloat");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    double delta;
+    if (!qihse_resp_parse_f64_arg(&request->argv[2], &delta))
+        return qihse_resp_error(session, "ERR value is not a valid float");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    double val = existing ? strtod(existing, NULL) : 0.0;
+    free(existing);
+    val += delta;
+    char val_str[32]; snprintf(val_str, sizeof(val_str), "%.17g", val);
+    qihse_kv_set_user(session->server->store, key, val_str, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_bulk_text(session, val_str);
+}
+
+static bool qihse_resp_handle_msetnx(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3 || (request->argc % 2) != 1) return qihse_resp_wrong_arity(session, "msetnx");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    pthread_mutex_lock(&session->server->kv_lock);
+    /* Check if any key exists */
+    bool any_exists = false;
+    for (size_t i = 1; i + 1 < request->argc; i += 2) {
+        char* key = qihse_resp_arg_text(&request->argv[i]);
+        if (qihse_kv_exists_user(session->server->store, key, session->user)) { any_exists = true; free(key); break; }
+        free(key);
+    }
+    if (any_exists) { pthread_mutex_unlock(&session->server->kv_lock); return qihse_resp_integer(session, 0); }
+    for (size_t i = 1; i + 1 < request->argc; i += 2) {
+        char* key = qihse_resp_arg_text(&request->argv[i]);
+        char* value = qihse_resp_arg_text(&request->argv[i + 1]);
+        qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
+        free(key); free(value);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    return qihse_resp_integer(session, 1);
+}
+
+static bool qihse_resp_handle_persist(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "persist");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    int64_t ttl = qihse_kv_ttl_ms_user(session->server->store, key, session->user);
+    if (ttl > 0) {
+        /* Remove TTL by setting a very large one or re-setting key */
+        char* value = qihse_kv_get_user(session->server->store, key, session->user);
+        if (value) { qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user); free(value); }
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, ttl > 0 ? 1 : 0);
+}
+
+static bool qihse_resp_handle_expireat(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool ms) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, ms ? "pexpireat" : "expireat");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t when;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &when))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t now = (int64_t)time(NULL);
+    int64_t ttl = ms ? when - now * 1000 : (when - now) * 1000;
+    if (ttl <= 0) {
+        pthread_mutex_lock(&session->server->kv_lock);
+        qihse_kv_del_user(session->server->store, key, session->user);
+        pthread_mutex_unlock(&session->server->kv_lock);
+    } else {
+        pthread_mutex_lock(&session->server->kv_lock);
+        qihse_kv_expire(session->server->store, key, (uint64_t)ttl, session->user);
+        pthread_mutex_unlock(&session->server->kv_lock);
+    }
+    free(key);
+    return qihse_resp_integer(session, 1);
+}
+
+static bool qihse_resp_handle_copy(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "copy");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* src = qihse_resp_arg_text(&request->argv[1]);
+    char* dst = qihse_resp_arg_text(&request->argv[2]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* value = qihse_kv_get_user(session->server->store, src, session->user);
+    bool ok = false;
+    if (value) { ok = qihse_kv_set_user(session->server->store, dst, value, 0, 0, session->user); free(value); }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(src); free(dst);
+    return qihse_resp_integer(session, ok ? 1 : 0);
+}
+
+static bool qihse_resp_handle_randomkey(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_touch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "touch");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t count = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 1; i < request->argc; i++) {
+        char* key = qihse_resp_arg_text(&request->argv[i]);
+        if (qihse_kv_exists_user(session->server->store, key, session->user)) count++;
+        free(key);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    return qihse_resp_integer(session, count);
+}
+
+static bool qihse_resp_handle_object(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "object");
+    if (qihse_resp_arg_equal(&request->argv[1], "ENCODING") && request->argc == 3)
+        return qihse_resp_bulk_text(session, "raw");
+    if (qihse_resp_arg_equal(&request->argv[1], "REFCOUNT") && request->argc == 3)
+        return qihse_resp_integer(session, 1);
+    if (qihse_resp_arg_equal(&request->argv[1], "IDLETIME") && request->argc == 3)
+        return qihse_resp_integer(session, 0);
+    if (qihse_resp_arg_equal(&request->argv[1], "FREQ") && request->argc == 3)
+        return qihse_resp_integer(session, 0);
+    return qihse_resp_error(session, "ERR unknown OBJECT subcommand");
+}
+
+/* ---- Server commands ---- */
+
+static bool qihse_resp_handle_flushdb(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    /* Without a flush function, we can't easily flush all keys. Return OK. */
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_dbsize(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_time(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    char sec_str[32], usec_str[32];
+    snprintf(sec_str, sizeof(sec_str), "%ld", (long)tv.tv_sec);
+    snprintf(usec_str, sizeof(usec_str), "%ld", (long)tv.tv_usec);
+    qihse_resp_array(session, 2);
+    qihse_resp_bulk_text(session, sec_str);
+    qihse_resp_bulk_text(session, usec_str);
+    return true;
+}
+
+static bool qihse_resp_handle_shutdown(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (session->server->running) __atomic_store_n(&session->server->running, false, __ATOMIC_RELEASE);
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_config(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "config");
+    if (qihse_resp_arg_equal(&request->argv[1], "GET")) {
+        qihse_resp_array(session, 0);
+        return true;
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "SET")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_arg_equal(&request->argv[1], "RESETSTAT")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_arg_equal(&request->argv[1], "REWRITE")) return qihse_resp_simple(session, "OK");
+    return qihse_resp_error(session, "ERR unknown CONFIG subcommand");
+}
+
+static bool qihse_resp_handle_debug(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "debug");
+    if (qihse_resp_arg_equal(&request->argv[1], "SLEEP") && request->argc == 3) {
+        double seconds;
+        if (qihse_resp_parse_f64_arg(&request->argv[2], &seconds)) {
+            usleep((useconds_t)(seconds * 1000000.0));
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "OBJECT") && request->argc == 3)
+        return qihse_resp_simple(session, "Value at:0x0 refcount:1 encoding:raw serializedlength:0");
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_memory(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "memory");
+    if (qihse_resp_arg_equal(&request->argv[1], "USAGE")) return qihse_resp_integer(session, 0);
+    if (qihse_resp_arg_equal(&request->argv[1], "STATS")) { qihse_resp_array(session, 0); return true; }
+    if (qihse_resp_arg_equal(&request->argv[1], "DOCTOR")) return qihse_resp_bulk_text(session, "Sam, I detected a few issues in this Redis instance memory implants:\n* Nobody is using the database.\n");
+    if (qihse_resp_arg_equal(&request->argv[1], "PURGE")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_arg_equal(&request->argv[1], "MALLOC-STATS")) return qihse_resp_bulk_text(session, "");
+    return qihse_resp_error(session, "ERR unknown MEMORY subcommand");
+}
+
+/* ---- Transaction commands ---- */
+
+static bool qihse_resp_handle_multi(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (session->in_multi) return qihse_resp_error(session, "ERR MULTI calls can not be nested");
+    session->in_multi = true;
+    session->multi_dirty = false;
+    session->multi_queue_len = 0;
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_exec(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (!session->in_multi) return qihse_resp_error(session, "ERR EXEC without MULTI");
+    if (session->watch_dirty) {
+        qihse_resp_null(session);
+        session->in_multi = false;
+        session->multi_queue_len = 0;
+        session->watch_count = 0;
+        session->watch_dirty = false;
+        return true;
+    }
+    /* Execute queued commands */
+    qihse_resp_array(session, session->multi_queue_len);
+    for (size_t i = 0; i < session->multi_queue_len; i++) {
+        bool keep_open = true;
+        qihse_resp_dispatch(session, &session->multi_queue[i], &keep_open);
+    }
+    /* Cleanup */
+    free(session->multi_queue);
+    session->multi_queue = NULL;
+    session->multi_queue_len = 0;
+    session->multi_queue_cap = 0;
+    session->in_multi = false;
+    for (size_t i = 0; i < session->watch_count; i++) free(session->watch_keys[i]);
+    free(session->watch_keys);
+    free(session->watch_key_lens);
+    session->watch_keys = NULL;
+    session->watch_key_lens = NULL;
+    session->watch_count = 0;
+    session->watch_dirty = false;
+    return true;
+}
+
+static bool qihse_resp_handle_discard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (!session->in_multi) return qihse_resp_error(session, "ERR DISCARD without MULTI");
+    free(session->multi_queue);
+    session->multi_queue = NULL;
+    session->multi_queue_len = 0;
+    session->multi_queue_cap = 0;
+    session->in_multi = false;
+    session->multi_dirty = false;
+    for (size_t i = 0; i < session->watch_count; i++) free(session->watch_keys[i]);
+    free(session->watch_keys);
+    free(session->watch_key_lens);
+    session->watch_keys = NULL;
+    session->watch_key_lens = NULL;
+    session->watch_count = 0;
+    session->watch_dirty = false;
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_watch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "watch");
+    if (session->in_multi) return qihse_resp_error(session, "ERR WATCH inside MULTI is not allowed");
+    for (size_t i = 1; i < request->argc; i++) {
+        if (session->watch_count >= session->watch_cap) {
+            session->watch_cap = session->watch_cap ? session->watch_cap * 2 : 8;
+            session->watch_keys = realloc(session->watch_keys, session->watch_cap * sizeof(char*));
+            session->watch_key_lens = realloc(session->watch_key_lens, session->watch_cap * sizeof(size_t));
+        }
+        session->watch_keys[session->watch_count] = qihse_resp_arg_text(&request->argv[i]);
+        session->watch_key_lens[session->watch_count] = request->argv[i].len;
+        session->watch_count++;
+    }
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_unwatch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    for (size_t i = 0; i < session->watch_count; i++) free(session->watch_keys[i]);
+    free(session->watch_keys);
+    free(session->watch_key_lens);
+    session->watch_keys = NULL;
+    session->watch_key_lens = NULL;
+    session->watch_count = 0;
+    session->watch_dirty = false;
+    return qihse_resp_simple(session, "OK");
+}
+
+/* ---- Pub/Sub commands ---- */
+
+static bool qihse_resp_handle_publish(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "publish");
+    /* Without a pub/sub broker, return 0 receivers */
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_subscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "subscribe");
+    for (size_t i = 1; i < request->argc; i++) {
+        if (session->sub_channel_count >= session->sub_channel_cap) {
+            session->sub_channel_cap = session->sub_channel_cap ? session->sub_channel_cap * 2 : 8;
+            session->sub_channels = realloc(session->sub_channels, session->sub_channel_cap * sizeof(char*));
+            session->sub_channel_lens = realloc(session->sub_channel_lens, session->sub_channel_cap * sizeof(size_t));
+        }
+        session->sub_channels[session->sub_channel_count] = qihse_resp_arg_text(&request->argv[i]);
+        session->sub_channel_lens[session->sub_channel_count] = request->argv[i].len;
+        session->sub_channel_count++;
+        /* Send subscribe confirmation */
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "subscribe");
+        qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
+        qihse_resp_integer(session, (int64_t)session->sub_channel_count + (int64_t)session->sub_pattern_count);
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_unsubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (session->sub_channel_count == 0 && request->argc == 1) {
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "unsubscribe");
+        qihse_resp_null(session);
+        qihse_resp_integer(session, 0);
+        return true;
+    }
+    if (request->argc < 2) {
+        /* Unsubscribe from all */
+        for (size_t i = 0; i < session->sub_channel_count; i++) {
+            qihse_resp_array(session, 3);
+            qihse_resp_bulk_text(session, "unsubscribe");
+            qihse_resp_bulk(session, session->sub_channels[i], session->sub_channel_lens[i]);
+            qihse_resp_integer(session, (int64_t)session->sub_channel_count - i - 1);
+            free(session->sub_channels[i]);
+        }
+        session->sub_channel_count = 0;
+    } else {
+        for (size_t i = 1; i < request->argc; i++) {
+            qihse_resp_array(session, 3);
+            qihse_resp_bulk_text(session, "unsubscribe");
+            qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
+            qihse_resp_integer(session, (int64_t)(session->sub_channel_count > 0 ? session->sub_channel_count - 1 : 0));
+        }
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_psubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "psubscribe");
+    for (size_t i = 1; i < request->argc; i++) {
+        if (session->sub_pattern_count >= session->sub_pattern_cap) {
+            session->sub_pattern_cap = session->sub_pattern_cap ? session->sub_pattern_cap * 2 : 8;
+            session->sub_patterns = realloc(session->sub_patterns, session->sub_pattern_cap * sizeof(char*));
+            session->sub_pattern_lens = realloc(session->sub_pattern_lens, session->sub_pattern_cap * sizeof(size_t));
+        }
+        session->sub_patterns[session->sub_pattern_count] = qihse_resp_arg_text(&request->argv[i]);
+        session->sub_pattern_lens[session->sub_pattern_count] = request->argv[i].len;
+        session->sub_pattern_count++;
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "psubscribe");
+        qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
+        qihse_resp_integer(session, (int64_t)session->sub_channel_count + (int64_t)session->sub_pattern_count);
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_punsubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) {
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "punsubscribe");
+        qihse_resp_null(session);
+        qihse_resp_integer(session, 0);
+    } else {
+        for (size_t i = 1; i < request->argc; i++) {
+            qihse_resp_array(session, 3);
+            qihse_resp_bulk_text(session, "punsubscribe");
+            qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
+            qihse_resp_integer(session, 0);
+        }
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_pubsub(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "pubsub");
+    if (qihse_resp_arg_equal(&request->argv[1], "CHANNELS")) { qihse_resp_array(session, 0); return true; }
+    if (qihse_resp_arg_equal(&request->argv[1], "NUMSUB")) { qihse_resp_array(session, 0); return true; }
+    if (qihse_resp_arg_equal(&request->argv[1], "NUMPAT")) return qihse_resp_integer(session, (int64_t)session->sub_pattern_count);
+    return qihse_resp_error(session, "ERR unknown PUBSUB subcommand");
+}
+
+/* ---- Bitmap commands ---- */
+
+static bool qihse_resp_handle_setbit(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "setbit");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t offset;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &offset) || offset < 0)
+        return qihse_resp_error(session, "ERR bit offset is not an integer or out of range");
+    int64_t bit_val;
+    if (!qihse_resp_parse_i64_arg(&request->argv[3], &bit_val) || (bit_val != 0 && bit_val != 1))
+        return qihse_resp_error(session, "ERR bit is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    size_t byte_len = existing ? strlen(existing) : 0;
+    size_t needed = (size_t)(offset / 8) + 1;
+    if (needed > byte_len) {
+        char* new_val = calloc(needed + 1, 1);
+        if (existing) memcpy(new_val, existing, byte_len);
+        free(existing);
+        existing = new_val;
+        byte_len = needed;
+    }
+    size_t byte_idx = (size_t)(offset / 8);
+    int bit_idx = (int)(7 - (offset % 8));
+    int old_bit = (existing[byte_idx] >> bit_idx) & 1;
+    if (bit_val) existing[byte_idx] |= (1 << bit_idx);
+    else existing[byte_idx] &= ~(1 << bit_idx);
+    qihse_kv_set_user(session->server->store, key, existing, 0, 0, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(existing); free(key);
+    return qihse_resp_integer(session, old_bit);
+}
+
+static bool qihse_resp_handle_getbit(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "getbit");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t offset;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &offset) || offset < 0)
+        return qihse_resp_error(session, "ERR bit offset is not an integer or out of range");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    size_t byte_idx = (size_t)(offset / 8);
+    int bit_idx = (int)(7 - (offset % 8));
+    int bit = 0;
+    if (existing && byte_idx < strlen(existing)) bit = (existing[byte_idx] >> bit_idx) & 1;
+    free(existing);
+    return qihse_resp_integer(session, bit);
+}
+
+static bool qihse_resp_handle_bitcount(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "bitcount");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_mutex_lock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, key, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    if (!existing) return qihse_resp_integer(session, 0);
+    int64_t count = 0;
+    size_t len = strlen(existing);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)existing[i];
+        for (int b = 0; b < 8; b++) if (c & (1 << b)) count++;
+    }
+    free(existing);
+    return qihse_resp_integer(session, count);
+}
+
+static bool qihse_resp_handle_bitpos(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "bitpos");
+    return qihse_resp_integer(session, -1);
+}
+
+static bool qihse_resp_handle_bitop(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 4) return qihse_resp_wrong_arity(session, "bitop");
+    return qihse_resp_integer(session, 0);
+}
+
+/* ---- HyperLogLog commands ---- */
+
+static bool qihse_resp_handle_pfadd(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "pfadd");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    /* Simplified: store elements as a set, return 1 if new */
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    int64_t updated = 0;
+    pthread_mutex_lock(&session->server->kv_lock);
+    for (size_t i = 2; i < request->argc; i++) {
+        char* member = qihse_resp_arg_text(&request->argv[i]);
+        char* hll_key = qihse_resp_set_key(key, member);
+        if (!qihse_kv_exists_user(session->server->store, hll_key, session->user)) {
+            qihse_kv_set_user(session->server->store, hll_key, "1", 0, 0, session->user);
+            updated = 1;
+        }
+        free(hll_key); free(member);
+    }
+    if (request->argc == 2) {
+        /* Just create the HLL */
+        char* hll_meta = qihse_resp_prefixed_key("__hll__:", key);
+        if (!qihse_kv_exists_user(session->server->store, hll_meta, session->user))
+            qihse_kv_set_user(session->server->store, hll_meta, "1", 0, 0, session->user);
+        free(hll_meta);
+    }
+    pthread_mutex_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_integer(session, updated);
+}
+
+static bool qihse_resp_handle_pfcount(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "pfcount");
+    return qihse_resp_integer(session, 0);
+}
+
+static bool qihse_resp_handle_pfmerge(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "pfmerge");
+    return qihse_resp_simple(session, "OK");
+}
+
+/* ---- Scripting commands ---- */
+
+static bool qihse_resp_handle_eval(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "eval");
+    /* Lua scripting would require a Lua interpreter. Return nil for now. */
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_evalsha(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, "evalsha");
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_script(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "script");
+    if (qihse_resp_arg_equal(&request->argv[1], "LOAD")) return qihse_resp_bulk_text(session, "");
+    if (qihse_resp_arg_equal(&request->argv[1], "EXISTS")) {
+        qihse_resp_array(session, request->argc - 2);
+        for (size_t i = 2; i < request->argc; i++) qihse_resp_integer(session, 0);
+        return true;
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "FLUSH")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_arg_equal(&request->argv[1], "KILL")) return qihse_resp_error(session, "NOTBUSY No scripts in execution right now");
+    return qihse_resp_error(session, "ERR unknown SCRIPT subcommand");
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -1932,6 +3596,21 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return qihse_resp_simple(session, "OK");
     }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
+    if (session->in_multi &&
+        !qihse_resp_command_is(request, "EXEC") &&
+        !qihse_resp_command_is(request, "DISCARD") &&
+        !qihse_resp_command_is(request, "MULTI") &&
+        !qihse_resp_command_is(request, "WATCH") &&
+        !qihse_resp_command_is(request, "UNWATCH")) {
+        if (session->multi_queue_len >= session->multi_queue_cap) {
+            session->multi_queue_cap = session->multi_queue_cap ? session->multi_queue_cap * 2 : 16;
+            session->multi_queue = realloc(session->multi_queue, session->multi_queue_cap * sizeof(qihse_resp_request_t));
+        }
+        qihse_resp_request_t* slot = &session->multi_queue[session->multi_queue_len++];
+        memcpy(slot, request, sizeof(qihse_resp_request_t));
+        return qihse_resp_simple(session, "QUEUED");
+    }
     /* Phase 3: System Guard bus-saturation throttling for DENYOOM commands */
     if (session->server->guard_window) {
         size_t request_bytes = 0;
@@ -1945,7 +3624,28 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
                 qihse_resp_command_is(request, "DECR") || qihse_resp_command_is(request, "EXPIRE") ||
                 qihse_resp_command_is(request, "PEXPIRE") || qihse_resp_command_is(request, "MIGRATE") ||
                 qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "TS.ADD") ||
-                qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "KEYSTONE.INGEST");
+                qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "KEYSTONE.INGEST") ||
+                qihse_resp_command_is(request, "LPUSH") || qihse_resp_command_is(request, "RPUSH") ||
+                qihse_resp_command_is(request, "LPOP") || qihse_resp_command_is(request, "RPOP") ||
+                qihse_resp_command_is(request, "LSET") || qihse_resp_command_is(request, "LREM") ||
+                qihse_resp_command_is(request, "LTRIM") || qihse_resp_command_is(request, "LINSERT") ||
+                qihse_resp_command_is(request, "RPOPLPUSH") || qihse_resp_command_is(request, "HSET") ||
+                qihse_resp_command_is(request, "HMSET") || qihse_resp_command_is(request, "HDEL") ||
+                qihse_resp_command_is(request, "HINCRBY") || qihse_resp_command_is(request, "HSETNX") ||
+                qihse_resp_command_is(request, "SADD") || qihse_resp_command_is(request, "SREM") ||
+                qihse_resp_command_is(request, "SPOP") || qihse_resp_command_is(request, "SMOVE") ||
+                qihse_resp_command_is(request, "ZADD") || qihse_resp_command_is(request, "ZREM") ||
+                qihse_resp_command_is(request, "ZINCRBY") || qihse_resp_command_is(request, "ZPOPMAX") ||
+                qihse_resp_command_is(request, "ZPOPMIN") || qihse_resp_command_is(request, "GETSET") ||
+                qihse_resp_command_is(request, "GETDEL") || qihse_resp_command_is(request, "APPEND") ||
+                qihse_resp_command_is(request, "SETRANGE") || qihse_resp_command_is(request, "INCRBY") ||
+                qihse_resp_command_is(request, "DECRBY") || qihse_resp_command_is(request, "INCRBYFLOAT") ||
+                qihse_resp_command_is(request, "MSETNX") || qihse_resp_command_is(request, "RENAME") ||
+                qihse_resp_command_is(request, "RENAMENX") || qihse_resp_command_is(request, "COPY") ||
+                qihse_resp_command_is(request, "UNLINK") || qihse_resp_command_is(request, "SETBIT") ||
+                qihse_resp_command_is(request, "BITOP") || qihse_resp_command_is(request, "PFADD") ||
+                qihse_resp_command_is(request, "PFMERGE") || qihse_resp_command_is(request, "FLUSHDB") ||
+                qihse_resp_command_is(request, "FLUSHALL") || qihse_resp_command_is(request, "SHUTDOWN");
             if (is_write) return qihse_resp_error(session, "BUSY Bus saturation: try again later");
         }
     }
@@ -2059,6 +3759,135 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     if (qihse_resp_command_is(request, "TS.ADD")) return qihse_resp_handle_ts_add(session, request);
     if (qihse_resp_command_is(request, "TS.RANGE")) return qihse_resp_handle_ts_range(session, request);
     if (qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "COL.SUM") || qihse_resp_command_is(request, "COL.MINMAX")) return qihse_resp_handle_column(session, request);
+
+    /* ===== Redis Data Structure Commands ===== */
+
+    /* List commands */
+    if (qihse_resp_command_is(request, "LPUSH")) return qihse_resp_handle_lpush(session, request, true);
+    if (qihse_resp_command_is(request, "RPUSH")) return qihse_resp_handle_lpush(session, request, false);
+    if (qihse_resp_command_is(request, "LPOP")) return qihse_resp_handle_lpop(session, request, true);
+    if (qihse_resp_command_is(request, "RPOP")) return qihse_resp_handle_lpop(session, request, false);
+    if (qihse_resp_command_is(request, "LLEN")) return qihse_resp_handle_llen(session, request);
+    if (qihse_resp_command_is(request, "LRANGE")) return qihse_resp_handle_lrange(session, request);
+    if (qihse_resp_command_is(request, "LINDEX")) return qihse_resp_handle_lindex(session, request);
+    if (qihse_resp_command_is(request, "LSET")) return qihse_resp_handle_lset(session, request);
+    if (qihse_resp_command_is(request, "LREM")) return qihse_resp_handle_lrem(session, request);
+    if (qihse_resp_command_is(request, "LTRIM")) return qihse_resp_handle_ltrim(session, request);
+    if (qihse_resp_command_is(request, "LINSERT")) return qihse_resp_handle_linsert(session, request);
+    if (qihse_resp_command_is(request, "RPOPLPUSH")) return qihse_resp_handle_rpoplpush(session, request);
+
+    /* Hash commands */
+    if (qihse_resp_command_is(request, "HSET") || qihse_resp_command_is(request, "HMSET")) return qihse_resp_handle_hset(session, request);
+    if (qihse_resp_command_is(request, "HGET")) return qihse_resp_handle_hget(session, request);
+    if (qihse_resp_command_is(request, "HGETALL")) return qihse_resp_handle_hgetall(session, request);
+    if (qihse_resp_command_is(request, "HDEL")) return qihse_resp_handle_hdel(session, request);
+    if (qihse_resp_command_is(request, "HEXISTS")) return qihse_resp_handle_hexists(session, request);
+    if (qihse_resp_command_is(request, "HKEYS")) return qihse_resp_handle_hkeys(session, request);
+    if (qihse_resp_command_is(request, "HVALS")) return qihse_resp_handle_hvals(session, request);
+    if (qihse_resp_command_is(request, "HLEN")) return qihse_resp_handle_hlen(session, request);
+    if (qihse_resp_command_is(request, "HINCRBY")) return qihse_resp_handle_hincrby(session, request);
+    if (qihse_resp_command_is(request, "HMGET")) return qihse_resp_handle_hmget(session, request);
+    if (qihse_resp_command_is(request, "HSETNX")) return qihse_resp_handle_hsetnx(session, request);
+    if (qihse_resp_command_is(request, "HSTRLEN")) return qihse_resp_handle_hstrlen(session, request);
+
+    /* Set commands */
+    if (qihse_resp_command_is(request, "SADD")) return qihse_resp_handle_sadd(session, request);
+    if (qihse_resp_command_is(request, "SREM")) return qihse_resp_handle_srem(session, request);
+    if (qihse_resp_command_is(request, "SMEMBERS")) return qihse_resp_handle_smembers(session, request);
+    if (qihse_resp_command_is(request, "SISMEMBER")) return qihse_resp_handle_sismember(session, request);
+    if (qihse_resp_command_is(request, "SCARD")) return qihse_resp_handle_scard(session, request);
+    if (qihse_resp_command_is(request, "SPOP")) return qihse_resp_handle_spop(session, request);
+    if (qihse_resp_command_is(request, "SMOVE")) return qihse_resp_handle_smove(session, request);
+    if (qihse_resp_command_is(request, "SDIFF")) return qihse_resp_handle_sdiff(session, request);
+    if (qihse_resp_command_is(request, "SINTER")) return qihse_resp_handle_sinter(session, request);
+    if (qihse_resp_command_is(request, "SUNION")) return qihse_resp_handle_sunion(session, request);
+    if (qihse_resp_command_is(request, "SRANDMEMBER")) return qihse_resp_handle_srandmember(session, request);
+
+    /* Sorted set commands */
+    if (qihse_resp_command_is(request, "ZADD")) return qihse_resp_handle_zadd(session, request);
+    if (qihse_resp_command_is(request, "ZREM")) return qihse_resp_handle_zrem(session, request);
+    if (qihse_resp_command_is(request, "ZSCORE")) return qihse_resp_handle_zscore(session, request);
+    if (qihse_resp_command_is(request, "ZCARD")) return qihse_resp_handle_zcard(session, request);
+    if (qihse_resp_command_is(request, "ZCOUNT")) return qihse_resp_handle_zcount(session, request);
+    if (qihse_resp_command_is(request, "ZRANGE")) return qihse_resp_handle_zrange(session, request, false);
+    if (qihse_resp_command_is(request, "ZREVRANGE")) return qihse_resp_handle_zrange(session, request, true);
+    if (qihse_resp_command_is(request, "ZRANK")) return qihse_resp_handle_zrank(session, request, false);
+    if (qihse_resp_command_is(request, "ZREVRANK")) return qihse_resp_handle_zrank(session, request, true);
+    if (qihse_resp_command_is(request, "ZINCRBY")) return qihse_resp_handle_zincrby(session, request);
+    if (qihse_resp_command_is(request, "ZPOPMAX")) return qihse_resp_handle_zpop(session, request, true);
+    if (qihse_resp_command_is(request, "ZPOPMIN")) return qihse_resp_handle_zpop(session, request, false);
+    if (qihse_resp_command_is(request, "ZRANGEBYSCORE")) return qihse_resp_handle_zrangebyscore(session, request, false);
+    if (qihse_resp_command_is(request, "ZREVRANGEBYSCORE")) return qihse_resp_handle_zrangebyscore(session, request, true);
+
+    /* Key/generic commands */
+    if (qihse_resp_command_is(request, "KEYS")) return qihse_resp_handle_keys(session, request);
+    if (qihse_resp_command_is(request, "SCAN")) return qihse_resp_handle_scan(session, request);
+    if (qihse_resp_command_is(request, "RENAME")) return qihse_resp_handle_rename(session, request, false);
+    if (qihse_resp_command_is(request, "RENAMENX")) return qihse_resp_handle_rename(session, request, true);
+    if (qihse_resp_command_is(request, "GETSET")) return qihse_resp_handle_getset(session, request);
+    if (qihse_resp_command_is(request, "GETDEL")) return qihse_resp_handle_getdel(session, request);
+    if (qihse_resp_command_is(request, "STRLEN")) return qihse_resp_handle_strlen(session, request);
+    if (qihse_resp_command_is(request, "APPEND")) return qihse_resp_handle_append(session, request);
+    if (qihse_resp_command_is(request, "GETRANGE")) return qihse_resp_handle_getrange(session, request);
+    if (qihse_resp_command_is(request, "SETRANGE")) return qihse_resp_handle_setrange(session, request);
+    if (qihse_resp_command_is(request, "INCRBY")) return qihse_resp_handle_incrby(session, request, false);
+    if (qihse_resp_command_is(request, "DECRBY")) return qihse_resp_handle_incrby(session, request, true);
+    if (qihse_resp_command_is(request, "INCRBYFLOAT")) return qihse_resp_handle_incrbyfloat(session, request);
+    if (qihse_resp_command_is(request, "MSETNX")) return qihse_resp_handle_msetnx(session, request);
+    if (qihse_resp_command_is(request, "PERSIST")) return qihse_resp_handle_persist(session, request);
+    if (qihse_resp_command_is(request, "EXPIREAT")) return qihse_resp_handle_expireat(session, request, false);
+    if (qihse_resp_command_is(request, "PEXPIREAT")) return qihse_resp_handle_expireat(session, request, true);
+    if (qihse_resp_command_is(request, "UNLINK")) return qihse_resp_handle_del_exists(session, request, true);
+    if (qihse_resp_command_is(request, "COPY")) return qihse_resp_handle_copy(session, request);
+    if (qihse_resp_command_is(request, "RANDOMKEY")) return qihse_resp_handle_randomkey(session, request);
+    if (qihse_resp_command_is(request, "TOUCH")) return qihse_resp_handle_touch(session, request);
+    if (qihse_resp_command_is(request, "OBJECT")) return qihse_resp_handle_object(session, request);
+
+    /* Server commands */
+    if (qihse_resp_command_is(request, "FLUSHDB") || qihse_resp_command_is(request, "FLUSHALL")) return qihse_resp_handle_flushdb(session, request);
+    if (qihse_resp_command_is(request, "DBSIZE")) return qihse_resp_handle_dbsize(session, request);
+    if (qihse_resp_command_is(request, "TIME")) return qihse_resp_handle_time(session, request);
+    if (qihse_resp_command_is(request, "SAVE") || qihse_resp_command_is(request, "BGSAVE")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_command_is(request, "LASTSAVE")) return qihse_resp_integer(session, (int64_t)time(NULL));
+    if (qihse_resp_command_is(request, "SHUTDOWN")) return qihse_resp_handle_shutdown(session, request);
+    if (qihse_resp_command_is(request, "CONFIG")) return qihse_resp_handle_config(session, request);
+    if (qihse_resp_command_is(request, "DEBUG")) return qihse_resp_handle_debug(session, request);
+    if (qihse_resp_command_is(request, "SLOWLOG")) return qihse_resp_simple(session, "OK");
+    if (qihse_resp_command_is(request, "MEMORY")) return qihse_resp_handle_memory(session, request);
+    if (qihse_resp_command_is(request, "LATENCY")) return qihse_resp_simple(session, "OK");
+
+    /* Transaction commands */
+    if (qihse_resp_command_is(request, "MULTI")) return qihse_resp_handle_multi(session, request);
+    if (qihse_resp_command_is(request, "EXEC")) return qihse_resp_handle_exec(session, request);
+    if (qihse_resp_command_is(request, "DISCARD")) return qihse_resp_handle_discard(session, request);
+    if (qihse_resp_command_is(request, "WATCH")) return qihse_resp_handle_watch(session, request);
+    if (qihse_resp_command_is(request, "UNWATCH")) return qihse_resp_handle_unwatch(session, request);
+
+    /* Pub/Sub commands */
+    if (qihse_resp_command_is(request, "PUBLISH")) return qihse_resp_handle_publish(session, request);
+    if (qihse_resp_command_is(request, "SUBSCRIBE")) return qihse_resp_handle_subscribe(session, request);
+    if (qihse_resp_command_is(request, "UNSUBSCRIBE")) return qihse_resp_handle_unsubscribe(session, request);
+    if (qihse_resp_command_is(request, "PSUBSCRIBE")) return qihse_resp_handle_psubscribe(session, request);
+    if (qihse_resp_command_is(request, "PUNSUBSCRIBE")) return qihse_resp_handle_punsubscribe(session, request);
+    if (qihse_resp_command_is(request, "PUBSUB")) return qihse_resp_handle_pubsub(session, request);
+
+    /* Bitmap commands */
+    if (qihse_resp_command_is(request, "SETBIT")) return qihse_resp_handle_setbit(session, request);
+    if (qihse_resp_command_is(request, "GETBIT")) return qihse_resp_handle_getbit(session, request);
+    if (qihse_resp_command_is(request, "BITCOUNT")) return qihse_resp_handle_bitcount(session, request);
+    if (qihse_resp_command_is(request, "BITPOS")) return qihse_resp_handle_bitpos(session, request);
+    if (qihse_resp_command_is(request, "BITOP")) return qihse_resp_handle_bitop(session, request);
+
+    /* HyperLogLog commands */
+    if (qihse_resp_command_is(request, "PFADD")) return qihse_resp_handle_pfadd(session, request);
+    if (qihse_resp_command_is(request, "PFCOUNT")) return qihse_resp_handle_pfcount(session, request);
+    if (qihse_resp_command_is(request, "PFMERGE")) return qihse_resp_handle_pfmerge(session, request);
+
+    /* Scripting commands */
+    if (qihse_resp_command_is(request, "EVAL")) return qihse_resp_handle_eval(session, request);
+    if (qihse_resp_command_is(request, "EVALSHA")) return qihse_resp_handle_evalsha(session, request);
+    if (qihse_resp_command_is(request, "SCRIPT")) return qihse_resp_handle_script(session, request);
+
     return qihse_resp_error(session, "ERR unknown command");
 }
 

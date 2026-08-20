@@ -14,7 +14,8 @@ typedef enum {
     HTTP_POST = 1,
     HTTP_PUT = 2,
     HTTP_DELETE = 3,
-    HTTP_PATCH = 4
+    HTTP_PATCH = 4,
+    HTTP_HEAD = 5
 } http_method_t;
 
 typedef struct {
