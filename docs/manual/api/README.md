@@ -717,3 +717,285 @@ qihse_doc_result_t* qihse_doc_query_user(qihse_doc_store_t* store, const char* q
 ```
 
 For complete API documentation including all function signatures, parameter descriptions, return values, and usage examples, see the individual header files in the `include/` directories of each component.
+
+---
+
+## SQL Engine API
+
+### SQL Parser
+
+```c
+#include "qihse_sql_parser.h"
+
+// Parse SQL text into an AST
+qihse_sql_ast_t* qihse_parse_sql_to_ast(const char* sql);
+
+// Free the AST
+void qihse_sql_ast_free(qihse_sql_ast_t* ast);
+
+// Statement types: SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
+// JOIN types: INNER, LEFT, RIGHT, CROSS, FULL
+// Aggregates: SUM, COUNT, AVG, MIN, MAX, COUNT(*), DISTINCT
+// Set ops: UNION, INTERSECT, EXCEPT
+// Subqueries: scalar, IN, EXISTS, correlated
+// DDL: CREATE TABLE, ALTER TABLE, CREATE INDEX, DROP INDEX, DROP TABLE
+```
+
+### Join Executor
+
+```c
+#include "qihse_join_executor.h"
+
+// Row stream abstraction for pipelining
+typedef struct qihse_row_stream_s qihse_row_stream_t;
+
+// Hash join: build hash table from build stream, probe with probe stream
+qihse_row_stream_t* qihse_hash_join(qihse_row_stream_t* build,
+    qihse_row_stream_t* probe, int join_col_build, int join_col_probe);
+
+// Nested-loop join: iterate over both streams
+qihse_row_stream_t* qihse_nested_loop_join(qihse_row_stream_t* outer,
+    qihse_row_stream_t* inner, join_condition_fn cond);
+```
+
+### Aggregate Executor
+
+```c
+#include "qihse_aggregate_executor.h"
+
+// Hash-based aggregation
+qihse_row_stream_t* qihse_aggregate_execute(qihse_row_stream_t* input,
+    int* group_by_cols, size_t num_group_by,
+    qihse_agg_func_t* agg_funcs, size_t num_aggs,
+    qihse_condition_t* having, size_t num_having);
+```
+
+### Sort Executor
+
+```c
+#include "qihse_sort_executor.h"
+
+// In-memory sort with optional spill-to-disk
+qihse_row_stream_t* qihse_sort_execute(qihse_row_stream_t* input,
+    int* sort_cols, size_t num_sort_cols,
+    bool* ascending, size_t spill_threshold_bytes);
+```
+
+### Schema Registry
+
+```c
+#include "qihse_schema.h"
+
+qihse_schema_t* qihse_schema_create(void);
+
+int qihse_schema_create_table(qihse_schema_t* s, const char* name,
+    qihse_column_def_t* cols, size_t num_cols);
+int qihse_schema_drop_table(qihse_schema_t* s, const char* name);
+int qihse_schema_alter_table_add_column(qihse_schema_t* s, const char* table,
+    qihse_column_def_t col);
+int qihse_schema_alter_table_drop_column(qihse_schema_t* s, const char* table,
+    const char* col_name);
+int qihse_schema_alter_table_rename_column(qihse_schema_t* s, const char* table,
+    const char* old_name, const char* new_name);
+int qihse_schema_create_index(qihse_schema_t* s, const char* name,
+    const char* table, const char** cols, size_t num_cols,
+    qihse_index_type_t type);
+int qihse_schema_drop_index(qihse_schema_t* s, const char* name);
+
+qihse_table_def_t* qihse_schema_get_table(qihse_schema_t* s, const char* name);
+qihse_index_def_t* qihse_schema_get_index(qihse_schema_t* s, const char* name);
+```
+
+### Cost-Based Optimizer
+
+```c
+#include "qihse_optimizer.h"
+
+qihse_optimizer_t* qihse_optimizer_create(void);
+
+// Collect statistics
+int qihse_optimizer_update_stats(qihse_optimizer_t* opt, const char* table,
+    const char* column, qihse_column_stats_t* stats);
+
+// Build an execution plan from an AST
+qihse_plan_node_t* qihse_optimizer_build_plan(qihse_optimizer_t* opt,
+    qihse_schema_t* schema, qihse_sql_ast_t* ast);
+
+// Plan node types: SEQ_SCAN, INDEX_SCAN, HASH_JOIN, NESTED_LOOP_JOIN,
+//                  AGGREGATE, SORT, LIMIT
+```
+
+---
+
+## Transaction & MVCC API
+
+### Transaction Manager
+
+```c
+#include "qihse_txn.h"
+
+qihse_txn_manager_t* qihse_txn_manager_create(void);
+
+qihse_txn_t* qihse_txn_begin(qihse_txn_manager_t* mgr,
+    qihse_isolation_level_t level);
+// Isolation levels: READ_COMMITTED, REPEATABLE_READ, SERIALIZABLE
+
+int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+int qihse_txn_rollback(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+
+int qihse_txn_savepoint(qihse_txn_t* txn, const char* name);
+int qihse_txn_rollback_to_savepoint(qihse_txn_t* txn, const char* name);
+
+// 2PC
+int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
+    qihse_txn_participant_t* participant);
+int qihse_txn_prepare(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+int qihse_txn_abort_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+```
+
+### MVCC Version Store
+
+```c
+#include "qihse_mvcc.h"
+
+qihse_mvcc_store_t* qihse_mvcc_create(void);
+
+int qihse_mvcc_insert(qihse_mvcc_store_t* store, uint8_t engine_id,
+    const void* key, size_t key_len,
+    const void* value, size_t value_len, uint64_t txn_id);
+int qihse_mvcc_update(qihse_mvcc_store_t* store, uint8_t engine_id,
+    const void* key, size_t key_len,
+    const void* new_value, size_t new_value_len, uint64_t txn_id);
+int qihse_mvcc_delete(qihse_mvcc_store_t* store, uint8_t engine_id,
+    const void* key, size_t key_len, uint64_t txn_id);
+qihse_mvcc_version_t* qihse_mvcc_read(qihse_mvcc_store_t* store, uint8_t engine_id,
+    const void* key, size_t key_len, uint64_t snapshot);
+
+size_t qihse_mvcc_vacuum(qihse_mvcc_store_t* store, uint64_t min_active_snapshot);
+```
+
+### Unified WAL
+
+```c
+#include "qihse_wal.h"
+
+qihse_wal_t* qihse_wal_create(const char* directory, size_t segment_size,
+    qihse_wal_durability_t durability);
+// Durability: NONE, FDATASYNC, GROUP_COMMIT
+
+uint64_t qihse_wal_append(qihse_wal_t* wal, uint64_t txn_id,
+    uint8_t engine_id, uint8_t op_type,
+    const void* key, size_t key_len,
+    const void* value, size_t value_len);
+
+uint64_t qihse_wal_append_begin(qihse_wal_t* wal, uint64_t txn_id);
+uint64_t qihse_wal_append_commit(qihse_wal_t* wal, uint64_t txn_id);
+uint64_t qihse_wal_append_abort(qihse_wal_t* wal, uint64_t txn_id);
+uint64_t qihse_wal_append_checkpoint(qihse_wal_t* wal, uint64_t lsn);
+
+int qihse_wal_replay(qihse_wal_t* wal, qihse_wal_replay_cb cb, void* ctx);
+int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t lsn);
+```
+
+### Crash Recovery
+
+```c
+#include "qihse_recovery.h"
+
+qihse_recovery_ctx_t* qihse_recovery_create(qihse_wal_t* wal,
+    qihse_mvcc_store_t* mvcc, qihse_txn_manager_t* txn_mgr);
+
+int qihse_recovery_run(qihse_recovery_ctx_t* ctx);
+// Runs analysis -> redo -> undo phases
+
+int qihse_recovery_checkpoint(qihse_recovery_ctx_t* ctx,
+    qihse_checkpoint_flush_cb flush, uint64_t* out_lsn);
+```
+
+---
+
+## Secondary Index API
+
+### B+ Tree Index
+
+```c
+#include "qihse_btree.h"
+
+qihse_btree_t* qihse_btree_create(qihse_btree_key_type_t key_type, int fanout);
+// Key types: INT32, INT64, FLOAT64, STRING
+
+int qihse_btree_insert(qihse_btree_t* tree, const void* key, size_t key_len, uint64_t row_id);
+bool qihse_btree_find(qihse_btree_t* tree, const void* key, size_t key_len, uint64_t* out);
+int qihse_btree_delete(qihse_btree_t* tree, const void* key, size_t key_len);
+
+qihse_btree_cursor_t* qihse_btree_range_scan(qihse_btree_t* tree,
+    const void* min_key, size_t min_len,
+    const void* max_key, size_t max_len);
+qihse_btree_cursor_t* qihse_btree_prefix_scan(qihse_btree_t* tree,
+    const void* prefix, size_t prefix_len);
+
+bool qihse_btree_cursor_next(qihse_btree_cursor_t* cursor, uint64_t* out);
+void qihse_btree_cursor_close(qihse_btree_cursor_t* cursor);
+
+// Composite key serialization
+int qihse_btree_serialize_key(const qihse_btree_key_t* keys, size_t num_keys,
+    uint8_t* out_buf, size_t* io_buf_len);
+```
+
+### Hash Index
+
+```c
+#include "qihse_hash_index.h"
+
+qihse_hash_index_t* qihse_hash_index_create(qihse_hash_key_type_t key_type,
+    size_t initial_capacity);
+
+int qihse_hash_index_insert(qihse_hash_index_t* idx, const void* key, size_t key_len, uint64_t row_id);
+bool qihse_hash_index_find(qihse_hash_index_t* idx, const void* key, size_t key_len, uint64_t* out);
+int qihse_hash_index_delete(qihse_hash_index_t* idx, const void* key, size_t key_len);
+```
+
+### Index Manager
+
+```c
+#include "qihse_index_manager.h"
+
+qihse_index_manager_t* qihse_index_manager_create(void);
+
+int qihse_index_manager_create_index(qihse_index_manager_t* mgr,
+    const char* table, const char* index_name,
+    qihse_index_type_t type, const char** columns, size_t num_cols);
+// Types: BTREE, HASH, VECTOR_HNSW, FTS_INVERTED
+
+int qihse_index_manager_register_wrapper(qihse_index_manager_t* mgr,
+    const char* table, const char* index_name,
+    qihse_index_type_t type, qihse_index_vtable_t* vtable);
+
+int qihse_index_manager_insert(qihse_index_manager_t* mgr,
+    const char* table, const void** keys, const size_t* key_lens,
+    size_t num_keys, uint64_t row_id);
+
+qihse_index_handle_t* qihse_index_manager_find(qihse_index_manager_t* mgr,
+    const char* index_name);
+
+int qihse_index_manager_bulk_load(qihse_index_manager_t* mgr,
+    const char* index_name, const void** keys, const size_t* key_lens,
+    const uint64_t* row_ids, size_t count);
+```
+
+### Index Scan Executor
+
+```c
+#include "qihse_index_scan.h"
+
+qihse_index_scan_t* qihse_index_scan_create(qihse_index_handle_t* idx,
+    qihse_index_scan_type_t type,
+    const void* start_key, size_t start_len,
+    const void* end_key, size_t end_len);
+// Scan types: EQ, RANGE, PREFIX
+
+size_t qihse_index_scan_execute(qihse_index_scan_t* scan, uint64_t** out_row_ids);
+bool qihse_index_scan_next(qihse_index_scan_t* scan, uint64_t* out_row_id);
+void qihse_index_scan_close(qihse_index_scan_t* scan);
+```

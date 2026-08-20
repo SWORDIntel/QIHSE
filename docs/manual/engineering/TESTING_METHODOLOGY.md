@@ -18,3 +18,50 @@ QIHSE degrades gracefully under load, falls back natively when hardware-accelera
 
 > **⚠️ TEMPORARY INFRASTRUCTURE ADVISORY**
 > Due to a recent "unfortunate incident" involving the primary testing laptop (we're totally blaming the NSA for this one 😉), direct access to NPU/GNA silicons and AVX-512 pipelines is currently unavailable. As a result, those specific pathways (while theoretically implemented) are not currently fully tested, mathematically verified, or optimally fleshed out under this framework. A repair is currently planned for the laptop, so we will have these pathways rigidly tested shortly! In the meantime, the engine correctly and automatically falls back to AVX2/FMA and scalar pipelines.
+
+---
+
+## Phase 1-3 Test Coverage
+
+The SQL completeness, ACID transactions, and secondary index implementations include dedicated test suites:
+
+### SQL Completeness Tests (`tests/test_sql_completeness.c`)
+22 tests covering:
+- SQL parsing: SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, ALTER TABLE, CREATE INDEX, DROP TABLE
+- JOIN parsing: INNER, LEFT, RIGHT, CROSS, FULL OUTER
+- Aggregate parsing: GROUP BY, HAVING, SUM, COUNT, AVG, MIN, MAX, DISTINCT
+- Subquery parsing: IN, EXISTS, scalar subqueries
+- Set operations: UNION, INTERSECT, EXCEPT
+- ORDER BY: multi-key, ASC/DESC
+- Join execution: hash join, nested-loop join
+- Aggregate execution: GROUP BY + SUM
+- Sort execution: multi-key sort
+- Schema registry: CREATE TABLE + INDEX
+- Cost-based optimizer: plan building
+
+### Transaction & MVCC Tests (`tests/test_txn.c`)
+6 tests covering:
+- BEGIN/COMMIT/ROLLBACK lifecycle
+- MVCC visibility (concurrent transactions, snapshot isolation)
+- SAVEPOINT and partial rollback
+- WAL append and replay
+- Crash recovery (committed txns visible, uncommitted not)
+- SERIALIZABLE conflict detection (OCC read-write conflict abort)
+
+### Secondary Index Tests (`tests/test_indexes.c`)
+14 tests covering:
+- B+ tree insert/lookup with forced node splits
+- B+ tree range scan with serialized keys
+- B+ tree delete
+- B+ tree string keys + range scan
+- Composite index prefix matching (single and multi-column)
+- Hash index insert/lookup with dynamic resize
+- Hash index string keys
+- Hash index delete + tombstone reuse
+- Index manager create/register/insert/lookup
+- Index manager find by name
+- Index scan executor (range + equality)
+- Bulk load (sort-then-build)
+- Wrapped HNSW/FTS index type registration
+
+**Total: 42/42 tests passing across all three phases.**

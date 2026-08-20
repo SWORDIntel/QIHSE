@@ -106,6 +106,11 @@ Operational runbooks: vector DB mutation flows, memory maintenance loops, benchm
 - [PostgreSQL Wire Protocol Sharded Catalogs](architecture/pgwire_sharded_catalogs.md)
 - [Automated Zero-Downtime Cluster Rebalancing](architecture/cluster_rebalancing.md)
 - [Distributed Multi-Engine Planner](architecture/distributed_query_planner.md)
+- [SQL Engine & Query Processing](architecture/sql_engine.md) — Full SQL parser, JOIN/GROUP BY/ORDER BY/subqueries, query executors, cost-based optimizer, schema registry, prepared statements
+- [ACID Transactions & MVCC](architecture/transactions_mvcc.md) — Transaction manager, MVCC version chains, unified WAL, crash recovery, 2PC
+- [Secondary Indexes](architecture/secondary_indexes.md) — B+ tree, hash index, composite keys, index manager, index scan executor
+- [General DB Engine Replacement Roadmap](plans/qihse_general_db_engine_roadmap.md) — 8-phase roadmap to replace PostgreSQL/Redis/MongoDB/ClickHouse/ES/Neo4j/InfluxDB
+
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md) — COMPLETE
 - [SQLite VFS Implementation Plan](qihse_sqlite_vfs_plan.md)
