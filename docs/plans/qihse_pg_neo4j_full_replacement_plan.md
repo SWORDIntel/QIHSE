@@ -1,5 +1,7 @@
 # QIHSE Full PostgreSQL & Neo4j Replacement Plan
 
+> **Status: Phase A & B COMPLETE** — All features below have been implemented, tested, and committed. See test results at the bottom of this document.
+
 ## 0. Design Philosophy
 
 **Everything routes through UWP.** Standard protocols (PostgreSQL wire, Cypher/Bolt) are accepted at the edge, translated to UWP packets, and executed against native engines with hardware acceleration. This gives drop-in compatibility with zero performance compromise.
@@ -42,13 +44,13 @@ New UWP targets beyond the existing 0x00-0x07:
 
 | Target ID | Engine | New/Existing |
 |---|---|---|
-| `0x08` | SQL Query Engine | New — routes parsed SQL ASTs to executors |
-| `0x09` | Transaction Manager | New — BEGIN/COMMIT/ROLLBACK via UWP |
-| `0x0A` | Graph Engine | New — vertices, edges, Cypher execution |
-| `0x0B` | Index Manager | New — B+ tree, hash, composite operations |
-| `0x0C` | Schema Registry | New — DDL operations via UWP |
-| `0x0D` | Replication | New — WAL shipping, replica sync |
-| `0x0E` | Connection Pool | New — pooled connection management |
+| `0x08` | SQL Query Engine | ✅ Done — routes parsed SQL ASTs to executors |
+| `0x09` | Transaction Manager | ✅ Done — BEGIN/COMMIT/ROLLBACK via UWP |
+| `0x0A` | Graph Engine | ✅ Done — vertices, edges, Cypher execution, Bolt protocol |
+| `0x0B` | Index Manager | ✅ Done — B+ tree, hash, composite operations |
+| `0x0C` | Schema Registry | ✅ Done — DDL operations via UWP |
+| `0x0D` | Replication | ✅ Done — WAL shipping, replica sync, read replica pool |
+| `0x0E` | Connection Pool | ✅ Done — session/transaction/statement pooling |
 
 ---
 
