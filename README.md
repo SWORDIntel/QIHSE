@@ -44,10 +44,11 @@ Data traverses from kernel-bypass network interfaces straight into SIMD computat
 | **Streaming Replication** | `0x0D` | `qihse_repl_*` | Primary/replica WAL shipping, replication slots, sync/async modes, read-replica pool with health checks and round-robin routing. |
 | **Backup & Restore** | Native | `qihse_backup_*` | Full and incremental backups with FNV-1a checksums, restore, verify, and backup listing. |
 | **Parallel Query** | Native | `qihse_parallel_*` | Multi-worker parallel scan, join, and aggregate with pthread-based partitioning. |
-| **Connection Pooler** | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling modes (pgbouncer-equivalent), backend management, health checks. |
+| **Connection Pooler** | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling modes (pgbouncer-equivalent), 16 SHOW commands, 10 control commands (PAUSE/RESUME/RELOAD/etc), authentication, statistics, config management. |
 | **CDC (Change Data Capture)** | `0x0D` | `qihse_cdc_*` | Pub/sub change data capture with insert/update/delete events, subscription management, LSN tracking. |
-| **MongoDB Wire Protocol** | Native | `qihse_mongo_wire_*` | BSON serialization, MongoDB wire protocol server, OP_REPLY handling for drop-in MongoDB client compatibility. |
+| **MongoDB Wire Protocol** | Native | `qihse_mongo_wire_*` | BSON serialization, MongoDB wire protocol server, CRUD operations, query operators, aggregation pipeline, admin commands, in-memory catalog. |
 | **HTTP/REST API** | Native | `qihse_http_api_*` | HTTP server with route registration, JSON responses, ClickHouse HTTP and Elasticsearch _search API compatibility. |
+| **InfluxDB API** | Native | `qihse_influx_api_*` | InfluxQL parser, line protocol ingestion, HTTP API (/query, /write, /health, /ping) for drop-in InfluxDB compatibility. |
 | **Prometheus Metrics** | Native | `qihse_metrics_*` | Counter/gauge/histogram/summary metrics with Prometheus text format /metrics export. |
 | **OpenTelemetry Tracing** | Native | `qihse_tracing_*` | Distributed tracing with span management, tags, parent/child relationships, JSON export. |
 | **Compaction & TTL** | Native | `qihse_compaction_*` | Background SSTable compaction across all engines, TTL expiration sweeps. |
@@ -61,7 +62,7 @@ QIHSE now provides a full relational query and ACID transaction layer on top of 
 
 | Feature | Description | Key Files |
 |---|---|---|
-| **SQL Engine** | Full SQL parser with JOIN (INNER/LEFT/RIGHT/CROSS/FULL), GROUP BY, HAVING, ORDER BY, subqueries (scalar/IN/EXISTS), UNION/INTERSECT/EXCEPT, DDL (CREATE/ALTER/DROP TABLE/INDEX), CTEs (WITH), window functions, UPSERT (ON CONFLICT), RETURNING, CREATE VIEW, CREATE SEQUENCE, VACUUM/ANALYZE, NOTIFY/LISTEN, EXPLAIN | `src/tractable/qihse_sql_parser.c` |
+| **SQL Engine** | Full SQL parser with JOIN (INNER/LEFT/RIGHT/CROSS/FULL), GROUP BY, HAVING, ORDER BY, subqueries (scalar/IN/EXISTS), UNION/INTERSECT/EXCEPT, DDL (CREATE/ALTER/DROP TABLE/INDEX), CTEs (WITH), window functions (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE), UPSERT (ON CONFLICT), RETURNING, CREATE VIEW, CREATE SEQUENCE, VACUUM/ANALYZE, NOTIFY/LISTEN, EXPLAIN, TRUNCATE, COPY, GRANT/REVOKE, BEGIN/COMMIT/ROLLBACK/SAVEPOINT, CREATE/DROP/ALTER ROLE, PREPARE/EXECUTE/DEALLOCATE, SHOW, RESET, SET, DISCARD, REINDEX, CLUSTER | `src/tractable/qihse_sql_parser.c` |
 | **Query Executors** | Hash-join, nested-loop join, hash-based aggregation (SUM/COUNT/AVG/MIN/MAX/DISTINCT), sort with spill-to-disk, index scan | `src/tractable/qihse_join_executor.c`, `qihse_aggregate_executor.c`, `qihse_sort_executor.c`, `qihse_index_scan.c` |
 | **Cost-Based Optimizer** | Per-column statistics, cardinality estimation, plan enumeration (seq scan vs index scan, hash join vs nested loop) | `src/tractable/qihse_optimizer.c` |
 | **Schema Registry** | In-memory catalog of table definitions, column types, and index metadata | `src/tractable/qihse_schema.c` |
@@ -161,19 +162,117 @@ Beyond the core storage and query engines, QIHSE provides a full operational and
 | Feature | API Prefix | Description |
 |---|---|---|
 | **CDC** | `qihse_cdc_*` | Change Data Capture — pub/sub event streaming for insert/update/delete with LSN tracking and subscription management |
-| **MongoDB Wire** | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server for drop-in pymongo compatibility |
-| **HTTP/REST API** | `qihse_http_api_*` | HTTP server with route registration, JSON responses, ClickHouse + Elasticsearch compatible endpoints |
-| **ClickHouse HTTP** | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface (TabSeparated, JSON, JSONEachRow formats) |
-| **Elasticsearch API** | `qihse_es_api_*` | ES-compatible `_search`, `_doc`, `_bulk`, `_cluster/health` endpoints with query DSL |
+| **MongoDB Wire** | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server with CRUD, query operators, aggregation pipeline, admin commands, in-memory catalog |
+| **HTTP/REST API** | `qihse_http_api_*` | HTTP server with route registration, JSON responses, ClickHouse + Elasticsearch + InfluxDB compatible endpoints |
+| **ClickHouse HTTP** | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface with MergeTree engines, materialized views, dictionaries, ARRAY JOIN, PREWHERE, SAMPLE, SETTINGS, system tables, SHOW/DESCRIBE, INSERT FORMAT (Values/CSV/JSON/TSV/Pretty) |
+| **Elasticsearch API** | `qihse_es_api_*` | ES-compatible query DSL (match/term/bool/range/match_all), aggregations (terms/avg/sum/max/min/cardinality), mappings, index management, cat API, cluster/nodes info, scroll, PIT, scripts, templates, msearch, mget, reindex |
+| **InfluxDB API** | `qihse_influx_api_*` | InfluxQL parser (SELECT/SHOW/CREATE/DROP/INSERT), line protocol ingestion, HTTP API (/query, /write, /health, /ping) |
 | **Prometheus Metrics** | `qihse_metrics_*` | Counter/gauge/histogram/summary metrics with `/metrics` Prometheus text format export |
 | **OpenTelemetry** | `qihse_tracing_*` | Distributed tracing with span management, parent/child, tags, JSON export |
 | **Compaction & TTL** | `qihse_compaction_*` | Background SSTable compaction across all engines, TTL expiration sweeps |
-| **SQL Extensions** | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions for vector, time-series, and full-text queries |
+| **SQL Extensions** | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions, ClickHouse SQL extensions (MergeTree, materialized views, dictionaries, ClickHouse functions) |
 | **Streaming Replication** | `qihse_repl_*` | Primary/replica WAL shipping, replication slots, sync/async modes |
 | **Read Replicas** | `qihse_read_replica_*` | Health-checked replica pool with round-robin routing |
 | **Backup & Restore** | `qihse_backup_*` | Full/incremental backups with checksums, restore, verify |
 | **Parallel Query** | `qihse_parallel_*` | Multi-worker parallel scan, join, aggregate |
-| **Connection Pooler** | `qihse_pooler_*` | Session/transaction/statement pooling (pgbouncer-equivalent) |
+| **Connection Pooler** | `qihse_pooler_*` | Session/transaction/statement pooling (pgbouncer-equivalent), 16 SHOW commands, 10 control commands, authentication, statistics |
+
+---
+
+## Database Equivalency -- Phase 9
+
+QIHSE now provides comprehensive command interoperability for **8 target databases**, enabling drop-in replacement without application changes:
+
+### Redis (RESP2/RESP3)
+
+| Category | Commands |
+|---|---|
+| **Lists** | LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LREM, LTRIM, LINSERT, RPOPLPUSH |
+| **Hashes** | HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HMGET, HSETNX, HSTRLEN |
+| **Sets** | SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP, SMOVE, SDIFF, SINTER, SUNION, SRANDMEMBER |
+| **Sorted Sets** | ZADD, ZREM, ZSCORE, ZCARD, ZCOUNT, ZRANGE, ZREVRANGE, ZRANK, ZREVRANK, ZINCRBY, ZPOPMAX, ZPOPMIN, ZRANGEBYSCORE, ZREVRANGEBYSCORE |
+| **Keys** | KEYS, SCAN, RENAME, RENAMENX, GETSET, GETDEL, STRLEN, APPEND, GETRANGE, SETRANGE, INCRBY, DECRBY, INCRBYFLOAT, MSETNX, PERSIST, EXPIREAT, PEXPIREAT, UNLINK, COPY, RANDOMKEY, TOUCH, OBJECT |
+| **Server** | FLUSHDB, FLUSHALL, DBSIZE, TIME, SAVE, BGSAVE, LASTSAVE, SHUTDOWN, CONFIG, DEBUG, MEMORY, SLOWLOG, LATENCY |
+| **Transactions** | MULTI, EXEC, DISCARD, WATCH, UNWATCH (with command queueing) |
+| **Pub/Sub** | PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBSUB |
+| **Bitmaps** | SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP |
+| **HyperLogLog** | PFADD, PFCOUNT, PFMERGE |
+| **Scripting** | EVAL, EVALSHA, SCRIPT |
+
+### MongoDB (Wire Protocol)
+
+| Category | Features |
+|---|---|
+| **CRUD** | insert, find, update, delete, findAndModify, count |
+| **Query Operators** | $eq, $gt, $gte, $lt, $lte, $ne, $in, $nin, $and, $or, $not, $exists, $regex |
+| **Aggregation** | $match, $group, $sort, $limit, $skip, $project, $unwind, $lookup |
+| **Admin** | createCollection, drop, listCollections, createIndex, dropIndex, listIndexes |
+| **BSON** | Full BSON type support including ObjectId, Regex, Timestamp, MinKey, MaxKey, sub-documents |
+
+### PostgreSQL (pgwire)
+
+| Category | Commands |
+|---|---|
+| **Transaction Control** | BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, SET TRANSACTION |
+| **DCL** | GRANT, REVOKE, CREATE ROLE, DROP ROLE, ALTER ROLE |
+| **Utility** | TRUNCATE, COPY, DISCARD, RESET, SET, SHOW, DEALLOCATE, PREPARE, EXECUTE, REINDEX, CLUSTER |
+| **Aggregates** | VARIANCE, STDDEV, CORR, COVAR_SAMP, COVAR_POP, EVERY |
+| **Window Functions** | FIRST_VALUE, LAST_VALUE, NTH_VALUE |
+
+### PgBouncer (Admin Console)
+
+| Category | Commands |
+|---|---|
+| **SHOW** | SHOW POOLS, SHOW CLIENTS, SHOW SERVERS, SHOW SOCKETS, SHOW DBS, SHOW USERS, SHOW VERSION, SHOW STATS, SHOW TOTALS, SHOW LISTS, SHOW FDS, SHOW MEM, SHOW CONFIG, SHOW DNS_HOSTS, SHOW DNS_ZONES, SHOW PEERS, SHOW PEER_POOLS |
+| **Control** | PAUSE, RESUME, DISABLE, ENABLE, RECONNECT, KILL, SUSPEND, SHUTDOWN, RELOAD, WAIT_DB |
+| **Pooling Modes** | Session, Transaction, Statement |
+| **Auth** | trust, password, md5, scram-sha-256, cert, hba |
+
+### Elasticsearch (HTTP API)
+
+| Category | Endpoints |
+|---|---|
+| **Query DSL** | match, term, range, bool (must/should/filter/must_not), match_all |
+| **Aggregations** | terms, avg, sum, max, min, cardinality |
+| **Document** | _doc (index/get/update/delete), _bulk, _mget, _msearch |
+| **Index Mgmt** | create index, delete index, mappings, settings, _count, _explain |
+| **Search** | _search, _scroll, _pit (point-in-time), _reindex, _template |
+| **Cluster** | _cluster/health, _nodes, _cat (indices/shards/nodes/health/aliases) |
+| **Scripts** | _scripts (stored scripts) |
+
+### InfluxDB (HTTP API)
+
+| Category | Endpoints |
+|---|---|
+| **Query** | `/query` (GET/POST) -- InfluxQL SELECT, SHOW, CREATE, DROP, INSERT |
+| **Write** | `/write` (POST) -- Line protocol ingestion |
+| **Health** | `/health`, `/ping` |
+| **Line Protocol** | `measurement,tag=val field=val timestamp` parsing |
+| **InfluxQL** | SELECT with aggregations (mean/sum/min/max/count), WHERE time predicates, GROUP BY time buckets |
+
+### ClickHouse (HTTP API)
+
+| Category | Features |
+|---|---|
+| **Engines** | MergeTree, ReplacingMergeTree, SummingMergeTree, AggregatingMergeTree, CollapsingMergeTree, VersionedMergeTree |
+| **DDL** | CREATE DATABASE, CREATE TABLE, CREATE MATERIALIZED VIEW, CREATE DICTIONARY, DROP TABLE, DROP DATABASE |
+| **DML** | INSERT INTO ... FORMAT (Values, CSV, JSON, TabSeparated, Pretty) |
+| **Query** | SHOW TABLES, SHOW DATABASES, SHOW COLUMNS, DESCRIBE TABLE, SELECT with FINAL, PREWHERE, SAMPLE, ARRAY JOIN, SETTINGS |
+| **System Tables** | system.tables, system.databases, system.columns, system.settings |
+| **Functions** | now(), today(), yesterday(), toStartOfMonth(), toStartOfDay(), countIf(), sumIf(), avgIf(), groupArray(), groupUniqArray() |
+| **Formats** | TabSeparated, JSON, JSONEachRow, CSV, CSVWithNames, Values, Pretty, Raw |
+
+### Neo4j (Cypher)
+
+| Category | Clauses |
+|---|---|
+| **Data Import** | LOAD CSV (WITH HEADERS, FROM path) |
+| **Procedures** | CALL db.labels(), CALL db.relationshipTypes(), CALL db.indexes() |
+| **Constraints** | CREATE CONSTRAINT, DROP CONSTRAINT, SHOW CONSTRAINTS |
+| **Indexes** | CREATE INDEX, DROP INDEX, SHOW INDEXES |
+| **Database Mgmt** | CREATE DATABASE, DROP DATABASE, SHOW DATABASES, START DATABASE, STOP DATABASE, ALTER DATABASE |
+| **Query** | EXPLAIN, PROFILE, FOREACH, USE, PERIODIC COMMIT |
+| **Expressions** | List comprehensions, pattern comprehensions, CASE with WHEN/THEN/ELSE/END |
 
 ---
 
@@ -354,7 +453,8 @@ All technical specifications, integration manuals, API definitions, and code exa
 - ⚡ **[QIHSE + KEYSTONE Integrated Benchmarks](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**: 5-pillar joint architecture report and comparative analysis.
 - ⚡ **[Task Queue Engine Plan (Celery-Equivalent)](docs/plans/qihse_task_queue_plan.md)**: Distributed task queue architecture, 4 priority levels, dedicated NUMA worker pool, and periodic cron scheduling.
 - 🎯 **[Full PostgreSQL & Neo4j Replacement Plan](docs/plans/qihse_pg_neo4j_full_replacement_plan.md)**: UWP target expansion (0x08-0x0E), Bolt protocol, Cypher engine, protocol translation, and SDK roadmap.
-- 📊 **[General DB Engine Replacement Roadmap](docs/plans/qihse_general_db_engine_roadmap.md)**: 8-phase roadmap tracking progress toward replacing PostgreSQL, Redis, MongoDB, ClickHouse, Elasticsearch, Neo4j, and InfluxDB.
+- 📊 **[General DB Engine Replacement Roadmap](docs/plans/qihse_general_db_engine_roadmap.md)**: 9-phase roadmap tracking progress toward replacing PostgreSQL, Redis, MongoDB, ClickHouse, Elasticsearch, Neo4j, and InfluxDB (Phase 9: Database Equivalency Commands COMPLETE).
+- 🔧 **[Operational & Protocol Layer](docs/architecture/operational_protocols.md)**: CDC, MongoDB wire, HTTP/REST, ClickHouse HTTP, ES API, InfluxDB API, metrics, tracing, compaction, SQL extensions, and database equivalency commands for all 8 target databases.
 - ⚡ **[Redis Cluster Sharding Plan](docs/plans/qihse_redis_cluster_sharding_plan.md)**: Native C99 multi-node clustering blueprint with 16,384 CRC16 hash slots and multi-model routing.
 - 🗄️ **[SQLite VFS Implementation Plan](docs/qihse_sqlite_vfs_plan.md)**: Architectural blueprint and page-cache integration model.
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
