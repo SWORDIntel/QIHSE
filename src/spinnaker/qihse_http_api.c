@@ -57,6 +57,8 @@ static void send_response(int fd, const http_response_t* res) {
         case 201: status_text = "Created"; break;
         case 400: status_text = "Bad Request"; break;
         case 404: status_text = "Not Found"; break;
+        case 405: status_text = "Method Not Allowed"; break;
+        case 409: status_text = "Conflict"; break;
         case 500: status_text = "Internal Server Error"; break;
     }
     char header[1024];
@@ -204,6 +206,7 @@ int http_parse_request(const char* raw, size_t len, http_request_t* out) {
     else if (mlen == 3 && strncmp(p, "PUT", 3) == 0) out->method = HTTP_PUT;
     else if (mlen == 6 && strncmp(p, "DELETE", 6) == 0) out->method = HTTP_DELETE;
     else if (mlen == 5 && strncmp(p, "PATCH", 5) == 0) out->method = HTTP_PATCH;
+    else if (mlen == 4 && strncmp(p, "HEAD", 4) == 0) out->method = HTTP_HEAD;
     else return -1;
     
     /* Parse path */
