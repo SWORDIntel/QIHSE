@@ -154,6 +154,29 @@ QIHSE treats performance as a low-level systems problem:
 
 ---
 
+## Operational & Protocol Layer
+
+Beyond the core storage and query engines, QIHSE provides a full operational and protocol stack:
+
+| Feature | API Prefix | Description |
+|---|---|---|
+| **CDC** | `qihse_cdc_*` | Change Data Capture — pub/sub event streaming for insert/update/delete with LSN tracking and subscription management |
+| **MongoDB Wire** | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server for drop-in pymongo compatibility |
+| **HTTP/REST API** | `qihse_http_api_*` | HTTP server with route registration, JSON responses, ClickHouse + Elasticsearch compatible endpoints |
+| **ClickHouse HTTP** | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface (TabSeparated, JSON, JSONEachRow formats) |
+| **Elasticsearch API** | `qihse_es_api_*` | ES-compatible `_search`, `_doc`, `_bulk`, `_cluster/health` endpoints with query DSL |
+| **Prometheus Metrics** | `qihse_metrics_*` | Counter/gauge/histogram/summary metrics with `/metrics` Prometheus text format export |
+| **OpenTelemetry** | `qihse_tracing_*` | Distributed tracing with span management, parent/child, tags, JSON export |
+| **Compaction & TTL** | `qihse_compaction_*` | Background SSTable compaction across all engines, TTL expiration sweeps |
+| **SQL Extensions** | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions for vector, time-series, and full-text queries |
+| **Streaming Replication** | `qihse_repl_*` | Primary/replica WAL shipping, replication slots, sync/async modes |
+| **Read Replicas** | `qihse_read_replica_*` | Health-checked replica pool with round-robin routing |
+| **Backup & Restore** | `qihse_backup_*` | Full/incremental backups with checksums, restore, verify |
+| **Parallel Query** | `qihse_parallel_*` | Multi-worker parallel scan, join, aggregate |
+| **Connection Pooler** | `qihse_pooler_*` | Session/transaction/statement pooling (pgbouncer-equivalent) |
+
+---
+
 ## Multi-Language SDKs
 
 QIHSE provides drop-in compatible SDKs for all major database client libraries:
@@ -162,8 +185,14 @@ QIHSE provides drop-in compatible SDKs for all major database client libraries:
 |---|---|---|---|
 | **qihse_pg** | psycopg2 | Python | `sdks/python/qihse_pg.py` |
 | **qihse_neo4j** | neo4j-python | Python | `sdks/python/qihse_neo4j.py` |
+| **qihse_mongo** | pymongo | Python | `sdks/python/qihse_mongo.py` |
+| **qihse_http** | requests / REST | Python | `sdks/python/qihse_http.py` |
+| **qihse_clickhouse** | clickhouse-driver | Python | `sdks/python/qihse_clickhouse.py` |
+| **qihse_elasticsearch** | elasticsearch-py | Python | `sdks/python/qihse_elasticsearch.py` |
+| **qihse_cdc** | pub/sub client | Python | `sdks/python/qihse_cdc.py` |
 | **qihse_rust** | tokio-postgres | Rust | `sdks/rust/` |
 | **qihse_libpq** | libpq (C) | C | `sdks/c/qihse_libpq.h` |
+| **qihse_mongo_c** | mongoc (C) | C | `sdks/c/qihse_mongo_c.h` |
 
 ### psycopg2-compatible (Python)
 
