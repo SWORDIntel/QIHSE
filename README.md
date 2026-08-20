@@ -40,6 +40,28 @@ Data traverses from kernel-bypass network interfaces straight into SIMD computat
 | **SQLite VFS** | Native | `qihse_sqlite_vfs` | Drop-in SQLite storage replacement routing database pages through Black Hole KV and Marmalade Event Stream. |
 | **Task Queue & Scheduler** | Native / RESP | `qihse_task_*` | Celery-equivalent distributed task queue with 4 priority levels, dedicated NUMA worker pool, 10ms timing wheel cron scheduler, and Celery-compatible Python SDK. |
 
+
+
+## Relational Query & Transaction Layer
+
+QIHSE now provides a full relational query and ACID transaction layer on top of the multi-model storage engines:
+
+| Feature | Description | Key Files |
+|---|---|---|
+| **SQL Engine** | Full SQL parser with JOIN (INNER/LEFT/RIGHT/CROSS/FULL), GROUP BY, HAVING, ORDER BY, subqueries (scalar/IN/EXISTS), UNION/INTERSECT/EXCEPT, DDL (CREATE/ALTER/DROP TABLE/INDEX) | `src/tractable/qihse_sql_parser.c` |
+| **Query Executors** | Hash-join, nested-loop join, hash-based aggregation (SUM/COUNT/AVG/MIN/MAX/DISTINCT), sort with spill-to-disk, index scan | `src/tractable/qihse_join_executor.c`, `qihse_aggregate_executor.c`, `qihse_sort_executor.c`, `qihse_index_scan.c` |
+| **Cost-Based Optimizer** | Per-column statistics, cardinality estimation, plan enumeration (seq scan vs index scan, hash join vs nested loop) | `src/tractable/qihse_optimizer.c` |
+| **Schema Registry** | In-memory catalog of table definitions, column types, and index metadata | `src/tractable/qihse_schema.c` |
+| **Prepared Statements** | pgwire extended query protocol (Parse/Bind/Execute/Describe/Close/Sync) with 64-slot statement cache | `src/spinnaker/qihse_pg_wire.c` |
+| **ACID Transactions** | BEGIN/COMMIT/ROLLBACK/SAVEPOINT, 3 isolation levels (READ COMMITTED, REPEATABLE READ, SERIALIZABLE with OCC) | `src/tractable/qihse_txn.c` |
+| **MVCC** | Per-row version chains with xmin/xmax, snapshot visibility, garbage collection, vacuum | `src/tractable/qihse_mvcc.c` |
+| **Unified WAL** | Cross-engine write-ahead log with segment rotation, CRC32 checksums, group commit, checkpoint | `src/tractable/qihse_wal.c` |
+| **Crash Recovery** | Three-phase recovery (analysis/redo/undo) with checkpoint truncation | `src/tractable/qihse_recovery.c` |
+| **B+ Tree Index** | Page-aligned nodes, configurable fanout, range scans, composite keys with prefix matching | `src/frieze/qihse_btree.c` |
+| **Hash Index** | Open-addressed, linear probing, dynamic resizing, tombstones | `src/frieze/qihse_hash_index.c` |
+| **Index Manager** | Per-table index tracking, bulk-load, HNSW/FTS wrapper support | `src/frieze/qihse_index_manager.c` |
+| **2PC Interface** | Two-phase commit coordinator with participant callbacks for cross-engine transactions | `src/tractable/qihse_txn.c` |
+
 ---
 
 ## Architecture
