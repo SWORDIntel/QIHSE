@@ -75,6 +75,15 @@ flowchart TB
 | Backup & Restore | Native | `qihse_backup_*` | Full/incremental backups with checksums |
 | Parallel Query | Native | `qihse_parallel_*` | Multi-worker parallel scan/join/aggregate |
 | Connection Pooler | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling |
+| CDC | `0x0F` | `qihse_cdc_*` | Change Data Capture — pub/sub event streaming with LSN tracking |
+| MongoDB Wire | `0x10` | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server |
+| HTTP/REST API | `0x11` | `qihse_http_api_*` | HTTP server with route registration, JSON responses |
+| ClickHouse HTTP | `0x12` | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface (TSV/JSON) |
+| Elasticsearch API | `0x13` | `qihse_es_api_*` | ES-compatible `_search`, `_doc`, `_bulk`, `_cluster/health` |
+| Prometheus Metrics | Native | `qihse_metrics_*` | Counter/gauge/histogram/summary, `/metrics` export |
+| OpenTelemetry | Native | `qihse_tracing_*` | Distributed tracing with span management, JSON export |
+| Compaction & TTL | Native | `qihse_compaction_*` | Background SSTable compaction, TTL expiration sweeps |
+| SQL Extensions | Native | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions |
 
 ---
 
