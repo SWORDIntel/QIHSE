@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
+#include "qihse_document.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,7 @@ typedef struct {
     pthread_t thread;
     volatile int running;
     void* doc_store;  /* qihse_document_store_t* */
+    void* catalog;    /* mongo_catalog_t* */
 } qihse_mongo_server_t;
 
 /* BSON operations */
@@ -83,6 +85,9 @@ typedef struct {
         const char* str;
         int b;
         struct { const uint8_t* data; size_t len; } bin;
+        struct { const uint8_t* data; int32_t len; } doc;   /* sub-document/array */
+        struct { const char* pattern; const char* options; } regex;
+        struct { const uint8_t* data; } oid;                /* 12-byte ObjectId */
     } v;
 } bson_element_t;
 
@@ -106,6 +111,68 @@ typedef struct {
 
 int mongo_msg_parse(const uint8_t* data, size_t len, mongo_msg_t* out);
 bson_t* mongo_msg_get_document(const mongo_msg_t* msg, size_t* offset);
+
+/* ---- Extended BSON helpers ---- */
+int bson_append_array(bson_t* b, const char* key, const bson_t* sub);
+int bson_append_objectid(bson_t* b, const char* key, const uint8_t oid[12]);
+int bson_append_regex(bson_t* b, const char* key, const char* pattern, const char* options);
+int bson_append_timestamp(bson_t* b, const char* key, int32_t incr, int32_t ts);
+int bson_append_minkey(bson_t* b, const char* key);
+int bson_append_maxkey(bson_t* b, const char* key);
+int bson_append_element(bson_t* b, const char* key, const bson_element_t* e, const uint8_t* raw);
+bson_t* bson_copy(const bson_t* src);
+int bson_find_element(const bson_t* b, const char* key, bson_element_t* out);
+int bson_find_path(const bson_t* b, const char* dotted, bson_element_t* out);
+char* bson_to_json(const bson_t* b);
+void bson_remove_key(bson_t* b, const char* key);
+int bson_set_field(bson_t* b, const char* key, const bson_element_t* e, const uint8_t* raw);
+
+/* ---- Catalog (in-memory database/collection store) ---- */
+typedef struct {
+    bson_t** docs;
+    size_t count;
+    size_t cap;
+    char name[128];
+} mongo_collection_t;
+
+typedef struct {
+    mongo_collection_t** colls;
+    size_t count;
+    size_t cap;
+    char name[128];
+} mongo_database_t;
+
+typedef struct {
+    mongo_database_t** dbs;
+    size_t count;
+    size_t cap;
+    qihse_document_store_t* doc_store;
+    pthread_mutex_t lock;
+} mongo_catalog_t;
+
+mongo_catalog_t* mongo_catalog_create(qihse_document_store_t* ds);
+void mongo_catalog_destroy(mongo_catalog_t* cat);
+mongo_database_t* mongo_catalog_get_db(mongo_catalog_t* cat, const char* db);
+mongo_collection_t* mongo_db_get_collection(mongo_database_t* db, const char* name);
+mongo_collection_t* mongo_catalog_get_collection(mongo_catalog_t* cat, const char* db, const char* coll);
+int mongo_catalog_drop_collection(mongo_catalog_t* cat, const char* db, const char* coll);
+
+/* ---- Query matching ---- */
+int bson_match(const bson_t* doc, const bson_t* filter);
+int bson_match_operator(const bson_t* doc, const char* key, const bson_element_t* field,
+                        const char* op, const bson_element_t* opval, const uint8_t* raw);
+
+/* ---- Update operators ---- */
+int bson_apply_update(bson_t* doc, const bson_t* update, int is_insert);
+
+/* ---- Aggregation pipeline ---- */
+bson_t** bson_aggregate(const bson_t* const* input, size_t n_in,
+                        const bson_t* pipeline, size_t n_stages,
+                        size_t* out_count);
+
+/* ---- Command dispatch ---- */
+bson_t* mongo_dispatch_command(mongo_catalog_t* cat, const char* db_name,
+                               const bson_t* cmd);
 
 #ifdef __cplusplus
 }

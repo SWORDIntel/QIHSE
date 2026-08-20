@@ -56,6 +56,20 @@ static const struct { const char* upper; tok_kind_t kind; } KEYWORDS[] = {
     {"FALSE", TOK_KEYWORD}, {"CASE", TOK_KEYWORD}, {"WHEN", TOK_KEYWORD},
     {"THEN", TOK_KEYWORD}, {"ELSE", TOK_KEYWORD}, {"END", TOK_KEYWORD},
     {"ASC", TOK_KEYWORD}, {"DESC", TOK_KEYWORD}, {"ON", TOK_KEYWORD},
+    {"LOAD", TOK_KEYWORD}, {"CSV", TOK_KEYWORD}, {"FROM", TOK_KEYWORD},
+    {"HEADERS", TOK_KEYWORD}, {"CALL", TOK_KEYWORD}, {"YIELD", TOK_KEYWORD},
+    {"FOREACH", TOK_KEYWORD}, {"INDEX", TOK_KEYWORD}, {"CONSTRAINT", TOK_KEYWORD},
+    {"DROP", TOK_KEYWORD}, {"SHOW", TOK_KEYWORD}, {"DATABASE", TOK_KEYWORD},
+    {"DATABASES", TOK_KEYWORD}, {"EXPLAIN", TOK_KEYWORD}, {"PROFILE", TOK_KEYWORD},
+    {"USE", TOK_KEYWORD}, {"PERIODIC", TOK_KEYWORD}, {"COMMIT", TOK_KEYWORD},
+    {"TRANSACTIONS", TOK_KEYWORD}, {"ROWS", TOK_KEYWORD}, {"NULLS", TOK_KEYWORD},
+    {"FIRST", TOK_KEYWORD}, {"LAST", TOK_KEYWORD}, {"ASSERT", TOK_KEYWORD},
+    {"UNIQUE", TOK_KEYWORD}, {"KEY", TOK_KEYWORD}, {"START", TOK_KEYWORD},
+    {"STOP", TOK_KEYWORD}, {"ALTER", TOK_KEYWORD}, {"READ", TOK_KEYWORD},
+    {"ONLY", TOK_KEYWORD}, {"WRITE", TOK_KEYWORD}, {"BUILT", TOK_KEYWORD},
+    {"PROCEDURES", TOK_KEYWORD}, {"FUNCTIONS", TOK_KEYWORD},
+    {"EXECUTABLE", TOK_KEYWORD}, {"IF", TOK_KEYWORD}, {"COUNT", TOK_KEYWORD},
+    {"COLLECT", TOK_KEYWORD},
     {NULL, TOK_EOF}
 };
 
@@ -278,6 +292,7 @@ static qihse_cypher_clause_t* clause_new(qihse_cypher_clause_type_t t) {
 
 static void expr_free(cypher_expr_t* e);
 static void path_free(cypher_path_t* p);
+static void clause_free(qihse_cypher_clause_t* c);
 
 static void expr_free(cypher_expr_t* e) {
     if (!e) return;
@@ -289,6 +304,19 @@ static void expr_free(cypher_expr_t* e) {
     free(e->args);
     for (size_t i = 0; i < e->ncase; ++i) { expr_free(e->when_exprs[i]); expr_free(e->then_exprs[i]); }
     free(e->when_exprs); free(e->then_exprs);
+    /* comprehension fields */
+    free(e->comp_var);
+    expr_free(e->comp_list);
+    expr_free(e->comp_where);
+    expr_free(e->comp_proj);
+    path_free(e->comp_path);
+    expr_free(e->idx_start);
+    expr_free(e->idx_end);
+    /* subquery */
+    if (e->subquery) {
+        clause_free(e->subquery->first);
+        free(e->subquery);
+    }
     free(e);
 }
 
@@ -334,6 +362,33 @@ static void clause_free(qihse_cypher_clause_t* c) {
     for (size_t i = 0; i < c->num_order_items; ++i) { expr_free(c->order_items[i]->expr); free(c->order_items[i]); }
     free(c->order_items);
     expr_free(c->unwind_expr); free(c->unwind_var);
+    /* LOAD CSV */
+    free(c->csv_uri); free(c->csv_var);
+    /* CALL procedure */
+    free(c->proc_namespace); free(c->proc_name);
+    for (size_t i = 0; i < c->num_proc_args; ++i) expr_free(c->proc_args[i]);
+    free(c->proc_args);
+    for (size_t i = 0; i < c->num_yield_vars; ++i) free(c->yield_vars[i]);
+    free(c->yield_vars);
+    if (c->call_subquery) {
+        clause_free(c->call_subquery->first);
+        free(c->call_subquery);
+    }
+    /* FOREACH */
+    free(c->foreach_var);
+    expr_free(c->foreach_list);
+    clause_free(c->foreach_body);
+    /* Schema */
+    free(c->schema_name); free(c->schema_label);
+    for (size_t i = 0; i < c->num_schema_props; ++i) free(c->schema_props[i]);
+    free(c->schema_props);
+    free(c->schema_rel_type);
+    /* SHOW */
+    free(c->show_user);
+    for (size_t i = 0; i < c->num_show_yield_vars; ++i) free(c->show_yield_vars[i]);
+    free(c->show_yield_vars);
+    /* USE */
+    free(c->use_database);
     clause_free(c->next);
     free(c);
 }
@@ -462,6 +517,105 @@ static cypher_expr_t* parse_case(parser_t* p) {
     return e;
 }
 
+static cypher_expr_t* parse_primary(parser_t* p);
+static qihse_cypher_query_t* parse_subquery_body(parser_t* p);
+static qihse_cypher_clause_t* parse_clause(parser_t* p);
+
+/* parse a subquery body enclosed in { ... } */
+static qihse_cypher_query_t* parse_subquery_body(parser_t* p) {
+    expect_tok(p, TOK_LBRACE);
+    qihse_cypher_query_t* q = calloc(1, sizeof(qihse_cypher_query_t));
+    qihse_cypher_clause_t* prev = NULL;
+    for (;;) {
+        qihse_cypher_clause_t* c = parse_clause(p);
+        if (!c) break;
+        if (prev) prev->next = c; else q->first = c;
+        q->last = c; prev = c;
+    }
+    expect_tok(p, TOK_RBRACE);
+    return q;
+}
+
+/* parse list comprehension: [var IN list WHERE pred | proj] */
+static cypher_expr_t* parse_list_comprehension(parser_t* p) {
+    expect_tok(p, TOK_LBRACK);
+    cypher_expr_t* e = expr_new(CEXPR_LIST_COMP);
+    /* var IN list */
+    if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) {
+        p_error(p, "expected variable in list comprehension"); expr_free(e); return NULL;
+    }
+    e->comp_var = strdup(p->L.cur.text ? p->L.cur.text : "");
+    lex_advance(&p->L);
+    if (!expect_kw(p, "IN")) { expr_free(e); return NULL; }
+    e->comp_list = parse_expr(p);
+    if (!e->comp_list) { expr_free(e); return NULL; }
+    /* optional WHERE */
+    if (accept_kw(p, "WHERE")) {
+        e->comp_where = parse_expr(p);
+        if (!e->comp_where) { expr_free(e); return NULL; }
+    }
+    /* optional | projection */
+    if (accept_tok(p, TOK_PIPE)) {
+        e->comp_proj = parse_expr(p);
+        if (!e->comp_proj) { expr_free(e); return NULL; }
+    }
+    expect_tok(p, TOK_RBRACK);
+    return e;
+}
+
+/* parse pattern comprehension: [(pattern) | proj] or [(pattern) WHERE pred | proj] */
+static cypher_expr_t* parse_pattern_comprehension(parser_t* p) {
+    expect_tok(p, TOK_LBRACK);
+    cypher_expr_t* e = expr_new(CEXPR_PATTERN_COMP);
+    e->comp_path = parse_path(p);
+    if (!e->comp_path) { expr_free(e); return NULL; }
+    /* optional WHERE */
+    if (accept_kw(p, "WHERE")) {
+        e->comp_where = parse_expr(p);
+        if (!e->comp_where) { expr_free(e); return NULL; }
+    }
+    /* | projection */
+    if (accept_tok(p, TOK_PIPE)) {
+        e->comp_proj = parse_expr(p);
+        if (!e->comp_proj) { expr_free(e); return NULL; }
+    }
+    expect_tok(p, TOK_RBRACK);
+    return e;
+}
+
+/* parse postfix [index] or [start..end] on an expression */
+static cypher_expr_t* parse_postfix(parser_t* p, cypher_expr_t* base) {
+    while (p->L.cur.kind == TOK_LBRACK) {
+        lex_advance(&p->L);
+        if (p->L.cur.kind == TOK_RBRACK) {
+            /* empty — treat as no-op */
+            lex_advance(&p->L);
+            continue;
+        }
+        cypher_expr_t* start = parse_expr(p);
+        if (!start) { expr_free(base); return NULL; }
+        if (accept_tok(p, TOK_DOT)) {
+            /* slice: start..end or start..] */
+            expect_tok(p, TOK_DOT);
+            cypher_expr_t* end = NULL;
+            if (p->L.cur.kind != TOK_RBRACK) {
+                end = parse_expr(p);
+                if (!end) { expr_free(start); expr_free(base); return NULL; }
+            }
+            expect_tok(p, TOK_RBRACK);
+            cypher_expr_t* s = expr_new(CEXPR_SLICE);
+            s->left = base; s->idx_start = start; s->idx_end = end;
+            base = s;
+        } else {
+            expect_tok(p, TOK_RBRACK);
+            cypher_expr_t* idx = expr_new(CEXPR_INDEX_ACCESS);
+            idx->left = base; idx->idx_start = start;
+            base = idx;
+        }
+    }
+    return base;
+}
+
 static cypher_expr_t* parse_primary(parser_t* p) {
     token_t* t = &p->L.cur;
     if (t->kind == TOK_INT) {
@@ -482,6 +636,14 @@ static cypher_expr_t* parse_primary(parser_t* p) {
     if (is_kw(t, "CASE")) return parse_case(p);
     if (is_kw(t, "EXISTS")) {
         lex_advance(&p->L);
+        if (p->L.cur.kind == TOK_LBRACE) {
+            /* EXISTS { subquery } */
+            qihse_cypher_query_t* sq = parse_subquery_body(p);
+            if (!sq) return NULL;
+            cypher_expr_t* e = expr_new(CEXPR_SUBQUERY);
+            e->subquery = sq; e->subquery_kind = 1;
+            return e;
+        }
         expect_tok(p, TOK_LPAREN);
         cypher_expr_t* inner = parse_expr(p);
         if (!inner) return NULL;
@@ -489,6 +651,20 @@ static cypher_expr_t* parse_primary(parser_t* p) {
         cypher_expr_t* e = expr_new(CEXPR_UNARYOP);
         e->op = COP_EXISTS; e->left = inner;
         return e;
+    }
+    if (is_kw(t, "COUNT") || is_kw(t, "COLLECT")) {
+        int kind = is_kw(t, "COUNT") ? 2 : 3;
+        /* peek ahead: if next is {, it's a subquery */
+        token_t* nxt = lex_peek(&p->L);
+        if (nxt->kind == TOK_LBRACE) {
+            lex_advance(&p->L); /* consume COUNT/COLLECT */
+            qihse_cypher_query_t* sq = parse_subquery_body(p);
+            if (!sq) return NULL;
+            cypher_expr_t* e = expr_new(CEXPR_SUBQUERY);
+            e->subquery = sq; e->subquery_kind = kind;
+            return e;
+        }
+        /* otherwise treat as regular function call — fall through */
     }
     if (t->kind == TOK_DOLLAR) {
         cypher_expr_t* e = expr_new(CEXPR_PARAM); e->s_val = strdup(t->text ? t->text : "");
@@ -498,14 +674,41 @@ static cypher_expr_t* parse_primary(parser_t* p) {
         cypher_expr_t* e = expr_new(CEXPR_STAR);
         lex_advance(&p->L); return e;
     }
-    if (t->kind == TOK_LBRACK) return parse_list_literal(p);
+    if (t->kind == TOK_LBRACK) {
+        /* could be list literal, list comprehension, or pattern comprehension */
+        token_t* nxt = lex_peek(&p->L);
+        if (nxt->kind == TOK_LPAREN) {
+            /* pattern comprehension: [(n)-[:R]->(m) | ...] */
+            return parse_pattern_comprehension(p);
+        }
+        /* check for list comprehension: [IDENT IN ...] */
+        if (nxt->kind == TOK_IDENT || nxt->kind == TOK_KEYWORD) {
+            /* need to look further: is the token after IDENT "IN"? */
+            /* save state, try to parse as comprehension, fall back to list */
+            size_t save_pos = p->L.pos;
+            /* advance past the [ and IDENT */
+            lex_advance(&p->L); /* consume [ */
+            char* name = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L); /* consume IDENT */
+            bool is_comp = is_kw(&p->L.cur, "IN");
+            /* restore state */
+            p->L.pos = save_pos;
+            /* re-lex current token */
+            token_free(&p->L.cur);
+            p->L.has_next = false;
+            lex_next(&p->L, &p->L.cur);
+            free(name);
+            if (is_comp) return parse_list_comprehension(p);
+        }
+        return parse_list_literal(p);
+    }
     if (t->kind == TOK_LBRACE) return parse_map_literal(p);
     if (t->kind == TOK_LPAREN) {
         lex_advance(&p->L);
         cypher_expr_t* e = parse_expr(p);
         if (!e) return NULL;
         expect_tok(p, TOK_RPAREN);
-        return e;
+        return parse_postfix(p, e);
     }
     if (t->kind == TOK_MINUS) {
         lex_advance(&p->L);
@@ -539,22 +742,27 @@ static cypher_expr_t* parse_primary(parser_t* p) {
             }
             expect_tok(p, TOK_RPAREN);
             /* detect aggregate functions */
-            const char* aggs[] = {"count","sum","avg","min","max","collect",NULL};
+            const char* aggs[] = {"count","sum","avg","min","max","collect","percentileCont","percentileDisc","stDev","stDevP",NULL};
             for (int i = 0; aggs[i]; ++i) if (strcasecmp(name, aggs[i]) == 0) { e->type = CEXPR_AGG_CALL; break; }
-            return e;
+            return parse_postfix(p, e);
         }
-        /* variable, possibly property access */
+        /* variable, possibly property access and index/slice */
         cypher_expr_t* e = expr_new(CEXPR_VAR);
         e->s_val = name;
-        while (accept_tok(p, TOK_DOT)) {
-            char* prop = NULL;
-            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
-                prop = strdup(p->L.cur.text ? p->L.cur.text : "");
-                lex_advance(&p->L);
-            } else { p_error(p, "expected property name"); expr_free(e); return NULL; }
-            cypher_expr_t* acc = expr_new(CEXPR_PROP_ACCESS);
-            acc->left = e; acc->s_val = prop;
-            e = acc;
+        for (;;) {
+            if (accept_tok(p, TOK_DOT)) {
+                char* prop = NULL;
+                if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                    prop = strdup(p->L.cur.text ? p->L.cur.text : "");
+                    lex_advance(&p->L);
+                } else { p_error(p, "expected property name"); expr_free(e); return NULL; }
+                cypher_expr_t* acc = expr_new(CEXPR_PROP_ACCESS);
+                acc->left = e; acc->s_val = prop;
+                e = acc;
+            } else if (p->L.cur.kind == TOK_LBRACK) {
+                e = parse_postfix(p, e);
+                if (!e) return NULL;
+            } else break;
         }
         return e;
     }
@@ -834,6 +1042,12 @@ static qihse_cypher_clause_t* parse_return_clause(parser_t* p, qihse_cypher_clau
     if (t == CYPHER_RETURN) expect_kw(p, "RETURN");
     else expect_kw(p, "WITH");
     if (is_kw(&p->L.cur, "DISTINCT")) { c->distinct = true; lex_advance(&p->L); }
+    /* RETURN * — return all variables */
+    if (t == CYPHER_RETURN && p->L.cur.kind == TOK_STAR) {
+        c->return_star = true;
+        lex_advance(&p->L);
+        return c;
+    }
     size_t cap = 4;
     c->items = malloc(cap * sizeof(cypher_return_item_t*));
     do {
@@ -948,6 +1162,12 @@ static qihse_cypher_clause_t* parse_order_by(parser_t* p) {
         cypher_order_item_t* oi = ord_new(e);
         if (is_kw(&p->L.cur, "DESC") || is_kw(&p->L.cur, "DESCENDING")) { oi->descending = true; lex_advance(&p->L); }
         else if (is_kw(&p->L.cur, "ASC") || is_kw(&p->L.cur, "ASCENDING")) { lex_advance(&p->L); }
+        /* NULLS FIRST / NULLS LAST */
+        if (is_kw(&p->L.cur, "NULLS")) {
+            lex_advance(&p->L);
+            if (is_kw(&p->L.cur, "FIRST")) { oi->nulls_first = true; lex_advance(&p->L); }
+            else if (is_kw(&p->L.cur, "LAST")) { oi->nulls_last = true; lex_advance(&p->L); }
+        }
         if (c->num_order_items == cap) { cap *= 2; c->order_items = realloc(c->order_items, cap * sizeof(cypher_order_item_t*)); }
         c->order_items[c->num_order_items++] = oi;
     } while (accept_tok(p, TOK_COMMA));
@@ -975,10 +1195,494 @@ static qihse_cypher_clause_t* parse_unwind(parser_t* p) {
     return c;
 }
 
+/* ---- LOAD CSV ---- */
+static qihse_cypher_clause_t* parse_load_csv(parser_t* p) {
+    expect_kw(p, "LOAD");
+    expect_kw(p, "CSV");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_LOAD_CSV);
+    c->csv_field_term = 0; /* default comma */
+    if (accept_kw(p, "WITH")) {
+        if (!expect_kw(p, "HEADERS")) { clause_free(c); return NULL; }
+        c->csv_with_headers = true;
+    }
+    if (!expect_kw(p, "FROM")) { clause_free(c); return NULL; }
+    if (p->L.cur.kind != TOK_STRING) { p_error(p, "expected string URI in LOAD CSV"); clause_free(c); return NULL; }
+    c->csv_uri = strdup(p->L.cur.text ? p->L.cur.text : "");
+    lex_advance(&p->L);
+    if (!expect_kw(p, "AS")) { clause_free(c); return NULL; }
+    if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) {
+        p_error(p, "expected row variable in LOAD CSV"); clause_free(c); return NULL;
+    }
+    c->csv_var = strdup(p->L.cur.text ? p->L.cur.text : "");
+    lex_advance(&p->L);
+    /* FIELDTERMINATOR */
+    if (is_kw(&p->L.cur, "FIELDTERMINATOR")) {
+        /* FIELDTERMINATOR is not a keyword; check if current token text matches */
+    }
+    /* Check for FIELDTERMINATOR as an identifier */
+    if (p->L.cur.kind == TOK_IDENT && p->L.cur.text && strcasecmp(p->L.cur.text, "FIELDTERMINATOR") == 0) {
+        lex_advance(&p->L);
+        if (p->L.cur.kind != TOK_STRING) { p_error(p, "expected string after FIELDTERMINATOR"); clause_free(c); return NULL; }
+        c->csv_field_term = p->L.cur.text ? p->L.cur.text[0] : ',';
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+/* ---- CALL procedure ---- */
+static qihse_cypher_clause_t* parse_call_clause(parser_t* p) {
+    expect_kw(p, "CALL");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_CALL);
+    /* CALL { subquery } — subquery form */
+    if (p->L.cur.kind == TOK_LBRACE) {
+        c->call_subquery = parse_subquery_body(p);
+        if (!c->call_subquery) { clause_free(c); return NULL; }
+        /* optional IN TRANSACTIONS OF n ROWS */
+        if (is_kw(&p->L.cur, "IN")) {
+            lex_advance(&p->L);
+            if (is_kw(&p->L.cur, "TRANSACTIONS")) lex_advance(&p->L);
+            if (is_kw(&p->L.cur, "OF")) lex_advance(&p->L);
+            if (p->L.cur.kind == TOK_INT) {
+                c->call_in_transactions = (int)p->L.cur.i_val;
+                lex_advance(&p->L);
+            }
+            if (is_kw(&p->L.cur, "ROWS")) lex_advance(&p->L);
+        }
+        return c;
+    }
+    /* CALL namespace.proc(args) or CALL proc(args) */
+    if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) {
+        p_error(p, "expected procedure name after CALL"); clause_free(c); return NULL;
+    }
+    char* first = strdup(p->L.cur.text ? p->L.cur.text : "");
+    lex_advance(&p->L);
+    if (accept_tok(p, TOK_DOT)) {
+        c->proc_namespace = first;
+        if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+            /* could be namespace.name or namespace.subname.name */
+            char* second = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+            if (accept_tok(p, TOK_DOT)) {
+                /* namespace.second.name */
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s.%s", second, "");
+                free(second);
+                if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                    char* third = strdup(p->L.cur.text ? p->L.cur.text : "");
+                    lex_advance(&p->L);
+                    snprintf(buf, sizeof(buf), "%s", third);
+                    free(third);
+                }
+                c->proc_name = strdup(buf);
+            } else {
+                c->proc_name = second;
+            }
+        }
+    } else {
+        c->proc_name = first;
+    }
+    /* args */
+    if (accept_tok(p, TOK_LPAREN)) {
+        size_t cap = 4;
+        c->proc_args = malloc(cap * sizeof(cypher_expr_t*));
+        c->num_proc_args = 0;
+        if (p->L.cur.kind != TOK_RPAREN) {
+            do {
+                cypher_expr_t* a = parse_expr(p);
+                if (!a) { clause_free(c); return NULL; }
+                if (c->num_proc_args == cap) { cap *= 2; c->proc_args = realloc(c->proc_args, cap * sizeof(cypher_expr_t*)); }
+                c->proc_args[c->num_proc_args++] = a;
+            } while (accept_tok(p, TOK_COMMA));
+        }
+        expect_tok(p, TOK_RPAREN);
+    }
+    /* YIELD vars */
+    if (is_kw(&p->L.cur, "YIELD")) {
+        lex_advance(&p->L);
+        size_t cap = 4;
+        c->yield_vars = malloc(cap * sizeof(char*));
+        c->num_yield_vars = 0;
+        do {
+            if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) {
+                p_error(p, "expected yield variable"); clause_free(c); return NULL;
+            }
+            char* vname = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+            if (c->num_yield_vars == cap) { cap *= 2; c->yield_vars = realloc(c->yield_vars, cap * sizeof(char*)); }
+            c->yield_vars[c->num_yield_vars++] = vname;
+        } while (accept_tok(p, TOK_COMMA));
+    }
+    return c;
+}
+
+/* ---- FOREACH ---- */
+static qihse_cypher_clause_t* parse_foreach(parser_t* p) {
+    expect_kw(p, "FOREACH");
+    if (!expect_tok(p, TOK_LPAREN)) return NULL;
+    qihse_cypher_clause_t* c = clause_new(CYPHER_FOREACH);
+    /* var IN list */
+    if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) {
+        p_error(p, "expected variable in FOREACH"); clause_free(c); return NULL;
+    }
+    c->foreach_var = strdup(p->L.cur.text ? p->L.cur.text : "");
+    lex_advance(&p->L);
+    if (!expect_kw(p, "IN")) { clause_free(c); return NULL; }
+    c->foreach_list = parse_expr(p);
+    if (!c->foreach_list) { clause_free(c); return NULL; }
+    if (!expect_tok(p, TOK_PIPE)) { clause_free(c); return NULL; }
+    /* body clauses until ')' */
+    qihse_cypher_clause_t* prev = NULL;
+    for (;;) {
+        qihse_cypher_clause_t* bc = parse_clause(p);
+        if (!bc) break;
+        if (prev) prev->next = bc; else c->foreach_body = bc;
+        prev = bc;
+    }
+    expect_tok(p, TOK_RPAREN);
+    return c;
+}
+
+/* ---- Schema: CREATE INDEX ---- */
+static qihse_cypher_clause_t* parse_create_index(parser_t* p) {
+    expect_kw(p, "CREATE");
+    expect_kw(p, "INDEX");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_CREATE_INDEX);
+    /* optional index name */
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        token_t* nxt = lex_peek(&p->L);
+        if (nxt->kind != TOK_KEYWORD || !is_kw(nxt, "FOR")) {
+            c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+        }
+    }
+    if (!expect_kw(p, "FOR")) { clause_free(c); return NULL; }
+    if (!expect_tok(p, TOK_LPAREN)) { clause_free(c); return NULL; }
+    /* (n:Label) */
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L); /* var */
+    if (accept_tok(p, TOK_COLON)) {
+        if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+            c->schema_label = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+        }
+    }
+    expect_tok(p, TOK_RPAREN);
+    if (!expect_kw(p, "ON")) { clause_free(c); return NULL; }
+    if (!expect_tok(p, TOK_LPAREN)) { clause_free(c); return NULL; }
+    /* (n.prop[, n.prop2]) */
+    size_t cap = 4;
+    c->schema_props = malloc(cap * sizeof(char*));
+    c->num_schema_props = 0;
+    do {
+        if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L); /* var */
+        if (accept_tok(p, TOK_DOT)) {
+            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                if (c->num_schema_props == cap) { cap *= 2; c->schema_props = realloc(c->schema_props, cap * sizeof(char*)); }
+                c->schema_props[c->num_schema_props++] = strdup(p->L.cur.text ? p->L.cur.text : "");
+                lex_advance(&p->L);
+            }
+        }
+    } while (accept_tok(p, TOK_COMMA));
+    expect_tok(p, TOK_RPAREN);
+    return c;
+}
+
+/* ---- Schema: DROP INDEX ---- */
+static qihse_cypher_clause_t* parse_drop_index(parser_t* p) {
+    expect_kw(p, "DROP");
+    expect_kw(p, "INDEX");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_DROP_INDEX);
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+/* ---- Schema: SHOW INDEXES ---- */
+static qihse_cypher_clause_t* parse_show_indexes(parser_t* p) {
+    expect_kw(p, "SHOW");
+    expect_kw(p, "INDEXES");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_SHOW_INDEXES);
+    /* optional YIELD */
+    if (is_kw(&p->L.cur, "YIELD")) {
+        lex_advance(&p->L);
+        c->show_yield = true;
+        size_t cap = 4;
+        c->show_yield_vars = malloc(cap * sizeof(char*));
+        c->num_show_yield_vars = 0;
+        do {
+            if (p->L.cur.kind != TOK_IDENT && p->L.cur.kind != TOK_KEYWORD) break;
+            if (c->num_show_yield_vars == cap) { cap *= 2; c->show_yield_vars = realloc(c->show_yield_vars, cap * sizeof(char*)); }
+            c->show_yield_vars[c->num_show_yield_vars++] = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+        } while (accept_tok(p, TOK_COMMA));
+    }
+    return c;
+}
+
+/* ---- Schema: CREATE CONSTRAINT ---- */
+static qihse_cypher_clause_t* parse_create_constraint(parser_t* p) {
+    expect_kw(p, "CREATE");
+    expect_kw(p, "CONSTRAINT");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_CREATE_CONSTRAINT);
+    /* optional constraint name */
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        token_t* nxt = lex_peek(&p->L);
+        if (nxt->kind != TOK_KEYWORD || !is_kw(nxt, "ON")) {
+            c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+        }
+    }
+    if (is_kw(&p->L.cur, "IF")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "NOT")) { lex_advance(&p->L); }
+        if (is_kw(&p->L.cur, "EXISTS")) { c->schema_if_exists = true; lex_advance(&p->L); }
+    }
+    if (!expect_kw(p, "ON")) { clause_free(c); return NULL; }
+    /* (n:Label) or ()-[r:TYPE]-() */
+    if (!expect_tok(p, TOK_LPAREN)) { clause_free(c); return NULL; }
+    if (p->L.cur.kind == TOK_RPAREN) {
+        /* relationship constraint: ()-[r:TYPE]-() */
+        lex_advance(&p->L); /* consume ) */
+        c->schema_rel = true;
+        /* -[r:TYPE]- */
+        expect_tok(p, TOK_DASH);
+        if (accept_tok(p, TOK_LBRACK)) {
+            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L); /* var */
+            if (accept_tok(p, TOK_COLON)) {
+                if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                    c->schema_rel_type = strdup(p->L.cur.text ? p->L.cur.text : "");
+                    lex_advance(&p->L);
+                }
+            }
+            expect_tok(p, TOK_RBRACK);
+        }
+        expect_tok(p, TOK_DASH);
+        /* () */
+        expect_tok(p, TOK_LPAREN);
+        expect_tok(p, TOK_RPAREN);
+    } else {
+        /* (n:Label) */
+        if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L); /* var */
+        if (accept_tok(p, TOK_COLON)) {
+            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                c->schema_label = strdup(p->L.cur.text ? p->L.cur.text : "");
+                lex_advance(&p->L);
+            }
+        }
+        expect_tok(p, TOK_RPAREN);
+    }
+    /* ASSERT */
+    if (accept_kw(p, "ASSERT")) {
+        size_t cap = 4;
+        c->schema_props = malloc(cap * sizeof(char*));
+        c->num_schema_props = 0;
+        do {
+            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L); /* var */
+            if (accept_tok(p, TOK_DOT)) {
+                if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                    if (c->num_schema_props == cap) { cap *= 2; c->schema_props = realloc(c->schema_props, cap * sizeof(char*)); }
+                    c->schema_props[c->num_schema_props++] = strdup(p->L.cur.text ? p->L.cur.text : "");
+                    lex_advance(&p->L);
+                }
+            }
+        } while (accept_tok(p, TOK_COMMA));
+        /* IS UNIQUE / IS NODE KEY / EXISTS(...) / IS NOT NULL */
+        if (is_kw(&p->L.cur, "IS")) {
+            lex_advance(&p->L);
+            if (is_kw(&p->L.cur, "UNIQUE")) { c->schema_kind = 0; lex_advance(&p->L); }
+            else if (is_kw(&p->L.cur, "NOT")) {
+                lex_advance(&p->L);
+                if (is_kw(&p->L.cur, "NULL")) { c->schema_kind = 3; lex_advance(&p->L); }
+            }
+            else if (is_kw(&p->L.cur, "NODE")) {
+                lex_advance(&p->L);
+                if (is_kw(&p->L.cur, "KEY")) { c->schema_kind = 1; lex_advance(&p->L); }
+            }
+        } else if (is_kw(&p->L.cur, "EXISTS")) {
+            lex_advance(&p->L);
+            expect_tok(p, TOK_LPAREN);
+            if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) lex_advance(&p->L);
+            if (accept_tok(p, TOK_DOT)) {
+                if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+                    if (c->num_schema_props == 0) {
+                        c->schema_props = realloc(c->schema_props, (c->num_schema_props + 1) * sizeof(char*));
+                        c->schema_props[c->num_schema_props++] = strdup(p->L.cur.text ? p->L.cur.text : "");
+                    }
+                    lex_advance(&p->L);
+                }
+            }
+            expect_tok(p, TOK_RPAREN);
+            c->schema_kind = 2;
+        }
+    }
+    return c;
+}
+
+/* ---- Schema: DROP CONSTRAINT ---- */
+static qihse_cypher_clause_t* parse_drop_constraint(parser_t* p) {
+    expect_kw(p, "DROP");
+    expect_kw(p, "CONSTRAINT");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_DROP_CONSTRAINT);
+    if (is_kw(&p->L.cur, "IF")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "EXISTS")) { c->schema_if_exists = true; lex_advance(&p->L); }
+    }
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+/* ---- Schema: SHOW CONSTRAINTS ---- */
+static qihse_cypher_clause_t* parse_show_constraints(parser_t* p) {
+    expect_kw(p, "SHOW");
+    expect_kw(p, "CONSTRAINTS");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_SHOW_CONSTRAINTS);
+    return c;
+}
+
+/* ---- Database management ---- */
+static qihse_cypher_clause_t* parse_create_database(parser_t* p) {
+    expect_kw(p, "CREATE");
+    expect_kw(p, "DATABASE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_CREATE_DATABASE);
+    if (is_kw(&p->L.cur, "IF")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "NOT")) lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "EXISTS")) { c->schema_if_exists = true; lex_advance(&p->L); }
+    }
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_drop_database(parser_t* p) {
+    expect_kw(p, "DROP");
+    expect_kw(p, "DATABASE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_DROP_DATABASE);
+    if (is_kw(&p->L.cur, "IF")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "EXISTS")) { c->schema_if_exists = true; lex_advance(&p->L); }
+    }
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_show_databases(parser_t* p) {
+    expect_kw(p, "SHOW");
+    /* could be DATABASES or DEFAULT DATABASE */
+    if (is_kw(&p->L.cur, "DEFAULT")) {
+        lex_advance(&p->L);
+        expect_kw(p, "DATABASE");
+        qihse_cypher_clause_t* c = clause_new(CYPHER_SHOW_DATABASES);
+        c->show_kind = 4; /* default database */
+        return c;
+    }
+    expect_kw(p, "DATABASES");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_SHOW_DATABASES);
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_show_clause(parser_t* p) {
+    expect_kw(p, "SHOW");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_SHOW);
+    if (is_kw(&p->L.cur, "ALL")) { c->show_kind = 0; lex_advance(&p->L); }
+    else if (is_kw(&p->L.cur, "BUILT")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "IN")) { lex_advance(&p->L); }
+        c->show_kind = 1;
+    }
+    else if (is_kw(&p->L.cur, "PROCEDURES")) { c->show_kind = 2; lex_advance(&p->L); }
+    else if (is_kw(&p->L.cur, "FUNCTIONS")) { c->show_kind = 3; lex_advance(&p->L); }
+    /* optional EXECUTABLE BY user */
+    if (is_kw(&p->L.cur, "EXECUTABLE")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "BY")) lex_advance(&p->L);
+        if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+            c->show_user = strdup(p->L.cur.text ? p->L.cur.text : "");
+            lex_advance(&p->L);
+        }
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_use_clause(parser_t* p) {
+    expect_kw(p, "USE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_USE);
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->use_database = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_start_database(parser_t* p) {
+    expect_kw(p, "START");
+    expect_kw(p, "DATABASE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_START_DATABASE);
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_stop_database(parser_t* p) {
+    expect_kw(p, "STOP");
+    expect_kw(p, "DATABASE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_STOP_DATABASE);
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
+static qihse_cypher_clause_t* parse_alter_database(parser_t* p) {
+    expect_kw(p, "ALTER");
+    expect_kw(p, "DATABASE");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_ALTER_DATABASE);
+    if (p->L.cur.kind == TOK_IDENT || p->L.cur.kind == TOK_KEYWORD) {
+        c->schema_name = strdup(p->L.cur.text ? p->L.cur.text : "");
+        lex_advance(&p->L);
+    }
+    if (is_kw(&p->L.cur, "SET")) {
+        lex_advance(&p->L);
+        if (is_kw(&p->L.cur, "ACCESS")) lex_advance(&p->L);
+        if (accept_tok(p, TOK_LBRACE)) {
+            if (is_kw(&p->L.cur, "READ")) {
+                lex_advance(&p->L);
+                if (is_kw(&p->L.cur, "ONLY")) { c->db_access = 0; lex_advance(&p->L); }
+                else if (is_kw(&p->L.cur, "WRITE")) { c->db_access = 1; lex_advance(&p->L); }
+            }
+            expect_tok(p, TOK_RBRACE);
+        }
+    }
+    return c;
+}
+
+/* ---- PERIODIC COMMIT ---- */
+static qihse_cypher_clause_t* parse_periodic_commit(parser_t* p) {
+    expect_kw(p, "PERIODIC");
+    expect_kw(p, "COMMIT");
+    qihse_cypher_clause_t* c = clause_new(CYPHER_PERIODIC_COMMIT);
+    if (p->L.cur.kind == TOK_INT) {
+        c->periodic_commit = (int)p->L.cur.i_val;
+        lex_advance(&p->L);
+    }
+    return c;
+}
+
 static qihse_cypher_clause_t* parse_clause(parser_t* p) {
     token_t* t = &p->L.cur;
     if (is_kw(t, "MATCH")) return parse_match_like(p, CYPHER_MATCH);
-    if (is_kw(t, "CREATE")) return parse_match_like(p, CYPHER_CREATE);
     if (is_kw(t, "MERGE")) return parse_match_like(p, CYPHER_MERGE);
     if (is_kw(t, "RETURN")) return parse_return_clause(p, CYPHER_RETURN);
     if (is_kw(t, "WITH")) return parse_return_clause(p, CYPHER_WITH);
@@ -990,6 +1694,54 @@ static qihse_cypher_clause_t* parse_clause(parser_t* p) {
     if (is_kw(t, "SKIP")) return parse_skip_limit(p, CYPHER_SKIP);
     if (is_kw(t, "LIMIT")) return parse_skip_limit(p, CYPHER_LIMIT);
     if (is_kw(t, "UNWIND")) return parse_unwind(p);
+    if (is_kw(t, "LOAD")) return parse_load_csv(p);
+    if (is_kw(t, "CALL")) return parse_call_clause(p);
+    if (is_kw(t, "FOREACH")) return parse_foreach(p);
+    if (is_kw(t, "PERIODIC")) return parse_periodic_commit(p);
+    if (is_kw(t, "USE")) return parse_use_clause(p);
+    if (is_kw(t, "EXPLAIN")) {
+        lex_advance(&p->L);
+        qihse_cypher_clause_t* c = clause_new(CYPHER_EXPLAIN);
+        return c;
+    }
+    if (is_kw(t, "PROFILE")) {
+        lex_advance(&p->L);
+        qihse_cypher_clause_t* c = clause_new(CYPHER_PROFILE);
+        return c;
+    }
+    if (is_kw(t, "START") && lex_peek(&p->L)->kind == TOK_KEYWORD &&
+        strcasecmp(lex_peek(&p->L)->text ? lex_peek(&p->L)->text : "", "DATABASE") == 0)
+        return parse_start_database(p);
+    if (is_kw(t, "STOP") && lex_peek(&p->L)->kind == TOK_KEYWORD &&
+        strcasecmp(lex_peek(&p->L)->text ? lex_peek(&p->L)->text : "", "DATABASE") == 0)
+        return parse_stop_database(p);
+    if (is_kw(t, "ALTER") && lex_peek(&p->L)->kind == TOK_KEYWORD &&
+        strcasecmp(lex_peek(&p->L)->text ? lex_peek(&p->L)->text : "", "DATABASE") == 0)
+        return parse_alter_database(p);
+    if (is_kw(t, "DROP")) {
+        token_t* nxt = lex_peek(&p->L);
+        if (is_kw(nxt, "INDEX")) return parse_drop_index(p);
+        if (is_kw(nxt, "CONSTRAINT")) return parse_drop_constraint(p);
+        if (is_kw(nxt, "DATABASE")) return parse_drop_database(p);
+        return NULL;
+    }
+    if (is_kw(t, "SHOW")) {
+        token_t* nxt = lex_peek(&p->L);
+        if (is_kw(nxt, "INDEXES") || is_kw(nxt, "INDEX")) return parse_show_indexes(p);
+        if (is_kw(nxt, "CONSTRAINTS") || is_kw(nxt, "CONSTRAINT")) return parse_show_constraints(p);
+        if (is_kw(nxt, "DATABASES") || is_kw(nxt, "DEFAULT")) return parse_show_databases(p);
+        if (is_kw(nxt, "ALL") || is_kw(nxt, "BUILT") || is_kw(nxt, "PROCEDURES") || is_kw(nxt, "FUNCTIONS"))
+            return parse_show_clause(p);
+        return NULL;
+    }
+    /* CREATE — check for INDEX/CONSTRAINT/DATABASE prefix */
+    if (is_kw(t, "CREATE")) {
+        token_t* nxt = lex_peek(&p->L);
+        if (is_kw(nxt, "INDEX")) return parse_create_index(p);
+        if (is_kw(nxt, "CONSTRAINT")) return parse_create_constraint(p);
+        if (is_kw(nxt, "DATABASE")) return parse_create_database(p);
+        return parse_match_like(p, CYPHER_CREATE);
+    }
     return NULL; /* not a clause */
 }
 

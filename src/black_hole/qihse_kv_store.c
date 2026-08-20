@@ -542,3 +542,75 @@ bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
     if (!store || !store->qdd_ctx) return false;
     return qihse_qdd_is_under_attack(store->qdd_ctx);
 }
+
+typedef struct {
+    qihse_kv_iter_cb cb;
+    void* user_data;
+    qihse_trinary_trie_t* trie;
+    uint64_t now;
+} kv_foreach_ctx_t;
+
+static bool kv_foreach_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size;
+    kv_foreach_ctx_t* ctx = (kv_foreach_ctx_t*)user_data;
+    if (!key || !value || !ctx) return true;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (p->expire_time_ms > 0 && p->expire_time_ms <= ctx->now) {
+        qihse_trinary_trie_delete(ctx->trie, key);
+        return true;
+    }
+    return ctx->cb(key, p->val, ctx->user_data);
+}
+
+void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
+    if (!store || !store->trie || !cb) return;
+    kv_foreach_ctx_t ctx = { cb, user_data, store->trie, current_time_ms() };
+    qihse_trinary_trie_foreach(store->trie, kv_foreach_callback, &ctx);
+}
+
+typedef struct {
+    qihse_trinary_trie_t* trie;
+    size_t removed;
+} kv_clear_ctx_t;
+
+static bool kv_clear_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value; (void)value_size;
+    kv_clear_ctx_t* ctx = (kv_clear_ctx_t*)user_data;
+    if (!key || !ctx) return true;
+    if (qihse_trinary_trie_delete(ctx->trie, key)) ctx->removed++;
+    return true;
+}
+
+size_t qihse_kv_clear(qihse_kv_store_t* store) {
+    if (!store || !store->trie) return 0;
+    kv_clear_ctx_t ctx = { store->trie, 0 };
+    qihse_trinary_trie_foreach(store->trie, kv_clear_callback, &ctx);
+    store->mem_usage = 0;
+    return ctx.removed;
+}
+
+typedef struct {
+    size_t count;
+    uint64_t now;
+    qihse_trinary_trie_t* trie;
+} kv_count_ctx_t;
+
+static bool kv_count_callback(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size; (void)key;
+    kv_count_ctx_t* ctx = (kv_count_ctx_t*)user_data;
+    if (!value || !ctx) return true;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (p->expire_time_ms > 0 && p->expire_time_ms <= ctx->now) {
+        if (key) qihse_trinary_trie_delete(ctx->trie, key);
+        return true;
+    }
+    ctx->count++;
+    return true;
+}
+
+size_t qihse_kv_count(qihse_kv_store_t* store) {
+    if (!store || !store->trie) return 0;
+    kv_count_ctx_t ctx = { 0, current_time_ms(), store->trie };
+    qihse_trinary_trie_foreach(store->trie, kv_count_callback, &ctx);
+    return ctx.count;
+}

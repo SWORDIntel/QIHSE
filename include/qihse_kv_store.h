@@ -112,4 +112,18 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath);
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store);
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store);
 
+/* Enumeration callback — called for each live key-value pair.
+ * Return true to continue iteration, false to stop. The value pointer is
+ * only valid for the duration of the callback. */
+typedef bool (*qihse_kv_iter_cb)(const char* key, const char* value, void* user_data);
+
+/* Iterate over all live (non-expired) key-value pairs in the in-memory trie. */
+void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data);
+
+/* Remove all keys from the in-memory trie. Returns the number removed. */
+size_t qihse_kv_clear(qihse_kv_store_t* store);
+
+/* Returns the number of live keys in the in-memory trie. */
+size_t qihse_kv_count(qihse_kv_store_t* store);
+
 #endif /* QIHSE_KV_STORE_H */
