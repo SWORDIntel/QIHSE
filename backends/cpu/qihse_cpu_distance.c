@@ -2,8 +2,9 @@
  * QIHSE - CPU Distance Function Dispatch
  *
  * Runtime selection of the best distance function implementation
- * based on CPU feature detection. Supports AVX-512+FMA, AVX2+FMA, and scalar.
+ * based on CPU feature detection. Supports AVX-512+FMA, AVX2+FMA, AVX1, and scalar.
  * AVX-512 path processes 16 floats per instruction with 2x unrolling for ILP.
+ * AVX1 path processes 8 floats per instruction without FMA (Sandy Bridge / Ivy Bridge).
  */
 
 #include "qihse_cpu_distance.h"
@@ -48,28 +49,29 @@ float qihse_distance_euclidean_scalar(const float* a, const float* b, size_t dim
 
 /* -------------------------------------------------------------------------- */
 /* Horizontal sum helper for __m256 — AVX target, pure SSE reduce             */
+/* AVX1 has no cross-lane permutes, so we extract the high 128-bit lane and   */
+/* reduce with SSE shuffles.  This helper is shared by the AVX1, AVX2 and     */
+/* AVX-512 paths (AVX-512 folds 512->256 first, then calls this).             */
 /* -------------------------------------------------------------------------- */
 #ifdef __x86_64__
 __attribute__((target("avx")))
 static float hsum256(__m256 v) {
-    /* Fold 8 lanes to 4 */
     __m128 lo  = _mm256_castps256_ps128(v);
     __m128 hi  = _mm256_extractf128_ps(v, 1);
     __m128 s4  = _mm_add_ps(lo, hi);
-    /* Fold 4 lanes to 2 using shuffle (SSE, no SSSE3 needed) */
-    __m128 t1  = _mm_movehl_ps(s4, s4);   /* high 2 -> low 2 */
-    __m128 s2  = _mm_add_ps(s4, t1);
-    /* Fold 2 lanes to 1 */
-    __m128 t2  = _mm_shuffle_ps(s2, s2, 0x1);
-    __m128 s1  = _mm_add_ss(s2, t2);
+    __m128 shuf = _mm_movehdup_ps(s4);          /* [1,1,3,3] */
+    __m128 s2  = _mm_add_ps(s4, shuf);
+    __m128 s1  = _mm_add_ss(s2, _mm_movehl_ps(s2, s2));
     return _mm_cvtss_f32(s1);
 }
 
 /* -------------------------------------------------------------------------- */
-/* AVX (AVX1) implementations (Sandy Bridge / Ivy Bridge fallback)            */
+/* AVX1 implementations (Sandy Bridge / Ivy Bridge — no AVX2, no FMA)         */
+/* Uses only _mm256_*_ps (float) and _mm_*_ps (128-bit reduce) intrinsics.    */
+/* No 256-bit integer ops, no FMA — separate mul + add.                       */
 /* -------------------------------------------------------------------------- */
 __attribute__((target("avx")))
-float qihse_distance_dot_avx(const float* a, const float* b, size_t dims) {
+float qihse_distance_dot_avx1(const float* a, const float* b, size_t dims) {
     __m256 acc = _mm256_setzero_ps();
     size_t i = 0;
     for (; i + 8 <= dims; i += 8) {
@@ -83,7 +85,7 @@ float qihse_distance_dot_avx(const float* a, const float* b, size_t dims) {
 }
 
 __attribute__((target("avx")))
-float qihse_distance_cosine_avx(const float* a, const float* b, size_t dims) {
+float qihse_distance_cosine_avx1(const float* a, const float* b, size_t dims) {
     __m256 acc_dot = _mm256_setzero_ps();
     __m256 acc_na  = _mm256_setzero_ps();
     __m256 acc_nb  = _mm256_setzero_ps();
@@ -106,7 +108,7 @@ float qihse_distance_cosine_avx(const float* a, const float* b, size_t dims) {
 }
 
 __attribute__((target("avx")))
-float qihse_distance_euclidean_avx(const float* a, const float* b, size_t dims) {
+float qihse_distance_euclidean_avx1(const float* a, const float* b, size_t dims) {
     __m256 acc = _mm256_setzero_ps();
     size_t i = 0;
     for (; i + 8 <= dims; i += 8) {
@@ -301,6 +303,17 @@ float qihse_distance_euclidean_avx512(const float* a, const float* b, size_t dim
 
 #else /* !__x86_64__ — portable fallbacks exported as symbols */
 
+/* AVX1 stubs for non-x86 platforms */
+float qihse_distance_dot_avx1(const float* a, const float* b, size_t dims) {
+    return qihse_distance_dot_scalar(a, b, dims);
+}
+float qihse_distance_cosine_avx1(const float* a, const float* b, size_t dims) {
+    return qihse_distance_cosine_scalar(a, b, dims);
+}
+float qihse_distance_euclidean_avx1(const float* a, const float* b, size_t dims) {
+    return qihse_distance_euclidean_scalar(a, b, dims);
+}
+
 float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
     return qihse_distance_dot_scalar(a, b, dims);
 }
@@ -349,9 +362,9 @@ static void qihse_distance_init_once(void) {
 #ifdef __x86_64__
     } else if (info.has_avx_support && qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX)) {
         /* AVX1 path — 8 floats per instruction without FMA (Sandy Bridge / Ivy Bridge fallback) */
-        g_cosine_fn    = qihse_distance_cosine_avx;
-        g_dot_fn       = qihse_distance_dot_avx;
-        g_euclidean_fn = qihse_distance_euclidean_avx;
+        g_cosine_fn    = qihse_distance_cosine_avx1;
+        g_dot_fn       = qihse_distance_dot_avx1;
+        g_euclidean_fn = qihse_distance_euclidean_avx1;
 #endif
     } else {
         /* Scalar fallback — safe on any architecture */
