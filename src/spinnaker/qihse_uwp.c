@@ -223,12 +223,102 @@ static bool uwp_route_payload(int client_fd, qihse_uwp_context_t* ctx, qihse_uwp
             }
 #endif
             break;
-            
+
+        /* ---- New UWP targets (stub dispatch infrastructure) ---- */
+        case QIHSE_UWP_TARGET_SQL:
+            /* 0x01=PARSE 0x02=EXECUTE 0x03=BIND 0x04=DESCRIBE 0x05=CLOSE */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_TXN:
+            /* 0x01=BEGIN 0x02=COMMIT 0x03=ROLLBACK 0x04=SAVEPOINT 0x05=ROLLBACK_TO_SAVEPOINT */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_GRAPH2:
+            /* 0x01=MATCH 0x02=CREATE 0x03=MERGE 0x04=DELETE 0x05=SET 0x06=REMOVE 0x10=ALGO */
+            if ((header->command_opcode >= 0x01 && header->command_opcode <= 0x06) ||
+                header->command_opcode == 0x10) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_INDEX:
+            /* 0x01=CREATE_INDEX 0x02=SCAN 0x03=INSERT 0x04=BULK_LOAD 0x05=DROP */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_SCHEMA:
+            /* 0x01=CREATE_TABLE 0x02=DROP_TABLE 0x03=ALTER_TABLE 0x04=GET_TABLE
+             * 0x05=CREATE_INDEX 0x06=DROP_INDEX */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x06) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_REPL:
+            /* 0x01=APPEND_WAL 0x02=SHIP_WAL 0x03=SYNC_REPLICA 0x04=STATUS */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x04) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
+        case QIHSE_UWP_TARGET_POOL:
+            /* 0x01=ACQUIRE 0x02=RELEASE 0x03=STATS */
+            if (header->command_opcode >= 0x01 && header->command_opcode <= 0x03) {
+                const char* reply = "OK\n";
+                uwp_write_all(client_fd, reply, 3);
+            }
+            break;
+
         default:
             /* Unknown target, ignore */
             break;
     }
     return false;
+}
+
+/* In-process UWP dispatcher used by protocol translation layers and Bolt server.
+ * Executes a UWP packet without a socket and writes the textual reply into
+ * out_response (a simple "OK\n" stub for now). Returns true on success. */
+bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, const qihse_uwp_header_t* header,
+                        const uint8_t* payload, size_t payload_len,
+                        uint8_t* out_response, size_t out_cap, size_t* out_len) {
+    if (!ctx || !header) return false;
+    if (memcmp(header->magic, "QIHSE", 5) != 0) return false;
+    uint64_t plen = le64toh(header->payload_length);
+    if (plen > payload_len) return false;
+
+    /* Validate target is in the known set */
+    uint8_t t = header->target_engine;
+    bool known = (t <= QIHSE_UWP_TARGET_STREAM) ||
+                 (t == QIHSE_UWP_TARGET_SQL) || (t == QIHSE_UWP_TARGET_TXN) ||
+                 (t == QIHSE_UWP_TARGET_GRAPH2) || (t == QIHSE_UWP_TARGET_INDEX) ||
+                 (t == QIHSE_UWP_TARGET_SCHEMA) || (t == QIHSE_UWP_TARGET_REPL) ||
+                 (t == QIHSE_UWP_TARGET_POOL);
+    if (!known) return false;
+
+    /* Stub: produce an "OK\n" response for any valid command opcode */
+    if (out_response && out_cap >= 3) {
+        memcpy(out_response, "OK\n", 3);
+        if (out_len) *out_len = 3;
+    } else if (out_len) {
+        *out_len = 0;
+    }
+    (void)payload;
+    return true;
 }
 
 void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_data, size_t len) {
