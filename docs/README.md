@@ -74,16 +74,17 @@ flowchart TB
 | Read Replicas | `0x0D` | `qihse_read_replica_*` | Health-checked pool with round-robin routing |
 | Backup & Restore | Native | `qihse_backup_*` | Full/incremental backups with checksums |
 | Parallel Query | Native | `qihse_parallel_*` | Multi-worker parallel scan/join/aggregate |
-| Connection Pooler | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling |
+| Connection Pooler | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling, 16 SHOW commands, 10 control commands, authentication, statistics |
 | CDC | `0x0F` | `qihse_cdc_*` | Change Data Capture — pub/sub event streaming with LSN tracking |
-| MongoDB Wire | `0x10` | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server |
+| MongoDB Wire | `0x10` | `qihse_mongo_wire_*` | BSON serialization + MongoDB wire protocol server with CRUD, query operators, aggregation pipeline, admin commands, in-memory catalog |
 | HTTP/REST API | `0x11` | `qihse_http_api_*` | HTTP server with route registration, JSON responses |
-| ClickHouse HTTP | `0x12` | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface (TSV/JSON) |
-| Elasticsearch API | `0x13` | `qihse_es_api_*` | ES-compatible `_search`, `_doc`, `_bulk`, `_cluster/health` |
+| ClickHouse HTTP | `0x12` | `qihse_clickhouse_http_*` | ClickHouse-compatible HTTP query interface with MergeTree engines, materialized views, dictionaries, ARRAY JOIN, PREWHERE, SAMPLE, SETTINGS, system tables |
+| Elasticsearch API | `0x13` | `qihse_es_api_*` | ES-compatible query DSL, aggregations, mappings, index management, cat API, cluster/nodes, scroll, PIT, scripts, templates |
+| InfluxDB API | `0x14` | `qihse_influx_api_*` | InfluxQL parser, line protocol ingestion, HTTP API (/query, /write, /health, /ping) |
 | Prometheus Metrics | Native | `qihse_metrics_*` | Counter/gauge/histogram/summary, `/metrics` export |
 | OpenTelemetry | Native | `qihse_tracing_*` | Distributed tracing with span management, JSON export |
 | Compaction & TTL | Native | `qihse_compaction_*` | Background SSTable compaction, TTL expiration sweeps |
-| SQL Extensions | Native | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions |
+| SQL Extensions | Native | `qihse_sql_extensions_*` | `VECTOR_SEARCH()`, `TIME_BUCKET()`, `MATCH()` table functions, ClickHouse SQL extensions (MergeTree, MV, dictionaries) |
 
 ---
 
@@ -124,11 +125,12 @@ Operational runbooks: vector DB mutation flows, memory maintenance loops, benchm
 - [SQL Engine & Query Processing](architecture/sql_engine.md) — Full SQL parser, JOIN/GROUP BY/ORDER BY/subqueries, query executors, cost-based optimizer, schema registry, prepared statements
 - [ACID Transactions & MVCC](architecture/transactions_mvcc.md) — Transaction manager, MVCC version chains, unified WAL, crash recovery, 2PC
 - [Secondary Indexes](architecture/secondary_indexes.md) — B+ tree, hash index, composite keys, index manager, index scan executor
-- [General DB Engine Replacement Roadmap](plans/qihse_general_db_engine_roadmap.md) — 8-phase roadmap to replace PostgreSQL/Redis/MongoDB/ClickHouse/ES/Neo4j/InfluxDB
+- [General DB Engine Replacement Roadmap](plans/qihse_general_db_engine_roadmap.md) — 9-phase roadmap to replace PostgreSQL/Redis/MongoDB/ClickHouse/ES/Neo4j/InfluxDB (Phase 9: Database Equivalency Commands COMPLETE)
 - [Full PostgreSQL & Neo4j Replacement Plan](plans/qihse_pg_neo4j_full_replacement_plan.md) — UWP 0x08-0x0E, Bolt protocol, Cypher, SDKs
 - [Graph Engine & Cypher](architecture/graph_engine.md) — Vertex/edge store, Cypher parser, graph algorithms, vector fusion
 - [Replication & Backup](architecture/replication_backup.md) — Streaming replication, read replicas, backup/restore
 - [Bolt Protocol](architecture/bolt_protocol.md) — Neo4j Bolt 4.x wire protocol with PackStream
+- [Operational & Protocol Layer](architecture/operational_protocols.md) — CDC, MongoDB wire, HTTP/REST, ClickHouse HTTP, ES API, InfluxDB API, metrics, tracing, compaction, SQL extensions, database equivalency commands
 
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md) — COMPLETE
