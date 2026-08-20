@@ -66,9 +66,15 @@ flowchart TB
 | Document Store | `0x03` | `qihse_document_*` | JSON insertion with JIT-compiled access paths |
 | Time-Series DB | `0x05` | `qihse_timeseries_*` | Gorilla XOR bit-packing, lock-free ingress |
 | Columnar Engine | `0x04` | `qihse_column_*` | AVX-accelerated OLAP, strided page alignment |
-| Graph Engine | `0x06` | `qihse_graph_*` | Anchor + HNSW multi-hop traversal (reserved target) |
+| Graph Engine | `0x06` / `0x0A` | `qihse_graph_*`, `qihse_cypher_*` | Vertex/edge store, Cypher parser/executor, graph algorithms (BFS, DFS, Dijkstra, A*, PageRank, SCC), graph+vector fusion |
 | Full-Text Search | Native | `qihse_fts_*` | BM25 lexical search, zero-copy tokenization |
 | Event Stream | `0x07` | `qihse_event_*` | `mmap`/`sendfile` DMA append-only log |
+| Bolt Protocol | `0x0A` | `qihse_bolt_*` | Neo4j Bolt 4.x with PackStream serialization |
+| Streaming Replication | `0x0D` | `qihse_repl_*` | Primary/replica WAL shipping, replication slots |
+| Read Replicas | `0x0D` | `qihse_read_replica_*` | Health-checked pool with round-robin routing |
+| Backup & Restore | Native | `qihse_backup_*` | Full/incremental backups with checksums |
+| Parallel Query | Native | `qihse_parallel_*` | Multi-worker parallel scan/join/aggregate |
+| Connection Pooler | `0x0E` | `qihse_pooler_*` | Session/transaction/statement pooling |
 
 ---
 
@@ -110,6 +116,10 @@ Operational runbooks: vector DB mutation flows, memory maintenance loops, benchm
 - [ACID Transactions & MVCC](architecture/transactions_mvcc.md) — Transaction manager, MVCC version chains, unified WAL, crash recovery, 2PC
 - [Secondary Indexes](architecture/secondary_indexes.md) — B+ tree, hash index, composite keys, index manager, index scan executor
 - [General DB Engine Replacement Roadmap](plans/qihse_general_db_engine_roadmap.md) — 8-phase roadmap to replace PostgreSQL/Redis/MongoDB/ClickHouse/ES/Neo4j/InfluxDB
+- [Full PostgreSQL & Neo4j Replacement Plan](plans/qihse_pg_neo4j_full_replacement_plan.md) — UWP 0x08-0x0E, Bolt protocol, Cypher, SDKs
+- [Graph Engine & Cypher](architecture/graph_engine.md) — Vertex/edge store, Cypher parser, graph algorithms, vector fusion
+- [Replication & Backup](architecture/replication_backup.md) — Streaming replication, read replicas, backup/restore
+- [Bolt Protocol](architecture/bolt_protocol.md) — Neo4j Bolt 4.x wire protocol with PackStream
 
 - [AF_XDP Kernel-Bypass Operational Guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Redis Cluster Sharding Plan](plans/qihse_redis_cluster_sharding_plan.md) — COMPLETE
