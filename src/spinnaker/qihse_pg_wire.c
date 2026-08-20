@@ -13,6 +13,9 @@
 #include "qihse_kv_store.h"
 #include "qihse_timeseries.h"
 #include "qihse_column.h"
+#include "qihse_sql_parser.h"
+#include "qihse_schema.h"
+#include "qihse_optimizer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -502,6 +505,110 @@ static qihse_user_t* pg_send_auth_and_startup(int fd) {
     return &local_user;
 }
 
+
+/* -------------------------------------------------------------------------
+ * Prepared statement cache (extended query protocol)
+ * ------------------------------------------------------------------------- */
+#define QIHSE_PG_MAX_PREPARED 64
+
+typedef struct {
+    char name[128];
+    char query[4096];
+    int16_t num_param_oids;
+    int32_t param_oids[64];
+    int in_use;
+} pg_prepared_stmt_t;
+
+typedef struct {
+    pg_prepared_stmt_t stmts[QIHSE_PG_MAX_PREPARED];
+    size_t count;
+} pg_stmt_cache_t;
+
+static void pg_stmt_cache_init(pg_stmt_cache_t* cache) {
+    memset(cache, 0, sizeof(*cache));
+}
+
+static pg_prepared_stmt_t* pg_stmt_cache_lookup(pg_stmt_cache_t* cache, const char* name) {
+    for (size_t i = 0; i < cache->count; i++) {
+        if (cache->stmts[i].in_use && strcmp(cache->stmts[i].name, name) == 0)
+            return &cache->stmts[i];
+    }
+    return NULL;
+}
+
+static pg_prepared_stmt_t* pg_stmt_cache_put(pg_stmt_cache_t* cache, const char* name,
+                                              const char* query, const int32_t* param_oids,
+                                              int16_t num_params) {
+    /* check if name already exists (replace) */
+    pg_prepared_stmt_t* s = pg_stmt_cache_lookup(cache, name);
+    if (!s) {
+        if (cache->count >= QIHSE_PG_MAX_PREPARED) {
+            /* evict slot 0 */
+            memmove(&cache->stmts[0], &cache->stmts[1], (QIHSE_PG_MAX_PREPARED - 1) * sizeof(pg_prepared_stmt_t));
+            cache->count = QIHSE_PG_MAX_PREPARED - 1;
+        }
+        s = &cache->stmts[cache->count++];
+    }
+    memset(s, 0, sizeof(*s));
+    strncpy(s->name, name, sizeof(s->name) - 1);
+    strncpy(s->query, query, sizeof(s->query) - 1);
+    s->num_param_oids = num_params;
+    for (int16_t i = 0; i < num_params && i < 64; i++) s->param_oids[i] = param_oids[i];
+    s->in_use = 1;
+    return s;
+}
+
+static void pg_stmt_cache_remove(pg_stmt_cache_t* cache, const char* name) {
+    pg_prepared_stmt_t* s = pg_stmt_cache_lookup(cache, name);
+    if (s) s->in_use = 0;
+}
+
+/* Substitute $1, $2, ... parameters in a query with bound values.
+ * Returns a newly-allocated string. */
+static char* pg_substitute_params(const char* query, const char** params, int16_t num_params) {
+    if (!query) return NULL;
+    if (num_params == 0) return strdup(query);
+    /* build result */
+    size_t cap = strlen(query) + 256;
+    char* result = (char*)malloc(cap);
+    size_t pos = 0;
+    const char* p = query;
+    while (*p) {
+        if (*p == '$' && p[1] >= '1' && p[1] <= '9') {
+            int idx = p[1] - '0';
+            /* handle multi-digit */
+            const char* d = p + 1;
+            while (*d >= '0' && *d <= '9') d++;
+            int param_idx = (int)strtol(p + 1, NULL, 10) - 1;
+            p = d;
+            if (param_idx >= 0 && param_idx < num_params && params[param_idx]) {
+                const char* val = params[param_idx];
+                size_t vlen = strlen(val);
+                /* quote string values */
+                size_t need = vlen + 4;
+                if (pos + need >= cap) {
+                    cap = (cap + need) * 2;
+                    result = (char*)realloc(result, cap);
+                }
+                result[pos++] = '\'';
+                for (size_t i = 0; i < vlen; i++) {
+                    if (val[i] == '\'') { result[pos++] = '\''; result[pos++] = '\''; }
+                    else result[pos++] = val[i];
+                }
+                result[pos++] = '\'';
+            } else {
+                if (pos + 4 >= cap) { cap *= 2; result = (char*)realloc(result, cap); }
+                result[pos++] = 'N'; result[pos++] = 'U'; result[pos++] = 'L'; result[pos++] = 'L';
+            }
+        } else {
+            if (pos + 1 >= cap) { cap *= 2; result = (char*)realloc(result, cap); }
+            result[pos++] = *p++;
+        }
+    }
+    result[pos] = '\0';
+    return result;
+}
+
 void qihse_pg_wire_handle_client_multi(
     int fd,
     qihse_kv_store_t* store,
@@ -524,7 +631,11 @@ void qihse_pg_wire_handle_client_multi(
         return;
     }
 
-    char last_parsed_query[4096] = {0};
+    pg_stmt_cache_t stmt_cache;
+    pg_stmt_cache_init(&stmt_cache);
+    char last_portal_query[4096] = {0};
+    char last_stmt_name[128] = {0};
+
     while (1) {
         uint8_t msg_type;
         if (pg_read_all(fd, &msg_type, 1) < 0) break;
@@ -565,31 +676,66 @@ void qihse_pg_wire_handle_client_multi(
             case 'S':
                 pg_send_ready_for_query(fd);
                 break;
+            /* ---- Parse (P): store prepared statement ---- */
             case 'P': {
                 const char* stmt_name = body ? (const char*)body : "";
                 size_t name_len = strlen(stmt_name) + 1;
                 const char* parsed_query = body ? (const char*)(body + name_len) : "";
-                strncpy(last_parsed_query, parsed_query, sizeof(last_parsed_query) - 1);
-                pg_send_msg(fd, '1', NULL, 0);
+                /* skip parameter OID array (int16 count + int32 oids) */
+                const int16_t* nptr = (const int16_t*)(body + name_len + strlen(parsed_query) + 1);
+                int16_t num_params = 0;
+                const int32_t* param_oids = NULL;
+                if ((size_t)((const uint8_t*)nptr - body) + 2 <= body_len) {
+                    num_params = (int16_t)(((uint16_t)nptr[0] << 8) | (uint16_t)((const uint8_t*)nptr)[1]);
+                    /* big-endian */
+                    num_params = (int16_t)(((uint16_t)((const uint8_t*)nptr)[0] << 8) | (uint16_t)((const uint8_t*)nptr)[1]);
+                    param_oids = (const int32_t*)((const uint8_t*)nptr + 2);
+                }
+                pg_stmt_cache_put(&stmt_cache, stmt_name, parsed_query, param_oids, num_params);
+                pg_send_msg(fd, '1', NULL, 0);  /* ParseComplete */
                 break;
             }
-            case 'B':
-                pg_send_msg(fd, '2', NULL, 0);
+            /* ---- Bind (B): bind parameters to a portal ---- */
+            case 'B': {
+                /* portal name (cstring), stmt name (cstring), then param formats, params, result formats */
+                const char* portal_name = body ? (const char*)body : "";
+                size_t portal_len = strlen(portal_name) + 1;
+                const char* stmt_name = body ? (const char*)(body + portal_len) : "";
+                pg_prepared_stmt_t* ps = pg_stmt_cache_lookup(&stmt_cache, stmt_name);
+                if (ps) {
+                    strncpy(last_portal_query, ps->query, sizeof(last_portal_query) - 1);
+                    last_portal_query[sizeof(last_portal_query)-1] = '\0';
+                    strncpy(last_stmt_name, stmt_name, sizeof(last_stmt_name) - 1);
+                }
+                pg_send_msg(fd, '2', NULL, 0);  /* BindComplete */
                 break;
+            }
+            /* ---- Describe (D): send row description ---- */
             case 'D': {
                 const char* col_names[] = {"id", "score", "metric", "payload"};
                 const int32_t type_oids[] = {23, 25, 25, 25};
                 pg_send_row_description(fd, col_names, type_oids, 4);
                 break;
             }
+            /* ---- Execute (E): run the bound portal ---- */
             case 'E': {
-                if (last_parsed_query[0]) {
-                    pg_handle_query_ctx(fd, &ctx, last_parsed_query, user);
-                    last_parsed_query[0] = '\0';
+                if (last_portal_query[0]) {
+                    pg_handle_query_ctx(fd, &ctx, last_portal_query, user);
+                    last_portal_query[0] = '\0';
                 } else {
-                    pg_send_msg(fd, 'I', NULL, 0);
+                    pg_send_msg(fd, 'I', NULL, 0);  /* EmptyQueryResponse */
                     pg_send_ready_for_query(fd);
                 }
+                break;
+            }
+            /* ---- Sync (S) handled above; Close (C) ---- */
+            case 'C': {
+                const char* close_type = body ? (const char*)body : "";
+                if (body && body_len > 0 && close_type[0] == 'S') {
+                    const char* sname = body + 1;
+                    pg_stmt_cache_remove(&stmt_cache, sname);
+                }
+                pg_send_msg(fd, '3', NULL, 0);  /* CloseComplete */
                 break;
             }
             default:
