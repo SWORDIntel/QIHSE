@@ -20,7 +20,10 @@ _LIB_PATHS = [
 _lib = None
 for p in _LIB_PATHS:
     if os.path.exists(p):
-        _lib = ctypes.CDLL(p)
+        # RTLD_GLOBAL is critical: qihse_vfs.so links libqihse.so as a NEEDED
+        # dependency. If we load with RTLD_LOCAL (default), the VFS extension
+        # loads a SECOND copy with fresh global state → segfault.
+        _lib = ctypes.CDLL(p, mode=getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0))
         break
 
 if _lib is None:

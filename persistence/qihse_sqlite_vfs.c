@@ -153,7 +153,7 @@ static const sqlite3_io_methods qihse_io_methods = {
 /* ── VFS descriptor ──────────────────────────────────────────────────────── */
 
 static sqlite3_vfs qihse_vfs_desc = {
-    .iVersion          = 1,
+    .iVersion          = 2,
     .szOsFile          = (int)sizeof(qihse_vfs_file_t),
     .mxPathname        = PATH_MAX,
     .pNext             = NULL,
