@@ -10,6 +10,51 @@
 #include <stdio.h>
 #include <math.h>
 
+/* ---- CSV line parser (for LOAD CSV) ---- */
+
+typedef struct {
+    char** fields;
+    size_t count;
+} csv_row_t__;
+
+static csv_row_t__ csv_parse_line__(const char* line, char delim) {
+    csv_row_t__ row = { .fields = NULL, .count = 0 };
+    size_t cap = 8;
+    row.fields = malloc(cap * sizeof(char*));
+    size_t fcap = 256;
+    char* field = malloc(fcap);
+    size_t fi = 0;
+    bool in_quotes = false;
+    const char* p = line;
+    while (*p) {
+        if (in_quotes) {
+            if (*p == '"') { if (p[1] == '"') { field[fi++] = '"'; p += 2; } else { in_quotes = false; p++; } }
+            else field[fi++] = *p++;
+        } else {
+            if (*p == '"') { in_quotes = true; p++; }
+            else if (*p == delim) {
+                field[fi] = '\0';
+                if (row.count == cap) { cap *= 2; row.fields = realloc(row.fields, cap * sizeof(char*)); }
+                row.fields[row.count++] = strdup(field);
+                fi = 0; p++;
+            } else if (*p == '\r' || *p == '\n') break;
+            else field[fi++] = *p++;
+        }
+        if (fi >= fcap - 1) { fcap *= 2; field = realloc(field, fcap); }
+    }
+    field[fi] = '\0';
+    if (row.count == cap) { cap *= 2; row.fields = realloc(row.fields, cap * sizeof(char*)); }
+    row.fields[row.count++] = strdup(field);
+    free(field);
+    return row;
+}
+
+static void csv_row_free__(csv_row_t__* r) {
+    for (size_t i = 0; i < r->count; i++) free(r->fields[i]);
+    free(r->fields);
+    r->fields = NULL; r->count = 0;
+}
+
 /* ---- result value helpers ---- */
 
 cypher_res_t cypher_res_int64(int64_t v) { cypher_res_t r = {0}; r.type = CRES_INT64; r.val.i = v; return r; }
@@ -341,6 +386,15 @@ static cypher_res_t eval_expr(qihse_graph_t* g, const cypher_expr_t* e, const br
         }
         case CEXPR_PROP_ACCESS: {
             cypher_res_t base = eval_expr(g, e->left, row);
+            if (base.type == CRES_NULL && e->left && e->left->type == CEXPR_VAR && e->left->s_val && e->s_val) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s.%s", e->left->s_val, e->s_val);
+                const cypher_res_t* v = brow_get(row, buf);
+                if (v) return cypher_res_dup(v);
+                /* also try just the property name without the var prefix */
+                v = brow_get(row, e->s_val);
+                if (v) return cypher_res_dup(v);
+            }
             uint64_t id = base.val.id;
             bool is_v = (base.type == CRES_VERTEX), is_e = (base.type == CRES_EDGE);
             cypher_res_free(&base);
@@ -845,6 +899,98 @@ static void exec_unwind(qihse_graph_t* g, const qihse_cypher_clause_t* c, table_
     }
 }
 
+/* ---- LOAD CSV ---- */
+
+static void exec_load_csv(qihse_graph_t* g, const qihse_cypher_clause_t* c, table_t* in, table_t* out) {
+    (void)g;
+    table_init(out);
+    if (!c->csv_uri) return;
+
+    /* strip file:/// prefix if present */
+    const char* path = c->csv_uri;
+    if (strncmp(path, "file:///", 8) == 0) path += 7; /* keep leading / */
+    else if (strncmp(path, "file://", 7) == 0) path += 7;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+
+    char line[65536];
+    char delim = c->csv_field_term ? c->csv_field_term : ',';
+    csv_row_t__ headers = { .fields = NULL, .count = 0 };
+
+    /* if WITH HEADERS, read first line as headers */
+    if (c->csv_with_headers) {
+        if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
+        line[strcspn(line, "\r\n")] = '\0';
+        headers = csv_parse_line__(line, delim);
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+
+        csv_row_t__ row = csv_parse_line__(line, delim);
+
+        /* build a binding row: the csv_var gets a map of column→value */
+        brow_t nr;
+        brow_init(&nr);
+
+        /* carry over existing bindings from input table (if any) */
+        if (in->count > 0) {
+            brow_copy_into(&in->rows[0], &nr);
+        }
+
+        /* create a map value for the row variable */
+        cypher_res_t map_val;
+        map_val.type = CRES_LIST; /* reuse LIST as a poor-man's map (pairs) */
+        size_t npairs = headers.count ? headers.count : row.count;
+        map_val.val.list.items = calloc(npairs, sizeof(cypher_res_t));
+        map_val.val.list.count = npairs;
+
+        for (size_t i = 0; i < npairs; i++) {
+            const char* key = (i < headers.count) ? headers.fields[i] : NULL;
+            const char* val = (i < row.count) ? row.fields[i] : "";
+            if (!key) {
+                char buf[16]; snprintf(buf, sizeof(buf), "col_%zu", i);
+                map_val.val.list.items[i] = cypher_res_string(buf);
+            } else {
+                map_val.val.list.items[i] = cypher_res_string(key);
+            }
+            /* store value as next item (key, value pairs) */
+            /* Actually, let's use a simpler approach: set each column as a
+             * separate binding var.column_name = value, and also set the
+             * row var to a map-like structure. For simplicity, we set
+             * var.column = value for each column. */
+        }
+
+        /* Simpler approach: set csv_var as a string map by setting
+         * "csv_var.col_name" = value for each column. But the binding system
+         * uses flat names. Let's set the row var to a CRES_LIST of alternating
+         * key/value strings, and also set individual "var.col" bindings. */
+        cypher_res_free(&map_val);
+
+        for (size_t i = 0; i < row.count; i++) {
+            const char* key = (i < headers.count) ? headers.fields[i] : NULL;
+            char binding_name[256];
+            if (key)
+                snprintf(binding_name, sizeof(binding_name), "%s.%s", c->csv_var, key);
+            else {
+                snprintf(binding_name, sizeof(binding_name), "%s.col_%zu", c->csv_var, i);
+            }
+            brow_set(&nr, binding_name, cypher_res_string(row.fields[i]));
+
+            /* also set just the column name (without var prefix) for convenience */
+            if (key) brow_set(&nr, key, cypher_res_string(row.fields[i]));
+        }
+
+        table_add(out, nr);
+        csv_row_free__(&row);
+    }
+
+    if (headers.fields) csv_row_free__(&headers);
+    fclose(f);
+}
+
 /* ---- aggregation ---- */
 
 static bool expr_has_aggregate(const cypher_expr_t* e) {
@@ -1098,6 +1244,9 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
             }
             case CYPHER_UNWIND: {
                 table_t out; exec_unwind(g, c, &cur, &out); table_free(&cur); cur = out; break;
+            }
+            case CYPHER_LOAD_CSV: {
+                table_t out; exec_load_csv(g, c, &cur, &out); table_free(&cur); cur = out; break;
             }
             case CYPHER_RETURN: {
                 rs = calloc(1, sizeof(cypher_result_set_t));
