@@ -430,6 +430,10 @@ test-routing-persistence: lib
 	$(CC) $(CFLAGS) -o tests/test_routing_persistence tests/qihse_routing_persistence_test.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_routing_persistence
 
+test-pqc: lib
+	$(CC) $(CFLAGS) -o tests/test_pqc_e2e tests/test_pqc_e2e.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. QIHSE_ENABLE_PQC=1 ./tests/test_pqc_e2e
+
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
 	    tests/qihse_trinary_codec_test.c \
