@@ -379,62 +379,63 @@ typedef struct {
 
 typedef struct {
     id_map_entry_t* entries;
-    size_t count;
     size_t cap;
+    size_t count;
 } id_map_t;
 
-/* We store the id_map inside the graph's arena-adjacent space via a global.
- * In a production system this would be per-graph; here we use a thread-local
- * approach with a simple static map keyed by graph pointer. */
-static id_map_t* g_id_maps = NULL;
-static size_t g_id_map_count = 0;
-static size_t g_id_map_cap = 0;
-static pthread_mutex_t g_id_map_lock = PTHREAD_MUTEX_INITIALIZER;
-
 static id_map_t* get_id_map(qihse_graph_t* g) {
-    pthread_mutex_lock(&g_id_map_lock);
-    for (size_t i = 0; i < g_id_map_count; i++) {
-        if (g_id_maps[i].entries == NULL) continue;
-        /* use the first entry's key as a sentinel? No — we need a proper graph pointer map.
-         * Instead, store the graph pointer in the first entry's key field. */
-    }
-    /* simpler: use graph pointer as index (hash by pointer) */
-    size_t idx = ((uintptr_t)g >> 4) % g_id_map_cap;
-    /* linear probe */
-    for (size_t i = 0; i < g_id_map_cap; i++) {
-        size_t j = (idx + i) % g_id_map_cap;
-        if (g_id_maps[j].count == 0) {
-            /* empty slot — but we need to distinguish "empty" from "has entries with 0 count"
-             * Use entries == NULL as empty marker */
-            if (g_id_maps[j].entries == NULL) {
-                /* Check if this slot was assigned to this graph already */
-                /* We need a different approach — store graph ptr in a parallel array */
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_id_map_lock);
-    /* Fallback: just use a single global map. This is fine for single-graph ingest. */
-    static id_map_t global_map = { .entries = NULL, .count = 0, .cap = 0 };
+    (void)g;
+    static id_map_t global_map = { .entries = NULL, .cap = 0, .count = 0 };
     return &global_map;
 }
 
-void qihse_graph_ingest_register_id(qihse_graph_t* g, const char* external_id, uint64_t internal_id) {
-    (void)g;
-    id_map_t* m = get_id_map(g);
-    if (m->count == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 256;
-        m->entries = realloc(m->entries, m->cap * sizeof(id_map_entry_t));
+// Simple FNV-1a hash
+static uint64_t hash_str(const char* str) {
+    uint64_t hash = 14695981039346656037ULL;
+    while (*str) {
+        hash ^= (unsigned char)*str++;
+        hash *= 1099511628211ULL;
     }
-    m->entries[m->count].key = strdup(external_id);
-    m->entries[m->count].id = internal_id;
+    return hash;
+}
+
+void qihse_graph_ingest_register_id(qihse_graph_t* g, const char* external_id, uint64_t internal_id) {
+    id_map_t* m = get_id_map(g);
+    if (m->count * 2 >= m->cap) {
+        size_t new_cap = m->cap ? m->cap * 2 : 1024;
+        id_map_entry_t* new_entries = calloc(new_cap, sizeof(id_map_entry_t));
+        for (size_t i = 0; i < m->cap; i++) {
+            if (m->entries[i].key) {
+                size_t idx = hash_str(m->entries[i].key) & (new_cap - 1);
+                while (new_entries[idx].key) idx = (idx + 1) & (new_cap - 1);
+                new_entries[idx] = m->entries[i];
+            }
+        }
+        free(m->entries);
+        m->entries = new_entries;
+        m->cap = new_cap;
+    }
+    size_t idx = hash_str(external_id) & (m->cap - 1);
+    while (m->entries[idx].key) {
+        if (strcmp(m->entries[idx].key, external_id) == 0) {
+            m->entries[idx].id = internal_id;
+            return;
+        }
+        idx = (idx + 1) & (m->cap - 1);
+    }
+    m->entries[idx].key = strdup(external_id);
+    m->entries[idx].id = internal_id;
     m->count++;
 }
 
 uint64_t qihse_graph_ingest_lookup_id(qihse_graph_t* g, const char* external_id) {
-    (void)g;
     id_map_t* m = get_id_map(g);
-    for (size_t i = 0; i < m->count; i++) {
-        if (strcmp(m->entries[i].key, external_id) == 0) return m->entries[i].id;
+    if (m->cap > 0) {
+        size_t idx = hash_str(external_id) & (m->cap - 1);
+        while (m->entries[idx].key) {
+            if (strcmp(m->entries[idx].key, external_id) == 0) return m->entries[idx].id;
+            idx = (idx + 1) & (m->cap - 1);
+        }
     }
     /* try numeric */
     char* endp;
@@ -444,9 +445,10 @@ uint64_t qihse_graph_ingest_lookup_id(qihse_graph_t* g, const char* external_id)
 }
 
 void qihse_graph_ingest_clear_ids(qihse_graph_t* g) {
-    (void)g;
     id_map_t* m = get_id_map(g);
-    for (size_t i = 0; i < m->count; i++) free(m->entries[i].key);
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->entries[i].key) free(m->entries[i].key);
+    }
     free(m->entries);
     m->entries = NULL;
     m->count = 0;
