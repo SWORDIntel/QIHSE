@@ -25,6 +25,30 @@
 #endif
 
 /* ============================================================
+ * Connection helpers
+ * ============================================================ */
+
+/* Extract the IPv4 source address of the peer connected to fd, in host
+ * byte order. Returns 0 if the address cannot be determined (in which
+ * case the auth rate limiter falls back to its global singleton entry). */
+static uint32_t bolt_get_source_ip(int fd) {
+#ifndef _WIN32
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*)&addr, &addr_len) == 0) {
+        return ntohl(addr.sin_addr.s_addr);
+    }
+#else
+    struct sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*)&addr, &addr_len) == 0) {
+        return ntohl(addr.sin_addr.s_addr);
+    }
+#endif
+    return 0;
+}
+
+/* ============================================================
  * PackStream encoder
  * ============================================================ */
 
@@ -743,7 +767,25 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                         }
                     }
                     if (username && password) {
-                        bolt_user = qihse_auth_authenticate(username, password);
+                        /* Per-IP rate limiting: check before attempting auth.
+                         * qihse_auth_check_rate_limit() increments the attempt
+                         * counter for source_ip and returns false if the limit
+                         * has been exceeded. */
+                        uint32_t source_ip = bolt_get_source_ip(client_fd);
+                        if (!qihse_auth_check_rate_limit(source_ip)) {
+                            bolt_send_failure(client_fd,
+                                              "Neo.ClientError.Security.RateLimited",
+                                              "rate limited");
+                            qihse_bolt_value_free(hello_map);
+                            break;
+                        }
+                        bolt_user = qihse_auth_authenticate_from(source_ip,
+                                                                 username,
+                                                                 password);
+                        if (bolt_user) {
+                            /* Successful auth: clear the per-IP counter. */
+                            qihse_auth_rate_limit_reset(source_ip);
+                        }
                     }
                     if (bolt_user) {
                         authenticated = true;

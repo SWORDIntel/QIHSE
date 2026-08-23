@@ -234,7 +234,14 @@ typedef enum {
     UWP_ROUTE_ERR_DISPATCH
 } uwp_route_result_t;
 
-static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_context_t* ctx,
+/* Forward declaration: uwp_conn_t is fully defined below, but uwp_route_payload
+ * needs to forward the connection pointer to the TLS-aware write helper so that
+ * replies are encrypted when ctx->tls_ctx is configured. */
+typedef struct uwp_conn_s uwp_conn_t;
+static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len);
+
+static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* conn,
+                                             qihse_uwp_context_t* ctx,
                                              qihse_uwp_header_t* header, uint8_t* payload,
                                              size_t actual_payload_len, qihse_user_t** user_slot, qihse_txn_t** current_txn) {
     /* Magic Byte Verification */
@@ -267,13 +274,13 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
             uwp_log_auth_failure(client_fd, username, "rate limited");
             return UWP_ROUTE_ERR_RATE_LIMITED;
         }
-        *user_slot = qihse_auth_authenticate(username, password);
+        *user_slot = qihse_auth_authenticate_from(uwp_peer_ipv4(client_fd), username, password);
         if (!*user_slot) {
             uwp_log_auth_failure(client_fd, username, "failed");
             return UWP_ROUTE_ERR_AUTH;
         }
         const char* reply = "OK\n";
-        uwp_write_all(client_fd, reply, 3);
+        uwp_tls_write_all(conn, reply, 3);
         return UWP_ROUTE_OK;
     }
 
@@ -302,7 +309,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                     return UWP_ROUTE_ERR_PERM;
                 }
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -334,7 +341,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -355,7 +362,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                 }
                 if (!qihse_doc_store_insert_json(ctx->doc, doc_id, json)) return UWP_ROUTE_ERR_DISPATCH;
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
 #endif
@@ -382,7 +389,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
 #endif
@@ -407,7 +414,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
 #endif
@@ -432,7 +439,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, qihse_uwp_co
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
                 const char* reply = "OK\n";
-                uwp_write_all(client_fd, reply, 3);
+                uwp_tls_write_all(conn, reply, 3);
                 return UWP_ROUTE_OK;
             }
 #endif
@@ -612,7 +619,7 @@ void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_d
     if (payload_length > QIHSE_UWP_MAX_PAYLOAD) return;
     uint8_t* payload = (uint8_t*)payload_data + sizeof(qihse_uwp_header_t);
     uwp_route_result_t result = uwp_route_payload(
-        -1, ctx, header, payload, len - sizeof(qihse_uwp_header_t), NULL, NULL);
+        -1, NULL, ctx, header, payload, len - sizeof(qihse_uwp_header_t), NULL, NULL);
     if (result != UWP_ROUTE_OK) return;
 }
 
@@ -640,7 +647,7 @@ typedef enum {
     READING_PAYLOAD
 } uwp_read_state_t;
 
-typedef struct {
+typedef struct uwp_conn_s {
     uwp_socket_t fd;
     qihse_uwp_context_t* ctx;
     qihse_user_t* user;
@@ -653,6 +660,15 @@ typedef struct {
     qihse_uwp_header_t header;
     size_t payload_length;
     qihse_txn_t* current_txn;
+    /* TLS (ChaCha20-Poly1305 AEAD) state. When tls_session is non-NULL the wire
+     * carries length-prefixed encrypted records; otherwise cleartext is used. */
+    qihse_uwp_tls_session_t* tls_session;
+    uint8_t  tls_decbuf[16384];   /* scratch plaintext buffer for one record   */
+    size_t   tls_decbuf_len;      /* valid bytes in tls_decbuf                 */
+    size_t   tls_decbuf_pos;      /* next unread byte in tls_decbuf            */
+    uint8_t* tls_rawbuf;          /* accumulation buffer for raw encrypted bytes */
+    size_t   tls_rawbuf_cap;      /* capacity of tls_rawbuf                    */
+    size_t   tls_rawbuf_len;      /* valid bytes in tls_rawbuf                 */
 } uwp_conn_t;
 
 typedef enum {
@@ -743,10 +759,211 @@ static void uwp_conn_destroy(uwp_conn_t* conn) {
         qihse_txn_rollback((qihse_txn_manager_t*)conn->ctx->txn_manager, conn->current_txn);
         conn->current_txn = NULL;
     }
+    if (conn->tls_session) {
+        qihse_uwp_tls_session_destroy(conn->tls_session);
+        conn->tls_session = NULL;
+    }
     if (conn->source_ip_tracked) uwp_connection_release(conn->source_ip);
     uwp_socket_close(conn->fd);
     free(conn->rbuf);
+    free(conn->tls_rawbuf);
     free(conn);
+}
+
+/* ---- TLS (ChaCha20-Poly1305 AEAD) transport helpers ----
+ *
+ * When conn->tls_session is non-NULL the wire format becomes a stream of
+ * length-prefixed AEAD records:
+ *
+ *     [4-byte little-endian record_len][record_len bytes of ciphertext]
+ *
+ * where the ciphertext layout is [12-byte nonce][encrypted data][16-byte tag]
+ * (28 bytes of AEAD overhead per record). When conn->tls_session is NULL (the
+ * default) behaviour is byte-for-byte identical to the original cleartext path:
+ * the helpers delegate to uwp_write_all / read(). */
+
+static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len) {
+    if (!conn || !conn->tls_session) {
+        uwp_socket_t fd = conn ? conn->fd : UWP_INVALID_SOCKET;
+        uwp_write_all(fd, (const char*)data, len);
+        return (ssize_t)len;
+    }
+
+    /* Allocate room for the 4-byte length prefix + nonce + ciphertext + tag. */
+    size_t cap = len + 28;
+    uint8_t* frame = (uint8_t*)malloc(cap + 4);
+    if (!frame) return -1;
+
+    size_t out_len = 0;
+    if (qihse_uwp_tls_encrypt(conn->tls_session, (const uint8_t*)data, len,
+                              frame + 4, cap, &out_len) != 0) {
+        free(frame);
+        return -1;
+    }
+
+    /* Prepend the 4-byte little-endian record length. */
+    uint32_t rec_len = (uint32_t)out_len;
+    frame[0] = (uint8_t)(rec_len & 0xff);
+    frame[1] = (uint8_t)((rec_len >> 8) & 0xff);
+    frame[2] = (uint8_t)((rec_len >> 16) & 0xff);
+    frame[3] = (uint8_t)((rec_len >> 24) & 0xff);
+
+    /* Write the whole frame (prefix + ciphertext), detecting partial writes. */
+    size_t total = out_len + 4;
+    size_t off = 0;
+    bool ok = true;
+    while (off < total) {
+#ifdef _WIN32
+        int chunk = total - off > INT_MAX ? INT_MAX : (int)(total - off);
+        int w = send(conn->fd, (const char*)frame + off, chunk, MSG_NOSIGNAL);
+        if (w == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            ok = false;
+            break;
+        }
+        if (w == 0) { ok = false; break; }
+        off += (size_t)w;
+#else
+        ssize_t w = write(conn->fd, frame + off, total - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (w == 0) { ok = false; break; }
+        off += (size_t)w;
+#endif
+    }
+
+    free(frame);
+    return ok ? (ssize_t)len : -1;
+}
+
+/* Blocking-style read helper. When TLS is disabled this is a plain read();
+ * when TLS is enabled it reads one length-prefixed AEAD record, decrypts it
+ * into conn->tls_decbuf, and copies up to @p cap bytes into @p buf. Returns
+ * the number of bytes copied, or -1 on error / short read (errno=EAGAIN). */
+static ssize_t __attribute__((unused))
+uwp_tls_read(uwp_conn_t* conn, uint8_t* buf, size_t cap) {
+    if (!conn || !conn->tls_session) {
+#ifdef _WIN32
+        int r = recv(conn ? conn->fd : INVALID_SOCKET, (char*)buf, (int)cap, 0);
+        if (r == SOCKET_ERROR) return -1;
+        return (ssize_t)r;
+#else
+        return read(conn ? conn->fd : -1, buf, cap);
+#endif
+    }
+
+    /* Serve any leftover decrypted plaintext first. */
+    if (conn->tls_decbuf_pos < conn->tls_decbuf_len) {
+        size_t avail = conn->tls_decbuf_len - conn->tls_decbuf_pos;
+        size_t n = avail < cap ? avail : cap;
+        memcpy(buf, conn->tls_decbuf + conn->tls_decbuf_pos, n);
+        conn->tls_decbuf_pos += n;
+        return (ssize_t)n;
+    }
+
+    /* Read the 4-byte little-endian record length prefix. */
+    uint8_t lenbuf[4];
+    size_t filled = 0;
+    while (filled < 4) {
+#ifdef _WIN32
+        int r = recv(conn->fd, (char*)lenbuf + filled, (int)(4 - filled), 0);
+        if (r == SOCKET_ERROR) { errno = EAGAIN; return -1; }
+        if (r == 0) { errno = EAGAIN; return -1; }
+        filled += (size_t)r;
+#else
+        ssize_t r = read(conn->fd, lenbuf + filled, 4 - filled);
+        if (r <= 0) { errno = EAGAIN; return -1; }
+        filled += (size_t)r;
+#endif
+    }
+    uint32_t rec_len = (uint32_t)lenbuf[0] | ((uint32_t)lenbuf[1] << 8) |
+                       ((uint32_t)lenbuf[2] << 16) | ((uint32_t)lenbuf[3] << 24);
+    if (rec_len < 28 || rec_len > sizeof(conn->tls_decbuf) + 28) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    /* Read the ciphertext record. */
+    uint8_t* cipher = (uint8_t*)malloc(rec_len);
+    if (!cipher) return -1;
+    size_t got = 0;
+    while (got < rec_len) {
+#ifdef _WIN32
+        int r = recv(conn->fd, (char*)cipher + got, (int)(rec_len - got), 0);
+        if (r == SOCKET_ERROR) { free(cipher); errno = EAGAIN; return -1; }
+        if (r == 0) { free(cipher); errno = EAGAIN; return -1; }
+        got += (size_t)r;
+#else
+        ssize_t r = read(conn->fd, cipher + got, rec_len - got);
+        if (r <= 0) { free(cipher); errno = EAGAIN; return -1; }
+        got += (size_t)r;
+#endif
+    }
+
+    size_t out_len = 0;
+    if (qihse_uwp_tls_decrypt(conn->tls_session, cipher, rec_len,
+                              conn->tls_decbuf, sizeof(conn->tls_decbuf),
+                              &out_len) != 0) {
+        free(cipher);
+        errno = EBADMSG;
+        return -1;
+    }
+    free(cipher);
+
+    conn->tls_decbuf_len = out_len;
+    conn->tls_decbuf_pos = 0;
+    size_t n = out_len < cap ? out_len : cap;
+    memcpy(buf, conn->tls_decbuf, n);
+    conn->tls_decbuf_pos = n;
+    return (ssize_t)n;
+}
+
+/* Drain complete AEAD records from conn->tls_rawbuf, decrypt them, and copy the
+ * resulting plaintext into conn->rbuf (respecting the current read target
+ * length). Returns the number of plaintext bytes appended to rbuf, or -1 on a
+ * decrypt / framing error. Used by the async (io_uring) and Windows read paths
+ * after raw encrypted bytes have been pulled off the socket. */
+static ssize_t uwp_tls_drain_records(uwp_conn_t* conn) {
+    if (!conn || !conn->tls_session) return 0;
+    size_t target_len = conn->state == READING_HEADER
+        ? sizeof(qihse_uwp_header_t) : conn->payload_length;
+    size_t appended = 0;
+
+    while (conn->rbuf_len < target_len && conn->tls_rawbuf_len >= 4) {
+        uint32_t rec_len = (uint32_t)conn->tls_rawbuf[0] |
+                           ((uint32_t)conn->tls_rawbuf[1] << 8) |
+                           ((uint32_t)conn->tls_rawbuf[2] << 16) |
+                           ((uint32_t)conn->tls_rawbuf[3] << 24);
+        if (rec_len < 28 || rec_len > QIHSE_UWP_MAX_PAYLOAD + 28) return -1;
+        if (conn->tls_rawbuf_len < (size_t)4 + rec_len) break; /* need more bytes */
+
+        size_t out_len = 0;
+        if (qihse_uwp_tls_decrypt(conn->tls_session,
+                                  conn->tls_rawbuf + 4, rec_len,
+                                  conn->tls_decbuf, sizeof(conn->tls_decbuf),
+                                  &out_len) != 0) {
+            return -1;
+        }
+
+        /* Consume the record from the raw accumulation buffer. */
+        size_t consume = (size_t)4 + rec_len;
+        memmove(conn->tls_rawbuf, conn->tls_rawbuf + consume,
+                conn->tls_rawbuf_len - consume);
+        conn->tls_rawbuf_len -= consume;
+
+        /* Copy plaintext into rbuf up to the current target length. */
+        size_t space = target_len - conn->rbuf_len;
+        size_t copy = out_len < space ? out_len : space;
+        memcpy(conn->rbuf + conn->rbuf_len, conn->tls_decbuf, copy);
+        conn->rbuf_len += copy;
+        appended += copy;
+    }
+
+    return (ssize_t)appended;
 }
 
 #ifndef _WIN32
@@ -771,10 +988,6 @@ static bool uwp_add_accept(struct io_uring *ring, int server_fd,
 }
 
 static bool uwp_add_read(struct io_uring *ring, uwp_conn_t* conn) {
-    size_t target_len = conn->state == READING_HEADER
-        ? sizeof(qihse_uwp_header_t) : conn->payload_length;
-    if (conn->rbuf_len >= target_len) return false;
-
     uwp_event_ctx_t *ev = malloc(sizeof(uwp_event_ctx_t));
     if (!ev) return false;
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
@@ -786,9 +999,26 @@ static bool uwp_add_read(struct io_uring *ring, uwp_conn_t* conn) {
     ev->fd = conn->fd;
     ev->ctx = conn->ctx;
     ev->conn = conn;
-    
-    io_uring_prep_recv(sqe, conn->fd, conn->rbuf + conn->rbuf_len,
-                       target_len - conn->rbuf_len, 0);
+
+    if (conn->tls_session) {
+        /* TLS: read a chunk of raw encrypted bytes into tls_rawbuf. */
+        if (conn->tls_rawbuf_cap < conn->tls_rawbuf_len + 4096) {
+            size_t need = conn->tls_rawbuf_len + 4096;
+            uint8_t* grown = realloc(conn->tls_rawbuf, need);
+            if (!grown) { free(ev); return false; }
+            conn->tls_rawbuf = grown;
+            conn->tls_rawbuf_cap = need;
+        }
+        io_uring_prep_recv(sqe, conn->fd,
+                           conn->tls_rawbuf + conn->tls_rawbuf_len,
+                           conn->tls_rawbuf_cap - conn->tls_rawbuf_len, 0);
+    } else {
+        size_t target_len = conn->state == READING_HEADER
+            ? sizeof(qihse_uwp_header_t) : conn->payload_length;
+        if (conn->rbuf_len >= target_len) { free(ev); return false; }
+        io_uring_prep_recv(sqe, conn->fd, conn->rbuf + conn->rbuf_len,
+                           target_len - conn->rbuf_len, 0);
+    }
     io_uring_sqe_set_data(sqe, ev);
     return true;
 }
@@ -816,6 +1046,20 @@ static uwp_conn_t* uwp_conn_create(uwp_socket_t fd, qihse_uwp_context_t* ctx,
     conn->source_ip_tracked = true;
     conn->state = READING_HEADER;
     conn->current_txn = NULL;
+    /* TLS: derive a per-connection session when transport encryption is on.
+     * On failure, tear down the partially-built connection (releasing the
+     * connection slot and freeing the read buffer) and return NULL so the
+     * caller closes the socket fd. */
+    if (ctx && ctx->tls_ctx) {
+        conn->tls_session = qihse_uwp_tls_session_create(ctx->tls_ctx);
+        if (!conn->tls_session) {
+            uwp_connection_release(source_ip);
+            conn->source_ip_tracked = false;
+            free(conn->rbuf);
+            free(conn);
+            return NULL;
+        }
+    }
     return conn;
 }
 
@@ -845,11 +1089,11 @@ static void uwp_conn_reset(uwp_conn_t* conn) {
 
 static bool uwp_windows_dispatch_frame(uwp_conn_t* conn) {
     uwp_route_result_t route_result = uwp_route_payload(
-        conn->fd, conn->ctx, &conn->header, conn->rbuf,
+        conn->fd, conn, conn->ctx, &conn->header, conn->rbuf,
         conn->rbuf_len, &conn->user, &conn->current_txn);
     if (route_result != UWP_ROUTE_OK) {
         const char* reply = uwp_route_error_reply(route_result);
-        uwp_write_all(conn->fd, reply, strlen(reply));
+        uwp_tls_write_all(conn, reply, strlen(reply));
         return false;
     }
     uwp_conn_reset(conn);
@@ -857,6 +1101,61 @@ static bool uwp_windows_dispatch_frame(uwp_conn_t* conn) {
 }
 
 static bool uwp_windows_receive(uwp_conn_t* conn) {
+    /* TLS path: pull raw encrypted bytes off the socket, decrypt complete AEAD
+     * records into conn->rbuf, then run the cleartext frame state machine. */
+    if (conn->tls_session) {
+        if (conn->tls_rawbuf_cap < conn->tls_rawbuf_len + 4096) {
+            size_t need = conn->tls_rawbuf_len + 4096;
+            uint8_t* grown = realloc(conn->tls_rawbuf, need);
+            if (!grown) return false;
+            conn->tls_rawbuf = grown;
+            conn->tls_rawbuf_cap = need;
+        }
+        int received = recv(conn->fd,
+                            (char*)conn->tls_rawbuf + conn->tls_rawbuf_len,
+                            (int)(conn->tls_rawbuf_cap - conn->tls_rawbuf_len), 0);
+        if (received == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            return error == WSAEWOULDBLOCK;
+        }
+        if (received == 0) return false;
+        conn->tls_rawbuf_len += (size_t)received;
+        if (uwp_tls_drain_records(conn) < 0) {
+            const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_DISPATCH);
+            uwp_tls_write_all(conn, reply, strlen(reply));
+            return false;
+        }
+
+        size_t target_len = conn->state == READING_HEADER
+            ? sizeof(qihse_uwp_header_t) : conn->payload_length;
+        if (conn->rbuf_len < target_len) return true; /* need more records */
+
+        if (conn->state == READING_HEADER) {
+            memcpy(&conn->header, conn->rbuf, sizeof(conn->header));
+            if (memcmp(conn->header.magic, qihse_uwp_magic,
+                       sizeof(conn->header.magic)) != 0) {
+                uwp_tls_write_all(conn, "ERR_MAGIC\n", 10);
+                return false;
+            }
+            if (conn->header.version != 0x01) {
+                uwp_tls_write_all(conn, "ERR_VERSION\n", 12);
+                return false;
+            }
+            uint64_t payload_length = uwp_payload_length(&conn->header);
+            if (payload_length > QIHSE_UWP_MAX_PAYLOAD) {
+                uwp_tls_write_all(conn, "ERR_TOO_LARGE\n", 14);
+                return false;
+            }
+            if (!uwp_conn_prepare_payload(conn, (size_t)payload_length)) {
+                uwp_tls_write_all(conn, "ERR_DISPATCH\n", 13);
+                return false;
+            }
+            if (payload_length == 0) return uwp_windows_dispatch_frame(conn);
+            return true;
+        }
+        return uwp_windows_dispatch_frame(conn);
+    }
+
     size_t target_len = conn->state == READING_HEADER
         ? sizeof(qihse_uwp_header_t) : conn->payload_length;
     size_t remaining = target_len - conn->rbuf_len;
@@ -1060,12 +1359,78 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
             if (res <= 0) {
                 /* EOF, SO_RCVTIMEO expiry, or another recv error. */
                 uwp_conn_destroy(conn);
+            } else if (conn->tls_session) {
+                /* TLS: the recv filled conn->tls_rawbuf with encrypted bytes.
+                 * Decrypt complete AEAD records into conn->rbuf, then run the
+                 * same header/payload state machine on the plaintext. */
+                conn->tls_rawbuf_len += (size_t)res;
+                if (uwp_tls_drain_records(conn) < 0) {
+                    const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_DISPATCH);
+                    uwp_tls_write_all(conn, reply, strlen(reply));
+                    uwp_conn_destroy(conn);
+                    io_uring_submit(&ring);
+                } else {
+                    size_t target_len = conn->state == READING_HEADER
+                        ? sizeof(qihse_uwp_header_t) : conn->payload_length;
+                    if (conn->rbuf_len < target_len) {
+                        if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
+                        io_uring_submit(&ring);
+                    } else if (conn->state == READING_HEADER) {
+                        memcpy(&conn->header, conn->rbuf, sizeof(conn->header));
+                        if (memcmp(conn->header.magic, qihse_uwp_magic,
+                                   sizeof(conn->header.magic)) != 0) {
+                            const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_MAGIC);
+                            uwp_tls_write_all(conn, reply, strlen(reply));
+                            uwp_conn_destroy(conn);
+                        } else if (conn->header.version != 0x01) {
+                            uwp_tls_write_all(conn, "ERR_VERSION\n", 12);
+                            uwp_conn_destroy(conn);
+                        } else {
+                            uint64_t payload_length = uwp_payload_length(&conn->header);
+                            if (payload_length > QIHSE_UWP_MAX_PAYLOAD) {
+                                uwp_tls_write_all(conn, "ERR_TOO_LARGE\n", 14);
+                                uwp_conn_destroy(conn);
+                            } else if (!uwp_conn_prepare_payload(conn, (size_t)payload_length)) {
+                                const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_DISPATCH);
+                                uwp_tls_write_all(conn, reply, strlen(reply));
+                                uwp_conn_destroy(conn);
+                            } else if (payload_length == 0) {
+                                uwp_route_result_t route_result = uwp_route_payload(
+                                    conn->fd, conn, conn->ctx, &conn->header, conn->rbuf, 0, &conn->user, &conn->current_txn);
+                                if (route_result == UWP_ROUTE_OK) {
+                                    uwp_conn_reset(conn);
+                                    if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
+                                } else {
+                                    const char* reply = uwp_route_error_reply(route_result);
+                                    uwp_tls_write_all(conn, reply, strlen(reply));
+                                    uwp_conn_destroy(conn);
+                                }
+                            } else {
+                                if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
+                            }
+                            io_uring_submit(&ring);
+                        }
+                    } else {
+                        uwp_route_result_t route_result = uwp_route_payload(
+                            conn->fd, conn, conn->ctx, &conn->header, conn->rbuf,
+                            conn->rbuf_len, &conn->user, &conn->current_txn);
+                        if (route_result == UWP_ROUTE_OK) {
+                            uwp_conn_reset(conn);
+                            if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
+                        } else {
+                            const char* reply = uwp_route_error_reply(route_result);
+                            uwp_tls_write_all(conn, reply, strlen(reply));
+                            uwp_conn_destroy(conn);
+                        }
+                        io_uring_submit(&ring);
+                    }
+                }
             } else {
                 size_t target_len = conn->state == READING_HEADER
                     ? sizeof(qihse_uwp_header_t) : conn->payload_length;
                 size_t remaining = target_len - conn->rbuf_len;
                 if ((size_t)res > remaining) {
-                    uwp_write_all(conn->fd, "ERR_LEN\n", 8);
+                    uwp_tls_write_all(conn, "ERR_LEN\n", 8);
                     uwp_conn_destroy(conn);
                 } else {
                     conn->rbuf_len += (size_t)res;
@@ -1079,30 +1444,30 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
                     if (memcmp(conn->header.magic, qihse_uwp_magic,
                                sizeof(conn->header.magic)) != 0) {
                         const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_MAGIC);
-                        uwp_write_all(conn->fd, reply, strlen(reply));
+                        uwp_tls_write_all(conn, reply, strlen(reply));
                         uwp_conn_destroy(conn);
                     } else {
                         if (conn->header.version != 0x01) {
-                            uwp_write_all(conn->fd, "ERR_VERSION\n", 12);
+                            uwp_tls_write_all(conn, "ERR_VERSION\n", 12);
                             uwp_conn_destroy(conn);
                         } else {
                         uint64_t payload_length = uwp_payload_length(&conn->header);
                         if (payload_length > QIHSE_UWP_MAX_PAYLOAD) {
-                            uwp_write_all(conn->fd, "ERR_TOO_LARGE\n", 14);
+                            uwp_tls_write_all(conn, "ERR_TOO_LARGE\n", 14);
                             uwp_conn_destroy(conn);
                         } else if (!uwp_conn_prepare_payload(conn, (size_t)payload_length)) {
                             const char* reply = uwp_route_error_reply(UWP_ROUTE_ERR_DISPATCH);
-                            uwp_write_all(conn->fd, reply, strlen(reply));
+                            uwp_tls_write_all(conn, reply, strlen(reply));
                             uwp_conn_destroy(conn);
                         } else if (payload_length == 0) {
                             uwp_route_result_t route_result = uwp_route_payload(
-                                conn->fd, conn->ctx, &conn->header, conn->rbuf, 0, &conn->user, &conn->current_txn);
+                                conn->fd, conn, conn->ctx, &conn->header, conn->rbuf, 0, &conn->user, &conn->current_txn);
                             if (route_result == UWP_ROUTE_OK) {
                                 uwp_conn_reset(conn);
                                 if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
                             } else {
                                 const char* reply = uwp_route_error_reply(route_result);
-                                uwp_write_all(conn->fd, reply, strlen(reply));
+                                uwp_tls_write_all(conn, reply, strlen(reply));
                                 uwp_conn_destroy(conn);
                             }
                         } else {
@@ -1113,14 +1478,14 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
                     }
                 } else if ((size_t)res <= remaining) {
                     uwp_route_result_t route_result = uwp_route_payload(
-                        conn->fd, conn->ctx, &conn->header, conn->rbuf,
+                        conn->fd, conn, conn->ctx, &conn->header, conn->rbuf,
                         conn->rbuf_len, &conn->user, &conn->current_txn);
                     if (route_result == UWP_ROUTE_OK) {
                         uwp_conn_reset(conn);
                         if (!uwp_add_read(&ring, conn)) uwp_conn_destroy(conn);
                     } else {
                         const char* reply = uwp_route_error_reply(route_result);
-                        uwp_write_all(conn->fd, reply, strlen(reply));
+                        uwp_tls_write_all(conn, reply, strlen(reply));
                         uwp_conn_destroy(conn);
                     }
                     io_uring_submit(&ring);
