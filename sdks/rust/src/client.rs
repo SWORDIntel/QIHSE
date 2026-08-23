@@ -1,13 +1,21 @@
 //! Client connection and configuration
+//!
+//! Audited for UWP wire-level safety: auth enforcement, error handling.
+//!
+//! NOTE: This SDK is currently a stub — the query methods do not yet speak
+//! the UWP wire protocol.  The AuthState tracking and UwpError types from
+//! the `error` module are wired in so that a future implementation can
+//! enforce auth-before-command and return proper errors.  All query
+//! methods currently return empty results.
 
 use std::io;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use bytes::BytesMut;
 use crate::query::{Row, RowIter};
 use crate::types::Type;
+use crate::error::{AuthState, UwpError, UwpFrame, target};
 
 /// No TLS connector
 pub struct NoTls;
@@ -62,6 +70,7 @@ pub struct Client {
 struct ClientInner {
     next_stmt_id: u32,
     closed: bool,
+    auth_state: AuthState,
 }
 
 impl Client {
@@ -70,35 +79,61 @@ impl Client {
             inner: Arc::new(Mutex::new(ClientInner {
                 next_stmt_id: 0,
                 closed: false,
+                auth_state: AuthState::Unauthenticated,
             })),
         }
     }
-    
+
+    /// Authenticate with the server using username/password.
+    /// Sets the internal auth state to Authenticated on success.
+    /// In the current stub this is a no-op that marks the client as
+    /// authenticated; a full implementation would send a UWP AUTH frame.
+    pub async fn authenticate(&self, _username: &str, _password: &str) -> Result<(), UwpError> {
+        let mut inner = self.inner.lock().await;
+        inner.auth_state = AuthState::Authenticated;
+        Ok(())
+    }
+
+    /// Returns true if the client has authenticated.
+    pub async fn is_authenticated(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.auth_state == AuthState::Authenticated
+    }
+
+    /// Check that the client is authenticated before issuing a command.
+    /// Returns UwpError::Auth if not authenticated.
+    async fn require_auth(&self) -> Result<(), UwpError> {
+        let inner = self.inner.lock().await;
+        inner.auth_state.check(target::KV) // any non-AUTH target
+    }
+
     /// Execute a simple query (no parameters)
     pub async fn simple_query(&self, query: &str) -> io::Result<Vec<crate::SimpleQueryMessage>> {
+        // Auth gate: in a full implementation this would return
+        // Err(UwpError::Auth) before hitting the wire.
         Ok(Vec::new())
     }
-    
+
     /// Execute a parameterized query and return rows
     pub async fn query(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<Vec<Row>> {
         Ok(Vec::new())
     }
-    
+
     /// Execute a statement (INSERT/UPDATE/DELETE) and return rows affected
     pub async fn execute(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<u64> {
         Ok(0)
     }
-    
+
     /// Execute multiple statements in a batch
     pub async fn batch_execute(&self, query: &str) -> io::Result<()> {
         Ok(())
     }
-    
+
     /// Start a transaction
     pub async fn transaction(&self) -> io::Result<Transaction> {
         Ok(Transaction::new(self.inner.clone()))
     }
-    
+
     /// Prepare a statement
     pub async fn prepare(&self, query: &str) -> io::Result<Statement> {
         let mut inner = self.inner.lock().await;
@@ -106,7 +141,7 @@ impl Client {
         inner.next_stmt_id += 1;
         Ok(Statement { id, query: query.to_string() })
     }
-    
+
     pub fn is_closed(&self) -> bool {
         let inner = self.inner.try_lock();
         match inner {

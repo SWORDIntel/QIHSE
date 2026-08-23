@@ -8,6 +8,7 @@
 
 #include "qihse_schema.h"
 #include "qihse_sql_parser.h"
+#include "qihse_table_store.h"
 #include "qihse_txn.h"
 
 /* Optional window-function executor.  A parallel agent may introduce this
@@ -476,14 +477,20 @@ static int uwp_execute_insert(qihse_uwp_context_t* ctx,
 /* -------------------------------------------------------------------------
  * Prepared statement cache (PARSE / BIND / EXECUTE / CLOSE).
  *
- * A simple fixed-capacity array of prepared-statement slots protected by a
- * mutex.  Each slot caches the raw SQL text, the parsed statement type, the
- * expected parameter count, and any bound parameter values supplied via BIND.
+ * A chained hash table keyed by stmt_id (FNV-1a hash of the SQL text).
+ * Initial capacity is 256 buckets; the table grows dynamically when the
+ * load factor exceeds 0.75, providing O(1) average lookup.  Thread-safe
+ * via a single mutex.
+ *
+ * Each entry caches the raw SQL text, the parsed statement type, the
+ * expected parameter count, and any bound parameter values supplied via
+ * BIND.  stmt_id is a 32-bit FNV-1a hash of the SQL text, so it is
+ * deterministic for the same query text.
  * ------------------------------------------------------------------------- */
 
-#define UWP_PS_MAX_SLOTS  64
-#define UWP_PS_MAX_PARAMS 64
-#define UWP_PS_SQL_LEN    4096
+#define UWP_PS_MAX_PARAMS    64
+#define UWP_PS_SQL_LEN       4096
+#define UWP_PS_INIT_BUCKETS  256
 
 typedef struct {
     char  sql[UWP_PS_SQL_LEN];
@@ -494,8 +501,110 @@ typedef struct {
     int   num_bound;
 } uwp_ps_slot_t;
 
-static uwp_ps_slot_t uwp_ps_slots[UWP_PS_MAX_SLOTS];
-static pthread_mutex_t uwp_ps_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct uwp_ps_node {
+    uint32_t              stmt_id;
+    uwp_ps_slot_t*        slot;     /* heap-allocated */
+    struct uwp_ps_node*   next;
+} uwp_ps_node_t;
+
+typedef struct {
+    uwp_ps_node_t** buckets;
+    size_t          num_buckets;
+    size_t          count;
+    pthread_mutex_t mutex;
+} uwp_ps_hash_t;
+
+static uwp_ps_hash_t uwp_ps_hash = { NULL, 0, 0, PTHREAD_MUTEX_INITIALIZER };
+
+/* FNV-1a 32-bit hash of a NUL-terminated string. */
+static uint32_t uwp_fnv1a(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+/* Lazily initialise the hash table buckets. */
+static void uwp_ps_hash_ensure(uwp_ps_hash_t* h) {
+    if (h->buckets) return;
+    h->num_buckets = UWP_PS_INIT_BUCKETS;
+    h->buckets = (uwp_ps_node_t**)calloc(h->num_buckets, sizeof(uwp_ps_node_t*));
+}
+
+/* Grow the hash table when load factor > 0.75. */
+static void uwp_ps_hash_grow(uwp_ps_hash_t* h) {
+    if (h->count * 4 < h->num_buckets * 3) return;
+    size_t new_cap = h->num_buckets * 2;
+    uwp_ps_node_t** new_buckets =
+        (uwp_ps_node_t**)calloc(new_cap, sizeof(uwp_ps_node_t*));
+    if (!new_buckets) return;
+    for (size_t i = 0; i < h->num_buckets; i++) {
+        uwp_ps_node_t* node = h->buckets[i];
+        while (node) {
+            uwp_ps_node_t* next = node->next;
+            size_t idx = node->stmt_id % new_cap;
+            node->next = new_buckets[idx];
+            new_buckets[idx] = node;
+            node = next;
+        }
+    }
+    free(h->buckets);
+    h->buckets = new_buckets;
+    h->num_buckets = new_cap;
+}
+
+/* Find a node by stmt_id.  Returns NULL if not found. */
+static uwp_ps_node_t* uwp_ps_hash_find(uwp_ps_hash_t* h, uint32_t stmt_id) {
+    if (!h->buckets) return NULL;
+    size_t idx = stmt_id % h->num_buckets;
+    uwp_ps_node_t* node = h->buckets[idx];
+    while (node) {
+        if (node->stmt_id == stmt_id) return node;
+        node = node->next;
+    }
+    return NULL;
+}
+
+/* Insert a new node.  Caller must ensure stmt_id is not already present. */
+static uwp_ps_node_t* uwp_ps_hash_insert(uwp_ps_hash_t* h, uint32_t stmt_id,
+                                         uwp_ps_slot_t* slot) {
+    uwp_ps_node_t* node = (uwp_ps_node_t*)malloc(sizeof(uwp_ps_node_t));
+    if (!node) return NULL;
+    node->stmt_id = stmt_id;
+    node->slot = slot;
+    size_t idx = stmt_id % h->num_buckets;
+    node->next = h->buckets[idx];
+    h->buckets[idx] = node;
+    h->count++;
+    uwp_ps_hash_grow(h);
+    return node;
+}
+
+/* Remove and free a node by stmt_id.  The slot is freed by the caller. */
+static void uwp_ps_hash_remove(uwp_ps_hash_t* h, uint32_t stmt_id) {
+    if (!h->buckets) return;
+    size_t idx = stmt_id % h->num_buckets;
+    uwp_ps_node_t* prev = NULL;
+    uwp_ps_node_t* node = h->buckets[idx];
+    while (node) {
+        if (node->stmt_id == stmt_id) {
+            if (prev) prev->next = node->next;
+            else      h->buckets[idx] = node->next;
+            h->count--;
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+/* Free a slot and its bound values. */
+static void uwp_ps_slot_free(uwp_ps_slot_t* s) {
+    if (!s) return;
+    for (int i = 0; i < UWP_PS_MAX_PARAMS; i++)
+        free(s->bound_values[i]);
+    free(s);
+}
 
 /* Count parameter placeholders (? and $N refs) in a SQL string, skipping
  * single-quoted string literals.  Returns the max of the '?' count and the
@@ -1311,59 +1420,63 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
         qihse_sql_stmt_type_t st = ast->stmt_type;
         qihse_sql_ast_free(ast);
 
-        pthread_mutex_lock(&uwp_ps_mutex);
-        int slot = -1;
-        for (int i = 0; i < UWP_PS_MAX_SLOTS; i++) {
-            if (!uwp_ps_slots[i].valid) { slot = i; break; }
+        /* Hash the SQL text to get a stmt_id (FNV-1a 32-bit). */
+        uint32_t stmt_id = uwp_fnv1a(sql);
+        pthread_mutex_lock(&uwp_ps_hash.mutex);
+        uwp_ps_hash_ensure(&uwp_ps_hash);
+        uwp_ps_node_t* node = uwp_ps_hash_find(&uwp_ps_hash, stmt_id);
+        uwp_ps_slot_t* s = NULL;
+        if (node) {
+            /* Reuse existing slot — clear old bindings. */
+            s = node->slot;
+            uwp_ps_clear_bindings(s);
+        } else {
+            /* Allocate a new slot. */
+            s = (uwp_ps_slot_t*)calloc(1, sizeof(uwp_ps_slot_t));
+            if (!s) {
+                pthread_mutex_unlock(&uwp_ps_hash.mutex);
+                uwp_reply_cb(write_fn, write_ctx, "ERR_NO_SLOTS\n");
+                return UWP_STS_ERR_FAILED;
+            }
+            uwp_ps_hash_insert(&uwp_ps_hash, stmt_id, s);
         }
-        if (slot < 0) {
-            pthread_mutex_unlock(&uwp_ps_mutex);
-            uwp_reply_cb(write_fn, write_ctx, "ERR_NO_SLOTS\n");
-            return UWP_STS_ERR_FAILED;
-        }
-        uwp_ps_slot_t* s = &uwp_ps_slots[slot];
-        uwp_ps_clear_bindings(s);
         strncpy(s->sql, sql, UWP_PS_SQL_LEN - 1);
         s->sql[UWP_PS_SQL_LEN - 1] = '\0';
         s->valid = true;
         s->stmt_type = st;
         s->num_params = params;
-        pthread_mutex_unlock(&uwp_ps_mutex);
+        pthread_mutex_unlock(&uwp_ps_hash.mutex);
 
         uwp_text_buffer_t response = {0};
-        (void)uwp_text_appendf(&response, "OK stmt_id=%d params=%d\n", slot, params);
+        (void)uwp_text_appendf(&response, "OK stmt_id=%u params=%d\n", stmt_id, params);
         uwp_write_cb(write_fn, write_ctx, response.data, response.len);
         uwp_text_destroy(&response);
         return UWP_STS_OK;
     }
 
     /* --- BIND (0x03): bind parameter values to a prepared statement.
-     * Payload layout: [4-byte LE slot id][val1\0val2\0...valN\0] --- */
+     * Payload layout: [4-byte LE stmt_id][val1\0val2\0...valN\0] --- */
     if (command_opcode == 0x03) {
         if (!payload || payload_len < 4) {
             uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
             return UWP_STS_ERR_ARGS;
         }
-        uint32_t slot_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
+        uint32_t stmt_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
                            ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 24);
-        if (slot_id >= UWP_PS_MAX_SLOTS) {
+        pthread_mutex_lock(&uwp_ps_hash.mutex);
+        uwp_ps_node_t* node = uwp_ps_hash_find(&uwp_ps_hash, stmt_id);
+        if (!node || !node->slot || !node->slot->valid) {
+            pthread_mutex_unlock(&uwp_ps_hash.mutex);
             uwp_reply_cb(write_fn, write_ctx, "ERR_NOT_FOUND\n");
             return UWP_STS_ERR_FAILED;
         }
-        pthread_mutex_lock(&uwp_ps_mutex);
-        uwp_ps_slot_t* s = &uwp_ps_slots[slot_id];
-        if (!s->valid) {
-            pthread_mutex_unlock(&uwp_ps_mutex);
-            uwp_reply_cb(write_fn, write_ctx, "ERR_NOT_FOUND\n");
-            return UWP_STS_ERR_FAILED;
-        }
+        uwp_ps_slot_t* s = node->slot;
         uwp_ps_clear_bindings(s);
         size_t off = 4;
         while (off < payload_len && s->num_bound < UWP_PS_MAX_PARAMS) {
             const uint8_t* end = (const uint8_t*)memchr(payload + off, '\0',
                                                         payload_len - off);
             if (!end) {
-                /* no terminating NUL — take the remaining bytes verbatim */
                 size_t vlen = payload_len - off;
                 char* val = (char*)malloc(vlen + 1);
                 if (val) {
@@ -1383,37 +1496,32 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
             }
             off = (size_t)(end - payload) + 1;
         }
-        pthread_mutex_unlock(&uwp_ps_mutex);
+        pthread_mutex_unlock(&uwp_ps_hash.mutex);
         uwp_reply_cb(write_fn, write_ctx, "OK\n");
         return UWP_STS_OK;
     }
 
     /* --- CLOSE (0x05): release a prepared statement slot.
-     * Payload: [4-byte LE slot id] --- */
+     * Payload: [4-byte LE stmt_id] --- */
     if (command_opcode == 0x05) {
         if (!payload || payload_len != 4) {
             uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
             return UWP_STS_ERR_ARGS;
         }
-        uint32_t slot_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
+        uint32_t stmt_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
                            ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 24);
-        if (slot_id >= UWP_PS_MAX_SLOTS) {
+        pthread_mutex_lock(&uwp_ps_hash.mutex);
+        uwp_ps_node_t* node = uwp_ps_hash_find(&uwp_ps_hash, stmt_id);
+        if (!node || !node->slot) {
+            pthread_mutex_unlock(&uwp_ps_hash.mutex);
             uwp_reply_cb(write_fn, write_ctx, "ERR_NOT_FOUND\n");
             return UWP_STS_ERR_FAILED;
         }
-        pthread_mutex_lock(&uwp_ps_mutex);
-        uwp_ps_slot_t* s = &uwp_ps_slots[slot_id];
-        if (!s->valid) {
-            pthread_mutex_unlock(&uwp_ps_mutex);
-            uwp_reply_cb(write_fn, write_ctx, "ERR_NOT_FOUND\n");
-            return UWP_STS_ERR_FAILED;
-        }
+        uwp_ps_slot_t* s = node->slot;
         uwp_ps_clear_bindings(s);
-        s->valid = false;
-        s->num_params = 0;
-        s->stmt_type = QIHSE_SQL_UNKNOWN;
-        s->sql[0] = '\0';
-        pthread_mutex_unlock(&uwp_ps_mutex);
+        uwp_ps_slot_free(s);
+        uwp_ps_hash_remove(&uwp_ps_hash, stmt_id);
+        pthread_mutex_unlock(&uwp_ps_hash.mutex);
         uwp_reply_cb(write_fn, write_ctx, "OK\n");
         return UWP_STS_OK;
     }
@@ -1433,24 +1541,22 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
     bool ps_active = false;
 
     if (command_opcode == 0x02 && payload && payload_len >= 4) {
-        uint32_t slot_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
+        uint32_t stmt_id = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
                            ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 24);
-        if (slot_id < UWP_PS_MAX_SLOTS) {
-            pthread_mutex_lock(&uwp_ps_mutex);
-            uwp_ps_slot_t* s = &uwp_ps_slots[slot_id];
-            if (s->valid) {
-                ps_sql = uwp_ps_substitute(s);
-                pthread_mutex_unlock(&uwp_ps_mutex);
-                if (ps_sql) {
-                    sql = ps_sql;
-                    ps_active = true;
-                } else {
-                    uwp_reply_cb(write_fn, write_ctx, "ERR_EXEC\n");
-                    return UWP_STS_ERR_FAILED;
-                }
+        pthread_mutex_lock(&uwp_ps_hash.mutex);
+        uwp_ps_node_t* node = uwp_ps_hash_find(&uwp_ps_hash, stmt_id);
+        if (node && node->slot && node->slot->valid) {
+            ps_sql = uwp_ps_substitute(node->slot);
+            pthread_mutex_unlock(&uwp_ps_hash.mutex);
+            if (ps_sql) {
+                sql = ps_sql;
+                ps_active = true;
             } else {
-                pthread_mutex_unlock(&uwp_ps_mutex);
+                uwp_reply_cb(write_fn, write_ctx, "ERR_EXEC\n");
+                return UWP_STS_ERR_FAILED;
             }
+        } else {
+            pthread_mutex_unlock(&uwp_ps_hash.mutex);
         }
     }
 

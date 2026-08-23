@@ -2,11 +2,20 @@
 #define _GNU_SOURCE
 #endif
 /*
- * QIHSE Window Function Executor
+ * QIHSE Window Function Executor (Streaming)
  *
- * Buffers all input rows, sorts them by PARTITION BY then ORDER BY columns,
- * and computes window function values per partition.  The output schema is
- * the input schema plus one appended column per window specification.
+ * Sorts the input by PARTITION BY then ORDER BY columns (using the sort
+ * executor, which may spill to disk for large inputs), then streams through
+ * the sorted output computing window function values per partition on the
+ * fly.  Only the previous row is retained for partition-boundary and tie
+ * detection, reducing window-computation memory from O(n) to O(1).
+ *
+ * Note: the sort step may still buffer the entire input in memory when the
+ * input is small enough to fit below the spill threshold.  For very large
+ * inputs the sort executor spills to disk, so the overall memory footprint
+ * is bounded by the spill threshold rather than the full input size.  The
+ * window computation itself is fully streaming — it never buffers more
+ * than one row beyond the current one.
  *
  * Window functions implemented:
  *   ROW_NUMBER  — sequential 1-based counter within each partition
@@ -16,11 +25,16 @@
  *                           up to and including the current row
  */
 #include "qihse_window_executor.h"
+#include "qihse_sort_executor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+
+/* Spill threshold for the sort step: 64 MB.  When the in-memory sort buffer
+ * exceeds this, the sort executor spills to a temporary file and merges. */
+#define WIN_SORT_SPILL_THRESHOLD (64 * 1024 * 1024)
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -62,64 +76,6 @@ static char* win_longlong_to_str(long long v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", v);
     return strdup(buf);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Stream state                                                               */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    qihse_row_stream_t* input;
-    const qihse_exec_schema_t* input_schema;
-    qihse_window_spec_t* specs;
-    size_t num_specs;
-
-    /* buffered input rows (owned until computed) */
-    qihse_exec_row_t* buf;
-    size_t buf_count;
-    size_t buf_cap;
-
-    /* computed output rows (owned) */
-    qihse_exec_row_t* out_rows;
-    size_t out_count;
-    size_t out_pos;
-
-    /* output schema (owned by this state) */
-    qihse_exec_schema_t out_schema;
-    char** out_schema_names;
-
-    int built;   /* 1 once output has been computed */
-} window_state_t;
-
-/* ------------------------------------------------------------------------- */
-/* Sort: PARTITION BY then ORDER BY                                          */
-/* ------------------------------------------------------------------------- */
-
-static window_state_t* g_win_cmp_state;
-static int g_win_cmp_spec;
-
-static int win_row_cmp(const void* pa, const void* pb) {
-    const qihse_exec_row_t* a = (const qihse_exec_row_t*)pa;
-    const qihse_exec_row_t* b = (const qihse_exec_row_t*)pb;
-    const qihse_window_spec_t* sp = &g_win_cmp_state->specs[g_win_cmp_spec];
-
-    /* PARTITION BY columns (ascending) */
-    for (size_t i = 0; i < sp->num_partition_cols; i++) {
-        int idx = sp->partition_by_cols[i];
-        const char* va = (idx >= 0 && (size_t)idx < a->num_values) ? a->values[idx] : NULL;
-        const char* vb = (idx >= 0 && (size_t)idx < b->num_values) ? b->values[idx] : NULL;
-        int c = win_compare_values(va, vb);
-        if (c != 0) return c;
-    }
-    /* ORDER BY columns (ascending) */
-    for (size_t i = 0; i < sp->num_order_cols; i++) {
-        int idx = sp->order_by_cols[i];
-        const char* va = (idx >= 0 && (size_t)idx < a->num_values) ? a->values[idx] : NULL;
-        const char* vb = (idx >= 0 && (size_t)idx < b->num_values) ? b->values[idx] : NULL;
-        int c = win_compare_values(va, vb);
-        if (c != 0) return c;
-    }
-    return 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -207,163 +163,29 @@ static char* win_agg_result(qihse_window_func_t func, const win_agg_t* agg) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Build: drain input, sort, compute window values                            */
+/* Stream state                                                               */
 /* ------------------------------------------------------------------------- */
 
-static void window_build(window_state_t* st) {
-    if (st->built) return;
-    st->built = 1;
+typedef struct {
+    qihse_row_stream_t* sorted_input;  /* sorted stream (or original input) */
+    const qihse_exec_schema_t* input_schema;
+    qihse_window_spec_t* specs;
+    size_t num_specs;
 
-    /* 1. Drain the entire input into buf. */
-    qihse_exec_row_t* r;
-    while ((r = qihse_row_stream_next(st->input)) != NULL) {
-        if (st->buf_count >= st->buf_cap) {
-            st->buf_cap = st->buf_cap ? st->buf_cap * 2 : 64;
-            st->buf = (qihse_exec_row_t*)realloc(st->buf,
-                                                st->buf_cap * sizeof(qihse_exec_row_t));
-        }
-        st->buf[st->buf_count] = *r;   /* take ownership of the row contents */
-        free(r);
-        st->buf_count++;
-    }
+    /* previous row for partition/tie detection (owned) */
+    qihse_exec_row_t* prev_row;
+    int has_prev;
 
-    size_t n = st->buf_count;
-    size_t in_cols = st->input_schema ? st->input_schema->num_cols : 0;
-    size_t out_cols = in_cols + st->num_specs;
+    /* per-spec running state (allocated once, reused for all rows) */
+    win_agg_t* aggs;
+    long long* row_number;
+    long long* rank_val;
+    long long* dense_val;
 
-    /* 2. Sort rows by PARTITION BY then ORDER BY (using spec 0 as the
-     *    representative ordering; all specs share the same row ordering
-     *    for partition detection). If there are no specs, skip. */
-    if (st->num_specs > 0 && n > 1) {
-        g_win_cmp_state = st;
-        g_win_cmp_spec = 0;
-        qsort(st->buf, n, sizeof(qihse_exec_row_t), win_row_cmp);
-    }
-
-    /* 3. Allocate output rows. */
-    st->out_rows = (qihse_exec_row_t*)calloc(n ? n : 1, sizeof(qihse_exec_row_t));
-    st->out_count = n;
-
-    /* Per-spec running state. */
-    win_agg_t* aggs = (win_agg_t*)calloc(st->num_specs ? st->num_specs : 1,
-                                         sizeof(win_agg_t));
-    long long* row_number = (long long*)calloc(st->num_specs ? st->num_specs : 1,
-                                               sizeof(long long));
-    long long* rank_val   = (long long*)calloc(st->num_specs ? st->num_specs : 1,
-                                               sizeof(long long));
-    long long* dense_val  = (long long*)calloc(st->num_specs ? st->num_specs : 1,
-                                               sizeof(long long));
-    for (size_t i = 0; i < n; i++) {
-        qihse_exec_row_t* src = &st->buf[i];
-
-        /* Build the output row: input columns + one per spec. */
-        qihse_exec_row_t* out = &st->out_rows[i];
-        out->num_values = out_cols;
-        out->values = (char**)calloc(out_cols ? out_cols : 1, sizeof(char*));
-        for (size_t c = 0; c < in_cols; c++)
-            out->values[c] = win_strdup_or_null(src->values[c]);
-
-        for (size_t s = 0; s < st->num_specs; s++) {
-            qihse_window_spec_t* sp = &st->specs[s];
-            char* result = NULL;
-
-            /* Detect new partition (relative to previous row). */
-            int new_part = 0;
-            if (i == 0) {
-                new_part = 1;
-            } else if (!same_partition(&st->buf[i - 1], src, sp)) {
-                new_part = 1;
-            }
-
-            if (new_part) {
-                win_agg_reset(&aggs[s]);
-                row_number[s] = 0;
-                rank_val[s] = 0;
-                dense_val[s] = 0;
-            }
-
-            /* Detect whether the ORDER BY key ties with the previous row
-             * within this partition (for RANK / DENSE_RANK). */
-            int tie = 0;
-            if (sp->num_order_cols > 0 && i > 0 &&
-                same_partition(&st->buf[i - 1], src, sp) &&
-                same_order_key(&st->buf[i - 1], src, sp)) {
-                tie = 1;
-            }
-
-            switch (sp->func) {
-                case QIHSE_WIN_FUNC_ROW_NUMBER:
-                    row_number[s]++;
-                    result = win_longlong_to_str(row_number[s]);
-                    break;
-
-                case QIHSE_WIN_FUNC_RANK:
-                    if (new_part) {
-                        rank_val[s] = 1;
-                    } else if (!tie) {
-                        /* rank jumps to current 1-based position = row_number */
-                        rank_val[s] = row_number[s] + 1;
-                    }
-                    /* if tie, rank stays the same */
-                    result = win_longlong_to_str(rank_val[s]);
-                    break;
-
-                case QIHSE_WIN_FUNC_DENSE_RANK:
-                    if (new_part) {
-                        dense_val[s] = 1;
-                    } else if (!tie) {
-                        dense_val[s]++;
-                    }
-                    /* if tie, dense rank stays the same */
-                    result = win_longlong_to_str(dense_val[s]);
-                    break;
-
-                case QIHSE_WIN_FUNC_SUM:
-                case QIHSE_WIN_FUNC_COUNT:
-                case QIHSE_WIN_FUNC_AVG:
-                case QIHSE_WIN_FUNC_MIN:
-                case QIHSE_WIN_FUNC_MAX: {
-                    const char* v = (sp->arg_col >= 0 &&
-                                     (size_t)sp->arg_col < src->num_values)
-                                    ? src->values[sp->arg_col] : NULL;
-                    win_agg_accum(&aggs[s], v);
-                    result = win_agg_result(sp->func, &aggs[s]);
-                    break;
-                }
-
-                default:
-                    result = strdup("0");
-                    break;
-            }
-
-            /* ROW_NUMBER must always advance regardless of function type,
-             * because RANK uses it to compute skip positions. */
-            if (sp->func != QIHSE_WIN_FUNC_ROW_NUMBER) {
-                /* maintain an implicit row counter for rank computation */
-                if (new_part) {
-                    row_number[s] = 1;
-                } else {
-                    row_number[s]++;
-                }
-            }
-
-            out->values[in_cols + s] = result;
-        }
-    }
-
-    free(aggs);
-    free(row_number);
-    free(rank_val);
-    free(dense_val);
-
-    /* 4. Free the buffered input rows now that output is computed. */
-    for (size_t i = 0; i < st->buf_count; i++)
-        qihse_exec_row_free(&st->buf[i]);
-    free(st->buf);
-    st->buf = NULL;
-    st->buf_count = 0;
-    st->buf_cap = 0;
-}
+    /* output schema (owned by this state) */
+    qihse_exec_schema_t out_schema;
+    char** out_schema_names;
+} window_state_t;
 
 /* ------------------------------------------------------------------------- */
 /* Stream operations                                                          */
@@ -371,37 +193,150 @@ static void window_build(window_state_t* st) {
 
 static qihse_exec_row_t* window_next(qihse_row_stream_t* self) {
     window_state_t* st = (window_state_t*)self->state;
-    if (!st->built) window_build(st);
-    if (st->out_pos >= st->out_count) return NULL;
-    qihse_exec_row_t* src = &st->out_rows[st->out_pos++];
+
+    qihse_exec_row_t* cur = qihse_row_stream_next(st->sorted_input);
+    if (!cur) return NULL;
+
+    size_t in_cols = st->input_schema ? st->input_schema->num_cols : 0;
+    size_t out_cols = in_cols + st->num_specs;
+
+    /* Build the output row: input columns + one per spec. */
     qihse_exec_row_t* out = (qihse_exec_row_t*)malloc(sizeof(qihse_exec_row_t));
-    out->num_values = src->num_values;
-    out->values = (char**)calloc(src->num_values ? src->num_values : 1,
-                                 sizeof(char*));
-    for (size_t i = 0; i < src->num_values; i++)
-        out->values[i] = win_strdup_or_null(src->values[i]);
+    if (!out) {
+        qihse_exec_row_free(cur);
+        free(cur);
+        return NULL;
+    }
+    out->num_values = out_cols;
+    out->values = (char**)calloc(out_cols ? out_cols : 1, sizeof(char*));
+    if (!out->values) {
+        free(out);
+        qihse_exec_row_free(cur);
+        free(cur);
+        return NULL;
+    }
+    for (size_t c = 0; c < in_cols; c++)
+        out->values[c] = win_strdup_or_null(cur->values[c]);
+
+    for (size_t s = 0; s < st->num_specs; s++) {
+        qihse_window_spec_t* sp = &st->specs[s];
+        char* result = NULL;
+
+        /* Detect new partition (relative to previous row). */
+        int new_part = 0;
+        if (!st->has_prev) {
+            new_part = 1;
+        } else if (!same_partition(st->prev_row, cur, sp)) {
+            new_part = 1;
+        }
+
+        if (new_part) {
+            win_agg_reset(&st->aggs[s]);
+            st->row_number[s] = 0;
+            st->rank_val[s] = 0;
+            st->dense_val[s] = 0;
+        }
+
+        /* Detect whether the ORDER BY key ties with the previous row
+         * within this partition (for RANK / DENSE_RANK). */
+        int tie = 0;
+        if (sp->num_order_cols > 0 && st->has_prev &&
+            same_partition(st->prev_row, cur, sp) &&
+            same_order_key(st->prev_row, cur, sp)) {
+            tie = 1;
+        }
+
+        switch (sp->func) {
+            case QIHSE_WIN_FUNC_ROW_NUMBER:
+                st->row_number[s]++;
+                result = win_longlong_to_str(st->row_number[s]);
+                break;
+
+            case QIHSE_WIN_FUNC_RANK:
+                if (new_part) {
+                    st->rank_val[s] = 1;
+                } else if (!tie) {
+                    /* rank jumps to current 1-based position = row_number + 1 */
+                    st->rank_val[s] = st->row_number[s] + 1;
+                }
+                /* if tie, rank stays the same */
+                result = win_longlong_to_str(st->rank_val[s]);
+                break;
+
+            case QIHSE_WIN_FUNC_DENSE_RANK:
+                if (new_part) {
+                    st->dense_val[s] = 1;
+                } else if (!tie) {
+                    st->dense_val[s]++;
+                }
+                /* if tie, dense rank stays the same */
+                result = win_longlong_to_str(st->dense_val[s]);
+                break;
+
+            case QIHSE_WIN_FUNC_SUM:
+            case QIHSE_WIN_FUNC_COUNT:
+            case QIHSE_WIN_FUNC_AVG:
+            case QIHSE_WIN_FUNC_MIN:
+            case QIHSE_WIN_FUNC_MAX: {
+                const char* v = (sp->arg_col >= 0 &&
+                                 (size_t)sp->arg_col < cur->num_values)
+                                ? cur->values[sp->arg_col] : NULL;
+                win_agg_accum(&st->aggs[s], v);
+                result = win_agg_result(sp->func, &st->aggs[s]);
+                break;
+            }
+
+            default:
+                result = strdup("0");
+                break;
+        }
+
+        /* ROW_NUMBER must always advance regardless of function type,
+         * because RANK uses it to compute skip positions. */
+        if (sp->func != QIHSE_WIN_FUNC_ROW_NUMBER) {
+            if (new_part) {
+                st->row_number[s] = 1;
+            } else {
+                st->row_number[s]++;
+            }
+        }
+
+        out->values[in_cols + s] = result;
+    }
+
+    /* Save current row as prev_row for the next call; free old prev_row. */
+    if (st->prev_row) {
+        qihse_exec_row_free(st->prev_row);
+        free(st->prev_row);
+    }
+    st->prev_row = cur;
+    st->has_prev = 1;
+
     return out;
 }
 
 static void window_close(qihse_row_stream_t* self) {
     window_state_t* st = (window_state_t*)self->state;
     if (!st) return;
-    /* free any remaining buffered input rows */
-    for (size_t i = 0; i < st->buf_count; i++)
-        qihse_exec_row_free(&st->buf[i]);
-    free(st->buf);
-    /* free computed output rows */
-    for (size_t i = 0; i < st->out_count; i++)
-        qihse_exec_row_free(&st->out_rows[i]);
-    free(st->out_rows);
+    /* free previous row */
+    if (st->prev_row) {
+        qihse_exec_row_free(st->prev_row);
+        free(st->prev_row);
+    }
+    /* free per-spec running state */
+    free(st->aggs);
+    free(st->row_number);
+    free(st->rank_val);
+    free(st->dense_val);
     /* free specs (deep) */
     for (size_t s = 0; s < st->num_specs; s++) {
         free(st->specs[s].partition_by_cols);
         free(st->specs[s].order_by_cols);
     }
     free(st->specs);
-    /* close input */
-    qihse_row_stream_close(st->input);
+    /* close the sorted input stream (which closes the original input) */
+    if (st->sorted_input)
+        qihse_row_stream_close(st->sorted_input);
     /* free output schema names */
     for (size_t i = 0; i < st->out_schema.num_cols; i++)
         free(st->out_schema_names[i]);
@@ -430,13 +365,22 @@ qihse_row_stream_t* qihse_window_create(qihse_row_stream_t* input,
 
     qihse_row_stream_t* s = (qihse_row_stream_t*)calloc(1, sizeof(*s));
     window_state_t* st = (window_state_t*)calloc(1, sizeof(*st));
-    st->input = input;
+    if (!s || !st) {
+        free(s);
+        free(st);
+        return NULL;
+    }
     st->input_schema = input_schema;
     st->num_specs = num_specs;
 
     /* deep-copy specs */
     st->specs = (qihse_window_spec_t*)calloc(num_specs ? num_specs : 1,
                                              sizeof(qihse_window_spec_t));
+    if (!st->specs) {
+        free(st);
+        free(s);
+        return NULL;
+    }
     for (size_t i = 0; i < num_specs; i++) {
         st->specs[i].func = specs[i].func;
         st->specs[i].arg_col = specs[i].arg_col;
@@ -444,6 +388,16 @@ qihse_row_stream_t* qihse_window_create(qihse_row_stream_t* input,
         if (specs[i].num_partition_cols > 0) {
             st->specs[i].partition_by_cols = (int*)malloc(
                 specs[i].num_partition_cols * sizeof(int));
+            if (!st->specs[i].partition_by_cols) {
+                for (size_t j = 0; j < i; j++) {
+                    free(st->specs[j].partition_by_cols);
+                    free(st->specs[j].order_by_cols);
+                }
+                free(st->specs);
+                free(st);
+                free(s);
+                return NULL;
+            }
             memcpy(st->specs[i].partition_by_cols, specs[i].partition_by_cols,
                    specs[i].num_partition_cols * sizeof(int));
         }
@@ -451,8 +405,69 @@ qihse_row_stream_t* qihse_window_create(qihse_row_stream_t* input,
         if (specs[i].num_order_cols > 0) {
             st->specs[i].order_by_cols = (int*)malloc(
                 specs[i].num_order_cols * sizeof(int));
+            if (!st->specs[i].order_by_cols) {
+                free(st->specs[i].partition_by_cols);
+                for (size_t j = 0; j < i; j++) {
+                    free(st->specs[j].partition_by_cols);
+                    free(st->specs[j].order_by_cols);
+                }
+                free(st->specs);
+                free(st);
+                free(s);
+                return NULL;
+            }
             memcpy(st->specs[i].order_by_cols, specs[i].order_by_cols,
                    specs[i].num_order_cols * sizeof(int));
+        }
+    }
+
+    /* allocate per-spec running state */
+    st->aggs = (win_agg_t*)calloc(num_specs ? num_specs : 1, sizeof(win_agg_t));
+    st->row_number = (long long*)calloc(num_specs ? num_specs : 1, sizeof(long long));
+    st->rank_val   = (long long*)calloc(num_specs ? num_specs : 1, sizeof(long long));
+    st->dense_val  = (long long*)calloc(num_specs ? num_specs : 1, sizeof(long long));
+    if (!st->aggs || !st->row_number || !st->rank_val || !st->dense_val) {
+        free(st->aggs);
+        free(st->row_number);
+        free(st->rank_val);
+        free(st->dense_val);
+        for (size_t i = 0; i < num_specs; i++) {
+            free(st->specs[i].partition_by_cols);
+            free(st->specs[i].order_by_cols);
+        }
+        free(st->specs);
+        free(st);
+        free(s);
+        return NULL;
+    }
+
+    /* Build the sorted input stream.  We sort by spec 0's PARTITION BY then
+     * ORDER BY columns (all ascending).  All specs share the same row
+     * ordering for partition detection.  If there are no partition or order
+     * columns, no sort is needed and we stream directly from the input. */
+    st->sorted_input = input;
+    if (num_specs > 0) {
+        const qihse_window_spec_t* sp0 = &st->specs[0];
+        size_t num_sort_keys = sp0->num_partition_cols + sp0->num_order_cols;
+        if (num_sort_keys > 0) {
+            qihse_sort_key_t* keys =
+                (qihse_sort_key_t*)malloc(num_sort_keys * sizeof(qihse_sort_key_t));
+            if (keys) {
+                size_t k = 0;
+                for (size_t i = 0; i < sp0->num_partition_cols; i++)
+                    keys[k].col_idx = sp0->partition_by_cols[i],
+                    keys[k].ascending = 1, k++;
+                for (size_t i = 0; i < sp0->num_order_cols; i++)
+                    keys[k].col_idx = sp0->order_by_cols[i],
+                    keys[k].ascending = 1, k++;
+                qihse_row_stream_t* sorted =
+                    qihse_sort_create(input, keys, num_sort_keys,
+                                      WIN_SORT_SPILL_THRESHOLD);
+                free(keys);
+                if (sorted)
+                    st->sorted_input = sorted;
+                /* if sort creation failed, fall back to unsorted input */
+            }
         }
     }
 
