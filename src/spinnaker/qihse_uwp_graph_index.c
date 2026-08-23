@@ -45,6 +45,14 @@
 
 #define UWP_GI_MAX_FIELDS 4096u
 
+#if defined(_MSC_VER)
+#define UWP_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define UWP_THREAD_LOCAL _Thread_local
+#else
+#define UWP_THREAD_LOCAL __thread
+#endif
+
 typedef struct {
     const uint8_t* cur;
     const uint8_t* end;
@@ -225,9 +233,10 @@ static bool gi_fts_delete(void* handle, uint64_t row_id) {
 }
 
 /* Pending dimension for HNSW index creation.
- * Note: Not thread-safe for concurrent HNSW index creation; acceptable because
- * index creation is an administrative operation. */
-static size_t g_hnsw_pending_dim = 0;
+ * Thread-local: each thread has its own pending dimension, so concurrent
+ * HNSW creation from different threads is safe. Within a thread, creation
+ * is serialized by call order. */
+static UWP_THREAD_LOCAL size_t g_hnsw_pending_dim = 0;
 
 typedef struct {
     qihse_hnsw_index_t* index;
