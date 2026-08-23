@@ -1,7 +1,23 @@
 # QIHSE Unified Wire Protocol (UWP) — Cryptographic Framing Design
 
 **Document ID:** SEC-DES-2026-08-UWP-CRYPTO  
-**Status:** PROPOSED / ARCHITECTURAL SPECIFICATION  
+**Status:** PARTIALLY IMPLEMENTED (August 2026)  
+
+**Implementation note (August 2026):** Two transport encryption modes are now implemented in `src/spinnaker/qihse_uwp_tls.c`:
+
+1. **TLS 1.3 (cert-based):** `qihse_uwp_tls_ctx_create_selfsigned()` generates a self-signed X509 certificate + key via OpenSSL. `qihse_uwp_tls_ctx_create_with_cert()` loads a PEM cert/key pair. `qihse_uwp_tls_session_create_with_fd()` performs `SSL_accept` on the server side. Encrypt/decrypt operations use `SSL_write`/`SSL_read` through the OpenSSL `SSL*` object. Key rotation (`qihse_uwp_tls_ctx_rotate_key`) and session renegotiation (`qihse_uwp_tls_session_renegotiate`) are supported. This path is verified by a real TLS 1.3 handshake integration test (server `SSL_accept` + client `SSL_connect`).
+
+2. **ChaCha20-Poly1305 AEAD (symmetric key fallback):** `qihse_uwp_tls_ctx_create()` generates a random symmetric key. Per-connection session keys are derived via HKDF-SHA256. This path is NOT equivalent to TLS 1.3 — it lacks certificate-based authentication, handshake integrity, and protocol-level replay protection. It is intended for development or trusted-network deployments only.
+
+**What is NOT yet implemented from this design document:**
+- KTLS offload (the implementation uses userspace OpenSSL, not `TCP_ULP`)
+- mTLS (client certificate verification)
+- PQC hybrid key exchange (X25519MLKEM1024)
+- FIPS provider integration
+- Certificate chain validation policy
+- Anti-replay at the protocol level (AEAD nonces are monotonic but not persisted across restarts)
+
+The design document below describes the target architecture. The current implementation is a subset.
 **Author:** Antigravity Architecture & Security Group  
 **Target Systems:** QIHSE Spinnaker Network Multiplexer, eBPF/XDP Kernel Subsystem, io_uring Fast Path  
 **Audit Reference:** [UWP_AUDIT_2026-08.md](file:///fast/home/john/QIHSE/docs/security/UWP_AUDIT_2026-08.md) (Finding H7)  
