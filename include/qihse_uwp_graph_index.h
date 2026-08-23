@@ -21,12 +21,14 @@ typedef enum {
 uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
                                     uint8_t command_opcode,
                                     const uint8_t* payload, size_t payload_len,
-                                    qihse_user_t* user, int client_fd);
+                                    qihse_user_t* user, int client_fd,
+                                    qihse_uwp_write_fn write_fn, void* write_ctx);
 
 uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
                                    uint8_t command_opcode,
                                    const uint8_t* payload, size_t payload_len,
-                                   qihse_user_t* user, int client_fd);
+                                   qihse_user_t* user, int client_fd,
+                                   qihse_uwp_write_fn write_fn, void* write_ctx);
 
 #ifdef __cplusplus
 }
