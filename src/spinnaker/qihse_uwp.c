@@ -84,6 +84,10 @@
 #define QIHSE_UWP_IP_TABLE_SIZE 256
 #define QIHSE_UWP_AUTH_BUCKET_TABLE_SIZE 256
 
+#define UWP_MAX_CONNECTIONS 1024          /* max simultaneous connections */
+#define UWP_AUTH_TIMEOUT_SECONDS 10       /* must authenticate within 10s */
+#define UWP_IDLE_TIMEOUT_SECONDS 300      /* idle connection closed after 5 min */
+
 static const uint8_t qihse_uwp_magic[4] = { 0x51, 0x49, 0x48, 0x53 };
 
 #ifdef _WIN32
@@ -247,6 +251,8 @@ typedef enum {
  * replies are encrypted when ctx->tls_ctx is configured. */
 typedef struct uwp_conn_s uwp_conn_t;
 static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len);
+static void uwp_conn_touch(uwp_conn_t* conn);
+static void uwp_conn_set_authenticated(uwp_conn_t* conn);
 
 /* TLS write callback wrapper matching qihse_uwp_write_fn signature.
  * write_ctx is the uwp_conn_t pointer. */
@@ -265,19 +271,28 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                                              qihse_uwp_context_t* ctx,
                                              qihse_uwp_header_t* header, uint8_t* payload,
                                              size_t actual_payload_len, qihse_user_t** user_slot, qihse_txn_t** current_txn) {
+    if (conn) uwp_conn_touch(conn);
     /* Magic Byte Verification */
     if (memcmp(header->magic, qihse_uwp_magic, sizeof(header->magic)) != 0) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_invalid_magic(ctx->uwp_metrics);
         return UWP_ROUTE_ERR_MAGIC;
     }
-    if (header->version != 0x01) return UWP_ROUTE_ERR_VERSION;
+    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_received(ctx->uwp_metrics);
+    if (header->version != 0x01) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_invalid_version(ctx->uwp_metrics);
+        return UWP_ROUTE_ERR_VERSION;
+    }
 
     uint64_t len = uwp_payload_length(header);
     if (len > QIHSE_UWP_MAX_PAYLOAD) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_oversized(ctx->uwp_metrics);
         return UWP_ROUTE_ERR_TOO_LARGE;
     }
     if (len != actual_payload_len) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_partial(ctx->uwp_metrics);
         return UWP_ROUTE_ERR_LEN;
     }
+    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_frames_valid(ctx->uwp_metrics);
 
     if (header->target_engine == QIHSE_UWP_TARGET_AUTH && header->command_opcode == 0x01) {
         if (!ctx || len == 0 || !user_slot) return UWP_ROUTE_ERR_AUTH;
@@ -289,17 +304,23 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
         if (strnlen(password, password_max_len) == password_max_len) return UWP_ROUTE_ERR_AUTH;
         if (username_len >= sizeof(((qihse_user_t*)0)->username)) {
             uwp_log_auth_failure(client_fd, username, "failed");
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_failures(ctx->uwp_metrics);
             return UWP_ROUTE_ERR_AUTH;
         }
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_attempts(ctx->uwp_metrics);
         if (!uwp_auth_attempt_allowed(uwp_peer_ipv4(client_fd), username)) {
             uwp_log_auth_failure(client_fd, username, "rate limited");
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_rate_limited(ctx->uwp_metrics);
             return UWP_ROUTE_ERR_RATE_LIMITED;
         }
         *user_slot = qihse_auth_authenticate_from(uwp_peer_ipv4(client_fd), username, password);
         if (!*user_slot) {
             uwp_log_auth_failure(client_fd, username, "failed");
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_failures(ctx->uwp_metrics);
             return UWP_ROUTE_ERR_AUTH;
         }
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_successes(ctx->uwp_metrics);
+        if (conn) uwp_conn_set_authenticated(conn);
         const char* reply = "OK\n";
         uwp_tls_write_all(conn, reply, 3);
         return UWP_ROUTE_OK;
@@ -336,8 +357,10 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 }
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
             
         case QIHSE_UWP_TARGET_VECTOR:
@@ -368,8 +391,10 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 }
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
             
         case QIHSE_UWP_TARGET_DOC:
@@ -389,9 +414,11 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 if (!qihse_doc_store_insert_json(ctx->doc, doc_id, json)) return UWP_ROUTE_ERR_DISPATCH;
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
 #endif
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
             
         case QIHSE_UWP_TARGET_COL:
@@ -416,9 +443,11 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 }
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
 #endif
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
             
         case QIHSE_UWP_TARGET_TSDB:
@@ -441,9 +470,11 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 }
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
 #endif
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
             
         case QIHSE_UWP_TARGET_STREAM:
@@ -466,9 +497,11 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 }
                 const char* reply = "OK\n";
                 uwp_tls_write_all(conn, reply, 3);
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
                 return UWP_ROUTE_OK;
             }
 #endif
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         /* ---- New UWP targets (wired to engine dispatchers) ---- */
@@ -478,8 +511,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_sts_result_t r = uwp_dispatch_sql(ctx, header->command_opcode,
                                                       payload, len, current_txn, current_user, client_fd,
                                                       write_fn, write_ctx);
-                return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_STS_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_TXN:
@@ -488,8 +527,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_sts_result_t r = uwp_dispatch_txn(ctx, header->command_opcode,
                                                       payload, len, current_txn, current_user, client_fd,
                                                       write_fn, write_ctx);
-                return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_STS_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_GRAPH2:
@@ -499,8 +544,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_gi_result_t r = uwp_dispatch_graph2(ctx, header->command_opcode,
                                                         payload, len, current_user, client_fd,
                                                         write_fn, write_ctx);
-                return (r == UWP_GI_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_GI_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_INDEX:
@@ -509,8 +560,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_gi_result_t r = uwp_dispatch_index(ctx, header->command_opcode,
                                                        payload, len, current_user, client_fd,
                                                        write_fn, write_ctx);
-                return (r == UWP_GI_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_GI_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_SCHEMA:
@@ -520,8 +577,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_sts_result_t r = uwp_dispatch_schema(ctx, header->command_opcode,
                                                          payload, len, current_user, client_fd,
                                                          write_fn, write_ctx);
-                return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_STS_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_REPL:
@@ -530,8 +593,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_repl_result_t r = uwp_dispatch_repl(ctx, header->command_opcode,
                                                         payload, len, current_user, client_fd,
                                                         write_fn, write_ctx);
-                return (r == UWP_REPL_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_REPL_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         case QIHSE_UWP_TARGET_POOL:
@@ -540,13 +609,21 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uwp_repl_result_t r = uwp_dispatch_pool(ctx, header->command_opcode,
                                                         payload, len, current_user, client_fd,
                                                         write_fn, write_ctx);
-                return (r == UWP_REPL_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
+                if (r == UWP_REPL_OK) {
+                    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_OK;
+                }
+                if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+                return UWP_ROUTE_ERR_DISPATCH;
             }
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
 
         default:
+            if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
             return UWP_ROUTE_ERR_DISPATCH;
     }
+    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
     return UWP_ROUTE_ERR_DISPATCH;
 }
 
@@ -702,7 +779,23 @@ typedef struct uwp_conn_s {
     uint8_t* tls_rawbuf;          /* accumulation buffer for raw encrypted bytes */
     size_t   tls_rawbuf_cap;      /* capacity of tls_rawbuf                    */
     size_t   tls_rawbuf_len;      /* valid bytes in tls_rawbuf                 */
+    time_t connected_at;    /* when the connection was accepted */
+    time_t last_activity;   /* last read/write time */
+    bool authenticated;     /* true after successful AUTH */
 } uwp_conn_t;
+
+/* Global connection table for timeout scanning in the io_uring event loop. */
+static uwp_conn_t* uwp_all_connections[UWP_MAX_CONNECTIONS];
+
+/* Update last_activity timestamp on a connection (called from uwp_route_payload). */
+static void uwp_conn_touch(uwp_conn_t* conn) {
+    if (conn) conn->last_activity = time(NULL);
+}
+
+/* Mark a connection as authenticated (called from uwp_route_payload auth path). */
+static void uwp_conn_set_authenticated(uwp_conn_t* conn) {
+    if (conn) conn->authenticated = true;
+}
 
 /* Pick the appropriate write callback for a connection.
  * - TLS enabled:  uwp_tls_write_cb with write_ctx=conn
@@ -805,6 +898,14 @@ static const char* uwp_route_error_reply(uwp_route_result_t result) {
 
 static void uwp_conn_destroy(uwp_conn_t* conn) {
     if (!conn) return;
+    if (conn->ctx && conn->ctx->uwp_metrics) qihse_uwp_metrics_dec_connections_active(conn->ctx->uwp_metrics);
+    /* Remove from the global connection table. */
+    for (size_t i = 0; i < UWP_MAX_CONNECTIONS; i++) {
+        if (uwp_all_connections[i] == conn) {
+            uwp_all_connections[i] = NULL;
+            break;
+        }
+    }
     if (conn->current_txn && conn->ctx->txn_manager) {
         qihse_txn_rollback((qihse_txn_manager_t*)conn->ctx->txn_manager, conn->current_txn);
         conn->current_txn = NULL;
@@ -1260,6 +1361,26 @@ static void uwp_windows_remove_connection(WSAPOLLFD* poll_fds,
 }
 #endif
 
+static void uwp_check_timeouts(uwp_conn_t** connections, size_t max_conns, qihse_uwp_context_t* ctx) {
+    time_t now = time(NULL);
+    for (size_t i = 0; i < max_conns; i++) {
+        uwp_conn_t* conn = connections[i];
+        if (!conn) continue;
+        /* Unauthenticated connections get less time */
+        if (!conn->authenticated && (now - conn->connected_at) > UWP_AUTH_TIMEOUT_SECONDS) {
+            uwp_conn_destroy(conn);
+            connections[i] = NULL;
+            continue;
+        }
+        /* Idle timeout for authenticated connections */
+        if ((now - conn->last_activity) > UWP_IDLE_TIMEOUT_SECONDS) {
+            uwp_conn_destroy(conn);
+            connections[i] = NULL;
+        }
+    }
+    (void)ctx;
+}
+
 bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address) {
     if (qihse_auth_is_operator_password_default()) {
         fprintf(stderr, "[FATAL SECURITY ERROR] Default operator password detected. "
@@ -1376,6 +1497,9 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
     io_uring_submit(&ring);
 
     while (1) {
+        /* Periodic timeout check for unauthenticated and idle connections. */
+        uwp_check_timeouts(uwp_all_connections, UWP_MAX_CONNECTIONS, ctx);
+
         struct io_uring_cqe *cqe;
         int ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0) {
@@ -1566,6 +1690,9 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
     poll_fds[0].events = POLLRDNORM;
 
     while (1) {
+        /* Periodic timeout check for unauthenticated and idle connections. */
+        uwp_check_timeouts(connections, UWP_WINDOWS_MAX_CONNECTIONS + 1, ctx);
+
         int ready = WSAPoll(poll_fds, poll_count, -1);
         if (ready == SOCKET_ERROR) {
             fprintf(stderr, "[QIHSE UWP] WSAPoll failed: %d\n", WSAGetLastError());

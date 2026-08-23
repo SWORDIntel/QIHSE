@@ -241,15 +241,220 @@ static void append_value(uwp_text_buffer_t* response, const char* val) {
     }
 }
 
-static bool check_complexity(qihse_sql_ast_t* ast) {
-    if (ast->with_clause && ast->with_clause->num_ctes > 0) return true;
+/* -------------------------------------------------------------------------
+ * SQL advanced execution helpers: DML row-store wiring, subquery / window /
+ * CE detection, and plan execution.
+ * ------------------------------------------------------------------------- */
+
+/* Map a SQL column type to the column store's internal type. */
+static qihse_column_type_t uwp_sql_type_to_col_type(qihse_sql_type_t t) {
+    switch (t) {
+        case QIHSE_TYPE_INT:
+        case QIHSE_TYPE_SERIAL:
+            return QIHSE_COL_TYPE_INT32;
+        case QIHSE_TYPE_BIGINT:
+        case QIHSE_TYPE_BIGSERIAL:
+            return QIHSE_COL_TYPE_INT64;
+        case QIHSE_TYPE_FLOAT:
+        case QIHSE_TYPE_DOUBLE:
+            return QIHSE_COL_TYPE_FLOAT32; /* no float64 append in column store */
+        default:
+            return QIHSE_COL_TYPE_STRING_DICT;
+    }
+}
+
+/* Check if the AST has window functions in the SELECT list. */
+static bool uwp_has_window_functions(const qihse_sql_ast_t* ast) {
     for (size_t i = 0; i < ast->num_select_items; i++) {
         if (ast->select_items[i].window != NULL) return true;
+        if (ast->select_items[i].win_kind != QIHSE_WIN_NONE) return true;
+    }
+    return false;
+}
+
+/* Check if the AST has subqueries (scalar subqueries in SELECT list or
+ * subquery predicates in WHERE). */
+static bool uwp_has_subqueries(const qihse_sql_ast_t* ast) {
+    for (size_t i = 0; i < ast->num_select_items; i++) {
+        if (ast->select_items[i].scalar_subquery != NULL) return true;
     }
     for (size_t i = 0; i < ast->num_where_conditions; i++) {
         if (ast->where_conditions[i].subq_kind != 0) return true;
     }
     return false;
+}
+
+/* Recursively check if a plan tree contains any SUBQUERY nodes. */
+static bool uwp_plan_has_subquery(const qihse_plan_node_t* plan) {
+    if (!plan) return false;
+    if (plan->type == QIHSE_PLAN_SUBQUERY) return true;
+    if (uwp_plan_has_subquery(plan->left)) return true;
+    if (uwp_plan_has_subquery(plan->right)) return true;
+    return false;
+}
+
+/* Check if the AST has recursive CTEs.  The parser does not set the
+ * recursive flag, so we also scan the raw SQL as a fallback. */
+static bool uwp_has_recursive_cte(const qihse_sql_ast_t* ast) {
+    if (!ast->with_clause) return false;
+    for (size_t i = 0; i < ast->with_clause->num_ctes; i++) {
+        if (ast->with_clause->ctes[i].recursive) return true;
+    }
+    if (ast->raw_sql && strcasestr(ast->raw_sql, "RECURSIVE")) return true;
+    return false;
+}
+
+/* Execute a pre-built plan and write results to the response buffer.
+ * Writes the schema header row followed by data rows.  Returns 0 on
+ * success, -1 if the stream could not be built. */
+static int uwp_execute_plan(qihse_plan_node_t* plan, qihse_uwp_context_t* ctx,
+                            uwp_text_buffer_t* response) {
+    if (!plan) return -1;
+    qihse_row_stream_t* stream = build_stream(plan, ctx);
+    if (!stream) return -1;
+    if (stream->schema) {
+        for (size_t i = 0; i < stream->schema->num_cols; i++) {
+            uwp_text_appendf(response, "%s", stream->schema->names[i]);
+            if (i + 1 < stream->schema->num_cols)
+                uwp_text_appendf(response, "\t");
+        }
+        uwp_text_appendf(response, "\n");
+    }
+    qihse_exec_row_t* row;
+    while ((row = qihse_row_stream_next(stream)) != NULL) {
+        for (size_t i = 0; i < row->num_values; i++) {
+            append_value(response, row->values[i]);
+            if (i + 1 < row->num_values)
+                uwp_text_appendf(response, "\t");
+        }
+        uwp_text_appendf(response, "\n");
+        qihse_exec_row_free(row);
+    }
+    qihse_row_stream_close(stream);
+    return 0;
+}
+
+/* Build an optimizer plan for the AST and execute it, writing results to
+ * the response buffer.  Returns 0 on success, -1 on failure. */
+static int uwp_execute_select_plan(qihse_uwp_context_t* ctx,
+                                   const qihse_sql_ast_t* ast,
+                                   uwp_text_buffer_t* response) {
+    qihse_optimizer_t* opt =
+        qihse_optimizer_create((qihse_schema_registry_t*)ctx->schema);
+    if (!opt) return -1;
+    qihse_plan_node_t* plan = qihse_optimizer_build_plan(opt, ast);
+    int rc = uwp_execute_plan(plan, ctx, response);
+    if (plan) qihse_plan_node_free(plan);
+    qihse_optimizer_destroy(opt);
+    return rc;
+}
+
+/* Execute INSERT into the column store.
+ * Returns the number of rows inserted (>= 0) on success,
+ * -1 if no row store / schema is wired,
+ * -2 on error (table not found, INSERT...SELECT, etc.). */
+static int uwp_execute_insert(qihse_uwp_context_t* ctx,
+                              const qihse_sql_ast_t* ast) {
+    if (!ctx->col || !ctx->schema) return -1;
+    if (!ast->table_name) return -2;
+    if (ast->insert_select_query) return -2; /* INSERT...SELECT not supported */
+    if (ast->num_insert_rows == 0 || !ast->insert_rows) return 0;
+
+    qihse_schema_registry_t* schema = (qihse_schema_registry_t*)ctx->schema;
+    qihse_column_store_t* col = ctx->col;
+
+    const qihse_schema_table_t* table = qihse_schema_get_table(schema, ast->table_name);
+    if (!table) return -2;
+
+    /* Determine column order and types. */
+    size_t num_cols;
+    qihse_column_type_t* col_types;
+    const char** col_names;
+
+    if (ast->num_insert_columns > 0) {
+        num_cols = ast->num_insert_columns;
+        col_types = (qihse_column_type_t*)malloc(num_cols * sizeof(*col_types));
+        col_names = (const char**)malloc(num_cols * sizeof(*col_names));
+        if (!col_types || !col_names) { free(col_types); free(col_names); return -2; }
+        for (size_t i = 0; i < num_cols; i++) {
+            col_names[i] = NULL;
+            col_types[i] = QIHSE_COL_TYPE_STRING_DICT;
+            for (size_t j = 0; j < table->num_columns; j++) {
+                if (strcasecmp(ast->insert_columns[i],
+                               table->columns[j].name) == 0) {
+                    col_types[i] = uwp_sql_type_to_col_type(table->columns[j].type);
+                    col_names[i] = table->columns[j].name;
+                    break;
+                }
+            }
+            if (!col_names[i]) {
+                free(col_types);
+                free(col_names);
+                return -2; /* column not found in schema */
+            }
+        }
+    } else {
+        num_cols = table->num_columns;
+        col_types = (qihse_column_type_t*)malloc(num_cols * sizeof(*col_types));
+        col_names = (const char**)malloc(num_cols * sizeof(*col_names));
+        if (!col_types || !col_names) { free(col_types); free(col_names); return -2; }
+        for (size_t i = 0; i < num_cols; i++) {
+            col_types[i] = uwp_sql_type_to_col_type(table->columns[i].type);
+            col_names[i] = table->columns[i].name;
+        }
+    }
+
+    /* Append each row's values to the column store. */
+    size_t rows_inserted = 0;
+    for (size_t r = 0; r < ast->num_insert_rows; r++) {
+        char** row = ast->insert_rows[r];
+        if (!row) break;
+        int row_ok = 1;
+        for (size_t c = 0; c < num_cols; c++) {
+            if (!row[c]) { row_ok = 0; break; }
+
+            /* Build namespaced column name: table.column */
+            char col_full_name[512];
+            snprintf(col_full_name, sizeof(col_full_name), "%s.%s",
+                     ast->table_name, col_names[c]);
+
+            /* Create the column if it does not yet exist. */
+            (void)qihse_column_create(col, col_full_name, col_types[c]);
+
+            const char* val = row[c];
+            bool ok = false;
+            switch (col_types[c]) {
+                case QIHSE_COL_TYPE_INT32:
+                    ok = qihse_column_append_int32(
+                        col, col_full_name,
+                        (int32_t)strtol(val, NULL, 10), 0, 0);
+                    break;
+                case QIHSE_COL_TYPE_INT64:
+                    ok = qihse_column_append_int64(
+                        col, col_full_name,
+                        (int64_t)strtoll(val, NULL, 10), 0, 0);
+                    break;
+                case QIHSE_COL_TYPE_FLOAT32:
+                    ok = qihse_column_append_float32(
+                        col, col_full_name,
+                        (float)strtod(val, NULL), 0, 0);
+                    break;
+                case QIHSE_COL_TYPE_STRING_DICT:
+                    ok = qihse_column_append_string(
+                        col, col_full_name, val, 0, 0);
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+            if (!ok) { row_ok = 0; break; }
+        }
+        if (row_ok) rows_inserted++;
+    }
+
+    free(col_types);
+    free(col_names);
+    return (int)rows_inserted;
 }
 
 static uwp_sts_result_t uwp_sql_execute(qihse_uwp_context_t* ctx,
@@ -377,51 +582,109 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
     } else {
         result = uwp_sql_execute(ctx, ast, sql, current_txn, user);
         if (result == UWP_STS_OK) {
-            if (ast->stmt_type == QIHSE_SQL_SELECT) {
-                if (check_complexity(ast)) {
-                    uwp_text_appendf(&response, "OK stmt_type=SELECT (plan too complex, not executed)\n");
-                } else {
-                    qihse_optimizer_t* opt = qihse_optimizer_create((qihse_schema_registry_t*)ctx->schema);
-                    qihse_plan_node_t* plan = qihse_optimizer_build_plan(opt, ast);
-                    
-                    if (!plan) {
-                        uwp_text_appendf(&response, "OK stmt_type=SELECT (plan too complex, not executed)\n");
+            if (ast->stmt_type == QIHSE_SQL_SELECT ||
+                ast->stmt_type == QIHSE_SQL_WITH) {
+                /* --- CTE (WITH clause) handling --- */
+                if (ast->with_clause && ast->with_clause->num_ctes > 0) {
+                    if (uwp_has_recursive_cte(ast)) {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=SELECT (recursive CTEs not yet supported)\n");
                     } else {
-                        qihse_row_stream_t* stream = build_stream(plan, ctx);
-                        if (stream) {
-                            if (stream->schema) {
-                                for (size_t i = 0; i < stream->schema->num_cols; i++) {
-                                    uwp_text_appendf(&response, "%s%s", stream->schema->names[i], i == stream->schema->num_cols - 1 ? "" : "	");
-                                }
-                                uwp_text_appendf(&response, "\n");
-                            }
-                            qihse_exec_row_t* row;
-                            while ((row = qihse_row_stream_next(stream)) != NULL) {
-                                for (size_t i = 0; i < row->num_values; i++) {
-                                    append_value(&response, row->values[i]);
-                                    uwp_text_appendf(&response, "%s", i == row->num_values - 1 ? "" : "	");
-                                }
-                                uwp_text_appendf(&response, "\n");
-                                qihse_exec_row_free(row);
-                            }
-                            qihse_row_stream_close(stream);
+                        /* Non-recursive CTE: the parser copies the inner
+                         * SELECT fields into the WITH AST, so we can attempt
+                         * to build and execute a plan directly.  CTE
+                         * materialisation is not yet wired, so queries that
+                         * reference CTE names as tables will produce empty
+                         * results rather than crashing. */
+                        if (uwp_execute_select_plan(ctx, ast, &response) == 0) {
                             uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
                         } else {
-                            uwp_text_appendf(&response, "OK stmt_type=SELECT (plan too complex, not executed)\n");
+                            uwp_text_appendf(&response,
+                                "OK stmt_type=SELECT (CTE materialisation not yet supported)\n");
                         }
-                        qihse_plan_node_free(plan);
                     }
-                    qihse_optimizer_destroy(opt);
                 }
-            } else if (ast->stmt_type == QIHSE_SQL_INSERT ||
-                       ast->stmt_type == QIHSE_SQL_UPDATE ||
-                       ast->stmt_type == QIHSE_SQL_DELETE) {
-                if (!ctx->col && !ctx->doc) {
-                    uwp_text_appendf(&response, "OK stmt_type=%s (no row store wired)\n",
-                                     qihse_sql_stmt_name(ast->stmt_type));
+                /* --- Window function handling --- */
+                else if (uwp_has_window_functions(ast)) {
+                    /* The executor pipeline (sort + aggregate) does not yet
+                     * support window functions.  Degrade gracefully. */
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=SELECT (window functions not yet supported)\n");
+                }
+                /* --- Subquery handling --- */
+                else if (uwp_has_subqueries(ast)) {
+                    /* Build a plan and check whether the optimizer emitted
+                     * any SUBQUERY plan nodes.  If it did, execute them
+                     * recursively; otherwise degrade with an informative
+                     * message. */
+                    qihse_optimizer_t* opt =
+                        qihse_optimizer_create((qihse_schema_registry_t*)ctx->schema);
+                    qihse_plan_node_t* plan =
+                        opt ? qihse_optimizer_build_plan(opt, ast) : NULL;
+                    if (plan && uwp_plan_has_subquery(plan)) {
+                        if (uwp_execute_plan(plan, ctx, &response) == 0) {
+                            uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
+                        } else {
+                            uwp_text_appendf(&response,
+                                "OK stmt_type=SELECT (subquery execution not supported by optimizer)\n");
+                        }
+                    } else {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=SELECT (subquery execution not supported by optimizer)\n");
+                    }
+                    if (plan) qihse_plan_node_free(plan);
+                    if (opt) qihse_optimizer_destroy(opt);
+                }
+                /* --- Normal SELECT --- */
+                else {
+                    if (uwp_execute_select_plan(ctx, ast, &response) == 0) {
+                        uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
+                    } else {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=SELECT (plan too complex, not executed)\n");
+                    }
+                }
+            } else if (ast->stmt_type == QIHSE_SQL_INSERT) {
+                /* --- INSERT: wire to column store --- */
+                if (!ctx->col || !ctx->schema) {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=INSERT (no row store wired)\n");
                 } else {
-                    uwp_text_appendf(&response, "OK stmt_type=%s\n",
-                                     qihse_sql_stmt_name(ast->stmt_type));
+                    int rows = uwp_execute_insert(ctx, ast);
+                    if (rows >= 0) {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=INSERT rows=%d\n", rows);
+                    } else if (rows == -1) {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=INSERT (no row store wired)\n");
+                    } else {
+                        uwp_text_appendf(&response,
+                            "OK stmt_type=INSERT (table not found in schema)\n");
+                    }
+                }
+            } else if (ast->stmt_type == QIHSE_SQL_UPDATE) {
+                /* --- UPDATE: column store is append-only, no update API --- */
+                if (!ctx->col && !ctx->doc) {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=UPDATE (no row store wired)\n");
+                } else if (ctx->col) {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=UPDATE (column store does not support in-place updates)\n");
+                } else {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=UPDATE (no row store wired)\n");
+                }
+            } else if (ast->stmt_type == QIHSE_SQL_DELETE) {
+                /* --- DELETE: column store is append-only, no delete API --- */
+                if (!ctx->col && !ctx->doc) {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=DELETE (no row store wired)\n");
+                } else if (ctx->col) {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=DELETE (column store does not support row deletion)\n");
+                } else {
+                    uwp_text_appendf(&response,
+                        "OK stmt_type=DELETE (no row store wired)\n");
                 }
             } else {
                 uwp_text_appendf(&response, "OK stmt_type=%s\n",
