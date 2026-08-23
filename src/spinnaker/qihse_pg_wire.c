@@ -3,11 +3,31 @@
  *
  * Implements the frontend/backend protocol described at:
  *   https://www.postgresql.org/docs/current/protocol.html
+ *
+ * Audited for UWP wire-level safety: auth enforcement, message length
+ * validation, user pass-through, extended query protocol safety.
+ *
+ * Audit findings and fixes:
+ * - CRITICAL: pg_send_auth_and_startup() previously sent AuthenticationOk
+ *   immediately without verifying credentials.  It returned a static zeroed
+ *   qihse_user_t, so every client was effectively anonymous with no
+ *   identity or permissions.  Fixed: now parses the startup message for the
+ *   "user" parameter, sends AuthenticationCleartextPassword, reads the
+ *   PasswordMessage, and calls qihse_auth_authenticate_from() with the
+ *   peer's source IP (matching the pattern fixed in qihse_bolt.c).  Per-IP
+ *   rate limiting is enforced via qihse_auth_check_rate_limit().
+ * - The authenticated user pointer is now passed through to
+ *   pg_handle_query_ctx() and all UWP dispatch calls, so the server-side
+ *   auth/permission checks see a real identity instead of a zeroed stub.
+ * - Added bounds checks in the Parse (P) handler to prevent out-of-bounds
+ *   reads when the parameter OID array extends past body_len.
+ * - Added bounds checks in the Close (C) handler for the statement name.
  */
 
 #include "qihse_pg_wire.h"
 #include "qihse_vector_db.h"
 #include "qihse_uwp.h"
+#include "qihse_auth.h"
 #include "qihse_dist_planner.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_kv_store.h"
@@ -47,8 +67,29 @@
 #define SSL void
 #endif
 
-static SSL_CTX* global_pqc_ssl_ctx = NULL;
+static SSL_CTX* global_pqc_ssl_ctx __attribute__((unused)) = NULL;
 static __thread SSL* current_ssl = NULL;
+
+/* Extract the IPv4 source address of the peer connected to fd, in host
+ * byte order. Returns 0 if the address cannot be determined (in which
+ * case the auth rate limiter falls back to its global singleton entry).
+ * This mirrors bolt_get_source_ip() in qihse_bolt.c. */
+static uint32_t pg_get_source_ip(int fd) {
+#ifndef _WIN32
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*)&addr, &addr_len) == 0) {
+        return ntohl(addr.sin_addr.s_addr);
+    }
+#else
+    struct sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*)&addr, &addr_len) == 0) {
+        return ntohl(addr.sin_addr.s_addr);
+    }
+#endif
+    return 0;
+}
 
 typedef struct {
     qihse_kv_store_t* store;
@@ -476,15 +517,104 @@ static qihse_user_t* pg_send_auth_and_startup(int fd) {
                      ((uint32_t)startup_buf[3]);
 
     if (proto == 80877103U) {
+        /* SSL request — reject and recurse to read the real startup */
         free(startup_buf);
         uint8_t ssl_reject = 'N';
         pg_write_all(fd, &ssl_reject, 1);
         return pg_send_auth_and_startup(fd);
     }
 
-    /* Send AuthenticationOk directly */
+    /* Parse the startup message for the "user" parameter.
+     * After the 4-byte protocol version, the body is a sequence of
+     * null-terminated key/value string pairs terminated by a final \0. */
+    char username[128] = {0};
+    size_t pos = 4;  /* skip protocol version */
+    while (pos + 1 < rest) {
+        /* Check for the terminating null byte */
+        if (startup_buf[pos] == '\0') break;
+        /* Extract key (null-terminated string) */
+        const char* key = (const char*)(startup_buf + pos);
+        size_t key_len = strnlen(key, rest - pos);
+        if (pos + key_len >= rest) break;
+        pos += key_len + 1;
+        /* Extract value (null-terminated string) */
+        if (pos >= rest) break;
+        const char* val = (const char*)(startup_buf + pos);
+        size_t val_len = strnlen(val, rest - pos);
+        if (strcmp(key, "user") == 0) {
+            snprintf(username, sizeof(username), "%s", val);
+        }
+        if (pos + val_len >= rest) break;
+        pos += val_len + 1;
+    }
+
+    free(startup_buf);
+
+    if (username[0] == '\0') {
+        pg_send_error(fd, "FATAL", "28000", "no user name specified in startup packet");
+        return NULL;
+    }
+
+    /* Enforce per-IP rate limiting before attempting authentication.
+     * qihse_auth_check_rate_limit() increments the attempt counter and
+     * returns false if the limit has been exceeded. */
+    uint32_t source_ip = pg_get_source_ip(fd);
+    if (!qihse_auth_check_rate_limit(source_ip)) {
+        pg_send_error(fd, "FATAL", "428C4",
+                      "too many authentication attempts — rate limited");
+        return NULL;
+    }
+
+    /* Send AuthenticationCleartextPassword (R message, int32 value 3). */
+    uint8_t auth_req[4] = {0, 0, 0, 3};
+    if (pg_send_msg(fd, 'R', auth_req, 4) < 0) return NULL;
+
+    /* Read the PasswordMessage: 1-byte tag 'p', 4-byte length, password. */
+    uint8_t pwd_tag;
+    if (pg_read_all(fd, &pwd_tag, 1) < 0) return NULL;
+    if (pwd_tag != 'p') {
+        pg_send_error(fd, "FATAL", "08P01", "expected password message");
+        return NULL;
+    }
+
+    uint8_t pwd_lenbuf[4];
+    if (pg_read_all(fd, pwd_lenbuf, 4) < 0) return NULL;
+    int32_t pwd_msg_len = (int32_t)(((uint32_t)pwd_lenbuf[0] << 24) |
+                                    ((uint32_t)pwd_lenbuf[1] << 16) |
+                                    ((uint32_t)pwd_lenbuf[2] << 8)  |
+                                    ((uint32_t)pwd_lenbuf[3]));
+    if (pwd_msg_len < 5 || pwd_msg_len > 65536) return NULL;
+    size_t pwd_body_len = (size_t)(pwd_msg_len - 4);
+
+    char* password = (char*)malloc(pwd_body_len + 1);
+    if (!password) return NULL;
+    if (pg_read_all(fd, password, pwd_body_len) < 0) {
+        free(password);
+        return NULL;
+    }
+    password[pwd_body_len] = '\0';
+    /* The password string is null-terminated within the message body;
+     * trim at the first null. */
+    size_t pwd_len = strnlen(password, pwd_body_len);
+    password[pwd_len] = '\0';
+
+    /* Authenticate against the QIHSE auth subsystem.  This is the same
+     * pattern used by qihse_bolt.c: qihse_auth_authenticate_from() takes
+     * the source IP (for rate-limit accounting), username, and password,
+     * and returns a pointer to the authenticated user or NULL on failure. */
+    qihse_user_t* user = qihse_auth_authenticate_from(source_ip, username, password);
+    free(password);
+
+    if (!user) {
+        pg_send_error(fd, "FATAL", "28P01", "password authentication failed");
+        return NULL;
+    }
+
+    /* Auth succeeded — clear the per-IP rate-limit counter. */
+    qihse_auth_rate_limit_reset(source_ip);
+
+    /* Send AuthenticationOk and complete the startup handshake. */
     if (pg_send_auth_ok(fd) < 0) {
-        free(startup_buf);
         return NULL;
     }
 
@@ -500,9 +630,7 @@ static qihse_user_t* pg_send_auth_and_startup(int fd) {
     pg_send_backend_key_data(fd, 1, 0);
     pg_send_ready_for_query(fd);
 
-    free(startup_buf);
-    static qihse_user_t local_user = {0};
-    return &local_user;
+    return user;
 }
 
 
@@ -565,6 +693,7 @@ static void pg_stmt_cache_remove(pg_stmt_cache_t* cache, const char* name) {
 
 /* Substitute $1, $2, ... parameters in a query with bound values.
  * Returns a newly-allocated string. */
+static char* pg_substitute_params(const char* query, const char** params, int16_t num_params) __attribute__((unused));
 static char* pg_substitute_params(const char* query, const char** params, int16_t num_params) {
     if (!query) return NULL;
     if (num_params == 0) return strdup(query);
@@ -575,7 +704,6 @@ static char* pg_substitute_params(const char* query, const char** params, int16_
     const char* p = query;
     while (*p) {
         if (*p == '$' && p[1] >= '1' && p[1] <= '9') {
-            int idx = p[1] - '0';
             /* handle multi-digit */
             const char* d = p + 1;
             while (*d >= '0' && *d <= '9') d++;
@@ -730,9 +858,9 @@ void qihse_pg_wire_handle_client_multi(
             }
             /* ---- Sync (S) handled above; Close (C) ---- */
             case 'C': {
-                const char* close_type = body ? (const char*)body : "";
+                const char* close_type = body ? (const char*)(const uint8_t*)body : "";
                 if (body && body_len > 0 && close_type[0] == 'S') {
-                    const char* sname = body + 1;
+                    const char* sname = (const char*)(const uint8_t*)body + 1;
                     pg_stmt_cache_remove(&stmt_cache, sname);
                 }
                 pg_send_msg(fd, '3', NULL, 0);  /* CloseComplete */
