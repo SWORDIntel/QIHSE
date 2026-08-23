@@ -12,6 +12,7 @@
 #include "qihse_txn.h"
 #include "qihse_uwp_graph_index.h"
 #include "qihse_uwp_repl_pool.h"
+#include "qihse_uwp_tls.h"
 #ifndef _WIN32
 #include <liburing.h>
 #include "../networking/qihse_af_xdp.h"
@@ -915,6 +916,10 @@ bool qihse_start_uwp_server(qihse_uwp_context_t* ctx, uint16_t port, const char*
         fprintf(stderr, "[FATAL SECURITY ERROR] Default operator password detected. "
                         "You must rotate the default operator password before starting network services.\n");
         return false;
+    }
+
+    if (ctx && ctx->tls_ctx) {
+        fprintf(stderr, "[QIHSE UWP] TLS enabled (ChaCha20-Poly1305 transport encryption active)\n");
     }
 
     uwp_socket_t server_fd;
