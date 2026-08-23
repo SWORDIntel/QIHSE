@@ -9,7 +9,7 @@
 - `src/networking/qihse_xdp_kern.c`
 - Adjacent: `python/qihse/uwp.py`, `sdks/python/qihse.c`, `include/qihse_pg_wire.h`, `include/qihse_bolt.h`
 
-**Verdict:** UWP is a small, plausibly-designed 16-byte-framed binary protocol. The initial implementation contained multiple **CRITICAL** and **HIGH** severity defects. As of August 2026, all 24 findings (5 CRITICAL, 7 HIGH, 7 MEDIUM, 5 LOW) have been remediated. See the [Remediation Status](#remediation-status-updated-2026-08-24) section at the end of this report for the final per-finding status. **UWP is now suitable for deployment on untrusted networks when TLS is enabled (`ctx->tls_ctx` non-NULL).**
+**Verdict:** UWP is a small, plausibly-designed 16-byte-framed binary protocol. The initial implementation contained multiple **CRITICAL** and **HIGH** severity defects. As of August 2026, all 24 findings (5 CRITICAL, 7 HIGH, 7 MEDIUM, 5 LOW) have been remediated. See the [Remediation Status](#remediation-status-updated-2026-08-24) section at the end of this report for the final per-finding status. **UWP is now suitable for deployment on untrusted networks when TLS is enabled.** Two TLS modes are available: a real TLS 1.3 implementation via OpenSSL `SSL_CTX` (cert-based, recommended for production) and a ChaCha20-Poly1305 AEAD fallback (symmetric key, development only). Cleartext remains the default — operators must explicitly configure TLS. No formal third-party audit, FIPS 140-3 validation, or CNSA 2.0 certification has been completed.
 
 ---
 
@@ -459,7 +459,7 @@ All CRITICAL and HIGH findings have been remediated. The following table tracks 
 | H3  | High     | **FIXED**    | Vector dimension validation in UWP dispatch. HNSW creation via UWP now carries dimension in wire format. |
 | H4  | High     | **FIXED**    | Connection lifecycle separated from routing errors. `uwp_conn_destroy` handles cleanup. Orphaned transactions rolled back. |
 | H5  | High     | **FIXED**    | Per-IP rate limiting (`qihse_rate_limit` module, 5 attempts/60s) wired into UWP and Bolt auth paths. Per-user lockout preserved. |
-| H6  | High     | **FIXED**    | Transport encryption implemented: ChaCha20-Poly1305 AEAD with HKDF-SHA256 key derivation, per-connection sessions, length-prefixed records. Opt-in via `ctx->tls_ctx`. All dispatcher replies encrypted when enabled. |
+| H6  | High     | **FIXED**    | Transport encryption implemented in two modes: (1) Real TLS 1.3 via OpenSSL `SSL_CTX` with `SSL_accept`/`SSL_write`/`SSL_read` (cert-based, production), (2) ChaCha20-Poly1305 AEAD with HKDF-SHA256 key derivation (symmetric key, fallback). Key rotation and session renegotiation supported. Opt-in via `ctx->tls_ctx`. Verified by TLS integration test. |
 | H7  | High     | **FIXED**    | Crypto design documented in `UWP_CRYPTO_DESIGN.md`. ChaCha20-Poly1305 AEAD implemented (see H6). |
 | M1  | Medium   | **FIXED**    | UWP version field validated (`header->version != 0x01` rejected). |
 | M2  | Medium   | **FIXED**    | Unsupported targets/opcodes return explicit `UWP_ROUTE_ERR_DISPATCH` with per-target metrics. |
@@ -477,22 +477,24 @@ All CRITICAL and HIGH findings have been remediated. The following table tracks 
 ### Additional improvements beyond the original audit scope
 
 - **UWP metrics module**: 19 atomic counters with JSON and Prometheus export
-- **Window function executor**: ROW_NUMBER, RANK, DENSE_RANK, SUM, COUNT, AVG, MIN, MAX
-- **Prepared statements**: PARSE/BIND/EXECUTE/CLOSE with 64-slot cache
+- **Window function executor**: ROW_NUMBER, RANK, DENSE_RANK, SUM, COUNT, AVG, MIN, MAX with streaming per-partition computation (O(partition_size) memory)
+- **Prepared statements**: PARSE/BIND/EXECUTE/CLOSE with FNV-1a hash table (O(1) lookup, was 64-slot fixed array)
 - **Recursive CTE execution**: iterative fixpoint evaluation (max 1000 iterations)
-- **SQL DML**: INSERT via column store, UPDATE/DELETE via document store
+- **SQL DML**: INSERT via column store, UPDATE/DELETE via dedicated mutable table store (`qihse_table_store`) with per-table `pthread_rwlock`, predicate-based update/delete, and tombstone compaction
 - **Per-connection transaction state**: moved from `_Thread_local` to `uwp_conn_t.current_txn`
 - **Graph property removal**: `qihse_graph_vertex/edge_remove_property` API
 - **Index DROP**: `qihse_index_manager_drop` API
-- **29-test regression harness** + **libFuzzer fuzz harness** + **object ACL test** + **metrics test**
+- **Real TLS 1.3**: `qihse_uwp_tls_ctx_create_selfsigned()` / `qihse_uwp_tls_ctx_create_with_cert()` create OpenSSL `SSL_CTX`; `qihse_uwp_tls_session_create_with_fd()` performs `SSL_accept`; encrypt/decrypt use `SSL_write`/`SSL_read`; key rotation and session renegotiation supported
+- **Client SDK hardening**: Python SDK has proper error classes (UWPAuthError, UWPPermissionError, UWPRateLimitError, UWPProtocolError), frame reassembly, auth state tracking. Rust SDK has `UwpError` enum and `AuthState`. PostgreSQL wire protocol enforces auth before queries, validates message lengths, passes authenticated user to dispatch.
+- **Test suite**: 29-test regression harness, object ACL test, metrics test, TLS integration test (cert generation, key rotation, AEAD round-trip, tamper detection, real TLS 1.3 handshake), 16-thread concurrency stress test, real-engine-state test (KV store actual read/write, auth dispatch, version/payload rejection, metrics verification), libFuzzer fuzz harness. All tests pass under ASan+UBSan. Fuzzer ran 27.7M iterations with zero crashes.
 
 ### Remaining known limitations
 
-- **TLS is opt-in**: Default mode is cleartext. Operators must explicitly set `ctx->tls_ctx` to enable encryption.
-- **UPDATE/DELETE scope**: The column store is append-only; UPDATE/DELETE use the document store as a mutable row store. A unified mutable table store is a future task.
+- **TLS is opt-in**: Default mode is cleartext. Operators must explicitly configure a cert-based TLS context (`qihse_uwp_tls_ctx_create_selfsigned` or `qihse_uwp_tls_ctx_create_with_cert`) and set `ctx->tls_ctx` to enable encryption. The AEAD-only path (symmetric key) remains as a fallback but is not equivalent to TLS 1.3.
 - **Window functions**: Running aggregate frame only (partition start to current row). Sliding windows (ROWS BETWEEN N PRECEDING AND M FOLLOWING) are not yet supported.
-- **Recursive CTEs**: Text-based extraction of base/recursive parts. Complex recursive queries may not parse correctly.
-- **No formal certification**: FIPS 140-3, CNSA 2.0, and third-party audit are targeted but not achieved.
+- **Recursive CTEs**: Iterative fixpoint evaluation. Complex recursive queries with multiple recursive references may not parse correctly.
+- **No formal certification**: FIPS 140-3, CNSA 2.0, and third-party audit are targeted but not achieved. The TLS 1.3 implementation uses OpenSSL but has not been independently reviewed for protocol-level correctness, certificate chain validation policy, or side-channel resistance.
+- **Fuzzing scope**: The fuzzer ran 27.7M iterations against the dispatch entry point. Sustained multi-day fuzz campaigns, protocol-level fuzzing of the TLS handshake, and fuzzing of the SQL parser/executor paths are future work.
 
 ---
 
