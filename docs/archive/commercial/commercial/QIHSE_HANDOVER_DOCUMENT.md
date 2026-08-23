@@ -156,7 +156,7 @@
 ### **CNSA 2.0 Alignment (In Progress)**
 - **Approved Algorithms**: AES-256-GCM, ECDSA P-384, ECDH P-384, HMAC-SHA384
 - **Key Management**: Secure derivation (PBKDF2), HSM integration, rotation
-- **Secure Communication**: TLS 1.3, mutual authentication, secure channels (planned — not yet implemented)
+- **Secure Communication**: TLS 1.3, mutual authentication, secure channels (ChaCha20-Poly1305 AEAD transport encryption implemented; mTLS planned)
 - **Audit Trails**: Cryptographic integrity, comprehensive event logging
 - **Access Control**: RBAC, multi-factor authentication, session management
 
