@@ -1515,7 +1515,7 @@ qihse-admin cluster-reset
 
 ## 22. Security & Compliance {#22-security--compliance}
 
-> **Status Note (August 2026):** The security controls described below represent the **target architecture**. QIHSE has undergone an internal security review (see [`docs/security/UWP_AUDIT_2026-08.md`](../security/UWP_AUDIT_2026-08.md)) but has **not** completed formal CNSA 2.0 compliance certification, FIPS 140-3 validation, or third-party audits (SOC 2, HIPAA, PCI DSS). Transport-layer encryption is **not yet implemented** — the UWP wire protocol operates in cleartext by default. Data-at-rest encryption (`.qdb` containers with ML-KEM-1024 / ML-DSA-87) is implemented where configured.
+> **Status Note (August 2026):** The security controls described below represent the **target architecture**. QIHSE has undergone an internal security review (see [`docs/security/UWP_AUDIT_2026-08.md`](../security/UWP_AUDIT_2026-08.md)) but has **not** completed formal CNSA 2.0 compliance certification, FIPS 140-3 validation, or third-party audits (SOC 2, HIPAA, PCI DSS). Transport-layer encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via `ctx->tls_ctx`; cleartext is the default. Data-at-rest encryption (`.qdb` containers with ML-KEM-1024 / ML-DSA-87) is implemented where configured.
 
 ### 16.1 Security Architecture {#161-security-architecture}
 
@@ -1532,7 +1532,7 @@ qihse-admin cluster-reset
 - **Input validation:** Strict bounds checking and sanitization
 - **Access control:** Role-based access with least privilege
 - **Audit logging:** Comprehensive logging of all operations
-- **Encryption:** Data-at-rest encryption for `.qdb` containers (transport encryption not yet implemented)
+- **Encryption:** Data-at-rest encryption for `.qdb` containers (transport encryption (ChaCha20-Poly1305 AEAD) implemented, opt-in)
 - **Integrity checks:** Cryptographic verification of configurations and models
 
 #### Secure Configuration Management

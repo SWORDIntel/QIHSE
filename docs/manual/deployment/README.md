@@ -834,7 +834,7 @@ qihse-info --health
 
 ### CNSA 2.0 Alignment (In Progress)
 
-> **Note:** QIHSE targets CNSA 2.0 alignment but has not completed formal compliance certification. Transport encryption is not yet implemented.
+> **Note:** QIHSE targets CNSA 2.0 alignment but has not completed formal compliance certification. Transport encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via ctx->tls_ctx; cleartext is the default.
 
 **Key Management:**
 ```bash

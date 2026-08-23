@@ -17,9 +17,17 @@
 
 > **Honest assessment of the current security posture (as of August 2026).**
 
-- **Internal Security Review (August 2026):** The project underwent an internal security review covering the UWP wire protocol. The full report is available at [`docs/security/UWP_AUDIT_2026-08.md`](docs/security/UWP_AUDIT_2026-08.md).
-- **Hardened areas:** Authentication, per-object ACLs (cell-level classification & SCI compartment bitmasks), and frame reassembly have been hardened based on audit findings.
-- **Transport encryption — NOT YET IMPLEMENTED:** The UWP wire protocol currently operates in **cleartext by default**. No TLS or cryptographic framing is present on the transport layer. See [`docs/security/UWP_CRYPTO_DESIGN.md`](docs/security/UWP_CRYPTO_DESIGN.md) for the proposed encryption design.
+- **Internal Security Review (August 2026):** The project underwent an internal security review covering the UWP wire protocol. 24 findings (5 CRITICAL, 7 HIGH, 7 MEDIUM, 5 LOW) were identified. All CRITICAL and HIGH findings have been remediated. The full report is available at [`docs/security/UWP_AUDIT_2026-08.md`](docs/security/UWP_AUDIT_2026-08.md).
+- **Authentication:** Enforced in both UWP and Bolt protocol. Non-AUTH targets reject unauthenticated sessions. Per-IP rate limiting (5 attempts/60s) and per-user lockout prevent brute-force attacks.
+- **Authorization:** Per-object ACLs with full-width resource IDs, per-user grant/revoke, and thread-safe lookup. UWP dispatch derives resource IDs from request payloads (FNV-1a hash for KV/Column/Stream, packet IDs for Vector/Document/TSDB).
+- **Transport encryption:** ChaCha20-Poly1305 AEAD is implemented and wired into the UWP read/write loop. When `ctx->tls_ctx` is non-NULL, all dispatcher replies are encrypted with per-connection session keys derived via HKDF-SHA256. Cleartext is the default (opt-in TLS). See [`docs/security/UWP_CRYPTO_DESIGN.md`](docs/security/UWP_CRYPTO_DESIGN.md).
+- **Frame reassembly:** Bounded payload allocation, proper short-read handling, per-connection state machine, version validation, and separation of routing errors from socket lifecycle.
+- **XDP/eBPF hardening:** Stats counters, rate limiting, `XDP_DROP` fallback (was `XDP_PASS` causing duplicate kernel/userspace processing).
+- **Connection limits:** Max 1024 simultaneous connections, 10-second auth deadline, 5-minute idle timeout with periodic scanning.
+- **Observability:** 19 atomic UWP metrics counters (connections, frames, auth, dispatch per-target, TLS, rate limiting) with JSON and Prometheus exposition format exporters.
+- **Engine coverage:** All 15 UWP targets (AUTH, KV, VECTOR, DOC, COL, TSDB, GRAPH, STREAM, SQL, TXN, GRAPH2, INDEX, SCHEMA, REPL, POOL) are wired to real engine APIs. No stubs remain.
+- **SQL execution:** SELECT via optimizer + index scan + join/aggregate/sort/window executors. INSERT via column store. UPDATE/DELETE via document store. Prepared statements (PARSE/BIND/EXECUTE/CLOSE). Recursive CTEs via iterative fixpoint evaluation. Window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM, COUNT, AVG, MIN, MAX).
+- **Test coverage:** 29-test UWP regression harness, object ACL test, metrics test, and libFuzzer fuzz harness.
 - **No formal certification:** No third-party security audit, FIPS 140-3 validation, or CNSA 2.0 certification has been completed. The badges above reflect **targeted** compliance goals, not achieved certifications.
 - **PQC-ready at rest:** The `.qdb` container format uses ML-KEM-1024 key encapsulation and ML-DSA-87 signatures for data-at-rest encryption where configured. This is a real implemented feature, but it does not constitute full CNSA 2.0 compliance.
 
