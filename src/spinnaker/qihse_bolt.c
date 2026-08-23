@@ -687,6 +687,11 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
     qihse_bolt_buf_t accum;
     qihse_bolt_buf_init(&accum, 4096);
     bool authenticated = false;
+    /* Authenticated user for this session.  Populated during HELLO.
+     * Every qihse_uwp_dispatch() call in this session passes bolt_user so
+     * that the in-process dispatch path enforces the same auth requirement
+     * as the socket-facing uwp_route_payload(). */
+    qihse_user_t* bolt_user = NULL;
 
     for (;;) {
         ssize_t r = read(client_fd, rbuf, sizeof(rbuf));
@@ -713,11 +718,44 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
             }
 
             switch (sig) {
-                case QIHSE_BOLT_MSG_HELLO:
-                    /* Accept any credentials for now */
-                    authenticated = true;
-                    bolt_send_success(client_fd, "server", "QIHSE/1.0");
+                case QIHSE_BOLT_MSG_HELLO: {
+                    /* Decode the principal/credentials map and authenticate.
+                     * Bolt 4.x HELLO payload: {scheme, principal, credentials, ...}.
+                     * We extract principal (username) and credentials (password). */
+                    const char* username = NULL;
+                    const char* password = NULL;
+                    qihse_bolt_decoder_t hdec;
+                    qihse_bolt_decoder_init(&hdec, payload, payload_len);
+                    qihse_bolt_value_t* hello_map = qihse_bolt_decode(&hdec);
+                    if (hello_map && hello_map->type == QIHSE_BOLT_MAP) {
+                        for (size_t ki = 0; ki < hello_map->v.map.count; ki++) {
+                            qihse_bolt_value_t* k = hello_map->v.map.keys[ki];
+                            qihse_bolt_value_t* v = hello_map->v.map.vals[ki];
+                            if (!k || k->type != QIHSE_BOLT_STRING || !v) continue;
+                            if (strcmp(k->v.s.data, "principal") == 0 &&
+                                v->type == QIHSE_BOLT_STRING) {
+                                username = v->v.s.data;
+                            }
+                            if (strcmp(k->v.s.data, "credentials") == 0 &&
+                                v->type == QIHSE_BOLT_STRING) {
+                                password = v->v.s.data;
+                            }
+                        }
+                    }
+                    if (username && password) {
+                        bolt_user = qihse_auth_authenticate(username, password);
+                    }
+                    if (bolt_user) {
+                        authenticated = true;
+                        bolt_send_success(client_fd, "server", "QIHSE/1.0");
+                    } else {
+                        bolt_send_failure(client_fd,
+                                          "Neo.ClientError.Security.Unauthorized",
+                                          "Authentication failed");
+                    }
+                    qihse_bolt_value_free(hello_map);
                     break;
+                }
                 case QIHSE_BOLT_MSG_GOODBYE:
                     free(payload);
                     goto done;
@@ -732,19 +770,42 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     const char* cy = (cypher && cypher->type == QIHSE_BOLT_STRING)
                                      ? cypher->v.s.data : "";
                     /* Translate to UWP and execute */
-                    uint8_t uwp_pkt[1024];
+                    size_t cypher_len = strlen(cy);
+                    if (cypher_len > QIHSE_UWP_TRANSLATE_MAX_PAYLOAD ||
+                        cypher_len > SIZE_MAX - sizeof(qihse_uwp_header_t)) {
+                        fprintf(stderr, "qihse: Bolt Cypher payload is too large (%zu bytes; max %u)\n",
+                                cypher_len, QIHSE_UWP_TRANSLATE_MAX_PAYLOAD);
+                        bolt_send_failure(client_fd, "Neo.ClientError.Request.Invalid",
+                                          "Cypher query exceeds the UWP translation payload limit");
+                        qihse_bolt_value_free(cypher);
+                        break;
+                    }
+                    size_t uwp_cap = sizeof(qihse_uwp_header_t) + cypher_len;
+                    uint8_t* uwp_pkt = (uint8_t*)malloc(uwp_cap);
                     size_t uwp_len = 0;
-                    qihse_translate_bolt_run_to_uwp(cy, NULL, uwp_pkt, &uwp_len);
+                    int translate_rc = uwp_pkt
+                        ? qihse_translate_bolt_run_to_uwp(cy, NULL, uwp_pkt, uwp_cap, &uwp_len)
+                        : -1;
+                    if (translate_rc < 0) {
+                        fprintf(stderr, "qihse: Bolt Cypher translation failed (required %zu bytes, capacity %zu)\n",
+                                uwp_len, uwp_cap);
+                        bolt_send_failure(client_fd, "Neo.ClientError.Request.Invalid",
+                                          "Unable to translate Cypher query to UWP");
+                        free(uwp_pkt);
+                        qihse_bolt_value_free(cypher);
+                        break;
+                    }
                     uint8_t resp[256];
                     size_t resp_len = 0;
                     if (ctx) {
-                        qihse_uwp_dispatch(ctx, (const qihse_uwp_header_t*)uwp_pkt,
+                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                            uwp_pkt + sizeof(qihse_uwp_header_t),
                                            uwp_len - sizeof(qihse_uwp_header_t),
                                            resp, sizeof(resp), &resp_len);
                     }
                     bolt_send_success(client_fd, "t_first", "1");
                     bolt_send_success(client_fd, "qid", "0");
+                    free(uwp_pkt);
                     qihse_bolt_value_free(cypher);
                     break;
                 }
@@ -758,13 +819,19 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     bolt_send_success(client_fd, NULL, NULL);
                     break;
                 case QIHSE_BOLT_MSG_BEGIN: {
-                    uint8_t uwp_pkt[64];
+                    uint8_t uwp_pkt[sizeof(qihse_uwp_header_t)];
                     size_t uwp_len = 0;
-                    qihse_translate_bolt_begin_to_uwp(uwp_pkt, &uwp_len);
+                    if (qihse_translate_bolt_begin_to_uwp(uwp_pkt, sizeof(uwp_pkt), &uwp_len) < 0) {
+                        fprintf(stderr, "qihse: Bolt BEGIN translation failed (required %zu bytes, capacity %zu)\n",
+                                uwp_len, sizeof(uwp_pkt));
+                        bolt_send_failure(client_fd, "Neo.ClientError.Request.Invalid",
+                                          "Unable to translate BEGIN to UWP");
+                        break;
+                    }
                     uint8_t resp[256];
                     size_t resp_len = 0;
                     if (ctx) {
-                        qihse_uwp_dispatch(ctx, (const qihse_uwp_header_t*)uwp_pkt,
+                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                            uwp_pkt + sizeof(qihse_uwp_header_t),
                                            uwp_len - sizeof(qihse_uwp_header_t),
                                            resp, sizeof(resp), &resp_len);
@@ -773,13 +840,19 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     break;
                 }
                 case QIHSE_BOLT_MSG_COMMIT: {
-                    uint8_t uwp_pkt[64];
+                    uint8_t uwp_pkt[sizeof(qihse_uwp_header_t)];
                     size_t uwp_len = 0;
-                    qihse_translate_bolt_commit_to_uwp(uwp_pkt, &uwp_len);
+                    if (qihse_translate_bolt_commit_to_uwp(uwp_pkt, sizeof(uwp_pkt), &uwp_len) < 0) {
+                        fprintf(stderr, "qihse: Bolt COMMIT translation failed (required %zu bytes, capacity %zu)\n",
+                                uwp_len, sizeof(uwp_pkt));
+                        bolt_send_failure(client_fd, "Neo.ClientError.Request.Invalid",
+                                          "Unable to translate COMMIT to UWP");
+                        break;
+                    }
                     uint8_t resp[256];
                     size_t resp_len = 0;
                     if (ctx) {
-                        qihse_uwp_dispatch(ctx, (const qihse_uwp_header_t*)uwp_pkt,
+                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                            uwp_pkt + sizeof(qihse_uwp_header_t),
                                            uwp_len - sizeof(qihse_uwp_header_t),
                                            resp, sizeof(resp), &resp_len);
@@ -788,13 +861,19 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     break;
                 }
                 case QIHSE_BOLT_MSG_ROLLBACK: {
-                    uint8_t uwp_pkt[64];
+                    uint8_t uwp_pkt[sizeof(qihse_uwp_header_t)];
                     size_t uwp_len = 0;
-                    qihse_translate_bolt_rollback_to_uwp(uwp_pkt, &uwp_len);
+                    if (qihse_translate_bolt_rollback_to_uwp(uwp_pkt, sizeof(uwp_pkt), &uwp_len) < 0) {
+                        fprintf(stderr, "qihse: Bolt ROLLBACK translation failed (required %zu bytes, capacity %zu)\n",
+                                uwp_len, sizeof(uwp_pkt));
+                        bolt_send_failure(client_fd, "Neo.ClientError.Request.Invalid",
+                                          "Unable to translate ROLLBACK to UWP");
+                        break;
+                    }
                     uint8_t resp[256];
                     size_t resp_len = 0;
                     if (ctx) {
-                        qihse_uwp_dispatch(ctx, (const qihse_uwp_header_t*)uwp_pkt,
+                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                            uwp_pkt + sizeof(qihse_uwp_header_t),
                                            uwp_len - sizeof(qihse_uwp_header_t),
                                            resp, sizeof(resp), &resp_len);

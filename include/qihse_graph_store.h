@@ -96,6 +96,8 @@ bool qihse_graph_vertex_update(qihse_graph_t* g, uint64_t vertex_id,
                                const char* const* prop_keys,
                                const graph_prop_t* prop_vals,
                                size_t num_props);
+bool qihse_graph_vertex_remove_property(qihse_graph_t* g, uint64_t vertex_id,
+                                        const char* prop_key);
 bool qihse_graph_vertex_delete(qihse_graph_t* g, uint64_t vertex_id);
 bool qihse_graph_vertex_add_label(qihse_graph_t* g, uint64_t vertex_id,
                                   const char* label);
@@ -111,6 +113,8 @@ bool qihse_graph_edge_update(qihse_graph_t* g, uint64_t edge_id,
                              const char* const* prop_keys,
                              const graph_prop_t* prop_vals,
                              size_t num_props);
+bool qihse_graph_edge_remove_property(qihse_graph_t* g, uint64_t edge_id,
+                                      const char* prop_key);
 bool qihse_graph_edge_delete(qihse_graph_t* g, uint64_t edge_id);
 
 /* --- Adjacency / lookups --- */

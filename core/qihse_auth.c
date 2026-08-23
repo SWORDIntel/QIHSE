@@ -51,7 +51,7 @@ void qihse_auth_init(void) {
     active_user_count = 0;
     
     // PRE-SEED THE SYSTEM OPERATOR (User ID 0)
-    qihse_user_t* op = malloc(sizeof(qihse_user_t));
+    qihse_user_t* op = calloc(1, sizeof(qihse_user_t));
     if (op) {
         op->user_id = 0;
         op->role = QIHSE_ROLE_OPERATOR;
@@ -287,6 +287,76 @@ bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t d
 
     qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
     return true;
+}
+
+bool qihse_auth_can_access_object(qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id) {
+    if (!user) return false;
+
+    if (user->role == QIHSE_ROLE_OPERATOR) return true;
+
+    bool allowed = false;
+    pthread_mutex_lock(&auth_mutex);
+    for (uint8_t i = 0; i < user->object_acl_count; i++) {
+        const qihse_acl_entry_t* entry = &user->object_acl[i];
+        if (entry->namespace_id == namespace_id && entry->resource_id == resource_id) {
+            allowed = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&auth_mutex);
+    return allowed;
+}
+
+bool qihse_auth_grant_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+                             uint32_t namespace_id, uint64_t resource_id, uint8_t access_flags) {
+    const uint8_t valid_flags = QIHSE_ACL_READ | QIHSE_ACL_WRITE | QIHSE_ACL_ADMIN;
+    if (!operator_user || operator_user->role != QIHSE_ROLE_OPERATOR || !target_user ||
+        access_flags == 0 || (access_flags & (uint8_t)~valid_flags) != 0) {
+        return false;
+    }
+
+    pthread_mutex_lock(&auth_mutex);
+    for (uint8_t i = 0; i < target_user->object_acl_count; i++) {
+        qihse_acl_entry_t* entry = &target_user->object_acl[i];
+        if (entry->namespace_id == namespace_id && entry->resource_id == resource_id) {
+            entry->access_flags = access_flags;
+            pthread_mutex_unlock(&auth_mutex);
+            return true;
+        }
+    }
+
+    if (target_user->object_acl_count >= QIHSE_OBJECT_ACL_MAX_ENTRIES) {
+        pthread_mutex_unlock(&auth_mutex);
+        return false;
+    }
+
+    qihse_acl_entry_t* entry = &target_user->object_acl[target_user->object_acl_count++];
+    entry->namespace_id = namespace_id;
+    entry->resource_id = resource_id;
+    entry->access_flags = access_flags;
+    pthread_mutex_unlock(&auth_mutex);
+    return true;
+}
+
+bool qihse_auth_revoke_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+                              uint32_t namespace_id, uint64_t resource_id) {
+    if (!operator_user || operator_user->role != QIHSE_ROLE_OPERATOR || !target_user) {
+        return false;
+    }
+
+    pthread_mutex_lock(&auth_mutex);
+    for (uint8_t i = 0; i < target_user->object_acl_count; i++) {
+        qihse_acl_entry_t* entry = &target_user->object_acl[i];
+        if (entry->namespace_id == namespace_id && entry->resource_id == resource_id) {
+            uint8_t last = --target_user->object_acl_count;
+            if (i != last) target_user->object_acl[i] = target_user->object_acl[last];
+            memset(&target_user->object_acl[last], 0, sizeof(target_user->object_acl[last]));
+            pthread_mutex_unlock(&auth_mutex);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&auth_mutex);
+    return false;
 }
 
 bool qihse_auth_is_operator_password_default(void) {
