@@ -13,6 +13,7 @@
 #include "qihse_auth.h"
 #include "qihse_repl.h"
 #include "qihse_pooler.h"
+#include "qihse_uwp_tls.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +37,7 @@ typedef struct {
     void* wal;             /* WAL handle */
     qihse_repl_context_t* repl_ctx; /* NULL unless replication is configured */
     qihse_pooler_t* pooler;         /* NULL unless pooling is configured */
+    qihse_uwp_tls_ctx_t* tls_ctx;   /* NULL = cleartext, non-NULL = TLS enabled */
 } qihse_uwp_context_t;
 
 /* 15-byte fixed width packed header */

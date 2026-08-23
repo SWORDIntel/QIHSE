@@ -79,7 +79,7 @@ typedef struct qihse_config_s {
     uint16_t cluster_port;        // Cluster communication port
 
     // Security settings
-    qihse_security_level_t security_level; // CNSA 2.0 compliance level
+    qihse_security_level_t security_level; // CNSA 2.0 alignment level (certification in progress)
     const char* key_store_path;   // Path to secure key store
 } qihse_config_t;
 ```

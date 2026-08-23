@@ -94,7 +94,7 @@ This guide provides comprehensive instructions for deploying QIHSE in production
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │
 │  │  QIHSE      │  │  Security   │  │  Audit  │  │
 │  │  Engine     │  │  Module     │  │ Service │  │
-│  │             │  │  (CNSA2)    │  │         │  │
+│  │             │  │  (CNSA2*)   │  │         │  │
 │  └─────────────┘  └─────────────┘  └─────────┘  │
 ├─────────────────────────────────────────────────┤
 │                Internal Network                 │
@@ -832,14 +832,16 @@ qihse-info --health
 
 ## Security Hardening
 
-### CNSA 2.0 Compliance
+### CNSA 2.0 Alignment (In Progress)
+
+> **Note:** QIHSE targets CNSA 2.0 alignment but has not completed formal compliance certification. Transport encryption is not yet implemented.
 
 **Key Management:**
 ```bash
 # Initialize HSM for key storage
 qihse-security --init-hsm --module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so
 
-# Generate CNSA 2.0 compliant keys
+# Generate CNSA 2.0 aligned keys
 qihse-security --generate-key --algorithm ecdsa-p384 --key-id master-key
 
 # Configure key rotation

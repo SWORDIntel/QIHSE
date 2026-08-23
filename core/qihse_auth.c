@@ -11,6 +11,73 @@
 #include <sys/mman.h>
 #endif
 
+// ---------------------------------------------------------------------------
+// IP-based auth rate limiter (brute-force protection)
+// ---------------------------------------------------------------------------
+// Lazy-initialized global singleton. Defaults: 5 attempts / 60s / 1024 slots.
+static qihse_rate_limiter_t* g_auth_rate_limiter = NULL;
+static pthread_mutex_t g_rate_limiter_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static qihse_rate_limiter_t* qihse_auth_get_rate_limiter(void) {
+    if (g_auth_rate_limiter) {
+        return g_auth_rate_limiter;
+    }
+    pthread_mutex_lock(&g_rate_limiter_mutex);
+    if (!g_auth_rate_limiter) {
+        g_auth_rate_limiter = qihse_rate_limiter_create(
+            QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES,
+            QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS,
+            QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC);
+    }
+    pthread_mutex_unlock(&g_rate_limiter_mutex);
+    return g_auth_rate_limiter;
+}
+
+void qihse_auth_init_rate_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries) {
+    pthread_mutex_lock(&g_rate_limiter_mutex);
+    if (g_auth_rate_limiter) {
+        qihse_rate_limiter_destroy(g_auth_rate_limiter);
+        g_auth_rate_limiter = NULL;
+    }
+    if (max_attempts == 0) max_attempts = QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS;
+    if (window_seconds == 0) window_seconds = QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC;
+    if (max_entries == 0) max_entries = QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES;
+    g_auth_rate_limiter = qihse_rate_limiter_create(max_entries, max_attempts, window_seconds);
+    pthread_mutex_unlock(&g_rate_limiter_mutex);
+}
+
+void qihse_auth_shutdown_rate_limiter(void) {
+    pthread_mutex_lock(&g_rate_limiter_mutex);
+    if (g_auth_rate_limiter) {
+        qihse_rate_limiter_destroy(g_auth_rate_limiter);
+        g_auth_rate_limiter = NULL;
+    }
+    pthread_mutex_unlock(&g_rate_limiter_mutex);
+}
+
+bool qihse_auth_check_rate_limit(uint32_t source_ip) {
+    qihse_rate_limiter_t* rl = qihse_auth_get_rate_limiter();
+    if (!rl) {
+        // Fail-open if the limiter could not be allocated.
+        return true;
+    }
+    return qihse_rate_limiter_check(rl, source_ip);
+}
+
+void qihse_auth_rate_limit_reset(uint32_t source_ip) {
+    qihse_rate_limiter_t* rl = qihse_auth_get_rate_limiter();
+    if (rl) {
+        qihse_rate_limiter_reset(rl, source_ip);
+    }
+}
+
+void qihse_auth_rate_limit_cleanup(void) {
+    qihse_rate_limiter_t* rl = qihse_auth_get_rate_limiter();
+    if (rl) {
+        qihse_rate_limiter_cleanup(rl);
+    }
+}
+
 #define MAX_USERS 1024
 #define MAX_AUTH_ATTEMPTS 5
 #define AUTH_LOCKOUT_SECONDS 300
@@ -373,8 +440,19 @@ bool qihse_auth_is_operator_password_default(void) {
     return is_default;
 }
 
-qihse_user_t* qihse_auth_authenticate(const char* username, const char* password) {
+qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* username, const char* password) {
     if (!username || !password) return NULL;
+
+    // --- IP-based rate limit check (brute-force protection) ------------------
+    // This runs BEFORE any credential verification. qihse_rate_limiter_check
+    // increments the per-IP attempt counter on every call, so a denied result
+    // here means the IP has already exhausted its quota within the window.
+    if (!qihse_auth_check_rate_limit(source_ip)) {
+        fprintf(stderr, "[AUTH] Rate limit exceeded for source IP %u. Authentication rejected.\n",
+                source_ip);
+        return NULL;
+    }
+
     pthread_mutex_lock(&auth_mutex);
     for (int i = 0; i < MAX_USERS; i++) {
         if (users[i] && strcmp(users[i]->username, username) == 0) {
@@ -392,6 +470,8 @@ qihse_user_t* qihse_auth_authenticate(const char* username, const char* password
                 rate_limits[i].lockout_until = 0;
                 qihse_user_t* u = users[i];
                 pthread_mutex_unlock(&auth_mutex);
+                // Successful auth: reset the IP rate-limit counter.
+                qihse_auth_rate_limit_reset(source_ip);
                 return u;
             } else {
                 rate_limits[i].failed_count++;
@@ -402,12 +482,23 @@ qihse_user_t* qihse_auth_authenticate(const char* username, const char* password
                             username, MAX_AUTH_ATTEMPTS, AUTH_LOCKOUT_SECONDS);
                 }
                 pthread_mutex_unlock(&auth_mutex);
+                // Failed auth: the IP counter was already incremented by
+                // qihse_auth_check_rate_limit above; nothing more to do.
                 return NULL;
             }
         }
     }
     pthread_mutex_unlock(&auth_mutex);
+    // No matching user: the IP counter was already incremented by the
+    // initial rate-limit check, which is the desired brute-force behavior.
     return NULL;
+}
+
+qihse_user_t* qihse_auth_authenticate(const char* username, const char* password) {
+    // Backwards-compatible entry point: no source IP is available, so we use
+    // 0 (unspecified). The rate limiter still tracks it as a single bucket,
+    // providing coarse global protection for legacy callers.
+    return qihse_auth_authenticate_from(0, username, password);
 }
 
 qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password) {

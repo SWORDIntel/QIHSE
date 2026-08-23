@@ -203,7 +203,7 @@ For defense and intelligence installations requiring cell-level access controls:
 
 - **Compartmented Access**: Optional classification level and SCI compartment bitmasks on individual keys and vectors.
 - **Constant-Time Rejection**: Unauthorized access requests execute algorithmic paths indistinguishable from missing keys to prevent timing analysis.
-- **CNSA 2.0 Cryptography**: Optional transparent page-level encryption via AES-256-GCM, ML-KEM-1024 key encapsulation, and ML-DSA-87 signature validation.
+- **CNSA 2.0 Aligned Cryptography (In Progress):** Optional transparent page-level encryption via AES-256-GCM, ML-KEM-1024 key encapsulation, and ML-DSA-87 signature validation (data at rest). Transport encryption is not yet implemented.
 - **Audit Hash Chains**: Append-only cryptographic ledger tracking access modifications and security events.
 
 ---

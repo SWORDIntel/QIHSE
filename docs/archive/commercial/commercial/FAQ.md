@@ -121,7 +121,7 @@ The combination delivers **3-7x speedup on AVX2 systems** and **12-25x speedup w
 ### Q: How does QIHSE handle data security?
 
 **A:** Enterprise-grade security:
-- **CNSA 2.0 compliance** for government/military use
+- **CNSA 2.0 alignment (in progress)** for government/military use
 - **End-to-end encryption** for data at rest and in transit
 - **Role-based access control** with fine-grained permissions
 - **Audit logging** for all operations
@@ -272,7 +272,7 @@ The combination delivers **3-7x speedup on AVX2 systems** and **12-25x speedup w
 - **Automatic failover** capabilities
 - **Performance regression detection** with alerts
 - **Comprehensive monitoring** and observability
-- **CNSA 2.0 compliance** for mission-critical use
+- **CNSA 2.0 alignment (in progress)** for mission-critical use
 
 ### Q: What happens if there are bugs or issues?
 
@@ -330,7 +330,7 @@ The combination delivers **3-7x speedup on AVX2 systems** and **12-25x speedup w
 
 **A:** Available upon NDA:
 - **Fortune 500 companies** in search, e-commerce, and finance
-- **Government agencies** using CNSA 2.0 compliant systems
+- **Government agencies** using CNSA 2.0 aligned (in progress) systems
 - **Cloud providers** integrating QIHSE into their platforms
 - **Database vendors** OEM partnerships
 

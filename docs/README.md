@@ -46,7 +46,7 @@ flowchart TB
         VER["Verification Modes"]
         EMGT["Energy Management"]
         BENCH["Benchmark Suite"]
-        SEC["Security<br/>CNSA 2.0"]
+        SEC["Security<br/>CNSA 2.0 (In Progress)"]
         PER["Persistence Engine<br/>Trinary / WAL / Planner"]
     end
 
@@ -143,7 +143,7 @@ Operational runbooks: vector DB mutation flows, memory maintenance loops, benchm
 Stress test specifications, regression detection methodology, and enterprise validation procedures.
 
 ### [🔒 Security](security/)
-CNSA 2.0 compliance, cryptographic operations, access control, audit logging, and threat mitigation.
+CNSA 2.0 alignment (in progress), cryptographic operations, access control, audit logging, and threat mitigation. Transport encryption is not yet implemented.
 
 ### [🚀 Deployment & Commercial](deployment/)
 Single-node and cluster deployment, cloud guides (AWS, Azure), monitoring, backup/recovery, and commercial analysis.

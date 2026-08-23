@@ -7,9 +7,21 @@
 
 ### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux) ![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen) ![CNSA 2.0 Compliant](https://img.shields.io/badge/Cryptography-CNSA%202.0-brightgreen.svg) ![FIPS 140-3](https://img.shields.io/badge/Hardware-FIPS%20140--3-brightgreen.svg) ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success) ![Security Audit](https://img.shields.io/badge/Security-Audited%20%26%20Hardened-success?logo=shield)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux) ![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen) ![CNSA 2.0 Alignment (In Progress)](https://img.shields.io/badge/Cryptography-CNSA%202.0%20Alignment%20(In%20Progress)-yellow.svg) ![FIPS 140-3 Targeted](https://img.shields.io/badge/Hardware-FIPS%20140--3%20Targeted-yellow.svg) ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success) ![Security Review](https://img.shields.io/badge/Security-Internal%20Review%20(2026--08)-yellow?logo=shield)
 
 </div>
+
+---
+
+## Security Status
+
+> **Honest assessment of the current security posture (as of August 2026).**
+
+- **Internal Security Review (August 2026):** The project underwent an internal security review covering the UWP wire protocol. The full report is available at [`docs/security/UWP_AUDIT_2026-08.md`](docs/security/UWP_AUDIT_2026-08.md).
+- **Hardened areas:** Authentication, per-object ACLs (cell-level classification & SCI compartment bitmasks), and frame reassembly have been hardened based on audit findings.
+- **Transport encryption — NOT YET IMPLEMENTED:** The UWP wire protocol currently operates in **cleartext by default**. No TLS or cryptographic framing is present on the transport layer. See [`docs/security/UWP_CRYPTO_DESIGN.md`](docs/security/UWP_CRYPTO_DESIGN.md) for the proposed encryption design.
+- **No formal certification:** No third-party security audit, FIPS 140-3 validation, or CNSA 2.0 certification has been completed. The badges above reflect **targeted** compliance goals, not achieved certifications.
+- **PQC-ready at rest:** The `.qdb` container format uses ML-KEM-1024 key encapsulation and ML-DSA-87 signatures for data-at-rest encryption where configured. This is a real implemented feature, but it does not constitute full CNSA 2.0 compliance.
 
 ---
 
@@ -102,7 +114,7 @@ flowchart TB
     CLIENT --> VFS_HOOK
 
     subgraph SECURITY["2. Security & Access Gate"]
-        AUTH["CNSA 2.0 Security Gate<br/>• Cell-Level Classification & SCI Bitmasks<br/>• Constant-Time Rejection (Zero Timing Leaks)"]
+        AUTH["Security & Access Gate<br/>• Cell-Level Classification & SCI Bitmasks<br/>• Constant-Time Rejection (Zero Timing Leaks)"]
     end
 
     UWP --> AUTH
@@ -460,7 +472,7 @@ All technical specifications, integration manuals, API definitions, and code exa
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
 - 🐍 **[Python SDK Manual](python/)**: Native CPython bindings and integration guide.
 - 🦀 **[Rust SDK Manual](rust/qihse-rs/)**: FFI safe wrappers (`KVStore`, `VectorDB`, `TrinaryTrie`).
-- 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and CNSA 2.0 PQC encryption.
+- 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and PQC-ready container encryption.
 - 🛡️ **[Security Audit & Hardening Report](docs/security/hardening-report.md)**: Results from static analysis, memory audit, and file I/O hardening.
 - ⚡ **[Performance Benchmarks](docs/benchmarks/benchmarks.md)**: Stress tests, throughput comparisons, and latency profiles.
 

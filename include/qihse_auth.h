@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "qihse_rate_limit.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,7 +80,29 @@ bool qihse_auth_revoke_object(qihse_user_t* operator_user, qihse_user_t* target_
 
 bool qihse_auth_is_operator_password_default(void);
 qihse_user_t* qihse_auth_authenticate(const char* username, const char* password);
+qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* username, const char* password);
 qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password);
+
+// --- IP-based auth rate limiting (brute-force protection) -------------------
+// Defaults: 5 attempts per 60 seconds per source IP. The limiter is
+// lazy-initialized on first use and can also be initialized explicitly via
+// qihse_auth_init_rate_limiter().
+#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5
+#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC  60
+#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES 1024
+
+void qihse_auth_init_rate_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
+void qihse_auth_shutdown_rate_limiter(void);
+
+// Returns true if an auth attempt from source_ip is allowed, false if it is
+// rate-limited. Each call increments the per-IP attempt counter.
+bool qihse_auth_check_rate_limit(uint32_t source_ip);
+
+// Reset the per-IP counter (call on successful authentication).
+void qihse_auth_rate_limit_reset(uint32_t source_ip);
+
+// Remove stale entries from the rate limiter (safe to call periodically).
+void qihse_auth_rate_limit_cleanup(void);
 
 #ifdef __cplusplus
 }

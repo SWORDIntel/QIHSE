@@ -426,7 +426,7 @@ QIHSE delivers exceptional performance across all benchmark categories:
 
 ### **Enterprise Readiness**
 - **Production-stable** with comprehensive testing
-- **CNSA 2.0 compliant** for secure deployments
+- **CNSA 2.0 aligned (in progress)** for secure deployments
 - **Enterprise monitoring** and regression detection
 - **Multi-platform support** (CPU, GPU, NPU)
 - **A00 Engineering**: Validated on Meteor Lake-P A00 boards with VSEC unlock

@@ -854,7 +854,7 @@ print(f'P99: {np.percentile(data, 99):.2f}ms')
 
 ## Security Considerations
 
-### CNSA 2.0 Compliance
+### CNSA 2.0 Alignment (In Progress)
 
 #### Approved Algorithms
 - **HMAC-SHA384** for integrity
@@ -864,7 +864,7 @@ print(f'P99: {np.percentile(data, 99):.2f}ms')
 #### Configuration
 ```ini
 [security]
-# CNSA 2.0 compliance
+# CNSA 2.0 alignment (in progress)
 cnsa_compliance = true
 approved_algorithms_only = true
 

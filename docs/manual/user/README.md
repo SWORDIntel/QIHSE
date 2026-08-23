@@ -647,7 +647,7 @@ setenv("QIHSE_MEMORY_DEBUG", "1", 1);
    - Log security events and system anomalies
 
 3. **Configure for Production**
-   - Use CNSA 2.0 compliant security settings
+   - Use CNSA 2.0 aligned security settings (compliance certification in progress)
    - Enable energy-aware optimization for data centers
    - Configure distributed operation for high availability
 
