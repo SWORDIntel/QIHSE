@@ -50,24 +50,14 @@ typedef struct {
     const uint8_t* end;
 } uwp_gi_cursor_t;
 
-static void uwp_write_all(int client_fd, const void* buf, size_t len) {
-    const uint8_t* bytes = (const uint8_t*)buf;
-    size_t offset = 0;
-    if (client_fd < 0) return;
-    while (offset < len) {
-        ssize_t written = write(client_fd, bytes + offset, len - offset);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (written == 0) break;
-        offset += (size_t)written;
-    }
+static void uwp_write_cb(qihse_uwp_write_fn write_fn, void* write_ctx,
+                         const void* data, size_t len) {
+    if (write_fn) write_fn(write_ctx, data, len);
 }
 
-static uwp_gi_result_t gi_reply(int client_fd, uwp_gi_result_t result,
-                                const char* text) {
-    uwp_write_all(client_fd, text, strlen(text));
+static uwp_gi_result_t gi_reply(qihse_uwp_write_fn write_fn, void* write_ctx,
+                                uwp_gi_result_t result, const char* text) {
+    if (write_fn) write_fn(write_ctx, text, strlen(text));
     return result;
 }
 
@@ -190,11 +180,12 @@ fail:
     return false;
 }
 
-static uwp_gi_result_t gi_reply_vertex(int client_fd, graph_vertex_t* vertex) {
+static uwp_gi_result_t gi_reply_vertex(qihse_uwp_write_fn write_fn, void* write_ctx,
+                                       graph_vertex_t* vertex) {
     size_t needed;
     char* reply;
     size_t offset;
-    if (!vertex) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+    if (!vertex) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
     needed = (size_t)snprintf(NULL, 0, "VERTEX id=%" PRIu64 " labels=[", vertex->id);
     for (size_t i = 0; i < vertex->num_labels; ++i) {
         size_t label_len = strlen(vertex->labels[i]);
@@ -212,13 +203,13 @@ static uwp_gi_result_t gi_reply_vertex(int client_fd, graph_vertex_t* vertex) {
                                    i ? "," : "", vertex->labels[i]);
     offset += (size_t)snprintf(reply + offset, needed + 1 - offset, "] props=%zu\n",
                                vertex->num_props);
-    uwp_write_all(client_fd, reply, offset);
+    uwp_write_cb(write_fn, write_ctx, reply, offset);
     free(reply);
     graph_vertex_free(vertex);
     return UWP_GI_OK;
 fail:
     graph_vertex_free(vertex);
-    return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+    return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
 }
 
 static void* gi_fts_create(void) { return qihse_fts_create(); }
@@ -322,12 +313,14 @@ static bool gi_hnsw_delete(void* handle, uint64_t row_id) {
 uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
                                     uint8_t command_opcode,
                                     const uint8_t* payload, size_t payload_len,
-                                    qihse_user_t* user, int client_fd) {
+                                    qihse_user_t* user, int client_fd,
+                                    qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     uwp_gi_cursor_t cursor;
     qihse_graph_t* graph;
-    if (!user) return gi_reply(client_fd, UWP_GI_ERR_PERM, "ERR_PERM\n");
-    if (!ctx || !ctx->graph_store) return gi_reply(client_fd, UWP_GI_ERR_NO_CTX, "ERR_NO_CTX\n");
-    if (!payload) return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+    if (!user) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_PERM, "ERR_PERM\n");
+    if (!ctx || !ctx->graph_store) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_NO_CTX, "ERR_NO_CTX\n");
+    if (!payload) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
     graph = (qihse_graph_t*)ctx->graph_store;
     cursor.cur = payload;
     cursor.end = payload + payload_len;
@@ -336,10 +329,10 @@ uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
             uint64_t id;
             graph_vertex_t* vertex;
             if (!gi_read_u64_le(&cursor, &id) || !gi_at_end(&cursor))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             vertex = qihse_graph_vertex_get(graph, id);
-            if (!vertex) return gi_reply(client_fd, UWP_GI_OK, "NOT_FOUND\n");
-            return gi_reply_vertex(client_fd, vertex);
+            if (!vertex) return gi_reply(write_fn, write_ctx, UWP_GI_OK, "NOT_FOUND\n");
+            return gi_reply_vertex(write_fn, write_ctx, vertex);
         }
         case 0x02:
         case 0x03: {
@@ -352,23 +345,23 @@ uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
             if (!gi_read_graph_create(&cursor, &labels, &label_count, &keys, &props,
                                       &prop_count) || !gi_at_end(&cursor)) {
                 free(labels); free(keys); gi_free_graph_props(props, prop_count);
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             }
             /* MERGE is CREATE-only until its wire format includes a vertex id. */
             id = qihse_graph_vertex_create(graph, labels, label_count, keys, props, prop_count);
             free(labels); free(keys); gi_free_graph_props(props, prop_count);
-            if (id == 0) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            if (id == 0) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
             for (unsigned int i = 0; i < 8; ++i) reply[i] = (uint8_t)(id >> (8u * i));
-            uwp_write_all(client_fd, reply, sizeof(reply));
+            uwp_write_cb(write_fn, write_ctx, reply, sizeof(reply));
             return UWP_GI_OK;
         }
         case 0x04: {
             uint64_t id;
             if (!gi_read_u64_le(&cursor, &id) || !gi_at_end(&cursor))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             if (!qihse_graph_vertex_delete(graph, id))
-                return gi_reply(client_fd, UWP_GI_OK, "NOT_FOUND\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_OK, "NOT_FOUND\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         case 0x05: {
             uint64_t id;
@@ -379,12 +372,12 @@ uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
             if (!gi_read_u64_le(&cursor, &id) || !gi_read_cstring(&cursor, &key, NULL) ||
                 !gi_read_graph_prop(&cursor, &prop) || !gi_at_end(&cursor)) {
                 graph_prop_free(&prop);
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             }
             updated = qihse_graph_vertex_update(graph, id, &key, &prop, 1);
             graph_prop_free(&prop);
-            if (!updated) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+            if (!updated) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         case 0x06: {
             uint8_t entity_type;
@@ -394,41 +387,43 @@ uwp_gi_result_t uwp_dispatch_graph2(qihse_uwp_context_t* ctx,
             if (!gi_read_u8(&cursor, &entity_type) || (entity_type != 0 && entity_type != 1) ||
                 !gi_read_u64_le(&cursor, &id) || !gi_read_cstring(&cursor, &prop_key, NULL) ||
                 !gi_at_end(&cursor))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             if (entity_type == 0) {
                 ok = qihse_graph_vertex_remove_property(graph, id, prop_key);
             } else {
                 ok = qihse_graph_edge_remove_property(graph, id, prop_key);
             }
-            if (!ok) return gi_reply(client_fd, UWP_GI_OK, "NOT_FOUND\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+            if (!ok) return gi_reply(write_fn, write_ctx, UWP_GI_OK, "NOT_FOUND\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         case 0x10: {
             uint8_t algorithm_id;
             char reply[32];
             int length;
             if (!gi_read_u8(&cursor, &algorithm_id))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             length = snprintf(reply, sizeof(reply), "ALGO %u QUEUED\n", algorithm_id);
             if (length < 0 || (size_t)length >= sizeof(reply))
-                return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            uwp_write_all(client_fd, reply, (size_t)length);
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            uwp_write_cb(write_fn, write_ctx, reply, (size_t)length);
             return UWP_GI_OK;
         }
         default:
-            return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
     }
 }
 
 uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
                                    uint8_t command_opcode,
                                    const uint8_t* payload, size_t payload_len,
-                                   qihse_user_t* user, int client_fd) {
+                                   qihse_user_t* user, int client_fd,
+                                   qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     uwp_gi_cursor_t cursor;
     qihse_index_manager_t* manager;
-    if (!user) return gi_reply(client_fd, UWP_GI_ERR_PERM, "ERR_PERM\n");
-    if (!ctx || !ctx->index_manager) return gi_reply(client_fd, UWP_GI_ERR_NO_CTX, "ERR_NO_CTX\n");
-    if (!payload) return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+    if (!user) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_PERM, "ERR_PERM\n");
+    if (!ctx || !ctx->index_manager) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_NO_CTX, "ERR_NO_CTX\n");
+    if (!payload) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
     manager = (qihse_index_manager_t*)ctx->index_manager;
     cursor.cur = payload;
     cursor.end = payload + payload_len;
@@ -443,9 +438,9 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
             if (!gi_read_cstring(&cursor, &name, &name_len) || name_len == 0 || name_len >= 128 ||
                 !gi_read_u8(&cursor, &type_wire) || !gi_read_u8(&cursor, &ncol_wire) ||
                 ncol_wire == 0 || type_wire > QIHSE_INDEX_FTS_INVERTED)
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             cols = calloc(ncol_wire, sizeof(*cols));
-            if (!cols) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            if (!cols) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
             for (uint8_t i = 0; i < ncol_wire; ++i) {
                 const char* col_name;
                 size_t col_name_len;
@@ -454,7 +449,7 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
                     !gi_read_cstring(&cursor, &col_name, &col_name_len) || col_name_len == 0 ||
                     col_name_len >= sizeof(cols[i].name)) {
                     free(cols);
-                    return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                    return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
                 }
                 cols[i].type = (qihse_idx_col_type_t)col_type;
                 memcpy(cols[i].name, col_name, col_name_len + 1);
@@ -462,10 +457,10 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
             if (type_wire == QIHSE_INDEX_VECTOR_HNSW) {
                 if (!gi_read_u32_le(&cursor, &hnsw_dim) || hnsw_dim == 0) {
                     free(cols);
-                    return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                    return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
                 }
             }
-            if (!gi_at_end(&cursor)) { free(cols); return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n"); }
+            if (!gi_at_end(&cursor)) { free(cols); return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n"); }
             switch ((qihse_index_type_t)type_wire) {
                 case QIHSE_INDEX_BTREE:
                     index = qihse_index_manager_add_btree(manager, name, cols, ncol_wire, 0); break;
@@ -491,8 +486,8 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
                 default: break;
             }
             free(cols);
-            if (!index) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+            if (!index) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         case 0x02: {
             const char* name;
@@ -500,14 +495,14 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
             char reply[256];
             int length;
             if (!gi_read_cstring(&cursor, &name, NULL) || !gi_at_end(&cursor))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             index = qihse_index_manager_find(manager, name);
-            if (!index) return gi_reply(client_fd, UWP_GI_OK, "NOT_FOUND\n");
+            if (!index) return gi_reply(write_fn, write_ctx, UWP_GI_OK, "NOT_FOUND\n");
             length = snprintf(reply, sizeof(reply), "INDEX %s COUNT %zu\n", name,
                               qihse_index_manager_count(manager));
             if (length < 0 || (size_t)length >= sizeof(reply))
-                return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            uwp_write_all(client_fd, reply, (size_t)length);
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            uwp_write_cb(write_fn, write_ctx, reply, (size_t)length);
             return UWP_GI_OK;
         }
         case 0x03: {
@@ -521,13 +516,13 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
             if (!gi_read_cstring(&cursor, &name, NULL) || !gi_read_u64_le(&cursor, &row_id) ||
                 !gi_read_u8(&cursor, &ncol_wire) || ncol_wire == 0 ||
                 !qihse_index_manager_find(manager, name))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             types = calloc(ncol_wire, sizeof(*types));
             values = calloc(ncol_wire, sizeof(*values));
             lengths = calloc(ncol_wire, sizeof(*lengths));
             if (!types || !values || !lengths) {
                 free(types); free(values); free(lengths);
-                return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
             }
             for (uint8_t i = 0; i < ncol_wire; ++i) {
                 uint8_t type_wire;
@@ -547,11 +542,11 @@ uwp_gi_result_t uwp_dispatch_index(qihse_uwp_context_t* ctx,
             if (!gi_at_end(&cursor)) goto insert_args;
             ok = qihse_index_manager_insert_row(manager, row_id, types, values, lengths, ncol_wire);
             free(types); free(values); free(lengths);
-            if (!ok) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+            if (!ok) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
 insert_args:
             free(types); free(values); free(lengths);
-            return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
         }
         case 0x04: {
             const char* name;
@@ -565,20 +560,20 @@ insert_args:
                 nrows_wire == 0 || !(index = qihse_index_manager_find(manager, name)) ||
                 qihse_index_type(index) != QIHSE_INDEX_BTREE ||
                 nrows_wire > (size_t)(cursor.end - cursor.cur) / 12u)
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             row_ids = calloc(nrows_wire, sizeof(*row_ids));
             keys = calloc(nrows_wire, sizeof(*keys));
             key_lens = calloc(nrows_wire, sizeof(*key_lens));
             if (!row_ids || !keys || !key_lens) {
                 free(row_ids); free(keys); free(key_lens);
-                return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
             }
             for (uint32_t i = 0; i < nrows_wire; ++i) {
                 uint32_t key_len;
                 if (!gi_read_u64_le(&cursor, &row_ids[i]) || !gi_read_u32_le(&cursor, &key_len) ||
                     (size_t)(cursor.end - cursor.cur) < key_len) {
                     free(row_ids); free(keys); free(key_lens);
-                    return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                    return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
                 }
                 keys[i] = cursor.cur;
                 key_lens[i] = key_len;
@@ -586,22 +581,22 @@ insert_args:
             }
             if (!gi_at_end(&cursor)) {
                 free(row_ids); free(keys); free(key_lens);
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             }
             ok = qihse_index_bulk_load(index, row_ids, keys, key_lens, nrows_wire);
             free(row_ids); free(keys); free(key_lens);
-            if (!ok) return gi_reply(client_fd, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+            if (!ok) return gi_reply(write_fn, write_ctx, UWP_GI_ERR_FAILED, "ERR_FAILED\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         case 0x05: {
             const char* name;
             if (!gi_read_cstring(&cursor, &name, NULL) || !gi_at_end(&cursor))
-                return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
             if (!qihse_index_manager_drop(manager, name))
-                return gi_reply(client_fd, UWP_GI_OK, "NOT_FOUND\n");
-            return gi_reply(client_fd, UWP_GI_OK, "OK\n");
+                return gi_reply(write_fn, write_ctx, UWP_GI_OK, "NOT_FOUND\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_OK, "OK\n");
         }
         default:
-            return gi_reply(client_fd, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
+            return gi_reply(write_fn, write_ctx, UWP_GI_ERR_ARGS, "ERR_ARGS\n");
     }
 }

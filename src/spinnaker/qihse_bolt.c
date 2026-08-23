@@ -413,7 +413,7 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     }
 
     /* Maps */
-    if ((marker & 0xF0) == 0xD7) {
+    if (marker >= 0xD4 && marker <= 0xD7) {
         size_t count = marker - 0xD4;
         qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
         v->v.map.count = count;

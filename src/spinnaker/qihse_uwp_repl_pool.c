@@ -13,30 +13,9 @@
 #include <unistd.h>
 #endif
 
-static void uwp_repl_pool_write_all(int client_fd, const void* buf, size_t len) {
-    const uint8_t* bytes = buf;
-    size_t off = 0;
-
-    if (client_fd < 0 || !buf) return;
-    while (off < len) {
-#ifdef _WIN32
-        int chunk = len - off > INT_MAX ? INT_MAX : (int)(len - off);
-        int written = send((SOCKET)client_fd, (const char*)bytes + off,
-                           chunk, MSG_NOSIGNAL);
-        if (written == SOCKET_ERROR) {
-            if (WSAGetLastError() == WSAEINTR) continue;
-            break;
-        }
-#else
-        ssize_t written = write(client_fd, bytes + off, len - off);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-#endif
-        if (written == 0) break;
-        off += (size_t)written;
-    }
+static void uwp_repl_pool_write_cb(qihse_uwp_write_fn write_fn, void* write_ctx,
+                                   const void* data, size_t len) {
+    if (write_fn) write_fn(write_ctx, data, len);
 }
 
 static uint32_t uwp_repl_pool_read_le32(const uint8_t* value) {
@@ -75,7 +54,8 @@ static const char* uwp_repl_pool_state_name(repl_state_t state) {
 static uwp_repl_result_t uwp_repl_pool_status(qihse_repl_context_t* repl_ctx,
                                                uint64_t requested_lsn,
                                                int include_requested_lsn,
-                                               int client_fd) {
+                                               qihse_uwp_write_fn write_fn,
+                                               void* write_ctx) {
     char reply[192];
     uint64_t last_lsn;
     uint64_t flush_lsn;
@@ -99,14 +79,16 @@ static uwp_repl_result_t uwp_repl_pool_status(qihse_repl_context_t* repl_ctx,
     }
     if (length < 0 || (size_t)length >= sizeof(reply)) return UWP_REPL_ERR_FAILED;
 
-    uwp_repl_pool_write_all(client_fd, reply, (size_t)length);
+    uwp_repl_pool_write_cb(write_fn, write_ctx, reply, (size_t)length);
     return UWP_REPL_OK;
 }
 
 uwp_repl_result_t uwp_dispatch_repl(qihse_uwp_context_t* ctx,
                                     uint8_t command_opcode,
                                     const uint8_t* payload, size_t payload_len,
-                                    qihse_user_t* user, int client_fd) {
+                                    qihse_user_t* user, int client_fd,
+                                    qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     uint64_t lsn;
 
     if (!user) return UWP_REPL_ERR_FAILED;
@@ -121,25 +103,26 @@ uwp_repl_result_t uwp_dispatch_repl(qihse_uwp_context_t* ctx,
                 : QIHSE_WAL_INVALID_LSN;
             if (qihse_repl_ship_wal(ctx->repl_ctx, payload, payload_len, lsn) != 0)
                 return UWP_REPL_ERR_FAILED;
-            uwp_repl_pool_write_all(client_fd, "OK\n", 3);
+            uwp_repl_pool_write_cb(write_fn, write_ctx, "OK\n", 3);
             return UWP_REPL_OK;
 
         case 0x02: /* SHIP_WAL */
             if (!payload || payload_len != 8) return UWP_REPL_ERR_ARGS;
             return uwp_repl_pool_status(ctx->repl_ctx,
                                         uwp_repl_pool_read_le64(payload), 1,
-                                        client_fd);
+                                        write_fn, write_ctx);
 
         case 0x03: /* SYNC_REPLICA */
             if (payload_len != 0) return UWP_REPL_ERR_ARGS;
             if (qihse_repl_start_streaming(ctx->repl_ctx) != 0)
                 return UWP_REPL_ERR_FAILED;
-            uwp_repl_pool_write_all(client_fd, "OK\n", 3);
+            uwp_repl_pool_write_cb(write_fn, write_ctx, "OK\n", 3);
             return UWP_REPL_OK;
 
         case 0x04: /* STATUS */
             if (payload_len != 0) return UWP_REPL_ERR_ARGS;
-            return uwp_repl_pool_status(ctx->repl_ctx, 0, 0, client_fd);
+            return uwp_repl_pool_status(ctx->repl_ctx, 0, 0,
+                                        write_fn, write_ctx);
 
         default:
             return UWP_REPL_ERR_ARGS;
@@ -149,7 +132,9 @@ uwp_repl_result_t uwp_dispatch_repl(qihse_uwp_context_t* ctx,
 uwp_repl_result_t uwp_dispatch_pool(qihse_uwp_context_t* ctx,
                                     uint8_t command_opcode,
                                     const uint8_t* payload, size_t payload_len,
-                                    qihse_user_t* user, int client_fd) {
+                                    qihse_user_t* user, int client_fd,
+                                    qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     char reply[96];
     uint8_t backend_reply[4];
     int backend_fd;
@@ -167,8 +152,8 @@ uwp_repl_result_t uwp_dispatch_pool(qihse_uwp_context_t* ctx,
                                      &backend_fd) != 0)
                 return UWP_REPL_ERR_FAILED;
             uwp_repl_pool_write_le32(backend_reply, (uint32_t)backend_fd);
-            uwp_repl_pool_write_all(client_fd, backend_reply,
-                                    sizeof(backend_reply));
+            uwp_repl_pool_write_cb(write_fn, write_ctx, backend_reply,
+                                   sizeof(backend_reply));
             return UWP_REPL_OK;
 
         case 0x02: /* RELEASE */
@@ -176,7 +161,7 @@ uwp_repl_result_t uwp_dispatch_pool(qihse_uwp_context_t* ctx,
             requested_client_fd = (int32_t)uwp_repl_pool_read_le32(payload);
             if (qihse_pooler_release(ctx->pooler, requested_client_fd) != 0)
                 return UWP_REPL_ERR_FAILED;
-            uwp_repl_pool_write_all(client_fd, "OK\n", 3);
+            uwp_repl_pool_write_cb(write_fn, write_ctx, "OK\n", 3);
             return UWP_REPL_OK;
 
         case 0x03: /* STATS */
@@ -186,7 +171,7 @@ uwp_repl_result_t uwp_dispatch_pool(qihse_uwp_context_t* ctx,
                               qihse_pooler_idle_count(ctx->pooler));
             if (length < 0 || (size_t)length >= sizeof(reply))
                 return UWP_REPL_ERR_FAILED;
-            uwp_repl_pool_write_all(client_fd, reply, (size_t)length);
+            uwp_repl_pool_write_cb(write_fn, write_ctx, reply, (size_t)length);
             return UWP_REPL_OK;
 
         default:
