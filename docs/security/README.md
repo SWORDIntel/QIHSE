@@ -1,6 +1,6 @@
 # QIHSE Security Guide
 
-This guide details the security features and CNSA 2.0 alignment goals in QIHSE. **Note:** QIHSE has not yet achieved formal CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption is not yet implemented (cleartext by default). See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the internal security review and [`UWP_CRYPTO_DESIGN.md`](UWP_CRYPTO_DESIGN.md) for the proposed encryption design.
+This guide details the security features and CNSA 2.0 alignment goals in QIHSE. **Note:** QIHSE has not yet achieved formal CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via `ctx->tls_ctx`; cleartext is the default. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the internal security review (all 24 findings remediated) and [`UWP_CRYPTO_DESIGN.md`](UWP_CRYPTO_DESIGN.md) for the encryption design.
 
 ## Table of Contents
 
@@ -74,14 +74,14 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 - Cryptographic log integrity
 
 #### **Network Security**
-- TLS 1.3 with post-quantum key exchange (planned — not yet implemented)
+- TLS 1.3 with post-quantum key exchange (planned — ChaCha20-Poly1305 AEAD transport encryption is implemented)
 - Mutual TLS (mTLS) for service communication (planned — not yet implemented)
 - Network segmentation and isolation
 - DDoS protection and rate limiting
 
 ## CNSA 2.0 Alignment (In Progress)
 
-> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented or planned for the `.qdb` container encryption (data at rest). Transport-layer encryption is not yet implemented. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the current security posture.
+> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented or planned for the `.qdb` container encryption (data at rest). Transport-layer encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the current security posture.
 
 ### Approved Cryptographic Algorithms
 
