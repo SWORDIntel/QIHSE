@@ -80,7 +80,7 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     
     // Check if operator password is still default (unless we are creating operator during init)
     if (users[0] && user_id != 0) {
-        char default_hash[QIHSE_AUTH_HASH_LEN];
+        char default_hash[QIHSE_AUTH_LEN];
         compute_sha384_hex("OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE", default_hash);
         if (constant_time_compare(users[0]->password_hash, default_hash, QIHSE_AUTH_HASH_LEN)) {
             printf("[SECURITY ERROR] Default operator password must be changed before creating users.\n");
@@ -91,6 +91,14 @@ qihse_user_t* qihse_auth_create_user(qihse_user_t* creator, uint32_t user_id, ui
     
     // Enforce that only an OPERATOR or delegated user can create new users.
     if (!creator || (creator->role != QIHSE_ROLE_OPERATOR && !creator->can_create_users)) {
+        pthread_mutex_unlock(&auth_mutex);
+        return NULL;
+    }
+
+    // Role numbers are ordered from most to least privileged (OPERATOR=0).
+    // Delegating account creation must never permit privilege escalation.
+    if (role < creator->role) {
+        qihse_audit_log("USER_CREATE_DENIED_ROLE", creator->user_id, user_id, classif, sci);
         pthread_mutex_unlock(&auth_mutex);
         return NULL;
     }
