@@ -219,7 +219,7 @@ breakthroughalgo/
 - **Correctness:** 100% verification success rate
 - **Performance:** 2x+ improvement over baselines
 - **Reliability:** <0.1% failure rate in production
-- **Security:** SOC 2 compliance for enterprise deployments
+- **Security:** SOC 2 compliance targeted for enterprise deployments (not yet certified)
 
 ---
 
