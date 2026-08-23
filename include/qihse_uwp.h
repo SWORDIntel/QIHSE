@@ -11,6 +11,8 @@
 #include "qihse_timeseries.h"
 #include "qihse_event_stream.h"
 #include "qihse_auth.h"
+#include "qihse_repl.h"
+#include "qihse_pooler.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,11 +34,13 @@ typedef struct {
     void* index_manager;   /* Index manager */
     void* schema;          /* Schema registry */
     void* wal;             /* WAL handle */
+    qihse_repl_context_t* repl_ctx; /* NULL unless replication is configured */
+    qihse_pooler_t* pooler;         /* NULL unless pooling is configured */
 } qihse_uwp_context_t;
 
-/* 16-byte fixed width packed header */
+/* 15-byte fixed width packed header */
 typedef struct __attribute__((packed)) {
-    uint8_t  magic[5];       // Must be {'Q', 'I', 'H', 'S', 'E'}
+    uint8_t  magic[4];       // Must be {0x51, 0x49, 0x48, 0x53}
     uint8_t  version;        // 0x01
     uint8_t  target_engine;  // Subsystem Routing Opcode
     uint8_t  command_opcode; // Engine-specific command
@@ -80,8 +84,13 @@ void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload, 
  * @brief Route a single UWP packet (header + payload) through the dispatch table.
  * Returns true if the packet was handled. Used by protocol translation layers
  * and the Bolt server to execute UWP packets in-process.
+ *
+ * @param user  Authenticated user obtained from qihse_auth_authenticate().
+ *              Must be non-NULL for any target other than QIHSE_UWP_TARGET_AUTH.
+ *              Callers that pass NULL for non-AUTH targets will receive false.
  */
-bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, const qihse_uwp_header_t* header,
+bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                        const qihse_uwp_header_t* header,
                         const uint8_t* payload, size_t payload_len,
                         uint8_t* out_response, size_t out_cap, size_t* out_len);
 

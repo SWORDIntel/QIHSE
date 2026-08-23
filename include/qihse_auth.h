@@ -17,6 +17,17 @@ extern "C" {
 #define QIHSE_AUTH_HASH_HEX_LEN 96
 #define QIHSE_AUTH_HASH_LEN (QIHSE_AUTH_HASH_HEX_LEN + 1)
 
+#define QIHSE_OBJECT_ACL_MAX_ENTRIES 64
+#define QIHSE_ACL_READ  0x01u
+#define QIHSE_ACL_WRITE 0x02u
+#define QIHSE_ACL_ADMIN 0x04u
+
+typedef struct qihse_acl_entry_s {
+    uint32_t namespace_id;
+    uint64_t resource_id;
+    uint8_t access_flags;
+} qihse_acl_entry_t;
+
 typedef struct qihse_user_s {
     uint32_t user_id;
     uint16_t role;
@@ -34,6 +45,10 @@ typedef struct qihse_user_s {
 
     // Password Auth
     char password_hash[QIHSE_AUTH_HASH_LEN]; // SHA-384 hex hash
+
+    // Per-object ACL. This initial implementation is limited to 64 entries/user.
+    qihse_acl_entry_t object_acl[QIHSE_OBJECT_ACL_MAX_ENTRIES];
+    uint8_t object_acl_count;
 } qihse_user_t;
 
 // Global Auth Context (Simplification for simulation)
@@ -52,6 +67,15 @@ bool qihse_auth_modify_user(qihse_user_t* operator_user, uint32_t target_user_id
 
 // Check if a user can access a specific data row's clearance
 bool qihse_auth_can_access(qihse_user_t* user, uint16_t data_classif, uint16_t data_sci);
+
+// Check access to an object independently of classification/SCI clearance.
+bool qihse_auth_can_access_object(qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id);
+
+// Only an OPERATOR may change another user's object ACL.
+bool qihse_auth_grant_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+                             uint32_t namespace_id, uint64_t resource_id, uint8_t access_flags);
+bool qihse_auth_revoke_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+                              uint32_t namespace_id, uint64_t resource_id);
 
 bool qihse_auth_is_operator_password_default(void);
 qihse_user_t* qihse_auth_authenticate(const char* username, const char* password);
