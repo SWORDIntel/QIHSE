@@ -145,6 +145,14 @@ static void uwp_write_all(uwp_socket_t fd, const char* buf, size_t len) {
     }
 }
 
+/* Cleartext write callback wrapper matching qihse_uwp_write_fn signature.
+ * write_ctx points to a uwp_socket_t (the raw fd). */
+static ssize_t uwp_cleartext_write(void* write_ctx, const void* data, size_t len) {
+    uwp_socket_t fd = *(uwp_socket_t*)write_ctx;
+    uwp_write_all(fd, (const char*)data, len);
+    return (ssize_t)len;
+}
+
 typedef struct {
     bool used;
     uint32_t source_ip;
@@ -240,6 +248,19 @@ typedef enum {
 typedef struct uwp_conn_s uwp_conn_t;
 static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len);
 
+/* TLS write callback wrapper matching qihse_uwp_write_fn signature.
+ * write_ctx is the uwp_conn_t pointer. */
+static ssize_t uwp_tls_write_cb(void* write_ctx, const void* data, size_t len) {
+    return uwp_tls_write_all((uwp_conn_t*)write_ctx, data, len);
+}
+
+/* Pick the appropriate write callback for a connection.
+ * - TLS enabled:  uwp_tls_write_cb with write_ctx=conn
+ * - Cleartext:    uwp_cleartext_write with write_ctx=&conn->fd
+ * - No conn:      NULL/NULL (dispatchers skip writes)
+ * Defined after uwp_conn_t (see below). */
+static void uwp_get_write_cb(uwp_conn_t* conn, qihse_uwp_write_fn* fn, void** ctx);
+
 static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* conn,
                                              qihse_uwp_context_t* ctx,
                                              qihse_uwp_header_t* header, uint8_t* payload,
@@ -288,7 +309,12 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
     if (!ctx || !current_user) {
         return UWP_ROUTE_ERR_AUTH;
     }
-    
+
+    /* Select the TLS-aware or cleartext write callback for the dispatchers. */
+    qihse_uwp_write_fn write_fn;
+    void* write_ctx;
+    uwp_get_write_cb(conn, &write_fn, &write_ctx);
+
     switch(header->target_engine) {
         case QIHSE_UWP_TARGET_KV:
             if (header->command_opcode == 0x01 && ctx->kv) {
@@ -450,7 +476,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=PARSE 0x02=EXECUTE 0x03=BIND 0x04=DESCRIBE 0x05=CLOSE */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
                 uwp_sts_result_t r = uwp_dispatch_sql(ctx, header->command_opcode,
-                                                      payload, len, current_txn, current_user, client_fd);
+                                                      payload, len, current_txn, current_user, client_fd,
+                                                      write_fn, write_ctx);
                 return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -459,7 +486,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=BEGIN 0x02=COMMIT 0x03=ROLLBACK 0x04=SAVEPOINT 0x05=ROLLBACK_TO_SAVEPOINT */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
                 uwp_sts_result_t r = uwp_dispatch_txn(ctx, header->command_opcode,
-                                                      payload, len, current_txn, current_user, client_fd);
+                                                      payload, len, current_txn, current_user, client_fd,
+                                                      write_fn, write_ctx);
                 return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -469,7 +497,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             if ((header->command_opcode >= 0x01 && header->command_opcode <= 0x06) ||
                 header->command_opcode == 0x10) {
                 uwp_gi_result_t r = uwp_dispatch_graph2(ctx, header->command_opcode,
-                                                        payload, len, current_user, client_fd);
+                                                        payload, len, current_user, client_fd,
+                                                        write_fn, write_ctx);
                 return (r == UWP_GI_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -478,7 +507,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=CREATE_INDEX 0x02=SCAN 0x03=INSERT 0x04=BULK_LOAD 0x05=DROP */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x05) {
                 uwp_gi_result_t r = uwp_dispatch_index(ctx, header->command_opcode,
-                                                       payload, len, current_user, client_fd);
+                                                       payload, len, current_user, client_fd,
+                                                       write_fn, write_ctx);
                 return (r == UWP_GI_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -488,7 +518,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
              * 0x05=CREATE_INDEX 0x06=DROP_INDEX */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x06) {
                 uwp_sts_result_t r = uwp_dispatch_schema(ctx, header->command_opcode,
-                                                         payload, len, current_user, client_fd);
+                                                         payload, len, current_user, client_fd,
+                                                         write_fn, write_ctx);
                 return (r == UWP_STS_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -497,7 +528,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=APPEND_WAL 0x02=SHIP_WAL 0x03=SYNC_REPLICA 0x04=STATUS */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x04) {
                 uwp_repl_result_t r = uwp_dispatch_repl(ctx, header->command_opcode,
-                                                        payload, len, current_user, client_fd);
+                                                        payload, len, current_user, client_fd,
+                                                        write_fn, write_ctx);
                 return (r == UWP_REPL_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -506,7 +538,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=ACQUIRE 0x02=RELEASE 0x03=STATS */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x03) {
                 uwp_repl_result_t r = uwp_dispatch_pool(ctx, header->command_opcode,
-                                                        payload, len, current_user, client_fd);
+                                                        payload, len, current_user, client_fd,
+                                                        write_fn, write_ctx);
                 return (r == UWP_REPL_OK) ? UWP_ROUTE_OK : UWP_ROUTE_ERR_DISPATCH;
             }
             return UWP_ROUTE_ERR_DISPATCH;
@@ -670,6 +703,23 @@ typedef struct uwp_conn_s {
     size_t   tls_rawbuf_cap;      /* capacity of tls_rawbuf                    */
     size_t   tls_rawbuf_len;      /* valid bytes in tls_rawbuf                 */
 } uwp_conn_t;
+
+/* Pick the appropriate write callback for a connection.
+ * - TLS enabled:  uwp_tls_write_cb with write_ctx=conn
+ * - Cleartext:    uwp_cleartext_write with write_ctx=&conn->fd
+ * - No conn:      NULL/NULL (dispatchers skip writes) */
+static void uwp_get_write_cb(uwp_conn_t* conn, qihse_uwp_write_fn* fn, void** ctx) {
+    if (conn && conn->tls_session) {
+        *fn = uwp_tls_write_cb;
+        *ctx = conn;
+    } else if (conn) {
+        *fn = uwp_cleartext_write;
+        *ctx = &conn->fd;
+    } else {
+        *fn = NULL;
+        *ctx = NULL;
+    }
+}
 
 typedef enum {
     EVENT_ACCEPT = 0,

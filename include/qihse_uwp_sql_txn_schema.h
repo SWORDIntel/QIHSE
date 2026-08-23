@@ -21,13 +21,16 @@ typedef enum {
 
 uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx, uint8_t command_opcode,
                                   const uint8_t* payload, size_t payload_len,
-                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd);
+                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx);
 uwp_sts_result_t uwp_dispatch_txn(qihse_uwp_context_t* ctx, uint8_t command_opcode,
                                   const uint8_t* payload, size_t payload_len,
-                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd);
+                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx);
 uwp_sts_result_t uwp_dispatch_schema(qihse_uwp_context_t* ctx, uint8_t command_opcode,
                                      const uint8_t* payload, size_t payload_len,
-                                     qihse_user_t* user, int client_fd);
+                                     qihse_user_t* user, int client_fd,
+                                     qihse_uwp_write_fn write_fn, void* write_ctx);
 
 #ifdef __cplusplus
 }

@@ -41,32 +41,14 @@ typedef struct {
     int failed;
 } uwp_text_buffer_t;
 
-static void uwp_write_all(int client_fd, const void* data, size_t len) {
-    if (client_fd < 0 || !data) return;
-    const char* bytes = (const char*)data;
-    size_t off = 0;
-    while (off < len) {
-#ifdef _WIN32
-        int chunk = len - off > INT_MAX ? INT_MAX : (int)(len - off);
-        int written = send((SOCKET)client_fd, bytes + off, chunk, 0);
-        if (written == SOCKET_ERROR) {
-            if (WSAGetLastError() == WSAEINTR) continue;
-            break;
-        }
-#else
-        ssize_t written = write(client_fd, bytes + off, len - off);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-#endif
-        if (written == 0) break;
-        off += (size_t)written;
-    }
+static void uwp_write_cb(qihse_uwp_write_fn write_fn, void* write_ctx,
+                         const void* data, size_t len) {
+    if (write_fn) write_fn(write_ctx, data, len);
 }
 
-static void uwp_reply(int client_fd, const char* text) {
-    uwp_write_all(client_fd, text, strlen(text));
+static void uwp_reply_cb(qihse_uwp_write_fn write_fn, void* write_ctx,
+                         const char* text) {
+    if (write_fn) write_fn(write_ctx, text, strlen(text));
 }
 
 static int uwp_text_reserve(uwp_text_buffer_t* out, size_t extra) {
@@ -295,16 +277,20 @@ static uwp_sts_result_t uwp_sql_execute(qihse_uwp_context_t* ctx,
             break;
         case QIHSE_SQL_BEGIN: {
             uint8_t isolation = (uint8_t)uwp_sql_isolation(sql);
-            return uwp_dispatch_txn(ctx, 0x01, &isolation, 1, current_txn, user, -1);
+            return uwp_dispatch_txn(ctx, 0x01, &isolation, 1, current_txn, user, -1,
+                                    NULL, NULL);
         }
         case QIHSE_SQL_COMMIT:
-            return uwp_dispatch_txn(ctx, 0x02, NULL, 0, current_txn, user, -1);
+            return uwp_dispatch_txn(ctx, 0x02, NULL, 0, current_txn, user, -1,
+                                    NULL, NULL);
         case QIHSE_SQL_ROLLBACK:
             if (ast->util && ast->util->name) {
                 return uwp_dispatch_txn(ctx, 0x05, (const uint8_t*)ast->util->name,
-                                        strlen(ast->util->name) + 1, current_txn, user, -1);
+                                        strlen(ast->util->name) + 1, current_txn, user, -1,
+                                        NULL, NULL);
             }
-            return uwp_dispatch_txn(ctx, 0x03, NULL, 0, current_txn, user, -1);
+            return uwp_dispatch_txn(ctx, 0x03, NULL, 0, current_txn, user, -1,
+                                    NULL, NULL);
         case QIHSE_SQL_SELECT:
             /* execution logic will be wired in caller because we need response buffer */
             break;
@@ -321,19 +307,21 @@ static uwp_sts_result_t uwp_sql_execute(qihse_uwp_context_t* ctx,
 uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                                   uint8_t command_opcode,
                                   const uint8_t* payload, size_t payload_len,
-                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd) {
+                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     if (!user) {
-        uwp_reply(client_fd, "ERR_PERM\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
     if (!ctx || !ctx->sql_engine) {
-        uwp_reply(client_fd, "ERR_NO_CTX\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_NO_CTX\n");
         return UWP_STS_ERR_NO_CTX;
     }
 
     if (command_opcode == 0x03) {
         if (!payload || payload_len < 4) {
-            uwp_reply(client_fd, "ERR_ARGS\n");
+            uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
             return UWP_STS_ERR_ARGS;
         }
         uint32_t count = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
@@ -341,42 +329,42 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
         size_t off = 4;
         for (uint32_t i = 0; i < count; ++i) {
             if (off >= payload_len) {
-                uwp_reply(client_fd, "ERR_ARGS\n");
+                uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
                 return UWP_STS_ERR_ARGS;
             }
             const uint8_t* end = (const uint8_t*)memchr(payload + off, '\0',
                                                           payload_len - off);
             if (!end) {
-                uwp_reply(client_fd, "ERR_ARGS\n");
+                uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
                 return UWP_STS_ERR_ARGS;
             }
             off = (size_t)(end - payload) + 1;
         }
-        uwp_reply(client_fd, "OK\n");
+        uwp_reply_cb(write_fn, write_ctx, "OK\n");
         return UWP_STS_OK;
     }
     if (command_opcode == 0x05) {
         if (!payload || payload_len != 4) {
-            uwp_reply(client_fd, "ERR_ARGS\n");
+            uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
             return UWP_STS_ERR_ARGS;
         }
-        uwp_reply(client_fd, "OK\n");
+        uwp_reply_cb(write_fn, write_ctx, "OK\n");
         return UWP_STS_OK;
     }
     if (command_opcode != 0x01 && command_opcode != 0x02 &&
         command_opcode != 0x04) {
-        uwp_reply(client_fd, "ERR_ARGS\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
         return UWP_STS_ERR_ARGS;
     }
 
     const char* sql;
     if (uwp_payload_string(payload, payload_len, &sql) != 0) {
-        uwp_reply(client_fd, "ERR_ARGS\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
         return UWP_STS_ERR_ARGS;
     }
     qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(sql);
     if (!ast) {
-        uwp_reply(client_fd, "ERR_PARSE\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PARSE\n");
         return UWP_STS_ERR_FAILED;
     }
 
@@ -445,11 +433,11 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
     }
 
     if (result == UWP_STS_OK) {
-        uwp_write_all(client_fd, response.data, response.len);
+        uwp_write_cb(write_fn, write_ctx, response.data, response.len);
     } else if (result == UWP_STS_ERR_NO_CTX) {
-        uwp_reply(client_fd, "ERR_NO_CTX\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_NO_CTX\n");
     } else {
-        uwp_reply(client_fd, command_opcode == 0x02 ? "ERR_EXEC\n" : "ERR\n");
+        uwp_reply_cb(write_fn, write_ctx, command_opcode == 0x02 ? "ERR_EXEC\n" : "ERR\n");
     }
     uwp_text_destroy(&response);
     qihse_sql_ast_free(ast);
@@ -459,13 +447,15 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
 uwp_sts_result_t uwp_dispatch_txn(qihse_uwp_context_t* ctx,
                                   uint8_t command_opcode,
                                   const uint8_t* payload, size_t payload_len,
-                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd) {
+                                  qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     if (!user) {
-        uwp_reply(client_fd, "ERR_PERM\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
     if (!ctx || !ctx->txn_manager) {
-        uwp_reply(client_fd, "ERR_NO_CTX\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_NO_CTX\n");
         return UWP_STS_ERR_NO_CTX;
     }
 
@@ -475,51 +465,51 @@ uwp_sts_result_t uwp_dispatch_txn(qihse_uwp_context_t* ctx,
         case 0x01: {
             int valid_args = payload && payload_len == 1 && payload[0] <= 2;
             if (!valid_args || (*current_txn) != NULL) {
-                uwp_reply(client_fd, valid_args ? "ERR\n" : "ERR_ARGS\n");
+                uwp_reply_cb(write_fn, write_ctx, valid_args ? "ERR\n" : "ERR_ARGS\n");
                 return valid_args ? UWP_STS_ERR_FAILED : UWP_STS_ERR_ARGS;
             }
             (*current_txn) = qihse_txn_begin(
                 manager, (qihse_isolation_level_t)payload[0]);
             if (!(*current_txn)) {
-                uwp_reply(client_fd, "ERR\n");
+                uwp_reply_cb(write_fn, write_ctx, "ERR\n");
                 return UWP_STS_ERR_FAILED;
             }
             uint8_t txn_id[8];
             uwp_put_u64_le(txn_id, (*current_txn)->id);
-            uwp_write_all(client_fd, txn_id, sizeof(txn_id));
+            uwp_write_cb(write_fn, write_ctx, txn_id, sizeof(txn_id));
             return UWP_STS_OK;
         }
         case 0x02:
         case 0x03:
             if (payload_len != 0) break;
             if (!(*current_txn)) {
-                uwp_reply(client_fd, "ERR\n");
+                uwp_reply_cb(write_fn, write_ctx, "ERR\n");
                 return UWP_STS_ERR_FAILED;
             }
             rc = command_opcode == 0x02
                      ? qihse_txn_commit(manager, (*current_txn))
                      : qihse_txn_rollback(manager, (*current_txn));
             (*current_txn) = NULL;
-            uwp_reply(client_fd, rc == 0 ? "OK\n" : "ERR\n");
+            uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
             return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
         case 0x04:
         case 0x05: {
             const char* name;
             if (uwp_payload_string(payload, payload_len, &name) != 0) break;
             if (!(*current_txn)) {
-                uwp_reply(client_fd, "ERR\n");
+                uwp_reply_cb(write_fn, write_ctx, "ERR\n");
                 return UWP_STS_ERR_FAILED;
             }
             rc = command_opcode == 0x04
                      ? qihse_txn_savepoint(manager, (*current_txn), name)
                      : qihse_txn_rollback_to_savepoint(manager, (*current_txn), name);
-            uwp_reply(client_fd, rc == 0 ? "OK\n" : "ERR\n");
+            uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
             return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
         }
         default:
             break;
     }
-    uwp_reply(client_fd, "ERR_ARGS\n");
+    uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
     return UWP_STS_ERR_ARGS;
 }
 
@@ -550,52 +540,54 @@ static int uwp_serialize_table(uwp_text_buffer_t* out,
 uwp_sts_result_t uwp_dispatch_schema(qihse_uwp_context_t* ctx,
                                      uint8_t command_opcode,
                                      const uint8_t* payload, size_t payload_len,
-                                     qihse_user_t* user, int client_fd) {
+                                     qihse_user_t* user, int client_fd,
+                                     qihse_uwp_write_fn write_fn, void* write_ctx) {
+    (void)client_fd;
     if (!user) {
-        uwp_reply(client_fd, "ERR_PERM\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
     if (!ctx || !ctx->schema) {
-        uwp_reply(client_fd, "ERR_NO_CTX\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_NO_CTX\n");
         return UWP_STS_ERR_NO_CTX;
     }
     if (command_opcode < 0x01 || command_opcode > 0x06) {
-        uwp_reply(client_fd, "ERR_ARGS\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
         return UWP_STS_ERR_ARGS;
     }
 
     const char* input;
     if (uwp_payload_string(payload, payload_len, &input) != 0) {
-        uwp_reply(client_fd, "ERR_ARGS\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR_ARGS\n");
         return UWP_STS_ERR_ARGS;
     }
     qihse_schema_registry_t* schema = (qihse_schema_registry_t*)ctx->schema;
     if (command_opcode == 0x02 || command_opcode == 0x06) {
         int rc = command_opcode == 0x02 ? qihse_schema_drop_table(schema, input)
                                         : qihse_schema_drop_index(schema, input);
-        uwp_reply(client_fd, rc == 0 ? "OK\n" : "ERR\n");
+        uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
         return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
     }
     if (command_opcode == 0x04) {
         const qihse_schema_table_t* table = qihse_schema_get_table(schema, input);
         if (!table) {
-            uwp_reply(client_fd, "NOT_FOUND\n");
+            uwp_reply_cb(write_fn, write_ctx, "NOT_FOUND\n");
             return UWP_STS_ERR_FAILED;
         }
         uwp_text_buffer_t response = {0};
         if (uwp_serialize_table(&response, table) != 0) {
             uwp_text_destroy(&response);
-            uwp_reply(client_fd, "ERR\n");
+            uwp_reply_cb(write_fn, write_ctx, "ERR\n");
             return UWP_STS_ERR_FAILED;
         }
-        uwp_write_all(client_fd, response.data, response.len);
+        uwp_write_cb(write_fn, write_ctx, response.data, response.len);
         uwp_text_destroy(&response);
         return UWP_STS_OK;
     }
 
     qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(input);
     if (!ast) {
-        uwp_reply(client_fd, "ERR\n");
+        uwp_reply_cb(write_fn, write_ctx, "ERR\n");
         return UWP_STS_ERR_FAILED;
     }
     int rc = -1;
@@ -610,6 +602,6 @@ uwp_sts_result_t uwp_dispatch_schema(qihse_uwp_context_t* ctx,
         rc = qihse_schema_create_index(schema, ast);
     }
     qihse_sql_ast_free(ast);
-    uwp_reply(client_fd, rc == 0 ? "OK\n" : "ERR\n");
+    uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
     return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
 }

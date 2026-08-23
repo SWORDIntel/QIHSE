@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>  /* ssize_t for qihse_uwp_write_fn */
 
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
@@ -14,6 +15,7 @@
 #include "qihse_repl.h"
 #include "qihse_pooler.h"
 #include "qihse_uwp_tls.h"
+#include "qihse_uwp_metrics.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +40,7 @@ typedef struct {
     qihse_repl_context_t* repl_ctx; /* NULL unless replication is configured */
     qihse_pooler_t* pooler;         /* NULL unless pooling is configured */
     qihse_uwp_tls_ctx_t* tls_ctx;   /* NULL = cleartext, non-NULL = TLS enabled */
+    qihse_uwp_metrics_t* uwp_metrics; /* NULL = metrics disabled */
 } qihse_uwp_context_t;
 
 /* 15-byte fixed width packed header */
@@ -95,6 +98,13 @@ bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
                         const qihse_uwp_header_t* header,
                         const uint8_t* payload, size_t payload_len,
                         uint8_t* out_response, size_t out_cap, size_t* out_len);
+
+/* Write callback abstraction for UWP dispatchers.
+ * When TLS is enabled, write_fn is a wrapper around uwp_tls_write_all with
+ * write_ctx=conn.  When cleartext, write_fn wraps uwp_write_all with
+ * write_ctx=&fd.  When NULL, the dispatcher skips all writes (internal
+ * nested calls such as SQL->TXN where the outer call handles the response). */
+typedef ssize_t (*qihse_uwp_write_fn)(void* write_ctx, const void* data, size_t len);
 
 #ifdef __cplusplus
 }
