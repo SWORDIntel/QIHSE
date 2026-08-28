@@ -58,7 +58,7 @@ Google processes **8.5 billion search queries daily** with sub-100ms latency req
 - **Real-time user profile vector matching**
 - **History-based recommendations** with instant response
 - **Cross-device personalization** across Google ecosystem
-- **Privacy-preserving** with CNSA 2.0 compliance
+- **Privacy-preserving** with CNSA 2.0 alignment (in progress)
 
 ### Performance Projections
 

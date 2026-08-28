@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>  /* ssize_t for qihse_uwp_write_fn */
 
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
@@ -11,6 +12,10 @@
 #include "qihse_timeseries.h"
 #include "qihse_event_stream.h"
 #include "qihse_auth.h"
+#include "qihse_repl.h"
+#include "qihse_pooler.h"
+#include "qihse_uwp_tls.h"
+#include "qihse_uwp_metrics.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,11 +37,15 @@ typedef struct {
     void* index_manager;   /* Index manager */
     void* schema;          /* Schema registry */
     void* wal;             /* WAL handle */
+    qihse_repl_context_t* repl_ctx; /* NULL unless replication is configured */
+    qihse_pooler_t* pooler;         /* NULL unless pooling is configured */
+    qihse_uwp_tls_ctx_t* tls_ctx;   /* NULL = cleartext, non-NULL = TLS enabled */
+    qihse_uwp_metrics_t* uwp_metrics; /* NULL = metrics disabled */
 } qihse_uwp_context_t;
 
-/* 16-byte fixed width packed header */
+/* 15-byte fixed width packed header */
 typedef struct __attribute__((packed)) {
-    uint8_t  magic[5];       // Must be {'Q', 'I', 'H', 'S', 'E'}
+    uint8_t  magic[4];       // Must be {0x51, 0x49, 0x48, 0x53}
     uint8_t  version;        // 0x01
     uint8_t  target_engine;  // Subsystem Routing Opcode
     uint8_t  command_opcode; // Engine-specific command
@@ -80,10 +89,22 @@ void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload, 
  * @brief Route a single UWP packet (header + payload) through the dispatch table.
  * Returns true if the packet was handled. Used by protocol translation layers
  * and the Bolt server to execute UWP packets in-process.
+ *
+ * @param user  Authenticated user obtained from qihse_auth_authenticate().
+ *              Must be non-NULL for any target other than QIHSE_UWP_TARGET_AUTH.
+ *              Callers that pass NULL for non-AUTH targets will receive false.
  */
-bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, const qihse_uwp_header_t* header,
+bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                        const qihse_uwp_header_t* header,
                         const uint8_t* payload, size_t payload_len,
                         uint8_t* out_response, size_t out_cap, size_t* out_len);
+
+/* Write callback abstraction for UWP dispatchers.
+ * When TLS is enabled, write_fn is a wrapper around uwp_tls_write_all with
+ * write_ctx=conn.  When cleartext, write_fn wraps uwp_write_all with
+ * write_ctx=&fd.  When NULL, the dispatcher skips all writes (internal
+ * nested calls such as SQL->TXN where the outer call handles the response). */
+typedef ssize_t (*qihse_uwp_write_fn)(void* write_ctx, const void* data, size_t len);
 
 #ifdef __cplusplus
 }

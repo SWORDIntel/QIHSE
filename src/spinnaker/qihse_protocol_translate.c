@@ -21,53 +21,62 @@ static int build_uwp(uint8_t* out, size_t* out_len, size_t out_cap,
                      uint8_t target, uint8_t command,
                      const uint8_t* payload, size_t payload_len) {
     size_t total = sizeof(qihse_uwp_header_t) + payload_len;
+    if (out_len) *out_len = total;
     if (!out || total > out_cap) return -1;
     qihse_uwp_header_t hdr;
-    memcpy(hdr.magic, "QIHSE", 5);
+    static const uint8_t uwp_magic[4] = { 0x51, 0x49, 0x48, 0x53 };
+    memcpy(hdr.magic, uwp_magic, sizeof(hdr.magic));
     hdr.version = 0x01;
     hdr.target_engine = target;
     hdr.command_opcode = command;
     hdr.payload_length = htole64((uint64_t)payload_len);
     memcpy(out, &hdr, sizeof(hdr));
     if (payload_len) memcpy(out + sizeof(hdr), payload, payload_len);
-    if (out_len) *out_len = total;
     return 0;
+}
+
+static uint64_t uwp_payload_length(const qihse_uwp_header_t* header) {
+    uint64_t wire_length;
+    memcpy(&wire_length, &header->payload_length, sizeof(wire_length));
+    return le64toh(wire_length);
 }
 
 /* ============================================================
  * PostgreSQL wire -> UWP
  * ============================================================ */
 
-int qihse_translate_pg_query_to_uwp(const char* sql, uint8_t* out_uwp, size_t* out_len) {
+int qihse_translate_pg_query_to_uwp(const char* sql, uint8_t* out_uwp, size_t out_cap,
+                                    size_t* out_len) {
     if (!sql) return -1;
     size_t slen = strlen(sql);
     /* SQL EXECUTE (target 0x08, command 0x02): payload = SQL text */
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_SQL, 0x02,
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_SQL, 0x02,
                      (const uint8_t*)sql, slen);
 }
 
 int qihse_translate_pg_parse_to_uwp(const char* sql, const char** params, int num_params,
-                                    uint8_t* out_uwp, size_t* out_len) {
+                                    uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
     if (!sql) return -1;
     (void)params; (void)num_params;
     size_t slen = strlen(sql);
     /* SQL PARSE (target 0x08, command 0x01): payload = SQL text */
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_SQL, 0x01,
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_SQL, 0x01,
                      (const uint8_t*)sql, slen);
 }
 
-int qihse_translate_pg_begin_to_uwp(int isolation_level, uint8_t* out_uwp, size_t* out_len) {
+int qihse_translate_pg_begin_to_uwp(int isolation_level, uint8_t* out_uwp, size_t out_cap,
+                                    size_t* out_len) {
     /* TXN BEGIN (target 0x09, command 0x01): payload = 1-byte isolation level */
     uint8_t iso = (uint8_t)isolation_level;
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x01, &iso, 1);
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x01, &iso, 1);
 }
 
-int qihse_translate_pg_commit_to_uwp(uint8_t* out_uwp, size_t* out_len) {
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x02, NULL, 0);
+int qihse_translate_pg_commit_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x02, NULL, 0);
 }
 
-int qihse_translate_pg_rollback_to_uwp(uint8_t* out_uwp, size_t* out_len) {
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x03, NULL, 0);
+int qihse_translate_pg_rollback_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x03, NULL, 0);
 }
 
 /* ============================================================
@@ -90,7 +99,7 @@ static uint8_t cypher_to_graph_command(const char* cypher) {
 }
 
 int qihse_translate_bolt_run_to_uwp(const char* cypher, const char* params_json,
-                                    uint8_t* out_uwp, size_t* out_len) {
+                                    uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
     if (!cypher) return -1;
     uint8_t cmd = cypher_to_graph_command(cypher);
     size_t clen = strlen(cypher);
@@ -103,21 +112,21 @@ int qihse_translate_bolt_run_to_uwp(const char* cypher, const char* params_json,
         payload[clen] = 0;
         memcpy(payload + clen + 1, params_json, strlen(params_json));
     }
-    int rc = build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_GRAPH2, cmd, payload, plen);
+    int rc = build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_GRAPH2, cmd, payload, plen);
     free(payload);
     return rc;
 }
 
-int qihse_translate_bolt_begin_to_uwp(uint8_t* out_uwp, size_t* out_len) {
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x01, NULL, 0);
+int qihse_translate_bolt_begin_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x01, NULL, 0);
 }
 
-int qihse_translate_bolt_commit_to_uwp(uint8_t* out_uwp, size_t* out_len) {
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x02, NULL, 0);
+int qihse_translate_bolt_commit_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x02, NULL, 0);
 }
 
-int qihse_translate_bolt_rollback_to_uwp(uint8_t* out_uwp, size_t* out_len) {
-    return build_uwp(out_uwp, out_len, 4096, QIHSE_UWP_TARGET_TXN, 0x03, NULL, 0);
+int qihse_translate_bolt_rollback_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_TXN, 0x03, NULL, 0);
 }
 
 /* ============================================================
@@ -129,8 +138,9 @@ int qihse_translate_uwp_to_pg_result(const uint8_t* uwp_response, size_t len,
                                      size_t* out_num_rows) {
     if (!uwp_response || len < sizeof(qihse_uwp_header_t)) return -1;
     const qihse_uwp_header_t* hdr = (const qihse_uwp_header_t*)uwp_response;
-    if (memcmp(hdr->magic, "QIHSE", 5) != 0) return -1;
-    uint64_t payload_len = le64toh(hdr->payload_length);
+    static const uint8_t uwp_magic[4] = { 0x51, 0x49, 0x48, 0x53 };
+    if (memcmp(hdr->magic, uwp_magic, sizeof(hdr->magic)) != 0) return -1;
+    uint64_t payload_len = uwp_payload_length(hdr);
     const uint8_t* payload = uwp_response + sizeof(qihse_uwp_header_t);
     if (sizeof(qihse_uwp_header_t) + payload_len > len) return -1;
 
@@ -165,8 +175,9 @@ int qihse_translate_uwp_to_bolt_record(const uint8_t* uwp_response, size_t len,
                                        uint8_t* out_bolt, size_t* out_len) {
     if (!uwp_response || len < sizeof(qihse_uwp_header_t)) return -1;
     const qihse_uwp_header_t* hdr = (const qihse_uwp_header_t*)uwp_response;
-    if (memcmp(hdr->magic, "QIHSE", 5) != 0) return -1;
-    uint64_t payload_len = le64toh(hdr->payload_length);
+    static const uint8_t uwp_magic[4] = { 0x51, 0x49, 0x48, 0x53 };
+    if (memcmp(hdr->magic, uwp_magic, sizeof(hdr->magic)) != 0) return -1;
+    uint64_t payload_len = uwp_payload_length(hdr);
     const uint8_t* payload = uwp_response + sizeof(qihse_uwp_header_t);
     if (sizeof(qihse_uwp_header_t) + payload_len > len) return -1;
 

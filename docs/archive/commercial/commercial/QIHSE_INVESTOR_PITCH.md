@@ -115,7 +115,7 @@
 - **Amazon**: 30x speedup, $220M annual savings projected
 
 **Technical Validation:**
-- **CNSA 2.0 compliant** for government contracts
+- **CNSA 2.0 alignment (in progress)** for government contracts
 - **Patent applications** filed for core algorithms
 - **Production deployments** in development
 
@@ -179,7 +179,7 @@
 - **Direct Sales**: Enterprise account teams
 - **Channel Partners**: System integrators, resellers
 - **Strategic Partnerships**: Cloud providers, database vendors
-- **Government**: CNSA 2.0 compliance for classified work
+- **Government**: CNSA 2.0 alignment (in progress) for classified work
 
 **Pricing Strategy:**
 - **Value-based pricing** tied to cost savings
@@ -224,7 +224,7 @@
 **Technical Leadership:**
 - **PhD-level researchers** in algorithms and HPC
 - **Enterprise software veterans** from Google, Meta, Amazon
-- **Security experts** with CNSA 2.0 experience
+- **Security experts** with CNSA 2.0 alignment experience
 
 **Business Leadership:**
 - **Enterprise sales executives** from database and cloud companies

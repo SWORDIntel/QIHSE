@@ -467,6 +467,44 @@ bool qihse_graph_vertex_update(qihse_graph_t* g, uint64_t vertex_id,
     return true;
 }
 
+bool qihse_graph_vertex_remove_property(qihse_graph_t* g, uint64_t vertex_id,
+                                        const char* prop_key) {
+    if (!g || !prop_key) return false;
+    pthread_rwlock_wrlock(&g->lock);
+    graph_vertex_t** slot = vslot(g, vertex_id);
+    if (!slot || !*slot) { pthread_rwlock_unlock(&g->lock); return false; }
+    graph_vertex_t* v = *slot;
+    size_t j;
+    for (j = 0; j < v->num_props; ++j) {
+        if (strcmp(v->prop_keys[j], prop_key) == 0) break;
+    }
+    if (j == v->num_props) {
+        pthread_rwlock_unlock(&g->lock);
+        return false;
+    }
+    /* remove from prop index */
+    char vbuf[128];
+    prop_to_str(&v->prop_vals[j], vbuf, sizeof(vbuf));
+    if (v->num_labels == 0) {
+        pmap_remove_id(&g->prop_index, "", v->prop_keys[j], vbuf, vertex_id);
+    } else {
+        for (size_t l = 0; l < v->num_labels; ++l) {
+            pmap_remove_id(&g->prop_index, v->labels[l], v->prop_keys[j], vbuf, vertex_id);
+        }
+    }
+    /* free key string and prop val */
+    free(v->prop_keys[j]);
+    graph_prop_free(&v->prop_vals[j]);
+    /* shift remaining entries down */
+    for (size_t k = j; k + 1 < v->num_props; ++k) {
+        v->prop_keys[k] = v->prop_keys[k + 1];
+        v->prop_vals[k] = v->prop_vals[k + 1];
+    }
+    v->num_props--;
+    pthread_rwlock_unlock(&g->lock);
+    return true;
+}
+
 bool qihse_graph_vertex_add_label(qihse_graph_t* g, uint64_t vertex_id,
                                   const char* label) {
     if (!g) return false;
@@ -591,6 +629,34 @@ bool qihse_graph_edge_update(qihse_graph_t* g, uint64_t edge_id,
             e->prop_vals[j] = graph_prop_dup(&prop_vals[i]);
         }
     }
+    pthread_rwlock_unlock(&g->lock);
+    return true;
+}
+
+bool qihse_graph_edge_remove_property(qihse_graph_t* g, uint64_t edge_id,
+                                      const char* prop_key) {
+    if (!g || !prop_key) return false;
+    pthread_rwlock_wrlock(&g->lock);
+    graph_edge_t** slot = eslot(g, edge_id);
+    if (!slot || !*slot) { pthread_rwlock_unlock(&g->lock); return false; }
+    graph_edge_t* e = *slot;
+    size_t j;
+    for (j = 0; j < e->num_props; ++j) {
+        if (strcmp(e->prop_keys[j], prop_key) == 0) break;
+    }
+    if (j == e->num_props) {
+        pthread_rwlock_unlock(&g->lock);
+        return false;
+    }
+    /* free key string and prop val */
+    free(e->prop_keys[j]);
+    graph_prop_free(&e->prop_vals[j]);
+    /* shift remaining entries down */
+    for (size_t k = j; k + 1 < e->num_props; ++k) {
+        e->prop_keys[k] = e->prop_keys[k + 1];
+        e->prop_vals[k] = e->prop_vals[k + 1];
+    }
+    e->num_props--;
     pthread_rwlock_unlock(&g->lock);
     return true;
 }

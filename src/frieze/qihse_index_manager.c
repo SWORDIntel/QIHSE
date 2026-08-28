@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* qihse_index_manager.c — Phase 3.4/3.6 index manager.
  *
  * Tracks all indexes on a table, supports synchronous insert-time updates,
@@ -161,6 +163,36 @@ qihse_index_t* qihse_index_manager_find(const qihse_index_manager_t* mgr,
     }
     pthread_rwlock_unlock(&((qihse_index_manager_t*)mgr)->lock);
     return cur;
+}
+
+bool qihse_index_manager_drop(qihse_index_manager_t* mgr, const char* name) {
+    if (!mgr || !name) return false;
+    pthread_rwlock_wrlock(&mgr->lock);
+    qihse_index_t* prev = NULL;
+    qihse_index_t* cur = mgr->head;
+    while (cur) {
+        if (strcmp(cur->name, name) == 0) {
+            if (prev) {
+                prev->next = cur->next;
+            } else {
+                mgr->head = cur->next;
+            }
+            mgr->count--;
+            pthread_rwlock_unlock(&mgr->lock);
+
+            if (cur->btree) qihse_btree_destroy(cur->btree);
+            if (cur->hash) qihse_hash_index_destroy(cur->hash);
+            if (cur->wrapped_handle && cur->vtbl.destroy_fn)
+                cur->vtbl.destroy_fn(cur->wrapped_handle);
+            free(cur->cols);
+            free(cur);
+            return true;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    pthread_rwlock_unlock(&mgr->lock);
+    return false;
 }
 
 size_t qihse_index_manager_count(const qihse_index_manager_t* mgr) {

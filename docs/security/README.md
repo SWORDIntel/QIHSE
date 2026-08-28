@@ -1,11 +1,11 @@
 # QIHSE Security Guide
 
-This guide details the security features and CNSA 2.0 compliance implementation in QIHSE, ensuring mission-critical security for enterprise and government deployments.
+This guide details the security features and CNSA 2.0 alignment goals in QIHSE. **Note:** QIHSE has not yet achieved formal CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via `ctx->tls_ctx`; cleartext is the default. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the internal security review (all 24 findings remediated) and [`UWP_CRYPTO_DESIGN.md`](UWP_CRYPTO_DESIGN.md) for the encryption design.
 
 ## Table of Contents
 
 1. [Security Architecture](#security-architecture)
-2. [CNSA 2.0 Compliance](#cnsa-20-compliance)
+2. [CNSA 2.0 Alignment (In Progress)](#cnsa-20-alignment-in-progress)
 3. [Cryptographic Operations](#cryptographic-operations)
 4. [Key Management](#key-management)
 5. [Access Control](#access-control)
@@ -48,7 +48,7 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 ├─────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────  ┐     │
 │  │   CNSA 2.0  │  │   FIPS      │  │   Hardware    │     │
-│  │ Compliance  │  │ Validation  │  │  Security     │     │
+│  │  Alignment │  │  Targeted   │  │  Security     │     │
 │  └─────────────┘  └─────────────┘  └─────────────  ┘     │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -56,8 +56,8 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 ### Security Components
 
 #### **Cryptographic Module**
-- CNSA 2.0 approved algorithms
-- FIPS 140-3 validated implementations
+- CNSA 2.0 approved algorithms (targeted alignment)
+- FIPS 140-3 validation targeted (not yet completed)
 - Hardware Security Module (HSM) integration
 - Secure key management and rotation
 
@@ -74,16 +74,18 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 - Cryptographic log integrity
 
 #### **Network Security**
-- TLS 1.3 with post-quantum key exchange
-- Mutual TLS (mTLS) for service communication
+- TLS 1.3 with post-quantum key exchange (planned — ChaCha20-Poly1305 AEAD transport encryption is implemented)
+- Mutual TLS (mTLS) for service communication (planned — not yet implemented)
 - Network segmentation and isolation
 - DDoS protection and rate limiting
 
-## CNSA 2.0 Compliance
+## CNSA 2.0 Alignment (In Progress)
+
+> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented or planned for the `.qdb` container encryption (data at rest). Transport-layer encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the current security posture.
 
 ### Approved Cryptographic Algorithms
 
-QIHSE implements all CNSA 2.0 approved algorithms for higher assurance applications:
+QIHSE implements or targets the following CNSA 2.0 approved algorithms for higher assurance applications:
 
 #### **Symmetric Encryption**
 - **AES-256-GCM** (primary)
@@ -126,7 +128,7 @@ QIHSE implements all CNSA 2.0 approved algorithms for higher assurance applicati
 ### Algorithm Selection Guidelines
 
 ```c
-// CNSA 2.0 compliant algorithm selection
+// CNSA 2.0 aligned algorithm selection
 qihse_crypto_config_t crypto_config = {
     .encryption_algorithm = QIHSE_CRYPTO_AES256_GCM,
     .signature_algorithm = QIHSE_CRYPTO_ECDSA_P384,
@@ -152,7 +154,7 @@ if (ret != QIHSE_SUCCESS) {
 ### Secure Random Number Generation
 
 ```c
-// CNSA 2.0 compliant random number generation
+// CNSA 2.0 aligned random number generation
 qihse_crypto_rng_t* rng = qihse_crypto_rng_init();
 
 // Generate cryptographic keys
@@ -562,7 +564,7 @@ qihse_secure_log_destroy(secure_log);
 // Configure audit trail
 qihse_audit_config_t audit_config = {
     .audit_all_operations = true,
-    .retain_audit_logs_days = 2555,  // 7 years for CNSA 2.0 compliance
+    .retain_audit_logs_days = 2555,  // 7 years for CNSA 2.0 alignment
     .compress_old_logs = true,
     .encrypt_audit_logs = true,
     .audit_key_rotation_days = 365,
@@ -602,7 +604,7 @@ qihse_tls_config_t tls_config = {
         NULL
     },
     .key_exchange_groups = {
-        "secp384r1",  // P-384 for CNSA 2.0 compliance
+        "secp384r1",  // P-384 for CNSA 2.0 alignment
         NULL
     },
     .certificate_path = "/etc/qihse/certs/server.pem",
@@ -742,9 +744,9 @@ qihse_crypto_cache_timing_protect();
 qihse_crypto_branch_prediction_protect();
 ```
 
-## Compliance Verification
+## Compliance Verification (Targeted — Not Yet Certified)
 
-### CNSA 2.0 Compliance Checking
+### CNSA 2.0 Alignment Checking
 
 ```c
 // Comprehensive compliance verification
@@ -764,7 +766,7 @@ qihse_cnsa_checker_t* checker = qihse_cnsa_checker_init(&compliance_config);
 qihse_cnsa_compliance_result_t result = qihse_cnsa_checker_run(checker);
 
 if (result.overall_compliant) {
-    printf("System is CNSA 2.0 compliant\n");
+    printf("System meets CNSA 2.0 alignment targets\n");
 } else {
     printf("Compliance violations found:\n");
     for (size_t i = 0; i < result.violation_count; i++) {
@@ -850,4 +852,4 @@ qihse_security_tester_destroy(tester);
 
 ---
 
-This security guide provides comprehensive coverage of QIHSE's security architecture and CNSA 2.0 compliance implementation. For deployment-specific security configurations, see the [Deployment Guide](deployment/). For security incident response procedures, contact your security operations center.
+This security guide provides comprehensive coverage of QIHSE's security architecture and CNSA 2.0 alignment goals. **QIHSE has not yet completed formal CNSA 2.0 compliance certification or FIPS 140-3 validation, and transport encryption is not yet implemented.** For deployment-specific security configurations, see the [Deployment Guide](deployment/). For security incident response procedures, contact your security operations center.

@@ -101,6 +101,7 @@ qihse_index_t* qihse_index_manager_add_wrapped(qihse_index_manager_t* mgr,
 
 qihse_index_t* qihse_index_manager_find(const qihse_index_manager_t* mgr,
                                         const char* name);
+bool qihse_index_manager_drop(qihse_index_manager_t* mgr, const char* name);
 size_t qihse_index_manager_count(const qihse_index_manager_t* mgr);
 
 /* ---- Index operations ---- */
