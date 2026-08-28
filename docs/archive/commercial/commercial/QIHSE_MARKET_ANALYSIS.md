@@ -113,7 +113,7 @@ Advantage_Ratio = Speedup_QIHSE / Speedup_Competitor
 - **Infrastructure Flexibility**: Works on standard hardware
 - **Accuracy**: 99.5%+ with confidence guarantees
 - **Scalability**: Maintains efficiency across dataset sizes
-- **Security**: CNSA 2.0 compliance for government/military
+- **Security**: CNSA 2.0 alignment (in progress) for government/military
 
 #### Weaknesses
 - **Market Awareness**: Emerging technology, limited brand recognition
@@ -181,7 +181,7 @@ Advantage_Ratio = Speedup_QIHSE / Speedup_Competitor
 #### Government & Defense (5% of SAM)
 - **Customer Profile**: Classified computing, intelligence agencies
 - **Pain Points**: Security requirements, performance needs
-- **QIHSE Value**: CNSA 2.0 compliance, superior performance
+- **QIHSE Value**: CNSA 2.0 alignment (in progress), superior performance
 - **Market Size**: $185M addressable
 
 #### Edge Computing & IoT (5% of SAM)

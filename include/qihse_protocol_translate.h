@@ -4,26 +4,31 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Maximum UWP payload size accepted by protocol translation callers. */
+#define QIHSE_UWP_TRANSLATE_MAX_PAYLOAD (1024u * 1024u)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* ---- PostgreSQL wire -> UWP ---- */
 
-int qihse_translate_pg_query_to_uwp(const char* sql, uint8_t* out_uwp, size_t* out_len);
+int qihse_translate_pg_query_to_uwp(const char* sql, uint8_t* out_uwp, size_t out_cap,
+                                    size_t* out_len);
 int qihse_translate_pg_parse_to_uwp(const char* sql, const char** params, int num_params,
-                                    uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_pg_begin_to_uwp(int isolation_level, uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_pg_commit_to_uwp(uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_pg_rollback_to_uwp(uint8_t* out_uwp, size_t* out_len);
+                                    uint8_t* out_uwp, size_t out_cap, size_t* out_len);
+int qihse_translate_pg_begin_to_uwp(int isolation_level, uint8_t* out_uwp, size_t out_cap,
+                                    size_t* out_len);
+int qihse_translate_pg_commit_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len);
+int qihse_translate_pg_rollback_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len);
 
 /* ---- Bolt -> UWP ---- */
 
 int qihse_translate_bolt_run_to_uwp(const char* cypher, const char* params_json,
-                                    uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_bolt_begin_to_uwp(uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_bolt_commit_to_uwp(uint8_t* out_uwp, size_t* out_len);
-int qihse_translate_bolt_rollback_to_uwp(uint8_t* out_uwp, size_t* out_len);
+                                    uint8_t* out_uwp, size_t out_cap, size_t* out_len);
+int qihse_translate_bolt_begin_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len);
+int qihse_translate_bolt_commit_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len);
+int qihse_translate_bolt_rollback_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len);
 
 /* ---- UWP -> PostgreSQL wire result ---- */
 

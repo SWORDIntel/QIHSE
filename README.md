@@ -7,9 +7,33 @@
 
 ### If you need a database—any database, for any workload, at any scale—this is your endgame. Vector, Graph, KV, Document, Time-Series, Columnar, FTS, and Event Stream—unified under one zero-copy protocol and one relentless standard of exactness.
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux) ![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen) ![CNSA 2.0 Compliant](https://img.shields.io/badge/Cryptography-CNSA%202.0-brightgreen.svg) ![FIPS 140-3](https://img.shields.io/badge/Hardware-FIPS%20140--3-brightgreen.svg) ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success) ![Security Audit](https://img.shields.io/badge/Security-Audited%20%26%20Hardened-success?logo=shield)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-black.svg)](LICENSE) ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white) ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white) ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white) ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black) ![SIMD](https://img.shields.io/badge/SIMD-AVX%20%7C%20AVX2%20%7C%20AVX--512-00599C) ![eBPF / XDP](https://img.shields.io/badge/Networking-eBPF%20%2F%20XDP-00599C?logo=linux) ![Multi-Modal](https://img.shields.io/badge/Multi--Modal-8%20Engines-darkgreen) ![CNSA 2.0 Alignment (In Progress)](https://img.shields.io/badge/Cryptography-CNSA%202.0%20Alignment%20(In%20Progress)-yellow.svg) ![FIPS 140-3 Targeted](https://img.shields.io/badge/Hardware-FIPS%20140--3%20Targeted-yellow.svg) ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success) ![Security Review](https://img.shields.io/badge/Security-Internal%20Review%20(2026--08)-yellow?logo=shield)
 
 </div>
+
+---
+
+## Security Status
+
+> **Honest assessment of the current security posture (as of August 2026).**
+
+- **Internal Security Review (August 2026):** The project underwent an internal security review covering the UWP wire protocol. 24 findings (5 CRITICAL, 7 HIGH, 7 MEDIUM, 5 LOW) were identified. All CRITICAL and HIGH findings have been remediated. The full report is available at [`docs/security/UWP_AUDIT_2026-08.md`](docs/security/UWP_AUDIT_2026-08.md).
+- **Authentication:** Enforced in both UWP and Bolt protocol. Non-AUTH targets reject unauthenticated sessions. Per-IP rate limiting (5 attempts/60s) and per-user lockout prevent brute-force attacks.
+- **Authorization:** Per-object ACLs with full-width resource IDs, per-user grant/revoke, and thread-safe lookup. UWP dispatch derives resource IDs from request payloads (FNV-1a hash for KV/Column/Stream, packet IDs for Vector/Document/TSDB).
+- **Transport encryption:** Two modes are available:
+  - **TLS 1.3 (cert-based, production):** `qihse_uwp_tls_ctx_create_selfsigned()` or `qihse_uwp_tls_ctx_create_with_cert()` creates an OpenSSL `SSL_CTX`. `qihse_uwp_tls_session_create_with_fd()` performs a real `SSL_accept` handshake. Encrypt/decrypt use `SSL_write`/`SSL_read`. Key rotation (`qihse_uwp_tls_ctx_rotate_key`) and session renegotiation (`qihse_uwp_tls_session_renegotiate`) are supported. Verified by a real TLS 1.3 handshake integration test (server `SSL_accept` + client `SSL_connect`).
+  - **ChaCha20-Poly1305 AEAD (symmetric key, fallback):** When no cert infrastructure is configured, per-connection session keys are derived via HKDF-SHA256. This is not equivalent to TLS 1.3 and is intended for development or trusted-network deployments only.
+  - Cleartext remains the default (opt-in TLS). See [`docs/security/UWP_CRYPTO_DESIGN.md`](docs/security/UWP_CRYPTO_DESIGN.md).
+- **Frame reassembly:** Bounded payload allocation, proper short-read handling, per-connection state machine, version validation, and separation of routing errors from socket lifecycle.
+- **XDP/eBPF hardening:** Stats counters, rate limiting, `XDP_DROP` fallback (was `XDP_PASS` causing duplicate kernel/userspace processing).
+- **Connection limits:** Max 1024 simultaneous connections, 10-second auth deadline, 5-minute idle timeout with periodic scanning.
+- **Observability:** 19 atomic UWP metrics counters (connections, frames, auth, dispatch per-target, TLS, rate limiting) with JSON and Prometheus exposition format exporters.
+- **Engine coverage:** All 15 UWP targets (AUTH, KV, VECTOR, DOC, COL, TSDB, GRAPH, STREAM, SQL, TXN, GRAPH2, INDEX, SCHEMA, REPL, POOL) are wired to real engine APIs. No stubs remain.
+- **SQL execution:** SELECT via optimizer + index scan + join/aggregate/sort/window executors. INSERT via column store. UPDATE/DELETE via a dedicated mutable table store (`qihse_table_store`) with per-table `pthread_rwlock`, predicate-based update/delete, and tombstone compaction. Prepared statements use an FNV-1a hash table with O(1) lookup (was a 64-slot fixed array). Recursive CTEs via iterative fixpoint evaluation. Window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM, COUNT, AVG, MIN, MAX) use streaming per-partition computation (O(partition_size) memory, was O(n) full-buffer).
+- **Client SDKs:** Python and Rust SDKs have proper error classes/enums for all UWP error codes (auth, permission, rate limit, protocol), frame reassembly, and auth state tracking. PostgreSQL wire protocol enforces auth before queries, validates message lengths, and passes the authenticated user through to UWP dispatch.
+- **Test coverage:** 29-test UWP regression harness, object ACL test, metrics test, TLS integration test (cert generation, key rotation, AEAD round-trip, tamper detection, real TLS 1.3 handshake), 16-thread concurrency stress test (metrics consistency, no deadlocks), real-engine-state test (KV store actual read/write, auth dispatch, version/payload rejection, metrics verification), and libFuzzer fuzz harness. All tests pass under AddressSanitizer + UndefinedBehaviorSanitizer. Fuzzer ran 27.7M iterations with zero crashes.
+- **No formal certification:** No third-party security audit, FIPS 140-3 validation, or CNSA 2.0 certification has been completed. The badges above reflect **targeted** compliance goals, not achieved certifications.
+- **PQC-ready at rest:** The `.qdb` container format uses ML-KEM-1024 key encapsulation and ML-DSA-87 signatures for data-at-rest encryption where configured. This is a real implemented feature, but it does not constitute full CNSA 2.0 compliance.
 
 ---
 
@@ -102,7 +126,7 @@ flowchart TB
     CLIENT --> VFS_HOOK
 
     subgraph SECURITY["2. Security & Access Gate"]
-        AUTH["CNSA 2.0 Security Gate<br/>• Cell-Level Classification & SCI Bitmasks<br/>• Constant-Time Rejection (Zero Timing Leaks)"]
+        AUTH["Security & Access Gate<br/>• Cell-Level Classification & SCI Bitmasks<br/>• Constant-Time Rejection (Zero Timing Leaks)"]
     end
 
     UWP --> AUTH
@@ -460,7 +484,7 @@ All technical specifications, integration manuals, API definitions, and code exa
 - 📚 **[API Reference](docs/api/)**: Comprehensive C API manuals for all database interfaces.
 - 🐍 **[Python SDK Manual](python/)**: Native CPython bindings and integration guide.
 - 🦀 **[Rust SDK Manual](rust/qihse-rs/)**: FFI safe wrappers (`KVStore`, `VectorDB`, `TrinaryTrie`).
-- 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and CNSA 2.0 PQC encryption.
+- 🔒 **[Security & Clearance Architecture](docs/security/README.md)**: Cell-level compartmentation and PQC-ready container encryption.
 - 🛡️ **[Security Audit & Hardening Report](docs/security/hardening-report.md)**: Results from static analysis, memory audit, and file I/O hardening.
 - ⚡ **[Performance Benchmarks](docs/benchmarks/benchmarks.md)**: Stress tests, throughput comparisons, and latency profiles.
 

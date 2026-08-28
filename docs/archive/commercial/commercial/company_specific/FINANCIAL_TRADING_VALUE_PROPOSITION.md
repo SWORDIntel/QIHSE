@@ -110,7 +110,7 @@ High-frequency trading firms operate on microsecond advantages where **10 nanose
 
 ### Trading-Specific Risks
 - **Execution Accuracy**: Multi-level verification ensures correct order matching
-- **Regulatory Compliance**: CNSA 2.0 compliance for financial data security
+- **Regulatory Compliance**: CNSA 2.0 alignment (in progress) for financial data security
 - **Market Impact**: Controlled deployment prevents market disruption
 - **System Stability**: Comprehensive testing prevents outages
 
@@ -150,7 +150,7 @@ High-frequency trading firms operate on microsecond advantages where **10 nanose
 - **FPGA Replacement**: Software solution vs expensive hardware
 - **Standard Infrastructure**: Commodity servers vs specialized systems
 - **Ecosystem Compatibility**: Integration with existing trading platforms
-- **Regulatory Alignment**: CNSA 2.0 compliance for financial data
+- **Regulatory Alignment**: CNSA 2.0 alignment (in progress) for financial data
 
 ### Competitive Position
 - **Speed Leadership**: Unmatched execution speed

@@ -38,7 +38,7 @@ QIHSE combines quantum-inspired mathematics with classical optimizations to deli
 
 ### 🔒 **Enterprise-Ready & High Availability**
 - **Distributed Raft Consensus**: Non-blocking `io_uring` clustering for zero-downtime replication
-- **CNSA 2.0 compliant** for mission-critical security and post-quantum readiness
+- **CNSA 2.0 aligned (in progress)** for mission-critical security and post-quantum readiness
 - **99%+ accuracy** with confidence-based verification
 - **Production-tested** benchmark suite (SIFT1M, GIST1M, MS MARCO)
 - **Defense & Intelligence Suite**: Pre-compiled tactical modules for aerospace telemetry and SIGINT

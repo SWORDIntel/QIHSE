@@ -203,7 +203,7 @@ typedef struct {
     uint64_t total_xact_time;
     uint64_t total_query_time;
     uint64_t total_wait_time;
-} qihse_user_t;
+} qihse_pooler_user_t;
 
 /* ------------------------------------------------------------------ */
 /* Admin console commands                                              */
@@ -329,7 +329,7 @@ qihse_database_t* qihse_pooler_find_database(qihse_pooler_t* pool, const char* n
 size_t qihse_pooler_database_count(qihse_pooler_t* pool);
 
 int qihse_pooler_add_user(qihse_pooler_t* pool, const char* username, const char* password);
-qihse_user_t* qihse_pooler_find_user(qihse_pooler_t* pool, const char* username);
+qihse_pooler_user_t* qihse_pooler_find_user(qihse_pooler_t* pool, const char* username);
 size_t qihse_pooler_user_count(qihse_pooler_t* pool);
 
 /**
