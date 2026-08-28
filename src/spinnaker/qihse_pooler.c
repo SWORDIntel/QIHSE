@@ -64,7 +64,7 @@ struct qihse_pooler_s {
     qihse_database_t* databases;
     size_t num_databases;
     size_t databases_cap;
-    qihse_user_t* users;
+    qihse_pooler_user_t* users;
     size_t num_users;
     size_t users_cap;
 
@@ -567,12 +567,12 @@ int qihse_pooler_add_user(qihse_pooler_t* pool, const char* username, const char
     }
     if (pool->num_users >= pool->users_cap) {
         size_t ncap = pool->users_cap ? pool->users_cap * 2 : 8;
-        qihse_user_t* nu = (qihse_user_t*)realloc(pool->users, ncap * sizeof(qihse_user_t));
+        qihse_pooler_user_t* nu = (qihse_pooler_user_t*)realloc(pool->users, ncap * sizeof(qihse_pooler_user_t));
         if (!nu) { POOL_UNLOCK(pool); return -1; }
         pool->users = nu;
         pool->users_cap = ncap;
     }
-    qihse_user_t* u = &pool->users[pool->num_users++];
+    qihse_pooler_user_t* u = &pool->users[pool->num_users++];
     memset(u, 0, sizeof(*u));
     u->username = dup_str(username);
     u->password = dup_str(password);
@@ -580,7 +580,7 @@ int qihse_pooler_add_user(qihse_pooler_t* pool, const char* username, const char
     return 0;
 }
 
-qihse_user_t* qihse_pooler_find_user(qihse_pooler_t* pool, const char* username) {
+qihse_pooler_user_t* qihse_pooler_find_user(qihse_pooler_t* pool, const char* username) {
     if (!pool || !username) return NULL;
     for (size_t i = 0; i < pool->num_users; i++) {
         if (strcmp(pool->users[i].username, username) == 0) return &pool->users[i];
@@ -728,7 +728,7 @@ void qihse_pooler_record_xact(qihse_pooler_t* pool, const char* database, const 
         }
     }
     if (user) {
-        qihse_user_t* u = qihse_pooler_find_user(pool, user);
+        qihse_pooler_user_t* u = qihse_pooler_find_user(pool, user);
         if (u) {
             u->total_xact_count++;
             u->total_xact_time += duration_us;
@@ -755,7 +755,7 @@ void qihse_pooler_record_query(qihse_pooler_t* pool, const char* database, const
         }
     }
     if (user) {
-        qihse_user_t* u = qihse_pooler_find_user(pool, user);
+        qihse_pooler_user_t* u = qihse_pooler_find_user(pool, user);
         if (u) {
             u->total_query_count++;
             u->total_query_time += duration_us;
@@ -778,7 +778,7 @@ void qihse_pooler_record_wait(qihse_pooler_t* pool, const char* database, const 
         }
     }
     if (user) {
-        qihse_user_t* u = qihse_pooler_find_user(pool, user);
+        qihse_pooler_user_t* u = qihse_pooler_find_user(pool, user);
         if (u) u->total_wait_time += wait_us;
     }
     POOL_UNLOCK(pool);
@@ -1107,7 +1107,7 @@ static void show_users(qihse_pooler_t* pool, textbuf_t* t) {
     tb_put(t, " name | admin | stats\n");
     tb_put(t, "------+-------+------\n");
     for (size_t i = 0; i < pool->num_users; i++) {
-        qihse_user_t* u = &pool->users[i];
+        qihse_pooler_user_t* u = &pool->users[i];
         tb_printf(t, " %s | %s | %s\n",
                   u->username,
                   u->is_admin ? "yes" : "no",
@@ -1218,7 +1218,7 @@ static void show_sockets(qihse_pooler_t* pool, textbuf_t* t, int active_only) {
 
 static void show_mem(qihse_pooler_t* pool, textbuf_t* t) {
     size_t db_mem = pool->num_databases * sizeof(qihse_database_t);
-    size_t user_mem = pool->num_users * sizeof(qihse_user_t);
+    size_t user_mem = pool->num_users * sizeof(qihse_pooler_user_t);
     size_t cl_mem = pool->num_clients * sizeof(qihse_client_info_t);
     size_t sv_mem = pool->num_servers * sizeof(qihse_server_info_t);
     size_t be_mem = pool->enh.num_backends * sizeof(qihse_pool_backend_t);

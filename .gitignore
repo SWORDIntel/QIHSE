@@ -10,6 +10,13 @@
 /fuzzer
 /tests/qihse_*_test
 /tests/test_*
+!/tests/test_object_acl.c
+!/tests/test_uwp_regression.c
+!/tests/fuzz_uwp.c
+!/tests/test_uwp_metrics.c
+!/tests/test_uwp_tls_integration.c
+!/tests/test_uwp_concurrency.c
+!/tests/test_uwp_real_engines.c
 /tests/qihse_server
 /tests/qihse_cluster_*
 /benchmarks/qihse_*_bench

@@ -34,7 +34,7 @@ QIHSE today is a native C99 multi-model engine with eight storage subsystems, tw
 | Cluster rebalancing / migration | Production | Zero-downtime ASK handoff |
 | Distributed scatter-gather planner | Production | RRF, aggregate fusion, multi-engine |
 | Task queue (Celery-equivalent) | Production | Priority, retry, cron, Python SDK |
-| Auth (classification + SCI compartments) | Production | CNSA 2.0 crypto, constant-time reject |
+| Auth (classification + SCI compartments) | Production | CNSA 2.0 aligned crypto (in progress), constant-time reject |
 | Temporal / time-travel queries | Partial | Vector DB only; not cross-engine |
 | SQL parser | Production | Full SQL: JOIN, GROUP BY, HAVING, ORDER BY, subqueries, UNION/INTERSECT/EXCEPT, CTEs, window functions, UPSERT, RETURNING, views, sequences, VACUUM, NOTIFY/LISTEN, EXPLAIN |
 | QQL parser | Minimal | Spatial + temporal + join hints + vector flag |
