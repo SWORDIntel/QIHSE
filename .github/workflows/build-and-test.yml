@@ -33,6 +33,13 @@ jobs:
       run: |
         make test
 
+    - name: Run Auth Privilege Boundary Regression
+      run: |
+        gcc -std=c99 -Wall -Wextra -I. -I./include -I./core \
+          tests/test_auth_privilege_boundary.c -L. -lqihse \
+          -o tests/test_auth_privilege_boundary
+        LD_LIBRARY_PATH=$PWD ./tests/test_auth_privilege_boundary
+
     - name: Run Python SDK Tests
       run: |
         export LD_LIBRARY_PATH=$PWD
