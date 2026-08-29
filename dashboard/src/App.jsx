@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -27,7 +27,7 @@ import {
   YAxis,
 } from 'recharts';
 
-const METRICS_ENDPOINT = 'http://127.0.0.1:8080/metrics';
+const METRICS_ENDPOINT = import.meta.env.VITE_QIHSE_METRICS_URL || '/metrics';
 const POLL_INTERVAL_MS = 1000;
 const WINDOW_SIZE = 60;
 
