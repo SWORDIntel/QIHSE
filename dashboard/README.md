@@ -4,13 +4,25 @@ The dashboard is a lightweight React/Vite observability UI for the native QIHSE 
 
 ## Data source
 
-The current UI polls:
+The UI polls the same-origin path:
+
+```text
+/metrics
+```
+
+During `npm run dev`, Vite proxies that path to:
 
 ```text
 http://127.0.0.1:8080/metrics
 ```
 
-at a one-second interval. The current payload is expected to provide:
+For another deployment topology, set a build/runtime environment override:
+
+```bash
+VITE_QIHSE_METRICS_URL=https://qihse.example.internal/metrics npm run dev
+```
+
+The current payload is expected to provide:
 
 ```json
 {
@@ -58,6 +70,8 @@ Lint:
 ```bash
 npm run lint
 ```
+
+For production, either serve the dashboard behind the same reverse proxy as QIHSE so `/metrics` is same-origin, or set `VITE_QIHSE_METRICS_URL` to a metrics endpoint that permits the dashboard origin.
 
 ## Native telemetry backlog
 
