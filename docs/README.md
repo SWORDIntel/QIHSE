@@ -16,7 +16,9 @@ If you are new to the project, start with the [root README](../README.md), then 
 | Run or inspect benchmarks | [Benchmarks](benchmarks/) |
 | Deploy QIHSE | [Deployment](deployment/) |
 | Work on the codebase | [Development](development/) |
-| Read the full technical treatment | [Technical Whitepaper](architecture/qihse_whitepaper_v1.0.md) |
+| Read the current technical treatment | [Technical Whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md) |
+
+The original [whitepaper v1.0](architecture/qihse_whitepaper_v1.0.md) is retained as a historical design snapshot. Use v1.1 for current implementation status, roadmap state, claim discipline, and production-readiness language.
 
 ## Core architecture
 
@@ -92,4 +94,4 @@ Notable documents include:
 
 ## Archive
 
-Historical or superseded material belongs under [`archive/`](archive/). Prefer current architecture, security, benchmark, and deployment documents when both current and archived material cover the same subsystem.
+Historical or superseded material belongs under [`archive/`](archive/). Versioned architecture documents may also be retained in place when they are useful as design-history snapshots; prefer the newest whitepaper and current subsystem documentation for implementation status.

@@ -41,7 +41,7 @@ Despite the name, QIHSE runs on conventional hardware. Its "quantum-inspired" co
 
 ## What does it contain?
 
-The core database surface is intentionally broad:
+The core database surface is intentionally broad, but **QIHSE is modular rather than all-or-nothing**. Applications can use one engine, protocol surface, SDK, index, or hardware backend without enabling the entire runtime. Heterogeneous acceleration, clustering, UWP networking, self-optimization, and additional compatibility layers are optional capabilities rather than prerequisites.
 
 | Data model | What QIHSE provides |
 |---|---|
@@ -87,7 +87,7 @@ flowchart LR
 
 The important part is the shared runtime. The individual engines are not intended to behave like unrelated services merely placed in the same repository.
 
-For implementation detail, start with the **[architecture documentation](docs/architecture/)** or the full **[technical whitepaper](docs/architecture/qihse_whitepaper_v1.0.md)**.
+For implementation detail, start with the **[architecture documentation](docs/architecture/)** or the current **[technical whitepaper](docs/architecture/qihse_whitepaper_v1.1.md)**.
 
 ---
 
@@ -246,7 +246,7 @@ For a task-oriented index, use the **[documentation hub](docs/README.md)**.
 | Understand replication/backup | [Replication & Backup](docs/architecture/replication_backup.md) |
 | Review protocol hardening | [Security](docs/security/) |
 | Reproduce performance tests | [Benchmarks](docs/benchmarks/) |
-| Read the deepest technical treatment | [Technical Whitepaper](docs/architecture/qihse_whitepaper_v1.0.md) |
+| Read the deepest technical treatment | [Technical Whitepaper v1.1](docs/architecture/qihse_whitepaper_v1.1.md) |
 
 The full documentation index is **[`docs/README.md`](docs/README.md)**.
 
