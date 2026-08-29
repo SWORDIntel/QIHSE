@@ -16,10 +16,16 @@ During `npm run dev`, Vite proxies that path to:
 http://127.0.0.1:8080/metrics
 ```
 
-For another deployment topology, set a build/runtime environment override:
+For another deployment topology, set the Vite metrics URL when running the dev server or building the dashboard:
 
 ```bash
 VITE_QIHSE_METRICS_URL=https://qihse.example.internal/metrics npm run dev
+```
+
+or:
+
+```bash
+VITE_QIHSE_METRICS_URL=https://qihse.example.internal/metrics npm run build
 ```
 
 The current payload is expected to provide:
@@ -71,7 +77,7 @@ Lint:
 npm run lint
 ```
 
-For production, either serve the dashboard behind the same reverse proxy as QIHSE so `/metrics` is same-origin, or set `VITE_QIHSE_METRICS_URL` to a metrics endpoint that permits the dashboard origin.
+For production, either serve the dashboard behind the same reverse proxy as QIHSE so `/metrics` is same-origin, or build with `VITE_QIHSE_METRICS_URL` set to a metrics endpoint that permits the dashboard origin.
 
 ## Native telemetry backlog
 
