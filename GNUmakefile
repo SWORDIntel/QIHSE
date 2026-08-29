@@ -18,3 +18,16 @@ src/spinnaker/qihse_uwp_secure.o: src/spinnaker/qihse_uwp_secure.c \
                                   src/spinnaker/qihse_uwp.c \
                                   src/spinnaker/qihse_uwp_tls.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: test-uwp-secure-default
+
+test-uwp-secure-default: tests/test_uwp_secure_default
+	LD_LIBRARY_PATH=. ./tests/test_uwp_secure_default
+
+tests/test_uwp_secure_default: tests/test_uwp_secure_default.c libqihse.so
+	$(CC) $(CFLAGS) -I. -I./include tests/test_uwp_secure_default.c \
+		-L. -lqihse -lssl -lcrypto -lpthread -lm -o $@
+
+# Extend the normal regression suite with both the existing real TLS 1.3
+# handshake test and the new fail-closed default-policy test.
+test: test-uwp-tls test-uwp-secure-default
