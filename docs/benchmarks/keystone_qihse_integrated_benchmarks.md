@@ -2,7 +2,7 @@
 
 ## Overview
 
-The QIHSE (Quantum-Inspired High-Dimensional Search Engine) and KEYSTONE integration forms a hardware-aware, zero-copy, multi-model data platform capable of unified vector search, columnar OLAP, time-series telemetry, key-value storage, and full-text search (FTS) with neural semantic classification.
+The QIHSE (Quantum-Inspired Hilbert Space Expansion Search) and KEYSTONE integration forms a hardware-aware, zero-copy, multi-model data platform capable of unified vector search, columnar OLAP, time-series telemetry, key-value storage, and full-text search (FTS) with neural semantic classification.
 
 This document details the performance benchmarks of the 5 joint architectural pillars measured on host hardware, along with direct comparative analysis against industry standards (FAISS, pgvector, `std::lower_bound`, B+Tree, Linux BSD sockets, ONNX Runtime, PyTorch LibTorch, OpenSearch, and Weaviate).
 
@@ -99,6 +99,6 @@ This document details the performance benchmarks of the 5 joint architectural pi
 To execute the full integrated benchmark on any target system:
 
 ```bash
-cd /home/john/SPECTRA/QIHSE
+cd QIHSE
 make bench-keystone-integrated
 ```
