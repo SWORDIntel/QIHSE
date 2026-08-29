@@ -187,28 +187,22 @@ Measured results, methodology, and comparative experiments are in **[`docs/bench
 
 ---
 
-## Security status
+## Security
 
-QIHSE is under active security hardening. The current state should be read as an engineering status, not as a certification claim.
+Security review and hardening are ongoing parts of QIHSE development rather than one-time milestones.
 
-As of **August 2026**:
+An internal UWP review in **August 2026** identified **24 issues**, including **5 critical** and **7 high-severity** findings. The critical and high-severity findings from that review were remediated, and regression coverage was added across authentication, ACLs, transport security, protocol state, sanitizers, concurrency, and fuzzing.
 
-- an internal review of the UWP wire protocol identified **24 findings**: 5 critical, 7 high, 7 medium, and 5 low;
-- the critical and high findings from that review have been remediated;
-- authentication and authorization are enforced across the reviewed protocol paths;
-- TLS 1.3 support is implemented for certificate-configured UWP deployments;
-- a ChaCha20-Poly1305 mode exists for selected symmetric-key/trusted-network use cases;
-- regression coverage includes sanitizer, concurrency, TLS, ACL, protocol-state, and fuzz testing;
-- `.qdb` container workflows can use post-quantum cryptographic primitives where configured.
+The reviewed security posture currently includes:
 
-### Important limitations
+- authentication and authorization across the reviewed UWP paths;
+- TLS 1.3 support for certificate-configured UWP transport;
+- ChaCha20-Poly1305 transport support for selected trusted-network or development use cases;
+- post-quantum cryptographic options for `.qdb` container workflows where configured.
 
-- **Cleartext transport is still the default unless TLS is explicitly configured.**
-- There has been **no third-party security audit**.
-- There is **no FIPS 140-3 validation or CNSA 2.0 certification**.
-- PQC functionality in the container format does not by itself make the whole system CNSA-compliant.
+Security review continues as the code changes. Security posture is therefore **commit- and configuration-specific**: security-sensitive deployments should pin and validate the exact revision they deploy. No actively developed system can provide a meaningful 100% security guarantee across every current and future commit.
 
-Read the **[UWP audit](docs/security/UWP_AUDIT_2026-08.md)**, **[cryptographic design](docs/security/UWP_CRYPTO_DESIGN.md)**, and **[security documentation](docs/security/)** before exposing QIHSE to an untrusted network.
+Detailed audit history, current limitations, cryptographic design, and certification status are maintained in **[docs/security/](docs/security/)** rather than duplicated on the front page.
 
 ---
 
