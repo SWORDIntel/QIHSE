@@ -189,20 +189,21 @@ Measured results, methodology, and comparative experiments are in **[`docs/bench
 
 ## Security
 
-Security review and hardening are ongoing parts of QIHSE development rather than one-time milestones.
+Security review and hardening are ongoing parts of QIHSE development.
 
-An internal UWP review in **August 2026** identified **24 issues**, including **5 critical** and **7 high-severity** findings. The critical and high-severity findings from that review were remediated, and regression coverage was added across authentication, ACLs, transport security, protocol state, sanitizers, concurrency, and fuzzing.
+An internal UWP review in **August 2026** identified security issues across authentication, access control, transport, and protocol handling, including critical and high-severity findings. The critical and high-severity findings identified in that review were remediated, and regression coverage was added around the affected areas.
 
-The reviewed security posture currently includes:
+Current defaults and reviewed controls include:
 
 - authentication and authorization across the reviewed UWP paths;
-- TLS 1.3 support for certificate-configured UWP transport;
-- ChaCha20-Poly1305 transport support for selected trusted-network or development use cases;
+- **certificate-backed TLS 1.3 required by default for the UWP network listener**;
+- cleartext and the legacy ChaCha20-Poly1305 transport available only through the explicit `QIHSE_UWP_ALLOW_INSECURE=1` compatibility/development opt-in;
+- regression coverage spanning transport security, authentication, ACLs, protocol state, sanitizers, concurrency, and fuzzing;
 - post-quantum cryptographic options for `.qdb` container workflows where configured.
 
-Security review continues as the code changes. Security posture is therefore **commit- and configuration-specific**: security-sensitive deployments should pin and validate the exact revision they deploy. No actively developed system can provide a meaningful 100% security guarantee across every current and future commit.
+Security reviews apply to specific revisions and configurations. Later commits can change the attack surface, so a review of one revision does not automatically establish the security of every future revision. Security-sensitive deployments should pin and validate the exact commit and configuration they deploy.
 
-Detailed audit history, current limitations, cryptographic design, and certification status are maintained in **[docs/security/](docs/security/)** rather than duplicated on the front page.
+Detailed findings, audit history, cryptographic design, remaining limitations, and certification status are maintained in **[docs/security/](docs/security/)** rather than duplicated on the front page.
 
 ---
 
