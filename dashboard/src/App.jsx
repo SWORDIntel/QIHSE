@@ -30,6 +30,7 @@ import {
 const METRICS_ENDPOINT = import.meta.env.VITE_QIHSE_METRICS_URL || '/metrics';
 const POLL_INTERVAL_MS = 1000;
 const WINDOW_SIZE = 60;
+const EMPTY_SAMPLE = { timestamp: 0, time: '', qps: 0, latency: 0 };
 
 const initialSample = () => ({
   timestamp: Date.now(),
@@ -90,6 +91,7 @@ export default function App() {
   const [lastError, setLastError] = useState('');
   const [successfulPolls, setSuccessfulPolls] = useState(0);
   const [failedPolls, setFailedPolls] = useState(0);
+  const [clockNow, setClockNow] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -158,11 +160,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      if (lastUpdated && Date.now() - lastUpdated > POLL_INTERVAL_MS * 3) {
+    const updateClock = () => {
+      const now = Date.now();
+      setClockNow(now);
+      if (lastUpdated && now - lastUpdated > POLL_INTERVAL_MS * 3) {
         setConnectionState((state) => (state === 'connected' ? 'stale' : state));
       }
-    }, 1000);
+    };
+
+    updateClock();
+    const interval = window.setInterval(updateClock, 1000);
     return () => window.clearInterval(interval);
   }, [lastUpdated]);
 
@@ -170,7 +177,7 @@ export default function App() {
     const observed = samples.filter((sample) => sample.timestamp && (sample.qps > 0 || sample.latency > 0));
     const qpsValues = observed.map((sample) => sample.qps);
     const latencyValues = observed.map((sample) => sample.latency);
-    const latest = samples[samples.length - 1] || initialSample();
+    const latest = samples[samples.length - 1] || EMPTY_SAMPLE;
     const pollTotal = successfulPolls + failedPolls;
 
     return {
@@ -192,7 +199,9 @@ export default function App() {
     down: 'Telemetry unavailable',
   }[connectionState];
 
-  const lastUpdateAge = lastUpdated ? Math.max(0, Math.round((Date.now() - lastUpdated) / 1000)) : null;
+  const lastUpdateAge = lastUpdated && clockNow
+    ? Math.max(0, Math.round((clockNow - lastUpdated) / 1000))
+    : null;
 
   const tabs = [
     ['overview', Activity, 'Overview'],
