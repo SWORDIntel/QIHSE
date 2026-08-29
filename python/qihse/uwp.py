@@ -1,7 +1,10 @@
 """QIHSE Unified Wire Protocol Python bindings."""
 
 import ctypes
+import os
+from pathlib import Path
 import socket
+import ssl
 import struct
 import time
 from typing import List, Optional, Tuple
@@ -98,18 +101,20 @@ _lib.qihse_start_uwp_server.restype = ctypes.c_bool
 _lib.qihse_auth_is_operator_password_default.argtypes = []
 _lib.qihse_auth_is_operator_password_default.restype = ctypes.c_bool
 
-_lib.qihse_auth_modify_user.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_uint32,
-    ctypes.c_char_p,
-    ctypes.c_char_p,
-    ctypes.c_int,
-    ctypes.c_int,
-]
-_lib.qihse_auth_modify_user.restype = ctypes.c_bool
+_lib.qihse_uwp_tls_ctx_create_with_cert.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_lib.qihse_uwp_tls_ctx_create_with_cert.restype = ctypes.c_void_p
+_lib.qihse_uwp_tls_ctx_destroy.argtypes = [ctypes.c_void_p]
+_lib.qihse_uwp_tls_ctx_destroy.restype = None
 
 
 class UWPServer:
+    """Blocking UWP server launcher.
+
+    Certificate TLS is required by the first-party Python launcher. The C
+    server also enforces TLS by default; development-only cleartext/legacy
+    transport requires an explicit opt-in at the native layer.
+    """
+
     @staticmethod
     def start(
         port: int,
@@ -118,15 +123,33 @@ class UWPServer:
         vdb: Optional[VectorDB] = None,
         doc: Optional[DocumentStore] = None,
         tsdb: Optional[TimeSeriesDB] = None,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
     ) -> bool:
         if _lib.qihse_auth_is_operator_password_default():
-            op_user = _lib.qihse_auth_get_user(0)
-            _lib.qihse_auth_modify_user(
-                op_user, 0, b"admin", b"SecureOpPass_2026!", -1, -1
+            raise UWPAuthError(
+                "refusing to start UWP while the default operator password is active; "
+                "rotate it explicitly before exposing a network service"
             )
 
-        # ctypes zero-initializes the complete C structure, so optional engine,
-        # auth, replication, TLS and metrics pointers are NULL unless supplied.
+        cert_path = tls_cert or os.environ.get("QIHSE_UWP_TLS_CERT")
+        key_path = tls_key or os.environ.get("QIHSE_UWP_TLS_KEY")
+        if not cert_path or not key_path:
+            raise UWPConnectionError(
+                "UWP requires TLS by default. Supply tls_cert/tls_key or set "
+                "QIHSE_UWP_TLS_CERT and QIHSE_UWP_TLS_KEY."
+            )
+
+        try:
+            cert_pem = Path(cert_path).read_bytes()
+            key_pem = Path(key_path).read_bytes()
+        except OSError as exc:
+            raise UWPConnectionError(f"failed to read TLS certificate/key: {exc}") from exc
+
+        tls_ctx = _lib.qihse_uwp_tls_ctx_create_with_cert(cert_pem, key_pem)
+        if not tls_ctx:
+            raise UWPConnectionError("failed to initialize the UWP TLS 1.3 context")
+
         ctx = UWPContext()
         ctx.kv = ctypes.cast(kv._ptr, ctypes.c_void_p) if kv else None
         ctx.vdb = ctypes.cast(vdb._ptr, ctypes.c_void_p) if vdb else None
@@ -134,13 +157,22 @@ class UWPServer:
         ctx.col = None
         ctx.tsdb = ctypes.cast(tsdb._ptr, ctypes.c_void_p) if tsdb else None
         ctx.stream = None
+        ctx.tls_ctx = tls_ctx
 
         addr = bind_address.encode("utf-8") if bind_address else None
-        return bool(_lib.qihse_start_uwp_server(ctypes.byref(ctx), port, addr))
+        try:
+            return bool(_lib.qihse_start_uwp_server(ctypes.byref(ctx), port, addr))
+        finally:
+            _lib.qihse_uwp_tls_ctx_destroy(tls_ctx)
 
 
 class UWPClient:
-    """TCP client for the QIHSE Unified Wire Protocol."""
+    """TCP client for the QIHSE Unified Wire Protocol.
+
+    TLS certificate verification is enabled by default. For a private CA or a
+    self-signed development certificate, pass ``ca_file``. Cleartext requires
+    the explicit ``tls=False`` compatibility setting.
+    """
 
     def __init__(
         self,
@@ -148,11 +180,20 @@ class UWPClient:
         port: int = 7600,
         timeout: float = 30.0,
         max_retries: int = UWP_RATE_LIMIT_MAX_RETRIES,
+        *,
+        tls: bool = True,
+        ca_file: Optional[str] = None,
+        server_hostname: Optional[str] = None,
+        insecure_skip_verify: bool = False,
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
         self._max_retries = max_retries
+        self._tls = tls
+        self._ca_file = ca_file
+        self._server_hostname = server_hostname
+        self._insecure_skip_verify = insecure_skip_verify
         self._sock: Optional[socket.socket] = None
         self._authenticated = False
         self._credentials: Optional[Tuple[str, str]] = None
@@ -167,12 +208,21 @@ class UWPClient:
         return False
 
     def connect(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(self.timeout)
         try:
-            sock.connect((self.host, self.port))
-        except OSError as exc:
-            sock.close()
+            raw_sock.connect((self.host, self.port))
+            sock: socket.socket = raw_sock
+            if self._tls:
+                context = ssl.create_default_context(cafile=self._ca_file)
+                if self._insecure_skip_verify:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                server_hostname = self._server_hostname or self.host
+                sock = context.wrap_socket(raw_sock, server_hostname=server_hostname)
+                sock.settimeout(self.timeout)
+        except (OSError, ssl.SSLError) as exc:
+            raw_sock.close()
             raise UWPConnectionError(
                 f"failed to connect to {self.host}:{self.port}: {exc}"
             ) from exc
