@@ -108,18 +108,81 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     FILE* f = fopen(wal_path, "r");
     if (!f) return;
 #endif
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "SET ", 4) == 0) {
-            unsigned int classif = 0, sci = 0;
-            char key_buf[256], val_buf[2048];
-            if (sscanf(line + 4, "%255s %2047s %u %u", key_buf, val_buf, &classif, &sci) >= 2) {
+    // Binary WAL format: "SET" marker + key_len(u16) + val_len(u32) + classif(u16) + sci(u16) + key + value
+    // Also support legacy text format for backward compat
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == 'S') {
+            // Check for "SET " (legacy text format)
+            char tag[4];
+            tag[0] = 'S';
+            if (fread(tag + 1, 1, 3, f) != 3) break;
+            if (tag[1] == 'E' && tag[2] == 'T' && tag[3] == ' ') {
+                // Legacy text format: parse line with fgets
+                char line[65536];
+                // Read rest of line (we already consumed "SET ")
+                if (!fgets(line, sizeof(line), f)) break;
+                unsigned int classif = 0, sci = 0;
+                char key_buf[256], val_buf[63488];
+                // Use %[^\n] to read value with spaces up to the last space before classif
+                // Actually legacy format is: "SET key value classif sci\n" but value has spaces...
+                // Legacy format is broken for values with spaces. Try best-effort:
+                int n = sscanf(line, "%255s %63487[^\n]", key_buf, val_buf);
+                if (n >= 2) {
+                    // Try to extract classif/sci from end of val_buf
+                    // Find last two numbers
+                    char *end = val_buf + strlen(val_buf);
+                    while (end > val_buf && (*end == ' ' || *end == '\n')) end--;
+                    // Walk back two tokens for classif and sci
+                    char *p2 = end;
+                    while (p2 > val_buf && *p2 != ' ') p2--;
+                    if (p2 > val_buf) {
+                        sci = atoi(p2 + 1);
+                        *p2 = '\0';
+                        char *p1 = p2 - 1;
+                        while (p1 > val_buf && *p1 != ' ') p1--;
+                        if (p1 > val_buf) {
+                            classif = atoi(p1 + 1);
+                            *p1 = '\0';
+                        }
+                    }
+                    qihse_kv_set(store, key_buf, val_buf, classif, sci);
+                }
+            } else if (tag[1] == 'E' && tag[2] == 'T' && tag[3] == '\x00') {
+                // Binary WAL format: "SET\0" marker
+                uint16_t key_len;
+                uint32_t val_len;
+                uint16_t classif, sci;
+                if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
+                if (fread(&val_len, sizeof(val_len), 1, f) != 1) break;
+                if (fread(&classif, sizeof(classif), 1, f) != 1) break;
+                if (fread(&sci, sizeof(sci), 1, f) != 1) break;
+                if (key_len == 0 || key_len > 1048576 || val_len > 16777216) break;
+                char* key_buf = (char*)malloc(key_len + 1);
+                char* val_buf = (char*)malloc(val_len + 1);
+                if (!key_buf || !val_buf) { free(key_buf); free(val_buf); break; }
+                if (fread(key_buf, 1, key_len, f) != key_len) { free(key_buf); free(val_buf); break; }
+                if (fread(val_buf, 1, val_len, f) != val_len) { free(key_buf); free(val_buf); break; }
+                key_buf[key_len] = '\0';
+                val_buf[val_len] = '\0';
                 qihse_kv_set(store, key_buf, val_buf, classif, sci);
+                free(key_buf);
+                free(val_buf);
+            } else {
+                // Not a SET record, skip the 3 bytes we consumed
+                continue;
             }
-        } else if (strncmp(line, "DEL ", 4) == 0) {
-            char key[256];
-            if (sscanf(line + 4, "%255s", key) == 1) {
-                qihse_kv_del_user(store, key, NULL);
+        } else if (c == 'D') {
+            char tag[4];
+            tag[0] = 'D';
+            if (fread(tag + 1, 1, 3, f) != 3) break;
+            if (tag[1] == 'E' && tag[2] == 'L' && tag[3] == ' ') {
+                char line[512];
+                if (!fgets(line, sizeof(line), f)) break;
+                char key[256];
+                if (sscanf(line, "%255s", key) == 1) {
+                    qihse_kv_del_user(store, key, NULL);
+                }
             }
         }
     }
@@ -132,12 +195,12 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
     store->trie = qihse_trinary_trie_create();
     if (!store->trie) { free(store); return NULL; }
     store->bulk_load_mode = false;
-    
+
     store->wal_fd = NULL;
     store->wal_unflushed_bytes = 0;
     store->mem_usage = 0;
     store->sstable_counter = 0;
-    store->qdd_ctx = qihse_qdd_init();
+    store->qdd_ctx = NULL;  /* Lazy init — only created on first access tracking */
     
     const char* dir_path = get_qihse_data_dir();
     
@@ -191,10 +254,26 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
 static bool qihse_kv_set_with_expiry(qihse_kv_store_t* store, const char* key, const char* value, uint64_t ttl_ms, uint16_t classification, uint16_t sci_compartment) {
     if (!store || !store->trie || !key || !value) return false;
     
-    // Buffered WAL logging
+    // Buffered WAL logging (binary format: "SET\0" + key_len(u16) + val_len(u32) + classif(u16) + sci(u16) + key + value)
     if (store->wal_fd && !store->bulk_load_mode) {
-        int written = fprintf(store->wal_fd, "SET %s %s %u %u\n", key, value, (unsigned)classification, (unsigned)sci_compartment);
-        if (written > 0) store->wal_unflushed_bytes += (size_t)written;
+        size_t key_len = strlen(key);
+        size_t val_len = strlen(value);
+        if (key_len <= 65535 && val_len <= 16777216) {
+            // Write binary record
+            const char marker[4] = {'S', 'E', 'T', '\0'};
+            uint16_t k16 = (uint16_t)key_len;
+            uint32_t v32 = (uint32_t)val_len;
+            uint16_t c16 = (uint16_t)classification;
+            uint16_t s16 = (uint16_t)sci_compartment;
+            fwrite(marker, 1, 4, store->wal_fd);
+            fwrite(&k16, sizeof(k16), 1, store->wal_fd);
+            fwrite(&v32, sizeof(v32), 1, store->wal_fd);
+            fwrite(&c16, sizeof(c16), 1, store->wal_fd);
+            fwrite(&s16, sizeof(s16), 1, store->wal_fd);
+            fwrite(key, 1, key_len, store->wal_fd);
+            fwrite(value, 1, val_len, store->wal_fd);
+            store->wal_unflushed_bytes += 4 + sizeof(k16) + sizeof(v32) + sizeof(c16) + sizeof(s16) + key_len + val_len;
+        }
         if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) {
             flush_wal_buffer(store);
         }
@@ -210,9 +289,12 @@ static bool qihse_kv_set_with_expiry(qihse_kv_store_t* store, const char* key, c
     payload->expire_time_ms = ttl_ms > 0 ? current_time_ms() + ttl_ms : 0;
     memcpy(payload->val, value, val_len + 1);
 
-    bool inserted = qihse_trinary_trie_insert(store->trie, key, payload, payload_len);
-    free(payload);
-    if (!inserted) return false;
+    /* nocopy: trie takes ownership of payload, avoiding a second malloc+memcpy */
+    bool inserted = qihse_trinary_trie_insert_nocopy(store->trie, key, payload, payload_len);
+    if (!inserted) {
+        free(payload);  /* trie didn't take ownership, we must free */
+        return false;
+    }
 
     store->mem_usage += strlen(key) + val_len + sizeof(kv_payload_t);
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX) {
@@ -254,8 +336,11 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !store->trie || !key) return NULL;
-    
-    // QDD Access Tracking
+
+    // QDD Access Tracking — lazy init on first get
+    if (!store->qdd_ctx) {
+        store->qdd_ctx = qihse_qdd_init();
+    }
     if (store->qdd_ctx) {
         uint64_t key_hash = 14695981039346656037ULL;
         for (const unsigned char* p = (const unsigned char*)key; *p; ++p) {

@@ -33,6 +33,19 @@ void qihse_trinary_trie_destroy(qihse_trinary_trie_t* trie);
 bool qihse_trinary_trie_insert(qihse_trinary_trie_t* trie, const char* key, void* value, size_t value_size);
 
 /**
+ * @brief Inserts a key-value pair, taking ownership of the value buffer.
+ * The caller must malloc() the value buffer; the trie will free() it on
+ * overwrite or destroy. This avoids the double malloc+memcpy of the
+ * regular insert path — critical for bulk ingestion throughput.
+ * @param trie The trie instance.
+ * @param key Null-terminated string key.
+ * @param value Pointer to a malloc'd value buffer (ownership transfers).
+ * @param value_size Size of the value buffer in bytes.
+ * @return true if successfully inserted or updated, false otherwise.
+ */
+bool qihse_trinary_trie_insert_nocopy(qihse_trinary_trie_t* trie, const char* key, void* value, size_t value_size);
+
+/**
  * @brief Searches for a key in the Trinary Trie.
  * @param trie The trie instance.
  * @param key Null-terminated string key.
