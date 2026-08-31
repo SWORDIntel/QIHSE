@@ -101,7 +101,7 @@ void qihse_trinary_trie_destroy(qihse_trinary_trie_t* trie) {
 bool qihse_trinary_trie_insert(qihse_trinary_trie_t* trie, const char* key, void* value, size_t value_size) {
     if (!trie || !key || *key == '\0') return false;
     bool inserted = false;
-    
+
     qihse_tst_node_t** ptr = &trie->root;
     while (*key) {
         if (!*ptr) {
@@ -144,6 +144,47 @@ bool qihse_trinary_trie_insert(qihse_trinary_trie_t* trie, const char* key, void
             node->value_size = 0;
             inserted = true;
         }
+    }
+    return inserted;
+}
+
+bool qihse_trinary_trie_insert_nocopy(qihse_trinary_trie_t* trie, const char* key, void* value, size_t value_size) {
+    if (!trie || !key || *key == '\0') return false;
+    bool inserted = false;
+
+    qihse_tst_node_t** ptr = &trie->root;
+    while (*key) {
+        if (!*ptr) {
+            *ptr = alloc_node(trie, *key);
+            if (!*ptr) return false;
+        }
+        if (*key < (*ptr)->c) {
+            ptr = &((*ptr)->left);
+        } else if (*key > (*ptr)->c) {
+            ptr = &((*ptr)->right);
+        } else {
+            if (*(key + 1) == '\0') {
+                break;
+            }
+            ptr = &((*ptr)->mid);
+            key++;
+        }
+    }
+
+    qihse_tst_node_t* node = *ptr;
+    if (node) {
+        if (node->is_end && node->value) {
+            free(node->value);
+            node->value = NULL;
+        }
+        node->is_end = true;
+        /* nocopy: take ownership of the caller's buffer directly */
+        node->value = value;
+        node->value_size = value_size;
+        inserted = true;
+    } else {
+        /* node allocation failed — caller still owns value, must free it */
+        inserted = false;
     }
     return inserted;
 }
