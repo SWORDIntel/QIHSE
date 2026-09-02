@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 
 
@@ -212,34 +213,33 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
     }
     rec.checksum = crc;
 
-    /* Write header (field by field to avoid struct packing issues) */
-    ssize_t w;
-    w = write(wal->seg_fd, &rec.lsn, 8);
-    if (w != 8) goto fail;
-    w = write(wal->seg_fd, &rec.txn_id, 8);
-    if (w != 8) goto fail;
-    w = write(wal->seg_fd, &rec.engine_id, 1);
-    if (w != 1) goto fail;
-    w = write(wal->seg_fd, &rec.op_type, 1);
-    if (w != 1) goto fail;
-    w = write(wal->seg_fd, &rec.key_length, 4);
-    if (w != 4) goto fail;
-    w = write(wal->seg_fd, &rec.value_length, 4);
-    if (w != 4) goto fail;
-    w = write(wal->seg_fd, &rec.checksum, 4);
-    if (w != 4) goto fail;
+    /* Pack header into contiguous buffer to write atomically with writev */
+    uint8_t hdr[QIHSE_WAL_RECORD_HEADER_SIZE];
+    memcpy(hdr + 0, &rec.lsn, 8);
+    memcpy(hdr + 8, &rec.txn_id, 8);
+    hdr[16] = rec.engine_id;
+    hdr[17] = rec.op_type;
+    memcpy(hdr + 18, &rec.key_length, 4);
+    memcpy(hdr + 22, &rec.value_length, 4);
+    memcpy(hdr + 26, &rec.checksum, 4);
 
-    /* Write key */
+    struct iovec iov[3];
+    int iovcnt = 1;
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = QIHSE_WAL_RECORD_HEADER_SIZE;
     if (key_len > 0 && key) {
-        w = write(wal->seg_fd, key, key_len);
-        if ((size_t)w != key_len) goto fail;
+        iov[iovcnt].iov_base = (void*)key;
+        iov[iovcnt].iov_len  = key_len;
+        iovcnt++;
+    }
+    if (value_len > 0 && value) {
+        iov[iovcnt].iov_base = (void*)value;
+        iov[iovcnt].iov_len  = value_len;
+        iovcnt++;
     }
 
-    /* Write value */
-    if (value_len > 0 && value) {
-        w = write(wal->seg_fd, value, value_len);
-        if ((size_t)w != value_len) goto fail;
-    }
+    ssize_t w = writev(wal->seg_fd, iov, iovcnt);
+    if (w != (ssize_t)rec_total) goto fail;
 
     wal->seg_offset += rec_total;
 
@@ -372,14 +372,16 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
 
         for (;;) {
             qihse_wal_record_t rec;
-            /* Read header fields individually */
-            if (!read_full(fd, &rec.lsn, 8)) break;
-            if (!read_full(fd, &rec.txn_id, 8)) break;
-            if (!read_full(fd, &rec.engine_id, 1)) break;
-            if (!read_full(fd, &rec.op_type, 1)) break;
-            if (!read_full(fd, &rec.key_length, 4)) break;
-            if (!read_full(fd, &rec.value_length, 4)) break;
-            if (!read_full(fd, &rec.checksum, 4)) break;
+            uint8_t hdr[QIHSE_WAL_RECORD_HEADER_SIZE];
+            if (!read_full(fd, hdr, QIHSE_WAL_RECORD_HEADER_SIZE)) break;
+
+            memcpy(&rec.lsn, hdr + 0, 8);
+            memcpy(&rec.txn_id, hdr + 8, 8);
+            rec.engine_id    = hdr[16];
+            rec.op_type      = hdr[17];
+            memcpy(&rec.key_length, hdr + 18, 4);
+            memcpy(&rec.value_length, hdr + 22, 4);
+            memcpy(&rec.checksum, hdr + 26, 4);
 
             /* Validate key/value lengths */
             if (rec.key_length > QIHSE_WAL_MAX_KEY ||

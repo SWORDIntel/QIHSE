@@ -2557,11 +2557,17 @@ static uint64_t qihse_vdb_cache_hash_query(
 ) {
     uint64_t h = 14695981039346656037ULL; /* FNV-1a offset basis */
     size_t i;
-    const uint8_t* bytes = (const uint8_t*)vector;
     size_t byte_len = dims * sizeof(float);
+    const uint64_t* u64s = (const uint64_t*)vector;
+    size_t u64_count = byte_len / sizeof(uint64_t);
 
-    for (i = 0u; i < byte_len; i++) {
-        h ^= bytes[i];
+    for (i = 0u; i < u64_count; i++) {
+        h ^= u64s[i];
+        h *= 1099511628211ULL;
+    }
+    const uint8_t* remainder = (const uint8_t*)(u64s + u64_count);
+    for (i = 0u; i < byte_len % sizeof(uint64_t); i++) {
+        h ^= remainder[i];
         h *= 1099511628211ULL;
     }
     h ^= (uint64_t)top_k;
@@ -2602,8 +2608,17 @@ static bool qihse_vdb_cache_lookup(
     metric = query->distance_metric;
     hash = qihse_vdb_cache_hash_query(query->query_vector, query->vector_dims, top_k, metric, query->user);
 
-    for (i = 0u; i < vdb->cache_count; i++) {
-        qihse_vdb_cache_entry_t* e = &vdb->cache_entries[i];
+    size_t cap = vdb->cache_capacity;
+    size_t base_idx = (size_t)(hash % cap);
+    size_t probe_limit = cap < 8 ? cap : 8;
+
+    for (i = 0u; i < probe_limit; i++) {
+        size_t idx = (base_idx + i) % cap;
+        qihse_vdb_cache_entry_t* e = &vdb->cache_entries[idx];
+        if (e->result_count == 0u || e->result_ids == NULL) {
+            /* Empty slot: not found in hash neighborhood */
+            break;
+        }
         if (e->query_hash == hash &&
             e->top_k == top_k &&
             e->metric == metric &&
@@ -2641,7 +2656,7 @@ static void qihse_vdb_cache_insert(
     qihse_distance_metric_t metric;
     qihse_vdb_cache_entry_t* e;
 
-    if (!vdb || !query || !results || vdb->cache_capacity == 0u) {
+    if (!vdb || !query || !results || vdb->cache_capacity == 0u || result_count == 0u) {
         return;
     }
 
@@ -2649,33 +2664,29 @@ static void qihse_vdb_cache_insert(
     metric = query->distance_metric;
     hash = qihse_vdb_cache_hash_query(query->query_vector, query->vector_dims, top_k, metric, query->user);
 
-    /* Check for existing entry with same hash */
-    for (i = 0u; i < vdb->cache_count; i++) {
-        if (vdb->cache_entries[i].query_hash == hash &&
-            vdb->cache_entries[i].top_k == top_k &&
-            vdb->cache_entries[i].metric == metric) {
-            slot = i;
-            qihse_vdb_cache_destroy_entry(&vdb->cache_entries[slot]);
-            goto fill_slot;
+    size_t cap = vdb->cache_capacity;
+    size_t base_idx = (size_t)(hash % cap);
+    size_t probe_limit = cap < 8 ? cap : 8;
+    size_t target_slot = base_idx;
+
+    /* 1. Check if an entry with this hash already exists, or find an empty/invalid slot */
+    for (i = 0u; i < probe_limit; i++) {
+        size_t idx = (base_idx + i) % cap;
+        qihse_vdb_cache_entry_t* cur = &vdb->cache_entries[idx];
+        if (cur->result_count == 0u || cur->result_ids == NULL || cur->valid_generation != vdb->cache_generation) {
+            target_slot = idx;
+            break;
+        }
+        if (cur->query_hash == hash && cur->top_k == top_k && cur->metric == metric) {
+            target_slot = idx;
+            break;
         }
     }
 
-    /* Find empty slot or evict oldest (simple round-robin for now) */
-    if (vdb->cache_count < vdb->cache_capacity) {
-        slot = vdb->cache_count++;
-    } else {
-        /* Evict first entry (simple FIFO) */
-        qihse_vdb_cache_destroy_entry(&vdb->cache_entries[0]);
-        /* Shift remaining entries down */
-        for (i = 1u; i < vdb->cache_count; i++) {
-            vdb->cache_entries[i - 1] = vdb->cache_entries[i];
-        }
-        vdb->cache_count--;
-        slot = vdb->cache_count++;
-    }
-
-fill_slot:
+    slot = target_slot;
     e = &vdb->cache_entries[slot];
+    qihse_vdb_cache_destroy_entry(e);
+
     e->query_hash = hash;
     e->top_k = top_k;
     e->metric = metric;
@@ -2690,6 +2701,9 @@ fill_slot:
     for (i = 0u; i < result_count; i++) {
         e->result_ids[i] = results[i].id;
         e->result_scores[i] = results[i].score;
+    }
+    if (vdb->cache_count < vdb->cache_capacity) {
+        vdb->cache_count++;
     }
 }
 

@@ -33,6 +33,7 @@ static unsigned long hash_str(const char* s) {
 }
 
 typedef struct agg_group {
+    unsigned long hash;     /* precomputed key hash for fast rejection */
     char** key_parts;       /* group key values */
     size_t num_keys;
     /* aggregate accumulators */
@@ -59,6 +60,7 @@ typedef struct {
     size_t num_groups_total;
     /* output */
     agg_group_t** group_list;
+    size_t group_list_cap;
     size_t group_pos;
     qihse_exec_schema_t out_schema;
     char** out_schema_names;
@@ -185,13 +187,36 @@ static void update_group(agg_state_t* st, agg_group_t* g, const qihse_aggop_t* a
     }
 }
 
+static void agg_rehash(agg_state_t* st) {
+    if (!st || !st->buckets || st->num_buckets == 0) return;
+    size_t new_num_buckets = st->num_buckets * 2;
+    agg_group_t** new_buckets = (agg_group_t**)calloc(new_num_buckets, sizeof(agg_group_t*));
+    if (!new_buckets) return; /* Allocation failure: keep existing buckets */
+
+    for (size_t i = 0; i < st->num_buckets; i++) {
+        agg_group_t* g = st->buckets[i];
+        while (g) {
+            agg_group_t* next = g->next;
+            unsigned long h = g->hash % new_num_buckets;
+            g->next = new_buckets[h];
+            new_buckets[h] = g;
+            g = next;
+        }
+    }
+    free(st->buckets);
+    st->buckets = new_buckets;
+    st->num_buckets = new_num_buckets;
+}
+
 static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
                                           qihse_exec_row_t* row) {
     if (!st || !key || !row || !st->buckets) return NULL;
 
-    unsigned long h = hash_str(key) % st->num_buckets;
+    unsigned long raw_hash = hash_str(key);
+    unsigned long h = raw_hash % st->num_buckets;
     agg_group_t* g = st->buckets[h];
     for (; g; g = g->next) {
+        if (g->hash != raw_hash) continue;
         int match = 1;
         for (size_t i = 0; i < st->num_groups && match; i++) {
             const char* gv = g->key_parts[i];
@@ -218,6 +243,7 @@ static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
     g = (agg_group_t*)calloc(1, sizeof(*g));
     if (!g) return NULL;
 
+    g->hash = raw_hash;
     g->num_keys = st->num_groups;
     g->key_parts = (char**)calloc(st->num_groups ? st->num_groups : 1, sizeof(char*));
     if (!g->key_parts) { free(g); return NULL; }
@@ -252,21 +278,39 @@ static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
     g->next = st->buckets[h];
     st->buckets[h] = g;
 
-    agg_group_t** new_list = (agg_group_t**)realloc(st->group_list, (st->num_groups_total + 1) * sizeof(agg_group_t*));
-    if (!new_list) {
-        return g; /* bucket already has g, but group_list won't include it */
+    if (st->num_groups_total >= st->group_list_cap) {
+        size_t new_cap = st->group_list_cap ? st->group_list_cap * 2 : 64;
+        if (new_cap > QIHSE_AGG_MAX_GROUPS) new_cap = QIHSE_AGG_MAX_GROUPS;
+        agg_group_t** new_list = (agg_group_t**)realloc(st->group_list, new_cap * sizeof(agg_group_t*));
+        if (!new_list) {
+            return g; /* bucket already has g, but group_list won't include it */
+        }
+        st->group_list = new_list;
+        st->group_list_cap = new_cap;
     }
-    st->group_list = new_list;
     st->group_list[st->num_groups_total++] = g;
     st->memory_used_bytes += est_bytes;
+
+    /* Rehash when load factor exceeds 0.75 */
+    if (st->num_groups_total > (st->num_buckets * 3 / 4) && st->num_buckets * 2 <= QIHSE_AGG_MAX_GROUPS * 2) {
+        agg_rehash(st);
+    }
 
     return g;
 }
 
 static void agg_build(agg_state_t* st) {
-    st->num_buckets = 256;
+    st->num_buckets = 1024;
     st->buckets = (agg_group_t**)calloc(st->num_buckets, sizeof(agg_group_t*));
     if (!st->buckets) return;
+
+    st->group_list_cap = 64;
+    st->group_list = (agg_group_t**)malloc(st->group_list_cap * sizeof(agg_group_t*));
+    if (!st->group_list) {
+        free(st->buckets);
+        st->buckets = NULL;
+        return;
+    }
 
     qihse_exec_row_t* r;
     while ((r = qihse_row_stream_next(st->input)) != NULL) {
