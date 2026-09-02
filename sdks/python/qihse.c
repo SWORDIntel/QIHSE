@@ -25,20 +25,14 @@ static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     self->ctx = (qihse_uwp_context_t*)malloc(sizeof(qihse_uwp_context_t));
     memset(self->ctx, 0, sizeof(qihse_uwp_context_t));
     
-    // Initialize Auth (creates User 0 God-Mode Operator)
-    qihse_auth_init();
-    
     // Initialize engines natively in memory
     self->ctx->kv = qihse_kv_store_create();
     self->ctx->vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
     self->ctx->doc = qihse_doc_store_create(self->ctx->kv);
     self->ctx->col = qihse_column_store_create();
     self->ctx->tsdb = qihse_tsdb_create();
-    // Auto-authenticate as God-Mode Operator (User 0) for non-interactive use
-    self->current_user = qihse_auth_authenticate("GODMODE_OP", "OPERATOR_DEFAULT_P@SSW0RD_DO_NOT_USE");
-    if (self->current_user) {
-        self->ctx->user = self->current_user;
-    }
+    self->current_user = NULL;
+    self->ctx->user = NULL;
     return 0;
 }
 
@@ -381,14 +375,15 @@ static PyObject* QihseDB_auth_destroy_user(QihseDBObject *self, PyObject *args) 
     if (!PyArg_ParseTuple(args, "I", &user_id)) {
         return NULL;
     }
-    if (!self->current_user || self->current_user->role != QIHSE_ROLE_OPERATOR) {
+    if (!self->current_user || qihse_user_get_role(self->current_user) != QIHSE_ROLE_OPERATOR) {
         PyErr_SetString(PyExc_PermissionError, "Operator authentication required");
         return NULL;
     }
     
-    // Natively calls into qihse_auth_destroy_user. If user_id is 0, it will invoke
-    // the interactive Y/N prompt via stdin within the C space.
-    qihse_auth_destroy_user(user_id);
+    if (!qihse_auth_destroy_user(self->current_user, user_id)) {
+        PyErr_SetString(PyExc_PermissionError, "User destruction denied or invalid user");
+        return NULL;
+    }
     
     Py_RETURN_NONE;
 }

@@ -1,6 +1,6 @@
 # QIHSE Security Guide
 
-This guide details the security features and CNSA 2.0 alignment goals in QIHSE. **Note:** QIHSE has not yet achieved formal CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via `ctx->tls_ctx`; cleartext is the default. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the internal security review (all 24 findings remediated) and [`UWP_CRYPTO_DESIGN.md`](UWP_CRYPTO_DESIGN.md) for the encryption design.
+This guide details the security features, access control architecture, and CNSA 2.0 alignment in QIHSE. **Note:** QIHSE has not yet achieved formal third-party CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption requires certificate-backed TLS 1.3 by default for network listeners (`QIHSE_UWP_ALLOW_INSECURE=1` is required for cleartext/dev opt-in). Post-quantum cryptography (`liboqs` / `oqs-provider` with ML-DSA-87 and ML-KEM-1024) is built and enabled by default. Passwords use CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) and [`hardening-report.md`](hardening-report.md) for the audit remediation history.
 
 ## Table of Contents
 
@@ -74,14 +74,14 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 - Cryptographic log integrity
 
 #### **Network Security**
-- TLS 1.3 with post-quantum key exchange (planned — ChaCha20-Poly1305 AEAD transport encryption is implemented)
-- Mutual TLS (mTLS) for service communication (planned — not yet implemented)
+- TLS 1.3 enforced by default with post-quantum key exchange (ML-KEM-1024 / ML-DSA-87 via OpenSSL 3.5+ and oqsprovider)
+- Mutual TLS (mTLS) for service communication and client certificate verification
 - Network segmentation and isolation
-- DDoS protection and rate limiting
+- DDoS protection and centralized IP rate limiting / account lockout
 
 ## CNSA 2.0 Alignment (In Progress)
 
-> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented or planned for the `.qdb` container encryption (data at rest). Transport-layer encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) for the current security posture.
+> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented and active for `.qdb` container encryption, audit log signing, and transport encryption. See [`hardening-report.md`](hardening-report.md) for the current security posture.
 
 ### Approved Cryptographic Algorithms
 
@@ -353,8 +353,8 @@ qihse_tsdb_insert(tsdb, series_id, timestamp, value, QIHSE_CLASS_SECRET, 0);
 // Data exceeding the user's clearance is silently dropped from the query pipeline.
 double avg = qihse_tsdb_average_range_user(tsdb, start_ts, end_ts, u_operator);
 
-// 5. Cleanup
-qihse_auth_destroy_user(1001);
+// 5. Cleanup (requires canonical operator actor context)
+qihse_auth_destroy_user(u_operator, 1001);
 ```
 
 ### Hardware Token Enforcement (YubiKey / FIDO2)
@@ -362,25 +362,22 @@ qihse_auth_destroy_user(1001);
 By design, hardware token enforcement can be applied natively at the system level. 
 - **God-Mode Operators (Role 0)**: Strictly required to present a hardware token. There is no bypass for this policy.
 - **Analysts (Role 1)**: Strictly required to present a hardware token to access any data, including unclassified data.
-- **Configurability**: When creating a user via `qihse_auth_create_user`, an Operator (or a delegate with `can_create_users == true`) can define whether that specific session/account mandates hardware token authentication via the `requires_hw_token` boolean. 
+- **Configurability**: When creating a user via `qihse_auth_create_user`, an Operator (or an authorized delegate with `can_create_users == true`) can define whether that specific account mandates hardware token authentication via the `requires_hw_token` boolean. 
 
-### Delegated User Administration
+### Delegated User Administration & Privilege Invariants
 
-Instead of bottle-necking all identity management through the God-Mode Operator, the `qihse_user_t` state struct includes a `can_create_users` boolean flag. This allows the Operator to mint sub-administrators capable of managing credentials for isolated enclaves without breaking the compartmentation firewall.
+In accordance with architectural Invariant 2, **no principal may create, promote, or modify another principal to a privilege level greater than its own**.
+- `can_create_users` delegates account creation only. It does not delegate Operator authority and cannot permit creation or promotion of a principal above the creator's role, clearance, or SCI compartments.
+- Identity modifications via `bool qihse_auth_modify_user(operator_user, ...)` and account destruction via `bool qihse_auth_destroy_user(actor, ...)` mandate an authoritative operator user context, fully audited under mutex synchronization.
 
-Furthermore, QIHSE provides a master-level override mechanism:
-`bool qihse_auth_modify_user(...)`
-This routine mandates explicit `QIHSE_ROLE_OPERATOR` privileges. It allows the Operator to aggressively override the internal settings of any target user on the fly. The Operator can seamlessly manipulate aliases, inject new passwords, revoke or mandate hardware token policies, and grant or strip downstream user creation capabilities—all audited automatically beneath a thread-safe mutex. 
+### Password Policies & Storage (CNSA 2.0 / FIPS Aligned)
 
-### Password Policies
-
-Users can be instantiated with an optional password. The system will issue the following warning if the password fails complexity checks (< 6 characters), designed with military operational awareness in mind:
-
-> **[WARNING]** The password assigned to User ID X is pathetically weak (under 6 characters).
-> If an adversary is trying passwords at this terminal, you got bigger problems than a weak password.
-> If they are running brute force against it and nobody is there to stop them, your security is doing an outstanding job, keep at it.
-
-This ensures operators maintain realistic threat modeling. All passwords, regardless of length, are passed through a SHA-256 hash derivative and never stored in plaintext within the `qihse_user_t` state struct.
+Passwords require a minimum length of 12 characters and are stored using **PBKDF2-HMAC-SHA-384** (NIST SP 800-132 / CNSA 2.0):
+- **Salt**: 128-bit (16-byte) per-user cryptographically random salt generated via `RAND_bytes`.
+- **Iterations**: Configurable with a default production floor of 600,000 iterations.
+- **Verification**: Constant-time comparison using `CRYPTO_memcmp`.
+- **Memory Erasure**: Sensitive plaintext and intermediate buffers are purged with `OPENSSL_cleanse` and locked via `mlock`.
+- **Optional Pepper**: Configurable via `QIHSE_AUTH_PEPPER`.
 
 ### Role-Based Access Control (RBAC)
 

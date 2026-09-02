@@ -496,7 +496,7 @@ void qihse_ch_result_set_null(qihse_ch_result_t* r, size_t row, size_t col) {
 qihse_ch_catalog_t* qihse_ch_catalog_create(void) {
     qihse_ch_catalog_t* cat = (qihse_ch_catalog_t*)calloc(1, sizeof(qihse_ch_catalog_t));
     if (!cat) return NULL;
-    strcpy(cat->current_database, "default");
+    snprintf(cat->current_database, sizeof(cat->current_database), "%s", "default");
     pthread_mutex_init(&cat->lock, NULL);
     return cat;
 }

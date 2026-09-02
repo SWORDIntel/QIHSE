@@ -4,10 +4,11 @@ import os
 import shutil
 import threading
 import time
+import subprocess
 import numpy as np
 
 from qihse.kv import KVStore
-from qihse.core import VectorDB, DistanceMetric
+from qihse.core import VectorDB, DistanceMetric, _lib
 from qihse.document import DocumentStore
 from qihse.timeseries import TimeSeriesDB
 from qihse.uwp import UWPServer
@@ -94,11 +95,23 @@ class TestQIHSEEngines(unittest.TestCase):
                 self.assertTrue(doc_store.insert_json(2, '{"value": 42}'))
 
     def test_uwp_server(self):
-        # We start the server on a background thread since it likely blocks
-        # and we use a random high port to avoid conflicts.
+        # Bootstrap operator password away from default
+        _lib.qihse_auth_bootstrap_operator(b"TestOperatorPass123!")
+
+        # Generate temporary TLS certificate for testing
+        cert_file = os.path.join(self.temp_dir, "test_cert.pem")
+        key_file = os.path.join(self.temp_dir, "test_key.pem")
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+             "-keyout", key_file, "-out", cert_file,
+             "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
         def run_server():
             with KVStore() as kv:
-                UWPServer.start(port=18472, bind_address="127.0.0.1", kv=kv)
+                UWPServer.start(port=18472, bind_address="127.0.0.1", kv=kv,
+                                tls_cert=cert_file, tls_key=key_file)
                 
         server_thread = threading.Thread(target=run_server, daemon=True)
         server_thread.start()

@@ -2568,15 +2568,15 @@ static uint64_t qihse_vdb_cache_hash_query(
     h *= 1099511628211ULL;
     h ^= (uint64_t)metric;
     h *= 1099511628211ULL;
-    h ^= user ? (uint64_t)user->user_id : UINT64_MAX;
+    h ^= user ? (uint64_t)qihse_user_get_id(user) : UINT64_MAX;
     h *= 1099511628211ULL;
-    h ^= user ? (uint64_t)user->role : UINT64_MAX;
+    h ^= user ? (uint64_t)qihse_user_get_role(user) : UINT64_MAX;
     h *= 1099511628211ULL;
-    h ^= user ? (uint64_t)user->classification_level : UINT64_MAX;
+    h ^= user ? (uint64_t)qihse_user_get_classification(user) : UINT64_MAX;
     h *= 1099511628211ULL;
-    h ^= user ? (uint64_t)user->sci_compartments : UINT64_MAX;
+    h ^= user ? (uint64_t)qihse_user_get_sci(user) : UINT64_MAX;
     h *= 1099511628211ULL;
-    h ^= user && user->hardware_token_present ? 1ULL : 0ULL;
+    h ^= user && qihse_user_has_hardware_token(user) ? 1ULL : 0ULL;
     h *= 1099511628211ULL;
     return h;
 }

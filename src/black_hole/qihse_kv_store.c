@@ -157,7 +157,7 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                 if (fread(&val_len, sizeof(val_len), 1, f) != 1) break;
                 if (fread(&classif, sizeof(classif), 1, f) != 1) break;
                 if (fread(&sci, sizeof(sci), 1, f) != 1) break;
-                if (key_len == 0 || key_len > 1048576 || val_len > 16777216) break;
+                if (key_len == 0 || val_len > 16777216) break;
                 char* key_buf = (char*)malloc(key_len + 1);
                 char* val_buf = (char*)malloc(val_len + 1);
                 if (!key_buf || !val_buf) { free(key_buf); free(val_buf); break; }

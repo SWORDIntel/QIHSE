@@ -150,10 +150,16 @@ _lib.qihse_vector_db_get_dims.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_get_dims.restype = ctypes.c_size_t
 
 _lib.qihse_auth_init.argtypes = []
-_lib.qihse_auth_init.restype = ctypes.c_bool
+_lib.qihse_auth_init.restype = None
 
 _lib.qihse_auth_get_user.argtypes = [ctypes.c_uint32]
 _lib.qihse_auth_get_user.restype = ctypes.c_void_p
+
+_lib.qihse_auth_bootstrap_operator.argtypes = [ctypes.c_char_p]
+_lib.qihse_auth_bootstrap_operator.restype = ctypes.c_bool
+
+_lib.qihse_auth_is_operator_password_default.argtypes = []
+_lib.qihse_auth_is_operator_password_default.restype = ctypes.c_bool
 
 _lib.qihse_auth_init()
 
