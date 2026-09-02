@@ -198,7 +198,7 @@ Current defaults and reviewed controls include:
 - authentication and authorization across all database and wire-protocol paths;
 - **certificate-backed TLS 1.3 required by default for the UWP network listener**;
 - cleartext and legacy clear transports available only through explicit `QIHSE_UWP_ALLOW_INSECURE=1` opt-in;
-- **CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384** password verification (128-bit salt, 600,000 iterations);
+- **CNSA 2.0 / FIPS-aligned password-verifier profile using PBKDF2-HMAC-SHA-384** (128-bit random salt, strict 600,000 production iteration floor, and fail-closed FIPS mode);
 - **discrete object ACL flags (`READ`, `WRITE`, `ADMIN`)** enforced on all mutation paths;
 - **authoritative opaque user security context** preventing caller-side privilege or role tampering;
 - **post-quantum cryptography built by default** via `liboqs` and `oqs-provider`, with `ML-DSA-87` digital signatures and `ML-KEM-1024` key encapsulation;

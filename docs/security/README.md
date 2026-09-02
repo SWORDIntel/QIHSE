@@ -370,12 +370,14 @@ In accordance with architectural Invariant 2, **no principal may create, promote
 - `can_create_users` delegates account creation only. It does not delegate Operator authority and cannot permit creation or promotion of a principal above the creator's role, clearance, or SCI compartments.
 - Identity modifications via `bool qihse_auth_modify_user(operator_user, ...)` and account destruction via `bool qihse_auth_destroy_user(actor, ...)` mandate an authoritative operator user context, fully audited under mutex synchronization.
 
-### Password Policies & Storage (CNSA 2.0 / FIPS Aligned)
+### CNSA 2.0 / FIPS-Aligned Password-Verifier Profile (PBKDF2-HMAC-SHA-384)
 
-Passwords require a minimum length of 12 characters and are stored using **PBKDF2-HMAC-SHA-384** (NIST SP 800-132 / CNSA 2.0):
+Passwords require a minimum length of 12 characters and use a **CNSA 2.0 / FIPS-aligned password-verifier profile using PBKDF2-HMAC-SHA-384** (combining NIST SP 800-132 password derivation with the CNSA 2.0-approved SHA-384 hash function):
 - **Salt**: 128-bit (16-byte) per-user cryptographically random salt generated via `RAND_bytes`.
-- **Iterations**: Configurable with a default production floor of 600,000 iterations.
-- **Verification**: Constant-time comparison using `CRYPTO_memcmp`.
+- **Iteration Work Factor**: Enforces a strict runtime production floor of 600,000 iterations (`QIHSE_PW_MIN_ITERATIONS`), rejecting below-policy iteration counts. Compile-time overrides (`QIHSE_TESTING`) are restricted strictly to testing harnesses.
+- **Metadata Validation**: Version and algorithm IDs (`QIHSE_PW_VERIFIER_VERSION_1`, `QIHSE_PW_ALG_PBKDF2_HMAC_SHA384`) are verified on every authentication attempt.
+- **FIPS Fail-Closed Mode**: When `QIHSE_FIPS_MODE=required` is set, `qihse_auth_init()` binds the OpenSSL `fips` and `base` providers, activates `fips=yes`, and fails closed immediately if the validated provider is absent or disabled.
+- **Verification**: Constant-time comparison using `CRYPTO_memcmp` with validated `HMAC` execution.
 - **Memory Erasure**: Sensitive plaintext and intermediate buffers are purged with `OPENSSL_cleanse` and locked via `mlock`.
 - **Optional Pepper**: Configurable via `QIHSE_AUTH_PEPPER`.
 

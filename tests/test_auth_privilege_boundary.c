@@ -7,7 +7,21 @@
 #include "core/qihse_auth_internal.h"
 
 int main(void) {
-    qihse_auth_init();
+    /* --- Validation: QIHSE_FIPS_MODE=required genuinely fails closed --- */
+    setenv("QIHSE_FIPS_MODE", "required", 1);
+    bool fips_init_res = qihse_auth_init();
+    if (!fips_init_res) {
+        /* OpenSSL FIPS provider not present: must fail closed */
+        assert(qihse_auth_get_user(0) == NULL);
+        assert(qihse_auth_authenticate("GODMODE_OP", "anypassword123") == NULL);
+        assert(!qihse_auth_can_access(NULL, 1, 0));
+        printf("[PASS] QIHSE_FIPS_MODE=required fails closed when FIPS provider is missing\n");
+    } else {
+        printf("[PASS] QIHSE_FIPS_MODE=required initialized with active FIPS provider\n");
+    }
+    unsetenv("QIHSE_FIPS_MODE");
+
+    assert(qihse_auth_init());
 
     qihse_user_t* operator_user = qihse_auth_get_user(0);
     assert(operator_user != NULL);
@@ -178,6 +192,51 @@ int main(void) {
     /* Username authenticate MUST ALSO FAIL due to shared user lockout */
     assert(qihse_auth_authenticate("User_60", "RateTargetPass1!") == NULL);
     printf("[PASS] Every authentication API shares rate limiting and lockout\n");
+
+    /* Reset rate limiter for subsequent independent tests */
+    qihse_auth_init_rate_limiter(10, 60, 1024);
+
+    /* --- Validation: Verifier metadata rejection (version, algorithm, iterations) --- */
+    qihse_password_verifier_t test_verifier;
+    assert(qihse_password_compute("MetaTargetPass1!", 0, &test_verifier));
+
+    /* Baseline verification succeeds */
+    assert(qihse_password_verify("MetaTargetPass1!", &test_verifier));
+
+    /* Wrong password fails */
+    assert(!qihse_password_verify("WrongPassword123!", &test_verifier));
+
+    /* Corrupt version -> verification must fail */
+    test_verifier.version = 99;
+    assert(!qihse_password_verify("MetaTargetPass1!", &test_verifier));
+    test_verifier.version = QIHSE_PW_VERIFIER_VERSION_1;
+
+    /* Corrupt algorithm -> verification must fail */
+    test_verifier.algorithm = 99;
+    assert(!qihse_password_verify("MetaTargetPass1!", &test_verifier));
+    test_verifier.algorithm = QIHSE_PW_ALG_PBKDF2_HMAC_SHA384;
+
+    /* Below minimum iterations -> verification must fail */
+    test_verifier.iterations = 10;
+    assert(!qihse_password_verify("MetaTargetPass1!", &test_verifier));
+    printf("[PASS] Verifier metadata validation (version, algorithm, iterations) enforced\n");
+
+    /* --- Validation: Malformed and out-of-range QIHSE_PW_ITERATIONS rejected --- */
+    setenv("QIHSE_PW_ITERATIONS", "invalid_iters", 1);
+    assert(qihse_auth_create_user(operator_user, 71, QIHSE_ROLE_GUEST, 0, 0, "TestPass12345!", false) == NULL);
+
+    setenv("QIHSE_PW_ITERATIONS", "100", 1); /* Below minimum floor even in testing */
+    assert(qihse_auth_create_user(operator_user, 72, QIHSE_ROLE_GUEST, 0, 0, "TestPass12345!", false) == NULL);
+
+#ifndef QIHSE_TESTING
+    /* In production builds, 1,000 iterations must be strictly rejected */
+    setenv("QIHSE_PW_ITERATIONS", "1000", 1);
+    assert(qihse_auth_create_user(operator_user, 73, QIHSE_ROLE_GUEST, 0, 0, "TestPass12345!", false) == NULL);
+    printf("[PASS] 600,000 production iteration floor strictly enforced\n");
+#endif
+
+    unsetenv("QIHSE_PW_ITERATIONS");
+    printf("[PASS] Malformed and below-policy QIHSE_PW_ITERATIONS rejected\n");
 
     puts("\nALL privilege-boundary and authorization regression tests PASSED!");
     return 0;
