@@ -7,11 +7,14 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
+#include <openssl/provider.h>
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
@@ -107,25 +110,48 @@ static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t active_user_count = 0;
 static auth_rate_limit_t rate_limits[MAX_USERS];
 
+#ifdef QIHSE_TESTING
+#define QIHSE_PW_MIN_ALLOWED_ITERATIONS 1000u
+#else
+#define QIHSE_PW_MIN_ALLOWED_ITERATIONS QIHSE_PW_MIN_ITERATIONS
+#endif
+
 static uint32_t get_password_iterations(void) {
     const char* env = getenv("QIHSE_PW_ITERATIONS");
     if (env) {
-        long v = strtol(env, NULL, 10);
-        if (v >= 1000) return (uint32_t)v;
+        char* endptr = NULL;
+        errno = 0;
+        long v = strtol(env, &endptr, 10);
+        if (errno != 0 || endptr == env || *endptr != '\0') {
+            fprintf(stderr, "[SECURITY ERROR] Malformed QIHSE_PW_ITERATIONS environment variable.\n");
+            return 0;
+        }
+        if (v < (long)QIHSE_PW_MIN_ALLOWED_ITERATIONS || v > (long)INT_MAX) {
+            fprintf(stderr,
+                    "[SECURITY ERROR] QIHSE_PW_ITERATIONS outside permitted range (minimum %u).\n",
+                    QIHSE_PW_MIN_ALLOWED_ITERATIONS);
+            return 0;
+        }
+        return (uint32_t)v;
     }
     return QIHSE_PW_MIN_ITERATIONS;
 }
 
-static bool compute_password_verifier(const char* password,
-                                      uint32_t iterations,
-                                      qihse_password_verifier_t* out_verifier) {
+bool qihse_password_compute(const char* password,
+                            uint32_t iterations,
+                            qihse_password_verifier_t* out_verifier) {
     if (!password || !out_verifier) return false;
     size_t pw_len = strlen(password);
     if (pw_len < 12) return false;
 
-    out_verifier->version = 1;
-    out_verifier->algorithm = 1; /* PBKDF2-HMAC-SHA384 */
-    out_verifier->iterations = iterations ? iterations : get_password_iterations();
+    uint32_t iters = iterations ? iterations : get_password_iterations();
+    if (iters < QIHSE_PW_MIN_ALLOWED_ITERATIONS || iters > (uint32_t)INT_MAX) {
+        return false;
+    }
+
+    out_verifier->version = QIHSE_PW_VERIFIER_VERSION_1;
+    out_verifier->algorithm = QIHSE_PW_ALG_PBKDF2_HMAC_SHA384;
+    out_verifier->iterations = iters;
 
     if (RAND_bytes(out_verifier->salt, QIHSE_PW_SALT_BYTES) != 1) {
         return false;
@@ -144,9 +170,14 @@ static bool compute_password_verifier(const char* password,
     const char* pepper = getenv("QIHSE_AUTH_PEPPER");
     if (pepper && strlen(pepper) > 0) {
         unsigned int hmac_len = 0;
-        HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
-             intermediate, sizeof(intermediate),
-             out_verifier->verifier, &hmac_len);
+        if (HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
+                 intermediate, sizeof(intermediate),
+                 out_verifier->verifier, &hmac_len) == NULL ||
+            hmac_len != QIHSE_PW_HASH_BYTES) {
+            OPENSSL_cleanse(intermediate, sizeof(intermediate));
+            OPENSSL_cleanse(out_verifier->verifier, sizeof(out_verifier->verifier));
+            return false;
+        }
     } else {
         memcpy(out_verifier->verifier, intermediate, sizeof(intermediate));
     }
@@ -154,9 +185,15 @@ static bool compute_password_verifier(const char* password,
     return true;
 }
 
-static bool verify_password(const char* password,
-                            const qihse_password_verifier_t* verifier) {
-    if (!password || !verifier || verifier->iterations == 0) return false;
+bool qihse_password_verify(const char* password,
+                           const qihse_password_verifier_t* verifier) {
+    if (!password || !verifier) return false;
+    if (verifier->version != QIHSE_PW_VERIFIER_VERSION_1 ||
+        verifier->algorithm != QIHSE_PW_ALG_PBKDF2_HMAC_SHA384 ||
+        verifier->iterations < QIHSE_PW_MIN_ALLOWED_ITERATIONS ||
+        verifier->iterations > (uint32_t)INT_MAX) {
+        return false;
+    }
     size_t pw_len = strlen(password);
 
     uint8_t intermediate[QIHSE_PW_HASH_BYTES];
@@ -173,9 +210,14 @@ static bool verify_password(const char* password,
     const char* pepper = getenv("QIHSE_AUTH_PEPPER");
     if (pepper && strlen(pepper) > 0) {
         unsigned int hmac_len = 0;
-        HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
-             intermediate, sizeof(intermediate),
-             expected, &hmac_len);
+        if (HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
+                 intermediate, sizeof(intermediate),
+                 expected, &hmac_len) == NULL ||
+            hmac_len != QIHSE_PW_HASH_BYTES) {
+            OPENSSL_cleanse(intermediate, sizeof(intermediate));
+            OPENSSL_cleanse(expected, sizeof(expected));
+            return false;
+        }
     } else {
         memcpy(expected, intermediate, sizeof(intermediate));
     }
@@ -184,6 +226,17 @@ static bool verify_password(const char* password,
     int match = CRYPTO_memcmp(expected, verifier->verifier, sizeof(expected));
     OPENSSL_cleanse(expected, sizeof(expected));
     return match == 0;
+}
+
+static inline bool compute_password_verifier(const char* password,
+                                             uint32_t iterations,
+                                             qihse_password_verifier_t* out_verifier) {
+    return qihse_password_compute(password, iterations, out_verifier);
+}
+
+static inline bool verify_password(const char* password,
+                                   const qihse_password_verifier_t* verifier) {
+    return qihse_password_verify(password, verifier);
 }
 
 /* auth_mutex must be held. */
@@ -217,6 +270,16 @@ static void set_authz_state_locked(uint32_t user_id, const qihse_user_t* user) {
 static bool check_fips_compliance(void) {
     const char* fips_env = getenv("QIHSE_FIPS_MODE");
     if (fips_env && (strcmp(fips_env, "1") == 0 || strcasecmp(fips_env, "required") == 0)) {
+        OSSL_PROVIDER *base = OSSL_PROVIDER_load(NULL, "base");
+        OSSL_PROVIDER *fips = OSSL_PROVIDER_load(NULL, "fips");
+        if (!base || !fips) {
+            fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but FIPS/base provider failed to load in OpenSSL.\n");
+            return false;
+        }
+        if (EVP_default_properties_enable_fips(NULL, 1) != 1) {
+            fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but EVP_default_properties_enable_fips failed.\n");
+            return false;
+        }
         if (!EVP_default_properties_is_fips_enabled(NULL)) {
             fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but FIPS provider is not active in OpenSSL.\n");
             return false;
@@ -225,9 +288,28 @@ static bool check_fips_compliance(void) {
     return true;
 }
 
-void qihse_auth_init(void) {
+bool qihse_auth_init(void) {
+    if (!check_fips_compliance()) {
+        pthread_mutex_lock(&auth_mutex);
+        for (uint32_t i = 0; i < MAX_USERS; i++) {
+            if (users[i]) {
+                OPENSSL_cleanse(users[i], sizeof(qihse_user_t));
+#ifndef _WIN32
+                munlock(users[i], sizeof(qihse_user_t));
+#endif
+                free(users[i]);
+                users[i] = NULL;
+            }
+        }
+        memset(users, 0, sizeof(users));
+        memset(authz_states, 0, sizeof(authz_states));
+        memset(rate_limits, 0, sizeof(rate_limits));
+        active_user_count = 0;
+        pthread_mutex_unlock(&auth_mutex);
+        return false;
+    }
+
     qihse_audit_init();
-    check_fips_compliance();
 
     pthread_mutex_lock(&auth_mutex);
     for (uint32_t i = 0; i < MAX_USERS; i++) {
@@ -277,6 +359,7 @@ void qihse_auth_init(void) {
     }
 
     pthread_mutex_unlock(&auth_mutex);
+    return true;
 }
 
 bool qihse_auth_bootstrap_operator(const char* initial_password) {

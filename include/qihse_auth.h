@@ -18,9 +18,11 @@ extern "C" {
 
 // CNSA 2.0 / FIPS-aligned PBKDF2 Password Parameters
 #define QIHSE_PW_ALGORITHM       "PBKDF2-HMAC-SHA384"
+#define QIHSE_PW_VERIFIER_VERSION_1 1u
+#define QIHSE_PW_ALG_PBKDF2_HMAC_SHA384 1u
 #define QIHSE_PW_SALT_BYTES      16
 #define QIHSE_PW_HASH_BYTES      48
-#define QIHSE_PW_MIN_ITERATIONS  600000
+#define QIHSE_PW_MIN_ITERATIONS  600000u
 
 #define QIHSE_AUTH_USERNAME_MAX  64
 #define QIHSE_OBJECT_ACL_MAX_ENTRIES 64
@@ -37,8 +39,8 @@ typedef struct qihse_acl_entry_s {
 // Opaque user handle. Internal representation is isolated in core/qihse_auth_internal.h.
 typedef struct qihse_user_s qihse_user_t;
 
-// Global Auth Context
-void qihse_auth_init(void);
+// Global Auth Context. Returns true on success; returns false and fails closed if FIPS/crypto policies fail.
+bool qihse_auth_init(void);
 
 // Bootstrap system operator with explicit password.
 bool qihse_auth_bootstrap_operator(const char* initial_password);

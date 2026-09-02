@@ -12,12 +12,14 @@ A comprehensive multi-pass security audit and verification identified and remedi
 - All `strtok` replaced with reentrant `strtok_r`
 - Zero unsafe function calls remain in production code
 
-### Cryptographic Hygiene & Password Storage (CNSA 2.0 / FIPS 140-3 Aligned)
-- Upgraded password verifiers to **PBKDF2-HMAC-SHA-384**:
-  - Algorithm: PBKDF2 with HMAC-SHA-384 digest
+### Cryptographic Hygiene & Password Storage (CNSA 2.0 / FIPS-Aligned Profile)
+- Upgraded password verifiers to **CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384**:
+  - Algorithm: PBKDF2 (NIST SP 800-132) with CNSA 2.0-approved HMAC-SHA-384 digest
   - Salt: 128-bit (16 bytes) cryptographically secure random salt generated via `RAND_bytes` DRBG
-  - Work factor: Default floor of 600,000 iterations (configurable/calibrated)
-  - Optional server-side pepper key via `QIHSE_AUTH_PEPPER`
+  - Work factor: Strict production runtime floor of 600,000 iterations (`QIHSE_PW_MIN_ITERATIONS`), rejecting downgrades; test overrides restricted to `-DQIHSE_TESTING`
+  - FIPS Mode Fail-Closed: `QIHSE_FIPS_MODE=required` explicitly binds `base` and `fips` providers, validates `fips=yes`, and genuinely fails closed if unavailable
+  - Verifier Metadata Validation: Enforces version (`QIHSE_PW_VERIFIER_VERSION_1`) and algorithm (`QIHSE_PW_ALG_PBKDF2_HMAC_SHA384`) checks on verification
+  - Optional server-side pepper key via `QIHSE_AUTH_PEPPER` with checked `HMAC` execution
   - Constant-time verification using `CRYPTO_memcmp`
   - Temporary password/verifier buffers cleansed immediately via `OPENSSL_cleanse`
 - Container integrity protected via **HMAC-SHA-384**
