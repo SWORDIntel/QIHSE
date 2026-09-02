@@ -106,9 +106,19 @@ typedef struct {
 
 static qihse_user_t* users[MAX_USERS];
 static authz_state_t authz_states[MAX_USERS];
-static pthread_mutex_t auth_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t auth_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t active_user_count = 0;
 static auth_rate_limit_t rate_limits[MAX_USERS];
+
+static EVP_MD* g_cached_sha384 = NULL;
+static pthread_once_t g_evp_fetch_once = PTHREAD_ONCE_INIT;
+static void fetch_evp_algorithms(void) {
+    g_cached_sha384 = EVP_MD_fetch(NULL, "SHA-384", NULL);
+}
+static const EVP_MD* get_sha384_md(void) {
+    pthread_once(&g_evp_fetch_once, fetch_evp_algorithms);
+    return g_cached_sha384 ? g_cached_sha384 : EVP_sha384();
+}
 
 #ifdef QIHSE_TESTING
 #define QIHSE_PW_MIN_ALLOWED_ITERATIONS 1000u
@@ -161,7 +171,7 @@ bool qihse_password_compute(const char* password,
     if (PKCS5_PBKDF2_HMAC(password, (int)pw_len,
                           out_verifier->salt, QIHSE_PW_SALT_BYTES,
                           (int)out_verifier->iterations,
-                          EVP_sha384(),
+                          get_sha384_md(),
                           sizeof(intermediate), intermediate) != 1) {
         OPENSSL_cleanse(intermediate, sizeof(intermediate));
         return false;
@@ -170,7 +180,7 @@ bool qihse_password_compute(const char* password,
     const char* pepper = getenv("QIHSE_AUTH_PEPPER");
     if (pepper && strlen(pepper) > 0) {
         unsigned int hmac_len = 0;
-        if (HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
+        if (HMAC(get_sha384_md(), pepper, (int)strlen(pepper),
                  intermediate, sizeof(intermediate),
                  out_verifier->verifier, &hmac_len) == NULL ||
             hmac_len != QIHSE_PW_HASH_BYTES) {
@@ -200,7 +210,7 @@ bool qihse_password_verify(const char* password,
     if (PKCS5_PBKDF2_HMAC(password, (int)pw_len,
                           verifier->salt, QIHSE_PW_SALT_BYTES,
                           (int)verifier->iterations,
-                          EVP_sha384(),
+                          get_sha384_md(),
                           sizeof(intermediate), intermediate) != 1) {
         OPENSSL_cleanse(intermediate, sizeof(intermediate));
         return false;
@@ -210,7 +220,7 @@ bool qihse_password_verify(const char* password,
     const char* pepper = getenv("QIHSE_AUTH_PEPPER");
     if (pepper && strlen(pepper) > 0) {
         unsigned int hmac_len = 0;
-        if (HMAC(EVP_sha384(), pepper, (int)strlen(pepper),
+        if (HMAC(get_sha384_md(), pepper, (int)strlen(pepper),
                  intermediate, sizeof(intermediate),
                  expected, &hmac_len) == NULL ||
             hmac_len != QIHSE_PW_HASH_BYTES) {
@@ -239,17 +249,16 @@ static inline bool verify_password(const char* password,
     return qihse_password_verify(password, verifier);
 }
 
-/* auth_mutex must be held. */
+/* auth_rwlock must be held (read or write). */
 static bool resolve_authoritative_user_locked(const qihse_user_t* presented,
                                               uint32_t* out_user_id,
                                               authz_state_t* out_state) {
     if (!presented) return false;
-    for (uint32_t i = 0; i < MAX_USERS; i++) {
-        if (users[i] == presented && authz_states[i].active) {
-            if (out_user_id) *out_user_id = i;
-            if (out_state) *out_state = authz_states[i];
-            return true;
-        }
+    uint32_t uid = presented->user_id;
+    if (uid < MAX_USERS && users[uid] == presented && authz_states[uid].active) {
+        if (out_user_id) *out_user_id = uid;
+        if (out_state) *out_state = authz_states[uid];
+        return true;
     }
     return false;
 }
@@ -290,7 +299,7 @@ static bool check_fips_compliance(void) {
 
 bool qihse_auth_init(void) {
     if (!check_fips_compliance()) {
-        pthread_mutex_lock(&auth_mutex);
+        pthread_rwlock_wrlock(&auth_rwlock);
         for (uint32_t i = 0; i < MAX_USERS; i++) {
             if (users[i]) {
                 OPENSSL_cleanse(users[i], sizeof(qihse_user_t));
@@ -305,13 +314,13 @@ bool qihse_auth_init(void) {
         memset(authz_states, 0, sizeof(authz_states));
         memset(rate_limits, 0, sizeof(rate_limits));
         active_user_count = 0;
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     qihse_audit_init();
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     for (uint32_t i = 0; i < MAX_USERS; i++) {
         if (users[i]) {
             OPENSSL_cleanse(users[i], sizeof(qihse_user_t));
@@ -358,42 +367,42 @@ bool qihse_auth_init(void) {
         active_user_count = 1;
     }
 
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
 
 bool qihse_auth_bootstrap_operator(const char* initial_password) {
     if (!initial_password || strlen(initial_password) < 12) return false;
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     if (!users[0] || !authz_states[0].active) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
     if (authz_states[0].password_set) {
         // Already bootstrapped; must rotate through modify_user with operator credentials
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     if (!compute_password_verifier(initial_password, 0, &users[0]->verifier)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
     users[0]->password_set = true;
     authz_states[0].verifier = users[0]->verifier;
     authz_states[0].password_set = true;
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
 
 bool qihse_auth_is_operator_password_default(void) {
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     bool is_default = true;
     if (users[0] && authz_states[0].active) {
         is_default = !authz_states[0].password_set;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return is_default;
 }
 
@@ -407,12 +416,12 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
         return NULL;
     }
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
 
     // Operator password must be set before creating other users
     if (user_id != 0 && !authz_states[0].password_set) {
         fprintf(stderr, "[SECURITY ERROR] Operator password must be configured before creating users.\n");
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
@@ -420,33 +429,33 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
     authz_state_t creator_authz;
     if (!resolve_authoritative_user_locked(creator, &creator_id, &creator_authz)) {
         qihse_audit_log("USER_CREATE_DENIED_INVALID_CREATOR", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
     // Only authoritative OPERATOR or delegated user can create new users
     if (creator_authz.role != QIHSE_ROLE_OPERATOR && !creator_authz.can_create_users) {
         qihse_audit_log("USER_CREATE_DENIED_DELEGATION", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
     // Principal cannot create a principal above itself
     if (role < creator_authz.role) {
         qihse_audit_log("USER_CREATE_DENIED_ROLE", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
     // Creator must possess the clearance they attempt to grant
     if (classif > creator_authz.classification_level) {
         qihse_audit_log("USER_CREATE_DENIED_CLEARANCE", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
     if ((sci & creator_authz.sci_compartments) != sci) {
         qihse_audit_log("USER_CREATE_DENIED_SCI", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
@@ -454,18 +463,18 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
     if (creator_authz.role != QIHSE_ROLE_OPERATOR &&
         creator_authz.requires_hardware_token && !requires_hw_token) {
         qihse_audit_log("USER_CREATE_DENIED_TOKEN_POLICY", creator_id, user_id, classif, sci);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
     if (users[user_id] != NULL) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
     qihse_user_t* u = calloc(1, sizeof(qihse_user_t));
     if (!u) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
@@ -482,7 +491,7 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 
     if (!compute_password_verifier(plaintext_password, 0, &u->verifier)) {
         free(u);
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
     u->password_set = true;
@@ -498,30 +507,30 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 #endif
 
     qihse_audit_log("USER_CREATE", creator_id, user_id, u->classification_level, u->sci_compartments);
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return u;
 }
 
 qihse_user_t* qihse_auth_get_user(uint32_t user_id) {
     if (user_id >= MAX_USERS) return NULL;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     qihse_user_t* u = NULL;
     if (authz_states[user_id].active) {
         u = users[user_id];
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return u;
 }
 
 bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id) {
     if (target_user_id >= MAX_USERS) return false;
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     uint32_t actor_id = 0xFFFFFFFFu;
     authz_state_t actor_authz;
     if (!resolve_authoritative_user_locked(actor, &actor_id, &actor_authz) ||
         actor_authz.role != QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("USER_DESTROY_DENIED", actor_id, target_user_id, 0, 0);
         return false;
     }
@@ -529,7 +538,7 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
     if (target_user_id == 0) {
         const char* allow_kill = getenv("QIHSE_ALLOW_DESTROY_OPERATOR");
         if (!allow_kill || strcmp(allow_kill, "1") != 0) {
-            pthread_mutex_unlock(&auth_mutex);
+            pthread_rwlock_unlock(&auth_rwlock);
             return false;
         }
     }
@@ -547,11 +556,11 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
         memset(&authz_states[target_user_id], 0, sizeof(authz_states[target_user_id]));
         memset(&rate_limits[target_user_id], 0, sizeof(rate_limits[target_user_id]));
         active_user_count--;
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return true;
     }
 
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return false;
 }
 
@@ -564,25 +573,25 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
         return false;
     }
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     uint32_t operator_id = 0xFFFFFFFFu;
     authz_state_t operator_authz;
     if (!resolve_authoritative_user_locked(operator_user, &operator_id, &operator_authz) ||
         operator_authz.role != QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("USER_MODIFY_DENIED", operator_id, target_user_id, 0, 0);
         return false;
     }
 
     if (target_user_id != 0 && !authz_states[0].password_set) {
         fprintf(stderr, "[SECURITY ERROR] Operator password must be set before modifying other users.\n");
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     qihse_user_t* target = users[target_user_id];
     if (!target || !authz_states[target_user_id].active) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
@@ -593,7 +602,7 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
 
     if (new_password != NULL) {
         if (!compute_password_verifier(new_password, 0, &target->verifier)) {
-            pthread_mutex_unlock(&auth_mutex);
+            pthread_rwlock_unlock(&auth_rwlock);
             return false;
         }
         target->password_set = true;
@@ -616,16 +625,16 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
     qihse_audit_log("USER_MODIFY", operator_id, target_user_id,
                     authz_states[target_user_id].classification_level,
                     authz_states[target_user_id].sci_compartments);
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
 
 bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char* credential_id) {
     if (!user) return false;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     uint32_t uid = 0xFFFFFFFF;
     if (!resolve_authoritative_user_locked(user, &uid, NULL)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
     user->hardware_token_present = present;
@@ -634,7 +643,7 @@ bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char*
         strncpy(user->fido2_credential_id, credential_id, sizeof(user->fido2_credential_id) - 1);
         user->fido2_credential_id[sizeof(user->fido2_credential_id) - 1] = '\0';
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
 
@@ -642,9 +651,9 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
     if (data_classif > 0) {
         uint32_t uid = 0xFFFFFFFF;
         if (user) {
-            pthread_mutex_lock(&auth_mutex);
+            pthread_rwlock_rdlock(&auth_rwlock);
             resolve_authoritative_user_locked(user, &uid, NULL);
-            pthread_mutex_unlock(&auth_mutex);
+            pthread_rwlock_unlock(&auth_rwlock);
         }
         qihse_audit_webhook_ping(uid, data_classif, data_sci);
     }
@@ -659,25 +668,25 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
         return true; /* Unclassified data allowed when unauthenticated */
     }
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid = 0xFFFFFFFF;
     authz_state_t authz;
     if (!resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("ACCESS_DENIED_UNREGISTERED_USER", 0xFFFFFFFF, 0, data_classif, data_sci);
         return false;
     }
 
     // Hardware Token Enforcement — checked against authoritative state
     if (authz.requires_hardware_token && !authz.hardware_token_present && authz.role != QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("ACCESS_DENIED_MISSING_TOKEN", uid, 0, data_classif, data_sci);
         return false;
     }
 
     // Operator has God Mode
     if (authz.role == QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         if (data_classif > 0) {
             qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
         }
@@ -686,19 +695,19 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
 
     // Clearance Check
     if (authz.classification_level < data_classif) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("ACCESS_DENIED_CLEARANCE", uid, 0, data_classif, data_sci);
         return false;
     }
 
     // SCI Check
     if ((data_sci & authz.sci_compartments) != data_sci) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_audit_log("ACCESS_DENIED_SCI", uid, 0, data_classif, data_sci);
         return false;
     }
 
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
     return true;
 }
@@ -706,16 +715,16 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
 bool qihse_auth_can_access_object(const qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id, uint8_t required_flags) {
     if (!user || required_flags == 0) return false;
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid = 0xFFFFFFFF;
     authz_state_t authz;
     if (!resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     if (authz.role == QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return true;
     }
 
@@ -730,7 +739,7 @@ bool qihse_auth_can_access_object(const qihse_user_t* user, uint32_t namespace_i
             break;
         }
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return allowed;
 }
 
@@ -742,18 +751,18 @@ bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* ta
         return false;
     }
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     uint32_t op_id = 0xFFFFFFFF;
     authz_state_t op_authz;
     if (!resolve_authoritative_user_locked(operator_user, &op_id, &op_authz) ||
         op_authz.role != QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     uint32_t target_id = 0xFFFFFFFF;
     if (!resolve_authoritative_user_locked(target_user, &target_id, NULL)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
@@ -762,13 +771,13 @@ bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* ta
         qihse_acl_entry_t* entry = &target->object_acl[i];
         if (entry->namespace_id == namespace_id && entry->resource_id == resource_id) {
             entry->access_flags = access_flags;
-            pthread_mutex_unlock(&auth_mutex);
+            pthread_rwlock_unlock(&auth_rwlock);
             return true;
         }
     }
 
     if (target->object_acl_count >= QIHSE_OBJECT_ACL_MAX_ENTRIES) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
@@ -776,7 +785,7 @@ bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* ta
     entry->namespace_id = namespace_id;
     entry->resource_id = resource_id;
     entry->access_flags = access_flags;
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
 
@@ -784,18 +793,18 @@ bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* t
                               uint32_t namespace_id, uint64_t resource_id) {
     if (!operator_user || !target_user) return false;
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     uint32_t op_id = 0xFFFFFFFF;
     authz_state_t op_authz;
     if (!resolve_authoritative_user_locked(operator_user, &op_id, &op_authz) ||
         op_authz.role != QIHSE_ROLE_OPERATOR) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
     uint32_t target_id = 0xFFFFFFFF;
     if (!resolve_authoritative_user_locked(target_user, &target_id, NULL)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
 
@@ -806,11 +815,11 @@ bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* t
             uint8_t last = --target->object_acl_count;
             if (i != last) target->object_acl[i] = target->object_acl[last];
             memset(&target->object_acl[last], 0, sizeof(target->object_acl[last]));
-            pthread_mutex_unlock(&auth_mutex);
+            pthread_rwlock_unlock(&auth_rwlock);
             return true;
         }
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return false;
 }
 
@@ -822,10 +831,10 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
         return NULL;
     }
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_wrlock(&auth_rwlock);
     qihse_user_t* u = users[user_id];
     if (!u || !authz_states[user_id].active || !authz_states[user_id].password_set) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
@@ -833,7 +842,7 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
     if (rate_limits[user_id].lockout_until > now) {
         fprintf(stderr, "[AUTH] User '%s' (ID %u) is locked out. Try again in %ld seconds.\n",
                 u->username, user_id, (long)(rate_limits[user_id].lockout_until - now));
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 
@@ -841,7 +850,7 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
     if (matched) {
         rate_limits[user_id].failed_count = 0;
         rate_limits[user_id].lockout_until = 0;
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         qihse_auth_rate_limit_reset(source_ip);
         return u;
     } else {
@@ -852,7 +861,7 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
             fprintf(stderr, "[AUTH] User '%s' (ID %u) locked out after %d failed attempts for %d seconds.\n",
                     u->username, user_id, MAX_AUTH_ATTEMPTS, AUTH_LOCKOUT_SECONDS);
         }
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
 }
@@ -860,7 +869,7 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
 qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* username, const char* password) {
     if (!username || !password) return NULL;
 
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t target_id = MAX_USERS;
     for (uint32_t i = 0; i < MAX_USERS; i++) {
         if (users[i] && authz_states[i].active && strcmp(users[i]->username, username) == 0) {
@@ -868,7 +877,7 @@ qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* usern
             break;
         }
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
 
     if (target_id == MAX_USERS) {
         qihse_auth_check_rate_limit(source_ip);
@@ -896,103 +905,103 @@ qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password)
 
 uint32_t qihse_user_get_id(const qihse_user_t* user) {
     if (!user) return UINT32_MAX;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid = UINT32_MAX;
     if (resolve_authoritative_user_locked(user, &uid, NULL)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return uid;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return UINT32_MAX;
 }
 
 uint16_t qihse_user_get_role(const qihse_user_t* user) {
     if (!user) return QIHSE_ROLE_GUEST;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.role;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return QIHSE_ROLE_GUEST;
 }
 
 uint16_t qihse_user_get_classification(const qihse_user_t* user) {
     if (!user) return 0;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.classification_level;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return 0;
 }
 
 uint16_t qihse_user_get_sci(const qihse_user_t* user) {
     if (!user) return 0;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.sci_compartments;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return 0;
 }
 
 const char* qihse_user_get_username(const qihse_user_t* user) {
     if (!user) return NULL;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     if (resolve_authoritative_user_locked(user, &uid, NULL)) {
         const char* name = users[uid]->username;
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return name;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return NULL;
 }
 
 bool qihse_user_has_hardware_token(const qihse_user_t* user) {
     if (!user) return false;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.hardware_token_present;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return false;
 }
 
 bool qihse_user_requires_hardware_token(const qihse_user_t* user) {
     if (!user) return false;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.requires_hardware_token;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return false;
 }
 
 bool qihse_user_can_create_users(const qihse_user_t* user) {
     if (!user) return false;
-    pthread_mutex_lock(&auth_mutex);
+    pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
     if (resolve_authoritative_user_locked(user, &uid, &authz)) {
-        pthread_mutex_unlock(&auth_mutex);
+        pthread_rwlock_unlock(&auth_rwlock);
         return authz.can_create_users;
     }
-    pthread_mutex_unlock(&auth_mutex);
+    pthread_rwlock_unlock(&auth_rwlock);
     return false;
 }
