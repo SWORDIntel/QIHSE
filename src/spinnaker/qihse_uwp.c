@@ -942,13 +942,14 @@ static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len)
 
     /* Allocate room for the 4-byte length prefix + nonce + ciphertext + tag. */
     size_t cap = len + 28;
-    uint8_t* frame = (uint8_t*)malloc(cap + 4);
+    uint8_t stack_buf[4096];
+    uint8_t* frame = (cap + 4 <= sizeof(stack_buf)) ? stack_buf : (uint8_t*)malloc(cap + 4);
     if (!frame) return -1;
 
     size_t out_len = 0;
     if (qihse_uwp_tls_encrypt(conn->tls_session, (const uint8_t*)data, len,
                               frame + 4, cap, &out_len) != 0) {
-        free(frame);
+        if (frame != stack_buf) free(frame);
         return -1;
     }
 
@@ -987,7 +988,7 @@ static ssize_t uwp_tls_write_all(uwp_conn_t* conn, const void* data, size_t len)
 #endif
     }
 
-    free(frame);
+    if (frame != stack_buf) free(frame);
     return ok ? (ssize_t)len : -1;
 }
 
@@ -1039,18 +1040,19 @@ uwp_tls_read(uwp_conn_t* conn, uint8_t* buf, size_t cap) {
     }
 
     /* Read the ciphertext record. */
-    uint8_t* cipher = (uint8_t*)malloc(rec_len);
+    uint8_t stack_cipher[4096];
+    uint8_t* cipher = (rec_len <= sizeof(stack_cipher)) ? stack_cipher : (uint8_t*)malloc(rec_len);
     if (!cipher) return -1;
     size_t got = 0;
     while (got < rec_len) {
 #ifdef _WIN32
         int r = recv(conn->fd, (char*)cipher + got, (int)(rec_len - got), 0);
-        if (r == SOCKET_ERROR) { free(cipher); errno = EAGAIN; return -1; }
-        if (r == 0) { free(cipher); errno = EAGAIN; return -1; }
+        if (r == SOCKET_ERROR) { if (cipher != stack_cipher) free(cipher); errno = EAGAIN; return -1; }
+        if (r == 0) { if (cipher != stack_cipher) free(cipher); errno = EAGAIN; return -1; }
         got += (size_t)r;
 #else
         ssize_t r = read(conn->fd, cipher + got, rec_len - got);
-        if (r <= 0) { free(cipher); errno = EAGAIN; return -1; }
+        if (r <= 0) { if (cipher != stack_cipher) free(cipher); errno = EAGAIN; return -1; }
         got += (size_t)r;
 #endif
     }
@@ -1059,11 +1061,11 @@ uwp_tls_read(uwp_conn_t* conn, uint8_t* buf, size_t cap) {
     if (qihse_uwp_tls_decrypt(conn->tls_session, cipher, rec_len,
                               conn->tls_decbuf, sizeof(conn->tls_decbuf),
                               &out_len) != 0) {
-        free(cipher);
+        if (cipher != stack_cipher) free(cipher);
         errno = EBADMSG;
         return -1;
     }
-    free(cipher);
+    if (cipher != stack_cipher) free(cipher);
 
     conn->tls_decbuf_len = out_len;
     conn->tls_decbuf_pos = 0;
