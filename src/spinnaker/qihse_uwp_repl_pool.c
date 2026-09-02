@@ -97,7 +97,7 @@ uwp_repl_result_t uwp_dispatch_repl(qihse_uwp_context_t* ctx,
     switch (command_opcode) {
         case 0x01: /* APPEND_WAL */
             if (!payload || payload_len == 0) return UWP_REPL_ERR_ARGS;
-            if (user->role != QIHSE_ROLE_OPERATOR) return UWP_REPL_ERR_FAILED;
+            if (qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR) return UWP_REPL_ERR_FAILED;
             lsn = ctx->wal
                 ? qihse_wal_current_lsn((qihse_wal_t*)ctx->wal)
                 : QIHSE_WAL_INVALID_LSN;

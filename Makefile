@@ -199,29 +199,35 @@ xdp-kern: src/networking/qihse_xdp_kern.c
 	    -o src/networking/qihse_xdp.o
 	@echo "qihse_xdp.o build successful"
 
-lib: $(LIB_TARGET)
+lib: liboqs oqs-provider $(LIB_TARGET)
 
 # ---------------------------------------------------------------------------
 # liboqs — post-quantum cryptography library (submodule)
 # ---------------------------------------------------------------------------
 liboqs:
-	@if [ -f vendor/liboqs/CMakeLists.txt ]; then \
+	@if [ ! -f vendor/liboqs/CMakeLists.txt ]; then \
+		echo "Initializing liboqs submodule..."; \
+		git submodule update --init --recursive vendor/liboqs; \
+	fi
+	@if [ -f vendor/liboqs/CMakeLists.txt ] && [ ! -f vendor/liboqs/build/lib/liboqs.so ] && [ ! -f /usr/local/lib/liboqs.so ]; then \
 		echo "Building liboqs..."; \
 		cd vendor/liboqs && mkdir -p build && cd build && \
-		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DOQS_USE_OPENSSL=OFF .. 2>&1 && \
+		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON .. 2>&1 && \
 		ninja 2>&1; (ninja install 2>&1 || true); \
 		echo "liboqs build successful"; \
-	elif [ -f /usr/local/include/oqs/oqs.h ] || [ -f /usr/include/oqs/oqs.h ]; then \
-		echo "liboqs already installed on system."; \
-	else \
-		echo "liboqs submodule not present; skipping local build"; \
+	elif [ -f /usr/local/lib/liboqs.so ] || [ -f vendor/liboqs/build/lib/liboqs.so ]; then \
+		echo "liboqs ready."; \
 	fi
 
 # ---------------------------------------------------------------------------
 # oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
 # ---------------------------------------------------------------------------
 oqs-provider: liboqs
-	@if [ -f vendor/oqs-provider/CMakeLists.txt ] && ([ -f /usr/local/lib/cmake/liboqs/liboqsConfig.cmake ] || [ -f /usr/lib/cmake/liboqs/liboqsConfig.cmake ]); then \
+	@if [ ! -f vendor/oqs-provider/CMakeLists.txt ]; then \
+		echo "Initializing oqs-provider submodule..."; \
+		git submodule update --init --recursive vendor/oqs-provider; \
+	fi
+	@if [ -f vendor/oqs-provider/CMakeLists.txt ] && [ ! -f vendor/oqs-provider/build/lib/oqsprovider.so ] && [ ! -f /usr/local/lib/ossl-modules/oqsprovider.so ]; then \
 		echo "Building oqs-provider..."; \
 		cd vendor/oqs-provider && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -229,11 +235,11 @@ oqs-provider: liboqs
 			-DOPENSSL_INCLUDE_DIR=/usr/include \
 			-DOPENSSL_CRYPTO_LIBRARY=/usr/lib/x86_64-linux-gnu/libcrypto.so \
 			-DOPENSSL_SSL_LIBRARY=/usr/lib/x86_64-linux-gnu/libssl.so \
-			-Dliboqs_DIR=/usr/local/lib/cmake/liboqs .. 2>&1 && \
-		ninja 2>&1 && (ninja install 2>&1 || true); \
+			-Dliboqs_DIR=$(if $(wildcard /usr/local/lib/cmake/liboqs/liboqsConfig.cmake),/usr/local/lib/cmake/liboqs,$(CURDIR)/vendor/liboqs/build) .. 2>&1 && \
+		ninja 2>&1; (ninja install 2>&1 || true); \
 		echo "oqs-provider build successful"; \
-	else \
-		echo "oqs-provider prerequisites not met; skipping"; \
+	elif [ -f vendor/oqs-provider/build/lib/oqsprovider.so ] || [ -f /usr/local/lib/ossl-modules/oqsprovider.so ]; then \
+		echo "oqs-provider ready."; \
 	fi
 
 CSRCS = $(filter %.c, $(SRCS))
@@ -269,6 +275,14 @@ test-graph: lib
 test-object-acl: lib
 	$(CC) $(CFLAGS) -o tests/test_object_acl tests/test_object_acl.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_object_acl
+
+test-auth-privilege-boundary: lib
+	$(CC) $(CFLAGS) -o tests/test_auth_privilege_boundary tests/test_auth_privilege_boundary.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. QIHSE_PW_ITERATIONS=1000 ./tests/test_auth_privilege_boundary
+
+test-aggregate-hardened: lib
+	$(CC) $(CFLAGS) -o tests/test_aggregate_hardened tests/test_aggregate_hardened.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aggregate_hardened
 
 test-uwp-regression: tests/test_uwp_regression
 	LD_LIBRARY_PATH=. ./tests/test_uwp_regression
@@ -319,7 +333,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-object-acl test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware
 
 test-cluster-slot: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
@@ -805,6 +819,7 @@ clean:
 	    tests/test_avx2_only tests/test_avx512_direct tests/test_amx_only \
 	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries \
 	    tests/test_column_tsdb_anchor tests/test_object_acl \
+	    tests/test_auth_privilege_boundary tests/test_aggregate_hardened \
 	    tests/test_uwp_regression tests/fuzz_uwp
 	@echo "Clean completed"
 

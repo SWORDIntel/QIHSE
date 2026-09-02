@@ -45,7 +45,7 @@ static void* worker_thread(void* arg) {
                 qihse_auth_grant_object(user, user, 0, resource, 1);
                 atomic_fetch_add(&g_acl_grants, 1);
             }
-            bool can = qihse_auth_can_access_object(user, 0, resource);
+            bool can = qihse_auth_can_access_object(user, 0, resource, QIHSE_ACL_READ);
             if (can && i % 3 == 0) {
                 /* expected: granted */
             } else if (!can) {

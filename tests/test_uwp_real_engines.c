@@ -32,9 +32,7 @@ static int test_kv_real(void) {
     qihse_uwp_context_t ctx = {0};
     ctx.kv = kv;
 
-    qihse_user_t* user = calloc(1, sizeof(qihse_user_t));
-    strncpy(user->username, "testuser", sizeof(user->username) - 1);
-    user->role = QIHSE_ROLE_OPERATOR;
+    qihse_user_t* user = qihse_auth_get_user(0);
 
     size_t klen = strlen(key) + 1;
     size_t vlen = strlen(val) + 1;
@@ -55,12 +53,10 @@ static int test_kv_real(void) {
     bool ok = qihse_uwp_dispatch(&ctx, user, &hdr, payload, plen, response, sizeof(response), &out_len);
     if (!ok) {
         fprintf(stderr, "[FAIL] KV PUT dispatch rejected valid frame\n");
-        free(user);
         qihse_kv_store_destroy(kv);
         return -1;
     }
 
-    free(user);
     qihse_kv_store_destroy(kv);
     printf("[PASS] KV store real read/write + UWP dispatch accepts KV frame\n");
     return 0;
@@ -99,9 +95,7 @@ static int test_version_rejection_real(void) {
     qihse_uwp_context_t ctx = {0};
     ctx.kv = kv;
 
-    qihse_user_t* user = calloc(1, sizeof(qihse_user_t));
-    strncpy(user->username, "test", sizeof(user->username) - 1);
-    user->role = QIHSE_ROLE_OPERATOR;
+    qihse_user_t* user = qihse_auth_get_user(0);
 
     qihse_uwp_header_t hdr = {0};
     hdr.magic[0] = 0x51; hdr.magic[1] = 0x49; hdr.magic[2] = 0x48; hdr.magic[3] = 0x53;
@@ -115,11 +109,9 @@ static int test_version_rejection_real(void) {
     bool ok = qihse_uwp_dispatch(&ctx, user, &hdr, NULL, 0, response, sizeof(response), &out_len);
     if (ok) {
         fprintf(stderr, "[FAIL] version 0x02 was not rejected\n");
-        free(user);
         qihse_kv_store_destroy(kv);
         return -1;
     }
-    free(user);
     qihse_kv_store_destroy(kv);
     printf("[PASS] version 0x02 rejected with real context\n");
     return 0;
@@ -130,9 +122,7 @@ static int test_oversized_payload_real(void) {
     qihse_uwp_context_t ctx = {0};
     ctx.kv = kv;
 
-    qihse_user_t* user = calloc(1, sizeof(qihse_user_t));
-    strncpy(user->username, "test", sizeof(user->username) - 1);
-    user->role = QIHSE_ROLE_OPERATOR;
+    qihse_user_t* user = qihse_auth_get_user(0);
 
     qihse_uwp_header_t hdr = {0};
     hdr.magic[0] = 0x51; hdr.magic[1] = 0x49; hdr.magic[2] = 0x48; hdr.magic[3] = 0x53;
@@ -146,11 +136,9 @@ static int test_oversized_payload_real(void) {
     bool ok = qihse_uwp_dispatch(&ctx, user, &hdr, NULL, 0, response, sizeof(response), &out_len);
     if (ok) {
         fprintf(stderr, "[FAIL] oversized payload was not rejected\n");
-        free(user);
         qihse_kv_store_destroy(kv);
         return -1;
     }
-    free(user);
     qihse_kv_store_destroy(kv);
     printf("[PASS] oversized payload rejected with real context\n");
     return 0;
@@ -186,6 +174,9 @@ static int test_metrics_real(void) {
 }
 
 int main(void) {
+    qihse_auth_init();
+    qihse_auth_bootstrap_operator("TestOperatorPass123!");
+
     int failures = 0;
     failures += test_kv_real();
     failures += test_auth_real();

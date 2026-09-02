@@ -10,13 +10,10 @@
 /fuzzer
 /tests/qihse_*_test
 /tests/test_*
-!/tests/test_object_acl.c
-!/tests/test_uwp_regression.c
-!/tests/fuzz_uwp.c
-!/tests/test_uwp_metrics.c
-!/tests/test_uwp_tls_integration.c
-!/tests/test_uwp_concurrency.c
-!/tests/test_uwp_real_engines.c
+!/tests/*.c
+/tests/test_aggregate_hardened
+/tests/test_auth_privilege_boundary
+/tests/test_object_acl
 /tests/qihse_server
 /tests/qihse_cluster_*
 /benchmarks/qihse_*_bench
@@ -61,3 +58,5 @@
 /sdks/python/__pycache__/
 /sdks/python/test_python.py
 .qihse_auth_cache.dat
+/vendor/liboqs/build/
+/vendor/oqs-provider/build/

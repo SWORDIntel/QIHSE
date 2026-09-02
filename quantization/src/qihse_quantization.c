@@ -29,7 +29,7 @@ qihse_quantization_pipeline_t* qihse_quantization_pipeline_create(
     if (name) {
         strncpy(pipeline->pipeline_name, name, sizeof(pipeline->pipeline_name) - 1);
     } else {
-        strcpy(pipeline->pipeline_name, "default_quantization");
+        snprintf(pipeline->pipeline_name, sizeof(pipeline->pipeline_name), "%s", "default_quantization");
     }
 
     pipeline->target_mode = target_mode;
@@ -667,7 +667,7 @@ int qihse_quantization_recommend_precision(
     recommendation->expected_compression_ratio = 4.0;
     recommendation->expected_speedup = 2.5;
     recommendation->expected_accuracy_loss = 0.02;
-    strcpy(recommendation->reasoning, "INT8 provides best balance for most workloads");
+    snprintf(recommendation->reasoning, sizeof(recommendation->reasoning), "%s", "INT8 provides best balance for most workloads");
 
     /* Adjust based on target accuracy */
     if (target_accuracy > 0.99) {
@@ -675,13 +675,13 @@ int qihse_quantization_recommend_precision(
         recommendation->expected_compression_ratio = 2.0;
         recommendation->expected_speedup = 1.8;
         recommendation->expected_accuracy_loss = 0.005;
-        strcpy(recommendation->reasoning, "FP16 recommended for high accuracy requirements");
+        snprintf(recommendation->reasoning, sizeof(recommendation->reasoning), "%s", "FP16 recommended for high accuracy requirements");
     } else if (target_accuracy < 0.9) {
         recommendation->recommended_mode = QIHSE_QUANT_INT4;
         recommendation->expected_compression_ratio = 8.0;
         recommendation->expected_speedup = 3.5;
         recommendation->expected_accuracy_loss = 0.05;
-        strcpy(recommendation->reasoning, "INT4 acceptable for lower accuracy requirements");
+        snprintf(recommendation->reasoning, sizeof(recommendation->reasoning), "%s", "INT4 acceptable for lower accuracy requirements");
     }
 
     return 0;

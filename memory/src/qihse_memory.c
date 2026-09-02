@@ -1398,7 +1398,7 @@ bool qihse_memory_migration_decision_inspect(
 
     if (!qihse_memory_migration_plan(buffer, target_device, target_type, &plan)) {
         out_decision->reason = QIHSE_MEMORY_MIGRATION_DECISION_REASON_INVALID_ARGUMENTS;
-        (void)strcpy(out_decision->plan_reason, "invalid target/type or null input");
+        snprintf(out_decision->plan_reason, sizeof(out_decision->plan_reason), "%s", "invalid target/type or null input");
         return true;
     }
 

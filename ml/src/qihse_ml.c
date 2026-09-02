@@ -1653,7 +1653,7 @@ int qihse_rl_agent_discover_algorithm(
     size_t num_algorithms = sizeof(algorithm_names) / sizeof(algorithm_names[0]);
     size_t selected_algorithm = config_idx % num_algorithms;
 
-    strcpy(output_config->algorithm_name, algorithm_names[selected_algorithm]);
+    snprintf(output_config->algorithm_name, sizeof(output_config->algorithm_name), "%s", algorithm_names[selected_algorithm]);
     output_config->max_iterations = 1000 + (config_idx % 9000);
     output_config->convergence_threshold = 0.001 + (config_idx % 10) * 0.001;
     output_config->population_size = 50 + (config_idx % 950);
@@ -2245,7 +2245,7 @@ char* qihse_telemetry_export_json(const qihse_telemetry_collector_t* collector) 
     char* json = calloc(json_size, sizeof(char));
     if (!json) return NULL;
 
-    strcpy(json, "{\"events\":[");
+    snprintf(json, json_size, "%s", "{\"events\":[");
 
     for (size_t i = 0; i < collector->num_events; i++) {
         const qihse_telemetry_event_data_t* event = &collector->events[i];
@@ -2571,9 +2571,9 @@ void qihse_ml_engine_process_query(
         .timestamp_us = (uint64_t)time(NULL) * 1000000ULL,
         .value = current_performance
     };
-    strcpy(event.component, "ml_engine");
-    strcpy(event.operation, "process_query");
-    sprintf(event.metadata, "arm=%zu,contextual=true,variational=%s", selected_arm, variational_ret == 0 ? "true" : "false");
+    snprintf(event.component, sizeof(event.component), "%s", "ml_engine");
+    snprintf(event.operation, sizeof(event.operation), "%s", "process_query");
+    snprintf(event.metadata, sizeof(event.metadata), "arm=%zu,contextual=true,variational=%s", selected_arm, variational_ret == 0 ? "true" : "false");
 
     qihse_telemetry_record_event(&engine->telemetry, &event);
 }
@@ -2649,9 +2649,9 @@ void qihse_ml_engine_train(
     event.type = QIHSE_TELEMETRY_OPTIMIZATION;
     event.timestamp_us = (uint64_t)time(NULL) * 1000000ULL;
     event.value = performance;
-    strcpy(event.component, "ml_engine");
-    strcpy(event.operation, "train");
-    sprintf(event.metadata, "reward=%f,contextual=true", reward);
+    snprintf(event.component, sizeof(event.component), "%s", "ml_engine");
+    snprintf(event.operation, sizeof(event.operation), "%s", "train");
+    snprintf(event.metadata, sizeof(event.metadata), "reward=%f,contextual=true", reward);
 
     qihse_telemetry_record_event(&engine->telemetry, &event);
 }

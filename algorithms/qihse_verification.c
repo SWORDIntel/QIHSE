@@ -430,9 +430,10 @@ static int qihse_verify_result_advanced_internal(
     if (verification_result->confidence < config->confidence_threshold) {
         verification_result->is_valid = 0;  /* REJECT - confidence too low */
         const char* error_msg = "Confidence below precision threshold";
-        verification_result->error_message = calloc(1, strlen(error_msg) + 1);
+        size_t elen = strlen(error_msg);
+        verification_result->error_message = calloc(1, elen + 1);
         if (verification_result->error_message) {
-            strcpy(verification_result->error_message, error_msg);
+            strncpy(verification_result->error_message, error_msg, elen);
         }
         errno = EINVAL;  /* Invalid result due to low confidence */
         return -1;  /* Return error - result rejected */
@@ -462,9 +463,10 @@ int qihse_verify_result_advanced(
         verification_result->is_valid = 0;
         verification_result->confidence = 0.0;
         const char* error_msg = "QIHSE_VERIFY_NONE not allowed for precision search";
-        verification_result->error_message = calloc(1, strlen(error_msg) + 1);
+        size_t elen = strlen(error_msg);
+        verification_result->error_message = calloc(1, elen + 1);
         if (verification_result->error_message) {
-            strcpy(verification_result->error_message, error_msg);
+            strncpy(verification_result->error_message, error_msg, elen);
         }
         errno = EINVAL;
         return -1;  /* Reject NONE mode for precision requirements */
@@ -496,9 +498,10 @@ int qihse_verify_batch(
             verification_results[i].is_valid = 0;
             verification_results[i].confidence = 0.0;
             const char* error_msg = "QIHSE_VERIFY_NONE not allowed for precision search";
-            verification_results[i].error_message = calloc(1, strlen(error_msg) + 1);
+            size_t elen = strlen(error_msg);
+            verification_results[i].error_message = calloc(1, elen + 1);
             if (verification_results[i].error_message) {
-                strcpy(verification_results[i].error_message, error_msg);
+                strncpy(verification_results[i].error_message, error_msg, elen);
             }
             errno = EINVAL;
             return -1;  /* Reject entire batch for NONE mode */

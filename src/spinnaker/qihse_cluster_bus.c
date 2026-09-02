@@ -181,6 +181,7 @@ static bool qihse_bus_send_to_all_peers(qihse_cluster_bus_t* bus,
 
 static void qihse_bus_handle_ping(qihse_cluster_bus_t* bus, uint16_t sender_index,
                                   const uint8_t* payload, size_t payload_len) {
+    (void)payload;
     if (payload_len >= QIHSE_CLUSTER_NODE_ID_LEN + 1u) {
         /* Reply with PONG containing our node_id */
         qihse_cluster_node_t local;
@@ -319,7 +320,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         strncpy(bus->bind_address, config->bind_address, QIHSE_CLUSTER_HOST_LEN);
         bus->bind_address[QIHSE_CLUSTER_HOST_LEN] = '\0';
     } else {
-        strcpy(bus->bind_address, "0.0.0.0");
+        snprintf(bus->bind_address, sizeof(bus->bind_address), "%s", "0.0.0.0");
     }
     if (config->xdp_interface) {
         strncpy(bus->xdp_interface, config->xdp_interface, sizeof(bus->xdp_interface) - 1u);

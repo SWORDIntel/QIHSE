@@ -9,6 +9,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_qql_parser.h"
 #include "qihse_auth.h"
+#include "core/qihse_auth_internal.h"
 #include "qihse_uwp.h"
 
 // Clearances
@@ -28,6 +29,7 @@ void generate_malformed_payload(char* buffer, size_t max_len) {
 int main() {
     printf("[APT-41 CLEARANCE BYPASS SIMULATION] Booting fuzzer...\n");
     srand(time(NULL));
+    qihse_auth_init();
 
     qihse_kv_store_t* kv = qihse_kv_store_create();
     
@@ -81,7 +83,8 @@ int main() {
         qihse_kv_set(kv, bad_key, bad_val, CLR_COMPARTMENT, 0xFF);
         
         // Try to read the bad key back with a zeroed user
-        qihse_user_t dummy = {0, QIHSE_ROLE_GUEST, 0, 0};
+        qihse_user_t dummy = {0};
+        dummy.role = QIHSE_ROLE_GUEST;
         char* leak3 = qihse_kv_get_user(kv, bad_key, &dummy);
         if (leak3) {
             printf("[CRITICAL VULNERABILITY] Attack 3 bypassed bounds! Expected block, got leak.\n");

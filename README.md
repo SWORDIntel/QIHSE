@@ -195,11 +195,14 @@ An internal UWP review in **August 2026** identified security issues across auth
 
 Current defaults and reviewed controls include:
 
-- authentication and authorization across the reviewed UWP paths;
+- authentication and authorization across all database and wire-protocol paths;
 - **certificate-backed TLS 1.3 required by default for the UWP network listener**;
-- cleartext and the legacy ChaCha20-Poly1305 transport available only through the explicit `QIHSE_UWP_ALLOW_INSECURE=1` compatibility/development opt-in;
-- regression coverage spanning transport security, authentication, ACLs, protocol state, sanitizers, concurrency, and fuzzing;
-- post-quantum cryptographic options for `.qdb` container workflows where configured.
+- cleartext and legacy clear transports available only through explicit `QIHSE_UWP_ALLOW_INSECURE=1` opt-in;
+- **CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384** password verification (128-bit salt, 600,000 iterations);
+- **discrete object ACL flags (`READ`, `WRITE`, `ADMIN`)** enforced on all mutation paths;
+- **authoritative opaque user security context** preventing caller-side privilege or role tampering;
+- **post-quantum cryptography built by default** via `liboqs` and `oqs-provider`, with `ML-DSA-87` digital signatures and `ML-KEM-1024` key encapsulation;
+- automated security gates including **AddressSanitizer (ASan)**, **UndefinedBehaviorSanitizer (UBSan)**, concurrency stress tests, and fuzzing in CI.
 
 Security reviews apply to specific revisions and configurations. Later commits can change the attack surface, so a review of one revision does not automatically establish the security of every future revision. Security-sensitive deployments should pin and validate the exact commit and configuration they deploy.
 

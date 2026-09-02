@@ -302,7 +302,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
         char* password = username + username_len + 1;
         size_t password_max_len = len - (username_len + 1);
         if (strnlen(password, password_max_len) == password_max_len) return UWP_ROUTE_ERR_AUTH;
-        if (username_len >= sizeof(((qihse_user_t*)0)->username)) {
+        if (username_len >= QIHSE_AUTH_USERNAME_MAX) {
             uwp_log_auth_failure(client_fd, username, "failed");
             if (ctx->uwp_metrics) qihse_uwp_metrics_inc_auth_failures(ctx->uwp_metrics);
             return UWP_ROUTE_ERR_AUTH;
@@ -349,7 +349,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 if (strnlen(val, val_max_len) == val_max_len) break; /* Missing null terminator for val */
 
                 uint64_t resource_id = uwp_fnv1a_32((const uint8_t*)key, key_len);
-                if (!qihse_auth_can_access_object(current_user, 0, resource_id)) {
+                if (!qihse_auth_can_access_object(current_user, 0, resource_id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_kv_set_user(ctx->kv, key, val, 0, 0, current_user)) {
@@ -382,7 +382,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
 
                 _Alignas(32) float staging[4096];
                 memcpy(staging, payload + 12, (size_t)dims * sizeof(float));
-                if (!qihse_auth_can_access_object(current_user, 0, id)) {
+                if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_vector_db_upsert_by_ids(ctx->vdb, &id, staging, 1, dims,
@@ -408,7 +408,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 char* json = (char*)(payload + 8);
                 size_t json_max_len = (size_t)(len - 8);
                 if (strnlen(json, json_max_len) == json_max_len) break; /* Missing null terminator */
-                if (!qihse_auth_can_access_object(current_user, 0, doc_id)) {
+                if (!qihse_auth_can_access_object(current_user, 0, doc_id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_doc_store_insert_json(ctx->doc, doc_id, json)) return UWP_ROUTE_ERR_DISPATCH;
@@ -435,7 +435,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 float fv;
                 memcpy(&fv, payload + col_name_len + 1, sizeof(float));
                 uint64_t resource_id = uwp_fnv1a_32((const uint8_t*)col_name, col_name_len);
-                if (!qihse_auth_can_access_object(current_user, 0, resource_id)) {
+                if (!qihse_auth_can_access_object(current_user, 0, resource_id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_column_append_float32(ctx->col, col_name, fv, 0, 0)) {
@@ -462,7 +462,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 ts = le64toh(ts);
                 double dv;
                 memcpy(&dv, payload + 16, sizeof(double));
-                if (!qihse_auth_can_access_object(current_user, 0, series)) {
+                if (!qihse_auth_can_access_object(current_user, 0, series, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_tsdb_insert(ctx->tsdb, (uint32_t)series, ts, dv, 0, 0)) {
@@ -489,7 +489,7 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uint8_t* msg = (uint8_t*)(payload + topic_len + 1);
                 size_t msg_len = len - (topic_len + 1);
                 uint64_t resource_id = uwp_fnv1a_32((const uint8_t*)topic, topic_len);
-                if (!qihse_auth_can_access_object(current_user, 0, resource_id)) {
+                if (!qihse_auth_can_access_object(current_user, 0, resource_id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
                 if (!qihse_event_stream_append(ctx->stream, topic, msg, msg_len)) {

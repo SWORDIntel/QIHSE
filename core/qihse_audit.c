@@ -126,13 +126,18 @@ void qihse_audit_set_webhook(const char* url) {
 void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
     
-    /* Load the OQS provider for PQC algorithms (ML-DSA-87, ML-KEM-1024).
-     * Only attempt loading if QIHSE_ENABLE_PQC is set — some vCPUs crash
-     * on SIMD instructions in liboqs even with generic build. */
-    if (!oqs_provider && getenv("QIHSE_ENABLE_PQC")) {
+    static OSSL_PROVIDER *default_provider = NULL;
+    if (!default_provider) {
+        default_provider = OSSL_PROVIDER_load(NULL, "default");
+    }
+
+    /* Load the OQS provider for PQC algorithms (ML-DSA-87, ML-KEM-1024) by default. */
+    if (!oqs_provider && !getenv("QIHSE_DISABLE_PQC")) {
         oqs_provider = OSSL_PROVIDER_load(NULL, "oqsprovider");
         if (!oqs_provider) {
             const char *paths[] = {
+                "vendor/oqs-provider/build/lib/oqsprovider.so",
+                "./vendor/oqs-provider/build/lib/oqsprovider.so",
                 "/usr/local/lib/ossl-modules/oqsprovider.so",
                 "/usr/lib/x86_64-linux-gnu/ossl-modules/oqsprovider.so",
                 NULL
@@ -146,9 +151,7 @@ void qihse_audit_init(void) {
 
     /* Generate ML-DSA-87 keys for signing the audit logs */
     if (!audit_pkey) {
-        if (oqs_provider) {
-            audit_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-87");
-        }
+        audit_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-87");
         if (!audit_pkey) {
             fprintf(stderr, "[WARN] ML-DSA-87 PQC unavailable, audit log will use SHA-384 hash chain only.\n");
         }

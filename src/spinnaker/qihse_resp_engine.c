@@ -95,7 +95,7 @@ struct qihse_resp_server {
     size_t max_clients;
     size_t max_request_bytes;
     bool auth_required;
-    qihse_user_t unauthenticated_user;
+    qihse_user_t* unauthenticated_user;
     bool require_full_coverage;
     bool pin_workers;
     bool strict_hardware_affinity;
@@ -2028,7 +2028,7 @@ static char* qihse_resp_zset_key(const char* key, const char* member) {
 }
 
 /* Helper: build a zset meta key "__zmeta__:KEY". Caller frees. */
-static char* qihse_resp_zset_meta(const char* key) {
+__attribute__((unused)) static char* qihse_resp_zset_meta(const char* key) {
     size_t klen = strlen(key);
     char* out = malloc(9 + klen + 1);
     if (out) snprintf(out, 9 + klen + 1, "__zmeta__:%s", key);
@@ -2044,7 +2044,7 @@ static char* qihse_resp_hash_meta(const char* key) {
 }
 
 /* Helper: build a set meta key "__smeta__:KEY". Caller frees. */
-static char* qihse_resp_set_meta(const char* key) {
+__attribute__((unused)) static char* qihse_resp_set_meta(const char* key) {
     size_t klen = strlen(key);
     char* out = malloc(9 + klen + 1);
     if (out) snprintf(out, 9 + klen + 1, "__smeta__:%s", key);
@@ -3897,7 +3897,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     session.server = server;
     session.fd = fd;
     session.protocol_version = 2;
-    if (!server->auth_required) session.user = &server->unauthenticated_user;
+    if (!server->auth_required) session.user = server->unauthenticated_user;
     session.id = __atomic_add_fetch(&server->next_client_id, 1u, __ATOMIC_RELAXED);
     if (server->pin_workers) {
         int cpus[256];
@@ -4164,12 +4164,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->max_clients = supplied->max_clients;
     server->max_request_bytes = supplied->max_request_bytes;
     server->auth_required = supplied->auth_required;
-    server->unauthenticated_user.user_id = UINT32_MAX;
-    server->unauthenticated_user.role = QIHSE_ROLE_OPERATOR;
-    server->unauthenticated_user.classification_level = UINT16_MAX;
-    server->unauthenticated_user.sci_compartments = UINT16_MAX;
-    server->unauthenticated_user.hardware_token_present = true;
-    snprintf(server->unauthenticated_user.username, sizeof(server->unauthenticated_user.username), "QIHSE_LOOPBACK");
+    server->unauthenticated_user = qihse_auth_get_user(0);
     server->require_full_coverage = supplied->require_full_coverage;
     server->pin_workers = supplied->pin_workers;
     server->strict_hardware_affinity = supplied->strict_hardware_affinity;
