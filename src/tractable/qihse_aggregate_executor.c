@@ -1,9 +1,7 @@
 #define _GNU_SOURCE
 /*
  * QIHSE Aggregate Executor — Phase 1 Relational Completeness
- *
- * Hash-based aggregation: builds groups in a hash table keyed by the
- * concatenation of group-by column values, then applies aggregates.
+ * Hardened against unbounded memory amplification and allocation failures.
  */
 #include "qihse_aggregate_executor.h"
 #include <stdio.h>
@@ -12,6 +10,11 @@
 #include <ctype.h>
 #include <math.h>
 #include <float.h>
+
+#define QIHSE_AGG_MAX_GROUPS 65536
+#define QIHSE_AGG_MAX_DISTINCT_PER_GROUP 4096
+#define QIHSE_AGG_MAX_KEY_LEN 32768
+#define QIHSE_AGG_MAX_MEMORY_BYTES (64 * 1024 * 1024) /* 64 MB budget */
 
 static bool ieq(const char* a, const char* b) {
     if (!a || !b) return a == b;
@@ -37,7 +40,7 @@ typedef struct agg_group {
     int64_t*  count;
     double*   min;
     double*   max;
-    /* distinct tracking (simple: store seen values per agg) */
+    /* distinct tracking */
     char***   distinct_vals;
     size_t*   distinct_count;
     size_t*   distinct_cap;
@@ -59,22 +62,33 @@ typedef struct {
     size_t group_pos;
     qihse_exec_schema_t out_schema;
     char** out_schema_names;
+    /* memory accounting */
+    size_t memory_used_bytes;
+    bool memory_limit_exceeded;
 } agg_state_t;
 
 static char* make_group_key(qihse_exec_row_t* row, const int* group_cols, size_t num_groups) {
-    /* build a concatenated key string */
     size_t total = 1;
     for (size_t i = 0; i < num_groups; i++) {
         int idx = group_cols[i];
         const char* v = (idx >= 0 && (size_t)idx < row->num_values) ? row->values[idx] : NULL;
-        total += (v ? strlen(v) : 0) + 1;
+        size_t vlen = v ? strlen(v) : 0;
+        if (vlen > QIHSE_AGG_MAX_KEY_LEN || total > QIHSE_AGG_MAX_KEY_LEN - vlen - 1) {
+            return NULL;
+        }
+        total += vlen + 1;
     }
     char* key = (char*)malloc(total);
+    if (!key) return NULL;
     char* p = key;
     for (size_t i = 0; i < num_groups; i++) {
         int idx = group_cols[i];
         const char* v = (idx >= 0 && (size_t)idx < row->num_values) ? row->values[idx] : NULL;
-        if (v) { strcpy(p, v); p += strlen(v); }
+        if (v) {
+            size_t vlen = strlen(v);
+            memcpy(p, v, vlen);
+            p += vlen;
+        }
         *p++ = '\x1f'; /* unit separator */
     }
     *p = '\0';
@@ -82,14 +96,17 @@ static char* make_group_key(qihse_exec_row_t* row, const int* group_cols, size_t
 }
 
 static int distinct_seen(char** vals, size_t count, const char* v) {
+    if (!vals || !v) return 0;
     for (size_t i = 0; i < count; i++) {
         if (ieq(vals[i], v)) return 1;
     }
     return 0;
 }
 
-static void update_group(agg_group_t* g, const qihse_aggop_t* aggs, size_t num_aggs,
+static void update_group(agg_state_t* st, agg_group_t* g, const qihse_aggop_t* aggs, size_t num_aggs,
                          qihse_exec_row_t* row) {
+    if (!st || !g || !aggs || !row) return;
+
     for (size_t i = 0; i < num_aggs; i++) {
         const qihse_aggop_t* a = &aggs[i];
         const char* v = NULL;
@@ -102,13 +119,29 @@ static void update_group(agg_group_t* g, const qihse_aggop_t* aggs, size_t num_a
         } else if (a->kind == QIHSE_AGGOP_COUNT) {
             if (v) {
                 if (a->is_distinct) {
+                    if (g->distinct_count[i] >= QIHSE_AGG_MAX_DISTINCT_PER_GROUP) {
+                        continue;
+                    }
                     if (!distinct_seen(g->distinct_vals[i], g->distinct_count[i], v)) {
                         if (g->distinct_count[i] >= g->distinct_cap[i]) {
-                            g->distinct_cap[i] = g->distinct_cap[i] ? g->distinct_cap[i] * 2 : 8;
-                            g->distinct_vals[i] = (char**)realloc(g->distinct_vals[i], g->distinct_cap[i] * sizeof(char*));
+                            size_t new_cap = g->distinct_cap[i] ? g->distinct_cap[i] * 2 : 8;
+                            if (new_cap > QIHSE_AGG_MAX_DISTINCT_PER_GROUP) new_cap = QIHSE_AGG_MAX_DISTINCT_PER_GROUP;
+                            char** new_arr = (char**)realloc(g->distinct_vals[i], new_cap * sizeof(char*));
+                            if (!new_arr) continue;
+                            g->distinct_vals[i] = new_arr;
+                            g->distinct_cap[i] = new_cap;
                         }
-                        g->distinct_vals[i][g->distinct_count[i]++] = strdup(v);
-                        g->count[i]++;
+                        size_t vlen = strlen(v) + 1;
+                        if (st->memory_used_bytes + vlen > QIHSE_AGG_MAX_MEMORY_BYTES) {
+                            st->memory_limit_exceeded = true;
+                            continue;
+                        }
+                        char* copy = strdup(v);
+                        if (copy) {
+                            g->distinct_vals[i][g->distinct_count[i]++] = copy;
+                            st->memory_used_bytes += vlen;
+                            g->count[i]++;
+                        }
                     }
                 } else {
                     g->count[i]++;
@@ -116,14 +149,29 @@ static void update_group(agg_group_t* g, const qihse_aggop_t* aggs, size_t num_a
             }
         } else if (v) {
             double dv = strtod(v, NULL);
-            if (a->is_distinct && distinct_seen(g->distinct_vals[i], g->distinct_count[i], v))
-                continue;
             if (a->is_distinct) {
+                if (g->distinct_count[i] >= QIHSE_AGG_MAX_DISTINCT_PER_GROUP ||
+                    distinct_seen(g->distinct_vals[i], g->distinct_count[i], v))
+                    continue;
+
                 if (g->distinct_count[i] >= g->distinct_cap[i]) {
-                    g->distinct_cap[i] = g->distinct_cap[i] ? g->distinct_cap[i] * 2 : 8;
-                    g->distinct_vals[i] = (char**)realloc(g->distinct_vals[i], g->distinct_cap[i] * sizeof(char*));
+                    size_t new_cap = g->distinct_cap[i] ? g->distinct_cap[i] * 2 : 8;
+                    if (new_cap > QIHSE_AGG_MAX_DISTINCT_PER_GROUP) new_cap = QIHSE_AGG_MAX_DISTINCT_PER_GROUP;
+                    char** new_arr = (char**)realloc(g->distinct_vals[i], new_cap * sizeof(char*));
+                    if (!new_arr) continue;
+                    g->distinct_vals[i] = new_arr;
+                    g->distinct_cap[i] = new_cap;
                 }
-                g->distinct_vals[i][g->distinct_count[i]++] = strdup(v);
+                size_t vlen = strlen(v) + 1;
+                if (st->memory_used_bytes + vlen > QIHSE_AGG_MAX_MEMORY_BYTES) {
+                    st->memory_limit_exceeded = true;
+                    continue;
+                }
+                char* copy = strdup(v);
+                if (copy) {
+                    g->distinct_vals[i][g->distinct_count[i]++] = copy;
+                    st->memory_used_bytes += vlen;
+                }
             }
             switch (a->kind) {
                 case QIHSE_AGGOP_SUM: g->sum[i] += dv; break;
@@ -139,10 +187,11 @@ static void update_group(agg_group_t* g, const qihse_aggop_t* aggs, size_t num_a
 
 static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
                                           qihse_exec_row_t* row) {
+    if (!st || !key || !row || !st->buckets) return NULL;
+
     unsigned long h = hash_str(key) % st->num_buckets;
     agg_group_t* g = st->buckets[h];
     for (; g; g = g->next) {
-        /* compare keys */
         int match = 1;
         for (size_t i = 0; i < st->num_groups && match; i++) {
             const char* gv = g->key_parts[i];
@@ -153,15 +202,36 @@ static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
         }
         if (match) return g;
     }
-    /* create new group */
+
+    /* Check group limits and memory budget */
+    if (st->memory_limit_exceeded || st->num_groups_total >= QIHSE_AGG_MAX_GROUPS) {
+        return NULL;
+    }
+
+    size_t est_bytes = sizeof(agg_group_t) + (st->num_groups * sizeof(char*)) +
+                       (st->num_aggs * (sizeof(double) * 3 + sizeof(int64_t) + sizeof(char**) + sizeof(size_t) * 2));
+    if (st->memory_used_bytes + est_bytes > QIHSE_AGG_MAX_MEMORY_BYTES) {
+        st->memory_limit_exceeded = true;
+        return NULL;
+    }
+
     g = (agg_group_t*)calloc(1, sizeof(*g));
+    if (!g) return NULL;
+
     g->num_keys = st->num_groups;
     g->key_parts = (char**)calloc(st->num_groups ? st->num_groups : 1, sizeof(char*));
+    if (!g->key_parts) { free(g); return NULL; }
+
     for (size_t i = 0; i < st->num_groups; i++) {
         int idx = st->group_cols[i];
-        g->key_parts[i] = (idx >= 0 && (size_t)idx < row->num_values && row->values[idx])
-                          ? strdup(row->values[idx]) : NULL;
+        if (idx >= 0 && (size_t)idx < row->num_values && row->values[idx]) {
+            g->key_parts[i] = strdup(row->values[idx]);
+            if (g->key_parts[i]) {
+                st->memory_used_bytes += strlen(row->values[idx]) + 1;
+            }
+        }
     }
+
     g->sum = (double*)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(double));
     g->count = (int64_t*)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(int64_t));
     g->min = (double*)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(double));
@@ -169,24 +239,45 @@ static agg_group_t* find_or_create_group(agg_state_t* st, const char* key,
     g->distinct_vals = (char***)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(char**));
     g->distinct_count = (size_t*)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(size_t));
     g->distinct_cap = (size_t*)calloc(st->num_aggs ? st->num_aggs : 1, sizeof(size_t));
+
+    if (!g->sum || !g->count || !g->min || !g->max || !g->distinct_vals || !g->distinct_count || !g->distinct_cap) {
+        for (size_t i = 0; i < st->num_groups; i++) free(g->key_parts[i]);
+        free(g->key_parts); free(g->sum); free(g->count); free(g->min); free(g->max);
+        free(g->distinct_vals); free(g->distinct_count); free(g->distinct_cap);
+        free(g);
+        return NULL;
+    }
+
     for (size_t i = 0; i < st->num_aggs; i++) { g->min[i] = DBL_MAX; g->max[i] = -DBL_MAX; }
     g->next = st->buckets[h];
     st->buckets[h] = g;
-    /* add to group list */
-    st->group_list = (agg_group_t**)realloc(st->group_list, (st->num_groups_total + 1) * sizeof(agg_group_t*));
+
+    agg_group_t** new_list = (agg_group_t**)realloc(st->group_list, (st->num_groups_total + 1) * sizeof(agg_group_t*));
+    if (!new_list) {
+        return g; /* bucket already has g, but group_list won't include it */
+    }
+    st->group_list = new_list;
     st->group_list[st->num_groups_total++] = g;
+    st->memory_used_bytes += est_bytes;
+
     return g;
 }
 
 static void agg_build(agg_state_t* st) {
     st->num_buckets = 256;
     st->buckets = (agg_group_t**)calloc(st->num_buckets, sizeof(agg_group_t*));
+    if (!st->buckets) return;
+
     qihse_exec_row_t* r;
     while ((r = qihse_row_stream_next(st->input)) != NULL) {
         char* key = make_group_key(r, st->group_cols, st->num_groups);
-        agg_group_t* g = find_or_create_group(st, key, r);
-        update_group(g, st->aggs, st->num_aggs, r);
-        free(key);
+        if (key) {
+            agg_group_t* g = find_or_create_group(st, key, r);
+            if (g) {
+                update_group(st, g, st->aggs, st->num_aggs, r);
+            }
+            free(key);
+        }
         qihse_exec_row_free(r);
         free(r);
     }
@@ -194,6 +285,7 @@ static void agg_build(agg_state_t* st) {
 
 static char* fmt_double(double v) {
     char* buf = (char*)malloc(32);
+    if (!buf) return NULL;
     if (v == (double)(int64_t)v && fabs(v) < 1e15) {
         snprintf(buf, 32, "%lld", (long long)v);
     } else {
@@ -204,11 +296,16 @@ static char* fmt_double(double v) {
 
 static qihse_exec_row_t* agg_next(qihse_row_stream_t* self) {
     agg_state_t* st = (agg_state_t*)self->state;
-    if (st->group_pos >= st->num_groups_total) return NULL;
+    if (!st || st->group_pos >= st->num_groups_total) return NULL;
     agg_group_t* g = st->group_list[st->group_pos++];
+    if (!g) return NULL;
+
     qihse_exec_row_t* out = (qihse_exec_row_t*)malloc(sizeof(qihse_exec_row_t));
+    if (!out) return NULL;
     out->num_values = st->num_groups + st->num_aggs;
     out->values = (char**)calloc(out->num_values ? out->num_values : 1, sizeof(char*));
+    if (!out->values) { free(out); return NULL; }
+
     for (size_t i = 0; i < st->num_groups; i++)
         out->values[i] = g->key_parts[i] ? strdup(g->key_parts[i]) : NULL;
     for (size_t i = 0; i < st->num_aggs; i++) {
@@ -228,33 +325,44 @@ static qihse_exec_row_t* agg_next(qihse_row_stream_t* self) {
 }
 
 static void agg_close(qihse_row_stream_t* self) {
+    if (!self) return;
     agg_state_t* st = (agg_state_t*)self->state;
     if (!st) return;
-    for (size_t i = 0; i < st->num_buckets; i++) {
-        agg_group_t* g = st->buckets[i];
-        while (g) {
-            agg_group_t* next = g->next;
-            for (size_t j = 0; j < g->num_keys; j++) free(g->key_parts[j]);
-            free(g->key_parts);
-            free(g->sum); free(g->count); free(g->min); free(g->max);
-            for (size_t j = 0; j < st->num_aggs; j++) {
-                if (g->distinct_vals[j]) {
-                    for (size_t k = 0; k < g->distinct_count[j]; k++) free(g->distinct_vals[j][k]);
-                    free(g->distinct_vals[j]);
+
+    if (st->buckets) {
+        for (size_t i = 0; i < st->num_buckets; i++) {
+            agg_group_t* g = st->buckets[i];
+            while (g) {
+                agg_group_t* next = g->next;
+                if (g->key_parts) {
+                    for (size_t j = 0; j < g->num_keys; j++) free(g->key_parts[j]);
+                    free(g->key_parts);
                 }
+                free(g->sum); free(g->count); free(g->min); free(g->max);
+                if (g->distinct_vals) {
+                    for (size_t j = 0; j < st->num_aggs; j++) {
+                        if (g->distinct_vals[j]) {
+                            for (size_t k = 0; k < g->distinct_count[j]; k++) free(g->distinct_vals[j][k]);
+                            free(g->distinct_vals[j]);
+                        }
+                    }
+                    free(g->distinct_vals);
+                }
+                free(g->distinct_count); free(g->distinct_cap);
+                free(g);
+                g = next;
             }
-            free(g->distinct_vals); free(g->distinct_count); free(g->distinct_cap);
-            free(g);
-            g = next;
         }
+        free(st->buckets);
     }
-    free(st->buckets);
     free(st->group_list);
     free(st->group_cols);
     free(st->aggs);
-    qihse_row_stream_close(st->input);
-    for (size_t i = 0; i < st->out_schema.num_cols; i++) free(st->out_schema_names[i]);
-    free(st->out_schema_names);
+    if (st->input) qihse_row_stream_close(st->input);
+    if (st->out_schema_names) {
+        for (size_t i = 0; i < st->out_schema.num_cols; i++) free(st->out_schema_names[i]);
+        free(st->out_schema_names);
+    }
     free(st);
 }
 
@@ -263,14 +371,21 @@ qihse_row_stream_t* qihse_aggregate_create(qihse_row_stream_t* input,
                                             const qihse_aggop_t* aggs, size_t num_aggs) {
     if (!input) return NULL;
     qihse_row_stream_t* s = (qihse_row_stream_t*)calloc(1, sizeof(*s));
+    if (!s) return NULL;
     agg_state_t* st = (agg_state_t*)calloc(1, sizeof(*st));
+    if (!st) { free(s); return NULL; }
+
     st->input = input;
     st->num_groups = num_groups;
     st->group_cols = (int*)calloc(num_groups ? num_groups : 1, sizeof(int));
-    memcpy(st->group_cols, group_cols, num_groups * sizeof(int));
+    if (group_cols && st->group_cols) {
+        memcpy(st->group_cols, group_cols, num_groups * sizeof(int));
+    }
     st->num_aggs = num_aggs;
     st->aggs = (qihse_aggop_t*)calloc(num_aggs ? num_aggs : 1, sizeof(qihse_aggop_t));
-    memcpy(st->aggs, aggs, num_aggs * sizeof(qihse_aggop_t));
+    if (aggs && st->aggs) {
+        memcpy(st->aggs, aggs, num_aggs * sizeof(qihse_aggop_t));
+    }
 
     /* output schema: group cols + agg result cols */
     size_t total = num_groups + num_aggs;
@@ -278,7 +393,7 @@ qihse_row_stream_t* qihse_aggregate_create(qihse_row_stream_t* input,
     st->out_schema.num_cols = total;
     for (size_t i = 0; i < num_groups; i++) {
         int idx = group_cols[i];
-        st->out_schema_names[i] = strdup(idx >= 0 ? input->schema->names[idx] : "?");
+        st->out_schema_names[i] = strdup((idx >= 0 && input->schema && input->schema->names) ? input->schema->names[idx] : "?");
     }
     for (size_t i = 0; i < num_aggs; i++) {
         char buf[64];

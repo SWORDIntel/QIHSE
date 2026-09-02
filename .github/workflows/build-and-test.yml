@@ -35,15 +35,48 @@ jobs:
 
     - name: Run Auth Privilege Boundary Regression
       run: |
-        gcc -std=c99 -Wall -Wextra -I. -I./include -I./core \
-          tests/test_auth_privilege_boundary.c -L. -lqihse \
-          -o tests/test_auth_privilege_boundary
-        LD_LIBRARY_PATH=$PWD ./tests/test_auth_privilege_boundary
+        make test-auth-privilege-boundary
+
+    - name: Run Object ACL Regression
+      run: |
+        make test-object-acl
+
+    - name: Run Aggregate Hardening Regression
+      run: |
+        make test-aggregate-hardened
+
+    - name: Run APT41 Fuzz Testing (ASan & UBSan)
+      run: |
+        make test-apt41
 
     - name: Run Python SDK Tests
       run: |
         export LD_LIBRARY_PATH=$PWD
         PYTHONPATH=python python3 -m unittest discover -s python/tests
+
+  sanitizers:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
+
+    - name: Build Sanitized Shared Library
+      run: |
+        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" lib -j$(nproc)
+
+    - name: Run Sanitized Security Regressions (ASan + UBSan)
+      run: |
+        export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1"
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+        export LD_LIBRARY_PATH=$PWD
+        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-apt41
 
   dashboard:
     runs-on: ubuntu-latest

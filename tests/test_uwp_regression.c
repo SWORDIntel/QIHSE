@@ -314,14 +314,14 @@ static void test_object_acl_with_dispatch(qihse_uwp_context_t* ctx,
     RUN("object_acl_grant");
 
     /* Grant access to resource 42 in namespace 0 */
-    bool granted = qihse_auth_grant_object(operator_user, analyst, 0, 42, QIHSE_ACL_READ);
+    bool granted = qihse_auth_grant_object(operator_user, analyst, 0, 42, QIHSE_ACL_READ | QIHSE_ACL_WRITE);
     if (!granted) {
         FAIL("object_acl_grant", "qihse_auth_grant_object returned false");
         return;
     }
 
     /* Verify analyst can access object 42 */
-    if (!qihse_auth_can_access_object(analyst, 0, 42)) {
+    if (!qihse_auth_can_access_object(analyst, 0, 42, QIHSE_ACL_READ)) {
         FAIL("object_acl_grant", "analyst cannot access granted object 42");
         return;
     }
@@ -352,7 +352,7 @@ static void test_object_acl_with_dispatch(qihse_uwp_context_t* ctx,
     }
 
     /* Verify analyst can no longer access object 42 */
-    if (qihse_auth_can_access_object(analyst, 0, 42)) {
+    if (qihse_auth_can_access_object(analyst, 0, 42, QIHSE_ACL_READ)) {
         FAIL("object_acl_revoke", "analyst still has access to revoked object 42");
         return;
     }
@@ -494,8 +494,7 @@ int main(void)
     assert(operator_user != NULL);
 
     /* Set a known password for the operator so we can authenticate */
-    assert(qihse_auth_modify_user(operator_user, 0, NULL,
-                                  "uwp-regression-test-password", -1, -1));
+    assert(qihse_auth_bootstrap_operator("uwp-regression-test-password"));
 
     /* Create an analyst user for ACL tests */
     qihse_user_t* analyst = qihse_auth_create_user(

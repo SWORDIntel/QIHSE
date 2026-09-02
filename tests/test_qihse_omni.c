@@ -30,14 +30,14 @@ int main() {
     printf("[QIHSE Omni-Test] Establishing Security Clearances...\n");
     qihse_user_t* op = qihse_auth_get_user(0);
     // Rotate operator password to allow privileged operations
-    qihse_auth_modify_user(op, 0, NULL, "SecureOpPass1!", -1, -1);
+    qihse_auth_bootstrap_operator("SecureOpPass1!");
     qihse_user_t* user_a = qihse_auth_create_user(op, 3, QIHSE_ROLE_OPERATOR, CLASSIF_TOP_SECRET, SCI_A | SCI_B, "default_password", true);
     qihse_user_t* user_b = qihse_auth_create_user(user_a, 2, QIHSE_ROLE_ANALYST, CLASSIF_SECRET, SCI_A, "default_password", true);
     qihse_user_t* user_c = qihse_auth_create_user(user_a, 1, QIHSE_ROLE_ANALYST, CLASSIF_UNCLASSIFIED, SCI_NONE, "default_password", true);
     assert(user_a && user_b && user_c);
-    user_a->hardware_token_present = true;
-    user_b->hardware_token_present = true;
-    user_c->hardware_token_present = true;
+    qihse_auth_set_hardware_token(user_a, true, "TOKEN_A");
+    qihse_auth_set_hardware_token(user_b, true, "TOKEN_B");
+    qihse_auth_set_hardware_token(user_c, true, "TOKEN_C");
 
     // 2. KV Store + Clearance
     printf("[QIHSE Omni-Test] Testing KV Store with strict clearance masking...\n");
@@ -109,9 +109,9 @@ int main() {
     qihse_vector_db_destroy(vdb);
     qihse_kv_store_destroy(kv);
 
-    free(user_a);
-    free(user_b);
-    free(user_c);
+    qihse_auth_destroy_user(op, 1);
+    qihse_auth_destroy_user(op, 2);
+    qihse_auth_destroy_user(op, 3);
 
     printf("\n[QIHSE Omni-Test] ALL ENGINES TESTED. CLEARANCES MASKED. HARDWARE GUARD DEPLOYED. SYSTEM SECURE.\n");
     return 0;

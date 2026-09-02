@@ -26,7 +26,7 @@ _lib.qihse_kv_del_user.restype = ctypes.c_bool
 _lib.qihse_kv_exists_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_exists_user.restype = ctypes.c_bool
 
-_lib.qihse_kv_expire.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_uint64]
+_lib.qihse_kv_expire.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_void_p]
 _lib.qihse_kv_expire.restype = ctypes.c_bool
 
 _lib.qihse_kv_save.argtypes = [_KVStore_p, ctypes.c_char_p]
@@ -70,8 +70,8 @@ class KVStore:
     def exists(self, key: str, user=None) -> bool:
         return bool(_lib.qihse_kv_exists_user(self._ptr, key.encode('utf-8'), user))
         
-    def expire(self, key: str, ttl_ms: int) -> bool:
-        return bool(_lib.qihse_kv_expire(self._ptr, key.encode('utf-8'), int(ttl_ms)))
+    def expire(self, key: str, ttl_ms: int, user=None) -> bool:
+        return bool(_lib.qihse_kv_expire(self._ptr, key.encode('utf-8'), int(ttl_ms), user))
         
     def save(self, filepath: str) -> bool:
         return _lib.qihse_kv_save(self._ptr, filepath.encode('utf-8')) == 0

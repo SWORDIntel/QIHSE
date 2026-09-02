@@ -7,6 +7,8 @@
 [submodule "vendor/liboqs"]
 	path = vendor/liboqs
 	url = https://github.com/open-quantum-safe/liboqs.git
+	ignore = dirty
 [submodule "vendor/oqs-provider"]
 	path = vendor/oqs-provider
 	url = https://github.com/open-quantum-safe/oqs-provider.git
+	ignore = dirty
