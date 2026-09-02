@@ -1,11 +1,14 @@
 import unittest
 import tempfile
 import os
+import sys
 import shutil
 import threading
 import time
 import subprocess
 import numpy as np
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from qihse.kv import KVStore
 from qihse.core import VectorDB, DistanceMetric, _lib

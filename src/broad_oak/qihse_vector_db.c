@@ -5237,8 +5237,9 @@ int qihse_vector_db_search(
         query_fallback = *query;
         query_fallback.user = qihse_auth_get_user(0);
         if (!query_fallback.user) {
-            qihse_auth_init();
-            query_fallback.user = qihse_auth_get_user(0);
+            if (qihse_auth_init()) {
+                query_fallback.user = qihse_auth_get_user(0);
+            }
         }
         query = &query_fallback;
     }

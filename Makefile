@@ -278,7 +278,7 @@ test-object-acl: lib
 
 test-auth-privilege-boundary: lib
 	$(CC) $(CFLAGS) -o tests/test_auth_privilege_boundary tests/test_auth_privilege_boundary.c -L. -lqihse $(LDFLAGS)
-	LD_LIBRARY_PATH=. QIHSE_PW_ITERATIONS=1000 ./tests/test_auth_privilege_boundary
+	LD_LIBRARY_PATH=. ./tests/test_auth_privilege_boundary
 
 test-aggregate-hardened: lib
 	$(CC) $(CFLAGS) -o tests/test_aggregate_hardened tests/test_aggregate_hardened.c -L. -lqihse $(LDFLAGS)

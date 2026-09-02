@@ -42,6 +42,10 @@ struct qihse_user_s {
     uint8_t object_acl_count;
 };
 
+// Internal password derivation and verification primitives
+bool qihse_password_compute(const char* password, uint32_t iterations, qihse_password_verifier_t* out_verifier);
+bool qihse_password_verify(const char* password, const qihse_password_verifier_t* verifier);
+
 #ifdef __cplusplus
 }
 #endif
