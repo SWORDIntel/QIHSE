@@ -200,7 +200,8 @@ Current defaults and reviewed controls include:
 - cleartext and legacy clear transports available only through explicit `QIHSE_UWP_ALLOW_INSECURE=1` opt-in;
 - **CNSA 2.0 / FIPS-aligned password-verifier profile using PBKDF2-HMAC-SHA-384** (128-bit random salt, strict 600,000 production iteration floor, and fail-closed FIPS mode);
 - **discrete object ACL flags (`READ`, `WRITE`, `ADMIN`)** enforced on all mutation paths;
-- **authoritative opaque user security context** preventing caller-side privilege or role tampering;
+- **authoritative opaque user security context** with $O(1)$ indexed resolution and reader-writer locking (`pthread_rwlock_t`) preventing caller-side privilege tampering while eliminating thread contention on query reads;
+- **high-throughput zero-churn pipelines**: dynamic aggregate rehashing, $O(1)$ set-associative query caching, zero-heap UWP framing fast-paths, and vectorized atomic `writev` WAL appends;
 - **post-quantum cryptography built by default** via `liboqs` and `oqs-provider`, with `ML-DSA-87` digital signatures and `ML-KEM-1024` key encapsulation;
 - automated security gates including **AddressSanitizer (ASan)**, **UndefinedBehaviorSanitizer (UBSan)**, concurrency stress tests, and fuzzing in CI.
 
