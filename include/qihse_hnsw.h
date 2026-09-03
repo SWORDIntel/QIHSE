@@ -75,6 +75,7 @@ typedef struct {
     bool anchor_seeding_enabled; // toggle for anchor-seeded search
     // Diagnostic counter: number of distance evaluations in the last search.
     uint64_t last_search_dist_calls;
+    bool prebuilt;            // true when loaded from sidecar (skip rebuild)
 } __attribute__((aligned(64))) qihse_hnsw_index_t;
 
 // Function prototypes

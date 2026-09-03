@@ -72,6 +72,8 @@ typedef struct qihse_container_s {
     int fd;
     char* path;            /* Owned copy of the file path */
     bool locked;
+    bool read_only;        /* True when opened via qihse_ctr_open_read */
+    bool skip_integrity;   /* Skip CRC64/HMAC verification on read (pre-prod) */
     qihse_ctr_section_t sections[QIHSE_CTR_MAX_SECTIONS];
     uint32_t section_count;
     qihse_pqc_ctx_t pqc_ctx;
