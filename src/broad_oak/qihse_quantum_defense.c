@@ -8,6 +8,7 @@
 #include "qihse_audit.h"
 #ifndef _WIN32
 #include <pthread.h>
+#include <unistd.h>
 #endif
 #ifndef _WIN32
 #include <openssl/rand.h>
@@ -97,24 +98,59 @@ static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const ch
     }
 }
 
+/* Resolve a GeoLite2 MMDB file path.
+ * Search order:
+ *   1. QIHSE_GEOIP_DIR env var
+ *   2. ~/.local/share/sword/geoip/
+ *   3. /usr/share/GeoIP/
+ *   4. /usr/local/share/GeoIP/
+ *   5. data/geolite2/ (relative to CWD — legacy)
+ * Returns a pointer to a static buffer, or NULL if not found. */
+static const char* qihse_qdd_resolve_mmdb(const char* filename) {
+    static char path[512];
+    const char* env_dir = getenv("QIHSE_GEOIP_DIR");
+    if (env_dir) {
+        snprintf(path, sizeof(path), "%s/%s", env_dir, filename);
+        if (access(path, R_OK) == 0) return path;
+    }
+    const char* home = getenv("HOME");
+    if (home) {
+        snprintf(path, sizeof(path), "%s/.local/share/sword/geoip/%s", home, filename);
+        if (access(path, R_OK) == 0) return path;
+    }
+    snprintf(path, sizeof(path), "/usr/share/GeoIP/%s", filename);
+    if (access(path, R_OK) == 0) return path;
+    snprintf(path, sizeof(path), "/usr/local/share/GeoIP/%s", filename);
+    if (access(path, R_OK) == 0) return path;
+    snprintf(path, sizeof(path), "data/geolite2/%s", filename);
+    if (access(path, R_OK) == 0) return path;
+    return NULL;
+}
+
 qihse_quantum_defense_ctx_t* qihse_qdd_init(void) {
     qihse_quantum_defense_ctx_t* ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
     pthread_mutex_init(&ctx->lock, NULL);
 
-    ctx->mmdb_country = qihse_mmdb_open("data/geolite2/GeoLite2-Country.mmdb");
-    ctx->mmdb_city    = qihse_mmdb_open("data/geolite2/GeoLite2-City.mmdb");
-    ctx->mmdb_asn     = qihse_mmdb_open("data/geolite2/GeoLite2-ASN.mmdb");
+    const char* country_path = qihse_qdd_resolve_mmdb("GeoLite2-Country.mmdb");
+    const char* city_path    = qihse_qdd_resolve_mmdb("GeoLite2-City.mmdb");
+    const char* asn_path     = qihse_qdd_resolve_mmdb("GeoLite2-ASN.mmdb");
+
+    ctx->mmdb_country = country_path ? qihse_mmdb_open(country_path) : NULL;
+    ctx->mmdb_city    = city_path    ? qihse_mmdb_open(city_path)    : NULL;
+    ctx->mmdb_asn     = asn_path     ? qihse_mmdb_open(asn_path)     : NULL;
 
     if (!ctx->mmdb_country || !ctx->mmdb_city || !ctx->mmdb_asn) {
         fprintf(stderr,
             "\n[QIHSE QDD] GeoIP databases not found or incomplete.\n"
             "  Download free GeoLite2 databases (requires free MaxMind account):\n"
             "  https://dev.maxmind.com/geoip/geolite2-free-geolocation-data\n"
-            "  Place the following files in data/geolite2/ relative to the working directory:\n"
-            "    GeoLite2-Country.mmdb\n"
-            "    GeoLite2-City.mmdb\n"
-            "    GeoLite2-ASN.mmdb\n"
+            "  Search order:\n"
+            "    1. $QIHSE_GEOIP_DIR/GeoLite2-*.mmdb\n"
+            "    2. ~/.local/share/sword/geoip/GeoLite2-*.mmdb\n"
+            "    3. /usr/share/GeoIP/GeoLite2-*.mmdb\n"
+            "    4. /usr/local/share/GeoIP/GeoLite2-*.mmdb\n"
+            "    5. data/geolite2/GeoLite2-*.mmdb (relative to CWD)\n"
             "  Geolocation attribution will be disabled until databases are present.\n\n");
         ctx->mmdb_advisory_printed = true;
     }
