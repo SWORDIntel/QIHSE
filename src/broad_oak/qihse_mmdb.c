@@ -269,6 +269,36 @@ static bool mmdb_walk_map(const qihse_mmdb_t* db, mmdb_cursor_t* c,
             return true;
         } else if (valtype == MMDB_TYPE_MAP && key_path[1] != NULL) {
             return mmdb_walk_map(db, c, vsz, key_path + 1, out, out_len);
+        } else if (key_path[1] == NULL && valtype == MMDB_TYPE_DOUBLE) {
+            if (c->pos + 8 > c->len) return false;
+            uint64_t bits = 0;
+            for (int i = 0; i < 8; i++) bits = (bits << 8) | db->data[c->pos + i];
+            double val; memcpy(&val, &bits, 8);
+            snprintf(out, out_len, "%.6f", val);
+            return true;
+        } else if (key_path[1] == NULL && valtype == MMDB_TYPE_FLOAT) {
+            if (c->pos + 4 > c->len) return false;
+            uint32_t bits = 0;
+            for (int i = 0; i < 4; i++) bits = (bits << 8) | db->data[c->pos + i];
+            float val; memcpy(&val, &bits, 4);
+            snprintf(out, out_len, "%.6f", (double)val);
+            return true;
+        } else if (key_path[1] == NULL &&
+                   (valtype == MMDB_TYPE_UINT16 || valtype == MMDB_TYPE_UINT32 ||
+                    valtype == MMDB_TYPE_INT32 || valtype == MMDB_TYPE_UINT64)) {
+            if (c->pos + vsz > c->len) return false;
+            uint64_t val = 0;
+            for (uint32_t i = 0; i < vsz; i++) val = (val << 8) | db->data[c->pos + i];
+            if (valtype == MMDB_TYPE_INT32 && vsz == 4 && (val & 0x80000000)) {
+                int64_t sval = (int64_t)(int32_t)(uint32_t)val;
+                snprintf(out, out_len, "%lld", (long long)sval);
+            } else {
+                snprintf(out, out_len, "%llu", (unsigned long long)val);
+            }
+            return true;
+        } else if (key_path[1] == NULL && valtype == MMDB_TYPE_BOOLEAN) {
+            snprintf(out, out_len, "%s", vsz ? "true" : "false");
+            return true;
         }
         return false;
     }
@@ -303,6 +333,48 @@ static bool mmdb_get_string(const qihse_mmdb_t* db, size_t offset,
         if (c.pos + copy > db->data_len) return false;
         memcpy(out, db->data + c.pos, copy);
         out[copy] = '\0';
+        return true;
+    } else if (valtype == MMDB_TYPE_DOUBLE) {
+        if (key_path != NULL && key_path[0] != NULL) return false;
+        if (c.pos + 8 > db->data_len) return false;
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; i++) bits = (bits << 8) | db->data[c.pos + i];
+        double val;
+        memcpy(&val, &bits, 8);
+        snprintf(out, out_len, "%.6f", val);
+        return true;
+    } else if (valtype == MMDB_TYPE_FLOAT) {
+        if (key_path != NULL && key_path[0] != NULL) return false;
+        if (c.pos + 4 > db->data_len) return false;
+        uint32_t bits = 0;
+        for (int i = 0; i < 4; i++) bits = (bits << 8) | db->data[c.pos + i];
+        float val;
+        memcpy(&val, &bits, 4);
+        snprintf(out, out_len, "%.6f", (double)val);
+        return true;
+    } else if (valtype == MMDB_TYPE_UINT16 || valtype == MMDB_TYPE_UINT32 ||
+               valtype == MMDB_TYPE_INT32) {
+        if (key_path != NULL && key_path[0] != NULL) return false;
+        if (c.pos + sz > db->data_len) return false;
+        uint64_t val = 0;
+        for (uint32_t i = 0; i < sz; i++) val = (val << 8) | db->data[c.pos + i];
+        if (valtype == MMDB_TYPE_INT32 && sz == 4 && (val & 0x80000000)) {
+            int64_t sval = (int64_t)(int32_t)(uint32_t)val;
+            snprintf(out, out_len, "%lld", (long long)sval);
+        } else {
+            snprintf(out, out_len, "%llu", (unsigned long long)val);
+        }
+        return true;
+    } else if (valtype == MMDB_TYPE_UINT64) {
+        if (key_path != NULL && key_path[0] != NULL) return false;
+        if (c.pos + sz > db->data_len) return false;
+        uint64_t val = 0;
+        for (uint32_t i = 0; i < sz; i++) val = (val << 8) | db->data[c.pos + i];
+        snprintf(out, out_len, "%llu", (unsigned long long)val);
+        return true;
+    } else if (valtype == MMDB_TYPE_BOOLEAN) {
+        if (key_path != NULL && key_path[0] != NULL) return false;
+        snprintf(out, out_len, "%s", sz ? "true" : "false");
         return true;
     }
     return false;
