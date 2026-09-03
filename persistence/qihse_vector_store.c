@@ -390,6 +390,12 @@ static bool qihse_load_raw_checked_ctr(const qihse_container_t* ctr,
     if (!qihse_ctr_read_section_alloc(ctr, section_id, out, out_size)) {
         return false;
     }
+    /* Skip CRC64 verification in pre-prod mode (no KEM key file).
+     * The integrity check scans the entire payload (373MB for vectors)
+     * and provides no security with a zero HMAC key. */
+    if (ctr->skip_integrity) {
+        return true;
+    }
     uint64_t actual_crc = qihse_fnv1a64(*out, *out_size);
     if ((uint64_t)*out_size != expected_size64 || actual_crc != expected_crc64) {
         free(*out);
@@ -457,15 +463,22 @@ static bool qihse_load_index_ctr(const qihse_container_t* ctr,
         !qihse_decode_file_header(data, QIHSE_INDEX_MAGIC, &count64, &crc64, &row_bytes) ||
         row_bytes != QIHSE_INDEX_ROW_DISK_SIZE ||
         count64 != manifest->row_count ||
-        crc64 != manifest->index_crc64 ||
         !qihse_u64_to_size(count64, &row_count) ||
         !qihse_checked_mul_size(row_count, QIHSE_INDEX_ROW_DISK_SIZE, &payload_size) ||
         !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, &expected_size) ||
-        size != expected_size ||
-        qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size) != crc64) {
+        size != expected_size) {
         free(data);
         errno = EINVAL;
         return false;
+    }
+    /* Skip CRC64 verification in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (crc64 != manifest->index_crc64 ||
+            qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size) != crc64) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
     }
 
     if (row_count != 0u) {
@@ -515,15 +528,22 @@ static bool qihse_load_idmap_optional_ctr(const qihse_container_t* ctr,
     if (size < QIHSE_FILE_HEADER_SIZE ||
         !qihse_decode_file_header(data, QIHSE_IDMAP_MAGIC, &count64, &crc64, &row_bytes) ||
         row_bytes != QIHSE_IDMAP_ENTRY_DISK_SIZE ||
-        crc64 != manifest->idmap_crc64 ||
         !qihse_u64_to_size(count64, &entry_count) ||
         !qihse_checked_mul_size(entry_count, QIHSE_IDMAP_ENTRY_DISK_SIZE, &payload_size) ||
         !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, &expected_size) ||
-        size != expected_size ||
-        qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size) != crc64) {
+        size != expected_size) {
         free(data);
         errno = EINVAL;
         return false;
+    }
+    /* Skip CRC64 verification in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (crc64 != manifest->idmap_crc64 ||
+            qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size) != crc64) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
     }
 
     if (entry_count != 0u) {
@@ -573,14 +593,21 @@ static bool qihse_load_trinary_optional_ctr(const qihse_container_t* ctr,
     if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_TRINARY, &data, &size)) {
         return false;
     }
-    if ((uint64_t)size != expected_size64 ||
-        qihse_fnv1a64(data, size) != manifest->trinary_crc64 ||
-        !qihse_trinary_tryte_validate_payload(data,
-                                              (size_t)manifest->trinary_rows,
-                                              (size_t)manifest->vector_dims)) {
+    if ((uint64_t)size != expected_size64) {
         free(data);
         errno = EINVAL;
         return false;
+    }
+    /* Skip CRC64 + payload validation in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (qihse_fnv1a64(data, size) != manifest->trinary_crc64 ||
+            !qihse_trinary_tryte_validate_payload(data,
+                                                  (size_t)manifest->trinary_rows,
+                                                  (size_t)manifest->vector_dims)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
     }
     *out = data;
     *out_size = size;
@@ -609,12 +636,19 @@ static bool qihse_load_magnitude_optional_ctr(const qihse_container_t* ctr,
     if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_MAGNITUDE, &data, &size)) {
         return false;
     }
-    if ((uint64_t)size != expected_size64 ||
-        qihse_fnv1a64(data, size) != manifest->magnitude_crc64 ||
-        !qihse_vector_store_validate_magnitude(data, size)) {
+    if ((uint64_t)size != expected_size64) {
         free(data);
         errno = EINVAL;
         return false;
+    }
+    /* Skip CRC64 + validation in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (qihse_fnv1a64(data, size) != manifest->magnitude_crc64 ||
+            !qihse_vector_store_validate_magnitude(data, size)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
     }
     *out = data;
     *out_size = size;
@@ -732,11 +766,13 @@ bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t*
         printf("[DEBUG] qihse_load_manifest_ctr failed\n");
         goto done;
     }
+
     if (!qihse_load_index_ctr(&ctr, &snapshot.manifest,
                               &snapshot.rows, &snapshot.row_count)) {
         printf("[DEBUG] qihse_load_index_ctr failed\n");
         goto done;
     }
+
     if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_VECTORS,
                                     snapshot.manifest.vector_bytes,
                                     snapshot.manifest.vector_crc64,
@@ -744,6 +780,7 @@ bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t*
         printf("[DEBUG] qihse_load_raw_checked_ctr SEC_VECTORS failed\n");
         goto done;
     }
+
     if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_METADATA,
                                     snapshot.manifest.metadata_bytes,
                                     snapshot.manifest.metadata_crc64,

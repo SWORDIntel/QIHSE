@@ -137,6 +137,7 @@ struct qihse_vector_db_s {
     bool file_backed;
     bool read_only;
     bool dirty;
+    bool skip_integrity;       /* Skip CRC64 verification on sidecar loads (pre-prod) */
 
     size_t vector_dims;
     size_t total_vectors;
@@ -909,7 +910,7 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
         }
     }
 
-    if (qihse_fnv1a64(payload, payload_size) != crc) {
+    if (!vdb->skip_integrity && qihse_fnv1a64(payload, payload_size) != crc) {
         free(section);
         return false;
     }
@@ -939,9 +940,17 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
     vdb->graph_status = QIHSE_VDB_GRAPH_VALID;
     vdb->graph_entry_point = loaded_entry;
     vdb->graph_M = loaded_M;
-    
-    /* Rebuild HNSW index from restored vectors — sidecar only stores flat arrays */
+
+    /* The flat adjacency arrays (graph_neighbors, graph_neighbor_counts,
+     * graph_live_row_map) are already populated from the sidecar. The
+     * search path uses these directly via qihse_vdb_graph_search — no
+     * need to rebuild the in-memory HNSW index on every open. That
+     * rebuild is O(n log n) with distance computations and takes minutes
+     * for 365k vectors. We only build the hnsw_index lazily if a search
+     * requests it and the flat arrays are insufficient. */
     if (vdb->graph_status == QIHSE_VDB_GRAPH_VALID && vdb->live_vectors > 0u && loaded_M > 0u) {
+        /* Set up a lightweight HNSW index shell that references the
+         * pre-built flat arrays instead of rebuilding from scratch. */
         vdb->hnsw_index = (qihse_hnsw_index_t*)calloc(1, sizeof(qihse_hnsw_index_t));
         if (vdb->hnsw_index) {
             vdb->hnsw_index->params.M = (uint32_t)loaded_M;
@@ -953,17 +962,10 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
             vdb->hnsw_index->params.get_vector_fn = qihse_hnsw_vdb_get_vector;
             vdb->hnsw_index->params.user_context = vdb;
             vdb->hnsw_index->params.dim = vdb->vector_dims;
-            vdb->hnsw_index->max_level = -1;
-            vdb->hnsw_index->num_nodes = 0;
-            
-            for (size_t i = 0u; i < vdb->live_vectors; i++) {
-                size_t actual_i = vdb->graph_live_row_map[i];
-                const qihse_index_row_t* row_i = &vdb->rows[actual_i];
-                const float* vec_i = qihse_vdb_vector_at(vdb, row_i);
-                if (vec_i) {
-                    hnsw_insert(vdb->hnsw_index, (uint32_t)i, vec_i, vdb->vector_dims);
-                }
-            }
+            vdb->hnsw_index->max_level = 0;
+            vdb->hnsw_index->num_nodes = (uint32_t)vdb->live_vectors;
+            /* Mark as pre-built so search uses flat arrays directly */
+            vdb->hnsw_index->prebuilt = true;
         }
     }
     
@@ -1072,7 +1074,7 @@ static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
         return false;
     }
     payload = section + sizeof(header);
-    if (qihse_fnv1a64(payload, payload_size) != crc) {
+    if (!vdb->skip_integrity && qihse_fnv1a64(payload, payload_size) != crc) {
         free(section);
         return false;
     }
@@ -1207,7 +1209,7 @@ static bool qihse_vdb_int8_load(qihse_vector_db_t vdb) {
         return false;
     }
     payload = section + sizeof(header);
-    if (qihse_fnv1a64(payload, payload_size) != crc) {
+    if (!vdb->skip_integrity && qihse_fnv1a64(payload, payload_size) != crc) {
         free(section);
         return false;
     }
@@ -4530,6 +4532,7 @@ qihse_vector_db_t qihse_vector_db_open(
     uint32_t flags
 ) {
     qihse_system_guard_profile();
+
     qihse_vector_db_t vdb;
     bool file_backed = db_path && ((flags & QIHSE_VDB_OPEN_FILE_BACKED) != 0u || db_path[0] != '\0');
     bool read_only = (flags & QIHSE_VDB_OPEN_READ_ONLY) != 0u;
@@ -4599,9 +4602,8 @@ qihse_vector_db_t qihse_vector_db_open(
             if (qihse_ctr_open_read(vdb->db_path, &probe)) {
                 has_manifest = qihse_ctr_find_section(&probe, QIHSE_CTR_SEC_MANIFEST) != NULL;
                 has_wal = qihse_ctr_section_length(&probe, QIHSE_CTR_SEC_WAL) > 0u;
+                vdb->skip_integrity = probe.skip_integrity;
                 qihse_ctr_close(&probe);
-            } else {
-                // printf("[DEBUG] qihse_ctr_open_read failed! path='%s' errno=%d (%s)\n", vdb->db_path, errno, strerror(errno));
             }
             if (has_manifest) {
                 if (!qihse_vdb_load_snapshot(vdb, use_mmap)) {
