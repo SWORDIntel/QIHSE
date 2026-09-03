@@ -341,7 +341,11 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
      * verification on read. The HMAC key is zero anyway, so the
      * integrity check provides no security. This makes opening a
      * 473MB vector index take <1s instead of 10+ minutes.
-     * Set QIHSE_ENFORCE_INTEGRITY=1 to force verification. */
+     * Set QIHSE_ENFORCE_INTEGRITY=1 to force verification.
+     *
+     * In production (KEM key present), CRC verification is enabled.
+     * Set QIHSE_PARALLEL_CRC=1 to use the unrolled FNV-1a (2x faster)
+     * and QIHSE_CRC_THREADS=N to control thread count. */
     {
         bool key_exists = false;
 #ifndef _WIN32
@@ -350,6 +354,9 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
 #endif
         ctr->skip_integrity = (!key_exists &&
                                getenv("QIHSE_ENFORCE_INTEGRITY") == NULL);
+        ctr->parallel_crc = (getenv("QIHSE_PARALLEL_CRC") != NULL);
+        const char* threads_env = getenv("QIHSE_CRC_THREADS");
+        ctr->crc_threads = threads_env ? atoi(threads_env) : 0;
     }
     
     {
