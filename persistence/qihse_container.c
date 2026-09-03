@@ -355,6 +355,7 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
         ctr->skip_integrity = (!key_exists &&
                                getenv("QIHSE_ENFORCE_INTEGRITY") == NULL);
         ctr->parallel_crc = (getenv("QIHSE_PARALLEL_CRC") != NULL);
+        ctr->use_crc32c = (getenv("QIHSE_CRC32C") != NULL);
         const char* threads_env = getenv("QIHSE_CRC_THREADS");
         ctr->crc_threads = threads_env ? atoi(threads_env) : 0;
     }

@@ -75,6 +75,7 @@ typedef struct qihse_container_s {
     bool read_only;        /* True when opened via qihse_ctr_open_read */
     bool skip_integrity;   /* Skip CRC64/HMAC verification on read (pre-prod) */
     bool parallel_crc;     /* Use parallel fingerprint for CRC (production fast path) */
+    bool use_crc32c;       /* Use CRC32C (SSE4.2) instead of FNV-1a for verification */
     int  crc_threads;      /* Thread count for parallel CRC (0 = auto) */
     qihse_ctr_section_t sections[QIHSE_CTR_MAX_SECTIONS];
     uint32_t section_count;

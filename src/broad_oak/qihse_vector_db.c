@@ -139,6 +139,7 @@ struct qihse_vector_db_s {
     bool dirty;
     bool skip_integrity;       /* Skip CRC64 verification on sidecar loads (pre-prod) */
     bool parallel_crc;         /* Use unrolled/parallel FNV-1a for CRC verification */
+    bool use_crc32c;           /* Use CRC32C (SSE4.2) instead of FNV-1a */
     int  crc_threads;          /* Thread count for parallel CRC (0 = auto) */
 
     size_t vector_dims;
@@ -912,7 +913,7 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
         }
     }
 
-    if (!vdb->skip_integrity && qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc) {
+    if (!vdb->skip_integrity && ((vdb->use_crc32c && (crc >> 32) == 0xC32C0000u) ? qihse_crc32c_parallel(payload, payload_size, vdb->crc_threads) != (uint32_t)(crc & 0xFFFFFFFFu) : qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc)) {
         free(section);
         return false;
     }
@@ -1076,7 +1077,7 @@ static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
         return false;
     }
     payload = section + sizeof(header);
-    if (!vdb->skip_integrity && qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc) {
+    if (!vdb->skip_integrity && ((vdb->use_crc32c && (crc >> 32) == 0xC32C0000u) ? qihse_crc32c_parallel(payload, payload_size, vdb->crc_threads) != (uint32_t)(crc & 0xFFFFFFFFu) : qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc)) {
         free(section);
         return false;
     }
@@ -1211,7 +1212,7 @@ static bool qihse_vdb_int8_load(qihse_vector_db_t vdb) {
         return false;
     }
     payload = section + sizeof(header);
-    if (!vdb->skip_integrity && qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc) {
+    if (!vdb->skip_integrity && ((vdb->use_crc32c && (crc >> 32) == 0xC32C0000u) ? qihse_crc32c_parallel(payload, payload_size, vdb->crc_threads) != (uint32_t)(crc & 0xFFFFFFFFu) : qihse_fnv1a64_parallel_verify(payload, payload_size, vdb->crc_threads) != crc)) {
         free(section);
         return false;
     }
@@ -4606,6 +4607,7 @@ qihse_vector_db_t qihse_vector_db_open(
                 has_wal = qihse_ctr_section_length(&probe, QIHSE_CTR_SEC_WAL) > 0u;
                 vdb->skip_integrity = probe.skip_integrity;
                 vdb->parallel_crc = probe.parallel_crc;
+                vdb->use_crc32c = probe.use_crc32c;
                 vdb->crc_threads = probe.crc_threads;
                 qihse_ctr_close(&probe);
             }

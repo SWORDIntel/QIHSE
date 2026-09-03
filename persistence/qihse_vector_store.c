@@ -376,6 +376,24 @@ static bool qihse_load_manifest_ctr(const qihse_container_t* ctr,
     return ok;
 }
 
+/* Helper: verify CRC for a loaded section.
+ * Returns true if CRC matches, false otherwise.
+ * Uses CRC32C (SSE4.2) if use_crc32c is set and the expected CRC has
+ * the CRC32C marker (upper 32 bits = 0xC32C0000). Otherwise uses FNV-1a. */
+static bool verify_section_crc(const qihse_container_t* ctr,
+                               const void* data, size_t size,
+                               uint64_t expected_crc64) {
+    if (ctr->use_crc32c && (expected_crc64 >> 32) == 0xC32C0000u) {
+        uint32_t expected_crc32c = (uint32_t)(expected_crc64 & 0xFFFFFFFFu);
+        uint32_t actual_crc32c = qihse_crc32c_parallel(data, size,
+                                                        ctr->crc_threads);
+        return actual_crc32c == expected_crc32c;
+    }
+    uint64_t actual_crc = qihse_fnv1a64_parallel_verify(data, size,
+                                                        ctr->crc_threads);
+    return actual_crc == expected_crc64;
+}
+
 static bool qihse_load_raw_checked_ctr(const qihse_container_t* ctr,
                                        uint16_t section_id,
                                        uint64_t expected_size64,
@@ -396,11 +414,9 @@ static bool qihse_load_raw_checked_ctr(const qihse_container_t* ctr,
     if (ctr->skip_integrity) {
         return true;
     }
-    /* Production mode: verify CRC using the unrolled FNV-1a for ~2x
-     * speedup over the naive byte-at-a-time loop. */
-    uint64_t actual_crc = qihse_fnv1a64_parallel_verify(*out, *out_size,
-                                                         ctr->crc_threads);
-    if ((uint64_t)*out_size != expected_size64 || actual_crc != expected_crc64) {
+    /* Production mode: verify CRC using CRC32C or FNV-1a */
+    if ((uint64_t)*out_size != expected_size64 ||
+        !verify_section_crc(ctr, *out, *out_size, expected_crc64)) {
         free(*out);
         *out = NULL;
         *out_size = 0u;
@@ -477,7 +493,7 @@ static bool qihse_load_index_ctr(const qihse_container_t* ctr,
     /* Skip CRC64 verification in pre-prod mode */
     if (!ctr->skip_integrity) {
         if (crc64 != manifest->index_crc64 ||
-            qihse_fnv1a64_parallel_verify(data + QIHSE_FILE_HEADER_SIZE, payload_size, ctr->crc_threads) != crc64) {
+            !verify_section_crc(ctr, data + QIHSE_FILE_HEADER_SIZE, payload_size, crc64)) {
             free(data);
             errno = EINVAL;
             return false;
@@ -542,7 +558,7 @@ static bool qihse_load_idmap_optional_ctr(const qihse_container_t* ctr,
     /* Skip CRC64 verification in pre-prod mode */
     if (!ctr->skip_integrity) {
         if (crc64 != manifest->idmap_crc64 ||
-            qihse_fnv1a64_parallel_verify(data + QIHSE_FILE_HEADER_SIZE, payload_size, ctr->crc_threads) != crc64) {
+            !verify_section_crc(ctr, data + QIHSE_FILE_HEADER_SIZE, payload_size, crc64)) {
             free(data);
             errno = EINVAL;
             return false;
@@ -603,7 +619,7 @@ static bool qihse_load_trinary_optional_ctr(const qihse_container_t* ctr,
     }
     /* Skip CRC64 + payload validation in pre-prod mode */
     if (!ctr->skip_integrity) {
-        if (qihse_fnv1a64_parallel_verify(data, size, ctr->crc_threads) != manifest->trinary_crc64 ||
+        if (!verify_section_crc(ctr, data, size, manifest->trinary_crc64) ||
             !qihse_trinary_tryte_validate_payload(data,
                                                   (size_t)manifest->trinary_rows,
                                                   (size_t)manifest->vector_dims)) {
@@ -646,7 +662,7 @@ static bool qihse_load_magnitude_optional_ctr(const qihse_container_t* ctr,
     }
     /* Skip CRC64 + validation in pre-prod mode */
     if (!ctr->skip_integrity) {
-        if (qihse_fnv1a64_parallel_verify(data, size, ctr->crc_threads) != manifest->magnitude_crc64 ||
+        if (!verify_section_crc(ctr, data, size, manifest->magnitude_crc64) ||
             !qihse_vector_store_validate_magnitude(data, size)) {
             free(data);
             errno = EINVAL;
@@ -939,14 +955,27 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
     manifest.metadata_bytes = (uint64_t)in->metadata_bytes;
     manifest.commit_generation = in->commit_generation;
     manifest.index_crc64 = index_crc64;
-    manifest.vector_crc64 = qihse_fnv1a64(in->vectors, in->vector_bytes);
-    manifest.metadata_crc64 = qihse_fnv1a64(in->metadata, in->metadata_bytes);
+    /* Use CRC32C (SSE4.2, ~10GB/s) if QIHSE_CRC32C=1, storing with
+     * marker 0xC32C0000 in upper 32 bits. Otherwise use FNV-1a. */
+    bool use_crc32c_write = (getenv("QIHSE_CRC32C") != NULL &&
+                             qihse_crc32c_available());
+    if (use_crc32c_write) {
+        manifest.vector_crc64 = ((uint64_t)0xC32C0000u << 32) |
+                                qihse_crc32c(in->vectors, in->vector_bytes);
+        manifest.metadata_crc64 = ((uint64_t)0xC32C0000u << 32) |
+                                  qihse_crc32c(in->metadata, in->metadata_bytes);
+    } else {
+        manifest.vector_crc64 = qihse_fnv1a64(in->vectors, in->vector_bytes);
+        manifest.metadata_crc64 = qihse_fnv1a64(in->metadata, in->metadata_bytes);
+    }
     manifest.idmap_crc64 = idmap_crc64;
     if (in->trinary_bytes != 0u) {
         manifest.trinary_generation = in->trinary_generation;
         manifest.trinary_row_bytes = in->trinary_row_bytes;
         manifest.trinary_rows = (uint64_t)in->row_count;
-        manifest.trinary_crc64 = qihse_fnv1a64(in->trinary, in->trinary_bytes);
+        manifest.trinary_crc64 = use_crc32c_write ?
+            (((uint64_t)0xC32C0000u << 32) | qihse_crc32c(in->trinary, in->trinary_bytes)) :
+            qihse_fnv1a64(in->trinary, in->trinary_bytes);
         manifest.trinary_flags =
             in->trinary_flags | QIHSE_VSTORE_TRI_PRESENT | QIHSE_VSTORE_TRI_VALID;
     }
@@ -954,7 +983,9 @@ bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flus
         manifest.magnitude_generation = in->magnitude_generation;
         manifest.magnitude_row_bytes = in->magnitude_row_bytes;
         manifest.magnitude_rows = (uint64_t)in->row_count;
-        manifest.magnitude_crc64 = qihse_fnv1a64(in->magnitude, in->magnitude_bytes);
+        manifest.magnitude_crc64 = use_crc32c_write ?
+            (((uint64_t)0xC32C0000u << 32) | qihse_crc32c(in->magnitude, in->magnitude_bytes)) :
+            qihse_fnv1a64(in->magnitude, in->magnitude_bytes);
         manifest.magnitude_flags =
             in->magnitude_flags | QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID;
     }
