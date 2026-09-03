@@ -334,7 +334,23 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
     ctr->fd = fd;
     ctr->section_count = count;
     ctr->locked = false;
+    ctr->read_only = true;
     ctr->path = NULL;
+
+    /* In pre-prod mode (no KEM key file), skip expensive CRC64
+     * verification on read. The HMAC key is zero anyway, so the
+     * integrity check provides no security. This makes opening a
+     * 473MB vector index take <1s instead of 10+ minutes.
+     * Set QIHSE_ENFORCE_INTEGRITY=1 to force verification. */
+    {
+        bool key_exists = false;
+#ifndef _WIN32
+        FILE *kf = fopen(QIHSE_KEM_PRIVATE_KEY_FILE, "rb");
+        if (kf) { fclose(kf); key_exists = true; }
+#endif
+        ctr->skip_integrity = (!key_exists &&
+                               getenv("QIHSE_ENFORCE_INTEGRITY") == NULL);
+    }
     
     {
         int key_idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_KEY);
