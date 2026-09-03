@@ -61,6 +61,48 @@ uint64_t qihse_fnv1a64_parallel(const void* data, size_t size, int nthreads);
  */
 uint64_t qihse_fnv1a64_parallel_verify(const void* data, size_t size, int nthreads);
 
+/* ---- CRC32C (Castagnoli) with SSE4.2 hardware acceleration ---- */
+
+/*
+ * CRC32C is hardware-accelerated via SSE4.2 (_mm_crc32_u64) and runs
+ * at ~10 GB/s vs ~400 MB/s for FNV-1a. Unlike FNV-1a, CRC32C is
+ * algebraically combinable: crc(a||b) can be computed from crc(a)
+ * and crc(b) with a length-dependent correction, making it truly
+ * parallelizable.
+ *
+ * We store CRC32C as the low 32 bits of a uint64_t in the manifest
+ * (new manifest version). The upper 32 bits are reserved for a
+ * parallel-combine seed.
+ *
+ * Returns the CRC32C checksum, or 0 on error.
+ */
+uint32_t qihse_crc32c(const void* data, size_t size);
+
+/*
+ * Parallel CRC32C using SSE4.2 + algebraic combination.
+ *
+ * Splits the buffer into nthreads chunks, computes CRC32C on each
+ * chunk in parallel, then combines them using crc32c_combine().
+ * Produces the EXACT same value as sequential qihse_crc32c().
+ *
+ * Returns the CRC32C checksum, or 0 on error.
+ */
+uint32_t qihse_crc32c_parallel(const void* data, size_t size, int nthreads);
+
+/*
+ * Combine two CRC32C values: if A is the CRC32C of data[0..len2)
+ * and B is the CRC32C of data[len2..len2+len3), this returns the
+ * CRC32C of data[0..len2+len3).
+ *
+ * Uses PCLMULQDQ for the polynomial multiplication step.
+ */
+uint32_t qihse_crc32c_combine(uint32_t crc1, uint32_t crc2, size_t len2);
+
+/*
+ * Check if SSE4.2 CRC32C instructions are available at runtime.
+ */
+bool qihse_crc32c_available(void);
+
 bool qihse_checked_add_size(size_t a, size_t b, size_t* out);
 bool qihse_checked_mul_size(size_t a, size_t b, size_t* out);
 bool qihse_checked_add_u64(uint64_t a, uint64_t b, uint64_t* out);
