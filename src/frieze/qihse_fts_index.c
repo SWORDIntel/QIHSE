@@ -404,3 +404,228 @@ qihse_keystone_class_t qihse_fts_get_doc_semantic_class(qihse_fts_index_t* index
     }
     return QIHSE_KEYSTONE_CLASS_UNKNOWN;
 }
+
+/* ===========================================================================
+ * FTS Persistence — save/load to disk
+ *
+ * Format (all little-endian):
+ *   magic[4]         = "QFTS"
+ *   version(u32)     = 1
+ *   doc_count(u32)
+ *   total_doc_length(u64)
+ *   doc_capacity(u32)
+ *   docs[doc_count]:
+ *     doc_id(u64) length(u32) classification(u16) sci_compartment(u16) semantic_class(u32)
+ *   trigram_count(u32)
+ *   trigrams[trigram_count]:
+ *     key(u32) document_frequency(u32)
+ *     postings[document_frequency]:
+ *       doc_idx(u32) term_frequency(u32)
+ *       positions[term_frequency]: u32 each
+ *
+ * Security: Both save and load require an authenticated qihse_user_t*.
+ *   - save: denies if any document's classification exceeds the caller's
+ *     clearance (no partial export — prevents inference from selective
+ *     disclosure).
+ *   - load: denies if any document in the file has classification above
+ *     the caller's clearance (no partial import — prevents loading data
+ *     the user cannot legitimately access).
+ * =========================================================================== */
+
+#include <stdio.h>
+
+#define QFTS_MAGIC 0x53544651  /* "QFTS" in little-endian */
+#define QFTS_VERSION 1
+
+bool qihse_fts_save(qihse_fts_index_t* index, const char* filepath, qihse_user_t* user) {
+    if (!index || !filepath) return false;
+
+    /* Authorization check: caller must be able to access every document's
+     * classification level. Deny entirely if any document is above the
+     * caller's clearance — no partial export.
+     *
+     * NULL user is permitted for unclassified-only indexes (classification=0,
+     * sci_compartment=0). qihse_auth_can_access(NULL, 0, 0) returns true,
+     * but qihse_auth_can_access(NULL, >0, >0) returns false. This preserves
+     * invariant 1: NULL must not become an authorization bypass. */
+    for (uint32_t i = 0; i < index->doc_count; i++) {
+        if (!qihse_auth_can_access(user, index->docs[i].classification, index->docs[i].sci_compartment)) {
+            return false;
+        }
+    }
+
+    FILE* f = fopen(filepath, "wb");
+    if (!f) return false;
+
+    /* Header */
+    uint32_t magic = QFTS_MAGIC;
+    uint32_t version = QFTS_VERSION;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&index->doc_count, sizeof(index->doc_count), 1, f);
+    fwrite(&index->total_doc_length, sizeof(index->total_doc_length), 1, f);
+    fwrite(&index->doc_capacity, sizeof(index->doc_capacity), 1, f);
+
+    /* Documents */
+    for (uint32_t i = 0; i < index->doc_count; i++) {
+        fwrite(&index->docs[i].doc_id, sizeof(uint64_t), 1, f);
+        fwrite(&index->docs[i].length, sizeof(uint32_t), 1, f);
+        fwrite(&index->docs[i].classification, sizeof(uint16_t), 1, f);
+        fwrite(&index->docs[i].sci_compartment, sizeof(uint16_t), 1, f);
+        fwrite(&index->docs[i].semantic_class, sizeof(uint32_t), 1, f);
+    }
+
+    /* Count non-empty trigram slots */
+    uint32_t trigram_count = 0;
+    for (size_t i = 0; i < TRIGRAM_HASH_SIZE; i++) {
+        if (index->trigram_table[i].key != 0) trigram_count++;
+    }
+    fwrite(&trigram_count, sizeof(trigram_count), 1, f);
+
+    /* Trigrams + postings */
+    for (size_t i = 0; i < TRIGRAM_HASH_SIZE; i++) {
+        trigram_entry_t* entry = &index->trigram_table[i];
+        if (entry->key == 0) continue;
+
+        fwrite(&entry->key, sizeof(uint32_t), 1, f);
+        posting_list_t* pl = entry->p_list;
+        uint32_t df = pl ? pl->document_frequency : 0;
+        fwrite(&df, sizeof(uint32_t), 1, f);
+
+        if (pl) {
+            doc_posting_t* curr = pl->head;
+            while (curr) {
+                fwrite(&curr->doc_idx, sizeof(uint32_t), 1, f);
+                fwrite(&curr->term_frequency, sizeof(uint32_t), 1, f);
+                /* Write positions */
+                for (uint32_t p = 0; p < curr->term_frequency; p++) {
+                    fwrite(&curr->positions[p], sizeof(uint32_t), 1, f);
+                }
+                curr = curr->next;
+            }
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
+qihse_fts_index_t* qihse_fts_load(const char* filepath, qihse_user_t* user) {
+    if (!filepath) return NULL;
+    FILE* f = fopen(filepath, "rb");
+    if (!f) return NULL;
+
+    uint32_t magic, version;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != QFTS_MAGIC) { fclose(f); return NULL; }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version != QFTS_VERSION) { fclose(f); return NULL; }
+
+    uint32_t doc_count;
+    uint64_t total_doc_length;
+    uint32_t doc_capacity;
+    if (fread(&doc_count, sizeof(doc_count), 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&total_doc_length, sizeof(total_doc_length), 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&doc_capacity, sizeof(doc_capacity), 1, f) != 1) { fclose(f); return NULL; }
+
+    /* Pre-scan: read document metadata to check authorization before
+     * allocating or populating the index. If any document's classification
+     * exceeds the caller's clearance, deny the entire load. */
+    /* We need to read the doc metadata, check auth, then seek back. */
+    long doc_section_start = ftell(f);
+    for (uint32_t i = 0; i < doc_count; i++) {
+        uint64_t doc_id;
+        uint32_t length;
+        uint16_t classification, sci_compartment;
+        uint32_t semantic_class;
+        if (fread(&doc_id, sizeof(uint64_t), 1, f) != 1) { fclose(f); return NULL; }
+        if (fread(&length, sizeof(uint32_t), 1, f) != 1) { fclose(f); return NULL; }
+        if (fread(&classification, sizeof(uint16_t), 1, f) != 1) { fclose(f); return NULL; }
+        if (fread(&sci_compartment, sizeof(uint16_t), 1, f) != 1) { fclose(f); return NULL; }
+        if (fread(&semantic_class, sizeof(uint32_t), 1, f) != 1) { fclose(f); return NULL; }
+
+        if (!qihse_auth_can_access(user, classification, sci_compartment)) {
+            /* Deny: caller cannot access data at this classification level.
+             * No partial load — prevents importing data above clearance. */
+            fclose(f);
+            return NULL;
+        }
+    }
+
+    /* Seek back to re-read documents into the index */
+    if (fseek(f, doc_section_start, SEEK_SET) != 0) { fclose(f); return NULL; }
+
+    qihse_fts_index_t* index = qihse_fts_create();
+    if (!index) { fclose(f); return NULL; }
+
+    /* Resize docs array if needed */
+    if (doc_capacity > index->doc_capacity) {
+        doc_info_t* new_docs = (doc_info_t*)realloc(index->docs, doc_capacity * sizeof(doc_info_t));
+        if (!new_docs) { qihse_fts_destroy(index); fclose(f); return NULL; }
+        index->docs = new_docs;
+        index->doc_capacity = doc_capacity;
+    }
+
+    /* Read documents */
+    for (uint32_t i = 0; i < doc_count; i++) {
+        if (fread(&index->docs[i].doc_id, sizeof(uint64_t), 1, f) != 1) goto fail;
+        if (fread(&index->docs[i].length, sizeof(uint32_t), 1, f) != 1) goto fail;
+        if (fread(&index->docs[i].classification, sizeof(uint16_t), 1, f) != 1) goto fail;
+        if (fread(&index->docs[i].sci_compartment, sizeof(uint16_t), 1, f) != 1) goto fail;
+        if (fread(&index->docs[i].semantic_class, sizeof(uint32_t), 1, f) != 1) goto fail;
+    }
+    index->doc_count = doc_count;
+    index->total_doc_length = total_doc_length;
+
+    /* Read trigrams + postings */
+    uint32_t trigram_count;
+    if (fread(&trigram_count, sizeof(trigram_count), 1, f) != 1) goto fail;
+
+    for (uint32_t t = 0; t < trigram_count; t++) {
+        uint32_t key;
+        uint32_t df;
+        if (fread(&key, sizeof(key), 1, f) != 1) goto fail;
+        if (fread(&df, sizeof(df), 1, f) != 1) goto fail;
+
+        /* Reconstruct trigram string from key */
+        char trigram[4];
+        unpack_trigram(key, trigram);
+
+        /* Find or create posting list */
+        posting_list_t* pl = trigram_get_or_create(index, trigram);
+        if (!pl) goto fail;
+
+        for (uint32_t d = 0; d < df; d++) {
+            uint32_t doc_idx, tf;
+            if (fread(&doc_idx, sizeof(doc_idx), 1, f) != 1) goto fail;
+            if (fread(&tf, sizeof(tf), 1, f) != 1) goto fail;
+
+            doc_posting_t* doc_node = (doc_posting_t*)qihse_arena_alloc(index->arena, sizeof(doc_posting_t));
+            if (!doc_node) goto fail;
+            doc_node->doc_idx = doc_idx;
+            doc_node->term_frequency = tf;
+            doc_node->capacity = tf;
+            doc_node->positions = (uint32_t*)qihse_arena_alloc(index->arena, sizeof(uint32_t) * (tf > 0 ? tf : 1));
+            if (!doc_node->positions) goto fail;
+            doc_node->next = NULL;
+
+            for (uint32_t p = 0; p < tf; p++) {
+                if (fread(&doc_node->positions[p], sizeof(uint32_t), 1, f) != 1) goto fail;
+            }
+
+            if (!pl->head) {
+                pl->head = doc_node;
+            } else {
+                pl->tail->next = doc_node;
+            }
+            pl->tail = doc_node;
+            pl->document_frequency++;
+        }
+    }
+
+    fclose(f);
+    return index;
+
+fail:
+    qihse_fts_destroy(index);
+    fclose(f);
+    return NULL;
+}

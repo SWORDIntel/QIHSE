@@ -1,6 +1,6 @@
 import ctypes
 import json
-from typing import Optional
+from typing import Optional, Callable, Any
 from .core import _lib
 
 class _KVStore(ctypes.Structure):
@@ -34,6 +34,20 @@ _lib.qihse_kv_save.restype = ctypes.c_int
 
 _lib.qihse_kv_load.argtypes = [_KVStore_p, ctypes.c_char_p]
 _lib.qihse_kv_load.restype = ctypes.c_int
+
+# Iteration support
+_KV_ITER_CB = ctypes.CFUNCTYPE(
+    ctypes.c_bool,  # return: true=continue, false=stop
+    ctypes.c_char_p,  # key
+    ctypes.c_char_p,  # value
+    ctypes.c_void_p,  # user_data
+)
+
+_lib.qihse_kv_foreach.argtypes = [_KVStore_p, _KV_ITER_CB, ctypes.c_void_p]
+_lib.qihse_kv_foreach.restype = None
+
+_lib.qihse_kv_clear.argtypes = [_KVStore_p]
+_lib.qihse_kv_clear.restype = ctypes.c_size_t
 
 class KVStore:
     def __init__(self):
@@ -94,3 +108,60 @@ class KVStore:
         port = finding.get("port", "unknown")
         key = f"finding:{cve}:{ip_addr}:{port}"
         return self.set(key, json.dumps(finding))
+
+    def foreach(self, callback: Callable[[str, str], bool]) -> int:
+        """Iterate over all live key-value pairs.
+
+        The callback receives (key, value) as strings and should return
+        True to continue iteration, False to stop.
+
+        Returns the number of pairs visited.
+        """
+        count = [0]
+
+        def _cb(key_ptr, val_ptr, _user_data):
+            count[0] += 1
+            key = key_ptr.decode('utf-8') if key_ptr else ""
+            val = val_ptr.decode('utf-8') if val_ptr else ""
+            return callback(key, val)
+
+        c_cb = _KV_ITER_CB(_cb)
+        _lib.qihse_kv_foreach(self._ptr, c_cb, None)
+        return count[0]
+
+    def keys(self, prefix: str = None) -> list:
+        """Return all keys, optionally filtered by prefix."""
+        result = []
+
+        def _cb(key, _val):
+            if prefix is None or key.startswith(prefix):
+                result.append(key)
+            return True
+
+        self.foreach(_cb)
+        return result
+
+    def items(self, prefix: str = None) -> list:
+        """Return all (key, value) pairs, optionally filtered by prefix."""
+        result = []
+
+        def _cb(key, val):
+            if prefix is None or key.startswith(prefix):
+                result.append((key, val))
+            return True
+
+        self.foreach(_cb)
+        return result
+
+    def clear(self) -> int:
+        """Remove all keys. Returns the number removed."""
+        return _lib.qihse_kv_clear(self._ptr)
+
+    def size(self) -> int:
+        """Return the number of live keys."""
+        count = [0]
+        def _cb(_k, _v):
+            count[0] += 1
+            return True
+        self.foreach(_cb)
+        return count[0]

@@ -69,6 +69,12 @@ _lib.qihse_fts_search_user_filtered.restype = ctypes.c_int
 _lib.qihse_fts_get_doc_semantic_class.argtypes = [_FTSIndex_p, ctypes.c_uint64]
 _lib.qihse_fts_get_doc_semantic_class.restype = ctypes.c_int
 
+_lib.qihse_fts_save.argtypes = [_FTSIndex_p, ctypes.c_char_p, ctypes.c_void_p]
+_lib.qihse_fts_save.restype = ctypes.c_bool
+
+_lib.qihse_fts_load.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+_lib.qihse_fts_load.restype = _FTSIndex_p
+
 
 @dataclass
 class FTSResult:
@@ -171,3 +177,31 @@ class FTSIndex:
         """
         cls_val = _lib.qihse_fts_get_doc_semantic_class(self._ptr, int(doc_id))
         return KeystoneClass(cls_val)
+
+    def save(self, filepath: str, user=None) -> bool:
+        """Saves the FTS index to a binary file on disk.
+
+        For unclassified indexes (all documents at classification=0), user
+        may be None. For classified indexes, a user with sufficient clearance
+        is required; the save is denied if any document exceeds the user's
+        clearance.
+        """
+        return bool(_lib.qihse_fts_save(self._ptr, filepath.encode("utf-8"), user))
+
+    @classmethod
+    def load(cls, filepath: str, user=None) -> "FTSIndex":
+        """Loads an FTS index from a binary file created by save().
+
+        For unclassified files, user may be None. For classified files,
+        a user with sufficient clearance is required; the load is denied
+        if any document in the file exceeds the user's clearance.
+
+        Returns a new FTSIndex instance. Raises RuntimeError if the file
+        cannot be loaded or authorization is denied.
+        """
+        ptr = _lib.qihse_fts_load(filepath.encode("utf-8"), user)
+        if not ptr:
+            raise RuntimeError(f"Failed to load FTS index from {filepath}")
+        obj = cls.__new__(cls)
+        obj._ptr = ptr
+        return obj
