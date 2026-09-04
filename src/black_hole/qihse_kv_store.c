@@ -67,21 +67,43 @@ static void flush_wal_buffer(qihse_kv_store_t* store) {
     }
 }
 
+/* Forward declarations — defined later in the file */
+typedef struct {
+    FILE* f;
+    size_t count;
+} sstable_save_ctx_t;
+
+static bool sstable_save_callback(const char* key, void* value, size_t value_size, void* user_data);
+
+/* Internal save — writes only the current memtable to a file.
+   Does NOT compact SSTables. Used by flush_memtable_to_sstable. */
+static int kv_save_memtable_only(qihse_kv_store_t* store, const char* filepath) {
+    if (!store || !filepath || !store->trie) return -1;
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    FILE* f = fdopen(fd, "w");
+    if (!f) { close(fd); return -1; }
+    sstable_save_ctx_t ctx = { .f = f, .count = 0 };
+    qihse_trinary_trie_foreach(store->trie, sstable_save_callback, &ctx);
+    fclose(f);
+    return 0;
+}
+
 static void flush_memtable_to_sstable(qihse_kv_store_t* store) {
     if (!store || !store->trie) return;
-    
+
     const char* dir = get_qihse_data_dir();
     char sst_path[256];
     snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, store->sstable_counter++);
-    
-    qihse_kv_save(store, sst_path);
-    
+
+    kv_save_memtable_only(store, sst_path);
+
     // Reset MemTable
     qihse_trinary_trie_destroy(store->trie);
     store->trie = qihse_trinary_trie_create();
     store->mem_usage = 0;
     store->wal_unflushed_bytes = 0;
-    
+
     // Truncate WAL
     if (store->wal_fd) fclose(store->wal_fd);
     char wal_path[256];
@@ -551,11 +573,6 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
     qihse_trinary_trie_foreach(store->trie, sweep_expired_callback, &ctx);
 }
 
-typedef struct {
-    FILE* f;
-    size_t count;
-} sstable_save_ctx_t;
-
 static bool sstable_save_callback(const char* key, void* value, size_t value_size, void* user_data) {
     (void)value_size;
     sstable_save_ctx_t* ctx = (sstable_save_ctx_t*)user_data;
@@ -571,14 +588,88 @@ static bool sstable_save_callback(const char* key, void* value, size_t value_siz
     return true;
 }
 
+/* Merge all SSTable files back into the in-memory trie so that
+   qihse_kv_save / qihse_kv_foreach see the complete dataset.
+   Latest SSTable wins on key conflicts (highest sstable_counter = newest).
+   After compaction, SSTable files are deleted and counter is reset. */
+static void compact_sstables_into_memtable(qihse_kv_store_t* store) {
+    if (!store || store->sstable_counter == 0) return;
+
+    const char* dir = get_qihse_data_dir();
+
+    /* Load oldest-first so newer entries overwrite older ones in the trie. */
+    for (int i = 0; i < store->sstable_counter; i++) {
+        char sst_path[256];
+        snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, i);
+#ifndef _WIN32
+        int sfd = open(sst_path, O_RDONLY | O_NOFOLLOW);
+        if (sfd < 0) continue;
+        FILE* f = fdopen(sfd, "r");
+        if (!f) { close(sfd); continue; }
+#else
+        FILE* f = fopen(sst_path, "r");
+        if (!f) continue;
+#endif
+        char header[256];
+        while (fgets(header, sizeof(header), f)) {
+            size_t key_len, val_len;
+            unsigned long long expire_time;
+            unsigned int classif, sci;
+            if (sscanf(header, "%zu %zu %llu %u %u", &key_len, &val_len, &expire_time, &classif, &sci) != 5) continue;
+            if (key_len > 1048576 || val_len > 16777216) continue;
+
+            char* key = (char*)malloc(key_len + 1);
+            char* val = (char*)malloc(val_len + 1);
+            if (!key || !val) { free(key); free(val); break; }
+            if (fread(key, 1, key_len, f) != key_len) { free(key); free(val); break; }
+            key[key_len] = '\0';
+            if (fread(val, 1, val_len, f) != val_len) { free(key); free(val); break; }
+            val[val_len] = '\0';
+            fgetc(f);  /* trailing newline */
+
+            /* Compute remaining TTL if any */
+            uint64_t ttl_ms = 0;
+            uint64_t now = current_time_ms();
+            if (expire_time > now) ttl_ms = expire_time - now;
+
+            /* Insert into trie (bypasses WAL to avoid re-logging) */
+            size_t payload_len = sizeof(kv_payload_t) + val_len + 1;
+            kv_payload_t* payload = (kv_payload_t*)malloc(payload_len);
+            if (payload) {
+                payload->classification = (uint16_t)classif;
+                payload->sci_compartment = (uint16_t)sci;
+                payload->expire_time_ms = ttl_ms > 0 ? now + ttl_ms : 0;
+                memcpy(payload->val, val, val_len + 1);
+                if (qihse_trinary_trie_insert_nocopy(store->trie, key, payload, payload_len)) {
+                    store->mem_usage += key_len + val_len + sizeof(kv_payload_t);
+                } else {
+                    free(payload);
+                }
+            }
+            free(key);
+            free(val);
+        }
+        fclose(f);
+
+        /* Delete the SSTable file after successful merge */
+        unlink(sst_path);
+    }
+
+    store->sstable_counter = 0;
+}
+
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) {
     if (!store || !filepath || !store->trie) return -1;
+
+    /* Merge any flushed SSTables back into the memtable so we save everything. */
+    compact_sstables_into_memtable(store);
+
     qihse_kv_sweep_expired(store);
     int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     FILE* f = fdopen(fd, "w");
     if (!f) { close(fd); return -1; }
-    
+
     sstable_save_ctx_t ctx = { .f = f, .count = 0 };
     qihse_trinary_trie_foreach(store->trie, sstable_save_callback, &ctx);
     fclose(f);
@@ -591,7 +682,18 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
     if (fd < 0) return -1;
     FILE* f = fdopen(fd, "r");
     if (!f) { close(fd); return -1; }
-    
+
+    /* Clear existing in-memory data and SSTables to avoid mixing datasets. */
+    qihse_kv_clear(store);
+    const char* dir = get_qihse_data_dir();
+    for (int i = 0; i < store->sstable_counter; i++) {
+        char sst_path[256];
+        snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, i);
+        unlink(sst_path);
+    }
+    store->sstable_counter = 0;
+    store->mem_usage = 0;
+
     char header[256];
     while (fgets(header, sizeof(header), f)) {
         size_t key_len, val_len;
@@ -599,17 +701,17 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) {
         unsigned int classif, sci;
         if (sscanf(header, "%zu %zu %llu %u %u", &key_len, &val_len, &expire_time, &classif, &sci) != 5) continue;
         if (key_len > 1048576 || val_len > 16777216) continue;
-        
+
         char* key = (char*)malloc(key_len + 1);
         char* val = (char*)malloc(val_len + 1);
         if (!key || !val) { free(key); free(val); break; }
-        
+
         if (fread(key, 1, key_len, f) != key_len) { free(key); free(val); break; }
         key[key_len] = '\0';
         if (fread(val, 1, val_len, f) != val_len) { free(key); free(val); break; }
         val[val_len] = '\0';
         fgetc(f);
-        
+
         uint64_t ttl_ms = 0;
         uint64_t now = current_time_ms();
         if (expire_time > now) {
@@ -649,6 +751,8 @@ static bool kv_foreach_callback(const char* key, void* value, size_t value_size,
 
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
     if (!store || !store->trie || !cb) return;
+    /* Merge any flushed SSTables back so iteration sees the full dataset. */
+    compact_sstables_into_memtable(store);
     kv_foreach_ctx_t ctx = { cb, user_data, store->trie, current_time_ms() };
     qihse_trinary_trie_foreach(store->trie, kv_foreach_callback, &ctx);
 }
@@ -695,6 +799,7 @@ static bool kv_count_callback(const char* key, void* value, size_t value_size, v
 
 size_t qihse_kv_count(qihse_kv_store_t* store) {
     if (!store || !store->trie) return 0;
+    compact_sstables_into_memtable(store);
     kv_count_ctx_t ctx = { 0, current_time_ms(), store->trie };
     qihse_trinary_trie_foreach(store->trie, kv_count_callback, &ctx);
     return ctx.count;

@@ -105,4 +105,40 @@ int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query, 
  */
 qihse_keystone_class_t qihse_fts_get_doc_semantic_class(qihse_fts_index_t* index, uint64_t doc_id);
 
+/**
+ * @brief Saves the FTS index to a binary file on disk.
+ *
+ * Serializes all document metadata and trigram posting lists so the index
+ * can be restored without re-tokenizing the original text. This is a
+ * backup/export primitive: the caller MUST have sufficient clearance to
+ * export every document's classification level. If any document exceeds
+ * the caller's clearance or SCI compartments, the entire operation is
+ * denied (no partial export) to prevent selective disclosure inference.
+ *
+ * @param index The FTS index to save.
+ * @param filepath Path to the output file.
+ * @param user The authenticated user requesting the export. May be NULL for
+ *             unclassified-only indexes (classification=0, sci=0); classified
+ *             data requires a user with sufficient clearance.
+ * @return true on success, false on failure or authorization denial.
+ */
+bool qihse_fts_save(qihse_fts_index_t* index, const char* filepath, qihse_user_t* user);
+
+/**
+ * @brief Loads an FTS index from a binary file created by qihse_fts_save.
+ *
+ * Returns a newly allocated index that must be freed with qihse_fts_destroy.
+ * This is a restore/import primitive: the caller MUST have sufficient
+ * clearance to import data at the highest classification level stored in
+ * the file. If the file contains data above the caller's clearance, the
+ * load is denied entirely.
+ *
+ * @param filepath Path to the saved FTS index file.
+ * @param user The authenticated user requesting the import. May be NULL for
+ *             unclassified-only files; classified data requires a user with
+ *             sufficient clearance.
+ * @return New FTS index, or NULL on failure or authorization denial.
+ */
+qihse_fts_index_t* qihse_fts_load(const char* filepath, qihse_user_t* user);
+
 #endif /* QIHSE_FTS_H */
