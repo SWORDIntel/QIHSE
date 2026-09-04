@@ -443,6 +443,10 @@ test-neural-fts-fusion: lib
 	$(CC) $(CFLAGS) -o tests/test_neural_fts_fusion tests/test_neural_fts_fusion.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_neural_fts_fusion
 
+test-fts-persistence-auth: lib
+	$(CC) $(CFLAGS) -o tests/test_fts_persistence_auth tests/test_fts_persistence_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_fts_persistence_auth
+
 test-e2e: lib
 	$(CC) $(CFLAGS) -o tests/test_qihse_e2e tests/test_qihse_e2e.c -L. -lqihse $(LDFLAGS)
 	rm -f qihse_integrity.chain*
