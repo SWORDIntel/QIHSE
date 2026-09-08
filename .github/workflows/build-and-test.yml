@@ -40,7 +40,16 @@ jobs:
 
     - name: Run Core Test Suite
       run: |
-        make test
+        set -o pipefail
+        make test 2>&1 | tee qihse-core-test.log
+
+    - name: Upload Core Test Log On Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qihse-core-test-log
+        path: qihse-core-test.log
+        if-no-files-found: error
 
     - name: Run Auth Privilege Boundary Regression
       run: |
@@ -99,11 +108,22 @@ jobs:
 
     - name: Run Sanitized Security Regressions (ASan + UBSan)
       run: |
+        set -o pipefail
         export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1"
         export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
         export LD_LIBRARY_PATH=$PWD
-        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-fts-persistence-auth test-apt41
-        make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-security-regressions
+        {
+          make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-fts-persistence-auth test-apt41
+          make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-security-regressions
+        } 2>&1 | tee qihse-sanitizer-test.log
+
+    - name: Upload Sanitizer Test Log On Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qihse-sanitizer-test-log
+        path: qihse-sanitizer-test.log
+        if-no-files-found: error
 
   dashboard:
     runs-on: ubuntu-latest
