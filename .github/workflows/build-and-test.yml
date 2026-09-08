@@ -49,9 +49,9 @@ jobs:
       run: |
         make test-fts-persistence-auth
 
-    - name: Run KV Authorization and Persistence Regression
+    - name: Run Security Boundary Regressions
       run: |
-        make -f Makefile -f tests/security-regression.mk test-kv-security-regression
+        make -f Makefile -f tests/security-regression.mk test-security-regressions
 
     - name: Run APT41 Fuzz Testing (ASan & UBSan)
       run: |
@@ -85,7 +85,7 @@ jobs:
         export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
         export LD_LIBRARY_PATH=$PWD
         make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-fts-persistence-auth test-apt41
-        make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-kv-security-regression
+        make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-security-regressions
 
   dashboard:
     runs-on: ubuntu-latest
