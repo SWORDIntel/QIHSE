@@ -17,9 +17,9 @@ typedef struct qihse_fts_index qihse_fts_index_t;
  * @brief Structure representing a search result.
  *
  * semantic_class carries the 6-class neural classification metadata that was
- * attached to the indexed record at add time (Idea 5: Neural Semantic Metadata
- * Tagging). It enables semantic class filtering during hybrid FTS + Vector RRF
- * fusion without an extra metadata lookup.
+ * attached to the indexed record at add time. It enables semantic class
+ * filtering during hybrid FTS + Vector RRF fusion without an extra metadata
+ * lookup.
  */
 typedef struct {
     uint64_t doc_id;
@@ -27,118 +27,97 @@ typedef struct {
     qihse_keystone_class_t semantic_class;
 } qihse_fts_result_t;
 
-/**
- * @brief Creates a new Full-Text Search index.
- * Uses a Trinary Trie for the dictionary and Arenas for posting lists.
- * @return Pointer to the FTS index.
- */
-qihse_fts_index_t* qihse_fts_create();
-
-/**
- * @brief Destroys the FTS index.
- * @param index The FTS index.
- */
+qihse_fts_index_t* qihse_fts_create(void);
 void qihse_fts_destroy(qihse_fts_index_t* index);
 
-/**
- * @brief Adds a document to the index using a zero-copy lexer.
- * Extracts tokens, maintains position data, and updates posting lists. The
- * 6-class neural classification metadata (semantic_class) is attached to the
- * indexed record so that semantic class filtering can be applied at query time.
- * @param index The FTS index.
- * @param doc_id The unique document ID.
- * @param text The full text content (read-only).
- * @param length Length of the text content.
- * @param classification Clearance level for RBAC filtering.
- * @param sci_compartment SCI compartment mask for RBAC filtering.
- * @param semantic_class 6-class neural classification tag.
- * @return true on success.
- */
 #include "qihse_auth.h"
 
-bool qihse_fts_add_document(qihse_fts_index_t* index, uint64_t doc_id, const char* text, size_t length, uint16_t classification, uint16_t sci_compartment, qihse_keystone_class_t semantic_class);
+/**
+ * @brief Adds a document to the index.
+ *
+ * The classification and SCI compartment travel with the indexed metadata and
+ * are enforced for every user-visible search or metadata lookup.
+ */
+bool qihse_fts_add_document(
+    qihse_fts_index_t* index,
+    uint64_t doc_id,
+    const char* text,
+    size_t length,
+    uint16_t classification,
+    uint16_t sci_compartment,
+    qihse_keystone_class_t semantic_class);
 
 /**
  * @brief Searches the index (BM25) with RBAC enforcement.
- * @param index The FTS index.
- * @param query The query string.
- * @param user The user executing the query (for RBAC).
- * @param results Output array of results.
- * @param top_k Maximum number of results to return.
- * @return Number of results written.
+ *
+ * Corpus statistics are computed only over documents visible to the caller so
+ * inaccessible records cannot influence result scores/ranking as an inference
+ * channel.
  */
-int qihse_fts_search_user(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k);
+int qihse_fts_search_user(
+    qihse_fts_index_t* index,
+    const char* query,
+    qihse_user_t* user,
+    qihse_fts_result_t* results,
+    int top_k);
 
 /**
- * @brief Searches the index (BM25) with RBAC + semantic class filtering.
+ * @brief Searches with RBAC + semantic class filtering.
  *
- * semantic_class_mask is a bitmask over the 6-class neural taxonomy:
- *   bit (1 << QIHSE_KEYSTONE_CLASS_FINANCIAL)      => FINANCIAL allowed
- *   bit (1 << QIHSE_KEYSTONE_CLASS_CORPORATE)      => CORPORATE allowed
- *   bit (1 << QIHSE_KEYSTONE_CLASS_GOVERNMENT)     => GOVERNMENT allowed
- *   bit (1 << QIHSE_KEYSTONE_CLASS_INFRASTRUCTURE) => INFRASTRUCTURE allowed
- *   bit (1 << QIHSE_KEYSTONE_CLASS_CONSUMER)       => CONSUMER allowed
- *   bit (1 << QIHSE_KEYSTONE_CLASS_UNKNOWN)        => UNKNOWN allowed
- * A mask of 0 disables filtering and returns all classes (equivalent to
- * qihse_fts_search_user).
- *
- * @param index The FTS index.
- * @param query The query string.
- * @param user The user executing the query (for RBAC).
- * @param results Output array of results.
- * @param top_k Maximum number of results to return.
- * @param semantic_class_mask Bitmask of allowed neural classes (0 = no filter).
- * @return Number of results written.
+ * semantic_class_mask is a bitmask over QIHSE_KEYSTONE_CLASS_* values. A mask
+ * of 0 disables semantic filtering. Authorization is always applied first.
  */
-int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query, qihse_user_t* user, qihse_fts_result_t* results, int top_k, uint8_t semantic_class_mask);
+int qihse_fts_search_user_filtered(
+    qihse_fts_index_t* index,
+    const char* query,
+    qihse_user_t* user,
+    qihse_fts_result_t* results,
+    int top_k,
+    uint8_t semantic_class_mask);
 
 /**
- * @brief Retrieves the stored 6-class neural classification for a document.
+ * @brief Authorization-aware semantic metadata lookup.
  *
- * Used by the hybrid FTS + Vector RRF fusion to enrich vector-sourced candidates
- * with semantic class metadata so that semantic class filtering can be applied
- * uniformly across both modalities.
- *
- * @param index The FTS index.
- * @param doc_id The document ID to look up.
- * @return The stored semantic class, or QIHSE_KEYSTONE_CLASS_UNKNOWN if not found.
+ * Returns UNKNOWN when the document is missing or inaccessible to ``user``.
+ * This is the API hybrid FTS/vector fusion should use.
  */
-qihse_keystone_class_t qihse_fts_get_doc_semantic_class(qihse_fts_index_t* index, uint64_t doc_id);
+qihse_keystone_class_t qihse_fts_get_doc_semantic_class_user(
+    qihse_fts_index_t* index,
+    uint64_t doc_id,
+    qihse_user_t* user);
 
 /**
- * @brief Saves the FTS index to a binary file on disk.
+ * @brief Legacy semantic metadata lookup retained for ABI compatibility.
  *
- * Serializes all document metadata and trigram posting lists so the index
- * can be restored without re-tokenizing the original text. This is a
- * backup/export primitive: the caller MUST have sufficient clearance to
- * export every document's classification level. If any document exceeds
- * the caller's clearance or SCI compartments, the entire operation is
- * denied (no partial export) to prevent selective disclosure inference.
- *
- * @param index The FTS index to save.
- * @param filepath Path to the output file.
- * @param user The authenticated user requesting the export. May be NULL for
- *             unclassified-only indexes (classification=0, sci=0); classified
- *             data requires a user with sufficient clearance.
- * @return true on success, false on failure or authorization denial.
+ * It now behaves as an unclassified-only lookup by internally using a NULL
+ * security context. Classified metadata is therefore not disclosed through the
+ * historical context-free symbol.
  */
-bool qihse_fts_save(qihse_fts_index_t* index, const char* filepath, qihse_user_t* user);
+qihse_keystone_class_t qihse_fts_get_doc_semantic_class(
+    qihse_fts_index_t* index,
+    uint64_t doc_id);
 
 /**
- * @brief Loads an FTS index from a binary file created by qihse_fts_save.
+ * @brief Saves the FTS index to a binary file.
  *
- * Returns a newly allocated index that must be freed with qihse_fts_destroy.
- * This is a restore/import primitive: the caller MUST have sufficient
- * clearance to import data at the highest classification level stored in
- * the file. If the file contains data above the caller's clearance, the
- * load is denied entirely.
- *
- * @param filepath Path to the saved FTS index file.
- * @param user The authenticated user requesting the import. May be NULL for
- *             unclassified-only files; classified data requires a user with
- *             sufficient clearance.
- * @return New FTS index, or NULL on failure or authorization denial.
+ * The caller must be authorized for every document. The save is all-or-nothing
+ * and uses a mode-0600, no-follow temporary file followed by atomic rename on
+ * POSIX systems so denied or failed exports do not leave partial snapshots.
  */
-qihse_fts_index_t* qihse_fts_load(const char* filepath, qihse_user_t* user);
+bool qihse_fts_save(
+    qihse_fts_index_t* index,
+    const char* filepath,
+    qihse_user_t* user);
+
+/**
+ * @brief Loads an FTS index from a binary file.
+ *
+ * The loader validates serialized counts, document indices, posting-list
+ * cardinalities and allocation sizes before accepting them. The caller must be
+ * authorized for every document; no partial import is performed.
+ */
+qihse_fts_index_t* qihse_fts_load(
+    const char* filepath,
+    qihse_user_t* user);
 
 #endif /* QIHSE_FTS_H */
