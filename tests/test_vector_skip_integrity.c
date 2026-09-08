@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <assert.h>
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,9 +70,17 @@ int main(void) {
 
     qihse_vector_store_snapshot_t snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
-    errno = 0;
-    assert(!qihse_vector_store_load(path, &snapshot));
-    assert(errno == EINVAL);
+    assert(qihse_vector_store_load(path, &snapshot));
+
+    /* Trinary is an optional acceleration sidecar. Structural corruption must
+     * be rejected even when checksum verification is skipped, without making
+     * the authoritative vector/index snapshot unavailable. */
+    assert(!snapshot.trinary_valid);
+    assert(snapshot.trinary == NULL);
+    assert(snapshot.trinary_bytes == 0u);
+    assert((snapshot.manifest.trinary_flags & QIHSE_VSTORE_TRI_VALID) == 0u);
+    assert(snapshot.row_count == 1u);
+    assert(snapshot.vector_bytes == sizeof(vector));
     qihse_vector_store_snapshot_free(&snapshot);
 
     unlink(path);
