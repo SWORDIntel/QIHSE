@@ -22,8 +22,17 @@ jobs:
 
     - name: Build Shared Library & Binaries
       run: |
+        set -o pipefail
         make clean
-        make all -j$(nproc)
+        make all -j$(nproc) 2>&1 | tee qihse-build.log
+
+    - name: Upload Native Build Log On Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qihse-native-build-log
+        path: qihse-build.log
+        if-no-files-found: error
 
     - name: Verify Library Exports
       run: |
@@ -77,7 +86,16 @@ jobs:
 
     - name: Build Sanitized Shared Library
       run: |
-        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" lib -j$(nproc)
+        set -o pipefail
+        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" lib -j$(nproc) 2>&1 | tee qihse-sanitizer-build.log
+
+    - name: Upload Sanitizer Build Log On Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qihse-sanitizer-build-log
+        path: qihse-sanitizer-build.log
+        if-no-files-found: error
 
     - name: Run Sanitized Security Regressions (ASan + UBSan)
       run: |
