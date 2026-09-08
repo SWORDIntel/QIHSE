@@ -283,14 +283,21 @@ static bool check_fips_compliance(void) {
         OSSL_PROVIDER *fips = OSSL_PROVIDER_load(NULL, "fips");
         if (!base || !fips) {
             fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but FIPS/base provider failed to load in OpenSSL.\n");
+            if (fips) OSSL_PROVIDER_unload(fips);
+            if (base) OSSL_PROVIDER_unload(base);
             return false;
         }
         if (EVP_default_properties_enable_fips(NULL, 1) != 1) {
             fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but EVP_default_properties_enable_fips failed.\n");
+            OSSL_PROVIDER_unload(fips);
+            OSSL_PROVIDER_unload(base);
             return false;
         }
         if (!EVP_default_properties_is_fips_enabled(NULL)) {
             fprintf(stderr, "[FIPS ERROR] QIHSE_FIPS_MODE=required but FIPS provider is not active in OpenSSL.\n");
+            (void)EVP_default_properties_enable_fips(NULL, 0);
+            OSSL_PROVIDER_unload(fips);
+            OSSL_PROVIDER_unload(base);
             return false;
         }
     }
