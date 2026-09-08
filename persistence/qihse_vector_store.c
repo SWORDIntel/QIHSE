@@ -617,9 +617,10 @@ static bool qihse_load_trinary_optional_ctr(const qihse_container_t* ctr,
         errno = EINVAL;
         return false;
     }
-    /* Skip CRC64 + payload validation in pre-prod mode */
-    if (!ctr->skip_integrity) {
-        if (!verify_section_crc(ctr, data, size, manifest->trinary_crc64) ||
+    /* Structural validation is mandatory; pre-prod mode may skip CRC64 only. */
+    {
+        if ((!ctr->skip_integrity &&
+             !verify_section_crc(ctr, data, size, manifest->trinary_crc64)) ||
             !qihse_trinary_tryte_validate_payload(data,
                                                   (size_t)manifest->trinary_rows,
                                                   (size_t)manifest->vector_dims)) {
