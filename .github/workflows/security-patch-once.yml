@@ -1,0 +1,102 @@
+name: Guarded one-shot QIHSE trust-boundary patch
+
+on:
+  push:
+    branches:
+      - security/keystone-regression-hardening-20260908
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'chore: apply guarded QIHSE trust-boundary patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/keystone-regression-hardening-20260908
+          fetch-depth: 0
+
+      - name: Apply exact guarded replacements
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          resp = Path('src/spinnaker/qihse_resp_engine.c')
+          text = resp.read_text()
+          replacements = [
+              (
+                  'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl)) return qihse_resp_error(session, "ERR invalid clearance");',
+                  'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl) || cl > UINT16_MAX) return qihse_resp_error(session, "ERR invalid clearance");'
+              ),
+              (
+                  'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp)) return qihse_resp_error(session, "ERR invalid compartment");',
+                  'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp) || cp > UINT16_MAX) return qihse_resp_error(session, "ERR invalid compartment");'
+              ),
+              (
+                  '''    size_t count = qihse_keystone_ingest_dirty_logs(
+        session->server->store,
+        session->server->topology,
+        (const char*)request->argv[1].data,
+        request->argv[1].len,
+        clearance,
+        compartment
+    );''',
+                  '''    size_t count = qihse_keystone_ingest_dirty_logs_user(
+        session->server->store,
+        session->server->topology,
+        (const char*)request->argv[1].data,
+        request->argv[1].len,
+        clearance,
+        compartment,
+        session->user
+    );'''
+              ),
+          ]
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'RESP guard failed: expected exactly one match, got {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+          resp.write_text(text)
+
+          vector = Path('persistence/qihse_vector_store.c')
+          text = vector.read_text()
+          old = '''    /* Skip CRC64 + payload validation in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (!verify_section_crc(ctr, data, size, manifest->trinary_crc64) ||
+            !qihse_trinary_tryte_validate_payload(data,
+                                                  (size_t)manifest->trinary_rows,
+                                                  (size_t)manifest->vector_dims)) {'''
+          new = '''    /* Structural validation is mandatory; pre-prod mode may skip CRC64 only. */
+    {
+        if ((!ctr->skip_integrity &&
+             !verify_section_crc(ctr, data, size, manifest->trinary_crc64)) ||
+            !qihse_trinary_tryte_validate_payload(data,
+                                                  (size_t)manifest->trinary_rows,
+                                                  (size_t)manifest->vector_dims)) {'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'vector-store guard failed: expected exactly one match, got {count}')
+          vector.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Validate patch shape
+        shell: bash
+        run: |
+          git diff --check
+          grep -F 'cl > UINT16_MAX' src/spinnaker/qihse_resp_engine.c
+          grep -F 'cp > UINT16_MAX' src/spinnaker/qihse_resp_engine.c
+          grep -F 'qihse_keystone_ingest_dirty_logs_user(' src/spinnaker/qihse_resp_engine.c
+          grep -F 'Structural validation is mandatory; pre-prod mode may skip CRC64 only.' persistence/qihse_vector_store.c
+
+      - name: Commit guarded patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/spinnaker/qihse_resp_engine.c persistence/qihse_vector_store.c
+          git commit -m 'security: close RESP and vector integrity trust-boundary gaps'
+          git push origin HEAD:security/keystone-regression-hardening-20260908
