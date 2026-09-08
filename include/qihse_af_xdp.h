@@ -45,22 +45,25 @@ bool qihse_af_xdp_extract_udp_payload(
     uint32_t *out_src_ip, uint16_t *out_src_port, uint16_t *out_dst_port);
 
 /**
- * @brief Zero-copy ingestion of a single raw Ethernet frame directly into the
- *        Keystone dirty-log pipeline.
+ * @brief Authorization-aware zero-copy frame ingestion into Keystone.
  *
- * The TCP/UDP payload pointer returned by the zero-copy parsers stays inside the
- * caller's buffer (e.g. the AF_XDP UMEM region) -- no userspace copy is performed.
- * The payload is handed directly to qihse_keystone_ingest_dirty_logs(), which
- * scans it in place and routes extracted artifacts across the 16,384 CRC16
- * cluster hash slots.
+ * The payload remains in the caller-owned frame/UMEM buffer. The supplied
+ * principal must be authorized for the target classification and SCI
+ * compartment before any extracted artifact can be persisted.
+ */
+size_t qihse_af_xdp_ingest_frame_zero_copy_user(
+    const void *raw_pkt, uint32_t raw_len,
+    qihse_kv_store_t *kv,
+    qihse_cluster_topology_t *topo,
+    uint16_t clearance,
+    uint16_t compartment,
+    qihse_user_t *user);
+
+/**
+ * @brief Legacy context-free frame ingestion retained for ABI compatibility.
  *
- * @param raw_pkt   Pointer to the raw Ethernet frame (may live inside a UMEM frame).
- * @param raw_len   Length of the raw frame in bytes.
- * @param kv        Black Hole KV store handle that will receive the artifacts.
- * @param topo      Optional cluster topology for sharding (may be NULL).
- * @param clearance Default SCI clearance level stamped on ingested records.
- * @param compartment Default SCI compartment mask stamped on ingested records.
- * @return Number of artifacts extracted and indexed from this frame.
+ * This path is unclassified/uncompartmented only because it reaches Keystone
+ * with a NULL principal. Classified callers must use the *_user API above.
  */
 size_t qihse_af_xdp_ingest_frame_zero_copy(
     const void *raw_pkt, uint32_t raw_len,
@@ -70,21 +73,25 @@ size_t qihse_af_xdp_ingest_frame_zero_copy(
     uint16_t compartment);
 
 /**
- * @brief Polls the AF_XDP RX ring and ingests every received UMEM frame directly
- *        into the Keystone dirty-log pipeline with zero userspace copies.
+ * @brief Poll the AF_XDP RX ring and ingest frames with an explicit principal.
  *
- * For each received descriptor the on-UMEM payload pointer is extracted by the
- * zero-copy TCP/UDP parsers and forwarded in place to
- * qihse_keystone_ingest_dirty_logs(). Extracted artifacts are distributed across
- * the 16,384 CRC16 cluster hash slots. After ingestion the UMEM frame is
- * recycled back onto the fill ring for immediate reuse by the kernel.
+ * qihse_af_xdp_poll() invokes the authorization-aware frame adapter while the
+ * descriptor still references the UMEM frame, preserving the zero-copy
+ * contract before the transport recycles the descriptor.
+ */
+size_t qihse_af_xdp_ingest_keystone_user(struct qihse_af_xdp_ctx *ctx,
+                                         qihse_kv_store_t *kv,
+                                         qihse_cluster_topology_t *topo,
+                                         uint16_t clearance,
+                                         uint16_t compartment,
+                                         qihse_user_t *user);
+
+/**
+ * @brief Legacy context-free RX-ring ingestion.
  *
- * @param ctx         AF_XDP context returned by qihse_af_xdp_init().
- * @param kv          Black Hole KV store handle that will receive the artifacts.
- * @param topo        Optional cluster topology for sharding (may be NULL).
- * @param clearance   Default SCI clearance level stamped on ingested records.
- * @param compartment Default SCI compartment mask stamped on ingested records.
- * @return Total number of artifacts extracted and indexed across all polled frames.
+ * Retained for ABI compatibility and restricted to unclassified data by the
+ * Keystone NULL-principal policy. Use qihse_af_xdp_ingest_keystone_user() for
+ * classified/SCI ingestion.
  */
 size_t qihse_af_xdp_ingest_keystone(struct qihse_af_xdp_ctx *ctx,
                                     qihse_kv_store_t *kv,
