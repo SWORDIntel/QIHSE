@@ -1539,23 +1539,24 @@ static bool qihse_resp_handle_keystone_ingest(qihse_resp_session_t* session, con
     uint16_t compartment = 0;
     if (request->argc >= 3) {
         uint64_t cl;
-        if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl)) return qihse_resp_error(session, "ERR invalid clearance");
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl) || cl > UINT16_MAX) return qihse_resp_error(session, "ERR invalid clearance");
         clearance = (uint16_t)cl;
     }
     if (request->argc >= 4) {
         uint64_t cp;
-        if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp)) return qihse_resp_error(session, "ERR invalid compartment");
+        if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp) || cp > UINT16_MAX) return qihse_resp_error(session, "ERR invalid compartment");
         compartment = (uint16_t)cp;
     }
 
     pthread_mutex_lock(&session->server->kv_lock);
-    size_t count = qihse_keystone_ingest_dirty_logs(
+    size_t count = qihse_keystone_ingest_dirty_logs_user(
         session->server->store,
         session->server->topology,
         (const char*)request->argv[1].data,
         request->argv[1].len,
         clearance,
-        compartment
+        compartment,
+        session->user
     );
     pthread_mutex_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, (int64_t)count);
