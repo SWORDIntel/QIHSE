@@ -23,63 +23,33 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          resp = Path('src/spinnaker/qihse_resp_engine.c')
-          text = resp.read_text()
-          replacements = [
-              (
-                  'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl)) return qihse_resp_error(session, "ERR invalid clearance");',
-                  'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl) || cl > UINT16_MAX) return qihse_resp_error(session, "ERR invalid clearance");'
-              ),
-              (
-                  'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp)) return qihse_resp_error(session, "ERR invalid compartment");',
-                  'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp) || cp > UINT16_MAX) return qihse_resp_error(session, "ERR invalid compartment");'
-              ),
-              (
-                  '''    size_t count = qihse_keystone_ingest_dirty_logs(
-        session->server->store,
-        session->server->topology,
-        (const char*)request->argv[1].data,
-        request->argv[1].len,
-        clearance,
-        compartment
-    );''',
-                  '''    size_t count = qihse_keystone_ingest_dirty_logs_user(
-        session->server->store,
-        session->server->topology,
-        (const char*)request->argv[1].data,
-        request->argv[1].len,
-        clearance,
-        compartment,
-        session->user
-    );'''
-              ),
-          ]
-          for old, new in replacements:
+          def replace_once(text, old, new, label):
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f'RESP guard failed: expected exactly one match, got {count}: {old[:80]!r}')
-              text = text.replace(old, new, 1)
+                  raise SystemExit(f'{label}: expected exactly one match, got {count}')
+              return text.replace(old, new, 1)
+
+          resp = Path('src/spinnaker/qihse_resp_engine.c')
+          text = resp.read_text()
+          text = replace_once(text,
+              'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl)) return qihse_resp_error(session, "ERR invalid clearance");',
+              'if (!qihse_resp_parse_u64_arg(&request->argv[2], &cl) || cl > UINT16_MAX) return qihse_resp_error(session, "ERR invalid clearance");',
+              'RESP clearance guard')
+          text = replace_once(text,
+              'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp)) return qihse_resp_error(session, "ERR invalid compartment");',
+              'if (!qihse_resp_parse_u64_arg(&request->argv[3], &cp) || cp > UINT16_MAX) return qihse_resp_error(session, "ERR invalid compartment");',
+              'RESP compartment guard')
+          old_call = '    size_t count = qihse_keystone_ingest_dirty_logs(\n        session->server->store,\n        session->server->topology,\n        (const char*)request->argv[1].data,\n        request->argv[1].len,\n        clearance,\n        compartment\n    );'
+          new_call = '    size_t count = qihse_keystone_ingest_dirty_logs_user(\n        session->server->store,\n        session->server->topology,\n        (const char*)request->argv[1].data,\n        request->argv[1].len,\n        clearance,\n        compartment,\n        session->user\n    );'
+          text = replace_once(text, old_call, new_call, 'RESP principal-aware KEYSTONE ingest')
           resp.write_text(text)
 
           vector = Path('persistence/qihse_vector_store.c')
           text = vector.read_text()
-          old = '''    /* Skip CRC64 + payload validation in pre-prod mode */
-    if (!ctr->skip_integrity) {
-        if (!verify_section_crc(ctr, data, size, manifest->trinary_crc64) ||
-            !qihse_trinary_tryte_validate_payload(data,
-                                                  (size_t)manifest->trinary_rows,
-                                                  (size_t)manifest->vector_dims)) {'''
-          new = '''    /* Structural validation is mandatory; pre-prod mode may skip CRC64 only. */
-    {
-        if ((!ctr->skip_integrity &&
-             !verify_section_crc(ctr, data, size, manifest->trinary_crc64)) ||
-            !qihse_trinary_tryte_validate_payload(data,
-                                                  (size_t)manifest->trinary_rows,
-                                                  (size_t)manifest->vector_dims)) {'''
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f'vector-store guard failed: expected exactly one match, got {count}')
-          vector.write_text(text.replace(old, new, 1))
+          old = '    /* Skip CRC64 + payload validation in pre-prod mode */\n    if (!ctr->skip_integrity) {\n        if (!verify_section_crc(ctr, data, size, manifest->trinary_crc64) ||\n            !qihse_trinary_tryte_validate_payload(data,\n                                                  (size_t)manifest->trinary_rows,\n                                                  (size_t)manifest->vector_dims)) {'
+          new = '    /* Structural validation is mandatory; pre-prod mode may skip CRC64 only. */\n    {\n        if ((!ctr->skip_integrity &&\n             !verify_section_crc(ctr, data, size, manifest->trinary_crc64)) ||\n            !qihse_trinary_tryte_validate_payload(data,\n                                                  (size_t)manifest->trinary_rows,\n                                                  (size_t)manifest->vector_dims)) {'
+          text = replace_once(text, old, new, 'vector structural validation guard')
+          vector.write_text(text)
           PY
 
       - name: Validate patch shape
