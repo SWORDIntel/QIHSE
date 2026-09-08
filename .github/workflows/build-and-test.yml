@@ -113,6 +113,7 @@ jobs:
         export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
         export LD_LIBRARY_PATH=$PWD
         {
+          make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-resp-cluster
           make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-fts-persistence-auth test-apt41
           make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-security-regressions
         } 2>&1 | tee qihse-sanitizer-test.log
