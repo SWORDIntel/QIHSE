@@ -26,16 +26,16 @@ import json
 # ========================================================================
 # SWORD color scheme
 # ========================================================================
-SWORD_BG = '#0a0a0a'
-SWORD_RED = '#C00000'
-SWORD_RED_LIGHT = '#E02020'
-SWORD_RED_DARK = '#600000'
-SWORD_GRAY = '#E0E0E0'
-SWORD_GRAY_DIM = '#808080'
-SWORD_GRID = '#1a1a1a'
-SWORD_GREEN = '#2ecc71'
-SWORD_BLUE = '#3498db'
-SWORD_ORANGE = '#e67e22'
+SWORD_BG = '#1a1a2e'          # dark navy-black (better contrast than pure black)
+SWORD_RED = '#FF3030'          # bright red (4.6:1 contrast on bg)
+SWORD_RED_LIGHT = '#E02020'    # secondary red
+SWORD_RED_DARK = '#800000'     # deep red for edges
+SWORD_GRAY = '#E0E0E0'         # light gray text (12.9:1)
+SWORD_GRAY_DIM = '#909090'     # medium gray
+SWORD_GRID = '#2a2a3e'         # subtle grid
+SWORD_GREEN = '#2ecc71'        # green accent (8.1:1)
+SWORD_BLUE = '#3498db'         # blue accent (5.4:1)
+SWORD_ORANGE = '#e67e22'       # orange accent (6.0:1)
 
 plt.rcParams.update({
     'figure.facecolor': SWORD_BG,
