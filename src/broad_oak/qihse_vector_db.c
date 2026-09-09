@@ -6127,6 +6127,10 @@ static int qihse_vdb_search_exact_rows(qihse_vector_db_t vdb,
     memset(results, 0, max_results * sizeof(*results));
 
     vdb->row_access_batch_ns = qihse_vdb_monotonic_ns();
+    qihse_distance_functions_t distances = qihse_distance_resolve();
+    qihse_distance_fn_t distance = query->distance_metric == QIHSE_DISTANCE_DOT_PRODUCT
+        ? distances.dot : query->distance_metric == QIHSE_DISTANCE_EUCLIDEAN
+        ? distances.euclidean : distances.cosine;
 
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
@@ -6153,8 +6157,10 @@ static int qihse_vdb_search_exact_rows(qihse_vector_db_t vdb,
                 continue;
             }
         }
-        score = qihse_vdb_compute_score(query->query_vector, vector,
-                                         vdb->vector_dims, query->distance_metric);
+        score = distance(query->query_vector, vector, vdb->vector_dims);
+        if (query->distance_metric == QIHSE_DISTANCE_EUCLIDEAN) {
+            score = 1.0f / (1.0f + score);
+        }
         if (score < query->similarity_threshold) {
             continue;
         }

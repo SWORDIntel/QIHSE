@@ -17,6 +17,14 @@ extern "C" {
 /* Distance function signatures */
 typedef float (*qihse_distance_fn_t)(const float* a, const float* b, size_t dims);
 
+typedef struct {
+    qihse_distance_fn_t cosine;
+    qihse_distance_fn_t dot;
+    qihse_distance_fn_t euclidean;
+} qihse_distance_functions_t;
+
+qihse_distance_functions_t qihse_distance_resolve(void);
+
 /* Runtime-dispatched distance functions.
  * These auto-select the best implementation (AVX-512 > AVX2 > AVX1 > scalar)
  * on first call. */

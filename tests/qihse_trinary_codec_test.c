@@ -413,11 +413,118 @@ static bool test_topk_invalid_padding_rejected(void) {
     return true;
 }
 
+static bool test_exhaustive_similarity(void) {
+    const int32_t weights[5] = {0, 1, INT32_MAX, 7, 31};
+    for (size_t dims = 1; dims <= 5; dims++) {
+        for (unsigned a = 0; a < 243; a++) {
+            uint8_t lhs = (uint8_t)a;
+            if (!qihse_trinary_tryte_validate_row(&lhs, dims)) continue;
+            for (unsigned b = 0; b < 243; b++) {
+                uint8_t rhs = (uint8_t)b;
+                if (!qihse_trinary_tryte_validate_row(&rhs, dims)) continue;
+                unsigned x = a, y = b;
+                int32_t expected = 0, actual = 0;
+                int64_t weighted = 0, actual_weighted = 0;
+                for (size_t d = 0; d < dims; d++, x /= 3, y /= 3) {
+                    int product = ((int)(x % 3) - 1) * ((int)(y % 3) - 1);
+                    expected += product;
+                    weighted += (int64_t)product * weights[d];
+                }
+                TEST_ASSERT(qihse_trinary_tryte_similarity_i32(&lhs, &rhs, dims, &actual),
+                            "valid pair should score");
+                TEST_ASSERT(actual == expected, "pair score must match scalar reference");
+                TEST_ASSERT(qihse_trinary_tryte_weighted_similarity_i64(
+                                &lhs, &rhs, weights, dims, &actual_weighted),
+                            "valid weighted pair should score");
+                TEST_ASSERT(actual_weighted == weighted, "weighted pair must match reference");
+            }
+        }
+    }
+    for (unsigned value = 243; value <= 255; value++) {
+        uint8_t invalid = (uint8_t)value, valid = 121;
+        int32_t score = 77;
+        TEST_ASSERT(!qihse_trinary_tryte_similarity_i32(&invalid, &valid, 5, &score),
+                    "invalid left byte must fail before lookup");
+        TEST_ASSERT(!qihse_trinary_tryte_similarity_i32(&valid, &invalid, 5, &score),
+                    "invalid right byte must fail before lookup");
+        TEST_ASSERT(score == 77 && errno == EINVAL, "invalid byte must preserve output");
+    }
+    int32_t score = 77;
+    TEST_ASSERT(qihse_trinary_tryte_similarity_i32(NULL, NULL, 0, &score) && score == 0,
+                "empty similarity must be zero");
+    return true;
+}
+
+static bool test_multibyte_topk_reference(void) {
+    enum { ROWS = 37, DIMS = 129, BYTES = 26 };
+    const size_t dimensions[] = {0, 1, 4, 5, 6, 15, 16, 63, 64, 127, 128, 129};
+    const size_t limits[] = {0, 1, 8, 36, 37, 40};
+    uint32_t seed = 12345;
+    float vectors[ROWS * DIMS], query[DIMS];
+    int32_t weights[DIMS];
+    uint8_t encoded[ROWS * BYTES], encoded_query[BYTES];
+    for (size_t d = 0; d < DIMS; d++) {
+        query[d] = (float)((int)(d % 3) - 1);
+        weights[d] = d % 7 == 0 ? INT32_MAX : (int32_t)(d % 11);
+    }
+    for (size_t i = 0; i < ROWS * DIMS; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        vectors[i] = (float)((int)(seed % 3) - 1);
+    }
+    for (size_t t = 0; t < sizeof(dimensions) / sizeof(dimensions[0]); t++) {
+        size_t dims = dimensions[t];
+        int32_t reference[ROWS] = {0};
+        int64_t weighted_reference[ROWS] = {0};
+        TEST_ASSERT(qihse_trinary_tryte_encode_matrix(vectors, ROWS, dims, encoded, sizeof(encoded)),
+                    "multibyte matrix should encode");
+        TEST_ASSERT(qihse_trinary_tryte_encode_row(query, dims, encoded_query, sizeof(encoded_query)),
+                    "multibyte query should encode");
+        for (size_t row = 0; row < ROWS; row++) {
+            for (size_t d = 0; d < dims; d++) {
+                int32_t product = (int32_t)(vectors[row * dims + d] * query[d]);
+                reference[row] += product;
+                weighted_reference[row] += (int64_t)product * weights[d];
+            }
+        }
+        for (size_t k = 0; k < sizeof(limits) / sizeof(limits[0]); k++) {
+            size_t indexes[40], weighted_indexes[40], count = 99, weighted_count = 99;
+            int32_t scores[40];
+            int64_t weighted_scores[40];
+            bool used[ROWS] = {false}, weighted_used[ROWS] = {false};
+            TEST_ASSERT(qihse_trinary_tryte_select_topk(encoded, encoded_query, ROWS, dims,
+                            indexes, scores, limits[k], &count), "multibyte topk must succeed");
+            TEST_ASSERT(qihse_trinary_tryte_select_topk_weighted(encoded, encoded_query, weights,
+                            ROWS, dims, weighted_indexes, weighted_scores, limits[k], &weighted_count),
+                        "multibyte weighted topk must succeed");
+            TEST_ASSERT(count == (limits[k] < ROWS ? limits[k] : ROWS) && count == weighted_count,
+                        "topk cardinality must be exact");
+            for (size_t rank = 0; rank < count; rank++) {
+                size_t best = ROWS, weighted_best = ROWS;
+                for (size_t row = 0; row < ROWS; row++) {
+                    if (!used[row] && (best == ROWS || reference[row] > reference[best])) best = row;
+                    if (!weighted_used[row] && (weighted_best == ROWS ||
+                        weighted_reference[row] > weighted_reference[weighted_best])) weighted_best = row;
+                }
+                TEST_ASSERT(indexes[rank] == best && scores[rank] == reference[best],
+                            "topk scores and stable ties must match independent reference");
+                TEST_ASSERT(weighted_indexes[rank] == weighted_best &&
+                            weighted_scores[rank] == weighted_reference[weighted_best],
+                            "weighted topk must match independent reference");
+                used[best] = true;
+                weighted_used[weighted_best] = true;
+            }
+        }
+    }
+    return true;
+}
+
 int main(void) {
     struct test_case {
         const char* name;
         bool (*run)(void);
     } tests[] = {
+        {"exhaustive similarity", test_exhaustive_similarity},
+        {"multibyte topk reference", test_multibyte_topk_reference},
         {"size helpers", test_size_helpers},
         {"pack/unpack/validation", test_pack_unpack_and_validation},
         {"encode row padding", test_encode_row_padding},

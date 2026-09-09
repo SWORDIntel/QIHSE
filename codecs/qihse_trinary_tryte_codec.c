@@ -64,20 +64,48 @@ static const int8_t qihse_tryte_trit_product[3][3] = {
 
 /* Precomputed unpack table: unpack_table[tryte][trit_index] = trit value.
  * Eliminates the division/modulo loop in qihse_trinary_tryte_unpack for the hot path. */
-static uint8_t qihse_tryte_unpack_table[243][QIHSE_TRINARY_TRITS_PER_TRYTE];
-static bool qihse_tryte_unpack_table_ready = false;
-
-static void qihse_tryte_init_unpack_table(void) {
-    size_t tryte, trit_idx;
-    for (tryte = 0u; tryte < 243u; tryte++) {
-        uint8_t v = (uint8_t)tryte;
-        for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE; trit_idx++) {
-            qihse_tryte_unpack_table[tryte][trit_idx] = (uint8_t)(v % 3u);
-            v = (uint8_t)(v / 3u);
-        }
-    }
-    qihse_tryte_unpack_table_ready = true;
-}
+#define QIHSE_TRYTE_REPEAT3(F, A, B) F(A, B), F(A, (B) + 1), F(A, (B) + 2)
+#define QIHSE_TRYTE_REPEAT9(F, A, B) \
+    QIHSE_TRYTE_REPEAT3(F, A, B), QIHSE_TRYTE_REPEAT3(F, A, (B) + 3), \
+    QIHSE_TRYTE_REPEAT3(F, A, (B) + 6)
+#define QIHSE_TRYTE_REPEAT27(F, A, B) \
+    QIHSE_TRYTE_REPEAT9(F, A, B), QIHSE_TRYTE_REPEAT9(F, A, (B) + 9), \
+    QIHSE_TRYTE_REPEAT9(F, A, (B) + 18)
+#define QIHSE_TRYTE_DECODE(A, B) \
+    {(B) % 3, (B) / 3 % 3, (B) / 9 % 3, (B) / 27 % 3, (B) / 81 % 3}
+static const uint8_t qihse_tryte_unpack_table[243][QIHSE_TRINARY_TRITS_PER_TRYTE] = {
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 0),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 27),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 54),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 81),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 108),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 135),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 162),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 189),
+    QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DECODE, 0, 216)
+};
+#define QIHSE_TRYTE_DOT3(A, B) \
+    (((A) % 3 - 1) * ((B) % 3 - 1) + \
+     ((A) / 3 % 3 - 1) * ((B) / 3 % 3 - 1) + \
+     ((A) / 9 % 3 - 1) * ((B) / 9 % 3 - 1))
+#define QIHSE_TRYTE_DOT_ROW(A, B) {QIHSE_TRYTE_REPEAT27(QIHSE_TRYTE_DOT3, B, 0)}
+static const int8_t qihse_tryte_dot3[27][27] = {
+    QIHSE_TRYTE_DOT_ROW(0, 0), QIHSE_TRYTE_DOT_ROW(0, 1), QIHSE_TRYTE_DOT_ROW(0, 2),
+    QIHSE_TRYTE_DOT_ROW(0, 3), QIHSE_TRYTE_DOT_ROW(0, 4), QIHSE_TRYTE_DOT_ROW(0, 5),
+    QIHSE_TRYTE_DOT_ROW(0, 6), QIHSE_TRYTE_DOT_ROW(0, 7), QIHSE_TRYTE_DOT_ROW(0, 8),
+    QIHSE_TRYTE_DOT_ROW(0, 9), QIHSE_TRYTE_DOT_ROW(0, 10), QIHSE_TRYTE_DOT_ROW(0, 11),
+    QIHSE_TRYTE_DOT_ROW(0, 12), QIHSE_TRYTE_DOT_ROW(0, 13), QIHSE_TRYTE_DOT_ROW(0, 14),
+    QIHSE_TRYTE_DOT_ROW(0, 15), QIHSE_TRYTE_DOT_ROW(0, 16), QIHSE_TRYTE_DOT_ROW(0, 17),
+    QIHSE_TRYTE_DOT_ROW(0, 18), QIHSE_TRYTE_DOT_ROW(0, 19), QIHSE_TRYTE_DOT_ROW(0, 20),
+    QIHSE_TRYTE_DOT_ROW(0, 21), QIHSE_TRYTE_DOT_ROW(0, 22), QIHSE_TRYTE_DOT_ROW(0, 23),
+    QIHSE_TRYTE_DOT_ROW(0, 24), QIHSE_TRYTE_DOT_ROW(0, 25), QIHSE_TRYTE_DOT_ROW(0, 26)
+};
+#undef QIHSE_TRYTE_DOT_ROW
+#undef QIHSE_TRYTE_DOT3
+#undef QIHSE_TRYTE_DECODE
+#undef QIHSE_TRYTE_REPEAT27
+#undef QIHSE_TRYTE_REPEAT9
+#undef QIHSE_TRYTE_REPEAT3
 
 static bool qihse_tryte_weighted_dims_fit_i64(size_t dims) {
     if (dims > (size_t)(INT64_MAX / (int64_t)INT32_MAX)) {
@@ -311,7 +339,6 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
                                         int32_t* out_score) {
     size_t row_bytes;
     size_t byte_idx;
-    size_t seen_dims = 0u;
     int32_t score = 0;
 
     if (!out_score || dims > (size_t)INT32_MAX) {
@@ -329,19 +356,11 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
         !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
-    if (!qihse_tryte_unpack_table_ready) {
-        qihse_tryte_init_unpack_table();
-    }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
-        const uint8_t* lhs = qihse_tryte_unpack_table[lhs_trytes[byte_idx]];
-        const uint8_t* rhs = qihse_tryte_unpack_table[rhs_trytes[byte_idx]];
-        size_t trit_idx;
-
-        for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE &&
-                            seen_dims < dims;
-             trit_idx++, seen_dims++) {
-            score += (int32_t)qihse_tryte_trit_product[lhs[trit_idx]][rhs[trit_idx]];
-        }
+        unsigned lhs = lhs_trytes[byte_idx];
+        unsigned rhs = rhs_trytes[byte_idx];
+        score += qihse_tryte_dot3[lhs % 27u][rhs % 27u] +
+                 qihse_tryte_dot3[lhs / 27u + 9u][rhs / 27u + 9u];
     }
     *out_score = score;
     return true;
@@ -466,9 +485,6 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
     if (!qihse_trinary_tryte_validate_row(lhs_trytes, dims) ||
         !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
-    }
-    if (!qihse_tryte_unpack_table_ready) {
-        qihse_tryte_init_unpack_table();
     }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
         const uint8_t* lhs = qihse_tryte_unpack_table[lhs_trytes[byte_idx]];
