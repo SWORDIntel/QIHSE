@@ -8,64 +8,66 @@ To validate sub-microsecond retrieval across diverse storage paradigms, QIHSE pr
 
 ## 1. Full-System Hot-Path Benchmark Results
 
-**Host Environment:** Intel Xeon E5-2407 (8 cores @ 2.20GHz), 96 GB Physical RAM, AVX1 execution mode, Linux 6.8 kernel.
+**Host Environment:** 8 cores, 88 GB Physical RAM, Linux, AVX2 runtime dispatch.
+**Methodology:** Authenticated operator principal, successful search validation, `make bench-micro` harness with p50/p95/p99 percentiles and 95% confidence intervals. All searches use real `qihse_vector_db_search()` calls with live/tombstone checks, authorization, and result materialization.
 
-### Subsystem Latency & Throughput Summary
+### A. Vector Database Engine (Exact Float32 Search)
 
-```
-=======================================================================
-  QIHSE FULL-SYSTEM ARCHITECTURAL BENCHMARK & HOT-PATH PROFILING       
-=======================================================================
-```
+*Dataset: unit vectors × 128 dimensions, k=10, cosine/dot/euclidean metrics*
 
-#### A. Vector Database Engine (Exact SIMD Math)
-*Dataset: 10,000 unit vectors × 128 dimensions*
-| Metric / Distance Function | Mean Latency | p50 (Median) | p95 Latency | p99 Latency | Max Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **Exact Dot-Product Rerank** | `0.04 μs` (40 ns) | **`38 ns`** | `40 ns` | `50 ns` | `90 ns` |
-| **Exact L2 Euclidean Distance** | `0.04 μs` (40 ns) | **`38 ns`** | `40 ns` | `40 ns` | `70 ns` |
-| **Exact Cosine Distance Rerank** | `0.07 μs` (70 ns) | **`40 ns`** | `50 ns` | `60 ns` | `5.22 μs` |
+| Workload | Metric | p50 | p95 | p99 | n |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1K×128 Cosine** | p50 | **83 µs** | 113 µs | 894 µs | 1600 |
+| **1K×128 Dot Product** | p50 | **67 µs** | 90 µs | 414 µs | 1600 |
+| **1K×128 Euclidean** | p50 | **80 µs** | 109 µs | 493 µs | 1600 |
+| **10K×128 Cosine** | p50 | **1135 µs** | 3767 µs | 7438 µs | 640 |
+| **10K×128 Dot Product** | p50 | **1012 µs** | 3524 µs | 8107 µs | 640 |
+| **10K×128 Euclidean** | p50 | **1113 µs** | 4115 µs | 8125 µs | 640 |
+| **100K×128 Cosine** | p50 | **13.6 ms** | 40.1 ms | 141.1 ms | 80 |
+| **100K×128 Dot Product** | p50 | **12.6 ms** | 41.2 ms | 107.8 ms | 80 |
+| **100K×128 Euclidean** | p50 | **13.2 ms** | 36.0 ms | 65.7 ms | 80 |
 
----
+### B. Graph Index (HNSW) Search
 
-#### B. Key-Value Subsystem & Trinary Trie
-*Dataset: 50,000 keys (Trinary Trie Indexing, LSM MemTable & WAL)*
-| Engine Layer & Access Mode | Throughput | Mean Latency | p50 (Median) | p99 Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **Raw Trinary Trie Search** | **`5,864,436 queries/sec`** | `170.52 ns` | **`150 ns`** | `311 ns` |
-| **In-Memory Trie Set** | **`971,596 writes/sec`** | `0.65 μs` | **`290 ns`** | `3.80 μs` |
-| **KV Set (Buffered WAL Ingress)** | **`489,089 writes/sec`** | `1.76 μs` | **`550 ns`** | `56.43 μs` |
-| **KV Point Get (Security Guarded)** | **`418,143 reads/sec`** | `2.20 μs` | **`320 ns`** | `550 ns` |
+| Workload | p50 | p95 | p99 |
+| :--- | :--- | :--- | :--- |
+| **1K×128 Graph Search** | **81 µs** | 169 µs | 169 µs |
+| **10K×128 Graph Search** | **1049 µs** | 1948 µs | 1948 µs |
+| **1K×128 Graph Build** | 401 ms | — | — |
+| **10K×128 Graph Build** | 26.7 s | — | — |
 
----
+### C. INT8 Scalar Quantization
 
-#### C. SQLite VFS Engine
-*Dataset: 10,000 records (Batch Transaction) & 1,000 Point Selects*
-| Operation | Metric | Benchmark Result |
+| Workload | p50 | Build Time |
 | :--- | :--- | :--- |
-| **Bulk Transaction Insert** | Throughput | **`116,259 rows/sec`** (`10k rows in 86 ms`) |
-| **Indexed Point Select (VFS Cached)** | p50 Latency | **`7.42 μs`** |
-| **Indexed Point Select (VFS Cached)** | p95 Latency | **`8.37 μs`** |
-| **Cache Hit Mode** | Layer | Served directly from QIHSE 64MB LRU Page Cache |
+| **1K×128 INT8 Search** | **295 µs** | 1.87 ms |
+| **10K×128 INT8 Search** | **2989 µs** | 12.6 ms |
+| **100K×128 INT8 Search** | **31.0 ms** | 155 ms |
 
----
+### D. Trinary Candidate Selection
 
-#### D. Time-Series Telemetry (Gorilla XOR Engine)
-*Dataset: 20,000 temporal data points*
-| Operation | Metric | Benchmark Result |
+| Workload | p50 | p95 |
 | :--- | :--- | :--- |
-| **Point Ingestion Rate** | Throughput | **`4,796,298 points/sec`** |
-| **Per-Point Ingestion Latency** | p50 (Median) | **`40 ns`** (`0.13 μs` mean) |
-| **Range Average Scan** | Latency | **`876.15 μs`** (for 20,000 points) |
+| **10K×128 Trinary Scalar (cand=100)** | **2712 µs** | 6692 µs |
+| **10K×128 Exact Float32 (k=10)** | **1187 µs** | 1442 µs |
+| **100K×128 Trinary Scalar (cand=500)** | **30.1 ms** | 38.0 ms |
+| **100K×128 Exact Float32 (k=10)** | **13.0 ms** | 32.4 ms |
 
----
+### E. Metadata Filtering
 
-#### E. Columnar OLAP Engine
-*Dataset: 50,000 float32 elements*
-| Operation | Metric | Benchmark Result |
+| Workload | p50 | p95 |
 | :--- | :--- | :--- |
-| **SIMD Sum Aggregation** | Latency | **`297.28 μs`** |
-| **Vector Scan Bandwidth** | Throughput | Continuous L1/L2 streamed aggregation |
+| **10K×128 Filtered (10% match)** | **538 µs** | 1148 µs |
+| **10K×128 Unfiltered** | **1063 µs** | 4346 µs |
+| **100K×128 Filtered (5% match)** | **5343 µs** | 5559 µs |
+| **100K×128 Unfiltered** | **12.9 ms** | 29.7 ms |
+
+### F. Batch Search Throughput
+
+| Workload | p50 (batch) | p50 (serial) |
+| :--- | :--- | :--- |
+| **10K×128 batch=32** | 38.6 ms | 44.7 ms |
+| **100K×128 batch=64** | 1.10 s | 1.08 s |
 
 ---
 
@@ -103,7 +105,7 @@ To validate sub-microsecond retrieval across diverse storage paradigms, QIHSE pr
 
 | Feature / Metric | Conventional Databases (Redis / Chroma / Postgres) | QIHSE Native Engine |
 | :--- | :--- | :--- |
-| **Vector Similarity Math** | 200–500 μs (network IPC + serial serialization) | **38–40 ns** (zero-copy direct SIMD registers) |
+| **Vector Similarity Math** | 200–500 μs (network IPC + serial serialization) | **67–83 μs** p50 (1K×128, in-process SIMD with auth) |
 | **Multi-Modal Concurrency** | Single-threaded event loop blocking or heavy B-Tree lock contention | Disjoint lockless memory structures per engine plane |
 | **Time-Series Ingestion** | 50k–200k points/sec (JSON / SQL parse overhead) | **4.8M–5.1M points/sec** (Gorilla XOR bit-packing) |
 | **Memory Architecture** | Unmanaged virtual memory / Garbage collected heap | NUMA-aware, HugePage-aligned UMA/HMA tiering |
