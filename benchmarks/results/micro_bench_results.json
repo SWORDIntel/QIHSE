@@ -1,0 +1,203 @@
+[
+  {
+    "name": "exact-search-cosine",
+    "params": "10000x128, k=10",
+    "p50_us": 1107.541,
+    "p95_us": 3573.04,
+    "p99_us": 7534.969,
+    "n": 640
+  },
+  {
+    "name": "exact-search-euclidean",
+    "params": "10000x128, k=10",
+    "p50_us": 1041.529,
+    "p95_us": 3649.038,
+    "p99_us": 6950.483,
+    "n": 640
+  },
+  {
+    "name": "exact-search-cosine",
+    "params": "100000x128, k=10",
+    "p50_us": 14864.549,
+    "p95_us": 69693.626,
+    "p99_us": 204980.696,
+    "n": 80
+  },
+  {
+    "name": "exact-search-dotproduct",
+    "params": "100000x128, k=10",
+    "p50_us": 13124.593,
+    "p95_us": 35134.026,
+    "p99_us": 84018.174,
+    "n": 80
+  },
+  {
+    "name": "exact-search-euclidean",
+    "params": "100000x128, k=10",
+    "p50_us": 14135.549,
+    "p95_us": 60219.162,
+    "p99_us": 612865.432,
+    "n": 80
+  },
+  {
+    "name": "batch-search",
+    "params": "10000x128, batch=32",
+    "p50_us": 36170.643,
+    "p95_us": 161700.359,
+    "p99_us": 161700.359,
+    "n": 20
+  },
+  {
+    "name": "serial-search",
+    "params": "10000x128, batch=32",
+    "p50_us": 36213.482,
+    "p95_us": 145911.173,
+    "p99_us": 145911.173,
+    "n": 20
+  },
+  {
+    "name": "batch-search",
+    "params": "100000x128, batch=64",
+    "p50_us": 1676109.713,
+    "p95_us": 2027490.235,
+    "p99_us": 2027490.235,
+    "n": 10
+  },
+  {
+    "name": "serial-search",
+    "params": "100000x128, batch=64",
+    "p50_us": 1334385.385,
+    "p95_us": 1995104.548,
+    "p99_us": 1995104.548,
+    "n": 10
+  },
+  {
+    "name": "hybrid-rrf",
+    "params": "10000x128, k=10",
+    "p50_us": 2058.716,
+    "p95_us": 4153.68,
+    "p99_us": 4153.68,
+    "n": 20
+  },
+  {
+    "name": "hybrid-rrf",
+    "params": "100000x128, k=10",
+    "p50_us": 24776.436,
+    "p95_us": 37219.74,
+    "p99_us": 37219.74,
+    "n": 10
+  },
+  {
+    "name": "int8-build",
+    "params": "1000x128",
+    "build_ms": 1.12
+  },
+  {
+    "name": "int8-build",
+    "params": "10000x128",
+    "build_ms": 12.223
+  },
+  {
+    "name": "int8-search",
+    "params": "10000x128, k=10",
+    "p50_us": 3123.197,
+    "p95_us": 5097.919,
+    "p99_us": 5097.919,
+    "n": 20
+  },
+  {
+    "name": "int8-build",
+    "params": "100000x128",
+    "build_ms": 191.563
+  },
+  {
+    "name": "int8-search",
+    "params": "100000x128, k=10",
+    "p50_us": 35730.236,
+    "p95_us": 43726.916,
+    "p99_us": 43726.916,
+    "n": 5
+  },
+  {
+    "name": "graph-build",
+    "params": "1000x128",
+    "build_ms": 374.966
+  },
+  {
+    "name": "graph-build",
+    "params": "10000x128",
+    "build_ms": 40855.62
+  },
+  {
+    "name": "unfiltered",
+    "params": "10000x128",
+    "p50_us": 1003.442,
+    "p95_us": 4033.467,
+    "p99_us": 4033.467,
+    "n": 20
+  },
+  {
+    "name": "metadata-filtered",
+    "params": "100000x128, match=5%",
+    "p50_us": 5624.872,
+    "p95_us": 8610.901,
+    "p99_us": 8610.901,
+    "n": 10
+  },
+  {
+    "name": "unfiltered",
+    "params": "100000x128",
+    "p50_us": 13668.414,
+    "p95_us": 17876.84,
+    "p99_us": 17876.84,
+    "n": 10
+  },
+  {
+    "name": "trinary-scalar",
+    "params": "10000x128, cand=100",
+    "p50_us": 2798.774,
+    "p95_us": 4774.599,
+    "p99_us": 4774.599,
+    "n": 20
+  },
+  {
+    "name": "trinary-magnitude",
+    "params": "10000x128, cand=100",
+    "p50_us": 2645.395,
+    "p95_us": 50912.206,
+    "p99_us": 50912.206,
+    "n": 20
+  },
+  {
+    "name": "exact-float32",
+    "params": "10000x128, k=10",
+    "p50_us": 1225.746,
+    "p95_us": 2892.983,
+    "p99_us": 2892.983,
+    "n": 20
+  },
+  {
+    "name": "trinary-scalar",
+    "params": "100000x128, cand=500",
+    "p50_us": 30261.017,
+    "p95_us": 36578.404,
+    "p99_us": 36578.404,
+    "n": 10
+  },
+  {
+    "name": "trinary-magnitude",
+    "params": "100000x128, cand=500",
+    "p50_us": 28809.896,
+    "p95_us": 812980.736,
+    "p99_us": 812980.736,
+    "n": 10
+  },
+  {
+    "name": "exact-float32",
+    "params": "100000x128, k=10",
+    "p50_us": 13326.603,
+    "p95_us": 35271.021,
+    "p99_us": 35271.021,
+    "n": 10
+  }
+]
