@@ -12,6 +12,26 @@
 #endif
 
 #define QIHSE_RING_SIZE 4096
+#define QIHSE_TSDB_ALIGNMENT 64u
+#define QIHSE_TS_CHUNK_ALIGNMENT 4096u
+
+static void* qihse_ts_aligned_alloc(size_t alignment, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+#endif
+}
+
+static void qihse_ts_aligned_free(void* ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 struct qihse_tsdb {
     qihse_tsdb_chunk_t* chunk_head;
@@ -93,18 +113,12 @@ static inline int64_t sign_extend(uint64_t val, int bits) {
 }
 
 qihse_tsdb_t* qihse_tsdb_create() {
-    qihse_tsdb_t* tsdb = (qihse_tsdb_t*)malloc(sizeof(qihse_tsdb_t));
-    if (tsdb) {
-        tsdb->chunk_head = NULL;
-        tsdb->chunk_tail = NULL;
-        tsdb->chunk_starts = NULL;
-        tsdb->chunk_ptrs = NULL;
-        tsdb->chunk_index_count = 0;
-        tsdb->chunk_index_cap = 0;
-        tsdb->ttl_ms = 0;
-        atomic_init(&tsdb->head.index, 0);
-        atomic_init(&tsdb->tail.index, 0);
-    }
+    qihse_tsdb_t* tsdb = (qihse_tsdb_t*)qihse_ts_aligned_alloc(QIHSE_TSDB_ALIGNMENT, sizeof(qihse_tsdb_t));
+    if (!tsdb) return NULL;
+
+    memset(tsdb, 0, sizeof(*tsdb));
+    atomic_init(&tsdb->head.index, 0);
+    atomic_init(&tsdb->tail.index, 0);
     return tsdb;
 }
 
@@ -113,12 +127,12 @@ void qihse_tsdb_destroy(qihse_tsdb_t* tsdb) {
     qihse_tsdb_chunk_t* curr = tsdb->chunk_head;
     while (curr) {
         qihse_tsdb_chunk_t* next = curr->next;
-        free(curr);
+        qihse_ts_aligned_free(curr);
         curr = next;
     }
     free(tsdb->chunk_starts);
     free(tsdb->chunk_ptrs);
-    free(tsdb);
+    qihse_ts_aligned_free(tsdb);
 }
 
 void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
@@ -129,15 +143,8 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
     
     if (head == tail) return;
     
-    void* ptr = NULL;
-#ifdef _WIN32
-    ptr = _aligned_malloc(sizeof(qihse_tsdb_chunk_t), 4096);
-    if (!ptr) {
-#else
-    if (posix_memalign(&ptr, 4096, sizeof(qihse_tsdb_chunk_t)) != 0) {
-#endif
-        return;
-    }
+    void* ptr = qihse_ts_aligned_alloc(QIHSE_TS_CHUNK_ALIGNMENT, sizeof(qihse_tsdb_chunk_t));
+    if (!ptr) return;
     
     qihse_tsdb_chunk_t* new_chunk = (qihse_tsdb_chunk_t*)ptr;
     memset(new_chunk, 0, sizeof(qihse_tsdb_chunk_t));
@@ -529,7 +536,7 @@ void qihse_tsdb_trim(qihse_tsdb_t* tsdb, uint64_t current_ts) {
             if (tsdb->chunk_tail == to_free) {
                 tsdb->chunk_tail = NULL;
             }
-            free(to_free);
+            qihse_ts_aligned_free(to_free);
             trimmed_from_front++;
         } else {
             break;
