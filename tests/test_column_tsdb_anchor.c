@@ -29,6 +29,10 @@
 #include <string.h>
 #include <time.h>
 
+#define ANCHOR_ANALYST_ID 424u
+#define ANCHOR_OPERATOR_PASSWORD "AnchorOperatorPass1!"
+#define ANCHOR_ANALYST_PASSWORD "AnchorAnalystPass1!"
+
 /* ------------------------------------------------------------------ */
 /* Timing helper                                                       */
 /* ------------------------------------------------------------------ */
@@ -110,21 +114,25 @@ static void test_column_anchor_index_acl(void) {
 
     qihse_column_store_t* store = qihse_column_store_create();
     assert(store);
-    qihse_auth_init();
+    assert(qihse_auth_init());
     qihse_user_t* op = qihse_auth_get_user(0);
+    assert(op != NULL);
+    if (qihse_auth_is_operator_password_default()) {
+        assert(qihse_auth_bootstrap_operator(ANCHOR_OPERATOR_PASSWORD));
+    }
 
-    /* Build a restricted analyst user on the stack: classification level 0,
-     * no SCI compartments, non-operator role. qihse_auth_can_access reads
-     * these fields directly, so registration via qihse_auth_create_user is
-     * not required for this access-control exercise. */
-    qihse_user_t analyst;
-    memset(&analyst, 0, sizeof(analyst));
-    analyst.user_id = 4242;
-    analyst.role = QIHSE_ROLE_ANALYST;
-    analyst.classification_level = 0;   /* UNCLASSIFIED only */
-    analyst.sci_compartments = 0;
-    analyst.hardware_token_present = true;
-    qihse_user_t* guest = &analyst;
+    /* Principals are authoritative registry objects. Use a registered analyst
+     * with classification level 0 and no SCI compartments rather than forging
+     * a caller-controlled qihse_user_t. */
+    qihse_user_t* guest = qihse_auth_create_user(
+        op,
+        ANCHOR_ANALYST_ID,
+        QIHSE_ROLE_ANALYST,
+        0,
+        0,
+        ANCHOR_ANALYST_PASSWORD,
+        false);
+    assert(guest != NULL);
 
     assert(qihse_column_create(store, "secret_ids", QIHSE_COL_TYPE_INT64));
     /* Mix of unclassified (0,0) and classified (level 1) rows.
@@ -149,6 +157,7 @@ static void test_column_anchor_index_acl(void) {
     /* Analyst point lookup on an unclassified (odd) value must hit. */
     assert(qihse_column_lookup_int64_user(store, "secret_ids", 3, guest) >= 0);
 
+    assert(qihse_auth_destroy_user(op, ANCHOR_ANALYST_ID));
     qihse_column_store_destroy(store);
     printf("[column] PASS ACL enforcement on anchor lookups\n");
 }
