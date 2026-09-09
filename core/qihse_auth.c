@@ -675,6 +675,16 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
         return true; /* Unclassified data allowed when unauthenticated */
     }
 
+    /* Fast path: unclassified data is accessible to any authenticated caller.
+     * Consistent with the NULL-user path above — unclassified data is already
+     * open to unauthenticated callers, so any authenticated user trivially
+     * passes the clearance (0 <= any level) and SCI (0 ⊆ any compartments)
+     * checks.  This avoids a per-row rwlock acquisition during search over
+     * unclassified datasets, which is the common case for vector search. */
+    if (data_classif == 0 && data_sci == 0) {
+        return true;
+    }
+
     pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid = 0xFFFFFFFF;
     authz_state_t authz;
