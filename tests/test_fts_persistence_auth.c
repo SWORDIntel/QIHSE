@@ -1,20 +1,7 @@
 #define _GNU_SOURCE
-/*
- * test_fts_persistence_auth.c — Negative authorization test for FTS save/load.
- *
- * Per QIHSE AGENTS.md invariant 3: every new protocol adapter / persistence
- * layer requires a low-clearance/high-data negative test.
- *
- * This test:
- *   1. Creates an FTS index with classified documents (classification=5)
- *   2. Verifies an operator can save and load the classified index
- *   3. Verifies a guest (classification=0) CANNOT save the classified index
- *   4. Verifies a guest CANNOT load the classified index file
- *   5. Verifies unclassified indexes work with NULL user
- *   6. Verifies round-trip fidelity (search results identical after save/load)
- */
-
 #include <assert.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,169 +11,187 @@
 #include "qihse_fts.h"
 #include "core/qihse_auth_internal.h"
 
+#define QFTS_MAGIC 0x53544651u
+#define QFTS_VERSION 1u
+
+static void cleanup(void) {
+    unlink("/tmp/test_fts_classified.qfts");
+    unlink("/tmp/test_fts_classified_guest.qfts");
+    unlink("/tmp/test_fts_unclassified.qfts");
+    unlink("/tmp/test_fts_roundtrip.qfts");
+    unlink("/tmp/test_fts_mixed.qfts");
+    unlink("/tmp/test_fts_mixed_null.qfts");
+    unlink("/tmp/test_fts_bad_counts.qfts");
+    unlink("/tmp/test_fts_bad_docidx.qfts");
+}
+
+static void write_bad_counts_fixture(void) {
+    FILE* f = fopen("/tmp/test_fts_bad_counts.qfts", "wb");
+    assert(f != NULL);
+    uint32_t magic = QFTS_MAGIC, version = QFTS_VERSION;
+    uint32_t doc_count = UINT32_MAX, doc_capacity = UINT32_MAX;
+    uint64_t total = 0;
+    assert(fwrite(&magic, sizeof(magic), 1, f) == 1);
+    assert(fwrite(&version, sizeof(version), 1, f) == 1);
+    assert(fwrite(&doc_count, sizeof(doc_count), 1, f) == 1);
+    assert(fwrite(&total, sizeof(total), 1, f) == 1);
+    assert(fwrite(&doc_capacity, sizeof(doc_capacity), 1, f) == 1);
+    fclose(f);
+}
+
+static void test_ranking_isolation(qihse_user_t* guest, qihse_user_t* operator_user) {
+    qihse_fts_index_t* public_only = qihse_fts_create();
+    qihse_fts_index_t* mixed = qihse_fts_create();
+    assert(public_only && mixed);
+
+    const char* pub = "alpha bravo public";
+    const char* secret = "alpha alpha classified material";
+    assert(qihse_fts_add_document(public_only, 100, pub, strlen(pub),
+                                  0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
+    assert(qihse_fts_add_document(mixed, 100, pub, strlen(pub),
+                                  0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
+    assert(qihse_fts_add_document_user(mixed, 101, secret, strlen(secret),
+                                       5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                       operator_user));
+
+    qihse_fts_result_t a[4], b[4];
+    int na = qihse_fts_search_user(public_only, "alpha", guest, a, 4);
+    int nb = qihse_fts_search_user(mixed, "alpha", guest, b, 4);
+    assert(na == 1 && nb == 1);
+    assert(a[0].doc_id == b[0].doc_id);
+    assert(fabsf(a[0].bm25_score - b[0].bm25_score) < 0.000001f);
+
+    /* Hidden semantic metadata is not an independent disclosure surface. */
+    assert(qihse_fts_get_doc_semantic_class_user(mixed, 101, guest) ==
+           QIHSE_KEYSTONE_CLASS_UNKNOWN);
+    assert(qihse_fts_get_doc_semantic_class_user(mixed, 101, operator_user) ==
+           QIHSE_KEYSTONE_CLASS_GOVERNMENT);
+    assert(qihse_fts_get_doc_semantic_class(mixed, 101) ==
+           QIHSE_KEYSTONE_CLASS_UNKNOWN);
+
+    qihse_fts_destroy(public_only);
+    qihse_fts_destroy(mixed);
+    printf("[PASS] Hidden documents do not influence guest BM25 scores or metadata\n");
+}
+
 int main(void) {
-    /* Initialize auth */
+    cleanup();
     setenv("QIHSE_FIPS_MODE", "disabled", 1);
     assert(qihse_auth_init());
-
-    /* Bootstrap operator */
     assert(qihse_auth_bootstrap_operator("SecureOpPass1!"));
     qihse_user_t* operator_user = qihse_auth_get_user(0);
     assert(operator_user != NULL);
 
-    /* Create a guest with classification=0 (unclassified only) */
     qihse_user_t* guest = qihse_auth_create_user(
         operator_user, 10, QIHSE_ROLE_GUEST, 0, 0,
         "GuestPass123!", false);
     assert(guest != NULL);
-
-    /* Create an analyst with classification=5 */
     qihse_user_t* analyst = qihse_auth_create_user(
         operator_user, 11, QIHSE_ROLE_ANALYST, 5, 0,
         "AnalystPass123!", false);
     assert(analyst != NULL);
 
-    /* ---- Test 1: Classified index — operator can save ---- */
+    /* Context-free classified indexing is now fail-closed. */
+    qihse_fts_index_t* deny_idx = qihse_fts_create();
+    assert(deny_idx);
+    assert(!qihse_fts_add_document(deny_idx, 99, "secret", 6,
+                                   5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT));
+    assert(!qihse_fts_add_document_user(deny_idx, 99, "secret", 6,
+                                        5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                        guest));
+    assert(qihse_fts_add_document_user(deny_idx, 99, "secret", 6,
+                                       5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                       operator_user));
+    qihse_fts_destroy(deny_idx);
+    printf("[PASS] Classified insertion requires an authorized principal\n");
+
     qihse_fts_index_t* idx_classified = qihse_fts_create();
     assert(idx_classified != NULL);
-
-    /* Add classified documents */
     const char* t1 = "secret kernel exploit driver analysis";
-    assert(qihse_fts_add_document(idx_classified, 1, t1, strlen(t1),
-        5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT));
     const char* t2 = "classified vulnerability refcount race";
-    assert(qihse_fts_add_document(idx_classified, 2, t2, strlen(t2),
-        5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT));
+    assert(qihse_fts_add_document_user(idx_classified, 1, t1, strlen(t1),
+                                       5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                       operator_user));
+    assert(qihse_fts_add_document_user(idx_classified, 2, t2, strlen(t2),
+                                       5, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                       operator_user));
 
-    /* Operator can save (has classification >= 5) */
-    bool op_save = qihse_fts_save(idx_classified, "/tmp/test_fts_classified.qfts", operator_user);
-    assert(op_save);
-    printf("[PASS] Operator can save classified FTS index\n");
+    assert(qihse_fts_save(idx_classified, "/tmp/test_fts_classified.qfts", operator_user));
+    assert(!qihse_fts_save(idx_classified, "/tmp/test_fts_classified_guest.qfts", guest));
+    assert(access("/tmp/test_fts_classified_guest.qfts", F_OK) != 0);
 
-    /* ---- Test 2: Guest CANNOT save classified index ---- */
-    bool guest_save = qihse_fts_save(idx_classified, "/tmp/test_fts_classified_guest.qfts", guest);
-    assert(!guest_save);
-    printf("[PASS] Guest denied saving classified FTS index (no partial export)\n");
-
-    /* Verify the guest's save file was NOT created */
-    FILE* check = fopen("/tmp/test_fts_classified_guest.qfts", "rb");
-    assert(check == NULL);
-    printf("[PASS] No file leaked from denied save\n");
-
-    /* ---- Test 3: Operator can load classified index ---- */
     qihse_fts_index_t* loaded_op = qihse_fts_load("/tmp/test_fts_classified.qfts", operator_user);
     assert(loaded_op != NULL);
-
-    /* Verify search works and returns classified results */
     qihse_fts_result_t results[10];
-    int n = qihse_fts_search_user(loaded_op, "exploit", operator_user, results, 10);
-    assert(n > 0);
-    printf("[PASS] Operator can load and search classified FTS index (%d results)\n", n);
+    assert(qihse_fts_search_user(loaded_op, "exploit", operator_user, results, 10) > 0);
     qihse_fts_destroy(loaded_op);
-
-    /* ---- Test 4: Guest CANNOT load classified index ---- */
-    qihse_fts_index_t* loaded_guest = qihse_fts_load("/tmp/test_fts_classified.qfts", guest);
-    assert(loaded_guest == NULL);
-    printf("[PASS] Guest denied loading classified FTS index (no partial import)\n");
-
-    /* ---- Test 5: Analyst (classification=5) CAN load classified index ---- */
+    assert(qihse_fts_load("/tmp/test_fts_classified.qfts", guest) == NULL);
     qihse_fts_index_t* loaded_analyst = qihse_fts_load("/tmp/test_fts_classified.qfts", analyst);
     assert(loaded_analyst != NULL);
-    printf("[PASS] Analyst (classification=5) can load classified FTS index\n");
     qihse_fts_destroy(loaded_analyst);
-
     qihse_fts_destroy(idx_classified);
+    printf("[PASS] FTS save/load is all-or-nothing RBAC protected\n");
 
-    /* ---- Test 6: Unclassified index — NULL user works ---- */
     qihse_fts_index_t* idx_unclassified = qihse_fts_create();
     assert(idx_unclassified != NULL);
-
     const char* t10 = "public driver analysis documentation";
-    assert(qihse_fts_add_document(idx_unclassified, 10, t10, strlen(t10),
-        0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
     const char* t11 = "open source kernel module reference";
+    assert(qihse_fts_add_document(idx_unclassified, 10, t10, strlen(t10),
+                                  0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
     assert(qihse_fts_add_document(idx_unclassified, 11, t11, strlen(t11),
-        0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
-
-    /* NULL user can save unclassified index */
-    bool null_save = qihse_fts_save(idx_unclassified, "/tmp/test_fts_unclassified.qfts", NULL);
-    assert(null_save);
-    printf("[PASS] NULL user can save unclassified FTS index\n");
-
-    /* NULL user can load unclassified index */
+                                  0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
+    assert(qihse_fts_save(idx_unclassified, "/tmp/test_fts_unclassified.qfts", NULL));
     qihse_fts_index_t* loaded_null = qihse_fts_load("/tmp/test_fts_unclassified.qfts", NULL);
     assert(loaded_null != NULL);
-    printf("[PASS] NULL user can load unclassified FTS index\n");
-
-    /* Guest can also load unclassified index */
-    qihse_fts_index_t* loaded_guest_unc = qihse_fts_load("/tmp/test_fts_unclassified.qfts", guest);
-    assert(loaded_guest_unc != NULL);
-    printf("[PASS] Guest can load unclassified FTS index\n");
-    qihse_fts_destroy(loaded_guest_unc);
-
     qihse_fts_destroy(loaded_null);
     qihse_fts_destroy(idx_unclassified);
+    printf("[PASS] Unclassified legacy FTS path remains compatible\n");
 
-    /* ---- Test 7: Round-trip fidelity ---- */
     qihse_fts_index_t* idx_rt = qihse_fts_create();
+    assert(idx_rt);
     for (int i = 0; i < 50; i++) {
         char text[128];
-        snprintf(text, sizeof(text), "function_%d ExAllocatePoolWithTag kernel driver test %d", i, i);
-        qihse_fts_add_document(idx_rt, 100 + i, text, strlen(text), 0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN);
+        snprintf(text, sizeof(text),
+                 "function_%d ExAllocatePoolWithTag kernel driver test %d", i, i);
+        assert(qihse_fts_add_document(idx_rt, 100 + (uint64_t)i, text, strlen(text),
+                                      0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
     }
-
-    /* Search before save */
-    qihse_fts_result_t before[5];
+    qihse_fts_result_t before[5], after[5];
     int n_before = qihse_fts_search_user(idx_rt, "ExAllocatePool", NULL, before, 5);
     assert(n_before > 0);
-
-    /* Save and reload */
     assert(qihse_fts_save(idx_rt, "/tmp/test_fts_roundtrip.qfts", NULL));
     qihse_fts_index_t* idx_loaded = qihse_fts_load("/tmp/test_fts_roundtrip.qfts", NULL);
     assert(idx_loaded != NULL);
-
-    /* Search after load — results must match */
-    qihse_fts_result_t after[5];
     int n_after = qihse_fts_search_user(idx_loaded, "ExAllocatePool", NULL, after, 5);
     assert(n_after == n_before);
-
     for (int i = 0; i < n_before; i++) {
         assert(before[i].doc_id == after[i].doc_id);
-        /* BM25 scores should be identical (same index structure) */
         assert(before[i].bm25_score == after[i].bm25_score);
     }
-    printf("[PASS] Round-trip fidelity: %d results match exactly\n", n_before);
-
     qihse_fts_destroy(idx_loaded);
     qihse_fts_destroy(idx_rt);
+    printf("[PASS] Hardened persistence preserves exact search round-trip\n");
 
-    /* ---- Test 8: NULL user CANNOT save classified index ---- */
     qihse_fts_index_t* idx_mixed = qihse_fts_create();
-    qihse_fts_add_document(idx_mixed, 1, "unclassified doc", 16, 0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN);
-    qihse_fts_add_document(idx_mixed, 2, "secret doc", 10, 3, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT);
-
-    bool null_save_classified = qihse_fts_save(idx_mixed, "/tmp/test_fts_mixed_null.qfts", NULL);
-    assert(!null_save_classified);
-    printf("[PASS] NULL user denied saving mixed-classification index\n");
-
-    /* Operator can save the mixed index */
-    bool op_save_mixed = qihse_fts_save(idx_mixed, "/tmp/test_fts_mixed.qfts", operator_user);
-    assert(op_save_mixed);
-    printf("[PASS] Operator can save mixed-classification index\n");
-
-    /* Guest cannot load mixed index (has classified docs) */
-    qihse_fts_index_t* guest_mixed = qihse_fts_load("/tmp/test_fts_mixed.qfts", guest);
-    assert(guest_mixed == NULL);
-    printf("[PASS] Guest denied loading mixed-classification index\n");
-
+    assert(idx_mixed);
+    assert(qihse_fts_add_document(idx_mixed, 1, "unclassified doc", 16,
+                                  0, 0, QIHSE_KEYSTONE_CLASS_UNKNOWN));
+    assert(qihse_fts_add_document_user(idx_mixed, 2, "secret doc", 10,
+                                       3, 0, QIHSE_KEYSTONE_CLASS_GOVERNMENT,
+                                       operator_user));
+    assert(!qihse_fts_save(idx_mixed, "/tmp/test_fts_mixed_null.qfts", NULL));
+    assert(qihse_fts_save(idx_mixed, "/tmp/test_fts_mixed.qfts", operator_user));
+    assert(qihse_fts_load("/tmp/test_fts_mixed.qfts", guest) == NULL);
     qihse_fts_destroy(idx_mixed);
 
-    /* Cleanup */
-    unlink("/tmp/test_fts_classified.qfts");
-    unlink("/tmp/test_fts_unclassified.qfts");
-    unlink("/tmp/test_fts_roundtrip.qfts");
-    unlink("/tmp/test_fts_mixed.qfts");
+    test_ranking_isolation(guest, operator_user);
 
-    printf("\n[ALL PASS] FTS persistence authorization tests — %s:%d\n", __FILE__, __LINE__);
+    /* Malicious serialized cardinalities must be rejected before allocation. */
+    write_bad_counts_fixture();
+    assert(qihse_fts_load("/tmp/test_fts_bad_counts.qfts", operator_user) == NULL);
+    printf("[PASS] Malformed FTS cardinalities are rejected before allocation\n");
+
+    cleanup();
+    printf("\n[ALL PASS] FTS persistence/RBAC/inference regression suite\n");
     return 0;
 }

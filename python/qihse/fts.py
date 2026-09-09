@@ -4,11 +4,10 @@ QIHSE Full-Text Search (FTS) Index with BM25 & Neural Classification (ctypes bin
 
 import ctypes
 import os
-from typing import List, Optional
+from typing import List
 from dataclasses import dataclass
 from .neural import KeystoneClass
 
-# Find libqihse.so
 _LIB_PATHS = [
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
     "/usr/local/lib/libqihse.so",
@@ -28,6 +27,7 @@ if _lib is None:
 class _FTSIndex(ctypes.Structure):
     pass
 
+
 _FTSIndex_p = ctypes.POINTER(_FTSIndex)
 
 
@@ -41,11 +41,10 @@ class _CFTSResult(ctypes.Structure):
 
 _lib.qihse_fts_create.argtypes = []
 _lib.qihse_fts_create.restype = _FTSIndex_p
-
 _lib.qihse_fts_destroy.argtypes = [_FTSIndex_p]
 _lib.qihse_fts_destroy.restype = None
 
-_lib.qihse_fts_add_document.argtypes = [
+_lib.qihse_fts_add_document_user.argtypes = [
     _FTSIndex_p,
     ctypes.c_uint64,
     ctypes.c_char_p,
@@ -53,8 +52,9 @@ _lib.qihse_fts_add_document.argtypes = [
     ctypes.c_uint16,
     ctypes.c_uint16,
     ctypes.c_int,
+    ctypes.c_void_p,
 ]
-_lib.qihse_fts_add_document.restype = ctypes.c_bool
+_lib.qihse_fts_add_document_user.restype = ctypes.c_bool
 
 _lib.qihse_fts_search_user_filtered.argtypes = [
     _FTSIndex_p,
@@ -66,12 +66,15 @@ _lib.qihse_fts_search_user_filtered.argtypes = [
 ]
 _lib.qihse_fts_search_user_filtered.restype = ctypes.c_int
 
-_lib.qihse_fts_get_doc_semantic_class.argtypes = [_FTSIndex_p, ctypes.c_uint64]
-_lib.qihse_fts_get_doc_semantic_class.restype = ctypes.c_int
+_lib.qihse_fts_get_doc_semantic_class_user.argtypes = [
+    _FTSIndex_p,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+]
+_lib.qihse_fts_get_doc_semantic_class_user.restype = ctypes.c_int
 
 _lib.qihse_fts_save.argtypes = [_FTSIndex_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_fts_save.restype = ctypes.c_bool
-
 _lib.qihse_fts_load.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_fts_load.restype = _FTSIndex_p
 
@@ -84,10 +87,7 @@ class FTSResult:
 
 
 class FTSIndex:
-    """
-    Trinary Trie Inverted Index with BM25 ranking, RBAC security filters,
-    and 6-class Keystone neural semantic classification.
-    """
+    """Trigram/BM25 index whose visibility is always resolved by QIHSE auth."""
 
     def __init__(self):
         self._ptr = _lib.qihse_fts_create()
@@ -119,13 +119,17 @@ class FTSIndex:
         classification: int = 0,
         sci_compartment: int = 0,
         semantic_class: KeystoneClass = KeystoneClass.UNKNOWN,
+        user=None,
     ) -> bool:
-        """
-        Tokenizes and indexes a document with classification metadata.
+        """Index a document using the supplied authorization principal.
+
+        ``None`` is valid only for unclassified/uncompartmented documents.
+        Classified/SCI documents are rejected by the C trust boundary unless
+        ``user`` is authorized for the target label.
         """
         encoded = text.encode("utf-8")
         return bool(
-            _lib.qihse_fts_add_document(
+            _lib.qihse_fts_add_document_user(
                 self._ptr,
                 int(doc_id),
                 encoded,
@@ -133,6 +137,7 @@ class FTSIndex:
                 int(classification),
                 int(sci_compartment),
                 int(semantic_class),
+                user,
             )
         )
 
@@ -143,12 +148,8 @@ class FTSIndex:
         semantic_mask: int = 0,
         user=None,
     ) -> List[FTSResult]:
-        """
-        Searches the FTS index using BM25 with optional neural class bitmask filtering.
-        """
         if top_k <= 0:
             return []
-
         c_results = (_CFTSResult * top_k)()
         query_enc = query.encode("utf-8")
         found = _lib.qihse_fts_search_user_filtered(
@@ -159,46 +160,31 @@ class FTSIndex:
             top_k,
             ctypes.c_uint8(semantic_mask),
         )
-
-        out = []
-        for i in range(found):
-            out.append(
-                FTSResult(
-                    doc_id=c_results[i].doc_id,
-                    score=c_results[i].bm25_score,
-                    semantic_class=KeystoneClass(c_results[i].semantic_class),
-                )
+        if found < 0:
+            raise RuntimeError("FTS search failed")
+        return [
+            FTSResult(
+                doc_id=c_results[i].doc_id,
+                score=c_results[i].bm25_score,
+                semantic_class=KeystoneClass(c_results[i].semantic_class),
             )
-        return out
+            for i in range(found)
+        ]
 
-    def get_semantic_class(self, doc_id: int) -> KeystoneClass:
-        """
-        Retrieves the 6-class neural semantic class assigned to a document ID.
-        """
-        cls_val = _lib.qihse_fts_get_doc_semantic_class(self._ptr, int(doc_id))
+    def get_semantic_class(self, doc_id: int, user=None) -> KeystoneClass:
+        """Return UNKNOWN for a missing or unauthorized document."""
+        cls_val = _lib.qihse_fts_get_doc_semantic_class_user(
+            self._ptr, int(doc_id), user
+        )
         return KeystoneClass(cls_val)
 
     def save(self, filepath: str, user=None) -> bool:
-        """Saves the FTS index to a binary file on disk.
-
-        For unclassified indexes (all documents at classification=0), user
-        may be None. For classified indexes, a user with sufficient clearance
-        is required; the save is denied if any document exceeds the user's
-        clearance.
-        """
+        """Atomically export only when ``user`` can access the entire index."""
         return bool(_lib.qihse_fts_save(self._ptr, filepath.encode("utf-8"), user))
 
     @classmethod
     def load(cls, filepath: str, user=None) -> "FTSIndex":
-        """Loads an FTS index from a binary file created by save().
-
-        For unclassified files, user may be None. For classified files,
-        a user with sufficient clearance is required; the load is denied
-        if any document in the file exceeds the user's clearance.
-
-        Returns a new FTSIndex instance. Raises RuntimeError if the file
-        cannot be loaded or authorization is denied.
-        """
+        """Load and validate an index, rejecting any record unauthorized to ``user``."""
         ptr = _lib.qihse_fts_load(filepath.encode("utf-8"), user)
         if not ptr:
             raise RuntimeError(f"Failed to load FTS index from {filepath}")
