@@ -3984,6 +3984,8 @@ static void qihse_resp_remove_client(qihse_resp_client_ctx_t* client) {
     pthread_mutex_lock(&server->state_lock);
     qihse_resp_client_ctx_t** cursor = &server->clients;
     while (*cursor && *cursor != client) cursor = &(*cursor)->next;
+    shutdown(client->fd, SHUT_RDWR);
+    close_socket(client->fd);
     if (*cursor == client) {
         *cursor = client->next;
         if (server->active_clients > 0) server->active_clients--;
@@ -3997,8 +3999,6 @@ static void* qihse_resp_client_main(void* argument) {
     qihse_resp_server_t* server = client->server;
     int fd = client->fd;
     qihse_resp_session_loop(server, fd);
-    shutdown(fd, SHUT_RDWR);
-    close_socket(fd);
     qihse_resp_remove_client(client);
     free(client);
     return NULL;
@@ -4100,7 +4100,6 @@ static bool qihse_resp_accept_loop(qihse_resp_server_t* server) {
         int error = pthread_create(&thread, NULL, qihse_resp_client_main, client);
         if (error != 0) {
             qihse_resp_remove_client(client);
-            close_socket(client_fd);
             free(client);
             continue;
         }
@@ -4409,11 +4408,7 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
     bool join_accept = false;
     pthread_mutex_lock(&server->state_lock);
     __atomic_store_n(&server->running, false, __ATOMIC_RELEASE);
-    if (server->listen_fd >= 0) {
-        shutdown(server->listen_fd, SHUT_RDWR);
-        close_socket(server->listen_fd);
-        server->listen_fd = -1;
-    }
+    if (server->listen_fd >= 0) shutdown(server->listen_fd, SHUT_RDWR);
     for (qihse_resp_client_ctx_t* client = server->clients; client; client = client->next) shutdown(client->fd, SHUT_RDWR);
     if (server->accept_thread_started) {
         accept_thread = server->accept_thread;
@@ -4423,6 +4418,10 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
     pthread_mutex_unlock(&server->state_lock);
     if (join_accept) pthread_join(accept_thread, NULL);
     pthread_mutex_lock(&server->state_lock);
+    if (server->listen_fd >= 0) {
+        close_socket(server->listen_fd);
+        server->listen_fd = -1;
+    }
     while (server->active_clients > 0) pthread_cond_wait(&server->clients_drained, &server->state_lock);
     pthread_mutex_unlock(&server->state_lock);
     /* Phase 3: stop cluster bus if present */

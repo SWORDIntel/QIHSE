@@ -1,3 +1,4 @@
+#include "qihse_auth.h"
 #include "qihse_resp_wire.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_kv_store.h"
@@ -172,6 +173,7 @@ static qihse_cluster_node_t node_from_seed(const char* seed, const char* host, u
 }
 
 int main(void) {
+    assert(qihse_auth_init());
     char data_dir[] = "/tmp/qihse-resp-test-XXXXXX";
     assert(mkdtemp(data_dir) != NULL);
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
@@ -457,6 +459,31 @@ int main(void) {
     qihse_resp_server_destroy(target_server);
     qihse_cluster_topology_destroy(target_topology);
     qihse_kv_store_destroy(target_store);
+
+    for (size_t iteration = 0; iteration < 8u; iteration++) {
+        assert(qihse_resp_server_start(server));
+        test_client_t reconnect = {0};
+        reconnect.fd = connect_local(qihse_resp_server_port(server));
+        send_all(reconnect.fd, ping, sizeof(ping) - 1u);
+        response = read_response(&reconnect);
+        assert(strcmp(response, "+PONG\r\n") == 0);
+        free(response);
+        if (iteration % 2u == 0) {
+            send_all(reconnect.fd, quit, sizeof(quit) - 1u);
+            response = read_response(&reconnect);
+            assert(strcmp(response, "+OK\r\n") == 0);
+            free(response);
+        }
+        int unrelated[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, unrelated) == 0);
+        qihse_resp_server_stop(server);
+        close(reconnect.fd);
+        send_all(unrelated[0], "x", 1u);
+        char byte;
+        assert(recv(unrelated[1], &byte, 1u, MSG_DONTWAIT) == 1 && byte == 'x');
+        close(unrelated[0]);
+        close(unrelated[1]);
+    }
 
     qihse_resp_server_destroy(server);
     qihse_cluster_topology_destroy(topology);

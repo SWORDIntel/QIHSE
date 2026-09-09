@@ -330,8 +330,8 @@ static void* worker_thread_func(void* arg) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     worker->start_time_sec = (uint64_t)ts.tv_sec;
 
-    while (pool->running) {
-        if (pool->paused) {
+    while (__atomic_load_n(&pool->running, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&pool->paused, __ATOMIC_RELAXED)) {
             worker->state = QIHSE_WORKER_PAUSED;
             usleep(50000); /* 50ms */
             continue;
@@ -436,12 +436,12 @@ qihse_task_worker_pool_t* qihse_task_worker_pool_create(const qihse_task_worker_
 bool qihse_task_worker_pool_start(qihse_task_worker_pool_t* pool) {
     if (!pool) return false;
     pthread_mutex_lock(&pool->pool_lock);
-    if (pool->running) {
+    if (__atomic_load_n(&pool->running, __ATOMIC_RELAXED)) {
         pthread_mutex_unlock(&pool->pool_lock);
         return true;
     }
-    pool->running = true;
-    pool->paused = false;
+    __atomic_store_n(&pool->running, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&pool->paused, false, __ATOMIC_RELEASE);
 
     for (uint32_t i = 0; i < pool->worker_count; i++) {
         pthread_create(&pool->workers[i].thread, NULL, worker_thread_func, &pool->workers[i]);
@@ -453,25 +453,25 @@ bool qihse_task_worker_pool_start(qihse_task_worker_pool_t* pool) {
 void qihse_task_worker_pool_pause(qihse_task_worker_pool_t* pool) {
     if (!pool) return;
     pthread_mutex_lock(&pool->pool_lock);
-    pool->paused = true;
+    __atomic_store_n(&pool->paused, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&pool->pool_lock);
 }
 
 void qihse_task_worker_pool_resume(qihse_task_worker_pool_t* pool) {
     if (!pool) return;
     pthread_mutex_lock(&pool->pool_lock);
-    pool->paused = false;
+    __atomic_store_n(&pool->paused, false, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&pool->pool_lock);
 }
 
 void qihse_task_worker_pool_stop(qihse_task_worker_pool_t* pool) {
     if (!pool) return;
     pthread_mutex_lock(&pool->pool_lock);
-    if (!pool->running) {
+    if (!__atomic_load_n(&pool->running, __ATOMIC_RELAXED)) {
         pthread_mutex_unlock(&pool->pool_lock);
         return;
     }
-    pool->running = false;
+    __atomic_store_n(&pool->running, false, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&pool->pool_lock);
 
     for (uint32_t i = 0; i < pool->worker_count; i++) {
