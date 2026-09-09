@@ -43,6 +43,7 @@ static bool qihse_tryte_checked_add_i64(int64_t a, int64_t b, int64_t* out) {
     return true;
 }
 
+static int8_t qihse_tryte_signed_trit(uint8_t trit) __attribute__((unused));
 static int8_t qihse_tryte_signed_trit(uint8_t trit) {
     if (trit == 0u) {
         return -1;
@@ -51,6 +52,31 @@ static int8_t qihse_tryte_signed_trit(uint8_t trit) {
         return 1;
     }
     return 0;
+}
+
+/* Precomputed trit-pair product table: trit_product[a][b] = signed_trit(a) * signed_trit(b).
+ * Trits 0,1,2 map to -1,0,+1. Products are -1,0,+1. */
+static const int8_t qihse_tryte_trit_product[3][3] = {
+    { 1, 0, -1 },  /* -1 * {-1, 0, +1} */
+    { 0, 0,  0 },  /*  0 * {-1, 0, +1} */
+    {-1, 0,  1 },  /* +1 * {-1, 0, +1} */
+};
+
+/* Precomputed unpack table: unpack_table[tryte][trit_index] = trit value.
+ * Eliminates the division/modulo loop in qihse_trinary_tryte_unpack for the hot path. */
+static uint8_t qihse_tryte_unpack_table[243][QIHSE_TRINARY_TRITS_PER_TRYTE];
+static bool qihse_tryte_unpack_table_ready = false;
+
+static void qihse_tryte_init_unpack_table(void) {
+    size_t tryte, trit_idx;
+    for (tryte = 0u; tryte < 243u; tryte++) {
+        uint8_t v = (uint8_t)tryte;
+        for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE; trit_idx++) {
+            qihse_tryte_unpack_table[tryte][trit_idx] = (uint8_t)(v % 3u);
+            v = (uint8_t)(v / 3u);
+        }
+    }
+    qihse_tryte_unpack_table_ready = true;
 }
 
 static bool qihse_tryte_weighted_dims_fit_i64(size_t dims) {
@@ -303,20 +329,18 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
         !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
+    if (!qihse_tryte_unpack_table_ready) {
+        qihse_tryte_init_unpack_table();
+    }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
-        uint8_t lhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
-        uint8_t rhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
+        const uint8_t* lhs = qihse_tryte_unpack_table[lhs_trytes[byte_idx]];
+        const uint8_t* rhs = qihse_tryte_unpack_table[rhs_trytes[byte_idx]];
         size_t trit_idx;
 
-        if (!qihse_trinary_tryte_unpack(lhs_trytes[byte_idx], lhs) ||
-            !qihse_trinary_tryte_unpack(rhs_trytes[byte_idx], rhs)) {
-            return false;
-        }
         for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE &&
                             seen_dims < dims;
              trit_idx++, seen_dims++) {
-            score += (int32_t)(qihse_tryte_signed_trit(lhs[trit_idx]) *
-                               qihse_tryte_signed_trit(rhs[trit_idx]));
+            score += (int32_t)qihse_tryte_trit_product[lhs[trit_idx]][rhs[trit_idx]];
         }
     }
     *out_score = score;
@@ -443,15 +467,14 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
         !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
+    if (!qihse_tryte_unpack_table_ready) {
+        qihse_tryte_init_unpack_table();
+    }
     for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
-        uint8_t lhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
-        uint8_t rhs[QIHSE_TRINARY_TRITS_PER_TRYTE];
+        const uint8_t* lhs = qihse_tryte_unpack_table[lhs_trytes[byte_idx]];
+        const uint8_t* rhs = qihse_tryte_unpack_table[rhs_trytes[byte_idx]];
         size_t trit_idx;
 
-        if (!qihse_trinary_tryte_unpack(lhs_trytes[byte_idx], lhs) ||
-            !qihse_trinary_tryte_unpack(rhs_trytes[byte_idx], rhs)) {
-            return false;
-        }
         for (trit_idx = 0u; trit_idx < QIHSE_TRINARY_TRITS_PER_TRYTE &&
                             seen_dims < dims;
              trit_idx++, seen_dims++) {
@@ -461,8 +484,7 @@ bool qihse_trinary_tryte_weighted_similarity_i64(const uint8_t* lhs_trytes,
             }
             {
                 int64_t signed_product =
-                    (int64_t)(qihse_tryte_signed_trit(lhs[trit_idx]) *
-                              qihse_tryte_signed_trit(rhs[trit_idx]));
+                    (int64_t)qihse_tryte_trit_product[lhs[trit_idx]][rhs[trit_idx]];
                 int64_t delta = signed_product * (int64_t)dim_weights[seen_dims];
 
                 if (!qihse_tryte_checked_add_i64(score, delta, &score)) {

@@ -277,6 +277,7 @@ struct qihse_vector_db_s {
     /* Per-vector access tracking for hierarchical storage management */
     uint64_t* row_access_counts;          /* Access count per row (parallel to rows[]) */
     uint64_t* row_last_access_ns;         /* Last access timestamp (monotonic ns) per row */
+    uint64_t row_access_batch_ns;         /* Cached timestamp for batch row-access tracking */
     qihse_memory_tier_t* row_tier;        /* Current memory tier per row */
     size_t row_tracking_capacity;         /* Capacity of tracking arrays */
 
@@ -331,6 +332,7 @@ static void qihse_vdb_spill_enforce_budget(qihse_vector_db_t vdb);
 static void qihse_vdb_spill_close(qihse_vector_db_t vdb);
 static void qihse_vdb_track_row_access(qihse_vector_db_t vdb, size_t row_idx);
 static double qihse_vdb_row_temperature(qihse_vector_db_t vdb, size_t row_idx);
+static uint64_t qihse_vdb_monotonic_ns(void);
 
 typedef struct qihse_vdb_wal_add_s {
     uint64_t generation;
@@ -2271,6 +2273,8 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
         return -1;
     }
 
+    vdb->row_access_batch_ns = qihse_vdb_monotonic_ns();
+
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
         float score;
@@ -2957,7 +2961,11 @@ static void qihse_vdb_track_row_access(qihse_vector_db_t vdb, size_t row_idx) {
         return;
     }
     vdb->row_access_counts[row_idx]++;
-    vdb->row_last_access_ns[row_idx] = qihse_vdb_monotonic_ns();
+    if (vdb->row_access_batch_ns != 0u) {
+        vdb->row_last_access_ns[row_idx] = vdb->row_access_batch_ns;
+    } else {
+        vdb->row_last_access_ns[row_idx] = qihse_vdb_monotonic_ns();
+    }
 }
 
 static double qihse_vdb_row_temperature(qihse_vector_db_t vdb, size_t row_idx) {
@@ -3582,6 +3590,8 @@ static int qihse_vdb_search_sparse(qihse_vector_db_t vdb,
         errno = ENOMEM;
         return -1;
     }
+
+    vdb->row_access_batch_ns = qihse_vdb_monotonic_ns();
 
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
@@ -6115,6 +6125,8 @@ static int qihse_vdb_search_exact_rows(qihse_vector_db_t vdb,
         return -1;
     }
     memset(results, 0, max_results * sizeof(*results));
+
+    vdb->row_access_batch_ns = qihse_vdb_monotonic_ns();
 
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];

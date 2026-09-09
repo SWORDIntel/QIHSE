@@ -16,10 +16,55 @@
 #include <errno.h>
 
 #include "qihse_vector_db.h"
+#include "qihse_auth.h"
 
 #ifndef M_PI
 #define M_PI acos(-1.0)
 #endif
+
+/* --------------------------------------------------------------------------
+ * Benchmark authentication — built-in benchmark mode
+ *
+ * Creates a temporary process-local operator principal so the benchmark
+ * can exercise the real authenticated search paths without requiring
+ * external credentials. The auth state is process-local and dies with
+ * the benchmark process. No production security policies are changed.
+ * -------------------------------------------------------------------------- */
+static qihse_user_t* bench_user = NULL;
+static bool bench_quick = false;
+
+#define BENCH_OP_PASSWORD "QIHSE-Bench-Op-7f3a9c2e"
+
+static bool bench_auth_init(void) {
+    if (!qihse_auth_init()) {
+        fprintf(stderr, "bench: qihse_auth_init failed\n");
+        return false;
+    }
+    if (!qihse_auth_bootstrap_operator(BENCH_OP_PASSWORD)) {
+        fprintf(stderr, "bench: qihse_auth_bootstrap_operator failed\n");
+        return false;
+    }
+    bench_user = qihse_auth_authenticate("GODMODE_OP", BENCH_OP_PASSWORD);
+    if (!bench_user) {
+        fprintf(stderr, "bench: operator authentication failed\n");
+        return false;
+    }
+    return true;
+}
+
+static bool bench_check_result(const char* label, int n, size_t expected_min) {
+    if (n < 0) {
+        fprintf(stderr, "bench: %s FAILED (ret=%d errno=%d) — aborting\n",
+                label, n, errno);
+        return false;
+    }
+    if ((size_t)n < expected_min) {
+        fprintf(stderr, "bench: %s returned %d results (expected >= %zu) — aborting\n",
+                label, n, expected_min);
+        return false;
+    }
+    return true;
+}
 
 /* --------------------------------------------------------------------------
  * Benchmark timing primitives
@@ -172,26 +217,30 @@ static void bench_exact_search(size_t n_rows, size_t dims, size_t n_queries, siz
             query.top_k = 10;
             query.similarity_threshold = -FLT_MAX;
             query.distance_metric = QIHSE_DISTANCE_COSINE;
+            query.user = bench_user;
 
             uint64_t t0 = bench_ns_now();
             int n = qihse_vector_db_search(vdb, &query, results, 10);
             uint64_t t1 = bench_ns_now();
-            (void)n;
+            if (!bench_check_result("exact-cosine", n, 1)) goto exact_done;
             bench_samples_push(&s_cosine, t1 - t0);
 
             query.distance_metric = QIHSE_DISTANCE_DOT_PRODUCT;
             t0 = bench_ns_now();
             n = qihse_vector_db_search(vdb, &query, results, 10);
             t1 = bench_ns_now();
+            if (!bench_check_result("exact-dot", n, 1)) goto exact_done;
             bench_samples_push(&s_dot, t1 - t0);
 
             query.distance_metric = QIHSE_DISTANCE_EUCLIDEAN;
             t0 = bench_ns_now();
             n = qihse_vector_db_search(vdb, &query, results, 10);
             t1 = bench_ns_now();
+            if (!bench_check_result("exact-euclid", n, 1)) goto exact_done;
             bench_samples_push(&s_euclid, t1 - t0);
         }
     }
+    exact_done:;
 
     char label[128];
     snprintf(label, sizeof(label), "exact-search-cosine (%zux%zd, k=10)", n_rows, dims);
@@ -247,6 +296,7 @@ static void bench_batch_search(size_t n_rows, size_t dims, size_t batch_size, si
         queries[i].top_k = 10;
         queries[i].similarity_threshold = -FLT_MAX;
         queries[i].distance_metric = QIHSE_DISTANCE_COSINE;
+        queries[i].user = bench_user;
     }
 
     qihse_vector_result_t* results = (qihse_vector_result_t*)malloc(batch_size * 10 * sizeof(qihse_vector_result_t));
@@ -267,7 +317,8 @@ static void bench_batch_search(size_t n_rows, size_t dims, size_t batch_size, si
 
         t0 = bench_ns_now();
         for (size_t i = 0; i < batch_size; i++) {
-            qihse_vector_db_search(vdb, &queries[i], results + i * 10, 10);
+            int n = qihse_vector_db_search(vdb, &queries[i], results + i * 10, 10);
+            if (n < 0) { fprintf(stderr, "Serial search failed\n"); break; }
         }
         t1 = bench_ns_now();
         bench_samples_push(&s_serial, t1 - t0);
@@ -328,12 +379,14 @@ static void bench_hybrid_search(size_t n_rows, size_t dims, size_t top_k, size_t
     request.query_a.top_k = top_k;
     request.query_a.similarity_threshold = -FLT_MAX;
     request.query_a.distance_metric = QIHSE_DISTANCE_COSINE;
+    request.query_a.user = bench_user;
 
     request.query_b.query_vector = qvec_b;
     request.query_b.vector_dims = dims;
     request.query_b.top_k = top_k;
     request.query_b.similarity_threshold = -FLT_MAX;
     request.query_b.distance_metric = QIHSE_DISTANCE_DOT_PRODUCT;
+    request.query_b.user = bench_user;
 
     request.fusion_constant_k = 60.0f;
 
@@ -345,7 +398,7 @@ static void bench_hybrid_search(size_t n_rows, size_t dims, size_t top_k, size_t
         uint64_t t0 = bench_ns_now();
         int n = qihse_vector_db_hybrid_search(vdb, &request, results, top_k);
         uint64_t t1 = bench_ns_now();
-        (void)n;
+        if (!bench_check_result("hybrid-rrf", n, 1)) break;
         bench_samples_push(&s, t1 - t0);
     }
 
@@ -418,6 +471,7 @@ static void bench_metadata_filter(size_t n_rows, size_t dims, float match_rate, 
     query.distance_metric = QIHSE_DISTANCE_COSINE;
     query.metadata_filter = bench_tag_filter;
     query.metadata_filter_opaque = (void*)"important";
+    query.user = bench_user;
 
     qihse_vector_result_t* results = (qihse_vector_result_t*)malloc(10 * sizeof(qihse_vector_result_t));
     bench_samples_t s_filtered, s_unfiltered;
@@ -428,13 +482,14 @@ static void bench_metadata_filter(size_t n_rows, size_t dims, float match_rate, 
         uint64_t t0 = bench_ns_now();
         int n = qihse_vector_db_search(vdb, &query, results, 10);
         uint64_t t1 = bench_ns_now();
-        (void)n;
+        if (!bench_check_result("metadata-filtered", n, 1)) break;
         bench_samples_push(&s_filtered, t1 - t0);
 
         query.metadata_filter = NULL;
         t0 = bench_ns_now();
         n = qihse_vector_db_search(vdb, &query, results, 10);
         t1 = bench_ns_now();
+        if (!bench_check_result("unfiltered", n, 1)) break;
         bench_samples_push(&s_unfiltered, t1 - t0);
         query.metadata_filter = bench_tag_filter;
     }
@@ -463,7 +518,12 @@ cleanup:
  * Benchmark: trinary candidate selection (if sidecar available)
  * -------------------------------------------------------------------------- */
 static void bench_trinary_candidate_selection(size_t n_rows, size_t dims, size_t candidate_count, size_t iterations) {
-    qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
+    /* Trinary sidecar requires a file-backed DB — in-memory flush is a no-op
+     * for sidecar generation. Use a temp file so the sidecar gets materialized. */
+    const char* db_path = "/tmp/qihse_bench_trinary.qdb";
+    /* Remove stale file if present */
+    remove(db_path);
+    qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, db_path);
     if (!vdb) {
         fprintf(stderr, "Failed to create VDB\n");
         return;
@@ -498,6 +558,7 @@ static void bench_trinary_candidate_selection(size_t n_rows, size_t dims, size_t
     query.top_k = 10;
     query.similarity_threshold = -FLT_MAX;
     query.distance_metric = QIHSE_DISTANCE_COSINE;
+    query.user = bench_user;
 
     qihse_vector_result_t* results = (qihse_vector_result_t*)malloc(10 * sizeof(qihse_vector_result_t));
     bench_samples_t s_tri, s_qmag, s_exact;
@@ -509,21 +570,24 @@ static void bench_trinary_candidate_selection(size_t n_rows, size_t dims, size_t
         uint64_t t0 = bench_ns_now();
         int n = qihse_vector_db_search_trinary_candidates(vdb, &query, candidate_count, results, 10);
         uint64_t t1 = bench_ns_now();
-        if (n >= 0) bench_samples_push(&s_tri, t1 - t0);
+        if (!bench_check_result("trinary-scalar", n, 1)) break;
+        bench_samples_push(&s_tri, t1 - t0);
 
         query.query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE;
         query.candidate_pool_size = candidate_count;
         t0 = bench_ns_now();
         n = qihse_vector_db_search(vdb, &query, results, 10);
         t1 = bench_ns_now();
-        if (n >= 0) bench_samples_push(&s_qmag, t1 - t0);
+        if (!bench_check_result("trinary-magnitude", n, 1)) break;
+        bench_samples_push(&s_qmag, t1 - t0);
 
         query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
         query.candidate_pool_size = 0;
         t0 = bench_ns_now();
         n = qihse_vector_db_search(vdb, &query, results, 10);
         t1 = bench_ns_now();
-        if (n >= 0) bench_samples_push(&s_exact, t1 - t0);
+        if (!bench_check_result("exact-float32", n, 1)) break;
+        bench_samples_push(&s_exact, t1 - t0);
     }
 
     char label[128];
@@ -543,6 +607,7 @@ static void bench_trinary_candidate_selection(size_t n_rows, size_t dims, size_t
     free(vectors);
     free(ids);
     qihse_vector_db_destroy(vdb);
+    remove(db_path);
 }
 
 /* --------------------------------------------------------------------------
@@ -590,6 +655,7 @@ static void bench_int8_search(size_t n_rows, size_t dims, size_t top_k, size_t i
     query.distance_metric = QIHSE_DISTANCE_COSINE;
     query.query_mode = QIHSE_VDB_QUERY_INT8;
     query.candidate_pool_size = top_k * 12;
+    query.user = bench_user;
 
     qihse_vector_result_t* results = (qihse_vector_result_t*)malloc(top_k * sizeof(qihse_vector_result_t));
     bench_samples_t s;
@@ -599,7 +665,7 @@ static void bench_int8_search(size_t n_rows, size_t dims, size_t top_k, size_t i
         uint64_t t0 = bench_ns_now();
         int n = qihse_vector_db_search(vdb, &query, results, top_k);
         uint64_t t1 = bench_ns_now();
-        (void)n;
+        if (!bench_check_result("int8-search", n, 1)) break;
         bench_samples_push(&s, t1 - t0);
     }
 
@@ -660,6 +726,7 @@ static void bench_graph_search(size_t n_rows, size_t dims, size_t top_k, size_t 
     query.distance_metric = QIHSE_DISTANCE_COSINE;
     query.query_mode = QIHSE_VDB_QUERY_GRAPH;
     query.candidate_pool_size = top_k * 4;
+    query.user = bench_user;
 
     qihse_vector_result_t* results = (qihse_vector_result_t*)malloc(top_k * sizeof(qihse_vector_result_t));
     bench_samples_t s;
@@ -669,7 +736,7 @@ static void bench_graph_search(size_t n_rows, size_t dims, size_t top_k, size_t 
         uint64_t t0 = bench_ns_now();
         int n = qihse_vector_db_search(vdb, &query, results, top_k);
         uint64_t t1 = bench_ns_now();
-        (void)n;
+        if (!bench_check_result("graph-search", n, 1)) break;
         bench_samples_push(&s, t1 - t0);
     }
 
@@ -689,42 +756,78 @@ static void bench_graph_search(size_t n_rows, size_t dims, size_t top_k, size_t 
  * Main harness
  * -------------------------------------------------------------------------- */
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--quick") == 0) {
+            bench_quick = true;
+        }
+    }
+
+    if (!bench_auth_init()) {
+        fprintf(stderr, "Benchmark auth setup failed — aborting\n");
+        return 1;
+    }
 
     printf("================================================================================\n");
     printf("QIHSE Micro-Benchmark Harness\n");
+    if (bench_quick) {
+        printf("Mode: QUICK (bounded synthetic data, low iteration count)\n");
+    }
     printf("================================================================================\n\n");
 
-    printf("--- Exact Search: Distance Metrics ---\n");
-    bench_exact_search(1000, 128, 32, 50);
-    bench_exact_search(10000, 128, 32, 20);
-    bench_exact_search(100000, 128, 16, 5);
+    if (bench_quick) {
+        printf("--- Exact Search: Distance Metrics ---\n");
+        bench_exact_search(1000, 128, 4, 2);
 
-    printf("\n--- Batch Search Throughput ---\n");
-    bench_batch_search(10000, 128, 32, 20);
-    bench_batch_search(100000, 128, 64, 10);
+        printf("\n--- Batch Search Throughput ---\n");
+        bench_batch_search(1000, 128, 4, 2);
 
-    printf("\n--- Hybrid Search (RRF Fusion) ---\n");
-    bench_hybrid_search(10000, 128, 10, 20);
-    bench_hybrid_search(100000, 128, 10, 10);
+        printf("\n--- Hybrid Search (RRF Fusion) ---\n");
+        bench_hybrid_search(1000, 128, 10, 2);
 
-    printf("\n--- INT8 Scalar Quantization ---\n");
-    bench_int8_search(1000, 128, 10, 20);
-    bench_int8_search(10000, 128, 10, 20);
-    bench_int8_search(100000, 128, 10, 5);
+        printf("\n--- INT8 Scalar Quantization ---\n");
+        bench_int8_search(1000, 128, 10, 2);
 
-    printf("\n--- Graph Index Candidate Selection ---\n");
-    bench_graph_search(1000, 128, 10, 20);
-    bench_graph_search(10000, 128, 10, 10);
+        printf("\n--- Graph Index Candidate Selection ---\n");
+        bench_graph_search(1000, 128, 10, 2);
 
-    printf("\n--- Metadata Filtering ---\n");
-    bench_metadata_filter(10000, 128, 0.1f, 20);
-    bench_metadata_filter(100000, 128, 0.05f, 10);
+        printf("\n--- Metadata Filtering ---\n");
+        bench_metadata_filter(1000, 128, 0.1f, 2);
 
-    printf("\n--- Trinary Candidate Selection ---\n");
-    bench_trinary_candidate_selection(10000, 128, 100, 20);
-    bench_trinary_candidate_selection(100000, 128, 500, 10);
+        printf("\n--- Trinary Candidate Selection ---\n");
+        bench_trinary_candidate_selection(1000, 128, 100, 2);
+    } else {
+        printf("--- Exact Search: Distance Metrics ---\n");
+        bench_exact_search(1000, 128, 32, 50);
+        bench_exact_search(10000, 128, 32, 20);
+        bench_exact_search(100000, 128, 16, 5);
+
+        printf("\n--- Batch Search Throughput ---\n");
+        bench_batch_search(10000, 128, 32, 20);
+        bench_batch_search(100000, 128, 64, 10);
+
+        printf("\n--- Hybrid Search (RRF Fusion) ---\n");
+        bench_hybrid_search(10000, 128, 10, 20);
+        bench_hybrid_search(100000, 128, 10, 10);
+
+        printf("\n--- INT8 Scalar Quantization ---\n");
+        bench_int8_search(1000, 128, 10, 20);
+        bench_int8_search(10000, 128, 10, 20);
+        bench_int8_search(100000, 128, 10, 5);
+
+        printf("\n--- Graph Index Candidate Selection ---\n");
+        bench_graph_search(1000, 128, 10, 20);
+        bench_graph_search(10000, 128, 10, 10);
+
+        printf("\n--- Metadata Filtering ---\n");
+        bench_metadata_filter(10000, 128, 0.1f, 20);
+        bench_metadata_filter(100000, 128, 0.05f, 10);
+
+        printf("\n--- Trinary Candidate Selection ---\n");
+        bench_trinary_candidate_selection(10000, 128, 100, 20);
+        bench_trinary_candidate_selection(100000, 128, 500, 10);
+    }
 
     printf("\n================================================================================\n");
     printf("Benchmark complete.\n");
