@@ -22,9 +22,7 @@ static bool keep_even(const void* metadata, size_t size, void* opaque) {
 }
 
 int main(void) {
-    /* Small dataset: per-row audit logging with ML-DSA-87 signing makes
-     * larger row counts impractically slow for a correctness test. */
-    enum { ROWS = 64, DIMS = 32, K = 5, ITERS = 3 };
+    enum { ROWS = 1024, DIMS = 128, K = 10, ITERS = 50 };
     unsigned char random[24];
     char password[49];
     if (RAND_bytes(random, sizeof(random)) != 1) return 1;
