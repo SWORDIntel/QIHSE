@@ -126,49 +126,6 @@ jobs:
         path: qihse-sanitizer-test.log
         if-no-files-found: error
 
-  resp-native-debug:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Install Debug Build Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential gcc g++ gdb libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
-
-    - name: Build Native Library With Symbols
-      run: |
-        make clean
-        make QIHSE_CFLAGS_EXTRA="-g -fno-omit-frame-pointer" lib -j$(nproc)
-
-    - name: Compile RESP Cluster Regression Without Running It
-      run: |
-        set -euo pipefail
-        make -n QIHSE_CFLAGS_EXTRA="-g -fno-omit-frame-pointer" test-resp-cluster \
-          | grep -m1 -E '(^| )gcc .*tests/test_resp_cluster\.c' \
-          | sh
-
-    - name: Run RESP Cluster Regression Under GDB
-      run: |
-        set -o pipefail
-        export LD_LIBRARY_PATH=$PWD
-        gdb -q -batch -return-child-result \
-          -ex 'set pagination off' \
-          -ex run \
-          -ex 'thread apply all bt full' \
-          --args ./tests/test_resp_cluster 2>&1 | tee qihse-resp-native-gdb.log
-
-    - name: Upload RESP Native Backtrace
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: qihse-resp-native-gdb-log
-        path: qihse-resp-native-gdb.log
-        if-no-files-found: error
-
   dashboard:
     runs-on: ubuntu-latest
 
@@ -181,10 +138,6 @@ jobs:
 
     - name: Set up Node.js
       uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-        cache: npm
-        cache-dependency-path: dashboard/package-lock.json
 
     - name: Install dashboard dependencies
       run: npm ci
