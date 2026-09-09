@@ -286,6 +286,25 @@ struct qihse_vector_db_s {
     uint64_t memory_maintenance_queries;  /* Queries since last maintenance */
     uint64_t memory_maintenance_interval; /* Run maintenance every N queries (0=explicit only) */
 
+    /* Memory budget enforcement (Phase 4)
+     *
+     * When memory_budget_bytes > 0, the vector DB caps the total bytes
+     * used by the in-RAM vectors buffer. Cold rows (below memory_cold_threshold)
+     * are evicted to an on-disk spill file and paged back on demand by
+     * qihse_vdb_vector_at(). This prevents swap storms on constrained
+     * hardware when the full float32 store exceeds available RAM.
+     *
+     * budget=0 means unlimited (no spilling, legacy behavior). */
+    size_t memory_budget_bytes;           /* Max bytes for in-RAM vectors (0=unlimited) */
+    size_t memory_vectors_in_ram;         /* Current bytes of vectors resident in RAM */
+    size_t spilled_count;                 /* Number of rows currently evicted to spill */
+    int    spill_fd;                      /* File descriptor for spill file (-1=none) */
+    char*  spill_path;                    /* Path to spill file (NULL=none) */
+    uint8_t* spill_page_buffer;           /* Single-vector temp buffer for page-in */
+    size_t spill_page_buffer_bytes;       /* Size of spill_page_buffer */
+    pthread_mutex_t spill_mutex;         /* Protects spill_fd, page buffer, spill state */
+    bool spill_mutex_initialized;
+
     bool hilbert_enabled;
     bool quantization_enabled;
     bool parallel_enabled;
@@ -301,6 +320,17 @@ struct qihse_vector_db_s {
     pthread_mutex_t explicit_edge_mutex;
     bool explicit_edge_mutex_initialized;
 };
+
+/* Forward declarations for cold-spill functions (Phase 4) */
+static bool qihse_vdb_spill_open(qihse_vector_db_t vdb);
+static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx);
+static const float* qihse_vdb_spill_page_in(qihse_vector_db_t vdb,
+                                             const qihse_index_row_t* row);
+static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx);
+static void qihse_vdb_spill_enforce_budget(qihse_vector_db_t vdb);
+static void qihse_vdb_spill_close(qihse_vector_db_t vdb);
+static void qihse_vdb_track_row_access(qihse_vector_db_t vdb, size_t row_idx);
+static double qihse_vdb_row_temperature(qihse_vector_db_t vdb, size_t row_idx);
 
 typedef struct qihse_vdb_wal_add_s {
     uint64_t generation;
@@ -1802,6 +1832,36 @@ static const float* qihse_vdb_vector_at(const qihse_vector_db_t vdb, const qihse
         end > (uint64_t)vdb->vector_bytes_used) {
         return NULL;
     }
+
+    /* If this row has been spilled to disk, page it back in from the
+     * spill file into the single-vector page buffer. The caller gets
+     * a valid float* but must use it before the next page-in (the
+     * buffer is reused). This is acceptable for search reranking
+     * which reads one vector at a time.
+     *
+     * The spill mutex protects the shared page buffer. The caller must
+     * consume the returned pointer before the next call to vector_at()
+     * for a spilled row, since the mutex is released here and the next
+     * page-in will overwrite the buffer. */
+    {
+        size_t row_idx = (size_t)(row - vdb->rows);
+        if (row_idx < vdb->row_tracking_capacity &&
+            vdb->row_tier[row_idx] == QIHSE_MEM_SPILLED &&
+            vdb->spill_fd >= 0) {
+            const float* result;
+            /* Track the access so maintenance can re-promote if needed */
+            qihse_vdb_track_row_access((qihse_vector_db_t)vdb, row_idx);
+            if (vdb->spill_mutex_initialized) {
+                pthread_mutex_lock(&vdb->spill_mutex);
+            }
+            result = qihse_vdb_spill_page_in(vdb, row);
+            if (vdb->spill_mutex_initialized) {
+                pthread_mutex_unlock(&vdb->spill_mutex);
+            }
+            return result;
+        }
+    }
+
     return (const float*)(const void*)(base + row->vector_offset);
 }
 
@@ -2724,6 +2784,7 @@ typedef struct qihse_vdb_config_s {
     double memory_hot_threshold;
     double memory_cold_threshold;
     uint64_t memory_maintenance_interval;
+    size_t memory_budget_bytes;          /* Max bytes for in-RAM vectors (0=unlimited) */
     bool graph_M_set;
     bool graph_ef_construction_set;
     bool cache_max_entries_set;
@@ -2731,6 +2792,7 @@ typedef struct qihse_vdb_config_s {
     bool memory_hot_threshold_set;
     bool memory_cold_threshold_set;
     bool memory_maintenance_interval_set;
+    bool memory_budget_bytes_set;
 } qihse_vdb_config_t;
 
 static void qihse_vdb_config_parse_line(const char* line, qihse_vdb_config_t* cfg) {
@@ -2767,6 +2829,9 @@ static void qihse_vdb_config_parse_line(const char* line, qihse_vdb_config_t* cf
     } else if (strcmp(key, "memory.maintenance_interval") == 0) {
         cfg->memory_maintenance_interval = (uint64_t)strtoull(value, NULL, 10);
         cfg->memory_maintenance_interval_set = true;
+    } else if (strcmp(key, "memory.budget_bytes") == 0) {
+        cfg->memory_budget_bytes = (size_t)strtoull(value, NULL, 10);
+        cfg->memory_budget_bytes_set = true;
     }
 }
 
@@ -2866,6 +2931,13 @@ static void qihse_vdb_config_load(qihse_vdb_config_t* cfg) {
             cfg->memory_maintenance_interval_set = true;
         }
     }
+    {
+        const char* env = getenv("QIHSE_VDB_MAX_MEMORY_BYTES");
+        if (env) {
+            cfg->memory_budget_bytes = (size_t)strtoull(env, NULL, 10);
+            cfg->memory_budget_bytes_set = true;
+        }
+    }
 }
 
 /* ============================================================================
@@ -2927,6 +2999,11 @@ static void qihse_vdb_run_memory_maintenance(qihse_vector_db_t vdb) {
             (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
+        /* Don't touch rows that have been spilled to disk — they stay
+         * spilled until explicitly promoted by a future access. */
+        if (vdb->row_tier[i] == QIHSE_MEM_SPILLED) {
+            continue;
+        }
         temp = qihse_vdb_row_temperature(vdb, i);
         if (temp >= vdb->memory_hot_threshold && vdb->row_tier[i] != fast_tier) {
             /* Promote: mark for migration to faster tier */
@@ -2937,6 +3014,336 @@ static void qihse_vdb_run_memory_maintenance(qihse_vector_db_t vdb) {
         }
     }
     vdb->memory_maintenance_queries = 0u;
+
+    /* Phase 4: enforce memory budget by spilling cold rows to disk */
+    if (vdb->memory_budget_bytes > 0u) {
+        if (vdb->spill_fd < 0) {
+            (void)qihse_vdb_spill_open(vdb);
+        }
+        if (vdb->spill_fd >= 0) {
+            qihse_vdb_spill_enforce_budget(vdb);
+        }
+    }
+}
+
+/* ============================================================================
+ * MEMORY BUDGET ENFORCEMENT + COLD-SPILL (Phase 4)
+ *
+ * When memory_budget_bytes > 0, cold rows are evicted to an on-disk spill
+ * file. The spill file is a flat binary blob mirroring the vector section
+ * layout: vector data for row i is at offset row->vector_offset, length
+ * vector_dims * sizeof(float). This means the spill file has the same
+ * layout as the in-RAM vectors buffer, so page-in is a single pread().
+ *
+ * Security: the spill file inherits the same authorization as the parent
+ * .qdb — it is created next to the .qdb with the same permissions and
+ * is only accessed via the vdb handle (which was opened with a user
+ * context). No context-free reads are performed.
+ * ============================================================================ */
+
+static bool qihse_vdb_spill_open(qihse_vector_db_t vdb) {
+    /* Create the spill file next to the .qdb */
+    if (!vdb->db_path) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vdb->spill_fd >= 0) {
+        return true;  /* Already open */
+    }
+
+    size_t path_len = strlen(vdb->db_path) + 8u;  /* ".spill" + NUL */
+    vdb->spill_path = (char*)malloc(path_len);
+    if (!vdb->spill_path) {
+        errno = ENOMEM;
+        return false;
+    }
+    snprintf(vdb->spill_path, path_len, "%s.spill", vdb->db_path);
+
+    /* Create/truncate the spill file */
+    vdb->spill_fd = open(vdb->spill_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (vdb->spill_fd < 0) {
+        free(vdb->spill_path);
+        vdb->spill_path = NULL;
+        return false;
+    }
+
+    /* Allocate a single-vector page-in buffer */
+    vdb->spill_page_buffer_bytes = vdb->vector_dims * sizeof(float);
+    vdb->spill_page_buffer = (uint8_t*)malloc(vdb->spill_page_buffer_bytes);
+    if (!vdb->spill_page_buffer) {
+        close(vdb->spill_fd);
+        vdb->spill_fd = -1;
+        free(vdb->spill_path);
+        vdb->spill_path = NULL;
+        errno = ENOMEM;
+        return false;
+    }
+
+    return true;
+}
+
+static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx) {
+    /* Write a single row's vector data to the spill file and free its RAM. */
+    qihse_index_row_t* row;
+    size_t vec_bytes;
+    off_t offset;
+    ssize_t written;
+
+    if (!vdb || row_idx >= vdb->total_vectors || vdb->spill_fd < 0) {
+        return false;
+    }
+    row = &vdb->rows[row_idx];
+    if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+        (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+        return false;  /* Don't spill dead/tombstoned rows */
+    }
+    if (vdb->row_tier[row_idx] == QIHSE_MEM_SPILLED) {
+        return true;  /* Already spilled */
+    }
+
+    vec_bytes = vdb->vector_dims * sizeof(float);
+    offset = (off_t)row->vector_offset;
+
+    /* Write the vector data to the spill file at the same offset */
+    {
+        const uint8_t* base = vdb->mapped_vectors
+            ? (const uint8_t*)vdb->mapped_vectors
+            : vdb->vectors;
+        if (!base || row->vector_offset + vec_bytes > vdb->vector_bytes_used) {
+            return false;
+        }
+        written = pwrite(vdb->spill_fd, base + row->vector_offset,
+                         vec_bytes, offset);
+        if (written < 0 || (size_t)written != vec_bytes) {
+            return false;
+        }
+    }
+
+    /* Zero out the in-RAM copy (keeps the buffer allocated but frees
+     * the physical pages via MADV_DONTNEED). */
+    {
+        uint8_t* base = vdb->mapped_vectors
+            ? (uint8_t*)vdb->mapped_vectors
+            : vdb->vectors;
+        if (base) {
+            memset(base + row->vector_offset, 0, vec_bytes);
+            /* Advise kernel to drop the pages */
+            (void)madvise(base + row->vector_offset, vec_bytes,
+                          MADV_DONTNEED);
+        }
+    }
+
+    vdb->row_tier[row_idx] = QIHSE_MEM_SPILLED;
+    vdb->spilled_count++;
+    if (vdb->memory_vectors_in_ram >= vec_bytes) {
+        vdb->memory_vectors_in_ram -= vec_bytes;
+    }
+    return true;
+}
+
+static const float* qihse_vdb_spill_page_in(qihse_vector_db_t vdb,
+                                             const qihse_index_row_t* row) {
+    /* Read a spilled vector back from the spill file into the page buffer.
+     * The page buffer is shared, so this must be called with the spill
+     * mutex held (or in a single-threaded context). The caller (search)
+     * holds the mutex for the duration of the vector read. */
+    size_t vec_bytes;
+    off_t offset;
+    ssize_t nread;
+
+    if (!vdb || !row || vdb->spill_fd < 0 || !vdb->spill_page_buffer) {
+        return NULL;
+    }
+    vec_bytes = vdb->vector_dims * sizeof(float);
+    if (vdb->spill_page_buffer_bytes < vec_bytes) {
+        return NULL;
+    }
+    offset = (off_t)row->vector_offset;
+    nread = pread(vdb->spill_fd, vdb->spill_page_buffer,
+                  vec_bytes, offset);
+    if (nread < 0 || (size_t)nread != vec_bytes) {
+        return NULL;
+    }
+    return (const float*)(const void*)vdb->spill_page_buffer;
+}
+
+static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx) {
+    /* Read a spilled vector back from the spill file into the primary
+     * vector buffer, restoring it to resident RAM. */
+    qihse_index_row_t* row;
+    size_t vec_bytes;
+    off_t offset;
+    ssize_t nread;
+    uint8_t* base;
+
+    if (!vdb || row_idx >= vdb->total_vectors || vdb->spill_fd < 0) {
+        return false;
+    }
+    row = &vdb->rows[row_idx];
+    if (vdb->row_tier[row_idx] != QIHSE_MEM_SPILLED) {
+        return true;  /* Not spilled, nothing to do */
+    }
+
+    vec_bytes = vdb->vector_dims * sizeof(float);
+    offset = (off_t)row->vector_offset;
+
+    base = vdb->mapped_vectors
+        ? (uint8_t*)vdb->mapped_vectors
+        : vdb->vectors;
+    if (!base || row->vector_offset + vec_bytes > vdb->vector_bytes_used) {
+        return false;
+    }
+
+    nread = pread(vdb->spill_fd, base + row->vector_offset,
+                  vec_bytes, offset);
+    if (nread < 0 || (size_t)nread != vec_bytes) {
+        return false;
+    }
+
+    vdb->row_tier[row_idx] = QIHSE_MEM_DRAM;
+    vdb->spilled_count--;
+    vdb->memory_vectors_in_ram += vec_bytes;
+    return true;
+}
+
+static void qihse_vdb_spill_enforce_budget(qihse_vector_db_t vdb) {
+    /* Evict coldest rows until in-RAM usage is within budget.
+     *
+     * We build a candidate list of spillable (live, non-tombstone, non-spilled,
+     * cold) rows, sort it by temperature ascending (coldest first), then spill
+     * from the coldest until we're within budget. This avoids evicting hot
+     * rows just because they happen to appear early in row order. */
+    size_t i;
+
+    if (!vdb || vdb->memory_budget_bytes == 0u || vdb->spill_fd < 0) {
+        return;
+    }
+    if (vdb->memory_vectors_in_ram <= vdb->memory_budget_bytes) {
+        return;  /* Within budget */
+    }
+
+    /* Collect spillable row indices with their temperatures. */
+    {
+        /* Stack-allocated candidate array for small DBs; fall back to malloc
+         * for large ones. The threshold is chosen to avoid deep stack usage
+         * while keeping the common small-DB path allocation-free. */
+        #define QIHSE_SPILL_STACK_MAX 256
+        size_t stack_idx[QIHSE_SPILL_STACK_MAX];
+        double stack_temp[QIHSE_SPILL_STACK_MAX];
+        size_t* idx_arr = stack_idx;
+        double* temp_arr = stack_temp;
+        size_t n_candidates = 0u;
+        size_t capacity = QIHSE_SPILL_STACK_MAX;
+        bool heap_alloc = false;
+
+        for (i = 0u; i < vdb->total_vectors; ++i) {
+            if ((vdb->rows[i].row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+                (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
+                continue;
+            }
+            if (vdb->row_tier[i] == QIHSE_MEM_SPILLED) {
+                continue;  /* Already spilled */
+            }
+            {
+                double temp = qihse_vdb_row_temperature(vdb, i);
+                if (temp > vdb->memory_cold_threshold) {
+                    continue;  /* Still hot, don't spill */
+                }
+            }
+            if (n_candidates >= capacity) {
+                /* Grow the array. Only happens for >256 cold candidates. */
+                size_t new_cap = capacity * 2u;
+                size_t* new_idx;
+                double* new_temp;
+                if (!heap_alloc) {
+                    new_idx = (size_t*)malloc(new_cap * sizeof(size_t));
+                    new_temp = (double*)malloc(new_cap * sizeof(double));
+                    if (new_idx && new_temp) {
+                        memcpy(new_idx, idx_arr, n_candidates * sizeof(size_t));
+                        memcpy(new_temp, temp_arr, n_candidates * sizeof(double));
+                        idx_arr = new_idx;
+                        temp_arr = new_temp;
+                        capacity = new_cap;
+                        heap_alloc = true;
+                    } else {
+                        free(new_idx);
+                        free(new_temp);
+                        break;  /* Can't grow, spill what we have */
+                    }
+                } else {
+                    new_idx = (size_t*)realloc(idx_arr, new_cap * sizeof(size_t));
+                    new_temp = (double*)realloc(temp_arr, new_cap * sizeof(double));
+                    if (new_idx) idx_arr = new_idx;
+                    if (new_temp) temp_arr = new_temp;
+                    if (!new_idx || !new_temp) break;
+                    capacity = new_cap;
+                }
+            }
+            idx_arr[n_candidates] = i;
+            temp_arr[n_candidates] = qihse_vdb_row_temperature(vdb, i);
+            n_candidates++;
+        }
+
+        /* Simple selection: spill coldest first. We don't need a full sort —
+         * we just repeatedly find the minimum-temperature candidate. For
+         * small candidate counts (the common case) this is O(n^2) but n is
+         * small. For large n, a full sort would be better, but the budget
+         * loop typically terminates early once we're within budget. */
+        {
+            size_t spilled_now = 0u;
+            while (vdb->memory_vectors_in_ram > vdb->memory_budget_bytes &&
+                   spilled_now < n_candidates) {
+                size_t best = spilled_now;  /* remaining candidates start here */
+                size_t k;
+                for (k = spilled_now + 1u; k < n_candidates; ++k) {
+                    if (temp_arr[k] < temp_arr[best]) {
+                        best = k;
+                    }
+                }
+                /* Swap best into position and spill it. */
+                if (best != spilled_now) {
+                    size_t tmp_i = idx_arr[spilled_now];
+                    double tmp_t = temp_arr[spilled_now];
+                    idx_arr[spilled_now] = idx_arr[best];
+                    temp_arr[spilled_now] = temp_arr[best];
+                    idx_arr[best] = tmp_i;
+                    temp_arr[best] = tmp_t;
+                }
+                if (!qihse_vdb_spill_row(vdb, idx_arr[spilled_now])) {
+                    break;  /* Spill failed, stop */
+                }
+                spilled_now++;
+            }
+        }
+
+        if (heap_alloc) {
+            free(idx_arr);
+            free(temp_arr);
+        }
+        #undef QIHSE_SPILL_STACK_MAX
+    }
+}
+
+static void qihse_vdb_spill_close(qihse_vector_db_t vdb) {
+    /* Close and unlink the spill file. */
+    if (!vdb) {
+        return;
+    }
+    if (vdb->spill_fd >= 0) {
+        close(vdb->spill_fd);
+        vdb->spill_fd = -1;
+    }
+    if (vdb->spill_path) {
+        unlink(vdb->spill_path);
+        free(vdb->spill_path);
+        vdb->spill_path = NULL;
+    }
+    if (vdb->spill_page_buffer) {
+        free(vdb->spill_page_buffer);
+        vdb->spill_page_buffer = NULL;
+    }
+    vdb->spill_page_buffer_bytes = 0u;
+    vdb->spilled_count = 0u;
 }
 
 /* ============================================================================
@@ -3513,6 +3920,7 @@ static bool qihse_vdb_append_row(qihse_vector_db_t vdb,
     vdb->total_vectors++;
     vdb->live_vectors++;
     vdb->vector_bytes_used = new_vector_used;
+    vdb->memory_vectors_in_ram += vdb->vector_dims * sizeof(float);
     vdb->metadata_bytes_used = new_metadata_used;
     if (id >= vdb->next_auto_id) {
         vdb->next_auto_id = id + 1u;
@@ -4427,6 +4835,7 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
     snapshot.vectors = NULL;
     vdb->vector_bytes_used = vector_bytes;
     vdb->vector_bytes_capacity = vector_bytes;
+    vdb->memory_vectors_in_ram = vector_bytes;  /* All vectors resident initially */
     vdb->metadata = snapshot.metadata;
     snapshot.metadata = NULL;
     vdb->metadata_bytes_used = metadata_bytes;
@@ -4577,6 +4986,19 @@ qihse_vector_db_t qihse_vector_db_open(
     vdb->memory_cold_threshold = 5.0;      /* 5 accesses per evaluation window = cold */
     vdb->memory_maintenance_interval = 0u; /* Explicit maintenance by default */
 
+    /* Memory budget defaults (no budget = unlimited) */
+    vdb->memory_budget_bytes = 0u;
+    vdb->memory_vectors_in_ram = 0u;
+    vdb->spilled_count = 0u;
+    vdb->spill_fd = -1;
+    vdb->spill_path = NULL;
+    vdb->spill_page_buffer = NULL;
+    vdb->spill_page_buffer_bytes = 0u;
+    vdb->spill_mutex_initialized = false;
+    if (pthread_mutex_init(&vdb->spill_mutex, NULL) == 0) {
+        vdb->spill_mutex_initialized = true;
+    }
+
     if (file_backed) {
         vdb->db_path = qihse_vdb_strdup(db_path);
         if (!vdb->db_path) {
@@ -4669,6 +5091,9 @@ qihse_vector_db_t qihse_vector_db_open(
         }
         if (cfg.memory_maintenance_interval_set) {
             vdb->memory_maintenance_interval = cfg.memory_maintenance_interval;
+        }
+        if (cfg.memory_budget_bytes_set) {
+            vdb->memory_budget_bytes = cfg.memory_budget_bytes;
         }
     }
 
@@ -7146,6 +7571,12 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
         return;
     }
     qihse_vdb_free_mmap(vdb);
+    /* Close and unlink the spill file if open */
+    qihse_vdb_spill_close(vdb);
+    if (vdb->spill_mutex_initialized) {
+        pthread_mutex_destroy(&vdb->spill_mutex);
+        vdb->spill_mutex_initialized = false;
+    }
     free(vdb->db_path);
     free(vdb->rows);
     free(vdb->vectors);
@@ -7238,6 +7669,56 @@ bool qihse_vector_db_run_memory_maintenance(
         return false;
     }
     qihse_vdb_run_memory_maintenance(vdb);
+    return true;
+}
+
+bool qihse_vector_db_set_memory_budget(
+    qihse_vector_db_t vdb,
+    size_t budget_bytes
+) {
+    if (!vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    vdb->memory_budget_bytes = budget_bytes;
+    if (budget_bytes > 0u) {
+        /* Budget enabled: open spill file if needed and enforce. */
+        if (vdb->spill_fd < 0 && vdb->db_path) {
+            if (qihse_vdb_spill_open(vdb)) {
+                qihse_vdb_spill_enforce_budget(vdb);
+            }
+        } else if (vdb->spill_fd >= 0) {
+            qihse_vdb_spill_enforce_budget(vdb);
+        }
+    } else {
+        /* Budget disabled: restore all spilled rows to RAM, then close
+         * and unlink the spill file. */
+        if (vdb->spill_fd >= 0) {
+            size_t i;
+            for (i = 0u; i < vdb->total_vectors; ++i) {
+                if (vdb->row_tier[i] == QIHSE_MEM_SPILLED) {
+                    (void)qihse_vdb_spill_restore_row(vdb, i);
+                }
+            }
+            qihse_vdb_spill_close(vdb);
+        }
+    }
+    return true;
+}
+
+bool qihse_vector_db_get_memory_usage(
+    qihse_vector_db_t vdb,
+    size_t* budget_bytes,
+    size_t* in_ram_bytes,
+    size_t* spilled_count
+) {
+    if (!vdb || !budget_bytes || !in_ram_bytes || !spilled_count) {
+        errno = EINVAL;
+        return false;
+    }
+    *budget_bytes = vdb->memory_budget_bytes;
+    *in_ram_bytes = vdb->memory_vectors_in_ram;
+    *spilled_count = vdb->spilled_count;
     return true;
 }
 

@@ -47,7 +47,7 @@ Usage:
     )
 """
 
-from .core import VectorDB, VectorQuery, VectorResult, DistanceMetric
+from .core import VectorDB, VectorQuery, VectorResult, DistanceMetric, QueryMode
 from .kv import KVStore
 from .timeseries import TimeSeriesDB
 from .document import DocumentStore
@@ -60,7 +60,7 @@ from .fts import FTSIndex, FTSResult
 from .fusion import MultimodalFusion, FusionResult
 
 __all__ = [
-    "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric",
+    "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode",
     "KVStore", "TimeSeriesDB", "DocumentStore",
     "EventStream", "EventRecord", "Durability",
     "UWPServer",

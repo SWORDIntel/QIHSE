@@ -430,6 +430,40 @@ bool qihse_vector_db_run_memory_maintenance(
 );
 
 /**
+ * Set a memory budget for the in-RAM vectors buffer. When the budget is
+ * exceeded, cold rows (below the cold_threshold access rate) are evicted
+ * to an on-disk spill file and paged back on demand during search.
+ *
+ * Set budget_bytes to 0 to disable budgeting (unlimited, legacy behavior).
+ * The budget only applies to the float32 vectors buffer, not to sidecars
+ * (INT8, FP8, etc.) or metadata.
+ *
+ * @param vdb Vector database handle
+ * @param budget_bytes Maximum bytes for in-RAM vectors (0=unlimited)
+ * @return true on success, false if vdb is NULL
+ */
+bool qihse_vector_db_set_memory_budget(
+    qihse_vector_db_t vdb,
+    size_t budget_bytes
+);
+
+/**
+ * Get current memory usage statistics for the vector DB.
+ *
+ * @param vdb Vector database handle
+ * @param budget_bytes Output: configured memory budget (0=unlimited)
+ * @param in_ram_bytes Output: current bytes of vectors resident in RAM
+ * @param spilled_count Output: number of rows evicted to spill file
+ * @return true on success, false if vdb or any output is NULL
+ */
+bool qihse_vector_db_get_memory_usage(
+    qihse_vector_db_t vdb,
+    size_t* budget_bytes,
+    size_t* in_ram_bytes,
+    size_t* spilled_count
+);
+
+/**
  * Checkpoint durable state by flushing the current snapshot and clearing WAL
  * records at or before the committed generation.
  *
