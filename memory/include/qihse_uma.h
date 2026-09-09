@@ -29,6 +29,7 @@ typedef enum {
     QIHSE_MEM_GNA_CACHE,     /* GNA cache */
     QIHSE_MEM_OPTANE,        /* Intel Optane persistent memory */
     QIHSE_MEM_CXL,           /* CXL-attached memory */
+    QIHSE_MEM_SPILLED,       /* Evicted to on-disk spill file (cold) */
 } qihse_memory_tier_t;
 
 /* ============================================================================

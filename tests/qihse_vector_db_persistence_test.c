@@ -161,6 +161,10 @@ static bool test_compact_rebuilds_corrupt_derived_sidecars(void);
 static bool test_compact_ignores_stale_tmp_files(void);
 static bool test_wal_mutations_compact_clear_wal_and_prune(void);
 
+static bool test_memory_budget_spills_cold_rows(void);
+static bool test_memory_budget_search_pages_in_spilled(void);
+static bool test_memory_budget_zero_restores_spilled(void);
+
 int main(void) {
     const test_case_t tests[] = {
         {"create -> insert -> close -> reopen -> search",
@@ -299,6 +303,12 @@ int main(void) {
          test_compact_ignores_stale_tmp_files},
         {"WAL mutations compact clears WAL and prunes rows",
          test_wal_mutations_compact_clear_wal_and_prune},
+        {"memory budget spills cold rows to disk",
+         test_memory_budget_spills_cold_rows},
+        {"memory budget search pages in spilled vectors",
+         test_memory_budget_search_pages_in_spilled},
+        {"memory budget zero restores spilled rows",
+         test_memory_budget_zero_restores_spilled},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(tests); i++) {
@@ -4982,6 +4992,270 @@ static bool test_wal_mutations_compact_clear_wal_and_prune(void) {
     free_results(&result, 1);
 
     TEST_ASSERT(qihse_vector_db_close(db), "read-only WAL compact database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+/*
+ * Memory budget enforcement tests (Phase 4)
+ *
+ * These tests verify that:
+ * 1. Setting a memory budget causes cold rows to be spilled to disk
+ * 2. Search can still find spilled vectors via page-in
+ * 3. Memory usage stats are reported correctly
+ * 4. The spill file is cleaned up on close
+ */
+
+static bool test_memory_budget_spills_cold_rows(void) {
+    test_env_t env;
+    char* path;
+    qihse_vector_db_t db;
+    const size_t dims = 4u;
+    const size_t n_vectors = 10u;
+    /* 10 vectors * 4 dims * 4 bytes = 160 bytes total */
+    const size_t total_vec_bytes = n_vectors * dims * sizeof(float);
+    /* Set budget to 40 bytes = 2.5 vectors worth — should spill most rows */
+    const size_t budget = 40u;
+
+    TEST_ASSERT(env_init(&env), "env_init should succeed");
+    path = make_temp_db_path("budget_spill");
+    TEST_ASSERT(path != NULL, "make_temp_db_path should succeed");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_CREATE
+    );
+    TEST_ASSERT(db != NULL, "create should return a database");
+
+    /* Insert 10 vectors */
+    for (size_t i = 0u; i < n_vectors; i++) {
+        float vec[4] = {(float)i, (float)(i + 1), (float)(i + 2), (float)(i + 3)};
+        char meta[16];
+        snprintf(meta, sizeof(meta), "vec_%zu", i);
+        TEST_ASSERT(add_one(db, vec, dims, 100u + i, meta, strlen(meta) + 1u),
+                    "add_one should succeed");
+    }
+
+    /* Flush so vectors are in the snapshot */
+    TEST_ASSERT(qihse_vector_db_flush(db), "flush should succeed");
+
+    /* Verify no budget is set initially */
+    size_t budget_bytes = 0, in_ram_bytes = 0, spilled_count = 0;
+    TEST_ASSERT(qihse_vector_db_get_memory_usage(db, &budget_bytes, &in_ram_bytes, &spilled_count),
+                "get_memory_usage should succeed");
+    TEST_ASSERT(budget_bytes == 0u, "initial budget should be 0 (unlimited)");
+    TEST_ASSERT(in_ram_bytes == total_vec_bytes, "all vectors should be in RAM");
+    TEST_ASSERT(spilled_count == 0u, "no rows should be spilled initially");
+
+    /* Set a memory budget smaller than total vector data */
+    TEST_ASSERT(qihse_vector_db_set_memory_budget(db, budget),
+                "set_memory_budget should succeed");
+
+    /* Run memory maintenance to trigger spilling.
+     * All rows have 0 access count (cold), so they should all be eligible
+     * for spilling. The budget is 40 bytes = 2.5 vectors, so we should
+     * spill enough to get under 40 bytes. */
+    TEST_ASSERT(qihse_vector_db_run_memory_maintenance(db),
+                "run_memory_maintenance should succeed");
+
+    /* Check that some rows were spilled */
+    TEST_ASSERT(qihse_vector_db_get_memory_usage(db, &budget_bytes, &in_ram_bytes, &spilled_count),
+                "get_memory_usage should succeed after maintenance");
+    TEST_ASSERT(budget_bytes == budget, "budget should match set value");
+    TEST_ASSERT(spilled_count > 0u, "at least one row should be spilled");
+    TEST_ASSERT(in_ram_bytes <= budget, "in-RAM bytes should be within budget");
+
+    /* Verify spill file exists */
+    {
+        char spill_path[512];
+        snprintf(spill_path, sizeof(spill_path), "%s.spill", path);
+        int fd = open(spill_path, O_RDONLY);
+        TEST_ASSERT(fd >= 0, "spill file should exist while DB is open");
+        close(fd);
+    }
+
+    TEST_ASSERT(qihse_vector_db_close(db), "database should close");
+
+    /* Verify spill file is cleaned up after close */
+    {
+        char spill_path[512];
+        snprintf(spill_path, sizeof(spill_path), "%s.spill", path);
+        int fd = open(spill_path, O_RDONLY);
+        TEST_ASSERT(fd < 0, "spill file should be unlinked after close");
+        if (fd >= 0) close(fd);
+    }
+
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_memory_budget_search_pages_in_spilled(void) {
+    test_env_t env;
+    char* path;
+    qihse_vector_db_t db;
+    const size_t dims = 4u;
+    const size_t n_vectors = 10u;
+    /* Set budget to 40 bytes — most rows will be spilled */
+    const size_t budget = 40u;
+
+    TEST_ASSERT(env_init(&env), "env_init should succeed");
+    path = make_temp_db_path("budget_pagein");
+    TEST_ASSERT(path != NULL, "make_temp_db_path should succeed");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_CREATE
+    );
+    TEST_ASSERT(db != NULL, "create should return a database");
+
+    /* Insert 10 one-hot vectors so cosine similarity is 0 between
+     * different vectors and 1.0 for exact matches. This makes the
+     * search deterministic regardless of spill state. */
+    for (size_t i = 0u; i < n_vectors; i++) {
+        float vec[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        vec[i % dims] = 1.0f + (float)(i / dims);  /* distinct one-hot */
+        TEST_ASSERT(add_one(db, vec, dims, 200u + i, NULL, 0),
+                    "add_one should succeed");
+    }
+
+    TEST_ASSERT(qihse_vector_db_flush(db), "flush should succeed");
+
+    /* Set budget and run maintenance to spill cold rows */
+    TEST_ASSERT(qihse_vector_db_set_memory_budget(db, budget),
+                "set_memory_budget should succeed");
+    TEST_ASSERT(qihse_vector_db_run_memory_maintenance(db),
+                "run_memory_maintenance should succeed");
+
+    size_t budget_bytes, in_ram_bytes, spilled_count;
+    TEST_ASSERT(qihse_vector_db_get_memory_usage(db, &budget_bytes, &in_ram_bytes, &spilled_count),
+                "get_memory_usage should succeed");
+    TEST_ASSERT(spilled_count > 0u, "rows should be spilled");
+
+    /* Search for a vector that was likely spilled.
+     * The search should page it in from the spill file. */
+    {
+        float query[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        query[0] = 1.0f;  /* Matches vector i=0 (id=200) */
+        qihse_vector_result_t result;
+        int count = search_one(db, query, dims, false, false, &result);
+        TEST_ASSERT(count >= 1, "search should find results even for spilled vectors");
+        if (count >= 1) {
+            TEST_ASSERT(result.id == 200u, "search should find the correct vector (id=200)");
+        }
+        free_results(&result, 1);
+    }
+
+    /* Search for another one-hot vector */
+    {
+        float query[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        query[1] = 1.0f;  /* Matches vector i=1 (id=201) */
+        qihse_vector_result_t result;
+        int count = search_one(db, query, dims, false, false, &result);
+        TEST_ASSERT(count >= 1, "search should find results for second vector");
+        if (count >= 1) {
+            TEST_ASSERT(result.id == 201u, "search should find the correct vector (id=201)");
+        }
+        free_results(&result, 1);
+    }
+
+    TEST_ASSERT(qihse_vector_db_close(db), "database should close");
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_memory_budget_zero_restores_spilled(void) {
+    test_env_t env;
+    char* path;
+    qihse_vector_db_t db;
+    const size_t dims = 4u;
+    const size_t n_vectors = 10u;
+    const size_t budget = 40u;
+
+    TEST_ASSERT(env_init(&env), "env_init should succeed");
+    path = make_temp_db_path("budget_restore");
+    TEST_ASSERT(path != NULL, "make_temp_db_path should succeed");
+
+    db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY,
+        env.uma,
+        path,
+        QIHSE_TEST_OPEN_FILE_BACKED | QIHSE_TEST_OPEN_CREATE
+    );
+    TEST_ASSERT(db != NULL, "create should return a database");
+
+    /* Insert 10 one-hot vectors */
+    for (size_t i = 0u; i < n_vectors; i++) {
+        float vec[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        vec[i % dims] = 1.0f + (float)(i / dims);
+        TEST_ASSERT(add_one(db, vec, dims, 300u + i, NULL, 0),
+                    "add_one should succeed");
+    }
+    TEST_ASSERT(qihse_vector_db_flush(db), "flush should succeed");
+
+    /* Set budget and spill */
+    TEST_ASSERT(qihse_vector_db_set_memory_budget(db, budget),
+                "set_memory_budget should succeed");
+    TEST_ASSERT(qihse_vector_db_run_memory_maintenance(db),
+                "run_memory_maintenance should succeed");
+
+    size_t budget_bytes, in_ram_bytes, spilled_count;
+    TEST_ASSERT(qihse_vector_db_get_memory_usage(db, &budget_bytes, &in_ram_bytes, &spilled_count),
+                "get_memory_usage should succeed");
+    TEST_ASSERT(spilled_count > 0u, "rows should be spilled");
+
+    /* Verify spill file exists */
+    {
+        size_t spill_len = strlen(path) + 8u;
+        char* spill_path = (char*)malloc(spill_len);
+        TEST_ASSERT(spill_path != NULL, "malloc should succeed");
+        snprintf(spill_path, spill_len, "%s.spill", path);
+        TEST_ASSERT(access(spill_path, F_OK) == 0, "spill file should exist while budget is set");
+        free(spill_path);
+    }
+
+    /* Set budget to 0 — should restore all spilled rows and remove spill file */
+    TEST_ASSERT(qihse_vector_db_set_memory_budget(db, 0),
+                "set_memory_budget(0) should succeed");
+
+    TEST_ASSERT(qihse_vector_db_get_memory_usage(db, &budget_bytes, &in_ram_bytes, &spilled_count),
+                "get_memory_usage should succeed after restore");
+    TEST_ASSERT(budget_bytes == 0u, "budget should be 0 after disable");
+    TEST_ASSERT(spilled_count == 0u, "no rows should be spilled after restore");
+
+    /* Spill file should be removed */
+    {
+        size_t spill_len = strlen(path) + 8u;
+        char* spill_path = (char*)malloc(spill_len);
+        TEST_ASSERT(spill_path != NULL, "malloc should succeed");
+        snprintf(spill_path, spill_len, "%s.spill", path);
+        TEST_ASSERT(access(spill_path, F_OK) != 0, "spill file should be removed after budget=0");
+        free(spill_path);
+    }
+
+    /* Search should still work with all rows resident */
+    {
+        float query[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        query[0] = 1.0f;
+        qihse_vector_result_t result;
+        int count = search_one(db, query, dims, false, false, &result);
+        TEST_ASSERT(count >= 1, "search should find results after restore");
+        if (count >= 1) {
+            TEST_ASSERT(result.id == 300u, "search should find the correct vector (id=300)");
+        }
+        free_results(&result, 1);
+    }
+
+    TEST_ASSERT(qihse_vector_db_close(db), "database should close");
     remove_tree(path);
     free(path);
     env_destroy(&env);

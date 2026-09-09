@@ -50,6 +50,35 @@ class DistanceMetric(IntEnum):
 
 
 # ---------------------------------------------------------------------------
+# Open flags (must match qihse_vector_db_open_flags_t in qihse_vector_db.h)
+# ---------------------------------------------------------------------------
+QIHSE_VDB_OPEN_CREATE      = 1 << 0
+QIHSE_VDB_OPEN_READ_ONLY   = 1 << 1
+QIHSE_VDB_OPEN_TRUNCATE    = 1 << 2
+QIHSE_VDB_OPEN_FILE_BACKED = 1 << 3
+QIHSE_VDB_OPEN_MMAP        = 1 << 4
+
+
+# ---------------------------------------------------------------------------
+# Query modes (must match qihse_vector_db_query_mode_t in qihse_vector_db.h)
+# ---------------------------------------------------------------------------
+class QueryMode(IntEnum):
+    """Search query mode. Lower-precision modes use less RAM but are approximate."""
+    FLOAT32 = 0                # Exact float32 search (3 GB for 196K×4096)
+    TRINARY_SCALAR = 1         # Sign-only candidate selection + float32 rerank
+    TRINARY_MAGNITUDE = 2      # Sign + magnitude candidate selection + rerank
+    TRINARY_MAGNITUDE_BYPASS = 3  # Approximate, no float32 rerank (fastest)
+    GRAPH = 4                  # HNSW graph candidate selection + rerank
+    INT8 = 5                   # INT8 quantized candidates (0.75 GB)
+    SPARSE = 6                 # Sparse inverted index (BM25)
+    FP16 = 7                   # FP16 candidates (1.5 GB)
+    FP32 = 8                   # Explicit FP32
+    FP8 = 9                    # FP8 candidates (375 MB)
+    FP4 = 10                   # FP4 candidates (188 MB)
+    INT4 = 11                  # INT4 candidates (94 MB)
+
+
+# ---------------------------------------------------------------------------
 # C function signatures
 # ---------------------------------------------------------------------------
 _lib.qihse_vector_db_create.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p]
@@ -143,8 +172,31 @@ _lib.qihse_vector_db_build_graph.restype = ctypes.c_bool
 _lib.qihse_vector_db_build_int8.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_build_int8.restype = ctypes.c_bool
 
+_lib.qihse_vector_db_build_fp8.argtypes = [_VectorDB_p]
+_lib.qihse_vector_db_build_fp8.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_build_fp4.argtypes = [_VectorDB_p]
+_lib.qihse_vector_db_build_fp4.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_build_int4.argtypes = [_VectorDB_p]
+_lib.qihse_vector_db_build_int4.restype = ctypes.c_bool
+
 _lib.qihse_vector_db_flush.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_flush.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_run_memory_maintenance.argtypes = [_VectorDB_p]
+_lib.qihse_vector_db_run_memory_maintenance.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_set_memory_budget.argtypes = [_VectorDB_p, ctypes.c_size_t]
+_lib.qihse_vector_db_set_memory_budget.restype = ctypes.c_bool
+
+_lib.qihse_vector_db_get_memory_usage.argtypes = [
+    _VectorDB_p,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_lib.qihse_vector_db_get_memory_usage.restype = ctypes.c_bool
 
 _lib.qihse_vector_db_get_dims.argtypes = [_VectorDB_p]
 _lib.qihse_vector_db_get_dims.restype = ctypes.c_size_t
@@ -210,10 +262,23 @@ class VectorDB:
         return db
 
     @staticmethod
-    def open(path: str, read_only: bool = False) -> "VectorDB":
-        flags = 0x00000008
+    def open(path: str, read_only: bool = False, mmap: bool = False) -> "VectorDB":
+        """Open an existing VectorDB.
+
+        Args:
+            path: Path to .qdb file
+            read_only: Open in read-only mode (required for mmap)
+            mmap: Memory-map the file instead of copying into RAM.
+                  Requires read_only=True. Drops search-time RSS from
+                  ~3 GB to ~0 (kernel page cache manages it).
+        """
+        flags = QIHSE_VDB_OPEN_FILE_BACKED
         if read_only:
-            flags |= 0x00000002
+            flags |= QIHSE_VDB_OPEN_READ_ONLY
+        if mmap:
+            if not read_only:
+                raise ValueError("mmap requires read_only=True")
+            flags |= QIHSE_VDB_OPEN_MMAP
         ptr = _lib.qihse_vector_db_open(0, None, path.encode("utf-8"), flags)
         if not ptr:
             raise RuntimeError(f"Failed to open VectorDB at {path}")
@@ -277,7 +342,18 @@ class VectorDB:
         k: Optional[int] = None,
         metric: Optional[DistanceMetric] = None,
         include_vectors: bool = False,
+        mode: Optional[QueryMode] = None,
     ) -> list[VectorResult]:
+        """Search for nearest neighbors.
+
+        Args:
+            query: Query vector or VectorQuery object
+            k: Number of results (default 10)
+            metric: Distance metric (default COSINE)
+            include_vectors: Return vectors in results
+            mode: Query mode for approximate search. Default is GRAPH (HNSW).
+                  Use INT8/FP8/FP4 for lower memory on constrained hardware.
+        """
         with self._lock:
             if isinstance(query, VectorQuery):
                 qvec = query.vector
@@ -300,7 +376,8 @@ class VectorDB:
             c_query.include_metadata = False
             c_query.use_trinary_candidates = False
             c_query.candidate_count = top_k * 2
-            c_query.query_mode = 4 # QIHSE_VDB_QUERY_GRAPH
+            # Use provided mode, default to GRAPH (HNSW + float32 rerank)
+            c_query.query_mode = int(mode) if mode is not None else 4
             c_query.candidate_pool_size = top_k * 20
             c_query.distance_metric = metric.value
             c_query.metadata_filter = None
@@ -428,11 +505,32 @@ class VectorDB:
                 raise RuntimeError("Failed to build graph index")
 
     def build_int8(self) -> None:
-        """Build the INT8 scalar quantization sidecar."""
+        """Build the INT8 scalar quantization sidecar (4x compression)."""
         with self._lock:
             ok = _lib.qihse_vector_db_build_int8(self._ptr)
             if not ok:
                 raise RuntimeError("Failed to build INT8 index")
+
+    def build_fp8(self) -> None:
+        """Build the FP8 quantization sidecar (8x compression, 375 MB for 196K×4096)."""
+        with self._lock:
+            ok = _lib.qihse_vector_db_build_fp8(self._ptr)
+            if not ok:
+                raise RuntimeError("Failed to build FP8 index")
+
+    def build_fp4(self) -> None:
+        """Build the FP4 quantization sidecar (16x compression, 188 MB for 196K×4096)."""
+        with self._lock:
+            ok = _lib.qihse_vector_db_build_fp4(self._ptr)
+            if not ok:
+                raise RuntimeError("Failed to build FP4 index")
+
+    def build_int4(self) -> None:
+        """Build the INT4 quantization sidecar (32x compression, 94 MB for 196K×4096)."""
+        with self._lock:
+            ok = _lib.qihse_vector_db_build_int4(self._ptr)
+            if not ok:
+                raise RuntimeError("Failed to build INT4 index")
 
     def flush(self) -> None:
         """Persist all pending changes to disk."""
@@ -440,6 +538,54 @@ class VectorDB:
             ok = _lib.qihse_vector_db_flush(self._ptr)
             if not ok:
                 raise RuntimeError("Flush failed")
+
+    def run_memory_maintenance(self) -> None:
+        """Run memory maintenance: recompute row temperatures, promote/demote
+        tiers, and spill cold rows to disk if a memory budget is set."""
+        with self._lock:
+            ok = _lib.qihse_vector_db_run_memory_maintenance(self._ptr)
+            if not ok:
+                raise RuntimeError("Memory maintenance failed")
+
+    def set_memory_budget(self, budget_bytes: int) -> None:
+        """Set the maximum in-RAM vector buffer size. When exceeded, cold
+        rows are spilled to a sidecar file (``<db_path>.spill``) and paged
+        back in on demand during search. A budget of 0 means unlimited
+        (legacy behavior). The budget applies only to the float32 vector
+        buffer, not metadata or quantized sidecars.
+
+        Args:
+            budget_bytes: Maximum bytes for in-RAM vectors (0=unlimited).
+        """
+        if budget_bytes < 0:
+            raise ValueError("budget_bytes must be >= 0")
+        with self._lock:
+            ok = _lib.qihse_vector_db_set_memory_budget(
+                self._ptr, ctypes.c_size_t(budget_bytes)
+            )
+            if not ok:
+                raise RuntimeError("Failed to set memory budget")
+
+    def get_memory_usage(self) -> tuple[int, int, int]:
+        """Return (budget_bytes, in_ram_bytes, spilled_count).
+
+        - ``budget_bytes``: configured budget (0 = unlimited).
+        - ``in_ram_bytes``: bytes currently resident in the float32 buffer.
+        - ``spilled_count``: number of rows evicted to the spill file.
+        """
+        budget = ctypes.c_size_t()
+        in_ram = ctypes.c_size_t()
+        spilled = ctypes.c_size_t()
+        with self._lock:
+            ok = _lib.qihse_vector_db_get_memory_usage(
+                self._ptr,
+                ctypes.byref(budget),
+                ctypes.byref(in_ram),
+                ctypes.byref(spilled),
+            )
+            if not ok:
+                raise RuntimeError("Failed to get memory usage")
+        return (int(budget.value), int(in_ram.value), int(spilled.value))
 
     @property
     def dims(self) -> int:

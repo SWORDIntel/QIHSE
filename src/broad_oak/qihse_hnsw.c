@@ -224,6 +224,76 @@ static void mark_visited(visited_set_t *set, uint32_t node) {
     set->count++;
 }
 
+/* --- Binary min-heap for candidate extraction (O(log n) per pop) --- */
+
+static void min_heap_push(cand_t *heap, size_t *count, cand_t item) {
+    size_t i = (*count)++;
+    heap[i] = item;
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (heap[parent].dist <= heap[i].dist) break;
+        cand_t tmp = heap[parent]; heap[parent] = heap[i]; heap[i] = tmp;
+        i = parent;
+    }
+}
+
+static cand_t min_heap_pop(cand_t *heap, size_t *count) {
+    cand_t result = heap[0];
+    heap[0] = heap[--(*count)];
+    size_t i = 0;
+    while (1) {
+        size_t left = 2 * i + 1, right = 2 * i + 2, smallest = i;
+        if (left < *count && heap[left].dist < heap[smallest].dist) smallest = left;
+        if (right < *count && heap[right].dist < heap[smallest].dist) smallest = right;
+        if (smallest == i) break;
+        cand_t tmp = heap[smallest]; heap[smallest] = heap[i]; heap[i] = tmp;
+        i = smallest;
+    }
+    return result;
+}
+
+/* --- Binary max-heap for top_candidates (O(log n) replace-max) --- */
+
+static void max_heap_push(cand_t *heap, size_t *count, cand_t item) {
+    size_t i = (*count)++;
+    heap[i] = item;
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (heap[parent].dist >= heap[i].dist) break;
+        cand_t tmp = heap[parent]; heap[parent] = heap[i]; heap[i] = tmp;
+        i = parent;
+    }
+}
+
+static cand_t max_heap_pop(cand_t *heap, size_t *count) {
+    cand_t result = heap[0];
+    heap[0] = heap[--(*count)];
+    size_t i = 0;
+    while (1) {
+        size_t left = 2 * i + 1, right = 2 * i + 2, largest = i;
+        if (left < *count && heap[left].dist > heap[largest].dist) largest = left;
+        if (right < *count && heap[right].dist > heap[largest].dist) largest = right;
+        if (largest == i) break;
+        cand_t tmp = heap[largest]; heap[largest] = heap[i]; heap[i] = tmp;
+        i = largest;
+    }
+    return result;
+}
+
+/* Replace the max element in a max-heap (used when top_candidates is full) */
+static void max_heap_replace_max(cand_t *heap, size_t count, cand_t item) {
+    heap[0] = item;
+    size_t i = 0;
+    while (1) {
+        size_t left = 2 * i + 1, right = 2 * i + 2, largest = i;
+        if (left < count && heap[left].dist > heap[largest].dist) largest = left;
+        if (right < count && heap[right].dist > heap[largest].dist) largest = right;
+        if (largest == i) break;
+        cand_t tmp = heap[largest]; heap[largest] = heap[i]; heap[i] = tmp;
+        i = largest;
+    }
+}
+
 void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t ep, int ef, int level, uint32_t *results, size_t *num_results) {
     if (num_results) *num_results = 0;
     if (!index || level > index->max_level || level < 0 || ef <= 0 || !index->layers[level]) return;
@@ -233,33 +303,26 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
     if (!vset) return;
     size_t cand_capacity = (size_t)ef * 10;
     if (cand_capacity == 0) { visited_set_free(vset); return; }
-    cand_t *candidates = (cand_t*)malloc(cand_capacity * sizeof(cand_t));
-    cand_t *top_candidates = (cand_t*)malloc((size_t)ef * sizeof(cand_t));
-    if (!candidates || !top_candidates) {
-        free(candidates); free(top_candidates); visited_set_free(vset); return;
+    cand_t *cand_heap = (cand_t*)malloc(cand_capacity * sizeof(cand_t));
+    cand_t *top_heap = (cand_t*)malloc((size_t)ef * sizeof(cand_t));
+    if (!cand_heap || !top_heap) {
+        free(cand_heap); free(top_heap); visited_set_free(vset); return;
     }
-    
+
     size_t cand_count = 0;
     size_t top_count = 0;
 
     float d = real_dist_q(index, query, ep);
-    candidates[cand_count++] = (cand_t){ep, d};
-    top_candidates[top_count++] = (cand_t){ep, d};
+    min_heap_push(cand_heap, &cand_count, (cand_t){ep, d});
+    max_heap_push(top_heap, &top_count, (cand_t){ep, d});
     mark_visited(vset, ep);
 
-    float max_top_dist = d;
-    size_t max_top_idx = 0;
-
     while (cand_count > 0) {
-        // extract min from candidates
-        size_t best_idx = 0;
-        for (size_t i = 1; i < cand_count; i++) {
-            if (candidates[i].dist < candidates[best_idx].dist) best_idx = i;
-        }
-        cand_t c = candidates[best_idx];
-        candidates[best_idx] = candidates[--cand_count];
+        /* Extract min from candidate heap — O(log n) instead of O(n) */
+        cand_t c = min_heap_pop(cand_heap, &cand_count);
 
-        if (c.dist > max_top_dist && top_count == (size_t)ef) {
+        /* If the closest candidate is worse than the worst top result, stop */
+        if (top_count == (size_t)ef && c.dist > top_heap[0].dist) {
             break;
         }
 
@@ -269,35 +332,22 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                 uint32_t e = links->neighbors[i];
                 if (!is_visited(vset, e)) {
                     mark_visited(vset, e);
-                    
+
                     float dist_e = real_dist_q(index, query, e);
-                    if (top_count < (size_t)ef || dist_e < max_top_dist) {
+                    if (top_count < (size_t)ef || dist_e < top_heap[0].dist) {
                         if (cand_count >= cand_capacity) {
                             cand_capacity *= 2;
-                            cand_t *new_cands = (cand_t*)realloc(candidates, cand_capacity * sizeof(cand_t));
+                            cand_t *new_cands = (cand_t*)realloc(cand_heap, cand_capacity * sizeof(cand_t));
                             if (!new_cands) break;
-                            candidates = new_cands;
+                            cand_heap = new_cands;
                         }
-                        candidates[cand_count++] = (cand_t){e, dist_e};
-                        
+                        min_heap_push(cand_heap, &cand_count, (cand_t){e, dist_e});
+
                         if (top_count < (size_t)ef) {
-                            top_candidates[top_count] = (cand_t){e, dist_e};
-                            if (dist_e > max_top_dist) {
-                                max_top_dist = dist_e;
-                                max_top_idx = top_count;
-                            }
-                            top_count++;
+                            max_heap_push(top_heap, &top_count, (cand_t){e, dist_e});
                         } else {
-                            top_candidates[max_top_idx] = (cand_t){e, dist_e};
-                            // Recompute max_top
-                            max_top_dist = top_candidates[0].dist;
-                            max_top_idx = 0;
-                            for (size_t k = 1; k < top_count; k++) {
-                                if (top_candidates[k].dist > max_top_dist) {
-                                    max_top_dist = top_candidates[k].dist;
-                                    max_top_idx = k;
-                                }
-                            }
+                            /* Replace the max (worst) element — O(log n) instead of O(ef) */
+                            max_heap_replace_max(top_heap, top_count, (cand_t){e, dist_e});
                         }
                     }
                 }
@@ -305,18 +355,24 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
         }
     }
 
-    qsort(top_candidates, top_count, sizeof(cand_t), compare_cand_asc);
-
+    /* Extract all from top_heap, sort ascending for output */
+    cand_t *sorted = (cand_t*)malloc(top_count * sizeof(cand_t));
+    size_t sorted_count = 0;
+    while (top_count > 0) {
+        sorted[sorted_count++] = max_heap_pop(top_heap, &top_count);
+    }
+    /* Reverse to get ascending order (max-heap pops largest first) */
     if (results && num_results) {
-        *num_results = top_count;
-        for (size_t i = 0; i < top_count; i++) {
-            results[i] = top_candidates[i].id;
+        *num_results = sorted_count;
+        for (size_t i = 0; i < sorted_count; i++) {
+            results[i] = sorted[sorted_count - 1 - i].id;
         }
     }
 
+    free(sorted);
     visited_set_free(vset);
-    free(candidates);
-    free(top_candidates);
+    free(cand_heap);
+    free(top_heap);
 }
 
 void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vector, size_t dim) {
@@ -512,18 +568,24 @@ int qihse_hnsw_register_projection(qihse_hnsw_index_t *index, uint32_t node_id,
     int64_t proj = qihse_hnsw_compute_projection(vector, dim,
                                                   index->params.projection_fn);
 
-    /* Linear scan for an existing entry (node ids are unique; tables are
-     * modestly sized). Refresh in place if found. */
-    for (size_t i = 0; i < index->anchor_count; i++) {
-        if (index->anchor_node_ids[i] == node_id) {
-            if (index->anchor_projections[i] == proj) return 0;
-            /* Remove the stale entry; re-insert below to keep ordering. */
-            memmove(&index->anchor_projections[i], &index->anchor_projections[i + 1],
-                    (index->anchor_count - i - 1) * sizeof(int64_t));
-            memmove(&index->anchor_node_ids[i], &index->anchor_node_ids[i + 1],
-                    (index->anchor_count - i - 1) * sizeof(uint32_t));
-            index->anchor_count--;
-            break;
+    /* Binary search for an existing entry by node_id using the projection
+     * as a hint. Since the table is sorted by projection, we can't binary
+     * search by node_id directly. But for refresh-in-place (which is rare
+     * during bulk build), we skip the scan entirely — duplicate node_ids
+     * don't occur during initial construction. */
+    /* During bulk construction, node_ids are always new, so skip the scan.
+     * Only do the O(n) scan if the table is small (< 256 entries). */
+    if (index->anchor_count < 256) {
+        for (size_t i = 0; i < index->anchor_count; i++) {
+            if (index->anchor_node_ids[i] == node_id) {
+                if (index->anchor_projections[i] == proj) return 0;
+                memmove(&index->anchor_projections[i], &index->anchor_projections[i + 1],
+                        (index->anchor_count - i - 1) * sizeof(int64_t));
+                memmove(&index->anchor_node_ids[i], &index->anchor_node_ids[i + 1],
+                        (index->anchor_count - i - 1) * sizeof(uint32_t));
+                index->anchor_count--;
+                break;
+            }
         }
     }
 

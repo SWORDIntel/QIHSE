@@ -146,6 +146,11 @@ class KVStore:
         return result
 
     def items(self, prefix: str = None, user=None) -> list:
+        """Return all (key, value) pairs, optionally filtered by prefix.
+
+        Warning: builds a full in-memory list. For large stores, use
+        iteritems() instead to stream one pair at a time.
+        """
         result = []
 
         def _cb(key, value):
@@ -155,6 +160,58 @@ class KVStore:
 
         self.foreach(_cb, user=user)
         return result
+
+    def iteritems(self, prefix: str = None, user=None):
+        """Yield (key, value) pairs one at a time without building a full list.
+
+        Uses a background thread + queue to bridge the blocking C
+        qihse_kv_foreach_user call to a Python generator. This avoids the
+        memory spike that items() causes for large stores (e.g. 196K
+        function metadata records).
+
+        The ``user`` security context is propagated to the underlying
+        authorization-aware bulk API so classified-capable data is never
+        enumerated without an authenticated principal.
+
+        Args:
+            prefix: Optional key prefix filter
+            user: Authenticated security context (qihse_user_t *). Required
+                  for stores that may contain classified data.
+
+        Yields:
+            (key, value) tuples as strings
+        """
+        import queue
+        import threading
+
+        _SENTINEL = object()
+        q: queue.Queue = queue.Queue(maxsize=256)
+
+        def _cb(key, val):
+            if prefix is None or key.startswith(prefix):
+                q.put((key, val))
+            return True
+
+        def _run():
+            try:
+                self.foreach(_cb, user=user)
+            except Exception as e:
+                q.put(e)
+            finally:
+                q.put(_SENTINEL)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+        t.join(timeout=5)
 
     def size(self, user=None) -> int:
         return int(_lib.qihse_kv_count_user(self._ptr, user))
