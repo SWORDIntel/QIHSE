@@ -2,128 +2,74 @@
 #define QIHSE_KV_STORE_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "qihse_trinary_trie.h"
 #include "qihse_auth.h"
 
-/**
- * @brief Opaque handle for the QIHSE Key-Value Store.
- */
+/** Opaque handle for the QIHSE Key-Value Store. */
 typedef struct qihse_kv_store qihse_kv_store_t;
 
-/**
- * @brief Creates a new QIHSE Key-Value Store instance.
- * @return Pointer to the newly allocated store, or NULL on failure.
- */
-qihse_kv_store_t* qihse_kv_store_create();
-
-/**
- * @brief Destroys a QIHSE Key-Value Store and frees all associated memory.
- * @param store The store to destroy.
- */
+qihse_kv_store_t* qihse_kv_store_create(void);
 void qihse_kv_store_destroy(qihse_kv_store_t* store);
 
-/**
- * @brief Inserts or updates a key-value pair.
- * @param store The KV store instance.
- * @param key Null-terminated string key.
- * @param value Null-terminated string value.
- * @return true if successful, false otherwise.
+/*
+ * Context-free writes are intentionally restricted to unclassified data.
+ * Classified/SCI writes MUST use qihse_kv_set_user().
  */
-bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment);
-bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment, struct qihse_user_s* user);
+bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
+                  uint16_t classification, uint16_t sci_compartment);
+bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value,
+                       uint16_t classification, uint16_t sci_compartment,
+                       qihse_user_t* user);
 
-/**
- * @brief Retrieves a value by key.
- * @param store The KV store instance.
- * @param key Null-terminated string key.
- * @return A newly allocated string containing the value, or NULL if not found. Caller must free().
- */
-char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
-
+char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_get_user(store, key, NULL);
 }
 
-/**
- * @brief Deletes a key-value pair.
- * @param store The KV store instance.
- * @param key Null-terminated string key.
- * @return true if the key was deleted, false if it did not exist.
- */
-bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
-
+bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 static inline bool qihse_kv_del(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_del_user(store, key, NULL);
 }
 
-/**
- * @brief Checks if a key exists in the store.
- * @param store The KV store instance.
- * @param key Null-terminated string key.
- * @return true if the key exists, false otherwise.
- */
-bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
-
+bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 static inline bool qihse_kv_exists(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_exists_user(store, key, NULL);
 }
 
-/* Phase 3: TTL and Persistence */
-/**
- * @brief Sets a Time-To-Live (TTL) expiration on a key.
- * @param store The KV store instance.
- * @param key The key to expire.
- * @param ttl_ms Time-to-live in milliseconds.
- * @return true if the TTL was set, false if the key doesn't exist.
- */
-bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, struct qihse_user_s* user);
-int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, struct qihse_user_s* user);
-
-/**
- * @brief Sweeps the store and removes all expired keys.
- * @param store The KV store instance.
- */
+bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms,
+                     qihse_user_t* user);
+int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 void qihse_kv_sweep_expired(qihse_kv_store_t* store);
 
-/**
- * @brief Checks if the store is under attack.
- * @param store The KV store instance.
- * @return true if the store is under attack, false otherwise.
- */
 bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store);
 
-/**
- * @brief Saves the entire KV store to a file on disk.
- * @param store The KV store instance.
- * @param filepath Path to the output file.
- * @return 0 on success, negative on error.
+/*
+ * Persistence is authorization-aware. *_user variants deny the whole export/import
+ * if any live record is outside the caller's clearance/SCI. Legacy variants run
+ * as NULL/unclassified and therefore cannot export/import classified records.
  */
+int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user);
+int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user);
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath);
-
-/**
- * @brief Loads a KV store snapshot from disk.
- * @param store The KV store instance.
- * @param filepath Path to the snapshot file.
- * @return 0 on success, negative on error.
- */
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath);
 
-/* Bulk load mode — skips WAL, QDD, and per-key metadata for fast ingestion */
+/* Bulk-load mode disables WAL buffering/automatic flush only; authorization rules remain. */
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store);
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store);
 
-/* Enumeration callback — called for each live key-value pair.
- * Return true to continue iteration, false to stop. The value pointer is
- * only valid for the duration of the callback. */
 typedef bool (*qihse_kv_iter_cb)(const char* key, const char* value, void* user_data);
 
-/* Iterate over all live (non-expired) key-value pairs in the in-memory trie. */
+/* Authorization-aware enumeration. Returns false on compaction/storage failure. */
+bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
+                           qihse_kv_iter_cb cb, void* user_data);
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data);
 
-/* Remove all keys from the in-memory trie. Returns the number removed. */
+size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user);
 size_t qihse_kv_clear(qihse_kv_store_t* store);
 
-/* Returns the number of live keys in the in-memory trie. */
+size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user);
 size_t qihse_kv_count(qihse_kv_store_t* store);
 
 #endif /* QIHSE_KV_STORE_H */

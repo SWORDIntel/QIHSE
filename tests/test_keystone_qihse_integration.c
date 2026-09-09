@@ -3,11 +3,23 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "qihse_auth.h"
 #include "qihse_keystone.h"
 #include "qihse_kv_store.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_resp_wire.h"
 
-static void test_micro_model_classification() {
+#define TEST_OPERATOR_PASSWORD "KeystoneIntegrationOpPass1!"
+#define TEST_GUEST_PASSWORD "KeystoneGuestPass1!"
+#define TEST_GUEST_ID 42u
+#define TEST_GUEST_USERNAME "keystone_guest"
+
+static void test_micro_model_classification(void) {
     printf("Testing Neural Micro-Model 6-Class Context Classification...\n");
 
     const char* fin_ctx = "payment processing bank account swift iban transaction wire 1000 USD transfer";
@@ -20,25 +32,22 @@ static void test_micro_model_classification() {
            qihse_keystone_class_name(cls), cls, conf);
 }
 
-static void test_anchor_search_performance() {
+static void test_anchor_search_performance(void) {
     printf("Testing Keystone Anchor-Guided Interpolation Search...\n");
 
     size_t n = 100000;
     int64_t* arr = (int64_t*)malloc(n * sizeof(int64_t));
+    assert(arr != NULL);
     for (size_t i = 0; i < n; i++) {
         arr[i] = (int64_t)(i * 3 + 7);
     }
 
-    // Exact hit
     int64_t target = arr[42424];
     int64_t idx = qihse_keystone_anchor_search(arr, n, target);
     assert(idx == 42424);
 
-    // Boundary hits
     assert(qihse_keystone_anchor_search(arr, n, arr[0]) == 0);
     assert(qihse_keystone_anchor_search(arr, n, arr[n - 1]) == (int64_t)(n - 1));
-
-    // Misses
     assert(qihse_keystone_anchor_search(arr, n, -1) == -1);
     assert(qihse_keystone_anchor_search(arr, n, arr[n - 1] + 100) == -1);
     assert(qihse_keystone_anchor_search(arr, n, arr[50] + 1) == -1);
@@ -47,8 +56,11 @@ static void test_anchor_search_performance() {
     printf("  -> Anchor-guided interpolation search verified across 100,000 keys OK\n");
 }
 
-static void test_simd_dirty_log_ingest() {
-    printf("Testing SIMD Dirty Log Ingestion into QIHSE Black Hole KV Store...\n");
+static void test_simd_dirty_log_ingest(void) {
+    printf("Testing principal-aware SIMD Dirty Log Ingestion into QIHSE Black Hole KV Store...\n");
+
+    qihse_user_t* operator_user = qihse_auth_get_user(0);
+    assert(operator_user != NULL);
 
     qihse_kv_store_t* kv = qihse_kv_store_create();
     assert(kv != NULL);
@@ -63,41 +75,39 @@ static void test_simd_dirty_log_ingest() {
         "Operator account: dev_lead@infra.cloud.org:SecretDevPass123\n"
         "--- END DUMP ---";
 
-    size_t count = qihse_keystone_ingest_dirty_logs(
+    size_t count = qihse_keystone_ingest_dirty_logs_user(
         kv,
         NULL,
         dirty_payload,
         strlen(dirty_payload),
-        1, // clearance
-        0  // compartment
+        1,
+        0,
+        operator_user
     );
 
     assert(count >= 3);
-    printf("  -> Extracted and indexed %zu credentials into Black Hole KV store\n", count);
+    printf("  -> Extracted and indexed %zu classified artifacts with explicit principal\n", count);
 
-    // Verify presence and enriched value metadata
-    char* val1 = qihse_kv_get(kv, "victim1@financial-corp.com");
+    char* val1 = qihse_kv_get_user(kv, "victim1@financial-corp.com", operator_user);
     assert(val1 != NULL);
     assert(strstr(val1, "pass=P@ssw0rd2026!") != NULL);
     assert(strstr(val1, "slot=") != NULL);
     assert(strstr(val1, "class=") != NULL);
-    printf("  -> Enriched KV record: %s\n", val1);
     free(val1);
 
-    char* val2 = qihse_kv_get(kv, "admin.ops@defense.gov");
+    char* val2 = qihse_kv_get_user(kv, "admin.ops@defense.gov", operator_user);
     assert(val2 != NULL);
     assert(strstr(val2, "pass=ClassifiedKey999") != NULL);
-    printf("  -> Enriched KV record: %s\n", val2);
     free(val2);
+
+    /* The legacy NULL-principal path must fail closed for classified data. */
+    const char* denied_payload = "legacy_denied@corp.internal:ShouldNotPersist\n";
+    assert(qihse_keystone_ingest_dirty_logs(
+               kv, NULL, denied_payload, strlen(denied_payload), 1, 0) == 0u);
+    assert(qihse_kv_get_user(kv, "legacy_denied@corp.internal", operator_user) == NULL);
 
     qihse_kv_store_destroy(kv);
 }
-
-#include "qihse_resp_wire.h"
-#include <sys/socket.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
 
 typedef struct {
     int fd;
@@ -175,7 +185,8 @@ static char* read_response(test_client_t* client) {
         if (status < 0) return NULL;
         if (status > 0) break;
         assert(client->used < sizeof(client->buffer));
-        ssize_t received = recv(client->fd, client->buffer + client->used, sizeof(client->buffer) - client->used, 0);
+        ssize_t received = recv(client->fd, client->buffer + client->used,
+                                sizeof(client->buffer) - client->used, 0);
         assert(received > 0);
         client->used += (size_t)received;
     }
@@ -200,16 +211,26 @@ static void send_all(int fd, const char* data, size_t len) {
 static void send_command(int fd, size_t argc, const char* const* argv) {
     char header[64];
     int len = snprintf(header, sizeof(header), "*%zu\r\n", argc);
-    assert(len > 0);
+    assert(len > 0 && (size_t)len < sizeof(header));
     send_all(fd, header, (size_t)len);
     for (size_t i = 0; i < argc; i++) {
         size_t arg_len = strlen(argv[i]);
         len = snprintf(header, sizeof(header), "$%zu\r\n", arg_len);
-        assert(len > 0);
+        assert(len > 0 && (size_t)len < sizeof(header));
         send_all(fd, header, (size_t)len);
         send_all(fd, argv[i], arg_len);
         send_all(fd, "\r\n", 2u);
     }
+}
+
+static void expect_response(test_client_t* client, const char* expected) {
+    char* response = read_response(client);
+    assert(response != NULL);
+    if (strcmp(response, expected) != 0) {
+        fprintf(stderr, "Expected RESP %s, received %s\n", expected, response);
+    }
+    assert(strcmp(response, expected) == 0);
+    free(response);
 }
 
 typedef struct {
@@ -223,11 +244,28 @@ static void* resp_server_thread(void* arg) {
     return NULL;
 }
 
-static void test_resp_keystone_commands() {
-    printf("Testing RESP Protocol KEYSTONE.INGEST and KEYSTONE.CLASSIFY commands...\n");
+static void test_resp_keystone_commands(void) {
+    printf("Testing authenticated RESP KEYSTONE trust boundaries...\n");
+
+    qihse_user_t* operator_user = qihse_auth_get_user(0);
+    assert(operator_user != NULL);
+    qihse_user_t* guest = qihse_auth_create_user(
+        operator_user,
+        TEST_GUEST_ID,
+        QIHSE_ROLE_GUEST,
+        0,
+        0,
+        TEST_GUEST_PASSWORD,
+        false
+    );
+    assert(guest != NULL);
+    assert(qihse_auth_modify_user(operator_user, TEST_GUEST_ID,
+                                  TEST_GUEST_USERNAME, NULL, -1, -1));
 
     qihse_kv_store_t* store = qihse_kv_store_create();
+    assert(store != NULL);
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo != NULL);
     qihse_cluster_node_t local_node;
     memset(&local_node, 0, sizeof(local_node));
     qihse_cluster_node_id_from_seed("local", 5, local_node.id);
@@ -239,13 +277,14 @@ static void test_resp_keystone_commands() {
     local_node.healthy = true;
 
     uint16_t local_idx = 0;
-    qihse_cluster_topology_upsert_node(topo, &local_node, &local_idx);
-    qihse_cluster_topology_set_local_node(topo, local_idx);
-    qihse_cluster_topology_assign_range(topo, 0, 16383, local_idx);
+    assert(qihse_cluster_topology_upsert_node(topo, &local_node, &local_idx));
+    assert(qihse_cluster_topology_set_local_node(topo, local_idx));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 16383, local_idx));
 
     qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
     qihse_tsdb_t* tsdb = qihse_tsdb_create();
     qihse_column_store_t* columns = qihse_column_store_create();
+    assert(vdb != NULL && tsdb != NULL && columns != NULL);
 
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
@@ -256,7 +295,7 @@ static void test_resp_keystone_commands() {
     config.topology = topo;
     config.local_node_index = local_idx;
     config.port = 0;
-    config.auth_required = false;
+    config.auth_required = true;
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     assert(server != NULL);
@@ -272,35 +311,92 @@ static void test_resp_keystone_commands() {
     memset(&client, 0, sizeof(client));
     client.fd = sockets[0];
 
-    /* Test 1: KEYSTONE.CLASSIFY */
-    const char* classify_cmd[] = { "KEYSTONE.CLASSIFY", "swift wire bank transfer transaction USD 500" };
-    send_command(client.fd, 2, classify_cmd);
-    char* r1 = read_response(&client);
-    assert(r1 != NULL);
-    printf("  -> RESP KEYSTONE.CLASSIFY response:\n%s", r1);
-    assert(r1[0] == '*');
-    free(r1);
+    const char* auth_operator[] = { "AUTH", "GODMODE_OP", TEST_OPERATOR_PASSWORD };
+    send_command(client.fd, 3, auth_operator);
+    expect_response(&client, "+OK\r\n");
 
-    /* Test 2: KEYSTONE.INGEST */
-    const char* ingest_cmd[] = { "KEYSTONE.INGEST", "Victim: breach_user@corp.internal:SecretVaultPass999\n" };
-    send_command(client.fd, 2, ingest_cmd);
-    char* r2 = read_response(&client);
-    assert(r2 != NULL);
-    printf("  -> RESP KEYSTONE.INGEST response:\n%s", r2);
-    assert(strcmp(r2, ":1\r\n") == 0);
-    free(r2);
+    const char* classify_cmd[] = {
+        "KEYSTONE.CLASSIFY",
+        "swift wire bank transfer transaction USD 500"
+    };
+    send_command(client.fd, 2, classify_cmd);
+    char* classify_response = read_response(&client);
+    assert(classify_response != NULL);
+    assert(classify_response[0] == '*');
+    free(classify_response);
+
+    const char* unclassified_ingest[] = {
+        "KEYSTONE.INGEST",
+        "breach_user@corp.internal:SecretVaultPass999\n"
+    };
+    send_command(client.fd, 2, unclassified_ingest);
+    expect_response(&client, ":1\r\n");
+
+    const char* clearance_overflow[] = {
+        "KEYSTONE.INGEST",
+        "overflow_clearance@corp.internal:NoStore\n",
+        "65536"
+    };
+    send_command(client.fd, 3, clearance_overflow);
+    expect_response(&client, "-ERR invalid clearance\r\n");
+
+    const char* compartment_overflow[] = {
+        "KEYSTONE.INGEST",
+        "overflow_compartment@corp.internal:NoStore\n",
+        "0",
+        "65536"
+    };
+    send_command(client.fd, 4, compartment_overflow);
+    expect_response(&client, "-ERR invalid compartment\r\n");
+
+    const char* operator_classified[] = {
+        "KEYSTONE.INGEST",
+        "operator_secret@corp.internal:OpSecret123\n",
+        "3",
+        "1"
+    };
+    send_command(client.fd, 4, operator_classified);
+    expect_response(&client, ":1\r\n");
+    char* operator_secret = qihse_kv_get_user(store,
+                                               "operator_secret@corp.internal",
+                                               operator_user);
+    assert(operator_secret != NULL);
+    free(operator_secret);
+
+    const char* auth_guest[] = { "AUTH", TEST_GUEST_USERNAME, TEST_GUEST_PASSWORD };
+    send_command(client.fd, 3, auth_guest);
+    expect_response(&client, "+OK\r\n");
+
+    const char* guest_classified[] = {
+        "KEYSTONE.INGEST",
+        "guest_denied@corp.internal:ShouldNotPersist\n",
+        "1",
+        "0"
+    };
+    send_command(client.fd, 4, guest_classified);
+    expect_response(&client, ":0\r\n");
+    assert(qihse_kv_get_user(store, "guest_denied@corp.internal", operator_user) == NULL);
 
     close(sockets[0]);
     pthread_join(th, NULL);
     qihse_resp_server_destroy(server);
     qihse_cluster_topology_destroy(topo);
+    qihse_column_store_destroy(columns);
+    qihse_tsdb_destroy(tsdb);
+    qihse_vector_db_destroy(vdb);
     qihse_kv_store_destroy(store);
+    assert(qihse_auth_destroy_user(operator_user, TEST_GUEST_ID));
+
+    printf("  -> RESP principal propagation, denial, and uint16 range checks OK\n");
 }
 
-int main() {
+int main(void) {
     printf("==============================================================\n");
     printf("  QIHSE + KEYSTONE Integration & Ingestion Engine Tests        \n");
     printf("==============================================================\n");
+
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator(TEST_OPERATOR_PASSWORD));
 
     test_micro_model_classification();
     test_anchor_search_performance();

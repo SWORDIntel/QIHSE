@@ -43,10 +43,12 @@ int main() {
     printf("[QIHSE Omni-Test] Testing KV Store with strict clearance masking...\n");
     qihse_kv_store_t* kv = qihse_kv_store_create();
     
-    // Insert data with different clearances
-    qihse_kv_set(kv, "public_key", "public_data", CLASSIF_UNCLASSIFIED, SCI_NONE);
-    qihse_kv_set(kv, "secret_key", "secret_data", CLASSIF_SECRET, SCI_A);
-    qihse_kv_set(kv, "ts_key", "ts_data", CLASSIF_TOP_SECRET, SCI_A | SCI_B);
+    // Insert data with different clearances. Legacy/context-free writes remain
+    // valid only for unclassified data; classified fixtures require an
+    // authoritative principal.
+    assert(qihse_kv_set(kv, "public_key", "public_data", CLASSIF_UNCLASSIFIED, SCI_NONE));
+    assert(qihse_kv_set_user(kv, "secret_key", "secret_data", CLASSIF_SECRET, SCI_A, user_a));
+    assert(qihse_kv_set_user(kv, "ts_key", "ts_data", CLASSIF_TOP_SECRET, SCI_A | SCI_B, user_a));
 
     // Test User C (Unclassified)
     char* val_c1 = qihse_kv_get_user(kv, "public_key", user_c);

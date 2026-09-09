@@ -12,6 +12,12 @@ include Makefile
 SRCS := $(filter-out src/spinnaker/qihse_uwp.c src/spinnaker/qihse_uwp_tls.c,$(SRCS))
 SRCS += src/spinnaker/qihse_uwp_secure.c
 
+# Makefile's libqihse.so prerequisite list is expanded while it is included,
+# before this overlay rewrites SRCS.  Explicitly add the TLS-first wrapper as a
+# library prerequisite so the later-expanded link recipe can never reference an
+# object that make did not build.
+$(LIB_TARGET): src/spinnaker/qihse_uwp_secure.o
+
 # The wrapper includes these implementation files directly, so make must
 # rebuild it when either source changes.
 src/spinnaker/qihse_uwp_secure.o: src/spinnaker/qihse_uwp_secure.c \
