@@ -629,7 +629,7 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
 
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (!store) return;
-    if (store->qdd_ctx) qihse_qdd_free(store->qdd_ctx);
+    if (store->qdd_ctx) qihse_qdd_free(__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE));
     if (store->wal_fd) { flush_wal_buffer(store); fclose(store->wal_fd); }
     if (store->trie) qihse_trinary_trie_destroy(store->trie);
     free(store);
@@ -671,10 +671,14 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return NULL;
-    if (!store->qdd_ctx) store->qdd_ctx = qihse_qdd_init();
-    if (store->qdd_ctx) {
+    if (!store->qdd_ctx) {
+        qihse_quantum_defense_ctx_t* ctx = qihse_qdd_init();
+        __atomic_store_n(&store->qdd_ctx, ctx, __ATOMIC_RELEASE);
+    }
+    qihse_quantum_defense_ctx_t* qdd = __atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE);
+    if (qdd) {
         uint64_t h = 14695981039346656037ULL; h = fnv1a64_update(h, key, strlen(key));
-        qihse_qdd_report_access(store->qdd_ctx, h, "0.0.0.0");
+        qihse_qdd_report_access(qdd, h, "0.0.0.0");
     }
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE || !qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
@@ -901,5 +905,7 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
 
 bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
-    return store && store->qdd_ctx && qihse_qdd_is_under_attack(store->qdd_ctx);
+    if (!store) return false;
+    qihse_quantum_defense_ctx_t* ctx = __atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE);
+    return ctx && qihse_qdd_is_under_attack(ctx);
 }

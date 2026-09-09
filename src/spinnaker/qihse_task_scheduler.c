@@ -152,7 +152,7 @@ bool qihse_task_scheduler_parse_cron_next(
 static void* scheduler_thread_func(void* arg) {
     qihse_task_scheduler_t* sched = (qihse_task_scheduler_t*)arg;
 
-    while (sched->running) {
+    while (__atomic_load_n(&sched->running, __ATOMIC_ACQUIRE)) {
         time_t now_real = time(NULL);
         uint64_t now_mono = get_time_ns();
 
@@ -225,11 +225,11 @@ qihse_task_scheduler_t* qihse_task_scheduler_create(const qihse_task_scheduler_c
 bool qihse_task_scheduler_start(qihse_task_scheduler_t* scheduler) {
     if (!scheduler) return false;
     pthread_mutex_lock(&scheduler->lock);
-    if (scheduler->running) {
+    if (__atomic_load_n(&scheduler->running, __ATOMIC_RELAXED)) {
         pthread_mutex_unlock(&scheduler->lock);
         return true;
     }
-    scheduler->running = true;
+    __atomic_store_n(&scheduler->running, true, __ATOMIC_RELEASE);
     pthread_create(&scheduler->thread, NULL, scheduler_thread_func, scheduler);
     pthread_mutex_unlock(&scheduler->lock);
     return true;
@@ -238,11 +238,11 @@ bool qihse_task_scheduler_start(qihse_task_scheduler_t* scheduler) {
 void qihse_task_scheduler_stop(qihse_task_scheduler_t* scheduler) {
     if (!scheduler) return;
     pthread_mutex_lock(&scheduler->lock);
-    if (!scheduler->running) {
+    if (!__atomic_load_n(&scheduler->running, __ATOMIC_RELAXED)) {
         pthread_mutex_unlock(&scheduler->lock);
         return;
     }
-    scheduler->running = false;
+    __atomic_store_n(&scheduler->running, false, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&scheduler->lock);
     pthread_join(scheduler->thread, NULL);
 }
