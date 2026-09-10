@@ -77,10 +77,27 @@ jobs:
 
     - name: Run Auth Privilege Boundary Regression
       run: |
-        gcc -std=c99 -Wall -Wextra -I. -I./include -I./core \
-          tests/test_auth_privilege_boundary.c -L. -lqihse \
-          -o tests/test_auth_privilege_boundary
-        LD_LIBRARY_PATH=$PWD ./tests/test_auth_privilege_boundary
+        make test-auth-privilege-boundary
+
+    - name: Run Object ACL Regression
+      run: |
+        make test-object-acl
+
+    - name: Run Aggregate Hardening Regression
+      run: |
+        make test-aggregate-hardened
+
+    - name: Run FTS Persistence Authorization Regression
+      run: |
+        make test-fts-persistence-auth
+
+    - name: Run Security Boundary Regressions
+      run: |
+        make -f Makefile -f tests/security-regression.mk test-security-regressions
+
+    - name: Run APT41 Fuzz Testing (ASan & UBSan)
+      run: |
+        make test-apt41
 
     - name: Run Python SDK Tests
       run: |

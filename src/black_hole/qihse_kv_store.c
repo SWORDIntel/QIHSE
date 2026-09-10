@@ -929,55 +929,136 @@ static bool kv_foreach_callback(const char* key, void* value, size_t value_size,
     return ctx->cb(key, p->val, ctx->user_data);
 }
 
+bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
+                           qihse_kv_iter_cb cb, void* user_data) {
+    if (!store || !cb || !compact_sstables_into_memtable(store)) return false;
+    foreach_user_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data, .now = current_time_ms(), .ok = true };
+    qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx); return ctx.ok;
+}
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
-    if (!store || !store->trie || !cb) return;
-    kv_foreach_ctx_t ctx = { cb, user_data, store->trie, current_time_ms() };
-    qihse_trinary_trie_foreach(store->trie, kv_foreach_callback, &ctx);
+    (void)qihse_kv_foreach_user(store, NULL, cb, user_data);
 }
 
-typedef struct {
-    qihse_trinary_trie_t* trie;
-    size_t removed;
-} kv_clear_ctx_t;
-
-static bool kv_clear_callback(const char* key, void* value, size_t value_size, void* user_data) {
-    (void)value; (void)value_size;
-    kv_clear_ctx_t* ctx = (kv_clear_ctx_t*)user_data;
-    if (!key || !ctx) return true;
-    if (qihse_trinary_trie_delete(ctx->trie, key)) ctx->removed++;
+typedef struct { qihse_user_t* user; size_t count; uint64_t now; } count_ctx_t;
+static bool count_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)key; (void)value_size; count_ctx_t* ctx = (count_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !p) return false;
+    if (!payload_is_dead(p, ctx->now) && qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) ctx->count++;
     return true;
 }
-
-size_t qihse_kv_clear(qihse_kv_store_t* store) {
-    if (!store || !store->trie) return 0;
-    kv_clear_ctx_t ctx = { store->trie, 0 };
-    qihse_trinary_trie_foreach(store->trie, kv_clear_callback, &ctx);
-    store->mem_usage = 0;
-    return ctx.removed;
+size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
+    if (!store || !compact_sstables_into_memtable(store)) return 0u;
+    count_ctx_t ctx = { .user = user, .count = 0u, .now = current_time_ms() };
+    qihse_trinary_trie_foreach(store->trie, count_cb, &ctx); return ctx.count;
 }
+size_t qihse_kv_count(qihse_kv_store_t* store) { return qihse_kv_count_user(store, NULL); }
 
-typedef struct {
-    size_t count;
-    uint64_t now;
-    qihse_trinary_trie_t* trie;
-} kv_count_ctx_t;
-
-static bool kv_count_callback(const char* key, void* value, size_t value_size, void* user_data) {
-    (void)value_size; (void)key;
-    kv_count_ctx_t* ctx = (kv_count_ctx_t*)user_data;
-    if (!value || !ctx) return true;
-    kv_payload_t* p = (kv_payload_t*)value;
-    if (p->expire_time_ms > 0 && p->expire_time_ms <= ctx->now) {
-        if (key) qihse_trinary_trie_delete(ctx->trie, key);
-        return true;
+typedef struct { qihse_user_t* user; char** keys; size_t count; size_t cap; uint64_t now; bool ok; } clear_collect_ctx_t;
+static bool clear_collect_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size; clear_collect_ctx_t* ctx = (clear_collect_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !ctx->ok || !key || !p) return false;
+    if (payload_is_dead(p, ctx->now) || !qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
+    if (ctx->count == ctx->cap) {
+        size_t new_cap = ctx->cap ? ctx->cap * 2u : 32u; char** next = (char**)realloc(ctx->keys, new_cap * sizeof(*next));
+        if (!next) { ctx->ok = false; return false; } ctx->keys = next; ctx->cap = new_cap;
     }
-    ctx->count++;
+    ctx->keys[ctx->count] = strdup(key);
+    if (!ctx->keys[ctx->count]) { ctx->ok = false; return false; }
+    ctx->count++; return true;
+}
+size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
+    if (!store || !compact_sstables_into_memtable(store)) return 0u;
+    clear_collect_ctx_t ctx = { .user = user, .now = current_time_ms(), .ok = true };
+    qihse_trinary_trie_foreach(store->trie, clear_collect_cb, &ctx);
+    size_t removed = 0u;
+    if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (qihse_kv_del_user(store, ctx.keys[i], user)) removed++;
+    for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]); free(ctx.keys); return removed;
+}
+size_t qihse_kv_clear(qihse_kv_store_t* store) { return qihse_kv_clear_user(store, NULL); }
+
+typedef struct { qihse_user_t* user; uint64_t now; bool authorized; } export_auth_ctx_t;
+static bool export_auth_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)key; (void)value_size; export_auth_ctx_t* ctx = (export_auth_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !p) return false;
+    if (payload_is_dead(p, ctx->now)) return true;
+    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) { ctx->authorized = false; return false; }
     return true;
 }
+typedef struct { FILE* f; uint64_t now; bool ok; } export_write_ctx_t;
+static bool export_write_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size; export_write_ctx_t* ctx = (export_write_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !ctx->ok || !key || !p) return false;
+    if (payload_is_dead(p, ctx->now)) return true;
+    if (!disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
+    return true;
+}
+int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
+    if (!store || !filepath || !compact_sstables_into_memtable(store)) return -1;
+    export_auth_ctx_t auth = { .user = user, .now = current_time_ms(), .authorized = true };
+    qihse_trinary_trie_foreach(store->trie, export_auth_cb, &auth);
+    if (!auth.authorized) { errno = EACCES; return -2; }
+    char tmp[8192]; FILE* f = NULL;
+    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
+    export_write_ctx_t wr = { .f = f, .now = current_time_ms(), .ok = true };
+    qihse_trinary_trie_foreach(store->trie, export_write_cb, &wr);
+    if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
+    if (!atomic_file_commit(f, tmp, filepath)) return -1;
+    return 0;
+}
+int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_save_user(store, filepath, NULL); }
 
-size_t qihse_kv_count(qihse_kv_store_t* store) {
-    if (!store || !store->trie) return 0;
-    kv_count_ctx_t ctx = { 0, current_time_ms(), store->trie };
-    qihse_trinary_trie_foreach(store->trie, kv_count_callback, &ctx);
-    return ctx.count;
+static bool parse_snapshot_into_trie(const char* filepath, qihse_user_t* user,
+                                     qihse_trinary_trie_t** out_trie, size_t* out_usage) {
+    int fd = open_secure_read(filepath);
+    if (fd < 0) return false;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    qihse_trinary_trie_t* trie = qihse_trinary_trie_create();
+    if (!trie) { fclose(f); return false; }
+    size_t usage = 0u; kv_disk_record_t r; int rc; bool ok = true;
+    while ((rc = disk_record_read(f, &r)) == 1) {
+        if (!qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
+            disk_record_free(&r); errno = EACCES; ok = false; break;
+        }
+        size_t ps = 0u;
+        kv_payload_t* p = payload_create(r.val, r.expire_time_ms, r.classification, r.sci_compartment, r.flags, &ps);
+        if (!p || !qihse_trinary_trie_insert_nocopy(trie, r.key, p, ps)) {
+            free(p); disk_record_free(&r); ok = false; break;
+        }
+        usage += strlen(r.key) + ps; disk_record_free(&r);
+    }
+    if (rc < 0) ok = false;
+    fclose(f);
+    if (!ok) { qihse_trinary_trie_destroy(trie); return false; }
+    *out_trie = trie; if (out_usage) *out_usage = usage; return true;
+}
+
+int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
+    if (!store || !filepath) return -1;
+    qihse_trinary_trie_t* replacement = NULL; size_t replacement_usage = 0u;
+    if (!parse_snapshot_into_trie(filepath, user, &replacement, &replacement_usage))
+        return errno == EACCES ? -2 : -1;
+    char wal_path[4096], wal_tmp[8192];
+    if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) { qihse_trinary_trie_destroy(replacement); return -1; }
+    FILE* new_wal_tmp = NULL;
+    if (!atomic_file_begin(wal_path, wal_tmp, sizeof(wal_tmp), &new_wal_tmp)) { qihse_trinary_trie_destroy(replacement); return -1; }
+    if (!atomic_file_commit(new_wal_tmp, wal_tmp, wal_path)) { qihse_trinary_trie_destroy(replacement); return -1; }
+    int new_wal_fd = open(wal_path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+    if (new_wal_fd < 0) { qihse_trinary_trie_destroy(replacement); return -1; }
+    FILE* new_wal = fdopen(new_wal_fd, "ab");
+    if (!new_wal) { close(new_wal_fd); qihse_trinary_trie_destroy(replacement); return -1; }
+    qihse_trinary_trie_t* old = store->trie; FILE* old_wal = store->wal_fd;
+    store->trie = replacement; store->mem_usage = replacement_usage; store->wal_fd = new_wal; store->wal_unflushed_bytes = 0u;
+    if (old_wal) fclose(old_wal); if (old) qihse_trinary_trie_destroy(old);
+    const char* dir = get_qihse_data_dir();
+    if (dir) for (int i = 0; i < store->sstable_counter; i++) {
+        char path[4096]; int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
+        if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
+    }
+    store->sstable_counter = 0; return 0;
+}
+int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
+
+bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
+    return store && store->qdd_ctx && qihse_qdd_is_under_attack(store->qdd_ctx);
 }

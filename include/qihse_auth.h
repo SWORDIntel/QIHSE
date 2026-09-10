@@ -72,13 +72,13 @@ bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* ta
 bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
                               uint32_t namespace_id, uint64_t resource_id);
 
-// Check access to an object independently of classification/SCI clearance.
-bool qihse_auth_can_access_object(qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id);
+// Check access to an object requiring specific access flags (QIHSE_ACL_READ, QIHSE_ACL_WRITE, QIHSE_ACL_ADMIN)
+bool qihse_auth_can_access_object(const qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id, uint8_t required_flags);
 
 // Only an OPERATOR may change another user's object ACL.
-bool qihse_auth_grant_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
                              uint32_t namespace_id, uint64_t resource_id, uint8_t access_flags);
-bool qihse_auth_revoke_object(qihse_user_t* operator_user, qihse_user_t* target_user,
+bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
                               uint32_t namespace_id, uint64_t resource_id);
 
 bool qihse_auth_is_operator_password_default(void);
@@ -110,9 +110,6 @@ void qihse_auth_rate_limit_reset(uint32_t source_ip);
 void qihse_auth_rate_limit_cleanup(void);
 
 // --- IP-based auth rate limiting (brute-force protection) -------------------
-// Defaults: 5 attempts per 60 seconds per source IP. The limiter is
-// lazy-initialized on first use and can also be initialized explicitly via
-// qihse_auth_init_rate_limiter().
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC  60
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES 1024
@@ -120,14 +117,8 @@ void qihse_auth_rate_limit_cleanup(void);
 void qihse_auth_init_rate_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
 void qihse_auth_shutdown_rate_limiter(void);
 
-// Returns true if an auth attempt from source_ip is allowed, false if it is
-// rate-limited. Each call increments the per-IP attempt counter.
 bool qihse_auth_check_rate_limit(uint32_t source_ip);
-
-// Reset the per-IP counter (call on successful authentication).
 void qihse_auth_rate_limit_reset(uint32_t source_ip);
-
-// Remove stale entries from the rate limiter (safe to call periodically).
 void qihse_auth_rate_limit_cleanup(void);
 
 #ifdef __cplusplus
