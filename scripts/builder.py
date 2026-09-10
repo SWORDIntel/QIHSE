@@ -90,7 +90,7 @@ def section(title: str) -> None:
 
 def success_box(msg: str) -> None:
     """Green rounded box for success messages."""
-    inner = WIDTH - 4
+    inner = WIDTH - 2
     top    = f"╭{'─' * inner}╮"
     bottom = f"╰{'─' * inner}╯"
     print(f"\n  {c(top, GREEN)}")
@@ -99,7 +99,7 @@ def success_box(msg: str) -> None:
 
 
 def warning_box(lines: list[str]) -> None:
-    inner = WIDTH - 4
+    inner = WIDTH - 2
     top    = f"╭{'─' * inner}╮"
     bottom = f"╰{'─' * inner}╯"
     print(f"\n  {c(top, YELLOW, BOLD)}")

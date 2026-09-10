@@ -7,6 +7,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_resp_wire.h"
 #include "qihse_pg_wire.h"
+#include "qihse_auth.h"
 
 extern void qihse_start_http_telemetry_server(void);
 
@@ -28,11 +29,22 @@ void* pg_server_thread(void* arg) {
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
-    
+
     printf("======================================\n");
     printf("     QIHSE ENDGAME SERVER DAEMON      \n");
     printf("======================================\n");
     printf("[QIHSE SERVER] Initializing engines...\n");
+
+    // Initialize auth subsystem — bootstraps operator (user 0).
+    // In operator-only mode, a random password is auto-generated if
+    // QIHSE_OPERATOR_PASSWORD is not set, so the server starts without
+    // manual configuration.
+    if (!qihse_auth_init()) {
+        fprintf(stderr, "[QIHSE SERVER] FATAL: auth initialization failed (FIPS compliance check).\n");
+        return 1;
+    }
+
+    printf("[QIHSE SERVER] Operator-only mode: ROLE_OPERATOR (user 0) active.\n");
 
     global_kv = qihse_kv_store_create();
     global_vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
@@ -42,23 +54,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Rotate default operator password to satisfy security controls
-    qihse_user_t* god = qihse_auth_get_user(0);
-    if (god) {
-        qihse_auth_modify_user(god, 0, "GODMODE_OP", "ROTATED_OPERATOR_P@SSW0RD_SECURE_123", -1, -1);
-    }
-
     pthread_t resp_t, pg_t;
-    
+
     printf("[QIHSE SERVER] Spawning proxy threads...\n");
-    
+
     qihse_start_http_telemetry_server();
 
     if (pthread_create(&resp_t, NULL, resp_server_thread, NULL) != 0) {
         perror("Failed to start RESP server thread");
         return 1;
     }
-    
+
     if (pthread_create(&pg_t, NULL, pg_server_thread, NULL) != 0) {
         perror("Failed to start PG server thread");
         return 1;

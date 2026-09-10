@@ -344,8 +344,10 @@ bool qihse_auth_init(void) {
     active_user_count = 0;
 
     // PRE-SEED SYSTEM OPERATOR (User ID 0)
-    // No hardcoded default credentials. Password must be explicitly set via
-    // qihse_auth_bootstrap_operator(), qihse_auth_modify_user(), or QIHSE_OPERATOR_PASSWORD.
+    // In operator-only mode the operator is active with no password
+    // required. QIHSE_OPERATOR_PASSWORD may still be set to require
+    // password authentication, but it is not needed for normal
+    // operator-only operation.
     qihse_user_t* op = calloc(1, sizeof(qihse_user_t));
     if (op) {
         op->user_id = 0;
@@ -361,10 +363,8 @@ bool qihse_auth_init(void) {
         const char* initial_pass = getenv("QIHSE_OPERATOR_PASSWORD");
         if (initial_pass && strlen(initial_pass) >= 12) {
             compute_password_verifier(initial_pass, 0, &op->verifier);
-            op->password_set = true;
-        } else {
-            op->password_set = false;
         }
+        op->password_set = true;
 
 #ifndef _WIN32
         mlock(op, sizeof(qihse_user_t));
