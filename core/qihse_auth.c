@@ -921,14 +921,6 @@ qihse_user_t* qihse_auth_authenticate_id_from(uint32_t source_ip, uint32_t user_
     return authenticate_user_internal(source_ip, user_id, password);
 }
 
-qihse_user_t* qihse_auth_authenticate(const char* username, const char* password) {
-    return qihse_auth_authenticate_from(0, username, password);
-}
-
-qihse_user_t* qihse_auth_authenticate_id_from(uint32_t source_ip, uint32_t user_id, const char* password) {
-    return authenticate_user_internal(source_ip, user_id, password);
-}
-
 qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password) {
     return authenticate_user_internal(0, user_id, password);
 }
