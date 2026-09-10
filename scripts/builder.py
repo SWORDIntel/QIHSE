@@ -375,30 +375,76 @@ def install_opt(dest: Path) -> None:
           f"{c('Data preserved:', DIM)} {len(list((dest / 'data').glob('*')))} files")
 
 
-def setup_alias(alias_name: str, dest: Path) -> None:
-    """Export an env var alias pointing at dest, offer to persist it."""
-    section("ALIAS")
-    info(f"{c(alias_name, CYAN)} = {c(str(dest), WHITE)}")
-    print(f"\n  {c('export', DIM)} {alias_name}={dest}")
+def detect_shell_configs() -> list[Path]:
+    """Find all shell config files that exist."""
+    home = Path.home()
+    candidates = [
+        home / ".bashrc",
+        home / ".zshrc",
+        home / ".config" / "fish" / "config.fish",
+        home / ".profile",
+        home / ".bash_profile",
+    ]
+    return [c for c in candidates if c.exists()]
 
-    # Offer to persist in shell config
-    if input(f"\n  {c('◆', RED)} {c('Persist in shell config?', WHITE)} [y/N] ").strip().lower() in ("y", "yes"):
-        added = False
-        for rc in (Path.home() / ".bashrc", Path.home() / ".zshrc"):
-            if rc.exists():
-                existing = rc.read_text()
-                line = f"export {alias_name}={dest}"
-                if line not in existing:
-                    rc.open("a").write(f"\n# {alias_name} — set by QIHSE builder\n{line}\n")
-                    ok(f"Added to {rc}")
-                    added = True
-                else:
-                    ok(f"Already in {rc}")
-        if not added:
-            rc = Path.home() / ".bashrc"
-            rc.open("a").write(f"\n# {alias_name} — set by QIHSE builder\nexport {alias_name}={dest}\n")
-            ok(f"Created {rc}")
-        warn(f"Run: {c('source ~/.bashrc', CYAN)}  or start a new shell")
+
+def setup_integration(alias_name: str, dest: Path, project: str) -> None:
+    """Set up env var alias, PATH, LD_LIBRARY_PATH, PKG_CONFIG_PATH, and
+    offer to persist across all auto-detected shell configs."""
+    section("INTEGRATION")
+
+    shell_rcs = detect_shell_configs()
+    if shell_rcs:
+        info(f"Detected shell configs: {c(', '.join(str(r.relative_to(Path.home())) for r in shell_rcs), CYAN)}")
+    else:
+        warn("No shell configs detected")
+
+    # Build the export block
+    exports = []
+    exports.append(f"export {alias_name}={dest}")
+    exports.append(f"export PATH=\"{dest}/bin:$PATH\"")
+    exports.append(f"export LD_LIBRARY_PATH=\"{dest}/lib:$LD_LIBRARY_PATH\"")
+    exports.append(f"export PKG_CONFIG_PATH=\"{dest}/lib/pkgconfig:$PKG_CONFIG_PATH\"")
+    exports.append(f"export CMAKE_PREFIX_PATH=\"{dest}:$CMAKE_PREFIX_PATH\"")
+
+    info(f"{c(alias_name, CYAN)} = {c(str(dest), WHITE)}")
+    print()
+    for e in exports:
+        print(f"  {c(e, DIM)}")
+    print()
+
+    # Offer to persist
+    if not shell_rcs:
+        return
+    if input(f"  {c('◆', RED)} {c('Persist in shell configs?', WHITE)} [Y/n] ").strip().lower() in ("n", "no"):
+        return
+
+    block = f"\n# {alias_name} — set by {project} builder\n" + "\n".join(exports) + "\n"
+    for rc in shell_rcs:
+        existing = rc.read_text()
+        if f"export {alias_name}=" not in existing:
+            rc.open("a").write(block)
+            ok(f"Added to {c(str(rc.relative_to(Path.home())), CYAN)}")
+        else:
+            ok(f"Already in {c(str(rc.relative_to(Path.home())), CYAN)}")
+
+    # Offer ld.so.conf.d for system-wide lib resolution
+    if input(f"\n  {c('◆', RED)} {c('Add to ld.so.conf.d (system-wide)?', WHITE)} [y/N] ").strip().lower() in ("y", "yes"):
+        conf = Path("/etc/ld.so.conf.d") / f"{project.lower()}.conf"
+        try:
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(f"{dest}/lib\n")
+            run(["ldconfig"], check=False)
+            ok(f"Written {conf} and ran ldconfig")
+        except PermissionError:
+            warn("Needs root, trying with sudo...")
+            run(["sudo", "tee", str(conf)], check=False, shell=False)
+            run(["sudo", "ldconfig"], check=False)
+            ok(f"Written {conf} via sudo")
+
+    # Source hint
+    rcs_str = "  ".join(f"source ~/{rc.relative_to(Path.home())}" for rc in shell_rcs)
+    warn(f"Run: {c(rcs_str, CYAN)}  or start a new shell")
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -470,7 +516,7 @@ def main() -> None:
     # Install to output path
     if input(f"\n  {c('◆', RED)} {c(f'Install to {out_path}?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
         install_opt(out_path)
-        setup_alias(alias_name, out_path)
+        setup_integration(alias_name, out_path, "QIHSE")
 
     done_line = c("Done.", GREEN, BOLD) + "  " + c("QIHSE build complete.", DIM)
     inner_w = WIDTH - 4
