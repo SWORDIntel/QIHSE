@@ -285,6 +285,10 @@ test-aggregate-hardened: lib
 	$(CC) $(CFLAGS) -o tests/test_aggregate_hardened tests/test_aggregate_hardened.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aggregate_hardened
 
+test-operator-mode: lib
+	$(CC) $(CFLAGS) -o tests/test_operator_mode tests/test_operator_mode.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_operator_mode
+
 test-uwp-regression: tests/test_uwp_regression
 	LD_LIBRARY_PATH=. ./tests/test_uwp_regression
 

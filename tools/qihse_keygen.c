@@ -41,24 +41,30 @@ static int bind_operator_password(const char *out_dir) {
         return 0;
     }
 
-    /* Write operator password to file */
-    char path[512];
-    snprintf(path, sizeof(path), "%s/operator_password.key", out_dir);
-    FILE *f = fopen(path, "wb");
+    /* Store operator key securely in ~/.ssh/ with chmod 600 */
+    const char *home = getenv("HOME");
+    if (!home || *home == '\0') home = "/root";
+
+    char ssh_dir[512];
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    mkdir(ssh_dir, 0700);
+
+    char key_path[512];
+    snprintf(key_path, sizeof(key_path), "%s/.ssh/qihse_operator_key", home);
+    FILE *f = fopen(key_path, "wb");
     if (!f) {
-        fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", path);
+        fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", key_path);
         return 0;
     }
     fwrite(pass, 1, sizeof(pass), f);
     fclose(f);
-    chmod(path, 0600);
+    chmod(key_path, 0600);
 
-    fprintf(stderr, "[QIHSE keygen] Operator password written: %s\n", path);
+    fprintf(stderr, "[QIHSE keygen] Operator key stored: %s (chmod 600)\n", key_path);
 
     /* Sign with Yubikey if present */
     if (yubikey_present()) {
-        fprintf(stderr, "[QIHSE keygen] Yubikey detected — signing operator password via PIV...\n");
-        /* Hash the password and sign with the Yubikey's PIV slot 9c */
+        fprintf(stderr, "[QIHSE keygen] Yubikey detected — signing operator key via PIV...\n");
         unsigned char hash[32];
         EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
         EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
@@ -66,16 +72,14 @@ static int bind_operator_password(const char *out_dir) {
         EVP_DigestFinal_ex(mdctx, hash, NULL);
         EVP_MD_CTX_free(mdctx);
 
-        /* Write hash to temp file for yubico-piv-tool */
         char hash_path[512];
-        snprintf(hash_path, sizeof(hash_path), "%s/.op_hash.tmp", out_dir);
+        snprintf(hash_path, sizeof(hash_path), "%s/.ssh/.qihse_op_hash.tmp", home);
         f = fopen(hash_path, "wb");
         if (f) {
             fwrite(hash, 1, 32, f);
             fclose(f);
-            /* Sign with PIV slot 9c (digital signature) */
             char sig_path[512];
-            snprintf(sig_path, sizeof(sig_path), "%s/operator_password.sig", out_dir);
+            snprintf(sig_path, sizeof(sig_path), "%s/.ssh/qihse_operator_key.sig", home);
             char cmd[1024];
             snprintf(cmd, sizeof(cmd),
                      "yubico-piv-tool -a sign -s 9c -i %s -o %s 2>/dev/null",
@@ -83,13 +87,14 @@ static int bind_operator_password(const char *out_dir) {
             int sign_rc = system(cmd);
             unlink(hash_path);
             if (sign_rc == 0) {
-                fprintf(stderr, "[QIHSE keygen] Operator password signed via Yubikey PIV slot 9c.\n");
+                chmod(sig_path, 0600);
+                fprintf(stderr, "[QIHSE keygen] Operator key signed via Yubikey PIV slot 9c.\n");
             } else {
-                fprintf(stderr, "[QIHSE keygen] Yubikey sign failed — password generated but unsigned.\n");
+                fprintf(stderr, "[QIHSE keygen] Yubikey sign failed — key generated but unsigned.\n");
             }
         }
     } else {
-        fprintf(stderr, "[QIHSE keygen] No Yubikey/HSM detected — password generated but unsigned.\n");
+        fprintf(stderr, "[QIHSE keygen] No Yubikey/HSM detected — key generated but unsigned.\n");
     }
 
     OPENSSL_cleanse(pass, sizeof(pass));
@@ -121,10 +126,10 @@ int main(int argc, char *argv[]) {
     /* Create output directory if it doesn't exist */
     mkdir(out_dir, 0755);
 
-    fprintf(stderr, "┌─────────────────────────────────────────────────────┐\n");
-    fprintf(stderr, "│  QIHSE CNSA 2.0 Key Generation                     │\n");
-    fprintf(stderr, "│  ML-KEM-1024 (FIPS 203) + ML-DSA-87 (FIPS 204)    │\n");
-    fprintf(stderr, "└─────────────────────────────────────────────────────┘\n");
+    fprintf(stderr, "┌──────────────────────────────────────────────────────────────┐\n");
+    fprintf(stderr, "│  QIHSE CNSA 2.0 Key Generation                               │\n");
+    fprintf(stderr, "│  ML-KEM-1024 (FIPS 203) + ML-DSA-87 (FIPS 204)               │\n");
+    fprintf(stderr, "└──────────────────────────────────────────────────────────────┘\n");
 
     /* Load FIPS provider if available, fall back to default */
     int fips_active = qihse_pqc_init_providers();
@@ -144,22 +149,35 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Summary box — 64 chars wide, 62 inner */
+    /* Truncate path to fit if needed */
+    char display_path[33];
+    if (strlen(out_dir) > 32) {
+        strncpy(display_path, out_dir, 29);
+        display_path[29] = '~';
+        display_path[30] = '.';
+        display_path[31] = '.';
+        display_path[32] = '\0';
+    } else {
+        strncpy(display_path, out_dir, 32);
+        display_path[32] = '\0';
+    }
     fprintf(stderr, "\n");
-    fprintf(stderr, "┌─────────────────────────────────────────────────────┐\n");
-    fprintf(stderr, "│  Complete. Files written to: %-22s│\n", out_dir);
-    fprintf(stderr, "│                                                     │\n");
-    fprintf(stderr, "│  Algorithm      Private key         Public key      │\n");
-    fprintf(stderr, "│  ───────────    ─────────────────   ──────────────  │\n");
-    fprintf(stderr, "│  ML-KEM-1024    qihse_kem_key.pem  qihse_kem_pub   │\n");
-    fprintf(stderr, "│  ML-DSA-87      qihse_dsa_key.pem  qihse_dsa_pub   │\n");
+    fprintf(stderr, "┌──────────────────────────────────────────────────────────────┐\n");
+    fprintf(stderr, "│  Complete. Files written to: %-32s│\n", display_path);
+    fprintf(stderr, "│                                                              │\n");
+    fprintf(stderr, "│  Algorithm      Private key            Public key            │\n");
+    fprintf(stderr, "│  ───────────    ──────────────────     ──────────────        │\n");
+    fprintf(stderr, "│  ML-KEM-1024    qihse_kem_key.pem      qihse_kem_pub.pem     │\n");
+    fprintf(stderr, "│  ML-DSA-87      qihse_dsa_key.pem      qihse_dsa_pub.pem     │\n");
     if (do_bind_operator)
-    fprintf(stderr, "│  Operator       operator_password.key (chmod 600)  │\n");
-    fprintf(stderr, "│                                                     │\n");
+    fprintf(stderr, "│  Operator       ~/.ssh/qihse_operator_key (chmod 600)        │\n");
+    fprintf(stderr, "│                                                              │\n");
     if (fips_active)
-    fprintf(stderr, "│  ✓ Generated via FIPS 140-3 validated module.       │\n");
+    fprintf(stderr, "│  ✓ Generated via FIPS 140-3 validated module.                │\n");
     else
-    fprintf(stderr, "│  ⚠ FIPS module not active — standard provider used. │\n");
-    fprintf(stderr, "└─────────────────────────────────────────────────────┘\n");
+    fprintf(stderr, "│  ⚠ FIPS module not active — standard provider used.           │\n");
+    fprintf(stderr, "└──────────────────────────────────────────────────────────────┘\n");
 
     return 0;
 }
