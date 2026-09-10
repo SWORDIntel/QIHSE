@@ -493,6 +493,20 @@ test-pqc: lib
 	$(CC) $(CFLAGS) -o tests/test_pqc_e2e tests/test_pqc_e2e.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. QIHSE_ENABLE_PQC=1 ./tests/test_pqc_e2e
 
+.PHONY: test-distance-dispatch test-exact-search-parity
+test: test-distance-dispatch test-exact-search-parity
+
+test-distance-dispatch:
+	$(CC) $(CFLAGS) -o tests/test_distance_dispatch \
+	    tests/test_distance_dispatch.c backends/cpu/qihse_cpu_distance.c \
+	    backends/cpu/qihse_cpu_detect.c -lm -pthread
+	./tests/test_distance_dispatch
+
+test-exact-search-parity: lib
+	$(CC) $(CFLAGS) -o tests/test_exact_search_parity \
+	    tests/test_exact_search_parity.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_exact_search_parity
+
 test-trinary-codec:
 	$(CC) $(CFLAGS) -o tests/qihse_trinary_codec_test \
 	    tests/qihse_trinary_codec_test.c \

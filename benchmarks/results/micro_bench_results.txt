@@ -1,0 +1,55 @@
+================================================================================
+QIHSE Micro-Benchmark Harness
+================================================================================
+
+--- Exact Search: Distance Metrics ---
+exact-search-cosine (1000x128, k=10)    : mean= 185.826 us  p50=  84.080 us  p95= 128.076 us  p99= 443.802 us  n=1600  ci95=[110.199, 261.454] us
+exact-search-dotproduct (1000x128, k=10): mean= 113.951 us  p50=  67.598 us  p95=  98.642 us  p99= 407.189 us  n=1600  ci95=[78.358, 149.544] us
+exact-search-euclidean (1000x128, k=10) : mean= 374.591 us  p50=  81.202 us  p95= 148.008 us  p99=4388.461 us  n=1600  ci95=[65.565, 683.617] us
+exact-search-cosine (10000x128, k=10)   : mean=1565.533 us  p50=1107.541 us  p95=3573.040 us  p99=7534.969 us  n=640  ci95=[1424.922, 1706.144] us
+exact-search-dotproduct (10000x128, k=10): mean=1390.940 us  p50= 926.465 us  p95=3218.554 us  p99=5445.450 us  n=640  ci95=[1108.499, 1673.381] us
+exact-search-euclidean (10000x128, k=10): mean=1449.435 us  p50=1041.529 us  p95=3649.038 us  p99=6950.483 us  n=640  ci95=[1348.129, 1550.742] us
+exact-search-cosine (100000x128, k=10)  : mean=22258.639 us  p50=14864.549 us  p95=69693.626 us  p99=204980.696 us  n=80  ci95=[16903.425, 27613.854] us
+exact-search-dotproduct (100000x128, k=10): mean=16853.031 us  p50=13124.593 us  p95=35134.026 us  p99=84018.174 us  n=80  ci95=[14551.634, 19154.428] us
+exact-search-euclidean (100000x128, k=10): mean=26234.226 us  p50=14135.549 us  p95=60219.162 us  p99=612865.432 us  n=80  ci95=[11496.945, 40971.507] us
+
+--- Batch Search Throughput ---
+batch-search (10000x128, batch=32)      : mean=47209.373 us  p50=36170.643 us  p95=161700.359 us  p99=161700.359 us  n=20  ci95=[32877.332, 61541.413] us
+serial-search (10000x128, batch=32)     : mean=46214.181 us  p50=36213.482 us  p95=145911.173 us  p99=145911.173 us  n=20  ci95=[34064.269, 58364.093] us
+batch-search (100000x128, batch=64)     : mean=1548486.863 us  p50=1676109.713 us  p95=2027490.235 us  p99=2027490.235 us  n=10  ci95=[1328851.015, 1768122.711] us
+serial-search (100000x128, batch=64)    : mean=1391552.520 us  p50=1334385.385 us  p95=1995104.548 us  p99=1995104.548 us  n=10  ci95=[1198544.855, 1584560.184] us
+
+--- Hybrid Search (RRF Fusion) ---
+hybrid-rrf (10000x128, k=10)            : mean=2211.861 us  p50=2058.716 us  p95=4153.680 us  p99=4153.680 us  n=20  ci95=[1960.352, 2463.370] us
+hybrid-rrf (100000x128, k=10)           : mean=25391.794 us  p50=24776.436 us  p95=37219.740 us  p99=37219.740 us  n=10  ci95=[22852.586, 27931.001] us
+
+--- INT8 Scalar Quantization ---
+int8-build (1000x128)                          : build_time= 1.120 ms
+int8-search (1000x128, k=10)            : mean= 297.262 us  p50= 293.218 us  p95= 338.404 us  p99= 338.404 us  n=20  ci95=[292.249, 302.275] us
+int8-build (10000x128)                          : build_time= 12.223 ms
+int8-search (10000x128, k=10)           : mean=3218.950 us  p50=3123.197 us  p95=5097.919 us  p99=5097.919 us  n=20  ci95=[3011.229, 3426.670] us
+int8-build (100000x128)                          : build_time= 191.563 ms
+int8-search (100000x128, k=10)          : mean=36569.048 us  p50=35730.236 us  p95=43726.916 us  p99=43726.916 us  n=5  ci95=[32769.161, 40368.936] us
+
+--- Graph Index Candidate Selection ---
+graph-build (1000x128)                          : build_time= 374.966 ms
+graph-search (1000x128, k=10)           : mean=  79.853 us  p50=  78.676 us  p95=  89.275 us  p99=  89.275 us  n=20  ci95=[78.552, 81.155] us
+graph-build (10000x128)                          : build_time= 40855.620 ms
+graph-search (10000x128, k=10)          : mean= 888.135 us  p50= 867.984 us  p95=1079.017 us  p99=1079.017 us  n=10  ci95=[826.629, 949.641] us
+
+--- Metadata Filtering ---
+metadata-filtered (10000x128, match=10%): mean= 624.813 us  p50= 495.251 us  p95=1697.161 us  p99=1697.161 us  n=20  ci95=[481.361, 768.266] us
+unfiltered (10000x128)                  : mean=1151.794 us  p50=1003.442 us  p95=4033.467 us  p99=4033.467 us  n=20  ci95=[846.731, 1456.857] us
+metadata-filtered (100000x128, match=5%): mean=6071.413 us  p50=5624.872 us  p95=8610.901 us  p99=8610.901 us  n=10  ci95=[5355.542, 6787.284] us
+unfiltered (100000x128)                 : mean=13766.061 us  p50=13668.414 us  p95=17876.840 us  p99=17876.840 us  n=10  ci95=[12760.235, 14771.888] us
+
+--- Trinary Candidate Selection ---
+trinary-scalar (10000x128, cand=100)    : mean=3057.402 us  p50=2798.774 us  p95=4774.599 us  p99=4774.599 us  n=20  ci95=[2798.237, 3316.568] us
+trinary-magnitude (10000x128, cand=100) : mean=5242.581 us  p50=2645.395 us  p95=50912.206 us  p99=50912.206 us  n=20  ci95=[637.513, 9847.649] us
+exact-float32 (10000x128, k=10)         : mean=1378.178 us  p50=1225.746 us  p95=2892.983 us  p99=2892.983 us  n=20  ci95=[1202.051, 1554.306] us
+trinary-scalar (100000x128, cand=500)   : mean=31353.958 us  p50=30261.017 us  p95=36578.404 us  p99=36578.404 us  n=10  ci95=[29432.924, 33274.991] us
+trinary-magnitude (100000x128, cand=500): mean=112003.928 us  p50=28809.896 us  p95=812980.736 us  p99=812980.736 us  n=10  ci95=[-33083.577, 257091.432] us
+exact-float32 (100000x128, k=10)        : mean=16983.501 us  p50=13326.603 us  p95=35271.021 us  p99=35271.021 us  n=10  ci95=[12477.375, 21489.628] us
+
+================================================================================
+Benchmark complete.

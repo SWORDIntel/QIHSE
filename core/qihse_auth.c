@@ -675,6 +675,16 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
         return true; /* Unclassified data allowed when unauthenticated */
     }
 
+    /* Fast path: unclassified data is accessible to any authenticated caller.
+     * Consistent with the NULL-user path above — unclassified data is already
+     * open to unauthenticated callers, so any authenticated user trivially
+     * passes the clearance (0 <= any level) and SCI (0 ⊆ any compartments)
+     * checks.  This avoids a per-row rwlock acquisition during search over
+     * unclassified datasets, which is the common case for vector search. */
+    if (data_classif == 0 && data_sci == 0) {
+        return true;
+    }
+
     pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid = 0xFFFFFFFF;
     authz_state_t authz;
@@ -715,7 +725,16 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
     }
 
     pthread_rwlock_unlock(&auth_rwlock);
-    qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
+    /* Only audit-log granted access to classified data, consistent with the
+     * operator path (which logs only when data_classif > 0) and the NULL-user
+     * path (which skips logging for unclassified data).  Logging every row of
+     * an unclassified search would generate one ML-DSA-87 signature per row,
+     * making multi-tenant search impractically slow without adding security
+     * value — unclassified access is already permitted to unauthenticated
+     * callers by design. */
+    if (data_classif > 0 || data_sci != 0) {
+        qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
+    }
     return true;
 }
 

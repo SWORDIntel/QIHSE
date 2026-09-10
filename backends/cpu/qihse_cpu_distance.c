@@ -377,6 +377,11 @@ static void qihse_distance_init_once(void) {
 /* -------------------------------------------------------------------------- */
 /* Public API */
 /* -------------------------------------------------------------------------- */
+qihse_distance_functions_t qihse_distance_resolve(void) {
+    pthread_once(&g_init_once, qihse_distance_init_once);
+    return (qihse_distance_functions_t){g_cosine_fn, g_dot_fn, g_euclidean_fn};
+}
+
 float qihse_distance_cosine(const float* a, const float* b, size_t dims) {
     pthread_once(&g_init_once, qihse_distance_init_once);
     return g_cosine_fn(a, b, dims);
