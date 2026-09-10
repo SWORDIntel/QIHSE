@@ -9,6 +9,7 @@ Theme: SWORD cyber-dark (#08080a bg, #e50000 accent, Share Tech Mono spirit).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shlex
@@ -50,8 +51,19 @@ WHITE  = "\033[97m"
 GREEN  = "\033[32m"
 YELLOW = "\033[33m"
 GRAY   = "\033[38;5;240m"
+DIMRED = "\033[38;5;52m"    # dark red for logo
 
 WIDTH = 80
+
+# ── SWORDIntel logo (12x6 ASCII, from sword_logo.png) ──────────────────
+SWORD_LOGO = [
+    "███▓▓▓▓▓▓███",
+    "██▓░░█▓░░▓██",
+    "█▓▓░▓█▓░░▓▓█",
+    "█▓▓▓███▓░▓▓█",
+    "██▓▓░▓▓░▓▓██",
+    "███▓▓▓▓▓▓███",
+]
 
 
 def c(text: str, *colors: str) -> str:
@@ -74,6 +86,16 @@ def banner(title: str) -> None:
 def section(title: str) -> None:
     print(f"\n  {c('◆', RED)} {c(title, RED, BOLD)}")
     print(f"  {c('─' * (WIDTH - 2), GRAY)}")
+
+
+def success_box(msg: str) -> None:
+    """Green rounded box for success messages."""
+    inner = WIDTH - 4
+    top    = f"╭{'─' * inner}╮"
+    bottom = f"╰{'─' * inner}╯"
+    print(f"\n  {c(top, GREEN)}")
+    print(f"  {c('│', GREEN)} {pad_right(msg, inner - 2)} {c('│', GREEN)}")
+    print(f"  {c(bottom, GREEN)}")
 
 
 def warning_box(lines: list[str]) -> None:
@@ -738,13 +760,22 @@ def setup_integration(alias_name: str, dest: Path, project: str) -> None:
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="QIHSE builder", add_help=False)
+    parser.add_argument("--arch", default=None, help="Override -march target")
+    parser.add_argument("--cores", type=int, default=None, help="Compile cores (-j)")
+    parser.add_argument("--goal", default=None, help="Build goal (all/lib/keygen/server/build)")
+    parser.add_argument("--output", default=None, help="Output path")
+    parser.add_argument("--clean", action="store_true", help="Clean before build")
+    parser.add_argument("--modify", action="store_true", help="Show interactive menus")
+    parser.add_argument("-h", "--help", action="help", help="Show options")
+    args = parser.parse_args()
+
     banner("Q I H S E")
     feat = detect_cpu()
 
     section("ARCHITECTURE DETECTION")
     info(f"CPU:    {c(feat['model'], WHITE)}")
     info(f"Arch:   {c(feat['arch'], CYAN)}  ISA: {c(arch_label(feat), CYAN)}")
-    # Show all detected ISA features
     feat_names = []
     for k, label in [
         ("sse42", "SSE42"), ("avx", "AVX"), ("avx2", "AVX2"), ("fma", "FMA"),
@@ -762,72 +793,87 @@ def main() -> None:
     # Provision deps
     provision_deps()
 
-    # Target menu with AVX-512 submenu
-    while True:
-        arch_choice = menu("Build target (architecture)", TARGETS, "1")
-        _, arch_desc, march_override = TARGETS[arch_choice]
-        if march_override == "SUBMENU":
-            sub_choice = menu("AVX-512 family", AVX512_TARGETS, "1")
-            _, sub_desc, sub_march = AVX512_TARGETS[sub_choice]
-            if sub_march is None:
-                continue  # Back to main menu
-            arch_desc = sub_desc
-            march_override = sub_march
-        break
+    # Defaults — native arch, half cores, repo root, default alias
+    march = None  # native
+    arch_desc = "Auto-detect (march=native)"
+    march_override = None
+    build_choice = "1"
+    build_desc = BUILD_TARGETS["1"][1]
+    out_path = Path(args.output).expanduser().resolve() if args.output else ROOT
+    alias_name = "QIHSE_DB"
+    clean = args.clean
+    total_cores = os.cpu_count() or 4
+    jobs = args.cores if args.cores else max(1, total_cores // 2)
 
-    # Cross-compile warning
-    if arch_choice != "1":
-        warning_box([
-            c("⚠  CROSS-COMPILATION WARNING", YELLOW, BOLD),
-            "",
-            f"  You selected: {arch_desc}",
-            f"  Your CPU ISA:  {arch_label(feat)}",
-            "",
-            "  Building for a different architecture than this",
-            "  CPU means the binaries may NOT run on this PC.",
-            "  Use this only when deploying to another machine.",
-            "",
-            "  If unsure, select [1] Auto-detect (march=native).",
-        ])
-        if safe_input(f"  {c('◆', RED)} {c('Proceed anyway?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
-            warn("Aborted — no changes made.")
+    # Apply CLI overrides
+    if args.goal:
+        for k, v in BUILD_TARGETS.items():
+            if v[0] == args.goal:
+                build_choice = k
+                build_desc = v[1]
+                break
+
+    # Interactive menus only if --modify flag
+    if args.modify:
+        while True:
+            arch_choice = menu("Build target (architecture)", TARGETS, "1")
+            _, arch_desc, march_override = TARGETS[arch_choice]
+            if march_override == "SUBMENU":
+                sub_choice = menu("AVX-512 family", AVX512_TARGETS, "1")
+                _, sub_desc, sub_march = AVX512_TARGETS[sub_choice]
+                if sub_march is None:
+                    continue
+                arch_desc = sub_desc
+                march_override = sub_march
+            break
+
+        if arch_choice != "1":
+            warning_box([
+                c("⚠  CROSS-COMPILATION WARNING", YELLOW, BOLD),
+                "",
+                f"  You selected: {arch_desc}",
+                f"  Your CPU ISA:  {arch_label(feat)}",
+                "",
+                "  Building for a different architecture than this",
+                "  CPU means the binaries may NOT run on this PC.",
+                "  Use this only when deploying to another machine.",
+                "",
+                "  If unsure, select [1] Auto-detect (march=native).",
+            ])
+            if safe_input(f"  {c('◆', RED)} {c('Proceed anyway?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
+                warn("Aborted — no changes made.")
+                sys.exit(0)
+
+        AVX512_MARCHES = {"skylake-avx512", "icelake-server", "cooperlake",
+                          "sapphirerapids", "emeraldrapids", "graniterapids", "x86-64-v4"}
+        if not hybrid_warning(feat, march_override in AVX512_MARCHES):
             sys.exit(0)
 
-    # Hybrid CPU warning — AVX-512 on P-cores only
-    AVX512_MARCHES = {"skylake-avx512", "icelake-server", "cooperlake",
-                      "sapphirerapids", "emeraldrapids", "graniterapids", "x86-64-v4"}
-    selected_has_avx512 = march_override in AVX512_MARCHES
-    if not hybrid_warning(feat, selected_has_avx512):
-        sys.exit(0)
+        build_choice = menu("Build target (make goal)", BUILD_TARGETS, "1")
+        _, build_desc = BUILD_TARGETS[build_choice]
 
-    build_choice = menu("Build target (make goal)", BUILD_TARGETS, "1")
-    _, build_desc = BUILD_TARGETS[build_choice]
+        section("OUTPUT PATH")
+        default_out = str(ROOT)
+        out_input = safe_input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
+        out_path = Path(out_input).expanduser().resolve() if out_input else Path(default_out)
 
-    # Output path
-    section("OUTPUT PATH")
-    default_out = str(ROOT)
-    out_input = safe_input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
-    out_path = Path(out_input).expanduser().resolve() if out_input else Path(default_out)
+        default_alias = "QIHSE_DB"
+        alias_input = safe_input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
+        alias_name = alias_input.upper() if alias_input else default_alias
 
-    # Alias
-    default_alias = "QIHSE_DB"
-    alias_input = safe_input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
-    alias_name = alias_input.upper() if alias_input else default_alias
+        clean = safe_input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
+        default_jobs = total_cores // 2
+        jobs_input = safe_input(f"  {c('◆', RED)} {c('Compile cores (-j)', WHITE)} [{c(str(default_jobs), DIM)}]: ").strip()
+        try:
+            jobs = int(jobs_input) if jobs_input else default_jobs
+            if jobs < 1:
+                jobs = 1
+        except ValueError:
+            jobs = default_jobs
 
-    clean = safe_input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
-    default_jobs = os.cpu_count() or 4
-    jobs_input = safe_input(f"  {c('◆', RED)} {c('Compile cores (-j)', WHITE)} [{c(str(default_jobs), DIM)}]: ").strip()
-    try:
-        jobs = int(jobs_input) if jobs_input else default_jobs
-        if jobs < 1:
-            jobs = 1
-    except ValueError:
-        warn(f"Invalid core count: {jobs_input!r} — using {default_jobs}")
-        jobs = default_jobs
+    march = march_override if march_override else (args.arch if args.arch else None)
 
-    march = march_override  # None means native
-
-    # Summary box
+    # Summary — review and confirm
     section("BUILD SUMMARY")
     info(f"Architecture:  {c(arch_desc, CYAN)}")
     info(f"Build goal:    {c(build_desc, CYAN)}")
@@ -835,18 +881,27 @@ def main() -> None:
     info(f"Output path:   {c(str(out_path), CYAN)}")
     info(f"Alias:         {c(alias_name, CYAN)} → {c(str(out_path), DIM)}")
 
+    # Single review prompt — Enter to build, m to modify
+    review = safe_input(f"\n  {c('◆', RED)} {c('Press Enter to build, or m for menus', WHITE)} ").strip().lower()
+    if review == "m":
+        sys.argv.extend(["--modify"])
+        main()
+        return
+
     build(march, BUILD_TARGETS[build_choice][0], clean, jobs, feat=feat)
 
-    # Install to output path
-    if safe_input(f"\n  {c('◆', RED)} {c(f'Install to {out_path}?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
-        install_opt(out_path)
-        setup_integration(alias_name, out_path, "QIHSE")
+    # Auto-install
+    install_opt(out_path)
+    setup_integration(alias_name, out_path, "QIHSE")
 
     done_line = c("Done.", GREEN, BOLD) + "  " + c("QIHSE build complete.", DIM)
-    inner_w = WIDTH - 4
-    print(f"\n  {c('╭' + '─' * (WIDTH - 2) + '╮', GREEN)}")
-    print(f"  {c('│', GREEN)} {pad_right(done_line, inner_w)} {c('│', GREEN)}")
-    print(f"  {c('╰' + '─' * (WIDTH - 2) + '╯', GREEN)}\n")
+    success_box(done_line)
+
+    # SWORDIntel logo — unobtrusive bottom-left
+    print()
+    for line in SWORD_LOGO:
+        print(f"  {c(line, DIMRED, DIM)}")
+    print(f"  {c('S W O R D I n t e l', DIMRED, DIM)}")
 
 
 if __name__ == "__main__":
