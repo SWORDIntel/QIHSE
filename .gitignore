@@ -3,6 +3,8 @@
 *.o
 *.a
 *.egg-info/
+bin/
+lib/
 /qihse-server
 /qihse_keygen
 /test_mldsa
@@ -17,6 +19,9 @@
 /tests/qihse_server
 /tests/qihse_cluster_*
 /benchmarks/qihse_*_bench
+
+# Generated headers
+/include/qihse/
 
 # Root-level patch/fix scripts (one-time use)
 /patch_*.py
@@ -50,11 +55,19 @@
 # Test data and databases
 /data/
 
+# Python SDK runtime data and logs
+/python/data/
+/python/qihse_audit.log
+/python/qihse_integrity.chain
+
 # SDK Python artifacts
 /sdks/python/build/
 /sdks/python/*.so
 /sdks/python/sstable_*.db
 /sdks/python/wal.log
+/sdks/python/data/
+/sdks/python/qihse_audit.log
+/sdks/python/qihse_integrity.chain
 /sdks/python/__pycache__/
 /sdks/python/test_python.py
 .qihse_auth_cache.dat
