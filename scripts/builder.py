@@ -815,7 +815,15 @@ def main() -> None:
     alias_name = alias_input.upper() if alias_input else default_alias
 
     clean = safe_input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
-    jobs = os.cpu_count() or 4
+    default_jobs = os.cpu_count() or 4
+    jobs_input = safe_input(f"  {c('◆', RED)} {c('Compile cores (-j)', WHITE)} [{c(str(default_jobs), DIM)}]: ").strip()
+    try:
+        jobs = int(jobs_input) if jobs_input else default_jobs
+        if jobs < 1:
+            jobs = 1
+    except ValueError:
+        warn(f"Invalid core count: {jobs_input!r} — using {default_jobs}")
+        jobs = default_jobs
 
     march = march_override  # None means native
 
