@@ -328,14 +328,14 @@ def build(march: str | None, target: str, clean: bool, jobs: int) -> None:
         sys.exit(rc)
 
 
-def install_opt() -> None:
-    """Install built artifacts to /opt/qihse."""
-    banner("INSTALL → /opt/qihse")
-    dest = Path("/opt/qihse")
+def install_opt(dest: Path) -> None:
+    """Install built artifacts to dest."""
+    banner(f"INSTALL → {dest}")
     if not dest.exists():
-        warn("/opt/qihse does not exist, creating (needs sudo)...")
-        run(["sudo", "mkdir", "-p", str(dest / "bin"), str(dest / "lib"), str(dest / "include" / "qihse")])
-        run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dest)])
+        warn(f"{dest} does not exist, creating...")
+        dest.mkdir(parents=True, exist_ok=True)
+    for sub in ("bin", "lib", Path("include") / "qihse"):
+        (dest / sub).mkdir(parents=True, exist_ok=True)
 
     lib = ROOT / "libqihse.so"
     keygen = ROOT / "qihse_keygen"
@@ -373,6 +373,32 @@ def install_opt() -> None:
 
     print(f"\n  {c('Keys preserved:', DIM)} {len(list((dest / 'keys').glob('*')))} files  "
           f"{c('Data preserved:', DIM)} {len(list((dest / 'data').glob('*')))} files")
+
+
+def setup_alias(alias_name: str, dest: Path) -> None:
+    """Export an env var alias pointing at dest, offer to persist it."""
+    section("ALIAS")
+    info(f"{c(alias_name, CYAN)} = {c(str(dest), WHITE)}")
+    print(f"\n  {c('export', DIM)} {alias_name}={dest}")
+
+    # Offer to persist in shell config
+    if input(f"\n  {c('◆', RED)} {c('Persist in shell config?', WHITE)} [y/N] ").strip().lower() in ("y", "yes"):
+        added = False
+        for rc in (Path.home() / ".bashrc", Path.home() / ".zshrc"):
+            if rc.exists():
+                existing = rc.read_text()
+                line = f"export {alias_name}={dest}"
+                if line not in existing:
+                    rc.open("a").write(f"\n# {alias_name} — set by QIHSE builder\n{line}\n")
+                    ok(f"Added to {rc}")
+                    added = True
+                else:
+                    ok(f"Already in {rc}")
+        if not added:
+            rc = Path.home() / ".bashrc"
+            rc.open("a").write(f"\n# {alias_name} — set by QIHSE builder\nexport {alias_name}={dest}\n")
+            ok(f"Created {rc}")
+        warn(f"Run: {c('source ~/.bashrc', CYAN)}  or start a new shell")
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -415,6 +441,17 @@ def main() -> None:
     build_choice = menu("Build target (make goal)", BUILD_TARGETS, "1")
     _, build_desc = BUILD_TARGETS[build_choice]
 
+    # Output path
+    section("OUTPUT PATH")
+    default_out = str(ROOT)
+    out_input = input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
+    out_path = Path(out_input).expanduser().resolve() if out_input else Path(default_out)
+
+    # Alias
+    default_alias = "QIHSE_DB"
+    alias_input = input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
+    alias_name = alias_input.upper() if alias_input else default_alias
+
     clean = input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
     jobs = os.cpu_count() or 4
 
@@ -425,13 +462,15 @@ def main() -> None:
     info(f"Architecture:  {c(arch_desc, CYAN)}")
     info(f"Build goal:    {c(build_desc, CYAN)}")
     info(f"Clean:         {c('yes' if clean else 'no', CYAN)}   Jobs: {c(str(jobs), CYAN)}")
-    info(f"Output:        {c(str(ROOT / 'libqihse.so'), DIM)}")
+    info(f"Output path:   {c(str(out_path), CYAN)}")
+    info(f"Alias:         {c(alias_name, CYAN)} → {c(str(out_path), DIM)}")
 
     build(march, BUILD_TARGETS[build_choice][0], clean, jobs)
 
-    # Offer install
-    if input(f"\n  {c('◆', RED)} {c('Install to /opt/qihse?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
-        install_opt()
+    # Install to output path
+    if input(f"\n  {c('◆', RED)} {c(f'Install to {out_path}?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
+        install_opt(out_path)
+        setup_alias(alias_name, out_path)
 
     done_line = c("Done.", GREEN, BOLD) + "  " + c("QIHSE build complete.", DIM)
     inner_w = WIDTH - 4
