@@ -53,7 +53,7 @@ GREEN  = "\033[32m"
 YELLOW = "\033[33m"
 GRAY   = "\033[38;5;240m"
 
-WIDTH = 63
+WIDTH = 80
 
 
 def c(text: str, *colors: str) -> str:
@@ -232,33 +232,79 @@ def detect_cpu() -> dict:
     feat = {
         "arch": arch,
         "model": model,
+        # SSE / AVX baseline
         "sse42": "sse4_2" in flags,
         "avx": "avx" in flags,
         "avx2": "avx2" in flags,
+        "fma": "fma" in flags,
+        "f16c": "f16c" in flags,
+        "aesni": "aes" in flags,
+        # AVX-VNNI (separate from AVX-512 VNNI)
+        "avx_vnni": "avx_vnni" in flags,
+        "avx_vnni_int8": "avx_vnni_int8" in flags,
+        "avx_vnni_int16": "avx_vnni_int16" in flags,
+        # AVX-512 foundation + subsets
         "avx512f": "avx512f" in flags,
         "avx512dq": "avx512dq" in flags,
         "avx512bw": "avx512bw" in flags,
         "avx512vl": "avx512vl" in flags,
-        "aesni": "aes" in flags,
-        "fma": "fma" in flags,
-        "amx": "amx_tile" in flags,
-        "vnni": "avx512_vnni" in flags,
-        "f16c": "f16c" in flags,
+        "avx512cd": "avx512cd" in flags,
+        "avx512_ifma": "avx512ifma" in flags,
+        "avx512_vbmi": "avx512vbmi" in flags,
+        "avx512_vbmi2": "avx512vbmi2" in flags,
+        "avx512_vpopcntdq": "avx512vpopcntdq" in flags,
+        "avx512_vnni": "avx512_vnni" in flags,
+        "avx512_bf16": "avx512_bf16" in flags,
+        "avx512_fp16": "avx512fp16" in flags,
+        "avx512_vp2intersect": "avx512_vp2intersect" in flags,
+        # AMX
+        "amx_tile": "amx_tile" in flags,
+        "amx_int8": "amx_int8" in flags,
+        "amx_bf16": "amx_bf16" in flags,
+        "amx_fp16": "amx_fp16" in flags,
+        # Other modern
+        "avx_ne_convert": "avx_ne_convert" in flags,
+        "avx_ifma": "avxifma" in flags,
     }
     feat["avx512"] = all(feat[k] for k in ("avx512f", "avx512dq", "avx512bw", "avx512vl"))
+    feat["amx"] = feat["amx_tile"] and (feat["amx_int8"] or feat["amx_bf16"])
+    feat["vnni"] = feat["avx512_vnni"] or feat["avx_vnni"]
     return feat
 
 
 def arch_label(feat: dict) -> str:
+    """Human-readable ISA label showing the highest supported level."""
+    parts = []
     if feat["avx512"]:
-        return "AVX-512"
-    if feat["avx2"]:
-        return "AVX2"
-    if feat["avx"]:
-        return "AVX1"
-    if feat["sse42"]:
-        return "SSE4.2"
-    return "scalar"
+        parts.append("AVX-512")
+        if feat["avx512_bf16"]:
+            parts.append("BF16")
+        if feat["avx512_fp16"]:
+            parts.append("FP16")
+        if feat["avx512_vnni"]:
+            parts.append("VNNI")
+        if feat["avx512_vbmi"]:
+            parts.append("VBMI")
+        if feat["avx512_ifma"]:
+            parts.append("IFMA")
+    if feat["amx"]:
+        parts.append("AMX")
+        if feat["amx_fp16"]:
+            parts.append("AMX-FP16")
+    if feat["avx_vnni"] and not feat["avx512"]:
+        parts.append("AVX-VNNI")
+    if not parts:
+        if feat["avx2"]:
+            parts.append("AVX2")
+        elif feat["avx"]:
+            parts.append("AVX1")
+        elif feat["sse42"]:
+            parts.append("SSE4.2")
+        else:
+            parts.append("scalar")
+    if feat["fma"] and "AVX2" in parts:
+        parts.append("FMA")
+    return "+".join(parts)
 
 
 def default_march(feat: dict) -> str:
@@ -271,10 +317,23 @@ def default_march(feat: dict) -> str:
 TARGETS = {
     "1": ("native",  "Auto-detect (march=native)", None),
     "2": ("sandy",   "Sandy Bridge (-march=sandybridge)", "sandybridge"),
-    "3": ("haswell", "Haswell AVX2 (-march=haswell)", "haswell"),
-    "4": ("skylake", "Skylake AVX-512 (-march=skylake-avx512)", "skylake-avx512"),
-    "5": ("generic", "Generic x86-64 (-march=x86-64-v2)", "x86-64-v2"),
-    "6": ("scalar",  "Scalar only (no SIMD)", "x86-64"),
+    "3": ("haswell", "Haswell AVX2+FMA (-march=haswell)", "haswell"),
+    "4": ("alder",   "Alder Lake AVX-VNNI (-march=alderlake)", "alderlake"),
+    "5": ("avx512",  "AVX-512 family → submenu", "SUBMENU"),
+    "6": ("generic_v2", "Generic x86-64-v2 (-march=x86-64-v2)", "x86-64-v2"),
+    "7": ("generic_v3", "Generic x86-64-v3 (-march=x86-64-v3)", "x86-64-v3"),
+    "8": ("generic_v4", "Generic x86-64-v4 (-march=x86-64-v4)", "x86-64-v4"),
+    "9": ("scalar",  "Scalar only (-march=x86-64)", "x86-64"),
+}
+
+AVX512_TARGETS = {
+    "1": ("skylake",   "Skylake-SP — F+DQ+BW+VL+CD (-march=skylake-avx512)", "skylake-avx512"),
+    "2": ("icelake",   "Ice Lake — +IFMA+VBMI+VPOPCNTDQ+VNNI (-march=icelake-server)", "icelake-server"),
+    "3": ("cooperlake", "Cooper Lake — +BF16 (-march=cooperlake)", "cooperlake"),
+    "4": ("sapphirerapids", "Sapphire Rapids — +BF16+AMX-INT8/BF16 (-march=sapphirerapids)", "sapphirerapids"),
+    "5": ("emeraldrapids", "Emerald Rapids — +AMX (-march=emeraldrapids)", "emeraldrapids"),
+    "6": ("graniterapids", "Granite Rapids — +AMX-FP16+AVX-VNNIINT8 (-march=graniterapids)", "graniterapids"),
+    "7": ("back",      "← Back to main menu", None),
 }
 
 BUILD_TARGETS = {
@@ -558,15 +617,36 @@ def main() -> None:
     section("ARCHITECTURE DETECTION")
     info(f"CPU:    {c(feat['model'], WHITE)}")
     info(f"Arch:   {c(feat['arch'], CYAN)}  ISA: {c(arch_label(feat), CYAN)}")
-    feats = [k.upper() for k in ("sse42", "avx", "avx2", "avx512", "aesni", "fma", "amx", "vnni", "f16c") if feat[k]]
-    info(f"Flags:  {c(' '.join(feats), DIM)}")
+    # Show all detected ISA features
+    feat_names = []
+    for k, label in [
+        ("sse42", "SSE42"), ("avx", "AVX"), ("avx2", "AVX2"), ("fma", "FMA"),
+        ("f16c", "F16C"), ("aesni", "AESNI"),
+        ("avx_vnni", "AVX-VNNI"), ("avx_vnni_int8", "AVX-VNNI-INT8"),
+        ("avx512", "AVX512"), ("avx512_bf16", "BF16"), ("avx512_fp16", "FP16"),
+        ("avx512_vnni", "VNNI"), ("avx512_vbmi", "VBMI"), ("avx512_ifma", "IFMA"),
+        ("amx", "AMX"), ("amx_int8", "AMX-INT8"), ("amx_bf16", "AMX-BF16"),
+        ("amx_fp16", "AMX-FP16"), ("avx_ne_convert", "NE-CONVERT"),
+    ]:
+        if feat.get(k):
+            feat_names.append(label)
+    info(f"Flags:  {c(' '.join(feat_names), DIM)}")
 
     # Provision deps
     provision_deps()
 
-    # Target menu
-    arch_choice = menu("Build target (architecture)", TARGETS, "1")
-    _, arch_desc, march_override = TARGETS[arch_choice]
+    # Target menu with AVX-512 submenu
+    while True:
+        arch_choice = menu("Build target (architecture)", TARGETS, "1")
+        _, arch_desc, march_override = TARGETS[arch_choice]
+        if march_override == "SUBMENU":
+            sub_choice = menu("AVX-512 family", AVX512_TARGETS, "1")
+            _, sub_desc, sub_march = AVX512_TARGETS[sub_choice]
+            if sub_march is None:
+                continue  # Back to main menu
+            arch_desc = sub_desc
+            march_override = sub_march
+        break
 
     # Cross-compile warning
     if arch_choice != "1":
