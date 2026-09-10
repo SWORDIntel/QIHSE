@@ -53,7 +53,7 @@ YELLOW = "\033[33m"
 GRAY   = "\033[38;5;240m"
 DIMRED = "\033[38;5;52m"    # dark red for logo
 
-WIDTH = 80
+WIDTH = 100
 
 # ── SWORDIntel logo (12x6 ASCII, from sword_logo.png) ──────────────────
 SWORD_LOGO = [
