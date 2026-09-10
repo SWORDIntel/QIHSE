@@ -728,6 +728,20 @@ def install_opt(dest: Path) -> None:
         link.symlink_to("lib/libqihse.so")
         ok(f"symlink → {dest}/libqihse.so")
 
+    # Symlink /opt/qihse/lib → dest/lib
+    opt_lib = Path("/opt/qihse/lib")
+    try:
+        opt_lib.parent.mkdir(parents=True, exist_ok=True)
+        if opt_lib.exists() and opt_lib.is_symlink():
+            opt_lib.unlink()
+        elif opt_lib.exists() and not opt_lib.is_symlink():
+            shutil.rmtree(opt_lib)
+        if not opt_lib.exists():
+            opt_lib.symlink_to(dest / "lib")
+            ok(f"/opt/qihse/lib → {dest}/lib/ (symlink)")
+    except (OSError, PermissionError):
+        warn(f"Could not create /opt/qihse/lib symlink")
+
     # Show preserved data dirs if they exist
     keys_dir = dest / "keys"
     data_dir = dest / "data"
