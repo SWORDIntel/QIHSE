@@ -220,6 +220,33 @@ def run(cmd: list[str] | str, cwd: Path | None = None, check: bool = True,
     return rc
 
 
+# Valid -march values for validation
+VALID_MARCHES = {
+    "native", "sandybridge", "haswell", "alderlake",
+    "skylake-avx512", "icelake-server", "cooperlake",
+    "sapphirerapids", "emeraldrapids", "graniterapids",
+    "x86-64", "x86-64-v2", "x86-64-v3", "x86-64-v4",
+}
+
+
+def validate_march(value: str) -> str:
+    """Validate -march value against known safe identifiers."""
+    if not re.match(r'^[a-z0-9.-]+$', value):
+        fail(f"Invalid --arch value: {value!r} — only [a-z0-9.-] allowed")
+        sys.exit(1)
+    if value not in VALID_MARCHES:
+        warn(f"Unknown --arch value: {value!r} — proceeding (not in known list)")
+    return value
+
+
+def validate_alias(name: str) -> str:
+    """Validate shell alias name to prevent injection."""
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        fail(f"Invalid alias name: {name!r} — must be [A-Za-z_][A-Za-z0-9_]*")
+        sys.exit(1)
+    return name
+
+
 # ── Architecture detection ─────────────────────────────────────────────
 
 def detect_cpu() -> dict:
@@ -382,11 +409,6 @@ def arch_label(feat: dict) -> str:
     if feat["fma"] and "AVX2" in parts:
         parts.append("FMA")
     return "+".join(parts)
-
-
-def default_march(feat: dict) -> str:
-    """Pick a safe -march for the detected CPU."""
-    return "native"
 
 
 # ── Target menu (cross-compile override) ───────────────────────────────
@@ -576,7 +598,15 @@ def build(march: str | None, target: str, clean: bool, jobs: int,
     except KeyboardInterrupt:
         if proc:
             proc.terminate()
-            proc.wait()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        stop_progress(success=False)
+        raise
+    except Exception:
+        if proc and proc.poll() is None:
+            proc.kill()
         stop_progress(success=False)
         raise
     finally:
@@ -658,8 +688,13 @@ def install_opt(dest: Path) -> None:
         link.symlink_to("lib/libqihse.so")
         ok(f"symlink → {dest}/libqihse.so")
 
-    print(f"\n  {c('Keys preserved:', DIM)} {len(list((dest / 'keys').glob('*')))} files  "
-          f"{c('Data preserved:', DIM)} {len(list((dest / 'data').glob('*')))} files")
+    # Show preserved data dirs if they exist
+    keys_dir = dest / "keys"
+    data_dir = dest / "data"
+    keys_count = len(list(keys_dir.glob("*"))) if keys_dir.exists() else 0
+    data_count = len(list(data_dir.glob("*"))) if data_dir.exists() else 0
+    print(f"\n  {c('Keys preserved:', DIM)} {keys_count} files  "
+          f"{c('Data preserved:', DIM)} {data_count} files")
 
 
 def detect_shell_configs() -> list[Path]:
@@ -770,6 +805,10 @@ def main() -> None:
     parser.add_argument("-h", "--help", action="help", help="Show options")
     args = parser.parse_args()
 
+    # Validate CLI inputs early
+    if args.arch:
+        validate_march(args.arch)
+
     banner("Q I H S E")
     feat = detect_cpu()
 
@@ -860,7 +899,7 @@ def main() -> None:
 
         default_alias = "QIHSE_DB"
         alias_input = safe_input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
-        alias_name = alias_input.upper() if alias_input else default_alias
+        alias_name = validate_alias(alias_input.upper()) if alias_input else default_alias
 
         clean = safe_input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
         default_jobs = total_cores // 2
