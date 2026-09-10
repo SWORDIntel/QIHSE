@@ -793,13 +793,14 @@ def main() -> None:
     # Provision deps
     provision_deps()
 
-    # Defaults — native arch, half cores, repo root, default alias
+    # Defaults — native arch, half cores, ZFS db dir, default alias
     march = None  # native
     arch_desc = "Auto-detect (march=native)"
     march_override = None
     build_choice = "1"
     build_desc = BUILD_TARGETS["1"][1]
-    out_path = Path(args.output).expanduser().resolve() if args.output else ROOT
+    default_out = "/rpool/data/db/qihse"
+    out_path = Path(args.output).expanduser().resolve() if args.output else Path(default_out)
     alias_name = "QIHSE_DB"
     clean = args.clean
     total_cores = os.cpu_count() or 4
@@ -853,7 +854,7 @@ def main() -> None:
         _, build_desc = BUILD_TARGETS[build_choice]
 
         section("OUTPUT PATH")
-        default_out = str(ROOT)
+        default_out = "/rpool/data/db/qihse"
         out_input = safe_input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
         out_path = Path(out_input).expanduser().resolve() if out_input else Path(default_out)
 
