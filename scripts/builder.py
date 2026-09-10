@@ -162,6 +162,46 @@ def countdown_prompt(prompt: str, seconds: int = 5) -> bool:
     return result
 
 
+def hsm_bind_prompt(seconds: int = 5) -> bool:
+    """5s countdown asking to validate via FIPS Yubikey/HSM to bind
+    the operator password. Defaults to SKIP (no) for normal operation."""
+    import select
+    import termios
+    import tty
+
+    prompt = "Validate via FIPS Yubikey/HSM to bind operator password?"
+    old = None
+    try:
+        old = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    except (termios.error, AttributeError):
+        print(f"  {c('◆', RED)} {prompt} [y/{c('N', RED)}] {c('(auto-skip)', DIM)}")
+        return False
+
+    result = False
+    try:
+        for i in range(seconds, 0, -1):
+            sys.stdout.write(f"\r  {c('◆', RED)} {prompt} [y/{c('N', RED)}] {c(f'auto-skip in {i}s', YELLOW)}  ")
+            sys.stdout.flush()
+            r, _, _ = select.select([sys.stdin], [], [], 1.0)
+            if r:
+                ch = sys.stdin.read(1)
+                if ch.lower() == "y":
+                    result = True
+                    break
+                elif ch.lower() == "n" or ch in ("\n", "\r"):
+                    result = False
+                    break
+        else:
+            result = False
+    finally:
+        if old:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+    label = c("✓ bind", GREEN) if result else c("✗ skip", DIM)
+    sys.stdout.write(f"\r  {c('◆', RED)} {prompt} [y/{c('N', RED)}] {label}{' ' * 20}\r\n")
+    return result
+
+
 # Progress bar state
 _progress_stop = threading.Event()
 _progress_thread = None
@@ -927,6 +967,29 @@ def main() -> None:
         os.execv(sys.executable, [sys.executable] + sys.argv + ["--modify"])
 
     build(march, BUILD_TARGETS[build_choice][0], clean, jobs, feat=feat)
+
+    # HSM / Yubikey operator password binding — 5s countdown, default skip
+    section("OPERATOR BINDING")
+    keys_dir = out_path / "keys"
+    keygen_bin = ROOT / "qihse_keygen"
+    if not keygen_bin.exists():
+        keygen_bin = out_path / "bin" / "qihse_keygen"
+    if keygen_bin.exists():
+        info(f"Keygen: {c(str(keygen_bin), CYAN)}")
+        # 5s countdown — default is skip (n) for normal operation
+        bind = hsm_bind_prompt()
+        if bind:
+            keys_dir.mkdir(parents=True, exist_ok=True)
+            info(f"Generating CNSA 2.0 keys + operator password → {c(str(keys_dir), CYAN)}")
+            rc = run([str(keygen_bin), str(keys_dir), "--bind-operator"], check=False)
+            if rc == 0:
+                ok("Operator password bound — keys written to keys/")
+            else:
+                warn(f"Keygen returned exit {rc} — operator binding skipped")
+        else:
+            info("Operator binding skipped — normal operator-only mode")
+    else:
+        warn("qihse_keygen not found — skipping operator binding")
 
     # Auto-install
     install_opt(out_path)
