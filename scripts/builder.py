@@ -10,13 +10,33 @@ Theme: SWORD cyber-dark (#08080a bg, #e50000 accent, Share Tech Mono spirit).
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    """Length of string excluding ANSI escape codes, counting wide chars as 2."""
+    clean = _ANSI_RE.sub("", s)
+    w = 0
+    for ch in clean:
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ("W", "F") else 1
+    return w
+
+
+def pad_right(s: str, width: int) -> str:
+    """Pad string on the right so its visible width equals width."""
+    vl = visible_len(s)
+    return s + " " * max(0, width - vl)
 
 # ── SWORD cyber-dark ANSI palette ──────────────────────────────────────
 BG     = "\033[48;5;233m"   # #08080a near-black
@@ -31,7 +51,7 @@ GREEN  = "\033[32m"
 YELLOW = "\033[33m"
 GRAY   = "\033[38;5;240m"
 
-WIDTH = 59
+WIDTH = 63
 
 
 def c(text: str, *colors: str) -> str:
@@ -43,7 +63,7 @@ def banner(title: str) -> None:
     top    = f"╭{'─' * inner}╮"
     bottom = f"╰{'─' * inner}╯"
     print(f"\n  {c(top, RED)}")
-    print(f"  {c('│', RED)} {c(title.center(inner - 2), RED, BOLD)} {c('│', RED)}")
+    print(f"  {c('│', RED)} {c(pad_right(title, inner - 2), RED, BOLD)} {c('│', RED)}")
     print(f"  {c(bottom, RED)}")
 
 
@@ -58,7 +78,7 @@ def warning_box(lines: list[str]) -> None:
     bottom = f"╰{'─' * inner}╯"
     print(f"\n  {c(top, YELLOW, BOLD)}")
     for line in lines:
-        print(f"  {c('│', YELLOW, BOLD)} {line.ljust(inner - 2)} {c('│', YELLOW, BOLD)}")
+        print(f"  {c('│', YELLOW, BOLD)} {pad_right(line, inner - 2)} {c('│', YELLOW, BOLD)}")
     print(f"  {c(bottom, YELLOW, BOLD)}")
 
 
@@ -378,9 +398,9 @@ def main() -> None:
             f"  You selected: {arch_desc}",
             f"  Your CPU ISA:  {arch_label(feat)}",
             "",
-            "  Building for a different architecture than this CPU",
-            "  means the resulting binaries may NOT run on this PC.",
-            "  Use this only when deploying to a different target machine.",
+            "  Building for a different architecture than this",
+            "  CPU means the binaries may NOT run on this PC.",
+            "  Use this only when deploying to another machine.",
             "",
             "  If unsure, select [1] Auto-detect (march=native).",
         ])
@@ -409,9 +429,11 @@ def main() -> None:
     if input(f"\n  {c('◆', RED)} {c('Install to /opt/qihse?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
         install_opt()
 
-    print(f"\n  {c('╭───────────────────────────────────────────────────╮', GREEN)}")
-    print(f"  {c('│', GREEN)} {c('Done.', GREEN, BOLD)}  {c('QIHSE build complete.', DIM)}{'':>16} {c('│', GREEN)}")
-    print(f"  {c('╰───────────────────────────────────────────────────╯', GREEN)}\n")
+    done_line = c("Done.", GREEN, BOLD) + "  " + c("QIHSE build complete.", DIM)
+    inner_w = WIDTH - 4
+    print(f"\n  {c('╭' + '─' * (WIDTH - 2) + '╮', GREEN)}")
+    print(f"  {c('│', GREEN)} {pad_right(done_line, inner_w)} {c('│', GREEN)}")
+    print(f"  {c('╰' + '─' * (WIDTH - 2) + '╯', GREEN)}\n")
 
 
 if __name__ == "__main__":
