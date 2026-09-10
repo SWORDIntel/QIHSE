@@ -154,6 +154,12 @@ Security functionality includes:
 - protocol metrics and audit paths
 - sanitizer, fuzz, and concurrency regression coverage
 - post-quantum cryptographic primitives in configured `.qdb` container workflows
+- CNSA 2.0 key generation (ML-KEM-1024 + ML-DSA-87) via native C keygen
+- optional operator password binding via FIPS YubiKey/HSM PIV slot 9c
+- operator key stored securely in `~/.ssh/qihse_operator_key` (chmod 600)
+- `.ssh` directory enforced at chmod 700
+- normal operator-only mode requires no manually configured password
+- five-second builder HSM prompt defaults to skip for noninteractive operation
 
 Security claims and limitations are documented separately because they change faster than the architectural overview. See [Security](security/README.md), [UWP cryptographic design](security/UWP_CRYPTO_DESIGN.md), and the [August 2026 UWP audit](security/UWP_AUDIT_2026-08.md).
 

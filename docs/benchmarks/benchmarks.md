@@ -160,3 +160,65 @@ To profile the unified integration between QIHSE and KEYSTONE, the dedicated tes
 | **Pillar 4: Neural Context Inference** | **370,749 infer/s** (2.55 µs)<br>Inlined Dense SAXPY C Kernel (260 $\to$ 64 $\to$ 6) | **ONNX Runtime (CPU)**: ~35,000 infer/s (28 µs)<br>**PyTorch LibTorch**: ~5,000 infer/s (200 µs) | **10.5x faster inference** vs ONNX Runtime<br>**74.0x faster** vs PyTorch LibTorch |
 | **Pillar 5: Hybrid Multimodal Search** | **1,838 queries/s** (501 µs)<br>In-Memory BM25 + HNSW + Neural Masking | **OpenSearch Hybrid**: ~120 QPS (8.3 ms)<br>**Weaviate Hybrid**: ~200 QPS (5.0 ms) | **16.5x lower latency** vs OpenSearch<br>**10.0x lower latency** vs Weaviate |
 
+---
+
+## 6. KEYSTONE Trigram Index — SSE4.2 + Algorithmic Speedups
+
+The trigram inverted index that powers Pillar 5's BM25 full-text path
+received genuine SIMD and algorithmic optimizations on the Sandy Bridge
+target hardware (SSE4.2 + AVX1, no AVX2/AVX-512).
+
+### Optimizations
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │              TRIGRAM INDEX PIPELINE                     │
+  │                                                         │
+  │  INGEST          SSE4.2 batch trigram extraction        │
+  │  (build)         14 trigrams per 16-byte load           │
+  │                   ↓                                     │
+  │                   Per-doc bitmap dedup (2MB, O(unique)) │
+  │                   Skip redundant hash lookups           │
+  │                   ↓                                     │
+  │                   Fibonacci hash: (key*0x9E3779B1)>>s   │
+  │                   2 ops vs FNV-1a's 6                   │
+  │                   ↓                                     │
+  │                   Split hash table:                     │
+  │                   4B keys (L2-resident) + ptr on match  │
+  │                   ↓                                     │
+  │                   Shared counting sort (O(n+k))         │
+  │                   Single alloc, reused per list         │
+  │                                                         │
+  │  SEARCH          Galloping intersection + SIMD 4-way    │
+  │  (query)         _mm_cmpeq_epi32 for lists < 64         │
+  │                   ↓                                     │
+  │                   Dual-byte SSE4.2 memmem               │
+  │                   First+last byte, 16-wide, ANDed       │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Benchmark Results (1MB / 10MB / 100MB / 1GB corpora)
+
+| Corpus | Docs | Brute-force | Build | Trigram Search | Speedup | Rejection |
+|--------|------|-------------|-------|----------------|---------|-----------|
+| 1 MB | 256 | 1.26 ms | 0.12s | 0.017 ms | 77x | 98.05% |
+| 10 MB | 2,560 | 23.83 ms | 1.16s | 0.024 ms | 1,002x | 99.80% |
+| 100 MB | 25,600 | 99.50 ms | 11.62s | 0.141 ms | 705x | 99.80% |
+| 1 GB | 262,144 | 1,021 ms | 111.30s | 0.976 ms | 1,046x | 99.98% |
+
+```
+  Speedup over Brute-Force (log scale)
+
+  1 MB   │  ████                                          77x
+  10 MB  │  ████████████████████                      1,002x
+  100 MB │  ██████████████████████████████              705x
+  1 GB   │  ████████████████████████████████████     1,046x
+         └──────────────────────────────────────────────
+```
+
+Search latency scales sublinearly: 1GB corpus (1024x more data) searches
+in only 57x more time. The index rejects 99.98% of documents at 1GB,
+so verification cost grows with matches, not corpus size.
+
+Full details: [KEYSTONE TRIGRAM_BENCHMARK.md](../../KEYSTONE/docs/TRIGRAM_BENCHMARK.md)
+
