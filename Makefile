@@ -181,13 +181,14 @@ redis-cluster-bootstrap: lib
 keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c
 	@echo "Building qihse_keygen..."
 	$(CC) -std=c99 -Wall -Wextra -O2 -fPIC \
+	    -DQIHSE_KEY_DIR='""' \
 	    -I. -I./persistence -I./include \
 	    -o qihse_keygen \
 	    tools/qihse_keygen.c \
 	    persistence/qihse_pqc_crypto.c \
 	    -lssl -lcrypto -lpthread
 	@echo "qihse_keygen build successful"
-	@echo "  Usage: ./qihse_keygen [output-dir]"
+	@echo "  Usage: ./qihse_keygen [output-dir]  (default: /opt/qihse/keys)"
 
 xdp-kern: src/networking/qihse_xdp_kern.c
 	@echo "Building eBPF XDP kernel object..."

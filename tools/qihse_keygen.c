@@ -8,16 +8,31 @@
  * If the OpenSSL FIPS provider is installed, keys are produced through the
  * FIPS 140-3 validated module automatically.
  *
+ * With no arguments, keys are written to $QIHSE_KEYS_DIR, falling back to
+ * /opt/qihse/keys, then ./keys — so the keygen is safe to invoke with no
+ * args from any working directory (e.g. from a container).
+ *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 #include "../persistence/qihse_pqc_crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 int main(int argc, char *argv[]) {
-    const char *out_dir = (argc > 1) ? argv[1] : ".";
+    const char *out_dir;
+    if (argc > 1) {
+        out_dir = argv[1];
+    } else if ((out_dir = getenv("QIHSE_KEYS_DIR")) == NULL || *out_dir == '\0') {
+        /* Default to /opt/qihse/keys if writable, otherwise ./keys */
+        if (mkdir("/opt/qihse/keys", 0755) == 0 || access("/opt/qihse/keys", W_OK) == 0)
+            out_dir = "/opt/qihse/keys";
+        else
+            out_dir = "keys";
+    }
 
     /* Create output directory if it doesn't exist */
     mkdir(out_dir, 0755);

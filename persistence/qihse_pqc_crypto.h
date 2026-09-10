@@ -17,7 +17,9 @@
 
 /* ── Key file locations ───────────────────────────────────────────────── */
 
+#ifndef QIHSE_KEY_DIR
 #define QIHSE_KEY_DIR "/etc/qihse/keys/"
+#endif
 
 /* ML-KEM-1024: used for key encapsulation (at-rest AES key wrapping).
  * Generate with: scripts/qihse_keygen.sh  */
