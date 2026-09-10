@@ -29,6 +29,9 @@ DIM    = "\033[2m"
 WHITE  = "\033[97m"
 GREEN  = "\033[32m"
 YELLOW = "\033[33m"
+GRAY   = "\033[38;5;240m"
+
+WIDTH = 59
 
 
 def c(text: str, *colors: str) -> str:
@@ -36,10 +39,27 @@ def c(text: str, *colors: str) -> str:
 
 
 def banner(title: str) -> None:
-    bar = "─" * 57
-    print(f"{BG}{c('┌' + bar + '┐', RED)}{RST}")
-    print(f"{BG}{c('│ ' + title.center(55) + ' │', RED, BOLD)}{RST}")
-    print(f"{BG}{c('└' + bar + '┘', RED)}{RST}")
+    inner = WIDTH - 2
+    top    = f"╭{'─' * inner}╮"
+    bottom = f"╰{'─' * inner}╯"
+    print(f"\n  {c(top, RED)}")
+    print(f"  {c('│', RED)} {c(title.center(inner - 2), RED, BOLD)} {c('│', RED)}")
+    print(f"  {c(bottom, RED)}")
+
+
+def section(title: str) -> None:
+    print(f"\n  {c('◆', RED)} {c(title, RED, BOLD)}")
+    print(f"  {c('─' * (WIDTH - 2), GRAY)}")
+
+
+def warning_box(lines: list[str]) -> None:
+    inner = WIDTH - 4
+    top    = f"╭{'─' * inner}╮"
+    bottom = f"╰{'─' * inner}╯"
+    print(f"\n  {c(top, YELLOW, BOLD)}")
+    for line in lines:
+        print(f"  {c('│', YELLOW, BOLD)} {line.ljust(inner - 2)} {c('│', YELLOW, BOLD)}")
+    print(f"  {c(bottom, YELLOW, BOLD)}")
 
 
 def info(msg: str) -> None:
@@ -163,12 +183,12 @@ BUILD_TARGETS = {
 
 
 def menu(title: str, options: dict, default: str) -> str:
-    print(f"\n  {c(title, RED, BOLD)}")
+    section(title)
     for key in sorted(options):
         desc = options[key][1]
-        marker = f" {c('→', CYAN)} " if key == default else "   "
-        print(f"  {marker}{c(f'[{key}]', DIM)} {desc}")
-    choice = input(f"\n  {c('Select', WHITE)} [{default}]: ").strip() or default
+        marker = f" {c('▸', CYAN)} " if key == default else "   "
+        print(f"  {marker}{c(f'[{key}]', BOLD)} {desc}")
+    choice = input(f"\n  {c('◆', RED)} {c('Select', WHITE)} [{default}]: ").strip() or default
     if choice not in options:
         fail(f"Invalid choice: {choice}")
         sys.exit(1)
@@ -337,7 +357,7 @@ def main() -> None:
     banner("QIHSE BUILDER")
     feat = detect_cpu()
 
-    print(f"\n  {c('Architecture', RED, BOLD)}")
+    section("ARCHITECTURE DETECTION")
     info(f"CPU:    {c(feat['model'], WHITE)}")
     info(f"Arch:   {c(feat['arch'], CYAN)}  ISA: {c(arch_label(feat), CYAN)}")
     feats = [k.upper() for k in ("sse42", "avx", "avx2", "avx512", "aesni", "fma", "amx", "vnni", "f16c") if feat[k]]
@@ -350,25 +370,48 @@ def main() -> None:
     arch_choice = menu("Build target (architecture)", TARGETS, "1")
     _, arch_desc, march_override = TARGETS[arch_choice]
 
+    # Cross-compile warning
+    if arch_choice != "1":
+        warning_box([
+            c("⚠  CROSS-COMPILATION WARNING", YELLOW, BOLD),
+            "",
+            f"  You selected: {arch_desc}",
+            f"  Your CPU ISA:  {arch_label(feat)}",
+            "",
+            "  Building for a different architecture than this CPU",
+            "  means the resulting binaries may NOT run on this PC.",
+            "  Use this only when deploying to a different target machine.",
+            "",
+            "  If unsure, select [1] Auto-detect (march=native).",
+        ])
+        if input(f"  {c('◆', RED)} {c('Proceed anyway?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
+            warn("Aborted — no changes made.")
+            sys.exit(0)
+
     build_choice = menu("Build target (make goal)", BUILD_TARGETS, "1")
     _, build_desc = BUILD_TARGETS[build_choice]
 
-    clean = input(f"\n  {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
+    clean = input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
     jobs = os.cpu_count() or 4
 
     march = march_override  # None means native
-    print(f"\n  {c('─' * 50, DIM)}")
-    info(f"Architecture: {c(arch_desc, CYAN)}")
-    info(f"Build goal:   {c(build_desc, CYAN)}")
-    info(f"Clean:        {c('yes' if clean else 'no', CYAN)}  Jobs: {c(str(jobs), CYAN)}")
+
+    # Summary box
+    section("BUILD SUMMARY")
+    info(f"Architecture:  {c(arch_desc, CYAN)}")
+    info(f"Build goal:    {c(build_desc, CYAN)}")
+    info(f"Clean:         {c('yes' if clean else 'no', CYAN)}   Jobs: {c(str(jobs), CYAN)}")
+    info(f"Output:        {c(str(ROOT / 'libqihse.so'), DIM)}")
 
     build(march, BUILD_TARGETS[build_choice][0], clean, jobs)
 
     # Offer install
-    if input(f"\n  {c('Install to /opt/qihse?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
+    if input(f"\n  {c('◆', RED)} {c('Install to /opt/qihse?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
         install_opt()
 
-    print(f"\n  {c('Done.', GREEN, BOLD)}  {c('QIHSE build complete.', DIM)}\n")
+    print(f"\n  {c('╭───────────────────────────────────────────────────╮', GREEN)}")
+    print(f"  {c('│', GREEN)} {c('Done.', GREEN, BOLD)}  {c('QIHSE build complete.', DIM)}{'':>16} {c('│', GREEN)}")
+    print(f"  {c('╰───────────────────────────────────────────────────╯', GREEN)}\n")
 
 
 if __name__ == "__main__":
