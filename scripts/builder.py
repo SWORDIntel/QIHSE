@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import threading
@@ -41,11 +41,9 @@ def pad_right(s: str, width: int) -> str:
     return s + " " * max(0, width - vl)
 
 # ── SWORD cyber-dark ANSI palette ──────────────────────────────────────
-BG     = "\033[48;5;233m"   # #08080a near-black
 RST    = "\033[0m"
 RED    = "\033[38;5;196m"   # #e50000 SWORD red
 CYAN   = "\033[36m"          # T420 label
-ORANGE = "\033[38;5;208m"   # T320 label
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 WHITE  = "\033[97m"
@@ -183,7 +181,8 @@ def stop_progress(success: bool = True) -> None:
 
 
 def run(cmd: list[str] | str, cwd: Path | None = None, check: bool = True,
-        env: dict | None = None, shell: bool = False) -> int:
+        env: dict | None = None, shell: bool = False,
+        input: str | None = None) -> int:
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
@@ -191,7 +190,8 @@ def run(cmd: list[str] | str, cwd: Path | None = None, check: bool = True,
         assert isinstance(cmd, str)
         return subprocess.run(cmd, cwd=cwd, env=full_env, shell=True).returncode
     assert isinstance(cmd, list)
-    rc = subprocess.run(cmd, cwd=cwd, env=full_env).returncode
+    rc = subprocess.run(cmd, cwd=cwd, env=full_env, input=input,
+                        text=input is not None).returncode
     if check and rc != 0:
         fail(f"Command failed (exit {rc}): {' '.join(cmd)}")
         sys.exit(rc)
@@ -201,26 +201,36 @@ def run(cmd: list[str] | str, cwd: Path | None = None, check: bool = True,
 # ── Architecture detection ─────────────────────────────────────────────
 
 def detect_cpu() -> dict:
-    """Detect CPU architecture and SIMD features via /proc/cpuinfo + cpuid."""
+    """Detect CPU architecture and SIMD features via /proc/cpuinfo.
+    On hybrid CPUs (Alder Lake+), computes the intersection of flags
+    across all cores for safe baseline detection."""
+    all_core_flags: list[set[str]] = []
     flags: list[str] = []
-    arch = "x86_64"
+    arch = os.uname().machine
     model = "unknown"
 
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
-                if line.startswith("flags") and not flags:
-                    flags = line.split(":", 1)[1].split()
+                if line.startswith("flags"):
+                    cur = set(line.split(":", 1)[1].split())
+                    all_core_flags.append(cur)
+                    if not flags:
+                        flags = list(cur)
                 if line.startswith("model name") and model == "unknown":
                     model = line.split(":", 1)[1].strip()
     except FileNotFoundError:
         pass
 
-    # Fallback: use uname
+    # On hybrid CPUs, use intersection of all cores' flags for safe detection
+    if len(all_core_flags) > 1:
+        unique_flag_sets = set(frozenset(s) for s in all_core_flags)
+        if len(unique_flag_sets) > 1:
+            flags = list(set.intersection(*all_core_flags))
+
     if not flags:
-        arch = os.uname().machine
         try:
-            out = subprocess.check_output(["lscpu"], text=True)
+            out = subprocess.check_output(["lscpu"], text=True, env={**os.environ, "LC_ALL": "C"})
             for line in out.splitlines():
                 if line.startswith("Flags:"):
                     flags = line.split(":", 1)[1].split()
@@ -269,7 +279,52 @@ def detect_cpu() -> dict:
     feat["avx512"] = all(feat[k] for k in ("avx512f", "avx512dq", "avx512bw", "avx512vl"))
     feat["amx"] = feat["amx_tile"] and (feat["amx_int8"] or feat["amx_bf16"])
     feat["vnni"] = feat["avx512_vnni"] or feat["avx_vnni"]
+    # Hybrid CPU detection
+    feat["hybrid"] = False
+    feat["hybrid_pcores"] = []
+    feat["hybrid_ecores"] = []
+    if len(all_core_flags) > 1:
+        unique_flag_sets = set(frozenset(s) for s in all_core_flags)
+        if len(unique_flag_sets) > 1:
+            feat["hybrid"] = True
+            for i, core_flags in enumerate(all_core_flags):
+                if "avx512f" in core_flags or "amx_tile" in core_flags:
+                    feat["hybrid_pcores"].append(i)
+                else:
+                    feat["hybrid_ecores"].append(i)
     return feat
+
+
+def hybrid_warning(feat: dict, selected_has_avx512: bool) -> bool:
+    """If hybrid CPU and selected target has AVX-512 but E-cores don't,
+    warn the user they need to pin to P-cores. Returns True if should proceed."""
+    if not feat["hybrid"]:
+        return True
+    if not selected_has_avx512:
+        return True
+    if not feat["hybrid_ecores"]:
+        return True
+
+    pcore_list = ",".join(str(c) for c in feat["hybrid_pcores"])
+    warning_box([
+        c("⚠  HYBRID CPU WARNING", YELLOW, BOLD),
+        "",
+        f"  This CPU has {len(feat['hybrid_pcores'])} P-cores and {len(feat['hybrid_ecores'])} E-cores.",
+        f"  P-cores ({pcore_list}) support AVX-512.",
+        f"  E-cores do NOT support AVX-512.",
+        "",
+        "  Binaries built with AVX-512 will SIGILL on E-cores.",
+        "  You MUST pin the process to P-cores at runtime:",
+        "",
+        f"  taskset -c {pcore_list} ./your_binary",
+        "",
+        "  Or use systemd CPUAffinity= in a service file.",
+        "  Or set sched_setaffinity() in code.",
+    ])
+    if safe_input(f"  {c('◆', RED)} {c('Proceed with AVX-512 build?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
+        warn("Aborted — no changes made.")
+        return False
+    return True
 
 
 def arch_label(feat: dict) -> str:
@@ -345,13 +400,26 @@ BUILD_TARGETS = {
 }
 
 
+def safe_input(prompt: str, default: str = "") -> str:
+    """Wrapper around input() that returns default on EOFError (closed stdin)."""
+    try:
+        return input(prompt)
+    except EOFError:
+        print()
+        return default
+
+
 def menu(title: str, options: dict, default: str) -> str:
     section(title)
     for key in sorted(options):
         desc = options[key][1]
         marker = f" {c('▸', CYAN)} " if key == default else "   "
         print(f"  {marker}{c(f'[{key}]', BOLD)} {desc}")
-    choice = input(f"\n  {c('◆', RED)} {c('Select', WHITE)} [{default}]: ").strip() or default
+    try:
+        choice = input(f"\n  {c('◆', RED)} {c('Select', WHITE)} [{default}]: ").strip() or default
+    except EOFError:
+        print()
+        choice = default
     if choice not in options:
         fail(f"Invalid choice: {choice}")
         sys.exit(1)
@@ -397,7 +465,7 @@ def install_apt_deps(missing: list[str]) -> None:
         ok("All system dependencies present")
         return
     warn(f"Missing system packages: {', '.join(missing)}")
-    if input(f"  {c('Install via apt?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
+    if safe_input(f"  {c('Install via apt?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
         run(["sudo", "apt-get", "install", "-y"] + missing)
 
 
@@ -433,17 +501,33 @@ def provision_deps() -> None:
 
 # ── Build ──────────────────────────────────────────────────────────────
 
-def build(march: str | None, target: str, clean: bool, jobs: int) -> None:
+def build(march: str | None, target: str, clean: bool, jobs: int,
+          feat: dict | None = None) -> None:
     banner("COMPILING")
+
+    if not shutil.which("make"):
+        fail("make not found — install build-essential or make")
+        sys.exit(1)
+
     make_args = ["make", f"-j{jobs}"]
 
     if clean:
         info("Cleaning previous build...")
         run(["make", "clean"], cwd=ROOT, check=False)
 
-    # SIMD flags
-    avx2 = "1" if march and march not in ("x86-64", "x86-64-v2", "sandybridge") else "0"
-    avx512 = "1" if march in ("skylake-avx512",) else "0"
+    # SIMD flags — derive from detected features when march is native
+    AVX512_MARCHES = {"skylake-avx512", "icelake-server", "cooperlake",
+                      "sapphirerapids", "emeraldrapids", "graniterapids", "x86-64-v4"}
+    if march is None and feat:
+        # Native build — use detected CPU features
+        avx2 = "1" if feat.get("avx2") else "0"
+        avx512 = "1" if feat.get("avx512") else "0"
+    elif march is None:
+        avx2 = "0"
+        avx512 = "0"
+    else:
+        avx2 = "1" if march not in ("x86-64", "x86-64-v2", "sandybridge") else "0"
+        avx512 = "1" if march in AVX512_MARCHES else "0"
 
     cflags = f"-march={march}" if march else "-march=native"
     cflags += " -DNDEBUG -O3"
@@ -458,13 +542,24 @@ def build(march: str | None, target: str, clean: bool, jobs: int) -> None:
     info(f"Target: {c(target, CYAN)}  march={c(march or 'native', CYAN)}  jobs={c(str(jobs), CYAN)}")
     info(f"Command: {' '.join(make_args)}")
 
-    start_progress(f"Building {target}")
-    proc = subprocess.Popen(make_args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = None
     output = []
-    for line in proc.stdout:
-        output.append(line)
-    proc.wait()
-    stop_progress(success=proc.returncode == 0)
+    try:
+        start_progress(f"Building {target}")
+        proc = subprocess.Popen(make_args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            output.append(line)
+        proc.wait()
+        stop_progress(success=proc.returncode == 0)
+    except KeyboardInterrupt:
+        if proc:
+            proc.terminate()
+            proc.wait()
+        stop_progress(success=False)
+        raise
+    finally:
+        if proc and proc.poll() is None:
+            proc.kill()
 
     # Print build output
     if output:
@@ -503,23 +598,32 @@ def install_opt(dest: Path) -> None:
             return False
 
     if lib.exists():
-        safe_copy(lib, dest / "lib" / "libqihse.so")
-        ok(f"libqihse.so → {dest}/lib/")
+        if safe_copy(lib, dest / "lib" / "libqihse.so"):
+            ok(f"libqihse.so → {dest}/lib/")
+        else:
+            warn(f"Failed to copy libqihse.so → {dest}/lib/")
     if keygen.exists():
-        safe_copy(keygen, dest / "bin" / "qihse_keygen")
-        ok(f"qihse_keygen → {dest}/bin/")
+        if safe_copy(keygen, dest / "bin" / "qihse_keygen"):
+            ok(f"qihse_keygen → {dest}/bin/")
+        else:
+            warn(f"Failed to copy qihse_keygen → {dest}/bin/")
     if server.exists():
-        safe_copy(server, dest / "bin" / "qihse_server")
-        ok(f"qihse_server → {dest}/bin/")
+        if safe_copy(server, dest / "bin" / "qihse_server"):
+            ok(f"qihse_server → {dest}/bin/")
+        else:
+            warn(f"Failed to copy qihse_server → {dest}/bin/")
 
     # Headers
     inc_src = ROOT / "include"
     inc_dst = dest / "include" / "qihse"
     inc_dst.mkdir(parents=True, exist_ok=True)
+    hdr_count = 0
     for h in inc_src.glob("*.h"):
-        safe_copy(h, inc_dst / h.name)
+        if safe_copy(h, inc_dst / h.name):
+            hdr_count += 1
     if (ROOT / "qihse.h").exists():
-        safe_copy(ROOT / "qihse.h", inc_dst / "qihse.h")
+        if safe_copy(ROOT / "qihse.h", inc_dst / "qihse.h"):
+            hdr_count += 1
     ok(f"headers → {dest}/include/qihse/ ({len(list(inc_dst.glob('*.h')))} files)")
 
     # Symlink
@@ -552,6 +656,11 @@ def detect_shell_configs() -> list[Path]:
 def setup_integration(alias_name: str, dest: Path, project: str) -> None:
     """Set up env var alias, PATH, LD_LIBRARY_PATH, PKG_CONFIG_PATH, and
     offer to persist across all auto-detected shell configs."""
+    # Validate alias name — prevent shell injection
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', alias_name):
+        fail(f"Invalid alias name: {alias_name!r} — must be [A-Za-z_][A-Za-z0-9_]*")
+        sys.exit(1)
+
     section("INTEGRATION")
 
     shell_rcs = detect_shell_configs()
@@ -560,17 +669,29 @@ def setup_integration(alias_name: str, dest: Path, project: str) -> None:
     else:
         warn("No shell configs detected")
 
-    # Build the export block
-    exports = []
-    exports.append(f"export {alias_name}={dest}")
-    exports.append(f"export PATH=\"{dest}/bin:$PATH\"")
-    exports.append(f"export LD_LIBRARY_PATH=\"{dest}/lib:$LD_LIBRARY_PATH\"")
-    exports.append(f"export PKG_CONFIG_PATH=\"{dest}/lib/pkgconfig:$PKG_CONFIG_PATH\"")
-    exports.append(f"export CMAKE_PREFIX_PATH=\"{dest}:$CMAKE_PREFIX_PATH\"")
+    qdest = shlex.quote(str(dest))
+
+    # Build POSIX export block (bash/zsh/profile)
+    posix_exports = [
+        f"export {alias_name}={qdest}",
+        f'export PATH="{dest}/bin${{PATH:+:$PATH}}"',
+        f'export LD_LIBRARY_PATH="{dest}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"',
+        f'export PKG_CONFIG_PATH="{dest}/lib/pkgconfig${{PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}}"',
+        f'export CMAKE_PREFIX_PATH="{dest}${{CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}}"',
+    ]
+
+    # Build fish export block (different syntax)
+    fish_exports = [
+        f"set -gx {alias_name} {qdest}",
+        f"fish_add_path {dest}/bin",
+        f"set -gx LD_LIBRARY_PATH {dest}/lib $LD_LIBRARY_PATH",
+        f"set -gx PKG_CONFIG_PATH {dest}/lib/pkgconfig $PKG_CONFIG_PATH",
+        f"set -gx CMAKE_PREFIX_PATH {dest} $CMAKE_PREFIX_PATH",
+    ]
 
     info(f"{c(alias_name, CYAN)} = {c(str(dest), WHITE)}")
     print()
-    for e in exports:
+    for e in posix_exports:
         print(f"  {c(e, DIM)}")
     print()
 
@@ -580,17 +701,23 @@ def setup_integration(alias_name: str, dest: Path, project: str) -> None:
     if not countdown_prompt("Persist in shell configs?", seconds=5):
         return
 
-    block = f"\n# {alias_name} — set by {project} builder\n" + "\n".join(exports) + "\n"
+    posix_block = f"\n# {alias_name} — set by {project} builder\n" + "\n".join(posix_exports) + "\n"
+    fish_block = f"\n# {alias_name} — set by {project} builder\n" + "\n".join(fish_exports) + "\n"
+
     for rc in shell_rcs:
+        is_fish = rc.name == "config.fish"
+        block = fish_block if is_fish else posix_block
+        marker = f"set -gx {alias_name} " if is_fish else f"export {alias_name}="
         existing = rc.read_text()
-        if f"export {alias_name}=" not in existing:
-            rc.open("a").write(block)
+        if marker not in existing:
+            with open(rc, "a") as f:
+                f.write(block)
             ok(f"Added to {c(str(rc.relative_to(Path.home())), CYAN)}")
         else:
             ok(f"Already in {c(str(rc.relative_to(Path.home())), CYAN)}")
 
     # Offer ld.so.conf.d for system-wide lib resolution
-    if input(f"\n  {c('◆', RED)} {c('Add to ld.so.conf.d (system-wide)?', WHITE)} [y/N] ").strip().lower() in ("y", "yes"):
+    if safe_input(f"\n  {c('◆', RED)} {c('Add to ld.so.conf.d (system-wide)?', WHITE)} [y/N] ").strip().lower() in ("y", "yes"):
         conf = Path("/etc/ld.so.conf.d") / f"{project.lower()}.conf"
         try:
             conf.parent.mkdir(parents=True, exist_ok=True)
@@ -599,7 +726,7 @@ def setup_integration(alias_name: str, dest: Path, project: str) -> None:
             ok(f"Written {conf} and ran ldconfig")
         except PermissionError:
             warn("Needs root, trying with sudo...")
-            run(["sudo", "tee", str(conf)], check=False, shell=False)
+            run(["sudo", "tee", str(conf)], check=False, input=f"{dest}/lib\n")
             run(["sudo", "ldconfig"], check=False)
             ok(f"Written {conf} via sudo")
 
@@ -662,9 +789,16 @@ def main() -> None:
             "",
             "  If unsure, select [1] Auto-detect (march=native).",
         ])
-        if input(f"  {c('◆', RED)} {c('Proceed anyway?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
+        if safe_input(f"  {c('◆', RED)} {c('Proceed anyway?', WHITE)} [y/N] ").strip().lower() not in ("y", "yes"):
             warn("Aborted — no changes made.")
             sys.exit(0)
+
+    # Hybrid CPU warning — AVX-512 on P-cores only
+    AVX512_MARCHES = {"skylake-avx512", "icelake-server", "cooperlake",
+                      "sapphirerapids", "emeraldrapids", "graniterapids", "x86-64-v4"}
+    selected_has_avx512 = march_override in AVX512_MARCHES
+    if not hybrid_warning(feat, selected_has_avx512):
+        sys.exit(0)
 
     build_choice = menu("Build target (make goal)", BUILD_TARGETS, "1")
     _, build_desc = BUILD_TARGETS[build_choice]
@@ -672,15 +806,15 @@ def main() -> None:
     # Output path
     section("OUTPUT PATH")
     default_out = str(ROOT)
-    out_input = input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
+    out_input = safe_input(f"  {c('◆', RED)} {c('Output path', WHITE)} [{c(default_out, DIM)}]: ").strip()
     out_path = Path(out_input).expanduser().resolve() if out_input else Path(default_out)
 
     # Alias
     default_alias = "QIHSE_DB"
-    alias_input = input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
+    alias_input = safe_input(f"  {c('◆', RED)} {c('Alias name', WHITE)} [{c(default_alias, DIM)}]: ").strip()
     alias_name = alias_input.upper() if alias_input else default_alias
 
-    clean = input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
+    clean = safe_input(f"\n  {c('◆', RED)} {c('Clean before build?', WHITE)} [y/N] ").strip().lower() in ("y", "yes")
     jobs = os.cpu_count() or 4
 
     march = march_override  # None means native
@@ -693,10 +827,10 @@ def main() -> None:
     info(f"Output path:   {c(str(out_path), CYAN)}")
     info(f"Alias:         {c(alias_name, CYAN)} → {c(str(out_path), DIM)}")
 
-    build(march, BUILD_TARGETS[build_choice][0], clean, jobs)
+    build(march, BUILD_TARGETS[build_choice][0], clean, jobs, feat=feat)
 
     # Install to output path
-    if input(f"\n  {c('◆', RED)} {c(f'Install to {out_path}?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
+    if safe_input(f"\n  {c('◆', RED)} {c(f'Install to {out_path}?', WHITE)} [Y/n] ").strip().lower() not in ("n", "no"):
         install_opt(out_path)
         setup_integration(alias_name, out_path, "QIHSE")
 
