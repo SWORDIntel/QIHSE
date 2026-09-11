@@ -66,6 +66,34 @@ bool qihse_hash_index_delete(qihse_hash_index_t* idx,
 /** @return number of live entries (excluding tombstones). */
 size_t qihse_hash_index_size(const qihse_hash_index_t* idx);
 
+/* ------------------------------------------------------------------ */
+/* Optional persistence (save/load)                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Serializes the hash index to a file.
+ *
+ * Format: magic(4) + version(4) + key_type(4) + capacity(8) +
+ *         count(8) + tombstones(8) + slot_stride(8) +
+ *         table data (capacity * slot_stride bytes).
+ *
+ * Tombstone and empty slots are preserved as-is so the loaded index
+ * is structurally identical to the saved one.
+ *
+ * @param idx  Hash index to save.
+ * @param path Output file path.
+ * @return 0 on success, -1 on error.
+ */
+int qihse_hash_index_save(const qihse_hash_index_t* idx, const char* path);
+
+/**
+ * @brief Loads a hash index from a file created by qihse_hash_index_save.
+ *
+ * @param path Input file path.
+ * @return New hash index handle, or NULL on error.
+ */
+qihse_hash_index_t* qihse_hash_index_load(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

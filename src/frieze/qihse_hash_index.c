@@ -286,3 +286,100 @@ size_t qihse_hash_index_size(const qihse_hash_index_t* idx) {
     if (!idx) return 0;
     return idx->count;
 }
+
+/* ------------------------------------------------------------------ */
+/* Persistence (save/load)                                             */
+/* ------------------------------------------------------------------ */
+
+#include <stdio.h>
+
+#define QIHSE_HASH_INDEX_MAGIC   0x51484958  /* "QHIX" */
+#define QIHSE_HASH_INDEX_VERSION 1
+
+int qihse_hash_index_save(const qihse_hash_index_t* idx, const char* path) {
+    if (!idx || !path) return -1;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&idx->lock);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        pthread_rwlock_unlock((pthread_rwlock_t*)&idx->lock);
+        return -1;
+    }
+
+    uint32_t magic = QIHSE_HASH_INDEX_MAGIC;
+    uint32_t version = QIHSE_HASH_INDEX_VERSION;
+    uint32_t key_type = (uint32_t)idx->key_type;
+
+    /* Header */
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&key_type, 4, 1, f);
+    fwrite(&idx->capacity, sizeof(size_t), 1, f);
+    fwrite(&idx->count, sizeof(size_t), 1, f);
+    fwrite(&idx->tombstones, sizeof(size_t), 1, f);
+    fwrite(&idx->slot_stride, sizeof(size_t), 1, f);
+
+    /* Table data */
+    size_t total = idx->slot_stride * idx->capacity;
+    fwrite(idx->table, 1, total, f);
+
+    fclose(f);
+    pthread_rwlock_unlock((pthread_rwlock_t*)&idx->lock);
+    return 0;
+}
+
+qihse_hash_index_t* qihse_hash_index_load(const char* path) {
+    if (!path) return NULL;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    uint32_t magic, version, key_type;
+    size_t capacity, count, tombstones, slot_stride;
+
+    if (fread(&magic, 4, 1, f) != 1 || magic != QIHSE_HASH_INDEX_MAGIC) {
+        fclose(f); return NULL;
+    }
+    if (fread(&version, 4, 1, f) != 1 || version != QIHSE_HASH_INDEX_VERSION) {
+        fclose(f); return NULL;
+    }
+    if (fread(&key_type, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&capacity, sizeof(size_t), 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&count, sizeof(size_t), 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&tombstones, sizeof(size_t), 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&slot_stride, sizeof(size_t), 1, f) != 1) { fclose(f); return NULL; }
+
+    /* Sanity checks */
+    if (capacity == 0 || slot_stride == 0 || capacity > (SIZE_MAX / slot_stride)) {
+        fclose(f); return NULL;
+    }
+
+    qihse_hash_index_t* idx = (qihse_hash_index_t*)calloc(1, sizeof(*idx));
+    if (!idx) { fclose(f); return NULL; }
+
+    idx->key_type = (qihse_hash_key_type_t)key_type;
+    idx->capacity = capacity;
+    idx->count = count;
+    idx->tombstones = tombstones;
+    idx->slot_stride = slot_stride;
+
+    size_t total = slot_stride * capacity;
+    idx->table = (unsigned char*)malloc(total);
+    if (!idx->table) {
+        free(idx);
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(idx->table, 1, total, f) != total) {
+        free(idx->table);
+        free(idx);
+        fclose(f);
+        return NULL;
+    }
+
+    fclose(f);
+    pthread_rwlock_init(&idx->lock, NULL);
+    return idx;
+}

@@ -148,6 +148,33 @@ int qihse_btree_serialize_key(const qihse_btree_col_t* cols, size_t ncol,
 int qihse_btree_serialize_key_alloc(const qihse_btree_col_t* cols, size_t ncol,
                                     void** out_buf, size_t* out_len);
 
+/* ------------------------------------------------------------------ */
+/* Optional persistence (save/load)                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Serializes the B+ tree to a file.
+ *
+ * Format: magic(4) + version(4) + fanout(4) + count(8) +
+ *         repeated entries: key_len(2) + row_id(8) + key_bytes(key_len).
+ *
+ * Entries are written in sorted order (leftmost leaf first). On load,
+ * the tree is rebuilt by re-inserting all entries.
+ *
+ * @param tree B+ tree to save.
+ * @param path Output file path.
+ * @return 0 on success, -1 on error.
+ */
+int qihse_btree_save(const qihse_btree_t* tree, const char* path);
+
+/**
+ * @brief Loads a B+ tree from a file created by qihse_btree_save.
+ *
+ * @param path Input file path.
+ * @return New B+ tree handle, or NULL on error.
+ */
+qihse_btree_t* qihse_btree_load(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

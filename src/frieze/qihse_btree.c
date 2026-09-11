@@ -665,3 +665,114 @@ int qihse_btree_serialize_key_alloc(const qihse_btree_col_t* cols, size_t ncol,
     *out_buf = buf; *out_len = need;
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Optional persistence (save/load)                                    */
+/* ------------------------------------------------------------------ */
+
+#include <stdio.h>
+
+#define QIHSE_BTREE_MAGIC   0x51425452  /* "QBTR" */
+#define QIHSE_BTREE_VERSION 1
+
+/* Serialize: walk all leaf entries in sorted order, write as a flat
+ * sequence of (key_len, row_id, key_bytes) records. On load, re-insert
+ * all entries to rebuild the tree structure. */
+
+int qihse_btree_save(const qihse_btree_t* tree, const char* path) {
+    if (!tree || !path) return -1;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&tree->lock);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        pthread_rwlock_unlock((pthread_rwlock_t*)&tree->lock);
+        return -1;
+    }
+
+    uint32_t magic = QIHSE_BTREE_MAGIC;
+    uint32_t version = QIHSE_BTREE_VERSION;
+    uint32_t fanout = tree->fanout;
+    size_t count = tree->count;
+
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&fanout, 4, 1, f);
+    fwrite(&count, sizeof(size_t), 1, f);
+
+    /* Walk leaf linked list from leftmost leaf */
+    btree_node_t* leaf = tree->root;
+    while (leaf && !leaf->is_leaf) leaf = leaf->u.in.children[0];
+
+    size_t written = 0;
+    while (leaf) {
+        for (uint16_t i = 0; i < leaf->count; i++) {
+            leaf_entry_t* e = leaf_entry(leaf, i);
+            fwrite(&e->key_len, sizeof(uint16_t), 1, f);
+            fwrite(&e->row_id, sizeof(uint64_t), 1, f);
+            fwrite(leaf_key(e), 1, e->key_len, f);
+            written++;
+        }
+        leaf = leaf->next_leaf;
+    }
+
+    fclose(f);
+    pthread_rwlock_unlock((pthread_rwlock_t*)&tree->lock);
+
+    if (written != count) return -1;
+    return 0;
+}
+
+qihse_btree_t* qihse_btree_load(const char* path) {
+    if (!path) return NULL;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    uint32_t magic, version, fanout;
+    size_t count;
+
+    if (fread(&magic, 4, 1, f) != 1 || magic != QIHSE_BTREE_MAGIC) {
+        fclose(f); return NULL;
+    }
+    if (fread(&version, 4, 1, f) != 1 || version != QIHSE_BTREE_VERSION) {
+        fclose(f); return NULL;
+    }
+    if (fread(&fanout, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&count, sizeof(size_t), 1, f) != 1) { fclose(f); return NULL; }
+
+    qihse_btree_t* tree = qihse_btree_create(fanout);
+    if (!tree) { fclose(f); return NULL; }
+
+    for (size_t i = 0; i < count; i++) {
+        uint16_t key_len;
+        uint64_t row_id;
+        if (fread(&key_len, sizeof(uint16_t), 1, f) != 1) {
+            qihse_btree_destroy(tree);
+            fclose(f);
+            return NULL;
+        }
+        if (fread(&row_id, sizeof(uint64_t), 1, f) != 1) {
+            qihse_btree_destroy(tree);
+            fclose(f);
+            return NULL;
+        }
+        unsigned char* key = (unsigned char*)malloc(key_len ? key_len : 1);
+        if (!key) {
+            qihse_btree_destroy(tree);
+            fclose(f);
+            return NULL;
+        }
+        if (key_len && fread(key, 1, key_len, f) != key_len) {
+            free(key);
+            qihse_btree_destroy(tree);
+            fclose(f);
+            return NULL;
+        }
+        qihse_btree_insert(tree, key, key_len, row_id);
+        free(key);
+    }
+
+    fclose(f);
+    return tree;
+}
