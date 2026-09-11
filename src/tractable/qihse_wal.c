@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE Unified Write-Ahead Log
  *
@@ -62,7 +64,12 @@ uint32_t qihse_wal_crc32(const void* data, size_t len) {
 /* ── Segment management ─────────────────────────────────────────────────── */
 
 static void seg_path(char* buf, size_t bufsz, const char* dir, uint64_t idx) {
-    snprintf(buf, bufsz, "%s/wal_%020lu.log", dir, (unsigned long)idx);
+    int n = snprintf(buf, bufsz, "%s/wal_%020lu.log", dir, (unsigned long)idx);
+    if (n < 0 || (size_t)n >= bufsz) {
+        /* Truncation occurred — null-terminate and leave path as-is.
+         * Caller will fail on open() with ENOENT. */
+        if (bufsz > 0) buf[bufsz - 1] = '\0';
+    }
 }
 
 static int seg_open(qihse_wal_t* wal) {
@@ -484,8 +491,12 @@ int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
             if (sscanf(ent->d_name, "wal_%020lu.log", &idx) == 1) {
                 if (idx < wal->seg_index) {
                     char path[PATH_MAX];
-                    snprintf(path, sizeof(path), "%s/%s",
+                    int n = snprintf(path, sizeof(path), "%s/%s",
                              wal->directory, ent->d_name);
+                    if (n < 0 || (size_t)n >= sizeof(path)) {
+                        /* Path too long — skip this entry */
+                        continue;
+                    }
                     unlink(path);
                 }
             }
