@@ -1,6 +1,7 @@
 #include "qihse_resp_wire.h"
 #include "qihse_resp_engine.h"
 #include "qihse_resp_cluster.h"
+#include "qihse_resp_pubsub.h"
 #include "qihse_cluster_numa.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_failover.h"
@@ -11,6 +12,7 @@
 #include "qihse_platform.h"
 #include <ctype.h>
 #include <errno.h>
+#include <fnmatch.h>
 #include <float.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -73,6 +75,14 @@ typedef struct {
     size_t* sub_pattern_lens;
     size_t sub_pattern_count;
     size_t sub_pattern_cap;
+    /* Serializes socket writes between this session's command thread and
+     * pub/sub publisher threads pushing messages to a subscribed client. */
+    pthread_mutex_t io_lock;
+    /* Buffered mode: replies accumulate in io_buf instead of a socket
+     * (used by the stateless execute path for the UWP bridge). */
+    uint8_t* io_buf;
+    size_t io_len;
+    size_t io_cap;
 } qihse_resp_session_t;
 
 struct qihse_resp_client_ctx {
@@ -131,6 +141,11 @@ struct qihse_resp_server {
     bool owns_task_workers;
     qihse_task_scheduler_t* task_scheduler;
     bool owns_task_scheduler;
+    /* Pub/Sub broker and channel security policy */
+    qihse_resp_pubsub_t* pubsub;
+    uint16_t channel_classification;
+    uint16_t channel_sci;
+    bool enable_uwp_bridge;
 };
 
 typedef struct {
@@ -355,6 +370,20 @@ static qihse_resp_parse_status_t qihse_resp_parse_request(const uint8_t* data, s
 
 static bool qihse_resp_write(qihse_resp_session_t* session, const void* data, size_t len) {
     const uint8_t* bytes = (const uint8_t*)data;
+    if (session->io_buf) {
+        if (session->io_len + len > session->io_cap) {
+            size_t next = session->io_cap ? session->io_cap : 4096u;
+            while (session->io_len + len > next) next *= 2u;
+            uint8_t* grown = realloc(session->io_buf, next);
+            if (!grown) return false;
+            session->io_buf = grown;
+            session->io_cap = next;
+        }
+        memcpy(session->io_buf + session->io_len, bytes, len);
+        session->io_len += len;
+        return true;
+    }
+    pthread_mutex_lock(&session->io_lock);
     size_t written = 0;
     while (written < len) {
 #ifdef MSG_NOSIGNAL
@@ -364,11 +393,16 @@ static bool qihse_resp_write(qihse_resp_session_t* session, const void* data, si
 #endif
         if (result < 0) {
             if (errno == EINTR) continue;
+            pthread_mutex_unlock(&session->io_lock);
             return false;
         }
-        if (result == 0) return false;
+        if (result == 0) {
+            pthread_mutex_unlock(&session->io_lock);
+            return false;
+        }
         written += (size_t)result;
     }
+    pthread_mutex_unlock(&session->io_lock);
     return true;
 }
 
@@ -781,12 +815,18 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
     size_t active_clients = server->active_clients;
     pthread_mutex_unlock(&server->state_lock);
     char info[2048];
+    size_t pubsub_channels = server->pubsub ? qihse_resp_pubsub_channel_count(server->pubsub, NULL) : 0;
+    size_t pubsub_patterns = server->pubsub ? qihse_resp_pubsub_pattern_subscription_count(server->pubsub) : 0;
     int len = snprintf(info, sizeof(info),
                        "# Server\r\nredis_version:7.2.0\r\nredis_mode:cluster\r\nqihse_version:0.1.0\r\n"
+                       "qihse_uwp_bridge:%s\r\n"
                        "# Clients\r\nconnected_clients:%zu\r\n"
+                       "# Pub/Sub\r\nactive_channels:%zu\r\npattern_subscriptions:%zu\r\n"
                        "# Cluster\r\ncluster_enabled:1\r\ncluster_known_nodes:%zu\r\ncluster_slots_assigned:%zu\r\n"
                        "qihse_crc16_backend:%s\r\n",
-                       active_clients, nodes, assigned, qihse_crc16_backend_name());
+                       server->enable_uwp_bridge ? "1" : "0",
+                       active_clients, pubsub_channels, pubsub_patterns,
+                       nodes, assigned, qihse_crc16_backend_name());
     return len > 0 && (size_t)len < sizeof(info) && qihse_resp_bulk(session, info, (size_t)len);
 }
 
@@ -3334,102 +3374,288 @@ static bool qihse_resp_handle_unwatch(qihse_resp_session_t* session, const qihse
 
 /* ---- Pub/Sub commands ---- */
 
+/* Delivery callback invoked by the broker (on a publisher's thread) while it
+ * holds the registry read lock. The whole push frame is composed into one
+ * buffer and emitted with a single qihse_resp_write call so the frame is
+ * atomic with respect to this session's own command replies (io_lock). */
+static bool qihse_resp_pubsub_deliver(void* context, bool pattern,
+                                      const char* pattern_value, size_t pattern_len,
+                                      const char* channel, size_t channel_len,
+                                      const char* message, size_t message_len) {
+    qihse_resp_session_t* session = (qihse_resp_session_t*)context;
+    size_t frame_cap = 64u + channel_len + message_len + (pattern ? pattern_len : 0u) + 32u;
+    uint8_t* frame = malloc(frame_cap);
+    if (!frame) return false;
+    size_t len = 0;
+    char header[64];
+    int written = snprintf(header, sizeof(header), pattern ? "*4\r\n$8\r\npmessage\r\n$%zu\r\n" : "*3\r\n$7\r\nmessage\r\n$%zu\r\n",
+                           pattern ? pattern_len : channel_len);
+    if (written <= 0 || (size_t)written >= sizeof(header) || (size_t)written + channel_len + message_len + 64u > frame_cap) {
+        free(frame);
+        return false;
+    }
+    memcpy(frame + len, header, (size_t)written);
+    len += (size_t)written;
+    if (pattern) {
+        memcpy(frame + len, pattern_value, pattern_len);
+        len += pattern_len;
+        written = snprintf(header, sizeof(header), "\r\n$%zu\r\n", channel_len);
+        if (written <= 0 || (size_t)written >= sizeof(header)) {
+            free(frame);
+            return false;
+        }
+        memcpy(frame + len, header, (size_t)written);
+        len += (size_t)written;
+    }
+    memcpy(frame + len, channel, channel_len);
+    len += channel_len;
+    written = snprintf(header, sizeof(header), "\r\n$%zu\r\n", message_len);
+    if (written <= 0 || (size_t)written >= sizeof(header)) {
+        free(frame);
+        return false;
+    }
+    memcpy(frame + len, header, (size_t)written);
+    len += (size_t)written;
+    memcpy(frame + len, message, message_len);
+    len += message_len;
+    frame[len++] = '\r';
+    frame[len++] = '\n';
+    bool delivered = qihse_resp_write(session, frame, len);
+    free(frame);
+    return delivered;
+}
+
+static bool qihse_resp_pubsub_subscribed(const qihse_resp_session_t* session) {
+    return session->sub_channel_count > 0 || session->sub_pattern_count > 0;
+}
+
+static size_t qihse_resp_sub_find(char** values, size_t* lens, size_t count, const char* value, size_t len) {
+    for (size_t i = 0; i < count; i++) {
+        if (lens[i] == len && memcmp(values[i], value, len) == 0) return i;
+    }
+    return SIZE_MAX;
+}
+
+static void qihse_resp_sub_remove_at(char*** values, size_t** lens, size_t* count, size_t index) {
+    free((*values)[index]);
+    for (size_t i = index; i + 1u < *count; i++) {
+        (*values)[i] = (*values)[i + 1u];
+        (*lens)[i] = (*lens)[i + 1u];
+    }
+    (*count)--;
+}
+
+static bool qihse_resp_sub_add(char*** values, size_t** lens, size_t* count, size_t* cap,
+                               char* value, size_t len) {
+    if (*count >= *cap) {
+        *cap = *cap ? *cap * 2u : 8u;
+        *values = realloc(*values, *cap * sizeof(char*));
+        *lens = realloc(*lens, *cap * sizeof(size_t));
+        if (!*values || !*lens) return false;
+    }
+    (*values)[*count] = value;
+    (*lens)[*count] = len;
+    (*count)++;
+    return true;
+}
+
+static void qihse_resp_session_pubsub_cleanup(qihse_resp_session_t* session) {
+    if (session->server->pubsub) qihse_resp_pubsub_detach_client(session->server->pubsub, session);
+    for (size_t i = 0; i < session->sub_channel_count; i++) free(session->sub_channels[i]);
+    free(session->sub_channels);
+    free(session->sub_channel_lens);
+    session->sub_channels = NULL;
+    session->sub_channel_lens = NULL;
+    session->sub_channel_count = 0;
+    session->sub_channel_cap = 0;
+    for (size_t i = 0; i < session->sub_pattern_count; i++) free(session->sub_patterns[i]);
+    free(session->sub_patterns);
+    free(session->sub_pattern_lens);
+    session->sub_patterns = NULL;
+    session->sub_pattern_lens = NULL;
+    session->sub_pattern_count = 0;
+    session->sub_pattern_cap = 0;
+}
+
 static bool qihse_resp_handle_publish(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 3) return qihse_resp_wrong_arity(session, "publish");
-    /* Without a pub/sub broker, return 0 receivers */
-    return qihse_resp_integer(session, 0);
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
+    if (!qihse_resp_pubsub_channel_allowed(session->server->pubsub, session->user))
+        return qihse_resp_error(session, "NOPERM channel clearance required for PUBLISH");
+    uint64_t receivers = qihse_resp_pubsub_publish(session->server->pubsub, session->user,
+                                                   (const char*)request->argv[1].data, request->argv[1].len,
+                                                   (const char*)request->argv[2].data, request->argv[2].len);
+    return qihse_resp_integer(session, (int64_t)receivers);
 }
 
 static bool qihse_resp_handle_subscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "subscribe");
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
     for (size_t i = 1; i < request->argc; i++) {
-        if (session->sub_channel_count >= session->sub_channel_cap) {
-            session->sub_channel_cap = session->sub_channel_cap ? session->sub_channel_cap * 2 : 8;
-            session->sub_channels = realloc(session->sub_channels, session->sub_channel_cap * sizeof(char*));
-            session->sub_channel_lens = realloc(session->sub_channel_lens, session->sub_channel_cap * sizeof(size_t));
+        if (!qihse_resp_pubsub_channel_allowed(session->server->pubsub, session->user))
+            return qihse_resp_error(session, "NOPERM channel clearance required for SUBSCRIBE");
+    }
+    for (size_t i = 1; i < request->argc; i++) {
+        const char* channel = (const char*)request->argv[i].data;
+        size_t len = request->argv[i].len;
+        if (qihse_resp_sub_find(session->sub_channels, session->sub_channel_lens, session->sub_channel_count, channel, len) == SIZE_MAX) {
+            char* copy = malloc(len + 1u);
+            if (!copy) return qihse_resp_error(session, "OOM out of memory");
+            memcpy(copy, channel, len);
+            copy[len] = '\0';
+            if (!qihse_resp_pubsub_subscribe(session->server->pubsub, session, qihse_resp_pubsub_deliver, channel, len) ||
+                !qihse_resp_sub_add(&session->sub_channels, &session->sub_channel_lens, &session->sub_channel_count, &session->sub_channel_cap, copy, len)) {
+                free(copy);
+                qihse_resp_pubsub_unsubscribe(session->server->pubsub, session, channel, len);
+                return qihse_resp_error(session, "OOM out of memory");
+            }
         }
-        session->sub_channels[session->sub_channel_count] = qihse_resp_arg_text(&request->argv[i]);
-        session->sub_channel_lens[session->sub_channel_count] = request->argv[i].len;
-        session->sub_channel_count++;
-        /* Send subscribe confirmation */
         qihse_resp_array(session, 3);
         qihse_resp_bulk_text(session, "subscribe");
-        qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
-        qihse_resp_integer(session, (int64_t)session->sub_channel_count + (int64_t)session->sub_pattern_count);
+        qihse_resp_bulk(session, channel, len);
+        qihse_resp_integer(session, (int64_t)(session->sub_channel_count + session->sub_pattern_count));
     }
     return true;
 }
 
 static bool qihse_resp_handle_unsubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
-    if (session->sub_channel_count == 0 && request->argc == 1) {
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
+    if (request->argc == 1) {
+        while (session->sub_channel_count > 0) {
+            size_t last = session->sub_channel_count - 1u;
+            char* channel = session->sub_channels[last];
+            size_t len = session->sub_channel_lens[last];
+            qihse_resp_pubsub_unsubscribe(session->server->pubsub, session, channel, len);
+            qihse_resp_array(session, 3);
+            qihse_resp_bulk_text(session, "unsubscribe");
+            qihse_resp_bulk(session, channel, len);
+            qihse_resp_integer(session, (int64_t)session->sub_channel_count - 1);
+            free(channel);
+            session->sub_channel_count = last;
+        }
         qihse_resp_array(session, 3);
         qihse_resp_bulk_text(session, "unsubscribe");
         qihse_resp_null(session);
         qihse_resp_integer(session, 0);
         return true;
     }
-    if (request->argc < 2) {
-        /* Unsubscribe from all */
-        for (size_t i = 0; i < session->sub_channel_count; i++) {
-            qihse_resp_array(session, 3);
-            qihse_resp_bulk_text(session, "unsubscribe");
-            qihse_resp_bulk(session, session->sub_channels[i], session->sub_channel_lens[i]);
-            qihse_resp_integer(session, (int64_t)session->sub_channel_count - i - 1);
-            free(session->sub_channels[i]);
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "unsubscribe");
+    for (size_t i = 1; i < request->argc; i++) {
+        const char* channel = (const char*)request->argv[i].data;
+        size_t len = request->argv[i].len;
+        size_t index = qihse_resp_sub_find(session->sub_channels, session->sub_channel_lens, session->sub_channel_count, channel, len);
+        if (index != SIZE_MAX) {
+            qihse_resp_pubsub_unsubscribe(session->server->pubsub, session, channel, len);
+            qihse_resp_sub_remove_at(&session->sub_channels, &session->sub_channel_lens, &session->sub_channel_count, index);
         }
-        session->sub_channel_count = 0;
-    } else {
-        for (size_t i = 1; i < request->argc; i++) {
-            qihse_resp_array(session, 3);
-            qihse_resp_bulk_text(session, "unsubscribe");
-            qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
-            qihse_resp_integer(session, (int64_t)(session->sub_channel_count > 0 ? session->sub_channel_count - 1 : 0));
-        }
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "unsubscribe");
+        qihse_resp_bulk(session, channel, len);
+        qihse_resp_integer(session, (int64_t)(session->sub_channel_count + session->sub_pattern_count));
     }
     return true;
 }
 
 static bool qihse_resp_handle_psubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "psubscribe");
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
     for (size_t i = 1; i < request->argc; i++) {
-        if (session->sub_pattern_count >= session->sub_pattern_cap) {
-            session->sub_pattern_cap = session->sub_pattern_cap ? session->sub_pattern_cap * 2 : 8;
-            session->sub_patterns = realloc(session->sub_patterns, session->sub_pattern_cap * sizeof(char*));
-            session->sub_pattern_lens = realloc(session->sub_pattern_lens, session->sub_pattern_cap * sizeof(size_t));
+        if (!qihse_resp_pubsub_channel_allowed(session->server->pubsub, session->user))
+            return qihse_resp_error(session, "NOPERM channel clearance required for PSUBSCRIBE");
+    }
+    for (size_t i = 1; i < request->argc; i++) {
+        const char* pattern = (const char*)request->argv[i].data;
+        size_t len = request->argv[i].len;
+        if (qihse_resp_sub_find(session->sub_patterns, session->sub_pattern_lens, session->sub_pattern_count, pattern, len) == SIZE_MAX) {
+            char* copy = malloc(len + 1u);
+            if (!copy) return qihse_resp_error(session, "OOM out of memory");
+            memcpy(copy, pattern, len);
+            copy[len] = '\0';
+            if (!qihse_resp_pubsub_psubscribe(session->server->pubsub, session, qihse_resp_pubsub_deliver, pattern, len) ||
+                !qihse_resp_sub_add(&session->sub_patterns, &session->sub_pattern_lens, &session->sub_pattern_count, &session->sub_pattern_cap, copy, len)) {
+                free(copy);
+                qihse_resp_pubsub_punsubscribe(session->server->pubsub, session, pattern, len);
+                return qihse_resp_error(session, "OOM out of memory");
+            }
         }
-        session->sub_patterns[session->sub_pattern_count] = qihse_resp_arg_text(&request->argv[i]);
-        session->sub_pattern_lens[session->sub_pattern_count] = request->argv[i].len;
-        session->sub_pattern_count++;
         qihse_resp_array(session, 3);
         qihse_resp_bulk_text(session, "psubscribe");
-        qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
-        qihse_resp_integer(session, (int64_t)session->sub_channel_count + (int64_t)session->sub_pattern_count);
+        qihse_resp_bulk(session, pattern, len);
+        qihse_resp_integer(session, (int64_t)(session->sub_channel_count + session->sub_pattern_count));
     }
     return true;
 }
 
 static bool qihse_resp_handle_punsubscribe(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
-    if (request->argc < 2) {
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
+    if (request->argc == 1) {
+        while (session->sub_pattern_count > 0) {
+            size_t last = session->sub_pattern_count - 1u;
+            char* pattern = session->sub_patterns[last];
+            size_t len = session->sub_pattern_lens[last];
+            qihse_resp_pubsub_punsubscribe(session->server->pubsub, session, pattern, len);
+            qihse_resp_array(session, 3);
+            qihse_resp_bulk_text(session, "punsubscribe");
+            qihse_resp_bulk(session, pattern, len);
+            qihse_resp_integer(session, (int64_t)session->sub_pattern_count - 1);
+            free(pattern);
+            session->sub_pattern_count = last;
+        }
         qihse_resp_array(session, 3);
         qihse_resp_bulk_text(session, "punsubscribe");
         qihse_resp_null(session);
         qihse_resp_integer(session, 0);
-    } else {
-        for (size_t i = 1; i < request->argc; i++) {
-            qihse_resp_array(session, 3);
-            qihse_resp_bulk_text(session, "punsubscribe");
-            qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
-            qihse_resp_integer(session, 0);
+        return true;
+    }
+    if (request->argc < 2) return qihse_resp_wrong_arity(session, "punsubscribe");
+    for (size_t i = 1; i < request->argc; i++) {
+        const char* pattern = (const char*)request->argv[i].data;
+        size_t len = request->argv[i].len;
+        size_t index = qihse_resp_sub_find(session->sub_patterns, session->sub_pattern_lens, session->sub_pattern_count, pattern, len);
+        if (index != SIZE_MAX) {
+            qihse_resp_pubsub_punsubscribe(session->server->pubsub, session, pattern, len);
+            qihse_resp_sub_remove_at(&session->sub_patterns, &session->sub_pattern_lens, &session->sub_pattern_count, index);
         }
+        qihse_resp_array(session, 3);
+        qihse_resp_bulk_text(session, "punsubscribe");
+        qihse_resp_bulk(session, pattern, len);
+        qihse_resp_integer(session, (int64_t)(session->sub_channel_count + session->sub_pattern_count));
     }
     return true;
 }
 
 static bool qihse_resp_handle_pubsub(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "pubsub");
-    if (qihse_resp_arg_equal(&request->argv[1], "CHANNELS")) { qihse_resp_array(session, 0); return true; }
-    if (qihse_resp_arg_equal(&request->argv[1], "NUMSUB")) { qihse_resp_array(session, 0); return true; }
-    if (qihse_resp_arg_equal(&request->argv[1], "NUMPAT")) return qihse_resp_integer(session, (int64_t)session->sub_pattern_count);
+    if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
+    if (qihse_resp_arg_equal(&request->argv[1], "CHANNELS")) {
+        const char* glob = NULL;
+        char glob_buffer[4096];
+        if (request->argc >= 3) {
+            if (request->argv[2].len >= sizeof(glob_buffer)) return qihse_resp_error(session, "ERR pattern too long");
+            memcpy(glob_buffer, request->argv[2].data, request->argv[2].len);
+            glob_buffer[request->argv[2].len] = '\0';
+            glob = glob_buffer;
+        }
+        char* names[256];
+        size_t count = qihse_resp_pubsub_channels(session->server->pubsub, glob, names, sizeof(names) / sizeof(names[0]));
+        qihse_resp_array(session, count);
+        for (size_t i = 0; i < count; i++) {
+            qihse_resp_bulk_text(session, names[i]);
+            free(names[i]);
+        }
+        return true;
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "NUMSUB")) {
+        if (request->argc == 2) return qihse_resp_array(session, 0);
+        qihse_resp_array(session, request->argc - 2);
+        for (size_t i = 2; i < request->argc; i++) {
+            qihse_resp_bulk(session, request->argv[i].data, request->argv[i].len);
+            qihse_resp_integer(session, (int64_t)qihse_resp_pubsub_channel_subscribers(session->server->pubsub, (const char*)request->argv[i].data, request->argv[i].len));
+        }
+        return true;
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "NUMPAT"))
+        return qihse_resp_integer(session, (int64_t)qihse_resp_pubsub_pattern_subscription_count(session->server->pubsub));
     return qihse_resp_error(session, "ERR unknown PUBSUB subcommand");
 }
 
@@ -3597,6 +3823,22 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return qihse_resp_simple(session, "OK");
     }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    /* Subscribed-mode command restriction (Redis semantics) */
+    if (qihse_resp_pubsub_subscribed(session) &&
+        !qihse_resp_command_is(request, "SUBSCRIBE") &&
+        !qihse_resp_command_is(request, "UNSUBSCRIBE") &&
+        !qihse_resp_command_is(request, "PSUBSCRIBE") &&
+        !qihse_resp_command_is(request, "PUNSUBSCRIBE") &&
+        !qihse_resp_command_is(request, "PING") &&
+        !qihse_resp_command_is(request, "QUIT") &&
+        !qihse_resp_command_is(request, "RESET")) {
+        char buffer[256];
+        size_t name_len = request->argv[0].len < 128u ? request->argv[0].len : 128u;
+        int len = snprintf(buffer, sizeof(buffer),
+                           "ERR Can't execute '%.*s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                           (int)name_len, (const char*)request->argv[0].data);
+        return len > 0 ? qihse_resp_error(session, buffer) : qihse_resp_error(session, "ERR command not allowed in subscribed mode");
+    }
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
         !qihse_resp_command_is(request, "EXEC") &&
@@ -3899,6 +4141,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     session.fd = fd;
     session.protocol_version = 2;
     if (!server->auth_required) session.user = server->unauthenticated_user;
+    if (pthread_mutex_init(&session.io_lock, NULL) != 0) return false;
     session.id = __atomic_add_fetch(&server->next_client_id, 1u, __ATOMIC_RELAXED);
     if (server->pin_workers) {
         int cpus[256];
@@ -3975,6 +4218,9 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         }
         used += (size_t)received;
     }
+    qihse_resp_session_pubsub_cleanup(&session);
+    pthread_mutex_destroy(&session.io_lock);
+    free(session.io_buf);
     free(buffer);
     return successful;
 }
@@ -4140,6 +4386,11 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->task_worker_count = 0;
     config->task_python_binary = "python3";
     config->enable_task_scheduler = true;
+    /* Pub/Sub + UWP bridge */
+    config->pubsub_log_directory = NULL;
+    config->channel_classification = 0;
+    config->channel_sci = 0;
+    config->enable_uwp_bridge = true;
 }
 
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
@@ -4170,6 +4421,16 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->strict_hardware_affinity = supplied->strict_hardware_affinity;
     server->numa_node_id = supplied->numa_node_id;
     server->listen_fd = -1;
+    server->channel_classification = supplied->channel_classification;
+    server->channel_sci = supplied->channel_sci;
+    server->enable_uwp_bridge = supplied->enable_uwp_bridge;
+    server->pubsub = qihse_resp_pubsub_create(supplied->pubsub_log_directory);
+    if (!server->pubsub) {
+        free(server);
+        errno = ENOMEM;
+        return NULL;
+    }
+    qihse_resp_pubsub_set_policy(server->pubsub, server->channel_classification, server->channel_sci);
     if (!qihse_resp_copy_string(server->bind_address, sizeof(server->bind_address), bind_address) ||
         !qihse_resp_copy_string(server->advertise_address, sizeof(server->advertise_address), advertise_address)) {
         free(server);
@@ -4439,6 +4700,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
     if (server->owns_scatter && server->scatter) qihse_cluster_scatter_destroy(server->scatter);
     if (server->owns_topology) qihse_cluster_topology_destroy(server->topology);
+    if (server->pubsub) qihse_resp_pubsub_destroy(server->pubsub);
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
     pthread_mutex_destroy(&server->vdb_lock);
@@ -4523,4 +4785,42 @@ bool qihse_resp_engine_run_legacy(qihse_kv_store_t* store, qihse_vector_db_t vdb
     bool result = qihse_resp_server_run(server);
     qihse_resp_server_destroy(server);
     return result;
+}
+
+bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,
+                               size_t argc, const qihse_resp_arg_t* argv,
+                               uint8_t** out_reply, size_t* out_reply_len) {
+    if (!server || !user || !argv || argc == 0 || argc > QIHSE_RESP_MAX_ARGS || !out_reply || !out_reply_len) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!server->enable_uwp_bridge) {
+        errno = EACCES;
+        return false;
+    }
+    qihse_resp_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.server = server;
+    session.user = user;
+    session.fd = -1;
+    session.protocol_version = 2;
+    qihse_resp_request_t request;
+    memset(&request, 0, sizeof(request));
+    request.argc = argc;
+    for (size_t i = 0; i < argc; i++) request.argv[i] = argv[i];
+    request.consumed = argc;
+    session.io_cap = 4096u;
+    session.io_buf = malloc(session.io_cap);
+    if (!session.io_buf) {
+        errno = ENOMEM;
+        return false;
+    }
+    bool keep_open = true;
+    if (!qihse_resp_dispatch(&session, &request, &keep_open)) {
+        free(session.io_buf);
+        return false;
+    }
+    *out_reply = session.io_buf;
+    *out_reply_len = session.io_len;
+    return true;
 }

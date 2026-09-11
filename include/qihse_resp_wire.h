@@ -9,6 +9,7 @@
 #include "qihse_timeseries.h"
 #include "qihse_column.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_resp_cluster.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
@@ -57,6 +58,15 @@ typedef struct {
     qihse_task_queue_t* task_queue;
     qihse_task_worker_pool_t* task_workers;
     qihse_task_scheduler_t* task_scheduler;
+    /* Pub/Sub: optional durable event-stream log directory for PUBLISH; when
+     * NULL the broker is in-memory only. Channels are tagged with
+     * (channel_classification, channel_sci) and require caller clearance. */
+    const char* pubsub_log_directory;
+    uint16_t channel_classification;
+    uint16_t channel_sci;
+    /* UWP bridge: allow qihse_resp_server_execute() (QIHSE_UWP_TARGET_RESP)
+     * to run commands through this server's dispatch path. Default true. */
+    bool enable_uwp_bridge;
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);
@@ -75,6 +85,18 @@ qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server);
 qihse_task_queue_t* qihse_resp_server_task_queue(qihse_resp_server_t* server);
 qihse_task_worker_pool_t* qihse_resp_server_task_workers(qihse_resp_server_t* server);
 qihse_task_scheduler_t* qihse_resp_server_task_scheduler(qihse_resp_server_t* server);
+
+/**
+ * @brief Executes a single RESP command on behalf of an explicit authenticated
+ * user, statelessly (no TCP session; MULTI/transaction state is not kept).
+ * The reply bytes (a complete RESP reply) are returned in *out_reply and must
+ * be freed by the caller. Used by the UWP RESP bridge
+ * (QIHSE_UWP_TARGET_RESP); requires config.enable_uwp_bridge and a non-NULL
+ * user — there is no context-free fallback.
+ */
+bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,
+                               size_t argc, const qihse_resp_arg_t* argv,
+                               uint8_t** out_reply, size_t* out_reply_len);
 
 /**
  * @brief Starts a TCP server that listens for RESP (Redis Serialization Protocol) commands.

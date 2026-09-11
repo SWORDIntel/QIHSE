@@ -43,9 +43,14 @@ The RESP compatibility layer covers common Redis-style data structures and comma
 
 - expiry and persistence-related key operations
 - MULTI / EXEC / DISCARD / WATCH / UNWATCH
-- pub/sub
+- pub/sub with real message fan-out (`qihse_resp_pubsub.c`): `SUBSCRIBE` / `UNSUBSCRIBE` / `PSUBSCRIBE` / `PUNSUBSCRIBE` / `PUBLISH` / `PUBSUB CHANNELS|NUMSUB|NUMPAT`. Every publish is appended to a durable event stream (topic `resp.pubsub`) when `pubsub_log_directory` is configured, making messages replayable by the UWP STREAM target and CDC. Subscribed connections accept only subscription commands, `PING`, `QUIT`, and `RESET`. Channels carry a configurable `(classification, SCI)` security tag; `SUBSCRIBE` and `PUBLISH` require the caller's clearance to dominate it (`NOPERM` otherwise).
 - server and introspection commands
 - scripting entry points
+
+### Standalone server and UWP bridge
+
+- `make redis-server` builds `qihse-redis-server`, a standalone daemon (`tools/qihse_redis_server.c`) serving RESP on port 6379 with optional `--require-auth`, durable pub/sub (`--pubsub-dir`), channel security policy (`--channel-classif` / `--channel-sci`), and an optional UWP listener on the same stores (`--uwp-port`).
+- `QIHSE_UWP_TARGET_RESP` (0x0F) routes UWP packets into the RESP dispatch path (`qihse_resp_server_execute`) with the UWP-authenticated `qihse_user_t`. Opcode `QIHSE_UWP_RESP_EXEC` (0x01) carries `u32 LE argc` followed by `argc × (u32 LE len + bytes)` and returns raw RESP reply bytes. There is no context-free fallback; see [RESP–UWP bridge](architecture/resp_uwp_bridge.md).
 
 Cluster-oriented work includes Redis-compatible hash-slot routing and sharding architecture. See [Cluster sharding](architecture/cluster_sharding.md).
 

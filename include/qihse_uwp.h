@@ -41,6 +41,7 @@ typedef struct {
     qihse_pooler_t* pooler;         /* NULL unless pooling is configured */
     qihse_uwp_tls_ctx_t* tls_ctx;   /* NULL = cleartext, non-NULL = TLS enabled */
     qihse_uwp_metrics_t* uwp_metrics; /* NULL = metrics disabled */
+    void* resp_server;    /* qihse_resp_server_t* enabling QIHSE_UWP_TARGET_RESP; NULL = bridge disabled */
 } qihse_uwp_context_t;
 
 /* 15-byte fixed width packed header */
@@ -68,6 +69,10 @@ typedef struct __attribute__((packed)) {
 #define QIHSE_UWP_TARGET_SCHEMA  0x0C  /* Schema registry */
 #define QIHSE_UWP_TARGET_REPL    0x0D  /* Replication */
 #define QIHSE_UWP_TARGET_POOL    0x0E  /* Connection pool */
+#define QIHSE_UWP_TARGET_RESP    0x0F  /* RESP (Redis) bridge via qihse_resp_server_execute */
+
+/* QIHSE_UWP_TARGET_RESP command opcodes */
+#define QIHSE_UWP_RESP_EXEC      0x01  /* payload: u32 LE argc, then argc × (u32 LE len + bytes) */
 
 /**
  * @brief Start the QIHSE Unified Wire Protocol TCP server.

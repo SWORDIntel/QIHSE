@@ -267,6 +267,72 @@ static ssize_t uwp_tls_write_cb(void* write_ctx, const void* data, size_t len) {
  * Defined after uwp_conn_t (see below). */
 static void uwp_get_write_cb(uwp_conn_t* conn, qihse_uwp_write_fn* fn, void** ctx);
 
+/* ---- RESP bridge (QIHSE_UWP_TARGET_RESP) ----
+ *
+ * Opcode 0x01 RESP_EXEC: payload is u32 LE argc followed by argc records of
+ * (u32 LE len + bytes). The command runs through the RESP engine's dispatch
+ * with the UWP-authenticated user; the raw RESP reply bytes are written back.
+ * There is no context-free fallback: user must be non-NULL (checked by the
+ * caller) and the server must have the UWP bridge enabled. */
+#define UWP_RESP_MAX_ARGS 2048u
+
+static uwp_route_result_t uwp_resp_target(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                                          const qihse_uwp_header_t* header,
+                                          const uint8_t* payload, size_t len,
+                                          uint8_t* out_response, size_t out_cap, size_t* out_len,
+                                          qihse_uwp_write_fn write_fn, void* write_ctx) {
+    if (!ctx->resp_server) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+        return UWP_ROUTE_ERR_DISPATCH;
+    }
+    if (header->command_opcode != QIHSE_UWP_RESP_EXEC) {
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+        return UWP_ROUTE_ERR_DISPATCH;
+    }
+    if (len < sizeof(uint32_t)) return UWP_ROUTE_ERR_DISPATCH;
+    uint32_t argc;
+    memcpy(&argc, payload, sizeof(argc));
+    argc = le32toh(argc);
+    if (argc == 0 || argc > UWP_RESP_MAX_ARGS) return UWP_ROUTE_ERR_DISPATCH;
+    qihse_resp_arg_t* argv = malloc((size_t)argc * sizeof(qihse_resp_arg_t));
+    if (!argv) return UWP_ROUTE_ERR_DISPATCH;
+    size_t cursor = sizeof(uint32_t);
+    bool parsed = true;
+    for (uint32_t i = 0; i < argc && parsed; i++) {
+        if (cursor + sizeof(uint32_t) > len) { parsed = false; break; }
+        uint32_t arg_len;
+        memcpy(&arg_len, payload + cursor, sizeof(arg_len));
+        arg_len = le32toh(arg_len);
+        cursor += sizeof(uint32_t);
+        if (arg_len > len - cursor) { parsed = false; break; }
+        argv[i].data = payload + cursor;
+        argv[i].len = arg_len;
+        cursor += arg_len;
+    }
+    if (!parsed) {
+        free(argv);
+        return UWP_ROUTE_ERR_DISPATCH;
+    }
+    uint8_t* reply = NULL;
+    size_t reply_len = 0;
+    if (!qihse_resp_server_execute((qihse_resp_server_t*)ctx->resp_server, user, argc, argv, &reply, &reply_len)) {
+        free(argv);
+        if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_error(ctx->uwp_metrics, header->target_engine);
+        return UWP_ROUTE_ERR_PERM;
+    }
+    free(argv);
+    if (write_fn) {
+        if (reply_len > 0) write_fn(write_ctx, reply, reply_len);
+    } else if (out_response) {
+        size_t copy = reply_len < out_cap ? reply_len : out_cap;
+        memcpy(out_response, reply, copy);
+        if (out_len) *out_len = copy;
+    }
+    free(reply);
+    if (ctx->uwp_metrics) qihse_uwp_metrics_inc_dispatch_ok(ctx->uwp_metrics, header->target_engine);
+    return UWP_ROUTE_OK;
+}
+
 static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* conn,
                                              qihse_uwp_context_t* ctx,
                                              qihse_uwp_header_t* header, uint8_t* payload,
@@ -337,6 +403,11 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
     uwp_get_write_cb(conn, &write_fn, &write_ctx);
 
     switch(header->target_engine) {
+        case QIHSE_UWP_TARGET_RESP: {
+            return uwp_resp_target(ctx, current_user, header, payload, len,
+                                   NULL, 0, NULL, write_fn, write_ctx);
+        }
+
         case QIHSE_UWP_TARGET_KV:
             if (header->command_opcode == 0x01 && ctx->kv) {
                 if (len == 0) break;
@@ -660,10 +731,26 @@ bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
                  (t == QIHSE_UWP_TARGET_SQL) || (t == QIHSE_UWP_TARGET_TXN) ||
                  (t == QIHSE_UWP_TARGET_GRAPH2) || (t == QIHSE_UWP_TARGET_INDEX) ||
                  (t == QIHSE_UWP_TARGET_SCHEMA) || (t == QIHSE_UWP_TARGET_REPL) ||
-                 (t == QIHSE_UWP_TARGET_POOL);
+                 (t == QIHSE_UWP_TARGET_POOL) || (t == QIHSE_UWP_TARGET_RESP);
     if (!known) return false;
 
     if (!out_response || out_cap < 3) return false;
+
+    /* RESP bridge target: run the command through the RESP engine dispatch
+     * with the authenticated user (no context-free fallback). */
+    if (t == QIHSE_UWP_TARGET_RESP) {
+        if (!ctx->resp_server) {
+            static const char no_bridge[] = "ERR_NO_BRIDGE\n";
+            memcpy(out_response, no_bridge, sizeof(no_bridge) - 1);
+            if (out_len) *out_len = sizeof(no_bridge) - 1;
+            return false;
+        }
+        size_t reply_len = 0;
+        uwp_route_result_t result = uwp_resp_target(ctx, user, header, payload, plen,
+                                                    out_response, out_cap, &reply_len, NULL, NULL);
+        if (out_len) *out_len = reply_len;
+        return result == UWP_ROUTE_OK;
+    }
 
     /* AUTH target: caller is allowed to have a NULL user (that is the whole
      * point — the user is authenticating and does not have a token yet). */

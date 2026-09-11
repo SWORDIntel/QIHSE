@@ -109,6 +109,11 @@ static authz_state_t authz_states[MAX_USERS];
 static pthread_rwlock_t auth_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t active_user_count = 0;
 static auth_rate_limit_t rate_limits[MAX_USERS];
+/* Set when any principal requires a hardware token. While zero, the
+ * unclassified fast path in qihse_auth_can_access may skip the authoritative
+ * resolve; once set it never clears, so the flag cannot be tampered with via
+ * user-struct memory and MFA-gated principals always take the full check. */
+static uint8_t g_any_token_required = 0;
 
 static EVP_MD* g_cached_sha384 = NULL;
 static pthread_once_t g_evp_fetch_once = PTHREAD_ONCE_INIT;
@@ -503,6 +508,7 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
     }
     u->password_set = true;
     u->requires_hardware_token = requires_hw_token;
+    if (requires_hw_token) __atomic_store_n(&g_any_token_required, (uint8_t)1, __ATOMIC_RELEASE);
     u->can_create_users = false;
     snprintf(u->username, 64, "User_%u", user_id);
 
@@ -621,6 +627,7 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
         bool value = (new_requires_hw_token != 0);
         target->requires_hardware_token = value;
         authz_states[target_user_id].requires_hardware_token = value;
+        if (value) __atomic_store_n(&g_any_token_required, (uint8_t)1, __ATOMIC_RELEASE);
     }
 
     if (new_can_create_users != -1) {
@@ -675,13 +682,16 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
         return true; /* Unclassified data allowed when unauthenticated */
     }
 
-    /* Fast path: unclassified data is accessible to any authenticated caller.
-     * Consistent with the NULL-user path above — unclassified data is already
-     * open to unauthenticated callers, so any authenticated user trivially
-     * passes the clearance (0 <= any level) and SCI (0 ⊆ any compartments)
-     * checks.  This avoids a per-row rwlock acquisition during search over
-     * unclassified datasets, which is the common case for vector search. */
-    if (data_classif == 0 && data_sci == 0) {
+    /* Fast path: unclassified data is accessible to any authenticated caller
+     * that is not subject to hardware-token (MFA) enforcement. Consistent with
+     * the NULL-user path above — unclassified data is already open to
+     * unauthenticated callers, so any authenticated user trivially passes the
+     * clearance (0 <= any level) and SCI (0 ⊆ any compartments) checks. The
+     * global g_any_token_required flag is tamper-proof (kernel-owned state,
+     * never cleared), so MFA-gated principals always fall through to the
+     * authoritative check below. This avoids a per-row rwlock acquisition
+     * during search over unclassified datasets when no MFA policy exists. */
+    if (data_classif == 0 && data_sci == 0 && !__atomic_load_n(&g_any_token_required, __ATOMIC_ACQUIRE)) {
         return true;
     }
 
