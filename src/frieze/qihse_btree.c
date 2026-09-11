@@ -35,6 +35,8 @@ typedef struct btree_node {
     uint8_t  is_leaf;
     uint16_t count;
     uint32_t capacity;
+    uint32_t data_size;             /* leaf-only: bytes used in data[] */
+    uint32_t data_capacity;         /* leaf-only: max bytes in data[] */
     struct btree_node* parent;
     struct btree_node* next_leaf;   /* leaf-only: right sibling */
     union {
@@ -121,16 +123,24 @@ static void leaf_insert_at(btree_node_t* n, uint16_t pos,
     e->row_id = row_id;
     memcpy(leaf_key(e), key, klen);
     n->count++;
+    n->data_size += (uint32_t)(sizeof(leaf_entry_t) + klen);
 }
 
 static void leaf_remove_at(btree_node_t* n, uint16_t pos) {
-    if (pos + 1 >= n->count) { n->count--; return; }
+    leaf_entry_t* e = leaf_entry(n, pos);
+    uint32_t entry_size = (uint32_t)(sizeof(leaf_entry_t) + e->key_len);
+    if (pos + 1 >= n->count) {
+        n->count--;
+        n->data_size -= entry_size;
+        return;
+    }
     char* dst = (char*)leaf_entry(n, pos);
     char* src = (char*)leaf_entry(n, pos + 1);
     char* end = (char*)leaf_entry(n, n->count);
     size_t tail = end - src;
     if (tail) memmove(dst, src, tail);
     n->count--;
+    n->data_size -= entry_size;
 }
 
 /* ------------------------------------------------------------------ */
@@ -143,6 +153,8 @@ static btree_node_t* node_alloc_leaf(uint32_t fanout) {
     n->is_leaf = 1;
     n->count = 0;
     n->capacity = fanout ? fanout : QIHSE_BTREE_DEFAULT_FANOUT;
+    n->data_size = 0;
+    n->data_capacity = QIHSE_BTREE_PAGE_SIZE - offsetof(btree_node_t, data);
     n->parent = NULL;
     n->next_leaf = NULL;
     return n;
@@ -230,6 +242,9 @@ static btree_node_t* leaf_split(btree_node_t* n, uint32_t fanout,
     size_t bytes = end - src;
     memcpy(right->data, src, bytes);
     right->count = total - mid;
+    right->data_size = (uint32_t)bytes;
+    /* Shrink left node's data_size by the bytes moved to right */
+    n->data_size -= (uint32_t)bytes;
     n->count = mid;
     leaf_entry_t* e0 = (leaf_entry_t*)right->data;
     *sep_len = e0->key_len;
@@ -325,9 +340,95 @@ bool qihse_btree_insert(qihse_btree_t* tree,
         }
     }
 
-    if (leaf->count < leaf->capacity) {
+    /* Check both entry count and byte capacity to avoid page overflow.
+     * Variable-length keys can fill the page before reaching fanout count. */
+    size_t entry_bytes = sizeof(leaf_entry_t) + key_len;
+    if (leaf->count < leaf->capacity &&
+        leaf->data_size + entry_bytes <= leaf->data_capacity) {
         leaf_insert_at(leaf, pos, key, key_len, row_id);
         tree->count++;
+        pthread_rwlock_unlock(&tree->lock);
+        return true;
+    }
+
+    /* If the page is byte-full but count < capacity, we still need to split.
+     * Insert (overflow by 1), then split. The overflow may temporarily exceed
+     * the page, but we allocate a larger buffer for the overflow insertion. */
+    if (leaf->data_size + entry_bytes > leaf->data_capacity) {
+        /* Allocate an oversized temporary node to hold the overflow entry,
+         * then split it into two properly-sized nodes. */
+        size_t need = QIHSE_BTREE_PAGE_SIZE + entry_bytes;
+        btree_node_t* big = (btree_node_t*)calloc(1, need);
+        if (!big) { pthread_rwlock_unlock(&tree->lock); return false; }
+        memcpy(big, leaf, QIHSE_BTREE_PAGE_SIZE);
+        big->data_capacity = (uint32_t)(need - offsetof(btree_node_t, data));
+        leaf_insert_at(big, pos, key, key_len, row_id);
+        tree->count++;
+        /* Now split big into two nodes, copying back into leaf */
+        void* sep_key2; size_t sep_len2;
+        btree_node_t* right = leaf_split(big, tree->fanout, &sep_key2, &sep_len2);
+        if (!right) {
+            free(big);
+            pthread_rwlock_unlock(&tree->lock);
+            return false;
+        }
+        /* Copy left half back into original leaf */
+        memcpy(leaf->data, big->data, big->data_size);
+        leaf->count = big->count;
+        leaf->data_size = big->data_size;
+        /* Fix leaf linked list: leaf -> right -> old_next */
+        right->next_leaf = leaf->next_leaf;
+        leaf->next_leaf = right;
+        free(big);
+
+        btree_node_t* child_left = leaf;
+        btree_node_t* child_right = right;
+        void* cur_key = sep_key2;
+        size_t cur_len = sep_len2;
+
+        while (child_left->parent) {
+            btree_node_t* parent = child_left->parent;
+            uint16_t pi = 0;
+            for (; pi <= parent->count; pi++)
+                if (parent->u.in.children[pi] == child_left) break;
+
+            if (parent->count < parent->capacity) {
+                internal_insert_child(parent, pi, cur_key, cur_len, child_right);
+                free(cur_key);
+                child_right = NULL;
+                break;
+            }
+            /* Parent full: insert (overflow), then split. */
+            internal_insert_child(parent, pi, cur_key, cur_len, child_right);
+            free(cur_key);
+
+            void* promo_key; size_t promo_len;
+            btree_node_t* parent_right = internal_split(parent, tree->fanout,
+                                                        &promo_key, &promo_len);
+            if (!parent_right) break;
+            child_left = parent;
+            child_right = parent_right;
+            cur_key = promo_key;
+            cur_len = promo_len;
+        }
+
+        if (child_right) {
+            /* New root. */
+            btree_node_t* new_root = node_alloc_internal(tree->fanout);
+            if (new_root) {
+                new_root->u.in.children[0] = child_left;
+                child_left->parent = new_root;
+                new_root->u.in.keys[0] = (unsigned char*)malloc(cur_len);
+                memcpy(new_root->u.in.keys[0], cur_key, cur_len);
+                new_root->u.in.key_lens[0] = (uint16_t)cur_len;
+                new_root->u.in.children[1] = child_right;
+                child_right->parent = new_root;
+                new_root->count = 1;
+                tree->root = new_root;
+            }
+            free(cur_key);
+        }
+
         pthread_rwlock_unlock(&tree->lock);
         return true;
     }
