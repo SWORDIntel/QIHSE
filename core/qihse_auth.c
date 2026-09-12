@@ -972,7 +972,25 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
         return NULL;
     }
 
-    bool matched = verify_password(password, &authz_states[user_id].verifier);
+    /* Copy the verifier and run PBKDF2 without holding the lock.  The KDF
+     * costs tens of milliseconds; running it under the write lock serialized
+     * every concurrent login behind each attempt. */
+    qihse_password_verifier_t verifier_copy = authz_states[user_id].verifier;
+    pthread_rwlock_unlock(&auth_rwlock);
+
+    bool matched = verify_password(password, &verifier_copy);
+
+    pthread_rwlock_wrlock(&auth_rwlock);
+    now = time(NULL);
+    /* Re-validate: the account may have been disabled/deleted, the password
+     * rotated, or a parallel failure lockout applied while the KDF ran. */
+    if (users[user_id] != u || !authz_states[user_id].active ||
+        !authz_states[user_id].password_set ||
+        memcmp(&authz_states[user_id].verifier, &verifier_copy, sizeof(verifier_copy)) != 0 ||
+        rate_limits[user_id].lockout_until > now) {
+        pthread_rwlock_unlock(&auth_rwlock);
+        return NULL;
+    }
     if (matched) {
         rate_limits[user_id].failed_count = 0;
         rate_limits[user_id].lockout_until = 0;

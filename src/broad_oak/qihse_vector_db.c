@@ -5687,6 +5687,147 @@ bool qihse_vector_db_upsert_by_ids(
     return true;
 }
 
+/* Graph-guided approximate search: beam-search the flat NSW adjacency
+ * (graph_neighbors / graph_neighbor_counts / graph_live_row_map), then rerank
+ * the candidates through the exact-scoring pipeline — row liveness,
+ * qihse_auth_can_access, metadata filter, query-metric distance, top-k insert.
+ * The graph only *generates* candidates; no result is emitted without the
+ * same authorization check the exact path applies. */
+static int qihse_vdb_search_graph_flat(qihse_vector_db_t vdb,
+                                       const qihse_vector_query_t* query,
+                                       qihse_vector_result_t* results,
+                                       size_t max_results,
+                                       size_t result_limit) {
+    if (!vdb || !query || !query->query_vector || !results || max_results == 0u ||
+        result_limit == 0u || result_limit > max_results ||
+        query->vector_dims != vdb->vector_dims) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (vdb->graph_status != QIHSE_VDB_GRAPH_VALID || !vdb->graph_neighbors ||
+        !vdb->graph_neighbor_counts || !vdb->graph_live_row_map ||
+        vdb->graph_nodes == 0u || vdb->graph_M == 0u ||
+        vdb->graph_entry_point >= vdb->graph_nodes) {
+        errno = ENOENT;
+        return -1;
+    }
+    memset(results, 0, max_results * sizeof(*results));
+
+    qihse_distance_functions_t distances = qihse_distance_resolve();
+    qihse_distance_fn_t dist = distances.euclidean; /* traversal matches graph construction */
+    qihse_distance_fn_t score_dist = query->distance_metric == QIHSE_DISTANCE_DOT_PRODUCT
+        ? distances.dot : query->distance_metric == QIHSE_DISTANCE_EUCLIDEAN
+        ? distances.euclidean : distances.cosine;
+
+    size_t ef = query->candidate_pool_size;
+    if (ef == 0u && vdb->hnsw_index) ef = vdb->hnsw_index->params.ef_search;
+    if (ef == 0u) ef = 200u;
+    if (ef < result_limit * 2u) ef = result_limit * 2u;
+    if (ef > vdb->graph_nodes) ef = vdb->graph_nodes;
+
+    uint8_t* visited = (uint8_t*)calloc((vdb->graph_nodes + 7u) / 8u, 1u);
+    size_t cand_cap = ef * 4u; if (cand_cap < 64u) cand_cap = 64u;
+    size_t* cand_id = (size_t*)malloc(cand_cap * sizeof(size_t));
+    float* cand_d = (float*)malloc(cand_cap * sizeof(float));
+    size_t* top_id = (size_t*)malloc(ef * sizeof(size_t));
+    float* top_d = (float*)malloc(ef * sizeof(float));
+    if (!visited || !cand_id || !cand_d || !top_id || !top_d) {
+        free(visited); free(cand_id); free(cand_d); free(top_id); free(top_d);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    size_t cand_n = 0u, top_n = 0u;
+    const float* ev0 = qihse_hnsw_vdb_get_vector(vdb, (uint32_t)vdb->graph_entry_point);
+    if (!ev0) {
+        free(visited); free(cand_id); free(cand_d); free(top_id); free(top_d);
+        errno = ENOENT;
+        return -1;
+    }
+    visited[vdb->graph_entry_point >> 3] |= (uint8_t)(1u << (vdb->graph_entry_point & 7u));
+    float d0 = dist(query->query_vector, ev0, vdb->vector_dims);
+    cand_id[0] = vdb->graph_entry_point; cand_d[0] = d0; cand_n = 1u;
+    top_id[0] = vdb->graph_entry_point; top_d[0] = d0; top_n = 1u;
+
+    while (cand_n > 0u) {
+        /* Pop the closest frontier node (linear min-scan; ef is small). */
+        size_t bi = 0u;
+        for (size_t i = 1u; i < cand_n; i++) if (cand_d[i] < cand_d[bi]) bi = i;
+        size_t c = cand_id[bi];
+        float cd = cand_d[bi];
+        cand_id[bi] = cand_id[cand_n - 1u]; cand_d[bi] = cand_d[cand_n - 1u]; cand_n--;
+
+        if (top_n == ef) {
+            float worst = top_d[0];
+            for (size_t j = 1u; j < top_n; j++) if (top_d[j] > worst) worst = top_d[j];
+            if (cd > worst) break; /* closest frontier node can't improve top-ef */
+        }
+
+        for (size_t j = 0u; j < vdb->graph_neighbor_counts[c]; j++) {
+            size_t e = vdb->graph_neighbors[c * vdb->graph_M + j];
+            if (e >= vdb->graph_nodes) continue;
+            if (visited[e >> 3] & (uint8_t)(1u << (e & 7u))) continue;
+            visited[e >> 3] |= (uint8_t)(1u << (e & 7u));
+            const float* ev = qihse_hnsw_vdb_get_vector(vdb, (uint32_t)e);
+            if (!ev) continue;
+            float de = dist(query->query_vector, ev, vdb->vector_dims);
+            float worst = 0.0f; size_t wi = 0u;
+            if (top_n == ef) {
+                worst = top_d[0];
+                for (size_t k = 1u; k < top_n; k++) if (top_d[k] > worst) { worst = top_d[k]; wi = k; }
+            }
+            if (top_n < ef || de < worst) {
+                if (cand_n == cand_cap) {
+                    size_t ncap = cand_cap * 2u;
+                    size_t* nid = (size_t*)realloc(cand_id, ncap * sizeof(size_t));
+                    if (!nid) break;
+                    cand_id = nid;
+                    float* nd = (float*)realloc(cand_d, ncap * sizeof(float));
+                    if (!nd) break; /* cand_d still owns the old buffer */
+                    cand_d = nd; cand_cap = ncap;
+                }
+                cand_id[cand_n] = e; cand_d[cand_n] = de; cand_n++;
+                if (top_n < ef) { top_id[top_n] = e; top_d[top_n] = de; top_n++; }
+                else { top_id[wi] = e; top_d[wi] = de; }
+            }
+        }
+    }
+
+    /* Rerank: dense candidate id -> real row -> exact auth/filter/score. */
+    size_t out_count = 0u;
+    int fail = 0;
+    for (size_t i = 0u; i < top_n; i++) {
+        size_t actual_i = vdb->graph_live_row_map[top_id[i]];
+        if (actual_i >= vdb->total_vectors) continue;
+        const qihse_index_row_t* row = &vdb->rows[actual_i];
+        if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
+            (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) continue;
+        if (!qihse_auth_can_access(query->user, row->classification, row->sci_compartment)) continue;
+        const float* vector = qihse_vdb_vector_at(vdb, row);
+        if (!vector) continue;
+        qihse_vdb_track_row_access(vdb, actual_i);
+        if (query->metadata_filter) {
+            const void* metadata = qihse_vdb_metadata_at(vdb, row);
+            if (!metadata ||
+                !query->metadata_filter(metadata, (size_t)row->metadata_size,
+                                        query->metadata_filter_opaque)) {
+                continue;
+            }
+        }
+        float score = score_dist(query->query_vector, vector, vdb->vector_dims);
+        if (query->distance_metric == QIHSE_DISTANCE_EUCLIDEAN) {
+            score = 1.0f / (1.0f + score);
+        }
+        if (score < query->similarity_threshold) continue;
+        if (!qihse_vdb_insert_exact_result(vdb, query, row, vector, score,
+                                           results, result_limit, &out_count)) {
+            fail = 1; break;
+        }
+    }
+    free(visited); free(cand_id); free(cand_d); free(top_id); free(top_d);
+    return fail ? -1 : (int)out_count;
+}
+
 int qihse_vector_db_search(
     qihse_vector_db_t vdb,
     const qihse_vector_query_t* query,
@@ -5731,12 +5872,7 @@ int qihse_vector_db_search(
                                                          results, max_results);
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_GRAPH) {
         size_t top_k = query->top_k > 0u ? query->top_k : 10u;
-
-        if (vdb->graph_status != QIHSE_VDB_GRAPH_VALID) {
-            errno = ENOENT;
-            return -1;
-        }
-        ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+        ret = qihse_vdb_search_graph_flat(vdb, query, results, max_results, top_k);
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_INT8) {
         size_t candidate_count;
         if (vdb->int8_status != QIHSE_VDB_INT8_VALID) {

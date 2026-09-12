@@ -1199,7 +1199,7 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
         query.query_vector = vector;
         query.vector_dims = dims;
         query.top_k = top_k;
-        query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
+        query.query_mode = QIHSE_VDB_QUERY_GRAPH;
         query.user = session->user;
         qihse_vec_tag_filter_t tag_filter = { NULL, 0 };
         if (valid && option + 2u == request->argc) {
@@ -1210,6 +1210,10 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
         }
         pthread_mutex_lock(&session->server->vdb_lock);
         int local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
+        if (local_found < 0 && errno == ENOENT) {
+            query.query_mode = QIHSE_VDB_QUERY_FLOAT32; /* no graph — exact scan */
+            local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
+        }
         pthread_mutex_unlock(&session->server->vdb_lock);
 
         /* Query remote peers and merge with RRF */
@@ -1274,10 +1278,14 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
     query.query_vector = vector;
     query.vector_dims = dims;
     query.top_k = top_k;
-    query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
+    query.query_mode = QIHSE_VDB_QUERY_GRAPH;
     query.user = session->user;
     pthread_mutex_lock(&session->server->vdb_lock);
     int found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
+    if (found < 0 && errno == ENOENT) {
+        query.query_mode = QIHSE_VDB_QUERY_FLOAT32; /* graph absent — exact scan */
+        found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
+    }
     pthread_mutex_unlock(&session->server->vdb_lock);
     bool response = found >= 0 ? qihse_resp_array(session, (size_t)found) : qihse_resp_error(session, "ERR vector search failed");
     for (int i = 0; response && i < found; i++) {

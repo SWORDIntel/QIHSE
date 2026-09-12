@@ -197,8 +197,21 @@ bool qihse_vfs_wal_append(qihse_vfs_wal_t* wal,
     free(payload);
 
     if (ok) {
-        /* Invalidate the flat image so the next xRead triggers a rebuild. */
-        wal->replayed = false;
+        /* Keep the flat image coherent incrementally: if it is currently
+         * materialized, patch this frame in place so the next xRead does not
+         * re-replay the entire stream.  A duplicate append writes the same
+         * bytes to the same offset — idempotent, matching Marmalade's silent
+         * duplicate rejection. */
+        if (wal->replayed) {
+            uint64_t uoff = (uint64_t)offset;
+            size_t needed = (size_t)uoff + size;
+            if (wal_buf_grow(wal, needed)) {
+                memcpy(wal->replay_buf + uoff, data, size);
+                if (needed > wal->replay_len) wal->replay_len = needed;
+            } else {
+                wal->replayed = false; /* OOM: fall back to full rebuild */
+            }
+        }
     }
     return ok;
 }
