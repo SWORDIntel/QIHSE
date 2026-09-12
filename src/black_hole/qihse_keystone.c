@@ -22,8 +22,15 @@ static float g_model_b2[DSMIL_MODEL_NUM_CLASSES];
 static bool g_weights_initialized = false;
 
 static void qihse_secure_zero(void* ptr, size_t len) {
+    if (!ptr || len == 0u) return;
+#if defined(__GLIBC__)
+    /* explicit_bzero is guaranteed not to be optimized away and uses a
+     * vectorized wipe instead of a byte-at-a-time volatile store loop. */
+    explicit_bzero(ptr, len);
+#else
     volatile unsigned char* p = (volatile unsigned char*)ptr;
-    while (p && len--) *p++ = 0u;
+    while (len--) *p++ = 0u;
+#endif
 }
 
 static void init_micro_model_weights(void) {

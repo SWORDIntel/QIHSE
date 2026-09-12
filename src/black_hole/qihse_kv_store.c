@@ -41,6 +41,140 @@ typedef struct {
     char val[];
 } kv_payload_t;
 
+/*
+ * In-memory key metadata index over flushed SSTables.
+ *
+ * The write path must know whether a key already exists (and at what
+ * classification) so it can enforce the auth-on-overwrite invariant.  The
+ * original implementation answered that question by calling logical_lookup(),
+ * which linear-scans every record in every SSTable on disk.  Because SSTables
+ * accumulate as data is flushed, bulk ingestion degraded to O(N^2) disk reads.
+ *
+ * This index holds only the metadata needed for the authorization decision
+ * (classification, compartment, expiry, flags) -- never values -- so it is not
+ * a classified read primitive and does not weaken AGENTS.md invariant #1: the
+ * authorization check itself is unchanged, only its data source is faster.
+ * Values are still only ever returned through the context-checked read path.
+ *
+ * The index is exact (no false negatives); if it cannot record a key (OOM) it
+ * marks itself degraded and the write path falls back to the authoritative
+ * logical_lookup() so correctness/authorization is never compromised.
+ */
+typedef struct {
+    char* key;                  /* NULL == empty slot */
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t expire_time_ms;
+    uint8_t flags;
+    int32_t sstable_id;         /* SSTable that holds the newest copy */
+    uint64_t sst_offset;        /* byte offset of the record within that file */
+} sst_meta_entry_t;
+
+typedef struct {
+    sst_meta_entry_t* slots;
+    size_t cap;                 /* power of two */
+    size_t count;
+    bool degraded;              /* true if any insert/lookup fell back to OOM */
+} sst_meta_index_t;
+
+static uint64_t sst_meta_hash(const char* key) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char* p = (const unsigned char*)key; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static sst_meta_index_t* sst_meta_index_create(void) {
+    sst_meta_index_t* idx = (sst_meta_index_t*)calloc(1u, sizeof(*idx));
+    if (!idx) return NULL;
+    idx->cap = 1024u;
+    idx->slots = (sst_meta_entry_t*)calloc(idx->cap, sizeof(*idx->slots));
+    if (!idx->slots) { free(idx); return NULL; }
+    return idx;
+}
+
+static void sst_meta_index_destroy(sst_meta_index_t* idx) {
+    if (!idx) return;
+    if (idx->slots) {
+        for (size_t i = 0; i < idx->cap; i++) free(idx->slots[i].key);
+        free(idx->slots);
+    }
+    free(idx);
+}
+
+static bool sst_meta_index_grow(sst_meta_index_t* idx) {
+    size_t new_cap = idx->cap * 2u;
+    sst_meta_entry_t* new_slots = (sst_meta_entry_t*)calloc(new_cap, sizeof(*new_slots));
+    if (!new_slots) return false;
+    for (size_t i = 0; i < idx->cap; i++) {
+        sst_meta_entry_t* e = &idx->slots[i];
+        if (!e->key) continue;
+        size_t j = (size_t)(sst_meta_hash(e->key) & (new_cap - 1u));
+        while (new_slots[j].key) j = (j + 1u) & (new_cap - 1u);
+        new_slots[j] = *e;
+    }
+    free(idx->slots);
+    idx->slots = new_slots;
+    idx->cap = new_cap;
+    return true;
+}
+
+static void sst_meta_index_insert(sst_meta_index_t* idx, const char* key,
+                                  uint16_t classification, uint16_t sci_compartment,
+                                  uint64_t expire_time_ms, uint8_t flags,
+                                  int32_t sstable_id, uint64_t sst_offset) {
+    if (!idx || !key) return;
+    if ((idx->count + 1u) * 10u >= idx->cap * 7u) {
+        if (!sst_meta_index_grow(idx)) { idx->degraded = true; return; }
+    }
+    size_t j = (size_t)(sst_meta_hash(key) & (idx->cap - 1u));
+    while (idx->slots[j].key) {
+        if (strcmp(idx->slots[j].key, key) == 0) {
+            idx->slots[j].classification = classification;
+            idx->slots[j].sci_compartment = sci_compartment;
+            idx->slots[j].expire_time_ms = expire_time_ms;
+            idx->slots[j].flags = flags;
+            idx->slots[j].sstable_id = sstable_id;
+            idx->slots[j].sst_offset = sst_offset;
+            return;
+        }
+        j = (j + 1u) & (idx->cap - 1u);
+    }
+    char* kcopy = strdup(key);
+    if (!kcopy) { idx->degraded = true; return; }
+    idx->slots[j].key = kcopy;
+    idx->slots[j].classification = classification;
+    idx->slots[j].sci_compartment = sci_compartment;
+    idx->slots[j].expire_time_ms = expire_time_ms;
+    idx->slots[j].flags = flags;
+    idx->slots[j].sstable_id = sstable_id;
+    idx->slots[j].sst_offset = sst_offset;
+    idx->count++;
+}
+
+static bool sst_meta_index_lookup(const sst_meta_index_t* idx, const char* key,
+                                  uint16_t* out_class, uint16_t* out_comp,
+                                  uint64_t* out_expire, uint8_t* out_flags,
+                                  int32_t* out_sstable_id, uint64_t* out_offset) {
+    if (!idx || !key || idx->count == 0u) return false;
+    size_t j = (size_t)(sst_meta_hash(key) & (idx->cap - 1u));
+    while (idx->slots[j].key) {
+        if (strcmp(idx->slots[j].key, key) == 0) {
+            if (out_class) *out_class = idx->slots[j].classification;
+            if (out_comp) *out_comp = idx->slots[j].sci_compartment;
+            if (out_expire) *out_expire = idx->slots[j].expire_time_ms;
+            if (out_flags) *out_flags = idx->slots[j].flags;
+            if (out_sstable_id) *out_sstable_id = idx->slots[j].sstable_id;
+            if (out_offset) *out_offset = idx->slots[j].sst_offset;
+            return true;
+        }
+        j = (j + 1u) & (idx->cap - 1u);
+    }
+    return false;
+}
+
 struct qihse_kv_store {
     qihse_trinary_trie_t* trie;
     FILE* wal_fd;
@@ -49,7 +183,18 @@ struct qihse_kv_store {
     int sstable_counter;
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
+    sst_meta_index_t* sst_meta;
 };
+
+/* Drop and rebuild an empty SSTable metadata index.  Called whenever SSTables
+ * are merged back into the memtable (compaction / snapshot load), after which
+ * the trie alone is authoritative.  If reallocation fails the index is left
+ * NULL and the write path falls back to logical_lookup(). */
+static void sst_meta_index_reset(qihse_kv_store_t* store) {
+    if (!store) return;
+    sst_meta_index_destroy(store->sst_meta);
+    store->sst_meta = sst_meta_index_create();
+}
 
 typedef struct {
     char* key;
@@ -281,20 +426,31 @@ static bool insert_internal(qihse_kv_store_t* store, const char* key, const char
     return true;
 }
 
-typedef struct { FILE* f; bool ok; } memtable_save_ctx_t;
+typedef struct { FILE* f; bool ok; qihse_kv_store_t* store; int32_t sstable_id; } memtable_save_ctx_t;
 static bool write_memtable_cb(const char* key, void* value, size_t value_size, void* user_data) {
     (void)value_size;
     memtable_save_ctx_t* ctx = (memtable_save_ctx_t*)user_data;
     if (!ctx || !ctx->ok || !key || !value || !ctx->f) return false;
-    if (!disk_record_write(ctx->f, key, (const kv_payload_t*)value)) { ctx->ok = false; return false; }
+    const kv_payload_t* p = (const kv_payload_t*)value;
+    long rec_off = ftell(ctx->f);
+    if (!disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
+    /* Record the flushed key's metadata so the write/read paths can answer
+     * existence and location in memory instead of scanning this file. */
+    if (ctx->store && ctx->store->sst_meta) {
+        sst_meta_index_insert(ctx->store->sst_meta, key,
+                              p->classification, p->sci_compartment,
+                              p->expire_time_ms, p->flags,
+                              ctx->sstable_id,
+                              rec_off >= 0 ? (uint64_t)rec_off : 0u);
+    }
     return true;
 }
 
-static int kv_save_memtable_only(qihse_kv_store_t* store, const char* filepath) {
+static int kv_save_memtable_only(qihse_kv_store_t* store, const char* filepath, int32_t sstable_id) {
     if (!store || !store->trie || !filepath) return -1;
     char tmp[8192]; FILE* f = NULL;
     if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
-    memtable_save_ctx_t ctx = { .f = f, .ok = true };
+    memtable_save_ctx_t ctx = { .f = f, .ok = true, .store = store, .sstable_id = sstable_id };
     qihse_trinary_trie_foreach(store->trie, write_memtable_cb, &ctx);
     if (!ctx.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
     if (!atomic_file_commit(f, tmp, filepath)) return -1;
@@ -324,7 +480,7 @@ static bool flush_memtable_to_sstable(qihse_kv_store_t* store) {
     char sst_path[4096];
     int n = snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, store->sstable_counter);
     if (n < 0 || (size_t)n >= sizeof(sst_path)) return false;
-    if (kv_save_memtable_only(store, sst_path) != 0) return false;
+    if (kv_save_memtable_only(store, sst_path, store->sstable_counter) != 0) return false;
     qihse_trinary_trie_t* replacement = qihse_trinary_trie_create();
     if (!replacement) { unlink(sst_path); return false; }
     qihse_trinary_trie_t* old = store->trie;
@@ -355,21 +511,55 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
     uint32_t val_len = (uint32_t)val_len_sz;
     uint64_t crc = wal_record_crc(op, flags, key_len, val_len, classification,
                                   sci_compartment, expire_time_ms, key, value ? value : "");
-    bool ok = fwrite_exact(KV_WAL_MAGIC, 1u, 4u, store->wal_fd) &&
-              fwrite_exact(&op, sizeof(op), 1u, store->wal_fd) &&
-              fwrite_exact(&flags, sizeof(flags), 1u, store->wal_fd) &&
-              fwrite_exact(&key_len, sizeof(key_len), 1u, store->wal_fd) &&
-              fwrite_exact(&val_len, sizeof(val_len), 1u, store->wal_fd) &&
-              fwrite_exact(&classification, sizeof(classification), 1u, store->wal_fd) &&
-              fwrite_exact(&sci_compartment, sizeof(sci_compartment), 1u, store->wal_fd) &&
-              fwrite_exact(&expire_time_ms, sizeof(expire_time_ms), 1u, store->wal_fd) &&
-              fwrite_exact(&crc, sizeof(crc), 1u, store->wal_fd) &&
+    /* Coalesce the fixed 32-byte header into one buffer so the record is
+     * written with 3 stdio calls (header, key, value) instead of 11. */
+    unsigned char hdr[32];
+    memcpy(hdr + 0, KV_WAL_MAGIC, 4u);
+    hdr[4] = op;
+    hdr[5] = flags;
+    memcpy(hdr + 6,  &key_len, 2u);
+    memcpy(hdr + 8,  &val_len, 4u);
+    memcpy(hdr + 12, &classification, 2u);
+    memcpy(hdr + 14, &sci_compartment, 2u);
+    memcpy(hdr + 16, &expire_time_ms, 8u);
+    memcpy(hdr + 24, &crc, 8u);
+    bool ok = fwrite_exact(hdr, 1u, sizeof(hdr), store->wal_fd) &&
               fwrite_exact(key, 1u, key_len, store->wal_fd) &&
               fwrite_exact(value ? value : "", 1u, val_len, store->wal_fd);
     if (!ok) return false;
     store->wal_unflushed_bytes += 32u + key_len + val_len;
     if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
     return true;
+}
+
+/* Read a single record by (file id, byte offset) as pinpointed by the
+ * metadata index. */
+static kv_lookup_state_t lookup_one_sstable(const char* dir, const char* key,
+                                            int32_t sstable_id, uint64_t offset,
+                                            kv_lookup_result_t* out) {
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, sstable_id);
+    if (n < 0 || (size_t)n >= sizeof(path)) return KV_LOOKUP_ERROR;
+    int fd = open_secure_read(path);
+    if (fd < 0) return (errno == ENOENT) ? KV_LOOKUP_MISS : KV_LOOKUP_ERROR;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return KV_LOOKUP_ERROR; }
+    if (fseeko(f, (off_t)offset, SEEK_SET) != 0) { fclose(f); return KV_LOOKUP_ERROR; }
+    uint64_t now = current_time_ms();
+    kv_disk_record_t r;
+    int rc = disk_record_read(f, &r);
+    if (rc != 1) { fclose(f); return (rc < 0) ? KV_LOOKUP_ERROR : KV_LOOKUP_MISS; }
+    if (strcmp(r.key, key) != 0) { disk_record_free(&r); fclose(f); return KV_LOOKUP_MISS; }
+    out->classification = r.classification;
+    out->sci_compartment = r.sci_compartment;
+    out->expire_time_ms = r.expire_time_ms;
+    out->flags = r.flags;
+    bool dead = (r.flags & KV_FLAG_TOMBSTONE) != 0u ||
+                (r.expire_time_ms != 0u && r.expire_time_ms <= now);
+    if (!dead) { out->value = r.val; r.val = NULL; }
+    disk_record_free(&r); fclose(f);
+    out->state = dead ? KV_LOOKUP_DEAD : KV_LOOKUP_LIVE;
+    return out->state;
 }
 
 static kv_lookup_state_t lookup_sstables(qihse_kv_store_t* store, const char* key,
@@ -424,6 +614,19 @@ static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store, const char* key
         out->value = strdup(p->val);
         if (!out->value) { out->state = KV_LOOKUP_ERROR; return out->state; }
         out->state = KV_LOOKUP_LIVE; return out->state;
+    }
+    /* Fast path: the SSTable metadata index pinpoints the single file holding
+     * the newest copy, so we open just that file instead of scanning them all.
+     * When the index is complete (not degraded) an index miss is authoritative:
+     * the key is absent from every SSTable. */
+    if (store->sst_meta && !store->sst_meta->degraded) {
+        int32_t sid = -1; uint64_t off = 0u;
+        if (sst_meta_index_lookup(store->sst_meta, key, NULL, NULL, NULL, NULL, &sid, &off)) {
+            const char* dir = get_qihse_data_dir();
+            if (!dir) return KV_LOOKUP_ERROR;
+            return lookup_one_sstable(dir, key, sid, off, out);
+        }
+        return KV_LOOKUP_MISS;
     }
     return lookup_sstables(store, key, out);
 }
@@ -492,6 +695,7 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
         if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
     }
     store->sstable_counter = 0;
+    sst_meta_index_reset(store);
     return true;
 }
 
@@ -598,11 +802,34 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     fclose(f);
 }
 
+/* Populate the in-memory SSTable metadata index from one on-disk SSTable. */
+static void sst_index_load_file(qihse_kv_store_t* store, const char* path, int32_t sstable_id) {
+    if (!store || !store->sst_meta || !path) return;
+    int fd = open_secure_read(path);
+    if (fd < 0) return;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return; }
+    kv_disk_record_t r; int rc;
+    for (;;) {
+        long rec_off = ftell(f);
+        rc = disk_record_read(f, &r);
+        if (rc != 1) break;
+        sst_meta_index_insert(store->sst_meta, r.key,
+                              r.classification, r.sci_compartment,
+                              r.expire_time_ms, r.flags, sstable_id,
+                              rec_off >= 0 ? (uint64_t)rec_off : 0u);
+        disk_record_free(&r);
+    }
+    fclose(f);
+}
+
 qihse_kv_store_t* qihse_kv_store_create(void) {
     qihse_kv_store_t* store = (qihse_kv_store_t*)calloc(1u, sizeof(*store));
     if (!store) return NULL;
     store->trie = qihse_trinary_trie_create();
     if (!store->trie) { free(store); return NULL; }
+    store->sst_meta = sst_meta_index_create();
+    if (!store->sst_meta) { qihse_kv_store_destroy(store); return NULL; }
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_kv_store_destroy(store); return NULL; }
     DIR* d = opendir(dir);
@@ -616,6 +843,14 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
             }
         }
         closedir(d);
+    }
+    /* Load key metadata from existing SSTables (oldest first so newer files
+     * overwrite older entries, matching lookup_sstables' newest-first scan). */
+    for (int i = 0; i < store->sstable_counter; i++) {
+        char sst_path[4096];
+        int n = snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, i);
+        if (n < 0 || (size_t)n >= sizeof(sst_path)) continue;
+        sst_index_load_file(store, sst_path, i);
     }
     recover_from_wal(store);
     char wal_path[4096];
@@ -632,6 +867,7 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (store->qdd_ctx) qihse_qdd_free(__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE));
     if (store->wal_fd) { flush_wal_buffer(store); fclose(store->wal_fd); }
     if (store->trie) qihse_trinary_trie_destroy(store->trie);
+    sst_meta_index_destroy(store->sst_meta);
     free(store);
 }
 
@@ -646,13 +882,37 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
     if (!store || !store->trie || !key || !value || key[0] == '\0') return false;
     if (strlen(key) > KV_MAX_KEY_LEN || strlen(value) > KV_MAX_VALUE_LEN) return false;
     if (!qihse_auth_can_access(user, classification, sci_compartment)) return false;
-    kv_lookup_result_t existing; kv_lookup_state_t state = logical_lookup(store, key, &existing);
-    if (state == KV_LOOKUP_ERROR) return false;
-    if ((state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) &&
-        !qihse_auth_can_access(user, existing.classification, existing.sci_compartment)) {
-        lookup_result_free(&existing); return false;
+    /* Determine whether the key already exists, and at what classification, so
+     * the auth-on-overwrite invariant can be enforced.  The memtable (trie) is
+     * newest; the SSTable metadata index covers flushed data.  Both are
+     * in-memory, so this no longer linear-scans every SSTable per write.
+     * If the index is degraded (OOM) we fall back to the authoritative
+     * logical_lookup() so authorization is never skipped. */
+    bool key_exists = false;
+    uint16_t ex_class = 0u, ex_comp = 0u;
+    size_t existing_size = 0u;
+    kv_payload_t* trie_hit = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, &existing_size);
+    if (trie_hit) {
+        key_exists = true;
+        ex_class = trie_hit->classification;
+        ex_comp = trie_hit->sci_compartment;
+    } else if (store->sst_meta && !store->sst_meta->degraded) {
+        uint64_t ex_expire = 0u; uint8_t ex_flags = 0u;
+        if (sst_meta_index_lookup(store->sst_meta, key, &ex_class, &ex_comp, &ex_expire, &ex_flags, NULL, NULL)) {
+            key_exists = true;
+        }
+    } else {
+        kv_lookup_result_t existing;
+        kv_lookup_state_t state = logical_lookup(store, key, &existing);
+        if (state == KV_LOOKUP_ERROR) return false;
+        if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
+            key_exists = true;
+            ex_class = existing.classification;
+            ex_comp = existing.sci_compartment;
+        }
+        lookup_result_free(&existing);
     }
-    lookup_result_free(&existing);
+    if (key_exists && !qihse_auth_can_access(user, ex_class, ex_comp)) return false;
     if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms, classification, sci_compartment, 0u)) return false;
     if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u)) return false;
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
@@ -900,7 +1160,9 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
         char path[4096]; int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
         if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
     }
-    store->sstable_counter = 0; return 0;
+    store->sstable_counter = 0;
+    sst_meta_index_reset(store);
+    return 0;
 }
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
 

@@ -21,4 +21,12 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
  * Triggers an authenticated lockdown prompt on mismatch. */
 void qihse_audit_verify_integrity(void);
 
+/* Block until every queued audit entry has been signed and written.
+ * Audit entries are signed asynchronously; call this before a clean exit or
+ * when an on-disk audit trail must be complete. */
+void qihse_audit_flush(void);
+
+/* Drain the audit queue and stop the background signer thread. */
+void qihse_audit_shutdown(void);
+
 #endif // QIHSE_AUDIT_H

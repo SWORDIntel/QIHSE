@@ -34,6 +34,33 @@ static char webhook_target[256] = ""; // Optional audit notification endpoint
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
+/*
+ * Asynchronous audit signing.
+ *
+ * The SHA-384 hash chain is computed synchronously (cheap, and it preserves
+ * ordering + tamper-evidence), but the expensive ML-DSA-87 signature and the
+ * audit-file / integrity-chain writes are performed by a background signer
+ * thread.  qihse_audit_log() therefore no longer pays the ~6.5 ms/entry
+ * signing cost on the calling thread, while the emitted records are
+ * byte-identical and in the same order as the synchronous implementation.
+ */
+typedef struct audit_pending {
+    char buffer[1024];
+    char new_hash[129];
+    struct audit_pending* next;
+} audit_pending_t;
+
+static audit_pending_t* g_q_head = NULL;
+static audit_pending_t* g_q_tail = NULL;
+static pthread_cond_t g_q_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_q_empty_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_signer_tid;
+static int g_signer_started = 0;
+static int g_signer_ok = 0;
+static int g_signer_stop = 0;
+
+static void* audit_signer_main(void* arg);
+
 // CNSA 2.0: REAL SHA-384
 static void compute_sha384(const char *input, char *output) {
     unsigned char hash[SHA384_DIGEST_LENGTH];
@@ -46,10 +73,15 @@ static void compute_sha384(const char *input, char *output) {
 
 static void write_obfuscated(FILE *f, const char* buffer) {
     size_t len = strlen(buffer);
-    for (size_t i = 0; i < len; i++) {
-        fputc(buffer[i] ^ XOR_KEY, f);
+    if (len + 1u > 4096u) {
+        for (size_t i = 0; i < len; i++) fputc(buffer[i] ^ XOR_KEY, f);
+        fputc('\n' ^ XOR_KEY, f);
+        return;
     }
-    fputc('\n' ^ XOR_KEY, f);
+    char tmp[4096];
+    for (size_t i = 0; i < len; i++) tmp[i] = (char)(buffer[i] ^ XOR_KEY);
+    tmp[len] = (char)('\n' ^ XOR_KEY);
+    fwrite(tmp, 1u, len + 1u, f);
 }
 
 static void update_integrity_chain(const char* new_hash);
@@ -169,26 +201,31 @@ void qihse_audit_init(void) {
         chmod(AUDIT_FILE, 0600);
 #endif
     }
+    /* Start the background signer so qihse_audit_log() never blocks on the
+     * ~6.5 ms/entry ML-DSA-87 signing path.  If the thread cannot start, the
+     * log path transparently falls back to synchronous signing. */
+    if (!g_signer_started) {
+        g_signer_stop = 0;
+        if (pthread_create(&g_signer_tid, NULL, audit_signer_main, NULL) == 0) {
+            g_signer_ok = 1;
+            g_signer_started = 1;
+        }
+    }
+    {
+        static int atexit_registered = 0;
+        if (!atexit_registered) { atexit_registered = 1; atexit(qihse_audit_flush); }
+    }
     pthread_mutex_unlock(&audit_mutex);
     qihse_audit_verify_integrity();
 }
 
-void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, uint16_t classif, uint16_t sci) {
-    pthread_mutex_lock(&audit_mutex);
-    
-    char buffer[1024];
-    time_t now = time(NULL);
-    snprintf(buffer, sizeof(buffer), "%s|%ld|%s|%u|%u|%u|%u", 
-             last_hash, (long)now, action, user_id, target_id, classif, sci);
-             
-    char new_hash[129];
-    compute_sha384(buffer, new_hash);
-    
-    // Real ML-DSA-87 signature over the SHA-384 hash
+/* The expensive part: ML-DSA-87 signature + audit file + integrity chain.
+ * Runs on the signer thread (or inline as a fallback). */
+static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     unsigned char mldsa87_sig[MLDSA87_SIG_BYTES];
     size_t siglen = sizeof(mldsa87_sig);
     memset(mldsa87_sig, 0, sizeof(mldsa87_sig));
-    
+
     if (audit_pkey) {
         EVP_MD_CTX *mctx = EVP_MD_CTX_new();
         if (mctx) {
@@ -198,13 +235,11 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
             EVP_MD_CTX_free(mctx);
         }
     }
-    
+
 #ifndef _WIN32
     int afd = open(AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
     FILE *f = NULL;
-    if (afd >= 0) {
-        f = fdopen(afd, "ab");
-    }
+    if (afd >= 0) f = fdopen(afd, "ab");
 #else
     FILE *f = fopen(AUDIT_FILE, "ab");
 #endif
@@ -212,19 +247,94 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         char out_buf[2048];
         snprintf(out_buf, sizeof(out_buf), "%s|%s|SIG_MLDSA87_ATTACHED", buffer, new_hash);
         write_obfuscated(f, out_buf);
-        for (int i = 0; i < MLDSA87_SIG_BYTES; i++) fputc(mldsa87_sig[i] ^ XOR_KEY, f);
+        char sigbuf[MLDSA87_SIG_BYTES];
+        for (int i = 0; i < MLDSA87_SIG_BYTES; i++) sigbuf[i] = (char)(mldsa87_sig[i] ^ XOR_KEY);
+        fwrite(sigbuf, 1u, sizeof(sigbuf), f);
         fclose(f);
     }
 #ifndef _WIN32
-    if (afd >= 0 && !f) {
-        close(afd);
-    }
+    if (afd >= 0 && !f) close(afd);
 #endif
-    
-    memcpy(last_hash, new_hash, 129);
-    update_integrity_chain(last_hash);
-    
+
+    update_integrity_chain(new_hash);
+}
+
+static void* audit_signer_main(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&audit_mutex);
+        while (!g_q_head && !g_signer_stop) {
+            pthread_cond_wait(&g_q_cond, &audit_mutex);
+        }
+        if (!g_q_head && g_signer_stop) {
+            pthread_mutex_unlock(&audit_mutex);
+            return NULL;
+        }
+        audit_pending_t* e = g_q_head;
+        g_q_head = e->next;
+        if (!g_q_head) { g_q_tail = NULL; pthread_cond_broadcast(&g_q_empty_cond); }
+        pthread_mutex_unlock(&audit_mutex);
+
+        audit_sign_and_write(e->buffer, e->new_hash);
+        free(e);
+    }
+}
+
+/* Block until every queued audit entry has been signed and written. */
+void qihse_audit_flush(void) {
+    if (!g_signer_ok) return;
+    pthread_mutex_lock(&audit_mutex);
+    while (g_q_head && !g_signer_stop) {
+        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+    }
     pthread_mutex_unlock(&audit_mutex);
+}
+
+/* Drain the queue and stop the signer thread. */
+void qihse_audit_shutdown(void) {
+    if (!g_signer_ok) return;
+    qihse_audit_flush();
+    pthread_mutex_lock(&audit_mutex);
+    g_signer_stop = 1;
+    pthread_cond_broadcast(&g_q_cond);
+    pthread_mutex_unlock(&audit_mutex);
+    pthread_join(g_signer_tid, NULL);
+    g_signer_ok = 0;
+    g_signer_started = 0;
+}
+
+void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, uint16_t classif, uint16_t sci) {
+    char buffer[1024];
+    char new_hash[129];
+
+    /* Hash-chain step stays synchronous: it is cheap and preserves the exact
+     * ordering and tamper-evidence of the chain. */
+    pthread_mutex_lock(&audit_mutex);
+    time_t now = time(NULL);
+    snprintf(buffer, sizeof(buffer), "%s|%ld|%s|%u|%u|%u|%u",
+             last_hash, (long)now, action, user_id, target_id, classif, sci);
+    compute_sha384(buffer, new_hash);
+    memcpy(last_hash, new_hash, 129);
+
+    /* Offload the ML-DSA-87 signature + file writes to the signer thread. */
+    if (g_signer_ok) {
+        audit_pending_t* e = (audit_pending_t*)malloc(sizeof(*e));
+        if (e) {
+            memcpy(e->buffer, buffer, sizeof(e->buffer));
+            memcpy(e->new_hash, new_hash, sizeof(e->new_hash));
+            e->next = NULL;
+            if (g_q_tail) g_q_tail->next = e; else g_q_head = e;
+            g_q_tail = e;
+            pthread_cond_signal(&g_q_cond);
+            pthread_mutex_unlock(&audit_mutex);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&audit_mutex);
+
+    /* Fallback (signer unavailable or allocation failure): sign inline so an
+     * entry is never silently dropped. */
+    audit_sign_and_write(buffer, new_hash);
 }
 
 #include <fcntl.h>
