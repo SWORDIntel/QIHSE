@@ -44,8 +44,23 @@ The RESP compatibility layer covers common Redis-style data structures and comma
 - expiry and persistence-related key operations
 - MULTI / EXEC / DISCARD / WATCH / UNWATCH
 - pub/sub with real message fan-out (`qihse_resp_pubsub.c`): `SUBSCRIBE` / `UNSUBSCRIBE` / `PSUBSCRIBE` / `PUNSUBSCRIBE` / `PUBLISH` / `PUBSUB CHANNELS|NUMSUB|NUMPAT`. Every publish is appended to a durable event stream (topic `resp.pubsub`) when `pubsub_log_directory` is configured, making messages replayable by the UWP STREAM target and CDC. Subscribed connections accept only subscription commands, `PING`, `QUIT`, and `RESET`. Channels carry a configurable `(classification, SCI)` security tag; `SUBSCRIBE` and `PUBLISH` require the caller's clearance to dominate it (`NOPERM` otherwise).
-- server and introspection commands
+- server and introspection commands — `DBSIZE` returns a real, authorization-aware count (callers see only records they may read)
 - scripting entry points
+
+### QIHSE extensions to the RESP surface
+
+These commands are QIHSE-specific; standard Redis clients will not send them.
+
+- `BUNDLE.PREPARE <fingerprint> [have-hash …]` / `BUNDLE.PREPARE <tenant_id> <fingerprint> [have-hash …]` and `BUNDLE.CHUNK <hash> <offset>` — session-bundle compose and chunked blob delivery (system-domain callers compose on behalf of a tenant). See [Session-delivery subsystem](architecture/session_delivery.md).
+- `METRICS.RENDER` — Prometheus-style delivery metrics; system-domain principals only (`NOPERM` for tenants).
+
+### Tenancy-aware behavior (differs from stock Redis)
+
+QIHSE tenant principals (`tenant_id != 0`) are deny-by-default at the engine boundary: they may access only keys under their own `t:<tenant_id>/…` namespace and the shared `commons/…` namespace; every other key — including unscoped ones — is refused with `NOPERM` before a handler runs. Writes into `t:*/tlm/…` (telemetry) must additionally match a closed record-type schema; violating records are rejected at ingest (`INGEST record rejected`), not stored. System-domain principals (including the operator) are unrestricted. See [Session-delivery subsystem](architecture/session_delivery.md).
+
+### Pub/sub channel policy
+
+Channels carry a configurable `(classification, SCI)` tag as before; since the session-delivery work a channel may additionally carry per-channel policy overrides, including `publish_system_only`. The fleet-wide `killswitch` channel (enabled via `enable_killswitch_channel`) is readable by every authenticated tenant but publishable only by system-domain principals; valid `burn_edge` telemetry writes fan out on it automatically.
 
 ### Standalone server and UWP bridge
 

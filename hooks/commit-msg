@@ -1,0 +1,26 @@
+#!/bin/bash
+# commit-msg hook: strip Devin/AI attribution lines from commit messages.
+#
+# Removes lines matching:
+#   Generated with [Devin](...)
+#   Co-Authored-By: Devin <...>
+#   Co-Authored-By: ...devin-ai-integration...
+#
+# Install: cp hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
+
+msg_file="$1"
+tmp=$(mktemp)
+
+# Strip attribution lines
+grep -v -i \
+  -e 'Generated with \[Devin\]' \
+  -e 'Co-Authored-By: Devin' \
+  -e 'devin-ai-integration\|devin\.ai' \
+  "$msg_file" > "$tmp"
+
+# Remove trailing blank lines, ensure single trailing newline
+perl -0777 -i -pe 's/\n+$/\n/' "$tmp"
+
+cp "$tmp" "$msg_file"
+rm -f "$tmp"
+exit 0

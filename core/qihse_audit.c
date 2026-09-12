@@ -34,6 +34,15 @@ static char webhook_target[256] = ""; // Optional audit notification endpoint
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
+/* Build integrity chain path from QIHSE_DATA_DIR env or fall back to CWD */
+static void build_chain_path(char *buf, size_t buflen) {
+    const char *dir = getenv("QIHSE_DATA_DIR");
+    if (dir && *dir) {
+        snprintf(buf, buflen, "%s/%s", dir, INTEGRITY_CHAIN_FILE);
+    } else {
+        snprintf(buf, buflen, "%s", INTEGRITY_CHAIN_FILE);
+    }
+}
 /*
  * Asynchronous audit signing.
  *
@@ -88,7 +97,9 @@ static void update_integrity_chain(const char* new_hash);
 
 void qihse_audit_verify_integrity(void) {
 #ifndef _WIN32
-    int sfd = open(INTEGRITY_CHAIN_FILE, O_RDONLY | O_NOFOLLOW);
+    char chain_path[4096];
+    build_chain_path(chain_path, sizeof(chain_path));
+    int sfd = open(chain_path, O_RDONLY | O_NOFOLLOW);
     if (sfd >= 0) {
     FILE *sf = fdopen(sfd, "r");
     if (sf) {
@@ -110,7 +121,9 @@ void qihse_audit_verify_integrity(void) {
     }
     // No integrity chain file = fresh start, no lockdown
 #else
-    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "r");
+    char chain_path[4096];
+    build_chain_path(chain_path, sizeof(chain_path));
+    FILE *sf = fopen(chain_path, "r");
     if (sf) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
@@ -126,7 +139,9 @@ void qihse_audit_verify_integrity(void) {
 
 static void update_integrity_chain(const char* new_hash) {
 #ifndef _WIN32
-    int sfd = open(INTEGRITY_CHAIN_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    char chain_path[4096];
+    build_chain_path(chain_path, sizeof(chain_path));
+    int sfd = open(chain_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (sfd >= 0) {
         FILE *sf = fdopen(sfd, "w");
         if (sf) {
@@ -137,7 +152,9 @@ static void update_integrity_chain(const char* new_hash) {
         }
     }
 #else
-    FILE *sf = fopen(INTEGRITY_CHAIN_FILE, "w");
+    char chain_path[4096];
+    build_chain_path(chain_path, sizeof(chain_path));
+    FILE *sf = fopen(chain_path, "w");
     if (sf) {
         fprintf(sf, "%s", new_hash);
         fclose(sf);

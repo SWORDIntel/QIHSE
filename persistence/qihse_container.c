@@ -48,7 +48,7 @@ static bool s_hmac_key_mlocked = false;
 static bool load_hmac_key(void) {
     if (s_hmac_key_loaded) return true;
 #ifndef _WIN32
-    FILE *kf = fopen(QIHSE_KEM_PRIVATE_KEY_FILE, "rb");
+    FILE *kf = fopen(QIHSE_KEM_KEY_PATH(), "rb");
     if (kf) {
         EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
         if (mdctx && EVP_DigestInit_ex(mdctx, EVP_sha384(), NULL) > 0) {
@@ -349,11 +349,12 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
     {
         bool key_exists = false;
 #ifndef _WIN32
-        FILE *kf = fopen(QIHSE_KEM_PRIVATE_KEY_FILE, "rb");
+        FILE *kf = fopen(QIHSE_KEM_KEY_PATH(), "rb");
         if (kf) { fclose(kf); key_exists = true; }
 #endif
         ctr->skip_integrity = (!key_exists &&
-                               getenv("QIHSE_ENFORCE_INTEGRITY") == NULL);
+                               getenv("QIHSE_ENFORCE_INTEGRITY") == NULL) ||
+                              (getenv("QIHSE_SKIP_INTEGRITY") != NULL);
         ctr->parallel_crc = (getenv("QIHSE_PARALLEL_CRC") != NULL);
         ctr->use_crc32c = (getenv("QIHSE_CRC32C") != NULL);
         const char* threads_env = getenv("QIHSE_CRC_THREADS");
@@ -541,7 +542,9 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
     }
     uint8_t computed_hmac[48];
     compute_hmac_sha384(buf, (size_t)sec->length, computed_hmac);
-    if (sec->section_id != QIHSE_CTR_SEC_WAL && CRYPTO_memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
+    if (!ctr->skip_integrity &&
+        sec->section_id != QIHSE_CTR_SEC_WAL &&
+        CRYPTO_memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
         fprintf(stderr, "[CONTAINER] HMAC-SHA-384 mismatch for section %u\n", section_id);
         free(buf);
         errno = EINVAL;

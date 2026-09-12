@@ -128,6 +128,57 @@ static EVP_PKEY *load_public_key(const char *path) {
 
 /* ── ML-KEM-1024 key encapsulation ───────────────────────────────────── */
 
+static bool pqc_encapsulate_with_key(qihse_pqc_ctx_t *ctx, EVP_PKEY *pub_key,
+                                     uint8_t *encapsulated_key_out) {
+    bool ok = false;
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pub_key, NULL);
+    if (pctx && EVP_PKEY_encapsulate_init(pctx, NULL) > 0) {
+        uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
+        size_t ct_len  = QIHSE_MLKEM_CIPHERTEXT_SIZE;
+        size_t ss_len  = sizeof(shared_secret);
+
+        if (EVP_PKEY_encapsulate(pctx,
+                                 encapsulated_key_out, &ct_len,
+                                 shared_secret, &ss_len) > 0
+            && ct_len == QIHSE_MLKEM_CIPHERTEXT_SIZE
+            && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
+            memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
+            OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+            ctx->initialized = true;
+            ok = true;
+        } else {
+            ERR_print_errors_fp(stderr);
+        }
+        EVP_PKEY_CTX_free(pctx);
+    }
+    return ok;
+}
+
+static bool pqc_decapsulate_with_key(qihse_pqc_ctx_t *ctx, EVP_PKEY *priv_key,
+                                     const uint8_t *encapsulated_key_in) {
+    bool ok = false;
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv_key, NULL);
+    if (pctx && EVP_PKEY_decapsulate_init(pctx, NULL) > 0) {
+        uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
+        size_t ss_len = sizeof(shared_secret);
+
+        if (EVP_PKEY_decapsulate(pctx,
+                                 shared_secret, &ss_len,
+                                 encapsulated_key_in,
+                                 QIHSE_MLKEM_CIPHERTEXT_SIZE) > 0
+            && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
+            memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
+            OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+            ctx->initialized = true;
+            ok = true;
+        } else {
+            ERR_print_errors_fp(stderr);
+        }
+        EVP_PKEY_CTX_free(pctx);
+    }
+    return ok;
+}
+
 bool qihse_pqc_init(qihse_pqc_ctx_t *ctx,
                     const uint8_t *encapsulated_key_in,
                     uint8_t *encapsulated_key_out) {
@@ -136,77 +187,52 @@ bool qihse_pqc_init(qihse_pqc_ctx_t *ctx,
 
     if (encapsulated_key_in == NULL && encapsulated_key_out != NULL) {
         /*
-         * Encapsulate path: generate a fresh session key.
-         *
-         * EVP_PKEY_encapsulate() generates:
-         *   - a random 32-byte shared secret  → we use this directly as AES-256 key
-         *   - a 1568-byte ML-KEM-1024 ciphertext → stored in the container header
-         *
-         * The private key holder can later recover the same shared secret by
-         * running EVP_PKEY_decapsulate() on the stored ciphertext.
+         * Encapsulate path: generate a fresh session key under the server's
+         * static public key (at-rest AES key wrapping).
          */
-        EVP_PKEY *pub_key = load_public_key(QIHSE_KEM_PUBLIC_KEY_FILE);
+        EVP_PKEY *pub_key = load_public_key(QIHSE_KEM_PUB_PATH());
         if (!pub_key) return false;
-
-        bool ok = false;
-        EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pub_key, NULL);
-        if (pctx && EVP_PKEY_encapsulate_init(pctx, NULL) > 0) {
-            uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
-            size_t ct_len  = QIHSE_MLKEM_CIPHERTEXT_SIZE;
-            size_t ss_len  = sizeof(shared_secret);
-
-            if (EVP_PKEY_encapsulate(pctx,
-                                     encapsulated_key_out, &ct_len,
-                                     shared_secret, &ss_len) > 0
-                && ct_len == QIHSE_MLKEM_CIPHERTEXT_SIZE
-                && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
-                memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
-                OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-                ctx->initialized = true;
-                ok = true;
-            } else {
-                ERR_print_errors_fp(stderr);
-            }
-            EVP_PKEY_CTX_free(pctx);
-        }
+        bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
         EVP_PKEY_free(pub_key);
         return ok;
 
     } else if (encapsulated_key_in != NULL) {
         /*
-         * Decapsulate path: recover the session key from a stored ciphertext.
-         *
-         * EVP_PKEY_decapsulate() uses the ML-KEM-1024 private key to recover
-         * the same 32-byte shared secret that was generated during encapsulation.
+         * Decapsulate path: recover the session key from a stored ciphertext
+         * with the server's static private key.
          */
-        EVP_PKEY *priv_key = load_private_key(QIHSE_KEM_PRIVATE_KEY_FILE);
+        EVP_PKEY *priv_key = load_private_key(QIHSE_KEM_KEY_PATH());
         if (!priv_key) return false;
-
-        bool ok = false;
-        EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv_key, NULL);
-        if (pctx && EVP_PKEY_decapsulate_init(pctx, NULL) > 0) {
-            uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
-            size_t ss_len = sizeof(shared_secret);
-
-            if (EVP_PKEY_decapsulate(pctx,
-                                     shared_secret, &ss_len,
-                                     encapsulated_key_in,
-                                     QIHSE_MLKEM_CIPHERTEXT_SIZE) > 0
-                && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
-                memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
-                OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-                ctx->initialized = true;
-                ok = true;
-            } else {
-                ERR_print_errors_fp(stderr);
-            }
-            EVP_PKEY_CTX_free(pctx);
-        }
+        bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
         EVP_PKEY_free(priv_key);
         return ok;
     }
 
     return false;
+}
+
+bool qihse_pqc_encapsulate_peer(qihse_pqc_ctx_t *ctx,
+                                const char *peer_public_key_path,
+                                uint8_t *encapsulated_key_out) {
+    if (!ctx || !peer_public_key_path || !encapsulated_key_out) return false;
+    ctx->initialized = false;
+    EVP_PKEY *pub_key = load_public_key(peer_public_key_path);
+    if (!pub_key) return false;
+    bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
+    EVP_PKEY_free(pub_key);
+    return ok;
+}
+
+bool qihse_pqc_decapsulate_private(qihse_pqc_ctx_t *ctx,
+                                   const char *private_key_path,
+                                   const uint8_t *encapsulated_key_in) {
+    if (!ctx || !private_key_path || !encapsulated_key_in) return false;
+    ctx->initialized = false;
+    EVP_PKEY *priv_key = load_private_key(private_key_path);
+    if (!priv_key) return false;
+    bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
+    EVP_PKEY_free(priv_key);
+    return ok;
 }
 
 void qihse_pqc_destroy(qihse_pqc_ctx_t *ctx) {
@@ -307,7 +333,14 @@ err:
 /* ── ML-DSA-87 sign/verify ───────────────────────────────────────────── */
 
 bool qihse_pqc_sign(const uint8_t *data, size_t len, uint8_t *out_sig) {
-    EVP_PKEY *priv_key = load_private_key(QIHSE_DSA_PRIVATE_KEY_FILE);
+    return qihse_pqc_sign_path(data, len, out_sig, NULL);
+}
+
+bool qihse_pqc_sign_path(const uint8_t *data, size_t len, uint8_t *out_sig,
+                         const char *private_key_path) {
+    if (!data || !out_sig) return false;
+    EVP_PKEY *priv_key = load_private_key(private_key_path ? private_key_path
+                                                           : QIHSE_DSA_KEY_PATH());
     if (!priv_key) return false;
 
     bool ok = false;
@@ -328,7 +361,7 @@ bool qihse_pqc_sign(const uint8_t *data, size_t len, uint8_t *out_sig) {
 }
 
 bool qihse_pqc_verify(const uint8_t *data, size_t len, const uint8_t *sig) {
-    EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUBLIC_KEY_FILE);
+    EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUB_PATH());
     if (!pub_key) return false;
 
     bool ok = false;
@@ -484,19 +517,12 @@ static bool verify_dsa_roundtrip(const char *priv_path, const char *pub_path) {
 bool qihse_pqc_keygen(const char *out_dir) {
     if (!out_dir) out_dir = ".";
 
-    /* Build file paths — key file macros may be absolute paths */
-    char kem_priv[512], kem_pub[512], dsa_priv[512], dsa_pub[512];
-    if (QIHSE_KEM_PRIVATE_KEY_FILE[0] == '/') {
-        snprintf(kem_priv, sizeof(kem_priv), "%s", QIHSE_KEM_PRIVATE_KEY_FILE);
-        snprintf(kem_pub,  sizeof(kem_pub),  "%s", QIHSE_KEM_PUBLIC_KEY_FILE);
-        snprintf(dsa_priv, sizeof(dsa_priv), "%s", QIHSE_DSA_PRIVATE_KEY_FILE);
-        snprintf(dsa_pub,  sizeof(dsa_pub),  "%s", QIHSE_DSA_PUBLIC_KEY_FILE);
-    } else {
-        snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, QIHSE_KEM_PRIVATE_KEY_FILE);
-        snprintf(kem_pub,  sizeof(kem_pub),  "%s/%s", out_dir, QIHSE_KEM_PUBLIC_KEY_FILE);
-        snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, QIHSE_DSA_PRIVATE_KEY_FILE);
-        snprintf(dsa_pub,  sizeof(dsa_pub),  "%s/%s", out_dir, QIHSE_DSA_PUBLIC_KEY_FILE);
-    }
+    /* Build file paths — use runtime resolver (honors QIHSE_KEY_DIR env var) */
+    char kem_priv[4096], kem_pub[4096], dsa_priv[4096], dsa_pub[4096];
+    snprintf(kem_priv, sizeof(kem_priv), "%s", QIHSE_KEM_KEY_PATH());
+    snprintf(kem_pub,  sizeof(kem_pub),  "%s", QIHSE_KEM_PUB_PATH());
+    snprintf(dsa_priv, sizeof(dsa_priv), "%s", QIHSE_DSA_KEY_PATH());
+    snprintf(dsa_pub,  sizeof(dsa_pub),  "%s", QIHSE_DSA_PUB_PATH());
 
     fprintf(stderr, "[QIHSE keygen] Output directory : %s\n", out_dir);
 

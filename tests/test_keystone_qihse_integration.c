@@ -260,7 +260,7 @@ static void test_resp_keystone_commands(void) {
     );
     assert(guest != NULL);
     assert(qihse_auth_modify_user(operator_user, TEST_GUEST_ID,
-                                  TEST_GUEST_USERNAME, NULL, -1, -1));
+                                  TEST_GUEST_USERNAME, NULL, -1, -1, -1, -1));
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     assert(store != NULL);

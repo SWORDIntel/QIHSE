@@ -38,6 +38,21 @@ void qihse_resp_pubsub_destroy(qihse_resp_pubsub_t* pubsub);
 void qihse_resp_pubsub_set_policy(qihse_resp_pubsub_t* pubsub, uint16_t classification, uint16_t sci);
 bool qihse_resp_pubsub_channel_allowed(const qihse_resp_pubsub_t* pubsub, qihse_user_t* user);
 
+/* U8: per-channel policy override. publish_system_only restricts PUBLISH to
+ * system-domain principals (tenant 0) — subscribers of any clearance
+ * satisfying the channel tag are unaffected. Used for the fleet-wide
+ * "killswitch" channel that tenants may read but never write. */
+void qihse_resp_pubsub_set_channel_policy(qihse_resp_pubsub_t* pubsub,
+                                          const char* channel, size_t channel_len,
+                                          uint16_t classification, uint16_t sci,
+                                          bool publish_system_only);
+/* Access check for one channel: uses the channel-specific policy when one is
+ * configured, otherwise the broker-wide default. `publishing` selects the
+ * publish-side restriction. */
+bool qihse_resp_pubsub_channel_access(const qihse_resp_pubsub_t* pubsub, qihse_user_t* user,
+                                      const char* channel, size_t channel_len,
+                                      bool publishing);
+
 bool qihse_resp_pubsub_subscribe(qihse_resp_pubsub_t* pubsub, void* client,
                                  qihse_resp_pubsub_delivery_fn delivery,
                                  const char* channel, size_t channel_len);

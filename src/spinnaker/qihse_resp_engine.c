@@ -8,6 +8,8 @@
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
 #include "qihse_keystone.h"
+#include "qihse_ingest_guard.h"
+#include "qihse_metrics.h"
 #include "qihse_system_guard.h"
 #include "qihse_platform.h"
 #include <ctype.h>
@@ -146,6 +148,19 @@ struct qihse_resp_server {
     uint16_t channel_classification;
     uint16_t channel_sci;
     bool enable_uwp_bridge;
+    /* Per-tenant quota policies (caller-owned, may be NULL) */
+    qihse_quota_table_t* quotas;
+    /* U3 session-bundle delivery */
+    qihse_blob_store_t* blobs;
+    qihse_bundle_composer_t* composer;
+    bool owns_composer;
+    /* U6 background expiry sweeper */
+    uint32_t kv_sweep_interval_seconds;
+    pthread_t sweeper_thread;
+    bool sweeper_started;
+    bool sweeper_shutdown;
+    /* U9 delivery metrics */
+    qihse_metrics_registry_t* metrics;
 };
 
 typedef struct {
@@ -174,6 +189,8 @@ typedef struct {
 static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"asking", 1, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"auth", -2, QIHSE_COMMAND_FAST, 0, 0, 0},
+    {"bundle.chunk", 3, QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"bundle.prepare", -2, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"client", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"cluster", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"col.append", 3, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
@@ -189,6 +206,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"hello", -1, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"incr", 2, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_FAST, 1, 1, 1},
     {"info", -1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
+    {"metrics.render", 1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"mget", -2, QIHSE_COMMAND_READONLY, 1, -1, 1},
     {"migrate", -6, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_ADMIN, 3, 3, 1},
     {"mset", -3, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, -1, 2},
@@ -849,6 +867,23 @@ static bool qihse_resp_handle_get(qihse_resp_session_t* session, const qihse_res
     return result;
 }
 
+/* U8 killswitch fan-out: a successfully stored burn_edge telemetry record is
+ * pushed to every connected tenant on the fleet-wide "killswitch" channel
+ * (system-domain publisher, per-channel policy) and mirrored to a durable
+ * unclassified commons record that offline clients pick up on their next
+ * pull. */
+static void qihse_resp_maybe_publish_killswitch(qihse_resp_session_t* session, const char* key, const char* value) {
+    if (!session->server->pubsub || !session->server->store || !key || !value) return;
+    if (strncmp(key, "t:", 2u) != 0) return;
+    if (!strstr(key, "/tlm/burn_edge/")) return;
+    qihse_user_t* system_user = session->server->unauthenticated_user;
+    qihse_resp_pubsub_publish(session->server->pubsub, system_user,
+                              "killswitch", sizeof("killswitch") - 1u,
+                              value, strlen(value));
+    if (session->server->metrics) qihse_metrics_increment(session->server->metrics, "qihse_killswitch_push_total", 1);
+    qihse_kv_set_user(session->server->store, "commons/killswitch/latest", value, 0, 0, system_user);
+}
+
 static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 3) return qihse_resp_wrong_arity(session, "set");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -891,6 +926,7 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
     bool stored = condition && qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
     if (stored && has_ttl) stored = qihse_kv_expire(session->server->store, key, ttl_ms, session->user);
     pthread_mutex_unlock(&session->server->kv_lock);
+    if (stored && condition) qihse_resp_maybe_publish_killswitch(session, key, value);
     free(key);
     free(value);
     if (!condition) {
@@ -1108,6 +1144,19 @@ static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_
     return result;
 }
 
+/* U5: hard collection boundary for ANN search. The TAG argument selects the
+ * collection; without this filter an approximate search sweeps the whole
+ * index and leaks cross-tenant neighbors (candidate-stage clearance filtering
+ * does not help — the rows are unclassified). */
+typedef struct { const char* tag; size_t len; } qihse_vec_tag_filter_t;
+
+static bool qihse_vec_tag_match(const void* metadata, size_t metadata_size, void* opaque) {
+    qihse_vec_tag_filter_t* filter = (qihse_vec_tag_filter_t*)opaque;
+    if (!filter || !filter->tag) return true; /* no tag: unfiltered */
+    return metadata && metadata_size == filter->len &&
+           memcmp(metadata, filter->tag, filter->len) == 0;
+}
+
 static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool scatter) {
     if (request->argc < 4 || !session->server->vdb) return !session->server->vdb ? qihse_resp_error(session, "ERR vector database is not configured") : qihse_resp_wrong_arity(session, scatter ? "vecscatter" : "vecsearch");
     if (scatter && !session->server->scatter && qihse_cluster_topology_nodes(session->server->topology, NULL, 0u) > 1u) return qihse_resp_error(session, "ERR distributed vector scatter transport is not configured");
@@ -1152,6 +1201,13 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
         query.top_k = top_k;
         query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
         query.user = session->user;
+        qihse_vec_tag_filter_t tag_filter = { NULL, 0 };
+        if (valid && option + 2u == request->argc) {
+            tag_filter.tag = (const char*)request->argv[option + 1u].data;
+            tag_filter.len = request->argv[option + 1u].len;
+            query.metadata_filter = qihse_vec_tag_match;
+            query.metadata_filter_opaque = &tag_filter;
+        }
         pthread_mutex_lock(&session->server->vdb_lock);
         int local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
         pthread_mutex_unlock(&session->server->vdb_lock);
@@ -3223,7 +3279,12 @@ static bool qihse_resp_handle_flushdb(qihse_resp_session_t* session, const qihse
 
 static bool qihse_resp_handle_dbsize(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
-    return qihse_resp_integer(session, 0);
+    if (!session->server->store) return qihse_resp_integer(session, 0);
+    pthread_mutex_lock(&session->server->kv_lock);
+    /* Authorization-aware count: callers see only records they may read. */
+    size_t count = qihse_kv_count_user(session->server->store, session->user);
+    pthread_mutex_unlock(&session->server->kv_lock);
+    return qihse_resp_integer(session, (int64_t)count);
 }
 
 static bool qihse_resp_handle_time(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -3480,7 +3541,9 @@ static void qihse_resp_session_pubsub_cleanup(qihse_resp_session_t* session) {
 static bool qihse_resp_handle_publish(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 3) return qihse_resp_wrong_arity(session, "publish");
     if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
-    if (!qihse_resp_pubsub_channel_allowed(session->server->pubsub, session->user))
+    if (!qihse_resp_pubsub_channel_access(session->server->pubsub, session->user,
+                                          (const char*)request->argv[1].data, request->argv[1].len,
+                                          true))
         return qihse_resp_error(session, "NOPERM channel clearance required for PUBLISH");
     uint64_t receivers = qihse_resp_pubsub_publish(session->server->pubsub, session->user,
                                                    (const char*)request->argv[1].data, request->argv[1].len,
@@ -3492,7 +3555,9 @@ static bool qihse_resp_handle_subscribe(qihse_resp_session_t* session, const qih
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "subscribe");
     if (!session->server->pubsub) return qihse_resp_error(session, "ERR pub/sub is not available");
     for (size_t i = 1; i < request->argc; i++) {
-        if (!qihse_resp_pubsub_channel_allowed(session->server->pubsub, session->user))
+        if (!qihse_resp_pubsub_channel_access(session->server->pubsub, session->user,
+                                              (const char*)request->argv[i].data, request->argv[i].len,
+                                              false))
             return qihse_resp_error(session, "NOPERM channel clearance required for SUBSCRIBE");
     }
     for (size_t i = 1; i < request->argc; i++) {
@@ -3807,6 +3872,254 @@ static bool qihse_resp_handle_script(qihse_resp_session_t* session, const qihse_
     return qihse_resp_error(session, "ERR unknown SCRIPT subcommand");
 }
 
+/* ---------------------------------------------------------------------------
+ * U2 tenant scoping + quotas
+ * Tenant principals (tenant_id != 0) are deny-by-default at the engine
+ * boundary: they may only touch keys in their own "t:<tenant_id>/" namespace
+ * or the shared "commons/" namespace, and quota-bearing command classes are
+ * charged per command. System-domain principals (tenant 0, incl. the
+ * operator) are exempt. This is defense in depth against a mis-prefixed or
+ * malicious tenant client — per-record clearance checks still apply below.
+ * ------------------------------------------------------------------------- */
+static uint32_t qihse_resp_session_tenant(qihse_resp_session_t* session) {
+    if (!session->user) return QIHSE_TENANT_SYSTEM; /* NOAUTH gate already ran */
+    return qihse_user_get_tenant_id(session->user);
+}
+
+static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key) {
+    static const char commons_prefix[] = "commons/";
+    if (key->len >= sizeof(commons_prefix) - 1u &&
+        memcmp(key->data, commons_prefix, sizeof(commons_prefix) - 1u) == 0) {
+        return true;
+    }
+    if (key->len > 2 && key->data[0] == 't' && key->data[1] == ':') {
+        uint64_t parsed = 0;
+        size_t i = 2;
+        for (; i < key->len && key->data[i] >= '0' && key->data[i] <= '9'; i++) {
+            parsed = parsed * 10u + (uint64_t)(key->data[i] - '0');
+            if (parsed > 0xFFFFFFFFu) return false;
+        }
+        if (i > 2 && i < key->len && key->data[i] == '/' && (uint32_t)parsed == tenant) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qihse_resp_key_is_tenant_telemetry(uint32_t tenant, const qihse_resp_arg_t* key) {
+    char prefix[32];
+    int len = snprintf(prefix, sizeof(prefix), "t:%u/tlm/", tenant);
+    return len > 0 && (size_t)len < sizeof(prefix) && key->len >= (size_t)len &&
+           memcmp(key->data, prefix, (size_t)len) == 0;
+}
+
+/* Returns false only when the command is over quota (reply already sent). */
+static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->quotas) return true;
+    uint32_t tenant = qihse_resp_session_tenant(session);
+    if (tenant == QIHSE_TENANT_SYSTEM) return true;
+
+    qihse_quota_class_t quota_class = QIHSE_QUOTA_KV_WRITE;
+    bool chargeable = false;
+    if (qihse_resp_command_is(request, "BUNDLE.PREPARE")) {
+        quota_class = QIHSE_QUOTA_BUNDLE_PULL;
+        chargeable = true;
+    } else if (qihse_resp_command_is(request, "VECSEARCH") || qihse_resp_command_is(request, "VECSCATTER")) {
+        quota_class = QIHSE_QUOTA_ANN_QUERY;
+        chargeable = true;
+    } else {
+        const qihse_resp_command_descriptor_t* descriptor = qihse_resp_find_command(&request->argv[0]);
+        if (descriptor && (descriptor->flags & QIHSE_COMMAND_WRITE)) {
+            /* Telemetry-namespace writes are charged against the ingest
+             * budget; other tenant writes against the generic write budget.
+             * Writes missing from the descriptor table go uncharged
+             * (under-charging is acceptable; clearance checks still apply). */
+            quota_class = QIHSE_QUOTA_KV_WRITE;
+            for (size_t i = 1; i < request->argc; i++) {
+                if (qihse_resp_key_is_tenant_telemetry(tenant, &request->argv[i])) {
+                    quota_class = QIHSE_QUOTA_TELEMETRY_INGEST;
+                    break;
+                }
+            }
+            chargeable = true;
+        }
+    }
+    if (!chargeable) return true;
+    if (qihse_quota_allow(session->server->quotas, tenant, quota_class)) return true;
+    if (session->server->metrics) qihse_metrics_increment(session->server->metrics, "qihse_quota_rejected_total", 1);
+    qihse_resp_error(session, "QUOTA Tenant quota exceeded for this operation class");
+    return false; /* error emitted; dispatch keeps the session open */
+}
+
+static bool qihse_resp_tenant_scope(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys) {
+    uint32_t tenant = qihse_resp_session_tenant(session);
+    if (tenant == QIHSE_TENANT_SYSTEM) return true;
+    for (size_t i = 0; i < keys->count; i++) {
+        const qihse_resp_arg_t* key = &request->argv[keys->indexes[i]];
+        if (!qihse_resp_tenant_key_allowed(tenant, key)) {
+            char buffer[160];
+            int len = snprintf(buffer, sizeof(buffer), "NOPERM key '%.*s' is outside tenant namespace t:%u/",
+                               key->len > 96 ? 96 : (int)key->len, (const char*)key->data, tenant);
+            if (len > 0) qihse_resp_error(session, buffer);
+            else qihse_resp_error(session, "NOPERM key outside tenant namespace");
+            return false; /* error emitted; dispatch keeps the session open */
+        }
+    }
+    return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * U4 PII-free ingest gate
+ * Writes into the telemetry namespace ("t:<id>/tlm/...") must match the
+ * closed record-type whitelist with per-field validators. Violations are
+ * REJECTED at ingest for every principal — this is structural, not policy.
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_ingest_gate(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys) {
+    const qihse_resp_command_descriptor_t* descriptor = qihse_resp_find_command(&request->argv[0]);
+    if (!descriptor || !(descriptor->flags & QIHSE_COMMAND_WRITE)) return true;
+
+    for (size_t i = 0; i < keys->count; i++) {
+        size_t key_index = keys->indexes[i];
+        const qihse_resp_arg_t* key = &request->argv[key_index];
+        if (!qihse_ingest_is_telemetry_key(key->data, key->len)) continue;
+        /* Locate the value argument for this key. */
+        size_t value_index;
+        if (qihse_resp_command_is(request, "MSET")) value_index = key_index + 1u;
+        else if (qihse_resp_command_is(request, "TS.ADD") || qihse_resp_command_is(request, "SETEX") ||
+                 qihse_resp_command_is(request, "PSETEX")) value_index = 3u;
+        else value_index = key_index + 1u;
+        if (value_index >= request->argc) {
+            qihse_resp_error(session, "INGEST malformed telemetry write rejected");
+            return false;
+        }
+        const qihse_resp_arg_t* value = &request->argv[value_index];
+        char reason[128];
+        if (!qihse_ingest_guard_validate(key->data, key->len, value->data, value->len, reason, sizeof(reason))) {
+            if (session->server->metrics) qihse_metrics_increment(session->server->metrics, "qihse_ingest_rejected_total", 1);
+            char buffer[192];
+            int len = snprintf(buffer, sizeof(buffer), "INGEST record rejected: %s", reason);
+            if (len <= 0) len = snprintf(buffer, sizeof(buffer), "INGEST record rejected");
+            qihse_resp_error(session, buffer);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * U3 session-bundle delivery (RESP-native). The manifest is self-contained
+ * (blob hashes + fresh per-session KEM encapsulation), so BUNDLE.CHUNK needs
+ * no server-side session state. Every blob byte is served through
+ * qihse_blob_get_user with the caller's user context (invariant #1).
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_handle_bundle_prepare(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->composer) return qihse_resp_error(session, "ERR bundle delivery is not configured on this server");
+    uint32_t session_tenant = qihse_user_get_tenant_id(session->user);
+    uint32_t tenant_id = session_tenant;
+    size_t fingerprint_index = 1u;
+    if (session_tenant == QIHSE_TENANT_SYSTEM) {
+        /* System-domain callers compose on behalf of a tenant. */
+        uint64_t parsed;
+        if (request->argc < 3 || !qihse_resp_parse_u64_arg(&request->argv[1], &parsed) || parsed > 0xFFFFFFFFu) {
+            return qihse_resp_error(session, "ERR usage: BUNDLE.PREPARE <tenant_id> <fingerprint> [have-hash ...]");
+        }
+        tenant_id = (uint32_t)parsed;
+        fingerprint_index = 2u;
+    }
+    if (request->argc < (int)fingerprint_index + 1u) return qihse_resp_wrong_arity(session, "bundle.prepare");
+    if (request->argv[fingerprint_index].len != 16u ||
+        memchr(request->argv[fingerprint_index].data, '\0', 16u)) {
+        return qihse_resp_error(session, "ERR fingerprint must be 16 lowercase hex characters");
+    }
+    char fingerprint[17];
+    memcpy(fingerprint, request->argv[fingerprint_index].data, 16u);
+    fingerprint[16u] = '\0';
+
+    /* Remaining args are have-list hashes (delta). */
+    const char* have[QIHSE_BUNDLE_MAX_BLOBS];
+    size_t have_count = 0;
+    size_t hash_hex_len = QIHSE_BLOB_HASH_HEX - 1u;
+    for (size_t i = fingerprint_index + 1u; i < request->argc && have_count < QIHSE_BUNDLE_MAX_BLOBS; i++) {
+        if (request->argv[i].len != hash_hex_len) continue; /* ignore malformed have entries */
+        char* hex = malloc(hash_hex_len + 1u);
+        if (!hex) break;
+        memcpy(hex, request->argv[i].data, hash_hex_len);
+        hex[hash_hex_len] = '\0';
+        have[have_count++] = hex;
+    }
+
+    char err[192];
+    char* manifest = NULL;
+    size_t manifest_len = 0;
+    uint64_t compose_started_ms = qihse_resp_now_ms();
+    bool composed = qihse_bundle_compose(session->server->composer, session->user, tenant_id,
+                                         fingerprint, have, have_count,
+                                         &manifest, &manifest_len, err, sizeof(err));
+    if (session->server->metrics) {
+        if (composed) {
+            qihse_metrics_increment(session->server->metrics, "qihse_bundle_compose_total", 1);
+            qihse_metrics_observe(session->server->metrics, "qihse_bundle_compose_latency_ms",
+                                  (double)(qihse_resp_now_ms() - compose_started_ms));
+            if (have_count > 0) qihse_metrics_increment(session->server->metrics, "qihse_bundle_delta_hits", (double)have_count);
+        }
+    }
+    for (size_t i = 0; i < have_count; i++) free((void*)have[i]);
+    if (!composed) {
+        char buffer[256];
+        int len = snprintf(buffer, sizeof(buffer), "ERR bundle compose failed: %s", err);
+        if (len <= 0) qihse_resp_error(session, "ERR bundle compose failed");
+        else qihse_resp_error(session, buffer);
+        return true;
+    }
+    bool ok = qihse_resp_bulk(session, (const uint8_t*)manifest, manifest_len);
+    free(manifest);
+    return ok;
+}
+
+static bool qihse_resp_handle_bundle_chunk(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->blobs) return qihse_resp_error(session, "ERR bundle delivery is not configured on this server");
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "bundle.chunk");
+    uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+    char hex[QIHSE_BLOB_HASH_HEX];
+    size_t hash_hex_len = QIHSE_BLOB_HASH_HEX - 1u;
+    if (request->argv[1].len != hash_hex_len) return qihse_resp_error(session, "ERR blob hash must be " /* 96 */ "96 hex characters (SHA-384)");
+    memcpy(hex, request->argv[1].data, hash_hex_len);
+    hex[hash_hex_len] = '\0';
+    if (!qihse_blob_hash_from_hex(hex, hash)) return qihse_resp_error(session, "ERR blob hash must be 96 hex characters (SHA-384)");
+    uint64_t offset;
+    if (!qihse_resp_parse_u64_arg(&request->argv[2], &offset)) return qihse_resp_error(session, "ERR invalid offset");
+
+    uint8_t* buffer = malloc(QIHSE_BUNDLE_CHUNK_SIZE);
+    if (!buffer) return qihse_resp_error(session, "OOM out of memory");
+    size_t nread = 0;
+    /* Authorization is re-checked inside the blob store on every read: a
+     * revoked or foreign principal cannot drain a transfer (invariant #1). */
+    if (!qihse_blob_get_user(session->server->blobs, hash, offset, buffer,
+                             QIHSE_BUNDLE_CHUNK_SIZE, &nread, session->user)) {
+        free(buffer);
+        /* Denial and I/O failure are indistinguishable to the client. */
+        return qihse_resp_error(session, "ERR blob read denied");
+    }
+    bool ok = qihse_resp_bulk(session, buffer, nread);
+    free(buffer);
+    return ok;
+}
+
+/* U9: render the delivery metrics registry (Prometheus text). System-domain
+ * only — metric values are operational data tenants have no business reading. */
+static bool qihse_resp_handle_metrics_render(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (!session->server->metrics) return qihse_resp_error(session, "ERR metrics are not available");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM metrics exposure is restricted to the system domain");
+    }
+    char* text = qihse_metrics_export(session->server->metrics);
+    if (!text) return qihse_resp_error(session, "ERR metrics export failed");
+    bool ok = qihse_resp_bulk_text(session, text);
+    free(text);
+    return ok;
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -3823,6 +4136,14 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return qihse_resp_simple(session, "OK");
     }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    /* U2 revocation SLA: re-validate the session principal authoritatively
+     * once per command. A destroyed principal loses the session immediately —
+     * including on the unclassified per-row fast path, which intentionally
+     * skips identity resolution for throughput. */
+    if (session->user && !qihse_auth_user_is_active(session->user)) {
+        session->user = NULL;
+        if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
+    }
     /* Subscribed-mode command restriction (Redis semantics) */
     if (qihse_resp_pubsub_subscribed(session) &&
         !qihse_resp_command_is(request, "SUBSCRIBE") &&
@@ -3839,6 +4160,8 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
                            (int)name_len, (const char*)request->argv[0].data);
         return len > 0 ? qihse_resp_error(session, buffer) : qihse_resp_error(session, "ERR command not allowed in subscribed mode");
     }
+    /* U2 per-tenant quota enforcement (ann queries, ingest, kv writes) */
+    if (!qihse_resp_tenant_quota(session, request)) return true;
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
         !qihse_resp_command_is(request, "EXEC") &&
@@ -3909,6 +4232,7 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     if (qihse_resp_command_is(request, "CLIENT")) return qihse_resp_handle_client_command(session, request);
     if (qihse_resp_command_is(request, "COMMAND")) return qihse_resp_handle_command(session, request);
     if (qihse_resp_command_is(request, "INFO")) return qihse_resp_handle_info(session);
+    if (qihse_resp_command_is(request, "METRICS.RENDER")) return qihse_resp_handle_metrics_render(session, request);
     if (qihse_resp_command_is(request, "ECHO")) return request->argc == 2 ? qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len) : qihse_resp_wrong_arity(session, "echo");
     if (qihse_resp_command_is(request, "SELECT")) {
         uint64_t database;
@@ -3922,6 +4246,10 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         if (!qihse_resp_array(session, 3u) || !qihse_resp_bulk_text(session, replica ? "slave" : "master") || !qihse_resp_integer(session, 0)) return false;
         return qihse_resp_array(session, 0u);
     }
+
+    /* U3 session-bundle delivery */
+    if (qihse_resp_command_is(request, "BUNDLE.PREPARE")) return qihse_resp_handle_bundle_prepare(session, request);
+    if (qihse_resp_command_is(request, "BUNDLE.CHUNK")) return qihse_resp_handle_bundle_chunk(session, request);
 
     /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
     if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
@@ -3968,6 +4296,8 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
 
     qihse_resp_keyset_t keys;
     qihse_resp_extract_keys(request, &keys);
+    if (keys.count > 0 && !qihse_resp_tenant_scope(session, request, &keys)) return true;
+    if (keys.count > 0 && !qihse_resp_ingest_gate(session, request, &keys)) return true;
     if (keys.count > 0 && !qihse_resp_route(session, request, &keys)) return true;
 
     if (qihse_resp_command_is(request, "GET")) return qihse_resp_handle_get(session, request);
@@ -4360,6 +4690,25 @@ static void* qihse_resp_accept_main(void* argument) {
     return NULL;
 }
 
+/* U6: background expiry sweeper — qihse_kv_sweep_expired previously had no
+ * callers; this thread physically removes expired records on a fixed cadence. */
+static void* qihse_resp_kv_sweeper_main(void* argument) {
+    qihse_resp_server_t* server = (qihse_resp_server_t*)argument;
+    while (!__atomic_load_n(&server->sweeper_shutdown, __ATOMIC_ACQUIRE)) {
+        for (size_t i = 0; i < (size_t)server->kv_sweep_interval_seconds * 10u; i++) {
+            if (__atomic_load_n(&server->sweeper_shutdown, __ATOMIC_ACQUIRE)) return NULL;
+            struct timespec pause = { 0, 100 * 1000 * 1000L };
+            nanosleep(&pause, NULL);
+        }
+        if (server->store) {
+            pthread_mutex_lock(&server->kv_lock);
+            qihse_kv_sweep_expired(server->store);
+            pthread_mutex_unlock(&server->kv_lock);
+        }
+    }
+    return NULL;
+}
+
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     if (!config) return;
     memset(config, 0, sizeof(*config));
@@ -4424,6 +4773,23 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->channel_classification = supplied->channel_classification;
     server->channel_sci = supplied->channel_sci;
     server->enable_uwp_bridge = supplied->enable_uwp_bridge;
+    server->quotas = supplied->quotas;
+    server->blobs = supplied->blobs;
+    server->metrics = qihse_metrics_create();
+    if (server->metrics) {
+        qihse_metrics_register(server->metrics, "qihse_bundle_compose_total", "Session bundles composed", METRIC_COUNTER);
+        qihse_metrics_register(server->metrics, "qihse_bundle_compose_latency_ms", "Bundle compose latency", METRIC_HISTOGRAM);
+        qihse_metrics_register(server->metrics, "qihse_bundle_delta_hits", "Blobs already held by clients (delta)", METRIC_COUNTER);
+        qihse_metrics_register(server->metrics, "qihse_ingest_rejected_total", "Telemetry records rejected by the ingest guard", METRIC_COUNTER);
+        qihse_metrics_register(server->metrics, "qihse_killswitch_push_total", "Killswitch edges fanned out", METRIC_COUNTER);
+        qihse_metrics_register(server->metrics, "qihse_quota_rejected_total", "Operations rejected by tenant quotas", METRIC_COUNTER);
+    }
+    if (supplied->blobs) {
+        server->composer = qihse_bundle_composer_create(supplied->blobs, server->store,
+                                                        supplied->bundle_keys_dir,
+                                                        supplied->bundle_dsa_private_key_path);
+        server->owns_composer = server->composer != NULL;
+    }
     server->pubsub = qihse_resp_pubsub_create(supplied->pubsub_log_directory);
     if (!server->pubsub) {
         free(server);
@@ -4431,6 +4797,17 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         return NULL;
     }
     qihse_resp_pubsub_set_policy(server->pubsub, server->channel_classification, server->channel_sci);
+    if (supplied->enable_killswitch_channel) {
+        qihse_resp_pubsub_set_channel_policy(server->pubsub, "killswitch", sizeof("killswitch") - 1u,
+                                             0, 0, true);
+    }
+    server->kv_sweep_interval_seconds = supplied->kv_sweep_interval_seconds;
+    if (server->kv_sweep_interval_seconds > 0 && server->store) {
+        server->sweeper_shutdown = false;
+        if (pthread_create(&server->sweeper_thread, NULL, qihse_resp_kv_sweeper_main, server) == 0) {
+            server->sweeper_started = true;
+        }
+    }
     if (!qihse_resp_copy_string(server->bind_address, sizeof(server->bind_address), bind_address) ||
         !qihse_resp_copy_string(server->advertise_address, sizeof(server->advertise_address), advertise_address)) {
         free(server);
@@ -4699,6 +5076,13 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
     if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
     if (server->owns_scatter && server->scatter) qihse_cluster_scatter_destroy(server->scatter);
+    if (server->sweeper_started) {
+        __atomic_store_n(&server->sweeper_shutdown, true, __ATOMIC_RELEASE);
+        pthread_join(server->sweeper_thread, NULL);
+        server->sweeper_started = false;
+    }
+    if (server->metrics) qihse_metrics_destroy(server->metrics);
+    if (server->owns_composer && server->composer) qihse_bundle_composer_destroy(server->composer);
     if (server->owns_topology) qihse_cluster_topology_destroy(server->topology);
     if (server->pubsub) qihse_resp_pubsub_destroy(server->pubsub);
     pthread_mutex_destroy(&server->column_lock);

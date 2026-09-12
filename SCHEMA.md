@@ -12,6 +12,22 @@ Complete reference for all data stored in QIHSE, keyed by the KV store prefix sy
 | **TimeSeriesDB** | Gorilla-compressed metrics | In-process | Yes |
 | **EventStream** | Append-only durable event log | `/bridge/audit/events_<name>` | No (file-backed) |
 
+## Tenant Namespace Conventions (session-delivery, enforced engine-side)
+
+Tenant principals are scoped by the engine to these namespaces; anything
+outside them is refused with `NOPERM` before a handler runs (system-domain /
+operator principals are unrestricted). See
+[architecture/session_delivery.md](docs/architecture/session_delivery.md).
+
+| Prefix | Purpose |
+|--------|---------|
+| `t:<tenant_id>/…` | Tenant-private keyspace |
+| `commons/…` | Shared namespace, readable by every authenticated tenant |
+| `t:<id>/tlm/<record_type>/<label>` | Telemetry ingest (closed schema: `build_record`, `symbol_context`, `census`, `survival_observation`, `burn_edge`; PII-free by construction) |
+| `t:<id>/bundle/pattern/<fingerprint>` | KV pointer (blob hash, 64-hex) to a build's pattern bundle |
+| `t:<id>/bundle/scripts` | KV pointer to the tenant's script-set blob |
+| `commons/killswitch/latest` | Durable last-valid burn edge (killswitch catch-up) |
+
 ## Auxiliary Files
 
 | File | Purpose |

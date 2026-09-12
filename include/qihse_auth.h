@@ -48,6 +48,17 @@ bool qihse_auth_bootstrap_operator(const char* initial_password);
 // Create a user. An OPERATOR or a user with `can_create_users` flag can create a user.
 qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
 
+// System-domain tenant assigned to the operator and to users created via
+// qihse_auth_create_user(). Tenant principals (tenant_id != 0) are scoped to
+// their own "t:<tenant_id>/" key namespace plus the shared "commons/" one.
+#define QIHSE_TENANT_SYSTEM 0u
+
+// Create a tenant-scoped user. Same privilege ladder as qihse_auth_create_user,
+// plus (invariant #2): a tenant-scoped creator may only create principals
+// within its own tenant; a system-domain creator may create in any tenant;
+// a tenant-scoped creator can never create system-domain (tenant 0) principals.
+qihse_user_t* qihse_auth_create_tenant_user(const qihse_user_t* creator, uint32_t tenant_id, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
+
 qihse_user_t* qihse_auth_get_user(uint32_t user_id);
 
 // Only an OPERATOR may destroy a user.
@@ -55,7 +66,11 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
 
 // Operator can modify any user's settings, passwords, names, and hardware token mandates.
 // Use -1 for integers/booleans to indicate "do not change", and NULL for strings to indicate "do not change".
-bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users);
+// new_classification / new_sci let the operator set (or raise) a principal's
+// clearance and SCI compartments after creation — an operator-exclusive
+// action, mirroring qihse_auth_create_user. OPERATOR-role targets always
+// carry 0xFFFF/0xFFFF regardless of the values passed.
+bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users, int new_classification, int new_sci);
 
 // Set hardware token state on user.
 bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char* credential_id);
@@ -92,10 +107,19 @@ uint32_t qihse_user_get_id(const qihse_user_t* user);
 uint16_t qihse_user_get_role(const qihse_user_t* user);
 uint16_t qihse_user_get_classification(const qihse_user_t* user);
 uint16_t qihse_user_get_sci(const qihse_user_t* user);
+uint32_t qihse_user_get_tenant_id(const qihse_user_t* user);
 const char* qihse_user_get_username(const qihse_user_t* user);
+const char* qihse_user_get_fido2_credential_id(const qihse_user_t* user);
 bool qihse_user_has_hardware_token(const qihse_user_t* user);
 bool qihse_user_requires_hardware_token(const qihse_user_t* user);
 bool qihse_user_can_create_users(const qihse_user_t* user);
+
+// Authoritatively re-validate a presented user handle against the shadow
+// authorization table. Returns false once the principal has been destroyed
+// (revocation) or the handle was forged. Callers should use this once per
+// command/request — not per data row — to enforce the revocation SLA without
+// giving up the per-row unclassified fast path.
+bool qihse_auth_user_is_active(const qihse_user_t* user);
 
 // --- IP-based auth rate limiting (brute-force protection) -------------------
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5

@@ -27,10 +27,20 @@ typedef struct pubsub_pattern_s {
     struct pubsub_pattern_s* next;
 } pubsub_pattern_t;
 
+typedef struct pubsub_channel_policy_s {
+    char* name;
+    size_t len;
+    uint16_t classification;
+    uint16_t sci;
+    bool publish_system_only;
+    struct pubsub_channel_policy_s* next;
+} pubsub_channel_policy_t;
+
 struct qihse_resp_pubsub {
     pthread_rwlock_t lock;
     pubsub_channel_t* channels;
     pubsub_pattern_t* patterns;
+    pubsub_channel_policy_t* channel_policies;
     uint16_t classification;
     uint16_t sci;
     qihse_event_stream_t* log;
@@ -81,6 +91,14 @@ void qihse_resp_pubsub_destroy(qihse_resp_pubsub_t* pubsub) {
         free(pattern);
         pattern = next_pattern;
     }
+    pubsub_channel_policy_t* policy = pubsub->channel_policies;
+    while (policy) {
+        pubsub_channel_policy_t* next_policy = policy->next;
+        free(policy->name);
+        free(policy);
+        policy = next_policy;
+    }
+    pubsub->channel_policies = NULL;
     pthread_rwlock_unlock(&pubsub->lock);
     pthread_rwlock_destroy(&pubsub->lock);
     if (pubsub->log) qihse_event_stream_destroy(pubsub->log);
@@ -105,6 +123,73 @@ bool qihse_resp_pubsub_channel_allowed(const qihse_resp_pubsub_t* pubsub, qihse_
     sci = pubsub->sci;
     pthread_rwlock_unlock((pthread_rwlock_t*)&pubsub->lock);
     if (!user) return classification == 0 && sci == 0;
+    return qihse_auth_can_access(user, classification, sci);
+}
+
+void qihse_resp_pubsub_set_channel_policy(qihse_resp_pubsub_t* pubsub,
+                                          const char* channel, size_t channel_len,
+                                          uint16_t classification, uint16_t sci,
+                                          bool publish_system_only) {
+    if (!pubsub || !channel || channel_len == 0) return;
+    pthread_rwlock_wrlock(&pubsub->lock);
+    for (pubsub_channel_policy_t* p = pubsub->channel_policies; p; p = p->next) {
+        if (p->len == channel_len && memcmp(p->name, channel, channel_len) == 0) {
+            p->classification = classification;
+            p->sci = sci;
+            p->publish_system_only = publish_system_only;
+            pthread_rwlock_unlock(&pubsub->lock);
+            return;
+        }
+    }
+    pubsub_channel_policy_t* p = calloc(1, sizeof(*p));
+    if (!p) {
+        pthread_rwlock_unlock(&pubsub->lock);
+        return;
+    }
+    p->name = malloc(channel_len + 1u);
+    if (!p->name) {
+        free(p);
+        pthread_rwlock_unlock(&pubsub->lock);
+        return;
+    }
+    memcpy(p->name, channel, channel_len);
+    p->name[channel_len] = '\0';
+    p->len = channel_len;
+    p->classification = classification;
+    p->sci = sci;
+    p->publish_system_only = publish_system_only;
+    p->next = pubsub->channel_policies;
+    pubsub->channel_policies = p;
+    pthread_rwlock_unlock(&pubsub->lock);
+}
+
+bool qihse_resp_pubsub_channel_access(const qihse_resp_pubsub_t* pubsub, qihse_user_t* user,
+                                      const char* channel, size_t channel_len,
+                                      bool publishing) {
+    if (!pubsub) return false;
+    uint16_t classification;
+    uint16_t sci;
+    bool system_only = false;
+    bool specific = false;
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&pubsub->lock);
+    for (pubsub_channel_policy_t* p = pubsub->channel_policies; p; p = p->next) {
+        if (p->len == channel_len && memcmp(p->name, channel, channel_len) == 0) {
+            classification = p->classification;
+            sci = p->sci;
+            system_only = p->publish_system_only;
+            specific = true;
+            break;
+        }
+    }
+    if (!specific) {
+        classification = pubsub->classification;
+        sci = pubsub->sci;
+    }
+    pthread_rwlock_unlock((pthread_rwlock_t*)&pubsub->lock);
+    if (!user) return classification == 0 && sci == 0 && !system_only;
+    if (publishing && system_only && qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM) {
+        return false;
+    }
     return qihse_auth_can_access(user, classification, sci);
 }
 

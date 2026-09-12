@@ -5064,9 +5064,16 @@ qihse_vector_db_t qihse_vector_db_open(
                 return NULL;
             }
         }
-        if (!qihse_vdb_replay_wal(vdb)) {
-            qihse_vector_db_destroy(vdb);
-            return NULL;
+        /* Read-only opens skip WAL replay: the snapshot represents the
+         * committed state. WAL records with generation > committed are
+         * uncommitted and must not be visible to read-only readers.
+         * This also avoids torn-WAL failures where the snapshot already
+         * contains the data but the WAL was not truncated. */
+        if (!read_only) {
+            if (!qihse_vdb_replay_wal(vdb)) {
+                qihse_vector_db_destroy(vdb);
+                return NULL;
+            }
         }
         if (vdb->wal_records_replayed != 0u) {
             if (!qihse_vdb_rebuild_idmap(vdb, !read_only)) {

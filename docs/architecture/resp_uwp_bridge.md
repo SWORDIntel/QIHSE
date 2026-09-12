@@ -38,6 +38,30 @@ context-free fallback — `qihse_resp_server_execute` rejects a `NULL` user, and
 `qihse_uwp_dispatch` rejects unauthenticated callers before reaching the
 bridge (invariant #1 in `AGENTS.md`).
 
+### Dispatch pipeline gates
+
+Both transports run the same ordered gate sequence inside
+`qihse_resp_dispatch()`:
+
+1. `AUTH` / `HELLO` / `PING` / `QUIT` short-circuit before any gate.
+2. `NOAUTH` gate when `auth_required` is set and the session has no user.
+3. **Revocation re-validation** — the session principal is re-resolved
+   against the shadow authorization table once per command
+   (`qihse_auth_user_is_active()`); a destroyed principal loses the session
+   immediately (`NOAUTH Session principal revoked`), even for unclassified
+   data whose per-row fast path skips identity resolution.
+4. Subscribed-mode command restriction (Redis semantics).
+5. **Per-tenant quotas** (`qihse_quota_*`) for ANN queries, telemetry ingest,
+   KV writes, and bundle pulls — fail-closed, `QUOTA …` on denial.
+6. MULTI queueing, system-guard bus-saturation throttling, cluster routing.
+7. **Tenant namespace scoping** — tenant principals may only touch keys
+   under `t:<own-id>/…` or `commons/…` (`NOPERM` otherwise, deny-by-default).
+8. **Ingest guard** — telemetry-namespace writes (`t:*/tlm/…`) must match the
+   closed record-type schema (`INGEST record rejected`).
+
+See [Session-delivery subsystem](session_delivery.md) for the tenancy, quota,
+and bundle-delivery machinery behind gates 3, 5, 7, and 8.
+
 ## Wire format
 
 `QIHSE_UWP_TARGET_RESP` (0x0F), opcode `QIHSE_UWP_RESP_EXEC` (0x01):
@@ -67,6 +91,12 @@ connection (TLS-aware when the UWP session is encrypted).
   (`channel_classification` / `channel_sci` config, or `--channel-classif` /
   `--channel-sci` on the daemon). `SUBSCRIBE`, `PSUBSCRIBE`, and `PUBLISH`
   require the caller's clearance to dominate the policy (`NOPERM` otherwise).
+- Channels may override that default with per-channel policy
+  (`qihse_resp_pubsub_set_channel_policy()`), including a
+  `publish_system_only` restriction. The fleet-wide `killswitch` channel uses
+  it: every authenticated tenant may subscribe, only system-domain principals
+  may publish, and valid `burn_edge` telemetry writes fan out on it
+  automatically. See [Session-delivery subsystem](session_delivery.md).
 
 ## Security invariants
 

@@ -81,7 +81,11 @@ void qihse_auth_rate_limit_cleanup(void) {
     pthread_mutex_unlock(&g_rate_limiter_mutex);
 }
 
-#define MAX_USERS 1024
+/* Principal capacity per node. Sized for large multi-tenant fleets (65,536):
+ * the registry and shadow-authz arrays are static but untouched pages cost
+ * nothing until principals are created (~104 B/authz slot, ~1 KB mlocked per
+ * live principal). user_id is u32; ids must stay below MAX_USERS. */
+#define MAX_USERS 65536
 #define MAX_AUTH_ATTEMPTS 5
 #define AUTH_LOCKOUT_SECONDS 300
 
@@ -97,10 +101,16 @@ typedef struct {
     uint16_t role;
     uint16_t classification_level;
     uint16_t sci_compartments;
+    uint32_t tenant_id;
     bool requires_hardware_token;
     bool hardware_token_present;
     bool can_create_users;
     bool password_set;
+    /* True only when a real PBKDF2 verifier has been computed (via
+     * QIHSE_OPERATOR_PASSWORD at init, bootstrap_operator, create_user, or
+     * modify_user). Distinct from password_set, which operator-only mode
+     * reports as true even before any password exists. */
+    bool verifier_configured;
     qihse_password_verifier_t verifier;
 } authz_state_t;
 
@@ -274,6 +284,7 @@ static void set_authz_state_locked(uint32_t user_id, const qihse_user_t* user) {
     authz_states[user_id].role = user->role;
     authz_states[user_id].classification_level = user->classification_level;
     authz_states[user_id].sci_compartments = user->sci_compartments;
+    authz_states[user_id].tenant_id = user->tenant_id;
     authz_states[user_id].requires_hardware_token = user->requires_hardware_token;
     authz_states[user_id].hardware_token_present = user->hardware_token_present;
     authz_states[user_id].can_create_users = user->can_create_users;
@@ -365,9 +376,10 @@ bool qihse_auth_init(void) {
         strncpy(op->username, "GODMODE_OP", 63);
         strncpy(op->fido2_credential_id, "OP-GODMODE-YUBIKEY-0001", 63);
 
+        bool operator_verifier_configured = false;
         const char* initial_pass = getenv("QIHSE_OPERATOR_PASSWORD");
         if (initial_pass && strlen(initial_pass) >= 12) {
-            compute_password_verifier(initial_pass, 0, &op->verifier);
+            operator_verifier_configured = compute_password_verifier(initial_pass, 0, &op->verifier);
         }
         op->password_set = true;
 
@@ -376,6 +388,7 @@ bool qihse_auth_init(void) {
 #endif
         users[0] = op;
         set_authz_state_locked(0, op);
+        authz_states[0].verifier_configured = operator_verifier_configured;
         active_user_count = 1;
     }
 
@@ -391,8 +404,9 @@ bool qihse_auth_bootstrap_operator(const char* initial_password) {
         pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
-    if (authz_states[0].password_set) {
-        // Already bootstrapped; must rotate through modify_user with operator credentials
+    if (authz_states[0].verifier_configured) {
+        // Already bootstrapped (env password or prior bootstrap); must rotate
+        // through modify_user with operator credentials
         pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
@@ -404,6 +418,7 @@ bool qihse_auth_bootstrap_operator(const char* initial_password) {
     users[0]->password_set = true;
     authz_states[0].verifier = users[0]->verifier;
     authz_states[0].password_set = true;
+    authz_states[0].verifier_configured = true;
     pthread_rwlock_unlock(&auth_rwlock);
     return true;
 }
@@ -418,10 +433,10 @@ bool qihse_auth_is_operator_password_default(void) {
     return is_default;
 }
 
-qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_id,
-                                     uint16_t role, uint16_t classif,
-                                     uint16_t sci, const char* plaintext_password,
-                                     bool requires_hw_token) {
+static qihse_user_t* create_user_internal(const qihse_user_t* creator, uint32_t tenant_id,
+                                          uint32_t user_id, uint16_t role, uint16_t classif,
+                                          uint16_t sci, const char* plaintext_password,
+                                          bool requires_hw_token) {
     if (user_id >= MAX_USERS) return NULL;
     if (!plaintext_password || strlen(plaintext_password) < 12) {
         fprintf(stderr, "[SECURITY ERROR] Password for User ID %u rejected: minimum 12 characters required.\n", user_id);
@@ -471,12 +486,41 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
         return NULL;
     }
 
+    // Tenant scope ladder (invariant #2): a tenant-scoped creator may only
+    // create principals inside its own tenant — never in another tenant and
+    // never in the system domain. Only system-domain (tenant 0) creators can
+    // mint system-domain principals, and only via qihse_auth_create_user.
+    if (creator_authz.tenant_id != QIHSE_TENANT_SYSTEM &&
+        tenant_id != creator_authz.tenant_id) {
+        qihse_audit_log("USER_CREATE_DENIED_TENANT", creator_id, user_id, classif, sci);
+        pthread_rwlock_unlock(&auth_rwlock);
+        return NULL;
+    }
+
     // Delegation must not weaken an enforced hardware-token requirement
     if (creator_authz.role != QIHSE_ROLE_OPERATOR &&
         creator_authz.requires_hardware_token && !requires_hw_token) {
         qihse_audit_log("USER_CREATE_DENIED_TOKEN_POLICY", creator_id, user_id, classif, sci);
         pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
+    }
+
+    // Delegated creation floors the new principal to the LOWEST rank
+    // (invariant #2: can_create_users delegates account creation, never
+    // authority — a delegated creator cannot duplicate its own rank either).
+    // Elevation afterwards is a separate operator action (modify_user is
+    // operator-only). OPERATOR-role creators mint explicitly; the ladder
+    // checks above still bound what they may grant.
+    if (creator_authz.role != QIHSE_ROLE_OPERATOR) {
+        uint16_t requested_classif = classif;
+        uint16_t requested_sci = sci;
+        role = QIHSE_ROLE_GUEST;
+        classif = 0;
+        sci = 0;
+        if (requested_classif != 0u || requested_sci != 0u) {
+            qihse_audit_log("USER_CREATE_DELEGATED_FLOOR", creator_id, user_id,
+                            requested_classif, requested_sci);
+        }
     }
 
     if (users[user_id] != NULL) {
@@ -492,6 +536,7 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 
     u->user_id = user_id;
     u->role = role;
+    u->tenant_id = tenant_id;
 
     if (role == QIHSE_ROLE_OPERATOR) {
         u->classification_level = 0xFFFF;
@@ -514,6 +559,7 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 
     users[user_id] = u;
     set_authz_state_locked(user_id, u);
+    authz_states[user_id].verifier_configured = true;
     active_user_count++;
 #ifndef _WIN32
     mlock(u, sizeof(qihse_user_t));
@@ -522,6 +568,27 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
     qihse_audit_log("USER_CREATE", creator_id, user_id, u->classification_level, u->sci_compartments);
     pthread_rwlock_unlock(&auth_rwlock);
     return u;
+}
+
+qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_id,
+                                     uint16_t role, uint16_t classif,
+                                     uint16_t sci, const char* plaintext_password,
+                                     bool requires_hw_token) {
+    return create_user_internal(creator, QIHSE_TENANT_SYSTEM, user_id, role, classif,
+                                sci, plaintext_password, requires_hw_token);
+}
+
+qihse_user_t* qihse_auth_create_tenant_user(const qihse_user_t* creator, uint32_t tenant_id,
+                                            uint32_t user_id, uint16_t role, uint16_t classif,
+                                            uint16_t sci, const char* plaintext_password,
+                                            bool requires_hw_token) {
+    if (tenant_id == QIHSE_TENANT_SYSTEM) {
+        // System-domain principals go through qihse_auth_create_user only.
+        qihse_audit_log("USER_CREATE_DENIED_TENANT", 0xFFFFFFFFu, user_id, classif, sci);
+        return NULL;
+    }
+    return create_user_internal(creator, tenant_id, user_id, role, classif,
+                                sci, plaintext_password, requires_hw_token);
 }
 
 qihse_user_t* qihse_auth_get_user(uint32_t user_id) {
@@ -579,10 +646,16 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
 
 bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_user_id,
                             const char* new_username, const char* new_password,
-                            int new_requires_hw_token, int new_can_create_users) {
+                            int new_requires_hw_token, int new_can_create_users,
+                            int new_classification, int new_sci) {
     if (target_user_id >= MAX_USERS) return false;
     if (new_password != NULL && strlen(new_password) < 12) {
         fprintf(stderr, "[SECURITY ERROR] Password for User ID %u rejected: minimum 12 characters required.\n", target_user_id);
+        return false;
+    }
+    if (new_classification < -1 || new_classification > 0xFFFF ||
+        new_sci < -1 || new_sci > 0xFFFF) {
+        fprintf(stderr, "[SECURITY ERROR] Clearance/SCI for User ID %u rejected: out of range.\n", target_user_id);
         return false;
     }
 
@@ -621,6 +694,7 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
         target->password_set = true;
         authz_states[target_user_id].verifier = target->verifier;
         authz_states[target_user_id].password_set = true;
+        authz_states[target_user_id].verifier_configured = true;
     }
 
     if (new_requires_hw_token != -1) {
@@ -634,6 +708,22 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
         bool value = (new_can_create_users != 0);
         target->can_create_users = value;
         authz_states[target_user_id].can_create_users = value;
+    }
+
+    if (new_classification != -1 || new_sci != -1) {
+        uint16_t classif_value = new_classification == -1
+            ? target->classification_level : (uint16_t)new_classification;
+        uint16_t sci_value = new_sci == -1
+            ? target->sci_compartments : (uint16_t)new_sci;
+        if (target->role == QIHSE_ROLE_OPERATOR) {
+            /* Operator principals always carry full clearance (mirrors create). */
+            classif_value = 0xFFFF;
+            sci_value = 0xFFFF;
+        }
+        target->classification_level = classif_value;
+        target->sci_compartments = sci_value;
+        authz_states[target_user_id].classification_level = classif_value;
+        authz_states[target_user_id].sci_compartments = sci_value;
     }
 
     qihse_audit_log("USER_MODIFY", operator_id, target_user_id,
@@ -1003,6 +1093,19 @@ const char* qihse_user_get_username(const qihse_user_t* user) {
     return NULL;
 }
 
+const char* qihse_user_get_fido2_credential_id(const qihse_user_t* user) {
+    if (!user) return NULL;
+    pthread_rwlock_rdlock(&auth_rwlock);
+    uint32_t uid;
+    if (resolve_authoritative_user_locked(user, &uid, NULL)) {
+        const char* credential = users[uid]->fido2_credential_id;
+        pthread_rwlock_unlock(&auth_rwlock);
+        return credential;
+    }
+    pthread_rwlock_unlock(&auth_rwlock);
+    return NULL;
+}
+
 bool qihse_user_has_hardware_token(const qihse_user_t* user) {
     if (!user) return false;
     pthread_rwlock_rdlock(&auth_rwlock);
@@ -1040,4 +1143,26 @@ bool qihse_user_can_create_users(const qihse_user_t* user) {
     }
     pthread_rwlock_unlock(&auth_rwlock);
     return false;
+}
+
+uint32_t qihse_user_get_tenant_id(const qihse_user_t* user) {
+    if (!user) return QIHSE_TENANT_SYSTEM;
+    pthread_rwlock_rdlock(&auth_rwlock);
+    uint32_t uid;
+    authz_state_t authz;
+    if (resolve_authoritative_user_locked(user, &uid, &authz)) {
+        pthread_rwlock_unlock(&auth_rwlock);
+        return authz.tenant_id;
+    }
+    pthread_rwlock_unlock(&auth_rwlock);
+    return QIHSE_TENANT_SYSTEM;
+}
+
+bool qihse_auth_user_is_active(const qihse_user_t* user) {
+    if (!user) return false;
+    pthread_rwlock_rdlock(&auth_rwlock);
+    uint32_t uid;
+    bool active = resolve_authoritative_user_locked(user, &uid, NULL);
+    pthread_rwlock_unlock(&auth_rwlock);
+    return active;
 }

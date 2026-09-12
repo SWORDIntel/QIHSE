@@ -232,7 +232,7 @@ bool qihse_raft_append_entry(qihse_raft_node_t* node, const uint8_t* data, size_
      */
     uint8_t sig[QIHSE_MLDSA_SIGNATURE_SIZE];
     bool signed_ok = false;
-    if (access(QIHSE_DSA_PRIVATE_KEY_FILE, F_OK) == 0) {
+    if (access(QIHSE_DSA_KEY_PATH(), F_OK) == 0) {
         signed_ok = qihse_pqc_sign(data, len, sig);
         if (signed_ok) {
             printf("[QIHSE Raft Node %u] WAL entry signed with ML-DSA-87.\n", node->node_id);

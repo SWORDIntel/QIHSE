@@ -227,8 +227,40 @@ static uint64_t current_time_ms(void) {
     return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
 }
 
+/* Resolved data directory (cached; trailing slash guaranteed). */
+static char data_dir[4096] = {0};
+
+/* A candidate data directory is usable only if the store's WAL file is
+ * either creatable by us (directory writable, no hostile file) or openable
+ * for append (pre-existing file we own/access). access() on the directory
+ * alone is NOT sufficient: /opt/qihse-data may be group/other-writable via
+ * ownership while wal.log inside is root-owned 0600. Never touches or
+ * deletes a pre-existing wal.log. */
+static bool data_dir_usable(const char* dir) {
+    char path[4096];
+    if (!dir) return false;
+    int n = snprintf(path, sizeof(path), "%swal.log", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        close(fd);
+        unlink(path); /* probe artifact only; the real create re-creates it */
+        return true;
+    }
+    if (errno != EEXIST) return false; /* EACCES/EROFS/... : directory itself unusable */
+    fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false; /* pre-existing file not ours to append */
+    close(fd);
+    return true;
+}
+
+static bool data_dir_probe_and_set(const char* dir) {
+    if (!data_dir_usable(dir)) return false;
+    snprintf(data_dir, sizeof(data_dir), "%s", dir);
+    return true;
+}
+
 static const char* get_qihse_data_dir(void) {
-    static char data_dir[4096] = {0};
     if (data_dir[0] != '\0') return data_dir;
     const char* env = getenv("QIHSE_DATA_DIR");
     if (env && env[0]) {
@@ -239,16 +271,30 @@ static const char* get_qihse_data_dir(void) {
         data_dir[n] = '\0';
         return data_dir;
     }
-    if (access("/var/lib/qihse", R_OK | W_OK) == 0) {
-        snprintf(data_dir, sizeof(data_dir), "%s", "/var/lib/qihse/");
+    if (access("/opt/qihse-data", R_OK | W_OK) == 0 &&
+        data_dir_probe_and_set("/opt/qihse-data/")) {
         return data_dir;
     }
-    (void)mkdir("data", 0700);
-    (void)mkdir("data/qihse", 0700);
-    (void)chmod("data", 0700);
-    (void)chmod("data/qihse", 0700);
-    snprintf(data_dir, sizeof(data_dir), "%s", "data/qihse/");
-    return data_dir;
+    if (access("/var/lib/qihse", R_OK | W_OK) == 0 &&
+        data_dir_probe_and_set("/var/lib/qihse/")) {
+        return data_dir;
+    }
+    (void)mkdir("/opt/qihse-data", 0700);
+    (void)chmod("/opt/qihse-data", 0700);
+    if (data_dir_probe_and_set("/opt/qihse-data/")) {
+        return data_dir;
+    }
+    /* Last resort (original behavior): a workspace-local directory. */
+    if (mkdir("data", 0700) == 0 || errno == EEXIST) {
+        (void)chmod("data", 0700);
+        if (mkdir("data/qihse", 0700) == 0 || errno == EEXIST) {
+            (void)chmod("data/qihse", 0700);
+            if (data_dir_probe_and_set("data/qihse/")) {
+                return data_dir;
+            }
+        }
+    }
+    return NULL;
 }
 
 static bool build_data_path(char* out, size_t out_size, const char* suffix) {

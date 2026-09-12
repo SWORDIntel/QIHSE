@@ -160,6 +160,18 @@ Security functionality includes:
 - `.ssh` directory enforced at chmod 700
 - normal operator-only mode requires no manually configured password
 - five-second builder HSM prompt defaults to skip for noninteractive operation
+- first-class tenancy: tenant-scoped principals (`t:<id>/` namespaces enforced
+  deny-by-default at the engine boundary), delegated creation floored to the
+  lowest rank, operator-set clearance/SCI at creation or via modification,
+  per-tenant quotas, and immediate mid-session revocation
+- content-addressed blob store with per-blob tenant/tag/classification binding
+- session-bundle compose and chunked RESP delivery with fresh per-session
+  ML-KEM-1024 session keys and a commons-poisoning sanity gate
+- closed-schema PII-free telemetry ingest gate for the `t:*/tlm/…` namespace
+- fleet-wide killswitch pub/sub channel (tenant-readable, system-publish-only)
+- tenant-subset export artifacts, background expiry sweeps, delivery metrics
+
+See [Session-delivery subsystem](architecture/session_delivery.md).
 
 Security claims and limitations are documented separately because they change faster than the architectural overview. See [Security](security/README.md), [UWP cryptographic design](security/UWP_CRYPTO_DESIGN.md), and the [August 2026 UWP audit](security/UWP_AUDIT_2026-08.md).
 

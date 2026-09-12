@@ -14,6 +14,9 @@
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_system_guard.h"
+#include "qihse_quota.h"
+#include "qihse_blob.h"
+#include "qihse_bundle.h"
 #include "qihse_task_queue.h"
 #include "qihse_task_worker.h"
 #include "qihse_task_scheduler.h"
@@ -67,6 +70,23 @@ typedef struct {
     /* UWP bridge: allow qihse_resp_server_execute() (QIHSE_UWP_TARGET_RESP)
      * to run commands through this server's dispatch path. Default true. */
     bool enable_uwp_bridge;
+    /* Per-tenant quota policies (QIHSE_QUOTA_*). Caller-owned; may be NULL
+     * (no quotas). Tenant principals (tenant_id != 0) are enforced at
+     * dispatch; system-domain principals are exempt. */
+    qihse_quota_table_t* quotas;
+    /* U3 session-bundle delivery. blobs is caller-owned (may be NULL =
+     * BUNDLE.* disabled). keys_dir holds per-tenant client KEM public keys
+     * ("tenant-<id>-kem_pub.pem"); dsa_private_key_path signs manifests
+     * (NULL = unsigned manifests). */
+    qihse_blob_store_t* blobs;
+    const char* bundle_keys_dir;
+    const char* bundle_dsa_private_key_path;
+    /* U8: enable the fleet-wide "killswitch" channel — every authenticated
+     * tenant may subscribe, only system-domain principals may publish
+     * (burn-edge writes fan out through the engine bridge). */
+    bool enable_killswitch_channel;
+    /* U6: background KV expiry sweep cadence in seconds. 0 = disabled. */
+    uint32_t kv_sweep_interval_seconds;
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);

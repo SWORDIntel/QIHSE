@@ -1,11 +1,12 @@
 /* Verify that the public UWP listener fails closed unless certificate TLS is configured. */
+#define _GNU_SOURCE /* unsetenv */
 
 #include "qihse_uwp.h"
 #include "qihse_uwp_tls.h"
 #include "qihse_auth.h"
 
-#include <stdio.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 int main(void) {
@@ -21,7 +22,7 @@ int main(void) {
      * Rotate it in this isolated test process so we can exercise transport policy. */
     if (!qihse_auth_modify_user(operator_user, 0, NULL,
                                 "UWP-TLS-default-regression-only-2026!",
-                                -1, -1)) {
+                                -1, -1, -1, -1)) {
         fprintf(stderr, "FAIL: could not rotate test operator password\n");
         return 1;
     }

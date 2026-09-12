@@ -16,6 +16,8 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#define _GNU_SOURCE /* unsetenv */
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,8 +44,8 @@ static void test_operator_bootstrapped(void) {
 
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);
-    assert(op->user_id == 0);
-    assert(op->role == QIHSE_ROLE_OPERATOR);
+    assert(qihse_user_get_id(op) == 0);
+    assert(qihse_user_get_role(op) == QIHSE_ROLE_OPERATOR);
     (void)op;
 }
 
@@ -55,22 +57,22 @@ static void test_password_is_set(void) {
 static void test_operator_has_full_access(void) {
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);
-    assert(op->classification_level == 0xFFFF);
-    assert(op->sci_compartments == 0xFFFF);
+    assert(qihse_user_get_classification(op) == 0xFFFF);
+    assert(qihse_user_get_sci(op) == 0xFFFF);
     (void)op;
 }
 
 static void test_operator_can_create_users(void) {
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);
-    assert(op->can_create_users == true);
+    assert(qihse_user_can_create_users(op) == true);
     (void)op;
 }
 
 static void test_operator_username(void) {
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);
-    assert(strcmp(op->username, "GODMODE_OP") == 0);
+    assert(strcmp(qihse_user_get_username(op), "GODMODE_OP") == 0);
     (void)op;
 }
 
@@ -106,7 +108,7 @@ static void test_reinit_clears_state(void) {
     assert(qihse_auth_init());
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);
-    assert(op->role == QIHSE_ROLE_OPERATOR);
+    assert(qihse_user_get_role(op) == QIHSE_ROLE_OPERATOR);
     (void)op;
 }
 

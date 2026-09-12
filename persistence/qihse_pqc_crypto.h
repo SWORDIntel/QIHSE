@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 /* ── Algorithm constants ──────────────────────────────────────────────── */
 
@@ -21,7 +24,7 @@
 #define QIHSE_KEY_DIR "/etc/qihse/keys/"
 #endif
 
-/* ML-KEM-1024: used for key encapsulation (at-rest AES key wrapping).
+/* ML-KEM-1024: used for key encapsulation (at-build AES key wrapping).
  * Generate with: scripts/qihse_keygen.sh  */
 #define QIHSE_KEM_PRIVATE_KEY_FILE  QIHSE_KEY_DIR "qihse_kem_key.pem"
 #define QIHSE_KEM_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_kem_pub.pem"
@@ -32,6 +35,33 @@
 #define QIHSE_DSA_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_dsa_pub.pem"
 
 #define QIHSE_TLS_CERT_FILE         QIHSE_KEY_DIR "qihse_dsa_cert.pem"
+
+/* ── Runtime key path resolver ────────────────────────────────────────── */
+/* Checks QIHSE_KEY_DIR env var at runtime, falling back to the compile-time
+ * default.  Returns a pointer to a thread-local static buffer. */
+static inline const char *qihse_resolve_key_path(const char *default_path,
+                                                 const char *filename)
+{
+    const char *env_dir = getenv("QIHSE_KEY_DIR");
+    if (env_dir && env_dir[0]) {
+        static __thread char buf[4096];
+        size_t dlen = strlen(env_dir);
+        /* Ensure exactly one separator between dir and filename */
+        if (dlen > 0 && env_dir[dlen - 1] == '/') {
+            snprintf(buf, sizeof(buf), "%s%s", env_dir, filename);
+        } else {
+            snprintf(buf, sizeof(buf), "%s/%s", env_dir, filename);
+        }
+        return buf;
+    }
+    return default_path;
+}
+
+#define QIHSE_KEM_KEY_PATH()    qihse_resolve_key_path(QIHSE_KEM_PRIVATE_KEY_FILE,  "qihse_kem_key.pem")
+#define QIHSE_KEM_PUB_PATH()    qihse_resolve_key_path(QIHSE_KEM_PUBLIC_KEY_FILE,   "qihse_kem_pub.pem")
+#define QIHSE_DSA_KEY_PATH()    qihse_resolve_key_path(QIHSE_DSA_PRIVATE_KEY_FILE, "qihse_dsa_key.pem")
+#define QIHSE_DSA_PUB_PATH()    qihse_resolve_key_path(QIHSE_DSA_PUBLIC_KEY_FILE,  "qihse_dsa_pub.pem")
+#define QIHSE_TLS_CERT_PATH()   qihse_resolve_key_path(QIHSE_TLS_CERT_FILE,        "qihse_dsa_cert.pem")
 
 /* ── Context ──────────────────────────────────────────────────────────── */
 
@@ -74,6 +104,31 @@ bool qihse_pqc_init(qihse_pqc_ctx_t* ctx,
                     const uint8_t* encapsulated_key_in,
                     uint8_t* encapsulated_key_out);
 
+/*
+ * qihse_pqc_encapsulate_peer - Session-key issuance against an ARBITRARY
+ * peer ML-KEM-1024 public key (session-delivery U3: the server encapsulates
+ * a fresh per-session AES-256 key under a tenant client's public key).
+ *
+ * Reads the peer public key from peer_public_key_path, runs
+ * EVP_PKEY_encapsulate() to generate a fresh ciphertext (written to
+ * encapsulated_key_out, QIHSE_MLKEM_CIPHERTEXT_SIZE bytes) and a fresh
+ * 32-byte shared secret, which becomes ctx's AES-256 session key. The
+ * session key exists only in server memory for the duration of the bundle
+ * compose — it is never persisted.
+ */
+bool qihse_pqc_encapsulate_peer(qihse_pqc_ctx_t* ctx,
+                                const char* peer_public_key_path,
+                                uint8_t* encapsulated_key_out);
+
+/*
+ * qihse_pqc_decapsulate_private - Recover a session key from a ciphertext
+ * using an ARBITRARY ML-KEM-1024 private key path (the tenant client side
+ * of qihse_pqc_encapsulate_peer; also used by tests).
+ */
+bool qihse_pqc_decapsulate_private(qihse_pqc_ctx_t* ctx,
+                                   const char* private_key_path,
+                                   const uint8_t* encapsulated_key_in);
+
 /* Zero and release the session key. Always call when done. */
 void qihse_pqc_destroy(qihse_pqc_ctx_t* ctx);
 
@@ -100,6 +155,13 @@ size_t qihse_pqc_decrypt(qihse_pqc_ctx_t* ctx,
  * out_sig must be QIHSE_MLDSA_SIGNATURE_SIZE bytes.
  */
 bool qihse_pqc_sign(const uint8_t* data, size_t len, uint8_t* out_sig);
+
+/*
+ * qihse_pqc_sign_path - Sign with an explicit ML-DSA-87 private key path
+ * (NULL = the standard qihse_dsa_key.pem location).
+ */
+bool qihse_pqc_sign_path(const uint8_t* data, size_t len, uint8_t* out_sig,
+                         const char* private_key_path);
 
 /*
  * qihse_pqc_verify - Verify an ML-DSA-87 signature (reads qihse_dsa_pub.pem).

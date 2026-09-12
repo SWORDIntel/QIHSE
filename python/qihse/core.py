@@ -13,6 +13,9 @@ from typing import List, Optional, Tuple, Union
 # Find libqihse.so — use absolute paths only to prevent CWD hijacking
 _LIB_PATHS = [
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
+    "/opt/qihse/libqihse.so",
+    "/opt/qihse/lib/libqihse.so",
+    "/opt/parrotagent/libqihse.so",
     "/usr/local/lib/libqihse.so",
     "/usr/lib/libqihse.so",
 ]
@@ -604,3 +607,284 @@ class VectorDB:
                 ctypes.c_uint16(port),
                 bind_address.encode("utf-8")
             )
+
+
+# ---------------------------------------------------------------------------
+# .qdb Container format — packs all QIHSE files into a single file
+# ---------------------------------------------------------------------------
+
+# Section IDs (must match qihse_container.h)
+QIHSE_CTR_SEC_MANIFEST  = 0x0001
+QIHSE_CTR_SEC_WAL       = 0x0002
+QIHSE_CTR_SEC_INDEX     = 0x0003
+QIHSE_CTR_SEC_IDMAP     = 0x0004
+QIHSE_CTR_SEC_VECTORS   = 0x0005
+QIHSE_CTR_SEC_METADATA  = 0x0006
+QIHSE_CTR_SEC_TRINARY   = 0x0007
+QIHSE_CTR_SEC_MAGNITUDE = 0x0008
+QIHSE_CTR_SEC_GRAPH     = 0x0009
+QIHSE_CTR_SEC_INT8      = 0x000A
+QIHSE_CTR_SEC_TIER      = 0x000B
+QIHSE_CTR_SEC_EDGES     = 0x000C
+QIHSE_CTR_SEC_KEY       = 0x1000
+QIHSE_CTR_SEC_SIGNATURE = 0x1001
+
+QIHSE_CTR_MAX_SECTIONS  = 14
+QIHSE_MLKEM_CIPHERTEXT_SIZE = 1568
+
+# File → section mapping for pack/unpack
+_QDB_FILE_SECTIONS = {
+    "qihse.db":            QIHSE_CTR_SEC_WAL,
+    "tool_vectors.db":     QIHSE_CTR_SEC_VECTORS,
+    "tool_graph.json":     QIHSE_CTR_SEC_GRAPH,
+    "research_graph.json": QIHSE_CTR_SEC_EDGES,
+    "tool_cards.json":     QIHSE_CTR_SEC_METADATA,
+    "qihse_fts_map.json":  QIHSE_CTR_SEC_IDMAP,
+    "tool_idf.json":       QIHSE_CTR_SEC_INT8,
+}
+# Reverse mapping for unpack
+_QDB_SECTION_FILES = {v: k for k, v in _QDB_FILE_SECTIONS.items()}
+
+
+class _PQCCtx(ctypes.Structure):
+    _fields_ = [
+        ("aes_key", ctypes.c_uint8 * 32),
+        ("initialized", ctypes.c_bool),
+    ]
+
+
+class _CtrSection(ctypes.Structure):
+    _fields_ = [
+        ("section_id", ctypes.c_uint16),
+        ("flags", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint32),
+        ("offset", ctypes.c_uint64),
+        ("length", ctypes.c_uint64),
+        ("hmac_sha384", ctypes.c_uint8 * 48),
+    ]
+
+
+class _Container(ctypes.Structure):
+    _fields_ = [
+        ("fd", ctypes.c_int),
+        ("path", ctypes.c_char_p),
+        ("locked", ctypes.c_bool),
+        ("read_only", ctypes.c_bool),
+        ("skip_integrity", ctypes.c_bool),
+        ("parallel_crc", ctypes.c_bool),
+        ("use_crc32c", ctypes.c_bool),
+        ("crc_threads", ctypes.c_int),
+        ("sections", _CtrSection * QIHSE_CTR_MAX_SECTIONS),
+        ("section_count", ctypes.c_uint32),
+        ("pqc_ctx", _PQCCtx),
+    ]
+
+
+class _CtrSectionBuf(ctypes.Structure):
+    _fields_ = [
+        ("section_id", ctypes.c_uint16),
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_size_t),
+    ]
+
+
+# Container C function signatures
+_lib.qihse_ctr_open_read.argtypes = [ctypes.c_char_p, ctypes.POINTER(_Container)]
+_lib.qihse_ctr_open_read.restype = ctypes.c_bool
+
+_lib.qihse_ctr_open_write.argtypes = [ctypes.c_char_p, ctypes.c_bool, ctypes.POINTER(_Container)]
+_lib.qihse_ctr_open_write.restype = ctypes.c_bool
+
+_lib.qihse_ctr_close.argtypes = [ctypes.POINTER(_Container)]
+_lib.qihse_ctr_close.restype = None
+
+_lib.qihse_ctr_find_section.argtypes = [ctypes.POINTER(_Container), ctypes.c_uint16]
+_lib.qihse_ctr_find_section.restype = ctypes.POINTER(_CtrSection)
+
+_lib.qihse_ctr_read_section_alloc.argtypes = [
+    ctypes.POINTER(_Container),
+    ctypes.c_uint16,
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_lib.qihse_ctr_read_section_alloc.restype = ctypes.c_bool
+
+_lib.qihse_ctr_section_length.argtypes = [ctypes.POINTER(_Container), ctypes.c_uint16]
+_lib.qihse_ctr_section_length.restype = ctypes.c_uint64
+
+_lib.qihse_ctr_flush.argtypes = [
+    ctypes.POINTER(_Container),
+    ctypes.POINTER(_CtrSectionBuf),
+    ctypes.c_size_t,
+]
+_lib.qihse_ctr_flush.restype = ctypes.c_bool
+
+_lib.qihse_ctr_fsync.argtypes = [ctypes.POINTER(_Container)]
+_lib.qihse_ctr_fsync.restype = ctypes.c_bool
+
+# C free for the allocated section buffer (qihse_ctr_read_section_alloc uses malloc)
+_libc = ctypes.CDLL("libc.so.6")
+_libc.free.argtypes = [ctypes.c_void_p]
+_libc.free.restype = None
+
+
+class Container:
+    """Python wrapper for the QIHSE .qdb container format.
+
+    Packs all QIHSE database files (qihse.db, tool_vectors.db, graphs,
+    cards, FTS map, IDF) into a single .qdb file with HMAC-SHA-384
+    integrity, atomic flush, and POSIX file locking.
+
+    Usage:
+        # Pack a directory of loose files into a .qdb
+        Container.pack("/opt/qihse-data", "/opt/qihse-data/data.qdb")
+
+        # Unpack a .qdb back to loose files
+        Container.unpack("/opt/qihse-data/data.qdb", "/opt/qihse-data")
+
+        # Inspect sections
+        with Container.open_read("/opt/qihse-data/data.qdb") as c:
+            print(c.list_sections())
+    """
+
+    def __init__(self, _ctr: _Container, _owns: bool = True):
+        self._ctr = _ctr
+        self._owns = _owns
+
+    @staticmethod
+    def open_read(path: str) -> "Container":
+        ctr = _Container()
+        if not _lib.qihse_ctr_open_read(path.encode("utf-8"), ctypes.byref(ctr)):
+            raise RuntimeError(f"Failed to open .qdb container: {path}")
+        return Container(ctr)
+
+    @staticmethod
+    def open_write(path: str, create: bool = False) -> "Container":
+        ctr = _Container()
+        if not _lib.qihse_ctr_open_write(path.encode("utf-8"), create, ctypes.byref(ctr)):
+            raise RuntimeError(f"Failed to open .qdb container for writing: {path}")
+        return Container(ctr)
+
+    def close(self):
+        if self._owns and self._ctr is not None:
+            _lib.qihse_ctr_close(ctypes.byref(self._ctr))
+            self._ctr = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def section_length(self, section_id: int) -> int:
+        return int(_lib.qihse_ctr_section_length(ctypes.byref(self._ctr), section_id))
+
+    def list_sections(self) -> list:
+        result = []
+        for name, sid in _QDB_FILE_SECTIONS.items():
+            length = self.section_length(sid)
+            if length > 0:
+                result.append({"section_id": sid, "name": name, "length": length})
+        return result
+
+    def read_section(self, section_id: int) -> bytes:
+        buf_ptr = ctypes.POINTER(ctypes.c_uint8)()
+        size = ctypes.c_size_t(0)
+        if not _lib.qihse_ctr_read_section_alloc(
+            ctypes.byref(self._ctr),
+            section_id,
+            ctypes.byref(buf_ptr),
+            ctypes.byref(size),
+        ):
+            raise RuntimeError(f"Failed to read section {section_id:#06x}")
+        try:
+            return ctypes.string_at(buf_ptr, size.value)
+        finally:
+            _libc.free(buf_ptr)
+
+    def flush(self, sections: list) -> None:
+        """Write sections atomically. sections is a list of (section_id, bytes)."""
+        bufs = (_CtrSectionBuf * len(sections))()
+        for i, (sid, data) in enumerate(sections):
+            bufs[i].section_id = sid
+            bufs[i].data = ctypes.cast(
+                ctypes.c_char_p(data), ctypes.c_void_p
+            )
+            bufs[i].size = len(data)
+        if not _lib.qihse_ctr_flush(
+            ctypes.byref(self._ctr), bufs, len(sections)
+        ):
+            raise RuntimeError("Failed to flush container")
+
+    @staticmethod
+    def pack(src_dir: str, qdb_path: str) -> dict:
+        """Pack all QIHSE files from src_dir into a single .qdb container.
+
+        Returns a manifest dict with file names, sizes, and section IDs.
+        """
+        import json
+
+        manifest = {"files": {}, "section_count": 0}
+        sections = []
+
+        for filename, section_id in _QDB_FILE_SECTIONS.items():
+            filepath = os.path.join(src_dir, filename)
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, "rb") as f:
+                data = f.read()
+            sections.append((section_id, data))
+            manifest["files"][filename] = {
+                "section_id": section_id,
+                "size": len(data),
+            }
+            manifest["section_count"] += 1
+
+        # Write manifest as SEC_MANIFEST
+        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+        sections.append((QIHSE_CTR_SEC_MANIFEST, manifest_bytes))
+
+        # Create and write the container
+        c = Container.open_write(qdb_path, create=True)
+        try:
+            c.flush(sections)
+        finally:
+            c.close()
+
+        total_size = sum(s[1].__len__() for s in sections)
+        manifest["qdb_path"] = qdb_path
+        manifest["total_size"] = total_size
+        return manifest
+
+    @staticmethod
+    def unpack(qdb_path: str, dst_dir: str) -> dict:
+        """Unpack a .qdb container back to loose files in dst_dir.
+
+        Returns the manifest dict.
+        """
+        import json
+
+        os.makedirs(dst_dir, exist_ok=True)
+
+        with Container.open_read(qdb_path) as c:
+            # Read manifest first
+            manifest_len = c.section_length(QIHSE_CTR_SEC_MANIFEST)
+            manifest = None
+            if manifest_len > 0:
+                manifest_bytes = c.read_section(QIHSE_CTR_SEC_MANIFEST)
+                manifest = json.loads(manifest_bytes)
+
+            # Unpack each known section
+            extracted = {}
+            for filename, section_id in _QDB_FILE_SECTIONS.items():
+                length = c.section_length(section_id)
+                if length == 0:
+                    continue
+                data = c.read_section(section_id)
+                filepath = os.path.join(dst_dir, filename)
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                extracted[filename] = len(data)
+
+        return manifest or {"files": {}, "extracted": extracted}
+

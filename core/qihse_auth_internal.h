@@ -23,6 +23,9 @@ struct qihse_user_s {
     uint16_t role;
     uint16_t classification_level;
     uint16_t sci_compartments;
+    /* Tenant namespace this principal is scoped to. 0 = system domain
+     * (operator/operators' delegates, unrestricted by tenant scoping). */
+    uint32_t tenant_id;
 
     // Identity & Permissions
     char username[64];

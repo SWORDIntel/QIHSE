@@ -35,7 +35,7 @@ int main(void) {
     assert(analyst != NULL);
 
     /* Delegate account creation without delegating Operator authority. */
-    assert(qihse_auth_modify_user(operator_user, 1, NULL, NULL, -1, 1));
+    assert(qihse_auth_modify_user(operator_user, 1, NULL, NULL, -1, 1, -1, -1));
     assert(qihse_user_can_create_users(analyst));
 
     /* Delegated Analyst cannot mint an Operator. */
@@ -53,7 +53,7 @@ int main(void) {
         operator_user, 4, QIHSE_ROLE_GUEST, 0, 0,
         "GuestAccount123!", false);
     assert(guest != NULL);
-    assert(qihse_auth_modify_user(operator_user, 4, NULL, NULL, -1, 1));
+    assert(qihse_auth_modify_user(operator_user, 4, NULL, NULL, -1, 1, -1, -1));
 
     /* Delegated Guest cannot create an Analyst. */
     assert(qihse_auth_create_user(
@@ -76,7 +76,7 @@ int main(void) {
     assert(qihse_auth_create_user(
         analyst, 7, QIHSE_ROLE_ANALYST, 6, 0x0001,
         "MutatedClass123!", false) == NULL);
-    assert(!qihse_auth_modify_user(analyst, 3, NULL, NULL, -1, 1));
+    assert(!qihse_auth_modify_user(analyst, 3, NULL, NULL, -1, 1, -1, -1));
 
     /* Ordinary access checks MUST also reject mutated role & clearance */
     assert(!qihse_auth_can_access(analyst, 10, 0x0001)); /* Clearance 10 > 5 */
@@ -134,7 +134,7 @@ int main(void) {
     assert(!qihse_auth_destroy_user(&forged_operator, 3));
     assert(qihse_auth_create_user(&forged_operator, 8, QIHSE_ROLE_OPERATOR, 0xFFFF, 0xFFFF,
                                   "ForgedCreator123!", false) == NULL);
-    assert(!qihse_auth_modify_user(&forged_operator, 3, NULL, NULL, -1, 1));
+    assert(!qihse_auth_modify_user(&forged_operator, 3, NULL, NULL, -1, 1, -1, -1));
     printf("[PASS] Forged qihse_user_t cannot grant/revoke ACLs or gain access\n");
 
     /* --- Validation: READ ACL cannot execute any mutation, WRITE cannot grant ACLs --- */

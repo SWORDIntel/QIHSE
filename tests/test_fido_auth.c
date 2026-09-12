@@ -15,9 +15,9 @@ int main() {
         return 1;
     }
     // Rotate operator password to allow privileged operations
-    qihse_auth_modify_user(operator, 0, NULL, "SecureOpPass1!", -1, -1);
-    printf("Operator retrieved. Hardware token present: %d, FIDO ID: %s\n", 
-            operator->hardware_token_present, operator->fido2_credential_id);
+    qihse_auth_modify_user(operator, 0, NULL, "SecureOpPass1!", -1, -1, -1, -1);
+    printf("Operator retrieved. Hardware token present: %d, FIDO ID: %s\n",
+            qihse_user_has_hardware_token(operator), qihse_user_get_fido2_credential_id(operator));
 
     // Operator accessing classified data
     bool op_access = qihse_auth_can_access(operator, 5, 0);
@@ -43,9 +43,12 @@ int main() {
     printf("Analyst accessing Classified data (no token)... Granted: %d\n", analyst_class_no_token);
     assert(analyst_class_no_token == false);
 
-    // Analyst accessing Classified data (Classif 5) with token
-    analyst->hardware_token_present = true;
-    strcpy(analyst->fido2_credential_id, "USER-FIPS-YUBIKEY");
+    // Analyst accessing Classified data (Classif 5) with token.
+    // Enrollment must go through the authoritative API: writing the user
+    // struct directly would not update the shadow authorization state.
+    assert(qihse_auth_set_hardware_token(analyst, true, "USER-FIPS-YUBIKEY"));
+    assert(qihse_user_has_hardware_token(analyst));
+    assert(strcmp(qihse_user_get_fido2_credential_id(analyst), "USER-FIPS-YUBIKEY") == 0);
     bool analyst_class_token = qihse_auth_can_access(analyst, 5, 0);
     printf("Analyst accessing Classified data (WITH token)... Granted: %d\n", analyst_class_token);
     assert(analyst_class_token == true);

@@ -37,7 +37,7 @@ static void ensure_init(void)
     qihse_user_t* op = qihse_auth_get_user(0);
     if (op) {
         /* Set a known password so we can authenticate */
-        qihse_auth_modify_user(op, 0, NULL, "fuzz-uwp-password", -1, -1);
+        qihse_auth_modify_user(op, 0, NULL, "fuzz-uwp-password", -1, -1, -1, -1);
     }
 
     /* Zero out the context — all engine pointers are NULL.
