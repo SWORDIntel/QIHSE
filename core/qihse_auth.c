@@ -1249,3 +1249,23 @@ bool qihse_auth_user_is_active(const qihse_user_t* user) {
     pthread_rwlock_unlock(&auth_rwlock);
     return active;
 }
+
+/* Combined liveness + tenant probe under a single rdlock round-trip — one
+ * lock acquisition instead of two for callers that need both (the RESP
+ * dispatch path).  Still a live lookup: no caching, revocation is honored
+ * on the very next command. */
+void qihse_auth_user_active_and_tenant(const qihse_user_t* user,
+                                       bool* out_active, uint32_t* out_tenant) {
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_SYSTEM;
+    if (user) {
+        pthread_rwlock_rdlock(&auth_rwlock);
+        uint32_t uid;
+        authz_state_t authz;
+        active = resolve_authoritative_user_locked(user, &uid, &authz);
+        if (active) tenant = authz.tenant_id;
+        pthread_rwlock_unlock(&auth_rwlock);
+    }
+    if (out_active) *out_active = active;
+    if (out_tenant) *out_tenant = tenant;
+}

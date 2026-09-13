@@ -187,6 +187,29 @@ typedef struct {
     int key_step;
 } qihse_resp_command_descriptor_t;
 
+/* Command dispatch table — one hash probe replaces the ~130-branch
+ * command_is if-else chain that previously ran for every request.
+ * flags: DSP_SUB_OK     — allowed while the session is subscribed
+ *        DSP_MULTI_OK   — executes immediately inside MULTI (not queued)
+ *        DSP_BUSY_WRITE — DENYOOM write class for the guard-window gate */
+typedef bool (*qihse_resp_cmd_fn)(qihse_resp_session_t*, const qihse_resp_request_t*);
+typedef struct { const char* name; qihse_resp_cmd_fn fn; uint32_t flags; } qihse_resp_dispatch_ent_t;
+#define DSP_SUB_OK     0x1u
+#define DSP_MULTI_OK   0x2u
+#define DSP_BUSY_WRITE 0x4u
+/* Key-extraction shape (upper nibble) — replaces the second command_is
+ * chain in qihse_resp_extract_keys. */
+#define DSP_KEY_1KV       (1u << 4)  /* key at argv[1], is a KV-store key */
+#define DSP_KEY_ALLKV     (2u << 4)  /* all args argv[1..n] are KV keys */
+#define DSP_KEY_ODDKV     (3u << 4)  /* argv[1,3,5...] are KV keys (MSET) */
+#define DSP_KEY_1         (4u << 4)  /* key at argv[1], NOT a KV key */
+#define DSP_KEY_12KV      (5u << 4)  /* argv[1] and argv[2] are KV keys */
+#define DSP_KEY_FROM2KV   (6u << 4)  /* argv[2..n] are KV keys */
+#define DSP_KEY_VECTAG    (7u << 4)  /* VECSET/VECGET: TAG-scanned key */
+#define DSP_KEY_VECSEARCH (8u << 4)  /* VECSEARCH: first TAG-scanned key */
+#define DSP_KEY_MIGRATE   (9u << 4)  /* MIGRATE: argv[3] or KEYS clause */
+#define DSP_KEY_MASK      (0xfu << 4)
+
 static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"asking", 1, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"auth", -2, QIHSE_COMMAND_FAST, 0, 0, 0},
@@ -483,100 +506,68 @@ static bool qihse_resp_command_is(const qihse_resp_request_t* request, const cha
     return request->argc > 0 && qihse_resp_arg_equal(&request->argv[0], command);
 }
 
-static bool qihse_resp_extract_keys(const qihse_resp_request_t* request, qihse_resp_keyset_t* keys) {
+static bool qihse_resp_extract_keys(const qihse_resp_request_t* request, qihse_resp_keyset_t* keys,
+                                    const qihse_resp_dispatch_ent_t* dispatch_entry) {
     memset(keys, 0, sizeof(*keys));
-    if (request->argc < 2) return true;
-    if (qihse_resp_command_is(request, "GET") || qihse_resp_command_is(request, "SET") ||
-        qihse_resp_command_is(request, "EXPIRE") || qihse_resp_command_is(request, "PEXPIRE") ||
-        qihse_resp_command_is(request, "TTL") || qihse_resp_command_is(request, "PTTL") ||
-        qihse_resp_command_is(request, "INCR") || qihse_resp_command_is(request, "DECR") ||
-        qihse_resp_command_is(request, "TYPE") || qihse_resp_command_is(request, "SETEX") ||
-        qihse_resp_command_is(request, "PSETEX")) {
+    if (request->argc < 2 || !dispatch_entry) return true;
+    switch (dispatch_entry->flags & DSP_KEY_MASK) {
+    case DSP_KEY_1KV:
         keys->indexes[keys->count++] = 1u;
         keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "DEL") || qihse_resp_command_is(request, "EXISTS") ||
-               qihse_resp_command_is(request, "MGET")) {
+        break;
+    case DSP_KEY_ALLKV:
         for (size_t i = 1; i < request->argc; i++) keys->indexes[keys->count++] = i;
         keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "MSET")) {
+        break;
+    case DSP_KEY_ODDKV:
         for (size_t i = 1; i + 1u < request->argc; i += 2u) keys->indexes[keys->count++] = i;
         keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "VECGET")) {
+        break;
+    case DSP_KEY_1:
+        keys->indexes[keys->count++] = 1u;
+        break;
+    case DSP_KEY_12KV:
+        keys->indexes[keys->count++] = 1u;
+        keys->indexes[keys->count++] = 2u;
+        keys->kv_keys = true;
+        break;
+    case DSP_KEY_FROM2KV:
+        for (size_t i = 2; i < request->argc; i++) keys->indexes[keys->count++] = i;
+        keys->kv_keys = true;
+        break;
+    case DSP_KEY_VECTAG: {
         size_t selected = 1u;
         for (size_t i = 2; i + 1u < request->argc; i++) {
             if (qihse_resp_arg_equal(&request->argv[i], "TAG")) selected = i + 1u;
         }
         keys->indexes[keys->count++] = selected;
-    } else if (qihse_resp_command_is(request, "VECSEARCH")) {
+        break;
+    }
+    case DSP_KEY_VECSEARCH:
         for (size_t i = 1; i + 1u < request->argc; i++) {
             if (qihse_resp_arg_equal(&request->argv[i], "TAG")) {
                 keys->indexes[keys->count++] = i + 1u;
                 break;
             }
         }
-    } else if (qihse_resp_command_is(request, "MIGRATE") && request->argc >= 6) {
-        if (request->argv[3].len > 0) {
-            keys->indexes[keys->count++] = 3u;
-        } else {
-            for (size_t i = 6; i < request->argc; i++) {
-                if (qihse_resp_arg_equal(&request->argv[i], "KEYS")) {
-                    for (size_t key = i + 1u; key < request->argc; key++) keys->indexes[keys->count++] = key;
-                    break;
+        break;
+    case DSP_KEY_MIGRATE:
+        if (request->argc >= 6) {
+            if (request->argv[3].len > 0) {
+                keys->indexes[keys->count++] = 3u;
+            } else {
+                for (size_t i = 6; i < request->argc; i++) {
+                    if (qihse_resp_arg_equal(&request->argv[i], "KEYS")) {
+                        for (size_t key = i + 1u; key < request->argc; key++) keys->indexes[keys->count++] = key;
+                        break;
+                    }
                 }
             }
+            keys->kv_keys = true;
         }
-        keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "TS.ADD") || qihse_resp_command_is(request, "TS.RANGE") ||
-               qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "COL.SUM") ||
-               qihse_resp_command_is(request, "COL.MINMAX")) {
-        keys->indexes[keys->count++] = 1u;
-    } else if (qihse_resp_command_is(request, "LPUSH") || qihse_resp_command_is(request, "RPUSH") ||
-               qihse_resp_command_is(request, "LPOP") || qihse_resp_command_is(request, "RPOP") ||
-               qihse_resp_command_is(request, "LLEN") || qihse_resp_command_is(request, "LRANGE") ||
-               qihse_resp_command_is(request, "LINDEX") || qihse_resp_command_is(request, "LSET") ||
-               qihse_resp_command_is(request, "LREM") || qihse_resp_command_is(request, "LTRIM") ||
-               qihse_resp_command_is(request, "LINSERT") ||
-               qihse_resp_command_is(request, "HSET") || qihse_resp_command_is(request, "HMSET") ||
-               qihse_resp_command_is(request, "HGET") || qihse_resp_command_is(request, "HGETALL") ||
-               qihse_resp_command_is(request, "HDEL") || qihse_resp_command_is(request, "HEXISTS") ||
-               qihse_resp_command_is(request, "HKEYS") || qihse_resp_command_is(request, "HVALS") ||
-               qihse_resp_command_is(request, "HLEN") || qihse_resp_command_is(request, "HINCRBY") ||
-               qihse_resp_command_is(request, "HMGET") || qihse_resp_command_is(request, "HSETNX") ||
-               qihse_resp_command_is(request, "HSTRLEN") ||
-               qihse_resp_command_is(request, "SADD") || qihse_resp_command_is(request, "SREM") ||
-               qihse_resp_command_is(request, "SMEMBERS") || qihse_resp_command_is(request, "SISMEMBER") ||
-               qihse_resp_command_is(request, "SCARD") || qihse_resp_command_is(request, "SPOP") ||
-               qihse_resp_command_is(request, "SRANDMEMBER") ||
-               qihse_resp_command_is(request, "ZADD") || qihse_resp_command_is(request, "ZREM") ||
-               qihse_resp_command_is(request, "ZSCORE") || qihse_resp_command_is(request, "ZCARD") ||
-               qihse_resp_command_is(request, "ZCOUNT") || qihse_resp_command_is(request, "ZRANGE") ||
-               qihse_resp_command_is(request, "ZREVRANGE") || qihse_resp_command_is(request, "ZRANK") ||
-               qihse_resp_command_is(request, "ZREVRANK") || qihse_resp_command_is(request, "ZINCRBY") ||
-               qihse_resp_command_is(request, "ZPOPMAX") || qihse_resp_command_is(request, "ZPOPMIN") ||
-               qihse_resp_command_is(request, "ZRANGEBYSCORE") || qihse_resp_command_is(request, "ZREVRANGEBYSCORE") ||
-               qihse_resp_command_is(request, "GETSET") || qihse_resp_command_is(request, "GETDEL") ||
-               qihse_resp_command_is(request, "STRLEN") || qihse_resp_command_is(request, "APPEND") ||
-               qihse_resp_command_is(request, "GETRANGE") || qihse_resp_command_is(request, "SETRANGE") ||
-               qihse_resp_command_is(request, "INCRBY") || qihse_resp_command_is(request, "DECRBY") ||
-               qihse_resp_command_is(request, "INCRBYFLOAT") || qihse_resp_command_is(request, "PERSIST") ||
-               qihse_resp_command_is(request, "EXPIREAT") || qihse_resp_command_is(request, "PEXPIREAT") ||
-               qihse_resp_command_is(request, "SETBIT") || qihse_resp_command_is(request, "GETBIT") ||
-               qihse_resp_command_is(request, "BITCOUNT") || qihse_resp_command_is(request, "BITPOS") ||
-               qihse_resp_command_is(request, "PFADD") || qihse_resp_command_is(request, "PFCOUNT") ||
-               qihse_resp_command_is(request, "OBJECT")) {
-        keys->indexes[keys->count++] = 1u;
-        keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "RENAME") || qihse_resp_command_is(request, "RENAMENX") ||
-               qihse_resp_command_is(request, "COPY") || qihse_resp_command_is(request, "RPOPLPUSH") ||
-               qihse_resp_command_is(request, "SMOVE")) {
-        keys->indexes[keys->count++] = 1u;
-        keys->indexes[keys->count++] = 2u;
-        keys->kv_keys = true;
-    } else if (qihse_resp_command_is(request, "SDIFF") || qihse_resp_command_is(request, "SINTER") ||
-               qihse_resp_command_is(request, "SUNION") || qihse_resp_command_is(request, "PFMERGE") ||
-               qihse_resp_command_is(request, "BITOP")) {
-        for (size_t i = 2; i < request->argc; i++) keys->indexes[keys->count++] = i;
-        keys->kv_keys = true;
+        break;
+    default:
+        break;
     }
     return true;
 }
@@ -3929,11 +3920,6 @@ static bool qihse_resp_handle_script(qihse_resp_session_t* session, const qihse_
  * operator) are exempt. This is defense in depth against a mis-prefixed or
  * malicious tenant client — per-record clearance checks still apply below.
  * ------------------------------------------------------------------------- */
-static uint32_t qihse_resp_session_tenant(qihse_resp_session_t* session) {
-    if (!session->user) return QIHSE_TENANT_SYSTEM; /* NOAUTH gate already ran */
-    return qihse_user_get_tenant_id(session->user);
-}
-
 static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key) {
     static const char commons_prefix[] = "commons/";
     if (key->len >= sizeof(commons_prefix) - 1u &&
@@ -3962,9 +3948,8 @@ static bool qihse_resp_key_is_tenant_telemetry(uint32_t tenant, const qihse_resp
 }
 
 /* Returns false only when the command is over quota (reply already sent). */
-static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_resp_request_t* request, uint32_t tenant) {
     if (!session->server->quotas) return true;
-    uint32_t tenant = qihse_resp_session_tenant(session);
     if (tenant == QIHSE_TENANT_SYSTEM) return true;
 
     qihse_quota_class_t quota_class = QIHSE_QUOTA_KV_WRITE;
@@ -3999,8 +3984,7 @@ static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_r
     return false; /* error emitted; dispatch keeps the session open */
 }
 
-static bool qihse_resp_tenant_scope(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys) {
-    uint32_t tenant = qihse_resp_session_tenant(session);
+static bool qihse_resp_tenant_scope(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys, uint32_t tenant) {
     if (tenant == QIHSE_TENANT_SYSTEM) return true;
     for (size_t i = 0; i < keys->count; i++) {
         const qihse_resp_arg_t* key = &request->argv[keys->indexes[i]];
@@ -4168,6 +4152,173 @@ static bool qihse_resp_handle_metrics_render(qihse_resp_session_t* session, cons
     return ok;
 }
 
+/* -------------------------------------------------------------------------
+ * Command dispatch table — one hash probe replaces the ~130-branch
+ * command_is if-else chain that previously ran for every request.
+ * ------------------------------------------------------------------------- */
+/* Thin wrappers for parameterized handlers so the table has one signature. */
+static bool dsp_setex_s(qihse_resp_session_t* s, const qihse_resp_request_t* r)  { return qihse_resp_handle_setex(s, r, false); }
+static bool dsp_setex_ms(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_setex(s, r, true); }
+static bool dsp_del(qihse_resp_session_t* s, const qihse_resp_request_t* r)      { return qihse_resp_handle_del_exists(s, r, true); }
+static bool dsp_exists(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_del_exists(s, r, false); }
+static bool dsp_expire(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_expiry(s, r, false); }
+static bool dsp_expire_ms(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expiry(s, r, true); }
+static bool dsp_ttl(qihse_resp_session_t* s, const qihse_resp_request_t* r)      { return qihse_resp_handle_ttl(s, r, false); }
+static bool dsp_ttl_ms(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_ttl(s, r, true); }
+static bool dsp_incr(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_increment(s, r, 1); }
+static bool dsp_decr(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_increment(s, r, -1); }
+static bool dsp_vecsearch(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_vecsearch(s, r, false); }
+static bool dsp_vecscatter(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_vecsearch(s, r, true); }
+static bool dsp_lpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_lpush(s, r, true); }
+static bool dsp_rpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_lpush(s, r, false); }
+static bool dsp_lpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_lpop(s, r, true); }
+static bool dsp_rpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_lpop(s, r, false); }
+static bool dsp_zrange(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_zrange(s, r, false); }
+static bool dsp_zrevrange(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_zrange(s, r, true); }
+static bool dsp_zrank(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_zrank(s, r, false); }
+static bool dsp_zrevrank(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_zrank(s, r, true); }
+static bool dsp_zpopmax(qihse_resp_session_t* s, const qihse_resp_request_t* r)  { return qihse_resp_handle_zpop(s, r, true); }
+static bool dsp_zpopmin(qihse_resp_session_t* s, const qihse_resp_request_t* r)  { return qihse_resp_handle_zpop(s, r, false); }
+static bool dsp_zrangebyscore(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_zrangebyscore(s, r, false); }
+static bool dsp_zrevrangebyscore(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_zrangebyscore(s, r, true); }
+static bool dsp_rename(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_rename(s, r, false); }
+static bool dsp_renamenx(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_rename(s, r, true); }
+static bool dsp_incrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_incrby(s, r, false); }
+static bool dsp_decrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_incrby(s, r, true); }
+static bool dsp_expireat(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_expireat(s, r, false); }
+static bool dsp_pexpireat(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expireat(s, r, true); }
+static bool dsp_save(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { (void)r; return qihse_resp_simple(s, "OK"); }
+static bool dsp_lastsave(qihse_resp_session_t* s, const qihse_resp_request_t* r) { (void)r; return qihse_resp_integer(s, (int64_t)time(NULL)); }
+static bool dsp_type(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "type");
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool exists = key && qihse_kv_exists_user(session->server->store, key, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(key);
+    return qihse_resp_simple(session, exists ? "string" : "none");
+}
+
+static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
+    {"get", qihse_resp_handle_get, DSP_KEY_1KV},
+    {"set", qihse_resp_handle_set, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"setex", dsp_setex_s, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"psetex", dsp_setex_ms, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"del", dsp_del, DSP_BUSY_WRITE | DSP_KEY_ALLKV},
+    {"unlink", dsp_del, DSP_BUSY_WRITE},
+    {"exists", dsp_exists, DSP_KEY_ALLKV},
+    {"mget", qihse_resp_handle_mget, DSP_KEY_ALLKV},
+    {"mset", qihse_resp_handle_mset, DSP_BUSY_WRITE | DSP_KEY_ODDKV},
+    {"migrate", qihse_resp_handle_migrate, DSP_BUSY_WRITE | DSP_KEY_MIGRATE},
+    {"expire", dsp_expire, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"pexpire", dsp_expire_ms, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"ttl", dsp_ttl, DSP_KEY_1KV}, {"pttl", dsp_ttl_ms, DSP_KEY_1KV},
+    {"incr", dsp_incr, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"decr", dsp_decr, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"type", dsp_type, DSP_KEY_1KV},
+    {"vecset", qihse_resp_handle_vecset, DSP_BUSY_WRITE | DSP_KEY_VECTAG},
+    {"vecget", qihse_resp_handle_vecget, DSP_KEY_VECTAG},
+    {"vecsearch", dsp_vecsearch, DSP_KEY_VECSEARCH}, {"vecscatter", dsp_vecscatter, 0},
+    {"ts.add", qihse_resp_handle_ts_add, DSP_BUSY_WRITE | DSP_KEY_1},
+    {"ts.range", qihse_resp_handle_ts_range, DSP_KEY_1},
+    {"col.append", qihse_resp_handle_column, DSP_BUSY_WRITE | DSP_KEY_1},
+    {"col.sum", qihse_resp_handle_column, DSP_KEY_1}, {"col.minmax", qihse_resp_handle_column, DSP_KEY_1},
+    {"lpush", dsp_lpush, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"rpush", dsp_rpush, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"lpop", dsp_lpop, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"rpop", dsp_rpop, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"llen", qihse_resp_handle_llen, DSP_KEY_1KV}, {"lrange", qihse_resp_handle_lrange, DSP_KEY_1KV},
+    {"lindex", qihse_resp_handle_lindex, DSP_KEY_1KV}, {"lset", qihse_resp_handle_lset, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"lrem", qihse_resp_handle_lrem, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"ltrim", qihse_resp_handle_ltrim, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"linsert", qihse_resp_handle_linsert, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"rpoplpush", qihse_resp_handle_rpoplpush, DSP_BUSY_WRITE | DSP_KEY_12KV},
+    {"hset", qihse_resp_handle_hset, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"hmset", qihse_resp_handle_hset, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"hget", qihse_resp_handle_hget, DSP_KEY_1KV}, {"hgetall", qihse_resp_handle_hgetall, DSP_KEY_1KV},
+    {"hdel", qihse_resp_handle_hdel, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"hexists", qihse_resp_handle_hexists, DSP_KEY_1KV},
+    {"hkeys", qihse_resp_handle_hkeys, DSP_KEY_1KV}, {"hvals", qihse_resp_handle_hvals, DSP_KEY_1KV},
+    {"hlen", qihse_resp_handle_hlen, DSP_KEY_1KV}, {"hincrby", qihse_resp_handle_hincrby, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"hmget", qihse_resp_handle_hmget, DSP_KEY_1KV}, {"hsetnx", qihse_resp_handle_hsetnx, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"hstrlen", qihse_resp_handle_hstrlen, DSP_KEY_1KV},
+    {"sadd", qihse_resp_handle_sadd, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"srem", qihse_resp_handle_srem, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"smembers", qihse_resp_handle_smembers, DSP_KEY_1KV}, {"sismember", qihse_resp_handle_sismember, DSP_KEY_1KV},
+    {"scard", qihse_resp_handle_scard, DSP_KEY_1KV}, {"spop", qihse_resp_handle_spop, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"smove", qihse_resp_handle_smove, DSP_BUSY_WRITE | DSP_KEY_12KV},
+    {"sdiff", qihse_resp_handle_sdiff, DSP_KEY_FROM2KV}, {"sinter", qihse_resp_handle_sinter, DSP_KEY_FROM2KV},
+    {"sunion", qihse_resp_handle_sunion, DSP_KEY_FROM2KV},
+    {"srandmember", qihse_resp_handle_srandmember, DSP_KEY_1KV},
+    {"zadd", qihse_resp_handle_zadd, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"zrem", qihse_resp_handle_zrem, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"zscore", qihse_resp_handle_zscore, DSP_KEY_1KV}, {"zcard", qihse_resp_handle_zcard, DSP_KEY_1KV},
+    {"zcount", qihse_resp_handle_zcount, DSP_KEY_1KV}, {"zincrby", qihse_resp_handle_zincrby, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"zrange", dsp_zrange, DSP_KEY_1KV}, {"zrevrange", dsp_zrevrange, DSP_KEY_1KV},
+    {"zrank", dsp_zrank, DSP_KEY_1KV}, {"zrevrank", dsp_zrevrank, DSP_KEY_1KV},
+    {"zpopmax", dsp_zpopmax, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"zpopmin", dsp_zpopmin, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"zrangebyscore", dsp_zrangebyscore, DSP_KEY_1KV}, {"zrevrangebyscore", dsp_zrevrangebyscore, DSP_KEY_1KV},
+    {"keys", qihse_resp_handle_keys, 0}, {"scan", qihse_resp_handle_scan, 0},
+    {"rename", dsp_rename, DSP_BUSY_WRITE | DSP_KEY_12KV}, {"renamenx", dsp_renamenx, DSP_BUSY_WRITE | DSP_KEY_12KV},
+    {"getset", qihse_resp_handle_getset, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"getdel", qihse_resp_handle_getdel, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"strlen", qihse_resp_handle_strlen, DSP_KEY_1KV}, {"append", qihse_resp_handle_append, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"getrange", qihse_resp_handle_getrange, DSP_KEY_1KV}, {"setrange", qihse_resp_handle_setrange, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"incrby", dsp_incrby, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"decrby", dsp_decrby, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"incrbyfloat", qihse_resp_handle_incrbyfloat, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"msetnx", qihse_resp_handle_msetnx, DSP_BUSY_WRITE}, {"persist", qihse_resp_handle_persist, DSP_KEY_1KV},
+    {"expireat", dsp_expireat, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"pexpireat", dsp_pexpireat, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"copy", qihse_resp_handle_copy, DSP_BUSY_WRITE | DSP_KEY_12KV}, {"randomkey", qihse_resp_handle_randomkey, 0},
+    {"touch", qihse_resp_handle_touch, 0}, {"object", qihse_resp_handle_object, DSP_KEY_1KV},
+    {"flushdb", qihse_resp_handle_flushdb, DSP_BUSY_WRITE}, {"flushall", qihse_resp_handle_flushdb, DSP_BUSY_WRITE},
+    {"dbsize", qihse_resp_handle_dbsize, 0}, {"time", qihse_resp_handle_time, 0},
+    {"save", dsp_save, 0}, {"bgsave", dsp_save, 0}, {"lastsave", dsp_lastsave, 0},
+    {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
+    {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_save, 0},
+    {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_save, 0},
+    {"multi", qihse_resp_handle_multi, DSP_MULTI_OK}, {"exec", qihse_resp_handle_exec, DSP_MULTI_OK},
+    {"discard", qihse_resp_handle_discard, DSP_MULTI_OK}, {"watch", qihse_resp_handle_watch, DSP_MULTI_OK},
+    {"unwatch", qihse_resp_handle_unwatch, DSP_MULTI_OK},
+    {"publish", qihse_resp_handle_publish, 0},
+    {"subscribe", qihse_resp_handle_subscribe, DSP_SUB_OK}, {"unsubscribe", qihse_resp_handle_unsubscribe, DSP_SUB_OK},
+    {"psubscribe", qihse_resp_handle_psubscribe, DSP_SUB_OK}, {"punsubscribe", qihse_resp_handle_punsubscribe, DSP_SUB_OK},
+    {"pubsub", qihse_resp_handle_pubsub, 0},
+    {"setbit", qihse_resp_handle_setbit, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"getbit", qihse_resp_handle_getbit, DSP_KEY_1KV},
+    {"bitcount", qihse_resp_handle_bitcount, DSP_KEY_1KV}, {"bitpos", qihse_resp_handle_bitpos, DSP_KEY_1KV},
+    {"bitop", qihse_resp_handle_bitop, DSP_BUSY_WRITE | DSP_KEY_FROM2KV},
+    {"pfadd", qihse_resp_handle_pfadd, DSP_BUSY_WRITE | DSP_KEY_1KV},
+    {"pfcount", qihse_resp_handle_pfcount, DSP_KEY_1KV},
+    {"pfmerge", qihse_resp_handle_pfmerge, DSP_BUSY_WRITE | DSP_KEY_FROM2KV},
+    {"eval", qihse_resp_handle_eval, 0}, {"evalsha", qihse_resp_handle_evalsha, 0},
+    {"script", qihse_resp_handle_script, 0},
+};
+
+#define RESP_DISPATCH_MAP_CAP 256u
+static const qihse_resp_dispatch_ent_t* g_dispatch_map[RESP_DISPATCH_MAP_CAP];
+static pthread_once_t g_dispatch_map_once = PTHREAD_ONCE_INIT;
+
+static void qihse_resp_dispatch_map_build(void) {
+    size_t n = sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]);
+    for (size_t i = 0; i < n; i++) {
+        const char* nm = g_dispatch_table[i].name;
+        uint32_t h = qihse_resp_cmd_hash((const uint8_t*)nm, strlen(nm)) & (RESP_DISPATCH_MAP_CAP - 1u);
+        for (size_t j = 0; j < RESP_DISPATCH_MAP_CAP; j++) {
+            size_t pos = (h + j) & (RESP_DISPATCH_MAP_CAP - 1u);
+            if (!g_dispatch_map[pos]) { g_dispatch_map[pos] = &g_dispatch_table[i]; break; }
+            if (strcasecmp(g_dispatch_map[pos]->name, nm) == 0) break; /* dup name */
+        }
+    }
+}
+
+static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(const qihse_resp_arg_t* name) {
+    if (!name) return NULL;
+    pthread_once(&g_dispatch_map_once, qihse_resp_dispatch_map_build);
+    uint32_t h = qihse_resp_cmd_hash(name->data, name->len) & (RESP_DISPATCH_MAP_CAP - 1u);
+    for (size_t i = 0; i < RESP_DISPATCH_MAP_CAP; i++) {
+        const qihse_resp_dispatch_ent_t* e = g_dispatch_map[(h + i) & (RESP_DISPATCH_MAP_CAP - 1u)];
+        if (!e) return NULL;
+        if (strlen(e->name) == name->len && qihse_resp_arg_equal(name, e->name)) return e;
+    }
+    return NULL;
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -4188,16 +4339,25 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
      * once per command. A destroyed principal loses the session immediately —
      * including on the unclassified per-row fast path, which intentionally
      * skips identity resolution for throughput. */
-    if (session->user && !qihse_auth_user_is_active(session->user)) {
-        session->user = NULL;
-        if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
+    /* Fused liveness + tenant probe: one auth_rwlock trip per command, still
+     * a live lookup so revocation lands on the next command. */
+    bool session_active = true;
+    uint32_t session_tenant = QIHSE_TENANT_SYSTEM;
+    if (session->user) {
+        qihse_auth_user_active_and_tenant(session->user, &session_active, &session_tenant);
+        if (!session_active) {
+            session->user = NULL;
+            session_tenant = QIHSE_TENANT_SYSTEM;
+            if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
+        }
     }
+    /* One hash probe per command — reused by the subscribed, MULTI-queue,
+     * guard-write and final-dispatch checks below. */
+    const qihse_resp_dispatch_ent_t* dispatch_entry = qihse_resp_dispatch_find(&request->argv[0]);
+
     /* Subscribed-mode command restriction (Redis semantics) */
     if (qihse_resp_pubsub_subscribed(session) &&
-        !qihse_resp_command_is(request, "SUBSCRIBE") &&
-        !qihse_resp_command_is(request, "UNSUBSCRIBE") &&
-        !qihse_resp_command_is(request, "PSUBSCRIBE") &&
-        !qihse_resp_command_is(request, "PUNSUBSCRIBE") &&
+        !(dispatch_entry && (dispatch_entry->flags & DSP_SUB_OK)) &&
         !qihse_resp_command_is(request, "PING") &&
         !qihse_resp_command_is(request, "QUIT") &&
         !qihse_resp_command_is(request, "RESET")) {
@@ -4209,14 +4369,10 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         return len > 0 ? qihse_resp_error(session, buffer) : qihse_resp_error(session, "ERR command not allowed in subscribed mode");
     }
     /* U2 per-tenant quota enforcement (ann queries, ingest, kv writes) */
-    if (!qihse_resp_tenant_quota(session, request)) return true;
+    if (!qihse_resp_tenant_quota(session, request, session_tenant)) return true;
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
-        !qihse_resp_command_is(request, "EXEC") &&
-        !qihse_resp_command_is(request, "DISCARD") &&
-        !qihse_resp_command_is(request, "MULTI") &&
-        !qihse_resp_command_is(request, "WATCH") &&
-        !qihse_resp_command_is(request, "UNWATCH")) {
+        !(dispatch_entry && (dispatch_entry->flags & DSP_MULTI_OK))) {
         if (session->multi_queue_len >= session->multi_queue_cap) {
             session->multi_queue_cap = session->multi_queue_cap ? session->multi_queue_cap * 2 : 16;
             session->multi_queue = realloc(session->multi_queue, session->multi_queue_cap * sizeof(qihse_resp_request_t));
@@ -4232,34 +4388,8 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         qihse_system_guard_window_record(session->server->guard_window, request_bytes);
         if (!qihse_system_guard_window_safe(session->server->guard_window)) {
             /* Allow readonly commands to proceed; reject write/DENYOOM commands */
-            bool is_write = qihse_resp_command_is(request, "SET") || qihse_resp_command_is(request, "SETEX") ||
-                qihse_resp_command_is(request, "PSETEX") || qihse_resp_command_is(request, "MSET") ||
-                qihse_resp_command_is(request, "DEL") || qihse_resp_command_is(request, "INCR") ||
-                qihse_resp_command_is(request, "DECR") || qihse_resp_command_is(request, "EXPIRE") ||
-                qihse_resp_command_is(request, "PEXPIRE") || qihse_resp_command_is(request, "MIGRATE") ||
-                qihse_resp_command_is(request, "VECSET") || qihse_resp_command_is(request, "TS.ADD") ||
-                qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "KEYSTONE.INGEST") ||
-                qihse_resp_command_is(request, "LPUSH") || qihse_resp_command_is(request, "RPUSH") ||
-                qihse_resp_command_is(request, "LPOP") || qihse_resp_command_is(request, "RPOP") ||
-                qihse_resp_command_is(request, "LSET") || qihse_resp_command_is(request, "LREM") ||
-                qihse_resp_command_is(request, "LTRIM") || qihse_resp_command_is(request, "LINSERT") ||
-                qihse_resp_command_is(request, "RPOPLPUSH") || qihse_resp_command_is(request, "HSET") ||
-                qihse_resp_command_is(request, "HMSET") || qihse_resp_command_is(request, "HDEL") ||
-                qihse_resp_command_is(request, "HINCRBY") || qihse_resp_command_is(request, "HSETNX") ||
-                qihse_resp_command_is(request, "SADD") || qihse_resp_command_is(request, "SREM") ||
-                qihse_resp_command_is(request, "SPOP") || qihse_resp_command_is(request, "SMOVE") ||
-                qihse_resp_command_is(request, "ZADD") || qihse_resp_command_is(request, "ZREM") ||
-                qihse_resp_command_is(request, "ZINCRBY") || qihse_resp_command_is(request, "ZPOPMAX") ||
-                qihse_resp_command_is(request, "ZPOPMIN") || qihse_resp_command_is(request, "GETSET") ||
-                qihse_resp_command_is(request, "GETDEL") || qihse_resp_command_is(request, "APPEND") ||
-                qihse_resp_command_is(request, "SETRANGE") || qihse_resp_command_is(request, "INCRBY") ||
-                qihse_resp_command_is(request, "DECRBY") || qihse_resp_command_is(request, "INCRBYFLOAT") ||
-                qihse_resp_command_is(request, "MSETNX") || qihse_resp_command_is(request, "RENAME") ||
-                qihse_resp_command_is(request, "RENAMENX") || qihse_resp_command_is(request, "COPY") ||
-                qihse_resp_command_is(request, "UNLINK") || qihse_resp_command_is(request, "SETBIT") ||
-                qihse_resp_command_is(request, "BITOP") || qihse_resp_command_is(request, "PFADD") ||
-                qihse_resp_command_is(request, "PFMERGE") || qihse_resp_command_is(request, "FLUSHDB") ||
-                qihse_resp_command_is(request, "FLUSHALL") || qihse_resp_command_is(request, "SHUTDOWN");
+            bool is_write = (dispatch_entry && (dispatch_entry->flags & DSP_BUSY_WRITE)) ||
+                            qihse_resp_command_is(request, "KEYSTONE.INGEST");
             if (is_write) return qihse_resp_error(session, "BUSY Bus saturation: try again later");
         }
     }
@@ -4343,172 +4473,12 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     }
 
     qihse_resp_keyset_t keys;
-    qihse_resp_extract_keys(request, &keys);
-    if (keys.count > 0 && !qihse_resp_tenant_scope(session, request, &keys)) return true;
+    qihse_resp_extract_keys(request, &keys, dispatch_entry);
+    if (keys.count > 0 && !qihse_resp_tenant_scope(session, request, &keys, session_tenant)) return true;
     if (keys.count > 0 && !qihse_resp_ingest_gate(session, request, &keys)) return true;
     if (keys.count > 0 && !qihse_resp_route(session, request, &keys)) return true;
 
-    if (qihse_resp_command_is(request, "GET")) return qihse_resp_handle_get(session, request);
-    if (qihse_resp_command_is(request, "SET")) return qihse_resp_handle_set(session, request);
-    if (qihse_resp_command_is(request, "SETEX")) return qihse_resp_handle_setex(session, request, false);
-    if (qihse_resp_command_is(request, "PSETEX")) return qihse_resp_handle_setex(session, request, true);
-    if (qihse_resp_command_is(request, "DEL")) return qihse_resp_handle_del_exists(session, request, true);
-    if (qihse_resp_command_is(request, "EXISTS")) return qihse_resp_handle_del_exists(session, request, false);
-    if (qihse_resp_command_is(request, "MGET")) return qihse_resp_handle_mget(session, request);
-    if (qihse_resp_command_is(request, "MSET")) return qihse_resp_handle_mset(session, request);
-    if (qihse_resp_command_is(request, "MIGRATE")) return qihse_resp_handle_migrate(session, request);
-    if (qihse_resp_command_is(request, "EXPIRE")) return qihse_resp_handle_expiry(session, request, false);
-    if (qihse_resp_command_is(request, "PEXPIRE")) return qihse_resp_handle_expiry(session, request, true);
-    if (qihse_resp_command_is(request, "TTL")) return qihse_resp_handle_ttl(session, request, false);
-    if (qihse_resp_command_is(request, "PTTL")) return qihse_resp_handle_ttl(session, request, true);
-    if (qihse_resp_command_is(request, "INCR")) return qihse_resp_handle_increment(session, request, 1);
-    if (qihse_resp_command_is(request, "DECR")) return qihse_resp_handle_increment(session, request, -1);
-    if (qihse_resp_command_is(request, "TYPE")) {
-        if (request->argc != 2) return qihse_resp_wrong_arity(session, "type");
-        if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-        char* key = qihse_resp_arg_text(&request->argv[1]);
-        pthread_rwlock_wrlock(&session->server->kv_lock);
-        bool exists = key && qihse_kv_exists_user(session->server->store, key, session->user);
-        pthread_rwlock_unlock(&session->server->kv_lock);
-        free(key);
-        return qihse_resp_simple(session, exists ? "string" : "none");
-    }
-    if (qihse_resp_command_is(request, "VECSET")) return qihse_resp_handle_vecset(session, request);
-    if (qihse_resp_command_is(request, "VECGET")) return qihse_resp_handle_vecget(session, request);
-    if (qihse_resp_command_is(request, "VECSEARCH")) return qihse_resp_handle_vecsearch(session, request, false);
-    if (qihse_resp_command_is(request, "VECSCATTER")) return qihse_resp_handle_vecsearch(session, request, true);
-    if (qihse_resp_command_is(request, "TS.ADD")) return qihse_resp_handle_ts_add(session, request);
-    if (qihse_resp_command_is(request, "TS.RANGE")) return qihse_resp_handle_ts_range(session, request);
-    if (qihse_resp_command_is(request, "COL.APPEND") || qihse_resp_command_is(request, "COL.SUM") || qihse_resp_command_is(request, "COL.MINMAX")) return qihse_resp_handle_column(session, request);
-
-    /* ===== Redis Data Structure Commands ===== */
-
-    /* List commands */
-    if (qihse_resp_command_is(request, "LPUSH")) return qihse_resp_handle_lpush(session, request, true);
-    if (qihse_resp_command_is(request, "RPUSH")) return qihse_resp_handle_lpush(session, request, false);
-    if (qihse_resp_command_is(request, "LPOP")) return qihse_resp_handle_lpop(session, request, true);
-    if (qihse_resp_command_is(request, "RPOP")) return qihse_resp_handle_lpop(session, request, false);
-    if (qihse_resp_command_is(request, "LLEN")) return qihse_resp_handle_llen(session, request);
-    if (qihse_resp_command_is(request, "LRANGE")) return qihse_resp_handle_lrange(session, request);
-    if (qihse_resp_command_is(request, "LINDEX")) return qihse_resp_handle_lindex(session, request);
-    if (qihse_resp_command_is(request, "LSET")) return qihse_resp_handle_lset(session, request);
-    if (qihse_resp_command_is(request, "LREM")) return qihse_resp_handle_lrem(session, request);
-    if (qihse_resp_command_is(request, "LTRIM")) return qihse_resp_handle_ltrim(session, request);
-    if (qihse_resp_command_is(request, "LINSERT")) return qihse_resp_handle_linsert(session, request);
-    if (qihse_resp_command_is(request, "RPOPLPUSH")) return qihse_resp_handle_rpoplpush(session, request);
-
-    /* Hash commands */
-    if (qihse_resp_command_is(request, "HSET") || qihse_resp_command_is(request, "HMSET")) return qihse_resp_handle_hset(session, request);
-    if (qihse_resp_command_is(request, "HGET")) return qihse_resp_handle_hget(session, request);
-    if (qihse_resp_command_is(request, "HGETALL")) return qihse_resp_handle_hgetall(session, request);
-    if (qihse_resp_command_is(request, "HDEL")) return qihse_resp_handle_hdel(session, request);
-    if (qihse_resp_command_is(request, "HEXISTS")) return qihse_resp_handle_hexists(session, request);
-    if (qihse_resp_command_is(request, "HKEYS")) return qihse_resp_handle_hkeys(session, request);
-    if (qihse_resp_command_is(request, "HVALS")) return qihse_resp_handle_hvals(session, request);
-    if (qihse_resp_command_is(request, "HLEN")) return qihse_resp_handle_hlen(session, request);
-    if (qihse_resp_command_is(request, "HINCRBY")) return qihse_resp_handle_hincrby(session, request);
-    if (qihse_resp_command_is(request, "HMGET")) return qihse_resp_handle_hmget(session, request);
-    if (qihse_resp_command_is(request, "HSETNX")) return qihse_resp_handle_hsetnx(session, request);
-    if (qihse_resp_command_is(request, "HSTRLEN")) return qihse_resp_handle_hstrlen(session, request);
-
-    /* Set commands */
-    if (qihse_resp_command_is(request, "SADD")) return qihse_resp_handle_sadd(session, request);
-    if (qihse_resp_command_is(request, "SREM")) return qihse_resp_handle_srem(session, request);
-    if (qihse_resp_command_is(request, "SMEMBERS")) return qihse_resp_handle_smembers(session, request);
-    if (qihse_resp_command_is(request, "SISMEMBER")) return qihse_resp_handle_sismember(session, request);
-    if (qihse_resp_command_is(request, "SCARD")) return qihse_resp_handle_scard(session, request);
-    if (qihse_resp_command_is(request, "SPOP")) return qihse_resp_handle_spop(session, request);
-    if (qihse_resp_command_is(request, "SMOVE")) return qihse_resp_handle_smove(session, request);
-    if (qihse_resp_command_is(request, "SDIFF")) return qihse_resp_handle_sdiff(session, request);
-    if (qihse_resp_command_is(request, "SINTER")) return qihse_resp_handle_sinter(session, request);
-    if (qihse_resp_command_is(request, "SUNION")) return qihse_resp_handle_sunion(session, request);
-    if (qihse_resp_command_is(request, "SRANDMEMBER")) return qihse_resp_handle_srandmember(session, request);
-
-    /* Sorted set commands */
-    if (qihse_resp_command_is(request, "ZADD")) return qihse_resp_handle_zadd(session, request);
-    if (qihse_resp_command_is(request, "ZREM")) return qihse_resp_handle_zrem(session, request);
-    if (qihse_resp_command_is(request, "ZSCORE")) return qihse_resp_handle_zscore(session, request);
-    if (qihse_resp_command_is(request, "ZCARD")) return qihse_resp_handle_zcard(session, request);
-    if (qihse_resp_command_is(request, "ZCOUNT")) return qihse_resp_handle_zcount(session, request);
-    if (qihse_resp_command_is(request, "ZRANGE")) return qihse_resp_handle_zrange(session, request, false);
-    if (qihse_resp_command_is(request, "ZREVRANGE")) return qihse_resp_handle_zrange(session, request, true);
-    if (qihse_resp_command_is(request, "ZRANK")) return qihse_resp_handle_zrank(session, request, false);
-    if (qihse_resp_command_is(request, "ZREVRANK")) return qihse_resp_handle_zrank(session, request, true);
-    if (qihse_resp_command_is(request, "ZINCRBY")) return qihse_resp_handle_zincrby(session, request);
-    if (qihse_resp_command_is(request, "ZPOPMAX")) return qihse_resp_handle_zpop(session, request, true);
-    if (qihse_resp_command_is(request, "ZPOPMIN")) return qihse_resp_handle_zpop(session, request, false);
-    if (qihse_resp_command_is(request, "ZRANGEBYSCORE")) return qihse_resp_handle_zrangebyscore(session, request, false);
-    if (qihse_resp_command_is(request, "ZREVRANGEBYSCORE")) return qihse_resp_handle_zrangebyscore(session, request, true);
-
-    /* Key/generic commands */
-    if (qihse_resp_command_is(request, "KEYS")) return qihse_resp_handle_keys(session, request);
-    if (qihse_resp_command_is(request, "SCAN")) return qihse_resp_handle_scan(session, request);
-    if (qihse_resp_command_is(request, "RENAME")) return qihse_resp_handle_rename(session, request, false);
-    if (qihse_resp_command_is(request, "RENAMENX")) return qihse_resp_handle_rename(session, request, true);
-    if (qihse_resp_command_is(request, "GETSET")) return qihse_resp_handle_getset(session, request);
-    if (qihse_resp_command_is(request, "GETDEL")) return qihse_resp_handle_getdel(session, request);
-    if (qihse_resp_command_is(request, "STRLEN")) return qihse_resp_handle_strlen(session, request);
-    if (qihse_resp_command_is(request, "APPEND")) return qihse_resp_handle_append(session, request);
-    if (qihse_resp_command_is(request, "GETRANGE")) return qihse_resp_handle_getrange(session, request);
-    if (qihse_resp_command_is(request, "SETRANGE")) return qihse_resp_handle_setrange(session, request);
-    if (qihse_resp_command_is(request, "INCRBY")) return qihse_resp_handle_incrby(session, request, false);
-    if (qihse_resp_command_is(request, "DECRBY")) return qihse_resp_handle_incrby(session, request, true);
-    if (qihse_resp_command_is(request, "INCRBYFLOAT")) return qihse_resp_handle_incrbyfloat(session, request);
-    if (qihse_resp_command_is(request, "MSETNX")) return qihse_resp_handle_msetnx(session, request);
-    if (qihse_resp_command_is(request, "PERSIST")) return qihse_resp_handle_persist(session, request);
-    if (qihse_resp_command_is(request, "EXPIREAT")) return qihse_resp_handle_expireat(session, request, false);
-    if (qihse_resp_command_is(request, "PEXPIREAT")) return qihse_resp_handle_expireat(session, request, true);
-    if (qihse_resp_command_is(request, "UNLINK")) return qihse_resp_handle_del_exists(session, request, true);
-    if (qihse_resp_command_is(request, "COPY")) return qihse_resp_handle_copy(session, request);
-    if (qihse_resp_command_is(request, "RANDOMKEY")) return qihse_resp_handle_randomkey(session, request);
-    if (qihse_resp_command_is(request, "TOUCH")) return qihse_resp_handle_touch(session, request);
-    if (qihse_resp_command_is(request, "OBJECT")) return qihse_resp_handle_object(session, request);
-
-    /* Server commands */
-    if (qihse_resp_command_is(request, "FLUSHDB") || qihse_resp_command_is(request, "FLUSHALL")) return qihse_resp_handle_flushdb(session, request);
-    if (qihse_resp_command_is(request, "DBSIZE")) return qihse_resp_handle_dbsize(session, request);
-    if (qihse_resp_command_is(request, "TIME")) return qihse_resp_handle_time(session, request);
-    if (qihse_resp_command_is(request, "SAVE") || qihse_resp_command_is(request, "BGSAVE")) return qihse_resp_simple(session, "OK");
-    if (qihse_resp_command_is(request, "LASTSAVE")) return qihse_resp_integer(session, (int64_t)time(NULL));
-    if (qihse_resp_command_is(request, "SHUTDOWN")) return qihse_resp_handle_shutdown(session, request);
-    if (qihse_resp_command_is(request, "CONFIG")) return qihse_resp_handle_config(session, request);
-    if (qihse_resp_command_is(request, "DEBUG")) return qihse_resp_handle_debug(session, request);
-    if (qihse_resp_command_is(request, "SLOWLOG")) return qihse_resp_simple(session, "OK");
-    if (qihse_resp_command_is(request, "MEMORY")) return qihse_resp_handle_memory(session, request);
-    if (qihse_resp_command_is(request, "LATENCY")) return qihse_resp_simple(session, "OK");
-
-    /* Transaction commands */
-    if (qihse_resp_command_is(request, "MULTI")) return qihse_resp_handle_multi(session, request);
-    if (qihse_resp_command_is(request, "EXEC")) return qihse_resp_handle_exec(session, request);
-    if (qihse_resp_command_is(request, "DISCARD")) return qihse_resp_handle_discard(session, request);
-    if (qihse_resp_command_is(request, "WATCH")) return qihse_resp_handle_watch(session, request);
-    if (qihse_resp_command_is(request, "UNWATCH")) return qihse_resp_handle_unwatch(session, request);
-
-    /* Pub/Sub commands */
-    if (qihse_resp_command_is(request, "PUBLISH")) return qihse_resp_handle_publish(session, request);
-    if (qihse_resp_command_is(request, "SUBSCRIBE")) return qihse_resp_handle_subscribe(session, request);
-    if (qihse_resp_command_is(request, "UNSUBSCRIBE")) return qihse_resp_handle_unsubscribe(session, request);
-    if (qihse_resp_command_is(request, "PSUBSCRIBE")) return qihse_resp_handle_psubscribe(session, request);
-    if (qihse_resp_command_is(request, "PUNSUBSCRIBE")) return qihse_resp_handle_punsubscribe(session, request);
-    if (qihse_resp_command_is(request, "PUBSUB")) return qihse_resp_handle_pubsub(session, request);
-
-    /* Bitmap commands */
-    if (qihse_resp_command_is(request, "SETBIT")) return qihse_resp_handle_setbit(session, request);
-    if (qihse_resp_command_is(request, "GETBIT")) return qihse_resp_handle_getbit(session, request);
-    if (qihse_resp_command_is(request, "BITCOUNT")) return qihse_resp_handle_bitcount(session, request);
-    if (qihse_resp_command_is(request, "BITPOS")) return qihse_resp_handle_bitpos(session, request);
-    if (qihse_resp_command_is(request, "BITOP")) return qihse_resp_handle_bitop(session, request);
-
-    /* HyperLogLog commands */
-    if (qihse_resp_command_is(request, "PFADD")) return qihse_resp_handle_pfadd(session, request);
-    if (qihse_resp_command_is(request, "PFCOUNT")) return qihse_resp_handle_pfcount(session, request);
-    if (qihse_resp_command_is(request, "PFMERGE")) return qihse_resp_handle_pfmerge(session, request);
-
-    /* Scripting commands */
-    if (qihse_resp_command_is(request, "EVAL")) return qihse_resp_handle_eval(session, request);
-    if (qihse_resp_command_is(request, "EVALSHA")) return qihse_resp_handle_evalsha(session, request);
-    if (qihse_resp_command_is(request, "SCRIPT")) return qihse_resp_handle_script(session, request);
-
+    if (dispatch_entry) return dispatch_entry->fn(session, request);
     return qihse_resp_error(session, "ERR unknown command");
 }
 

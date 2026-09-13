@@ -121,6 +121,11 @@ bool qihse_user_can_create_users(const qihse_user_t* user);
 // giving up the per-row unclassified fast path.
 bool qihse_auth_user_is_active(const qihse_user_t* user);
 
+// Combined liveness + tenant probe under a single auth_rwlock round-trip.
+// Live lookup — no caching; revocation is honored on the next command.
+void qihse_auth_user_active_and_tenant(const qihse_user_t* user,
+                                       bool* out_active, uint32_t* out_tenant);
+
 // --- IP-based auth rate limiting (brute-force protection) -------------------
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC  60

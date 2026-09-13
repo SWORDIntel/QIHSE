@@ -23,6 +23,7 @@ typedef struct pubsub_channel_s {
 
 typedef struct pubsub_pattern_s {
     char* pattern;
+    size_t literal_len; /* bytes before first glob char — prefix filter */
     pubsub_client_t* clients;
     struct pubsub_pattern_s* next;
 } pubsub_pattern_t;
@@ -301,6 +302,16 @@ bool qihse_resp_pubsub_psubscribe(qihse_resp_pubsub_t* pubsub, void* client,
         }
         memcpy(node->pattern, pattern, pattern_len);
         node->pattern[pattern_len] = '\0';
+        /* Literal prefix = bytes before the first glob metacharacter.
+         * '\' stops the prefix — the byte before an escape is still a
+         * required literal, so the truncated prefix remains a sound
+         * filter (it is a filter, not a verdict; fnmatch still decides). */
+        node->literal_len = 0;
+        while (node->literal_len < pattern_len) {
+            char c = pattern[node->literal_len];
+            if (c == '*' || c == '?' || c == '[' || c == '\\' || c == ']') break;
+            node->literal_len++;
+        }
         node->next = pubsub->patterns;
         pubsub->patterns = node;
     }
@@ -435,9 +446,18 @@ uint64_t qihse_resp_pubsub_publish(qihse_resp_pubsub_t* pubsub, qihse_user_t* pu
     }
     for (pubsub_pattern_t* pattern = pubsub->patterns; pattern; pattern = pattern->next) {
         if (!glob_channel) break;
+        /* Literal-prefix filter: a channel that doesn't start with the
+         * pattern's literal prefix can never fnmatch — skip it before the
+         * glob engine runs.  Empty prefix (pattern starts with a glob) is
+         * always verified. */
+        if (pattern->literal_len > channel_len ||
+            (pattern->literal_len > 0 &&
+             memcmp(pattern->pattern, glob_channel, pattern->literal_len) != 0)) {
+            continue;
+        }
+        if (fnmatch(pattern->pattern, glob_channel, 0) != 0) continue;
+        size_t pattern_len = strlen(pattern->pattern);
         for (pubsub_client_t* client = pattern->clients; client; client = client->next) {
-            if (fnmatch(pattern->pattern, glob_channel, 0) != 0) continue;
-            size_t pattern_len = strlen(pattern->pattern);
             if (client->delivery(client->context, true, pattern->pattern, pattern_len,
                                  channel, channel_len, message, message_len)) {
                 receivers++;
