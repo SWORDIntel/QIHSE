@@ -74,7 +74,24 @@ static int g_signer_started = 0;
 static int g_signer_ok = 0;
 static int g_signer_stop = 0;
 
+/* Start the background signer if it isn't running yet.  Must be called
+ * with audit_mutex held.  Also registers the atexit teardown handler on
+ * first use.  If the thread cannot start, callers fall back to sync. */
 static void* audit_signer_main(void* arg);
+
+static void audit_ensure_signer_locked(void) {
+    if (!g_signer_started) {
+        g_signer_stop = 0;
+        if (pthread_create(&g_signer_tid, NULL, audit_signer_main, NULL) == 0) {
+            g_signer_ok = 1;
+            g_signer_started = 1;
+        }
+    }
+    {
+        static int atexit_registered = 0;
+        if (!atexit_registered) { atexit_registered = 1; atexit(qihse_audit_shutdown); }
+    }
+}
 static void send_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
 
 // CNSA 2.0: REAL SHA-384
@@ -230,17 +247,7 @@ void qihse_audit_init(void) {
     /* Start the background signer so qihse_audit_log() never blocks on the
      * ~6.5 ms/entry ML-DSA-87 signing path.  If the thread cannot start, the
      * log path transparently falls back to synchronous signing. */
-    if (!g_signer_started) {
-        g_signer_stop = 0;
-        if (pthread_create(&g_signer_tid, NULL, audit_signer_main, NULL) == 0) {
-            g_signer_ok = 1;
-            g_signer_started = 1;
-        }
-    }
-    {
-        static int atexit_registered = 0;
-        if (!atexit_registered) { atexit_registered = 1; atexit(qihse_audit_flush); }
-    }
+    audit_ensure_signer_locked();
     pthread_mutex_unlock(&audit_mutex);
     qihse_audit_verify_integrity();
 }
@@ -441,13 +448,7 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) 
         pthread_mutex_unlock(&audit_mutex);
         return; // No endpoint configured — skip entirely.
     }
-    if (!g_signer_started) {
-        g_signer_stop = 0;
-        if (pthread_create(&g_signer_tid, NULL, audit_signer_main, NULL) == 0) {
-            g_signer_ok = 1;
-            g_signer_started = 1;
-        }
-    }
+    audit_ensure_signer_locked();
     if (g_signer_ok) {
         g_ping_uid = user_id;
         g_ping_classif = classif;

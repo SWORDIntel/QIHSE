@@ -162,6 +162,8 @@ struct qihse_resp_server {
     bool sweeper_shutdown;
     /* U9 delivery metrics */
     qihse_metrics_registry_t* metrics;
+    /* CLUSTER MOVESLOTS target auth */
+    const char* cluster_migrate_password;
 };
 
 typedef struct {
@@ -4348,6 +4350,187 @@ static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(const qihse_res
     return NULL;
 }
 
+/* ---------------------------------------------------------------------------
+ * CLUSTER MOVESLOTS <first>-<last> <host>:<port>  (system domain only)
+ * Streams every locally-owned KV record whose slot falls in the range to the
+ * target node over the MIGRATE wire flow (AUTH, ASKING, SET [PX]), deletes it
+ * locally, then flips ownership and broadcasts the change on the cluster bus.
+ * Keys written to moved slots during the transfer remain on this node until
+ * the ownership flip; a short ASK-state window is future work.
+ * ------------------------------------------------------------------------- */
+#define MOVESLOTS_KEY_MAX 512u
+#define MOVESLOTS_KEY_CAP 100000u
+
+typedef struct {
+    char (*keys)[MOVESLOTS_KEY_MAX + 1u];
+    size_t count;
+    size_t cap;
+    size_t skipped;
+    uint16_t first, last;
+} moveslots_collector_t;
+
+static bool moveslots_collect_cb(const char* key, const char* value, void* user_data) {
+    (void)value;
+    moveslots_collector_t* c = (moveslots_collector_t*)user_data;
+    size_t len = strlen(key);
+    uint16_t slot = qihse_cluster_key_slot(key, len);
+    if (slot < c->first || slot > c->last) return true;
+    if (len > MOVESLOTS_KEY_MAX) { c->skipped++; return true; }
+    if (c->count >= MOVESLOTS_KEY_CAP) return false; /* stop collecting: cap reached */
+    if (c->count == c->cap) {
+        size_t next = c->cap ? c->cap * 2u : 256u;
+        char (*grown)[MOVESLOTS_KEY_MAX + 1u] = realloc(c->keys, next * sizeof(*grown));
+        if (!grown) return false;
+        c->keys = grown;
+        c->cap = next;
+    }
+    memcpy(c->keys[c->count], key, len + 1u);
+    c->count++;
+    return true;
+}
+
+static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM MOVESLOTS is restricted to the system domain");
+    }
+    if (request->argc != 4) return qihse_resp_error(session, "ERR usage: CLUSTER MOVESLOTS <first>-<last> <host>:<port>");
+
+    /* Range: "first-last" or single "slot". */
+    char range[64];
+    size_t rl = request->argv[2].len;
+    if (rl == 0 || rl >= sizeof(range)) return qihse_resp_error(session, "ERR invalid slot range");
+    memcpy(range, request->argv[2].data, rl);
+    range[rl] = '\0';
+    uint32_t first, last;
+    char* dash = strchr(range, '-');
+    if (dash) {
+        *dash = '\0';
+        first = (uint32_t)strtoul(range, NULL, 10);
+        last = (uint32_t)strtoul(dash + 1, NULL, 10);
+    } else {
+        first = last = (uint32_t)strtoul(range, NULL, 10);
+    }
+    if (first > last || last >= QIHSE_CLUSTER_SLOT_COUNT) {
+        return qihse_resp_error(session, "ERR invalid slot range");
+    }
+
+    /* Target: resolve by host:port among known topology nodes. */
+    char target_spec[QIHSE_CLUSTER_HOST_LEN + 16u];
+    size_t tl = request->argv[3].len;
+    if (tl == 0 || tl >= sizeof(target_spec)) return qihse_resp_error(session, "ERR invalid target");
+    memcpy(target_spec, request->argv[3].data, tl);
+    target_spec[tl] = '\0';
+    char* colon = strrchr(target_spec, ':');
+    if (!colon) return qihse_resp_error(session, "ERR target must be host:port");
+    *colon = '\0';
+    uint16_t target_port = (uint16_t)strtoul(colon + 1, NULL, 10);
+
+    qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+    size_t node_count = qihse_cluster_topology_nodes(session->server->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    for (size_t i = 0; i < node_count; i++) {
+        if (strcmp(nodes[i].host, target_spec) == 0 && nodes[i].port == target_port) {
+            target_index = nodes[i].index;
+            break;
+        }
+    }
+    if (target_index == QIHSE_CLUSTER_NODE_NONE) {
+        return qihse_resp_error(session, "ERR target node is not part of this cluster");
+    }
+    uint16_t local_index = qihse_cluster_topology_local_node(session->server->topology);
+    if (target_index == local_index) return qihse_resp_error(session, "ERR target is the local node");
+
+    /* Collect local keys whose slot falls in the range. */
+    moveslots_collector_t collector = { NULL, 0, 0, 0, (uint16_t)first, (uint16_t)last };
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    qihse_kv_foreach_user(session->server->store, session->user, moveslots_collect_cb, &collector);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (collector.count == 0) {
+        free(collector.keys);
+        /* Nothing to move: still flip ownership so the range takes load. */
+        qihse_cluster_topology_assign_range(session->server->topology, (uint16_t)first, (uint16_t)last, target_index);
+        if (session->server->bus)
+            qihse_cluster_bus_broadcast_slot_update(session->server->bus, (uint16_t)first, (uint16_t)last, target_index);
+        return qihse_resp_integer(session, 0);
+    }
+
+    /* Flip ownership FIRST (locally + bus broadcast): the target must accept
+     * SETs for the range during the transfer, and its clients route there.
+     * The source keeps reading its store directly (no routing), so in-flight
+     * keys stream over after the flip. Redis-style ASK-state windows are
+     * future work; a brief not-found window exists for not-yet-moved keys. */
+    qihse_cluster_topology_assign_range(session->server->topology, (uint16_t)first, (uint16_t)last, target_index);
+    if (session->server->bus)
+        qihse_cluster_bus_broadcast_slot_update(session->server->bus, (uint16_t)first, (uint16_t)last, target_index);
+
+    /* Connect + authenticate to the target. */
+    const char* password = session->server->cluster_migrate_password;
+    int target_fd = qihse_resp_connect_timeout(target_spec, target_port, 5000);
+    if (target_fd < 0) {
+        free(collector.keys);
+        return qihse_resp_error(session, "ERR cannot connect to target node");
+    }
+    char remote_error[512] = {0};
+    if (password && *password) {
+        static const uint8_t auth_cmd[] = "AUTH";
+        static const uint8_t op_user[] = "GODMODE_OP";
+        qihse_resp_arg_t auth_args[3] = {
+            { auth_cmd, sizeof(auth_cmd) - 1u },
+            { (const uint8_t*)op_user, sizeof(op_user) - 1u },
+            { (const uint8_t*)password, strlen(password) }
+        };
+        if (!qihse_resp_fd_command(target_fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
+            close_socket(target_fd);
+            free(collector.keys);
+            return qihse_resp_error(session, "ERR target authentication failed");
+        }
+    }
+
+    static const uint8_t asking_cmd[] = "ASKING";
+    static const uint8_t set_cmd[] = "SET";
+    static const uint8_t px_opt[] = "PX";
+    size_t moved = 0;
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    for (size_t i = 0; i < collector.count; i++) {
+        char* key = collector.keys[i];
+        char* value = qihse_kv_get_user(session->server->store, key, session->user);
+        if (!value) continue; /* vanished mid-migration */
+        int64_t ttl = qihse_kv_ttl_ms_user(session->server->store, key, session->user);
+        qihse_resp_arg_t asking = { asking_cmd, sizeof(asking_cmd) - 1u };
+        bool sent = qihse_resp_fd_command(target_fd, 1u, &asking, remote_error, sizeof(remote_error));
+        qihse_resp_arg_t set_args[5];
+        size_t set_argc = 0;
+        set_args[set_argc++] = (qihse_resp_arg_t){ set_cmd, sizeof(set_cmd) - 1u };
+        set_args[set_argc++] = (qihse_resp_arg_t){ (const uint8_t*)key, strlen(key) };
+        set_args[set_argc++] = (qihse_resp_arg_t){ (const uint8_t*)value, strlen(value) };
+        char ttl_buf[32];
+        if (sent && ttl > 0) {
+            int n = snprintf(ttl_buf, sizeof(ttl_buf), "%lld", (long long)ttl);
+            set_args[set_argc++] = (qihse_resp_arg_t){ px_opt, sizeof(px_opt) - 1u };
+            set_args[set_argc++] = (qihse_resp_arg_t){ (const uint8_t*)ttl_buf, (size_t)n };
+        }
+        if (sent) sent = qihse_resp_fd_command(target_fd, set_argc, set_args, remote_error, sizeof(remote_error));
+        if (sent) {
+            /* Transferred: drop the local copy (MIGRATE semantics, no COPY). */
+            qihse_kv_del_user(session->server->store, key, session->user);
+            moved++;
+        } else {
+            fprintf(stderr, "qihse-cluster-daemon: MOVESLOTS key transfer failed: %s\n", remote_error);
+        }
+        free(value);
+        if (!sent) break;
+    }
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    close_socket(target_fd);
+
+    free(collector.keys);
+    char summary[64];
+    snprintf(summary, sizeof(summary), "%zu keys moved; slots %u-%u now owned by %s:%u",
+             moved, first, last, target_spec, target_port);
+    return qihse_resp_bulk_text(session, summary);
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -4431,6 +4614,11 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         if (request->argc != 1) return qihse_resp_wrong_arity(session, qihse_resp_command_is(request, "READONLY") ? "readonly" : "readwrite");
         session->readonly = qihse_resp_command_is(request, "READONLY");
         return qihse_resp_simple(session, "OK");
+    }
+    if (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
+        qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
+        /* Before the generic CLUSTER dispatch: MOVESLOTS needs store + bus. */
+        return qihse_resp_handle_moveslots(session, request);
     }
     if (qihse_resp_command_is(request, "CLUSTER")) {
         qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session };
@@ -4849,6 +5037,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
                                              0, 0, true);
     }
     server->kv_sweep_interval_seconds = supplied->kv_sweep_interval_seconds;
+    server->cluster_migrate_password = supplied->cluster_migrate_password;
     if (server->kv_sweep_interval_seconds > 0 && server->store) {
         server->sweeper_shutdown = false;
         if (pthread_create(&server->sweeper_thread, NULL, qihse_resp_kv_sweeper_main, server) == 0) {
@@ -5075,6 +5264,10 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
     }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&server->state_lock);
+    /* Phase 3: start cluster bus if present (mirrors qihse_resp_server_start;
+     * run() previously never started the bus, silently disabling clustering
+     * for run()-only deployments). */
+    if (server->bus) qihse_cluster_bus_start(server->bus);
     /* Start Task Workers & Scheduler */
     if (server->task_workers) qihse_task_worker_pool_start(server->task_workers);
     if (server->task_scheduler) qihse_task_scheduler_start(server->task_scheduler);

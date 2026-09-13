@@ -560,3 +560,7 @@ make test-cluster-scatter
 - redis-benchmark --cluster compatibility verification
 - p50 latency measurement (CSV mode)
 - Key distribution uniformity verification
+
+## Dynamic discovery (--join)
+
+Nodes may join without a pre-shared topology: launch with `--join SEED_HOST:SEED_BUS_PORT` (repeatable) instead of `--node` entries. The joiner sends MEET frames to the seed's bus port; the seed replies with its own MEET, gossips the newcomer to every peer it knows, and re-announces the slot ranges it owns (`SLOT_UPDATE`). Slot announcements are re-sent on every MEET contact, so slot knowledge self-heals after UDP loss. Heartbeats identify peers by node ID (not table index), so membership learned dynamically stays healthy. A joiner starts with no slots and becomes routable once the slot map is received; slot *reassignment* to the new node remains a manual/rebalance operation. See `tools/qihse_cluster_daemon.c` and `tests/cluster_discover_smoke.py`.

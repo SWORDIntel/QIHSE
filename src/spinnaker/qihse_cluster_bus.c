@@ -179,38 +179,139 @@ static bool qihse_bus_send_to_all_peers(qihse_cluster_bus_t* bus,
     return any;
 }
 
-static void qihse_bus_handle_ping(qihse_cluster_bus_t* bus, uint16_t sender_index,
-                                  const uint8_t* payload, size_t payload_len) {
-    (void)payload;
+/* Resolve a heartbeat peer by the node id carried in its payload — header
+ * indexes are per-sender table positions and mean nothing to a receiver that
+ * learned membership dynamically (index spaces differ per node). */
+static bool qihse_bus_resolve_heartbeat_peer(qihse_cluster_bus_t* bus,
+                                             uint16_t sender_index,
+                                             const uint8_t* payload, size_t payload_len,
+                                             uint16_t* out_peer_index) {
     if (payload_len >= QIHSE_CLUSTER_NODE_ID_LEN + 1u) {
-        /* Reply with PONG containing our node_id */
-        qihse_cluster_node_t local;
-        if (qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) {
-            uint8_t pong_payload[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
-            memcpy(pong_payload, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
-            qihse_cluster_node_t peer;
-            if (qihse_cluster_topology_get_node(bus->topology, sender_index, &peer)) {
-                uint8_t datagram[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(pong_payload)];
-                qihse_bus_build_header(datagram, QIHSE_BUS_MSG_PONG, bus->local_node_index, sizeof(pong_payload));
-                memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, pong_payload, sizeof(pong_payload));
-                qihse_bus_send_datagram(bus, peer.host, peer.bus_port, datagram, sizeof(datagram));
-            }
+        char id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+        memcpy(id, payload, QIHSE_CLUSTER_NODE_ID_LEN);
+        id[QIHSE_CLUSTER_NODE_ID_LEN] = '\0';
+        if (id[0] != '\0' && qihse_cluster_topology_find_node(bus->topology, id, out_peer_index)) {
+            return true;
         }
     }
-    qihse_bus_touch_node(bus, sender_index);
+    /* Fallback for legacy frames without an id payload. */
+    *out_peer_index = sender_index;
+    return true;
 }
 
-static void qihse_bus_handle_pong(qihse_cluster_bus_t* bus, uint16_t sender_index) {
-    qihse_bus_touch_node(bus, sender_index);
+static void qihse_bus_handle_ping(qihse_cluster_bus_t* bus, uint16_t sender_index,
+                                  const uint8_t* payload, size_t payload_len) {
+    uint16_t peer_index = sender_index;
+    if (!qihse_bus_resolve_heartbeat_peer(bus, sender_index, payload, payload_len, &peer_index)) return;
+    qihse_cluster_node_t local;
+    if (qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) {
+        uint8_t pong_payload[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+        memcpy(pong_payload, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+        qihse_cluster_node_t peer;
+        if (qihse_cluster_topology_get_node(bus->topology, peer_index, &peer)) {
+            uint8_t datagram[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(pong_payload)];
+            qihse_bus_build_header(datagram, QIHSE_BUS_MSG_PONG, bus->local_node_index, sizeof(pong_payload));
+            memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, pong_payload, sizeof(pong_payload));
+            qihse_bus_send_datagram(bus, peer.host, peer.bus_port, datagram, sizeof(datagram));
+        }
+    }
+    qihse_bus_touch_node(bus, peer_index);
+}
+
+static void qihse_bus_handle_pong(qihse_cluster_bus_t* bus, uint16_t sender_index,
+                                  const uint8_t* payload, size_t payload_len) {
+    uint16_t peer_index = sender_index;
+    qihse_bus_resolve_heartbeat_peer(bus, sender_index, payload, payload_len, &peer_index);
+    qihse_bus_touch_node(bus, peer_index);
     __atomic_add_fetch(&bus->stats.pongs_received, 1u, __ATOMIC_RELAXED);
 }
 
+/* Send one MEET datagram describing `node` to a bus address. */
+static void qihse_bus_send_meet_node(qihse_cluster_bus_t* bus, const qihse_cluster_node_t* node,
+                                     const char* host, uint16_t port) {
+    uint8_t payload[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
+    size_t len = qihse_bus_serialise_node(node, payload, sizeof(payload));
+    if (len == 0) return;
+    uint8_t datagram[QIHSE_BUS_MAX_DATAGRAM];
+    qihse_bus_build_header(datagram, QIHSE_BUS_MSG_MEET, bus->local_node_index, (uint32_t)len);
+    memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, payload, len);
+    qihse_bus_send_datagram(bus, host, port, datagram, QIHSE_CLUSTER_BUS_HEADER_SIZE + len);
+}
+
+/* Re-announce the slot ranges owned by the LOCAL node as SLOT_UPDATE frames
+ * (coalesced into consecutive runs) — sent to one destination. */
+static void qihse_bus_announce_local_slots(qihse_cluster_bus_t* bus, const char* host, uint16_t port) {
+    qihse_cluster_node_t local;
+    if (!qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) return;
+    uint16_t run_start = 0;
+    bool in_run = false;
+    uint8_t datagram[QIHSE_BUS_MAX_DATAGRAM];
+    for (uint32_t slot = 0; slot <= QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        qihse_cluster_slot_state_t state = QIHSE_CLUSTER_SLOT_STABLE;
+        uint16_t peer = QIHSE_CLUSTER_NODE_NONE;
+        if (slot < QIHSE_CLUSTER_SLOT_COUNT) {
+            qihse_cluster_topology_get_slot(bus->topology, (uint16_t)slot, &owner, &state, &peer);
+        }
+        bool owned = owner == bus->local_node_index;
+        if (owned && !in_run) {
+            run_start = (uint16_t)slot;
+            in_run = true;
+        } else if (!owned && in_run) {
+            in_run = false;
+            qihse_cluster_bus_slot_update_t upd;
+            memset(&upd, 0, sizeof(upd));
+            upd.start = run_start;
+            upd.end = (uint16_t)(slot - 1u);
+            upd.owner_index = bus->local_node_index;
+            memcpy(upd.owner_id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+            qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
+                                   (uint32_t)sizeof(upd));
+            memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
+            qihse_bus_send_datagram(bus, host, port, datagram,
+                                    QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(upd));
+        }
+    }
+}
+
+/* MEET handling with dynamic discovery:
+ *   1. upsert the newcomer (idempotent by node id),
+ *   2. if the newcomer is NEW to us, introduce OURSELVES back to it (so a
+ *      joiner that only knows one seed learns the whole membership),
+ *   3. and gossip the newcomer to every other peer we know (they in turn
+ *      skip forwarding because the node is already known to them, so the
+ *      flood terminates in one hop). */
 static void qihse_bus_handle_meet(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
     qihse_cluster_node_t node;
     if (!qihse_bus_deserialise_node(payload, payload_len, &node)) return;
+    uint16_t known_idx;
+    bool known = qihse_cluster_topology_find_node(bus->topology, node.id, &known_idx);
     uint16_t idx;
-    if (qihse_cluster_topology_upsert_node(bus->topology, &node, &idx)) {
-        qihse_bus_touch_node(bus, idx);
+    if (!qihse_cluster_topology_upsert_node(bus->topology, &node, &idx)) return;
+    qihse_bus_touch_node(bus, idx);
+    if (known) {
+        /* UDP is lossy and joiners repeat their MEETs: re-announce our slot
+         * ownership on every contact so slot knowledge self-heals. */
+        qihse_bus_announce_local_slots(bus, node.host, node.bus_port);
+        return;
+    }
+
+    qihse_cluster_node_t local;
+    if (qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) {
+        /* Introduce ourselves to the newcomer, then re-announce the slot
+         * ranges WE own so the joiner can route immediately (membership
+         * gossip alone carries no slot map). */
+        qihse_bus_send_meet_node(bus, &local, node.host, node.bus_port);
+        qihse_bus_announce_local_slots(bus, node.host, node.bus_port);
+        /* Gossip the newcomer to our other peers. */
+        qihse_cluster_node_t peers[QIHSE_CLUSTER_MAX_NODES];
+        size_t count = qihse_cluster_topology_nodes(bus->topology, peers, QIHSE_CLUSTER_MAX_NODES);
+        for (size_t i = 0; i < count; i++) {
+            if (memcmp(peers[i].id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0 ||
+                memcmp(peers[i].id, node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0) continue;
+            if (peers[i].bus_port == 0 || peers[i].host[0] == '\0') continue;
+            qihse_bus_send_meet_node(bus, &node, peers[i].host, peers[i].bus_port);
+        }
     }
 }
 
@@ -264,7 +365,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
     __atomic_add_fetch(&bus->stats.received, 1u, __ATOMIC_RELAXED);
     switch ((qihse_cluster_bus_msg_type_t)type) {
         case QIHSE_BUS_MSG_PING:        qihse_bus_handle_ping(bus, sender, payload, payload_len); break;
-        case QIHSE_BUS_MSG_PONG:        qihse_bus_handle_pong(bus, sender); break;
+        case QIHSE_BUS_MSG_PONG:        qihse_bus_handle_pong(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_MEET:        qihse_bus_handle_meet(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_FAIL:        qihse_bus_handle_fail(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_SLOT_UPDATE: qihse_bus_handle_slot_update(bus, payload, payload_len); break;

@@ -87,6 +87,9 @@ typedef struct {
     bool enable_killswitch_channel;
     /* U6: background KV expiry sweep cadence in seconds. 0 = disabled. */
     uint32_t kv_sweep_interval_seconds;
+    /* Password used by CLUSTER MOVESLOTS when authenticating to the target
+     * node (as GODMODE_OP). NULL/empty = migration auth disabled. */
+    const char* cluster_migrate_password;
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);

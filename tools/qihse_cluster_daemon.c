@@ -20,8 +20,10 @@
  */
 #include "qihse_resp_wire.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_cluster_bus.h"
 #include "qihse_kv_store.h"
 #include "qihse_platform.h"
+#include <pthread.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -60,6 +62,23 @@ static bool mkdirs(const char* path) {
     return true;
 }
 
+/* Deterministic node identity: the same host:port must mint the same id on
+ * every machine that describes the topology, or the nodes will not recognize
+ * each other. */
+static void fill_node(const char* host, uint16_t port, uint16_t bus_port,
+                      qihse_cluster_node_t* node) {
+    memset(node, 0, sizeof(*node));
+    char seed[QIHSE_CLUSTER_HOST_LEN + 16u];
+    int len = snprintf(seed, sizeof(seed), "qihse-node-%s:%u", host, port);
+    qihse_cluster_node_id_from_seed(seed, len > 0 ? (size_t)len : 0u, node->id);
+    snprintf(node->host, sizeof(node->host), "%s", host);
+    node->port = port;
+    node->bus_port = bus_port;
+    node->role = QIHSE_CLUSTER_NODE_PRIMARY;
+    node->primary_index = QIHSE_CLUSTER_NODE_NONE;
+    node->healthy = true;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -89,11 +108,64 @@ static bool parse_slot_range(const char* s, uint16_t* first, uint16_t* last) {
 static void usage(const char* argv0) {
     fprintf(stderr,
         "usage: %s --index N --bind ADDR --port P --bus-port B\n"
-        "          --node INDEX:HOST:PORT:BUS-PORT [--node …]\n"
+        "          (--node INDEX:HOST:PORT:BUS-PORT [--node …] | --join HOST:BUS-PORT [--join …])\n"
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
-        "          [--max-clients N]\n",
+        "          [--max-clients N]\n"
+        "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
+        "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
+        "  static --node list defines the topology.\n",
         argv0);
+}
+
+typedef struct {
+    qihse_resp_server_t* server;
+    char seeds[8][QIHSE_CLUSTER_HOST_LEN + 8u];
+    size_t seed_count;
+} join_ctx_t;
+
+/* Dynamic join: once the bus is running, repeatedly MEET the seeds until the
+ * topology contains at least one other node (or retries are exhausted). */
+static void* join_main(void* argument) {
+    join_ctx_t* j = (join_ctx_t*)argument;
+    qihse_cluster_bus_t* bus = NULL;
+    for (int wait = 0; wait < 40 && !bus; wait++) { /* bus starts with the server */
+        bus = qihse_resp_server_bus(j->server);
+        if (bus && qihse_cluster_bus_fd(bus) < 0) bus = NULL; /* not started yet */
+        struct timespec ts = {0, 250 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    if (!bus) {
+        fprintf(stderr, "qihse-cluster-daemon: bus never started; join failed\n");
+        return NULL;
+    }
+    for (int round = 0; round < 15; round++) {
+        for (size_t i = 0; i < j->seed_count; i++) {
+            char spec[QIHSE_CLUSTER_HOST_LEN + 8u];
+            snprintf(spec, sizeof(spec), "%s", j->seeds[i]);
+            char* colon = strrchr(spec, ':');
+            if (!colon) continue;
+            *colon = '\0';
+            char* end = NULL;
+            unsigned long port = strtoul(colon + 1, &end, 10);
+            if (end == colon + 1 || *end != '\0' || port == 0 || port > UINT16_MAX) continue;
+            qihse_cluster_bus_meet(bus, spec, (uint16_t)port);
+        }
+        /* Joined = membership discovered AND slot map received (a joiner
+         * without slots cannot route anything). */
+        qihse_cluster_topology_t* topology =
+            (qihse_cluster_topology_t*)qihse_resp_server_topology(j->server);
+        qihse_cluster_node_t nodes[64];
+        size_t count = qihse_cluster_topology_nodes(topology, nodes, 64);
+        if (count > 1 && qihse_cluster_topology_is_covered(topology)) {
+            fprintf(stderr, "qihse-cluster-daemon: joined cluster, %zu nodes discovered\n", count);
+            return NULL;
+        }
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "qihse-cluster-daemon: join retries exhausted\n");
+    return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -106,6 +178,10 @@ int main(int argc, char** argv) {
     size_t max_clients = 4096u;
     peer_spec_t peers[MAX_PEERS];
     size_t peer_count = 0;
+    /* Dynamic discovery seeds (--join HOST:BUSPORT). When present, the static
+     * peer list is optional: membership is learned over the bus via MEET. */
+    char seeds[8][QIHSE_CLUSTER_HOST_LEN + 8u];
+    size_t seed_count = 0;
     bool self_has_slots = false;
     uint16_t self_slot_first = 0, self_slot_last = 0;
 
@@ -136,6 +212,9 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--slot-range") == 0 && i + 1 < argc) {
             self_has_slots = parse_slot_range(argv[++i], &self_slot_first, &self_slot_last);
             if (!self_has_slots) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--join") == 0 && i + 1 < argc) {
+            if (seed_count >= 8u) return usage(argv[0]), 2;
+            snprintf(seeds[seed_count++], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", argv[++i]);
         } else if (strcmp(a, "--node") == 0 && i + 1 < argc) {
             /* INDEX:HOST:PORT:BUS-PORT */
             char spec[512];
@@ -209,13 +288,7 @@ int main(int argc, char** argv) {
     memset(indexes, 0xFF, sizeof(indexes));
     for (size_t k = 0; k < peer_count; k++) {
         qihse_cluster_node_t node;
-        memset(&node, 0, sizeof(node));
-        snprintf(node.host, sizeof(node.host), "%s", peers[k].host);
-        node.port = peers[k].port;
-        node.bus_port = peers[k].bus_port;
-        node.role = QIHSE_CLUSTER_NODE_PRIMARY;
-        node.primary_index = QIHSE_CLUSTER_NODE_NONE;
-        node.healthy = true;
+        fill_node(peers[k].host, peers[k].port, peers[k].bus_port, &node);
         uint16_t idx;
         if (!qihse_cluster_topology_upsert_node(topology, &node, &idx)) {
             fprintf(stderr, "qihse-cluster-daemon: upsert node %zu failed\n", k);
@@ -225,13 +298,7 @@ int main(int argc, char** argv) {
     }
     {
         qihse_cluster_node_t node;
-        memset(&node, 0, sizeof(node));
-        snprintf(node.host, sizeof(node.host), "%s", bind);
-        node.port = port;
-        node.bus_port = bus_port;
-        node.role = QIHSE_CLUSTER_NODE_PRIMARY;
-        node.primary_index = QIHSE_CLUSTER_NODE_NONE;
-        node.healthy = true;
+        fill_node(bind, port, bus_port, &node);
         uint16_t idx;
         if (!qihse_cluster_topology_upsert_node(topology, &node, &idx)) return 1;
         if (indexes[self_index] == 0xFFFFu) indexes[self_index] = idx;
@@ -254,7 +321,9 @@ int main(int argc, char** argv) {
                                                  indexes[self_index]))
             return 1;
     }
-    if (!assigned_any_to_self && peer_count == 0) {
+    /* A lone node owns every slot; a JOINER (has seeds) starts slotless and
+     * learns ownership from the seed's slot announcements over the bus. */
+    if (!assigned_any_to_self && peer_count == 0 && seed_count == 0) {
         if (!qihse_cluster_topology_assign_range(topology, 0u, QIHSE_CLUSTER_SLOT_COUNT - 1u,
                                                  indexes[self_index]))
             return 1;
@@ -277,6 +346,7 @@ int main(int argc, char** argv) {
     config.enable_task_queue = false;
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
+    config.cluster_migrate_password = operator_password;
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     if (!server) {
@@ -286,8 +356,15 @@ int main(int argc, char** argv) {
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, auth=%s\n",
-            self_index, bind, port, bus_port, peer_count, config.auth_required ? "on" : "off");
+    fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s\n",
+            self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off");
+    pthread_t join_thread;
+    join_ctx_t join_ctx = { server, {{0}}, seed_count };
+    if (seed_count > 0) {
+        for (size_t i = 0; i < seed_count; i++)
+            snprintf(join_ctx.seeds[i], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", seeds[i]);
+        if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
+    }
     bool ok = qihse_resp_server_run(server);
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
