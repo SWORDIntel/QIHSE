@@ -124,7 +124,7 @@ struct qihse_resp_server {
     uint64_t next_client_id;
     uint64_t next_worker;
     pthread_rwlock_t kv_lock;
-    pthread_mutex_t vdb_lock;
+    pthread_mutex_t vdb_lock; /* VECSET writes; VECGET/VECSEARCH share — see notes */
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
@@ -358,6 +358,19 @@ static char* qihse_resp_arg_text(const qihse_resp_arg_t* arg) {
     memcpy(text, arg->data, arg->len);
     text[arg->len] = '\0';
     return text;
+}
+
+/* Stack-buffer fast path for arg → NUL-terminated text.  Returns buf on
+ * success (no allocation) or NULL if the arg is invalid / doesn't fit.
+ * Caller MUST free() the result only when it != buf. */
+static char* qihse_resp_arg_text_buf(const qihse_resp_arg_t* arg, char* buf, size_t bufsize) {
+    if (!arg || arg->len == SIZE_MAX || memchr(arg->data, '\0', arg->len) || arg->len + 1u > bufsize) {
+        errno = EINVAL;
+        return NULL;
+    }
+    memcpy(buf, arg->data, arg->len);
+    buf[arg->len] = '\0';
+    return buf;
 }
 
 static qihse_resp_parse_status_t qihse_resp_parse_request(const uint8_t* data, size_t len, qihse_resp_request_t* request) {
@@ -608,9 +621,11 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
         all_exist = true;
         pthread_rwlock_rdlock(&server->kv_lock);
         for (size_t i = 0; i < keys->count; i++) {
-            char* key = qihse_resp_arg_text(&request->argv[keys->indexes[i]]);
+            char keybuf[256];
+            char* key = qihse_resp_arg_text_buf(&request->argv[keys->indexes[i]], keybuf, sizeof(keybuf));
+            if (!key) key = qihse_resp_arg_text(&request->argv[keys->indexes[i]]);
             bool exists = key && qihse_kv_exists_user(server->store, key, session->user);
-            free(key);
+            if (key && key != keybuf) free(key);
             any_exists = any_exists || exists;
             all_exist = all_exist && exists;
         }
@@ -881,13 +896,15 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
 static bool qihse_resp_handle_get(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "get");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char keybuf[256];
+    char* key = qihse_resp_arg_text_buf(&request->argv[1], keybuf, sizeof(keybuf));
+    if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR keys containing NUL bytes are not supported by this storage backend");
     pthread_rwlock_rdlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
     bool under_attack = qihse_kv_store_is_under_attack(session->server->store);
     pthread_rwlock_unlock(&session->server->kv_lock);
-    free(key);
+    if (key != keybuf) free(key);
     if (under_attack) {
         free(value);
         return qihse_resp_error(session, "ERR request rejected by QIHSE defense policy");
@@ -937,15 +954,17 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
         }
     }
     if (nx && xx) return qihse_resp_error(session, "ERR syntax error");
-    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char keybuf[256];
+    char* key = qihse_resp_arg_text_buf(&request->argv[1], keybuf, sizeof(keybuf));
+    if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     char* value = qihse_resp_arg_text(&request->argv[2]);
     if (!key || !value) {
-        free(key);
+        if (key && key != keybuf) free(key);
         free(value);
         return qihse_resp_error(session, "ERR keys and values containing NUL bytes are not supported by this storage backend");
     }
     if (!qihse_system_guard_check_operation(request->argv[1].len + request->argv[2].len, false)) {
-        free(key);
+        if (key && key != keybuf) free(key);
         free(value);
         return qihse_resp_error(session, "OOM command not allowed by QIHSE system guard");
     }
@@ -957,7 +976,7 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
     if (stored && has_ttl) stored = qihse_kv_expire(session->server->store, key, ttl_ms, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
     if (stored && condition) qihse_resp_maybe_publish_killswitch(session, key, value);
-    free(key);
+    if (key != keybuf) free(key);
     free(value);
     if (!condition) {
         free(old);
@@ -1001,10 +1020,12 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
     if (remove) pthread_rwlock_wrlock(&session->server->kv_lock);
     else        pthread_rwlock_rdlock(&session->server->kv_lock);
     for (size_t i = 1; i < request->argc; i++) {
-        char* key = qihse_resp_arg_text(&request->argv[i]);
+        char keybuf[256];
+        char* key = qihse_resp_arg_text_buf(&request->argv[i], keybuf, sizeof(keybuf));
+        if (!key) key = qihse_resp_arg_text(&request->argv[i]);
         if (!key) continue;
         count += remove ? qihse_kv_del_user(session->server->store, key, session->user) : qihse_kv_exists_user(session->server->store, key, session->user);
-        free(key);
+        if (key != keybuf) free(key);
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, count);
@@ -1018,9 +1039,11 @@ static bool qihse_resp_handle_mget(qihse_resp_session_t* session, const qihse_re
     if (!values) return qihse_resp_error(session, "OOM out of memory");
     pthread_rwlock_rdlock(&session->server->kv_lock);
     for (size_t i = 0; i < count; i++) {
-        char* key = qihse_resp_arg_text(&request->argv[i + 1u]);
+        char keybuf[256];
+        char* key = qihse_resp_arg_text_buf(&request->argv[i + 1u], keybuf, sizeof(keybuf));
+        if (!key) key = qihse_resp_arg_text(&request->argv[i + 1u]);
         if (key) values[i] = qihse_kv_get_user(session->server->store, key, session->user);
-        free(key);
+        if (key && key != keybuf) free(key);
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
     bool result = qihse_resp_array(session, count);
@@ -1076,12 +1099,14 @@ static bool qihse_resp_handle_expiry(qihse_resp_session_t* session, const qihse_
 static bool qihse_resp_handle_ttl(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool milliseconds) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, milliseconds ? "pttl" : "ttl");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char keybuf[256];
+    char* key = qihse_resp_arg_text_buf(&request->argv[1], keybuf, sizeof(keybuf));
+    if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR invalid key");
     pthread_rwlock_rdlock(&session->server->kv_lock);
     int64_t ttl = qihse_kv_ttl_ms_user(session->server->store, key, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
-    free(key);
+    if (key != keybuf) free(key);
     if (!milliseconds && ttl >= 0) ttl /= 1000;
     return qihse_resp_integer(session, ttl);
 }
@@ -1089,7 +1114,9 @@ static bool qihse_resp_handle_ttl(qihse_resp_session_t* session, const qihse_res
 static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qihse_resp_request_t* request, int delta) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, delta > 0 ? "incr" : "decr");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char keybuf[256];
+    char* key = qihse_resp_arg_text_buf(&request->argv[1], keybuf, sizeof(keybuf));
+    if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR invalid key");
     pthread_rwlock_wrlock(&session->server->kv_lock);
     char* current = qihse_kv_get_user(session->server->store, key, session->user);
@@ -1106,7 +1133,7 @@ static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qih
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
     free(current);
-    free(key);
+    if (key != keybuf) free(key);
     if (!valid) return qihse_resp_error(session, "ERR value is not an integer or out of range");
     return stored ? qihse_resp_integer(session, value) : qihse_resp_error(session, "ERR increment failed");
 }
@@ -4192,11 +4219,13 @@ static bool dsp_lastsave(qihse_resp_session_t* s, const qihse_resp_request_t* r)
 static bool dsp_type(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "type");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char keybuf[256];
+    char* key = qihse_resp_arg_text_buf(&request->argv[1], keybuf, sizeof(keybuf));
+    if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     pthread_rwlock_rdlock(&session->server->kv_lock);
     bool exists = key && qihse_kv_exists_user(session->server->store, key, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
-    free(key);
+    if (key && key != keybuf) free(key);
     return qihse_resp_simple(session, exists ? "string" : "none");
 }
 
