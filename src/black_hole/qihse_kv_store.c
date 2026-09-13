@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,15 @@ struct qihse_kv_store {
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
     sst_meta_index_t* sst_meta;
+    /* Read-side fd cache: keep a bounded set of SSTable FILE*s open so a
+     * point GET on flushed data does not pay open()+close() per request.
+     * Safe because SSTable files are immutable once written and ids are
+     * monotonically increasing.  Invalidated whenever SSTables are deleted
+     * or replaced (compaction, load, destroy).  Guarded by its own leaf
+     * mutex (held across the seek+read, since the FILE* position is shared)
+     * so point lookups stay correct when kv_lock is held read-side. */
+    pthread_mutex_t sst_fd_lock;
+    struct { int32_t sid; FILE* f; } sst_fds[8];
 };
 
 /* Drop and rebuild an empty SSTable metadata index.  Called whenever SSTables
@@ -622,24 +632,76 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
     return true;
 }
 
-/* Read a single record by (file id, byte offset) as pinpointed by the
- * metadata index. */
-static kv_lookup_state_t lookup_one_sstable(const char* dir, const char* key,
-                                            int32_t sstable_id, uint64_t offset,
-                                            kv_lookup_result_t* out) {
+/* Close every cached SSTable fd.  Called whenever SSTable files are deleted
+ * or replaced (compaction, load, destroy) so a stale FILE* can never serve
+ * data from an unlinked inode. */
+static void sst_fd_cache_clear(qihse_kv_store_t* store) {
+    if (!store) return;
+    pthread_mutex_lock(&store->sst_fd_lock);
+    for (size_t i = 0; i < sizeof(store->sst_fds) / sizeof(store->sst_fds[0]); i++) {
+        if (store->sst_fds[i].f) fclose(store->sst_fds[i].f);
+        store->sst_fds[i].f = NULL;
+        store->sst_fds[i].sid = -1;
+    }
+    pthread_mutex_unlock(&store->sst_fd_lock);
+}
+
+/* Fetch a cached FILE* for sstable `sid`, opening it on miss.  Caller must
+ * not fclose the result.  Returns NULL when the file cannot be opened —
+ * errno is preserved so ENOENT still maps to KV_LOOKUP_MISS. */
+static FILE* sst_fd_get(qihse_kv_store_t* store, const char* dir, int32_t sid) {
+    if (!store || !dir || sid < 0) { errno = EINVAL; return NULL; }
+    size_t nslots = sizeof(store->sst_fds) / sizeof(store->sst_fds[0]);
+    for (size_t i = 0; i < nslots; i++)
+        if (store->sst_fds[i].f && store->sst_fds[i].sid == sid)
+            return store->sst_fds[i].f;
     char path[4096];
-    int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, sstable_id);
-    if (n < 0 || (size_t)n >= sizeof(path)) return KV_LOOKUP_ERROR;
+    int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, sid);
+    if (n < 0 || (size_t)n >= sizeof(path)) { errno = EINVAL; return NULL; }
     int fd = open_secure_read(path);
-    if (fd < 0) return (errno == ENOENT) ? KV_LOOKUP_MISS : KV_LOOKUP_ERROR;
+    if (fd < 0) return NULL;
     FILE* f = fdopen(fd, "rb");
-    if (!f) { close(fd); return KV_LOOKUP_ERROR; }
-    if (fseeko(f, (off_t)offset, SEEK_SET) != 0) { fclose(f); return KV_LOOKUP_ERROR; }
+    if (!f) { close(fd); return NULL; }
+    size_t slot = nslots;
+    for (size_t i = 0; i < nslots; i++)
+        if (!store->sst_fds[i].f) { slot = i; break; }
+    if (slot == nslots) { slot = 0u; fclose(store->sst_fds[0].f); }
+    store->sst_fds[slot].f = f;
+    store->sst_fds[slot].sid = sid;
+    return f;
+}
+
+/* Read a single record by (file id, byte offset) as pinpointed by the
+ * metadata index.  Takes sst_fd_lock for the whole seek+read: the cached
+ * FILE* has one shared position, so concurrent readers (kv_lock read side)
+ * must serialize on it. */
+static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char* dir,
+                                            const char* key, int32_t sstable_id,
+                                            uint64_t offset, kv_lookup_result_t* out) {
+    pthread_mutex_lock(&store->sst_fd_lock);
+    FILE* f = sst_fd_get(store, dir, sstable_id);
+    if (!f) {
+        int e = errno;
+        pthread_mutex_unlock(&store->sst_fd_lock);
+        return (e == ENOENT) ? KV_LOOKUP_MISS : KV_LOOKUP_ERROR;
+    }
+    /* fseeko clears a sticky EOF left by an earlier read on this FILE*. */
+    if (fseeko(f, (off_t)offset, SEEK_SET) != 0) {
+        pthread_mutex_unlock(&store->sst_fd_lock);
+        return KV_LOOKUP_ERROR;
+    }
     uint64_t now = current_time_ms();
     kv_disk_record_t r;
     int rc = disk_record_read(f, &r);
-    if (rc != 1) { fclose(f); return (rc < 0) ? KV_LOOKUP_ERROR : KV_LOOKUP_MISS; }
-    if (strcmp(r.key, key) != 0) { disk_record_free(&r); fclose(f); return KV_LOOKUP_MISS; }
+    if (rc != 1) {
+        pthread_mutex_unlock(&store->sst_fd_lock);
+        return (rc < 0) ? KV_LOOKUP_ERROR : KV_LOOKUP_MISS;
+    }
+    if (strcmp(r.key, key) != 0) {
+        disk_record_free(&r);
+        pthread_mutex_unlock(&store->sst_fd_lock);
+        return KV_LOOKUP_MISS;
+    }
     out->classification = r.classification;
     out->sci_compartment = r.sci_compartment;
     out->expire_time_ms = r.expire_time_ms;
@@ -647,7 +709,8 @@ static kv_lookup_state_t lookup_one_sstable(const char* dir, const char* key,
     bool dead = (r.flags & KV_FLAG_TOMBSTONE) != 0u ||
                 (r.expire_time_ms != 0u && r.expire_time_ms <= now);
     if (!dead) { out->value = r.val; r.val = NULL; }
-    disk_record_free(&r); fclose(f);
+    disk_record_free(&r);
+    pthread_mutex_unlock(&store->sst_fd_lock);
     out->state = dead ? KV_LOOKUP_DEAD : KV_LOOKUP_LIVE;
     return out->state;
 }
@@ -714,7 +777,7 @@ static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store, const char* key
         if (sst_meta_index_lookup(store->sst_meta, key, NULL, NULL, NULL, NULL, &sid, &off)) {
             const char* dir = get_qihse_data_dir();
             if (!dir) return KV_LOOKUP_ERROR;
-            return lookup_one_sstable(dir, key, sid, off, out);
+            return lookup_one_sstable(store, dir, key, sid, off, out);
         }
         return KV_LOOKUP_MISS;
     }
@@ -786,6 +849,7 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
     }
     store->sstable_counter = 0;
     sst_meta_index_reset(store);
+    sst_fd_cache_clear(store);
     return true;
 }
 
@@ -906,6 +970,7 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
         char p[4096]; int m = snprintf(p, sizeof(p), "%ssstable_%d.db", dir, i);
         if (m >= 0 && (size_t)m < sizeof(p)) (void)unlink(p);
     }
+    sst_fd_cache_clear(store);
     if (wctx.written == 0u) {
         store->sstable_counter = 0;
         sst_meta_index_reset(store); /* entries now point at deleted files — rebuild empty */
@@ -1069,6 +1134,10 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
     if (!store->trie) { free(store); return NULL; }
     store->sst_meta = sst_meta_index_create();
     if (!store->sst_meta) { qihse_kv_store_destroy(store); return NULL; }
+    if (pthread_mutex_init(&store->sst_fd_lock, NULL) != 0) {
+        qihse_kv_store_destroy(store);
+        return NULL;
+    }
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_kv_store_destroy(store); return NULL; }
     DIR* d = opendir(dir);
@@ -1105,6 +1174,8 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (!store) return;
     if (store->qdd_ctx) qihse_qdd_free(__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE));
     if (store->wal_fd) { flush_wal_buffer(store); fclose(store->wal_fd); }
+    sst_fd_cache_clear(store);
+    pthread_mutex_destroy(&store->sst_fd_lock);
     if (store->trie) qihse_trinary_trie_destroy(store->trie);
     sst_meta_index_destroy(store->sst_meta);
     free(store);
@@ -1170,9 +1241,15 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return NULL;
-    if (!store->qdd_ctx) {
+    if (!__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE)) {
+        /* CAS-publish so concurrent readers (kv_lock read side) can't
+         * double-init; the loser frees its context instead of leaking it. */
         qihse_quantum_defense_ctx_t* ctx = qihse_qdd_init();
-        __atomic_store_n(&store->qdd_ctx, ctx, __ATOMIC_RELEASE);
+        qihse_quantum_defense_ctx_t* expected = NULL;
+        if (ctx && !__atomic_compare_exchange_n(&store->qdd_ctx, &expected, ctx,
+                                                false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+            qihse_qdd_free(ctx);
+        }
     }
     qihse_quantum_defense_ctx_t* qdd = __atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE);
     if (qdd) {
@@ -1525,6 +1602,7 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     }
     store->sstable_counter = 0;
     sst_meta_index_reset(store);
+    sst_fd_cache_clear(store);
     return 0;
 }
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }

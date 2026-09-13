@@ -10,11 +10,15 @@ static uint64_t now_ns(void) {
 }
 
 static char* random_hex(size_t bytes) {
+    static const char digits[] = "0123456789abcdef";
     char* hex = (char*)malloc(bytes * 2 + 1);
+    if (!hex) return NULL;
     for (size_t i = 0; i < bytes; i++) {
         uint8_t b = (uint8_t)(rand() & 0xFF);
-        snprintf(hex + i * 2, 3, "%02x", b);
+        hex[i * 2]     = digits[(b >> 4) & 0x0F];
+        hex[i * 2 + 1] = digits[b & 0x0F];
     }
+    hex[bytes * 2] = '\0';
     return hex;
 }
 

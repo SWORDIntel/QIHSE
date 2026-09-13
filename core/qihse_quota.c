@@ -19,18 +19,28 @@ typedef struct qihse_quota_tenant {
         uint32_t max_ops;
         uint32_t window_seconds;
     } policy[QIHSE_QUOTA_CLASS_COUNT];
-    struct qihse_quota_tenant* next;
 } qihse_quota_tenant_t;
 
+/* Open-addressed tenant map: slot array at >=2x max_tenants keeps load
+ * factor <= 0.5 so tenant lookup is a couple of probes instead of a linked
+ * list walk.  Deletion (quota_cleanup) uses backshift so no tombstones. */
 struct qihse_quota_table {
     size_t max_tenants;
     size_t tenant_count;
-    qihse_quota_tenant_t* tenants;   /* chained overflow list */
+    size_t map_cap;
+    qihse_quota_tenant_t** slots;
     pthread_mutex_t mutex;
 };
 
+static size_t quota_hash(uint32_t tenant_id) {
+    return (size_t)(tenant_id * 2654435761u);
+}
+
 static qihse_quota_tenant_t* quota_find_locked(qihse_quota_table_t* table, uint32_t tenant_id) {
-    for (qihse_quota_tenant_t* t = table->tenants; t; t = t->next) {
+    size_t h = quota_hash(tenant_id) & (table->map_cap - 1u);
+    for (size_t i = 0; i < table->map_cap; i++) {
+        qihse_quota_tenant_t* t = table->slots[(h + i) & (table->map_cap - 1u)];
+        if (!t) return NULL;
         if (t->used && t->tenant_id == tenant_id) return t;
     }
     return NULL;
@@ -44,10 +54,34 @@ static qihse_quota_tenant_t* quota_get_or_create_locked(qihse_quota_table_t* tab
     if (!t) return NULL;
     t->tenant_id = tenant_id;
     t->used = true;
-    t->next = table->tenants;
-    table->tenants = t;
-    table->tenant_count++;
-    return t;
+    size_t h = quota_hash(tenant_id) & (table->map_cap - 1u);
+    for (size_t i = 0; i < table->map_cap; i++) {
+        size_t pos = (h + i) & (table->map_cap - 1u);
+        if (!table->slots[pos]) { table->slots[pos] = t; table->tenant_count++; return t; }
+    }
+    free(t);
+    return NULL;
+}
+
+/* Remove the slot at index `pos` and backshift the probe cluster: an element
+ * at `cur` slides into the cleared slot iff its probe path reached `pos`
+ * before `cur` (i.e. `pos` lies on the home..cur span). */
+static void quota_slot_delete_locked(qihse_quota_table_t* table, size_t pos) {
+    table->slots[pos] = NULL;
+    size_t cur = pos;
+    for (size_t n = 0; n < table->map_cap; n++) {
+        cur = (cur + 1) & (table->map_cap - 1u);
+        qihse_quota_tenant_t* t = table->slots[cur];
+        if (!t) return;
+        size_t home = quota_hash(t->tenant_id) & (table->map_cap - 1u);
+        size_t dist_to_pos = (pos - home + table->map_cap) & (table->map_cap - 1u);
+        size_t dist_to_cur = (cur - home + table->map_cap) & (table->map_cap - 1u);
+        if (dist_to_pos < dist_to_cur) {
+            table->slots[pos] = t;
+            table->slots[cur] = NULL;
+            pos = cur;
+        }
+    }
 }
 
 qihse_quota_table_t* qihse_quota_table_create(size_t max_tenants) {
@@ -55,7 +89,12 @@ qihse_quota_table_t* qihse_quota_table_create(size_t max_tenants) {
     qihse_quota_table_t* table = calloc(1, sizeof(*table));
     if (!table) return NULL;
     table->max_tenants = max_tenants;
+    table->map_cap = 8u;
+    while (table->map_cap < max_tenants * 2u) table->map_cap *= 2u;
+    table->slots = calloc(table->map_cap, sizeof(*table->slots));
+    if (!table->slots) { free(table); return NULL; }
     if (pthread_mutex_init(&table->mutex, NULL) != 0) {
+        free(table->slots);
         free(table);
         return NULL;
     }
@@ -65,15 +104,12 @@ qihse_quota_table_t* qihse_quota_table_create(size_t max_tenants) {
 void qihse_quota_table_destroy(qihse_quota_table_t* table) {
     if (!table) return;
     pthread_mutex_lock(&table->mutex);
-    qihse_quota_tenant_t* t = table->tenants;
-    while (t) {
-        qihse_quota_tenant_t* next = t->next;
-        free(t);
-        t = next;
+    for (size_t i = 0; i < table->map_cap; i++) {
+        if (table->slots[i]) { free(table->slots[i]); table->slots[i] = NULL; }
     }
-    table->tenants = NULL;
     pthread_mutex_unlock(&table->mutex);
     pthread_mutex_destroy(&table->mutex);
+    free(table->slots);
     free(table);
 }
 
@@ -143,8 +179,9 @@ bool qihse_quota_allow(qihse_quota_table_t* table, uint32_t tenant_id,
 void qihse_quota_reset(qihse_quota_table_t* table) {
     if (!table) return;
     pthread_mutex_lock(&table->mutex);
-    for (qihse_quota_tenant_t* t = table->tenants; t; t = t->next) {
-        memset(t->counters, 0, sizeof(t->counters));
+    for (size_t i = 0; i < table->map_cap; i++) {
+        qihse_quota_tenant_t* t = table->slots[i];
+        if (t) memset(t->counters, 0, sizeof(t->counters));
     }
     pthread_mutex_unlock(&table->mutex);
 }
@@ -156,9 +193,9 @@ void qihse_quota_cleanup(qihse_quota_table_t* table) {
     /* Expire idle windows and drop entries with no configured policy so
      * capacity recycles; configured policies are re-registered by the
      * operator and intentionally survive cleanup. */
-    qihse_quota_tenant_t** link = &table->tenants;
-    while (*link) {
-        qihse_quota_tenant_t* t = *link;
+    for (size_t i = 0; i < table->map_cap; i++) {
+        qihse_quota_tenant_t* t = table->slots[i];
+        if (!t) continue;
         bool has_policy = false;
         for (size_t c = 0; c < QIHSE_QUOTA_CLASS_COUNT; c++) {
             if (t->policy[c].max_ops != 0) has_policy = true;
@@ -169,11 +206,9 @@ void qihse_quota_cleanup(qihse_quota_table_t* table) {
             }
         }
         if (!has_policy) {
-            *link = t->next;
+            quota_slot_delete_locked(table, i);
             table->tenant_count--;
             free(t);
-        } else {
-            link = &t->next;
         }
     }
     pthread_mutex_unlock(&table->mutex);

@@ -188,10 +188,13 @@ bool qihse_bundle_compose(qihse_bundle_composer_t* composer, qihse_user_t* user,
     manifest_append(&buf, line);
     manifest_append(&buf, "session-key:MLKEM1024 ");
     {
+        static const char hex[] = "0123456789abcdef";
         char hex_ct[QIHSE_MLKEM_CIPHERTEXT_SIZE * 2u + 1u];
         for (size_t i = 0; i < QIHSE_MLKEM_CIPHERTEXT_SIZE; i++) {
-            snprintf(hex_ct + i * 2u, 3u, "%02x", ciphertext[i]);
+            hex_ct[i * 2u]     = hex[(ciphertext[i] >> 4) & 0x0F];
+            hex_ct[i * 2u + 1u] = hex[ciphertext[i] & 0x0F];
         }
+        hex_ct[QIHSE_MLKEM_CIPHERTEXT_SIZE * 2u] = '\0';
         manifest_append(&buf, hex_ct);
     }
     manifest_append(&buf, "\n");
@@ -216,10 +219,13 @@ bool qihse_bundle_compose(qihse_bundle_composer_t* composer, qihse_user_t* user,
         uint8_t signature[QIHSE_MLDSA_SIGNATURE_SIZE];
         if (qihse_pqc_sign_path((const uint8_t*)buf.data, buf.len, signature, composer->dsa_key_path)) {
             manifest_append(&buf, "sig:MLDSA87 ");
+            static const char hex[] = "0123456789abcdef";
             char hex_sig[QIHSE_MLDSA_SIGNATURE_SIZE * 2u + 1u];
             for (size_t i = 0; i < QIHSE_MLDSA_SIGNATURE_SIZE; i++) {
-                snprintf(hex_sig + i * 2u, 3u, "%02x", signature[i]);
+                hex_sig[i * 2u]     = hex[(signature[i] >> 4) & 0x0F];
+                hex_sig[i * 2u + 1u] = hex[signature[i] & 0x0F];
             }
+            hex_sig[QIHSE_MLDSA_SIGNATURE_SIZE * 2u] = '\0';
             manifest_append(&buf, hex_sig);
             manifest_append(&buf, "\n");
         }

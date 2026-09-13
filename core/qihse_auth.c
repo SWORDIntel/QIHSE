@@ -119,6 +119,70 @@ static authz_state_t authz_states[MAX_USERS];
 static pthread_rwlock_t auth_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t active_user_count = 0;
 static auth_rate_limit_t rate_limits[MAX_USERS];
+
+/* Username -> user_id map: open-addressed linear-probe table with twice the
+ * capacity of MAX_USERS (load factor <= 0.5), so the per-login lookup in
+ * qihse_auth_authenticate_from is O(1) instead of a 65,536-entry strcmp scan.
+ * Slot value = user_id + 1; 0 = empty, UINT32_MAX = tombstone.
+ * All access is under auth_rwlock. */
+#define AUTH_NAME_MAP_CAP (1u << 17)
+static uint32_t g_name_map[AUTH_NAME_MAP_CAP];
+
+static uint32_t auth_name_hash(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+/* Returns the map slot index for `username`, or -1 if absent. */
+static int64_t auth_name_find_slot(const char* username) {
+    uint32_t h = auth_name_hash(username) & (AUTH_NAME_MAP_CAP - 1u);
+    for (uint32_t i = 0; i < AUTH_NAME_MAP_CAP; i++) {
+        uint32_t slot = g_name_map[(h + i) & (AUTH_NAME_MAP_CAP - 1u)];
+        if (slot == 0u) return -1;
+        if (slot == UINT32_MAX) continue;
+        uint32_t uid = slot - 1u;
+        if (uid < MAX_USERS && users[uid] && strcmp(users[uid]->username, username) == 0)
+            return (int64_t)((h + i) & (AUTH_NAME_MAP_CAP - 1u));
+    }
+    return -1;
+}
+
+static void auth_name_insert_locked(const char* username, uint32_t user_id) {
+    if (!username || !username[0]) return;
+    uint32_t h = auth_name_hash(username) & (AUTH_NAME_MAP_CAP - 1u);
+    for (uint32_t i = 0; i < AUTH_NAME_MAP_CAP; i++) {
+        uint32_t pos = (h + i) & (AUTH_NAME_MAP_CAP - 1u);
+        uint32_t slot = g_name_map[pos];
+        if (slot == 0u || slot == UINT32_MAX) { g_name_map[pos] = user_id + 1u; return; }
+        uint32_t uid = slot - 1u;
+        if (uid < MAX_USERS && users[uid] && strcmp(users[uid]->username, username) == 0) {
+            g_name_map[pos] = user_id + 1u; /* remap (username moved to a different id) */
+            return;
+        }
+    }
+}
+
+static void auth_name_remove_locked(const char* username) {
+    if (!username) return;
+    int64_t slot = auth_name_find_slot(username);
+    if (slot >= 0) g_name_map[slot] = UINT32_MAX;
+}
+
+static void auth_name_map_clear_locked(void) {
+    memset(g_name_map, 0, sizeof(g_name_map));
+}
+
+/* O(1) username -> active user_id lookup; returns MAX_USERS on miss.
+ * Caller must hold auth_rwlock (read or write). */
+static uint32_t auth_name_lookup_locked(const char* username) {
+    int64_t slot = auth_name_find_slot(username);
+    if (slot < 0) return MAX_USERS;
+    uint32_t uid = g_name_map[slot] - 1u;
+    if (uid >= MAX_USERS || !users[uid] || !authz_states[uid].active ||
+        strcmp(users[uid]->username, username) != 0) return MAX_USERS;
+    return uid;
+}
 /* Set when any principal requires a hardware token. While zero, the
  * unclassified fast path in qihse_auth_can_access may skip the authoritative
  * resolve; once set it never clears, so the flag cannot be tampered with via
@@ -336,6 +400,7 @@ bool qihse_auth_init(void) {
         memset(users, 0, sizeof(users));
         memset(authz_states, 0, sizeof(authz_states));
         memset(rate_limits, 0, sizeof(rate_limits));
+        auth_name_map_clear_locked();
         active_user_count = 0;
         pthread_rwlock_unlock(&auth_rwlock);
         return false;
@@ -357,6 +422,7 @@ bool qihse_auth_init(void) {
     memset(users, 0, sizeof(users));
     memset(authz_states, 0, sizeof(authz_states));
     memset(rate_limits, 0, sizeof(rate_limits));
+    auth_name_map_clear_locked();
     active_user_count = 0;
 
     // PRE-SEED SYSTEM OPERATOR (User ID 0)
@@ -387,6 +453,7 @@ bool qihse_auth_init(void) {
         mlock(op, sizeof(qihse_user_t));
 #endif
         users[0] = op;
+        auth_name_insert_locked(op->username, 0);
         set_authz_state_locked(0, op);
         authz_states[0].verifier_configured = operator_verifier_configured;
         active_user_count = 1;
@@ -558,6 +625,7 @@ static qihse_user_t* create_user_internal(const qihse_user_t* creator, uint32_t 
     snprintf(u->username, 64, "User_%u", user_id);
 
     users[user_id] = u;
+    auth_name_insert_locked(u->username, user_id);
     set_authz_state_locked(user_id, u);
     authz_states[user_id].verifier_configured = true;
     active_user_count++;
@@ -627,6 +695,7 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
         qihse_audit_log("USER_DESTROY", actor_id, target_user_id,
                         authz_states[target_user_id].classification_level,
                         authz_states[target_user_id].sci_compartments);
+        auth_name_remove_locked(users[target_user_id]->username);
         OPENSSL_cleanse(users[target_user_id], sizeof(qihse_user_t));
 #ifndef _WIN32
         munlock(users[target_user_id], sizeof(qihse_user_t));
@@ -682,8 +751,10 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
     }
 
     if (new_username != NULL) {
+        auth_name_remove_locked(target->username);
         strncpy(target->username, new_username, 63);
         target->username[63] = '\0';
+        auth_name_insert_locked(target->username, target_user_id);
     }
 
     if (new_password != NULL) {
@@ -1014,13 +1085,7 @@ qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* usern
     if (!username || !password) return NULL;
 
     pthread_rwlock_rdlock(&auth_rwlock);
-    uint32_t target_id = MAX_USERS;
-    for (uint32_t i = 0; i < MAX_USERS; i++) {
-        if (users[i] && authz_states[i].active && strcmp(users[i]->username, username) == 0) {
-            target_id = i;
-            break;
-        }
-    }
+    uint32_t target_id = auth_name_lookup_locked(username);
     pthread_rwlock_unlock(&auth_rwlock);
 
     if (target_id == MAX_USERS) {

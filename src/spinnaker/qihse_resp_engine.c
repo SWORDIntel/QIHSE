@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -122,7 +123,7 @@ struct qihse_resp_server {
     size_t active_clients;
     uint64_t next_client_id;
     uint64_t next_worker;
-    pthread_mutex_t kv_lock;
+    pthread_rwlock_t kv_lock;
     pthread_mutex_t vdb_lock;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
@@ -614,7 +615,7 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
     bool all_exist = false;
     if (keys->kv_keys && owner == local && state != QIHSE_CLUSTER_SLOT_STABLE && server->store) {
         all_exist = true;
-        pthread_mutex_lock(&server->kv_lock);
+        pthread_rwlock_rdlock(&server->kv_lock);
         for (size_t i = 0; i < keys->count; i++) {
             char* key = qihse_resp_arg_text(&request->argv[keys->indexes[i]]);
             bool exists = key && qihse_kv_exists_user(server->store, key, session->user);
@@ -622,7 +623,7 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
             any_exists = any_exists || exists;
             all_exist = all_exist && exists;
         }
-        pthread_mutex_unlock(&server->kv_lock);
+        pthread_rwlock_unlock(&server->kv_lock);
         if (any_exists && !all_exist) {
             session->asking = false;
             qihse_resp_error(session, "TRYAGAIN Multiple keys request during rehashing of slot");
@@ -747,9 +748,47 @@ static bool qihse_resp_handle_client_command(qihse_resp_session_t* session, cons
     return qihse_resp_error(session, "ERR unknown subcommand or wrong number of arguments for 'CLIENT'");
 }
 
+/* Case-insensitive FNV-1a over the command name bytes — matches the
+ * semantics of qihse_resp_arg_equal (ASCII case fold). */
+static uint32_t qihse_resp_cmd_hash(const uint8_t* data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = data[i];
+        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - ('a' - 'A'));
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Command-dispatch index: open-addressed map name->descriptor built once so
+ * dispatch is one hash + one strcmp-verify instead of scanning all ~40
+ * command names with per-char toupper. */
+#define RESP_CMD_MAP_CAP 128u
+static const qihse_resp_command_descriptor_t* g_cmd_map[RESP_CMD_MAP_CAP];
+static pthread_once_t g_cmd_map_once = PTHREAD_ONCE_INIT;
+
+static void qihse_resp_cmd_map_build(void) {
+    size_t n = sizeof(g_qihse_resp_commands) / sizeof(g_qihse_resp_commands[0]);
+    for (size_t i = 0; i < n; i++) {
+        const char* nm = g_qihse_resp_commands[i].name;
+        uint32_t h = qihse_resp_cmd_hash((const uint8_t*)nm, strlen(nm)) & (RESP_CMD_MAP_CAP - 1u);
+        for (size_t j = 0; j < RESP_CMD_MAP_CAP; j++) {
+            size_t pos = (h + j) & (RESP_CMD_MAP_CAP - 1u);
+            if (!g_cmd_map[pos]) { g_cmd_map[pos] = &g_qihse_resp_commands[i]; break; }
+            if (strcasecmp(g_cmd_map[pos]->name, nm) == 0) break; /* dup name */
+        }
+    }
+}
+
 static const qihse_resp_command_descriptor_t* qihse_resp_find_command(const qihse_resp_arg_t* name) {
-    for (size_t i = 0; i < sizeof(g_qihse_resp_commands) / sizeof(g_qihse_resp_commands[0]); i++) {
-        if (qihse_resp_arg_equal(name, g_qihse_resp_commands[i].name)) return &g_qihse_resp_commands[i];
+    if (!name) return NULL;
+    pthread_once(&g_cmd_map_once, qihse_resp_cmd_map_build);
+    uint32_t h = qihse_resp_cmd_hash(name->data, name->len) & (RESP_CMD_MAP_CAP - 1u);
+    for (size_t i = 0; i < RESP_CMD_MAP_CAP; i++) {
+        const qihse_resp_command_descriptor_t* cmd = g_cmd_map[(h + i) & (RESP_CMD_MAP_CAP - 1u)];
+        if (!cmd) return NULL;
+        if (strlen(cmd->name) == name->len && qihse_resp_arg_equal(name, cmd->name)) return cmd;
     }
     return NULL;
 }
@@ -853,10 +892,10 @@ static bool qihse_resp_handle_get(qihse_resp_session_t* session, const qihse_res
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR keys containing NUL bytes are not supported by this storage backend");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_rdlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
     bool under_attack = qihse_kv_store_is_under_attack(session->server->store);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     if (under_attack) {
         free(value);
@@ -919,13 +958,13 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
         free(value);
         return qihse_resp_error(session, "OOM command not allowed by QIHSE system guard");
     }
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool exists = qihse_kv_exists_user(session->server->store, key, session->user);
     char* old = return_old && exists ? qihse_kv_get_user(session->server->store, key, session->user) : NULL;
     bool condition = (!nx || !exists) && (!xx || exists);
     bool stored = condition && qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
     if (stored && has_ttl) stored = qihse_kv_expire(session->server->store, key, ttl_ms, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     if (stored && condition) qihse_resp_maybe_publish_killswitch(session, key, value);
     free(key);
     free(value);
@@ -955,10 +994,10 @@ static bool qihse_resp_handle_setex(qihse_resp_session_t* session, const qihse_r
         free(value);
         return qihse_resp_error(session, "ERR keys and values containing NUL bytes are not supported by this storage backend");
     }
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool stored = qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user) &&
                   qihse_kv_expire(session->server->store, key, ttl, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     free(value);
     return stored ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR set failed");
@@ -968,14 +1007,15 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
     if (request->argc < 2) return qihse_resp_wrong_arity(session, remove ? "del" : "exists");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
     int64_t count = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    if (remove) pthread_rwlock_wrlock(&session->server->kv_lock);
+    else        pthread_rwlock_rdlock(&session->server->kv_lock);
     for (size_t i = 1; i < request->argc; i++) {
         char* key = qihse_resp_arg_text(&request->argv[i]);
         if (!key) continue;
         count += remove ? qihse_kv_del_user(session->server->store, key, session->user) : qihse_kv_exists_user(session->server->store, key, session->user);
         free(key);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, count);
 }
 
@@ -985,13 +1025,13 @@ static bool qihse_resp_handle_mget(qihse_resp_session_t* session, const qihse_re
     size_t count = request->argc - 1u;
     char** values = (char**)calloc(count, sizeof(*values));
     if (!values) return qihse_resp_error(session, "OOM out of memory");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_rdlock(&session->server->kv_lock);
     for (size_t i = 0; i < count; i++) {
         char* key = qihse_resp_arg_text(&request->argv[i + 1u]);
         if (key) values[i] = qihse_kv_get_user(session->server->store, key, session->user);
         free(key);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     bool result = qihse_resp_array(session, count);
     for (size_t i = 0; result && i < count; i++) result = values[i] ? qihse_resp_bulk_text(session, values[i]) : qihse_resp_null(session);
     for (size_t i = 0; i < count; i++) free(values[i]);
@@ -1012,14 +1052,14 @@ static bool qihse_resp_handle_mset(qihse_resp_session_t* session, const qihse_re
     }
     bool stored = valid;
     if (valid) {
-        pthread_mutex_lock(&session->server->kv_lock);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
         for (size_t i = 0; i < text_count; i += 2u) {
             if (!qihse_kv_set_user(session->server->store, text[i], text[i + 1u], 0, 0, session->user)) {
                 stored = false;
                 break;
             }
         }
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
     }
     for (size_t i = 0; i < text_count; i++) free(text[i]);
     free(text);
@@ -1035,9 +1075,9 @@ static bool qihse_resp_handle_expiry(qihse_resp_session_t* session, const qihse_
     if (!milliseconds) ttl *= 1000u;
     char* key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR invalid key");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool result = qihse_kv_expire(session->server->store, key, ttl, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, result ? 1 : 0);
 }
@@ -1047,9 +1087,9 @@ static bool qihse_resp_handle_ttl(qihse_resp_session_t* session, const qihse_res
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR invalid key");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_rdlock(&session->server->kv_lock);
     int64_t ttl = qihse_kv_ttl_ms_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     if (!milliseconds && ttl >= 0) ttl /= 1000;
     return qihse_resp_integer(session, ttl);
@@ -1060,7 +1100,7 @@ static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qih
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR invalid key");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* current = qihse_kv_get_user(session->server->store, key, session->user);
     int64_t value = 0;
     bool valid = true;
@@ -1073,7 +1113,7 @@ static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qih
         int len = snprintf(text, sizeof(text), "%" PRId64, value);
         stored = len > 0 && (size_t)len < sizeof(text) && qihse_kv_set_user(session->server->store, key, text, 0, 0, session->user);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(current);
     free(key);
     if (!valid) return qihse_resp_error(session, "ERR value is not an integer or out of range");
@@ -1555,7 +1595,7 @@ static bool qihse_resp_handle_migrate(qihse_resp_session_t* session, const qihse
         return qihse_resp_error(session, "OOM out of memory");
     }
     size_t found = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 0; i < key_count; i++) {
         char* key = qihse_resp_arg_text(&request->argv[key_indexes[i]]);
         char* value = key ? qihse_kv_get_user(session->server->store, key, session->user) : NULL;
@@ -1569,7 +1609,7 @@ static bool qihse_resp_handle_migrate(qihse_resp_session_t* session, const qihse
             free(value);
         }
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     if (found == 0) {
         free(items);
         free(host);
@@ -1618,9 +1658,9 @@ static bool qihse_resp_handle_migrate(qihse_resp_session_t* session, const qihse
     }
     if (target_fd >= 0) close_socket(target_fd);
     if (migrated && !copy) {
-        pthread_mutex_lock(&session->server->kv_lock);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
         for (size_t i = 0; i < found; i++) qihse_kv_del_user(session->server->store, items[i].key, session->user);
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
     }
     for (size_t i = 0; i < found; i++) {
         free(items[i].key);
@@ -1652,7 +1692,7 @@ static bool qihse_resp_handle_keystone_ingest(qihse_resp_session_t* session, con
         compartment = (uint16_t)cp;
     }
 
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     size_t count = qihse_keystone_ingest_dirty_logs_user(
         session->server->store,
         session->server->topology,
@@ -1662,7 +1702,7 @@ static bool qihse_resp_handle_keystone_ingest(qihse_resp_session_t* session, con
         compartment,
         session->user
     );
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, (int64_t)count);
 }
 
@@ -2210,7 +2250,7 @@ static bool qihse_resp_handle_lpush(qihse_resp_session_t* session, const qihse_r
     if (!key) return qihse_resp_error(session, "ERR invalid key");
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
     size_t count = 0;
     char** parts = existing ? qihse_resp_list_split(existing, &count) : NULL;
@@ -2232,7 +2272,7 @@ static bool qihse_resp_handle_lpush(qihse_resp_session_t* session, const qihse_r
     size_t val_len;
     char* joined = qihse_resp_list_join(new_parts, new_count, &val_len);
     qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(joined);
     for (size_t i = 0; i < new_count; i++) free(new_parts[i]);
     free(new_parts);
@@ -2252,14 +2292,14 @@ static bool qihse_resp_handle_lpop(qihse_resp_session_t* session, const qihse_re
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_null(session); }
+    if (!existing) { pthread_rwlock_unlock(&session->server->kv_lock); free(lk); return qihse_resp_null(session); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(existing, &count);
     free(existing);
     if (pop_count == 0) {
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         qihse_resp_array(session, 0);
         for (size_t i = 0; i < count; i++) free(parts[i]);
         free(parts); free(lk);
@@ -2280,7 +2320,7 @@ static bool qihse_resp_handle_lpop(qihse_resp_session_t* session, const qihse_re
         } else {
             qihse_kv_del_user(session->server->store, lk, session->user);
         }
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         qihse_resp_bulk_text(session, elem);
         free(elem);
         if (left) free(parts[0]); else free(parts[count-1]);
@@ -2308,7 +2348,7 @@ static bool qihse_resp_handle_lpop(qihse_resp_session_t* session, const qihse_re
         else qihse_kv_del_user(session->server->store, lk, session->user);
         free(remaining);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     for (size_t i = 0; i < count; i++) free(parts[i]);
     free(parts); free(lk);
     return true;
@@ -2320,9 +2360,9 @@ static bool qihse_resp_handle_llen(qihse_resp_session_t* session, const qihse_re
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(lk);
     if (!existing) return qihse_resp_integer(session, 0);
     size_t count = 1;
@@ -2340,9 +2380,9 @@ static bool qihse_resp_handle_lrange(qihse_resp_session_t* session, const qihse_
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(lk);
     if (!existing) return qihse_resp_array(session, 0);
     size_t count = 0;
@@ -2375,9 +2415,9 @@ static bool qihse_resp_handle_lindex(qihse_resp_session_t* session, const qihse_
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(lk);
     if (!existing) return qihse_resp_null(session);
     size_t count = 0;
@@ -2401,15 +2441,15 @@ static bool qihse_resp_handle_lset(qihse_resp_session_t* session, const qihse_re
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_error(session, "ERR no such key"); }
+    if (!existing) { pthread_rwlock_unlock(&session->server->kv_lock); free(lk); return qihse_resp_error(session, "ERR no such key"); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(existing, &count);
     free(existing);
     if (index < 0) index += (int64_t)count;
     if (index < 0 || index >= (int64_t)count) {
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         for (size_t i = 0; i < count; i++) free(parts[i]);
         free(parts); free(lk);
         return qihse_resp_error(session, "ERR index out of range");
@@ -2418,7 +2458,7 @@ static bool qihse_resp_handle_lset(qihse_resp_session_t* session, const qihse_re
     parts[index] = qihse_resp_arg_text(&request->argv[3]);
     size_t rl; char* joined = qihse_resp_list_join(parts, count, &rl);
     qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(joined);
     for (size_t i = 0; i < count; i++) free(parts[i]);
     free(parts); free(lk);
@@ -2435,9 +2475,9 @@ static bool qihse_resp_handle_lrem(qihse_resp_session_t* session, const qihse_re
     char* lk = qihse_resp_list_key(key);
     char* target = qihse_resp_arg_text(&request->argv[3]);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); free(target); return qihse_resp_integer(session, 0); }
+    if (!existing) { pthread_rwlock_unlock(&session->server->kv_lock); free(lk); free(target); return qihse_resp_integer(session, 0); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(existing, &count);
     free(existing);
@@ -2470,7 +2510,7 @@ static bool qihse_resp_handle_lrem(qihse_resp_session_t* session, const qihse_re
     } else {
         qihse_kv_del_user(session->server->store, lk, session->user);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(new_parts); free(parts); free(remove); free(lk); free(target);
     return qihse_resp_integer(session, removed);
 }
@@ -2484,9 +2524,9 @@ static bool qihse_resp_handle_ltrim(qihse_resp_session_t* session, const qihse_r
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* lk = qihse_resp_list_key(key);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); return qihse_resp_simple(session, "OK"); }
+    if (!existing) { pthread_rwlock_unlock(&session->server->kv_lock); free(lk); return qihse_resp_simple(session, "OK"); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(existing, &count);
     free(existing);
@@ -2504,7 +2544,7 @@ static bool qihse_resp_handle_ltrim(qihse_resp_session_t* session, const qihse_r
         qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
         free(joined); free(new_parts);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     for (size_t i = 0; i < count; i++) free(parts[i]);
     free(parts); free(lk);
     return qihse_resp_simple(session, "OK");
@@ -2521,9 +2561,9 @@ static bool qihse_resp_handle_linsert(qihse_resp_session_t* session, const qihse
     char* pivot = qihse_resp_arg_text(&request->argv[3]);
     char* value = qihse_resp_arg_text(&request->argv[4]);
     free(key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
-    if (!existing) { pthread_mutex_unlock(&session->server->kv_lock); free(lk); free(pivot); free(value); return qihse_resp_integer(session, 0); }
+    if (!existing) { pthread_rwlock_unlock(&session->server->kv_lock); free(lk); free(pivot); free(value); return qihse_resp_integer(session, 0); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(existing, &count);
     free(existing);
@@ -2532,7 +2572,7 @@ static bool qihse_resp_handle_linsert(qihse_resp_session_t* session, const qihse
         if (strcmp(parts[i], pivot) == 0) { found = (int64_t)i; break; }
     }
     if (found < 0) {
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         for (size_t i = 0; i < count; i++) free(parts[i]);
         free(parts); free(lk); free(pivot); free(value);
         return qihse_resp_integer(session, -1);
@@ -2545,7 +2585,7 @@ static bool qihse_resp_handle_linsert(qihse_resp_session_t* session, const qihse
     for (size_t i = insert_at; i < count; i++) new_parts[i + 1] = parts[i];
     size_t rl; char* joined = qihse_resp_list_join(new_parts, new_count, &rl);
     qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(joined); free(new_parts); free(parts); free(lk); free(pivot);
     return qihse_resp_integer(session, (int64_t)new_count);
 }
@@ -2558,14 +2598,14 @@ static bool qihse_resp_handle_rpoplpush(qihse_resp_session_t* session, const qih
     char* src_lk = qihse_resp_list_key(src_key);
     char* dst_lk = qihse_resp_list_key(dst_key);
     free(src_key); free(dst_key);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* src_val = qihse_kv_get_user(session->server->store, src_lk, session->user);
-    if (!src_val) { pthread_mutex_unlock(&session->server->kv_lock); free(src_lk); free(dst_lk); return qihse_resp_null(session); }
+    if (!src_val) { pthread_rwlock_unlock(&session->server->kv_lock); free(src_lk); free(dst_lk); return qihse_resp_null(session); }
     size_t count = 0;
     char** parts = qihse_resp_list_split(src_val, &count);
     free(src_val);
     if (count == 0) {
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         free(src_lk); free(dst_lk); free(parts);
         return qihse_resp_null(session);
     }
@@ -2589,7 +2629,7 @@ static bool qihse_resp_handle_rpoplpush(qihse_resp_session_t* session, const qih
     size_t rl; char* joined = qihse_resp_list_join(new_dst, dst_count + 1, &rl);
     qihse_kv_set_user(session->server->store, dst_lk, joined, 0, 0, session->user);
     free(joined);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     qihse_resp_bulk_text(session, elem);
     for (size_t i = 0; i < count; i++) free(parts[i]);
     free(parts);
@@ -2605,7 +2645,7 @@ static bool qihse_resp_handle_hset(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t new_fields = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i + 1 < request->argc; i += 2) {
         char* field = qihse_resp_arg_text(&request->argv[i]);
         char* value = qihse_resp_arg_text(&request->argv[i + 1]);
@@ -2620,7 +2660,7 @@ static bool qihse_resp_handle_hset(qihse_resp_session_t* session, const qihse_re
     char meta_val[32];
     snprintf(meta_val, sizeof(meta_val), "%" PRId64, new_fields);
     /* Actually we need to track total. For simplicity, store count. */
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(meta); free(key);
     bool is_hmset = qihse_resp_command_is(request, "HMSET");
     return is_hmset ? qihse_resp_simple(session, "OK") : qihse_resp_integer(session, new_fields);
@@ -2633,9 +2673,9 @@ static bool qihse_resp_handle_hget(qihse_resp_session_t* session, const qihse_re
     char* field = qihse_resp_arg_text(&request->argv[2]);
     char* hk = qihse_resp_hash_key(key, field);
     free(key); free(field);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, hk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(hk);
     bool result = value ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session);
     free(value);
@@ -2654,14 +2694,14 @@ static bool qihse_resp_handle_hdel(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t deleted = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* field = qihse_resp_arg_text(&request->argv[i]);
         char* hk = qihse_resp_hash_key(key, field);
         if (qihse_kv_del_user(session->server->store, hk, session->user)) deleted++;
         free(hk); free(field);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, deleted);
 }
@@ -2673,9 +2713,9 @@ static bool qihse_resp_handle_hexists(qihse_resp_session_t* session, const qihse
     char* field = qihse_resp_arg_text(&request->argv[2]);
     char* hk = qihse_resp_hash_key(key, field);
     free(key); free(field);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool exists = qihse_kv_exists_user(session->server->store, hk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(hk);
     return qihse_resp_integer(session, exists ? 1 : 0);
 }
@@ -2705,7 +2745,7 @@ static bool qihse_resp_handle_hincrby(qihse_resp_session_t* session, const qihse
     char* field = qihse_resp_arg_text(&request->argv[2]);
     char* hk = qihse_resp_hash_key(key, field);
     free(key); free(field);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, hk, session->user);
     int64_t val = 0;
     if (existing) val = strtoll(existing, NULL, 10);
@@ -2713,7 +2753,7 @@ static bool qihse_resp_handle_hincrby(qihse_resp_session_t* session, const qihse
     val += increment;
     char val_str[32]; snprintf(val_str, sizeof(val_str), "%" PRId64, val);
     qihse_kv_set_user(session->server->store, hk, val_str, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(hk);
     return qihse_resp_integer(session, val);
 }
@@ -2723,7 +2763,7 @@ static bool qihse_resp_handle_hmget(qihse_resp_session_t* session, const qihse_r
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     qihse_resp_array(session, request->argc - 2);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* field = qihse_resp_arg_text(&request->argv[i]);
         char* hk = qihse_resp_hash_key(key, field);
@@ -2732,7 +2772,7 @@ static bool qihse_resp_handle_hmget(qihse_resp_session_t* session, const qihse_r
         else qihse_resp_null(session);
         free(hk); free(field);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return true;
 }
@@ -2745,11 +2785,11 @@ static bool qihse_resp_handle_hsetnx(qihse_resp_session_t* session, const qihse_
     char* value = qihse_resp_arg_text(&request->argv[3]);
     char* hk = qihse_resp_hash_key(key, field);
     free(key); free(field);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool exists = qihse_kv_exists_user(session->server->store, hk, session->user);
     bool ok = true;
     if (!exists) ok = qihse_kv_set_user(session->server->store, hk, value, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(hk); free(value);
     return qihse_resp_integer(session, (!exists && ok) ? 1 : 0);
 }
@@ -2761,9 +2801,9 @@ static bool qihse_resp_handle_hstrlen(qihse_resp_session_t* session, const qihse
     char* field = qihse_resp_arg_text(&request->argv[2]);
     char* hk = qihse_resp_hash_key(key, field);
     free(key); free(field);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, hk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(hk);
     int64_t len = value ? (int64_t)strlen(value) : 0;
     free(value);
@@ -2777,7 +2817,7 @@ static bool qihse_resp_handle_sadd(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t added = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* member = qihse_resp_arg_text(&request->argv[i]);
         char* sk = qihse_resp_set_key(key, member);
@@ -2787,7 +2827,7 @@ static bool qihse_resp_handle_sadd(qihse_resp_session_t* session, const qihse_re
         }
         free(sk); free(member);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, added);
 }
@@ -2797,14 +2837,14 @@ static bool qihse_resp_handle_srem(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t removed = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* member = qihse_resp_arg_text(&request->argv[i]);
         char* sk = qihse_resp_set_key(key, member);
         if (qihse_kv_del_user(session->server->store, sk, session->user)) removed++;
         free(sk); free(member);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, removed);
 }
@@ -2821,9 +2861,9 @@ static bool qihse_resp_handle_sismember(qihse_resp_session_t* session, const qih
     char* member = qihse_resp_arg_text(&request->argv[2]);
     char* sk = qihse_resp_set_key(key, member);
     free(key); free(member);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool exists = qihse_kv_exists_user(session->server->store, sk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(sk);
     return qihse_resp_integer(session, exists ? 1 : 0);
 }
@@ -2847,13 +2887,13 @@ static bool qihse_resp_handle_smove(qihse_resp_session_t* session, const qihse_r
     char* sk = qihse_resp_set_key(src, member);
     char* dk = qihse_resp_set_key(dst, member);
     free(src); free(dst); free(member);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     bool exists = qihse_kv_exists_user(session->server->store, sk, session->user);
     if (exists) {
         qihse_kv_del_user(session->server->store, sk, session->user);
         qihse_kv_set_user(session->server->store, dk, "1", 0, 0, session->user);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(sk); free(dk);
     return qihse_resp_integer(session, exists ? 1 : 0);
 }
@@ -2885,7 +2925,7 @@ static bool qihse_resp_handle_zadd(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t added = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i + 1 < request->argc; i += 2) {
         double score;
         if (!qihse_resp_parse_f64_arg(&request->argv[i], &score))
@@ -2898,7 +2938,7 @@ static bool qihse_resp_handle_zadd(qihse_resp_session_t* session, const qihse_re
         if (!existed) added++;
         free(zk); free(member);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, added);
 }
@@ -2908,14 +2948,14 @@ static bool qihse_resp_handle_zrem(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t removed = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* member = qihse_resp_arg_text(&request->argv[i]);
         char* zk = qihse_resp_zset_key(key, member);
         if (qihse_kv_del_user(session->server->store, zk, session->user)) removed++;
         free(zk); free(member);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, removed);
 }
@@ -2927,9 +2967,9 @@ static bool qihse_resp_handle_zscore(qihse_resp_session_t* session, const qihse_
     char* member = qihse_resp_arg_text(&request->argv[2]);
     char* zk = qihse_resp_zset_key(key, member);
     free(key); free(member);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* score = qihse_kv_get_user(session->server->store, zk, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(zk);
     bool result = score ? qihse_resp_bulk_text(session, score) : qihse_resp_null(session);
     free(score);
@@ -2966,14 +3006,14 @@ static bool qihse_resp_handle_zincrby(qihse_resp_session_t* session, const qihse
     char* member = qihse_resp_arg_text(&request->argv[3]);
     char* zk = qihse_resp_zset_key(key, member);
     free(key); free(member);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, zk, session->user);
     double val = existing ? strtod(existing, NULL) : 0.0;
     free(existing);
     val += increment;
     char score_str[32]; snprintf(score_str, sizeof(score_str), "%.17g", val);
     qihse_kv_set_user(session->server->store, zk, score_str, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(zk);
     return qihse_resp_bulk_text(session, score_str);
 }
@@ -3010,16 +3050,16 @@ static bool qihse_resp_handle_rename(qihse_resp_session_t* session, const qihse_
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* src = qihse_resp_arg_text(&request->argv[1]);
     char* dst = qihse_resp_arg_text(&request->argv[2]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, src, session->user);
-    if (!value) { pthread_mutex_unlock(&session->server->kv_lock); free(src); free(dst); return qihse_resp_error(session, "ERR no such key"); }
+    if (!value) { pthread_rwlock_unlock(&session->server->kv_lock); free(src); free(dst); return qihse_resp_error(session, "ERR no such key"); }
     if (nx && qihse_kv_exists_user(session->server->store, dst, session->user)) {
-        pthread_mutex_unlock(&session->server->kv_lock); free(value); free(src); free(dst);
+        pthread_rwlock_unlock(&session->server->kv_lock); free(value); free(src); free(dst);
         return qihse_resp_integer(session, 0);
     }
     qihse_kv_set_user(session->server->store, dst, value, 0, 0, session->user);
     qihse_kv_del_user(session->server->store, src, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(value); free(src); free(dst);
     return nx ? qihse_resp_integer(session, 1) : qihse_resp_simple(session, "OK");
 }
@@ -3029,10 +3069,10 @@ static bool qihse_resp_handle_getset(qihse_resp_session_t* session, const qihse_
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* value = qihse_resp_arg_text(&request->argv[2]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* old = qihse_kv_get_user(session->server->store, key, session->user);
     qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key); free(value);
     bool result = old ? qihse_resp_bulk_text(session, old) : qihse_resp_null(session);
     free(old);
@@ -3043,10 +3083,10 @@ static bool qihse_resp_handle_getdel(qihse_resp_session_t* session, const qihse_
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "getdel");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
     if (value) qihse_kv_del_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     bool result = value ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session);
     free(value);
@@ -3057,9 +3097,9 @@ static bool qihse_resp_handle_strlen(qihse_resp_session_t* session, const qihse_
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "strlen");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     int64_t len = value ? (int64_t)strlen(value) : 0;
     free(value);
@@ -3071,7 +3111,7 @@ static bool qihse_resp_handle_append(qihse_resp_session_t* session, const qihse_
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* suffix = qihse_resp_arg_text(&request->argv[2]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
     size_t old_len = existing ? strlen(existing) : 0;
     size_t suf_len = strlen(suffix);
@@ -3079,7 +3119,7 @@ static bool qihse_resp_handle_append(qihse_resp_session_t* session, const qihse_
     if (existing) memcpy(combined, existing, old_len);
     memcpy(combined + old_len, suffix, suf_len + 1);
     qihse_kv_set_user(session->server->store, key, combined, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(combined); free(existing); free(key); free(suffix);
     return qihse_resp_integer(session, (int64_t)(old_len + suf_len));
 }
@@ -3091,9 +3131,9 @@ static bool qihse_resp_handle_getrange(qihse_resp_session_t* session, const qihs
     if (!qihse_resp_parse_i64_arg(&request->argv[2], &start) || !qihse_resp_parse_i64_arg(&request->argv[3], &end))
         return qihse_resp_error(session, "ERR value is not an integer or out of range");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     if (!value) return qihse_resp_bulk(session, "", 0);
     int64_t len = (int64_t)strlen(value);
@@ -3117,7 +3157,7 @@ static bool qihse_resp_handle_setrange(qihse_resp_session_t* session, const qihs
     char* key = qihse_resp_arg_text(&request->argv[1]);
     char* value = qihse_resp_arg_text(&request->argv[3]);
     size_t val_len = strlen(value);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
     size_t old_len = existing ? strlen(existing) : 0;
     size_t new_len = offset + val_len;
@@ -3126,7 +3166,7 @@ static bool qihse_resp_handle_setrange(qihse_resp_session_t* session, const qihs
     if (existing) memcpy(result_str, existing, old_len);
     memcpy(result_str + offset, value, val_len);
     qihse_kv_set_user(session->server->store, key, result_str, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(result_str); free(existing); free(key); free(value);
     return qihse_resp_integer(session, (int64_t)new_len);
 }
@@ -3139,14 +3179,14 @@ static bool qihse_resp_handle_incrby(qihse_resp_session_t* session, const qihse_
         return qihse_resp_error(session, "ERR value is not an integer or out of range");
     if (dec) delta = -delta;
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
     int64_t val = existing ? strtoll(existing, NULL, 10) : 0;
     free(existing);
     val += delta;
     char val_str[32]; snprintf(val_str, sizeof(val_str), "%" PRId64, val);
     qihse_kv_set_user(session->server->store, key, val_str, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, val);
 }
@@ -3158,14 +3198,14 @@ static bool qihse_resp_handle_incrbyfloat(qihse_resp_session_t* session, const q
     if (!qihse_resp_parse_f64_arg(&request->argv[2], &delta))
         return qihse_resp_error(session, "ERR value is not a valid float");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
     double val = existing ? strtod(existing, NULL) : 0.0;
     free(existing);
     val += delta;
     char val_str[32]; snprintf(val_str, sizeof(val_str), "%.17g", val);
     qihse_kv_set_user(session->server->store, key, val_str, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_bulk_text(session, val_str);
 }
@@ -3173,7 +3213,7 @@ static bool qihse_resp_handle_incrbyfloat(qihse_resp_session_t* session, const q
 static bool qihse_resp_handle_msetnx(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 3 || (request->argc % 2) != 1) return qihse_resp_wrong_arity(session, "msetnx");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     /* Check if any key exists */
     bool any_exists = false;
     for (size_t i = 1; i + 1 < request->argc; i += 2) {
@@ -3181,14 +3221,14 @@ static bool qihse_resp_handle_msetnx(qihse_resp_session_t* session, const qihse_
         if (qihse_kv_exists_user(session->server->store, key, session->user)) { any_exists = true; free(key); break; }
         free(key);
     }
-    if (any_exists) { pthread_mutex_unlock(&session->server->kv_lock); return qihse_resp_integer(session, 0); }
+    if (any_exists) { pthread_rwlock_unlock(&session->server->kv_lock); return qihse_resp_integer(session, 0); }
     for (size_t i = 1; i + 1 < request->argc; i += 2) {
         char* key = qihse_resp_arg_text(&request->argv[i]);
         char* value = qihse_resp_arg_text(&request->argv[i + 1]);
         qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
         free(key); free(value);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, 1);
 }
 
@@ -3196,14 +3236,14 @@ static bool qihse_resp_handle_persist(qihse_resp_session_t* session, const qihse
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "persist");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     int64_t ttl = qihse_kv_ttl_ms_user(session->server->store, key, session->user);
     if (ttl > 0) {
         /* Remove TTL by setting a very large one or re-setting key */
         char* value = qihse_kv_get_user(session->server->store, key, session->user);
         if (value) { qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user); free(value); }
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, ttl > 0 ? 1 : 0);
 }
@@ -3218,13 +3258,13 @@ static bool qihse_resp_handle_expireat(qihse_resp_session_t* session, const qihs
     int64_t now = (int64_t)time(NULL);
     int64_t ttl = ms ? when - now * 1000 : (when - now) * 1000;
     if (ttl <= 0) {
-        pthread_mutex_lock(&session->server->kv_lock);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
         qihse_kv_del_user(session->server->store, key, session->user);
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
     } else {
-        pthread_mutex_lock(&session->server->kv_lock);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
         qihse_kv_expire(session->server->store, key, (uint64_t)ttl, session->user);
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
     }
     free(key);
     return qihse_resp_integer(session, 1);
@@ -3235,11 +3275,11 @@ static bool qihse_resp_handle_copy(qihse_resp_session_t* session, const qihse_re
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* src = qihse_resp_arg_text(&request->argv[1]);
     char* dst = qihse_resp_arg_text(&request->argv[2]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* value = qihse_kv_get_user(session->server->store, src, session->user);
     bool ok = false;
     if (value) { ok = qihse_kv_set_user(session->server->store, dst, value, 0, 0, session->user); free(value); }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(src); free(dst);
     return qihse_resp_integer(session, ok ? 1 : 0);
 }
@@ -3253,13 +3293,13 @@ static bool qihse_resp_handle_touch(qihse_resp_session_t* session, const qihse_r
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "touch");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     int64_t count = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 1; i < request->argc; i++) {
         char* key = qihse_resp_arg_text(&request->argv[i]);
         if (qihse_kv_exists_user(session->server->store, key, session->user)) count++;
         free(key);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, count);
 }
 
@@ -3288,10 +3328,10 @@ static bool qihse_resp_handle_flushdb(qihse_resp_session_t* session, const qihse
 static bool qihse_resp_handle_dbsize(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
     if (!session->server->store) return qihse_resp_integer(session, 0);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     /* Authorization-aware count: callers see only records they may read. */
     size_t count = qihse_kv_count_user(session->server->store, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     return qihse_resp_integer(session, (int64_t)count);
 }
 
@@ -3744,7 +3784,7 @@ static bool qihse_resp_handle_setbit(qihse_resp_session_t* session, const qihse_
     if (!qihse_resp_parse_i64_arg(&request->argv[3], &bit_val) || (bit_val != 0 && bit_val != 1))
         return qihse_resp_error(session, "ERR bit is not an integer or out of range");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
     size_t byte_len = existing ? strlen(existing) : 0;
     size_t needed = (size_t)(offset / 8) + 1;
@@ -3761,7 +3801,7 @@ static bool qihse_resp_handle_setbit(qihse_resp_session_t* session, const qihse_
     if (bit_val) existing[byte_idx] |= (1 << bit_idx);
     else existing[byte_idx] &= ~(1 << bit_idx);
     qihse_kv_set_user(session->server->store, key, existing, 0, 0, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(existing); free(key);
     return qihse_resp_integer(session, old_bit);
 }
@@ -3773,9 +3813,9 @@ static bool qihse_resp_handle_getbit(qihse_resp_session_t* session, const qihse_
     if (!qihse_resp_parse_i64_arg(&request->argv[2], &offset) || offset < 0)
         return qihse_resp_error(session, "ERR bit offset is not an integer or out of range");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     size_t byte_idx = (size_t)(offset / 8);
     int bit_idx = (int)(7 - (offset % 8));
@@ -3789,9 +3829,9 @@ static bool qihse_resp_handle_bitcount(qihse_resp_session_t* session, const qihs
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "bitcount");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
     char* key = qihse_resp_arg_text(&request->argv[1]);
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     char* existing = qihse_kv_get_user(session->server->store, key, session->user);
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     if (!existing) return qihse_resp_integer(session, 0);
     int64_t count = 0;
@@ -3822,7 +3862,7 @@ static bool qihse_resp_handle_pfadd(qihse_resp_session_t* session, const qihse_r
     /* Simplified: store elements as a set, return 1 if new */
     char* key = qihse_resp_arg_text(&request->argv[1]);
     int64_t updated = 0;
-    pthread_mutex_lock(&session->server->kv_lock);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     for (size_t i = 2; i < request->argc; i++) {
         char* member = qihse_resp_arg_text(&request->argv[i]);
         char* hll_key = qihse_resp_set_key(key, member);
@@ -3839,7 +3879,7 @@ static bool qihse_resp_handle_pfadd(qihse_resp_session_t* session, const qihse_r
             qihse_kv_set_user(session->server->store, hll_meta, "1", 0, 0, session->user);
         free(hll_meta);
     }
-    pthread_mutex_unlock(&session->server->kv_lock);
+    pthread_rwlock_unlock(&session->server->kv_lock);
     free(key);
     return qihse_resp_integer(session, updated);
 }
@@ -4327,9 +4367,9 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         if (request->argc != 2) return qihse_resp_wrong_arity(session, "type");
         if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
         char* key = qihse_resp_arg_text(&request->argv[1]);
-        pthread_mutex_lock(&session->server->kv_lock);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
         bool exists = key && qihse_kv_exists_user(session->server->store, key, session->user);
-        pthread_mutex_unlock(&session->server->kv_lock);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         free(key);
         return qihse_resp_simple(session, exists ? "string" : "none");
     }
@@ -4709,9 +4749,9 @@ static void* qihse_resp_kv_sweeper_main(void* argument) {
             nanosleep(&pause, NULL);
         }
         if (server->store) {
-            pthread_mutex_lock(&server->kv_lock);
+            pthread_rwlock_wrlock(&server->kv_lock);
             qihse_kv_sweep_expired(server->store);
-            pthread_mutex_unlock(&server->kv_lock);
+            pthread_rwlock_unlock(&server->kv_lock);
         }
     }
     return NULL;
@@ -4823,7 +4863,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         return NULL;
     }
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
-        pthread_mutex_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
+        pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0) {
         free(server);
         errno = ENOMEM;
@@ -5096,7 +5136,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
     pthread_mutex_destroy(&server->vdb_lock);
-    pthread_mutex_destroy(&server->kv_lock);
+    pthread_rwlock_destroy(&server->kv_lock);
     pthread_cond_destroy(&server->clients_drained);
     pthread_mutex_destroy(&server->state_lock);
     free(server);

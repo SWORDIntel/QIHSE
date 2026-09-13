@@ -135,8 +135,10 @@ static void compute_task_id(const char* queue_name, const uint8_t* payload, size
     EVP_DigestFinal_ex(ctx, digest, &len);
     EVP_MD_CTX_free(ctx);
 
+    static const char digits[] = "0123456789abcdef";
     for (unsigned int i = 0; i < len && i < 48; i++) {
-        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+        out_hex[i * 2]     = digits[(digest[i] >> 4) & 0x0F];
+        out_hex[i * 2 + 1] = digits[digest[i] & 0x0F];
     }
     out_hex[QIHSE_TASK_ID_LEN] = '\0';
 }

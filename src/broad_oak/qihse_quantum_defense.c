@@ -43,6 +43,7 @@ struct qihse_quantum_defense_ctx_t {
     bool under_attack;
     qihse_qdd_ip_threat_t ip_threats[QDD_IP_CACHE_SIZE];
     uint32_t ip_threat_count;
+    uint32_t last_ip_idx; /* hint: index of most recently seen accessor ip */
     qihse_mmdb_t* mmdb_country;
     qihse_mmdb_t* mmdb_city;
     qihse_mmdb_t* mmdb_asn;
@@ -60,9 +61,26 @@ static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const ch
     if (!ctx || !ip) return;
     
     uint64_t now = (uint64_t)time(NULL);
-    
+
+    /* Same accessor dominates (e.g. the KV path reports a fixed source) —
+     * check the last-seen slot before scanning all entries. */
+    if (ctx->last_ip_idx < ctx->ip_threat_count &&
+        strcmp(ctx->ip_threats[ctx->last_ip_idx].ip, ip) == 0) {
+        qihse_qdd_ip_threat_t* e = &ctx->ip_threats[ctx->last_ip_idx];
+        uint64_t time_delta = now - e->last_access_time;
+        if (time_delta < 1) {
+            e->burst_count++;
+            if (e->burst_count > 10) e->threat_contribution += 5;
+        } else {
+            e->burst_count = 1;
+        }
+        e->last_access_time = now;
+        return;
+    }
+
     for (uint32_t i = 0; i < ctx->ip_threat_count; i++) {
         if (strcmp(ctx->ip_threats[i].ip, ip) == 0) {
+            ctx->last_ip_idx = i;
             uint64_t time_delta = now - ctx->ip_threats[i].last_access_time;
             if (time_delta < 1) {
                 ctx->ip_threats[i].burst_count++;
@@ -93,7 +111,8 @@ static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const ch
         snprintf(geo_details, sizeof(geo_details), "IP %s from %s/%s (ASN: %s)", ip,
                  entry->country, entry->city, entry->asn);
         qihse_qdd_audit_log("IP_THREAT_TRACKED", geo_details);
-        
+
+        ctx->last_ip_idx = ctx->ip_threat_count;
         ctx->ip_threat_count++;
     }
 }

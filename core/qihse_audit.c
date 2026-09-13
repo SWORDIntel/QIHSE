@@ -28,6 +28,12 @@ static OSSL_PROVIDER *oqs_provider = NULL;
 static pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char last_hash[129] = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"; // 96 chars for SHA-384
 static char webhook_target[256] = ""; // Optional audit notification endpoint
+/* Latest-pending webhook notification — set under audit_mutex, drained by
+ * the signer thread.  Coalesces classified-access bursts to the most recent
+ * event instead of opening a socket per row. */
+static int g_ping_pending = 0;
+static uint32_t g_ping_uid = 0;
+static uint16_t g_ping_classif = 0, g_ping_sci = 0;
 
 #define AUDIT_FILE "qihse_audit.log"
 #define INTEGRITY_CHAIN_FILE "qihse_integrity.chain"
@@ -69,13 +75,16 @@ static int g_signer_ok = 0;
 static int g_signer_stop = 0;
 
 static void* audit_signer_main(void* arg);
+static void send_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
 
 // CNSA 2.0: REAL SHA-384
 static void compute_sha384(const char *input, char *output) {
+    static const char hex[] = "0123456789abcdef";
     unsigned char hash[SHA384_DIGEST_LENGTH];
     SHA384((const unsigned char*)input, strlen(input), hash);
     for (int i = 0; i < SHA384_DIGEST_LENGTH; i++) {
-        snprintf(output + (i * 2), 3, "%02x", hash[i]);
+        output[i * 2]     = hex[(hash[i] >> 4) & 0x0F];
+        output[i * 2 + 1] = hex[hash[i] & 0x0F];
     }
     output[96] = '\0';
 }
@@ -280,20 +289,25 @@ static void* audit_signer_main(void* arg) {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&audit_mutex);
-        while (!g_q_head && !g_signer_stop) {
+        while (!g_q_head && !g_ping_pending && !g_signer_stop) {
             pthread_cond_wait(&g_q_cond, &audit_mutex);
         }
-        if (!g_q_head && g_signer_stop) {
+        if (!g_q_head && !g_ping_pending && g_signer_stop) {
             pthread_mutex_unlock(&audit_mutex);
             return NULL;
         }
         audit_pending_t* e = g_q_head;
-        g_q_head = e->next;
-        if (!g_q_head) { g_q_tail = NULL; pthread_cond_broadcast(&g_q_empty_cond); }
+        if (e) {
+            g_q_head = e->next;
+            if (!g_q_head) { g_q_tail = NULL; pthread_cond_broadcast(&g_q_empty_cond); }
+        }
+        int ping = g_ping_pending;
+        uint32_t pu = g_ping_uid; uint16_t pc = g_ping_classif, ps = g_ping_sci;
+        g_ping_pending = 0;
         pthread_mutex_unlock(&audit_mutex);
 
-        audit_sign_and_write(e->buffer, e->new_hash);
-        free(e);
+        if (e) { audit_sign_and_write(e->buffer, e->new_hash); free(e); }
+        if (ping) send_webhook_ping(pu, pc, ps);
     }
 }
 
@@ -374,10 +388,8 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
  * Payload format:
  *   {"event":"classified_access", "user_id":<UID>, "classif":<LEVEL>, "sci":<COMPARTMENTS>}
  */
-void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) {
-    if (webhook_target[0] == '\0') {
-        return; // No endpoint configured — skip network call entirely.
-    }
+static void send_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) {
+    if (webhook_target[0] == '\0') return;
 
     // Non-blocking socket so we never stall the calling thread.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -421,4 +433,31 @@ void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) 
     // for a best-effort audit notification.
     send(sock, request, req_len, MSG_NOSIGNAL);
     close(sock);
+}
+
+void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci) {
+    pthread_mutex_lock(&audit_mutex);
+    if (webhook_target[0] == '\0') {
+        pthread_mutex_unlock(&audit_mutex);
+        return; // No endpoint configured — skip entirely.
+    }
+    if (!g_signer_started) {
+        g_signer_stop = 0;
+        if (pthread_create(&g_signer_tid, NULL, audit_signer_main, NULL) == 0) {
+            g_signer_ok = 1;
+            g_signer_started = 1;
+        }
+    }
+    if (g_signer_ok) {
+        g_ping_uid = user_id;
+        g_ping_classif = classif;
+        g_ping_sci = sci;
+        g_ping_pending = 1;
+        pthread_cond_signal(&g_q_cond);
+        pthread_mutex_unlock(&audit_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&audit_mutex);
+    /* Signer thread unavailable — preserve the original direct-send behavior. */
+    send_webhook_ping(user_id, classif, sci);
 }
