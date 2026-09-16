@@ -31,6 +31,11 @@ from enum import IntEnum
 from typing import Iterator, Optional, Callable
 from .core import _lib
 
+# ctypes has no free(); libc does (same idiom as core.py/kv.py)
+_libc = ctypes.CDLL(None)
+_libc.free.argtypes = [ctypes.c_void_p]
+_libc.free.restype = None
+
 # ---------------------------------------------------------------------------
 # C type definitions
 # ---------------------------------------------------------------------------
@@ -234,7 +239,7 @@ class EventStream:
             return None
         payload = ctypes.string_at(payload_ptr, payload_size.value) if payload_ptr and payload_size.value > 0 else b""
         if payload_ptr:
-            ctypes.free(payload_ptr)
+            _libc.free(payload_ptr)
         return EventRecord(header, payload)
 
     def iterate(self, topic: str) -> Iterator[EventRecord]:
@@ -249,7 +254,7 @@ class EventStream:
         ):
             payload = ctypes.string_at(payload_ptr, payload_size.value) if payload_ptr and payload_size.value > 0 else b""
             if payload_ptr:
-                ctypes.free(payload_ptr)
+                _libc.free(payload_ptr)
             yield EventRecord(header, payload)
 
     def length(self, topic: str) -> int:

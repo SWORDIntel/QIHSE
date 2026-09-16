@@ -69,5 +69,8 @@ class NeuralClassifier:
         )
 
         cls_enum = KeystoneClass(cls_val.value)
-        name = _lib.qihse_keystone_class_name(cls_val.value).decode("utf-8")
+        raw_name = _lib.qihse_keystone_class_name(cls_val.value)
+        if not raw_name:
+            raise RuntimeError(f"unknown keystone class value {cls_val.value}")
+        name = raw_name.decode("utf-8")
         return cls_enum, name, float(conf_val.value)

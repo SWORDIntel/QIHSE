@@ -86,7 +86,10 @@ class HardwareProfiler:
             raise RuntimeError("Failed to create hardware profile")
         try:
             hw = ptr.contents
-            name = _lib.qihse_hw_backend_name(hw.preferred).decode("utf-8")
+            raw_name = _lib.qihse_hw_backend_name(hw.preferred)
+            if not raw_name:
+                raise RuntimeError(f"unknown hardware backend {hw.preferred}")
+            name = raw_name.decode("utf-8")
             return HardwareProfile(
                 preferred_backend=name,
                 avx=bool(hw.avx_available),

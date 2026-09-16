@@ -8,6 +8,11 @@ import numpy as np
 from typing import List, Optional
 from dataclasses import dataclass
 from .neural import KeystoneClass
+
+# ctypes has no free(); libc does (same idiom as core.py/kv.py)
+_libc = ctypes.CDLL(None)
+_libc.free.argtypes = [ctypes.c_void_p]
+_libc.free.restype = None
 from .fts import FTSIndex
 
 # Find libqihse.so
@@ -144,7 +149,6 @@ class MultimodalFusion:
                         )
                     )
             finally:
-                libc = ctypes.CDLL(None)
-                libc.free(res_ptr)
+                _libc.free(res_ptr)
 
         return results

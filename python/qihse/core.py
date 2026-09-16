@@ -216,7 +216,8 @@ _lib.qihse_auth_bootstrap_operator.restype = ctypes.c_bool
 _lib.qihse_auth_is_operator_password_default.argtypes = []
 _lib.qihse_auth_is_operator_password_default.restype = ctypes.c_bool
 
-_lib.qihse_auth_init()
+if not _lib.qihse_auth_init():
+    raise RuntimeError("QIHSE auth initialization failed")
 
 _lib.qihse_start_pg_wire_server.argtypes = [_VectorDB_p, ctypes.c_uint16, ctypes.c_char_p]
 _lib.qihse_start_pg_wire_server.restype = ctypes.c_bool
@@ -494,7 +495,7 @@ class VectorDB:
                     (output[index].from_id, output[index].to_id,
                      bytes(output[index].edge_type).split(b"\x00", 1)[0].decode("utf-8"),
                      ctypes.string_at(output[index].metadata, output[index].metadata_size)
-                     if output[index].metadata_size else b"")
+                     if (output[index].metadata and output[index].metadata_size) else b"")
                     for index in range(count)
                 ]
             finally:
