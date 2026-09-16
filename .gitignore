@@ -73,3 +73,26 @@ lib/
 .qihse_auth_cache.dat
 /vendor/liboqs/build/
 /vendor/oqs-provider/build/
+
+# Cluster daemon / server binaries (built by the Makefile)
+/qihse-cluster-daemon
+/qihse-redis-server
+
+# Rust build output
+/rust/qihse-rs/target/
+/sdks/rust/target/
+
+# Generated runtime test data
+/python/stress_sift1m_test.db/
+/python/test_db_concurrency/
+/test_recall_db/
+
+# Compiled test binaries (sources are tracked via !/tests/*.c)
+/tests/apt41_fuzzer
+/tests/apt41_qql_fuzzer
+/tests/qihse_cluster_bootstrap
+/tests/qihse_cluster_node
+/tests/stress_session_delivery
+
+# Agent session plans (local working notes)
+/.zcode/
