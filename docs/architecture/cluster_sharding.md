@@ -660,3 +660,37 @@ phase 1; a persistent replication link (rather than per-write connections) is
 the performance follow-up. Verified live: duplicated key survives SIGKILL of
 the lead and is served by the promoted successor. See
 `tests/cluster_failover_smoke.py`.
+
+## 5-node lab status (2026-09-16)
+
+Five nodes, all `cluster_state:ok` with 16,384/16,384 slots assigned and an
+identical ownership map on every node:
+
+| Node | Where | Endpoint | Bus | Slots |
+|---|---|---|---|---|
+| 0 | t420 (Proxmox host) | 192.168.1.91:7100 | 17100 | 0-5459 |
+| 1 | t320 (Proxmox host) | 192.168.1.250:7101 | 17101 | 10923-13653 |
+| 2 | CT 410 `qihse-node2` on t320 | 10.200.69.2:7112 | 17112 | 13654-16383 |
+| 3 | CT 411 `qihse-node3` on 730xd | 192.168.1.92:7113 | 17113 | 5460-8191 |
+| 4 | CT 412 `qihse-node4` on 730xd | 192.168.1.93:7114 | 17114 | 8192-10922 |
+
+Provisioning (the 730xd joined the SIG-TRUST Proxmox cluster, so its nodes
+are reachable with cluster root SSH — `sudo ssh root@192.168.1.90` — which
+avoids needing a separate OS credential):
+
+1. `pct create 411/412 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst`
+   with 2 cores / 1 GiB / 8 GiB on `fast-dir-vms`, unprivileged, static
+   addresses on `vmbr0` (192.168.1.92/.93), `onboot 1`.
+2. Runtime push: the container needs the non-glibc dependencies of
+   `libqihse.so` (liburing, libluajit-5.1, libbpf, libxdp, libsqlite3,
+   libzstd, libexpat, libelf, libssl/libcrypto, libpython3.13) — installed
+   with `apt-get` in the container, then `libqihse.so` +
+   `qihse-cluster-daemon` extracted to `/opt/qihse/{lib,bin}`.
+3. `qihse-node{3,4}.service` (`Restart=always`, enabled) runs the daemon with
+   `--join 192.168.1.91:17100` and `--brain` (observe-only) so the nodes are
+   self-healing across container reboots.
+
+The two new nodes joined slotless and were given ranges with
+`CLUSTER MOVESLOTS` from the largest owner (t420). Verified: writes to keys
+in all five ranges land on the owning node via MOVED (including both new
+730xd nodes) and every node can read all five ranges (10/10 checks).
