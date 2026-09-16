@@ -8,6 +8,7 @@
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
 #include "qihse_keystone.h"
+#include "qihse_fabric_index.h"
 #include "qihse_ingest_guard.h"
 #include "qihse_metrics.h"
 #include "qihse_system_guard.h"
@@ -164,6 +165,8 @@ struct qihse_resp_server {
     qihse_metrics_registry_t* metrics;
     /* CLUSTER MOVESLOTS target auth */
     const char* cluster_migrate_password;
+    /* Data redundancy peer ("host:port") */
+    const char* redundancy_peer;
 };
 
 typedef struct {
@@ -933,6 +936,123 @@ static void qihse_resp_maybe_publish_killswitch(qihse_resp_session_t* session, c
     qihse_kv_set_user(session->server->store, "commons/killswitch/latest", value, 0, 0, system_user);
 }
 
+/* ---------------------------------------------------------------------------
+ * Data redundancy link (phase 1: string KV, fire-and-forget)
+ * After a local commit, the write is replayed to the redundancy peer with
+ * ASKING (accepted regardless of slot ownership) so the peer holds a
+ * duplicate that survives this node's failure. Loss window: writes in flight
+ * when this node dies are gone (async replication); the redundancy peer is
+ * not consulted for reads until failover re-homes the slots. Hash/list/set
+ * structures replicate in phase 2.
+ * ------------------------------------------------------------------------- */
+static int qihse_resp_connect_timeout(const char* host, uint16_t port, int timeout_ms);
+static bool qihse_resp_fd_command(int fd, size_t argc, const qihse_resp_arg_t* argv,
+                                  char* remote_error, size_t remote_error_cap);
+
+static void redundancy_log(const char* stage, const char* detail) {
+    static time_t last_log = 0;
+    time_t now = time(NULL);
+    if (now - last_log >= 10) {
+        fprintf(stderr, "qihse redundancy: %s failed: %s\n", stage, detail);
+        last_log = now;
+    }
+}
+
+static void qihse_resp_replicate_write(qihse_resp_server_t* server, const char* key,
+                                       const char* value, int64_t ttl_ms) {
+    if (!server || !server->redundancy_peer || !*server->redundancy_peer) return;
+    char spec[QIHSE_CLUSTER_HOST_LEN + 16u];
+    snprintf(spec, sizeof(spec), "%s", server->redundancy_peer);
+    char* colon = strrchr(spec, ':');
+    if (!colon) return;
+    *colon = '\0';
+    uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
+    if (port == 0) return;
+
+    int fd = qihse_resp_connect_timeout(spec, port, 2000);
+    if (fd < 0) {
+        redundancy_log("connect", errno ? strerror(errno) : "timeout");
+        return; /* peer down: local commit stands; failover re-homes later */
+    }
+    char remote_error[256] = {0};
+    const char* password = server->cluster_migrate_password;
+    if (password && *password) {
+        static const uint8_t auth_cmd[] = "AUTH";
+        static const uint8_t op_user[] = "GODMODE_OP";
+        qihse_resp_arg_t auth_args[3] = {
+            { auth_cmd, sizeof(auth_cmd) - 1u },
+            { (const uint8_t*)op_user, sizeof(op_user) - 1u },
+            { (const uint8_t*)password, strlen(password) }
+        };
+        if (!qihse_resp_fd_command(fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
+            redundancy_log("target auth", remote_error);
+            close_socket(fd);
+            return;
+        }
+    }
+    static const uint8_t asking_cmd[] = "ASKING";
+    static const uint8_t set_cmd[] = "SET";
+    static const uint8_t px_opt[] = "PX";
+    qihse_resp_arg_t asking = { asking_cmd, sizeof(asking_cmd) - 1u };
+    if (qihse_resp_fd_command(fd, 1u, &asking, remote_error, sizeof(remote_error))) {
+        qihse_resp_arg_t set_args[5];
+        size_t argc = 0;
+        set_args[argc++] = (qihse_resp_arg_t){ set_cmd, sizeof(set_cmd) - 1u };
+        set_args[argc++] = (qihse_resp_arg_t){ (const uint8_t*)key, strlen(key) };
+        set_args[argc++] = (qihse_resp_arg_t){ (const uint8_t*)value, strlen(value) };
+        char ttl_buf[32];
+        if (ttl_ms > 0) {
+            int n = snprintf(ttl_buf, sizeof(ttl_buf), "%lld", (long long)ttl_ms);
+            set_args[argc++] = (qihse_resp_arg_t){ px_opt, sizeof(px_opt) - 1u };
+            set_args[argc++] = (qihse_resp_arg_t){ (const uint8_t*)ttl_buf, (size_t)n };
+        }
+        if (!qihse_resp_fd_command(fd, argc, set_args, remote_error, sizeof(remote_error))) {
+            redundancy_log("SET replay", remote_error);
+        }
+    }
+    close_socket(fd);
+}
+
+static void qihse_resp_replicate_del(qihse_resp_server_t* server, const char* key) {
+    if (!server || !server->redundancy_peer || !*server->redundancy_peer) return;
+    char spec[QIHSE_CLUSTER_HOST_LEN + 16u];
+    snprintf(spec, sizeof(spec), "%s", server->redundancy_peer);
+    char* colon = strrchr(spec, ':');
+    if (!colon) return;
+    *colon = '\0';
+    uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
+    if (port == 0) return;
+
+    int fd = qihse_resp_connect_timeout(spec, port, 2000);
+    if (fd < 0) return;
+    char remote_error[256] = {0};
+    const char* password = server->cluster_migrate_password;
+    if (password && *password) {
+        static const uint8_t auth_cmd[] = "AUTH";
+        static const uint8_t op_user[] = "GODMODE_OP";
+        qihse_resp_arg_t auth_args[3] = {
+            { auth_cmd, sizeof(auth_cmd) - 1u },
+            { (const uint8_t*)op_user, sizeof(op_user) - 1u },
+            { (const uint8_t*)password, strlen(password) }
+        };
+        if (!qihse_resp_fd_command(fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
+            close_socket(fd);
+            return;
+        }
+    }
+    static const uint8_t asking_cmd[] = "ASKING";
+    static const uint8_t del_cmd[] = "DEL";
+    qihse_resp_arg_t asking = { asking_cmd, sizeof(asking_cmd) - 1u };
+    if (qihse_resp_fd_command(fd, 1u, &asking, remote_error, sizeof(remote_error))) {
+        qihse_resp_arg_t del_args[2] = {
+            { del_cmd, sizeof(del_cmd) - 1u },
+            { (const uint8_t*)key, strlen(key) }
+        };
+        qihse_resp_fd_command(fd, 2u, del_args, remote_error, sizeof(remote_error));
+    }
+    close_socket(fd);
+}
+
 static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 3) return qihse_resp_wrong_arity(session, "set");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -977,7 +1097,16 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
     bool stored = condition && qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user);
     if (stored && has_ttl) stored = qihse_kv_expire(session->server->store, key, ttl_ms, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
-    if (stored && condition) qihse_resp_maybe_publish_killswitch(session, key, value);
+    if (stored && condition) {
+        qihse_resp_maybe_publish_killswitch(session, key, value);
+        if (session->server->redundancy_peer)
+            qihse_resp_replicate_write(session->server, key, value, has_ttl ? (int64_t)ttl_ms : 0);
+        /* AI fabric artifacts (ai_fabric.md build item 2): classify + index
+         * fabric: writes via KEYSTONE once. Best-effort — indexing failures
+         * never fail an already-persisted write. */
+        if (strncmp(key, "fabric:", 7u) == 0)
+            (void)qihse_fabric_index_artifact_user(key, value, strlen(value), 0u, 0u, session->user);
+    }
     if (key != keybuf) free(key);
     free(value);
     if (!condition) {
@@ -1019,6 +1148,8 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
     if (request->argc < 2) return qihse_resp_wrong_arity(session, remove ? "del" : "exists");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
     int64_t count = 0;
+    char deleted_keys[16][256];
+    size_t deleted_count = 0;
     if (remove) pthread_rwlock_wrlock(&session->server->kv_lock);
     else        pthread_rwlock_rdlock(&session->server->kv_lock);
     for (size_t i = 1; i < request->argc; i++) {
@@ -1026,10 +1157,19 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
         char* key = qihse_resp_arg_text_buf(&request->argv[i], keybuf, sizeof(keybuf));
         if (!key) key = qihse_resp_arg_text(&request->argv[i]);
         if (!key) continue;
-        count += remove ? qihse_kv_del_user(session->server->store, key, session->user) : qihse_kv_exists_user(session->server->store, key, session->user);
+        int64_t removed_now = remove ? qihse_kv_del_user(session->server->store, key, session->user) : 0;
+        if (remove && removed_now && deleted_count < 16u && strlen(key) < 256u) {
+            snprintf(deleted_keys[deleted_count], sizeof(deleted_keys[0]), "%s", key);
+            deleted_count++;
+        }
+        count += removed_now;
         if (key != keybuf) free(key);
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
+    if (remove && session->server->redundancy_peer) {
+        for (size_t i = 0; i < deleted_count; i++)
+            qihse_resp_replicate_del(session->server, deleted_keys[i]);
+    }
     return qihse_resp_integer(session, count);
 }
 
@@ -4531,6 +4671,108 @@ static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qih
     return qihse_resp_bulk_text(session, summary);
 }
 
+/* ---------------------------------------------------------------------------
+ * FABRIC.* — heterogeneous compute dispatch
+ * FABRIC.CAPS    — cluster capability map (system domain only)
+ * FABRIC.SUBMIT <min_isa> <payload> — dispatch a job to the best-fit node
+ * FABRIC.RESULT <job-id> — read a job result
+ * Jobs are stored in KV under fabric:job:<id>; the target node's worker
+ * scans for them and executes. Phase 1: local execution only (the node
+ * that receives the submit runs it if it matches, else forwards).
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
+    if (!session->server->bus) return qihse_resp_error(session, "ERR bus not available");
+    uint16_t local = qihse_cluster_topology_local_node(session->server->topology);
+    qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+    size_t count = qihse_cluster_topology_nodes(session->server->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
+    if (!qihse_resp_array(session, (size_t)(count * 2))) return false;
+    for (size_t i = 0; i < count; i++) {
+        char addr[128];
+        snprintf(addr, sizeof(addr), "%s:%u", nodes[i].host, nodes[i].port);
+        if (!qihse_resp_bulk_text(session, addr)) return false;
+        uint8_t isa = 0, npu = 0, gpu = 0;
+        uint32_t ram = 0;
+        uint16_t load = 0;
+        if (qihse_cluster_bus_node_caps(session->server->bus, nodes[i].index, &isa, &npu, &gpu, &ram, &load)) {
+            char cap_buf[192];
+            int cl = snprintf(cap_buf, sizeof(cap_buf),
+                "isa=%u npu=%u gpu=%u ram=%u load=%u", isa, npu, gpu, ram, load);
+            if (!qihse_resp_bulk_text(session, cap_buf)) return false;
+        } else {
+            if (!qihse_resp_bulk_text(session, "no-cap")) return false;
+        }
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_error(session, "ERR usage: FABRIC.SUBMIT <min_isa> <need_npu> <payload>");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM FABRIC dispatch is system-domain only");
+    }
+    uint64_t min_isa, need_npu;
+    if (!qihse_resp_parse_u64_arg(&request->argv[1], &min_isa) ||
+        !qihse_resp_parse_u64_arg(&request->argv[2], &need_npu)) {
+        return qihse_resp_error(session, "ERR invalid capability spec");
+    }
+    char payload[4096];
+    size_t plen = request->argv[3].len;
+    if (plen == 0 || plen >= sizeof(payload)) return qihse_resp_error(session, "ERR payload too large (max 4095)");
+    memcpy(payload, request->argv[3].data, plen);
+    payload[plen] = '\0';
+
+    /* Find best-fit node: lowest load_pct among nodes meeting the capability */
+    if (!session->server->bus) return qihse_resp_error(session, "ERR bus not available");
+    qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+    size_t count = qihse_cluster_topology_nodes(session->server->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
+    uint16_t best_idx = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t best_load = UINT16_MAX;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t isa, npu, gpu;
+        uint32_t ram;
+        uint16_t load;
+        if (qihse_cluster_bus_node_caps(session->server->bus, nodes[i].index, &isa, &npu, &gpu, &ram, &load)) {
+            if (isa < min_isa || (need_npu && !npu)) continue;
+            if (load < best_load) { best_load = load; best_idx = nodes[i].index; }
+        }
+    }
+    if (best_idx == QIHSE_CLUSTER_NODE_NONE)
+        return qihse_resp_error(session, "ERR no node matches the capability requirement");
+
+    /* Store the job in KV */
+    static uint64_t job_seq = 0;
+    uint64_t jid = __atomic_add_fetch(&job_seq, 1, __ATOMIC_RELAXED);
+    char job_key[128], job_val[4200];
+    uint64_t now = (uint64_t)time(NULL);
+    snprintf(job_key, sizeof(job_key), "fabric:job:%llu", (unsigned long long)jid);
+    snprintf(job_val, sizeof(job_val), "{\"isa\":%llu,\"npu\":%llu,\"payload\":\"%s\"}",
+             (unsigned long long)min_isa, (unsigned long long)need_npu, payload);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    bool ok = qihse_kv_set_user(session->server->store, job_key, job_val, 0, 0, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (!ok) return qihse_resp_error(session, "ERR failed to store job");
+    char reply[128];
+    snprintf(reply, sizeof(reply), "job:%llu node:%u", (unsigned long long)jid, best_idx);
+    return qihse_resp_bulk_text(session, reply);
+}
+
+static bool qihse_resp_handle_fabric_result(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_error(session, "ERR usage: FABRIC.RESULT <job-id>");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM FABRIC.RESULT is system-domain only");
+    }
+    char job_key[128];
+    snprintf(job_key, sizeof(job_key), "fabric:result:%s", (const char*)request->argv[1].data);
+    char* val = NULL;
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    val = qihse_kv_get_user(session->server->store, job_key, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (!val) return qihse_resp_error(session, "ERR no result for job");
+    bool ok = qihse_resp_bulk_text(session, val);
+    free(val);
+    return ok;
+}
+
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -4619,6 +4861,11 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
         /* Before the generic CLUSTER dispatch: MOVESLOTS needs store + bus. */
         return qihse_resp_handle_moveslots(session, request);
+    }
+    if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
+        if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
+        if (qihse_resp_arg_equal(&request->argv[1], "SUBMIT")) return qihse_resp_handle_fabric_submit(session, request);
+        if (qihse_resp_arg_equal(&request->argv[1], "RESULT") && request->argc == 3) return qihse_resp_handle_fabric_result(session, request);
     }
     if (qihse_resp_command_is(request, "CLUSTER")) {
         qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session };
@@ -5038,6 +5285,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     }
     server->kv_sweep_interval_seconds = supplied->kv_sweep_interval_seconds;
     server->cluster_migrate_password = supplied->cluster_migrate_password;
+    server->redundancy_peer = supplied->redundancy_peer;
+    server->redundancy_peer = supplied->redundancy_peer;
     if (server->kv_sweep_interval_seconds > 0 && server->store) {
         server->sweeper_shutdown = false;
         if (pthread_create(&server->sweeper_thread, NULL, qihse_resp_kv_sweeper_main, server) == 0) {
@@ -5111,6 +5360,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         bus_cfg.bus_port = server->bus_port;
         bus_cfg.bind_address = supplied->bind_address;
         bus_cfg.xdp_interface = supplied->xdp_interface;
+        bus_cfg.veil_key = supplied->veil_key;
         server->bus = qihse_cluster_bus_create(&bus_cfg);
         server->owns_bus = server->bus != NULL;
     }
@@ -5134,6 +5384,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             re_cfg.bus_port = server->bus_port;
             re_cfg.bind_address = supplied->bind_address;
             re_cfg.xdp_interface = supplied->xdp_interface;
+            re_cfg.veil_key = supplied->veil_key;
             re_cfg.on_fail = qihse_cluster_failover_on_fail_cb;
             re_cfg.on_fail_user_data = server->failover;
             qihse_cluster_bus_destroy(server->bus);

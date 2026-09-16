@@ -59,6 +59,10 @@ jobs:
       run: |
         make test-object-acl
 
+    - name: Run Fabric Index Authorization Regression
+      run: |
+        make test-fabric-index
+
     - name: Run Aggregate Hardening Regression
       run: |
         make test-aggregate-hardened
@@ -83,6 +87,10 @@ jobs:
       run: |
         make test-object-acl
 
+    - name: Run Fabric Index Authorization Regression
+      run: |
+        make test-fabric-index
+
     - name: Run Aggregate Hardening Regression
       run: |
         make test-aggregate-hardened
@@ -94,6 +102,14 @@ jobs:
     - name: Run Security Boundary Regressions
       run: |
         make -f Makefile -f tests/security-regression.mk test-security-regressions
+
+    - name: Run Cluster Brain Unit Tests
+      run: |
+        make test-cluster-brain
+
+    - name: Run Overlay Protocol Unit Tests
+      run: |
+        make test-overlay
 
     - name: Run APT41 Fuzz Testing (ASan & UBSan)
       run: |
@@ -138,7 +154,7 @@ jobs:
         export LD_LIBRARY_PATH=$PWD
         {
           make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-resp-cluster
-          make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-fts-persistence-auth test-apt41
+          make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-auth-privilege-boundary test-object-acl test-fabric-index test-aggregate-hardened test-fts-persistence-auth test-apt41
           make -f Makefile -f tests/security-regression.mk QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-security-regressions
         } 2>&1 | tee qihse-sanitizer-test.log
 

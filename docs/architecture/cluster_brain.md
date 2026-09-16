@@ -1,12 +1,12 @@
 # Cluster Brain — Decision Making for QIHSE Clusters
 
-> **Implementation status (2026-09-15):** phase 1 (observe / journal / decide,
-> acting gated behind `--brain-act`) is implemented in
-> `src/spinnaker/qihse_cluster_brain.c` and is **pending landing** (W0 of the
-> master [roadmap](../../ROADMAP.md)): daemon flags `--brain`, `--brain-act`,
-> `--brain-dir`, `--brain-interval`, `--brain-dsa-key`. The smoke test
-> described under "Testing" below (`tests/cluster_brain_smoke.py`) does not
-> exist yet — writing it is also W0.
+> **Implementation status (2026-09-15):** phase 1 (observe / journal / decide)
+> is implemented in `src/spinnaker/qihse_cluster_brain.c` and is **pending
+> landing** (W0 of the master [roadmap](../../ROADMAP.md)): daemon flags
+> `--brain`, `--brain-dir`, `--brain-interval`, `--brain-dsa-key`.
+> **Actuation is not implemented** — `--brain-act` is accepted and reserved
+> for phase 2; the brain currently observes, journals, and decides only. Unit
+> test: `tests/test_cluster_brain.c` (`make test-cluster-brain`).
 
 ## Why
 
@@ -65,9 +65,10 @@ bus (MEET/PING/PONG/SLOT_UPDATE)          topology (health, owners)
 
 ### Safety posture
 
-- Phase 1 ships **observe + journal + decide** with acting disabled by
-  default (`--brain-act` to enable). A brain that can act is a brain that can
-  misact; the journal is useful from day one, the actions earn trust.
+- Phase 1 ships **observe + journal + decide** only; no actuation code exists
+  yet and `--brain-act` is accepted-but-inert, reserved for phase 2. A brain
+  that can act is a brain that can misact; the journal is useful from day one,
+  the actions earn trust.
 - All actions reuse the audited MOVESLOTS machinery (key transfer, ownership
   flip, bus broadcast) — the brain introduces no new data-path code.
 - Decision records: `{timestamp, node id, rule, inputs (health/owners/stats),
@@ -88,10 +89,17 @@ deliberately single-writer.
 
 ## Testing
 
-- `tests/cluster_brain_smoke.py`: boots the dynamic cluster, injects a
-  failure (drop bus traffic to the seed from the joiner), asserts the brain
-  journals `ASYMMETRY`/`ISOLATED` observations without acting (R2/R3), then
-  asserts R1 re-home under `--brain-act` with a genuinely failed node.
+- `tests/test_cluster_brain.c` (`make test-cluster-brain`, runs in CI): the
+  phase-1 unit test. It builds a synthetic topology against a non-started resp
+  server, runs the brain through three health scenarios, and asserts the
+  journal contents — `BRAIN_START` + `OBSERVE` with no alarms when all peers
+  are healthy, `ASYMMETRY` + `ISOLATED` when a peer fails, `RECONNECTED` on
+  recovery — and that slot ownership is never modified (the no-action property
+  phase 2 must preserve).
+- Phase-2 actuation (R1 re-home under `--brain-act`) has no test because
+  actuation is not implemented. The live-cluster smoke test described
+  originally — boot the dynamic cluster, inject a failure, assert R1 re-home —
+  belongs with the actuation work, not with the phase-1 landing.
 
 ## Relation to the federation direction
 

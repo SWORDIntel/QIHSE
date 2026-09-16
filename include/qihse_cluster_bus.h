@@ -30,6 +30,8 @@ extern "C" {
  *   FAIL        — mark a node as failed, payload = node_id (40 bytes)
  *   SLOT_UPDATE — slot range ownership change, payload = slot_update_t
  *   NODE_UPDATE — node metadata change (role/health), payload = node_t
+ *   NODE_OBS    — third-party health observation
+ *   NODE_CAP    — sender capability profile (ISA tier / NPU / GPU / RAM / load)
  */
 
 #define QIHSE_CLUSTER_BUS_MAGIC 0x51424E53u
@@ -45,8 +47,32 @@ typedef enum {
     QIHSE_BUS_MSG_MEET = 3u,
     QIHSE_BUS_MSG_FAIL = 4u,
     QIHSE_BUS_MSG_SLOT_UPDATE = 5u,
-    QIHSE_BUS_MSG_NODE_UPDATE = 6u
+    QIHSE_BUS_MSG_NODE_UPDATE = 6u,
+    QIHSE_BUS_MSG_NODE_OBS    = 7u,  /* third-party health observation */
+    QIHSE_BUS_MSG_NODE_CAP    = 8u   /* node capability profile (ISA/NPU/GPU) */
 } qihse_cluster_bus_msg_type_t;
+
+/*
+ * NODE_CAP wire payload — packed field-by-field (little-endian multi-byte
+ * values via memcpy, matching the rest of the bus):
+ *   node_id[41]     char, NUL-terminated sender node id
+ *   isa_tier u8     0=generic, 1=AVX, 2=AVX2, 3=AVX-512, 4=AVX-512+AMX
+ *   npu      u8     1 if an accelerator device (/dev/accel) is present
+ *   gpu      u8     1 if a GPU device (/dev/dri, /dev/nvidiactl) is present
+ *   free_ram_mb u32  MemAvailable (fallback MemFree) from /proc/meminfo
+ *   load_pct   u16  1-minute load average * 100, clamped to 65535
+ */
+#define QIHSE_CLUSTER_BUS_NODE_CAP_PAYLOAD_SIZE \
+    (QIHSE_CLUSTER_NODE_ID_LEN + 1u + 3u + 4u + 2u)
+
+typedef struct {
+    char node_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    uint8_t isa_tier;
+    uint8_t npu;
+    uint8_t gpu;
+    uint32_t free_ram_mb;
+    uint16_t load_pct;
+} qihse_cluster_bus_node_cap_t;
 
 typedef struct {
     uint16_t start;
@@ -68,6 +94,8 @@ typedef struct {
     uint16_t bus_port;
     const char* bind_address;
     const char* xdp_interface;   /* NULL = standard UDP; set to enable AF_XDP */
+    const char* veil_key;        /* veiled framing key (cluster operator password);
+                                  * NULL/empty = passthrough (plain bus frames) */
     uint32_t heartbeat_ms;
     uint32_t timeout_ms;
     qihse_cluster_bus_on_fail_cb on_fail;
@@ -91,6 +119,26 @@ bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus,
 /* Broadcast a FAIL notice for a node. */
 bool qihse_cluster_bus_broadcast_fail(qihse_cluster_bus_t* bus,
                                       uint16_t failed_node_index);
+
+/* When did this node first appear on our bus (ms epoch, 0 = never seen)?
+ * "Peer uptime from the observer's perspective" — the failover coordinator
+ * uses this for most-uptime successor selection. */
+bool qihse_cluster_bus_peer_first_seen(const qihse_cluster_bus_t* bus,
+                                       uint16_t node_index, uint64_t* out_first_seen_ms);
+
+/* When did ANY bus participant last report this node healthy? 0 = never.
+ * The failover coordinator uses this to gate promotion: a node someone
+ * recently saw alive is an asymmetry suspect, not a confirmed failure. */
+uint64_t qihse_cluster_bus_last_observed_healthy(const qihse_cluster_bus_t* bus,
+                                                 uint16_t node_index);
+
+/* Capability profile last advertised by a node via NODE_CAP (per-node table
+ * keyed by topology node index).  Returns false when no NODE_CAP has been
+ * received for that node yet; out pointers may be NULL to fetch a subset. */
+bool qihse_cluster_bus_node_caps(const qihse_cluster_bus_t* bus,
+                                 uint16_t node_index,
+                                 uint8_t* isa, uint8_t* npu, uint8_t* gpu,
+                                 uint32_t* free_ram, uint16_t* load);
 
 /* Send a MEET to a specific address (introduces this node to a peer). */
 bool qihse_cluster_bus_meet(qihse_cluster_bus_t* bus,

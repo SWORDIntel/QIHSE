@@ -282,7 +282,21 @@ qihse_cluster_route_t qihse_cluster_topology_route(const qihse_cluster_topology_
     route.owner_index = owner;
     route.state = state;
     route.config_epoch = qihse_cluster_topology_epoch(topology);
-    if (owner == QIHSE_CLUSTER_NODE_NONE) return route;
+    if (owner == QIHSE_CLUSTER_NODE_NONE) {
+        /* ASKING: force local processing even when the slot has no owner —
+         * the redundancy link and migration flows depend on this (Redis
+         * semantics: ASKING overrides routing for the next command). */
+        if (asking) {
+            route.decision = QIHSE_CLUSTER_ROUTE_LOCAL;
+            route.target_index = local;
+        }
+        return route;
+    }
+    if (asking && owner != local) {
+        route.decision = QIHSE_CLUSTER_ROUTE_LOCAL;
+        route.target_index = local;
+        return route;
+    }
 
     if (owner == local) {
         if (state != QIHSE_CLUSTER_SLOT_STABLE && peer != QIHSE_CLUSTER_NODE_NONE && !local_key_exists) {
@@ -343,6 +357,18 @@ size_t qihse_cluster_topology_assigned_slots(const qihse_cluster_topology_t* top
         if (__atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) != QIHSE_CLUSTER_NODE_NONE) count++;
     }
     return count;
+}
+
+size_t qihse_cluster_topology_slot_owner_snapshot(const qihse_cluster_topology_t* topology,
+                                                  uint16_t* out_owners, size_t capacity) {
+    if (!topology || !out_owners || capacity < QIHSE_CLUSTER_SLOT_COUNT) {
+        if (out_owners && capacity >= 1u) out_owners[0] = QIHSE_CLUSTER_NODE_NONE;
+        return 0;
+    }
+    pthread_mutex_lock((pthread_mutex_t*)&topology->metadata_lock);
+    memcpy(out_owners, topology->slot_to_node, QIHSE_CLUSTER_SLOT_COUNT * sizeof(uint16_t));
+    pthread_mutex_unlock((pthread_mutex_t*)&topology->metadata_lock);
+    return QIHSE_CLUSTER_SLOT_COUNT;
 }
 
 bool qihse_cluster_topology_is_covered(const qihse_cluster_topology_t* topology) {

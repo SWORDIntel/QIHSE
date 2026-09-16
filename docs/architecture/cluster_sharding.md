@@ -564,3 +564,99 @@ make test-cluster-scatter
 ## Dynamic discovery (--join)
 
 Nodes may join without a pre-shared topology: launch with `--join SEED_HOST:SEED_BUS_PORT` (repeatable) instead of `--node` entries. The joiner sends MEET frames to the seed's bus port; the seed replies with its own MEET, gossips the newcomer to every peer it knows, and re-announces the slot ranges it owns (`SLOT_UPDATE`). Slot announcements are re-sent on every MEET contact, so slot knowledge self-heals after UDP loss. Heartbeats identify peers by node ID (not table index), so membership learned dynamically stays healthy. A joiner starts with no slots and becomes routable once the slot map is received; slot *reassignment* to the new node remains a manual/rebalance operation. See `tools/qihse_cluster_daemon.c` and `tests/cluster_discover_smoke.py`.
+
+## Slot load shift (CLUSTER MOVESLOTS)
+
+`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` (system domain only) hands a
+slot range to another node: it transfers every locally-owned KV record in the
+range to the target over the MIGRATE wire flow (AUTH + ASKING + SET [PX]),
+deletes the local copies, flips ownership in the topology, and broadcasts the
+change on the cluster bus (`SLOT_UPDATE`), so every node's routing agrees.
+Ownership flips BEFORE the transfer (the target must accept the incoming
+SETs); a brief not-found window exists for not-yet-transferred keys — Redis
+style ASK-state handling is future work. Verified cross-machine by
+`tests/cluster_loadshift_smoke.py` (9/9).
+
+## Cluster brain (--brain)
+
+Optional per-node decision loop (`src/spinnaker/qihse_cluster_brain.c`,
+`--brain`, `--brain-act` for phase-2 actions): every `--brain-interval`
+seconds it snapshots the topology and appends ML-DSA-87-signed records to a
+durable event stream under `--brain-dir` (topic `cluster.brain`) —
+`OBSERVE` (nodes, health, slot runs), `ISOLATED` / `ASYMMETRY` /
+`RECONNECTED` policy observations. Phase 1 is observe/journal/decide only;
+phase 2 adds actuation (re-homing slots from failed owners via the
+MOVESLOTS machinery, with auto-rollback). Design rationale and the
+MEMSHADOW take/reject table: [cluster brain](cluster_brain.md).
+
+## Transitive slot-map gossip
+
+When a node receives a MEET from a newcomer, it (1) upserts the newcomer,
+(2) introduces itself + gossips the newcomer to every peer it knows, and
+(3) announces its FULL KNOWN slot map (all owners, coalesced runs) to the
+newcomer — so a joiner that learned the cluster transitively still learns
+who owns what. Known peers also receive the full map on repeat MEETs
+(self-healing after UDP loss). Verified: a node that joins through an
+intermediary appears in the whole cluster's tables (3-node lab).
+
+## Container node networking (routed subnet — SOLVED)
+
+The T320's vmbr0 is an isolated segment and its WiFi (192.168.1.250) is the
+only live path to the seed, so the container node uses a **routed subnet**:
+container = `10.200.69.2/24` (gw `10.200.69.1` on the T320's vmbr0), t420
+routes `10.200.69.0/24 via 192.168.1.250`. The node binds
+`10.200.69.2:7112`, joins via the seed's bus, and MOVED redirects from t420
+are routable end-to-end. One-off setup: `ip addr add 10.200.69.1/24 dev
+vmbr0` on the T320 + the t420 route (non-persistent; add to
+/etc/network/interfaces or systemd-networkd for permanence).
+
+## Node provisioning notes (T320 LXC)
+
+A third node was provisioned as an unprivileged LXC (`pct` 410, Debian 13,
+static 192.168.1.241 on vmbr0, later switched to host networking): runtime
+libs are pushed from the T320 host (`/opt/qihse/lib/*` — libqihse + its 15
+non-glibc deps), binaries to `/opt/qihse/bin`. Open item: the daemon serves
+fine in the container foreground but exits status=1 within seconds under
+systemd in this unprivileged CT (T320 host instance runs identically fine) —
+suspect CT environment (capability/sysctl); a privileged CT or full VM is
+the workaround. Join/retry logic now retries indefinitely while the daemon
+lives (lossy-path safe).
+
+## 3-node lab status (2026-09-13)
+
+Three-node topology live and converged: t420 seed (slots 0-10922), T320
+(10923-13653), T320 LXC `qihse-node2` (13654-16383). All three views agree:
+`cluster_state:ok`, 16,384/16,384 assigned, identical `CLUSTER NODES`. Slot
+routing verified across all three: writes land on the owning node and the
+seed issues correct MOVED redirects — including to the container node
+(physical client reachability of the container's segment is the lab's
+remaining limit; the redirect itself is correct).
+
+## Failover: most-uptime successor
+
+When a primary is marked failed (5 s heartbeat timeout on the bus), the
+failover coordinator succeeds it:
+1. dedicated replicas first (existing rule: healthy replica of the failed
+   primary; tie-break by lowest index);
+2. otherwise — the sharded-cluster fallback — the healthy PRIMARY with the
+   longest continuous presence on the bus (`first_seen`, receiver-local
+   observation) inherits the failed node's slot ranges. Ownership changes are
+   broadcast (`SLOT_UPDATE` + `NODE_UPDATE`), so routing converges cluster-wide.
+
+Selection is receiver-local and deterministic; with 2 nodes the surviving
+node always succeeds the dead one. Verified live: SIGKILL the lead, the
+successor owns 16,384/16,384 slots within the health window.
+
+## Data redundancy (phase 1: string KV, async)
+
+`--redundancy-peer HOST:PORT` enables fire-and-forget duplication: every
+committed string-KV write (SET with TTL) and delete (DEL) is replayed to the
+peer with ASKING (accepted regardless of slot ownership — the peer stores a
+duplicate outside its own routing range). Reads never consult the duplicate
+until failover re-homes the slots, at which point the promoted successor
+already holds the data. Honest limits: writes in flight when a node dies are
+lost (async); hashes/lists/sets and blob/vector objects do not replicate in
+phase 1; a persistent replication link (rather than per-write connections) is
+the performance follow-up. Verified live: duplicated key survives SIGKILL of
+the lead and is served by the promoted successor. See
+`tests/cluster_failover_smoke.py`.

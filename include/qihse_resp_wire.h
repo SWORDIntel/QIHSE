@@ -47,6 +47,11 @@ typedef struct {
     bool enable_failover;
     bool enable_guard_throttle;
     const char* xdp_interface;       /* NULL = standard UDP bus */
+    /* Veiled bus framing key (cluster operator password). Non-NULL and
+     * non-empty wraps every bus datagram as [nonce 8B][pad_len u8][padding]
+     * [HMAC-SHA384-keystream-XORed frame] — transport obfuscation only; bus
+     * auth is separate. NULL/empty = plain frames. */
+    const char* veil_key;
     uint64_t guard_window_ms;        /* 0 = default 1000ms */
     double guard_saturation_fraction; /* 0 = default 0.8 */
     /* Phase 4: scatter-gather engine */
@@ -90,6 +95,10 @@ typedef struct {
     /* Password used by CLUSTER MOVESLOTS when authenticating to the target
      * node (as GODMODE_OP). NULL/empty = migration auth disabled. */
     const char* cluster_migrate_password;
+    /* Data redundancy peer: "host:port" of the node that should receive a
+     * duplicate of every committed string-KV write (fire-and-forget, async).
+     * NULL/empty = no duplication. */
+    const char* redundancy_peer;
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);

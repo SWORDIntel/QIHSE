@@ -82,6 +82,12 @@ qihse_cluster_route_t qihse_cluster_topology_route(const qihse_cluster_topology_
 size_t qihse_cluster_topology_ranges(const qihse_cluster_topology_t* topology, qihse_cluster_slot_range_t* out_ranges, size_t capacity);
 size_t qihse_cluster_topology_assigned_slots(const qihse_cluster_topology_t* topology);
 bool qihse_cluster_topology_is_covered(const qihse_cluster_topology_t* topology);
+
+/* One-lock bulk snapshot of every slot's owner into out_owners[0..16383]
+ * (indexed by slot; QIHSE_CLUSTER_NODE_NONE where unassigned). Returns the
+ * number of entries written (QIHSE_CLUSTER_SLOT_COUNT, or 0 + EINVAL). */
+size_t qihse_cluster_topology_slot_owner_snapshot(const qihse_cluster_topology_t* topology,
+                                                  uint16_t* out_owners, size_t capacity);
 uint64_t qihse_cluster_topology_epoch(const qihse_cluster_topology_t* topology);
 void qihse_cluster_node_id_from_seed(const void* seed, size_t seed_len, char out_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u]);
 

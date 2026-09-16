@@ -1,8 +1,16 @@
 #include "qihse_cluster_failover.h"
+#include "qihse_cluster_bus.h"
 #include "qihse_platform.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static uint64_t fo_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 #ifndef _WIN32
 #include <pthread.h>
@@ -14,6 +22,7 @@ struct qihse_cluster_failover {
     uint16_t local_node_index;
     bool single_coordinator;
     uint64_t failover_events;
+    uint64_t last_attempt_ms;
     pthread_mutex_t lock;
 };
 
@@ -63,9 +72,13 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
 
     qihse_cluster_node_t replica;
     if (!qihse_cluster_topology_get_node(fo->topology, replica_index, &replica)) return false;
-    if (replica.role != QIHSE_CLUSTER_NODE_REPLICA) return false;
+    /* Valid successors: a dedicated REPLICA of the failed primary, or (the
+     * sharded-cluster fallback) another healthy PRIMARY with the most
+     * continuous presence. A failed/unhealthy successor is never chosen. */
+    if (replica.role != QIHSE_CLUSTER_NODE_REPLICA && replica.role != QIHSE_CLUSTER_NODE_PRIMARY) return false;
+    if (!replica.healthy) return false;
 
-    /* Promote the replica to primary */
+    /* Promote the successor to primary */
     replica.role = QIHSE_CLUSTER_NODE_PRIMARY;
     replica.primary_index = QIHSE_CLUSTER_NODE_NONE;
     replica.healthy = true;
@@ -91,6 +104,13 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
                                        uint16_t failed_node_index) {
     if (!fo || !fo->topology) return QIHSE_CLUSTER_NODE_NONE;
     pthread_mutex_lock(&fo->lock);
+    /* cooldown: while a dead node REMAINS unhealthy the bus re-fires on_fail
+     * every cycle; promote is idempotent but the broadcasts are not free */
+    if (fo->last_attempt_ms && fo_now_ms() - fo->last_attempt_ms < 30000u) {
+        pthread_mutex_unlock(&fo->lock);
+        return QIHSE_CLUSTER_NODE_NONE;
+    }
+    fo->last_attempt_ms = fo_now_ms();
 
     qihse_cluster_node_t failed;
     if (!qihse_cluster_topology_get_node(fo->topology, failed_node_index, &failed)) {
@@ -124,8 +144,48 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
 
     uint16_t replica = qihse_cluster_failover_best_replica(fo->topology, failed_node_index);
     if (replica == QIHSE_CLUSTER_NODE_NONE) {
-        pthread_mutex_unlock(&fo->lock);
-        return QIHSE_CLUSTER_NODE_NONE;
+        /* Sharded-cluster fallback: no dedicated replica exists, so the
+         * healthy node with the LONGEST CONTINUOUS PRESENCE (most uptime as
+         * observed on our bus) succeeds the failed primary and inherits its
+         * slot ranges. Its data must have been duplicated by the redundancy
+         * link; anything not duplicated is lost with the failed node — that
+         * is the documented cost of the phase-1 redundancy design. */
+        qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+        size_t count = qihse_cluster_topology_nodes(fo->topology, nodes, sizeof(nodes) / sizeof(nodes[0]));
+        uint64_t now = fo_now_ms();
+        /* Evidence gate: if ANY bus participant recently reported the failed
+         * node healthy, this looks like an asymmetric link — defer so we
+         * don't strip ranges from a node the rest of the cluster can reach.
+         * check_health re-fires on_fail each cycle, so the failover executes
+         * as soon as the confirming evidence goes stale. */
+        if (fo->bus) {
+            uint64_t last_healthy = qihse_cluster_bus_last_observed_healthy(fo->bus, failed_node_index);
+            if (last_healthy > 0 && now - last_healthy < QIHSE_CLUSTER_BUS_TIMEOUT_MS) {
+                pthread_mutex_unlock(&fo->lock);
+                return QIHSE_CLUSTER_NODE_NONE; /* deferred: asymmetry suspect */
+            }
+        }
+        uint64_t best_uptime = 0;
+        uint16_t best = QIHSE_CLUSTER_NODE_NONE;
+        for (size_t i = 0; i < count; i++) {
+            if (nodes[i].index == failed_node_index) continue;
+            if (nodes[i].role != QIHSE_CLUSTER_NODE_PRIMARY || !nodes[i].healthy) continue;
+            uint64_t first_seen = 0;
+            uint64_t uptime = 0;
+            if (fo->bus && qihse_cluster_bus_peer_first_seen(fo->bus, nodes[i].index, &first_seen) && first_seen > 0)
+                uptime = now > first_seen ? now - first_seen : 0;
+            /* Our own presence counts too (we are a live successor candidate) */
+            if (nodes[i].index == fo->local_node_index) uptime = UINT64_MAX / 2u;
+            if (uptime > best_uptime || (uptime == best_uptime && best == QIHSE_CLUSTER_NODE_NONE)) {
+                best_uptime = uptime;
+                best = nodes[i].index;
+            }
+        }
+        if (best == QIHSE_CLUSTER_NODE_NONE) {
+            pthread_mutex_unlock(&fo->lock);
+            return QIHSE_CLUSTER_NODE_NONE;
+        }
+        replica = best;
     }
 
     bool promoted = qihse_cluster_failover_promote(fo, failed_node_index, replica);

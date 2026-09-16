@@ -21,6 +21,8 @@
 #include "qihse_resp_wire.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_brain.h"
+#include "qihse_overlay.h"
 #include "qihse_kv_store.h"
 #include "qihse_platform.h"
 #include <pthread.h>
@@ -111,6 +113,10 @@ static void usage(const char* argv0) {
         "          (--node INDEX:HOST:PORT:BUS-PORT [--node …] | --join HOST:BUS-PORT [--join …])\n"
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
+        "          (the operator password also keys the veiled bus framing;\n"
+        "           every cluster node must use the same password)\n"
+        "          [--brain] [--brain-act] [--brain-dir DIR] [--brain-interval S] [--brain-dsa-key PATH]\n"
+        "          [--redundancy-peer HOST:PORT]\n"
         "          [--max-clients N]\n"
         "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
         "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
@@ -139,7 +145,10 @@ static void* join_main(void* argument) {
         fprintf(stderr, "qihse-cluster-daemon: bus never started; join failed\n");
         return NULL;
     }
-    for (int round = 0; round < 15; round++) {
+    /* Retry indefinitely while the daemon lives: lossy/asymmetric paths
+     * (WiFi, firewalled segments) can take far longer than a fixed window
+     * to come up, and a node that stopped trying never joins. */
+    for (int round = 0; ; round++) {
         for (size_t i = 0; i < j->seed_count; i++) {
             char spec[QIHSE_CLUSTER_HOST_LEN + 8u];
             snprintf(spec, sizeof(spec), "%s", j->seeds[i]);
@@ -164,8 +173,6 @@ static void* join_main(void* argument) {
         struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
     }
-    fprintf(stderr, "qihse-cluster-daemon: join retries exhausted\n");
-    return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -184,6 +191,14 @@ int main(int argc, char** argv) {
     size_t seed_count = 0;
     bool self_has_slots = false;
     uint16_t self_slot_first = 0, self_slot_last = 0;
+    bool brain_enabled = false, brain_act = false;
+    const char* redundancy_peer = NULL;
+    const char* irc_server = NULL;
+    const char* irc_channel = NULL;
+    const char* irc_nick_prefix = "qihse";
+    const char* brain_dir = NULL;
+    const char* brain_dsa_key = "/etc/qihse/keys/qihse_dsa_key.pem";
+    uint32_t brain_interval = 5;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -212,6 +227,28 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--slot-range") == 0 && i + 1 < argc) {
             self_has_slots = parse_slot_range(argv[++i], &self_slot_first, &self_slot_last);
             if (!self_has_slots) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--redundancy-peer") == 0 && i + 1 < argc) {
+            redundancy_peer = argv[++i];
+        } else if (strcmp(a, "--irc-server") == 0 && i + 1 < argc) {
+            irc_server = argv[++i];
+        } else if (strcmp(a, "--irc-channel") == 0 && i + 1 < argc) {
+            irc_channel = argv[++i];
+        } else if (strcmp(a, "--irc-nick-prefix") == 0 && i + 1 < argc) {
+            irc_nick_prefix = argv[++i];
+        } else if (strcmp(a, "--brain") == 0) {
+            brain_enabled = true;
+        } else if (strcmp(a, "--brain-act") == 0) {
+            brain_enabled = true;
+            brain_act = true;
+        } else if (strcmp(a, "--brain-dir") == 0 && i + 1 < argc) {
+            brain_dir = argv[++i];
+        } else if (strcmp(a, "--brain-interval") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v == 0 || v > 3600u) return usage(argv[0]), 2;
+            brain_interval = (uint32_t)v;
+        } else if (strcmp(a, "--brain-dsa-key") == 0 && i + 1 < argc) {
+            brain_dsa_key = argv[++i];
         } else if (strcmp(a, "--join") == 0 && i + 1 < argc) {
             if (seed_count >= 8u) return usage(argv[0]), 2;
             snprintf(seeds[seed_count++], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", argv[++i]);
@@ -347,6 +384,11 @@ int main(int argc, char** argv) {
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
     config.cluster_migrate_password = operator_password;
+    config.redundancy_peer = redundancy_peer;
+    /* The cluster password also keys the veiled bus framing: every bus
+     * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
+     * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
+    config.veil_key = operator_password;
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     if (!server) {
@@ -354,10 +396,51 @@ int main(int argc, char** argv) {
                 bind, port, strerror(errno));
         return 1;
     }
+    if (irc_server && irc_channel) {
+        qihse_cluster_node_t self_node;
+        if (qihse_cluster_topology_get_node(topology, indexes[self_index], &self_node)) {
+            qihse_cluster_bus_t* bus = qihse_resp_server_bus(server);
+            if (bus) {
+                qihse_overlay_config_t ocfg = {0};
+                ocfg.irc_server = irc_server;
+                ocfg.irc_channel = irc_channel;
+                ocfg.nick_prefix = irc_nick_prefix;
+                ocfg.node_id = self_node.id;
+                ocfg.bind_host = bind;
+                ocfg.bind_port = bus_port;
+                ocfg.hmac_password = operator_password;
+                ocfg.bus = bus;
+                if (qihse_overlay_start(&ocfg))
+                    fprintf(stderr, "qihse-cluster-daemon: overlay bootstrap active on %s\n", irc_channel);
+                else
+                    fprintf(stderr, "qihse-cluster-daemon: overlay bootstrap failed to start\n");
+            }
+        }
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s\n",
             self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off");
+    if (brain_enabled) {
+        char default_dir[600];
+        if (!brain_dir) {
+            snprintf(default_dir, sizeof(default_dir), "%s/brain", data_dir ? data_dir : ".");
+            brain_dir = default_dir;
+        }
+        qihse_brain_config_t brain_cfg = {
+            .server = server,
+            .journal_dir = brain_dir,
+            .dsa_key_path = brain_dsa_key,
+            .interval_seconds = brain_interval,
+            .act = brain_act
+        };
+        if (!qihse_cluster_brain_start(&brain_cfg)) {
+            fprintf(stderr, "qihse-cluster-daemon: brain failed to start (continuing without it)\n");
+        } else {
+            fprintf(stderr, "qihse-cluster-daemon: brain active (%s)\n", brain_act ? "observe+act" : "observe");
+        }
+    }
     pthread_t join_thread;
     join_ctx_t join_ctx = { server, {{0}}, seed_count };
     if (seed_count > 0) {
@@ -366,6 +449,7 @@ int main(int argc, char** argv) {
         if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
     }
     bool ok = qihse_resp_server_run(server);
+    qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
     fprintf(stderr, "qihse-cluster-daemon: stopped\n");
