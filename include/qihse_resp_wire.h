@@ -109,6 +109,7 @@ void qihse_resp_server_stop(qihse_resp_server_t* server);
 void qihse_resp_server_destroy(qihse_resp_server_t* server);
 uint16_t qihse_resp_server_port(const qihse_resp_server_t* server);
 qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server);
+qihse_kv_store_t* qihse_resp_server_store(qihse_resp_server_t* server);
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd);
 qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
 qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server);

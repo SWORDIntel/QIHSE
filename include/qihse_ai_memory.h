@@ -1,0 +1,79 @@
+#ifndef QIHSE_AI_MEMORY_H
+#define QIHSE_AI_MEMORY_H
+
+/* Local-first AI memory — the MEMSHADOW successor surface (ai_fabric.md §5).
+ *
+ * Episodic and semantic memories live in the native KV namespace
+ * (`aimem:<doc-id>`) and are indexed by the FTS engine for recall. Recall is
+ * BM25-ranked over caller-visible documents only, so ranking cannot leak
+ * hidden records.
+ *
+ * Every entry point takes an explicit security context: there is no
+ * context-free variant. Records are written with the caller's classification
+ * and SCI compartment, and reads are subject to the same RBAC as the
+ * underlying store and index.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "qihse_auth.h"
+#include "qihse_resp_wire.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define QIHSE_AIMEM_ID_LEN 36u /* formatted UUID */
+
+typedef enum {
+    QIHSE_AIMEM_EPISODIC = 1u, /* what happened */
+    QIHSE_AIMEM_SEMANTIC = 2u  /* what is known  */
+} qihse_ai_memory_kind_t;
+
+typedef struct {
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    uint64_t created_ms;
+    uint32_t kind;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    double score; /* BM25 score; 0 when fetched by id rather than recalled */
+    char* text;   /* caller frees */
+} qihse_ai_memory_hit_t;
+
+/* Remember: store `text` and index it for recall. Returns false when the
+ * store or index rejects the write (including insufficient clearance). */
+bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
+                           const char* text, uint32_t kind,
+                           char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+
+/* Recall: BM25 search over visible memories. Fills up to `out_cap` hits and
+ * returns how many were written; hits with `text` must be freed by the
+ * caller (qihse_ai_memory_hits_free). */
+size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user,
+                              const char* query, size_t limit,
+                              qihse_ai_memory_hit_t* out, size_t out_cap);
+
+/* Fetch one memory by id (RBAC enforced by the store). */
+bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user,
+                         const char* id, qihse_ai_memory_hit_t* out);
+
+/* Forget: delete the record. The search index may retain a stale posting for
+ * the id; recall skips records whose KV entry is gone. */
+bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
+                            const char* id);
+
+/* How many memories the caller can see. */
+size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user);
+
+void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count);
+
+/* Drop the process-local search index (tests / shutdown). */
+void qihse_ai_memory_reset(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* QIHSE_AI_MEMORY_H */

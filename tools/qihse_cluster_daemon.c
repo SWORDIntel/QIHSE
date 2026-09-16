@@ -116,11 +116,17 @@ static void usage(const char* argv0) {
         "          (the operator password also keys the veiled bus framing;\n"
         "           every cluster node must use the same password)\n"
         "          [--brain] [--brain-act] [--brain-dir DIR] [--brain-interval S] [--brain-dsa-key PATH]\n"
+        "          [--brain-cooldown S] [--brain-rollback-window S]\n"
+        "          [--brain-prune-timeout S] [--brain-rebalance-min-slots N]\n"
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--max-clients N]\n"
         "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
         "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
-        "  static --node list defines the topology.\n",
+        "  static --node list defines the topology.\n"
+        "\n  --brain observes and journals always; --brain-act additionally re-homes\n"
+        "  a failed owner's range to a healthy target (evidence-gated) and rolls\n"
+        "  it back if the move did not complete or the target failed within\n"
+        "  --brain-rollback-window seconds.\n",
         argv0);
 }
 
@@ -199,6 +205,10 @@ int main(int argc, char** argv) {
     const char* brain_dir = NULL;
     const char* brain_dsa_key = "/etc/qihse/keys/qihse_dsa_key.pem";
     uint32_t brain_interval = 5;
+    uint32_t brain_cooldown = 30;         /* per-range re-home cooldown (seconds) */
+    uint32_t brain_rollback_window = 60;  /* R4 evaluation window (seconds) */
+    uint32_t brain_prune_timeout = 0;     /* stale-node prune (0 = disabled) */
+    uint32_t brain_rebalance_min = 0;     /* rebalance-on-join threshold (0 = disabled) */
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -249,6 +259,26 @@ int main(int argc, char** argv) {
             brain_interval = (uint32_t)v;
         } else if (strcmp(a, "--brain-dsa-key") == 0 && i + 1 < argc) {
             brain_dsa_key = argv[++i];
+        } else if (strcmp(a, "--brain-cooldown") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v == 0 || v > 86400u) return usage(argv[0]), 2;
+            brain_cooldown = (uint32_t)v;
+        } else if (strcmp(a, "--brain-rollback-window") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v == 0 || v > 86400u) return usage(argv[0]), 2;
+            brain_rollback_window = (uint32_t)v;
+        } else if (strcmp(a, "--brain-prune-timeout") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v > 86400u) return usage(argv[0]), 2;
+            brain_prune_timeout = (uint32_t)v;
+        } else if (strcmp(a, "--brain-rebalance-min-slots") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v > QIHSE_CLUSTER_SLOT_COUNT) return usage(argv[0]), 2;
+            brain_rebalance_min = (uint32_t)v;
         } else if (strcmp(a, "--join") == 0 && i + 1 < argc) {
             if (seed_count >= 8u) return usage(argv[0]), 2;
             snprintf(seeds[seed_count++], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", argv[++i]);
@@ -433,7 +463,11 @@ int main(int argc, char** argv) {
             .journal_dir = brain_dir,
             .dsa_key_path = brain_dsa_key,
             .interval_seconds = brain_interval,
-            .act = brain_act
+            .act = brain_act,
+            .act_cooldown_seconds = brain_cooldown,
+            .rollback_window_seconds = brain_rollback_window,
+            .prune_timeout_seconds = brain_prune_timeout,
+            .rebalance_min_slots = brain_rebalance_min
         };
         if (!qihse_cluster_brain_start(&brain_cfg)) {
             fprintf(stderr, "qihse-cluster-daemon: brain failed to start (continuing without it)\n");

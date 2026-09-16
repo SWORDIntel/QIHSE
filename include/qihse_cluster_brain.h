@@ -1,14 +1,16 @@
 #ifndef QIHSE_CLUSTER_BRAIN_H
 #define QIHSE_CLUSTER_BRAIN_H
 
-/* Cluster brain — decision making for QIHSE clusters (phase 1).
+/* Cluster brain — decision making for QIHSE clusters (phase 1 + actuation).
  *
  * Mines MEMSHADOW for the useful parts (persistent decision journal, health
  * monitoring with rollback, deterministic telemetry, signed records) without
  * the bloat. See docs/architecture/cluster_brain.md.
  *
- * Phase 1 = observe + remember + decide, with acting gated behind an
- * explicit flag. Every observation/decision is appended to a durable
+ * Observe + remember + decide always run. Acting (R1 failed-owner re-home via
+ * the audited slot-handoff path, with R4 rollback) runs only when `act` is
+ * set: a brain that can act is a brain that can misact, so the journal earns
+ * trust first. Every observation/decision is appended to a durable
  * qihse_event_stream (topic "cluster.brain") and decisions are signed with
  * the node's ML-DSA-87 key when one is configured.
  */
@@ -27,6 +29,12 @@ typedef struct {
     const char* dsa_key_path;       /* ML-DSA-87 signing key (NULL = unsigned) */
     uint32_t interval_seconds;      /* observation cadence (default 5) */
     bool act;                       /* false = observe/journal/decide only */
+    uint32_t act_cooldown_seconds;  /* per-range re-home cooldown (default 30) */
+    uint32_t rollback_window_seconds; /* R4 evaluation window (default 60) */
+    uint32_t prune_timeout_seconds;   /* prune a node unhealthy this long (0 = never) */
+    uint32_t rebalance_min_slots;     /* donate a proportional range to a slotless
+                                       * joiner when the largest owner holds at
+                                       * least this many slots (0 = disabled) */
 } qihse_brain_config_t;
 
 /* Start the brain thread. Returns false on allocation/startup failure. */

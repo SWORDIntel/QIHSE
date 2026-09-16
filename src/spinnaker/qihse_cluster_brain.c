@@ -1,5 +1,6 @@
 #include "qihse_cluster_brain.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_ops.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_event_stream.h"
 #include "qihse_pqc_crypto.h"
@@ -15,17 +16,44 @@
 
 #define BRAIN_TOPIC "cluster.brain"
 #define BRAIN_MAX_NODES 64u
+#define BRAIN_MAX_HANDOFFS 16u
+
+/* A re-home awaiting R4 evaluation: the range, where it went, and when the
+ * rollback window closes. `moved < collected` means the transfer stopped
+ * partway and ownership must go back. */
+typedef struct {
+    bool active;
+    uint16_t first, last;
+    uint16_t target;
+    uint64_t deadline_ms;
+    uint64_t moved, collected;
+} brain_handoff_t;
+
+/* Per-range cooldown so the brain cannot thrash a range it just touched. */
+typedef struct {
+    bool used;
+    uint16_t first, last;
+    uint64_t until_ms;
+} brain_cooldown_t;
 
 typedef struct {
     qihse_resp_server_t* server;
     qihse_cluster_topology_t* topology;
+    qihse_cluster_bus_t* bus;
     char journal_dir[512];
     char dsa_key_path[576];
     pthread_mutex_t journal_lock;
     uint32_t interval_seconds;
     bool act;
+    uint32_t act_cooldown_seconds;
+    uint32_t rollback_window_seconds;
     bool running;
     qihse_event_stream_t* journal;
+    brain_handoff_t handoffs[BRAIN_MAX_HANDOFFS];
+    brain_cooldown_t cooldowns[BRAIN_MAX_HANDOFFS];
+    uint64_t unhealthy_since[BRAIN_MAX_NODES]; /* 0 = healthy or not yet observed */
+    uint32_t prune_timeout_seconds;
+    uint32_t rebalance_min_slots;
     pthread_t thread;
 } brain_t;
 
@@ -265,11 +293,344 @@ static void brain_check_asymmetry(brain_t* brain, const qihse_cluster_node_t* no
     }
 }
 
+/* ---- Actuation (R1 re-home + R4 rollback) -------------------------------
+ * Every action goes through qihse_cluster_handoff_range() — the same audited
+ * path CLUSTER MOVESLOTS uses — so the brain adds policy, never data-path
+ * code. One action per cycle keeps the journal readable and the state
+ * reversible. */
+
+static bool brain_range_cooled(brain_t* brain, uint16_t first, uint16_t last, uint64_t now) {
+    for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
+        brain_cooldown_t* c = &brain->cooldowns[i];
+        if (!c->used || c->first != first || c->last != last) continue;
+        return now < c->until_ms;
+    }
+    return false;
+}
+
+static void brain_range_cooldown(brain_t* brain, uint16_t first, uint16_t last, uint64_t now) {
+    brain_cooldown_t* slot = &brain->cooldowns[0];
+    for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
+        brain_cooldown_t* c = &brain->cooldowns[i];
+        if (!c->used || (c->first == first && c->last == last)) {
+            slot = c;
+            break;
+        }
+    }
+    slot->used = true;
+    slot->first = first;
+    slot->last = last;
+    slot->until_ms = now + (uint64_t)brain->act_cooldown_seconds * 1000u;
+}
+
+/* Healthy primary to receive a re-homed range. Capability-aware placement
+ * (ai_fabric.md §4): prefer nodes that advertise headroom via NODE_CAP
+ * (free RAM minus a load penalty); nodes that have not advertised yet stay
+ * eligible at the lowest score. Uptime breaks ties, so the choice stays
+ * deterministic and journalable. Excludes the failed owner and the local
+ * node (we are the actor). */
+static uint16_t brain_pick_target(brain_t* brain, const qihse_cluster_node_t* nodes, size_t count,
+                                  uint16_t failed_owner, uint16_t local) {
+    uint64_t now = brain_now_ms();
+    int64_t best_score = 0;
+    uint64_t best_uptime = 0;
+    uint16_t best = QIHSE_CLUSTER_NODE_NONE;
+    for (size_t i = 0; i < count; i++) {
+        if (nodes[i].index == failed_owner || nodes[i].index == local) continue;
+        if (!nodes[i].healthy || nodes[i].role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
+        uint64_t first_seen = 0;
+        uint64_t uptime = 0;
+        if (brain->bus &&
+            qihse_cluster_bus_peer_first_seen(brain->bus, nodes[i].index, &first_seen) &&
+            first_seen > 0) {
+            uptime = now > first_seen ? now - first_seen : 0;
+        }
+        int64_t score = 0;
+        uint32_t free_ram = 0;
+        uint16_t load = 0;
+        if (brain->bus &&
+            qihse_cluster_bus_node_caps(brain->bus, nodes[i].index, NULL, NULL, NULL,
+                                        &free_ram, &load)) {
+            score = (int64_t)free_ram - (int64_t)load * 64;
+        }
+        if (best == QIHSE_CLUSTER_NODE_NONE || score > best_score ||
+            (score == best_score && uptime > best_uptime)) {
+            best_score = score;
+            best_uptime = uptime;
+            best = nodes[i].index;
+        }
+    }
+    return best;
+}
+
+/* Journal evidence for a placement decision: the capability profile the
+ * choice was based on (or null when the node has not advertised). */
+static void brain_caps_evidence(brain_t* brain, uint16_t index, char* out, size_t cap) {
+    uint8_t isa = 0, npu = 0, gpu = 0;
+    uint32_t free_ram = 0;
+    uint16_t load = 0;
+    if (brain->bus &&
+        qihse_cluster_bus_node_caps(brain->bus, index, &isa, &npu, &gpu, &free_ram, &load)) {
+        snprintf(out, cap,
+                 "{\"isa\":%u,\"npu\":%u,\"gpu\":%u,\"free_ram_mb\":%u,\"load_pct\":%u}",
+                 (unsigned)isa, (unsigned)npu, (unsigned)gpu, (unsigned)free_ram,
+                 (unsigned)load);
+    } else {
+        snprintf(out, cap, "null");
+    }
+}
+
+/* R1 — failed-owner re-home. Evidence-gated exactly like the failover
+ * coordinator: if ANY peer recently observed the owner healthy this is an
+ * asymmetric link, not a dead node, so the brain journals and waits.
+ * Returns true when an action was taken. */
+static bool brain_check_rehome(brain_t* brain) {
+    if (!brain->act || !brain->server) return false;
+    qihse_cluster_node_t nodes[BRAIN_MAX_NODES];
+    size_t count = qihse_cluster_topology_nodes(brain->topology, nodes, BRAIN_MAX_NODES);
+    uint16_t local = qihse_cluster_topology_local_node(brain->topology);
+    if (count == 0 || local == QIHSE_CLUSTER_NODE_NONE) return false;
+
+    qihse_cluster_node_t self;
+    if (!qihse_cluster_topology_get_node(brain->topology, local, &self) || !self.healthy)
+        return false;
+
+    /* R3 guard: with no healthy peer there is nowhere safe to move a range. */
+    size_t healthy_peers = 0;
+    for (size_t i = 0; i < count; i++)
+        if (nodes[i].index != local && nodes[i].healthy) healthy_peers++;
+    if (healthy_peers == 0) return false;
+
+    bool acted = false;
+    uint64_t now = brain_now_ms();
+    qihse_cluster_slot_range_t ranges[QIHSE_CLUSTER_SLOT_COUNT];
+    size_t range_count = qihse_cluster_topology_ranges(brain->topology, ranges,
+                                                       QIHSE_CLUSTER_SLOT_COUNT);
+    for (size_t r = 0; r < range_count; r++) {
+        uint16_t owner = ranges[r].owner_index;
+        if (owner == QIHSE_CLUSTER_NODE_NONE || owner == local) continue;
+        qihse_cluster_node_t owner_node;
+        if (!qihse_cluster_topology_get_node(brain->topology, owner, &owner_node)) continue;
+        if (owner_node.healthy) continue;
+        if (brain_range_cooled(brain, ranges[r].start, ranges[r].end, now)) continue;
+        /* Evidence gate: same rule the failover coordinator applies. */
+        if (brain->bus) {
+            uint64_t last_healthy = qihse_cluster_bus_last_observed_healthy(brain->bus, owner);
+            if (last_healthy > 0 && now - last_healthy < QIHSE_CLUSTER_BUS_TIMEOUT_MS) continue;
+        }
+        uint16_t target = brain_pick_target(brain, nodes, count, owner, local);
+        if (target == QIHSE_CLUSTER_NODE_NONE) continue;
+
+        /* Only re-home a range this node can actually serve. */
+        if (!qihse_cluster_range_has_local_keys(brain->server, ranges[r].start, ranges[r].end,
+                                                4096u)) {
+            char detail[192];
+            snprintf(detail, sizeof(detail),
+                     "{\"range\":\"%u-%u\",\"owner\":\"%.12s\",\"reason\":\"no-local-data\"}",
+                     ranges[r].start, ranges[r].end, owner_node.id);
+            brain_journal(brain, "REHOME_SKIP", detail);
+            brain_range_cooldown(brain, ranges[r].start, ranges[r].end, now);
+            continue;
+        }
+
+        uint64_t moved = 0, collected = 0;
+        char err[160];
+        int rc = qihse_cluster_handoff_range(brain->server, ranges[r].start, ranges[r].end,
+                                             target, &moved, &collected, err, sizeof(err));
+        char caps[192];
+        brain_caps_evidence(brain, target, caps, sizeof(caps));
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+                 "{\"range\":\"%u-%u\",\"from\":\"%.12s\",\"to\":%u,\"moved\":%llu,"
+                 "\"collected\":%llu,\"ok\":%s,\"err\":\"%s\",\"target_caps\":%s}",
+                 ranges[r].start, ranges[r].end, owner_node.id, (unsigned)target,
+                 (unsigned long long)moved, (unsigned long long)collected,
+                 rc == 0 ? "true" : "false", rc == 0 ? "" : err, caps);
+        brain_journal(brain, "REHOME", detail);
+        brain_range_cooldown(brain, ranges[r].start, ranges[r].end, now);
+
+        /* R4: evaluate this handoff once the rollback window closes. */
+        for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
+            if (brain->handoffs[i].active) continue;
+            brain->handoffs[i].active = true;
+            brain->handoffs[i].first = ranges[r].start;
+            brain->handoffs[i].last = ranges[r].end;
+            brain->handoffs[i].target = target;
+            brain->handoffs[i].deadline_ms =
+                now + (uint64_t)brain->rollback_window_seconds * 1000u;
+            brain->handoffs[i].moved = moved;
+            brain->handoffs[i].collected = collected;
+            break;
+        }
+        acted = true;
+        break; /* one action per cycle: predictable, journalable, reversible */
+    }
+    return acted;
+}
+
+/* R4 — rollback. A re-home is kept only if the range arrived completely and
+ * the target is still healthy when the window closes; otherwise ownership
+ * returns to the local node, which still holds whatever did not transfer. */
+static void brain_check_rollback(brain_t* brain) {
+    if (!brain->act) return;
+    uint64_t now = brain_now_ms();
+    uint16_t local = qihse_cluster_topology_local_node(brain->topology);
+    for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
+        brain_handoff_t* h = &brain->handoffs[i];
+        if (!h->active || now < h->deadline_ms) continue;
+        qihse_cluster_node_t target_node;
+        bool target_ok = qihse_cluster_topology_get_node(brain->topology, h->target,
+                                                         &target_node) &&
+                         target_node.healthy;
+        const char* reason = NULL;
+        if (h->moved < h->collected) reason = "transfer-incomplete";
+        else if (!target_ok) reason = "target-unhealthy";
+        if (reason) {
+            if (qihse_cluster_set_range_owner(brain->server, h->first, h->last, local)) {
+                char detail[256];
+                snprintf(detail, sizeof(detail),
+                         "{\"range\":\"%u-%u\",\"target\":%u,\"reason\":\"%s\",\"moved\":%llu,"
+                         "\"collected\":%llu}",
+                         h->first, h->last, (unsigned)h->target, reason,
+                         (unsigned long long)h->moved, (unsigned long long)h->collected);
+                brain_journal(brain, "ROLLBACK", detail);
+                brain_range_cooldown(brain, h->first, h->last, now);
+            }
+        } else {
+            char detail[192];
+            snprintf(detail, sizeof(detail), "{\"range\":\"%u-%u\",\"target\":%u,\"moved\":%llu}",
+                     h->first, h->last, (unsigned)h->target, (unsigned long long)h->moved);
+            brain_journal(brain, "REHOME_CONFIRM", detail);
+        }
+        h->active = false;
+    }
+}
+
+/* R6 — stale-node prune. A node that has been unhealthy for the prune timeout
+ * with no peer reporting it healthy is removed from this node's view, so
+ * CLUSTER NODES stops accumulating corpses. Nodes that still own slots are
+ * refused (failover / R1 must re-home them first). */
+static void brain_check_prune(brain_t* brain, const qihse_cluster_node_t* nodes, size_t count) {
+    if (!brain->act || !brain->prune_timeout_seconds) return;
+    uint64_t now = brain_now_ms();
+    uint16_t local = qihse_cluster_topology_local_node(brain->topology);
+    for (size_t i = 0; i < count; i++) {
+        uint16_t idx = nodes[i].index;
+        if (idx >= BRAIN_MAX_NODES || idx == local) continue;
+        if (nodes[i].healthy) {
+            brain->unhealthy_since[idx] = 0;
+            continue;
+        }
+        if (brain->unhealthy_since[idx] == 0) {
+            brain->unhealthy_since[idx] = now;
+            continue;
+        }
+        if (now - brain->unhealthy_since[idx] <
+            (uint64_t)brain->prune_timeout_seconds * 1000u) {
+            continue;
+        }
+        /* Evidence gate: a peer still seeing it healthy means an asymmetric
+         * link, not a dead node. */
+        if (brain->bus) {
+            uint64_t last_healthy = qihse_cluster_bus_last_observed_healthy(brain->bus, idx);
+            if (last_healthy > 0 && now - last_healthy < QIHSE_CLUSTER_BUS_TIMEOUT_MS) continue;
+        }
+        if (qihse_cluster_topology_remove_node(brain->topology, idx)) {
+            char detail[224];
+            snprintf(detail, sizeof(detail),
+                     "{\"node\":\"%.12s\",\"addr\":\"%s:%u\",\"unhealthy_ms\":%llu}",
+                     nodes[i].id, nodes[i].host, nodes[i].port,
+                     (unsigned long long)(now - brain->unhealthy_since[idx]));
+            brain_journal(brain, "PRUNE", detail);
+            brain->unhealthy_since[idx] = 0;
+        }
+        /* EBUSY = still owns slots: expected until the range is re-homed. */
+    }
+}
+
+/* R5 — rebalance on join. A healthy, slotless primary receives a proportional
+ * share from the largest owner. Deterministic: only the largest owner acts
+ * (tie-break by lowest index), so exactly one node moves the range. */
+static void brain_check_rebalance(brain_t* brain, const qihse_cluster_node_t* nodes, size_t count) {
+    if (!brain->act || !brain->rebalance_min_slots || count < 2u) return;
+    uint16_t local = qihse_cluster_topology_local_node(brain->topology);
+    qihse_cluster_slot_range_t ranges[QIHSE_CLUSTER_SLOT_COUNT];
+    size_t range_count = qihse_cluster_topology_ranges(brain->topology, ranges,
+                                                       QIHSE_CLUSTER_SLOT_COUNT);
+
+    size_t healthy = 0;
+    for (size_t i = 0; i < count; i++)
+        if (nodes[i].healthy) healthy++;
+
+    /* Largest owner among healthy nodes (deterministic tie-break by index). */
+    size_t best_slots = 0;
+    uint16_t best_owner = QIHSE_CLUSTER_NODE_NONE;
+    size_t my_slots = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!nodes[i].healthy) continue;
+        size_t owned = 0;
+        for (size_t r = 0; r < range_count; r++) {
+            if (ranges[r].owner_index != nodes[i].index) continue;
+            owned += (size_t)(ranges[r].end - ranges[r].start) + 1u;
+        }
+        if (nodes[i].index == local) my_slots = owned;
+        if (best_owner == QIHSE_CLUSTER_NODE_NONE || owned > best_slots) {
+            best_slots = owned;
+            best_owner = nodes[i].index;
+        }
+    }
+    if (best_owner != local || my_slots < brain->rebalance_min_slots) return;
+
+    for (size_t i = 0; i < count; i++) {
+        if (nodes[i].index == local || !nodes[i].healthy) continue;
+        if (nodes[i].role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
+        size_t owned = 0;
+        for (size_t r = 0; r < range_count; r++) {
+            if (ranges[r].owner_index != nodes[i].index) continue;
+            owned += (size_t)(ranges[r].end - ranges[r].start) + 1u;
+        }
+        if (owned != 0) continue; /* not a joiner */
+
+        /* Donate the tail of our largest range; never more than half of it. */
+        size_t pick_len = 0;
+        uint16_t pick_end = 0;
+        for (size_t r = 0; r < range_count; r++) {
+            if (ranges[r].owner_index != local) continue;
+            size_t len = (size_t)(ranges[r].end - ranges[r].start) + 1u;
+            if (len > pick_len) {
+                pick_len = len;
+                pick_end = ranges[r].end;
+            }
+        }
+        size_t give = my_slots / (healthy ? healthy : 1u);
+        if (give > pick_len / 2u) give = pick_len / 2u;
+        if (give == 0) return;
+        uint16_t first = (uint16_t)(pick_end - give + 1u);
+        uint64_t now = brain_now_ms();
+        if (brain_range_cooled(brain, first, pick_end, now)) return;
+
+        uint64_t moved = 0, collected = 0;
+        char err[160];
+        int rc = qihse_cluster_handoff_range(brain->server, first, pick_end, nodes[i].index,
+                                             &moved, &collected, err, sizeof(err));
+        char detail[320];
+        snprintf(detail, sizeof(detail),
+                 "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"moved\":%llu,\"collected\":%llu,"
+                 "\"ok\":%s,\"err\":\"%s\"}",
+                 first, pick_end, nodes[i].id, (unsigned long long)moved,
+                 (unsigned long long)collected, rc == 0 ? "true" : "false",
+                 rc == 0 ? "" : err);
+        brain_journal(brain, "REBALANCE", detail);
+        brain_range_cooldown(brain, first, pick_end, now);
+        return; /* one action per cycle */
+    }
+}
+
 static void* brain_main(void* argument) {
     /* The thread owns its brain struct for its whole lifetime: stop() joins
      * the thread BEFORE freeing, so these accesses need no lock. */
     brain_t* brain = (brain_t*)argument;
-    brain_journal(brain, "BRAIN_START", "{\"mode\":\"observe\"}");
+    brain_journal(brain, "BRAIN_START", brain->act ? "{\"mode\":\"act\"}" : "{\"mode\":\"observe\"}");
     while (__atomic_load_n(&brain->running, __ATOMIC_ACQUIRE)) {
         qihse_cluster_node_t nodes[BRAIN_MAX_NODES];
         size_t count = brain->topology
@@ -279,7 +640,11 @@ static void* brain_main(void* argument) {
             brain_observe(brain);
             brain_check_isolation(brain, nodes, count);
             brain_check_asymmetry(brain, nodes, count);
+            brain_check_prune(brain, nodes, count);
+            /* R1 and R5 both move data: at most one of them acts per cycle. */
+            if (!brain_check_rehome(brain)) brain_check_rebalance(brain, nodes, count);
         }
+        brain_check_rollback(brain);
         uint32_t ms = brain->interval_seconds * 1000u;
         struct timespec ts = { (time_t)(ms / 1000u), (long)((ms % 1000u) * 1000000L) };
         nanosleep(&ts, NULL);
@@ -307,6 +672,12 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
         snprintf(brain->dsa_key_path, sizeof(brain->dsa_key_path), "%s", config->dsa_key_path);
     brain->interval_seconds = config->interval_seconds ? config->interval_seconds : 5u;
     brain->act = config->act;
+    brain->act_cooldown_seconds = config->act_cooldown_seconds ? config->act_cooldown_seconds : 30u;
+    brain->rollback_window_seconds =
+        config->rollback_window_seconds ? config->rollback_window_seconds : 60u;
+    brain->prune_timeout_seconds = config->prune_timeout_seconds;
+    brain->rebalance_min_slots = config->rebalance_min_slots;
+    brain->bus = qihse_resp_server_bus(config->server);
     brain->running = true;
 
     brain->journal = qihse_event_stream_create(brain->journal_dir);

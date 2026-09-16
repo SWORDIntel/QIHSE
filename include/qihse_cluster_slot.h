@@ -72,6 +72,10 @@ size_t qihse_cluster_topology_nodes(const qihse_cluster_topology_t* topology, qi
 bool qihse_cluster_topology_set_local_node(qihse_cluster_topology_t* topology, uint16_t index);
 uint16_t qihse_cluster_topology_local_node(const qihse_cluster_topology_t* topology);
 bool qihse_cluster_topology_set_node_health(qihse_cluster_topology_t* topology, uint16_t index, bool healthy);
+/* Prune a node from this node's view (stale-node cleanup). Refuses the local
+ * node and any node that still owns slots; an upsert of the same node id
+ * revives a pruned node in place. */
+bool qihse_cluster_topology_remove_node(qihse_cluster_topology_t* topology, uint16_t index);
 bool qihse_cluster_topology_assign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end, uint16_t owner_index);
 bool qihse_cluster_topology_unassign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end);
 bool qihse_cluster_topology_set_migrating(qihse_cluster_topology_t* topology, uint16_t slot, uint16_t source_index, uint16_t target_index);

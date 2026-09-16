@@ -1,12 +1,14 @@
 # Cluster Brain — Decision Making for QIHSE Clusters
 
-> **Implementation status (2026-09-15):** phase 1 (observe / journal / decide)
-> is implemented in `src/spinnaker/qihse_cluster_brain.c` and is **pending
-> landing** (W0 of the master [roadmap](../../ROADMAP.md)): daemon flags
-> `--brain`, `--brain-dir`, `--brain-interval`, `--brain-dsa-key`.
-> **Actuation is not implemented** — `--brain-act` is accepted and reserved
-> for phase 2; the brain currently observes, journals, and decides only. Unit
-> test: `tests/test_cluster_brain.c` (`make test-cluster-brain`).
+> **Implementation status (2026-09-16):** phase 1 (observe / journal / decide)
+> and **actuation** are implemented in `src/spinnaker/qihse_cluster_brain.c`:
+> daemon flags `--brain`, `--brain-act`, `--brain-dir`, `--brain-interval`,
+> `--brain-dsa-key`, `--brain-cooldown`, `--brain-rollback-window`,
+> `--brain-prune-timeout`, `--brain-rebalance-min-slots`. Acting (R1 re-home,
+> R4 rollback, R5 rebalance-on-join, R6 stale prune) runs only under
+> `--brain-act` and every action goes through the same audited slot-handoff
+> path `CLUSTER MOVESLOTS` uses. Tests: `tests/test_cluster_brain.c` (phase 1),
+> `tests/test_brain_actuate.c` (R1/R4), `tests/test_brain_rebalance.c` (R5/R6).
 
 ## Why
 
@@ -48,29 +50,24 @@ bus (MEET/PING/PONG/SLOT_UPDATE)          topology (health, owners)
 
 ### Policy rules (phase 1, deterministic)
 
-1. **R1 — failed-owner re-home.** IF a slot range's owner is unhealthy AND I
-   am healthy AND I can reach a healthy target AND I hold the range's data
-   reachable (probes succeed), THEN transfer the range to the healthy target
-   and journal the action. Refuse (R3) when it would split the cluster.
-2. **R2 — quarantine asymmetry.** IF a peer fails my probes but other peers
-   report it healthy, journal an `ASYMMETRY` observation and DO NOT act on it
-   (routing decisions stay with nodes that can actually reach it). This is
-   exactly the T320 case.
-3. **R3 — split-brain guard.** IF I cannot reach any healthy peer, act on
-   nothing; journal `ISOLATED` once and keep serving read-local traffic only.
-4. **R4 — rollback.** IF a re-home was journaled and the moved range's error
-   rate (client CLUSTERDOWN/MOVED-storm counters) degrades vs. the journal
-   baseline within the rollback window, move the range back and journal
-   `ROLLBACK`.
+| Rule | State |
+|---|---|
+| **R1 — failed-owner re-home.** | **Implemented** (`--brain-act`). Evidence-gated like the failover coordinator: while any peer recently observed the owner healthy the brain only journals (asymmetry, not death). Acts only on a range the local node actually holds data for, hands it to the healthy target with the most headroom (NODE_CAP free RAM minus a load penalty, uptime tie-break), journals `REHOME` with the target's capability evidence, and refuses when it would split the cluster. |
+| **R2 — quarantine asymmetry.** | **Implemented** (phase 1, journal-only). |
+| **R3 — split-brain guard.** | **Implemented**: with no healthy peer the brain neither re-homes nor rebalances. |
+| **R4 — rollback.** | **Implemented**: each re-home is evaluated when its window closes — `transfer-incomplete` (moved < collected) or `target-unhealthy` moves ownership back to the local node and journals `ROLLBACK`; otherwise `REHOME_CONFIRM`. |
+| **R5 — rebalance on join.** | **Implemented** (`--brain-rebalance-min-slots N`): a healthy slotless primary receives a proportional share of the largest owner's largest range (never more than half of it). Deterministic — only the largest owner acts. |
+| **R6 — stale-node prune.** | **Implemented** (`--brain-prune-timeout S`): a node unhealthy past the timeout with no peer reporting it healthy is pruned from this node's view. Nodes that still own slots are refused until their ranges are re-homed. |
 
 ### Safety posture
 
-- Phase 1 ships **observe + journal + decide** only; no actuation code exists
-  yet and `--brain-act` is accepted-but-inert, reserved for phase 2. A brain
-  that can act is a brain that can misact; the journal is useful from day one,
-  the actions earn trust.
-- All actions reuse the audited MOVESLOTS machinery (key transfer, ownership
-  flip, bus broadcast) — the brain introduces no new data-path code.
+- Acting is **off by default** and gated behind `--brain-act`. A brain that
+  can act is a brain that can misact; the journal earns trust first.
+- Every action is evidence-gated (R2/R3/R6 use the third-party observation
+  matrix), reversible (R4), and rate-limited (per-range cooldown, one data
+  action per cycle).
+- All actions reuse the audited MOVESLOTS machinery — the brain introduces no
+  new data-path code.
 - Decision records: `{timestamp, node id, rule, inputs (health/owners/stats),
   action, result}` signed with the node's ML-DSA-87 key.
 
@@ -89,17 +86,21 @@ deliberately single-writer.
 
 ## Testing
 
-- `tests/test_cluster_brain.c` (`make test-cluster-brain`, runs in CI): the
-  phase-1 unit test. It builds a synthetic topology against a non-started resp
-  server, runs the brain through three health scenarios, and asserts the
-  journal contents — `BRAIN_START` + `OBSERVE` with no alarms when all peers
-  are healthy, `ASYMMETRY` + `ISOLATED` when a peer fails, `RECONNECTED` on
-  recovery — and that slot ownership is never modified (the no-action property
-  phase 2 must preserve).
-- Phase-2 actuation (R1 re-home under `--brain-act`) has no test because
-  actuation is not implemented. The live-cluster smoke test described
-  originally — boot the dynamic cluster, inject a failure, assert R1 re-home —
-  belongs with the actuation work, not with the phase-1 landing.
+- `tests/test_cluster_brain.c` (`make test-cluster-brain`): phase 1 — a
+  synthetic topology runs through three health scenarios; asserts the journal
+  contents (`BRAIN_START` + `OBSERVE` with no alarms when healthy,
+  `ASYMMETRY` + `ISOLATED` when a peer fails, `RECONNECTED` on recovery) and
+  that observe-only mode never modifies ownership.
+- `tests/test_brain_actuate.c` (`make test-brain-actuate`): R1/R4 against a
+  fake RESP peer — a failed owner's range moves with its keys and is confirmed
+  (`REHOME` + `REHOME_CONFIRM`); a target that fails inside the rollback window
+  triggers `ROLLBACK` and ownership returns to the local node; a target that
+  refuses the transfer is detected as an incomplete move and rolled back.
+- `tests/test_brain_rebalance.c` (`make test-brain-rebalance`): R5/R6 — a
+  slotless joiner receives a proportional range (`REBALANCE`); a stale slotless
+  node is pruned (`PRUNE`); a stale node that still owns slots is refused.
+
+All three run in CI.
 
 ## Relation to the federation direction
 

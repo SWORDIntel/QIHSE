@@ -107,9 +107,25 @@ jobs:
       run: |
         make test-cluster-brain
 
+    - name: Run Brain Actuation Tests
+      run: |
+        make test-brain-actuate
+
+    - name: Run Brain Rebalance and Prune Tests
+      run: |
+        make test-brain-rebalance
+
     - name: Run Overlay Protocol Unit Tests
       run: |
         make test-overlay
+
+    - name: Run Federation F0 Primitive Tests
+      run: |
+        make test-federation-f0
+
+    - name: Run AI Memory Tests
+      run: |
+        make test-ai-memory
 
     - name: Run APT41 Fuzz Testing (ASan & UBSan)
       run: |

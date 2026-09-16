@@ -11,6 +11,11 @@ struct qihse_cluster_topology {
     uint64_t current_epoch __attribute__((aligned(64)));
     uint16_t local_node;
     qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+    /* Tombstones for pruned nodes. Indices are never reused (slot ownership
+     * and peer views reference them), so a removed node keeps its slot and is
+     * simply excluded from every lookup. Upserting the same node id revives
+     * it in place. */
+    uint8_t node_removed[QIHSE_CLUSTER_MAX_NODES];
     size_t node_count;
     pthread_mutex_t metadata_lock;
 };
@@ -24,7 +29,7 @@ static bool qihse_cluster_valid_slot_range(uint16_t start, uint16_t end) {
 }
 
 static bool qihse_cluster_valid_node_locked(const qihse_cluster_topology_t* topology, uint16_t index) {
-    return index < topology->node_count;
+    return index < topology->node_count && !topology->node_removed[index];
 }
 
 static bool qihse_cluster_node_id_valid(const char* id) {
@@ -99,9 +104,38 @@ bool qihse_cluster_topology_upsert_node(qihse_cluster_topology_t* topology, cons
     if (copy.role == QIHSE_CLUSTER_NODE_PRIMARY) copy.primary_index = QIHSE_CLUSTER_NODE_NONE;
     copy.config_epoch = qihse_cluster_next_epoch(topology);
     topology->nodes[index] = copy;
+    topology->node_removed[index] = 0; /* revive a pruned node in place */
     if (index == topology->node_count) topology->node_count++;
     pthread_mutex_unlock(&topology->metadata_lock);
     if (out_index) *out_index = (uint16_t)index;
+    return true;
+}
+
+/* Prune a node from this node's view. Indices are never reused, so the node
+ * keeps its slot and is excluded from lookups until an upsert revives it.
+ * Refuses to prune the local node or a node that still owns slots — ranges
+ * must be re-homed (failover / brain R1) before the owner disappears. */
+bool qihse_cluster_topology_remove_node(qihse_cluster_topology_t* topology, uint16_t index) {
+    if (!topology) {
+        errno = EINVAL;
+        return false;
+    }
+    pthread_mutex_lock(&topology->metadata_lock);
+    if (!qihse_cluster_valid_node_locked(topology, index) || index == topology->local_node) {
+        pthread_mutex_unlock(&topology->metadata_lock);
+        errno = EINVAL;
+        return false;
+    }
+    for (uint16_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+        if (topology->slot_to_node[slot] == index) {
+            pthread_mutex_unlock(&topology->metadata_lock);
+            errno = EBUSY;
+            return false;
+        }
+    }
+    topology->node_removed[index] = 1;
+    pthread_mutex_unlock(&topology->metadata_lock);
+    qihse_cluster_next_epoch(topology);
     return true;
 }
 
@@ -126,6 +160,7 @@ bool qihse_cluster_topology_find_node(const qihse_cluster_topology_t* topology, 
     bool found = false;
     pthread_mutex_lock((pthread_mutex_t*)&topology->metadata_lock);
     for (size_t i = 0; i < topology->node_count; i++) {
+        if (topology->node_removed[i]) continue;
         if (strcmp(topology->nodes[i].id, node_id) == 0) {
             *out_index = (uint16_t)i;
             found = true;
@@ -140,11 +175,14 @@ bool qihse_cluster_topology_find_node(const qihse_cluster_topology_t* topology, 
 size_t qihse_cluster_topology_nodes(const qihse_cluster_topology_t* topology, qihse_cluster_node_t* out_nodes, size_t capacity) {
     if (!topology) return 0;
     pthread_mutex_lock((pthread_mutex_t*)&topology->metadata_lock);
-    size_t count = topology->node_count;
-    size_t copied = count < capacity ? count : capacity;
-    if (out_nodes && copied > 0) memcpy(out_nodes, topology->nodes, copied * sizeof(*out_nodes));
+    size_t live = 0;
+    for (size_t i = 0; i < topology->node_count; i++) {
+        if (topology->node_removed[i]) continue; /* pruned: excluded from every view */
+        if (out_nodes && live < capacity) out_nodes[live] = topology->nodes[i];
+        live++;
+    }
     pthread_mutex_unlock((pthread_mutex_t*)&topology->metadata_lock);
-    return count;
+    return live;
 }
 
 bool qihse_cluster_topology_set_local_node(qihse_cluster_topology_t* topology, uint16_t index) {

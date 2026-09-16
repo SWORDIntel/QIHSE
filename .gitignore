@@ -96,3 +96,9 @@ lib/
 
 # Agent session plans (local working notes)
 /.zcode/
+
+# Test scratch directories (mkdtemp'd by unit tests under build/)
+/build/aimem_data_*/
+/build/brain_act_*/
+/build/brain_journal_*/
+/build/brain_reb_*/

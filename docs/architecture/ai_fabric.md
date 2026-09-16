@@ -1,15 +1,17 @@
 # AI Compute Fabric — Superseding MEMSHADOW
 
-> **Implementation status (2026-09-15):** items 1–3 are implemented and
-> **pending landing** (W0 of the master [roadmap](../../ROADMAP.md)) —
+> **Implementation status (2026-09-16):** all five items are implemented —
 > NODE_CAP capability frames (`QIHSE_BUS_MSG_NODE_CAP`, getter
 > `qihse_cluster_bus_node_caps()`), the KEYSTONE fabric index
 > (`src/spinnaker/qihse_fabric_index.c`, CI-gated by
-> `tests/test_fabric_index.c`), and fabric job dispatch (`FABRIC.CAPS` /
+> `tests/test_fabric_index.c`), fabric job dispatch (`FABRIC.CAPS` /
 > `FABRIC.SUBMIT` / `FABRIC.RESULT` in `qihse_resp_engine.c`, KV keys
-> `fabric:job:<id>` / `fabric:result:<id>`). Items 4–5 are not implemented;
-> per the section at the end of this document they build on the federation
-> plan's primitives rather than ad-hoc bus messaging.
+> `fabric:job:<id>` / `fabric:result:<id>`), capability-aware brain placement
+> (the cluster brain's target selection consumes NODE_CAP headroom and
+> journals the evidence — `tests/test_brain_actuate.c`), and the local-first
+> AI memory API (`src/spinnaker/qihse_ai_memory.c`, `tests/test_ai_memory.c`).
+> Items 3–5 build on the federation primitives where the plan provides them
+> (HLC-stamped identities, per-object generations).
 
 Design of record for the heterogeneous AI compute cluster built on QIHSE +
 KEYSTONE. This document is the execution spec: subagents and future sessions
@@ -70,6 +72,12 @@ Postgres, no platform glue.
   with KEYSTONE classes, 4096-d quantized embeddings via QIHSE's own
   quantization module. Queryable from any node. This is the MEMSHADOW
   successor surface.
+- **Implemented as** `qihse_ai_memory_store/recall/get/forget/count`
+  (`include/qihse_ai_memory.h`): records in the `aimem:` KV namespace, indexed
+  by the FTS engine for BM25 recall over caller-visible documents only, with
+  every entry point taking an explicit security context. Embedding-backed
+  semantic search (quantized vectors instead of lexical recall) remains the
+  follow-up; the record layout and RBAC surface do not change when it lands.
 
 ## Rejected from MEMSHADOW
 Python monolith, Postgres, Docker tiers, consciousness/Mamba/neuromorphic/
