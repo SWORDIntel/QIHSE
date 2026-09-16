@@ -694,3 +694,38 @@ The two new nodes joined slotless and were given ranges with
 `CLUSTER MOVESLOTS` from the largest owner (t420). Verified: writes to keys
 in all five ranges land on the owning node via MOVED (including both new
 730xd nodes) and every node can read all five ranges (10/10 checks).
+
+## 6-node lab status — automatic rebalance on join (2026-09-16)
+
+A sixth node (CT 413 `qihse-node5`, 192.168.1.96:7115, bus 17115) was added
+and **received its range with no manual step**: it joined slotless, and the
+largest owner's brain (R5, `--brain-rebalance-min-slots 1024`) donated a
+proportional share on the next decision cycle.
+
+```
+before  t420 0-5459 (5460 slots), 5 healthy nodes
+after   t420 0-4549,  node5 4550-5459  (5460 / 6 = 910 slots donated)
+```
+
+t420's journal recorded the signed decision:
+
+```json
+{"kind":"REBALANCE","detail":{"range":"4550-5459","to":"98fb431d096c",
+ "moved":0,"collected":0,"ok":true,"err":""}}
+```
+
+All six nodes run the current build (brain actuation R1/R4/R5/R6, federation
+F0 primitives, AI memory) under systemd units — including the two Proxmox
+hosts, which previously had no unit and did not survive a reboot. Final
+state: six nodes, `cluster_state:ok`, 16,384/16,384 slots, identical
+ownership map; writes across all six ranges land on the owning node and every
+node reads all six (12/12 checks).
+
+| Node | Where | Endpoint | Bus | Slots |
+|---|---|---|---|---|
+| 0 | t420 (Proxmox host) | 192.168.1.91:7100 | 17100 | 0-4549 |
+| 1 | t320 (Proxmox host) | 192.168.1.250:7101 | 17101 | 10923-13653 |
+| 2 | CT 410 on t320 | 10.200.69.2:7112 | 17112 | 13654-16383 |
+| 3 | CT 411 on 730xd | 192.168.1.92:7113 | 17113 | 5460-8191 |
+| 4 | CT 412 on 730xd | 192.168.1.93:7114 | 17114 | 8192-10922 |
+| 5 | CT 413 on 730xd | 192.168.1.96:7115 | 17115 | 4550-5459 |
