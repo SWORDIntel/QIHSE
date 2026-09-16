@@ -11,6 +11,10 @@
 > - **Neo4j**: LOAD CSV, CALL procedures, constraints, indexes, database management, EXPLAIN/PROFILE, FOREACH
 >
 > See the status table below for details.
+>
+> **Future direction:** with Phases 1-9 complete, **Phase 10 (Federation Data Plane)** is the accepted next major effort. It turns the database-centric cluster into a federation of sovereign nodes and adds the build/supply-chain substrate. See the Phase 10 section at the end of this document and the full design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md).
+>
+> For cross-workstream sequencing (federation, AI fabric, cluster brain, overlay, production hardening), see the master [ROADMAP.md](../../ROADMAP.md).
 
 ## 0. Current State Summary
 
@@ -152,9 +156,41 @@ Goal: Beyond SQL -- domain-specific query surfaces.
 | 8.4 Full-text SQL extensions | MATCH(), RANK(), highlight snippets in SELECT | qihse_fts_index.c, qihse_sql_parser.c |
 | 8.5 QQL v2 | Unified QQL with first-class spatial, temporal, vector, graph, and FTS predicates | qihse_qql_parser.c |
 
+### Phase 10 -- Federation Data Plane 🧭 PLANNED (accepted future direction)
+
+Goal: upgrade QIHSE from a database-centric sharded cluster into a **partition-aware, security-first federation data plane** of sovereign nodes — suitable for backing a multi-host hypervisor control system and the Citadel build/supply-chain fabric — without coupling ordinary local operation to whole-cluster quorum.
+
+Governing principle: **federation must enhance a node, never become a prerequisite for that node to remain locally operable.**
+
+Design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md) (accepted 2026-09-15; planning status — not yet implemented). Rollout stages from that plan:
+
+| Stage | Scope |
+|---|---|
+| F0 | Refactor boundaries: federation module, UUID/HLC/version primitives, document current cluster semantics. No behavior changes. |
+| F1 | Sovereign local state: consistency classes (LOCAL/EVENTUAL/CAUSAL/QUORUM/LINEARIZABLE), local-authority namespaces, no global quorum gate on local-safe writes, federation status API. |
+| F2 | Event journal + resumable watch API, idempotent request IDs, controller SDK. |
+| F3 | Replication correctness: anti-entropy, manifests/range digests, explicit conflict objects, resumable reconciliation. |
+| F4 | Strong namespaces: scoped consensus (replication groups), native CAS, monotonic fencing epochs, lease primitive. |
+| F5 | Trust plane: node enrollment, mTLS, signed replay-resistant gossip, revocation, infrastructure security scopes. |
+| F6 | Build & supply-chain substrate: package override/source registry, build-job state machine, worker capability records, provenance graph, SBOM/attestation records, vulnerability observations, repository snapshots, controller-facing build/supply APIs. |
+| F7 | Operational hardening: rolling schema upgrades, federation-consistent snapshots, chaos test suite, performance regression budgets, recovery tooling. |
+
+Key invariants (the plan's section 3 has the full list):
+
+- an isolated node stays read-write for LOCAL-consistency namespaces (no global read-only on quorum loss);
+- execution decisions (VM start/stop/migrate/fence, storage/network promotion) remain outside QIHSE — it stores evidence, leases, epochs, ownership records;
+- every federation mutation is idempotent, attributable, and HLC-stamped;
+- exclusive-state transitions fail closed, without bricking unrelated local operation;
+- never infer safety from absence (a missing heartbeat is not proof a peer is down).
+
+Explicit non-goals: QIHSE does not become a VM scheduler, fencing system, storage/SDN controller, secret vault, remote shell, build executor, or signing authority.
+
 ---
 
 ## 2. Priority Recommendations
+
+> The recommendations below are historical (written when Phases 1-8 were pending).
+> With Phases 1-9 complete, the active forward direction is **Phase 10 -- Federation Data Plane** above.
 
 ### Immediate (next 1-2 development cycles)
 1. Phase 1 (SQL completeness) -- without JOIN, GROUP BY, and ORDER BY, the pgwire surface cannot replace PostgreSQL for real applications. This is the highest-leverage gap.

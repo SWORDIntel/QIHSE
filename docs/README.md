@@ -17,6 +17,8 @@ If you are new to the project, start with the [root README](../README.md), then 
 | Deploy QIHSE | [Deployment](deployment/) |
 | Work on the codebase | [Development](development/) |
 | Read the current technical treatment | [Technical Whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md) |
+| See what is being built and in what order | [Roadmap](../ROADMAP.md) |
+| See where the project is headed | [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) |
 
 The original [whitepaper v1.0](architecture/qihse_whitepaper_v1.0.md) is retained as a historical design snapshot. Use v1.1 for current implementation status, roadmap state, claim discipline, and production-readiness language.
 
@@ -36,6 +38,9 @@ Use these when you need implementation-level detail rather than the project over
 - [Cluster rebalancing](architecture/cluster_rebalancing.md)
 - [Routing and persistence](architecture/routing_persistence.md)
 - [Event stream](architecture/event_stream.md)
+- [Cluster brain](architecture/cluster_brain.md)
+- [AI compute fabric](architecture/ai_fabric.md)
+- [Overlay protocol](architecture/overlay_protocol.md)
 - [QMAG policy](architecture/qmag-policy.md)
 - [TRITON Lua injector](architecture/lua_injector.md)
 
@@ -86,6 +91,7 @@ The [`plans/`](plans/) directory contains design documents and implementation ro
 
 Notable documents include:
 
+- [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — **the accepted future direction**: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Planning status; not yet implemented.
 - [General database engine roadmap](plans/qihse_general_db_engine_roadmap.md)
 - [PostgreSQL and Neo4j replacement plan](plans/qihse_pg_neo4j_full_replacement_plan.md)
 - [Redis cluster sharding plan](plans/qihse_redis_cluster_sharding_plan.md)

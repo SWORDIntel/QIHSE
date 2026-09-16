@@ -662,12 +662,14 @@ QIHSE has crossed the implementation bar for a large portion of the original roa
 Use the following repository areas when evaluating current state:
 
 - `README.md` — current project overview and scope;
+- `ROADMAP.md` — master sequencing: verified current state, workstream order, and completion gates;
 - `docs/FEATURES.md` — subsystem inventory;
 - `docs/COMPATIBILITY.md` — compatibility surfaces;
 - `docs/architecture/` — implementation architecture;
 - `docs/benchmarks/` — measured performance and methodology;
 - `docs/security/` — current security posture and audit material;
 - `docs/deployment/` — deployment/operations documentation;
+- `docs/plans/` — design and roadmap documents. The federation upgrade plan (`docs/plans/qihse_federation_upgrade_plan.md`, accepted 2026-09-15) is the future architectural direction; it is planning material and does not describe implemented capability;
 - `tests/` and subsystem test directories — implementation evidence;
 - `.github/workflows/` — current CI behavior;
 - `dashboard/` — runtime observability UI.
