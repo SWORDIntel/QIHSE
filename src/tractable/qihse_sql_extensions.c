@@ -363,12 +363,15 @@ static qihse_ch_engine_kind_t detect_engine(const char* sql) {
     /* Uppercase for comparison */
     for (size_t j = 0; j < i; j++) engname[j] = (char)toupper((unsigned char)engname[j]);
 
-    if (strcmp(engname, "MergeTree") == 0) return QIHSE_CH_ENGINE_MERGETREE;
-    if (strcmp(engname, "ReplacingMergeTree") == 0) return QIHSE_CH_ENGINE_REPLACING_MERGETREE;
-    if (strcmp(engname, "SummingMergeTree") == 0) return QIHSE_CH_ENGINE_SUMMING_MERGETREE;
-    if (strcmp(engname, "AggregatingMergeTree") == 0) return QIHSE_CH_ENGINE_AGGREGATING_MERGETREE;
-    if (strcmp(engname, "CollapsingMergeTree") == 0) return QIHSE_CH_ENGINE_COLLAPSING_MERGETREE;
-    if (strcmp(engname, "VersionedMergeTree") == 0) return QIHSE_CH_ENGINE_VERSIONED_MERGETREE;
+    /* engname is upper-cased above, so the comparison must be too: comparing
+     * it against mixed-case literals made detect_engine() return NONE for
+     * every real engine name and qihse_sql_parse_mergetree() always fail. */
+    if (strcmp(engname, "MERGETREE") == 0) return QIHSE_CH_ENGINE_MERGETREE;
+    if (strcmp(engname, "REPLACINGMERGETREE") == 0) return QIHSE_CH_ENGINE_REPLACING_MERGETREE;
+    if (strcmp(engname, "SUMMINGMERGETREE") == 0) return QIHSE_CH_ENGINE_SUMMING_MERGETREE;
+    if (strcmp(engname, "AGGREGATINGMERGETREE") == 0) return QIHSE_CH_ENGINE_AGGREGATING_MERGETREE;
+    if (strcmp(engname, "COLLAPSINGMERGETREE") == 0) return QIHSE_CH_ENGINE_COLLAPSING_MERGETREE;
+    if (strcmp(engname, "VERSIONEDMERGETREE") == 0) return QIHSE_CH_ENGINE_VERSIONED_MERGETREE;
     return QIHSE_CH_ENGINE_NONE;
 }
 
@@ -456,7 +459,8 @@ int qihse_sql_parse_materialized_view(const char* sql, qihse_ch_matview_spec_t* 
 
     const char* p = strcasestr(sql, "CREATE MATERIALIZED VIEW");
     if (!p) return -1;
-    p += 23; /* strlen("CREATE MATERIALIZED VIEW") */
+    p += 24; /* strlen("CREATE MATERIALIZED VIEW"); was 23, which left the
+              * trailing 'W' to be parsed as the view name */
 
     /* IF NOT EXISTS */
     p = ch_skip_ws(p);

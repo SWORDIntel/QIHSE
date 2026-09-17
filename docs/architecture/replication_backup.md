@@ -1,18 +1,24 @@
 # Replication, Backup & Operational Features
 
-> **Status: partial — status unverified.** Streaming replication, read-replica
-> routing, backup/restore, parallel query and the pooler have sources under
-> `src/spinnaker/` and `src/tractable/`, but the test file this document names
-> (`tests/test_repl.c`) does not exist and no test in `tests/` calls
-> `qihse_repl_*`.
->
-> **Contradiction with the code:** the backup/restore section below describes a
-> working export. The legacy surface it refers to (`src/tractable/qihse_backup.c`,
-> `include/qihse_backup.h`) is a stub that writes an empty data section and
-> carries a `TODO: iterate KV store and write all key-value pairs`. The working
-> backup path is the federation writer/reader in `src/federation/qihse_backup.c`,
-> verified by `tests/test_federation_backup.c`; see
+> **Status: partial.** Streaming replication, read-replica routing and the
+> connection pooler are implemented and are exercised by `tests/test_repl.c`
+> (run via `make test-repl`). Backup/restore has an authenticated implementation
+> under `src/tractable/qihse_backup.c`, but **no test in `tests/` covers that
+> API** — the only backup test in the tree is
+> `tests/test_federation_backup.c`, which covers the federation writer/reader
+> instead; see
 > [API_REFERENCE.md §2.3](../API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph).
+> **Parallel query is not implemented** (see below).
+>
+> Two further limits:
+>
+> - `qihse_repl_apply_wal()` records the LSN but does **not** replay the WAL
+>   into a local store; the source says "In a real implementation, this would
+>   replay the WAL into the local store". `tests/test_repl.c` asserts the LSN
+>   bookkeeping and states this in its header comment.
+> - `qihse_backup_incremental_user()` is not a delta export: it returns
+>   UNSUPPORTED by design, because the KV store exposes no change sequence
+>   (documented in the API snippet below).
 
 ## Overview
 
@@ -90,7 +96,14 @@ qihse_restore_user(kv, user, "/backups/full.bak");
 qihse_backup_verify_user(user, "/backups/full.bak");
 ```
 
-## Parallel Query (`src/tractable/qihse_parallel_query.c`)
+## Parallel Query (`src/tractable/qihse_parallel_query.c`) — NOT IMPLEMENTED
+
+> **Status: planned.** The entry points exist and return success, but the work
+> inside them does not: the scan workers contain
+> `TODO: actual KV store iteration with partitioning` and report a row count of
+> zero, the aggregate is `TODO: actual aggregation over KV store partition`, and
+> the join is `TODO: implement parallel hash join or merge join`. No test covers
+> this file. The description below is the design, not the code.
 
 ### Architecture
 - pthread-based worker threads
@@ -138,4 +151,26 @@ qihse_pooler_add_backend(pool, "10.0.0.1", 5432);
 ```
 
 ## Testing
-9 tests in `tests/test_repl.c` covering all the above features.
+
+`tests/test_repl.c` (run via `make test-repl`) covers:
+
+1. **Replication context**: role/state transitions, and refusal to ship WAL or
+   start streaming before a connection exists.
+2. **Replication slots**: create, duplicate refused, advance (including the
+   refusal to move `restart_lsn` backwards), drop, count.
+3. **WAL shipping over a real loopback socket**: the peer must receive the
+   `[LSN][length][data]` frame byte-for-byte and `qihse_repl_get_status()` must
+   report it; `qihse_repl_apply_wal()` advances the flush LSN.
+4. **Refusals**: connecting to a closed port, an invalid address and a NULL host
+   all fail and leave the context in `REPL_STATE_ERROR`.
+5. **Read-replica pool**: add/remove, round-robin routing with wrap-around,
+   active count, and health checking against unreachable addresses (all
+   unhealthy, no route) and against a live listener (healthy, routable).
+6. **Pooler**: config defaults and round-trip, backend add/remove/count, pooling
+   modes, admin-console parse and execute (`SHOW VERSION`, `SHOW POOLS`,
+   `PAUSE`), databases and users.
+
+**Not covered by this test, because the code does not implement it:** parallel
+query (stubbed, see above). **Not covered because no test exists:** the
+authenticated backup/restore API in `src/tractable/qihse_backup.c`, and
+`qihse_repl_apply_wal()` actually replaying WAL records into a store.

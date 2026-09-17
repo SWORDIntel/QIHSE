@@ -1,4 +1,6 @@
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* the build also passes -D_GNU_SOURCE; guard the redefinition */
+#endif
 /*
  * QIHSE Schema Registry — Phase 1 Relational Completeness
  *
@@ -151,9 +153,16 @@ int qihse_schema_alter_table(qihse_schema_registry_t* reg, const qihse_sql_ast_t
     switch (ac->action) {
         case QIHSE_ALTER_ADD_COLUMN: {
             if (!ac->add_column) return -1;
-            if (t->num_columns && (t->num_columns % 8 == 0)) {
-                t->columns = (qihse_schema_column_t*)realloc(t->columns, (t->num_columns + 8) * sizeof(qihse_schema_column_t));
-            }
+            /* Grow by one column every time.  The table struct does not
+             * record an allocated capacity, so the previous
+             * "num_columns % 8 == 0" test reallocated only when the count
+             * happened to be a multiple of 8 and otherwise appended past the
+             * end of the array (heap overflow).  Reallocating to exactly
+             * num_columns + 1 is always safe. */
+            qihse_schema_column_t* grown = (qihse_schema_column_t*)realloc(
+                t->columns, (t->num_columns + 1) * sizeof(qihse_schema_column_t));
+            if (!grown) return -1;
+            t->columns = grown;
             qihse_schema_column_t* c = &t->columns[t->num_columns++];
             memset(c, 0, sizeof(*c));
             c->name = ac->add_column->name ? strdup(ac->add_column->name) : NULL;

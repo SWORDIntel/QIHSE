@@ -1,4 +1,6 @@
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* the build also passes -D_GNU_SOURCE; guard the redefinition */
+#endif
 /*
  * QIHSE Sort Executor — Phase 1 Relational Completeness
  *
@@ -178,7 +180,6 @@ static void sort_build(sort_state_t* st) {
 
     /* k-way merge: merge spilled runs + in-memory buffer */
     /* collect all rows into merged array (simple approach for correctness) */
-    size_t total = st->buf_count;
     /* count rows in spill files */
     for (size_t i = 0; i < st->num_spills; i++) {
         while (1) {
@@ -187,7 +188,6 @@ static void sort_build(sort_state_t* st) {
                 if (rr.values) { free(rr.values); }
                 break;
             }
-            total++;
             /* store temporarily — we'll re-sort; for simplicity merge by reading all */
             /* Actually we need to store; use a temp dynamic array */
             if (st->merged_count >= st->buf_cap) {
@@ -200,6 +200,10 @@ static void sort_build(sort_state_t* st) {
             st->merged_count++;
         }
         fclose(st->spill_files[i]);
+        /* sort_close() closes every spill file again, so clear the slot here:
+         * leaving it set made any spilling sort abort in fclose() with
+         * "double free detected". */
+        st->spill_files[i] = NULL;
     }
     /* add in-memory buffer rows */
     for (size_t i = 0; i < st->buf_count; i++) {
