@@ -57,6 +57,9 @@ typedef struct {
     uint32_t prune_timeout_seconds;
     uint32_t rebalance_min_slots;
     brain_pool_t* pool; /* scan workers, created at start and reused every cycle */
+    qihse_cluster_slot_range_t* ranges; /* range snapshot reused by every act
+                                         * check; NULL = not allocated, so the
+                                         * checks skip instead of acting */
     pthread_t thread;
 } brain_t;
 
@@ -574,9 +577,17 @@ static bool brain_check_rehome(brain_t* brain) {
         if (nodes[i].index != local && nodes[i].healthy) healthy_peers++;
     if (healthy_peers == 0) return false;
 
+    /* The range snapshot is the brain-owned heap buffer, never a stack array:
+     * 16384 ranges is ~96 KB and this runs on the brain thread, where a frame
+     * that size is a hazard (AGENTS.md, "bounded stack frames"). The buffer is
+     * allocated once at start and reused every cycle. A brain without one
+     * (allocation failed) skips the check rather than acting on an empty
+     * range list. */
+    qihse_cluster_slot_range_t* ranges = brain->ranges;
+    if (!ranges) return false;
+
     bool acted = false;
     uint64_t now = brain_now_ms();
-    qihse_cluster_slot_range_t ranges[QIHSE_CLUSTER_SLOT_COUNT];
     size_t range_count = qihse_cluster_topology_ranges(brain->topology, ranges,
                                                        QIHSE_CLUSTER_SLOT_COUNT);
     for (size_t r = 0; r < range_count; r++) {
@@ -726,8 +737,11 @@ static void brain_check_prune(brain_t* brain, const qihse_cluster_node_t* nodes,
  * (tie-break by lowest index), so exactly one node moves the range. */
 static void brain_check_rebalance(brain_t* brain, const qihse_cluster_node_t* nodes, size_t count) {
     if (!brain->act || !brain->rebalance_min_slots || count < 2u) return;
+    /* Same brain-owned heap range snapshot as brain_check_rehome; without it
+     * there is no range view, so no range is donated. */
+    qihse_cluster_slot_range_t* ranges = brain->ranges;
+    if (!ranges) return;
     uint16_t local = qihse_cluster_topology_local_node(brain->topology);
-    qihse_cluster_slot_range_t ranges[QIHSE_CLUSTER_SLOT_COUNT];
     size_t range_count = qihse_cluster_topology_ranges(brain->topology, ranges,
                                                        QIHSE_CLUSTER_SLOT_COUNT);
 
@@ -869,8 +883,23 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
      * array serially on the brain thread. */
     brain->pool = brain_pool_create(brain_worker_count());
 
+    /* Actuation needs a full range snapshot: 16384 ranges is ~96 KB, which
+     * must not sit on the brain thread's stack (AGENTS.md, "bounded stack
+     * frames"). One heap buffer is allocated here and reused by every act
+     * check, so no cycle pays a malloc/free. Observe-only brains never
+     * allocate it. An allocation failure is NOT fatal either: the act checks
+     * then skip (no re-home, no rebalance) instead of acting on an empty
+     * range list, and the degraded mode is journaled once. */
+    if (brain->act) {
+        brain->ranges = malloc(QIHSE_CLUSTER_SLOT_COUNT * sizeof(qihse_cluster_slot_range_t));
+        if (!brain->ranges)
+            brain_journal(brain, "BRAIN_DEGRADED",
+                          "{\"reason\":\"range-snapshot-unavailable\",\"act\":\"disabled\"}");
+    }
+
     if (pthread_create(&brain->thread, NULL, brain_main, brain) != 0) {
         brain_pool_destroy(brain->pool);
+        free(brain->ranges);
         qihse_event_stream_destroy(brain->journal);
         pthread_mutex_destroy(&brain->journal_lock);
         free(brain);
@@ -893,6 +922,7 @@ void qihse_cluster_brain_stop(void) {
     /* The brain thread is joined, so no round is in flight: this parks the
      * idle workers and joins them before the brain struct goes away. */
     brain_pool_destroy(brain->pool);
+    free(brain->ranges); /* the act checks ran on the joined thread only */
     qihse_event_stream_destroy(brain->journal);
     pthread_mutex_destroy(&brain->journal_lock);
     free(brain);
