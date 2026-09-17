@@ -380,8 +380,12 @@ static void scenario_replay_and_revocation(void) {
     snprintf(id.hostname, sizeof(id.hostname), "sim-node-0");
     snprintf(id.boot_id, sizeof(id.boot_id), "boot-0");
     id.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
+    /* Ed25519 here: the legacy entry point, so the record exercises the
+     * algorithm-agile path with a pre-quantum algorithm. */
     assert(qihse_federation_node_keygen(key_dir, &id.node_id, id.public_key,
                                         id.key_handle, sizeof(id.key_handle)));
+    id.sig_alg = QIHSE_SIG_ED25519;
+    id.public_key_len = (uint16_t)qihse_sig_alg_public_key_bytes(QIHSE_SIG_ED25519);
     assert(qihse_federation_node_enroll_request(g_store, g_op, &id));
     assert(qihse_federation_node_enroll_approve(g_store, g_op, &id.node_id, 1));
 
@@ -397,6 +401,7 @@ static void scenario_replay_and_revocation(void) {
     g.boot_id = boot_id;
     g.sequence = 10;
     g.hlc.physical_ms = qihse_sim_wall_ms(&sim, 0);
+    assert(qihse_uuid_generate(&g.session_id));
     assert(qihse_federation_gossip_sign(pkey, &g));
     assert(qihse_federation_gossip_accept(g_store, g_op, &g) == QIHSE_GOSSIP_ACCEPTED);
 

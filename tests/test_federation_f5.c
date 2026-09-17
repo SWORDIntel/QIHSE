@@ -137,9 +137,11 @@ static void test_node_identity(qihse_kv_store_t* store, qihse_user_t* op,
     id.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
 
     /* Keygen writes the private key to disk; only the public key and a
-     * handle come back. */
+     * handle come back.  This uses the legacy Ed25519 entry point. */
     assert(qihse_federation_node_keygen(key_dir, &id.node_id, id.public_key,
                                         id.key_handle, sizeof(id.key_handle)));
+    id.sig_alg = QIHSE_SIG_ED25519;
+    id.public_key_len = (uint16_t)qihse_sig_alg_public_key_bytes(QIHSE_SIG_ED25519);
 
     /* The key file exists and is 0600. */
     struct stat st;
@@ -153,14 +155,14 @@ static void test_node_identity(qihse_kv_store_t* store, qihse_user_t* op,
     /* Fingerprint is deterministic and the right size. */
     uint8_t fp1[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
     uint8_t fp2[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
-    assert(qihse_federation_node_fingerprint(id.public_key, fp1));
-    assert(qihse_federation_node_fingerprint(id.public_key, fp2));
+    assert(qihse_federation_node_fingerprint(id.public_key, id.public_key_len, fp1));
+    assert(qihse_federation_node_fingerprint(id.public_key, id.public_key_len, fp2));
     assert(memcmp(fp1, fp2, sizeof(fp1)) == 0);
     /* A different key yields a different fingerprint. */
-    uint8_t other_pub[QIHSE_FEDERATION_NODE_PUBKEY_BYTES];
+    uint8_t other_pub[64];
     memset(other_pub, 0xA5, sizeof(other_pub));
     uint8_t fp3[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
-    assert(qihse_federation_node_fingerprint(other_pub, fp3));
+    assert(qihse_federation_node_fingerprint(other_pub, sizeof(other_pub), fp3));
     assert(memcmp(fp1, fp3, sizeof(fp1)) != 0);
 
     /* Enrollment request lands in PENDING. */
@@ -173,7 +175,9 @@ static void test_node_identity(qihse_kv_store_t* store, qihse_user_t* op,
     assert(got.trust == QIHSE_TRUST_PENDING);
     assert(got.enrollment_epoch == 0);
     assert(strcmp(got.hostname, "r730xd-a") == 0);
-    assert(memcmp(got.public_key, id.public_key, sizeof(id.public_key)) == 0);
+    assert(got.public_key_len == id.public_key_len);
+    assert(got.sig_alg == id.sig_alg);
+    assert(memcmp(got.public_key, id.public_key, id.public_key_len) == 0);
     assert(memcmp(got.fingerprint, fp1, sizeof(fp1)) == 0);
 
     /* Scopes come from the identity kind, not from the caller. */
@@ -214,6 +218,8 @@ static void test_gossip(qihse_kv_store_t* store, qihse_user_t* op,
     a.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
     assert(qihse_federation_node_keygen(key_dir, &a.node_id, a.public_key,
                                         a.key_handle, sizeof(a.key_handle)));
+    a.sig_alg = QIHSE_SIG_ED25519;
+    a.public_key_len = (uint16_t)qihse_sig_alg_public_key_bytes(QIHSE_SIG_ED25519);
     assert(qihse_federation_node_enroll_request(store, op, &a));
     assert(qihse_federation_node_enroll_approve(store, op, &a.node_id, 1));
 
@@ -244,25 +250,25 @@ static void test_gossip(qihse_kv_store_t* store, qihse_user_t* op,
     assert(memcmp(frame1, frame2, len1) == 0);
 
     assert(qihse_federation_gossip_sign(a_key, &g));
-    assert(qihse_federation_gossip_verify(a.public_key, &g));
+    assert(qihse_federation_gossip_verify(a.public_key, a.public_key_len, &g));
 
     /* Tampering with any signed field breaks verification. */
     qihse_federation_gossip_t tampered = g;
     tampered.sequence = 999;
-    assert(!qihse_federation_gossip_verify(a.public_key, &tampered));
+    assert(!qihse_federation_gossip_verify(a.public_key, a.public_key_len, &tampered));
     tampered = g;
     tampered.capability_bitmap = 0xFFFF;
-    assert(!qihse_federation_gossip_verify(a.public_key, &tampered));
+    assert(!qihse_federation_gossip_verify(a.public_key, a.public_key_len, &tampered));
     tampered = g;
     tampered.sender_node.bytes[0] ^= 0xFFu;
-    assert(!qihse_federation_gossip_verify(a.public_key, &tampered));
+    assert(!qihse_federation_gossip_verify(a.public_key, a.public_key_len, &tampered));
     tampered = g;
     tampered.hlc.physical_ms = 2000;
-    assert(!qihse_federation_gossip_verify(a.public_key, &tampered));
+    assert(!qihse_federation_gossip_verify(a.public_key, a.public_key_len, &tampered));
     /* A flipped signature bit fails too. */
     tampered = g;
     tampered.signature[0] ^= 0x01u;
-    assert(!qihse_federation_gossip_verify(a.public_key, &tampered));
+    assert(!qihse_federation_gossip_verify(a.public_key, a.public_key_len, &tampered));
 
     /* Accept: a signed frame from an approved node is accepted. */
     assert(qihse_federation_gossip_accept(store, op, &g) == QIHSE_GOSSIP_ACCEPTED);
@@ -304,6 +310,8 @@ static void test_gossip(qihse_kv_store_t* store, qihse_user_t* op,
     b.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
     assert(qihse_federation_node_keygen(key_dir, &b.node_id, b.public_key,
                                         b.key_handle, sizeof(b.key_handle)));
+    b.sig_alg = QIHSE_SIG_ED25519;
+    b.public_key_len = (uint16_t)qihse_sig_alg_public_key_bytes(QIHSE_SIG_ED25519);
     assert(qihse_federation_node_enroll_request(store, op, &b));
     void* b_key = qihse_federation_node_key_load(b.key_handle);
     assert(b_key);
@@ -347,6 +355,251 @@ static void test_gossip(qihse_kv_store_t* store, qihse_user_t* op,
 
     printf("PASS gossip: sign/verify + tamper detection + replay window (AC8)\n");
     printf("PASS gossip accept: unknown/untrusted/forged/replay rejected (AC8)\n");
+}
+
+
+/* ── Signature algorithm agility and PQC (full-PQC requirement) ────────── */
+
+static void test_signature_agility(void) {
+    /* Every supported algorithm must round-trip through a node record and a
+     * signed statement, because a fleet mid-migration contains a mix. */
+    static const qihse_sig_alg_t algs[] = {
+        QIHSE_SIG_ED25519, QIHSE_SIG_ML_DSA_44,
+        QIHSE_SIG_ML_DSA_65, QIHSE_SIG_ML_DSA_87,
+    };
+    for (size_t i = 0; i < sizeof(algs) / sizeof(algs[0]); i++) {
+        const char* name = qihse_sig_alg_name(algs[i]);
+        assert(name && strcmp(name, "unknown") != 0);
+        qihse_sig_alg_t parsed;
+        assert(qihse_sig_alg_parse(name, &parsed));
+        assert(parsed == algs[i]);
+        /* Sizes must match FIPS 204 / RFC 8032 exactly. */
+        assert(qihse_sig_alg_public_key_bytes(algs[i]) > 0);
+        assert(qihse_sig_alg_signature_bytes(algs[i]) > 0);
+        assert(qihse_sig_alg_public_key_bytes(algs[i]) <= QIHSE_FEDERATION_PUBKEY_MAX_BYTES);
+        assert(qihse_sig_alg_signature_bytes(algs[i]) <= QIHSE_FEDERATION_SIG_MAX_BYTES);
+        /* Only Ed25519 is pre-quantum. */
+        assert(qihse_sig_alg_is_post_quantum(algs[i]) == (algs[i] != QIHSE_SIG_ED25519));
+    }
+    assert(qihse_sig_alg_public_key_bytes(QIHSE_SIG_ED25519) == 32u);
+    assert(qihse_sig_alg_signature_bytes(QIHSE_SIG_ED25519) == 64u);
+    assert(qihse_sig_alg_public_key_bytes(QIHSE_SIG_ML_DSA_87) == 2592u);
+    assert(qihse_sig_alg_signature_bytes(QIHSE_SIG_ML_DSA_87) == 4627u);
+
+    /* The default must be post-quantum. */
+    assert(qihse_sig_alg_is_post_quantum(QIHSE_SIG_ALG_DEFAULT));
+
+    printf("PASS signature agility: 4 algorithms, exact FIPS 204 sizes, PQ default\n");
+}
+
+static void test_pqc_node_identity(qihse_kv_store_t* store, qihse_user_t* op,
+                                   const char* key_dir) {
+    /* A node whose identity is ML-DSA-87 must enroll, approve and be read
+     * back with its algorithm and variable-length key intact. */
+    qihse_federation_node_identity_t id;
+    memset(&id, 0, sizeof(id));
+    assert(qihse_uuid_from_seed("f5-pqc-node", strlen("f5-pqc-node"), &id.node_id));
+    snprintf(id.hostname, sizeof(id.hostname), "pqc-node");
+    snprintf(id.boot_id, sizeof(id.boot_id), "pqc-boot");
+    id.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
+
+    assert(qihse_federation_node_keygen_alg(key_dir, QIHSE_SIG_ML_DSA_87, &id));
+    assert(id.sig_alg == QIHSE_SIG_ML_DSA_87);
+    assert(id.public_key_len == 2592u);
+
+    /* The key file is 0600 and holds no public material in the record. */
+    struct stat st;
+    assert(stat(id.key_handle, &st) == 0);
+    assert((st.st_mode & 0777) == 0600);
+
+    assert(qihse_federation_node_enroll_request(store, op, &id));
+    assert(qihse_federation_node_enroll_approve(store, op, &id.node_id, 5));
+
+    qihse_federation_node_identity_t got;
+    assert(qihse_federation_node_lookup(store, op, &id.node_id, &got));
+    assert(got.sig_alg == QIHSE_SIG_ML_DSA_87);
+    assert(got.public_key_len == 2592u);
+    assert(memcmp(got.public_key, id.public_key, 2592u) == 0);
+    assert(memcmp(got.fingerprint, id.fingerprint, 48u) == 0);
+    assert(got.trust == QIHSE_TRUST_APPROVED);
+
+    printf("PASS PQC node identity: ML-DSA-87 keygen + enroll + read-back\n");
+}
+
+static void test_pqc_signed_statement(qihse_kv_store_t* store, qihse_user_t* op,
+                                      const char* key_dir) {
+    qihse_uuid_t cluster_id, boot_id;
+    assert(qihse_uuid_from_seed("f5-pqc-cluster", strlen("f5-pqc-cluster"), &cluster_id));
+    assert(qihse_uuid_from_seed("f5-pqc-boot", strlen("f5-pqc-boot"), &boot_id));
+
+    qihse_federation_node_identity_t n;
+    memset(&n, 0, sizeof(n));
+    assert(qihse_uuid_from_seed("f5-pqc-signer", strlen("f5-pqc-signer"), &n.node_id));
+    snprintf(n.hostname, sizeof(n.hostname), "pqc-signer");
+    snprintf(n.boot_id, sizeof(n.boot_id), "pqc-signer-boot");
+    n.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
+    assert(qihse_federation_node_keygen_alg(key_dir, QIHSE_SIG_ML_DSA_65, &n));
+    assert(qihse_federation_node_enroll_request(store, op, &n));
+    assert(qihse_federation_node_enroll_approve(store, op, &n.node_id, 1));
+
+    void* pkey = qihse_federation_node_key_load(n.key_handle);
+    assert(pkey);
+
+    qihse_uuid_t session_id;
+    assert(qihse_uuid_generate(&session_id));
+
+    qihse_federation_gossip_t g;
+    memset(&g, 0, sizeof(g));
+    g.magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
+    g.version = QIHSE_FEDERATION_GOSSIP_VERSION;
+    g.cluster_id = cluster_id;
+    g.sender_node = n.node_id;
+    g.boot_id = boot_id;
+    g.session_id = session_id;
+    g.sequence = 1;
+    g.hlc.physical_ms = 1234;
+    g.capability_bitmap = 0x1F;
+    assert(qihse_federation_gossip_sign(pkey, &g));
+
+    /* The signer recorded its own algorithm and length; a caller cannot
+     * mislabel a key. */
+    assert(g.sig_alg == QIHSE_SIG_ML_DSA_65);
+    assert(g.signature_len == 3309u);
+    assert(qihse_federation_gossip_verify(n.public_key, n.public_key_len, &g));
+
+    /* Tampering with any signed field breaks verification. */
+    qihse_federation_gossip_t t = g;
+    t.session_id.bytes[0] ^= 0xFFu;
+    assert(!qihse_federation_gossip_verify(n.public_key, n.public_key_len, &t));
+
+    /* ALGORITHM DOWNGRADE: the algorithm and signature length are inside the
+     * signed region, so an attacker cannot relabel an ML-DSA signature as a
+     * shorter one and have it accepted. */
+    t = g;
+    t.sig_alg = QIHSE_SIG_ED25519;
+    t.signature_len = 64;
+    assert(!qihse_federation_gossip_verify(n.public_key, n.public_key_len, &t));
+
+    /* A truncated signature is refused before any crypto runs. */
+    t = g;
+    t.signature_len = 64;
+    assert(!qihse_federation_gossip_verify(n.public_key, n.public_key_len, &t));
+
+    /* The statement is accepted and recorded. */
+    assert(qihse_federation_gossip_accept(store, op, &g) == QIHSE_GOSSIP_ACCEPTED);
+
+    qihse_federation_gossip_t stored;
+    assert(qihse_federation_gossip_statement_read(store, op, &n.node_id, &boot_id, &stored));
+    assert(qihse_uuid_equal(&stored.session_id, &session_id));
+    assert(stored.sig_alg == QIHSE_SIG_ML_DSA_65);
+    assert(stored.signature_len == 3309u);
+
+    qihse_federation_node_key_free(pkey);
+    printf("PASS PQC signed statement: ML-DSA-65 sign/verify + downgrade rejected\n");
+}
+
+/* ── Two-tier gossip: cheap heartbeats gated on a signed session ───────── */
+
+static void test_heartbeat_tier(qihse_kv_store_t* store, qihse_user_t* op,
+                                const char* key_dir) {
+    qihse_uuid_t cluster_id, boot_id;
+    assert(qihse_uuid_from_seed("f5-hb-cluster", strlen("f5-hb-cluster"), &cluster_id));
+    assert(qihse_uuid_from_seed("f5-hb-boot", strlen("f5-hb-boot"), &boot_id));
+
+    qihse_federation_node_identity_t n;
+    memset(&n, 0, sizeof(n));
+    assert(qihse_uuid_from_seed("f5-hb-node", strlen("f5-hb-node"), &n.node_id));
+    snprintf(n.hostname, sizeof(n.hostname), "hb-node");
+    snprintf(n.boot_id, sizeof(n.boot_id), "hb-boot");
+    n.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
+    assert(qihse_federation_node_keygen_alg(key_dir, QIHSE_SIG_ML_DSA_44, &n));
+    assert(qihse_federation_node_enroll_request(store, op, &n));
+    assert(qihse_federation_node_enroll_approve(store, op, &n.node_id, 1));
+    void* pkey = qihse_federation_node_key_load(n.key_handle);
+    assert(pkey);
+
+    qihse_uuid_t session_id;
+    assert(qihse_uuid_generate(&session_id));
+
+    /* A heartbeat BEFORE any statement is refused: there is no session to
+     * match, so liveness cannot be claimed without signing. */
+    qihse_federation_heartbeat_t hb;
+    memset(&hb, 0, sizeof(hb));
+    hb.magic = QIHSE_FEDERATION_HEARTBEAT_MAGIC;
+    hb.version = QIHSE_FEDERATION_HEARTBEAT_VERSION;
+    hb.sender_node = n.node_id;
+    hb.boot_id = boot_id;
+    hb.session_id = session_id;
+    hb.sequence = 1;
+    assert(qihse_federation_heartbeat_accept(store, op, &hb) ==
+           QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER);
+
+    /* Serialize/deserialize round-trip is exactly 80 bytes. */
+    uint8_t wire[128];
+    size_t wire_len = 0;
+    assert(qihse_federation_heartbeat_serialize(&hb, wire, sizeof(wire), &wire_len));
+    assert(wire_len == 80u);
+    qihse_federation_heartbeat_t hb2;
+    assert(qihse_federation_heartbeat_deserialize(wire, wire_len, &hb2));
+    assert(qihse_uuid_equal(&hb2.session_id, &session_id));
+    assert(hb2.sequence == 1);
+    /* A truncated datagram is refused. */
+    assert(!qihse_federation_heartbeat_deserialize(wire, wire_len - 1u, &hb2));
+
+    /* Now the node signs a statement, minting the session. */
+    qihse_federation_gossip_t g;
+    memset(&g, 0, sizeof(g));
+    g.magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
+    g.version = QIHSE_FEDERATION_GOSSIP_VERSION;
+    g.cluster_id = cluster_id;
+    g.sender_node = n.node_id;
+    g.boot_id = boot_id;
+    g.session_id = session_id;
+    g.sequence = 1;
+    assert(qihse_federation_gossip_sign(pkey, &g));
+    assert(qihse_federation_gossip_accept(store, op, &g) == QIHSE_GOSSIP_ACCEPTED);
+
+    /* The heartbeat is now accepted, cheaply. */
+    assert(qihse_federation_heartbeat_accept(store, op, &hb) == QIHSE_GOSSIP_ACCEPTED);
+
+    /* Replay is refused. */
+    assert(qihse_federation_heartbeat_accept(store, op, &hb) == QIHSE_GOSSIP_REJECT_REPLAY);
+
+    /* A later heartbeat advances. */
+    qihse_federation_heartbeat_t hb3 = hb;
+    hb3.sequence = 2;
+    assert(qihse_federation_heartbeat_accept(store, op, &hb3) == QIHSE_GOSSIP_ACCEPTED);
+
+    /* A NEW statement starts a NEW session, which retires the old session's
+     * heartbeats: a stale session id is refused even at a higher sequence. */
+    qihse_uuid_t new_session;
+    assert(qihse_uuid_generate(&new_session));
+    qihse_federation_gossip_t g2 = g;
+    g2.session_id = new_session;
+    g2.sequence = 2;
+    assert(qihse_federation_gossip_sign(pkey, &g2));
+    assert(qihse_federation_gossip_accept(store, op, &g2) == QIHSE_GOSSIP_ACCEPTED);
+
+    qihse_federation_heartbeat_t stale = hb;
+    stale.sequence = 99;
+    assert(qihse_federation_heartbeat_accept(store, op, &stale) ==
+           QIHSE_GOSSIP_REJECT_REPLAY);
+
+    /* The new session's heartbeats are accepted. */
+    qihse_federation_heartbeat_t fresh = hb;
+    fresh.session_id = new_session;
+    fresh.sequence = 1;
+    assert(qihse_federation_heartbeat_accept(store, op, &fresh) == QIHSE_GOSSIP_ACCEPTED);
+
+    /* Revocation kills the cheap tier too. */
+    assert(qihse_federation_node_revoke(store, op, &n.node_id));
+    qihse_federation_heartbeat_t after = fresh;
+    after.sequence = 2;
+    assert(qihse_federation_heartbeat_accept(store, op, &after) ==
+           QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER);
+
+    qihse_federation_node_key_free(pkey);
+    printf("PASS heartbeat tier: no statement -> refused, session match -> accepted, replay + stale session refused\n");
 }
 
 /* ── RESP-level F5 ─────────────────────────────────────────────────────── */
@@ -592,8 +845,12 @@ int main(void) {
     test_scopes();
     test_service_identities();
     test_scope_check(op);
+    test_signature_agility();
     test_node_identity(store, op, key_dir);
+    test_pqc_node_identity(store, op, key_dir);
     test_gossip(store, op, key_dir);
+    test_pqc_signed_statement(store, op, key_dir);
+    test_heartbeat_tier(store, op, key_dir);
     test_resp_federation_f5(store, op, key_dir);
 
     qihse_kv_store_destroy(store);

@@ -96,6 +96,14 @@ The accepted major direction. Governing principle: **federation must enhance a n
   - [x] Fuzzing targets for wire and persisted parsers: 16 string parsers x 4000 hostile inputs, 11 persisted-record readers x 600 corrupt records, byte-flip mutation of a valid record, and numeric overflow probes. The fuzzer found two real fail-open bugs, both fixed: decoders accepted out-of-range enum values, and readers returned records whose embedded id disagreed with the key they were stored under.
   - [x] Architecture documentation set: 17 federation documents under `docs/architecture/`, indexed from `docs/README.md`, each stating plainly what is implemented and what is not (no replication transport, no mTLS binding, no consensus, no SDKs). The governing brief is filed at `docs/plans/qihse_federation_upgrade_plan_v3.md`.
 
+### Federation follow-ups (post-F8)
+
+- [x] **Post-quantum identity and signed gossip.** Signature algorithm agility across Ed25519 and ML-DSA-44/65/87 (FIPS 204), with the algorithm and key/signature lengths recorded in every identity and frame so a fleet mid-migration stays readable. ML-DSA-87 is the default; the algorithm and signature length sit *inside* the signed region, so an algorithm-downgrade edit invalidates the signature. Two-tier gossip: signed membership statements on an interval mint a session id, and cheap 80-byte heartbeats are accepted only while they match it, so liveness is not a weaker claim than membership.
+- [x] **Signed gossip wired into the live bus.** `QIHSE_BUS_MSG_FED_STATEMENT` and `QIHSE_BUS_MSG_FED_HEARTBEAT` are verified through the federation layer before any handler runs, and dropped outright when no federation context is configured. `qihse_bus_msg_carries_authority()` documents and enforces that bootstrap/liveness types (MEET, PING, SLOT_UPDATE, ...) may never carry authority. *Closes criterion 8's replay-resistance half on the path that actually carries traffic.*
+- [ ] **mTLS binding.** `SSL_CTX_set_verify` with `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`, a federation CA issuing ML-DSA certificates, and a three-layer check that keeps TLS key possession, enrolled fingerprint, and current runtime trust as separate questions. Hybrid key exchange (X25519MLKEM768) available in the toolchain.
+- [ ] **Replication transport.** The remaining functional gap: anti-entropy can compare and plan but nothing executes a plan.
+- [ ] **Backup writer.** Snapshot manifests are recorded and verified; the writer that produces the referenced data is not written.
+
 ### W2 — AI compute fabric
 
 Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitives rather than ad-hoc bus messaging.

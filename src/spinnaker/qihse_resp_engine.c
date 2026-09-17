@@ -6002,7 +6002,7 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++)
             snprintf(fp_hex + i * 2, 3, "%02x", node.fingerprint[i]);
         fp_hex[96] = '\0';
-        if (!qihse_resp_array(session, 8)) return false;
+        if (!qihse_resp_array(session, 10)) return false;
         if (!qihse_resp_bulk_text(session, node.hostname)) return false;
         if (!qihse_resp_bulk_text(session, qihse_trust_state_name(node.trust))) return false;
         if (!qihse_resp_bulk_text(session, qihse_service_identity_name(node.identity_kind))) return false;
@@ -6011,6 +6011,8 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (!qihse_resp_integer(session, (int64_t)node.capabilities)) return false;
         if (!qihse_resp_bulk_text(session, fp_hex)) return false;
         if (!qihse_resp_bulk_text(session, node.key_handle)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_sig_alg_name(node.sig_alg))) return false;
+        if (!qihse_resp_integer(session, (int64_t)node.public_key_len)) return false;
         return true;
     }
 
@@ -6039,11 +6041,11 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (bl == 0 || bl >= sizeof(id.boot_id)) return qihse_resp_error(session, "ERR invalid boot id");
         memcpy(id.boot_id, request->argv[4].data, bl); id.boot_id[bl] = '\0';
         id.identity_kind = kind;
-        /* Generate the identity keypair.  The private key is written to the
-         * configured directory and never enters a QIHSE record. */
-        if (!qihse_federation_node_keygen(session->server->federation_key_directory,
-                                         &id.node_id, id.public_key,
-                                         id.key_handle, sizeof(id.key_handle))) {
+        /* Generate the identity keypair with the post-quantum default.  The
+         * private key is written to the configured directory and never enters
+         * a QIHSE record. */
+        if (!qihse_federation_node_keygen_alg(session->server->federation_key_directory,
+                                             QIHSE_SIG_ALG_DEFAULT, &id)) {
             return qihse_resp_error(session, "ERR node keygen failed");
         }
         if (!qihse_federation_node_enroll_request(session->server->store, session->user, &id)) {

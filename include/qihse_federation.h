@@ -702,8 +702,36 @@ typedef enum {
 const char* qihse_trust_state_name(qihse_trust_state_t state);
 bool qihse_trust_state_parse(const char* name, qihse_trust_state_t* out);
 
-#define QIHSE_FEDERATION_NODE_PUBKEY_BYTES 32u  /* Ed25519 raw public key */
-#define QIHSE_FEDERATION_NODE_SIG_BYTES    64u  /* Ed25519 signature */
+/* ── Signature algorithms ──────────────────────────────────────────────────
+ *
+ * Algorithm agility is a hard requirement, not a nicety: a node record or
+ * frame written under one algorithm must stay readable after the fleet moves
+ * to another.  Every persisted identity and every signed frame therefore
+ * carries its algorithm, and the key/signature fields are length-tagged.
+ *
+ * ML-DSA is FIPS 204.  Ed25519 is retained so pre-quantum records remain
+ * readable and so a bootstrap path exists, but it is not the default.
+ */
+typedef enum {
+    QIHSE_SIG_ED25519 = 0,      /* legacy / bootstrap only */
+    QIHSE_SIG_ML_DSA_44 = 1,    /* NIST level 2 */
+    QIHSE_SIG_ML_DSA_65 = 2,    /* NIST level 3 */
+    QIHSE_SIG_ML_DSA_87 = 3     /* NIST level 5, CNSA 2.0 */
+} qihse_sig_alg_t;
+
+/* The default for new node identities and signed membership statements. */
+#define QIHSE_SIG_ALG_DEFAULT QIHSE_SIG_ML_DSA_87
+
+const char* qihse_sig_alg_name(qihse_sig_alg_t alg);
+bool qihse_sig_alg_parse(const char* name, qihse_sig_alg_t* out);
+size_t qihse_sig_alg_public_key_bytes(qihse_sig_alg_t alg);
+size_t qihse_sig_alg_signature_bytes(qihse_sig_alg_t alg);
+bool qihse_sig_alg_is_post_quantum(qihse_sig_alg_t alg);
+
+/* Upper bounds across all supported algorithms, so records can be sized
+ * without a heap allocation.  Values are the ML-DSA-87 figures. */
+#define QIHSE_FEDERATION_PUBKEY_MAX_BYTES 2592u
+#define QIHSE_FEDERATION_SIG_MAX_BYTES    4627u
 #define QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES 48u /* SHA-384 */
 
 typedef struct {
@@ -711,7 +739,9 @@ typedef struct {
     char hostname[128];         /* mutable attribute — display only */
     char boot_id[64];           /* boot/session identifier, changes per boot */
     char key_handle[160];       /* filesystem reference to the private key */
-    uint8_t public_key[QIHSE_FEDERATION_NODE_PUBKEY_BYTES];
+    qihse_sig_alg_t sig_alg;    /* which algorithm public_key belongs to */
+    uint16_t public_key_len;
+    uint8_t public_key[QIHSE_FEDERATION_PUBKEY_MAX_BYTES];
     uint8_t fingerprint[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
     qihse_trust_state_t trust;
     uint64_t enrollment_epoch;
@@ -732,8 +762,16 @@ bool qihse_federation_node_keygen(const char* key_directory,
                                   uint8_t* out_public_key,
                                   char* out_key_handle, size_t out_key_handle_cap);
 
-/* Compute the SHA-384 fingerprint of a raw public key. */
+/* Algorithm-agile key generation.  Fills sig_alg, public_key,
+ * public_key_len, key_handle and fingerprint.  node_id and hostname must be
+ * set by the caller first. */
+bool qihse_federation_node_keygen_alg(const char* key_directory,
+                                      qihse_sig_alg_t alg,
+                                      qihse_federation_node_identity_t* out);
+
+/* Compute the SHA-384 fingerprint of a raw public key of the given length. */
 bool qihse_federation_node_fingerprint(const uint8_t* public_key,
+                                       size_t public_key_len,
                                        uint8_t* out_fingerprint);
 
 /* Load a node private key from a handle.  Returns an opaque EVP_PKEY* which
@@ -760,10 +798,42 @@ typedef bool (*qihse_federation_node_cb)(const qihse_federation_node_identity_t*
 void qihse_federation_node_foreach(void* store_void, void* user_void,
                                    qihse_federation_node_cb cb, void* user_data);
 
-/* ── Signed gossip / membership plane (plan §17) ────────────────────────── */
+typedef enum {
+    QIHSE_GOSSIP_ACCEPTED = 0,
+    QIHSE_GOSSIP_REJECT_MALFORMED,
+    QIHSE_GOSSIP_REJECT_VERSION,
+    QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER,
+    QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER,
+    QIHSE_GOSSIP_REJECT_BAD_SIGNATURE,
+    QIHSE_GOSSIP_REJECT_REPLAY
+} qihse_gossip_result_t;
+
+const char* qihse_gossip_result_name(qihse_gossip_result_t result);
+
+/* ── Signed gossip: membership statements and heartbeats (plan §17) ───────
+ *
+ * Two tiers, because they have different costs and different authority:
+ *
+ *   MEMBERSHIP STATEMENT  signed, interval-based or on change.  This is what
+ *                         carries authority: it names the node, its boot
+ *                         session, its capabilities and health, and it mints
+ *                         the session id that authenticates the cheap tier.
+ *
+ *   HEARTBEAT             unsigned, frequent, small.  Carries liveness only,
+ *                         and is accepted ONLY while it matches the session
+ *                         id from a valid statement.  A heartbeat therefore
+ *                         cannot be forged without forging a statement, so
+ *                         liveness is not a weaker claim than membership.
+ *
+ * Signing on an interval rather than per packet is what makes ML-DSA
+ * affordable here: the signature cost is amortised over the interval, and a
+ * lost statement is simply replaced by the next one.
+ */
 
 #define QIHSE_FEDERATION_GOSSIP_MAGIC 0x51484753u /* "QHGS" */
-#define QIHSE_FEDERATION_GOSSIP_VERSION 1u
+#define QIHSE_FEDERATION_GOSSIP_VERSION 2u        /* v2 adds session + algorithm */
+#define QIHSE_FEDERATION_HEARTBEAT_MAGIC 0x51484842u /* "QHHB" */
+#define QIHSE_FEDERATION_HEARTBEAT_VERSION 1u
 
 typedef struct {
     uint32_t magic;
@@ -772,11 +842,16 @@ typedef struct {
     qihse_uuid_t cluster_id;   /* cluster/federation UUID */
     qihse_uuid_t sender_node;  /* sender node UUID, not topology index */
     qihse_uuid_t boot_id;      /* boot/session UUID */
+    /* Mints the session id that the cheap heartbeat tier must match.  A new
+     * statement starts a new session, which retires every old heartbeat. */
+    qihse_uuid_t session_id;
     uint64_t sequence;         /* monotonic per boot */
     qihse_hlc_t hlc;
     uint32_t capability_bitmap;
     uint32_t health_summary;
-    uint8_t signature[QIHSE_FEDERATION_NODE_SIG_BYTES];
+    qihse_sig_alg_t sig_alg;
+    uint16_t signature_len;
+    uint8_t signature[QIHSE_FEDERATION_SIG_MAX_BYTES];
 } qihse_federation_gossip_t;
 
 /* The bytes covered by the signature: every field except the signature
@@ -785,12 +860,54 @@ typedef struct {
 bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
                                        uint8_t* out, size_t out_cap, size_t* out_len);
 
-/* Sign a gossip frame in place. pkey is an EVP_PKEY* from node_key_load(). */
+/* Wire form of a statement: the signed region followed by the raw signature.
+ * Deserialization validates the magic, version, algorithm and length fields
+ * before returning, so a malformed frame never reaches the verifier. */
+bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
+                                         qihse_federation_gossip_t* out);
+/* Total wire size of a statement for the given algorithm. */
+size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg);
+
+/* Sign a statement in place. pkey is an EVP_PKEY* from node_key_load(). */
 bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip);
 
-/* Verify a gossip frame's signature against a raw Ed25519 public key. */
-bool qihse_federation_gossip_verify(const uint8_t* public_key,
+/* Verify a statement's signature against a raw public key of the algorithm
+ * named in the statement itself. */
+bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len,
                                     const qihse_federation_gossip_t* gossip);
+
+/* ── Cheap heartbeat tier ──────────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    qihse_uuid_t session_id;   /* must match the current signed statement */
+    uint64_t sequence;         /* monotonic within the session */
+    qihse_hlc_t hlc;
+    uint32_t health_summary;
+} qihse_federation_heartbeat_t;
+
+bool qihse_federation_heartbeat_serialize(const qihse_federation_heartbeat_t* hb,
+                                          uint8_t* out, size_t out_cap, size_t* out_len);
+bool qihse_federation_heartbeat_deserialize(const uint8_t* in, size_t in_len,
+                                            qihse_federation_heartbeat_t* out);
+
+/* Accept a heartbeat.  Succeeds only when a valid signed statement for the
+ * same (sender, boot) is on record, the session ids match, and the heartbeat
+ * sequence advances.  A heartbeat from a node that has never signed, or that
+ * carries a retired session id, is refused. */
+qihse_gossip_result_t qihse_federation_heartbeat_accept(void* store_void, void* user_void,
+                                                       const qihse_federation_heartbeat_t* hb);
+
+/* Read the recorded statement for a (sender, boot).  Returns false if the
+ * node has not signed. */
+bool qihse_federation_gossip_statement_read(void* store_void, void* user_void,
+                                            const qihse_uuid_t* sender_node,
+                                            const qihse_uuid_t* boot_id,
+                                            qihse_federation_gossip_t* out);
 
 /* Replay-window state, one per (sender node, boot). */
 typedef struct {
@@ -810,17 +927,6 @@ typedef struct {
  * Replay state persists under "fedreplay:<node>:<boot>" so a restart does
  * not reopen the window.  Every call takes an explicit authenticated user
  * (AGENTS.md invariant 1). */
-typedef enum {
-    QIHSE_GOSSIP_ACCEPTED = 0,
-    QIHSE_GOSSIP_REJECT_MALFORMED,
-    QIHSE_GOSSIP_REJECT_VERSION,
-    QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER,
-    QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER,
-    QIHSE_GOSSIP_REJECT_BAD_SIGNATURE,
-    QIHSE_GOSSIP_REJECT_REPLAY
-} qihse_gossip_result_t;
-
-const char* qihse_gossip_result_name(qihse_gossip_result_t result);
 
 qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* user_void,
                                                     const qihse_federation_gossip_t* gossip);

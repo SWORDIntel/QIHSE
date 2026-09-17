@@ -2,6 +2,7 @@
 #define QIHSE_CLUSTER_BUS_H
 
 #include <stdbool.h>
+#include "qihse_federation.h"
 #include <stddef.h>
 #include <stdint.h>
 #include "qihse_cluster_slot.h"
@@ -36,7 +37,11 @@ extern "C" {
 
 #define QIHSE_CLUSTER_BUS_MAGIC 0x51424E53u
 #define QIHSE_CLUSTER_BUS_DEFAULT_PORT 16379u
-#define QIHSE_CLUSTER_BUS_MAX_PAYLOAD 4096u
+/* Sized so a full ML-DSA-87 membership statement (120-byte signed region +
+ * 4627-byte signature) fits in one datagram.  Statements are interval-based
+ * and idempotent, so the fragmentation this implies on a lossy path costs
+ * liveness at worst and never correctness. */
+#define QIHSE_CLUSTER_BUS_MAX_PAYLOAD 8192u
 #define QIHSE_CLUSTER_BUS_HEADER_SIZE 16u
 #define QIHSE_CLUSTER_BUS_HEARTBEAT_MS 1000u
 #define QIHSE_CLUSTER_BUS_TIMEOUT_MS 5000u
@@ -51,7 +56,17 @@ typedef enum {
     QIHSE_BUS_MSG_NODE_OBS    = 7u,  /* third-party health observation */
     QIHSE_BUS_MSG_NODE_CAP    = 8u,  /* node capability profile (ISA/NPU/GPU) */
     QIHSE_BUS_MSG_GROUP_UPDATE = 9u, /* group update push (operator -> members) */
-    QIHSE_BUS_MSG_GROUP_ACK    = 10u /* member applied/rejected a group update */
+    QIHSE_BUS_MSG_GROUP_ACK    = 10u, /* member applied/rejected a group update */
+    /* Federation trust plane.  These two carry post-quantum signed membership
+     * statements and cheap session-bound heartbeats.  They are VERIFIED
+     * through the federation layer before any handler runs, and they are
+     * DROPPED — not trusted — when no federation trust context is configured.
+     *
+     * Everything else on this bus (PING/PONG/MEET/SLOT_UPDATE/...) is a
+     * bootstrap or liveness frame and must never carry authority.  See
+     * qihse_bus_msg_carries_authority(). */
+    QIHSE_BUS_MSG_FED_STATEMENT = 11u,
+    QIHSE_BUS_MSG_FED_HEARTBEAT = 12u
 } qihse_cluster_bus_msg_type_t;
 
 /*
@@ -128,7 +143,31 @@ typedef struct {
     void (*on_group_ack)(qihse_cluster_bus_t* bus, uint64_t update_id,
                          uint16_t sender_index, uint16_t status, void* user_data);
     void* on_group_ack_user_data;
+    /* Federation trust context.  When set, FED_STATEMENT and FED_HEARTBEAT
+     * datagrams are verified through the federation layer (signature against
+     * the enrolled node key, trust state, replay window) before
+     * on_federation runs.  When NULL, those message types are dropped
+     * outright: an unverified membership claim is never acted on. */
+    void* federation_store;      /* qihse_kv_store_t* */
+    void* federation_user;       /* qihse_user_t* */
+    /* Fires only for a frame that passed verification.  Runs on the bus
+     * thread: keep it short. */
+    void (*on_federation)(qihse_cluster_bus_t* bus,
+                          const qihse_uuid_t* sender_node,
+                          const qihse_uuid_t* boot_id,
+                          uint32_t health_summary,
+                          bool is_heartbeat,
+                          void* user_data);
+    void* on_federation_user_data;
 } qihse_cluster_bus_config_t;
+
+/* True when a bus message type is allowed to carry federation authority.
+ *
+ * The bootstrap and liveness types are deliberately excluded: a node cannot
+ * verify a peer it has not enrolled yet, so MEET and PING must remain usable
+ * during bootstrap, but that also means they must never be the basis for an
+ * authority decision such as a slot ownership change. */
+bool qihse_bus_msg_carries_authority(uint32_t message_type);
 
 /* Push a group update to every peer (members apply it, non-members ignore it —
  * membership is enforced by the consumer, not the transport). Returns false
@@ -136,6 +175,18 @@ typedef struct {
 bool qihse_cluster_bus_broadcast_group_update(qihse_cluster_bus_t* bus, uint64_t update_id,
                                               const char* group, const uint8_t* payload,
                                               size_t payload_len);
+
+/* Broadcast a post-quantum signed membership statement to every peer.  The
+ * statement must already be signed (qihse_federation_gossip_sign); this only
+ * serializes and sends it.  Returns false if it cannot be built or sent. */
+bool qihse_cluster_bus_broadcast_federation_statement(qihse_cluster_bus_t* bus,
+                                                     const qihse_federation_gossip_t* stmt);
+
+/* Broadcast a cheap session-bound heartbeat.  Carries no authority of its own:
+ * a receiver accepts it only while it matches the session minted by a valid
+ * statement. */
+bool qihse_cluster_bus_broadcast_federation_heartbeat(qihse_cluster_bus_t* bus,
+                                                     const qihse_federation_heartbeat_t* hb);
 
 /* Report that this node applied (status 0) or rejected a group update. */
 bool qihse_cluster_bus_broadcast_group_ack(qihse_cluster_bus_t* bus, uint64_t update_id,

@@ -1,4 +1,5 @@
 #include "qihse_cluster_bus.h"
+#include "qihse_federation.h"
 #include "qihse_platform.h"
 #include <errno.h>
 #include <stdio.h>
@@ -53,6 +54,16 @@ struct qihse_cluster_bus {
     void (*on_group_ack)(qihse_cluster_bus_t* bus, uint64_t update_id, uint16_t sender_index,
                          uint16_t status, void* user_data);
     void* on_group_ack_user_data;
+    /* Federation trust context (see qihse_cluster_bus_config_t). */
+    void* federation_store;
+    void* federation_user;
+    void (*on_federation)(qihse_cluster_bus_t* bus,
+                          const qihse_uuid_t* sender_node,
+                          const qihse_uuid_t* boot_id,
+                          uint32_t health_summary,
+                          bool is_heartbeat,
+                          void* user_data);
+    void* on_federation_user_data;
     int sock_fd;
     bool running;
     pthread_t thread;
@@ -643,6 +654,49 @@ bool qihse_cluster_bus_node_caps(const qihse_cluster_bus_t* bus, uint16_t node_i
     return true;
 }
 
+/* ── Federation trust plane over the bus ────────────────────────────────
+ *
+ * These two handlers are the only place on this bus where a datagram's
+ * content is verified rather than its source.  A frame that fails
+ * verification is dropped and the callback is never invoked, so a forged
+ * datagram cannot reach any consumer.
+ *
+ * When no federation context is configured the types are dropped rather
+ * than trusted, which is the fail-closed default.
+ */
+static void qihse_bus_handle_fed_statement(qihse_cluster_bus_t* bus,
+                                           const uint8_t* payload, size_t payload_len) {
+    if (!bus->federation_store || !bus->federation_user) return;
+    qihse_federation_gossip_t stmt;
+    if (!qihse_federation_gossip_deserialize(payload, payload_len, &stmt)) return;
+    /* Acceptance re-checks the enrolled key, the trust state, the signature
+     * and the replay window.  A frame that fails never reaches a consumer. */
+    if (qihse_federation_gossip_accept(bus->federation_store, bus->federation_user,
+                                       &stmt) != QIHSE_GOSSIP_ACCEPTED) {
+        return;
+    }
+    if (bus->on_federation) {
+        bus->on_federation(bus, &stmt.sender_node, &stmt.boot_id,
+                           stmt.health_summary, false, bus->on_federation_user_data);
+    }
+}
+
+static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
+                                           const uint8_t* payload, size_t payload_len) {
+    if (!bus->federation_store || !bus->federation_user) return;
+    qihse_federation_heartbeat_t hb;
+    if (!qihse_federation_heartbeat_deserialize(payload, payload_len, &hb)) return;
+    /* Verification decides whether the callback runs at all. */
+    if (qihse_federation_heartbeat_accept(bus->federation_store, bus->federation_user,
+                                         &hb) != QIHSE_GOSSIP_ACCEPTED) {
+        return;
+    }
+    if (bus->on_federation) {
+        bus->on_federation(bus, &hb.sender_node, &hb.boot_id,
+                           hb.health_summary, true, bus->on_federation_user_data);
+    }
+}
+
 static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
                                        const uint8_t* data, size_t len) {
     uint8_t plain[QIHSE_BUS_MAX_DATAGRAM];
@@ -670,8 +724,45 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         case QIHSE_BUS_MSG_NODE_CAP:    qihse_bus_handle_node_cap(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_GROUP_UPDATE: qihse_bus_handle_group_update(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_GROUP_ACK:    qihse_bus_handle_group_ack(bus, sender, payload, payload_len); break;
+        case QIHSE_BUS_MSG_FED_STATEMENT: qihse_bus_handle_fed_statement(bus, payload, payload_len); break;
+        case QIHSE_BUS_MSG_FED_HEARTBEAT: qihse_bus_handle_fed_heartbeat(bus, payload, payload_len); break;
         default: break;
     }
+}
+
+bool qihse_bus_msg_carries_authority(uint32_t message_type) {
+    switch ((qihse_cluster_bus_msg_type_t)message_type) {
+        /* Verified, post-quantum signed: may carry authority. */
+        case QIHSE_BUS_MSG_FED_STATEMENT:
+        case QIHSE_BUS_MSG_FED_HEARTBEAT:
+            return true;
+        /* Bootstrap and liveness only.  MEET and PING must work before a peer
+         * is enrolled, which is exactly why they must not confer authority. */
+        default:
+            return false;
+    }
+}
+
+bool qihse_cluster_bus_broadcast_federation_statement(qihse_cluster_bus_t* bus,
+                                                     const qihse_federation_gossip_t* stmt) {
+    if (!bus || !stmt) return false;
+    size_t wire = qihse_federation_gossip_wire_size(stmt->sig_alg);
+    if (wire == 0 || wire > QIHSE_CLUSTER_BUS_MAX_PAYLOAD) return false;
+    uint8_t frame[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
+    size_t signed_len = 0;
+    if (!qihse_federation_gossip_serialize(stmt, frame, sizeof(frame), &signed_len)) return false;
+    if (signed_len + stmt->signature_len != wire) return false;
+    memcpy(frame + signed_len, stmt->signature, stmt->signature_len);
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_FED_STATEMENT, frame, wire);
+}
+
+bool qihse_cluster_bus_broadcast_federation_heartbeat(qihse_cluster_bus_t* bus,
+                                                     const qihse_federation_heartbeat_t* hb) {
+    if (!bus || !hb) return false;
+    uint8_t frame[128];
+    size_t len = 0;
+    if (!qihse_federation_heartbeat_serialize(hb, frame, sizeof(frame), &len)) return false;
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_FED_HEARTBEAT, frame, len);
 }
 
 /* ---- Local capability probes for NODE_CAP emission ---------------------- */
@@ -829,6 +920,10 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_group_update_user_data = config->on_group_update_user_data;
     bus->on_group_ack = config->on_group_ack;
     bus->on_group_ack_user_data = config->on_group_ack_user_data;
+    bus->federation_store = config->federation_store;
+    bus->federation_user = config->federation_user;
+    bus->on_federation = config->on_federation;
+    bus->on_federation_user_data = config->on_federation_user_data;
     bus->sock_fd = -1;
     bus->running = false;
     if (config->bind_address) {

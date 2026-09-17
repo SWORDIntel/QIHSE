@@ -883,6 +883,19 @@ static void conflict_kv_key(const qihse_uuid_t* conflict_id, char* out, size_t c
  *   remote_value_len \t remote_value_hex \t
  *   reason \t resolved_by_16B_hex \t resolved_at_hlc_physical
  * We use a binary-safe encoding: values are hex-encoded. */
+/* Split a tab-separated record, preserving empty fields.  sscanf's "%[^\t]"
+ * cannot match an empty field, and supply-chain and identity records have
+ * optional columns. */
+static const char* fed_next_field(const char* p, char* out, size_t cap) {
+    if (!p) { if (cap) out[0] = '\0'; return NULL; }
+    const char* start = p;
+    while (*p && *p != '\t') p++;
+    size_t len = (size_t)(p - start);
+    if (len >= cap) len = cap - 1u;
+    if (cap) { memcpy(out, start, len); out[len] = '\0'; }
+    return (*p == '\t') ? p + 1 : NULL;
+}
+
 static void uuid_hex(const qihse_uuid_t* u, char* out) {
     const uint8_t* b = (const uint8_t*)u;
     for (int i = 0; i < 16; i++) snprintf(out + i * 2, 3, "%02x", b[i]);
@@ -2008,27 +2021,93 @@ bool qihse_trust_state_parse(const char* name, qihse_trust_state_t* out) {
     return false;
 }
 
+/* ── Signature algorithms ──────────────────────────────────────────────── */
+
+typedef struct {
+    qihse_sig_alg_t alg;
+    const char* name;
+    const char* ossl_name;   /* name OpenSSL knows this key type by */
+    size_t pk_bytes;
+    size_t sig_bytes;
+    bool post_quantum;
+} sig_alg_entry_t;
+
+static const sig_alg_entry_t g_sig_algs[] = {
+    { QIHSE_SIG_ED25519,   "ed25519",   "ED25519",   32u,    64u,   false },
+    { QIHSE_SIG_ML_DSA_44, "ml-dsa-44", "ML-DSA-44", 1312u,  2420u, true  },
+    { QIHSE_SIG_ML_DSA_65, "ml-dsa-65", "ML-DSA-65", 1952u,  3309u, true  },
+    { QIHSE_SIG_ML_DSA_87, "ml-dsa-87", "ML-DSA-87", 2592u,  4627u, true  },
+};
+
+static const sig_alg_entry_t* sig_alg_lookup(qihse_sig_alg_t alg) {
+    for (size_t i = 0; i < sizeof(g_sig_algs) / sizeof(g_sig_algs[0]); i++) {
+        if (g_sig_algs[i].alg == alg) return &g_sig_algs[i];
+    }
+    return NULL;
+}
+
+const char* qihse_sig_alg_name(qihse_sig_alg_t alg) {
+    const sig_alg_entry_t* e = sig_alg_lookup(alg);
+    return e ? e->name : "unknown";
+}
+
+bool qihse_sig_alg_parse(const char* name, qihse_sig_alg_t* out) {
+    if (!name || !out) return false;
+    for (size_t i = 0; i < sizeof(g_sig_algs) / sizeof(g_sig_algs[0]); i++) {
+        if (strcasecmp(g_sig_algs[i].name, name) == 0) {
+            *out = g_sig_algs[i].alg;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t qihse_sig_alg_public_key_bytes(qihse_sig_alg_t alg) {
+    const sig_alg_entry_t* e = sig_alg_lookup(alg);
+    return e ? e->pk_bytes : 0u;
+}
+
+size_t qihse_sig_alg_signature_bytes(qihse_sig_alg_t alg) {
+    const sig_alg_entry_t* e = sig_alg_lookup(alg);
+    return e ? e->sig_bytes : 0u;
+}
+
+bool qihse_sig_alg_is_post_quantum(qihse_sig_alg_t alg) {
+    const sig_alg_entry_t* e = sig_alg_lookup(alg);
+    return e ? e->post_quantum : false;
+}
+
 bool qihse_federation_node_fingerprint(const uint8_t* public_key,
+                                       size_t public_key_len,
                                        uint8_t* out_fingerprint) {
-    if (!public_key || !out_fingerprint) return false;
+    if (!public_key || public_key_len == 0 || !out_fingerprint) return false;
     unsigned int len = 0;
-    if (!EVP_Digest(public_key, QIHSE_FEDERATION_NODE_PUBKEY_BYTES,
+    if (!EVP_Digest(public_key, public_key_len,
                     out_fingerprint, &len, EVP_sha384(), NULL)) return false;
     return len == QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES;
 }
 
-bool qihse_federation_node_keygen(const char* key_directory,
-                                  const qihse_uuid_t* node_id,
-                                  uint8_t* out_public_key,
-                                  char* out_key_handle, size_t out_key_handle_cap) {
-    if (!key_directory || !node_id || !out_public_key || !out_key_handle) return false;
+/* Shared keypair generation for one algorithm.  Writes the private key
+ * PEM-encoded at 0600 and returns the raw public key. */
+static bool node_keygen_for_alg(const char* key_directory,
+                                const qihse_uuid_t* node_id,
+                                qihse_sig_alg_t alg,
+                                uint8_t* out_public_key, size_t* out_public_key_len,
+                                char* out_key_handle, size_t out_key_handle_cap) {
+    const sig_alg_entry_t* entry = sig_alg_lookup(alg);
+    if (!entry) return false;
 
-    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
+    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(NULL, NULL, entry->ossl_name);
     if (!pkey) return false;
 
-    size_t pub_len = QIHSE_FEDERATION_NODE_PUBKEY_BYTES;
+    size_t pub_len = 0;
+    if (EVP_PKEY_get_raw_public_key(pkey, NULL, &pub_len) != 1 ||
+        pub_len != entry->pk_bytes) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
     if (EVP_PKEY_get_raw_public_key(pkey, out_public_key, &pub_len) != 1 ||
-        pub_len != QIHSE_FEDERATION_NODE_PUBKEY_BYTES) {
+        pub_len != entry->pk_bytes) {
         EVP_PKEY_free(pkey);
         return false;
     }
@@ -2038,8 +2117,6 @@ bool qihse_federation_node_keygen(const char* key_directory,
     int n = snprintf(out_key_handle, out_key_handle_cap, "%s/%s.key", key_directory, id_str);
     if (n <= 0 || (size_t)n >= out_key_handle_cap) { EVP_PKEY_free(pkey); return false; }
 
-    /* Write the private key PEM-encoded with 0600 permissions.  The private
-     * key never enters a QIHSE record (plan §20). */
     FILE* f = fopen(out_key_handle, "wb");
     if (!f) { EVP_PKEY_free(pkey); return false; }
     int ok = PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL);
@@ -2053,7 +2130,35 @@ bool qihse_federation_node_keygen(const char* key_directory,
     (void)chmod(out_key_handle, 0600);
 #endif
     EVP_PKEY_free(pkey);
+    if (out_public_key_len) *out_public_key_len = entry->pk_bytes;
     return true;
+}
+
+/* Legacy entry point: Ed25519, for bootstrap and pre-quantum compatibility. */
+bool qihse_federation_node_keygen(const char* key_directory,
+                                  const qihse_uuid_t* node_id,
+                                  uint8_t* out_public_key,
+                                  char* out_key_handle, size_t out_key_handle_cap) {
+    if (!key_directory || !node_id || !out_public_key || !out_key_handle) return false;
+    return node_keygen_for_alg(key_directory, node_id, QIHSE_SIG_ED25519,
+                               out_public_key, NULL, out_key_handle, out_key_handle_cap);
+}
+
+bool qihse_federation_node_keygen_alg(const char* key_directory,
+                                      qihse_sig_alg_t alg,
+                                      qihse_federation_node_identity_t* out) {
+    if (!key_directory || !out) return false;
+    if (!sig_alg_lookup(alg)) return false;
+
+    size_t pk_len = 0;
+    if (!node_keygen_for_alg(key_directory, &out->node_id, alg,
+                             out->public_key, &pk_len,
+                             out->key_handle, sizeof(out->key_handle))) {
+        return false;
+    }
+    out->sig_alg = alg;
+    out->public_key_len = (uint16_t)pk_len;
+    return qihse_federation_node_fingerprint(out->public_key, pk_len, out->fingerprint);
 }
 
 void* qihse_federation_node_key_load(const char* key_handle) {
@@ -2070,56 +2175,100 @@ void qihse_federation_node_key_free(void* pkey) {
 }
 
 /* Node record wire format (tab-separated, binary fields hex-encoded). */
+/* Hex-encode a byte string into a caller buffer (2 chars per byte + NUL). */
+static void bytes_to_hex(const uint8_t* in, size_t len, char* out) {
+    for (size_t i = 0; i < len; i++) snprintf(out + i * 2, 3, "%02x", in[i]);
+    out[len * 2] = '\0';
+}
+
+static bool hex_to_bytes(const char* hex, uint8_t* out, size_t max_len, size_t* out_len) {
+    size_t hlen = hex ? strlen(hex) : 0;
+    if (hlen == 0 || (hlen % 2u) != 0) return false;
+    size_t n = hlen / 2u;
+    if (n > max_len) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return false;
+        out[i] = (uint8_t)byte;
+    }
+    if (out_len) *out_len = n;
+    return true;
+}
+
+/* Node record wire format.  The signature algorithm and the public key length
+ * are recorded so a record written under one algorithm stays readable after
+ * the fleet moves to another. */
 static void node_encode(const qihse_federation_node_identity_t* n, char* out, size_t cap) {
-    char nid[33], pub_hex[65], fp_hex[97];
+    char nid[33], fp_hex[97];
     uuid_hex(&n->node_id, nid);
-    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_PUBKEY_BYTES; i++)
-        snprintf(pub_hex + i * 2, 3, "%02x", n->public_key[i]);
-    pub_hex[64] = '\0';
-    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++)
-        snprintf(fp_hex + i * 2, 3, "%02x", n->fingerprint[i]);
-    fp_hex[96] = '\0';
-    snprintf(out, cap, "%s\t%s\t%s\t%s\t%s\t%s\t%u\t%llu\t%u\t%u\t%u\t%llu",
-             nid, n->hostname, n->boot_id, n->key_handle, pub_hex, fp_hex,
+    /* Public keys reach 2592 bytes, so hex needs 5185 characters; build it in
+     * a heap buffer rather than a large stack frame. */
+    size_t pk_hex_len = (size_t)n->public_key_len * 2u + 1u;
+    char* pub_hex = (char*)malloc(pk_hex_len);
+    if (!pub_hex) return;
+    bytes_to_hex(n->public_key, n->public_key_len, pub_hex);
+    bytes_to_hex(n->fingerprint, QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES, fp_hex);
+    snprintf(out, cap, "%s\t%s\t%s\t%s\t%u\t%u\t%s\t%s\t%u\t%llu\t%u\t%u\t%u\t%llu",
+             nid, n->hostname, n->boot_id, n->key_handle,
+             (unsigned)n->sig_alg, (unsigned)n->public_key_len,
+             pub_hex, fp_hex,
              (unsigned)n->trust, (unsigned long long)n->enrollment_epoch,
              (unsigned)n->identity_kind, (unsigned)n->scopes,
              (unsigned)n->capabilities,
              (unsigned long long)n->last_hlc_physical);
+    free(pub_hex);
 }
 
 static bool node_decode(const char* blob, qihse_federation_node_identity_t* out) {
     if (!blob || !out) return false;
     memset(out, 0, sizeof(*out));
-    char nid[33], pub_hex[65], fp_hex[97];
-    char hostname[128], boot_id[64], key_handle[160];
-    unsigned trust = 0, kind = 0, scopes = 0, caps = 0;
-    unsigned long long epoch = 0, last_hlc = 0;
-    int n = sscanf(blob, "%32[^\t]\t%127[^\t]\t%63[^\t]\t%159[^\t]\t%64[^\t]\t%96[^\t]\t%u\t%llu\t%u\t%u\t%u\t%llu",
-                   nid, hostname, boot_id, key_handle, pub_hex, fp_hex,
-                   &trust, &epoch, &kind, &scopes, &caps, &last_hlc);
-    if (n < 12) return false;
-    uuid_from_hex(nid, &out->node_id);
-    snprintf(out->hostname, sizeof(out->hostname), "%s", hostname);
-    snprintf(out->boot_id, sizeof(out->boot_id), "%s", boot_id);
-    snprintf(out->key_handle, sizeof(out->key_handle), "%s", key_handle);
-    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_PUBKEY_BYTES; i++) {
-        unsigned int byte;
-        if (sscanf(pub_hex + i * 2, "%2x", &byte) != 1) return false;
-        out->public_key[i] = (uint8_t)byte;
+    /* Walk the record field by field: the public key is variable length and
+     * the trailing fields are optional, so positional sscanf cannot be used. */
+    char f[14][5200];
+    const char* p = blob;
+    for (size_t i = 0; i < 14u; i++) p = fed_next_field(p, f[i], sizeof(f[i]));
+
+    if (!uuid_from_hex(f[0], &out->node_id)) return false;
+    snprintf(out->hostname, sizeof(out->hostname), "%s", f[1]);
+    snprintf(out->boot_id, sizeof(out->boot_id), "%s", f[2]);
+    snprintf(out->key_handle, sizeof(out->key_handle), "%s", f[3]);
+
+    uint64_t alg_raw = strtoull(f[4], NULL, 10);
+    if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) return false;
+    out->sig_alg = (qihse_sig_alg_t)alg_raw;
+
+    size_t declared_pk_len = (size_t)strtoull(f[5], NULL, 10);
+    size_t actual_pk_len = 0;
+    if (!hex_to_bytes(f[6], out->public_key, QIHSE_FEDERATION_PUBKEY_MAX_BYTES,
+                      &actual_pk_len)) return false;
+    /* The declared length must match the encoded length AND the algorithm's
+     * fixed size, or the record is inconsistent. */
+    if (declared_pk_len != actual_pk_len) return false;
+    if (actual_pk_len != qihse_sig_alg_public_key_bytes(out->sig_alg)) return false;
+    out->public_key_len = (uint16_t)actual_pk_len;
+
+    size_t fp_len = 0;
+    if (!hex_to_bytes(f[7], out->fingerprint,
+                      QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES, &fp_len)) return false;
+    if (fp_len != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) return false;
+    /* The fingerprint must actually describe the key it is attached to. */
+    uint8_t recomputed[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    if (!qihse_federation_node_fingerprint(out->public_key, actual_pk_len, recomputed)) {
+        return false;
     }
-    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++) {
-        unsigned int byte;
-        if (sscanf(fp_hex + i * 2, "%2x", &byte) != 1) return false;
-        out->fingerprint[i] = (uint8_t)byte;
-    }
-    if (trust > (unsigned)QIHSE_TRUST_REVOKED) return false;
-    if (kind > (unsigned)QIHSE_IDENTITY_BACKUP_AGENT) return false;
-    out->trust = (qihse_trust_state_t)trust;
-    out->enrollment_epoch = (uint64_t)epoch;
-    out->identity_kind = (qihse_service_identity_t)kind;
-    out->scopes = (qihse_infra_scope_t)scopes;
-    out->capabilities = (uint32_t)caps;
-    out->last_hlc_physical = (uint64_t)last_hlc;
+    if (memcmp(recomputed, out->fingerprint, sizeof(recomputed)) != 0) return false;
+
+    uint64_t trust_raw = strtoull(f[8], NULL, 10);
+    if (trust_raw > (uint64_t)QIHSE_TRUST_REVOKED) return false;
+    out->trust = (qihse_trust_state_t)trust_raw;
+    out->enrollment_epoch = (uint64_t)strtoull(f[9], NULL, 10);
+
+    uint64_t kind_raw = strtoull(f[10], NULL, 10);
+    if (kind_raw > (uint64_t)QIHSE_IDENTITY_BACKUP_AGENT) return false;
+    out->identity_kind = (qihse_service_identity_t)kind_raw;
+    out->scopes = (qihse_infra_scope_t)strtoul(f[11], NULL, 10);
+    out->capabilities = (uint32_t)strtoul(f[12], NULL, 10);
+    out->last_hlc_physical = (uint64_t)strtoull(f[13], NULL, 10);
     return true;
 }
 
@@ -2144,9 +2293,13 @@ bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
     /* The identity's scopes come from its service identity kind, not from
      * the enrolling caller — a requester cannot self-grant privilege. */
     rec.scopes = qihse_service_identity_default_scopes(rec.identity_kind);
-    if (!qihse_federation_node_fingerprint(rec.public_key, rec.fingerprint)) return false;
+    if (rec.public_key_len == 0 ||
+        rec.public_key_len != qihse_sig_alg_public_key_bytes(rec.sig_alg)) return false;
+    if (!qihse_federation_node_fingerprint(rec.public_key, rec.public_key_len,
+                                          rec.fingerprint)) return false;
 
-    char blob[2048];
+    /* An ML-DSA-87 public key hex-encodes to 5184 characters. */
+    char blob[8192];
     node_encode(&rec, blob, sizeof(blob));
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
                              (qihse_user_t*)user_void);
@@ -2169,7 +2322,7 @@ bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
     if (rec.trust == QIHSE_TRUST_REVOKED) return false; /* revocation is permanent */
     rec.trust = QIHSE_TRUST_APPROVED;
     rec.enrollment_epoch = enrollment_epoch;
-    char new_blob[2048];
+    char new_blob[8192];
     node_encode(&rec, new_blob, sizeof(new_blob));
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
                              (qihse_user_t*)user_void);
@@ -2190,7 +2343,7 @@ bool qihse_federation_node_revoke(void* store_void, void* user_void,
     if (!ok) return false;
     rec.trust = QIHSE_TRUST_REVOKED;
     rec.scopes = QIHSE_SCOPE_NONE;
-    char new_blob[2048];
+    char new_blob[8192];
     node_encode(&rec, new_blob, sizeof(new_blob));
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
                              (qihse_user_t*)user_void);
@@ -2261,6 +2414,9 @@ static void le_bytes(le_writer_t* w, const uint8_t* b, size_t n) {
     w->len += n;
 }
 
+/* The signed bytes: every field except the signature itself.  The algorithm
+ * and the signature length are INSIDE the signed region, so an attacker
+ * cannot downgrade the algorithm by editing those two fields. */
 bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
                                        uint8_t* out, size_t out_cap, size_t* out_len) {
     if (!gossip || !out || !out_len) return false;
@@ -2271,50 +2427,360 @@ bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
     le_bytes(&w, gossip->cluster_id.bytes, QIHSE_UUID_BYTES);
     le_bytes(&w, gossip->sender_node.bytes, QIHSE_UUID_BYTES);
     le_bytes(&w, gossip->boot_id.bytes, QIHSE_UUID_BYTES);
+    le_bytes(&w, gossip->session_id.bytes, QIHSE_UUID_BYTES);
     le_u64(&w, gossip->sequence);
     le_u64(&w, gossip->hlc.physical_ms);
     le_u16(&w, gossip->hlc.logical);
     le_u16(&w, 0u); /* reserved, keeps the frame 4-byte aligned */
     le_u32(&w, gossip->capability_bitmap);
     le_u32(&w, gossip->health_summary);
+    le_u16(&w, (uint16_t)gossip->sig_alg);
+    le_u16(&w, gossip->signature_len);
     if (w.overflow) return false;
     *out_len = w.len;
     return true;
 }
 
+/* Map an EVP_PKEY to the algorithm enum, so a signer cannot mislabel a key.
+ *
+ * EVP_PKEY_get_base_id() and EVP_PKEY_get_id() are NOT usable here: ML-DSA
+ * keys are provider-native types with no legacy NID, so they report base id 0
+ * and id -1.  EVP_PKEY_is_a() is the provider-aware check and is the only
+ * reliable way to identify them. */
+static bool pkey_sig_alg(EVP_PKEY* pkey, qihse_sig_alg_t* out) {
+    if (!pkey || !out) return false;
+    for (size_t i = 0; i < sizeof(g_sig_algs) / sizeof(g_sig_algs[0]); i++) {
+        if (EVP_PKEY_is_a(pkey, g_sig_algs[i].ossl_name) == 1) {
+            *out = g_sig_algs[i].alg;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip) {
     if (!pkey || !gossip) return false;
+
+    /* Record the algorithm from the key itself rather than trusting a caller
+     * to set it consistently with the key they pass. */
+    qihse_sig_alg_t alg;
+    if (!pkey_sig_alg((EVP_PKEY*)pkey, &alg)) return false;
+    gossip->sig_alg = alg;
+    gossip->signature_len = (uint16_t)qihse_sig_alg_signature_bytes(alg);
+
+    /* The serialized region is ~120 bytes; the signature is appended by the
+     * caller's structure, not by this buffer. */
     uint8_t frame[256];
     size_t frame_len = 0;
     if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
+
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) return false;
-    size_t sig_len = QIHSE_FEDERATION_NODE_SIG_BYTES;
+    size_t sig_len = gossip->signature_len;
     bool ok = EVP_DigestSignInit(ctx, NULL, NULL, NULL, (EVP_PKEY*)pkey) == 1 &&
               EVP_DigestSign(ctx, gossip->signature, &sig_len, frame, frame_len) == 1 &&
-              sig_len == QIHSE_FEDERATION_NODE_SIG_BYTES;
+              sig_len == gossip->signature_len;
     EVP_MD_CTX_free(ctx);
+    if (!ok) gossip->signature_len = 0;
     return ok;
 }
 
-bool qihse_federation_gossip_verify(const uint8_t* public_key,
+bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len,
                                     const qihse_federation_gossip_t* gossip) {
     if (!public_key || !gossip) return false;
+
+    const sig_alg_entry_t* entry = sig_alg_lookup(gossip->sig_alg);
+    if (!entry) return false;
+    /* The declared key length and signature length must match the algorithm,
+     * so a truncated or padded signature is rejected before any crypto runs. */
+    if (public_key_len != entry->pk_bytes) return false;
+    if (gossip->signature_len != entry->sig_bytes) return false;
+
     uint8_t frame[256];
     size_t frame_len = 0;
     if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
-    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                                 public_key,
-                                                 QIHSE_FEDERATION_NODE_PUBKEY_BYTES);
+
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key_ex(NULL, entry->ossl_name, NULL,
+                                                   public_key, public_key_len);
     if (!pkey) return false;
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pkey); return false; }
     bool ok = EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-              EVP_DigestVerify(ctx, gossip->signature, QIHSE_FEDERATION_NODE_SIG_BYTES,
+              EVP_DigestVerify(ctx, gossip->signature, gossip->signature_len,
                                frame, frame_len) == 1;
     EVP_MD_CTX_free(ctx);
     EVP_PKEY_free(pkey);
     return ok;
+}
+
+/* The wire layout is: [ signed region ][ raw signature ].
+ *
+ * The signed region's size is DERIVED from the serializer rather than
+ * hard-coded, so adding a field cannot silently desynchronise the reader from
+ * the writer. */
+static size_t gossip_signed_region_bytes(void) {
+    static size_t cached = 0;
+    if (cached != 0) return cached;
+    qihse_federation_gossip_t probe;
+    memset(&probe, 0, sizeof(probe));
+    uint8_t buf[512];
+    size_t len = 0;
+    if (!qihse_federation_gossip_serialize(&probe, buf, sizeof(buf), &len)) return 0;
+    cached = len;
+    return cached;
+}
+
+size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg) {
+    size_t region = gossip_signed_region_bytes();
+    size_t sig = qihse_sig_alg_signature_bytes(alg);
+    return (region && sig) ? region + sig : 0u;
+}
+
+bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
+                                         qihse_federation_gossip_t* out) {
+    if (!in || !out) return false;
+    size_t region = gossip_signed_region_bytes();
+    if (region == 0 || in_len < region + 1u) return false;
+    memset(out, 0, sizeof(*out));
+
+    size_t o = 0;
+    memcpy(&out->magic, in + o, 4); o += 4;
+    memcpy(&out->version, in + o, 2); o += 2;
+    memcpy(&out->feature_bitmap, in + o, 2); o += 2;
+    memcpy(out->cluster_id.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(out->sender_node.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(out->boot_id.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(out->session_id.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(&out->sequence, in + o, 8); o += 8;
+    memcpy(&out->hlc.physical_ms, in + o, 8); o += 8;
+    memcpy(&out->hlc.logical, in + o, 2); o += 2;
+    o += 2; /* reserved */
+    memcpy(&out->capability_bitmap, in + o, 4); o += 4;
+    memcpy(&out->health_summary, in + o, 4); o += 4;
+    uint16_t alg_raw = 0, sig_len = 0;
+    memcpy(&alg_raw, in + o, 2); o += 2;
+    memcpy(&sig_len, in + o, 2); o += 2;
+
+    /* Validate before any crypto: a frame that names an unknown algorithm, or
+     * whose length fields disagree with the algorithm, is malformed. */
+    if (out->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return false;
+    if (out->version != QIHSE_FEDERATION_GOSSIP_VERSION) return false;
+    if (alg_raw > (uint16_t)QIHSE_SIG_ML_DSA_87) return false;
+    out->sig_alg = (qihse_sig_alg_t)alg_raw;
+    if (sig_len != qihse_sig_alg_signature_bytes(out->sig_alg)) return false;
+    if (in_len != region + sig_len) return false;
+    out->signature_len = sig_len;
+    memcpy(out->signature, in + region, sig_len);
+    return true;
+}
+
+/* ── Cheap heartbeat tier ──────────────────────────────────────────────── */
+
+bool qihse_federation_heartbeat_serialize(const qihse_federation_heartbeat_t* hb,
+                                          uint8_t* out, size_t out_cap, size_t* out_len) {
+    if (!hb || !out || !out_len) return false;
+    le_writer_t w = { out, out_cap, 0, false };
+    le_u32(&w, hb->magic);
+    le_u16(&w, hb->version);
+    le_u16(&w, hb->reserved);
+    le_bytes(&w, hb->sender_node.bytes, QIHSE_UUID_BYTES);
+    le_bytes(&w, hb->boot_id.bytes, QIHSE_UUID_BYTES);
+    le_bytes(&w, hb->session_id.bytes, QIHSE_UUID_BYTES);
+    le_u64(&w, hb->sequence);
+    le_u64(&w, hb->hlc.physical_ms);
+    le_u16(&w, hb->hlc.logical);
+    le_u16(&w, 0u);
+    le_u32(&w, hb->health_summary);
+    if (w.overflow) return false;
+    *out_len = w.len;
+    return true;
+}
+
+bool qihse_federation_heartbeat_deserialize(const uint8_t* in, size_t in_len,
+                                            qihse_federation_heartbeat_t* out) {
+    if (!in || !out) return false;
+    /* Fixed layout: 4+2+2+16+16+16+8+8+2+2+4 = 80 bytes. */
+    if (in_len != 80u) return false;
+    memset(out, 0, sizeof(*out));
+    size_t o = 0;
+    memcpy(&out->magic, in + o, 4); o += 4;
+    memcpy(&out->version, in + o, 2); o += 2;
+    memcpy(&out->reserved, in + o, 2); o += 2;
+    memcpy(out->sender_node.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(out->boot_id.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(out->session_id.bytes, in + o, QIHSE_UUID_BYTES); o += QIHSE_UUID_BYTES;
+    memcpy(&out->sequence, in + o, 8); o += 8;
+    memcpy(&out->hlc.physical_ms, in + o, 8); o += 8;
+    memcpy(&out->hlc.logical, in + o, 2); o += 2;
+    o += 2; /* reserved */
+    memcpy(&out->health_summary, in + o, 4); o += 4;
+    if (out->magic != QIHSE_FEDERATION_HEARTBEAT_MAGIC) return false;
+    if (out->version != QIHSE_FEDERATION_HEARTBEAT_VERSION) return false;
+    return true;
+}
+
+/* The statement record: the signed frame stored under its (sender, boot) key,
+ * so heartbeats can be checked against the session it minted. */
+static void statement_kv_key(const qihse_uuid_t* sender, const qihse_uuid_t* boot,
+                             char* out, size_t cap) {
+    char s_str[QIHSE_UUID_STR_LEN + 1u], b_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(sender, s_str);
+    qihse_uuid_format(boot, b_str);
+    snprintf(out, cap, "fedstmt:%s:%s", s_str, b_str);
+}
+
+static void statement_encode(const qihse_federation_gossip_t* g, char* out, size_t cap) {
+    char cid[33], snd[33], boot[33], sess[33], sig_hex[QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 1u];
+    uuid_hex(&g->cluster_id, cid);
+    uuid_hex(&g->sender_node, snd);
+    uuid_hex(&g->boot_id, boot);
+    uuid_hex(&g->session_id, sess);
+    bytes_to_hex(g->signature, g->signature_len, sig_hex);
+    snprintf(out, cap, "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s",
+             cid, snd, boot, sess,
+             (unsigned long long)g->sequence,
+             (unsigned long long)g->hlc.physical_ms,
+             (unsigned)g->capability_bitmap,
+             (unsigned)g->health_summary,
+             (unsigned)g->sig_alg,
+             (unsigned)g->signature_len,
+             sig_hex);
+}
+
+static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+    char f[11][QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 2u];
+    const char* p = blob;
+    for (size_t i = 0; i < 11u; i++) p = fed_next_field(p, f[i], sizeof(f[i]));
+
+    if (!uuid_from_hex(f[0], &out->cluster_id)) return false;
+    if (!uuid_from_hex(f[1], &out->sender_node)) return false;
+    if (!uuid_from_hex(f[2], &out->boot_id)) return false;
+    if (!uuid_from_hex(f[3], &out->session_id)) return false;
+    out->sequence = (uint64_t)strtoull(f[4], NULL, 10);
+    out->hlc.physical_ms = (uint64_t)strtoull(f[5], NULL, 10);
+    out->capability_bitmap = (uint32_t)strtoul(f[6], NULL, 10);
+    out->health_summary = (uint32_t)strtoul(f[7], NULL, 10);
+    uint64_t alg_raw = strtoull(f[8], NULL, 10);
+    if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) return false;
+    out->sig_alg = (qihse_sig_alg_t)alg_raw;
+    size_t declared = (size_t)strtoull(f[9], NULL, 10);
+    size_t actual = 0;
+    if (!hex_to_bytes(f[10], out->signature, QIHSE_FEDERATION_SIG_MAX_BYTES, &actual)) return false;
+    if (declared != actual) return false;
+    if (actual != qihse_sig_alg_signature_bytes(out->sig_alg)) return false;
+    out->signature_len = (uint16_t)actual;
+    out->magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
+    out->version = QIHSE_FEDERATION_GOSSIP_VERSION;
+    return true;
+}
+
+bool qihse_federation_gossip_statement_read(void* store_void, void* user_void,
+                                            const qihse_uuid_t* sender_node,
+                                            const qihse_uuid_t* boot_id,
+                                            qihse_federation_gossip_t* out) {
+    if (!store_void || !user_void || !sender_node || !boot_id || !out) return false;
+    char key[160];
+    statement_kv_key(sender_node, boot_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = statement_decode(blob, out);
+    free(blob);
+    return ok;
+}
+
+static bool statement_store(void* store_void, void* user_void,
+                            const qihse_federation_gossip_t* g) {
+    char key[160];
+    statement_kv_key(&g->sender_node, &g->boot_id, key, sizeof(key));
+    /* The signature reaches 4627 bytes -> 9255 hex characters. */
+    size_t blob_len = QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 512u;
+    char* blob = (char*)malloc(blob_len);
+    if (!blob) return false;
+    statement_encode(g, blob, blob_len);
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                                (qihse_user_t*)user_void);
+    free(blob);
+    return ok;
+}
+
+/* Heartbeat sequence state, keyed on (sender, boot) like the replay window. */
+static void hb_kv_key(const qihse_uuid_t* sender, const qihse_uuid_t* boot,
+                      char* out, size_t cap) {
+    char s_str[QIHSE_UUID_STR_LEN + 1u], b_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(sender, s_str);
+    qihse_uuid_format(boot, b_str);
+    snprintf(out, cap, "fedhb:%s:%s", s_str, b_str);
+}
+
+qihse_gossip_result_t qihse_federation_heartbeat_accept(void* store_void, void* user_void,
+                                                       const qihse_federation_heartbeat_t* hb) {
+    if (!store_void || !user_void || !hb) return QIHSE_GOSSIP_REJECT_MALFORMED;
+    if (hb->magic != QIHSE_FEDERATION_HEARTBEAT_MAGIC) return QIHSE_GOSSIP_REJECT_MALFORMED;
+    if (hb->version != QIHSE_FEDERATION_HEARTBEAT_VERSION) return QIHSE_GOSSIP_REJECT_VERSION;
+
+    /* The sender must be an enrolled, approved node. */
+    qihse_federation_node_identity_t sender;
+    if (!qihse_federation_node_lookup(store_void, user_void, &hb->sender_node, &sender)) {
+        return QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER;
+    }
+    if (sender.trust != QIHSE_TRUST_APPROVED) return QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER;
+
+    /* A heartbeat has no authority of its own: it is accepted only while it
+     * matches the session minted by a valid signed statement.  Without a
+     * statement on record there is nothing to match, so it is refused. */
+    qihse_federation_gossip_t stmt;
+    if (!qihse_federation_gossip_statement_read(store_void, user_void,
+                                                &hb->sender_node, &hb->boot_id, &stmt)) {
+        return QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER;
+    }
+    if (!qihse_uuid_equal(&stmt.session_id, &hb->session_id)) {
+        return QIHSE_GOSSIP_REJECT_REPLAY; /* retired session */
+    }
+    /* Re-verify the statement: it may have been written before a revocation
+     * or a policy change, and the record is not itself proof of validity. */
+    if (!qihse_federation_gossip_verify(sender.public_key, sender.public_key_len, &stmt)) {
+        return QIHSE_GOSSIP_REJECT_BAD_SIGNATURE;
+    }
+
+    /* The sequence must advance, but the sequence space is per SESSION rather
+     * than per boot: a new signed statement retires the previous session
+     * entirely, so its first heartbeat legitimately starts again at 1.  Replay
+     * protection within a session comes from the monotonic counter, and replay
+     * across sessions comes from the session id check above. */
+    char key[160];
+    hb_kv_key(&hb->sender_node, &hb->boot_id, key, sizeof(key));
+    char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                  (qihse_user_t*)user_void);
+    uint64_t highest = 0;
+    bool same_session = false;
+    if (val) {
+        char f[2][64];
+        const char* q = val;
+        for (size_t i = 0; i < 2u; i++) q = fed_next_field(q, f[i], sizeof(f[i]));
+        qihse_uuid_t seen_session;
+        if (qihse_uuid_parse(f[0], &seen_session)) {
+            same_session = qihse_uuid_equal(&seen_session, &hb->session_id);
+        }
+        if (same_session) highest = (uint64_t)strtoull(f[1], NULL, 10);
+        free(val);
+    }
+    if (same_session && highest != 0 && hb->sequence <= highest) {
+        return QIHSE_GOSSIP_REJECT_REPLAY;
+    }
+
+    char sess_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(&hb->session_id, sess_str);
+    char new_val[96];
+    snprintf(new_val, sizeof(new_val), "%s\t%llu", sess_str,
+             (unsigned long long)hb->sequence);
+    if (!qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_val, 0, 0,
+                           (qihse_user_t*)user_void)) {
+        return QIHSE_GOSSIP_REJECT_MALFORMED;
+    }
+    return QIHSE_GOSSIP_ACCEPTED;
 }
 
 const char* qihse_gossip_result_name(qihse_gossip_result_t result) {
@@ -2365,6 +2831,17 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
     if (gossip->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return QIHSE_GOSSIP_REJECT_MALFORMED;
     if (gossip->version != QIHSE_FEDERATION_GOSSIP_VERSION) return QIHSE_GOSSIP_REJECT_VERSION;
 
+    /* Read the previously recorded session id first, so a genuine new session
+     * is distinguishable from a replayed statement. */
+    qihse_uuid_t prev_session;
+    memset(&prev_session, 0, sizeof(prev_session));
+    qihse_federation_gossip_t prior;
+    if (qihse_federation_gossip_statement_read(store_void, user_void,
+                                              &gossip->sender_node, &gossip->boot_id,
+                                              &prior)) {
+        prev_session = prior.session_id;
+    }
+
     /* A datagram is never trusted because of its source IP — the sender must
      * be an enrolled, approved node and the frame must carry a valid
      * signature from that node's identity key (plan §17, §18). */
@@ -2373,9 +2850,17 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
         return QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER;
     }
     if (sender.trust != QIHSE_TRUST_APPROVED) return QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER;
-    if (!qihse_federation_gossip_verify(sender.public_key, gossip)) {
+    if (!qihse_federation_gossip_verify(sender.public_key, sender.public_key_len, gossip)) {
         return QIHSE_GOSSIP_REJECT_BAD_SIGNATURE;
     }
+    /* A new session id retires every heartbeat issued under the old one, so
+     * the statement must be recorded before its heartbeats are accepted. */
+    if (!qihse_uuid_equal(&gossip->session_id, &prev_session)) {
+        if (!statement_store(store_void, user_void, gossip)) {
+            return QIHSE_GOSSIP_REJECT_MALFORMED;
+        }
+    }
+    (void)prev_session;
 
     /* Replay window: the sequence must advance strictly. */
     char key[192];
