@@ -88,11 +88,11 @@ The accepted major direction. Governing principle: **federation must enhance a n
 - [x] **F7 — Runtime trust and hardening.** Evidence-aware federation admission: runtime trust states (UNKNOWN/TRUSTED/TRUSTED_DEGRADED/LOCAL_ONLY/QUARANTINED/REVOKED) with immutable per-boot evidence bundles and external verification records that emit journal audit events. Local usability is true in *every* trust state; only distributed authority is tiered. Runtime security profiles with a measured kernel-interface allowlist (REQUIRED/OPTIONAL/FORBIDDEN/UNKNOWN), network exposure/egress declarations, and a hardening self-audit that reads ACTUAL process state (credentials, effective capabilities, core-dump rlimit, seccomp mode, listening sockets). Time-integrity monitor plus a wall-clock-independent HLC advance/merge that cannot be broken by backward or forward clock jumps. *Unblocks criteria 23–28.*
 - [~] **F8 — Operational hardening.** *In progress.*
   - [x] Deterministic distributed simulation harness (seeded PRNG, virtual clock, loss/duplication/reorder/delay/partition/crash/stale-clock injectors) plus the mandatory scenarios from the brief run against the real F1-F7 entry points. *Closes criterion 13.*
-  - [ ] Rolling schema evolution (schema id/version/min-reader/feature bits, resumable migrations)
-  - [ ] Snapshot and backup semantics (local + coordinated metadata snapshots, manifest, WAL continuation)
-  - [ ] Reconciliation safety state machine (the explicit rejoin sequence)
-  - [ ] Observability metrics (label-bounded)
-  - [ ] Performance regression budgets *Closes criterion 14.*
+  - [x] Rolling schema evolution: schema id/version/min-reader plus required and optional feature bits. An unknown REQUIRED feature or a too-old reader fails closed; unknown OPTIONAL features are ignored, which is what lets a new writer add fields without a flag day. Migrations are forward-only and record resumable progress. *Covers the mixed schema N/N+1 scenario (criterion 13).*
+  - [x] Snapshot and backup semantics: local and coordinated metadata snapshots with a manifest carrying the schema header, max generation, WAL continuation point, per-group capture list, and an encryption key id (never key material). The recorder computes the checksum itself, so an edited or truncated manifest fails verification. *Covers mid-snapshot crash recovery (criterion 13).*
+  - [x] Reconciliation safety state machine: the explicit ordered rejoin sequence, with ownership publication withheld until state is reconstructed and checksums verified.
+  - [x] Observability metrics: all 21 series from the brief, rendered label-bounded with no node or namespace labels.
+  - [x] Performance regression budgets: each metric independently enforced, unmeasured metrics skipped so a partial harness cannot produce a false failure. *Closes criterion 14.*
   - [ ] Fuzzing targets for wire and persisted parsers
   - [ ] Architecture documentation set
 

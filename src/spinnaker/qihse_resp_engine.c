@@ -9,6 +9,7 @@
 #include "qihse_supply_chain.h"
 #include "qihse_runtime_trust.h"
 #include "qihse_security_audit.h"
+#include "qihse_operations.h"
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
@@ -6849,6 +6850,247 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (!qihse_resp_integer(session, (int64_t)np.listener_count)) return false;
         if (!qihse_resp_integer(session, (int64_t)np.generation)) return false;
         return true;
+    }
+
+    /* ── F8: Operational hardening ───────────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "SCHEMA.CHECK")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SCHEMA.CHECK <writer_version> <min_reader> <required_hex> <optional_hex>");
+        }
+        char nums[4][32];
+        for (size_t i = 0; i < 4u; i++) {
+            size_t l = request->argv[2 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[2 + i].data, l); nums[i][l] = '\0';
+        }
+        qihse_schema_header_t h;
+        qihse_schema_header_init(&h, QIHSE_SCHEMA_ID_FEDERATION,
+                                 (uint32_t)strtoul(nums[0], NULL, 10));
+        h.minimum_reader_version = (uint32_t)strtoul(nums[1], NULL, 10);
+        h.required_features = (uint64_t)strtoull(nums[2], NULL, 0);
+        h.optional_features = (uint64_t)strtoull(nums[3], NULL, 0);
+        /* The reader is this build, so its capabilities are this build's —
+         * not the object's, which would make the check vacuous. */
+        qihse_schema_reader_t reader;
+        reader.max_schema_version = QIHSE_SCHEMA_MAX_VERSION;
+        reader.known_features = QIHSE_SCHEMA_KNOWN_FEATURES;
+        qihse_schema_result_t res = qihse_schema_check(&h, &reader);
+        return qihse_resp_bulk_text(session, qihse_schema_result_name(res));
+    }
+
+    if (qihse_resp_arg_equal(sub, "SCHEMA.MIGRATE")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SCHEMA.MIGRATE <schema_id> <from_version> <to_version> <resumable>");
+        }
+        char nums[4][32];
+        for (size_t i = 0; i < 4u; i++) {
+            size_t l = request->argv[2 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[2 + i].data, l); nums[i][l] = '\0';
+        }
+        qihse_schema_migration_t m;
+        memset(&m, 0, sizeof(m));
+        m.schema_id = (uint32_t)strtoul(nums[0], NULL, 10);
+        m.from_version = (uint32_t)strtoul(nums[1], NULL, 10);
+        m.to_version = (uint32_t)strtoul(nums[2], NULL, 10);
+        m.resumable = strtoul(nums[3], NULL, 10) != 0;
+        snprintf(m.description, sizeof(m.description), "registered via RESP");
+        if (!qihse_schema_migration_register(session->server->store, session->user, &m)) {
+            return qihse_resp_error(session, "ERR migration must move forward");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "SCHEMA.PROGRESS")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SCHEMA.PROGRESS <schema_id> <version> <completed> <total>");
+        }
+        char nums[4][32];
+        for (size_t i = 0; i < 4u; i++) {
+            size_t l = request->argv[2 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[2 + i].data, l); nums[i][l] = '\0';
+        }
+        uint32_t schema_id = (uint32_t)strtoul(nums[0], NULL, 10);
+        uint32_t version = (uint32_t)strtoul(nums[1], NULL, 10);
+        uint64_t completed = (uint64_t)strtoull(nums[2], NULL, 10);
+        uint64_t total = (uint64_t)strtoull(nums[3], NULL, 10);
+        if (!qihse_schema_progress_set(session->server->store, session->user,
+                                       schema_id, version, completed, total)) {
+            return qihse_resp_error(session, "ERR progress cannot over-report");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "SCHEMA.STATUS")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.schema.status");
+        char nums[2][32];
+        for (size_t i = 0; i < 2u; i++) {
+            size_t l = request->argv[2 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[2 + i].data, l); nums[i][l] = '\0';
+        }
+        uint32_t schema_id = (uint32_t)strtoul(nums[0], NULL, 10);
+        uint32_t version = (uint32_t)strtoul(nums[1], NULL, 10);
+        uint64_t completed = 0, total = 0;
+        bool found = qihse_schema_progress_get(session->server->store, session->user,
+                                               schema_id, version, &completed, &total);
+        bool complete = qihse_schema_progress_complete(session->server->store, session->user,
+                                                       schema_id, version);
+        if (!qihse_resp_array(session, 4)) return false;
+        if (!qihse_resp_integer(session, found ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, (int64_t)completed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)total)) return false;
+        if (!qihse_resp_integer(session, complete ? 1 : 0)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SNAPSHOT.CREATE")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SNAPSHOT.CREATE <local|coordinated> <max_generation> <wal_offset> [key_id]");
+        }
+        char kind_name[24], nums[2][32];
+        size_t kl = request->argv[2].len;
+        if (kl == 0 || kl >= sizeof(kind_name)) return qihse_resp_error(session, "ERR invalid kind");
+        memcpy(kind_name, request->argv[2].data, kl); kind_name[kl] = '\0';
+        qihse_snapshot_kind_t kind;
+        if (!qihse_snapshot_kind_parse(kind_name, &kind)) {
+            return qihse_resp_error(session, "ERR unknown snapshot kind");
+        }
+        for (size_t i = 0; i < 2u; i++) {
+            size_t l = request->argv[3 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[3 + i].data, l); nums[i][l] = '\0';
+        }
+        qihse_snapshot_manifest_t m;
+        memset(&m, 0, sizeof(m));
+        if (!qihse_uuid_generate(&m.snapshot_id)) {
+            return qihse_resp_error(session, "ERR could not generate snapshot id");
+        }
+        m.kind = kind;
+        m.cluster_id = session->server->federation_node_id;
+        m.created_by = session->server->federation_node_id;
+        m.created_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        qihse_schema_header_init(&m.schema, QIHSE_SCHEMA_ID_FEDERATION, 1);
+        m.max_generation = (uint64_t)strtoull(nums[0], NULL, 10);
+        m.wal_continuation_offset = (uint64_t)strtoull(nums[1], NULL, 10);
+        if (request->argc == 6) {
+            size_t xl = request->argv[5].len;
+            if (xl >= sizeof(m.encryption_key_id)) return qihse_resp_error(session, "ERR key id too long");
+            memcpy(m.encryption_key_id, request->argv[5].data, xl);
+            m.encryption_key_id[xl] = '\0';
+        }
+        m.object_count = qihse_kv_count_user(session->server->store, session->user);
+        if (!qihse_snapshot_record(session->server->store, session->user, &m)) {
+            return qihse_resp_error(session, "ERR snapshot record failed");
+        }
+        char sid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&m.snapshot_id, sid);
+        return qihse_resp_bulk_text(session, sid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SNAPSHOT.SHOW")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.snapshot.show");
+        char sid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t sl = request->argv[2].len;
+        if (sl == 0 || sl >= sizeof(sid_str)) return qihse_resp_error(session, "ERR invalid snapshot id");
+        memcpy(sid_str, request->argv[2].data, sl); sid_str[sl] = '\0';
+        qihse_uuid_t sid;
+        if (!qihse_uuid_parse(sid_str, &sid)) return qihse_resp_error(session, "ERR invalid snapshot id");
+        qihse_snapshot_manifest_t m;
+        if (!qihse_snapshot_lookup(session->server->store, session->user, &sid, &m)) {
+            return qihse_resp_error(session, "ERR snapshot not found");
+        }
+        bool verified = qihse_snapshot_verify(session->server->store, session->user, &sid);
+        if (!qihse_resp_array(session, 7)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_snapshot_kind_name(m.kind))) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.max_generation)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.wal_continuation_offset)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.object_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.group_count)) return false;
+        if (!qihse_resp_bulk_text(session, m.encryption_key_id)) return false;
+        if (!qihse_resp_integer(session, verified ? 1 : 0)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SNAPSHOT.VERIFY")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.snapshot.verify");
+        char sid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t sl = request->argv[2].len;
+        if (sl == 0 || sl >= sizeof(sid_str)) return qihse_resp_error(session, "ERR invalid snapshot id");
+        memcpy(sid_str, request->argv[2].data, sl); sid_str[sl] = '\0';
+        qihse_uuid_t sid;
+        if (!qihse_uuid_parse(sid_str, &sid)) return qihse_resp_error(session, "ERR invalid snapshot id");
+        bool ok = qihse_snapshot_verify(session->server->store, session->user, &sid);
+        return qihse_resp_integer(session, ok ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(sub, "REJOIN.STEPS")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.rejoin.steps");
+        static const qihse_rejoin_step_t steps[] = {
+            QIHSE_REJOIN_IDLE, QIHSE_REJOIN_AUTHENTICATE_PEER,
+            QIHSE_REJOIN_COMPARE_FEDERATION_UUID, QIHSE_REJOIN_COMPARE_BOOT_UUID,
+            QIHSE_REJOIN_EXCHANGE_HLC, QIHSE_REJOIN_EXCHANGE_MANIFESTS,
+            QIHSE_REJOIN_IDENTIFY_DIVERGENCE, QIHSE_REJOIN_TRANSFER_EVENTS,
+            QIHSE_REJOIN_APPLY_CONFLICT_POLICY, QIHSE_REJOIN_RECONSTRUCT_STATE,
+            QIHSE_REJOIN_VERIFY_CHECKSUMS, QIHSE_REJOIN_COMPLETE, QIHSE_REJOIN_ABORTED,
+        };
+        size_t n = sizeof(steps) / sizeof(steps[0]);
+        if (!qihse_resp_array(session, n)) return false;
+        for (size_t i = 0; i < n; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_rejoin_step_name(steps[i]))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "REJOIN.STATUS")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.rejoin.status");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        qihse_rejoin_state_t st;
+        if (!qihse_rejoin_state_get(session->server->store, session->user, &nid, &st)) {
+            return qihse_resp_error(session, "ERR no rejoin state for that node");
+        }
+        if (!qihse_resp_array(session, 5)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_rejoin_step_name(st.step))) return false;
+        if (!qihse_resp_integer(session, (int64_t)st.events_transferred)) return false;
+        if (!qihse_resp_integer(session, (int64_t)st.conflicts_applied)) return false;
+        if (!qihse_resp_integer(session,
+                qihse_rejoin_may_publish_ownership(st.step) ? 1 : 0)) return false;
+        if (!qihse_resp_bulk_text(session, st.last_error)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "METRICS")) {
+        if (request->argc < 2 || request->argc > 3) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.METRICS [prefix]");
+        }
+        qihse_federation_metrics_t m;
+        qihse_federation_metrics_init(&m);
+        pthread_mutex_lock(&session->server->federation_lock);
+        qihse_federation_status_recompute(&session->server->federation_status);
+        m.federation_peer_state_connected =
+            (session->server->federation_status.federation_state == QIHSE_FEDERATION_STATE_CONNECTED)
+                ? 1u : 0u;
+        m.runtime_trust_state = (uint64_t)session->server->federation_status.federation_state;
+        pthread_mutex_unlock(&session->server->federation_lock);
+        m.unreplicated_bytes = 0;
+        char prefix[64];
+        prefix[0] = '\0';
+        if (request->argc == 3) {
+            size_t pl = request->argv[2].len;
+            if (pl == 0 || pl >= sizeof(prefix)) return qihse_resp_error(session, "ERR invalid prefix");
+            memcpy(prefix, request->argv[2].data, pl); prefix[pl] = '\0';
+        }
+        char out[4096];
+        if (!qihse_federation_metrics_render(&m, prefix[0] ? prefix : NULL, out, sizeof(out))) {
+            return qihse_resp_error(session, "ERR metrics render failed");
+        }
+        return qihse_resp_bulk_text(session, out);
     }
 
     return qihse_resp_error(session, "ERR unknown FEDERATION subcommand");
