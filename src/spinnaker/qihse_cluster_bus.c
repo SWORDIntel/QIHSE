@@ -46,6 +46,13 @@ struct qihse_cluster_bus {
     uint32_t timeout_ms;
     qihse_cluster_bus_on_fail_cb on_fail;
     void* on_fail_user_data;
+    void (*on_group_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
+                            const uint8_t* payload, size_t payload_len,
+                            uint16_t sender_index, void* user_data);
+    void* on_group_update_user_data;
+    void (*on_group_ack)(qihse_cluster_bus_t* bus, uint64_t update_id, uint16_t sender_index,
+                         uint16_t status, void* user_data);
+    void* on_group_ack_user_data;
     int sock_fd;
     bool running;
     pthread_t thread;
@@ -67,6 +74,12 @@ struct qihse_cluster_bus {
     char* veil_key;
     size_t veil_key_len;
 };
+
+/* Group update push handlers (defined below the broadcast helpers). */
+static void qihse_bus_handle_group_update(qihse_cluster_bus_t* bus, uint16_t sender,
+                                          const uint8_t* payload, size_t payload_len);
+static void qihse_bus_handle_group_ack(qihse_cluster_bus_t* bus, uint16_t sender,
+                                       const uint8_t* payload, size_t payload_len);
 
 static uint64_t qihse_bus_now_ms(void) {
 #ifdef _WIN32
@@ -655,6 +668,8 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         case QIHSE_BUS_MSG_NODE_UPDATE: qihse_bus_handle_node_update(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_NODE_OBS:    qihse_bus_handle_node_obs(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_NODE_CAP:    qihse_bus_handle_node_cap(bus, payload, payload_len); break;
+        case QIHSE_BUS_MSG_GROUP_UPDATE: qihse_bus_handle_group_update(bus, sender, payload, payload_len); break;
+        case QIHSE_BUS_MSG_GROUP_ACK:    qihse_bus_handle_group_ack(bus, sender, payload, payload_len); break;
         default: break;
     }
 }
@@ -810,6 +825,10 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->timeout_ms = config->timeout_ms ? config->timeout_ms : QIHSE_CLUSTER_BUS_TIMEOUT_MS;
     bus->on_fail = config->on_fail;
     bus->on_fail_user_data = config->on_fail_user_data;
+    bus->on_group_update = config->on_group_update;
+    bus->on_group_update_user_data = config->on_group_update_user_data;
+    bus->on_group_ack = config->on_group_ack;
+    bus->on_group_ack_user_data = config->on_group_ack_user_data;
     bus->sock_fd = -1;
     bus->running = false;
     if (config->bind_address) {
@@ -919,6 +938,90 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
     memcpy(upd.owner_id, owner.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
                                        (const uint8_t*)&upd, sizeof(upd));
+}
+
+void qihse_cluster_bus_set_group_callbacks(
+    qihse_cluster_bus_t* bus,
+    void (*on_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
+                      const uint8_t* payload, size_t payload_len, uint16_t sender_index,
+                      void* user_data),
+    void* on_update_user_data,
+    void (*on_ack)(qihse_cluster_bus_t* bus, uint64_t update_id, uint16_t sender_index,
+                   uint16_t status, void* user_data),
+    void* on_ack_user_data) {
+    if (!bus) return;
+    bus->on_group_update = on_update;
+    bus->on_group_update_user_data = on_update_user_data;
+    bus->on_group_ack = on_ack;
+    bus->on_group_ack_user_data = on_ack_user_data;
+}
+
+bool qihse_cluster_bus_broadcast_group_update(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                              const char* group, const uint8_t* payload,
+                                              size_t payload_len) {
+    if (!bus || !group || !*group || !payload || payload_len == 0) return false;
+    size_t group_len = strlen(group);
+    if (group_len > QIHSE_CLUSTER_BUS_GROUP_NAME_MAX ||
+        payload_len > QIHSE_CLUSTER_BUS_GROUP_UPDATE_MAX) {
+        return false;
+    }
+    uint8_t frame[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
+    size_t need = 8u + 2u + 2u + group_len + payload_len;
+    if (need > sizeof(frame)) return false;
+    memcpy(frame, &update_id, 8u);
+    uint16_t glen = (uint16_t)group_len, plen = (uint16_t)payload_len;
+    memcpy(frame + 8u, &glen, 2u);
+    memcpy(frame + 10u, &plen, 2u);
+    memcpy(frame + 12u, group, group_len);
+    memcpy(frame + 12u + group_len, payload, payload_len);
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_GROUP_UPDATE, frame, need);
+}
+
+bool qihse_cluster_bus_broadcast_group_ack(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                           uint16_t status) {
+    if (!bus) return false;
+    qihse_cluster_node_t local;
+    if (!qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) return false;
+    uint8_t frame[8u + 2u + QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    memcpy(frame, &update_id, 8u);
+    memcpy(frame + 8u, &status, 2u);
+    memcpy(frame + 10u, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_GROUP_ACK, frame, sizeof(frame));
+}
+
+/* ---- Group update push handlers ---------------------------------------- */
+
+static void qihse_bus_handle_group_update(qihse_cluster_bus_t* bus, uint16_t sender,
+                                          const uint8_t* payload, size_t payload_len) {
+    if (payload_len < 12u) return;
+    uint64_t update_id = 0;
+    uint16_t group_len = 0, body_len = 0;
+    memcpy(&update_id, payload, 8u);
+    memcpy(&group_len, payload + 8u, 2u);
+    memcpy(&body_len, payload + 10u, 2u);
+    if (group_len == 0 || group_len > QIHSE_CLUSTER_BUS_GROUP_NAME_MAX) return;
+    if (12u + (size_t)group_len + (size_t)body_len != payload_len) return;
+    char group[QIHSE_CLUSTER_BUS_GROUP_NAME_MAX + 1u];
+    memcpy(group, payload + 12u, group_len);
+    group[group_len] = '\0';
+    __atomic_add_fetch(&bus->stats.group_updates_received, 1u, __ATOMIC_RELAXED);
+    if (bus->on_group_update) {
+        bus->on_group_update(bus, update_id, group, payload + 12u + group_len, body_len,
+                             sender, bus->on_group_update_user_data);
+    }
+}
+
+static void qihse_bus_handle_group_ack(qihse_cluster_bus_t* bus, uint16_t sender,
+                                       const uint8_t* payload, size_t payload_len) {
+    if (payload_len < 10u) return;
+    uint64_t update_id = 0;
+    uint16_t status = 0;
+    memcpy(&update_id, payload, 8u);
+    memcpy(&status, payload + 8u, 2u);
+    __atomic_add_fetch(&bus->stats.group_acks_received, 1u, __ATOMIC_RELAXED);
+    if (bus->on_group_ack) {
+        bus->on_group_ack(bus, update_id, sender, status, bus->on_group_ack_user_data);
+    }
 }
 
 bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus, uint16_t node_index) {

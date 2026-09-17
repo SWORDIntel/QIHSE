@@ -49,8 +49,26 @@ typedef enum {
     QIHSE_BUS_MSG_SLOT_UPDATE = 5u,
     QIHSE_BUS_MSG_NODE_UPDATE = 6u,
     QIHSE_BUS_MSG_NODE_OBS    = 7u,  /* third-party health observation */
-    QIHSE_BUS_MSG_NODE_CAP    = 8u   /* node capability profile (ISA/NPU/GPU) */
+    QIHSE_BUS_MSG_NODE_CAP    = 8u,  /* node capability profile (ISA/NPU/GPU) */
+    QIHSE_BUS_MSG_GROUP_UPDATE = 9u, /* group update push (operator -> members) */
+    QIHSE_BUS_MSG_GROUP_ACK    = 10u /* member applied/rejected a group update */
 } qihse_cluster_bus_msg_type_t;
+
+/*
+ * GROUP_UPDATE wire payload (packed, little-endian multi-byte values):
+ *   update_id   u64   monotonic update id (HLC-packed: sortable)
+ *   group_len   u16   bytes of group name that follow
+ *   payload_len u16   bytes of payload that follow
+ *   group[]     char  group_len bytes (not NUL-terminated on the wire)
+ *   payload[]   u8    payload_len bytes (the update body)
+ *
+ * GROUP_ACK wire payload:
+ *   update_id   u64
+ *   status      u16   0 = applied, non-zero = rejected (reason code)
+ *   node_id[41] char  NUL-terminated acknowledging node id
+ */
+#define QIHSE_CLUSTER_BUS_GROUP_NAME_MAX 32u
+#define QIHSE_CLUSTER_BUS_GROUP_UPDATE_MAX 1024u
 
 /*
  * NODE_CAP wire payload — packed field-by-field (little-endian multi-byte
@@ -100,7 +118,41 @@ typedef struct {
     uint32_t timeout_ms;
     qihse_cluster_bus_on_fail_cb on_fail;
     void* on_fail_user_data;
+    /* Group update push. on_group_update fires on every member when an update
+     * frame arrives; on_group_ack fires on the pusher when a member reports
+     * applied/rejected. Both run on the bus thread: keep them short. */
+    void (*on_group_update)(qihse_cluster_bus_t* bus, uint64_t update_id,
+                            const char* group, const uint8_t* payload,
+                            size_t payload_len, uint16_t sender_index, void* user_data);
+    void* on_group_update_user_data;
+    void (*on_group_ack)(qihse_cluster_bus_t* bus, uint64_t update_id,
+                         uint16_t sender_index, uint16_t status, void* user_data);
+    void* on_group_ack_user_data;
 } qihse_cluster_bus_config_t;
+
+/* Push a group update to every peer (members apply it, non-members ignore it —
+ * membership is enforced by the consumer, not the transport). Returns false
+ * when the frame could not be built or sent. */
+bool qihse_cluster_bus_broadcast_group_update(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                              const char* group, const uint8_t* payload,
+                                              size_t payload_len);
+
+/* Report that this node applied (status 0) or rejected a group update. */
+bool qihse_cluster_bus_broadcast_group_ack(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                           uint16_t status);
+
+/* Install the group callbacks after creation (the bus struct is opaque, so
+ * consumers that wire themselves up post-create use this instead of touching
+ * qihse_cluster_bus_config_t). */
+void qihse_cluster_bus_set_group_callbacks(
+    qihse_cluster_bus_t* bus,
+    void (*on_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
+                      const uint8_t* payload, size_t payload_len, uint16_t sender_index,
+                      void* user_data),
+    void* on_update_user_data,
+    void (*on_ack)(qihse_cluster_bus_t* bus, uint64_t update_id, uint16_t sender_index,
+                   uint16_t status, void* user_data),
+    void* on_ack_user_data);
 
 qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* config);
 bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus);
@@ -171,6 +223,8 @@ typedef struct {
     uint64_t slot_updates_received;
     uint64_t fail_notices_received;
     uint64_t nodes_marked_unhealthy;
+    uint64_t group_updates_received;
+    uint64_t group_acks_received;
 } qihse_cluster_bus_stats_t;
 
 void qihse_cluster_bus_stats(const qihse_cluster_bus_t* bus,

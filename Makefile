@@ -323,6 +323,10 @@ test-ai-memory: lib
 	$(CC) $(CFLAGS) -o tests/test_ai_memory tests/test_ai_memory.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ai_memory
 
+test-group-push: lib
+	$(CC) $(CFLAGS) -o tests/test_group_push tests/test_group_push.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_group_push
+
 test-overlay: lib
 	$(CC) $(CFLAGS) -o tests/test_overlay tests/test_overlay.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_overlay

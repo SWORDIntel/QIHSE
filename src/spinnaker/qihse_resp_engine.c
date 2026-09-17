@@ -5,6 +5,7 @@
 #include "qihse_cluster_numa.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
+#include "qihse_federation.h"
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
@@ -96,6 +97,20 @@ struct qihse_resp_client_ctx {
     qihse_resp_client_ctx_t* next;
 };
 
+/* Group update push (GROUP.*): membership lives under grp:<name>, applied
+ * updates under grpupd:<name>:<id>. Acks are held for the most recent
+ * updates so GROUP.STATUS can report per-member outcomes. */
+#define GROUP_MEMBERSHIP_PREFIX "grp:"
+#define GROUP_UPDATE_PREFIX "grpupd:"
+#define GROUP_ACK_SLOTS 8u
+
+typedef struct {
+    bool used;
+    uint64_t update_id;
+    uint16_t status[QIHSE_CLUSTER_MAX_NODES];
+    bool seen[QIHSE_CLUSTER_MAX_NODES];
+} group_ack_set_t;
+
 struct qihse_resp_server {
     qihse_kv_store_t* store;
     qihse_vector_db_t vdb;
@@ -132,6 +147,11 @@ struct qihse_resp_server {
     /* Phase 3: cluster bus + failover + guard throttling */
     qihse_cluster_bus_t* bus;
     qihse_cluster_failover_t* failover;
+    /* Group update push: monotonic id source + per-update member acks. */
+    qihse_hlc_t group_clock;
+    uint64_t group_last_update;
+    pthread_mutex_t group_lock;
+    group_ack_set_t group_acks[GROUP_ACK_SLOTS];
     qihse_system_guard_window_t* guard_window;
     bool owns_bus;
     bool owns_failover;
@@ -4772,6 +4792,332 @@ static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qih
 }
 
 /* ---------------------------------------------------------------------------
+ * GROUP.* — group update push
+ * GROUP.DEFINE <name> <addr|node-id>...   (system domain)
+ * GROUP.LIST                              (system domain)
+ * GROUP.PUSH <name> <payload>             (system domain)
+ * GROUP.STATUS <name>                     (system domain)
+ *
+ * A group is a named set of cluster nodes stored in KV (`grp:<name>` ->
+ * comma-separated node ids). PUSH assigns a monotonic, sortable update id
+ * (hybrid logical clock), broadcasts it on the cluster bus, and applies it
+ * locally; members apply the update to their own KV (`grpupd:<name>:<id>`)
+ * and answer with an ack frame, so the pusher can report per-member status.
+ * Membership is enforced by the consumer: a node that is not a member ignores
+ * the frame. Payloads are text (NUL-terminated), max
+ * QIHSE_CLUSTER_BUS_GROUP_UPDATE_MAX bytes.
+ * ------------------------------------------------------------------------- */
+
+static uint16_t qihse_resp_group_apply(qihse_resp_server_t* server, uint64_t update_id,
+                                       const char* group, const uint8_t* payload,
+                                       size_t payload_len);
+
+static void qihse_resp_group_ack_record(qihse_resp_server_t* server, uint64_t update_id,
+                                        uint16_t node_index, uint16_t status) {
+    pthread_mutex_lock(&server->group_lock);
+    group_ack_set_t* slot = NULL;
+    for (size_t i = 0; i < GROUP_ACK_SLOTS && !slot; i++) {
+        if (server->group_acks[i].used && server->group_acks[i].update_id == update_id) {
+            slot = &server->group_acks[i];
+        }
+    }
+    if (!slot) {
+        for (size_t i = 0; i < GROUP_ACK_SLOTS && !slot; i++) {
+            if (!server->group_acks[i].used) slot = &server->group_acks[i];
+        }
+    }
+    if (!slot) {
+        /* Evict the oldest slot (smallest update id: ids are monotonic). */
+        slot = &server->group_acks[0];
+        for (size_t i = 1; i < GROUP_ACK_SLOTS; i++) {
+            if (server->group_acks[i].update_id < slot->update_id) slot = &server->group_acks[i];
+        }
+    }
+    if (!slot->used || slot->update_id != update_id) {
+        memset(slot, 0, sizeof(*slot));
+        slot->used = true;
+        slot->update_id = update_id;
+    }
+    if (node_index < QIHSE_CLUSTER_MAX_NODES) {
+        slot->seen[node_index] = true;
+        slot->status[node_index] = status;
+    }
+    pthread_mutex_unlock(&server->group_lock);
+}
+
+static bool qihse_resp_group_ack_lookup(qihse_resp_server_t* server, uint64_t update_id,
+                                        uint16_t node_index, uint16_t* out_status) {
+    bool seen = false;
+    pthread_mutex_lock(&server->group_lock);
+    for (size_t i = 0; i < GROUP_ACK_SLOTS; i++) {
+        if (server->group_acks[i].used && server->group_acks[i].update_id == update_id &&
+            node_index < QIHSE_CLUSTER_MAX_NODES && server->group_acks[i].seen[node_index]) {
+            if (out_status) *out_status = server->group_acks[i].status[node_index];
+            seen = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&server->group_lock);
+    return seen;
+}
+
+/* Bus thread: an update arrived. Apply it if this node is a member. */
+static void qihse_resp_on_group_update(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                       const char* group, const uint8_t* payload,
+                                       size_t payload_len, uint16_t sender_index,
+                                       void* user_data) {
+    (void)bus;
+    (void)sender_index;
+    qihse_resp_server_t* server = (qihse_resp_server_t*)user_data;
+    if (!server || !group || !payload) return;
+    uint16_t status = qihse_resp_group_apply(server, update_id, group, payload, payload_len);
+    qihse_cluster_bus_broadcast_group_ack(server->bus, update_id, status);
+}
+
+/* Bus thread: a member reported the outcome of an update we pushed. */
+static void qihse_resp_on_group_ack(qihse_cluster_bus_t* bus, uint64_t update_id,
+                                    uint16_t sender_index, uint16_t status, void* user_data) {
+    (void)bus;
+    qihse_resp_server_t* server = (qihse_resp_server_t*)user_data;
+    if (!server) return;
+    qihse_resp_group_ack_record(server, update_id, sender_index, status);
+}
+
+static void qihse_resp_group_wire_bus(qihse_resp_server_t* server, qihse_cluster_bus_t* bus) {
+    if (!bus) return;
+    qihse_cluster_bus_set_group_callbacks(bus, qihse_resp_on_group_update, server,
+                                          qihse_resp_on_group_ack, server);
+}
+
+/* Membership helpers. The local node id is what the registry stores, so a
+ * pushed update can be applied by any node without extra identity plumbing. */
+static size_t qihse_resp_group_members(qihse_resp_server_t* server, const char* name, char* out,
+                                       size_t out_cap) {
+    if (!server->store || !name || !*name) return 0;
+    char key[128];
+    snprintf(key, sizeof(key), GROUP_MEMBERSHIP_PREFIX "%s", name);
+    char* value = qihse_kv_get_user(server->store, key, qihse_auth_get_user(0));
+    if (!value) return 0;
+    size_t len = strlen(value);
+    if (len >= out_cap) len = out_cap - 1u;
+    memcpy(out, value, len);
+    out[len] = '\0';
+    free(value);
+    return len;
+}
+
+static bool qihse_resp_group_is_member(qihse_resp_server_t* server, const char* name) {
+    char members[1024];
+    if (qihse_resp_group_members(server, name, members, sizeof(members)) == 0) return false;
+    qihse_cluster_node_t local;
+    if (!qihse_cluster_topology_get_node(server->topology,
+                                         qihse_cluster_topology_local_node(server->topology),
+                                         &local)) {
+        return false;
+    }
+    const char* p = members;
+    while (*p) {
+        const char* comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == QIHSE_CLUSTER_NODE_ID_LEN && strncmp(p, local.id, len) == 0) return true;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return false;
+}
+
+/* Apply a pushed update on this node. Returns the ack status:
+ * 0 = applied, 1 = not a member (ignored), 2 = rejected (size/store). */
+static uint16_t qihse_resp_group_apply(qihse_resp_server_t* server, uint64_t update_id,
+                                       const char* group, const uint8_t* payload,
+                                       size_t payload_len) {
+    if (!server || !server->store || !group || !*group) return 2;
+    if (payload_len == 0 || payload_len > QIHSE_CLUSTER_BUS_GROUP_UPDATE_MAX) return 2;
+    if (!qihse_resp_group_is_member(server, group)) return 1;
+    char key[192];
+    snprintf(key, sizeof(key), GROUP_UPDATE_PREFIX "%s:%016llx", group,
+             (unsigned long long)update_id);
+    char* value = malloc(payload_len + 1u);
+    if (!value) return 2;
+    memcpy(value, payload, payload_len);
+    value[payload_len] = '\0';
+    bool ok = qihse_kv_set_user(server->store, key, value, 0, 0, qihse_auth_get_user(0));
+    free(value);
+    return ok ? 0u : 2u;
+}
+
+typedef struct {
+    char names[64][QIHSE_CLUSTER_BUS_GROUP_NAME_MAX + 1u];
+    size_t count;
+} group_list_t;
+
+static bool qihse_resp_group_list_cb(const char* key, const char* value, void* user_data) {
+    (void)value;
+    group_list_t* list = (group_list_t*)user_data;
+    /* Membership keys are `grp:<name>`; applied-update keys are `grpupd:...`
+     * (which does not share the `grp:` prefix) so this stays unambiguous. */
+    if (strncmp(key, GROUP_MEMBERSHIP_PREFIX, sizeof(GROUP_MEMBERSHIP_PREFIX) - 1u) != 0) return true;
+    if (list->count >= 64u) return false;
+    const char* name = key + sizeof(GROUP_MEMBERSHIP_PREFIX) - 1u;
+    if (strlen(name) > QIHSE_CLUSTER_BUS_GROUP_NAME_MAX) return true;
+    snprintf(list->names[list->count], sizeof(list->names[0]), "%s", name);
+    list->count++;
+    return true;
+}
+
+static bool qihse_resp_handle_group(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2) {
+        return qihse_resp_error(session, "ERR usage: GROUP.DEFINE|LIST|PUSH|STATUS ...");
+    }
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM GROUP.* is restricted to the system domain");
+    }
+    const qihse_resp_arg_t* sub = &request->argv[1];
+
+    if (qihse_resp_arg_equal(sub, "LIST")) {
+        if (!session->server->store) return qihse_resp_error(session, "ERR no store");
+        group_list_t list;
+        memset(&list, 0, sizeof(list));
+        qihse_kv_foreach_user(session->server->store, qihse_auth_get_user(0),
+                              qihse_resp_group_list_cb, &list);
+        if (!qihse_resp_array(session, list.count * 2u)) return false;
+        for (size_t i = 0; i < list.count; i++) {
+            if (!qihse_resp_bulk_text(session, list.names[i])) return false;
+            char members[1024];
+            size_t len = qihse_resp_group_members(session->server, list.names[i], members,
+                                                  sizeof(members));
+            size_t member_count = len ? 1u : 0u;
+            for (size_t k = 0; k < len; k++)
+                if (members[k] == ',') member_count++;
+            char count_buf[32];
+            snprintf(count_buf, sizeof(count_buf), "%zu", member_count);
+            if (!qihse_resp_bulk_text(session, count_buf)) return false;
+        }
+        return true;
+    }
+
+    if (request->argc < 3) return qihse_resp_error(session, "ERR missing group name");
+    char name[QIHSE_CLUSTER_BUS_GROUP_NAME_MAX + 1u];
+    size_t nl = request->argv[2].len;
+    if (nl == 0 || nl > QIHSE_CLUSTER_BUS_GROUP_NAME_MAX) return qihse_resp_error(session, "ERR invalid group name");
+    memcpy(name, request->argv[2].data, nl);
+    name[nl] = '\0';
+
+    if (qihse_resp_arg_equal(sub, "DEFINE")) {
+        if (request->argc < 4) return qihse_resp_error(session, "ERR usage: GROUP.DEFINE <name> <host:port|node-id>...");
+        if (!session->server->store) return qihse_resp_error(session, "ERR no store");
+        char members[1024];
+        size_t off = 0;
+        for (size_t i = 3; i < request->argc; i++) {
+            char spec[QIHSE_CLUSTER_HOST_LEN + 16u];
+            size_t sl = request->argv[i].len;
+            if (sl == 0 || sl >= sizeof(spec)) return qihse_resp_error(session, "ERR invalid member");
+            memcpy(spec, request->argv[i].data, sl);
+            spec[sl] = '\0';
+            qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
+            size_t count = qihse_cluster_topology_nodes(session->server->topology, nodes,
+                                                        QIHSE_CLUSTER_MAX_NODES);
+            const char* found_id = NULL;
+            for (size_t k = 0; k < count; k++) {
+                if (strcmp(nodes[k].id, spec) == 0) { found_id = nodes[k].id; break; }
+                char addr[QIHSE_CLUSTER_HOST_LEN + 8u];
+                snprintf(addr, sizeof(addr), "%s:%u", nodes[k].host, nodes[k].port);
+                if (strcmp(addr, spec) == 0) { found_id = nodes[k].id; break; }
+            }
+            if (!found_id) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "ERR member '%s' is not a known cluster node", spec);
+                return qihse_resp_error(session, msg);
+            }
+            int n = snprintf(members + off, sizeof(members) - off, "%s%s",
+                             off ? "," : "", found_id);
+            if (n <= 0 || (size_t)n >= sizeof(members) - off) return qihse_resp_error(session, "ERR too many members");
+            off += (size_t)n;
+        }
+        char key[128];
+        snprintf(key, sizeof(key), GROUP_MEMBERSHIP_PREFIX "%s", name);
+        if (!qihse_kv_set_user(session->server->store, key, members, 0, 0, qihse_auth_get_user(0))) {
+            return qihse_resp_error(session, "ERR cannot store group");
+        }
+        return qihse_resp_integer(session, (long long)request->argc - 3);
+    }
+
+    if (qihse_resp_arg_equal(sub, "PUSH")) {
+        if (request->argc != 4) return qihse_resp_error(session, "ERR usage: GROUP.PUSH <name> <payload>");
+        char members[1024];
+        if (qihse_resp_group_members(session->server, name, members, sizeof(members)) == 0) {
+            return qihse_resp_error(session, "ERR unknown group");
+        }
+        if (request->argv[3].len == 0 ||
+            request->argv[3].len > QIHSE_CLUSTER_BUS_GROUP_UPDATE_MAX) {
+            return qihse_resp_error(session, "ERR payload too large");
+        }
+        qihse_hlc_t ts;
+        qihse_hlc_tick(&session->server->group_clock, &ts);
+        uint64_t update_id = qihse_hlc_pack(&ts);
+        session->server->group_last_update = update_id;
+        const uint8_t* payload = request->argv[3].data;
+        size_t payload_len = request->argv[3].len;
+        bool broadcast = false;
+        if (session->server->bus) {
+            broadcast = qihse_cluster_bus_broadcast_group_update(session->server->bus, update_id,
+                                                                 name, payload, payload_len);
+        }
+        /* Apply locally (the pusher may or may not be a member) and record the
+         * local outcome so GROUP.STATUS is complete without waiting for a
+         * frame to come back. */
+        uint16_t local_status = qihse_resp_group_apply(session->server, update_id, name,
+                                                       payload, payload_len);
+        qihse_resp_group_ack_record(session->server, update_id,
+                                    qihse_cluster_topology_local_node(session->server->topology),
+                                    local_status);
+        char reply[128];
+        snprintf(reply, sizeof(reply), "%llu %s local=%u",
+                 (unsigned long long)update_id, broadcast ? "broadcast" : "local-only",
+                 (unsigned)local_status);
+        return qihse_resp_bulk_text(session, reply);
+    }
+
+    if (qihse_resp_arg_equal(sub, "STATUS")) {
+        char members[1024];
+        size_t len = qihse_resp_group_members(session->server, name, members, sizeof(members));
+        if (len == 0) return qihse_resp_error(session, "ERR unknown group");
+        /* Report every member with the latest ack we hold for it. */
+        size_t member_count = 1;
+        for (size_t i = 0; i < len; i++)
+            if (members[i] == ',') member_count++;
+        if (!qihse_resp_array(session, member_count * 2u)) return false;
+        const char* p = members;
+        for (size_t i = 0; i < member_count; i++) {
+            const char* comma = strchr(p, ',');
+            size_t id_len = comma ? (size_t)(comma - p) : strlen(p);
+            char id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+            if (id_len != QIHSE_CLUSTER_NODE_ID_LEN) return false;
+            memcpy(id, p, id_len);
+            id[id_len] = '\0';
+            if (!qihse_resp_bulk_text(session, id)) return false;
+            uint16_t node_index = QIHSE_CLUSTER_NODE_NONE;
+            uint16_t status = 0;
+            qihse_cluster_topology_find_node(session->server->topology, id, &node_index);
+            bool seen = node_index != QIHSE_CLUSTER_NODE_NONE &&
+                        qihse_resp_group_ack_lookup(session->server, session->server->group_last_update,
+                                                    node_index, &status);
+            char state[64];
+            if (!seen) snprintf(state, sizeof(state), "pending");
+            else if (status == 0) snprintf(state, sizeof(state), "applied");
+            else if (status == 1) snprintf(state, sizeof(state), "not-member");
+            else snprintf(state, sizeof(state), "rejected(%u)", (unsigned)status);
+            if (!qihse_resp_bulk_text(session, state)) return false;
+            if (!comma) break;
+            p = comma + 1;
+        }
+        return true;
+    }
+
+    return qihse_resp_error(session, "ERR unknown GROUP subcommand");
+}
+
+/* ---------------------------------------------------------------------------
  * FABRIC.* — heterogeneous compute dispatch
  * FABRIC.CAPS    — cluster capability map (system domain only)
  * FABRIC.SUBMIT <min_isa> <payload> — dispatch a job to the best-fit node
@@ -4961,6 +5307,9 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
         /* Before the generic CLUSTER dispatch: MOVESLOTS needs store + bus. */
         return qihse_resp_handle_moveslots(session, request);
+    }
+    if (qihse_resp_command_is(request, "GROUP") && request->argc >= 2) {
+        return qihse_resp_handle_group(session, request);
     }
     if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
         if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
@@ -5401,7 +5750,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     }
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
-        pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0) {
+        pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->group_lock, NULL) != 0) {
         free(server);
         errno = ENOMEM;
         return NULL;
@@ -5411,6 +5761,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->topology = qihse_cluster_topology_create();
         server->owns_topology = true;
     }
+    qihse_hlc_init(&server->group_clock);
     if (!server->topology) {
         qihse_resp_server_destroy(server);
         return NULL;
@@ -5463,6 +5814,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         bus_cfg.veil_key = supplied->veil_key;
         server->bus = qihse_cluster_bus_create(&bus_cfg);
         server->owns_bus = server->bus != NULL;
+        qihse_resp_group_wire_bus(server, server->bus);
     }
     /* Phase 3: create failover coordinator if requested */
     if (supplied->enable_failover) {
@@ -5490,6 +5842,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             qihse_cluster_bus_destroy(server->bus);
             server->bus = qihse_cluster_bus_create(&re_cfg);
             server->owns_bus = server->bus != NULL;
+            qihse_resp_group_wire_bus(server, server->bus);
         }
     }
     /* Phase 3: create system guard throttling window if requested */
@@ -5682,6 +6035,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_rwlock_destroy(&server->kv_lock);
     pthread_cond_destroy(&server->clients_drained);
     pthread_mutex_destroy(&server->state_lock);
+    pthread_mutex_destroy(&server->group_lock);
     free(server);
 }
 
