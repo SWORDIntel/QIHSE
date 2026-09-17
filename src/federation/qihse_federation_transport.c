@@ -18,6 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -320,6 +324,204 @@ bool qihse_federation_tls_negotiated(const qihse_fed_tls_session_t* session,
     }
     if (out_group && group_cap) snprintf(out_group, group_cap, "%s", group ? group : "unknown");
     return true;
+}
+
+/* ── Listener ──────────────────────────────────────────────────────────── */
+
+struct qihse_fed_listener {
+    int fd;
+    uint16_t port;
+    qihse_fed_tls_server_t* server;   /* not owned */
+};
+
+/* Bound on how many connections may be queued before accept().  A larger
+ * backlog lets a peer flood the queue faster than the node drains it. */
+#define FED_TLS_BACKLOG 8
+
+qihse_fed_listener_t* qihse_federation_listener_open(qihse_fed_tls_server_t* server,
+                                                    const char* bind_address,
+                                                    uint16_t port) {
+    if (!server || !server->server_ctx || !bind_address) return NULL;
+    /* A wildcard bind is refused rather than honoured by default: exposing a
+     * federation port on every interface is an operator's decision. */
+    if (bind_address[0] == '\0' || strcmp(bind_address, "*") == 0 ||
+        strcmp(bind_address, "0.0.0.0") == 0 || strcmp(bind_address, "::") == 0) {
+        return NULL;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+    struct addrinfo* res = NULL;
+    if (getaddrinfo(bind_address, port_str, &hints, &res) != 0 || !res) return NULL;
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return NULL; }
+
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(fd, res->ai_addr, res->ai_addrlen) != 0 ||
+        listen(fd, FED_TLS_BACKLOG) != 0) {
+        close(fd);
+        freeaddrinfo(res);
+        return NULL;
+    }
+    freeaddrinfo(res);
+
+    /* Report the port the kernel actually assigned, which is the only way to
+     * learn it when port 0 was requested. */
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    uint16_t bound_port = 0;
+    if (getsockname(fd, (struct sockaddr*)&ss, &slen) == 0) {
+        if (ss.ss_family == AF_INET) {
+            bound_port = ntohs(((struct sockaddr_in*)&ss)->sin_port);
+        } else if (ss.ss_family == AF_INET6) {
+            bound_port = ntohs(((struct sockaddr_in6*)&ss)->sin6_port);
+        }
+    }
+
+    qihse_fed_listener_t* l = (qihse_fed_listener_t*)calloc(1, sizeof(*l));
+    if (!l) { close(fd); return NULL; }
+    l->fd = fd;
+    l->port = bound_port;
+    l->server = server;
+    return l;
+}
+
+void qihse_federation_listener_close(qihse_fed_listener_t* listener) {
+    if (!listener) return;
+    if (listener->fd >= 0) close(listener->fd);
+    listener->fd = -1;
+    free(listener);
+}
+
+uint16_t qihse_federation_listener_port(const qihse_fed_listener_t* listener) {
+    return listener ? listener->port : 0;
+}
+
+qihse_fed_tls_session_t* qihse_federation_listener_accept(qihse_fed_listener_t* listener,
+                                                         int timeout_ms,
+                                                         qihse_peer_verdict_t* out_verdict) {
+    if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
+    if (!listener || listener->fd < 0) return NULL;
+
+    /* Wait for a connection without blocking indefinitely, so a caller can
+     * still observe shutdown.  A timeout is not an error and leaves the
+     * listener usable. */
+    struct pollfd pfd;
+    pfd.fd = listener->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+    if (pr <= 0) return NULL;
+    if (!(pfd.revents & POLLIN)) return NULL;
+
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+    int cfd = accept(listener->fd, (struct sockaddr*)&peer_addr, &peer_len);
+    if (cfd < 0) return NULL;
+
+    /* The handshake runs with its own bound (set inside accept_fd), so a peer
+     * that connects and then stalls cannot hold this thread past it.  A
+     * refusal here closes this connection only — the listener survives, which
+     * is what stops a hostile peer from denying service by being refused. */
+    qihse_peer_verdict_t verdict = QIHSE_PEER_REJECT_MALFORMED;
+    qihse_fed_tls_session_t* session = qihse_federation_tls_accept_fd(listener->server,
+                                                                     cfd, &verdict);
+    if (!session) {
+        close(cfd);
+        if (out_verdict) *out_verdict = verdict;
+        return NULL;
+    }
+    if (out_verdict) *out_verdict = verdict;
+    return session;
+}
+
+bool qihse_federation_tls_session_peer_gone(qihse_fed_tls_session_t* session,
+                                            int timeout_ms) {
+    if (!session || !session->ssl) return true;
+
+    /* A clean shutdown already tells us. */
+    if (SSL_get_shutdown(session->ssl) != 0) return true;
+
+    int fd = SSL_get_fd(session->ssl);
+    if (fd < 0) return true;
+
+    /* TLS 1.3 validates the client certificate AFTER the client's handshake
+     * completes, so a refusal arrives as a post-handshake alert.  Wait a short
+     * moment for one and read it if it lands. */
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, timeout_ms < 0 ? 0 : timeout_ms);
+    if (pr <= 0) return false;   /* nothing waiting: the peer is still there */
+    if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) return false;
+
+    uint8_t scratch[1];
+    int n = SSL_read(session->ssl, scratch, 1);
+    if (n > 0) return false;   /* real data, not an alert */
+    int err = SSL_get_error(session->ssl, n);
+    /* ZERO_RETURN is a clean close; SSL_ERROR_SSL is a fatal alert.  Both mean
+     * the peer is gone, which for our purposes is the same answer. */
+    return err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SSL ||
+           err == SSL_ERROR_SYSCALL;
+}
+
+qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t* server,
+                                                        const char* host,
+                                                        uint16_t port,
+                                                        int timeout_ms,
+                                                        qihse_peer_verdict_t* out_verdict) {
+    if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
+    if (!server || !server->client_ctx || !host) return NULL;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+    struct addrinfo* res = NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return NULL;
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return NULL; }
+
+    /* Bound the CONNECT itself.  A peer that is unreachable must not stall the
+     * caller for the kernel's default SYN timeout. */
+    fed_tls_set_handshake_timeout(fd);
+
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc != 0) { close(fd); return NULL; }
+
+    qihse_fed_tls_session_t* session = qihse_federation_tls_connect_fd(server, fd,
+                                                                      out_verdict);
+    if (!session) { close(fd); return NULL; }
+
+    /* A completed handshake here means THIS side verified the peer.  The peer
+     * may still have refused us, because TLS 1.3 validates the client
+     * certificate after the client's handshake finishes.  Give a refusal a
+     * brief window to arrive so the common case is reported honestly rather
+     * than as a session that silently does nothing. */
+    if (qihse_federation_tls_session_peer_gone(session, 100)) {
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_UNTRUSTED;
+        qihse_federation_tls_session_destroy(session);
+        close(fd);
+        return NULL;
+    }
+    return session;
 }
 
 /* ── Replication transport ─────────────────────────────────────────────── */

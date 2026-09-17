@@ -375,6 +375,194 @@ static void test_transport_over_tls(const char* dir, const char* ca_key_path,
     printf("PASS transport over mTLS: peer fingerprint from the certificate, bytes round-trip\n");
 }
 
+/* ── Listener over real TCP ────────────────────────────────────────────── */
+
+typedef struct {
+    qihse_fed_listener_t* listener;
+    qihse_fed_tls_session_t* session;
+    qihse_peer_verdict_t verdict;
+} accept_arg_t;
+
+static void* accept_once(void* arg) {
+    accept_arg_t* a = (accept_arg_t*)arg;
+    a->session = qihse_federation_listener_accept(a->listener, 5000, &a->verdict);
+    return NULL;
+}
+
+static void test_listener_refuses_wildcard(const char* dir, const char* ca_key_path,
+                                           const qihse_federation_ca_t* ca) {
+    test_node_t n;
+    make_node(dir, ca, ca_key_path, "wild-node", QIHSE_RTRUST_TRUSTED, true, &n);
+
+    /* Exposing a federation port on every interface is an operator's decision,
+     * so a wildcard bind is refused rather than honoured silently. */
+    assert(qihse_federation_listener_open(n.tls, "0.0.0.0", 0) == NULL);
+    assert(qihse_federation_listener_open(n.tls, "::", 0) == NULL);
+    assert(qihse_federation_listener_open(n.tls, "*", 0) == NULL);
+    assert(qihse_federation_listener_open(n.tls, "", 0) == NULL);
+    /* An address this node does not have fails at bind, so a node that cannot
+     * listen says so at startup. */
+    assert(qihse_federation_listener_open(n.tls, "203.0.113.7", 0) == NULL);
+
+    qihse_federation_tls_server_destroy(n.tls);
+    printf("PASS listener: wildcard and unbindable addresses refused\n");
+}
+
+static void test_listener_accepts_verified_peer(const char* dir, const char* ca_key_path,
+                                                const qihse_federation_ca_t* ca) {
+    test_node_t server_node, client_node;
+    make_node(dir, ca, ca_key_path, "srv-l", QIHSE_RTRUST_TRUSTED, true, &server_node);
+    make_node(dir, ca, ca_key_path, "cli-l", QIHSE_RTRUST_TRUSTED, true, &client_node);
+
+    qihse_fed_listener_t* l = qihse_federation_listener_open(server_node.tls,
+                                                             "127.0.0.1", 0);
+    assert(l);
+    uint16_t port = qihse_federation_listener_port(l);
+    assert(port != 0);
+
+    /* Nobody connects: a timeout is NOT an error and the listener survives. */
+    qihse_peer_verdict_t idle = QIHSE_PEER_REJECT_MALFORMED;
+    assert(qihse_federation_listener_accept(l, 50, &idle) == NULL);
+    assert(qihse_federation_listener_port(l) == port);
+
+    accept_arg_t a;
+    memset(&a, 0, sizeof(a));
+    a.listener = l;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, accept_once, &a) == 0);
+
+    qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
+    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_to(client_node.tls,
+                                                                     "127.0.0.1", port,
+                                                                     5000, &cv);
+    pthread_join(th, NULL);
+
+    assert(a.session != NULL);
+    assert(a.verdict == QIHSE_PEER_ACCEPT);
+    assert(client != NULL);
+
+    /* The accepted session names the peer, so the server attributes the
+     * connection to an identity rather than to an address. */
+    qihse_uuid_t peer;
+    qihse_runtime_trust_t trust;
+    assert(qihse_federation_tls_peer_identity(a.session, &peer, &trust));
+    assert(qihse_uuid_equal(&peer, &client_node.id.node_id));
+
+    char group[64], version[32];
+    assert(qihse_federation_tls_negotiated(a.session, group, sizeof(group),
+                                          version, sizeof(version)));
+    assert(strcmp(version, "TLSv1.3") == 0);
+
+    qihse_federation_tls_session_destroy(a.session);
+    qihse_federation_tls_session_destroy(client);
+    qihse_federation_listener_close(l);
+    qihse_federation_tls_server_destroy(server_node.tls);
+    qihse_federation_tls_server_destroy(client_node.tls);
+    printf("PASS listener: idle timeout is not an error, verified peer accepted over TCP\n");
+}
+
+static void test_listener_survives_refusal(const char* dir, const char* ca_key_path,
+                                           const qihse_federation_ca_t* ca) {
+    test_node_t server_node, good, stranger;
+    make_node(dir, ca, ca_key_path, "srv-m", QIHSE_RTRUST_TRUSTED, true, &server_node);
+    make_node(dir, ca, ca_key_path, "good-m", QIHSE_RTRUST_TRUSTED, true, &good);
+    make_node(dir, ca, ca_key_path, "stranger-m", QIHSE_RTRUST_UNKNOWN, false, &stranger);
+
+    qihse_fed_listener_t* l = qihse_federation_listener_open(server_node.tls,
+                                                             "127.0.0.1", 0);
+    assert(l);
+    uint16_t port = qihse_federation_listener_port(l);
+
+    /* A peer with a valid federation certificate for a node that was never
+     * enrolled is refused. */
+    accept_arg_t bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.listener = l;
+    pthread_t th1;
+    assert(pthread_create(&th1, NULL, accept_once, &bad) == 0);
+
+    qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
+    qihse_fed_tls_session_t* refused = qihse_federation_tls_connect_to(stranger.tls,
+                                                                      "127.0.0.1", port,
+                                                                      5000, &cv);
+    pthread_join(th1, NULL);
+    assert(bad.session == NULL);
+    assert(refused == NULL);
+
+    /* THE point of the test: the refusal was per-connection.  A hostile peer
+     * cannot deny service by being refused, so the listener must still work. */
+    accept_arg_t ok;
+    memset(&ok, 0, sizeof(ok));
+    ok.listener = l;
+    pthread_t th2;
+    assert(pthread_create(&th2, NULL, accept_once, &ok) == 0);
+
+    qihse_peer_verdict_t cv2 = QIHSE_PEER_REJECT_MALFORMED;
+    qihse_fed_tls_session_t* accepted = qihse_federation_tls_connect_to(good.tls,
+                                                                      "127.0.0.1", port,
+                                                                      5000, &cv2);
+    pthread_join(th2, NULL);
+    assert(ok.session != NULL);
+    assert(ok.verdict == QIHSE_PEER_ACCEPT);
+    assert(accepted != NULL);
+
+    qihse_federation_tls_session_destroy(ok.session);
+    qihse_federation_tls_session_destroy(accepted);
+    qihse_federation_listener_close(l);
+    qihse_federation_tls_server_destroy(server_node.tls);
+    qihse_federation_tls_server_destroy(good.tls);
+    qihse_federation_tls_server_destroy(stranger.tls);
+    printf("PASS listener survives refusal: a refused peer does not take it down\n");
+}
+
+static void test_replication_over_real_tcp(const char* dir, const char* ca_key_path,
+                                           const qihse_federation_ca_t* ca) {
+    test_node_t server_node, client_node;
+    make_node(dir, ca, ca_key_path, "srv-n", QIHSE_RTRUST_TRUSTED, true, &server_node);
+    make_node(dir, ca, ca_key_path, "cli-n", QIHSE_RTRUST_TRUSTED, true, &client_node);
+
+    qihse_fed_listener_t* l = qihse_federation_listener_open(server_node.tls,
+                                                             "127.0.0.1", 0);
+    assert(l);
+    uint16_t port = qihse_federation_listener_port(l);
+
+    accept_arg_t a;
+    memset(&a, 0, sizeof(a));
+    a.listener = l;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, accept_once, &a) == 0);
+
+    qihse_peer_verdict_t cv;
+    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_to(client_node.tls,
+                                                                     "127.0.0.1", port,
+                                                                     5000, &cv);
+    pthread_join(th, NULL);
+    assert(a.session && client);
+
+    /* The range transfer rides the verified channel: the transport reports the
+     * peer fingerprint from the real certificate, so its "unverified peer"
+     * guard is satisfied by construction rather than by the caller asserting. */
+    qihse_repl_transport_ops_t ops = qihse_federation_tls_transport_ops(a.session);
+    qihse_repl_transport_t t;
+    assert(qihse_repl_transport_open(&t, &ops, a.session, "tcp"));
+    assert(t.peer_verified);
+
+    uint8_t fp[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    assert(ops.peer_fingerprint(a.session, fp));
+    qihse_federation_node_identity_t looked_up;
+    assert(qihse_federation_node_lookup(g_store, g_op, &client_node.id.node_id,
+                                       &looked_up));
+    assert(memcmp(fp, looked_up.fingerprint, sizeof(fp)) == 0);
+
+    qihse_repl_transport_close(&t);
+    qihse_federation_tls_session_destroy(a.session);
+    qihse_federation_tls_session_destroy(client);
+    qihse_federation_listener_close(l);
+    qihse_federation_tls_server_destroy(server_node.tls);
+    qihse_federation_tls_server_destroy(client_node.tls);
+    printf("PASS replication over TCP: verified fingerprint matches the enrolled record\n");
+}
+
 int main(void) {
     char data_root[] = "build/fed_transport_XXXXXX";
     assert(mkdtemp(data_root));
@@ -409,6 +597,10 @@ int main(void) {
     test_untrusted_enrolled_peer_refused(key_dir, ca_key_path, &ca);
     test_degraded_peer_admitted_with_less_authority(key_dir, ca_key_path, &ca);
     test_transport_over_tls(key_dir, ca_key_path, &ca);
+    test_listener_refuses_wildcard(key_dir, ca_key_path, &ca);
+    test_listener_accepts_verified_peer(key_dir, ca_key_path, &ca);
+    test_listener_survives_refusal(key_dir, ca_key_path, &ca);
+    test_replication_over_real_tcp(key_dir, ca_key_path, &ca);
 
     qihse_kv_store_destroy(g_store);
     printf("federation transport tests passed\n");

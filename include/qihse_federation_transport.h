@@ -97,6 +97,75 @@ bool qihse_federation_tls_negotiated(const qihse_fed_tls_session_t* session,
                                      char* out_group, size_t group_cap,
                                      char* out_version, size_t version_cap);
 
+/* ── Listener ──────────────────────────────────────────────────────────── */
+
+typedef struct qihse_fed_listener qihse_fed_listener_t;
+
+/* Bind and listen for federation peers.
+ *
+ * `bind_address` is REQUIRED and is not defaulted to a wildcard: a federation
+ * port exposed on every interface is a decision an operator must make
+ * deliberately, not one this code makes for them.  Pass "127.0.0.1" for a
+ * loopback-only node.  Port 0 asks the kernel for an ephemeral port, which
+ * qihse_federation_listener_port() then reports.
+ *
+ * Returns NULL if the address is unusable or the bind fails, so a node that
+ * cannot listen says so at startup rather than silently accepting nothing. */
+qihse_fed_listener_t* qihse_federation_listener_open(qihse_fed_tls_server_t* server,
+                                                    const char* bind_address,
+                                                    uint16_t port);
+
+void qihse_federation_listener_close(qihse_fed_listener_t* listener);
+
+/* The port actually bound, which matters when port 0 was requested. */
+uint16_t qihse_federation_listener_port(const qihse_fed_listener_t* listener);
+
+/* Accept ONE connection and complete the handshake with peer verification.
+ *
+ * Returns NULL when no peer arrives within `timeout_ms` — that is not an error
+ * and the listener remains usable — and also when a peer connects but is
+ * refused.  A refusal is per-connection: a hostile peer cannot take the
+ * listener down, and the caller cannot distinguish "refused" from "nobody
+ * called" except through `out_verdict`, which is what keeps a refusal from
+ * becoming an oracle.
+ *
+ * The returned session owns the connection; destroy it to close. */
+qihse_fed_tls_session_t* qihse_federation_listener_accept(qihse_fed_listener_t* listener,
+                                                         int timeout_ms,
+                                                         qihse_peer_verdict_t* out_verdict);
+
+/* Connect to a federation peer and complete the handshake.
+ *
+ * Symmetric with listener_accept: this node presents its certificate and
+ * verifies the peer's against the same CA under the same policy, so the two
+ * directions cannot drift apart.
+ *
+ * IMPORTANT ASYMMETRY, and it is a property of TLS 1.3 rather than of this
+ * code: the server validates the client's certificate AFTER the client's own
+ * handshake has completed.  So a client whose SSL_connect succeeded may be
+ * talking to a server that has already refused it.  A completed handshake on
+ * the initiating side therefore means "I verified the peer", NOT "the peer
+ * accepted me", and any decision that depends on the peer's acceptance needs
+ * an application-level confirmation.
+ *
+ * This function does a best-effort check for a post-handshake fatal alert so
+ * the common case of immediate refusal is reported as failure, but the check
+ * is a heuristic with a short window, not a guarantee.  Do not build an
+ * authority decision on it. */
+qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t* server,
+                                                        const char* host,
+                                                        uint16_t port,
+                                                        int timeout_ms,
+                                                        qihse_peer_verdict_t* out_verdict);
+
+/* True if the peer has sent a fatal alert or closed the connection.
+ *
+ * This is the reliable check: after the first successful exchange with a peer,
+ * a refusal will have surfaced.  Call it before acting on a session whose
+ * acceptance matters. */
+bool qihse_federation_tls_session_peer_gone(qihse_fed_tls_session_t* session,
+                                            int timeout_ms);
+
 /* ── Replication transport over the verified channel ───────────────────── */
 
 /* Build transport ops bound to a session.  The peer identity comes from the
