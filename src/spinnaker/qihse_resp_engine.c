@@ -52,15 +52,20 @@ typedef struct {
 
 typedef struct qihse_resp_client_ctx qihse_resp_client_ctx_t;
 
+#define QIHSE_RESP_MAX_WATCHES 8u
+
 typedef struct {
     qihse_resp_server_t* server;
     int fd;
     qihse_user_t* user;
+    uint32_t user_id;            /* numeric user id for federation attribution */
     uint64_t id;
     int protocol_version;
     bool asking;
     bool readonly;
     char name[128];
+    /* F2: per-session federation watch handles. */
+    qihse_federation_watch_t* federation_watches[QIHSE_RESP_MAX_WATCHES];
     /* Transaction (MULTI/EXEC) state */
     bool in_multi;
     bool multi_dirty;            /* a queued command had an error */
@@ -157,6 +162,9 @@ struct qihse_resp_server {
     qihse_uuid_t federation_node_id;
     qihse_federation_status_t federation_status;
     pthread_mutex_t federation_lock;
+    /* F2: event journal + watches. The journal is opened if a directory
+     * was configured; otherwise FEDERATION.EVENT.* returns an error. */
+    qihse_federation_journal_t* federation_journal;
     qihse_system_guard_window_t* guard_window;
     bool owns_bus;
     bool owns_failover;
@@ -705,6 +713,7 @@ static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_r
     free(password_text);
     if (!user) return qihse_resp_error(session, "WRONGPASS invalid username-password pair or user is disabled.");
     session->user = user;
+    session->user_id = qihse_user_get_id(user);
     *authenticated = true;
     return true;
 }
@@ -3770,6 +3779,15 @@ static void qihse_resp_session_pubsub_cleanup(qihse_resp_session_t* session) {
     session->sub_pattern_lens = NULL;
     session->sub_pattern_count = 0;
     session->sub_pattern_cap = 0;
+    /* F2: release any open federation watches. */
+    if (session->server && session->server->federation_journal) {
+        for (size_t i = 0; i < QIHSE_RESP_MAX_WATCHES; i++) {
+            if (session->federation_watches[i]) {
+                qihse_federation_watch_destroy(session->federation_watches[i]);
+                session->federation_watches[i] = NULL;
+            }
+        }
+    }
 }
 
 static bool qihse_resp_handle_publish(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -5146,6 +5164,26 @@ static bool qihse_fed_ns_list_cb(const qihse_federation_namespace_t* ns, void* u
     return true;
 }
 
+/* F2: journal replay callbacks for FEDERATION.EVENT.REPLAY. */
+static bool qihse_fed_replay_count_cb(const qihse_federation_event_t* event,
+                                     const uint8_t* payload, size_t payload_len,
+                                     void* user_data) {
+    (void)event; (void)payload; (void)payload_len;
+    (*(size_t*)user_data)++;
+    return true;
+}
+
+static bool qihse_fed_replay_emit_cb(const qihse_federation_event_t* event,
+                                    const uint8_t* payload, size_t payload_len,
+                                    void* user_data) {
+    qihse_resp_session_t* session = (qihse_resp_session_t*)user_data;
+    if (!qihse_resp_integer(session, (int64_t)event->journal_offset)) return false;
+    if (!qihse_resp_bulk_text(session, event->event_type)) return false;
+    if (!qihse_resp_bulk_text(session, event->resource_id)) return false;
+    (void)payload; (void)payload_len;
+    return true;
+}
+
 static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
                                         const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_error(session, "ERR usage: FEDERATION.STATUS|STATE|NS.REGISTER|NS.UNREGISTER|NS.LIST|NS.WRITABLE ...");
@@ -5249,6 +5287,159 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         pthread_mutex_unlock(&session->server->federation_lock);
         bool w = qihse_federation_namespace_writable(&ns, s, &session->server->federation_node_id);
         return qihse_resp_integer(session, w ? 1 : 0);
+    }
+
+    /* ── F2: Event journal + watches ────────────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "EVENT.APPEND")) {
+        if (request->argc < 4 || request->argc > 5) return qihse_resp_error(session, "ERR usage: FEDERATION.EVENT.APPEND <event_type> <resource_id> [payload]");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        char event_type[QIHSE_FEDERATION_EVENT_TYPE_MAX + 1u];
+        size_t etl = request->argv[2].len;
+        if (etl == 0 || etl > QIHSE_FEDERATION_EVENT_TYPE_MAX) return qihse_resp_error(session, "ERR invalid event type");
+        memcpy(event_type, request->argv[2].data, etl); event_type[etl] = '\0';
+        char resource_id[64];
+        size_t rl = request->argv[3].len;
+        if (rl == 0 || rl >= sizeof(resource_id)) return qihse_resp_error(session, "ERR invalid resource id");
+        memcpy(resource_id, request->argv[3].data, rl); resource_id[rl] = '\0';
+        const uint8_t* payload = NULL;
+        size_t payload_len = 0;
+        if (request->argc == 5) { payload = request->argv[4].data; payload_len = request->argv[4].len; }
+        qihse_federation_mutation_t m;
+        memset(&m, 0, sizeof(m));
+        m.origin_node = session->server->federation_node_id;
+        /* principal_id: derive from the authenticated user id. */
+        qihse_uuid_from_seed(&session->user_id, sizeof(session->user_id), &m.principal_id);
+        m.consistency = QIHSE_CONSISTENCY_LOCAL;
+        qihse_federation_event_t ev;
+        uint64_t off = qihse_federation_journal_append(session->server->federation_journal,
+                                                      &m, event_type, resource_id,
+                                                      payload, payload_len, &ev);
+        if (off == 0) return qihse_resp_error(session, "ERR journal append failed");
+        return qihse_resp_integer(session, (int64_t)off);
+    }
+
+    if (qihse_resp_arg_equal(sub, "EVENT.REPLAY")) {
+        if (request->argc != 2 && request->argc != 3) return qihse_resp_error(session, "ERR usage: FEDERATION.EVENT.REPLAY [from_cursor]");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        uint64_t from = 0;
+        if (request->argc == 3) {
+            char cur_str[32];
+            size_t cl = request->argv[2].len;
+            if (cl == 0 || cl >= sizeof(cur_str)) return qihse_resp_error(session, "ERR invalid cursor");
+            memcpy(cur_str, request->argv[2].data, cl); cur_str[cl] = '\0';
+            from = (uint64_t)strtoull(cur_str, NULL, 10);
+        }
+        /* Two-pass: count then emit. */
+        size_t count = 0;
+        qihse_federation_journal_replay(session->server->federation_journal, from,
+                                        qihse_fed_replay_count_cb, &count);
+        if (!qihse_resp_array(session, count * 3u)) return false;
+        qihse_federation_journal_replay(session->server->federation_journal, from,
+                                        qihse_fed_replay_emit_cb, session);
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "EVENT.LENGTH")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.event.length");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        uint64_t len = qihse_federation_journal_length(session->server->federation_journal);
+        return qihse_resp_integer(session, (int64_t)len);
+    }
+
+    if (qihse_resp_arg_equal(sub, "WATCH.OPEN")) {
+        if (request->argc != 2 && request->argc != 3) return qihse_resp_error(session, "ERR usage: FEDERATION.WATCH.OPEN [prefix]");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        qihse_federation_watch_config_t wcfg;
+        memset(&wcfg, 0, sizeof(wcfg));
+        if (request->argc == 3) {
+            size_t pl = request->argv[2].len;
+            if (pl >= sizeof(wcfg.prefix)) return qihse_resp_error(session, "ERR prefix too long");
+            memcpy(wcfg.prefix, request->argv[2].data, pl); wcfg.prefix[pl] = '\0';
+        }
+        wcfg.backlog_limit = 1024;
+        qihse_federation_watch_t* w = qihse_federation_watch_open(
+            session->server->federation_journal, &wcfg);
+        if (!w) return qihse_resp_error(session, "ERR watch open failed");
+        /* Store the watch on the session. We use a simple slot array. */
+        for (size_t i = 0; i < QIHSE_RESP_MAX_WATCHES; i++) {
+            if (!session->federation_watches[i]) {
+                session->federation_watches[i] = w;
+                return qihse_resp_integer(session, (int64_t)i);
+            }
+        }
+        qihse_federation_watch_destroy(w);
+        return qihse_resp_error(session, "ERR too many open watches");
+    }
+
+    if (qihse_resp_arg_equal(sub, "WATCH.NEXT")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.watch.next");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        char id_str[16];
+        size_t il = request->argv[2].len;
+        if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
+        memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
+        int wid = atoi(id_str);
+        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+            return qihse_resp_error(session, "ERR invalid watch id");
+        }
+        qihse_federation_event_t ev;
+        uint8_t* payload = NULL;
+        size_t plen = 0;
+        if (!qihse_federation_watch_next(session->federation_watches[wid], &ev, &payload, &plen)) {
+            return qihse_resp_integer(session, 0); /* end of journal */
+        }
+        /* Emit as array: [offset, event_type, resource_id, payload] */
+        if (!qihse_resp_array(session, 4)) { if (payload) free(payload); return false; }
+        if (!qihse_resp_integer(session, (int64_t)ev.journal_offset)) { if (payload) free(payload); return false; }
+        if (!qihse_resp_bulk_text(session, ev.event_type)) { if (payload) free(payload); return false; }
+        if (!qihse_resp_bulk_text(session, ev.resource_id)) { if (payload) free(payload); return false; }
+        bool ok = qihse_resp_bulk(session, payload, plen);
+        if (payload) free(payload);
+        return ok;
+    }
+
+    if (qihse_resp_arg_equal(sub, "WATCH.ACK")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.watch.ack");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        char id_str[16];
+        size_t il = request->argv[2].len;
+        if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
+        memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
+        int wid = atoi(id_str);
+        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+            return qihse_resp_error(session, "ERR invalid watch id");
+        }
+        char off_str[32];
+        size_t ol = request->argv[3].len;
+        if (ol == 0 || ol >= sizeof(off_str)) return qihse_resp_error(session, "ERR invalid offset");
+        memcpy(off_str, request->argv[3].data, ol); off_str[ol] = '\0';
+        uint64_t off = (uint64_t)strtoull(off_str, NULL, 10);
+        if (!qihse_federation_watch_ack(session->federation_watches[wid], off)) {
+            return qihse_resp_error(session, "ERR ack failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "WATCH.RESUME")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.watch.resume");
+        if (!session->server->federation_journal) return qihse_resp_error(session, "ERR federation journal not configured");
+        char id_str[16];
+        size_t il = request->argv[2].len;
+        if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
+        memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
+        int wid = atoi(id_str);
+        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+            return qihse_resp_error(session, "ERR invalid watch id");
+        }
+        char cur_str[32];
+        size_t cl = request->argv[3].len;
+        if (cl == 0 || cl >= sizeof(cur_str)) return qihse_resp_error(session, "ERR invalid cursor");
+        memcpy(cur_str, request->argv[3].data, cl); cur_str[cl] = '\0';
+        uint64_t cur = (uint64_t)strtoull(cur_str, NULL, 10);
+        if (!qihse_federation_watch_resume(session->federation_watches[wid], cur)) {
+            return qihse_resp_error(session, "ERR resume failed");
+        }
+        return qihse_resp_simple(session, "OK");
     }
 
     return qihse_resp_error(session, "ERR unknown FEDERATION subcommand");
@@ -5910,6 +6101,12 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         qihse_uuid_from_seed(seed, strlen(seed), &server->federation_node_id);
         qihse_federation_status_init(&server->federation_status, &server->federation_node_id);
     }
+    /* F2: open the federation event journal if a directory was configured. */
+    if (supplied->federation_journal_directory) {
+        server->federation_journal = qihse_federation_journal_open(
+            supplied->federation_journal_directory,
+            supplied->federation_journal_durability);
+    }
     if (!server->topology) {
         qihse_resp_server_destroy(server);
         return NULL;
@@ -6185,6 +6382,10 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_mutex_destroy(&server->state_lock);
     pthread_mutex_destroy(&server->group_lock);
     pthread_mutex_destroy(&server->federation_lock);
+    if (server->federation_journal) {
+        qihse_federation_journal_destroy(server->federation_journal);
+        server->federation_journal = NULL;
+    }
     free(server);
 }
 

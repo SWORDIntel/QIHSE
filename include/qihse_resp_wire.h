@@ -72,6 +72,9 @@ typedef struct {
     const char* pubsub_log_directory;
     uint16_t channel_classification;
     uint16_t channel_sci;
+    /* F2: federation event journal log directory. NULL = journal disabled. */
+    const char* federation_journal_directory;
+    qihse_es_durability_t federation_journal_durability;
     /* UWP bridge: allow qihse_resp_server_execute() (QIHSE_UWP_TARGET_RESP)
      * to run commands through this server's dispatch path. Default true. */
     bool enable_uwp_bridge;

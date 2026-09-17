@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "qihse_event_stream.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -209,6 +210,135 @@ typedef bool (*qihse_federation_ns_iter_cb)(const qihse_federation_namespace_t* 
 void qihse_federation_namespace_foreach(void* store_void, void* user_void,
                                         qihse_federation_ns_iter_cb cb,
                                         void* user_data);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F2 — Event journal + watches (plan §8, §9, §12, §13).
+ *
+ * Every cross-node mutation carries a federation mutation envelope so the
+ * journal can deduplicate retries (idempotency), attribute changes, and
+ * detect conflicts.  The journal itself is an append-only log backed by
+ * qihse_event_stream under the "federation" topic; records form a hash
+ * chain for tamper-evidence.  Watches are resumable cursors over the
+ * journal with prefix filtering and at-least-once delivery.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Mutation envelope (plan §8). Every cross-node write path carries this. */
+typedef struct {
+    qihse_uuid_t request_id;      /* idempotency key — retries reuse it */
+    qihse_uuid_t origin_node;     /* node that initiated the mutation */
+    qihse_uuid_t principal_id;    /* authenticated principal */
+    qihse_hlc_t  hlc;             /* causal timestamp */
+    uint64_t     expected_generation; /* CAS guard; 0 = no CAS */
+    uint64_t     fencing_epoch;   /* exclusive-state epoch; 0 = none */
+    qihse_consistency_class_t consistency;
+    uint32_t     flags;           /* reserved */
+} qihse_federation_mutation_t;
+
+/* Idempotency ledger (plan §9). Bounded, KV-backed under "fedreq:". Maps
+ * request_id -> result digest + completion generation. Every entry takes
+ * an explicit authenticated user (AGENTS.md invariant 1). */
+typedef struct {
+    qihse_uuid_t request_id;
+    uint64_t     completed_generation;
+    uint32_t     result_code;
+    char         result_digest[64]; /* hex SHA-384 truncated, or empty */
+} qihse_federation_request_result_t;
+
+#define QIHSE_FEDERATION_REQ_PREFIX "fedreq:"
+
+/* Record a completed request. Returns false if the request_id is already
+ * present (caller should treat that as a replay and fetch the stored result
+ * instead of re-executing). */
+bool qihse_federation_request_record(void* store_void, void* user_void,
+                                     const qihse_federation_request_result_t* result);
+/* Look up a previously completed request. Returns false if not found. */
+bool qihse_federation_request_lookup(void* store_void, void* user_void,
+                                     const qihse_uuid_t* request_id,
+                                     qihse_federation_request_result_t* out);
+/* Is this request_id already completed? (idempotency check before execute) */
+bool qihse_federation_request_seen(void* store_void, void* user_void,
+                                   const qihse_uuid_t* request_id);
+
+/* ── Event journal ──────────────────────────────────────────────────────── */
+
+#define QIHSE_FEDERATION_JOURNAL_TOPIC "federation"
+#define QIHSE_FEDERATION_EVENT_TYPE_MAX 63u
+
+typedef struct {
+    qihse_uuid_t event_id;        /* journal-assigned, monotonic-ish */
+    qihse_federation_mutation_t mutation;
+    char event_type[QIHSE_FEDERATION_EVENT_TYPE_MAX + 1u];
+    char resource_id[64];
+    uint64_t journal_offset;      /* assigned by the event stream */
+    uint8_t  previous_hash[48];   /* SHA-384 chain */
+    uint8_t  hash[48];            /* SHA-384 of (previous_hash || envelope || payload) */
+} qihse_federation_event_t;
+
+/* Opaque journal handle. Backed by qihse_event_stream. */
+typedef struct qihse_federation_journal qihse_federation_journal_t;
+
+qihse_federation_journal_t* qihse_federation_journal_open(const char* log_directory,
+                                                         qihse_es_durability_t durability);
+void qihse_federation_journal_destroy(qihse_federation_journal_t* journal);
+
+/* Append a federation event. The envelope's hlc is ticked from the journal's
+ * clock if it is zero; the event_id is generated if nil. The hash chain is
+ * extended from the previous record. Returns the journal offset, or 0 on
+ * failure. The payload is opaque bytes stored alongside the envelope. */
+uint64_t qihse_federation_journal_append(qihse_federation_journal_t* journal,
+                                        const qihse_federation_mutation_t* mutation,
+                                        const char* event_type,
+                                        const char* resource_id,
+                                        const uint8_t* payload, size_t payload_len,
+                                        qihse_federation_event_t* out_event);
+
+/* Replay events from a cursor (0 = beginning). Returns the number of events
+ * replayed. cb returns false to stop. */
+typedef bool (*qihse_federation_journal_cb)(const qihse_federation_event_t* event,
+                                           const uint8_t* payload, size_t payload_len,
+                                           void* user_data);
+uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
+                                        uint64_t from_cursor,
+                                        qihse_federation_journal_cb cb,
+                                        void* user_data);
+
+/* Current journal length (offset of the next append). */
+uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal);
+
+/* ── Resumable watches (plan §13) ───────────────────────────────────────── */
+
+typedef struct qihse_federation_watch qihse_federation_watch_t;
+
+typedef struct {
+    char prefix[64];        /* resource_id prefix filter; "" = all */
+    uint64_t cursor;        /* resume point; 0 = from beginning */
+    uint64_t last_ack;      /* highest acknowledged offset */
+    size_t  backlog_limit;  /* max unacked events before backpressure */
+} qihse_federation_watch_config_t;
+
+qihse_federation_watch_t* qihse_federation_watch_open(qihse_federation_journal_t* journal,
+                                                     const qihse_federation_watch_config_t* config);
+void qihse_federation_watch_destroy(qihse_federation_watch_t* watch);
+
+/* Fetch the next event matching the prefix filter. Returns false at
+ * end-of-journal (caller may poll or sleep). Advances the internal cursor
+ * but does NOT advance last_ack — call qihse_federation_watch_ack(). */
+bool qihse_federation_watch_next(qihse_federation_watch_t* watch,
+                                qihse_federation_event_t* out_event,
+                                uint8_t** out_payload, size_t* out_payload_len);
+
+/* Acknowledge events up to `offset`. At-least-once: unacked events are
+ * re-delivered on resume. */
+bool qihse_federation_watch_ack(qihse_federation_watch_t* watch, uint64_t offset);
+
+/* Resume a watch from a previously saved cursor (e.g. after reconnect). */
+bool qihse_federation_watch_resume(qihse_federation_watch_t* watch, uint64_t cursor);
+
+/* Get the current cursor and last_ack for persistence. */
+uint64_t qihse_federation_watch_cursor(const qihse_federation_watch_t* watch);
+uint64_t qihse_federation_watch_last_ack(const qihse_federation_watch_t* watch);
+/* Number of unacked events in the backlog. */
+size_t qihse_federation_watch_backlog(const qihse_federation_watch_t* watch);
 
 #ifdef __cplusplus
 }

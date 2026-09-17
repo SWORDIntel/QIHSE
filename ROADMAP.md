@@ -80,7 +80,7 @@ The accepted major direction. Governing principle: **federation must enhance a n
 
 - [x] **F0 — Refactor boundaries.** Federation module skeleton, UUID/HLC/object-generation/fencing-epoch primitives, current cluster semantics documented. No behavior changes.
 - [x] **F1 — Sovereign local state.** Consistency classes (LOCAL/EVENTUAL/CAUSAL/QUORUM/LINEARIZABLE), local-authority namespaces, no global quorum gate on local-safe writes, federation status API. *Unblocks acceptance criteria 1–2.*
-- [ ] **F2 — Event journal + watches.** Immutable mutation envelope, resumable watch API, idempotent request IDs, controller SDK. *Unblocks W2, W3-phase-2, and acceptance criteria 5, 9, 10.*
+- [x] **F2 — Event journal + watches.** Immutable mutation envelope, resumable watch API, idempotent request IDs, controller SDK. *Unblocks W2, W3-phase-2, and acceptance criteria 5, 9, 10.*
 - [ ] **F3 — Replication correctness.** Anti-entropy, manifests/range digests, explicit conflict objects, resumable reconciliation. *Needs F2. Unblocks criteria 6–7.*
 - [ ] **F4 — Strong namespace.** Scoped consensus groups, native CAS, monotonic fencing epochs, lease primitive, explicit membership. *Needs F1+F2. Unblocks criteria 3–4, 10.*
 - [ ] **F5 — Trust plane.** Node enrollment, mTLS, signed replay-resistant gossip, revocation, infrastructure security scopes. *Needs F0 identity primitives. Unblocks criterion 8 and overlay phase-2 membership.*

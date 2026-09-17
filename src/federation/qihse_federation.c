@@ -8,12 +8,14 @@
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "qihse_auth.h"
+#include "qihse_event_stream.h"
 #include "qihse_kv_store.h"
 
 /* ── UUID ───────────────────────────────────────────────────────────────── */
@@ -449,4 +451,384 @@ void qihse_federation_namespace_foreach(void* store_void, void* user_void,
     ns_iter_ctx_t ctx = { cb, user_data };
     qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
                           ns_iter_cb, &ctx);
+}
+
+/* ── F2: Idempotency ledger ──────────────────────────────────────────────── */
+
+static void req_kv_key(const qihse_uuid_t* request_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(request_id, id_str);
+    snprintf(out, cap, QIHSE_FEDERATION_REQ_PREFIX "%s", id_str);
+}
+
+/* Wire format: <result_code>\t<completed_generation>\t<result_digest> */
+static void req_encode(const qihse_federation_request_result_t* r, char* out, size_t cap) {
+    snprintf(out, cap, "%u\t%llu\t%s", (unsigned)r->result_code,
+             (unsigned long long)r->completed_generation, r->result_digest);
+}
+
+static bool req_decode(const char* blob, qihse_federation_request_result_t* out) {
+    if (!blob || !out) return false;
+    unsigned rc = 0;
+    unsigned long long gen = 0;
+    char digest[64];
+    digest[0] = '\0';
+    if (sscanf(blob, "%u\t%llu\t%63[^\n]", &rc, &gen, digest) < 2) return false;
+    out->result_code = rc;
+    out->completed_generation = (uint64_t)gen;
+    snprintf(out->result_digest, sizeof(out->result_digest), "%s", digest);
+    return true;
+}
+
+bool qihse_federation_request_record(void* store_void, void* user_void,
+                                     const qihse_federation_request_result_t* result) {
+    if (!store_void || !user_void || !result) return false;
+    char key[128];
+    req_kv_key(&result->request_id, key, sizeof(key));
+    /* Check for existing — idempotency: a replay must not overwrite. */
+    char* existing = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                       (qihse_user_t*)user_void);
+    if (existing) { free(existing); return false; }
+    char blob[256];
+    req_encode(result, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_request_lookup(void* store_void, void* user_void,
+                                     const qihse_uuid_t* request_id,
+                                     qihse_federation_request_result_t* out) {
+    if (!store_void || !user_void || !request_id || !out) return false;
+    char key[128];
+    req_kv_key(request_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                  (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = req_decode(blob, out);
+    out->request_id = *request_id;
+    free(blob);
+    return ok;
+}
+
+bool qihse_federation_request_seen(void* store_void, void* user_void,
+                                   const qihse_uuid_t* request_id) {
+    if (!store_void || !user_void || !request_id) return false;
+    char key[128];
+    req_kv_key(request_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                  (qihse_user_t*)user_void);
+    if (!blob) return false;
+    free(blob);
+    return true;
+}
+
+/* ── F2: Event journal ──────────────────────────────────────────────────── */
+
+struct qihse_federation_journal {
+    qihse_event_stream_t* stream;
+    qihse_hlc_t clock;
+    uint8_t previous_hash[48];
+    bool has_previous;
+};
+
+qihse_federation_journal_t* qihse_federation_journal_open(const char* log_directory,
+                                                         qihse_es_durability_t durability) {
+    if (!log_directory) return NULL;
+    qihse_federation_journal_t* j = (qihse_federation_journal_t*)calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    j->stream = qihse_event_stream_open(log_directory, durability, false);
+    if (!j->stream) {
+        free(j);
+        return NULL;
+    }
+    qihse_hlc_init(&j->clock);
+    memset(j->previous_hash, 0, sizeof(j->previous_hash));
+    j->has_previous = false;
+    /* Replay to recover the last hash so the chain continues across restarts. */
+    qihse_es_record_header_t hdr;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+    uint64_t cursor = 0;
+    while (qihse_event_stream_iterate(j->stream, QIHSE_FEDERATION_JOURNAL_TOPIC,
+                                      &cursor, &hdr, &payload, &plen)) {
+        /* The event_id field in the record header is the hash of the record.
+         * We use it as the chain tip. */
+        memcpy(j->previous_hash, hdr.event_id, 48);
+        j->has_previous = true;
+        free(payload);
+        payload = NULL;
+    }
+    return j;
+}
+
+void qihse_federation_journal_destroy(qihse_federation_journal_t* journal) {
+    if (!journal) return;
+    if (journal->stream) qihse_event_stream_destroy(journal->stream);
+    free(journal);
+}
+
+/* Serialize a mutation envelope + event metadata into a payload for the
+ * event stream. Format (all little-endian, fixed-width):
+ *   [event_type 64B][resource_id 64B]
+ *   [mutation: request_id 16 + origin 16 + principal 16 + hlc 12 +
+ *              expected_gen 8 + fencing_epoch 8 + consistency 4 + flags 4]
+ *   [previous_hash 48B]
+ *   [user_payload...]                                            */
+static void journal_serialize(const qihse_federation_event_t* ev,
+                              const uint8_t* user_payload, size_t user_len,
+                              uint8_t* out, size_t out_cap) {
+    size_t off = 0;
+    memset(out, 0, out_cap);
+    memcpy(out + off, ev->event_type, 64); off += 64;
+    memcpy(out + off, ev->resource_id, 64); off += 64;
+    /* mutation */
+    memcpy(out + off, &ev->mutation.request_id, 16); off += 16;
+    memcpy(out + off, &ev->mutation.origin_node, 16); off += 16;
+    memcpy(out + off, &ev->mutation.principal_id, 16); off += 16;
+    memcpy(out + off, &ev->mutation.hlc, sizeof(qihse_hlc_t)); off += sizeof(qihse_hlc_t);
+    memcpy(out + off, &ev->mutation.expected_generation, 8); off += 8;
+    memcpy(out + off, &ev->mutation.fencing_epoch, 8); off += 8;
+    uint32_t cc = (uint32_t)ev->mutation.consistency;
+    memcpy(out + off, &cc, 4); off += 4;
+    memcpy(out + off, &ev->mutation.flags, 4); off += 4;
+    /* hash chain */
+    memcpy(out + off, ev->previous_hash, 48); off += 48;
+    if (user_payload && user_len) {
+        memcpy(out + off, user_payload, user_len); off += user_len;
+    }
+}
+
+static void journal_deserialize(const uint8_t* blob, size_t blen,
+                                qihse_federation_event_t* ev,
+                                const uint8_t** out_user_payload,
+                                size_t* out_user_len) {
+    size_t off = 0;
+    memset(ev, 0, sizeof(*ev));
+    memcpy(ev->event_type, blob + off, 64); ev->event_type[64] = '\0'; off += 64;
+    memcpy(ev->resource_id, blob + off, 64); ev->resource_id[64] = '\0'; off += 64;
+    memcpy(&ev->mutation.request_id, blob + off, 16); off += 16;
+    memcpy(&ev->mutation.origin_node, blob + off, 16); off += 16;
+    memcpy(&ev->mutation.principal_id, blob + off, 16); off += 16;
+    memcpy(&ev->mutation.hlc, blob + off, sizeof(qihse_hlc_t)); off += sizeof(qihse_hlc_t);
+    memcpy(&ev->mutation.expected_generation, blob + off, 8); off += 8;
+    memcpy(&ev->mutation.fencing_epoch, blob + off, 8); off += 8;
+    uint32_t cc = 0;
+    memcpy(&cc, blob + off, 4); off += 4;
+    ev->mutation.consistency = (qihse_consistency_class_t)cc;
+    memcpy(&ev->mutation.flags, blob + off, 4); off += 4;
+    memcpy(ev->previous_hash, blob + off, 48); off += 48;
+    if (out_user_payload && out_user_len) {
+        *out_user_len = blen > off ? blen - off : 0;
+        *out_user_payload = *out_user_len > 0 ? blob + off : NULL;
+    }
+}
+
+/* Compute SHA-384 of (previous_hash || serialized_envelope || user_payload).
+ * The event stream already computes its own event_id as SHA-384(topic||payload),
+ * but we also embed an explicit hash chain in the payload for tamper-evidence
+ * that survives topic changes. */
+static void journal_hash(const uint8_t* previous_hash, const uint8_t* serialized,
+                         size_t slen, const uint8_t* user_payload, size_t user_len,
+                         uint8_t out[48]) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) { memset(out, 0, 48); return; }
+    EVP_DigestInit_ex(ctx, EVP_sha384(), NULL);
+    EVP_DigestUpdate(ctx, previous_hash, 48);
+    EVP_DigestUpdate(ctx, serialized, slen);
+    if (user_payload && user_len) EVP_DigestUpdate(ctx, user_payload, user_len);
+    unsigned int hlen = 48;
+    EVP_DigestFinal_ex(ctx, out, &hlen);
+    EVP_MD_CTX_free(ctx);
+}
+
+uint64_t qihse_federation_journal_append(qihse_federation_journal_t* journal,
+                                        const qihse_federation_mutation_t* mutation,
+                                        const char* event_type,
+                                        const char* resource_id,
+                                        const uint8_t* payload, size_t payload_len,
+                                        qihse_federation_event_t* out_event) {
+    if (!journal || !mutation || !event_type) return 0;
+    qihse_federation_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.mutation = *mutation;
+    snprintf(ev.event_type, sizeof(ev.event_type), "%s", event_type);
+    if (resource_id) snprintf(ev.resource_id, sizeof(ev.resource_id), "%s", resource_id);
+    /* Tick the HLC if the caller didn't supply one. */
+    if (ev.mutation.hlc.physical_ms == 0 && ev.mutation.hlc.logical == 0) {
+        qihse_hlc_tick(&journal->clock, &ev.mutation.hlc);
+    } else {
+        qihse_hlc_observe(&journal->clock, &ev.mutation.hlc);
+    }
+    /* Generate an event_id if nil. */
+    if (qihse_uuid_is_nil(&ev.mutation.request_id)) {
+        qihse_uuid_generate(&ev.mutation.request_id);
+    }
+    ev.event_id = ev.mutation.request_id; /* event_id == request_id for dedupe */
+    /* Hash chain. */
+    if (journal->has_previous) {
+        memcpy(ev.previous_hash, journal->previous_hash, 48);
+    } else {
+        memset(ev.previous_hash, 0, 48);
+    }
+    /* Serialize. */
+    size_t header_len = 64 + 64 + 16 + 16 + 16 + sizeof(qihse_hlc_t) + 8 + 8 + 4 + 4 + 48;
+    size_t total = header_len + payload_len;
+    uint8_t* buf = (uint8_t*)malloc(total);
+    if (!buf) return 0;
+    journal_serialize(&ev, payload, payload_len, buf, total);
+    /* Compute the embedded hash. */
+    journal_hash(ev.previous_hash, buf, header_len, payload, payload_len, ev.hash);
+    /* Re-serialize with the hash filled in (hash goes after previous_hash). */
+    /* Actually the hash is not stored in the payload — it's recomputed on
+     * replay. We store previous_hash in the payload; the record header's
+     * event_id (SHA-384 of topic||payload) serves as the chain link. */
+    /* Append to the event stream. */
+    uint64_t offset = qihse_event_stream_append_record(journal->stream,
+                                                       QIHSE_FEDERATION_JOURNAL_TOPIC,
+                                                       1u, /* schema version */
+                                                       ev.hash, /* use our hash as event_id */
+                                                       buf, total);
+    free(buf);
+    if (offset == 0) return 0;
+    ev.journal_offset = offset;
+    /* Update the chain tip. */
+    memcpy(journal->previous_hash, ev.hash, 48);
+    journal->has_previous = true;
+    if (out_event) *out_event = ev;
+    return offset;
+}
+
+uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
+                                        uint64_t from_cursor,
+                                        qihse_federation_journal_cb cb,
+                                        void* user_data) {
+    if (!journal || !cb) return 0;
+    qihse_es_record_header_t hdr;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+    uint64_t cursor = from_cursor;
+    uint64_t count = 0;
+    while (qihse_event_stream_iterate(journal->stream, QIHSE_FEDERATION_JOURNAL_TOPIC,
+                                      &cursor, &hdr, &payload, &plen)) {
+        qihse_federation_event_t ev;
+        const uint8_t* user_payload = NULL;
+        size_t user_len = 0;
+        journal_deserialize(payload, plen, &ev, &user_payload, &user_len);
+        ev.journal_offset = hdr.stream_offset;
+        memcpy(ev.hash, hdr.event_id, 48);
+        bool cont = cb(&ev, user_payload, user_len, user_data);
+        free(payload);
+        payload = NULL;
+        count++;
+        if (!cont) break;
+    }
+    return count;
+}
+
+uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal) {
+    if (!journal || !journal->stream) return 0;
+    return qihse_event_stream_length(journal->stream, QIHSE_FEDERATION_JOURNAL_TOPIC);
+}
+
+/* ── F2: Resumable watches ──────────────────────────────────────────────── */
+
+struct qihse_federation_watch {
+    qihse_federation_journal_t* journal;
+    char prefix[64];
+    uint64_t cursor;
+    uint64_t last_ack;
+    size_t backlog_limit;
+};
+
+qihse_federation_watch_t* qihse_federation_watch_open(qihse_federation_journal_t* journal,
+                                                     const qihse_federation_watch_config_t* config) {
+    if (!journal) return NULL;
+    qihse_federation_watch_t* w = (qihse_federation_watch_t*)calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->journal = journal;
+    if (config) {
+        snprintf(w->prefix, sizeof(w->prefix), "%s", config->prefix);
+        w->cursor = config->cursor;
+        w->last_ack = config->last_ack;
+        w->backlog_limit = config->backlog_limit ? config->backlog_limit : 1024;
+    } else {
+        w->backlog_limit = 1024;
+    }
+    return w;
+}
+
+void qihse_federation_watch_destroy(qihse_federation_watch_t* watch) {
+    free(watch);
+}
+
+bool qihse_federation_watch_next(qihse_federation_watch_t* watch,
+                                qihse_federation_event_t* out_event,
+                                uint8_t** out_payload, size_t* out_payload_len) {
+    if (!watch || !out_event) return false;
+    qihse_es_record_header_t hdr;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+    while (qihse_event_stream_iterate(watch->journal->stream,
+                                      QIHSE_FEDERATION_JOURNAL_TOPIC,
+                                      &watch->cursor, &hdr, &payload, &plen)) {
+        qihse_federation_event_t ev;
+        const uint8_t* user_payload = NULL;
+        size_t user_len = 0;
+        journal_deserialize(payload, plen, &ev, &user_payload, &user_len);
+        ev.journal_offset = hdr.stream_offset;
+        memcpy(ev.hash, hdr.event_id, 48);
+        /* Prefix filter on resource_id. */
+        if (watch->prefix[0] != '\0' &&
+            strncmp(ev.resource_id, watch->prefix, strlen(watch->prefix)) != 0) {
+            free(payload);
+            payload = NULL;
+            continue;
+        }
+        *out_event = ev;
+        if (out_payload && out_payload_len) {
+            if (user_payload && user_len > 0) {
+                *out_payload = (uint8_t*)malloc(user_len);
+                if (*out_payload) {
+                    memcpy(*out_payload, user_payload, user_len);
+                    *out_payload_len = user_len;
+                } else {
+                    *out_payload_len = 0;
+                }
+            } else {
+                *out_payload = NULL;
+                *out_payload_len = 0;
+            }
+        }
+        free(payload);
+        return true;
+    }
+    return false;
+}
+
+bool qihse_federation_watch_ack(qihse_federation_watch_t* watch, uint64_t offset) {
+    if (!watch) return false;
+    if (offset > watch->last_ack) watch->last_ack = offset;
+    return true;
+}
+
+bool qihse_federation_watch_resume(qihse_federation_watch_t* watch, uint64_t cursor) {
+    if (!watch) return false;
+    watch->cursor = cursor;
+    return true;
+}
+
+uint64_t qihse_federation_watch_cursor(const qihse_federation_watch_t* watch) {
+    return watch ? watch->cursor : 0;
+}
+
+uint64_t qihse_federation_watch_last_ack(const qihse_federation_watch_t* watch) {
+    return watch ? watch->last_ack : 0;
+}
+
+size_t qihse_federation_watch_backlog(const qihse_federation_watch_t* watch) {
+    if (!watch) return 0;
+    /* Backlog = events delivered but not yet acked. */
+    if (watch->cursor <= watch->last_ack) return 0;
+    /* This is approximate since cursor is a byte offset, not an event count. */
+    return 0; /* precise backlog tracking requires per-event ack bookkeeping */
 }
