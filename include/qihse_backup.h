@@ -11,16 +11,46 @@
 extern "C" {
 #endif
 
-/* ── Legacy whole-store export (unclassified only) ────────────────────────
+/* ── Whole-store export (manifest-free container) ────────────────────────
  *
- * This surface takes no security context, so it can only ever move
- * unclassified data (the KV layer's NULL-user path denies classified/SCI
- * records).  It is retained for compatibility and for the unclassified
- * operational snapshot it was written for.  New work MUST use the
- * context-taking federation backup API below, which propagates an
- * authenticated principal to the lowest data-retrieval layer (AGENTS.md
- * invariant 1).
+ * A whole-store container: a 64-byte fixed header (magic, version, type,
+ * LSN range, timestamp, data length, the writer's clearance/SCI bound and a
+ * FNV-1a over the header prefix and the data section) followed by a data
+ * section produced by the KV layer's own authorization-aware export.
+ *
+ * Every entry point takes an authenticated principal and fails closed
+ * (AGENTS.md invariant 1).  A NULL context is an argument error, never
+ * "export everything"; a revoked handle is denied.  The identity is
+ * propagated to the KV layer — the only layer that knows a record's
+ * classification — so a principal that may not read a record may neither
+ * export nor restore it, and the KV layer refuses the WHOLE export/import
+ * rather than producing a quietly partial one (invariant 2).  Nothing is
+ * written or applied when a call is refused.
+ *
+ * The container records the writing principal's clearance/SCI as an upper
+ * bound on what it can hold (the KV layer refuses an export containing a
+ * record above the writer's clearance), which is the only classification
+ * signal available when there is no store to ask — so list, verify and
+ * restore refuse a container whose recorded bound the caller does not
+ * dominate.  A listing is refused whole rather than filtered, because the
+ * existence of a higher-bound container is itself metadata a lower
+ * principal may not see.
+ *
+ * Return codes (this surface predates qihse_backup_result_t and stays an
+ * int, matching the KV layer's own convention; a denial also sets
+ * errno = EACCES, as the KV layer's export/import does):
+ *    0  QIHSE_BACKUP_EXPORT_OK          success
+ *   -1  QIHSE_BACKUP_EXPORT_ERR         argument, container or I/O error
+ *   -2  QIHSE_BACKUP_EXPORT_DENIED      the principal is not live, or a
+ *                                       record/container is outside its
+ *                                       clearance/SCI
+ *   -3  QIHSE_BACKUP_EXPORT_UNSUPPORTED this layer cannot honour the request
  * ───────────────────────────────────────────────────────────────────────── */
+
+#define QIHSE_BACKUP_EXPORT_OK           0
+#define QIHSE_BACKUP_EXPORT_ERR         (-1)
+#define QIHSE_BACKUP_EXPORT_DENIED      (-2)
+#define QIHSE_BACKUP_EXPORT_UNSUPPORTED (-3)
 
 typedef enum {
     BACKUP_FULL = 0,
@@ -31,18 +61,63 @@ typedef enum {
 typedef struct {
     backup_type_t type;
     char* path;
+    /* This layer has no change sequence, so both are 0 in a container it
+     * writes (see qihse_backup_incremental_user). */
     uint64_t start_lsn;
     uint64_t end_lsn;
     time_t timestamp;
     size_t size_bytes;
     char* checksum;
+    /* The writing principal's clearance/SCI bound recorded in the header. */
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint32_t writer_user_id;
 } qihse_backup_info_t;
 
-int qihse_backup_full(qihse_kv_store_t* kv, const char* output_path, qihse_backup_info_t* info);
-int qihse_backup_incremental(qihse_kv_store_t* kv, const char* output_path, uint64_t since_lsn, qihse_backup_info_t* info);
-int qihse_restore(qihse_kv_store_t* kv, const char* backup_path);
-int qihse_backup_list(const char* dir, qihse_backup_info_t** out_backups, size_t* out_count);
-int qihse_backup_verify(const char* backup_path);
+/* Write every record `user` is cleared for, as `user`.  The data section is
+ * the KV layer's authorization-aware snapshot stream, so the classification
+ * decision is made where the knowledge lives and a record above the
+ * caller's clearance refuses the whole export (-2) with no container and no
+ * scratch file left behind.
+ *
+ * `info` is zeroed on entry, so a refused call never hands back a partial
+ * record; on success it owns `path` and `checksum`, which
+ * qihse_backup_info_free() releases. */
+int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                           const char* output_path, qihse_backup_info_t* info);
+
+/* Incremental export.  The KV layer exposes no change sequence or LSN, so a
+ * delta cannot be produced honestly: this refuses with
+ * QIHSE_BACKUP_EXPORT_UNSUPPORTED and writes nothing, rather than labelling
+ * a full snapshot "incremental" (which would make a restore silently
+ * non-incremental).  It exists so the surface stays context-taking and a
+ * caller that needs a delta gets an explicit refusal instead of a
+ * context-free fallback.  A manifest-bound federated backup with a WAL
+ * continuation point is the supported answer for incremental coverage. */
+int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                                  const char* output_path, uint64_t since_lsn,
+                                  qihse_backup_info_t* info);
+
+/* Apply a container through the KV layer's transactional, authorization-aware
+ * load.  The container's checksum is verified over the bytes that are about
+ * to be applied, and a container whose recorded clearance/SCI bound the
+ * caller does not dominate, or that holds a record above the caller's
+ * clearance/SCI, is refused with -2 and the live dataset untouched. */
+int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path);
+
+/* List the containers in `dir` the caller may know about.  Refused whole
+ * (-2) when any container's recorded bound is above the caller's
+ * clearance/SCI; `*out_backups` is NULL and `*out_count` 0 on every failure,
+ * and each entry's strings are released by qihse_backup_info_free(). */
+int qihse_backup_list_user(qihse_user_t* user, const char* dir,
+                           qihse_backup_info_t** out_backups, size_t* out_count);
+
+/* Verify a container's checksum, as an authenticated principal.  Reads no
+ * payload beyond hashing it and writes nothing. */
+int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path);
+
+/* Release the strings owned by one qihse_backup_info_t.  Not a data
+ * primitive: it neither reads nor discloses anything. */
 void qihse_backup_info_free(qihse_backup_info_t* info);
 
 /* ────────────────────────────────────────────────────────────────────────

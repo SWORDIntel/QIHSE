@@ -20,13 +20,21 @@
  *     same-clearance/different-compartment principal are both DENIED, the
  *     protected payload BYTES are asserted absent from every artefact they
  *     could have produced, and no scratch file is left behind
+ *   - the manifest-free whole-store export is held to the same rule: the
+ *     context-free forms are gone, a NULL or forged handle is refused on
+ *     every entry point, and a guest/analyst is denied on export, verify,
+ *     list and restore with no artefact and no protected bytes
  */
 #include "qihse_auth.h"
 #include "qihse_backup.h"
 #include "qihse_kv_store.h"
 #include "qihse_operations.h"
+/* For the forged-handle probe: a handle that is not the live record must not
+ * resolve as a principal.  The test builds one deliberately. */
+#include "qihse_auth_internal.h"
 
 #include <assert.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,6 +121,46 @@ static bool dir_has_entry_containing(const char* dir, const char* needle) {
     bool found = file_holds(out_path, needle);
     unlink(out_path);
     return found;
+}
+
+/* A refused call must leave no artefact AT ALL, not merely none at the path it
+ * was asked to write: this counts a directory's real entries. */
+static size_t dir_entry_count(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) return (size_t)-1;
+    size_t n = 0u;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* Does ANY regular file in `dir` contain the needle?  Byte absence has to be
+ * asserted against every artefact a refused call could have produced. */
+static bool dir_files_hold(const char* dir, const char* needle) {
+    DIR* d = opendir(dir);
+    if (!d) return false;
+    bool found = false;
+    char path[1024];
+    struct dirent* entry;
+    while (!found && (entry = readdir(d)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        found = file_holds(path, needle);
+    }
+    closedir(d);
+    return found;
+}
+
+static void free_listing(qihse_backup_info_t* list, size_t count) {
+    for (size_t i = 0; i < count; i++) qihse_backup_info_free(&list[i]);
+    free(list);
 }
 
 static void put(qihse_user_t* user, const char* key, const char* value,
@@ -613,6 +661,197 @@ static void test_low_clearance_denied(void) {
            "appear in no artefact the low principals could have produced\n");
 }
 
+/* ── The manifest-free whole-store export (invariants 1, 2 and 3) ──────── */
+
+static void test_whole_store_export_authenticated(void) {
+    char op_path[512], tampered[512], guest_dir[512], guest_path[512];
+    test_path(op_path, sizeof(op_path), "legacy-operator.bak");
+    test_path(tampered, sizeof(tampered), "legacy-tampered.bak");
+    test_path(guest_dir, sizeof(guest_dir), "legacy-guest-dir");
+    assert(mkdir(guest_dir, 0700) == 0);
+    int written = snprintf(guest_path, sizeof(guest_path), "%s/guest.bak", guest_dir);
+    assert(written > 0 && (size_t)written < sizeof(guest_path));
+
+    qihse_backup_info_t info;
+    qihse_backup_info_t* list = NULL;
+    size_t count = 0u;
+
+    /* 1. NULL is an argument error on every entry point: never "export
+     * everything", never an implicit security-disabled mode. */
+    memset(&info, 0xAB, sizeof(info));
+    assert(qihse_backup_full_user(g_store, NULL, guest_path, &info) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(info.path == NULL && info.checksum == NULL);
+    assert(qihse_backup_full_user(NULL, g_op, guest_path, &info) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_full_user(g_store, g_op, NULL, &info) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_full_user(g_store, g_op, "", &info) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_incremental_user(g_store, NULL, guest_path, 0u, &info) ==
+           QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_restore_user(g_store, NULL, op_path) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_restore_user(NULL, g_op, op_path) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_verify_user(NULL, op_path) == QIHSE_BACKUP_EXPORT_ERR);
+    count = 99u;
+    assert(qihse_backup_list_user(NULL, g_dir, &list, &count) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(list == NULL && count == 0u);
+    assert(qihse_backup_list_user(g_op, NULL, &list, &count) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_list_user(g_op, g_dir, NULL, &count) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_backup_list_user(g_op, g_dir, &list, NULL) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(dir_entry_count(guest_dir) == 0u);
+
+    /* 2. A forged handle is not a principal.  It carries the operator's user
+     * id and the highest clearance, but a handle must BE the live record:
+     * matching fields are not an authentication. */
+    qihse_user_t forged;
+    memset(&forged, 0, sizeof(forged));
+    forged.user_id = qihse_user_get_id(g_op);
+    forged.role = QIHSE_ROLE_OPERATOR;
+    forged.classification_level = 0xFFFFu;
+    forged.sci_compartments = 0xFFFFu;
+    memset(&info, 0xAB, sizeof(info));
+    assert(qihse_backup_full_user(g_store, &forged, guest_path, &info) ==
+           QIHSE_BACKUP_EXPORT_DENIED);
+    assert(info.path == NULL && info.checksum == NULL);
+    assert(qihse_restore_user(g_store, &forged, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    assert(qihse_backup_verify_user(&forged, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    assert(qihse_backup_list_user(&forged, g_dir, &list, &count) ==
+           QIHSE_BACKUP_EXPORT_DENIED);
+    assert(list == NULL && count == 0u);
+    assert(dir_entry_count(guest_dir) == 0u);
+
+    /* 3. The operator's whole-store container.  Its data section comes from
+     * the KV layer's authorization-aware export, so the operator's view
+     * really does include the protected payload. */
+    memset(&info, 0, sizeof(info));
+    assert(qihse_backup_full_user(g_store, g_op, op_path, &info) == QIHSE_BACKUP_EXPORT_OK);
+    assert(info.type == BACKUP_FULL);
+    assert(info.path != NULL && strcmp(info.path, op_path) == 0);
+    assert(info.checksum != NULL && strlen(info.checksum) == 16u);
+    assert(info.writer_user_id == qihse_user_get_id(g_op));
+    assert(info.classification == qihse_user_get_classification(g_op));
+    assert(info.sci_compartment == qihse_user_get_sci(g_op));
+    struct stat st;
+    assert(stat(op_path, &st) == 0);
+    assert((size_t)st.st_size == info.size_bytes);
+    /* A backup of a classified dataset is not world-readable. */
+    assert((st.st_mode & 0777u) == 0600u);
+    assert(file_holds(op_path, SECRET_GAMMA_VALUE));
+    assert(file_holds(op_path, PUBLIC_ALPHA_VALUE));
+    /* ... and the writer's scratch is gone. */
+    assert(!dir_has_entry_containing(g_dir, ".data."));
+    assert(!dir_has_entry_containing(g_dir, ".tmp."));
+    qihse_backup_info_free(&info);
+    memset(&info, 0, sizeof(info));
+
+    /* 4. A guest may neither produce the operator's view nor learn about,
+     * verify or apply the operator's container.  The container records the
+     * writer's clearance/SCI as an upper bound on what it can hold, and the
+     * guest does not dominate it. */
+    memset(&info, 0xAB, sizeof(info));
+    assert(qihse_backup_full_user(g_store, g_guest, guest_path, &info) ==
+           QIHSE_BACKUP_EXPORT_DENIED);
+    assert(info.path == NULL && info.checksum == NULL);
+    assert(qihse_backup_verify_user(g_guest, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    assert(qihse_restore_user(g_store, g_guest, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    count = 99u;
+    assert(qihse_backup_list_user(g_guest, g_dir, &list, &count) ==
+           QIHSE_BACKUP_EXPORT_DENIED);
+    assert(list == NULL && count == 0u);
+    /* Same clearance, wrong compartments: the analyst does not dominate the
+     * bound either. */
+    assert(qihse_backup_verify_user(g_analyst, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    assert(qihse_restore_user(g_store, g_analyst, op_path) == QIHSE_BACKUP_EXPORT_DENIED);
+    assert(qihse_backup_list_user(g_analyst, g_dir, &list, &count) ==
+           QIHSE_BACKUP_EXPORT_DENIED);
+    assert(list == NULL && count == 0u);
+
+    /* The refusals produced NO artefact at all: not a container, not a
+     * scratch file, and no file anywhere that carries the protected bytes. */
+    assert(dir_entry_count(guest_dir) == 0u);
+    assert(!dir_files_hold(guest_dir, SECRET_GAMMA_VALUE));
+    assert(!dir_files_hold(guest_dir, SECRET_DELTA_VALUE));
+    assert(!file_holds(guest_path, SECRET_GAMMA_VALUE));
+    assert(!file_holds(guest_path, SECRET_DELTA_VALUE));
+    assert(!dir_has_entry_containing(g_dir, ".restore."));
+
+    /* 5. Incremental refuses rather than labelling a full snapshot
+     * "incremental": the KV layer exposes no change sequence to filter on. */
+    memset(&info, 0xAB, sizeof(info));
+    assert(qihse_backup_incremental_user(g_store, g_op, guest_path, 1234u, &info) ==
+           QIHSE_BACKUP_EXPORT_UNSUPPORTED);
+    assert(qihse_backup_incremental_user(g_store, g_guest, guest_path, 1234u, &info) ==
+           QIHSE_BACKUP_EXPORT_UNSUPPORTED);
+    assert(info.path == NULL && info.checksum == NULL);
+    assert(dir_entry_count(guest_dir) == 0u);
+
+    /* 6. The operator can verify and list what it wrote. */
+    assert(qihse_backup_verify_user(g_op, op_path) == QIHSE_BACKUP_EXPORT_OK);
+    assert(qihse_backup_list_user(g_op, g_dir, &list, &count) == QIHSE_BACKUP_EXPORT_OK);
+    assert(list != NULL && count >= 1u);
+    bool found = false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(list[i].path, op_path) == 0) {
+            found = true;
+            assert(list[i].type == BACKUP_FULL);
+            assert(list[i].classification == qihse_user_get_classification(g_op));
+            assert(list[i].size_bytes == (size_t)st.st_size);
+        }
+    }
+    assert(found);
+    free_listing(list, count);
+    list = NULL;
+    count = 0u;
+
+    /* 7. Tampering is refused before anything is applied, and the recorded
+     * bound is inside the hashed region: lowering it to slip past the
+     * container gate invalidates the container instead of opening it. */
+    size_t len = 0u;
+    uint8_t* bytes = slurp(op_path, &len);
+    assert(bytes != NULL && len > 64u);
+    put(g_op, "public:legacy-sentinel", "legacy-sentinel-value", 0, 0);
+    uint8_t* edited = (uint8_t*)malloc(len);
+    assert(edited != NULL);
+    memcpy(edited, bytes, len);
+    edited[len - 1u] ^= 0x01u;                 /* a byte of the data section */
+    spit(tampered, edited, len);
+    assert(qihse_backup_verify_user(g_op, tampered) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_restore_user(g_store, g_op, tampered) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(can_read(g_op, "public:legacy-sentinel"));
+    memcpy(edited, bytes, len);
+    edited[52] = 0u; edited[53] = 0u;          /* writer_classification -> 0 */
+    edited[54] = 0u; edited[55] = 0u;          /* writer_sci -> 0 */
+    spit(tampered, edited, len);
+    /* Refused — as a checksum error or as a denial, but never applied. */
+    assert(qihse_backup_verify_user(g_op, tampered) != QIHSE_BACKUP_EXPORT_OK);
+    assert(qihse_restore_user(g_store, g_op, tampered) != QIHSE_BACKUP_EXPORT_OK);
+    assert(can_read(g_op, "public:legacy-sentinel"));
+    free(edited);
+    spit(tampered, bytes, len - 8u);           /* truncated */
+    assert(qihse_backup_verify_user(g_op, tampered) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(qihse_restore_user(g_store, g_op, tampered) == QIHSE_BACKUP_EXPORT_ERR);
+    assert(can_read(g_op, "public:legacy-sentinel"));
+    free(bytes);
+    unlink(tampered);
+
+    /* 8. The authenticated path really works: the restore is the snapshot,
+     * not the drifted dataset, and the classification survived the round trip
+     * (a restore cannot downgrade a record to unclassified). */
+    put(g_op, "public:legacy-drift", "legacy-drift-value", 0, 0);
+    assert(qihse_restore_user(g_store, g_op, op_path) == QIHSE_BACKUP_EXPORT_OK);
+    assert(!can_read(g_op, "public:legacy-drift"));
+    assert(!can_read(g_op, "public:legacy-sentinel"));
+    read_is(g_op, "public:alpha", PUBLIC_ALPHA_VALUE);
+    read_is(g_op, SECRET_GAMMA_KEY, SECRET_GAMMA_VALUE);
+    read_is(g_op, SECRET_DELTA_KEY, SECRET_DELTA_VALUE);
+    assert(!can_read(g_guest, SECRET_GAMMA_KEY));
+    assert(!can_read(g_guest, SECRET_DELTA_KEY));
+    assert(!dir_has_entry_containing(g_dir, ".restore."));
+
+    printf("PASS whole-store export: no context-free form remains, NULL and "
+           "forged handles are refused on every entry point, guest and analyst "
+           "are denied on export, verify, list and restore, no artefact or "
+           "protected byte survives a refusal, and the authenticated round "
+           "trip restores the snapshot with its classifications intact\n");
+}
+
 /* ── The denial is about clearance, not about the API being unusable ───── */
 
 static void test_low_clearance_within_its_view(void) {
@@ -720,6 +959,7 @@ int main(void) {
     test_key_material_refused();
     test_null_context_fails_closed();
     test_low_clearance_denied();
+    test_whole_store_export_authenticated();
     test_low_clearance_within_its_view();
     test_undeclared_count();
 
