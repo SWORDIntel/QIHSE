@@ -19,12 +19,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* ── Server ────────────────────────────────────────────────────────────── */
 
 struct qihse_fed_tls_server {
-    SSL_CTX* ctx;
+    /* A federation peer both accepts and initiates connections, so it needs
+     * BOTH contexts.  A client handshake driven from a TLS_server_method()
+     * context fails with SSL_R_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL, which
+     * is not an error that points at the real cause. */
+    SSL_CTX* server_ctx;
+    SSL_CTX* client_ctx;
     void* store;
     void* user;
     bool require_client_cert;
@@ -116,6 +122,40 @@ static int fed_verify_cb(int preverify_ok, X509_STORE_CTX* store_ctx) {
     return 1;
 }
 
+/* Apply the certificate, key, CA store and verification policy shared by both
+ * directions.  Keeping this in ONE place is what guarantees the accept and
+ * initiate paths cannot drift into different security postures. */
+static bool configure_ctx(SSL_CTX* ctx, qihse_fed_tls_server_t* owner,
+                          const qihse_federation_ca_t* ca,
+                          const char* node_cert_pem, const char* node_key_path) {
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) return false;
+    if (SSL_CTX_set1_groups_list(ctx, qihse_federation_tls_group_list()) != 1) return false;
+
+    BIO* cert_bio = BIO_new_mem_buf(node_cert_pem, -1);
+    X509* own = cert_bio ? PEM_read_bio_X509(cert_bio, NULL, NULL, NULL) : NULL;
+    if (cert_bio) BIO_free(cert_bio);
+    if (!own || SSL_CTX_use_certificate(ctx, own) != 1) {
+        if (own) X509_free(own);
+        return false;
+    }
+    X509_free(own);
+    if (SSL_CTX_use_PrivateKey_file(ctx, node_key_path, SSL_FILETYPE_PEM) != 1) return false;
+    if (SSL_CTX_check_private_key(ctx) != 1) return false;
+
+    X509_STORE* ca_store = NULL;
+    if (!build_ca_store(ca, &ca_store)) return false;
+    SSL_CTX_set_cert_store(ctx, ca_store);
+
+    /* THE line that makes this mutual authentication in BOTH directions.
+     * Without SSL_VERIFY_FAIL_IF_NO_PEER_CERT a peer that presents no
+     * certificate is admitted, which is exactly the server-auth-only posture
+     * this replaces. */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       fed_verify_cb);
+    SSL_CTX_set_app_data(ctx, owner);
+    return true;
+}
+
 qihse_fed_tls_server_t* qihse_federation_tls_server_create(
     const qihse_federation_ca_t* ca,
     const char* node_cert_pem,
@@ -133,49 +173,24 @@ qihse_fed_tls_server_t* qihse_federation_tls_server_create(
     s->user = user_void;
     s->require_client_cert = true;
 
-    s->ctx = SSL_CTX_new(TLS_server_method());
-    if (!s->ctx) { free(s); return NULL; }
-
-    /* TLS 1.3 floor and hybrid post-quantum key exchange. */
-    SSL_CTX_set_min_proto_version(s->ctx, TLS1_3_VERSION);
-    SSL_CTX_set1_groups_list(s->ctx, qihse_federation_tls_group_list());
-
-    /* This node's own certificate and key. */
-    BIO* cert_bio = BIO_new_mem_buf(node_cert_pem, -1);
-    X509* own = cert_bio ? PEM_read_bio_X509(cert_bio, NULL, NULL, NULL) : NULL;
-    if (cert_bio) BIO_free(cert_bio);
-    if (!own || SSL_CTX_use_certificate(s->ctx, own) != 1) {
-        if (own) X509_free(own);
-        SSL_CTX_free(s->ctx); free(s);
+    s->server_ctx = SSL_CTX_new(TLS_server_method());
+    s->client_ctx = SSL_CTX_new(TLS_client_method());
+    if (!s->server_ctx || !s->client_ctx) {
+        qihse_federation_tls_server_destroy(s);
         return NULL;
     }
-    X509_free(own);
-    if (SSL_CTX_use_PrivateKey_file(s->ctx, node_key_path, SSL_FILETYPE_PEM) != 1 ||
-        SSL_CTX_check_private_key(s->ctx) != 1) {
-        SSL_CTX_free(s->ctx); free(s);
+    if (!configure_ctx(s->server_ctx, s, ca, node_cert_pem, node_key_path) ||
+        !configure_ctx(s->client_ctx, s, ca, node_cert_pem, node_key_path)) {
+        qihse_federation_tls_server_destroy(s);
         return NULL;
     }
-
-    X509_STORE* ca_store = NULL;
-    if (!build_ca_store(ca, &ca_store)) {
-        SSL_CTX_free(s->ctx); free(s);
-        return NULL;
-    }
-    SSL_CTX_set_cert_store(s->ctx, ca_store);
-
-    /* THE line that makes this mutual authentication.  Without
-     * SSL_VERIFY_FAIL_IF_NO_PEER_CERT a client that presents no certificate
-     * is admitted, which is exactly the server-auth-only posture this is
-     * replacing. */
-    SSL_CTX_set_verify(s->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                       fed_verify_cb);
-    SSL_CTX_set_app_data(s->ctx, s);
     return s;
 }
 
 void qihse_federation_tls_server_destroy(qihse_fed_tls_server_t* server) {
     if (!server) return;
-    if (server->ctx) SSL_CTX_free(server->ctx);
+    if (server->server_ctx) SSL_CTX_free(server->server_ctx);
+    if (server->client_ctx) SSL_CTX_free(server->client_ctx);
     free(server);
 }
 
@@ -184,6 +199,16 @@ bool qihse_federation_tls_server_requires_client_cert(const qihse_fed_tls_server
 }
 
 /* ── Sessions ──────────────────────────────────────────────────────────── */
+
+/* Bound a handshake so a peer that connects and then stalls cannot hold a
+ * thread indefinitely. */
+static void fed_tls_set_handshake_timeout(int fd) {
+    struct timeval tv;
+    tv.tv_sec = QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 
 static qihse_fed_tls_session_t* session_from_ssl(SSL* ssl, qihse_fed_tls_server_t* server,
                                                 bool is_server,
@@ -225,11 +250,16 @@ static qihse_fed_tls_session_t* session_from_ssl(SSL* ssl, qihse_fed_tls_server_
 qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* server,
                                                        int fd,
                                                        qihse_peer_verdict_t* out_verdict) {
-    if (!server || !server->ctx || fd < 0) {
+    if (!server || !server->server_ctx || fd < 0) {
         if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
         return NULL;
     }
-    SSL* ssl = SSL_new(server->ctx);
+    /* Bound the handshake.  A peer that connects and then stalls would
+     * otherwise hold a thread indefinitely, which is a cheap denial of service
+     * against a node that is also trying to serve its own database. */
+    fed_tls_set_handshake_timeout(fd);
+
+    SSL* ssl = SSL_new(server->server_ctx);
     if (!ssl) { if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
     SSL_set_fd(ssl, fd);
     SSL_set_accept_state(ssl);
@@ -239,14 +269,16 @@ qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* 
 qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder,
                                                         int fd,
                                                         qihse_peer_verdict_t* out_verdict) {
-    if (!ctx_holder || !ctx_holder->ctx || fd < 0) {
+    if (!ctx_holder || !ctx_holder->client_ctx || fd < 0) {
         if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
         return NULL;
     }
-    /* A client uses the same context: it presents this node's certificate and
-     * verifies the server's against the same CA, so both directions are
-     * mutually authenticated. */
-    SSL* ssl = SSL_new(ctx_holder->ctx);
+    fed_tls_set_handshake_timeout(fd);
+
+    /* The CLIENT context.  This node presents its own certificate and verifies
+     * the server's against the same CA under the same policy, so both
+     * directions are mutually authenticated and cannot drift apart. */
+    SSL* ssl = SSL_new(ctx_holder->client_ctx);
     if (!ssl) { if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
     SSL_set_fd(ssl, fd);
     SSL_set_connect_state(ssl);

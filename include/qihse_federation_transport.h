@@ -5,13 +5,6 @@
  * QIHSE federation mTLS transport.
  * See v3.md §18 (node identity and trust) and §22 (replication transport).
  *
- * STATUS: NOT FUNCTIONAL.  The mTLS security core this depends on (federation
- * CA, certificate issuance, and the three-layer peer decision) is complete and
- * tested in qihse_federation_mtls.  This transport layer is written but its
- * TLS handshake currently fails with SSL_R_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL
- * on the client side, and it is deliberately NOT built or shipped until that
- * is resolved.  Do not wire it in.
- *
  * The generic UWP TLS layer provides a server certificate and a session over
  * an fd, but it has no way to REQUIRE a client certificate or to read the
  * peer's — which is the whole of mutual authentication.  So federation owns
@@ -31,6 +24,11 @@
 #include "qihse_federation_mtls.h"
 #include "qihse_federation_repl.h"
 #include "qihse_runtime_trust.h"
+
+/* A handshake that never completes would hold a thread indefinitely, which is
+ * a cheap denial of service against a node that is also serving its own
+ * database. */
+#define QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC 10
 
 #ifdef __cplusplus
 extern "C" {
@@ -111,18 +109,3 @@ qihse_repl_transport_ops_t qihse_federation_tls_transport_ops(qihse_fed_tls_sess
 #endif
 
 #endif /* QIHSE_FEDERATION_TRANSPORT_H */
-/*
- * LEAD on the handshake failure, for whoever picks this up:
- *
- * The client fails with SSL_R_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL before any
- * certificate verification runs, and the server then blocks.  The prime
- * suspect is that fed_verify_cb() stores the resolved peer identity with
- * SSL_set_ex_data(ssl, 0, ...) and reads it back with SSL_get_ex_data(ssl, 0).
- * Index 0 in an SSL's ex_data space is not safe for user data — indices must be
- * allocated with SSL_get_ex_new_index().  Writing over a reserved slot would
- * corrupt OpenSSL's own state and produce exactly this class of error.
- *
- * First thing to try: allocate a proper index and use it.  Second: confirm the
- * server side actually reaches fed_verify_cb at all, since no callback entry
- * was observed in the diagnostic run.
- */
