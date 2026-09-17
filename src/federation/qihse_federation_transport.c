@@ -1,0 +1,363 @@
+/*
+ * QIHSE federation mTLS transport.
+ * See v3.md §18 and §22.
+ *
+ * The UWP TLS layer gives a server certificate and a session over an fd but
+ * cannot require or read a client certificate, so federation builds its own
+ * context here.  The peer decision is the three-layer check from
+ * qihse_federation_mtls: the handshake proves key possession, the verify
+ * callback resolves the fingerprint to an enrolled node and consults its
+ * runtime trust, and a refusal is a failed connection.
+ */
+#include "qihse_federation_transport.h"
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* ── Server ────────────────────────────────────────────────────────────── */
+
+struct qihse_fed_tls_server {
+    SSL_CTX* ctx;
+    void* store;
+    void* user;
+    bool require_client_cert;
+};
+
+struct qihse_fed_tls_session {
+    SSL* ssl;
+    qihse_fed_tls_server_t* server;   /* not owned */
+    bool peer_resolved;
+    qihse_uuid_t peer_node;
+    qihse_runtime_trust_t peer_trust;
+};
+
+/* Load the CA certificate into a store so the peer chain can be verified
+ * against exactly the federation CA and nothing else. */
+static bool build_ca_store(const qihse_federation_ca_t* ca, X509_STORE** out) {
+    X509_STORE* store = X509_STORE_new();
+    if (!store) return false;
+    BIO* bio = BIO_new_mem_buf(ca->cert_pem, (int)ca->cert_pem_len);
+    if (!bio) { X509_STORE_free(store); return false; }
+    X509* cacert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!cacert) { X509_STORE_free(store); return false; }
+    bool ok = X509_STORE_add_cert(store, cacert) == 1;
+    X509_free(cacert);
+    if (!ok) { X509_STORE_free(store); return false; }
+    *out = store;
+    return true;
+}
+
+/* The verify callback runs during the handshake.  It does NOT re-implement
+ * chain validation: OpenSSL has already done that, and the CA store constrains
+ * it to the federation CA.  This decides the second and third questions —
+ * whether the key belongs to a node we enrolled, and whether that node is
+ * currently trusted.
+ *
+ * Returning 0 here aborts the handshake, so an unauthorised peer never gets a
+ * channel at all. */
+static int fed_verify_cb(int preverify_ok, X509_STORE_CTX* store_ctx) {
+    if (!preverify_ok) return 0;   /* chain validation failed; OpenSSL said so */
+
+    SSL* ssl = (SSL*)X509_STORE_CTX_get_ex_data(store_ctx,
+                    SSL_get_ex_data_X509_STORE_CTX_idx());
+    if (!ssl) return 0;
+    qihse_fed_tls_server_t* server = (qihse_fed_tls_server_t*)SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
+    if (!server || !server->store || !server->user) return 0;
+
+    X509* peer = X509_STORE_CTX_get0_cert(store_ctx);
+    if (!peer) return 0;
+    EVP_PKEY* pkey = X509_get_pubkey(peer);
+    if (!pkey) return 0;
+
+    /* Hash the raw public key, matching how the enrolled node record and the
+     * certificate fingerprint are both computed.  One definition of "the
+     * node's fingerprint" across enrollment, issuance and verification. */
+    size_t raw_len = 0;
+    int got = EVP_PKEY_get_raw_public_key(pkey, NULL, &raw_len);
+    if (got != 1 || raw_len == 0 || raw_len > 4096u) { EVP_PKEY_free(pkey); return 0; }
+    uint8_t raw[4096];
+    if (EVP_PKEY_get_raw_public_key(pkey, raw, &raw_len) != 1) {
+        EVP_PKEY_free(pkey);
+        return 0;
+    }
+    EVP_PKEY_free(pkey);
+
+    uint8_t fp[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    unsigned int fp_len = 0;
+    if (EVP_Digest(raw, raw_len, fp, &fp_len, EVP_sha384(), NULL) != 1 ||
+        fp_len != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) {
+        return 0;
+    }
+
+    qihse_uuid_t node_id;
+    qihse_runtime_trust_t trust;
+    qihse_peer_verdict_t verdict = qihse_federation_peer_verify(
+        server->store, server->user, fp, fp_len, &node_id, &trust);
+    if (verdict != QIHSE_PEER_ACCEPT) return 0;
+
+    /* Stash the resolved identity so the accepted session can report it
+     * without recomputing anything. */
+    SSL_set_ex_data(ssl, 0, NULL);
+    uint8_t* stash = (uint8_t*)malloc(QIHSE_UUID_BYTES + 4u);
+    if (stash) {
+        memcpy(stash, node_id.bytes, QIHSE_UUID_BYTES);
+        uint32_t t = (uint32_t)trust;
+        memcpy(stash + QIHSE_UUID_BYTES, &t, 4);
+        SSL_set_ex_data(ssl, 0, stash);
+    }
+    return 1;
+}
+
+qihse_fed_tls_server_t* qihse_federation_tls_server_create(
+    const qihse_federation_ca_t* ca,
+    const char* node_cert_pem,
+    const char* node_key_path,
+    void* store_void, void* user_void) {
+    if (!ca || !node_cert_pem || !node_key_path || !store_void || !user_void) return NULL;
+    /* A misconfigured node must fail to start rather than start with a weaker
+     * posture than intended. */
+    if (strstr(ca->cert_pem, "CERTIFICATE") == NULL) return NULL;
+    if (!qihse_federation_cert_verify(node_cert_pem, ca)) return NULL;
+
+    qihse_fed_tls_server_t* s = (qihse_fed_tls_server_t*)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->store = store_void;
+    s->user = user_void;
+    s->require_client_cert = true;
+
+    s->ctx = SSL_CTX_new(TLS_server_method());
+    if (!s->ctx) { free(s); return NULL; }
+
+    /* TLS 1.3 floor and hybrid post-quantum key exchange. */
+    SSL_CTX_set_min_proto_version(s->ctx, TLS1_3_VERSION);
+    SSL_CTX_set1_groups_list(s->ctx, qihse_federation_tls_group_list());
+
+    /* This node's own certificate and key. */
+    BIO* cert_bio = BIO_new_mem_buf(node_cert_pem, -1);
+    X509* own = cert_bio ? PEM_read_bio_X509(cert_bio, NULL, NULL, NULL) : NULL;
+    if (cert_bio) BIO_free(cert_bio);
+    if (!own || SSL_CTX_use_certificate(s->ctx, own) != 1) {
+        if (own) X509_free(own);
+        SSL_CTX_free(s->ctx); free(s);
+        return NULL;
+    }
+    X509_free(own);
+    if (SSL_CTX_use_PrivateKey_file(s->ctx, node_key_path, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(s->ctx) != 1) {
+        SSL_CTX_free(s->ctx); free(s);
+        return NULL;
+    }
+
+    X509_STORE* ca_store = NULL;
+    if (!build_ca_store(ca, &ca_store)) {
+        SSL_CTX_free(s->ctx); free(s);
+        return NULL;
+    }
+    SSL_CTX_set_cert_store(s->ctx, ca_store);
+
+    /* THE line that makes this mutual authentication.  Without
+     * SSL_VERIFY_FAIL_IF_NO_PEER_CERT a client that presents no certificate
+     * is admitted, which is exactly the server-auth-only posture this is
+     * replacing. */
+    SSL_CTX_set_verify(s->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       fed_verify_cb);
+    SSL_CTX_set_app_data(s->ctx, s);
+    return s;
+}
+
+void qihse_federation_tls_server_destroy(qihse_fed_tls_server_t* server) {
+    if (!server) return;
+    if (server->ctx) SSL_CTX_free(server->ctx);
+    free(server);
+}
+
+bool qihse_federation_tls_server_requires_client_cert(const qihse_fed_tls_server_t* s) {
+    return s && s->require_client_cert;
+}
+
+/* ── Sessions ──────────────────────────────────────────────────────────── */
+
+static qihse_fed_tls_session_t* session_from_ssl(SSL* ssl, qihse_fed_tls_server_t* server,
+                                                bool is_server,
+                                                qihse_peer_verdict_t* out_verdict) {
+    if (!ssl) {
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_NO_CERT;
+        return NULL;
+    }
+    /* SSL_accept/SSL_connect rather than SSL_do_handshake: the role-specific
+     * entry points set up the handshake state themselves. */
+    int rc = is_server ? SSL_accept(ssl) : SSL_connect(ssl);
+    if (rc != 1) {
+        /* A refusal in the verify callback lands here, as does a peer that
+         * presented no certificate. */
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_UNTRUSTED;
+        SSL_free(ssl);
+        return NULL;
+    }
+    /* The handshake cannot complete without the callback having accepted, so
+     * reaching here means the peer was resolved. */
+    qihse_fed_tls_session_t* session = (qihse_fed_tls_session_t*)calloc(1, sizeof(*session));
+    if (!session) { SSL_free(ssl); if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
+    session->ssl = ssl;
+    session->server = server;
+
+    uint8_t* stash = (uint8_t*)SSL_get_ex_data(ssl, 0);
+    if (stash) {
+        memcpy(session->peer_node.bytes, stash, QIHSE_UUID_BYTES);
+        uint32_t t = 0;
+        memcpy(&t, stash + QIHSE_UUID_BYTES, 4);
+        session->peer_trust = (qihse_runtime_trust_t)t;
+        session->peer_resolved = true;
+    }
+    if (out_verdict) *out_verdict = session->peer_resolved ? QIHSE_PEER_ACCEPT
+                                                          : QIHSE_PEER_REJECT_UNTRUSTED;
+    return session;
+}
+
+qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* server,
+                                                       int fd,
+                                                       qihse_peer_verdict_t* out_verdict) {
+    if (!server || !server->ctx || fd < 0) {
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
+        return NULL;
+    }
+    SSL* ssl = SSL_new(server->ctx);
+    if (!ssl) { if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
+    SSL_set_fd(ssl, fd);
+    SSL_set_accept_state(ssl);
+    return session_from_ssl(ssl, server, true, out_verdict);
+}
+
+qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder,
+                                                        int fd,
+                                                        qihse_peer_verdict_t* out_verdict) {
+    if (!ctx_holder || !ctx_holder->ctx || fd < 0) {
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
+        return NULL;
+    }
+    /* A client uses the same context: it presents this node's certificate and
+     * verifies the server's against the same CA, so both directions are
+     * mutually authenticated. */
+    SSL* ssl = SSL_new(ctx_holder->ctx);
+    if (!ssl) { if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
+    SSL_set_fd(ssl, fd);
+    SSL_set_connect_state(ssl);
+    return session_from_ssl(ssl, ctx_holder, false, out_verdict);
+}
+
+void qihse_federation_tls_session_destroy(qihse_fed_tls_session_t* session) {
+    if (!session) return;
+    if (session->ssl) {
+        uint8_t* stash = (uint8_t*)SSL_get_ex_data(session->ssl, 0);
+        if (stash) free(stash);
+        SSL_shutdown(session->ssl);
+        SSL_free(session->ssl);
+    }
+    free(session);
+}
+
+bool qihse_federation_tls_peer_identity(const qihse_fed_tls_session_t* session,
+                                        qihse_uuid_t* out_node_id,
+                                        qihse_runtime_trust_t* out_trust) {
+    if (!session || !session->peer_resolved) return false;
+    if (out_node_id) *out_node_id = session->peer_node;
+    if (out_trust) *out_trust = session->peer_trust;
+    return true;
+}
+
+bool qihse_federation_tls_negotiated(const qihse_fed_tls_session_t* session,
+                                     char* out_group, size_t group_cap,
+                                     char* out_version, size_t version_cap) {
+    if (!session || !session->ssl) return false;
+    const char* version = SSL_get_version(session->ssl);
+    if (out_version && version_cap) snprintf(out_version, version_cap, "%s", version ? version : "");
+    const char* group = NULL;
+    /* The negotiated group is the evidence that key exchange is actually
+     * post-quantum, rather than something the deployment assumes. */
+    if (SSL_get_negotiated_group(session->ssl) != 0) {
+        int nid = SSL_get_negotiated_group(session->ssl);
+        group = SSL_group_to_name(session->ssl, nid);
+    }
+    if (out_group && group_cap) snprintf(out_group, group_cap, "%s", group ? group : "unknown");
+    return true;
+}
+
+/* ── Replication transport ─────────────────────────────────────────────── */
+
+static bool tls_connect(void* ctx, const char* peer) {
+    (void)peer;   /* the fd is already connected; identity came from the handshake */
+    return ctx != NULL;
+}
+
+static long tls_send(void* ctx, const uint8_t* buf, size_t len) {
+    qihse_fed_tls_session_t* s = (qihse_fed_tls_session_t*)ctx;
+    if (!s || !s->ssl) return -1;
+    size_t sent = 0;
+    while (sent < len) {
+        int n = SSL_write(s->ssl, buf + sent, (int)(len - sent));
+        if (n <= 0) return -1;
+        sent += (size_t)n;
+    }
+    return (long)sent;
+}
+
+static long tls_recv(void* ctx, uint8_t* buf, size_t cap) {
+    qihse_fed_tls_session_t* s = (qihse_fed_tls_session_t*)ctx;
+    if (!s || !s->ssl) return -1;
+    int n = SSL_read(s->ssl, buf, (int)cap);
+    if (n > 0) return (long)n;
+    int err = SSL_get_error(s->ssl, n);
+    if (err == SSL_ERROR_ZERO_RETURN) return 0;   /* clean close */
+    return -1;
+}
+
+static void tls_close(void* ctx) {
+    qihse_fed_tls_session_t* s = (qihse_fed_tls_session_t*)ctx;
+    if (s && s->ssl) SSL_shutdown(s->ssl);
+}
+
+static bool tls_peer_fingerprint(void* ctx, uint8_t* out) {
+    qihse_fed_tls_session_t* s = (qihse_fed_tls_session_t*)ctx;
+    if (!s || !s->ssl || !out) return false;
+    /* Recomputed from the peer's certificate rather than taken on trust from
+     * the handshake, so the caller's comparison is against the real chain. */
+    X509* peer = SSL_get1_peer_certificate(s->ssl);
+    if (!peer) return false;
+    EVP_PKEY* pkey = X509_get_pubkey(peer);
+    bool ok = false;
+    if (pkey) {
+        size_t raw_len = 0;
+        if (EVP_PKEY_get_raw_public_key(pkey, NULL, &raw_len) == 1 &&
+            raw_len > 0 && raw_len <= 4096u) {
+            uint8_t raw[4096];
+            if (EVP_PKEY_get_raw_public_key(pkey, raw, &raw_len) == 1) {
+                unsigned int fp_len = 0;
+                ok = EVP_Digest(raw, raw_len, out, &fp_len, EVP_sha384(), NULL) == 1 &&
+                     fp_len == QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES;
+            }
+        }
+        EVP_PKEY_free(pkey);
+    }
+    X509_free(peer);
+    return ok;
+}
+
+qihse_repl_transport_ops_t qihse_federation_tls_transport_ops(qihse_fed_tls_session_t* session) {
+    qihse_repl_transport_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.connect = tls_connect;
+    ops.send = tls_send;
+    ops.recv = tls_recv;
+    ops.close = tls_close;
+    ops.peer_fingerprint = tls_peer_fingerprint;
+    (void)session;
+    return ops;
+}
