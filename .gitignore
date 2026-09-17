@@ -117,3 +117,4 @@ lib/
 /build/fed_mtls_*/
 /build/fed_repl_*/
 /build/fed_transport_*/
+/build/fed_rejoin_*/
