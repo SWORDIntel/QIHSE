@@ -2198,14 +2198,16 @@ static bool hex_to_bytes(const char* hex, uint8_t* out, size_t max_len, size_t* 
 /* Node record wire format.  The signature algorithm and the public key length
  * are recorded so a record written under one algorithm stays readable after
  * the fleet moves to another. */
-static void node_encode(const qihse_federation_node_identity_t* n, char* out, size_t cap) {
+static bool node_encode(const qihse_federation_node_identity_t* n, char* out, size_t cap) {
     char nid[33], fp_hex[97];
     uuid_hex(&n->node_id, nid);
     /* Public keys reach 2592 bytes, so hex needs 5185 characters; build it in
      * a heap buffer rather than a large stack frame. */
     size_t pk_hex_len = (size_t)n->public_key_len * 2u + 1u;
     char* pub_hex = (char*)malloc(pk_hex_len);
-    if (!pub_hex) return;
+    /* Returning silently here would leave `out` uninitialised and the caller
+     * would store garbage as a node record. */
+    if (!pub_hex) return false;
     bytes_to_hex(n->public_key, n->public_key_len, pub_hex);
     bytes_to_hex(n->fingerprint, QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES, fp_hex);
     snprintf(out, cap, "%s\t%s\t%s\t%s\t%u\t%u\t%s\t%s\t%u\t%llu\t%u\t%u\t%u\t%llu",
@@ -2217,59 +2219,94 @@ static void node_encode(const qihse_federation_node_identity_t* n, char* out, si
              (unsigned)n->capabilities,
              (unsigned long long)n->last_hlc_physical);
     free(pub_hex);
+    return true;
 }
 
 static bool node_decode(const char* blob, qihse_federation_node_identity_t* out) {
     if (!blob || !out) return false;
     memset(out, 0, sizeof(*out));
+
     /* Walk the record field by field: the public key is variable length and
-     * the trailing fields are optional, so positional sscanf cannot be used. */
-    char f[14][5200];
+     * the trailing fields are optional, so positional sscanf cannot be used.
+     *
+     * ONE reusable heap buffer rather than one array element per column.  A
+     * `char f[14][5200]` frame is ~73 KB, which is a needless denial-of-service
+     * surface for a malformed record and would blow a small thread stack — and
+     * this decoder runs on the bus thread. */
+    size_t buf_cap = QIHSE_FEDERATION_PUBKEY_MAX_BYTES * 2u + 2u;
+    char* f = (char*)malloc(buf_cap);
+    if (!f) return false;
+    bool ok = false;
     const char* p = blob;
-    for (size_t i = 0; i < 14u; i++) p = fed_next_field(p, f[i], sizeof(f[i]));
+    size_t declared_pk_len = 0, actual_pk_len = 0, fp_len = 0;
 
-    if (!uuid_from_hex(f[0], &out->node_id)) return false;
-    snprintf(out->hostname, sizeof(out->hostname), "%s", f[1]);
-    snprintf(out->boot_id, sizeof(out->boot_id), "%s", f[2]);
-    snprintf(out->key_handle, sizeof(out->key_handle), "%s", f[3]);
-
-    uint64_t alg_raw = strtoull(f[4], NULL, 10);
-    if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) return false;
-    out->sig_alg = (qihse_sig_alg_t)alg_raw;
-
-    size_t declared_pk_len = (size_t)strtoull(f[5], NULL, 10);
-    size_t actual_pk_len = 0;
-    if (!hex_to_bytes(f[6], out->public_key, QIHSE_FEDERATION_PUBKEY_MAX_BYTES,
-                      &actual_pk_len)) return false;
+    /* 0: node id */
+    p = fed_next_field(p, f, buf_cap);
+    if (!uuid_from_hex(f, &out->node_id)) goto done;
+    /* 1-3: display attributes and the key handle */
+    p = fed_next_field(p, out->hostname, sizeof(out->hostname));
+    p = fed_next_field(p, out->boot_id, sizeof(out->boot_id));
+    p = fed_next_field(p, out->key_handle, sizeof(out->key_handle));
+    /* 4: signature algorithm */
+    p = fed_next_field(p, f, buf_cap);
+    {
+        uint64_t alg_raw = strtoull(f, NULL, 10);
+        if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) goto done;
+        out->sig_alg = (qihse_sig_alg_t)alg_raw;
+    }
+    /* 5: declared public key length */
+    p = fed_next_field(p, f, buf_cap);
+    declared_pk_len = (size_t)strtoull(f, NULL, 10);
+    /* 6: public key, hex */
+    p = fed_next_field(p, f, buf_cap);
+    if (!hex_to_bytes(f, out->public_key, QIHSE_FEDERATION_PUBKEY_MAX_BYTES,
+                      &actual_pk_len)) goto done;
     /* The declared length must match the encoded length AND the algorithm's
      * fixed size, or the record is inconsistent. */
-    if (declared_pk_len != actual_pk_len) return false;
-    if (actual_pk_len != qihse_sig_alg_public_key_bytes(out->sig_alg)) return false;
+    if (declared_pk_len != actual_pk_len) goto done;
+    if (actual_pk_len != qihse_sig_alg_public_key_bytes(out->sig_alg)) goto done;
     out->public_key_len = (uint16_t)actual_pk_len;
-
-    size_t fp_len = 0;
-    if (!hex_to_bytes(f[7], out->fingerprint,
-                      QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES, &fp_len)) return false;
-    if (fp_len != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) return false;
-    /* The fingerprint must actually describe the key it is attached to. */
-    uint8_t recomputed[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
-    if (!qihse_federation_node_fingerprint(out->public_key, actual_pk_len, recomputed)) {
-        return false;
+    /* 7: fingerprint, which must actually describe the key it is attached to */
+    p = fed_next_field(p, f, buf_cap);
+    if (!hex_to_bytes(f, out->fingerprint, QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES,
+                      &fp_len)) goto done;
+    if (fp_len != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) goto done;
+    {
+        uint8_t recomputed[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+        if (!qihse_federation_node_fingerprint(out->public_key, actual_pk_len, recomputed)) {
+            goto done;
+        }
+        if (memcmp(recomputed, out->fingerprint, sizeof(recomputed)) != 0) goto done;
     }
-    if (memcmp(recomputed, out->fingerprint, sizeof(recomputed)) != 0) return false;
+    /* 8: trust state */
+    p = fed_next_field(p, f, buf_cap);
+    {
+        uint64_t trust_raw = strtoull(f, NULL, 10);
+        if (trust_raw > (uint64_t)QIHSE_TRUST_REVOKED) goto done;
+        out->trust = (qihse_trust_state_t)trust_raw;
+    }
+    /* 9: enrollment epoch */
+    p = fed_next_field(p, f, buf_cap);
+    out->enrollment_epoch = (uint64_t)strtoull(f, NULL, 10);
+    /* 10: service identity kind */
+    p = fed_next_field(p, f, buf_cap);
+    {
+        uint64_t kind_raw = strtoull(f, NULL, 10);
+        if (kind_raw > (uint64_t)QIHSE_IDENTITY_BACKUP_AGENT) goto done;
+        out->identity_kind = (qihse_service_identity_t)kind_raw;
+    }
+    /* 11-13: scopes, capabilities, last HLC */
+    p = fed_next_field(p, f, buf_cap);
+    out->scopes = (qihse_infra_scope_t)strtoul(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    out->capabilities = (uint32_t)strtoul(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    out->last_hlc_physical = (uint64_t)strtoull(f, NULL, 10);
+    ok = true;
 
-    uint64_t trust_raw = strtoull(f[8], NULL, 10);
-    if (trust_raw > (uint64_t)QIHSE_TRUST_REVOKED) return false;
-    out->trust = (qihse_trust_state_t)trust_raw;
-    out->enrollment_epoch = (uint64_t)strtoull(f[9], NULL, 10);
-
-    uint64_t kind_raw = strtoull(f[10], NULL, 10);
-    if (kind_raw > (uint64_t)QIHSE_IDENTITY_BACKUP_AGENT) return false;
-    out->identity_kind = (qihse_service_identity_t)kind_raw;
-    out->scopes = (qihse_infra_scope_t)strtoul(f[11], NULL, 10);
-    out->capabilities = (uint32_t)strtoul(f[12], NULL, 10);
-    out->last_hlc_physical = (uint64_t)strtoull(f[13], NULL, 10);
-    return true;
+done:
+    free(f);
+    return ok;
 }
 
 static void node_kv_key(const qihse_uuid_t* node_id, char* out, size_t cap) {
@@ -2300,7 +2337,9 @@ bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
 
     /* An ML-DSA-87 public key hex-encodes to 5184 characters. */
     char blob[8192];
-    node_encode(&rec, blob, sizeof(blob));
+    /* An encode failure means the record could not be built; storing an
+     * uninitialised buffer as a node identity would be worse than failing. */
+    if (!node_encode(&rec, blob, sizeof(blob))) return false;
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
                              (qihse_user_t*)user_void);
 }
@@ -2323,7 +2362,7 @@ bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
     rec.trust = QIHSE_TRUST_APPROVED;
     rec.enrollment_epoch = enrollment_epoch;
     char new_blob[8192];
-    node_encode(&rec, new_blob, sizeof(new_blob));
+    if (!node_encode(&rec, new_blob, sizeof(new_blob))) return false;
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
                              (qihse_user_t*)user_void);
 }
@@ -2344,7 +2383,7 @@ bool qihse_federation_node_revoke(void* store_void, void* user_void,
     rec.trust = QIHSE_TRUST_REVOKED;
     rec.scopes = QIHSE_SCOPE_NONE;
     char new_blob[8192];
-    node_encode(&rec, new_blob, sizeof(new_blob));
+    if (!node_encode(&rec, new_blob, sizeof(new_blob))) return false;
     return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
                              (qihse_user_t*)user_void);
 }
@@ -2650,30 +2689,53 @@ static void statement_encode(const qihse_federation_gossip_t* g, char* out, size
 static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
     if (!blob || !out) return false;
     memset(out, 0, sizeof(*out));
-    char f[11][QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 2u];
-    const char* p = blob;
-    for (size_t i = 0; i < 11u; i++) p = fed_next_field(p, f[i], sizeof(f[i]));
 
-    if (!uuid_from_hex(f[0], &out->cluster_id)) return false;
-    if (!uuid_from_hex(f[1], &out->sender_node)) return false;
-    if (!uuid_from_hex(f[2], &out->boot_id)) return false;
-    if (!uuid_from_hex(f[3], &out->session_id)) return false;
-    out->sequence = (uint64_t)strtoull(f[4], NULL, 10);
-    out->hlc.physical_ms = (uint64_t)strtoull(f[5], NULL, 10);
-    out->capability_bitmap = (uint32_t)strtoul(f[6], NULL, 10);
-    out->health_summary = (uint32_t)strtoul(f[7], NULL, 10);
-    uint64_t alg_raw = strtoull(f[8], NULL, 10);
-    if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) return false;
-    out->sig_alg = (qihse_sig_alg_t)alg_raw;
-    size_t declared = (size_t)strtoull(f[9], NULL, 10);
-    size_t actual = 0;
-    if (!hex_to_bytes(f[10], out->signature, QIHSE_FEDERATION_SIG_MAX_BYTES, &actual)) return false;
-    if (declared != actual) return false;
-    if (actual != qihse_sig_alg_signature_bytes(out->sig_alg)) return false;
+    /* One reusable heap buffer rather than `char f[11][9256]`, which is a
+     * ~102 KB stack frame — a malformed record must not cost that much, and
+     * this runs on the bus thread. */
+    size_t buf_cap = QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 2u;
+    char* f = (char*)malloc(buf_cap);
+    if (!f) return false;
+    bool ok = false;
+    const char* p = blob;
+    size_t declared = 0, actual = 0;
+
+    p = fed_next_field(p, f, buf_cap);
+    if (!uuid_from_hex(f, &out->cluster_id)) goto done;
+    p = fed_next_field(p, f, buf_cap);
+    if (!uuid_from_hex(f, &out->sender_node)) goto done;
+    p = fed_next_field(p, f, buf_cap);
+    if (!uuid_from_hex(f, &out->boot_id)) goto done;
+    p = fed_next_field(p, f, buf_cap);
+    if (!uuid_from_hex(f, &out->session_id)) goto done;
+    p = fed_next_field(p, f, buf_cap);
+    out->sequence = (uint64_t)strtoull(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    out->hlc.physical_ms = (uint64_t)strtoull(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    out->capability_bitmap = (uint32_t)strtoul(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    out->health_summary = (uint32_t)strtoul(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    {
+        uint64_t alg_raw = strtoull(f, NULL, 10);
+        if (alg_raw > (uint64_t)QIHSE_SIG_ML_DSA_87) goto done;
+        out->sig_alg = (qihse_sig_alg_t)alg_raw;
+    }
+    p = fed_next_field(p, f, buf_cap);
+    declared = (size_t)strtoull(f, NULL, 10);
+    p = fed_next_field(p, f, buf_cap);
+    if (!hex_to_bytes(f, out->signature, QIHSE_FEDERATION_SIG_MAX_BYTES, &actual)) goto done;
+    if (declared != actual) goto done;
+    if (actual != qihse_sig_alg_signature_bytes(out->sig_alg)) goto done;
     out->signature_len = (uint16_t)actual;
     out->magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
     out->version = QIHSE_FEDERATION_GOSSIP_VERSION;
-    return true;
+    ok = true;
+
+done:
+    free(f);
+    return ok;
 }
 
 bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t* stmt,
