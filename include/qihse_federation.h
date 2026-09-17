@@ -340,6 +340,135 @@ uint64_t qihse_federation_watch_last_ack(const qihse_federation_watch_t* watch);
 /* Number of unacked events in the backlog. */
 size_t qihse_federation_watch_backlog(const qihse_federation_watch_t* watch);
 
+/* ────────────────────────────────────────────────────────────────────────
+ * F3 — Replication correctness (plan §10, §11).
+ *
+ * Anti-entropy: each namespace produces a manifest of range digests over
+ * sorted object IDs so peers can compare state without full dataset
+ * transfer.  Divergent ranges are reconciled by exchanging missing events
+ * from the F2 journal.
+ *
+ * Conflict handling: irreconcilable control-plane conflicts are never
+ * silently overwritten.  Each namespace has a conflict policy; conflicts
+ * are recorded as explicit conflict objects under "fedconf:" with both
+ * versions, causal metadata, origin nodes, principal, reason, and
+ * resolution status.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Conflict policies (plan §11). */
+typedef enum {
+    QIHSE_CONFLICT_LWW_HLC = 0,      /* last-writer-wins by HLC */
+    QIHSE_CONFLICT_MERGE_SET,        /* set union merge */
+    QIHSE_CONFLICT_COUNTER,          /* CRDT counter merge */
+    QIHSE_CONFLICT_APPEND_ONLY,      /* append, never overwrite */
+    QIHSE_CONFLICT_MANUAL,           /* require operator resolution */
+    QIHSE_CONFLICT_REJECT,            /* reject the conflicting write */
+    QIHSE_CONFLICT_CUSTOM             /* caller-defined merge function */
+} qihse_conflict_policy_t;
+
+const char* qihse_conflict_policy_name(qihse_conflict_policy_t policy);
+bool qihse_conflict_policy_parse(const char* name, qihse_conflict_policy_t* out);
+
+/* Conflict object (plan §11). Stored under "fedconf:<uuid>". */
+typedef struct {
+    qihse_uuid_t conflict_id;        /* assigned at creation */
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    char resource_id[64];
+    qihse_conflict_policy_t policy;
+    qihse_federation_mutation_t local_mutation;
+    qihse_federation_mutation_t remote_mutation;
+    uint8_t local_value[256];
+    size_t local_value_len;
+    uint8_t remote_value[256];
+    size_t remote_value_len;
+    char reason[128];
+    bool resolved;
+    qihse_uuid_t resolved_by;        /* nil if unresolved */
+    uint64_t resolved_at_hlc_physical;
+} qihse_federation_conflict_t;
+
+#define QIHSE_FEDERATION_CONFLICT_PREFIX "fedconf:"
+
+/* Record a conflict. Returns false if a conflict with the same id exists.
+ * Every entry takes an explicit authenticated user (AGENTS.md invariant 1). */
+bool qihse_federation_conflict_record(void* store_void, void* user_void,
+                                     const qihse_federation_conflict_t* conflict);
+/* Look up a conflict by id. */
+bool qihse_federation_conflict_lookup(void* store_void, void* user_void,
+                                      const qihse_uuid_t* conflict_id,
+                                      qihse_federation_conflict_t* out);
+/* Mark a conflict resolved. */
+bool qihse_federation_conflict_resolve(void* store_void, void* user_void,
+                                       const qihse_uuid_t* conflict_id,
+                                       const qihse_uuid_t* resolver);
+/* Iterate unresolved conflicts. cb returns false to stop. */
+typedef bool (*qihse_federation_conflict_cb)(const qihse_federation_conflict_t* conflict,
+                                            void* user_data);
+void qihse_federation_conflict_foreach(void* store_void, void* user_void,
+                                       qihse_federation_conflict_cb cb,
+                                       void* user_data);
+
+/* ── Namespace manifest (plan §10) ──────────────────────────────────────── */
+
+/* A manifest entry covers a contiguous range of object IDs and carries a
+ * SHA-384 digest of the sorted (id, generation, hlc) tuples in that range.
+ * Peers compare manifests to identify divergent ranges without transferring
+ * the full dataset. */
+#define QIHSE_FEDERATION_MANIFEST_MAX_RANGES 64u
+
+typedef struct {
+    char range_start[64];   /* inclusive lower bound of object id range */
+    char range_end[64];     /* exclusive upper bound; "" = end of keyspace */
+    uint64_t object_count;
+    uint8_t digest[48];     /* SHA-384 of sorted (id||generation||hlc) */
+} qihse_federation_manifest_entry_t;
+
+typedef struct {
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    uint64_t total_objects;
+    uint64_t max_generation;
+    qihse_hlc_t max_hlc;
+    size_t entry_count;
+    qihse_federation_manifest_entry_t entries[QIHSE_FEDERATION_MANIFEST_MAX_RANGES];
+} qihse_federation_manifest_t;
+
+/* Build a manifest for a namespace by scanning KV keys with the namespace
+ * prefix. The scan takes an explicit authenticated user (AGENTS.md invariant 1). */
+bool qihse_federation_manifest_build(void* store_void, void* user_void,
+                                     const char* namespace_name,
+                                     qihse_federation_manifest_t* out);
+
+/* Compare two manifests. Returns the number of divergent ranges. Divergent
+ * ranges are written to `out_divergent` (up to out_cap). A range is divergent
+ * if the digests differ or the object counts differ. */
+size_t qihse_federation_manifest_compare(const qihse_federation_manifest_t* local,
+                                        const qihse_federation_manifest_t* remote,
+                                        qihse_federation_manifest_entry_t* out_divergent,
+                                        size_t out_cap);
+
+/* ── Anti-entropy sync (plan §10) ───────────────────────────────────────── */
+
+/* A sync plan identifies what a peer needs to send or receive. */
+typedef enum {
+    QIHSE_SYNC_NONE = 0,
+    QIHSE_SYNC_FETCH,    /* local is missing objects remote has */
+    QIHSE_SYNC_SEND,     /* remote is missing objects local has */
+    QIHSE_SYNC_CONFLICT  /* both have objects but they diverge */
+} qihse_sync_action_t;
+
+typedef struct {
+    char range_start[64];
+    char range_end[64];
+    qihse_sync_action_t action;
+} qihse_federation_sync_range_t;
+
+/* Produce a sync plan from a manifest comparison. Returns the number of
+ * ranges needing action. */
+size_t qihse_federation_sync_plan(const qihse_federation_manifest_t* local,
+                                 const qihse_federation_manifest_t* remote,
+                                 qihse_federation_sync_range_t* out_ranges,
+                                 size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

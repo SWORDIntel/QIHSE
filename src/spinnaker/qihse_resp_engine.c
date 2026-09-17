@@ -5164,6 +5164,23 @@ static bool qihse_fed_ns_list_cb(const qihse_federation_namespace_t* ns, void* u
     return true;
 }
 
+/* F3: callback for FEDERATION.CONFLICT.LIST — collects unresolved conflict IDs. */
+struct qihse_resp_conflict_list_ctx {
+    char ids[32][QIHSE_UUID_STR_LEN + 1u];
+    char namespaces[32][QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    size_t count;
+};
+
+bool qihse_resp_conflict_list_cb(const qihse_federation_conflict_t* c, void* ud) {
+    struct qihse_resp_conflict_list_ctx* ctx = (struct qihse_resp_conflict_list_ctx*)ud;
+    if (ctx->count >= 32) return false; /* stop at capacity */
+    qihse_uuid_format(&c->conflict_id, ctx->ids[ctx->count]);
+    snprintf(ctx->namespaces[ctx->count], sizeof(ctx->namespaces[ctx->count]),
+             "%s", c->namespace_name);
+    ctx->count++;
+    return true;
+}
+
 /* F2: journal replay callbacks for FEDERATION.EVENT.REPLAY. */
 static bool qihse_fed_replay_count_cb(const qihse_federation_event_t* event,
                                      const uint8_t* payload, size_t payload_len,
@@ -5438,6 +5455,72 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         uint64_t cur = (uint64_t)strtoull(cur_str, NULL, 10);
         if (!qihse_federation_watch_resume(session->federation_watches[wid], cur)) {
             return qihse_resp_error(session, "ERR resume failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    /* ── F3: Replication correctness ──────────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "MANIFEST")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.manifest");
+        char ns[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(ns, request->argv[2].data, nl); ns[nl] = '\0';
+        qihse_federation_manifest_t m;
+        if (!qihse_federation_manifest_build(session->server->store, session->user, ns, &m)) {
+            return qihse_resp_error(session, "ERR manifest build failed");
+        }
+        /* Return: namespace total_objects max_generation max_hlc entry_count
+         *        then for each entry: range_start range_end object_count digest_hex */
+        size_t total_fields = 5 + m.entry_count * 4;
+        if (!qihse_resp_array(session, total_fields)) return false;
+        if (!qihse_resp_bulk_text(session, m.namespace_name)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.total_objects)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.max_generation)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.max_hlc.physical_ms)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.entry_count)) return false;
+        for (size_t i = 0; i < m.entry_count; i++) {
+            if (!qihse_resp_bulk_text(session, m.entries[i].range_start)) return false;
+            if (!qihse_resp_bulk_text(session, m.entries[i].range_end)) return false;
+            if (!qihse_resp_integer(session, (int64_t)m.entries[i].object_count)) return false;
+            char hex[97];
+            for (size_t j = 0; j < 48; j++) snprintf(hex + j * 2, 3, "%02x", m.entries[i].digest[j]);
+            hex[96] = '\0';
+            if (!qihse_resp_bulk_text(session, hex)) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "CONFLICT.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.conflict.list");
+        struct qihse_resp_conflict_list_ctx ctx;
+        ctx.count = 0;
+        qihse_federation_conflict_foreach(session->server->store, session->user,
+                                          qihse_resp_conflict_list_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count * 2)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.namespaces[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "CONFLICT.RESOLVE")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.conflict.resolve");
+        char id_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t il = request->argv[2].len;
+        if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid conflict id");
+        memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
+        qihse_uuid_t cid;
+        if (!qihse_uuid_parse(id_str, &cid)) return qihse_resp_error(session, "ERR invalid conflict id");
+        char resolver_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t rl = request->argv[3].len;
+        if (rl == 0 || rl >= sizeof(resolver_str)) return qihse_resp_error(session, "ERR invalid resolver id");
+        memcpy(resolver_str, request->argv[3].data, rl); resolver_str[rl] = '\0';
+        qihse_uuid_t resolver;
+        if (!qihse_uuid_parse(resolver_str, &resolver)) return qihse_resp_error(session, "ERR invalid resolver id");
+        if (!qihse_federation_conflict_resolve(session->server->store, session->user, &cid, &resolver)) {
+            return qihse_resp_error(session, "ERR conflict resolve failed");
         }
         return qihse_resp_simple(session, "OK");
     }

@@ -832,3 +832,503 @@ size_t qihse_federation_watch_backlog(const qihse_federation_watch_t* watch) {
     /* This is approximate since cursor is a byte offset, not an event count. */
     return 0; /* precise backlog tracking requires per-event ack bookkeeping */
 }
+
+/* ── F3: Conflict policies ─────────────────────────────────────────────── */
+
+const char* qihse_conflict_policy_name(qihse_conflict_policy_t policy) {
+    switch (policy) {
+        case QIHSE_CONFLICT_LWW_HLC:    return "lww_hlc";
+        case QIHSE_CONFLICT_MERGE_SET:  return "merge_set";
+        case QIHSE_CONFLICT_COUNTER:    return "counter";
+        case QIHSE_CONFLICT_APPEND_ONLY: return "append_only";
+        case QIHSE_CONFLICT_MANUAL:     return "manual";
+        case QIHSE_CONFLICT_REJECT:     return "reject";
+        case QIHSE_CONFLICT_CUSTOM:     return "custom";
+    }
+    return "unknown";
+}
+
+bool qihse_conflict_policy_parse(const char* name, qihse_conflict_policy_t* out) {
+    if (!name || !out) return false;
+    if (strcmp(name, "lww_hlc") == 0)     { *out = QIHSE_CONFLICT_LWW_HLC; return true; }
+    if (strcmp(name, "merge_set") == 0)   { *out = QIHSE_CONFLICT_MERGE_SET; return true; }
+    if (strcmp(name, "counter") == 0)    { *out = QIHSE_CONFLICT_COUNTER; return true; }
+    if (strcmp(name, "append_only") == 0){ *out = QIHSE_CONFLICT_APPEND_ONLY; return true; }
+    if (strcmp(name, "manual") == 0)     { *out = QIHSE_CONFLICT_MANUAL; return true; }
+    if (strcmp(name, "reject") == 0)     { *out = QIHSE_CONFLICT_REJECT; return true; }
+    if (strcmp(name, "custom") == 0)     { *out = QIHSE_CONFLICT_CUSTOM; return true; }
+    return false;
+}
+
+/* ── F3: Conflict store ────────────────────────────────────────────────── */
+
+static void conflict_kv_key(const qihse_uuid_t* conflict_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(conflict_id, id_str);
+    snprintf(out, cap, QIHSE_FEDERATION_CONFLICT_PREFIX "%s", id_str);
+}
+
+/* Wire format (tab-separated, fixed sections):
+ *   policy_int \t namespace \t resource_id \t resolved_0or1 \t
+ *   local_mutation(request_id 16B hex \t origin 16B hex \t principal 16B hex \t
+ *                   hlc_phys \t hlc_logical \t expected_gen \t fencing_epoch \t
+ *                   consistency \t flags) \t
+ *   remote_mutation(...) \t
+ *   local_value_len \t local_value_hex \t
+ *   remote_value_len \t remote_value_hex \t
+ *   reason \t resolved_by_16B_hex \t resolved_at_hlc_physical
+ * We use a binary-safe encoding: values are hex-encoded. */
+static void uuid_hex(const qihse_uuid_t* u, char* out) {
+    const uint8_t* b = (const uint8_t*)u;
+    for (int i = 0; i < 16; i++) snprintf(out + i * 2, 3, "%02x", b[i]);
+    out[32] = '\0';
+}
+
+static bool uuid_from_hex(const char* hex, qihse_uuid_t* out) {
+    if (!hex || strlen(hex) != 32) return false;
+    uint8_t* b = (uint8_t*)out;
+    for (int i = 0; i < 16; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return false;
+        b[i] = (uint8_t)byte;
+    }
+    return true;
+}
+
+static void value_hex(const uint8_t* val, size_t len, char* out, size_t cap) {
+    if (!val || len == 0) { out[0] = '\0'; return; }
+    size_t i;
+    for (i = 0; i < len && i * 2 + 1 < cap - 1; i++)
+        snprintf(out + i * 2, 3, "%02x", val[i]);
+    out[i * 2] = '\0';
+}
+
+static bool value_from_hex(const char* hex, uint8_t* out, size_t cap, size_t* out_len) {
+    size_t hlen = hex ? strlen(hex) : 0;
+    if (hlen % 2 != 0) return false;
+    size_t n = hlen / 2;
+    if (n > cap) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return false;
+        out[i] = (uint8_t)byte;
+    }
+    *out_len = n;
+    return true;
+}
+
+static void mutation_to_str(const qihse_federation_mutation_t* m, char* out, size_t cap) {
+    char rid[33], oid[33], pid[33];
+    uuid_hex(&m->request_id, rid);
+    uuid_hex(&m->origin_node, oid);
+    uuid_hex(&m->principal_id, pid);
+    /* Use pipe-separated fields inside the mutation so the outer tab-separated
+     * conflict encoding can parse the mutation as a single token. */
+    snprintf(out, cap, "%s|%s|%s|%llu|%u|%llu|%llu|%u|%u",
+             rid, oid, pid,
+             (unsigned long long)m->hlc.physical_ms, (unsigned)m->hlc.logical,
+             (unsigned long long)m->expected_generation,
+             (unsigned long long)m->fencing_epoch,
+             (unsigned)m->consistency, (unsigned)m->flags);
+}
+
+static bool mutation_from_str(const char* str, qihse_federation_mutation_t* m) {
+    char rid[33], oid[33], pid[33];
+    unsigned long long hlc_phys = 0, exp_gen = 0, fence_epoch = 0;
+    unsigned hlc_log = 0, cons = 0, flags = 0;
+    int n = sscanf(str, "%32[^|]|%32[^|]|%32[^|]|%llu|%u|%llu|%llu|%u|%u",
+                   rid, oid, pid, &hlc_phys, &hlc_log, &exp_gen, &fence_epoch, &cons, &flags);
+    if (n < 9) return false;
+    memset(m, 0, sizeof(*m));
+    uuid_from_hex(rid, &m->request_id);
+    uuid_from_hex(oid, &m->origin_node);
+    uuid_from_hex(pid, &m->principal_id);
+    m->hlc.physical_ms = (uint64_t)hlc_phys;
+    m->hlc.logical = (uint16_t)hlc_log;
+    m->expected_generation = (uint64_t)exp_gen;
+    m->fencing_epoch = (uint64_t)fence_epoch;
+    m->consistency = (qihse_consistency_class_t)cons;
+    m->flags = (uint32_t)flags;
+    return true;
+}
+
+static void conflict_encode(const qihse_federation_conflict_t* c, char* out, size_t cap) {
+    char local_m[512], remote_m[512];
+    mutation_to_str(&c->local_mutation, local_m, sizeof(local_m));
+    mutation_to_str(&c->remote_mutation, remote_m, sizeof(remote_m));
+    char local_val[512], remote_val[512];
+    value_hex(c->local_value, c->local_value_len, local_val, sizeof(local_val));
+    value_hex(c->remote_value, c->remote_value_len, remote_val, sizeof(remote_val));
+    char resolved_by[33];
+    uuid_hex(&c->resolved_by, resolved_by);
+    snprintf(out, cap, "%u\t%s\t%s\t%d\t%s\t%s\t%llu\t%s\t%llu\t%s\t%s\t%s\t%llu",
+             (unsigned)c->policy, c->namespace_name, c->resource_id,
+             c->resolved ? 1 : 0,
+             local_m, remote_m,
+             (unsigned long long)c->local_value_len, local_val,
+             (unsigned long long)c->remote_value_len, remote_val,
+             c->reason, resolved_by,
+             (unsigned long long)c->resolved_at_hlc_physical);
+}
+
+static bool conflict_decode(const char* blob, qihse_federation_conflict_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+    unsigned policy_u = 0, resolved_u = 0;
+    unsigned long long local_len = 0, remote_len = 0, resolved_at = 0;
+    char ns[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    char resource[64];
+    char local_m[512], remote_m[512];
+    char local_val_hex[512], remote_val_hex[512];
+    char reason[128];
+    char resolved_by_hex[33];
+    /* Use %63[^\t] which requires at least one char; for empty fields we
+     * need to handle them specially. We parse field by field manually. */
+    const char* p = blob;
+    /* policy */
+    policy_u = (unsigned)strtoul(p, (char**)&p, 10);
+    if (*p != '\t') return false;
+    p++;
+    /* namespace */
+    const char* start = p;
+    while (*p && *p != '\t') p++;
+    size_t nlen = (size_t)(p - start);
+    if (nlen >= sizeof(ns)) return false;
+    memcpy(ns, start, nlen); ns[nlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* resource_id */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t rlen = (size_t)(p - start);
+    if (rlen >= sizeof(resource)) return false;
+    memcpy(resource, start, rlen); resource[rlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* resolved */
+    resolved_u = (unsigned)strtoul(p, (char**)&p, 10);
+    if (*p != '\t') return false;
+    p++;
+    /* local_mutation */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t lmlen = (size_t)(p - start);
+    if (lmlen >= sizeof(local_m)) return false;
+    memcpy(local_m, start, lmlen); local_m[lmlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* remote_mutation */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t rmlen = (size_t)(p - start);
+    if (rmlen >= sizeof(remote_m)) return false;
+    memcpy(remote_m, start, rmlen); remote_m[rmlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* local_value_len */
+    local_len = strtoull(p, (char**)&p, 10);
+    if (*p != '\t') return false;
+    p++;
+    /* local_value_hex */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t lvlen = (size_t)(p - start);
+    if (lvlen >= sizeof(local_val_hex)) return false;
+    memcpy(local_val_hex, start, lvlen); local_val_hex[lvlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* remote_value_len */
+    remote_len = strtoull(p, (char**)&p, 10);
+    if (*p != '\t') return false;
+    p++;
+    /* remote_value_hex */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t rvlen = (size_t)(p - start);
+    if (rvlen >= sizeof(remote_val_hex)) return false;
+    memcpy(remote_val_hex, start, rvlen); remote_val_hex[rvlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* reason */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t rsnlen = (size_t)(p - start);
+    if (rsnlen >= sizeof(reason)) return false;
+    memcpy(reason, start, rsnlen); reason[rsnlen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* resolved_by_hex */
+    start = p;
+    while (*p && *p != '\t') p++;
+    size_t rblen = (size_t)(p - start);
+    if (rblen >= sizeof(resolved_by_hex)) return false;
+    memcpy(resolved_by_hex, start, rblen); resolved_by_hex[rblen] = '\0';
+    if (*p != '\t') return false;
+    p++;
+    /* resolved_at_hlc_physical */
+    resolved_at = strtoull(p, (char**)&p, 10);
+
+    out->policy = (qihse_conflict_policy_t)policy_u;
+    snprintf(out->namespace_name, sizeof(out->namespace_name), "%s", ns);
+    snprintf(out->resource_id, sizeof(out->resource_id), "%s", resource);
+    out->resolved = resolved_u != 0;
+    mutation_from_str(local_m, &out->local_mutation);
+    mutation_from_str(remote_m, &out->remote_mutation);
+    out->local_value_len = (size_t)local_len;
+    out->remote_value_len = (size_t)remote_len;
+    if (out->local_value_len <= sizeof(out->local_value))
+        value_from_hex(local_val_hex, out->local_value, sizeof(out->local_value), &out->local_value_len);
+    if (out->remote_value_len <= sizeof(out->remote_value))
+        value_from_hex(remote_val_hex, out->remote_value, sizeof(out->remote_value), &out->remote_value_len);
+    snprintf(out->reason, sizeof(out->reason), "%s", reason);
+    uuid_from_hex(resolved_by_hex, &out->resolved_by);
+    out->resolved_at_hlc_physical = (uint64_t)resolved_at;
+    return true;
+}
+
+bool qihse_federation_conflict_record(void* store_void, void* user_void,
+                                     const qihse_federation_conflict_t* conflict) {
+    if (!store_void || !user_void || !conflict) return false;
+    char key[128];
+    conflict_kv_key(&conflict->conflict_id, key, sizeof(key));
+    char* existing = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                       (qihse_user_t*)user_void);
+    if (existing) { free(existing); return false; }
+    char blob[4096];
+    conflict_encode(conflict, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_conflict_lookup(void* store_void, void* user_void,
+                                      const qihse_uuid_t* conflict_id,
+                                      qihse_federation_conflict_t* out) {
+    if (!store_void || !user_void || !conflict_id || !out) return false;
+    char key[128];
+    conflict_kv_key(conflict_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                  (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = conflict_decode(blob, out);
+    out->conflict_id = *conflict_id;
+    free(blob);
+    return ok;
+}
+
+bool qihse_federation_conflict_resolve(void* store_void, void* user_void,
+                                       const qihse_uuid_t* conflict_id,
+                                       const qihse_uuid_t* resolver) {
+    if (!store_void || !user_void || !conflict_id || !resolver) return false;
+    qihse_federation_conflict_t c;
+    if (!qihse_federation_conflict_lookup(store_void, user_void, conflict_id, &c)) return false;
+    if (c.resolved) return false;
+    c.resolved = true;
+    c.resolved_by = *resolver;
+    c.resolved_at_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+    char key[128];
+    conflict_kv_key(conflict_id, key, sizeof(key));
+    char blob[4096];
+    conflict_encode(&c, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+typedef struct {
+    qihse_federation_conflict_cb cb;
+    void* user_data;
+} conflict_iter_ctx_t;
+
+static bool conflict_iter_cb(const char* key, const char* value, void* user_data) {
+    conflict_iter_ctx_t* ctx = (conflict_iter_ctx_t*)user_data;
+    if (strncmp(key, QIHSE_FEDERATION_CONFLICT_PREFIX,
+                strlen(QIHSE_FEDERATION_CONFLICT_PREFIX)) != 0) return true;
+    qihse_federation_conflict_t c;
+    if (!conflict_decode(value, &c)) return true;
+    /* Parse the conflict_id from the key. */
+    const char* uuid_str = key + strlen(QIHSE_FEDERATION_CONFLICT_PREFIX);
+    qihse_uuid_t cid;
+    if (qihse_uuid_parse(uuid_str, &cid)) c.conflict_id = cid;
+    if (c.resolved) return true; /* skip resolved */
+    return ctx->cb(&c, ctx->user_data);
+}
+
+void qihse_federation_conflict_foreach(void* store_void, void* user_void,
+                                       qihse_federation_conflict_cb cb,
+                                       void* user_data) {
+    if (!store_void || !cb) return;
+    conflict_iter_ctx_t ctx = { cb, user_data };
+    qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
+                          conflict_iter_cb, &ctx);
+}
+
+/* ── F3: Namespace manifest ─────────────────────────────────────────────── */
+
+typedef struct {
+    qihse_federation_manifest_t* manifest;
+    char ns_prefix[128];
+    size_t ns_prefix_len;
+    qihse_federation_manifest_entry_t* current_entry;
+    char current_range_start[64];
+    uint64_t current_count;
+    EVP_MD_CTX* digest_ctx;
+} manifest_build_ctx_t;
+
+static bool manifest_flush_range(manifest_build_ctx_t* ctx) {
+    if (ctx->current_count == 0) return true;
+    if (ctx->manifest->entry_count >= QIHSE_FEDERATION_MANIFEST_MAX_RANGES) return false;
+    qihse_federation_manifest_entry_t* e = &ctx->manifest->entries[ctx->manifest->entry_count++];
+    snprintf(e->range_start, sizeof(e->range_start), "%s", ctx->current_range_start);
+    e->range_end[0] = '\0'; /* we use a single range for simplicity in F3 */
+    e->object_count = ctx->current_count;
+    unsigned int hlen = 48;
+    EVP_DigestFinal_ex(ctx->digest_ctx, e->digest, &hlen);
+    EVP_MD_CTX_free(ctx->digest_ctx);
+    ctx->digest_ctx = NULL;
+    ctx->current_count = 0;
+    return true;
+}
+
+static bool manifest_kv_cb(const char* key, const char* value, void* user_data) {
+    (void)value;
+    manifest_build_ctx_t* ctx = (manifest_build_ctx_t*)user_data;
+    /* Only keys that start with the namespace prefix. */
+    if (strncmp(key, ctx->ns_prefix, ctx->ns_prefix_len) != 0) return true;
+    const char* obj_id = key + ctx->ns_prefix_len;
+    if (ctx->current_count == 0) {
+        /* Start a new range. */
+        snprintf(ctx->current_range_start, sizeof(ctx->current_range_start), "%s", obj_id);
+        ctx->digest_ctx = EVP_MD_CTX_new();
+        if (!ctx->digest_ctx) return false;
+        EVP_DigestInit_ex(ctx->digest_ctx, EVP_sha384(), NULL);
+    }
+    /* Hash the object id into the digest. We don't have generation/HLC
+     * metadata in the KV value for F3's simple model, so we hash the
+     * id and value together. */
+    EVP_DigestUpdate(ctx->digest_ctx, key, strlen(key));
+    if (value) EVP_DigestUpdate(ctx->digest_ctx, value, strlen(value));
+    ctx->current_count++;
+    ctx->manifest->total_objects++;
+    return true;
+}
+
+bool qihse_federation_manifest_build(void* store_void, void* user_void,
+                                     const char* namespace_name,
+                                     qihse_federation_manifest_t* out) {
+    if (!store_void || !user_void || !namespace_name || !out) return false;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->namespace_name, sizeof(out->namespace_name), "%s", namespace_name);
+    manifest_build_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.manifest = out;
+    snprintf(ctx.ns_prefix, sizeof(ctx.ns_prefix), "ns:%s:", namespace_name);
+    ctx.ns_prefix_len = strlen(ctx.ns_prefix);
+    ctx.current_count = 0;
+    ctx.digest_ctx = NULL;
+    qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
+                          manifest_kv_cb, &ctx);
+    if (ctx.digest_ctx) {
+        manifest_flush_range(&ctx);
+    }
+    return true;
+}
+
+size_t qihse_federation_manifest_compare(const qihse_federation_manifest_t* local,
+                                        const qihse_federation_manifest_t* remote,
+                                        qihse_federation_manifest_entry_t* out_divergent,
+                                        size_t out_cap) {
+    if (!local || !remote) return 0;
+    size_t divergent = 0;
+    /* Simple comparison: compare each local entry against the remote.
+     * For F3 we use a single-range manifest, so we compare the two
+     * single entries directly. */
+    for (size_t i = 0; i < local->entry_count && divergent < out_cap; i++) {
+        bool found = false;
+        for (size_t j = 0; j < remote->entry_count; j++) {
+            if (strcmp(local->entries[i].range_start, remote->entries[j].range_start) == 0) {
+                found = true;
+                if (local->entries[i].object_count != remote->entries[j].object_count ||
+                    memcmp(local->entries[i].digest, remote->entries[j].digest, 48) != 0) {
+                    out_divergent[divergent++] = local->entries[i];
+                }
+                break;
+            }
+        }
+        if (!found && divergent < out_cap) {
+            out_divergent[divergent++] = local->entries[i];
+        }
+    }
+    /* Check for ranges remote has that local doesn't. */
+    for (size_t j = 0; j < remote->entry_count && divergent < out_cap; j++) {
+        bool found = false;
+        for (size_t i = 0; i < local->entry_count; i++) {
+            if (strcmp(local->entries[i].range_start, remote->entries[j].range_start) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            out_divergent[divergent++] = remote->entries[j];
+        }
+    }
+    return divergent;
+}
+
+/* ── F3: Anti-entropy sync plan ─────────────────────────────────────────── */
+
+size_t qihse_federation_sync_plan(const qihse_federation_manifest_t* local,
+                                 const qihse_federation_manifest_t* remote,
+                                 qihse_federation_sync_range_t* out_ranges,
+                                 size_t out_cap) {
+    if (!local || !remote || !out_ranges || out_cap == 0) return 0;
+    size_t count = 0;
+    /* For each local entry, determine the action. */
+    for (size_t i = 0; i < local->entry_count && count < out_cap; i++) {
+        bool found = false;
+        for (size_t j = 0; j < remote->entry_count; j++) {
+            if (strcmp(local->entries[i].range_start, remote->entries[j].range_start) == 0) {
+                found = true;
+                if (local->entries[i].object_count == remote->entries[j].object_count &&
+                    memcmp(local->entries[i].digest, remote->entries[j].digest, 48) == 0) {
+                    /* in sync — no action */
+                } else {
+                    /* divergent — potential conflict */
+                    out_ranges[count].action = QIHSE_SYNC_CONFLICT;
+                    snprintf(out_ranges[count].range_start, sizeof(out_ranges[count].range_start),
+                             "%s", local->entries[i].range_start);
+                    snprintf(out_ranges[count].range_end, sizeof(out_ranges[count].range_end),
+                             "%s", local->entries[i].range_end);
+                    count++;
+                }
+                break;
+            }
+        }
+        if (!found) {
+            /* local has objects remote doesn't — send */
+            out_ranges[count].action = QIHSE_SYNC_SEND;
+            snprintf(out_ranges[count].range_start, sizeof(out_ranges[count].range_start),
+                     "%s", local->entries[i].range_start);
+            snprintf(out_ranges[count].range_end, sizeof(out_ranges[count].range_end),
+                     "%s", local->entries[i].range_end);
+            count++;
+        }
+    }
+    /* Remote has objects local doesn't — fetch. */
+    for (size_t j = 0; j < remote->entry_count && count < out_cap; j++) {
+        bool found = false;
+        for (size_t i = 0; i < local->entry_count; i++) {
+            if (strcmp(local->entries[i].range_start, remote->entries[j].range_start) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            out_ranges[count].action = QIHSE_SYNC_FETCH;
+            snprintf(out_ranges[count].range_start, sizeof(out_ranges[count].range_start),
+                     "%s", remote->entries[j].range_start);
+            snprintf(out_ranges[count].range_end, sizeof(out_ranges[count].range_end),
+                     "%s", remote->entries[j].range_end);
+            count++;
+        }
+    }
+    return count;
+}
