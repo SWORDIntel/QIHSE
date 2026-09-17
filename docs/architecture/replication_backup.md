@@ -80,10 +80,14 @@ qihse_read_replica_route(pool, &host, &port);
 ### API
 ```c
 qihse_backup_info_t info;
-qihse_backup_full(kv, "/backups/full.bak", &info);
-qihse_backup_incremental(kv, "/backups/incr.bak", since_lsn, &info);
-qihse_restore(kv, "/backups/full.bak");
-qihse_backup_verify("/backups/full.bak");
+qihse_backup_full_user(kv, user, "/backups/full.bak", &info);
+/* Incremental export is NOT implemented: the KV store exposes no change
+   sequence, so this returns UNSUPPORTED rather than shipping a full snapshot
+   labelled incremental. Use the manifest-bound federation backup, which
+   carries a WAL continuation point, for delta restore. */
+qihse_backup_incremental_user(kv, user, "/backups/incr.bak", since_lsn, &info);
+qihse_restore_user(kv, user, "/backups/full.bak");
+qihse_backup_verify_user(user, "/backups/full.bak");
 ```
 
 ## Parallel Query (`src/tractable/qihse_parallel_query.c`)

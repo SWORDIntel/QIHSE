@@ -335,15 +335,15 @@ Legacy whole-store export, `src/tractable/qihse_backup.c` — **partial, stub**:
 
 | Function | Purpose | On failure |
 |---|---|---|
-| `int qihse_backup_full(qihse_kv_store_t* kv, const char* output_path, qihse_backup_info_t* info)` | Whole-store export. | `-1` |
-| `int qihse_backup_incremental(qihse_kv_store_t* kv, const char* output_path, uint64_t since_lsn, qihse_backup_info_t* info)` | Incremental export. | `-1` |
-| `int qihse_restore(qihse_kv_store_t* kv, const char* backup_path)` | Restore from a container. | `-1` |
-| `int qihse_backup_list(const char* dir, qihse_backup_info_t** out_backups, size_t* out_count)` | List containers in a directory. | `-1` |
-| `int qihse_backup_verify(const char* backup_path)` | Verify a container's checksum. | `-1` |
+| `int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, qihse_backup_info_t* info)` | Whole-store export. Requires an authenticated context. | `-1` argument, `-2` denied | `-1` |
+| `int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, uint64_t since_lsn, qihse_backup_info_t* info)` | Incremental export. | `-1` |
+| `int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path)` | Restore from a container. | `-1` argument, `-2` denied |
+| `int qihse_backup_list_user(qihse_user_t* user, const char* dir, qihse_backup_info_t** out_backups, size_t* out_count)` | List containers in a directory. | `-1` |
+| `int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path)` | Verify a container's checksum. | `-1` argument, `-2` denied |
 | `void qihse_backup_info_free(qihse_backup_info_t* info)` | Release a listing entry. | n/a |
 
 > **Contradiction with the code:** the legacy surface is a stub.
-> `qihse_backup_full()` in `src/tractable/qihse_backup.c` writes an empty data
+> `qihse_backup_full_user()` in `src/tractable/qihse_backup.c` writes an empty data
 > section and carries an explicit `TODO: iterate KV store and write all
 > key-value pairs`; `data_len` is derived from the file size rather than from
 > captured records. These functions take no security context, so they can only
