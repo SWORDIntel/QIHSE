@@ -730,6 +730,55 @@ uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
     return count;
 }
 
+uint64_t qihse_federation_journal_replay_window(qihse_federation_journal_t* journal,
+                                               uint64_t from_cursor,
+                                               uint64_t max_events,
+                                               qihse_federation_journal_cb cb,
+                                               void* user_data,
+                                               uint64_t* out_cursor) {
+    if (!journal || !cb) return 0;
+    if (out_cursor) *out_cursor = from_cursor;
+
+    qihse_es_record_header_t hdr;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+    uint64_t cursor = from_cursor;
+    uint64_t count = 0;
+    /* Remember the offset of the last record DELIVERED, so the resume point
+     * never runs past a record the callback refused. */
+    uint64_t last_delivered_end = from_cursor;
+    uint64_t last_delivered_start = from_cursor;
+    bool delivered_any = false;
+
+    while (count < max_events &&
+           qihse_event_stream_iterate(journal->stream, QIHSE_FEDERATION_JOURNAL_TOPIC,
+                                      &cursor, &hdr, &payload, &plen)) {
+        qihse_federation_event_t ev;
+        const uint8_t* user_payload = NULL;
+        size_t user_len = 0;
+        journal_deserialize(payload, plen, &ev, &user_payload, &user_len);
+        ev.journal_offset = hdr.stream_offset;
+        memcpy(ev.hash, hdr.event_id, 48);
+        last_delivered_start = hdr.stream_offset;
+        last_delivered_end = cursor;
+        bool cont = cb(&ev, user_payload, user_len, user_data);
+        free(payload);
+        payload = NULL;
+        count++;
+        delivered_any = true;
+        if (!cont) break;
+    }
+
+    if (out_cursor) {
+        /* The resume point is the offset after the last record the callback
+         * ACCEPTED, not the iterator's position: a callback that stopped early
+         * must not have its remaining records skipped. */
+        *out_cursor = delivered_any ? last_delivered_end : from_cursor;
+        (void)last_delivered_start;
+    }
+    return count;
+}
+
 uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal) {
     if (!journal || !journal->stream) return 0;
     return qihse_event_stream_length(journal->stream, QIHSE_FEDERATION_JOURNAL_TOPIC);

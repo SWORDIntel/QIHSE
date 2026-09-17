@@ -115,3 +115,4 @@ lib/
 /build/fed_fuzz_*/
 /build/fed_bustrust_*/
 /build/fed_mtls_*/
+/build/fed_repl_*/

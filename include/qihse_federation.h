@@ -302,6 +302,21 @@ uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
                                         qihse_federation_journal_cb cb,
                                         void* user_data);
 
+/* Bounded replay that reports where to resume.
+ *
+ * The cursor is owned by the event stream (a record's size is only known once
+ * read), so a caller cannot compute the next offset from the current one.  A
+ * range transfer needs exactly this: ship at most `max_events` records from
+ * `from_cursor`, then learn the offset to resume from.  Returns the number of
+ * events delivered; `out_cursor` receives the resume point and is unchanged
+ * when nothing was delivered, which is what makes a failed round retryable. */
+uint64_t qihse_federation_journal_replay_window(qihse_federation_journal_t* journal,
+                                               uint64_t from_cursor,
+                                               uint64_t max_events,
+                                               qihse_federation_journal_cb cb,
+                                               void* user_data,
+                                               uint64_t* out_cursor);
+
 /* Current journal length (offset of the next append). */
 uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal);
 
