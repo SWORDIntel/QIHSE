@@ -86,7 +86,15 @@ The accepted major direction. Governing principle: **federation must enhance a n
 - [x] **F5 — Trust plane.** Durable node identity keypairs (Ed25519, private key on disk, never in a record), operator-approved enrollment with permanent revocation, infrastructure authorization scopes with per-service defaults, signed replay-resistant gossip (protocol version, sender/boot UUID, monotonic sequence, HLC, capability/health, signature, persistent replay window). *Unblocks criterion 8's crypto substrate.* Transport-level mTLS binding for federation RPC remains — it attaches where the overlay transport lands.
 - [x] **F6 — Build & supply-chain substrate.** Package override registry (reason mandatory), build-job state machine with idempotent transitions, builder capability + historical performance, provenance graph (21 entities / 15 edges) with direction-aware trace-back and reverse-impact, SBOM/attestation records (key handles only), append-only vulnerability observations, immutable queryable repository snapshots. *Unblocks criteria 15–22.*
 - [x] **F7 — Runtime trust and hardening.** Evidence-aware federation admission: runtime trust states (UNKNOWN/TRUSTED/TRUSTED_DEGRADED/LOCAL_ONLY/QUARANTINED/REVOKED) with immutable per-boot evidence bundles and external verification records that emit journal audit events. Local usability is true in *every* trust state; only distributed authority is tiered. Runtime security profiles with a measured kernel-interface allowlist (REQUIRED/OPTIONAL/FORBIDDEN/UNKNOWN), network exposure/egress declarations, and a hardening self-audit that reads ACTUAL process state (credentials, effective capabilities, core-dump rlimit, seccomp mode, listening sockets). Time-integrity monitor plus a wall-clock-independent HLC advance/merge that cannot be broken by backward or forward clock jumps. *Unblocks criteria 23–28.*
-- [ ] **F8 — Operational hardening.** Rolling schema upgrades, federation-consistent snapshots/backup, deterministic chaos suite, performance regression budgets, recovery tooling.
+- [~] **F8 — Operational hardening.** *In progress.*
+  - [x] Deterministic distributed simulation harness (seeded PRNG, virtual clock, loss/duplication/reorder/delay/partition/crash/stale-clock injectors) plus the mandatory scenarios from the brief run against the real F1-F7 entry points. *Closes criterion 13.*
+  - [ ] Rolling schema evolution (schema id/version/min-reader/feature bits, resumable migrations)
+  - [ ] Snapshot and backup semantics (local + coordinated metadata snapshots, manifest, WAL continuation)
+  - [ ] Reconciliation safety state machine (the explicit rejoin sequence)
+  - [ ] Observability metrics (label-bounded)
+  - [ ] Performance regression budgets *Closes criterion 14.*
+  - [ ] Fuzzing targets for wire and persisted parsers
+  - [ ] Architecture documentation set
 
 ### W2 — AI compute fabric
 
