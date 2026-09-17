@@ -628,6 +628,209 @@ void qihse_federation_group_foreach(void* store_void, void* user_void,
                                     qihse_federation_group_cb cb,
                                     void* user_data);
 
+/* ────────────────────────────────────────────────────────────────────────
+ * F5 — Trust plane (plan §17, §18, §19, §20).
+ *
+ * Node identity is a durable keypair, not an IP address, hostname, or
+ * topology index.  Enrollment is an operator-approved flow:
+ *
+ *   generate node key -> operator approves -> federation CA signs
+ *     -> node obtains scoped certificate -> QIHSE stores enrollment event
+ *
+ * Private keys are NEVER placed in QIHSE records.  Records carry a key
+ * handle (a filesystem reference) and the public key only (plan §20).
+ *
+ * Gossip becomes a signed membership/health plane with a replay window.
+ * A UDP datagram is never trusted merely because its source IP matches a
+ * configured peer (plan §17).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Infrastructure authorization scopes (plan §19) ─────────────────────── */
+
+typedef uint32_t qihse_infra_scope_t;
+
+#define QIHSE_SCOPE_NONE              (0u)
+#define QIHSE_SCOPE_FEDERATION_READ   (1u << 0)
+#define QIHSE_SCOPE_FEDERATION_WRITE  (1u << 1)
+#define QIHSE_SCOPE_NODE_ENROLL       (1u << 2)
+#define QIHSE_SCOPE_NODE_REVOKE       (1u << 3)
+#define QIHSE_SCOPE_POLICY_READ       (1u << 4)
+#define QIHSE_SCOPE_POLICY_WRITE      (1u << 5)
+#define QIHSE_SCOPE_LEASE_READ        (1u << 6)
+#define QIHSE_SCOPE_LEASE_WRITE       (1u << 7)
+#define QIHSE_SCOPE_SECURITY_ADMIN    (1u << 8)
+#define QIHSE_SCOPE_AUDIT_READ        (1u << 9)
+#define QIHSE_SCOPE_TELEMETRY_WRITE   (1u << 10)
+
+/* Every scope that exists, for iteration/validation. */
+#define QIHSE_SCOPE_ALL               (0x7FFu)
+
+const char* qihse_infra_scope_name(qihse_infra_scope_t scope);
+bool qihse_infra_scope_parse(const char* name, qihse_infra_scope_t* out);
+
+/* Service identities are distinct from human principals.  KEYSTONE must
+ * receive a read/index identity, never database-admin privileges. */
+typedef enum {
+    QIHSE_IDENTITY_OPERATOR = 0,
+    QIHSE_IDENTITY_HYPERVISOR_CONTROLLER,
+    QIHSE_IDENTITY_HOST_AGENT,
+    QIHSE_IDENTITY_UI_API,
+    QIHSE_IDENTITY_KEYSTONE_INDEXER,
+    QIHSE_IDENTITY_BACKUP_AGENT
+} qihse_service_identity_t;
+
+const char* qihse_service_identity_name(qihse_service_identity_t kind);
+bool qihse_service_identity_parse(const char* name, qihse_service_identity_t* out);
+
+/* The default scope set granted to a service identity at enrollment.
+ * KEYSTONE_INDEXER deliberately receives read/index scopes only. */
+qihse_infra_scope_t qihse_service_identity_default_scopes(qihse_service_identity_t kind);
+
+/* Check whether an authenticated principal holds the required scope.
+ * The operator principal implicitly holds every scope. */
+bool qihse_infra_scope_check(void* user_void, qihse_infra_scope_t required);
+
+/* ── Node identity and trust (plan §18, §20) ────────────────────────────── */
+
+typedef enum {
+    QIHSE_TRUST_UNKNOWN = 0,
+    QIHSE_TRUST_PENDING,    /* enrollment requested, awaiting operator approval */
+    QIHSE_TRUST_APPROVED,   /* CA-signed and active */
+    QIHSE_TRUST_REVOKED     /* permanently denied */
+} qihse_trust_state_t;
+
+const char* qihse_trust_state_name(qihse_trust_state_t state);
+bool qihse_trust_state_parse(const char* name, qihse_trust_state_t* out);
+
+#define QIHSE_FEDERATION_NODE_PUBKEY_BYTES 32u  /* Ed25519 raw public key */
+#define QIHSE_FEDERATION_NODE_SIG_BYTES    64u  /* Ed25519 signature */
+#define QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES 48u /* SHA-384 */
+
+typedef struct {
+    qihse_uuid_t node_id;       /* durable, immutable identity */
+    char hostname[128];         /* mutable attribute — display only */
+    char boot_id[64];           /* boot/session identifier, changes per boot */
+    char key_handle[160];       /* filesystem reference to the private key */
+    uint8_t public_key[QIHSE_FEDERATION_NODE_PUBKEY_BYTES];
+    uint8_t fingerprint[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    qihse_trust_state_t trust;
+    uint64_t enrollment_epoch;
+    qihse_service_identity_t identity_kind;
+    qihse_infra_scope_t scopes;
+    uint32_t capabilities;
+    uint64_t last_hlc_physical;
+} qihse_federation_node_identity_t;
+
+#define QIHSE_FEDERATION_NODE_PREFIX "fednode:"
+
+/* Generate a durable node identity keypair.  The private key is written to
+ * "<key_directory>/<node_id>.key" with 0600 permissions; only the public key
+ * and a key handle are returned.  The private key never enters a QIHSE
+ * record (plan §20).  key_directory must exist. */
+bool qihse_federation_node_keygen(const char* key_directory,
+                                  const qihse_uuid_t* node_id,
+                                  uint8_t* out_public_key,
+                                  char* out_key_handle, size_t out_key_handle_cap);
+
+/* Compute the SHA-384 fingerprint of a raw public key. */
+bool qihse_federation_node_fingerprint(const uint8_t* public_key,
+                                       uint8_t* out_fingerprint);
+
+/* Load a node private key from a handle.  Returns an opaque EVP_PKEY* which
+ * the caller must release with qihse_federation_node_key_free(). */
+void* qihse_federation_node_key_load(const char* key_handle);
+void qihse_federation_node_key_free(void* pkey);
+
+/* Enrollment: request records a PENDING identity; approve promotes it to
+ * APPROVED and assigns the enrollment epoch; revoke marks it REVOKED and
+ * makes it permanently unusable. */
+bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
+                                         const qihse_federation_node_identity_t* identity);
+bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
+                                         const qihse_uuid_t* node_id,
+                                         uint64_t enrollment_epoch);
+bool qihse_federation_node_revoke(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id);
+bool qihse_federation_node_lookup(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id,
+                                  qihse_federation_node_identity_t* out);
+
+typedef bool (*qihse_federation_node_cb)(const qihse_federation_node_identity_t* node,
+                                        void* user_data);
+void qihse_federation_node_foreach(void* store_void, void* user_void,
+                                   qihse_federation_node_cb cb, void* user_data);
+
+/* ── Signed gossip / membership plane (plan §17) ────────────────────────── */
+
+#define QIHSE_FEDERATION_GOSSIP_MAGIC 0x51484753u /* "QHGS" */
+#define QIHSE_FEDERATION_GOSSIP_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;          /* protocol version */
+    uint16_t feature_bitmap;   /* feature negotiation */
+    qihse_uuid_t cluster_id;   /* cluster/federation UUID */
+    qihse_uuid_t sender_node;  /* sender node UUID, not topology index */
+    qihse_uuid_t boot_id;      /* boot/session UUID */
+    uint64_t sequence;         /* monotonic per boot */
+    qihse_hlc_t hlc;
+    uint32_t capability_bitmap;
+    uint32_t health_summary;
+    uint8_t signature[QIHSE_FEDERATION_NODE_SIG_BYTES];
+} qihse_federation_gossip_t;
+
+/* The bytes covered by the signature: every field except the signature
+ * itself.  Serialization is little-endian and length-prefixed so a peer
+ * cannot reinterpret fields. */
+bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
+                                       uint8_t* out, size_t out_cap, size_t* out_len);
+
+/* Sign a gossip frame in place. pkey is an EVP_PKEY* from node_key_load(). */
+bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip);
+
+/* Verify a gossip frame's signature against a raw Ed25519 public key. */
+bool qihse_federation_gossip_verify(const uint8_t* public_key,
+                                    const qihse_federation_gossip_t* gossip);
+
+/* Replay-window state, one per (sender node, boot). */
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    uint64_t highest_sequence;
+    uint64_t first_seen_hlc_physical;
+} qihse_federation_replay_state_t;
+
+#define QIHSE_FEDERATION_REPLAY_PREFIX "fedreplay:"
+
+/* Accept a gossip frame: checks the magic/version, the sender's trust state,
+ * the signature against the enrolled public key, and the replay window.
+ * A frame is rejected if its sequence is not strictly greater than the
+ * highest sequence already accepted from that (sender, boot).
+ *
+ * Replay state persists under "fedreplay:<node>:<boot>" so a restart does
+ * not reopen the window.  Every call takes an explicit authenticated user
+ * (AGENTS.md invariant 1). */
+typedef enum {
+    QIHSE_GOSSIP_ACCEPTED = 0,
+    QIHSE_GOSSIP_REJECT_MALFORMED,
+    QIHSE_GOSSIP_REJECT_VERSION,
+    QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER,
+    QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER,
+    QIHSE_GOSSIP_REJECT_BAD_SIGNATURE,
+    QIHSE_GOSSIP_REJECT_REPLAY
+} qihse_gossip_result_t;
+
+const char* qihse_gossip_result_name(qihse_gossip_result_t result);
+
+qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* user_void,
+                                                    const qihse_federation_gossip_t* gossip);
+
+/* Read the stored replay state for a (sender, boot). */
+bool qihse_federation_replay_state_read(void* store_void, void* user_void,
+                                        const qihse_uuid_t* sender_node,
+                                        const qihse_uuid_t* boot_id,
+                                        qihse_federation_replay_state_t* out);
+
 #ifdef __cplusplus
 }
 #endif

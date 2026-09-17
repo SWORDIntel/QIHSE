@@ -7,13 +7,17 @@
 #include "qihse_federation.h"
 
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "qihse_auth.h"
 #include "qihse_event_stream.h"
@@ -1864,4 +1868,522 @@ void qihse_federation_group_foreach(void* store_void, void* user_void,
     group_iter_ctx_t ctx = { cb, user_data };
     qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
                           group_iter_cb, &ctx);
+}
+
+/* ── F5: Infrastructure authorization scopes (plan §19) ────────────────── */
+
+typedef struct {
+    qihse_infra_scope_t bit;
+    const char* name;
+} infra_scope_entry_t;
+
+static const infra_scope_entry_t g_infra_scopes[] = {
+    { QIHSE_SCOPE_FEDERATION_READ,  "FEDERATION_READ"  },
+    { QIHSE_SCOPE_FEDERATION_WRITE, "FEDERATION_WRITE" },
+    { QIHSE_SCOPE_NODE_ENROLL,      "NODE_ENROLL"      },
+    { QIHSE_SCOPE_NODE_REVOKE,      "NODE_REVOKE"      },
+    { QIHSE_SCOPE_POLICY_READ,      "POLICY_READ"      },
+    { QIHSE_SCOPE_POLICY_WRITE,     "POLICY_WRITE"     },
+    { QIHSE_SCOPE_LEASE_READ,       "LEASE_READ"       },
+    { QIHSE_SCOPE_LEASE_WRITE,      "LEASE_WRITE"      },
+    { QIHSE_SCOPE_SECURITY_ADMIN,   "SECURITY_ADMIN"   },
+    { QIHSE_SCOPE_AUDIT_READ,       "AUDIT_READ"       },
+    { QIHSE_SCOPE_TELEMETRY_WRITE,  "TELEMETRY_WRITE"  },
+};
+
+const char* qihse_infra_scope_name(qihse_infra_scope_t scope) {
+    for (size_t i = 0; i < sizeof(g_infra_scopes) / sizeof(g_infra_scopes[0]); i++) {
+        if (g_infra_scopes[i].bit == scope) return g_infra_scopes[i].name;
+    }
+    return "UNKNOWN";
+}
+
+bool qihse_infra_scope_parse(const char* name, qihse_infra_scope_t* out) {
+    if (!name || !out) return false;
+    for (size_t i = 0; i < sizeof(g_infra_scopes) / sizeof(g_infra_scopes[0]); i++) {
+        if (strcasecmp(g_infra_scopes[i].name, name) == 0) {
+            *out = g_infra_scopes[i].bit;
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    qihse_service_identity_t kind;
+    const char* name;
+    qihse_infra_scope_t scopes;
+} service_identity_entry_t;
+
+static const service_identity_entry_t g_service_identities[] = {
+    { QIHSE_IDENTITY_OPERATOR,              "operator",              QIHSE_SCOPE_ALL },
+    { QIHSE_IDENTITY_HYPERVISOR_CONTROLLER, "hypervisor-controller",
+      QIHSE_SCOPE_FEDERATION_READ | QIHSE_SCOPE_FEDERATION_WRITE |
+      QIHSE_SCOPE_POLICY_READ | QIHSE_SCOPE_POLICY_WRITE |
+      QIHSE_SCOPE_LEASE_READ | QIHSE_SCOPE_LEASE_WRITE |
+      QIHSE_SCOPE_TELEMETRY_WRITE },
+    { QIHSE_IDENTITY_HOST_AGENT,            "host-agent",
+      QIHSE_SCOPE_FEDERATION_READ | QIHSE_SCOPE_TELEMETRY_WRITE |
+      QIHSE_SCOPE_LEASE_READ },
+    { QIHSE_IDENTITY_UI_API,                "ui-api",
+      QIHSE_SCOPE_FEDERATION_READ | QIHSE_SCOPE_POLICY_READ |
+      QIHSE_SCOPE_LEASE_READ },
+    /* KEYSTONE receives a read/index identity, never database-admin. */
+    { QIHSE_IDENTITY_KEYSTONE_INDEXER,      "keystone-indexer",
+      QIHSE_SCOPE_FEDERATION_READ },
+    { QIHSE_IDENTITY_BACKUP_AGENT,          "backup-agent",
+      QIHSE_SCOPE_FEDERATION_READ | QIHSE_SCOPE_POLICY_READ |
+      QIHSE_SCOPE_AUDIT_READ },
+};
+
+const char* qihse_service_identity_name(qihse_service_identity_t kind) {
+    for (size_t i = 0; i < sizeof(g_service_identities) / sizeof(g_service_identities[0]); i++) {
+        if (g_service_identities[i].kind == kind) return g_service_identities[i].name;
+    }
+    return "unknown";
+}
+
+bool qihse_service_identity_parse(const char* name, qihse_service_identity_t* out) {
+    if (!name || !out) return false;
+    for (size_t i = 0; i < sizeof(g_service_identities) / sizeof(g_service_identities[0]); i++) {
+        if (strcmp(g_service_identities[i].name, name) == 0) {
+            *out = g_service_identities[i].kind;
+            return true;
+        }
+    }
+    return false;
+}
+
+qihse_infra_scope_t qihse_service_identity_default_scopes(qihse_service_identity_t kind) {
+    for (size_t i = 0; i < sizeof(g_service_identities) / sizeof(g_service_identities[0]); i++) {
+        if (g_service_identities[i].kind == kind) return g_service_identities[i].scopes;
+    }
+    return QIHSE_SCOPE_NONE;
+}
+
+bool qihse_infra_scope_check(void* user_void, qihse_infra_scope_t required) {
+    if (!user_void) return false; /* NULL is never an authorization bypass */
+    qihse_user_t* user = (qihse_user_t*)user_void;
+    uint16_t role = qihse_user_get_role(user);
+    qihse_infra_scope_t held;
+    switch (role) {
+        case QIHSE_ROLE_OPERATOR: held = QIHSE_SCOPE_ALL; break;
+        case QIHSE_ROLE_ANALYST:
+            held = QIHSE_SCOPE_FEDERATION_READ | QIHSE_SCOPE_POLICY_READ |
+                   QIHSE_SCOPE_LEASE_READ | QIHSE_SCOPE_TELEMETRY_WRITE;
+            break;
+        default: held = QIHSE_SCOPE_NONE; break;
+    }
+    if (required == QIHSE_SCOPE_NONE) return true;
+    return (held & required) == required;
+}
+
+/* ── F5: Node identity and trust (plan §18, §20) ───────────────────────── */
+
+const char* qihse_trust_state_name(qihse_trust_state_t state) {
+    switch (state) {
+        case QIHSE_TRUST_UNKNOWN:  return "unknown";
+        case QIHSE_TRUST_PENDING:  return "pending";
+        case QIHSE_TRUST_APPROVED: return "approved";
+        case QIHSE_TRUST_REVOKED:  return "revoked";
+    }
+    return "unknown";
+}
+
+bool qihse_trust_state_parse(const char* name, qihse_trust_state_t* out) {
+    if (!name || !out) return false;
+    if (strcmp(name, "unknown") == 0)  { *out = QIHSE_TRUST_UNKNOWN; return true; }
+    if (strcmp(name, "pending") == 0)  { *out = QIHSE_TRUST_PENDING; return true; }
+    if (strcmp(name, "approved") == 0) { *out = QIHSE_TRUST_APPROVED; return true; }
+    if (strcmp(name, "revoked") == 0)  { *out = QIHSE_TRUST_REVOKED; return true; }
+    return false;
+}
+
+bool qihse_federation_node_fingerprint(const uint8_t* public_key,
+                                       uint8_t* out_fingerprint) {
+    if (!public_key || !out_fingerprint) return false;
+    unsigned int len = 0;
+    if (!EVP_Digest(public_key, QIHSE_FEDERATION_NODE_PUBKEY_BYTES,
+                    out_fingerprint, &len, EVP_sha384(), NULL)) return false;
+    return len == QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES;
+}
+
+bool qihse_federation_node_keygen(const char* key_directory,
+                                  const qihse_uuid_t* node_id,
+                                  uint8_t* out_public_key,
+                                  char* out_key_handle, size_t out_key_handle_cap) {
+    if (!key_directory || !node_id || !out_public_key || !out_key_handle) return false;
+
+    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
+    if (!pkey) return false;
+
+    size_t pub_len = QIHSE_FEDERATION_NODE_PUBKEY_BYTES;
+    if (EVP_PKEY_get_raw_public_key(pkey, out_public_key, &pub_len) != 1 ||
+        pub_len != QIHSE_FEDERATION_NODE_PUBKEY_BYTES) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(node_id, id_str);
+    int n = snprintf(out_key_handle, out_key_handle_cap, "%s/%s.key", key_directory, id_str);
+    if (n <= 0 || (size_t)n >= out_key_handle_cap) { EVP_PKEY_free(pkey); return false; }
+
+    /* Write the private key PEM-encoded with 0600 permissions.  The private
+     * key never enters a QIHSE record (plan §20). */
+    FILE* f = fopen(out_key_handle, "wb");
+    if (!f) { EVP_PKEY_free(pkey); return false; }
+    int ok = PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL);
+    fclose(f);
+    if (ok != 1) {
+        (void)remove(out_key_handle);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+#ifndef _WIN32
+    (void)chmod(out_key_handle, 0600);
+#endif
+    EVP_PKEY_free(pkey);
+    return true;
+}
+
+void* qihse_federation_node_key_load(const char* key_handle) {
+    if (!key_handle) return NULL;
+    FILE* f = fopen(key_handle, "rb");
+    if (!f) return NULL;
+    EVP_PKEY* pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+    fclose(f);
+    return pkey;
+}
+
+void qihse_federation_node_key_free(void* pkey) {
+    if (pkey) EVP_PKEY_free((EVP_PKEY*)pkey);
+}
+
+/* Node record wire format (tab-separated, binary fields hex-encoded). */
+static void node_encode(const qihse_federation_node_identity_t* n, char* out, size_t cap) {
+    char nid[33], pub_hex[65], fp_hex[97];
+    uuid_hex(&n->node_id, nid);
+    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_PUBKEY_BYTES; i++)
+        snprintf(pub_hex + i * 2, 3, "%02x", n->public_key[i]);
+    pub_hex[64] = '\0';
+    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++)
+        snprintf(fp_hex + i * 2, 3, "%02x", n->fingerprint[i]);
+    fp_hex[96] = '\0';
+    snprintf(out, cap, "%s\t%s\t%s\t%s\t%s\t%s\t%u\t%llu\t%u\t%u\t%u\t%llu",
+             nid, n->hostname, n->boot_id, n->key_handle, pub_hex, fp_hex,
+             (unsigned)n->trust, (unsigned long long)n->enrollment_epoch,
+             (unsigned)n->identity_kind, (unsigned)n->scopes,
+             (unsigned)n->capabilities,
+             (unsigned long long)n->last_hlc_physical);
+}
+
+static bool node_decode(const char* blob, qihse_federation_node_identity_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+    char nid[33], pub_hex[65], fp_hex[97];
+    char hostname[128], boot_id[64], key_handle[160];
+    unsigned trust = 0, kind = 0, scopes = 0, caps = 0;
+    unsigned long long epoch = 0, last_hlc = 0;
+    int n = sscanf(blob, "%32[^\t]\t%127[^\t]\t%63[^\t]\t%159[^\t]\t%64[^\t]\t%96[^\t]\t%u\t%llu\t%u\t%u\t%u\t%llu",
+                   nid, hostname, boot_id, key_handle, pub_hex, fp_hex,
+                   &trust, &epoch, &kind, &scopes, &caps, &last_hlc);
+    if (n < 12) return false;
+    uuid_from_hex(nid, &out->node_id);
+    snprintf(out->hostname, sizeof(out->hostname), "%s", hostname);
+    snprintf(out->boot_id, sizeof(out->boot_id), "%s", boot_id);
+    snprintf(out->key_handle, sizeof(out->key_handle), "%s", key_handle);
+    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_PUBKEY_BYTES; i++) {
+        unsigned int byte;
+        if (sscanf(pub_hex + i * 2, "%2x", &byte) != 1) return false;
+        out->public_key[i] = (uint8_t)byte;
+    }
+    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++) {
+        unsigned int byte;
+        if (sscanf(fp_hex + i * 2, "%2x", &byte) != 1) return false;
+        out->fingerprint[i] = (uint8_t)byte;
+    }
+    out->trust = (qihse_trust_state_t)trust;
+    out->enrollment_epoch = (uint64_t)epoch;
+    out->identity_kind = (qihse_service_identity_t)kind;
+    out->scopes = (qihse_infra_scope_t)scopes;
+    out->capabilities = (uint32_t)caps;
+    out->last_hlc_physical = (uint64_t)last_hlc;
+    return true;
+}
+
+static void node_kv_key(const qihse_uuid_t* node_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(node_id, id_str);
+    snprintf(out, cap, QIHSE_FEDERATION_NODE_PREFIX "%s", id_str);
+}
+
+bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
+                                         const qihse_federation_node_identity_t* identity) {
+    if (!store_void || !user_void || !identity) return false;
+    char key[128];
+    node_kv_key(&identity->node_id, key, sizeof(key));
+    char* existing = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                       (qihse_user_t*)user_void);
+    if (existing) { free(existing); return false; }
+
+    qihse_federation_node_identity_t rec = *identity;
+    rec.trust = QIHSE_TRUST_PENDING;
+    rec.enrollment_epoch = 0;
+    /* The identity's scopes come from its service identity kind, not from
+     * the enrolling caller — a requester cannot self-grant privilege. */
+    rec.scopes = qihse_service_identity_default_scopes(rec.identity_kind);
+    if (!qihse_federation_node_fingerprint(rec.public_key, rec.fingerprint)) return false;
+
+    char blob[2048];
+    node_encode(&rec, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
+                                         const qihse_uuid_t* node_id,
+                                         uint64_t enrollment_epoch) {
+    if (!store_void || !user_void || !node_id) return false;
+    if (!qihse_infra_scope_check(user_void, QIHSE_SCOPE_NODE_ENROLL)) return false;
+    char key[128];
+    node_kv_key(node_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    qihse_federation_node_identity_t rec;
+    bool ok = node_decode(blob, &rec);
+    free(blob);
+    if (!ok) return false;
+    if (rec.trust == QIHSE_TRUST_REVOKED) return false; /* revocation is permanent */
+    rec.trust = QIHSE_TRUST_APPROVED;
+    rec.enrollment_epoch = enrollment_epoch;
+    char new_blob[2048];
+    node_encode(&rec, new_blob, sizeof(new_blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_node_revoke(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id) {
+    if (!store_void || !user_void || !node_id) return false;
+    if (!qihse_infra_scope_check(user_void, QIHSE_SCOPE_NODE_REVOKE)) return false;
+    char key[128];
+    node_kv_key(node_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    qihse_federation_node_identity_t rec;
+    bool ok = node_decode(blob, &rec);
+    free(blob);
+    if (!ok) return false;
+    rec.trust = QIHSE_TRUST_REVOKED;
+    rec.scopes = QIHSE_SCOPE_NONE;
+    char new_blob[2048];
+    node_encode(&rec, new_blob, sizeof(new_blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_node_lookup(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id,
+                                  qihse_federation_node_identity_t* out) {
+    if (!store_void || !user_void || !node_id || !out) return false;
+    char key[128];
+    node_kv_key(node_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = node_decode(blob, out);
+    free(blob);
+    return ok;
+}
+
+typedef struct {
+    qihse_federation_node_cb cb;
+    void* user_data;
+} node_iter_ctx_t;
+
+static bool node_iter_cb(const char* key, const char* value, void* user_data) {
+    node_iter_ctx_t* ctx = (node_iter_ctx_t*)user_data;
+    if (strncmp(key, QIHSE_FEDERATION_NODE_PREFIX,
+                strlen(QIHSE_FEDERATION_NODE_PREFIX)) != 0) return true;
+    qihse_federation_node_identity_t rec;
+    if (!node_decode(value, &rec)) return true;
+    return ctx->cb(&rec, ctx->user_data);
+}
+
+void qihse_federation_node_foreach(void* store_void, void* user_void,
+                                   qihse_federation_node_cb cb, void* user_data) {
+    if (!store_void || !cb) return;
+    node_iter_ctx_t ctx = { cb, user_data };
+    qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
+                          node_iter_cb, &ctx);
+}
+
+/* ── F5: Signed gossip / membership plane (plan §17) ───────────────────── */
+
+/* Little-endian buffer writer. */
+typedef struct { uint8_t* buf; size_t cap; size_t len; bool overflow; } le_writer_t;
+
+static void le_u16(le_writer_t* w, uint16_t v) {
+    if (w->len + 2u > w->cap) { w->overflow = true; return; }
+    w->buf[w->len++] = (uint8_t)(v & 0xFFu);
+    w->buf[w->len++] = (uint8_t)((v >> 8) & 0xFFu);
+}
+static void le_u32(le_writer_t* w, uint32_t v) {
+    for (int i = 0; i < 4; i++) {
+        if (w->len + 1u > w->cap) { w->overflow = true; return; }
+        w->buf[w->len++] = (uint8_t)((v >> (8 * i)) & 0xFFu);
+    }
+}
+static void le_u64(le_writer_t* w, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        if (w->len + 1u > w->cap) { w->overflow = true; return; }
+        w->buf[w->len++] = (uint8_t)((v >> (8 * i)) & 0xFFu);
+    }
+}
+static void le_bytes(le_writer_t* w, const uint8_t* b, size_t n) {
+    if (w->len + n > w->cap) { w->overflow = true; return; }
+    memcpy(w->buf + w->len, b, n);
+    w->len += n;
+}
+
+bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
+                                       uint8_t* out, size_t out_cap, size_t* out_len) {
+    if (!gossip || !out || !out_len) return false;
+    le_writer_t w = { out, out_cap, 0, false };
+    le_u32(&w, gossip->magic);
+    le_u16(&w, gossip->version);
+    le_u16(&w, gossip->feature_bitmap);
+    le_bytes(&w, gossip->cluster_id.bytes, QIHSE_UUID_BYTES);
+    le_bytes(&w, gossip->sender_node.bytes, QIHSE_UUID_BYTES);
+    le_bytes(&w, gossip->boot_id.bytes, QIHSE_UUID_BYTES);
+    le_u64(&w, gossip->sequence);
+    le_u64(&w, gossip->hlc.physical_ms);
+    le_u16(&w, gossip->hlc.logical);
+    le_u16(&w, 0u); /* reserved, keeps the frame 4-byte aligned */
+    le_u32(&w, gossip->capability_bitmap);
+    le_u32(&w, gossip->health_summary);
+    if (w.overflow) return false;
+    *out_len = w.len;
+    return true;
+}
+
+bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip) {
+    if (!pkey || !gossip) return false;
+    uint8_t frame[256];
+    size_t frame_len = 0;
+    if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    size_t sig_len = QIHSE_FEDERATION_NODE_SIG_BYTES;
+    bool ok = EVP_DigestSignInit(ctx, NULL, NULL, NULL, (EVP_PKEY*)pkey) == 1 &&
+              EVP_DigestSign(ctx, gossip->signature, &sig_len, frame, frame_len) == 1 &&
+              sig_len == QIHSE_FEDERATION_NODE_SIG_BYTES;
+    EVP_MD_CTX_free(ctx);
+    return ok;
+}
+
+bool qihse_federation_gossip_verify(const uint8_t* public_key,
+                                    const qihse_federation_gossip_t* gossip) {
+    if (!public_key || !gossip) return false;
+    uint8_t frame[256];
+    size_t frame_len = 0;
+    if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
+                                                 public_key,
+                                                 QIHSE_FEDERATION_NODE_PUBKEY_BYTES);
+    if (!pkey) return false;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) { EVP_PKEY_free(pkey); return false; }
+    bool ok = EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+              EVP_DigestVerify(ctx, gossip->signature, QIHSE_FEDERATION_NODE_SIG_BYTES,
+                               frame, frame_len) == 1;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+const char* qihse_gossip_result_name(qihse_gossip_result_t result) {
+    switch (result) {
+        case QIHSE_GOSSIP_ACCEPTED:               return "accepted";
+        case QIHSE_GOSSIP_REJECT_MALFORMED:       return "malformed";
+        case QIHSE_GOSSIP_REJECT_VERSION:         return "version";
+        case QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER:  return "unknown_sender";
+        case QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER:return "untrusted_sender";
+        case QIHSE_GOSSIP_REJECT_BAD_SIGNATURE:   return "bad_signature";
+        case QIHSE_GOSSIP_REJECT_REPLAY:          return "replay";
+    }
+    return "unknown";
+}
+
+static void replay_kv_key(const qihse_uuid_t* sender, const qihse_uuid_t* boot,
+                          char* out, size_t cap) {
+    char s_str[QIHSE_UUID_STR_LEN + 1u], b_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(sender, s_str);
+    qihse_uuid_format(boot, b_str);
+    snprintf(out, cap, QIHSE_FEDERATION_REPLAY_PREFIX "%s:%s", s_str, b_str);
+}
+
+bool qihse_federation_replay_state_read(void* store_void, void* user_void,
+                                        const qihse_uuid_t* sender_node,
+                                        const qihse_uuid_t* boot_id,
+                                        qihse_federation_replay_state_t* out) {
+    if (!store_void || !user_void || !sender_node || !boot_id || !out) return false;
+    char key[192];
+    replay_kv_key(sender_node, boot_id, key, sizeof(key));
+    char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!val) return false;
+    memset(out, 0, sizeof(*out));
+    out->sender_node = *sender_node;
+    out->boot_id = *boot_id;
+    unsigned long long seq = 0, first = 0;
+    int n = sscanf(val, "%llu\t%llu", &seq, &first);
+    free(val);
+    if (n < 1) return false;
+    out->highest_sequence = (uint64_t)seq;
+    if (n >= 2) out->first_seen_hlc_physical = (uint64_t)first;
+    return true;
+}
+
+qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* user_void,
+                                                    const qihse_federation_gossip_t* gossip) {
+    if (!store_void || !user_void || !gossip) return QIHSE_GOSSIP_REJECT_MALFORMED;
+    if (gossip->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return QIHSE_GOSSIP_REJECT_MALFORMED;
+    if (gossip->version != QIHSE_FEDERATION_GOSSIP_VERSION) return QIHSE_GOSSIP_REJECT_VERSION;
+
+    /* A datagram is never trusted because of its source IP — the sender must
+     * be an enrolled, approved node and the frame must carry a valid
+     * signature from that node's identity key (plan §17, §18). */
+    qihse_federation_node_identity_t sender;
+    if (!qihse_federation_node_lookup(store_void, user_void, &gossip->sender_node, &sender)) {
+        return QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER;
+    }
+    if (sender.trust != QIHSE_TRUST_APPROVED) return QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER;
+    if (!qihse_federation_gossip_verify(sender.public_key, gossip)) {
+        return QIHSE_GOSSIP_REJECT_BAD_SIGNATURE;
+    }
+
+    /* Replay window: the sequence must advance strictly. */
+    char key[192];
+    replay_kv_key(&gossip->sender_node, &gossip->boot_id, key, sizeof(key));
+    char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    uint64_t highest = 0;
+    if (val) {
+        unsigned long long seq = 0;
+        if (sscanf(val, "%llu", &seq) >= 1) highest = (uint64_t)seq;
+        free(val);
+    }
+    if (highest != 0 && gossip->sequence <= highest) return QIHSE_GOSSIP_REJECT_REPLAY;
+
+    char new_val[64];
+    snprintf(new_val, sizeof(new_val), "%llu\t%llu",
+             (unsigned long long)gossip->sequence,
+             (unsigned long long)gossip->hlc.physical_ms);
+    if (!qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_val, 0, 0,
+                           (qihse_user_t*)user_void)) {
+        return QIHSE_GOSSIP_REJECT_MALFORMED;
+    }
+    return QIHSE_GOSSIP_ACCEPTED;
 }

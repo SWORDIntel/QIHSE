@@ -75,6 +75,10 @@ typedef struct {
     /* F2: federation event journal log directory. NULL = journal disabled. */
     const char* federation_journal_directory;
     qihse_es_durability_t federation_journal_durability;
+    /* F5: directory holding node identity private keys. NULL = node
+     * enrollment via RESP is disabled (fails closed).  Private keys are
+     * written here with 0600 permissions and never enter a QIHSE record. */
+    const char* federation_key_directory;
     /* UWP bridge: allow qihse_resp_server_execute() (QIHSE_UWP_TARGET_RESP)
      * to run commands through this server's dispatch path. Default true. */
     bool enable_uwp_bridge;

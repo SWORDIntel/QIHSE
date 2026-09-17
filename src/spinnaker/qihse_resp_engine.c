@@ -165,6 +165,9 @@ struct qihse_resp_server {
     /* F2: event journal + watches. The journal is opened if a directory
      * was configured; otherwise FEDERATION.EVENT.* returns an error. */
     qihse_federation_journal_t* federation_journal;
+    /* F5: node identity key directory. NULL = enrollment via RESP fails
+     * closed. The directory is not owned by the server. */
+    char* federation_key_directory;
     qihse_system_guard_window_t* guard_window;
     bool owns_bus;
     bool owns_failover;
@@ -5195,6 +5198,26 @@ static bool qihse_resp_fedgroup_list_cb(const qihse_federation_group_t* g, void*
     return true;
 }
 
+/* F5: callback for FEDERATION.NODE.LIST — collects node ids, trust, kinds. */
+struct qihse_resp_node_list_ctx {
+    char ids[32][QIHSE_UUID_STR_LEN + 1u];
+    char trust[32][16];
+    char kinds[32][32];
+    size_t count;
+};
+
+static bool qihse_resp_node_list_cb(const qihse_federation_node_identity_t* n, void* ud) {
+    struct qihse_resp_node_list_ctx* ctx = (struct qihse_resp_node_list_ctx*)ud;
+    if (ctx->count >= 32) return false;
+    qihse_uuid_format(&n->node_id, ctx->ids[ctx->count]);
+    snprintf(ctx->trust[ctx->count], sizeof(ctx->trust[ctx->count]),
+             "%s", qihse_trust_state_name(n->trust));
+    snprintf(ctx->kinds[ctx->count], sizeof(ctx->kinds[ctx->count]),
+             "%s", qihse_service_identity_name(n->identity_kind));
+    ctx->count++;
+    return true;
+}
+
 /* F2: journal replay callbacks for FEDERATION.EVENT.REPLAY. */
 static bool qihse_fed_replay_count_cb(const qihse_federation_event_t* event,
                                      const uint8_t* payload, size_t payload_len,
@@ -5820,6 +5843,194 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
             return qihse_resp_error(session, "ERR lease release failed");
         }
         return qihse_resp_simple(session, "OK");
+    }
+
+    /* ── F5: Trust plane ─────────────────────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "SCOPE.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.scope.list");
+        static const qihse_infra_scope_t scopes[] = {
+            QIHSE_SCOPE_FEDERATION_READ, QIHSE_SCOPE_FEDERATION_WRITE,
+            QIHSE_SCOPE_NODE_ENROLL, QIHSE_SCOPE_NODE_REVOKE,
+            QIHSE_SCOPE_POLICY_READ, QIHSE_SCOPE_POLICY_WRITE,
+            QIHSE_SCOPE_LEASE_READ, QIHSE_SCOPE_LEASE_WRITE,
+            QIHSE_SCOPE_SECURITY_ADMIN, QIHSE_SCOPE_AUDIT_READ,
+            QIHSE_SCOPE_TELEMETRY_WRITE,
+        };
+        size_t n = sizeof(scopes) / sizeof(scopes[0]);
+        if (!qihse_resp_array(session, n)) return false;
+        for (size_t i = 0; i < n; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_infra_scope_name(scopes[i]))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SCOPE.CHECK")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.scope.check");
+        char scope_name[64];
+        size_t sl = request->argv[2].len;
+        if (sl == 0 || sl >= sizeof(scope_name)) return qihse_resp_error(session, "ERR invalid scope name");
+        memcpy(scope_name, request->argv[2].data, sl); scope_name[sl] = '\0';
+        qihse_infra_scope_t scope;
+        if (!qihse_infra_scope_parse(scope_name, &scope)) return qihse_resp_error(session, "ERR unknown scope");
+        bool held = qihse_infra_scope_check(session->user, scope);
+        return qihse_resp_integer(session, held ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SCOPE.DEFAULTS")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.scope.defaults");
+        char kind_name[64];
+        size_t kl = request->argv[2].len;
+        if (kl == 0 || kl >= sizeof(kind_name)) return qihse_resp_error(session, "ERR invalid identity kind");
+        memcpy(kind_name, request->argv[2].data, kl); kind_name[kl] = '\0';
+        qihse_service_identity_t kind;
+        if (!qihse_service_identity_parse(kind_name, &kind)) {
+            return qihse_resp_error(session, "ERR unknown service identity");
+        }
+        qihse_infra_scope_t scopes = qihse_service_identity_default_scopes(kind);
+        return qihse_resp_integer(session, (int64_t)scopes);
+    }
+
+    if (qihse_resp_arg_equal(sub, "NODE.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.node.list");
+        struct qihse_resp_node_list_ctx ctx;
+        ctx.count = 0;
+        qihse_federation_node_foreach(session->server->store, session->user,
+                                      qihse_resp_node_list_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count * 3)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.trust[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.kinds[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "NODE.SHOW")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.node.show");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        qihse_federation_node_identity_t node;
+        if (!qihse_federation_node_lookup(session->server->store, session->user, &nid, &node)) {
+            return qihse_resp_error(session, "ERR node not found");
+        }
+        char fp_hex[97];
+        for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++)
+            snprintf(fp_hex + i * 2, 3, "%02x", node.fingerprint[i]);
+        fp_hex[96] = '\0';
+        if (!qihse_resp_array(session, 8)) return false;
+        if (!qihse_resp_bulk_text(session, node.hostname)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_trust_state_name(node.trust))) return false;
+        if (!qihse_resp_bulk_text(session, qihse_service_identity_name(node.identity_kind))) return false;
+        if (!qihse_resp_integer(session, (int64_t)node.scopes)) return false;
+        if (!qihse_resp_integer(session, (int64_t)node.enrollment_epoch)) return false;
+        if (!qihse_resp_integer(session, (int64_t)node.capabilities)) return false;
+        if (!qihse_resp_bulk_text(session, fp_hex)) return false;
+        if (!qihse_resp_bulk_text(session, node.key_handle)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "NODE.ENROLL")) {
+        if (request->argc != 5) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.NODE.ENROLL <identity_kind> <hostname> <boot_id>");
+        }
+        if (!session->server->federation_key_directory) {
+            return qihse_resp_error(session, "ERR node enrollment is disabled (no key directory configured)");
+        }
+        char kind_name[64];
+        size_t kl = request->argv[2].len;
+        if (kl == 0 || kl >= sizeof(kind_name)) return qihse_resp_error(session, "ERR invalid identity kind");
+        memcpy(kind_name, request->argv[2].data, kl); kind_name[kl] = '\0';
+        qihse_service_identity_t kind;
+        if (!qihse_service_identity_parse(kind_name, &kind)) {
+            return qihse_resp_error(session, "ERR unknown service identity");
+        }
+        qihse_federation_node_identity_t id;
+        memset(&id, 0, sizeof(id));
+        if (!qihse_uuid_generate(&id.node_id)) return qihse_resp_error(session, "ERR could not generate node id");
+        size_t hl = request->argv[3].len;
+        if (hl == 0 || hl >= sizeof(id.hostname)) return qihse_resp_error(session, "ERR invalid hostname");
+        memcpy(id.hostname, request->argv[3].data, hl); id.hostname[hl] = '\0';
+        size_t bl = request->argv[4].len;
+        if (bl == 0 || bl >= sizeof(id.boot_id)) return qihse_resp_error(session, "ERR invalid boot id");
+        memcpy(id.boot_id, request->argv[4].data, bl); id.boot_id[bl] = '\0';
+        id.identity_kind = kind;
+        /* Generate the identity keypair.  The private key is written to the
+         * configured directory and never enters a QIHSE record. */
+        if (!qihse_federation_node_keygen(session->server->federation_key_directory,
+                                         &id.node_id, id.public_key,
+                                         id.key_handle, sizeof(id.key_handle))) {
+            return qihse_resp_error(session, "ERR node keygen failed");
+        }
+        if (!qihse_federation_node_enroll_request(session->server->store, session->user, &id)) {
+            return qihse_resp_error(session, "ERR node enroll request failed");
+        }
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&id.node_id, nid_str);
+        return qihse_resp_bulk_text(session, nid_str);
+    }
+
+    if (qihse_resp_arg_equal(sub, "NODE.APPROVE")) {
+        if (request->argc < 3 || request->argc > 4) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.NODE.APPROVE <node_id> [enrollment_epoch]");
+        }
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        uint64_t epoch = qihse_federation_epoch_next(session->server->store, session->user,
+                                                     &session->server->federation_node_id);
+        if (request->argc == 4) {
+            char ep_str[32];
+            size_t el = request->argv[3].len;
+            if (el == 0 || el >= sizeof(ep_str)) return qihse_resp_error(session, "ERR invalid epoch");
+            memcpy(ep_str, request->argv[3].data, el); ep_str[el] = '\0';
+            epoch = (uint64_t)strtoull(ep_str, NULL, 10);
+        }
+        if (!qihse_federation_node_enroll_approve(session->server->store, session->user, &nid, epoch)) {
+            return qihse_resp_error(session, "ERR node approve failed");
+        }
+        return qihse_resp_integer(session, (int64_t)epoch);
+    }
+
+    if (qihse_resp_arg_equal(sub, "NODE.REVOKE")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.node.revoke");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        if (!qihse_federation_node_revoke(session->server->store, session->user, &nid)) {
+            return qihse_resp_error(session, "ERR node revoke failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "GOSSIP.STATUS")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.gossip.status");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u], bid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len, bl = request->argv[3].len;
+        if (nl == 0 || nl >= sizeof(nid_str) || bl == 0 || bl >= sizeof(bid_str)) {
+            return qihse_resp_error(session, "ERR invalid node or boot id");
+        }
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        memcpy(bid_str, request->argv[3].data, bl); bid_str[bl] = '\0';
+        qihse_uuid_t nid, bid;
+        if (!qihse_uuid_parse(nid_str, &nid) || !qihse_uuid_parse(bid_str, &bid)) {
+            return qihse_resp_error(session, "ERR invalid node or boot id");
+        }
+        qihse_federation_replay_state_t st;
+        if (!qihse_federation_replay_state_read(session->server->store, session->user,
+                                                &nid, &bid, &st)) {
+            return qihse_resp_error(session, "ERR no gossip state for that node/boot");
+        }
+        return qihse_resp_integer(session, (int64_t)st.highest_sequence);
     }
 
     return qihse_resp_error(session, "ERR unknown FEDERATION subcommand");
@@ -6487,6 +6698,17 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             supplied->federation_journal_directory,
             supplied->federation_journal_durability);
     }
+    /* F5: node identity key directory. Copied so the caller's buffer may be
+     * transient. NULL leaves enrollment via RESP disabled. */
+    if (supplied->federation_key_directory) {
+        size_t n = strlen(supplied->federation_key_directory);
+        server->federation_key_directory = (char*)malloc(n + 1u);
+        if (!server->federation_key_directory) {
+            qihse_resp_server_destroy(server);
+            return NULL;
+        }
+        memcpy(server->federation_key_directory, supplied->federation_key_directory, n + 1u);
+    }
     if (!server->topology) {
         qihse_resp_server_destroy(server);
         return NULL;
@@ -6766,6 +6988,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         qihse_federation_journal_destroy(server->federation_journal);
         server->federation_journal = NULL;
     }
+    free(server->federation_key_directory);
     free(server);
 }
 
