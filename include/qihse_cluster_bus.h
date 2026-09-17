@@ -150,15 +150,24 @@ typedef struct {
      * outright: an unverified membership claim is never acted on. */
     void* federation_store;      /* qihse_kv_store_t* */
     void* federation_user;       /* qihse_user_t* */
-    /* Fires only for a frame that passed verification.  Runs on the bus
-     * thread: keep it short. */
-    void (*on_federation)(qihse_cluster_bus_t* bus,
-                          const qihse_uuid_t* sender_node,
-                          const qihse_uuid_t* boot_id,
-                          uint32_t health_summary,
-                          bool is_heartbeat,
+    /* Two callbacks with DISTINCT payload types, because the two tiers carry
+     * different authority.
+     *
+     * on_liveness fires for a verified heartbeat.  It carries liveness only.
+     * on_membership fires for a verified signed statement.  It is the only
+     * input an authority decision may use.
+     *
+     * Keeping them separate types means a consumer cannot accidentally make
+     * an ownership decision from a heartbeat: it will not compile.  Both run
+     * on the bus thread — keep them short. */
+    void (*on_liveness)(qihse_cluster_bus_t* bus,
+                        const qihse_federation_liveness_t* observation,
+                        void* user_data);
+    void* on_liveness_user_data;
+    void (*on_membership)(qihse_cluster_bus_t* bus,
+                          const qihse_federation_membership_t* member,
                           void* user_data);
-    void* on_federation_user_data;
+    void* on_membership_user_data;
 } qihse_cluster_bus_config_t;
 
 /* True when a bus message type is allowed to carry federation authority.

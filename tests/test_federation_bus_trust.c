@@ -25,23 +25,41 @@ static qihse_user_t* g_op;
 
 /* ── Callback capture ──────────────────────────────────────────────────── */
 
+/* Two separate captures, mirroring the two callbacks.  A heartbeat must never
+ * reach the membership capture, and a statement must never reach the liveness
+ * one: the payload types differ, so a consumer cannot mix them up. */
 typedef struct {
-    uint32_t calls;
-    uint32_t statements;
-    uint32_t heartbeats;
+    uint32_t liveness_calls;
+    uint32_t membership_calls;
     qihse_uuid_t last_sender;
     uint32_t last_health;
+    qihse_sig_alg_t last_alg;
+    qihse_uuid_t last_session;
 } fed_capture_t;
 
-static void fed_capture_cb(qihse_cluster_bus_t* bus, const qihse_uuid_t* sender_node,
-                           const qihse_uuid_t* boot_id, uint32_t health_summary,
-                           bool is_heartbeat, void* user_data) {
-    (void)bus; (void)boot_id;
+static void fed_liveness_cb(qihse_cluster_bus_t* bus,
+                            const qihse_federation_liveness_t* obs, void* user_data) {
+    (void)bus;
     fed_capture_t* c = (fed_capture_t*)user_data;
-    c->calls++;
-    if (is_heartbeat) c->heartbeats++; else c->statements++;
-    c->last_sender = *sender_node;
-    c->last_health = health_summary;
+    c->liveness_calls++;
+    c->last_sender = obs->sender_node;
+    c->last_health = obs->health_summary;
+}
+
+static void fed_membership_cb(qihse_cluster_bus_t* bus,
+                              const qihse_federation_membership_t* member, void* user_data) {
+    (void)bus;
+    fed_capture_t* c = (fed_capture_t*)user_data;
+    c->membership_calls++;
+    c->last_sender = member->sender_node;
+    c->last_health = member->health_summary;
+    c->last_alg = member->sig_alg;
+    c->last_session = member->session_id;
+}
+
+/* Total callbacks, either tier. */
+static uint32_t capture_total(const fed_capture_t* c) {
+    return c->liveness_calls + c->membership_calls;
 }
 
 /* ── Datagram construction (mirrors the bus wire header) ───────────────── */
@@ -128,8 +146,10 @@ static void fixture_up(fixture_t* f, const char* key_dir, bool with_fed_context)
     if (with_fed_context) {
         cfg.federation_store = g_store;
         cfg.federation_user = g_op;
-        cfg.on_federation = fed_capture_cb;
-        cfg.on_federation_user_data = &f->capture;
+        cfg.on_liveness = fed_liveness_cb;
+        cfg.on_liveness_user_data = &f->capture;
+        cfg.on_membership = fed_membership_cb;
+        cfg.on_membership_user_data = &f->capture;
     }
     f->bus = qihse_cluster_bus_create(&cfg);
     assert(f->bus);
@@ -186,7 +206,7 @@ static void test_heartbeat_without_statement_is_dropped(const char* key_dir) {
 
     /* No statement has been signed, so there is no session to match and the
      * frame must not reach a consumer. */
-    assert(f.capture.calls == 0);
+    assert(capture_total(&f.capture) == 0);
 
     fixture_down(&f);
     printf("PASS heartbeat from a configured peer without a signed statement: dropped\n");
@@ -231,7 +251,7 @@ static void test_forged_statement_is_dropped(const char* key_dir) {
     size_t dlen = build_datagram(dgram, sizeof(dgram), QIHSE_BUS_MSG_FED_STATEMENT,
                                  f.peer_index, payload, plen);
     assert(qihse_cluster_bus_inject(f.bus, dgram, dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 0);
+    assert(capture_total(&f.capture) == 0);
 
     qihse_federation_node_key_free(bad_key);
     fixture_down(&f);
@@ -268,15 +288,16 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
     size_t dlen = build_datagram(dgram, sizeof(dgram), QIHSE_BUS_MSG_FED_STATEMENT,
                                  f.peer_index, payload, plen);
     assert(qihse_cluster_bus_inject(f.bus, dgram, dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 1);
-    assert(f.capture.statements == 1);
-    assert(f.capture.heartbeats == 0);
+    assert(f.capture.membership_calls == 1);
+    assert(f.capture.liveness_calls == 0);
     assert(f.capture.last_health == 7);
+    assert(f.capture.last_alg == QIHSE_SIG_ML_DSA_65);
+    assert(qihse_uuid_equal(&f.capture.last_session, &f.session_id));
     assert(qihse_uuid_equal(&f.capture.last_sender, &f.identity.node_id));
 
     /* Replaying the same statement must not reach the consumer again. */
     assert(qihse_cluster_bus_inject(f.bus, dgram, dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 1);
+    assert(f.capture.membership_calls == 1);
 
     /* Now the cheap tier works, and is far smaller than the statement. */
     qihse_federation_heartbeat_t hb;
@@ -298,8 +319,10 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
     size_t hb_dlen = build_datagram(hb_dgram, sizeof(hb_dgram), QIHSE_BUS_MSG_FED_HEARTBEAT,
                                     f.peer_index, hb_wire, hb_len);
     assert(qihse_cluster_bus_inject(f.bus, hb_dgram, hb_dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 2);
-    assert(f.capture.heartbeats == 1);
+    assert(f.capture.liveness_calls == 1);
+    /* THE POINT: a heartbeat must never reach the membership capture.  A
+     * consumer that needs authority has no liveness input to misuse. */
+    assert(f.capture.membership_calls == 1);   /* unchanged */
     assert(f.capture.last_health == 9);
 
     /* A heartbeat on a retired session is refused even at a higher sequence. */
@@ -316,7 +339,7 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
     size_t s2_dlen = build_datagram(dgram, sizeof(dgram), QIHSE_BUS_MSG_FED_STATEMENT,
                                     f.peer_index, payload, s2_plen);
     assert(qihse_cluster_bus_inject(f.bus, dgram, s2_dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 3);
+    assert(f.capture.membership_calls == 2);
 
     qihse_federation_heartbeat_t stale = hb;
     stale.sequence = 500;
@@ -325,7 +348,8 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
     size_t stale_dlen = build_datagram(hb_dgram, sizeof(hb_dgram), QIHSE_BUS_MSG_FED_HEARTBEAT,
                                        f.peer_index, hb_wire, stale_len);
     assert(qihse_cluster_bus_inject(f.bus, hb_dgram, stale_dlen, "127.0.0.1", 17001));
-    assert(f.capture.calls == 3);   /* unchanged: retired session */
+    assert(f.capture.liveness_calls == 1);   /* unchanged: retired session */
+    assert(f.capture.membership_calls == 2);
 
     fixture_down(&f);
     printf("PASS valid statement accepted, cheap heartbeat accepted, replay and stale session dropped\n");
@@ -360,7 +384,7 @@ static void test_no_context_fails_closed(const char* key_dir) {
     /* Injected and accepted by the transport, but no callback is registered so
      * nothing consumes it, and the federation record is not written either. */
     (void)qihse_cluster_bus_inject(f.bus, dgram, dlen, "127.0.0.1", 17001);
-    assert(f.capture.calls == 0);
+    assert(capture_total(&f.capture) == 0);
 
     /* Prove nothing was recorded: no statement exists for this peer. */
     qihse_federation_gossip_t stored;
@@ -397,11 +421,53 @@ static void test_malformed_frames_are_dropped(const char* key_dir) {
                           f.peer_index, zeros, sizeof(zeros));
     (void)qihse_cluster_bus_inject(f.bus, dgram, dlen, "127.0.0.1", 17001);
 
-    assert(f.capture.calls == 0);
+    assert(capture_total(&f.capture) == 0);
 
 
     fixture_down(&f);
     printf("PASS malformed federation frames: dropped without reaching a consumer\n");
+}
+
+static void test_membership_conversion_chokepoint(void) {
+    /* A membership record is only ever derived from a well-formed statement.
+     * There is deliberately no conversion from a liveness observation, so a
+     * consumer that needs authority has no liveness-shaped input to pass. */
+    qihse_federation_gossip_t stmt;
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
+    stmt.version = QIHSE_FEDERATION_GOSSIP_VERSION;
+    stmt.sig_alg = QIHSE_SIG_ML_DSA_65;
+    stmt.signature_len = (uint16_t)qihse_sig_alg_signature_bytes(QIHSE_SIG_ML_DSA_65);
+    stmt.sequence = 42;
+    stmt.capability_bitmap = 0x0F;
+    stmt.health_summary = 3;
+    assert(qihse_uuid_generate(&stmt.sender_node));
+    assert(qihse_uuid_generate(&stmt.session_id));
+
+    qihse_federation_membership_t member;
+    assert(qihse_federation_membership_from_statement(&stmt, &member));
+    assert(qihse_uuid_equal(&member.sender_node, &stmt.sender_node));
+    assert(qihse_uuid_equal(&member.session_id, &stmt.session_id));
+    assert(member.sequence == 42);
+    assert(member.capability_bitmap == 0x0F);
+    assert(member.sig_alg == QIHSE_SIG_ML_DSA_65);
+
+    /* A malformed statement yields no membership record. */
+    qihse_federation_gossip_t bad = stmt;
+    bad.magic = 0xDEADBEEFu;
+    assert(!qihse_federation_membership_from_statement(&bad, &member));
+    bad = stmt;
+    bad.version = 99;
+    assert(!qihse_federation_membership_from_statement(&bad, &member));
+    /* A signature length that disagrees with the named algorithm is refused,
+     * so a truncated signature cannot become a membership claim. */
+    bad = stmt;
+    bad.signature_len = 64;
+    assert(!qihse_federation_membership_from_statement(&bad, &member));
+    assert(!qihse_federation_membership_from_statement(NULL, &member));
+    assert(!qihse_federation_membership_from_statement(&stmt, NULL));
+
+    printf("PASS membership chokepoint: only a well-formed statement yields authority input\n");
 }
 
 int main(void) {
@@ -424,6 +490,7 @@ int main(void) {
     assert(g_store);
 
     test_authority_classification();
+    test_membership_conversion_chokepoint();
     test_heartbeat_without_statement_is_dropped(key_dir);
     test_forged_statement_is_dropped(key_dir);
     test_valid_statement_then_heartbeat(key_dir);

@@ -902,6 +902,48 @@ bool qihse_federation_heartbeat_deserialize(const uint8_t* in, size_t in_len,
 qihse_gossip_result_t qihse_federation_heartbeat_accept(void* store_void, void* user_void,
                                                        const qihse_federation_heartbeat_t* hb);
 
+/* ── Liveness versus membership: enforced by type, not by comment ────────
+ *
+ * A heartbeat is accepted only while it matches the session id minted by a
+ * signed statement, so it cannot be forged without forging a statement.  But
+ * the session id is minted on an interval, so an attacker who can read the
+ * wire can forge a heartbeat for up to one interval.
+ *
+ * What that buys is a false LIVENESS claim, and the harm from that is delayed
+ * failover.  So the rule is: liveness may inform health, and must never inform
+ * authority.
+ *
+ * That rule is enforced by the type system rather than by documentation.  A
+ * liveness observation and a membership record are different types, and only a
+ * signature-checked statement converts into a membership record.  A consumer
+ * that needs to make an authority decision (slot ownership, lease grant, voter
+ * eligibility) cannot pass a liveness observation where membership is
+ * required: the compiler refuses.  A comment could not do that.
+ */
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    uint64_t sequence;
+    uint32_t health_summary;
+} qihse_federation_liveness_t;
+
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    qihse_uuid_t session_id;
+    uint64_t sequence;
+    qihse_hlc_t hlc;
+    uint32_t capability_bitmap;
+    uint32_t health_summary;
+    qihse_sig_alg_t sig_alg;
+} qihse_federation_membership_t;
+
+/* The ONLY way to obtain a membership record: from a statement that already
+ * passed signature, trust-state and replay verification.  There is no
+ * conversion from a liveness observation, by design. */
+bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t* stmt,
+                                               qihse_federation_membership_t* out);
+
 /* Read the recorded statement for a (sender, boot).  Returns false if the
  * node has not signed. */
 bool qihse_federation_gossip_statement_read(void* store_void, void* user_void,

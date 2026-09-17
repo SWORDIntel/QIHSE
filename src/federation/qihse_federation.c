@@ -2676,6 +2676,28 @@ static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
     return true;
 }
 
+bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t* stmt,
+                                               qihse_federation_membership_t* out) {
+    if (!stmt || !out) return false;
+    /* A membership record is only ever derived from a well-formed statement.
+     * This is the single chokepoint, which is what makes the rule auditable:
+     * grep for this function and you have found every path to an authority
+     * input. */
+    if (stmt->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return false;
+    if (stmt->version != QIHSE_FEDERATION_GOSSIP_VERSION) return false;
+    if (stmt->signature_len != qihse_sig_alg_signature_bytes(stmt->sig_alg)) return false;
+    memset(out, 0, sizeof(*out));
+    out->sender_node = stmt->sender_node;
+    out->boot_id = stmt->boot_id;
+    out->session_id = stmt->session_id;
+    out->sequence = stmt->sequence;
+    out->hlc = stmt->hlc;
+    out->capability_bitmap = stmt->capability_bitmap;
+    out->health_summary = stmt->health_summary;
+    out->sig_alg = stmt->sig_alg;
+    return true;
+}
+
 bool qihse_federation_gossip_statement_read(void* store_void, void* user_void,
                                             const qihse_uuid_t* sender_node,
                                             const qihse_uuid_t* boot_id,

@@ -57,13 +57,14 @@ struct qihse_cluster_bus {
     /* Federation trust context (see qihse_cluster_bus_config_t). */
     void* federation_store;
     void* federation_user;
-    void (*on_federation)(qihse_cluster_bus_t* bus,
-                          const qihse_uuid_t* sender_node,
-                          const qihse_uuid_t* boot_id,
-                          uint32_t health_summary,
-                          bool is_heartbeat,
+    void (*on_liveness)(qihse_cluster_bus_t* bus,
+                        const qihse_federation_liveness_t* observation,
+                        void* user_data);
+    void* on_liveness_user_data;
+    void (*on_membership)(qihse_cluster_bus_t* bus,
+                          const qihse_federation_membership_t* member,
                           void* user_data);
-    void* on_federation_user_data;
+    void* on_membership_user_data;
     int sock_fd;
     bool running;
     pthread_t thread;
@@ -675,9 +676,11 @@ static void qihse_bus_handle_fed_statement(qihse_cluster_bus_t* bus,
                                        &stmt) != QIHSE_GOSSIP_ACCEPTED) {
         return;
     }
-    if (bus->on_federation) {
-        bus->on_federation(bus, &stmt.sender_node, &stmt.boot_id,
-                           stmt.health_summary, false, bus->on_federation_user_data);
+    if (bus->on_membership) {
+        qihse_federation_membership_t member;
+        if (qihse_federation_membership_from_statement(&stmt, &member)) {
+            bus->on_membership(bus, &member, bus->on_membership_user_data);
+        }
     }
 }
 
@@ -691,9 +694,16 @@ static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
                                          &hb) != QIHSE_GOSSIP_ACCEPTED) {
         return;
     }
-    if (bus->on_federation) {
-        bus->on_federation(bus, &hb.sender_node, &hb.boot_id,
-                           hb.health_summary, true, bus->on_federation_user_data);
+    if (bus->on_liveness) {
+        /* A liveness observation is a DIFFERENT TYPE from a membership
+         * record, so this cannot be passed where authority is required. */
+        qihse_federation_liveness_t obs;
+        memset(&obs, 0, sizeof(obs));
+        obs.sender_node = hb.sender_node;
+        obs.boot_id = hb.boot_id;
+        obs.sequence = hb.sequence;
+        obs.health_summary = hb.health_summary;
+        bus->on_liveness(bus, &obs, bus->on_liveness_user_data);
     }
 }
 
@@ -922,8 +932,10 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_group_ack_user_data = config->on_group_ack_user_data;
     bus->federation_store = config->federation_store;
     bus->federation_user = config->federation_user;
-    bus->on_federation = config->on_federation;
-    bus->on_federation_user_data = config->on_federation_user_data;
+    bus->on_liveness = config->on_liveness;
+    bus->on_liveness_user_data = config->on_liveness_user_data;
+    bus->on_membership = config->on_membership;
+    bus->on_membership_user_data = config->on_membership_user_data;
     bus->sock_fd = -1;
     bus->running = false;
     if (config->bind_address) {
