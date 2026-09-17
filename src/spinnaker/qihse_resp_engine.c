@@ -6,6 +6,7 @@
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
+#include "qihse_supply_chain.h"
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
@@ -5218,6 +5219,83 @@ static bool qihse_resp_node_list_cb(const qihse_federation_node_identity_t* n, v
     return true;
 }
 
+/* F6: helpers and callbacks for the supply-chain commands. */
+
+/* Parse an "ENTITY|id" reference used by PROV.EDGE. */
+static bool qihse_resp_parse_prov_ref(const qihse_resp_arg_t* arg,
+                                      qihse_prov_entity_t* entity,
+                                      char* out_id, size_t out_cap) {
+    if (!arg || !entity || !out_id || arg->len == 0) return false;
+    const char* data = (const char*)arg->data;
+    const char* bar = NULL;
+    for (size_t i = 0; i < arg->len; i++) {
+        if (data[i] == '|') { bar = data + i; break; }
+    }
+    if (!bar) return false;
+    size_t el = (size_t)(bar - data);
+    size_t il = arg->len - el - 1u;
+    if (el == 0 || el >= 64u || il == 0 || il >= out_cap) return false;
+    char ent_name[64];
+    memcpy(ent_name, data, el); ent_name[el] = '\0';
+    if (!qihse_prov_entity_parse(ent_name, entity)) return false;
+    memcpy(out_id, bar + 1, il); out_id[il] = '\0';
+    return true;
+}
+
+struct qihse_resp_prov_ctx {
+    char entities[32][32];
+    char ids[32][QIHSE_PROV_ID_MAX + 1u];
+    char edges[32][32];
+    size_t count;
+};
+
+static bool qihse_resp_prov_collect_cb(const qihse_prov_hit_t* hit, void* ud) {
+    struct qihse_resp_prov_ctx* ctx = (struct qihse_resp_prov_ctx*)ud;
+    if (ctx->count >= 32) return false;
+    snprintf(ctx->entities[ctx->count], sizeof(ctx->entities[0]),
+             "%s", qihse_prov_entity_name(hit->entity));
+    snprintf(ctx->ids[ctx->count], sizeof(ctx->ids[0]), "%s", hit->id);
+    snprintf(ctx->edges[ctx->count], sizeof(ctx->edges[0]),
+             "%s", qihse_prov_edge_name(hit->via_edge));
+    ctx->count++;
+    return true;
+}
+
+struct qihse_resp_build_list_ctx {
+    char ids[32][QIHSE_UUID_STR_LEN + 1u];
+    char packages[32][128];
+    char states[32][32];
+    size_t count;
+};
+
+static bool qihse_resp_build_list_cb(const qihse_build_job_t* job, void* ud) {
+    struct qihse_resp_build_list_ctx* ctx = (struct qihse_resp_build_list_ctx*)ud;
+    if (ctx->count >= 32) return false;
+    qihse_uuid_format(&job->build_id, ctx->ids[ctx->count]);
+    snprintf(ctx->packages[ctx->count], sizeof(ctx->packages[0]), "%s", job->package);
+    snprintf(ctx->states[ctx->count], sizeof(ctx->states[0]),
+             "%s", qihse_build_state_name(job->state));
+    ctx->count++;
+    return true;
+}
+
+struct qihse_resp_snapshot_list_ctx {
+    char ids[32][QIHSE_UUID_STR_LEN + 1u];
+    char releases[32][64];
+    char digests[32][QIHSE_PROV_DIGEST_MAX * 2u + 1u];
+    size_t count;
+};
+
+static bool qihse_resp_snapshot_list_cb(const qihse_repo_snapshot_t* snap, void* ud) {
+    struct qihse_resp_snapshot_list_ctx* ctx = (struct qihse_resp_snapshot_list_ctx*)ud;
+    if (ctx->count >= 32) return false;
+    qihse_uuid_format(&snap->snapshot_id, ctx->ids[ctx->count]);
+    snprintf(ctx->releases[ctx->count], sizeof(ctx->releases[0]), "%s", snap->release);
+    snprintf(ctx->digests[ctx->count], sizeof(ctx->digests[0]), "%s", snap->snapshot_digest);
+    ctx->count++;
+    return true;
+}
+
 /* F2: journal replay callbacks for FEDERATION.EVENT.REPLAY. */
 static bool qihse_fed_replay_count_cb(const qihse_federation_event_t* event,
                                      const uint8_t* payload, size_t payload_len,
@@ -6031,6 +6109,518 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
             return qihse_resp_error(session, "ERR no gossip state for that node/boot");
         }
         return qihse_resp_integer(session, (int64_t)st.highest_sequence);
+    }
+
+    /* ── F6: Build & supply-chain substrate ───────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "PROV.EDGE")) {
+        if (request->argc != 5) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.PROV.EDGE <ENTITY|id> <edge> <ENTITY|id>");
+        }
+        qihse_prov_entity_t fe, te;
+        qihse_prov_edge_t edge;
+        char fid[QIHSE_PROV_ID_MAX + 1u], tid[QIHSE_PROV_ID_MAX + 1u];
+        if (!qihse_resp_parse_prov_ref(&request->argv[2], &fe, fid, sizeof(fid))) {
+            return qihse_resp_error(session, "ERR invalid from reference (want ENTITY|id)");
+        }
+        char edge_name[64];
+        size_t el = request->argv[3].len;
+        if (el == 0 || el >= sizeof(edge_name)) return qihse_resp_error(session, "ERR invalid edge");
+        memcpy(edge_name, request->argv[3].data, el); edge_name[el] = '\0';
+        if (!qihse_prov_edge_parse(edge_name, &edge)) return qihse_resp_error(session, "ERR unknown edge");
+        if (!qihse_resp_parse_prov_ref(&request->argv[4], &te, tid, sizeof(tid))) {
+            return qihse_resp_error(session, "ERR invalid to reference (want ENTITY|id)");
+        }
+        if (!qihse_provenance_edge_put(session->server->store, session->user,
+                                       fe, fid, edge, te, tid)) {
+            return qihse_resp_error(session, "ERR edge put failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "PROV.NODE")) {
+        if (request->argc < 4 || request->argc > 5) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.PROV.NODE <entity> <id> [label]");
+        }
+        char ent_name[64], id[QIHSE_PROV_ID_MAX + 1u];
+        size_t el = request->argv[2].len, il = request->argv[3].len;
+        if (el == 0 || el >= sizeof(ent_name) || il == 0 || il >= sizeof(id)) {
+            return qihse_resp_error(session, "ERR invalid entity or id");
+        }
+        memcpy(ent_name, request->argv[2].data, el); ent_name[el] = '\0';
+        memcpy(id, request->argv[3].data, il); id[il] = '\0';
+        qihse_prov_entity_t entity;
+        if (!qihse_prov_entity_parse(ent_name, &entity)) return qihse_resp_error(session, "ERR unknown entity");
+        qihse_prov_node_t node;
+        memset(&node, 0, sizeof(node));
+        node.entity = entity;
+        snprintf(node.id, sizeof(node.id), "%s", id);
+        if (request->argc == 5) {
+            size_t ll = request->argv[4].len;
+            if (ll >= sizeof(node.label)) return qihse_resp_error(session, "ERR label too long");
+            memcpy(node.label, request->argv[4].data, ll); node.label[ll] = '\0';
+        }
+        if (!qihse_provenance_node_put(session->server->store, session->user, &node)) {
+            return qihse_resp_error(session, "ERR node put failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "PROV.SHOW")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.prov.show");
+        char ent_name[64], id[QIHSE_PROV_ID_MAX + 1u];
+        size_t el = request->argv[2].len, il = request->argv[3].len;
+        if (el == 0 || el >= sizeof(ent_name) || il == 0 || il >= sizeof(id)) {
+            return qihse_resp_error(session, "ERR invalid entity or id");
+        }
+        memcpy(ent_name, request->argv[2].data, el); ent_name[el] = '\0';
+        memcpy(id, request->argv[3].data, il); id[il] = '\0';
+        qihse_prov_entity_t entity;
+        if (!qihse_prov_entity_parse(ent_name, &entity)) return qihse_resp_error(session, "ERR unknown entity");
+        qihse_prov_node_t node;
+        if (!qihse_provenance_node_get(session->server->store, session->user, entity, id, &node)) {
+            return qihse_resp_error(session, "ERR node not found");
+        }
+        if (!qihse_resp_array(session, 3)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_prov_entity_name(node.entity))) return false;
+        if (!qihse_resp_bulk_text(session, node.label)) return false;
+        if (!qihse_resp_integer(session, node.immutable ? 1 : 0)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "PROV.TRACE")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.PROV.TRACE <entity> <id> <forward|reverse> [depth]");
+        }
+        char ent_name[64], id[QIHSE_PROV_ID_MAX + 1u], dir[16];
+        size_t el = request->argv[2].len, il = request->argv[3].len, dl = request->argv[4].len;
+        if (el == 0 || el >= sizeof(ent_name) || il == 0 || il >= sizeof(id) ||
+            dl == 0 || dl >= sizeof(dir)) return qihse_resp_error(session, "ERR invalid arguments");
+        memcpy(ent_name, request->argv[2].data, el); ent_name[el] = '\0';
+        memcpy(id, request->argv[3].data, il); id[il] = '\0';
+        memcpy(dir, request->argv[4].data, dl); dir[dl] = '\0';
+        qihse_prov_entity_t entity;
+        if (!qihse_prov_entity_parse(ent_name, &entity)) return qihse_resp_error(session, "ERR unknown entity");
+        uint32_t depth = 16u;
+        if (request->argc == 6) {
+            char d_str[8];
+            size_t sl = request->argv[5].len;
+            if (sl == 0 || sl >= sizeof(d_str)) return qihse_resp_error(session, "ERR invalid depth");
+            memcpy(d_str, request->argv[5].data, sl); d_str[sl] = '\0';
+            depth = (uint32_t)strtoul(d_str, NULL, 10);
+        }
+        struct qihse_resp_prov_ctx ctx;
+        ctx.count = 0;
+        if (strcasecmp(dir, "forward") == 0) {
+            qihse_provenance_trace_forward(session->server->store, session->user, entity, id,
+                                           depth, qihse_resp_prov_collect_cb, &ctx);
+        } else if (strcasecmp(dir, "reverse") == 0) {
+            qihse_provenance_trace_reverse(session->server->store, session->user, entity, id,
+                                           depth, qihse_resp_prov_collect_cb, &ctx);
+        } else {
+            return qihse_resp_error(session, "ERR direction must be forward or reverse");
+        }
+        if (!qihse_resp_array(session, ctx.count * 3)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.entities[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.edges[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "PROV.IMPACT")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.PROV.IMPACT <entity> <id> <want_entity> [depth]");
+        }
+        char ent_name[64], id[QIHSE_PROV_ID_MAX + 1u], want_name[64];
+        size_t el = request->argv[2].len, il = request->argv[3].len, wl = request->argv[4].len;
+        if (el == 0 || el >= sizeof(ent_name) || il == 0 || il >= sizeof(id) ||
+            wl == 0 || wl >= sizeof(want_name)) return qihse_resp_error(session, "ERR invalid arguments");
+        memcpy(ent_name, request->argv[2].data, el); ent_name[el] = '\0';
+        memcpy(id, request->argv[3].data, il); id[il] = '\0';
+        memcpy(want_name, request->argv[4].data, wl); want_name[wl] = '\0';
+        qihse_prov_entity_t entity, want;
+        if (!qihse_prov_entity_parse(ent_name, &entity)) return qihse_resp_error(session, "ERR unknown entity");
+        if (!qihse_prov_entity_parse(want_name, &want)) return qihse_resp_error(session, "ERR unknown entity");
+        uint32_t depth = 16u;
+        if (request->argc == 6) {
+            char d_str[8];
+            size_t sl = request->argv[5].len;
+            if (sl == 0 || sl >= sizeof(d_str)) return qihse_resp_error(session, "ERR invalid depth");
+            memcpy(d_str, request->argv[5].data, sl); d_str[sl] = '\0';
+            depth = (uint32_t)strtoul(d_str, NULL, 10);
+        }
+        struct qihse_resp_prov_ctx ctx;
+        ctx.count = 0;
+        qihse_provenance_reverse_impact(session->server->store, session->user,
+                                        entity, id, want, depth,
+                                        qihse_resp_prov_collect_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count * 3)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.entities[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.edges[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILD.STATES")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.build.states");
+        static const qihse_build_state_t states[] = {
+            QIHSE_BUILD_QUEUED, QIHSE_BUILD_PLANNING, QIHSE_BUILD_LEASED,
+            QIHSE_BUILD_BUILDING, QIHSE_BUILD_TESTING, QIHSE_BUILD_VERIFYING,
+            QIHSE_BUILD_SIGNING, QIHSE_BUILD_PUBLISHED, QIHSE_BUILD_FAILED,
+            QIHSE_BUILD_RETRYABLE, QIHSE_BUILD_QUARANTINED, QIHSE_BUILD_CANCELLED,
+        };
+        size_t n = sizeof(states) / sizeof(states[0]);
+        if (!qihse_resp_array(session, n)) return false;
+        for (size_t i = 0; i < n; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_build_state_name(states[i]))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILD.CREATE")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.BUILD.CREATE <package> <revision> <profile> <toolchain>");
+        }
+        qihse_build_job_t job;
+        memset(&job, 0, sizeof(job));
+        if (!qihse_uuid_generate(&job.build_id)) return qihse_resp_error(session, "ERR could not generate build id");
+        size_t pl = request->argv[2].len, rl = request->argv[3].len,
+               fl = request->argv[4].len, tl = request->argv[5].len;
+        if (pl == 0 || pl >= sizeof(job.package) || rl == 0 || rl >= sizeof(job.source_revision) ||
+            fl >= sizeof(job.profile) || tl >= sizeof(job.toolchain)) {
+            return qihse_resp_error(session, "ERR invalid argument length");
+        }
+        memcpy(job.package, request->argv[2].data, pl); job.package[pl] = '\0';
+        memcpy(job.source_revision, request->argv[3].data, rl); job.source_revision[rl] = '\0';
+        memcpy(job.profile, request->argv[4].data, fl); job.profile[fl] = '\0';
+        memcpy(job.toolchain, request->argv[5].data, tl); job.toolchain[tl] = '\0';
+        job.created_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        qihse_build_job_t out;
+        if (!qihse_build_job_create(session->server->store, session->user, &job, &out)) {
+            return qihse_resp_error(session, "ERR build create failed");
+        }
+        char bid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&out.build_id, bid);
+        return qihse_resp_bulk_text(session, bid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILD.SHOW")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.build.show");
+        char bid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t bl = request->argv[2].len;
+        if (bl == 0 || bl >= sizeof(bid_str)) return qihse_resp_error(session, "ERR invalid build id");
+        memcpy(bid_str, request->argv[2].data, bl); bid_str[bl] = '\0';
+        qihse_uuid_t bid;
+        if (!qihse_uuid_parse(bid_str, &bid)) return qihse_resp_error(session, "ERR invalid build id");
+        qihse_build_job_t job;
+        if (!qihse_build_job_get(session->server->store, session->user, &bid, &job)) {
+            return qihse_resp_error(session, "ERR build not found");
+        }
+        if (!qihse_resp_array(session, 7)) return false;
+        if (!qihse_resp_bulk_text(session, job.package)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_build_state_name(job.state))) return false;
+        if (!qihse_resp_integer(session, (int64_t)job.generation)) return false;
+        if (!qihse_resp_bulk_text(session, job.source_revision)) return false;
+        if (!qihse_resp_bulk_text(session, job.profile)) return false;
+        if (!qihse_resp_bulk_text(session, job.toolchain)) return false;
+        if (!qihse_resp_bulk_text(session, job.failure_reason)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILD.TRANSITION")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.BUILD.TRANSITION <build_id> <state> <request_id> [reason]");
+        }
+        char bid_str[QIHSE_UUID_STR_LEN + 1u], state_name[32], req_name[128];
+        size_t bl = request->argv[2].len, sl = request->argv[3].len, rl = request->argv[4].len;
+        if (bl == 0 || bl >= sizeof(bid_str) || sl == 0 || sl >= sizeof(state_name) ||
+            rl == 0 || rl >= sizeof(req_name)) return qihse_resp_error(session, "ERR invalid arguments");
+        memcpy(bid_str, request->argv[2].data, bl); bid_str[bl] = '\0';
+        memcpy(state_name, request->argv[3].data, sl); state_name[sl] = '\0';
+        memcpy(req_name, request->argv[4].data, rl); req_name[rl] = '\0';
+        qihse_uuid_t bid, req_id;
+        if (!qihse_uuid_parse(bid_str, &bid)) return qihse_resp_error(session, "ERR invalid build id");
+        qihse_build_state_t next;
+        if (!qihse_build_state_parse(state_name, &next)) return qihse_resp_error(session, "ERR unknown state");
+        if (!qihse_uuid_from_seed(req_name, strlen(req_name), &req_id)) {
+            return qihse_resp_error(session, "ERR invalid request id");
+        }
+        char reason[256];
+        reason[0] = '\0';
+        if (request->argc == 6) {
+            size_t xl = request->argv[5].len;
+            if (xl >= sizeof(reason)) return qihse_resp_error(session, "ERR reason too long");
+            memcpy(reason, request->argv[5].data, xl); reason[xl] = '\0';
+        }
+        qihse_build_job_t out;
+        if (!qihse_build_job_transition(session->server->store, session->user, &bid, next,
+                                        &req_id, reason[0] ? reason : NULL, &out)) {
+            return qihse_resp_error(session, "ERR illegal transition");
+        }
+        return qihse_resp_integer(session, (int64_t)out.generation);
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILD.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.build.list");
+        struct qihse_resp_build_list_ctx ctx;
+        ctx.count = 0;
+        qihse_build_job_foreach(session->server->store, session->user,
+                                qihse_resp_build_list_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count * 3)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.packages[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.states[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "PKG.MODES")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.pkg.modes");
+        static const qihse_pkg_mode_t modes[] = {
+            QIHSE_PKG_UPSTREAM_BINARY, QIHSE_PKG_UPSTREAM_SOURCE_REBUILD,
+            QIHSE_PKG_CITADEL_OVERLAY, QIHSE_PKG_CITADEL_FORK,
+            QIHSE_PKG_FORBIDDEN, QIHSE_PKG_ISOLATED_EXCEPTION,
+        };
+        size_t n = sizeof(modes) / sizeof(modes[0]);
+        if (!qihse_resp_array(session, n)) return false;
+        for (size_t i = 0; i < n; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_pkg_mode_name(modes[i]))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "PKG.SET")) {
+        if (request->argc != 5) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.PKG.SET <package> <mode> <reason>");
+        }
+        qihse_pkg_policy_t p;
+        memset(&p, 0, sizeof(p));
+        size_t pl = request->argv[2].len, ml = request->argv[3].len, rl = request->argv[4].len;
+        if (pl == 0 || pl >= sizeof(p.package) || ml == 0 || ml >= 32 ||
+            rl == 0 || rl >= sizeof(p.reason)) return qihse_resp_error(session, "ERR invalid arguments");
+        memcpy(p.package, request->argv[2].data, pl); p.package[pl] = '\0';
+        char mode_name[32];
+        memcpy(mode_name, request->argv[3].data, ml); mode_name[ml] = '\0';
+        if (!qihse_pkg_mode_parse(mode_name, &p.mode)) return qihse_resp_error(session, "ERR unknown package mode");
+        memcpy(p.reason, request->argv[4].data, rl); p.reason[rl] = '\0';
+        p.decided_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        if (!qihse_pkg_policy_set(session->server->store, session->user, &p)) {
+            return qihse_resp_error(session, "ERR policy set failed (a reason is required)");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "PKG.GET")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.pkg.get");
+        char package[128];
+        size_t pl = request->argv[2].len;
+        if (pl == 0 || pl >= sizeof(package)) return qihse_resp_error(session, "ERR invalid package");
+        memcpy(package, request->argv[2].data, pl); package[pl] = '\0';
+        qihse_pkg_policy_t p;
+        if (!qihse_pkg_policy_get(session->server->store, session->user, package, &p)) {
+            return qihse_resp_error(session, "ERR no policy for that package");
+        }
+        if (!qihse_resp_array(session, 2)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_pkg_mode_name(p.mode))) return false;
+        if (!qihse_resp_bulk_text(session, p.reason)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILDER.CAP")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.BUILDER.CAP <node_id> <cores_available> <ram_available_gb> <queue_depth>");
+        }
+        qihse_builder_capability_t cap;
+        memset(&cap, 0, sizeof(cap));
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        if (!qihse_uuid_parse(nid_str, &cap.node_id)) return qihse_resp_error(session, "ERR invalid node id");
+        char nums[3][16];
+        for (size_t i = 0; i < 3; i++) {
+            size_t l = request->argv[3 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[3 + i].data, l); nums[i][l] = '\0';
+        }
+        cap.cores_available = (uint32_t)strtoul(nums[0], NULL, 10);
+        cap.ram_available_gb = (uint64_t)strtoull(nums[1], NULL, 10);
+        cap.build_queue_depth = (uint32_t)strtoul(nums[2], NULL, 10);
+        cap.trust_state = QIHSE_TRUST_APPROVED;
+        cap.observed_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        if (!qihse_builder_capability_put(session->server->store, session->user, &cap)) {
+            return qihse_resp_error(session, "ERR capability put failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUILDER.SHOW")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.builder.show");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        qihse_builder_capability_t cap;
+        if (!qihse_builder_capability_get(session->server->store, session->user, &nid, &cap)) {
+            return qihse_resp_error(session, "ERR no capability record for that node");
+        }
+        if (!qihse_resp_array(session, 4)) return false;
+        if (!qihse_resp_integer(session, (int64_t)cap.cores_available)) return false;
+        if (!qihse_resp_integer(session, (int64_t)cap.ram_available_gb)) return false;
+        if (!qihse_resp_integer(session, (int64_t)cap.build_queue_depth)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_trust_state_name(cap.trust_state))) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.SBOM")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SUPPLY.SBOM <artifact_digest> <sbom_digest> <signing_identity> <format>");
+        }
+        qihse_sbom_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        if (!qihse_uuid_generate(&rec.sbom_id)) return qihse_resp_error(session, "ERR could not generate sbom id");
+        size_t al = request->argv[2].len, sl = request->argv[3].len,
+               il = request->argv[4].len, fl = request->argv[5].len;
+        if (al == 0 || al >= sizeof(rec.artifact_digest) || sl == 0 || sl >= sizeof(rec.sbom_digest) ||
+            il == 0 || il >= sizeof(rec.signing_identity) || fl == 0 || fl >= sizeof(rec.format)) {
+            return qihse_resp_error(session, "ERR invalid argument length");
+        }
+        memcpy(rec.artifact_digest, request->argv[2].data, al); rec.artifact_digest[al] = '\0';
+        memcpy(rec.sbom_digest, request->argv[3].data, sl); rec.sbom_digest[sl] = '\0';
+        memcpy(rec.signing_identity, request->argv[4].data, il); rec.signing_identity[il] = '\0';
+        memcpy(rec.format, request->argv[5].data, fl); rec.format[fl] = '\0';
+        rec.signature_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        snprintf(rec.verification_status, sizeof(rec.verification_status), "unverified");
+        /* QIHSE records no key material — only an external handle. */
+        snprintf(rec.signing_key_handle, sizeof(rec.signing_key_handle), "external");
+        if (!qihse_sbom_record_put(session->server->store, session->user, &rec)) {
+            return qihse_resp_error(session, "ERR sbom record failed");
+        }
+        char sid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&rec.sbom_id, sid);
+        return qihse_resp_bulk_text(session, sid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.SBOM.GET")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.supply.sbom.get");
+        char sid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t sl = request->argv[2].len;
+        if (sl == 0 || sl >= sizeof(sid_str)) return qihse_resp_error(session, "ERR invalid sbom id");
+        memcpy(sid_str, request->argv[2].data, sl); sid_str[sl] = '\0';
+        qihse_uuid_t sid;
+        if (!qihse_uuid_parse(sid_str, &sid)) return qihse_resp_error(session, "ERR invalid sbom id");
+        qihse_sbom_record_t rec;
+        if (!qihse_sbom_record_get(session->server->store, session->user, &sid, &rec)) {
+            return qihse_resp_error(session, "ERR sbom not found");
+        }
+        if (!qihse_resp_array(session, 4)) return false;
+        if (!qihse_resp_bulk_text(session, rec.artifact_digest)) return false;
+        if (!qihse_resp_bulk_text(session, rec.signing_identity)) return false;
+        if (!qihse_resp_bulk_text(session, rec.verification_status)) return false;
+        if (!qihse_resp_bulk_text(session, rec.format)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.VULN")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SUPPLY.VULN <component_digest> <advisory> <severity> <status>");
+        }
+        qihse_vuln_observation_t obs;
+        memset(&obs, 0, sizeof(obs));
+        if (!qihse_uuid_generate(&obs.observation_id)) {
+            return qihse_resp_error(session, "ERR could not generate observation id");
+        }
+        size_t cl = request->argv[2].len, al = request->argv[3].len,
+               sl = request->argv[4].len, tl = request->argv[5].len;
+        if (cl == 0 || cl >= sizeof(obs.component_digest) || al == 0 || al >= sizeof(obs.advisory_id) ||
+            sl == 0 || sl >= sizeof(obs.severity) || tl == 0 || tl >= sizeof(obs.status)) {
+            return qihse_resp_error(session, "ERR invalid argument length");
+        }
+        memcpy(obs.component_digest, request->argv[2].data, cl); obs.component_digest[cl] = '\0';
+        memcpy(obs.advisory_id, request->argv[3].data, al); obs.advisory_id[al] = '\0';
+        memcpy(obs.severity, request->argv[4].data, sl); obs.severity[sl] = '\0';
+        memcpy(obs.status, request->argv[5].data, tl); obs.status[tl] = '\0';
+        obs.observed_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        if (!qihse_vuln_observation_put(session->server->store, session->user, &obs)) {
+            return qihse_resp_error(session, "ERR observation record failed");
+        }
+        char oid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&obs.observation_id, oid);
+        return qihse_resp_bulk_text(session, oid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.VULN.COUNT")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.supply.vuln.count");
+        char digest[QIHSE_PROV_DIGEST_MAX * 2u + 1u];
+        size_t dl = request->argv[2].len;
+        if (dl == 0 || dl >= sizeof(digest)) return qihse_resp_error(session, "ERR invalid component digest");
+        memcpy(digest, request->argv[2].data, dl); digest[dl] = '\0';
+        size_t n = qihse_vuln_count_by_component(session->server->store, session->user, digest);
+        return qihse_resp_integer(session, (int64_t)n);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.SNAPSHOT")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SUPPLY.SNAPSHOT <repository> <digest> <release> [package_count]");
+        }
+        qihse_repo_snapshot_t snap;
+        memset(&snap, 0, sizeof(snap));
+        if (!qihse_uuid_generate(&snap.snapshot_id)) {
+            return qihse_resp_error(session, "ERR could not generate snapshot id");
+        }
+        size_t rl = request->argv[2].len, dl = request->argv[3].len, ll = request->argv[4].len;
+        if (rl == 0 || rl >= sizeof(snap.repository) || dl == 0 || dl >= sizeof(snap.snapshot_digest) ||
+            ll == 0 || ll >= sizeof(snap.release)) return qihse_resp_error(session, "ERR invalid argument length");
+        memcpy(snap.repository, request->argv[2].data, rl); snap.repository[rl] = '\0';
+        memcpy(snap.snapshot_digest, request->argv[3].data, dl); snap.snapshot_digest[dl] = '\0';
+        memcpy(snap.release, request->argv[4].data, ll); snap.release[ll] = '\0';
+        if (request->argc == 6) {
+            char c_str[24];
+            size_t cl = request->argv[5].len;
+            if (cl == 0 || cl >= sizeof(c_str)) return qihse_resp_error(session, "ERR invalid package count");
+            memcpy(c_str, request->argv[5].data, cl); c_str[cl] = '\0';
+            snap.package_count = (uint64_t)strtoull(c_str, NULL, 10);
+        }
+        snap.created_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        snap.created_by = session->server->federation_node_id;
+        snprintf(snap.signing_key_handle, sizeof(snap.signing_key_handle), "external");
+        if (!qihse_repo_snapshot_put(session->server->store, session->user, &snap)) {
+            return qihse_resp_error(session, "ERR snapshot record failed");
+        }
+        char sid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&snap.snapshot_id, sid);
+        return qihse_resp_bulk_text(session, sid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "SUPPLY.SNAPSHOT.LIST")) {
+        if (request->argc < 2 || request->argc > 3) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SUPPLY.SNAPSHOT.LIST [repository]");
+        }
+        char repo[128];
+        repo[0] = '\0';
+        if (request->argc == 3) {
+            size_t rl = request->argv[2].len;
+            if (rl == 0 || rl >= sizeof(repo)) return qihse_resp_error(session, "ERR invalid repository");
+            memcpy(repo, request->argv[2].data, rl); repo[rl] = '\0';
+        }
+        struct qihse_resp_snapshot_list_ctx ctx;
+        ctx.count = 0;
+        qihse_repo_snapshot_foreach(session->server->store, session->user,
+                                    repo[0] ? repo : NULL,
+                                    qihse_resp_snapshot_list_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count * 3)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.releases[i])) return false;
+            if (!qihse_resp_bulk_text(session, ctx.digests[i])) return false;
+        }
+        return true;
     }
 
     return qihse_resp_error(session, "ERR unknown FEDERATION subcommand");

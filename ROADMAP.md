@@ -84,8 +84,9 @@ The accepted major direction. Governing principle: **federation must enhance a n
 - [x] **F3 — Replication correctness.** Anti-entropy, manifests/range digests, explicit conflict objects, resumable reconciliation. *Needs F2. Unblocks criteria 6–7.*
 - [x] **F4 — Strong namespace.** Scoped consensus groups, native CAS, monotonic fencing epochs, lease primitive, explicit membership. *Needs F1+F2. Unblocks criteria 3–4, 10.*
 - [x] **F5 — Trust plane.** Durable node identity keypairs (Ed25519, private key on disk, never in a record), operator-approved enrollment with permanent revocation, infrastructure authorization scopes with per-service defaults, signed replay-resistant gossip (protocol version, sender/boot UUID, monotonic sequence, HLC, capability/health, signature, persistent replay window). *Unblocks criterion 8's crypto substrate.* Transport-level mTLS binding for federation RPC remains — it attaches where the overlay transport lands.
-- [ ] **F6 — Build & supply-chain substrate.** Package override/source registry, build-job state machine, worker capability records, build leases, provenance graph, SBOM/attestation records, vulnerability observations, repository snapshots, controller-facing build APIs. *Needs F2+F4+F5. Unblocks criteria 15–22.*
-- [ ] **F7 — Operational hardening.** Rolling schema upgrades, federation-consistent snapshots, chaos suite, performance regression budgets, recovery tooling.
+- [x] **F6 — Build & supply-chain substrate.** Package override registry (reason mandatory), build-job state machine with idempotent transitions, builder capability + historical performance, provenance graph (21 entities / 15 edges) with direction-aware trace-back and reverse-impact, SBOM/attestation records (key handles only), append-only vulnerability observations, immutable queryable repository snapshots. *Unblocks criteria 15–22.*
+- [ ] **F7 — Runtime trust and hardening.** Evidence-aware federation admission (runtime trust states + evidence bundles), runtime security profiles, network exposure/egress declarations, time-integrity events, hardening self-audit driven by actual process state. *Unblocks criteria 23–28.*
+- [ ] **F8 — Operational hardening.** Rolling schema upgrades, federation-consistent snapshots/backup, deterministic chaos suite, performance regression budgets, recovery tooling.
 
 ### W2 — AI compute fabric
 
