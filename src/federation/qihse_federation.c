@@ -8,8 +8,13 @@
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "qihse_auth.h"
+#include "qihse_kv_store.h"
 
 /* ── UUID ───────────────────────────────────────────────────────────────── */
 
@@ -194,4 +199,254 @@ bool qihse_fencing_acquire(qihse_fencing_token_t* token, uint64_t observed_epoch
 bool qihse_fencing_valid(const qihse_fencing_token_t* token, uint64_t observed_epoch) {
     if (!token) return false;
     return token->epoch > observed_epoch;
+}
+
+/* ── F1: Consistency classes ────────────────────────────────────────────── */
+
+const char* qihse_consistency_class_name(qihse_consistency_class_t c) {
+    switch (c) {
+        case QIHSE_CONSISTENCY_LOCAL:        return "LOCAL";
+        case QIHSE_CONSISTENCY_EVENTUAL:     return "EVENTUAL";
+        case QIHSE_CONSISTENCY_CAUSAL:       return "CAUSAL";
+        case QIHSE_CONSISTENCY_QUORUM:       return "QUORUM";
+        case QIHSE_CONSISTENCY_LINEARIZABLE: return "LINEARIZABLE";
+    }
+    return NULL;
+}
+
+bool qihse_consistency_class_parse(const char* name, qihse_consistency_class_t* out) {
+    if (!name || !out) return false;
+    if (strcmp(name, "LOCAL") == 0)        { *out = QIHSE_CONSISTENCY_LOCAL;        return true; }
+    if (strcmp(name, "EVENTUAL") == 0)     { *out = QIHSE_CONSISTENCY_EVENTUAL;     return true; }
+    if (strcmp(name, "CAUSAL") == 0)       { *out = QIHSE_CONSISTENCY_CAUSAL;       return true; }
+    if (strcmp(name, "QUORUM") == 0)       { *out = QIHSE_CONSISTENCY_QUORUM;       return true; }
+    if (strcmp(name, "LINEARIZABLE") == 0) { *out = QIHSE_CONSISTENCY_LINEARIZABLE; return true; }
+    return false;
+}
+
+bool qihse_consistency_class_is_local_safe(qihse_consistency_class_t c) {
+    /* LOCAL is always local-safe; EVENTUAL and CAUSAL tolerate disconnected
+     * writes and reconcile later (plan §4.1–§4.3). */
+    return c == QIHSE_CONSISTENCY_LOCAL ||
+           c == QIHSE_CONSISTENCY_EVENTUAL ||
+           c == QIHSE_CONSISTENCY_CAUSAL;
+}
+
+bool qihse_consistency_class_is_strong(qihse_consistency_class_t c) {
+    return c == QIHSE_CONSISTENCY_QUORUM ||
+           c == QIHSE_CONSISTENCY_LINEARIZABLE;
+}
+
+/* ── F1: Federation state ───────────────────────────────────────────────── */
+
+const char* qihse_federation_state_name(qihse_federation_state_t s) {
+    switch (s) {
+        case QIHSE_FEDERATION_STATE_CONNECTED:  return "connected";
+        case QIHSE_FEDERATION_STATE_DEGRADED:   return "degraded";
+        case QIHSE_FEDERATION_STATE_ISOLATED:   return "isolated";
+        case QIHSE_FEDERATION_STATE_RECOVERING: return "recovering";
+        case QIHSE_FEDERATION_STATE_FENCED:     return "fenced";
+        case QIHSE_FEDERATION_STATE_MAINTENANCE:return "maintenance";
+    }
+    return NULL;
+}
+
+bool qihse_federation_state_parse(const char* name, qihse_federation_state_t* out) {
+    if (!name || !out) return false;
+    if (strcmp(name, "connected") == 0)   { *out = QIHSE_FEDERATION_STATE_CONNECTED;   return true; }
+    if (strcmp(name, "degraded") == 0)    { *out = QIHSE_FEDERATION_STATE_DEGRADED;    return true; }
+    if (strcmp(name, "isolated") == 0)    { *out = QIHSE_FEDERATION_STATE_ISOLATED;    return true; }
+    if (strcmp(name, "recovering") == 0)  { *out = QIHSE_FEDERATION_STATE_RECOVERING; return true; }
+    if (strcmp(name, "fenced") == 0)      { *out = QIHSE_FEDERATION_STATE_FENCED;     return true; }
+    if (strcmp(name, "maintenance") == 0)  { *out = QIHSE_FEDERATION_STATE_MAINTENANCE;return true; }
+    return false;
+}
+
+const char* qihse_local_db_state_name(qihse_local_db_state_t s) {
+    return s == QIHSE_LOCAL_DB_READ_WRITE ? "read-write" : "read-only";
+}
+
+/* ── F1: Namespace writability ──────────────────────────────────────────── */
+
+bool qihse_federation_namespace_writable(const qihse_federation_namespace_t* ns,
+                                         qihse_federation_state_t state,
+                                         const qihse_uuid_t* local_node) {
+    if (!ns) return false;
+    (void)local_node; /* reserved for finer authority checks in F4 */
+    /* Local-safe classes remain writable regardless of federation state
+     * (acceptance criteria 1–2). */
+    if (qihse_consistency_class_is_local_safe(ns->consistency)) return true;
+    /* Strong namespaces require peer agreement. They fail closed unless the
+     * node is connected (or degraded, which still has a quorum path). */
+    if (qihse_consistency_class_is_strong(ns->consistency)) {
+        return state == QIHSE_FEDERATION_STATE_CONNECTED ||
+               state == QIHSE_FEDERATION_STATE_DEGRADED;
+    }
+    return false;
+}
+
+/* ── F1: Federation status ──────────────────────────────────────────────── */
+
+void qihse_federation_status_init(qihse_federation_status_t* status,
+                                 const qihse_uuid_t* node_id) {
+    if (!status) return;
+    memset(status, 0, sizeof(*status));
+    if (node_id) status->node_id = *node_id;
+    status->federation_state = QIHSE_FEDERATION_STATE_CONNECTED;
+    status->local_database = QIHSE_LOCAL_DB_READ_WRITE;
+    status->strong_namespaces_available = true;
+    status->eventual_namespaces_available = true;
+    qihse_hlc_init(&status->last_peer_contact_hlc);
+}
+
+void qihse_federation_status_recompute(qihse_federation_status_t* status) {
+    if (!status) return;
+    /* Local-safe namespaces keep the local database read-write even when the
+     * node is isolated (acceptance criterion 2: quorum loss does not force
+     * the whole node read-only). */
+    status->local_database = QIHSE_LOCAL_DB_READ_WRITE;
+    status->eventual_namespaces_available = true;
+    /* Strong namespaces are only available when consensus is reachable. */
+    bool consensus_reachable = (status->federation_state == QIHSE_FEDERATION_STATE_CONNECTED) ||
+                              (status->federation_state == QIHSE_FEDERATION_STATE_DEGRADED);
+    status->strong_namespaces_available = consensus_reachable;
+    /* Maintenance deliberately takes the local DB read-only for planned
+     * work; F1 does not automate this but the status reflects it. */
+    if (status->federation_state == QIHSE_FEDERATION_STATE_MAINTENANCE) {
+        status->local_database = QIHSE_LOCAL_DB_READ_ONLY;
+        status->strong_namespaces_available = false;
+    }
+    /* Reconciliation is required after isolation or recovery. */
+    status->reconciliation_required =
+        status->federation_state == QIHSE_FEDERATION_STATE_ISOLATED ||
+        status->federation_state == QIHSE_FEDERATION_STATE_RECOVERING ||
+        status->federation_state == QIHSE_FEDERATION_STATE_FENCED;
+}
+
+void qihse_federation_status_format(const qihse_federation_status_t* status,
+                                    char* out, size_t out_cap) {
+    if (!status || !out || out_cap == 0) return;
+    char node_str[QIHSE_UUID_STR_LEN + 1u];
+    char hlc_str[64];
+    qihse_uuid_format(&status->node_id, node_str);
+    uint64_t packed = qihse_hlc_pack(&status->last_peer_contact_hlc);
+    snprintf(hlc_str, sizeof(hlc_str), "%llu:%u",
+             (unsigned long long)status->last_peer_contact_hlc.physical_ms,
+             (unsigned)status->last_peer_contact_hlc.logical);
+    snprintf(out, out_cap,
+             "{\"node_id\":\"%s\",\"federation_state\":\"%s\","
+             "\"local_database\":\"%s\",\"strong_namespaces_available\":%s,"
+             "\"eventual_namespaces_available\":%s,"
+             "\"pending_replication_events\":%llu,"
+             "\"last_peer_contact_hlc\":\"%s\","
+             "\"reconciliation_required\":%s}",
+             node_str,
+             qihse_federation_state_name(status->federation_state),
+             qihse_local_db_state_name(status->local_database),
+             status->strong_namespaces_available ? "true" : "false",
+             status->eventual_namespaces_available ? "true" : "false",
+             (unsigned long long)status->pending_replication_events,
+             packed ? hlc_str : "none",
+             status->reconciliation_required ? "true" : "false");
+    (void)packed;
+}
+
+/* ── F1: Namespace registry (KV-backed under "fedns:") ──────────────────── */
+
+static void ns_kv_key(const char* name, char* out, size_t cap) {
+    snprintf(out, cap, QIHSE_FEDERATION_NS_PREFIX "%s", name);
+}
+
+/* Wire format: <consistency_int>\t<authority_uuid_str>\t<local_authority_0or1> */
+static void ns_encode(const qihse_federation_namespace_t* ns, char* out, size_t cap) {
+    char auth_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(&ns->authority_node, auth_str);
+    snprintf(out, cap, "%d\t%s\t%d", (int)ns->consistency, auth_str,
+             ns->local_authority ? 1 : 0);
+}
+
+static bool ns_decode(const char* blob, qihse_federation_namespace_t* out) {
+    if (!blob || !out) return false;
+    int c = 0;
+    char auth_str[QIHSE_UUID_STR_LEN + 1u];
+    int la = 0;
+    if (sscanf(blob, "%d\t%36[^\t]\t%d", &c, auth_str, &la) != 3) return false;
+    if (c < 0 || c > (int)QIHSE_CONSISTENCY_LINEARIZABLE) return false;
+    if (!qihse_uuid_parse(auth_str, &out->authority_node)) return false;
+    out->consistency = (qihse_consistency_class_t)c;
+    out->local_authority = la != 0;
+    return true;
+}
+
+bool qihse_federation_namespace_register(void* store_void, void* user_void,
+                                         const char* name,
+                                         qihse_consistency_class_t consistency,
+                                         const qihse_uuid_t* authority_node,
+                                         const qihse_uuid_t* local_node) {
+    if (!store_void || !user_void || !name || !authority_node || !local_node) return false;
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return false;
+    if (qihse_consistency_class_name(consistency) == NULL) return false;
+    qihse_federation_namespace_t ns;
+    memset(&ns, 0, sizeof(ns));
+    snprintf(ns.name, sizeof(ns.name), "%s", name);
+    ns.consistency = consistency;
+    ns.authority_node = *authority_node;
+    ns.local_authority = (consistency == QIHSE_CONSISTENCY_LOCAL) ||
+                        qihse_uuid_equal(authority_node, local_node);
+    char key[128];
+    ns_kv_key(name, key, sizeof(key));
+    char blob[128];
+    ns_encode(&ns, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_namespace_lookup(void* store_void, void* user_void,
+                                        const char* name,
+                                        qihse_federation_namespace_t* out) {
+    if (!store_void || !user_void || !name || !out) return false;
+    char key[128];
+    ns_kv_key(name, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                  (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = ns_decode(blob, out);
+    snprintf(out->name, sizeof(out->name), "%s", name);
+    free(blob);
+    return ok;
+}
+
+bool qihse_federation_namespace_unregister(void* store_void, void* user_void,
+                                            const char* name) {
+    if (!store_void || !user_void || !name) return false;
+    char key[128];
+    ns_kv_key(name, key, sizeof(key));
+    return qihse_kv_del_user((qihse_kv_store_t*)store_void, key,
+                             (qihse_user_t*)user_void);
+}
+
+typedef struct {
+    qihse_federation_ns_iter_cb cb;
+    void* user_data;
+} ns_iter_ctx_t;
+
+static bool ns_iter_cb(const char* key, const char* value, void* user_data) {
+    ns_iter_ctx_t* ctx = (ns_iter_ctx_t*)user_data;
+    size_t plen = strlen(QIHSE_FEDERATION_NS_PREFIX);
+    if (strncmp(key, QIHSE_FEDERATION_NS_PREFIX, plen) != 0) return true;
+    const char* name = key + plen;
+    qihse_federation_namespace_t ns;
+    if (!ns_decode(value, &ns)) return true;
+    snprintf(ns.name, sizeof(ns.name), "%s", name);
+    return ctx->cb(&ns, ctx->user_data);
+}
+
+void qihse_federation_namespace_foreach(void* store_void, void* user_void,
+                                        qihse_federation_ns_iter_cb cb,
+                                        void* user_data) {
+    if (!store_void || !cb) return;
+    ns_iter_ctx_t ctx = { cb, user_data };
+    qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
+                          ns_iter_cb, &ctx);
 }

@@ -152,6 +152,11 @@ struct qihse_resp_server {
     uint64_t group_last_update;
     pthread_mutex_t group_lock;
     group_ack_set_t group_acks[GROUP_ACK_SLOTS];
+    /* F1: sovereign local state — federation status + node UUID derived
+     * from the cluster node id. The status is recomputed on demand. */
+    qihse_uuid_t federation_node_id;
+    qihse_federation_status_t federation_status;
+    pthread_mutex_t federation_lock;
     qihse_system_guard_window_t* guard_window;
     bool owns_bus;
     bool owns_failover;
@@ -5118,6 +5123,138 @@ static bool qihse_resp_handle_group(qihse_resp_session_t* session, const qihse_r
 }
 
 /* ---------------------------------------------------------------------------
+ * FEDERATION.* — F1 sovereign local state (plan §4, §5).
+ * FEDERATION.STATUS                       — status snapshot (system domain)
+ * FEDERATION.STATE <connected|degraded|...> — set the node's federation state
+ * FEDERATION.NS.REGISTER <name> <class> [authority-node-id] — register a namespace
+ * FEDERATION.NS.UNREGISTER <name>          — remove a namespace
+ * FEDERATION.NS.LIST                       — list registered namespaces
+ * FEDERATION.NS.WRITABLE <name>           — is this namespace writable now?
+ * ------------------------------------------------------------------------- */
+static bool qihse_fed_ns_count_cb(const qihse_federation_namespace_t* ns, void* ud) {
+    (void)ns; (*(size_t*)ud)++; return true;
+}
+
+static bool qihse_fed_ns_list_cb(const qihse_federation_namespace_t* ns, void* ud) {
+    qihse_resp_session_t* session = (qihse_resp_session_t*)ud;
+    if (!qihse_resp_bulk_text(session, ns->name)) return false;
+    if (!qihse_resp_bulk_text(session, qihse_consistency_class_name(ns->consistency))) return false;
+    char auth_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(&ns->authority_node, auth_str);
+    if (!qihse_resp_bulk_text(session, auth_str)) return false;
+    if (!qihse_resp_bulk_text(session, ns->local_authority ? "local" : "federation")) return false;
+    return true;
+}
+
+static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
+                                        const qihse_resp_request_t* request) {
+    if (request->argc < 2) return qihse_resp_error(session, "ERR usage: FEDERATION.STATUS|STATE|NS.REGISTER|NS.UNREGISTER|NS.LIST|NS.WRITABLE ...");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM FEDERATION.* is restricted to the system domain");
+    }
+    const qihse_resp_arg_t* sub = &request->argv[1];
+
+    if (qihse_resp_arg_equal(sub, "STATUS")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.status");
+        pthread_mutex_lock(&session->server->federation_lock);
+        qihse_federation_status_recompute(&session->server->federation_status);
+        char buf[512];
+        qihse_federation_status_format(&session->server->federation_status, buf, sizeof(buf));
+        pthread_mutex_unlock(&session->server->federation_lock);
+        return qihse_resp_bulk_text(session, buf);
+    }
+
+    if (qihse_resp_arg_equal(sub, "STATE")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.state");
+        char name[32];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(name)) return qihse_resp_error(session, "ERR invalid state name");
+        memcpy(name, request->argv[2].data, nl); name[nl] = '\0';
+        qihse_federation_state_t s;
+        if (!qihse_federation_state_parse(name, &s)) return qihse_resp_error(session, "ERR unknown federation state");
+        pthread_mutex_lock(&session->server->federation_lock);
+        session->server->federation_status.federation_state = s;
+        qihse_federation_status_recompute(&session->server->federation_status);
+        pthread_mutex_unlock(&session->server->federation_lock);
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "NS.REGISTER")) {
+        if (request->argc < 4 || request->argc > 5) return qihse_resp_error(session, "ERR usage: FEDERATION.NS.REGISTER <name> <class> [authority-node-id]");
+        char name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(name, request->argv[2].data, nl); name[nl] = '\0';
+        char class_name[32];
+        size_t cl = request->argv[3].len;
+        if (cl == 0 || cl >= sizeof(class_name)) return qihse_resp_error(session, "ERR invalid consistency class");
+        memcpy(class_name, request->argv[3].data, cl); class_name[cl] = '\0';
+        qihse_consistency_class_t cc;
+        if (!qihse_consistency_class_parse(class_name, &cc)) return qihse_resp_error(session, "ERR unknown consistency class");
+        qihse_uuid_t authority;
+        if (request->argc == 5) {
+            char auth_str[QIHSE_UUID_STR_LEN + 1u];
+            size_t al = request->argv[4].len;
+            if (al != QIHSE_UUID_STR_LEN) return qihse_resp_error(session, "ERR authority node id must be a 36-char UUID");
+            memcpy(auth_str, request->argv[4].data, al); auth_str[al] = '\0';
+            if (!qihse_uuid_parse(auth_str, &authority)) return qihse_resp_error(session, "ERR invalid authority node UUID");
+        } else {
+            authority = session->server->federation_node_id;
+        }
+        if (!qihse_federation_namespace_register(session->server->store, qihse_auth_get_user(0),
+                                                  name, cc, &authority,
+                                                  &session->server->federation_node_id)) {
+            return qihse_resp_error(session, "ERR cannot register namespace");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "NS.UNREGISTER")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.ns.unregister");
+        char name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(name, request->argv[2].data, nl); name[nl] = '\0';
+        if (!qihse_federation_namespace_unregister(session->server->store, qihse_auth_get_user(0), name)) {
+            return qihse_resp_error(session, "ERR namespace not found");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "NS.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.ns.list");
+        if (!session->server->store) return qihse_resp_error(session, "ERR no store");
+        /* Count first, then emit. */
+        size_t count = 0;
+        qihse_federation_namespace_foreach(session->server->store, qihse_auth_get_user(0),
+                                           qihse_fed_ns_count_cb, &count);
+        if (!qihse_resp_array(session, count * 4u)) return false;
+        qihse_federation_namespace_foreach(session->server->store, qihse_auth_get_user(0),
+                                           qihse_fed_ns_list_cb, session);
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "NS.WRITABLE")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.ns.writable");
+        char name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(name, request->argv[2].data, nl); name[nl] = '\0';
+        qihse_federation_namespace_t ns;
+        if (!qihse_federation_namespace_lookup(session->server->store, qihse_auth_get_user(0), name, &ns)) {
+            return qihse_resp_error(session, "ERR namespace not found");
+        }
+        pthread_mutex_lock(&session->server->federation_lock);
+        qihse_federation_state_t s = session->server->federation_status.federation_state;
+        pthread_mutex_unlock(&session->server->federation_lock);
+        bool w = qihse_federation_namespace_writable(&ns, s, &session->server->federation_node_id);
+        return qihse_resp_integer(session, w ? 1 : 0);
+    }
+
+    return qihse_resp_error(session, "ERR unknown FEDERATION subcommand");
+}
+
+/* ---------------------------------------------------------------------------
  * FABRIC.* — heterogeneous compute dispatch
  * FABRIC.CAPS    — cluster capability map (system domain only)
  * FABRIC.SUBMIT <min_isa> <payload> — dispatch a job to the best-fit node
@@ -5310,6 +5447,9 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     }
     if (qihse_resp_command_is(request, "GROUP") && request->argc >= 2) {
         return qihse_resp_handle_group(session, request);
+    }
+    if (qihse_resp_command_is(request, "FEDERATION") && request->argc >= 2) {
+        return qihse_resp_handle_federation(session, request);
     }
     if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
         if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
@@ -5751,7 +5891,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
-        pthread_mutex_init(&server->group_lock, NULL) != 0) {
+        pthread_mutex_init(&server->group_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->federation_lock, NULL) != 0) {
         free(server);
         errno = ENOMEM;
         return NULL;
@@ -5762,6 +5903,13 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->owns_topology = true;
     }
     qihse_hlc_init(&server->group_clock);
+    /* F1: derive a stable federation UUID from the configured cluster node id
+     * (or a default seed) and initialize the federation status snapshot. */
+    {
+        const char* seed = supplied->node_id ? supplied->node_id : "qihse-federation-default";
+        qihse_uuid_from_seed(seed, strlen(seed), &server->federation_node_id);
+        qihse_federation_status_init(&server->federation_status, &server->federation_node_id);
+    }
     if (!server->topology) {
         qihse_resp_server_destroy(server);
         return NULL;
@@ -6036,6 +6184,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_cond_destroy(&server->clients_drained);
     pthread_mutex_destroy(&server->state_lock);
     pthread_mutex_destroy(&server->group_lock);
+    pthread_mutex_destroy(&server->federation_lock);
     free(server);
 }
 
