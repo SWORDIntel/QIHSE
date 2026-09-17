@@ -9,6 +9,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1331,4 +1332,536 @@ size_t qihse_federation_sync_plan(const qihse_federation_manifest_t* local,
         }
     }
     return count;
+}
+
+/* ── F4: Native CAS (plan §7.2) ────────────────────────────────────────── */
+
+#include <pthread.h>
+
+static pthread_mutex_t g_federation_cas_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void fedobj_key(const char* ns, const char* resource, char* out, size_t cap) {
+    snprintf(out, cap, "fedobj:%s:%s", ns, resource);
+}
+
+bool qihse_federation_object_get(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t* out_generation,
+                                 char* out_value, size_t out_value_cap) {
+    if (!store_void || !user_void || !namespace_name || !resource_id || !out_value) return false;
+    char key[256];
+    fedobj_key(namespace_name, resource_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!blob) return false;
+    /* Format: "<generation>\t<value>" */
+    char* tab = strchr(blob, '\t');
+    if (!tab) { free(blob); return false; }
+    if (out_generation) *out_generation = strtoull(blob, NULL, 10);
+    size_t vlen = strlen(tab + 1);
+    if (vlen >= out_value_cap) vlen = out_value_cap - 1u;
+    memcpy(out_value, tab + 1, vlen);
+    out_value[vlen] = '\0';
+    free(blob);
+    return true;
+}
+
+bool qihse_federation_object_cas(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t expected_generation,
+                                 const char* new_value,
+                                 qihse_federation_cas_result_t* result) {
+    if (!store_void || !user_void || !namespace_name || !resource_id || !new_value) return false;
+    if (result) memset(result, 0, sizeof(*result));
+
+    pthread_mutex_lock(&g_federation_cas_lock);
+
+    char key[256];
+    fedobj_key(namespace_name, resource_id, key, sizeof(key));
+    char* existing = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+
+    uint64_t current_gen = 0;
+    if (existing) {
+        current_gen = strtoull(existing, NULL, 10);
+        free(existing);
+    }
+
+    if (result) result->old_generation = current_gen;
+
+    if (existing && current_gen != expected_generation) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        if (result) result->swapped = false;
+        return true; /* CAS failed but the call itself succeeded */
+    }
+
+    /* If the key doesn't exist, expected_generation must be 0. */
+    if (!existing && expected_generation != 0) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        if (result) result->swapped = false;
+        return true;
+    }
+
+    uint64_t new_gen = current_gen + 1;
+    char blob[4096];
+    snprintf(blob, sizeof(blob), "%llu\t%s", (unsigned long long)new_gen, new_value);
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                                (qihse_user_t*)user_void);
+
+    pthread_mutex_unlock(&g_federation_cas_lock);
+
+    if (!ok) return false;
+    if (result) {
+        result->swapped = true;
+        result->new_generation = new_gen;
+    }
+    return true;
+}
+
+/* ── F4: Fencing epochs (plan §7.3) ────────────────────────────────────── */
+
+static void fedepoch_key(const qihse_uuid_t* node_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(node_id, id_str);
+    snprintf(out, cap, "fedepoch:%s", id_str);
+}
+
+uint64_t qihse_federation_epoch_current(void* store_void, void* user_void,
+                                        const qihse_uuid_t* node_id) {
+    if (!store_void || !user_void || !node_id) return 0;
+    char key[128];
+    fedepoch_key(node_id, key, sizeof(key));
+    char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!val) return 0;
+    uint64_t epoch = strtoull(val, NULL, 10);
+    free(val);
+    return epoch;
+}
+
+uint64_t qihse_federation_epoch_next(void* store_void, void* user_void,
+                                      const qihse_uuid_t* node_id) {
+    if (!store_void || !user_void || !node_id) return 0;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    char key[128];
+    fedepoch_key(node_id, key, sizeof(key));
+    char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    uint64_t current = val ? strtoull(val, NULL, 10) : 0;
+    free(val);
+    uint64_t next = current + 1;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)next);
+    qihse_kv_set_user((qihse_kv_store_t*)store_void, key, buf, 0, 0, (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return next;
+}
+
+/* ── F4: Lease primitive (plan §14) ────────────────────────────────────── */
+
+const char* qihse_lease_state_name(qihse_lease_state_t state) {
+    switch (state) {
+        case QIHSE_LEASE_FREE:     return "free";
+        case QIHSE_LEASE_GRANTED:   return "granted";
+        case QIHSE_LEASE_EXPIRED:  return "expired";
+        case QIHSE_LEASE_RELEASED: return "released";
+    }
+    return "unknown";
+}
+
+static void lease_kv_key(const qihse_uuid_t* lease_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(lease_id, id_str);
+    snprintf(out, cap, QIHSE_FEDERATION_LEASE_PREFIX "%s", id_str);
+}
+
+static void lease_encode(const qihse_federation_lease_t* l, char* out, size_t cap) {
+    char lid[33], oid[33], rid[33], iss[33];
+    uuid_hex(&l->lease_id, lid);
+    uuid_hex(&l->owner_node, oid);
+    uuid_hex(&l->request_id, rid);
+    uuid_hex(&l->issuer, iss);
+    snprintf(out, cap, "%s\t%s\t%s\t%llu\t%llu\t%u\t%llu\t%llu\t%s\t%s",
+             lid, oid, l->resource_id,
+             (unsigned long long)l->fencing_epoch,
+             (unsigned long long)l->generation,
+             (unsigned)l->state,
+             (unsigned long long)l->issued_hlc_physical,
+             (unsigned long long)l->expires_hlc_physical,
+             rid, iss);
+}
+
+static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+    char lid[33], oid[33], rid[33], iss[33];
+    char resource[64];
+    unsigned state_u = 0;
+    unsigned long long fence = 0, gen = 0, issued = 0, expires = 0;
+    int n = sscanf(blob, "%32[^\t]\t%32[^\t]\t%63[^\t]\t%llu\t%llu\t%u\t%llu\t%llu\t%32[^\t]\t%32[^\t]",
+                   lid, oid, resource, &fence, &gen, &state_u, &issued, &expires, rid, iss);
+    if (n < 8) return false;
+    uuid_from_hex(lid, &out->lease_id);
+    uuid_from_hex(oid, &out->owner_node);
+    snprintf(out->resource_id, sizeof(out->resource_id), "%s", resource);
+    out->fencing_epoch = (uint64_t)fence;
+    out->generation = (uint64_t)gen;
+    out->state = (qihse_lease_state_t)state_u;
+    out->issued_hlc_physical = (uint64_t)issued;
+    out->expires_hlc_physical = (uint64_t)expires;
+    if (n >= 9) uuid_from_hex(rid, &out->request_id);
+    if (n >= 10) uuid_from_hex(iss, &out->issuer);
+    return true;
+}
+
+bool qihse_federation_lease_acquire(void* store_void, void* user_void,
+                                   const qihse_federation_lease_t* request,
+                                   qihse_federation_lease_t* out) {
+    if (!store_void || !user_void || !request || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    pthread_mutex_lock(&g_federation_cas_lock);
+
+    /* Idempotency: a repeated request_id returns the previously issued lease
+     * rather than minting a new one. */
+    char req_key[128];
+    {
+        char rid_str[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&request->request_id, rid_str);
+        snprintf(req_key, sizeof(req_key), QIHSE_FEDERATION_LEASE_REQUEST_PREFIX "%s", rid_str);
+    }
+    char* prior_id = qihse_kv_get_user((qihse_kv_store_t*)store_void, req_key,
+                                       (qihse_user_t*)user_void);
+    if (prior_id) {
+        qihse_uuid_t prior;
+        bool have_prior = qihse_uuid_parse(prior_id, &prior);
+        free(prior_id);
+        if (have_prior) {
+            char pkey[128];
+            lease_kv_key(&prior, pkey, sizeof(pkey));
+            char* pblob = qihse_kv_get_user((qihse_kv_store_t*)store_void, pkey,
+                                            (qihse_user_t*)user_void);
+            if (pblob) {
+                bool decoded = lease_decode(pblob, out);
+                free(pblob);
+                if (decoded) {
+                    pthread_mutex_unlock(&g_federation_cas_lock);
+                    return true;
+                }
+            }
+        }
+    }
+
+    /* Resource exclusivity with a monotonic fencing high-water mark.  The
+     * resource record persists after release so a stale holder at a lower
+     * epoch can never re-acquire the resource. */
+    char res_key[192];
+    snprintf(res_key, sizeof(res_key), QIHSE_FEDERATION_LEASE_RESOURCE_PREFIX "%s:%s",
+             request->namespace_name, request->resource_id);
+    char* res_val = qihse_kv_get_user((qihse_kv_store_t*)store_void, res_key,
+                                      (qihse_user_t*)user_void);
+    if (res_val) {
+        unsigned long long high_epoch = 0;
+        char holder_str[QIHSE_UUID_STR_LEN + 1u];
+        holder_str[0] = '\0';
+        if (sscanf(res_val, "%40[^\t]\t%llu", holder_str, &high_epoch) >= 1) {
+            if ((uint64_t)high_epoch >= request->fencing_epoch) {
+                free(res_val);
+                pthread_mutex_unlock(&g_federation_cas_lock);
+                return false; /* stale fencing epoch — refuse */
+            }
+        }
+        free(res_val);
+    }
+
+    /* Issue the lease. */
+    *out = *request;
+    out->state = QIHSE_LEASE_GRANTED;
+    out->generation = request->generation + 1u;
+    char key[128];
+    lease_kv_key(&out->lease_id, key, sizeof(key));
+    char blob[1024];
+    lease_encode(out, blob, sizeof(blob));
+    if (!qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                           (qihse_user_t*)user_void)) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return false;
+    }
+
+    /* Publish the fencing high-water mark for the resource. */
+    char lid_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(&out->lease_id, lid_str);
+    char res_val_new[128];
+    snprintf(res_val_new, sizeof(res_val_new), "%s\t%llu", lid_str,
+             (unsigned long long)out->fencing_epoch);
+    qihse_kv_set_user((qihse_kv_store_t*)store_void, res_key, res_val_new, 0, 0,
+                      (qihse_user_t*)user_void);
+
+    /* Record the request index for idempotent retries. */
+    qihse_kv_set_user((qihse_kv_store_t*)store_void, req_key, lid_str, 0, 0,
+                      (qihse_user_t*)user_void);
+
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return true;
+}
+
+bool qihse_federation_lease_renew(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 uint64_t new_expires_hlc_physical,
+                                 qihse_federation_lease_t* out) {
+    if (!store_void || !user_void || !lease_id || !out) return false;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    char key[128];
+    lease_kv_key(lease_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!blob) { pthread_mutex_unlock(&g_federation_cas_lock); return false; }
+    if (!lease_decode(blob, out)) { free(blob); pthread_mutex_unlock(&g_federation_cas_lock); return false; }
+    free(blob);
+    if (out->state != QIHSE_LEASE_GRANTED) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return false;
+    }
+    out->expires_hlc_physical = new_expires_hlc_physical;
+    char new_blob[1024];
+    lease_encode(out, new_blob, sizeof(new_blob));
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
+                                (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return ok;
+}
+
+bool qihse_federation_lease_release(void* store_void, void* user_void,
+                                   const qihse_uuid_t* lease_id) {
+    if (!store_void || !user_void || !lease_id) return false;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    char key[128];
+    lease_kv_key(lease_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!blob) { pthread_mutex_unlock(&g_federation_cas_lock); return false; }
+    qihse_federation_lease_t l;
+    if (!lease_decode(blob, &l)) { free(blob); pthread_mutex_unlock(&g_federation_cas_lock); return false; }
+    free(blob);
+    if (l.state == QIHSE_LEASE_RELEASED) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return true; /* idempotent */
+    }
+    l.state = QIHSE_LEASE_RELEASED;
+    char new_blob[1024];
+    lease_encode(&l, new_blob, sizeof(new_blob));
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
+                                (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return ok;
+}
+
+bool qihse_federation_lease_read(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 qihse_federation_lease_t* out) {
+    if (!store_void || !user_void || !lease_id || !out) return false;
+    char key[128];
+    lease_kv_key(lease_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = lease_decode(blob, out);
+    free(blob);
+    return ok;
+}
+
+/* ── F4: Replication groups (plan §15) ─────────────────────────────────── */
+
+static void group_kv_key(const char* group_id, char* out, size_t cap) {
+    snprintf(out, cap, QIHSE_FEDERATION_GROUP_PREFIX "%s", group_id);
+}
+
+static void group_encode(const qihse_federation_group_t* g, char* out, size_t cap) {
+    size_t off = 0;
+    off += (size_t)snprintf(out + off, cap - off, "%s\t%llu\t%u\t%zu",
+                           g->group_id, (unsigned long long)g->term,
+                           (unsigned)g->consistency, g->member_count);
+    for (size_t i = 0; i < g->member_count && off < cap; i++) {
+        char mid[33];
+        uuid_hex(&g->members[i].member_id, mid);
+        off += (size_t)snprintf(out + off, cap - off, "\t%s\t%d\t%d",
+                               mid, g->members[i].is_voter ? 1 : 0,
+                               g->members[i].is_witness ? 1 : 0);
+    }
+}
+
+static bool group_decode(const char* blob, qihse_federation_group_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+    char gid[64];
+    unsigned long long term = 0;
+    unsigned cons = 0;
+    unsigned long long mcount = 0;
+    int n = sscanf(blob, "%63[^\t]\t%llu\t%u\t%llu",
+                   gid, &term, &cons, &mcount);
+    if (n < 4) return false;
+    snprintf(out->group_id, sizeof(out->group_id), "%s", gid);
+    out->term = (uint64_t)term;
+    out->consistency = (qihse_consistency_class_t)cons;
+    out->member_count = (size_t)mcount;
+    if (out->member_count > QIHSE_FEDERATION_GROUP_MAX_MEMBERS) return false;
+    /* Parse members from the remaining tabs. */
+    const char* p = blob;
+    /* Skip past the first 4 fields. */
+    for (int i = 0; i < 4; i++) {
+        p = strchr(p, '\t');
+        if (!p) return n >= 4; /* no members is valid */
+        p++;
+    }
+    for (size_t i = 0; i < out->member_count && i < QIHSE_FEDERATION_GROUP_MAX_MEMBERS; i++) {
+        char mid[33];
+        int voter = 0, witness = 0;
+        int mn = sscanf(p, "%32[^\t]\t%d\t%d", mid, &voter, &witness);
+        if (mn < 1) break;
+        uuid_from_hex(mid, &out->members[i].member_id);
+        out->members[i].is_voter = voter != 0;
+        out->members[i].is_witness = witness != 0;
+        /* Advance past member_id, voter, witness. */
+        for (int j = 0; j < 3; j++) {
+            p = strchr(p, '\t');
+            if (!p) return true;
+            p++;
+        }
+    }
+    return true;
+}
+
+bool qihse_federation_group_create(void* store_void, void* user_void,
+                                   const qihse_federation_group_t* group) {
+    if (!store_void || !user_void || !group) return false;
+    char key[128];
+    group_kv_key(group->group_id, key, sizeof(key));
+    char* existing = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (existing) { free(existing); return false; }
+    char blob[4096];
+    group_encode(group, blob, sizeof(blob));
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+bool qihse_federation_group_lookup(void* store_void, void* user_void,
+                                   const char* group_id,
+                                   qihse_federation_group_t* out) {
+    if (!store_void || !user_void || !group_id || !out) return false;
+    char key[128];
+    group_kv_key(group_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = group_decode(blob, out);
+    free(blob);
+    return ok;
+}
+
+bool qihse_federation_group_add_member(void* store_void, void* user_void,
+                                       const char* group_id,
+                                       const qihse_federation_group_member_t* member) {
+    if (!store_void || !user_void || !group_id || !member) return false;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    qihse_federation_group_t g;
+    if (!qihse_federation_group_lookup(store_void, user_void, group_id, &g)) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return false;
+    }
+    /* Check if member already exists; if so, update. */
+    bool found = false;
+    for (size_t i = 0; i < g.member_count; i++) {
+        if (qihse_uuid_equal(&g.members[i].member_id, &member->member_id)) {
+            g.members[i] = *member;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        if (g.member_count >= QIHSE_FEDERATION_GROUP_MAX_MEMBERS) {
+            pthread_mutex_unlock(&g_federation_cas_lock);
+            return false;
+        }
+        g.members[g.member_count++] = *member;
+    }
+    char key[128];
+    group_kv_key(group_id, key, sizeof(key));
+    char blob[4096];
+    group_encode(&g, blob, sizeof(blob));
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                                (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return ok;
+}
+
+bool qihse_federation_group_remove_member(void* store_void, void* user_void,
+                                          const char* group_id,
+                                          const qihse_uuid_t* member_id) {
+    if (!store_void || !user_void || !group_id || !member_id) return false;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    qihse_federation_group_t g;
+    if (!qihse_federation_group_lookup(store_void, user_void, group_id, &g)) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return false;
+    }
+    bool found = false;
+    for (size_t i = 0; i < g.member_count; i++) {
+        if (qihse_uuid_equal(&g.members[i].member_id, member_id)) {
+            /* Shift remaining members down. */
+            for (size_t j = i; j + 1 < g.member_count; j++)
+                g.members[j] = g.members[j + 1];
+            g.member_count--;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return false;
+    }
+    char key[128];
+    group_kv_key(group_id, key, sizeof(key));
+    char blob[4096];
+    group_encode(&g, blob, sizeof(blob));
+    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                                (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return ok;
+}
+
+uint64_t qihse_federation_group_advance_term(void* store_void, void* user_void,
+                                              const char* group_id) {
+    if (!store_void || !user_void || !group_id) return 0;
+    pthread_mutex_lock(&g_federation_cas_lock);
+    qihse_federation_group_t g;
+    if (!qihse_federation_group_lookup(store_void, user_void, group_id, &g)) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return 0;
+    }
+    g.term++;
+    char key[128];
+    group_kv_key(group_id, key, sizeof(key));
+    char blob[4096];
+    group_encode(&g, blob, sizeof(blob));
+    qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                      (qihse_user_t*)user_void);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return g.term;
+}
+
+typedef struct {
+    qihse_federation_group_cb cb;
+    void* user_data;
+} group_iter_ctx_t;
+
+static bool group_iter_cb(const char* key, const char* value, void* user_data) {
+    group_iter_ctx_t* ctx = (group_iter_ctx_t*)user_data;
+    if (strncmp(key, QIHSE_FEDERATION_GROUP_PREFIX,
+                strlen(QIHSE_FEDERATION_GROUP_PREFIX)) != 0) return true;
+    qihse_federation_group_t g;
+    if (!group_decode(value, &g)) return true;
+    return ctx->cb(&g, ctx->user_data);
+}
+
+void qihse_federation_group_foreach(void* store_void, void* user_void,
+                                    qihse_federation_group_cb cb,
+                                    void* user_data) {
+    if (!store_void || !cb) return;
+    group_iter_ctx_t ctx = { cb, user_data };
+    qihse_kv_foreach_user((qihse_kv_store_t*)store_void, (qihse_user_t*)user_void,
+                          group_iter_cb, &ctx);
 }

@@ -5181,6 +5181,20 @@ bool qihse_resp_conflict_list_cb(const qihse_federation_conflict_t* c, void* ud)
     return true;
 }
 
+/* F4: callback for FEDERATION.GROUP.LIST — collects group ids. */
+struct qihse_resp_fedgroup_list_ctx {
+    char ids[32][64];
+    size_t count;
+};
+
+static bool qihse_resp_fedgroup_list_cb(const qihse_federation_group_t* g, void* ud) {
+    struct qihse_resp_fedgroup_list_ctx* ctx = (struct qihse_resp_fedgroup_list_ctx*)ud;
+    if (ctx->count >= 32) return false;
+    snprintf(ctx->ids[ctx->count], sizeof(ctx->ids[ctx->count]), "%s", g->group_id);
+    ctx->count++;
+    return true;
+}
+
 /* F2: journal replay callbacks for FEDERATION.EVENT.REPLAY. */
 static bool qihse_fed_replay_count_cb(const qihse_federation_event_t* event,
                                      const uint8_t* payload, size_t payload_len,
@@ -5521,6 +5535,289 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (!qihse_uuid_parse(resolver_str, &resolver)) return qihse_resp_error(session, "ERR invalid resolver id");
         if (!qihse_federation_conflict_resolve(session->server->store, session->user, &cid, &resolver)) {
             return qihse_resp_error(session, "ERR conflict resolve failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    /* ── F4: Strong namespace ─────────────────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "EPOCH.NEXT")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.epoch.next");
+        uint64_t e = qihse_federation_epoch_next(session->server->store, session->user,
+                                                 &session->server->federation_node_id);
+        if (e == 0) return qihse_resp_error(session, "ERR epoch advance failed");
+        return qihse_resp_integer(session, (int64_t)e);
+    }
+
+    if (qihse_resp_arg_equal(sub, "EPOCH.CURRENT")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.epoch.current");
+        uint64_t e = qihse_federation_epoch_current(session->server->store, session->user,
+                                                    &session->server->federation_node_id);
+        return qihse_resp_integer(session, (int64_t)e);
+    }
+
+    if (qihse_resp_arg_equal(sub, "OBJECT.CAS")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.OBJECT.CAS <namespace> <resource_id> <value> [expected_generation]");
+        }
+        char ns[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(ns, request->argv[2].data, nl); ns[nl] = '\0';
+        char rid[64];
+        size_t rl = request->argv[3].len;
+        if (rl == 0 || rl >= sizeof(rid)) return qihse_resp_error(session, "ERR invalid resource id");
+        memcpy(rid, request->argv[3].data, rl); rid[rl] = '\0';
+        char value[512];
+        size_t vl = request->argv[4].len;
+        if (vl >= sizeof(value)) return qihse_resp_error(session, "ERR value too long");
+        memcpy(value, request->argv[4].data, vl); value[vl] = '\0';
+        uint64_t expected = 0;
+        if (request->argc == 6) {
+            char gen_str[32];
+            size_t gl = request->argv[5].len;
+            if (gl == 0 || gl >= sizeof(gen_str)) return qihse_resp_error(session, "ERR invalid generation");
+            memcpy(gen_str, request->argv[5].data, gl); gen_str[gl] = '\0';
+            expected = (uint64_t)strtoull(gen_str, NULL, 10);
+        }
+        qihse_federation_cas_result_t r;
+        if (!qihse_federation_object_cas(session->server->store, session->user, ns, rid,
+                                        expected, value, &r)) {
+            return qihse_resp_error(session, "ERR cas failed");
+        }
+        return qihse_resp_integer(session, r.swapped ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(sub, "OBJECT.GET")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.object.get");
+        char ns[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(ns, request->argv[2].data, nl); ns[nl] = '\0';
+        char rid[64];
+        size_t rl = request->argv[3].len;
+        if (rl == 0 || rl >= sizeof(rid)) return qihse_resp_error(session, "ERR invalid resource id");
+        memcpy(rid, request->argv[3].data, rl); rid[rl] = '\0';
+        uint64_t gen = 0;
+        char value[512];
+        if (!qihse_federation_object_get(session->server->store, session->user, ns, rid,
+                                        &gen, value, sizeof(value))) {
+            return qihse_resp_error(session, "ERR object not found");
+        }
+        if (!qihse_resp_array(session, 2)) return false;
+        if (!qihse_resp_integer(session, (int64_t)gen)) return false;
+        if (!qihse_resp_bulk_text(session, value)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.CREATE")) {
+        if (request->argc < 3 || request->argc > 4) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.GROUP.CREATE <group_id> [consistency]");
+        }
+        qihse_federation_group_t g;
+        memset(&g, 0, sizeof(g));
+        size_t gl = request->argv[2].len;
+        if (gl == 0 || gl >= sizeof(g.group_id)) return qihse_resp_error(session, "ERR invalid group id");
+        memcpy(g.group_id, request->argv[2].data, gl); g.group_id[gl] = '\0';
+        g.consistency = QIHSE_CONSISTENCY_QUORUM;
+        if (request->argc == 4) {
+            char cons[32];
+            size_t cl = request->argv[3].len;
+            if (cl == 0 || cl >= sizeof(cons)) return qihse_resp_error(session, "ERR invalid consistency");
+            memcpy(cons, request->argv[3].data, cl); cons[cl] = '\0';
+            qihse_consistency_class_t cc;
+            if (qihse_consistency_class_parse(cons, &cc)) g.consistency = cc;
+        }
+        if (!qihse_federation_group_create(session->server->store, session->user, &g)) {
+            return qihse_resp_error(session, "ERR group create failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.ADVANCE")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.group.advance");
+        char gid[64];
+        size_t gl = request->argv[2].len;
+        if (gl == 0 || gl >= sizeof(gid)) return qihse_resp_error(session, "ERR invalid group id");
+        memcpy(gid, request->argv[2].data, gl); gid[gl] = '\0';
+        uint64_t term = qihse_federation_group_advance_term(session->server->store, session->user, gid);
+        if (term == 0) return qihse_resp_error(session, "ERR group advance failed");
+        return qihse_resp_integer(session, (int64_t)term);
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.ADD")) {
+        if (request->argc < 4 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.GROUP.ADD <group_id> <member_uuid> [voter] [witness]");
+        }
+        char gid[64];
+        size_t gl = request->argv[2].len;
+        if (gl == 0 || gl >= sizeof(gid)) return qihse_resp_error(session, "ERR invalid group id");
+        memcpy(gid, request->argv[2].data, gl); gid[gl] = '\0';
+        char mid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t ml = request->argv[3].len;
+        if (ml == 0 || ml >= sizeof(mid_str)) return qihse_resp_error(session, "ERR invalid member id");
+        memcpy(mid_str, request->argv[3].data, ml); mid_str[ml] = '\0';
+        qihse_federation_group_member_t m;
+        memset(&m, 0, sizeof(m));
+        if (!qihse_uuid_parse(mid_str, &m.member_id)) return qihse_resp_error(session, "ERR invalid member id");
+        m.is_voter = true;
+        if (request->argc >= 5) {
+            m.is_voter = request->argv[4].len == 1u && request->argv[4].data[0] == '1';
+        }
+        if (request->argc >= 6) {
+            m.is_witness = request->argv[5].len == 1u && request->argv[5].data[0] == '1';
+        }
+        if (!qihse_federation_group_add_member(session->server->store, session->user, gid, &m)) {
+            return qihse_resp_error(session, "ERR group add failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.REMOVE")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.group.remove");
+        char gid[64];
+        size_t gl = request->argv[2].len;
+        if (gl == 0 || gl >= sizeof(gid)) return qihse_resp_error(session, "ERR invalid group id");
+        memcpy(gid, request->argv[2].data, gl); gid[gl] = '\0';
+        char mid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t ml = request->argv[3].len;
+        if (ml == 0 || ml >= sizeof(mid_str)) return qihse_resp_error(session, "ERR invalid member id");
+        memcpy(mid_str, request->argv[3].data, ml); mid_str[ml] = '\0';
+        qihse_uuid_t mid;
+        if (!qihse_uuid_parse(mid_str, &mid)) return qihse_resp_error(session, "ERR invalid member id");
+        if (!qihse_federation_group_remove_member(session->server->store, session->user, gid, &mid)) {
+            return qihse_resp_error(session, "ERR group remove failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.SHOW")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.group.show");
+        char gid[64];
+        size_t gl = request->argv[2].len;
+        if (gl == 0 || gl >= sizeof(gid)) return qihse_resp_error(session, "ERR invalid group id");
+        memcpy(gid, request->argv[2].data, gl); gid[gl] = '\0';
+        qihse_federation_group_t g;
+        if (!qihse_federation_group_lookup(session->server->store, session->user, gid, &g)) {
+            return qihse_resp_error(session, "ERR group not found");
+        }
+        if (!qihse_resp_array(session, 4 + g.member_count * 3)) return false;
+        if (!qihse_resp_bulk_text(session, g.group_id)) return false;
+        if (!qihse_resp_integer(session, (int64_t)g.term)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_consistency_class_name(g.consistency))) return false;
+        if (!qihse_resp_integer(session, (int64_t)g.member_count)) return false;
+        for (size_t i = 0; i < g.member_count; i++) {
+            char mid[QIHSE_UUID_STR_LEN + 1u];
+            qihse_uuid_format(&g.members[i].member_id, mid);
+            if (!qihse_resp_bulk_text(session, mid)) return false;
+            if (!qihse_resp_integer(session, g.members[i].is_voter ? 1 : 0)) return false;
+            if (!qihse_resp_integer(session, g.members[i].is_witness ? 1 : 0)) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "GROUP.LIST")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.group.list");
+        struct qihse_resp_fedgroup_list_ctx ctx;
+        ctx.count = 0;
+        qihse_federation_group_foreach(session->server->store, session->user,
+                                       qihse_resp_fedgroup_list_cb, &ctx);
+        if (!qihse_resp_array(session, ctx.count)) return false;
+        for (size_t i = 0; i < ctx.count; i++) {
+            if (!qihse_resp_bulk_text(session, ctx.ids[i])) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "LEASE.ACQUIRE")) {
+        if (request->argc < 5 || request->argc > 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.LEASE.ACQUIRE <namespace> <resource_id> <fencing_epoch> [expires_ms]");
+        }
+        qihse_federation_lease_t req;
+        memset(&req, 0, sizeof(req));
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl > QIHSE_FEDERATION_NS_NAME_MAX) return qihse_resp_error(session, "ERR invalid namespace name");
+        memcpy(req.namespace_name, request->argv[2].data, nl); req.namespace_name[nl] = '\0';
+        size_t rl = request->argv[3].len;
+        if (rl == 0 || rl >= sizeof(req.resource_id)) return qihse_resp_error(session, "ERR invalid resource id");
+        memcpy(req.resource_id, request->argv[3].data, rl); req.resource_id[rl] = '\0';
+        char epoch_str[32];
+        size_t el = request->argv[4].len;
+        if (el == 0 || el >= sizeof(epoch_str)) return qihse_resp_error(session, "ERR invalid fencing epoch");
+        memcpy(epoch_str, request->argv[4].data, el); epoch_str[el] = '\0';
+        req.fencing_epoch = (uint64_t)strtoull(epoch_str, NULL, 10);
+        if (request->argc == 6) {
+            char exp_str[32];
+            size_t xl = request->argv[5].len;
+            if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid expiry");
+            memcpy(exp_str, request->argv[5].data, xl); exp_str[xl] = '\0';
+            req.expires_hlc_physical = (uint64_t)strtoull(exp_str, NULL, 10);
+        }
+        req.owner_node = session->server->federation_node_id;
+        req.issuer = session->server->federation_node_id;
+        if (!qihse_uuid_generate(&req.lease_id) || !qihse_uuid_generate(&req.request_id)) {
+            return qihse_resp_error(session, "ERR could not generate lease identity");
+        }
+        req.issued_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        qihse_federation_lease_t out;
+        if (!qihse_federation_lease_acquire(session->server->store, session->user, &req, &out)) {
+            return qihse_resp_error(session, "ERR lease acquire failed");
+        }
+        char lid[QIHSE_UUID_STR_LEN + 1u];
+        qihse_uuid_format(&out.lease_id, lid);
+        return qihse_resp_bulk_text(session, lid);
+    }
+
+    if (qihse_resp_arg_equal(sub, "LEASE.READ")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.lease.read");
+        char lid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t ll = request->argv[2].len;
+        if (ll == 0 || ll >= sizeof(lid_str)) return qihse_resp_error(session, "ERR invalid lease id");
+        memcpy(lid_str, request->argv[2].data, ll); lid_str[ll] = '\0';
+        qihse_uuid_t lid;
+        if (!qihse_uuid_parse(lid_str, &lid)) return qihse_resp_error(session, "ERR invalid lease id");
+        qihse_federation_lease_t l;
+        if (!qihse_federation_lease_read(session->server->store, session->user, &lid, &l)) {
+            return qihse_resp_error(session, "ERR lease not found");
+        }
+        if (!qihse_resp_array(session, 5)) return false;
+        if (!qihse_resp_bulk_text(session, l.resource_id)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_lease_state_name(l.state))) return false;
+        if (!qihse_resp_integer(session, (int64_t)l.fencing_epoch)) return false;
+        if (!qihse_resp_integer(session, (int64_t)l.generation)) return false;
+        if (!qihse_resp_integer(session, (int64_t)l.expires_hlc_physical)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "LEASE.RENEW")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.lease.renew");
+        char lid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t ll = request->argv[2].len;
+        if (ll == 0 || ll >= sizeof(lid_str)) return qihse_resp_error(session, "ERR invalid lease id");
+        memcpy(lid_str, request->argv[2].data, ll); lid_str[ll] = '\0';
+        qihse_uuid_t lid;
+        if (!qihse_uuid_parse(lid_str, &lid)) return qihse_resp_error(session, "ERR invalid lease id");
+        char exp_str[32];
+        size_t xl = request->argv[3].len;
+        if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid expiry");
+        memcpy(exp_str, request->argv[3].data, xl); exp_str[xl] = '\0';
+        uint64_t expires = (uint64_t)strtoull(exp_str, NULL, 10);
+        qihse_federation_lease_t out;
+        if (!qihse_federation_lease_renew(session->server->store, session->user, &lid, expires, &out)) {
+            return qihse_resp_error(session, "ERR lease renew failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "LEASE.RELEASE")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.lease.release");
+        char lid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t ll = request->argv[2].len;
+        if (ll == 0 || ll >= sizeof(lid_str)) return qihse_resp_error(session, "ERR invalid lease id");
+        memcpy(lid_str, request->argv[2].data, ll); lid_str[ll] = '\0';
+        qihse_uuid_t lid;
+        if (!qihse_uuid_parse(lid_str, &lid)) return qihse_resp_error(session, "ERR invalid lease id");
+        if (!qihse_federation_lease_release(session->server->store, session->user, &lid)) {
+            return qihse_resp_error(session, "ERR lease release failed");
         }
         return qihse_resp_simple(session, "OK");
     }

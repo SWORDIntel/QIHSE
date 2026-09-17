@@ -469,6 +469,165 @@ size_t qihse_federation_sync_plan(const qihse_federation_manifest_t* local,
                                  qihse_federation_sync_range_t* out_ranges,
                                  size_t out_cap);
 
+/* ────────────────────────────────────────────────────────────────────────
+ * F4 — Strong namespace (plan §7.2, §7.3, §14, §15, §16).
+ *
+ * Strong namespaces require:
+ *   - native compare-and-swap (CAS) on generation-tagged objects;
+ *   - monotonic, non-reusable fencing epochs;
+ *   - a lease primitive with server-side expiry;
+ *   - scoped replication groups (not a monolithic federation quorum).
+ *
+ * Consensus is NOT implemented as Raft in F4 — the plan explicitly forbids
+ * labeling a component Raft without full Raft safety mechanics.  F4 provides
+ * the data structures and local primitives; actual consensus is a future
+ * stage.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Native CAS (plan §7.2) ─────────────────────────────────────────────── */
+
+/* A CAS result tells the caller whether the swap succeeded, what the old
+ * generation was, and what the new generation is. */
+typedef struct {
+    bool swapped;           /* true if the CAS succeeded */
+    uint64_t old_generation;/* generation observed before the CAS */
+    uint64_t new_generation;/* generation after the CAS (old+1 on success) */
+} qihse_federation_cas_result_t;
+
+/* Atomically compare-and-swap a generation-tagged object value.
+ *
+ * The object is stored under "fedobj:<namespace>:<resource_id>" and its
+ * value format is "<generation>\t<value>".  If expected_generation matches
+ * the stored generation, the value is replaced and the generation is
+ * incremented.  Otherwise the swap fails and the current generation is
+ * returned in old_generation.
+ *
+ * Every CAS takes an explicit authenticated user (AGENTS.md invariant 1).
+ * The CAS is atomic under the federation CAS lock. */
+bool qihse_federation_object_cas(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t expected_generation,
+                                 const char* new_value,
+                                 qihse_federation_cas_result_t* result);
+
+/* Read a generation-tagged object. Returns false if not found. */
+bool qihse_federation_object_get(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t* out_generation,
+                                 char* out_value, size_t out_value_cap);
+
+/* ── Fencing epochs (plan §7.3) ─────────────────────────────────────────── */
+
+/* Fencing epochs are monotonic and non-reusable.  Each node maintains a
+ * persistent counter under "fedepoch:<node_id>".  EPOCH.NEXT advances the
+ * counter and returns the new value.  The counter never goes backwards. */
+uint64_t qihse_federation_epoch_next(void* store_void, void* user_void,
+                                      const qihse_uuid_t* node_id);
+uint64_t qihse_federation_epoch_current(void* store_void, void* user_void,
+                                        const qihse_uuid_t* node_id);
+
+/* ── Lease primitive (plan §14) ─────────────────────────────────────────── */
+
+typedef enum {
+    QIHSE_LEASE_FREE = 0,
+    QIHSE_LEASE_GRANTED,
+    QIHSE_LEASE_EXPIRED,
+    QIHSE_LEASE_RELEASED
+} qihse_lease_state_t;
+
+const char* qihse_lease_state_name(qihse_lease_state_t state);
+
+typedef struct {
+    qihse_uuid_t lease_id;
+    qihse_uuid_t owner_node;
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    char resource_id[64];
+    uint64_t fencing_epoch;
+    uint64_t generation;
+    qihse_lease_state_t state;
+    uint64_t issued_hlc_physical;
+    uint64_t expires_hlc_physical;  /* 0 = no expiry */
+    qihse_uuid_t request_id;         /* for idempotency */
+    qihse_uuid_t issuer;
+} qihse_federation_lease_t;
+
+#define QIHSE_FEDERATION_LEASE_PREFIX "fedlease:"
+/* Request-id index for idempotent retries. */
+#define QIHSE_FEDERATION_LEASE_REQUEST_PREFIX "fedleasereq:"
+/* Resource index carrying the monotonic fencing high-water mark.  Persists
+ * after release so a stale holder at a lower epoch can never re-acquire. */
+#define QIHSE_FEDERATION_LEASE_RESOURCE_PREFIX "fedleaseres:"
+
+/* Acquire a lease.  If a live lease exists for the resource, the acquire
+ * fails unless the caller's fencing_epoch is strictly greater than the
+ * existing lease's epoch.  Idempotent: a repeated request_id returns the
+ * existing lease. */
+bool qihse_federation_lease_acquire(void* store_void, void* user_void,
+                                   const qihse_federation_lease_t* request,
+                                   qihse_federation_lease_t* out);
+
+/* Renew a lease.  The caller must hold the current lease. */
+bool qihse_federation_lease_renew(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 uint64_t new_expires_hlc_physical,
+                                 qihse_federation_lease_t* out);
+
+/* Release a lease.  Idempotent: releasing an already-released lease succeeds. */
+bool qihse_federation_lease_release(void* store_void, void* user_void,
+                                   const qihse_uuid_t* lease_id);
+
+/* Read a lease by id. */
+bool qihse_federation_lease_read(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 qihse_federation_lease_t* out);
+
+/* ── Replication groups (plan §15) ──────────────────────────────────────── */
+
+#define QIHSE_FEDERATION_GROUP_MAX_MEMBERS 32u
+
+typedef struct {
+    qihse_uuid_t member_id;
+    bool is_voter;
+    bool is_witness;
+} qihse_federation_group_member_t;
+
+typedef struct {
+    char group_id[64];
+    size_t member_count;
+    qihse_federation_group_member_t members[QIHSE_FEDERATION_GROUP_MAX_MEMBERS];
+    uint64_t term;
+    qihse_consistency_class_t consistency;
+} qihse_federation_group_t;
+
+#define QIHSE_FEDERATION_GROUP_PREFIX "fedgrp:"
+
+/* Create a replication group. Returns false if the group already exists. */
+bool qihse_federation_group_create(void* store_void, void* user_void,
+                                   const qihse_federation_group_t* group);
+/* Look up a group by id. */
+bool qihse_federation_group_lookup(void* store_void, void* user_void,
+                                   const char* group_id,
+                                   qihse_federation_group_t* out);
+/* Add or update a member. */
+bool qihse_federation_group_add_member(void* store_void, void* user_void,
+                                       const char* group_id,
+                                       const qihse_federation_group_member_t* member);
+/* Remove a member. */
+bool qihse_federation_group_remove_member(void* store_void, void* user_void,
+                                          const char* group_id,
+                                          const qihse_uuid_t* member_id);
+/* Advance the term. Returns the new term. */
+uint64_t qihse_federation_group_advance_term(void* store_void, void* user_void,
+                                              const char* group_id);
+/* List all groups. cb returns false to stop. */
+typedef bool (*qihse_federation_group_cb)(const qihse_federation_group_t* group,
+                                         void* user_data);
+void qihse_federation_group_foreach(void* store_void, void* user_void,
+                                    qihse_federation_group_cb cb,
+                                    void* user_data);
+
 #ifdef __cplusplus
 }
 #endif
