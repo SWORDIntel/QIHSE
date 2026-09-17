@@ -109,6 +109,15 @@ The accepted major direction. Governing principle: **federation must enhance a n
 - [x] **Backup writer.** A 320-byte fixed header plus a data section produced by the KV layer's own authorization-aware export, so the classification decision stays in the layer that owns the knowledge. The security context is mandatory and NULL fails closed; two independent gates (a coverage check and the KV clearance/SCI check) rather than one; the low-clearance negative test asserts the protected payload BYTES are absent from every artefact, not merely that a call failed. Restore verifies the manifest checksum and WAL point before opening the container. *Known boundaries: the container is integrity-checked but not authenticated (fix: sign with the F5 node key); no verify-only entry point; no WAL segment.*
 - [x] **Legacy backup API invariant-1 violation resolved.** The five context-free declarations were REMOVED rather than deprecated, and replaced with `_user` forms that take an authenticated context. Removal was chosen over an `#ifdef`/env boundary because a flag leaves a latent bypass a future build can enable. NULL is an argument error, a forged principal handle is refused, and identity is propagated to the KV layer. *Not implemented: incremental export — the KV store exposes no change sequence, so it returns UNSUPPORTED rather than shipping a full snapshot labelled incremental.*
 
+### Correctness findings surfaced by the documentation audit
+
+- [ ] **Bolt adapter is not wire-compatible.** The message-signature constants in `include/qihse_bolt.h` disagree with the Bolt 4.x spec (RUN `0x11` vs `0x10`, PULL `0x13` vs `0x3F`, RESET `0x10` vs `0x0F`), so a real driver's RUN is read as RESET. Tiny maps are encoded as `0xD7|count` instead of `0xA0..0xAF`, malforming every SUCCESS/FAILURE frame with fewer than 16 entries; negative tiny ints encode but do not decode. Needs a proper PackStream pass, not a patch. `tests/test_bolt.c` asserts only the working subset and `bolt_protocol.md` is marked partial.
+- [ ] **MongoDB wire protocol is absent.** `mongo_msg_parse`, `mongo_catalog_*` and `qihse_mongo_server_*` are declared in the header and defined nowhere; the library exports no `mongo_*` symbol. Only the BSON codec and query matcher exist.
+- [ ] **`qihse_repl_apply_wal()` records the LSN but does not replay.** `qihse_parallel_query.c` is also still a stub.
+- [ ] **`qihse_mvcc_delete()` can leave a committed delete's row visible** — it marks the chain head, which may be an aborted version. Reproduced.
+- [ ] **SQL gaps:** `UPDATE ... SET` is never parsed; `DELETE WHERE` is raw text rather than conditions; optimizer histograms/MCVs are declared but never populated.
+- [ ] **Bounded stack frames in the failover path.** `qihse_cluster_failover_promote` frame is 98704 bytes with `_handle` at 84432 and `best_replica.part.0` at 83984. Same defect as the brain, same fix.
+
 ### W2 — AI compute fabric
 
 Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitives rather than ad-hoc bus messaging.
