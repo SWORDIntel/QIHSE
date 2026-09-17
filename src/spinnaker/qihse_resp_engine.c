@@ -7,6 +7,8 @@
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
 #include "qihse_supply_chain.h"
+#include "qihse_runtime_trust.h"
+#include "qihse_security_audit.h"
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
@@ -6620,6 +6622,232 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
             if (!qihse_resp_bulk_text(session, ctx.releases[i])) return false;
             if (!qihse_resp_bulk_text(session, ctx.digests[i])) return false;
         }
+        return true;
+    }
+
+    /* ── F7: Runtime trust and hardening ─────────────────────────────── */
+    if (qihse_resp_arg_equal(sub, "TRUST.STATES")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.trust.states");
+        static const qihse_runtime_trust_t states[] = {
+            QIHSE_RTRUST_UNKNOWN, QIHSE_RTRUST_TRUSTED, QIHSE_RTRUST_TRUSTED_DEGRADED,
+            QIHSE_RTRUST_LOCAL_ONLY, QIHSE_RTRUST_QUARANTINED, QIHSE_RTRUST_REVOKED,
+        };
+        size_t n = sizeof(states) / sizeof(states[0]);
+        if (!qihse_resp_array(session, n)) return false;
+        for (size_t i = 0; i < n; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_runtime_trust_name(states[i]))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "TRUST.ADMISSION")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "federation.trust.admission");
+        char nid_str[QIHSE_UUID_STR_LEN + 1u];
+        size_t nl = request->argv[2].len;
+        if (nl == 0 || nl >= sizeof(nid_str)) return qihse_resp_error(session, "ERR invalid node id");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        qihse_admission_t a;
+        if (!qihse_runtime_admission_for_node(session->server->store, session->user, &nid, &a)) {
+            return qihse_resp_error(session, "ERR admission lookup failed");
+        }
+        if (!qihse_resp_array(session, 7)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_runtime_trust_name(a.trust_state))) return false;
+        if (!qihse_resp_integer(session, a.local_usable ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, a.may_replicate ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, a.may_read_remote ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, a.may_strong_write ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, a.may_vote ? 1 : 0)) return false;
+        if (!qihse_resp_bulk_text(session, a.reason)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "TRUST.SET")) {
+        if (request->argc != 5) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.TRUST.SET <node_id> <trust_state> <result>");
+        }
+        char nid_str[QIHSE_UUID_STR_LEN + 1u], state_name[32], result[64];
+        size_t nl = request->argv[2].len, sl = request->argv[3].len, rl = request->argv[4].len;
+        if (nl == 0 || nl >= sizeof(nid_str) || sl == 0 || sl >= sizeof(state_name) ||
+            rl == 0 || rl >= sizeof(result)) return qihse_resp_error(session, "ERR invalid arguments");
+        memcpy(nid_str, request->argv[2].data, nl); nid_str[nl] = '\0';
+        memcpy(state_name, request->argv[3].data, sl); state_name[sl] = '\0';
+        memcpy(result, request->argv[4].data, rl); result[rl] = '\0';
+        qihse_uuid_t nid;
+        if (!qihse_uuid_parse(nid_str, &nid)) return qihse_resp_error(session, "ERR invalid node id");
+        qihse_runtime_trust_t trust;
+        if (!qihse_runtime_trust_parse(state_name, &trust)) {
+            return qihse_resp_error(session, "ERR unknown trust state");
+        }
+        qihse_trust_verification_t v;
+        memset(&v, 0, sizeof(v));
+        v.node_id = nid;
+        v.trust_state = trust;
+        v.trust_policy_generation = qihse_federation_epoch_current(
+            session->server->store, session->user, &session->server->federation_node_id);
+        v.evidence_verified_hlc_physical = (uint64_t)time(NULL) * 1000ULL;
+        v.verification_principal = session->server->federation_node_id;
+        snprintf(v.verification_result, sizeof(v.verification_result), "%s", result);
+        if (!qihse_trust_verification_put(session->server->store, session->user, &v,
+                                          session->server->federation_journal)) {
+            return qihse_resp_error(session, "ERR trust verification failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.IFACES")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.security.ifaces");
+        if (!qihse_resp_array(session, QIHSE_IFACE_COUNT)) return false;
+        for (size_t i = 0; i < QIHSE_IFACE_COUNT; i++) {
+            if (!qihse_resp_bulk_text(session, qihse_kernel_iface_name((qihse_kernel_iface_t)i))) return false;
+        }
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.OBSERVE")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "federation.security.observe");
+        qihse_runtime_observation_t o;
+        if (!qihse_runtime_observe(&o)) return qihse_resp_error(session, "ERR runtime observation failed");
+        if (!qihse_resp_array(session, 9)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.uid)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.euid)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.gid)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.egid)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.effective_capabilities)) return false;
+        if (!qihse_resp_integer(session, o.core_dumps_enabled ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, o.dumpable ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.seccomp_mode)) return false;
+        if (!qihse_resp_integer(session, (int64_t)o.listening_port_count)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.AUDIT")) {
+        if (request->argc < 2 || request->argc > 4) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SECURITY.AUDIT [service] [version]");
+        }
+        char service[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u], version[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u];
+        service[0] = '\0';
+        version[0] = '\0';
+        if (request->argc >= 3) {
+            size_t sl = request->argv[2].len;
+            if (sl == 0 || sl >= sizeof(service)) return qihse_resp_error(session, "ERR invalid service");
+            memcpy(service, request->argv[2].data, sl); service[sl] = '\0';
+        }
+        if (request->argc == 4) {
+            size_t vl = request->argv[3].len;
+            if (vl == 0 || vl >= sizeof(version)) return qihse_resp_error(session, "ERR invalid version");
+            memcpy(version, request->argv[3].data, vl); version[vl] = '\0';
+        }
+        qihse_runtime_profile_t profile;
+        qihse_net_profile_t net;
+        bool have_profile = false;
+        bool have_net = false;
+        if (service[0] && version[0]) {
+            have_profile = qihse_runtime_profile_get(session->server->store, session->user,
+                                                    service, version, &profile);
+            have_net = qihse_net_profile_get(session->server->store, session->user,
+                                             service, version, &net);
+        }
+        qihse_runtime_observation_t o;
+        if (!qihse_runtime_observe(&o)) return qihse_resp_error(session, "ERR runtime observation failed");
+        uint32_t declared[32];
+        size_t declared_count = 0;
+        if (have_net) {
+            /* Declared listeners come from the network exposure profile. */
+            declared_count = net.listener_count;
+            for (size_t i = 0; i < declared_count && i < 32u; i++) declared[i] = net.ports[i];
+        } else {
+            /* Without a declared network profile, treat the process's own
+             * current listeners as the baseline so the report is still
+             * meaningful. */
+            declared_count = o.listening_port_count;
+            for (size_t i = 0; i < declared_count && i < 32u; i++) declared[i] = o.listening_ports[i];
+        }
+        qihse_audit_report_t report;
+        if (!qihse_runtime_audit(have_profile ? &profile : NULL, &o, declared, declared_count, &report)) {
+            return qihse_resp_error(session, "ERR audit failed");
+        }
+        if (!qihse_resp_array(session, 9)) return false;
+        if (!qihse_resp_bulk_text(session, qihse_runtime_trust_name(report.recommended_trust))) return false;
+        if (!qihse_resp_integer(session, report.critical ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, report.profile_found ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, (int64_t)report.unexpected_capability_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)report.unexpected_listener_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)report.unclassified_interface_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)report.forbidden_interface_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)report.finding_count)) return false;
+        if (!qihse_resp_bulk_text(session, report.finding_count ? report.findings[0].detail : "")) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.PROFILE.SET")) {
+        if (request->argc != 6) {
+            return qihse_resp_error(session, "ERR usage: FEDERATION.SECURITY.PROFILE.SET <service> <version> <allowed_caps_mask> <core_dumps> <require_seccomp>");
+        }
+        char service[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u], version[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u];
+        size_t sl = request->argv[2].len, vl = request->argv[3].len;
+        if (sl == 0 || sl >= sizeof(service) || vl == 0 || vl >= sizeof(version)) {
+            return qihse_resp_error(session, "ERR invalid service or version");
+        }
+        memcpy(service, request->argv[2].data, sl); service[sl] = '\0';
+        memcpy(version, request->argv[3].data, vl); version[vl] = '\0';
+        char nums[3][24];
+        for (size_t i = 0; i < 3u; i++) {
+            size_t l = request->argv[4 + i].len;
+            if (l == 0 || l >= sizeof(nums[i])) return qihse_resp_error(session, "ERR invalid numeric argument");
+            memcpy(nums[i], request->argv[4 + i].data, l); nums[i][l] = '\0';
+        }
+        qihse_runtime_profile_t p;
+        qihse_runtime_profile_init(&p, service, version);
+        p.allowed_capabilities = (uint64_t)strtoull(nums[0], NULL, 0);
+        p.core_dumps_allowed = strtoul(nums[1], NULL, 10) != 0;
+        p.require_seccomp = strtoul(nums[2], NULL, 10) != 0;
+        if (!qihse_runtime_profile_put(session->server->store, session->user, &p)) {
+            return qihse_resp_error(session, "ERR profile put failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.PROFILE.GET")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.security.profile.get");
+        char service[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u], version[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u];
+        size_t sl = request->argv[2].len, vl = request->argv[3].len;
+        if (sl == 0 || sl >= sizeof(service) || vl == 0 || vl >= sizeof(version)) {
+            return qihse_resp_error(session, "ERR invalid service or version");
+        }
+        memcpy(service, request->argv[2].data, sl); service[sl] = '\0';
+        memcpy(version, request->argv[3].data, vl); version[vl] = '\0';
+        qihse_runtime_profile_t p;
+        if (!qihse_runtime_profile_get(session->server->store, session->user, service, version, &p)) {
+            return qihse_resp_error(session, "ERR profile not found");
+        }
+        if (!qihse_resp_array(session, 5)) return false;
+        if (!qihse_resp_integer(session, (int64_t)p.allowed_capabilities)) return false;
+        if (!qihse_resp_integer(session, p.core_dumps_allowed ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, p.require_seccomp ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, (int64_t)p.generation)) return false;
+        if (!qihse_resp_integer(session, (int64_t)p.expected_uid)) return false;
+        return true;
+    }
+
+    if (qihse_resp_arg_equal(sub, "SECURITY.NET.GET")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.security.net.get");
+        char service[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u], version[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u];
+        size_t sl = request->argv[2].len, vl = request->argv[3].len;
+        if (sl == 0 || sl >= sizeof(service) || vl == 0 || vl >= sizeof(version)) {
+            return qihse_resp_error(session, "ERR invalid service or version");
+        }
+        memcpy(service, request->argv[2].data, sl); service[sl] = '\0';
+        memcpy(version, request->argv[3].data, vl); version[vl] = '\0';
+        qihse_net_profile_t np;
+        if (!qihse_net_profile_get(session->server->store, session->user, service, version, &np)) {
+            return qihse_resp_error(session, "ERR network profile not found");
+        }
+        if (!qihse_resp_array(session, 3)) return false;
+        if (!qihse_resp_integer(session, qihse_net_profile_is_egress_restricted(&np) ? 1 : 0)) return false;
+        if (!qihse_resp_integer(session, (int64_t)np.listener_count)) return false;
+        if (!qihse_resp_integer(session, (int64_t)np.generation)) return false;
         return true;
     }
 
