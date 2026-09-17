@@ -1,5 +1,10 @@
 # File-Backed Trinary Persistence and Retrieval
 
+> **Status: partial — status unverified.** The file names and layout described
+> here are produced by the vector store at runtime
+> (`persistence/qihse_vector_store.c`), but no test in `tests/` asserts this
+> specific document's on-disk contract.
+
 ## What is persisted
 - `vectors.qtri` stores row-oriented trinary signatures generated from every committed vector.
 - `vectors.qmag` stores row-wise magnitude data aligned to `vectors.qtri` rows.

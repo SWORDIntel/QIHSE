@@ -1,5 +1,13 @@
 # QIHSE Security Hardening Report
 
+> **Status: partial.** Remediation items with named regression tests
+> (`tests/test_auth_privilege_boundary.c`, `tests/test_object_acl.c`,
+> `tests/test_aggregate_hardened.c`) are verified by those tests. The report's
+> broader claims — "zero unsafe function calls remain in production code",
+> "all `system()` calls replaced" — are whole-tree assertions that no test
+> enforces; treat them as reviewed statements about the revision described, not
+> as continuously verified properties.
+
 A comprehensive multi-pass security audit and verification identified and remediated vulnerabilities across the entire codebase, including low-level memory safety, cryptographic hygiene, authorization architecture, and wire protocols.
 
 ## Remediation Summary

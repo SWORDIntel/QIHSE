@@ -1,5 +1,10 @@
 # QIHSE — Self-Optimizing Intelligent Search System
 
+> **Status: superseded** — retained as the original design snapshot. Use
+> [qihse_whitepaper_v1.1.md](qihse_whitepaper_v1.1.md) for implementation
+> status. This document's own closing note ("Ready for Implementation")
+> describes intent at the time of writing, not the current tree.
+
 ## Commercial Architecture Whitepaper v1.0
 
 **Authors:** DSMIL Research Team

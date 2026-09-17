@@ -1,5 +1,18 @@
 # QIHSE Task Queue Engine — Celery-Equivalent Distributed Task Dispatch
 
+> **Status: implemented — contradicted by the tree.** The header says "PLANNED
+> — Not yet implemented", but the task lifecycle layer it describes exists:
+> `include/qihse_task_queue.h`, `include/qihse_task_scheduler.h`,
+> `include/qihse_task_worker.h` and the matching sources under
+> `src/spinnaker/`, with `tests/test_task_queue.c`,
+> `tests/test_task_scheduler.c`, `tests/test_task_worker.c` and
+> `tests/test_task_resp.c` wired as `make test-task` in the default test list.
+> The header is stale; the remaining open item is the full Celery-style task
+> composition the document itself defers. One detail is contradicted: the plan
+> proposes `src/marmalade/qihse_task_scheduler.{c,h}`; the module landed as
+> `src/spinnaker/qihse_task_scheduler.c` with
+> `include/qihse_task_scheduler.h`.
+
 > **Status**: PLANNED — Not yet implemented.
 > **Scope**: Focused subset — task dispatch, result storage, retry/backoff, priority queues, periodic scheduling. Full task composition (chains/groups/chords) deferred to future phase.
 

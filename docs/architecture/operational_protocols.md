@@ -1,5 +1,12 @@
 # Operational & Protocol Layer
 
+> **Status: partial — status unverified.** CDC, the MongoDB wire protocol, the
+> HTTP/REST API, and the ClickHouse, Elasticsearch and InfluxDB surfaces all
+> have sources under `src/spinnaker/`, but the test file this document names
+> (`tests/test_phase_c.c`) does not exist. Some individual surfaces are covered
+> elsewhere (`tests/test_resp_pubsub.c`, `tests/test_uwp_metrics.c`); the
+> protocol list as a whole is unverified.
+
 ## Overview
 
 QIHSE provides a complete operational and protocol stack beyond the core storage engines: CDC, MongoDB wire protocol, HTTP/REST API, ClickHouse HTTP, Elasticsearch API, InfluxDB API, Prometheus metrics, OpenTelemetry tracing, compaction/TTL, SQL extensions, and comprehensive database equivalency commands for 8 target databases.

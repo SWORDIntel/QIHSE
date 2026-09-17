@@ -1,5 +1,10 @@
 # Bolt Protocol (Neo4j Wire Protocol)
 
+> **Status: partial — status unverified.** `src/spinnaker/qihse_bolt.c` exists
+> and is wired into the build, but the test file this document names
+> (`tests/test_bolt.c`) does not exist and no test in `tests/` exercises Bolt.
+> The protocol description below is therefore unverified against running code.
+
 ## Overview
 
 QIHSE implements the Neo4j Bolt 4.x wire protocol, allowing applications using the neo4j-python driver to connect to QIHSE without code changes.

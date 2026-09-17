@@ -1,5 +1,8 @@
 # Qlearn & QIHSE Data Condensation Enhancements
 
+> **Status: planned** — these are proposals, not a description of the current
+> tree. No implementation is claimed.
+
 While the current JSON-based `.qdb` memory bank sits at the Pareto optimal limit for high usefulness relative to low operational effort (semantic compression via structural text summaries), there are several pathways to further enhance the condensation and retrieval limits for Qlearn and QIHSE.
 
 These enhancements are geared towards scaling these protocols to support massive enterprise mono-repos without overflowing an agent's context window.

@@ -1,5 +1,16 @@
 # QIHSE — Federation Database Layer Upgrade Design Brief
 
+> **Status: planned.** The stage-by-stage record of what has landed is in the
+> [roadmap](../../ROADMAP.md) and in
+> [architecture/federation_overview.md](../architecture/federation_overview.md):
+> the F0–F8 stages this document specifies are implemented and tested, while
+> the rest of it remains the design of record for what is not built (consensus,
+> backup writer, controller SDKs).
+>
+> **Contradiction:** the status line this document carried until the labeling
+> pass said "nothing in it is implemented yet". That is stale — F0–F8 are
+> implemented and tested. The retained line is reproduced below.
+
 > **Status (2026-09-15):** Accepted as QIHSE's future architectural direction.
 > This is a planning document — nothing in it is implemented yet, and it does not
 > describe current capability. It is the design of record for the federation

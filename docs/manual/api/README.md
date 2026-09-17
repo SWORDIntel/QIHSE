@@ -1,5 +1,10 @@
 # QIHSE API Reference
 
+> **Status: partial — status unverified.** An older API guide for the search
+> library. Some of what it documents exists (`qihse_search()` is declared in
+> `include/qihse.h`), but the document is not maintained against the current
+> tree. For the current surface use [../API_REFERENCE.md](../API_REFERENCE.md).
+
 This document provides comprehensive API documentation for the QIHSE (Quantum-Inspired Hilbert Space Expansion) search ecosystem.
 
 ## Table of Contents

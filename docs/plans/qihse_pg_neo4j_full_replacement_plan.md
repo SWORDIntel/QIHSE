@@ -1,5 +1,16 @@
 # QIHSE Full PostgreSQL & Neo4j Replacement Plan
 
+> **Status: partial — the test results reported here are contradicted by the
+> repository.** The header claims "Phase A & B COMPLETE" with 62/62 passing
+> tests.
+>
+> **Contradictions with the tree:** four of the five test suites in the results
+> table do not exist — `tests/test_pg_sql.c`, `tests/test_bolt.c`,
+> `tests/test_repl.c` and `tests/test_sdk.py` are absent from this repository,
+> and only `tests/test_graph.c` is present (and is a different suite from the
+> one described). The two cited commits (`9615def`, `4340927`) do not resolve
+> in the current history. Do not cite this table as evidence.
+
 > **Status: Phase A & B COMPLETE** — All features below have been implemented, tested, and committed. See test results at the bottom of this document.
 
 ## 0. Design Philosophy

@@ -1,5 +1,11 @@
 # QIHSE SQL Engine & Query Processing Architecture
 
+> **Status: partial — status unverified.** The parser, executors, optimizer and
+> schema registry have sources under `src/tractable/`, but the test file this
+> document names (`tests/test_sql_completeness.c`) does not exist. SQL is
+> exercised indirectly through the pgwire cluster test, which is not the same as
+> the 22-test coverage claimed below.
+
 ## 1. Overview
 
 QIHSE includes a native C99 SQL engine that provides full relational query processing on top of the multi-model storage engines. The SQL engine consists of a parser, query executors, a cost-based optimizer, and a schema registry.

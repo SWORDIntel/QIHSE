@@ -1,5 +1,13 @@
 # QIHSE SQLite VFS — Native C Implementation Plan
 
+> **Status: partial.** The VFS itself is implemented
+> (`persistence/qihse_sqlite_vfs.c`, `persistence/qihse_vfs_page_cache.c`,
+> `persistence/qihse_vfs_wal.c`) and has a test target
+> (`tests/test_sqlite_vfs.c`, `make test-sqlite-vfs`), but this document is
+> written as a plan and mixes built and unbuilt items without distinguishing
+> them. Treat individual sections as `planned` unless the code above shows
+> otherwise.
+
 > **Scope**: A production-quality, generalized SQLite Virtual File System implemented in C99 using only existing QIHSE primitives. Once registered, any program that uses SQLite — whether through `sqlite3.h`, the Python `sqlite3` module, ORMs, or the `sqlite3` CLI — routes all storage through QIHSE automatically, with zero changes to SQL code.
 
 ---

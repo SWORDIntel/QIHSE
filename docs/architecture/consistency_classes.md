@@ -1,5 +1,8 @@
 # Consistency Classes
 
+> **Status: implemented** — class semantics, local-safe/strong classification,
+> and the writability table are verified by `tests/test_federation_f1.c`.
+
 Every QIHSE namespace declares one of five consistency classes. Write
 authorization is determined by **consistency class + namespace authority**,
 never by global cluster status.

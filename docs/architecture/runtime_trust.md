@@ -1,5 +1,9 @@
 # Runtime Trust and Federation Admission
 
+> **Status: implemented** — trust states, the admission table (including
+> `local_usable` in every state), and journaled trust changes are verified by
+> `tests/test_federation_f7.c` and `tests/test_federation_f8.c`.
+
 A valid node certificate proves **identity**, not current **trustworthiness**.
 Admission therefore evaluates runtime evidence.
 

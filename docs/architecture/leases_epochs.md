@@ -1,5 +1,10 @@
 # Leases and Epochs
 
+> **Status: implemented** — the lease primitive, fencing high-water mark,
+> request-id idempotency index, and scoped replication groups are verified by
+> `tests/test_federation_f4.c`. The document's statement that no consensus
+> algorithm is claimed matches the code.
+
 QIHSE provides a generic, auditable atomic primitive. It does **not** implement
 hypervisor HA policy — the controller decides when a lease may be acquired.
 

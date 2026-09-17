@@ -1,5 +1,9 @@
 # Build Coordination
 
+> **Status: implemented** — the job state machine, idempotent transitions,
+> builder capability records, package override registry, and historical
+> performance are verified by `tests/test_federation_f6.c`.
+
 QIHSE provides durable coordination state for the Citadel Adaptive Federated
 Build Fabric.
 

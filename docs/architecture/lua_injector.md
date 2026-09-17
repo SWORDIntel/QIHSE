@@ -1,5 +1,15 @@
 # QIHSE TRITON Lua Injector
 
+> **Status: partial — status unverified.** `src/spinnaker/qihse_lua_injector.c`
+> is built and wired into the Makefile, but no test in `tests/` exercises it and
+> there is no CI target for it.
+>
+> **Contradiction with the code:** this document says the sandbox binds
+> `qihse_hardware_dot_product(vec_ptr, dims)` into the Lua namespace. The
+> sandbox actually binds `qihse_cosine_similarity_scalar` / `_avx2` /
+> `_avx512` from `algorithms/qihse_verification.h`; a script calling
+> `qihse_hardware_dot_product` will not resolve.
+
 > **Security Clearance**: Internal Operations Only
 > **Subsystem**: `src/spinnaker/qihse_lua_injector.c`
 

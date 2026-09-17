@@ -1,5 +1,11 @@
 # QIHSE AF_XDP (Kernel Bypass) Operational Guide
 
+> **Status: implemented** — the AF_XDP ingress paths are exercised by
+> `tests/test_af_xdp_keystone_ingest.c` and `tests/test_af_xdp_resp.c`
+> (`make test-af-xdp-keystone-ingest`, `make test-af-xdp-resp`), with the
+> kernel-side sources in `src/networking/`. Hardware-dependent behaviour
+> (NIC/driver support) still has to be validated on the target host.
+
 The QIHSE engine supports an extreme-performance networking subsystem utilizing Linux eBPF and AF_XDP. This enables zero-copy packet ingestion directly from the network interface card (NIC) receive rings into user-space UMEM buffers, bypassing the Linux network stack for ultra-low latency operations.
 
 ---

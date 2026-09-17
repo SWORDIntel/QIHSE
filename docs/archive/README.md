@@ -1,5 +1,13 @@
 # QIHSE Search Model
 
+> **Status: superseded.** Everything under `docs/archive/` is retained for
+> design history. Documents in this directory inherit `superseded` by
+> convention unless they carry a more specific status line: they describe
+> earlier revisions, earlier names (QIHSE was previously documented as a search
+> model rather than a multi-model database), or abandoned directions. For
+> current status use [docs/README.md](../README.md) and the documents it
+> indexes.
+
 Quantum-Inspired Hilbert Space Expansion (QIHSE) search model for high-performance similarity search and retrieval operations.
 
 ## Overview

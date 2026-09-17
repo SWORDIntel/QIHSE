@@ -1,16 +1,15 @@
 # QIHSE Overlay Protocol — Self-Forming Internet Cluster
 
-> **Implementation status (2026-09-15):** phase 1 is implemented and **pending
-> landing** (W0 of the master [roadmap](../../ROADMAP.md)), with two deltas from
-> the design below. (1) Layer 1 (veiled framing) lives in the bus,
-> not in the overlay module — `qihse_bus_veil_encode`/`qihse_bus_veil_decode`
-> in `src/spinnaker/qihse_cluster_bus.c`, enabled by setting
-> `qihse_cluster_bus_config_t.veil_key` (the daemon passes the cluster operator
-> password, so framing is always veiled when a password is set; there is no
-> separate `--overlay-key` flag). (2) Layer 2 (IRC dead-drop) authenticates
-> records with **HMAC-SHA-384 keyed by the cluster operator password**, not
-> ML-DSA-87 signatures; ML-DSA signing remains the phase-2 upgrade path noted
-> in `include/qihse_overlay.h`. Layer 3 (DHT peer exchange) is not implemented.
+> **Status: implemented (phase 1).** Veiled bus framing, the IRC dead-drop, and
+> HMAC-SHA-384 record authentication are verified by `tests/test_overlay.c`.
+>
+> **Contradiction:** the status line this document carried until the labeling
+> pass said phase 1 was "pending landing (W0)"; W0 is complete and the test is
+> CI-wired. Two deltas from the
+> design still hold: layer 1 lives in the bus
+> (`qihse_bus_veil_encode`/`_decode` in `src/spinnaker/qihse_cluster_bus.c`),
+> and layer 2 authenticates with HMAC-SHA-384 rather than ML-DSA signatures.
+> Layer 3 (DHT peer exchange) is `planned`.
 
 ## Purpose
 

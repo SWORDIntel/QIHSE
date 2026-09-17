@@ -1,5 +1,8 @@
 # QIHSE User Guide
 
+> **Status: partial — status unverified.** A user guide that predates the
+> current launcher and SDK surface. It is not verified against the tree.
+
 This guide provides comprehensive instructions for installing, configuring, and using the QIHSE (Quantum-Inspired Hilbert Space Expansion) search ecosystem.
 
 ## Table of Contents

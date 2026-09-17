@@ -1,5 +1,10 @@
 # QIHSE General-Purpose Database Engine Replacement Roadmap
 
+> **Status: partial.** A phase-by-phase roadmap for the database-replacement
+> program. Several phases describe work whose test files do not exist (see the
+> status lines for SQL, transactions, secondary indexes and replication in
+> [architecture/](../architecture/)). Treat its phase markers as intent.
+
 > **Update:** Phases 1-8 are **COMPLETE**. Phase 9 (Database Equivalency Commands) is **COMPLETE** -- all 8 target databases now have comprehensive command interoperability:
 > - **Redis**: lists, hashes, sets, sorted sets, pub/sub, transactions (MULTI/EXEC), bitmaps, HyperLogLog, scripting, key management, server commands
 > - **MongoDB**: CRUD operations, query operators, aggregation pipeline, admin commands, BSON helpers, in-memory catalog

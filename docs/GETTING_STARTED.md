@@ -1,5 +1,10 @@
 # Getting Started with QIHSE
 
+> **Status: implemented** — the launcher commands described here exist in
+> `qihse` / `qihse_launcher.py` (`dev-setup`, `build`, `test`, `status`,
+> `isa-info`, `db`, `server`, `python`, `demo`, `bench`), and the Makefile
+> targets they wrap are present.
+
 This guide covers the shortest path from a fresh checkout to a working local QIHSE build.
 
 For the project overview, start with the [root README](../README.md). For subsystem details, use the [documentation hub](README.md).

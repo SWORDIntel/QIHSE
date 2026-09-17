@@ -1,5 +1,19 @@
 # Replication, Backup & Operational Features
 
+> **Status: partial — status unverified.** Streaming replication, read-replica
+> routing, backup/restore, parallel query and the pooler have sources under
+> `src/spinnaker/` and `src/tractable/`, but the test file this document names
+> (`tests/test_repl.c`) does not exist and no test in `tests/` calls
+> `qihse_repl_*`.
+>
+> **Contradiction with the code:** the backup/restore section below describes a
+> working export. The legacy surface it refers to (`src/tractable/qihse_backup.c`,
+> `include/qihse_backup.h`) is a stub that writes an empty data section and
+> carries a `TODO: iterate KV store and write all key-value pairs`. The working
+> backup path is the federation writer/reader in `src/federation/qihse_backup.c`,
+> verified by `tests/test_federation_backup.c`; see
+> [API_REFERENCE.md §2.3](../API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph).
+
 ## Overview
 
 QIHSE provides streaming replication, read replica routing, backup/restore, parallel query execution, and an enhanced connection pooler for production operational maturity.

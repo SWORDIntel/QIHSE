@@ -1,5 +1,15 @@
 # QIHSE Unified Wire Protocol (UWP) — Security & Correctness Audit
 
+> **Status: superseded.** The audit is a dated snapshot (2026-08-23) of a
+> specific revision; its per-finding remediation status remains the record for
+> that revision. One verdict is contradicted by the current code:
+>
+> **Contradiction:** the verdict line states "Cleartext remains the default —
+> operators must explicitly configure TLS". The current UWP entry point
+> (`src/spinnaker/qihse_uwp_secure.c`) requires certificate-backed TLS 1.3 by
+> default and refuses cleartext unless `QIHSE_UWP_ALLOW_INSECURE=1` is set, as
+> the root README states. Later commits changed this default.
+
 **Date:** 2026-08-23
 **Auditor:** Devin (Claude Opus 4.7, Medium)
 **Scope:**

@@ -1,5 +1,10 @@
 # QIHSE PostgreSQL Wire Protocol (PGWire) Sharded Partitioning & Multi-Engine Virtual Catalogs
 
+> **Status: implemented** — the pgwire server, CRC16 slot routing, and the
+> virtual `pg_catalog.pg_tables` view are exercised by
+> `tests/test_pg_wire_cluster.c` (`make test-pg-wire-cluster`; the target exists
+> but is not part of the default `make test` list).
+
 ## 1. Executive Summary
 
 QIHSE incorporates a native **PostgreSQL Wire Protocol v3 Server** (`include/qihse_pg_wire.h`) extended with **16,384 CRC16 Hash Slot Partitioning** and **Multi-Engine Virtual System Catalogs**.

@@ -1,5 +1,9 @@
 # Security Self-Audit
 
+> **Status: implemented** — reading real process state, the finding model, and
+> the recommended-trust mapping are verified by `tests/test_federation_f7.c` and
+> `tests/test_federation_f8.c`.
+
 QIHSE exposes a machine-readable security posture report for Citadel's global
 audit mechanism. The audit verifies **actual runtime state**, not configuration
 files.

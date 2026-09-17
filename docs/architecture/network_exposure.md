@@ -1,5 +1,17 @@
 # Network Exposure and Egress Policy
 
+> **Status: implemented** — the declared-listener and egress profile model,
+> drift detection, and its use by the hardening audit are verified by
+> `tests/test_federation_f7.c` and `tests/test_federation_fuzz.c`.
+>
+> **Contradiction with the code:** the "Profile location" section below gives
+> `security/runtime-network-profile/<service>/<version>`. The key built in
+> `src/federation/qihse_security_audit.c` is
+> `security/runtime-network-profile:<service>:<version>` (colon-separated, per
+> `QIHSE_NET_PROFILE_PREFIX`). The runtime hardening profile uses the same
+> colon form, which [runtime_hardening.md](runtime_hardening.md) states
+> correctly.
+
 QIHSE network behaviour is explicit and minimal. A production node exposes only
 configured interfaces.
 

@@ -1,14 +1,11 @@
 # Cluster Brain — Decision Making for QIHSE Clusters
 
-> **Implementation status (2026-09-16):** phase 1 (observe / journal / decide)
-> and **actuation** are implemented in `src/spinnaker/qihse_cluster_brain.c`:
-> daemon flags `--brain`, `--brain-act`, `--brain-dir`, `--brain-interval`,
-> `--brain-dsa-key`, `--brain-cooldown`, `--brain-rollback-window`,
-> `--brain-prune-timeout`, `--brain-rebalance-min-slots`. Acting (R1 re-home,
-> R4 rollback, R5 rebalance-on-join, R6 stale prune) runs only under
-> `--brain-act` and every action goes through the same audited slot-handoff
-> path `CLUSTER MOVESLOTS` uses. Tests: `tests/test_cluster_brain.c` (phase 1),
-> `tests/test_brain_actuate.c` (R1/R4), `tests/test_brain_rebalance.c` (R5/R6).
+> **Status: implemented** — phase 1 (observe / journal / decide) and actuation
+> are verified by `tests/test_cluster_brain.c` (phase 1),
+> `tests/test_brain_actuate.c` (R1/R4), and `tests/test_brain_rebalance.c`
+> (R5/R6). Acting runs only under `--brain-act` in
+> `src/spinnaker/qihse_cluster_brain.c`. Migrating observations and signed
+> decisions onto the federation event journal is `planned` (W3.4).
 
 ## Why
 

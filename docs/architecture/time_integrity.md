@@ -1,5 +1,8 @@
 # Time Integrity and Trusted Ordering
 
+> **Status: implemented** — the wall-clock-independent HLC advance/merge and the
+> anomaly model are verified by `tests/test_federation_f7.c`.
+
 QIHSE relies on its hybrid logical clock for distributed ordering. HLC remains
 the correctness mechanism; the wall clock is human and audit context.
 

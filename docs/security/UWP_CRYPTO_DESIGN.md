@@ -1,5 +1,16 @@
 # QIHSE Unified Wire Protocol (UWP) — Cryptographic Framing Design
 
+> **Status: partial — status unverified.** The document's own "PARTIALLY
+> IMPLEMENTED" marker is accurate: the userspace TLS 1.3 path exists, while the
+> kernel-TLS (kTLS) and AF_XDP in-kernel decryption phases described here are
+> not built. No test in `tests/` exercises the phases described. The document
+> also names `tests/uwp_fuzz.c`; the fuzzer in this tree is `tests/fuzz_uwp.c`.
+>
+> **Repository rule violation:** this document contains absolute `file:///`
+> links rooted at a developer home directory. `AGENTS.md` requires strictly
+> relative or dynamically resolved paths; the links as written will not resolve
+> on another machine.
+
 **Document ID:** SEC-DES-2026-08-UWP-CRYPTO  
 **Status:** PARTIALLY IMPLEMENTED (August 2026)  
 

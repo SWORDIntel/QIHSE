@@ -1,5 +1,20 @@
 # Federation Overview
 
+> **Status: implemented** — F0–F8 are verified by `tests/test_federation_f0.c`
+> through `tests/test_federation_f8.c`, plus `tests/test_federation_f8_ops.c`,
+> `tests/test_federation_bus_trust.c`, `tests/test_federation_fuzz.c`,
+> `tests/test_federation_mtls.c`, `tests/test_federation_repl.c`,
+> `tests/test_federation_transport.c`, `tests/test_federation_rejoin.c`, and
+> `tests/test_federation_backup.c`.
+>
+> **Contradiction:** the "What is not implemented" section below is stale. The
+> replication transport (`src/federation/qihse_federation_repl.c`) and the mTLS
+> binding (`src/federation/qihse_federation_transport.c`) both exist and are
+> tested, as is the backup writer/reader (`src/federation/qihse_backup.c`,
+> `tests/test_federation_backup.c`). What remains true from that list is
+> consensus (there is deliberately no Raft in the federation layer) and the
+> controller SDKs (`planned`).
+
 QIHSE federation turns a cluster of QIHSE instances into a
 **partition-aware, security-first federation data plane**. It is designed to
 back a multi-host hypervisor control system without making host operation
@@ -47,10 +62,20 @@ anything, and it never holds private signing keys.
 | Runtime trust | `include/qihse_runtime_trust.h` | `src/federation/qihse_runtime_trust.c` |
 | Security audit | `include/qihse_security_audit.h` | `src/federation/qihse_security_audit.c` |
 | Operations | `include/qihse_operations.h` | `src/federation/qihse_operations.c` |
+| Backup writer/reader | `include/qihse_backup.h` | `src/federation/qihse_backup.c` |
 | Simulation | `include/qihse_federation_sim.h` | `src/federation/qihse_federation_sim.c` |
 | RESP surface | `include/qihse_resp_wire.h` | `src/spinnaker/qihse_resp_engine.c` |
 
 ## What is not implemented
+
+> **Section status: partial — this list is stale.** Three of its five entries
+> are now implemented and tested: the replication transport
+> (`src/federation/qihse_federation_repl.c`), the mTLS binding
+> (`src/federation/qihse_federation_transport.c`), and the backup
+> writer/reader (`src/federation/qihse_backup.c`, verified by
+> `tests/test_federation_backup.c`). What remains true is consensus (there is
+> deliberately no Raft) and the controller SDKs (`planned`). See the
+> contradiction note at the top of this document.
 
 Stated plainly so the documentation does not overstate the code:
 

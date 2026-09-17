@@ -1,5 +1,12 @@
 # Runtime maintenance loop (caller-driven)
 
+> **Status: implemented** — the caller-driven maintenance loop and the
+> migration scheduler it describes are verified by `tests/test_memory_planner.c`
+> (`make test-memory-planner`, part of the default `make test` list) and by the
+> `qihse_memory_maintenance_*` / `qihse_memory_migration_scheduler_*`
+> declarations in `memory/include/qihse_memory.h` and
+> `memory/include/qihse_memory_migration_scheduler.h`.
+
 QIHSE does not spawn hidden maintenance workers for memory migration. The caller
 explicitly owns the maintenance loop.
 

@@ -1,5 +1,10 @@
 # QIHSE ACID Transactions & MVCC Architecture
 
+> **Status: partial — status unverified.** The transaction manager, MVCC version
+> store, WAL and recovery have sources under `src/tractable/`, but the test file
+> this document names (`tests/test_txn.c`) does not exist and no test in
+> `tests/` calls `qihse_txn_*`.
+
 ## 1. Overview
 
 QIHSE provides full ACID transaction support across all storage engines. The transaction layer consists of a transaction manager, an MVCC version store, a unified Write-Ahead Log, and a crash recovery module.

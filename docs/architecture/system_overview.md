@@ -1,5 +1,11 @@
 # QIHSE System Architecture & Engine Overview
 
+> **Status: partial — status unverified.** This is a broad engine overview. The
+> subsystems it summarises have their own documents and status lines, and
+> several of those (SQL, transactions, secondary indexes, replication) cite test
+> files that do not exist. Read the per-subsystem status line before relying on
+> a claim here.
+
 QIHSE is a native C99 multi-model database engine designed for high-throughput, low-latency workloads. It unifies eight distinct storage engines under a single process space and memory hierarchy, eliminating the operational overhead of managing fragmented database infrastructure.
 
 ---

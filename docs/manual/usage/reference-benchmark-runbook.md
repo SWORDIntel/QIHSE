@@ -1,5 +1,10 @@
 # Reference benchmark and validation runbook
 
+> **Status: implemented** — every `make` target named in this runbook exists in
+> the root Makefile (`bench-reference-runner-smoke`, `bench-reference-workload`,
+> `bench-sift1m-fallback-data`, `calibrate-sift1m-workload`, `test-persist`,
+> `validate-reference-workflow`).
+
 Use these commands for repeatable evidence in local integration and CI-like checks.
 
 ## Fast local validation

@@ -23,6 +23,13 @@
 
 ---
 
+> **Status: partial.** QIHSE is a large systems project with production-oriented
+> components: some subsystems are implemented and test-verified, others are
+> experimental, partial, or planned. Each document in the documentation tree
+> states its own status; the vocabulary and its rules are defined in
+> [docs/README.md](docs/README.md#documentation-status-labels), and the API
+> surface is catalogued in [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+
 ## What is QIHSE?
 
 QIHSE is an attempt to solve a common infrastructure problem: one application increasingly needs several different kinds of database at once.
@@ -128,7 +135,7 @@ See **[Getting Started](docs/GETTING_STARTED.md)** for build dependencies, SDK u
 
 ## Python example
 
-The Python bindings expose the native engine without requiring a separate database service for local use.
+The Python bindings expose the native engine without requiring a separate database service for local use. The full Python and C surface is catalogued in the **[API Reference](docs/API_REFERENCE.md)**.
 
 ```python
 import numpy as np
@@ -142,7 +149,7 @@ with qihse.VectorDB.create("/tmp/example-qihse", dims=128) as db:
     print(results)
 ```
 
-Python compatibility clients for other database interfaces are under [`sdks/python/`](sdks/python/). Rust and C interfaces live under [`sdks/rust/`](sdks/rust/) and [`sdks/c/`](sdks/c/).
+Python compatibility clients for other database interfaces are under [`sdks/python/`](sdks/python/), and C compatibility clients are under [`sdks/c/`](sdks/c/). [`sdks/rust/`](sdks/rust/) currently contains only `Cargo.toml` and `Cargo.lock` — the Rust SDK is not implemented yet.
 
 ---
 
@@ -236,6 +243,7 @@ For a task-oriented index, use the **[documentation hub](docs/README.md)**.
 | If you want to… | Start here |
 |---|---|
 | Build and run QIHSE | [Getting Started](docs/GETTING_STARTED.md) |
+| Call the C API, Python SDK, or set configuration | [API Reference](docs/API_REFERENCE.md) |
 | Understand the database engines | [Features](docs/FEATURES.md) |
 | Integrate an existing DB client | [Compatibility](docs/COMPATIBILITY.md) |
 | Understand the overall design | [Architecture](docs/architecture/) |

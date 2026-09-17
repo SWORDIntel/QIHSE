@@ -1,5 +1,9 @@
 # QIHSE + KEYSTONE 5-Pillar Integrated Architecture Benchmark & Comparative Analysis
 
+> **Status: partial.** Comparative results depend on the KEYSTONE build, the
+> dataset and the host; the document records one configuration. Treat the
+> comparison as a measurement of that configuration, not as a general claim.
+
 ## Overview
 
 The QIHSE (Quantum-Inspired Hilbert Space Expansion Search) and KEYSTONE integration forms a hardware-aware, zero-copy, multi-model data platform capable of unified vector search, columnar OLAP, time-series telemetry, key-value storage, and full-text search (FTS) with neural semantic classification.

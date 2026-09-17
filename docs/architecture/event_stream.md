@@ -1,5 +1,13 @@
 # QIHSE Event Stream — Record-Framed Commit Log
 
+> **Status: implemented** — the record format, durability modes, replay, and
+> torn-tail recovery are verified by `tests/qihse_event_stream_test.c`
+> (`make test-event-stream`).
+>
+> **Minor discrepancy:** the testing section below says "16 test cases with 49
+> assertions"; the file contains 14 test functions, and its own harness prints
+> the counts it observed at run time.
+
 ## Overview
 
 The QIHSE Event Stream (`qihse_event_stream`) is a durable, record-framed commit log

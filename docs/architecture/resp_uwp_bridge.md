@@ -1,5 +1,10 @@
 # RESP ↔ UWP Bridge Architecture
 
+> **Status: implemented** — the stateless execute bridge, its `NULL`-user
+> rejection, and the pub/sub path are verified by
+> `tests/test_resp_security_regression.c` and `tests/test_resp_pubsub.c`
+> (`make -f Makefile -f tests/security-regression.mk test-security-regressions`).
+
 ## Overview
 
 QIHSE serves Redis-compatible workloads (RESP2/RESP3) and its own Unified Wire

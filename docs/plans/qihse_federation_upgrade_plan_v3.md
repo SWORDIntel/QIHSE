@@ -1,5 +1,10 @@
 # QIHSE — Federation Database Layer Upgrade Design Brief
 
+> **Status: planned.** The governing brief for the federation work. The stages
+> it specifies that are built are recorded in
+> [architecture/federation_overview.md](../architecture/federation_overview.md);
+> the rest of this document describes intent, not the tree.
+
 **Document type:** AI implementation brief  
 **Target repository:** `SWORDIntel/QIHSE`  
 **Role in system:** Distributed state, persistence, telemetry, event, and metadata substrate  

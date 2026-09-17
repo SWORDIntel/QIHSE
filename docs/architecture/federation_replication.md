@@ -1,7 +1,13 @@
 # Federation Replication
 
-> **Status: partial.** The comparison and planning half of anti-entropy is
-> implemented. The transport that would execute a plan is not.
+> **Status: implemented** — manifests, sync plans, the pluggable transport, the
+> loopback transport, and resumable digest-verified range transfer are verified
+> by `tests/test_federation_repl.c`.
+>
+> **Contradiction:** the "What is not implemented" section below is stale. The
+> transport that carries ranges, the bounded resumable cursor, and checksum
+> verification of transferred data all exist in
+> `src/federation/qihse_federation_repl.c`.
 
 ## Anti-entropy model
 
@@ -47,6 +53,11 @@ which is what makes a merge outcome reproducible.
 | `QIHSE_SYNC_CONFLICT` | both have objects and they diverge |
 
 ## What is not implemented
+
+> **Section status: partial — this list is stale.** The transport, the
+> resumable cursor and checksum verification all exist in
+> `src/federation/qihse_federation_repl.c`. See the contradiction note at the
+> top of this document.
 
 - The transport that carries ranges between peers.
 - Rate limiting and resumable transfer (the plan is a plan, not a cursor).

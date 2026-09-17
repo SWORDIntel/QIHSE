@@ -1,5 +1,11 @@
 # QIHSE Performance Benchmarks & Hot-Path Profiling Report
 
+> **Status: partial.** The harness targets described here exist
+> (`make bench-hotpath` and the programs under `benchmarks/`), but the numbers
+> are only meaningful with the hardware, dataset, compiler, ISA and workload
+> configuration that produced them. Results are not reproducible from this
+> document alone.
+
 QIHSE treats data retrieval as a low-level systems problem. Rather than acting as a traditional managed dashboard or heavy intermediary application, QIHSE acts as a native memory overlay with SIMD-accelerated execution pipelines.
 
 To validate sub-microsecond retrieval across diverse storage paradigms, QIHSE provides a dedicated profiling harness (`make bench-hotpath`) measuring latency percentiles (mean, p50, p95, p99, max) and transaction throughput across all core engines.

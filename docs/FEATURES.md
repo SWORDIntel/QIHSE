@@ -1,5 +1,12 @@
 # QIHSE Features
 
+> **Status: partial.** This is a feature map, and per-engine verification
+> varies. Engines with CI-wired tests include the event stream, document store,
+> column store, time-series, FTS, graph, vector DB and routing persistence.
+> SQL, transactions and secondary indexes cite test files that do not exist —
+> see the status lines in
+> [architecture/](architecture/) for the specific documents.
+
 This document is the detailed feature map for QIHSE. The [root README](../README.md) intentionally stays higher level.
 
 QIHSE is a native-C, multi-model database system built around a shared memory, execution, persistence, and protocol layer. The goal is not to bolt unrelated databases together; it is to expose different data models through one runtime.

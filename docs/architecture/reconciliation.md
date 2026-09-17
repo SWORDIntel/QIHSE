@@ -1,5 +1,14 @@
 # Reconciliation
 
+> **Status: implemented** — the ordered sequence, the ownership gate, and
+> resumable progress are verified by `tests/test_federation_rejoin.c` and
+> `tests/test_federation_f8_ops.c`.
+>
+> **Contradiction:** the "What is not implemented" section below is stale.
+> `TRANSFER_EVENTS` and `RECONSTRUCT_STATE` are driven by
+> `qihse_rejoin_driver_step()` in `src/federation/qihse_federation_rejoin.c`,
+> which moves records through `qihse_repl_sync_round()`.
+
 On rejoin, a node must not immediately publish stale exclusive ownership as
 authoritative. The sequence is therefore explicit and ordered.
 
@@ -47,6 +56,11 @@ typedef struct {
 ```
 
 ## What is not implemented
+
+> **Section status: partial — this section is stale.** `TRANSFER_EVENTS` and
+> `RECONSTRUCT_STATE` do move data: `qihse_rejoin_driver_step()` drives
+> `qihse_repl_sync_round()` in `src/federation/qihse_federation_rejoin.c`. See
+> the contradiction note at the top of this document.
 
 Steps `TRANSFER_EVENTS` and `RECONSTRUCT_STATE` are represented and ordered but
 do not yet move data, because the replication transport is not implemented

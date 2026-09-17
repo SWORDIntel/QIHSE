@@ -1,5 +1,13 @@
 # QIHSE Redis-Compatible Sharded Cluster Engine — Native Hardware-Aware Implementation Plan
 
+> **Status: partial.** The engine it plans exists and has tests
+> (`tests/test_resp_cluster.c`, `tests/test_cluster_slot.c`,
+> `tests/test_cluster_scatter.c`, `tests/test_cluster_failover.c`), but the
+> "COMPLETE — tested and benchmarked" header overstates verification: the
+> failover path is a coordinator rather than the "Raft consensus" claimed in
+> [architecture/cluster_sharding.md](../architecture/cluster_sharding.md), and
+> the four commit hashes cited here do not resolve in the current history.
+
 > **Status**: COMPLETE — All 5 phases implemented, tested, and benchmarked.
 > See [Cluster Sharding Architecture](../architecture/cluster_sharding.md) for the full implementation reference.
 >

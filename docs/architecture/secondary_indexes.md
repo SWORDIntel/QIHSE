@@ -1,5 +1,10 @@
 # QIHSE Secondary Index Architecture
 
+> **Status: partial — status unverified.** The B+ tree, hash index, index
+> manager and index-scan executor have sources under `src/frieze/`, but the test
+> file this document names (`tests/test_indexes.c`) does not exist and no test
+> in `tests/` calls `qihse_btree_*` or `qihse_hash_index_*`.
+
 ## 1. Overview
 
 QIHSE provides secondary index support beyond the primary key index (Trinary Trie in the KV store). The index layer consists of B+ tree and hash index implementations, an index manager, and an index scan executor that integrates with the query optimizer.

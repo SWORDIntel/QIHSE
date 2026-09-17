@@ -1,5 +1,13 @@
 # Session-Delivery Subsystem (U1–U9)
 
+> **Status: implemented** — all nine upgrades are verified by the security
+> regression suite in `tests/security-regression.mk`
+> (`test-blob-security-regression`, `test-tenant-security-regression`,
+> `test-tenant-privilege-ladder`, `test-ingest-guard-regression`,
+> `test-killswitch-regression`, `test-retention-regression`,
+> `test-export-regression`, `test-metrics-regression`,
+> `test-sci-compartment-regression`).
+
 Architecture for the session-delivery workload upgrades specified in
 [`SESSION_DELIVERY_UPGRADES.md`](../../SESSION_DELIVERY_UPGRADES.md)
 (SparkBench-class multi-tenant clients). **All nine upgrades are implemented**

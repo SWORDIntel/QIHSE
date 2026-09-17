@@ -1,5 +1,16 @@
 # QIHSE Security Guide
 
+> **Status: partial.** The security controls that exist — certificate-backed
+> TLS 1.3 by default, PBKDF2-HMAC-SHA-384 verifiers, object ACL flags, opaque
+> user handles, audit hash chaining — are described accurately at a high level
+> and are covered by the regression suite in `tests/security-regression.mk`.
+> **Contradiction with the code:** the "Cryptographic Operations", "Key
+> Management", "Audit and Logging" and "Compliance Verification" sections are
+> API sketches for a `qihse_crypto_*` / `qihse_secure_log_*` /
+> `qihse_cnsa_checker_*` layer that does not exist in this repository. Those
+> symbols are absent from `include/`, from `src/`, and from the built
+> `libqihse.so`. Do not write code against them.
+
 This guide details the security features, access control architecture, and CNSA 2.0 alignment in QIHSE. **Note:** QIHSE has not yet achieved formal third-party CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption requires certificate-backed TLS 1.3 by default for network listeners (`QIHSE_UWP_ALLOW_INSECURE=1` is required for cleartext/dev opt-in). Post-quantum cryptography (`liboqs` / `oqs-provider` with ML-DSA-87 and ML-KEM-1024) is built and enabled by default. Passwords use CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) and [`hardening-report.md`](hardening-report.md) for the audit remediation history.
 
 ## Table of Contents
@@ -150,6 +161,15 @@ if (ret != QIHSE_SUCCESS) {
 ```
 
 ## Cryptographic Operations
+
+> **Section status: planned — the code below is an API sketch, not a
+> description of this repository.** The `qihse_crypto_*`, `qihse_secure_log_*`
+> and `qihse_cnsa_checker_*` symbols used in this section and in the
+> "Key Management", "Audit and Logging" and "Compliance Verification" sections
+> do not exist in `include/`, `src/`, or the built `libqihse.so`. The real
+> primitives are OpenSSL and liboqs calls reached through
+> `core/qihse_auth.c`, `core/qihse_audit.c` and `persistence/qihse_pqc_crypto.c`.
+> See the contradiction note at the top of this document.
 
 ### Secure Random Number Generation
 

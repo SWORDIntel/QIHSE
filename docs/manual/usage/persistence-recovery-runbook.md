@@ -1,5 +1,9 @@
 # Persistence recovery and reopen runbook
 
+> **Status: implemented** — the reopen and recovery paths are verified by
+> `tests/qihse_vector_db_persistence_test.c` (`make test-persist`, part of the
+> default `make test` list).
+
 Use this runbook whenever process restart, crash recovery, or corruption handling is involved.
 
 ## 1) Validate startup state

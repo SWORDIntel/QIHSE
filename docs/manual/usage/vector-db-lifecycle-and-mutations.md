@@ -1,5 +1,10 @@
 # Vector DB lifecycle and mutation usage
 
+> **Status: implemented** — the lifecycle, checkpoint and flush paths are
+> verified by `tests/qihse_vector_db_persistence_test.c` (`make test-persist`,
+> part of the default `make test` list); `core/qihse_abi.h` is the include it
+> names.
+
 This page is the practical baseline for opening and mutating QIHSE vector stores.
 
 ## 1) Build a runtime stack once

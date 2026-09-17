@@ -1,7 +1,16 @@
 # QIHSE Cluster Sharding Engine — Architecture & Implementation
 
-> **Status**: Production-ready. All 5 phases implemented, tested, and benchmarked.
-> **Commits**: `685ce05` (P1-2), `6df02e0` (P3), `291b271` (P4), `a0a86ec` (P5)
+> **Status: partial.** The slot table, `-MOVED`/`-ASK` redirection,
+> scatter-gather and the failover coordinator are verified by
+> `tests/test_resp_cluster.c`, `tests/test_cluster_slot.c`,
+> `tests/test_cluster_scatter.c`, and `tests/test_cluster_failover.c`.
+>
+> **Contradictions with the code:** the property table below claims
+> "Failover — Raft consensus", but the tested failover path is
+> `src/spinnaker/qihse_cluster_failover.c`, an evidence-gated coordinator, not
+> Raft; `src/spinnaker/qihse_raft.c` is a separate module with no test and no
+> CI entry. The four commit hashes cited here (`685ce05`, `6df02e0`, `291b271`,
+> `a0a86ec`) do not resolve in the current repository history.
 
 ---
 

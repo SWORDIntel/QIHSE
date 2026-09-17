@@ -1,5 +1,9 @@
 # QIHSE Subsystem Architecture Diagram
 
+> **Status: partial — status unverified.** This is a schematic overview, not a
+> status claim. Subsystems shown here carry their own status lines in
+> [architecture/](../architecture/).
+
 A full-page schematic mapping the QIHSE database topology from kernel-bypass network ingress down to memory tiering, runtime SIMD dispatch arbiters, and durable persistence layers.
 
 ```mermaid

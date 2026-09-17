@@ -1,5 +1,16 @@
 # Trinary and file-backed query usage
 
+> **Status: partial.** The trinary/magnitude query paths and the file-backed
+> open flags it describes are real (`include/qihse_vector_db.h`, exercised by
+> `tests/qihse_vector_db_persistence_test.c` via `make test-persist`, and by
+> `tests/test_exact_search_parity.c`).
+>
+> **Unverified claim:** the "Battle-Tested Scale & Stability" callout asserts
+> 100,000+ iteration runs under autonomous generative harnesses. No harness of
+> that name exists in `tests/`, and the claim is not reproducible from this
+> document. Treat it as a statement about a local run, not a repository
+> guarantee.
+
 QIHSE keeps float32 vectors authoritative by default. Trinary (`qtri`) and
 magnitude (`qmag`) are used as candidate selectors; `QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS`
 adds an explicit approximate fast path.

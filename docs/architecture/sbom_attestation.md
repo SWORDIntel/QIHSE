@@ -1,5 +1,9 @@
 # SBOM and Attestation Records
 
+> **Status: implemented** — SBOM immutability, artifact lookup, and the
+> separation of vulnerability observations are verified by
+> `tests/test_federation_f6.c`.
+
 QIHSE stores normalized supply-chain evidence. It does not hold private
 signing keys.
 

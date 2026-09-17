@@ -1,5 +1,11 @@
 # Controller-Facing API
 
+> **Status: implemented** — the RESP-level `FEDERATION.*` surface is exercised
+> by `tests/test_federation_f1.c` (status, namespaces, and the low-clearance
+> negative test required by `AGENTS.md` invariant 3) through
+> `tests/test_federation_f8_ops.c`. Rust and Python controller SDKs remain
+> `planned`.
+
 The controller talks to QIHSE through a narrow, first-class federation surface
 rather than pretending to be a Redis or PostgreSQL client. Every command is
 restricted to the **system tenant**; tenant principals receive `NOPERM`.

@@ -1,5 +1,8 @@
 # QIHSE Documentation
 
+> **Status: implemented** — every relative link on this page resolves, and the
+> status vocabulary used across the tree is defined below.
+
 This directory contains the detailed technical documentation for QIHSE.
 
 If you are new to the project, start with the [root README](../README.md), then use this page to go deeper without having to understand the repository layout first.
@@ -9,6 +12,7 @@ If you are new to the project, start with the [root README](../README.md), then 
 | I want to… | Read… |
 |---|---|
 | Build and run QIHSE | [Getting Started](GETTING_STARTED.md) |
+| Call the C API, Python SDK, or set configuration | [API Reference](API_REFERENCE.md) |
 | See the major subsystems | [Features](FEATURES.md) |
 | Use an existing database client/protocol | [Compatibility](COMPATIBILITY.md) |
 | Understand the architecture | [Architecture](architecture/) |
@@ -21,6 +25,39 @@ If you are new to the project, start with the [root README](../README.md), then 
 | See where the project is headed | [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) |
 
 The original [whitepaper v1.0](architecture/qihse_whitepaper_v1.0.md) is retained as a historical design snapshot. Use v1.1 for current implementation status, roadmap state, claim discipline, and production-readiness language.
+
+## Documentation status labels
+
+Every document in this tree states its status on one line near the top:
+
+```
+> **Status: <value>** — <evidence>
+```
+
+The vocabulary is closed. Use these six values, never interchangeably:
+
+| Value | Means | Evidence required |
+|---|---|---|
+| `implemented` | Built and reachable in the current tree | A test must exist; name the test file |
+| `experimental` | Built, deliberately unstable or opt-in, not recommended for production | Name the test or state plainly that none exists |
+| `partial` | Works for some inputs, paths, or configurations and not others | Say which |
+| `planned` | Described but not built | Name the design document |
+| `superseded` | Retained for design history; a newer document or implementation replaces it | Name the replacement |
+| `externally validated` | Assessed by a party outside the project | Name the report and its date |
+
+Rules:
+
+- A design document is never evidence of implementation. "Described in
+  `docs/plans/`" means `planned`, not `implemented`.
+- `implemented` without a named test is a documentation defect. Where the code
+  exists but no test does, the honest label is
+  `partial — status unverified`, with the reason stated.
+- Where a document's claim is contradicted by the code, the contradiction is
+  noted in place rather than the claim being silently rewritten.
+- Documents that mix statuses carry a status line per major section as well as
+  one at the top.
+- Certification is never inferred from implemented cryptography. QIHSE does not
+  claim third-party audit, FIPS 140-3 validation, or CNSA 2.0 certification.
 
 ## Core architecture
 

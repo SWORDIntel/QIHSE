@@ -1,5 +1,9 @@
 # QIHSE Reference Workloads: Commercial Validation Suite
 
+> **Status: partial — status unverified.** This is a workload-design document.
+> The named workloads are not all wired to runnable harnesses in `benchmarks/`,
+> so the suite as described is not executable end to end.
+
 ## Benchmark Design for Enterprise-Grade Validation
 
 **Purpose:** Establish credible performance claims through standardized, reproducible benchmarks that reflect real-world usage patterns.

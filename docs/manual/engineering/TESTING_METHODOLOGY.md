@@ -1,5 +1,10 @@
 # QIHSE Testing Methodology: The "Omni-Test" Standard
 
+> **Status: partial — status unverified.** The CI suite it describes does run
+> (`make test`, plus `tests/security-regression.mk` and the ASan/UBSan gates in
+> `.github/workflows/`), but the "autonomous generative harness"
+> (`VectorReVamp`) named here is not a component in this tree.
+
 When building an endgame database engine that operates across Unified (UMA) and Heterogeneous (HMA) Memory Architectures, "standard testing" is insufficient. QIHSE employs a hostile, adversarial approach to validation to ensure uncompromising stability, even under catastrophic loads or unauthorized access attempts.
 
 ## The Autonomous Generative Harness

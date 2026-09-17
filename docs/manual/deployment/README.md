@@ -1,5 +1,11 @@
 # QIHSE Deployment Guide
 
+> **Status: partial — status unverified.** A deployment guide that predates the
+> federation and mTLS work.
+>
+> **Repository rule violation:** this document contains absolute paths.
+> `AGENTS.md` requires strictly relative or dynamically resolved paths.
+
 This guide provides comprehensive instructions for deploying QIHSE in production environments, including single-node, multi-node cluster, and cloud deployments.
 
 ## Table of Contents

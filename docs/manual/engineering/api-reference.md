@@ -1,5 +1,10 @@
 # 🔧 QIHSE API Reference - Engineering Documentation
 
+> **Status: partial — status unverified.** An engineering reference for the
+> search library that predates the multi-model runtime. It is not verified
+> against the current headers and should not be used as an API contract; use
+> [../API_REFERENCE.md](../API_REFERENCE.md) instead.
+
 > **Complete Technical Reference for QIHSE Integration**
 
 ## Table of Contents

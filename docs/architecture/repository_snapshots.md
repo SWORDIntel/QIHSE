@@ -1,5 +1,8 @@
 # Repository Snapshots
 
+> **Status: implemented** — immutable repository snapshot records and the
+> repository filter are verified by `tests/test_federation_f6.c`.
+
 APT repository state is represented as an immutable snapshot object so a
 deployment can name the exact package closure it was assembled from.
 

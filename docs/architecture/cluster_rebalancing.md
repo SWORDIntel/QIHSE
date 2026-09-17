@@ -1,5 +1,10 @@
 # QIHSE Automated Zero-Downtime Cluster Rebalancing & Live Dynamic Migration
 
+> **Status: implemented** — the imbalance planner and migration state machine in
+> `src/spinnaker/qihse_cluster_rebalance.c` are verified by
+> `tests/test_cluster_rebalance.c` (`make test-cluster-rebalance`; the target
+> exists but is not part of the default `make test` list).
+
 ## 1. Executive Summary
 
 QIHSE features an autonomous, zero-downtime **Cluster Slot Rebalancing and Dynamic Migration Engine** (`include/qihse_cluster_rebalance.h`). When new nodes join via `CLUSTER MEET` or hardware nodes fail over, the cluster autonomously calculates slot variances across all primary nodes and transitions hash slots with zero downtime using non-blocking `-ASK` handoffs.

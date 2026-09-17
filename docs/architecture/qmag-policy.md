@@ -1,5 +1,9 @@
 # QMAG Default Policy Guidance
 
+> **Status: implemented** — the default-pool fallback policy and the 100-case
+> loss patterns are covered by `tests/qihse_vector_db_persistence_test.c`
+> (`make test-persist`, part of the default `make test` list).
+
 This note captures the result-driven policy from the 100-case qmag sweep and
 the dimension-mapped default heuristic.
 

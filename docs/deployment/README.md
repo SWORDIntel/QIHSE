@@ -1,5 +1,13 @@
 # QIHSE Deployment Guide
 
+> **Status: partial — status unverified.** A deployment guide that predates the
+> federation and mTLS work; cluster and TLS guidance should be checked against
+> [architecture/federation_overview.md](../architecture/federation_overview.md)
+> and the [API reference](../API_REFERENCE.md).
+>
+> **Repository rule violation:** this document contains absolute paths.
+> `AGENTS.md` requires strictly relative or dynamically resolved paths.
+
 This guide provides comprehensive instructions for deploying QIHSE in production environments, including single-node, multi-node cluster, and cloud deployments.
 
 ## Table of Contents

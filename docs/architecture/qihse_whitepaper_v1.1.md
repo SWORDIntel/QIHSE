@@ -1,5 +1,12 @@
 # QIHSE — Self-Optimizing Multi-Model Search and Database Runtime
 
+> **Status: partial.** This is a synthesis document: its per-subsystem claims
+> are only as strong as the underlying documents and tests, and it states that
+> itself ("current repository code, tests, security reports, and reproducible
+> benchmarks take precedence"). Where this document and the code disagree, the
+> code wins. Per-subsystem status lives in the subsystem documents listed in
+> [docs/README.md](../README.md).
+
 ## Commercial Architecture Whitepaper v1.1
 
 **Original design date:** 2025-12-27  

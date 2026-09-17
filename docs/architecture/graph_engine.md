@@ -1,5 +1,13 @@
 # Graph Engine & Cypher
 
+> **Status: implemented** — the graph store, Cypher parser and executor, graph
+> algorithms, and graph+vector fusion are verified by `tests/test_graph.c`.
+> "Drop-in replacement for Neo4j" is a compatibility goal, not a verified
+> claim: Bolt coverage is unverified — see [bolt_protocol.md](bolt_protocol.md).
+>
+> **Minor discrepancy:** the testing section below says "12 tests in
+> `tests/test_graph.c`"; the file contains 18 test functions.
+
 ## Overview
 
 QIHSE's Graph Engine provides explicit vertex/edge storage with a Cypher-compatible query language, making QIHSE a drop-in replacement for Neo4j. The engine integrates with the vector DB for hybrid similarity+traversal search.

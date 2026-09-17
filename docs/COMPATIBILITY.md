@@ -1,5 +1,14 @@
 # Protocol and Client Compatibility
 
+> **Status: partial.** The protocol surfaces listed here exist in the tree, but
+> verification is uneven. RESP, pub/sub, pgwire cluster and the UWP bridge have
+> tests (`tests/test_resp_cluster.c`, `tests/test_resp_pubsub.c`,
+> `tests/test_pg_wire_cluster.c`, `tests/test_resp_security_regression.c`), and
+> SQLite VFS has `tests/test_sqlite_vfs.c`. Bolt has no test at all (see
+> [architecture/bolt_protocol.md](architecture/bolt_protocol.md)), and the
+> MongoDB, ClickHouse, Elasticsearch and InfluxDB surfaces have no dedicated
+> tests in `tests/`.
+
 QIHSE exposes compatibility layers for several established database protocols and client ecosystems. This lets existing applications reach QIHSE without requiring every workload to adopt the native UWP interface immediately.
 
 Compatibility is implemented inside QIHSE; it is not a statement that every edge case of every upstream database is identical. Treat this document as the supported surface, then validate application-specific behavior before migration.

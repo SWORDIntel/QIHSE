@@ -1,5 +1,8 @@
 # QIHSE Usage Guides
 
+> **Status: implemented** — an index of the usage guides in this directory; the
+> linked documents all exist.
+
 This folder holds practical, how-to documentation for key runtime paths that are
 used in production and are easy to miss in the monolithic architecture and API
 reference docs.

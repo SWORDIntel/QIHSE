@@ -1,5 +1,13 @@
 # QIHSE Network Intelligence — Routing Persistence Integration
 
+> **Status: implemented** — the BGP/RPKI/RDAP/PTR persistence adapter and its
+> event-stream, timeseries and column-store paths are verified by
+> `tests/qihse_routing_persistence_test.c` (`make test-routing-persistence`,
+> part of the default `make test` list).
+>
+> **Minor discrepancy:** the testing section below reports "10 test cases"; the
+> file contains 9 test functions, and the harness prints its own totals.
+
 ## Overview
 
 QIHSE's `network_intelligence/` subsystem integrates TGMap's routing observation

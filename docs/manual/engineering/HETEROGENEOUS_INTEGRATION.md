@@ -1,5 +1,10 @@
 # QIHSE Heterogeneous Compute Integration
 
+> **Status: partial — status unverified.** The heterogeneous compute pipeline it
+> describes has sources under `backends/` and `memory/`, but no test in
+> `tests/` verifies the speedup claims, and the document is not maintained
+> against the current backends.
+
 ## Overview
 The Quantum-Inspired Hilbert Space Expansion (QIHSE) library now features a fully integrated heterogeneous compute pipeline. It dynamically offloads parallel workload partitions across multiple hardware architectures to achieve massive speedups over classical binary search and industry-standard vector search algorithms.
 

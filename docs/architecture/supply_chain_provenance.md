@@ -1,5 +1,9 @@
 # Supply-Chain Provenance Graph
 
+> **Status: implemented** — the provenance graph, direction-aware traversal,
+> trace-back and reverse-impact queries are verified by
+> `tests/test_federation_f6.c`.
+
 QIHSE is the authoritative provenance graph for Citadel software artifacts.
 
 ## Entity types

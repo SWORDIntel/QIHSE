@@ -1,5 +1,8 @@
 # Sovereign Nodes
 
+> **Status: implemented** — the two-identity model and local survivability under
+> isolation are verified by the S1/S4 scenarios in `tests/test_federation_f8.c`.
+
 Every QIHSE node has two simultaneous identities:
 
 ```

@@ -1,5 +1,9 @@
 # QIHSE Phase 2: Advanced Memory Management & Vector Database Integration
 
+> **Status: superseded** — a phase-2 design note retained for history. Current
+> memory work is documented by the memory subsystem and the
+> [technical whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md).
+
 ## Overview
 
 Phase 2 introduces revolutionary memory management and vector database integration capabilities to QIHSE, enabling **memory superposition** across heterogeneous compute devices and **instant vector access** through intelligent pre-loading.

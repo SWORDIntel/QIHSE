@@ -1,5 +1,8 @@
 # QIHSE Reference Workloads: Commercial Validation Suite
 
+> **Status: superseded** — superseded by
+> [reference_workloads.md](reference_workloads.md).
+
 ## Benchmark Design for Enterprise-Grade Validation
 
 **Purpose:** Establish credible performance claims through standardized, reproducible benchmarks that reflect real-world usage patterns.

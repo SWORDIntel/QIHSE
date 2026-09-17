@@ -1,17 +1,10 @@
 # AI Compute Fabric — Superseding MEMSHADOW
 
-> **Implementation status (2026-09-16):** all five items are implemented —
-> NODE_CAP capability frames (`QIHSE_BUS_MSG_NODE_CAP`, getter
-> `qihse_cluster_bus_node_caps()`), the KEYSTONE fabric index
-> (`src/spinnaker/qihse_fabric_index.c`, CI-gated by
-> `tests/test_fabric_index.c`), fabric job dispatch (`FABRIC.CAPS` /
-> `FABRIC.SUBMIT` / `FABRIC.RESULT` in `qihse_resp_engine.c`, KV keys
-> `fabric:job:<id>` / `fabric:result:<id>`), capability-aware brain placement
-> (the cluster brain's target selection consumes NODE_CAP headroom and
-> journals the evidence — `tests/test_brain_actuate.c`), and the local-first
-> AI memory API (`src/spinnaker/qihse_ai_memory.c`, `tests/test_ai_memory.c`).
-> Items 3–5 build on the federation primitives where the plan provides them
-> (HLC-stamped identities, per-object generations).
+> **Status: implemented** — items 1–5 are verified by `tests/test_fabric_index.c`
+> (KEYSTONE fabric index), `tests/test_brain_actuate.c` (capability-aware
+> placement), and `tests/test_ai_memory.c` (local-first AI memory, including an
+> RBAC negative test). Embedding-backed semantic recall is `planned`: recall
+> today is BM25 over caller-visible documents.
 
 Design of record for the heterogeneous AI compute cluster built on QIHSE +
 KEYSTONE. This document is the execution spec: subagents and future sessions

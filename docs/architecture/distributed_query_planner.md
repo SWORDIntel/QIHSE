@@ -1,5 +1,11 @@
 # QIHSE Distributed Scatter-Gather SQL/QQL Multi-Engine Planner
 
+> **Status: partial.** The planner and hardware-aware dispatch are verified by
+> `tests/test_dist_planner.c` and `tests/test_dist_planner_hardware.c`, but the
+> engine dispatch table below names `qihse_doc_store_get()`, which does not
+> exist anywhere in the tree — the document-store hook is not implemented as
+> described.
+
 ## 1. Executive Summary
 
 QIHSE incorporates a native **Distributed Scatter-Gather Query Planner** (`include/qihse_dist_planner.h`) designed to orchestrate complex composite SQL and QQL statements across sharded cluster nodes and multi-model storage backends.

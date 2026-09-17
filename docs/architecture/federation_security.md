@@ -1,7 +1,20 @@
 # Federation Security
 
-> **Status: identity, signing and authorization are implemented. The mTLS
-> transport binding is not.**
+> **Status: implemented** — node identity, enrollment, infrastructure scopes,
+> signed gossip with a persistent replay window, and the federation mTLS
+> binding are verified by `tests/test_federation_f5.c` and
+> `tests/test_federation_mtls.c`.
+>
+> **Contradictions with the code:** this document describes a node identity as
+> "a durable Ed25519 keypair" with a 32-byte `public_key`. The record type in
+> `include/qihse_federation.h` is algorithm-agile: it carries `sig_alg`,
+> `public_key_len`, and a 2592-byte key buffer, and the default for new
+> identities is ML-DSA-87 (`QIHSE_SIG_ALG_DEFAULT`). The document's description
+> matches only the legacy `qihse_federation_node_keygen()` entry point, which
+> is still Ed25519-only; `qihse_federation_node_keygen_alg()` is the general
+> path and the RESP enrollment command uses the ML-DSA-87 default. The closing
+> "What is not implemented" section (mTLS for federation RPC) is also stale —
+> the mTLS transport is implemented and tested.
 
 ## Node identity
 
@@ -77,6 +90,11 @@ advancing sequence. The replay window persists under
 peer.**
 
 ## What is not implemented
+
+> **Section status: implemented — this section is stale.** mTLS for federation
+> RPC is implemented in `src/federation/qihse_federation_transport.c` and
+> verified by `tests/test_federation_mtls.c`. See the contradiction note at the
+> top of this document.
 
 mTLS for federation RPC. The identity and signing substrate is in place; the
 TLS binding attaches where the overlay transport lands.

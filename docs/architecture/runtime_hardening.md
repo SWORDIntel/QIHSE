@@ -1,5 +1,9 @@
 # Runtime Hardening Profile
 
+> **Status: implemented** — the conservative default profile, drift detection,
+> and the severity-to-trust mapping are verified by
+> `tests/test_federation_f7.c`.
+
 QIHSE is a network-facing, state-authoritative component and requires its own
 explicit security profile.
 
