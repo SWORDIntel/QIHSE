@@ -29,6 +29,14 @@ static const char* op_next_field(const char* p, char* out, size_t cap) {
 
 static pthread_mutex_t g_ops_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Decoders must refuse a record they could not have produced.  An enum field
+ * outside its range means the bytes are corrupt (or hostile), and returning a
+ * "successfully decoded" record with a nonsense state would turn a damaged
+ * record into a plausible-looking lie. */
+static bool enum_in_range(uint64_t v, uint32_t count) {
+    return v < (uint64_t)count;
+}
+
 /* ── Schema evolution (v3.md §24) ──────────────────────────────────────── */
 
 const char* qihse_schema_result_name(qihse_schema_result_t r) {
@@ -286,8 +294,10 @@ bool qihse_snapshot_lookup(void* store_void, void* user_void,
     size_t nfields = 15u + QIHSE_SNAPSHOT_MAX_GROUPS + 1u;
     for (size_t i = 0; i < nfields; i++) p = op_next_field(p, f[i], sizeof(f[i]));
 
-    (void)qihse_uuid_parse(f[0], &out->snapshot_id);
-    out->kind = (qihse_snapshot_kind_t)strtoul(f[1], NULL, 10);
+    if (!qihse_uuid_parse(f[0], &out->snapshot_id)) { free(blob); return false; }
+    uint64_t kind_raw = strtoull(f[1], NULL, 10);
+    if (!enum_in_range(kind_raw, 2u)) { free(blob); return false; }
+    out->kind = (qihse_snapshot_kind_t)kind_raw;
     (void)qihse_uuid_parse(f[2], &out->cluster_id);
     (void)qihse_uuid_parse(f[3], &out->created_by);
     out->created_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
@@ -316,6 +326,8 @@ bool qihse_snapshot_lookup(void* store_void, void* user_void,
         out->checksum[i] = (uint8_t)byte;
     }
     free(blob);
+    /* The body's snapshot id must agree with the key. */
+    if (!qihse_uuid_equal(&out->snapshot_id, snapshot_id)) return false;
     return true;
 }
 
@@ -465,14 +477,17 @@ bool qihse_rejoin_state_get(void* store_void, void* user_void,
     const char* p = blob;
     for (size_t i = 0; i < 8u; i++) p = op_next_field(p, f[i], sizeof(f[i]));
     free(blob);
-    (void)qihse_uuid_parse(f[0], &out->node_id);
-    (void)qihse_uuid_parse(f[1], &out->peer_node);
-    out->step = (qihse_rejoin_step_t)strtoul(f[2], NULL, 10);
+    if (!qihse_uuid_parse(f[0], &out->node_id)) return false;
+    if (!qihse_uuid_parse(f[1], &out->peer_node)) return false;
+    uint64_t step_raw = strtoull(f[2], NULL, 10);
+    if (!enum_in_range(step_raw, (uint32_t)QIHSE_REJOIN_ABORTED + 1u)) return false;
+    out->step = (qihse_rejoin_step_t)step_raw;
     out->started_hlc_physical = (uint64_t)strtoull(f[3], NULL, 10);
     out->updated_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
     out->events_transferred = (uint64_t)strtoull(f[5], NULL, 10);
     out->conflicts_applied = (uint64_t)strtoull(f[6], NULL, 10);
     snprintf(out->last_error, sizeof(out->last_error), "%s", f[7]);
+    if (!qihse_uuid_equal(&out->node_id, node_id)) return false;
     return true;
 }
 

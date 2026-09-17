@@ -93,7 +93,7 @@ The accepted major direction. Governing principle: **federation must enhance a n
   - [x] Reconciliation safety state machine: the explicit ordered rejoin sequence, with ownership publication withheld until state is reconstructed and checksums verified.
   - [x] Observability metrics: all 21 series from the brief, rendered label-bounded with no node or namespace labels.
   - [x] Performance regression budgets: each metric independently enforced, unmeasured metrics skipped so a partial harness cannot produce a false failure. *Closes criterion 14.*
-  - [ ] Fuzzing targets for wire and persisted parsers
+  - [x] Fuzzing targets for wire and persisted parsers: 16 string parsers x 4000 hostile inputs, 11 persisted-record readers x 600 corrupt records, byte-flip mutation of a valid record, and numeric overflow probes. The fuzzer found two real fail-open bugs, both fixed: decoders accepted out-of-range enum values, and readers returned records whose embedded id disagreed with the key they were stored under.
   - [ ] Architecture documentation set
 
 ### W2 — AI compute fabric

@@ -842,7 +842,11 @@ static bool build_job_decode(const char* blob, qihse_build_job_t* out) {
     snprintf(out->source_revision, sizeof(out->source_revision), "%s", f_rev);
     snprintf(out->profile, sizeof(out->profile), "%s", f_profile);
     snprintf(out->toolchain, sizeof(out->toolchain), "%s", f_toolchain);
-    out->state = (qihse_build_state_t)strtoul(f_state, NULL, 10);
+    {
+        unsigned long st = strtoul(f_state, NULL, 10);
+        if (st > (unsigned long)QIHSE_BUILD_CANCELLED) return false;
+        out->state = (qihse_build_state_t)st;
+    }
     out->generation = (uint64_t)strtoull(f_gen, NULL, 10);
     (void)hex_to_uuid(f_owner, &out->owner_node);
     (void)hex_to_uuid(f_lease, &out->lease_id);
@@ -893,6 +897,8 @@ bool qihse_build_job_get(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = build_job_decode(blob, out);
     free(blob);
+    /* The body's build id must agree with the key. */
+    if (ok && !qihse_uuid_equal(&out->build_id, build_id)) return false;
     return ok;
 }
 
@@ -1186,6 +1192,7 @@ bool qihse_sbom_record_get(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = sbom_decode(blob, out);
     free(blob);
+    if (ok && !qihse_uuid_equal(&out->sbom_id, sbom_id)) return false;
     return ok;
 }
 
@@ -1275,6 +1282,7 @@ bool qihse_vuln_observation_get(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = vuln_decode(blob, out);
     free(blob);
+    if (ok && !qihse_uuid_equal(&out->observation_id, observation_id)) return false;
     return ok;
 }
 
@@ -1376,6 +1384,7 @@ bool qihse_repo_snapshot_get(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = repo_snap_decode(blob, out);
     free(blob);
+    if (ok && !qihse_uuid_equal(&out->snapshot_id, snapshot_id)) return false;
     return ok;
 }
 

@@ -192,7 +192,9 @@ static bool verification_decode(const char* blob, qihse_trust_verification_t* ou
     const char* p = blob;
     for (size_t i = 0; i < 7u; i++) p = rt_next_field(p, f[i], sizeof(f[i]));
     if (!rt_uuid_from_hex(f[0], &out->node_id)) return false;
-    out->trust_state = (qihse_runtime_trust_t)strtoul(f[1], NULL, 10);
+    uint64_t trust_raw = strtoull(f[1], NULL, 10);
+    if (trust_raw > (uint64_t)QIHSE_RTRUST_REVOKED) return false;
+    out->trust_state = (qihse_runtime_trust_t)trust_raw;
     out->trust_policy_generation = (uint64_t)strtoull(f[2], NULL, 10);
     (void)rt_uuid_from_hex(f[3], &out->evidence_bundle_id);
     out->evidence_verified_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
@@ -274,6 +276,8 @@ bool qihse_trust_verification_get(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = verification_decode(blob, out);
     free(blob);
+    /* The body's node id must agree with the key. */
+    if (ok && !qihse_uuid_equal(&out->node_id, node_id)) return false;
     return ok;
 }
 

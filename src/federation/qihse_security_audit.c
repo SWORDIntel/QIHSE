@@ -168,7 +168,9 @@ static bool runtime_profile_decode(const char* blob, qihse_runtime_profile_t* ou
     out->expected_uid = (int32_t)strtol(f[6], NULL, 10);
     out->expected_gid = (int32_t)strtol(f[7], NULL, 10);
     for (size_t i = 0; i < QIHSE_IFACE_COUNT; i++) {
-        out->interfaces[i] = (qihse_iface_class_t)strtoul(f[8 + i], NULL, 10);
+        unsigned long cls = strtoul(f[8 + i], NULL, 10);
+        if (cls > (unsigned long)QIHSE_IFACE_UNKNOWN) return false;
+        out->interfaces[i] = (qihse_iface_class_t)cls;
     }
     return true;
 }

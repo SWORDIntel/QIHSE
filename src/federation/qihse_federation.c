@@ -1073,6 +1073,7 @@ static bool conflict_decode(const char* blob, qihse_federation_conflict_t* out) 
     /* resolved_at_hlc_physical */
     resolved_at = strtoull(p, (char**)&p, 10);
 
+    if (policy_u > (unsigned)QIHSE_CONFLICT_CUSTOM) return false;
     out->policy = (qihse_conflict_policy_t)policy_u;
     snprintf(out->namespace_name, sizeof(out->namespace_name), "%s", ns);
     snprintf(out->resource_id, sizeof(out->resource_id), "%s", resource);
@@ -1508,6 +1509,9 @@ static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
     snprintf(out->resource_id, sizeof(out->resource_id), "%s", resource);
     out->fencing_epoch = (uint64_t)fence;
     out->generation = (uint64_t)gen;
+    /* A state outside the enum means the record is corrupt; refuse rather
+     * than hand back a lease in a state that does not exist. */
+    if (state_u > (unsigned)QIHSE_LEASE_RELEASED) return false;
     out->state = (qihse_lease_state_t)state_u;
     out->issued_hlc_physical = (uint64_t)issued;
     out->expires_hlc_physical = (uint64_t)expires;
@@ -1666,6 +1670,10 @@ bool qihse_federation_lease_read(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = lease_decode(blob, out);
     free(blob);
+    /* The embedded id must agree with the key it was stored under.  A record
+     * whose body names a different lease is corrupt, and returning it would
+     * hand the caller a record belonging to something else. */
+    if (ok && !qihse_uuid_equal(&out->lease_id, lease_id)) return false;
     return ok;
 }
 
@@ -1699,6 +1707,7 @@ static bool group_decode(const char* blob, qihse_federation_group_t* out) {
     int n = sscanf(blob, "%63[^\t]\t%llu\t%u\t%llu",
                    gid, &term, &cons, &mcount);
     if (n < 4) return false;
+    if (cons > (unsigned)QIHSE_CONSISTENCY_LINEARIZABLE) return false;
     snprintf(out->group_id, sizeof(out->group_id), "%s", gid);
     out->term = (uint64_t)term;
     out->consistency = (qihse_consistency_class_t)cons;
@@ -2103,6 +2112,8 @@ static bool node_decode(const char* blob, qihse_federation_node_identity_t* out)
         if (sscanf(fp_hex + i * 2, "%2x", &byte) != 1) return false;
         out->fingerprint[i] = (uint8_t)byte;
     }
+    if (trust > (unsigned)QIHSE_TRUST_REVOKED) return false;
+    if (kind > (unsigned)QIHSE_IDENTITY_BACKUP_AGENT) return false;
     out->trust = (qihse_trust_state_t)trust;
     out->enrollment_epoch = (uint64_t)epoch;
     out->identity_kind = (qihse_service_identity_t)kind;
@@ -2196,6 +2207,7 @@ bool qihse_federation_node_lookup(void* store_void, void* user_void,
     if (!blob) return false;
     bool ok = node_decode(blob, out);
     free(blob);
+    if (ok && !qihse_uuid_equal(&out->node_id, node_id)) return false;
     return ok;
 }
 
