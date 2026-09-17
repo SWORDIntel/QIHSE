@@ -44,6 +44,26 @@ Use these when you need implementation-level detail rather than the project over
 - [QMAG policy](architecture/qmag-policy.md)
 - [TRITON Lua injector](architecture/lua_injector.md)
 
+### Federation data plane
+
+- [Federation overview](architecture/federation_overview.md)
+- [Consistency classes](architecture/consistency_classes.md)
+- [Sovereign nodes](architecture/sovereign_nodes.md)
+- [Federation replication](architecture/federation_replication.md)
+- [Federation security](architecture/federation_security.md)
+- [Leases and epochs](architecture/leases_epochs.md)
+- [Reconciliation](architecture/reconciliation.md)
+- [Controller API](architecture/controller_api.md)
+- [Build coordination](architecture/build_coordination.md)
+- [Supply-chain provenance](architecture/supply_chain_provenance.md)
+- [SBOM and attestation](architecture/sbom_attestation.md)
+- [Repository snapshots](architecture/repository_snapshots.md)
+- [Runtime trust](architecture/runtime_trust.md)
+- [Runtime hardening](architecture/runtime_hardening.md)
+- [Network exposure](architecture/network_exposure.md)
+- [Time integrity](architecture/time_integrity.md)
+- [Security self-audit](architecture/security_self_audit.md)
+
 For the full interconnect view, see [Subsystem Architecture](diagrams/subsystem_architecture.md).
 
 ## Security
