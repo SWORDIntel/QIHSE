@@ -36,6 +36,8 @@ typedef struct {
     uint64_t until_ms;
 } brain_cooldown_t;
 
+typedef struct brain_pool brain_pool_t; /* persistent scan pool (see below) */
+
 typedef struct {
     qihse_resp_server_t* server;
     qihse_cluster_topology_t* topology;
@@ -54,6 +56,7 @@ typedef struct {
     uint64_t unhealthy_since[BRAIN_MAX_NODES]; /* 0 = healthy or not yet observed */
     uint32_t prune_timeout_seconds;
     uint32_t rebalance_min_slots;
+    brain_pool_t* pool; /* scan workers, created at start and reused every cycle */
     pthread_t thread;
 } brain_t;
 
@@ -172,6 +175,183 @@ static uint32_t brain_worker_count(void) {
     return t;
 }
 
+/* ---- Persistent scan pool ------------------------------------------------
+ * A fresh pthread per chunk per cycle was the dominant cost of the observe
+ * pass (thread creation, not slot triage: ~730-780 us/cycle at 8 workers on
+ * the 2-node lab). The pool is created once by qihse_cluster_brain_start()
+ * and reused by every scan — workers park on a condvar between rounds and
+ * wake to triage their own chunk.
+ *
+ * Determinism is unchanged: a chunk is still a contiguous slice of the slot
+ * array, the brain thread still owns chunk 0, and results are merged in chunk
+ * order only after every chunk has reported done. No worker can see or
+ * reorder another's runs, so output never depends on completion order (or on
+ * the chunk count at all).
+ *
+ * Lifecycle: create at brain start, destroy after the brain thread is joined.
+ * Workers are never detached and never cancelled — destroy broadcasts `stop`,
+ * a worker caught mid-chunk finishes that chunk and parks, then exits. */
+
+#define BRAIN_MAX_WORKERS 32u /* matches the QIHSE_BRAIN_WORKERS ceiling */
+
+typedef struct {
+    brain_pool_t* pool;
+    uint32_t index; /* chunk this worker owns (1..chunks-1) */
+    uint64_t round; /* last round this worker executed */
+} brain_pool_worker_t;
+
+struct brain_pool {
+    brain_scan_t scans[BRAIN_MAX_WORKERS]; /* one descriptor per chunk */
+    pthread_t threads[BRAIN_MAX_WORKERS];  /* one per chunk 1..chunks-1 */
+    brain_pool_worker_t workers[BRAIN_MAX_WORKERS];
+    uint32_t chunks;  /* chunks in use; chunk 0 belongs to the owning thread */
+    uint32_t want;    /* last requested count (0 = never sized) */
+    uint32_t pending; /* worker chunks still running this round */
+    uint64_t round;   /* round counter; a worker runs when it lags this */
+    bool stop;        /* destroy requested */
+    pthread_mutex_t lock;
+    pthread_cond_t work; /* owner -> workers: a round is open */
+    pthread_cond_t done; /* workers -> owner: the round is complete */
+};
+
+/* One pool worker: park until the owner opens a round this worker has not run
+ * yet, triage its own chunk, park again. Chunks run lock-free; only the round
+ * handshake touches the pool lock, so workers never block each other. */
+static void* brain_pool_worker(void* argument) {
+    brain_pool_worker_t* w = (brain_pool_worker_t*)argument;
+    brain_pool_t* pool = w->pool;
+    pthread_mutex_lock(&pool->lock);
+    for (;;) {
+        while (!pool->stop && pool->round == w->round) pthread_cond_wait(&pool->work, &pool->lock);
+        if (pool->stop) break; /* mid-chunk work already finished above */
+        uint64_t round = pool->round;
+        pthread_mutex_unlock(&pool->lock);
+        scan_worker(&pool->scans[w->index]);
+        pthread_mutex_lock(&pool->lock);
+        w->round = round;
+        if (--pool->pending == 0u) pthread_cond_signal(&pool->done);
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return NULL;
+}
+
+/* Park the current workers and start `chunks - 1` fresh ones. Called by the
+ * owning thread between rounds only, so no chunk is ever half-written. A
+ * worker that cannot be spawned shrinks the pool instead of failing the scan:
+ * chunk 0 always belongs to the owning thread, so a pool of one chunk is the
+ * serial fallback. Failed spawns are not retried until the requested count
+ * changes, so an OOM cannot turn into a per-cycle spawn storm. */
+static void brain_pool_resize(brain_pool_t* pool, uint32_t chunks) {
+    if (chunks > BRAIN_MAX_WORKERS) chunks = BRAIN_MAX_WORKERS;
+    if (chunks < 1u) chunks = 1u;
+    if (chunks == pool->want) return;
+
+    pthread_mutex_lock(&pool->lock);
+    pool->stop = true;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    for (uint32_t i = 1; i < pool->chunks; i++) pthread_join(pool->threads[i], NULL);
+
+    pool->stop = false;
+    pool->round = 0;
+    pool->pending = 0;
+    pool->chunks = chunks;
+    pool->want = chunks;
+    for (uint32_t i = 1; i < chunks; i++) {
+        brain_pool_worker_t* w = &pool->workers[i];
+        w->pool = pool;
+        w->index = i;
+        w->round = 0;
+        if (pthread_create(&pool->threads[i], NULL, brain_pool_worker, w) != 0) {
+            pool->chunks = i; /* owning thread covers chunk 0; threads 1..i-1 started */
+            break;
+        }
+    }
+}
+
+/* Create the pool with `chunks` chunks (chunk 0 is the owning thread's).
+ * Returns NULL only when the pool itself cannot be allocated or initialised;
+ * the caller then scans serially. Thread creation failure is not fatal — the
+ * pool simply shrinks to the chunks it could start. */
+static brain_pool_t* brain_pool_create(uint32_t chunks) {
+    brain_pool_t* pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+    if (pthread_mutex_init(&pool->lock, NULL) != 0) {
+        free(pool);
+        return NULL;
+    }
+    if (pthread_cond_init(&pool->work, NULL) != 0) {
+        pthread_mutex_destroy(&pool->lock);
+        free(pool);
+        return NULL;
+    }
+    if (pthread_cond_init(&pool->done, NULL) != 0) {
+        pthread_cond_destroy(&pool->work);
+        pthread_mutex_destroy(&pool->lock);
+        free(pool);
+        return NULL;
+    }
+    brain_pool_resize(pool, chunks);
+    return pool;
+}
+
+/* Stop and join every worker, then release the pool. A worker mid-chunk is
+ * never cancelled: it finishes, parks, sees `stop`, and exits. The owning
+ * thread calls this between rounds, so the drain below normally returns
+ * immediately; it exists so a round can never be torn down half-written. */
+static void brain_pool_destroy(brain_pool_t* pool) {
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    while (pool->pending) pthread_cond_wait(&pool->done, &pool->lock);
+    pool->stop = true;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    for (uint32_t i = 1; i < pool->chunks; i++) pthread_join(pool->threads[i], NULL);
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->work);
+    pthread_cond_destroy(&pool->done);
+    free(pool);
+}
+
+/* Run one triage round over `owners`: the owning thread takes chunk 0, the
+ * pool's workers take the rest, and the call returns only once every chunk is
+ * written. A worker executes a round only when its own round counter lags the
+ * pool's, so no chunk is ever scanned twice. Returns the chunks used. */
+static uint32_t brain_pool_scan(brain_pool_t* pool, const uint16_t* owners) {
+    uint32_t chunk = (QIHSE_CLUSTER_SLOT_COUNT + pool->chunks - 1u) / pool->chunks;
+    for (uint32_t i = 0; i < pool->chunks; i++) {
+        brain_scan_t* scan = &pool->scans[i];
+        scan->owners = owners;
+        scan->start = i * chunk;
+        scan->end = scan->start + chunk;
+        if (scan->end > QIHSE_CLUSTER_SLOT_COUNT) scan->end = QIHSE_CLUSTER_SLOT_COUNT;
+    }
+
+    pthread_mutex_lock(&pool->lock);
+    pool->round++;
+    pool->pending = pool->chunks - 1u;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+
+    scan_worker(&pool->scans[0]); /* the owner takes chunk 0: no idle-core tax */
+
+    if (pool->chunks > 1u) {
+        pthread_mutex_lock(&pool->lock);
+        while (pool->pending) pthread_cond_wait(&pool->done, &pool->lock);
+        pthread_mutex_unlock(&pool->lock);
+    }
+    return pool->chunks;
+}
+
+/* Release a chunk's run list. The pool reuses its descriptors, so a stale run
+ * count must never survive into the next round. */
+static void brain_scan_clear(brain_scan_t* scan) {
+    free(scan->runs);
+    scan->runs = NULL;
+    scan->count = 0;
+    scan->cap = 0;
+}
+
 static void brain_observe(brain_t* brain) {
     qihse_cluster_node_t nodes[BRAIN_MAX_NODES];
     size_t count = qihse_cluster_topology_nodes(brain->topology, nodes, BRAIN_MAX_NODES);
@@ -188,30 +368,24 @@ static void brain_observe(brain_t* brain) {
 
     uint32_t workers = brain_worker_count();
     if (workers > QIHSE_CLUSTER_SLOT_COUNT) workers = QIHSE_CLUSTER_SLOT_COUNT;
-    brain_scan_t* scans = calloc(workers, sizeof(*scans));
-    if (!scans) {
-        free(owners);
-        return;
+    brain_scan_t serial; /* used only when the pool could not be created */
+    brain_scan_t* scans;
+    if (brain->pool) {
+        /* Re-size first if the configured count changed since the last cycle:
+         * a stale count is never used, and re-sizing happens between rounds. */
+        brain_pool_resize(brain->pool, workers);
+        scans = brain->pool->scans;
+        workers = brain_pool_scan(brain->pool, owners);
+    } else {
+        /* No pool: triage the whole array on this thread rather than skip the
+         * observation (the OBSERVE record then reports workers=1). */
+        memset(&serial, 0, sizeof(serial));
+        serial.owners = owners;
+        serial.end = QIHSE_CLUSTER_SLOT_COUNT;
+        scan_worker(&serial);
+        scans = &serial;
+        workers = 1u;
     }
-    uint32_t chunk = (QIHSE_CLUSTER_SLOT_COUNT + workers - 1u) / workers;
-
-    for (uint32_t i = 0; i < workers; i++) {
-        scans[i].owners = owners;
-        scans[i].start = i * chunk;
-        scans[i].end = scans[i].start + chunk;
-        if (scans[i].end > QIHSE_CLUSTER_SLOT_COUNT) scans[i].end = QIHSE_CLUSTER_SLOT_COUNT;
-    }
-    /* spawn workers for all but the first chunk; the calling thread takes
-     * the first chunk so no idle-core tax at T=1 */
-    pthread_t threads[31];
-    uint32_t spawned = 0;
-    for (uint32_t i = 1; i < workers; i++) {
-        if (scans[i].start >= scans[i].end) break;
-        if (pthread_create(&threads[spawned], NULL, scan_worker, &scans[i]) == 0) spawned++;
-        else { scan_worker(&scans[i]); } /* degrade to serial on spawn failure */
-    }
-    scan_worker(&scans[0]);
-    for (uint32_t i = 0; i < spawned; i++) pthread_join(threads[i], NULL);
 
     /* Merge chunk results in order; coalesce runs across chunk boundaries. */
     size_t total = 0;
@@ -239,7 +413,7 @@ static void brain_observe(brain_t* brain) {
         int roff = 0;
         uint32_t runs = 0;
         if (merged) {
-            for (size_t r = 0; r < merged_count && roff < (int)sizeof(runs_buf) - 32u; r++) {
+            for (size_t r = 0; r < merged_count && roff < (int)(sizeof(runs_buf) - 32u); r++) {
                 if (merged[r].owner != nodes[i].index) continue;
                 roff += snprintf(runs_buf + roff, (size_t)(sizeof(runs_buf) - (size_t)roff),
                                  "%s%u-%u", runs ? "," : "", merged[r].start, merged[r].end);
@@ -257,8 +431,7 @@ static void brain_observe(brain_t* brain) {
              (unsigned long long)(brain_now_us() - t0), workers);
     brain_journal(brain, "OBSERVE", detail);
 
-    for (uint32_t i = 0; i < workers; i++) free(scans[i].runs);
-    free(scans);
+    for (uint32_t i = 0; i < workers; i++) brain_scan_clear(&scans[i]);
     free(merged);
     free(owners);
 }
@@ -284,7 +457,7 @@ static void brain_check_isolation(brain_t* brain, const qihse_cluster_node_t* no
 static void brain_check_asymmetry(brain_t* brain, const qihse_cluster_node_t* nodes, size_t count) {
     for (size_t i = 0; i < count; i++) {
         if (!nodes[i].healthy && nodes[i].host[0]) {
-            char detail[256];
+            char detail[512];
             snprintf(detail, sizeof(detail), "{\"peer\":\"%s:%u\",\"policy\":\"quarantine-noaction\"}",
                      nodes[i].host, nodes[i].port);
             brain_journal(brain, "ASYMMETRY", detail);
@@ -690,7 +863,14 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
     }
     qihse_pqc_init_providers();
 
+    /* Persistent scan pool: created once here and reused by every cycle, so
+     * the observe pass no longer pays a thread spawn per chunk. A pool that
+     * cannot be created is NOT fatal — brain_observe() then triages the slot
+     * array serially on the brain thread. */
+    brain->pool = brain_pool_create(brain_worker_count());
+
     if (pthread_create(&brain->thread, NULL, brain_main, brain) != 0) {
+        brain_pool_destroy(brain->pool);
         qihse_event_stream_destroy(brain->journal);
         pthread_mutex_destroy(&brain->journal_lock);
         free(brain);
@@ -710,6 +890,9 @@ void qihse_cluster_brain_stop(void) {
     if (!brain) return;
     __atomic_store_n(&brain->running, false, __ATOMIC_RELEASE);
     pthread_join(brain->thread, NULL); /* thread finishes its cycle on its own struct */
+    /* The brain thread is joined, so no round is in flight: this parks the
+     * idle workers and joins them before the brain struct goes away. */
+    brain_pool_destroy(brain->pool);
     qihse_event_stream_destroy(brain->journal);
     pthread_mutex_destroy(&brain->journal_lock);
     free(brain);
