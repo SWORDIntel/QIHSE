@@ -762,7 +762,12 @@ typedef struct {
     uint64_t enrollment_epoch;
     qihse_service_identity_t identity_kind;
     qihse_infra_scope_t scopes;
-    uint32_t capabilities;
+    uint32_t capabilities;      /* RESERVED.  Not a capability profile: too
+                                 * small for the five-field tuple, and this is
+                                 * a trust record that must not be rewritten
+                                 * at heartbeat rate.  The durable capability
+                                 * profile is qihse_federation_node_capability_t
+                                 * at federation/node/<uuid> (W2.4). */
     uint64_t last_hlc_physical;
 } qihse_federation_node_identity_t;
 
@@ -813,6 +818,113 @@ typedef bool (*qihse_federation_node_cb)(const qihse_federation_node_identity_t*
 void qihse_federation_node_foreach(void* store_void, void* user_void,
                                    qihse_federation_node_cb cb, void* user_data);
 
+/* ── Node capability records (W2.4) ──────────────────────────────────────
+ *
+ * A NODE_CAP bus frame is a 50-byte, unauthenticated, in-memory hint: it is
+ * lost on restart, and nothing binds the node id in the payload to the
+ * sender.  The durable record below is the first-class form of that payload,
+ * stored at "federation/node/<uuid>" — the same per-node resource path the
+ * federation journal already uses for trust.state.changed.
+ *
+ * It is a SEPARATE record from the identity record (fednode:<uuid>) rather
+ * than fields on it, because:
+ *   1. The identity record is the object of trust: enroll/approve/revoke
+ *      rewrite it with a read-decode-modify-encode cycle.  Capability changes
+ *      at heartbeat rate, so merging them would turn every capability update
+ *      into a read-modify-write of a trust record, where a lost update could
+ *      silently revert an approval or a revocation.
+ *   2. The identity record carries a 2592-byte ML-DSA-87 public key (~5 KB
+ *      hex on disk).  A 1 Hz capability refresh must not rewrite it.
+ *   3. Trust changes are journaled (trust.state.changed).  A capability
+ *      observation is not a trust change and must not look like one.
+ *
+ * Trust state is still part of the record, as the item requires, but it is a
+ * SNAPSHOT taken at admission time for attribution and audit.  It is NOT
+ * authorization: qihse_federation_node_capability_lookup_admissible()
+ * re-reads the identity record, so a node revoked after its capability was
+ * recorded stops being admissible.
+ *
+ * The stored values are always a CLAIM, never an attested fact.  A signature
+ * proves which node made the claim, not that the hardware exists.  A
+ * self-reported record therefore has QIHSE_CAP_FLAG_ATTESTED clear; nothing
+ * in this library sets that flag.
+ *
+ * Producers:
+ *   - qihse_federation_node_capability_record_local() — the node's own probe
+ *     (authenticated by construction).  The cluster bus calls this for its
+ *     configured local_node_uuid.
+ *   - qihse_federation_gossip_accept() — a signature-verified v3 membership
+ *     statement from an APPROVED node persists that node's profile.  An
+ *     unauthenticated NODE_CAP frame never writes this record: a durable
+ *     record that any host on the wire can poison is worse than an
+ *     in-memory hint that any host on the wire can poison.
+ */
+
+#define QIHSE_FEDERATION_NODE_CAP_PREFIX "federation/node/"
+
+/* The known ISA tier enum (0=generic .. 4=AVX-512+AMX).  A claim outside this
+ * range is refused on write and on read. */
+#define QIHSE_FEDERATION_CAP_ISA_TIER_MAX 4u
+
+typedef enum {
+    QIHSE_CAP_SOURCE_NONE = 0,            /* no claim on record */
+    QIHSE_CAP_SOURCE_LOCAL_PROBE = 1,     /* this node's own hardware probe */
+    QIHSE_CAP_SOURCE_SIGNED_STATEMENT = 2,/* signature-verified peer statement */
+    QIHSE_CAP_SOURCE_OPERATOR = 3         /* operator-attested (reserved) */
+} qihse_capability_source_t;
+
+const char* qihse_capability_source_name(qihse_capability_source_t source);
+
+/* Bit 0: the values have been attested by an operator rather than merely
+ * claimed by the node.  Never set by a self-report. */
+#define QIHSE_CAP_FLAG_ATTESTED 0x1u
+
+/* The five NODE_CAP fields, without the node id. */
+typedef struct {
+    uint8_t isa_tier;          /* 0..QIHSE_FEDERATION_CAP_ISA_TIER_MAX */
+    uint8_t npu;               /* 0 or 1 */
+    uint8_t gpu;               /* 0 or 1 */
+    uint32_t free_ram_mb;
+    uint16_t load_pct;
+} qihse_federation_capability_values_t;
+
+typedef struct {
+    qihse_uuid_t node_id;      /* key: federation/node/<uuid> */
+    qihse_uuid_t boot_id;      /* boot that made the claim (nil = local probe) */
+    qihse_uuid_t session_id;   /* signed-statement session (nil = local probe) */
+    uint64_t sequence;         /* statement sequence that carried the claim */
+    qihse_federation_capability_values_t values;
+    qihse_trust_state_t trust; /* trust state AT ADMISSION (snapshot, not auth) */
+    qihse_capability_source_t source;
+    uint32_t flags;
+    qihse_hlc_t observed;      /* when the claim was observed */
+} qihse_federation_node_capability_t;
+
+/* Record the LOCAL node's own hardware probe.  The trust snapshot is read
+ * from the node's identity record when one exists (UNKNOWN otherwise), never
+ * supplied by the caller, and the source is always LOCAL_PROBE.  Returns
+ * false for an out-of-range tuple or a storage failure. */
+bool qihse_federation_node_capability_record_local(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    const qihse_federation_capability_values_t* values);
+
+/* Read the durable capability record for a node.  The body's node id must
+ * agree with the key, every field is range-checked, and an unknown record
+ * version is refused.  This does NOT check trust: it returns what is stored,
+ * for audit and for callers that only want provenance. */
+bool qihse_federation_node_capability_lookup(void* store_void, void* user_void,
+                                             const qihse_uuid_t* node_id,
+                                             qihse_federation_node_capability_t* out);
+
+/* Read a capability record AND require that the node is APPROVED right now.
+ * The identity record is re-read, so a revocation invalidates capability data
+ * that was admitted earlier.  This is the accessor a placement decision must
+ * use: it is the difference between "somebody claimed this" and "this is
+ * usable". */
+bool qihse_federation_node_capability_lookup_admissible(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    qihse_federation_node_capability_t* out);
+
 typedef enum {
     QIHSE_GOSSIP_ACCEPTED = 0,
     QIHSE_GOSSIP_REJECT_MALFORMED,
@@ -846,7 +958,21 @@ const char* qihse_gossip_result_name(qihse_gossip_result_t result);
  */
 
 #define QIHSE_FEDERATION_GOSSIP_MAGIC 0x51484753u /* "QHGS" */
-#define QIHSE_FEDERATION_GOSSIP_VERSION 2u        /* v2 adds session + algorithm */
+/* The version a producer writes by DEFAULT.  Version 3 is opt-in: a producer
+ * that wants its capability profile recorded sets version 3 and fills caps.
+ * Keeping the default at 2 means an existing producer's frames are byte-for-
+ * byte what they were, and a mixed-version cluster does not see a new frame
+ * length it cannot parse. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION 2u
+/* v3 adds the NODE_CAP profile to the signed region (W2.4). */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY 3u
+/* Both versions remain readable and verifiable: the serializer and the
+ * verifier write/check the layout the frame's OWN version names, so an old
+ * record on disk still verifies against the v2 bytes it was signed over.
+ * v2 carries no capability profile, so a v2 statement is accepted without
+ * touching the durable capability record. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_MIN 2u
+#define QIHSE_FEDERATION_GOSSIP_VERSION_MAX QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY
 #define QIHSE_FEDERATION_HEARTBEAT_MAGIC 0x51484842u /* "QHHB" */
 #define QIHSE_FEDERATION_HEARTBEAT_VERSION 1u
 
@@ -864,6 +990,11 @@ typedef struct {
     qihse_hlc_t hlc;
     uint32_t capability_bitmap;
     uint32_t health_summary;
+    /* v3: the NODE_CAP profile, INSIDE the signed region.  A capability claim
+     * that steers placement must be attributable, so it is covered by the
+     * signature rather than sent as a separate unauthenticated frame.  Zero
+     * for a v2 statement. */
+    qihse_federation_capability_values_t caps;
     qihse_sig_alg_t sig_alg;
     uint16_t signature_len;
     uint8_t signature[QIHSE_FEDERATION_SIG_MAX_BYTES];
@@ -871,7 +1002,8 @@ typedef struct {
 
 /* The bytes covered by the signature: every field except the signature
  * itself.  Serialization is little-endian and length-prefixed so a peer
- * cannot reinterpret fields. */
+ * cannot reinterpret fields, and it is VERSION-DEPENDENT so a frame signed
+ * under one version verifies under that version only. */
 bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
                                        uint8_t* out, size_t out_cap, size_t* out_len);
 
@@ -880,8 +1012,13 @@ bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
  * before returning, so a malformed frame never reaches the verifier. */
 bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
                                          qihse_federation_gossip_t* out);
-/* Total wire size of a statement for the given algorithm. */
+/* Total wire size of a statement for the given algorithm, at the DEFAULT
+ * version.  A producer that writes another version must use the explicit
+ * version-aware form below, or its size check will not match its frame. */
 size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg);
+/* Total wire size for an explicit version, so a sender can size a v2 frame
+ * as well as the current version.  Returns 0 for an unknown version. */
+size_t qihse_federation_gossip_wire_size_v(uint16_t version, qihse_sig_alg_t alg);
 
 /* Sign a statement in place. pkey is an EVP_PKEY* from node_key_load(). */
 bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip);
@@ -982,6 +1119,7 @@ typedef struct {
     qihse_hlc_t hlc;
     uint32_t capability_bitmap;
     uint32_t health_summary;
+    qihse_federation_capability_values_t caps; /* v3 statements; zero for v2 */
     qihse_sig_alg_t sig_alg;
 } qihse_federation_membership_t;
 
@@ -1012,6 +1150,14 @@ typedef struct {
  * the signature against the enrolled public key, and the replay window.
  * A frame is rejected if its sequence is not strictly greater than the
  * highest sequence already accepted from that (sender, boot).
+ *
+ * A v3 frame also carries the sender's NODE_CAP profile inside the signed
+ * region; on acceptance that profile is persisted as the sender's durable
+ * capability record at "federation/node/<uuid>", with the trust state it was
+ * admitted under.  This is the producer for peer capability data: it only
+ * ever runs on a signature-verified frame from an APPROVED node.  A storage
+ * failure refuses the frame (the same way a statement-store failure does)
+ * rather than silently leaving the record missing.
  *
  * Replay state persists under "fedreplay:<node>:<boot>" so a restart does
  * not reopen the window.  Every call takes an explicit authenticated user

@@ -57,6 +57,11 @@ struct qihse_cluster_bus {
     /* Federation trust context (see qihse_cluster_bus_config_t). */
     void* federation_store;
     void* federation_user;
+    /* Optional local federation UUID: when set, this node's own capability
+     * probe is persisted durably (see qihse_bus_record_local_caps). */
+    qihse_uuid_t local_node_uuid;
+    bool has_local_node_uuid;
+    uint64_t last_cap_record_ms;
     void (*on_liveness)(qihse_cluster_bus_t* bus,
                         const qihse_federation_liveness_t* observation,
                         void* user_data);
@@ -614,7 +619,15 @@ uint64_t qihse_cluster_bus_last_observed_healthy(const qihse_cluster_bus_t* bus,
 /* NODE_CAP frame: payload = {node_id[41], isa_tier u8, npu u8, gpu u8,
  * free_ram_mb u32, load_pct u16} (50 bytes, field-packed).  Stores the
  * sender's capability profile in the per-bus table so the brain can do
- * capability-aware placement. */
+ * capability-aware placement.
+ *
+ * This frame is UNAUTHENTICATED: nothing binds the node id in the payload to
+ * the sender, so it deliberately does NOT write the durable
+ * "federation/node/<uuid>" record.  A durable record any host on the wire
+ * can poison would be worse than an in-memory hint any host on the wire can
+ * poison.  The durable record is produced from a signature-verified v3
+ * membership statement (qihse_federation_gossip_accept) and from the node's
+ * own probe. */
 static void qihse_bus_handle_node_cap(qihse_cluster_bus_t* bus,
                                       const uint8_t* payload, size_t payload_len) {
     if (payload_len < QIHSE_CLUSTER_BUS_NODE_CAP_PAYLOAD_SIZE) return;
@@ -756,7 +769,10 @@ bool qihse_bus_msg_carries_authority(uint32_t message_type) {
 bool qihse_cluster_bus_broadcast_federation_statement(qihse_cluster_bus_t* bus,
                                                      const qihse_federation_gossip_t* stmt) {
     if (!bus || !stmt) return false;
-    size_t wire = qihse_federation_gossip_wire_size(stmt->sig_alg);
+    /* The wire size is version-dependent: a v2 statement is shorter than a
+     * v3 one, and a receiver rebuilds the signed bytes for the frame's own
+     * version. */
+    size_t wire = qihse_federation_gossip_wire_size_v(stmt->version, stmt->sig_alg);
     if (wire == 0 || wire > QIHSE_CLUSTER_BUS_MAX_PAYLOAD) return false;
     uint8_t frame[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
     size_t signed_len = 0;
@@ -848,6 +864,38 @@ static void qihse_bus_local_memory_load(uint32_t* free_ram_mb, uint16_t* load_pc
 #endif
 }
 
+/* Persist the LOCAL node's own capability probe as a durable
+ * "federation/node/<uuid>" record (W2.4).  This is the producer that makes a
+ * node's own capability data survive a restart: the in-memory cap_* table
+ * below is rebuilt only from incoming frames, so without this a restarted
+ * node knows nothing about itself until a peer tells it.
+ *
+ * force=false throttles to QIHSE_CLUSTER_BUS_CAP_RECORD_MS so the durable
+ * record is a floor, not a 1 Hz WAL trace.  Writes only happen when the bus
+ * was given a local federation UUID: the bus will not invent an identity.
+ * Returns true when a write was performed. */
+static bool qihse_bus_record_local_caps(qihse_cluster_bus_t* bus, bool force) {
+    if (!bus || !bus->has_local_node_uuid) return false;
+    if (!bus->federation_store || !bus->federation_user) return false;
+    uint64_t now = qihse_bus_now_ms();
+    if (!force && bus->last_cap_record_ms != 0 &&
+        now - bus->last_cap_record_ms < QIHSE_CLUSTER_BUS_CAP_RECORD_MS) {
+        return false;
+    }
+    qihse_federation_capability_values_t values;
+    memset(&values, 0, sizeof(values));
+    values.isa_tier = qihse_bus_local_isa_tier();
+    qihse_bus_local_accelerators(&values.npu, &values.gpu);
+    qihse_bus_local_memory_load(&values.free_ram_mb, &values.load_pct);
+    if (!qihse_federation_node_capability_record_local(bus->federation_store,
+                                                       bus->federation_user,
+                                                       &bus->local_node_uuid, &values)) {
+        return false;
+    }
+    bus->last_cap_record_ms = now;
+    return true;
+}
+
 static void qihse_bus_send_heartbeat(qihse_cluster_bus_t* bus) {
     qihse_cluster_node_t local;
     if (!qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) return;
@@ -855,6 +903,9 @@ static void qihse_bus_send_heartbeat(qihse_cluster_bus_t* bus) {
     memcpy(payload, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
     qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_PING, payload, sizeof(payload));
     __atomic_add_fetch(&bus->stats.pings_sent, 1u, __ATOMIC_RELAXED);
+
+    /* Durable self-record, throttled (see qihse_bus_record_local_caps). */
+    (void)qihse_bus_record_local_caps(bus, false);
 
     /* Health-evidence gossip: tell every peer which nodes WE see healthy.
      * A peer marked failed only locally stays failed; one the rest of the
@@ -932,6 +983,10 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_group_ack_user_data = config->on_group_ack_user_data;
     bus->federation_store = config->federation_store;
     bus->federation_user = config->federation_user;
+    if (config->local_node_uuid) {
+        bus->local_node_uuid = *config->local_node_uuid;
+        bus->has_local_node_uuid = true;
+    }
     bus->on_liveness = config->on_liveness;
     bus->on_liveness_user_data = config->on_liveness_user_data;
     bus->on_membership = config->on_membership;
@@ -994,6 +1049,9 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
     int flags = fcntl(bus->sock_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(bus->sock_fd, F_SETFL, flags | O_NONBLOCK);
 #endif
+    /* Write the durable self-record before the first heartbeat, so a node
+     * that restarts has its own capability profile on disk immediately. */
+    (void)qihse_bus_record_local_caps(bus, true);
     bus->running = true;
     if (pthread_create(&bus->thread, NULL, qihse_bus_thread, bus) != 0) {
         bus->running = false;

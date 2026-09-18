@@ -6,6 +6,7 @@
  * See docs/plans/qihse_federation_upgrade_plan.md §7. */
 #include "qihse_federation.h"
 
+#include <errno.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
@@ -2474,11 +2475,246 @@ void qihse_federation_node_foreach(void* store_void, void* user_void,
                           node_iter_cb, &ctx);
 }
 
+/* ── Node capability records (W2.4) ───────────────────────────────────────
+ *
+ * The durable form of a NODE_CAP payload, at "federation/node/<uuid>".
+ * Separate from the identity record by design (see the header): a capability
+ * update must never be a read-modify-write of a trust record. */
+
+#define CAP_RECORD_VERSION 1u
+
+const char* qihse_capability_source_name(qihse_capability_source_t source) {
+    switch (source) {
+        case QIHSE_CAP_SOURCE_NONE:             return "none";
+        case QIHSE_CAP_SOURCE_LOCAL_PROBE:      return "local-probe";
+        case QIHSE_CAP_SOURCE_SIGNED_STATEMENT: return "signed-statement";
+        case QIHSE_CAP_SOURCE_OPERATOR:         return "operator";
+    }
+    return "unknown";
+}
+
+/* Strict unsigned parse: the whole field must be a number.  strtoull() alone
+ * accepts "12abc" as 12, which would let a malformed record decode as a
+ * different record. */
+static bool cap_parse_u64(const char* f, uint64_t* out) {
+    if (!f || !out || *f == '\0') return false;
+    char* end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(f, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+static void cap_kv_key(const qihse_uuid_t* node_id, char* out, size_t cap) {
+    char id_str[QIHSE_UUID_STR_LEN + 1u];
+    qihse_uuid_format(node_id, id_str);
+    snprintf(out, cap, QIHSE_FEDERATION_NODE_CAP_PREFIX "%s", id_str);
+}
+
+/* A tuple is refused on write and on read unless every field is inside its
+ * declared range.  The decoder must never be more permissive than the
+ * producer. */
+static bool cap_values_valid(const qihse_federation_capability_values_t* v) {
+    if (!v) return false;
+    if (v->isa_tier > QIHSE_FEDERATION_CAP_ISA_TIER_MAX) return false;
+    if (v->npu > 1u || v->gpu > 1u) return false;
+    return true;
+}
+
+/* Attribution invariants shared by the writer and the reader, so a record the
+ * decoder would refuse can never be written. */
+static bool cap_attribution_valid(const qihse_federation_node_capability_t* c) {
+    switch (c->source) {
+        case QIHSE_CAP_SOURCE_LOCAL_PROBE:
+            /* A local probe may precede enrollment (trust UNKNOWN), but a
+             * revoked node must not keep re-writing its own profile. */
+            return c->trust == QIHSE_TRUST_UNKNOWN || c->trust == QIHSE_TRUST_PENDING ||
+                   c->trust == QIHSE_TRUST_APPROVED;
+        case QIHSE_CAP_SOURCE_SIGNED_STATEMENT:
+            /* Attributable only with the boot and session that carried it. */
+            return c->trust == QIHSE_TRUST_APPROVED &&
+                   !qihse_uuid_is_nil(&c->boot_id) && !qihse_uuid_is_nil(&c->session_id);
+        case QIHSE_CAP_SOURCE_OPERATOR:
+            return true; /* reserved: operator-attested records */
+        default:
+            return false;
+    }
+}
+
+static bool cap_encode(const qihse_federation_node_capability_t* c, char* out, size_t cap) {
+    char nid[33], bid[33], sid[33];
+    uuid_hex(&c->node_id, nid);
+    uuid_hex(&c->boot_id, bid);
+    uuid_hex(&c->session_id, sid);
+    int n = snprintf(out, cap,
+                     "%u\t%s\t%s\t%s\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%u",
+                     (unsigned)CAP_RECORD_VERSION, nid, bid, sid,
+                     (unsigned long long)c->sequence,
+                     (unsigned)c->values.isa_tier, (unsigned)c->values.npu,
+                     (unsigned)c->values.gpu, (unsigned)c->values.free_ram_mb,
+                     (unsigned)c->values.load_pct,
+                     (unsigned)c->trust, (unsigned)c->source, (unsigned)c->flags,
+                     (unsigned long long)c->observed.physical_ms,
+                     (unsigned)c->observed.logical);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool cap_decode(const char* blob, qihse_federation_node_capability_t* out) {
+    if (!blob || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    /* Every column is small (a UUID is 32 hex chars, a counter under 21
+     * digits), so ONE reusable field buffer keeps this frame tiny.  There is
+     * no variable-length field here; the record cannot be inflated. */
+    char f[64];
+    const char* p = blob;
+    uint64_t v = 0;
+
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v != CAP_RECORD_VERSION) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!uuid_from_hex(f, &out->node_id)) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!uuid_from_hex(f, &out->boot_id)) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!uuid_from_hex(f, &out->session_id)) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &out->sequence)) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > QIHSE_FEDERATION_CAP_ISA_TIER_MAX) return false;
+    out->values.isa_tier = (uint8_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > 1u) return false;
+    out->values.npu = (uint8_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > 1u) return false;
+    out->values.gpu = (uint8_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > UINT32_MAX) return false;
+    out->values.free_ram_mb = (uint32_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > UINT16_MAX) return false;
+    out->values.load_pct = (uint16_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > (uint64_t)QIHSE_TRUST_REVOKED) return false;
+    out->trust = (qihse_trust_state_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > (uint64_t)QIHSE_CAP_SOURCE_OPERATOR) return false;
+    out->source = (qihse_capability_source_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > UINT32_MAX) return false;
+    out->flags = (uint32_t)v;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &out->observed.physical_ms)) return false;
+    p = fed_next_field(p, f, sizeof(f));
+    if (!cap_parse_u64(f, &v) || v > UINT32_MAX) return false;
+    out->observed.logical = (uint32_t)v;
+
+    /* Length agreement: a record with trailing columns is not the record this
+     * library wrote, so it is refused rather than partially read. */
+    if (p != NULL && *p != '\0') return false;
+
+    return cap_values_valid(&out->values) && cap_attribution_valid(out);
+}
+
+static bool cap_put(void* store_void, void* user_void,
+                    const qihse_federation_node_capability_t* c) {
+    if (!store_void || !user_void || !c) return false;
+    if (qihse_uuid_is_nil(&c->node_id)) return false;
+    if (c->trust > QIHSE_TRUST_REVOKED) return false;
+    if (!cap_values_valid(&c->values) || !cap_attribution_valid(c)) return false;
+    char key[128];
+    cap_kv_key(&c->node_id, key, sizeof(key));
+    char blob[512];
+    /* A silent encode failure would store an uninitialised buffer as a
+     * durable record (AGENTS.md). */
+    if (!cap_encode(c, blob, sizeof(blob))) return false;
+    return qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
+                             (qihse_user_t*)user_void);
+}
+
+/* Producer for a peer's profile: only ever called with a statement that
+ * already passed signature, trust-state and replay verification. */
+static bool cap_record_from_statement(void* store_void, void* user_void,
+                                      const qihse_federation_gossip_t* stmt,
+                                      qihse_trust_state_t trust) {
+    qihse_federation_node_capability_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.node_id = stmt->sender_node;
+    rec.boot_id = stmt->boot_id;
+    rec.session_id = stmt->session_id;
+    rec.sequence = stmt->sequence;
+    rec.values = stmt->caps;
+    rec.trust = trust;
+    rec.source = QIHSE_CAP_SOURCE_SIGNED_STATEMENT;
+    rec.flags = 0u; /* a signature is not an attestation of the hardware */
+    rec.observed = stmt->hlc;
+    return cap_put(store_void, user_void, &rec);
+}
+
+bool qihse_federation_node_capability_record_local(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    const qihse_federation_capability_values_t* values) {
+    if (!store_void || !user_void || !node_id || !values) return false;
+    if (qihse_uuid_is_nil(node_id)) return false;
+    qihse_federation_node_capability_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.node_id = *node_id;
+    rec.values = *values;
+    rec.source = QIHSE_CAP_SOURCE_LOCAL_PROBE;
+    rec.flags = 0u;
+    rec.observed.physical_ms = fed_now_ms();
+    rec.observed.logical = 0u;
+    /* The trust snapshot is READ from the identity record, never supplied by
+     * the caller.  An unenrolled node still gets a durable record — the data
+     * must survive a restart — but admissibility requires APPROVED. */
+    qihse_federation_node_identity_t identity;
+    rec.trust = qihse_federation_node_lookup(store_void, user_void, node_id, &identity)
+                    ? identity.trust
+                    : QIHSE_TRUST_UNKNOWN;
+    return cap_put(store_void, user_void, &rec);
+}
+
+bool qihse_federation_node_capability_lookup(void* store_void, void* user_void,
+                                             const qihse_uuid_t* node_id,
+                                             qihse_federation_node_capability_t* out) {
+    if (!store_void || !user_void || !node_id || !out) return false;
+    char key[128];
+    cap_kv_key(node_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = cap_decode(blob, out);
+    free(blob);
+    /* The body's node id must agree with the key. */
+    if (ok && !qihse_uuid_equal(&out->node_id, node_id)) return false;
+    return ok;
+}
+
+bool qihse_federation_node_capability_lookup_admissible(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    qihse_federation_node_capability_t* out) {
+    if (!qihse_federation_node_capability_lookup(store_void, user_void, node_id, out)) {
+        return false;
+    }
+    /* The trust snapshot inside the record is attribution, not authorization:
+     * re-read the identity record so a revocation that happened after
+     * admission takes effect immediately. */
+    qihse_federation_node_identity_t identity;
+    if (!qihse_federation_node_lookup(store_void, user_void, node_id, &identity)) return false;
+    return identity.trust == QIHSE_TRUST_APPROVED;
+}
+
 /* ── F5: Signed gossip / membership plane (plan §17) ───────────────────── */
 
 /* Little-endian buffer writer. */
 typedef struct { uint8_t* buf; size_t cap; size_t len; bool overflow; } le_writer_t;
 
+static void le_u8(le_writer_t* w, uint8_t v) {
+    if (w->len + 1u > w->cap) { w->overflow = true; return; }
+    w->buf[w->len++] = v;
+}
 static void le_u16(le_writer_t* w, uint16_t v) {
     if (w->len + 2u > w->cap) { w->overflow = true; return; }
     w->buf[w->len++] = (uint8_t)(v & 0xFFu);
@@ -2504,10 +2740,19 @@ static void le_bytes(le_writer_t* w, const uint8_t* b, size_t n) {
 
 /* The signed bytes: every field except the signature itself.  The algorithm
  * and the signature length are INSIDE the signed region, so an attacker
- * cannot downgrade the algorithm by editing those two fields. */
+ * cannot downgrade the algorithm by editing those two fields.
+ *
+ * The layout is version-dependent, and the version field is itself signed:
+ * v2 is the pre-W2.4 layout, v3 appends the capability profile.  A v2 frame
+ * therefore verifies against the v2 bytes it was signed over, and an attacker
+ * cannot reinterpret a v2 frame as a v3 frame (the version byte is covered). */
 bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
                                        uint8_t* out, size_t out_cap, size_t* out_len) {
     if (!gossip || !out || !out_len) return false;
+    if (gossip->version < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+        gossip->version > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) {
+        return false;
+    }
     le_writer_t w = { out, out_cap, 0, false };
     le_u32(&w, gossip->magic);
     le_u16(&w, gossip->version);
@@ -2522,6 +2767,15 @@ bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
     le_u16(&w, 0u); /* reserved, keeps the frame 4-byte aligned */
     le_u32(&w, gossip->capability_bitmap);
     le_u32(&w, gossip->health_summary);
+    if (gossip->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+        le_u8(&w, gossip->caps.isa_tier);
+        le_u8(&w, gossip->caps.npu);
+        le_u8(&w, gossip->caps.gpu);
+        le_u8(&w, 0u); /* reserved */
+        le_u32(&w, gossip->caps.free_ram_mb);
+        le_u16(&w, gossip->caps.load_pct);
+        le_u16(&w, 0u); /* reserved */
+    }
     le_u16(&w, (uint16_t)gossip->sig_alg);
     le_u16(&w, gossip->signature_len);
     if (w.overflow) return false;
@@ -2643,29 +2897,57 @@ bool qihse_federation_verify(qihse_sig_alg_t alg,
  *
  * The signed region's size is DERIVED from the serializer rather than
  * hard-coded, so adding a field cannot silently desynchronise the reader from
- * the writer. */
-static size_t gossip_signed_region_bytes(void) {
-    static size_t cached = 0;
-    if (cached != 0) return cached;
+ * the writer.  It is derived PER VERSION, because the verifier must rebuild
+ * the exact bytes a frame was signed over. */
+static size_t gossip_signed_region_bytes(uint16_t version) {
+    if (version < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+        version > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) {
+        return 0;
+    }
+    /* One cache slot per supported version, indexed by the version itself so
+     * adding a version cannot silently alias another's size. */
+    enum { GOSSIP_VERSION_SLOTS =
+               QIHSE_FEDERATION_GOSSIP_VERSION_MAX - QIHSE_FEDERATION_GOSSIP_VERSION_MIN + 1u };
+    static size_t cached[GOSSIP_VERSION_SLOTS];
+    size_t slot = (size_t)(version - QIHSE_FEDERATION_GOSSIP_VERSION_MIN);
+    if (slot >= (size_t)GOSSIP_VERSION_SLOTS) return 0;
+    if (cached[slot] != 0u) return cached[slot];
     qihse_federation_gossip_t probe;
     memset(&probe, 0, sizeof(probe));
-    uint8_t buf[512];
+    probe.version = version;
+    uint8_t buf[256];
     size_t len = 0;
     if (!qihse_federation_gossip_serialize(&probe, buf, sizeof(buf), &len)) return 0;
-    cached = len;
-    return cached;
+    cached[slot] = len;
+    return cached[slot];
+}
+
+size_t qihse_federation_gossip_wire_size_v(uint16_t version, qihse_sig_alg_t alg) {
+    size_t region = gossip_signed_region_bytes(version);
+    size_t sig = qihse_sig_alg_signature_bytes(alg);
+    return (region && sig) ? region + sig : 0u;
 }
 
 size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg) {
-    size_t region = gossip_signed_region_bytes();
-    size_t sig = qihse_sig_alg_signature_bytes(alg);
-    return (region && sig) ? region + sig : 0u;
+    return qihse_federation_gossip_wire_size_v(QIHSE_FEDERATION_GOSSIP_VERSION, alg);
 }
 
 bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
                                          qihse_federation_gossip_t* out) {
     if (!in || !out) return false;
-    size_t region = gossip_signed_region_bytes();
+    /* The version is read FIRST, because it decides the layout; an unknown
+     * version is refused before any length arithmetic. */
+    if (in_len < 8u) return false;
+    uint32_t magic = 0;
+    uint16_t version = 0;
+    memcpy(&magic, in, 4);
+    memcpy(&version, in + 4, 2);
+    if (magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return false;
+    if (version < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+        version > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) {
+        return false;
+    }
+    size_t region = gossip_signed_region_bytes(version);
     if (region == 0 || in_len < region + 1u) return false;
     memset(out, 0, sizeof(*out));
 
@@ -2683,14 +2965,28 @@ bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
     o += 2; /* reserved */
     memcpy(&out->capability_bitmap, in + o, 4); o += 4;
     memcpy(&out->health_summary, in + o, 4); o += 4;
+    if (version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+        out->caps.isa_tier = in[o]; o += 1;
+        out->caps.npu = in[o]; o += 1;
+        out->caps.gpu = in[o]; o += 1;
+        o += 1; /* reserved */
+        memcpy(&out->caps.free_ram_mb, in + o, 4); o += 4;
+        memcpy(&out->caps.load_pct, in + o, 2); o += 2;
+        o += 2; /* reserved */
+        /* Range-check the claim before any crypto: a statement naming an
+         * impossible capability is malformed, not merely implausible. */
+        if (out->caps.isa_tier > QIHSE_FEDERATION_CAP_ISA_TIER_MAX) return false;
+        if (out->caps.npu > 1u || out->caps.gpu > 1u) return false;
+    }
     uint16_t alg_raw = 0, sig_len = 0;
     memcpy(&alg_raw, in + o, 2); o += 2;
     memcpy(&sig_len, in + o, 2); o += 2;
+    /* The reader and the writer must agree on the layout, not just on the
+     * fields: a mismatch here means a frame built for another version. */
+    if (o != region) return false;
 
     /* Validate before any crypto: a frame that names an unknown algorithm, or
      * whose length fields disagree with the algorithm, is malformed. */
-    if (out->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return false;
-    if (out->version != QIHSE_FEDERATION_GOSSIP_VERSION) return false;
     if (alg_raw > (uint16_t)QIHSE_SIG_ML_DSA_87) return false;
     out->sig_alg = (qihse_sig_alg_t)alg_raw;
     if (sig_len != qihse_sig_alg_signature_bytes(out->sig_alg)) return false;
@@ -2755,22 +3051,50 @@ static void statement_kv_key(const qihse_uuid_t* sender, const qihse_uuid_t* boo
     snprintf(out, cap, "fedstmt:%s:%s", s_str, b_str);
 }
 
-static void statement_encode(const qihse_federation_gossip_t* g, char* out, size_t cap) {
+static bool statement_encode(const qihse_federation_gossip_t* g, char* out, size_t cap) {
     char cid[33], snd[33], boot[33], sess[33], sig_hex[QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 1u];
     uuid_hex(&g->cluster_id, cid);
     uuid_hex(&g->sender_node, snd);
     uuid_hex(&g->boot_id, boot);
     uuid_hex(&g->session_id, sess);
     bytes_to_hex(g->signature, g->signature_len, sig_hex);
-    snprintf(out, cap, "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s",
-             cid, snd, boot, sess,
-             (unsigned long long)g->sequence,
-             (unsigned long long)g->hlc.physical_ms,
-             (unsigned)g->capability_bitmap,
-             (unsigned)g->health_summary,
-             (unsigned)g->sig_alg,
-             (unsigned)g->signature_len,
-             sig_hex);
+    /* The version and the capability profile are TRAILING columns: a record
+     * written before they existed decodes as a v2 statement with no profile,
+     * so old on-disk records still load and still verify against the v2 bytes
+     * they were signed over.  The cap columns are written for v3 only, so the
+     * stored record matches the wire layout for its version. */
+    int n;
+    if (g->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+        n = snprintf(out, cap,
+                     "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u",
+                     cid, snd, boot, sess,
+                     (unsigned long long)g->sequence,
+                     (unsigned long long)g->hlc.physical_ms,
+                     (unsigned)g->capability_bitmap,
+                     (unsigned)g->health_summary,
+                     (unsigned)g->sig_alg,
+                     (unsigned)g->signature_len,
+                     sig_hex,
+                     (unsigned)g->version,
+                     (unsigned)g->caps.isa_tier,
+                     (unsigned)g->caps.npu,
+                     (unsigned)g->caps.gpu,
+                     (unsigned)g->caps.free_ram_mb,
+                     (unsigned)g->caps.load_pct);
+    } else {
+        n = snprintf(out, cap, "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s\t%u",
+                     cid, snd, boot, sess,
+                     (unsigned long long)g->sequence,
+                     (unsigned long long)g->hlc.physical_ms,
+                     (unsigned)g->capability_bitmap,
+                     (unsigned)g->health_summary,
+                     (unsigned)g->sig_alg,
+                     (unsigned)g->signature_len,
+                     sig_hex,
+                     (unsigned)g->version);
+    }
+    /* A truncating encode must not be stored as if it were the record. */
+    return n > 0 && (size_t)n < cap;
 }
 
 static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
@@ -2817,7 +3141,39 @@ static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
     if (actual != qihse_sig_alg_signature_bytes(out->sig_alg)) goto done;
     out->signature_len = (uint16_t)actual;
     out->magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
-    out->version = QIHSE_FEDERATION_GOSSIP_VERSION;
+
+    /* Trailing columns: version, then (for v3) the capability profile.  A
+     * record that predates them is a v2 statement. */
+    out->version = QIHSE_FEDERATION_GOSSIP_VERSION_MIN;
+    if (p != NULL) {
+        uint64_t ver = 0;
+        p = fed_next_field(p, f, buf_cap);
+        if (!cap_parse_u64(f, &ver) ||
+            ver < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+            ver > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) {
+            goto done; /* present but invalid: not a record this library wrote */
+        }
+        out->version = (uint16_t)ver;
+        if (out->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+            uint64_t v = 0;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > QIHSE_FEDERATION_CAP_ISA_TIER_MAX) goto done;
+            out->caps.isa_tier = (uint8_t)v;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > 1u) goto done;
+            out->caps.npu = (uint8_t)v;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > 1u) goto done;
+            out->caps.gpu = (uint8_t)v;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > UINT32_MAX) goto done;
+            out->caps.free_ram_mb = (uint32_t)v;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > UINT16_MAX) goto done;
+            out->caps.load_pct = (uint16_t)v;
+        }
+        if (p != NULL && *p != '\0') goto done; /* extra columns */
+    }
     ok = true;
 
 done:
@@ -2833,7 +3189,8 @@ bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t*
      * grep for this function and you have found every path to an authority
      * input. */
     if (stmt->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return false;
-    if (stmt->version != QIHSE_FEDERATION_GOSSIP_VERSION) return false;
+    if (stmt->version < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+        stmt->version > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) return false;
     if (stmt->signature_len != qihse_sig_alg_signature_bytes(stmt->sig_alg)) return false;
     memset(out, 0, sizeof(*out));
     out->sender_node = stmt->sender_node;
@@ -2843,6 +3200,7 @@ bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t*
     out->hlc = stmt->hlc;
     out->capability_bitmap = stmt->capability_bitmap;
     out->health_summary = stmt->health_summary;
+    if (stmt->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) out->caps = stmt->caps;
     out->sig_alg = stmt->sig_alg;
     return true;
 }
@@ -2866,11 +3224,12 @@ static bool statement_store(void* store_void, void* user_void,
                             const qihse_federation_gossip_t* g) {
     char key[160];
     statement_kv_key(&g->sender_node, &g->boot_id, key, sizeof(key));
-    /* The signature reaches 4627 bytes -> 9255 hex characters. */
-    size_t blob_len = QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 512u;
+    /* The signature reaches 4627 bytes -> 9255 hex characters, plus the
+     * version and capability columns. */
+    size_t blob_len = QIHSE_FEDERATION_SIG_MAX_BYTES * 2u + 640u;
     char* blob = (char*)malloc(blob_len);
     if (!blob) return false;
-    statement_encode(g, blob, blob_len);
+    if (!statement_encode(g, blob, blob_len)) { free(blob); return false; }
     bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, blob, 0, 0,
                                 (qihse_user_t*)user_void);
     free(blob);
@@ -3000,7 +3359,10 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
                                                     const qihse_federation_gossip_t* gossip) {
     if (!store_void || !user_void || !gossip) return QIHSE_GOSSIP_REJECT_MALFORMED;
     if (gossip->magic != QIHSE_FEDERATION_GOSSIP_MAGIC) return QIHSE_GOSSIP_REJECT_MALFORMED;
-    if (gossip->version != QIHSE_FEDERATION_GOSSIP_VERSION) return QIHSE_GOSSIP_REJECT_VERSION;
+    if (gossip->version < QIHSE_FEDERATION_GOSSIP_VERSION_MIN ||
+        gossip->version > QIHSE_FEDERATION_GOSSIP_VERSION_MAX) {
+        return QIHSE_GOSSIP_REJECT_VERSION;
+    }
 
     /* Read the previously recorded session id first, so a genuine new session
      * is distinguishable from a replayed statement. */
@@ -3044,6 +3406,19 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
         free(val);
     }
     if (highest != 0 && gossip->sequence <= highest) return QIHSE_GOSSIP_REJECT_REPLAY;
+
+    /* W2.4 producer: the capability profile is inside the signed region, so
+     * by this point it is attributable to an enrolled, APPROVED node and its
+     * signature and replay window have been checked.  Persist it as the
+     * node's durable capability record.  A storage failure refuses the frame
+     * (matching statement_store above) rather than leaving a node looking
+     * capable with no record of the claim.  A v2 frame carries no profile and
+     * leaves any existing record untouched. */
+    if (gossip->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+        if (!cap_record_from_statement(store_void, user_void, gossip, sender.trust)) {
+            return QIHSE_GOSSIP_REJECT_MALFORMED;
+        }
+    }
 
     char new_val[64];
     snprintf(new_val, sizeof(new_val), "%llu\t%llu",

@@ -94,9 +94,21 @@ typedef enum {
  *   gpu      u8     1 if a GPU device (/dev/dri, /dev/nvidiactl) is present
  *   free_ram_mb u32  MemAvailable (fallback MemFree) from /proc/meminfo
  *   load_pct   u16  1-minute load average * 100, clamped to 65535
+ *
+ * This frame is an UNAUTHENTICATED, in-memory hint: nothing binds the node id
+ * in the payload to the sender.  It is kept for the live peer table (and for
+ * clusters with no federation context), but it never writes a durable record.
+ * The durable, attributable form is the v3 signed membership statement, which
+ * carries the same five fields inside its signed region; acceptance persists
+ * them at "federation/node/<uuid>" (see qihse_federation.h, W2.4).
  */
 #define QIHSE_CLUSTER_BUS_NODE_CAP_PAYLOAD_SIZE \
     (QIHSE_CLUSTER_NODE_ID_LEN + 1u + 3u + 4u + 2u)
+
+/* How often the bus re-persists the local node's own capability record when a
+ * local federation UUID is configured.  The record is a durable floor, not a
+ * per-heartbeat trace: the live NODE_CAP frame is the 1 Hz channel. */
+#define QIHSE_CLUSTER_BUS_CAP_RECORD_MS 10000u
 
 typedef struct {
     char node_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
@@ -150,6 +162,14 @@ typedef struct {
      * outright: an unverified membership claim is never acted on. */
     void* federation_store;      /* qihse_kv_store_t* */
     void* federation_user;       /* qihse_user_t* */
+    /* Optional: this node's own federation UUID (plan §18 — identity is a
+     * UUID, never a topology index).  When set AND a federation store is
+     * configured, the bus persists this node's own capability probe as a
+     * durable "federation/node/<uuid>" record at start and every
+     * QIHSE_CLUSTER_BUS_CAP_RECORD_MS, so its capability profile survives a
+     * restart.  NULL (the default) writes nothing: the bus will not invent an
+     * identity it was not given. */
+    const qihse_uuid_t* local_node_uuid;
     /* Two callbacks with DISTINCT payload types, because the two tiers carry
      * different authority.
      *
