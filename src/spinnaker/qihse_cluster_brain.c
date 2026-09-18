@@ -42,7 +42,14 @@
 
 #define BRAIN_FED_OBS_MAGIC      0x5148424Fu /* "QHBO" */
 #define BRAIN_FED_DECISION_MAGIC 0x51484244u /* "QHBD" */
+/* Version 1 records carry no federation identity. Version 2 APPENDS a 16-byte
+ * node UUID to each node record. BOTH decode: a v1 record is still a valid
+ * observation of what the node saw, it simply cannot be resolved to a durable
+ * capability record, so has_uuid stays false. Rejecting v1 would make a
+ * journal written before this change unreadable, which is worse than a node
+ * with an unknown identity. */
 #define BRAIN_FED_FORMAT_VERSION 1u
+#define BRAIN_FED_FORMAT_VERSION_2 2u
 
 /* Declared maximums for the variable-length decision fields.  The decoder
  * enforces them, so a malformed record cannot make a reader allocate or copy
@@ -64,6 +71,8 @@
 #define BRAIN_OBS_RUN_BYTES 8u
 #define BRAIN_OBS_NODE_BYTES (6u * 2u + 4u + (QIHSE_CLUSTER_NODE_ID_LEN + 1u) + \
                               (QIHSE_CLUSTER_HOST_LEN + 1u))
+/* v2 appends the node's federation identity to each node record. */
+#define BRAIN_OBS_NODE_BYTES_V2 (BRAIN_OBS_NODE_BYTES + 16u)
 #define BRAIN_OBS_F_HEALTHY 0x1u
 #define BRAIN_OBS_F_LOCAL   0x2u
 
@@ -107,6 +116,11 @@ typedef struct {
     uint32_t flags; /* BRAIN_OBS_F_* */
     char id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
     char host[QIHSE_CLUSTER_HOST_LEN + 1u];
+    /* The node's federation identity when the topology knows it. Without it
+     * the node cannot be resolved to a durable capability record and a
+     * placement decision has only the ephemeral bus hint to go on. */
+    uint8_t node_uuid[16];
+    bool has_uuid;
 } brain_obs_node_t;
 
 /* The rule input: one observation, as recorded on the federation journal and
@@ -203,6 +217,13 @@ typedef struct {
     char sign_key_handle[BRAIN_FED_KEY_HANDLE_MAX + 1u];
     pthread_t thread;
 } brain_t;
+
+/* Defined with the capability evidence helper below; placement scoring needs
+ * it earlier. Prefers the durable capability record over the live bus hint. */
+static bool brain_node_caps(brain_t* brain, uint16_t index,
+                            uint8_t* isa, uint8_t* npu, uint8_t* gpu,
+                            uint32_t* free_ram, uint16_t* load,
+                            const char** out_source);
 
 static brain_t* g_brain = NULL;
 static pthread_mutex_t g_brain_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -360,13 +381,13 @@ static size_t brain_obs_encode(const brain_obs_t* obs, const char* detail, size_
     if (obs->run_count > QIHSE_CLUSTER_SLOT_COUNT) return 0;
     if (detail_len > BRAIN_FED_DETAIL_MAX) return 0;
     size_t need = QIHSE_BRAIN_OBS_HEADER_BYTES +
-                  obs->node_count * BRAIN_OBS_NODE_BYTES +
+                  obs->node_count * BRAIN_OBS_NODE_BYTES_V2 +
                   obs->run_count * BRAIN_OBS_RUN_BYTES + detail_len;
     if (need > out_cap) return 0;
 
     brain_le_writer_t w = { out, out_cap, 0, false };
     brain_le_u32(&w, BRAIN_FED_OBS_MAGIC);
-    brain_le_u16(&w, BRAIN_FED_FORMAT_VERSION);
+    brain_le_u16(&w, BRAIN_FED_FORMAT_VERSION_2);
     brain_le_u16(&w, obs->local_index);
     brain_le_u64(&w, obs->seq);
     brain_le_u64(&w, obs->scan_us);
@@ -385,6 +406,10 @@ static size_t brain_obs_encode(const brain_obs_t* obs, const char* detail, size_
         brain_le_u32(&w, n->flags);
         brain_le_bytes(&w, n->id, sizeof(n->id));
         brain_le_bytes(&w, n->host, sizeof(n->host));
+        /* v2: the node's federation identity, or 16 zero bytes when unknown.
+         * Written unconditionally so the record size is fixed per version and
+         * the decoder needs no per-node presence flag on the wire. */
+        brain_le_bytes(&w, n->node_uuid, sizeof(n->node_uuid));
     }
     for (size_t i = 0; i < obs->run_count; i++) {
         brain_le_u16(&w, obs->runs[i].owner);
@@ -415,11 +440,16 @@ static bool brain_obs_decode(const uint8_t* in, size_t in_len, brain_obs_t* out)
     uint32_t run_count = brain_le_get_u32(&r);
     uint32_t detail_len = brain_le_get_u32(&r);
     if (r.underflow) return false;
-    if (magic != BRAIN_FED_OBS_MAGIC || version != BRAIN_FED_FORMAT_VERSION) return false;
+    if (magic != BRAIN_FED_OBS_MAGIC) return false;
+    if (version != BRAIN_FED_FORMAT_VERSION && version != BRAIN_FED_FORMAT_VERSION_2) {
+        return false; /* an unknown version is refused, not guessed at */
+    }
     if (node_count > BRAIN_MAX_NODES) return false;
     if (run_count > QIHSE_CLUSTER_SLOT_COUNT) return false;
     if (detail_len > BRAIN_FED_DETAIL_MAX) return false;
-    size_t need = (size_t)node_count * BRAIN_OBS_NODE_BYTES +
+    const size_t node_bytes = (version >= BRAIN_FED_FORMAT_VERSION_2)
+                                  ? BRAIN_OBS_NODE_BYTES_V2 : BRAIN_OBS_NODE_BYTES;
+    size_t need = (size_t)node_count * node_bytes +
                   (size_t)run_count * BRAIN_OBS_RUN_BYTES + (size_t)detail_len;
     if (need > in_len - r.off) return false;
 
@@ -451,6 +481,16 @@ static bool brain_obs_decode(const uint8_t* in, size_t in_len, brain_obs_t* out)
          * string in the rule input. */
         n->id[QIHSE_CLUSTER_NODE_ID_LEN] = '\0';
         n->host[QIHSE_CLUSTER_HOST_LEN] = '\0';
+        if (version >= BRAIN_FED_FORMAT_VERSION_2) {
+            const uint8_t* uuid = brain_le_get_bytes(&r, sizeof(n->node_uuid));
+            if (r.underflow || !uuid) return false;
+            memcpy(n->node_uuid, uuid, sizeof(n->node_uuid));
+            /* All-zero encodes "unknown", never a usable identity: the nil
+             * UUID is not a node. */
+            for (size_t k = 0; k < sizeof(n->node_uuid); k++) {
+                if (n->node_uuid[k]) { n->has_uuid = true; break; }
+            }
+        }
     }
     for (uint32_t i = 0; i < run_count; i++) {
         out->runs[i].owner = brain_le_get_u16(&r);
@@ -1210,6 +1250,14 @@ static void brain_observe(brain_t* brain) {
             if (src->index == local) dst->flags |= BRAIN_OBS_F_LOCAL;
             snprintf(dst->id, sizeof(dst->id), "%s", src->id);
             snprintf(dst->host, sizeof(dst->host), "%s", src->host);
+            /* Carry the federation identity so a decision can be traced to a
+             * durable capability record, and so the recorded observation stays
+             * resolvable by a later replayer even if this process could not
+             * resolve it at the time. */
+            if (src->has_uuid) {
+                memcpy(dst->node_uuid, src->node_uuid, sizeof(dst->node_uuid));
+                dst->has_uuid = true;
+            }
         }
         for (size_t r = 0; r < brain->obs_local.run_count; r++) {
             brain->obs_local.runs[r].owner = merged[r].owner;
@@ -1369,9 +1417,7 @@ static uint16_t brain_pick_target(brain_t* brain, const brain_obs_t* obs,
         int64_t score = 0;
         uint32_t free_ram = 0;
         uint16_t load = 0;
-        if (brain->bus &&
-            qihse_cluster_bus_node_caps(brain->bus, node->index, NULL, NULL, NULL,
-                                        &free_ram, &load)) {
+        if (brain_node_caps(brain, node->index, NULL, NULL, NULL, &free_ram, &load, NULL)) {
             score = (int64_t)free_ram - (int64_t)load * 64;
         }
         if (best == QIHSE_CLUSTER_NODE_NONE || score > best_score ||
@@ -1384,18 +1430,70 @@ static uint16_t brain_pick_target(brain_t* brain, const brain_obs_t* obs,
     return best;
 }
 
+/* The capability profile for a node, preferring the DURABLE record.
+ *
+ * The live bus hint is rebuilt from incoming datagrams and lost on boot, so a
+ * node quiet since restart has no hint even though its last claim is on disk.
+ * The durable lookup goes through the admissible accessor, which re-reads the
+ * node's identity record: a REVOKED node's stale claim is not usable, which is
+ * the difference between "somebody claimed this" and "this is usable".
+ *
+ * `out_source` receives "durable", "hint", or "" when neither answered, so a
+ * decision's evidence records which it rested on. An ephemeral, unauthenticated
+ * hint and an attributable, restart-surviving record are not the same thing,
+ * and a caller that cannot tell them apart will treat the weaker as the
+ * stronger. */
+static bool brain_node_caps(brain_t* brain, uint16_t index,
+                            uint8_t* isa, uint8_t* npu, uint8_t* gpu,
+                            uint32_t* free_ram, uint16_t* load,
+                            const char** out_source) {
+    if (out_source) *out_source = "";
+    if (!brain) return false;
+
+    const brain_obs_node_t* node = brain_obs_find_node(&brain->obs, index);
+    if (node && node->has_uuid && brain->server) {
+        qihse_kv_store_t* store = qihse_resp_server_store(brain->server);
+        /* The system principal: this is an internal placement decision, not a
+         * request on behalf of a caller. The record's own trust is re-checked
+         * by the admissible lookup below. */
+        qihse_user_t* sys = qihse_auth_get_user(0);
+        if (store && sys) {
+            qihse_uuid_t nu;
+            memcpy(nu.bytes, node->node_uuid, sizeof nu.bytes);
+            qihse_federation_node_capability_t rec;
+            memset(&rec, 0, sizeof rec);
+            if (qihse_federation_node_capability_lookup_admissible(store, sys, &nu, &rec)) {
+                if (isa) *isa = rec.values.isa_tier;
+                if (npu) *npu = rec.values.npu;
+                if (gpu) *gpu = rec.values.gpu;
+                if (free_ram) *free_ram = rec.values.free_ram_mb;
+                if (load) *load = rec.values.load_pct;
+                if (out_source) *out_source = "durable";
+                return true;
+            }
+        }
+    }
+    if (brain->bus &&
+        qihse_cluster_bus_node_caps(brain->bus, index, isa, npu, gpu, free_ram, load)) {
+        if (out_source) *out_source = "hint";
+        return true;
+    }
+    return false;
+}
+
 /* Journal evidence for a placement decision: the capability profile the
  * choice was based on (or null when the node has not advertised). */
 static void brain_caps_evidence(brain_t* brain, uint16_t index, char* out, size_t cap) {
     uint8_t isa = 0, npu = 0, gpu = 0;
     uint32_t free_ram = 0;
     uint16_t load = 0;
-    if (brain->bus &&
-        qihse_cluster_bus_node_caps(brain->bus, index, &isa, &npu, &gpu, &free_ram, &load)) {
+    const char* source = "";
+    if (brain_node_caps(brain, index, &isa, &npu, &gpu, &free_ram, &load, &source)) {
         snprintf(out, cap,
-                 "{\"isa\":%u,\"npu\":%u,\"gpu\":%u,\"free_ram_mb\":%u,\"load_pct\":%u}",
+                 "{\"isa\":%u,\"npu\":%u,\"gpu\":%u,\"free_ram_mb\":%u,\"load_pct\":%u,"
+                 "\"src\":\"%s\"}",
                  (unsigned)isa, (unsigned)npu, (unsigned)gpu, (unsigned)free_ram,
-                 (unsigned)load);
+                 (unsigned)load, source);
     } else {
         snprintf(out, cap, "null");
     }
