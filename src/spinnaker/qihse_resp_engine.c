@@ -4815,9 +4815,46 @@ typedef struct {
     bool found;
 } cluster_range_probe_t;
 
+/* Is this key NODE-LOCAL bookkeeping rather than shardable data?
+ *
+ * Slot ownership exists to decide which node holds a piece of the sharded
+ * keyspace. A node's own operational records are not a piece of anything: an
+ * incident history, a job record or a capability claim describes THIS node and
+ * has no meaning on a peer. Counting them as local data made the brain believe
+ * it held shardable content in a range owned by an unhealthy node, so it
+ * re-homed that range to a peer — moving bookkeeping, not data.
+ *
+ * Found by dogfooding: recording brain incidents as AI memories (W3.6) put new
+ * keys into the managed keyspace, and the rebalance/prune test caught the
+ * consequence. Without that test the effect would have been silent range
+ * movement in production.
+ *
+ * This list is a POLICY STATEMENT, not a derived fact. It says these
+ * namespaces are node-local. If one of them should ever be sharded, it must be
+ * removed from here deliberately rather than by accident. */
+static bool cluster_key_is_node_local(const char* key) {
+    static const char* const prefixes[] = {
+        "aimem:",             /* AI memory records */
+        "aimemv:",            /* their embedding vectors */
+        "fabric:",            /* fabric job and ingest records */
+        "fednode:",           /* this node's federation identity record */
+        "federation/node/",   /* capability records */
+        "snapshot/manifest:", /* snapshot manifests */
+        "rejoin/state:",      /* rejoin progress */
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t n = strlen(prefixes[i]);
+        if (strncmp(key, prefixes[i], n) == 0) return true;
+    }
+    return false;
+}
+
 static bool cluster_range_probe_cb(const char* key, const char* value, void* user_data) {
     (void)value;
     cluster_range_probe_t* p = (cluster_range_probe_t*)user_data;
+    /* Node-local bookkeeping is not shardable data and must not make a range
+     * look locally owned. */
+    if (cluster_key_is_node_local(key)) return true;
     p->seen++;
     uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
     if (slot >= p->first && slot <= p->last) {

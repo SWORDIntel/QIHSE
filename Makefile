@@ -319,6 +319,10 @@ test-cluster-brain: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_brain tests/test_cluster_brain.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_brain
 
+test-brain-incidents: lib
+	$(CC) $(CFLAGS) -o tests/test_brain_incidents tests/test_brain_incidents.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_brain_incidents
+
 test-brain-actuate: lib
 	$(CC) $(CFLAGS) -o tests/test_brain_actuate tests/test_brain_actuate.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_brain_actuate
@@ -481,7 +485,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-indexes test-sql-completeness test-bolt test-repl test-phase-c test-gold
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-indexes test-sql-completeness test-bolt test-repl test-phase-c test-gold
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack

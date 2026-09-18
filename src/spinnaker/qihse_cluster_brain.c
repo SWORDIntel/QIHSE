@@ -1,4 +1,6 @@
 #include "qihse_cluster_brain.h"
+
+#include "qihse_ai_memory.h" /* incidents become episodic memories (W3.6) */
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_cluster_slot.h"
@@ -243,8 +245,48 @@ static uint64_t brain_now_us(void) {
 /* Append one record to the durable journal. Decisions/observations carry an
  * ML-DSA-87 signature over the record body when a signing key is configured.
  * `brain` is owned by the calling thread (stop() joins before freeing). */
+/* Kinds that are ROUTINE and must not become incidents: OBSERVE fires every
+ * cycle and would flood the index, and START/STOP are lifecycle.
+ *
+ * A SKIP list, so a NEW incident kind is recorded by default. An allowlist
+ * fails the other way: someone adds an incident kind, forgets to list it, and
+ * the incident is silently unretrievable. */
+static bool brain_kind_is_routine(const char* kind) {
+    return strcmp(kind, "OBSERVE") == 0 ||
+           strcmp(kind, "BRAIN_START") == 0 ||
+           strcmp(kind, "BRAIN_STOP") == 0;
+}
+
+/* W3.6: incidents become EPISODIC memories, which indexes them for both
+ * lexical and semantic recall through QIHSE's own FTS and vector paths. The
+ * brain reports its own history through the AI memory surface rather than
+ * through a log nobody can query, and the fabric's recall is exercised by real
+ * operational data instead of by tests alone.
+ *
+ * Best-effort: a failure here must never affect the decision path.
+ *
+ * NOTE: these records are NODE-LOCAL bookkeeping. cluster_key_is_node_local()
+ * in qihse_resp_engine.c excludes them from slot-ownership probing — without
+ * that, writing an incident made the brain believe it held shardable data in
+ * a range and re-home it to a peer. */
+static void brain_record_incident(brain_t* brain, const char* kind, const char* detail) {
+    if (!brain || !brain->server || !kind || brain_kind_is_routine(kind)) return;
+    qihse_user_t* sys = qihse_auth_get_user(0);
+    if (!sys) return;
+    char text[1200];
+    int n = snprintf(text, sizeof(text), "brain incident %s: %s", kind,
+                     detail ? detail : "{}");
+    if (n <= 0 || n >= (int)sizeof(text)) return;
+    char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
+    (void)qihse_ai_memory_store(brain->server, sys, text, QIHSE_AIMEM_EPISODIC, mem_id);
+}
+
 static void brain_journal(brain_t* brain, const char* kind, const char* detail) {
-    if (!brain || !brain->journal) return;
+    if (!brain) return;
+    /* Record BEFORE the journal check, so incident history does not depend on
+     * whether a local journal is configured. */
+    brain_record_incident(brain, kind, detail);
+    if (!brain->journal) return;
     char body[1024];
     int n = snprintf(body, sizeof(body),
                      "{\"t\":%llu,\"kind\":\"%s\",\"detail\":%s}",
