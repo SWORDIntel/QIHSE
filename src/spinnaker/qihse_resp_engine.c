@@ -70,6 +70,8 @@ typedef struct {
     char name[128];
     /* F2: per-session federation watch handles. */
     qihse_federation_watch_t* federation_watches[QIHSE_RESP_MAX_WATCHES];
+    /* W2.5: per-session KEYSTONE change-feed handles (read/index identity). */
+    qihse_keystone_feed_t* keystone_feeds[QIHSE_RESP_MAX_WATCHES];
     /* Transaction (MULTI/EXEC) state */
     bool in_multi;
     bool multi_dirty;            /* a queued command had an error */
@@ -563,6 +565,14 @@ static bool qihse_resp_reply_double(qihse_resp_session_t* session, double value)
 
 static bool qihse_resp_command_is(const qihse_resp_request_t* request, const char* command) {
     return request->argc > 0 && qihse_resp_arg_equal(&request->argv[0], command);
+}
+
+/* W2.5: KEYSTONE.FEED.<sub> — one command family, matched by prefix so the
+ * dispatch allowlist for the index identity can be expressed in one place. */
+static bool qihse_resp_command_is_keystone_feed(const qihse_resp_request_t* request) {
+    static const char prefix[] = "KEYSTONE.FEED.";
+    if (request->argc == 0 || request->argv[0].len < sizeof(prefix) - 1u) return false;
+    return strncasecmp((const char*)request->argv[0].data, prefix, sizeof(prefix) - 1u) == 0;
 }
 
 static bool qihse_resp_extract_keys(const qihse_resp_request_t* request, qihse_resp_keyset_t* keys,
@@ -1671,8 +1681,17 @@ static bool qihse_resp_fd_command(int fd, size_t argc, const qihse_resp_arg_t* a
     line[used - 2u] = '\0';
     if (line[0] == '+') return true;
     if (error && error_capacity > 0) {
-        if (line[0] == '-') snprintf(error, error_capacity, "%s", line + 1u);
-        else snprintf(error, error_capacity, "target did not acknowledge command");
+        if (line[0] == '-') {
+            /* Bounded copy: `line` is a full read buffer, so the diagnostic
+             * must be clipped to the caller's capacity explicitly rather than
+             * relying on snprintf truncation. */
+            size_t copy_len = strlen(line + 1u);
+            if (copy_len >= error_capacity) copy_len = error_capacity - 1u;
+            memcpy(error, line + 1u, copy_len);
+            error[copy_len] = '\0';
+        } else {
+            snprintf(error, error_capacity, "target did not acknowledge command");
+        }
     }
     errno = EREMOTEIO;
     return false;
@@ -1918,6 +1937,194 @@ static bool qihse_resp_handle_keystone_classify(qihse_resp_session_t* session, c
     if (!qihse_resp_array(session, 2u)) return false;
     if (!qihse_resp_bulk_text(session, qihse_keystone_class_name(cls))) return false;
     return qihse_resp_reply_double(session, (double)conf);
+}
+
+/* ---------------------------------------------------------------------------
+ * KEYSTONE.FEED.* — W2.5: the change-feed surface of the KEYSTONE index
+ * identity.
+ *
+ * This is the one surface the read/index identity may use. It is deliberately
+ * NOT part of FEDERATION.*: the federation control plane stays system-domain
+ * and operator-only, and a provisioned index identity is tenant-scoped, so it
+ * cannot reach FEDERATION.*, CLUSTER MOVESLOTS, GROUP.*, FABRIC.* or
+ * METRICS.RENDER even if a handler's own gate were ever relaxed (the dispatch
+ * allowlist is the chokepoint).
+ *
+ * Every record delivered here has already been checked against the session
+ * principal's clearance, SCI compartments and tenant by
+ * qihse_keystone_feed_next(); records the principal is not cleared for are
+ * skipped and counted, never sent.
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_keystone_feed_reader(qihse_resp_session_t* session) {
+    if (!session->user) return false;
+    if (qihse_keystone_feed_identity_is_indexer(session->user)) return true;
+    return qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR;
+}
+
+static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
+                                           const qihse_resp_request_t* request) {
+    static const char prefix[] = "KEYSTONE.FEED.";
+    if (request->argc < 1 || request->argv[0].len <= sizeof(prefix) - 1u) {
+        return qihse_resp_error(session, "ERR unknown KEYSTONE.FEED subcommand");
+    }
+    char sub[32];
+    size_t sub_len = request->argv[0].len - (sizeof(prefix) - 1u);
+    if (sub_len >= sizeof(sub)) return qihse_resp_error(session, "ERR unknown KEYSTONE.FEED subcommand");
+    memcpy(sub, (const char*)request->argv[0].data + (sizeof(prefix) - 1u), sub_len);
+    sub[sub_len] = '\0';
+
+    if (!session->server->federation_journal) {
+        return qihse_resp_error(session, "ERR federation journal not configured");
+    }
+
+    /* Publishing is a federation control-plane write and is gated by scope
+     * inside qihse_keystone_feed_publish(), so the index identity's denial
+     * comes from the privilege ladder rather than from this handler. */
+    if (strcasecmp(sub, "PUBLISH") == 0) {
+        if (request->argc != 8) {
+            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.PUBLISH <event_type> <resource_id> <classification> <sci> <tenant> <generation> <payload>");
+        }
+        char event_type[QIHSE_FEDERATION_EVENT_TYPE_MAX + 1u];
+        size_t etl = request->argv[1].len;
+        if (etl == 0 || etl > QIHSE_FEDERATION_EVENT_TYPE_MAX) return qihse_resp_error(session, "ERR invalid event type");
+        memcpy(event_type, request->argv[1].data, etl); event_type[etl] = '\0';
+        char resource_id[64];
+        size_t rl = request->argv[2].len;
+        if (rl == 0 || rl >= sizeof(resource_id)) return qihse_resp_error(session, "ERR invalid resource id");
+        memcpy(resource_id, request->argv[2].data, rl); resource_id[rl] = '\0';
+        uint64_t classif = 0, sci = 0, tenant = 0, generation = 0;
+        if (!qihse_resp_parse_u64_arg(&request->argv[3], &classif) || classif > UINT16_MAX) {
+            return qihse_resp_error(session, "ERR invalid classification");
+        }
+        if (!qihse_resp_parse_u64_arg(&request->argv[4], &sci) || sci > UINT16_MAX) {
+            return qihse_resp_error(session, "ERR invalid sci");
+        }
+        if (!qihse_resp_parse_u64_arg(&request->argv[5], &tenant) || tenant > UINT32_MAX) {
+            return qihse_resp_error(session, "ERR invalid tenant");
+        }
+        if (!qihse_resp_parse_u64_arg(&request->argv[6], &generation)) {
+            return qihse_resp_error(session, "ERR invalid generation");
+        }
+        qihse_keystone_feed_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.classification = (uint16_t)classif;
+        rec.sci = (uint16_t)sci;
+        rec.tenant_id = (uint32_t)tenant;
+        rec.generation = generation;
+        /* Deterministic object identity for the RESP surface: the same
+         * resource always maps to the same indexed object. */
+        if (!qihse_uuid_from_seed(resource_id, rl, &rec.object_id)) {
+            return qihse_resp_error(session, "ERR could not derive object id");
+        }
+        qihse_federation_event_t ev;
+        if (!qihse_keystone_feed_publish(session->server->federation_journal, session->user,
+                                         &session->server->federation_node_id,
+                                         event_type, resource_id, &rec,
+                                         request->argv[7].data, request->argv[7].len, &ev)) {
+            return qihse_resp_error(session, "NOPERM feed publish requires FEDERATION_WRITE");
+        }
+        return qihse_resp_integer(session, (int64_t)ev.journal_offset);
+    }
+
+    if (!qihse_resp_keystone_feed_reader(session)) {
+        return qihse_resp_error(session, "NOPERM KEYSTONE.FEED.* requires the KEYSTONE index identity");
+    }
+
+    if (strcasecmp(sub, "OPEN") == 0) {
+        if (request->argc != 1 && request->argc != 2) {
+            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.OPEN [prefix]");
+        }
+        qihse_keystone_feed_config_t fcfg;
+        memset(&fcfg, 0, sizeof(fcfg));
+        if (request->argc == 2) {
+            size_t pl = request->argv[1].len;
+            if (pl >= sizeof(fcfg.prefix)) return qihse_resp_error(session, "ERR prefix too long");
+            memcpy(fcfg.prefix, request->argv[1].data, pl); fcfg.prefix[pl] = '\0';
+        }
+        qihse_keystone_feed_t* feed = qihse_keystone_feed_open(
+            session->server->federation_journal, session->user, &fcfg);
+        if (!feed) return qihse_resp_error(session, "NOPERM change-feed open refused for this principal");
+        for (size_t i = 0; i < QIHSE_RESP_MAX_WATCHES; i++) {
+            if (!session->keystone_feeds[i]) {
+                session->keystone_feeds[i] = feed;
+                return qihse_resp_integer(session, (int64_t)i);
+            }
+        }
+        qihse_keystone_feed_close(feed);
+        return qihse_resp_error(session, "ERR too many open feeds");
+    }
+
+    if (request->argc < 2) return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.<sub> <feed-id> ...");
+    uint64_t slot = 0;
+    if (!qihse_resp_parse_u64_arg(&request->argv[1], &slot) || slot >= QIHSE_RESP_MAX_WATCHES ||
+        !session->keystone_feeds[slot]) {
+        return qihse_resp_error(session, "ERR unknown feed id");
+    }
+    qihse_keystone_feed_t* feed = session->keystone_feeds[slot];
+
+    if (strcasecmp(sub, "NEXT") == 0) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "keystone.feed.next");
+        qihse_federation_event_t ev;
+        qihse_keystone_feed_record_t rec;
+        uint8_t* payload = NULL;
+        size_t payload_len = 0;
+        if (!qihse_keystone_feed_next(feed, &ev, &rec, &payload, &payload_len)) {
+            return qihse_resp_integer(session, 0);
+        }
+        bool ok = qihse_resp_array(session, 8u);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)ev.journal_offset);
+        if (ok) ok = qihse_resp_bulk_text(session, ev.event_type);
+        if (ok) ok = qihse_resp_bulk_text(session, ev.resource_id);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.classification);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.sci);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.tenant_id);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.generation);
+        if (ok) ok = qihse_resp_bulk(session, payload, payload_len);
+        free(payload);
+        return ok;
+    }
+
+    if (strcasecmp(sub, "ACK") == 0) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "keystone.feed.ack");
+        uint64_t offset = 0;
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &offset)) {
+            return qihse_resp_error(session, "ERR invalid offset");
+        }
+        if (!qihse_keystone_feed_ack(feed, offset)) {
+            return qihse_resp_error(session, "ERR feed ack failed");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (strcasecmp(sub, "RESUME") == 0) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "keystone.feed.resume");
+        uint64_t cursor = 0;
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &cursor)) {
+            return qihse_resp_error(session, "ERR invalid cursor");
+        }
+        if (!qihse_keystone_feed_resume(feed, cursor)) {
+            return qihse_resp_error(session, "ERR feed resume refused");
+        }
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (strcasecmp(sub, "CLOSE") == 0) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "keystone.feed.close");
+        qihse_keystone_feed_close(feed);
+        session->keystone_feeds[slot] = NULL;
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (strcasecmp(sub, "STATUS") == 0) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "keystone.feed.status");
+        if (!qihse_resp_array(session, 4u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)qihse_keystone_feed_cursor(feed))) return false;
+        if (!qihse_resp_integer(session, (int64_t)qihse_keystone_feed_last_ack(feed))) return false;
+        if (!qihse_resp_integer(session, (int64_t)qihse_keystone_feed_denied(feed))) return false;
+        return qihse_resp_integer(session, (int64_t)qihse_keystone_feed_malformed(feed));
+    }
+
+    return qihse_resp_error(session, "ERR unknown KEYSTONE.FEED subcommand");
 }
 
 /* =========================================================================
@@ -3795,6 +4002,13 @@ static void qihse_resp_session_pubsub_cleanup(qihse_resp_session_t* session) {
             }
         }
     }
+    /* W2.5: release any open KEYSTONE change feeds. */
+    for (size_t i = 0; i < QIHSE_RESP_MAX_WATCHES; i++) {
+        if (session->keystone_feeds[i]) {
+            qihse_keystone_feed_close(session->keystone_feeds[i]);
+            session->keystone_feeds[i] = NULL;
+        }
+    }
 }
 
 static bool qihse_resp_handle_publish(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4815,8 +5029,8 @@ static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qih
         /* Nothing to move: ownership still flipped so the range takes load. */
         return qihse_resp_integer(session, 0);
     }
-    char summary[96];
-    snprintf(summary, sizeof(summary), "%llu keys moved; slots %u-%u now owned by %s:%u",
+    char summary[128];
+    snprintf(summary, sizeof(summary), "%llu keys moved; slots %u-%u now owned by %.64s:%u",
              (unsigned long long)moved, first, last, target_spec, target_port);
     return qihse_resp_bulk_text(session, summary);
 }
@@ -5056,7 +5270,7 @@ static bool qihse_resp_handle_group(qihse_resp_session_t* session, const qihse_r
             }
             if (!found_id) {
                 char msg[160];
-                snprintf(msg, sizeof(msg), "ERR member '%s' is not a known cluster node", spec);
+                snprintf(msg, sizeof(msg), "ERR member '%.100s' is not a known cluster node", spec);
                 return qihse_resp_error(session, msg);
             }
             int n = snprintf(members + off, sizeof(members) - off, "%s%s",
@@ -5325,6 +5539,14 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
         return qihse_resp_error(session, "NOPERM FEDERATION.* is restricted to the system domain");
     }
+    /* W2.5, defense in depth: the federation control plane is operator work,
+     * never the index identity's. A provisioned index identity is refused
+     * before any subcommand runs, so even a future change to the tenant gate
+     * above cannot hand it the control plane. */
+    if (qihse_keystone_feed_identity_is_indexer(session->user)) {
+        return qihse_resp_error(session,
+            "NOPERM FEDERATION.* is not available to the KEYSTONE index identity; use KEYSTONE.FEED.*");
+    }
     const qihse_resp_arg_t* sub = &request->argv[1];
 
     if (qihse_resp_arg_equal(sub, "STATUS")) {
@@ -5514,7 +5736,7 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
         memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
         int wid = atoi(id_str);
-        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+        if (wid < 0 || (size_t)wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
             return qihse_resp_error(session, "ERR invalid watch id");
         }
         qihse_federation_event_t ev;
@@ -5541,7 +5763,7 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
         memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
         int wid = atoi(id_str);
-        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+        if (wid < 0 || (size_t)wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
             return qihse_resp_error(session, "ERR invalid watch id");
         }
         char off_str[32];
@@ -5563,7 +5785,7 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (il == 0 || il >= sizeof(id_str)) return qihse_resp_error(session, "ERR invalid watch id");
         memcpy(id_str, request->argv[2].data, il); id_str[il] = '\0';
         int wid = atoi(id_str);
-        if (wid < 0 || wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
+        if (wid < 0 || (size_t)wid >= QIHSE_RESP_MAX_WATCHES || !session->federation_watches[wid]) {
             return qihse_resp_error(session, "ERR invalid watch id");
         }
         char cur_str[32];
@@ -7109,7 +7331,6 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
  * ------------------------------------------------------------------------- */
 static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
     if (!session->server->bus) return qihse_resp_error(session, "ERR bus not available");
-    uint16_t local = qihse_cluster_topology_local_node(session->server->topology);
     qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
     size_t count = qihse_cluster_topology_nodes(session->server->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
     if (!qihse_resp_array(session, (size_t)(count * 2))) return false;
@@ -7122,7 +7343,7 @@ static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
         uint16_t load = 0;
         if (qihse_cluster_bus_node_caps(session->server->bus, nodes[i].index, &isa, &npu, &gpu, &ram, &load)) {
             char cap_buf[192];
-            int cl = snprintf(cap_buf, sizeof(cap_buf),
+            (void)snprintf(cap_buf, sizeof(cap_buf),
                 "isa=%u npu=%u gpu=%u ram=%u load=%u", isa, npu, gpu, ram, load);
             if (!qihse_resp_bulk_text(session, cap_buf)) return false;
         } else {
@@ -7170,7 +7391,6 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     static uint64_t job_seq = 0;
     uint64_t jid = __atomic_add_fetch(&job_seq, 1, __ATOMIC_RELAXED);
     char job_key[128], job_val[4200];
-    uint64_t now = (uint64_t)time(NULL);
     snprintf(job_key, sizeof(job_key), "fabric:job:%llu", (unsigned long long)jid);
     snprintf(job_val, sizeof(job_val), "{\"isa\":%llu,\"npu\":%llu,\"payload\":\"%s\"}",
              (unsigned long long)min_isa, (unsigned long long)need_npu, payload);
@@ -7231,6 +7451,18 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
             session_tenant = QIHSE_TENANT_SYSTEM;
             if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
         }
+    }
+    /* W2.5: the KEYSTONE index identity is a narrow read/index principal. Its
+     * command surface is the change feed and nothing else — enforced here at
+     * the single dispatch chokepoint rather than trusting every handler's own
+     * gate. A compromised indexer therefore cannot reach a write, an
+     * administrative command, or a federation control-plane command, and
+     * KEYSTONE.FEED.PUBLISH still has to pass the FEDERATION_WRITE scope check
+     * in qihse_keystone_feed_publish(). */
+    if (session->user && qihse_keystone_feed_identity_is_indexer(session->user) &&
+        !qihse_resp_command_is_keystone_feed(request)) {
+        return qihse_resp_error(session,
+            "NOPERM the KEYSTONE index identity may only consume KEYSTONE.FEED.*");
     }
     /* One hash probe per command — reused by the subscribed, MULTI-queue,
      * guard-write and final-dispatch checks below. */
@@ -7329,6 +7561,8 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
     if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
     if (qihse_resp_command_is(request, "KEYSTONE.CLASSIFY")) return qihse_resp_handle_keystone_classify(session, request);
+    /* W2.5: KEYSTONE change feed (read/index identity) */
+    if (qihse_resp_command_is_keystone_feed(request)) return qihse_resp_handle_keystone_feed(session, request);
 
     /* TASK.* commands */
     if (qihse_resp_command_is(request, "TASK.SUBMIT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "SUBMIT"))) {

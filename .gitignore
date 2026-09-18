@@ -100,6 +100,7 @@ lib/
 # Test scratch directories (mkdtemp'd by unit tests under build/)
 /build/aimem_data_*/
 /build/brain_act_*/
+/build/brain_fed_*/
 /build/brain_journal_*/
 /build/brain_reb_*/
 /build/group_push_data_*/
@@ -118,3 +119,4 @@ lib/
 /build/fed_repl_*/
 /build/fed_transport_*/
 /build/fed_rejoin_*/
+/build/w25_*/
