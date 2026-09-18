@@ -3,6 +3,7 @@
 #include "qihse_resp_cluster.h"
 #include "qihse_resp_pubsub.h"
 #include "qihse_cluster_numa.h"
+#include "qihse_ai_memory.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
@@ -7389,20 +7390,44 @@ static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
 }
 
 static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
-    if (request->argc != 4) return qihse_resp_error(session, "ERR usage: FABRIC.SUBMIT <min_isa> <need_npu> <payload>");
+    /* Superset signature. The 4-argument form is the original and is kept
+     * working: it is an `embed` job. The 5-argument form names the type
+     * explicitly. Changing the original would break every existing caller for
+     * no gain, so the new form is additive. */
+    /* argv[0] is FABRIC and argv[1] is SUBMIT, so the legacy form
+     * `FABRIC SUBMIT <min_isa> <need_npu> <payload>` is argc == 5. */
+    const char* job_type = "embed";
+    int base = 2;
+    if (request->argc == 6) {
+        job_type = (const char*)request->argv[2].data;
+        base = 3;
+    } else if (request->argc != 5) {
+        return qihse_resp_error(session,
+            "ERR usage: FABRIC.SUBMIT [<type>] <min_isa> <need_npu> <payload>");
+    }
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
         return qihse_resp_error(session, "NOPERM FABRIC dispatch is system-domain only");
     }
     uint64_t min_isa, need_npu;
-    if (!qihse_resp_parse_u64_arg(&request->argv[1], &min_isa) ||
-        !qihse_resp_parse_u64_arg(&request->argv[2], &need_npu)) {
+    if (!qihse_resp_parse_u64_arg(&request->argv[base], &min_isa) ||
+        !qihse_resp_parse_u64_arg(&request->argv[base + 1], &need_npu)) {
         return qihse_resp_error(session, "ERR invalid capability spec");
     }
     char payload[4096];
-    size_t plen = request->argv[3].len;
+    size_t plen = request->argv[base + 2].len;
     if (plen == 0 || plen >= sizeof(payload)) return qihse_resp_error(session, "ERR payload too large (max 4095)");
-    memcpy(payload, request->argv[3].data, plen);
+    memcpy(payload, request->argv[base + 2].data, plen);
     payload[plen] = '\0';
+
+    /* A type with no executor is REFUSED, not accepted-and-ignored. Silently
+     * storing a job nobody will ever run is how a queue fills with work that
+     * reports success. */
+    if (!qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "embed")) {
+        char err[192];
+        snprintf(err, sizeof(err),
+                 "ERR job type not implemented: %s (implemented: embed)", job_type);
+        return qihse_resp_error(session, err);
+    }
 
     /* Find best-fit node: lowest load_pct among nodes meeting the capability */
     if (!session->server->bus) return qihse_resp_error(session, "ERR bus not available");
@@ -7419,37 +7444,116 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
             if (load < best_load) { best_load = load; best_idx = nodes[i].index; }
         }
     }
+    /* Also consider THIS node. Nothing sends a node its own bus hint, so on a
+     * single-node deployment the loop above finds nothing and no job can ever
+     * run. The local node's capabilities are not unknown — they are durable
+     * (the bus records its own probe at start) — they are simply not in the
+     * hint table. Reading them here is what makes a one-node fabric work. */
+    if (best_idx == QIHSE_CLUSTER_NODE_NONE && session->server->topology) {
+        uint16_t local_idx = qihse_cluster_topology_local_node(session->server->topology);
+        for (size_t i = 0; i < count && local_idx != QIHSE_CLUSTER_NODE_NONE; i++) {
+            if (nodes[i].index != local_idx) continue;
+            if (!nodes[i].has_uuid) break;
+            qihse_uuid_t nu;
+            memcpy(nu.bytes, nodes[i].node_uuid, sizeof nu.bytes);
+            qihse_federation_node_capability_t rec;
+            memset(&rec, 0, sizeof rec);
+            pthread_rwlock_rdlock(&session->server->kv_lock);
+            /* The NON-admissible lookup, deliberately. The admissibility check
+             * answers "may I trust this PEER's claim about its hardware". For
+             * the local node that question does not arise: the probe is this
+             * node's own measurement of itself, and requiring the node to be
+             * federation-approved before it may know its own CPU would make a
+             * single-node deployment unable to place any work. Peer claims
+             * still go through the admissible accessor in the brain. */
+            bool have = qihse_federation_node_capability_lookup(
+                session->server->store, session->user, &nu, &rec);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            if (!have) break;
+            if (rec.values.isa_tier < min_isa || (need_npu && !rec.values.npu)) break;
+            best_idx = local_idx;
+            best_load = rec.values.load_pct;
+            break;
+        }
+    }
     if (best_idx == QIHSE_CLUSTER_NODE_NONE)
         return qihse_resp_error(session, "ERR no node matches the capability requirement");
 
-    /* Store the job in KV */
+    /* EXECUTE, then record what actually happened.
+     *
+     * Phase 1 is LOCAL execution only, and the record says so rather than
+     * implying a dispatch that did not occur. When the best-fit node is not
+     * this node the job is recorded as `queued` with the chosen target, which
+     * is the truth: it has been placed but not run. Remote dispatch needs a
+     * transport and a result path that do not exist yet. */
     static uint64_t job_seq = 0;
     uint64_t jid = __atomic_add_fetch(&job_seq, 1, __ATOMIC_RELAXED);
-    char job_key[128], job_val[4200];
+
+    uint16_t local_idx = session->server->topology
+        ? qihse_cluster_topology_local_node(session->server->topology)
+        : QIHSE_CLUSTER_NODE_NONE;
+    bool is_local = (best_idx == local_idx);
+
+    char result[QIHSE_AIMEM_ID_LEN + 1u];
+    result[0] = '\0';
+    const char* status = "queued";
+    const char* exec = "none";
+    char err[160];
+    err[0] = '\0';
+
+    if (is_local) {
+        /* `embed`: turn the payload into a memory, which indexes it for both
+         * lexical and semantic recall. The executor is the only one with a
+         * real backend today; the others are refused above. */
+        char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
+        if (qihse_ai_memory_store(session->server, session->user, payload,
+                                  QIHSE_AIMEM_SEMANTIC, mem_id)) {
+            snprintf(result, sizeof(result), "%s", mem_id);
+            status = "done";
+            exec = "local";
+        } else {
+            status = "failed";
+            exec = "local";
+            snprintf(err, sizeof(err), "embed failed");
+        }
+    }
+
+    char job_key[128], job_val[4600];
     snprintf(job_key, sizeof(job_key), "fabric:job:%llu", (unsigned long long)jid);
-    snprintf(job_val, sizeof(job_val), "{\"isa\":%llu,\"npu\":%llu,\"payload\":\"%s\"}",
-             (unsigned long long)min_isa, (unsigned long long)need_npu, payload);
+    snprintf(job_val, sizeof(job_val),
+             "{\"type\":\"%s\",\"status\":\"%s\",\"exec\":\"%s\",\"target\":%u,"
+             "\"isa\":%llu,\"npu\":%llu,\"result\":\"%s\",\"err\":\"%s\"}",
+             job_type, status, exec, (unsigned)best_idx,
+             (unsigned long long)min_isa, (unsigned long long)need_npu, result, err);
     pthread_rwlock_wrlock(&session->server->kv_lock);
     bool ok = qihse_kv_set_user(session->server->store, job_key, job_val, 0, 0, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
     if (!ok) return qihse_resp_error(session, "ERR failed to store job");
-    char reply[128];
-    snprintf(reply, sizeof(reply), "job:%llu node:%u", (unsigned long long)jid, best_idx);
+    char reply[192];
+    snprintf(reply, sizeof(reply), "job:%llu node:%u status:%s",
+             (unsigned long long)jid, (unsigned)best_idx, status);
     return qihse_resp_bulk_text(session, reply);
 }
 
 static bool qihse_resp_handle_fabric_result(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
-    if (request->argc != 2) return qihse_resp_error(session, "ERR usage: FABRIC.RESULT <job-id>");
+    /* argv[0] is FABRIC, argv[1] is RESULT, argv[2] is the job id: argc == 3.
+     * This check said 2, so the dispatcher routed the command and the handler
+     * then rejected its own arity — FABRIC.RESULT could not work even after
+     * the record it reads was made to exist. */
+    if (request->argc != 3) return qihse_resp_error(session, "ERR usage: FABRIC RESULT <job-id>");
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
         return qihse_resp_error(session, "NOPERM FABRIC.RESULT is system-domain only");
     }
+    /* The job record IS the result. The previous version read a
+     * `fabric:result:<id>` key that NOTHING in the tree ever wrote, so
+     * FABRIC.RESULT could not succeed for any job ever submitted. */
     char job_key[128];
-    snprintf(job_key, sizeof(job_key), "fabric:result:%s", (const char*)request->argv[1].data);
+    snprintf(job_key, sizeof(job_key), "fabric:job:%s", (const char*)request->argv[2].data);
     char* val = NULL;
     pthread_rwlock_wrlock(&session->server->kv_lock);
     val = qihse_kv_get_user(session->server->store, job_key, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
-    if (!val) return qihse_resp_error(session, "ERR no result for job");
+    if (!val) return qihse_resp_error(session, "ERR no such job");
     bool ok = qihse_resp_bulk_text(session, val);
     free(val);
     return ok;
