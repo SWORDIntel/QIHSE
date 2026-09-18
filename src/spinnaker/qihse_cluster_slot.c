@@ -1,4 +1,6 @@
 #include "qihse_cluster_slot.h"
+
+#include "qihse_federation.h" /* qihse_uuid_from_seed: the derivation */
 #include "qihse_platform.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -78,6 +80,14 @@ void qihse_cluster_topology_destroy(qihse_cluster_topology_t* topology) {
 #endif
 }
 
+bool qihse_cluster_node_federation_uuid(const char* node_id, uint8_t out[16]) {
+    if (!node_id || !out || !*node_id) return false;
+    qihse_uuid_t uuid;
+    if (!qihse_uuid_from_seed(node_id, strlen(node_id), &uuid)) return false;
+    memcpy(out, uuid.bytes, 16u);
+    return true;
+}
+
 bool qihse_cluster_topology_upsert_node(qihse_cluster_topology_t* topology, const qihse_cluster_node_t* node, uint16_t* out_index) {
     if (!topology || !node || !qihse_cluster_node_id_valid(node->id) || node->host[0] == '\0' || node->port == 0) {
         errno = EINVAL;
@@ -103,6 +113,16 @@ bool qihse_cluster_topology_upsert_node(qihse_cluster_topology_t* topology, cons
     if (copy.bus_port == 0 && copy.port <= UINT16_MAX - 10000u) copy.bus_port = (uint16_t)(copy.port + 10000u);
     if (copy.role == QIHSE_CLUSTER_NODE_PRIMARY) copy.primary_index = QIHSE_CLUSTER_NODE_NONE;
     copy.config_epoch = qihse_cluster_next_epoch(topology);
+    /* Derive the federation identity here rather than relying on a caller.
+     * Every node gets one, including nodes discovered from an unauthenticated
+     * MEET, so the durable stores are reachable for all of them — and the
+     * admissible check downstream is what decides whether the record is
+     * usable. See the header: this UUID is an index, not a credential. */
+    if (qihse_cluster_node_federation_uuid(copy.id, copy.node_uuid)) {
+        copy.has_uuid = true;
+    } else {
+        copy.has_uuid = false;
+    }
     topology->nodes[index] = copy;
     topology->node_removed[index] = 0; /* revive a pruned node in place */
     if (index == topology->node_count) topology->node_count++;

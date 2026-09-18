@@ -116,9 +116,14 @@ int main(void) {
         assert(qihse_cluster_topology_upsert_node(topo, &node, &idx));
         assert(qihse_cluster_topology_set_local_node(topo, idx));
 
+        /* The UUID is DERIVED at upsert, so the test does not set it. This
+         * is the point: no caller has to remember, and a node discovered from
+         * an unauthenticated MEET gets one too. Compute the same derivation
+         * only to write the capability record the lookup will find. */
+        uint8_t derived[16];
+        assert(qihse_cluster_node_federation_uuid(node_id, derived));
         qihse_uuid_t nu;
-        assert(qihse_uuid_from_seed(node_id, strlen(node_id), &nu));
-        assert(qihse_cluster_topology_set_node_uuid(topo, idx, nu.bytes));
+        memcpy(nu.bytes, derived, sizeof nu.bytes);
 
         qihse_federation_capability_values_t vals;
         memset(&vals, 0, sizeof vals);

@@ -84,6 +84,26 @@ bool qihse_cluster_topology_set_node_health(qihse_cluster_topology_t* topology, 
  * found. Without this a node is only reachable through the live bus hint. */
 bool qihse_cluster_topology_set_node_uuid(qihse_cluster_topology_t* topology,
                                           uint16_t index, const uint8_t uuid[16]);
+
+/* The federation UUID of a cluster node id: DERIVED, not configured.
+ *
+ * This is the single definition of the mapping. Every topology node gets one
+ * automatically at upsert, so there is no caller to forget and no node that is
+ * silently unreachable in the durable stores.
+ *
+ * THE RESULT IS AN INDEX, NOT A CREDENTIAL. A topology node id can arrive from
+ * an unauthenticated path — qihse_bus_handle_meet upserts nodes straight from a
+ * MEET datagram, and overlay discovery (DHT/Veilid/IRC) supplies hints of the
+ * same kind. Anyone may therefore put any id in a MEET, and the derived UUID
+ * will follow. What that buys them is a LOOKUP KEY that resolves to an identity
+ * record they cannot make APPROVED. Enrollment remains the gate: the durable
+ * accessors re-read the identity record, so a discovered-but-unenrolled node
+ * resolves to nothing usable.
+ *
+ * Nothing may treat this UUID as evidence of identity. If a future caller is
+ * tempted to skip the admissible check because "we derived the UUID", this
+ * comment is the reason not to. */
+bool qihse_cluster_node_federation_uuid(const char* node_id, uint8_t out[16]);
 /* Prune a node from this node's view (stale-node cleanup). Refuses the local
  * node and any node that still owns slots; an upsert of the same node id
  * revives a pruned node in place. */
