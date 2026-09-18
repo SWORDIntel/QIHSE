@@ -302,10 +302,11 @@ workload vector-skip-integrity area=security-regressions expect=known-fail timeo
     ref="tests/test_vector_skip_integrity.c" \
     run="make -s -f Makefile -f tests/security-regression.mk test-vector-skip-integrity"
 
-# Known defect probe: a NULL security context is replaced by the operator
-# identity instead of failing closed (AGENTS.md invariant 1).
-workload null-security-context area=security-regressions expect=known-bug timeout=120 \
+# Invariant-1 regression probe: a NULL security context must fail closed with
+# EACCES and materialise nothing, never be replaced by the operator principal.
+workload null-security-context area=security-regressions expect=pass timeout=120 \
     ref="AGENTS.md" \
+    output="GOLD: OK gold_security_null_context null-user-fails-closed" \
     bin=tests/gold/workloads/gold_security_null_context \
     run="./tests/gold/workloads/gold_security_null_context"
 

@@ -1,28 +1,32 @@
 /*
  * gold_security_null_context.c — gold workload (area: security-regressions).
  *
- * A KNOWN-DEFECT probe for AGENTS.md security invariant 1:
+ * Regression probe for AGENTS.md security invariant 1:
  *
  *   "NULL MUST NOT accidentally become an authorization bypass.  If QIHSE
  *    supports an explicitly security-disabled operating mode, that mode must be
  *    represented deliberately in configuration/context state rather than
  *    inferred from a forgotten user argument."
  *
- * qihse_vector_db_search() substitutes qihse_auth_get_user(0) — the operator,
- * the highest-privilege principal — when query.user is NULL
- * (src/broad_oak/qihse_vector_db.c:5841-5845) instead of failing closed.  This
- * probe observes the behaviour on a real search:
+ * The defect this probe was written for: qihse_vector_db_search() substituted
+ * qihse_auth_get_user(0) — the operator, the highest-privilege principal — when
+ * query.user was NULL (src/broad_oak/qihse_vector_db.c:5841-5845).  The
+ * substitution is removed; a NULL context now fails closed with EACCES and
+ * materialises nothing.
  *
- *   GOLD: KNOWN-BUG <workload-id> <check>: <detail>
- *   GOLD: OK        <workload-id> <check>: <detail>
+ *   GOLD: OK        <workload-id> <check>: <detail>   (defect absent)
+ *   GOLD: KNOWN-BUG <workload-id> <check>: <detail>   (defect present)
  *
- * The control is the same search with an explicit authenticated user; if the
- * control fails the probe is broken and exits non-zero.
+ * The check asserts absence, not merely an error return: the search must report
+ * no rows AND leave the caller's result slot byte-for-byte untouched, so a
+ * regression that returns rows — or writes a result and then reports an error —
+ * is caught.  The control is the same search with an explicit authenticated
+ * user; if the control fails the probe is broken and exits non-zero.
  *
  * Impact statement (kept honest): every vector row is written with
- * QIHSE_CLASS_UNCLASSIFIED today (src/broad_oak/qihse_vector_db.c:3927), so no
- * classified payload is disclosed by this path yet.  The defect is that a
- * forgotten argument selects the operator identity rather than failing closed,
+ * QIHSE_CLASS_UNCLASSIFIED today (src/broad_oak/qihse_vector_db.c:3927), so the
+ * old fallback disclosed no classified payload yet.  The defect was that a
+ * forgotten argument selected the operator identity rather than failing closed,
  * which is what invariant 1 forbids for a classified-capable read primitive.
  * The same fallback is why the shipped persistence regression test — which
  * never initialises auth and passes user = NULL — fails today
@@ -37,6 +41,7 @@
 #include "qihse_auth.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +50,14 @@
 #define GOLD_DIMS     3u
 #define GOLD_PASSWORD "gold-suite-test-password"
 
-static int search_with(qihse_vector_db_t db, const float* vector,
-                       qihse_user_t* user, int* out_errno) {
+typedef struct {
+    int  count;        /* qihse_vector_db_search() return value */
+    int  err;          /* errno observed after the call */
+    bool bytes_absent; /* the result slot was not written at all */
+} gold_search_outcome_t;
+
+static gold_search_outcome_t search_with(qihse_vector_db_t db, const float* vector,
+                                         qihse_user_t* user) {
     qihse_vector_query_t query;
     memset(&query, 0, sizeof(query));
     query.query_vector = vector;
@@ -56,14 +67,23 @@ static int search_with(qihse_vector_db_t db, const float* vector,
     query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
     query.distance_metric = QIHSE_DISTANCE_COSINE;
     query.user = user;
+
     qihse_vector_result_t result;
+    qihse_vector_result_t untouched;
     memset(&result, 0, sizeof(result));
+    memset(&untouched, 0, sizeof(untouched));
+
+    gold_search_outcome_t out;
+    memset(&out, 0, sizeof(out));
     errno = 0;
-    int count = qihse_vector_db_search(db, &query, &result, 1);
-    if (out_errno) *out_errno = errno;
+    out.count = qihse_vector_db_search(db, &query, &result, 1);
+    out.err = errno;
+    /* Byte absence: a fail-closed search must not have written id, score,
+     * vector or metadata into the caller's result slot. */
+    out.bytes_absent = memcmp(&result, &untouched, sizeof(untouched)) == 0;
     free(result.vector);
     free(result.metadata);
-    return count;
+    return out;
 }
 
 int main(void) {
@@ -114,40 +134,44 @@ int main(void) {
     }
 
     /* Control: an explicit authenticated identity can read the row. */
-    int control_errno = 0;
-    int control_count = search_with(db, vector, operator_user, &control_errno);
-    if (control_count != 1) {
+    gold_search_outcome_t control = search_with(db, vector, operator_user);
+    if (control.count != 1) {
         fprintf(stderr,
                 "%s: probe control failed: an explicit operator search returned "
                 "%d (errno=%d); the NULL-user check below cannot be interpreted\n",
-                GOLD_ID, control_count, control_errno);
+                GOLD_ID, control.count, control.err);
         return 1;
     }
 
-    /* The check: a NULL security context must not become an identity. */
-    int null_errno = 0;
-    int null_count = search_with(db, vector, NULL, &null_errno);
-    if (null_count > 0) {
-        char detail[900];
+    /* The check: a NULL security context must not become an identity, and must
+     * return no rows and no result bytes. */
+    gold_search_outcome_t null_out = search_with(db, vector, NULL);
+    if (null_out.count > 0 || !null_out.bytes_absent || null_out.err != EACCES) {
+        char detail[1100];
         snprintf(detail, sizeof(detail),
-                 "a search with query.user == NULL was accepted (returned %d row) "
-                 "instead of failing closed with EACCES; the caller's missing "
-                 "argument was replaced by qihse_auth_get_user(0), which is the "
-                 "active operator principal (role=%d, clearance=0x%X, "
-                 "user_id=%u) — src/broad_oak/qihse_vector_db.c:5841-5845, "
-                 "AGENTS.md invariant 1.  Impact today: vector rows are written "
-                 "as QIHSE_CLASS_UNCLASSIFIED (src/broad_oak/qihse_vector_db.c:3927), "
+                 "a search with query.user == NULL did not fail closed with no "
+                 "result bytes (count=%d, errno=%d, result_bytes_absent=%s). If "
+                 "it returned rows, the caller's missing argument was replaced by "
+                 "qihse_auth_get_user(0), the active operator principal "
+                 "(role=%d, clearance=0x%X, user_id=%u) — "
+                 "src/broad_oak/qihse_vector_db.c:5831, AGENTS.md invariant 1.  "
+                 "Impact today: vector rows are written as "
+                 "QIHSE_CLASS_UNCLASSIFIED (src/broad_oak/qihse_vector_db.c:3927), "
                  "so no classified payload is disclosed yet; the same fallback is "
                  "why tests/qihse_vector_db_persistence_test.c:423-441 fails "
                  "(it passes user = NULL without initialising auth)",
-                 null_count, (int)qihse_user_get_role(user_zero),
+                 null_out.count, null_out.err,
+                 null_out.bytes_absent ? "yes" : "no",
+                 (int)qihse_user_get_role(user_zero),
                  (unsigned)qihse_user_get_classification(user_zero),
                  (unsigned)qihse_user_get_id(user_zero));
         printf("GOLD: KNOWN-BUG %s null-user-fails-closed: %s\n", GOLD_ID, detail);
     } else {
         printf("GOLD: OK %s null-user-fails-closed: a search with query.user == "
-               "NULL was refused (count=%d errno=%d), not silently run as the "
-               "operator\n", GOLD_ID, null_count, null_errno);
+               "NULL returned no rows (count=%d errno=%d) and wrote no result "
+               "bytes; no principal was substituted — "
+               "src/broad_oak/qihse_vector_db.c:5831, AGENTS.md invariant 1\n",
+               GOLD_ID, null_out.count, null_out.err);
     }
 
     qihse_vector_db_destroy(db);

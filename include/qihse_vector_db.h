@@ -15,6 +15,7 @@
 #define QIHSE_VECTOR_DB_PR5_TRINARY_SEARCH_API 1
 
 #include "../memory/include/qihse_uma.h"
+#include "qihse_auth.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -689,6 +690,10 @@ bool qihse_vector_db_upsert_by_ids(
  * results, except for QIHSE_VDB_QUERY_TRINARY_MAGNITUDE_BYPASS which returns
  * approximate qmag-only ordering for lowest-latency execution.
  *
+ * query.user MUST be an explicit authenticated security context.  A NULL user
+ * fails closed with EACCES and returns no rows: it is never replaced by a
+ * default principal (AGENTS.md invariant 1).
+ *
  * @param vdb Vector database handle
  * @param query Query parameters; see qihse_vector_query_t for trinary contract
  * @param results Output array for results
@@ -883,34 +888,47 @@ typedef struct qihse_result_set_s {
 
 /**
  * Execute a native QIHSE Query Language (QQL) string entirely in memory.
- * Parses the string, compiles WHERE clauses to native bytecode, performs the 
+ * Parses the string, compiles WHERE clauses to native bytecode, performs the
  * underlying vector search, and returns the results.
- * 
+ *
+ * These are classified-capable read primitives, so the context-free forms were
+ * removed rather than deprecated: there is no qihse_execute_qql() without a
+ * principal.  `user` MUST be an explicit authenticated security context; NULL
+ * fails closed with EACCES and returns NULL (AGENTS.md invariant 1).
+ *
  * @param vdb Vector database handle
+ * @param user Authenticated principal performing the query (never NULL)
  * @param qql_query_string Raw QQL query (e.g., "MATCH (d) SEARCH d.vec WITH VEC(...)")
- * @return Allocated result set, or NULL on parsing/execution error. 
+ * @return Allocated result set, or NULL on parsing/execution error.
  *         Caller must free via qihse_free_result_set().
  */
-qihse_result_set_t* qihse_execute_qql(
-    qihse_vector_db_t vdb, 
+qihse_result_set_t* qihse_execute_qql_user(
+    qihse_vector_db_t vdb,
+    qihse_user_t* user,
     const char* qql_query_string
 );
 
 /**
  * Execute a legacy SQL string by dynamically translating it into QIHSE graph operations.
  * Requires the native SQL parser module to be linked into the framework.
- * 
+ *
+ * `user` MUST be an explicit authenticated security context; NULL fails closed
+ * with EACCES and returns NULL (AGENTS.md invariant 1).
+ *
  * @param vdb Vector database handle
+ * @param user Authenticated principal performing the query (never NULL)
  * @param sql_query_string Raw SQL query
  * @return Allocated result set, or NULL on parsing/execution error.
  */
-qihse_result_set_t* qihse_execute_sql(
-    qihse_vector_db_t vdb, 
+qihse_result_set_t* qihse_execute_sql_user(
+    qihse_vector_db_t vdb,
+    qihse_user_t* user,
     const char* sql_query_string
 );
 
 /**
- * Free a result set allocated by qihse_execute_qql or qihse_execute_sql.
+ * Free a result set allocated by qihse_execute_qql_user or
+ * qihse_execute_sql_user.
  */
 void qihse_free_result_set(qihse_result_set_t* rs);
 

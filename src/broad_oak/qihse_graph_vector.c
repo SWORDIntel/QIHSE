@@ -1,5 +1,6 @@
 #include "qihse_graph_vector.h"
 #include "qihse_arena.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -22,20 +23,27 @@ static void sv_push(scored_vertex_t** arr, size_t* n, size_t* cap, uint64_t id, 
     (*arr)[*n].id = id; (*arr)[*n].score = score; (*n)++;
 }
 
-/* Graph-guided vector search */
-size_t qihse_graph_vector_search(qihse_graph_t* g, qihse_vector_db_t vdb,
-                                 const float* query, size_t dims, size_t k, size_t hops,
-                                 uint64_t* out_vertex_ids, float* out_scores, size_t max_out) {
+/* Graph-guided vector search.  This is a classified-capable read primitive, so
+ * it requires an explicit authenticated context and has no context-free form
+ * (AGENTS.md invariant 1): a NULL principal yields no rows and errno = EACCES
+ * rather than being replaced by a default identity. */
+size_t qihse_graph_vector_search_user(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                      qihse_user_t* user,
+                                      const float* query, size_t dims, size_t k, size_t hops,
+                                      uint64_t* out_vertex_ids, float* out_scores, size_t max_out) {
+    if (!user) { errno = EACCES; return 0; }
     if (!g || !vdb || !query || !out_vertex_ids || max_out == 0) return 0;
-    
+
     /* Step 1: HNSW search to get initial nearest neighbors */
     qihse_vector_query_t vq;
     memset(&vq, 0, sizeof(vq));
     vq.query_vector = query;
     vq.vector_dims = dims;
     vq.top_k = k;
-    
+    vq.user = user;
+
     qihse_vector_result_t* results = malloc(k * sizeof(qihse_vector_result_t));
+    if (!results) return 0;
     int nresults = qihse_vector_db_search(vdb, &vq, results, k);
     if (nresults < 0) nresults = 0;
     

@@ -5836,14 +5836,14 @@ int qihse_vector_db_search(
 ) {
     int ret;
     int cache_count = 0;
-    qihse_vector_query_t query_fallback;
 
-    if (query && !query->user) {
-        query_fallback = *query;
-        query_fallback.user = qihse_auth_get_user(0);
-        query = &query_fallback;
-    }
-
+    /* AGENTS.md invariant 1: a classified-capable read primitive must never
+     * infer a principal from a missing security context.  query->user == NULL
+     * fails closed with EACCES.  There is deliberately no fallback to
+     * qihse_auth_get_user(0): substituting the operator identity for a
+     * forgotten argument is an authorization bypass, not a convenience.  A
+     * security-disabled mode, if one is ever needed, must be an explicit
+     * configuration/context state rather than an inferred principal. */
     if (!vdb || !query || !query->user || !query->query_vector || !results || max_results == 0u) {
         errno = query && !query->user ? EACCES : EINVAL;
         return -1;
@@ -8227,13 +8227,22 @@ void qihse_vector_db_free_edge_records(qihse_edge_result_t* results, size_t coun
 
 /* ============================================================================
  * EMBEDDED QUERY EXECUTION (QQL & SQL)
+ *
+ * These are read primitives: the generic MATCH branch enumerates live rows and
+ * the text branch scans row metadata.  They therefore require an explicit
+ * authenticated context and have no context-free form (AGENTS.md invariant 1);
+ * a NULL principal is an argument error that discloses nothing.
  * ============================================================================ */
 
-qihse_result_set_t* qihse_execute_qql(
-    qihse_vector_db_t vdb, 
+qihse_result_set_t* qihse_execute_qql_user(
+    qihse_vector_db_t vdb,
+    qihse_user_t* user,
     const char* qql_query_string
 ) {
-    if (!vdb || !qql_query_string) return NULL;
+    if (!vdb || !user || !qql_query_string) {
+        errno = user ? EINVAL : EACCES;
+        return NULL;
+    }
 
     /* Parse the QQL string using the native tree-sitter parser */
     qihse_qql_ast_t* ast = qihse_parse_qql_to_ast(qql_query_string);
@@ -8280,6 +8289,7 @@ qihse_result_set_t* qihse_execute_qql(
         query.similarity_threshold = 0.0f;
         query.include_vectors = false;
         query.include_metadata = false;
+        query.user = user;
 
         int found = qihse_vector_db_search(vdb, &query, results, top_k);
         free(query_vec);
@@ -8303,6 +8313,8 @@ qihse_result_set_t* qihse_execute_qql(
         for (size_t i = 0; i < vdb->total_vectors && match_count < top_k; i++) {
             if ((vdb->rows[i].row_flags & QIHSE_ROW_F_LIVE) == 0u ||
                 (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) continue;
+            if (!qihse_auth_can_access(user, vdb->rows[i].classification,
+                                       vdb->rows[i].sci_compartment)) continue;
             if (vdb->rows[i].metadata_offset < vdb->metadata_bytes_used && vdb->rows[i].metadata_size > 0) {
                 const char* meta = (const char*)(vdb->metadata + vdb->rows[i].metadata_offset);
                 size_t meta_len = vdb->rows[i].metadata_size;
@@ -8343,6 +8355,8 @@ qihse_result_set_t* qihse_execute_qql(
         for (size_t i = 0; i < vdb->total_vectors && match_count < top_k; i++) {
             if ((vdb->rows[i].row_flags & QIHSE_ROW_F_LIVE) == 0u ||
                 (vdb->rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) continue;
+            if (!qihse_auth_can_access(user, vdb->rows[i].classification,
+                                       vdb->rows[i].sci_compartment)) continue;
             results[match_count].id = vdb->rows[i].vector_id;
             results[match_count].score = 1.0f;
             results[match_count].vector_dims = vdb->vector_dims;
@@ -8361,16 +8375,20 @@ qihse_result_set_t* qihse_execute_qql(
     return rs;
 }
 
-qihse_result_set_t* qihse_execute_sql(
-    qihse_vector_db_t vdb, 
+qihse_result_set_t* qihse_execute_sql_user(
+    qihse_vector_db_t vdb,
+    qihse_user_t* user,
     const char* sql_query_string
 ) {
-    if (!vdb || !sql_query_string) return NULL;
-    
+    if (!vdb || !user || !sql_query_string) {
+        errno = user ? EINVAL : EACCES;
+        return NULL;
+    }
+
     // Scaffold: In full implementation, we would hand this string to libpg_query,
     // translate the PG AST to QQL AST, and then execute.
-    
-    return qihse_execute_qql(vdb, "MATCH (n) /* Transpiled from SQL */");
+
+    return qihse_execute_qql_user(vdb, user, "MATCH (n) /* Transpiled from SQL */");
 }
 
 void qihse_free_result_set(qihse_result_set_t* rs) {
