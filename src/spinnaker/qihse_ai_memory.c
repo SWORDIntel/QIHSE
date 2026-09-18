@@ -15,6 +15,8 @@
 #include "qihse_fts.h"
 #include "qihse_kv_store.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,9 @@
 
 static qihse_fts_index_t* g_aimem_index = NULL;
 static pthread_mutex_t g_aimem_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Defined with the embedding block below; reset() needs it earlier. */
+static void aimem_vecs_clear(void);
 
 static uint64_t aimem_now_ms(void) {
     struct timespec ts;
@@ -119,7 +124,268 @@ void qihse_ai_memory_reset(void) {
         qihse_fts_destroy(g_aimem_index);
         g_aimem_index = NULL;
     }
+    aimem_vecs_clear();
     pthread_mutex_unlock(&g_aimem_lock);
+}
+
+/* ── embeddings (ai_fabric.md §5) ───────────────────────────────────────── */
+
+/* Vectors live under their own prefix so the existing record layout is
+ * untouched and a pre-embedding record still parses. A memory without a
+ * vector is still recallable lexically; it simply does not participate in
+ * semantic ranking. */
+#define AIMEM_VEC_PREFIX "aimemv:"
+#define AIMEM_VEC_PREFIX_LEN (sizeof(AIMEM_VEC_PREFIX) - 1u)
+#define AIMEM_BUILTIN_DIM 256u
+#define AIMEM_BUILTIN_NAME "builtin-lexical-256"
+#define AIMEM_EMBEDDER_NAME_MAX 63u
+
+/* Reciprocal-rank-fusion constant. RRF is used rather than a weighted sum of
+ * raw scores because BM25 scores and cosine similarities are on different,
+ * corpus-dependent scales: any fixed weighting between them is a tuning
+ * accident that silently changes meaning as the corpus grows. RRF consumes
+ * RANKS, so it is stable under both. */
+#define AIMEM_RRF_K 60.0
+
+static uint64_t aimem_hash64(const char* s, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* The built-in embedder: a deterministic hashed bag of tokens, L2-normalised.
+ * Similarity therefore reflects shared vocabulary, NOT meaning — it is a
+ * lexical vector, and calling it semantic would be a lie. It exists so the
+ * storage, ranking, fusion and clearance-filtering paths are complete and
+ * testable with no model present. */
+static bool aimem_builtin_embed(const char* text, float* out, size_t dim, void* ctx) {
+    (void)ctx;
+    if (!text || !out || dim == 0) return false;
+    memset(out, 0, dim * sizeof(float));
+    size_t i = 0, n = strlen(text);
+    while (i < n) {
+        while (i < n && !isalnum((unsigned char)text[i])) i++;
+        size_t start = i;
+        while (i < n && isalnum((unsigned char)text[i])) i++;
+        if (i == start) continue;
+        uint64_t h = aimem_hash64(text + start, i - start);
+        float sign = (h & 0x8000000000000000ULL) ? -1.0f : 1.0f;
+        out[h % dim] += sign;
+    }
+    double norm = 0.0;
+    for (size_t k = 0; k < dim; k++) norm += (double)out[k] * (double)out[k];
+    if (norm <= 0.0) return true; /* no tokens: a zero vector, not an error */
+    float inv = (float)(1.0 / sqrt(norm));
+    for (size_t k = 0; k < dim; k++) out[k] *= inv;
+    return true;
+}
+
+typedef struct {
+    uint64_t doc_id;
+    size_t dim;
+    float* vec;
+} aimem_vec_entry_t;
+
+static aimem_vec_entry_t* g_aimem_vecs = NULL;
+static size_t g_aimem_vec_count = 0;
+static size_t g_aimem_vec_cap = 0;
+static bool g_aimem_vecs_loaded = false;
+
+static qihse_ai_memory_embedder_t g_aimem_embedder = {
+    AIMEM_BUILTIN_NAME, AIMEM_BUILTIN_DIM, aimem_builtin_embed, NULL
+};
+static char g_aimem_embedder_name[AIMEM_EMBEDDER_NAME_MAX + 1u] = AIMEM_BUILTIN_NAME;
+
+bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider) {
+    if (!provider) {
+        g_aimem_embedder.name = AIMEM_BUILTIN_NAME;
+        g_aimem_embedder.dim = AIMEM_BUILTIN_DIM;
+        g_aimem_embedder.embed = aimem_builtin_embed;
+        g_aimem_embedder.ctx = NULL;
+        snprintf(g_aimem_embedder_name, sizeof g_aimem_embedder_name, "%s",
+                 AIMEM_BUILTIN_NAME);
+        return true;
+    }
+    /* A provider that cannot embed is worse than none: recall would silently
+     * degrade to lexical while reporting semantic. Refuse it. */
+    if (!provider->embed || !provider->name || !*provider->name) return false;
+    if (provider->dim == 0 || provider->dim > QIHSE_AIMEM_MAX_DIM) return false;
+    if (strlen(provider->name) > AIMEM_EMBEDDER_NAME_MAX) return false;
+    g_aimem_embedder = *provider;
+    /* Copy the name: the caller's string need not outlive this call, and the
+     * name is persisted with every vector. */
+    snprintf(g_aimem_embedder_name, sizeof g_aimem_embedder_name, "%s",
+             provider->name);
+    g_aimem_embedder.name = g_aimem_embedder_name;
+    return true;
+}
+
+size_t qihse_ai_memory_embedding_dim(void) { return g_aimem_embedder.dim; }
+const char* qihse_ai_memory_embedder_name(void) { return g_aimem_embedder_name; }
+
+static void aimem_vec_key(char* out, size_t cap, uint64_t doc_id) {
+    snprintf(out, cap, AIMEM_VEC_PREFIX "%016llx", (unsigned long long)doc_id);
+}
+
+/* Serialise as <provider>|<dim>|<f0>,<f1>,... — text rather than binary so a
+ * stored vector is inspectable and a corrupt one is detectable by parsing
+ * rather than by a plausible-looking float read. */
+static bool aimem_vec_store(qihse_kv_store_t* store, qihse_user_t* user,
+                            uint64_t doc_id, const float* vec, size_t dim,
+                            uint16_t classification, uint16_t sci) {
+    size_t need = AIMEM_EMBEDDER_NAME_MAX + 32u + dim * 16u;
+    char* buf = (char*)malloc(need);
+    if (!buf) return false;
+    int n = snprintf(buf, need, "%s|%zu|", g_aimem_embedder_name, dim);
+    if (n <= 0) { free(buf); return false; }
+    size_t off = (size_t)n;
+    for (size_t i = 0; i < dim; i++) {
+        int w = snprintf(buf + off, need - off, "%s%.6g", i ? "," : "", (double)vec[i]);
+        if (w <= 0 || (size_t)w >= need - off) { free(buf); return false; }
+        off += (size_t)w;
+    }
+    char key[64];
+    aimem_vec_key(key, sizeof key, doc_id);
+    bool ok = qihse_kv_set_user(store, key, buf, classification, sci, user);
+    free(buf);
+    return ok;
+}
+
+static void aimem_vecs_clear(void) {
+    for (size_t i = 0; i < g_aimem_vec_count; i++) free(g_aimem_vecs[i].vec);
+    free(g_aimem_vecs);
+    g_aimem_vecs = NULL;
+    g_aimem_vec_count = 0;
+    g_aimem_vec_cap = 0;
+    g_aimem_vecs_loaded = false;
+}
+
+static bool aimem_vecs_push(uint64_t doc_id, const float* vec, size_t dim) {
+    if (g_aimem_vec_count == g_aimem_vec_cap) {
+        size_t cap = g_aimem_vec_cap ? g_aimem_vec_cap * 2u : 64u;
+        aimem_vec_entry_t* grown = (aimem_vec_entry_t*)realloc(
+            g_aimem_vecs, cap * sizeof(*grown));
+        if (!grown) return false;
+        g_aimem_vecs = grown;
+        g_aimem_vec_cap = cap;
+    }
+    float* copy = (float*)malloc(dim * sizeof(float));
+    if (!copy) return false;
+    memcpy(copy, vec, dim * sizeof(float));
+    g_aimem_vecs[g_aimem_vec_count].doc_id = doc_id;
+    g_aimem_vecs[g_aimem_vec_count].dim = dim;
+    g_aimem_vecs[g_aimem_vec_count].vec = copy;
+    g_aimem_vec_count++;
+    return true;
+}
+
+/* Parse a stored vector. Rejects a vector produced by a DIFFERENT provider:
+ * embeddings from different models are not comparable, and comparing them
+ * would yield confident nonsense rather than an error. */
+static bool aimem_vec_parse(const char* value, const char* want_provider,
+                            float* out, size_t cap, size_t* out_dim) {
+    if (!value || !out || !out_dim) return false;
+    const char* bar = strchr(value, '|');
+    if (!bar) return false;
+    size_t name_len = (size_t)(bar - value);
+    if (name_len != strlen(want_provider) ||
+        strncmp(value, want_provider, name_len) != 0) {
+        return false;
+    }
+    const char* p = bar + 1;
+    char* end = NULL;
+    unsigned long dim = strtoul(p, &end, 10);
+    if (!end || *end != '|' || dim == 0 || dim > cap) return false;
+    p = end + 1;
+    for (unsigned long i = 0; i < dim; i++) {
+        if (i) {
+            if (*p != ',') return false;
+            p++;
+        }
+        double v = strtod(p, &end);
+        if (end == p) return false; /* not a number: refuse rather than guess */
+        out[i] = (float)v;
+        p = end;
+    }
+    if (*p != '\0') return false; /* trailing junk means a malformed record */
+    *out_dim = (size_t)dim;
+    return true;
+}
+
+typedef struct {
+    size_t loaded;
+} aimem_vec_rebuild_t;
+
+static bool aimem_vec_rebuild_cb(const char* key, const char* value, void* user_data) {
+    aimem_vec_rebuild_t* rb = (aimem_vec_rebuild_t*)user_data;
+    if (strncmp(key, AIMEM_VEC_PREFIX, AIMEM_VEC_PREFIX_LEN) != 0) return true;
+    uint64_t doc_id = strtoull(key + AIMEM_VEC_PREFIX_LEN, NULL, 16);
+    float vec[QIHSE_AIMEM_MAX_DIM];
+    size_t dim = 0;
+    if (!aimem_vec_parse(value, g_aimem_embedder_name, vec, QIHSE_AIMEM_MAX_DIM, &dim)) {
+        return true; /* unparsable or foreign-provider: skip, do not fail the scan */
+    }
+    if (aimem_vecs_push(doc_id, vec, dim)) rb->loaded++;
+    return true;
+}
+
+/* Caller holds g_aimem_lock. */
+static bool aimem_vecs_ensure(qihse_resp_server_t* server) {
+    if (g_aimem_vecs_loaded) return true;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store) return false;
+    aimem_vec_rebuild_t rb = { 0 };
+    qihse_kv_foreach_user(store, qihse_auth_get_user(0), aimem_vec_rebuild_cb, &rb);
+    g_aimem_vecs_loaded = true;
+    return true;
+}
+
+typedef struct {
+    uint64_t doc_id;
+    double score;
+} aimem_cand_t;
+
+/* Caller holds g_aimem_lock. Scores every stored vector against the query and
+ * returns the top `want` by cosine similarity. Vectors from another provider
+ * were already excluded at load time. */
+static size_t aimem_vec_search(const float* qvec, size_t qdim, size_t want,
+                               aimem_cand_t* out) {
+    size_t written = 0;
+    for (size_t i = 0; i < g_aimem_vec_count; i++) {
+        if (g_aimem_vecs[i].dim != qdim) continue;
+        const float* v = g_aimem_vecs[i].vec;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (size_t k = 0; k < qdim; k++) {
+            dot += (double)qvec[k] * (double)v[k];
+            na += (double)qvec[k] * (double)qvec[k];
+            nb += (double)v[k] * (double)v[k];
+        }
+        if (na <= 0.0 || nb <= 0.0) continue;
+        double sim = dot / (sqrt(na) * sqrt(nb));
+        if (written < want) {
+            out[written].doc_id = g_aimem_vecs[i].doc_id;
+            out[written].score = sim;
+            written++;
+        } else {
+            size_t worst = 0;
+            for (size_t j = 1; j < want; j++) if (out[j].score < out[worst].score) worst = j;
+            if (sim > out[worst].score) { out[worst].doc_id = g_aimem_vecs[i].doc_id; out[worst].score = sim; }
+        }
+    }
+    /* Descending by score: the caller treats position as rank. */
+    for (size_t i = 0; i + 1u < written; i++) {
+        for (size_t j = i + 1u; j < written; j++) {
+            if (out[j].score > out[i].score) {
+                aimem_cand_t t = out[i];
+                out[i] = out[j];
+                out[j] = t;
+            }
+        }
+    }
+    return written;
 }
 
 /* ── write path ─────────────────────────────────────────────────────────── */
@@ -157,6 +423,25 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
     bool ok = qihse_kv_set_user(store, key, value, classification, sci, user);
     free(value);
     if (!ok) return false;
+
+    /* Embed and persist the vector. A failure here is NOT fatal: the record is
+     * durable and still recallable lexically, so semantic ranking simply does
+     * not see it. Losing recall quality is better than losing the memory. */
+    {
+        float vec[QIHSE_AIMEM_MAX_DIM];
+        size_t dim = g_aimem_embedder.dim;
+        if (dim && dim <= QIHSE_AIMEM_MAX_DIM &&
+            g_aimem_embedder.embed(text, vec, dim, g_aimem_embedder.ctx)) {
+            if (!aimem_vec_store(store, user, aimem_doc_id(&uuid), vec, dim,
+                                 classification, sci)) {
+                fprintf(stderr, "qihse-ai-memory: record stored without a vector (id %s)\n", id);
+            } else {
+                pthread_mutex_lock(&g_aimem_lock);
+                if (g_aimem_vecs_loaded) (void)aimem_vecs_push(aimem_doc_id(&uuid), vec, dim);
+                pthread_mutex_unlock(&g_aimem_lock);
+            }
+        }
+    }
 
     pthread_mutex_lock(&g_aimem_lock);
     bool rebuilt_now = false;
@@ -199,41 +484,126 @@ bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user,
     return aimem_fetch(server, user, &uuid, out);
 }
 
-size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user,
-                              const char* query, size_t limit,
-                              qihse_ai_memory_hit_t* out, size_t out_cap) {
+/* Resolve a doc_id to a visible memory. Returns false when the record is gone
+ * or the principal cannot see it — the SAME filter every mode goes through, so
+ * no ranking mode can surface, score, or count an invisible record. */
+static bool aimem_resolve(qihse_resp_server_t* server, qihse_user_t* user,
+                          uint64_t doc_id, qihse_ai_memory_hit_t* out) {
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store) return false;
+    char key[64];
+    aimem_key(key, sizeof key, doc_id);
+    char* value = qihse_kv_get_user(store, key, user);
+    if (!value) return false;
+    bool ok = aimem_parse_record(value, out);
+    free(value);
+    return ok;
+}
+
+size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* query, size_t limit,
+                                   qihse_ai_memory_mode_t mode,
+                                   qihse_ai_memory_hit_t* out, size_t out_cap) {
     if (!server || !user || !query || !*query || !out || out_cap == 0) return 0;
+    if (mode != QIHSE_AIMEM_MODE_BM25 && mode != QIHSE_AIMEM_MODE_SEMANTIC &&
+        mode != QIHSE_AIMEM_MODE_HYBRID) {
+        return 0;
+    }
     size_t want = limit ? limit : 10u;
     if (want > out_cap) want = out_cap;
     if (want > 256u) want = 256u;
 
-    qihse_fts_result_t results[256];
-    pthread_mutex_lock(&g_aimem_lock);
-    if (!aimem_index_ensure(server, NULL)) {
-        pthread_mutex_unlock(&g_aimem_lock);
-        return 0;
-    }
-    int found = qihse_fts_search_user(g_aimem_index, query, user, results, (int)want);
-    pthread_mutex_unlock(&g_aimem_lock);
-    if (found <= 0) return 0;
+    aimem_cand_t lexical[256];
+    aimem_cand_t vector[256];
+    size_t n_lexical = 0, n_vector = 0;
 
+    pthread_mutex_lock(&g_aimem_lock);
+    if (mode == QIHSE_AIMEM_MODE_BM25 || mode == QIHSE_AIMEM_MODE_HYBRID) {
+        if (aimem_index_ensure(server, NULL)) {
+            qihse_fts_result_t results[256];
+            int found = qihse_fts_search_user(g_aimem_index, query, user, results, (int)want);
+            for (int i = 0; i < found && n_lexical < 256u; i++) {
+                lexical[n_lexical].doc_id = results[i].doc_id;
+                lexical[n_lexical].score = results[i].bm25_score;
+                n_lexical++;
+            }
+        }
+    }
+    if (mode == QIHSE_AIMEM_MODE_SEMANTIC || mode == QIHSE_AIMEM_MODE_HYBRID) {
+        float qvec[QIHSE_AIMEM_MAX_DIM];
+        size_t qdim = g_aimem_embedder.dim;
+        if (qdim && qdim <= QIHSE_AIMEM_MAX_DIM &&
+            g_aimem_embedder.embed(query, qvec, qdim, g_aimem_embedder.ctx) &&
+            aimem_vecs_ensure(server)) {
+            n_vector = aimem_vec_search(qvec, qdim, want, vector);
+        }
+    }
+    pthread_mutex_unlock(&g_aimem_lock);
+
+    /* Fuse by rank, not by score. BM25 and cosine are on different
+     * corpus-dependent scales, so any weighted sum between them is a tuning
+     * accident; RRF consumes positions and is stable under both. */
     size_t written = 0;
-    for (int i = 0; i < found && written < want; i++) {
-        /* doc_id -> uuid: the id is stored in the record, so fetch by key. */
-        qihse_kv_store_t* store = qihse_resp_server_store(server);
-        char key[64];
-        aimem_key(key, sizeof key, results[i].doc_id);
-        char* value = qihse_kv_get_user(store, key, user);
-        if (!value) continue; /* forgotten, or not visible to this principal */
+    if (mode == QIHSE_AIMEM_MODE_HYBRID) {
+        struct { uint64_t doc_id; double rrf; } fused[512];
+        size_t n_fused = 0;
+        for (size_t i = 0; i < n_lexical && n_fused < 512u; i++) {
+            fused[n_fused].doc_id = lexical[i].doc_id;
+            fused[n_fused].rrf = 1.0 / (AIMEM_RRF_K + (double)(i + 1u));
+            n_fused++;
+        }
+        for (size_t i = 0; i < n_vector && n_fused < 512u; i++) {
+            size_t j = 0;
+            for (; j < n_fused; j++) {
+                if (fused[j].doc_id == vector[i].doc_id) {
+                    fused[j].rrf += 1.0 / (AIMEM_RRF_K + (double)(i + 1u));
+                    break;
+                }
+            }
+            if (j == n_fused) {
+                fused[n_fused].doc_id = vector[i].doc_id;
+                fused[n_fused].rrf = 1.0 / (AIMEM_RRF_K + (double)(i + 1u));
+                n_fused++;
+            }
+        }
+        for (size_t i = 0; i + 1u < n_fused; i++) {
+            for (size_t j = i + 1u; j < n_fused; j++) {
+                if (fused[j].rrf > fused[i].rrf) {
+                    uint64_t d = fused[i].doc_id; double r = fused[i].rrf;
+                    fused[i].doc_id = fused[j].doc_id; fused[i].rrf = fused[j].rrf;
+                    fused[j].doc_id = d; fused[j].rrf = r;
+                }
+            }
+        }
+        for (size_t i = 0; i < n_fused && written < want; i++) {
+            qihse_ai_memory_hit_t hit;
+            memset(&hit, 0, sizeof hit);
+            if (aimem_resolve(server, user, fused[i].doc_id, &hit)) {
+                hit.score = fused[i].rrf;
+                out[written++] = hit;
+            }
+        }
+        return written;
+    }
+
+    const aimem_cand_t* list = (mode == QIHSE_AIMEM_MODE_SEMANTIC) ? vector : lexical;
+    size_t n_list = (mode == QIHSE_AIMEM_MODE_SEMANTIC) ? n_vector : n_lexical;
+    for (size_t i = 0; i < n_list && written < want; i++) {
         qihse_ai_memory_hit_t hit;
         memset(&hit, 0, sizeof hit);
-        if (aimem_parse_record(value, &hit)) {
-            hit.score = results[i].bm25_score;
+        if (aimem_resolve(server, user, list[i].doc_id, &hit)) {
+            hit.score = list[i].score;
             out[written++] = hit;
         }
-        free(value);
     }
     return written;
+}
+
+size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user,
+                              const char* query, size_t limit,
+                              qihse_ai_memory_hit_t* out, size_t out_cap) {
+    return qihse_ai_memory_recall_mode(server, user, query, limit,
+                                       QIHSE_AIMEM_MODE_BM25, out, out_cap);
 }
 
 bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
@@ -245,7 +615,15 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
     if (!store) return false;
     char key[64];
     aimem_key(key, sizeof key, aimem_doc_id(&uuid));
-    return qihse_kv_del_user(store, key, user);
+    bool ok = qihse_kv_del_user(store, key, user);
+    /* Drop the vector as well, or a forgotten memory would keep ranking in
+     * semantic recall. Its KV record is gone so it would not be returned, but
+     * a stale vector still consumes a candidate slot and can push a visible
+     * memory out of the top-k. */
+    char vkey[64];
+    aimem_vec_key(vkey, sizeof vkey, aimem_doc_id(&uuid));
+    (void)qihse_kv_del_user(store, vkey, user);
+    return ok;
 }
 
 typedef struct {

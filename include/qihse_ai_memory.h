@@ -38,15 +38,73 @@ typedef struct {
     uint32_t kind;
     uint16_t classification;
     uint16_t sci_compartment;
-    double score; /* BM25 score; 0 when fetched by id rather than recalled */
+    double score; /* ranking score; 0 when fetched by id rather than recalled */
     char* text;   /* caller frees */
 } qihse_ai_memory_hit_t;
+
+/* ── Embeddings (ai_fabric.md §5, the embedding-backed recall item) ─────── */
+
+/* How recall ranks.
+ *
+ * BM25 is lexical: it matches the words the caller typed. SEMANTIC ranks by
+ * vector similarity, so a query can match a memory that shares no words with
+ * it. HYBRID fuses both, because either alone has a failure mode — lexical
+ * misses paraphrase, and vector similarity alone drifts toward whatever is
+ * nearest rather than whatever answers the question.
+ *
+ * Every mode is subject to the SAME visibility filter: candidates are
+ * resolved through the KV store's authorization-aware read, so no mode can
+ * rank, score, or even count a record the principal cannot see. That is the
+ * property that matters here, because an embedding is derived from the text
+ * and can leak it. */
+typedef enum {
+    QIHSE_AIMEM_MODE_BM25 = 0,
+    QIHSE_AIMEM_MODE_SEMANTIC,
+    QIHSE_AIMEM_MODE_HYBRID
+} qihse_ai_memory_mode_t;
+
+/* Maximum embedding dimension the storage and search paths accept. */
+#define QIHSE_AIMEM_MAX_DIM 1024u
+
+/* An embedding provider. `embed` fills exactly `dim` floats for `text` and
+ * returns false on failure. `name` is recorded with the stored vector so a
+ * memory embedded by one provider is never silently compared against a query
+ * embedded by another — vectors from different models are not comparable, and
+ * treating them as if they were would produce confident nonsense. */
+typedef struct {
+    const char* name;
+    size_t dim;
+    bool (*embed)(const char* text, float* out, size_t dim, void* ctx);
+    void* ctx;
+} qihse_ai_memory_embedder_t;
+
+/* Install an embedding provider. Pass NULL to restore the built-in one.
+ *
+ * The built-in embedder is a DETERMINISTIC LEXICAL VECTOR, not a learned
+ * model: it hashes tokens into a fixed-width space, so similarity reflects
+ * shared vocabulary rather than meaning. It exists so the storage, ranking,
+ * fusion and filtering paths are complete and testable with no model present,
+ * and it is honest about being lexical. A real model plugs in here and
+ * everything downstream is unchanged. */
+bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider);
+
+/* The dimension of the active embedder. */
+size_t qihse_ai_memory_embedding_dim(void);
+
+/* The active embedder's name, or "" when none is usable. */
+const char* qihse_ai_memory_embedder_name(void);
 
 /* Remember: store `text` and index it for recall. Returns false when the
  * store or index rejects the write (including insufficient clearance). */
 bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                            const char* text, uint32_t kind,
                            char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+
+/* Recall with an explicit ranking mode. */
+size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* query, size_t limit,
+                                   qihse_ai_memory_mode_t mode,
+                                   qihse_ai_memory_hit_t* out, size_t out_cap);
 
 /* Recall: BM25 search over visible memories. Fills up to `out_cap` hits and
  * returns how many were written; hits with `text` must be freed by the
