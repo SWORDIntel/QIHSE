@@ -109,6 +109,8 @@ The accepted major direction. Governing principle: **federation must enhance a n
 - [x] **Backup writer.** A 320-byte fixed header plus a data section produced by the KV layer's own authorization-aware export, so the classification decision stays in the layer that owns the knowledge. The security context is mandatory and NULL fails closed; two independent gates (a coverage check and the KV clearance/SCI check) rather than one; the low-clearance negative test asserts the protected payload BYTES are absent from every artefact, not merely that a call failed. Restore verifies the manifest checksum and WAL point before opening the container. *Known boundaries: the container is integrity-checked but not authenticated (fix: sign with the F5 node key); no verify-only entry point; no WAL segment.*
 - [x] **Legacy backup API invariant-1 violation resolved.** The five context-free declarations were REMOVED rather than deprecated, and replaced with `_user` forms that take an authenticated context. Removal was chosen over an `#ifdef`/env boundary because a flag leaves a latent bypass a future build can enable. NULL is an argument error, a forged principal handle is refused, and identity is propagated to the KV layer. *Not implemented: incremental export — the KV store exposes no change sequence, so it returns UNSUPPORTED rather than shipping a full snapshot labelled incremental.*
 
+- [ ] **NULL security context is an authorization bypass in the vector search path.** `query.user == NULL` is ACCEPTED and returns rows instead of failing closed; the NULL principal resolves to the active operator (role=0, clearance=0xFFFF) at `src/broad_oak/qihse_vector_db.c:5841-5845`. This is AGENTS.md invariant 1 violated in shipping code. Impact currently bounded because the rows are UNCLASSIFIED. Found by the gold suite; NOT fixed.
+
 ### Correctness findings surfaced by the documentation audit
 
 - [ ] **Bolt adapter is not wire-compatible.** The message-signature constants in `include/qihse_bolt.h` disagree with the Bolt 4.x spec (RUN `0x11` vs `0x10`, PULL `0x13` vs `0x3F`, RESET `0x10` vs `0x0F`), so a real driver's RUN is read as RESET. Tiny maps are encoded as `0xD7|count` instead of `0xA0..0xAF`, malforming every SUCCESS/FAILURE frame with fewer than 16 entries; negative tiny ints encode but do not decode. Needs a proper PackStream pass, not a patch. `tests/test_bolt.c` asserts only the working subset and `bolt_protocol.md` is marked partial.
@@ -126,7 +128,7 @@ Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitive
 - [x] **W2.2** Brain governance phase 2 — capability-aware placement decisions (NODE_CAP headroom + load scoring), signed and journaled with the capability evidence the choice was based on (needs F2 for the full journal migration).
 - [x] **W2.3** Local-first AI memory API — episodic/semantic memory in KV with FTS recall, explicit security context on every entry point, RBAC negative test in CI (embedding-backed semantic recall remains the follow-up).
 - [ ] **W2.4** Generalize NODE_CAP payloads into first-class federation node records at `federation/node/<uuid>` with trust state (needs F1+F5).
-- [ ] **W2.5** KEYSTONE consumes the resumable change feed with a read/index identity — never database-admin privileges (needs F2; criterion 9).
+- [x] **W2.5** KEYSTONE consumes the resumable change feed with a read/index identity. Tenant-scoped ANALYST, never OPERATOR, tenant 0 refused; RESP dispatch allowlist admits only `KEYSTONE.FEED.*`; feed rides the F2 watch API and is always clearance-filtered. *Boundary: read-only on the surfaces it is given, not at the storage layer — the RBAC model has no read-only role.*
 
 - [ ] **Bounded stack frames in the brain.** `qihse_cluster_slot_range_t ranges[QIHSE_CLUSTER_SLOT_COUNT]` sits on the stack at two sites (~96 KB each), making brain_main's frame ~142 KB. Pre-existing, and exactly what the AGENTS.md rule exists to prevent.
 
@@ -135,7 +137,7 @@ Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitive
 - [x] **W3.1** Phase 1 hardening and landing (W0.1–W0.2).
 - [x] **W3.2** Actuation: R1 failed-owner re-home through the shared slot-handoff path (the same audited code `CLUSTER MOVESLOTS` uses), R4 rollback on incomplete transfer or target failure, per-range cooldown, evidence gates (observation matrix) on every action.
 - [x] **W3.3** Rebalance on join (R5: largest owner donates a proportional share to a healthy slotless primary) and stale-node pruning (R6: unhealthy past the timeout, no peer evidence, owns no slots).
-- [ ] **W3.4** Migrate observations/signed decisions onto the federation event journal with HLC stamps and authenticated envelopes; rules consume watch streams instead of polling topology snapshots (needs F2).
+- [x] **W3.4** Observations and signed decisions on the federation journal. Rules consume the watch stream; **no action without a journaled pre-condition**, enforced by a byte-exact round-trip check. ML-DSA-87 signatures over decisions only, ~0.04% of a 5 s cadence; determinism proven byte-for-byte against the old library. *Limit: the append is O(topic length) — needs a tail-offset cache in `qihse_event_stream.c`.*
 - [x] **W3.5** Persistent worker pool. Cycle time at 8 workers drops ~576 µs → ~128 µs (p50, ~4.5x); no regression at 1 worker. Determinism preserved by construction and verified byte-identical against the pre-change library across worker counts and a second topology.
 - [ ] **W3.6** Phase 3: incident retrieval over QIHSE's own FTS/vector indexes (dogfooding).
 - [x] **W3.7** Hard boundary: brain actuation stays database-internal (slot re-homing, quarantine). It must not grow hypervisor actuation — execution decisions belong to the external controller.
@@ -152,7 +154,7 @@ Whitepaper v1.1 §12 priorities, in its stated order:
 
 - [ ] **W5.1** Optimizer governance: A/B or shadow-plan harness, explicit safety constraints, automatic rollback, persistent decision/outcome history, regression budgets by workload/backend.
 - [ ] **W5.2** Telemetry expansion: backend availability/utilization, per-query-type latency histograms, error counters, memory/index movement, cluster/replication status, XDP counters, optimizer rollback counters.
-- [ ] **W5.3** Gold validation suite: versioned workload pack (ANN + rerank, relational, graph, FTS+vector fusion, persistence/recovery, protocol compat, distributed failure, security regressions).
+- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **35 workloads, 8 areas, 0 fully covered — all 8 PARTIAL with declared gaps.**
 - [ ] **W5.4** API documentation: coherent generated/reference surface for the public C API, SDKs, protocol compatibility, configuration.
 - [ ] **W5.5** Documentation labeling discipline: consistently mark implemented / experimental / partial / planned / superseded / externally validated.
 
