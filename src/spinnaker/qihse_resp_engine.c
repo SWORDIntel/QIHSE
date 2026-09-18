@@ -4829,9 +4829,30 @@ typedef struct {
  * consequence. Without that test the effect would have been silent range
  * movement in production.
  *
- * This list is a POLICY STATEMENT, not a derived fact. It says these
- * namespaces are node-local. If one of them should ever be sharded, it must be
- * removed from here deliberately rather than by accident. */
+ * This list is a POLICY STATEMENT, not a derived fact, and CLASSIFYING A NEW
+ * NAMESPACE IS MANDATORY EITHER WAY. The failure mode is symmetric and only
+ * one direction is obvious:
+ *
+ *   - A node-local namespace left out of this list makes bookkeeping look like
+ *     shardable data, so ranges get re-homed for no reason. That is the bug
+ *     this function was written for.
+ *   - Application data wrongly ADDED to this list makes a range holding real
+ *     records look empty, so it is never replicated to the node that owns it.
+ *     That is silent data loss, and it is worse.
+ *
+ * When in doubt, ask whether the records would mean anything on a peer. Two
+ * cases already decided, recorded here so they are not re-litigated:
+ *
+ *   `ns:` is NOT excluded — it is the application keyspace, which is precisely
+ *   what slot ownership partitions.
+ *
+ *   `task:` is NOT excluded — the task queue is a DISTRIBUTED queue by design
+ *   (docs/plans/qihse_task_queue_plan.md: the event stream is the broker and
+ *   the KV store is the result backend), so task records are data that should
+ *   follow their range.
+ *
+ * A sweep of every KV prefix in the tree found no other namespace in the
+ * ambiguous position. */
 static bool cluster_key_is_node_local(const char* key) {
     static const char* const prefixes[] = {
         "aimem:",             /* AI memory records */
