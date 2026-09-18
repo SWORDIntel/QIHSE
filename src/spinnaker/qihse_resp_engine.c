@@ -7422,10 +7422,13 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     /* A type with no executor is REFUSED, not accepted-and-ignored. Silently
      * storing a job nobody will ever run is how a queue fills with work that
      * reports success. */
-    if (!qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "embed")) {
+    bool is_embed = qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "embed");
+    bool is_ingest = qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "keystone-ingest");
+    if (!is_embed && !is_ingest) {
         char err[192];
         snprintf(err, sizeof(err),
-                 "ERR job type not implemented: %s (implemented: embed)", job_type);
+                 "ERR job type not implemented: %s (implemented: embed, keystone-ingest)",
+                 job_type);
         return qihse_resp_error(session, err);
     }
 
@@ -7502,19 +7505,49 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     err[0] = '\0';
 
     if (is_local) {
-        /* `embed`: turn the payload into a memory, which indexes it for both
-         * lexical and semantic recall. The executor is the only one with a
-         * real backend today; the others are refused above. */
-        char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
-        if (qihse_ai_memory_store(session->server, session->user, payload,
-                                  QIHSE_AIMEM_SEMANTIC, mem_id)) {
-            snprintf(result, sizeof(result), "%s", mem_id);
-            status = "done";
-            exec = "local";
+        exec = "local";
+        if (is_embed) {
+            /* `embed`: turn the payload into a memory, which indexes it for
+             * both lexical and semantic recall. */
+            char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
+            if (qihse_ai_memory_store(session->server, session->user, payload,
+                                      QIHSE_AIMEM_SEMANTIC, mem_id)) {
+                snprintf(result, sizeof(result), "%s", mem_id);
+                status = "done";
+            } else {
+                status = "failed";
+                snprintf(err, sizeof(err), "embed failed");
+            }
         } else {
-            status = "failed";
-            exec = "local";
-            snprintf(err, sizeof(err), "embed failed");
+            /* `keystone-ingest`: persist the payload as a fabric artifact and
+             * classify+index it through KEYSTONE.
+             *
+             * The index is a SOFT dependency (it dlopens libkeystone.so), so
+             * "stored but not indexed" is a real and reportable outcome. It is
+             * reported as its own status rather than as success, because a
+             * caller told `done` would reasonably expect the artifact to be
+             * findable, and it would not be. */
+            char art_key[128];
+            snprintf(art_key, sizeof(art_key), "fabric:ingest:%llu", (unsigned long long)jid);
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            bool stored = qihse_kv_set_user(session->server->store, art_key, payload,
+                                            0, 0, session->user);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            if (!stored) {
+                status = "failed";
+                snprintf(err, sizeof(err), "artifact store failed");
+            } else {
+                int irc = qihse_fabric_index_artifact_user(art_key, payload, strlen(payload),
+                                                          0u, 0u, session->user);
+                snprintf(result, sizeof(result), "%s", art_key);
+                if (irc == 0) {
+                    status = "done";
+                } else {
+                    status = "stored-unindexed";
+                    snprintf(err, sizeof(err),
+                             "artifact persisted but KEYSTONE indexing failed (%d)", irc);
+                }
+            }
         }
     }
 

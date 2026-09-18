@@ -187,6 +187,27 @@ int main(void) {
     assert(strstr(reply, "status:done") != NULL);
     printf("PASS legacy 4-argument FABRIC.SUBMIT still works\n");
 
+    /* ── keystone-ingest persists AND reports indexing honestly ───────── */
+    /* The KEYSTONE index is a soft dependency (it dlopens libkeystone.so), so
+     * "stored but not indexed" is a real outcome. It must be reported as its
+     * own status rather than as success: a caller told `done` would reasonably
+     * expect the artifact to be findable, and it would not be. */
+    const char* ing[] = { "FABRIC", "SUBMIT", "keystone-ingest", "0", "0",
+                          "incident report: keystone index rebuild" };
+    assert(run_cmd(6u, ing, reply, sizeof reply));
+    assert(strstr(reply, "not implemented") == NULL);
+    bool indexed = strstr(reply, "status:done") != NULL;
+    bool stored_unindexed = strstr(reply, "status:stored-unindexed") != NULL;
+    assert(indexed || stored_unindexed);
+    char ijid[32];
+    assert(parse_job_id(reply, ijid, sizeof ijid));
+    const char* ires[] = { "FABRIC", "RESULT", ijid };
+    assert(run_cmd(3u, ires, reply, sizeof reply));
+    assert(strstr(reply, "keystone-ingest") != NULL);
+    assert(strstr(reply, "fabric:ingest:") != NULL);
+    printf("PASS keystone-ingest persisted an artifact and reported indexing as %s\n",
+           indexed ? "done" : "stored-unindexed");
+
     /* ── a job id that does not exist is an error, not a phantom ──────── */
     const char* missing[] = { "FABRIC", "RESULT", "999999" };
     assert(run_cmd(3u, missing, reply, sizeof reply));
