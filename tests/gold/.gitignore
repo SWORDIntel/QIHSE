@@ -1,0 +1,8 @@
+# tests/gold/ — build artifacts of the gold validation suite
+
+# The runner and the gold-only workload binaries are built by `make test-gold`;
+# the sources (.c) and the pack (.gold) are tracked.
+gold_runner
+workloads/gold_*
+!workloads/gold_*.c
+.tmp/

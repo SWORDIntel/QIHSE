@@ -1,0 +1,313 @@
+# ============================================================================
+# QIHSE gold validation suite — workload pack, version 1
+# ============================================================================
+#
+# Roadmap item W5.3.  This file is DATA: the runner (tests/gold/gold_runner.c)
+# parses it, executes every workload, and prints a per-area summary plus a final
+# verdict.  Adding a workload is an edit to this file only — the runner and the
+# Makefile do not need to change.
+#
+# Version scheme
+# --------------
+#   pack-version <N>   the grammar/semantics version, implemented by the runner.
+#                      The runner refuses to run a pack whose version it does not
+#                      implement, and refuses to run when the file name
+#                      (pack.v<N>.gold) disagrees with this directive: the suite
+#                      identity must not be ambiguous.
+#   pack-id            human-readable identity printed in the report.
+#   A future grammar change lands as pack.v2.gold next to this file; the
+#   Makefile pins the version it runs (GOLD_PACK ?= tests/gold/pack.v1.gold), so
+#   a v2 pack can be reviewed side by side with v1 and switched deliberately.
+#
+# Grammar
+# -------
+#   area <id> <description>
+#       Declares an area.  Every area must have at least one workload or at
+#       least one gap; an area with neither is a pack error (the runner refuses
+#       to report an untested area as covered).
+#   workload <id> area=<id> expect=<pass|known-bug|known-fail> [timeout=<sec>]
+#            output="<substring>" match="<substring>" ref="<path>"
+#            bin=<relative binary> run="<argv...>"
+#       expect=pass       the workload must exit 0 AND print output= (the
+#                         evidence line that proves it reached its end).  Exit 0
+#                         without the evidence line is a FAIL, not a pass.
+#       expect=known-bug  a known-defect probe: it must exit 0 and print
+#                         "GOLD: KNOWN-BUG <workload-id> <check>: <detail>" for
+#                         every defect it still reproduces, and
+#                         "GOLD: OK <workload-id> <check>: <detail>" for every
+#                         check that now passes.  ref= is mandatory.  A probe
+#                         whose controls fail exits non-zero and is reported as
+#                         FAIL — a broken probe is never reported as a defect.
+#       expect=known-fail the workload is recorded as failing.  match= must be
+#                         present in the failing output, otherwise the failure
+#                         is reported as FAIL ("failed for a reason that is NOT
+#                         the documented one") so a known-fail expectation can
+#                         never mask a new breakage.  ref= is mandatory.
+#       bin=              relative path of a gold-only binary (a .c file under
+#                         tests/gold/workloads/) that the Makefile builds before
+#                         the run; the list is extracted from this pack, so no
+#                         Makefile edit is needed.  Workloads that are existing
+#                         make targets use run="make -s <target>" and need no
+#                         bin=.
+#       run=              the command line; run from the repository root.
+#                         Relative paths only (AGENTS.md path policy); the
+#                         runner rejects absolute paths at parse time.
+#   gap <id> area=<id> reason="<why this cannot be tested today>"
+#       A recorded coverage gap.  An area with workloads and gaps is reported
+#       PARTIAL; an area with gaps only is reported UNCOVERED.  Gaps are never
+#       silently skipped — they are printed in the report and counted in the
+#       verdict.
+#
+# Statuses and exit codes are documented at the top of tests/gold/gold_runner.c.
+# The verdict is green only when every area is FULL and every workload passed;
+# known defects, stale expectations and gaps are printed as caveats and are
+# fatal under GOLD_STRICT=1.
+# ============================================================================
+
+pack-version 1
+pack-id qihse-gold
+
+# ----------------------------------------------------------------------------
+# 1. ANN + rerank
+# ----------------------------------------------------------------------------
+area ann-rerank "Approximate candidate generation followed by exact float32 rerank"
+
+# In-process ANN fixture: exact parity vs brute force, graph candidate path with
+# a recall floor, exact rerank scores, live-row awareness and metadata filtering.
+workload gold-ann-rerank area=ann-rerank expect=pass timeout=300 \
+    output="gold_ann_rerank: PASS" \
+    bin=tests/gold/workloads/gold_ann_rerank \
+    run="./tests/gold/workloads/gold_ann_rerank"
+
+# HNSW index with anchor seeding: recall against a brute-force nearest neighbour
+# and a hop-count comparison against the default entry point.
+workload hnsw-anchor-seeding area=ann-rerank expect=pass timeout=300 \
+    output="All HNSW Anchor-Guided Seeding Tests PASSED!" \
+    run="make -s test-hnsw-anchor-seeding"
+
+# Exact float32 search parity against a brute-force scan, three metrics,
+# filtered and unfiltered, tie stability and result materialization.
+workload exact-search-parity area=ann-rerank expect=pass timeout=300 \
+    output="PASS: guest exact-search scores, stable ties, filtering and materialization" \
+    run="make -s test-exact-search-parity"
+
+gap ann-rerank/trinary-sidecar-rerank area=ann-rerank \
+    reason="the qtri/qmag candidate-then-exact-rerank path is exercised only by tests/qihse_vector_db_persistence_test.c, whose cases abort at case 1 today (see the persistence-recovery known-fail entry); the persisted-sidecar rerank path is therefore not verified by this pack"
+
+# ----------------------------------------------------------------------------
+# 2. Relational
+# ----------------------------------------------------------------------------
+area relational "SQL parser/executors, transactions and MVCC, secondary indexes"
+
+workload sql-completeness area=relational expect=pass timeout=300 \
+    output="test_sql_completeness: all SQL engine tests passed" \
+    run="make -s test-sql-completeness"
+
+workload txn-mvcc area=relational expect=pass timeout=300 \
+    output="test_txn: all transaction tests passed" \
+    run="make -s test-txn"
+
+workload secondary-indexes area=relational expect=pass timeout=300 \
+    output="test_indexes: all secondary-index tests passed" \
+    run="make -s test-indexes"
+
+# Known defect: a committed MVCC delete can leave the row visible when the chain
+# head is a version written by a transaction that later aborted.
+workload mvcc-committed-delete area=relational expect=known-bug timeout=120 \
+    ref="docs/architecture/transactions_mvcc.md" \
+    bin=tests/gold/workloads/gold_mvcc_committed_delete \
+    run="./tests/gold/workloads/gold_mvcc_committed_delete"
+
+gap relational/sql-over-storage area=relational \
+    reason="the SQL parser, join/aggregate/sort executors, schema registry and optimizer are covered, but no in-tree test runs SQL statements against the KV/document/column stores end to end; UPDATE SET-list parsing and DELETE WHERE structure are documented gaps in tests/test_sql_completeness.c"
+
+# ----------------------------------------------------------------------------
+# 3. Graph
+# ----------------------------------------------------------------------------
+area graph "Graph store, Cypher parse/execute, ingest and graph algorithms"
+
+workload graph-engine area=graph expect=pass timeout=300 \
+    output="=== Results: 18 passed, 0 failed ===" \
+    run="make -s test-graph"
+
+gap graph/graph-vector-hybrid area=graph \
+    reason="src/broad_oak/qihse_graph_vector.c (graph+vector hybrid traversal) has no test under tests/; the graph area here covers the property graph store, Cypher and algorithms only"
+
+# ----------------------------------------------------------------------------
+# 4. FTS + vector fusion
+# ----------------------------------------------------------------------------
+area fts-vector-fusion "BM25 trigram full-text search fused with vector search via RRF"
+
+workload fts-bm25 area=fts-vector-fusion expect=pass timeout=300 \
+    output="ALL PASS" \
+    run="make -s test-fts-engine"
+
+workload fts-vector-rrf area=fts-vector-fusion expect=pass timeout=300 \
+    output="ALL PASS" \
+    run="make -s test-neural-fts-fusion"
+
+gap fts-vector-fusion/server-path area=fts-vector-fusion \
+    reason="fusion is verified in-process through qihse_vector_db_search_multimodal(); no test drives hybrid FTS+vector search through a protocol adapter or the server, and there is no recall/latency gate for the fused ranking"
+
+# ----------------------------------------------------------------------------
+# 5. Persistence / recovery
+# ----------------------------------------------------------------------------
+area persistence-recovery "Durability, WAL replay after a crash, and delete durability"
+
+# Gold workload: file-backed round trip, WAL replay after a writer exits without
+# close, and a committed delete that stays deleted across reopen.
+workload gold-persistence-roundtrip area=persistence-recovery expect=pass timeout=300 \
+    output="gold_persistence_roundtrip: PASS" \
+    bin=tests/gold/workloads/gold_persistence_roundtrip \
+    run="./tests/gold/workloads/gold_persistence_roundtrip"
+
+# Known failure: the shipped 60-case persistence regression aborts at its first
+# case.  The cause is diagnosed: the test never initialises auth and passes
+# user = NULL, and qihse_vector_db_search() only falls back to
+# qihse_auth_get_user(0) when an operator identity exists, so the reopened search
+# is refused with EACCES.  Do not weaken the test to make the suite green.
+workload persistence-regression-suite area=persistence-recovery expect=known-fail timeout=600 \
+    match="FAIL create -> insert -> close -> reopen -> search" \
+    ref="tests/qihse_vector_db_persistence_test.c" \
+    run="make -s test-persist"
+
+# Known defect: the replication applier records an LSN without replaying.
+workload repl-apply-wal area=persistence-recovery expect=known-bug timeout=120 \
+    ref="docs/architecture/replication_backup.md" \
+    bin=tests/gold/workloads/gold_repl_apply_wal \
+    run="./tests/gold/workloads/gold_repl_apply_wal"
+
+gap persistence-recovery/shipped-suite-cases area=persistence-recovery \
+    reason="the shipped persistence regression aborts at case 1 (known-fail above), so its WAL-replay, torn-tail, corruption-rejection, compaction, idmap-rebuild and trinary-sidecar cases do not run today; this pack's gold workload covers close/reopen, WAL replay after an unclosed writer and delete durability only"
+
+# ----------------------------------------------------------------------------
+# 6. Protocol compatibility
+# ----------------------------------------------------------------------------
+area protocol-compat "Wire protocol codecs, framing and adapter presence"
+
+workload bolt-codec area=protocol-compat expect=pass timeout=300 \
+    output="test_bolt: all asserted Bolt behaviours passed" \
+    run="make -s test-bolt"
+
+workload replication-wire area=protocol-compat expect=pass timeout=300 \
+    output="test_repl: all replication/pooler tests passed" \
+    run="make -s test-repl"
+
+# Known failure: the PG-wire sharded ingress test dies on SIGPIPE before it can
+# flush any output (make reports 141 = 128 + 13).  The root cause has not been
+# diagnosed; it is recorded so the state is visible rather than skipped.
+workload pg-wire-shard area=protocol-compat expect=known-fail timeout=300 \
+    match="Error 141" \
+    ref="tests/test_pg_wire_cluster.c" \
+    run="make -s test-pg-wire-cluster"
+
+# Known defect probe: Bolt message signatures disagree with Bolt 4.x (observed
+# on the wire, not just in the header), and the declared MongoDB wire entry
+# points are not defined by libqihse.so.
+workload protocol-compat-probe area=protocol-compat expect=known-bug timeout=120 \
+    ref="docs/architecture/bolt_protocol.md" \
+    bin=tests/gold/workloads/gold_protocol_compat \
+    run="./tests/gold/workloads/gold_protocol_compat"
+
+gap protocol-compat/other-adapters area=protocol-compat \
+    reason="RESP, HTTP, Elasticsearch, ClickHouse and Influx adapter end-to-end compatibility has no runnable harness in the main Makefile target graph; this pack exercises Bolt, the replication frame and the pooler only, plus the declared-adapter presence probe"
+
+gap protocol-compat/bolt-negative-auth area=protocol-compat \
+    reason="AGENTS.md invariant 3 requires a low-clearance/high-data negative authorization test for every protocol adapter; tests/test_bolt.c exercises the codec, framing and handshake only, and no Bolt negative authorization test exists in the target graph"
+
+# ----------------------------------------------------------------------------
+# 7. Distributed failure
+# ----------------------------------------------------------------------------
+area distributed-failure "Partition, quorum, isolation, rejoin and failover scenarios"
+
+workload federation-f8-scenarios area=distributed-failure expect=pass timeout=600 \
+    output="federation F8 scenario tests passed" \
+    run="make -s test-federation-f8"
+
+workload federation-f8-ops area=distributed-failure expect=pass timeout=600 \
+    output="federation F8 operations tests passed" \
+    run="make -s test-federation-f8-ops"
+
+workload cluster-failover area=distributed-failure expect=pass timeout=300 \
+    output="cluster failover tests passed" \
+    run="make -s test-cluster-failover"
+
+workload federation-rejoin area=distributed-failure expect=pass timeout=600 \
+    output="federation rejoin tests passed" \
+    run="make -s test-federation-rejoin"
+
+gap distributed-failure/multi-process-cluster area=distributed-failure \
+    reason="failure scenarios run through the deterministic in-process simulator over the real F1-F7 entry points; the multi-process smoke scripts (tests/cluster_*_smoke.py) need a running cluster daemon and are not part of make test-gold, so no workload here kills a real peer process"
+
+# ----------------------------------------------------------------------------
+# 8. Security regressions
+# ----------------------------------------------------------------------------
+area security-regressions "Authorization, tenant isolation, classification and trust regressions"
+
+workload auth-privilege-boundary area=security-regressions expect=pass timeout=300 \
+    output="ALL privilege-boundary and authorization regression tests PASSED!" \
+    run="make -s test-auth-privilege-boundary"
+
+workload object-acl area=security-regressions expect=pass timeout=300 \
+    output="PASS object ACL grant, deny, operator bypass, and revoke with discrete READ/WRITE/ADMIN flags" \
+    run="make -s test-object-acl"
+
+workload uwp-wire-security area=security-regressions expect=pass timeout=300 \
+    output="RESULT: PASS (all 29 test(s) passed, no crashes)" \
+    run="make -s test-uwp-regression"
+
+workload federation-mtls area=security-regressions expect=pass timeout=300 \
+    output="federation mTLS tests passed" \
+    run="make -s test-federation-mtls"
+
+workload federation-bus-trust area=security-regressions expect=pass timeout=300 \
+    output="federation bus trust tests passed" \
+    run="make -s test-federation-bus-trust"
+
+# The security regression matrix lives in tests/security-regression.mk; its
+# targets are runnable from here because run= is a full command line.
+workload kv-security-regression area=security-regressions expect=pass timeout=300 \
+    output="[ALL PASS] KV security regression tests" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-kv-security-regression"
+
+workload tenant-security-regression area=security-regressions expect=pass timeout=300 \
+    output="test_tenant_security_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-tenant-security-regression"
+
+workload tenant-privilege-ladder area=security-regressions expect=pass timeout=300 \
+    output="test_tenant_privilege_ladder: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-tenant-privilege-ladder"
+
+workload sci-compartment-regression area=security-regressions expect=pass timeout=300 \
+    output="test_sci_compartment_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-sci-compartment-regression"
+
+workload resp-security-regression area=security-regressions expect=pass timeout=300 \
+    output="test_resp_security_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-resp-security-regression"
+
+workload vector-tenant-isolation area=security-regressions expect=pass timeout=300 \
+    output="test_vector_tenant_isolation: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-vector-tenant-isolation"
+
+workload export-regression area=security-regressions expect=pass timeout=300 \
+    output="test_export_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-export-regression"
+
+# Known failure: the skip-integrity structural validation regression aborts
+# (assertion at tests/test_vector_skip_integrity.c:68).  The reader does not
+# report skip_integrity even though QIHSE_ENFORCE_INTEGRITY is unset.
+workload vector-skip-integrity area=security-regressions expect=known-fail timeout=300 \
+    match="Assertion `reader.skip_integrity' failed" \
+    ref="tests/test_vector_skip_integrity.c" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-vector-skip-integrity"
+
+# Known defect probe: a NULL security context is replaced by the operator
+# identity instead of failing closed (AGENTS.md invariant 1).
+workload null-security-context area=security-regressions expect=known-bug timeout=120 \
+    ref="AGENTS.md" \
+    bin=tests/gold/workloads/gold_security_null_context \
+    run="./tests/gold/workloads/gold_security_null_context"
+
+gap security-regressions/remaining-matrix-targets area=security-regressions \
+    reason="tests/security-regression.mk declares 16 targets; this pack runs 8 of them (KV, tenant isolation, tenant privilege ladder, SCI compartments, RESP, vector tenant isolation, export, vector skip integrity). The remaining 8 are runnable with 'make -f Makefile -f tests/security-regression.mk test-security-regressions' and are omitted here only to keep the default gold run bounded"

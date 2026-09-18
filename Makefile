@@ -315,6 +315,10 @@ test-brain-rebalance: lib
 	$(CC) $(CFLAGS) -o tests/test_brain_rebalance tests/test_brain_rebalance.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_brain_rebalance
 
+test-brain-fed-journal: lib
+	$(CC) $(CFLAGS) -o tests/test_brain_fed_journal tests/test_brain_fed_journal.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_brain_fed_journal
+
 test-federation-f0: lib
 	$(CC) $(CFLAGS) -o tests/test_federation_f0 tests/test_federation_f0.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_federation_f0
@@ -383,6 +387,10 @@ test-federation-backup: lib
 	$(CC) $(CFLAGS) -o tests/test_federation_backup tests/test_federation_backup.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_federation_backup
 
+test-keystone-feed-w25: lib
+	$(CC) $(CFLAGS) -o tests/test_keystone_feed_w25 tests/test_keystone_feed_w25.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_keystone_feed_w25
+
 test-ai-memory: lib
 	$(CC) $(CFLAGS) -o tests/test_ai_memory tests/test_ai_memory.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ai_memory
@@ -448,7 +456,26 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-actuate test-brain-rebalance test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-ai-memory test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-indexes test-sql-completeness test-bolt test-repl test-phase-c
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-indexes test-sql-completeness test-bolt test-repl test-phase-c test-gold
+
+# --- W5.3 gold validation suite -------------------------------------------
+# One entry point for the versioned workload pack under tests/gold/.  The pack
+# is data: adding a workload is a pack edit, not a Makefile edit.  The pack
+# names the binaries the Makefile must build (bin=) and runs everything else
+# through the targets that already exist.  GOLD_PACK pins the pack version;
+# GOLD_STRICT=1 makes known defects and recorded coverage gaps fatal (the
+# runner then exits 2).
+GOLD_PACK ?= tests/gold/pack.v1.gold
+GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^[:space:]]*\/[^[:space:]]*\).*/\1/p' $(GOLD_PACK) 2>/dev/null)
+
+test-gold: lib tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
+	LD_LIBRARY_PATH=. ./tests/gold/gold_runner $(GOLD_PACK)
+
+tests/gold/gold_runner: tests/gold/gold_runner.c libqihse.so
+	$(CC) $(CFLAGS) -o tests/gold/gold_runner tests/gold/gold_runner.c -L. -lqihse $(LDFLAGS)
+
+tests/gold/workloads/%: tests/gold/workloads/%.c libqihse.so
+	$(CC) $(CFLAGS) -o $@ $< -L. -lqihse $(LDFLAGS)
 
 # --- Architecture-document reconciliation tests ---------------------------
 # Each of these is named by the corresponding document under docs/architecture/.
