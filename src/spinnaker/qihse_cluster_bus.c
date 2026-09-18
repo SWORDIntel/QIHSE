@@ -1,4 +1,6 @@
 #include "qihse_cluster_bus.h"
+
+#include "qihse_cpu_detect.h" /* the one ISA detector */
 #include "qihse_federation.h"
 #include "qihse_platform.h"
 #include <errno.h>
@@ -795,30 +797,35 @@ bool qihse_cluster_bus_broadcast_federation_heartbeat(qihse_cluster_bus_t* bus,
 
 /* ISA tier from /proc/cpuinfo flags, probed once (single bus thread calls
  * this at heartbeat rate): 4=AVX-512+AMX, 3=AVX-512, 2=AVX2, 1=AVX, 0=generic. */
+/* The ISA tier advertised to the fabric.
+ *
+ * This used to parse /proc/cpuinfo with strstr, which is wrong in two ways.
+ *
+ *   - It reimplemented detection that already exists. backends/cpu does this
+ *     with CPUID, and that is the detection the code actually uses when it
+ *     picks a kernel. Advertising one answer while executing another means the
+ *     fabric can place work on a node for capabilities it will not use, or
+ *     withhold work from one that has them.
+ *   - /proc/cpuinfo is commonly MASKED inside a container (lxcfs), so a node
+ *     running in one under-reported its own ISA tier and the fabric treated it
+ *     as weaker than it is. CPUID is not maskable that way.
+ *
+ * The tier scale is unchanged, so the same hardware advertises the same value;
+ * what changes is that it is now derived from the same source the rest of the
+ * system trusts. */
 static uint8_t qihse_bus_local_isa_tier(void) {
-#ifndef _WIN32
     static uint8_t tier_cache = 0;
     static bool tier_probed = false;
     if (tier_probed) return tier_cache;
     tier_probed = true;
-    FILE* f = fopen("/proc/cpuinfo", "r");
-    if (!f) return 0;
-    char line[2048];
-    bool avx = false, avx2 = false, avx512 = false, amx = false;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "flags", 5) != 0) continue;
-        avx = strstr(line, "avx") != NULL;
-        avx2 = strstr(line, "avx2") != NULL;
-        avx512 = strstr(line, "avx512f") != NULL;
-        amx = strstr(line, "amx_bf16") != NULL || strstr(line, "amx_int8") != NULL;
-        break; /* first flags line is representative of the package */
-    }
-    fclose(f);
+
+    qihse_cpu_feature_t features = qihse_cpu_detect_features();
+    bool avx = (features & QIHSE_CPU_FEATURE_AVX) != 0;
+    bool avx2 = (features & QIHSE_CPU_FEATURE_AVX2) != 0;
+    bool avx512 = (features & QIHSE_CPU_FEATURE_AVX512F) != 0;
+    bool amx = (features & (QIHSE_CPU_FEATURE_AMX | QIHSE_CPU_FEATURE_AMX_TILE)) != 0;
     tier_cache = (uint8_t)((avx512 && amx) ? 4 : avx512 ? 3 : avx2 ? 2 : avx ? 1 : 0);
     return tier_cache;
-#else
-    return 0;
-#endif
 }
 
 /* Accelerator presence: NPU via the kernel accel subsystem, GPU via DRM
