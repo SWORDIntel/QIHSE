@@ -118,11 +118,16 @@ static void usage(const char* argv0) {
         "          [--brain] [--brain-act] [--brain-dir DIR] [--brain-interval S] [--brain-dsa-key PATH]\n"
         "          [--brain-cooldown S] [--brain-rollback-window S]\n"
         "          [--brain-prune-timeout S] [--brain-rebalance-min-slots N]\n"
+        "          [--brain-fed-dir DIR] [--brain-node-key PATH]\n"
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--max-clients N]\n"
         "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
         "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
         "  static --node list defines the topology.\n"
+        "\n  --brain-fed-dir is the federation event journal the brain publishes\n"
+        "  observations and signed decisions to (default: --brain-dir); the brain\n"
+        "  refuses to act when that journal is unavailable. --brain-node-key is the\n"
+        "  node identity key that signs decisions (default: --brain-dsa-key).\n"
         "\n  --brain observes and journals always; --brain-act additionally re-homes\n"
         "  a failed owner's range to a healthy target (evidence-gated) and rolls\n"
         "  it back if the move did not complete or the target failed within\n"
@@ -204,6 +209,8 @@ int main(int argc, char** argv) {
     const char* irc_nick_prefix = "qihse";
     const char* brain_dir = NULL;
     const char* brain_dsa_key = "/etc/qihse/keys/qihse_dsa_key.pem";
+    const char* brain_fed_dir = NULL;   /* federation journal (default: brain_dir) */
+    const char* brain_node_key = NULL;  /* decision signing key (default: brain_dsa_key) */
     uint32_t brain_interval = 5;
     uint32_t brain_cooldown = 30;         /* per-range re-home cooldown (seconds) */
     uint32_t brain_rollback_window = 60;  /* R4 evaluation window (seconds) */
@@ -259,6 +266,10 @@ int main(int argc, char** argv) {
             brain_interval = (uint32_t)v;
         } else if (strcmp(a, "--brain-dsa-key") == 0 && i + 1 < argc) {
             brain_dsa_key = argv[++i];
+        } else if (strcmp(a, "--brain-fed-dir") == 0 && i + 1 < argc) {
+            brain_fed_dir = argv[++i];
+        } else if (strcmp(a, "--brain-node-key") == 0 && i + 1 < argc) {
+            brain_node_key = argv[++i];
         } else if (strcmp(a, "--brain-cooldown") == 0 && i + 1 < argc) {
             char* end = NULL; errno = 0;
             unsigned long v = strtoul(argv[++i], &end, 10);
@@ -467,7 +478,9 @@ int main(int argc, char** argv) {
             .act_cooldown_seconds = brain_cooldown,
             .rollback_window_seconds = brain_rollback_window,
             .prune_timeout_seconds = brain_prune_timeout,
-            .rebalance_min_slots = brain_rebalance_min
+            .rebalance_min_slots = brain_rebalance_min,
+            .federation_journal_dir = brain_fed_dir,
+            .node_key_handle = brain_node_key
         };
         if (!qihse_cluster_brain_start(&brain_cfg)) {
             fprintf(stderr, "qihse-cluster-daemon: brain failed to start (continuing without it)\n");

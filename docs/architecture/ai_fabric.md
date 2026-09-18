@@ -55,8 +55,11 @@ Postgres, no platform glue.
 - Reuse: `src/spinnaker/qihse_task_queue.c`, `qihse_task_scheduler.c`.
 
 ### 4. Brain governance (phase 2 act)
-- Capability-aware placement decisions, signed (ML-DSA, pattern exists in
-  `qihse_cluster_brain.c` brain_journal), journaled to the event stream.
+- Capability-aware placement decisions, signed and journaled: the placement
+  evidence (NODE_CAP headroom + load, uptime tie-break) is part of the decision
+  record, and since W3.4 the decision itself is published to the federation
+  event journal as an authenticated envelope citing the observation it was
+  derived from (see cluster_brain.md).
 - Evidence gates already specified: confirmed-failure vs asymmetry vs
   isolated (see cluster_brain.md R1-R4).
 

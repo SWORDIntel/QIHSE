@@ -891,6 +891,38 @@ bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip)
 bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len,
                                     const qihse_federation_gossip_t* gossip);
 
+/* ── Algorithm-agile detached signatures (plan §17) ──────────────────────
+ *
+ * The membership statement above is one consumer of a signature; a durable
+ * record that must be attributable (a brain decision, a supply-chain
+ * attestation) is another.  These primitives keep the algorithm knowledge in
+ * this module — the module that owns the algorithm table — so a consumer
+ * never has to hard-code a key type name.
+ *
+ * The caller is responsible for putting the algorithm INSIDE the bytes it
+ * signs (as the statement serializer does), so an algorithm-downgrade edit
+ * invalidates the signature rather than reinterpreting it.
+ */
+
+/* Algorithm of a loaded key handle (an EVP_PKEY* from node_key_load()).
+ * Returns false for a key type the federation does not support. */
+bool qihse_federation_pkey_sig_alg(void* pkey, qihse_sig_alg_t* out);
+
+/* Sign `data` with a loaded key.  `in_out_len` is the capacity of out_sig on
+ * entry and receives the bytes written; the capacity must be at least the
+ * algorithm's signature size. */
+bool qihse_federation_sign(void* pkey, const uint8_t* data, size_t data_len,
+                           uint8_t* out_sig, size_t* in_out_len);
+
+/* Verify a detached signature against a raw public key of the given
+ * algorithm.  The declared key and signature lengths are validated against
+ * the algorithm's fixed sizes before any crypto runs, so a truncated or
+ * padded signature never reaches the verifier. */
+bool qihse_federation_verify(qihse_sig_alg_t alg,
+                             const uint8_t* public_key, size_t public_key_len,
+                             const uint8_t* data, size_t data_len,
+                             const uint8_t* signature, size_t signature_len);
+
 /* ── Cheap heartbeat tier ──────────────────────────────────────────────── */
 
 typedef struct {

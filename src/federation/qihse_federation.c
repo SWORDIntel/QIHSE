@@ -2562,31 +2562,70 @@ bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip)
     size_t frame_len = 0;
     if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
 
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) return false;
-    size_t sig_len = gossip->signature_len;
-    bool ok = EVP_DigestSignInit(ctx, NULL, NULL, NULL, (EVP_PKEY*)pkey) == 1 &&
-              EVP_DigestSign(ctx, gossip->signature, &sig_len, frame, frame_len) == 1 &&
-              sig_len == gossip->signature_len;
-    EVP_MD_CTX_free(ctx);
-    if (!ok) gossip->signature_len = 0;
-    return ok;
+    size_t sig_len = sizeof(gossip->signature);
+    if (!qihse_federation_sign(pkey, frame, frame_len, gossip->signature, &sig_len)) {
+        gossip->signature_len = 0;
+        return false;
+    }
+    gossip->signature_len = (uint16_t)sig_len;
+    return true;
 }
 
 bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len,
                                     const qihse_federation_gossip_t* gossip) {
     if (!public_key || !gossip) return false;
 
-    const sig_alg_entry_t* entry = sig_alg_lookup(gossip->sig_alg);
+    uint8_t frame[256];
+    size_t frame_len = 0;
+    if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
+
+    return qihse_federation_verify(gossip->sig_alg, public_key, public_key_len,
+                                   frame, frame_len,
+                                   gossip->signature, gossip->signature_len);
+}
+
+/* ── Algorithm-agile detached signatures ──────────────────────────────── */
+
+bool qihse_federation_pkey_sig_alg(void* pkey, qihse_sig_alg_t* out) {
+    if (!pkey || !out) return false;
+    return pkey_sig_alg((EVP_PKEY*)pkey, out);
+}
+
+bool qihse_federation_sign(void* pkey, const uint8_t* data, size_t data_len,
+                           uint8_t* out_sig, size_t* in_out_len) {
+    if (!pkey || !out_sig || !in_out_len) return false;
+    if (!data && data_len > 0) return false;
+
+    qihse_sig_alg_t alg;
+    if (!pkey_sig_alg((EVP_PKEY*)pkey, &alg)) return false;
+    size_t want = qihse_sig_alg_signature_bytes(alg);
+    if (want == 0 || *in_out_len < want) return false;
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    size_t sig_len = want;
+    bool ok = EVP_DigestSignInit(ctx, NULL, NULL, NULL, (EVP_PKEY*)pkey) == 1 &&
+              EVP_DigestSign(ctx, out_sig, &sig_len, data, data_len) == 1 &&
+              sig_len == want;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) return false;
+    *in_out_len = sig_len;
+    return true;
+}
+
+bool qihse_federation_verify(qihse_sig_alg_t alg,
+                             const uint8_t* public_key, size_t public_key_len,
+                             const uint8_t* data, size_t data_len,
+                             const uint8_t* signature, size_t signature_len) {
+    if (!public_key || !signature) return false;
+    if (!data && data_len > 0) return false;
+
+    const sig_alg_entry_t* entry = sig_alg_lookup(alg);
     if (!entry) return false;
     /* The declared key length and signature length must match the algorithm,
      * so a truncated or padded signature is rejected before any crypto runs. */
     if (public_key_len != entry->pk_bytes) return false;
-    if (gossip->signature_len != entry->sig_bytes) return false;
-
-    uint8_t frame[256];
-    size_t frame_len = 0;
-    if (!qihse_federation_gossip_serialize(gossip, frame, sizeof(frame), &frame_len)) return false;
+    if (signature_len != entry->sig_bytes) return false;
 
     EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key_ex(NULL, entry->ossl_name, NULL,
                                                    public_key, public_key_len);
@@ -2594,8 +2633,7 @@ bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pkey); return false; }
     bool ok = EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-              EVP_DigestVerify(ctx, gossip->signature, gossip->signature_len,
-                               frame, frame_len) == 1;
+              EVP_DigestVerify(ctx, signature, signature_len, data, data_len) == 1;
     EVP_MD_CTX_free(ctx);
     EVP_PKEY_free(pkey);
     return ok;
