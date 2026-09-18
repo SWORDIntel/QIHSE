@@ -1,6 +1,7 @@
 # Build artifacts and binaries
 *.so
 *.o
+*.d
 *.a
 *.egg-info/
 bin/

@@ -7341,12 +7341,47 @@ static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
         uint8_t isa = 0, npu = 0, gpu = 0;
         uint32_t ram = 0;
         uint16_t load = 0;
-        if (qihse_cluster_bus_node_caps(session->server->bus, nodes[i].index, &isa, &npu, &gpu, &ram, &load)) {
+        bool answered = false;
+
+        /* Prefer the DURABLE capability record when the node's federation
+         * identity is known. The live bus hint is ephemeral — it is rebuilt
+         * from incoming datagrams and lost on restart — so a node that has
+         * been quiet since boot has no hint even though its last claim is on
+         * disk. The durable lookup additionally requires the node to be
+         * APPROVED right now, so a revoked node's stale claim is not served.
+         *
+         * `src=` tells the caller which it got. That matters: a durable record
+         * is attributable and survives restart, a live hint is neither, and a
+         * caller that cannot tell them apart will treat the weaker one as the
+         * stronger. */
+        if (nodes[i].has_uuid) {
+            qihse_uuid_t nu;
+            memcpy(nu.bytes, nodes[i].node_uuid, sizeof nu.bytes);
+            qihse_federation_node_capability_t rec;
+            memset(&rec, 0, sizeof rec);
+            qihse_kv_store_t* st = qihse_resp_server_store(session->server);
+            if (st && qihse_federation_node_capability_lookup_admissible(
+                          st, session->user, &nu, &rec)) {
+                char cap_buf[256];
+                (void)snprintf(cap_buf, sizeof(cap_buf),
+                    "isa=%u npu=%u gpu=%u ram=%u load=%u src=durable trust=%u attested=%u",
+                    (unsigned)rec.values.isa_tier, (unsigned)rec.values.npu,
+                    (unsigned)rec.values.gpu, (unsigned)rec.values.free_ram_mb,
+                    (unsigned)rec.values.load_pct, (unsigned)rec.trust,
+                    (unsigned)((rec.flags & QIHSE_CAP_FLAG_ATTESTED) ? 1u : 0u));
+                if (!qihse_resp_bulk_text(session, cap_buf)) return false;
+                answered = true;
+            }
+        }
+        if (!answered &&
+            qihse_cluster_bus_node_caps(session->server->bus, nodes[i].index, &isa, &npu, &gpu, &ram, &load)) {
             char cap_buf[192];
             (void)snprintf(cap_buf, sizeof(cap_buf),
-                "isa=%u npu=%u gpu=%u ram=%u load=%u", isa, npu, gpu, ram, load);
+                "isa=%u npu=%u gpu=%u ram=%u load=%u src=hint", isa, npu, gpu, ram, load);
             if (!qihse_resp_bulk_text(session, cap_buf)) return false;
-        } else {
+            answered = true;
+        }
+        if (!answered) {
             if (!qihse_resp_bulk_text(session, "no-cap")) return false;
         }
     }

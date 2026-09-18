@@ -44,6 +44,13 @@ typedef struct {
     uint16_t primary_index;
     uint64_t config_epoch;
     bool healthy;
+    /* The node's federation identity, when it is known. Raw bytes rather than
+     * qihse_uuid_t so this header does not take a dependency on the federation
+     * header. A node with no known federation identity has has_uuid false and
+     * CANNOT be looked up in the durable capability store — it falls back to
+     * the live bus hint, which is ephemeral. */
+    uint8_t node_uuid[16];
+    bool has_uuid;
 } qihse_cluster_node_t;
 
 typedef struct {
@@ -72,6 +79,11 @@ size_t qihse_cluster_topology_nodes(const qihse_cluster_topology_t* topology, qi
 bool qihse_cluster_topology_set_local_node(qihse_cluster_topology_t* topology, uint16_t index);
 uint16_t qihse_cluster_topology_local_node(const qihse_cluster_topology_t* topology);
 bool qihse_cluster_topology_set_node_health(qihse_cluster_topology_t* topology, uint16_t index, bool healthy);
+
+/* Record a node's federation identity so its durable capability record can be
+ * found. Without this a node is only reachable through the live bus hint. */
+bool qihse_cluster_topology_set_node_uuid(qihse_cluster_topology_t* topology,
+                                          uint16_t index, const uint8_t uuid[16]);
 /* Prune a node from this node's view (stale-node cleanup). Refuses the local
  * node and any node that still owns slots; an upsert of the same node id
  * revives a pruned node in place. */

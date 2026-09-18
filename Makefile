@@ -263,11 +263,23 @@ COBJS = $(CSRCS:.c=.o)
 CXXOBJS = $(CXXSRCS:.cpp=.o)
 OBJS = $(COBJS) $(CXXOBJS)
 
+# Header dependency tracking. Without this a change to a struct in a header
+# leaves every .o that included it compiled against the OLD layout while the
+# rest of the tree is rebuilt against the new one, and the link succeeds: the
+# mismatch shows up as memory corruption far from the edit. That is exactly
+# what happened when qihse_cluster_node_t gained fields — the brain test
+# failed until `make clean`, and nothing in the build said why.
+#
+# -MMD -MP emits a .d per object listing the headers it actually included,
+# and -include pulls them in so make knows to rebuild. The generated .d files
+# are build artifacts and are gitignored with the rest of the objects.
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS_BASE) -c $< -o $@
+	$(CXX) $(CXXFLAGS_BASE) -MMD -MP -c $< -o $@
+
+-include $(OBJS:.o=.d)
 
 $(LIB_TARGET): $(OBJS)
 	@echo "Building $(LIB_TARGET)..."

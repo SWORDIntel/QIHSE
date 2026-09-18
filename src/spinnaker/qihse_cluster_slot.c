@@ -222,6 +222,19 @@ bool qihse_cluster_topology_set_node_health(qihse_cluster_topology_t* topology, 
     pthread_mutex_unlock(&topology->metadata_lock);
     return true;
 }
+bool qihse_cluster_topology_set_node_uuid(qihse_cluster_topology_t* topology,
+                                          uint16_t index, const uint8_t uuid[16]) {
+    if (!topology || !uuid) return false;
+    if (index >= QIHSE_CLUSTER_MAX_NODES) return false;
+    if (!topology->nodes[index].healthy && !topology->nodes[index].id[0] &&
+        topology->nodes[index].config_epoch == 0) {
+        return false; /* no such node */
+    }
+    memcpy(topology->nodes[index].node_uuid, uuid, 16u);
+    topology->nodes[index].has_uuid = true;
+    return true;
+}
+
 
 bool qihse_cluster_topology_assign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end, uint16_t owner_index) {
     if (!topology || !qihse_cluster_valid_slot_range(start, end)) {
