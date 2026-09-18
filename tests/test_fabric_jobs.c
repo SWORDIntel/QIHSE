@@ -15,9 +15,17 @@
  *   3. A job type with no executor is REFUSED, not accepted and ignored.
  *      Silently queueing work nobody will run is how a queue fills with
  *      entries that report success.
- *   4. A job whose best-fit node is not this node is recorded as `queued`
- *      rather than `done`, because it has been placed but not run.
- *   5. The original 4-argument FABRIC.SUBMIT signature still works.
+ *   4. The original 4-argument FABRIC.SUBMIT signature still works.
+ *
+ * NOT COVERED HERE, and it was claimed here until a documentation audit
+ * checked the claim against this file's body: a job whose best-fit node is
+ * ANOTHER node should be recorded `queued` rather than `done`, because it has
+ * been placed but not run. Asserting that needs a peer with a capability hint
+ * in the bus table, and a unit test cannot inject one without standing up a
+ * real bus peer. It is recorded as a declared gap in
+ * tests/gold/pack.v1.gold (ai-fabric/remote-dispatch) rather than asserted
+ * here, and the earlier comment listing it as verified was simply wrong — the
+ * same overstatement this repository keeps finding in its documents.
  */
 #include "qihse_ai_memory.h"
 #include "qihse_auth.h"
