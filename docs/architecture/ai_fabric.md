@@ -1,14 +1,23 @@
 # AI Compute Fabric — Superseding MEMSHADOW
 
-> **Status: implemented** — items 1–5 are verified by `tests/test_fabric_index.c`
-> (KEYSTONE fabric index), `tests/test_brain_actuate.c` (capability-aware
-> placement), and `tests/test_ai_memory.c` (local-first AI memory, including an
-> RBAC negative test). Embedding-backed semantic recall is `planned`: recall
-> today is BM25 over caller-visible documents.
+> **Status: partial** — item 3 is the incomplete one. Item 1 is `implemented`
+> and verified by `tests/test_node_cap_records.c`, with its durable
+> reachability chain covered by the `gold-fabric-durable-caps` workload in
+> `tests/gold/pack.v1.gold`. Item 2 is `implemented` and verified by
+> `tests/test_fabric_index.c`. Item 3 is `partial`: `FABRIC.SUBMIT` executes
+> two job types locally and refuses the other two, and it does not dispatch to
+> another node — both gaps are recorded in `tests/gold/pack.v1.gold` under the
+> `ai-fabric` area. Item 4 is `implemented` and verified by
+> `tests/test_brain_actuate.c` (R1/R4) and `tests/test_brain_fed_journal.c`
+> (W3.4). Item 5 is `implemented` and verified by `tests/test_ai_memory.c`
+> (including an RBAC negative test). Embedding-backed semantic recall is no
+> longer `planned`: it is `implemented` and verified by
+> `tests/test_ai_memory_embed.c`.
 
 Design of record for the heterogeneous AI compute cluster built on QIHSE +
 KEYSTONE. This document is the execution spec: subagents and future sessions
-implement from here.
+implement from here. Each build item below carries its own status line,
+because the items are at different stages.
 
 ## The idea
 
@@ -23,57 +32,172 @@ Postgres, no platform glue.
 ## Build items (in order)
 
 ### 1. NODE_CAP capability profiles (bus)
-- New bus frame `QIHSE_BUS_MSG_NODE_CAP = 8u` in
+
+> **Status: implemented** — `tests/test_node_cap_records.c` (durable records,
+> both producer paths, trust and admissibility, malformed-record refusal), and
+> the `gold-fabric-durable-caps` workload
+> (`tests/gold/workloads/gold_fabric_durable_caps.c`, declared in
+> `tests/gold/pack.v1.gold`) covering the topology-node-to-UUID chain that
+> makes the durable record reachable at all.
+
+- Bus frame `QIHSE_BUS_MSG_NODE_CAP = 8u` in
   `include/qihse_cluster_bus.h`, payload `{node_id[41], isa_tier u8
-  (0=generic,1=AVX,2=AVX2,3=AVX512,4=AMX), npu u8, gpu u8, free_ram_mb u32,
-  load_pct u16}` (~90 bytes).
-- Emitted alongside heartbeats (piggyback loop like NODE_OBS) every N
-  heartbeats; handler stores per-node capability in the bus (arrays like
-  obs_healthy_ms pattern) with getter
-  `qihse_cluster_bus_node_caps(bus, idx, out)`.
-- ISA tier source: `backends/cpu/qihse_cpu_detect.c` already detects AVX2/
-  AVX-512/AMX. NPU: OpenVINO backend presence (`backends/npu/`). GPU:
-  probe CUDA device file.
-- Files: bus .h/.c, small brain/daemon wiring. No new threads.
+  (0=generic,1=AVX,2=AVX2,3=AVX-512,4=AVX-512+AMX), npu u8, gpu u8,
+  free_ram_mb u32, load_pct u16}` — exactly 50 bytes, defined by
+  `QIHSE_CLUSTER_BUS_NODE_CAP_PAYLOAD_SIZE`. (Earlier revisions of this
+  document said "~90 bytes"; the code defines 50.)
+- Emitted alongside every heartbeat (not every Nth) by
+  `src/spinnaker/qihse_cluster_bus.c`, which stores the per-node capability in
+  the bus's in-memory tables; the getter is
+  `qihse_cluster_bus_node_caps(bus, node_index, isa, npu, gpu, free_ram, load)`.
+- The frame is an UNAUTHENTICATED, in-memory hint: nothing binds the node id
+  in the payload to the sender, and it is lost on restart. It updates the live
+  hint table and writes no durable record.
+- Capability data is now DURABLE as well. A first-class record
+  (`qihse_federation_node_capability_t`) lives at `federation/node/<uuid>`,
+  written by the local node's own probe
+  (`qihse_federation_node_capability_record_local`, called by the bus for its
+  configured local federation UUID, throttled to one write per 10 seconds) and
+  by a signature-verified v3 membership statement. It is read with
+  `qihse_federation_node_capability_lookup` (audit; returns the stored claim)
+  or `qihse_federation_node_capability_lookup_admissible` (requires the node
+  to be APPROVED right now).
+- Trust semantics: the stored values are always a CLAIM, never an attested
+  fact. A signature proves WHICH NODE made the claim, not that the hardware
+  exists; a self-report carries `QIHSE_CAP_FLAG_ATTESTED` clear and nothing in
+  the library sets that flag. The trust state stored in the record is a
+  snapshot taken at admission for attribution and audit — it is NOT
+  authorization, which is why the admissible accessor re-reads the identity
+  record so a revocation takes effect immediately.
+- ISA tier source: `backends/cpu/qihse_cpu_detect.c` (CPUID, not a kernel text
+  interface that a container can mask). NPU: presence of the kernel accel
+  device. GPU: a DRM render node or the NVIDIA control device. RAM and load
+  are read from the kernel's memory-info and load-average interfaces. See
+  `src/spinnaker/qihse_cluster_bus.c`.
+- Consumers: `FABRIC.CAPS` (prefers the durable record, falls back to the
+  live hint, and reports `src=durable` / `src=hint` so a caller can tell them
+  apart) and the brain's placement scoring in
+  `src/spinnaker/qihse_cluster_brain.c`. The topology-node-to-federation-UUID
+  mapping is derived at node upsert, so no caller has to supply it.
 
 ### 2. KEYSTONE indexing hookup
-- KEYSTONE (`~/Documents/KEYSTONE`, C11/SIMD/OpenMP) indexes and classifies;
-  it already feeds QIHSE. Wire its ingestion API so every artifact QIHSE
-  stores via the fabric (KV writes under `fabric:` prefix, job results,
-  brain decisions) is classified + indexed once, searchable cluster-wide
-  by semantic class.
-- Read KEYSTONE's public headers first (`ls`, main header), link as needed,
-  integrate at the QIHSE ingest boundary (`qihse_resp_handle_set` fabric
-  prefix hook or `KEYSTONE.INGEST` path).
+
+> **Status: implemented** — `tests/test_fabric_index.c` (authorization
+> negative test, soft-dependency fail-closed behaviour, candidate-only
+> indexing).
+
+- KEYSTONE (a separate C11/SIMD repository) indexes and classifies. It is a
+  SOFT dependency: located via dlopen at first use, so QIHSE builds and runs
+  without it and every index call fails closed with
+  `QIHSE_FABRIC_INDEX_EUNAVAILABLE`.
+- `include/qihse_fabric_index.h` wires the ingestion boundary: every artifact
+  written under the `fabric:` KV prefix is classified and trigram-indexed once
+  (`src/spinnaker/qihse_resp_engine.c`), and the `keystone-ingest` job
+  executor calls it explicitly. The index keeps candidate postings only —
+  KEYSTONE never retains artifact content, so no second copy of classified
+  data exists outside the authoritative KV store.
+- Lookup surfaces (`..._lookup_user`, `..._by_class_user`) require an
+  authenticated context, deny NULL, and filter every candidate through
+  `qihse_auth_can_access()` against the classification/SCI recorded at ingest.
 
 ### 3. Fabric job model
-- Job frame over the bus OR task-queue wiring:
-  `{kind: embedding|inference|index-build|keystone-ingest, payload blob
-  hash, cap requirement (isa/npu/gpu), priority}`.
-- Dispatch: best-fit node by NODE_CAP + observation matrix (reachability)
-  + load. Results land as QIHSE vectors/KV, KEYSTONE-indexed.
-- Reuse: `src/spinnaker/qihse_task_queue.c`, `qihse_task_scheduler.c`.
+
+> **Status: partial** — the local executors and the refusal path are verified
+> by `tests/test_fabric_jobs.c`. Remote dispatch does not exist
+> (`ai-fabric/remote-dispatch` gap in `tests/gold/pack.v1.gold`), and two of
+> the four named job types have no executor
+> (`ai-fabric/inference-executors`).
+
+- The command surface is RESP, not the bus job frame this item originally
+  specified: `FABRIC.CAPS`, `FABRIC.SUBMIT [<type>] <min_isa> <need_npu>
+  <payload>`, `FABRIC.RESULT <job-id>`. `FABRIC.SUBMIT` and `FABRIC.RESULT`
+  are refused outside the system tenant. The original four-argument form
+  (`FABRIC.SUBMIT <min_isa> <need_npu> <payload>`) is retained and is an
+  `embed` job.
+- Two executors exist, both LOCAL:
+  - `embed` turns the payload into an AI memory, so the result is indexed for
+    lexical and semantic recall; the returned id reads the payload back.
+  - `keystone-ingest` persists the payload as a `fabric:ingest:<job-id>`
+    artifact and classifies/indexes it through KEYSTONE. Because the index is a
+    soft dependency, "stored but not indexed" is reported as its own
+    `stored-unindexed` status rather than as success.
+- `inference` and `index-build` are REFUSED with `job type not implemented`,
+  rather than accepted and silently ignored.
+- There is NO remote dispatch. A job whose best-fit node is another node is
+  recorded `queued` with the chosen target and never runs; it is recorded
+  `queued` rather than `done` so the record does not claim a dispatch that did
+  not happen. Placement picks the lowest `load_pct` among nodes meeting the
+  ISA/NPU requirement from the live hint table, then falls back to the local
+  node's durable record so a single-node fabric can place work at all;
+  reachability is not consulted.
+- Job records live at `fabric:job:<job-id>` and ARE the result `FABRIC.RESULT`
+  returns. The job frame this item specified — payload blob hash, priority,
+  bus or task-queue dispatch — was not built: there is no priority field, no
+  blob hash, and no fabric path touches `src/spinnaker/qihse_task_queue.c` or
+  `src/spinnaker/qihse_task_scheduler.c`.
 
 ### 4. Brain governance (phase 2 act)
+
+> **Status: implemented** — R1 failed-owner re-home and R4 rollback are
+> verified by `tests/test_brain_actuate.c`; the W3.4 federation decision
+> envelope (signed, citing the observation it was derived from) is verified by
+> `tests/test_brain_fed_journal.c`. The narrower claim that a decision record
+> carries the capability evidence fields is `partial — status unverified`: the
+> code journals them (`brain_caps_evidence` in
+> `src/spinnaker/qihse_cluster_brain.c`) but no test asserts them.
+
 - Capability-aware placement decisions, signed and journaled: the placement
-  evidence (NODE_CAP headroom + load, uptime tie-break) is part of the decision
-  record, and since W3.4 the decision itself is published to the federation
-  event journal as an authenticated envelope citing the observation it was
-  derived from (see cluster_brain.md).
+  evidence (capability headroom + load, with the profile's source — `durable`
+  or `hint` — recorded, uptime tie-break) is part of the decision record, and
+  since W3.4 the decision itself is published to the federation event journal
+  as an authenticated envelope citing the observation it was derived from (see
+  `docs/architecture/cluster_brain.md`).
 - Evidence gates already specified: confirmed-failure vs asymmetry vs
-  isolated (see cluster_brain.md R1-R4).
+  isolated (see `docs/architecture/cluster_brain.md` R1-R4).
 
 ### 5. Local-first AI memory API
-- Episodic/semantic memory for AI workloads stored in QIHSE vectors/FTS/KV
-  with KEYSTONE classes, 4096-d quantized embeddings via QIHSE's own
-  quantization module. Queryable from any node. This is the MEMSHADOW
-  successor surface.
+
+> **Status: implemented** — `tests/test_ai_memory.c` (store/recall/get/forget/
+> count and the RBAC negative test) and `tests/test_ai_memory_embed.c`
+> (embedding-backed recall: a semantic match with no shared tokens, clearance
+> filtering on every mode, provider binding, forget, hybrid fusion).
+
+- Episodic/semantic memory for AI workloads stored in QIHSE KV/FTS with
+  KEYSTONE classes. This is the MEMSHADOW successor surface.
 - **Implemented as** `qihse_ai_memory_store/recall/get/forget/count`
   (`include/qihse_ai_memory.h`): records in the `aimem:` KV namespace, indexed
   by the FTS engine for BM25 recall over caller-visible documents only, with
-  every entry point taking an explicit security context. Embedding-backed
-  semantic search (quantized vectors instead of lexical recall) remains the
-  follow-up; the record layout and RBAC surface do not change when it lands.
+  every entry point taking an explicit security context. There is no
+  context-free variant.
+- Embedding-backed recall is implemented, not planned:
+  `qihse_ai_memory_recall_mode()` supports BM25, SEMANTIC and HYBRID.
+  `qihse_ai_memory_set_embedder()` installs a provider (NULL restores the
+  built-in one), `qihse_ai_memory_embedding_dim()` and
+  `qihse_ai_memory_embedder_name()` describe the active provider, and vectors
+  are stored under `aimemv:<id>` bound to the name of the embedder that
+  produced them — vectors from different providers are never compared, because
+  comparing them yields confident nonsense rather than an error. HYBRID fuses
+  the two rank lists (reciprocal rank fusion) rather than adding BM25 and
+  cosine scores, which live on different corpus-dependent scales.
+- The built-in embedder is deliberately LEXICAL and named for what it is:
+  `builtin-lexical-256`, 256 dimensions, deterministic token hashing. Its
+  similarity reflects shared vocabulary, not meaning. It exists so the
+  storage, ranking, fusion and filtering paths are complete and testable with
+  no model present; a real model plugs into the same interface and everything
+  downstream is unchanged. The maximum accepted dimension is
+  `QIHSE_AIMEM_MAX_DIM` (1024).
+- Every ranking mode resolves candidates through the same authorization-aware
+  read, so no mode can rank, score, or even count a record the principal
+  cannot see. That is the property that matters here, because an embedding is
+  derived from the text and can leak it.
+- Correction to this item's original specification: it called for 4096-d
+  quantized embeddings via QIHSE's own quantization module. What was built is
+  neither — vectors are float, stored as decimal text in KV, capped at 1024
+  dimensions with a 256-d built-in, and there is no quantization step. The
+  record layout and RBAC surface are as specified.
+- Cross-node queryability is `partial — status unverified`: recall runs
+  against a server's own store and process-local vector/FTS state, and no test
+  drives it from a peer node.
 
 ## Rejected from MEMSHADOW
 Python monolith, Postgres, Docker tiers, consciousness/Mamba/neuromorphic/
@@ -91,13 +215,15 @@ rollback, deterministic telemetry, capability-aware dispatch.
 
 The [federation upgrade plan](../plans/qihse_federation_upgrade_plan.md)
 (accepted 2026-09-15) supplies the coordination substrate this fabric was
-going to have to invent. Items 3–5 above should be built on the plan's
+going to have to invent. What remains above should be built on the plan's
 primitives rather than ad-hoc bus messaging:
 
-- fabric job dispatch and brain governance use the mutation envelope,
-  idempotent request IDs, leases, and watch streams (plan §8, §9, §13, §14);
-- item 1's NODE_CAP payloads generalize into first-class node records at
-  `federation/node/<uuid>` with trust state and capabilities (plan §6.1);
+- fabric job dispatch (the missing remote half of item 3) needs the mutation
+  envelope, idempotent request IDs, leases, and watch streams (plan §8, §9,
+  §13, §14). Brain governance already publishes to that journal (W3.4);
+- item 1's NODE_CAP payloads have since been built as first-class node records
+  at `federation/node/<uuid>` with trust state and capabilities (plan §6.1;
+  see the W2.4 section of `include/qihse_federation.h`);
 - the same lease/idempotency model is what the Citadel build fabric uses
   (plan §28–30) — one set of primitives, two consumers;
 - KEYSTONE consumes the plan's resumable change feed with a read/index
@@ -105,4 +231,6 @@ primitives rather than ad-hoc bus messaging:
 
 This document remains the design of record for AI-workload dispatch
 (embedding/inference/index-build jobs); the federation plan governs the
-substrate those jobs run on.
+substrate those jobs run on. Of those job kinds, `embed` and
+`keystone-ingest` execute today (locally), `inference` and `index-build` do
+not, and no job executes on another node.
