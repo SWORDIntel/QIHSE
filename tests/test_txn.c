@@ -216,12 +216,15 @@ static void test_mvcc_visibility(void) {
     assert(qihse_mvcc_min_active_snapshot(store) == 0);
 
     /*
-     * KNOWN DEFECT (reported, not asserted): qihse_mvcc_delete() marks the
-     * chain head, which may be a version written by a transaction that later
-     * aborted.  It therefore does not necessarily delete the version readers
-     * can actually see.  The block below runs the sequence and prints what
-     * happens so the defect is visible in CI output; it asserts nothing so
-     * that fixing the defect does not break this test.
+     * A committed DELETE hides the row even when the writer before it aborted.
+     * qihse_mvcc_delete() records a delete intent that the read path resolves
+     * against the deleting snapshot, so it hides the version readers actually
+     * see (the committed base version) rather than the chain head (the aborted
+     * update's version).  Marking the head used to leave the row visible; that
+     * is what this block printed as a NOTE before the delete path was fixed,
+     * so the corrected behaviour is asserted here.  The over-correction guards
+     * (no resurrection of a deleted row, no hiding of a version the deleter
+     * could not see) live in tests/test_mvcc_delete.c.
      */
     const char* key3 = "user:3";
     qihse_txn_t* t7 = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
@@ -241,10 +244,13 @@ static void test_mvcc_visibility(void) {
     bool kd_visible = qihse_mvcc_read(store, QIHSE_MVCC_ENGINE_KV, key3,
                                       strlen(key3), t9->id, committed_cb, mgr,
                                       &kd_val, &kd_len);
-    printf("NOTE mvcc delete-after-aborted-write: row %s after a committed "
-           "DELETE (expected: hidden) -- see the defect note in "
-           "docs/architecture/transactions_mvcc.md\n",
-           kd_visible ? "STILL VISIBLE (defect reproduced)" : "hidden");
+    assert(!kd_visible);
+    /* Snapshots that predate the delete still see the committed base version;
+     * the aborted writer's value is never returned. */
+    expect_value(store, mgr, key3, t7->id, "base");
+    expect_value(store, mgr, key3, t8->id, "base");
+    assert(!qihse_mvcc_exists(store, QIHSE_MVCC_ENGINE_KV, key3, strlen(key3),
+                              t9->id + 100, committed_cb, mgr));
 
     qihse_mvcc_store_destroy(store);
     qihse_txn_manager_destroy(mgr);

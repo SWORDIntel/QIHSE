@@ -145,7 +145,8 @@ int main(void) {
     }
 
     qihse_repl_context_t* ctx = qihse_repl_create(REPL_ROLE_REPLICA);
-    if (!ctx || qihse_repl_apply_wal(ctx, record, record_len, lsn) != 0) {
+    if (!ctx || qihse_repl_set_store(ctx, store) != 0 ||
+        qihse_repl_apply_wal(ctx, record, record_len, lsn) != 0) {
         fprintf(stderr, "%s: probe control failed: qihse_repl_apply_wal "
                 "refused the valid record\n", GOLD_ID);
         free(record);

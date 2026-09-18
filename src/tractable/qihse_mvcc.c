@@ -94,6 +94,8 @@ static qihse_mvcc_version_t* version_create(qihse_mvcc_store_t* store,
     v->xmin = txn_id;
     v->xmax = QIHSE_MVCC_INVALID_XMAX;
     v->value_len = value_len;
+    v->is_delete = false;
+    v->delete_snapshot = 0;
     v->next = NULL;
 
     if (value_len > 0 && value) {
@@ -201,10 +203,34 @@ int qihse_mvcc_delete(qihse_mvcc_store_t* store,
         return -1;
     }
 
-    /* Set xmax on the head version (the latest live version) */
-    if (row->head->xmax == QIHSE_MVCC_INVALID_XMAX) {
-        row->head->xmax = txn_id;
+    /*
+     * Record a delete intent at the head of the chain instead of marking xmax
+     * on a version.
+     *
+     * The head is not necessarily the version a reader at this transaction's
+     * snapshot sees: it may be a version whose writer aborted (or an earlier
+     * delete intent), and this call has no commit context, so it cannot tell a
+     * committed version from an aborted one.  Marking the wrong version leaves
+     * a committed DELETE's row visible; marking every version hides versions
+     * the delete never saw (and overwriting an older marker resurrects a row
+     * an earlier committed DELETE hid).
+     *
+     * The intent records the deleting transaction and the snapshot the delete
+     * is evaluated at (this transaction's id -- the snapshot a reader of this
+     * delete uses).  qihse_mvcc_read() resolves it with commit context and
+     * hides exactly the versions that were visible at that snapshot.
+     */
+    qihse_mvcc_version_t* v = version_create(store, txn_id, NULL, 0);
+    if (!v) {
+        pthread_mutex_unlock(&store->lock);
+        return -1;
     }
+    v->is_delete = true;
+    v->delete_snapshot = txn_id;
+
+    v->next = row->head;
+    row->head = v;
+    store->total_versions++;
 
     pthread_mutex_unlock(&store->lock);
     return 0;
@@ -231,9 +257,12 @@ int qihse_mvcc_update(qihse_mvcc_store_t* store,
                                  value, value_len, txn_id);
     }
 
-    /* Set xmax on the current head */
-    if (row->head && row->head->xmax == QIHSE_MVCC_INVALID_XMAX) {
-        row->head->xmax = txn_id;
+    /* Mark the newest data version as superseded.  A delete intent is a
+     * marker, not a version: it carries no xmax and is never superseded. */
+    qihse_mvcc_version_t* prev = row->head;
+    while (prev && prev->is_delete) prev = prev->next;
+    if (prev && prev->xmax == QIHSE_MVCC_INVALID_XMAX) {
+        prev->xmax = txn_id;
     }
 
     /* Create new version and prepend */
@@ -286,6 +315,35 @@ static bool version_visible(const qihse_mvcc_version_t* v,
     return false;
 }
 
+/* True when a delete intent above v in the chain deletes v.
+ *
+ * The intent deletes the versions that were visible at the snapshot it was
+ * evaluated at, so it hides v only if v was itself visible at that snapshot.
+ * That is what keeps the delete precise: a version written by a transaction
+ * the deleter could not see (xmin above the deleting snapshot) stays visible,
+ * and a version already superseded or hidden by an earlier committed delete
+ * was not visible there either, so the intent never resurrects it.
+ *
+ * A delete that has not committed (or has aborted) hides nothing.
+ */
+static bool version_deleted_by_intent(const qihse_mvcc_version_t* head,
+                                      const qihse_mvcc_version_t* v,
+                                      uint64_t snapshot,
+                                      qihse_mvcc_committed_cb is_committed,
+                                      void* committed_ctx)
+{
+    for (const qihse_mvcc_version_t* p = head; p && p != v; p = p->next) {
+        if (!p->is_delete) continue;
+        /* The delete must be visible to this reader ... */
+        if (p->xmin > snapshot) continue;
+        if (is_committed && !is_committed(committed_ctx, p->xmin)) continue;
+        /* ... and it deletes v only if v was visible where it was taken. */
+        if (version_visible(v, p->delete_snapshot, is_committed, committed_ctx))
+            return true;
+    }
+    return false;
+}
+
 /* ── Read ───────────────────────────────────────────────────────────────── */
 
 bool qihse_mvcc_read(qihse_mvcc_store_t* store,
@@ -306,10 +364,24 @@ bool qihse_mvcc_read(qihse_mvcc_store_t* store,
         return false;
     }
 
-    /* Walk the chain from newest to oldest, return first visible version */
+    /* Walk the chain from newest to oldest, return first visible version.
+     * A delete intent is a marker rather than a version: it is never returned,
+     * and it can hide the versions below it that were visible at the snapshot
+     * it was evaluated at.  Chains with no delete intent (the common case) take
+     * the same path as before -- no intent is ever consulted. */
     qihse_mvcc_version_t* v = row->head;
+    int intents_above = 0;
     while (v) {
-        if (version_visible(v, snapshot, is_committed, committed_ctx)) {
+        if (v->is_delete) {
+            intents_above++;
+            v = v->next;
+            continue;
+        }
+        if (version_visible(v, snapshot, is_committed, committed_ctx) &&
+            (intents_above == 0 ||
+             !version_deleted_by_intent(row->head, v, snapshot,
+                                        is_committed, committed_ctx)))
+        {
             if (out_value)     *out_value = v->value;
             if (out_value_len) *out_value_len = v->value_len;
             pthread_mutex_unlock(&store->lock);
@@ -360,6 +432,14 @@ int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
             qihse_mvcc_version_t** pp = &row->head;
             while (*pp) {
                 qihse_mvcc_version_t* v = *pp;
+                if (v->is_delete) {
+                    /* A delete intent is a marker, not a version.  Removing it
+                     * would resurrect the versions it hides, and deciding that
+                     * it may go needs the commit context this cutoff does not
+                     * carry, so it is never reclaimed. */
+                    pp = &v->next;
+                    continue;
+                }
                 if (v->xmax != QIHSE_MVCC_INVALID_XMAX &&
                     v->xmax < min_snapshot)
                 {

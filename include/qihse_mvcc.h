@@ -33,6 +33,8 @@ typedef struct qihse_mvcc_version_s {
     uint64_t xmax;                    /* txn ID that deleted/superseded, 0 = live */
     size_t   value_len;
     void*    value;                   /* owned copy of the value data */
+    bool     is_delete;               /* delete intent: a marker, not a version */
+    uint64_t delete_snapshot;         /* snapshot a delete intent was taken at */
     struct qihse_mvcc_version_s* next; /* newer version in the chain */
 } qihse_mvcc_version_t;
 
@@ -66,7 +68,18 @@ int qihse_mvcc_insert(qihse_mvcc_store_t* store,
                       const void* value, size_t value_len,
                       uint64_t txn_id);
 
-/* Delete a row by setting xmax on the visible version.
+/* Delete a row for the given transaction.
+ *
+ * The delete is recorded as a delete intent at the head of the chain instead
+ * of marking xmax on a version: the chain head is not necessarily the version
+ * a reader at this transaction's snapshot sees (it may be a version whose
+ * writer aborted), and the store has no commit context here, so it cannot tell
+ * a committed version from an aborted one.  The intent carries the deleting
+ * transaction and the snapshot the delete is evaluated at (the deleting
+ * transaction's id, the snapshot a reader of this delete uses); the read path,
+ * which does have commit context, then hides exactly the versions that were
+ * visible at that snapshot.  Readers whose snapshot predates the delete still
+ * see the row.
  * Returns 0 on success, -1 if row not found. */
 int qihse_mvcc_delete(qihse_mvcc_store_t* store,
                       uint8_t engine_id,
@@ -85,6 +98,11 @@ int qihse_mvcc_update(qihse_mvcc_store_t* store,
 /* A version is visible to a transaction if:
  *   xmin <= snapshot AND (xmax == 0 OR xmax > snapshot)
  * and xmin belongs to a committed transaction or the current txn itself.
+ *
+ * A delete intent (qihse_mvcc_delete) hides the versions that were visible at
+ * the snapshot it was evaluated at, once its deleting transaction is committed
+ * and visible to the reader; a version written by a transaction the delete
+ * could not see (xmin above that snapshot) is not hidden.
  *
  * is_committed_cb: callback to check if a txn_id is committed.
  *   (passed from the transaction manager)
@@ -119,7 +137,9 @@ bool qihse_mvcc_exists(qihse_mvcc_store_t* store,
 uint64_t qihse_mvcc_min_active_snapshot(qihse_mvcc_store_t* store);
 
 /* Garbage collect dead versions (xmax set and xmax < min_active_snapshot).
- * Returns the number of versions reclaimed. */
+ * Delete intents are never reclaimed: removing one would resurrect the
+ * versions it hides, and deciding whether it may go needs the commit context
+ * the cutoff does not carry.  Returns the number of versions reclaimed. */
 int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot);
 
 /* Vacuum: reclaim space from dead versions and compact chains.

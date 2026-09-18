@@ -111,10 +111,18 @@ workload secondary-indexes area=relational expect=pass timeout=300 \
     output="test_indexes: all secondary-index tests passed" \
     run="make -s test-indexes"
 
-# Known defect: a committed MVCC delete can leave the row visible when the chain
-# head is a version written by a transaction that later aborted.
-workload mvcc-committed-delete area=relational expect=known-bug timeout=120 \
-    ref="docs/architecture/transactions_mvcc.md" \
+# Verified fix: a committed MVCC delete records an intent resolved against the
+# DELETING SNAPSHOT, so it hides exactly the versions its transaction could see.
+# Aborted writers before it cannot leave the row visible, and versions written
+# by transactions the deleter could not see are NOT hidden.
+#
+# The wording matters: an earlier attempt marked "all versions in the chain",
+# which made this probe print OK while being wrong in BOTH dangerous
+# directions — it overwrote an earlier committed DELETE's marker (resurrecting
+# the row for snapshots between two deletes) and hid versions the deleter never
+# saw (silent data loss). A probe that passes is not evidence the rule is right.
+workload mvcc-committed-delete area=relational expect=pass timeout=120 \
+    output="GOLD: OK gold_mvcc_committed_delete mvcc-committed-delete-hides-row" \
     bin=tests/gold/workloads/gold_mvcc_committed_delete \
     run="./tests/gold/workloads/gold_mvcc_committed_delete"
 
@@ -171,9 +179,9 @@ workload persistence-regression-suite area=persistence-recovery expect=known-fai
     ref="tests/qihse_vector_db_persistence_test.c" \
     run="make -s test-persist"
 
-# Known defect: the replication applier records an LSN without replaying.
-workload repl-apply-wal area=persistence-recovery expect=known-bug timeout=120 \
-    ref="docs/architecture/replication_backup.md" \
+# Verified fix: the replication applier replays valid WAL records into the local KV store.
+workload repl-apply-wal area=persistence-recovery expect=pass timeout=120 \
+    output="GOLD: OK gold_repl_apply_wal wal-apply-replays-record" \
     bin=tests/gold/workloads/gold_repl_apply_wal \
     run="./tests/gold/workloads/gold_repl_apply_wal"
 
