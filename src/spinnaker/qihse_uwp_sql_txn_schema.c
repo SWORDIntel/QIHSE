@@ -770,12 +770,13 @@ static void uwp_build_where_expr(uwp_text_buffer_t* out,
     }
 }
 
-/* Extract and normalize a WHERE clause for UPDATE/DELETE statements.
+/* Extract and normalize a WHERE clause for DML statements.
  *
- * The parser leaves UPDATE's WHERE entirely unparsed (only the table name is
- * captured) and stores DELETE's WHERE as raw text in insert_select_query.
- * This routine pulls the raw WHERE text from whichever source is available and
- * normalizes it into the document store's bytecode grammar:
+ * The parser populates ast->where_conditions for UPDATE and DELETE, and
+ * uwp_build_dml_where() prefers those.  This fallback re-reads the raw
+ * statement text for constructs the structured form cannot translate (for
+ * example LIKE or IN), and normalizes the clause into the document store's
+ * bytecode grammar:
  *   - "="  -> "=="
  *   - "<>" -> "!="
  *   - single-quoted string literals -> double-quoted (with " doubled)
@@ -783,24 +784,20 @@ static void uwp_build_where_expr(uwp_text_buffer_t* out,
  * Best-effort: unsupported constructs (LIKE / IN) simply fail to compile at
  * the document store, which the caller reports as zero matches. */
 static char* uwp_extract_dml_where(const qihse_sql_ast_t* ast) {
-    if (!ast) return NULL;
+    if (!ast || !ast->raw_sql) return NULL;
     const char* where = NULL;
     char* owned = NULL;
 
-    if (ast->stmt_type == QIHSE_SQL_DELETE && ast->insert_select_query) {
-        where = ast->insert_select_query;
-    } else if (ast->raw_sql) {
-        const char* w = strcasestr(ast->raw_sql, "WHERE");
-        if (w) {
-            w += 5;
-            const char* end = strcasestr(w, "RETURNING");
-            size_t len = end ? (size_t)(end - w) : strlen(w);
-            while (len > 0 && isspace((unsigned char)w[0])) { w++; len--; }
-            while (len > 0 && isspace((unsigned char)w[len - 1])) len--;
-            if (len > 0) {
-                owned = strndup(w, len);
-                where = owned;
-            }
+    const char* w = strcasestr(ast->raw_sql, "WHERE");
+    if (w) {
+        w += 5;
+        const char* end = strcasestr(w, "RETURNING");
+        size_t len = end ? (size_t)(end - w) : strlen(w);
+        while (len > 0 && isspace((unsigned char)w[0])) { w++; len--; }
+        while (len > 0 && isspace((unsigned char)w[len - 1])) len--;
+        if (len > 0) {
+            owned = strndup(w, len);
+            where = owned;
         }
     }
     if (!where) return NULL;

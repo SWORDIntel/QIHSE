@@ -3,22 +3,29 @@
 > **Status: partial.** The parser, executors, optimizer and schema registry all
 > have real implementations under `src/tractable/` and are exercised by
 > `tests/test_sql_completeness.c` (run via `make test-sql-completeness`).
-> Four claims in the previous revision of this document were not true of the
-> code and are corrected in place below:
+> Corrections to earlier revisions of this document:
 >
-> 1. **`UPDATE ... SET` is not parsed.** The parser captures the table name and
->    stops; `ast->set_columns`/`set_values`/`num_set` are declared and freed but
->    never populated. `tests/test_sql_completeness.c` prints the count (0) as a
->    `NOTE`.
-> 2. **`DELETE ... WHERE` is not parsed into conditions.** The clause text is
->    kept as raw text in `ast->insert_select_query`, and `ast->where_conditions`
->    stays empty.
+> 1. **`UPDATE ... SET` is parsed.** `ast->set_columns`/`set_values`/`num_set`
+>    carry the assignments, and the WHERE clause is parsed into
+>    `ast->where_conditions` like SELECT. An UPDATE that parses to zero
+>    assignments (no SET clause, an empty SET list, or an assignment with no
+>    value) is **refused**: `qihse_parse_sql_to_ast()` returns NULL instead of
+>    an AST that would execute as a silent no-op.
+> 2. **`DELETE ... WHERE` is parsed into conditions.** The clause lands in
+>    `ast->where_conditions`; `ast->insert_select_query` is no longer used to
+>    carry the raw text.
 > 3. **A scalar subquery in the SELECT list is not extracted** into
->    `ast->select_items[i].scalar_subquery`.
-> 4. **The optimizer has no histograms or most-common-value tracking.** The
->    `qihse_column_stat_t` histogram fields exist in the header but nothing ever
->    fills them; cardinality estimation uses `distinct_count` (equality) and a
->    fixed 1/3 (ranges).
+>    `ast->select_items[i].scalar_subquery`. This remains a gap; it is printed
+>    as a `NOTE` by `tests/test_sql_completeness.c`.
+> 4. **Optimizer histograms are populated through an explicit setter and used
+>    by range estimation.** `qihse_optimizer_set_column_histogram()` fills the
+>    `qihse_column_stat_t` buckets and `qihse_optimizer_estimate_selectivity()`
+>    uses them for `<`/`<=`/`>`/`>=` when present (falling back to the fixed
+>    1/3 otherwise). There is **no automatic statistics collection pass** in
+>    the tree: like `set_table_stats`/`set_column_stats`, the histogram setter
+>    is the caller's contract, so the optimizer is only as informed as its
+>    caller. There is no most-common-value (MCV) structure — earlier revisions
+>    of this document claimed MCV tracking that never existed.
 >
 > Also unverified here: the pgwire prepared-statement cache (see §6). No test in
 > the tree exercises it.
@@ -36,11 +43,20 @@ The parser tokenizes and builds an AST from SQL text. Supported statement types:
 ### DML
 - `SELECT` with column list, FROM, JOIN, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, DISTINCT
 - `INSERT INTO ... VALUES ...` (multi-row, with an optional column list)
-- `UPDATE ... SET ... WHERE ...` — **recognised only**: the table name is
-  captured and the SET list is not parsed (`ast->num_set` stays 0)
-- `DELETE FROM ... WHERE ...` — **recognised only**: the table name is captured
-  and the WHERE clause is kept as raw text in `ast->insert_select_query`, not as
-  `ast->where_conditions`
+- `UPDATE ... SET col = value [, ...] [WHERE ...]` — the assignments land in
+  `ast->set_columns`/`set_values`/`num_set` (string literals are stored without
+  quotes, matching `insert_rows`; other right-hand sides keep their text), and
+  WHERE lands in `ast->where_conditions`. A zero-assignment UPDATE is refused
+  with a NULL return
+- `DELETE FROM ... [WHERE ...] [RETURNING *]` — WHERE lands in
+  `ast->where_conditions`, the same representation SELECT uses; no raw clause
+  text is carried in `ast->insert_select_query`
+
+Both DML forms accept an optional target alias (`UPDATE t AS x SET ...`,
+`DELETE FROM t x WHERE ...`). The AST has no DML alias field, so the alias is
+consumed and dropped; consuming it matters because otherwise the following
+SET/WHERE keyword would not be recognised and an aliased DELETE would silently
+lose its filter.
 
 ### DDL
 - `CREATE TABLE name (col TYPE, ...)` with types: INT, BIGINT, FLOAT, DOUBLE, VARCHAR(n), TEXT, BOOL, TIMESTAMP, VECTOR(n)
@@ -82,27 +98,40 @@ spellings are covered by `tests/test_sql_completeness.c`.
 
 ### AST Structure
 
+The struct is `qihse_sql_ast_t` in `include/qihse_sql_parser.h`. The fields the
+statement forms above populate (an excerpt, not the whole struct):
+
 ```c
 typedef struct qihse_sql_ast_s {
-    qihse_sql_stmt_type_t stmt_type;    // SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
-    char** select_columns;
-    size_t num_select_columns;
+    qihse_sql_stmt_type_t stmt_type;    // SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ...
+
+    /* SELECT */
+    qihse_sql_select_item_t* select_items;
+    size_t num_select_items;
     qihse_sql_table_ref_t* from_tables;
     size_t num_from_tables;
-    qihse_sql_join_t* joins;            // JOIN clauses with type and ON condition
+    qihse_sql_join_t* joins;            // JOIN clauses with type and decomposed ON keys
     size_t num_joins;
-    qihse_sql_condition_t* where_conditions;
+    qihse_sql_condition_t* where_conditions;  // SELECT / UPDATE / DELETE
     size_t num_where_conditions;
-    qihse_sql_column_ref_t* group_by_cols;
-    size_t num_group_by_cols;
-    qihse_sql_condition_t* having_conditions;
-    size_t num_having_conditions;
-    qihse_sql_order_by_t* order_by_cols;
-    size_t num_order_by_cols;
+    qihse_sql_group_by_t* group_by;     // NULL if no GROUP BY
+    qihse_sql_order_item_t* order_items;
+    size_t num_order_items;
     int limit;
     int offset;
-    int distinct;
-    // ... DDL fields for CREATE/ALTER/DROP
+    int select_distinct;
+
+    /* DML */
+    char* table_name;                   // target table for DDL/DML
+    char** insert_columns;              // INSERT column list
+    size_t num_insert_columns;
+    char*** insert_rows;                // INSERT rows (string literals without quotes)
+    size_t num_insert_rows;
+    char** set_columns;                 // UPDATE SET column names
+    char** set_values;                  // UPDATE SET right-hand sides
+    size_t num_set;
+
+    char* raw_sql;                      // the statement text as parsed
 } qihse_sql_ast_t;
 ```
 
@@ -155,16 +184,31 @@ DISTINCT tracking uses a separate hash set per group to deduplicate values befor
 **Files**: `include/qihse_optimizer.h`, `src/tractable/qihse_optimizer.c`
 
 ### Statistics Collection
+The optimizer has no data access of its own. Every statistic is supplied by the
+caller through a setter, exactly as before:
+
 - Per-table row count estimates (`qihse_optimizer_set_table_stats`)
 - Per-column distinct count, null fraction and min/max
   (`qihse_optimizer_set_column_stats`)
-- Per-column histograms with most-common-value (MCV) tracking — **declared in
-  `qihse_column_stat_t` but never populated by the optimizer**; do not rely on
-  the histogram fields
+- Per-column histograms (`qihse_optimizer_set_column_histogram`): up to
+  `QIHSE_OPT_HIST_MAX_BUCKETS` (16) buckets, each with a low bound, a high
+  bound and a row frequency. The setter copies the bounds, returns false on
+  malformed input (leaving any existing histogram unchanged), and there is
+  **no MCV structure**: an MCV list would be another caller-supplied
+  structure and none is declared.
+
+There is no automatic statistics collection pass in the tree — no ANALYZE
+executor scans a store into an optimizer — so a query plan is only as informed
+as the caller that populated the statistics. `tests/test_sql_completeness.c`
+populates them explicitly and asserts the estimates that result.
 
 ### Cardinality Estimation
 - Equality filter: `selectivity = 1 / distinct_count`
-- Range filter (`<`, `<=`, `>`, `>=`): a fixed `0.33`
+- Range filter (`<`, `<=`, `>`, `>=`): with a histogram, the fraction of rows
+  the buckets place below (or above) the bound. Buckets wholly below the bound
+  count in full; the bucket containing the bound is interpolated linearly when
+  its endpoints are numeric and counted as half otherwise. Without a histogram,
+  a fixed `0.33`
 - `<>`: `1 - 1/distinct_count`; `LIKE` and `IN`: a fixed `0.1`
 - Unknown table, unknown column, subquery or unrecognised operator: `0.1`
 - Combined filters: not combined — the estimator takes one condition at a time
@@ -238,9 +282,12 @@ section:
   OFFSET, DISTINCT), aggregates (SUM/COUNT/COUNT(*)/AVG/MIN/MAX) with GROUP BY
   and HAVING text, all five JOIN spellings with their ON keys, IN and EXISTS
   subqueries (including a correlated inner predicate), UNION/INTERSECT/EXCEPT,
-  multi-row INSERT, CREATE TABLE across all nine documented column types, the
-  four ALTER TABLE actions, CREATE INDEX, DROP INDEX, DROP TABLE, and an
-  unclassifiable statement reported as `QIHSE_SQL_UNKNOWN`.
+  multi-row INSERT, UPDATE SET assignments (including an expression right-hand
+  side) with structured WHERE and the refusal of zero-assignment UPDATEs,
+  DELETE structured WHERE (including a quoted value and RETURNING), CREATE
+  TABLE across all nine documented column types, the four ALTER TABLE actions,
+  CREATE INDEX, DROP INDEX, DROP TABLE, and an unclassifiable statement
+  reported as `QIHSE_SQL_UNKNOWN`.
 - **Join execution**: hash join (inner) and nested-loop join (LEFT with NULL
   padding and CROSS), plus case-insensitive column lookup.
 - **Aggregate execution**: GROUP BY with SUM/COUNT/COUNT(*)/AVG/MIN/MAX and a
@@ -252,10 +299,17 @@ section:
 - **Optimizer**: selectivity estimation, sequential vs index scan choice
   (switching when an index is added), and the SORT/LIMIT/AGGREGATE/JOIN plan
   nodes, plus "no plan for a non-SELECT statement".
+- **Optimizer histograms**: population through
+  `qihse_optimizer_set_column_histogram`, the stored bucket values, the
+  histogram-driven range estimates (`age < 50` -> 0.3, `age >= 50` -> 0.7 for
+  a 300/1000 split), and the refusal of malformed input.
 
-Reported as `NOTE` lines rather than asserted, so that fixing them cannot break
-the test: UPDATE SET captures 0 columns, DELETE WHERE yields 0 structured
-conditions, and the select-list scalar subquery is not extracted.
+Reported as a `NOTE` line rather than asserted, so that fixing it cannot break
+the test: the select-list scalar subquery is not extracted.
 
 Not covered: the pgwire prepared-statement cache, window functions, and
-`INSERT ... SELECT` execution.
+`INSERT ... SELECT` execution. UPDATE and DELETE execution is also not covered:
+the UWP dispatcher reports the document-store match count and notes that the
+store has no in-place update/delete API, while the parsed assignments are not
+yet consumed by any executor (the mutable `qihse_table_store` has
+`qihse_table_update`/`qihse_table_delete` but nothing wires SQL to it).

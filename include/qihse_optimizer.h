@@ -52,6 +52,9 @@ typedef struct qihse_plan_node {
     int    limit;
 } qihse_plan_node_t;
 
+/* Maximum number of histogram buckets a column statistic can hold. */
+#define QIHSE_OPT_HIST_MAX_BUCKETS 16
+
 /* Column statistics: distinct count, min, max (as strings), null fraction */
 typedef struct {
     char*  column_name;
@@ -59,10 +62,14 @@ typedef struct {
     double  null_fraction;
     char*  min_value;
     char*  max_value;
-    /* simple histogram: up to 16 buckets */
-    char*  hist_lo[16];
-    char*  hist_hi[16];
-    int64_t hist_freq[16];
+    /* Histogram: up to QIHSE_OPT_HIST_MAX_BUCKETS buckets.  Bucket i covers
+     * [hist_lo[i], hist_hi[i]] and hist_freq[i] is the number of rows the
+     * statistics collector counted in it.  Populated by
+     * qihse_optimizer_set_column_histogram(); range selectivity uses it when
+     * num_buckets > 0, and falls back to a fixed estimate otherwise. */
+    char*  hist_lo[QIHSE_OPT_HIST_MAX_BUCKETS];
+    char*  hist_hi[QIHSE_OPT_HIST_MAX_BUCKETS];
+    int64_t hist_freq[QIHSE_OPT_HIST_MAX_BUCKETS];
     int    num_buckets;
 } qihse_column_stat_t;
 
@@ -85,6 +92,18 @@ void qihse_optimizer_set_table_stats(qihse_optimizer_t* opt, const char* table, 
 void qihse_optimizer_set_column_stats(qihse_optimizer_t* opt, const char* table,
                                        const char* column, int64_t distinct_count,
                                        double null_fraction, const char* min_val, const char* max_val);
+/* Populate a column histogram.  lo/hi/freq are parallel arrays of num_buckets
+ * entries (1..QIHSE_OPT_HIST_MAX_BUCKETS); the optimizer copies the strings.
+ * The optimizer has no data access of its own, so the caller is the statistics
+ * collector — the same contract as qihse_optimizer_set_column_stats().  Returns
+ * false, leaving any existing histogram unchanged, when the arguments are
+ * malformed or num_buckets is out of range. */
+bool qihse_optimizer_set_column_histogram(qihse_optimizer_t* opt, const char* table,
+                                          const char* column,
+                                          const char* const* lo,
+                                          const char* const* hi,
+                                          const int64_t* freq,
+                                          size_t num_buckets);
 const qihse_table_stat_t* qihse_optimizer_get_table_stats(const qihse_optimizer_t* opt, const char* table);
 
 /* Cardinality estimation for a filter condition */

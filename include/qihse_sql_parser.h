@@ -529,8 +529,9 @@ typedef struct qihse_sql_ast_s {
     char*  insert_select_query;         /* raw INSERT ... SELECT text */
 
     /* UPDATE specifics */
-    char** set_columns;
-    char** set_values;
+    char** set_columns;                 /* SET column names */
+    char** set_values;                  /* RHS text; string literals stored without
+                                         * their quotes, matching insert_rows */
     size_t num_set;
 
     /* raw */
@@ -540,6 +541,10 @@ typedef struct qihse_sql_ast_s {
 /* -------------------------------------------------------------------------
  * Public API
  * ------------------------------------------------------------------------- */
+/* Parse one SQL statement into an AST.  Returns NULL when the statement is
+ * empty or malformed.  A data-modifying statement that cannot modify anything
+ * is malformed: an UPDATE with no SET assignments (or an assignment with no
+ * value) is refused with NULL rather than returned as a silent no-op. */
 qihse_sql_ast_t* qihse_parse_sql_to_ast(const char* sql);
 
 void qihse_sql_ast_free(qihse_sql_ast_t* ast);

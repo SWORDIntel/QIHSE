@@ -13,22 +13,19 @@
  * Covered: SELECT shape (columns, FROM, WHERE, GROUP BY, HAVING, ORDER BY,
  * LIMIT, OFFSET, DISTINCT), aggregate detection, all five JOIN spellings,
  * IN / EXISTS subqueries, UNION / INTERSECT / EXCEPT, multi-row INSERT,
- * CREATE TABLE across every documented column type, ALTER TABLE
- * add/drop/rename column and rename table, CREATE/DROP INDEX, DROP TABLE,
- * join execution (hash + nested loop, including LEFT and CROSS), GROUP BY
- * with SUM/COUNT/AVG/MIN/MAX/COUNT(*), multi-key sort, schema registry and
- * optimizer plan shape.
+ * UPDATE SET assignments and structured WHERE (a zero-assignment UPDATE is
+ * refused), DELETE structured WHERE, CREATE TABLE across every documented
+ * column type, ALTER TABLE add/drop/rename column and rename table,
+ * CREATE/DROP INDEX, DROP TABLE, join execution (hash + nested loop,
+ * including LEFT and CROSS), GROUP BY with SUM/COUNT/AVG/MIN/MAX/COUNT(*),
+ * multi-key sort, schema registry, optimizer plan shape, and optimizer
+ * histogram population with histogram-driven range selectivity.
  *
- * Known gaps versus the document, printed at the end of this run and stated
- * in docs/architecture/sql_engine.md:
- *   - UPDATE captures the table name only: the SET list is never parsed
- *     (ast->set_columns/set_values/num_set stay empty).
- *   - DELETE captures its WHERE clause as raw text in
- *     ast->insert_select_query, not as structured ast->where_conditions.
+ * Remaining gap versus the document, printed at the end of this run and
+ * stated in docs/architecture/sql_engine.md:
  *   - A scalar subquery in the SELECT list is not extracted into
  *     ast->select_items[i].scalar_subquery.
- * These are reported, not asserted, so that fixing them cannot break this
- * test.
+ * It is reported, not asserted, so that fixing it cannot break this test.
  */
 #include "qihse_sql_parser.h"
 #include "qihse_join_executor.h"
@@ -203,17 +200,72 @@ static void test_dml_and_ddl_parsing(void) {
     assert(strcmp(ast->insert_rows[1][1], "y") == 0);
     qihse_sql_ast_free(ast);
 
-    /* UPDATE and DELETE are recognised; see the gap note below. */
-    ast = qihse_parse_sql_to_ast("UPDATE t SET a = 1 WHERE id = 3");
+    /* UPDATE SET is parsed into structured assignments, and the WHERE clause
+     * into the same condition representation SELECT uses. */
+    ast = qihse_parse_sql_to_ast("UPDATE t SET a = 1, b = 'x y' WHERE id = 3");
     assert(ast);
     assert(ast->stmt_type == QIHSE_SQL_UPDATE);
     assert(strcmp(ast->table_name, "t") == 0);
+    assert(ast->num_set == 2);
+    assert(strcmp(ast->set_columns[0], "a") == 0);
+    assert(strcmp(ast->set_values[0], "1") == 0);
+    assert(strcmp(ast->set_columns[1], "b") == 0);
+    assert(strcmp(ast->set_values[1], "x y") == 0);
+    assert(ast->num_where_conditions == 1);
+    assert(strcmp(ast->where_conditions[0].column_name, "id") == 0);
+    assert(strcmp(ast->where_conditions[0].operator, "=") == 0);
+    assert(strcmp(ast->where_conditions[0].value, "3") == 0);
     qihse_sql_ast_free(ast);
 
+    /* An expression right-hand side survives, and WHERE is not folded into it. */
+    ast = qihse_parse_sql_to_ast("UPDATE t SET n = n + 1 WHERE id = 3");
+    assert(ast && ast->num_set == 1);
+    assert(strcmp(ast->set_columns[0], "n") == 0);
+    assert(strcmp(ast->set_values[0], "n + 1") == 0);
+    assert(ast->num_where_conditions == 1);
+    qihse_sql_ast_free(ast);
+
+    /* An UPDATE that parses to zero assignments is refused (NULL), not
+     * returned as an AST that would execute as a silent no-op. */
+    assert(qihse_parse_sql_to_ast("UPDATE t") == NULL);
+    assert(qihse_parse_sql_to_ast("UPDATE t SET") == NULL);
+    assert(qihse_parse_sql_to_ast("UPDATE t SET WHERE id = 3") == NULL);
+    assert(qihse_parse_sql_to_ast("UPDATE t SET a") == NULL);
+    assert(qihse_parse_sql_to_ast("UPDATE t SET a = ") == NULL);
+
+    /* DELETE WHERE lands in where_conditions; no raw text is carried. */
     ast = qihse_parse_sql_to_ast("DELETE FROM t WHERE id = 4");
     assert(ast);
     assert(ast->stmt_type == QIHSE_SQL_DELETE);
     assert(strcmp(ast->table_name, "t") == 0);
+    assert(ast->num_where_conditions == 1);
+    assert(strcmp(ast->where_conditions[0].column_name, "id") == 0);
+    assert(strcmp(ast->where_conditions[0].operator, "=") == 0);
+    assert(strcmp(ast->where_conditions[0].value, "4") == 0);
+    assert(ast->insert_select_query == NULL);
+    qihse_sql_ast_free(ast);
+
+    /* A quoted DELETE condition, and RETURNING kept out of the condition. */
+    ast = qihse_parse_sql_to_ast("DELETE FROM t WHERE name = 'bob' RETURNING *");
+    assert(ast && ast->num_where_conditions == 1);
+    assert(ast->where_conditions[0].value_is_string == 1);
+    assert(strcmp(ast->where_conditions[0].value, "bob") == 0);
+    assert(ast->returning && ast->returning->is_star == 1);
+    qihse_sql_ast_free(ast);
+
+    /* An aliased target is consumed, not mistaken for the clause keyword: an
+     * aliased DELETE WHERE must not degrade into an unfiltered DELETE. */
+    ast = qihse_parse_sql_to_ast("UPDATE t AS x SET a = 1 WHERE x.id = 3");
+    assert(ast && ast->num_set == 1);
+    assert(strcmp(ast->set_columns[0], "a") == 0);
+    assert(ast->num_where_conditions == 1);
+    assert(strcmp(ast->where_conditions[0].column_name, "x.id") == 0);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast("DELETE FROM t x WHERE id = 4");
+    assert(ast && ast->num_where_conditions == 1);
+    assert(strcmp(ast->where_conditions[0].column_name, "id") == 0);
+    assert(strcmp(ast->where_conditions[0].value, "4") == 0);
     qihse_sql_ast_free(ast);
 
     /* CREATE TABLE with every documented column type. */
@@ -279,7 +331,8 @@ static void test_dml_and_ddl_parsing(void) {
     assert(strcmp(ast->drop_name, "t") == 0);
     qihse_sql_ast_free(ast);
 
-    printf("PASS sql parser: INSERT rows, UPDATE/DELETE recognition, CREATE TABLE types, "
+    printf("PASS sql parser: INSERT rows, UPDATE SET assignments + structured WHERE "
+           "(zero-assignment refused), DELETE structured WHERE, CREATE TABLE types, "
            "ALTER, CREATE/DROP INDEX, DROP TABLE\n");
 }
 
@@ -666,25 +719,73 @@ static void test_optimizer_plans(void) {
     printf("PASS optimizer: selectivity, seq/index scan choice, sort/limit/aggregate/join nodes\n");
 }
 
-/* ── Documented gaps (reported, not asserted) ───────────────────────────── */
+/* ── Optimizer histograms ───────────────────────────────────────────────── */
+
+static void test_optimizer_histograms(void) {
+    qihse_schema_registry_t* reg = qihse_schema_registry_create();
+    assert(reg);
+    qihse_sql_ast_t* ddl = qihse_parse_sql_to_ast(
+        "CREATE TABLE users (id INT PRIMARY KEY, age INT)");
+    assert(ddl && qihse_schema_create_table(reg, ddl) == 0);
+    qihse_sql_ast_free(ddl);
+
+    qihse_optimizer_t* opt = qihse_optimizer_create(reg);
+    assert(opt);
+    qihse_optimizer_set_table_stats(opt, "users", 1000);
+    qihse_optimizer_set_column_stats(opt, "users", "age", 100, 0.0, "0", "100");
+
+    /* Without a histogram a range filter is a fixed 1/3. */
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(
+        "SELECT id FROM users WHERE age < 50");
+    assert(ast && ast->num_where_conditions == 1);
+    double sel = qihse_optimizer_estimate_selectivity(opt, "users",
+                                                      &ast->where_conditions[0]);
+    assert(sel > 0.32 && sel < 0.34);
+    qihse_sql_ast_free(ast);
+
+    /* A caller that scanned the column supplies buckets; the estimator must
+     * use them instead of the fixed 1/3. */
+    const char* lo[4] = {"0", "25", "50", "75"};
+    const char* hi[4] = {"24", "49", "74", "100"};
+    int64_t freq[4] = {100, 200, 300, 400};
+    assert(qihse_optimizer_set_column_histogram(opt, "users", "age", lo, hi, freq, 4));
+    const qihse_table_stat_t* st = qihse_optimizer_get_table_stats(opt, "users");
+    assert(st && st->num_columns == 1);
+    assert(st->columns[0].num_buckets == 4);
+    assert(st->columns[0].hist_freq[2] == 300);
+    assert(strcmp(st->columns[0].hist_lo[3], "75") == 0);
+
+    /* Buckets [0,24] and [25,49] are wholly below 50: 300/1000. */
+    ast = qihse_parse_sql_to_ast("SELECT id FROM users WHERE age < 50");
+    assert(ast && ast->num_where_conditions == 1);
+    sel = qihse_optimizer_estimate_selectivity(opt, "users", &ast->where_conditions[0]);
+    assert(sel > 0.299 && sel < 0.301);
+    qihse_sql_ast_free(ast);
+
+    /* >= is the complement. */
+    ast = qihse_parse_sql_to_ast("SELECT id FROM users WHERE age >= 50");
+    assert(ast && ast->num_where_conditions == 1);
+    sel = qihse_optimizer_estimate_selectivity(opt, "users", &ast->where_conditions[0]);
+    assert(sel > 0.699 && sel < 0.701);
+    qihse_sql_ast_free(ast);
+
+    /* Malformed input is refused and leaves the stored histogram intact. */
+    assert(!qihse_optimizer_set_column_histogram(opt, "users", "age", lo, hi, freq,
+                                                 QIHSE_OPT_HIST_MAX_BUCKETS + 1));
+    assert(!qihse_optimizer_set_column_histogram(opt, "users", "age", NULL, hi, freq, 4));
+    assert(!qihse_optimizer_set_column_histogram(opt, "users", NULL, lo, hi, freq, 4));
+    st = qihse_optimizer_get_table_stats(opt, "users");
+    assert(st && st->columns[0].num_buckets == 4);
+
+    qihse_optimizer_destroy(opt);
+    qihse_schema_registry_destroy(reg);
+    printf("PASS optimizer: histogram population and histogram-driven range selectivity\n");
+}
+
+/* ── Documented gap (reported, not asserted) ────────────────────────────── */
 
 static void report_known_gaps(void) {
-    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast("UPDATE t SET a = 1 WHERE id = 3");
-    assert(ast);
-    printf("NOTE sql parser: UPDATE ... SET captures %zu set columns "
-           "(document claims SET support) -- see docs/architecture/sql_engine.md\n",
-           ast->num_set);
-    qihse_sql_ast_free(ast);
-
-    ast = qihse_parse_sql_to_ast("DELETE FROM t WHERE id = 4");
-    assert(ast);
-    printf("NOTE sql parser: DELETE WHERE yields %zu structured conditions; raw text is "
-           "kept in insert_select_query (%s) -- see docs/architecture/sql_engine.md\n",
-           ast->num_where_conditions,
-           ast->insert_select_query ? "present" : "absent");
-    qihse_sql_ast_free(ast);
-
-    ast = qihse_parse_sql_to_ast("SELECT (SELECT MAX(x) FROM s) AS m FROM t");
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast("SELECT (SELECT MAX(x) FROM s) AS m FROM t");
     assert(ast);
     printf("NOTE sql parser: select-list scalar subquery extracted: %s "
            "-- see docs/architecture/sql_engine.md\n",
@@ -703,6 +804,7 @@ int main(void) {
     test_sort_execution();
     test_schema_registry();
     test_optimizer_plans();
+    test_optimizer_histograms();
     report_known_gaps();
     printf("test_sql_completeness: all SQL engine tests passed\n");
     return 0;

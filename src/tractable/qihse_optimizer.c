@@ -1,10 +1,17 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE Cost-based Optimizer — Phase 1 Relational Completeness
  *
  * Implements basic statistics (row count estimates, column histograms),
  * cardinality estimation for filter conditions, and plan enumeration
  * choosing between seq scan, index scan, hash join vs nested loop.
+ *
+ * The optimizer has no data access of its own: row counts, column statistics
+ * and histograms are supplied by the caller (an ANALYZE-style collector),
+ * exactly as qihse_optimizer_set_table_stats()/_set_column_stats() have
+ * always worked.  There is no in-tree statistics collection pass yet.
  */
 #include "qihse_optimizer.h"
 #include <stdio.h>
@@ -88,35 +95,85 @@ void qihse_optimizer_set_table_stats(qihse_optimizer_t* opt, const char* table, 
     }
 }
 
-void qihse_optimizer_set_column_stats(qihse_optimizer_t* opt, const char* table,
-                                       const char* column, int64_t distinct_count,
-                                       double null_fraction, const char* min_val, const char* max_val) {
-    if (!opt || !table || !column) return;
+/* Find the column statistic, creating the table/column entries if absent.
+ * Returns NULL only when the optimizer or the names are missing. */
+static qihse_column_stat_t* find_or_create_col_stat(qihse_optimizer_t* opt,
+                                                    const char* table,
+                                                    const char* column) {
+    if (!opt || !table || !column) return NULL;
     qihse_table_stat_t* ts = find_stat(opt, table);
     if (!ts) {
         qihse_optimizer_set_table_stats(opt, table, 1000);
         ts = find_stat(opt, table);
     }
-    if (!ts) return;
-    /* find or create column stat */
-    qihse_column_stat_t* cs = NULL;
+    if (!ts) return NULL;
     for (size_t i = 0; i < ts->num_columns; i++) {
-        if (ieq(ts->columns[i].column_name, column)) { cs = &ts->columns[i]; break; }
+        if (ieq(ts->columns[i].column_name, column)) return &ts->columns[i];
     }
-    if (!cs) {
-        if (ts->num_columns && (ts->num_columns % 8 == 0)) {
-            ts->columns = (qihse_column_stat_t*)realloc(ts->columns, (ts->num_columns + 8) * sizeof(qihse_column_stat_t));
-        } else if (ts->num_columns == 0) {
-            ts->columns = (qihse_column_stat_t*)calloc(8, sizeof(qihse_column_stat_t));
-        }
-        cs = &ts->columns[ts->num_columns++];
-        memset(cs, 0, sizeof(*cs));
-        cs->column_name = strdup(column);
+    if (ts->num_columns && (ts->num_columns % 8 == 0)) {
+        ts->columns = (qihse_column_stat_t*)realloc(ts->columns, (ts->num_columns + 8) * sizeof(qihse_column_stat_t));
+    } else if (ts->num_columns == 0) {
+        ts->columns = (qihse_column_stat_t*)calloc(8, sizeof(qihse_column_stat_t));
     }
+    qihse_column_stat_t* cs = &ts->columns[ts->num_columns++];
+    memset(cs, 0, sizeof(*cs));
+    cs->column_name = strdup(column);
+    return cs;
+}
+
+void qihse_optimizer_set_column_stats(qihse_optimizer_t* opt, const char* table,
+                                       const char* column, int64_t distinct_count,
+                                       double null_fraction, const char* min_val, const char* max_val) {
+    if (!opt || !table || !column) return;
+    qihse_column_stat_t* cs = find_or_create_col_stat(opt, table, column);
+    if (!cs) return;
     cs->distinct_count = distinct_count;
     cs->null_fraction = null_fraction;
     free(cs->min_value); cs->min_value = dup_s(min_val);
     free(cs->max_value); cs->max_value = dup_s(max_val);
+}
+
+bool qihse_optimizer_set_column_histogram(qihse_optimizer_t* opt, const char* table,
+                                          const char* column,
+                                          const char* const* lo,
+                                          const char* const* hi,
+                                          const int64_t* freq,
+                                          size_t num_buckets) {
+    if (!opt || !table || !column || !lo || !hi || !freq) return false;
+    if (num_buckets == 0 || num_buckets > QIHSE_OPT_HIST_MAX_BUCKETS) return false;
+    for (size_t i = 0; i < num_buckets; i++) {
+        if (!lo[i] || !hi[i] || freq[i] < 0) return false;
+    }
+    qihse_column_stat_t* cs = find_or_create_col_stat(opt, table, column);
+    if (!cs) return false;
+
+    /* Replace the old buckets only once the new ones validate. */
+    for (int i = 0; i < cs->num_buckets; i++) {
+        free(cs->hist_lo[i]);
+        free(cs->hist_hi[i]);
+        cs->hist_lo[i] = NULL;
+        cs->hist_hi[i] = NULL;
+    }
+    memset(cs->hist_freq, 0, sizeof(cs->hist_freq));
+    cs->num_buckets = 0;
+    for (size_t i = 0; i < num_buckets; i++) {
+        cs->hist_lo[i] = strdup(lo[i]);
+        cs->hist_hi[i] = strdup(hi[i]);
+        cs->hist_freq[i] = freq[i];
+        if (!cs->hist_lo[i] || !cs->hist_hi[i]) {
+            /* Out of memory: drop the partial histogram rather than leave a
+             * half-populated one that the estimator would trust. */
+            for (size_t j = 0; j <= i; j++) {
+                free(cs->hist_lo[j]);
+                free(cs->hist_hi[j]);
+                cs->hist_lo[j] = NULL;
+                cs->hist_hi[j] = NULL;
+            }
+            return false;
+        }
+        cs->num_buckets = (int)(i + 1);
+    }
+    return true;
 }
 
 const qihse_table_stat_t* qihse_optimizer_get_table_stats(const qihse_optimizer_t* opt, const char* table) {
@@ -133,6 +190,64 @@ static const qihse_column_stat_t* find_col_stat(const qihse_table_stat_t* ts, co
         if (ieq(ts->columns[i].column_name, col)) return &ts->columns[i];
     }
     return NULL;
+}
+
+/* Order two statistics values: numerically when both are fully numeric,
+ * otherwise lexicographically.  Returns -1, 0 or 1. */
+static int stat_value_compare(const char* a, const char* b) {
+    char* ea = NULL;
+    char* eb = NULL;
+    double da = strtod(a, &ea);
+    double db = strtod(b, &eb);
+    if (ea != a && eb != b && *ea == '\0' && *eb == '\0') {
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+    }
+    int c = strcmp(a, b);
+    if (c < 0) return -1;
+    if (c > 0) return 1;
+    return 0;
+}
+
+/* Fraction of rows the histogram places at (inclusive=1) or below (inclusive=0)
+ * the bound.  Buckets wholly below the bound count in full; the bucket that
+ * contains the bound is interpolated linearly when its endpoints are numeric
+ * and counted as half otherwise (the value order is known, the within-bucket
+ * distribution is not).  Returns false when there is no usable histogram. */
+static bool hist_fraction_below(const qihse_column_stat_t* cs, const char* bound,
+                                int inclusive, double* out) {
+    int64_t total = 0;
+    for (int i = 0; i < cs->num_buckets; i++) total += cs->hist_freq[i];
+    if (total <= 0) return false;
+
+    double below = 0.0;
+    for (int i = 0; i < cs->num_buckets; i++) {
+        int hi_cmp = stat_value_compare(cs->hist_hi[i], bound);
+        int lo_cmp = stat_value_compare(cs->hist_lo[i], bound);
+        bool whole = inclusive ? (hi_cmp <= 0) : (hi_cmp < 0);
+        bool contains = inclusive ? (lo_cmp <= 0) : (lo_cmp < 0);
+        if (whole) {
+            below += (double)cs->hist_freq[i];
+        } else if (contains) {
+            double f = 0.5;
+            char* elo = NULL;
+            char* ehi = NULL;
+            char* eb = NULL;
+            double dlo = strtod(cs->hist_lo[i], &elo);
+            double dhi = strtod(cs->hist_hi[i], &ehi);
+            double db = strtod(bound, &eb);
+            if (elo != cs->hist_lo[i] && ehi != cs->hist_hi[i] && eb != bound &&
+                *elo == '\0' && *ehi == '\0' && *eb == '\0' && dhi > dlo) {
+                f = (db - dlo) / (dhi - dlo);
+                if (f < 0.0) f = 0.0;
+                if (f > 1.0) f = 1.0;
+            }
+            below += f * (double)cs->hist_freq[i];
+        }
+    }
+    *out = below / (double)total;
+    return true;
 }
 
 double qihse_optimizer_estimate_selectivity(const qihse_optimizer_t* opt,
@@ -153,7 +268,15 @@ double qihse_optimizer_estimate_selectivity(const qihse_optimizer_t* opt,
         return 0.01;
     } else if (ieq(cond->operator, "<") || ieq(cond->operator, "<=") ||
                ieq(cond->operator, ">") || ieq(cond->operator, ">=")) {
-        /* range: assume 1/3 selectivity */
+        /* range: use the histogram when the caller supplied one; otherwise a
+         * fixed 1/3 */
+        if (cs->num_buckets > 0 && cond->value) {
+            int inclusive = (cond->operator[1] == '=');
+            int greater = (cond->operator[0] == '>');
+            double below = 0.0;
+            if (hist_fraction_below(cs, cond->value, inclusive, &below))
+                return greater ? 1.0 - below : below;
+        }
         return 0.33;
     } else if (ieq(cond->operator, "<>")) {
         if (cs->distinct_count > 1) return 1.0 - 1.0 / (double)cs->distinct_count;

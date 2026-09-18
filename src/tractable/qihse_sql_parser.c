@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE SQL Parser — Phase 1 Relational Completeness
  *
@@ -905,6 +907,110 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
         break;
     }
     *pp = p;
+}
+
+/* -------------------------------------------------------------------------
+ * Parse an UPDATE SET list into structured assignments:
+ *
+ *   SET col = value [, col = value]*
+ *
+ * A string literal is stored without its quotes, matching insert_rows; any
+ * other right-hand side is kept as raw text up to the first top-level comma
+ * or the WHERE / RETURNING keyword (so expressions such as "n = n + 1" and
+ * "p = point(1, 2)" survive).  Returns the number of assignments written to
+ * the AST; 0 means the list was absent or malformed.
+ * ------------------------------------------------------------------------- */
+static size_t parse_set_list(const char** pp, qihse_sql_ast_t* ast) {
+    const char* p = *pp;
+    size_t cap = 4;
+    ast->set_columns = (char**)calloc(cap, sizeof(char*));
+    ast->set_values = (char**)calloc(cap, sizeof(char*));
+    ast->num_set = 0;
+
+    for (;;) {
+        p = skip_ws(p);
+        size_t clen = 0;
+        const char* cstart = read_identifier(p, &clen);
+        if (clen == 0) break;
+        const char* q = skip_ws(cstart + clen);
+        if (*q != '=') break;                  /* not "col = ..." */
+        q++;
+        q = skip_ws(q);
+        if (!*q || *q == ',' || *q == ';') break;  /* assignment with no value */
+
+        const char* vstart;
+        const char* vend;
+        if (*q == '\'') {
+            q++;
+            vstart = q;
+            while (*q && *q != '\'') q++;
+            vend = q;
+            if (*q == '\'') q++;
+        } else {
+            vstart = q;
+            int depth = 0;
+            while (*q) {
+                if (*q == '(') { depth++; q++; continue; }
+                if (*q == ')') { if (depth == 0) break; depth--; q++; continue; }
+                if (depth == 0 && (*q == ',' || *q == ';')) break;
+                if (depth == 0 && q > vstart && isspace((unsigned char)q[-1])) {
+                    size_t kwlen = 0;
+                    if (strncasecmp(q, "WHERE", 5) == 0) kwlen = 5;
+                    else if (strncasecmp(q, "RETURNING", 9) == 0) kwlen = 9;
+                    if (kwlen && !isalnum((unsigned char)q[kwlen]) && q[kwlen] != '_')
+                        break;
+                }
+                q++;
+            }
+            vend = q;
+            while (vend > vstart && isspace((unsigned char)vend[-1])) vend--;
+        }
+        if (vend <= vstart) break;             /* "col =" with an empty value */
+
+        if (ast->num_set >= cap) {
+            cap *= 2;
+            ast->set_columns = (char**)realloc(ast->set_columns, cap * sizeof(char*));
+            ast->set_values = (char**)realloc(ast->set_values, cap * sizeof(char*));
+        }
+        ast->set_columns[ast->num_set] = dup_token(cstart, clen);
+        ast->set_values[ast->num_set] = dup_range(vstart, vend);
+        ast->num_set++;
+
+        p = skip_ws(q);
+        if (*p == ',') { p++; continue; }
+        break;
+    }
+    *pp = p;
+    return ast->num_set;
+}
+
+/* -------------------------------------------------------------------------
+ * Skip an optional table alias after the target table of an UPDATE/DELETE.
+ *
+ * The AST has no alias field for DML, so the alias is dropped, but it must be
+ * consumed here or the SET/WHERE clause that follows would not be recognised —
+ * and an unrecognised WHERE on DELETE would silently match every row.  A bare
+ * alias is only consumed when SET / WHERE / RETURNING follows it, so a
+ * malformed statement still fails its keyword check rather than having the
+ * keyword eaten as an alias.
+ * ------------------------------------------------------------------------- */
+static void skip_dml_table_alias(const char** pp) {
+    const char* p = skip_ws(*pp);
+    const char* as_after = match_kw(p, "AS");
+    if (as_after) {
+        p = skip_ws(as_after);
+        size_t alen = 0;
+        const char* astart = read_identifier(p, &alen);
+        if (alen > 0) p = astart + alen;
+        *pp = p;
+        return;
+    }
+    size_t alen = 0;
+    const char* astart = read_identifier(p, &alen);
+    if (alen == 0) return;
+    const char* after = skip_ws(astart + alen);
+    if (match_kw(after, "SET") || match_kw(after, "WHERE") || match_kw(after, "RETURNING"))
+        *pp = after;
 }
 
 /* -------------------------------------------------------------------------
@@ -2235,6 +2341,29 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         size_t tlen;
         const char* tstart = read_identifier(cur, &tlen);
         if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
+        skip_dml_table_alias(&cur);
+        cur = skip_ws(cur);
+        /* SET list */
+        const char* set_after = match_kw(cur, "SET");
+        if (set_after) {
+            cur = set_after;
+            (void)parse_set_list(&cur, ast);
+        }
+        if (ast->num_set == 0) {
+            /* An UPDATE with no assignments cannot modify anything.  Refuse it
+             * (NULL = parse error for every caller) instead of returning an AST
+             * that callers would execute as a silent no-op. */
+            qihse_sql_ast_free(ast);
+            free(work);
+            return NULL;
+        }
+        /* WHERE — structured, the same representation SELECT and DELETE use */
+        cur = skip_ws(cur);
+        const char* where_after = match_kw(cur, "WHERE");
+        if (where_after) {
+            cur = where_after;
+            parse_where(&cur, ast);
+        }
     } else if (strncasecmp(cur, "DELETE", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_DELETE;
@@ -2247,16 +2376,13 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         size_t tlen;
         const char* tstart = read_identifier(cur, &tlen);
         if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
+        skip_dml_table_alias(&cur);
         cur = skip_ws(cur);
-        /* WHERE */
+        /* WHERE — parsed into structured conditions, not kept as raw text */
         const char* where_after = match_kw(cur, "WHERE");
         if (where_after) {
             cur = where_after;
-            const char* wstart = cur;
-            while (*cur && *cur != ';') cur++;
-            size_t wlen = (size_t)(cur - wstart);
-            while (wlen > 0 && isspace((unsigned char)wstart[wlen-1])) wlen--;
-            { ast->insert_select_query = dup_token(wstart, wlen); }
+            parse_where(&cur, ast);
         }
         /* RETURNING */
         cur = skip_ws(cur);
