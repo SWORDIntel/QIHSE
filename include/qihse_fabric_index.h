@@ -134,6 +134,13 @@ const char* qihse_fabric_index_class_name(qihse_fabric_index_class_t cls);
 /* KEYSTONE version string, or NULL when the library is unavailable. */
 const char* qihse_fabric_index_keystone_version(void);
 
+/*
+ * Export KEYSTONE node capability frame (NODE_CAP) into out_buf (50 bytes).
+ * When KEYSTONE library is loaded and supports fabric export, returns 50 (bytes written).
+ * Returns QIHSE_FABRIC_INDEX_EUNAVAILABLE if KEYSTONE is not loaded or missing the symbol.
+ */
+int qihse_fabric_index_export_node_cap(const char* node_id, uint8_t* out_buf, size_t buf_size);
+
 #ifdef __cplusplus
 }
 #endif

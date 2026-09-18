@@ -72,6 +72,7 @@ typedef size_t (*ks_trigram_doc_count_fn)(const void*);
 typedef size_t (*ks_trigram_candidates_fn)(const void*, const char*, size_t,
                                            uint32_t*, size_t);
 typedef const char* (*ks_version_fn)(void);
+typedef int (*ks_export_node_cap_fn)(const char*, uint8_t*, size_t);
 
 /* Layout must match KEYSTONE's compiled dsmil_model_context_t exactly. */
 typedef char ks_ctx_size_check[(sizeof(ks_model_context_t) == 656u) ? 1 : -1];
@@ -114,6 +115,7 @@ static ks_trigram_destroy_fn ks_trigram_destroy = NULL;
 static ks_trigram_doc_count_fn ks_trigram_doc_count = NULL;
 static ks_trigram_candidates_fn ks_trigram_candidates = NULL;
 static ks_version_fn ks_version = NULL;
+static ks_export_node_cap_fn ks_export_node_cap = NULL;
 
 static fabric_record_t* g_records = NULL;
 static size_t g_record_count = 0u;
@@ -161,6 +163,7 @@ static void fabric_state_reset_locked(void) {
     ks_trigram_doc_count = NULL;
     ks_trigram_candidates = NULL;
     ks_version = NULL;
+    ks_export_node_cap = NULL;
     g_available = false;
     g_index_dir[0] = '\0';
     g_lib_path[0] = '\0';
@@ -323,6 +326,8 @@ static bool fabric_resolve_symbols_locked(void) {
         if (!sym) return false;
         *needed[i].out = sym;
     }
+    /* Optional capability frame export */
+    ks_export_node_cap = (ks_export_node_cap_fn)dlsym(g_dl, "keystone_export_node_cap_frame");
     return true;
 }
 
@@ -622,4 +627,17 @@ const char* qihse_fabric_index_keystone_version(void) {
     const char* v = g_available && ks_version ? ks_version() : NULL;
     pthread_mutex_unlock(&g_fabric_lock);
     return v;
+}
+
+int qihse_fabric_index_export_node_cap(const char* node_id, uint8_t* out_buf, size_t buf_size) {
+    if (!out_buf || buf_size < 50u) return QIHSE_FABRIC_INDEX_EINVAL;
+    pthread_mutex_lock(&g_fabric_lock);
+    fabric_lazy_init_locked();
+    if (!g_available || !ks_export_node_cap) {
+        pthread_mutex_unlock(&g_fabric_lock);
+        return QIHSE_FABRIC_INDEX_EUNAVAILABLE;
+    }
+    int res = ks_export_node_cap(node_id, out_buf, buf_size);
+    pthread_mutex_unlock(&g_fabric_lock);
+    return res;
 }

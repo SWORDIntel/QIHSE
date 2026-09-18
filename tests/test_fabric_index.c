@@ -117,6 +117,10 @@ int main(void) {
           "lookup without KEYSTONE fails closed with no records");
     CHECK(qihse_fabric_index_keystone_version() == NULL,
           "keystone_version NULL without KEYSTONE");
+    uint8_t cap_buf[50];
+    CHECK(qihse_fabric_index_export_node_cap("node1", cap_buf, sizeof(cap_buf)) ==
+              QIHSE_FABRIC_INDEX_EUNAVAILABLE,
+          "export_node_cap without KEYSTONE fails closed");
     qihse_fabric_index_shutdown();
 
     /* --- 3. Authenticated scenarios against live KEYSTONE (if present) */
@@ -128,6 +132,10 @@ int main(void) {
               "fabric index init is idempotent");
         CHECK(qihse_fabric_index_keystone_version() != NULL,
               "keystone version exposed when available");
+        CHECK(qihse_fabric_index_export_node_cap("node1", cap_buf, sizeof(cap_buf)) == 50,
+              "export_node_cap with live KEYSTONE returns 50 bytes");
+        CHECK(qihse_fabric_index_export_node_cap("node1", cap_buf, 40) == QIHSE_FABRIC_INDEX_EINVAL,
+              "export_node_cap rejects undersized buffer with EINVAL");
 
         char value[512];
         snprintf(value, sizeof(value),

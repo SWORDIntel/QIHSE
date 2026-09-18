@@ -97,6 +97,9 @@ lib/
 
 # Agent session plans (local working notes)
 /.zcode/
+/ZCODE_SESSION_RECOVERY.md
+/zcode_recovered_sessions.tar.gz
+/zcode_recovered_sessions/
 
 # Test scratch directories (mkdtemp'd by unit tests under build/)
 /build/aimem_data_*/
@@ -121,3 +124,5 @@ lib/
 /build/fed_transport_*/
 /build/fed_rejoin_*/
 /build/w25_*/
+/build/aimem_embed_*/
+/build/fabric_jobs_*/
