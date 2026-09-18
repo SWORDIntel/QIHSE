@@ -2,17 +2,12 @@
  * test_bolt.c — Neo4j Bolt adapter: PackStream codec, message framing and
  * the version handshake.
  *
- * Exercises src/spinnaker/qihse_bolt.c.  The document this test belongs to
- * (docs/architecture/bolt_protocol.md) claims "PackStream encode/decode for
- * all types and the Bolt message flow".  That claim is only partly true: the
- * codec has real gaps, which this test does NOT paper over.  It asserts the
- * paths that work and then prints the observed behaviour of the broken paths
- * so the gaps are visible on every run and cannot be mistaken for coverage.
+ * Exercises src/spinnaker/qihse_bolt.c.
  *
  * Asserted (works):
- *   1.  PackStream round trip: null, bool, int (positive tiny / int8 / int16 /
- *       int32 / int64 and negative values <= -17), float64, string
- *       (empty / 8-bit / 16-bit lengths), list, 16+-entry map, tiny struct
+ *   1.  PackStream round trip: null, bool, int (positive tiny / negative tiny / int8 / int16 /
+ *       int32 / int64), float64, string (tiny / empty / 8-bit / 16-bit lengths), list
+ *       (tiny / 8-bit), map (tiny / 8-bit / 16-bit / 32-bit), tiny struct
  *       with the Node/Relationship/Path signatures
  *   2.  Truncated input is refused rather than mis-decoded
  *   3.  Message framing: single-chunk encode/decode round trip, two messages
@@ -22,22 +17,9 @@
  *       a wrong magic byte is refused, and an unknown version is refused
  *   5.  Client message loop over a socketpair: RESET is answered with a
  *       SUCCESS frame and GOODBYE ends the session
- *
- * Reported as defects (NOT asserted, so fixing them cannot break this test):
- *   - tiny maps: the encoder writes marker 0xD7|count instead of the
- *     PackStream tiny-map markers 0xA0..0xAF, so every SUCCESS/FAILURE frame
- *     the server emits for a map of fewer than 16 entries is malformed on the
- *     wire and the library's own decoder reads it as a 3-entry map
- *   - negative tiny ints (-16..-1): the encoder emits 0xF0..0xFF, which the
- *     decoder does not recognise (it maps 0x80..0x8F to tiny negative ints,
- *     but PackStream reserves 0x80..0x8F for tiny strings)
- *   - tiny strings/lists (0x80..0x8F / 0x90..0x9F) and tiny maps
- *     (0xA0..0xAF) cannot be decoded at all
- *   - the QIHSE_BOLT_MSG_* constants in include/qihse_bolt.h do not match the
- *     Bolt 4.x message signatures (RUN 0x11 vs 0x10, PULL 0x13 vs 0x3F,
- *     DISCARD 0x12 vs 0x2F, BEGIN 0x2F vs 0x11, COMMIT 0x30 vs 0x12,
- *     ROLLBACK 0x31 vs 0x13, RESET 0x10 vs 0x0F), so a stock neo4j driver
- *     and this server disagree about what every non-HELLO message means
+ *   6.  Bolt 4.x spec compliance: client->server message signatures (HELLO, GOODBYE,
+ *       RESET 0x0F, RUN 0x10, BEGIN 0x11, COMMIT 0x12, ROLLBACK 0x13, DISCARD 0x2F, PULL 0x3F)
+ *       and PackStream tiny map/int/string/list encoding and decoding.
  */
 #include "qihse_bolt.h"
 
@@ -85,6 +67,7 @@ static void test_packstream_primitives(void) {
     /* Integers in the ranges the codec handles. */
     int64_t cases[] = {
         0, 1, 42, 127,             /* tiny positive */
+        -1, -5, -16,               /* tiny negative (-16..-1) */
         128, 32767,                /* int16 */
         32768, 2147483647LL,       /* int32 */
         2147483648LL, 1234567890123LL, INT64_MIN, INT64_MAX,
@@ -165,9 +148,38 @@ static void test_packstream_containers(void) {
     qihse_bolt_value_free(v);
     qihse_bolt_buf_free(&b);
 
+    /* Tiny map: 0 entries (0xA0) and 3 entries (0xA3). */
+    qihse_bolt_buf_init(&b, 16);
+    qihse_bolt_encode_map_begin(&b, 0);
+    assert(b.buf[0] == 0xA0);
+    v = round_trip(&b);
+    assert(v && v->type == QIHSE_BOLT_MAP && v->v.map.count == 0);
+    qihse_bolt_value_free(v);
+    qihse_bolt_buf_free(&b);
+
+    qihse_bolt_buf_init(&b, 64);
+    qihse_bolt_encode_map_begin(&b, 3);
+    assert(b.buf[0] == 0xA3);
+    char tkey[16];
+    for (int i = 0; i < 3; i++) {
+        snprintf(tkey, sizeof(tkey), "tk%d", i);
+        qihse_bolt_encode_string(&b, tkey);
+        qihse_bolt_encode_int(&b, i);
+    }
+    v = round_trip(&b);
+    assert(v && v->type == QIHSE_BOLT_MAP && v->v.map.count == 3);
+    for (int i = 0; i < 3; i++) {
+        snprintf(tkey, sizeof(tkey), "tk%d", i);
+        assert(v->v.map.keys[i]->type == QIHSE_BOLT_STRING && strcmp(v->v.map.keys[i]->v.s.data, tkey) == 0);
+        assert(v->v.map.vals[i]->type == QIHSE_BOLT_INT && v->v.map.vals[i]->v.i == i);
+    }
+    qihse_bolt_value_free(v);
+    qihse_bolt_buf_free(&b);
+
     /* Map with 16 entries: the smallest size that uses the 0xD8 prefix. */
     qihse_bolt_buf_init(&b, 256);
     qihse_bolt_encode_map_begin(&b, 16);
+    assert(b.buf[0] == 0xD8);
     char key[16];
     for (int i = 0; i < 16; i++) {
         snprintf(key, sizeof(key), "k%02d", i);
@@ -474,66 +486,81 @@ static void test_client_message_loop(void) {
     printf("PASS bolt message loop: RESET answered with SUCCESS, unknown IGNORED, GOODBYE closes\n");
 }
 
-/* ── Defect report (observed, not asserted) ─────────────────────────────── */
+/* ── 7. Bolt 4.x spec compliance (asserted) ─────────────────────────────── */
 
-static void report_defects(void) {
-    /* Tiny map: what the encoder writes and what the library's decoder reads. */
+static void test_bolt_spec_compliance(void) {
+    /* Tiny map: verify 0xA0..0xAF encoding and round-trip decoding. */
     qihse_bolt_buf_t b;
     qihse_bolt_buf_init(&b, 32);
     qihse_bolt_encode_map_begin(&b, 1);
     qihse_bolt_encode_string(&b, "server");
     qihse_bolt_encode_string(&b, "QIHSE/1.0");
     uint8_t marker = b.buf[0];
+    assert(marker == 0xA1);
     qihse_bolt_value_t* v = round_trip(&b);
-    printf("NOTE packstream tiny map: encoder marker=0x%02X (PackStream tiny maps are "
-           "0xA0..0xAF); library decoder reads %s\n",
-           marker,
-           (v && v->type == QIHSE_BOLT_MAP) ? "a map" : "nothing");
-    if (v && v->type == QIHSE_BOLT_MAP) {
-        printf("NOTE packstream tiny map: decoded entry count=%zu (encoded count was 1)\n",
-               v->v.map.count);
+    assert(v && v->type == QIHSE_BOLT_MAP);
+    assert(v->v.map.count == 1);
+    assert(v->v.map.keys[0]->type == QIHSE_BOLT_STRING && strcmp(v->v.map.keys[0]->v.s.data, "server") == 0);
+    assert(v->v.map.vals[0]->type == QIHSE_BOLT_STRING && strcmp(v->v.map.vals[0]->v.s.data, "QIHSE/1.0") == 0);
+    qihse_bolt_value_free(v);
+    qihse_bolt_buf_free(&b);
+
+    /* Negative tiny ints: -16..-1 encode as 0xF0..0xFF and decode with sign extension. */
+    int64_t tiny_neg_cases[] = { -1, -5, -16 };
+    uint8_t tiny_neg_expected[] = { 0xFF, 0xFB, 0xF0 };
+    for (size_t i = 0; i < sizeof(tiny_neg_cases) / sizeof(tiny_neg_cases[0]); i++) {
+        qihse_bolt_buf_init(&b, 8);
+        qihse_bolt_encode_int(&b, tiny_neg_cases[i]);
+        assert(b.buf[0] == tiny_neg_expected[i]);
+        v = round_trip(&b);
+        assert(v && v->type == QIHSE_BOLT_INT);
+        assert(v->v.i == tiny_neg_cases[i]);
+        qihse_bolt_value_free(v);
+        qihse_bolt_buf_free(&b);
     }
-    qihse_bolt_value_free(v);
-    qihse_bolt_buf_free(&b);
 
-    /* Negative tiny ints. */
-    qihse_bolt_buf_init(&b, 8);
-    qihse_bolt_encode_int(&b, -5);
-    v = round_trip(&b);
-    printf("NOTE packstream tiny negative int: encoder marker=0x%02X, decoder %s\n",
-           b.buf[0], v ? "decoded" : "returned NULL");
-    qihse_bolt_value_free(v);
-    qihse_bolt_buf_free(&b);
-
-    /* Tiny string / tiny list markers. */
+    /* Tiny string / tiny list / tiny map markers decode correctly. */
     const uint8_t tiny_string[] = {0x83, 'a', 'b', 'c'};   /* PackStream: "abc" */
     const uint8_t tiny_list[] = {0x92, 0x01, 0x02};        /* PackStream: [1,2] */
     const uint8_t tiny_map[] = {0xA1, 0x81, 'k', 0x01};    /* PackStream: {"k":1} */
     qihse_bolt_decoder_t d;
+
     qihse_bolt_decoder_init(&d, tiny_string, sizeof(tiny_string));
     v = qihse_bolt_decode(&d);
-    printf("NOTE packstream tiny string (0x83 'abc'): %s%s\n",
-           v ? "decoded as " : "returned NULL",
-           (v && v->type == QIHSE_BOLT_INT) ? "an integer" : "");
-    qihse_bolt_value_free(v);
-    qihse_bolt_decoder_init(&d, tiny_list, sizeof(tiny_list));
-    v = qihse_bolt_decode(&d);
-    printf("NOTE packstream tiny list (0x92 [1,2]): %s\n",
-           v ? "decoded" : "returned NULL");
-    qihse_bolt_value_free(v);
-    qihse_bolt_decoder_init(&d, tiny_map, sizeof(tiny_map));
-    v = qihse_bolt_decode(&d);
-    printf("NOTE packstream tiny map (0xA1 {\"k\":1}): %s\n",
-           v ? "decoded" : "returned NULL");
+    assert(v && v->type == QIHSE_BOLT_STRING);
+    assert(v->v.s.len == 3 && strcmp(v->v.s.data, "abc") == 0);
     qihse_bolt_value_free(v);
 
-    /* Message signature constants versus Bolt 4.x. */
-    printf("NOTE bolt signatures: header RUN=0x%02X (Bolt 4.x 0x10), PULL=0x%02X (0x3F), "
-           "DISCARD=0x%02X (0x2F), BEGIN=0x%02X (0x11), COMMIT=0x%02X (0x12), "
-           "ROLLBACK=0x%02X (0x13), RESET=0x%02X (0x0F)\n",
-           QIHSE_BOLT_MSG_RUN, QIHSE_BOLT_MSG_PULL, QIHSE_BOLT_MSG_DISCARD,
-           QIHSE_BOLT_MSG_BEGIN, QIHSE_BOLT_MSG_COMMIT, QIHSE_BOLT_MSG_ROLLBACK,
-           QIHSE_BOLT_MSG_RESET);
+    qihse_bolt_decoder_init(&d, tiny_list, sizeof(tiny_list));
+    v = qihse_bolt_decode(&d);
+    assert(v && v->type == QIHSE_BOLT_LIST && v->v.list.count == 2);
+    assert(v->v.list.items[0]->type == QIHSE_BOLT_INT && v->v.list.items[0]->v.i == 1);
+    assert(v->v.list.items[1]->type == QIHSE_BOLT_INT && v->v.list.items[1]->v.i == 2);
+    qihse_bolt_value_free(v);
+
+    qihse_bolt_decoder_init(&d, tiny_map, sizeof(tiny_map));
+    v = qihse_bolt_decode(&d);
+    assert(v && v->type == QIHSE_BOLT_MAP && v->v.map.count == 1);
+    assert(v->v.map.keys[0]->type == QIHSE_BOLT_STRING && strcmp(v->v.map.keys[0]->v.s.data, "k") == 0);
+    assert(v->v.map.vals[0]->type == QIHSE_BOLT_INT && v->v.map.vals[0]->v.i == 1);
+    qihse_bolt_value_free(v);
+
+    /* Message signature constants match Bolt 4.x spec. */
+    assert(QIHSE_BOLT_MSG_HELLO == 0x01);
+    assert(QIHSE_BOLT_MSG_GOODBYE == 0x02);
+    assert(QIHSE_BOLT_MSG_RESET == 0x0F);
+    assert(QIHSE_BOLT_MSG_RUN == 0x10);
+    assert(QIHSE_BOLT_MSG_BEGIN == 0x11);
+    assert(QIHSE_BOLT_MSG_COMMIT == 0x12);
+    assert(QIHSE_BOLT_MSG_ROLLBACK == 0x13);
+    assert(QIHSE_BOLT_MSG_DISCARD == 0x2F);
+    assert(QIHSE_BOLT_MSG_PULL == 0x3F);
+    assert(QIHSE_BOLT_MSG_SUCCESS == 0x70);
+    assert(QIHSE_BOLT_MSG_RECORD == 0x71);
+    assert(QIHSE_BOLT_MSG_IGNORED == 0x7E);
+    assert(QIHSE_BOLT_MSG_FAILURE == 0x7F);
+
+    printf("PASS bolt 4.x spec compliance: signatures and packstream tiny containers\n");
 }
 
 int main(void) {
@@ -543,8 +570,7 @@ int main(void) {
     test_message_framing();
     test_handshake();
     test_client_message_loop();
-    report_defects();
-    printf("test_bolt: all asserted Bolt behaviours passed (see NOTE lines for the "
-           "unimplemented PackStream cases)\n");
+    test_bolt_spec_compliance();
+    printf("test_bolt: all asserted Bolt behaviours passed\n");
     return 0;
 }

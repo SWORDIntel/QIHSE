@@ -186,14 +186,18 @@ void qihse_bolt_encode_list_begin(qihse_bolt_buf_t* b, size_t count) {
 
 void qihse_bolt_encode_map_begin(qihse_bolt_buf_t* b, size_t count) {
     if (count < 16) {
-        uint8_t hdr = 0xD7 | (uint8_t)count;
+        uint8_t hdr = 0xA0 + (uint8_t)count;
         qihse_bolt_buf_append(b, &hdr, 1);
-    } else if (count <= 0xFFFF) {
+    } else if (count <= 0xFF) {
         uint8_t hdr = 0xD8;
+        qihse_bolt_buf_append(b, &hdr, 1);
+        bolt_put_u8(b, (uint8_t)count);
+    } else if (count <= 0xFFFF) {
+        uint8_t hdr = 0xD9;
         qihse_bolt_buf_append(b, &hdr, 1);
         bolt_put_u16be(b, (uint16_t)count);
     } else {
-        uint8_t hdr = 0xD9;
+        uint8_t hdr = 0xDA;
         qihse_bolt_buf_append(b, &hdr, 1);
         bolt_put_u32be(b, (uint32_t)count);
     }
@@ -288,171 +292,159 @@ void qihse_bolt_value_free(qihse_bolt_value_t* v) {
     free(v);
 }
 
+static qihse_bolt_value_t* bolt_decode_string_payload(qihse_bolt_decoder_t* d, size_t len) {
+    if (!bolt_have(d, len)) return NULL;
+    qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRING);
+    if (!v) return NULL;
+    v->v.s.len = len;
+    v->v.s.data = (char*)malloc(len + 1);
+    if (!v->v.s.data) { free(v); return NULL; }
+    if (len) memcpy(v->v.s.data, d->data + d->pos, len);
+    v->v.s.data[len] = '\0';
+    d->pos += len;
+    return v;
+}
+
+static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, size_t count) {
+    qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
+    if (!v) return NULL;
+    v->v.list.count = count;
+    v->v.list.items = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
+    if (!v->v.list.items) { free(v); return NULL; }
+    for (size_t i = 0; i < count; i++) {
+        v->v.list.items[i] = qihse_bolt_decode(d);
+        if (!v->v.list.items[i]) { qihse_bolt_value_free(v); return NULL; }
+    }
+    return v;
+}
+
+static qihse_bolt_value_t* bolt_decode_map_entries(qihse_bolt_decoder_t* d, size_t count) {
+    qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
+    if (!v) return NULL;
+    v->v.map.count = count;
+    v->v.map.keys = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
+    v->v.map.vals = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
+    if (!v->v.map.keys || !v->v.map.vals) { qihse_bolt_value_free(v); return NULL; }
+    for (size_t i = 0; i < count; i++) {
+        v->v.map.keys[i] = qihse_bolt_decode(d);
+        v->v.map.vals[i] = qihse_bolt_decode(d);
+        if (!v->v.map.keys[i] || !v->v.map.vals[i]) { qihse_bolt_value_free(v); return NULL; }
+    }
+    return v;
+}
+
 qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     if (!bolt_have(d, 1)) return NULL;
     uint8_t marker = d->data[d->pos++];
 
-    /* Tiny ints: 0..127 (positive) and 0x80..0x8F (-16..-1) */
+    /* Tiny positive ints: 0..127 */
     if (marker <= 0x7F) {
         qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-        v->v.i = (int8_t)marker;
+        if (v) v->v.i = (int64_t)(int8_t)marker;
         return v;
     }
-    /* 0x80-0x8F are tiny negative ints (-16 to -1) */
-    if (marker >= 0x80 && marker <= 0x8F) {
+
+    /* Tiny negative ints: 0xF0..0xFF (-16 to -1) */
+    if (marker >= 0xF0) {
         qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-        v->v.i = (int8_t)marker;
+        if (v) v->v.i = (int64_t)(int8_t)marker;
         return v;
+    }
+
+    /* Tiny strings: 0x80..0x8F (length 0..15) */
+    if (marker >= 0x80 && marker <= 0x8F) {
+        return bolt_decode_string_payload(d, marker & 0x0F);
+    }
+
+    /* Tiny lists: 0x90..0x9F (length 0..15) */
+    if (marker >= 0x90 && marker <= 0x9F) {
+        return bolt_decode_list_entries(d, marker & 0x0F);
+    }
+
+    /* Tiny maps: 0xA0..0xAF (size 0..15) */
+    if (marker >= 0xA0 && marker <= 0xAF) {
+        return bolt_decode_map_entries(d, marker & 0x0F);
     }
 
     switch (marker) {
         case 0xC0: return bolt_new_value(QIHSE_BOLT_NULL);
-        case 0xC2: { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_BOOL); v->v.b = false; return v; }
-        case 0xC3: { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_BOOL); v->v.b = true; return v; }
-        case 0xC8:
+        case 0xC2: { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_BOOL); if (v) v->v.b = false; return v; }
+        case 0xC3: { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_BOOL); if (v) v->v.b = true; return v; }
+        case 0xC8: {
             if (!bolt_have(d, 1)) return NULL;
-            { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-              v->v.i = (int8_t)d->data[d->pos++]; return v; }
-        case 0xC9:
+            qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
+            if (v) v->v.i = (int8_t)d->data[d->pos++];
+            return v;
+        }
+        case 0xC9: {
             if (!bolt_have(d, 2)) return NULL;
-            { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-              v->v.i = (int16_t)bolt_get_u16be(d); return v; }
-        case 0xCA:
+            qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
+            if (v) v->v.i = (int16_t)bolt_get_u16be(d);
+            return v;
+        }
+        case 0xCA: {
             if (!bolt_have(d, 4)) return NULL;
-            { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-              v->v.i = (int32_t)bolt_get_u32be(d); return v; }
-        case 0xCB:
+            qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
+            if (v) v->v.i = (int32_t)bolt_get_u32be(d);
+            return v;
+        }
+        case 0xCB: {
             if (!bolt_have(d, 8)) return NULL;
-            { qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
-              v->v.i = (int64_t)bolt_get_u64be(d); return v; }
+            qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_INT);
+            if (v) v->v.i = (int64_t)bolt_get_u64be(d);
+            return v;
+        }
         case 0xC1: {
             if (!bolt_have(d, 8)) return NULL;
             uint64_t bits = bolt_get_u64be(d);
             qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_FLOAT);
-            memcpy(&v->v.f, &bits, 8);
+            if (v) memcpy(&v->v.f, &bits, 8);
             return v;
         }
         default:
             break;
     }
 
-    /* Strings */
+    /* Strings: String 8 (0xD0), String 16 (0xD1), String 32 (0xD2) */
     if (marker == 0xD0) {
         if (!bolt_have(d, 1)) return NULL;
-        size_t len = d->data[d->pos++];
-        if (!bolt_have(d, len)) return NULL;
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRING);
-        v->v.s.len = len;
-        v->v.s.data = (char*)malloc(len + 1);
-        memcpy(v->v.s.data, d->data + d->pos, len);
-        v->v.s.data[len] = '\0';
-        d->pos += len;
-        return v;
+        return bolt_decode_string_payload(d, d->data[d->pos++]);
     }
     if (marker == 0xD1) {
         if (!bolt_have(d, 2)) return NULL;
-        uint16_t len = bolt_get_u16be(d);
-        if (!bolt_have(d, len)) return NULL;
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRING);
-        v->v.s.len = len;
-        v->v.s.data = (char*)malloc(len + 1);
-        memcpy(v->v.s.data, d->data + d->pos, len);
-        v->v.s.data[len] = '\0';
-        d->pos += len;
-        return v;
+        return bolt_decode_string_payload(d, bolt_get_u16be(d));
     }
     if (marker == 0xD2) {
         if (!bolt_have(d, 4)) return NULL;
-        uint32_t len = bolt_get_u32be(d);
-        if (!bolt_have(d, len)) return NULL;
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRING);
-        v->v.s.len = len;
-        v->v.s.data = (char*)malloc(len + 1);
-        memcpy(v->v.s.data, d->data + d->pos, len);
-        v->v.s.data[len] = '\0';
-        d->pos += len;
-        return v;
+        return bolt_decode_string_payload(d, bolt_get_u32be(d));
     }
 
-    /* Lists */
+    /* Lists: List 8 (0xD4), List 16 (0xD5), List 32 (0xD6) */
     if (marker == 0xD4) {
         if (!bolt_have(d, 1)) return NULL;
-        size_t count = d->data[d->pos++];
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
-        v->v.list.count = count;
-        v->v.list.items = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.list.items[i] = qihse_bolt_decode(d);
-            if (!v->v.list.items[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
+        return bolt_decode_list_entries(d, d->data[d->pos++]);
     }
     if (marker == 0xD5) {
         if (!bolt_have(d, 2)) return NULL;
-        uint16_t count = bolt_get_u16be(d);
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
-        v->v.list.count = count;
-        v->v.list.items = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.list.items[i] = qihse_bolt_decode(d);
-            if (!v->v.list.items[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
+        return bolt_decode_list_entries(d, bolt_get_u16be(d));
     }
     if (marker == 0xD6) {
         if (!bolt_have(d, 4)) return NULL;
-        uint32_t count = bolt_get_u32be(d);
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
-        v->v.list.count = count;
-        v->v.list.items = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.list.items[i] = qihse_bolt_decode(d);
-            if (!v->v.list.items[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
+        return bolt_decode_list_entries(d, bolt_get_u32be(d));
     }
 
-    /* Maps */
-    if (marker >= 0xD4 && marker <= 0xD7) {
-        size_t count = marker - 0xD4;
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
-        v->v.map.count = count;
-        v->v.map.keys = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        v->v.map.vals = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.map.keys[i] = qihse_bolt_decode(d);
-            v->v.map.vals[i] = qihse_bolt_decode(d);
-            if (!v->v.map.keys[i] || !v->v.map.vals[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
-    }
+    /* Maps: Map 8 (0xD8), Map 16 (0xD9), Map 32 (0xDA) */
     if (marker == 0xD8) {
-        if (!bolt_have(d, 2)) return NULL;
-        uint16_t count = bolt_get_u16be(d);
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
-        v->v.map.count = count;
-        v->v.map.keys = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        v->v.map.vals = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.map.keys[i] = qihse_bolt_decode(d);
-            v->v.map.vals[i] = qihse_bolt_decode(d);
-            if (!v->v.map.keys[i] || !v->v.map.vals[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
+        if (!bolt_have(d, 1)) return NULL;
+        return bolt_decode_map_entries(d, d->data[d->pos++]);
     }
     if (marker == 0xD9) {
+        if (!bolt_have(d, 2)) return NULL;
+        return bolt_decode_map_entries(d, bolt_get_u16be(d));
+    }
+    if (marker == 0xDA) {
         if (!bolt_have(d, 4)) return NULL;
-        uint32_t count = bolt_get_u32be(d);
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
-        v->v.map.count = count;
-        v->v.map.keys = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        v->v.map.vals = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < count; i++) {
-            v->v.map.keys[i] = qihse_bolt_decode(d);
-            v->v.map.vals[i] = qihse_bolt_decode(d);
-            if (!v->v.map.keys[i] || !v->v.map.vals[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
+        return bolt_decode_map_entries(d, bolt_get_u32be(d));
     }
 
     /* Structs */

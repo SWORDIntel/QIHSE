@@ -19,13 +19,13 @@ extern "C" {
 /* Bolt 4.x message signatures (client -> server) */
 #define QIHSE_BOLT_MSG_HELLO     0x01
 #define QIHSE_BOLT_MSG_GOODBYE   0x02
-#define QIHSE_BOLT_MSG_RESET     0x10
-#define QIHSE_BOLT_MSG_RUN       0x11
-#define QIHSE_BOLT_MSG_DISCARD   0x12
-#define QIHSE_BOLT_MSG_PULL      0x13
-#define QIHSE_BOLT_MSG_BEGIN     0x2F
-#define QIHSE_BOLT_MSG_COMMIT    0x30
-#define QIHSE_BOLT_MSG_ROLLBACK  0x31
+#define QIHSE_BOLT_MSG_RESET     0x0F
+#define QIHSE_BOLT_MSG_RUN       0x10
+#define QIHSE_BOLT_MSG_BEGIN     0x11
+#define QIHSE_BOLT_MSG_COMMIT    0x12
+#define QIHSE_BOLT_MSG_ROLLBACK  0x13
+#define QIHSE_BOLT_MSG_DISCARD   0x2F
+#define QIHSE_BOLT_MSG_PULL      0x3F
 
 /* Bolt 4.x message signatures (server -> client) */
 #define QIHSE_BOLT_MSG_SUCCESS   0x70
