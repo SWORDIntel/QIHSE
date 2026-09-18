@@ -7480,8 +7480,11 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     /* A type with no executor is REFUSED, not accepted-and-ignored. Silently
      * storing a job nobody will ever run is how a queue fills with work that
      * reports success. */
-    bool is_embed = qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "embed");
-    bool is_ingest = qihse_resp_arg_equal(&(qihse_resp_arg_t){ (char*)job_type, strlen(job_type) }, "keystone-ingest");
+    /* Plain strcmp: building a compound qihse_resp_arg_t here meant casting
+     * away const to satisfy a uint8_t* field, which is both noisy and a
+     * pointer-target mismatch the compiler warns about. */
+    bool is_embed = strcmp(job_type, "embed") == 0;
+    bool is_ingest = strcmp(job_type, "keystone-ingest") == 0;
     if (!is_embed && !is_ingest) {
         char err[192];
         snprintf(err, sizeof(err),
@@ -7555,7 +7558,11 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
         : QIHSE_CLUSTER_NODE_NONE;
     bool is_local = (best_idx == local_idx);
 
-    char result[QIHSE_AIMEM_ID_LEN + 1u];
+    /* Big enough for either a memory id (36) or an artifact key
+     * ("fabric:ingest:<job-id>"). Sized to the larger: at 37 this silently
+     * TRUNCATED an artifact key, so FABRIC.RESULT would have handed back a key
+     * that does not exist — a job reporting a result nobody could look up. */
+    char result[128];
     result[0] = '\0';
     const char* status = "queued";
     const char* exec = "none";
