@@ -743,8 +743,20 @@ static int match_operator_d(const bson_t* doc, const char* key, const bson_eleme
         }
         return 1;
     } else if (strcmp(op, "$where") == 0) {
+        /* NOT EVALUATED, and REFUSED rather than matched.
+         *
+         * This returned 1 — MATCH — while the top-level path below returns -1
+         * with the comment "refused rather than silently matching everything".
+         * The two contradicted each other, and this is the dangerous half: a
+         * filter like {field: {$where: "..."}} would match EVERY document,
+         * so a query the caller wrote to narrow a result set returned the
+         * whole collection instead. Same class as a DELETE losing its WHERE.
+         *
+         * $where is a server-side code-execution primitive in MongoDB. There
+         * is no JavaScript engine here, so the only honest answers are
+         * "evaluate it" (impossible) or "refuse". Matching is neither. */
         (void)doc; (void)key; (void)field; (void)opval;
-        return 1;
+        return -1;
     }
     return 0;
 }
