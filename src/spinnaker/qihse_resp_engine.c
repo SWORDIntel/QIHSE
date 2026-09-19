@@ -15,6 +15,7 @@
 #include "qihse_cluster_scatter.h"
 #include "qihse_crc16.h"
 #include "qihse_keystone.h"
+#include "qihse_fabric_dispatch.h"
 #include "qihse_fabric_index.h"
 #include "qihse_ingest_guard.h"
 #include "qihse_metrics.h"
@@ -206,6 +207,9 @@ struct qihse_resp_server {
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
     qihse_cluster_bus_t* bus;
+    /* Remote fabric job dispatch. Both owned; stopped and freed on destroy. */
+    qihse_fabric_listener_t* fabric_listener;
+    qihse_fed_tls_server_t* fabric_tls;
     qihse_cluster_failover_t* failover;
     /* Group update push: monotonic id source + per-update member acks. */
     qihse_hlc_t group_clock;
@@ -8970,6 +8974,71 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->owns_task_scheduler = (server->task_scheduler != NULL);
     }
 
+    /* Remote fabric job dispatch. OFF unless asked for: a listener is
+     * network-facing, so it is opt-in, and a failure to start it is NOT fatal
+     * to the server — the node stays locally operable, which is the whole
+     * point of the federation rules. A caller that asked for dispatch and did
+     * not get it can tell, because qihse_resp_server_fabric_port() returns 0
+     * rather than a port. */
+    if (supplied->enable_fabric_dispatch) {
+        if (!supplied->fabric_dispatch_bind || !*supplied->fabric_dispatch_bind) {
+            fprintf(stderr, "qihse: fabric dispatch enabled without a bind address; "
+                            "refusing to start a listener\n");
+        } else if (server->fabric_tls == NULL) {
+            /* Load THIS node's approved identity first: the TLS context needs a
+             * KEY HANDLE, not the node id, and loading it also proves the node
+             * is enrolled and its private key is readable. A node that is not
+             * enrolled gets no listener, which is the correct outcome — an
+             * unenrolled node must not accept jobs from peers it cannot
+             * identify itself to. */
+            qihse_uuid_t self_id;
+            qihse_federation_node_identity_t self_identity;
+            void* self_pkey = NULL;
+            bool have_self = false;
+            if (supplied->fabric_dispatch_node_id &&
+                qihse_uuid_parse(supplied->fabric_dispatch_node_id, &self_id)) {
+                have_self = qihse_fabric_node_signer_load(server->store, qihse_auth_get_user(0),
+                                                          &self_id, &self_identity, &self_pkey);
+            }
+            if (!have_self) {
+                fprintf(stderr, "qihse: fabric dispatch enabled but this node has no loadable "
+                                "enrolled identity; dispatch is NOT running\n");
+            } else if (qihse_fabric_tls_context_create(supplied->fabric_dispatch_ca_cert_path,
+                                                       supplied->fabric_dispatch_node_cert_path,
+                                                       self_identity.key_handle,
+                                                       server->store, qihse_auth_get_user(0),
+                                                       &server->fabric_tls)) {
+            qihse_fabric_listener_config_t lcfg;
+            memset(&lcfg, 0, sizeof lcfg);
+            lcfg.tls = server->fabric_tls;
+            lcfg.bind_address = supplied->fabric_dispatch_bind;
+            lcfg.port = supplied->fabric_dispatch_port;
+            lcfg.accept_timeout_ms = 0;
+            /* The executor runs jobs as the node's OWN system principal. That
+             * is deliberate and it is NOT the peer's principal: a submitted
+             * job carries a signed capability that the executor verifies
+             * against the claimed principal BEFORE running, and refuses when
+             * it cannot. local_user is who the LISTENER runs as for its own
+             * bookkeeping, not an authorization fallback. */
+            lcfg.executor.server = server;
+            lcfg.executor.local_user = qihse_auth_get_user(0);
+            if (supplied->fabric_dispatch_node_id) {
+                (void)qihse_uuid_parse(supplied->fabric_dispatch_node_id,
+                                       &lcfg.executor.local_node);
+            }
+            lcfg.executor.node_label = supplied->fabric_dispatch_node_id;
+            server->fabric_listener = qihse_fabric_listener_start(&lcfg);
+            if (!server->fabric_listener) {
+                fprintf(stderr, "qihse: fabric dispatch listener failed to start on %s:%u\n",
+                        supplied->fabric_dispatch_bind, (unsigned)supplied->fabric_dispatch_port);
+            }
+            }
+        } else {
+            fprintf(stderr, "qihse: fabric dispatch enabled but no TLS context "
+                            "(check the CA/cert paths); dispatch is NOT running\n");
+        }
+    }
+
     return server;
 }
 
@@ -9084,6 +9153,8 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (server->owns_task_workers && server->task_workers) qihse_task_worker_pool_destroy(server->task_workers);
     if (server->owns_task_queue && server->task_queue) qihse_task_queue_destroy(server->task_queue);
     if (server->owns_failover && server->failover) qihse_cluster_failover_destroy(server->failover);
+    if (server->fabric_listener) qihse_fabric_listener_stop(server->fabric_listener);
+    if (server->fabric_tls) qihse_federation_tls_server_destroy(server->fabric_tls);
     if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
     if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
     if (server->owns_scatter && server->scatter) qihse_cluster_scatter_destroy(server->scatter);
@@ -9191,6 +9262,11 @@ bool qihse_resp_engine_run_legacy(qihse_kv_store_t* store, qihse_vector_db_t vdb
     bool result = qihse_resp_server_run(server);
     qihse_resp_server_destroy(server);
     return result;
+}
+
+uint16_t qihse_resp_server_fabric_port(qihse_resp_server_t* server) {
+    if (!server || !server->fabric_listener) return 0;
+    return qihse_fabric_listener_port(server->fabric_listener);
 }
 
 bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,

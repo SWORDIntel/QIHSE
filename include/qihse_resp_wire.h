@@ -82,6 +82,18 @@ typedef struct {
     /* UWP bridge: allow qihse_resp_server_execute() (QIHSE_UWP_TARGET_RESP)
      * to run commands through this server's dispatch path. Default true. */
     bool enable_uwp_bridge;
+    /* Remote fabric job dispatch. When enabled, this server starts a dispatch
+     * listener so peers can submit jobs to it. OFF by default: a listener is
+     * network-facing and must be opted into. `fabric_dispatch_bind` is
+     * REQUIRED when enabled (a wildcard bind is refused by the listener), and
+     * port 0 means ephemeral — read the real port back with
+     * qihse_resp_server_fabric_port(). */
+    bool enable_fabric_dispatch;
+    const char* fabric_dispatch_bind;
+    uint16_t fabric_dispatch_port;
+    const char* fabric_dispatch_ca_cert_path;
+    const char* fabric_dispatch_node_cert_path;
+    const char* fabric_dispatch_node_id;
     /* Per-tenant quota policies (QIHSE_QUOTA_*). Caller-owned; may be NULL
      * (no quotas). Tenant principals (tenant_id != 0) are enforced at
      * dispatch; system-domain principals are exempt. */
@@ -119,6 +131,11 @@ qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server
 qihse_kv_store_t* qihse_resp_server_store(qihse_resp_server_t* server);
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd);
 qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
+
+/* The dispatch listener's actual port, or 0 when dispatch is not running
+ * (disabled, or the listener could not start). A caller that asked for an
+ * ephemeral port needs this to build a dispatch endpoint. */
+uint16_t qihse_resp_server_fabric_port(qihse_resp_server_t* server);
 qihse_cluster_failover_t* qihse_resp_server_failover(qihse_resp_server_t* server);
 qihse_system_guard_window_t* qihse_resp_server_guard_window(qihse_resp_server_t* server);
 qihse_cluster_scatter_t* qihse_resp_server_scatter(qihse_resp_server_t* server);
