@@ -1,24 +1,30 @@
 # Replication, Backup & Operational Features
 
-> **Status: partial.** Streaming replication, read-replica routing and the
-> connection pooler are implemented and are exercised by `tests/test_repl.c`
-> (run via `make test-repl`). Backup/restore has an authenticated implementation
-> under `src/tractable/qihse_backup.c`, but **no test in `tests/` covers that
-> API** — the only backup test in the tree is
+> **Status: partial.** Streaming replication, read-replica routing, parallel
+> query and the connection pooler are implemented. Backup/restore has an
+> authenticated implementation under `src/tractable/qihse_backup.c`, but **no
+> test in `tests/` covers that API** — the only backup test in the tree is
 > `tests/test_federation_backup.c`, which covers the federation writer/reader
 > instead; see
 > [API_REFERENCE.md §2.3](../API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph).
-> **Parallel query is not implemented** (see below).
 >
-> Two further limits:
+> Two claims in earlier revisions of this document were wrong and are corrected
+> in place:
 >
-> - `qihse_repl_apply_wal()` records the LSN but does **not** replay the WAL
->   into a local store; the source says "In a real implementation, this would
->   replay the WAL into the local store". `tests/test_repl.c` asserts the LSN
->   bookkeeping and states this in its header comment.
-> - `qihse_backup_incremental_user()` is not a delta export: it returns
->   UNSUPPORTED by design, because the KV store exposes no change sequence
->   (documented in the API snippet below).
+> - **`qihse_repl_apply_wal()` replays.** It no longer only records an LSN: the
+>   record is staged as a private single-record WAL segment and replayed through
+>   `qihse_wal_replay()`, and the mutation reaches the bound store. A context
+>   with no store bound refuses every record rather than advancing an LSN that
+>   reached nothing (`qihse_repl_set_store()`). Verified by
+>   `tests/test_repl.c` and by the `repl-apply-wal` gold workload
+>   (`tests/gold/workloads/gold_repl_apply_wal.c`).
+> - **Parallel query is implemented**, not a stub. Verified by
+>   `tests/test_parallel_query.c` (`make test-parallel-query`) and the
+>   `parallel-query` gold workload.
+>
+> One limit remains: `qihse_backup_incremental_user()` is not a delta export —
+> it returns UNSUPPORTED by design, because the KV store exposes no change
+> sequence (documented in the API snippet below).
 
 ## Overview
 
@@ -43,6 +49,10 @@ qihse_repl_context_t* ctx = qihse_repl_create(REPL_ROLE_REPLICA);
 qihse_repl_connect_primary(ctx, "10.0.0.1", 5432);
 qihse_repl_start_streaming(ctx);
 qihse_repl_create_slot(ctx, "my_slot");
+/* Bind the local store that apply replays into. Borrowed, never owned; a
+   context with no store bound refuses every record rather than advancing an
+   LSN that reached no store. */
+qihse_repl_set_store(ctx, kv);
 qihse_repl_apply_wal(ctx, wal_data, len, lsn);
 ```
 
@@ -96,33 +106,61 @@ qihse_restore_user(kv, user, "/backups/full.bak");
 qihse_backup_verify_user(user, "/backups/full.bak");
 ```
 
-## Parallel Query (`src/tractable/qihse_parallel_query.c`) — NOT IMPLEMENTED
+## Parallel Query (`src/tractable/qihse_parallel_query.c`)
 
-> **Status: planned.** The entry points exist and return success, but the work
-> inside them does not: the scan workers contain
-> `TODO: actual KV store iteration with partitioning` and report a row count of
-> zero, the aggregate is `TODO: actual aggregation over KV store partition`, and
-> the join is `TODO: implement parallel hash join or merge join`. No test covers
-> this file. The description below is the design, not the code.
+> **Status: implemented.** Verified by `tests/test_parallel_query.c` (run via
+> `make test-parallel-query`) and by the `parallel-query` workload in
+> `tests/gold/pack.v1.gold`. An earlier revision of this document said the
+> module was a stub that returned success while doing nothing; that was true and
+> is no longer. What the implementation does *not* claim is stated in the header
+> and repeated here.
 
 ### Architecture
-- pthread-based worker threads
-- Data partitioning by key range or hash
-- Independent partition processing
+- pthread-based worker threads, 1..`QIHSE_PARALLEL_MAX_WORKERS` (64)
+- The keyspace traversal itself is **serial**: `qihse_kv_foreach_user()` is the
+  only enumeration the KV layer exposes and it has no prefix, range or resume
+  form, so the rows under a table prefix are materialised on the calling thread
+  and the resulting array is then partitioned across the workers (worker *i*
+  takes rows *i*, *i+num_workers*, …). Every row is visited exactly once.
+- Parallelised per-row work: the row copies a scan returns, the numeric parse an
+  aggregate needs, and the hash build/probe a join needs. A prefix/range
+  iterator in the KV API would remove the materialisation; until one exists this
+  module does not claim to have it.
 - Result merging (sum, count, avg, min, max)
 
 ### Operations
-- **Parallel scan**: Split table into chunks, scan in parallel
-- **Parallel join**: Partition both tables, join in parallel
-- **Parallel aggregate**: Compute aggregates in parallel, merge results
+- **Parallel scan**: split the materialised rows into chunks, copy them in parallel
+- **Parallel hash join**: build/probe in parallel, on a shared column name
+- **Parallel aggregate**: parse and accumulate in parallel, merge results
+
+### Security context
+Rows are read through `qihse_kv_foreach_user()` with the principal bound to the
+context (`qihse_parallel_set_user()`), so enumeration is authorization-aware. A
+context with no user bound is unclassified-only — the same deliberate mode as
+the context-free KV forms, not an authorization bypass.
+
+### Failures are reported, never folded into a result
+Every entry point returns `QIHSE_PARALLEL_OK` (0) or a negative code
+(`QIHSE_PARALLEL_ERR_ARGS`, `_UNSUPPORTED`, `_THREAD`, `_NOMEM`, `_STORE`,
+`_DATA`, `_NO_RESULT`, `_LIMIT`). A refusal exposes no partial result, so a
+caller can tell "the query ran and matched nothing" from "the query could not
+run". `avg`/`min`/`max` over an empty table are `_NO_RESULT` rather than 0, and
+a join in which either table has no row carrying the join column is `_NO_RESULT`
+rather than "0 rows matched".
 
 ### API
 ```c
 qihse_parallel_ctx_t* ctx = qihse_parallel_init(4);  // 4 workers
+qihse_parallel_set_user(ctx, user);                  // borrow the principal
 qihse_parallel_scan_t scan;
 qihse_parallel_scan(ctx, kv, "users", &scan);
 double count;
 qihse_parallel_aggregate(ctx, kv, "users", "age", "count", &count);
+qihse_parallel_join_t join;
+qihse_parallel_join(ctx, kv, "orders", "users", "user_id", &join);
+qihse_parallel_scan_free(&scan);
+qihse_parallel_join_free(&join);
+qihse_parallel_cleanup(ctx);
 ```
 
 ## Enhanced Connection Pooler (`src/spinnaker/qihse_pooler.c`)
@@ -160,7 +198,13 @@ qihse_pooler_add_backend(pool, "10.0.0.1", 5432);
    refusal to move `restart_lsn` backwards), drop, count.
 3. **WAL shipping over a real loopback socket**: the peer must receive the
    `[LSN][length][data]` frame byte-for-byte and `qihse_repl_get_status()` must
-   report it; `qihse_repl_apply_wal()` advances the flush LSN.
+   report it; `qihse_repl_apply_wal()` replays the record into the store bound
+   with `qihse_repl_set_store()` and advances the flush LSN, a retransmitted
+   record is a no-op rather than applied twice, a truncated, checksum-broken,
+   length-inconsistent or unknown-op record is refused with nothing applied and
+   no LSN advanced, and a context with no bound store refuses rather than
+   acknowledging. The `repl-apply-wal` gold workload asserts the replay
+   independently.
 4. **Refusals**: connecting to a closed port, an invalid address and a NULL host
    all fail and leave the context in `REPL_STATE_ERROR`.
 5. **Read-replica pool**: add/remove, round-robin routing with wrap-around,
@@ -170,7 +214,12 @@ qihse_pooler_add_backend(pool, "10.0.0.1", 5432);
    modes, admin-console parse and execute (`SHOW VERSION`, `SHOW POOLS`,
    `PAUSE`), databases and users.
 
-**Not covered by this test, because the code does not implement it:** parallel
-query (stubbed, see above). **Not covered because no test exists:** the
-authenticated backup/restore API in `src/tractable/qihse_backup.c`, and
-`qihse_repl_apply_wal()` actually replaying WAL records into a store.
+`tests/test_parallel_query.c` (run via `make test-parallel-query`) covers the
+parallel scan, aggregate and hash join described above, including the refusal
+codes, the inherited security context and a real `pthread_create()` failure
+(`RLIMIT_NPROC` 0) reported as `QIHSE_PARALLEL_ERR_THREAD` with no partial
+result. The speedup it measures is printed rather than asserted, because the
+traversal is serial.
+
+**Not covered because no test exists:** the authenticated backup/restore API in
+`src/tractable/qihse_backup.c`.

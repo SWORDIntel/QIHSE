@@ -1,7 +1,9 @@
 # QIHSE Overlay Protocol — Self-Forming Internet Cluster
 
-> **Status: implemented (phase 1).** Veiled bus framing, the IRC dead-drop, and
-> HMAC-SHA-384 record authentication are verified by `tests/test_overlay.c`.
+> **Status: implemented (phase 1 and phase 2).** Veiled bus framing, the IRC
+> dead-drop, HMAC-SHA-384 record authentication, and the layer-3 DHT peer
+> exchange are verified by `tests/test_overlay.c` and
+> `tests/test_dht_peer_exchange.c`.
 >
 > **Contradiction:** the status line this document carried until the labeling
 > pass said phase 1 was "pending landing (W0)"; W0 is complete and the test is
@@ -9,7 +11,7 @@
 > design still hold: layer 1 lives in the bus
 > (`qihse_bus_veil_encode`/`_decode` in `src/spinnaker/qihse_cluster_bus.c`),
 > and layer 2 authenticates with HMAC-SHA-384 rather than ML-DSA signatures.
-> Layer 3 (DHT peer exchange) is `planned`.
+> Layer 3 landed as W4.2; it is a hint source, not a routing layer — see below.
 
 ## Purpose
 
@@ -72,18 +74,67 @@ Config (daemon flags):
 Files: `src/spinnaker/qihse_overlay.c` (IRC client thread, record
 sign/verify, MEET trigger), `include/qihse_overlay.h`.
 
-### Layer 3: DHT peer exchange (simplified Kademlia)
+### Layer 3: DHT peer exchange (simplified Kademlia) — implemented (W4.2)
 
-For clusters > ~8 nodes, a full mesh doesn't scale. The DHT layer:
+**What it buys: a peer-exchange hint source, and nothing more.** A node can ask
+a peer "which peers do you know near this node id?" and get back up to k=8
+peers ordered by XOR distance to the target. It does not improve routing: slot
+ownership and membership still travel on the bus (MEET / SLOT_UPDATE), and a
+DHT reply is never consulted to decide where a key lives.
 
-- Each node maintains k-buckets (k=8) by XOR distance from its node ID
-- Peer records (endpoint + public key) stored at key = SHA-384(node_id)
-- FIND_NODE and FIND_VALUE operations over the bus (new msg types 9/10)
-- Bootstrap: IRC-discovered nodes seed the DHT routing table
-- New nodes: `FIND_NODE(self_id)` → get k closest peers → MEET each
+Implemented as bus message types **13/14**, not the 9/10 this document (and the
+roadmap) originally named — 9 and 10 were taken by `GROUP_UPDATE`/`GROUP_ACK`
+before layer 3 landed. The pair is defined in `qihse_cluster_bus.h` and
+dispatched to the overlay handlers in `src/spinnaker/qihse_overlay.c`:
 
-This is NOT implemented in phase 1. The IRC bootstrap + MEET gossip
-handles up to ~20 nodes. DHT is phase 2 for internet-scale.
+- `QIHSE_BUS_MSG_DHT_FIND` (13) — "peers near this node id?", fixed 160-byte
+  payload: version, flags, max_peers, reserved, ts, requester endpoint
+  (host/port), requester id, target id.
+- `QIHSE_BUS_MSG_DHT_NODES` (14) — up to 8 peers, nearest first, fixed 53-byte
+  header plus 107 bytes per entry.
+
+A lookup is **one hop**: a FIND is answered, never forwarded, and a NODES frame
+never causes another query, so nothing recurses. Both frames are fixed-size
+with no length field to lie about; an unknown version, a non-zero flag or
+reserved byte, a count/size mismatch, a non-literal host, the unspecified
+address, or a timestamp outside the same ±5 min replay window the IRC records
+use drops the frame whole. Replies are capped at 16/s, hint processing at
+32 entries/s, and dials at 4/s; hint state is a fixed 64-entry dedupe table, so
+a flood cannot grow it.
+
+**A DHT record is an unauthenticated HINT, enforced in code.** No signature,
+MAC or key is carried and nothing binds the node id in a record to its sender.
+The only action a record can cause is a **dial** — `qihse_cluster_bus_meet()`
+to the hinted endpoint, the same call the IRC path makes (the shared
+`overlay_dial_hint()` gate). It cannot upsert a topology node, write a
+federation identity or capability record, change a trust state, or acquire
+authority: `qihse_bus_msg_carries_authority()` is false for the DHT types and
+for MEET, and the dial path refuses to run if that ever stops being true.
+Membership is still decided by the peer's own MEET reply and by F5 enrollment —
+a discovered peer that was never enrolled resolves to no usable identity
+(`qihse_federation_node_capability_lookup_admissible()`). With a federation
+trust context configured, a hint whose derived UUID is **REVOKED** is never
+dialed: the DHT may not undo an operator decision, and it may not make one.
+
+Deltas from the original design, on purpose:
+
+- **No k-buckets and no routing table.** The responder answers from the peers
+  it already knows (the cluster topology) and ranks them by XOR distance; there
+  is no bucket maintenance to poison.
+- **No `FIND_VALUE` and no value store.** A value store reachable by an
+  unauthenticated datagram is a poisoning target with no benefit over the bus
+  that already carries the cluster's state.
+- **No public keys in DHT frames.** A key in an unauthenticated record proves
+  nothing; the signed F5 identity record is where a node's key lives.
+- **Bootstrap is still the IRC dead-drop (or a configured seed).** A FIND
+  returns peers the responder knows; it does not discover the responder.
+
+Tests: `tests/test_dht_peer_exchange.c` (CI-wired as `make test-dht-peer-exchange`),
+including the roadmap's gate — a forged, expired or hostile DHT record never
+yields membership.
+
+This is NOT a full DHT: the IRC bootstrap + MEET gossip still handles small
+clusters, and the DHT is a hint source for internet-scale discovery.
 
 ### NAT traversal
 
@@ -105,7 +156,7 @@ within the same window.
 | 1a | Veiled framing (XOR + padding) | overlay.c, bus send/recv hooks | ~100 lines |
 | 1b | IRC bootstrap client | overlay.c (IRC thread) | ~300 lines |
 | 1c | Daemon flags + wiring | qihse_cluster_daemon.c | ~50 lines |
-| 2 | DHT peer exchange | overlay.c (Kademlia buckets) | ~400 lines |
+| 2 | DHT peer exchange — **landed (W4.2)**: fixed-frame FIND/NODES, XOR ranking, no buckets | overlay.c, bus dispatch (types 13/14) | ~500 lines |
 | 3 | AI memory API | brain.c extensions | ~300 lines |
 
 ## Config reference (daemon flags)
@@ -117,6 +168,10 @@ within the same window.
 | `--irc-nick-prefix PREFIX` | Nick prefix (suffix = node_id[:8]) |
 | `--overlay-key PASSWORD` | Veiled framing key (defaults to cluster password) |
 
+The DHT (layer 3) has no daemon flag: it comes up with the IRC bootstrap and is
+disabled per deployment with `qihse_overlay_config_t.disable_dht`. It can also
+be run without IRC via `qihse_overlay_dht_start()`.
+
 ## Security
 
 - IRC records: ML-DSA-87 signed, timestamp-checked (±5 min replay window)
@@ -125,6 +180,10 @@ within the same window.
 - IRC channel: public — anyone can read the records but can't forge them
   (ML-DSA-87 signatures) and can't join the cluster without the operator
   password (RESP auth)
+- DHT records (types 13/14): **unauthenticated hints**. Timestamp-checked,
+  fixed-size, rate-limited, deduplicated, and able to cause a dial and nothing
+  else — see layer 3 above. A record never yields membership, trust or
+  authority.
 
 ## Relation to the federation direction
 
@@ -142,6 +201,8 @@ transport-obfuscation plane** and layers real membership trust on top of it
 
 Under that model an IRC dead-drop record becomes a **discovery hint**: it
 tells a node where to find a peer, but the node cannot join the federation
-until its node identity is enrolled. The phase-2 DHT remains the
-internet-scale discovery path; replication correctness moves to the plan's
+until its node identity is enrolled. The phase-2 DHT is a hint source of the
+same kind (and an even weaker one — it carries no key at all), which is why it
+was sequenced after F5: discovery can hand out addresses, enrollment still
+decides who is a member. Replication correctness moves to the plan's
 anti-entropy layer (plan §10), not gossip.

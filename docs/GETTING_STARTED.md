@@ -38,8 +38,14 @@ The normal build automatically selects supported CPU instruction paths from the 
 Equivalent Makefile workflow:
 
 ```bash
-make clean && make
+make
 ```
+
+A full rebuild is no longer required after editing a header: object rules carry
+`-MMD -MP` and the generated `.d` files are included by the Makefile, so a
+header change rebuilds exactly the objects that included it. `make clean && make`
+still works when you want a from-scratch build (for example after changing
+compiler flags or switching ISA paths), but it is not needed for a header edit.
 
 Useful alternatives:
 

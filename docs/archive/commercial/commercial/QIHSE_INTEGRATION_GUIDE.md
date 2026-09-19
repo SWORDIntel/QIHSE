@@ -1,5 +1,12 @@
 # QIHSE Technical Integration Guide
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Enterprise Deployment and Integration Manual
 
 This guide provides comprehensive instructions for integrating QIHSE into enterprise search infrastructures, database systems, and applications.

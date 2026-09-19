@@ -1,5 +1,12 @@
 # QIHSE Market Analysis & Competitive Positioning
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Executive Summary
 
 QIHSE addresses a **$245B total addressable market** with a **$59B serviceable opportunity** in the next 3-5 years. The market is characterized by rapid growth (15-20% CAGR), increasing demand for real-time data processing, and the limitations of traditional search algorithms.

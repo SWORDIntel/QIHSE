@@ -2,7 +2,29 @@
 
 > **Status: superseded** — a phase-2 design note retained for history. Current
 > memory work is documented by the memory subsystem and the
-> [technical whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md).
+> [technical whitepaper v1.1](../architecture/qihse_whitepaper_v1.1.md).
+>
+> **Do not run the commands below as written.** The four `make test-*` targets in
+> the benchmark-suite snippet — `test-memory-superposition`,
+> `test-vector-db-integration`, `test-temperature-migration` and
+> `test-preloading-performance` — do not exist in the Makefile, nor does
+> `benchmark-phase2`. The memory work that *is* in the tree is covered by the
+> `test-memory-*` targets in the default `make test` list
+> (`test-memory-planner`, `test-memory-topology-probe`, `test-memory-planner-trace`,
+> `test-memory-allocation-policy`, `test-memory-coherence`,
+> `test-memory-migration-policy`, `test-memory-migration`,
+> `test-memory-device-placement`, `test-memory-migration-backend`,
+> `test-memory-migration-scheduler`). The commands are left in place as the
+> record of what the phase intended.
+>
+> **The API names in this note are design proposals, not the current surface.**
+> `qihse_uma_create()`, `qihse_uma_allocate_superposition()`,
+> `qihse_uma_access_temperature_aware()`, `qihse_uma_enable_vector_db_preload()`,
+> `qihse_memory_create_manager()` and the other `qihse_uma_*` identifiers here
+> are declared in no header under `include/` and defined nowhere in the tree. The
+> memory surface that does exist is `include/qihse_uma.h` plus the
+> `memory/src/` modules; for the rest, use
+> [../API_REFERENCE.md](../API_REFERENCE.md).
 
 ## Overview
 

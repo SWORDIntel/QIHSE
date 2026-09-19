@@ -4,6 +4,20 @@
 > [qihse_whitepaper_v1.1.md](qihse_whitepaper_v1.1.md) for implementation
 > status. This document's own closing note ("Ready for Implementation")
 > describes intent at the time of writing, not the current tree.
+>
+> **Known defect in this snapshot, recorded rather than repaired:** the table of
+> contents links 14 subsections that have no heading in the body — 8.3,
+> 19.2-19.4, 20.1-20.4, 21.1-21.3 and 22.1-22.3. The top-level sections 19-22
+> are present and carry explicit `{#anchor}` attributes, but their subsections
+> were never written. The links are left as they are, because the snapshot is
+> the record of what was authored; use v1.1 for the current treatment.
+>
+> **The API names in this document are design proposals, not the current
+> surface.** Roughly 25 `qihse_*` identifiers appear here — `qihse_init()`,
+> `qihse_unified_malloc()`, `qihse_register_backend()`, the `qihse_auto_tuner_*`
+> family and others — that are declared in no header under `include/` and defined
+> nowhere in the tree. For the surfaces that exist, use
+> [../API_REFERENCE.md](../API_REFERENCE.md).
 
 ## Commercial Architecture Whitepaper v1.0
 

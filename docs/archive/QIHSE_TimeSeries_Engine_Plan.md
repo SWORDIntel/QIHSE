@@ -1,5 +1,12 @@
 # QIHSE Time-Series Engine Architecture Plan
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Overview
 The Time-Series Engine is designed to store high-frequency telemetry data with extreme memory efficiency while supporting fast aggregations and automatic eviction of stale data.
 

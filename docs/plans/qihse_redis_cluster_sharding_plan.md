@@ -7,6 +7,10 @@
 > failover path is a coordinator rather than the "Raft consensus" claimed in
 > [architecture/cluster_sharding.md](../architecture/cluster_sharding.md), and
 > the four commit hashes cited here do not resolve in the current history.
+> Three `file:///` links rooted at a developer home directory have been replaced
+> with the repository-relative paths the `AGENTS.md` path policy requires; the
+> targets are `src/spinnaker/qihse_crc16.c`, `qihse_cluster_numa.c` and
+> `qihse_cluster_slot.c`.
 
 > **Status**: COMPLETE — All 5 phases implemented, tested, and benchmarked.
 > See [Cluster Sharding Architecture](../architecture/cluster_sharding.md) for the full implementation reference.
@@ -174,7 +178,7 @@ QIHSE/src/spinnaker/
 
 ## 7. Deep Hardware-Aware Engine Modules
 
-### Module 1: SIMD-Dispatched CRC16 Engine ([`qihse_crc16.c`](file:///home/john/SPECTRA/QIHSE/src/spinnaker/qihse_crc16.c))
+### Module 1: SIMD-Dispatched CRC16 Engine ([`qihse_crc16.c`](../../src/spinnaker/qihse_crc16.c))
 ```c
 #include "qihse_crc16.h"
 #include "../../include/qihse_cpu_detect.h"
@@ -206,7 +210,7 @@ void qihse_crc16_init_dispatch(void) {
 }
 ```
 
-### Module 2: NUMA-Pinned Shard State ([`qihse_cluster_numa.c`](file:///home/john/SPECTRA/QIHSE/src/spinnaker/qihse_cluster_numa.c))
+### Module 2: NUMA-Pinned Shard State ([`qihse_cluster_numa.c`](../../src/spinnaker/qihse_cluster_numa.c))
 ```c
 typedef struct {
     uint32_t shard_id;
@@ -242,7 +246,7 @@ bool qihse_shard_bind_hardware(qihse_shard_worker_t* worker, int core_id, int nu
 }
 ```
 
-### Module 3: Lockless Hash Slot Routing Table ([`qihse_cluster_slot.c`](file:///home/john/SPECTRA/QIHSE/src/spinnaker/qihse_cluster_slot.c))
+### Module 3: Lockless Hash Slot Routing Table ([`qihse_cluster_slot.c`](../../src/spinnaker/qihse_cluster_slot.c))
 ```c
 typedef struct {
     /* 16,384 16-bit slot-to-shard entries (exactly 32KB — fits in L1/L2 cache) */

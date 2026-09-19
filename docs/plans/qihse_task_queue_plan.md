@@ -1,19 +1,29 @@
 # QIHSE Task Queue Engine — Celery-Equivalent Distributed Task Dispatch
 
-> **Status: implemented — contradicted by the tree.** The header says "PLANNED
-> — Not yet implemented", but the task lifecycle layer it describes exists:
-> `include/qihse_task_queue.h`, `include/qihse_task_scheduler.h`,
+> **Status: partial.** The task lifecycle layer this document describes exists
+> and is tested: `include/qihse_task_queue.h`, `include/qihse_task_scheduler.h`,
 > `include/qihse_task_worker.h` and the matching sources under
-> `src/spinnaker/`, with `tests/test_task_queue.c`,
-> `tests/test_task_scheduler.c`, `tests/test_task_worker.c` and
-> `tests/test_task_resp.c` wired as `make test-task` in the default test list.
-> The header is stale; the remaining open item is the full Celery-style task
-> composition the document itself defers. One detail is contradicted: the plan
+> `src/spinnaker/`, with `tests/test_task_queue.c`, `tests/test_task_scheduler.c`,
+> `tests/test_task_worker.c` and `tests/test_task_resp.c` wired as
+> `make test-task` in the default test list. What is **not** built is the full
+> Celery-style task composition the document itself defers, and the per-phase
+> test files the plan names in §11 (`test_task_retry.c`, `test_task_priority.c`,
+> `test_task_cancel.c`) do not exist — their behaviour is covered by
+> `tests/test_task_queue.c` instead.
+>
+> **Contradictions noted in place, not silently rewritten.** The document's own
+> header below still reads "PLANNED — Not yet implemented"; the tree contradicts
+> it and the implementation list above is the accurate statement. The plan also
 > proposes `src/marmalade/qihse_task_scheduler.{c,h}`; the module landed as
 > `src/spinnaker/qihse_task_scheduler.c` with
-> `include/qihse_task_scheduler.h`.
+> `include/qihse_task_scheduler.h`. The test table near the end of the document
+> lists `test-task-retry`, `test-task-priority` and `test-task-cancel` targets
+> that do not exist in the Makefile; the three `make test-task-*` targets that do
+> exist are `test-task-queue`, `test-task-worker` and `test-task-scheduler`,
+> plus `test-task-resp`.
 
-> **Status**: PLANNED — Not yet implemented.
+> **Original plan header (retained for design history; superseded by the status
+> line above):** PLANNED — Not yet implemented.
 > **Scope**: Focused subset — task dispatch, result storage, retry/backoff, priority queues, periodic scheduling. Full task composition (chains/groups/chords) deferred to future phase.
 
 ---

@@ -226,5 +226,9 @@ Search latency scales sublinearly: 1GB corpus (1024x more data) searches
 in only 57x more time. The index rejects 99.98% of documents at 1GB,
 so verification cost grows with matches, not corpus size.
 
-Full details: [KEYSTONE TRIGRAM_BENCHMARK.md](../../KEYSTONE/docs/TRIGRAM_BENCHMARK.md)
+Full details: KEYSTONE `docs/TRIGRAM_BENCHMARK.md`. That file lives in the
+separate KEYSTONE repository, which is a sibling checkout rather than a
+subdirectory of this tree, so there is deliberately no relative link here: a
+relative path would not resolve on another machine and `AGENTS.md` forbids an
+absolute one.
 

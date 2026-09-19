@@ -1,5 +1,12 @@
 # QIHSE Commercial FAQ
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Frequently Asked Questions
 
 This document addresses common questions, concerns, and objections about QIHSE implementation, performance claims, and business value.

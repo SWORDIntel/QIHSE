@@ -1,5 +1,12 @@
 # QIHSE-NOT_STISLA Integration Plan
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 **Integrating NOT_STISLA Optimizations into QIHSE**
 
 **Objective:** Ensure QIHSE incorporates all NOT_STISLA optimizations while maintaining its full feature set. NOT_STISLA serves as lightweight alternative for simpler use cases.

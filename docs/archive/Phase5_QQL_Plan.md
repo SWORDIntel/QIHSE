@@ -1,5 +1,12 @@
 # Phase 5: QIHSE Query Language (QQL) Engine
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## 1. Overview
 The QQL Engine will parse and execute text-based queries against the QIHSE databases. It will use a formal Grammar generated via **Tree-Sitter** to parse queries into an Abstract Syntax Tree (AST), which our C execution engine will traverse to invoke the underlying Vector, KV, Document, or Columnar stores.
 

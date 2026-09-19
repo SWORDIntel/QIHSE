@@ -1,5 +1,12 @@
 # QIHSE Phase 2: Advanced Memory Management & Vector Database Integration
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Overview
 
 Phase 2 introduces revolutionary memory management and vector database integration capabilities to QIHSE, enabling **memory superposition** across heterogeneous compute devices and **instant vector access** through intelligent pre-loading.

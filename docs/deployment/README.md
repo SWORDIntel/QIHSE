@@ -5,6 +5,13 @@
 > [architecture/federation_overview.md](../architecture/federation_overview.md)
 > and the [API reference](../API_REFERENCE.md).
 >
+> **Code samples that will not compile.** The tuning snippets below call
+> `qihse_memory_configure()`, `qihse_backend_optimize()` and
+> `qihse_ml_tune_engine()`, none of which is declared in any header under
+> `include/` or defined anywhere in the tree. They are illustrative, not a
+> current interface; use [API_REFERENCE.md](../API_REFERENCE.md) for the
+> surfaces that exist.
+>
 > **Repository rule violation:** this document contains absolute paths.
 > `AGENTS.md` requires strictly relative or dynamically resolved paths.
 
@@ -1014,4 +1021,4 @@ qihse-optimize --benchmark benchmark_results.json --profile profile_data.json --
 
 ---
 
-This deployment guide provides comprehensive instructions for production deployment of QIHSE across various environments. For additional support, consult the [User Guide](user/) or [Security Guide](security/).
+This deployment guide provides comprehensive instructions for production deployment of QIHSE across various environments. For additional support, consult the [User Guide](../manual/user/README.md) or the [Security Guide](../security/README.md).

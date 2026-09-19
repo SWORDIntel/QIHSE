@@ -1,5 +1,12 @@
 # QIHSE Return on Investment Analysis
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Executive Summary
 
 QIHSE delivers exceptional financial returns through infrastructure cost savings, performance improvements, and competitive advantages. This analysis shows **250-500% ROI** in the first year across major use cases, with **cumulative savings exceeding $1B over 5 years**.

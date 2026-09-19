@@ -2,7 +2,8 @@
 
 > **Status: partial.** The transaction manager, MVCC version store, WAL and
 > recovery all have real implementations under `src/tractable/` and are
-> exercised by `tests/test_txn.c` (run via `make test-txn`). Three limits are
+> exercised by `tests/test_txn.c` (run via `make test-txn`) and
+> `tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`). Two limits are
 > stated plainly rather than glossed over:
 >
 > 1. **SERIALIZABLE OCC validation only sees transactions that are still active
@@ -11,12 +12,19 @@
 >    a conflict with an already-committed concurrent transaction is not
 >    detected. The source says so in place, and `tests/test_txn.c` therefore
 >    asserts only the active-transaction cases.
-> 2. **`qihse_mvcc_delete()` marks the chain head, which may be a version
->    written by a transaction that later aborted.** It therefore does not always
->    delete the version readers can see. Reproduced by `tests/test_txn.c` as a
->    `NOTE` line, not asserted.
-> 3. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
+> 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
+>
+> One claim in an earlier revision of this document was wrong and is corrected
+> in place: **`qihse_mvcc_delete()` no longer marks the chain head.** It records
+> a delete intent carrying the deleting transaction and the snapshot the delete
+> is evaluated at, and the read path — which does have commit context — resolves
+> the intent so it hides exactly the versions that were visible at that
+> snapshot. Marking the head did not always delete the version readers could
+> see, because the head may be a version written by a transaction that later
+> aborted. `tests/test_txn.c` asserts the corrected behaviour and
+> `tests/test_mvcc_delete.c` asserts it in both directions, including the
+> over-correction guards.
 
 ## 1. Overview
 
@@ -180,9 +188,12 @@ int qihse_mvcc_update(qihse_mvcc_store_t* store, uint8_t engine_id,
     const void* key, size_t key_len, const void* new_value, size_t new_value_len,
     uint64_t txn_id);
 
-// Delete: set xmax on the chain head
-// NOTE: the head may be a version written by a transaction that aborted, in
-// which case the delete does not affect the version readers can see.
+// Delete: record a delete intent at the chain head, carrying the deleting
+// transaction and the snapshot the delete is evaluated at. The read path
+// resolves the intent with commit context and hides exactly the versions that
+// were visible at that snapshot; readers whose snapshot predates the delete
+// still see the row. Recording an intent instead of marking xmax matters
+// because the head may be a version written by a transaction that aborted.
 int qihse_mvcc_delete(qihse_mvcc_store_t* store, uint8_t engine_id,
     const void* key, size_t key_len, uint64_t txn_id);
 
@@ -331,7 +342,9 @@ Checkpoint procedure:
    plumbing, and refusal of a second commit or rollback.
 2. **MVCC visibility**: an older snapshot still sees the superseded version; a
    version written by an uncommitted or aborted transaction is invisible; a
-   committed delete hides the row; vacuum reclaims dead versions.
+   committed delete hides the row (including when an aborted writer preceded
+   it); deleting a missing key is an error rather than a silent success; vacuum
+   reclaims dead versions.
 3. **SAVEPOINT and partial rollback**: savepoint stack and write-set trim.
 4. **WAL append and replay**: LSN ordering, payload survival, `start_lsn`
    filtering, and refusal to replay a record whose CRC does not match.
@@ -343,9 +356,19 @@ Checkpoint procedure:
 7. **Two-phase commit**: prepare / commit_prepared / abort_prepared callback
    sequencing, and a participant whose prepare fails aborting the transaction.
 
-Reproduced as a `NOTE` line rather than asserted (so that fixing it cannot break
-the test): `qihse_mvcc_delete()` after an aborted writer leaves the row visible
-to committed readers.
+`tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`) covers delete
+semantics in both directions: a committed DELETE hides the row for readers at or
+after the deleting snapshot whatever aborted writers preceded it (aborted
+UPDATE, aborted DELETE, several aborted writers, a hole under a committed
+version), and it does **not** hide anything an older snapshot is entitled to
+see, does not hide a version written by a transaction the deleter could not see
+(silent data loss), and does not resurrect a row an earlier committed DELETE
+hid. The last three cases are the over-correction guards: they fail against a
+fix that marks xmax on every version of the chain.
+
+The `mvcc-committed-delete` gold workload
+(`tests/gold/workloads/gold_mvcc_committed_delete.c`) asserts the same rule
+independently.
 
 Not covered: the committed-transaction OCC case (not implemented, see the status
 note) and WAL segment rotation under load.

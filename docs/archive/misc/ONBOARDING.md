@@ -1,5 +1,12 @@
 # QIHSE Onboarding Guide
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 This guide gives the fastest path to use QIHSE with the most important runtime
 flows: multi-modal DB lifecycle (Vector, KV, Columnar, Time-Series, Document, Event Stream, Graph, FTS), Unified Wire Protocol (UWP) networking, trinary-backed search behavior, persistence recovery, caller-driven maintenance loops, and validation workflows.
 

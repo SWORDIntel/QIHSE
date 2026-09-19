@@ -6,13 +6,18 @@
 > not built. No test in `tests/` exercises the phases described. The document
 > also names `tests/uwp_fuzz.c`; the fuzzer in this tree is `tests/fuzz_uwp.c`.
 >
-> **Repository rule violation:** this document contains absolute `file:///`
-> links rooted at a developer home directory. `AGENTS.md` requires strictly
-> relative or dynamically resolved paths; the links as written will not resolve
-> on another machine.
+> **Repository rule violation — fixed in place.** This document contained
+> absolute `file:///` links rooted at a developer home directory, which
+> `AGENTS.md` forbids and which would not resolve on another machine. The ten
+> links have been rewritten as repository-relative paths
+> (`../../include/...`, `../../src/...`, `../../README.md`, and sibling
+> documents under `docs/security/`); the two `#L` line anchors were dropped,
+> because line anchors into another file are not stable.
 
 **Document ID:** SEC-DES-2026-08-UWP-CRYPTO  
-**Status:** PARTIALLY IMPLEMENTED (August 2026)  
+**Status: partial** — partially implemented as of August 2026; the userspace
+TLS 1.3 path exists, the kernel-TLS and AF_XDP in-kernel phases do not. This is
+the same value as the status line at the top of this document.  
 
 **Implementation note (August 2026):** Two transport encryption modes are now implemented in `src/spinnaker/qihse_uwp_tls.c`:
 
@@ -31,8 +36,8 @@
 The design document below describes the target architecture. The current implementation is a subset.
 **Author:** Antigravity Architecture & Security Group  
 **Target Systems:** QIHSE Spinnaker Network Multiplexer, eBPF/XDP Kernel Subsystem, io_uring Fast Path  
-**Audit Reference:** [UWP_AUDIT_2026-08.md](file:///fast/home/john/QIHSE/docs/security/UWP_AUDIT_2026-08.md) (Finding H7)  
-**Related Specs:** [qihse_uwp.h](file:///fast/home/john/QIHSE/include/qihse_uwp.h), [qihse_uwp.c](file:///fast/home/john/QIHSE/src/spinnaker/qihse_uwp.c), [qihse_xdp_kern.c](file:///fast/home/john/QIHSE/src/networking/qihse_xdp_kern.c), [README.md](file:///fast/home/john/QIHSE/README.md)  
+**Audit Reference:** [UWP_AUDIT_2026-08.md](UWP_AUDIT_2026-08.md) (Finding H7)  
+**Related Specs:** [qihse_uwp.h](../../include/qihse_uwp.h), [qihse_uwp.c](../../src/spinnaker/qihse_uwp.c), [qihse_xdp_kern.c](../../src/networking/qihse_xdp_kern.c), [README.md](../../README.md)  
 
 ---
 
@@ -73,7 +78,7 @@ The design document below describes the target architecture. The current impleme
 
 The QIHSE Unified Wire Protocol (UWP) is the core binary communication layer that unifies ingress across all multi-modal storage engines in the QIHSE ecosystem (Vector, KV, Document, Columnar, Time-Series, Graph, SQL, and Event Streams). 
 
-As defined in [`include/qihse_uwp.h`](file:///fast/home/john/QIHSE/include/qihse_uwp.h#L37-L45), UWP frames are preceded by a 16-byte fixed-width packed header:
+As defined in [`include/qihse_uwp.h`](../../include/qihse_uwp.h), UWP frames are preceded by a 16-byte fixed-width packed header:
 
 ```
  0                   1                   2                   3
@@ -94,7 +99,7 @@ As defined in [`include/qihse_uwp.h`](file:///fast/home/john/QIHSE/include/qihse
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Security Audit finding **H7** ([`docs/security/UWP_AUDIT_2026-08.md`](file:///fast/home/john/QIHSE/docs/security/UWP_AUDIT_2026-08.md#L267-L279)) identified three critical vulnerabilities in the wire-level implementation:
+Security Audit finding **H7** ([`docs/security/UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md)) identified three critical vulnerabilities in the wire-level implementation:
 
 1. **Cleartext Password Transmission:** When authenticating via `target_engine == QIHSE_UWP_TARGET_AUTH` (`0x00`) with `command_opcode == 0x01`, the payload contains `username\0password` transmitted as raw bytes over an unencrypted TCP socket on port `7432`.
 2. **Zero Cryptographic Framing:** The wire protocol lacks any Message Authentication Code (MAC), Authenticated Encryption with Associated Data (AEAD) envelope, or cryptographic checksum. A network adversary with intermediate access can freely tamper with routing headers, vector dimensions, keys, and values.
@@ -102,7 +107,7 @@ Security Audit finding **H7** ([`docs/security/UWP_AUDIT_2026-08.md`](file:///fa
 
 ### 1.2 Marketing & Compliance Conflict
 
-The top-level repository [`README.md`](file:///fast/home/john/QIHSE/README.md#L10) promotes QIHSE as:
+The top-level repository [`README.md`](../../README.md) promotes QIHSE as:
 * **"CNSA 2.0 Compliant"** (Commercial National Security Algorithm Suite 2.0)
 * **"FIPS 140-3"** (Federal Information Processing Standard 140-3)
 * **"Security Audited & Hardened"**
@@ -606,11 +611,11 @@ gantt
 ```
 
 ### Phase 1: OpenSSL 3.x FIPS Context Initialization
-* Update [`persistence/qihse_pqc_crypto.c`](file:///fast/home/john/QIHSE/persistence/qihse_pqc_crypto.c) to expose `qihse_tls_server_ctx_create()`.
+* Update [`persistence/qihse_pqc_crypto.c`](../../persistence/qihse_pqc_crypto.c) to expose `qihse_tls_server_ctx_create()`.
 * Configure TLS 1.3 cipher suites (`TLS_AES_256_GCM_SHA384`), elliptic curves (`P-384`, `X25519MLKEM1024`), and load server certificate/private key from `/etc/qihse/keys/`.
 
 ### Phase 2: Kernel-TLS Socket Integration in `qihse_uwp.c`
-* In [`src/spinnaker/qihse_uwp.c`](file:///fast/home/john/QIHSE/src/spinnaker/qihse_uwp.c), after accepting a client socket in the `io_uring` loop, execute the non-blocking TLS 1.3 handshake.
+* In [`src/spinnaker/qihse_uwp.c`](../../src/spinnaker/qihse_uwp.c), after accepting a client socket in the `io_uring` loop, execute the non-blocking TLS 1.3 handshake.
 * On handshake completion, query OpenSSL for the established cipher secrets via `SSL_get_shared_ciphers()` and `BIO_get_ktls_send()` / `BIO_get_ktls_recv()`.
 * Issue `setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls"))` and install TX/RX `tls12_crypto_info_aes_gcm_256` structs.
 * Transition connection state directly to `uwp_add_read(&ring, conn)` so `io_uring_prep_recv()` delivers plaintext UWP frames directly to `uwp_route_payload()`.

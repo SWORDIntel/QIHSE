@@ -1,5 +1,12 @@
 # QIHSE Technical Performance Report
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Executive Summary
 
 QIHSE (Quantum-Inspired Hilbert Space Expansion) delivers **3-7x performance improvements** on standard AVX2-only systems and **12-25x improvements** with full hardware acceleration, representing a fundamental breakthrough in search algorithm efficiency.

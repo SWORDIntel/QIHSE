@@ -328,7 +328,7 @@ later.
 
 ## 6. Prepared Statements (pgwire)
 
-**Status: not covered by any test.** The PostgreSQL wire protocol server
+**Status: partial — status unverified.** The PostgreSQL wire protocol server
 (`src/spinnaker/qihse_pg_wire.c`) implements the extended query protocol's
 Parse / Bind / Describe / Execute / Close / Sync message handling, and
 `QIHSE_PG_MAX_PREPARED` is 64. Two corrections to the previous revision of this

@@ -1,5 +1,12 @@
 # QIHSE Columnar OLAP Engine Plan
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## 1. Overview
 The QIHSE Columnar OLAP Engine provides high-performance, SIMD-accelerated columnar storage for analytical workloads. Unlike the row-based document store, data here is stored in contiguous, type-homogeneous blocks (columns) optimized for aggregations, scans, and CPU cache locality.
 

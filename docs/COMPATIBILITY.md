@@ -4,10 +4,17 @@
 > verification is uneven. RESP, pub/sub, pgwire cluster and the UWP bridge have
 > tests (`tests/test_resp_cluster.c`, `tests/test_resp_pubsub.c`,
 > `tests/test_pg_wire_cluster.c`, `tests/test_resp_security_regression.c`), and
-> SQLite VFS has `tests/test_sqlite_vfs.c`. Bolt has no test at all (see
-> [architecture/bolt_protocol.md](architecture/bolt_protocol.md)), and the
-> MongoDB, ClickHouse, Elasticsearch and InfluxDB surfaces have no dedicated
-> tests in `tests/`.
+> SQLite VFS has `tests/test_sqlite_vfs.c`. MongoDB has `tests/test_mongo_wire.c`
+> and `tests/test_mongo_wire_security.c`. Bolt has `tests/test_bolt.c`, which
+> covers the codec, framing, handshake and message loop — it does **not** verify
+> driver compatibility, and the adapter still discards `RUN` results and has no
+> result cursor (see
+> [architecture/bolt_protocol.md](architecture/bolt_protocol.md)). The
+> ClickHouse, Elasticsearch and InfluxDB surfaces have no dedicated test beyond
+> the handler-entry-point coverage in `tests/test_phase_c.c`.
+>
+> Two claims in an earlier revision of this document were wrong: Bolt does have
+> a test, and MongoDB does have dedicated tests.
 
 QIHSE exposes compatibility layers for several established database protocols and client ecosystems. This lets existing applications reach QIHSE without requiring every workload to adopt the native UWP interface immediately.
 
@@ -80,26 +87,45 @@ Cluster-oriented work includes Redis-compatible hash-slot routing and sharding a
 
 ## MongoDB wire protocol
 
+**Status: implemented** — BSON handling, framing, the in-memory catalog, command
+dispatch and the TCP server are all in `src/spinnaker/qihse_mongo_wire.c` and
+are covered by `tests/test_mongo_wire.c`; the invariant-3 negative authorization
+test is `tests/test_mongo_wire_security.c`.
+
 The MongoDB compatibility layer includes BSON handling and wire-protocol operations for:
 
 - insert
 - find
 - update
 - delete
-- findAndModify
-- count
-- collection management
-- index management
+- count and distinct
+- collection and database management (`listCollections`, `listDatabases`, drop)
 - query operators such as comparison, boolean, existence, set-membership, and regex predicates
-- aggregation stages including match, group, sort, limit, skip, project, unwind, and lookup
+- aggregation stages match, group, sort, limit, skip, count, project and unwind
+
+Limits, stated rather than implied. `$lookup` (and `$facet`/`$graphLookup` and
+computed expressions) are refused with `NOT_IMPLEMENTED` rather than silently
+dropped. `findAndModify`, `getMore`, `createIndexes` and `listIndexes` are
+refused loudly — there is no secondary-index management surface and every cursor
+is returned as a single batch with id 0. `$where` is not evaluated (there is no
+server-side JavaScript) and a filter using it is refused. An earlier revision of
+this document listed `findAndModify` and index management as supported; they are
+not.
 
 Implementation: `src/spinnaker/qihse_mongo_wire.c`.
 
 ## Neo4j / Bolt / Cypher
 
-QIHSE exposes a Bolt 4.x-compatible protocol path with PackStream serialization and graph-native execution.
+**Status: partial.** The Bolt 4.x protocol path (PackStream serialization,
+handshake, framing, message loop) is implemented and covered by
+`tests/test_bolt.c`, and Cypher executes through the graph engine
+(`tests/test_graph.c`). The adapter is **not** driver-compatible: `RUN`
+dispatches the Cypher and then discards the result, and `PULL` returns a single
+empty record with no result cursor, so a stock neo4j driver will not see query
+results. See [Bolt protocol](architecture/bolt_protocol.md) for the exact
+deviations.
 
-Supported graph-facing functionality includes:
+Graph-facing functionality includes:
 
 - HELLO / RUN / PULL
 - BEGIN / COMMIT / ROLLBACK

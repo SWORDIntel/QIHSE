@@ -9,6 +9,12 @@
 > (`src/spinnaker/qihse_uwp_secure.c`) requires certificate-backed TLS 1.3 by
 > default and refuses cleartext unless `QIHSE_UWP_ALLOW_INSECURE=1` is set, as
 > the root README states. Later commits changed this default.
+>
+> **Path policy note.** The remediation section reproduces the command lines
+> that were actually run, including absolute `--add-dir`/`-C` paths from the
+> machine the audit ran on. They are retained as the record of what was executed
+> and are not intended to be re-run as written; `AGENTS.md` requires new
+> documentation to use relative or dynamically resolved paths.
 
 **Date:** 2026-08-23
 **Auditor:** Devin (Claude Opus 4.7, Medium)

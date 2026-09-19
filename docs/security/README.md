@@ -19,11 +19,11 @@ This guide details the security features, access control architecture, and CNSA 
 2. [CNSA 2.0 Alignment (In Progress)](#cnsa-20-alignment-in-progress)
 3. [Cryptographic Operations](#cryptographic-operations)
 4. [Key Management](#key-management)
-5. [Access Control](#access-control)
+5. [Access Control & Security Clearances](#access-control--security-clearances)
 6. [Audit and Logging](#audit-and-logging)
 7. [Secure Communication](#secure-communication)
 8. [Threat Mitigation](#threat-mitigation)
-9. [Compliance Verification](#compliance-verification)
+9. [Compliance Verification (Targeted — Not Yet Certified)](#compliance-verification-targeted--not-yet-certified)
 
 ## Security Architecture
 
@@ -92,7 +92,7 @@ QIHSE implements a comprehensive security architecture following defense-in-dept
 
 ## CNSA 2.0 Alignment (In Progress)
 
-> **Status:** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented and active for `.qdb` container encryption, audit log signing, and transport encryption. See [`hardening-report.md`](hardening-report.md) for the current security posture.
+> **Status: partial.** QIHSE targets CNSA 2.0 alignment but has **not** completed formal compliance certification. The algorithms below are implemented and active for `.qdb` container encryption, audit log signing, and transport encryption. See [`hardening-report.md`](hardening-report.md) for the current security posture. Certification is never inferred from implemented cryptography.
 
 ### Approved Cryptographic Algorithms
 
@@ -880,4 +880,4 @@ qihse_security_tester_destroy(tester);
 
 ---
 
-This security guide provides comprehensive coverage of QIHSE's security architecture and CNSA 2.0 alignment goals. **QIHSE has not yet completed formal CNSA 2.0 compliance certification or FIPS 140-3 validation, and transport encryption is not yet implemented.** For deployment-specific security configurations, see the [Deployment Guide](deployment/). For security incident response procedures, contact your security operations center.
+This security guide provides comprehensive coverage of QIHSE's security architecture and CNSA 2.0 alignment goals. **QIHSE has not yet completed formal CNSA 2.0 compliance certification or FIPS 140-3 validation, and transport encryption is not yet implemented.** For deployment-specific security configurations, see the [Deployment Guide](../deployment/). For security incident response procedures, contact your security operations center.

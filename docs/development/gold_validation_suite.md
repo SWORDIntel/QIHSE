@@ -76,54 +76,67 @@ gap <id> area=<id> reason="<why this cannot be tested today>"
   reason is also written to stderr.
 * exit **2** — `--strict`/`GOLD_STRICT=1` and the verdict is not fully green.
 
-## Coverage of the eight areas named by W5.3
+## Coverage of the areas named by W5.3
 
-| Area | Workloads | Coverage | What is not covered (recorded as `gap`) |
+The pack has grown from the eight areas W5.3 named to nine: `ai-fabric` was
+added after three shipped fabric features were found to be correct code
+resolving to nothing for three commits, and nothing reported it. The table
+below is the current state of the pack: 42 workloads, every one declared
+`expect=pass`, and 9 recorded gaps. The counts are read from
+`tests/gold/pack.v1.gold`; run `make test-gold` for the runtime verdict.
+
+| Area | Workloads | Declared | What is not covered (recorded as `gap`) |
 |---|---|---|---|
-| ANN + rerank | 3 | 3 pass | the qtri/qmag persisted-sidecar rerank path, because the shipped persistence suite aborts at case 1 |
-| Relational | 4 | 3 pass, 1 known-bug | no end-to-end SQL-over-storage test; UPDATE SET-list and DELETE WHERE structure remain documented parser gaps |
+| ANN + rerank | 3 | 3 pass | — |
+| Relational | 6 | 6 pass | no end-to-end SQL-over-storage test: SQL INSERT does not yet populate the mutable row store that UPDATE/DELETE execute against |
 | Graph | 1 | 1 pass | `qihse_graph_vector.c` (graph+vector hybrid) has no test |
 | FTS + vector fusion | 2 | 2 pass | fusion is in-process only; no adapter/server path and no fused-ranking gate |
-| Persistence / recovery | 3 | 1 pass, 1 known-fail, 1 known-bug | the shipped persistence suite's WAL/torn-tail/corruption/compaction/trinary cases do not run |
-| Protocol compatibility | 4 | 2 pass, 1 known-fail, 1 known-bug | RESP/HTTP/ES/ClickHouse/Influx end-to-end compatibility; no Bolt negative-authorization test (invariant 3) |
+| Persistence / recovery | 3 | 3 pass | — |
+| Protocol compatibility | 5 | 5 pass | RESP/HTTP/ES/ClickHouse/Influx end-to-end compatibility; no Bolt negative-authorization test (invariant 3) |
 | Distributed failure | 4 | 4 pass | scenarios are in-process simulation; no real multi-process peer kill |
-| Security regressions | 14 | 12 pass, 1 known-fail, 1 known-bug | 8 of the 16 `tests/security-regression.mk` targets are runnable but omitted to bound the default run |
+| Security regressions | 15 | 15 pass | 8 of the 16 `tests/security-regression.mk` targets are runnable but omitted to bound the default run |
+| AI fabric | 3 | 3 pass | no remote job dispatch; `inference` and `index-build` have no executor |
 
 Every gap is also printed by the runner and counted in the verdict, so the
 suite cannot report an untested area as covered.
 
-## Known defects recorded (not fixed here)
+## Defects that were recorded and have since been fixed
 
-The suite records the true state; it does not repair it.
+The suite records the true state; it does not repair it. The entries below were
+recorded as `known-bug` when this document was first written and now report
+`GOLD: OK` — the pack's `protocol-compat-probe`, `mvcc-committed-delete` and
+`repl-apply-wal` workloads assert the fixed behaviour. They are kept here
+because a stale "known defect" list is itself a documentation defect:
 
-* **Bolt message signatures disagree with Bolt 4.x** — 7 of 13 implemented
-  signatures differ (`RUN`, `PULL`, `DISCARD`, `BEGIN`, `COMMIT`, `ROLLBACK`,
-  `RESET`), demonstrated on the wire: a spec-conformant `RESET` (0x0F) is
-  answered `IGNORED` (0x7E) instead of `SUCCESS`. See
-  `docs/architecture/bolt_protocol.md`.
-* **MongoDB wire protocol declared but absent** — 13 of 13 declared server,
-  message-parsing, catalog and dispatch entry points are not defined by
-  `libqihse.so`; only the BSON helper layer is compiled in.
-  See `include/qihse_mongo_wire.h`.
-* **`qihse_repl_apply_wal` records an LSN without replaying** — a valid WAL
-  record (proved replayable through `qihse_wal_replay`) leaves the target store
-  unchanged. See `docs/architecture/replication_backup.md`.
-* **A committed MVCC delete can leave its row visible** — when the chain head is
-  a version written by an aborted transaction, the delete marks a version no
-  reader can see. See `docs/architecture/transactions_mvcc.md`.
-* **A NULL security context is replaced by the operator identity** —
-  `qihse_vector_db_search()` substitutes `qihse_auth_get_user(0)` for
-  `query.user == NULL` instead of failing closed, contrary to `AGENTS.md`
-  invariant 1. Vector rows are currently written `UNCLASSIFIED`, so no
-  classified payload is disclosed yet.
-* **`tests/qihse_vector_db_persistence_test.c` aborts at its first case** — it
-  never initialises auth and passes `user = NULL`, so the search is refused with
-  `EACCES`. Recorded as `known-fail` with the failure text matched; the test was
-  not weakened to make the suite green.
-* **`tests/test_vector_skip_integrity.c` aborts** — assertion at line 68
-  (`reader.skip_integrity`).
-* **`tests/test_pg_wire_cluster.c` dies on SIGPIPE** — no output, `make` reports
-  `Error 141`; the root cause is undiagnosed.
+* **Bolt message signatures disagreed with Bolt 4.x** — all thirteen
+  `QIHSE_BOLT_MSG_*` constants now match the specification, and a
+  spec-conformant `RESET` (0x0F) is answered with SUCCESS on the wire. See
+  `docs/architecture/bolt_protocol.md` for the deviations that remain (the
+  adapter still discards `RUN` results).
+* **MongoDB wire protocol declared but absent** — all declared server,
+  message-parsing, catalog and dispatch entry points are defined by
+  `libqihse.so`; 17 `mongo_*`/`qihse_mongo_*` symbols are exported, and the
+  adapter is covered by `tests/test_mongo_wire.c` and
+  `tests/test_mongo_wire_security.c`.
+* **`qihse_repl_apply_wal` recorded an LSN without replaying** — the applier
+  stages the record and replays it through `qihse_wal_replay()`, and a context
+  with no bound store refuses rather than acknowledging.
+* **A committed MVCC delete could leave its row visible** — the delete records
+  an intent resolved against the deleting snapshot, so it hides exactly the
+  versions its transaction could see, without hiding versions the deleter never
+  saw. See `docs/architecture/transactions_mvcc.md`.
+* **A NULL security context was replaced by the operator identity** —
+  `qihse_vector_db_search()` now fails closed with `EACCES` and materialises
+  nothing; the `null-security-context` workload asserts it.
+* **`tests/qihse_vector_db_persistence_test.c` aborted at its first case** — the
+  suite now initialises auth and passes an authenticated principal, and
+  `make test-persist` passes in full (`persistence-regression-suite`).
+* **`tests/test_vector_skip_integrity.c` aborted** — the malformed-tryte
+  rejection path now runs to completion (`vector-skip-integrity`).
+
+Still recorded as defects or open items in the current pack: nothing. Every
+workload in `pack.v1.gold` is `expect=pass` and the only caveats the runner
+prints are the nine `gap` entries above.
 
 ## Maintenance
 
@@ -134,3 +147,9 @@ The suite records the true state; it does not repair it.
   cite the fix in `ROADMAP.md` §1.1).
 * Changing the grammar: bump `pack-version`, add `pack.v<N+1>.gold`, and switch
   `GOLD_PACK` deliberately.
+* The pack's own comments are part of the record. Where a workload's comment
+  block still describes the defect it was written to catch (for example
+  `tests/gold/workloads/gold_mvcc_committed_delete.c` and
+  `tests/gold/workloads/gold_repl_apply_wal.c`), that is the probe's rationale,
+  not a current claim; the `GOLD: OK` line and the pack's `output=` substring
+  are what the runner asserts.

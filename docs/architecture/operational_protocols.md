@@ -3,15 +3,20 @@
 > **Status: partial.** `tests/test_phase_c.c` (run via `make test-phase-c`) now
 > exists and covers CDC, the metrics registry, tracing, HTTP request parsing and
 > helpers, BSON, the Elasticsearch/InfluxDB/ClickHouse handler entry points, the
-> compaction context and the SQL-extension parsers. Several surfaces described
-> below are **not implemented** and are marked in place:
+> compaction context and the SQL-extension parsers. One earlier claim in this
+> document was wrong and is corrected in place:
 >
-> - **The MongoDB wire protocol is not implemented.** `include/qihse_mongo_wire.h`
+> - **The MongoDB wire protocol is implemented.** `include/qihse_mongo_wire.h`
 >   declares `mongo_msg_parse()`, `mongo_msg_get_document()`, `mongo_catalog_*()`,
->   `mongo_dispatch_command()` and `qihse_mongo_server_*()`, but none of them
->   exists in any source file and `libqihse.so` exports no `mongo_*` symbol at
->   all. Only the BSON codec (`bson_*`) and the query matcher (`bson_match`) are
->   real, and that is what `tests/test_phase_c.c` covers.
+>   `mongo_dispatch_command()` and `qihse_mongo_server_*()`; every one of them is
+>   defined in `src/spinnaker/qihse_mongo_wire.c`, and `libqihse.so` exports
+>   seventeen `mongo_*` / `qihse_mongo_*` symbols. An earlier revision of this
+>   document said the wire protocol was declared but defined nowhere. It is
+>   covered by `tests/test_mongo_wire.c` (framing, catalog, command dispatch and
+>   server) and by `tests/test_mongo_wire_security.c` (the `AGENTS.md`
+>   invariant-3 low-clearance/high-data negative test); the `mongo-wire` and
+>   `protocol-compat-probe` workloads in `tests/gold/pack.v1.gold` assert the
+>   same state.
 > - **The Elasticsearch query DSL and aggregations, and the InfluxQL parser, are
 >   not covered by any test.** `tests/test_phase_c.c` exercises the health/ping
 >   handlers, route registration and the dispatcher only.
@@ -42,30 +47,55 @@ qihse_cdc_emit(ctx, CDC_OP_INSERT, "users", "user:1", NULL, 0, new_val, len);
 - **LSN tracking**: Monotonically increasing LSN per event
 - **Thread-safe**: Mutex-protected subscription list
 
-## MongoDB Wire Protocol (`src/spinnaker/qihse_mongo_wire.c`) — PARTIALLY IMPLEMENTED
+## MongoDB Wire Protocol (`src/spinnaker/qihse_mongo_wire.c`)
 
-**Status: partial.** The BSON layer is real and covered by
-`tests/test_phase_c.c`; the wire protocol and server are not implemented at all.
-
-Implemented (`src/spinnaker/qihse_mongo_wire.c`, all `bson_*` symbols exported):
+**Status: implemented.** The BSON codec, the wire protocol, the catalog, the
+command dispatcher and the TCP server are all in this one file, and all of them
+are covered by `tests/test_mongo_wire.c` (`make test-mongo-wire`); the
+invariant-3 negative authorization test is
+`tests/test_mongo_wire_security.c` (`make test-mongo-wire-security`).
 
 - **BSON codec**: int32, int64, double, string, bool, null, document, array,
   binary, datetime, timestamp, ObjectId, Regex, MinKey, MaxKey — build and
   iterate, plus `bson_to_json`, `bson_find_element`, `bson_find_path`,
-  `bson_set_field`, `bson_remove_key`, `bson_copy`.
+  `bson_set_field`, `bson_remove_key`, `bson_copy`. Nested documents declare
+  their own length and terminator, including when the last element is an int32.
+- **Framing**: `mongo_msg_parse()` accepts OP_REPLY, OP_QUERY, OP_INSERT,
+  OP_UPDATE, OP_DELETE, OP_MSG and the legacy OP_MSG form, and refuses a
+  declared length that overruns the bytes present, an unknown opcode,
+  OP_COMPRESSED, a checksummed OP_MSG, a document-sequence section and a
+  document that is not NUL-terminated.
 - **Query matching**: `bson_match()` and `bson_match_operator()` over a BSON
-  filter document, and `bson_apply_update()`.
-- **Query operators**: the matcher implements the `$eq`/`$gt`/`$gte`/`$lt`/
-  `$lte`/`$ne`/`$in`/`$nin`/`$and`/`$or`/`$not`/`$exists`/`$regex` family. Not
-  covered by any test.
+  filter document, and `bson_apply_update()`. The matcher implements
+  `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$and`/`$or`/`$nor`/`$not`/
+  `$exists`/`$type`/`$regex`/`$mod`/`$all`/`$elemMatch`/`$size`, and the
+  update operators `$set`/`$unset`/`$setOnInsert`/`$inc` plus array modifiers
+  (`$each`, `$position`, `$slice`, `$sort`). `$where` is **not evaluated** —
+  there is no server-side JavaScript — and a filter that uses it is refused
+  rather than silently matching everything.
+- **Catalog and dispatch**: an in-memory catalog (`mongo_catalog_create()`,
+  `mongo_catalog_create_auth()`, `mongo_catalog_bind_user()`,
+  `mongo_catalog_get_db()`, `mongo_db_get_collection()`,
+  `mongo_catalog_get_collection()`, `mongo_catalog_drop_collection()`), a
+  user-aware dispatcher (`mongo_dispatch_command_as()`, `mongo_dispatch_command()`)
+  and the commands ping, hello, insert, find, count, distinct, update, delete,
+  aggregate, listCollections, listDatabases and drop. `getMore` and
+  `createIndexes` are refused loudly rather than accepted and ignored.
+- **Aggregation pipeline**: `$match`, `$group`, `$sort`, `$limit`, `$skip`,
+  `$count`, `$project`, `$unwind`. `$lookup`, `$facet`, `$graphLookup` and
+  computed expressions are refused with `NOT_IMPLEMENTED` rather than silently
+  dropped.
+- **Server**: `qihse_mongo_server_create()`, `_start()`, `_stop()`,
+  `_destroy()` over a per-client thread, with the authenticated principal
+  threaded through to the KV/document layer. A NULL principal is refused with
+  code 13 and no payload.
 
-**Not implemented** (declared in the header, defined nowhere, no exported
-symbols): the wire protocol (OP_REPLY, OP_INSERT, OP_QUERY, OP_UPDATE,
-OP_DELETE, OP_MSG), the TCP server (`qihse_mongo_server_*`), the per-client
-threading, the document-store routing, CRUD entry points, the aggregation
-pipeline ($match, $group, $sort, $limit, $skip, $project, $unwind, $lookup), the
-admin commands and the in-memory catalog (`mongo_catalog_*`,
-`mongo_dispatch_command`).
+The whole surface is restricted to the caller's clearance: the pipeline runs
+over exactly the documents the principal may read, and every reply document
+passes one gate — the static `mongo_reply_doc()` in
+`src/spinnaker/qihse_mongo_wire.c` — which drops any document the principal may
+not see and strips the stored classification/SCI metadata before the frame is
+written.
 
 ## HTTP/REST API (`src/spinnaker/qihse_http_api.c`)
 
@@ -298,8 +328,9 @@ separate and partial — see [bolt_protocol.md](bolt_protocol.md).
    content-type), the JSON helpers, the response helpers, and route
    registration.
 5. **MongoDB**: the BSON codec (all documented types, self-describing length,
-   iteration, field lookup), query matching, and JSON export. The wire protocol
-   is absent and is reported as a `NOTE`.
+   iteration, field lookup), query matching, and JSON export. The wire protocol,
+   catalog, dispatcher and server are covered by `tests/test_mongo_wire.c`, not
+   by this file.
 6. **Elasticsearch / InfluxDB / ClickHouse**: the health, ping and query handler
    entry points answer, and route registration succeeds.
 7. **Compaction**: context lifecycle, background start/stop idempotence, and
@@ -309,6 +340,7 @@ separate and partial — see [bolt_protocol.md](bolt_protocol.md).
    SAMPLE, SETTINGS and the function detector.
 
 Not covered by this file, and not claimed: the Redis/RESP surface and Cypher
-(named tests above), the MongoDB aggregation pipeline and query operators, the
-Elasticsearch query DSL and aggregations, the InfluxQL parser, the HTTP server
-socket loop, and per-engine compaction semantics.
+(named tests above), the MongoDB aggregation pipeline and query operators
+(covered by `tests/test_mongo_wire.c` instead), the Elasticsearch query DSL and
+aggregations, the InfluxQL parser, the HTTP server socket loop, and per-engine
+compaction semantics.

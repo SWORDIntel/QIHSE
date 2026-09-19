@@ -3,8 +3,15 @@
 > **Status: implemented** — every C function in this reference is declared in a
 > header under `include/` and is exported by the built `libqihse.so`; the Python
 > surface is read from `python/qihse/`. Nothing here is transcribed from a design
-> document. The one section that describes something not built is marked
-> `planned` in place ([§11](#11-known-gaps-and-unverified-areas)).
+> document. The sections that describe something not built are marked `planned`
+> or `partial` in place ([§12](#12-known-gaps-and-unverified-areas)).
+>
+> **Coverage.** The original nine headers of the federation data plane are
+> covered in [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh).
+> [§8](#8-additional-public-c-surfaces) adds the public surfaces that were
+> outside that set when this reference was first written: replication apply,
+> the table-store DML primitives, parallel query, AI memory, the KEYSTONE change
+> feed, the MongoDB wire adapter, and the derived cluster-node federation UUID.
 
 This is the reference surface for the public C API, the Python SDK, protocol
 compatibility, and configuration knobs. It is deliberately narrower than the
@@ -24,20 +31,31 @@ the header list was checked against the built shared object:
 nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
-All 244 functions declared across the nine headers this reference covers —
-`include/qihse_federation.h` (110), `include/qihse_federation_mtls.h` (8),
-`include/qihse_federation_repl.h` (13),
-`include/qihse_federation_transport.h` (15),
-`include/qihse_federation_rejoin.h` (6), `include/qihse_operations.h` (23),
-`include/qihse_backup.h` (9), `include/qihse_kv_store.h` (26) and
-`include/qihse_auth.h` (34) —
-resolve to a definition, with one expected exception: `qihse_kv_get()`,
-`qihse_kv_del()` and `qihse_kv_exists()` are `static inline` wrappers in
-`include/qihse_kv_store.h`, so they compile into the caller rather than
-appearing as library symbols. There is no header-only declaration in these
-areas. That is a stronger statement than "the source file exists", so a
-function that appears here is safe to call; a function that does not appear here
-has not been verified and should be read in its header first.
+The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
+declare 252 `qihse_*` functions between them, and 249 of those resolve to a
+symbol in `libqihse.so`. The three that do not are the expected exception:
+`qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
+wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
+than appearing as library symbols. [§8](#8-additional-public-c-surfaces) adds
+the remaining public headers on the same terms. There is no header-only
+declaration in any of these areas. That is a stronger statement than "the
+source file exists", so a function that appears here is safe to call; a
+function that does not appear here has not been verified and should be read in
+its header first.
+
+The per-header split, as counted by the command above:
+
+| Header | Declared | Exported |
+|---|---|---|
+| `include/qihse_federation.h` | 118 | 118 |
+| `include/qihse_federation_mtls.h` | 8 | 8 |
+| `include/qihse_federation_repl.h` | 13 | 13 |
+| `include/qihse_federation_transport.h` | 15 | 15 |
+| `include/qihse_federation_rejoin.h` | 6 | 6 |
+| `include/qihse_operations.h` | 23 | 23 |
+| `include/qihse_backup.h` | 9 | 9 |
+| `include/qihse_kv_store.h` | 26 | 23 (3 `static inline`) |
+| `include/qihse_auth.h` | 34 | 34 |
 
 ## Conventions
 
@@ -67,7 +85,7 @@ has not been verified and should be read in its header first.
   handles are released by the matching `_destroy`/`_close`/`_free` function
   named in the same section.
 - **Persistence keys.** Federation state is stored in the caller-supplied KV
-  store under documented prefixes; see [§10](#10-configuration-knobs) for the
+  store under documented prefixes; see [§11](#11-configuration-knobs) for the
   prefix inventory. Nothing in this API opens its own database.
 
 ---
@@ -256,7 +274,8 @@ Signed gossip:
 | `const char* qihse_gossip_result_name(qihse_gossip_result_t result)` | Name of an accept/reject result. | `NULL` |
 | `bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip, uint8_t* out, size_t out_cap, size_t* out_len)` | Serialise the signed region (every field except the signature), little-endian and length-prefixed. | `false` |
 | `bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len, qihse_federation_gossip_t* out)` | Parse a statement; validates magic, version, algorithm and length fields before returning. | `false` — a malformed frame never reaches the verifier |
-| `size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg)` | Total wire size for an algorithm. | `0` |
+| `size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg)` | Total wire size for an algorithm at the default statement version. | `0` |
+| `size_t qihse_federation_gossip_wire_size_v(uint16_t version, qihse_sig_alg_t alg)` | Total wire size for an explicit version, so a sender can size an older frame as well as the current one. A producer that writes a non-default version must use this form or its size check will not match its frame. | `0` for an unknown version |
 | `bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip)` | Sign in place with an `EVP_PKEY*` from `_node_key_load`. | `false` |
 | `bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len, const qihse_federation_gossip_t* gossip)` | Verify against a raw public key using the algorithm named inside the statement. | `false` |
 | `bool qihse_federation_heartbeat_serialize(const qihse_federation_heartbeat_t* hb, uint8_t* out, size_t out_cap, size_t* out_len)` | Serialise the cheap 80-byte heartbeat. | `false` |
@@ -266,6 +285,47 @@ Signed gossip:
 | `bool qihse_federation_gossip_statement_read(void* store, void* user, const qihse_uuid_t* sender_node, const qihse_uuid_t* boot_id, qihse_federation_gossip_t* out)` | Read the recorded statement for a `(sender, boot)`. | `false` if the node has not signed |
 | `qihse_gossip_result_t qihse_federation_gossip_accept(void* store, void* user, const qihse_federation_gossip_t* gossip)` | Accept an authority-bearing frame: magic/version, sender trust state, signature against the enrolled key, replay window. | `QIHSE_GOSSIP_REJECT_MALFORMED`/`_VERSION`/`_UNKNOWN_SENDER`/`_UNTRUSTED_SENDER`/`_BAD_SIGNATURE`/`_REPLAY` |
 | `bool qihse_federation_replay_state_read(void* store, void* user, const qihse_uuid_t* sender_node, const qihse_uuid_t* boot_id, qihse_federation_replay_state_t* out)` | Read the persistent replay window (`fedreplay:<node>:<boot>`). | `false` |
+
+Algorithm-agile detached signatures (federation upgrade plan §17). The
+membership statement above is one consumer of a signature; a durable record that
+must be attributable — a brain decision, a supply-chain attestation — is
+another. These primitives keep the algorithm knowledge in the module that owns
+the algorithm table, so a consumer never hard-codes a key type name:
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_federation_pkey_sig_alg(void* pkey, qihse_sig_alg_t* out)` | Algorithm of a loaded key handle (an `EVP_PKEY*` from `qihse_federation_node_key_load()`). | `false` for a key type the federation does not support |
+| `bool qihse_federation_sign(void* pkey, const uint8_t* data, size_t data_len, uint8_t* out_sig, size_t* in_out_len)` | Sign `data` with a loaded key. `*in_out_len` is the capacity of `out_sig` on entry and receives the bytes written; the capacity must be at least the algorithm's signature size. The caller is responsible for putting the algorithm inside the signed bytes, so an algorithm-downgrade edit invalidates the signature rather than reinterpreting it. | `false` |
+| `bool qihse_federation_verify(qihse_sig_alg_t alg, const uint8_t* public_key, size_t public_key_len, const uint8_t* data, size_t data_len, const uint8_t* signature, size_t signature_len)` | Verify a detached signature. The declared key and signature lengths are validated against the algorithm's fixed sizes before any crypto runs, so a truncated or padded signature never reaches the verifier. | `false` |
+
+These three are used in production paths (`src/federation/qihse_federation.c`,
+`src/spinnaker/qihse_cluster_brain.c`) and are exercised indirectly — including
+an algorithm-downgrade refusal — by `tests/test_brain_fed_journal.c`, which
+verifies signed decision envelopes through `qihse_cluster_brain_decision_verify()`.
+No test calls them directly, so their own status is
+`partial — status unverified` at the entry-point level.
+
+### 1.7 W2.4 — durable node capability records (`federation/node/<uuid>`)
+
+Source: `src/federation/qihse_federation.c`.
+Tests: `tests/test_node_cap_records.c` (durability across a restart, both
+producer paths, trust and admissibility, malformed-record refusal), and the
+`gold-fabric-durable-caps` workload in `tests/gold/pack.v1.gold` for the
+topology-node-to-UUID chain that makes the record reachable at all.
+
+The stored values are always a **claim**, never an attested fact: a signature
+proves which node made the claim, not that the hardware exists. A self-report
+carries `QIHSE_CAP_FLAG_ATTESTED` clear and nothing in the library sets that
+flag. The trust state in the record is a snapshot taken at admission, for
+attribution and audit — it is not authorization, which is why the admissible
+accessor re-reads the identity record.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `const char* qihse_capability_source_name(qihse_capability_source_t source)` | `"none"`, `"local-probe"`, `"signed-statement"`, `"operator"`, and `"unknown"` for a value outside the enum. | never `NULL` |
+| `bool qihse_federation_node_capability_record_local(void* store_void, void* user_void, const qihse_uuid_t* node_id, const qihse_federation_capability_values_t* values)` | Record the local node's own hardware probe. The trust snapshot is read from the node's identity record when one exists (UNKNOWN otherwise), never supplied by the caller, and the source is always `LOCAL_PROBE`. An out-of-range ISA tier is refused. | `false` |
+| `bool qihse_federation_node_capability_lookup(void* store_void, void* user_void, const qihse_uuid_t* node_id, qihse_federation_node_capability_t* out)` | Read the durable record. The body's node id must agree with the key, every field is range-checked and an unknown record version is refused. This does **not** check trust: it returns what is stored, for audit and provenance. | `false` |
+| `bool qihse_federation_node_capability_lookup_admissible(void* store_void, void* user_void, const qihse_uuid_t* node_id, qihse_federation_node_capability_t* out)` | Read a capability record **and** require that the node is APPROVED right now. The identity record is re-read, so a revocation invalidates capability data admitted earlier. This is the accessor a placement decision must use. | `false` |
 
 ---
 
@@ -449,7 +509,7 @@ would silently truncate.
 | `void qihse_federation_tls_server_destroy(qihse_fed_tls_server_t* server)` | Release the context. | n/a |
 | `bool qihse_federation_tls_server_requires_client_cert(const qihse_fed_tls_server_t* s)` | True by default; exposed so the setting is visible and testable. | `false` |
 | `qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* server, int fd, qihse_peer_verdict_t* out_verdict)` | Server-side handshake on a connected fd; the three-layer decision runs inside the verify callback, so an unauthorised peer never gets a channel. | `NULL` (no certificate, or refused peer) |
-| `qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder, int fd, qihse_peer_verdict_t* out_verdict)` | Client-side handshake on a connected fd. | `NULL` |
+| `qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder, int fd, int timeout_ms, qihse_peer_verdict_t* out_verdict)` | Client-side handshake on an already-connected fd. `timeout_ms` bounds the handshake; the same asymmetry as `_connect_to` applies. | `NULL` |
 | `void qihse_federation_tls_session_destroy(qihse_fed_tls_session_t* session)` | Close the session. | n/a |
 | `bool qihse_federation_tls_peer_identity(const qihse_fed_tls_session_t* session, qihse_uuid_t* out_node_id, qihse_runtime_trust_t* out_trust)` | The verified peer identity. | `false` — never treat as "any peer" |
 | `bool qihse_federation_tls_negotiated(const qihse_fed_tls_session_t* session, char* out_group, size_t group_cap, char* out_version, size_t version_cap)` | Negotiated group and TLS version, so a deployment can prove it is running post-quantum key exchange. | `false` |
@@ -561,7 +621,247 @@ Auth rate limiting (brute-force protection):
 
 ---
 
-## 8. Python SDK — `python/qihse/`
+## 8. Additional public C surfaces
+
+These are public entry points that sit outside the nine headers of
+[§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh).
+They are documented here because an operator, a controller or a protocol adapter
+is expected to call them; each was verified against its header and against the
+built `libqihse.so` by the same method as the sections above.
+
+### 8.1 Replication apply — `include/qihse_repl.h`
+
+Source: `src/spinnaker/qihse_repl.c`.
+Tests: `tests/test_repl.c` (`make test-repl`); the replay itself also by the
+`repl-apply-wal` workload in `tests/gold/pack.v1.gold`.
+
+`qihse_repl_apply_wal()` **replays** an accepted record into the store bound
+with `qihse_repl_set_store()`. The record is not re-parsed here: the bytes are
+staged as the single record of a private WAL segment and replayed through
+`qihse_wal_replay()`, so the length rules and the CRC32 check that decide
+whether a record is valid are the WAL layer's, not a second copy of them. The
+store mutation happens in the replay callback, which the WAL layer invokes only
+after it accepted the record, so a refused record cannot be partially applied.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `int qihse_repl_set_store(qihse_repl_context_t* ctx, qihse_kv_store_t* store)` | Bind the local store that apply replays into. The store is **borrowed**, never owned, and must outlive the context. Passing `NULL` unbinds, after which apply refuses every record. | `-1` for a `NULL` context |
+| `qihse_kv_store_t* qihse_repl_get_store(qihse_repl_context_t* ctx)` | The bound store. | `NULL` when none is bound |
+| `int qihse_repl_apply_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, size_t len, uint64_t lsn)` | Apply one received `[LSN][length][data]` frame payload. On success the mutation has reached the store and `replay_lsn`/`flush_lsn` advance to the record's LSN. Ordering is enforced by a monotonic in-memory watermark: a record at or below it is not applied twice and still reports success, so a retransmission is a no-op. | `-1` with nothing applied and no LSN advanced |
+
+Refused, with nothing applied: a `NULL`/empty record, a context with no bound
+store, `QIHSE_WAL_INVALID_LSN`, a record whose own LSN is not the `lsn`
+argument, declared field lengths that disagree with `len`, bytes the WAL layer
+rejects (truncated tail, checksum mismatch, unknown op), and a mutation the
+store refuses. The applier writes through the KV layer's unclassified-only
+entry points: a WAL record carries no classification or SCI, so it cannot
+express a classified write, and a mutation the store refuses (for example an
+overwrite of a classified row) refuses the whole record. The watermark is in
+memory and is not recovered after a restart, which is safe for
+INSERT/UPDATE/DELETE because reaching the same key state twice is idempotent,
+but a caller that needs durable exactly-once semantics must persist the
+position itself.
+
+### 8.2 Table-store DML primitives — `include/qihse_table_store.h`
+
+Source: `src/tractable/qihse_table_store.c`.
+Test: `tests/test_sql_dml_exec.c` (`make test-sql-dml-exec`), which drives
+these through `qihse_uwp_sql_execute_dml()`.
+
+The mutable table store is the only in-tree store with in-place update and
+delete primitives, which is why the SQL `UPDATE`/`DELETE` executor targets it
+(see [sql_engine.md §3.5](architecture/sql_engine.md)).
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `qihse_table_store_t* qihse_table_store_create(void)` / `void qihse_table_store_destroy(qihse_table_store_t* store)` | Create/destroy the store. | `NULL` |
+| `qihse_table_t* qihse_table_store_create_table(qihse_table_store_t* store, const char* name, const qihse_col_def_t* cols, size_t num_cols)` | Create a table. | `NULL` |
+| `qihse_table_t* qihse_table_store_find_table(qihse_table_store_t* store, const char* name)` | Look up a table by name. | `NULL` |
+| `int qihse_table_insert(qihse_table_t* table, const qihse_col_value_t* values, size_t num_values)` | Insert a row; string values are deep-copied. | `-1` |
+| `bool qihse_table_update(qihse_table_t* table, int (*pred)(const qihse_col_value_t* values, size_t num_cols, void* ctx), void* pred_ctx, const int* update_cols, const qihse_col_value_t* new_values, size_t num_updates)` | Update the rows the predicate accepts: the columns in `update_cols` are set to the corresponding `new_values` (strings deep-copied). | `false` when no row matched (not an error) |
+| `bool qihse_table_delete(qihse_table_t* table, int (*pred)(const qihse_col_value_t* values, size_t num_cols, void* ctx), void* pred_ctx)` | Delete (tombstone) the rows the predicate accepts; the table is compacted periodically. | `false` when no row matched |
+| `size_t qihse_table_row_count(const qihse_table_t* table)` | Live (non-deleted) row count. | `0` |
+| `void qihse_table_scan(const qihse_table_t* table, qihse_table_row_cb cb, void* ctx)` | Scan live rows; the callback's value pointer is valid only during the call and returning `false` stops the scan. | n/a |
+| `size_t qihse_table_num_cols(const qihse_table_t* table)` / `const qihse_col_def_t* qihse_table_col_def(const qihse_table_t* table, size_t idx)` / `int qihse_table_find_col(const qihse_table_t* table, const char* name)` / `const char* qihse_table_name(const qihse_table_t* table)` | Introspection. | `0` / `NULL` / `-1` |
+
+The SQL executor above these primitives reports the rows actually changed, not
+a match count, and refuses a zero-condition DELETE instead of turning it into a
+match-all; see [sql_engine.md §3.5](architecture/sql_engine.md) for the
+executor-level contract.
+
+### 8.3 Parallel query — `include/qihse_parallel_query.h`
+
+Source: `src/tractable/qihse_parallel_query.c`.
+Test: `tests/test_parallel_query.c` (`make test-parallel-query`); also the
+`parallel-query` workload in `tests/gold/pack.v1.gold`.
+
+Every entry point returns `QIHSE_PARALLEL_OK` (0) or a negative code, and a
+refusal exposes no partial result — so a caller can tell "the query ran and
+matched nothing" from "the query could not run".
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `qihse_parallel_ctx_t* qihse_parallel_init(int num_workers)` | Create a context with 1..`QIHSE_PARALLEL_MAX_WORKERS` (64) workers. A new context has no user bound, i.e. it sees unclassified data only. | `NULL` for an out-of-range worker count or an allocation/mutex failure |
+| `int qihse_parallel_set_user(qihse_parallel_ctx_t* ctx, qihse_user_t* user)` / `qihse_user_t* qihse_parallel_get_user(qihse_parallel_ctx_t* ctx)` | Bind (or clear, with `NULL`) the security context inherited by every operation. Borrowed: the caller keeps ownership. | `QIHSE_PARALLEL_ERR_ARGS` / `NULL` |
+| `int qihse_parallel_scan(qihse_parallel_ctx_t* ctx, qihse_kv_store_t* kv, const char* table_prefix, qihse_parallel_scan_t* out_scan)` | Scan every key under `table_prefix` and partition the rows across the workers. Success with `total_rows == 0` means the traversal ran and found no key — a KV store has no schema, so an empty table and an absent one are the same thing. | a negative code, `out_scan` zeroed |
+| `void qihse_parallel_scan_free(qihse_parallel_scan_t* scan)` | Release the rows and arrays a scan owns. Safe on a zeroed struct. | n/a |
+| `void qihse_parallel_cleanup(qihse_parallel_ctx_t* ctx)` | Release the context. | n/a |
+| `int qihse_parallel_join(qihse_parallel_ctx_t* ctx, qihse_kv_store_t* kv, const char* left_table, const char* right_table, const char* join_key, qihse_parallel_join_t* out_join)` | Parallel hash join on a shared column name. A row participates when its key is under the table prefix and its final component equals `join_key`; two rows match when their join values are byte-equal. `left_keys`/`right_keys`/`left_join_rows`/`right_join_rows` report what was examined, so success with `matched_rows == 0` is evidence the join ran. | `QIHSE_PARALLEL_ERR_NO_RESULT` when either table has no key carrying the join column — nothing could ever have matched, and reporting that as "0 rows matched" is the false success this module exists to remove |
+| `void qihse_parallel_join_free(qihse_parallel_join_t* join)` | Release the pairs a join result owns. Safe on a zeroed struct. | n/a |
+| `int qihse_parallel_aggregate(qihse_parallel_ctx_t* ctx, qihse_kv_store_t* kv, const char* table_name, const char* agg_column, const char* agg_func, double* out_result)` | Aggregate the rows under `table_name`. `agg_column` selects the column (final key component) to aggregate; `NULL` aggregates each row's own value. `agg_func` is `count`/`sum`/`avg`/`min`/`max`, case-insensitive. | `count`/`sum` have a defined answer for an empty table (0); `avg`/`min`/`max` return `QIHSE_PARALLEL_ERR_NO_RESULT` rather than 0. A non-numeric value in a numeric aggregate is `_ERR_DATA`; an `agg_column` no key carries is `_ERR_NO_RESULT` for every function |
+
+Error codes: `QIHSE_PARALLEL_ERR_ARGS`, `_UNSUPPORTED`, `_THREAD`, `_NOMEM`,
+`_STORE`, `_DATA`, `_NO_RESULT`, `_LIMIT`.
+
+**What is not parallel, stated in the header and here:** `qihse_kv_foreach_user()`
+is the only enumeration the KV layer exposes and it has no prefix, range or
+resume form, so the keyspace traversal runs once on the calling thread and
+materialises the rows before partitioning them. Only the per-row work — the row
+copies, the numeric parse, the hash build/probe — is parallel.
+
+### 8.4 AI memory and embeddings — `include/qihse_ai_memory.h`
+
+Source: `src/spinnaker/qihse_ai_memory.c`.
+Tests: `tests/test_ai_memory.c` (`make test-ai-memory`, including the RBAC
+negative test) and `tests/test_ai_memory_embed.c`
+(`make test-ai-memory-embed`); also the `fabric-semantic-recall` workload in
+`tests/gold/pack.v1.gold`.
+
+Records live in the `aimem:` KV namespace and are indexed by the FTS engine for
+recall; vectors are stored under `aimemv:<id>`, bound to the name of the
+embedder that produced them. Every entry point takes an explicit security
+context — there is no context-free variant — and every ranking mode resolves
+candidates through the same authorization-aware read, so no mode can rank,
+score, or even count a record the principal cannot see.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider)` | Install an embedding provider; `NULL` restores the built-in one. A provider declares `name`, `dim` and an `embed` callback. Vectors from different providers are never compared. | `false` |
+| `size_t qihse_ai_memory_embedding_dim(void)` | Dimension of the active embedder. Capped at `QIHSE_AIMEM_MAX_DIM` (1024). | `0` |
+| `const char* qihse_ai_memory_embedder_name(void)` | The active embedder's name. | `""` when none is usable |
+| `bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user, const char* text, uint32_t kind, char out_id[QIHSE_AIMEM_ID_LEN + 1u])` | Remember: store `text` and index it for recall. `kind` is `QIHSE_AIMEM_EPISODIC` (1) or `QIHSE_AIMEM_SEMANTIC` (2). | `false` when the store or index rejects the write, including insufficient clearance |
+| `size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user, const char* query, size_t limit, qihse_ai_memory_mode_t mode, qihse_ai_memory_hit_t* out, size_t out_cap)` | Recall with an explicit ranking mode: `QIHSE_AIMEM_MODE_BM25` (lexical), `_SEMANTIC` (vector similarity, so a query can match a memory that shares no words with it) or `_HYBRID` (reciprocal rank fusion of both). | number of hits written; `0` when nothing matched |
+| `size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user, const char* query, size_t limit, qihse_ai_memory_hit_t* out, size_t out_cap)` | BM25 recall over visible memories. | as above |
+| `bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user, const char* id, qihse_ai_memory_hit_t* out)` | Fetch one memory by id (RBAC enforced by the store). | `false` |
+| `bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user, const char* id)` | Delete the record. The search index may retain a stale posting; recall skips records whose KV entry is gone. | `false` |
+| `size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user)` | How many memories the caller can see. | `0` |
+| `void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count)` | Release the `text` of every hit. | n/a |
+| `void qihse_ai_memory_reset(void)` | Drop the process-local search index (tests / shutdown). | n/a |
+
+The built-in embedder is a **deterministic lexical vector**, not a learned
+model: it hashes tokens into a fixed-width space, so similarity reflects shared
+vocabulary rather than meaning. It exists so the storage, ranking, fusion and
+filtering paths are complete and testable with no model present; a real model
+plugs into the same interface and everything downstream is unchanged.
+
+### 8.5 KEYSTONE change feed — `include/qihse_keystone.h`
+
+Source: `src/black_hole/qihse_keystone.c` (feed), `src/spinnaker/qihse_resp_engine.c`
+(the wire surface).
+Test: `tests/test_keystone_feed_w25.c` (`make test-keystone-feed-w25`).
+
+The feed lets an indexer consume federation change events **without** becoming
+authoritative: the index identity is a tenant-scoped ANALYST holding
+`QIHSE_SCOPE_FEDERATION_READ` only, so it cannot publish, enrol, revoke or
+create principals. Records above the reader's clearance, outside its SCI
+compartments, in another tenant, larger than the configured cap, or malformed
+are skipped and counted — never delivered, not even as metadata. The clearance
+decision is made per record at delivery time, so rewinding or transplanting a
+cursor cannot replay past a denial.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_keystone_feed_encode(const qihse_keystone_feed_record_t* record, const void* payload, size_t payload_len, uint8_t* out, size_t out_cap, size_t* out_len)` | Encode header + body (`QIHSE_KEYSTONE_FEED_MAGIC` `"KSFD"`, record version 1). | `false` when the record or body is outside the contract (oversized payload, out-of-range fields) |
+| `bool qihse_keystone_feed_decode(const uint8_t* payload, size_t payload_len, qihse_keystone_feed_record_t* out_record, const uint8_t** out_body, size_t* out_body_len)` | Decode a journal payload, validating the declared body length against both the encoded length and the fixed header size. `*out_body` points into the caller's buffer. | `false` — an undecodable record can never reach the index |
+| `qihse_user_t* qihse_keystone_feed_identity_provision(const qihse_user_t* creator, uint32_t tenant_id, uint32_t user_id, uint16_t clearance, uint16_t sci, const char* plaintext_password)` | Provision the index identity: a tenant-scoped ANALYST at exactly the requested clearance/SCI, with no user-creation delegation. Refused for tenant 0 and for any creator that does not already hold every privilege it is granting (`AGENTS.md` invariant 2). | `NULL` |
+| `bool qihse_keystone_feed_identity_is_indexer(const qihse_user_t* user)` | True only for a principal provisioned by the call above that is still an active ANALYST in a non-system tenant. | `false` |
+| `bool qihse_keystone_feed_identity_revoke(const qihse_user_t* actor, uint32_t user_id)` | Operator-only: drop the feed binding so the principal loses change-feed access immediately, without waiting for account destruction. | `false` |
+| `bool qihse_keystone_feed_publish(qihse_federation_journal_t* journal, const qihse_user_t* publisher, const qihse_uuid_t* origin_node, const char* event_type, const char* resource_id, const qihse_keystone_feed_record_t* record, const void* payload, size_t payload_len, qihse_federation_event_t* out_event)` | Publish one feed record to the journal. Requires `QIHSE_SCOPE_FEDERATION_WRITE`, so it is denied for the index identity; the publisher may not publish above its own clearance/SCI nor outside its own tenant. | `false` |
+| `qihse_keystone_feed_t* qihse_keystone_feed_open(qihse_federation_journal_t* journal, const qihse_user_t* reader, const qihse_keystone_feed_config_t* config)` | Open a feed for an authenticated reader. Allowed for the provisioned index identity and for an operator; any other principal — including a plain analyst — is refused. | `NULL` — including for a `NULL` reader or `NULL` journal |
+| `void qihse_keystone_feed_close(qihse_keystone_feed_t* feed)` | Release the feed. | n/a |
+| `bool qihse_keystone_feed_next(qihse_keystone_feed_t* feed, qihse_federation_event_t* out_event, qihse_keystone_feed_record_t* out_record, uint8_t** out_payload, size_t* out_payload_len)` | Deliver the next record the reader is cleared for. On success `*out_payload` is a heap copy the caller frees. | `false` at end-of-journal |
+| `bool qihse_keystone_feed_ack(qihse_keystone_feed_t* feed, uint64_t offset)` | Acknowledge events up to `offset` (at-least-once: unacked events are re-delivered on resume). | `false` |
+| `bool qihse_keystone_feed_resume(qihse_keystone_feed_t* feed, uint64_t cursor)` | Resume from a saved cursor. A cursor beyond the current end of the journal is refused. | `false` |
+| `uint64_t qihse_keystone_feed_cursor(const qihse_keystone_feed_t* feed)` / `uint64_t qihse_keystone_feed_last_ack(const qihse_keystone_feed_t* feed)` | Current cursor / highest acknowledged offset. | `0` |
+| `size_t qihse_keystone_feed_denied(const qihse_keystone_feed_t* feed)` / `size_t qihse_keystone_feed_malformed(const qihse_keystone_feed_t* feed)` | How many records were withheld and how many were malformed. | `0` |
+| `bool qihse_keystone_feed_cursor_save(const qihse_keystone_feed_t* feed, const char* path)` / `bool qihse_keystone_feed_cursor_load(const qihse_user_t* reader, const char* path, uint64_t* out_cursor)` | Persist/restore the resume cursor. The file records the principal that minted it and loading it as a different principal is refused, so a cursor minted for a wider identity cannot be transplanted onto the index identity. Writes are atomic (tmp + rename) and 0600. | `false` |
+
+`qihse_keystone_feed_config_t` carries a resource-id prefix filter ("" = all), a
+resume cursor (0 = from the beginning) and a maximum payload size
+(0 = `QIHSE_KEYSTONE_FEED_MAX_PAYLOAD`, 256 KiB).
+
+### 8.6 KEYSTONE fabric index — `include/qihse_fabric_index.h`
+
+Source: `src/spinnaker/qihse_fabric_index.c`.
+Test: `tests/test_fabric_index.c`.
+
+KEYSTONE is a **soft dependency**: located via `dlopen` at first use, so QIHSE
+builds and runs without it and every index call fails closed with
+`QIHSE_FABRIC_INDEX_EUNAVAILABLE`. The index keeps candidate postings only —
+KEYSTONE never retains artifact content, so no second copy of classified data
+exists outside the authoritative KV store.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `int qihse_fabric_index_init(const char* index_dir, const char* library)` / `void qihse_fabric_index_shutdown(void)` / `bool qihse_fabric_index_is_available(void)` | Bring the soft dependency up, drop it, and report whether it is usable. `index_dir` falls back to `QIHSE_FABRIC_INDEX_DIR` then a `/tmp` path; `library` falls back to `QIHSE_KEYSTONE_LIB`, then a conventional checkout path, then the loader search path. Init is idempotent: re-initialising with a different configuration returns the current state without reloading. Shutdown is safe to call twice. | `QIHSE_FABRIC_INDEX_OK` when KEYSTONE is loaded, `QIHSE_FABRIC_INDEX_EUNAVAILABLE` when it is not (the index is then a no-op but every call remains safe), `EINVAL` on bad arguments |
+| `int qihse_fabric_index_artifact_user(const char* key, const char* value, size_t value_len, uint16_t classification, uint16_t sci_compartment, qihse_user_t* user)` | Classify and trigram-index one artifact. Called from the write path after the KV write is authorized and persisted; the write-time classification/SCI is recorded with the index record so later lookups can be gated, and the caller's context is checked against the declared classification (defence in depth on top of the KV write gate). Keys containing tabs/newlines or exceeding 255 bytes are rejected. | non-zero (`EINVAL` for a bad key, `QIHSE_FABRIC_INDEX_EUNAVAILABLE` when the soft dependency is missing) |
+| `int qihse_fabric_index_lookup_user(const char* pattern, qihse_user_t* user, qihse_fabric_index_record_t* out_records, size_t max_records, size_t* out_count)` | Trigram candidate lookup: indexed records whose content contains `pattern`. Candidates are substring postings — verify exact content against the authoritative KV store. Every candidate is filtered through `qihse_auth_can_access()`; a `NULL` user is denied outright. Patterns shorter than three bytes match every record. Records whose artifact was overwritten in KV remain listed until compaction; `seq` orders versions. | non-zero |
+| `int qihse_fabric_index_by_class_user(qihse_fabric_index_class_t cls, qihse_user_t* user, qihse_fabric_index_record_t* out_records, size_t max_records, size_t* out_count)` | Semantic-class listing; `QIHSE_FABRIC_CLASS_UNKNOWN` selects low-confidence artifacts. Same authorization rules as `_lookup_user`. | non-zero |
+| `size_t qihse_fabric_index_record_count(void)` / `const char* qihse_fabric_index_class_name(qihse_fabric_index_class_t cls)` / `const char* qihse_fabric_index_keystone_version(void)` | Introspection; the version string is `NULL` when the library is unavailable. | `0` / `NULL` |
+| `int qihse_fabric_index_export_node_cap(const char* node_id, uint8_t* out_buf, size_t buf_size)` | Export a KEYSTONE NODE_CAP frame (50 bytes) into `out_buf`. | `QIHSE_FABRIC_INDEX_EUNAVAILABLE` when KEYSTONE is not loaded or lacks the symbol |
+
+### 8.7 MongoDB wire protocol — `include/qihse_mongo_wire.h`
+
+Source: `src/spinnaker/qihse_mongo_wire.c`.
+Tests: `tests/test_mongo_wire.c` (`make test-mongo-wire`) and
+`tests/test_mongo_wire_security.c` (`make test-mongo-wire-security`); also the
+`mongo-wire` and `protocol-compat-probe` workloads in `tests/gold/pack.v1.gold`.
+
+Seventeen `mongo_*` / `qihse_mongo_*` symbols are exported by `libqihse.so`.
+The adapter is authorization-aware end to end: the catalog carries the bound
+principal, the dispatcher refuses a `NULL` principal with code 13 and no
+payload, and every reply document passes one gate — the static
+`mongo_reply_doc()` in `src/spinnaker/qihse_mongo_wire.c` — which drops any
+document the principal may not see and strips the stored classification/SCI
+metadata before the frame is written.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `int mongo_msg_parse(const uint8_t* data, size_t len, mongo_msg_t* out)` | Parse a framed message. Accepted only when the declared `message_length` fits inside `len`, the opcode is one this adapter implements, and the opcode's own header is present. | `-1`, nothing written to `out`, no byte past `len` read |
+| `bson_t* mongo_msg_get_document(const mongo_msg_t* msg, size_t* offset)` | Materialise the next BSON document of the body as a heap copy the caller owns. On the first call (`*offset == 0`) the opcode's own header is skipped automatically, so a caller can walk the documents of an OP_MSG/OP_QUERY/OP_INSERT/OP_UPDATE/OP_DELETE in order. | `NULL` on a malformed document or the end of the body; `*offset` is left untouched when the document is refused |
+| `mongo_catalog_t* mongo_catalog_create(qihse_document_store_t* ds)` / `mongo_catalog_t* mongo_catalog_create_auth(qihse_document_store_t* ds, qihse_user_t* user)` | Create the in-memory catalog, with or without a principal bound. The user-less accessors fail closed until a principal is bound. | `NULL` |
+| `int mongo_catalog_bind_user(mongo_catalog_t* cat, qihse_user_t* user)` / `qihse_user_t* mongo_catalog_get_user(const mongo_catalog_t* cat)` / `void mongo_catalog_destroy(mongo_catalog_t* cat)` | Bind, read and release the catalog principal. | non-zero / `NULL` / n/a |
+| `mongo_database_t* mongo_catalog_get_db(mongo_catalog_t* cat, const char* db)` / `mongo_collection_t* mongo_db_get_collection(mongo_database_t* db, const char* name)` / `mongo_collection_t* mongo_catalog_get_collection(mongo_catalog_t* cat, const char* db, const char* coll)` / `int mongo_catalog_drop_collection(mongo_catalog_t* cat, const char* db, const char* coll)` | Catalog navigation and collection drop. | `NULL` / non-zero |
+| `bson_t* mongo_dispatch_command_as(mongo_catalog_t* cat, qihse_user_t* user, const char* db_name, const bson_t* cmd)` / `bson_t* mongo_dispatch_command(mongo_catalog_t* cat, const char* db_name, const bson_t* cmd)` | Dispatch a command document. The `_as` form takes an explicit authenticated principal; a `NULL` user is refused with error code 13 and no document bytes. The user-less form inherits the catalog's bound principal and fails closed the same way when none is bound. Implemented: `ping`, `hello`/`isMaster`, `find`, `count`, `distinct`, `aggregate`, `insert`, `update`, `delete`, `drop`, `dropDatabase`, `listCollections`, `listDatabases`. Refused loudly: `findAndModify`, `getMore` (every cursor is a single batch with id 0), `createIndexes`, `listIndexes`. | a BSON error reply the caller owns |
+| `qihse_mongo_server_t* qihse_mongo_server_create(uint16_t port, void* doc_store)` / `int qihse_mongo_server_start(qihse_mongo_server_t* srv)` / `int qihse_mongo_server_stop(qihse_mongo_server_t* srv)` / `void qihse_mongo_server_destroy(qihse_mongo_server_t* srv)` | The TCP server and its per-client threads. | `NULL` / non-zero |
+| `int bson_match(const bson_t* doc, const bson_t* filter)` / `int bson_match_operator(const bson_t* doc, const char* key, const bson_element_t* field, const char* op, const bson_element_t* opval, const uint8_t* raw)` / `int bson_apply_update(bson_t* doc, const bson_t* update, int is_insert)` / `bson_t** bson_aggregate(const bson_t* const* input, size_t n_in, const bson_t* pipeline, size_t n_stages, size_t* out_count)` | The matcher, the update applier and the pipeline. Implemented stages: `$match`, `$limit`, `$skip`, `$sort`, `$count`, `$project` (inclusion/exclusion only), `$unwind` and `$group` (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`). `n_stages == 0` runs every stage in the pipeline. | `0`/negative for the matcher; `NULL` with `*out_count == 0` for the pipeline — `$lookup`, `$facet`, `$graphLookup` and computed `$project` expressions are refused rather than silently dropped, and the dispatcher then answers `NOT_IMPLEMENTED` |
+
+`$where` is not evaluated — there is no server-side JavaScript — and a filter
+using it is refused rather than silently matching everything.
+
+### 8.8 Cluster node federation UUID — `include/qihse_cluster_slot.h`
+
+Source: `src/spinnaker/qihse_cluster_slot.c`.
+Test: `tests/gold/workloads/gold_fabric_durable_caps.c` (the
+`gold-fabric-durable-caps` workload), which asserts that a topology node derives
+its federation UUID with no caller setting it and that the derived UUID resolves
+to the durable capability record across a restart.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_cluster_node_federation_uuid(const char* node_id, uint8_t out[16])` | The federation UUID of a cluster node id: **derived, not configured**. This is the single definition of the mapping; every topology node gets one automatically at upsert, so there is no caller to forget and no node that is silently unreachable in the durable stores. | `false` |
+
+**The result is an index, not a credential.** A topology node id can arrive from
+an unauthenticated path — `qihse_bus_handle_meet` upserts nodes straight from a
+MEET datagram, and overlay discovery supplies hints of the same kind. What that
+buys an attacker is a lookup key that resolves to an identity record they cannot
+make APPROVED; enrollment remains the gate, and the durable accessors re-read
+the identity record, so a discovered-but-unenrolled node resolves to nothing
+usable. Nothing may treat this UUID as evidence of identity.
+
+---
+
+## 9. Python SDK — `python/qihse/`
 
 The Python package is a `ctypes` binding over `libqihse.so`. It is not a
 reimplementation: each method calls a C entry point. `python/qihse/__init__.py`
@@ -630,7 +930,7 @@ linker rather than editing the search list.
 
 ---
 
-## 9. Protocol compatibility
+## 10. Protocol compatibility
 
 Compatibility surfaces are implemented inside QIHSE. Presence is not a claim of
 byte-for-byte upstream equivalence; validate the commands your application
@@ -649,10 +949,10 @@ actually depends on.
 | UWP (native) | `src/spinnaker/qihse_uwp.c`, `src/spinnaker/qihse_uwp_secure.c` | Unified Wire Protocol; TLS 1.3 required by default |
 | RESP ↔ UWP bridge | `QIHSE_UWP_TARGET_RESP` (0x0F) | A UWP packet can execute any RESP command for an explicit principal |
 
-### 9.1 The `FEDERATION.*` command surface
+### 10.1 The `FEDERATION.*` command surface
 
 `FEDERATION.*` is restricted to the system tenant; a tenant principal receives
-`NOPERM`. The following subcommands are dispatched by
+`NOPERM`. The following 79 subcommands are dispatched by
 `qihse_resp_handle_federation()` (static) in `src/spinnaker/qihse_resp_engine.c` and were
 enumerated from that function, not from a design document:
 
@@ -688,14 +988,55 @@ METRICS
 returns the ordered reconciliation sequence; `FEDERATION.STATUS` returns the
 status object described in [§1.2](#12-f1--consistency-classes-namespaces-status).
 
+### 10.2 The `FABRIC.*` command surface
+
+The AI compute fabric dispatches over RESP as well. `FABRIC.CAPS` and
+`FABRIC.RESULT` are refused outside the system tenant. Enumerated from
+`src/spinnaker/qihse_resp_engine.c`:
+
+```
+FABRIC.CAPS                                  cluster capability map
+FABRIC.SUBMIT [<type>] <min_isa> <need_npu> <payload>
+FABRIC.RESULT <job-id>                       read a job record
+```
+
+`FABRIC.CAPS` prefers the durable capability record
+([§1.7](#17-w24--durable-node-capability-records-federationnodeuuid)) and falls
+back to the live in-memory hint, reporting `src=durable` or `src=hint` so a
+caller can tell them apart.
+
+`FABRIC.SUBMIT` executes **locally only**. The four job types named in
+[ai_fabric.md](architecture/ai_fabric.md) are `embed` and `keystone-ingest`
+(executors exist) and `inference` and `index-build` (REFUSED with
+`job type not implemented` rather than accepted and ignored). A job whose
+best-fit node is another node is recorded `queued` with the chosen target and
+never runs — recorded as queued rather than done so the record does not claim a
+dispatch that did not happen. Both gaps are recorded in
+`tests/gold/pack.v1.gold` under the `ai-fabric` area. Job records live at
+`fabric:job:<job-id>` and are what `FABRIC.RESULT` returns. Verified by
+`tests/test_fabric_jobs.c` (`make test-fabric-jobs`) and the `fabric-job-model`
+gold workload.
+
 ---
 
-## 10. Configuration knobs
+## 11. Configuration knobs
 
 Environment variables read by `getenv()` in production code. Benchmark-only
-knobs (`QIHSE_BENCH_*`) are omitted.
+knobs (`QIHSE_BENCH_*`) are omitted, and so are the standard environment
+variables the tree consults rather than defines (`TMPDIR` for the replication
+staging area in `src/spinnaker/qihse_repl.c`, `HOME` for the vector-DB default
+configuration location in `src/broad_oak/qihse_vector_db.c`).
 
-### 10.1 Storage and paths
+The inventory below was enumerated from the tree with
+`getenv("...")` over `src/`, `core/`, `persistence/`, `memory/`, `backends/`,
+`tools/`, `python/` and `sdks/`: 43 distinct names, of which 38 are QIHSE knobs
+listed here, 3 are benchmark-only (`QIHSE_BENCH_DATASET`,
+`QIHSE_BENCH_SWEEP`, `QIHSE_BENCH_TRINARY_SCORE`) and 2 are the standard
+variables named above. Two further variables are listed because the Python SDK
+reads them, through `os.environ` rather than `getenv()`:
+`QIHSE_UWP_TLS_CERT` and `QIHSE_UWP_TLS_KEY`.
+
+### 11.1 Storage and paths
 
 | Variable | Read by | Purpose |
 |---|---|---|
@@ -707,7 +1048,7 @@ knobs (`QIHSE_BENCH_*`) are omitted.
 | `QIHSE_KEYSTONE_LIB` | `src/spinnaker/qihse_fabric_index.c` | Path to the KEYSTONE shared library |
 | `QIHSE_GEOIP_DIR` | `src/broad_oak/qihse_quantum_defense.c` | GeoIP MMDB directory |
 
-### 10.2 Security and authentication
+### 11.2 Security and authentication
 
 | Variable | Read by | Purpose |
 |---|---|---|
@@ -722,7 +1063,7 @@ knobs (`QIHSE_BENCH_*`) are omitted.
 | `QIHSE_ENFORCE_INTEGRITY`, `QIHSE_SKIP_INTEGRITY` | `persistence/qihse_container.c` | Container integrity enforcement / explicit skip |
 | `QIHSE_SKIP_OPTIONAL_SECTIONS` | `persistence/qihse_vector_store.c` | Skip optional sections when loading a vector store |
 
-### 10.3 Networking and cluster
+### 11.3 Networking and cluster
 
 | Variable | Read by | Purpose |
 |---|---|---|
@@ -730,7 +1071,7 @@ knobs (`QIHSE_BENCH_*`) are omitted.
 | `QIHSE_XDP_IFACE`, `QIHSE_XDP_OBJ` | `src/spinnaker/qihse_uwp.c`, `src/spinnaker/qihse_uwp_secure.c`, `src/networking/qihse_af_xdp.c` | AF_XDP interface and object file |
 | `QIHSE_BRAIN_WORKERS` | `src/spinnaker/qihse_cluster_brain.c` | Brain observe-pass worker count (default `min(cores, 8)`) |
 
-### 10.4 Engines, memory, and CPU paths
+### 11.4 Engines, memory, and CPU paths
 
 | Variable | Read by | Purpose |
 |---|---|---|
@@ -744,7 +1085,7 @@ knobs (`QIHSE_BENCH_*`) are omitted.
 | `QIHSE_CRC32C`, `QIHSE_CRC_THREADS`, `QIHSE_PARALLEL_CRC` | `persistence/qihse_container.c`, `persistence/qihse_vector_store.c` | Checksum backend and parallel CRC tuning |
 | `QIHSE_ENABLE_AMX`, `QIHSE_ENABLE_AVX512`, `QIHSE_ENABLE_AVX_VNNI`, `QIHSE_FORCE_FULL_FEATURES` | `backends/cpu/qihse_cpu_detect.c` | Force or disable specific CPU execution paths |
 
-### 10.5 Persistence key prefixes
+### 11.5 Persistence key prefixes
 
 Federation and operations state is namespaced inside the caller's KV store:
 
@@ -758,6 +1099,7 @@ Federation and operations state is namespaced inside the caller's KV store:
 | `fedlease:`, `fedleasereq:`, `fedleaseres:` | leases, request index, fencing high-water mark |
 | `fedgrp:` | replication groups |
 | `fednode:` | node identity records |
+| `federation/node/<uuid>` | durable node capability records ([§1.7](#17-w24--durable-node-capability-records-federationnodeuuid)) |
 | `fedreplay:` | gossip replay windows |
 | `federation` | journal topic in the event stream |
 | `schema/migration:`, `schema/progress:` | schema evolution |
@@ -766,10 +1108,14 @@ Federation and operations state is namespaced inside the caller's KV store:
 | `security/runtime-profile:<service>:<version>` | runtime hardening profiles |
 | `security/runtime-network-profile:<service>:<version>` | network exposure profiles |
 | `security/audit/<node>/<service>/<hlc>` | self-audit evidence records |
+| `aimem:` | AI memory records (FTS-indexed) |
+| `aimemv:<id>` | AI memory embedding vectors, bound to the embedder name that produced them |
+| `fabric:ingest:<job-id>` | fabric artifacts indexed through KEYSTONE |
+| `fabric:job:<job-id>` | fabric job records, and the result `FABRIC.RESULT` returns |
 
 ---
 
-## 11. Known gaps and unverified areas
+## 12. Known gaps and unverified areas
 
 Stated plainly rather than omitted:
 
@@ -797,8 +1143,14 @@ Stated plainly rather than omitted:
 5. **Python federation SDK — not written.** The Python package covers the
    engines and UWP; it does not expose the `FEDERATION.*` controller surface.
    Use RESP for controller work.
-6. **Rust SDK — planned.** `sdks/rust/` contains `sdks/rust/Cargo.toml` and
-   `sdks/rust/Cargo.lock` only; there is no Rust source in the tree.
+6. **Rust SDK — implemented, unverified against the C surface.** An earlier
+   revision of this document said `sdks/rust/` contained only `Cargo.toml` and
+   `Cargo.lock`. It now contains nine modules under `sdks/rust/src/`
+   (`lib.rs`, `client.rs`, `query.rs`, `http.rs`, `mongo.rs`, `cdc.rs`,
+   `metrics.rs`, `types.rs`, `error.rs`). There is still no Rust test target and
+   no entry in the CI test list, so the honest label for this surface is
+   `partial — status unverified`: the source exists, nothing in the tree
+   exercises it.
 7. **Federation transport CA provisioning — external.** QIHSE can create and
    use a federation CA, but certificate provisioning for a real fleet is an
    operator procedure outside the process. The header states this.
@@ -813,8 +1165,24 @@ Stated plainly rather than omitted:
    `qihse_federation_namespace_writable()`; the header reserves it for finer
    authority checks. Passing it is still required for future compatibility.
 10. **Failure modes not documented in headers.** A few functions (for example
-   `qihse_federation_watch_resume()` and `qihse_schema_progress_set()`) return
-   `bool` without stating in the header which condition produces `false`. Their
-   behaviour is consistent with the module conventions in
-   [Conventions](#conventions), but the specific reject reasons are not
-   enumerated in the header.
+    `qihse_federation_watch_resume()` and `qihse_schema_progress_set()`) return
+    `bool` without stating in the header which condition produces `false`. Their
+    behaviour is consistent with the module conventions in
+    [Conventions](#conventions), but the specific reject reasons are not
+    enumerated in the header.
+11. **Detached signature primitives have no direct test — `partial — status
+    unverified`.** `qihse_federation_sign()`, `qihse_federation_verify()` and
+    `qihse_federation_pkey_sig_alg()` ([§1.6](#16-f5--trust-plane)) are used in
+    production paths and are reached indirectly by
+    `tests/test_brain_fed_journal.c`, but no test calls them directly.
+12. **`FABRIC.SUBMIT` does not dispatch to another node — partial.** The two
+    local executors and the refusal path are tested
+    (`tests/test_fabric_jobs.c`); remote dispatch and the `inference` and
+    `index-build` executors are not built. See
+    [§10.2](#102-the-fabric-command-surface) and the `ai-fabric` area of
+    `tests/gold/pack.v1.gold`.
+13. **The Rust, C and Python compatibility SDKs under `sdks/` are outside this
+    reference.** Only `python/qihse/` ([§9](#9-python-sdk--pythonqihse)) is
+    enumerated here. `sdks/python/` (native CPython bindings),
+    `sdks/c/qihse_libpq.h`, `sdks/c/qihse_mongo_c.h` and `sdks/rust/` exist and
+    are not verified by this document.

@@ -4,14 +4,19 @@
 > repository.** The header claims "Phase A & B COMPLETE" with 62/62 passing
 > tests.
 >
-> **Contradictions with the tree:** four of the five test suites in the results
-> table do not exist — `tests/test_pg_sql.c`, `tests/test_bolt.c`,
-> `tests/test_repl.c` and `tests/test_sdk.py` are absent from this repository,
-> and only `tests/test_graph.c` is present (and is a different suite from the
-> one described). The two cited commits (`9615def`, `4340927`) do not resolve
-> in the current history. Do not cite this table as evidence.
+> **Contradictions with the tree:** `tests/test_pg_sql.c` and `tests/test_sdk.py`
+> are absent from this repository, and the two cited commits (`9615def`,
+> `4340927`) do not resolve in the current history, so the results table below
+> cannot be reproduced as written. Do not cite it as evidence. Two of the suites
+> the status note originally listed as absent — `tests/test_bolt.c` and
+> `tests/test_repl.c` — now exist, as does `tests/test_graph.c`; each covers
+> different behaviour from the suite this plan describes, so their presence does
+> not validate the table either.
 
-> **Status: Phase A & B COMPLETE** — All features below have been implemented, tested, and committed. See test results at the bottom of this document.
+> **Original plan header (retained for design history; contradicted by the
+> repository, see above):** Phase A & B COMPLETE — All features below have been
+> implemented, tested, and committed. See test results at the bottom of this
+> document.
 
 ## 0. Design Philosophy
 

@@ -1012,4 +1012,4 @@ qihse-optimize --benchmark benchmark_results.json --profile profile_data.json --
 
 ---
 
-This deployment guide provides comprehensive instructions for production deployment of QIHSE across various environments. For additional support, consult the [User Guide](user/) or [Security Guide](security/).
+This deployment guide provides comprehensive instructions for production deployment of QIHSE across various environments. For additional support, consult the [User Guide](../user/README.md) or the [Security Guide](../../security/README.md).

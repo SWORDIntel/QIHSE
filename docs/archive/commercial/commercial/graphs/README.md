@@ -1,5 +1,12 @@
 # QIHSE Commercial Visual Assets
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 This directory contains specifications and data for generating professional graphs and charts used in QIHSE commercial documentation.
 
 ## Graph Generation Instructions

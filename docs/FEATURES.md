@@ -3,9 +3,15 @@
 > **Status: partial.** This is a feature map, and per-engine verification
 > varies. Engines with CI-wired tests include the event stream, document store,
 > column store, time-series, FTS, graph, vector DB and routing persistence.
-> SQL, transactions and secondary indexes cite test files that do not exist —
-> see the status lines in
-> [architecture/](architecture/) for the specific documents.
+> SQL, transactions and secondary indexes are covered by
+> `tests/test_sql_completeness.c`, `tests/test_sql_dml_exec.c`,
+> `tests/test_txn.c`, `tests/test_mvcc_delete.c` and `tests/test_indexes.c` —
+> an earlier revision of this document said those test files did not exist, and
+> that is no longer true. Read the per-area status lines in
+> `tests/gold/pack.v1.gold` and in [architecture/](architecture/) for the
+> specific gaps that remain (SQL INSERT does not yet populate the mutable row
+> store that UPDATE/DELETE execute against, and the Bolt adapter does not
+> return query results to a driver).
 
 This document is the detailed feature map for QIHSE. The [root README](../README.md) intentionally stays higher level.
 
@@ -81,8 +87,9 @@ The persistence stack includes:
 - write-ahead logging
 - checkpoint and replay
 - crash recovery
-- full and incremental backup
+- full backup and restore (incremental export is **not** implemented: it returns UNSUPPORTED because the KV store exposes no change sequence — see [Replication and backup](architecture/replication_backup.md))
 - replication slots and WAL shipping
+- replica-side WAL apply into a bound store
 - read-replica routing
 - background compaction
 - TTL expiration
@@ -125,7 +132,7 @@ The operational layer includes:
 
 - streaming replication
 - read replicas
-- full/incremental backup and restore
+- full backup and restore (no incremental export — see above)
 - parallel query execution
 - connection pooling
 - change data capture

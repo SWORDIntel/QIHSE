@@ -690,4 +690,4 @@ setenv("QIHSE_MEMORY_DEBUG", "1", 1);
 
 ---
 
-This guide covers the essential aspects of installing, configuring, and using QIHSE. For detailed API documentation, see the [API Reference](api/). For deployment in production environments, see the [Deployment Guide](deployment/).
+This guide covers the essential aspects of installing, configuring, and using QIHSE. For detailed API documentation, see the [API Reference](../api/README.md). For deployment in production environments, see the [Deployment Guide](../deployment/README.md).

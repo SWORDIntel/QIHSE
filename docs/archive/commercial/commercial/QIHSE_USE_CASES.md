@@ -1,5 +1,12 @@
 # QIHSE Industry Use Case Studies
 
+> **Status: superseded** — retained for design history. This document
+> describes an earlier revision, name or direction and is not maintained
+> against the current tree; for current status use
+> [docs/README.md](../../../README.md) and the documents it indexes. Documents under
+> `docs/archive/` inherit `superseded` by the convention stated in
+> `docs/archive/README.md`.
+
 ## Real-World Performance Impact Across Major Technology Companies
 
 This document provides detailed case studies demonstrating QIHSE's transformative impact on search infrastructure at scale. Each case study includes current challenges, QIHSE solutions, quantified benefits, and implementation roadmaps.
