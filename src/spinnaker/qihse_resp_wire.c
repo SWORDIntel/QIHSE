@@ -23,7 +23,7 @@
 #include <pthread.h>
 #include <liburing.h>
 #include <poll.h>
-#include "../networking/qihse_af_xdp.h"
+#include "qihse_af_xdp.h"
 #endif
 #include "../broad_oak/qihse_quantum_defense.h"
 

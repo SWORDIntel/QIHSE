@@ -58,7 +58,7 @@
 #include <openssl/crypto.h>
 #include <liburing.h>
 #include <poll.h>
-#include "../networking/qihse_af_xdp.h"
+#include "qihse_af_xdp.h"
 #include "../../persistence/qihse_pqc_crypto.h"
 #else
 #include <winsock2.h>

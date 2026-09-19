@@ -15,7 +15,7 @@
 #include "qihse_uwp_tls.h"
 #ifndef _WIN32
 #include <liburing.h>
-#include "../networking/qihse_af_xdp.h"
+#include "qihse_af_xdp.h"
 #endif
 
 #include <stdio.h>
