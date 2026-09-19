@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE Join Executor — Phase 1 Relational Completeness
  *

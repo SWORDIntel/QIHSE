@@ -813,7 +813,9 @@ static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store, const char* key
 }
 
 static void lookup_result_free(kv_lookup_result_t* r) {
-    if (!r) return; free(r->value); memset(r, 0, sizeof(*r));
+    if (!r) return;
+    free(r->value);
+    memset(r, 0, sizeof(*r));
 }
 
 typedef struct { qihse_trinary_trie_t* dst; bool ok; size_t mem_usage; } copy_trie_ctx_t;
@@ -1217,7 +1219,9 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
 
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) { if (store) store->bulk_load_mode = true; }
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
-    if (!store) return; store->bulk_load_mode = false; flush_wal_buffer(store);
+    if (!store) return;
+    store->bulk_load_mode = false;
+    flush_wal_buffer(store);
 }
 
 static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
@@ -1513,7 +1517,8 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
     }
     size_t removed = 0u;
     if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (qihse_kv_del_user(store, ctx.keys[i], user)) removed++;
-    for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]); free(ctx.keys);
+    for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
+    free(ctx.keys);
     /* Physically purge the SSTable copies of everything just tombstoned —
      * same on-disk removal guarantee as the old compact-first version. */
     if (removed > 0 && fast && store->sstable_counter > 0)
@@ -1628,7 +1633,8 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     if (!new_wal) { close(new_wal_fd); qihse_trinary_trie_destroy(replacement); return -1; }
     qihse_trinary_trie_t* old = store->trie; FILE* old_wal = store->wal_fd;
     store->trie = replacement; store->mem_usage = replacement_usage; store->wal_fd = new_wal; store->wal_unflushed_bytes = 0u;
-    if (old_wal) fclose(old_wal); if (old) qihse_trinary_trie_destroy(old);
+    if (old_wal) fclose(old_wal);
+    if (old) qihse_trinary_trie_destroy(old);
     const char* dir = get_qihse_data_dir();
     if (dir) for (int i = 0; i < store->sstable_counter; i++) {
         char path[4096]; int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);

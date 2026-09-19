@@ -433,7 +433,9 @@ static int qihse_verify_result_advanced_internal(
         size_t elen = strlen(error_msg);
         verification_result->error_message = calloc(1, elen + 1);
         if (verification_result->error_message) {
-            strncpy(verification_result->error_message, error_msg, elen);
+            /* Copy the terminator too (n = strlen + 1); strncpy with n ==
+             * strlen() copies no NUL, which is what the warning flagged. */
+            strncpy(verification_result->error_message, error_msg, elen + 1);
         }
         errno = EINVAL;  /* Invalid result due to low confidence */
         return -1;  /* Return error - result rejected */
@@ -466,7 +468,8 @@ int qihse_verify_result_advanced(
         size_t elen = strlen(error_msg);
         verification_result->error_message = calloc(1, elen + 1);
         if (verification_result->error_message) {
-            strncpy(verification_result->error_message, error_msg, elen);
+            /* n = strlen + 1 so the terminator is copied as well. */
+            strncpy(verification_result->error_message, error_msg, elen + 1);
         }
         errno = EINVAL;
         return -1;  /* Reject NONE mode for precision requirements */
@@ -501,7 +504,8 @@ int qihse_verify_batch(
             size_t elen = strlen(error_msg);
             verification_results[i].error_message = calloc(1, elen + 1);
             if (verification_results[i].error_message) {
-                strncpy(verification_results[i].error_message, error_msg, elen);
+                /* n = strlen + 1 so the terminator is copied as well. */
+                strncpy(verification_results[i].error_message, error_msg, elen + 1);
             }
             errno = EINVAL;
             return -1;  /* Reject entire batch for NONE mode */

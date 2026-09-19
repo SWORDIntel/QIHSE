@@ -482,6 +482,12 @@ qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t*
                                                         qihse_peer_verdict_t* out_verdict) {
     if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
     if (!server || !server->client_ctx || !host) return NULL;
+    /* timeout_ms is currently NOT honoured: the connect/handshake bound is the
+     * fixed QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC, and the post-handshake alert
+     * window below is the fixed 100 ms heuristic.  Wiring the caller's value
+     * through would change connect behaviour, so it is left as-is (see the
+     * warning-cleanup report). */
+    (void)timeout_ms;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));

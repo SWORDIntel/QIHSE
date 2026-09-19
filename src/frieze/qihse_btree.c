@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* qihse_btree.c — Phase 3.1/3.3 cache-conscious B+ tree index.
  *
  * Design notes

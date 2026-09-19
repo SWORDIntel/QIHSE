@@ -1402,12 +1402,13 @@ bool qihse_memory_migration_decision_inspect(
         return true;
     }
 
-    (void)strncpy(
-        out_decision->plan_reason,
-        plan.reason,
-        sizeof(out_decision->plan_reason) - 1);
-    out_decision->plan_reason[sizeof(out_decision->plan_reason) - 1] = '\0';
-    out_decision->plan_reason[sizeof(out_decision->plan_reason) - 1u] = '\0';
+    /* Bounded copy that always terminates: strncpy here could copy a full
+     * 127 bytes without a NUL (and did, per the old warning).  snprintf is
+     * provably safe — source and destination are both REASON_SIZE bytes — and
+     * the destination is zeroed above, so the bytes past the NUL are
+     * unchanged. */
+    snprintf(out_decision->plan_reason, sizeof(out_decision->plan_reason), "%s",
+             plan.reason);
 
     out_decision->source_type = plan.source_type;
     out_decision->preserves_coherence = plan.preserves_coherence;

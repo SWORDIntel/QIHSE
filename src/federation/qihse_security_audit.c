@@ -159,8 +159,14 @@ static bool runtime_profile_decode(const char* blob, qihse_runtime_profile_t* ou
     const char* p = blob;
     size_t want = 8u + QIHSE_IFACE_COUNT;
     for (size_t i = 0; i < want; i++) p = sa_next_field(p, f[i], sizeof(f[i]));
-    snprintf(out->service, sizeof(out->service), "%s", f[0]);
-    snprintf(out->version, sizeof(out->version), "%s", f[1]);
+    /* service/version are fixed-width record fields bounded by
+     * QIHSE_RUNTIME_PROFILE_ID_MAX, which is part of the public profile
+     * contract; bound the copy explicitly instead of widening the field.
+     * Truncation at 64 chars is what snprintf("%s") already did. */
+    snprintf(out->service, sizeof(out->service), "%.*s",
+             (int)(sizeof(out->service) - 1u), f[0]);
+    snprintf(out->version, sizeof(out->version), "%.*s",
+             (int)(sizeof(out->version) - 1u), f[1]);
     out->generation = (uint64_t)strtoull(f[2], NULL, 10);
     out->allowed_capabilities = (uint64_t)strtoull(f[3], NULL, 10);
     out->core_dumps_allowed = strtoul(f[4], NULL, 10) != 0;

@@ -199,7 +199,12 @@ static bool verification_decode(const char* blob, qihse_trust_verification_t* ou
     (void)rt_uuid_from_hex(f[3], &out->evidence_bundle_id);
     out->evidence_verified_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
     (void)rt_uuid_from_hex(f[5], &out->verification_principal);
-    snprintf(out->verification_result, sizeof(out->verification_result), "%s", f[6]);
+    /* verification_result is a fixed-width field of the v3.md §35 verification
+     * record; its width is part of the record's ABI, so the copy is bounded
+     * explicitly rather than widening the field.  Truncation at 63 chars is
+     * what snprintf("%s") already did — no behaviour change. */
+    snprintf(out->verification_result, sizeof(out->verification_result), "%.*s",
+             (int)(sizeof(out->verification_result) - 1u), f[6]);
     return true;
 }
 
@@ -211,6 +216,10 @@ static void emit_trust_event(void* journal_void, void* user_void,
                              const qihse_trust_verification_t* v,
                              qihse_runtime_trust_t previous) {
     if (!journal_void) return;
+    /* The F2 journal append is context-free by design — it takes only the
+     * journal handle — so there is nothing here for the caller's security
+     * context to do; qihse_trust_verification_put() has already enforced it. */
+    (void)user_void;
     qihse_federation_journal_t* journal = (qihse_federation_journal_t*)journal_void;
     qihse_federation_mutation_t m;
     memset(&m, 0, sizeof(m));

@@ -6,6 +6,7 @@
 #include "../memory/include/qihse_memory.h"
 #include "qihse_vector_db.h"
 #include "../persistence/qihse_container.h"
+#include "qihse_auth.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -311,6 +312,11 @@ int main(void) {
          test_memory_budget_zero_restores_spilled},
     };
 
+    if (!qihse_auth_init() || !qihse_auth_bootstrap_operator("PersistenceTestPass123!")) {
+        fprintf(stderr, "FAIL: auth init or operator bootstrap failed\n");
+        return 1;
+    }
+
     for (size_t i = 0; i < ARRAY_LEN(tests); i++) {
         printf("RUN  %s\n", tests[i].name);
         if (!tests[i].fn()) {
@@ -435,6 +441,7 @@ static int search_one(qihse_vector_db_t vdb,
         .similarity_threshold = 0.999f,
         .include_vectors = include_vector,
         .include_metadata = include_metadata,
+        .user = qihse_auth_get_user(0),
     };
 
     return qihse_vector_db_search(vdb, &query, result, 1);
@@ -899,11 +906,6 @@ static bool test_wal_replays_unflushed_delete_update_upsert(void) {
     TEST_ASSERT(add_one(db, upsert_old, ARRAY_LEN(upsert_old), 9603, NULL, 0),
                 "upsert target insert should succeed");
     TEST_ASSERT(close_db(db), "base snapshot should close before WAL mutations");
-    if (access(path, 0) != 0) {
-        printf("[DEBUG] path '%s' does not exist! errno=%d (%s)\n", path, errno, strerror(errno));
-    } else {
-        printf("[DEBUG] path '%s' exists!\n", path);
-    }
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -911,9 +913,6 @@ static bool test_wal_replays_unflushed_delete_update_upsert(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED
     );
-    if (db == NULL) {
-        printf("[DEBUG] qihse_vector_db_open failed! errno=%d (%s)\n", errno, strerror(errno));
-    }
     TEST_ASSERT(db != NULL, "writer reopen should return a database");
     TEST_ASSERT(qihse_vector_db_delete_by_id(db, 9601),
                 "delete mutation should append WAL");
@@ -2165,6 +2164,7 @@ static int search_many(qihse_vector_db_t vdb,
         .include_metadata = false,
         .use_trinary_candidates = false,
         .candidate_count = 0u,
+        .user = qihse_auth_get_user(0),
     };
 
     return qihse_vector_db_search(vdb, &query, results, max_results);
@@ -2186,6 +2186,7 @@ static int search_many_qtri(qihse_vector_db_t vdb,
         .include_metadata = false,
         .use_trinary_candidates = true,
         .candidate_count = candidate_count,
+        .user = qihse_auth_get_user(0),
     };
 
     return qihse_vector_db_search(vdb, &query, results, max_results);
@@ -2209,6 +2210,7 @@ static int search_many_qtri_scalar(qihse_vector_db_t vdb,
         .candidate_count = candidate_count,
         .query_mode = QIHSE_VDB_QUERY_TRINARY_SCALAR,
         .candidate_pool_size = candidate_pool_size,
+        .user = qihse_auth_get_user(0),
     };
 
     return qihse_vector_db_search(vdb, &query, results, max_results);
@@ -2230,6 +2232,7 @@ static int search_many_qmag(qihse_vector_db_t vdb,
         .include_metadata = false,
         .query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
         .candidate_pool_size = candidate_count,
+        .user = qihse_auth_get_user(0),
     };
 
     return qihse_vector_db_search(vdb, &query, results, max_results);
@@ -2469,6 +2472,7 @@ static bool test_trinary_rerank_hydrates_requested_payloads(void) {
         .include_metadata = true,
         .query_mode = QIHSE_VDB_QUERY_TRINARY_SCALAR,
         .candidate_pool_size = ARRAY_LEN(vectors),
+        .user = qihse_auth_get_user(0),
     };
     int count = qihse_vector_db_search(db, &scalar_query, scalar_results,
                                        ARRAY_LEN(scalar_results));
@@ -2494,6 +2498,7 @@ static bool test_trinary_rerank_hydrates_requested_payloads(void) {
         .include_metadata = false,
         .query_mode = QIHSE_VDB_QUERY_TRINARY_SCALAR,
         .candidate_pool_size = ARRAY_LEN(vectors),
+        .user = qihse_auth_get_user(0),
     };
     count = qihse_vector_db_search(db, &omitted_query, &omitted_result, 1u);
     TEST_ASSERT(count == 1, "scalar trinary rerank should return one omitted-payload result");
@@ -2516,6 +2521,7 @@ static bool test_trinary_rerank_hydrates_requested_payloads(void) {
         .include_metadata = true,
         .query_mode = QIHSE_VDB_QUERY_TRINARY_MAGNITUDE,
         .candidate_pool_size = ARRAY_LEN(vectors),
+        .user = qihse_auth_get_user(0),
     };
     count = qihse_vector_db_search(db, &qmag_query, &qmag_result, 1u);
     TEST_ASSERT(count == 1, "qmag trinary rerank should return one result");

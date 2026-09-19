@@ -163,10 +163,6 @@ static void table_add(table_t* t, brow_t r) {
     if (t->count == t->cap) { t->cap = t->cap ? t->cap * 2 : 8; t->rows = realloc(t->rows, t->cap * sizeof(brow_t)); }
     t->rows[t->count++] = r;
 }
-static void table_clear(table_t* t) {
-    for (size_t i = 0; i < t->count; ++i) brow_free(&t->rows[i]);
-    t->count = 0;
-}
 
 /* ---- expression evaluation ---- */
 
@@ -543,6 +539,19 @@ static cypher_res_t eval_expr(qihse_graph_t* g, const cypher_expr_t* e, const br
             cypher_res_free(&a); cypher_res_free(&b);
             return r;
         }
+        /* These expression forms are produced by the parser but have no
+         * evaluator in this build; they evaluate to NULL, exactly as they
+         * did when they fell out of this switch. */
+        case CEXPR_LIST_COMP:
+        case CEXPR_PATTERN_COMP:
+        case CEXPR_INDEX_ACCESS:
+        case CEXPR_SLICE:
+        case CEXPR_SUBQUERY:
+            return cypher_res_null();
+        /* Every cypher_expr_type_t value is handled above.  The default is
+         * fail-closed: an unrecognised form must not look like a value. */
+        default:
+            return cypher_res_null();
     }
     return cypher_res_null();
 }
@@ -841,7 +850,10 @@ static void exec_set(qihse_graph_t* g, const qihse_cypher_clause_t* c, table_t* 
 
 static void exec_remove(qihse_graph_t* g, const qihse_cypher_clause_t* c, table_t* in, table_t* out) {
     table_init(out);
+    /* Removal is not implemented by the store yet: rows pass through
+     * unchanged, so neither the graph handle nor the clause is consulted. */
     (void)g;
+    (void)c;
     for (size_t r = 0; r < in->count; ++r) {
         brow_t nr; brow_copy_into(&in->rows[r], &nr);
         /* property/label removal not fully supported by store; row passes through */
@@ -949,9 +961,9 @@ static void exec_load_csv(qihse_graph_t* g, const qihse_cypher_clause_t* c, tabl
 
         for (size_t i = 0; i < npairs; i++) {
             const char* key = (i < headers.count) ? headers.fields[i] : NULL;
-            const char* val = (i < row.count) ? row.fields[i] : "";
             if (!key) {
-                char buf[16]; snprintf(buf, sizeof(buf), "col_%zu", i);
+                /* "col_" + up to 20 digits of size_t + NUL. */
+                char buf[25]; snprintf(buf, sizeof(buf), "col_%zu", i);
                 map_val.val.list.items[i] = cypher_res_string(buf);
             } else {
                 map_val.val.list.items[i] = cypher_res_string(key);
@@ -1203,17 +1215,14 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
     while (c) {
         switch (c->type) {
             case CYPHER_MATCH: {
-                table_t out;
                 for (size_t p = 0; p < c->num_paths; ++p) {
                     table_t tmp;
                     exec_match_path(g, c->paths[p], &cur, &tmp);
                     table_free(&cur); cur = tmp;
                 }
-                (void)out;
                 break;
             }
             case CYPHER_CREATE: {
-                table_t out;
                 for (size_t p = 0; p < c->num_paths; ++p) {
                     table_t tmp;
                     exec_create_path(g, c->paths[p], &cur, &tmp);
@@ -1222,7 +1231,6 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
                 break;
             }
             case CYPHER_MERGE: {
-                table_t out;
                 for (size_t p = 0; p < c->num_paths; ++p) {
                     table_t tmp;
                     exec_merge_path(g, c->paths[p], &cur, &tmp);

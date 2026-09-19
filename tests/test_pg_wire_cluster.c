@@ -6,9 +6,11 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <signal.h>
 #include "qihse_pg_wire.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_kv_store.h"
+#include "qihse_auth.h"
 
 typedef struct {
     int server_fd;
@@ -38,6 +40,14 @@ static void send_pg_msg(int fd, uint8_t tag, const char* body, size_t body_len) 
 
 static void test_pg_wire_handshake_and_queries() {
     printf("Testing PostgreSQL Wire Protocol Sharded Multi-Model Ingress...\n");
+    signal(SIGPIPE, SIG_IGN);
+
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("PGWireClusterTestPass123!"));
+    qihse_user_t* op = qihse_auth_get_user(0);
+    assert(op);
+    qihse_user_t* user = qihse_auth_create_user(op, 1, QIHSE_ROLE_OPERATOR, 0xFFFF, 0xFFFF, "PGWireClusterTestPass123!", false);
+    assert(user);
 
     int fds[2];
     int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -67,25 +77,56 @@ static void test_pg_wire_handshake_and_queries() {
     pthread_t stid;
     pthread_create(&stid, NULL, server_worker, &sargs);
 
-    // 1. Send Startup packet (Length: 8, Protocol: 3.0 = 196608)
-    uint32_t startup_pkt[2];
-    startup_pkt[0] = htonl(8);
-    startup_pkt[1] = htonl(196608);
-    write(fds[0], startup_pkt, 8);
+    // 1. Send Startup packet (Length, Protocol: 3.0, "user\0User_1\0database\0qihse\0\0")
+    char startup_payload[128];
+    int ppos = 0;
+    memcpy(startup_payload + ppos, "user", 5); ppos += 5;
+    memcpy(startup_payload + ppos, "User_1", 7); ppos += 7;
+    memcpy(startup_payload + ppos, "database", 9); ppos += 9;
+    memcpy(startup_payload + ppos, "qihse", 6); ppos += 6;
+    startup_payload[ppos++] = '\0';
+
+    uint32_t pkt_len = htonl((uint32_t)(8 + ppos));
+    uint32_t proto = htonl(196608);
+    write(fds[0], &pkt_len, 4);
+    write(fds[0], &proto, 4);
+    write(fds[0], startup_payload, ppos);
+
+    // Read AuthenticationCleartextPassword ('R', len=8, type=3)
+    uint8_t tag = 0;
+    assert(read(fds[0], &tag, 1) == 1 && tag == 'R');
+    uint32_t auth_len = 0;
+    assert(read(fds[0], &auth_len, 4) == 4);
+    auth_len = ntohl(auth_len);
+    assert(auth_len == 8);
+    uint32_t auth_type = 0;
+    assert(read(fds[0], &auth_type, 4) == 4);
+    auth_type = ntohl(auth_type);
+    assert(auth_type == 3);
+
+    // Send PasswordMessage ('p', len, password\0)
+    const char* password = "PGWireClusterTestPass123!";
+    size_t pw_len = strlen(password) + 1;
+    uint32_t pw_msg_len = htonl((uint32_t)(4 + pw_len));
+    uint8_t pw_tag = 'p';
+    write(fds[0], &pw_tag, 1);
+    write(fds[0], &pw_msg_len, 4);
+    write(fds[0], password, pw_len);
 
     // Read responses until ReadyForQuery ('Z')
-    uint8_t tag = 0;
+    tag = 0;
     while (read(fds[0], &tag, 1) > 0) {
         uint32_t len = 0;
-        read(fds[0], &len, 4);
+        assert(read(fds[0], &len, 4) == 4);
         len = ntohl(len);
         if (len > 4) {
             char* buf = malloc(len - 4);
-            read(fds[0], buf, len - 4);
+            assert(read(fds[0], buf, len - 4) == (ssize_t)(len - 4));
             free(buf);
         }
         if (tag == 'Z') break;
     }
+    assert(tag == 'Z');
     printf("  -> Startup handshake OK (AuthOk + ParameterStatus + ReadyForQuery)\n");
 
     // 2. Query virtual system tables: SELECT * FROM pg_catalog.pg_tables

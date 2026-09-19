@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* qihse_index_scan.c — Phase 3.5 index scan executor operator.
  *
  * Wraps B+ tree range/prefix cursors and hash equality lookups behind a

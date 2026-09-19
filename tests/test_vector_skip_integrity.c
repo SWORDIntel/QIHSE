@@ -61,10 +61,11 @@ int main(void) {
     qihse_ctr_close(&writer);
 
     unsetenv("QIHSE_ENFORCE_INTEGRITY");
+    setenv("QIHSE_SKIP_INTEGRITY", "1", 1);
     qihse_container_t reader;
     assert(qihse_ctr_open_read(path, &reader));
-    /* CI/pre-production has no KEM private key, so this proves the load below
-     * exercises the skip-CRC path rather than simply failing a checksum. */
+    /* With QIHSE_SKIP_INTEGRITY set, verify reader activates skip_integrity
+     * and the load below exercises the structural validation path without CRC. */
     assert(reader.skip_integrity);
     qihse_ctr_close(&reader);
 

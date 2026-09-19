@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* qihse_hash_index.c — Phase 3.2 open-addressed hash index with linear
  * probing, dynamic resizing, and tombstone-based deletion.
  */

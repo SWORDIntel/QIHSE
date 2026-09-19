@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE Aggregate Executor — Phase 1 Relational Completeness
  * Hardened against unbounded memory amplification and allocation failures.

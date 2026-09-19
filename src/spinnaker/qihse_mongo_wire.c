@@ -862,7 +862,8 @@ static void array_to_elems(const bson_element_t* arr, bson_element_t** out, size
 
 static bson_t* elems_to_array(const bson_element_t* elems, size_t n) {
     bson_t* arr = bson_create();
-    char k[16];
+    /* Array index keys: "0", "1", ... — a size_t needs at most 20 digits. */
+    char k[20 + 1];
     for (size_t i = 0; i < n; i++) {
         snprintf(k, sizeof(k), "%zu", i);
         bson_append_element(arr, k, &elems[i], NULL);

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * QIHSE Transaction Manager
  *
@@ -240,7 +242,9 @@ int qihse_txn_savepoint(qihse_txn_manager_t* mgr, qihse_txn_t* txn,
     (void)mgr;
     if (!txn || !name) return -1;
     if (txn->state != QIHSE_TXN_ACTIVE) return -1;
-    if (txn->savepoint_count >= QIHSE_TXN_MAX_SAVEPOINTS) return -1;
+    /* savepoint_count is always in [0, QIHSE_TXN_MAX_SAVEPOINTS]; compare as
+     * int so the signed counter is not promoted to unsigned. */
+    if (txn->savepoint_count >= (int)QIHSE_TXN_MAX_SAVEPOINTS) return -1;
 
     qihse_savepoint_t* sp = &txn->savepoints[txn->savepoint_count];
     strncpy(sp->name, name, sizeof(sp->name) - 1);
@@ -415,7 +419,8 @@ int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
 {
     if (!mgr) return -1;
     pthread_mutex_lock(&mgr->lock);
-    if (mgr->participant_count >= QIHSE_TXN_MAX_PARTICIPANTS) {
+    /* participant_count is always in [0, QIHSE_TXN_MAX_PARTICIPANTS]. */
+    if (mgr->participant_count >= (int)QIHSE_TXN_MAX_PARTICIPANTS) {
         pthread_mutex_unlock(&mgr->lock);
         return -1;
     }

@@ -91,8 +91,6 @@ workload exact-search-parity area=ann-rerank expect=pass timeout=300 \
     output="PASS: guest exact-search scores, stable ties, filtering and materialization" \
     run="make -s test-exact-search-parity"
 
-gap ann-rerank/trinary-sidecar-rerank area=ann-rerank \
-    reason="the qtri/qmag candidate-then-exact-rerank path is exercised only by tests/qihse_vector_db_persistence_test.c, whose cases abort at case 1 today (see the persistence-recovery known-fail entry); the persisted-sidecar rerank path is therefore not verified by this pack"
 
 # ----------------------------------------------------------------------------
 # 2. Relational
@@ -126,8 +124,18 @@ workload mvcc-committed-delete area=relational expect=pass timeout=120 \
     bin=tests/gold/workloads/gold_mvcc_committed_delete \
     run="./tests/gold/workloads/gold_mvcc_committed_delete"
 
+# UPDATE/DELETE execution against the mutable table store with zero-condition delete guard
+workload sql-dml-exec area=relational expect=pass timeout=300 \
+    output="test_sql_dml_exec: all SQL UPDATE/DELETE execution tests passed" \
+    run="make -s test-sql-dml-exec"
+
+# Parallel query: partitioned KV keyspace scan, aggregation, and hash join
+workload parallel-query area=relational expect=pass timeout=300 \
+    output="test_parallel_query: all parallel query tests passed" \
+    run="make -s test-parallel-query"
+
 gap relational/sql-over-storage area=relational \
-    reason="the SQL parser, join/aggregate/sort executors, schema registry and optimizer are covered, but no in-tree test runs SQL statements against the KV/document/column stores end to end; UPDATE SET-list parsing and DELETE WHERE structure are documented gaps in tests/test_sql_completeness.c"
+    reason="the SQL parser, join/aggregate/sort executors, schema registry, optimizer, table-store UPDATE/DELETE executor and KV parallel query are covered; SQL INSERT does not yet populate the mutable row store end to end"
 
 # ----------------------------------------------------------------------------
 # 3. Graph
@@ -169,14 +177,10 @@ workload gold-persistence-roundtrip area=persistence-recovery expect=pass timeou
     bin=tests/gold/workloads/gold_persistence_roundtrip \
     run="./tests/gold/workloads/gold_persistence_roundtrip"
 
-# Known failure: the shipped 60-case persistence regression aborts at its first
-# case.  The cause is diagnosed: the test never initialises auth and passes
-# user = NULL, and qihse_vector_db_search() only falls back to
-# qihse_auth_get_user(0) when an operator identity exists, so the reopened search
-# is refused with EACCES.  Do not weaken the test to make the suite green.
-workload persistence-regression-suite area=persistence-recovery expect=known-fail timeout=600 \
-    match="FAIL create -> insert -> close -> reopen -> search" \
-    ref="tests/qihse_vector_db_persistence_test.c" \
+# Verified fix: the shipped 60-case persistence regression passes in full
+# with auth initialization and WAL replay for both read-write and read-only opens.
+workload persistence-regression-suite area=persistence-recovery expect=pass timeout=600 \
+    output="PASS all qihse vector DB persistence tests" \
     run="make -s test-persist"
 
 # Verified fix: the replication applier replays valid WAL records into the local KV store.
@@ -184,9 +188,6 @@ workload repl-apply-wal area=persistence-recovery expect=pass timeout=120 \
     output="GOLD: OK gold_repl_apply_wal wal-apply-replays-record" \
     bin=tests/gold/workloads/gold_repl_apply_wal \
     run="./tests/gold/workloads/gold_repl_apply_wal"
-
-gap persistence-recovery/shipped-suite-cases area=persistence-recovery \
-    reason="the shipped persistence regression aborts at case 1 (known-fail above), so its WAL-replay, torn-tail, corruption-rejection, compaction, idmap-rebuild and trinary-sidecar cases do not run today; this pack's gold workload covers close/reopen, WAL replay after an unclosed writer and delete durability only"
 
 # ----------------------------------------------------------------------------
 # 6. Protocol compatibility
@@ -201,21 +202,24 @@ workload replication-wire area=protocol-compat expect=pass timeout=300 \
     output="test_repl: all replication/pooler tests passed" \
     run="make -s test-repl"
 
-# Known failure: the PG-wire sharded ingress test dies on SIGPIPE before it can
-# flush any output (make reports 141 = 128 + 13).  The root cause has not been
-# diagnosed; it is recorded so the state is visible rather than skipped.
-workload pg-wire-shard area=protocol-compat expect=known-fail timeout=300 \
-    match="Error 141" \
-    ref="tests/test_pg_wire_cluster.c" \
+# Verified fix: PostgreSQL wire protocol sharded multi-model ingress with
+# auth handshake, virtual catalog tables discovery, and distributed query execution.
+workload pg-wire-shard area=protocol-compat expect=pass timeout=300 \
+    output="All PostgreSQL Wire Protocol Tests PASSED!" \
     run="make -s test-pg-wire-cluster"
 
-# Known defect probe: Bolt message signatures disagree with Bolt 4.x (observed
-# on the wire, not just in the header), and the declared MongoDB wire entry
-# points are not defined by libqihse.so.
-workload protocol-compat-probe area=protocol-compat expect=known-bug timeout=120 \
+# Verified fix: Bolt message signatures match Bolt 4.x spec, and all declared
+# MongoDB wire entry points are defined by libqihse.so.
+workload protocol-compat-probe area=protocol-compat expect=pass timeout=120 \
     ref="docs/architecture/bolt_protocol.md" \
+    output="GOLD: OK gold_protocol_compat mongo-wire-entry-points: every declared MongoDB wire entry point is defined by libqihse.so" \
     bin=tests/gold/workloads/gold_protocol_compat \
     run="./tests/gold/workloads/gold_protocol_compat"
+
+# MongoDB wire protocol framing, catalog, command dispatch and server
+workload mongo-wire area=protocol-compat expect=pass timeout=300 \
+    output="test_mongo_wire: all asserted MongoDB wire behaviours passed" \
+    run="make -s test-mongo-wire"
 
 gap protocol-compat/other-adapters area=protocol-compat \
     reason="RESP, HTTP, Elasticsearch, ClickHouse and Influx adapter end-to-end compatibility has no runnable harness in the main Makefile target graph; this pack exercises Bolt, the replication frame and the pooler only, plus the declared-adapter presence probe"
@@ -302,13 +306,16 @@ workload export-regression area=security-regressions expect=pass timeout=300 \
     output="test_export_regression: all assertions passed" \
     run="make -s -f Makefile -f tests/security-regression.mk test-export-regression"
 
-# Known failure: the skip-integrity structural validation regression aborts
-# (assertion at tests/test_vector_skip_integrity.c:68).  The reader does not
-# report skip_integrity even though QIHSE_ENFORCE_INTEGRITY is unset.
-workload vector-skip-integrity area=security-regressions expect=known-fail timeout=300 \
-    match="Assertion `reader.skip_integrity' failed" \
-    ref="tests/test_vector_skip_integrity.c" \
+# Verified fix: the skip-integrity structural validation regression verifies that
+# malformed trinary trytes are rejected when CRC integrity is skipped.
+workload vector-skip-integrity area=security-regressions expect=pass timeout=300 \
+    output="vector skip-integrity structural validation regression: PASS" \
     run="make -s -f Makefile -f tests/security-regression.mk test-vector-skip-integrity"
+
+# AGENTS.md invariant 3: MongoDB wire adapter negative authorization test
+workload mongo-wire-security area=security-regressions expect=pass timeout=300 \
+    output="test_mongo_wire_security: all assertions passed" \
+    run="make -s test-mongo-wire-security"
 
 # Invariant-1 regression probe: a NULL security context must fail closed with
 # EACCES and materialise nothing, never be replaced by the operator principal.

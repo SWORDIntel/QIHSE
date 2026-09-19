@@ -5,13 +5,6 @@
 #include <math.h>
 #include <float.h>
 
-/* Simple dynamic array for vertex IDs */
-typedef struct { uint64_t* data; size_t count; size_t cap; } id_vec_t;
-static void id_vec_push(id_vec_t* v, uint64_t id) {
-    if (v->count >= v->cap) { v->cap = v->cap ? v->cap * 2 : 16; v->data = realloc(v->data, v->cap * sizeof(uint64_t)); }
-    v->data[v->count++] = id;
-}
-
 /* Visited set using a simple hash map (vertex_id -> bool) */
 typedef struct { uint64_t key; int visited; } visited_entry_t;
 typedef struct { visited_entry_t* entries; size_t cap; size_t count; } visited_set_t;

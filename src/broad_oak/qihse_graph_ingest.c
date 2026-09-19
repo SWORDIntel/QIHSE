@@ -512,20 +512,8 @@ int64_t qihse_graph_ingest_vertices_csv(qihse_graph_t* g,
             }
         }
 
-        /* determine ID */
-        uint64_t vid = 0;
-        bool has_explicit_id = false;
-        if (id_col_idx >= 0 && (size_t)id_col_idx < row.count) {
-            char* idstr = row.fields[id_col_idx];
-            if (*idstr) {
-                char* endp;
-                uint64_t parsed = strtoull(idstr, &endp, 10);
-                if (*endp == '\0') { vid = parsed; has_explicit_id = true; }
-                else {
-                    /* string ID — register mapping after creation */
-                }
-            }
-        }
+        /* The ID column is registered verbatim after creation (see the
+         * qihse_graph_ingest_register_id call below); no pre-parse needed. */
 
         /* collect properties (all columns except id, label) */
         char* prop_keys[256];
@@ -536,7 +524,8 @@ int64_t qihse_graph_ingest_vertices_csv(qihse_graph_t* g,
             if ((int)c == id_col_idx || (int)c == label_col_idx) continue;
             const char* col_name = (has_header && c < headers.count) ? headers.fields[c] : NULL;
             if (!col_name) {
-                char buf[16];
+                /* "col_" + up to 20 digits of size_t + NUL. */
+                char buf[25];
                 snprintf(buf, sizeof(buf), "col_%zu", c);
                 prop_keys[num_props] = strdup(buf);
             } else {
@@ -670,7 +659,8 @@ int64_t qihse_graph_ingest_edges_csv(qihse_graph_t* g,
                 continue;
             const char* col_name = (has_header && c < headers.count) ? headers.fields[c] : NULL;
             if (!col_name) {
-                char buf[16];
+                /* "col_" + up to 20 digits of size_t + NUL. */
+                char buf[25];
                 snprintf(buf, sizeof(buf), "col_%zu", c);
                 prop_keys[num_props] = strdup(buf);
             } else {

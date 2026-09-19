@@ -126,7 +126,11 @@ bool qihse_schema_migration_lookup(void* store_void, void* user_void,
     out->from_version = from_version;
     out->to_version = (uint32_t)strtoul(f[1], NULL, 10);
     out->resumable = strtoul(f[2], NULL, 10) != 0;
-    snprintf(out->description, sizeof(out->description), "%s", f[3]);
+    /* description is a fixed-width field of the migration record; the record
+     * width is part of its contract, so the copy is bounded explicitly rather
+     * than widening the field.  Truncation at 127 chars is unchanged. */
+    snprintf(out->description, sizeof(out->description), "%.*s",
+             (int)(sizeof(out->description) - 1u), f[3]);
     return true;
 }
 
@@ -308,7 +312,10 @@ bool qihse_snapshot_lookup(void* store_void, void* user_void,
     out->schema.optional_features = (uint64_t)strtoull(f[9], NULL, 10);
     out->max_generation = (uint64_t)strtoull(f[10], NULL, 10);
     out->wal_continuation_offset = (uint64_t)strtoull(f[11], NULL, 10);
-    snprintf(out->encryption_key_id, sizeof(out->encryption_key_id), "%s", f[12]);
+    /* Fixed-width record field; the record width is part of its contract, so
+     * the copy is bounded explicitly rather than widening the field. */
+    snprintf(out->encryption_key_id, sizeof(out->encryption_key_id), "%.*s",
+             (int)(sizeof(out->encryption_key_id) - 1u), f[12]);
     uint32_t groups = (uint32_t)strtoul(f[13], NULL, 10);
     if (groups > QIHSE_SNAPSHOT_MAX_GROUPS) { free(blob); return false; }
     out->group_count = groups;
@@ -486,7 +493,10 @@ bool qihse_rejoin_state_get(void* store_void, void* user_void,
     out->updated_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
     out->events_transferred = (uint64_t)strtoull(f[5], NULL, 10);
     out->conflicts_applied = (uint64_t)strtoull(f[6], NULL, 10);
-    snprintf(out->last_error, sizeof(out->last_error), "%s", f[7]);
+    /* Fixed-width record field; the record width is part of its contract, so
+     * the copy is bounded explicitly rather than widening the field. */
+    snprintf(out->last_error, sizeof(out->last_error), "%.*s",
+             (int)(sizeof(out->last_error) - 1u), f[7]);
     if (!qihse_uuid_equal(&out->node_id, node_id)) return false;
     return true;
 }

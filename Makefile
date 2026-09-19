@@ -485,7 +485,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-bolt test-repl test-phase-c test-gold
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-parallel-query test-gold
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -528,9 +528,32 @@ test-sql-completeness: lib
 	$(CC) $(CFLAGS) -o tests/test_sql_completeness tests/test_sql_completeness.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_sql_completeness
 
+# UPDATE/DELETE execution against the mutable table store, including the
+# zero-condition DELETE guard (a DELETE whose WHERE parsed to nothing must
+# refuse, never match-all).
+test-sql-dml-exec: lib
+	$(CC) $(CFLAGS) -o tests/test_sql_dml_exec tests/test_sql_dml_exec.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_sql_dml_exec
+
 test-bolt: lib
 	$(CC) $(CFLAGS) -o tests/test_bolt tests/test_bolt.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_bolt
+
+# MongoDB wire adapter: BSON framing (spec-conformant nested documents,
+# declared lengths validated against the bytes present), the catalog, command
+# dispatch and the TCP server (OP_MSG + legacy OP_QUERY/OP_REPLY).
+test-mongo-wire: lib
+	$(CC) $(CFLAGS) -o tests/test_mongo_wire tests/test_mongo_wire.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_mongo_wire
+
+# AGENTS.md invariant 3: the negative authorization test for the MongoDB wire
+# adapter.  A low-clearance principal (classification 91, no SCI) must be
+# denied every access form — query, direct-ID, enumeration, aggregate, update,
+# delete, drop, handle materialisation, NULL context, forged labels, and the
+# same over a real socket — with no protected payload byte in any reply.
+test-mongo-wire-security: lib
+	$(CC) $(CFLAGS) -o tests/test_mongo_wire_security tests/test_mongo_wire_security.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_mongo_wire_security
 
 test-repl: lib
 	$(CC) $(CFLAGS) -o tests/test_repl tests/test_repl.c -L. -lqihse $(LDFLAGS)
@@ -539,6 +562,15 @@ test-repl: lib
 test-phase-c: lib
 	$(CC) $(CFLAGS) -o tests/test_phase_c tests/test_phase_c.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_phase_c
+
+# Parallel query: the scan really partitions the KV keyspace, the aggregate
+# really aggregates, the hash join really joins, a join that cannot have
+# matched anything is refused instead of reporting 0 rows, a refused
+# pthread_create fails the operation, and a context with no user bound sees
+# unclassified rows only.
+test-parallel-query: lib
+	$(CC) $(CFLAGS) -o tests/test_parallel_query tests/test_parallel_query.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_parallel_query
 
 test-cluster-slot: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_slot tests/test_cluster_slot.c -L. -lqihse $(LDFLAGS)
