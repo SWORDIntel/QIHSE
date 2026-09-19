@@ -32,6 +32,10 @@ typedef enum {
     QIHSE_AIMEM_SEMANTIC = 2u  /* what is known  */
 } qihse_ai_memory_kind_t;
 
+/* A read FILTER value, not a storable kind: it selects both kinds.
+ * `qihse_ai_memory_store()` still accepts only EPISODIC and SEMANTIC. */
+#define QIHSE_AIMEM_KIND_ANY 0u
+
 typedef struct {
     char id[QIHSE_AIMEM_ID_LEN + 1u];
     uint64_t created_ms;
@@ -106,6 +110,21 @@ size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* us
                                    qihse_ai_memory_mode_t mode,
                                    qihse_ai_memory_hit_t* out, size_t out_cap);
 
+/* Recall with an explicit ranking mode AND a kind filter: pass
+ * QIHSE_AIMEM_KIND_ANY, QIHSE_AIMEM_EPISODIC or QIHSE_AIMEM_SEMANTIC.
+ *
+ * The two kinds share one namespace and one index, so without a filter an
+ * episodic question ("what happened") and a semantic one ("what is known")
+ * compete for the same limit. The filter is applied to candidates that have
+ * ALREADY been resolved through the authorization-aware read every other path
+ * uses, so it can only remove hits the principal was allowed to see: it can
+ * never widen the result set, and an unrecognised kind value is refused (0)
+ * rather than treated as "any". */
+size_t qihse_ai_memory_recall_kind(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* query, size_t limit,
+                                   qihse_ai_memory_mode_t mode, uint32_t kind,
+                                   qihse_ai_memory_hit_t* out, size_t out_cap);
+
 /* Recall: BM25 search over visible memories. Fills up to `out_cap` hits and
  * returns how many were written; hits with `text` must be freed by the
  * caller (qihse_ai_memory_hits_free). */
@@ -124,6 +143,12 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
 
 /* How many memories the caller can see. */
 size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user);
+
+/* How many memories of one kind the caller can see; QIHSE_AIMEM_KIND_ANY
+ * counts every visible memory, which is what qihse_ai_memory_count() returns.
+ * An unrecognised kind counts nothing rather than counting everything. */
+size_t qihse_ai_memory_count_kind(qihse_resp_server_t* server, qihse_user_t* user,
+                                  uint32_t kind);
 
 void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count);
 

@@ -8,6 +8,11 @@
  * so a restart re-derives it from the durable records. Forgetting a memory
  * removes the KV record; the index posting is ignored at read time when the
  * record is gone (the FTS engine has no delete primitive).
+ *
+ * Reads are narrowed, never widened: every candidate is resolved through the
+ * authorization-aware KV read first, and the kind filter is applied to the
+ * result of that resolve, so no filter value can reach a record the principal
+ * cannot read.
  */
 #include "qihse_ai_memory.h"
 
@@ -51,7 +56,11 @@ static void aimem_key(char* out, size_t cap, uint64_t doc_id) {
     snprintf(out, cap, AIMEM_PREFIX "%016llx", (unsigned long long)doc_id);
 }
 
-static bool aimem_parse_record(const char* value, qihse_ai_memory_hit_t* out) {
+/* Parse the fixed-width header fields, leaving the body in the record. A
+ * count needs the kind and nothing else, and must not strdup a 64 KB body per
+ * record to find it. `text_out` receives the body when the caller wants it. */
+static bool aimem_parse_header(const char* value, qihse_ai_memory_hit_t* out,
+                               const char** text_out) {
     /* <uuid>|<created_ms>|<kind>|<classif>|<sci>|<text> */
     const char* p = value;
     const char* bar = strchr(p, '|');
@@ -71,7 +80,14 @@ static bool aimem_parse_record(const char* value, qihse_ai_memory_hit_t* out) {
     p = end + 1;
     out->sci_compartment = (uint16_t)strtoul(p, &end, 10);
     if (!end || *end != '|') return false;
-    out->text = strdup(end + 1);
+    if (text_out) *text_out = end + 1;
+    return true;
+}
+
+static bool aimem_parse_record(const char* value, qihse_ai_memory_hit_t* out) {
+    const char* text = NULL;
+    if (!aimem_parse_header(value, out, &text)) return false;
+    out->text = strdup(text);
     return out->text != NULL;
 }
 
@@ -462,6 +478,24 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
 
 /* ── read path ──────────────────────────────────────────────────────────── */
 
+/* Bounds on the candidate window a recall may consider and on the fused list
+ * HYBRID builds from it. Both are fixed-size arrays on the stack: recall
+ * never grows a result set beyond what the caller's buffer holds. */
+#define AIMEM_CAND_MAX 256u
+#define AIMEM_FUSED_MAX (2u * AIMEM_CAND_MAX)
+
+/* Kind filter helpers. ANY is the only value wider than one kind; every other
+ * value must name a kind this module can actually have stored, or the read is
+ * refused rather than defaulted. */
+static bool aimem_kind_valid(uint32_t kind) {
+    return kind == QIHSE_AIMEM_KIND_ANY || kind == QIHSE_AIMEM_EPISODIC ||
+           kind == QIHSE_AIMEM_SEMANTIC;
+}
+
+static bool aimem_kind_ok(uint32_t filter, uint32_t kind) {
+    return filter == QIHSE_AIMEM_KIND_ANY || filter == kind;
+}
+
 static bool aimem_fetch(qihse_resp_server_t* server, qihse_user_t* user,
                         const qihse_uuid_t* uuid, qihse_ai_memory_hit_t* out) {
     qihse_kv_store_t* store = qihse_resp_server_store(server);
@@ -500,29 +534,64 @@ static bool aimem_resolve(qihse_resp_server_t* server, qihse_user_t* user,
     return ok;
 }
 
-size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,
-                                   const char* query, size_t limit,
-                                   qihse_ai_memory_mode_t mode,
-                                   qihse_ai_memory_hit_t* out, size_t out_cap) {
+/* Resolve a candidate and then apply the kind filter. The order is the whole
+ * point: authorization runs FIRST, through the same authorization-aware read
+ * every other path uses, and the kind filter can only discard a hit that was
+ * already visible. A rejected candidate releases its text, so a filtered-out
+ * record never leaves a payload in the caller's buffer. */
+static bool aimem_accept(qihse_resp_server_t* server, qihse_user_t* user,
+                         uint64_t doc_id, uint32_t kind_filter,
+                         qihse_ai_memory_hit_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!aimem_resolve(server, user, doc_id, out)) return false;
+    if (!aimem_kind_ok(kind_filter, out->kind)) {
+        free(out->text);
+        out->text = NULL;
+        return false;
+    }
+    return true;
+}
+
+/* Shared body of every recall entry point, so all of them go through the same
+ * candidate gathering, the same authorization-aware resolve, and the same
+ * kind filter. Takes g_aimem_lock only around the shared index/vector state. */
+static size_t aimem_recall(qihse_resp_server_t* server, qihse_user_t* user,
+                           const char* query, size_t limit,
+                           qihse_ai_memory_mode_t mode, uint32_t kind,
+                           qihse_ai_memory_hit_t* out, size_t out_cap) {
     if (!server || !user || !query || !*query || !out || out_cap == 0) return 0;
     if (mode != QIHSE_AIMEM_MODE_BM25 && mode != QIHSE_AIMEM_MODE_SEMANTIC &&
         mode != QIHSE_AIMEM_MODE_HYBRID) {
         return 0;
     }
+    /* An unrecognised kind is refused, not widened to ANY: a filter parameter
+     * that silently means "everything" is the defect it must not introduce. */
+    if (!aimem_kind_valid(kind)) return 0;
     size_t want = limit ? limit : 10u;
     if (want > out_cap) want = out_cap;
-    if (want > 256u) want = 256u;
+    if (want > AIMEM_CAND_MAX) want = AIMEM_CAND_MAX;
+    /* A kind filter discards candidates AFTER authorization, so gather the
+     * whole bounded candidate window rather than only `want` of them —
+     * otherwise a filtered recall would return fewer hits than the caller can
+     * see. The window is bounded by AIMEM_CAND_MAX either way and every
+     * candidate is authorization-filtered, so asking for more candidates
+     * cannot disclose more. */
+    size_t cand_want = want;
+    if (kind != QIHSE_AIMEM_KIND_ANY && cand_want < AIMEM_CAND_MAX) {
+        cand_want = AIMEM_CAND_MAX;
+    }
 
-    aimem_cand_t lexical[256];
-    aimem_cand_t vector[256];
+    aimem_cand_t lexical[AIMEM_CAND_MAX];
+    aimem_cand_t vector[AIMEM_CAND_MAX];
     size_t n_lexical = 0, n_vector = 0;
 
     pthread_mutex_lock(&g_aimem_lock);
     if (mode == QIHSE_AIMEM_MODE_BM25 || mode == QIHSE_AIMEM_MODE_HYBRID) {
         if (aimem_index_ensure(server, NULL)) {
-            qihse_fts_result_t results[256];
-            int found = qihse_fts_search_user(g_aimem_index, query, user, results, (int)want);
-            for (int i = 0; i < found && n_lexical < 256u; i++) {
+            qihse_fts_result_t results[AIMEM_CAND_MAX];
+            int found = qihse_fts_search_user(g_aimem_index, query, user, results,
+                                              (int)cand_want);
+            for (int i = 0; i < found && n_lexical < AIMEM_CAND_MAX; i++) {
                 lexical[n_lexical].doc_id = results[i].doc_id;
                 lexical[n_lexical].score = results[i].bm25_score;
                 n_lexical++;
@@ -535,7 +604,7 @@ size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* us
         if (qdim && qdim <= QIHSE_AIMEM_MAX_DIM &&
             g_aimem_embedder.embed(query, qvec, qdim, g_aimem_embedder.ctx) &&
             aimem_vecs_ensure(server)) {
-            n_vector = aimem_vec_search(qvec, qdim, want, vector);
+            n_vector = aimem_vec_search(qvec, qdim, cand_want, vector);
         }
     }
     pthread_mutex_unlock(&g_aimem_lock);
@@ -545,14 +614,14 @@ size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* us
      * accident; RRF consumes positions and is stable under both. */
     size_t written = 0;
     if (mode == QIHSE_AIMEM_MODE_HYBRID) {
-        struct { uint64_t doc_id; double rrf; } fused[512];
+        struct { uint64_t doc_id; double rrf; } fused[AIMEM_FUSED_MAX];
         size_t n_fused = 0;
-        for (size_t i = 0; i < n_lexical && n_fused < 512u; i++) {
+        for (size_t i = 0; i < n_lexical && n_fused < AIMEM_FUSED_MAX; i++) {
             fused[n_fused].doc_id = lexical[i].doc_id;
             fused[n_fused].rrf = 1.0 / (AIMEM_RRF_K + (double)(i + 1u));
             n_fused++;
         }
-        for (size_t i = 0; i < n_vector && n_fused < 512u; i++) {
+        for (size_t i = 0; i < n_vector && n_fused < AIMEM_FUSED_MAX; i++) {
             size_t j = 0;
             for (; j < n_fused; j++) {
                 if (fused[j].doc_id == vector[i].doc_id) {
@@ -577,8 +646,7 @@ size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* us
         }
         for (size_t i = 0; i < n_fused && written < want; i++) {
             qihse_ai_memory_hit_t hit;
-            memset(&hit, 0, sizeof hit);
-            if (aimem_resolve(server, user, fused[i].doc_id, &hit)) {
+            if (aimem_accept(server, user, fused[i].doc_id, kind, &hit)) {
                 hit.score = fused[i].rrf;
                 out[written++] = hit;
             }
@@ -590,13 +658,27 @@ size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* us
     size_t n_list = (mode == QIHSE_AIMEM_MODE_SEMANTIC) ? n_vector : n_lexical;
     for (size_t i = 0; i < n_list && written < want; i++) {
         qihse_ai_memory_hit_t hit;
-        memset(&hit, 0, sizeof hit);
-        if (aimem_resolve(server, user, list[i].doc_id, &hit)) {
+        if (aimem_accept(server, user, list[i].doc_id, kind, &hit)) {
             hit.score = list[i].score;
             out[written++] = hit;
         }
     }
     return written;
+}
+
+size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* query, size_t limit,
+                                   qihse_ai_memory_mode_t mode,
+                                   qihse_ai_memory_hit_t* out, size_t out_cap) {
+    return aimem_recall(server, user, query, limit, mode, QIHSE_AIMEM_KIND_ANY,
+                        out, out_cap);
+}
+
+size_t qihse_ai_memory_recall_kind(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* query, size_t limit,
+                                   qihse_ai_memory_mode_t mode, uint32_t kind,
+                                   qihse_ai_memory_hit_t* out, size_t out_cap) {
+    return aimem_recall(server, user, query, limit, mode, kind, out, out_cap);
 }
 
 size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user,
@@ -628,22 +710,39 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
 
 typedef struct {
     size_t count;
+    uint32_t kind; /* QIHSE_AIMEM_KIND_ANY counts every visible record */
 } aimem_count_t;
 
 static bool aimem_count_cb(const char* key, const char* value, void* user_data) {
-    (void)value;
     aimem_count_t* c = (aimem_count_t*)user_data;
-    if (strncmp(key, AIMEM_PREFIX, AIMEM_PREFIX_LEN) == 0) c->count++;
+    if (strncmp(key, AIMEM_PREFIX, AIMEM_PREFIX_LEN) != 0) return true;
+    if (c->kind == QIHSE_AIMEM_KIND_ANY) {
+        c->count++;
+        return true;
+    }
+    /* Parse the header rather than substring-match a field separator: a body
+     * containing "|2|" is not a semantic memory. No body is copied — counting
+     * must not duplicate a 64 KB text per record to read one field. */
+    qihse_ai_memory_hit_t hit;
+    memset(&hit, 0, sizeof hit);
+    if (aimem_parse_header(value, &hit, NULL) && hit.kind == c->kind) c->count++;
     return true;
 }
 
-size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user) {
+size_t qihse_ai_memory_count_kind(qihse_resp_server_t* server, qihse_user_t* user,
+                                  uint32_t kind) {
     if (!server || !user) return 0;
+    /* An unrecognised kind counts nothing rather than counting everything. */
+    if (!aimem_kind_valid(kind)) return 0;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
     if (!store) return 0;
-    aimem_count_t c = { 0 };
+    aimem_count_t c = { .count = 0u, .kind = kind };
     qihse_kv_foreach_user(store, user, aimem_count_cb, &c);
     return c.count;
+}
+
+size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user) {
+    return qihse_ai_memory_count_kind(server, user, QIHSE_AIMEM_KIND_ANY);
 }
 
 void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count) {
