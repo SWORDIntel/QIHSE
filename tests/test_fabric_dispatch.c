@@ -206,10 +206,30 @@ static void test_token_verification(const qihse_federation_ca_t* ca) {
     other.now_ms = claims.expires_ms;
     assert(qihse_fabric_token_check(g_store_b, g_op, (const uint8_t*)blob, blob_len,
                                     &other, &verified) == QIHSE_FABRIC_TOKEN_EXPIRED);
-    other = check;
-    other.now_ms = claims.issued_ms + QIHSE_FABRIC_TOKEN_CLOCK_SKEW_MS + 5000u;
-    assert(qihse_fabric_token_check(g_store_b, g_op, (const uint8_t*)blob, blob_len,
-                                    &other, &verified) == QIHSE_FABRIC_TOKEN_NOT_YET_VALID);
+    /* ISSUED IN THE FUTURE is refused, and it is NOT a `not_before` — the
+     * token format has no such field. The rule is that a token whose issued
+     * time is ahead of us beyond the clock skew is refused, because its
+     * expiry is ahead too, so accepting it would give it a longer life than
+     * the TTL allows measured from our clock.
+     *
+     * This assertion previously read `issued_ms + skew + 5000` — a time AFTER
+     * issue — and expected a refusal for being "not yet valid". That is not a
+     * rule this code has, and with issued_ms = 1000 and a 60 s skew it was not
+     * even REACHABLE: `issued > now + skew` cannot hold for any non-negative
+     * `now`. The case is constructed properly here, by minting a token whose
+     * issued time is genuinely ahead of the verifier. */
+    {
+        qihse_fabric_token_t future = claims;
+        uint8_t fblob[QIHSE_FABRIC_TOKEN_MAX_BYTES];
+        size_t flen = 0;
+        future.issued_ms = other.now_ms + QIHSE_FABRIC_TOKEN_CLOCK_SKEW_MS + 5000u;
+        future.expires_ms = future.issued_ms + 60000u;
+        assert(qihse_fabric_token_mint(pkey, &future, fblob, sizeof fblob, &flen));
+        qihse_fabric_token_check_t fcheck = check;
+        fcheck.now_ms = other.now_ms;
+        assert(qihse_fabric_token_check(g_store_b, g_op, fblob, flen, &fcheck, &verified)
+               == QIHSE_FABRIC_TOKEN_ISSUED_IN_FUTURE);
+    }
 
     /* Scope: the token must carry the required scope, and the whole asserted
      * scope must be within what the submitter NODE was enrolled with. */

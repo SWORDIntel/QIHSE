@@ -483,7 +483,7 @@ const char* qihse_fabric_token_verdict_name(qihse_fabric_token_verdict_t v) {
         case QIHSE_FABRIC_TOKEN_UNKNOWN_SUBMITTER: return "unknown-submitter-node";
         case QIHSE_FABRIC_TOKEN_NOT_APPROVED:    return "submitter-not-approved";
         case QIHSE_FABRIC_TOKEN_NODE_MISMATCH:   return "node-not-the-tls-peer";
-        case QIHSE_FABRIC_TOKEN_NOT_YET_VALID:   return "token-not-yet-valid";
+        case QIHSE_FABRIC_TOKEN_ISSUED_IN_FUTURE:   return "token-issued-in-future";
         case QIHSE_FABRIC_TOKEN_EXPIRED:         return "token-expired";
         case QIHSE_FABRIC_TOKEN_TTL_TOO_LONG:    return "token-lifetime-too-long";
         case QIHSE_FABRIC_TOKEN_SCOPE_REFUSED:   return "scope-refused";
@@ -559,8 +559,20 @@ qihse_fabric_token_verdict_t qihse_fabric_token_check(
     /* 5. Lifetime.  A clock that disagrees is refused rather than tolerated:
      * a token from the future would extend the replay window. */
     uint64_t now = check->now_ms ? check->now_ms : fabric_now_ms();
+    /* ISSUED IN THE FUTURE, refused. This is NOT a `not_before`: the token
+     * format has no such field. The rule is that a token whose issued time is
+     * ahead of us beyond the clock skew is refused, because its expiry
+     * (issued + TTL) is ALSO ahead — so accepting it would give it a longer
+     * life than the TTL allows, measured from our clock.
+     *
+     * The name was previously NOT_YET_VALID, which described a concept the
+     * format cannot express and invited exactly the wrong reading: a test
+     * asserted that a token checked AFTER its issue time should be refused
+     * for being "not yet valid", which is not a rule this code has. A name
+     * that describes a feature you do not have is how a reviewer tests the
+     * wrong contract. */
     if (claims.issued_ms > now + QIHSE_FABRIC_TOKEN_CLOCK_SKEW_MS) {
-        verdict = QIHSE_FABRIC_TOKEN_NOT_YET_VALID;
+        verdict = QIHSE_FABRIC_TOKEN_ISSUED_IN_FUTURE;
         goto done;
     }
     if (claims.expires_ms <= now) {
