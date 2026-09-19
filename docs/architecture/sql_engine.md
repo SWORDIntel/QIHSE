@@ -2,7 +2,8 @@
 
 > **Status: partial.** The parser, executors, optimizer and schema registry all
 > have real implementations under `src/tractable/` and are exercised by
-> `tests/test_sql_completeness.c` (run via `make test-sql-completeness`).
+> `tests/test_sql_completeness.c` (run via `make test-sql-completeness`) and
+> `tests/test_sql_dml_exec.c` (run via `make test-sql-dml-exec`).
 > Corrections to earlier revisions of this document:
 >
 > 1. **`UPDATE ... SET` is parsed.** `ast->set_columns`/`set_values`/`num_set`
@@ -26,6 +27,15 @@
 >    is the caller's contract, so the optimizer is only as informed as its
 >    caller. There is no most-common-value (MCV) structure — earlier revisions
 >    of this document claimed MCV tracking that never existed.
+> 5. **`UPDATE` and `DELETE` execute** against the mutable table store
+>    (`src/tractable/qihse_table_store.c`) through
+>    `qihse_uwp_sql_execute_dml()`: the parsed assignments and structured WHERE
+>    conditions are consumed directly, the reply reports the rows actually
+>    changed, and a zero-condition DELETE refuses instead of becoming a
+>    match-all. Earlier revisions documented the opposite — that the executor
+>    reported a document-store match count because no in-place update/delete
+>    API existed. See §3.5. INSERT still writes to the append-only column
+>    store, not the row store.
 >
 > Also unverified here: the pgwire prepared-statement cache (see §6). No test in
 > the tree exercises it.
@@ -179,6 +189,62 @@ DISTINCT tracking uses a separate hash set per group to deduplicate values befor
 - **PREFIX predicate**: Composite index prefix matching on B+ tree
 - Returns matching row IDs that can be joined with table data fetch
 
+### 3.5 Table-store DML Executor (UPDATE / DELETE)
+
+**Files**: `src/spinnaker/qihse_uwp_sql_txn_schema.c`
+(`qihse_uwp_sql_execute_dml`, the UWP SQL UPDATE/DELETE branch),
+`src/tractable/qihse_table_store.c` (the primitives it calls)
+
+The mutable table store is the only in-tree store with in-place update and
+delete primitives, so parsed UPDATE and DELETE statements execute against it.
+The executor consumes the structured AST only — `ast->set_columns` /
+`set_values` / `num_set` for UPDATE and `ast->where_conditions` for both — and
+the raw SQL text is never re-parsed for execution.
+
+- **Row counts are actual changes.** The predicate handed to
+  `qihse_table_update` / `qihse_table_delete` counts every row it accepts, and
+  pre-validation has already rejected unknown columns and non-literal values,
+  so a match is a change. The reply is `OK stmt_type=UPDATE rows=N` /
+  `OK stmt_type=DELETE rows=N`; it does not report a match count for work it
+  did not do.
+- **A zero-condition DELETE refuses.** `DELETE FROM t` and any DELETE whose
+  WHERE clause parsed to zero conditions (an aliased target whose filter was
+  lost, `NOT`, parentheses) are refused with no rows changed. There is no
+  match-all DELETE path in this executor.
+- **A zero-assignment UPDATE refuses** at the executor as well as at the
+  parser.
+- **The WHERE clause is verified against the raw text before execution.** The
+  clause must be exactly the conjunction of the parsed conditions — same
+  columns, operators and values, joined by `AND`, nothing else. `OR`,
+  parentheses, `NOT`, `NOT LIKE` (whose negation the parser drops), `IN`,
+  `BETWEEN` (whose upper bound the parser drops), `IS`, subqueries and a
+  malformed tail all refuse. This check only gates execution; it never
+  supplies a condition or a value.
+- **Supported predicates**: `=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`, `LIKE` and
+  `ILIKE`, joined by AND. Qualified names (`x.id`, an alias the parser drops)
+  resolve on their last component. An UPDATE with no WHERE at all is a
+  legitimate update-all; an UPDATE whose WHERE parsed to nothing is refused.
+- **Assignments must be literals.** Numeric columns require a numeric literal,
+  so `SET n = n + 1` refuses. The AST does not record whether a SET value was
+  quoted, so a value that names a column (`SET name = other_col`) refuses
+  rather than being stored as text; the refusal conservatively also catches a
+  quoted literal that happens to equal a column name.
+- **Atomicity**: all validation happens before the store call, and the store
+  then holds the table's write lock for the whole scan, so a statement cannot
+  interleave with another writer. Statements are **not** integrated with the
+  transaction manager: ROLLBACK does not undo an applied UPDATE/DELETE, and
+  there is no cross-table atomicity. A second identical DELETE reports
+  `rows=0` (idempotent).
+- **Store scope**: the row store is process-wide and lazily created
+  (`qihse_uwp_sql_table_store()`), matching the prepared-statement cache; the
+  UWP SQL path has no per-connection engine state yet, and `ctx->sql_engine`
+  is not dereferenced. Tables must be created in the store before DML can
+  target them. INSERT still writes to the column store, so it does not yet
+  populate the row store.
+- **Permission**: the same model as the KV / column / document targets — the
+  ACL resource id is the FNV-1a hash of the table name, namespace 0; the
+  operator role passes and every other role needs a `QIHSE_ACL_WRITE` grant.
+
 ## 4. Cost-Based Optimizer
 
 **Files**: `include/qihse_optimizer.h`, `src/tractable/qihse_optimizer.c`
@@ -307,9 +373,29 @@ section:
 Reported as a `NOTE` line rather than asserted, so that fixing it cannot break
 the test: the select-list scalar subquery is not extracted.
 
+`tests/test_sql_dml_exec.c` (run via `make test-sql-dml-exec`) covers UPDATE
+and DELETE execution against the mutable table store:
+
+- UPDATE with `=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE` predicates and AND
+  chains, a qualified target alias (`x.id`), a WHERE keyword inside a SET
+  string literal, update-all with no WHERE, and truthful `rows=N` counts;
+- DELETE with equality and string predicates, `RETURNING` excluded from the
+  clause, truthful counts, and idempotent re-deletion (`rows=0`);
+- **the zero-condition DELETE guard**: `DELETE FROM t`, a WHERE clause that
+  parsed to zero conditions (`NOT`, parentheses), and conditions that do not
+  match the raw clause (OR, malformed tails, IN) all refuse with no rows
+  changed; a hand-built zero-condition AST refuses too;
+- the zero-assignment UPDATE refusal at the executor (the parser already
+  refuses it), and refusals for expression SET values, a SET value that names
+  a column, unknown columns, `NOT LIKE`, `IS`, `BETWEEN`, and `IN`;
+- WRITE-permission enforcement: a non-operator without a grant is refused and
+  nothing changes; a grant on the table's FNV-1a resource id allows the
+  statement.
+
 Not covered: the pgwire prepared-statement cache, window functions, and
-`INSERT ... SELECT` execution. UPDATE and DELETE execution is also not covered:
-the UWP dispatcher reports the document-store match count and notes that the
-store has no in-place update/delete API, while the parsed assignments are not
-yet consumed by any executor (the mutable `qihse_table_store` has
-`qihse_table_update`/`qihse_table_delete` but nothing wires SQL to it).
+`INSERT ... SELECT` execution. INSERT is still wired to the column store, not
+the row store, so SQL INSERT does not yet populate the store that UPDATE and
+DELETE execute against; the row store must be populated through
+`qihse_uwp_sql_table_store()`. UPDATE/DELETE are also not integrated with the
+transaction manager, so ROLLBACK does not undo them.
+

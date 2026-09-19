@@ -730,146 +730,586 @@ static char* uwp_ps_substitute(const uwp_ps_slot_t* s) {
 }
 
 /* -------------------------------------------------------------------------
- * Document-store WHERE expression builder.
+ * SQL row store and UPDATE / DELETE execution.
  *
- * The document store's bytecode query API accepts a small expression grammar
- * (==, !=, <, >, <=, >=, AND, OR, NOT) with double-quoted string literals.
- * This converts the AST's structured WHERE conditions into that text form.
- * Conditions using LIKE / IN / subqueries are skipped (unsupported).  Returns
- * an empty buffer when no translatable conditions exist. */
-static void uwp_build_where_expr(uwp_text_buffer_t* out,
-                                 const qihse_sql_ast_t* ast) {
-    if (!out || !ast) return;
-    int first = 1;
-    for (size_t i = 0; i < ast->num_where_conditions; i++) {
-        const qihse_sql_condition_t* c = &ast->where_conditions[i];
-        if (!c->column_name || !c->operator || !c->value) continue;
-        if (c->subq_kind != 0) continue; /* subquery predicates unsupported */
-        const char* bcop = NULL;
-        if (strcasecmp(c->operator, "=") == 0) bcop = "==";
-        else if (strcasecmp(c->operator, "<>") == 0 ||
-                 strcasecmp(c->operator, "!=") == 0) bcop = "!=";
-        else if (strcasecmp(c->operator, "<") == 0) bcop = "<";
-        else if (strcasecmp(c->operator, ">") == 0) bcop = ">";
-        else if (strcasecmp(c->operator, "<=") == 0) bcop = "<=";
-        else if (strcasecmp(c->operator, ">=") == 0) bcop = ">=";
-        else continue; /* LIKE / IN / others unsupported by bytecode VM */
-        if (!first) (void)uwp_text_appendf(out, " AND ");
-        first = 0;
-        (void)uwp_text_appendf(out, "%s %s ", c->column_name, bcop);
-        if (c->value_is_string) {
-            (void)uwp_text_appendf(out, "\"");
-            for (const char* v = c->value; *v; v++) {
-                if (*v == '"') (void)uwp_text_appendf(out, "\"\"");
-                else (void)uwp_text_appendf(out, "%c", *v);
-            }
-            (void)uwp_text_appendf(out, "\"");
-        } else {
-            (void)uwp_text_appendf(out, "%s", c->value);
-        }
-    }
+ * The mutable table store (src/tractable/qihse_table_store.c) is the only
+ * in-tree store with in-place update and delete primitives, so parsed UPDATE
+ * and DELETE statements execute against it.  The store is process-wide and
+ * lazily created, matching the prepared-statement cache above: the UWP SQL
+ * path has no per-connection engine state yet, and ctx->sql_engine is an
+ * opaque caller-owned pointer this file does not dereference.  Tables must be
+ * created in it (qihse_table_store_create_table) before DML can target them.
+ *
+ * Execution reads only the structured AST.  The raw WHERE text is consulted
+ * solely to *verify* that the AST is a complete, faithful representation of
+ * the clause (uwp_dml_where_verifies); a construct the parser dropped -- an
+ * OR, parentheses, a NOT, a malformed tail -- refuses the statement instead of
+ * silently matching rows the statement did not ask for.  Nothing is executed
+ * from the raw text.
+ * ------------------------------------------------------------------------- */
+
+static qihse_table_store_t* uwp_sql_row_store;
+static pthread_mutex_t uwp_sql_row_store_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+qihse_table_store_t* qihse_uwp_sql_table_store(void) {
+    pthread_mutex_lock(&uwp_sql_row_store_mutex);
+    if (!uwp_sql_row_store)
+        uwp_sql_row_store = qihse_table_store_create();
+    qihse_table_store_t* store = uwp_sql_row_store;
+    pthread_mutex_unlock(&uwp_sql_row_store_mutex);
+    return store;
 }
 
-/* Extract and normalize a WHERE clause for DML statements.
- *
- * The parser populates ast->where_conditions for UPDATE and DELETE, and
- * uwp_build_dml_where() prefers those.  This fallback re-reads the raw
- * statement text for constructs the structured form cannot translate (for
- * example LIKE or IN), and normalizes the clause into the document store's
- * bytecode grammar:
- *   - "="  -> "=="
- *   - "<>" -> "!="
- *   - single-quoted string literals -> double-quoted (with " doubled)
- * Returns a malloc'd string (caller frees) or NULL when no WHERE is present.
- * Best-effort: unsupported constructs (LIKE / IN) simply fail to compile at
- * the document store, which the caller reports as zero matches. */
-static char* uwp_extract_dml_where(const qihse_sql_ast_t* ast) {
-    if (!ast || !ast->raw_sql) return NULL;
-    const char* where = NULL;
-    char* owned = NULL;
-
-    const char* w = strcasestr(ast->raw_sql, "WHERE");
-    if (w) {
-        w += 5;
-        const char* end = strcasestr(w, "RETURNING");
-        size_t len = end ? (size_t)(end - w) : strlen(w);
-        while (len > 0 && isspace((unsigned char)w[0])) { w++; len--; }
-        while (len > 0 && isspace((unsigned char)w[len - 1])) len--;
-        if (len > 0) {
-            owned = strndup(w, len);
-            where = owned;
-        }
+/* Single-line DML reply, malloc'd; NULL on allocation failure. */
+static char* uwp_dml_replyf(const char* format, ...) {
+    va_list args;
+    va_list copy;
+    va_start(args, format);
+    va_copy(copy, args);
+    int count = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    char* out = NULL;
+    if (count >= 0) {
+        out = (char*)malloc((size_t)count + 1);
+        if (out) (void)vsnprintf(out, (size_t)count + 1, format, args);
     }
-    if (!where) return NULL;
+    va_end(args);
+    return out;
+}
 
-    uwp_text_buffer_t out = {0};
-    const char* p = where;
-    while (*p) {
+/* Find a bare keyword outside single-quoted literals.  Returns a pointer just
+ * past it, or NULL. */
+static const char* uwp_sql_find_keyword(const char* sql, const char* keyword) {
+    if (!sql || !keyword) return NULL;
+    size_t klen = strlen(keyword);
+    for (const char* p = sql; *p; ) {
         if (*p == '\'') {
-            (void)uwp_text_appendf(&out, "\"");
             p++;
             while (*p) {
                 if (*p == '\'' && p[1] == '\'') { p += 2; continue; }
                 if (*p == '\'') { p++; break; }
-                if (*p == '"') (void)uwp_text_appendf(&out, "\"\"");
-                else (void)uwp_text_appendf(&out, "%c", *p);
                 p++;
             }
-            (void)uwp_text_appendf(&out, "\"");
             continue;
         }
-        if (*p == '<' && p[1] == '>') {
-            (void)uwp_text_appendf(&out, "!=");
-            p += 2;
-            continue;
+        if (strncasecmp(p, keyword, klen) == 0 &&
+            (p == sql || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')) &&
+            !isalnum((unsigned char)p[klen]) && p[klen] != '_') {
+            return p + klen;
         }
-        if (*p == '!' && p[1] == '=') {
-            (void)uwp_text_appendf(&out, "!=");
-            p += 2;
-            continue;
-        }
-        if (*p == '=' && p[1] == '=') {
-            (void)uwp_text_appendf(&out, "==");
-            p += 2;
-            continue;
-        }
-        if (*p == '=') {
-            (void)uwp_text_appendf(&out, "==");
-            p++;
-            continue;
-        }
-        (void)uwp_text_appendf(&out, "%c", *p);
         p++;
     }
-    free(owned);
-
-    char* result = out.failed ? NULL : strdup(out.data ? out.data : "");
-    uwp_text_destroy(&out);
-    if (result) {
-        bool has_content = false;
-        for (const char* c = result; *c; c++) {
-            if (!isspace((unsigned char)*c)) { has_content = true; break; }
-        }
-        if (!has_content) { free(result); result = NULL; }
-    }
-    return result;
+    return NULL;
 }
 
-/* Build a bytecode-compatible WHERE expression for DML statements.
- * Prefers the parser's structured where_conditions (when populated) and falls
- * back to text-based extraction from the raw SQL.  Returns a malloc'd string
- * (caller frees) or NULL when no WHERE clause is available. */
-static char* uwp_build_dml_where(const qihse_sql_ast_t* ast) {
-    if (!ast) return NULL;
-    uwp_text_buffer_t out = {0};
-    uwp_build_where_expr(&out, ast);
-    if (out.data && out.len > 0) {
-        char* r = strdup(out.data);
-        uwp_text_destroy(&out);
-        return r;
+/* Locate the raw WHERE clause: text after WHERE, up to a bare RETURNING or the
+ * end of the statement, trimmed of surrounding whitespace and a trailing
+ * semicolon.  *out_len is 0 when the keyword is present but the clause is
+ * empty.  Returns true when a WHERE keyword was found at all, so a clause that
+ * parsed to nothing can be distinguished from a statement that has no WHERE. */
+static bool uwp_dml_where_region(const qihse_sql_ast_t* ast,
+                                 const char** out, size_t* out_len) {
+    *out = NULL;
+    *out_len = 0;
+    if (!ast || !ast->raw_sql) return false;
+    const char* start = uwp_sql_find_keyword(ast->raw_sql, "WHERE");
+    if (!start) return false;
+    const char* end = uwp_sql_find_keyword(start, "RETURNING");
+    if (end) end -= strlen("RETURNING");  /* find_keyword returns past the word */
+    else     end = start + strlen(start);
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    while (end > start && end[-1] == ';') {
+        end--;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
     }
-    uwp_text_destroy(&out);
-    return uwp_extract_dml_where(ast);
+    *out = start;
+    *out_len = (size_t)(end - start);
+    return true;
+}
+
+/* Token mirroring the parser's lexical rules for identifiers, operators and
+ * values (see read_identifier / read_operator / read_value in
+ * qihse_sql_parser.c).  For quoted strings `text` is the content between the
+ * quotes, matching how the parser stores string literals. */
+typedef struct {
+    const char* text;
+    size_t      len;
+    bool        is_string;
+} uwp_dml_token_t;
+
+static bool uwp_dml_token_eq(const uwp_dml_token_t* token, const char* text) {
+    if (!text) return false;
+    size_t n = strlen(text);
+    return token->len == n && memcmp(token->text, text, n) == 0;
+}
+
+static bool uwp_dml_next_token(const char** pp, uwp_dml_token_t* token) {
+    const char* p = *pp;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) { *pp = p; return false; }
+    token->text = p;
+    token->is_string = false;
+    if (*p == '\'') {
+        token->is_string = true;
+        p++;
+        token->text = p;
+        while (*p && *p != '\'') p++;
+        token->len = (size_t)(p - token->text);
+        if (*p == '\'') p++;
+    } else if (*p == '=' || *p == '<' || *p == '>' || *p == '!' ||
+               *p == '~' || *p == '|') {
+        p++;
+        if (*p == '=' || (*token->text == '<' && *p == '>')) p++;
+        else if ((*token->text == '~' || *token->text == '|') && *p == '*') p++;
+        token->len = (size_t)(p - token->text);
+    } else {
+        while (*p && !isspace((unsigned char)*p) && *p != '\'' &&
+               *p != '=' && *p != '<' && *p != '>' && *p != '!' &&
+               *p != '~' && *p != '|')
+            p++;
+        token->len = (size_t)(p - token->text);
+    }
+    *pp = p;
+    return token->len > 0;
+}
+
+/* Verify that the raw WHERE clause is exactly the conjunction of the AST's
+ * conditions -- same columns, operators and values, joined by AND, and nothing
+ * else.  Returns false (with a reason) for any construct the parser may have
+ * dropped or transformed, which refuses the statement rather than executing a
+ * match set the user did not write. */
+static bool uwp_dml_where_verifies(const qihse_sql_ast_t* ast,
+                                   const char** reason) {
+    *reason = NULL;
+    const char* region = NULL;
+    size_t region_len = 0;
+    bool has_where = uwp_dml_where_region(ast, &region, &region_len);
+    if (!has_where) {
+        if (ast->num_where_conditions > 0) {
+            *reason = "WHERE clause not found in the statement text";
+            return false;
+        }
+        return true;  /* no WHERE and no conditions: nothing to verify */
+    }
+    if (region_len == 0) {
+        *reason = "WHERE clause is empty";
+        return false;
+    }
+    if (ast->num_where_conditions == 0) {
+        *reason = "WHERE clause has no parsed conditions";
+        return false;
+    }
+
+    /* Tokenise a bounded copy of the clause: the statement text after the
+     * clause (RETURNING, a trailing terminator) must not leak into a token. */
+    char* clause = (char*)malloc(region_len + 1);
+    if (!clause) {
+        *reason = "out of memory while verifying the WHERE clause";
+        return false;
+    }
+    memcpy(clause, region, region_len);
+    clause[region_len] = '\0';
+
+    bool verified = true;
+    const char* p = clause;
+    for (size_t i = 0; i < ast->num_where_conditions && verified; i++) {
+        const qihse_sql_condition_t* c = &ast->where_conditions[i];
+        uwp_dml_token_t token;
+        if (!uwp_dml_next_token(&p, &token) || token.is_string ||
+            !uwp_dml_token_eq(&token, c->column_name)) {
+            *reason = "WHERE column text does not match the parsed condition";
+            verified = false;
+            break;
+        }
+        if (!uwp_dml_next_token(&p, &token) || token.is_string ||
+            !uwp_dml_token_eq(&token, c->operator)) {
+            *reason = "WHERE operator text does not match the parsed condition";
+            verified = false;
+            break;
+        }
+        if (!uwp_dml_next_token(&p, &token) ||
+            token.is_string != (c->value_is_string != 0) ||
+            !uwp_dml_token_eq(&token, c->value)) {
+            *reason = "WHERE value text does not match the parsed condition";
+            verified = false;
+            break;
+        }
+        if (i + 1 < ast->num_where_conditions) {
+            if (!uwp_dml_next_token(&p, &token) || token.is_string ||
+                token.len != 3 || strncasecmp(token.text, "AND", 3) != 0) {
+                *reason = "WHERE conditions are not joined by AND";
+                verified = false;
+                break;
+            }
+        }
+    }
+    if (verified) {
+        uwp_dml_token_t trailing;
+        if (uwp_dml_next_token(&p, &trailing)) {
+            *reason = "WHERE clause has text the parser did not represent";
+            verified = false;
+        }
+    }
+    free(clause);
+    return verified;
+}
+
+/* Operators the row-store predicate can evaluate.  Everything else (IS,
+ * BETWEEN, IN, regex operators, subqueries) is refused: the parser drops part
+ * of BETWEEN's range, so executing it would match the wrong set. */
+static bool uwp_dml_operator_supported(const char* op) {
+    if (!op) return false;
+    return strcmp(op, "=") == 0 || strcmp(op, "<>") == 0 ||
+           strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
+           strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 ||
+           strcmp(op, ">=") == 0 || strcasecmp(op, "LIKE") == 0 ||
+           strcasecmp(op, "ILIKE") == 0;
+}
+
+/* Resolve a condition's column name in the table.  A qualified name (x.id, the
+ * alias the parser consumed and dropped) resolves on its last component. */
+static int uwp_dml_resolve_column(const qihse_table_t* table, const char* name) {
+    if (!table || !name) return -1;
+    const char* bare = strrchr(name, '.');
+    if (bare && bare[1]) name = bare + 1;
+    return qihse_table_find_col(table, name);
+}
+
+/* SQL LIKE/ILIKE match: % is any run, _ is one character.  Iterative (no
+ * recursion), so the frame stays bounded for adversarial patterns. */
+static bool uwp_dml_like(const char* text, const char* pattern, bool ci) {
+    const char* t = text;
+    const char* p = pattern;
+    const char* star = NULL;
+    const char* t_star = NULL;
+    while (*t) {
+        if (*p == '%') { star = p++; t_star = t; continue; }
+        bool eq = (*p == '_');
+        if (!eq) {
+            eq = ci ? tolower((unsigned char)*p) == tolower((unsigned char)*t)
+                    : *p == *t;
+        }
+        if (eq && *p) { p++; t++; continue; }
+        if (star) { p = star + 1; t = ++t_star; continue; }
+        return false;
+    }
+    while (*p == '%') p++;
+    return *p == '\0';
+}
+
+/* Render a cell as text for LIKE; strings are used as-is, numbers formatted
+ * into the caller's buffer.  Returns false when the cell has no text form
+ * (a NULL string). */
+static bool uwp_dml_cell_text(const qihse_col_value_t* cell, char* buf,
+                              size_t cap, const char** out) {
+    switch (cell->type) {
+        case QIHSE_TS_STRING:
+            if (!cell->v.str) return false;
+            *out = cell->v.str;
+            return true;
+        case QIHSE_TS_INT32:
+            (void)snprintf(buf, cap, "%d", cell->v.i32);
+            *out = buf;
+            return true;
+        case QIHSE_TS_INT64:
+            (void)snprintf(buf, cap, "%lld", (long long)cell->v.i64);
+            *out = buf;
+            return true;
+        case QIHSE_TS_FLOAT:
+            (void)snprintf(buf, cap, "%g", (double)cell->v.f32);
+            *out = buf;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Evaluate one parsed condition against one row cell.  A value that cannot be
+ * compared to the cell type matches nothing, so a mistyped filter cannot
+ * silently widen a DELETE. */
+static bool uwp_dml_condition_matches(const qihse_col_value_t* cell,
+                                      const qihse_sql_condition_t* c) {
+    if (!c->operator || !c->value) return false;
+    bool like = strcasecmp(c->operator, "LIKE") == 0;
+    bool ilike = strcasecmp(c->operator, "ILIKE") == 0;
+    if (like || ilike) {
+        char buf[64];
+        const char* text = NULL;
+        if (!uwp_dml_cell_text(cell, buf, sizeof(buf), &text)) return false;
+        return uwp_dml_like(text, c->value, ilike);
+    }
+    int cmp = 0;
+    if (cell->type == QIHSE_TS_STRING) {
+        if (!cell->v.str) return false;
+        cmp = strcmp(cell->v.str, c->value);
+    } else {
+        char* endp = NULL;
+        long double want = strtold(c->value, &endp);
+        if (endp == c->value || !endp || *endp != '\0') return false;
+        long double have;
+        switch (cell->type) {
+            case QIHSE_TS_INT32: have = (long double)cell->v.i32; break;
+            case QIHSE_TS_INT64: have = (long double)cell->v.i64; break;
+            case QIHSE_TS_FLOAT: have = (long double)cell->v.f32; break;
+            default: return false;
+        }
+        cmp = have < want ? -1 : (have > want ? 1 : 0);
+    }
+    if (strcmp(c->operator, "=") == 0) return cmp == 0;
+    if (strcmp(c->operator, "<>") == 0 || strcmp(c->operator, "!=") == 0)
+        return cmp != 0;
+    if (strcmp(c->operator, "<") == 0) return cmp < 0;
+    if (strcmp(c->operator, ">") == 0) return cmp > 0;
+    if (strcmp(c->operator, "<=") == 0) return cmp <= 0;
+    if (strcmp(c->operator, ">=") == 0) return cmp >= 0;
+    return false;
+}
+
+/* Predicate handed to qihse_table_update / qihse_table_delete.  Every matched
+ * row is counted here, which is what makes the reported row count the number
+ * of rows the store actually changed: the store applies the assignments to
+ * exactly the rows this predicate accepts, and pre-validation has already
+ * rejected unknown columns, so a match is a change. */
+typedef struct {
+    const qihse_sql_condition_t* conds;
+    const int*                   col_idx;   /* resolved index per condition */
+    size_t                       num_conds;
+    size_t                       matched;
+} uwp_dml_scan_t;
+
+static int uwp_dml_pred(const qihse_col_value_t* values, size_t num_cols,
+                        void* ctx) {
+    uwp_dml_scan_t* scan = (uwp_dml_scan_t*)ctx;
+    for (size_t i = 0; i < scan->num_conds; i++) {
+        int col = scan->col_idx[i];
+        if (col < 0 || (size_t)col >= num_cols) return 0;
+        if (!uwp_dml_condition_matches(&values[col], &scan->conds[i])) return 0;
+    }
+    scan->matched++;
+    return 1;
+}
+
+/* Convert a SET right-hand side to a typed value for the target column.  Only
+ * literals are accepted: the table store applies constant values, so an
+ * expression (n + 1) is refused rather than stored as text. */
+static bool uwp_dml_set_value(const qihse_col_def_t* def, const char* text,
+                              qihse_col_value_t* out) {
+    if (!def || !text || !out) return false;
+    memset(out, 0, sizeof(*out));
+    char* endp = NULL;
+    errno = 0;
+    switch (def->type) {
+        case QIHSE_TS_INT32: {
+            long v = strtol(text, &endp, 10);
+            if (endp == text || *endp != '\0' || errno == ERANGE ||
+                v < INT32_MIN || v > INT32_MAX)
+                return false;
+            out->type = QIHSE_TS_INT32;
+            out->v.i32 = (int32_t)v;
+            return true;
+        }
+        case QIHSE_TS_INT64: {
+            long long v = strtoll(text, &endp, 10);
+            if (endp == text || *endp != '\0' || errno == ERANGE)
+                return false;
+            out->type = QIHSE_TS_INT64;
+            out->v.i64 = (int64_t)v;
+            return true;
+        }
+        case QIHSE_TS_FLOAT: {
+            float v = strtof(text, &endp);
+            if (endp == text || *endp != '\0' || errno == ERANGE)
+                return false;
+            out->type = QIHSE_TS_FLOAT;
+            out->v.f32 = v;
+            return true;
+        }
+        case QIHSE_TS_STRING:
+            out->type = QIHSE_TS_STRING;
+            out->v.str = strdup(text);
+            return out->v.str != NULL;
+        default:
+            return false;
+    }
+}
+
+char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast, qihse_user_t* user) {
+    if (!ast || (ast->stmt_type != QIHSE_SQL_UPDATE &&
+                 ast->stmt_type != QIHSE_SQL_DELETE))
+        return NULL;
+    const char* stmt = ast->stmt_type == QIHSE_SQL_DELETE ? "DELETE" : "UPDATE";
+
+    if (!ast->table_name || ast->table_name[0] == '\0') {
+        return uwp_dml_replyf("OK stmt_type=%s (refused: statement has no "
+                              "target table; no rows changed)\n", stmt);
+    }
+
+    /* Same write-permission model as the KV / column / document targets: the
+     * resource id is the FNV-1a hash of the object name, namespace 0.  The
+     * operator role passes; every other role needs an explicit grant. */
+    if (!user || !qihse_auth_can_access_object(
+                     user, 0, (uint64_t)uwp_fnv1a(ast->table_name),
+                     QIHSE_ACL_WRITE)) {
+        return uwp_dml_replyf("OK stmt_type=%s (refused: no write access to "
+                              "table %s; no rows changed)\n", stmt,
+                              ast->table_name);
+    }
+
+    if (ast->stmt_type == QIHSE_SQL_UPDATE && ast->num_set == 0) {
+        return uwp_dml_replyf("OK stmt_type=UPDATE (refused: zero SET "
+                              "assignments; no rows changed)\n");
+    }
+
+    qihse_table_store_t* store = qihse_uwp_sql_table_store();
+    qihse_table_t* table =
+        store ? qihse_table_store_find_table(store, ast->table_name) : NULL;
+    if (!table) {
+        return uwp_dml_replyf("OK stmt_type=%s (table %s not found in the SQL "
+                              "row store; no rows changed)\n", stmt,
+                              ast->table_name);
+    }
+
+    char* reply = NULL;
+    int* set_cols = NULL;
+    qihse_col_value_t* set_vals = NULL;
+    int* cond_cols = NULL;
+    size_t num_set = ast->num_set;
+    size_t num_conds = ast->num_where_conditions;
+
+    /* ---- validate the assignments before anything is mutated ---- */
+    if (ast->stmt_type == QIHSE_SQL_UPDATE) {
+        set_cols = (int*)calloc(num_set, sizeof(int));
+        set_vals = (qihse_col_value_t*)calloc(num_set, sizeof(qihse_col_value_t));
+        if (!set_cols || !set_vals) goto done;
+        for (size_t i = 0; i < num_set; i++) {
+            int col = uwp_dml_resolve_column(table, ast->set_columns[i]);
+            if (col < 0) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=UPDATE (refused: SET column %s is not in "
+                    "table %s; no rows changed)\n",
+                    ast->set_columns[i] ? ast->set_columns[i] : "<unnamed>",
+                    ast->table_name);
+                goto done;
+            }
+            const qihse_col_def_t* def =
+                qihse_table_col_def(table, (size_t)col);
+            /* The AST does not record whether a SET value was quoted, so a
+             * bare identifier that names a column is the one expression form
+             * that can be told apart from a literal.  Refuse it for string
+             * columns rather than storing the column name as text.  The
+             * refusal is conservative: a quoted literal that happens to equal
+             * a column name is refused too. */
+            if (def && def->type == QIHSE_TS_STRING && ast->set_values[i] &&
+                uwp_dml_resolve_column(table, ast->set_values[i]) >= 0) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=UPDATE (refused: SET %s = %s names a column; "
+                    "column-to-column assignment is not supported by the row "
+                    "store; no rows changed)\n",
+                    ast->set_columns[i] ? ast->set_columns[i] : "<unnamed>",
+                    ast->set_values[i]);
+                goto done;
+            }
+            if (!uwp_dml_set_value(def, ast->set_values[i], &set_vals[i])) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=UPDATE (refused: SET %s = %s is not a "
+                    "literal for the column type; no rows changed)\n",
+                    ast->set_columns[i] ? ast->set_columns[i] : "<unnamed>",
+                    ast->set_values[i] ? ast->set_values[i] : "<empty>");
+                goto done;
+            }
+            set_cols[i] = col;
+        }
+    }
+
+    /* ---- the zero-condition guards, before any store call ---- */
+    const char* where_region = NULL;
+    size_t where_len = 0;
+    bool has_where = uwp_dml_where_region(ast, &where_region, &where_len);
+    (void)where_region;
+    if (num_conds == 0) {
+        if (ast->stmt_type == QIHSE_SQL_DELETE) {
+            /* A zero-condition DELETE must never become a match-all: the
+             * parser has already dropped a filter once (an aliased DELETE),
+             * and this store has no transaction to undo a mass delete. */
+            reply = uwp_dml_replyf(
+                has_where
+                    ? "OK stmt_type=DELETE (refused: WHERE clause present but "
+                      "no conditions were parsed; no rows changed)\n"
+                    : "OK stmt_type=DELETE (refused: zero WHERE conditions; an "
+                      "unqualified DELETE is not executed; no rows changed)\n");
+            goto done;
+        }
+        if (has_where) {
+            reply = uwp_dml_replyf(
+                "OK stmt_type=UPDATE (refused: WHERE clause present but no "
+                "conditions were parsed; no rows changed)\n");
+            goto done;
+        }
+        /* No WHERE at all: UPDATE without WHERE is a legitimate update-all. */
+    } else {
+        const char* reason = NULL;
+        if (!uwp_dml_where_verifies(ast, &reason)) {
+            reply = uwp_dml_replyf(
+                "OK stmt_type=%s (refused: %s; no rows changed)\n", stmt,
+                reason ? reason : "WHERE clause does not match the parsed "
+                                 "conditions");
+            goto done;
+        }
+        cond_cols = (int*)malloc(num_conds * sizeof(int));
+        if (!cond_cols) goto done;
+        for (size_t i = 0; i < num_conds; i++) {
+            const qihse_sql_condition_t* c = &ast->where_conditions[i];
+            if (c->subq_kind != 0) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=%s (refused: subquery predicates are not "
+                    "supported by the row store; no rows changed)\n", stmt);
+                goto done;
+            }
+            if (!uwp_dml_operator_supported(c->operator)) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=%s (refused: operator %s is not supported by "
+                    "the row store; no rows changed)\n", stmt,
+                    c->operator ? c->operator : "<none>");
+                goto done;
+            }
+            int col = uwp_dml_resolve_column(table, c->column_name);
+            if (col < 0) {
+                reply = uwp_dml_replyf(
+                    "OK stmt_type=%s (refused: WHERE column %s is not in table "
+                    "%s; no rows changed)\n", stmt,
+                    c->column_name ? c->column_name : "<unnamed>",
+                    ast->table_name);
+                goto done;
+            }
+            cond_cols[i] = col;
+        }
+    }
+
+    /* ---- execute: one table write lock covers the whole statement ---- */
+    uwp_dml_scan_t scan;
+    scan.conds = ast->where_conditions;
+    scan.col_idx = cond_cols;
+    scan.num_conds = num_conds;
+    scan.matched = 0;
+    if (ast->stmt_type == QIHSE_SQL_UPDATE) {
+        (void)qihse_table_update(table, uwp_dml_pred, &scan, set_cols, set_vals,
+                                 num_set);
+    } else {
+        (void)qihse_table_delete(table, uwp_dml_pred, &scan);
+    }
+    reply = uwp_dml_replyf("OK stmt_type=%s rows=%zu\n", stmt, scan.matched);
+
+done:
+    if (set_vals) {
+        for (size_t i = 0; i < num_set; i++) {
+            if (set_vals[i].type == QIHSE_TS_STRING) free(set_vals[i].v.str);
+        }
+    }
+    free(set_cols);
+    free(set_vals);
+    free(cond_cols);
+    return reply;
 }
 
 /* -------------------------------------------------------------------------
@@ -1669,70 +2109,20 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                             "OK stmt_type=INSERT (table not found in schema)\n");
                     }
                 }
-            } else if (ast->stmt_type == QIHSE_SQL_UPDATE) {
-                /* --- UPDATE: wire to the document store (mutable row store).
-                 * The column store is append-only, so ctx->doc is the only
-                 * store that can serve UPDATE.  The document store exposes a
-                 * query API but no in-place update routine, so we report the
-                 * matched row count and note the API limitation. --- */
-                if (!ctx->doc) {
-                    if (ctx->col) {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=UPDATE (column store does not support in-place updates)\n");
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=UPDATE (no row store wired)\n");
-                    }
+            } else if (ast->stmt_type == QIHSE_SQL_UPDATE ||
+                       ast->stmt_type == QIHSE_SQL_DELETE) {
+                /* --- UPDATE / DELETE: execute against the mutable SQL row
+                 * store (qihse_table_store).  The parsed SET assignments and
+                 * the structured WHERE conditions are the only inputs; the
+                 * raw SQL text is never re-parsed for execution.  The reply
+                 * carries the number of rows actually changed, or states that
+                 * the statement was refused and nothing changed. --- */
+                char* dml_reply = qihse_uwp_sql_execute_dml(ast, user);
+                if (!dml_reply) {
+                    result = UWP_STS_ERR_FAILED;
                 } else {
-                    char* where_norm = uwp_build_dml_where(ast);
-                    const char* wclause = where_norm ? where_norm : "1 == 1";
-                    bool has_where = (where_norm != NULL);
-                    qihse_document_result_t res =
-                        qihse_doc_store_query_user(ctx->doc, wclause, user);
-                    size_t matched = res.count;
-                    free(res.doc_ids);
-                    free(where_norm);
-                    if (has_where) {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=UPDATE rows=0 (document store has no in-place update API; matched=%zu)\n",
-                            matched);
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=UPDATE rows=0 (document store has no in-place update API; no WHERE filtering, matched=%zu)\n",
-                            matched);
-                    }
-                }
-            } else if (ast->stmt_type == QIHSE_SQL_DELETE) {
-                /* --- DELETE: wire to the document store (mutable row store).
-                 * Same rationale as UPDATE: the document store can query
-                 * matching documents but exposes no delete routine, so we
-                 * report the matched count and note the limitation. --- */
-                if (!ctx->doc) {
-                    if (ctx->col) {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=DELETE (column store does not support row deletion)\n");
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=DELETE (no row store wired)\n");
-                    }
-                } else {
-                    char* where_norm = uwp_build_dml_where(ast);
-                    const char* wclause = where_norm ? where_norm : "1 == 1";
-                    bool has_where = (where_norm != NULL);
-                    qihse_document_result_t res =
-                        qihse_doc_store_query_user(ctx->doc, wclause, user);
-                    size_t matched = res.count;
-                    free(res.doc_ids);
-                    free(where_norm);
-                    if (has_where) {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=DELETE rows=0 (document store has no delete API; matched=%zu)\n",
-                            matched);
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=DELETE rows=0 (document store has no delete API; no WHERE filtering, matched=%zu)\n",
-                            matched);
-                    }
+                    (void)uwp_text_appendf(&response, "%s", dml_reply);
+                    free(dml_reply);
                 }
             } else {
                 uwp_text_appendf(&response, "OK stmt_type=%s\n",
