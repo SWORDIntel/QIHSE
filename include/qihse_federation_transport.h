@@ -81,6 +81,7 @@ qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* 
 /* Perform a client-side handshake on an already-connected fd. */
 qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder,
                                                         int fd,
+                                                        int timeout_ms,
                                                         qihse_peer_verdict_t* out_verdict);
 
 void qihse_federation_tls_session_destroy(qihse_fed_tls_session_t* session);

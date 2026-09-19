@@ -71,8 +71,7 @@ static void run_handshake(qihse_fed_tls_server_t* server_ctx,
     assert(pthread_create(&th, NULL, accept_thread, &a) == 0);
 
     qihse_peer_verdict_t client_verdict = QIHSE_PEER_REJECT_MALFORMED;
-    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(client_ctx, sv[1],
-                                                                     &client_verdict);
+    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(client_ctx, sv[1], 0 /* default bound */, &client_verdict);
     pthread_join(th, NULL);
 
     if (out_server) *out_server = a.session;
@@ -180,7 +179,7 @@ static void test_trusted_peer_accepted(const char* dir, const char* ca_key_path,
     assert(pthread_create(&th, NULL, accept_thread, &a) == 0);
     qihse_peer_verdict_t cv;
     qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(client_node.tls,
-                                                                     sv2[1], &cv);
+                                                                     sv2[1], 0 /* default bound */, &cv);
     pthread_join(th, NULL);
     assert(a.session != NULL);
     assert(qihse_federation_tls_peer_identity(a.session, &peer, &trust));
@@ -296,7 +295,7 @@ static void test_degraded_peer_admitted_with_less_authority(const char* dir,
     assert(pthread_create(&th, NULL, accept_thread, &a) == 0);
     qihse_peer_verdict_t cv;
     qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(degraded.tls,
-                                                                     sv[1], &cv);
+                                                                     sv[1], 0 /* default bound */, &cv);
     pthread_join(th, NULL);
     assert(a.session != NULL);
 
@@ -337,7 +336,7 @@ static void test_transport_over_tls(const char* dir, const char* ca_key_path,
     assert(pthread_create(&th, NULL, accept_thread, &a) == 0);
     qihse_peer_verdict_t cv;
     qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(client_node.tls,
-                                                                     sv[1], &cv);
+                                                                     sv[1], 0 /* default bound */, &cv);
     pthread_join(th, NULL);
     assert(a.session != NULL);
 

@@ -206,10 +206,12 @@ bool qihse_federation_tls_server_requires_client_cert(const qihse_fed_tls_server
 
 /* Bound a handshake so a peer that connects and then stalls cannot hold a
  * thread indefinitely. */
-static void fed_tls_set_handshake_timeout(int fd) {
+static void fed_tls_set_handshake_timeout_ms(int fd, int timeout_ms) {
     struct timeval tv;
-    tv.tv_sec = QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC;
-    tv.tv_usec = 0;
+    if (timeout_ms <= 0) timeout_ms = QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC * 1000;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1000; /* never a zero timeout */
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
@@ -261,7 +263,7 @@ qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* 
     /* Bound the handshake.  A peer that connects and then stalls would
      * otherwise hold a thread indefinitely, which is a cheap denial of service
      * against a node that is also trying to serve its own database. */
-    fed_tls_set_handshake_timeout(fd);
+    fed_tls_set_handshake_timeout_ms(fd, 0); /* the fixed default */
 
     SSL* ssl = SSL_new(server->server_ctx);
     if (!ssl) { if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
@@ -272,12 +274,13 @@ qihse_fed_tls_session_t* qihse_federation_tls_accept_fd(qihse_fed_tls_server_t* 
 
 qihse_fed_tls_session_t* qihse_federation_tls_connect_fd(qihse_fed_tls_server_t* ctx_holder,
                                                         int fd,
+                                                        int timeout_ms,
                                                         qihse_peer_verdict_t* out_verdict) {
     if (!ctx_holder || !ctx_holder->client_ctx || fd < 0) {
         if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
         return NULL;
     }
-    fed_tls_set_handshake_timeout(fd);
+    fed_tls_set_handshake_timeout_ms(fd, timeout_ms);
 
     /* The CLIENT context.  This node presents its own certificate and verifies
      * the server's against the same CA under the same policy, so both
@@ -482,12 +485,14 @@ qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t*
                                                         qihse_peer_verdict_t* out_verdict) {
     if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
     if (!server || !server->client_ctx || !host) return NULL;
-    /* timeout_ms is currently NOT honoured: the connect/handshake bound is the
-     * fixed QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC, and the post-handshake alert
-     * window below is the fixed 100 ms heuristic.  Wiring the caller's value
-     * through would change connect behaviour, so it is left as-is (see the
-     * warning-cleanup report). */
-    (void)timeout_ms;
+    /* HONOURED, not decorative. This parameter was documented and silently
+     * ignored: a caller passing 5000 got the fixed 10 s bound, and one passing
+     * 100 also got 10 s. An API that takes a bound and ignores it is the same
+     * defect class as a function that reports success without doing the work —
+     * the signature promises something the implementation does not deliver.
+     *
+     * timeout_ms <= 0 means "use the default". */
+    if (timeout_ms <= 0) timeout_ms = QIHSE_FED_TLS_HANDSHAKE_TIMEOUT_SEC * 1000;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -506,13 +511,14 @@ qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t*
 
     /* Bound the CONNECT itself.  A peer that is unreachable must not stall the
      * caller for the kernel's default SYN timeout. */
-    fed_tls_set_handshake_timeout(fd);
+    fed_tls_set_handshake_timeout_ms(fd, timeout_ms);
 
     int rc = connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     if (rc != 0) { close(fd); return NULL; }
 
     qihse_fed_tls_session_t* session = qihse_federation_tls_connect_fd(server, fd,
+                                                                      timeout_ms,
                                                                       out_verdict);
     if (!session) { close(fd); return NULL; }
 
@@ -521,11 +527,19 @@ qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t*
      * certificate after the client's handshake finishes.  Give a refusal a
      * brief window to arrive so the common case is reported honestly rather
      * than as a session that silently does nothing. */
-    if (qihse_federation_tls_session_peer_gone(session, 100)) {
+    /* The alert window is a fraction of the caller's bound, capped: a short
+     * connect timeout should not be spent entirely waiting for an alert that
+     * may never come, and a long one should not add seconds of latency. */
+    {
+        int alert_window = timeout_ms / 10;
+        if (alert_window > 200) alert_window = 200;
+        if (alert_window < 20) alert_window = 20;
+    if (qihse_federation_tls_session_peer_gone(session, alert_window)) {
         if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_UNTRUSTED;
         qihse_federation_tls_session_destroy(session);
         close(fd);
         return NULL;
+    }
     }
     return session;
 }
