@@ -7,7 +7,9 @@
  * pub/sub subscribe/publish, the stateless execute bridge, and the UWP
  * TARGET_RESP path (including the NULL-user bypass case).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

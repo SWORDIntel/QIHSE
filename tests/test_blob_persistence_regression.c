@@ -10,7 +10,9 @@
  *   - range-read edges (offset == size, offset > size, last byte),
  *   - empty payloads and unknown hashes.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <stdbool.h>
@@ -114,7 +116,7 @@ int main(void) {
     /* ...and the store keeps accepting new blobs across the torn tail. */
     uint8_t hash_post[QIHSE_BLOB_HASH_BYTES];
     assert(qihse_blob_put_buffer_user(blobs, 7, QIHSE_BLOB_TAG_SCRIPT_SET, 0, 0,
-                                      op, "post-torn", 9, hash_post));
+                                      op, (const uint8_t*)"post-torn", 9, hash_post));
     assert(qihse_blob_get_user(blobs, hash_post, 0, out, sizeof(out), &nread, op));
     assert(nread == 9 && memcmp(out, "post-torn", 9) == 0);
 

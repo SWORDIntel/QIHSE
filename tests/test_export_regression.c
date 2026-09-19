@@ -5,7 +5,9 @@
  * excluded; foreign-tenant export is denied; NULL user is denied (invariant
  * #1); the system domain may export on behalf of any tenant.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <stdbool.h>

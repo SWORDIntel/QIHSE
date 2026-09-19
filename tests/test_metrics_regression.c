@@ -2,7 +2,9 @@
  * fan-outs, and bundle composes are counted in the metrics registry and
  * exposed via METRICS.RENDER (system-domain only; tenants get NOPERM).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

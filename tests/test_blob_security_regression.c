@@ -6,7 +6,9 @@
  * above-clearance blobs, tenant writes to commons or foreign tenants, hash
  * binding-clash dedup abuse, and revoked principals.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <stdbool.h>

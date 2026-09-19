@@ -6,7 +6,9 @@
  * tenants may subscribe but never publish, and invalid edges are rejected at
  * ingest before anything is pushed or persisted.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

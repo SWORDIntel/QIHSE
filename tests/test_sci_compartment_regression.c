@@ -12,7 +12,9 @@
  * (write-side possession and read-side enforcement, with no payload
  * disclosure on denial). Also: NULL user against nonzero-SCI data is denied.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <stdbool.h>

@@ -5,7 +5,9 @@
  * access, the commons-poisoning sanity gate, and mid-transfer revocation —
  * each asserted with no protected payload disclosure.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

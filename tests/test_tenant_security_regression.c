@@ -12,7 +12,9 @@
  *   - a destroyed principal loses its live session immediately (revocation
  *     SLA) — the next command on the same connection is refused.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

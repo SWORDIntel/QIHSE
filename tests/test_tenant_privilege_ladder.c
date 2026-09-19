@@ -7,7 +7,9 @@
  * and qihse_auth_create_tenant_user refuses to mint tenant-0 principals
  * outright.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <stdbool.h>

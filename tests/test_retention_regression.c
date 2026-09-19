@@ -3,7 +3,9 @@
  * (qihse_kv_sweep_expired previously had zero callers), and the server
  * keeps serving across sweeps.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

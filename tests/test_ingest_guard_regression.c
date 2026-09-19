@@ -7,7 +7,9 @@
  * persisted (GET-after-assert). The gate is structural: it binds the
  * operator too. Non-telemetry keys are unaffected.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <netinet/in.h>

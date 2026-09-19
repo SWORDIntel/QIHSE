@@ -10,7 +10,9 @@
  *      numerically closest match and unclassified (the approximate-search
  *      leakage trap).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <assert.h>
 #include <math.h>
