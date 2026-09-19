@@ -83,7 +83,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/network_intelligence/bgp_route_probe.cpp src/network_intelligence/bgp_update_decoder.cpp src/network_intelligence/rpki_rtr_probe.cpp src/network_intelligence/rdap_probe.cpp src/network_intelligence/ptr_probe.cpp src/network_intelligence/route_helper.cpp \
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c src/tractable/qihse_index_scan.c src/tractable/qihse_txn.c src/tractable/qihse_mvcc.c src/tractable/qihse_wal.c src/tractable/qihse_recovery.c src/broad_oak/qihse_graph_store.c src/broad_oak/qihse_graph_ingest.c src/tractable/qihse_cypher_parser.c src/tractable/qihse_cypher_executor.c src/broad_oak/qihse_graph_algo.c src/broad_oak/qihse_graph_vector.c \
             src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
-            vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c src/tractable/qihse_join_executor.c src/tractable/qihse_aggregate_executor.c src/tractable/qihse_sort_executor.c src/tractable/qihse_window_executor.c src/tractable/qihse_table_store.c src/tractable/qihse_schema.c src/tractable/qihse_optimizer.c \
+            vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c src/tractable/qihse_join_executor.c src/tractable/qihse_aggregate_executor.c src/tractable/qihse_sort_executor.c src/tractable/qihse_window_executor.c src/tractable/qihse_table_store.c src/tractable/qihse_schema.c src/tractable/qihse_optimizer.c src/tractable/qihse_optimizer_governance.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
@@ -420,6 +420,10 @@ test-ai-memory-embed: lib
 	$(CC) $(CFLAGS) -o tests/test_ai_memory_embed tests/test_ai_memory_embed.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ai_memory_embed
 
+test-ai-memory-ext: lib
+	$(CC) $(CFLAGS) -o tests/test_ai_memory_ext tests/test_ai_memory_ext.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ai_memory_ext
+
 test-fabric-jobs: lib
 	$(CC) $(CFLAGS) -o tests/test_fabric_jobs tests/test_fabric_jobs.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fabric_jobs
@@ -431,6 +435,10 @@ test-group-push: lib
 test-overlay: lib
 	$(CC) $(CFLAGS) -o tests/test_overlay tests/test_overlay.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_overlay
+
+test-dht-peer-exchange: lib
+	$(CC) $(CFLAGS) -o tests/test_dht_peer_exchange tests/test_dht_peer_exchange.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_dht_peer_exchange
 
 test-operator-mode: lib
 	$(CC) $(CFLAGS) -o tests/test_operator_mode tests/test_operator_mode.c -L. -lqihse $(LDFLAGS)
@@ -485,7 +493,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-parallel-query test-gold
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-backup test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-fabric-jobs test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -528,6 +536,18 @@ test-sql-completeness: lib
 	$(CC) $(CFLAGS) -o tests/test_sql_completeness tests/test_sql_completeness.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_sql_completeness
 
+# W5.1 optimizer governance: shadow A/B evaluation of a candidate plan with
+# the safety constraints named in code (regression bound, minimum sample size,
+# result equivalence, journal required, anti-oscillation, proven improvement),
+# automatic rollback inside the observation path, and every switch/rollback
+# persisted to an event-stream journal.  The case that matters is the rollback:
+# it asserts the violation is DETECTED and the incumbent plan is RESTORED
+# without an operator, and then reads the SWITCH and ROLLBACK records back out
+# of the journal with the evidence they rested on.
+test-optimizer-governance: lib
+	$(CC) $(CFLAGS) -o tests/test_optimizer_governance tests/test_optimizer_governance.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_optimizer_governance
+
 # UPDATE/DELETE execution against the mutable table store, including the
 # zero-condition DELETE guard (a DELETE whose WHERE parsed to nothing must
 # refuse, never match-all).
@@ -562,6 +582,15 @@ test-repl: lib
 test-phase-c: lib
 	$(CC) $(CFLAGS) -o tests/test_phase_c tests/test_phase_c.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_phase_c
+
+# W5.2 telemetry expansion: label-bounded families (query type, engine
+# backend), per-query-type latency histograms, error counters, cluster/
+# replication status, memory/index gauges and XDP counters — all rendered by
+# the existing METRICS.RENDER.  Asserts the counters MOVE on the event, and
+# that an undeclared label value creates no series.
+test-metrics-w52: lib
+	$(CC) $(CFLAGS) -o tests/test_metrics_w52_telemetry tests/test_metrics_w52_telemetry.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_metrics_w52_telemetry
 
 # Parallel query: the scan really partitions the KV keyspace, the aggregate
 # really aggregates, the hash join really joins, a join that cannot have

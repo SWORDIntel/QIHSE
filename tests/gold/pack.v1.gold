@@ -358,6 +358,17 @@ workload fabric-job-model area=ai-fabric expect=pass timeout=180 \
     output="fabric job model tests passed" \
     run="make -s test-fabric-jobs"
 
+# A kind filter on recall must only NARROW: it must never widen the
+# authorization filter, and a NULL security context must fail closed. An
+# unrecognised kind is refused rather than treated as ANY.
+workload fabric-memory-kind-filter area=ai-fabric expect=pass timeout=180 \
+    ref="include/qihse_ai_memory.h" \
+    output="ai memory extension tests passed" \
+    run="make -s test-ai-memory-ext"
+
+gap ai-fabric/vector-candidate-crowding area=ai-fabric \
+    reason="aimem_vec_search() selects the top-want vectors WITHOUT a user, so a vector the caller cannot read can occupy a candidate slot and push a visible memory out of the semantic top-k. This is CROWDING, not disclosure — every candidate is re-resolved with the caller before it is returned — but a low-clearance caller's semantic recall is degraded by records they cannot see. Pre-existing; the kind filter does not cause or fix it, because post-resolve filtering happens after top-k selection."
+
 gap ai-fabric/remote-dispatch area=ai-fabric \
     reason="FABRIC.SUBMIT executes locally only. A job whose best-fit node is another node is recorded 'queued' and never runs; remote dispatch needs a transport and a result path that do not exist. Recorded as queued rather than done so the record is not claiming a dispatch that did not happen."
 
