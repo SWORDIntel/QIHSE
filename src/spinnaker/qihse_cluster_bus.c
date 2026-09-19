@@ -2,6 +2,7 @@
 
 #include "qihse_cpu_detect.h" /* the one ISA detector */
 #include "qihse_federation.h"
+#include "qihse_overlay.h" /* overlay layer 3: DHT peer exchange (W4.2) */
 #include "qihse_platform.h"
 #include <errno.h>
 #include <stdio.h>
@@ -751,6 +752,17 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         case QIHSE_BUS_MSG_GROUP_ACK:    qihse_bus_handle_group_ack(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_FED_STATEMENT: qihse_bus_handle_fed_statement(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_FED_HEARTBEAT: qihse_bus_handle_fed_heartbeat(bus, payload, payload_len); break;
+        /* Overlay layer 3.  These handlers are hint-only: they can record a
+         * bounded hint and cause a MEET, and they cannot touch the topology or
+         * the trust plane.  Both are no-ops when the DHT hint table is not
+         * enabled (the fail-closed default).  The return value is deliberately
+         * ignored here: a rejected hint frame is not a transport error. */
+        case QIHSE_BUS_MSG_DHT_FIND:
+            (void)qihse_overlay_dht_handle_find(bus, bus->topology, payload, payload_len);
+            break;
+        case QIHSE_BUS_MSG_DHT_NODES:
+            (void)qihse_overlay_dht_handle_nodes(bus, payload, payload_len);
+            break;
         default: break;
     }
 }
@@ -761,8 +773,12 @@ bool qihse_bus_msg_carries_authority(uint32_t message_type) {
         case QIHSE_BUS_MSG_FED_STATEMENT:
         case QIHSE_BUS_MSG_FED_HEARTBEAT:
             return true;
-        /* Bootstrap and liveness only.  MEET and PING must work before a peer
-         * is enrolled, which is exactly why they must not confer authority. */
+        /* Bootstrap, liveness and discovery only.  MEET and PING must work
+         * before a peer is enrolled, which is exactly why they must not confer
+         * authority.  DHT_FIND/DHT_NODES are unauthenticated peer-exchange
+         * hints and are covered by this default on purpose; the DHT dial path
+         * checks this function before dialing, so if a future change moves a
+         * DHT type above, discovery stops instead of becoming admission. */
         default:
             return false;
     }
@@ -1226,6 +1242,22 @@ bool qihse_cluster_bus_meet(qihse_cluster_bus_t* bus, const char* host, uint16_t
     qihse_bus_build_header(datagram, QIHSE_BUS_MSG_MEET, bus->local_node_index, (uint32_t)len);
     memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, payload, len);
     return qihse_bus_send_datagram(bus, host, port, datagram, QIHSE_CLUSTER_BUS_HEADER_SIZE + len);
+}
+
+bool qihse_cluster_bus_send_frame(qihse_cluster_bus_t* bus, uint32_t message_type,
+                                  const uint8_t* payload, size_t payload_len,
+                                  const char* host, uint16_t port) {
+    if (!bus || !host || port == 0) return false;
+    if (payload_len > QIHSE_CLUSTER_BUS_MAX_PAYLOAD) return false;
+    if (payload_len > 0 && !payload) return false;
+    uint8_t datagram[QIHSE_BUS_MAX_DATAGRAM];
+    qihse_bus_build_header(datagram, (qihse_cluster_bus_msg_type_t)message_type,
+                           bus->local_node_index, (uint32_t)payload_len);
+    if (payload_len > 0) {
+        memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, payload, payload_len);
+    }
+    return qihse_bus_send_datagram(bus, host, port, datagram,
+                                   QIHSE_CLUSTER_BUS_HEADER_SIZE + payload_len);
 }
 
 bool qihse_cluster_bus_peer_first_seen(const qihse_cluster_bus_t* bus,

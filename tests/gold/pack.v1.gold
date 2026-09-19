@@ -363,3 +363,22 @@ gap ai-fabric/remote-dispatch area=ai-fabric \
 
 gap ai-fabric/inference-executors area=ai-fabric \
     reason="Two of the four job types named in ai_fabric.md have executors (embed, keystone-ingest). inference and index-build do NOT and are REFUSED with 'job type not implemented' rather than accepted, so the gap is loud rather than silent. inference needs a model backend that does not exist; index-build needs a defined build unit."
+
+# ----------------------------------------------------------------------------
+# 11. Overlay discovery (IRC dead-drop + DHT peer exchange)
+# ----------------------------------------------------------------------------
+area overlay-discovery "Overlay layers 2/3: IRC dead-drop records and DHT peer-exchange hints"
+
+workload overlay-irc-dead-drop area=overlay-discovery expect=pass timeout=120 \
+    ref="src/spinnaker/qihse_overlay.c" \
+    output="overlay tests passed" \
+    run="make -s test-overlay"
+
+# A DHT record may cause exactly one thing: a dial. It can never make a node a
+# member, trusted, or admissible — asserted directly, including the contrast
+# case that a MEET upserts a topology node (existing precedent) and STILL is
+# not admissible.
+workload dht-peer-exchange area=overlay-discovery expect=pass timeout=180 \
+    ref="tests/test_dht_peer_exchange.c" \
+    output="dht peer exchange tests passed" \
+    run="make -s test-dht-peer-exchange"

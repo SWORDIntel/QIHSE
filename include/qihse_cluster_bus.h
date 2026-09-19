@@ -33,6 +33,15 @@ extern "C" {
  *   NODE_UPDATE — node metadata change (role/health), payload = node_t
  *   NODE_OBS    — third-party health observation
  *   NODE_CAP    — sender capability profile (ISA tier / NPU / GPU / RAM / load)
+ *   DHT_FIND    — overlay layer 3: "which peers do you know near this id?"
+ *   DHT_NODES   — overlay layer 3: up to k peers, nearest first
+ *
+ * The DHT pair is dispatched to the overlay (qihse_overlay.h) and is an
+ * UNAUTHENTICATED peer-exchange hint: it can only cause a dial (a MEET), never
+ * a membership, trust or authority change.  See the gate note in
+ * qihse_overlay.h.  The roadmap for this item named "msg types 9/10"; 9 and 10
+ * were taken by GROUP_UPDATE/GROUP_ACK before the DHT landed, so the pair is
+ * 13/14.
  */
 
 #define QIHSE_CLUSTER_BUS_MAGIC 0x51424E53u
@@ -66,7 +75,13 @@ typedef enum {
      * bootstrap or liveness frame and must never carry authority.  See
      * qihse_bus_msg_carries_authority(). */
     QIHSE_BUS_MSG_FED_STATEMENT = 11u,
-    QIHSE_BUS_MSG_FED_HEARTBEAT = 12u
+    QIHSE_BUS_MSG_FED_HEARTBEAT = 12u,
+    /* Overlay layer 3 (W4.2): DHT peer exchange.  UNAUTHENTICATED hint frames
+     * — see the gate note in qihse_overlay.h.  They are dispatched to the
+     * overlay and are dropped when the DHT hint table is not enabled, which is
+     * the fail-closed default. */
+    QIHSE_BUS_MSG_DHT_FIND  = 13u, /* "peers near this node id?" */
+    QIHSE_BUS_MSG_DHT_NODES = 14u  /* up to k peers, nearest first */
 } qihse_cluster_bus_msg_type_t;
 
 /*
@@ -275,6 +290,15 @@ bool qihse_cluster_bus_node_caps(const qihse_cluster_bus_t* bus,
 /* Send a MEET to a specific address (introduces this node to a peer). */
 bool qihse_cluster_bus_meet(qihse_cluster_bus_t* bus,
                             const char* host, uint16_t port);
+
+/* Send one frame of `message_type` to a specific address, framed and veiled
+ * exactly like every other bus datagram.  The bus does not interpret the
+ * payload; the caller owns the type's semantics.  Used by overlay layer 3 to
+ * send a DHT query to a peer's bus port (the bus itself never originates one).
+ * Returns false when the frame cannot be built or sent. */
+bool qihse_cluster_bus_send_frame(qihse_cluster_bus_t* bus, uint32_t message_type,
+                                  const uint8_t* payload, size_t payload_len,
+                                  const char* host, uint16_t port);
 
 /* Manually inject a received datagram (for testing).  Returns true if
  * the message was processed and applied to the topology. */
