@@ -32,8 +32,10 @@
  *     RESP pub/sub are exercised by tests/test_resp_cluster.c and
  *     tests/test_resp_pubsub.c, not by this file;
  *   - the Cypher surface is exercised by tests/test_graph.c;
- *   - the MongoDB aggregation pipeline, query operators and admin commands are
- *     not covered by any test in this repository;
+ *   - the MongoDB wire protocol, catalog, aggregation pipeline, query
+ *     operators and admin commands are exercised by tests/test_mongo_wire.c
+ *     and tests/test_mongo_wire_security.c, not by this file (this file covers
+ *     the BSON codec and the query matcher only);
  *   - the Elasticsearch query DSL and aggregations, and the InfluxQL parser,
  *     are not covered beyond the health/ping paths below.
  */
@@ -431,16 +433,18 @@ static void test_mongo_bson(void) {
     bson_destroy(qdoc);
 
     /*
-     * KNOWN GAP (reported, not asserted): include/qihse_mongo_wire.h declares
-     * mongo_msg_parse(), mongo_msg_get_document(), mongo_catalog_*(),
-     * mongo_dispatch_command() and qihse_mongo_server_*(), but none of them
-     * exist in any source file and libqihse.so exports no mongo_* symbols at
-     * all.  There is therefore no MongoDB wire protocol to test: only the BSON
-     * codec and the query matcher above are implemented.
+     * The MongoDB wire protocol declared in include/qihse_mongo_wire.h
+     * (mongo_msg_parse, mongo_msg_get_document, mongo_catalog_*, the command
+     * dispatcher and qihse_mongo_server_*) is implemented in
+     * src/spinnaker/qihse_mongo_wire.c and exported by libqihse.so.  It is
+     * covered by tests/test_mongo_wire.c (framing, catalog, dispatch, server)
+     * and by tests/test_mongo_wire_security.c (the invariant-3 negative
+     * authorization test); this file covers only the BSON codec and the query
+     * matcher below.
      */
-    printf("NOTE mongo wire: the wire protocol (mongo_msg_parse / qihse_mongo_server_*) "
-           "declared in include/qihse_mongo_wire.h is not implemented; only the BSON "
-           "codec and query matcher exist -- see docs/architecture/operational_protocols.md\n");
+    printf("NOTE mongo wire: the wire protocol is implemented and covered by "
+           "tests/test_mongo_wire.c and tests/test_mongo_wire_security.c; this file "
+           "covers the BSON codec and query matcher only\n");
 
     printf("PASS mongo bson: build/iterate round trip, field lookup, query matching, JSON export\n");
 }
