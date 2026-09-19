@@ -39,17 +39,31 @@ size_t qihse_af_xdp_ingest_frame_zero_copy_user(
     qihse_user_t *user)
 {
     if (!raw_pkt || raw_len == 0u || !kv) return 0u;
-    if (!qihse_auth_can_access(user, clearance, compartment)) return 0u;
+    if (!qihse_auth_can_access(user, clearance, compartment)) {
+        /* W5.2: a refusal is a security event, so it is counted separately
+         * from a malformed frame. */
+        qihse_af_xdp_stats_record_denied(1u);
+        return 0u;
+    }
 
     const char *tcp_payload = NULL;
     uint32_t tcp_len = 0u;
     if (qihse_af_xdp_extract_tcp_payload(raw_pkt, raw_len,
                                          &tcp_payload, &tcp_len,
                                          NULL, NULL, NULL)) {
-        if (tcp_len == 0u) return 0u;
-        return qihse_keystone_ingest_dirty_logs_user(
+        if (tcp_len == 0u) {
+            qihse_af_xdp_stats_record_dropped(1u);
+            return 0u;
+        }
+        size_t added = qihse_keystone_ingest_dirty_logs_user(
             kv, topo, tcp_payload, (size_t)tcp_len,
             clearance, compartment, user);
+        if (added > 0u) {
+            qihse_af_xdp_stats_record_ingested(added);
+        } else {
+            qihse_af_xdp_stats_record_dropped(1u);
+        }
+        return added;
     }
 
     const void *udp_payload = NULL;
@@ -57,12 +71,22 @@ size_t qihse_af_xdp_ingest_frame_zero_copy_user(
     if (qihse_af_xdp_extract_udp_payload(raw_pkt, raw_len,
                                          &udp_payload, &udp_len,
                                          NULL, NULL, NULL)) {
-        if (udp_len == 0u) return 0u;
-        return qihse_keystone_ingest_dirty_logs_user(
+        if (udp_len == 0u) {
+            qihse_af_xdp_stats_record_dropped(1u);
+            return 0u;
+        }
+        size_t added = qihse_keystone_ingest_dirty_logs_user(
             kv, topo, (const char *)udp_payload, (size_t)udp_len,
             clearance, compartment, user);
+        if (added > 0u) {
+            qihse_af_xdp_stats_record_ingested(added);
+        } else {
+            qihse_af_xdp_stats_record_dropped(1u);
+        }
+        return added;
     }
 
+    qihse_af_xdp_stats_record_dropped(1u);
     return 0u;
 }
 
@@ -99,7 +123,10 @@ size_t qihse_af_xdp_ingest_keystone_user(
     qihse_user_t *user)
 {
     if (!ctx || !kv) return 0u;
-    if (!qihse_auth_can_access(user, clearance, compartment)) return 0u;
+    if (!qihse_auth_can_access(user, clearance, compartment)) {
+        qihse_af_xdp_stats_record_denied(1u);
+        return 0u;
+    }
 
     qihse_af_xdp_keystone_user_ctx_t ingest = {
         .kv = kv,
@@ -110,6 +137,8 @@ size_t qihse_af_xdp_ingest_keystone_user(
         .artifacts = 0u
     };
     qihse_af_xdp_poll(ctx, qihse_af_xdp_keystone_user_cb, &ingest);
+    /* The per-frame adapter already counted each frame's artifacts, so the
+     * ring total is deliberately not counted a second time here. */
     return ingest.artifacts;
 }
 #endif

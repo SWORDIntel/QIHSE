@@ -99,6 +99,38 @@ size_t qihse_af_xdp_ingest_keystone(struct qihse_af_xdp_ctx *ctx,
                                     uint16_t clearance,
                                     uint16_t compartment);
 
+/**
+ * @brief W5.2 XDP counters.
+ *
+ * These live here rather than in the metrics registry because the datapath
+ * does not own a registry and must not learn about one: the counter is a
+ * process-global atomic that costs one lock-free add per frame, and the
+ * metrics surface samples it at scrape time (METRICS.RENDER).  A datapath
+ * that blocked on a registry lock per packet would cost more than the packet.
+ *
+ * - frames_rx        frames taken off the RX ring
+ * - frames_dropped   frames taken off the ring that produced no artifact
+ *                    (malformed/unsupported, or a fill-ring shortfall batch)
+ * - artifacts_ingested artifacts Keystone accepted from those frames
+ * - ingest_denied    frames refused because the principal lacked clearance
+ *                    or SCI compartment for the declared classification; a
+ *                    ring-level refusal that happens before any frame is read
+ *                    counts as one, because a refusal is the event of
+ *                    interest and no frame was examined to count instead
+ */
+typedef struct {
+    uint64_t frames_rx;
+    uint64_t frames_dropped;
+    uint64_t artifacts_ingested;
+    uint64_t ingest_denied;
+} qihse_af_xdp_stats_t;
+
+void qihse_af_xdp_stats_get(qihse_af_xdp_stats_t *out);
+void qihse_af_xdp_stats_record_rx(uint64_t frames);
+void qihse_af_xdp_stats_record_dropped(uint64_t frames);
+void qihse_af_xdp_stats_record_ingested(uint64_t artifacts);
+void qihse_af_xdp_stats_record_denied(uint64_t frames);
+
 #endif /* _WIN32 */
 
 #endif /* QIHSE_AF_XDP_H */

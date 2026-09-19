@@ -92,6 +92,24 @@ size_t qihse_af_xdp_ingest_keystone(struct qihse_af_xdp_ctx *ctx,
                                     uint16_t clearance,
                                     uint16_t compartment);
 
+/* W5.2 XDP counters.  This module-local header shadows include/qihse_af_xdp.h
+ * for translation units inside src/networking/ (a quoted include searches the
+ * including file's directory first), so the declaration is repeated here
+ * rather than only in the canonical header — otherwise this file would
+ * compile against a header that does not declare the counters it defines. */
+typedef struct {
+    uint64_t frames_rx;
+    uint64_t frames_dropped;
+    uint64_t artifacts_ingested;
+    uint64_t ingest_denied;
+} qihse_af_xdp_stats_t;
+
+void qihse_af_xdp_stats_get(qihse_af_xdp_stats_t *out);
+void qihse_af_xdp_stats_record_rx(uint64_t frames);
+void qihse_af_xdp_stats_record_dropped(uint64_t frames);
+void qihse_af_xdp_stats_record_ingested(uint64_t artifacts);
+void qihse_af_xdp_stats_record_denied(uint64_t frames);
+
 #endif /* _WIN32 */
 
 #endif /* QIHSE_AF_XDP_H */

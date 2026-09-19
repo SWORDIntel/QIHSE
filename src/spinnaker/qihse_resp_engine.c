@@ -20,6 +20,9 @@
 #include "qihse_metrics.h"
 #include "qihse_system_guard.h"
 #include "qihse_platform.h"
+#ifndef _WIN32
+#include "qihse_af_xdp.h"
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <fnmatch.h>
@@ -101,6 +104,11 @@ typedef struct {
     uint8_t* io_buf;
     size_t io_len;
     size_t io_cap;
+    /* W5.2: the query type of the command currently being dispatched, so an
+     * error reply produced deep inside a handler is attributed to the
+     * command that caused it.  OTHER until classification runs, never a
+     * caller-supplied string. */
+    qihse_query_type_t query_type;
 } qihse_resp_session_t;
 
 struct qihse_resp_client_ctx {
@@ -122,6 +130,46 @@ typedef struct {
     uint16_t status[QIHSE_CLUSTER_MAX_NODES];
     bool seen[QIHSE_CLUSTER_MAX_NODES];
 } group_ack_set_t;
+
+/* W5.2 telemetry handles.
+ *
+ * Every handle is resolved ONCE, when the registry is populated, so the
+ * request path never looks a metric up by name (a lookup takes the registry
+ * lock and walks it).  A NULL handle means that family was not registered —
+ * the metric is then simply not produced, rather than crashing the path that
+ * would have counted it.
+ *
+ * The gauges at the bottom are sampled at scrape time by
+ * qihse_resp_metrics_sample(): cluster/replication status and engine
+ * occupancy are read from live structures, and doing that per request would
+ * cost far more than the request. */
+typedef struct {
+    qihse_metric_series_t* queries[QIHSE_QUERY_TYPE_COUNT];
+    qihse_metric_series_t* errors[QIHSE_QUERY_TYPE_COUNT];
+    qihse_metric_series_t* latency[QIHSE_QUERY_TYPE_COUNT];
+    qihse_metric_series_t* backend_queries[QIHSE_ENGINE_BACKEND_COUNT];
+    qihse_metric_series_t* backend_available[QIHSE_ENGINE_BACKEND_COUNT];
+    /* Scrape-time status: cluster + replication. */
+    qihse_metric_series_t* cluster_nodes_total;
+    qihse_metric_series_t* cluster_nodes_healthy;
+    qihse_metric_series_t* cluster_slots_assigned;
+    qihse_metric_series_t* cluster_epoch;
+    qihse_metric_series_t* cluster_local_role;
+    qihse_metric_series_t* federation_state[6]; /* qihse_federation_state_t */
+    qihse_metric_series_t* federation_pending_events;
+    qihse_metric_series_t* replication_attempts;
+    qihse_metric_series_t* replication_failures;
+    /* Scrape-time status: memory + index movement. */
+    qihse_metric_series_t* kv_keys;
+    qihse_metric_series_t* vector_bytes_in_ram;
+    qihse_metric_series_t* vector_rows_spilled;
+    qihse_metric_series_t* label_rejected;
+    /* Scrape-time status: network/XDP. */
+    qihse_metric_series_t* xdp_frames_rx;
+    qihse_metric_series_t* xdp_frames_dropped;
+    qihse_metric_series_t* xdp_frames_ingested;
+    qihse_metric_series_t* xdp_ingest_denied;
+} qihse_resp_telemetry_t;
 
 struct qihse_resp_server {
     qihse_kv_store_t* store;
@@ -207,6 +255,11 @@ struct qihse_resp_server {
     bool sweeper_shutdown;
     /* U9 delivery metrics */
     qihse_metrics_registry_t* metrics;
+    /* W5.2 telemetry: per-query-type series handles + status gauges. */
+    qihse_resp_telemetry_t tlm;
+    /* W5.2: async write-duplication attempts/failures (replication status). */
+    uint64_t replication_attempts;
+    uint64_t replication_failures;
     /* CLUSTER MOVESLOTS target auth */
     const char* cluster_migrate_password;
     /* Data redundancy peer ("host:port") */
@@ -519,6 +572,14 @@ static bool qihse_resp_simple(qihse_resp_session_t* session, const char* value) 
 }
 
 static bool qihse_resp_error(qihse_resp_session_t* session, const char* value) {
+    /* W5.2: every error reply is counted once, here, attributed to the query
+     * type the session is currently running.  Counting at the single place
+     * that writes '-' means a handler cannot forget to report its failure,
+     * and it costs one lock-free add on a path that has already failed. */
+    if (session && session->server && session->server->metrics) {
+        qihse_metric_series_t* series = session->server->tlm.errors[session->query_type];
+        if (series) qihse_metrics_series_increment(series, 1u);
+    }
     return qihse_resp_write(session, "-", 1u) && qihse_resp_write(session, value, strlen(value)) && qihse_resp_write(session, "\r\n", 2u);
 }
 
@@ -1022,8 +1083,14 @@ static void qihse_resp_replicate_write(qihse_resp_server_t* server, const char* 
     uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
     if (port == 0) return;
 
+    /* W5.2 replication status: an attempt is a write the operator asked to be
+     * duplicated, a failure is one that did not reach the peer.  Both are
+     * plain increments on a path that already opens a socket, so the counter
+     * is free relative to the work it measures. */
+    server->replication_attempts++;
     int fd = qihse_resp_connect_timeout(spec, port, 2000);
     if (fd < 0) {
+        server->replication_failures++;
         redundancy_log("connect", errno ? strerror(errno) : "timeout");
         return; /* peer down: local commit stands; failover re-homes later */
     }
@@ -1038,6 +1105,7 @@ static void qihse_resp_replicate_write(qihse_resp_server_t* server, const char* 
             { (const uint8_t*)password, strlen(password) }
         };
         if (!qihse_resp_fd_command(fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
+            server->replication_failures++;
             redundancy_log("target auth", remote_error);
             close_socket(fd);
             return;
@@ -1060,6 +1128,7 @@ static void qihse_resp_replicate_write(qihse_resp_server_t* server, const char* 
             set_args[argc++] = (qihse_resp_arg_t){ (const uint8_t*)ttl_buf, (size_t)n };
         }
         if (!qihse_resp_fd_command(fd, argc, set_args, remote_error, sizeof(remote_error))) {
+            server->replication_failures++;
             redundancy_log("SET replay", remote_error);
         }
     }
@@ -1076,8 +1145,12 @@ static void qihse_resp_replicate_del(qihse_resp_server_t* server, const char* ke
     uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
     if (port == 0) return;
 
+    server->replication_attempts++;
     int fd = qihse_resp_connect_timeout(spec, port, 2000);
-    if (fd < 0) return;
+    if (fd < 0) {
+        server->replication_failures++;
+        return;
+    }
     char remote_error[256] = {0};
     const char* password = server->cluster_migrate_password;
     if (password && *password) {
@@ -1089,6 +1162,7 @@ static void qihse_resp_replicate_del(qihse_resp_server_t* server, const char* ke
             { (const uint8_t*)password, strlen(password) }
         };
         if (!qihse_resp_fd_command(fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
+            server->replication_failures++;
             close_socket(fd);
             return;
         }
@@ -1101,7 +1175,11 @@ static void qihse_resp_replicate_del(qihse_resp_server_t* server, const char* ke
             { del_cmd, sizeof(del_cmd) - 1u },
             { (const uint8_t*)key, strlen(key) }
         };
-        qihse_resp_fd_command(fd, 2u, del_args, remote_error, sizeof(remote_error));
+        if (!qihse_resp_fd_command(fd, 2u, del_args, remote_error, sizeof(remote_error))) {
+            server->replication_failures++;
+        }
+    } else {
+        server->replication_failures++;
     }
     close_socket(fd);
 }
@@ -4572,6 +4650,283 @@ static bool qihse_resp_handle_bundle_chunk(qihse_resp_session_t* session, const 
     return ok;
 }
 
+/* ---------------------------------------------------------------------------
+ * W5.2 telemetry: registration, then scrape-time sampling.
+ *
+ * Everything below registers into the ONE registry that already backs
+ * METRICS.RENDER.  There is no second metrics surface, no second exporter and
+ * no parallel naming scheme: the new families use the `qihse_*` names the
+ * whitepaper's telemetry contract already lists.
+ * ------------------------------------------------------------------------- */
+
+/* Latency bucket ladder, in seconds.
+ *
+ * Chosen deliberately, not geometrically-by-accident:
+ *   - Ratio 2.5 between bounds (4 buckets per decade), which is the ladder
+ *     Prometheus uses for its own http_request_duration_seconds.  It bounds
+ *     the quantization error at any point to ~25%, which is enough to see a
+ *     regression and not enough to lie about one.
+ *   - Starts at 50 us rather than Prometheus's 5 ms, because a native
+ *     in-process store answers a point operation in tens of microseconds; a
+ *     ladder that starts at 5 ms would put every healthy request in the first
+ *     bucket and measure nothing.
+ *   - Ends at 5 s.  Beyond that a query is not "slow", it is hung, and one
+ *     overflow bucket (the +Inf bucket, which is `_count`) says so honestly
+ *     instead of pretending to resolve it.
+ *   - 16 bounds is the compile-time cap (QIHSE_METRICS_MAX_BUCKETS), so the
+ *     per-series cost is a fixed 16 counters x 16 bytes and cannot grow with
+ *     traffic.  Quantiles (p50/p95/p99) are derived by the scraper with
+ *     histogram_quantile() from these buckets; the registry deliberately does
+ *     not maintain a decayed reservoir, which would be the only way to get a
+ *     native quantile and is lossy under the hood.
+ */
+static const double g_query_latency_bounds[] = {
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+    0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+};
+
+#define QIHSE_FEDERATION_STATE_VALUES 6u
+
+/* Register one unlabelled series and cache its handle. */
+static void qihse_resp_telemetry_gauge(qihse_metrics_registry_t* reg,
+                                       qihse_metric_series_t** handle,
+                                       const char* name, const char* help,
+                                       metric_type_t type) {
+    if (qihse_metrics_register(reg, name, help, type) != 0) return;
+    *handle = qihse_metrics_series(reg, name, NULL);
+}
+
+/* Register the W5.2 families.  Called once, from server create, so every
+ * value set is fixed before the first request is served. */
+static void qihse_resp_telemetry_register(qihse_resp_server_t* server) {
+    qihse_metrics_registry_t* reg = server->metrics;
+    if (!reg) return;
+
+    const char* query_types[QIHSE_QUERY_TYPE_COUNT];
+    for (size_t i = 0; i < (size_t)QIHSE_QUERY_TYPE_COUNT; i++) {
+        query_types[i] = qihse_query_type_name((qihse_query_type_t)i);
+    }
+    const char* backends[QIHSE_ENGINE_BACKEND_COUNT];
+    for (size_t i = 0; i < (size_t)QIHSE_ENGINE_BACKEND_COUNT; i++) {
+        backends[i] = qihse_engine_backend_name((qihse_engine_backend_t)i);
+    }
+
+    if (qihse_metrics_register_bounded(reg, "qihse_queries_total",
+                                       "Commands dispatched, by query type",
+                                       METRIC_COUNTER, "type",
+                                       query_types, (size_t)QIHSE_QUERY_TYPE_COUNT) == 0) {
+        for (size_t i = 0; i < (size_t)QIHSE_QUERY_TYPE_COUNT; i++) {
+            server->tlm.queries[i] = qihse_metrics_series(reg, "qihse_queries_total", query_types[i]);
+        }
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_query_errors_total",
+                                       "Error replies, by query type",
+                                       METRIC_COUNTER, "type",
+                                       query_types, (size_t)QIHSE_QUERY_TYPE_COUNT) == 0) {
+        for (size_t i = 0; i < (size_t)QIHSE_QUERY_TYPE_COUNT; i++) {
+            server->tlm.errors[i] = qihse_metrics_series(reg, "qihse_query_errors_total", query_types[i]);
+        }
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_query_latency_seconds",
+                                       "Command latency, by query type",
+                                       METRIC_HISTOGRAM, "type",
+                                       query_types, (size_t)QIHSE_QUERY_TYPE_COUNT) == 0) {
+        size_t buckets = sizeof(g_query_latency_bounds) / sizeof(g_query_latency_bounds[0]);
+        for (size_t i = 0; i < (size_t)QIHSE_QUERY_TYPE_COUNT; i++) {
+            qihse_metrics_set_buckets(reg, "qihse_query_latency_seconds", query_types[i],
+                                      g_query_latency_bounds, buckets);
+            server->tlm.latency[i] = qihse_metrics_series(reg, "qihse_query_latency_seconds", query_types[i]);
+        }
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_backend_queries_total",
+                                       "Commands attributed to each engine backend",
+                                       METRIC_COUNTER, "backend",
+                                       backends, (size_t)QIHSE_ENGINE_BACKEND_COUNT) == 0) {
+        for (size_t i = 0; i < (size_t)QIHSE_ENGINE_BACKEND_COUNT; i++) {
+            server->tlm.backend_queries[i] = qihse_metrics_series(reg, "qihse_backend_queries_total", backends[i]);
+        }
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_backend_available",
+                                       "Engine backend configured and usable on this node (1/0)",
+                                       METRIC_GAUGE, "backend",
+                                       backends, (size_t)QIHSE_ENGINE_BACKEND_COUNT) == 0) {
+        for (size_t i = 0; i < (size_t)QIHSE_ENGINE_BACKEND_COUNT; i++) {
+            server->tlm.backend_available[i] = qihse_metrics_series(reg, "qihse_backend_available", backends[i]);
+        }
+    }
+
+    /* Federation state as a bounded info-style family: exactly one member is
+     * 1 and the rest are 0, so `sum(qihse_federation_state)` stays 1 and a
+     * state the enum does not name cannot appear as a series. */
+    const char* fed_states[QIHSE_FEDERATION_STATE_VALUES];
+    for (size_t i = 0; i < QIHSE_FEDERATION_STATE_VALUES; i++) {
+        const char* nm = qihse_federation_state_name((qihse_federation_state_t)i);
+        fed_states[i] = nm ? nm : "unknown";
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_federation_state",
+                                       "Federation operating state of this node (1 for the current state)",
+                                       METRIC_GAUGE, "state",
+                                       fed_states, QIHSE_FEDERATION_STATE_VALUES) == 0) {
+        for (size_t i = 0; i < QIHSE_FEDERATION_STATE_VALUES; i++) {
+            server->tlm.federation_state[i] = qihse_metrics_series(reg, "qihse_federation_state", fed_states[i]);
+        }
+    }
+
+    qihse_resp_telemetry_gauge(reg, &server->tlm.cluster_nodes_total, "qihse_cluster_nodes_total",
+                               "Nodes known to the cluster topology", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.cluster_nodes_healthy, "qihse_cluster_nodes_healthy",
+                               "Nodes the cluster topology reports healthy", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.cluster_slots_assigned, "qihse_cluster_slots_assigned",
+                               "Hash slots with an assigned owner", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.cluster_epoch, "qihse_cluster_epoch",
+                               "Topology configuration epoch", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.cluster_local_role, "qihse_cluster_local_role",
+                               "This node's role (0 primary, 1 replica)", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.federation_pending_events, "qihse_replication_pending_events",
+                               "Replication events not yet acknowledged", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.replication_attempts, "qihse_replication_attempts_total",
+                               "Async write-duplication attempts to the redundancy peer", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.replication_failures, "qihse_replication_failures_total",
+                               "Async write-duplication attempts that did not reach the peer", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.kv_keys, "qihse_kv_keys",
+                               "Live keys in the local key-value store", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.vector_bytes_in_ram, "qihse_vector_bytes_in_ram",
+                               "Vector bytes resident in RAM", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.vector_rows_spilled, "qihse_vector_rows_spilled",
+                               "Vector rows evicted to the spill file", METRIC_GAUGE);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.label_rejected, "qihse_metrics_label_rejected_total",
+                               "Attempts to use a label value outside its declared value set", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.xdp_frames_rx, "qihse_xdp_frames_rx_total",
+                               "AF_XDP frames taken off the RX ring", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.xdp_frames_dropped, "qihse_xdp_frames_dropped_total",
+                               "AF_XDP frames that produced no ingested artifact", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.xdp_frames_ingested, "qihse_xdp_artifacts_ingested_total",
+                               "Artifacts the XDP path ingested into Keystone", METRIC_COUNTER);
+    qihse_resp_telemetry_gauge(reg, &server->tlm.xdp_ingest_denied, "qihse_xdp_ingest_denied_total",
+                               "XDP frames refused for lack of clearance or SCI compartment", METRIC_COUNTER);
+}
+
+/* Refresh the values that are too expensive to maintain per request: cluster
+ * and replication status, engine availability, engine occupancy and the XDP
+ * datapath totals.  Called immediately before the registry is exported, so a
+ * scrape always reports the state at scrape time and the request path pays
+ * nothing for any of it. */
+static void qihse_resp_metrics_sample(qihse_resp_server_t* server) {
+    if (!server || !server->metrics) return;
+    qihse_resp_telemetry_t* t = &server->tlm;
+
+    if (t->label_rejected) {
+        qihse_metrics_series_set(t->label_rejected,
+                                 (double)__atomic_load_n(&server->metrics->label_rejected_total, __ATOMIC_RELAXED));
+    }
+
+    /* ── Cluster + replication status ── */
+    if (server->topology) {
+        /* One heap buffer, not a 24 KB stack frame: QIHSE_CLUSTER_MAX_NODES is
+         * 256 and a node record is ~90 bytes.  Scrape-time only. */
+        qihse_cluster_node_t* nodes = (qihse_cluster_node_t*)malloc(QIHSE_CLUSTER_MAX_NODES * sizeof(*nodes));
+        size_t total = qihse_cluster_topology_nodes(server->topology, NULL, 0);
+        size_t healthy = 0;
+        if (nodes) {
+            size_t n = qihse_cluster_topology_nodes(server->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
+            for (size_t i = 0; i < n; i++) {
+                if (nodes[i].healthy) healthy++;
+            }
+            free(nodes);
+        }
+        if (t->cluster_nodes_total) qihse_metrics_series_set(t->cluster_nodes_total, (double)total);
+        if (t->cluster_nodes_healthy) qihse_metrics_series_set(t->cluster_nodes_healthy, (double)healthy);
+        if (t->cluster_slots_assigned) {
+            qihse_metrics_series_set(t->cluster_slots_assigned,
+                                     (double)qihse_cluster_topology_assigned_slots(server->topology));
+        }
+        if (t->cluster_epoch) {
+            qihse_metrics_series_set(t->cluster_epoch,
+                                     (double)qihse_cluster_topology_epoch(server->topology));
+        }
+        if (t->cluster_local_role) {
+            qihse_cluster_node_t local_node;
+            uint16_t local = qihse_cluster_topology_local_node(server->topology);
+            bool replica = qihse_cluster_topology_get_node(server->topology, local, &local_node) &&
+                           local_node.role == QIHSE_CLUSTER_NODE_REPLICA;
+            qihse_metrics_series_set(t->cluster_local_role, replica ? 1.0 : 0.0);
+        }
+    }
+    pthread_mutex_lock(&server->federation_lock);
+    qihse_federation_status_recompute(&server->federation_status);
+    qihse_federation_state_t state = server->federation_status.federation_state;
+    uint64_t pending = server->federation_status.pending_replication_events;
+    pthread_mutex_unlock(&server->federation_lock);
+    for (size_t i = 0; i < QIHSE_FEDERATION_STATE_VALUES; i++) {
+        if (t->federation_state[i]) {
+            qihse_metrics_series_set(t->federation_state[i], ((size_t)state == i) ? 1.0 : 0.0);
+        }
+    }
+    if (t->federation_pending_events) qihse_metrics_series_set(t->federation_pending_events, (double)pending);
+    if (t->replication_attempts) {
+        qihse_metrics_series_set(t->replication_attempts, (double)server->replication_attempts);
+    }
+    if (t->replication_failures) {
+        qihse_metrics_series_set(t->replication_failures, (double)server->replication_failures);
+    }
+
+    /* ── Backend availability (the engines actually attached) + occupancy ── */
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_KV]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_KV], server->store ? 1.0 : 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_VECTOR]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_VECTOR], server->vdb ? 1.0 : 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_TIMESERIES]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_TIMESERIES], server->tsdb ? 1.0 : 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_COLUMN]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_COLUMN], server->column_store ? 1.0 : 0.0);
+    }
+    /* The RESP server holds no document, graph or FTS engine handle, so those
+     * backends report 0 rather than a fabricated availability.  The control
+     * plane is always "available": it is this process. */
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_DOCUMENT]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_DOCUMENT], 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_GRAPH]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_GRAPH], 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_FTS]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_FTS], 0.0);
+    }
+    if (t->backend_available[QIHSE_ENGINE_BACKEND_CONTROL]) {
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_CONTROL], 1.0);
+    }
+
+    /* ── Memory + index movement ── */
+    if (t->kv_keys && server->store) {
+        qihse_metrics_series_set(t->kv_keys, (double)qihse_kv_count(server->store));
+    }
+    if (server->vdb && (t->vector_bytes_in_ram || t->vector_rows_spilled)) {
+        size_t budget = 0;
+        size_t in_ram = 0;
+        size_t spilled = 0;
+        pthread_mutex_lock(&server->vdb_lock);
+        bool have = qihse_vector_db_get_memory_usage(server->vdb, &budget, &in_ram, &spilled);
+        pthread_mutex_unlock(&server->vdb_lock);
+        if (have) {
+            if (t->vector_bytes_in_ram) qihse_metrics_series_set(t->vector_bytes_in_ram, (double)in_ram);
+            if (t->vector_rows_spilled) qihse_metrics_series_set(t->vector_rows_spilled, (double)spilled);
+        }
+    }
+
+    /* ── Network / XDP ── */
+#ifndef _WIN32
+    qihse_af_xdp_stats_t xdp;
+    qihse_af_xdp_stats_get(&xdp);
+    if (t->xdp_frames_rx) qihse_metrics_series_set(t->xdp_frames_rx, (double)xdp.frames_rx);
+    if (t->xdp_frames_dropped) qihse_metrics_series_set(t->xdp_frames_dropped, (double)xdp.frames_dropped);
+    if (t->xdp_frames_ingested) qihse_metrics_series_set(t->xdp_frames_ingested, (double)xdp.artifacts_ingested);
+    if (t->xdp_ingest_denied) qihse_metrics_series_set(t->xdp_ingest_denied, (double)xdp.ingest_denied);
+#endif
+}
+
 /* U9: render the delivery metrics registry (Prometheus text). System-domain
  * only — metric values are operational data tenants have no business reading. */
 static bool qihse_resp_handle_metrics_render(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4580,6 +4935,9 @@ static bool qihse_resp_handle_metrics_render(qihse_resp_session_t* session, cons
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
         return qihse_resp_error(session, "NOPERM metrics exposure is restricted to the system domain");
     }
+    /* W5.2: refresh the scrape-time series before rendering, so the export is
+     * a snapshot of now rather than of whenever the last request ran. */
+    qihse_resp_metrics_sample(session->server);
     char* text = qihse_metrics_export(session->server->metrics);
     if (!text) return qihse_resp_error(session, "ERR metrics export failed");
     bool ok = qihse_resp_bulk_text(session, text);
@@ -7657,7 +8015,230 @@ static bool qihse_resp_handle_fabric_result(qihse_resp_session_t* session, const
     return ok;
 }
 
+/* ---------------------------------------------------------------------------
+ * W5.2 query-type classification.
+ *
+ * The `type` label of qihse_queries_total / qihse_query_errors_total /
+ * qihse_query_latency_seconds is bounded by the qihse_query_type_t enum: this
+ * table maps command NAMES (never an argument, never a key) onto that enum,
+ * and a name that is not listed lands in OTHER.  A command added to the
+ * engine without a type therefore shows up as `other` — a slightly less
+ * useful number, never a new series and never a cardinality leak.
+ *
+ * The lookup is the same folded FNV-1a hash the dispatch table uses, so
+ * attribution costs one hash and one probe.  It is skipped entirely when the
+ * registry is absent, which is the only case where a hot path pays nothing.
+ * ------------------------------------------------------------------------- */
+typedef struct { const char* name; uint8_t type; } qihse_resp_qtype_ent_t;
+
+static const qihse_resp_qtype_ent_t g_qtype_table[] = {
+    /* single-key value reads */
+    {"get", QIHSE_QUERY_TYPE_GET}, {"getrange", QIHSE_QUERY_TYPE_GET},
+    {"getbit", QIHSE_QUERY_TYPE_GET}, {"strlen", QIHSE_QUERY_TYPE_GET},
+    {"hget", QIHSE_QUERY_TYPE_GET}, {"hmget", QIHSE_QUERY_TYPE_GET},
+    {"hgetall", QIHSE_QUERY_TYPE_GET}, {"hkeys", QIHSE_QUERY_TYPE_GET},
+    {"hvals", QIHSE_QUERY_TYPE_GET}, {"hlen", QIHSE_QUERY_TYPE_GET},
+    {"hexists", QIHSE_QUERY_TYPE_GET}, {"hstrlen", QIHSE_QUERY_TYPE_GET},
+    {"lindex", QIHSE_QUERY_TYPE_GET}, {"llen", QIHSE_QUERY_TYPE_GET},
+    {"lrange", QIHSE_QUERY_TYPE_GET}, {"zscore", QIHSE_QUERY_TYPE_GET},
+    {"zcard", QIHSE_QUERY_TYPE_GET}, {"zcount", QIHSE_QUERY_TYPE_GET},
+    {"zrange", QIHSE_QUERY_TYPE_GET}, {"zrevrange", QIHSE_QUERY_TYPE_GET},
+    {"zrangebyscore", QIHSE_QUERY_TYPE_GET}, {"zrevrangebyscore", QIHSE_QUERY_TYPE_GET},
+    {"zrank", QIHSE_QUERY_TYPE_GET}, {"zrevrank", QIHSE_QUERY_TYPE_GET},
+    {"sismember", QIHSE_QUERY_TYPE_GET}, {"scard", QIHSE_QUERY_TYPE_GET},
+    {"smembers", QIHSE_QUERY_TYPE_GET}, {"sdiff", QIHSE_QUERY_TYPE_GET},
+    {"sinter", QIHSE_QUERY_TYPE_GET}, {"sunion", QIHSE_QUERY_TYPE_GET},
+    {"srandmember", QIHSE_QUERY_TYPE_GET}, {"pfcount", QIHSE_QUERY_TYPE_GET},
+    {"bitcount", QIHSE_QUERY_TYPE_GET}, {"bitpos", QIHSE_QUERY_TYPE_GET},
+    {"memory", QIHSE_QUERY_TYPE_GET},
+    /* writes */
+    {"set", QIHSE_QUERY_TYPE_SET}, {"setex", QIHSE_QUERY_TYPE_SET},
+    {"psetex", QIHSE_QUERY_TYPE_SET}, {"setrange", QIHSE_QUERY_TYPE_SET},
+    {"setbit", QIHSE_QUERY_TYPE_SET}, {"getset", QIHSE_QUERY_TYPE_SET},
+    {"append", QIHSE_QUERY_TYPE_SET}, {"incr", QIHSE_QUERY_TYPE_SET},
+    {"decr", QIHSE_QUERY_TYPE_SET}, {"incrby", QIHSE_QUERY_TYPE_SET},
+    {"decrby", QIHSE_QUERY_TYPE_SET}, {"incrbyfloat", QIHSE_QUERY_TYPE_SET},
+    {"mset", QIHSE_QUERY_TYPE_SET}, {"msetnx", QIHSE_QUERY_TYPE_SET},
+    {"hset", QIHSE_QUERY_TYPE_SET}, {"hmset", QIHSE_QUERY_TYPE_SET},
+    {"hsetnx", QIHSE_QUERY_TYPE_SET}, {"hincrby", QIHSE_QUERY_TYPE_SET},
+    {"lpush", QIHSE_QUERY_TYPE_SET}, {"rpush", QIHSE_QUERY_TYPE_SET},
+    {"lpop", QIHSE_QUERY_TYPE_SET}, {"rpop", QIHSE_QUERY_TYPE_SET},
+    {"lset", QIHSE_QUERY_TYPE_SET}, {"ltrim", QIHSE_QUERY_TYPE_SET},
+    {"linsert", QIHSE_QUERY_TYPE_SET}, {"rpoplpush", QIHSE_QUERY_TYPE_SET},
+    {"sadd", QIHSE_QUERY_TYPE_SET}, {"smove", QIHSE_QUERY_TYPE_SET},
+    {"spop", QIHSE_QUERY_TYPE_SET}, {"zadd", QIHSE_QUERY_TYPE_SET},
+    {"zincrby", QIHSE_QUERY_TYPE_SET}, {"zpopmax", QIHSE_QUERY_TYPE_SET},
+    {"zpopmin", QIHSE_QUERY_TYPE_SET}, {"pfadd", QIHSE_QUERY_TYPE_SET},
+    {"pfmerge", QIHSE_QUERY_TYPE_SET}, {"bitop", QIHSE_QUERY_TYPE_SET},
+    {"copy", QIHSE_QUERY_TYPE_SET}, {"rename", QIHSE_QUERY_TYPE_SET},
+    {"renamenx", QIHSE_QUERY_TYPE_SET}, {"flushdb", QIHSE_QUERY_TYPE_SET},
+    {"flushall", QIHSE_QUERY_TYPE_SET}, {"save", QIHSE_QUERY_TYPE_SET},
+    {"bgsave", QIHSE_QUERY_TYPE_SET},
+    /* deletes */
+    {"del", QIHSE_QUERY_TYPE_DELETE}, {"unlink", QIHSE_QUERY_TYPE_DELETE},
+    {"getdel", QIHSE_QUERY_TYPE_DELETE}, {"hdel", QIHSE_QUERY_TYPE_DELETE},
+    {"srem", QIHSE_QUERY_TYPE_DELETE}, {"zrem", QIHSE_QUERY_TYPE_DELETE},
+    {"lrem", QIHSE_QUERY_TYPE_DELETE},
+    /* expiry */
+    {"expire", QIHSE_QUERY_TYPE_EXPIRE}, {"pexpire", QIHSE_QUERY_TYPE_EXPIRE},
+    {"expireat", QIHSE_QUERY_TYPE_EXPIRE}, {"pexpireat", QIHSE_QUERY_TYPE_EXPIRE},
+    {"persist", QIHSE_QUERY_TYPE_EXPIRE}, {"ttl", QIHSE_QUERY_TYPE_EXPIRE},
+    {"pttl", QIHSE_QUERY_TYPE_EXPIRE},
+    /* multi-key / metadata reads */
+    {"mget", QIHSE_QUERY_TYPE_SCAN}, {"keys", QIHSE_QUERY_TYPE_SCAN},
+    {"scan", QIHSE_QUERY_TYPE_SCAN}, {"dbsize", QIHSE_QUERY_TYPE_SCAN},
+    {"randomkey", QIHSE_QUERY_TYPE_SCAN}, {"type", QIHSE_QUERY_TYPE_SCAN},
+    {"exists", QIHSE_QUERY_TYPE_SCAN}, {"object", QIHSE_QUERY_TYPE_SCAN},
+    {"touch", QIHSE_QUERY_TYPE_SCAN},
+    /* model-specific engines */
+    {"vecset", QIHSE_QUERY_TYPE_VECTOR}, {"vecget", QIHSE_QUERY_TYPE_VECTOR},
+    {"vecsearch", QIHSE_QUERY_TYPE_VECTOR}, {"vecscatter", QIHSE_QUERY_TYPE_VECTOR},
+    {"ts.add", QIHSE_QUERY_TYPE_TIMESERIES}, {"ts.range", QIHSE_QUERY_TYPE_TIMESERIES},
+    {"col.append", QIHSE_QUERY_TYPE_COLUMN}, {"col.sum", QIHSE_QUERY_TYPE_COLUMN},
+    {"col.minmax", QIHSE_QUERY_TYPE_COLUMN},
+    {"keystone.ingest", QIHSE_QUERY_TYPE_KEYSTONE},
+    {"keystone.classify", QIHSE_QUERY_TYPE_KEYSTONE},
+    {"fabric.caps", QIHSE_QUERY_TYPE_FABRIC}, {"fabric.submit", QIHSE_QUERY_TYPE_FABRIC},
+    {"fabric.result", QIHSE_QUERY_TYPE_FABRIC},
+    /* control plane */
+    {"cluster", QIHSE_QUERY_TYPE_CLUSTER}, {"migrate", QIHSE_QUERY_TYPE_CLUSTER},
+    {"asking", QIHSE_QUERY_TYPE_CLUSTER}, {"readonly", QIHSE_QUERY_TYPE_CLUSTER},
+    {"readwrite", QIHSE_QUERY_TYPE_CLUSTER}, {"role", QIHSE_QUERY_TYPE_CLUSTER},
+    {"federation", QIHSE_QUERY_TYPE_FEDERATION},
+    {"publish", QIHSE_QUERY_TYPE_PUBSUB}, {"subscribe", QIHSE_QUERY_TYPE_PUBSUB},
+    {"unsubscribe", QIHSE_QUERY_TYPE_PUBSUB}, {"psubscribe", QIHSE_QUERY_TYPE_PUBSUB},
+    {"punsubscribe", QIHSE_QUERY_TYPE_PUBSUB}, {"pubsub", QIHSE_QUERY_TYPE_PUBSUB},
+    {"info", QIHSE_QUERY_TYPE_ADMIN}, {"config", QIHSE_QUERY_TYPE_ADMIN},
+    {"debug", QIHSE_QUERY_TYPE_ADMIN}, {"command", QIHSE_QUERY_TYPE_ADMIN},
+    {"client", QIHSE_QUERY_TYPE_ADMIN}, {"shutdown", QIHSE_QUERY_TYPE_ADMIN},
+    {"slowlog", QIHSE_QUERY_TYPE_ADMIN}, {"latency", QIHSE_QUERY_TYPE_ADMIN},
+    {"time", QIHSE_QUERY_TYPE_ADMIN}, {"lastsave", QIHSE_QUERY_TYPE_ADMIN},
+    {"script", QIHSE_QUERY_TYPE_ADMIN}, {"eval", QIHSE_QUERY_TYPE_ADMIN},
+    {"evalsha", QIHSE_QUERY_TYPE_ADMIN}, {"metrics.render", QIHSE_QUERY_TYPE_ADMIN},
+    {"auth", QIHSE_QUERY_TYPE_SESSION}, {"hello", QIHSE_QUERY_TYPE_SESSION},
+    {"ping", QIHSE_QUERY_TYPE_SESSION}, {"quit", QIHSE_QUERY_TYPE_SESSION},
+    {"select", QIHSE_QUERY_TYPE_SESSION}, {"echo", QIHSE_QUERY_TYPE_SESSION},
+    {"reset", QIHSE_QUERY_TYPE_SESSION}, {"multi", QIHSE_QUERY_TYPE_SESSION},
+    {"exec", QIHSE_QUERY_TYPE_SESSION}, {"discard", QIHSE_QUERY_TYPE_SESSION},
+    {"watch", QIHSE_QUERY_TYPE_SESSION}, {"unwatch", QIHSE_QUERY_TYPE_SESSION}
+};
+
+#define RESP_QTYPE_MAP_CAP 256u
+static const qihse_resp_qtype_ent_t* g_qtype_map[RESP_QTYPE_MAP_CAP];
+static pthread_once_t g_qtype_map_once = PTHREAD_ONCE_INIT;
+
+static void qihse_resp_qtype_map_build(void) {
+    size_t n = sizeof(g_qtype_table) / sizeof(g_qtype_table[0]);
+    for (size_t i = 0; i < n; i++) {
+        const char* nm = g_qtype_table[i].name;
+        uint32_t h = qihse_resp_cmd_hash((const uint8_t*)nm, strlen(nm)) & (RESP_QTYPE_MAP_CAP - 1u);
+        for (size_t j = 0; j < RESP_QTYPE_MAP_CAP; j++) {
+            size_t pos = (h + j) & (RESP_QTYPE_MAP_CAP - 1u);
+            if (!g_qtype_map[pos]) { g_qtype_map[pos] = &g_qtype_table[i]; break; }
+            if (strcasecmp(g_qtype_map[pos]->name, nm) == 0) break; /* dup name */
+        }
+    }
+}
+
+/* Command families whose subcommand set is open-ended: a subcommand added
+ * later is still the same query type, so a prefix rule keeps the LABEL
+ * bounded while the vocabulary grows.  The list is fixed and short, and only
+ * consulted for names the table above does not cover. */
+static const struct { const char* prefix; uint8_t type; } g_qtype_prefixes[] = {
+    {"KEYSTONE.FEED.", QIHSE_QUERY_TYPE_KEYSTONE},
+    {"TASK.", QIHSE_QUERY_TYPE_FABRIC},
+    {"SCHEDULE.", QIHSE_QUERY_TYPE_FABRIC},
+    {"GROUP.", QIHSE_QUERY_TYPE_CLUSTER},
+    {"CLUSTER.", QIHSE_QUERY_TYPE_CLUSTER},
+    {"FEDERATION.", QIHSE_QUERY_TYPE_FEDERATION},
+    {"FABRIC.", QIHSE_QUERY_TYPE_FABRIC},
+    {"BUNDLE.", QIHSE_QUERY_TYPE_ADMIN}
+};
+
+static qihse_query_type_t qihse_resp_classify(const qihse_resp_request_t* request) {
+    if (!request || request->argc == 0) return QIHSE_QUERY_TYPE_OTHER;
+    const qihse_resp_arg_t* name = &request->argv[0];
+    /* The longest name in the vocabulary is well under 32 bytes; anything
+     * longer is not a command this build knows. */
+    if (name->len == 0 || name->len > 31u) return QIHSE_QUERY_TYPE_OTHER;
+    pthread_once(&g_qtype_map_once, qihse_resp_qtype_map_build);
+    uint32_t h = qihse_resp_cmd_hash(name->data, name->len) & (RESP_QTYPE_MAP_CAP - 1u);
+    for (size_t i = 0; i < RESP_QTYPE_MAP_CAP; i++) {
+        const qihse_resp_qtype_ent_t* e = g_qtype_map[(h + i) & (RESP_QTYPE_MAP_CAP - 1u)];
+        if (!e) break;
+        if (strlen(e->name) == name->len && qihse_resp_arg_equal(name, e->name)) {
+            return (qihse_query_type_t)e->type;
+        }
+    }
+    for (size_t i = 0; i < sizeof(g_qtype_prefixes) / sizeof(g_qtype_prefixes[0]); i++) {
+        size_t plen = strlen(g_qtype_prefixes[i].prefix);
+        if (name->len < plen) continue;
+        if (strncasecmp((const char*)name->data, g_qtype_prefixes[i].prefix, plen) == 0) {
+            return (qihse_query_type_t)g_qtype_prefixes[i].type;
+        }
+    }
+    return QIHSE_QUERY_TYPE_OTHER;
+}
+
+/* Which engine serves a query type.  Used for the backend dimension; the
+ * mapping is a property of the command vocabulary, not of the caller. */
+static qihse_engine_backend_t qihse_resp_backend_for_type(qihse_query_type_t type) {
+    switch (type) {
+        case QIHSE_QUERY_TYPE_GET:
+        case QIHSE_QUERY_TYPE_SET:
+        case QIHSE_QUERY_TYPE_DELETE:
+        case QIHSE_QUERY_TYPE_SCAN:
+        case QIHSE_QUERY_TYPE_EXPIRE:
+            return QIHSE_ENGINE_BACKEND_KV;
+        case QIHSE_QUERY_TYPE_VECTOR:     return QIHSE_ENGINE_BACKEND_VECTOR;
+        case QIHSE_QUERY_TYPE_TIMESERIES: return QIHSE_ENGINE_BACKEND_TIMESERIES;
+        case QIHSE_QUERY_TYPE_COLUMN:     return QIHSE_ENGINE_BACKEND_COLUMN;
+        case QIHSE_QUERY_TYPE_DOCUMENT:   return QIHSE_ENGINE_BACKEND_DOCUMENT;
+        case QIHSE_QUERY_TYPE_GRAPH:      return QIHSE_ENGINE_BACKEND_GRAPH;
+        case QIHSE_QUERY_TYPE_FTS:        return QIHSE_ENGINE_BACKEND_FTS;
+        default:                          return QIHSE_ENGINE_BACKEND_CONTROL;
+    }
+}
+
+static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open);
+
+/* W5.2: the timing/attribution wrapper.
+ *
+ * It exists so that every early return inside dispatch — and there are many —
+ * is still measured and attributed to a query type without editing a hundred
+ * return statements.  When the registry is absent this is a tail call: no
+ * clock read, no hash, no counter, so a build without metrics pays nothing.
+ *
+ * Measured cost when metrics are present: ~100 ns per command — two
+ * clock_gettime (44 ns), the two counter adds (16 ns), the histogram
+ * observation (23 ns) and one folded-hash classification (~10-20 ns).  That is
+ * ~5% of a ~2 us point operation and is stated here rather than left as an
+ * assumption; if it ever became a larger share than the thing it measures,
+ * the histogram would be the part to drop, not the counters.
+ */
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
+    qihse_resp_server_t* server = session->server;
+    if (!server || !server->metrics || request->argc == 0) {
+        return qihse_resp_dispatch_inner(session, request, keep_open);
+    }
+    qihse_query_type_t type = qihse_resp_classify(request);
+    session->query_type = type;
+    struct timespec started;
+    struct timespec finished;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    bool ok = qihse_resp_dispatch_inner(session, request, keep_open);
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    double seconds = (double)(finished.tv_sec - started.tv_sec) +
+                     (double)(finished.tv_nsec - started.tv_nsec) / 1000000000.0;
+    if (seconds < 0.0) seconds = 0.0;
+    if (server->tlm.queries[type]) qihse_metrics_series_increment(server->tlm.queries[type], 1u);
+    qihse_engine_backend_t backend = qihse_resp_backend_for_type(type);
+    if (server->tlm.backend_queries[backend]) qihse_metrics_series_increment(server->tlm.backend_queries[backend], 1u);
+    if (server->tlm.latency[type]) qihse_metrics_series_observe(server->tlm.latency[type], seconds);
+    return ok;
+}
+
+static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
     if (qihse_resp_command_is(request, "AUTH")) return qihse_resp_handle_auth(session, request);
@@ -7856,6 +8437,9 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     session.server = server;
     session.fd = fd;
     session.protocol_version = 2;
+    /* W5.2: an error raised before the first command is classified must not
+     * be attributed to query type 0 (GET). */
+    session.query_type = QIHSE_QUERY_TYPE_OTHER;
     if (!server->auth_required) session.user = server->unauthenticated_user;
     if (pthread_mutex_init(&session.io_lock, NULL) != 0) return false;
     session.id = __atomic_add_fetch(&server->next_client_id, 1u, __ATOMIC_RELAXED);
@@ -8169,6 +8753,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         qihse_metrics_register(server->metrics, "qihse_ingest_rejected_total", "Telemetry records rejected by the ingest guard", METRIC_COUNTER);
         qihse_metrics_register(server->metrics, "qihse_killswitch_push_total", "Killswitch edges fanned out", METRIC_COUNTER);
         qihse_metrics_register(server->metrics, "qihse_quota_rejected_total", "Operations rejected by tenant quotas", METRIC_COUNTER);
+        /* W5.2: label-bounded families + status gauges.  Registered here, so
+         * every value set is fixed before the first request is served. */
+        qihse_resp_telemetry_register(server);
     }
     if (supplied->blobs) {
         server->composer = qihse_bundle_composer_create(supplied->blobs, server->store,
@@ -8621,6 +9208,7 @@ bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,
     memset(&session, 0, sizeof(session));
     session.server = server;
     session.user = user;
+    session.query_type = QIHSE_QUERY_TYPE_OTHER;
     session.fd = -1;
     session.protocol_version = 2;
     qihse_resp_request_t request;

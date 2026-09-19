@@ -22,6 +22,38 @@
 #define NUM_FRAMES 4096
 #define FRAME_SIZE 2048
 
+/* W5.2 datapath counters.  Process-global and lock-free on purpose: the
+ * datapath must not take a metrics lock per frame, so it counts here and the
+ * metrics surface samples the totals at scrape time. */
+static uint64_t g_xdp_frames_rx;
+static uint64_t g_xdp_frames_dropped;
+static uint64_t g_xdp_artifacts_ingested;
+static uint64_t g_xdp_ingest_denied;
+
+void qihse_af_xdp_stats_record_rx(uint64_t frames) {
+    __atomic_add_fetch(&g_xdp_frames_rx, frames, __ATOMIC_RELAXED);
+}
+
+void qihse_af_xdp_stats_record_dropped(uint64_t frames) {
+    __atomic_add_fetch(&g_xdp_frames_dropped, frames, __ATOMIC_RELAXED);
+}
+
+void qihse_af_xdp_stats_record_ingested(uint64_t artifacts) {
+    __atomic_add_fetch(&g_xdp_artifacts_ingested, artifacts, __ATOMIC_RELAXED);
+}
+
+void qihse_af_xdp_stats_record_denied(uint64_t frames) {
+    __atomic_add_fetch(&g_xdp_ingest_denied, frames, __ATOMIC_RELAXED);
+}
+
+void qihse_af_xdp_stats_get(qihse_af_xdp_stats_t *out) {
+    if (!out) return;
+    out->frames_rx = __atomic_load_n(&g_xdp_frames_rx, __ATOMIC_RELAXED);
+    out->frames_dropped = __atomic_load_n(&g_xdp_frames_dropped, __ATOMIC_RELAXED);
+    out->artifacts_ingested = __atomic_load_n(&g_xdp_artifacts_ingested, __ATOMIC_RELAXED);
+    out->ingest_denied = __atomic_load_n(&g_xdp_ingest_denied, __ATOMIC_RELAXED);
+}
+
 struct qihse_af_xdp_ctx {
     struct xsk_umem *umem;
     struct xsk_socket *xsk;
@@ -186,10 +218,14 @@ void qihse_af_xdp_poll(struct qihse_af_xdp_ctx *ctx, qihse_af_xdp_cb_t cb, void 
     uint32_t idx_fq = 0;
     unsigned int ret = xsk_ring_prod__reserve(&ctx->fill_ring, rcvd, &idx_fq);
     if (ret < rcvd) {
+        /* Batch dropped: the frames cannot be recycled this round. */
+        qihse_af_xdp_stats_record_rx(rcvd);
+        qihse_af_xdp_stats_record_dropped(rcvd);
         xsk_ring_cons__release(&ctx->rx_ring, rcvd);
         return;
     }
 
+    qihse_af_xdp_stats_record_rx(rcvd);
     for (unsigned int i = 0; i < rcvd; i++) {
         const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&ctx->rx_ring, idx_rx++);
         uint64_t addr = desc->addr;
@@ -292,10 +328,17 @@ size_t qihse_af_xdp_ingest_frame_zero_copy(
                                          &tcp_payload, &tcp_len,
                                          NULL, NULL, NULL)) {
         if (tcp_len > 0) {
-            return qihse_keystone_ingest_dirty_logs(kv, topo,
-                                                    tcp_payload, tcp_len,
-                                                    clearance, compartment);
+            size_t added = qihse_keystone_ingest_dirty_logs(kv, topo,
+                                                            tcp_payload, tcp_len,
+                                                            clearance, compartment);
+            if (added > 0) {
+                qihse_af_xdp_stats_record_ingested(added);
+            } else {
+                qihse_af_xdp_stats_record_dropped(1u);
+            }
+            return added;
         }
+        qihse_af_xdp_stats_record_dropped(1u);
         return 0;
     }
 
@@ -306,12 +349,19 @@ size_t qihse_af_xdp_ingest_frame_zero_copy(
                                          &udp_payload, &udp_len,
                                          NULL, NULL, NULL)) {
         if (udp_len > 0) {
-            return qihse_keystone_ingest_dirty_logs(kv, topo,
-                                                    (const char *)udp_payload, udp_len,
-                                                    clearance, compartment);
+            size_t added = qihse_keystone_ingest_dirty_logs(kv, topo,
+                                                            (const char *)udp_payload, udp_len,
+                                                            clearance, compartment);
+            if (added > 0) {
+                qihse_af_xdp_stats_record_ingested(added);
+            } else {
+                qihse_af_xdp_stats_record_dropped(1u);
+            }
+            return added;
         }
     }
 
+    qihse_af_xdp_stats_record_dropped(1u);
     return 0;
 }
 
@@ -334,11 +384,14 @@ size_t qihse_af_xdp_ingest_keystone(struct qihse_af_xdp_ctx *ctx,
     if (reserved < rcvd) {
         /* Unable to recycle all frames this round -- drop the batch and let
          * the kernel keep ownership so we never leak fill-ring slots. */
+        qihse_af_xdp_stats_record_rx(rcvd);
+        qihse_af_xdp_stats_record_dropped(rcvd);
         xsk_ring_cons__release(&ctx->rx_ring, rcvd);
         return 0;
     }
 
     size_t total_artifacts = 0;
+    qihse_af_xdp_stats_record_rx(rcvd);
     for (unsigned int i = 0; i < rcvd; i++) {
         const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&ctx->rx_ring, idx_rx++);
         uint64_t addr = desc->addr;
