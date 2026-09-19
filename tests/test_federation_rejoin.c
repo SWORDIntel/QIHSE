@@ -91,7 +91,7 @@ static void session_pair(rnode_t* a, rnode_t* b,
     pthread_t th;
     assert(pthread_create(&th, NULL, hs_thread, &h) == 0);
     qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
-    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(a->tls, sv[1], &cv);
+    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(a->tls, sv[1], 0, &cv);
     pthread_join(th, NULL);
     if (!h.sess || !client) {
         fprintf(stderr, "session_pair failed: server=%p (verdict=%s) client=%p (verdict=%s)\n",
@@ -226,7 +226,7 @@ static void test_peer_trust_forbids_source(const char* dir, const char* ca_key_p
     pthread_t th;
     assert(pthread_create(&th, NULL, hs_thread, &h) == 0);
     qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
-    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(a.tls, sv[1], &cv);
+    qihse_fed_tls_session_t* client = qihse_federation_tls_connect_fd(a.tls, sv[1], 0, &cv);
     pthread_join(th, NULL);
     assert(h.sess == NULL);              /* no session was granted */
     assert(h.verdict != QIHSE_PEER_ACCEPT);
@@ -481,7 +481,7 @@ int main(void) {
 
     qihse_federation_ca_t ca;
     assert(qihse_federation_ca_create(ca_dir, QIHSE_SIG_ML_DSA_87, &ca));
-    char ca_key_path[512];
+    char ca_key_path[2048];
     snprintf(ca_key_path, sizeof(ca_key_path), "%s/federation-ca.key", ca_dir);
 
     test_ownership_gate();
