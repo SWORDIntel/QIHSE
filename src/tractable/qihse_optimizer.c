@@ -492,3 +492,62 @@ const char* qihse_plan_node_type_name(qihse_plan_node_type_t t) {
         default: return "Unknown";
     }
 }
+
+/* ------------------------------------------------------------------------- */
+/* Plan shape digest (W5.1 governance)                                        */
+/* ------------------------------------------------------------------------- */
+
+/* FNV-1a over bytes.  Chosen because it is four lines, has no dependency and
+ * no state: a digest that needs a library would be a reason not to check a
+ * plan, and the digest is only ever compared with itself (it identifies a
+ * shape, it does not authenticate one). */
+static uint64_t shape_mix(uint64_t h, const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t shape_mix_u64(uint64_t h, uint64_t v) {
+    unsigned char buf[8];
+    for (int i = 0; i < 8; i++) buf[i] = (unsigned char)((v >> (i * 8)) & 0xffu);
+    return shape_mix(h, buf, sizeof(buf));
+}
+
+static uint64_t shape_mix_str(uint64_t h, const char* s) {
+    /* A NUL byte separates fields, so "ab" + "c" cannot collide with "a" +
+     * "bc". */
+    if (s) h = shape_mix(h, s, strlen(s));
+    unsigned char sep = 0;
+    return shape_mix(h, &sep, 1);
+}
+
+uint64_t qihse_optimizer_plan_shape_digest(const qihse_plan_node_t* plan) {
+    if (!plan) return 0;
+    uint64_t h = 1469598103934665603ULL;
+    h = shape_mix_u64(h, (uint64_t)plan->type);
+    /* Which index was chosen, and which columns the node reads: these change
+     * what the plan does, so they are part of its shape.  The table name is
+     * not: the caller's workload key carries that. */
+    h = shape_mix_str(h, plan->index_name);
+    h = shape_mix_str(h, plan->filter_column);
+    h = shape_mix_str(h, plan->join_key_left);
+    h = shape_mix_str(h, plan->join_key_right);
+    h = shape_mix_u64(h, (uint64_t)plan->join_type);
+    h = shape_mix_u64(h, (uint64_t)(plan->limit < 0 ? -1 : plan->limit));
+    h = shape_mix_u64(h, (uint64_t)plan->num_group_cols);
+    for (size_t i = 0; i < plan->num_group_cols; i++) h = shape_mix_str(h, plan->group_cols[i]);
+    h = shape_mix_u64(h, (uint64_t)plan->num_sort_cols);
+    for (size_t i = 0; i < plan->num_sort_cols; i++) {
+        int asc = plan->sort_asc ? plan->sort_asc[i] : 0;
+        h = shape_mix_str(h, plan->sort_cols[i]);
+        h = shape_mix_u64(h, (uint64_t)(asc ? 1u : 0u));
+    }
+    h = shape_mix_u64(h, qihse_optimizer_plan_shape_digest(plan->left));
+    h = shape_mix_u64(h, qihse_optimizer_plan_shape_digest(plan->right));
+    /* A digest of 0 means "no plan" to every caller of this function, so a
+     * real plan can never report it. */
+    return h ? h : 1u;
+}

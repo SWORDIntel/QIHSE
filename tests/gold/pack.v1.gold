@@ -134,6 +134,14 @@ workload parallel-query area=relational expect=pass timeout=300 \
     output="test_parallel_query: all parallel query tests passed" \
     run="make -s test-parallel-query"
 
+# Governance: a plan change must be PROVEN, and a regression must be undone
+# automatically. The test reads the persisted decision record back to prove the
+# incumbent was restored — asserting only the return value would not show that.
+workload optimizer-governance area=relational expect=pass timeout=300 \
+    ref="include/qihse_optimizer_governance.h" \
+    output="PASS optimizer governance: shadow A/B, declared constraints, automatic rollback, persisted decisions" \
+    run="make -s test-optimizer-governance"
+
 gap relational/sql-over-storage area=relational \
     reason="the SQL parser, join/aggregate/sort executors, schema registry, optimizer, table-store UPDATE/DELETE executor and KV parallel query are covered; SQL INSERT does not yet populate the mutable row store end to end"
 

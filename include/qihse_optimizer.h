@@ -117,6 +117,17 @@ qihse_plan_node_t* qihse_optimizer_build_plan(qihse_optimizer_t* opt, const qihs
 /* Free a plan tree */
 void qihse_plan_node_free(qihse_plan_node_t* node);
 
+/* A 64-bit digest of a plan's SHAPE: node types, scan/index choice, join
+ * algorithm and the columns each node touches, with the child digests mixed
+ * in.  Table names are deliberately NOT part of it — two tables accessed the
+ * same way have the same shape, and a caller that needs to tell them apart
+ * does so through its own workload key.  Returns 0 for a NULL plan, which is
+ * a shape no caller can claim.
+ *
+ * This is what optimizer governance (W5.1) compares: a plan change is a
+ * change of digest.  A digest is a hash, never a label. */
+uint64_t qihse_optimizer_plan_shape_digest(const qihse_plan_node_t* plan);
+
 /* Get a human-readable name for a plan node type */
 const char* qihse_plan_node_type_name(qihse_plan_node_type_t t);
 
