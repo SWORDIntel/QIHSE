@@ -128,7 +128,7 @@ static void test_context_posture(const char* dir, const char* ca_key_path,
     /* A certificate that does not verify against this CA is refused at
      * context creation, so a misconfigured node fails to start rather than
      * starting with a weaker posture. */
-    char other_dir[512];
+    char other_dir[1024];
     snprintf(other_dir, sizeof(other_dir), "%s/otherca2", dir);
     assert(mkdir(other_dir, 0700) == 0);
     qihse_federation_ca_t other_ca;
@@ -209,12 +209,12 @@ static void test_foreign_ca_refused(const char* dir, const char* ca_key_path,
 
     /* A peer with a certificate from a DIFFERENT CA: it holds a valid key and
      * a valid certificate, just not one this federation issued. */
-    char other_dir[512];
+    char other_dir[1024];
     snprintf(other_dir, sizeof(other_dir), "%s/otherca3", dir);
     assert(mkdir(other_dir, 0700) == 0);
     qihse_federation_ca_t other_ca;
     assert(qihse_federation_ca_create(other_dir, QIHSE_SIG_ML_DSA_87, &other_ca));
-    char other_ca_key[512];
+    char other_ca_key[2048];
     snprintf(other_ca_key, sizeof(other_ca_key), "%s/federation-ca.key", other_dir);
 
     test_node_t foreign;
@@ -586,7 +586,7 @@ int main(void) {
 
     qihse_federation_ca_t ca;
     assert(qihse_federation_ca_create(ca_dir, QIHSE_SIG_ML_DSA_87, &ca));
-    char ca_key_path[512];
+    char ca_key_path[2048];
     snprintf(ca_key_path, sizeof(ca_key_path), "%s/federation-ca.key", ca_dir);
 
     test_context_posture(key_dir, ca_key_path, &ca);
