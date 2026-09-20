@@ -89,20 +89,42 @@ size_t qihse_keystone_anchor_upper_bound(const int64_t* arr, size_t n, int64_t k
  * no principal may provision an index identity above itself (invariant 2).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Feed record contract (plan §26). A journal payload that carries a feed
- * record is a fixed 64-byte header followed by the record body, so a consumer
- * never has to guess what an event is or how it is classified. */
+/* Feed record contract (plan §26; KEYSTONE brief §4 envelope). A journal
+ * payload that carries a feed record is a fixed 64-byte header followed by
+ * the record body, so a consumer never has to guess what an event is or how
+ * it is classified.
+ *
+ * The envelope on the wire (KEYSTONE.FEED.NEXT, 16 items) is the record
+ * plus the journal event's own provenance — event_id, origin_node and
+ * fencing_epoch come from the event envelope, not the indexed record:
+ *
+ *   [journal_offset, event_type, resource_id, classification, sci,
+ *    tenant_id, generation, payload,
+ *    event_id_hex, origin_node_hex, object_id_hex,
+ *    fencing_epoch, hlc_physical_ms, hlc_logical, flags, object_type]
+ *
+ * Flags vocabulary matches the KEYSTONE brief §4: a deletion is a record
+ * with TOMBSTONE set (payload may be empty) — it is delivered on the wire
+ * like any other record, because a tombstone the consumer cannot see is a
+ * deleted object that resurrects in its index. */
 #define QIHSE_KEYSTONE_FEED_MAGIC 0x4B534644u /* "KSFD" */
 #define QIHSE_KEYSTONE_FEED_RECORD_VERSION 1u
 #define QIHSE_KEYSTONE_FEED_HEADER_BYTES 64u
 #define QIHSE_KEYSTONE_FEED_MAX_PAYLOAD (256u * 1024u)
 #define QIHSE_KEYSTONE_FEED_FLAG_TOMBSTONE 0x0001u
+#define QIHSE_KEYSTONE_FEED_FLAG_SNAPSHOT 0x0002u
+#define QIHSE_KEYSTONE_FEED_FLAG_EVENT 0x0004u
+#define QIHSE_KEYSTONE_FEED_FLAG_TELEMETRY 0x0008u
+#define QIHSE_KEYSTONE_FEED_FLAG_AUDIT 0x0010u
+#define QIHSE_KEYSTONE_FEED_FLAG_SECURITY_SENSITIVE 0x0020u
+#define QIHSE_KEYSTONE_FEED_FLAG_DERIVED 0x0040u
 
 typedef struct {
     qihse_uuid_t object_id;   /* immutable indexed object identity */
     qihse_hlc_t hlc;          /* causal stamp of the mutation */
     uint64_t generation;      /* object generation, so KEYSTONE can go stale */
     uint32_t tenant_id;       /* security context: owning tenant */
+    uint32_t object_type;     /* publisher-assigned type tag (0 = unspecified) */
     uint16_t classification;  /* security context: clearance required */
     uint16_t sci;             /* security context: SCI compartments required */
     uint16_t flags;           /* QIHSE_KEYSTONE_FEED_FLAG_* */

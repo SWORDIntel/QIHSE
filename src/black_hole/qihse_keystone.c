@@ -423,6 +423,7 @@ bool qihse_keystone_feed_encode(const qihse_keystone_feed_record_t* record,
     memcpy(out + 32u, record->object_id.bytes, QIHSE_UUID_BYTES);
     ks_feed_put_u64(out + 48u, record->hlc.physical_ms);
     ks_feed_put_u32(out + 56u, record->hlc.logical);
+    ks_feed_put_u32(out + 60u, record->object_type); /* v1 spare; 0 in old records */
     if (payload_len > 0u) memcpy(out + QIHSE_KEYSTONE_FEED_HEADER_BYTES, payload, payload_len);
     if (out_len) *out_len = QIHSE_KEYSTONE_FEED_HEADER_BYTES + payload_len;
     return true;
@@ -453,6 +454,7 @@ bool qihse_keystone_feed_decode(const uint8_t* payload, size_t payload_len,
     memcpy(out_record->object_id.bytes, payload + 32u, QIHSE_UUID_BYTES);
     out_record->hlc.physical_ms = ks_feed_get_u64(payload + 48u);
     out_record->hlc.logical = ks_feed_get_u32(payload + 56u);
+    out_record->object_type = ks_feed_get_u32(payload + 60u);
     if (out_body) *out_body = payload + QIHSE_KEYSTONE_FEED_HEADER_BYTES;
     if (out_body_len) *out_body_len = (size_t)declared;
     return true;

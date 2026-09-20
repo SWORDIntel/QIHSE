@@ -2075,8 +2075,8 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
      * inside qihse_keystone_feed_publish(), so the index identity's denial
      * comes from the privilege ladder rather than from this handler. */
     if (strcasecmp(sub, "PUBLISH") == 0) {
-        if (request->argc != 8) {
-            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.PUBLISH <event_type> <resource_id> <classification> <sci> <tenant> <generation> <payload>");
+        if (request->argc != 8 && request->argc != 10) {
+            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.PUBLISH <event_type> <resource_id> <classification> <sci> <tenant> <generation> [<flags> <object_type>] <payload>");
         }
         char event_type[QIHSE_FEDERATION_EVENT_TYPE_MAX + 1u];
         size_t etl = request->argv[1].len;
@@ -2099,12 +2099,26 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
         if (!qihse_resp_parse_u64_arg(&request->argv[6], &generation)) {
             return qihse_resp_error(session, "ERR invalid generation");
         }
+        uint64_t flags = 0, object_type = 0;
+        size_t payload_arg = 7;
+        if (request->argc == 10) {
+            if (!qihse_resp_parse_u64_arg(&request->argv[7], &flags) || flags > UINT16_MAX) {
+                return qihse_resp_error(session, "ERR invalid flags");
+            }
+            if (!qihse_resp_parse_u64_arg(&request->argv[8], &object_type) ||
+                object_type > UINT32_MAX) {
+                return qihse_resp_error(session, "ERR invalid object_type");
+            }
+            payload_arg = 9;
+        }
         qihse_keystone_feed_record_t rec;
         memset(&rec, 0, sizeof(rec));
         rec.classification = (uint16_t)classif;
         rec.sci = (uint16_t)sci;
         rec.tenant_id = (uint32_t)tenant;
         rec.generation = generation;
+        rec.flags = (uint16_t)flags;
+        rec.object_type = (uint32_t)object_type;
         /* Deterministic object identity for the RESP surface: the same
          * resource always maps to the same indexed object. */
         if (!qihse_uuid_from_seed(resource_id, rl, &rec.object_id)) {
@@ -2114,7 +2128,8 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
         if (!qihse_keystone_feed_publish(session->server->federation_journal, session->user,
                                          &session->server->federation_node_id,
                                          event_type, resource_id, &rec,
-                                         request->argv[7].data, request->argv[7].len, &ev)) {
+                                         request->argv[payload_arg].data,
+                                         request->argv[payload_arg].len, &ev)) {
             return qihse_resp_error(session, "NOPERM feed publish requires FEDERATION_WRITE");
         }
         return qihse_resp_integer(session, (int64_t)ev.journal_offset);
@@ -2165,7 +2180,17 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
         if (!qihse_keystone_feed_next(feed, &ev, &rec, &payload, &payload_len)) {
             return qihse_resp_integer(session, 0);
         }
-        bool ok = qihse_resp_array(session, 8u);
+        /* The full §4 envelope: the record fields plus the journal event's
+         * own provenance, so the consumer can dedup by event id, attribute by
+         * origin node, bound staleness by generation/HLC, and see deletions
+         * via the flags word (a tombstone it cannot see is a resurrection). */
+        char event_hex[QIHSE_UUID_STR_LEN + 1u];
+        char node_hex[QIHSE_UUID_STR_LEN + 1u];
+        char object_hex[QIHSE_UUID_STR_LEN + 1u];
+        bool ok = qihse_uuid_format(&ev.event_id, event_hex) &&
+                  qihse_uuid_format(&ev.mutation.origin_node, node_hex) &&
+                  qihse_uuid_format(&rec.object_id, object_hex);
+        if (ok) ok = qihse_resp_array(session, 16u);
         if (ok) ok = qihse_resp_integer(session, (int64_t)ev.journal_offset);
         if (ok) ok = qihse_resp_bulk_text(session, ev.event_type);
         if (ok) ok = qihse_resp_bulk_text(session, ev.resource_id);
@@ -2174,6 +2199,14 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
         if (ok) ok = qihse_resp_integer(session, (int64_t)rec.tenant_id);
         if (ok) ok = qihse_resp_integer(session, (int64_t)rec.generation);
         if (ok) ok = qihse_resp_bulk(session, payload, payload_len);
+        if (ok) ok = qihse_resp_bulk_text(session, event_hex);
+        if (ok) ok = qihse_resp_bulk_text(session, node_hex);
+        if (ok) ok = qihse_resp_bulk_text(session, object_hex);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)ev.mutation.fencing_epoch);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)ev.mutation.hlc.physical_ms);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)ev.mutation.hlc.logical);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.flags);
+        if (ok) ok = qihse_resp_integer(session, (int64_t)rec.object_type);
         free(payload);
         return ok;
     }

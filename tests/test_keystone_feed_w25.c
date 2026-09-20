@@ -624,6 +624,36 @@ static void test_resp_surface(qihse_kv_store_t* store, qihse_user_t* op,
     assert(strcmp(reply, "0") == 0);
     w25_sink_add(&sink, reply, used);
 
+    /* The §4 envelope: a tombstone publish through the extended form
+     * (flags=1, object_type=42) must arrive with its full provenance —
+     * a tombstone the consumer cannot see is a deleted object that
+     * resurrects in its index. */
+    {
+        const char* tomb_argv[10] = { "KEYSTONE.FEED.PUBLISH", "w25.resp.tombstone",
+                                      "resp/tombstone", "1", "1", "7", "2",
+                                      "1", "42", "" };
+        w25_send_argv(&opc, tomb_argv, 10u);
+        used = 0; assert(w25_read_reply(&opc, reply, sizeof reply, &used));
+        assert(atoi(reply) > 0);
+    }
+    w25_send3(&kc, "KEYSTONE.FEED.NEXT", fid_str, NULL);
+    used = 0; assert(w25_read_reply(&kc, reply, sizeof reply, &used));
+    {
+        /* 16 envelope items -> 15 separators in the flattened reply. */
+        int seps = 0;
+        for (const char* p = reply; *p; p++) if (*p == '|') seps++;
+        assert(seps == 15);
+        /* Deterministic object id is on the wire. */
+        qihse_uuid_t oid; char oid_hex[QIHSE_UUID_STR_LEN + 1u];
+        assert(qihse_uuid_from_seed("resp/tombstone", strlen("resp/tombstone"), &oid));
+        assert(qihse_uuid_format(&oid, oid_hex));
+        assert(strstr(reply, oid_hex) != NULL);
+        /* Flags=1 (TOMBSTONE) and object_type=42 close the envelope. */
+        size_t rl = strlen(reply);
+        assert(rl >= 5u && strcmp(reply + rl - 5u, "|1|42") == 0);
+    }
+    w25_sink_add(&sink, reply, used);
+
     w25_send3(&kc, "KEYSTONE.FEED.STATUS", fid_str, NULL);
     used = 0; assert(w25_read_reply(&kc, reply, sizeof reply, &used));
     assert(strstr(reply, "|1|") != NULL); /* denied >= 1 */
