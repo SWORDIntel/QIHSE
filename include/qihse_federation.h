@@ -888,6 +888,19 @@ typedef struct {
     uint16_t load_pct;
 } qihse_federation_capability_values_t;
 
+/* A signed dispatch endpoint (v4 membership statement): the address a peer
+ * advertises for FABRIC dispatch, inside the signed region.  This is
+ * deliberately NOT part of capability_values_t: hardware capabilities are
+ * a claim about what the node HAS, an endpoint is a claim about where its
+ * dispatch listener IS, and conflating them would let a capability update
+ * silently rewrite a dial target.  port == 0 means "not advertised" and
+ * requires an empty host; a nonzero port requires a printable host. */
+#define QIHSE_FEDERATION_ENDPOINT_HOST_LEN 64u
+typedef struct {
+    char host[QIHSE_FEDERATION_ENDPOINT_HOST_LEN]; /* NUL-terminated within */
+    uint16_t port;
+} qihse_federation_endpoint_t;
+
 typedef struct {
     qihse_uuid_t node_id;      /* key: federation/node/<uuid> */
     qihse_uuid_t boot_id;      /* boot that made the claim (nil = local probe) */
@@ -898,6 +911,11 @@ typedef struct {
     qihse_capability_source_t source;
     uint32_t flags;
     qihse_hlc_t observed;      /* when the claim was observed */
+    /* The node's signed dispatch endpoint, copied from a v4 statement.
+     * Empty for a v2/v3 statement and for a local probe: nothing unsigned
+     * may fill it — a topology host:port or a NODE_CAP frame is a hint,
+     * never a recorded endpoint. */
+    qihse_federation_endpoint_t dispatch_endpoint;
 } qihse_federation_node_capability_t;
 
 /* Record the LOCAL node's own hardware probe.  The trust snapshot is read
@@ -966,13 +984,18 @@ const char* qihse_gossip_result_name(qihse_gossip_result_t result);
 #define QIHSE_FEDERATION_GOSSIP_VERSION 2u
 /* v3 adds the NODE_CAP profile to the signed region (W2.4). */
 #define QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY 3u
+/* v4 adds the signed dispatch endpoint (ai-fabric endpoint discovery):
+ * the address a node advertises for FABRIC dispatch, signed like the
+ * capability profile.  A v4 statement is what populates the durable
+ * capability record's dispatch_endpoint field. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT 4u
 /* Both versions remain readable and verifiable: the serializer and the
  * verifier write/check the layout the frame's OWN version names, so an old
  * record on disk still verifies against the v2 bytes it was signed over.
  * v2 carries no capability profile, so a v2 statement is accepted without
  * touching the durable capability record. */
 #define QIHSE_FEDERATION_GOSSIP_VERSION_MIN 2u
-#define QIHSE_FEDERATION_GOSSIP_VERSION_MAX QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY
+#define QIHSE_FEDERATION_GOSSIP_VERSION_MAX QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT
 #define QIHSE_FEDERATION_HEARTBEAT_MAGIC 0x51484842u /* "QHHB" */
 #define QIHSE_FEDERATION_HEARTBEAT_VERSION 1u
 
@@ -995,6 +1018,11 @@ typedef struct {
      * signature rather than sent as a separate unauthenticated frame.  Zero
      * for a v2 statement. */
     qihse_federation_capability_values_t caps;
+    /* v4: the signed dispatch endpoint — where this node's fabric dispatch
+     * listener accepts jobs.  Zero (empty host, port 0) for a node that does
+     * not advertise one.  Part of the signed region, so a forged endpoint is
+     * a signature failure, not a misdirected dial. */
+    qihse_federation_endpoint_t dispatch_endpoint;
     qihse_sig_alg_t sig_alg;
     uint16_t signature_len;
     uint8_t signature[QIHSE_FEDERATION_SIG_MAX_BYTES];
@@ -1120,6 +1148,7 @@ typedef struct {
     uint32_t capability_bitmap;
     uint32_t health_summary;
     qihse_federation_capability_values_t caps; /* v3 statements; zero for v2 */
+    qihse_federation_endpoint_t dispatch_endpoint; /* v4; empty otherwise */
     qihse_sig_alg_t sig_alg;
 } qihse_federation_membership_t;
 
@@ -1175,23 +1204,27 @@ bool qihse_federation_replay_state_read(void* store_void, void* user_void,
 /* ── Statement production ──────────────────────────────────────────────────
  *
  * qihse_federation_statement_mint() is the PRODUCER half of signed gossip:
- * it fills a v3 statement for the local node and signs it in place.  The
+ * it fills a v4 statement for the local node and signs it in place.  The
  * sequence continues from the highest recorded sequence for (sender, boot)
  * — a mint mid-boot can never emit a frame a receiver's replay window would
  * refuse — and a FRESH session id is generated per call, because a new
  * statement retires every heartbeat issued under the old one by design.
  *
  * Nothing is emitted when the signature cannot be produced.  `caps` may be
- * NULL (a v3 statement with a zeroed profile is still attributable
- * membership).  This function does NOT check enrollment or approval —
- * receivers enforce that — but a producer that mints for a node that is not
- * enrolled produces frames every peer refuses, which is noise rather than
- * harm. */
+ * NULL (a statement with a zeroed profile is still attributable
+ * membership); `endpoint` may be NULL (the node advertises no dispatch
+ * listener) and is validated when given — an endpoint that violates the
+ * host/port contract fails the mint rather than producing a statement no
+ * receiver will accept.  This function does NOT check enrollment or
+ * approval — receivers enforce that — but a producer that mints for a node
+ * that is not enrolled produces frames every peer refuses, which is noise
+ * rather than harm. */
 bool qihse_federation_statement_mint(void* store_void, void* user_void,
                                      const qihse_uuid_t* cluster_id,
                                      const qihse_uuid_t* sender_node,
                                      const qihse_uuid_t* boot_id,
                                      const qihse_federation_capability_values_t* caps,
+                                     const qihse_federation_endpoint_t* endpoint,
                                      void* pkey,
                                      qihse_federation_gossip_t* out);
 

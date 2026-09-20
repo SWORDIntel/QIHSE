@@ -72,6 +72,10 @@ struct qihse_cluster_bus {
     qihse_uuid_t federation_boot_id;
     uint32_t statement_ms;
     uint64_t last_statement_ms;
+    /* The dispatch endpoint this node signs into its v4 membership
+     * statements.  Empty (port 0) until an owner tells the bus where its
+     * fabric listener lives — the bus never guesses one. */
+    qihse_federation_endpoint_t dispatch_endpoint;
     void (*on_liveness)(qihse_cluster_bus_t* bus,
                         const qihse_federation_liveness_t* observation,
                         void* user_data);
@@ -1006,7 +1010,8 @@ static bool qihse_bus_send_fed_statement(qihse_cluster_bus_t* bus) {
                                          &bus->federation_cluster_id,
                                          &bus->local_node_uuid,
                                          &bus->federation_boot_id,
-                                         &values, bus->federation_sign_key, &stmt)) {
+                                         &values, &bus->dispatch_endpoint,
+                                         bus->federation_sign_key, &stmt)) {
         return false;
     }
     bus->last_statement_ms = now;
@@ -1204,6 +1209,20 @@ void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
     /* No production without a signing identity: an unsigned statement is not
      * mintable, and minting for a nil boot would collide every restart. */
     if (!sign_key || !boot_id || !node_uuid) bus->federation_sign_key = NULL;
+}
+
+void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
+                                              const char* host, uint16_t port) {
+    if (!bus) return;
+    memset(&bus->dispatch_endpoint, 0, sizeof(bus->dispatch_endpoint));
+    if (!host || port == 0u) return;
+    /* Copy with a guaranteed NUL inside the field; the statement minter's
+     * own contract check refuses anything that does not fit, so a too-long
+     * name simply never gets advertised rather than being silently cut. */
+    size_t hl = strlen(host);
+    if (hl >= QIHSE_FEDERATION_ENDPOINT_HOST_LEN) return;
+    memcpy(bus->dispatch_endpoint.host, host, hl + 1u);
+    bus->dispatch_endpoint.port = port;
 }
 
 void qihse_cluster_bus_set_group_callbacks(

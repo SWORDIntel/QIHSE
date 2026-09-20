@@ -2481,7 +2481,7 @@ void qihse_federation_node_foreach(void* store_void, void* user_void,
  * Separate from the identity record by design (see the header): a capability
  * update must never be a read-modify-write of a trust record. */
 
-#define CAP_RECORD_VERSION 1u
+#define CAP_RECORD_VERSION 2u
 
 const char* qihse_capability_source_name(qihse_capability_source_t source) {
     switch (source) {
@@ -2522,6 +2522,24 @@ static bool cap_values_valid(const qihse_federation_capability_values_t* v) {
     return true;
 }
 
+/* The host/port contract for a signed endpoint: port 0 means "not
+ * advertised" and requires an empty host; a nonzero port requires a
+ * printable, whitespace-free host that NUL-terminates inside the field.
+ * Whitespace is refused because the durable record columns are
+ * tab-separated — a host containing one would silently rewrite the
+ * record's field boundaries. */
+static bool fed_endpoint_valid(const qihse_federation_endpoint_t* ep) {
+    if (!ep) return false;
+    if (ep->port == 0u) return ep->host[0] == '\0';
+    if (ep->host[0] == '\0') return false;
+    for (size_t i = 0; i < QIHSE_FEDERATION_ENDPOINT_HOST_LEN; i++) {
+        unsigned char c = (unsigned char)ep->host[i];
+        if (c == 0u) return true;
+        if (c < 0x21u || c > 0x7eu) return false;
+    }
+    return false; /* no NUL inside the field */
+}
+
 /* Attribution invariants shared by the writer and the reader, so a record the
  * decoder would refuse can never be written. */
 static bool cap_attribution_valid(const qihse_federation_node_capability_t* c) {
@@ -2547,8 +2565,11 @@ static bool cap_encode(const qihse_federation_node_capability_t* c, char* out, s
     uuid_hex(&c->node_id, nid);
     uuid_hex(&c->boot_id, bid);
     uuid_hex(&c->session_id, sid);
+    /* v2 appends the signed dispatch endpoint (host, port) as trailing
+     * columns.  A v1 record decodes with an empty endpoint — which is the
+     * truth: nothing unsigned ever populated it. */
     int n = snprintf(out, cap,
-                     "%u\t%s\t%s\t%s\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%u",
+                     "%u\t%s\t%s\t%s\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%u\t%s\t%u",
                      (unsigned)CAP_RECORD_VERSION, nid, bid, sid,
                      (unsigned long long)c->sequence,
                      (unsigned)c->values.isa_tier, (unsigned)c->values.npu,
@@ -2556,7 +2577,9 @@ static bool cap_encode(const qihse_federation_node_capability_t* c, char* out, s
                      (unsigned)c->values.load_pct,
                      (unsigned)c->trust, (unsigned)c->source, (unsigned)c->flags,
                      (unsigned long long)c->observed.physical_ms,
-                     (unsigned)c->observed.logical);
+                     (unsigned)c->observed.logical,
+                     c->dispatch_endpoint.host,
+                     (unsigned)c->dispatch_endpoint.port);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -2571,8 +2594,10 @@ static bool cap_decode(const char* blob, qihse_federation_node_capability_t* out
     const char* p = blob;
     uint64_t v = 0;
 
+    uint64_t record_version = 0;
     p = fed_next_field(p, f, sizeof(f));
-    if (!cap_parse_u64(f, &v) || v != CAP_RECORD_VERSION) return false;
+    if (!cap_parse_u64(f, &record_version) ||
+        record_version == 0u || record_version > CAP_RECORD_VERSION) return false;
     p = fed_next_field(p, f, sizeof(f));
     if (!uuid_from_hex(f, &out->node_id)) return false;
     p = fed_next_field(p, f, sizeof(f));
@@ -2611,11 +2636,23 @@ static bool cap_decode(const char* blob, qihse_federation_node_capability_t* out
     if (!cap_parse_u64(f, &v) || v > UINT32_MAX) return false;
     out->observed.logical = (uint32_t)v;
 
+    if (record_version >= 2u) {
+        /* The signed dispatch endpoint columns. */
+        p = fed_next_field(p, f, sizeof(f));
+        if (!p || strlen(f) >= QIHSE_FEDERATION_ENDPOINT_HOST_LEN) return false;
+        memcpy(out->dispatch_endpoint.host, f, strlen(f) + 1u);
+        p = fed_next_field(p, f, sizeof(f));
+        if (!cap_parse_u64(f, &v) || v > UINT16_MAX) return false;
+        out->dispatch_endpoint.port = (uint16_t)v;
+        if (!fed_endpoint_valid(&out->dispatch_endpoint)) return false;
+    }
+
     /* Length agreement: a record with trailing columns is not the record this
      * library wrote, so it is refused rather than partially read. */
     if (p != NULL && *p != '\0') return false;
 
-    return cap_values_valid(&out->values) && cap_attribution_valid(out);
+    return cap_values_valid(&out->values) && cap_attribution_valid(out) &&
+           fed_endpoint_valid(&out->dispatch_endpoint);
 }
 
 static bool cap_put(void* store_void, void* user_void,
@@ -2624,6 +2661,7 @@ static bool cap_put(void* store_void, void* user_void,
     if (qihse_uuid_is_nil(&c->node_id)) return false;
     if (c->trust > QIHSE_TRUST_REVOKED) return false;
     if (!cap_values_valid(&c->values) || !cap_attribution_valid(c)) return false;
+    if (!fed_endpoint_valid(&c->dispatch_endpoint)) return false;
     char key[128];
     cap_kv_key(&c->node_id, key, sizeof(key));
     char blob[512];
@@ -2646,6 +2684,13 @@ static bool cap_record_from_statement(void* store_void, void* user_void,
     rec.session_id = stmt->session_id;
     rec.sequence = stmt->sequence;
     rec.values = stmt->caps;
+    /* Only a v4 statement may populate the endpoint: it is inside the signed
+     * region, so it carries the statement's attribution with it.  An older
+     * statement leaves the field empty. */
+    if (stmt->version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT &&
+        fed_endpoint_valid(&stmt->dispatch_endpoint)) {
+        rec.dispatch_endpoint = stmt->dispatch_endpoint;
+    }
     rec.trust = trust;
     rec.source = QIHSE_CAP_SOURCE_SIGNED_STATEMENT;
     rec.flags = 0u; /* a signature is not an attestation of the hardware */
@@ -2775,6 +2820,15 @@ bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
         le_u32(&w, gossip->caps.free_ram_mb);
         le_u16(&w, gossip->caps.load_pct);
         le_u16(&w, 0u); /* reserved */
+    }
+    if (gossip->version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT) {
+        /* The endpoint is validated before it enters the signed region:
+         * a producer must not sign a claim no receiver will accept. */
+        if (!fed_endpoint_valid(&gossip->dispatch_endpoint)) return false;
+        le_bytes(&w, (const uint8_t*)gossip->dispatch_endpoint.host,
+                 QIHSE_FEDERATION_ENDPOINT_HOST_LEN);
+        le_u16(&w, gossip->dispatch_endpoint.port);
+        le_u16(&w, 0u); /* reserved, keeps the region 4-byte aligned */
     }
     le_u16(&w, (uint16_t)gossip->sig_alg);
     le_u16(&w, gossip->signature_len);
@@ -2978,6 +3032,15 @@ bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
         if (out->caps.isa_tier > QIHSE_FEDERATION_CAP_ISA_TIER_MAX) return false;
         if (out->caps.npu > 1u || out->caps.gpu > 1u) return false;
     }
+    if (version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT) {
+        memcpy(out->dispatch_endpoint.host, in + o,
+               QIHSE_FEDERATION_ENDPOINT_HOST_LEN); o += QIHSE_FEDERATION_ENDPOINT_HOST_LEN;
+        memcpy(&out->dispatch_endpoint.port, in + o, 2); o += 2;
+        o += 2; /* reserved */
+        /* A malformed endpoint is a malformed frame: refuse it before the
+         * verifier, never carry it into a capability record. */
+        if (!fed_endpoint_valid(&out->dispatch_endpoint)) return false;
+    }
     uint16_t alg_raw = 0, sig_len = 0;
     memcpy(&alg_raw, in + o, 2); o += 2;
     memcpy(&sig_len, in + o, 2); o += 2;
@@ -3064,7 +3127,26 @@ static bool statement_encode(const qihse_federation_gossip_t* g, char* out, size
      * they were signed over.  The cap columns are written for v3 only, so the
      * stored record matches the wire layout for its version. */
     int n;
-    if (g->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
+    if (g->version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT) {
+        n = snprintf(out, cap,
+                     "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%u",
+                     cid, snd, boot, sess,
+                     (unsigned long long)g->sequence,
+                     (unsigned long long)g->hlc.physical_ms,
+                     (unsigned)g->capability_bitmap,
+                     (unsigned)g->health_summary,
+                     (unsigned)g->sig_alg,
+                     (unsigned)g->signature_len,
+                     sig_hex,
+                     (unsigned)g->version,
+                     (unsigned)g->caps.isa_tier,
+                     (unsigned)g->caps.npu,
+                     (unsigned)g->caps.gpu,
+                     (unsigned)g->caps.free_ram_mb,
+                     (unsigned)g->caps.load_pct,
+                     g->dispatch_endpoint.host,
+                     (unsigned)g->dispatch_endpoint.port);
+    } else if (g->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) {
         n = snprintf(out, cap,
                      "%s\t%s\t%s\t%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u",
                      cid, snd, boot, sess,
@@ -3172,6 +3254,20 @@ static bool statement_decode(const char* blob, qihse_federation_gossip_t* out) {
             if (!cap_parse_u64(f, &v) || v > UINT16_MAX) goto done;
             out->caps.load_pct = (uint16_t)v;
         }
+        if (out->version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT) {
+            /* The endpoint host is a text column; the field buffer is the
+             * reusable one and is bounded, so an oversized host fails here. */
+            p = fed_next_field(p, f, buf_cap);
+            if (strlen(f) >= QIHSE_FEDERATION_ENDPOINT_HOST_LEN) goto done;
+            memcpy(out->dispatch_endpoint.host, f, strlen(f) + 1u);
+            uint64_t v = 0;
+            p = fed_next_field(p, f, buf_cap);
+            if (!cap_parse_u64(f, &v) || v > UINT16_MAX) goto done;
+            out->dispatch_endpoint.port = (uint16_t)v;
+            /* The stored record has to satisfy the same contract the wire
+             * decoder enforces. */
+            if (!fed_endpoint_valid(&out->dispatch_endpoint)) goto done;
+        }
         if (p != NULL && *p != '\0') goto done; /* extra columns */
     }
     ok = true;
@@ -3201,6 +3297,9 @@ bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t*
     out->capability_bitmap = stmt->capability_bitmap;
     out->health_summary = stmt->health_summary;
     if (stmt->version >= QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY) out->caps = stmt->caps;
+    if (stmt->version >= QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT) {
+        out->dispatch_endpoint = stmt->dispatch_endpoint;
+    }
     out->sig_alg = stmt->sig_alg;
     return true;
 }
@@ -3442,12 +3541,13 @@ bool qihse_federation_statement_mint(void* store_void, void* user_void,
                                      const qihse_uuid_t* sender_node,
                                      const qihse_uuid_t* boot_id,
                                      const qihse_federation_capability_values_t* caps,
+                                     const qihse_federation_endpoint_t* endpoint,
                                      void* pkey,
                                      qihse_federation_gossip_t* out) {
     if (!sender_node || !boot_id || !pkey || !out) return false;
     memset(out, 0, sizeof(*out));
     out->magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
-    out->version = QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY;
+    out->version = QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT;
     out->feature_bitmap = 0u;
     if (cluster_id) out->cluster_id = *cluster_id;
     out->sender_node = *sender_node;
@@ -3481,6 +3581,12 @@ bool qihse_federation_statement_mint(void* store_void, void* user_void,
     if (caps) {
         if (!cap_values_valid(caps)) return false;
         out->caps = *caps;
+    }
+    if (endpoint) {
+        /* A node that advertises a listener signs for it; a node with none
+         * signs the empty endpoint, which is also attributable. */
+        if (!fed_endpoint_valid(endpoint)) return false;
+        out->dispatch_endpoint = *endpoint;
     }
     /* Sign last: nothing is emitted unsigned, and a signing failure leaves
      * the output zeroed rather than a plausible-looking frame. */

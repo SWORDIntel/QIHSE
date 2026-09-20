@@ -265,6 +265,15 @@ void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
                                       const qihse_uuid_t* cluster_id,
                                       const qihse_uuid_t* boot_id);
 
+/* Set the dispatch endpoint this node signs into its v4 membership
+ * statements — the address of its fabric dispatch listener.  Called by the
+ * RESP server after the listener exists, because the signed claim must
+ * match the real bound port, not the requested one.  NULL host or port 0
+ * clears the advertisement; a host longer than the endpoint field is
+ * refused (never truncated). */
+void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
+                                              const char* host, uint16_t port);
+
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
  * qihse_cluster_bus_config_t). */

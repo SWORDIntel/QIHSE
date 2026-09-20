@@ -7794,6 +7794,43 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
  * scans for them and executes. Phase 1: local execution only (the node
  * that receives the submit runs it if it matches, else forwards).
  * ------------------------------------------------------------------------- */
+
+/* Resolve a peer's dispatch endpoint.  The preferred source is the durable
+ * capability record's signed endpoint, which exists only when a v4
+ * membership statement passed signature + trust + replay verification and
+ * the node is still APPROVED right now (lookup_admissible re-reads the
+ * identity record, so a revocation invalidates the endpoint).  The topology
+ * host:port is the fallback: it is unauthenticated reachability data, not
+ * authority — the mTLS handshake pins the peer identity regardless, so the
+ * worst a forged hint causes is a refused connection — and the job record
+ * says which source was used. */
+static bool fabric_resolve_endpoint(qihse_resp_session_t* session,
+                                    const qihse_cluster_node_t* target,
+                                    char* host_out, size_t host_cap,
+                                    uint16_t* port_out, const char** source_out) {
+    if (target->has_uuid && session->server->store) {
+        qihse_uuid_t fu;
+        memset(&fu, 0, sizeof fu);
+        memcpy(fu.bytes, target->node_uuid, sizeof fu.bytes);
+        qihse_federation_node_capability_t cap;
+        if (qihse_federation_node_capability_lookup_admissible(
+                session->server->store, session->user, &fu, &cap) &&
+            cap.dispatch_endpoint.port != 0u) {
+            snprintf(host_out, host_cap, "%s", cap.dispatch_endpoint.host);
+            *port_out = cap.dispatch_endpoint.port;
+            *source_out = "signed";
+            return true;
+        }
+    }
+    if (target->port != 0u && target->host[0] != '\0') {
+        snprintf(host_out, host_cap, "%s", target->host);
+        *port_out = target->port;
+        *source_out = "topology";
+        return true;
+    }
+    return false;
+}
+
 static bool qihse_resp_handle_fabric_caps(qihse_resp_session_t* session) {
     if (!session->server->bus) return qihse_resp_error(session, "ERR bus not available");
     qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
@@ -7988,6 +8025,7 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     uint64_t remote_gen = 0;
     unsigned remote_cls = 0, remote_sci = 0;
     char remote_digest[97] = "-";
+    const char* ep_source = "-"; /* where the dial target came from */
 
     if (is_local) {
         exec = "local";
@@ -8035,15 +8073,23 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
             }
         }
     } else {
-        /* Remote target.  The endpoint is the peer's topology address, which
-         * is where its dispatch listener is advertised; the dispatch module
-         * does the token mint, the mTLS dial and the retry policy.  A node
-         * that cannot sign (no enrolled identity) or has no TLS context
-         * cannot dispatch, and the record stays `queued`. */
+        /* Remote target.  The endpoint comes from the peer's signed
+         * capability record when one exists (fabric_resolve_endpoint), and
+         * from topology only as explicitly-marked fallback; the dispatch
+         * module does the token mint, the mTLS dial and the retry policy.
+         * A node that cannot sign (no enrolled identity) or has no TLS
+         * context cannot dispatch, and the record stays `queued`. */
         qihse_cluster_node_t target;
         memset(&target, 0, sizeof target);
         bool have_target = qihse_cluster_topology_get_node(session->server->topology,
                                                          best_idx, &target) && target.healthy;
+        char ep_host[QIHSE_CLUSTER_HOST_LEN + 1u];
+        uint16_t ep_port = 0;
+        if (have_target) {
+            have_target = fabric_resolve_endpoint(session, &target,
+                                                  ep_host, sizeof ep_host,
+                                                  &ep_port, &ep_source);
+        }
         if (have_target && session->server->fabric_have_identity &&
             session->server->fabric_tls && session->server->fabric_pkey) {
             exec = "remote";
@@ -8054,8 +8100,8 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
             } else {
                 qihse_fabric_run_request_t rreq;
                 memset(&rreq, 0, sizeof rreq);
-                rreq.host = target.host;
-                rreq.port = target.port;
+                rreq.host = ep_host;
+                rreq.port = ep_port;
                 rreq.timeout_ms = 5000;
                 rreq.tls = session->server->fabric_tls;
                 rreq.pkey = session->server->fabric_pkey;
@@ -8126,11 +8172,12 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
              "\"isa\":%llu,\"npu\":%llu,\"result\":\"%s\",\"err\":\"%s\","
              "\"remote_status\":\"%s\",\"attempts\":%u,\"retry\":\"%s\","
              "\"remote_gen\":%llu,\"remote_cls\":%u,\"remote_sci\":%u,"
-             "\"remote_digest\":\"%s\"}",
+             "\"remote_digest\":\"%s\",\"ep\":\"%s\"}",
              job_type, status, exec, (unsigned)best_idx,
              (unsigned long long)min_isa, (unsigned long long)need_npu, result, err,
              remote_status, attempts, retry,
-             (unsigned long long)remote_gen, remote_cls, remote_sci, remote_digest);
+             (unsigned long long)remote_gen, remote_cls, remote_sci, remote_digest,
+             ep_source);
     pthread_rwlock_wrlock(&session->server->kv_lock);
     bool ok = qihse_kv_set_user(session->server->store, job_key, job_val, 0, 0, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
@@ -8326,12 +8373,20 @@ static bool qihse_resp_handle_fabric_fetch(qihse_resp_session_t* session, const 
         return qihse_resp_error(session, "ERR fabric dispatch identity not configured");
     }
 
+    char ep_host[QIHSE_CLUSTER_HOST_LEN + 1u];
+    uint16_t ep_port = 0;
+    const char* ep_source = "-";
+    if (!fabric_resolve_endpoint(session, &target, ep_host, sizeof ep_host,
+                                 &ep_port, &ep_source)) {
+        return qihse_resp_error(session, "ERR fetch target has no dispatch endpoint");
+    }
+
     char* fbody = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
     if (!fbody) return qihse_resp_error(session, "ERR out of memory");
     qihse_fabric_fetch_request_t freq;
     memset(&freq, 0, sizeof freq);
-    freq.host = target.host;
-    freq.port = target.port;
+    freq.host = ep_host;
+    freq.port = ep_port;
     freq.timeout_ms = 5000;
     freq.tls = session->server->fabric_tls;
     freq.pkey = session->server->fabric_pkey;
@@ -9463,6 +9518,13 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             if (!server->fabric_listener) {
                 fprintf(stderr, "qihse: fabric dispatch listener failed to start on %s:%u\n",
                         supplied->fabric_dispatch_bind, (unsigned)supplied->fabric_dispatch_port);
+            } else if (server->bus) {
+                /* The signed v4 statement advertises the listener's REAL
+                 * bound endpoint, not the configured one — a claim peers
+                 * would dial and miss is worse than no claim. */
+                qihse_cluster_bus_set_dispatch_endpoint(server->bus,
+                        supplied->fabric_dispatch_bind,
+                        qihse_fabric_listener_port(server->fabric_listener));
             }
             }
         } else {

@@ -40,6 +40,8 @@
 #include "qihse_resp_wire.h"
 #include "qihse_runtime_trust.h"
 
+#include <openssl/evp.h>
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -398,6 +400,9 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
     assert(strstr(reply, "done") == NULL);
     assert(strstr(reply, "exec\":\"remote") != NULL);
     assert(strstr(reply, "remote_gen") != NULL);
+    /* No signed statement has been accepted for the peer yet, so the dial
+     * target came from the topology hint — and the record says so. */
+    assert(strstr(reply, "\"ep\":\"topology\"") != NULL);
 
     /* The pull: the result comes back and is cached. */
     const char* fetch[] = { "FABRIC", "FETCH", jid };
@@ -435,6 +440,64 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
     free(hit.text);
     printf("PASS remote embed: executed on the peer at the token's clearance, "
            "memory in the peer's store\n");
+
+    /* ── Signed endpoint discovery ──────────────────────────────────────
+     * A v4 membership statement names the peer's dispatch endpoint inside
+     * the signed region; once accepted into the submitter's store (which
+     * requires the signature, enrollment and APPROVED trust to all check
+     * out), the durable capability record — not the topology hint — becomes
+     * the dial target, and the job record says "ep":"signed". */
+    {
+        qihse_federation_node_identity_t id_b;
+        void* pkey_b = NULL;
+        assert(qihse_fabric_node_signer_load(g_store_b, g_op, &g_id_b.node_id,
+                                           &id_b, &pkey_b));
+        qihse_uuid_t boot_b;
+        assert(qihse_uuid_from_seed("node-b-boot", strlen("node-b-boot"), &boot_b));
+        qihse_federation_endpoint_t ep;
+        memset(&ep, 0, sizeof ep);
+        snprintf(ep.host, sizeof ep.host, "%s", "127.0.0.1");
+        ep.port = qihse_resp_server_fabric_port(g_executor);
+        assert(ep.port != 0);
+        qihse_federation_gossip_t stmt;
+        assert(qihse_federation_statement_mint(NULL, NULL, NULL,
+                                               &g_id_b.node_id, &boot_b,
+                                               NULL, &ep, pkey_b, &stmt));
+        EVP_PKEY_free((EVP_PKEY*)pkey_b);
+        /* The submitter accepts it (signature + trust + replay all pass) and
+         * the capability record gains the signed endpoint. */
+        assert(qihse_federation_gossip_accept(g_store_a, g_op, &stmt) ==
+               QIHSE_GOSSIP_ACCEPTED);
+        qihse_federation_node_capability_t cap;
+        assert(qihse_federation_node_capability_lookup_admissible(
+                   g_store_a, g_op, &g_id_b.node_id, &cap));
+        assert(cap.dispatch_endpoint.port == ep.port);
+
+        /* The topology peer must carry the peer's federation identity for
+         * the record to be found. */
+        assert(qihse_cluster_topology_set_node_uuid(
+                   qihse_resp_server_topology(g_submitter),
+                   g_peer_index, g_id_b.node_id.bytes));
+
+        const char* sub3[] = { "FABRIC", "SUBMIT", "keystone-ingest", "0", "0",
+                               "signed-endpoint payload" };
+        run_cmd(g_submitter, g_low, 6u, sub3, reply, sizeof reply);
+        assert(strstr(reply, "status:pending-fetch") != NULL);
+        char jid3[32];
+        assert(parse_job_id(reply, jid3, sizeof jid3));
+        const char* res3[] = { "FABRIC", "RESULT", jid3 };
+        run_cmd(g_submitter, g_low, 3u, res3, reply, sizeof reply);
+        assert(strstr(reply, "\"ep\":\"signed\"") != NULL);
+        /* And it really ran there: the artifact is in the executor's store. */
+        char art3[192];
+        assert(qihse_fabric_remote_artifact_key(&g_id_a.node_id,
+                                                strtoull(jid3, NULL, 10),
+                                                art3, sizeof art3));
+        char* a3 = qihse_kv_get_user(g_store_b, art3, g_op);
+        assert(a3 != NULL);
+        free(a3);
+        printf("PASS signed endpoint: v4 statement endpoint becomes the dial target\n");
+    }
 }
 
 /* ── INVARIANT 3: low clearance vs high data (merge blocker) ───────────── */

@@ -108,8 +108,12 @@ Postgres, no platform glue.
 > by `tests/test_fabric_jobs.c`, and remote dispatch is verified by
 > `tests/test_fabric_dispatch.c` (the `fabric-remote-dispatch` workload in
 > `tests/gold/pack.v1.gold`). Two of the four named job types have no executor
-> (`ai-fabric/inference-executors`), and dispatch endpoint discovery still
-> rides the topology address (`ai-fabric/dispatch-endpoint-discovery`).
+> (`ai-fabric/inference-executors`). Dispatch endpoint discovery is signed:
+> the v4 membership statement carries the node's dispatch `host:port` inside
+> the signed region, and `FABRIC.SUBMIT`/`FABRIC.FETCH` resolve the peer
+> through the durable capability record (`lookup_admissible`, so revocation
+> invalidates the endpoint) before falling back to the topology hint, which
+> the job record marks `"ep":"topology"`.
 
 - The command surface is RESP, not the bus job frame this item originally
   specified: `FABRIC.CAPS`, `FABRIC.SUBMIT [<type>] <min_isa> <need_npu>
@@ -143,8 +147,12 @@ Postgres, no platform glue.
   truth. Placement picks the lowest `load_pct` among nodes meeting the
   ISA/NPU requirement from the live hint table, then falls back to the local
   node's durable record so a single-node fabric can place work at all;
-  reachability is not consulted, and the dispatch endpoint is the peer's
-  topology `host:port` (see `ai-fabric/dispatch-endpoint-discovery`).
+  reachability is not consulted. The dispatch endpoint is the peer's signed
+  v4 endpoint when a verified statement has been accepted (the durable
+  capability record's `dispatch_endpoint`), and the topology `host:port`
+  otherwise — the mTLS handshake pins the peer identity either way, so a
+  forged hint can only cost a refused connection. The job record reports
+  which source was used.
 - Job records live at `fabric:job:<job-id>` and ARE the result `FABRIC.RESULT`
   returns. The job frame this item specified — payload blob hash, priority,
   bus or task-queue dispatch — was not built: there is no priority field, no

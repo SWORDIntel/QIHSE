@@ -356,9 +356,10 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
 }
 
 /* The production half: qihse_federation_statement_mint() fills and signs a
- * v3 statement — monotonic sequence continuing from stored state, a fresh
- * session per statement, and a capability profile inside the signed region
- * that lands as a SIGNED_STATEMENT capability record on acceptance. */
+ * v4 statement — monotonic sequence continuing from stored state, a fresh
+ * session per statement, and a capability profile plus dispatch endpoint
+ * inside the signed region that lands as a SIGNED_STATEMENT capability
+ * record on acceptance. */
 static void test_statement_mint(const char* key_dir) {
     fixture_t f;
     fixture_up(&f, key_dir, true);
@@ -367,18 +368,41 @@ static void test_statement_mint(const char* key_dir) {
     memset(&caps, 0, sizeof(caps));
     caps.isa_tier = 3; caps.npu = 1; caps.free_ram_mb = 4096; caps.load_pct = 25;
 
+    qihse_federation_endpoint_t ep;
+    memset(&ep, 0, sizeof(ep));
+    snprintf(ep.host, sizeof(ep.host), "%s", "worker-a.example");
+    ep.port = 7443;
+
+    /* An endpoint that violates the host/port contract fails the mint. */
+    qihse_federation_endpoint_t bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.port = 7443; /* port with no host: refused */
+    qihse_federation_gossip_t junk;
+    assert(!qihse_federation_statement_mint(g_store, g_op, &f.cluster_id,
+                                            &f.identity.node_id, &f.boot_id,
+                                            &caps, &bad, f.pkey, &junk));
+
     qihse_federation_gossip_t s1;
     assert(qihse_federation_statement_mint(g_store, g_op, &f.cluster_id,
                                            &f.identity.node_id, &f.boot_id,
-                                           &caps, f.pkey, &s1));
+                                           &caps, &ep, f.pkey, &s1));
     assert(s1.sequence == 1u);
-    assert(s1.version == QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY);
+    assert(s1.version == QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT);
+    assert(s1.dispatch_endpoint.port == 7443u);
+    assert(strcmp(s1.dispatch_endpoint.host, "worker-a.example") == 0);
     assert(!qihse_uuid_is_nil(&s1.session_id));
     /* The signature verifies against the enrolled public key. */
     assert(qihse_federation_gossip_verify(f.identity.public_key,
                                           f.identity.public_key_len, &s1));
 
-    /* Accept: the signed capability profile becomes the durable record. */
+    /* A tampered endpoint is a signature failure, not a misdirected dial. */
+    qihse_federation_gossip_t forged = s1;
+    forged.dispatch_endpoint.port = 9999;
+    assert(!qihse_federation_gossip_verify(f.identity.public_key,
+                                           f.identity.public_key_len, &forged));
+
+    /* Accept: the signed capability profile + endpoint become the durable
+     * record. */
     assert(qihse_federation_gossip_accept(g_store, g_op, &s1) == QIHSE_GOSSIP_ACCEPTED);
     qihse_federation_node_capability_t cap;
     assert(qihse_federation_node_capability_lookup_admissible(g_store, g_op,
@@ -387,12 +411,15 @@ static void test_statement_mint(const char* key_dir) {
     assert(cap.sequence == 1u);
     assert(qihse_uuid_equal(&cap.session_id, &s1.session_id));
     assert(cap.values.isa_tier == 3u && cap.values.npu == 1u && cap.values.load_pct == 25u);
+    /* The signed endpoint survived durable persistence. */
+    assert(cap.dispatch_endpoint.port == 7443u);
+    assert(strcmp(cap.dispatch_endpoint.host, "worker-a.example") == 0);
 
     /* A second mint continues the sequence and mints a NEW session. */
     qihse_federation_gossip_t s2;
     assert(qihse_federation_statement_mint(g_store, g_op, &f.cluster_id,
                                            &f.identity.node_id, &f.boot_id,
-                                           &caps, f.pkey, &s2));
+                                           &caps, &ep, f.pkey, &s2));
     assert(s2.sequence == 2u);
     assert(!qihse_uuid_equal(&s2.session_id, &s1.session_id));
     assert(qihse_federation_gossip_accept(g_store, g_op, &s2) == QIHSE_GOSSIP_ACCEPTED);
