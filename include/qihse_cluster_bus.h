@@ -124,6 +124,10 @@ typedef enum {
  * local federation UUID is configured.  The record is a durable floor, not a
  * per-heartbeat trace: the live NODE_CAP frame is the 1 Hz channel. */
 #define QIHSE_CLUSTER_BUS_CAP_RECORD_MS 10000u
+/* Signed membership statement cadence: slower than a heartbeat, faster than
+ * the durable capability record — it is the frame that carries attributable
+ * capability, and its fresh session id retires old heartbeats. */
+#define QIHSE_CLUSTER_BUS_STATEMENT_MS 5000u
 
 typedef struct {
     char node_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
@@ -185,6 +189,19 @@ typedef struct {
      * restart.  NULL (the default) writes nothing: the bus will not invent an
      * identity it was not given. */
     const qihse_uuid_t* local_node_uuid;
+    /* Production side of signed gossip (the consume side is
+     * federation_store/federation_user above).  When sign_key AND boot_id
+     * AND local_node_uuid are all set, the bus mints a v3 signed membership
+     * statement every statement_ms and broadcasts it — the frame that makes
+     * a peer's durable capability record attributable, rather than the
+     * unauthenticated NODE_CAP hint.  sign_key is BORROWED (the caller keeps
+     * the node private key's lifetime; the bus never frees it).  A node with
+     * no enrolled identity is simply not given a sign key and mints nothing.
+     * cluster_id may be nil (the accept path does not gate on it). */
+    void* federation_sign_key;   /* EVP_PKEY* — borrowed */
+    qihse_uuid_t federation_cluster_id;
+    qihse_uuid_t federation_boot_id;
+    uint32_t statement_ms;       /* 0 → QIHSE_CLUSTER_BUS_STATEMENT_MS */
     /* Two callbacks with DISTINCT payload types, because the two tiers carry
      * different authority.
      *
@@ -235,6 +252,18 @@ bool qihse_cluster_bus_broadcast_federation_heartbeat(qihse_cluster_bus_t* bus,
 /* Report that this node applied (status 0) or rejected a group update. */
 bool qihse_cluster_bus_broadcast_group_ack(qihse_cluster_bus_t* bus, uint64_t update_id,
                                            uint16_t status);
+
+/* Install the federation production context after creation (the RESP server
+ * creates the bus before it has loaded the node's enrolled signing key, so
+ * this is how production wires it rather than touching the config struct).
+ * Passing NULL sign_key or boot_id DISABLES statement production; the
+ * consume side (statement/heartbeat verification) needs only store+user. */
+void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
+                                      void* store, void* user,
+                                      const qihse_uuid_t* node_uuid,
+                                      void* sign_key,
+                                      const qihse_uuid_t* cluster_id,
+                                      const qihse_uuid_t* boot_id);
 
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching

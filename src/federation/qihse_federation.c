@@ -3386,16 +3386,11 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
     if (!qihse_federation_gossip_verify(sender.public_key, sender.public_key_len, gossip)) {
         return QIHSE_GOSSIP_REJECT_BAD_SIGNATURE;
     }
-    /* A new session id retires every heartbeat issued under the old one, so
-     * the statement must be recorded before its heartbeats are accepted. */
-    if (!qihse_uuid_equal(&gossip->session_id, &prev_session)) {
-        if (!statement_store(store_void, user_void, gossip)) {
-            return QIHSE_GOSSIP_REJECT_MALFORMED;
-        }
-    }
-    (void)prev_session;
 
-    /* Replay window: the sequence must advance strictly. */
+    /* Replay window BEFORE the statement store: a replayed OLD statement
+     * carries a different session id, and recording it would retire the
+     * current session's heartbeats — a replay would then be a live denial,
+     * not just a refused frame.  Refuse first, record second. */
     char key[192];
     replay_kv_key(&gossip->sender_node, &gossip->boot_id, key, sizeof(key));
     char* val = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
@@ -3406,6 +3401,15 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
         free(val);
     }
     if (highest != 0 && gossip->sequence <= highest) return QIHSE_GOSSIP_REJECT_REPLAY;
+
+    /* A new session id retires every heartbeat issued under the old one, so
+     * the statement must be recorded before its heartbeats are accepted. */
+    if (!qihse_uuid_equal(&gossip->session_id, &prev_session)) {
+        if (!statement_store(store_void, user_void, gossip)) {
+            return QIHSE_GOSSIP_REJECT_MALFORMED;
+        }
+    }
+    (void)prev_session;
 
     /* W2.4 producer: the capability profile is inside the signed region, so
      * by this point it is attributable to an enrolled, APPROVED node and its
@@ -3429,4 +3433,60 @@ qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* use
         return QIHSE_GOSSIP_REJECT_MALFORMED;
     }
     return QIHSE_GOSSIP_ACCEPTED;
+}
+
+/* ── Statement production ─────────────────────────────────────────────── */
+
+bool qihse_federation_statement_mint(void* store_void, void* user_void,
+                                     const qihse_uuid_t* cluster_id,
+                                     const qihse_uuid_t* sender_node,
+                                     const qihse_uuid_t* boot_id,
+                                     const qihse_federation_capability_values_t* caps,
+                                     void* pkey,
+                                     qihse_federation_gossip_t* out) {
+    if (!sender_node || !boot_id || !pkey || !out) return false;
+    memset(out, 0, sizeof(*out));
+    out->magic = QIHSE_FEDERATION_GOSSIP_MAGIC;
+    out->version = QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY;
+    out->feature_bitmap = 0u;
+    if (cluster_id) out->cluster_id = *cluster_id;
+    out->sender_node = *sender_node;
+    out->boot_id = *boot_id;
+    if (!qihse_uuid_generate(&out->session_id)) return false;
+
+    /* Sequence continues from the highest the store knows about: the stored
+     * statement (written by accept) and the replay record (also written by
+     * accept) are both consulted, so a mint after a partial write still
+     * produces a sequence a receiver's window accepts. */
+    uint64_t seq = 0;
+    if (store_void && user_void) {
+        qihse_federation_gossip_t prior;
+        if (qihse_federation_gossip_statement_read(store_void, user_void,
+                                                  sender_node, boot_id, &prior) &&
+            prior.sequence > seq) {
+            seq = prior.sequence;
+        }
+        qihse_federation_replay_state_t replay;
+        if (qihse_federation_replay_state_read(store_void, user_void,
+                                               sender_node, boot_id, &replay) &&
+            replay.highest_sequence > seq) {
+            seq = replay.highest_sequence;
+        }
+    }
+    out->sequence = seq + 1u;
+    out->hlc.physical_ms = fed_now_ms();
+    out->hlc.logical = 0u;
+    out->capability_bitmap = 0u;
+    out->health_summary = 0u;
+    if (caps) {
+        if (!cap_values_valid(caps)) return false;
+        out->caps = *caps;
+    }
+    /* Sign last: nothing is emitted unsigned, and a signing failure leaves
+     * the output zeroed rather than a plausible-looking frame. */
+    if (!qihse_federation_gossip_sign(pkey, out)) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    return true;
 }

@@ -218,6 +218,9 @@ struct qihse_resp_server {
     void* fabric_pkey;
     qihse_uuid_t fabric_node_id;
     bool fabric_have_identity;
+    /* This boot's UUID: statements minted by the bus carry it so a restart
+     * is a new boot for every peer's replay window.  Generated at create. */
+    qihse_uuid_t federation_boot_id;
     qihse_cluster_failover_t* failover;
     /* Group update push: monotonic id source + per-update member acks. */
     qihse_hlc_t group_clock;
@@ -9182,6 +9185,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->owns_topology = true;
     }
     qihse_hlc_init(&server->group_clock);
+    (void)qihse_uuid_generate(&server->federation_boot_id);
     /* F1: derive a stable federation UUID from the configured cluster node id
      * (or a default seed) and initialize the federation status snapshot. */
     {
@@ -9380,6 +9384,20 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
                 server->fabric_pkey = self_pkey;
                 server->fabric_node_id = self_id;
                 server->fabric_have_identity = true;
+                /* The enrolled identity that outbound dispatch uses is also
+                 * what signed-gossip production needs: wire the bus to mint
+                 * v3 membership statements (capability profile inside the
+                 * signed region) so peers' durable capability records are
+                 * attributable rather than NODE_CAP hints.  The cluster id is
+                 * nil until cluster-id configuration exists — the accept
+                 * path does not gate on it. */
+                if (server->bus) {
+                    qihse_cluster_bus_set_federation(server->bus, server->store,
+                                                   qihse_auth_get_user(0),
+                                                   &server->fabric_node_id,
+                                                   server->fabric_pkey,
+                                                   NULL, &server->federation_boot_id);
+                }
             }
             if (!have_self) {
                 fprintf(stderr, "qihse: fabric dispatch enabled but this node has no loadable "

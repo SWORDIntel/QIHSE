@@ -1172,6 +1172,29 @@ bool qihse_federation_replay_state_read(void* store_void, void* user_void,
                                         const qihse_uuid_t* boot_id,
                                         qihse_federation_replay_state_t* out);
 
+/* ── Statement production ──────────────────────────────────────────────────
+ *
+ * qihse_federation_statement_mint() is the PRODUCER half of signed gossip:
+ * it fills a v3 statement for the local node and signs it in place.  The
+ * sequence continues from the highest recorded sequence for (sender, boot)
+ * — a mint mid-boot can never emit a frame a receiver's replay window would
+ * refuse — and a FRESH session id is generated per call, because a new
+ * statement retires every heartbeat issued under the old one by design.
+ *
+ * Nothing is emitted when the signature cannot be produced.  `caps` may be
+ * NULL (a v3 statement with a zeroed profile is still attributable
+ * membership).  This function does NOT check enrollment or approval —
+ * receivers enforce that — but a producer that mints for a node that is not
+ * enrolled produces frames every peer refuses, which is noise rather than
+ * harm. */
+bool qihse_federation_statement_mint(void* store_void, void* user_void,
+                                     const qihse_uuid_t* cluster_id,
+                                     const qihse_uuid_t* sender_node,
+                                     const qihse_uuid_t* boot_id,
+                                     const qihse_federation_capability_values_t* caps,
+                                     void* pkey,
+                                     qihse_federation_gossip_t* out);
+
 #ifdef __cplusplus
 }
 #endif

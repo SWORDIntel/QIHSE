@@ -65,6 +65,13 @@ struct qihse_cluster_bus {
     qihse_uuid_t local_node_uuid;
     bool has_local_node_uuid;
     uint64_t last_cap_record_ms;
+    /* Statement production (see qihse_cluster_bus_config_t).  sign_key is
+     * borrowed — the caller owns the node private key. */
+    void* federation_sign_key;
+    qihse_uuid_t federation_cluster_id;
+    qihse_uuid_t federation_boot_id;
+    uint32_t statement_ms;
+    uint64_t last_statement_ms;
     void (*on_liveness)(qihse_cluster_bus_t* bus,
                         const qihse_federation_liveness_t* observation,
                         void* user_data);
@@ -968,6 +975,46 @@ static void qihse_bus_send_heartbeat(qihse_cluster_bus_t* bus) {
     qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_NODE_CAP, capbuf, sizeof(capbuf));
 }
 
+/* Mint and broadcast a v3 signed membership statement for the local node.
+ * Gated on the whole production context: no enrolled identity means no sign
+ * key means no statement — the bus will not invent an identity, and a frame
+ * a receiver would refuse is noise rather than harm but still noise.
+ *
+ * The minted statement is fed through the LOCAL accept path before the
+ * broadcast: this node's durable capability record gains SIGNED_STATEMENT
+ * provenance (a self-signed claim is still attributable), and the replay
+ * record it writes keeps the minted sequence monotonic.  A node that is not
+ * approved gets refused by its own accept path and keeps the LOCAL_PROBE
+ * record instead. */
+static bool qihse_bus_send_fed_statement(qihse_cluster_bus_t* bus) {
+    if (!bus->federation_store || !bus->federation_user ||
+        !bus->federation_sign_key || !bus->has_local_node_uuid) {
+        return false;
+    }
+    uint64_t now = qihse_bus_now_ms();
+    if (bus->last_statement_ms != 0 &&
+        now - bus->last_statement_ms < bus->statement_ms) {
+        return false;
+    }
+    qihse_federation_capability_values_t values;
+    memset(&values, 0, sizeof(values));
+    values.isa_tier = qihse_bus_local_isa_tier();
+    qihse_bus_local_accelerators(&values.npu, &values.gpu);
+    qihse_bus_local_memory_load(&values.free_ram_mb, &values.load_pct);
+    qihse_federation_gossip_t stmt;
+    if (!qihse_federation_statement_mint(bus->federation_store, bus->federation_user,
+                                         &bus->federation_cluster_id,
+                                         &bus->local_node_uuid,
+                                         &bus->federation_boot_id,
+                                         &values, bus->federation_sign_key, &stmt)) {
+        return false;
+    }
+    bus->last_statement_ms = now;
+    (void)qihse_federation_gossip_accept(bus->federation_store,
+                                         bus->federation_user, &stmt);
+    return qihse_cluster_bus_broadcast_federation_statement(bus, &stmt);
+}
+
 static void* qihse_bus_thread(void* arg) {
     qihse_cluster_bus_t* bus = (qihse_cluster_bus_t*)arg;
     uint64_t last_heartbeat = 0;
@@ -978,6 +1025,7 @@ static void* qihse_bus_thread(void* arg) {
             qihse_bus_send_heartbeat(bus);
             last_heartbeat = now;
         }
+        (void)qihse_bus_send_fed_statement(bus);
         qihse_cluster_bus_check_health(bus);
 #ifdef _WIN32
         Sleep(50);
@@ -1010,6 +1058,11 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         bus->local_node_uuid = *config->local_node_uuid;
         bus->has_local_node_uuid = true;
     }
+    bus->federation_sign_key = config->federation_sign_key;
+    bus->federation_cluster_id = config->federation_cluster_id;
+    bus->federation_boot_id = config->federation_boot_id;
+    bus->statement_ms = config->statement_ms ? config->statement_ms
+                                             : QIHSE_CLUSTER_BUS_STATEMENT_MS;
     bus->on_liveness = config->on_liveness;
     bus->on_liveness_user_data = config->on_liveness_user_data;
     bus->on_membership = config->on_membership;
@@ -1075,6 +1128,10 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
     /* Write the durable self-record before the first heartbeat, so a node
      * that restarts has its own capability profile on disk immediately. */
     (void)qihse_bus_record_local_caps(bus, true);
+    /* Emit the first signed statement at once rather than after a whole
+     * statement_ms interval — a peer should not wait seconds to learn an
+     * attributable capability profile. */
+    (void)qihse_bus_send_fed_statement(bus);
     bus->running = true;
     if (pthread_create(&bus->thread, NULL, qihse_bus_thread, bus) != 0) {
         bus->running = false;
@@ -1126,6 +1183,27 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
     memcpy(upd.owner_id, owner.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
                                        (const uint8_t*)&upd, sizeof(upd));
+}
+
+void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
+                                      void* store, void* user,
+                                      const qihse_uuid_t* node_uuid,
+                                      void* sign_key,
+                                      const qihse_uuid_t* cluster_id,
+                                      const qihse_uuid_t* boot_id) {
+    if (!bus) return;
+    bus->federation_store = store;
+    bus->federation_user = user;
+    if (node_uuid) {
+        bus->local_node_uuid = *node_uuid;
+        bus->has_local_node_uuid = true;
+    }
+    bus->federation_sign_key = sign_key;
+    if (cluster_id) bus->federation_cluster_id = *cluster_id;
+    if (boot_id) bus->federation_boot_id = *boot_id;
+    /* No production without a signing identity: an unsigned statement is not
+     * mintable, and minting for a nil boot would collide every restart. */
+    if (!sign_key || !boot_id || !node_uuid) bus->federation_sign_key = NULL;
 }
 
 void qihse_cluster_bus_set_group_callbacks(

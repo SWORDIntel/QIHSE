@@ -355,6 +355,66 @@ static void test_valid_statement_then_heartbeat(const char* key_dir) {
     printf("PASS valid statement accepted, cheap heartbeat accepted, replay and stale session dropped\n");
 }
 
+/* The production half: qihse_federation_statement_mint() fills and signs a
+ * v3 statement — monotonic sequence continuing from stored state, a fresh
+ * session per statement, and a capability profile inside the signed region
+ * that lands as a SIGNED_STATEMENT capability record on acceptance. */
+static void test_statement_mint(const char* key_dir) {
+    fixture_t f;
+    fixture_up(&f, key_dir, true);
+
+    qihse_federation_capability_values_t caps;
+    memset(&caps, 0, sizeof(caps));
+    caps.isa_tier = 3; caps.npu = 1; caps.free_ram_mb = 4096; caps.load_pct = 25;
+
+    qihse_federation_gossip_t s1;
+    assert(qihse_federation_statement_mint(g_store, g_op, &f.cluster_id,
+                                           &f.identity.node_id, &f.boot_id,
+                                           &caps, f.pkey, &s1));
+    assert(s1.sequence == 1u);
+    assert(s1.version == QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY);
+    assert(!qihse_uuid_is_nil(&s1.session_id));
+    /* The signature verifies against the enrolled public key. */
+    assert(qihse_federation_gossip_verify(f.identity.public_key,
+                                          f.identity.public_key_len, &s1));
+
+    /* Accept: the signed capability profile becomes the durable record. */
+    assert(qihse_federation_gossip_accept(g_store, g_op, &s1) == QIHSE_GOSSIP_ACCEPTED);
+    qihse_federation_node_capability_t cap;
+    assert(qihse_federation_node_capability_lookup_admissible(g_store, g_op,
+                                                            &f.identity.node_id, &cap));
+    assert(cap.source == QIHSE_CAP_SOURCE_SIGNED_STATEMENT);
+    assert(cap.sequence == 1u);
+    assert(qihse_uuid_equal(&cap.session_id, &s1.session_id));
+    assert(cap.values.isa_tier == 3u && cap.values.npu == 1u && cap.values.load_pct == 25u);
+
+    /* A second mint continues the sequence and mints a NEW session. */
+    qihse_federation_gossip_t s2;
+    assert(qihse_federation_statement_mint(g_store, g_op, &f.cluster_id,
+                                           &f.identity.node_id, &f.boot_id,
+                                           &caps, f.pkey, &s2));
+    assert(s2.sequence == 2u);
+    assert(!qihse_uuid_equal(&s2.session_id, &s1.session_id));
+    assert(qihse_federation_gossip_accept(g_store, g_op, &s2) == QIHSE_GOSSIP_ACCEPTED);
+
+    /* A replayed OLD statement is refused — and, because the replay check
+     * now runs BEFORE the statement store, it must not retire the current
+     * session: a heartbeat under session 2 is still accepted afterwards. */
+    assert(qihse_federation_gossip_accept(g_store, g_op, &s1) == QIHSE_GOSSIP_REJECT_REPLAY);
+    qihse_federation_heartbeat_t hb;
+    memset(&hb, 0, sizeof(hb));
+    hb.magic = QIHSE_FEDERATION_HEARTBEAT_MAGIC;
+    hb.version = QIHSE_FEDERATION_HEARTBEAT_VERSION;
+    hb.sender_node = f.identity.node_id;
+    hb.boot_id = f.boot_id;
+    hb.session_id = s2.session_id;
+    hb.sequence = 1;
+    assert(qihse_federation_heartbeat_accept(g_store, g_op, &hb) == QIHSE_GOSSIP_ACCEPTED);
+
+    fixture_down(&f);
+    printf("PASS statement mint: monotonic sequence, fresh session, attributable cap record, replay cannot retire a session\n");
+}
+
 static void test_no_context_fails_closed(const char* key_dir) {
     /* A bus with NO federation context must drop federation frames rather than
      * trust them.  This is the fail-closed default for a misconfigured node. */
@@ -494,6 +554,7 @@ int main(void) {
     test_heartbeat_without_statement_is_dropped(key_dir);
     test_forged_statement_is_dropped(key_dir);
     test_valid_statement_then_heartbeat(key_dir);
+    test_statement_mint(key_dir);
     test_no_context_fails_closed(key_dir);
     test_malformed_frames_are_dropped(key_dir);
 
