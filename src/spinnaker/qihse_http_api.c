@@ -136,6 +136,14 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
     addr.sin_port = htons(srv->port);
     if (bind(srv->fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(srv->fd); return -1; }
     if (listen(srv->fd, 128) < 0) { close(srv->fd); return -1; }
+    /* Port 0 means ephemeral: read back the bound port so callers can reach
+     * the server without racing a fixed port. */
+    if (srv->port == 0) {
+        struct sockaddr_in bound;
+        socklen_t blen = sizeof(bound);
+        if (getsockname(srv->fd, (struct sockaddr*)&bound, &blen) == 0)
+            srv->port = ntohs(bound.sin_port);
+    }
     srv->running = 1;
     pthread_create(&srv->thread, NULL, http_accept_thread, srv);
     return 0;
@@ -144,7 +152,14 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
 int qihse_http_server_stop(qihse_http_server_t* srv) {
     if (!srv) return -1;
     srv->running = 0;
-    if (srv->fd >= 0) { close(srv->fd); srv->fd = -1; }
+    if (srv->fd >= 0) {
+        /* shutdown() before close(): closing a listen fd does NOT reliably
+         * wake a thread blocked in accept() on it, and the join below would
+         * hang forever. */
+        shutdown(srv->fd, SHUT_RDWR);
+        close(srv->fd);
+        srv->fd = -1;
+    }
     pthread_join(srv->thread, NULL);
     return 0;
 }

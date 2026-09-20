@@ -250,8 +250,17 @@ workload mongo-wire area=protocol-compat expect=pass timeout=300 \
     output="test_mongo_wire: all asserted MongoDB wire behaviours passed" \
     run="make -s test-mongo-wire"
 
-gap protocol-compat/other-adapters area=protocol-compat \
-    reason="RESP, HTTP, Elasticsearch, ClickHouse and Influx adapter end-to-end compatibility has no runnable harness in the main Makefile target graph; this pack exercises Bolt, the replication frame and the pooler only, plus the declared-adapter presence probe"
+# HTTP adapter harness: InfluxDB (real write→query roundtrip on the TSDB,
+# plus the invariant-3 negative — a classified point is invisible through
+# the adapter's unclassified-only NULL context), ClickHouse (ping, SHOW,
+# SELECT, unsupported refused) and Elasticsearch (health/search/bulk
+# shapes, unknown route 404), all over real TCP through
+# qihse_http_server_t.  RESP is the native wire — covered by the rest of
+# this pack.
+workload http-adapters area=protocol-compat expect=pass timeout=300 \
+    output="test_http_adapters: all adapter harness tests passed" \
+    ref="src/spinnaker/qihse_http_api.c" \
+    run="make -s test-http-adapters"
 
 # bolt-negative-auth: COVERED by the bolt-codec workload above.  tests/test_bolt.c
 # (test_bolt_negative_auth) drives the real client handler over a socketpair:
