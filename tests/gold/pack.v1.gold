@@ -377,8 +377,19 @@ workload fabric-memory-kind-filter area=ai-fabric expect=pass timeout=180 \
 gap ai-fabric/vector-candidate-crowding area=ai-fabric \
     reason="aimem_vec_search() selects the top-want vectors WITHOUT a user, so a vector the caller cannot read can occupy a candidate slot and push a visible memory out of the semantic top-k. This is CROWDING, not disclosure — every candidate is re-resolved with the caller before it is returned — but a low-clearance caller's semantic recall is degraded by records they cannot see. Pre-existing; the kind filter does not cause or fix it, because post-resolve filtering happens after top-k selection."
 
-gap ai-fabric/remote-dispatch area=ai-fabric \
-    reason="FABRIC.SUBMIT executes locally only. A job whose best-fit node is another node is recorded 'queued' and never runs; remote dispatch needs a transport and a result path that do not exist. Recorded as queued rather than done so the record is not claiming a dispatch that did not happen."
+# Remote dispatch: a job whose best-fit node is a peer must RUN there under a
+# signed capability token bound to job/payload/principal/scope; the executor
+# owns its result record and the submitter pulls it with FABRIC.FETCH
+# (pending-fetch is not done); retry is per-type idempotency; and a
+# low-clearance principal is refused with no protected payload on the wire
+# (AGENTS.md invariant 3).
+workload fabric-remote-dispatch area=ai-fabric expect=pass timeout=300 \
+    ref="include/qihse_fabric_dispatch.h" \
+    output="fabric dispatch tests passed" \
+    run="make -s test-fabric-dispatch"
+
+gap ai-fabric/dispatch-endpoint-discovery area=ai-fabric \
+    reason="Remote dispatch exists and is tested, but the peer's dispatch endpoint is taken from its topology host:port. No production code mints signed v3 membership statements yet, so a peer's durable capability record — and with it any advertised dispatch endpoint — is populated only when statement production is wired; until then a fresh peer claims reach a submitter only through the unauthenticated NODE_CAP hint path."
 
 gap ai-fabric/inference-executors area=ai-fabric \
     reason="Two of the four job types named in ai_fabric.md have executors (embed, keystone-ingest). inference and index-build do NOT and are REFUSED with 'job type not implemented' rather than accepted, so the gap is loud rather than silent. inference needs a model backend that does not exist; index-build needs a defined build unit."

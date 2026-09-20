@@ -210,6 +210,14 @@ struct qihse_resp_server {
     /* Remote fabric job dispatch. Both owned; stopped and freed on destroy. */
     qihse_fabric_listener_t* fabric_listener;
     qihse_fed_tls_server_t* fabric_tls;
+    /* The submitter half: this node's enrolled identity and private key, kept
+     * so FABRIC.SUBMIT/FETCH can mint capability tokens.  Loaded once at
+     * create; a node that could not load them simply cannot dispatch (the
+     * listener may still serve INBOUND jobs — the two directions are
+     * independent capabilities). */
+    void* fabric_pkey;
+    qihse_uuid_t fabric_node_id;
+    bool fabric_have_identity;
     qihse_cluster_failover_t* failover;
     /* Group update push: monotonic id source + per-update member acks. */
     qihse_hlc_t group_clock;
@@ -7907,11 +7915,14 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
 
     /* EXECUTE, then record what actually happened.
      *
-     * Phase 1 is LOCAL execution only, and the record says so rather than
-     * implying a dispatch that did not occur. When the best-fit node is not
-     * this node the job is recorded as `queued` with the chosen target, which
-     * is the truth: it has been placed but not run. Remote dispatch needs a
-     * transport and a result path that do not exist yet. */
+     * A remote target is dispatched over the federation mTLS channel with a
+     * signed capability token (qihse_fabric_dispatch.h): the executor runs
+     * the job as the TOKEN's principal, owns its own result record, and the
+     * submitter pulls it with FABRIC.FETCH.  The local record therefore says
+     * `pending-fetch` when the job ran remotely — never `done`, because the
+     * result is not in this node's store yet.  When dispatch itself is not
+     * configured on this node the job stays `queued`, which is also the
+     * truth: placed, not run. */
     static uint64_t job_seq = 0;
     uint64_t jid = __atomic_add_fetch(&job_seq, 1, __ATOMIC_RELAXED);
 
@@ -7923,13 +7934,24 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     /* Big enough for either a memory id (36) or an artifact key
      * ("fabric:ingest:<job-id>"). Sized to the larger: at 37 this silently
      * TRUNCATED an artifact key, so FABRIC.RESULT would have handed back a key
-     * that does not exist — a job reporting a result nobody could look up. */
-    char result[128];
+     * that does not exist — a job reporting a result nobody could look up.
+     * Sized to the dispatch result_ref (192) as well, so a remote result
+     * reference cannot truncate either. */
+    char result[192];
     result[0] = '\0';
     const char* status = "queued";
     const char* exec = "none";
     char err[160];
     err[0] = '\0';
+    /* Remote-dispatch fields.  Defaults describe "no remote attempt": they are
+     * part of the job record schema either way, so a local job and a remote
+     * job have the same shape. */
+    char remote_status[32] = "-";
+    unsigned attempts = 0;
+    const char* retry = "-";
+    uint64_t remote_gen = 0;
+    unsigned remote_cls = 0, remote_sci = 0;
+    char remote_digest[97] = "-";
 
     if (is_local) {
         exec = "local";
@@ -7976,23 +7998,160 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
                 }
             }
         }
+    } else {
+        /* Remote target.  The endpoint is the peer's topology address, which
+         * is where its dispatch listener is advertised; the dispatch module
+         * does the token mint, the mTLS dial and the retry policy.  A node
+         * that cannot sign (no enrolled identity) or has no TLS context
+         * cannot dispatch, and the record stays `queued`. */
+        qihse_cluster_node_t target;
+        memset(&target, 0, sizeof target);
+        bool have_target = qihse_cluster_topology_get_node(session->server->topology,
+                                                         best_idx, &target) && target.healthy;
+        if (have_target && session->server->fabric_have_identity &&
+            session->server->fabric_tls && session->server->fabric_pkey) {
+            exec = "remote";
+            char* rbody = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
+            if (!rbody) {
+                status = QIHSE_FABRIC_STATE_FAILED;
+                snprintf(err, sizeof(err), "out of memory");
+            } else {
+                qihse_fabric_run_request_t rreq;
+                memset(&rreq, 0, sizeof rreq);
+                rreq.host = target.host;
+                rreq.port = target.port;
+                rreq.timeout_ms = 5000;
+                rreq.tls = session->server->fabric_tls;
+                rreq.pkey = session->server->fabric_pkey;
+                rreq.submitter_node = session->server->fabric_node_id;
+                rreq.job_type = is_embed ? QIHSE_FABRIC_JOB_EMBED
+                                         : QIHSE_FABRIC_JOB_KEYSTONE_INGEST;
+                rreq.job_id = jid;
+                rreq.payload = payload;
+                rreq.payload_len = plen;
+                /* The principal claims are read from the AUTHENTICATED
+                 * session, never from request arguments. */
+                rreq.principal_user_id = qihse_user_get_id(session->user);
+                rreq.clearance = qihse_user_get_classification(session->user);
+                rreq.sci = qihse_user_get_sci(session->user);
+                rreq.principal_tenant = qihse_user_get_tenant_id(session->user);
+                rreq.scope = QIHSE_FABRIC_SCOPE_RUN;
+                qihse_fabric_run_outcome_t out;
+                memset(&out, 0, sizeof out);
+                out.body = rbody;
+                out.body_cap = QIHSE_FABRIC_MAX_RESPONSE;
+                if (!qihse_fabric_run(&rreq, &out)) {
+                    status = QIHSE_FABRIC_STATE_FAILED;
+                    snprintf(err, sizeof(err), "dispatch request invalid");
+                } else {
+                    attempts = out.attempts;
+                    retry = out.retried ? "retried" : "-";
+                    remote_gen = out.remote_gen;
+                    remote_cls = out.remote_clearance;
+                    remote_sci = out.remote_sci;
+                    if (out.remote_digest[0])
+                        snprintf(remote_digest, sizeof remote_digest, "%s", out.remote_digest);
+                    if (out.remote_status[0])
+                        snprintf(remote_status, sizeof remote_status, "%s", out.remote_status);
+                    if (out.succeeded) {
+                        /* The executor ran the job and owns the result; this
+                         * node has not pulled it.  `pending-fetch` is the
+                         * truth; `done` is only written after FABRIC.FETCH
+                         * caches the record locally. */
+                        status = QIHSE_FABRIC_STATE_PENDING_FETCH;
+                        snprintf(remote_status, sizeof remote_status, "%s", "acked");
+                        if (out.result_ref[0])
+                            snprintf(result, sizeof result, "%s", out.result_ref);
+                    } else if (out.denied) {
+                        status = QIHSE_FABRIC_STATE_DENIED;
+                        snprintf(err, sizeof err, "%s", out.terminal_reason);
+                    } else if (out.gave_up) {
+                        status = QIHSE_FABRIC_STATE_GAVE_UP;
+                        snprintf(err, sizeof err, "%s", out.terminal_reason);
+                    } else {
+                        status = QIHSE_FABRIC_STATE_FAILED;
+                        snprintf(err, sizeof err, "%s",
+                                 out.terminal_reason[0] ? out.terminal_reason
+                                                        : "executor-reported-failure");
+                    }
+                }
+                free(rbody);
+            }
+        }
+        /* Otherwise: dispatch not available on this node.  The record keeps
+         * `queued`, which is the truth — placed, not run, and a caller can
+         * see exec=none and why. */
     }
 
     char job_key[128], job_val[4600];
     snprintf(job_key, sizeof(job_key), "fabric:job:%llu", (unsigned long long)jid);
     snprintf(job_val, sizeof(job_val),
              "{\"type\":\"%s\",\"status\":\"%s\",\"exec\":\"%s\",\"target\":%u,"
-             "\"isa\":%llu,\"npu\":%llu,\"result\":\"%s\",\"err\":\"%s\"}",
+             "\"isa\":%llu,\"npu\":%llu,\"result\":\"%s\",\"err\":\"%s\","
+             "\"remote_status\":\"%s\",\"attempts\":%u,\"retry\":\"%s\","
+             "\"remote_gen\":%llu,\"remote_cls\":%u,\"remote_sci\":%u,"
+             "\"remote_digest\":\"%s\"}",
              job_type, status, exec, (unsigned)best_idx,
-             (unsigned long long)min_isa, (unsigned long long)need_npu, result, err);
+             (unsigned long long)min_isa, (unsigned long long)need_npu, result, err,
+             remote_status, attempts, retry,
+             (unsigned long long)remote_gen, remote_cls, remote_sci, remote_digest);
     pthread_rwlock_wrlock(&session->server->kv_lock);
     bool ok = qihse_kv_set_user(session->server->store, job_key, job_val, 0, 0, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
     if (!ok) return qihse_resp_error(session, "ERR failed to store job");
-    char reply[192];
-    snprintf(reply, sizeof(reply), "job:%llu node:%u status:%s",
-             (unsigned long long)jid, (unsigned)best_idx, status);
+    char reply[320];
+    if (err[0])
+        snprintf(reply, sizeof(reply), "job:%llu node:%u status:%s err:%s",
+                 (unsigned long long)jid, (unsigned)best_idx, status, err);
+    else
+        snprintf(reply, sizeof(reply), "job:%llu node:%u status:%s",
+                 (unsigned long long)jid, (unsigned)best_idx, status);
     return qihse_resp_bulk_text(session, reply);
+}
+
+/* Read one field from the flat job record this file writes ("key":"str" or
+ * "key":num).  It is a record WE produce, not a general JSON parser; anything
+ * that does not fit the shape is simply absent. */
+static bool fabric_job_field(const char* rec, const char* key,
+                             char* out, size_t cap) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char* p = strstr(rec, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    const char* e;
+    if (*p == '"') {
+        p++;
+        e = strchr(p, '"');
+        if (!e) return false;
+    } else {
+        e = p;
+        while (*e && *e != ',' && *e != '}') e++;
+    }
+    size_t n = (size_t)(e - p);
+    if (n == 0 || n >= cap) return false;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* Serve `rec` with its status field replaced.  Used when the cached remote
+ * record no longer verifies: the job record is still the truth about what was
+ * dispatched, but the status must not keep claiming `done`. */
+static bool fabric_job_patch_status(const char* rec, const char* status,
+                                    char* out, size_t cap) {
+    const char* p = strstr(rec, "\"status\":\"");
+    if (!p) return false;
+    p += strlen("\"status\":\"");
+    const char* e = strchr(p, '"');
+    if (!e) return false;
+    size_t head = (size_t)(p - rec);
+    size_t tail = strlen(e);
+    if (head + strlen(status) + tail >= cap) return false;
+    memcpy(out, rec, head);
+    memcpy(out + head, status, strlen(status));
+    memcpy(out + head + strlen(status), e, tail + 1u);
+    return true;
 }
 
 static bool qihse_resp_handle_fabric_result(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -8014,9 +8173,222 @@ static bool qihse_resp_handle_fabric_result(qihse_resp_session_t* session, const
     val = qihse_kv_get_user(session->server->store, job_key, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
     if (!val) return qihse_resp_error(session, "ERR no such job");
+
+    /* A remote job whose result was fetched serves the CACHED record along
+     * with the job record — but only after the cache verifies.  The digest
+     * in the record header must be SHA-384 of the payload bytes that follow
+     * it; a cached copy a local writer has tampered with fails that check and
+     * is reported as cache-corrupt rather than served. */
+    char jstatus[48], jexec[16];
+    if (fabric_job_field(val, "status", jstatus, sizeof jstatus) &&
+        fabric_job_field(val, "exec", jexec, sizeof jexec) &&
+        strcmp(jexec, "remote") == 0 &&
+        (strcmp(jstatus, QIHSE_FABRIC_STATE_DONE) == 0 ||
+         strcmp(jstatus, "stored-unindexed") == 0)) {
+        char cache_key[128];
+        snprintf(cache_key, sizeof cache_key, "fabric:remote-cache:%s",
+                 (const char*)request->argv[2].data);
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        char* cache = qihse_kv_get_user(session->server->store, cache_key, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        bool cache_ok = false;
+        if (cache) {
+            qihse_fabric_response_t parsed;
+            if (qihse_fabric_response_parse(cache, strlen(cache), &parsed) &&
+                parsed.payload_offset + parsed.payload_len <= strlen(cache) &&
+                strcmp(parsed.digest, "-") != 0) {
+                char digest[97];
+                if (qihse_fabric_sha384_hex(cache + parsed.payload_offset,
+                                            parsed.payload_len,
+                                            digest, sizeof digest) &&
+                    strcmp(digest, parsed.digest) == 0) {
+                    cache_ok = true;
+                }
+            }
+        }
+        if (cache_ok) {
+            size_t need = strlen(val) + strlen(cache) + 2u;
+            char* both = (char*)malloc(need);
+            if (both) {
+                snprintf(both, need, "%s\n%s", val, cache);
+                bool ok = qihse_resp_bulk_text(session, both);
+                free(both);
+                free(cache);
+                free(val);
+                return ok;
+            }
+        }
+        /* Missing, unparseable or digest-mismatched: the cache is not
+         * evidence, so the record is served with its real state. */
+        free(cache);
+        char patched[4600];
+        if (fabric_job_patch_status(val, QIHSE_FABRIC_STATE_CACHE_CORRUPT,
+                                    patched, sizeof patched)) {
+            bool ok = qihse_resp_bulk_text(session, patched);
+            free(val);
+            return ok;
+        }
+    }
     bool ok = qihse_resp_bulk_text(session, val);
     free(val);
     return ok;
+}
+
+/* Pull a remote job's result record from the executor and cache it locally.
+ * The job record keeps `pending-fetch` until this succeeds — a refusal leaves
+ * it untouched, because a refusal is not a result. */
+static bool qihse_resp_handle_fabric_fetch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_error(session, "ERR usage: FABRIC FETCH <job-id>");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session, "NOPERM FABRIC.FETCH is system-domain only");
+    }
+    const char* jid_str = (const char*)request->argv[2].data;
+    char job_key[128];
+    snprintf(job_key, sizeof(job_key), "fabric:job:%s", jid_str);
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    char* val = qihse_kv_get_user(session->server->store, job_key, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (!val) return qihse_resp_error(session, "ERR no such job");
+
+    char jstatus[48], jexec[16], jtype[48], jtarget[16], jgen[24];
+    if (!fabric_job_field(val, "status", jstatus, sizeof jstatus) ||
+        !fabric_job_field(val, "exec", jexec, sizeof jexec) ||
+        !fabric_job_field(val, "type", jtype, sizeof jtype) ||
+        !fabric_job_field(val, "target", jtarget, sizeof jtarget)) {
+        free(val);
+        return qihse_resp_error(session, "ERR corrupt job record");
+    }
+    if (strcmp(jexec, "remote") != 0) {
+        free(val);
+        return qihse_resp_error(session, "ERR job was not dispatched remotely");
+    }
+    if (strcmp(jstatus, QIHSE_FABRIC_STATE_PENDING_FETCH) != 0) {
+        /* A terminal state is terminal; an already-fetched job is served
+         * from cache by FABRIC.RESULT. */
+        char reply[160];
+        snprintf(reply, sizeof reply, "job:%s status:%s", jid_str, jstatus);
+        free(val);
+        return qihse_resp_bulk_text(session, reply);
+    }
+    uint64_t cached_gen = 0;
+    if (fabric_job_field(val, "remote_gen", jgen, sizeof jgen))
+        cached_gen = strtoull(jgen, NULL, 10);
+    free(val);
+
+    const qihse_fabric_jobtype_decl_t* decl = qihse_fabric_jobtype_lookup(jtype);
+    if (!decl) return qihse_resp_error(session, "ERR job type has no executor");
+    unsigned tidx = (unsigned)strtoul(jtarget, NULL, 10);
+    qihse_cluster_node_t target;
+    memset(&target, 0, sizeof target);
+    if (!session->server->topology ||
+        !qihse_cluster_topology_get_node(session->server->topology, (uint16_t)tidx, &target) ||
+        !target.healthy) {
+        return qihse_resp_error(session, "ERR fetch target no longer reachable");
+    }
+    if (!session->server->fabric_have_identity || !session->server->fabric_tls ||
+        !session->server->fabric_pkey) {
+        return qihse_resp_error(session, "ERR fabric dispatch identity not configured");
+    }
+
+    char* fbody = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
+    if (!fbody) return qihse_resp_error(session, "ERR out of memory");
+    qihse_fabric_fetch_request_t freq;
+    memset(&freq, 0, sizeof freq);
+    freq.host = target.host;
+    freq.port = target.port;
+    freq.timeout_ms = 5000;
+    freq.tls = session->server->fabric_tls;
+    freq.pkey = session->server->fabric_pkey;
+    freq.submitter_node = session->server->fabric_node_id;
+    freq.job_type = decl->type;
+    freq.job_id = strtoull(jid_str, NULL, 10);
+    freq.principal_user_id = qihse_user_get_id(session->user);
+    freq.clearance = qihse_user_get_classification(session->user);
+    freq.sci = qihse_user_get_sci(session->user);
+    freq.principal_tenant = qihse_user_get_tenant_id(session->user);
+    freq.scope = QIHSE_FABRIC_SCOPE_FETCH;
+    freq.cached_gen = cached_gen;
+    freq.have_cached_gen = cached_gen != 0;
+    qihse_fabric_fetch_outcome_t fout;
+    memset(&fout, 0, sizeof fout);
+    fout.body = fbody;
+    fout.body_cap = QIHSE_FABRIC_MAX_RESPONSE;
+    if (!qihse_fabric_fetch(&freq, &fout)) {
+        free(fbody);
+        return qihse_resp_error(session, "ERR fetch request invalid");
+    }
+    if (!fout.answered) {
+        char reply[160];
+        snprintf(reply, sizeof reply, "fetch-failed job:%s reason:%s",
+                 jid_str, fout.terminal_reason[0] ? fout.terminal_reason : "no-answer");
+        free(fbody);
+        return qihse_resp_bulk_text(session, reply);
+    }
+    if (fout.refused) {
+        /* A refusal is not a result: the job record stays pending-fetch and
+         * nothing is cached.  The reason is reported verbatim so the caller
+         * can see WHY (above-clearance, stale, denied). */
+        char reply[192];
+        snprintf(reply, sizeof reply, "refused job:%s reason:%s",
+                 jid_str, fout.terminal_reason[0] ? fout.terminal_reason : "denied");
+        free(fbody);
+        return qihse_resp_bulk_text(session, reply);
+    }
+    qihse_fabric_response_t parsed;
+    if (!qihse_fabric_response_parse(fbody, fout.body_len, &parsed)) {
+        free(fbody);
+        return qihse_resp_error(session, "ERR unparseable remote record");
+    }
+
+    /* Cache the executor's record under its own classification, then move the
+     * job record to the executor's reported status.  The cache is what
+     * FABRIC.RESULT serves, and its digest is what keeps a tampered copy from
+     * being served. */
+    char cache_key[128];
+    snprintf(cache_key, sizeof cache_key, "fabric:remote-cache:%s", jid_str);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    bool cached = qihse_kv_set_user(session->server->store, cache_key, fbody,
+                                    parsed.clearance, parsed.sci, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (!cached) {
+        free(fbody);
+        return qihse_resp_error(session, "ERR failed to cache remote record");
+    }
+
+    char jisa[16] = "0", jnpu[16] = "0", jresult[192] = "", jerr[160] = "";
+    {
+        /* Re-read the record fields that survive the update. */
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        char* old = qihse_kv_get_user(session->server->store, job_key, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (old) {
+            (void)fabric_job_field(old, "isa", jisa, sizeof jisa);
+            (void)fabric_job_field(old, "npu", jnpu, sizeof jnpu);
+            (void)fabric_job_field(old, "err", jerr, sizeof jerr);
+            free(old);
+        }
+        if (parsed.result[0] && strcmp(parsed.result, "-") != 0)
+            snprintf(jresult, sizeof jresult, "%s", parsed.result);
+    }
+    char job_val[4600];
+    snprintf(job_val, sizeof job_val,
+             "{\"type\":\"%s\",\"status\":\"%s\",\"exec\":\"remote\",\"target\":%u,"
+             "\"isa\":%s,\"npu\":%s,\"result\":\"%s\",\"err\":\"%s\","
+             "\"remote_status\":\"%s\",\"attempts\":1,\"retry\":\"-\","
+             "\"remote_gen\":%llu,\"remote_cls\":%u,\"remote_sci\":%u,"
+             "\"remote_digest\":\"%s\"}",
+             jtype, parsed.status, tidx, jisa, jnpu, jresult, jerr,
+             parsed.status, (unsigned long long)parsed.gen,
+             (unsigned)parsed.clearance, (unsigned)parsed.sci,
+             parsed.record_digest[0] ? parsed.record_digest : "-");
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    (void)qihse_kv_set_user(session->server->store, job_key, job_val, 0, 0, session->user);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+
+    char reply[256];
+    snprintf(reply, sizeof reply, "fetched job:%s status:%s", jid_str, parsed.status);
+    free(fbody);
+    return qihse_resp_bulk_text(session, reply);
 }
 
 /* ---------------------------------------------------------------------------
@@ -8103,7 +8475,7 @@ static const qihse_resp_qtype_ent_t g_qtype_table[] = {
     {"keystone.ingest", QIHSE_QUERY_TYPE_KEYSTONE},
     {"keystone.classify", QIHSE_QUERY_TYPE_KEYSTONE},
     {"fabric.caps", QIHSE_QUERY_TYPE_FABRIC}, {"fabric.submit", QIHSE_QUERY_TYPE_FABRIC},
-    {"fabric.result", QIHSE_QUERY_TYPE_FABRIC},
+    {"fabric.result", QIHSE_QUERY_TYPE_FABRIC}, {"fabric.fetch", QIHSE_QUERY_TYPE_FABRIC},
     /* control plane */
     {"cluster", QIHSE_QUERY_TYPE_CLUSTER}, {"migrate", QIHSE_QUERY_TYPE_CLUSTER},
     {"asking", QIHSE_QUERY_TYPE_CLUSTER}, {"readonly", QIHSE_QUERY_TYPE_CLUSTER},
@@ -8353,6 +8725,7 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
         if (qihse_resp_arg_equal(&request->argv[1], "SUBMIT")) return qihse_resp_handle_fabric_submit(session, request);
         if (qihse_resp_arg_equal(&request->argv[1], "RESULT") && request->argc == 3) return qihse_resp_handle_fabric_result(session, request);
+        if (qihse_resp_arg_equal(&request->argv[1], "FETCH")) return qihse_resp_handle_fabric_fetch(session, request);
     }
     if (qihse_resp_command_is(request, "CLUSTER")) {
         qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session };
@@ -9000,6 +9373,14 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
                 have_self = qihse_fabric_node_signer_load(server->store, qihse_auth_get_user(0),
                                                           &self_id, &self_identity, &self_pkey);
             }
+            if (have_self) {
+                /* Kept for the OUTBOUND direction: FABRIC.SUBMIT/FETCH mint
+                 * capability tokens with this key.  Previously self_pkey was
+                 * loaded, used to prove enrollability, and leaked. */
+                server->fabric_pkey = self_pkey;
+                server->fabric_node_id = self_id;
+                server->fabric_have_identity = true;
+            }
             if (!have_self) {
                 fprintf(stderr, "qihse: fabric dispatch enabled but this node has no loadable "
                                 "enrolled identity; dispatch is NOT running\n");
@@ -9155,6 +9536,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (server->owns_failover && server->failover) qihse_cluster_failover_destroy(server->failover);
     if (server->fabric_listener) qihse_fabric_listener_stop(server->fabric_listener);
     if (server->fabric_tls) qihse_federation_tls_server_destroy(server->fabric_tls);
+    if (server->fabric_pkey) qihse_federation_node_key_free(server->fabric_pkey);
     if (server->owns_bus && server->bus) qihse_cluster_bus_destroy(server->bus);
     if (server->owns_guard_window && server->guard_window) qihse_system_guard_window_destroy(server->guard_window);
     if (server->owns_scatter && server->scatter) qihse_cluster_scatter_destroy(server->scatter);

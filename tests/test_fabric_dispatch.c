@@ -46,6 +46,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
@@ -341,7 +342,7 @@ static void run_cmd(qihse_resp_server_t* server, qihse_user_t* user,
     qihse_resp_arg_t args[8];
     assert(argc <= 8u);
     for (size_t i = 0; i < argc; i++) {
-        args[i].data = (char*)argv[i];
+        args[i].data = (uint8_t*)argv[i];
         args[i].len = strlen(argv[i]);
     }
     uint8_t* reply = NULL;
@@ -638,8 +639,13 @@ static void test_refusal_paths(void) {
     claims.principal_user_id = qihse_user_get_id(g_low);
     claims.submitter_node = g_id_a.node_id;
     claims.job_id = 5555u;
-    claims.issued_ms = 1000u;
-    claims.expires_ms = 1000u + 60000u;
+    /* The executor checks against ITS OWN clock (there is no now_ms override
+     * on this path), so a live token needs real time, not a fixture. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t now_ms = (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
+    claims.issued_ms = now_ms;
+    claims.expires_ms = now_ms + 60000u;
     claims.payload_len = (uint32_t)payload_len;
     {
         char hex[97];
@@ -682,8 +688,8 @@ static void test_refusal_paths(void) {
     assert(strstr(body, "token-expired") != NULL);
 
     /* A token that names a node the executor has never enrolled: refused. */
-    claims.issued_ms = 1000u;
-    claims.expires_ms = 1000u + 60000u;
+    claims.issued_ms = now_ms;
+    claims.expires_ms = now_ms + 60000u;
     qihse_uuid_t real = claims.submitter_node;
     assert(qihse_uuid_generate(&claims.submitter_node));
     assert(qihse_uuid_generate(&claims.nonce));
@@ -781,7 +787,7 @@ int main(void) {
     char cert_a[QIHSE_FEDERATION_PEM_MAX], cert_b[QIHSE_FEDERATION_PEM_MAX];
     assert(qihse_federation_ca_issue_node(ca_key_path, ca, &g_id_a, 1, cert_a, sizeof(cert_a)));
     assert(qihse_federation_ca_issue_node(ca_key_path, ca, &g_id_b, 1, cert_b, sizeof(cert_b)));
-    char cert_a_path[512], cert_b_path[512];
+    char cert_a_path[1024], cert_b_path[1024];
     snprintf(cert_a_path, sizeof(cert_a_path), "%s/node-a.crt", ca_dir);
     snprintf(cert_b_path, sizeof(cert_b_path), "%s/node-b.crt", ca_dir);
     {

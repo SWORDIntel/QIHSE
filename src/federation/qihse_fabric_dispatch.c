@@ -867,6 +867,17 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
         return true;
     }
 
+    /* The wire payload is a counted byte range, NOT a C string: it sits in
+     * the frame buffer with no NUL, and the executors below take strings.
+     * Storing `payload` directly let strlen() run past payload_len into frame
+     * slack — the artifact came out as the payload plus whatever bytes
+     * followed it on the heap.  Bound it, terminate it, use the copy. */
+    char payload_str[QIHSE_FABRIC_MAX_PAYLOAD + 1u];
+    memcpy(payload_str, payload, payload_len);
+    payload_str[payload_len] = '\0';
+    payload = payload_str;
+    payload_len = strlen(payload_str);
+
     qihse_user_t remote_ctx;
     fabric_remote_context(&remote_ctx, claims);
 
@@ -1030,7 +1041,8 @@ bool qihse_fabric_executor_run(qihse_fabric_executor_t* ex,
 
     qihse_fabric_token_t verified;
     qihse_fabric_token_verdict_t verdict =
-        qihse_fabric_token_check(ex->server, ex->local_user, body, body_len, &check, &verified);
+        qihse_fabric_token_check(qihse_resp_server_store(ex->server), ex->local_user,
+                                 body, body_len, &check, &verified);
     if (verdict != QIHSE_FABRIC_TOKEN_OK) {
         fabric_refusal_body(qihse_fabric_token_verdict_name(verdict), claims.job_type,
                             claims.job_id, out_body, out_cap, out_len);
@@ -1072,16 +1084,16 @@ bool qihse_fabric_executor_fetch(qihse_fabric_executor_t* ex,
     check.required_scope = QIHSE_FABRIC_SCOPE_FETCH;
     check.consume = true;
 
+    qihse_kv_store_t* store = qihse_resp_server_store(ex->server);
     qihse_fabric_token_t verified;
     qihse_fabric_token_verdict_t verdict =
-        qihse_fabric_token_check(ex->server, ex->local_user, body, body_len, &check, &verified);
+        qihse_fabric_token_check(store, ex->local_user, body, body_len, &check, &verified);
     if (verdict != QIHSE_FABRIC_TOKEN_OK) {
         fabric_refusal_body(qihse_fabric_token_verdict_name(verdict), claims.job_type,
                             claims.job_id, out_body, out_cap, out_len);
         return true;
     }
 
-    qihse_kv_store_t* store = qihse_resp_server_store(ex->server);
     char key[128];
     if (!store || !qihse_fabric_remote_result_key(&verified.submitter_node, verified.job_id,
                                                   key, sizeof(key))) {

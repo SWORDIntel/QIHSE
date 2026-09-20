@@ -5,9 +5,11 @@
 > reachability chain covered by the `gold-fabric-durable-caps` workload in
 > `tests/gold/pack.v1.gold`. Item 2 is `implemented` and verified by
 > `tests/test_fabric_index.c`. Item 3 is `partial`: `FABRIC.SUBMIT` executes
-> two job types locally and refuses the other two, and it does not dispatch to
-> another node — both gaps are recorded in `tests/gold/pack.v1.gold` under the
-> `ai-fabric` area. Item 4 is `implemented` and verified by
+> two job types locally and refuses the other two, and it dispatches to a
+> peer over the federation mTLS channel under a signed capability token
+> (`src/federation/qihse_fabric_dispatch.c`, verified by
+> `tests/test_fabric_dispatch.c`); the remaining gaps are recorded in
+> `tests/gold/pack.v1.gold` under the `ai-fabric` area. Item 4 is `implemented` and verified by
 > `tests/test_brain_actuate.c` (R1/R4) and `tests/test_brain_fed_journal.c`
 > (W3.4). Item 5 is `implemented` and verified by `tests/test_ai_memory.c`
 > (including an RBAC negative test). Embedding-backed semantic recall is no
@@ -103,16 +105,17 @@ Postgres, no platform glue.
 ### 3. Fabric job model
 
 > **Status: partial** — the local executors and the refusal path are verified
-> by `tests/test_fabric_jobs.c`. Remote dispatch does not exist
-> (`ai-fabric/remote-dispatch` gap in `tests/gold/pack.v1.gold`), and two of
-> the four named job types have no executor
-> (`ai-fabric/inference-executors`).
+> by `tests/test_fabric_jobs.c`, and remote dispatch is verified by
+> `tests/test_fabric_dispatch.c` (the `fabric-remote-dispatch` workload in
+> `tests/gold/pack.v1.gold`). Two of the four named job types have no executor
+> (`ai-fabric/inference-executors`), and dispatch endpoint discovery still
+> rides the topology address (`ai-fabric/dispatch-endpoint-discovery`).
 
 - The command surface is RESP, not the bus job frame this item originally
   specified: `FABRIC.CAPS`, `FABRIC.SUBMIT [<type>] <min_isa> <need_npu>
-  <payload>`, `FABRIC.RESULT <job-id>`. `FABRIC.SUBMIT` and `FABRIC.RESULT`
-  are refused outside the system tenant. The original four-argument form
-  (`FABRIC.SUBMIT <min_isa> <need_npu> <payload>`) is retained and is an
+  <payload>`, `FABRIC.RESULT <job-id>`, `FABRIC.FETCH <job-id>`. The FABRIC
+  commands are refused outside the system tenant. The original four-argument
+  form (`FABRIC.SUBMIT <min_isa> <need_npu> <payload>`) is retained and is an
   `embed` job.
 - Two executors exist, both LOCAL:
   - `embed` turns the payload into an AI memory, so the result is indexed for
@@ -123,13 +126,22 @@ Postgres, no platform glue.
     `stored-unindexed` status rather than as success.
 - `inference` and `index-build` are REFUSED with `job type not implemented`,
   rather than accepted and silently ignored.
-- There is NO remote dispatch. A job whose best-fit node is another node is
-  recorded `queued` with the chosen target and never runs; it is recorded
-  `queued` rather than `done` so the record does not claim a dispatch that did
-  not happen. Placement picks the lowest `load_pct` among nodes meeting the
+- Remote dispatch is implemented (`src/federation/qihse_fabric_dispatch.c`).
+  A job whose best-fit node is a peer is sent over the federation mTLS
+  channel with a signed capability token binding job type, job id, payload
+  digest, submitter node, principal claims, scope and expiry; the executor
+  verifies it against the mTLS peer and a replay ledger, runs the job as the
+  token's principal — never the executor's own — and owns the result record.
+  The submitter's record is `pending-fetch` until `FABRIC.FETCH` pulls and
+  caches the record locally; a tampered cache is reported `cache-corrupt`,
+  not served. Retry is per-type: only types that declare idempotency
+  (`keystone-ingest`) are retried, and `gave-up` is distinct from `failed`.
+  When dispatch is not configured the record stays `queued`, which is the
+  truth. Placement picks the lowest `load_pct` among nodes meeting the
   ISA/NPU requirement from the live hint table, then falls back to the local
   node's durable record so a single-node fabric can place work at all;
-  reachability is not consulted.
+  reachability is not consulted, and the dispatch endpoint is the peer's
+  topology `host:port` (see `ai-fabric/dispatch-endpoint-discovery`).
 - Job records live at `fabric:job:<job-id>` and ARE the result `FABRIC.RESULT`
   returns. The job frame this item specified — payload blob hash, priority,
   bus or task-queue dispatch — was not built: there is no priority field, no
