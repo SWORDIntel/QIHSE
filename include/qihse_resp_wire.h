@@ -22,12 +22,18 @@
 #include "qihse_task_scheduler.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
+/* Forward-declared: the full FTS type lives in qihse_fts.h and is only
+ * dereferenced by the fusion path in the engine. */
+typedef struct qihse_fts_index qihse_fts_index_t;
 
 typedef struct {
     qihse_kv_store_t* store;
     qihse_vector_db_t vdb;
     qihse_tsdb_t* tsdb;
     qihse_column_store_t* column_store;
+    /* Optional full-text index for VECHYBRID (hybrid FTS+vector RRF
+     * fusion).  Caller-owned; NULL = VECHYBRID refuses explicitly. */
+    qihse_fts_index_t* fts;
     qihse_cluster_topology_t* topology;
     const char* bind_address;
     const char* advertise_address;

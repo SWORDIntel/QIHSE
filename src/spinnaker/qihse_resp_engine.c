@@ -17,6 +17,7 @@
 #include "qihse_keystone.h"
 #include "qihse_fabric_dispatch.h"
 #include "qihse_fabric_index.h"
+#include "qihse_fusion.h"
 /* The claims context CLUSTER PEERAUTH installs needs the user STRUCT by
  * value — the same narrow, deliberate use of the internal representation
  * qihse_fabric_dispatch.c makes for its remote context: the struct it
@@ -194,6 +195,8 @@ struct qihse_resp_server {
     qihse_vector_db_t vdb;
     qihse_tsdb_t* tsdb;
     qihse_column_store_t* column_store;
+    /* Optional full-text index for VECHYBRID.  Caller-owned, like vdb. */
+    qihse_fts_index_t* fts;
     qihse_cluster_topology_t* topology;
     bool owns_topology;
     char bind_address[QIHSE_CLUSTER_HOST_LEN + 1u];
@@ -384,6 +387,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"ttl", 2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, 1, 1},
     {"type", 2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, 1, 1},
     {"vecget", -2, QIHSE_COMMAND_READONLY, 1, 1, 1},
+    {"vechybrid", -6, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"vecscatter", -4, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"vecsearch", -4, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"vecset", -4, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1}
@@ -1733,6 +1737,102 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
     }
     free(vector);
     free(results);
+    return response;
+}
+
+/* VECHYBRID <dims> <topk> <v0..> FTS <query>
+ *
+ * Hybrid FTS+vector search: the vector clause is one multimodal query and
+ * the FTS clause supplies a BM25-ranked modality; the two are fused with
+ * Reciprocal Rank Fusion by qihse_vector_db_search_multimodal.  The caller's
+ * authenticated context is passed through — a NULL user is refused inside
+ * the fusion layer, and this handler never fabricates one.
+ *
+ * The FTS clause is REQUIRED: this command exists to exercise the fused
+ * path, and a plain vector search is VECSEARCH's job.  An unconfigured FTS
+ * index is an explicit error, not a silent fallback to vector-only. */
+static bool qihse_resp_handle_vechybrid(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 4 || !session->server->vdb)
+        return !session->server->vdb
+            ? qihse_resp_error(session, "ERR vector database is not configured")
+            : qihse_resp_wrong_arity(session, "vechybrid");
+    uint64_t dims_u64, top_u64;
+    if (!qihse_resp_parse_u64_arg(&request->argv[1], &dims_u64) ||
+        !qihse_resp_parse_u64_arg(&request->argv[2], &top_u64) ||
+        dims_u64 == 0 || dims_u64 > 65536u || top_u64 == 0 || top_u64 > 10000u)
+        return qihse_resp_error(session, "ERR invalid hybrid search parameters");
+    size_t dims = (size_t)dims_u64;
+    size_t top_k = (size_t)top_u64;
+    if (request->argc != 3u + dims + 2u ||
+        !qihse_resp_arg_equal(&request->argv[3u + dims], "FTS"))
+        return qihse_resp_error(session, "ERR invalid hybrid search format (expected: VECHYBRID <dims> <topk> <v...> FTS <query>)");
+    const qihse_resp_arg_t* fts_arg = &request->argv[3u + dims + 1u];
+    if (fts_arg->len == 0 || fts_arg->len >= 1024u)
+        return qihse_resp_error(session, "ERR invalid FTS query");
+    if (!session->server->fts)
+        return qihse_resp_error(session, "ERR full-text index is not configured");
+
+    float* vector = (float*)malloc(dims * sizeof(*vector));
+    if (!vector) return qihse_resp_error(session, "OOM out of memory");
+    bool valid = true;
+    for (size_t i = 0; i < dims; i++) {
+        double value;
+        if (!qihse_resp_parse_double_arg(&request->argv[3u + i], &value) ||
+            value < -FLT_MAX || value > FLT_MAX) {
+            valid = false;
+            break;
+        }
+        vector[i] = (float)value;
+    }
+    if (!valid) {
+        free(vector);
+        return qihse_resp_error(session, "ERR invalid vector search format");
+    }
+    /* The FTS arg is a RESP bulk string and is not NUL-terminated; copy it
+     * into a bounded buffer for the text-query API. */
+    char* fts_query = (char*)malloc(fts_arg->len + 1u);
+    if (!fts_query) {
+        free(vector);
+        return qihse_resp_error(session, "OOM out of memory");
+    }
+    memcpy(fts_query, fts_arg->data, fts_arg->len);
+    fts_query[fts_arg->len] = '\0';
+
+    qihse_multimodal_query_t mq;
+    memset(&mq, 0, sizeof(mq));
+    mq.vector = vector;
+    mq.dim = dims;
+    mq.modality = "vector";
+    mq.weight = 1.0f;
+    qihse_multimodal_request_t mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.queries = &mq;
+    mreq.num_queries = 1u;
+    mreq.top_k = (int)top_k;
+    mreq.user = session->user;
+    mreq.fts_index = session->server->fts;
+    mreq.fts_query = fts_query;
+    mreq.fts_weight = 1.0f;
+
+    pthread_mutex_lock(&session->server->vdb_lock);
+    size_t n = 0;
+    qihse_fusion_result_t* fused =
+        qihse_vector_db_search_multimodal(session->server->vdb, &mreq, &n);
+    pthread_mutex_unlock(&session->server->vdb_lock);
+    free(vector);
+    free(fts_query);
+    if (!fused)
+        return qihse_resp_error(session, "ERR hybrid search failed");
+    /* Each result is [id, fused RRF score, semantic class].  The class is the
+     * 6-class neural metadata the fusion layer resolved for the candidate. */
+    bool response = qihse_resp_array(session, n);
+    for (size_t i = 0; response && i < n; i++) {
+        response = qihse_resp_array(session, 3u) &&
+                   qihse_resp_integer(session, (int64_t)fused[i].id) &&
+                   qihse_resp_reply_double(session, fused[i].score) &&
+                   qihse_resp_integer(session, (int64_t)fused[i].semantic_class);
+    }
+    free(fused);
     return response;
 }
 
@@ -4612,7 +4712,8 @@ static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_r
     if (qihse_resp_command_is(request, "BUNDLE.PREPARE")) {
         quota_class = QIHSE_QUOTA_BUNDLE_PULL;
         chargeable = true;
-    } else if (qihse_resp_command_is(request, "VECSEARCH") || qihse_resp_command_is(request, "VECSCATTER")) {
+    } else if (qihse_resp_command_is(request, "VECSEARCH") || qihse_resp_command_is(request, "VECSCATTER") ||
+               qihse_resp_command_is(request, "VECHYBRID")) {
         quota_class = QIHSE_QUOTA_ANN_QUERY;
         chargeable = true;
     } else {
@@ -5104,6 +5205,7 @@ static bool dsp_incr(qihse_resp_session_t* s, const qihse_resp_request_t* r)    
 static bool dsp_decr(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_increment(s, r, -1); }
 static bool dsp_vecsearch(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_vecsearch(s, r, false); }
 static bool dsp_vecscatter(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_vecsearch(s, r, true); }
+static bool dsp_vechybrid(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_vechybrid(s, r); }
 static bool dsp_lpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_lpush(s, r, true); }
 static bool dsp_rpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_lpush(s, r, false); }
 static bool dsp_lpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_lpop(s, r, true); }
@@ -5156,6 +5258,7 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"type", dsp_type, DSP_KEY_1KV},
     {"vecset", qihse_resp_handle_vecset, DSP_BUSY_WRITE | DSP_KEY_VECTAG},
     {"vecget", qihse_resp_handle_vecget, DSP_KEY_VECTAG},
+    {"vechybrid", dsp_vechybrid, DSP_KEY_VECSEARCH},
     {"vecsearch", dsp_vecsearch, DSP_KEY_VECSEARCH}, {"vecscatter", dsp_vecscatter, 0},
     {"ts.add", qihse_resp_handle_ts_add, DSP_BUSY_WRITE | DSP_KEY_1},
     {"ts.range", qihse_resp_handle_ts_range, DSP_KEY_1},
@@ -8729,6 +8832,7 @@ static const qihse_resp_qtype_ent_t g_qtype_table[] = {
     /* model-specific engines */
     {"vecset", QIHSE_QUERY_TYPE_VECTOR}, {"vecget", QIHSE_QUERY_TYPE_VECTOR},
     {"vecsearch", QIHSE_QUERY_TYPE_VECTOR}, {"vecscatter", QIHSE_QUERY_TYPE_VECTOR},
+    {"vechybrid", QIHSE_QUERY_TYPE_VECTOR},
     {"ts.add", QIHSE_QUERY_TYPE_TIMESERIES}, {"ts.range", QIHSE_QUERY_TYPE_TIMESERIES},
     {"col.append", QIHSE_QUERY_TYPE_COLUMN}, {"col.sum", QIHSE_QUERY_TYPE_COLUMN},
     {"col.minmax", QIHSE_QUERY_TYPE_COLUMN},
@@ -9372,6 +9476,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->vdb = supplied->vdb;
     server->tsdb = supplied->tsdb;
     server->column_store = supplied->column_store;
+    server->fts = supplied->fts;
     server->port = supplied->port;
     server->bus_port = supplied->bus_port;
     server->max_clients = supplied->max_clients;

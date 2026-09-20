@@ -183,8 +183,16 @@ workload fts-vector-rrf area=fts-vector-fusion expect=pass timeout=300 \
     output="ALL PASS" \
     run="make -s test-neural-fts-fusion"
 
-gap fts-vector-fusion/server-path area=fts-vector-fusion \
-    reason="fusion is verified in-process through qihse_vector_db_search_multimodal(); no test drives hybrid FTS+vector search through a protocol adapter or the server, and there is no recall/latency gate for the fused ranking"
+# VECHYBRID: hybrid FTS+vector RRF fusion through the RESP server path,
+# including the low-clearance/high-data negative test (invariant 3) and
+# explicit refusal when the FTS clause is missing or the index unconfigured.
+workload resp-hybrid-fusion area=fts-vector-fusion expect=pass timeout=300 \
+    output="test_resp_hybrid: all hybrid FTS+vector server-path tests passed" \
+    ref="src/spinnaker/qihse_resp_engine.c" \
+    run="make -s test-resp-hybrid"
+
+gap fts-vector-fusion/recall-latency-gate area=fts-vector-fusion \
+    reason="the fused path is now driven over RESP (VECHYBRID) and verified end to end including the invariant-3 negative test; what remains uncovered is a recall/latency gate for the fused ranking — a scored benchmark workload, not a correctness path"
 
 # ----------------------------------------------------------------------------
 # 5. Persistence / recovery
