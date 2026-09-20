@@ -510,6 +510,30 @@ void hnsw_destroy(qihse_hnsw_index_t *index) {
     free(index);
 }
 
+size_t qihse_hnsw_index_bytes(const qihse_hnsw_index_t *index) {
+    if (!index) return 0;
+    size_t total = sizeof(*index);
+    total += (size_t)index->layers_capacity * sizeof(qihse_hnsw_layer_t*);
+    if (index->layers) {
+        for (uint32_t i = 0; i < index->layers_capacity; i++) {
+            const qihse_hnsw_layer_t* layer = index->layers[i];
+            if (!layer) continue;
+            total += sizeof(*layer);
+            total += (size_t)layer->links_capacity * sizeof(qihse_hnsw_links_t*);
+            if (!layer->links) continue;
+            for (uint32_t j = 0; j < layer->links_capacity; j++) {
+                const qihse_hnsw_links_t* links = layer->links[j];
+                if (!links) continue;
+                total += sizeof(*links);
+                total += (size_t)links->capacity * sizeof(uint32_t);
+            }
+        }
+    }
+    total += index->anchor_capacity *
+             (sizeof(int64_t) + sizeof(uint32_t));
+    return total;
+}
+
 /* ===========================================================================
  * Anchor-Guided Vector Proximity Seeding
  * ---------------------------------------------------------------------------

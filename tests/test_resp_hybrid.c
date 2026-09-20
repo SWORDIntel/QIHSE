@@ -107,7 +107,7 @@ int main(void) {
     g_server = qihse_resp_server_create(&cfg);
     assert(g_server != NULL);
 
-    char reply[8192];
+    char reply[65536];
 
     /* ── fused path returns real merged rows ─────────────────────────── */
     const char* hyb[] = { "VECHYBRID", "4", "3", "1", "0", "0", "0",
@@ -160,6 +160,19 @@ int main(void) {
     assert(!reply_has_id(reply, 4));
     printf("PASS vechybrid: classified doc filtered out for low-clearance "
            "principal (invariant 3)\n");
+
+    /* ── qihse_index_bytes{index="hnsw"} is emitted by the same server ── */
+    {
+        const char* rend[] = { "METRICS.RENDER" };
+        assert(run_cmd(op, 1u, rend, reply, sizeof reply));
+        assert(strstr(reply, "qihse_index_bytes{index=\"hnsw\"}") != NULL);
+        /* The FTS backend reports real availability now that config.fts
+         * exists — previously it was pinned at 0 regardless. */
+        assert(strstr(reply, "qihse_backend_available{backend=\"fts\"} 1")
+               != NULL);
+        printf("PASS vechybrid: index-bytes + backend-availability metrics "
+               "emitted\n");
+    }
 
     qihse_resp_server_destroy(g_server);
     qihse_fts_destroy(fts);

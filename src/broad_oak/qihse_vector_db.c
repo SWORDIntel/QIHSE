@@ -7871,6 +7871,14 @@ bool qihse_vector_db_get_memory_usage(
     return true;
 }
 
+size_t qihse_vector_db_index_bytes(qihse_vector_db_t vdb) {
+    if (!vdb) return 0;
+    /* The HNSW graph is the index the vector db owns; it holds topology and
+     * projections only — the vectors themselves are counted by
+     * qihse_vector_db_get_memory_usage.  0 when no graph sidecar exists. */
+    return vdb->hnsw_index ? qihse_hnsw_index_bytes(vdb->hnsw_index) : 0;
+}
+
 bool qihse_vector_db_get_persistence_stats(
     qihse_vector_db_t vdb,
     qihse_vector_db_persistence_stats_t* stats

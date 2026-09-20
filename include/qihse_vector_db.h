@@ -465,6 +465,17 @@ bool qihse_vector_db_get_memory_usage(
 );
 
 /**
+ * Approximate heap footprint of the index structures the db owns (the HNSW
+ * graph's layers, link tables and anchor projections).  Vector payloads are
+ * NOT included — they are counted by get_memory_usage.  Returns 0 when no
+ * graph sidecar exists.
+ *
+ * @param vdb Vector database handle
+ * @return Bytes of index topology
+ */
+size_t qihse_vector_db_index_bytes(qihse_vector_db_t vdb);
+
+/**
  * Checkpoint durable state by flushing the current snapshot and clearing WAL
  * records at or before the committed generation.
  *

@@ -182,6 +182,9 @@ typedef struct {
     qihse_metric_series_t* kv_keys;
     qihse_metric_series_t* vector_bytes_in_ram;
     qihse_metric_series_t* vector_rows_spilled;
+    /* qihse_index_bytes{index}: one member per index type the server can
+     * sample — "hnsw" (the vector db's graph) today. */
+    qihse_metric_series_t* index_bytes_hnsw;
     qihse_metric_series_t* label_rejected;
     /* Scrape-time status: network/XDP. */
     qihse_metric_series_t* xdp_frames_rx;
@@ -5037,6 +5040,20 @@ static void qihse_resp_telemetry_register(qihse_resp_server_t* server) {
                                "Vector bytes resident in RAM", METRIC_GAUGE);
     qihse_resp_telemetry_gauge(reg, &server->tlm.vector_rows_spilled, "qihse_vector_rows_spilled",
                                "Vector rows evicted to the spill file", METRIC_GAUGE);
+    /* Index byte accounting as a bounded family: the label value set is the
+     * index types the server can actually sample, so a new member is a code
+     * change, not a client-controlled series.  Vector payload bytes live on
+     * qihse_vector_bytes_in_ram; this is index TOPOLOGY only. */
+    {
+        const char* index_names[] = { "hnsw" };
+        if (qihse_metrics_register_bounded(reg, "qihse_index_bytes",
+                                           "Heap bytes held by an index's topology (vectors excluded)",
+                                           METRIC_GAUGE, "index",
+                                           index_names, 1u) == 0) {
+            server->tlm.index_bytes_hnsw =
+                qihse_metrics_series(reg, "qihse_index_bytes", "hnsw");
+        }
+    }
     qihse_resp_telemetry_gauge(reg, &server->tlm.label_rejected, "qihse_metrics_label_rejected_total",
                                "Attempts to use a label value outside its declared value set", METRIC_COUNTER);
     qihse_resp_telemetry_gauge(reg, &server->tlm.xdp_frames_rx, "qihse_xdp_frames_rx_total",
@@ -5136,7 +5153,10 @@ static void qihse_resp_metrics_sample(qihse_resp_server_t* server) {
         qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_GRAPH], 0.0);
     }
     if (t->backend_available[QIHSE_ENGINE_BACKEND_FTS]) {
-        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_FTS], 0.0);
+        /* The server does hold an FTS handle when the operator wires one
+         * (config.fts, for VECHYBRID) — report it honestly. */
+        qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_FTS],
+                                 server->fts ? 1.0 : 0.0);
     }
     if (t->backend_available[QIHSE_ENGINE_BACKEND_CONTROL]) {
         qihse_metrics_series_set(t->backend_available[QIHSE_ENGINE_BACKEND_CONTROL], 1.0);
@@ -5157,6 +5177,17 @@ static void qihse_resp_metrics_sample(qihse_resp_server_t* server) {
             if (t->vector_bytes_in_ram) qihse_metrics_series_set(t->vector_bytes_in_ram, (double)in_ram);
             if (t->vector_rows_spilled) qihse_metrics_series_set(t->vector_rows_spilled, (double)spilled);
         }
+    }
+    if (t->index_bytes_hnsw) {
+        /* 0 when no graph sidecar exists — the metric reports the index's
+         * real footprint, not a fabricated estimate. */
+        size_t ib = 0;
+        if (server->vdb) {
+            pthread_mutex_lock(&server->vdb_lock);
+            ib = qihse_vector_db_index_bytes(server->vdb);
+            pthread_mutex_unlock(&server->vdb_lock);
+        }
+        qihse_metrics_series_set(t->index_bytes_hnsw, (double)ib);
     }
 
     /* ── Network / XDP ── */

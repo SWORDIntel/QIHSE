@@ -119,6 +119,13 @@ void qihse_hnsw_anchor_seed_search(qihse_hnsw_index_t *index,
 // Free anchor-seeding state owned by the index (invoked by hnsw_destroy).
 void qihse_hnsw_anchor_destroy(qihse_hnsw_index_t *index);
 
+/* Approximate heap footprint of the index: the layers array, per-layer link
+ * tables, per-node link records and their neighbor arrays, plus the anchor
+ * projection tables.  Excludes the vectors themselves (they belong to the
+ * caller's store — the index only holds topology).  Intended for the
+ * qihse_index_bytes metric, so an empty/absent index reports 0. */
+size_t qihse_hnsw_index_bytes(const qihse_hnsw_index_t *index);
+
 #ifdef __cplusplus
 }
 #endif

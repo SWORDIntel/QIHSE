@@ -463,8 +463,8 @@ workload telemetry-w52 area=observability expect=pass timeout=300 \
     output="test_metrics_w52_telemetry: all assertions passed" \
     run="make -s test-metrics-w52"
 
-gap observability/index-bytes area=observability \
-    reason="qihse_index_bytes{index} is NOT shipped: no index type in the tree exposes byte accounting (HNSW is insert/search only, the hash index reports entry count, the index manager reports count/ncols) and the RESP server holds no index handle to sample. Memory movement is covered for the two engines the server does hold (KV key count, vector RAM/spill). Recorded rather than fabricated."
+gap observability/index-bytes-nonvector area=observability \
+    reason="qihse_index_bytes{index=\"hnsw\"} ships: qihse_hnsw_index_bytes counts layer/link/anchor topology and the vector db surfaces it through qihse_vector_db_index_bytes, sampled at scrape via METRICS.RENDER (asserted by resp-hybrid-fusion).  The remaining gap is the OTHER index types — the hash index reports entry count and the index manager count/ncols, but no byte accounting — and no RESP handle exists to sample them.  Recorded rather than fabricated."
 
 gap observability/backend-utilization area=observability \
     reason="backend 'utilization' is DISPATCH SHARE (qihse_backend_queries_total), not busy time: engines are called synchronously and have no busy-time accounting. The ISA/compute reading of 'backend' (CPU/GPU/NPU) is not covered here — that dimension already has FABRIC.CAPS and the dist-planner surfaces."
