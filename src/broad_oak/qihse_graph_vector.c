@@ -1,5 +1,6 @@
 #include "qihse_graph_vector.h"
 #include "qihse_arena.h"
+#include "backends/cpu/qihse_cpu_distance.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,14 +127,21 @@ size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
             for (size_t j = 0; j < nn; j++) {
                 uint64_t nb = adj[j].neighbor_id;
                 if (vis_has(&visited, nb)) continue;
-                /* Check vector similarity if vdb available */
+                /* Check vector similarity if vdb available: fetch the
+                 * neighbour's vector and compare against the query.  A
+                 * neighbour whose vector cannot be fetched is NOT accepted —
+                 * "only follow edges to similar vertices" cannot be verified
+                 * for it, so the filter fails closed rather than accepting. */
                 if (vdb && query && dims > 0) {
-                    /* Search for this vertex in vector DB to get its vector */
-                    /* For simplicity, we do a single-vector search and check if it matches */
-                    /* In a real implementation, we'd fetch the vector by ID */
-                    /* Here we use a simple heuristic: accept all if we can't verify */
-                    float score = 1.0; /* default: accept */
-                    /* TODO: actual vector fetch by ID would go here */
+                    float* nbv = (float*)malloc(dims * sizeof(float));
+                    if (!nbv) continue;
+                    size_t nb_dims = 0;
+                    bool got = qihse_vector_db_get_vector_by_id(vdb, nb, nbv,
+                                                              &nb_dims);
+                    float score = -1.0f;
+                    if (got && nb_dims == dims)
+                        score = qihse_distance_cosine(query, nbv, dims);
+                    free(nbv);
                     if (score < similarity_threshold) continue;
                 }
                 vis_add(&visited, nb);
@@ -147,24 +155,30 @@ size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
     return out_count;
 }
 
-/* Subgraph embedding: average of vertex embeddings */
+/* Subgraph embedding: mean of the member vertices' embeddings.  A vertex
+ * whose vector cannot be fetched (no embedding, dimension mismatch) is
+ * skipped rather than folded in as a zero vector — a zero would bias the
+ * mean toward the origin for no reason.  If NO vertex has a vector the
+ * call fails: an all-zero "embedding" is not a subgraph embedding. */
 int qihse_graph_subgraph_embedding(qihse_graph_t* g, qihse_vector_db_t vdb,
                                    const uint64_t* vertex_ids, size_t num_vertices,
                                    size_t dims, float* out_embedding) {
-    if (!g || !vertex_ids || !out_embedding || dims == 0) return -1;
+    if (!g || !vdb || !vertex_ids || !out_embedding || dims == 0) return -1;
     memset(out_embedding, 0, dims * sizeof(float));
+    float* buf = (float*)malloc(dims * sizeof(float));
+    if (!buf) return -1;
     size_t valid = 0;
-    /* For each vertex, we'd fetch its vector from vdb and accumulate */
-    /* Since we don't have a direct "get vector by ID" API here, we use zero vectors */
-    /* In production, this would call qihse_vector_db_get_vector(vdb, vertex_ids[i], ...) */
     for (size_t i = 0; i < num_vertices; i++) {
-        /* Placeholder: in a full implementation, fetch the vector and add to out_embedding */
+        size_t got_dims = 0;
+        if (!qihse_vector_db_get_vector_by_id(vdb, vertex_ids[i], buf,
+                                              &got_dims)) continue;
+        if (got_dims != dims) continue;
+        for (size_t d = 0; d < dims; d++) out_embedding[d] += buf[d];
         valid++;
     }
-    if (valid > 0) {
-        for (size_t d = 0; d < dims; d++) out_embedding[d] /= (float)valid;
-    }
-    (void)vdb;
+    free(buf);
+    if (valid == 0) return -1;
+    for (size_t d = 0; d < dims; d++) out_embedding[d] /= (float)valid;
     return 0;
 }
 

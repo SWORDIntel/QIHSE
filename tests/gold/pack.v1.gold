@@ -158,8 +158,17 @@ workload graph-engine area=graph expect=pass timeout=300 \
     output="=== Results: 18 passed, 0 failed ===" \
     run="make -s test-graph"
 
-gap graph/graph-vector-hybrid area=graph \
-    reason="src/broad_oak/qihse_graph_vector.c (graph+vector hybrid traversal) has no test under tests/; the graph area here covers the property graph store, Cypher and algorithms only"
+# Hybrid graph+vector: HNSW seed + hop-decayed BFS expansion, vector-guided
+# traverse bounds, and recommend ranking.  NULL-user fails closed (invariant 1).
+workload graph-vector-hybrid area=graph expect=pass timeout=300 \
+    output="test_graph_vector: all hybrid graph-vector tests passed" \
+    ref="src/broad_oak/qihse_graph_vector.c" \
+    run="make -s test-graph-vector"
+
+# graph/graph-vector-placeholders: COVERED. qihse_vector_db_get_vector_by_id
+# now backs both paths: traverse scores each neighbour's cosine against the
+# query (unfetchable neighbours fail closed) and subgraph_embedding returns
+# the true mean of member vectors, refusing when none exist.
 
 # ----------------------------------------------------------------------------
 # 4. FTS + vector fusion
