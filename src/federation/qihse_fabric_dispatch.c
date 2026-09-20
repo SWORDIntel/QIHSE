@@ -60,6 +60,7 @@
 #define FABRIC_REMOTE_RESULT_KEY_PREFIX "fabric:remote-result:"
 #define FABRIC_REMOTE_ARTIFACT_KEY_PREFIX "fabric:ingest:r:"
 #define FABRIC_REMOTE_INFERENCE_KEY_PREFIX "fabric:infer:r:"
+#define FABRIC_REMOTE_INDEX_KEY_PREFIX "fabric:index:r:"
 #define FABRIC_REPLAY_KEY_PREFIX "fabric:replay:"
 
 /* ── Bounded little-endian codec ────────────────────────────────────────── */
@@ -168,7 +169,11 @@ static const qihse_fabric_jobtype_decl_t g_fabric_jobtypes[] = {
     { "inference", QIHSE_FABRIC_JOB_INFERENCE, true,
       "the output is a deterministic function of (payload, provider) written "
       "to the deterministic artifact key for the job binding; a retry "
-      "overwrites the same record and leaves the same state as one run" }
+      "overwrites the same record and leaves the same state as one run" },
+    { "index-build", QIHSE_FABRIC_JOB_INDEX_BUILD, true,
+      "re-indexes the payload prefix through the fabric index and writes the "
+      "report to the deterministic artifact key for the job binding; a retry "
+      "re-scans and overwrites the same report, leaving the same state" }
 };
 
 const qihse_fabric_jobtype_decl_t* qihse_fabric_jobtype_lookup(const char* name) {
@@ -197,6 +202,81 @@ bool qihse_fabric_jobtype_is_idempotent(qihse_fabric_job_t type) {
      * been reasoned about, and "not reasoned about" must not read as "safe to
      * repeat". */
     return d ? d->idempotent : false;
+}
+
+/* ── index-build: re-index a key prefix through the fabric index ──────────
+ *
+ * The build unit is the namespace scan: every record under `prefix` that the
+ * caller's principal may read is handed to qihse_fabric_index_artifact_user,
+ * which is the same hook the keystone-ingest write path uses — a rebuild is
+ * additive and convergent, never a second index.  The report (scanned /
+ * indexed / unindexed counts) is returned to the caller, who persists it at
+ * the deterministic artifact key for the job binding, so a retry overwrites
+ * it rather than accumulating.
+ *
+ * The scan runs as the CALLER's principal: qihse_kv_foreach_user already
+ * filters by qihse_auth_can_access, so records above the caller's claims are
+ * not merely unindexed — they are never seen.  Job bookkeeping keys are
+ * excluded: `fabric:job:`, `fabric:result:`, `fabric:index:` are fabric
+ * metadata, not artifacts, and a rebuild must not index its own report. */
+
+#define QIHSE_FABRIC_INDEX_BUILD_PREFIX_MAX 120u
+
+typedef struct {
+    const char* prefix;
+    size_t prefix_len;
+    qihse_user_t* user;
+    uint16_t classification;
+    uint16_t sci;
+    uint64_t scanned;
+    uint64_t indexed;
+    uint64_t unindexed;
+} fabric_index_build_ctx_t;
+
+static bool fabric_index_build_cb(const char* key, const char* value,
+                                  void* user_data) {
+    fabric_index_build_ctx_t* c = (fabric_index_build_ctx_t*)user_data;
+    if (!key || !value) return true;
+    if (strncmp(key, c->prefix, c->prefix_len) != 0) return true;
+    /* Fabric bookkeeping is not an artifact — skip it so a rebuild does not
+     * index its own reports or job records. */
+    if (strncmp(key, "fabric:job:", 11u) == 0 ||
+        strncmp(key, "fabric:result:", 14u) == 0 ||
+        strncmp(key, "fabric:index:", 13u) == 0) return true;
+    c->scanned++;
+    int irc = qihse_fabric_index_artifact_user(key, value, strlen(value),
+                                             c->classification, c->sci, c->user);
+    if (irc == 0) c->indexed++; else c->unindexed++;
+    return true;
+}
+
+bool qihse_fabric_index_build(void* store_void, const char* prefix,
+                              qihse_user_t* user,
+                              uint16_t classification, uint16_t sci,
+                              char* out_report, size_t out_cap) {
+    if (!store_void || !user || !out_report || out_cap == 0u) return false;
+    if (!prefix || prefix[0] == '\0') prefix = "fabric:";
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len > QIHSE_FABRIC_INDEX_BUILD_PREFIX_MAX) return false;
+
+    fabric_index_build_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.prefix = prefix;
+    ctx.prefix_len = prefix_len;
+    ctx.user = user;
+    ctx.classification = classification;
+    ctx.sci = sci;
+    if (!qihse_kv_foreach_user((qihse_kv_store_t*)store_void, user,
+                               fabric_index_build_cb, &ctx)) {
+        return false;
+    }
+    int n = snprintf(out_report, out_cap,
+                     "prefix:%s scanned:%llu indexed:%llu unindexed:%llu",
+                     prefix,
+                     (unsigned long long)ctx.scanned,
+                     (unsigned long long)ctx.indexed,
+                     (unsigned long long)ctx.unindexed);
+    return n > 0 && (size_t)n < out_cap;
 }
 
 /* ── SHA-384 (payload binding and cache coherence) ──────────────────────── */
@@ -317,7 +397,8 @@ bool qihse_fabric_token_parse(const uint8_t* blob, size_t blob_len,
         if (job_type != (uint16_t)QIHSE_FABRIC_JOB_NONE) return false;
     } else if (job_type != (uint16_t)QIHSE_FABRIC_JOB_EMBED &&
                job_type != (uint16_t)QIHSE_FABRIC_JOB_KEYSTONE_INGEST &&
-               job_type != (uint16_t)QIHSE_FABRIC_JOB_INFERENCE) return false;
+               job_type != (uint16_t)QIHSE_FABRIC_JOB_INFERENCE &&
+               job_type != (uint16_t)QIHSE_FABRIC_JOB_INDEX_BUILD) return false;
     if (payload_len > QIHSE_FABRIC_MAX_PAYLOAD) return false;
     if (issued_ms == 0u || expires_ms <= issued_ms) return false;
     if (expires_ms - issued_ms > QIHSE_FABRIC_TOKEN_MAX_TTL_MS) return false;
@@ -834,6 +915,12 @@ bool qihse_fabric_remote_inference_key(const qihse_uuid_t* submitter_node,
                                     FABRIC_REMOTE_INFERENCE_KEY_PREFIX);
 }
 
+bool qihse_fabric_remote_index_key(const qihse_uuid_t* submitter_node,
+                                   uint64_t job_id, char* out, size_t out_cap) {
+    return fabric_remote_result_key(submitter_node, job_id, out, out_cap,
+                                    FABRIC_REMOTE_INDEX_KEY_PREFIX);
+}
+
 bool qihse_fabric_run_inference(const char* payload, char* out, size_t cap) {
     if (!payload || !out || cap == 0u) return false;
     size_t dim = qihse_ai_memory_embedding_dim();
@@ -1029,6 +1116,38 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
         if (!qihse_fabric_run_inference(payload, infer_out, QIHSE_FABRIC_MAX_RESPONSE)) {
             status = "failed";
             reason = "inference-failed";
+        } else {
+            snprintf(result_ref, sizeof(result_ref), "%s", art_key);
+            bool stored = qihse_kv_set_user(store, art_key, infer_out,
+                                            claims->clearance, claims->sci,
+                                            ex->local_user);
+            if (!stored) {
+                status = "failed";
+                reason = "artifact-store-refused";
+            } else {
+                status = "done";
+                reason = "-";
+                record_payload = infer_out;
+                record_payload_len = strlen(infer_out);
+            }
+        }
+    } else if (claims->job_type == QIHSE_FABRIC_JOB_INDEX_BUILD) {
+        /* `index-build`: the payload is the key prefix to rebuild ("fabric:"
+         * when empty).  The scan runs as the token's claims context, so
+         * records above those claims are never even seen — and the report is
+         * persisted at the claims' classification like every artifact here. */
+        char art_key[192];
+        if (!qihse_fabric_remote_index_key(&claims->submitter_node, claims->job_id,
+                                           art_key, sizeof(art_key))) {
+            return false;
+        }
+        infer_out = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
+        if (!infer_out) return false;
+        if (!qihse_fabric_index_build(store, payload, &remote_ctx,
+                                      claims->clearance, claims->sci,
+                                      infer_out, QIHSE_FABRIC_MAX_RESPONSE)) {
+            status = "failed";
+            reason = "index-build-failed";
         } else {
             snprintf(result_ref, sizeof(result_ref), "%s", art_key);
             bool stored = qihse_kv_set_user(store, art_key, infer_out,

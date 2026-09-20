@@ -4,8 +4,8 @@
 > and verified by `tests/test_node_cap_records.c`, with its durable
 > reachability chain covered by the `gold-fabric-durable-caps` workload in
 > `tests/gold/pack.v1.gold`. Item 2 is `implemented` and verified by
-> `tests/test_fabric_index.c`. Item 3 is `partial`: `FABRIC.SUBMIT` executes
-> three job types locally and refuses `index-build`, and it dispatches to a
+> `tests/test_fabric_index.c`. Item 3 is `implemented`: `FABRIC.SUBMIT` executes
+> all four named job types locally, and it dispatches to a
 > peer over the federation mTLS channel under a signed capability token
 > (`src/federation/qihse_fabric_dispatch.c`, verified by
 > `tests/test_fabric_dispatch.c`); the remaining gaps are recorded in
@@ -104,11 +104,10 @@ Postgres, no platform glue.
 
 ### 3. Fabric job model
 
-> **Status: partial** — the local executors and the refusal path are verified
-> by `tests/test_fabric_jobs.c`, and remote dispatch is verified by
+> **Status: implemented** — the local executors and the refusal path are
+> verified by `tests/test_fabric_jobs.c`, and remote dispatch is verified by
 > `tests/test_fabric_dispatch.c` (the `fabric-remote-dispatch` workload in
-> `tests/gold/pack.v1.gold`). Three of the four named job types have
-> executors; `index-build` does not (`ai-fabric/index-build-executor`).
+> `tests/gold/pack.v1.gold`). All four named job types have executors.
 > Dispatch endpoint discovery is signed:
 > the v4 membership statement carries the node's dispatch `host:port` inside
 > the signed region, and `FABRIC.SUBMIT`/`FABRIC.FETCH` resolve the peer
@@ -137,8 +136,18 @@ Postgres, no platform glue.
   under `fabric:infer:r:<submitter>:<job>` at the token's claims. The output
   is a deterministic function of (payload, provider), which is what makes it
   dispatch-idempotent.
-- `index-build` is REFUSED with `job type not implemented`, rather than
-  accepted and silently ignored — it needs a defined build unit.
+- `index-build` re-indexes a key prefix through the fabric index. The build
+  unit is the namespace scan: the payload is the prefix ("fabric:" when
+  empty), `qihse_fabric_index_build` iterates the records the CALLER's
+  principal may read and feeds each to `qihse_fabric_index_artifact_user` —
+  the same hook the ingest path uses, so a rebuild converges rather than
+  duplicating. The report (`prefix: scanned: indexed: unindexed:`) is
+  persisted at the deterministic `fabric:index:<job-id>` key
+  (`fabric:index:r:<submitter>:<job>` remotely), which makes it
+  dispatch-idempotent, and fabric bookkeeping keys (`fabric:job:`,
+  `fabric:result:`, `fabric:index:`) are excluded so a rebuild never indexes
+  its own report. A type with no executor is still REFUSED with
+  `job type not implemented`.
 - Remote dispatch is implemented (`src/federation/qihse_fabric_dispatch.c`).
   A job whose best-fit node is a peer is sent over the federation mTLS
   channel with a signed capability token binding job type, job id, payload
@@ -263,6 +272,6 @@ primitives rather than ad-hoc bus messaging:
 
 This document remains the design of record for AI-workload dispatch
 (embedding/inference/index-build jobs); the federation plan governs the
-substrate those jobs run on. Of those job kinds, `embed` and
-`keystone-ingest` execute today (locally), `inference` and `index-build` do
-not, and no job executes on another node.
+substrate those jobs run on. All four named job kinds — `embed`,
+`keystone-ingest`, `inference`, `index-build` — execute today, both locally
+and on a peer over the signed dispatch channel.

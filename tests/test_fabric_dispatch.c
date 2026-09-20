@@ -527,6 +527,36 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
         free(vr);
         printf("PASS remote inference: vector record stored on the executor\n");
     }
+
+    /* ── index-build dispatches remotely ─────────────────────────────────
+     * The executor re-scans its own fabric namespace as the token's claims
+     * context and persists the report at the deterministic index key.  The
+     * earlier remote-ingest artifacts (`fabric:ingest:r:...`, stored at the
+     * low-clearance claims) are visible to that context, so the scan has
+     * real work to count. */
+    {
+        const char* sub5[] = { "FABRIC", "SUBMIT", "index-build", "0", "0",
+                               "fabric:ingest:r:" };
+        run_cmd(g_submitter, g_low, 6u, sub5, reply, sizeof reply);
+        assert(strstr(reply, "status:pending-fetch") != NULL);
+        char jid5[32];
+        assert(parse_job_id(reply, jid5, sizeof jid5));
+        const char* fetch5[] = { "FABRIC", "FETCH", jid5 };
+        run_cmd(g_submitter, g_low, 3u, fetch5, reply, sizeof reply);
+        assert(strstr(reply, "fetched") != NULL);
+        assert(strstr(reply, "status:done") != NULL);
+        /* The report is in the EXECUTOR's store and counted real records. */
+        char bkey[192];
+        assert(qihse_fabric_remote_index_key(&g_id_a.node_id,
+                                             strtoull(jid5, NULL, 10),
+                                             bkey, sizeof bkey));
+        char* rep = qihse_kv_get_user(g_store_b, bkey, g_op);
+        assert(rep != NULL);
+        assert(strstr(rep, "scanned:") != NULL);
+        assert(strstr(rep, "scanned:0") == NULL);
+        free(rep);
+        printf("PASS remote index-build: namespace scan ran on the executor, report stored\n");
+    }
 }
 
 /* ── SCATTER-purpose tokens: CLUSTER PEERAUTH ────────────────────────────

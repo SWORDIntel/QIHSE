@@ -107,7 +107,12 @@ typedef enum {
     QIHSE_FABRIC_JOB_NONE = 0,
     QIHSE_FABRIC_JOB_EMBED = 1,
     QIHSE_FABRIC_JOB_KEYSTONE_INGEST = 2,
-    QIHSE_FABRIC_JOB_INFERENCE = 3
+    QIHSE_FABRIC_JOB_INFERENCE = 3,
+    /* Re-index a KV prefix through the fabric index and write the report.
+     * The build unit is the namespace scan: records the caller's principal
+     * can see under `payload` (a key prefix, "fabric:" when empty) are fed
+     * to qihse_fabric_index_artifact_user and the counts are persisted. */
+    QIHSE_FABRIC_JOB_INDEX_BUILD = 4
 } qihse_fabric_job_t;
 
 typedef struct {
@@ -284,6 +289,24 @@ bool qihse_fabric_remote_inference_key(const qihse_uuid_t* submitter_node,
  * `cap` cannot hold the result — the caller refuses rather than serving a
  * truncated vector. */
 bool qihse_fabric_run_inference(const char* payload, char* out, size_t cap);
+
+/* Same deterministic binding for an `index-build` report artifact. */
+bool qihse_fabric_remote_index_key(const qihse_uuid_t* submitter_node,
+                                   uint64_t job_id,
+                                   char* out, size_t out_cap);
+
+/* Run the `index-build` executor: scan `store` for keys under `prefix`
+ * ("fabric:" when NULL/empty) that `user` may read, feed each to
+ * qihse_fabric_index_artifact_user, and format the report
+ * `prefix:<p> scanned:<n> indexed:<m> unindexed:<k>` into `out_report`.
+ * `classification`/`sci` are the claims stamped on each index record — the
+ * caller passes its own claims, never an executor-side privilege.  Returns
+ * false on a bad argument or a scan failure; an unavailable KEYSTONE is NOT
+ * a failure — it lands as `unindexed` counts in the report. */
+bool qihse_fabric_index_build(void* store_void, const char* prefix,
+                              qihse_user_t* user,
+                              uint16_t classification, uint16_t sci,
+                              char* out_report, size_t out_cap);
 
 typedef struct {
     qihse_resp_server_t* server;   /* store + the local executors */

@@ -403,8 +403,12 @@ workload controller-api area=protocol-compat expect=pass timeout=300 \
     output="controller api tests passed" \
     run="make -s test-controller-api"
 
-gap ai-fabric/index-build-executor area=ai-fabric \
-    reason="Three of the four job types named in ai_fabric.md have executors (embed, keystone-ingest, inference — the last running the active embedding provider and persisting the vector record, verified locally and remotely). index-build does NOT and is REFUSED with 'job type not implemented' rather than accepted, so the gap is loud rather than silent. index-build needs a defined build unit."
+# ai-fabric/index-build-executor: COVERED. index-build re-indexes a key
+# prefix through the fabric index (qihse_fabric_index_build): the namespace
+# scan runs as the caller's principal, the report is persisted at the
+# deterministic fabric:index:<job> key, and tests/test_fabric_jobs.c verifies
+# the local path while tests/test_fabric_dispatch.c verifies the remote one.
+# Unknown job types are still refused with 'job type not implemented'.
 
 # ----------------------------------------------------------------------------
 # 11. Overlay discovery (IRC dead-drop + DHT peer exchange)

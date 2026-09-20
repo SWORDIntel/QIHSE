@@ -8023,10 +8023,11 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
     bool is_embed = strcmp(job_type, "embed") == 0;
     bool is_ingest = strcmp(job_type, "keystone-ingest") == 0;
     bool is_infer = strcmp(job_type, "inference") == 0;
-    if (!is_embed && !is_ingest && !is_infer) {
+    bool is_indexbuild = strcmp(job_type, "index-build") == 0;
+    if (!is_embed && !is_ingest && !is_infer && !is_indexbuild) {
         char err[192];
         snprintf(err, sizeof(err),
-                 "ERR job type not implemented: %s (implemented: embed, keystone-ingest, inference)",
+                 "ERR job type not implemented: %s (implemented: embed, keystone-ingest, inference, index-build)",
                  job_type);
         return qihse_resp_error(session, err);
     }
@@ -8166,6 +8167,47 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
                     status = "done";
                 }
             }
+        } else if (is_indexbuild) {
+            /* `index-build`: the payload is the key prefix to rebuild
+             * ("fabric:" when empty).  The scan runs as the CALLER — records
+             * above its claims are never seen — and the report is persisted
+             * at the caller's classification under the deterministic key, so
+             * a retry overwrites the same report. */
+            char art_key[128];
+            snprintf(art_key, sizeof(art_key), "fabric:index:%llu", (unsigned long long)jid);
+            char report[384];
+            pthread_rwlock_rdlock(&session->server->kv_lock);
+            bool built = qihse_fabric_index_build(session->server->store, payload,
+                                                  session->user,
+                                                  qihse_user_get_classification(session->user),
+                                                  qihse_user_get_sci(session->user),
+                                                  report, sizeof(report));
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            if (!built) {
+                status = "failed";
+                snprintf(err, sizeof(err), "index-build scan failed");
+            } else {
+                pthread_rwlock_wrlock(&session->server->kv_lock);
+                bool stored = qihse_kv_set_user(session->server->store, art_key, report,
+                                                qihse_user_get_classification(session->user),
+                                                qihse_user_get_sci(session->user),
+                                                session->user);
+                pthread_rwlock_unlock(&session->server->kv_lock);
+                if (!stored) {
+                    status = "failed";
+                    snprintf(err, sizeof(err), "report store failed");
+                } else {
+                    /* The report IS the result — the counts inside it say
+                     * whether KEYSTONE actually indexed anything, so a
+                     * soft-absent index is reported, not hidden. */
+                    snprintf(result, sizeof(result), "%s", art_key);
+                    status = "done";
+                    if (strstr(report, "indexed:0 ") != NULL &&
+                        strstr(report, "scanned:0 ") == NULL) {
+                        snprintf(err, sizeof(err), "%s", "keystone-index-unavailable");
+                    }
+                }
+            }
         } else {
             /* `keystone-ingest`: persist the payload as a fabric artifact and
              * classify+index it through KEYSTONE.
@@ -8233,6 +8275,7 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
                 rreq.submitter_node = session->server->fabric_node_id;
                 rreq.job_type = is_embed ? QIHSE_FABRIC_JOB_EMBED
                                 : is_infer ? QIHSE_FABRIC_JOB_INFERENCE
+                                : is_indexbuild ? QIHSE_FABRIC_JOB_INDEX_BUILD
                                            : QIHSE_FABRIC_JOB_KEYSTONE_INGEST;
                 rreq.job_id = jid;
                 rreq.payload = payload;

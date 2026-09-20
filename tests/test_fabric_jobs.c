@@ -147,7 +147,7 @@ int main(void) {
     char reply[8192];
 
     /* ── 3. a type with no executor is refused ────────────────────────── */
-    const char* bad[] = { "FABRIC", "SUBMIT", "index-build", "0", "0", "hello" };
+    const char* bad[] = { "FABRIC", "SUBMIT", "defrag", "0", "0", "hello" };
     assert(run_cmd(6u, bad, reply, sizeof reply));
     assert(strstr(reply, "not implemented") != NULL);
     printf("PASS unimplemented type refused rather than queued and ignored\n");
@@ -251,6 +251,32 @@ int main(void) {
     free(vec_rec);
     free(vec_rec2);
     printf("PASS inference ran the provider and stored a deterministic vector artifact\n");
+
+    /* ── index-build re-indexes the artifact namespace and reports it ──── */
+    /* There is at least one `fabric:` artifact in the store by now (the
+     * keystone-ingest job above), so the scan has real work to count.  The
+     * report is persisted at the deterministic key and the counts inside it
+     * say whether KEYSTONE was present — a soft-absent index is reported in
+     * `unindexed`, not hidden. */
+    const char* ib[] = { "FABRIC", "SUBMIT", "index-build", "0", "0", "fabric:" };
+    assert(run_cmd(6u, ib, reply, sizeof reply));
+    assert(strstr(reply, "status:done") != NULL);
+    char ibid[32];
+    assert(parse_job_id(reply, ibid, sizeof ibid));
+    char report_key[128];
+    snprintf(report_key, sizeof report_key, "fabric:index:%s", ibid);
+    char* report = qihse_kv_get_user(store, report_key, qihse_auth_get_user(0));
+    assert(report != NULL);
+    assert(strstr(report, "prefix:fabric:") != NULL);
+    assert(strstr(report, "scanned:") != NULL);
+    assert(strstr(report, "scanned:0") == NULL);  /* the ingest artifact exists */
+    free(report);
+    /* The job record names index-build and its report artifact. */
+    const char* ibr[] = { "FABRIC", "RESULT", ibid };
+    assert(run_cmd(3u, ibr, reply, sizeof reply));
+    assert(strstr(reply, "index-build") != NULL);
+    assert(strstr(reply, "fabric:index:") != NULL);
+    printf("PASS index-build scanned the fabric namespace and stored a report artifact\n");
 
     /* ── a job id that does not exist is an error, not a phantom ──────── */
     const char* missing[] = { "FABRIC", "RESULT", "999999" };
