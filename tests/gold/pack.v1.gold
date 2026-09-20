@@ -359,8 +359,39 @@ workload null-security-context area=security-regressions expect=pass timeout=120
     bin=tests/gold/workloads/gold_security_null_context \
     run="./tests/gold/workloads/gold_security_null_context"
 
-gap security-regressions/remaining-matrix-targets area=security-regressions \
-    reason="tests/security-regression.mk declares 16 targets; this pack runs 8 of them (KV, tenant isolation, tenant privilege ladder, SCI compartments, RESP, vector tenant isolation, export, vector skip integrity). The remaining 8 are runnable with 'make -f Makefile -f tests/security-regression.mk test-security-regressions' and are omitted here only to keep the default gold run bounded"
+# The remaining matrix targets — the pack now runs all 16 declared targets
+# plus the adapter probes.  Nothing in this area is skipped for time.
+workload keystone-qihse-security area=security-regressions expect=pass timeout=300 \
+    output="All QIHSE + KEYSTONE Integration Tests PASSED!" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-keystone-qihse-security"
+
+workload blob-security-regression area=security-regressions expect=pass timeout=300 \
+    output="test_blob_security_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-blob-security-regression"
+
+workload ingest-guard-regression area=security-regressions expect=pass timeout=300 \
+    output="test_ingest_guard_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-ingest-guard-regression"
+
+workload bundle-security-regression area=security-regressions expect=pass timeout=300 \
+    output="test_bundle_security_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-bundle-security-regression"
+
+workload killswitch-regression area=security-regressions expect=pass timeout=300 \
+    output="test_killswitch_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-killswitch-regression"
+
+workload retention-regression area=security-regressions expect=pass timeout=300 \
+    output="test_retention_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-retention-regression"
+
+workload metrics-regression area=security-regressions expect=pass timeout=300 \
+    output="test_metrics_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-metrics-regression"
+
+workload blob-persistence-regression area=security-regressions expect=pass timeout=300 \
+    output="test_blob_persistence_regression: all assertions passed" \
+    run="make -s -f Makefile -f tests/security-regression.mk test-blob-persistence-regression"
 
 # ── AI fabric ───────────────────────────────────────────────────────────────
 # The fabric's own area. These exist because three shipped fabric features were
