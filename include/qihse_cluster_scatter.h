@@ -7,6 +7,7 @@
 #include "qihse_cluster_slot.h"
 #include "qihse_vector_db.h"
 #include "qihse_auth.h"
+#include "qihse_federation.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,9 +37,35 @@ typedef struct {
     size_t max_peers;          /* 0 = all peers */
 } qihse_cluster_scatter_config_t;
 
+/* Install this node's signing identity so that each peer connection opens
+ * with CLUSTER PEERAUTH — a signed SCATTER-purpose capability token
+ * (qihse_fabric_dispatch.h) carrying the CALLER's principal claims
+ * (user id, clearance, SCI, tenant).  The peer verifies it against the
+ * enrolled node identity and installs the claims as the session context,
+ * so a fanned-out read runs under the same principal on every shard
+ * instead of unauthenticated.
+ *
+ * Without an identity the scatter sends no PEERAUTH and queries run
+ * unauthenticated — the historical posture, kept because a non-federated
+ * deployment has no enrolled identity to sign with.  When an identity IS
+ * installed and the peer refuses the token, the peer is skipped entirely:
+ * a claim the peer will not honour is a refused peer, not a degraded
+ * query that would leak to an unauthenticated context.
+ *
+ * `node_id` and `sign_key` are borrowed (the RESP server's loaded
+ * federation identity); both must outlive the scatter engine. */
+void qihse_cluster_scatter_set_identity(qihse_cluster_scatter_t* sg,
+                                        const qihse_uuid_t* node_id,
+                                        void* sign_key);
+
 /* RRF fusion constant (standard value 60).  Higher values reduce the
  * influence of rank position. */
 #define QIHSE_RRF_K 60u
+
+/* Lifetime of a PEERAUTH token: long enough for one connect+query, short
+ * enough that a captured token is useless quickly.  Replay consumption on
+ * the peer makes a second use impossible regardless. */
+#define QIHSE_SCATTER_TOKEN_TTL_MS 30000u
 
 /*
  * VECSCATTER: scatter a vector search to all peer shards, gather

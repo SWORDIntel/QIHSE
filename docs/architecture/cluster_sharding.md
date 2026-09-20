@@ -325,6 +325,18 @@ The scatter-gather engine uses TCP connections with:
 - Lightweight embedded RESP client for peer queries
 - Unhealthy peers are skipped (marked via gossip bus)
 - Stats tracking: queries sent, received, failures
+- **Principal propagation**: when the node has an enrolled federation
+  identity (fabric dispatch enabled), each peer connection opens with
+  `CLUSTER PEERAUTH <token>` — a signed SCATTER-purpose capability token
+  carrying the caller's claims (user id, clearance, SCI, tenant).  The peer
+  verifies it against the enrolled node identity (signature, scope subset,
+  lifetime, replay ledger — the fabric token check) and installs the claims
+  as the session context, so the fanned-out query runs under the same
+  principal on every shard rather than unauthenticated.  A peer that
+  refuses the token receives no query — dropping to unauthenticated is a
+  refused peer, not a degraded one.  With no signing identity configured,
+  the scatter sends no PEERAUTH and queries run unauthenticated, which is
+  the historical posture for a non-federated deployment.
 
 ---
 

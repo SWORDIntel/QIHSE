@@ -1,4 +1,5 @@
 #include "qihse_cluster_scatter.h"
+#include "qihse_fabric_dispatch.h"
 #include "qihse_platform.h"
 #include <errno.h>
 #include <math.h>
@@ -151,7 +152,99 @@ struct qihse_cluster_scatter {
     size_t max_peers;
     pthread_mutex_t lock;
     qihse_cluster_scatter_stats_t stats;
+    /* Signing identity for CLUSTER PEERAUTH (see the header).  NULL means
+     * the node has no enrolled federation identity and peers are queried
+     * unauthenticated — the pre-PEERAUTH posture. */
+    void* sign_key;
+    qihse_uuid_t node_id;
+    bool has_node_id;
 };
+
+void qihse_cluster_scatter_set_identity(qihse_cluster_scatter_t* sg,
+                                        const qihse_uuid_t* node_id,
+                                        void* sign_key) {
+    if (!sg) return;
+    sg->sign_key = sign_key;
+    sg->has_node_id = node_id != NULL;
+    if (node_id) sg->node_id = *node_id;
+}
+
+static uint64_t scatter_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Present the caller's principal claims to the peer: mint a SCATTER-purpose
+ * capability token, send CLUSTER PEERAUTH <hex>, and require +OK.  The peer
+ * verifies the signature against THIS node's enrolled identity and installs
+ * the claims as the connection's context, so the query that follows runs
+ * under the caller's clearance/SCI/tenant rather than unauthenticated.
+ *
+ * Returns true when claims are installed (or none were required — no
+ * identity configured).  False means the peer could not or would not take
+ * the claims, and the caller must NOT send the query: running it anyway
+ * would silently drop the principal to unauthenticated. */
+static bool qihse_scatter_peerauth(int fd, qihse_cluster_scatter_t* sg,
+                                   const qihse_user_t* user, uint32_t timeout_ms) {
+    if (!sg->sign_key || !sg->has_node_id) return true;  /* nothing to claim */
+    if (!user) return false; /* claims exist only with a principal */
+
+    qihse_fabric_token_t tok;
+    memset(&tok, 0, sizeof(tok));
+    tok.purpose = QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER;
+    tok.job_type = QIHSE_FABRIC_JOB_NONE;
+    tok.scope = QIHSE_FABRIC_SCOPE_SCATTER;
+    tok.principal_user_id = qihse_user_get_id(user);
+    tok.clearance = qihse_user_get_classification(user);
+    tok.sci = qihse_user_get_sci(user);
+    tok.principal_tenant = qihse_user_get_tenant_id(user);
+    tok.submitter_node = sg->node_id;
+    if (!qihse_uuid_generate(&tok.nonce)) return false;
+    tok.issued_ms = scatter_now_ms();
+    if (tok.issued_ms == 0u) return false;
+    tok.expires_ms = tok.issued_ms + QIHSE_SCATTER_TOKEN_TTL_MS;
+    /* A SCATTER token binds no payload; the digest is of zero bytes, which is
+     * what the peer's token check recomputes. */
+    tok.payload_len = 0u;
+    char dig[97];
+    if (!qihse_fabric_sha384_hex(NULL, 0u, dig, sizeof(dig))) return false;
+    static const char hexv[] = "0123456789abcdef";
+    for (size_t i = 0; i < 48u; i++) {
+        const char* p = dig + i * 2u;
+        tok.payload_digest[i] = (uint8_t)(((strchr(hexv, p[0]) - hexv) << 4) |
+                                          (strchr(hexv, p[1]) - hexv));
+    }
+
+    uint8_t blob[QIHSE_FABRIC_TOKEN_MAX_BYTES];
+    size_t blob_len = 0;
+    if (!qihse_fabric_token_mint(sg->sign_key, &tok, blob, sizeof(blob), &blob_len)) {
+        return false;
+    }
+
+    /* Command: *3 CLUSTER PEERAUTH <hex>.  Heap: the blob is multi-KB PQ
+     * material, and doubling it as hex doubles it again. */
+    size_t hex_len = blob_len * 2u;
+    size_t cmd_cap = 64u + hex_len;
+    char* cmd = (char*)malloc(cmd_cap);
+    if (!cmd) return false;
+    int pos = snprintf(cmd, cmd_cap, "*3\r\n$7\r\nCLUSTER\r\n$8\r\nPEERAUTH\r\n$%zu\r\n",
+                       hex_len);
+    for (size_t i = 0; i < blob_len && pos > 0 && (size_t)pos < cmd_cap; i++) {
+        cmd[pos++] = hexv[blob[i] >> 4];
+        cmd[pos++] = hexv[blob[i] & 0x0Fu];
+    }
+    if ((size_t)pos + 2u < cmd_cap) { cmd[pos++] = '\r'; cmd[pos++] = '\n'; }
+    bool sent = qihse_scatter_send_all(fd, cmd, (size_t)pos, timeout_ms);
+    free(cmd);
+    if (!sent) return false;
+
+    uint8_t rbuf[512];
+    ssize_t received = qihse_scatter_recv(fd, rbuf, sizeof(rbuf), timeout_ms);
+    if (received <= 0) return false;
+    /* +OK means the claims installed; anything else is a refusal. */
+    return rbuf[0] == '+' && received >= 3u;
+}
 
 qihse_cluster_scatter_t* qihse_cluster_scatter_create(const qihse_cluster_scatter_config_t* config) {
     if (!config || !config->topology) return NULL;
@@ -299,12 +392,20 @@ static int qihse_scatter_parse_vecsearch_response(const uint8_t* buf, size_t len
 }
 
 /* Query a single peer for VECSEARCH.  Returns number of results, or -1. */
-static int qihse_scatter_query_peer_vecsearch(const char* host, uint16_t port,
+static int qihse_scatter_query_peer_vecsearch(qihse_cluster_scatter_t* sg,
+                                              const char* host, uint16_t port,
                                               uint32_t timeout_ms,
+                                              const qihse_user_t* user,
                                               const float* query_vector, size_t dims, size_t top_k,
                                               qihse_vector_result_t* results, size_t max_results) {
     int fd = qihse_scatter_connect(host, port, timeout_ms);
     if (fd < 0) return -1;
+    /* Install the caller's claims first; a peer that cannot take them gets
+     * no query. */
+    if (!qihse_scatter_peerauth(fd, sg, user, timeout_ms)) {
+        close(fd);
+        return -1;
+    }
     /* Build VECSEARCH command: VECSEARCH dims top_k v0 v1 ... */
     /* Format: *(3+dims)\r\n$9\r\nVECSEARCH\r\n$dims_len\r\ndims\r\n$topk_len\r\ntop_k\r\n$vlen\r\nv0\r\n... */
     size_t cmd_cap = 64 + dims * 32;
@@ -332,7 +433,8 @@ int qihse_cluster_scatter_vecsearch(qihse_cluster_scatter_t* sg,
                                     size_t top_k, const qihse_user_t* user,
                                     qihse_vector_result_t* out_results) {
     if (!sg || !query_vector || !out_results || dims == 0 || top_k == 0) return -1;
-    (void)user; /* user context is applied at each peer's RESP server */
+    /* `user` is propagated to each peer as a signed PEERAUTH claim (or not
+     * sent, when this node has no signing identity — see the header). */
 
     pthread_mutex_lock(&sg->lock);
     __atomic_add_fetch(&sg->stats.scatter_queries, 1u, __ATOMIC_RELAXED);
@@ -354,8 +456,8 @@ int qihse_cluster_scatter_vecsearch(qihse_cluster_scatter_t* sg,
     for (size_t p = 0; p < peer_count; p++) {
         qihse_vector_result_t peer_results[256];
         size_t ask = top_k < 256 ? top_k : 256;
-        int found = qihse_scatter_query_peer_vecsearch(peers[p].host, peers[p].port,
-                                                        sg->timeout_ms,
+        int found = qihse_scatter_query_peer_vecsearch(sg, peers[p].host, peers[p].port,
+                                                        sg->timeout_ms, user,
                                                         query_vector, dims, ask,
                                                         peer_results, ask);
         pthread_mutex_lock(&sg->lock);
@@ -405,7 +507,6 @@ bool qihse_cluster_scatter_ts_range(qihse_cluster_scatter_t* sg,
                                     int aggregation, const qihse_user_t* user,
                                     double* out_value, uint64_t* out_count) {
     if (!sg || !out_value || !out_count) return false;
-    (void)user;
 
     qihse_cluster_node_t peers[QIHSE_CLUSTER_MAX_NODES];
     size_t peer_count = qihse_scatter_get_peers(sg, peers, sizeof(peers) / sizeof(peers[0]));
@@ -427,6 +528,7 @@ bool qihse_cluster_scatter_ts_range(qihse_cluster_scatter_t* sg,
     for (size_t p = 0; p < peer_count; p++) {
         int fd = qihse_scatter_connect(peers[p].host, peers[p].port, sg->timeout_ms);
         if (fd < 0) continue;
+        if (!qihse_scatter_peerauth(fd, sg, user, sg->timeout_ms)) { close(fd); continue; }
         char cmd[256];
         int pos = snprintf(cmd, sizeof(cmd), "*5\r\n$8\r\nTS.RANGE\r\n$10\r\n%u\r\n$%zu\r\n%llu\r\n$%zu\r\n%llu\r\n$%zu\r\n%s\r\n",
                            series_id, digits(start), (unsigned long long)start,
@@ -471,7 +573,6 @@ bool qihse_cluster_scatter_col_sum(qihse_cluster_scatter_t* sg,
                                    const char* key, const qihse_user_t* user,
                                    double* out_sum) {
     if (!sg || !key || !out_sum) return false;
-    (void)user;
 
     qihse_cluster_node_t peers[QIHSE_CLUSTER_MAX_NODES];
     size_t peer_count = qihse_scatter_get_peers(sg, peers, sizeof(peers) / sizeof(peers[0]));
@@ -482,6 +583,7 @@ bool qihse_cluster_scatter_col_sum(qihse_cluster_scatter_t* sg,
     for (size_t p = 0; p < peer_count; p++) {
         int fd = qihse_scatter_connect(peers[p].host, peers[p].port, sg->timeout_ms);
         if (fd < 0) continue;
+        if (!qihse_scatter_peerauth(fd, sg, user, sg->timeout_ms)) { close(fd); continue; }
         char cmd[512];
         int pos = snprintf(cmd, sizeof(cmd), "*2\r\n$7\r\nCOL.SUM\r\n$%zu\r\n%s\r\n", strlen(key), key);
         if (!qihse_scatter_send_all(fd, cmd, (size_t)pos, sg->timeout_ms)) { close(fd); continue; }
@@ -503,7 +605,6 @@ bool qihse_cluster_scatter_col_minmax(qihse_cluster_scatter_t* sg,
                                       const char* key, const qihse_user_t* user,
                                       double* out_min, double* out_max) {
     if (!sg || !key || !out_min || !out_max) return false;
-    (void)user;
 
     qihse_cluster_node_t peers[QIHSE_CLUSTER_MAX_NODES];
     size_t peer_count = qihse_scatter_get_peers(sg, peers, sizeof(peers) / sizeof(peers[0]));
@@ -515,6 +616,7 @@ bool qihse_cluster_scatter_col_minmax(qihse_cluster_scatter_t* sg,
     for (size_t p = 0; p < peer_count; p++) {
         int fd = qihse_scatter_connect(peers[p].host, peers[p].port, sg->timeout_ms);
         if (fd < 0) continue;
+        if (!qihse_scatter_peerauth(fd, sg, user, sg->timeout_ms)) { close(fd); continue; }
         char cmd[512];
         int pos = snprintf(cmd, sizeof(cmd), "*2\r\n$10\r\nCOL.MINMAX\r\n$%zu\r\n%s\r\n", strlen(key), key);
         if (!qihse_scatter_send_all(fd, cmd, (size_t)pos, sg->timeout_ms)) { close(fd); continue; }

@@ -528,6 +528,125 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
     }
 }
 
+/* ── SCATTER-purpose tokens: CLUSTER PEERAUTH ────────────────────────────
+ * A SCATTER token is the principal claim a peer presents over plain RESP.
+ * The same verification applies: enrolled submitter, signature, scope
+ * subset, lifetime, replay.  PEERAUTH accepts it and refuses everything
+ * that is not it. */
+static void test_scatter_peerauth(void) {
+    void* pkey = NULL;
+    qihse_federation_node_identity_t id;
+    assert(qihse_fabric_node_signer_load(g_store_b, g_op, &g_id_a.node_id, &id, &pkey));
+
+    static char blob[QIHSE_FABRIC_TOKEN_MAX_BYTES];
+    static char hexbuf[QIHSE_FABRIC_TOKEN_MAX_BYTES * 2u];
+    static const char hexv[] = "0123456789abcdef";
+
+    qihse_fabric_token_t tok;
+    memset(&tok, 0, sizeof(tok));
+    tok.purpose = QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER;
+    tok.job_type = QIHSE_FABRIC_JOB_NONE;
+    tok.scope = QIHSE_FABRIC_SCOPE_SCATTER;
+    tok.principal_user_id = 42u;
+    tok.clearance = 0;
+    tok.sci = 0;
+    tok.principal_tenant = QIHSE_TENANT_SYSTEM;
+    tok.submitter_node = g_id_a.node_id;
+    tok.job_id = 0u;
+    tok.issued_ms = 1000u;
+    tok.expires_ms = 1000u + 30000u;
+    tok.payload_len = 0u;
+    {
+        uint8_t digest[48];
+        char hex[97];
+        assert(qihse_fabric_sha384_hex(NULL, 0u, hex, sizeof(hex)));
+        for (size_t i = 0; i < 48u; i++) {
+            unsigned hi = 0, lo = 0;
+            assert(sscanf(hex + i * 2u, "%1x%1x", &hi, &lo) == 2);
+            digest[i] = (uint8_t)((hi << 4) | lo);
+        }
+        memcpy(tok.payload_digest, digest, sizeof(digest));
+    }
+    assert(qihse_uuid_generate(&tok.nonce));
+    size_t blob_len = 0;
+    assert(qihse_fabric_token_mint(pkey, &tok, (uint8_t*)blob, sizeof(blob), &blob_len));
+
+    /* The token CHECK path first — purpose/scope/job binding. */
+    qihse_fabric_token_check_t check;
+    memset(&check, 0, sizeof(check));
+    check.channel_peer = g_id_a.node_id;
+    check.expect_purpose = QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER;
+    check.expect_job_type = QIHSE_FABRIC_JOB_NONE;
+    check.expect_job_id = 0u;
+    check.payload = NULL;
+    check.payload_len = 0u;
+    check.required_scope = QIHSE_FABRIC_SCOPE_SCATTER;
+    check.now_ms = 2000u;
+    check.consume = false;
+    qihse_fabric_token_t verified;
+    assert(qihse_fabric_token_check(g_store_b, g_op, (const uint8_t*)blob, blob_len,
+                                    &check, &verified) == QIHSE_FABRIC_TOKEN_OK);
+    assert(verified.principal_user_id == 42u);
+
+    /* A SCATTER token minted with a job type must not even PARSE — the two
+     * token shapes are distinct at the format level, not by caller promise. */
+    tok.job_type = QIHSE_FABRIC_JOB_EMBED;
+    assert(qihse_uuid_generate(&tok.nonce));
+    size_t bad_len = 0;
+    assert(qihse_fabric_token_mint(pkey, &tok, (uint8_t*)blob, sizeof(blob), &bad_len));
+    qihse_fabric_token_t ignored;
+    size_t r = 0, t = 0;
+    assert(!qihse_fabric_token_parse((const uint8_t*)blob, bad_len, &ignored, &r, &t));
+    tok.job_type = QIHSE_FABRIC_JOB_NONE;
+
+    /* And the wire path: CLUSTER PEERAUTH <hex> on the executor's RESP
+     * surface.  A real check consumes the nonce AND checks the lifetime
+     * against the real clock — mint fresh, wall-clock-now tokens. */
+    struct timeval tv;
+    assert(gettimeofday(&tv, NULL) == 0);
+    uint64_t now_ms = (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
+    char reply[512];
+    tok.issued_ms = now_ms;
+    tok.expires_ms = now_ms + 30000u;
+    assert(qihse_uuid_generate(&tok.nonce));
+    assert(qihse_fabric_token_mint(pkey, &tok, (uint8_t*)blob, sizeof(blob), &blob_len));
+    for (size_t i = 0; i < blob_len; i++) {
+        hexbuf[i * 2u] = hexv[((const uint8_t*)blob)[i] >> 4];
+        hexbuf[i * 2u + 1u] = hexv[((const uint8_t*)blob)[i] & 0x0Fu];
+    }
+    hexbuf[blob_len * 2u] = '\0';
+    const char* auth[] = { "CLUSTER", "PEERAUTH", hexbuf };
+    /* The in-process execute path needs an initial context; on a real
+     * socket the session is unauthenticated until PEERAUTH runs. */
+    run_cmd(g_executor, g_op, 3u, auth, reply, sizeof reply);
+    assert(strstr(reply, "+OK") != NULL || strstr(reply, "OK") != NULL);
+
+    /* The SAME token again is a replay — the nonce is spent. */
+    run_cmd(g_executor, g_op, 3u, auth, reply, sizeof reply);
+    assert(strstr(reply, "token-replayed") != NULL);
+
+    /* A RUN-purpose token is not a principal claim.  It carries the WRITE
+     * scope a RUN needs, so the SCATTER scope requirement refuses it — the
+     * check rejects it before purpose is even compared.  Either verdict is
+     * correct; what must not happen is acceptance. */
+    tok.purpose = QIHSE_FABRIC_TOKEN_PURPOSE_RUN;
+    tok.job_type = QIHSE_FABRIC_JOB_EMBED;
+    tok.job_id = 77u;
+    tok.scope = QIHSE_FABRIC_SCOPE_RUN | QIHSE_FABRIC_SCOPE_SCATTER;
+    assert(qihse_uuid_generate(&tok.nonce));
+    assert(qihse_fabric_token_mint(pkey, &tok, (uint8_t*)blob, sizeof(blob), &blob_len));
+    for (size_t i = 0; i < blob_len; i++) {
+        hexbuf[i * 2u] = hexv[((const uint8_t*)blob)[i] >> 4];
+        hexbuf[i * 2u + 1u] = hexv[((const uint8_t*)blob)[i] & 0x0Fu];
+    }
+    hexbuf[blob_len * 2u] = '\0';
+    run_cmd(g_executor, g_op, 3u, auth, reply, sizeof reply);
+    assert(strstr(reply, "wrong-purpose") != NULL);
+
+    EVP_PKEY_free((EVP_PKEY*)pkey);
+    printf("PASS scatter peerauth: claims install on a verified token; replay and wrong-purpose refused\n");
+}
+
 /* ── INVARIANT 3: low clearance vs high data (merge blocker) ───────────── */
 
 static void test_negative_low_clearance_high_data(void) {
@@ -1022,6 +1141,7 @@ int main(void) {
 
     test_token_verification(ca);
     test_retry_policy();
+    test_scatter_peerauth();
     test_remote_dispatch_runs_on_the_peer();
     test_cache_coherence();
     test_negative_low_clearance_high_data();

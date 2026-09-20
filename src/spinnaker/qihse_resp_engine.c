@@ -17,6 +17,12 @@
 #include "qihse_keystone.h"
 #include "qihse_fabric_dispatch.h"
 #include "qihse_fabric_index.h"
+/* The claims context CLUSTER PEERAUTH installs needs the user STRUCT by
+ * value — the same narrow, deliberate use of the internal representation
+ * qihse_fabric_dispatch.c makes for its remote context: the struct it
+ * builds is non-authoritative by construction (auth resolves principals by
+ * pointer identity) and can never carry more than unclassified access. */
+#include "qihse_auth_internal.h"
 #include "qihse_ingest_guard.h"
 #include "qihse_metrics.h"
 #include "qihse_system_guard.h"
@@ -110,6 +116,17 @@ typedef struct {
      * command that caused it.  OTHER until classification runs, never a
      * caller-supplied string. */
     qihse_query_type_t query_type;
+    /* CLUSTER PEERAUTH: a verified remote principal's claims, installed as
+     * the session context (session->user == &peer_claims).  This is NOT a
+     * node-local auth-table principal, so the per-command revocation probe —
+     * which resolves the presented user by POINTER IDENTITY against the
+     * table — must skip it: a pointer that is not in the table reports
+     * inactive and would revoke the session.  The claims' authority comes
+     * from the token's signature (enrolled-node verification at install
+     * time) and dies with the connection; the token's TTL and the replay
+     * ledger bound its life, not the local principal table. */
+    qihse_user_t peer_claims;
+    bool peer_claims_valid;
 } qihse_resp_session_t;
 
 struct qihse_resp_client_ctx {
@@ -825,6 +842,83 @@ static bool qihse_resp_handle_auth(qihse_resp_session_t* session, const qihse_re
         return qihse_resp_wrong_arity(session, "auth");
     }
     if (!response || !authenticated) return response;
+    return qihse_resp_simple(session, "OK");
+}
+
+/* CLUSTER PEERAUTH <token-hex> — the peer end of scatter principal
+ * propagation (qihse_cluster_scatter.h).  A SCATTER-purpose capability
+ * token carries a principal's claims (user id, clearance, SCI, tenant)
+ * signed by an enrolled node; verification is exactly the fabric token
+ * check — enrolled+approved submitter, signature against the enrolled key,
+ * scope subset, lifetime, replay ledger.  There is no channel identity on a
+ * plain RESP connection, so the claimed submitter node stands in for
+ * `channel_peer`: the signature already binds the token to the key of the
+ * node that minted it.
+ *
+ * On success the claims become the session's context for every following
+ * command — including the classification/SCI/tenant the filters apply.
+ * This runs BEFORE the NOAUTH gate because it IS the authentication. */
+static bool qihse_resp_handle_cluster_peerauth(qihse_resp_session_t* session,
+                                               const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "cluster|peerauth");
+    const qihse_resp_arg_t* hexarg = &request->argv[2];
+    size_t blob_len = hexarg->len / 2u;
+    if (hexarg->len == 0u || (hexarg->len & 1u) != 0u ||
+        blob_len > (size_t)QIHSE_FABRIC_TOKEN_MAX_BYTES)
+        return qihse_resp_error(session, "ERR peer auth refused: malformed-token");
+    uint8_t* blob = (uint8_t*)malloc(blob_len);
+    if (!blob) return qihse_resp_error(session, "ERR out of memory");
+    static const char hexv[] = "0123456789abcdef";
+    bool valid = true;
+    for (size_t i = 0; i < blob_len && valid; i++) {
+        const char* hi = (const char*)memchr(hexv, hexarg->data[i * 2u], 16u);
+        const char* lo = (const char*)memchr(hexv, hexarg->data[i * 2u + 1u], 16u);
+        if (!hi || !lo) { valid = false; break; }
+        blob[i] = (uint8_t)((unsigned)(hi - hexv) << 4 | (unsigned)(lo - hexv));
+    }
+    if (!valid) {
+        free(blob);
+        return qihse_resp_error(session, "ERR peer auth refused: malformed-token");
+    }
+
+    qihse_fabric_token_t parsed;
+    size_t region = 0, total = 0;
+    bool parsed_ok = qihse_fabric_token_parse(blob, blob_len, &parsed, &region, &total);
+    qihse_fabric_token_check_t check;
+    memset(&check, 0, sizeof(check));
+    if (parsed_ok) check.channel_peer = parsed.submitter_node;
+    check.expect_purpose = QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER;
+    check.expect_job_type = QIHSE_FABRIC_JOB_NONE;
+    check.expect_job_id = 0u;
+    check.payload = NULL;
+    check.payload_len = 0u;
+    check.required_scope = QIHSE_FABRIC_SCOPE_SCATTER;
+    check.consume = true;
+
+    qihse_fabric_token_t verified;
+    qihse_fabric_token_verdict_t verdict =
+        qihse_fabric_token_check(session->server->store, qihse_auth_get_user(0),
+                                 blob, blob_len, &check, &verified);
+    free(blob);
+    if (verdict != QIHSE_FABRIC_TOKEN_OK) {
+        char err[128];
+        snprintf(err, sizeof(err), "ERR peer auth refused: %s",
+                 qihse_fabric_token_verdict_name(verdict));
+        return qihse_resp_error(session, err);
+    }
+
+    memset(&session->peer_claims, 0, sizeof(session->peer_claims));
+    session->peer_claims.user_id = verified.principal_user_id;
+    session->peer_claims.classification_level = verified.clearance;
+    session->peer_claims.sci_compartments = verified.sci;
+    session->peer_claims.tenant_id = verified.principal_tenant;
+    /* role 0, no account capabilities, no verifier: a claims context is a
+     * claim about read clearance, nothing more. */
+    snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
+             "scatter-peer:%u", (unsigned)verified.principal_user_id);
+    session->peer_claims_valid = true;
+    session->user = &session->peer_claims;
+    session->user_id = verified.principal_user_id;
     return qihse_resp_simple(session, "OK");
 }
 
@@ -8752,6 +8846,12 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         *keep_open = false;
         return qihse_resp_simple(session, "OK");
     }
+    /* CLUSTER PEERAUTH is authentication, not a data command: it must run
+     * before the NOAUTH gate, exactly like AUTH and HELLO. */
+    if (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
+        qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
+        return qihse_resp_handle_cluster_peerauth(session, request);
+    }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     /* U2 revocation SLA: re-validate the session principal authoritatively
      * once per command. A destroyed principal loses the session immediately —
@@ -8761,7 +8861,7 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
      * a live lookup so revocation lands on the next command. */
     bool session_active = true;
     uint32_t session_tenant = QIHSE_TENANT_SYSTEM;
-    if (session->user) {
+    if (session->user && session->user != &session->peer_claims) {
         qihse_auth_user_active_and_tenant(session->user, &session_active, &session_tenant);
         if (!session_active) {
             session->user = NULL;
@@ -9504,6 +9604,14 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
                 server->fabric_pkey = self_pkey;
                 server->fabric_node_id = self_id;
                 server->fabric_have_identity = true;
+                /* Scatter principal propagation: the same enrolled identity
+                 * lets fanned-out queries present the caller's claims to
+                 * each peer (CLUSTER PEERAUTH). */
+                if (server->scatter) {
+                    qihse_cluster_scatter_set_identity(server->scatter,
+                                                       &server->fabric_node_id,
+                                                       server->fabric_pkey);
+                }
                 /* The enrolled identity that outbound dispatch uses is also
                  * what signed-gossip production needs: wire the bus to mint
                  * v3 membership statements (capability profile inside the

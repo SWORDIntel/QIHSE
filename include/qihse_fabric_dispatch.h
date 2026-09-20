@@ -133,6 +133,12 @@ bool qihse_fabric_jobtype_is_idempotent(qihse_fabric_job_t type);
  * be presented to fetch a result and vice versa. */
 #define QIHSE_FABRIC_TOKEN_PURPOSE_RUN 1u
 #define QIHSE_FABRIC_TOKEN_PURPOSE_FETCH 2u
+/* A SCATTER token is not a job capability: it is a principal claim a peer
+ * presents over a plain RESP connection (CLUSTER PEERAUTH) so a fanned-out
+ * query runs under the submitter's principal rather than unauthenticated.
+ * It binds no job and no payload — job_type is NONE and the payload digest
+ * is the digest of zero bytes. */
+#define QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER 3u
 
 /* The scope a token must carry.  These are the federation infrastructure
  * scopes (qihse_federation.h): a RUN writes on the peer, a FETCH reads.  The
@@ -140,6 +146,9 @@ bool qihse_fabric_jobtype_is_idempotent(qihse_fabric_job_t type);
  * enrolled scopes, so a node cannot claim a scope it was never enrolled with. */
 #define QIHSE_FABRIC_SCOPE_RUN QIHSE_SCOPE_FEDERATION_WRITE
 #define QIHSE_FABRIC_SCOPE_FETCH QIHSE_SCOPE_FEDERATION_READ
+/* A SCATTER token only ever installs a READ claim; a node cannot propagate
+ * write authority it does not itself hold. */
+#define QIHSE_FABRIC_SCOPE_SCATTER QIHSE_SCOPE_FEDERATION_READ
 
 typedef struct {
     uint16_t purpose;          /* QIHSE_FABRIC_TOKEN_PURPOSE_* */

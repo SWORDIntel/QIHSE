@@ -309,10 +309,15 @@ bool qihse_fabric_token_parse(const uint8_t* blob, size_t blob_len,
     if (signature_len != qihse_sig_alg_signature_bytes(sig_alg)) return false;
     if (signature_len == 0) return false;
     if (purpose != QIHSE_FABRIC_TOKEN_PURPOSE_RUN &&
-        purpose != QIHSE_FABRIC_TOKEN_PURPOSE_FETCH) return false;
-    if (job_type != (uint16_t)QIHSE_FABRIC_JOB_EMBED &&
-        job_type != (uint16_t)QIHSE_FABRIC_JOB_KEYSTONE_INGEST &&
-        job_type != (uint16_t)QIHSE_FABRIC_JOB_INFERENCE) return false;
+        purpose != QIHSE_FABRIC_TOKEN_PURPOSE_FETCH &&
+        purpose != QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER) return false;
+    /* A SCATTER token carries no job binding; a job token carries no
+     * principal claim for a scatter session. */
+    if (purpose == QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER) {
+        if (job_type != (uint16_t)QIHSE_FABRIC_JOB_NONE) return false;
+    } else if (job_type != (uint16_t)QIHSE_FABRIC_JOB_EMBED &&
+               job_type != (uint16_t)QIHSE_FABRIC_JOB_KEYSTONE_INGEST &&
+               job_type != (uint16_t)QIHSE_FABRIC_JOB_INFERENCE) return false;
     if (payload_len > QIHSE_FABRIC_MAX_PAYLOAD) return false;
     if (issued_ms == 0u || expires_ms <= issued_ms) return false;
     if (expires_ms - issued_ms > QIHSE_FABRIC_TOKEN_MAX_TTL_MS) return false;
