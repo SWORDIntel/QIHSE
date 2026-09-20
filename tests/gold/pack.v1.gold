@@ -232,8 +232,13 @@ workload mongo-wire area=protocol-compat expect=pass timeout=300 \
 gap protocol-compat/other-adapters area=protocol-compat \
     reason="RESP, HTTP, Elasticsearch, ClickHouse and Influx adapter end-to-end compatibility has no runnable harness in the main Makefile target graph; this pack exercises Bolt, the replication frame and the pooler only, plus the declared-adapter presence probe"
 
-gap protocol-compat/bolt-negative-auth area=protocol-compat \
-    reason="AGENTS.md invariant 3 requires a low-clearance/high-data negative authorization test for every protocol adapter; tests/test_bolt.c exercises the codec, framing and handshake only, and no Bolt negative authorization test exists in the target graph"
+# bolt-negative-auth: COVERED by the bolt-codec workload above.  tests/test_bolt.c
+# (test_bolt_negative_auth) drives the real client handler over a socketpair:
+# unauthenticated RUN and refused authenticated RUN both return FAILURE frames,
+# wrong credentials are refused, and the refusal bytes are asserted not to echo
+# the query text.  There is no result path to probe for high-data disclosure —
+# RUN dispatch is refused for the graph stub and PULL returns an empty record —
+# so the denial test plus the absent-data-path assertion IS the honest coverage.
 
 # ----------------------------------------------------------------------------
 # 7. Distributed failure

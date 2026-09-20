@@ -22,6 +22,8 @@
  *       and PackStream tiny map/int/string/list encoding and decoding.
  */
 #include "qihse_bolt.h"
+#include "qihse_auth.h"
+#include "qihse_uwp.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -563,6 +565,137 @@ static void test_bolt_spec_compliance(void) {
     printf("PASS bolt 4.x spec compliance: signatures and packstream tiny containers\n");
 }
 
+/* ── 8. Negative authorization (AGENTS invariant 3) ─────────────────────── */
+
+/* A HELLO frame: {scheme, principal, credentials}. */
+static void send_hello(int fd, const char* principal, const char* credentials) {
+    qihse_bolt_buf_t fields, msg;
+    qihse_bolt_buf_init(&fields, 64);
+    qihse_bolt_encode_map_begin(&fields, 3);
+    qihse_bolt_encode_string(&fields, "scheme");
+    qihse_bolt_encode_string(&fields, "basic");
+    qihse_bolt_encode_string(&fields, "principal");
+    qihse_bolt_encode_string(&fields, principal);
+    qihse_bolt_encode_string(&fields, "credentials");
+    qihse_bolt_encode_string(&fields, credentials);
+    qihse_bolt_buf_init(&msg, fields.len + 8);
+    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_HELLO, fields.buf, fields.len);
+    assert(write(fd, msg.buf, msg.len) == (ssize_t)msg.len);
+    qihse_bolt_buf_free(&fields);
+    qihse_bolt_buf_free(&msg);
+}
+
+/* A RUN frame: [cypher, {}, {}]. */
+static void send_run(int fd, const char* cypher) {
+    qihse_bolt_buf_t fields, msg;
+    qihse_bolt_buf_init(&fields, 128);
+    qihse_bolt_encode_list_begin(&fields, 3);
+    qihse_bolt_encode_string(&fields, cypher);
+    qihse_bolt_encode_map_begin(&fields, 0);
+    qihse_bolt_encode_map_begin(&fields, 0);
+    qihse_bolt_buf_init(&msg, fields.len + 8);
+    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_RUN, fields.buf, fields.len);
+    assert(write(fd, msg.buf, msg.len) == (ssize_t)msg.len);
+    qihse_bolt_buf_free(&fields);
+    qihse_bolt_buf_free(&msg);
+}
+
+/* A marker that must never appear on the wire: it is the query text, and an
+ * honest adapter does not echo a refused query back. */
+#define BOLT_PROBE_MARKER "PROBE_CLASSIFIED_SENTINEL_7f3a"
+
+static void test_bolt_negative_auth(void) {
+    /* A low-clearance principal to authenticate as.  The auth table is
+     * populated BEFORE fork so the handler child sees the same users. */
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("test-op-password-bolt"));
+    qihse_user_t* op = qihse_auth_get_user(0);
+    assert(op != NULL);
+    assert(qihse_auth_create_user(op, 90u, QIHSE_ROLE_GUEST, 91u, 0u,
+                                  "guest-bolt-pass", false) != NULL);
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    /* A UWP context that is present but carries no engines: dispatch can run
+     * and refuse, which is exactly what must reach the wire as FAILURE. */
+    static qihse_uwp_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    uint8_t req[20];
+    req[0] = 0x60; req[1] = 0x60; req[2] = 0xB0; req[3] = 0x17;
+    for (int i = 0; i < 4; i++) {
+        uint32_t v = (i == 0) ? QIHSE_BOLT_VERSION_4 : 0;
+        req[4 + i * 4] = (uint8_t)(v >> 24);
+        req[5 + i * 4] = (uint8_t)(v >> 16);
+        req[6 + i * 4] = (uint8_t)(v >> 8);
+        req[7 + i * 4] = (uint8_t)v;
+    }
+    assert(write(sv[0], req, sizeof(req)) == (ssize_t)sizeof(req));
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(sv[0]);
+        qihse_bolt_handle_client(sv[1], &ctx);
+        _exit(0);
+    }
+    close(sv[1]);
+
+    uint8_t vresp[4];
+    assert(read(sv[0], vresp, 4) == 4);
+
+    uint8_t sig = 0;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+
+    /* RUN with NO HELLO: unauthenticated dispatch is a FAILURE, not a
+     * SUCCESS for work that was never done. */
+    send_run(sv[0], "MATCH (n) RETURN n /* " BOLT_PROBE_MARKER " */");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_FAILURE);
+    assert(payload == NULL || memmem(payload, plen, BOLT_PROBE_MARKER,
+                                     strlen(BOLT_PROBE_MARKER)) == NULL);
+    free(payload);
+
+    /* HELLO with a wrong password is refused, not admitted. */
+    send_hello(sv[0], "User_90", "wrong-password");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_FAILURE);
+    free(payload);
+
+    /* HELLO with the real credentials is accepted. */
+    send_hello(sv[0], "User_90", "guest-bolt-pass");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_SUCCESS);
+    free(payload);
+
+    /* An authenticated RUN whose engine refuses is STILL a FAILURE — the
+     * adapter does not report success for a query that did not run. */
+    send_run(sv[0], "MATCH (n) RETURN n /* " BOLT_PROBE_MARKER " */");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_FAILURE);
+    assert(payload == NULL || memmem(payload, plen, BOLT_PROBE_MARKER,
+                                     strlen(BOLT_PROBE_MARKER)) == NULL);
+    free(payload);
+
+    /* GOODBYE ends the session. */
+    qihse_bolt_buf_t msg;
+    qihse_bolt_buf_init(&msg, 16);
+    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_GOODBYE, NULL, 0);
+    assert(write(sv[0], msg.buf, msg.len) == (ssize_t)msg.len);
+    qihse_bolt_buf_free(&msg);
+
+    uint8_t sink[8];
+    assert(read(sv[0], sink, sizeof(sink)) == 0);
+    close(sv[0]);
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+
+    printf("PASS bolt negative auth: unauthenticated and refused RUNs are FAILURE, "
+           "bad credentials refused, no query text on the wire\n");
+}
+
 int main(void) {
     test_packstream_primitives();
     test_packstream_containers();
@@ -571,6 +704,7 @@ int main(void) {
     test_handshake();
     test_client_message_loop();
     test_bolt_spec_compliance();
+    test_bolt_negative_auth();
     printf("test_bolt: all asserted Bolt behaviours passed\n");
     return 0;
 }

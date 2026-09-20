@@ -831,11 +831,23 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx) {
+                    bool dispatched = ctx &&
                         qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                            uwp_pkt + sizeof(qihse_uwp_header_t),
                                            uwp_len - sizeof(qihse_uwp_header_t),
                                            resp, sizeof(resp), &resp_len);
+                    /* A dispatch refusal is a FAILURE, not a SUCCESS: an
+                     * unauthenticated RUN (bolt_user NULL) or a query the
+                     * engine refused must not report success for work it did
+                     * not do.  The refusal reason is the generic Bolt code —
+                     * the response buffer is never echoed to the wire. */
+                    if (!dispatched) {
+                        bolt_send_failure(client_fd,
+                                          "Neo.ClientError.Security.Unauthorized",
+                                          bolt_user ? "query refused" : "unauthenticated");
+                        free(uwp_pkt);
+                        qihse_bolt_value_free(cypher);
+                        break;
                     }
                     bolt_send_success(client_fd, "t_first", "1");
                     bolt_send_success(client_fd, "qid", "0");
@@ -864,11 +876,16 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx) {
-                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
-                                           uwp_pkt + sizeof(qihse_uwp_header_t),
-                                           uwp_len - sizeof(qihse_uwp_header_t),
-                                           resp, sizeof(resp), &resp_len);
+                    if (ctx &&
+                        !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
+                                            uwp_pkt + sizeof(qihse_uwp_header_t),
+                                            uwp_len - sizeof(qihse_uwp_header_t),
+                                            resp, sizeof(resp), &resp_len)) {
+                        /* Same rule as RUN: a refused dispatch is a FAILURE. */
+                        bolt_send_failure(client_fd,
+                                          "Neo.ClientError.Security.Unauthorized",
+                                          bolt_user ? "query refused" : "unauthenticated");
+                        break;
                     }
                     bolt_send_success(client_fd, NULL, NULL);
                     break;
@@ -885,11 +902,16 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx) {
-                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
-                                           uwp_pkt + sizeof(qihse_uwp_header_t),
-                                           uwp_len - sizeof(qihse_uwp_header_t),
-                                           resp, sizeof(resp), &resp_len);
+                    if (ctx &&
+                        !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
+                                            uwp_pkt + sizeof(qihse_uwp_header_t),
+                                            uwp_len - sizeof(qihse_uwp_header_t),
+                                            resp, sizeof(resp), &resp_len)) {
+                        /* Same rule as RUN: a refused dispatch is a FAILURE. */
+                        bolt_send_failure(client_fd,
+                                          "Neo.ClientError.Security.Unauthorized",
+                                          bolt_user ? "query refused" : "unauthenticated");
+                        break;
                     }
                     bolt_send_success(client_fd, "bookmark", "qihse:0");
                     break;
@@ -906,11 +928,16 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx) {
-                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
-                                           uwp_pkt + sizeof(qihse_uwp_header_t),
-                                           uwp_len - sizeof(qihse_uwp_header_t),
-                                           resp, sizeof(resp), &resp_len);
+                    if (ctx &&
+                        !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
+                                            uwp_pkt + sizeof(qihse_uwp_header_t),
+                                            uwp_len - sizeof(qihse_uwp_header_t),
+                                            resp, sizeof(resp), &resp_len)) {
+                        /* Same rule as RUN: a refused dispatch is a FAILURE. */
+                        bolt_send_failure(client_fd,
+                                          "Neo.ClientError.Security.Unauthorized",
+                                          bolt_user ? "query refused" : "unauthenticated");
+                        break;
                     }
                     bolt_send_success(client_fd, NULL, NULL);
                     break;
