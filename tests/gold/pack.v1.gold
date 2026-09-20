@@ -374,8 +374,13 @@ workload fabric-memory-kind-filter area=ai-fabric expect=pass timeout=180 \
     output="ai memory extension tests passed" \
     run="make -s test-ai-memory-ext"
 
-gap ai-fabric/vector-candidate-crowding area=ai-fabric \
-    reason="aimem_vec_search() selects the top-want vectors WITHOUT a user, so a vector the caller cannot read can occupy a candidate slot and push a visible memory out of the semantic top-k. This is CROWDING, not disclosure — every candidate is re-resolved with the caller before it is returned — but a low-clearance caller's semantic recall is degraded by records they cannot see. Pre-existing; the kind filter does not cause or fix it, because post-resolve filtering happens after top-k selection."
+# FIXED: aimem_vec_search now carries each vector's classification/SCI in the
+# in-memory entry and filters by qihse_auth_can_access DURING top-k selection,
+# so an invisible vector can no longer crowd a visible memory out of a
+# caller's top-k. Verified by the crowding regression inside
+# tests/test_ai_memory_ext.c (workload fabric-memory-kind-filter). Resolve
+# still re-checks every candidate through the authorization-aware read before
+# it is returned — the selection-time check withholds, it cannot surface.
 
 # Remote dispatch: a job whose best-fit node is a peer must RUN there under a
 # signed capability token bound to job/payload/principal/scope; the executor

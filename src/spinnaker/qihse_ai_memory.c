@@ -203,6 +203,13 @@ typedef struct {
     uint64_t doc_id;
     size_t dim;
     float* vec;
+    /* The memory's classification at write time, kept in the entry so vector
+     * candidate selection can filter by visibility WITHOUT resolving the
+     * record.  Without this the top-k fills with vectors the caller cannot
+     * see and visible memories are crowded out — a recall-quality denial,
+     * not a disclosure (resolve still re-checks before returning a hit). */
+    uint16_t classification;
+    uint16_t sci;
 } aimem_vec_entry_t;
 
 static aimem_vec_entry_t* g_aimem_vecs = NULL;
@@ -270,6 +277,18 @@ static bool aimem_vec_store(qihse_kv_store_t* store, qihse_user_t* user,
     return ok;
 }
 
+/* Caller holds g_aimem_lock. */
+static void aimem_vecs_remove(uint64_t doc_id) {
+    for (size_t i = 0; i < g_aimem_vec_count; i++) {
+        if (g_aimem_vecs[i].doc_id == doc_id) {
+            free(g_aimem_vecs[i].vec);
+            g_aimem_vecs[i] = g_aimem_vecs[g_aimem_vec_count - 1u];
+            g_aimem_vec_count--;
+            return;
+        }
+    }
+}
+
 static void aimem_vecs_clear(void) {
     for (size_t i = 0; i < g_aimem_vec_count; i++) free(g_aimem_vecs[i].vec);
     free(g_aimem_vecs);
@@ -279,7 +298,8 @@ static void aimem_vecs_clear(void) {
     g_aimem_vecs_loaded = false;
 }
 
-static bool aimem_vecs_push(uint64_t doc_id, const float* vec, size_t dim) {
+static bool aimem_vecs_push(uint64_t doc_id, const float* vec, size_t dim,
+                            uint16_t classification, uint16_t sci) {
     if (g_aimem_vec_count == g_aimem_vec_cap) {
         size_t cap = g_aimem_vec_cap ? g_aimem_vec_cap * 2u : 64u;
         aimem_vec_entry_t* grown = (aimem_vec_entry_t*)realloc(
@@ -294,6 +314,8 @@ static bool aimem_vecs_push(uint64_t doc_id, const float* vec, size_t dim) {
     g_aimem_vecs[g_aimem_vec_count].doc_id = doc_id;
     g_aimem_vecs[g_aimem_vec_count].dim = dim;
     g_aimem_vecs[g_aimem_vec_count].vec = copy;
+    g_aimem_vecs[g_aimem_vec_count].classification = classification;
+    g_aimem_vecs[g_aimem_vec_count].sci = sci;
     g_aimem_vec_count++;
     return true;
 }
@@ -332,6 +354,7 @@ static bool aimem_vec_parse(const char* value, const char* want_provider,
 }
 
 typedef struct {
+    qihse_kv_store_t* store; /* for the doc-record lookup that carries cls/sci */
     size_t loaded;
 } aimem_vec_rebuild_t;
 
@@ -344,7 +367,23 @@ static bool aimem_vec_rebuild_cb(const char* key, const char* value, void* user_
     if (!aimem_vec_parse(value, g_aimem_embedder_name, vec, QIHSE_AIMEM_MAX_DIM, &dim)) {
         return true; /* unparsable or foreign-provider: skip, do not fail the scan */
     }
-    if (aimem_vecs_push(doc_id, vec, dim)) rb->loaded++;
+    /* The vector record does not serialise the memory's classification; the
+     * DOC record does.  Read it for the in-memory entry so selection can
+     * pre-filter by visibility.  A vector with no doc record is stale (the
+     * memory was deleted but its vector was not) and is skipped: loading it
+     * would consume candidate slots for a record resolve can never return. */
+    char doc_key[64];
+    aimem_key(doc_key, sizeof doc_key, doc_id);
+    char* doc = qihse_kv_get_user(rb->store, doc_key, qihse_auth_get_user(0));
+    if (!doc) return true;
+    qihse_ai_memory_hit_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    bool have = aimem_parse_header(doc, &hdr, NULL);
+    free(doc);
+    if (!have) return true;
+    if (aimem_vecs_push(doc_id, vec, dim, hdr.classification, hdr.sci_compartment)) {
+        rb->loaded++;
+    }
     return true;
 }
 
@@ -353,7 +392,7 @@ static bool aimem_vecs_ensure(qihse_resp_server_t* server) {
     if (g_aimem_vecs_loaded) return true;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
     if (!store) return false;
-    aimem_vec_rebuild_t rb = { 0 };
+    aimem_vec_rebuild_t rb = { .store = store, .loaded = 0 };
     qihse_kv_foreach_user(store, qihse_auth_get_user(0), aimem_vec_rebuild_cb, &rb);
     g_aimem_vecs_loaded = true;
     return true;
@@ -366,12 +405,24 @@ typedef struct {
 
 /* Caller holds g_aimem_lock. Scores every stored vector against the query and
  * returns the top `want` by cosine similarity. Vectors from another provider
- * were already excluded at load time. */
+ * were already excluded at load time.
+ *
+ * Visibility is checked DURING selection, not after: a vector whose memory
+ * the caller cannot read must not occupy a top-k slot, or it crowds a
+ * visible memory out of the result — a recall denial the old code produced
+ * by filtering only at resolve time. This is still not the disclosure check:
+ * aimem_resolve re-reads the record through the authorization-aware path
+ * before anything is returned, so a stale or forged classification here can
+ * only withhold a hit, never surface one. */
 static size_t aimem_vec_search(const float* qvec, size_t qdim, size_t want,
-                               aimem_cand_t* out) {
+                               const qihse_user_t* user, aimem_cand_t* out) {
     size_t written = 0;
     for (size_t i = 0; i < g_aimem_vec_count; i++) {
         if (g_aimem_vecs[i].dim != qdim) continue;
+        if (!qihse_auth_can_access(user, g_aimem_vecs[i].classification,
+                                   g_aimem_vecs[i].sci)) {
+            continue;
+        }
         const float* v = g_aimem_vecs[i].vec;
         double dot = 0.0, na = 0.0, nb = 0.0;
         for (size_t k = 0; k < qdim; k++) {
@@ -453,7 +504,10 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                 fprintf(stderr, "qihse-ai-memory: record stored without a vector (id %s)\n", id);
             } else {
                 pthread_mutex_lock(&g_aimem_lock);
-                if (g_aimem_vecs_loaded) (void)aimem_vecs_push(aimem_doc_id(&uuid), vec, dim);
+                if (g_aimem_vecs_loaded) {
+                    (void)aimem_vecs_push(aimem_doc_id(&uuid), vec, dim,
+                                          classification, sci);
+                }
                 pthread_mutex_unlock(&g_aimem_lock);
             }
         }
@@ -604,7 +658,7 @@ static size_t aimem_recall(qihse_resp_server_t* server, qihse_user_t* user,
         if (qdim && qdim <= QIHSE_AIMEM_MAX_DIM &&
             g_aimem_embedder.embed(query, qvec, qdim, g_aimem_embedder.ctx) &&
             aimem_vecs_ensure(server)) {
-            n_vector = aimem_vec_search(qvec, qdim, cand_want, vector);
+            n_vector = aimem_vec_search(qvec, qdim, cand_want, user, vector);
         }
     }
     pthread_mutex_unlock(&g_aimem_lock);
@@ -699,12 +753,15 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
     aimem_key(key, sizeof key, aimem_doc_id(&uuid));
     bool ok = qihse_kv_del_user(store, key, user);
     /* Drop the vector as well, or a forgotten memory would keep ranking in
-     * semantic recall. Its KV record is gone so it would not be returned, but
-     * a stale vector still consumes a candidate slot and can push a visible
-     * memory out of the top-k. */
+     * semantic recall — from the in-memory index too, not only the KV record:
+     * a stale entry consumes a candidate slot and can push a visible memory
+     * out of the top-k even though resolve can never return it. */
     char vkey[64];
     aimem_vec_key(vkey, sizeof vkey, aimem_doc_id(&uuid));
     (void)qihse_kv_del_user(store, vkey, user);
+    pthread_mutex_lock(&g_aimem_lock);
+    aimem_vecs_remove(aimem_doc_id(&uuid));
+    pthread_mutex_unlock(&g_aimem_lock);
     return ok;
 }
 

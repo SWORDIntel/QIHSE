@@ -339,6 +339,38 @@ int main(void) {
     qihse_ai_memory_hits_free(hits, n);
     printf("PASS durability: records and vectors survive a reopen, index and vector cache rebuild\n");
 
+    /* ── G. crowding: an invisible vector must not occupy a top-k slot ────
+     * aimem_vec_search used to select the top-k with no visibility check, so
+     * a classified vector that outranked the caller's own consumed the slot
+     * and a limit=1 semantic recall returned NOTHING — a recall denial, not
+     * a disclosure. Selection now filters by the vector's recorded
+     * classification before a candidate can take a slot.
+     *
+     * The classified memory repeats BOTH query tokens so its cosine score is
+     * higher than the guest's, which shares only one.  Run on the REOPENED
+     * store so the rebuild path (doc-record classification lookup) is what
+     * the assertion exercises, not only the store-time push. */
+    {
+        char id_hi[QIHSE_AIMEM_ID_LEN + 1u], id_lo[QIHSE_AIMEM_ID_LEN + 1u];
+        assert(qihse_ai_memory_store(server, analyst,
+                                     "quokka orbit quokka orbit quokka orbit " MARK_CLASSIFIED,
+                                     QIHSE_AIMEM_SEMANTIC, id_hi));
+        assert(qihse_ai_memory_store(server, guest,
+                                     "quokka " MARK_GUEST " low orbit note",
+                                     QIHSE_AIMEM_SEMANTIC, id_lo));
+        memset(hits, 0, sizeof hits);
+        bool saw_secret = false;
+        n = recall_kind(server, guest, "quokka orbit", 1u, QIHSE_AIMEM_MODE_SEMANTIC,
+                        QIHSE_AIMEM_KIND_ANY, hits, 16u, MARK_CLASSIFIED, &saw_secret);
+        assert(!saw_secret);
+        /* The visible memory wins the slot the classified vector would have
+         * crowded out. */
+        assert(n == 1u);
+        assert(text_contains(hits[0].text, MARK_GUEST));
+        qihse_ai_memory_hits_free(hits, n);
+        printf("PASS crowding: an invisible top-ranked vector cannot consume a caller's top-k\n");
+    }
+
     qihse_ai_memory_reset();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
