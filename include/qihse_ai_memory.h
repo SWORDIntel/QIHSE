@@ -98,6 +98,13 @@ size_t qihse_ai_memory_embedding_dim(void);
 /* The active embedder's name, or "" when none is usable. */
 const char* qihse_ai_memory_embedder_name(void);
 
+/* Run the active embedder on `text`, filling exactly `dim` floats.
+ * Returns false when no provider is usable, `dim` does not match the
+ * provider, or the provider fails.  This is the "inference" primitive: the
+ * embedder is the model backend, and this is the only way to run it without
+ * storing a memory. */
+bool qihse_ai_memory_embed_text(const char* text, float* out, size_t dim);
+
 /* Remember: store `text` and index it for recall. Returns false when the
  * store or index rejects the write (including insufficient clearance). */
 bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,

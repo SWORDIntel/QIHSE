@@ -398,8 +398,8 @@ workload controller-api area=protocol-compat expect=pass timeout=300 \
     output="controller api tests passed" \
     run="make -s test-controller-api"
 
-gap ai-fabric/inference-executors area=ai-fabric \
-    reason="Two of the four job types named in ai_fabric.md have executors (embed, keystone-ingest). inference and index-build do NOT and are REFUSED with 'job type not implemented' rather than accepted, so the gap is loud rather than silent. inference needs a model backend that does not exist; index-build needs a defined build unit."
+gap ai-fabric/index-build-executor area=ai-fabric \
+    reason="Three of the four job types named in ai_fabric.md have executors (embed, keystone-ingest, inference — the last running the active embedding provider and persisting the vector record, verified locally and remotely). index-build does NOT and is REFUSED with 'job type not implemented' rather than accepted, so the gap is loud rather than silent. index-build needs a defined build unit."
 
 # ----------------------------------------------------------------------------
 # 11. Overlay discovery (IRC dead-drop + DHT peer exchange)

@@ -147,7 +147,7 @@ int main(void) {
     char reply[8192];
 
     /* ── 3. a type with no executor is refused ────────────────────────── */
-    const char* bad[] = { "FABRIC", "SUBMIT", "inference", "0", "0", "hello" };
+    const char* bad[] = { "FABRIC", "SUBMIT", "index-build", "0", "0", "hello" };
     assert(run_cmd(6u, bad, reply, sizeof reply));
     assert(strstr(reply, "not implemented") != NULL);
     printf("PASS unimplemented type refused rather than queued and ignored\n");
@@ -215,6 +215,42 @@ int main(void) {
     assert(strstr(reply, "fabric:ingest:") != NULL);
     printf("PASS keystone-ingest persisted an artifact and reported indexing as %s\n",
            indexed ? "done" : "stored-unindexed");
+
+    /* ── inference runs the active provider and stores the vector ─────── */
+    const char* inf[] = { "FABRIC", "SUBMIT", "inference", "0", "0",
+                          "vector for a semantic retrieval check" };
+    assert(run_cmd(6u, inf, reply, sizeof reply));
+    assert(strstr(reply, "status:done") != NULL);
+    char xjid[32];
+    assert(parse_job_id(reply, xjid, sizeof xjid));
+    const char* xres[] = { "FABRIC", "RESULT", xjid };
+    assert(run_cmd(3u, xres, reply, sizeof reply));
+    assert(strstr(reply, "inference") != NULL);
+    assert(strstr(reply, "fabric:infer:") != NULL);
+    /* The artifact is a real vector record, not a stub: it names the active
+     * provider, the dimension, and the digest of the float vector. */
+    char infer_key[128];
+    snprintf(infer_key, sizeof infer_key, "fabric:infer:%s", xjid);
+    char* vec_rec = qihse_kv_get_user(store, infer_key, qihse_auth_get_user(0));
+    assert(vec_rec != NULL);
+    assert(strstr(vec_rec, "model:") != NULL);
+    assert(strstr(vec_rec, "dim:") != NULL);
+    assert(strstr(vec_rec, "sha384:") != NULL);
+    assert(strstr(vec_rec, "vec:") != NULL);
+    /* Deterministic: the same payload infers the same digest. */
+    const char* inf2[] = { "FABRIC", "SUBMIT", "inference", "0", "0",
+                           "vector for a semantic retrieval check" };
+    assert(run_cmd(6u, inf2, reply, sizeof reply));
+    assert(strstr(reply, "status:done") != NULL);
+    char xjid2[32];
+    assert(parse_job_id(reply, xjid2, sizeof xjid2));
+    snprintf(infer_key, sizeof infer_key, "fabric:infer:%s", xjid2);
+    char* vec_rec2 = qihse_kv_get_user(store, infer_key, qihse_auth_get_user(0));
+    assert(vec_rec2 != NULL);
+    assert(strcmp(vec_rec, vec_rec2) == 0);
+    free(vec_rec);
+    free(vec_rec2);
+    printf("PASS inference ran the provider and stored a deterministic vector artifact\n");
 
     /* ── a job id that does not exist is an error, not a phantom ──────── */
     const char* missing[] = { "FABRIC", "RESULT", "999999" };

@@ -5,7 +5,7 @@
 > reachability chain covered by the `gold-fabric-durable-caps` workload in
 > `tests/gold/pack.v1.gold`. Item 2 is `implemented` and verified by
 > `tests/test_fabric_index.c`. Item 3 is `partial`: `FABRIC.SUBMIT` executes
-> two job types locally and refuses the other two, and it dispatches to a
+> three job types locally and refuses `index-build`, and it dispatches to a
 > peer over the federation mTLS channel under a signed capability token
 > (`src/federation/qihse_fabric_dispatch.c`, verified by
 > `tests/test_fabric_dispatch.c`); the remaining gaps are recorded in
@@ -107,8 +107,9 @@ Postgres, no platform glue.
 > **Status: partial** — the local executors and the refusal path are verified
 > by `tests/test_fabric_jobs.c`, and remote dispatch is verified by
 > `tests/test_fabric_dispatch.c` (the `fabric-remote-dispatch` workload in
-> `tests/gold/pack.v1.gold`). Two of the four named job types have no executor
-> (`ai-fabric/inference-executors`). Dispatch endpoint discovery is signed:
+> `tests/gold/pack.v1.gold`). Three of the four named job types have
+> executors; `index-build` does not (`ai-fabric/index-build-executor`).
+> Dispatch endpoint discovery is signed:
 > the v4 membership statement carries the node's dispatch `host:port` inside
 > the signed region, and `FABRIC.SUBMIT`/`FABRIC.FETCH` resolve the peer
 > through the durable capability record (`lookup_admissible`, so revocation
@@ -128,8 +129,16 @@ Postgres, no platform glue.
     artifact and classifies/indexes it through KEYSTONE. Because the index is a
     soft dependency, "stored but not indexed" is reported as its own
     `stored-unindexed` status rather than as success.
-- `inference` and `index-build` are REFUSED with `job type not implemented`,
-  rather than accepted and silently ignored.
+- `inference` runs the ACTIVE embedding provider over the payload — the
+  builtin lexical vector today, a real model when one is installed via
+  `qihse_ai_memory_set_embedder` — and persists the result as a
+  `fabric:infer:<job-id>` artifact record (`model:<name> dim:<n>
+  sha384:<digest> vec:<f,f,...>`) at the caller's classification, remotely
+  under `fabric:infer:r:<submitter>:<job>` at the token's claims. The output
+  is a deterministic function of (payload, provider), which is what makes it
+  dispatch-idempotent.
+- `index-build` is REFUSED with `job type not implemented`, rather than
+  accepted and silently ignored — it needs a defined build unit.
 - Remote dispatch is implemented (`src/federation/qihse_fabric_dispatch.c`).
   A job whose best-fit node is a peer is sent over the federation mTLS
   channel with a signed capability token binding job type, job id, payload

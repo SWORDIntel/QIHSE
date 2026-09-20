@@ -106,7 +106,8 @@ extern "C" {
 typedef enum {
     QIHSE_FABRIC_JOB_NONE = 0,
     QIHSE_FABRIC_JOB_EMBED = 1,
-    QIHSE_FABRIC_JOB_KEYSTONE_INGEST = 2
+    QIHSE_FABRIC_JOB_KEYSTONE_INGEST = 2,
+    QIHSE_FABRIC_JOB_INFERENCE = 3
 } qihse_fabric_job_t;
 
 typedef struct {
@@ -257,6 +258,23 @@ bool qihse_fabric_remote_result_key(const qihse_uuid_t* submitter_node,
 bool qihse_fabric_remote_artifact_key(const qihse_uuid_t* submitter_node,
                                       uint64_t job_id,
                                       char* out, size_t out_cap);
+
+/* Same deterministic binding for an `inference` artifact (the vector
+ * record), under its own prefix so an ingest artifact and an inference
+ * artifact for the same job can never alias. */
+bool qihse_fabric_remote_inference_key(const qihse_uuid_t* submitter_node,
+                                       uint64_t job_id,
+                                       char* out, size_t out_cap);
+
+/* Run the `inference` executor over `payload`: runs the ACTIVE embedding
+ * provider (`qihse_ai_memory_set_embedder` — the builtin lexical vector
+ * today, a real model when one is installed) and formats the result as
+ * `model:<name> dim:<n> sha384:<96-hex> vec:<f,f,...>`.  The output is a
+ * deterministic function of (payload, provider), which is what makes the
+ * job dispatch-idempotent.  Returns false on a provider failure or when
+ * `cap` cannot hold the result — the caller refuses rather than serving a
+ * truncated vector. */
+bool qihse_fabric_run_inference(const char* payload, char* out, size_t cap);
 
 typedef struct {
     qihse_resp_server_t* server;   /* store + the local executors */

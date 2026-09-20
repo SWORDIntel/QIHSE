@@ -498,6 +498,34 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
         free(a3);
         printf("PASS signed endpoint: v4 statement endpoint becomes the dial target\n");
     }
+
+    /* ── inference dispatches remotely too ──────────────────────────────
+     * The executor runs the ACTIVE provider on the payload and stores the
+     * vector record under the deterministic inference artifact key, at the
+     * token's claims. */
+    {
+        const char* sub4[] = { "FABRIC", "SUBMIT", "inference", "0", "0",
+                               "remote inference payload" };
+        run_cmd(g_submitter, g_low, 6u, sub4, reply, sizeof reply);
+        assert(strstr(reply, "status:pending-fetch") != NULL);
+        char jid4[32];
+        assert(parse_job_id(reply, jid4, sizeof jid4));
+        const char* fetch4[] = { "FABRIC", "FETCH", jid4 };
+        run_cmd(g_submitter, g_low, 3u, fetch4, reply, sizeof reply);
+        assert(strstr(reply, "fetched") != NULL);
+        assert(strstr(reply, "status:done") != NULL);
+        /* The vector record is in the EXECUTOR's store at the inference
+         * artifact key — not the ingest key. */
+        char ikey[192];
+        assert(qihse_fabric_remote_inference_key(&g_id_a.node_id,
+                                                 strtoull(jid4, NULL, 10),
+                                                 ikey, sizeof ikey));
+        char* vr = qihse_kv_get_user(g_store_b, ikey, g_op);
+        assert(vr != NULL);
+        assert(strstr(vr, "model:") != NULL && strstr(vr, "vec:") != NULL);
+        free(vr);
+        printf("PASS remote inference: vector record stored on the executor\n");
+    }
 }
 
 /* ── INVARIANT 3: low clearance vs high data (merge blocker) ───────────── */

@@ -249,6 +249,12 @@ bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider) {
 size_t qihse_ai_memory_embedding_dim(void) { return g_aimem_embedder.dim; }
 const char* qihse_ai_memory_embedder_name(void) { return g_aimem_embedder_name; }
 
+bool qihse_ai_memory_embed_text(const char* text, float* out, size_t dim) {
+    if (!text || !out || dim == 0u || dim != g_aimem_embedder.dim) return false;
+    if (!g_aimem_embedder.embed) return false;
+    return g_aimem_embedder.embed(text, out, dim, g_aimem_embedder.ctx);
+}
+
 static void aimem_vec_key(char* out, size_t cap, uint64_t doc_id) {
     snprintf(out, cap, AIMEM_VEC_PREFIX "%016llx", (unsigned long long)doc_id);
 }

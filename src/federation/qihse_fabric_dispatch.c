@@ -59,6 +59,7 @@
  * an idempotent job an OVERWRITE of the same record rather than a second one. */
 #define FABRIC_REMOTE_RESULT_KEY_PREFIX "fabric:remote-result:"
 #define FABRIC_REMOTE_ARTIFACT_KEY_PREFIX "fabric:ingest:r:"
+#define FABRIC_REMOTE_INFERENCE_KEY_PREFIX "fabric:infer:r:"
 #define FABRIC_REPLAY_KEY_PREFIX "fabric:replay:"
 
 /* ── Bounded little-endian codec ────────────────────────────────────────── */
@@ -163,7 +164,11 @@ static const qihse_fabric_jobtype_decl_t g_fabric_jobtypes[] = {
       "the executor dedups on the submitter+job binding before running: a "
       "retry re-ACKs the existing result record, so the observed state is "
       "that of one run — the underlying store() call is NOT idempotent, and "
-      "it is never reached twice for the same binding" }
+      "it is never reached twice for the same binding" },
+    { "inference", QIHSE_FABRIC_JOB_INFERENCE, true,
+      "the output is a deterministic function of (payload, provider) written "
+      "to the deterministic artifact key for the job binding; a retry "
+      "overwrites the same record and leaves the same state as one run" }
 };
 
 const qihse_fabric_jobtype_decl_t* qihse_fabric_jobtype_lookup(const char* name) {
@@ -306,7 +311,8 @@ bool qihse_fabric_token_parse(const uint8_t* blob, size_t blob_len,
     if (purpose != QIHSE_FABRIC_TOKEN_PURPOSE_RUN &&
         purpose != QIHSE_FABRIC_TOKEN_PURPOSE_FETCH) return false;
     if (job_type != (uint16_t)QIHSE_FABRIC_JOB_EMBED &&
-        job_type != (uint16_t)QIHSE_FABRIC_JOB_KEYSTONE_INGEST) return false;
+        job_type != (uint16_t)QIHSE_FABRIC_JOB_KEYSTONE_INGEST &&
+        job_type != (uint16_t)QIHSE_FABRIC_JOB_INFERENCE) return false;
     if (payload_len > QIHSE_FABRIC_MAX_PAYLOAD) return false;
     if (issued_ms == 0u || expires_ms <= issued_ms) return false;
     if (expires_ms - issued_ms > QIHSE_FABRIC_TOKEN_MAX_TTL_MS) return false;
@@ -817,6 +823,41 @@ bool qihse_fabric_remote_artifact_key(const qihse_uuid_t* submitter_node,
                                     FABRIC_REMOTE_ARTIFACT_KEY_PREFIX);
 }
 
+bool qihse_fabric_remote_inference_key(const qihse_uuid_t* submitter_node,
+                                       uint64_t job_id, char* out, size_t out_cap) {
+    return fabric_remote_result_key(submitter_node, job_id, out, out_cap,
+                                    FABRIC_REMOTE_INFERENCE_KEY_PREFIX);
+}
+
+bool qihse_fabric_run_inference(const char* payload, char* out, size_t cap) {
+    if (!payload || !out || cap == 0u) return false;
+    size_t dim = qihse_ai_memory_embedding_dim();
+    if (dim == 0u || dim > QIHSE_AIMEM_MAX_DIM) return false;
+    float* vec = (float*)malloc(dim * sizeof(float));
+    if (!vec) return false;
+    bool ok = qihse_ai_memory_embed_text(payload, vec, dim);
+    if (ok) {
+        uint8_t dig[48];
+        ok = fabric_sha384_raw(vec, dim * sizeof(float), dig);
+        char hex[97];
+        fabric_hex48(dig, hex);
+        int n = snprintf(out, cap, "model:%s dim:%zu sha384:%s vec:",
+                         qihse_ai_memory_embedder_name(), dim, hex);
+        if (n <= 0 || (size_t)n >= cap) { ok = false; }
+        else {
+            size_t off = (size_t)n;
+            for (size_t i = 0; i < dim && ok; i++) {
+                int w = snprintf(out + off, cap - off, "%s%.6g",
+                                 i ? "," : "", (double)vec[i]);
+                if (w <= 0 || (size_t)w >= cap - off) ok = false;
+                else off += (size_t)w;
+            }
+        }
+    }
+    free(vec);
+    return ok;
+}
+
 /* Read the previous record's generation so a retry is observably a new
  * generation of the same job rather than a silent overwrite.  The read uses
  * the executor's explicit context: this is the executor's own store, and the
@@ -934,6 +975,9 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
     result_ref[0] = '\0';
     const char* record_payload = NULL;
     size_t record_payload_len = 0;
+    /* The inference result text has to outlive the executor branch: it is
+     * part of the durable record written below. */
+    char* infer_out = NULL;
 
     if (claims->job_type == QIHSE_FABRIC_JOB_KEYSTONE_INGEST) {
         char art_key[192];
@@ -967,6 +1011,34 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
             record_payload = payload;
             record_payload_len = payload_len;
         }
+    } else if (claims->job_type == QIHSE_FABRIC_JOB_INFERENCE) {
+        /* `inference`: run the ACTIVE provider over the payload and persist
+         * the vector record as the job's artifact at the token's claims. */
+        char art_key[192];
+        if (!qihse_fabric_remote_inference_key(&claims->submitter_node, claims->job_id,
+                                               art_key, sizeof(art_key))) {
+            return false;
+        }
+        infer_out = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
+        if (!infer_out) return false;
+        if (!qihse_fabric_run_inference(payload, infer_out, QIHSE_FABRIC_MAX_RESPONSE)) {
+            status = "failed";
+            reason = "inference-failed";
+        } else {
+            snprintf(result_ref, sizeof(result_ref), "%s", art_key);
+            bool stored = qihse_kv_set_user(store, art_key, infer_out,
+                                            claims->clearance, claims->sci,
+                                            ex->local_user);
+            if (!stored) {
+                status = "failed";
+                reason = "artifact-store-refused";
+            } else {
+                status = "done";
+                reason = "-";
+                record_payload = infer_out;
+                record_payload_len = strlen(infer_out);
+            }
+        }
     } else {
         char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
         mem_id[0] = '\0';
@@ -990,15 +1062,17 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
      * runs on the connection thread, and a multi-kilobyte frame per peer is
      * exactly the cheap denial-of-service shape AGENTS.md warns about. */
     char* record = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
-    if (!record) return false;
+    if (!record) { free(infer_out); return false; }
     size_t record_len = 0;
     if (!fabric_response_format(status, claims->job_type, claims->job_id, gen,
                                 claims->clearance, claims->sci, &ex->local_node,
                                 result_ref, reason, record_payload, record_payload_len,
                                 NULL, record, QIHSE_FABRIC_MAX_RESPONSE, &record_len)) {
         free(record);
+        free(infer_out);
         return false;
     }
+    free(infer_out); /* copied into the record; done with it */
     char record_digest[97];
     if (!qihse_fabric_sha384_hex(record, record_len, record_digest, sizeof(record_digest))) {
         free(record);

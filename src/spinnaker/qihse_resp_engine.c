@@ -7928,10 +7928,11 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
      * pointer-target mismatch the compiler warns about. */
     bool is_embed = strcmp(job_type, "embed") == 0;
     bool is_ingest = strcmp(job_type, "keystone-ingest") == 0;
-    if (!is_embed && !is_ingest) {
+    bool is_infer = strcmp(job_type, "inference") == 0;
+    if (!is_embed && !is_ingest && !is_infer) {
         char err[192];
         snprintf(err, sizeof(err),
-                 "ERR job type not implemented: %s (implemented: embed, keystone-ingest)",
+                 "ERR job type not implemented: %s (implemented: embed, keystone-ingest, inference)",
                  job_type);
         return qihse_resp_error(session, err);
     }
@@ -8041,6 +8042,36 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
                 status = "failed";
                 snprintf(err, sizeof(err), "embed failed");
             }
+        } else if (is_infer) {
+            /* `inference`: run the ACTIVE provider over the payload and
+             * persist the vector record at the caller's classification —
+             * the artifact key is deterministic, so a retry overwrites. */
+            char art_key[128];
+            snprintf(art_key, sizeof(art_key), "fabric:infer:%llu", (unsigned long long)jid);
+            char* out_vec = (char*)malloc(8192);
+            if (!out_vec) {
+                status = "failed";
+                snprintf(err, sizeof(err), "out of memory");
+            } else if (!qihse_fabric_run_inference(payload, out_vec, 8192)) {
+                free(out_vec);
+                status = "failed";
+                snprintf(err, sizeof(err), "inference failed");
+            } else {
+                pthread_rwlock_wrlock(&session->server->kv_lock);
+                bool stored = qihse_kv_set_user(session->server->store, art_key, out_vec,
+                                                qihse_user_get_classification(session->user),
+                                                qihse_user_get_sci(session->user),
+                                                session->user);
+                pthread_rwlock_unlock(&session->server->kv_lock);
+                free(out_vec);
+                if (!stored) {
+                    status = "failed";
+                    snprintf(err, sizeof(err), "artifact store failed");
+                } else {
+                    snprintf(result, sizeof(result), "%s", art_key);
+                    status = "done";
+                }
+            }
         } else {
             /* `keystone-ingest`: persist the payload as a fabric artifact and
              * classify+index it through KEYSTONE.
@@ -8107,7 +8138,8 @@ static bool qihse_resp_handle_fabric_submit(qihse_resp_session_t* session, const
                 rreq.pkey = session->server->fabric_pkey;
                 rreq.submitter_node = session->server->fabric_node_id;
                 rreq.job_type = is_embed ? QIHSE_FABRIC_JOB_EMBED
-                                         : QIHSE_FABRIC_JOB_KEYSTONE_INGEST;
+                                : is_infer ? QIHSE_FABRIC_JOB_INFERENCE
+                                           : QIHSE_FABRIC_JOB_KEYSTONE_INGEST;
                 rreq.job_id = jid;
                 rreq.payload = payload;
                 rreq.payload_len = plen;
