@@ -167,6 +167,23 @@ qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t*
 bool qihse_federation_tls_session_peer_gone(qihse_fed_tls_session_t* session,
                                             int timeout_ms);
 
+/* Re-run the three-layer peer decision on an ESTABLISHED session.
+ *
+ * The handshake's verdict is a point-in-time answer: a node enrolled at
+ * accept time may be revoked or quarantined while a connection is still
+ * open, and nothing in TLS 1.3 tells us.  This re-reads the peer's
+ * certificate, recomputes the fingerprint, and re-runs
+ * qihse_federation_peer_verify() — so a revocation lands on the next call
+ * rather than surviving for the connection's life.
+ *
+ * On QIHSE_PEER_ACCEPT the session's recorded trust is refreshed and true is
+ * returned.  Any other verdict leaves the caller to drop the connection —
+ * the session is NOT torn down here because the transport layer does not
+ * own the caller's in-flight state. */
+qihse_peer_verdict_t qihse_federation_tls_session_recheck(
+    qihse_fed_tls_session_t* session,
+    qihse_runtime_trust_t* out_trust);
+
 /* ── Replication transport over the verified channel ───────────────────── */
 
 /* Build transport ops bound to a session.  The peer identity comes from the

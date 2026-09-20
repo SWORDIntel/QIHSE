@@ -1154,13 +1154,17 @@ Stated plainly rather than omitted:
 7. **Federation transport CA provisioning — external.** QIHSE can create and
    use a federation CA, but certificate provisioning for a real fleet is an
    operator procedure outside the process. The header states this.
-8. **Per-connection revocation re-check — not implemented.** The three-layer
-   decision *is* wired into the live handshake: `fed_verify_cb()` in
-   `src/federation/qihse_federation_transport.c` calls
-   `qihse_federation_peer_verify()` from `SSL_VERIFY_PEER |
-   SSL_VERIFY_FAIL_IF_NO_PEER_CERT`. What is missing is a re-check of an
-   *existing* session when a node is revoked mid-session; reconnect is required
-   to observe revocation on the transport.
+8. **Per-connection revocation re-check — implemented.**
+   `qihse_federation_tls_session_recheck()` in
+   `src/federation/qihse_federation_transport.c` re-reads the peer's
+   certificate from the wire, recomputes the fingerprint, and re-runs
+   `qihse_federation_peer_verify()` on an established session, refreshing the
+   recorded trust on accept. The fabric dispatch executor calls it after a
+   frame arrives and before dispatch, so a node revoked or quarantined
+   mid-session loses the connection on its next request rather than keeping
+   it for the connection's life. Verified by `tests/test_fabric_dispatch.c`
+   (`test_session_recheck`: a live session flips to `REJECT_REVOKED` after
+   revocation).
 9. **`local_node` is currently unused** in
    `qihse_federation_namespace_writable()`; the header reserves it for finer
    authority checks. Passing it is still required for future compatibility.

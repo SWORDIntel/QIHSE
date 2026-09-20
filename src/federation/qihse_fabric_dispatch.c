@@ -1390,6 +1390,17 @@ bool qihse_fabric_executor_serve_session(qihse_fabric_executor_t* ex,
     bool ok = fabric_frame_read(&ops, session, &type, body, QIHSE_FABRIC_MAX_FRAME_BODY,
                                 &body_len);
     if (ok) {
+        /* The handshake's verdict is point-in-time: a node revoked or
+         * quarantined after connect would otherwise keep its session for
+         * the connection's life.  Re-run the peer decision before the frame
+         * is dispatched — the revocation lands on this request. */
+        qihse_runtime_trust_t live_trust;
+        if (qihse_federation_tls_session_recheck(session, &live_trust) !=
+                QIHSE_PEER_ACCEPT) {
+            ok = false;
+        }
+    }
+    if (ok) {
         size_t response_len = 0;
         bool handled = false;
         if (type == FABRIC_FRAME_RUN) {

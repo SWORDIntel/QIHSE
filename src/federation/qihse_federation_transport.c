@@ -478,6 +478,61 @@ bool qihse_federation_tls_session_peer_gone(qihse_fed_tls_session_t* session,
            err == SSL_ERROR_SYSCALL;
 }
 
+qihse_peer_verdict_t qihse_federation_tls_session_recheck(
+    qihse_fed_tls_session_t* session,
+    qihse_runtime_trust_t* out_trust) {
+    if (out_trust) *out_trust = QIHSE_RTRUST_UNKNOWN;
+    if (!session || !session->ssl || !session->server ||
+        !session->server->store || !session->server->user) {
+        return QIHSE_PEER_REJECT_MALFORMED;
+    }
+
+    /* Recompute the fingerprint from the certificate on the wire, not from
+     * the identity stashed at handshake: the check must describe the peer
+     * that is actually holding this connection. */
+    X509* peer = SSL_get1_peer_certificate(session->ssl);
+    if (!peer) return QIHSE_PEER_REJECT_NO_CERT;
+    EVP_PKEY* pkey = X509_get_pubkey(peer);
+    X509_free(peer);
+    if (!pkey) return QIHSE_PEER_REJECT_NO_CERT;
+
+    size_t raw_len = 0;
+    int got = EVP_PKEY_get_raw_public_key(pkey, NULL, &raw_len);
+    if (got != 1 || raw_len == 0 || raw_len > 4096u) {
+        EVP_PKEY_free(pkey);
+        return QIHSE_PEER_REJECT_MALFORMED;
+    }
+    uint8_t raw[4096];
+    if (EVP_PKEY_get_raw_public_key(pkey, raw, &raw_len) != 1) {
+        EVP_PKEY_free(pkey);
+        return QIHSE_PEER_REJECT_MALFORMED;
+    }
+    EVP_PKEY_free(pkey);
+
+    uint8_t fp[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    unsigned int fp_len = 0;
+    if (EVP_Digest(raw, raw_len, fp, &fp_len, EVP_sha384(), NULL) != 1 ||
+        fp_len != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) {
+        return QIHSE_PEER_REJECT_MALFORMED;
+    }
+
+    qihse_uuid_t node_id;
+    qihse_runtime_trust_t trust;
+    qihse_peer_verdict_t verdict = qihse_federation_peer_verify(
+        session->server->store, session->server->user, fp, fp_len,
+        &node_id, &trust);
+    if (verdict == QIHSE_PEER_ACCEPT) {
+        /* Refresh the recorded identity: the same node, with its CURRENT
+         * trust — a TRUSTED->TRUSTED_DEGRADED transition must be visible to
+         * whoever reads the session next. */
+        session->peer_node = node_id;
+        session->peer_trust = trust;
+        session->peer_resolved = true;
+        if (out_trust) *out_trust = trust;
+    }
+    return verdict;
+}
+
 qihse_fed_tls_session_t* qihse_federation_tls_connect_to(qihse_fed_tls_server_t* server,
                                                         const char* host,
                                                         uint16_t port,

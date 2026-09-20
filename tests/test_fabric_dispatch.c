@@ -66,6 +66,7 @@ static qihse_fed_tls_server_t* g_tls_b;
 static qihse_user_t* g_low;      /* clearance 0, system domain */
 static qihse_user_t* g_mid;      /* clearance 1, system domain */
 static uint16_t g_peer_index;
+static uint16_t g_exec_port;
 
 /* ── Fixture ───────────────────────────────────────────────────────────── */
 
@@ -647,6 +648,29 @@ static void test_scatter_peerauth(void) {
     printf("PASS scatter peerauth: claims install on a verified token; replay and wrong-purpose refused\n");
 }
 
+/* ── Per-connection revocation re-check ──────────────────────────────────
+ * The handshake verdict is point-in-time: a node revoked while a connection
+ * is still open must lose it on the next recheck, not keep it for the
+ * connection's life.  Runs before test_refusal_paths (which revokes the
+ * SUBMITTER in the executor's store — a live handshake would then be
+ * refused at accept): this revokes the EXECUTOR's node in the submitter's
+ * store, which nothing afterwards consults. */
+static void test_session_recheck(void) {
+    qihse_peer_verdict_t v;
+    qihse_fed_tls_session_t* s = qihse_federation_tls_connect_to(g_tls_a,
+        "127.0.0.1", g_exec_port, 5000, &v);
+    assert(s != NULL);
+    qihse_runtime_trust_t trust;
+    /* Fresh session: the recheck agrees with the handshake. */
+    assert(qihse_federation_tls_session_recheck(s, &trust) == QIHSE_PEER_ACCEPT);
+    /* Revoke the peer in OUR store — the store this TLS context's decision
+     * reads — and the SAME connection must now fail the recheck. */
+    assert(qihse_federation_node_revoke(g_store_a, g_op, &g_id_b.node_id));
+    assert(qihse_federation_tls_session_recheck(s, &trust) == QIHSE_PEER_REJECT_REVOKED);
+    qihse_federation_tls_session_destroy(s);
+    printf("PASS session recheck: mid-connection revocation lands on the next check\n");
+}
+
 /* ── INVARIANT 3: low clearance vs high data (merge blocker) ───────────── */
 
 static void test_negative_low_clearance_high_data(void) {
@@ -1049,6 +1073,7 @@ int main(void) {
     }
     assert(g_executor);
     uint16_t exec_port = qihse_resp_server_fabric_port(g_executor);
+    g_exec_port = exec_port;
     assert(exec_port != 0);
     printf("executor dispatch listener on 127.0.0.1:%u\n", (unsigned)exec_port);
 
@@ -1145,6 +1170,7 @@ int main(void) {
     test_remote_dispatch_runs_on_the_peer();
     test_cache_coherence();
     test_negative_low_clearance_high_data();
+    test_session_recheck();
     test_refusal_paths();
 
     qihse_federation_tls_server_destroy(g_tls_a);
