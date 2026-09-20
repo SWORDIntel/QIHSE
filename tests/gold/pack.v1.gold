@@ -393,6 +393,11 @@ workload fabric-remote-dispatch area=ai-fabric expect=pass timeout=300 \
     output="fabric dispatch tests passed" \
     run="make -s test-fabric-dispatch"
 
+workload controller-api area=protocol-compat expect=pass timeout=300 \
+    ref="include/qihse_controller.h" \
+    output="controller api tests passed" \
+    run="make -s test-controller-api"
+
 gap ai-fabric/dispatch-endpoint-discovery area=ai-fabric \
     reason="Remote dispatch exists and is tested, and the bus now mints signed v3 membership statements in production (capability profile inside the signed region, wired when the enrolled fabric identity loads). What remains: the statement's capability record has no dispatch-PORT field, so the peer's dispatch endpoint still comes from its topology host:port — adding the endpoint to the signed profile is a deliberate wire-format decision, deferred."
 
