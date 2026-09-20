@@ -159,9 +159,11 @@ static const qihse_fabric_jobtype_decl_t g_fabric_jobtypes[] = {
     { "keystone-ingest", QIHSE_FABRIC_JOB_KEYSTONE_INGEST, true,
       "writes the deterministic artifact key for the job binding; a retry "
       "overwrites it and leaves the same state as one run" },
-    { "embed", QIHSE_FABRIC_JOB_EMBED, false,
-      "qihse_ai_memory_store() generates a new memory id per call, so a retry "
-      "creates a SECOND memory rather than replacing the first" }
+    { "embed", QIHSE_FABRIC_JOB_EMBED, true,
+      "the executor dedups on the submitter+job binding before running: a "
+      "retry re-ACKs the existing result record, so the observed state is "
+      "that of one run — the underlying store() call is NOT idempotent, and "
+      "it is never reached twice for the same binding" }
 };
 
 const qihse_fabric_jobtype_decl_t* qihse_fabric_jobtype_lookup(const char* name) {
@@ -886,6 +888,44 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
                                         result_key, sizeof(result_key))) {
         return false;
     }
+
+    /* Executor-side dedup.  If this submitter+job binding already has a
+     * result record, the job ALREADY ran — re-ACK that record instead of
+     * executing again.  This is what makes a retry safe even for `embed`:
+     * a lost reply lets the submitter retry, and the retry returns the same
+     * result rather than creating a second memory.  The ACK carries no
+     * payload (that still goes through FETCH's own clearance check), so a
+     * replay discloses nothing the first ACK did not. */
+    {
+        char* existing = qihse_kv_get_user(store, result_key, ex->local_user);
+        if (existing) {
+            qihse_fabric_response_t prior;
+            bool usable = qihse_fabric_response_parse(existing, strlen(existing), &prior) &&
+                          prior.job_id == claims->job_id &&
+                          strcmp(prior.type, qihse_fabric_jobtype_name(claims->job_type)) == 0;
+            if (usable) {
+                char rdigest[97];
+                if (!qihse_fabric_sha384_hex(existing, strlen(existing),
+                                             rdigest, sizeof(rdigest))) {
+                    free(existing);
+                    return false;
+                }
+                const char* ref = strcmp(prior.result, "-") == 0 ? "" : prior.result;
+                bool ok = fabric_response_format(prior.status, claims->job_type,
+                                                 claims->job_id, prior.gen,
+                                                 prior.clearance, prior.sci,
+                                                 &ex->local_node, ref, "dedup-replay",
+                                                 NULL, 0u, rdigest,
+                                                 out, out_cap, out_len);
+                free(existing);
+                return ok;
+            }
+            /* A record that does not match this binding is not evidence of a
+             * prior run: fall through and execute. */
+            free(existing);
+        }
+    }
+
     uint64_t gen = fabric_previous_generation(store, ex->local_user, result_key) + 1u;
 
     const char* status = "failed";

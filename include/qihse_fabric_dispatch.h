@@ -22,13 +22,14 @@
  *    the honest state (`pending-fetch` is not `done`).
  *
  * 2. FAILURE SEMANTICS — retry is permitted ONLY for a job type that
- *    DECLARES idempotency, and the declaration is per type because the two
- *    executors genuinely differ: `keystone-ingest` writes the deterministic
- *    key `fabric:ingest:<job-id>` (a retry overwrites, so it is idempotent)
- *    while `embed` calls qihse_ai_memory_store(), which GENERATES A NEW ID
- *    per call (a retry creates a SECOND memory, so it is not).  A
- *    non-idempotent type is never retried, and the terminal "gave up" state
- *    is distinct from "failed".
+ *    DECLARES idempotency.  `keystone-ingest` writes the deterministic key
+ *    `fabric:ingest:<job-id>` (a retry overwrites), and `embed` is idempotent
+ *    AT THE DISPATCH LAYER because the executor dedups on the submitter+job
+ *    binding: a retried RUN re-ACKs the existing result record instead of
+ *    executing a second time.  The underlying embed store() call is not
+ *    idempotent and is never reached twice for one binding.  A type without
+ *    that guarantee is never retried, and the terminal "gave up" state is
+ *    distinct from "failed".
  *
  * 3. PRINCIPAL — a signed capability token, because clearance and SCI are
  *    NODE-LOCAL (the federation has no replication hook for them) and because

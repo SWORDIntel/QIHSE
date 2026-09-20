@@ -274,12 +274,15 @@ static void test_token_verification(const qihse_federation_ca_t* ca) {
 /* ── Retry policy (decision 2) ─────────────────────────────────────────── */
 
 static void test_retry_policy(void) {
-    /* The declarations are the ones the executors' own result keys imply. */
-    assert(!qihse_fabric_jobtype_is_idempotent(QIHSE_FABRIC_JOB_EMBED));
+    /* Both executors are dispatch-idempotent: keystone-ingest overwrites its
+     * deterministic artifact key, and embed is deduped by the executor on the
+     * submitter+job binding — a retry re-ACKs the existing result record
+     * rather than running again. */
+    assert(qihse_fabric_jobtype_is_idempotent(QIHSE_FABRIC_JOB_EMBED));
     assert(qihse_fabric_jobtype_is_idempotent(QIHSE_FABRIC_JOB_KEYSTONE_INGEST));
     assert(!qihse_fabric_jobtype_is_idempotent(QIHSE_FABRIC_JOB_NONE));
     const qihse_fabric_jobtype_decl_t* d = qihse_fabric_jobtype_lookup("embed");
-    assert(d && !d->idempotent && strstr(d->idempotency_reason, "SECOND") != NULL);
+    assert(d && d->idempotent && strstr(d->idempotency_reason, "dedup") != NULL);
 
     /* A dead endpoint: connection refused, so no answer, so the retry policy
      * is what decides the outcome. */
@@ -305,21 +308,20 @@ static void test_retry_policy(void) {
     out.body = body;
     out.body_cap = QIHSE_FABRIC_MAX_RESPONSE;
 
-    /* Non-idempotent: ONE attempt, then terminal `gave-up` — never `failed`,
-     * because the submitter cannot tell whether the job ran. */
+    /* embed is dispatch-idempotent (executor dedup), so a dead endpoint is
+     * retried up to the budget and ends `gave-up` — never `failed`, because
+     * the submitter cannot tell whether the job ran. */
     void* pkey = NULL;
     qihse_federation_node_identity_t id;
     assert(qihse_fabric_node_signer_load(g_store_a, g_op, &g_id_a.node_id, &id, &pkey));
     req.pkey = pkey;
     req.job_type = QIHSE_FABRIC_JOB_EMBED;
     assert(qihse_fabric_run(&req, &out));
-    assert(out.attempts == 1u);
-    assert(out.gave_up && !out.succeeded && !out.denied);
-    assert(strcmp(out.terminal_reason, "gave-up:retry-refused-non-idempotent") == 0);
-    assert(!out.retried);
+    assert(out.attempts == QIHSE_FABRIC_MAX_ATTEMPTS);
+    assert(out.retried && out.gave_up && !out.succeeded && !out.denied);
+    assert(strcmp(out.terminal_reason, "gave-up:attempts-exhausted") == 0);
 
-    /* Idempotent: retried up to the budget, then terminal `gave-up` with the
-     * budget named. */
+    /* keystone-ingest: same retry budget, same terminal state. */
     memset(&out, 0, sizeof(out));
     out.body = body;
     out.body_cap = QIHSE_FABRIC_MAX_RESPONSE;
@@ -331,8 +333,8 @@ static void test_retry_policy(void) {
 
     qihse_federation_node_key_free(pkey);
     free(body);
-    printf("PASS retry: refused for non-idempotent embed, retried for idempotent "
-           "keystone-ingest, gave-up distinct from failed\n");
+    printf("PASS retry: both types retried to budget (dedup makes embed safe), "
+           "gave-up distinct from failed\n");
 }
 
 /* ── End-to-end dispatch ───────────────────────────────────────────────── */
@@ -669,6 +671,19 @@ static void test_refusal_paths(void) {
     char art_key[192];
     assert(qihse_fabric_remote_artifact_key(&g_id_a.node_id, 5555u, art_key, sizeof art_key));
     assert(qihse_kv_get_user(g_store_b, art_key, g_op) != NULL);
+
+    /* Executor dedup: a SECOND RUN for the same submitter+job binding —
+     * fresh nonce, so it is not replay — re-ACKs the existing record instead
+     * of executing again.  This is what makes a retried `embed` safe. */
+    assert(qihse_uuid_generate(&claims.nonce));
+    assert(qihse_fabric_token_mint(pkey, &claims, request, sizeof(request), &blob_len));
+    memcpy(request + blob_len, payload, payload_len);
+    memset(body, 0, sizeof(body));
+    body_len = 0;
+    assert(qihse_fabric_executor_run(&ex, request, blob_len + payload_len, g_id_a.node_id,
+                                     body, sizeof(body), &body_len));
+    assert(strstr(body, "status=done") != NULL);
+    assert(strstr(body, "dedup-replay") != NULL);
 
     /* The SAME token again: replayed, refused, and the job does not run a
      * second time (the artifact is the one that was there). */

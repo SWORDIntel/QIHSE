@@ -134,8 +134,11 @@ Postgres, no platform glue.
   token's principal — never the executor's own — and owns the result record.
   The submitter's record is `pending-fetch` until `FABRIC.FETCH` pulls and
   caches the record locally; a tampered cache is reported `cache-corrupt`,
-  not served. Retry is per-type: only types that declare idempotency
-  (`keystone-ingest`) are retried, and `gave-up` is distinct from `failed`.
+  not served. Both executors are dispatch-idempotent: `keystone-ingest`
+  overwrites its deterministic artifact key, and the executor dedups on the
+  submitter+job binding, so a retried `embed` RUN re-ACKs the existing result
+  record instead of creating a second memory. `gave-up` remains distinct
+  from `failed`.
   When dispatch is not configured the record stays `queued`, which is the
   truth. Placement picks the lowest `load_pct` among nodes meeting the
   ISA/NPU requirement from the live hint table, then falls back to the local
