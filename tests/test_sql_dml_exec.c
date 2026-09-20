@@ -30,11 +30,13 @@
  *     and nothing changes; a grant on the table's resource id allows it.
  *
  * The row store is process-wide and lazily created (see
- * qihse_uwp_sql_table_store()); this test populates it directly because the
- * INSERT path still targets the append-only column store.
+ * qihse_uwp_sql_table_store()); most fixtures populate it directly, and
+ * test_insert_populates_row_store verifies the INSERT statement path
+ * reaches it.
  */
 #include "qihse_uwp.h"
 #include "qihse_uwp_sql_txn_schema.h"
+#include "qihse_schema.h"
 #include "qihse_sql_parser.h"
 #include "qihse_table_store.h"
 #include "qihse_auth.h"
@@ -489,6 +491,52 @@ static void test_missing_table(qihse_uwp_context_t* ctx, qihse_user_t* user) {
            "refused without changing anything\n");
 }
 
+/* ── INSERT populates the row store end to end ────────────────────────────
+ * INSERT previously went to the append-only column store only, so a row a
+ * client inserted could never be UPDATEd or DELETEd.  The row store is now
+ * the insert's authoritative destination — the column-store append remains
+ * as the analytic copy. */
+static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
+                                            qihse_user_t* user) {
+    uwp_reply_buf_t out;
+
+    run_sql(ctx, user,
+            "CREATE TABLE t_ins (id INT, name TEXT, n INT)", &out);
+    expect_reply(&out, "OK");
+
+    run_sql(ctx, user,
+            "INSERT INTO t_ins (id, name, n) VALUES (1, 'alice', 7), "
+            "(2, 'bob', 8)", &out);
+    expect_reply(&out, "stmt_type=INSERT rows=2");
+
+    /* The rows are in the mutable row store, not only the column store. */
+    qihse_table_store_t* store = qihse_uwp_sql_table_store();
+    qihse_table_t* table = qihse_table_store_find_table(store, "t_ins");
+    assert(table != NULL);
+    expect_row(table, 1, "alice", 7);
+    expect_row(table, 2, "bob", 8);
+    assert(qihse_table_row_count(table) == 2);
+
+    /* ...so UPDATE and DELETE reach them end to end. */
+    run_sql(ctx, user, "UPDATE t_ins SET n = 9 WHERE id = 1", &out);
+    expect_reply(&out, "rows=1");
+    expect_row(table, 1, "alice", 9);
+
+    run_sql(ctx, user, "DELETE FROM t_ins WHERE id = 2", &out);
+    expect_reply(&out, "rows=1");
+    expect_row_absent(table, 2);
+    assert(qihse_table_row_count(table) == 1);
+
+    /* A column subset lands the named columns and type-zero defaults. */
+    run_sql(ctx, user,
+            "INSERT INTO t_ins (id, name) VALUES (3, 'carol')", &out);
+    expect_reply(&out, "rows=1");
+    expect_row(table, 3, "carol", 0);
+
+    printf("PASS insert: rows land in the mutable row store and are "
+           "UPDATE/DELETE-able end to end\n");
+}
+
 int main(void) {
     qihse_auth_init();
     qihse_user_t* operator_user = qihse_auth_get_user(0);
@@ -500,6 +548,9 @@ int main(void) {
     memset(&ctx, 0, sizeof(ctx));
     static int sql_engine_placeholder;
     ctx.sql_engine = &sql_engine_placeholder;
+    /* INSERT resolves its table through the schema registry. */
+    ctx.schema = qihse_schema_registry_create();
+    assert(ctx.schema != NULL);
 
     test_update_executes(&ctx, operator_user);
     test_update_qualified_and_quoted(&ctx, operator_user);
@@ -508,7 +559,9 @@ int main(void) {
     test_delete_zero_condition_guard(&ctx, operator_user);
     test_write_permission(&ctx, operator_user);
     test_missing_table(&ctx, operator_user);
+    test_insert_populates_row_store(&ctx, operator_user);
 
-    printf("test_sql_dml_exec: all SQL UPDATE/DELETE execution tests passed\n");
+    qihse_schema_registry_destroy((qihse_schema_registry_t*)ctx.schema);
+    printf("test_sql_dml_exec: all SQL UPDATE/DELETE/INSERT execution tests passed\n");
     return 0;
 }

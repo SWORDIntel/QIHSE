@@ -124,9 +124,10 @@ workload mvcc-committed-delete area=relational expect=pass timeout=120 \
     bin=tests/gold/workloads/gold_mvcc_committed_delete \
     run="./tests/gold/workloads/gold_mvcc_committed_delete"
 
-# UPDATE/DELETE execution against the mutable table store with zero-condition delete guard
+# UPDATE/DELETE/INSERT execution against the mutable table store with
+# zero-condition delete guard; INSERT populates the row store end to end.
 workload sql-dml-exec area=relational expect=pass timeout=300 \
-    output="test_sql_dml_exec: all SQL UPDATE/DELETE execution tests passed" \
+    output="test_sql_dml_exec: all SQL UPDATE/DELETE/INSERT execution tests passed" \
     run="make -s test-sql-dml-exec"
 
 # Parallel query: partitioned KV keyspace scan, aggregation, and hash join
@@ -142,8 +143,11 @@ workload optimizer-governance area=relational expect=pass timeout=300 \
     output="PASS optimizer governance: shadow A/B, declared constraints, automatic rollback, persisted decisions" \
     run="make -s test-optimizer-governance"
 
-gap relational/sql-over-storage area=relational \
-    reason="the SQL parser, join/aggregate/sort executors, schema registry, optimizer, table-store UPDATE/DELETE executor and KV parallel query are covered; SQL INSERT does not yet populate the mutable row store end to end"
+# relational/sql-over-storage: COVERED. SQL INSERT populates the mutable row
+# store (uwp_execute_insert writes qihse_table_store via the schema registry,
+# lazily mirroring the table definition; the column-store append remains the
+# analytic copy). tests/test_sql_dml_exec.c verifies INSERT -> UPDATE ->
+# DELETE end to end, column subsets, and typed-literal conversion.
 
 # ----------------------------------------------------------------------------
 # 3. Graph

@@ -28,6 +28,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* Defined below; uwp_execute_insert needs both. */
+static qihse_table_t* uwp_sql_row_table(qihse_schema_registry_t* schema,
+                                        const char* table_name);
+static bool uwp_dml_set_value(const qihse_col_def_t* def, const char* text,
+                              qihse_col_value_t* out);
 #include <string.h>
 
 #ifdef _WIN32
@@ -372,7 +378,10 @@ static int uwp_execute_select_plan(qihse_uwp_context_t* ctx,
  * -2 on error (table not found, INSERT...SELECT, etc.). */
 static int uwp_execute_insert(qihse_uwp_context_t* ctx,
                               const qihse_sql_ast_t* ast) {
-    if (!ctx->col || !ctx->schema) return -1;
+    /* The schema registry is required — it is the table definition.  The
+     * column store is optional; the mutable row store is process-wide and
+     * needs no ctx. */
+    if (!ctx->schema) return -1;
     if (!ast->table_name) return -2;
     if (ast->insert_select_query) return -2; /* INSERT...SELECT not supported */
     if (ast->num_insert_rows == 0 || !ast->insert_rows) return 0;
@@ -421,54 +430,115 @@ static int uwp_execute_insert(qihse_uwp_context_t* ctx,
         }
     }
 
-    /* Append each row's values to the column store. */
+    /* The mutable row store: the table mirrors the schema definition, created
+     * lazily so a table declared before this path existed still becomes
+     * writable.  When the row store can host the table it is the insert's
+     * authoritative destination — the column-store append is then the
+     * analytic copy.  When it cannot (no schema entry, OOM), the column
+     * store alone decides the count, which is the historical behavior. */
+    qihse_table_t* row_table = uwp_sql_row_table(schema, ast->table_name);
+    size_t row_cols = row_table ? qihse_table_num_cols(row_table) : 0;
+    qihse_col_value_t* row_vals = NULL;
+    if (row_table) {
+        row_vals = (qihse_col_value_t*)calloc(row_cols, sizeof(*row_vals));
+        if (!row_vals) row_table = NULL;
+    }
+
+    /* Append each row's values to the column store AND insert into the row
+     * store. */
     size_t rows_inserted = 0;
     for (size_t r = 0; r < ast->num_insert_rows; r++) {
         char** row = ast->insert_rows[r];
         if (!row) break;
-        int row_ok = 1;
-        for (size_t c = 0; c < num_cols; c++) {
-            if (!row[c]) { row_ok = 0; break; }
-
-            /* Build namespaced column name: table.column */
-            char col_full_name[512];
-            snprintf(col_full_name, sizeof(col_full_name), "%s.%s",
-                     ast->table_name, col_names[c]);
-
-            /* Create the column if it does not yet exist. */
-            (void)qihse_column_create(col, col_full_name, col_types[c]);
-
-            const char* val = row[c];
-            bool ok = false;
-            switch (col_types[c]) {
-                case QIHSE_COL_TYPE_INT32:
-                    ok = qihse_column_append_int32(
-                        col, col_full_name,
-                        (int32_t)strtol(val, NULL, 10), 0, 0);
-                    break;
-                case QIHSE_COL_TYPE_INT64:
-                    ok = qihse_column_append_int64(
-                        col, col_full_name,
-                        (int64_t)strtoll(val, NULL, 10), 0, 0);
-                    break;
-                case QIHSE_COL_TYPE_FLOAT32:
-                    ok = qihse_column_append_float32(
-                        col, col_full_name,
-                        (float)strtod(val, NULL), 0, 0);
-                    break;
-                case QIHSE_COL_TYPE_STRING_DICT:
-                    ok = qihse_column_append_string(
-                        col, col_full_name, val, 0, 0);
-                    break;
-                default:
-                    ok = false;
-                    break;
+        int col_ok = ctx->col ? 1 : 0;
+        int row_ok = row_table ? 1 : 0;
+        /* Row-store pass: full-width values, type-checked literals.  Columns
+         * the INSERT does not name keep their type's zero value — the row
+         * store has no NULL, and a fabricated NULL would be worse. */
+        if (row_table) {
+            memset(row_vals, 0, row_cols * sizeof(*row_vals));
+            for (size_t i = 0; i < row_cols; i++) {
+                const qihse_col_def_t* d = qihse_table_col_def(row_table, i);
+                if (!d) { row_ok = 0; break; }
+                row_vals[i].type = d->type;
             }
-            if (!ok) { row_ok = 0; break; }
+            if (row_ok) {
+                for (size_t c = 0; c < num_cols && row_ok; c++) {
+                    if (!row[c]) { row_ok = 0; break; }
+                    int idx = qihse_table_find_col(row_table, col_names[c]);
+                    if (idx < 0) { row_ok = 0; break; }
+                    const qihse_col_def_t* d =
+                        qihse_table_col_def(row_table, (size_t)idx);
+                    if (!uwp_dml_set_value(d, row[c], &row_vals[idx])) {
+                        row_ok = 0;
+                        break;
+                    }
+                }
+            }
+            if (row_ok) {
+                int rid = qihse_table_insert(row_table, row_vals, row_cols);
+                if (rid < 0) row_ok = 0;
+            }
+            /* uwp_dml_set_value deep-copies strings into the value slots;
+             * qihse_table_insert deep-copies again into the row.  Free the
+             * staging copies regardless of whether the insert landed. */
+            for (size_t i = 0; i < row_cols; i++) {
+                if (row_vals[i].type == QIHSE_TS_STRING && row_vals[i].v.str) {
+                    free(row_vals[i].v.str);
+                    row_vals[i].v.str = NULL;
+                }
+            }
         }
-        if (row_ok) rows_inserted++;
+
+        /* Column-store pass: unchanged from before. */
+        if (ctx->col) {
+            for (size_t c = 0; c < num_cols && col_ok; c++) {
+                if (!row[c]) { col_ok = 0; break; }
+
+                /* Build namespaced column name: table.column */
+                char col_full_name[512];
+                snprintf(col_full_name, sizeof(col_full_name), "%s.%s",
+                         ast->table_name, col_names[c]);
+
+                /* Create the column if it does not yet exist. */
+                (void)qihse_column_create(col, col_full_name, col_types[c]);
+
+                const char* val = row[c];
+                bool ok = false;
+                switch (col_types[c]) {
+                    case QIHSE_COL_TYPE_INT32:
+                        ok = qihse_column_append_int32(
+                            col, col_full_name,
+                            (int32_t)strtol(val, NULL, 10), 0, 0);
+                        break;
+                    case QIHSE_COL_TYPE_INT64:
+                        ok = qihse_column_append_int64(
+                            col, col_full_name,
+                            (int64_t)strtoll(val, NULL, 10), 0, 0);
+                        break;
+                    case QIHSE_COL_TYPE_FLOAT32:
+                        ok = qihse_column_append_float32(
+                            col, col_full_name,
+                            (float)strtod(val, NULL), 0, 0);
+                        break;
+                    case QIHSE_COL_TYPE_STRING_DICT:
+                        ok = qihse_column_append_string(
+                            col, col_full_name, val, 0, 0);
+                        break;
+                    default:
+                        ok = false;
+                        break;
+                }
+                if (!ok) col_ok = 0;
+            }
+        }
+        /* A row counts when it landed in the store that can answer mutations
+         * for it — the row store when present, else the column store as
+         * before. */
+        if ((row_table && row_ok) || (!row_table && col_ok)) rows_inserted++;
     }
 
+    free(row_vals);
     free(col_types);
     free(col_names);
     return (int)rows_inserted;
@@ -758,6 +828,59 @@ qihse_table_store_t* qihse_uwp_sql_table_store(void) {
     qihse_table_store_t* store = uwp_sql_row_store;
     pthread_mutex_unlock(&uwp_sql_row_store_mutex);
     return store;
+}
+
+/* SQL type -> mutable row store column type.  Mirrors uwp_sql_type_to_col_type
+ * so the column store and the row store agree on what a column IS. */
+static qihse_ts_type_t uwp_sql_type_to_ts_type(qihse_sql_type_t t) {
+    switch (t) {
+        case QIHSE_TYPE_INT:
+        case QIHSE_TYPE_SERIAL:
+            return QIHSE_TS_INT32;
+        case QIHSE_TYPE_BIGINT:
+        case QIHSE_TYPE_BIGSERIAL:
+            return QIHSE_TS_INT64;
+        case QIHSE_TYPE_FLOAT:
+        case QIHSE_TYPE_DOUBLE:
+            return QIHSE_TS_FLOAT;
+        default:
+            return QIHSE_TS_STRING;
+    }
+}
+
+/* Ensure the mutable row store has a table mirroring the schema registry's
+ * definition.  Called lazily — on first INSERT as well as on CREATE — so a
+ * table declared before the row store was wired still becomes writable, and
+ * a table created through the schema-target opcode (which bypasses the SQL
+ * statement path) is picked up without duplicating the CREATE logic. */
+static qihse_table_t* uwp_sql_row_table(qihse_schema_registry_t* schema,
+                                        const char* table_name) {
+    if (!schema || !table_name) return NULL;
+    qihse_table_store_t* store = qihse_uwp_sql_table_store();
+    if (!store) return NULL;
+    qihse_table_t* t = qihse_table_store_find_table(store, table_name);
+    if (t) return t;
+    const qihse_schema_table_t* st = qihse_schema_get_table(schema, table_name);
+    if (!st || st->num_columns == 0) return NULL;
+    qihse_col_def_t* defs =
+        (qihse_col_def_t*)calloc(st->num_columns, sizeof(*defs));
+    if (!defs) return NULL;
+    for (size_t i = 0; i < st->num_columns; i++) {
+        defs[i].name = strdup(st->columns[i].name);
+        defs[i].type = uwp_sql_type_to_ts_type(st->columns[i].type);
+        if (!defs[i].name) {
+            for (size_t j = 0; j < i; j++) free(defs[j].name);
+            free(defs);
+            return NULL;
+        }
+    }
+    /* create_table deep-copies the definitions; on a duplicate-name race the
+     * existing table is returned instead. */
+    t = qihse_table_store_create_table(store, table_name, defs, st->num_columns);
+    for (size_t i = 0; i < st->num_columns; i++) free(defs[i].name);
+    free(defs);
+    if (!t) t = qihse_table_store_find_table(store, table_name);
+    return t;
 }
 
 /* Single-line DML reply, malloc'd; NULL on allocation failure. */
@@ -2092,8 +2215,9 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                     }
                 }
             } else if (ast->stmt_type == QIHSE_SQL_INSERT) {
-                /* --- INSERT: wire to column store --- */
-                if (!ctx->col || !ctx->schema) {
+                /* --- INSERT: row store is authoritative; the column-store
+                 * append is the analytic copy and needs no ctx gate --- */
+                if (!ctx->schema) {
                     uwp_text_appendf(&response,
                         "OK stmt_type=INSERT (no row store wired)\n");
                 } else {
