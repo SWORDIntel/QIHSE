@@ -1,27 +1,31 @@
 # QIHSE — Federation Database Layer Upgrade Design Brief
 
-> **Status: planned.** The stage-by-stage record of what has landed is in the
-> [roadmap](../../ROADMAP.md) and in
-> [architecture/federation_overview.md](../architecture/federation_overview.md):
-> the F0–F8 stages this document specifies are implemented and tested, while
-> the rest of it remains the design of record for what is not built (consensus,
-> backup writer, controller SDKs).
+> **Status: planned.** The governing brief for the federation work: the design
+> of record for what is not yet built. The stages that are built (F0–F8 and
+> the post-F8 follow-ups) are recorded in
+> [architecture/federation_overview.md](../architecture/federation_overview.md)
+> and the [master roadmap](../../ROADMAP.md) §W1; the rest of this document
+> describes intent, not the tree.
 >
-> **Contradiction:** the status line this document carried until the labeling
-> pass said "nothing in it is implemented yet". That is stale — F0–F8 are
-> implemented and tested. The retained line is reproduced below.
-
-> **Status (2026-09-15):** Accepted as QIHSE's future architectural direction.
-> This is a planning document — nothing in it is implemented yet, and it does not
-> describe current capability. It is the design of record for the federation
-> upgrade and is tracked as **Phase 10** of the
-> [general roadmap](qihse_general_db_engine_roadmap.md).
+> **Consolidated 2026-09-24:** this file absorbs
+> `qihse_federation_upgrade_plan_v3.md` (now a redirect stub). It is identical
+> to the earlier v1 brief through §34; §35–§39 were added in v3 and shifted the
+> later sections by five — v1's §35 Performance Requirements is §40 here, and
+> v1's §41 Acceptance Criteria is §46 here (grown from 22 to 28 criteria).
+> References to "v3.md §N" resolve to §N of this file.
 >
+> **Upstream original:** [QIHSE_FEDERATION_DATABASE_UPGRADE_PREDESIGN_v3.md](../CITADEL/docs/architecture/QIHSE_FEDERATION_DATABASE_UPGRADE_PREDESIGN_v3.md)
+> in the sibling CITADEL repository — identical content apart from this
+> file's status/provenance header.
+>
+> Accepted 2026-09-15 as QIHSE's future architectural direction, tracked as
+> **Phase 10** of the [general roadmap](qihse_general_db_engine_roadmap.md).
 > It resolves the pending "smarter cluster" direction: the
 > [cluster brain](../architecture/cluster_brain.md) stays database-scoped, the
-> [AI compute fabric](../architecture/ai_fabric.md) items 3–5 build on this plan's
-> coordination primitives, and the [overlay protocol](../architecture/overlay_protocol.md)
-> gains a real trust plane (see Phase 5).
+> [AI compute fabric](../architecture/ai_fabric.md) items 3–5 build on this
+> plan's coordination primitives, and the
+> [overlay protocol](../architecture/overlay_protocol.md) gains a real trust
+> plane (see Phase 5).
 
 **Document type:** AI implementation brief  
 **Target repository:** `SWORDIntel/QIHSE`  
@@ -346,7 +350,11 @@ Fields:
 - current health;
 - last HLC;
 - software/build revision;
-- local authority namespaces.
+- local authority namespaces;
+- runtime trust state;
+- evidence bundle reference;
+- root-image/package provenance references;
+- hardening-audit generation.
 
 ## 6.2 Resource
 
@@ -830,6 +838,22 @@ topology array index
 ```
 
 Those are mutable attributes.
+
+A valid node identity proves identity, not current trustworthiness.
+
+Federation admission policy should additionally evaluate current runtime evidence such as:
+
+```text
+approved Citadel image
+approved QIHSE artifact
+valid SBOM/provenance
+attestation state
+hardening-audit state
+revocation state
+```
+
+before granting voter or strong-write authority.
+
 
 ---
 
@@ -1371,7 +1395,7 @@ All artifact-bearing nodes must use cryptographic digests as stable identities w
 
 # 32. SBOM and Attestation Records
 
-SBOM Z should write normalized supply-chain evidence into QIHSE.
+SBOM should write normalized supply-chain evidence into QIHSE.
 
 QIHSE stores:
 
@@ -1518,7 +1542,333 @@ KEYSTONE may accelerate these queries but must not become authoritative.
 ---
 
 
-# 35. Performance Requirements
+
+# 35. Evidence-Aware Federation Admission
+
+QIHSE federation trust must not rely only on possession of a valid node certificate.
+
+A node should present a machine-readable **runtime trust evidence bundle** containing, where available:
+
+```text
+node identity
+boot/session UUID
+Citadel release/image identity
+root-image digest
+QIHSE package/artifact digest
+QIHSE SBOM digest
+QIHSE provenance-attestation digest
+policy generation
+kernel/Xen image identities
+Secure/Measured Boot state
+TPM attestation reference
+hardening-audit generation
+```
+
+QIHSE stores this evidence but does not fabricate or self-approve it.
+
+Citadel/attestation components determine whether the evidence satisfies current federation policy.
+
+Suggested trust states:
+
+```text
+TRUSTED
+TRUSTED_DEGRADED
+LOCAL_ONLY
+QUARANTINED
+REVOKED
+UNKNOWN
+```
+
+Recommended semantics:
+
+```text
+TRUSTED
+    may participate according to configured replication/consensus roles
+
+TRUSTED_DEGRADED
+    reads and selected replication allowed;
+    strong-write/voter eligibility policy-dependent
+
+LOCAL_ONLY
+    local QIHSE remains usable;
+    no authoritative federation voting or strong mutation rights
+
+QUARANTINED
+    federation data exchange heavily restricted;
+    forensic/repair access only
+
+REVOKED
+    federation access denied
+```
+
+Critical principle:
+
+> A failed provenance or attestation check must not unnecessarily destroy local availability, but it must be able to remove the node from trusted distributed authority.
+
+Federation membership records should include:
+
+```text
+trust_state
+trust_policy_generation
+evidence_bundle_id
+evidence_verified_hlc
+verification_principal
+verification_result
+```
+
+Changes in trust state must emit immutable audit events.
+
+---
+
+# 36. QIHSE Runtime Hardening Profile
+
+QIHSE is a network-facing, state-authoritative component and requires its own explicit Citadel security profile.
+
+The release profile should minimize ambient operating-system capability.
+
+Default posture should include, where compatible with measured performance and required functionality:
+
+```text
+dedicated unprivileged service identity
+no interactive shell requirement
+no setuid requirement
+no arbitrary device access
+no raw block-device access unless explicitly configured
+no arbitrary kernel module loading
+no ptrace of unrelated processes
+no unrestricted perf access
+no unrestricted BPF access
+restricted user namespaces
+restricted filesystem write paths
+restricted Unix/network socket families
+restricted address families
+bounded memory-lock capability
+bounded file-descriptor limits
+production core dumps disabled by default
+```
+
+Use systemd sandboxing, LSM policy, seccomp, capability dropping, namespace restrictions, and filesystem protections as appropriate.
+
+Do not blindly disable interfaces that QIHSE demonstrably needs.
+
+Instead maintain a **measured allowlist** per build/profile.
+
+Potentially sensitive Linux interfaces to audit explicitly:
+
+```text
+AF_PACKET
+AF_NETLINK
+AF_ALG
+raw sockets
+io_uring
+userfaultfd
+perf_event_open
+BPF
+process_vm_readv/process_vm_writev
+ptrace
+keyrings
+memfd
+mount-related syscalls
+```
+
+For each interface classify:
+
+```text
+REQUIRED
+OPTIONAL
+FORBIDDEN
+UNKNOWN
+```
+
+Unknown should fail CI hardening review for production builds.
+
+QIHSE release packages should expose the intended syscall/capability profile as versioned metadata so runtime drift can be detected.
+
+---
+
+# 37. Network Exposure and Egress Policy
+
+QIHSE network behavior should be explicit and minimal.
+
+A production node should expose only configured QIHSE interfaces such as:
+
+```text
+federation/replication
+client API
+metrics/health
+local Unix sockets
+```
+
+Each listener must have:
+
+```text
+defined bind address
+defined authentication mode
+defined authorization scope
+defined protocol version
+defined rate/size limits
+```
+
+No listener should bind to all interfaces merely for convenience unless the deployment policy explicitly permits it.
+
+Outbound connectivity should also be policy-described.
+
+QIHSE itself should not require unrestricted Internet egress.
+
+Expected outbound classes may include:
+
+```text
+configured federation peers
+configured backup target
+configured telemetry sink
+local Citadel services
+```
+
+Package/source fetching, CVE-database updates, and build dependency retrieval belong to dedicated update/build domains rather than the QIHSE process.
+
+Represent network policy in QIHSE as data, but enforcement belongs to Citadel/sys-net/host policy.
+
+Suggested metadata:
+
+```text
+security/runtime-network-profile/<service>/<version>
+```
+
+This allows the system to detect when the actual listening/egress surface diverges from the declared profile.
+
+---
+
+# 38. Time Integrity and Trusted Ordering
+
+QIHSE already relies on HLC for distributed ordering; retain HLC as the correctness mechanism.
+
+Wall-clock synchronization should nevertheless be hardened because timestamps affect:
+
+```text
+audit interpretation
+certificate validity
+build provenance
+repository publication
+operator incident analysis
+lease expiry diagnostics
+```
+
+Citadel hosts should prefer authenticated time synchronization such as NTS where operationally available.
+
+QIHSE must never assume wall-clock accuracy for consensus safety.
+
+Rules:
+
+```text
+HLC/order correctness > wall clock
+monotonic clock > wall clock for duration measurement
+wall clock = human/audit context
+```
+
+QIHSE should detect and record significant clock anomalies:
+
+```text
+backward jump
+large forward jump
+peer skew beyond threshold
+NTP/NTS sync loss
+monotonic/wall-clock inconsistency
+```
+
+Suggested event types:
+
+```text
+time.sync_lost
+time.sync_restored
+time.wall_jump
+time.peer_skew
+```
+
+These events may affect trust/diagnostic state but should not silently rewrite existing event timestamps.
+
+---
+
+# 39. QIHSE Hardening Self-Audit
+
+QIHSE should expose a machine-readable security posture report for Citadel's global `citadel audit` mechanism.
+
+Suggested API:
+
+```text
+Security.Audit
+Security.RuntimeProfile
+Security.TrustEvidence
+```
+
+Example report:
+
+```json
+{
+  "qihse_build": "...",
+  "artifact_digest": "...",
+  "sbom_verified": true,
+  "provenance_verified": true,
+  "trust_state": "TRUSTED",
+  "service_uid": 992,
+  "core_dumps": false,
+  "unexpected_capabilities": [],
+  "unexpected_listeners": [],
+  "runtime_profile_generation": 17,
+  "federation_mtls": true,
+  "gossip_replay_protection": true,
+  "data_encryption_policy": "satisfied",
+  "audit_chain": "valid"
+}
+```
+
+The audit must verify actual runtime state rather than merely reading configuration files.
+
+Checks should include, where practical:
+
+```text
+effective Linux capabilities
+process UID/GID
+open listening sockets
+unexpected outbound connections
+loaded runtime modules/plugins
+writable filesystem paths
+core-dump policy
+seccomp/LSM state
+binary/artifact digest
+SBOM/provenance verification
+node certificate validity
+federation trust state
+audit-chain continuity
+WAL integrity state
+backup encryption policy
+```
+
+Results should be versioned and stored as evidence objects:
+
+```text
+security/audit/<node>/<service>/<hlc>
+```
+
+A failed self-audit must not automatically erase local data or terminate the database.
+
+Policy may:
+
+```text
+degrade federation trust
+remove voter eligibility
+block strong mutations
+quarantine the node
+alert the operator
+```
+
+according to severity.
+
+This provides a continuously testable security posture rather than assuming that build-time hardening remains intact after deployment.
+
+---
+
+
+# 40. Performance Requirements
 
 The federation work must not regress QIHSE's fast local paths.
 
@@ -1549,7 +1899,7 @@ Treat these as engineering targets, not benchmark claims.
 
 ---
 
-# 36. Observability
+# 41. Observability
 
 Expose:
 
@@ -1568,13 +1918,20 @@ cas_failures
 stale_epoch_rejections
 auth_failures
 audit_chain_status
+runtime_trust_state
+runtime_profile_drift
+unexpected_listener_count
+unexpected_capability_count
+provenance_verification_state
+clock_sync_state
+peer_clock_skew
 ```
 
 Metrics must be label-bounded to avoid cardinality explosions.
 
 ---
 
-# 37. Failure-State Matrix
+# 42. Failure-State Matrix
 
 Required semantics:
 
@@ -1586,11 +1943,13 @@ Required semantics:
 | local disk degraded | limited/fail closed | limited | no | best effort | storage repair |
 | QIHSE process restart | after WAL | after WAL | after state recovery | yes | automatic |
 | identity revoked | no federation writes | no | no | policy dependent | re-enroll |
+| runtime provenance invalid | yes local | policy/local only | no strong authority | local reads yes | re-attest/rebuild |
+| hardening audit critical failure | yes local | policy/local only | no strong authority | local reads yes | investigate/remediate |
 | conflicting versions | unaffected namespaces yes | policy | reject | both available to resolver | explicit |
 
 ---
 
-# 38. Reconciliation Safety
+# 43. Reconciliation Safety
 
 On rejoin:
 
@@ -1610,7 +1969,7 @@ A rejoining node must not immediately publish stale exclusive ownership as autho
 
 ---
 
-# 39. Testing Requirements
+# 44. Testing Requirements
 
 ## 31.1 Deterministic distributed simulation
 
@@ -1644,6 +2003,12 @@ stale fencing epoch -> rejected
 duplicate request UUID -> no duplicate mutation
 old boot UUID packet replay -> rejected
 revoked node attempts replication -> rejected
+node with valid cert but invalid provenance -> denied voter/strong-write authority
+unexpected listener introduced -> hardening audit detects drift
+unexpected Linux capability introduced -> hardening audit detects drift
+core dump policy changed -> hardening audit detects drift
+wall clock jumps backward -> HLC remains monotonic and event emitted
+NTS/time sync loss -> recorded without corrupting ordering
 mid-snapshot crash -> recoverable
 schema N and N+1 mixed cluster -> supported
 ```
@@ -1665,7 +2030,7 @@ Continue ASan/UBSan and add TSan-capable concurrency jobs where practical.
 
 ---
 
-# 40. Rollout Plan
+# 45. Rollout Plan
 
 ## Phase 0 — Refactor boundaries
 
@@ -1723,7 +2088,17 @@ Continue ASan/UBSan and add TSan-capable concurrency jobs where practical.
 - repository snapshot/deployment lineage;
 - controller-facing build/supply APIs.
 
-## Phase 7 — Operational hardening
+## Phase 7 — Runtime trust and hardening
+
+- evidence-aware federation admission;
+- runtime security profiles;
+- network exposure/egress declarations;
+- time-integrity events;
+- QIHSE hardening self-audit;
+- Citadel audit integration;
+- trust-state effects on voter/strong-write eligibility.
+
+## Phase 8 — Operational hardening
 
 - rolling schema upgrades;
 - backup/snapshot semantics;
@@ -1733,7 +2108,7 @@ Continue ASan/UBSan and add TSan-capable concurrency jobs where practical.
 
 ---
 
-# 41. Acceptance Criteria
+# 46. Acceptance Criteria
 
 This upgrade is not complete until all are true:
 
@@ -1759,10 +2134,16 @@ This upgrade is not complete until all are true:
 20. Historical signed SBOM records are never rewritten because vulnerability intelligence changes.
 21. QIHSE can answer reverse-impact queries from vulnerable component/source/toolchain/builder to deployed nodes.
 22. KEYSTONE may index supply-chain records without becoming authoritative for provenance.
+23. A node with valid credentials but failed provenance can remain locally usable while being denied trusted federation authority.
+24. QIHSE exposes a runtime hardening audit based on actual process/system state.
+25. Unexpected listeners, capabilities, provenance drift, or runtime-profile drift are detectable.
+26. QIHSE requires no unrestricted Internet egress.
+27. Wall-clock anomalies do not break HLC ordering or consensus safety.
+28. Production core-dump policy and sensitive kernel-interface policy are explicitly testable.
 
 ---
 
-# 42. Explicit Non-Goals
+# 47. Explicit Non-Goals
 
 Do **not** turn QIHSE into:
 
@@ -1782,7 +2163,7 @@ Provide the durable, secure primitives those systems require.
 
 ---
 
-# 43. AI Implementation Instructions
+# 48. AI Implementation Instructions
 
 When implementing this brief:
 
@@ -1801,7 +2182,7 @@ When implementing this brief:
 
 ---
 
-# 44. Deliverables Expected From the Implementing AI
+# 49. Deliverables Expected From the Implementing AI
 
 Produce:
 
@@ -1818,6 +2199,11 @@ docs/architecture/build_coordination.md
 docs/architecture/supply_chain_provenance.md
 docs/architecture/sbom_attestation.md
 docs/architecture/repository_snapshots.md
+docs/architecture/runtime_trust.md
+docs/architecture/runtime_hardening.md
+docs/architecture/network_exposure.md
+docs/architecture/time_integrity.md
+docs/architecture/security_self_audit.md
 
 include/qihse_federation.h
 include/qihse_hlc.h
@@ -1826,6 +2212,8 @@ include/qihse_lease.h
 include/qihse_build.h
 include/qihse_supply_chain.h
 include/qihse_provenance.h
+include/qihse_runtime_trust.h
+include/qihse_security_audit.h
 
 src/federation/*
 src/build/*
@@ -1848,7 +2236,7 @@ only when the implementation genuinely supports the documented feature.
 
 ---
 
-# 45. Final Architectural Statement
+# 50. Final Architectural Statement
 
 QIHSE should become a **secure federated data substrate composed of sovereign nodes**.
 
@@ -1867,6 +2255,9 @@ local autonomy
 + software-supply-chain provenance
 + SBOM/attestation state
 + immutable repository/deployment lineage
++ evidence-aware federation admission
++ runtime hardening verification
++ explicit network/time security posture
 ```
 
 without coupling ordinary local operation to whole-cluster quorum.
