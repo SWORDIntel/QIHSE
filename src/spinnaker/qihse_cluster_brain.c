@@ -1593,6 +1593,36 @@ static bool brain_check_rehome(brain_t* brain, const brain_obs_t* obs) {
 
         /* Only re-home a range this node can actually serve. */
         if (!have_local_keys) {
+            /* Nothing to stream: the range is orphaned — its data died with
+             * the owner, or it never held any. Skipping forever (the old
+             * behavior) deadlocks against R6, which refuses to prune a node
+             * that still owns slots, so a data-less corpse kept the cluster
+             * short-covered for good. Instead the lowest-index healthy
+             * primary claims the range deterministically: an ownership flip
+             * only, through the same audited path, under the same evidence
+             * gate as a streamed re-home. */
+            uint16_t coordinator = QIHSE_CLUSTER_NODE_NONE;
+            for (size_t i = 0; i < obs->node_count; i++) {
+                const brain_obs_node_t* candidate = &obs->nodes[i];
+                if (!(candidate->flags & BRAIN_OBS_F_HEALTHY) ||
+                    candidate->role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
+                if (coordinator == QIHSE_CLUSTER_NODE_NONE || candidate->index < coordinator)
+                    coordinator = candidate->index;
+            }
+            if (local == coordinator && brain_gate(brain, "rehome-orphan", evidence)) {
+                if (qihse_cluster_set_range_owner(brain->server, run->start, run->end, local)) {
+                    char detail[256];
+                    snprintf(detail, sizeof(detail),
+                             "{\"range\":\"%u-%u\",\"owner\":\"%.12s\",\"reason\":\"no-local-data\","
+                             "\"claimed_by\":\"%.12s\"}",
+                             run->start, run->end, owner_node->id, self->id);
+                    brain_journal(brain, "REHOME_ORPHAN", detail);
+                    brain_decision_record(brain, "rehome-orphan", detail, true);
+                    brain_range_cooldown(brain, run->start, run->end, now);
+                    acted = true;
+                    break; /* one action per cycle: predictable, journalable, reversible */
+                }
+            }
             char detail[192];
             snprintf(detail, sizeof(detail),
                      "{\"range\":\"%u-%u\",\"owner\":\"%.12s\",\"reason\":\"no-local-data\"}",
@@ -1784,6 +1814,13 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
             owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
         }
         if (owned != 0) continue; /* not a joiner */
+
+        /* Evidence rule (same one R1 applies to owners): a joiner this bus
+         * has never heard from directly is a stale entry, not a newcomer.
+         * Donating a range to it hands live slots to a corpse — the health
+         * flag alone cannot be trusted, because entries learned only through
+         * gossip are healthy-by-default. */
+        if (brain->bus && qihse_cluster_bus_last_observed_healthy(brain->bus, joiner->index) == 0) continue;
 
         /* Donate the tail of our largest range; never more than half of it. */
         size_t pick_len = 0;

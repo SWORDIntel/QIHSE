@@ -6,8 +6,10 @@
  *   B. node unhealthy past the prune timeout, owns no slots
  *      -> pruned from the topology (PRUNE), and it disappears from
  *         qihse_cluster_topology_nodes()
- *   C. node unhealthy past the prune timeout but still owning slots
- *      -> refused (EBUSY): ranges must be re-homed before the owner goes
+ *   C. node unhealthy past the prune timeout and still owning slots
+ *      -> direct removal refused (EBUSY); the brain claims the orphaned
+ *         range for the local node (rehome-orphan) and the now-slotless
+ *         node is pruned
  *
  * Loopback only; journal dirs are relative.
  */
@@ -21,6 +23,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -265,18 +268,29 @@ int main(void) {
     assert(!qihse_cluster_topology_get_node(topo, stale, &gone));
     printf("PASS stale slotless node pruned from the topology\n");
 
-    /* C — an unhealthy node that still owns slots is refused. */
+    /* C — an unhealthy node that still owns slots: the direct API refuses to
+     * remove it while any slot points at it (EBUSY), and the brain claims
+     * the orphaned range for the local node first (R1 rehome-orphan: the
+     * owner is dark past the bus timeout and the range carries no local
+     * keys, so streaming would move nothing). Once the range is claimed the
+     * node owns nothing and the prune takes it — the invariant "ranges must
+     * be re-homed before the owner goes" still holds, just automatically. */
     uint16_t busy = QIHSE_CLUSTER_NODE_NONE;
     add_node(topo, "brain-reb-busy", "127.0.0.1", 7097u, 17095u, false, &busy);
     assert(qihse_cluster_topology_assign_range(topo, 4096u, 8191u, busy));
+    errno = 0;
+    assert(!qihse_cluster_topology_remove_node(topo, busy));
+    assert(errno == EBUSY);
     bcfg.journal_dir = dir_c;
     assert(qihse_cluster_brain_start(&bcfg));
-    sleep_ms(3000);
+    sleep_ms(4000);
     qihse_cluster_brain_stop();
-    qihse_cluster_node_t still_there;
-    assert(qihse_cluster_topology_get_node(topo, busy, &still_there));
-    assert(still_there.healthy == false);
-    printf("PASS node owning slots is not pruned (ranges must be re-homed first)\n");
+    assert(journal_has(dir_c, "REHOME_ORPHAN"));
+    assert(qihse_cluster_topology_get_slot(topo, 4096u, &owner, &state, &peer_index));
+    assert(owner == local); /* claimed by the local node */
+    qihse_cluster_node_t gone_busy;
+    assert(!qihse_cluster_topology_get_node(topo, busy, &gone_busy));
+    printf("PASS orphaned range claimed, then slotless owner pruned\n");
 
     peer.stop = true;
     pthread_join(peer.thread, NULL);

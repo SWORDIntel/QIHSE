@@ -18,6 +18,7 @@
 #include "qihse_fabric_dispatch.h"
 #include "qihse_fabric_index.h"
 #include "qihse_fusion.h"
+#include "qihse_fts.h"
 /* The claims context CLUSTER PEERAUTH installs needs the user STRUCT by
  * value — the same narrow, deliberate use of the internal representation
  * qihse_fabric_dispatch.c makes for its remote context: the struct it
@@ -226,6 +227,15 @@ struct qihse_resp_server {
     uint64_t next_worker;
     pthread_rwlock_t kv_lock;
     pthread_mutex_t vdb_lock; /* VECSET writes; VECGET/VECSEARCH share — see notes */
+    /* FTS.BUILD/FTS.SEARCH bookkeeping.  The INDEX is caller-owned
+     * (config.fts); this map is engine-owned: doc ids are dense, 1-based,
+     * reset by every FTS.BUILD, and fts_keys[doc_id - 1] is the KV key the
+     * document was built from.  fts_meta_lock guards both the map and the
+     * index pointer across BUILD's destroy+create swap and SEARCH. */
+    pthread_mutex_t fts_meta_lock;
+    char** fts_keys;
+    uint64_t fts_key_count;
+    uint64_t fts_key_cap;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
@@ -1404,10 +1414,17 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
         char* key = qihse_resp_arg_text_buf(&request->argv[i], keybuf, sizeof(keybuf));
         if (!key) key = qihse_resp_arg_text(&request->argv[i]);
         if (!key) continue;
-        int64_t removed_now = remove ? qihse_kv_del_user(session->server->store, key, session->user) : 0;
-        if (remove && removed_now && deleted_count < 16u && strlen(key) < 256u) {
-            snprintf(deleted_keys[deleted_count], sizeof(deleted_keys[0]), "%s", key);
-            deleted_count++;
+        int64_t removed_now = 0;
+        if (remove) {
+            removed_now = qihse_kv_del_user(session->server->store, key, session->user);
+            if (removed_now && deleted_count < 16u && strlen(key) < 256u) {
+                snprintf(deleted_keys[deleted_count], sizeof(deleted_keys[0]), "%s", key);
+                deleted_count++;
+            }
+        } else {
+            /* EXISTS previously never consulted the store at all and always
+             * answered 0. */
+            removed_now = qihse_kv_exists_user(session->server->store, key, session->user) ? 1 : 0;
         }
         count += removed_now;
         if (key != keybuf) free(key);
@@ -3763,19 +3780,281 @@ static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const
 
 /* ---- Key/generic commands ---- */
 
+/* KEYS/SCAN share one bounded collector: authorization-filtered iteration
+ * (qihse_kv_foreach_user honors the session principal exactly like GET/SET),
+ * glob matching via fnmatch, and a hard key cap so a large keyspace cannot
+ * balloon one reply. The list is a single page; SCAN therefore always
+ * reports next-cursor 0, which is the defined shape for a complete scan. */
+#define QIHSE_RESP_KEYS_MAX 4096u
+
+typedef struct {
+    const char* pattern;
+    size_t cap;
+    char** keys;
+    size_t count;
+} key_list_t;
+
+static void key_list_free(key_list_t* list) {
+    if (!list || !list->keys) return;
+    for (size_t i = 0; i < list->count; i++) free(list->keys[i]);
+    free(list->keys);
+    list->keys = NULL;
+    list->count = 0;
+}
+
+static bool qihse_resp_keys_collect_cb(const char* key, const char* value, void* user_data) {
+    (void)value;
+    key_list_t* list = (key_list_t*)user_data;
+    if (list->pattern && fnmatch(list->pattern, key, 0) != 0) return true;
+    if (list->count >= list->cap) return false;
+    list->keys[list->count] = strdup(key);
+    if (!list->keys[list->count]) return false; /* OOM: reply with what we hold */
+    list->count++;
+    return true;
+}
+
+/* Collect matching keys under the session principal. Returns false only on
+ * allocation failure of the list itself (the reply is still usable). */
+static bool qihse_resp_keys_collect(qihse_resp_session_t* session, const char* pattern,
+                                    size_t cap, key_list_t* list) {
+    memset(list, 0, sizeof(*list));
+    list->pattern = pattern;
+    list->cap = cap ? cap : QIHSE_RESP_KEYS_MAX;
+    list->keys = (char**)calloc(list->cap, sizeof(char*));
+    if (!list->keys) return false;
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    qihse_kv_foreach_user(session->server->store, session->user,
+                          qihse_resp_keys_collect_cb, list);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    return true;
+}
+
 static bool qihse_resp_handle_keys(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "keys");
-    /* Without KV iteration, return empty */
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* pattern = qihse_resp_arg_text(&request->argv[1]);
+    key_list_t list;
+    bool ok = qihse_resp_keys_collect(session, pattern, QIHSE_RESP_KEYS_MAX, &list);
+    free(pattern);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    if (!qihse_resp_array(session, list.count)) {
+        key_list_free(&list);
+        return false;
+    }
+    for (size_t i = 0; i < list.count; i++) {
+        if (!qihse_resp_bulk_text(session, list.keys[i])) {
+            key_list_free(&list);
+            return false;
+        }
+    }
+    key_list_free(&list);
+    return true;
 }
 
 static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "scan");
-    /* Return cursor 0 and empty array */
-    qihse_resp_array(session, 2);
-    qihse_resp_bulk_text(session, "0");
-    qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    uint64_t cursor;
+    if (!qihse_resp_parse_u64_arg(&request->argv[1], &cursor)) {
+        return qihse_resp_error(session, "ERR invalid cursor");
+    }
+    const char* pattern = NULL;
+    size_t cap = QIHSE_RESP_KEYS_MAX;
+    char* pattern_copy = NULL;
+    for (size_t i = 2u; i + 1u < request->argc; i += 2u) {
+        if (qihse_resp_arg_equal(&request->argv[i], "MATCH")) {
+            free(pattern_copy);
+            pattern_copy = qihse_resp_arg_text(&request->argv[i + 1u]);
+            if (!pattern_copy) return qihse_resp_error(session, "ERR out of memory");
+            pattern = pattern_copy;
+        } else if (qihse_resp_arg_equal(&request->argv[i], "COUNT")) {
+            uint64_t count;
+            if (!qihse_resp_parse_u64_arg(&request->argv[i + 1u], &count) || count == 0u) {
+                free(pattern_copy);
+                return qihse_resp_error(session, "ERR value is not an integer or out of range");
+            }
+            if (count < cap) cap = (size_t)count;
+        } else {
+            free(pattern_copy);
+            return qihse_resp_error(session, "ERR syntax error");
+        }
+    }
+    key_list_t list;
+    bool ok = qihse_resp_keys_collect(session, pattern, cap, &list);
+    free(pattern_copy);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    bool built = qihse_resp_array(session, 2u);
+    if (built) built = qihse_resp_bulk_text(session, "0");
+    if (built) built = qihse_resp_array(session, list.count);
+    for (size_t i = 0; built && i < list.count; i++) {
+        built = qihse_resp_bulk_text(session, list.keys[i]);
+    }
+    key_list_free(&list);
+    return built;
+}
+
+/* ---- FTS.BUILD / FTS.SEARCH — BM25 search over the KV store -------------
+ * The index is caller-owned (config.fts; the cluster daemon installs one).
+ * BUILD iterates the store with the poison-tolerant qihse_kv_foreach_user
+ * (documents are only ever records the BUILDING principal can read), feeds
+ * each match as one document (text = key + "\n" + value), and swaps the
+ * index destroy+create so rebuilds start clean; doc ids restart at 1.
+ * SEARCH replies with a FLAT array [key, score, key, score, ...] — score is
+ * the BM25 relevance as text. The index is in-memory by design: after a
+ * restart FTS.SEARCH returns an empty array until the next FTS.BUILD.
+ *
+ * Bounds: pattern ≤ 256B, query ≤ 1024B, limit ∈ [1,100] (default 20),
+ * 100k documents max, 1MB of text per document. BUILD holds fts_meta_lock
+ * for its whole run, so concurrent SEARCHes wait rather than race the
+ * destroy+create swap; lock order is kv_lock → fts_meta_lock only. */
+
+#define QIHSE_RESP_FTS_MAX_DOCS      100000u
+#define QIHSE_RESP_FTS_MAX_PATTERN   256u
+#define QIHSE_RESP_FTS_MAX_QUERY     1024u
+#define QIHSE_RESP_FTS_DEFAULT_LIMIT 20u
+#define QIHSE_RESP_FTS_MAX_LIMIT     100u
+#define QIHSE_RESP_FTS_MAX_DOC_BYTES (1u << 20)
+
+typedef struct {
+    qihse_fts_index_t* index;
+    qihse_user_t* user;
+    const char* pattern;
+    char** keys;        /* keys[doc_id - 1]; engine-owned map, dense */
+    uint64_t count;
+    uint64_t cap;
+    bool map_full;      /* engine map allocation failed: stop cleanly */
+} fts_build_ctx_t;
+
+static bool qihse_resp_fts_build_cb(const char* key, const char* value, void* user_data) {
+    fts_build_ctx_t* b = (fts_build_ctx_t*)user_data;
+    if (!b || !b->keys || !key) return false;
+    if (b->pattern && fnmatch(b->pattern, key, 0) != 0) return true;
+    if (b->count >= b->cap) return false;
+
+    size_t klen = strlen(key);
+    size_t vlen = value ? strlen(value) : 0u;
+    if (vlen > QIHSE_RESP_FTS_MAX_DOC_BYTES) vlen = QIHSE_RESP_FTS_MAX_DOC_BYTES;
+    char* text = (char*)malloc(klen + 1u + vlen + 1u);
+    if (!text) { b->map_full = true; return false; }
+    memcpy(text, key, klen);
+    text[klen] = '\n';
+    if (vlen) memcpy(text + klen + 1u, value, vlen);
+    text[klen + 1u + vlen] = '\0';
+
+    /* doc ids are dense: doc_id == count + 1, so keys[doc_id - 1] is exact. */
+    uint64_t doc_id = b->count + 1u;
+    bool added = qihse_fts_add_document_user(b->index, doc_id, text, klen + 1u + vlen,
+                                             0u, 0u, QIHSE_KEYSTONE_CLASS_UNKNOWN,
+                                             b->user);
+    free(text);
+    if (!added) return true; /* unusable document: skip, keep the run alive */
+    b->keys[b->count] = strdup(key);
+    if (!b->keys[b->count]) { b->map_full = true; return false; }
+    b->count++;
     return true;
+}
+
+static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.build");
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    if (!session->server->fts) return qihse_resp_error(session, "ERR full-text index is not configured");
+    if (request->argv[1].len == 0u || request->argv[1].len > QIHSE_RESP_FTS_MAX_PATTERN) {
+        return qihse_resp_error(session, "ERR invalid key pattern");
+    }
+    char pattern_buf[QIHSE_RESP_FTS_MAX_PATTERN + 1u];
+    memcpy(pattern_buf, request->argv[1].data, request->argv[1].len);
+    pattern_buf[request->argv[1].len] = '\0';
+
+    fts_build_ctx_t b;
+    memset(&b, 0, sizeof(b));
+    b.pattern = pattern_buf;
+    b.cap = QIHSE_RESP_FTS_MAX_DOCS;
+    b.user = session->user;
+
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    /* Rebuild semantics: destroy+create, so postings, doc stats and the
+     * doc-id space all start clean. VECHYBRID reads server->fts per call
+     * and takes the same lock's discipline, so the swap is safe. */
+    qihse_fts_index_t* fresh = qihse_fts_create();
+    if (!fresh) {
+        pthread_mutex_unlock(&session->server->fts_meta_lock);
+        return qihse_resp_error(session, "ERR out of memory");
+    }
+    b.keys = (char**)calloc(b.cap + 1u, sizeof(char*));
+    if (!b.keys) {
+        qihse_fts_destroy(fresh);
+        pthread_mutex_unlock(&session->server->fts_meta_lock);
+        return qihse_resp_error(session, "ERR out of memory");
+    }
+    qihse_fts_index_t* old = session->server->fts;
+    session->server->fts = fresh;
+    for (uint64_t i = 0; i < session->server->fts_key_count; i++) free(session->server->fts_keys[i]);
+    free(session->server->fts_keys);
+    session->server->fts_keys = b.keys;
+    session->server->fts_key_count = 0u;
+    session->server->fts_key_cap = b.cap;
+
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    b.index = fresh;
+    qihse_kv_foreach_user(session->server->store, session->user,
+                          qihse_resp_fts_build_cb, &b);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    session->server->fts_key_count = b.count;
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    qihse_fts_destroy(old);
+    /* b.count == cap means the bound was reached: remaining records were
+     * not indexed. The count is the honest reply either way. */
+    return qihse_resp_integer(session, (int64_t)b.count);
+}
+
+static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 2 || request->argc > 3) return qihse_resp_wrong_arity(session, "fts.search");
+    if (!session->server->fts) return qihse_resp_error(session, "ERR full-text index is not configured");
+    if (request->argv[1].len == 0u || request->argv[1].len > QIHSE_RESP_FTS_MAX_QUERY) {
+        return qihse_resp_error(session, "ERR invalid query");
+    }
+    uint64_t limit = QIHSE_RESP_FTS_DEFAULT_LIMIT;
+    if (request->argc == 3) {
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &limit) || limit == 0u) {
+            return qihse_resp_error(session, "ERR invalid limit");
+        }
+        if (limit > QIHSE_RESP_FTS_MAX_LIMIT) limit = QIHSE_RESP_FTS_MAX_LIMIT;
+    }
+    char query_buf[QIHSE_RESP_FTS_MAX_QUERY + 1u];
+    memcpy(query_buf, request->argv[1].data, request->argv[1].len);
+    query_buf[request->argv[1].len] = '\0';
+
+    /* Snapshot the hits under the lock: BUILD may swap the index and free
+     * the key map the moment we unlock, so copy the key strings out. */
+    qihse_fts_result_t hits[QIHSE_RESP_FTS_MAX_LIMIT];
+    char* hit_keys[QIHSE_RESP_FTS_MAX_LIMIT];
+    int n = 0;
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    if (session->server->fts) {
+        n = qihse_fts_search_user(session->server->fts, query_buf, session->user,
+                                  hits, (int)limit);
+        for (int i = 0; i < n; i++) {
+            hit_keys[i] = NULL;
+            if (hits[i].doc_id >= 1u && hits[i].doc_id <= session->server->fts_key_count) {
+                const char* k = session->server->fts_keys[hits[i].doc_id - 1u];
+                if (k) hit_keys[i] = strdup(k);
+            }
+        }
+    }
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    if (n < 0) {
+        for (int i = 0; i < n && i < QIHSE_RESP_FTS_MAX_LIMIT; i++) free(hit_keys[i]);
+        return qihse_resp_error(session, "ERR search failed");
+    }
+    bool built = qihse_resp_array(session, (size_t)n * 2u);
+    for (int i = 0; built && i < n; i++) {
+        char score[32];
+        snprintf(score, sizeof(score), "%.6g", (double)hits[i].bm25_score);
+        built = qihse_resp_bulk_text(session, hit_keys[i] ? hit_keys[i] : "") &&
+                qihse_resp_bulk_text(session, score);
+    }
+    for (int i = 0; i < n && i < QIHSE_RESP_FTS_MAX_LIMIT; i++) free(hit_keys[i]);
+    return built;
 }
 
 static bool qihse_resp_handle_rename(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool nx) {
@@ -5327,6 +5606,8 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"zpopmax", dsp_zpopmax, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"zpopmin", dsp_zpopmin, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"zrangebyscore", dsp_zrangebyscore, DSP_KEY_1KV}, {"zrevrangebyscore", dsp_zrevrangebyscore, DSP_KEY_1KV},
     {"keys", qihse_resp_handle_keys, 0}, {"scan", qihse_resp_handle_scan, 0},
+    {"fts.build", qihse_resp_handle_fts_build, DSP_BUSY_WRITE},
+    {"fts.search", qihse_resp_handle_fts_search, 0},
     {"rename", dsp_rename, DSP_BUSY_WRITE | DSP_KEY_12KV}, {"renamenx", dsp_renamenx, DSP_BUSY_WRITE | DSP_KEY_12KV},
     {"getset", qihse_resp_handle_getset, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"getdel", qihse_resp_handle_getdel, DSP_BUSY_WRITE | DSP_KEY_1KV},
@@ -5440,6 +5721,15 @@ bool qihse_cluster_set_range_owner(qihse_resp_server_t* server, uint16_t first, 
     if (!qihse_cluster_topology_assign_range(server->topology, first, last, owner_index)) return false;
     if (server->bus) qihse_cluster_bus_broadcast_slot_update(server->bus, first, last, owner_index);
     return true;
+}
+
+/* qihse_resp_cluster_context_t hook: lets the operator-facing CLUSTER surface
+ * (ADDSLOTS / SETSLOT NODE) take the same broadcast path as MOVESLOTS and the
+ * brain, so a manual repair reaches every peer instead of living only in the
+ * local table until the next slot-map announcement overwrites it. */
+static bool qihse_resp_cluster_owner_cb(void* server, uint16_t first, uint16_t last,
+                                        uint16_t owner_index) {
+    return qihse_cluster_set_range_owner((qihse_resp_server_t*)server, first, last, owner_index);
 }
 
 typedef struct {
@@ -8856,6 +9146,7 @@ static const qihse_resp_qtype_ent_t g_qtype_table[] = {
     {"pttl", QIHSE_QUERY_TYPE_EXPIRE},
     /* multi-key / metadata reads */
     {"mget", QIHSE_QUERY_TYPE_SCAN}, {"keys", QIHSE_QUERY_TYPE_SCAN},
+    {"fts.build", QIHSE_QUERY_TYPE_SCAN}, {"fts.search", QIHSE_QUERY_TYPE_SCAN},
     {"scan", QIHSE_QUERY_TYPE_SCAN}, {"dbsize", QIHSE_QUERY_TYPE_SCAN},
     {"randomkey", QIHSE_QUERY_TYPE_SCAN}, {"type", QIHSE_QUERY_TYPE_SCAN},
     {"exists", QIHSE_QUERY_TYPE_SCAN}, {"object", QIHSE_QUERY_TYPE_SCAN},
@@ -9129,7 +9420,8 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         if (qihse_resp_arg_equal(&request->argv[1], "FETCH")) return qihse_resp_handle_fabric_fetch(session, request);
     }
     if (qihse_resp_command_is(request, "CLUSTER")) {
-        qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session };
+        qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
+                                                 qihse_resp_cluster_owner_cb, session->server };
         return qihse_resp_cluster_dispatch(&context, request->argc, request->argv);
     }
     if (qihse_resp_command_is(request, "CLIENT")) return qihse_resp_handle_client_command(session, request);
@@ -9349,7 +9641,9 @@ static int qihse_resp_open_listener(qihse_resp_server_t* server) {
         int enabled = 1;
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
         if (bind(listener, address->ai_addr, address->ai_addrlen) == 0 && listen(listener, 256) == 0) break;
+        int bind_errno = errno;
         close_socket(listener);
+        errno = bind_errno;
         listener = -1;
     }
     freeaddrinfo(addresses);
@@ -9571,6 +9865,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     }
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->fts_meta_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
         pthread_mutex_init(&server->group_lock, NULL) != 0 ||
         pthread_mutex_init(&server->federation_lock, NULL) != 0) {
@@ -9873,6 +10168,8 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
     server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
+        fprintf(stderr, "qihse: resp listener %s:%u unavailable: %s\n",
+                server->bind_address, server->port, strerror(errno));
         return false;
     }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
@@ -9913,6 +10210,8 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
     server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
+        fprintf(stderr, "qihse: resp listener %s:%u unavailable: %s\n",
+                server->bind_address, server->port, strerror(errno));
         return false;
     }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
@@ -9984,6 +10283,11 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
     pthread_mutex_destroy(&server->vdb_lock);
+    if (server->fts_keys) {
+        for (uint64_t i = 0; i < server->fts_key_count; i++) free(server->fts_keys[i]);
+        free(server->fts_keys);
+    }
+    pthread_mutex_destroy(&server->fts_meta_lock);
     pthread_rwlock_destroy(&server->kv_lock);
     pthread_cond_destroy(&server->clients_drained);
     pthread_mutex_destroy(&server->state_lock);

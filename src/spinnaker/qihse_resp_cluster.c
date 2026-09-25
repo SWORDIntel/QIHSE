@@ -222,8 +222,14 @@ static qihse_resp_snapshot_status_t qihse_resp_snapshot_nodes(const qihse_cluste
         if (!nodes) return QIHSE_RESP_SNAPSHOT_OOM;
         size_t count = qihse_cluster_topology_nodes(topology, nodes, capacity);
         if (count <= capacity) {
+            /* The view is COMPACTED: pruned nodes are left out, so a live
+             * entry's position here is not its topology index. Each entry
+             * carries its true index and qihse_resp_node_at() searches by
+             * it — before this, the first prune made every entry fail the
+             * position==index check and CLUSTER NODES/SLOTS/INFO died with
+             * "cluster topology unavailable". */
             for (size_t i = 0; i < count; i++) {
-                if (!qihse_resp_node_valid(&nodes[i], (uint16_t)i)) {
+                if (!qihse_resp_node_valid(&nodes[i], nodes[i].index)) {
                     free(nodes);
                     return QIHSE_RESP_SNAPSHOT_INVALID;
                 }
@@ -259,8 +265,18 @@ static qihse_resp_snapshot_status_t qihse_resp_snapshot_slots(const qihse_cluste
 }
 
 static const qihse_cluster_node_t* qihse_resp_node_at(const qihse_cluster_node_t* nodes, size_t count, uint16_t index) {
-    if (index == QIHSE_CLUSTER_NODE_NONE || (size_t)index >= count) return NULL;
-    return &nodes[index];
+    if (index == QIHSE_CLUSTER_NODE_NONE) return NULL;
+    /* Compacted view: find the entry whose TOPOLOGY index matches. Entries
+     * are index-ordered, so a binary search is enough. */
+    size_t low = 0;
+    size_t high = count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2u;
+        if ((size_t)nodes[mid].index < (size_t)index) low = mid + 1u;
+        else high = mid;
+    }
+    if (low < count && (size_t)nodes[low].index == (size_t)index) return &nodes[low];
+    return NULL;
 }
 
 static bool qihse_resp_handle_snapshot_error(qihse_resp_cluster_context_t* context, qihse_resp_snapshot_status_t status) {
@@ -457,7 +473,7 @@ static bool qihse_resp_handle_nodes(qihse_resp_cluster_context_t* context, size_
                 qihse_resp_buffer_append_node_endpoint(&payload, node) &&
                 qihse_resp_buffer_append_char(&payload, ' ');
         if (!built) break;
-        if ((uint16_t)i == local_index) built = qihse_resp_buffer_append_string(&payload, "myself,");
+        if (node->index == local_index) built = qihse_resp_buffer_append_string(&payload, "myself,");
         if (built) built = qihse_resp_buffer_append_string(&payload, node->role == QIHSE_CLUSTER_NODE_PRIMARY ? "master" : "slave");
         if (built && !node->healthy) built = qihse_resp_buffer_append_string(&payload, ",fail");
         if (built) built = qihse_resp_buffer_append_char(&payload, ' ');
@@ -476,9 +492,9 @@ static bool qihse_resp_handle_nodes(qihse_resp_cluster_context_t* context, size_
                     qihse_resp_buffer_append_string(&payload, node->healthy ? "connected" : "disconnected");
         }
         if (built && node->role == QIHSE_CLUSTER_NODE_PRIMARY) {
-            built = qihse_resp_buffer_append_node_ranges(&payload, (uint16_t)i, slots);
+            built = qihse_resp_buffer_append_node_ranges(&payload, node->index, slots);
         }
-        if (built) built = qihse_resp_buffer_append_node_transitions(&payload, (uint16_t)i, nodes, node_count, slots);
+        if (built) built = qihse_resp_buffer_append_node_transitions(&payload, node->index, nodes, node_count, slots);
         if (built) built = qihse_resp_buffer_append_char(&payload, '\n');
     }
     free(slots);
@@ -518,7 +534,7 @@ static bool qihse_resp_handle_info(qihse_resp_cluster_context_t* context, size_t
     }
     size_t cluster_size = 0;
     for (size_t i = 0; i < node_count; i++) {
-        if (primary_has_slot[i]) cluster_size++;
+        if (primary_has_slot[nodes[i].index]) cluster_size++;
     }
     uint64_t my_epoch = 0;
     uint16_t local_index = qihse_cluster_topology_local_node(context->topology);
@@ -716,7 +732,10 @@ static bool qihse_resp_handle_addslots(qihse_resp_cluster_context_t* context, si
         }
     }
     for (size_t i = 0; i < slot_count; i++) {
-        if (!qihse_cluster_topology_assign_range(context->topology, slots[i], slots[i], local_index)) {
+        bool updated = context->set_range_owner
+                           ? context->set_range_owner(context->server, slots[i], slots[i], local_index)
+                           : qihse_cluster_topology_assign_range(context->topology, slots[i], slots[i], local_index);
+        if (!updated) {
             free(slots);
             return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
         }
@@ -791,9 +810,10 @@ static bool qihse_resp_handle_setslot(qihse_resp_cluster_context_t* context, siz
         return qihse_resp_emit_string(context, "-ERR unknown primary node\r\n");
     }
     if (qihse_resp_arg_equals(&argv[3], "NODE")) {
-        if (!qihse_cluster_topology_assign_range(context->topology, slot, slot, target_index)) {
-            return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-        }
+        bool updated = context->set_range_owner
+                           ? context->set_range_owner(context->server, slot, slot, target_index)
+                           : qihse_cluster_topology_assign_range(context->topology, slot, slot, target_index);
+        if (!updated) return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
         return qihse_resp_emit_string(context, "+OK\r\n");
     }
     uint16_t local_index;

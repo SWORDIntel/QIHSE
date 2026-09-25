@@ -89,6 +89,9 @@ struct qihse_cluster_bus {
     pthread_t thread;
     pthread_mutex_t lock;
     qihse_cluster_bus_stats_t stats;
+    /* Bus liveness reference (monotonic ms at start): entries never
+     * contacted directly are timed out against this, not skipped. */
+    uint64_t started_ms;
     /* Per-node last-seen timestamps (indexed by topology node index) */
     uint64_t* last_seen_ms;
     uint64_t* first_seen_ms;
@@ -600,6 +603,19 @@ static void qihse_bus_handle_node_update(qihse_cluster_bus_t* bus, const uint8_t
     uint16_t idx;
     if (qihse_cluster_topology_upsert_node(bus->topology, &node, &idx)) {
         qihse_cluster_topology_set_node_health(bus->topology, idx, node.healthy);
+        /* First learned about this node through GOSSIP only: start its
+         * liveness clock. Without this, check_health skips an entry it has
+         * never heard from directly forever (last_seen == 0), so a corpse
+         * repeated by a peer stays "connected" here — healthy-by-default —
+         * no matter how long its daemon is gone. Direct contact still
+         * refreshes the clock (touch_node); third-party health evidence
+         * stays separate (obs_healthy_ms). */
+        qihse_bus_ensure_last_seen(bus, (size_t)idx + 1u);
+        if (bus->first_seen_ms && bus->first_seen_ms[idx] == 0 && bus->last_seen_ms[idx] == 0) {
+            uint64_t now = qihse_bus_now_ms();
+            bus->first_seen_ms[idx] = now;
+            bus->last_seen_ms[idx] = now;
+        }
     }
 }
 
@@ -621,7 +637,11 @@ static void qihse_bus_handle_node_obs(qihse_cluster_bus_t* bus,
     if (!qihse_cluster_topology_find_node(bus->topology, about_id, &idx)) return;
     if (!bus->obs_healthy_ms) return;
     bus->obs_healthy_ms[idx] = qihse_bus_now_ms();
-    qihse_bus_touch_node(bus, idx);
+    /* Deliberately NOT touch_node(): third-party "it is healthy" evidence
+     * must not refresh the DIRECT-contact clock. It used to, which let two
+     * peers keep a dead node alive forever — each announced the corpse as
+     * healthy, each refresh refreshed the other's last_seen, check_health
+     * never timed it out, and the brain kept treating it as a live target. */
 }
 
 uint64_t qihse_cluster_bus_last_observed_healthy(const qihse_cluster_bus_t* bus,
@@ -1137,6 +1157,7 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
      * statement_ms interval — a peer should not wait seconds to learn an
      * attributable capability profile. */
     (void)qihse_bus_send_fed_statement(bus);
+    bus->started_ms = qihse_bus_now_ms();
     bus->running = true;
     if (pthread_create(&bus->thread, NULL, qihse_bus_thread, bus) != 0) {
         bus->running = false;
@@ -1410,8 +1431,20 @@ size_t qihse_cluster_bus_check_health(qihse_cluster_bus_t* bus) {
     for (size_t i = 0; i < count; i++) {
         uint16_t idx = nodes[i].index;
         if (idx == bus->local_node_index) continue;
-        if (idx >= bus->last_seen_capacity || bus->last_seen_ms[idx] == 0) continue;
-        if (now - bus->last_seen_ms[idx] > bus->timeout_ms) {
+        uint64_t last_seen = idx < bus->last_seen_capacity ? bus->last_seen_ms[idx] : 0;
+        if (last_seen == 0) {
+            /* Never heard from this node directly. That used to mean
+             * "skip forever", which made a corpse learned only through
+             * gossip permanently "connected" here. Time it out against the
+             * bus start instead: a live peer heartbeats us well inside
+             * timeout_ms, so only a genuinely absent node is still at zero
+             * once the grace window passes. Direct contact revives it
+             * (touch_node), and a node whose frames we cannot receive but
+             * whose peers can is covered by FAIL/NODE_UPDATE gossip. */
+            if (bus->started_ms == 0 || now - bus->started_ms <= bus->timeout_ms) continue;
+            last_seen = bus->started_ms;
+        }
+        if (now - last_seen > bus->timeout_ms) {
             /* re-emit while it REMAINS unhealthy: a gated/deferred failover
              * must re-evaluate once confirming evidence (or the lack of it)
              * resolves. Promote() is idempotent. */

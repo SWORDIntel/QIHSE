@@ -24,6 +24,7 @@
 #include "qihse_cluster_brain.h"
 #include "qihse_overlay.h"
 #include "qihse_kv_store.h"
+#include "qihse_fts.h"
 #include "qihse_platform.h"
 #include <pthread.h>
 #include <errno.h>
@@ -121,6 +122,9 @@ static void usage(const char* argv0) {
         "          [--brain-fed-dir DIR] [--brain-node-key PATH]\n"
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--max-clients N]\n"
+        "          (each daemon owns an in-memory BM25 index over its local KV:\n"
+        "           FTS.BUILD <pattern> indexes matching keys, FTS.SEARCH <query>\n"
+        "           [limit] replies [key, score, ...]; the index resets on restart)\n"
         "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
         "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
         "  static --node list defines the topology.\n"
@@ -344,14 +348,30 @@ int main(int argc, char** argv) {
     }
     if (operator_password && strlen(operator_password) >= 12) {
         setenv("QIHSE_OPERATOR_PASSWORD", operator_password, 1);
+    } else if (operator_password) {
+        /* qihse_auth_bootstrap_operator() refuses passwords under 12 chars.
+         * Continuing would enable auth_required with no usable verifier:
+         * every AUTH would fail with WRONGPASS and nothing would say why. */
+        fprintf(stderr, "qihse-cluster-daemon: --operator-password must be at least 12 characters\n");
+        return 2;
     }
     if (!qihse_auth_init()) {
         fprintf(stderr, "qihse-cluster-daemon: auth init failed\n");
         return 1;
     }
-    /* QIHSE_OPERATOR_PASSWORD was exported before qihse_auth_init(), so the
-     * operator verifier is already configured: a non-loopback listener with
-     * auth_required is immediately usable. */
+    if (operator_password && strlen(operator_password) >= 12) {
+        if (!qihse_auth_bootstrap_operator(operator_password)) {
+            /* Already bootstrapped on a previous run: re-init with the
+             * password in the environment so the operator verifier matches,
+             * exactly as tools/qihse_federation_ca.c and
+             * tools/qihse_redis_server.c do it. */
+            setenv("QIHSE_OPERATOR_PASSWORD", operator_password, 1);
+            if (!qihse_auth_init()) {
+                fprintf(stderr, "qihse-cluster-daemon: auth re-init failed\n");
+                return 1;
+            }
+        }
+    }
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     if (!store) {
@@ -430,6 +450,14 @@ int main(int argc, char** argv) {
      * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
      * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
     config.veil_key = operator_password;
+    /* BM25 full-text search surface (FTS.BUILD / FTS.SEARCH): unlike
+     * VECHYBRID, which expects the caller to bring an index, every cluster
+     * daemon owns one over its local KV. In-memory by design: after a
+     * restart FTS.SEARCH returns an empty array until the next FTS.BUILD. */
+    qihse_fts_index_t* fts = qihse_fts_create();
+    if (!fts)
+        fprintf(stderr, "qihse-cluster-daemon: FTS index create failed (FTS.* unavailable)\n");
+    config.fts = fts;
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     if (!server) {
@@ -499,6 +527,7 @@ int main(int argc, char** argv) {
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
+    if (fts) qihse_fts_destroy(fts); /* caller-owned: destroyed with the server */
     fprintf(stderr, "qihse-cluster-daemon: stopped\n");
     return ok ? 0 : 1;
 }

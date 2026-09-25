@@ -55,6 +55,10 @@ _lib.qihse_kv_save_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p
 _lib.qihse_kv_save_user.restype = ctypes.c_int
 _lib.qihse_kv_load_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_load_user.restype = ctypes.c_int
+_lib.qihse_kv_bulk_load_begin.argtypes = [_KVStore_p]
+_lib.qihse_kv_bulk_load_begin.restype = None
+_lib.qihse_kv_bulk_load_end.argtypes = [_KVStore_p]
+_lib.qihse_kv_bulk_load_end.restype = None
 
 _libc = ctypes.CDLL(None)
 _libc.free.argtypes = [ctypes.c_void_p]
@@ -237,3 +241,11 @@ class KVStore:
         port = finding.get("port", "unknown")
         key = f"finding:{cve}:{ip_addr}:{port}"
         return self.set(key, json.dumps(finding), user=user)
+
+    def bulk_load_begin(self) -> None:
+        if self._ptr:
+            _lib.qihse_kv_bulk_load_begin(self._ptr)
+
+    def bulk_load_end(self) -> None:
+        if self._ptr:
+            _lib.qihse_kv_bulk_load_end(self._ptr)
