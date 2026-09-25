@@ -1562,14 +1562,17 @@ static bool qihse_resp_watch_deliver(qihse_resp_session_t* session, const char* 
     if (session->io_buf) return true; /* stateless buffered mode: nothing to stream to */
     size_t key_len = strlen(key);
     size_t value_len = is_del ? 0u : strlen(value);
-    size_t frame_cap = 96u + prefix_len + key_len + value_len;
+    /* Cap covers the fixed framing (array/type headers, length lines —
+     * ~50 bytes) plus slack; the guard below re-checks with the real
+     * header length n. */
+    size_t frame_cap = 128u + prefix_len + key_len + value_len;
     uint8_t* frame = malloc(frame_cap);
     if (!frame) return true; /* OOM: skip this event, keep the watch */
     size_t len = 0;
     char head[48];
     int n = snprintf(head, sizeof(head), is_del ? "*4\r\n$7\r\nmessage\r\n$%zu\r\n" : "*5\r\n$7\r\nmessage\r\n$%zu\r\n",
                      prefix_len);
-    if (n <= 0 || (size_t)n >= sizeof(head) || (size_t)n + prefix_len + key_len + value_len + 96u > frame_cap) {
+    if (n <= 0 || (size_t)n >= sizeof(head) || (size_t)n + prefix_len + key_len + value_len + 64u > frame_cap) {
         free(frame);
         return true;
     }
