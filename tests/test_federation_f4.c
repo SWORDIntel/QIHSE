@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── CAS ─────────────────────────────────────────────────────────────────── */
@@ -109,7 +110,11 @@ static void test_leases(qihse_kv_store_t* store, qihse_user_t* op) {
     assert(qihse_uuid_from_seed("f4-lease-req-1", strlen("f4-lease-req-1"), &request_id));
     assert(qihse_uuid_from_seed("f4-lease-id-1", strlen("f4-lease-id-1"), &lease_id));
 
-    /* Acquire a lease. */
+    /* Acquire a lease.  Phase-B liveness: the expiry must be in the FUTURE
+     * (absolute ms since epoch, like the RESP handler stamps) — the old
+     * literal here was a 1970 timestamp, i.e. a born-dead lease, which the
+     * Phase-B server-side expiry correctly refuses to renew. */
+    uint64_t now_ms = (uint64_t)time(NULL) * 1000ULL;
     qihse_federation_lease_t req;
     memset(&req, 0, sizeof(req));
     req.lease_id = lease_id;
@@ -118,7 +123,7 @@ static void test_leases(qihse_kv_store_t* store, qihse_user_t* op) {
     req.fencing_epoch = 1;
     req.request_id = request_id;
     req.issuer = issuer;
-    req.expires_hlc_physical = 999999999;
+    req.expires_hlc_physical = now_ms + 60000;
 
     qihse_federation_lease_t out;
     assert(qihse_federation_lease_acquire(store, op, &req, &out));
@@ -132,11 +137,12 @@ static void test_leases(qihse_kv_store_t* store, qihse_user_t* op) {
     assert(fetched.state == QIHSE_LEASE_GRANTED);
     assert(qihse_uuid_equal(&fetched.owner_node, &owner));
 
-    /* Renew the lease. */
+    /* Renew the lease (extends further into the future). */
     qihse_federation_lease_t renewed;
-    assert(qihse_federation_lease_renew(store, op, &lease_id, 8888888888ULL, &renewed));
+    assert(qihse_federation_lease_renew(store, op, &lease_id,
+                                        now_ms + 120000, &renewed));
     assert(renewed.state == QIHSE_LEASE_GRANTED);
-    assert(renewed.expires_hlc_physical == 8888888888ULL);
+    assert(renewed.expires_hlc_physical == now_ms + 120000);
 
     /* Release the lease. */
     assert(qihse_federation_lease_release(store, op, &lease_id));
@@ -431,8 +437,14 @@ static void test_resp_federation_f4(qihse_kv_store_t* store, qihse_user_t* op) {
     used = 0; assert(f4_read_reply(&c, reply, sizeof reply, &used));
     assert(strstr(reply, "resp-group") != NULL);
 
-    /* LEASE.ACQUIRE returns a lease id. */
-    f4_send_cmd6(&c, "FEDERATION", "LEASE.ACQUIRE", "infra", "vm/lease-01", "7", "99999999999");
+    /* LEASE.ACQUIRE returns a lease id.  Phase-B liveness: the expiry
+     * argument is an absolute wall-clock ms timestamp and must be in the
+     * future — the old literals here were 1970s timestamps (born-dead). */
+    uint64_t now_ms = (uint64_t)time(NULL) * 1000ULL;
+    char exp_arg[32], renew_arg[32];
+    snprintf(exp_arg, sizeof exp_arg, "%llu", (unsigned long long)(now_ms + 60000));
+    snprintf(renew_arg, sizeof renew_arg, "%llu", (unsigned long long)(now_ms + 120000));
+    f4_send_cmd6(&c, "FEDERATION", "LEASE.ACQUIRE", "infra", "vm/lease-01", "7", exp_arg);
     used = 0; assert(f4_read_reply(&c, reply, sizeof reply, &used));
     assert(strlen(reply) > 20);
     char lease_id[64];
@@ -445,7 +457,7 @@ static void test_resp_federation_f4(qihse_kv_store_t* store, qihse_user_t* op) {
     assert(strstr(reply, "granted") != NULL);
 
     /* LEASE.RENEW succeeds. */
-    f4_send_cmd(&c, "FEDERATION", "LEASE.RENEW", lease_id, "88888888888");
+    f4_send_cmd(&c, "FEDERATION", "LEASE.RENEW", lease_id, renew_arg);
     used = 0; assert(f4_read_reply(&c, reply, sizeof reply, &used));
     assert(strstr(reply, "OK") != NULL);
 

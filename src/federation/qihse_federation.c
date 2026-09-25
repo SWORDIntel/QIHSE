@@ -1535,6 +1535,21 @@ const char* qihse_lease_state_name(qihse_lease_state_t state) {
     return "unknown";
 }
 
+const char* qihse_federation_lease_renew_status_name(
+    qihse_federation_lease_renew_status_t status) {
+    switch (status) {
+        case QIHSE_LEASE_RENEW_OK:                    return "ok";
+        case QIHSE_LEASE_RENEW_ERR_INVALID:           return "invalid";
+        case QIHSE_LEASE_RENEW_ERR_NOT_FOUND:         return "not-found";
+        case QIHSE_LEASE_RENEW_ERR_EXPIRED:           return "expired";
+        case QIHSE_LEASE_RENEW_ERR_NOT_GRANTED:       return "not-granted";
+        case QIHSE_LEASE_RENEW_ERR_HOLDER_MISMATCH:   return "holder-mismatch";
+        case QIHSE_LEASE_RENEW_ERR_GENERATION_MISMATCH: return "generation-mismatch";
+        case QIHSE_LEASE_RENEW_ERR_STORE:             return "store";
+    }
+    return "unknown";
+}
+
 static void lease_kv_key(const qihse_uuid_t* lease_id, char* out, size_t cap) {
     char id_str[QIHSE_UUID_STR_LEN + 1u];
     qihse_uuid_format(lease_id, id_str);
@@ -1547,14 +1562,21 @@ static void lease_encode(const qihse_federation_lease_t* l, char* out, size_t ca
     uuid_hex(&l->owner_node, oid);
     uuid_hex(&l->request_id, rid);
     uuid_hex(&l->issuer, iss);
-    snprintf(out, cap, "%s\t%s\t%s\t%llu\t%llu\t%u\t%llu\t%llu\t%s\t%s",
-             lid, oid, l->resource_id,
-             (unsigned long long)l->fencing_epoch,
-             (unsigned long long)l->generation,
-             (unsigned)l->state,
-             (unsigned long long)l->issued_hlc_physical,
-             (unsigned long long)l->expires_hlc_physical,
-             rid, iss);
+    int n = snprintf(out, cap, "%s\t%s\t%s\t%llu\t%llu\t%u\t%llu\t%llu\t%s\t%s",
+                     lid, oid, l->resource_id,
+                     (unsigned long long)l->fencing_epoch,
+                     (unsigned long long)l->generation,
+                     (unsigned)l->state,
+                     (unsigned long long)l->issued_hlc_physical,
+                     (unsigned long long)l->expires_hlc_physical,
+                     rid, iss);
+    /* Phase-B field 11: the recorded holder principal.  Written only when a
+     * holder was recorded, so a legacy record that is decoded and re-written
+     * (e.g. reaped or released) stays legacy — and stays fail-closed for
+     * renewals — instead of silently growing a holder it never had. */
+    if (n > 0 && l->has_holder && (size_t)n < cap) {
+        snprintf(out + n, cap - (size_t)n, "\t%u", l->holder_user_id);
+    }
 }
 
 static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
@@ -1562,10 +1584,11 @@ static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
     memset(out, 0, sizeof(*out));
     char lid[33], oid[33], rid[33], iss[33];
     char resource[64];
-    unsigned state_u = 0;
+    unsigned state_u = 0, holder_u = 0;
     unsigned long long fence = 0, gen = 0, issued = 0, expires = 0;
-    int n = sscanf(blob, "%32[^\t]\t%32[^\t]\t%63[^\t]\t%llu\t%llu\t%u\t%llu\t%llu\t%32[^\t]\t%32[^\t]",
-                   lid, oid, resource, &fence, &gen, &state_u, &issued, &expires, rid, iss);
+    int n = sscanf(blob, "%32[^\t]\t%32[^\t]\t%63[^\t]\t%llu\t%llu\t%u\t%llu\t%llu\t%32[^\t]\t%32[^\t]\t%u",
+                   lid, oid, resource, &fence, &gen, &state_u, &issued, &expires, rid, iss,
+                   &holder_u);
     if (n < 8) return false;
     uuid_from_hex(lid, &out->lease_id);
     uuid_from_hex(oid, &out->owner_node);
@@ -1580,7 +1603,45 @@ static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
     out->expires_hlc_physical = (uint64_t)expires;
     if (n >= 9) uuid_from_hex(rid, &out->request_id);
     if (n >= 10) uuid_from_hex(iss, &out->issuer);
+    /* Phase-B field 11: recorded holder principal.  Its ABSENCE is the
+     * legacy marker — has_holder stays false and renewals fail closed.
+     * (Holder id 0 is a valid principal — the operator — so presence is
+     * signalled by the field existing, never by a zero sentinel.) */
+    if (n >= 11) {
+        out->holder_user_id = (uint32_t)holder_u;
+        out->has_holder = true;
+    }
     return true;
+}
+
+/* Wall-clock milliseconds — the compatibility liveness source.  The core
+ * has no clock of its own by design; the Phase-B primary path
+ * (lease_renew_checked) takes the caller's now_ms instead.  This helper
+ * exists only for the pre-Phase-B signatures and the read/acquire paths,
+ * using the same source the RESP handler uses to stamp issued_hlc_physical.
+ * Plan §42 partition risk: a node with a skewed wall clock judges liveness
+ * divergently from its peers; fencing epochs bound the damage. */
+static uint64_t lease_wall_now_ms(void) {
+    return (uint64_t)time(NULL) * 1000ULL;
+}
+
+/* A lease is time-DEAD when it carries a non-zero expiry that has passed.
+ * Expiry equality is still alive; strictly past is dead. */
+static bool lease_is_dead(const qihse_federation_lease_t* l, uint64_t now_ms) {
+    return l->expires_hlc_physical != 0 && now_ms > l->expires_hlc_physical;
+}
+
+/* Persist the EXPIRED transition for a GRANTED, time-dead lease (reaping).
+ * Best-effort write: even if the write fails the caller still treats the
+ * lease as dead — liveness never depends on the reap succeeding. */
+static void lease_reap(void* store, qihse_user_t* user,
+                       const char* key, qihse_federation_lease_t* l,
+                       uint64_t now_ms) {
+    if (l->state != QIHSE_LEASE_GRANTED || !lease_is_dead(l, now_ms)) return;
+    l->state = QIHSE_LEASE_EXPIRED;
+    char dead_blob[1024];
+    lease_encode(l, dead_blob, sizeof(dead_blob));
+    qihse_kv_set_user((qihse_kv_store_t*)store, key, dead_blob, 0, 0, user);
 }
 
 bool qihse_federation_lease_acquire(void* store_void, void* user_void,
@@ -1588,11 +1649,16 @@ bool qihse_federation_lease_acquire(void* store_void, void* user_void,
                                    qihse_federation_lease_t* out) {
     if (!store_void || !user_void || !request || !out) return false;
     memset(out, 0, sizeof(*out));
+    /* Compatibility liveness source for the pre-Phase-B signature (the
+     * primary checked-renew path takes the caller's clock instead). */
+    uint64_t now_ms = lease_wall_now_ms();
 
     pthread_mutex_lock(&g_federation_cas_lock);
 
     /* Idempotency: a repeated request_id returns the previously issued lease
-     * rather than minting a new one. */
+     * rather than minting a new one.  If that lease is time-dead it is
+     * reaped first, so a retry never receives a dead lease reported as
+     * granted (the returned record shows the true EXPIRED state). */
     char req_key[128];
     {
         char rid_str[QIHSE_UUID_STR_LEN + 1u];
@@ -1614,6 +1680,7 @@ bool qihse_federation_lease_acquire(void* store_void, void* user_void,
                 bool decoded = lease_decode(pblob, out);
                 free(pblob);
                 if (decoded) {
+                    lease_reap(store_void, (qihse_user_t*)user_void, pkey, out, now_ms);
                     pthread_mutex_unlock(&g_federation_cas_lock);
                     return true;
                 }
@@ -1639,6 +1706,27 @@ bool qihse_federation_lease_acquire(void* store_void, void* user_void,
                 pthread_mutex_unlock(&g_federation_cas_lock);
                 return false; /* stale fencing epoch — refuse */
             }
+            /* Phase-B liveness: the record carries the current holder lease
+             * id.  If that lease is time-dead, reap it before issuing the
+             * successor — a dead lease never stays on the books as granted,
+             * and the new lease supersedes it on the resource record below. */
+            if (holder_str[0] != '\0') {
+                qihse_uuid_t holder_lease;
+                if (qihse_uuid_parse(holder_str, &holder_lease)) {
+                    char hkey[128];
+                    lease_kv_key(&holder_lease, hkey, sizeof(hkey));
+                    char* hblob = qihse_kv_get_user((qihse_kv_store_t*)store_void, hkey,
+                                                    (qihse_user_t*)user_void);
+                    if (hblob) {
+                        qihse_federation_lease_t holder_rec;
+                        if (lease_decode(hblob, &holder_rec)) {
+                            lease_reap(store_void, (qihse_user_t*)user_void, hkey,
+                                       &holder_rec, now_ms);
+                        }
+                        free(hblob);
+                    }
+                }
+            }
         }
         free(res_val);
     }
@@ -1647,6 +1735,10 @@ bool qihse_federation_lease_acquire(void* store_void, void* user_void,
     *out = *request;
     out->state = QIHSE_LEASE_GRANTED;
     out->generation = request->generation + 1u;
+    /* Phase-B holder check: record the authenticated principal that acquires
+     * the lease; renewals must present the same principal. */
+    out->holder_user_id = qihse_user_get_id((qihse_user_t*)user_void);
+    out->has_holder = true;
     char key[128];
     lease_kv_key(&out->lease_id, key, sizeof(key));
     char blob[1024];
@@ -1674,29 +1766,90 @@ bool qihse_federation_lease_acquire(void* store_void, void* user_void,
     return true;
 }
 
+/* Shared Phase-B renewal engine.  Enforcement order is deliberate:
+ * liveness first (a dead lease is dead regardless of who asks), then
+ * state, then holder, then generation — a non-holder probing with a
+ * stale generation learns nothing but "not yours". */
+static qihse_federation_lease_renew_status_t lease_renew_internal(
+    void* store_void, void* user_void,
+    const qihse_uuid_t* lease_id,
+    uint64_t expected_generation,
+    uint64_t now_ms,
+    uint64_t new_expires_hlc_physical,
+    qihse_federation_lease_t* out) {
+    qihse_kv_store_t* store = (qihse_kv_store_t*)store_void;
+    qihse_user_t* user = (qihse_user_t*)user_void;
+    if (!store || !user || !lease_id || !out) return QIHSE_LEASE_RENEW_ERR_INVALID;
+
+    pthread_mutex_lock(&g_federation_cas_lock);
+    char key[128];
+    lease_kv_key(lease_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user(store, key, user);
+    if (!blob) { pthread_mutex_unlock(&g_federation_cas_lock); return QIHSE_LEASE_RENEW_ERR_NOT_FOUND; }
+    if (!lease_decode(blob, out)) { free(blob); pthread_mutex_unlock(&g_federation_cas_lock); return QIHSE_LEASE_RENEW_ERR_NOT_FOUND; }
+    free(blob);
+
+    /* Server-side expiry: a past-expiry GRANTED lease is DEAD.  Reap it
+     * (persist EXPIRED) and refuse — an expired lease is never renewable,
+     * by its holder or by anyone else.  The resource is re-acquirable at a
+     * strictly higher fencing epoch. */
+    if (out->state == QIHSE_LEASE_GRANTED && lease_is_dead(out, now_ms)) {
+        lease_reap(store, user, key, out, now_ms);
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return QIHSE_LEASE_RENEW_ERR_EXPIRED;
+    }
+    if (out->state != QIHSE_LEASE_GRANTED) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return QIHSE_LEASE_RENEW_ERR_NOT_GRANTED;
+    }
+    /* Holder check: only the recorded holder principal may renew.  A legacy
+     * record with no recorded holder fails closed (see header contract) —
+     * it must be re-acquired. */
+    if (!out->has_holder || out->holder_user_id != qihse_user_get_id(user)) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return QIHSE_LEASE_RENEW_ERR_HOLDER_MISMATCH;
+    }
+    /* Stale-renewal rejection.  Skippable only via the explicit
+     * GENERATION_UNCHECKED sentinel — a deliberate caller decision, never
+     * a default. */
+    if (expected_generation != QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED &&
+        expected_generation != out->generation) {
+        pthread_mutex_unlock(&g_federation_cas_lock);
+        return QIHSE_LEASE_RENEW_ERR_GENERATION_MISMATCH;
+    }
+    out->expires_hlc_physical = new_expires_hlc_physical;
+    out->generation = out->generation + 1u; /* a renewal is a mutation */
+    char new_blob[1024];
+    lease_encode(out, new_blob, sizeof(new_blob));
+    bool ok = qihse_kv_set_user(store, key, new_blob, 0, 0, user);
+    pthread_mutex_unlock(&g_federation_cas_lock);
+    return ok ? QIHSE_LEASE_RENEW_OK : QIHSE_LEASE_RENEW_ERR_STORE;
+}
+
+qihse_federation_lease_renew_status_t qihse_federation_lease_renew_checked(
+    void* store_void, void* user_void,
+    const qihse_uuid_t* lease_id,
+    uint64_t expected_generation,
+    uint64_t now_ms,
+    uint64_t new_expires_hlc_physical,
+    qihse_federation_lease_t* out) {
+    return lease_renew_internal(store_void, user_void, lease_id,
+                                expected_generation, now_ms,
+                                new_expires_hlc_physical, out);
+}
+
 bool qihse_federation_lease_renew(void* store_void, void* user_void,
                                  const qihse_uuid_t* lease_id,
                                  uint64_t new_expires_hlc_physical,
                                  qihse_federation_lease_t* out) {
-    if (!store_void || !user_void || !lease_id || !out) return false;
-    pthread_mutex_lock(&g_federation_cas_lock);
-    char key[128];
-    lease_kv_key(lease_id, key, sizeof(key));
-    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key, (qihse_user_t*)user_void);
-    if (!blob) { pthread_mutex_unlock(&g_federation_cas_lock); return false; }
-    if (!lease_decode(blob, out)) { free(blob); pthread_mutex_unlock(&g_federation_cas_lock); return false; }
-    free(blob);
-    if (out->state != QIHSE_LEASE_GRANTED) {
-        pthread_mutex_unlock(&g_federation_cas_lock);
-        return false;
-    }
-    out->expires_hlc_physical = new_expires_hlc_physical;
-    char new_blob[1024];
-    lease_encode(out, new_blob, sizeof(new_blob));
-    bool ok = qihse_kv_set_user((qihse_kv_store_t*)store_void, key, new_blob, 0, 0,
-                                (qihse_user_t*)user_void);
-    pthread_mutex_unlock(&g_federation_cas_lock);
-    return ok;
+    /* Pre-Phase-B signature: wall-clock liveness and no caller-supplied
+     * expected generation (see header — plan §42 risk documented there).
+     * All other Phase-B enforcement (expiry, holder) applies. */
+    return lease_renew_internal(store_void, user_void, lease_id,
+                                QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED,
+                                lease_wall_now_ms(),
+                                new_expires_hlc_physical, out)
+        == QIHSE_LEASE_RENEW_OK;
 }
 
 bool qihse_federation_lease_release(void* store_void, void* user_void,
@@ -1737,6 +1890,15 @@ bool qihse_federation_lease_read(void* store_void, void* user_void,
      * whose body names a different lease is corrupt, and returning it would
      * hand the caller a record belonging to something else. */
     if (ok && !qihse_uuid_equal(&out->lease_id, lease_id)) return false;
+    /* Phase-B liveness, read side: a GRANTED lease past its expiry is DEAD.
+     * Derive EXPIRED in the returned copy WITHOUT persisting — reads stay
+     * side-effect free, and a time-dead lease is never reported as granted.
+     * The persisted transition happens through renew/acquire reaping or
+     * release. */
+    if (ok && out->state == QIHSE_LEASE_GRANTED &&
+        lease_is_dead(out, lease_wall_now_ms())) {
+        out->state = QIHSE_LEASE_EXPIRED;
+    }
     return ok;
 }
 

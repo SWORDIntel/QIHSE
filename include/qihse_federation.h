@@ -543,7 +543,55 @@ uint64_t qihse_federation_epoch_next(void* store_void, void* user_void,
 uint64_t qihse_federation_epoch_current(void* store_void, void* user_void,
                                         const qihse_uuid_t* node_id);
 
-/* ── Lease primitive (plan §14) ─────────────────────────────────────────── */
+/* ── Lease primitive (plan §14) ───────────────────────────────────────────
+ *
+ * PHASE-B LIVENESS CONTRACT (R7 gap-analysis fixes — honest statement):
+ *
+ *   Server-side expiry: a GRANTED lease whose expires_hlc_physical is
+ *   non-zero and in the past (now_ms > expires) is DEAD.  The dead state
+ *   becomes visible three ways: (1) qihse_federation_lease_renew() and
+ *   qihse_federation_lease_renew_checked() refuse it AND persist the
+ *   EXPIRED transition (reap); (2) qihse_federation_lease_acquire()
+ *   reaps a dead predecessor when taking over the resource and reaps a
+ *   dead lease reached through the request-id idempotency index; the new
+ *   lease then supersedes it on the resource record; (3)
+ *   qihse_federation_lease_read() derives EXPIRED in the returned copy
+ *   (without persisting) so readers never see a time-dead lease reported
+ *   as GRANTED.  Acquire does not re-validate the REQUESTED expiry: a
+ *   lease whose requested expiry is already past is granted in the
+ *   GRANTED state but is born-dead — the first renew/reap transition
+ *   marks it EXPIRED.
+ *
+ *   Holder check: acquire records the authenticated principal
+ *   (qihse_user_get_id of the caller's user context) in
+ *   holder_user_id / has_holder.  Every renewal must present the SAME
+ *   principal.  has_holder distinguishes "holder recorded" from legacy
+ *   records persisted before this contract: a lease with no recorded
+ *   holder CANNOT be renewed by anyone (id 0 is a valid principal — the
+ *   operator — so absence is a separate flag, not a zero sentinel).
+ *   Legacy records must re-acquire.  Fail closed.
+ *
+ *   Stale renewal rejection: every successful mutation advances
+ *   `generation` (acquire sets request->generation + 1; renew bumps by
+ *   1).  qihse_federation_lease_renew_checked() takes the caller's
+ *   expected generation and refuses on mismatch, so a renewal computed
+ *   against a stale view of the lease is rejected.
+ *
+ *   TIME AND PARTITION RISK (plan §42 — documented, not rewritten in
+ *   this pass): liveness is evaluated against the caller-supplied
+ *   now_ms of renew_checked; the module itself reads no clock.  The
+ *   compatibility wrapper renew() and the acquire/read paths use
+ *   wall-clock milliseconds (time(NULL) * 1000), the same source the
+ *   RESP handler uses to stamp issued_hlc_physical.  A partitioned node
+ *   with a skewed wall clock can therefore judge liveness divergently
+ *   from its peers until reconciliation.  The module's own HLC
+ *   (qihse_hlc_tick/observe) is the intended future source: callers of
+ *   renew_checked can feed an HLC-derived physical value (or any
+ *   deterministic, injected value — the test does exactly that).  The
+ *   fencing-epoch high-water mark bounds the damage of a holder that
+ *   wrongly believes its lease is alive: it may renew its record, but it
+ *   can never commit exclusive-resource actions at an epoch below the
+ *   high-water mark. */
 
 typedef enum {
     QIHSE_LEASE_FREE = 0,
@@ -566,6 +614,13 @@ typedef struct {
     uint64_t expires_hlc_physical;  /* 0 = no expiry */
     qihse_uuid_t request_id;         /* for idempotency */
     qihse_uuid_t issuer;
+    /* Authenticated principal that acquired (holds) the lease.  Set by
+     * acquire() from the caller's user context; renewals must present
+     * the same principal.  has_holder == false marks a legacy record
+     * persisted before this field existed — such records fail closed
+     * on renew (see the PHASE-B contract above). */
+    uint32_t holder_user_id;
+    bool has_holder;
 } qihse_federation_lease_t;
 
 #define QIHSE_FEDERATION_LEASE_PREFIX "fedlease:"
@@ -577,13 +632,64 @@ typedef struct {
 
 /* Acquire a lease.  If a live lease exists for the resource, the acquire
  * fails unless the caller's fencing_epoch is strictly greater than the
- * existing lease's epoch.  Idempotent: a repeated request_id returns the
- * existing lease. */
+ * existing lease's epoch (monotonic, non-reusable — a dead lease does not
+ * lower the mark).  A time-dead lease never blocks: acquire reaps it and
+ * supersedes it on the resource record.  Idempotent: a repeated request_id
+ * returns the existing lease (reaped first if time-dead).  The acquiring
+ * principal is recorded as the lease holder. */
 bool qihse_federation_lease_acquire(void* store_void, void* user_void,
                                    const qihse_federation_lease_t* request,
                                    qihse_federation_lease_t* out);
 
-/* Renew a lease.  The caller must hold the current lease. */
+/* Renewal outcome detail for qihse_federation_lease_renew_checked(). */
+typedef enum {
+    QIHSE_LEASE_RENEW_OK = 0,
+    QIHSE_LEASE_RENEW_ERR_INVALID,            /* NULL/nonsensical arguments */
+    QIHSE_LEASE_RENEW_ERR_NOT_FOUND,          /* no such lease id */
+    QIHSE_LEASE_RENEW_ERR_EXPIRED,            /* past expiry — DEAD (reaped) */
+    QIHSE_LEASE_RENEW_ERR_NOT_GRANTED,        /* released or otherwise dead */
+    QIHSE_LEASE_RENEW_ERR_HOLDER_MISMATCH,    /* renewal by a non-holder, or
+                                               * a legacy record with no
+                                               * recorded holder */
+    QIHSE_LEASE_RENEW_ERR_GENERATION_MISMATCH,/* stale expected_generation */
+    QIHSE_LEASE_RENEW_ERR_STORE               /* persistence failure */
+} qihse_federation_lease_renew_status_t;
+
+const char* qihse_federation_lease_renew_status_name(
+    qihse_federation_lease_renew_status_t status);
+
+/* Sentinel for "the caller declines the generation check" in
+ * qihse_federation_lease_renew_checked().  Engine-minted leases start at
+ * generation 1, so 0 is never a live generation value.  Expiry and holder
+ * checks are NOT skippable. */
+#define QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED 0u
+
+/* Fully-checked renewal (Phase-B primary path): refuses a time-dead lease
+ * (now_ms > expires_hlc_physical, 0 = never expires — evaluated against the
+ * CALLER-SUPPLIED now_ms so the liveness clock is injectable/deterministic;
+ * feed an HLC-derived value in production, see plan §42 note above), a
+ * non-holder, and — unless expected_generation is
+ * QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED — a renewal computed from a
+ * stale generation.  On QIHSE_LEASE_RENEW_OK the lease is re-written with
+ * the new expiry and generation advanced by one; on EXPIRED the record is
+ * reaped to QIHSE_LEASE_EXPIRED.  *out receives the resulting record on
+ * OK and EXPIRED. */
+qihse_federation_lease_renew_status_t qihse_federation_lease_renew_checked(
+    void* store_void, void* user_void,
+    const qihse_uuid_t* lease_id,
+    uint64_t expected_generation,
+    uint64_t now_ms,
+    uint64_t new_expires_hlc_physical,
+    qihse_federation_lease_t* out);
+
+/* Backward-compatible renewal wrapper (same signature as before Phase-B).
+ * Enforces everything renew_checked enforces EXCEPT the caller-supplied
+ * expected generation (the signature cannot carry it — callers who can
+ * supply one must migrate to renew_checked) and the explicit liveness
+ * clock: wall-clock milliseconds are used, with the documented plan §42
+ * partition risk.  Returns false on every condition renew_checked
+ * refuses; inspect via renew_checked for the specific reason.  A
+ * successful renew advances generation by one. */
 bool qihse_federation_lease_renew(void* store_void, void* user_void,
                                  const qihse_uuid_t* lease_id,
                                  uint64_t new_expires_hlc_physical,
@@ -593,7 +699,10 @@ bool qihse_federation_lease_renew(void* store_void, void* user_void,
 bool qihse_federation_lease_release(void* store_void, void* user_void,
                                    const qihse_uuid_t* lease_id);
 
-/* Read a lease by id. */
+/* Read a lease by id.  Read-only: the returned copy derives EXPIRED for a
+ * GRANTED lease past its expiry (without persisting the transition), so a
+ * time-dead lease is never reported as granted; the persisted state
+ * changes only through renew/acquire reaping or release. */
 bool qihse_federation_lease_read(void* store_void, void* user_void,
                                  const qihse_uuid_t* lease_id,
                                  qihse_federation_lease_t* out);
