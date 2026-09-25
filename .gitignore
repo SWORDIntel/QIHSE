@@ -129,3 +129,7 @@ lib/
 /build/aimem_embed_*/
 /build/fabric_jobs_*/
 /build/gold_fabric_caps_*/
+
+# vendored tree-sitter build artifacts
+vendor/tree-sitter/lib/src/lib.d
+vendor/tree-sitter/lib/src/*.o
