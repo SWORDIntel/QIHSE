@@ -342,7 +342,7 @@ static void test_runtime_profile(qihse_kv_store_t* store, qihse_user_t* op) {
     qihse_runtime_profile_t p;
     qihse_runtime_profile_init(&p, "qihse", "3.0.0");
 
-    /* Production defaults are conservative (v3.md §36). */
+    /* Production defaults are conservative (plan §36). */
     assert(p.allowed_capabilities == 0);
     assert(!p.core_dumps_allowed);
     assert(p.require_seccomp);
@@ -507,7 +507,7 @@ static void test_net_profile(qihse_kv_store_t* store, qihse_user_t* op) {
     assert(p.egress[QIHSE_EGRESS_LOCAL_CITADEL]);
     assert(!p.egress[QIHSE_EGRESS_UNRESTRICTED_INTERNET]);
 
-    /* Declare a listener with the required attributes (v3.md §37). */
+    /* Declare a listener with the required attributes (plan §37). */
     p.ports[0] = 6379u;
     snprintf(p.bind_addresses[0], sizeof(p.bind_addresses[0]), "127.0.0.1");
     p.listener_requires_auth[0] = true;

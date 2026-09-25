@@ -3,7 +3,7 @@
 
 /*
  * QIHSE runtime trust and time integrity — federation stage F7.
- * See v3.md §35 (evidence-aware federation admission) and §38 (time
+ * See docs/plans/qihse_federation_upgrade_plan.md §35 (evidence-aware federation admission) and §38 (time
  * integrity and trusted ordering).
  *
  * A valid node certificate proves identity, not current trustworthiness.
@@ -13,7 +13,7 @@
  * audit came out.
  *
  * QIHSE STORES this evidence and EVALUATES it against policy.  It does not
- * fabricate evidence and does not self-approve (v3.md §35).
+ * fabricate evidence and does not self-approve (plan §35).
  *
  * Critical principle: a failed provenance or attestation check must not
  * destroy local availability, but it must be able to remove the node from
@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-/* ── Runtime trust states (v3.md §35) ──────────────────────────────────── */
+/* ── Runtime trust states (plan §35) ──────────────────────────────────── */
 
 typedef enum {
     QIHSE_RTRUST_UNKNOWN = 0,      /* no evidence evaluated yet */
@@ -45,7 +45,7 @@ typedef enum {
 const char* qihse_runtime_trust_name(qihse_runtime_trust_t state);
 bool qihse_runtime_trust_parse(const char* name, qihse_runtime_trust_t* out);
 
-/* ── Runtime trust evidence bundle (v3.md §35) ─────────────────────────── */
+/* ── Runtime trust evidence bundle (plan §35) ─────────────────────────── */
 
 #define QIHSE_RTRUST_DIGEST_MAX 128u
 #define QIHSE_RTRUST_ID_MAX 128u
@@ -78,7 +78,7 @@ bool qihse_trust_evidence_get(void* store_void, void* user_void,
                               const qihse_uuid_t* node_id, const qihse_uuid_t* boot_id,
                               qihse_trust_evidence_t* out);
 
-/* ── Verification result (v3.md §35) ───────────────────────────────────── */
+/* ── Verification result (plan §35) ───────────────────────────────────── */
 
 typedef struct {
     qihse_uuid_t node_id;
@@ -105,7 +105,7 @@ bool qihse_trust_verification_get(void* store_void, void* user_void,
                                   const qihse_uuid_t* node_id,
                                   qihse_trust_verification_t* out);
 
-/* ── Admission decision (v3.md §35, acceptance criterion 23) ───────────── */
+/* ── Admission decision (plan §35, acceptance criterion 23) ───────────── */
 
 typedef struct {
     qihse_runtime_trust_t trust_state;
@@ -129,7 +129,7 @@ bool qihse_runtime_admission_for_node(void* store_void, void* user_void,
                                       const qihse_uuid_t* node_id,
                                       qihse_admission_t* out);
 
-/* ── Time integrity (v3.md §38, acceptance criterion 27) ───────────────── */
+/* ── Time integrity (plan §38, acceptance criterion 27) ───────────────── */
 
 typedef enum {
     QIHSE_TIME_OK = 0,

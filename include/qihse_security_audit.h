@@ -3,12 +3,12 @@
 
 /*
  * QIHSE runtime hardening self-audit — federation stage F7.
- * See v3.md §36 (runtime hardening profile), §37 (network exposure and
+ * See docs/plans/qihse_federation_upgrade_plan.md §36 (runtime hardening profile), §37 (network exposure and
  * egress policy) and §39 (hardening self-audit).
  *
  * The audit must verify ACTUAL runtime state rather than merely reading
  * configuration files.  A failed self-audit must never erase local data or
- * terminate the database: it degrades federation trust instead (v3.md §39).
+ * terminate the database: it degrades federation trust instead (plan §39).
  */
 
 #include <stdbool.h>
@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-/* ── Sensitive kernel interface classification (v3.md §36) ─────────────── */
+/* ── Sensitive kernel interface classification (plan §36) ─────────────── */
 
 typedef enum {
     QIHSE_IFACE_REQUIRED = 0,
@@ -34,7 +34,7 @@ typedef enum {
 const char* qihse_iface_class_name(qihse_iface_class_t cls);
 bool qihse_iface_class_parse(const char* name, qihse_iface_class_t* out);
 
-/* The interfaces v3.md §36 calls out for explicit classification. */
+/* The interfaces plan §36 calls out for explicit classification. */
 typedef enum {
     QIHSE_IFACE_AF_PACKET = 0,
     QIHSE_IFACE_AF_NETLINK,
@@ -55,7 +55,7 @@ typedef enum {
 const char* qihse_kernel_iface_name(qihse_kernel_iface_t iface);
 bool qihse_kernel_iface_parse(const char* name, qihse_kernel_iface_t* out);
 
-/* ── Runtime security profile (v3.md §36) ──────────────────────────────── */
+/* ── Runtime security profile (plan §36) ──────────────────────────────── */
 
 #define QIHSE_RUNTIME_PROFILE_ID_MAX 64u
 
@@ -71,7 +71,7 @@ typedef struct {
     /* Whether a seccomp filter is required. */
     bool require_seccomp;
     /* Per-interface classification.  An UNKNOWN entry fails hardening review
-     * for production builds (v3.md §36). */
+     * for production builds (plan §36). */
     qihse_iface_class_t interfaces[QIHSE_IFACE_COUNT];
     /* Service identity the process is expected to run as.  -1 = any. */
     int32_t expected_uid;
@@ -81,7 +81,7 @@ typedef struct {
 #define QIHSE_RUNTIME_PROFILE_PREFIX "security/runtime-profile:"
 
 /* Initialise a profile with the conservative production defaults from
- * v3.md §36: no capabilities, no core dumps, and every audited interface
+ * plan §36: no capabilities, no core dumps, and every audited interface
  * marked UNKNOWN until someone classifies it deliberately. */
 void qihse_runtime_profile_init(qihse_runtime_profile_t* profile, const char* service,
                                 const char* version);
@@ -92,7 +92,7 @@ bool qihse_runtime_profile_get(void* store_void, void* user_void,
                                const char* service, const char* version,
                                qihse_runtime_profile_t* out);
 
-/* ── Observed runtime state (v3.md §39) ────────────────────────────────── */
+/* ── Observed runtime state (plan §39) ────────────────────────────────── */
 
 typedef struct {
     int32_t uid;
@@ -173,7 +173,7 @@ bool qihse_runtime_audit_record(void* store_void, void* user_void,
                                 const qihse_uuid_t* node_id,
                                 const qihse_audit_report_t* report);
 
-/* ── Network exposure and egress policy (v3.md §37) ────────────────────── */
+/* ── Network exposure and egress policy (plan §37) ────────────────────── */
 
 typedef enum {
     QIHSE_EGRESS_FEDERATION_PEERS = 0,
@@ -192,7 +192,7 @@ typedef struct {
     char version[QIHSE_RUNTIME_PROFILE_ID_MAX + 1u];
     /* Declared listeners.  Every listener must have a defined bind address,
      * authentication mode, authorization scope, protocol version, and rate
-     * and size limits (v3.md §37). */
+     * and size limits (plan §37). */
     uint32_t ports[32];
     char bind_addresses[32][64];
     size_t listener_count;

@@ -3,7 +3,7 @@
 
 /*
  * QIHSE deterministic distributed simulation — federation stage F8.
- * See v3.md §44.1 (deterministic distributed simulation).
+ * See docs/plans/qihse_federation_upgrade_plan.md §44.1 (deterministic distributed simulation).
  *
  * The simulator provides a virtual clock, a seeded PRNG, and fault injectors
  * for packet loss, duplication, reordering, delay, partition (including
@@ -143,7 +143,7 @@ uint64_t qihse_sim_latency_ms(qihse_sim_t* sim);
 
 /* ── Scenario bookkeeping ──────────────────────────────────────────────── */
 
-/* Quorum evaluation for a scoped replication group (v3.md §15).
+/* Quorum evaluation for a scoped replication group (plan §15).
  *
  * Quorum is per group, never whole-federation: a group whose voters are
  * unreachable must not be able to commit, while an unrelated group whose

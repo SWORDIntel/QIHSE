@@ -1,6 +1,6 @@
 /*
  * QIHSE runtime trust and time integrity — federation stage F7.
- * See v3.md §35 (evidence-aware federation admission) and §38 (time
+ * See docs/plans/qihse_federation_upgrade_plan.md §35 (evidence-aware federation admission) and §38 (time
  * integrity and trusted ordering).
  */
 #include "qihse_runtime_trust.h"
@@ -199,7 +199,7 @@ static bool verification_decode(const char* blob, qihse_trust_verification_t* ou
     (void)rt_uuid_from_hex(f[3], &out->evidence_bundle_id);
     out->evidence_verified_hlc_physical = (uint64_t)strtoull(f[4], NULL, 10);
     (void)rt_uuid_from_hex(f[5], &out->verification_principal);
-    /* verification_result is a fixed-width field of the v3.md §35 verification
+    /* verification_result is a fixed-width field of the plan §35 verification
      * record; its width is part of the record's ABI, so the copy is bounded
      * explicitly rather than widening the field.  Truncation at 63 chars is
      * what snprintf("%s") already did — no behaviour change. */
@@ -210,7 +210,7 @@ static bool verification_decode(const char* blob, qihse_trust_verification_t* ou
 
 /* Append an audit event to the F2 journal when distributed authority changes.
  * A trust change is exactly the kind of control-plane transition the journal
- * exists to make reconstructable (v3.md §35: "Changes in trust state must
+ * exists to make reconstructable (plan §35: "Changes in trust state must
  * emit immutable audit events"). */
 static void emit_trust_event(void* journal_void, void* user_void,
                              const qihse_trust_verification_t* v,
@@ -290,7 +290,7 @@ bool qihse_trust_verification_get(void* store_void, void* user_void,
     return ok;
 }
 
-/* ── Admission (v3.md §35, criterion 23) ───────────────────────────────── */
+/* ── Admission (plan §35, criterion 23) ───────────────────────────────── */
 
 void qihse_runtime_admission_evaluate(qihse_runtime_trust_t trust, qihse_admission_t* out) {
     if (!out) return;
@@ -364,7 +364,7 @@ bool qihse_runtime_admission_for_node(void* store_void, void* user_void,
     return true;
 }
 
-/* ── Time integrity (v3.md §38) ────────────────────────────────────────── */
+/* ── Time integrity (plan §38) ────────────────────────────────────────── */
 
 typedef struct { qihse_time_anomaly_t v; const char* name; } time_anomaly_entry_t;
 

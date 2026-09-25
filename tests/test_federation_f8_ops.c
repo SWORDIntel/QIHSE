@@ -31,7 +31,7 @@
 static qihse_kv_store_t* g_store;
 static qihse_user_t* g_op;
 
-/* ── Schema compatibility (v3.md §24) ──────────────────────────────────── */
+/* ── Schema compatibility (plan §24) ──────────────────────────────────── */
 
 #define FEAT_TELEMETRY_SUMMARY (1ULL << 0)
 #define FEAT_LEASE_V2          (1ULL << 1)
@@ -152,7 +152,7 @@ static void test_migrations(void) {
 
 static void test_migration_progress(void) {
     /* A migration that crashed partway through reports where it stopped, so
-     * it can continue instead of restarting (v3.md §24: migrations
+     * it can continue instead of restarting (plan §24: migrations
      * resumable). */
     assert(qihse_schema_progress_set(g_store, g_op, QIHSE_SCHEMA_ID_FEDERATION, 4, 0, 1000));
 
@@ -186,7 +186,7 @@ static void test_migration_progress(void) {
     printf("PASS migration progress: crash at 400/1000 resumes, completion requires real work\n");
 }
 
-/* ── Snapshots (v3.md §23, AC13 mid-snapshot crash) ────────────────────── */
+/* ── Snapshots (plan §23, AC13 mid-snapshot crash) ────────────────────── */
 
 static void test_snapshot_manifest(void) {
     qihse_snapshot_manifest_t m;
@@ -285,7 +285,7 @@ static void test_snapshot_tamper_detection(void) {
     printf("PASS snapshot tamper detection: an edited manifest fails verification\n");
 }
 
-/* ── Rejoin sequence (v3.md §43) ───────────────────────────────────────── */
+/* ── Rejoin sequence (plan §43) ───────────────────────────────────────── */
 
 static void test_rejoin_sequence(void) {
     /* The sequence is ordered and complete. */
@@ -348,7 +348,7 @@ static void test_rejoin_sequence(void) {
     printf("PASS rejoin sequence: 11 ordered steps, ownership withheld until complete\n");
 }
 
-/* ── Observability (v3.md §41) ─────────────────────────────────────────── */
+/* ── Observability (plan §41) ─────────────────────────────────────────── */
 
 static void test_metrics_render(void) {
     qihse_federation_metrics_t m;
@@ -398,7 +398,7 @@ static void test_metrics_render(void) {
     printf("PASS metrics: all 21 series rendered, label-bounded, no truncation\n");
 }
 
-/* ── Performance budgets (v3.md §40, AC14) ─────────────────────────────── */
+/* ── Performance budgets (plan §40, AC14) ─────────────────────────────── */
 
 static void test_perf_budgets(void) {
     qihse_perf_budget_t b;

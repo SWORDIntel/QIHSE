@@ -148,7 +148,7 @@ The [`plans/`](plans/) directory contains design documents and implementation ro
 
 Notable documents include:
 
-- [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — **the accepted future direction**: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Planning status; not yet implemented.
+- [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — **the accepted forward direction**: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Stages F0–F8 and the post-F8 follow-ups are implemented, through the two 2026-09-25 waves (node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export); no tracked unbuilt items remain — the plan stays the design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing).
 - [General database engine roadmap](plans/qihse_general_db_engine_roadmap.md)
 - [PostgreSQL and Neo4j replacement plan](plans/qihse_pg_neo4j_full_replacement_plan.md)
 - [Redis cluster sharding plan](plans/qihse_redis_cluster_sharding_plan.md)

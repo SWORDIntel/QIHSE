@@ -2,7 +2,7 @@
  * test_keystone_feed_w25.c — W2.5: KEYSTONE consumes the resumable change
  * feed with a read/index identity — never database-admin privileges.
  *
- * Acceptance criterion exercised (federation plan §41 criterion 9):
+ * Acceptance criterion exercised (federation plan §46 criterion 9):
  *   "KEYSTONE can consume resumable change streams without becoming
  *    authoritative."
  *

@@ -8,6 +8,8 @@ bin/
 lib/
 /qihse-server
 /qihse_keygen
+/qihse-federation-ca
+/test_recall_db
 /test_mldsa
 /test-sqlite-vfs
 /fuzzer

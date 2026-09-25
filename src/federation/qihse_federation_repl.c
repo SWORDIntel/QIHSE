@@ -1,6 +1,6 @@
 /*
  * QIHSE federation replication transport and range transfer.
- * See v3.md §10, §22, §43.
+ * See docs/plans/qihse_federation_upgrade_plan.md §10, §22, §43.
  */
 #include "qihse_federation_repl.h"
 

@@ -1,6 +1,6 @@
 /*
  * QIHSE federation rejoin driver.
- * See v3.md §43 and §10.
+ * See docs/plans/qihse_federation_upgrade_plan.md §43 and §10.
  */
 #include "qihse_federation_rejoin.h"
 

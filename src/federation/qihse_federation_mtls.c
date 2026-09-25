@@ -1,6 +1,6 @@
 /*
  * QIHSE federation mTLS — mutual authentication for federation RPC.
- * See v3.md §18 and §22.
+ * See docs/plans/qihse_federation_upgrade_plan.md §18 and §22.
  *
  * Post-quantum throughout: ML-DSA certificates and the X25519MLKEM768 hybrid
  * key-exchange group.  The CA private key never enters a QIHSE record and is
@@ -8,6 +8,7 @@
  */
 #include "qihse_federation_mtls.h"
 
+#include <errno.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "qihse_ca_provision.h"
 #include "qihse_kv_store.h"
 
 /* ── Small helpers ─────────────────────────────────────────────────────── */
@@ -312,6 +314,272 @@ bool qihse_federation_cert_verify(const char* cert_pem,
     return ok;
 }
 
+/* ── Node-side CRL: the file half of revocation state ────────────────────
+ *
+ * qihse_ca_provision.h is included ONLY for the on-disk format constants
+ * (magic, line bound); no CA-provisioning code is linked into libqihse.so,
+ * so the database process still gains no minting capability.  The parser
+ * below mirrors provision_crl_line_match() and the reader loop of
+ * qihse_ca_provision_crl_check() in src/federation/qihse_ca_provision.c
+ * EXACTLY — that parser is normative, because the node must accept exactly
+ * what the tool writes and refuse exactly what the tool refuses.  Where the
+ * tool's parser is lenient in a way its writer never produces (e.g. a
+ * strtoull-accepted sign or space in a numeric field), this loader stays
+ * equally lenient rather than diverging from the reference. */
+
+typedef struct {
+    qihse_uuid_t node_id;
+    bool have_fingerprint;
+    uint8_t fingerprint[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+} mtls_crl_entry_t;
+
+/* Process-wide snapshot, published only after a fully successful parse.
+ * The check below scans under the same mutex the loader swaps under, so a
+ * reload can never free an entry a verification is still comparing. */
+static pthread_mutex_t g_crl_lock = PTHREAD_MUTEX_INITIALIZER;
+static mtls_crl_entry_t* g_crl_entries = NULL;
+static size_t g_crl_count = 0;
+static bool g_crl_configured = false;
+static bool g_crl_failed = false;
+
+static bool mtls_hex_nibble(char c, unsigned* out) {
+    if (c >= '0' && c <= '9') { *out = (unsigned)(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { *out = (unsigned)(c - 'a' + 10); return true; }
+    if (c >= 'A' && c <= 'F') { *out = (unsigned)(c - 'A' + 10); return true; }
+    return false;
+}
+
+static bool mtls_hex_decode_48(const char* hex, uint8_t* out48) {
+    if (strlen(hex) != QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES * 2u) return false;
+    for (size_t i = 0; i < QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES; i++) {
+        unsigned hi, lo;
+        if (!mtls_hex_nibble(hex[i * 2], &hi) ||
+            !mtls_hex_nibble(hex[i * 2 + 1], &lo)) return false;
+        out48[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+/* Strict unsigned decimal, byte for byte the tool's provision_parse_u64(). */
+static bool mtls_parse_u64(const char* f, uint64_t* out) {
+    if (!f || *f == '\0') return false;
+    errno = 0;
+    char* end = NULL;
+    unsigned long long v = strtoull(f, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+/* Decode ONE record into `out`.  `field` is the single reusable heap buffer
+ * every column is extracted through (AGENTS.md decoder rule 1).  Declared
+ * length is validated against the encoded length and the fixed size on
+ * every field: uuid is exactly QIHSE_UUID_STR_LEN and must parse, the
+ * fingerprint is exactly 96 hex chars or "-", and both numbers must be
+ * wholly numeric.  Serial and revoked-at are validated and then unused —
+ * matching is by UUID or fingerprint, exactly as in the tool. */
+static bool mtls_crl_line_parse(const char* line, char* field,
+                                mtls_crl_entry_t* out) {
+    memset(out, 0, sizeof(*out));
+
+    /* field 0: magic */
+    const char* p = line;
+    const char* tab = strchr(p, '\t');
+    if (!tab) return false;
+    size_t consumed = (size_t)(tab - p);
+    if (consumed >= QIHSE_CA_PROVISION_CRL_LINE_MAX) return false;
+    memcpy(field, p, consumed);
+    field[consumed] = '\0';
+    if (strcmp(field, QIHSE_CA_PROVISION_CRL_MAGIC) != 0) return false;
+    p = tab + 1;
+
+    /* field 1: node uuid (fixed 36 chars) */
+    tab = strchr(p, '\t');
+    if (!tab) return false;
+    consumed = (size_t)(tab - p);
+    if (consumed != QIHSE_UUID_STR_LEN) return false;
+    memcpy(field, p, consumed);
+    field[consumed] = '\0';
+    if (!qihse_uuid_parse(field, &out->node_id)) return false;
+    p = tab + 1;
+
+    /* field 2: cert serial (numeric, not used for matching) */
+    tab = strchr(p, '\t');
+    if (!tab) return false;
+    consumed = (size_t)(tab - p);
+    if (consumed >= QIHSE_CA_PROVISION_CRL_LINE_MAX) return false;
+    memcpy(field, p, consumed);
+    field[consumed] = '\0';
+    uint64_t serial = 0;
+    if (!mtls_parse_u64(field, &serial)) return false;
+    p = tab + 1;
+
+    /* field 3: fingerprint, 96 hex chars or "-" */
+    tab = strchr(p, '\t');
+    if (!tab) return false;
+    consumed = (size_t)(tab - p);
+    if (consumed >= QIHSE_CA_PROVISION_CRL_LINE_MAX) return false;
+    memcpy(field, p, consumed);
+    field[consumed] = '\0';
+    out->have_fingerprint = strcmp(field, "-") != 0;
+    if (out->have_fingerprint && !mtls_hex_decode_48(field, out->fingerprint)) {
+        return false;
+    }
+    p = tab + 1;
+
+    /* field 4: revoked-at unix time */
+    tab = strchr(p, '\t');
+    if (!tab) return false;
+    consumed = (size_t)(tab - p);
+    if (consumed >= QIHSE_CA_PROVISION_CRL_LINE_MAX) return false;
+    memcpy(field, p, consumed);
+    field[consumed] = '\0';
+    uint64_t revoked_at = 0;
+    if (!mtls_parse_u64(field, &revoked_at)) return false;
+    p = tab + 1;
+
+    /* field 5: reason, and nothing after it — no tabs, bounded length. */
+    if (strchr(p, '\t')) return false;
+    if (p - line >= (ptrdiff_t)QIHSE_CA_PROVISION_CRL_LINE_MAX) return false;
+
+    (void)serial;
+    (void)revoked_at;
+    return true;
+}
+
+bool qihse_federation_crl_load(void* operator_user, const char* crl_path) {
+    /* Authorization first: loading a CRL is the node-side application of
+     * revocation authority (the read half of QIHSE_SCOPE_NODE_REVOKE), so
+     * NULL is refused, never a bypass (AGENTS.md invariant 1). */
+    if (!operator_user) return false;
+    if (!qihse_infra_scope_check(operator_user, QIHSE_SCOPE_NODE_REVOKE)) {
+        return false;
+    }
+
+    /* Explicit authorized opt-out: return to KV-only revocation. */
+    if (!crl_path) {
+        pthread_mutex_lock(&g_crl_lock);
+        free(g_crl_entries);
+        g_crl_entries = NULL;
+        g_crl_count = 0;
+        g_crl_configured = false;
+        g_crl_failed = false;
+        pthread_mutex_unlock(&g_crl_lock);
+        return true;
+    }
+
+    /* Two heap buffers total (line + reusable field extraction), one cleanup
+     * path: the decoder's frame stays a handful of locals (AGENTS.md rules
+     * 1-2 for bounded stack frames). */
+    char* line = (char*)malloc(QIHSE_CA_PROVISION_CRL_LINE_MAX);
+    char* field = (char*)malloc(QIHSE_CA_PROVISION_CRL_LINE_MAX);
+    FILE* f = NULL;
+    mtls_crl_entry_t* entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    bool ok = line && field;
+
+    if (ok) {
+        f = fopen(crl_path, "rb");
+        if (!f) {
+            /* An absent file is an empty list, exactly as in the tool's
+             * qihse_ca_provision_crl_check; any other I/O error fails. */
+            ok = (errno == ENOENT);
+        }
+    }
+
+    /* Reader loop, mirroring the tool line for line: an overlong line, a
+     * blank-passing-but-malformed record, or any I/O error refuses the
+     * whole file — malformed input is never skipped. */
+    while (ok && f && fgets(line, QIHSE_CA_PROVISION_CRL_LINE_MAX, f)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+        else if (!feof(f)) { ok = false; break; } /* overlong line */
+        if (line[0] == '\0') continue;            /* blank line */
+
+        mtls_crl_entry_t entry;
+        if (!mtls_crl_line_parse(line, field, &entry)) { ok = false; break; }
+
+        if (count >= QIHSE_FEDERATION_CRL_MAX_ENTRIES) { ok = false; break; }
+        if (count == capacity) {
+            size_t next = (capacity == 0) ? 16u : capacity * 2u;
+            mtls_crl_entry_t* grown =
+                (mtls_crl_entry_t*)realloc(entries, next * sizeof(*entries));
+            if (!grown) { ok = false; break; }
+            entries = grown;
+            capacity = next;
+        }
+        entries[count++] = entry;
+    }
+    if (ok && f && ferror(f)) ok = false;
+
+    if (f) fclose(f);
+    free(field);
+    free(line);
+
+    /* Publish or poison, under the same lock the check scans under.  A
+     * failed load drops any previous snapshot AND leaves the sticky
+     * fail-closed flag set: a configured CRL that cannot be parsed must
+     * never let a peer verify as clean, exactly like the tool. */
+    pthread_mutex_lock(&g_crl_lock);
+    if (ok) {
+        free(g_crl_entries);
+        g_crl_entries = entries;
+        g_crl_count = count;
+        g_crl_configured = true;
+        g_crl_failed = false;
+        entries = NULL;
+    } else {
+        free(entries);
+        free(g_crl_entries);
+        g_crl_entries = NULL;
+        g_crl_count = 0;
+        g_crl_configured = false;
+        g_crl_failed = true;
+    }
+    pthread_mutex_unlock(&g_crl_lock);
+    return ok;
+}
+
+bool qihse_federation_crl_check(const qihse_uuid_t* node_id,
+                                const uint8_t* node_fingerprint,
+                                bool* out_revoked) {
+    if (!out_revoked || !node_id) return false;
+    *out_revoked = false;
+
+    pthread_mutex_lock(&g_crl_lock);
+    if (g_crl_failed) {
+        /* Sticky fail-closed: an unparsable configured CRL refuses the whole
+         * check; the caller must not treat this as "not revoked". */
+        pthread_mutex_unlock(&g_crl_lock);
+        return false;
+    }
+    for (size_t i = 0; i < g_crl_count; i++) {
+        const mtls_crl_entry_t* e = &g_crl_entries[i];
+        if (qihse_uuid_equal(&e->node_id, node_id)) {
+            *out_revoked = true;
+            break;
+        }
+        if (e->have_fingerprint && node_fingerprint &&
+            memcmp(e->fingerprint, node_fingerprint,
+                   QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES) == 0) {
+            *out_revoked = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_crl_lock);
+    return true;
+}
+
+void qihse_federation_crl_state(qihse_federation_crl_status_t* out) {
+    if (!out) return;
+    pthread_mutex_lock(&g_crl_lock);
+    out->entry_count = g_crl_count;
+    out->configured = g_crl_configured;
+    out->failed = g_crl_failed;
+    pthread_mutex_unlock(&g_crl_lock);
+}
+
 /* ── The three-layer peer decision ─────────────────────────────────────── */
 
 typedef struct { qihse_peer_verdict_t v; const char* name; } peer_verdict_entry_t;
@@ -324,6 +592,7 @@ static const peer_verdict_entry_t g_peer_verdicts[] = {
     { QIHSE_PEER_REJECT_REVOKED,            "reject_revoked" },
     { QIHSE_PEER_REJECT_UNTRUSTED,          "reject_untrusted" },
     { QIHSE_PEER_REJECT_MALFORMED,          "reject_malformed" },
+    { QIHSE_PEER_REJECT_CRL,                "reject_crl" },
 };
 
 const char* qihse_peer_verdict_name(qihse_peer_verdict_t v) {
@@ -376,6 +645,21 @@ qihse_peer_verdict_t qihse_federation_peer_verify(void* store_void, void* user_v
 
     if (search.node.trust == QIHSE_TRUST_REVOKED) return QIHSE_PEER_REJECT_REVOKED;
     if (search.node.trust == QIHSE_TRUST_PENDING) return QIHSE_PEER_REJECT_NOT_YET_APPROVED;
+
+    /* Layer 2, file source: the CRL the out-of-process CA tool writes
+     * (loaded explicitly by an operator via qihse_federation_crl_load)
+     * COMPOSES with the KV record above — either source saying REVOKED
+     * refuses the peer, with the same verdict a KV-revoked node produces.
+     * A configured CRL that failed to load fails the whole check closed:
+     * an unparsable revocation list must never verify a peer as clean,
+     * mirroring qihse_ca_provision_crl_check.  With no CRL configured this
+     * is a no-op and the decision is byte-for-byte what it was before. */
+    bool crl_revoked = false;
+    if (!qihse_federation_crl_check(&search.node.node_id, cert_fingerprint,
+                                    &crl_revoked)) {
+        return QIHSE_PEER_REJECT_CRL;
+    }
+    if (crl_revoked) return QIHSE_PEER_REJECT_REVOKED;
 
     /* Layer 3: enrollment says the node is a member; it does not say the node
      * is currently trustworthy.

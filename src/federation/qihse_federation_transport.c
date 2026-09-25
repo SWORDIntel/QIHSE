@@ -1,6 +1,6 @@
 /*
  * QIHSE federation mTLS transport.
- * See v3.md §18 and §22.
+ * See docs/plans/qihse_federation_upgrade_plan.md §18 and §22.
  *
  * The UWP TLS layer gives a server certificate and a session over an fd but
  * cannot require or read a client certificate, so federation builds its own

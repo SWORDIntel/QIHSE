@@ -3,7 +3,7 @@
 
 /*
  * QIHSE federation mTLS — mutual authentication for federation RPC.
- * See v3.md §18 (node identity and trust) and §22 (replication transport).
+ * See docs/plans/qihse_federation_upgrade_plan.md §18 (node identity and trust) and §22 (replication transport).
  *
  * Post-quantum throughout: the CA and node certificates are ML-DSA, and the
  * key exchange uses the X25519MLKEM768 hybrid group, both of which this
@@ -90,7 +90,11 @@ typedef enum {
     QIHSE_PEER_REJECT_NOT_YET_APPROVED,    /* layer 2: enrolled but pending */
     QIHSE_PEER_REJECT_REVOKED,             /* layer 2: permanently denied */
     QIHSE_PEER_REJECT_UNTRUSTED,           /* layer 3: runtime trust withholds */
-    QIHSE_PEER_REJECT_MALFORMED
+    QIHSE_PEER_REJECT_MALFORMED,
+    /* Layer 2, file revocation source: a CRL is configured but could not be
+     * parsed.  Fails the whole check closed rather than verifying as clean
+     * (appended last so existing verdict values keep their ABI numbering). */
+    QIHSE_PEER_REJECT_CRL
 } qihse_peer_verdict_t;
 
 const char* qihse_peer_verdict_name(qihse_peer_verdict_t v);
@@ -106,6 +110,68 @@ qihse_peer_verdict_t qihse_federation_peer_verify(void* store_void, void* user_v
                                                  size_t fingerprint_len,
                                                  qihse_uuid_t* out_node_id,
                                                  qihse_runtime_trust_t* out_trust);
+
+/* ── Node-side CRL: the file half of revocation state ────────────────────
+ *
+ * The out-of-process CA tool appends revocation records to a file the
+ * running node can read (qihse_ca_provision_revoke, format
+ * QIHSE-FED-CRL-V1 — see include/qihse_ca_provision.h).  The KV "fednode:"
+ * record is the OTHER half.  The two COMPOSE: either source saying REVOKED
+ * refuses the peer at layer 2 of qihse_federation_peer_verify, with the same
+ * verdict a KV-revoked node produces.  The file is never sniffed
+ * ambiently — an operator loads it explicitly, and a load that finds a
+ * malformed record fails the whole check closed (sticky, until a good CRL
+ * is loaded or the file source is explicitly cleared), mirroring the CA
+ * tool's own qihse_ca_provision_crl_check semantics exactly.
+ *
+ * Matching follows the tool's parser: by node UUID, or by fingerprint when
+ * the entry carries one.  A configured-but-absent file is an EMPTY list
+ * (valid, nothing revoked), exactly as in the tool.
+ *
+ * Authorization decision (deliberate, per the repo security rules): the CRL
+ * file is not classified user data — it carries node UUIDs, fingerprints and
+ * free-text reasons — so loading it is not a classified-read primitive.
+ * It IS security-relevant trust-plane configuration: installing it decides
+ * which enrolled peers the node refuses, it is the node-side application of
+ * the same QIHSE_SCOPE_NODE_REVOKE authority the CA tool needs to APPEND a
+ * revocation, and an unauthenticated in-process caller must not be able to
+ * point the node at a file of its choosing, poison the state, or clear it —
+ * any more than it could call qihse_federation_node_revoke.  Hence
+ * qihse_federation_crl_load takes an explicit authenticated operator
+ * context holding QIHSE_SCOPE_NODE_REVOKE and REFUSES NULL (NULL is never
+ * an authorization bypass).  qihse_federation_crl_check performs no I/O and
+ * discloses a single bit of trust-plane state about a caller-supplied
+ * identity, so it takes no context; the authority gate is at load time.
+ */
+
+/* Upper bound on in-memory entries.  A CRL line is bounded
+ * (QIHSE_CA_PROVISION_CRL_LINE_MAX), so this caps the snapshot a runaway
+ * or hostile file can force the node to hold; exceeding it fails closed. */
+#define QIHSE_FEDERATION_CRL_MAX_ENTRIES 65536u
+
+typedef struct {
+    size_t entry_count;  /* revocation records currently loaded */
+    bool configured;     /* a CRL path is installed (possibly an empty list) */
+    bool failed;         /* last load failed: every check fails closed */
+} qihse_federation_crl_status_t;
+
+/* Load (or reload) the append-only CRL written by the CA tool.  The file is
+ * parsed with the tool's own strict semantics: any malformed record fails
+ * the load AND leaves the check failing closed for every peer until a valid
+ * CRL is loaded or the source is cleared.  crl_path == NULL is an explicit
+ * authorized opt-out that returns the node to KV-only revocation.
+ * Requires an operator context holding QIHSE_SCOPE_NODE_REVOKE. */
+bool qihse_federation_crl_load(void* operator_user, const char* crl_path);
+
+/* Strict lookup against the loaded snapshot.  Returns false only when the
+ * configured CRL failed to load (fail closed — never verifies as clean);
+ * with no CRL configured it is a no-op returning true / not revoked. */
+bool qihse_federation_crl_check(const qihse_uuid_t* node_id,
+                                const uint8_t* node_fingerprint,
+                                bool* out_revoked);
+
+/* Current snapshot state, for diagnostics and tests. */
+void qihse_federation_crl_state(qihse_federation_crl_status_t* out);
 
 /* ── TLS configuration helpers ─────────────────────────────────────────── */
 

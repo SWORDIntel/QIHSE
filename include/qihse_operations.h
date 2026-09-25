@@ -3,7 +3,7 @@
 
 /*
  * QIHSE operational hardening — federation stage F8.
- * See v3.md §23 (snapshot and backup semantics), §24 (schema evolution),
+ * See docs/plans/qihse_federation_upgrade_plan.md §23 (snapshot and backup semantics), §24 (schema evolution),
  * §41 (observability) and §43 (reconciliation safety).
  *
  * Every persisted or wire object carries a schema header.  Snapshots carry a
@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /* ────────────────────────────────────────────────────────────────────────
- * Schema evolution (v3.md §24)
+ * Schema evolution (plan §24)
  * ──────────────────────────────────────────────────────────────────────── */
 
 #define QIHSE_SCHEMA_ID_FEDERATION 0x51484644u /* "QHFD" */
@@ -71,7 +71,7 @@ qihse_schema_result_t qihse_schema_check(const qihse_schema_header_t* header,
 void qihse_schema_header_init(qihse_schema_header_t* header, uint32_t schema_id,
                               uint32_t version);
 
-/* ── Resumable migrations (v3.md §24) ──────────────────────────────────── */
+/* ── Resumable migrations (plan §24) ──────────────────────────────────── */
 
 typedef struct {
     uint32_t schema_id;
@@ -105,7 +105,7 @@ bool qihse_schema_progress_complete(void* store_void, void* user_void,
                                     uint32_t schema_id, uint32_t version);
 
 /* ────────────────────────────────────────────────────────────────────────
- * Snapshot and backup semantics (v3.md §23)
+ * Snapshot and backup semantics (plan §23)
  * ──────────────────────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -135,7 +135,7 @@ typedef struct {
     /* SHA-384 over the manifest body, so a truncated or edited manifest is
      * detectable before anyone tries to restore from it. */
     uint8_t checksum[48];
-    /* Key id only — never key material (v3.md §20, §21). */
+    /* Key id only — never key material (plan §20, §21). */
     char encryption_key_id[128];
     uint32_t group_count;
     char groups[QIHSE_SNAPSHOT_MAX_GROUPS][64];
@@ -159,7 +159,7 @@ bool qihse_snapshot_verify(void* store_void, void* user_void,
                            const qihse_uuid_t* snapshot_id);
 
 /* ────────────────────────────────────────────────────────────────────────
- * Reconciliation safety (v3.md §43)
+ * Reconciliation safety (plan §43)
  * ──────────────────────────────────────────────────────────────────────── */
 
 /* The ordered rejoin sequence.  A rejoining node must not publish stale
@@ -212,7 +212,7 @@ bool qihse_rejoin_state_get(void* store_void, void* user_void,
                             qihse_rejoin_state_t* out);
 
 /* ────────────────────────────────────────────────────────────────────────
- * Observability (v3.md §41)
+ * Observability (plan §41)
  * ──────────────────────────────────────────────────────────────────────── */
 
 /* Counters are plain monotonically-increasing integers.  Gauges are
@@ -252,7 +252,7 @@ bool qihse_federation_metrics_render(const qihse_federation_metrics_t* m,
                                      char* out, size_t out_cap);
 
 /* ────────────────────────────────────────────────────────────────────────
- * Performance budgets (v3.md §40)
+ * Performance budgets (plan §40)
  * ──────────────────────────────────────────────────────────────────────── */
 
 /* Budgets are engineering targets, not benchmark claims.  A measurement is

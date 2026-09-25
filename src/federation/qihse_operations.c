@@ -1,6 +1,6 @@
 /*
  * QIHSE operational hardening — federation stage F8.
- * See v3.md §23, §24, §40, §41, §43.
+ * See docs/plans/qihse_federation_upgrade_plan.md §23, §24, §40, §41, §43.
  */
 #include "qihse_operations.h"
 
@@ -37,7 +37,7 @@ static bool enum_in_range(uint64_t v, uint32_t count) {
     return v < (uint64_t)count;
 }
 
-/* ── Schema evolution (v3.md §24) ──────────────────────────────────────── */
+/* ── Schema evolution (plan §24) ──────────────────────────────────────── */
 
 const char* qihse_schema_result_name(qihse_schema_result_t r) {
     switch (r) {
@@ -177,7 +177,7 @@ bool qihse_schema_progress_complete(void* store_void, void* user_void,
     return completed == total;
 }
 
-/* ── Snapshots (v3.md §23) ─────────────────────────────────────────────── */
+/* ── Snapshots (plan §23) ─────────────────────────────────────────────── */
 
 typedef struct { qihse_snapshot_kind_t v; const char* name; } snapshot_kind_entry_t;
 
@@ -368,7 +368,7 @@ bool qihse_snapshot_verify(void* store_void, void* user_void,
     return ok;
 }
 
-/* ── Reconciliation safety (v3.md §43) ─────────────────────────────────── */
+/* ── Reconciliation safety (plan §43) ─────────────────────────────────── */
 
 typedef struct { qihse_rejoin_step_t v; const char* name; } rejoin_step_entry_t;
 
@@ -501,7 +501,7 @@ bool qihse_rejoin_state_get(void* store_void, void* user_void,
     return true;
 }
 
-/* ── Observability (v3.md §41) ─────────────────────────────────────────── */
+/* ── Observability (plan §41) ─────────────────────────────────────────── */
 
 void qihse_federation_metrics_init(qihse_federation_metrics_t* m) {
     if (!m) return;
@@ -547,7 +547,7 @@ bool qihse_federation_metrics_render(const qihse_federation_metrics_t* m,
     return true;
 }
 
-/* ── Performance budgets (v3.md §40) ───────────────────────────────────── */
+/* ── Performance budgets (plan §40) ───────────────────────────────────── */
 
 void qihse_perf_budget_init(qihse_perf_budget_t* b) {
     if (!b) return;

@@ -1,6 +1,6 @@
 /*
  * QIHSE deterministic distributed simulation — federation stage F8.
- * See v3.md §44.1.
+ * See docs/plans/qihse_federation_upgrade_plan.md §44.1.
  *
  * Everything here is deterministic: the PRNG is seeded, and time comes from
  * the virtual clock.  No wall-clock reads, no threads, no real sockets, so a

@@ -123,6 +123,26 @@ jobs:
       run: |
         make test-federation-f0
 
+    - name: Run Federation Consensus Tests
+      run: |
+        make test-consensus
+
+    - name: Run Backup Authentication Regression
+      run: |
+        make test-backup-auth
+
+    - name: Run Federation CA Provisioning Tests
+      run: |
+        make test-federation-ca
+
+    - name: Run Federation CRL Loader Tests
+      run: |
+        make test-federation-crl
+
+    - name: Run Incremental Export Tests
+      run: |
+        make test-incremental-export
+
     - name: Run AI Memory Tests
       run: |
         make test-ai-memory
@@ -135,6 +155,13 @@ jobs:
       run: |
         export LD_LIBRARY_PATH=$PWD
         PYTHONPATH=python python3 -m unittest discover -s python/tests
+
+    - name: Run Rust Controller SDK Tests
+      run: |
+        cd rust/qihse-rs
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE
+        cargo test --locked --test controller_sdk
+        cargo test --locked --lib 'controller::'
 
   sanitizers:
     runs-on: ubuntu-latest

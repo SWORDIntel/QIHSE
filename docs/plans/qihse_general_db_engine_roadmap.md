@@ -161,13 +161,13 @@ Goal: Beyond SQL -- domain-specific query surfaces.
 | 8.4 Full-text SQL extensions | MATCH(), RANK(), highlight snippets in SELECT | qihse_fts_index.c, qihse_sql_parser.c |
 | 8.5 QQL v2 | Unified QQL with first-class spatial, temporal, vector, graph, and FTS predicates | qihse_qql_parser.c |
 
-### Phase 10 -- Federation Data Plane 🧭 PLANNED (accepted future direction)
+### Phase 10 -- Federation Data Plane 🚧 IN PROGRESS (F0–F8 landed)
 
 Goal: upgrade QIHSE from a database-centric sharded cluster into a **partition-aware, security-first federation data plane** of sovereign nodes — suitable for backing a multi-host hypervisor control system and the Citadel build/supply-chain fabric — without coupling ordinary local operation to whole-cluster quorum.
 
 Governing principle: **federation must enhance a node, never become a prerequisite for that node to remain locally operable.**
 
-Design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md) (accepted 2026-09-15; planning status — not yet implemented). Rollout stages from that plan:
+Design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md) (accepted 2026-09-15; consolidated 2026-09-24 with its `_v3` variant, whose upstream original lives in the sibling CITADEL repository). Stages F0–F8 and the post-F8 follow-ups are implemented and tested, through the two 2026-09-25 waves (node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export) — see the master [ROADMAP.md](../../ROADMAP.md) §W1 for the item-by-item record; no tracked unbuilt items remain — the plan stays the design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing). Rollout stages from that plan:
 
 | Stage | Scope |
 |---|---|
@@ -178,7 +178,8 @@ Design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_pl
 | F4 | Strong namespaces: scoped consensus (replication groups), native CAS, monotonic fencing epochs, lease primitive. |
 | F5 | Trust plane: node enrollment, mTLS, signed replay-resistant gossip, revocation, infrastructure security scopes. |
 | F6 | Build & supply-chain substrate: package override/source registry, build-job state machine, worker capability records, provenance graph, SBOM/attestation records, vulnerability observations, repository snapshots, controller-facing build/supply APIs. |
-| F7 | Operational hardening: rolling schema upgrades, federation-consistent snapshots, chaos test suite, performance regression budgets, recovery tooling. |
+| F7 | Runtime trust and hardening: evidence-aware federation admission, runtime trust states, runtime security profiles with a measured kernel-interface allowlist, hardening self-audit against actual process state, time-integrity monitor. |
+| F8 | Operational hardening: deterministic distributed simulation harness, rolling schema evolution, federation-consistent snapshots, reconciliation safety state machine, observability metrics, performance regression budgets, wire/persisted-parser fuzzing. |
 
 Key invariants (the plan's section 3 has the full list):
 

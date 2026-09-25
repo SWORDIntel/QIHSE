@@ -3,7 +3,7 @@
 
 /*
  * QIHSE federation rejoin driver.
- * See v3.md §43 (reconciliation safety) and §10 (anti-entropy).
+ * See docs/plans/qihse_federation_upgrade_plan.md §43 (reconciliation safety) and §10 (anti-entropy).
  *
  * F8.4 produced the ordered sequence and the rule that ownership may only be
  * published after checksums verify.  F3 produces manifests and sync plans.

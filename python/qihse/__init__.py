@@ -58,6 +58,7 @@ from .anchor import AnchorIndex
 from .hardware import HardwareProfiler, HardwareProfile
 from .fts import FTSIndex, FTSResult
 from .fusion import MultimodalFusion, FusionResult
+from .controller import Controller, Reply, Watch, ControllerError, ControllerServerError
 
 __all__ = [
     "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode",
@@ -69,5 +70,6 @@ __all__ = [
     "HardwareProfiler", "HardwareProfile",
     "FTSIndex", "FTSResult",
     "MultimodalFusion", "FusionResult",
+    "Controller", "Reply", "Watch", "ControllerError", "ControllerServerError",
 ]
 __version__ = "0.3.0"

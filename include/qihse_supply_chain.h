@@ -7,7 +7,7 @@
  * Makes QIHSE the authoritative provenance graph for Citadel software
  * artifacts, and the durable coordination state for the Adaptive Federated
  * Build Fabric.
- * See docs/plans/qihse_federation_upgrade_plan.md §27–§35.
+ * See docs/plans/qihse_federation_upgrade_plan.md §27–§34.
  *
  * Boundaries (plan §28, §42):
  *   QIHSE stores job state, source identity, builder capability metadata,

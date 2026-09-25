@@ -1,13 +1,13 @@
 /*
  * QIHSE runtime hardening self-audit — federation stage F7.
- * See v3.md §36 (runtime hardening profile), §37 (network exposure and
+ * See docs/plans/qihse_federation_upgrade_plan.md §36 (runtime hardening profile), §37 (network exposure and
  * egress policy) and §39 (hardening self-audit).
  *
  * The audit reads ACTUAL process and kernel state — credentials, effective
  * capabilities, core-dump rlimit, dumpable flag, seccomp mode, and the
  * listening sockets visible to this process — and compares it against a
  * declared profile.  A failed audit degrades federation trust; it never
- * makes the local database unavailable (v3.md §39).
+ * makes the local database unavailable (plan §39).
  */
 
 /* getuid/getrlimit/prctl are POSIX/GNU, hidden by -std=c99 without this. */
@@ -29,7 +29,7 @@
 
 #include "qihse_kv_store.h"
 
-/* ── Sensitive kernel interface vocabulary (v3.md §36) ─────────────────── */
+/* ── Sensitive kernel interface vocabulary (plan §36) ─────────────────── */
 
 typedef struct { qihse_iface_class_t v; const char* name; } iface_class_entry_t;
 
@@ -110,7 +110,7 @@ static const char* sa_next_field(const char* p, char* out, size_t cap) {
 
 static pthread_mutex_t g_audit_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── Runtime security profile (v3.md §36) ──────────────────────────────── */
+/* ── Runtime security profile (plan §36) ──────────────────────────────── */
 
 void qihse_runtime_profile_init(qihse_runtime_profile_t* profile, const char* service,
                                 const char* version) {
@@ -121,7 +121,7 @@ void qihse_runtime_profile_init(qihse_runtime_profile_t* profile, const char* se
     profile->generation = 1;
     /* Conservative production defaults: hold no capabilities, do not permit
      * core dumps, require a seccomp filter, and leave every audited interface
-     * UNKNOWN until it is classified deliberately (v3.md §36). */
+     * UNKNOWN until it is classified deliberately (plan §36). */
     profile->allowed_capabilities = 0;
     profile->core_dumps_allowed = false;
     profile->require_seccomp = true;
@@ -207,7 +207,7 @@ bool qihse_runtime_profile_get(void* store_void, void* user_void,
     return ok;
 }
 
-/* ── Observed runtime state (v3.md §39) ────────────────────────────────── */
+/* ── Observed runtime state (plan §39) ────────────────────────────────── */
 
 /* Parse a "CapEff:\t00000000000000ff" style line out of /proc/self/status. */
 static bool parse_status_cap(const char* path, const char* key, uint64_t* out) {
@@ -433,7 +433,7 @@ bool qihse_runtime_audit(const qihse_runtime_profile_t* profile,
     }
 
     /* Interface classification: UNKNOWN fails hardening review, FORBIDDEN is
-     * an outright violation (v3.md §36). */
+     * an outright violation (plan §36). */
     for (size_t i = 0; i < QIHSE_IFACE_COUNT; i++) {
         if (profile->interfaces[i] == QIHSE_IFACE_UNKNOWN) {
             out->unclassified_interface_count++;
@@ -471,7 +471,7 @@ bool qihse_runtime_audit(const qihse_runtime_profile_t* profile,
     return true;
 }
 
-/* ── Audit record persistence (v3.md §39) ──────────────────────────────── */
+/* ── Audit record persistence (plan §39) ──────────────────────────────── */
 
 static void audit_record_key(const qihse_uuid_t* node_id, const char* service,
                              uint64_t hlc, char* out, size_t cap) {
@@ -518,7 +518,7 @@ bool qihse_runtime_audit_record(void* store_void, void* user_void,
     return ok;
 }
 
-/* ── Network exposure and egress policy (v3.md §37) ────────────────────── */
+/* ── Network exposure and egress policy (plan §37) ────────────────────── */
 
 typedef struct { qihse_egress_class_t v; const char* name; } egress_entry_t;
 

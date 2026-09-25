@@ -33,8 +33,29 @@
 #define KV_WAL_OP_DEL 2u
 #define KV_HEADER_LINE_MAX 256u
 
+/* The text record header line, versioned by FIELD COUNT exactly the way the
+ * flags field was: a reader accepts 5, 6 or 7 fields and defaults the rest.
+ *
+ *   5 fields  "key_len val_len expire classif sci\n"             (legacy, flags=0)
+ *   6 fields  "key_len val_len expire classif sci flags\n"       (legacy, seq=0)
+ *   7 fields  "key_len val_len expire classif sci flags seq\n"   (current)
+ *
+ * The 7th field is the store-global change sequence stamped on the record's
+ * last authorized mutation.  A record written before sequences existed
+ * decodes with sequence 0 — the defined value for "predates the sequence" —
+ * so every older snapshot, SSTable and hand-built fixture stays readable.
+ * Sequence-0 records are never part of a delta (a delta is "seq > since",
+ * since >= 0): callers bootstrap with a full export and then track deltas.
+ */
+#define KV_SEQ_FIELDS_MIN 5
+#define KV_SEQ_FIELDS_V4  7
+
 typedef struct {
     uint64_t expire_time_ms;
+    /* Store-global change sequence stamped on the mutation that produced
+     * this payload.  0 means the record predates sequences (loaded from a
+     * pre-v4 file) or was re-created by a legacy WAL replay. */
+    uint64_t change_seq;
     uint16_t classification;
     uint16_t sci_compartment;
     uint8_t flags;
@@ -185,6 +206,15 @@ struct qihse_kv_store {
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
     sst_meta_index_t* sst_meta;
+    /* Store-global monotonic change sequence: the LAST sequence issued to an
+     * authorized mutation (the high-water).  Advanced once per authorized
+     * set/delete and stamped on the affected record's payload; maintained
+     * with atomics so concurrent writers get unique sequences without a
+     * store-wide lock (the write path is otherwise unlocked, same as
+     * mem_usage).  Loads/restores raise it with a CAS-max so a restore never
+     * regresses it; it is never reset.  Exposed through
+     * qihse_kv_change_seq(). */
+    uint64_t change_seq;
     /* Read-side fd cache: keep a bounded set of SSTable fds open so a
      * point GET on flushed data does not pay open()+close() per request.
      * Safe because SSTable files are immutable once written and ids are
@@ -214,7 +244,48 @@ typedef struct {
     uint16_t classification;
     uint16_t sci_compartment;
     uint8_t flags;
+    uint64_t change_seq;   /* 0 for pre-v4 records (defined default) */
 } kv_disk_record_t;
+
+/* ── Change sequence discipline ──────────────────────────────────────────
+ *
+ * One 64-bit counter per store, advanced on EVERY authorized mutation (set
+ * with classification/SCI, delete, expiry-setting update, sweep tombstone)
+ * and stamped on the mutated record's payload, which persists it through the
+ * v4 record header.  The high-water is queryable (qihse_kv_change_seq) and
+ * is the delta exporter's upper bound.
+ *
+ * Not advanced by: reads (get/exists/ttl), failed/unauthorized mutations,
+ * compaction (which preserves stamped sequences), snapshot load (which
+ * preserves them and only raises the high-water to the file's maximum).
+ * Crash recovery replays the WAL, whose records carry no sequence (the
+ * binary WAL format is unchanged for backward compatibility): each replayed
+ * mutation is re-stamped with a fresh sequence.  Replay order is mutation
+ * order, so relative order survives; the store never regresses. */
+
+/* Issue the next sequence.  0 means the counter is exhausted (2^64
+ * mutations): the caller must fail the mutation rather than issue a
+ * duplicate sequence.  The counter is pinned at UINT64_MAX on exhaustion so
+ * every later mutation keeps failing closed. */
+static uint64_t kv_change_seq_next(qihse_kv_store_t* store) {
+    if (!store) return 0u;
+    uint64_t seq = __atomic_add_fetch(&store->change_seq, 1u, __ATOMIC_RELAXED);
+    if (seq != 0u) return seq;
+    __atomic_store_n(&store->change_seq, UINT64_MAX, __ATOMIC_RELAXED);
+    return 0u;
+}
+
+/* Raise the high-water to at least `floor` (persist/load paths feed the
+ * maximum sequence they observed).  Never lowers. */
+static void kv_change_seq_floor(qihse_kv_store_t* store, uint64_t floor) {
+    if (!store || floor == 0u) return;
+    uint64_t cur = __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED);
+    while (floor > cur &&
+           !__atomic_compare_exchange_n(&store->change_seq, &cur, floor,
+                                        false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        /* cur was reloaded on failure; retry while the floor is still above. */
+    }
+}
 
 typedef enum {
     KV_LOOKUP_ERROR = -1,
@@ -396,7 +467,7 @@ static bool payload_is_dead(const kv_payload_t* p, uint64_t now) {
 
 static kv_payload_t* payload_create(const char* value, uint64_t expire_time_ms,
                                     uint16_t classification, uint16_t sci_compartment,
-                                    uint8_t flags, size_t* out_size) {
+                                    uint8_t flags, uint64_t change_seq, size_t* out_size) {
     if ((flags & ~KV_ALLOWED_FLAGS) != 0u) return NULL;
     const char* src = value ? value : "";
     size_t val_len = strlen(src);
@@ -405,6 +476,7 @@ static kv_payload_t* payload_create(const char* value, uint64_t expire_time_ms,
     kv_payload_t* p = (kv_payload_t*)calloc(1, total);
     if (!p) return NULL;
     p->expire_time_ms = expire_time_ms;
+    p->change_seq = change_seq;
     p->classification = classification;
     p->sci_compartment = sci_compartment;
     p->flags = flags;
@@ -427,11 +499,13 @@ static int disk_record_read(FILE* f, kv_disk_record_t* r) {
     if (hlen == 0u || header[hlen - 1u] != '\n') return -1;
     size_t key_len = 0u, val_len = 0u;
     unsigned long long expire = 0u;
+    unsigned long long seq = 0u;
     unsigned int classif = 0u, sci = 0u, flags = 0u;
-    int fields = sscanf(header, "%zu %zu %llu %u %u %u", &key_len, &val_len,
-                        &expire, &classif, &sci, &flags);
-    if (fields != 5 && fields != 6) return -1;
-    if (fields == 5) flags = 0u;
+    int fields = sscanf(header, "%zu %zu %llu %u %u %u %llu", &key_len, &val_len,
+                        &expire, &classif, &sci, &flags, &seq);
+    if (fields < KV_SEQ_FIELDS_MIN || fields > KV_SEQ_FIELDS_V4) return -1;
+    if (fields < 6) flags = 0u;      /* legacy: no flags field */
+    if (fields < KV_SEQ_FIELDS_V4) seq = 0u; /* pre-v4: no sequence field */
     if (key_len == 0u || key_len > KV_MAX_KEY_LEN || val_len > KV_MAX_VALUE_LEN ||
         classif > UINT16_MAX || sci > UINT16_MAX || (flags & ~KV_ALLOWED_FLAGS) != 0u) return -1;
     if ((flags & KV_FLAG_TOMBSTONE) != 0u && val_len != 0u) return -1;
@@ -450,19 +524,22 @@ static int disk_record_read(FILE* f, kv_disk_record_t* r) {
     r->classification = (uint16_t)classif;
     r->sci_compartment = (uint16_t)sci;
     r->flags = (uint8_t)flags;
+    r->change_seq = (uint64_t)seq;
     return 1;
 }
 
 static bool disk_record_write_fields(FILE* f, const char* key, const char* val,
                                      uint64_t expire_time_ms, uint16_t classification,
-                                     uint16_t sci_compartment, uint8_t flags) {
+                                     uint16_t sci_compartment, uint8_t flags,
+                                     uint64_t change_seq) {
     if (!f || !key) return false;
     size_t key_len = strlen(key);
     size_t val_len = (flags & KV_FLAG_TOMBSTONE) ? 0u : strlen(val ? val : "");
     if (key_len == 0u || key_len > KV_MAX_KEY_LEN || val_len > KV_MAX_VALUE_LEN) return false;
-    if (fprintf(f, "%zu %zu %llu %u %u %u\n", key_len, val_len,
+    if (fprintf(f, "%zu %zu %llu %u %u %u %llu\n", key_len, val_len,
                 (unsigned long long)expire_time_ms, (unsigned)classification,
-                (unsigned)sci_compartment, (unsigned)flags) < 0) return false;
+                (unsigned)sci_compartment, (unsigned)flags,
+                (unsigned long long)change_seq) < 0) return false;
     if (!fwrite_exact(key, 1u, key_len, f)) return false;
     if (val_len != 0u && !fwrite_exact(val, 1u, val_len, f)) return false;
     return fputc('\n', f) != EOF;
@@ -471,7 +548,8 @@ static bool disk_record_write_fields(FILE* f, const char* key, const char* val,
 static bool disk_record_write(FILE* f, const char* key, const kv_payload_t* p) {
     if (!p) return false;
     return disk_record_write_fields(f, key, p->val, p->expire_time_ms,
-                                    p->classification, p->sci_compartment, p->flags);
+                                    p->classification, p->sci_compartment, p->flags,
+                                    p->change_seq);
 }
 
 /* Header-only variant of disk_record_read: parses the header line and reads
@@ -487,11 +565,13 @@ static int disk_record_read_header(FILE* f, kv_disk_record_t* r) {
     if (hlen == 0u || header[hlen - 1u] != '\n') return -1;
     size_t key_len = 0u, val_len = 0u;
     unsigned long long expire = 0u;
+    unsigned long long seq = 0u;
     unsigned int classif = 0u, sci = 0u, flags = 0u;
-    int fields = sscanf(header, "%zu %zu %llu %u %u %u", &key_len, &val_len,
-                        &expire, &classif, &sci, &flags);
-    if (fields != 5 && fields != 6) return -1;
-    if (fields == 5) flags = 0u;
+    int fields = sscanf(header, "%zu %zu %llu %u %u %u %llu", &key_len, &val_len,
+                        &expire, &classif, &sci, &flags, &seq);
+    if (fields < KV_SEQ_FIELDS_MIN || fields > KV_SEQ_FIELDS_V4) return -1;
+    if (fields < 6) flags = 0u;
+    if (fields < KV_SEQ_FIELDS_V4) seq = 0u;
     if (key_len == 0u || key_len > KV_MAX_KEY_LEN || val_len > KV_MAX_VALUE_LEN ||
         classif > UINT16_MAX || sci > UINT16_MAX || (flags & ~KV_ALLOWED_FLAGS) != 0u) return -1;
     if ((flags & KV_FLAG_TOMBSTONE) != 0u && val_len != 0u) return -1;
@@ -507,18 +587,19 @@ static int disk_record_read_header(FILE* f, kv_disk_record_t* r) {
     r->classification = (uint16_t)classif;
     r->sci_compartment = (uint16_t)sci;
     r->flags = (uint8_t)flags;
+    r->change_seq = (uint64_t)seq;
     return 1;
 }
 
 static bool insert_internal(qihse_kv_store_t* store, const char* key, const char* value,
                             uint64_t expire_time_ms, uint16_t classification,
-                            uint16_t sci_compartment, uint8_t flags) {
+                            uint16_t sci_compartment, uint8_t flags, uint64_t change_seq) {
     if (!store || !store->trie || !key || key[0] == '\0') return false;
     size_t key_len = strlen(key);
     if (key_len > KV_MAX_KEY_LEN) return false;
     size_t payload_size = 0u;
     kv_payload_t* payload = payload_create(value, expire_time_ms, classification,
-                                           sci_compartment, flags, &payload_size);
+                                           sci_compartment, flags, change_seq, &payload_size);
     if (!payload) return false;
     if (!qihse_trinary_trie_insert_nocopy(store->trie, key, payload, payload_size)) {
         free(payload); return false;
@@ -686,11 +767,13 @@ static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
     hbuf[hlen - 1u] = '\0'; /* sscanf parses text up to the newline only */
     size_t key_len = 0u, val_len = 0u;
     unsigned long long expire = 0u;
+    unsigned long long seq = 0u;
     unsigned int classif = 0u, sci = 0u, flags = 0u;
-    int fields = sscanf(hbuf, "%zu %zu %llu %u %u %u", &key_len, &val_len,
-                        &expire, &classif, &sci, &flags);
-    if (fields != 5 && fields != 6) return -1;
-    if (fields == 5) flags = 0u;
+    int fields = sscanf(hbuf, "%zu %zu %llu %u %u %u %llu", &key_len, &val_len,
+                        &expire, &classif, &sci, &flags, &seq);
+    if (fields < KV_SEQ_FIELDS_MIN || fields > KV_SEQ_FIELDS_V4) return -1;
+    if (fields < 6) flags = 0u;
+    if (fields < KV_SEQ_FIELDS_V4) seq = 0u;
     if (key_len == 0u || key_len > KV_MAX_KEY_LEN || val_len > KV_MAX_VALUE_LEN ||
         classif > UINT16_MAX || sci > UINT16_MAX || (flags & ~KV_ALLOWED_FLAGS) != 0u) return -1;
     if ((flags & KV_FLAG_TOMBSTONE) != 0u && val_len != 0u) return -1;
@@ -712,6 +795,7 @@ static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
     r->classification = (uint16_t)classif;
     r->sci_compartment = (uint16_t)sci;
     r->flags = (uint8_t)flags;
+    r->change_seq = (uint64_t)seq;
     return 1;
 }
 
@@ -832,7 +916,11 @@ static bool copy_payload_cb(const char* key, void* value, size_t value_size, voi
     return true;
 }
 
-static bool load_sstable_into_trie(const char* path, qihse_trinary_trie_t* dst, size_t* mem_usage) {
+/* Load one SSTable's records into a trie, PRESERVING each record's stamped
+ * sequence (compaction is not a mutation), and reporting the maximum
+ * sequence seen so the caller can raise the store's high-water. */
+static bool load_sstable_into_trie(const char* path, qihse_trinary_trie_t* dst,
+                                   size_t* mem_usage, uint64_t* max_seq) {
     int fd = open_secure_read(path);
     if (fd < 0) return errno == ENOENT;
     FILE* f = fdopen(fd, "rb");
@@ -841,10 +929,11 @@ static bool load_sstable_into_trie(const char* path, qihse_trinary_trie_t* dst, 
     while ((rc = disk_record_read(f, &r)) == 1) {
         size_t ps = 0u;
         kv_payload_t* p = payload_create(r.val, r.expire_time_ms, r.classification,
-                                         r.sci_compartment, r.flags, &ps);
+                                         r.sci_compartment, r.flags, r.change_seq, &ps);
         if (!p || !qihse_trinary_trie_insert_nocopy(dst, r.key, p, ps)) {
             free(p); disk_record_free(&r); ok = false; break;
         }
+        if (max_seq && r.change_seq > *max_seq) *max_seq = r.change_seq;
         if (mem_usage) *mem_usage += strlen(r.key) + ps;
         disk_record_free(&r);
     }
@@ -858,15 +947,19 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
     qihse_trinary_trie_t* merged = qihse_trinary_trie_create();
     if (!merged) return false;
     size_t merged_usage = 0u;
+    uint64_t max_seq = 0u;
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_trinary_trie_destroy(merged); return false; }
     for (int i = 0; i < store->sstable_counter; i++) {
         char path[4096];
         int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
-        if (n < 0 || (size_t)n >= sizeof(path) || !load_sstable_into_trie(path, merged, &merged_usage)) {
+        if (n < 0 || (size_t)n >= sizeof(path) || !load_sstable_into_trie(path, merged, &merged_usage, &max_seq)) {
             qihse_trinary_trie_destroy(merged); return false;
         }
     }
+    /* Merging never issues sequences, but the files' sequences must be
+     * reflected if this runs before the index pass raised the high-water. */
+    kv_change_seq_floor(store, max_seq);
     copy_trie_ctx_t copy_ctx = { .dst = merged, .ok = true, .mem_usage = merged_usage };
     qihse_trinary_trie_foreach(store->trie, copy_payload_cb, &copy_ctx);
     if (!copy_ctx.ok) { qihse_trinary_trie_destroy(merged); return false; }
@@ -913,10 +1006,17 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * (the callback receives them) but nothing is merged into RAM: memory stays
  * O(1) beyond the index itself.
  *
+ * `include_tombstones` is the delta exporter's mode: a newest TOMBSTONE is
+ * a deletion a delta must be able to carry, so it is emitted instead of
+ * skipped (expired-but-live records are still skipped, matching the full
+ * export's liveness semantics).  Every existing caller passes false and
+ * keeps the live-only behavior.
+ *
  * Returns 1 when the scan completed, 0 when the callback asked to stop,
  * -1 on error.  Only usable when the index is present and not degraded;
  * callers must provide the compact_sstables_into_memtable() fallback. */
-static int sst_foreach_newest(qihse_kv_store_t* store, kv_sst_record_cb cb, void* ud) {
+static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
+                              kv_sst_record_cb cb, void* ud) {
     if (!store || !store->trie || !cb) return -1;
     if (!store->sst_meta || store->sst_meta->degraded) return -1;
     const char* dir = get_qihse_data_dir();
@@ -934,17 +1034,32 @@ static int sst_foreach_newest(qihse_kv_store_t* store, kv_sst_record_cb cb, void
         for (;;) {
             long rec_off = ftell(f);
             rc = disk_record_read(f, &r);
+            if (rc < 0) {
+                /* One malformed/unreadable record must not blind the whole
+                 * enumeration: this used to abort the entire scan, so a
+                 * single poison record — often in the NEWEST sstable, which
+                 * is scanned first — silently emptied every KEYS/SCAN over
+                 * data that GET and DBSIZE (index-driven) still served.
+                 * Resync at the next line and keep going; at true EOF the
+                 * resync immediately falls through to the clean break. */
+                int c;
+                while ((c = fgetc(f)) != EOF && c != '\n') {}
+                if (c == EOF) { rc = 0; break; } /* clean end of file */
+                continue;
+            }
             if (rc != 1) break;
             int32_t isid = -1; uint64_t ioff = 0u;
             bool newest = sst_meta_index_lookup(store->sst_meta, r.key,
                                                 NULL, NULL, NULL, NULL,
                                                 &isid, &ioff) &&
                           isid == sid && ioff == (uint64_t)(rec_off >= 0 ? rec_off : 0);
-            bool dead = (r.flags & KV_FLAG_TOMBSTONE) != 0u ||
-                        (r.expire_time_ms != 0u && r.expire_time_ms <= now);
+            bool tombstone = (r.flags & KV_FLAG_TOMBSTONE) != 0u;
+            bool expired = (!tombstone && r.expire_time_ms != 0u && r.expire_time_ms <= now);
             size_t z = 0u;
             bool shadowed = qihse_trinary_trie_search(store->trie, r.key, &z) != NULL;
-            if (newest && !dead && !shadowed) {
+            bool emit = newest && !shadowed && !expired &&
+                        (include_tombstones || !tombstone);
+            if (emit) {
                 if (!cb(r.key, &r, ud)) stopped = 1;
             }
             disk_record_free(&r);
@@ -966,7 +1081,8 @@ static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud
     compact_emit_ctx_t* ctx = (compact_emit_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
     if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
-                                  r->classification, r->sci_compartment, r->flags)) {
+                                  r->classification, r->sci_compartment, r->flags,
+                                  r->change_seq)) {
         ctx->ok = false; return false;
     }
     ctx->written++;
@@ -988,7 +1104,7 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(new_path, tmp, sizeof(tmp), &out)) return false;
     compact_emit_ctx_t wctx = { .f = out, .ok = true, .written = 0u };
-    int rc = sst_foreach_newest(store, compact_emit_cb, &wctx);
+    int rc = sst_foreach_newest(store, false, compact_emit_cb, &wctx);
     if (rc < 0 || !wctx.ok || ferror(out)) { fclose(out); unlink(tmp); return false; }
     if (wctx.written == 0u) {
         /* Nothing live left in SSTables — drop all old files, no new one. */
@@ -1037,7 +1153,13 @@ static bool wal_replay_new_record(qihse_kv_store_t* store, FILE* f) {
     key[key_len] = '\0'; val[val_len] = '\0';
     uint64_t actual = wal_record_crc(op, flags, key_len, val_len, classification, sci, expire, key, val);
     if (actual != crc) { free(key); free(val); return false; }
-    bool ok = insert_internal(store, key, val, expire, classification, sci, flags);
+    /* The binary WAL format carries no sequence (unchanged, so existing
+     * wal.log files keep decoding); recovery re-stamps each replayed
+     * mutation with a fresh sequence.  Replay order is mutation order, so
+     * relative order survives and the high-water only moves forward. */
+    uint64_t seq = kv_change_seq_next(store);
+    if (seq == 0u) { free(key); free(val); return false; }
+    bool ok = insert_internal(store, key, val, expire, classification, sci, flags, seq);
     free(key); free(val); return ok;
 }
 
@@ -1072,7 +1194,10 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                     free(key); free(val); break;
                 }
                 key[key_len] = '\0'; val[val_len] = '\0';
-                if (!insert_internal(store, key, val, 0u, classification, sci, 0u)) { free(key); free(val); break; }
+                uint64_t seq = kv_change_seq_next(store);
+                if (seq == 0u || !insert_internal(store, key, val, 0u, classification, sci, 0u, seq)) {
+                    free(key); free(val); break;
+                }
                 free(key); free(val); continue;
             }
             if (tag[1] == 'E' && tag[2] == 'T' && tag[3] == ' ') {
@@ -1088,8 +1213,12 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                         char* p1 = strrchr(rest, ' ');
                         if (p1) { classif = (unsigned int)strtoul(p1 + 1, NULL, 10); *p1 = '\0'; }
                     }
-                    if (classif <= UINT16_MAX && sci <= UINT16_MAX)
-                        (void)insert_internal(store, key, rest, 0u, (uint16_t)classif, (uint16_t)sci, 0u);
+                    if (classif <= UINT16_MAX && sci <= UINT16_MAX) {
+                        uint64_t seq = kv_change_seq_next(store);
+                        if (seq != 0u)
+                            (void)insert_internal(store, key, rest, 0u, (uint16_t)classif,
+                                                  (uint16_t)sci, 0u, seq);
+                    }
                 }
                 continue;
             }
@@ -1123,7 +1252,10 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                         }
                         lookup_result_free(&prior);
                     }
-                    (void)insert_internal(store, line, "", 0u, cclass, csci, KV_FLAG_TOMBSTONE);
+                    uint64_t seq = kv_change_seq_next(store);
+                    if (seq != 0u)
+                        (void)insert_internal(store, line, "", 0u, cclass, csci,
+                                              KV_FLAG_TOMBSTONE, seq);
                 }
                 continue;
             }
@@ -1136,7 +1268,9 @@ static void recover_from_wal(qihse_kv_store_t* store) {
 
 /* Populate the in-memory SSTable metadata index from one on-disk SSTable.
  * Uses the header-only reader so the value bytes (up to 16MB each) are
- * skipped with fseeko rather than malloc'd + read + discarded. */
+ * skipped with fseeko rather than malloc'd + read + discarded.  The stamped
+ * sequences pass by on the header line; the maximum observed raises the
+ * store's high-water so a restart does not regress it. */
 static void sst_index_load_file(qihse_kv_store_t* store, const char* path, int32_t sstable_id) {
     if (!store || !store->sst_meta || !path) return;
     int fd = open_secure_read(path);
@@ -1152,6 +1286,7 @@ static void sst_index_load_file(qihse_kv_store_t* store, const char* path, int32
                               r.classification, r.sci_compartment,
                               r.expire_time_ms, r.flags, sstable_id,
                               rec_off >= 0 ? (uint64_t)rec_off : 0u);
+        if (r.change_seq != 0u) kv_change_seq_floor(store, r.change_seq);
         disk_record_free(&r);
     }
     fclose(f);
@@ -1261,8 +1396,14 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
         lookup_result_free(&existing);
     }
     if (key_exists && !qihse_auth_can_access(user, ex_class, ex_comp)) return false;
+    /* Authorized mutation: issue the change sequence BEFORE any side effect,
+     * so a failure after this point at worst skips a number (monotonicity is
+     * what matters, not density) and no unauthorized mutation ever advances
+     * or receives one. */
+    uint64_t seq = kv_change_seq_next(store);
+    if (seq == 0u) return false;
     if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms, classification, sci_compartment, 0u)) return false;
-    if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u)) return false;
+    if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u, seq)) return false;
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     return true;
 }
@@ -1311,8 +1452,12 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* u
     if (state != KV_LOOKUP_LIVE) { lookup_result_free(&r); return false; }
     if (!qihse_auth_can_access(user, r.classification, r.sci_compartment)) { lookup_result_free(&r); return false; }
     uint16_t classification = r.classification, sci = r.sci_compartment; lookup_result_free(&r);
+    /* Authorized delete: the tombstone is stamped like any mutation, so a
+     * delta can carry the deletion. */
+    uint64_t seq = kv_change_seq_next(store);
+    if (seq == 0u) return false;
     if (!wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE)) return false;
-    if (!insert_internal(store, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE)) return false;
+    if (!insert_internal(store, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE, seq)) return false;
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     return true;
 }
@@ -1367,8 +1512,12 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
         kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, keys[i], &sz);
         if (p) {
             uint16_t c = p->classification, s = p->sci_compartment;
+            /* A sweep tombstone is a mutation: it advances the sequence so a
+             * delta consumer learns the key is gone. */
+            uint64_t seq = kv_change_seq_next(store);
+            if (seq == 0u) continue;
             (void)wal_append(store, KV_WAL_OP_DEL, keys[i], "", 0u, c, s, KV_FLAG_TOMBSTONE);
-            (void)insert_internal(store, keys[i], "", 0u, c, s, KV_FLAG_TOMBSTONE);
+            (void)insert_internal(store, keys[i], "", 0u, c, s, KV_FLAG_TOMBSTONE, seq);
         }
     }
 }
@@ -1431,7 +1580,7 @@ bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
      * index-pinned newest live records from each SSTable. */
     foreach_user_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data, .now = current_time_ms(), .ok = true };
     qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
-    int rc = sst_foreach_newest(store, foreach_sst_emit_cb, &ctx);
+    int rc = sst_foreach_newest(store, false, foreach_sst_emit_cb, &ctx);
     return rc >= 0;
 }
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
@@ -1547,7 +1696,8 @@ static bool export_sst_write_cb(const char* key, const kv_disk_record_t* r, void
     export_write_ctx_t* ctx = (export_write_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
     if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
-                                  r->classification, r->sci_compartment, r->flags)) {
+                                  r->classification, r->sci_compartment, r->flags,
+                                  r->change_seq)) {
         ctx->ok = false; return false;
     }
     return true;
@@ -1582,7 +1732,7 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     export_write_ctx_t wr = { .f = f, .now = now, .ok = true };
     qihse_trinary_trie_foreach(store->trie, export_write_cb, &wr);
     if (wr.ok && fast) {
-        int rc = sst_foreach_newest(store, export_sst_write_cb, &wr);
+        int rc = sst_foreach_newest(store, false, export_sst_write_cb, &wr);
         if (rc < 0) wr.ok = false;
     }
     if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
@@ -1591,36 +1741,49 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
 }
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_save_user(store, filepath, NULL); }
 
+/* Parse a snapshot file into a replacement trie, PRESERVING each record's
+ * stamped sequence (a restore is not a mutation) and reporting the maximum
+ * sequence seen so qihse_kv_load_user can raise — never lower — the store's
+ * high-water. */
 static bool parse_snapshot_into_trie(const char* filepath, qihse_user_t* user,
-                                     qihse_trinary_trie_t** out_trie, size_t* out_usage) {
+                                     qihse_trinary_trie_t** out_trie, size_t* out_usage,
+                                     uint64_t* out_max_seq) {
     int fd = open_secure_read(filepath);
     if (fd < 0) return false;
     FILE* f = fdopen(fd, "rb");
     if (!f) { close(fd); return false; }
     qihse_trinary_trie_t* trie = qihse_trinary_trie_create();
     if (!trie) { fclose(f); return false; }
-    size_t usage = 0u; kv_disk_record_t r; int rc; bool ok = true;
+    size_t usage = 0u; uint64_t max_seq = 0u;
+    kv_disk_record_t r; int rc; bool ok = true;
     while ((rc = disk_record_read(f, &r)) == 1) {
         if (!qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
             disk_record_free(&r); errno = EACCES; ok = false; break;
         }
         size_t ps = 0u;
-        kv_payload_t* p = payload_create(r.val, r.expire_time_ms, r.classification, r.sci_compartment, r.flags, &ps);
+        kv_payload_t* p = payload_create(r.val, r.expire_time_ms, r.classification,
+                                         r.sci_compartment, r.flags, r.change_seq, &ps);
         if (!p || !qihse_trinary_trie_insert_nocopy(trie, r.key, p, ps)) {
             free(p); disk_record_free(&r); ok = false; break;
         }
+        if (r.change_seq > max_seq) max_seq = r.change_seq;
         usage += strlen(r.key) + ps; disk_record_free(&r);
     }
     if (rc < 0) ok = false;
     fclose(f);
     if (!ok) { qihse_trinary_trie_destroy(trie); return false; }
-    *out_trie = trie; if (out_usage) *out_usage = usage; return true;
+    *out_trie = trie;
+    if (out_usage) *out_usage = usage;
+    if (out_max_seq) *out_max_seq = max_seq;
+    return true;
 }
 
 int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
     if (!store || !filepath) return -1;
     qihse_trinary_trie_t* replacement = NULL; size_t replacement_usage = 0u;
-    if (!parse_snapshot_into_trie(filepath, user, &replacement, &replacement_usage))
+    uint64_t replacement_max_seq = 0u;
+    if (!parse_snapshot_into_trie(filepath, user, &replacement, &replacement_usage,
+                                  &replacement_max_seq))
         return errno == EACCES ? -2 : -1;
     char wal_path[4096], wal_tmp[8192];
     if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) { qihse_trinary_trie_destroy(replacement); return -1; }
@@ -1633,6 +1796,13 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     if (!new_wal) { close(new_wal_fd); qihse_trinary_trie_destroy(replacement); return -1; }
     qihse_trinary_trie_t* old = store->trie; FILE* old_wal = store->wal_fd;
     store->trie = replacement; store->mem_usage = replacement_usage; store->wal_fd = new_wal; store->wal_unflushed_bytes = 0u;
+    /* A restore must not regress the change sequence: the loaded records
+     * keep their stamped sequences and the high-water rises to the file's
+     * maximum if it was higher.  It is NOT re-stamped — a restore is not a
+     * mutation — so a caller holding a cursor from BEFORE a restore should
+     * re-baseline with a full export (the restored dataset may be older
+     * than the cursor). */
+    kv_change_seq_floor(store, replacement_max_seq);
     if (old_wal) fclose(old_wal);
     if (old) qihse_trinary_trie_destroy(old);
     const char* dir = get_qihse_data_dir();
@@ -1646,6 +1816,216 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     return 0;
 }
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
+
+/* ── Change sequence and incremental (delta) export ──────────────────────
+ *
+ * The delta read path.  It enumerates records whose stamped sequence is
+ * STRICTLY greater than `since_seq`, carrying live records AND tombstones
+ * (a delete is a mutation a delta must express), with the SAME
+ * authorization-aware iteration the full export uses: the caller's identity
+ * reaches this, the lowest data-retrieval layer, and each record is checked
+ * with qihse_auth_can_access against its classification/SCI before the
+ * callback sees anything (AGENTS.md invariant 1).  A NULL user keeps this
+ * layer's family convention (the deliberately unclassified-only view);
+ * higher layers that must refuse NULL wrap this and add their own gate.
+ *
+ * METADATA DISCLOSURE — the resume point is need-to-know, by default and
+ * only.  It is the highest sequence among the records THIS principal was
+ * allowed to see, never the store-global high-water.  Mutations the
+ * principal may not see are filtered before the resume point is computed,
+ * so they are never enumerated, and a caller comparing successive resume
+ * points cannot infer how many hidden mutations occurred — the resume point
+ * simply does not move until the principal is allowed to see something
+ * newer.  The cost is a re-scan of the records between the resume point and
+ * the global high-water on each export, which is a sequence compare during
+ * iteration.  No "global high-water with gaps visible" form is offered,
+ * even opt-in: it would disclose the count of hidden mutations.
+ *
+ * Records predating the sequence (sequence 0, from pre-v4 files) are never
+ * part of a delta — a caller bootstraps with a full export (which carries
+ * them) and then tracks deltas. */
+
+uint64_t qihse_kv_change_seq(qihse_kv_store_t* store) {
+    if (!store) return 0u;
+    return __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED);
+}
+
+void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count) {
+    if (!records) return;
+    for (size_t i = 0; i < count; i++) {
+        free(records[i].key);
+        free(records[i].value);
+    }
+    free(records);
+}
+
+typedef struct {
+    qihse_user_t* user;
+    uint64_t since;
+    uint64_t now;
+    qihse_kv_delta_record_t* recs;
+    size_t count;
+    size_t cap;
+    uint64_t resume;   /* highest sequence the principal was ALLOWED to see */
+    bool ok;
+} delta_collect_ctx_t;
+
+/* Grow-by-doubling collector shared by the memtable and SSTable walks.  The
+ * array (not one stack buffer per record) keeps frames bounded. */
+static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const char* val,
+                               const kv_payload_t* p) {
+    if (ctx->count == ctx->cap) {
+        size_t new_cap = ctx->cap ? ctx->cap * 2u : 16u;
+        qihse_kv_delta_record_t* next =
+            (qihse_kv_delta_record_t*)realloc(ctx->recs, new_cap * sizeof(*next));
+        if (!next) { ctx->ok = false; return false; }
+        ctx->recs = next;
+        ctx->cap = new_cap;
+    }
+    qihse_kv_delta_record_t* out = &ctx->recs[ctx->count];
+    memset(out, 0, sizeof(*out));
+    out->key = strdup(key);
+    if (!out->key) { ctx->ok = false; return false; }
+    bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
+    if (!tombstone) {
+        out->value = strdup(val ? val : "");
+        if (!out->value) { free(out->key); out->key = NULL; ctx->ok = false; return false; }
+    }
+    out->tombstone = tombstone;
+    out->change_seq = p->change_seq;
+    out->classification = p->classification;
+    out->sci_compartment = p->sci_compartment;
+    out->expire_time_ms = p->expire_time_ms;
+    ctx->count++;
+    if (p->change_seq > ctx->resume) ctx->resume = p->change_seq;
+    return true;
+}
+
+/* Memtable walk: one payload at a time, authorization-checked HERE before
+ * anything is copied.  Tombstones are included (a delete is a delta event);
+ * live-but-expired payloads are skipped, matching the full export. */
+static bool delta_trie_cb(const char* key, void* value, size_t value_size, void* user_data) {
+    (void)value_size;
+    delta_collect_ctx_t* ctx = (delta_collect_ctx_t*)user_data;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !ctx->ok || !key || !p) return false;
+    if (p->change_seq <= ctx->since || p->change_seq == 0u) return true; /* skip */
+    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
+    bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
+    bool expired = !tombstone && p->expire_time_ms != 0u && p->expire_time_ms <= ctx->now;
+    if (expired) return true;
+    return delta_collect_push(ctx, key, p->val, p);
+}
+
+/* SSTable walk: the index-pinned newest record at this (id, offset); the
+ * same checks as the memtable walk. */
+static bool delta_sst_cb(const char* key, const kv_disk_record_t* r, void* ud) {
+    delta_collect_ctx_t* ctx = (delta_collect_ctx_t*)ud;
+    if (!ctx || !ctx->ok || !key || !r) return false;
+    if (r->change_seq <= ctx->since || r->change_seq == 0u) return true;
+    if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) return true;
+    kv_payload_t view;
+    memset(&view, 0, sizeof(view));
+    view.expire_time_ms = r->expire_time_ms;
+    view.change_seq = r->change_seq;
+    view.classification = r->classification;
+    view.sci_compartment = r->sci_compartment;
+    view.flags = r->flags;
+    bool tombstone = (r->flags & KV_FLAG_TOMBSTONE) != 0u;
+    bool expired = !tombstone && r->expire_time_ms != 0u && r->expire_time_ms <= ctx->now;
+    if (expired) return true;
+    return delta_collect_push(ctx, key, r->val, &view);
+}
+
+/* Deterministic order for consumers and tests: ascending sequence, with the
+ * key as a tie-break (only hand-crafted files can tie). */
+static int delta_record_cmp(const void* a, const void* b) {
+    const qihse_kv_delta_record_t* ra = (const qihse_kv_delta_record_t*)a;
+    const qihse_kv_delta_record_t* rb = (const qihse_kv_delta_record_t*)b;
+    if (ra->change_seq != rb->change_seq) return ra->change_seq < rb->change_seq ? -1 : 1;
+    if (ra->key && rb->key) return strcmp(ra->key, rb->key);
+    return 0;
+}
+
+int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user,
+                                     uint64_t since_seq,
+                                     qihse_kv_delta_record_t** out_records,
+                                     size_t* out_count, uint64_t* out_resume_seq) {
+    if (out_records) *out_records = NULL;
+    if (out_count) *out_count = 0u;
+    if (out_resume_seq) *out_resume_seq = 0u;
+    if (!store || !store->trie || !out_records || !out_count || !out_resume_seq) return -1;
+
+    delta_collect_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.user = user;
+    ctx.since = since_seq;
+    ctx.now = current_time_ms();
+    ctx.resume = since_seq;   /* the no-leak default: it does not move
+                               * unless the principal sees something newer */
+    ctx.ok = true;
+
+    bool fast = store->sst_meta && !store->sst_meta->degraded;
+    if (!fast && !compact_sstables_into_memtable(store)) return -1;
+    qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
+    if (ctx.ok && fast) {
+        int rc = sst_foreach_newest(store, true, delta_sst_cb, &ctx);
+        if (rc < 0) ctx.ok = false;
+    }
+    if (!ctx.ok) {
+        qihse_kv_delta_records_free(ctx.recs, ctx.count);
+        return -1;
+    }
+    if (ctx.count > 1u) {
+        qsort(ctx.recs, ctx.count, sizeof(*ctx.recs), delta_record_cmp);
+    }
+    *out_records = ctx.recs;
+    *out_count = ctx.count;
+    *out_resume_seq = ctx.resume;
+    return 0;
+}
+
+/* File form of the delta: the same text record stream qihse_kv_save_user
+ * writes (v4 headers with the sequence; tombstones included), assembled
+ * atomically like every snapshot.  Unlike qihse_kv_save_user this FILTERS
+ * by authorization rather than refusing whole: a delta is explicitly "the
+ * mutations you may see since the cursor", and its resume point is the
+ * allowed-high-water — a partial-by-clearance delta is the CONTRACT here,
+ * whereas a full snapshot claims complete coverage and must refuse (the KV
+ * layer's save refuses whole for exactly that reason). */
+int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath,
+                             qihse_user_t* user, uint64_t since_seq,
+                             uint64_t* out_resume_seq) {
+    if (out_resume_seq) *out_resume_seq = 0u;
+    if (!store || !filepath) return -1;
+    qihse_kv_delta_record_t* recs = NULL;
+    size_t count = 0u;
+    uint64_t resume = 0u;
+    int rc = qihse_kv_export_incremental_user(store, user, since_seq, &recs, &count, &resume);
+    if (rc != 0) return rc;
+
+    char tmp[8192]; FILE* f = NULL;
+    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) {
+        qihse_kv_delta_records_free(recs, count);
+        return -1;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < count && ok; i++) {
+        const qihse_kv_delta_record_t* r = &recs[i];
+        uint8_t flags = r->tombstone ? KV_FLAG_TOMBSTONE : 0u;
+        const char* val = r->tombstone ? "" : r->value;
+        if (!disk_record_write_fields(f, r->key, val, r->expire_time_ms,
+                                      r->classification, r->sci_compartment,
+                                      flags, r->change_seq)) {
+            ok = false;
+        }
+    }
+    qihse_kv_delta_records_free(recs, count);
+    if (!ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
+    if (!atomic_file_commit(f, tmp, filepath)) return -1;
+    if (out_resume_seq) *out_resume_seq = resume;
+    return 0;
+}
 
 bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
     if (!store) return false;

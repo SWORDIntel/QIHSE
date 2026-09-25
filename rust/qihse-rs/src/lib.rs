@@ -6,6 +6,17 @@ pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+// ============================================================================
+// Controller client (pure-std protocol SDK — no FFI)
+// ============================================================================
+
+pub mod controller;
+
+pub use controller::{
+    CasPrecondition, ControllerClient, ControllerConfig, ControllerError, Credentials, Reply,
+    Watch, WatchEvent, DEFAULT_TIMEOUT_MS, MAX_BULK, MAX_DEPTH, MAX_ITEMS,
+};
+
 use std::ffi::{CStr, CString};
 
 // ============================================================================
@@ -121,6 +132,81 @@ impl Drop for TrinaryTrie {
 }
 
 // ============================================================================
+// Authenticated principal (explicit security context)
+// ============================================================================
+
+/// An authenticated QIHSE principal handle (`qihse_user_t*` from
+/// `qihse_auth.h`).
+///
+/// The C auth layer keeps principals in a process-global table, so a `User`
+/// is a borrowed, non-owning handle into that table: the C API exposes no
+/// free function for it, it stays valid until the principal is destroyed,
+/// and it is cheap to copy.
+///
+/// Classified-capable read primitives such as [`VectorDB::search`] demand an
+/// explicit `User`: the C layer fails closed with `EACCES` for a NULL
+/// security context and never substitutes a default principal (repository
+/// invariant 1). This wrapper therefore has no unauthenticated fallback —
+/// callers must obtain a principal through [`Auth`].
+#[derive(Clone, Copy)]
+pub struct User {
+    ptr: *mut ffi::qihse_user_t,
+}
+
+impl User {
+    /// Numeric user id (C `qihse_user_get_id`). User 0 is the system operator.
+    pub fn id(&self) -> u32 {
+        unsafe { ffi::qihse_user_get_id(self.ptr) }
+    }
+
+    /// Clearance level (C `qihse_user_get_classification`).
+    pub fn classification(&self) -> u16 {
+        unsafe { ffi::qihse_user_get_classification(self.ptr) }
+    }
+}
+
+/// Process-global authentication subsystem (C `qihse_auth_*`).
+pub struct Auth;
+
+impl Auth {
+    /// Initialise the global auth context (C `qihse_auth_init`).
+    ///
+    /// Note: the C implementation resets the principal table on every call,
+    /// so initialise once per process before authenticating.
+    pub fn init() -> bool {
+        unsafe { ffi::qihse_auth_init() }
+    }
+
+    /// Bootstrap the system operator (user id 0) with `password`.
+    ///
+    /// The C layer requires a password of at least 12 characters and refuses
+    /// to overwrite an already-configured operator verifier (for example one
+    /// configured through the `QIHSE_OPERATOR_PASSWORD` environment
+    /// variable); in that case authenticate with that password instead.
+    pub fn bootstrap_operator(password: &str) -> bool {
+        let pw = CString::new(password).expect("CString::new failed");
+        unsafe { ffi::qihse_auth_bootstrap_operator(pw.as_ptr()) }
+    }
+
+    /// Authenticates `username` with `password`. Returns `None` on bad
+    /// credentials or an interior NUL byte.
+    pub fn authenticate(username: &str, password: &str) -> Option<User> {
+        let name = CString::new(username).ok()?;
+        let pw = CString::new(password).ok()?;
+        let ptr = unsafe { ffi::qihse_auth_authenticate(name.as_ptr(), pw.as_ptr()) };
+        if ptr.is_null() { None } else { Some(User { ptr }) }
+    }
+
+    /// Authenticates principal `user_id` (user 0 is the system operator) with
+    /// `password`. Returns `None` on bad credentials or an interior NUL byte.
+    pub fn authenticate_id(user_id: u32, password: &str) -> Option<User> {
+        let pw = CString::new(password).ok()?;
+        let ptr = unsafe { ffi::qihse_auth_authenticate_id(user_id, pw.as_ptr()) };
+        if ptr.is_null() { None } else { Some(User { ptr }) }
+    }
+}
+
+// ============================================================================
 // VectorDB
 // ============================================================================
 
@@ -168,9 +254,16 @@ impl VectorDB {
         }
     }
 
-    /// Searches for the `top_k` nearest neighbours of `query`.
+    /// Searches for the `top_k` nearest neighbours of `query`, executed as
+    /// the authenticated principal `user`.
+    ///
+    /// `user` is an explicit authenticated security context (repository
+    /// invariant 1): the C layer fails closed with `EACCES` for a NULL
+    /// context and returns no rows, so this wrapper requires a [`User`]
+    /// handle and offers no unauthenticated fallback.
     pub fn search(
         &self,
+        user: &User,
         query: &[f32],
         top_k: usize,
         mode: ffi::qihse_vector_db_query_mode_e,
@@ -201,7 +294,7 @@ impl VectorDB {
             distance_metric: metric,
             metadata_filter: None,
             metadata_filter_opaque: std::ptr::null_mut(),
-            user: std::ptr::null_mut(),
+            user: user.ptr,
         };
 
         let found = unsafe {
@@ -367,8 +460,37 @@ mod tests {
         assert!(trie.get("hello").is_none());
     }
 
+    /// Authenticated system operator for vector-search tests.
+    ///
+    /// Follows the C gold-workload pattern (`gold_security_null_context.c`):
+    /// honour a pre-configured `QIHSE_OPERATOR_PASSWORD` verifier, otherwise
+    /// bootstrap the operator with a fixed test password. The password must
+    /// be at least 12 characters (C requirement).
+    fn operator_for_search_tests() -> User {
+        const PW: &str = "qihse-rs-vector-test-op";
+        assert!(Auth::init(), "qihse_auth_init failed");
+        if let Ok(env_pw) = std::env::var("QIHSE_OPERATOR_PASSWORD") {
+            if !env_pw.is_empty() {
+                if let Some(user) = Auth::authenticate_id(0, &env_pw) {
+                    return user;
+                }
+            }
+        }
+        if Auth::authenticate_id(0, PW).is_none() {
+            assert!(
+                Auth::bootstrap_operator(PW),
+                "operator bootstrap failed (verifier already configured?)"
+            );
+        }
+        Auth::authenticate_id(0, PW).expect("no authenticated operator for vector search")
+    }
+
     #[test]
     fn test_vector_db() {
+        let operator = operator_for_search_tests();
+        assert_eq!(operator.id(), 0);
+        assert_eq!(operator.classification(), 0xFFFF);
+
         let db = VectorDB::new(
             ffi::qihse_vector_db_backend_e_QIHSE_VECTOR_DB_INMEMORY,
             None,
@@ -381,6 +503,7 @@ mod tests {
 
         let query: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
         let results = db.search(
+            &operator,
             &query,
             1,
             ffi::qihse_vector_db_query_mode_e_QIHSE_VDB_QUERY_FLOAT32,
@@ -388,6 +511,67 @@ mod tests {
         );
         assert!(!results.is_empty());
         assert_eq!(results[0].id, 42);
+    }
+
+    /// Invariant 1: a NULL security context must never become an
+    /// authorization bypass. The safe API makes this unrepresentable
+    /// (`VectorDB::search` demands a `User`); this probe pins the underlying
+    /// C contract through the crate's public `ffi` surface the same way the
+    /// C gold workload `gold_security_null_context.c` does: a NULL-user query
+    /// returns no rows, writes no result bytes, and reports `EACCES`.
+    ///
+    /// (A low-clearance negative probe is not constructible here: the public
+    /// C add API writes every row as UNCLASSIFIED, so there is no classified
+    /// payload to withhold from a reduced principal.)
+    #[test]
+    fn test_vector_db_null_user_fails_closed() {
+        let db = VectorDB::new(
+            ffi::qihse_vector_db_backend_e_QIHSE_VECTOR_DB_INMEMORY,
+            None,
+        )
+        .expect("Failed to create VectorDB");
+
+        let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+        let ids: Vec<u64> = vec![7];
+        assert!(db.add_vectors(&vectors, 4, Some(&ids)));
+
+        let query: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+        let q = ffi::qihse_vector_query_t {
+            query_vector: query.as_ptr(),
+            vector_dims: query.len(),
+            top_k: 1,
+            similarity_threshold: 0.0,
+            include_vectors: false,
+            include_metadata: false,
+            use_trinary_candidates: false,
+            candidate_count: 0,
+            query_mode: ffi::qihse_vector_db_query_mode_e_QIHSE_VDB_QUERY_FLOAT32,
+            candidate_pool_size: 0,
+            distance_metric: ffi::qihse_distance_metric_e_QIHSE_DISTANCE_COSINE,
+            metadata_filter: None,
+            metadata_filter_opaque: std::ptr::null_mut(),
+            user: std::ptr::null_mut(), // the deliberately missing context
+        };
+
+        let mut raw = ffi::qihse_vector_result_t {
+            id: 0,
+            score: 0.0,
+            vector: std::ptr::null_mut(),
+            vector_dims: 0,
+            metadata: std::ptr::null_mut(),
+            metadata_size: 0,
+        };
+
+        let found = unsafe { ffi::qihse_vector_db_search(db.ptr, &q, &mut raw, 1) };
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+        assert!(
+            found <= 0,
+            "NULL user context returned {found} rows; invariant 1 violated"
+        );
+        assert_eq!(err, libc::EACCES, "expected EACCES for NULL user context");
+        assert_eq!(raw.id, 0, "fail-closed search must not write result bytes");
+        assert_eq!(raw.score, 0.0, "fail-closed search must not write a score");
     }
 
     #[test]

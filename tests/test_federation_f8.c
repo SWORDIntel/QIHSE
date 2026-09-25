@@ -1,7 +1,7 @@
 /*
  * test_federation_f8.c — F8 operational hardening: deterministic scenarios.
  *
- * Runs the mandatory scenarios from v3.md §44.2 against the REAL F1–F7 entry
+ * Runs the mandatory scenarios from plan §44.2 against the REAL F1–F7 entry
  * points.  The simulator only decides what the network and the hosts do
  * between calls, so a passing scenario is evidence about the shipped code.
  *
@@ -111,7 +111,7 @@ static void scenario_local_survives_isolation(void) {
     printf("PASS S1/S4: isolated node keeps LOCAL writes + events, strong fails closed\n");
 }
 
-/* ── S2/S3: scoped quorum (v3.md §15) ──────────────────────────────────── */
+/* ── S2/S3: scoped quorum (plan §15) ──────────────────────────────────── */
 
 static void scenario_split_quorum(void) {
     qihse_sim_t sim;
@@ -156,7 +156,7 @@ static void scenario_split_quorum(void) {
     assert(q.quorum);
 
     /* Scoped: an unrelated group whose voters are all on the majority side is
-     * unaffected by the other group's outage (v3.md §15). */
+     * unaffected by the other group's outage (plan §15). */
     qihse_federation_group_t other;
     memset(&other, 0, sizeof(other));
     snprintf(other.group_id, sizeof(other.group_id), "telemetry");

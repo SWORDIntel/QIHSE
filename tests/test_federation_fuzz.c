@@ -1,7 +1,7 @@
 /*
  * test_federation_fuzz.c — F8.7 fuzzing of wire and persisted parsers.
  *
- * v3.md §44.3 lists the parsers that must be fuzzed: the federation frame
+ * plan §44.3 lists the parsers that must be fuzzed: the federation frame
  * parser, snapshot manifest, reconciliation manifests, mutation envelopes,
  * the schema decoder, the gossip parser, the watch cursor decoder, and
  * persisted lease records.

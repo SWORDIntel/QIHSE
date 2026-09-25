@@ -3,7 +3,7 @@
 
 /*
  * QIHSE federation replication transport and range transfer.
- * See v3.md §10 (anti-entropy and reconciliation), §22 (replication
+ * See docs/plans/qihse_federation_upgrade_plan.md §10 (anti-entropy and reconciliation), §22 (replication
  * transport) and §43 (reconciliation safety).
  *
  * F3 produced manifests and sync plans: it can tell you WHICH ranges
@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-/* ── Transport abstraction (v3.md §22) ─────────────────────────────────── */
+/* ── Transport abstraction (plan §22) ─────────────────────────────────── */
 
 typedef struct {
     /* Establish a connection.  `peer` is transport-specific: a host:port for
@@ -134,7 +134,7 @@ bool qihse_repl_record_decode(const uint8_t* in, size_t in_len,
 /* ── The transfer state machine ────────────────────────────────────────── */
 
 /* Bound on how much one round may move, so reconciliation cannot saturate a
- * link or a CPU (v3.md §10: rate limited, bounded). */
+ * link or a CPU (plan §10: rate limited, bounded). */
 #define QIHSE_REPL_MAX_RECORDS_PER_ROUND 64u
 
 typedef struct {
@@ -188,7 +188,7 @@ bool qihse_repl_sync_finish(qihse_repl_sync_t* sync,
  * sequence applies to ownership. */
 bool qihse_repl_sync_may_publish(const qihse_repl_sync_t* sync);
 
-/* ── Reconciliation ordering (v3.md §43) ───────────────────────────────── */
+/* ── Reconciliation ordering (plan §43) ───────────────────────────────── */
 
 /* The rejoin sequence ends with VERIFY_CHECKSUMS and COMPLETE.  A transfer
  * may only run while the sequence is at or past TRANSFER_EVENTS, so a node

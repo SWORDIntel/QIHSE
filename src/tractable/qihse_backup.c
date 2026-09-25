@@ -29,6 +29,13 @@
  * substitute a container that hashes correctly.  A backup path must be as
  * protected as the dataset it holds.  Signing containers against the node
  * identity key is the same documented follow-up as the federation writer's.
+ *
+ * Incremental containers (BACKUP_INCREMENTAL) carry the KV layer's delta
+ * stream: only the records whose stamped change sequence is strictly
+ * greater than the caller's cursor (start_lsn), tombstones included,
+ * clearance/SCI-FILTERED at the KV layer, with the no-leak resume point as
+ * end_lsn.  Whole-store restore still refuses them — a delta is not a
+ * whole-store image.
  */
 #include "qihse_backup.h"
 
@@ -312,38 +319,25 @@ static void backup_info_commit(qihse_backup_info_t* info, const backup_header_t*
 
 /* ── Writer ────────────────────────────────────────────────────────────── */
 
-int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
-                           const char* output_path, qihse_backup_info_t* info) {
-    /* A failed call hands back nothing that could be mistaken for a result. */
-    if (info) memset(info, 0, sizeof(*info));
-    if (!kv || !output_path || output_path[0] == '\0') return QIHSE_BACKUP_EXPORT_ERR;
-    int rc = backup_principal_gate(user);
-    if (rc != QIHSE_BACKUP_EXPORT_OK) return rc;
-    if (!backup_info_reserve(info, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
-
+/* Seal a data section — already produced by the KV layer at `data_path`,
+ * which this function consumes and unlinks — into a container at
+ * `output_path`.  Shared by the full and incremental writers so both get
+ * the same discipline: fixed header, single-pass hash while the section is
+ * copied (the bytes verified are the bytes sealed), checksum written last,
+ * rename into place only once every byte is down, and no container at
+ * `output_path` on any failure.  The caller has already reserved `info`,
+ * which is released here on failure. */
+static int backup_seal_container(const char* output_path, backup_type_t type,
+                                 uint64_t start_lsn, uint64_t end_lsn,
+                                 const char* data_path, const qihse_user_t* user,
+                                 qihse_backup_info_t* info) {
     int result = QIHSE_BACKUP_EXPORT_ERR;
     FILE* data_f = NULL;
     FILE* out_f = NULL;
     uint8_t* chunk = NULL;
-    char data_path[BACKUP_PATH_MAX];
     char tmp_path[BACKUP_PATH_MAX];
     bool tmp_pending = false;
-    /* The KV layer only ever leaves a file at data_path when it returns 0, so
-     * a truncated or unbuilt scratch path is never unlinked. */
-    bool data_pending = false;
     uint64_t data_bytes = 0u, moved = 0u, checksum = 0u;
-
-    /* The data section is produced by the KV layer's own authorization-aware
-     * export: it refuses the WHOLE export when any live record is outside
-     * this principal's clearance/SCI, and it writes atomically.  The identity
-     * reaches the lowest data-retrieval layer instead of being re-implemented
-     * here, which is what makes the clearance check authoritative rather than
-     * advisory. */
-    if (!backup_sibling_path(output_path, ".data", data_path, sizeof(data_path))) goto done;
-    int save_rc = qihse_kv_save_user(kv, data_path, user);
-    if (save_rc == -2) { result = QIHSE_BACKUP_EXPORT_DENIED; goto done; }
-    if (save_rc != 0) goto done;
-    data_pending = true;
 
     data_f = backup_open_read(data_path);
     if (!data_f) goto done;
@@ -355,7 +349,9 @@ int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
 
     backup_header_t h;
     memset(&h, 0, sizeof(h));
-    h.type = BACKUP_FULL;
+    h.type = type;
+    h.start_lsn = start_lsn;
+    h.end_lsn = end_lsn;
     h.timestamp = (uint64_t)time(NULL);
     h.data_length = data_bytes;
     h.writer_user_id = qihse_user_get_id(user);
@@ -405,7 +401,7 @@ done:
     if (out_f) fclose(out_f);
     if (tmp_pending) unlink(tmp_path);
     if (data_f) fclose(data_f);
-    if (data_pending) unlink(data_path);
+    unlink(data_path);
     free(chunk);
     if (result != QIHSE_BACKUP_EXPORT_OK && info) {
         qihse_backup_info_free(info);
@@ -414,20 +410,88 @@ done:
     return result;
 }
 
-int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
-                                  const char* output_path, uint64_t since_lsn,
-                                  qihse_backup_info_t* info) {
-    (void)since_lsn;
+/* Produce the data section beside the target, run one writer gate around
+ * it, and hand the section to the sealer.  `info` is already reserved by
+ * the caller and released on every failure path.  `produce` returning -2 is
+ * a denial (the KV layer's convention). */
+static int backup_write_container(qihse_kv_store_t* kv, qihse_user_t* user,
+                                  const char* output_path, backup_type_t type,
+                                  uint64_t since_seq, qihse_backup_info_t* info,
+                                  int (*produce)(qihse_kv_store_t*, const char*,
+                                                 qihse_user_t*, uint64_t, uint64_t*)) {
+    char data_path[BACKUP_PATH_MAX];
+    if (!backup_sibling_path(output_path, ".data", data_path, sizeof(data_path))) {
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return QIHSE_BACKUP_EXPORT_ERR;
+    }
+    uint64_t resume_seq = 0u;
+    int save_rc = produce(kv, data_path, user, since_seq, &resume_seq);
+    /* The KV layer only ever leaves a file at data_path when it returns 0,
+     * so a truncated or unbuilt scratch path is never unlinked. */
+    if (save_rc == -2) {
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return QIHSE_BACKUP_EXPORT_DENIED;
+    }
+    if (save_rc != 0) {
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return QIHSE_BACKUP_EXPORT_ERR;
+    }
+    return backup_seal_container(output_path, type, since_seq, resume_seq,
+                                 data_path, user, info);
+}
+
+/* The full writer's data-section producer: the KV layer's authorization-
+ * aware export refuses the WHOLE export when any live record is outside
+ * this principal's clearance/SCI (a full container claims complete
+ * coverage; a quietly partial one would be a lie about coverage), and it
+ * writes atomically.  The identity reaches the lowest data-retrieval layer
+ * instead of being re-implemented here, which is what makes the clearance
+ * check authoritative rather than advisory.  The change sequence is not a
+ * full container's concern: start/end are 0. */
+static int backup_full_produce(qihse_kv_store_t* kv, const char* data_path,
+                               qihse_user_t* user, uint64_t since_seq, uint64_t* out_resume) {
+    (void)since_seq;
+    if (out_resume) *out_resume = 0u;
+    return qihse_kv_save_user(kv, data_path, user);
+}
+
+int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                           const char* output_path, qihse_backup_info_t* info) {
+    /* A failed call hands back nothing that could be mistaken for a result. */
     if (info) memset(info, 0, sizeof(*info));
     if (!kv || !output_path || output_path[0] == '\0') return QIHSE_BACKUP_EXPORT_ERR;
     int rc = backup_principal_gate(user);
     if (rc != QIHSE_BACKUP_EXPORT_OK) return rc;
-    /* The KV layer exposes no change sequence or LSN, so there is nothing to
-     * filter on.  Writing a full snapshot labelled "incremental" would make a
-     * restore silently non-incremental, and exporting the caller's whole
-     * authorized view under a delta's name is a lie about coverage — so this
-     * refuses and writes nothing. */
-    return QIHSE_BACKUP_EXPORT_UNSUPPORTED;
+    if (!backup_info_reserve(info, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
+    return backup_write_container(kv, user, output_path, BACKUP_FULL, 0u, info,
+                                  backup_full_produce);
+}
+
+/* The incremental writer's data-section producer: the KV layer's delta
+ * stream — only records whose change sequence is strictly greater than
+ * `since_seq`, tombstones included, clearance/SCI-FILTERED at the KV layer
+ * (a delta's contract is "the mutations you may see since the cursor", so
+ * it filters where the full export refuses whole), with the no-leak resume
+ * point as the continuation. */
+static int backup_incremental_produce(qihse_kv_store_t* kv, const char* data_path,
+                                      qihse_user_t* user, uint64_t since_seq,
+                                      uint64_t* out_resume) {
+    return qihse_kv_save_delta_user(kv, data_path, user, since_seq, out_resume);
+}
+
+int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                                  const char* output_path, uint64_t since_lsn,
+                                  qihse_backup_info_t* info) {
+    if (info) memset(info, 0, sizeof(*info));
+    if (!kv || !output_path || output_path[0] == '\0') return QIHSE_BACKUP_EXPORT_ERR;
+    int rc = backup_principal_gate(user);
+    if (rc != QIHSE_BACKUP_EXPORT_OK) return rc;
+    if (!backup_info_reserve(info, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
+    return backup_write_container(kv, user, output_path, BACKUP_INCREMENTAL,
+                                  since_lsn, info, backup_incremental_produce);
 }
 
 /* ── Reader ────────────────────────────────────────────────────────────── */
@@ -452,8 +516,12 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
     if (fread(header, 1u, sizeof(header), f) != sizeof(header)) goto done;
     if (!backup_decode_header(header, &h)) goto done;
     /* This reader replaces the live dataset with a whole-store image, so it
-     * can only apply a container that is one.  A delta container would have
-     * to be applied as a delta, and none can be written (see the writer). */
+     * can only apply a container that is one.  Delta containers CAN now be
+     * written (BACKUP_INCREMENTAL, via qihse_kv_save_delta_user) — that is
+     * exactly why they are refused here: applying a delta as though it were
+     * the whole store would silently drop every record the delta did not
+     * carry.  A delta is applied by a delta-aware consumer against the base
+     * it extends, not by whole-store restore. */
     if (h.type != BACKUP_FULL) { result = QIHSE_BACKUP_EXPORT_UNSUPPORTED; goto done; }
 
     struct stat st;

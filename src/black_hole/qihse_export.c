@@ -105,3 +105,52 @@ bool qihse_export_tenant_user(qihse_kv_store_t* kv, qihse_blob_store_t* blobs,
     }
     return true;
 }
+
+/* ── Incremental (delta) export ───────────────────────────────────────────
+ *
+ * The gates this layer owns (this family's convention): NULL context is an
+ * argument error — never the KV layer's unclassified-only fallback view —
+ * and the handle must be a live principal.  Everything classified is
+ * decided one layer down, inside the KV store's delta iteration, which
+ * applies the same per-record qihse_auth_can_access check the full export
+ * applies (AGENTS.md invariant 1: the identity reaches the lowest
+ * data-retrieval layer; no classifier is re-implemented here).
+ *
+ * The resume point is computed down there too, deliberately: it is the
+ * highest sequence the principal was ALLOWED to see, so hidden mutations
+ * are filtered out before it is derived and a restricted principal cannot
+ * count them from gaps.  This surface offers no "global high-water" form. */
+bool qihse_export_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                                   uint64_t since_seq,
+                                   qihse_kv_delta_record_t** out_records,
+                                   size_t* out_count, uint64_t* out_resume_seq,
+                                   char* err, size_t err_cap) {
+    if (err && err_cap > 0) err[0] = '\0';
+    if (out_records) *out_records = NULL;
+    if (out_count) *out_count = 0u;
+    if (out_resume_seq) *out_resume_seq = 0u;
+    if (!kv || !out_records || !out_count || !out_resume_seq) {
+        if (err) snprintf(err, err_cap, "invalid arguments");
+        return false;
+    }
+    /* A NULL context is an argument error, never "export everything" and
+     * never a silent fallback to the KV layer's unclassified-only view. */
+    if (!user) {
+        if (err) snprintf(err, err_cap, "an authenticated security context is required");
+        return false;
+    }
+    if (!qihse_auth_user_is_active(user)) {
+        if (err) snprintf(err, err_cap, "principal is not active");
+        return false;
+    }
+    int rc = qihse_kv_export_incremental_user(kv, user, since_seq,
+                                              out_records, out_count, out_resume_seq);
+    if (rc != 0) {
+        *out_records = NULL;
+        *out_count = 0u;
+        *out_resume_seq = 0u;
+        if (err) snprintf(err, err_cap, "delta enumeration failed");
+        return false;
+    }
+    return true;
+}

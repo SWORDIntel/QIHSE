@@ -61,8 +61,13 @@ typedef enum {
 typedef struct {
     backup_type_t type;
     char* path;
-    /* This layer has no change sequence, so both are 0 in a container it
-     * writes (see qihse_backup_incremental_user). */
+    /* The container's change-sequence range.  A FULL container claims no
+     * sequence range: both are 0.  An INCREMENTAL container carries the
+     * caller's cursor as start_lsn (the `since` the delta was taken from)
+     * and the delta's continuation point as end_lsn — for a full-clearance
+     * writer that is the store's last mutation; for a restricted writer it
+     * is the highest sequence the principal was ALLOWED to see, by design
+     * (see qihse_backup_incremental_user). */
     uint64_t start_lsn;
     uint64_t end_lsn;
     time_t timestamp;
@@ -86,14 +91,39 @@ typedef struct {
 int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
                            const char* output_path, qihse_backup_info_t* info);
 
-/* Incremental export.  The KV layer exposes no change sequence or LSN, so a
- * delta cannot be produced honestly: this refuses with
- * QIHSE_BACKUP_EXPORT_UNSUPPORTED and writes nothing, rather than labelling
- * a full snapshot "incremental" (which would make a restore silently
- * non-incremental).  It exists so the surface stays context-taking and a
- * caller that needs a delta gets an explicit refusal instead of a
- * context-free fallback.  A manifest-bound federated backup with a WAL
- * continuation point is the supported answer for incremental coverage. */
+/* Incremental export.  Writes the delta since the caller's change-sequence
+ * cursor: the data section is the KV layer's delta stream (only records
+ * whose stamped sequence is STRICTLY greater than `since_lsn`, tombstones
+ * included, each key's latest state), produced through the KV layer's
+ * authorization-aware iteration with this principal's identity (AGENTS.md
+ * invariant 1: NULL is an argument error, never "export everything").
+ *
+ * The continuation point comes back as info->end_lsn (start_lsn echoes the
+ * cursor).  Feed it to the next call as `since_lsn`.
+ *
+ * METADATA-DISCLOSURE DECISION (default and ONLY form): the continuation
+ * point is the highest sequence among the records THIS principal was
+ * ALLOWED to see — never the store-global high-water.  Mutations the
+ * principal may not see are filtered at the KV layer before the resume
+ * point is derived, so hidden mutations are never enumerated and comparing
+ * successive resume points cannot reveal how many occurred.  A
+ * full-clearance writer's resume point coincides with the store's last
+ * mutation.  No "global high-water with gaps visible" form is offered,
+ * even opt-in: it would disclose the count of hidden mutations.
+ *
+ * Unlike a FULL container (whose data section is refused whole if any live
+ * record is above the writer's clearance — a full container claims complete
+ * coverage), an INCREMENTAL container's section is clearance-FILTERED: a
+ * delta is explicitly "the mutations you may see since the cursor".  The
+ * container still records the writer's clearance/SCI bound, so the same
+ * dominance gates apply on verify/list.
+ *
+ * Boundaries: records predating the change sequence (sequence 0) are never
+ * in a delta — take a full backup first, then track deltas.  A delta
+ * container is NOT restorable through qihse_restore_user (a whole-store
+ * image restorer); it is applied by a delta-aware consumer against the base
+ * it extends.  qihse_restore_user refuses it with
+ * QIHSE_BACKUP_EXPORT_UNSUPPORTED, on purpose. */
 int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
                                   const char* output_path, uint64_t since_lsn,
                                   qihse_backup_info_t* info);
@@ -121,7 +151,7 @@ int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path);
 void qihse_backup_info_free(qihse_backup_info_t* info);
 
 /* ────────────────────────────────────────────────────────────────────────
- * Federation snapshot backup (v3.md §20, §21, §23)
+ * Federation snapshot backup (plan §20, §21, §23)
  *
  * A snapshot manifest is a claim: this snapshot id, captured at this WAL
  * continuation offset, over this many objects, under this key id, with a
@@ -148,40 +178,146 @@ void qihse_backup_info_free(qihse_backup_info_t* info);
  *
  *   3. Integrity is verified before anything is applied.  The manifest's
  *      checksum is verified through qihse_snapshot_verify() first, the
- *      container carries its own SHA-384 over its data section, and the KV
- *      layer's load is transactional — a truncated, edited or unauthorized
- *      restore is refused whole rather than half-applied.
+ *      container carries its own SHA-384 over its data section and over its
+ *      WAL section, and the KV layer's load is transactional — a truncated,
+ *      edited or unauthorized restore is refused whole rather than
+ *      half-applied.
  *
  * The container never carries key material.  The manifest's
  * encryption_key_id is a key id, is validated as an identifier, and is the
- * only key-related field written (v3.md §20, §21).  An empty key id records
+ * only key-related field written (plan §20, §21).  An empty key id records
  * a backup the snapshot declared unencrypted; a value that looks like key
  * material is refused rather than copied.  The data section carries the
  * dataset as the store holds it, and the store never holds private key
  * material (§20), so a backup cannot introduce any.
  *
- * The container holds the captured dataset plus the resume point.  It does
- * not hold the WAL segment that follows that point; replaying from
- * `wal_continuation_offset` is the caller's job, which is why the descriptor
- * reports the offset it was bound to.
+ * ── Authentication (signed containers) ───────────────────────────────────
  *
- * Known boundary: the container is integrity-checked, not authenticated.  It
- * is bound to the snapshot id, the manifest revision and the WAL
- * continuation point, and any edit is caught by the SHA-384 — but a writer
- * with filesystem access can substitute a container that agrees with all
- * three, because the manifest itself carries no signature.  Authenticating
- * backups against the node identity key is the follow-up; until then a
- * backup path must be as protected as the dataset it holds.
+ * The container is integrity-checked AND authenticated: it is bound to the
+ * snapshot id, the manifest revision and the WAL continuation point, and it
+ * is signed with the F5 node identity key, so a writer with filesystem
+ * access cannot substitute a container that agrees with all three:
+ *
+ *   - qihse_backup_write_signed() resolves the signer through the store's
+ *     enrolled identity records (fednode:<uuid>) as the authenticated
+ *     principal, requires the identity to be APPROVED right now, and loads
+ *     the private key from the record's key HANDLE — a filesystem reference.
+ *     The private key never enters a QIHSE record and never enters the
+ *     container (plan §20).  An absent, unenrolled, unapproved or keyless
+ *     identity FAILS the write with QIHSE_BACKUP_ERR_SIGNER: there is no
+ *     unsigned fallback and no development flag that creates one.
+ *
+ *   - The header carries the signer's node id and public-key fingerprint,
+ *     the signature algorithm id and the signature length — never key
+ *     material.  The algorithm, the fingerprint and the length sit INSIDE
+ *     the signed region, so an algorithm-downgrade or signer-substitution
+ *     edit invalidates the signature instead of reinterpreting it.
+ *
+ *   - The signature covers the whole fixed header, which carries the
+ *     manifest checksum, the data section's SHA-384 and the WAL section's
+ *     SHA-384, so one detached signature authenticates the manifest
+ *     binding, both payload digests and the signer identity at once.  The
+ *     layout is
+ *       [ header ][ signature ][ data section ][ WAL section ]
+ *     so a reader can refuse a bad signature BEFORE any payload byte is
+ *     read, and refuse a bad WAL section before any WAL byte is applied.
+ *
+ *   - qihse_backup_restore_signed() and qihse_backup_verify() re-check the
+ *     signer against the identity records at read time — mirroring
+ *     qihse_federation_node_capability_lookup_admissible(), the trust state
+ *     is re-read rather than snapshot, so a signer revoked after the backup
+ *     was written stops being acceptable immediately.  Unknown, unapproved
+ *     and revoked signers, and signatures that do not match the recorded
+ *     fingerprint's enrolled key, are refused with
+ *     QIHSE_BACKUP_ERR_SIGNATURE and nothing is applied.
+ *
+ *   - The single exception is the explicit operator override parameter on
+ *     qihse_backup_restore_signed().  It skips ONLY the signature and
+ *     signer-admissibility gate, it is available only to a principal that
+ *     holds QIHSE_SCOPE_SECURITY_ADMIN (an operator, implicitly), and it
+ *     leaves every other gate exactly where it was: manifest, structure,
+ *     version, data and WAL checksums, snapshot binding, WAL continuation
+ *     point, coverage, and the KV layer's clearance/SCI load check.  The
+ *     override can never turn a clearance denial into a restore, and a
+ *     checksum-tampered container is still refused under it.  Fail closed
+ *     by default.
+ *
+ * ── The WAL section (v3 containers) ──────────────────────────────────────
+ *
+ * The container holds the captured dataset, the resume point, and a bounded
+ * run of the WAL records that FOLLOW that point (plan §23: "backups must
+ * include ... WAL continuation point" — the segment is what makes the
+ * continuation point actionable inside one restore).  The section is
+ * length-declared, digest-covered, signature-covered and bounded by
+ * QIHSE_BACKUP_WAL_SECTION_MAX, and its records are self-describing with a
+ * per-record CRC32 — the same integrity primitive and the same composition
+ * qihse_wal uses (qihse_wal_crc32 over the header fields, key and value,
+ * XOR-combined), the same bounded key/value lengths (QIHSE_WAL_MAX_KEY /
+ * QIHSE_WAL_MAX_VALUE) and the same ordered-replay discipline as
+ * qihse_wal_replay():
+ *
+ *   - The record header extends the tractable WAL's record with the two
+ *     fields the KV layer needs to preserve classification through a
+ *     replay (classification and SCI compartment).  A record that could
+ *     not carry them could only be applied as unclassified, which would
+ *     make a WAL replay a classification-downgrade channel.
+ *
+ *   - Replay is fail-closed on structure: the WHOLE section is validated —
+ *     per-record CRC, declared-versus-present lengths, bounded key/value,
+ *     strictly increasing LSNs, first/last LSN agreeing with the header —
+ *     before the data section is loaded and before the first WAL byte is
+ *     applied, so a truncated or mid-record tail refuses the restore rather
+ *     than partially applying.
+ *
+ *   - Replay is idempotent-safe the way qihse_wal_replay() is: records
+ *     whose LSN is below the manifest's WAL continuation point were already
+ *     reflected in the snapshot and are SKIPPED, not re-applied; data ops
+ *     are applied through the KV layer's set/delete primitives, which
+ *     converge on re-application; and a DELETE whose key is already absent
+ *     is satisfied rather than an error.
+ *
+ *   - Replay is authorization-checked before anything is applied: every
+ *     INSERT/UPDATE record's classification/SCI is checked against the
+ *     restoring principal with qihse_auth_can_access() — the exact
+ *     predicate qihse_kv_set_user() applies — BEFORE the dataset is
+ *     replaced, and every record the loaded snapshot can hold is already
+ *     within the caller's access (the KV layer refuses the whole load
+ *     otherwise), so a WAL record above the caller's clearance refuses the
+ *     restore with QIHSE_BACKUP_ERR_DENIED and nothing is applied.
+ *
+ *   - The writer only produces a segment whose first record sits exactly at
+ *     the manifest's WAL continuation point.  The reader refuses a segment
+ *     that starts ABOVE it (records missing between the snapshot and the
+ *     segment would silently lose writes — QIHSE_BACKUP_ERR_WAL_POINT) and
+ *     skips one that starts below it (already-applied records).
  * ──────────────────────────────────────────────────────────────────────── */
 
 #define QIHSE_BACKUP_MAGIC "QIHSEBK1"
 #define QIHSE_BACKUP_MAGIC_LEN 8u
-#define QIHSE_BACKUP_VERSION 1u
+/* Container version history (the version is inside the signed region):
+ *   1  unsigned, integrity-only          — RETIRED, no writer or reader
+ *   2  signed, no WAL section            — RETIRED, no writer or reader
+ *   3  signed + bounded WAL section      — the current format
+ * Every entry point refuses version 1 and 2 containers with
+ * QIHSE_BACKUP_ERR_VERSION rather than downgrading them to whatever checks
+ * an older format could still run. */
+#define QIHSE_BACKUP_VERSION_WAL 3u
 /* Fixed-size header, so the data section's offset never depends on a
- * variable-length field and a truncated container is detectable by size. */
-#define QIHSE_BACKUP_HEADER_BYTES 320u
+ * variable-length field and a truncated container is detectable by size:
+ * 392 bytes of snapshot + signer fields, then wal_bytes (8), wal_checksum
+ * (48), wal_first_lsn (8) and wal_last_lsn (8). */
+#define QIHSE_BACKUP_HEADER_WAL_BYTES 464u
 /* Key ID only — never key material. */
 #define QIHSE_BACKUP_KEY_ID_MAX 127u
+/* The WAL section is bounded: a declared length above this is refused by
+ * writer and reader alike, so a container cannot promise an unbounded
+ * segment (and the reader's single heap buffer stays bounded). */
+#define QIHSE_BACKUP_WAL_SECTION_MAX (8u * 1024u * 1024u)
+/* WAL record header: lsn (8), txn_id (8), engine_id (1), op_type (1),
+ * classification (2), sci (2), key_length (4), value_length (4),
+ * reserved (2, zero), checksum (4, CRC32) — followed by
+ * key[key_length] and value[value_length]. */
+#define QIHSE_BACKUP_WAL_RECORD_HEADER_BYTES 36u
 
 typedef enum {
     QIHSE_BACKUP_OK = 0,
@@ -209,7 +345,21 @@ typedef enum {
     /* The manifest carries something that looks like key material instead of
      * a key id. */
     QIHSE_BACKUP_ERR_KEY_MATERIAL,
-    QIHSE_BACKUP_ERR_IO
+    QIHSE_BACKUP_ERR_IO,
+    /* Signed containers: the signing node identity is absent, not enrolled,
+     * not APPROVED right now, or its private key does not load or does not
+     * match the enrolled record.  The write fails rather than producing an
+     * unsigned container. */
+    QIHSE_BACKUP_ERR_SIGNER,
+    /* Signed containers: the signature is absent, truncated or does not
+     * verify, the recorded fingerprint does not match the signer's enrolled
+     * key, or the signer is unknown, unapproved or revoked at read time. */
+    QIHSE_BACKUP_ERR_SIGNATURE,
+    /* The container's version is not QIHSE_BACKUP_VERSION_WAL: a container
+     * this build's writer could not have produced.  Retired formats (the
+     * unsigned v1 pair, the WAL-less v2) are refused here rather than
+     * downgraded to whatever checks an older format could still run. */
+    QIHSE_BACKUP_ERR_VERSION
 } qihse_backup_result_t;
 
 const char* qihse_backup_result_name(qihse_backup_result_t r);
@@ -220,7 +370,7 @@ const char* qihse_backup_result_name(qihse_backup_result_t r);
 typedef struct {
     qihse_uuid_t snapshot_id;
     /* The point the restore resumes from — copied from the manifest and
-     * verified against it on read. */
+     * verified against it on read.  The WAL section starts here. */
     uint64_t wal_continuation_offset;
     uint64_t max_generation;
     /* Records in the data section, counted through the caller's authorized
@@ -233,10 +383,25 @@ typedef struct {
     uint8_t manifest_checksum[48];  /* the manifest body digest it was bound to */
     char encryption_key_id[QIHSE_BACKUP_KEY_ID_MAX + 1u];
     qihse_schema_header_t schema;
+    /* Who vouches for everything above.  The signer's durable node identity
+     * and the fingerprint of the enrolled public key that must verify the
+     * signature. */
+    qihse_uuid_t signer_node;
+    uint8_t signer_fingerprint[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    qihse_sig_alg_t sig_alg;
+    /* The post-snapshot WAL section: its length, its SHA-384, and the LSN
+     * range it covers.  An absent section is 0/zeroed throughout — the
+     * container then resumes at `wal_continuation_offset` with nothing to
+     * replay, which is what qihse_backup_write_signed() produces. */
+    uint64_t wal_bytes;
+    uint8_t wal_checksum[48];
+    uint64_t wal_first_lsn;
+    uint64_t wal_last_lsn;
 } qihse_backup_descriptor_t;
 
 /* Write the data `manifest` refers to, as the authenticated principal
- * `user_void` (a qihse_user_t*).
+ * `user_void` (a qihse_user_t*), as an AUTHENTICATED container signed with
+ * the enrolled identity of `signer_node`.
  *
  * The manifest must already be recorded and verify (qihse_snapshot_verify),
  * and the caller must present exactly the recorded manifest, so a backup
@@ -246,27 +411,121 @@ typedef struct {
  * reported as QIHSE_BACKUP_ERR_COVERAGE (too narrow) or denied outright by
  * the KV layer's clearance gate (QIHSE_BACKUP_ERR_DENIED).
  *
- * `out` is zeroed on entry, so a failed call never hands back a partial
- * descriptor.  Nothing is written at `path` unless every gate passed. */
-qihse_backup_result_t qihse_backup_write(void* store_void, void* user_void,
-                                         const qihse_snapshot_manifest_t* manifest,
-                                         const char* path,
-                                         qihse_backup_descriptor_t* out);
+ * The signer is resolved through the store's fednode:<uuid> records as the
+ * authenticated principal `user_void` (the identity reaches the lowest
+ * data-retrieval layer, AGENTS.md invariant 1), must be QIHSE_TRUST_APPROVED
+ * right now, and its private key is loaded from the record's key handle —
+ * the key lives on disk and never enters a record or the container.  An
+ * absent, unenrolled, unapproved or keyless signer fails the whole write
+ * with QIHSE_BACKUP_ERR_SIGNER and writes nothing: there is no unsigned
+ * fallback.
+ *
+ * The container records the signer's node id, the fingerprint of the
+ * enrolled public key, the algorithm id and the signature length — never key
+ * material — and the signature covers the whole fixed header, which carries
+ * the manifest checksum and the data section's SHA-384.  No WAL section is
+ * written: the descriptor's wal fields come back zeroed.
+ *
+ * `out` is zeroed on entry; nothing is written at `path` unless every gate
+ * passed. */
+qihse_backup_result_t qihse_backup_write_signed(void* store_void, void* user_void,
+                                                const qihse_snapshot_manifest_t* manifest,
+                                                const qihse_uuid_t* signer_node,
+                                                const char* path,
+                                                qihse_backup_descriptor_t* out);
 
-/* Restore the data `manifest` refers to, as the authenticated principal
- * `user_void` (a qihse_user_t*).
+/* Write the data `manifest` refers to PLUS a bounded post-snapshot WAL
+ * segment, as an AUTHENTICATED container signed with the enrolled identity
+ * of `signer_node`.
+ *
+ * Every gate of qihse_backup_write_signed() applies unchanged.  The segment
+ * is `wal_len` bytes of records in the container's WAL record format (see
+ * QIHSE_BACKUP_WAL_RECORD_HEADER_BYTES): the caller captures it from its WAL
+ * starting at the manifest's wal_continuation_offset.  The writer validates
+ * the WHOLE segment before anything is written — per-record CRC32, bounded
+ * and NUL-free keys/values, strictly increasing LSNs, a size within
+ * QIHSE_BACKUP_WAL_SECTION_MAX — and refuses a segment whose first record
+ * does not sit exactly at the manifest's wal_continuation_offset with
+ * QIHSE_BACKUP_ERR_WAL_POINT: below it the records are pre-snapshot, above
+ * it the gap would silently lose writes.  A segment that fails validation is
+ * QIHSE_BACKUP_ERR_TRUNCATED; one that exceeds the bound is
+ * QIHSE_BACKUP_ERR_ARGUMENT.
+ *
+ * The section's SHA-384, its length and its LSN range go into the header —
+ * inside the signed region — so the signature authenticates the segment the
+ * same way it authenticates the data section. */
+qihse_backup_result_t qihse_backup_write_signed_wal(void* store_void, void* user_void,
+                                                    const qihse_snapshot_manifest_t* manifest,
+                                                    const qihse_uuid_t* signer_node,
+                                                    const char* path,
+                                                    const uint8_t* wal_segment,
+                                                    size_t wal_len,
+                                                    qihse_backup_descriptor_t* out);
+
+/* Restore an AUTHENTICATED container, as the authenticated principal
+ * `user_void`.
  *
  * Refuses unless, in order: the recorded manifest verifies against its
- * checksum and is the manifest presented; the container parses, is not
- * truncated, and matches its recorded SHA-384; the container is bound to
- * this snapshot id, this manifest revision and this WAL continuation point.
- * Only then is the dataset replaced, through the KV layer's authorization
- * gate — which denies the whole load if any record is outside the caller's
- * clearance/SCI, leaving the live dataset untouched. */
-qihse_backup_result_t qihse_backup_restore(void* store_void, void* user_void,
-                                           const qihse_snapshot_manifest_t* manifest,
-                                           const char* path,
-                                           qihse_backup_descriptor_t* out);
+ * checksum and is the manifest presented; the container parses, is the
+ * current version (a v1 or v2 container is QIHSE_BACKUP_ERR_VERSION), is
+ * not truncated, and its declared lengths agree with the bytes present; the
+ * container is bound to this snapshot id, this manifest revision and this
+ * WAL continuation point; the signature verifies against the PUBLIC KEY OF
+ * THE RECORDED SIGNER as it is enrolled right now; the data section and the
+ * WAL section each match their recorded SHA-384; and the WAL section is
+ * structurally whole.  Only then is the dataset replaced through the KV
+ * layer's authorization gate — which denies the whole load if any record is
+ * outside the caller's clearance/SCI, leaving the live dataset untouched —
+ * and the WAL segment replayed in LSN order, through the same gate, with
+ * records below the continuation point skipped (idempotent-safe, the
+ * qihse_wal_replay() start-LSN rule) and a clearance pre-flight over every
+ * record run BEFORE the dataset is replaced.  A truncated or mid-record WAL
+ * tail is refused whole rather than partially applied.
+ *
+ * The identity record is re-read at restore time (so a revocation after the
+ * write takes effect immediately, the way
+ * qihse_federation_node_capability_lookup_admissible() re-checks trust), the
+ * enrolled key's fingerprint must equal the recorded one, and the trust
+ * state must be APPROVED.  An unknown, unapproved or revoked signer, a
+ * mismatched fingerprint, or a tampered, stripped or absent signature is
+ * refused with QIHSE_BACKUP_ERR_SIGNATURE and nothing is applied.
+ *
+ * `operator_override` is the single, explicit exception, and it is narrow:
+ * it skips ONLY the signature and signer-admissibility gate above.  It is
+ * offered only to a principal holding QIHSE_SCOPE_SECURITY_ADMIN (an
+ * operator holds it implicitly) — anyone else passing true is refused with
+ * QIHSE_BACKUP_ERR_DENIED outright.  The manifest gate, the version,
+ * structural and length checks, both checksums, the snapshot/WAL/coverage
+ * binding, the WAL structural gate and the KV layer's clearance/SCI load
+ * check all still run, so the override can neither bypass classification
+ * nor rescue a tampered container.  The default (false) fails closed. */
+qihse_backup_result_t qihse_backup_restore_signed(void* store_void, void* user_void,
+                                                  const qihse_snapshot_manifest_t* manifest,
+                                                  const char* path,
+                                                  bool operator_override,
+                                                  qihse_backup_descriptor_t* out);
+
+/* Verify a container without restoring it: checks the container's structure
+ * and declared-versus-present lengths, its version, its data section and
+ * its WAL section against their recorded SHA-384 digests, the WAL section's
+ * structural coherence (per-record CRC32, bounded lengths, strictly
+ * increasing LSNs, first/last LSN agreeing with the header, first record no
+ * later than the recorded continuation point), and the signature against
+ * the recorded signer's enrolled key with the signer's admissibility
+ * re-checked (APPROVED right now).  As an authenticated principal (a
+ * fednode lookup and the container's metadata are the inputs; NULL is an
+ * argument error, never a bypass).
+ *
+ * The payload is never materialized and the WAL section is never applied:
+ * the data section is streamed through the digest in bounded chunks, the
+ * bounded WAL section is checked in a single heap buffer, no scratch file is
+ * created, and the store is neither opened for load nor written.  On success
+ * `out` (optional, zeroed on entry) carries the container's claims —
+ * including the signer identity and the WAL section's LSN range — so a
+ * caller can compare them against the manifest it holds without restoring. */
+qihse_backup_result_t qihse_backup_verify(void* store_void, void* user_void,
+                                          const char* path,
+                                          qihse_backup_descriptor_t* out);
 
 #ifdef __cplusplus
 }

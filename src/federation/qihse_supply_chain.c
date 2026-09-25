@@ -4,7 +4,7 @@
  * Provenance graph, build-job coordination state, builder capability and
  * history, SBOM/attestation evidence, immutable vulnerability observations,
  * and immutable repository snapshots.
- * See docs/plans/qihse_federation_upgrade_plan.md §27–§35.
+ * See docs/plans/qihse_federation_upgrade_plan.md §27–§34.
  *
  * QIHSE stores coordination state and evidence.  It never invokes compilers
  * or executes arbitrary commands, and it never holds private signing keys.

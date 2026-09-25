@@ -3,7 +3,7 @@
 
 /*
  * QIHSE federation mTLS transport.
- * See v3.md §18 (node identity and trust) and §22 (replication transport).
+ * See docs/plans/qihse_federation_upgrade_plan.md §18 (node identity and trust) and §22 (replication transport).
  *
  * The generic UWP TLS layer provides a server certificate and a session over
  * an fd, but it has no way to REQUIRE a client certificate or to read the
