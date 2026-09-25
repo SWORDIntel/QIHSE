@@ -236,6 +236,14 @@ struct qihse_resp_server {
     char** fts_keys;
     uint64_t fts_key_count;
     uint64_t fts_key_cap;
+    /* SAVE/BGSAVE/LASTSAVE. save_lock guards the state below; the worker
+     * thread is one-shot per BGSAVE and joined before the server goes away.
+     * last_save is a completed-save timestamp (unix, 0 = never this run). */
+    pthread_mutex_t save_lock;
+    pthread_t bgsave_thread;
+    bool bgsave_thread_alive;
+    bool bgsave_in_progress;
+    time_t last_save;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
@@ -5534,8 +5542,100 @@ static bool dsp_incrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)  
 static bool dsp_decrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_incrby(s, r, true); }
 static bool dsp_expireat(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_expireat(s, r, false); }
 static bool dsp_pexpireat(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expireat(s, r, true); }
-static bool dsp_save(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { (void)r; return qihse_resp_simple(s, "OK"); }
-static bool dsp_lastsave(qihse_resp_session_t* s, const qihse_resp_request_t* r) { (void)r; return qihse_resp_integer(s, (int64_t)time(NULL)); }
+/* ---- SAVE / BGSAVE / LASTSAVE — operator-triggered durability ----------
+ * SAVE flushes the memtable into a new SSTable, fsyncs it, the WAL and the
+ * data directory (qihse_kv_sync_store), under the kv_lock write-side so
+ * concurrent writers are excluded for the flush (Redis forks for BGSAVE;
+ * this store has no fork-safe snapshot, so BGSAVE runs the identical flush
+ * on a one-shot worker thread and clients keep serving between saves).
+ * Both are NODE-LOCAL by design: no cluster coordination, each node
+ * persists its own shard when its operator asks.
+ * LASTSAVE replies the unix timestamp of the last COMPLETED save (0 =
+ * never in this process). */
+static bool qihse_resp_run_save(qihse_resp_session_t* session, char* err, size_t err_cap) {
+    if (!session->server->store) {
+        snprintf(err, err_cap, "key-value store is not configured");
+        return false;
+    }
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    bool ok = qihse_kv_sync_store(session->server->store);
+    int saved_errno = errno;
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    if (!ok) {
+        snprintf(err, err_cap, "flush/fsync failed%s%s",
+                 saved_errno ? ": " : "", saved_errno ? strerror(saved_errno) : "");
+        return false;
+    }
+    pthread_mutex_lock(&session->server->save_lock);
+    session->server->last_save = time(NULL);
+    pthread_mutex_unlock(&session->server->save_lock);
+    return true;
+}
+
+static void* qihse_resp_bgsave_worker(void* arg) {
+    qihse_resp_session_t session;   /* stack session: only server/store used */
+    memset(&session, 0, sizeof(session));
+    session.server = (qihse_resp_server_t*)arg;
+    char err[160];
+    qihse_resp_run_save(&session, err, sizeof(err));
+    pthread_mutex_lock(&session.server->save_lock);
+    session.server->bgsave_in_progress = false;
+    pthread_mutex_unlock(&session.server->save_lock);
+    return NULL;
+}
+
+static bool qihse_resp_handle_save(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    char err[160];
+    if (!qihse_resp_run_save(session, err, sizeof(err))) {
+        char msg[224];
+        snprintf(msg, sizeof(msg), "ERR %s", err);
+        return qihse_resp_error(session, msg);
+    }
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_bgsave(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    (void)request;
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    pthread_mutex_lock(&session->server->save_lock);
+    if (session->server->bgsave_in_progress) {
+        pthread_mutex_unlock(&session->server->save_lock);
+        return qihse_resp_simple(session, "Background saving already in progress");
+    }
+    /* Reap the previous one-shot worker before spawning a new one. */
+    if (session->server->bgsave_thread_alive) {
+        pthread_t t = session->server->bgsave_thread;
+        pthread_mutex_unlock(&session->server->save_lock);
+        pthread_join(t, NULL);
+        pthread_mutex_lock(&session->server->save_lock);
+        session->server->bgsave_thread_alive = false;
+    }
+    if (pthread_create(&session->server->bgsave_thread, NULL,
+                       qihse_resp_bgsave_worker, session->server) != 0) {
+        pthread_mutex_unlock(&session->server->save_lock);
+        return qihse_resp_error(session, "ERR could not start background save thread");
+    }
+    session->server->bgsave_thread_alive = true;
+    session->server->bgsave_in_progress = true;
+    pthread_mutex_unlock(&session->server->save_lock);
+    return qihse_resp_simple(session, "Background saving started");
+}
+
+static bool dsp_lastsave(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
+    (void)r;
+    pthread_mutex_lock(&s->server->save_lock);
+    time_t ts = s->server->last_save;
+    pthread_mutex_unlock(&s->server->save_lock);
+    return qihse_resp_integer(s, (int64_t)ts);
+}
+
+/* Placeholder positive acks for the not-yet-implemented surfaces that used
+ * to share the save stub (never perform a save as a side effect). */
+static bool dsp_ok_stub(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
+    (void)r;
+    return qihse_resp_simple(s, "OK");
+}
 static bool dsp_type(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "type");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -5621,10 +5721,11 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"touch", qihse_resp_handle_touch, 0}, {"object", qihse_resp_handle_object, DSP_KEY_1KV},
     {"flushdb", qihse_resp_handle_flushdb, DSP_BUSY_WRITE}, {"flushall", qihse_resp_handle_flushdb, DSP_BUSY_WRITE},
     {"dbsize", qihse_resp_handle_dbsize, 0}, {"time", qihse_resp_handle_time, 0},
-    {"save", dsp_save, 0}, {"bgsave", dsp_save, 0}, {"lastsave", dsp_lastsave, 0},
+    {"save", qihse_resp_handle_save, DSP_BUSY_WRITE}, {"bgsave", qihse_resp_handle_bgsave, 0},
+    {"lastsave", dsp_lastsave, 0},
     {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
-    {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_save, 0},
-    {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_save, 0},
+    {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_ok_stub, 0},
+    {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_ok_stub, 0},
     {"multi", qihse_resp_handle_multi, DSP_MULTI_OK}, {"exec", qihse_resp_handle_exec, DSP_MULTI_OK},
     {"discard", qihse_resp_handle_discard, DSP_MULTI_OK}, {"watch", qihse_resp_handle_watch, DSP_MULTI_OK},
     {"unwatch", qihse_resp_handle_unwatch, DSP_MULTI_OK},
@@ -9866,6 +9967,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
         pthread_mutex_init(&server->fts_meta_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->save_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
         pthread_mutex_init(&server->group_lock, NULL) != 0 ||
         pthread_mutex_init(&server->federation_lock, NULL) != 0) {
@@ -10288,6 +10390,15 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         free(server->fts_keys);
     }
     pthread_mutex_destroy(&server->fts_meta_lock);
+    /* A BGSAVE worker may still hold kv_lock write-side: join it BEFORE the
+     * store and locks are torn down. Workers are one-shot; the join only
+     * waits out the tail of a running save. */
+    pthread_mutex_lock(&server->save_lock);
+    bool join_bgsave = server->bgsave_thread_alive;
+    server->bgsave_thread_alive = false;
+    pthread_mutex_unlock(&server->save_lock);
+    if (join_bgsave) pthread_join(server->bgsave_thread, NULL);
+    pthread_mutex_destroy(&server->save_lock);
     pthread_rwlock_destroy(&server->kv_lock);
     pthread_cond_destroy(&server->clients_drained);
     pthread_mutex_destroy(&server->state_lock);

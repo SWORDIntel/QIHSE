@@ -1622,6 +1622,40 @@ size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
 }
 size_t qihse_kv_count(qihse_kv_store_t* store) { return qihse_kv_count_user(store, NULL); }
 
+/* fsync a directory so renames inside it survive power loss. */
+static bool fsync_dir_path(const char* dir) {
+    if (!dir) return false;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    close(fd);
+    return ok;
+}
+
+bool qihse_kv_sync_store(qihse_kv_store_t* store) {
+    if (!store || !store->trie) return false;
+    /* 1. WAL: stdio buffer to the kernel, then the fd itself. Without the
+     * fsync the WAL lives only in the page cache -- fine against process
+     * death, lost on power loss; SAVE promises both. */
+    if (store->wal_fd) {
+        if (fflush(store->wal_fd) != 0) return false;
+        int wfd = fileno(store->wal_fd);
+        if (wfd >= 0 && fsync(wfd) != 0) return false;
+        store->wal_unflushed_bytes = 0u;
+    }
+    /* 2. Memtable -> new SSTable (atomic rename, file fsynced inside the
+     * atomic commit) + WAL rotation. Every mutation lands in BOTH the WAL
+     * and the memtable, so an empty memtable means the WAL holds nothing
+     * that is not already durable -- skip the flush, keep the fsyncs. */
+    if (store->mem_usage > 0u && !flush_memtable_to_sstable(store)) return false;
+    /* 3. The renames above and in flush/rotate are only as durable as the
+     * directory entry that points at them. */
+    const char* dir = get_qihse_data_dir();
+    if (dir && !fsync_dir_path(dir)) return false;
+    return true;
+}
+
+
 typedef struct { qihse_user_t* user; char** keys; size_t count; size_t cap; uint64_t now; bool ok; } clear_collect_ctx_t;
 static bool clear_collect_cb(const char* key, void* value, size_t value_size, void* user_data) {
     (void)value_size; clear_collect_ctx_t* ctx = (clear_collect_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;

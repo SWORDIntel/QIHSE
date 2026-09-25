@@ -72,6 +72,16 @@ size_t qihse_kv_clear(qihse_kv_store_t* store);
 size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user);
 size_t qihse_kv_count(qihse_kv_store_t* store);
 
+/* Operator-triggered durability (RESP SAVE / BGSAVE):
+ *   1. fsync the WAL (stdio buffer out, then the fd itself),
+ *   2. flush the memtable into a new SSTable (atomic rename, file fsynced)
+ *      and rotate the WAL empty -- skipped when the memtable is empty,
+ *   3. fsync the data directory so the renames survive power loss.
+ * Returns true on full success. NOT internally serialized: the caller must
+ * hold the engine kv_lock write-side across the call (the RESP surface
+ * does), so concurrent readers/writers are excluded for its duration. */
+bool qihse_kv_sync_store(qihse_kv_store_t* store);
+
 /* ── Change sequence and incremental (delta) export ──────────────────────
  *
  * Every authorized mutation (set with classification/SCI, delete, expiry
