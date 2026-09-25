@@ -131,6 +131,23 @@ typedef struct {
     bool peer_claims_valid;
 } qihse_resp_session_t;
 
+/* ── R5 WATCH streams (predesign §13) ───────────────────────────────────────
+ * Per-session key-prefix event watches.  The registry lives on the server;
+ * an entry is one (session, fnmatch prefix) pair.  Sessions never hold a
+ * pointer into the registry — they address their entries by session pointer,
+ * and detach happens in the session teardown path while the session object
+ * is still valid (see qihse_resp_watch_detach). */
+#define QIHSE_WATCH_MAX_PREFIX 256u        /* prefix bytes; longer → ERR (NUL reserved) */
+#define QIHSE_WATCH_MAX_PER_SESSION 64u    /* spec cap: prefixes per session */
+#define QIHSE_WATCH_MAX_SESSIONS 1024u     /* spec cap: watched sessions per server */
+
+typedef struct qihse_watch_entry {
+    qihse_resp_session_t* session;   /* valid while any entry for it exists */
+    char prefix[QIHSE_WATCH_MAX_PREFIX];
+    size_t prefix_len;
+    bool dead;                       /* marked when its session is dropped */
+} qihse_watch_entry_t;
+
 struct qihse_resp_client_ctx {
     qihse_resp_server_t* server;
     int fd;
@@ -249,6 +266,17 @@ struct qihse_resp_server {
      * renders. repl_lock guards the whole list. */
     pthread_mutex_t repl_lock;
     struct qihse_resp_repl_mark* repl_marks;
+    /* R5 WATCH streams: flat (session, prefix) registry.  watch_lock guards
+     * entries, the counts and the drop counter; delivery holds it while it
+     * tries each watcher's io_lock with a non-blocking send, so a slow
+     * consumer costs one failed trylock/EAGAIN — never a blocked writer and
+     * never a wait on kv_lock (delivery runs strictly post-commit). */
+    pthread_mutex_t watch_lock;
+    qihse_watch_entry_t* watch_entries;
+    size_t watch_count;
+    size_t watch_cap;
+    uint64_t watch_drop_total;   /* sessions dropped as slow consumers */
+
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
@@ -1340,6 +1368,293 @@ static void qihse_resp_replicate_del(qihse_resp_server_t* server, const char* ke
     close_socket(fd);
 }
 
+/* ── R5 WATCH streams (predesign §13) ───────────────────────────────────────
+ * Key-prefix watch streams so clients stop polling.
+ *
+ * Commands
+ *   WATCH <prefix> [prefix …]   register this session for fnmatch(prefix, key)
+ *                               events; multiple WATCHes per session allowed.
+ *                               Still also performs the legacy MULTI/EXEC
+ *                               optimistic-lock registration (unchanged).
+ *   UNWATCH [<prefix> …]        with prefixes: remove only those event
+ *                               watches. Without: remove ALL event watches
+ *                               and the legacy transaction watches.
+ *
+ * Wire format — RESP2 push frames, one per (matched prefix, event):
+ *   SET commit → *5\r\n$7\r\nmessage\r\n
+ *                $<plen>\r\n<prefix>\r\n
+ *                $<klen>\r\n<key>\r\n
+ *                $3\r\nset\r\n
+ *                $<vlen>\r\n<value>\r\n
+ *   DEL commit → *4\r\n$7\r\nmessage\r\n
+ *                $<plen>\r\n<prefix>\r\n
+ *                $<klen>\r\n<key>\r\n
+ *                $3\r\ndel\r\n
+ * i.e. array ["message", <prefix>, <key>, "set", <value>] for a set and
+ * ["message", <prefix>, <key>, "del"] for a delete.  A key matching N
+ * registered prefixes of one session is delivered N times (once per
+ * matching prefix), mirroring pub/sub PSUBSCRIBE semantics.
+ *
+ * Semantics and limits (phase 1, deliberately minimal — be honest about them):
+ *   • Events fire only for writes that COMPLETED (post-commit), and delivery
+ *     runs strictly OUTSIDE kv_lock: the writer thread notifies after the
+ *     kv_lock unlock, so watch fan-out can never stall storage traffic.
+ *   • Covered mutations: SET, SETEX/PSETEX, MSET, DEL.  Other mutating
+ *     paths (APPEND/INCR/SETRANGE, hash/list/set/zset writes, FLUSHDB,
+ *     expires reaching their TTL) do NOT emit events in phase 1.
+ *   • At-least-once per registered prefix: an event may be delivered more
+ *     than once per prefix match, never fabricated.  NO cursors: a
+ *     reconnecting client must re-WATCH and re-scan (e.g. KEYS <prefix>);
+ *     resumable cursors are a future layer.
+ *   • Slow consumers are DROPPED, never blocked and never block the writer:
+ *     delivery tries the watcher's io_lock (trylock) and pushes with a
+ *     non-blocking send.  A full socket buffer (EAGAIN, or a partial frame)
+ *     unregisters ALL of that session's watches and logs one line per drop.
+ *     A partial frame may reach the wire before the drop — the connection's
+ *     push stream must be considered desynced; command replies are
+ *     unaffected but the client should reconnect.  A transiently busy
+ *     io_lock (the watcher is mid-reply) skips that event and keeps the
+ *     watch; counted misses are the price of never blocking.
+ *   • A DEL command notifies at most the first 16 deleted keys (the
+ *     existing post-commit deleted-key record shared with replication).
+ *   • Phase 1 has no per-key ACL on delivery: any authenticated session may
+ *     WATCH any prefix and will receive values of matching keys.  Gate
+ *     sensitive namespaces at the network/policy layer until phase 2.
+ *   • Caps: 64 prefixes per session, 1024 watched sessions per server
+ *     (ERR beyond either).
+ * ------------------------------------------------------------------------- */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
+#ifdef MSG_NOSIGNAL
+#define QIHSE_WATCH_SEND_FLAGS (MSG_DONTWAIT | MSG_NOSIGNAL)
+#else
+#define QIHSE_WATCH_SEND_FLAGS MSG_DONTWAIT
+#endif
+
+typedef enum {
+    QIHSE_WATCH_REG_OK = 0,
+    QIHSE_WATCH_REG_OOM,
+    QIHSE_WATCH_REG_SESSION_LIMIT,   /* > 64 prefixes on this session */
+    QIHSE_WATCH_REG_SERVER_LIMIT     /* 1024 watched sessions on this server */
+} qihse_watch_reg_rc_t;
+
+/* Capacity dry-run for `count` prefixes about to be registered (idempotent
+ * duplicates — already registered here or repeated inside the command — do
+ * not consume capacity).  Called before ANY registration so WATCH is
+ * all-or-nothing across its arguments. */
+static qihse_watch_reg_rc_t qihse_resp_watch_probe(qihse_resp_session_t* session,
+                                                   const qihse_resp_arg_t* args, size_t count) {
+    qihse_resp_server_t* server = session->server;
+    pthread_mutex_lock(&server->watch_lock);
+    size_t mine = 0;
+    for (size_t i = 0; i < server->watch_count; i++)
+        if (server->watch_entries[i].session == session) mine++;
+    size_t to_add = 0;
+    for (size_t a = 0; a < count; a++) {
+        bool dup = false;
+        for (size_t i = 0; i < server->watch_count && !dup; i++) {
+            qihse_watch_entry_t* e = &server->watch_entries[i];
+            if (e->session == session && e->prefix_len == args[a].len &&
+                memcmp(e->prefix, args[a].data, e->prefix_len) == 0) dup = true;
+        }
+        for (size_t b = 0; b < a && !dup; b++)
+            if (args[b].len == args[a].len && memcmp(args[b].data, args[a].data, args[a].len) == 0) dup = true;
+        if (!dup) to_add++;
+    }
+    if (mine + to_add > QIHSE_WATCH_MAX_PER_SESSION) {
+        pthread_mutex_unlock(&server->watch_lock);
+        return QIHSE_WATCH_REG_SESSION_LIMIT;
+    }
+    if (mine == 0 && to_add > 0) {
+        /* First watch for this session: enforce the server-wide cap on
+         * distinct watched sessions. */
+        size_t distinct = 0;
+        qihse_resp_session_t** seen = malloc((server->watch_count ? server->watch_count : 1u) * sizeof(*seen));
+        if (!seen) {
+            pthread_mutex_unlock(&server->watch_lock);
+            return QIHSE_WATCH_REG_OOM;
+        }
+        for (size_t i = 0; i < server->watch_count; i++) {
+            qihse_resp_session_t* s = server->watch_entries[i].session;
+            bool known = false;
+            for (size_t k = 0; k < distinct && !known; k++) known = seen[k] == s;
+            if (!known) seen[distinct++] = s;
+        }
+        free(seen);
+        if (distinct + 1u > QIHSE_WATCH_MAX_SESSIONS) {
+            pthread_mutex_unlock(&server->watch_lock);
+            return QIHSE_WATCH_REG_SERVER_LIMIT;
+        }
+    }
+    pthread_mutex_unlock(&server->watch_lock);
+    return QIHSE_WATCH_REG_OK;
+}
+
+/* Register one (session, prefix).  Probe must have passed; idempotent. */
+static bool qihse_resp_watch_add(qihse_resp_session_t* session, const uint8_t* prefix, size_t len) {
+    qihse_resp_server_t* server = session->server;
+    pthread_mutex_lock(&server->watch_lock);
+    for (size_t i = 0; i < server->watch_count; i++) {
+        qihse_watch_entry_t* e = &server->watch_entries[i];
+        if (e->session == session && e->prefix_len == len && memcmp(e->prefix, prefix, len) == 0) {
+            pthread_mutex_unlock(&server->watch_lock);
+            return true;
+        }
+    }
+    if (server->watch_count == server->watch_cap) {
+        size_t next = server->watch_cap ? server->watch_cap * 2u : 8u;
+        qihse_watch_entry_t* grown = realloc(server->watch_entries, next * sizeof(*grown));
+        if (!grown) {
+            pthread_mutex_unlock(&server->watch_lock);
+            return false;
+        }
+        server->watch_entries = grown;
+        server->watch_cap = next;
+    }
+    qihse_watch_entry_t* e = &server->watch_entries[server->watch_count++];
+    e->session = session;
+    memcpy(e->prefix, prefix, len);
+    e->prefix[len] = '\0';
+    e->prefix_len = len;
+    e->dead = false;
+    pthread_mutex_unlock(&server->watch_lock);
+    return true;
+}
+
+/* Remove all of `session`'s entries (compaction under the lock). */
+static void qihse_resp_watch_drop_session_entries(qihse_resp_server_t* server,
+                                                  qihse_resp_session_t* session) {
+    size_t w = 0;
+    for (size_t i = 0; i < server->watch_count; i++)
+        if (server->watch_entries[i].session != session)
+            server->watch_entries[w++] = server->watch_entries[i];
+    server->watch_count = w;
+}
+
+static void qihse_resp_watch_detach(qihse_resp_session_t* session) {
+    qihse_resp_server_t* server = session->server;
+    if (!server || !server->watch_entries) return;
+    pthread_mutex_lock(&server->watch_lock);
+    qihse_resp_watch_drop_session_entries(server, session);
+    pthread_mutex_unlock(&server->watch_lock);
+}
+
+static void qihse_resp_watch_remove_prefix(qihse_resp_session_t* session, const uint8_t* prefix, size_t len) {
+    qihse_resp_server_t* server = session->server;
+    if (!server || !server->watch_entries) return;
+    pthread_mutex_lock(&server->watch_lock);
+    size_t w = 0;
+    for (size_t i = 0; i < server->watch_count; i++) {
+        qihse_watch_entry_t* e = &server->watch_entries[i];
+        if (e->session == session && e->prefix_len == len && memcmp(e->prefix, prefix, len) == 0) continue;
+        server->watch_entries[w++] = *e;
+    }
+    server->watch_count = w;
+    pthread_mutex_unlock(&server->watch_lock);
+}
+
+/* Push one frame to one watcher.  Returns false ONLY when the socket is
+ * full/dead (the caller drops that session's watches); a busy io_lock or an
+ * allocation failure skips the event but keeps the watch. */
+static bool qihse_resp_watch_deliver(qihse_resp_session_t* session, const char* prefix, size_t prefix_len,
+                                     const char* key, bool is_del, const char* value) {
+    if (session->io_buf) return true; /* stateless buffered mode: nothing to stream to */
+    size_t key_len = strlen(key);
+    size_t value_len = is_del ? 0u : strlen(value);
+    size_t frame_cap = 96u + prefix_len + key_len + value_len;
+    uint8_t* frame = malloc(frame_cap);
+    if (!frame) return true; /* OOM: skip this event, keep the watch */
+    size_t len = 0;
+    char head[48];
+    int n = snprintf(head, sizeof(head), is_del ? "*4\r\n$7\r\nmessage\r\n$%zu\r\n" : "*5\r\n$7\r\nmessage\r\n$%zu\r\n",
+                     prefix_len);
+    if (n <= 0 || (size_t)n >= sizeof(head) || (size_t)n + prefix_len + key_len + value_len + 96u > frame_cap) {
+        free(frame);
+        return true;
+    }
+    memcpy(frame + len, head, (size_t)n);
+    len += (size_t)n;
+    memcpy(frame + len, prefix, prefix_len);
+    len += prefix_len;
+    n = snprintf(head, sizeof(head), "\r\n$%zu\r\n", key_len);
+    if (n <= 0 || (size_t)n >= sizeof(head)) {
+        free(frame);
+        return true;
+    }
+    memcpy(frame + len, head, (size_t)n);
+    len += (size_t)n;
+    memcpy(frame + len, key, key_len);
+    len += key_len;
+    memcpy(frame + len, "\r\n$3\r\n", 6u);
+    len += 6u;
+    memcpy(frame + len, is_del ? "del" : "set", 3u);
+    len += 3u;
+    if (!is_del) {
+        n = snprintf(head, sizeof(head), "\r\n$%zu\r\n", value_len);
+        if (n <= 0 || (size_t)n >= sizeof(head)) {
+            free(frame);
+            return true;
+        }
+        memcpy(frame + len, head, (size_t)n);
+        len += (size_t)n;
+        memcpy(frame + len, value, value_len);
+        len += value_len;
+    }
+    memcpy(frame + len, "\r\n", 2u);
+    len += 2u;
+
+    if (pthread_mutex_trylock(&session->io_lock) != 0) {
+        free(frame);
+        return true; /* watcher mid-reply: transient, skip event, keep watch */
+    }
+    bool drop = false;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(session->fd, frame + sent, len - sent, QIHSE_WATCH_SEND_FLAGS);
+        if (w > 0) {
+            sent += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        drop = true; /* EAGAIN: buffer full; EPIPE/ECONNRESET: peer gone */
+        break;
+    }
+    pthread_mutex_unlock(&session->io_lock);
+    free(frame);
+    return !drop;
+}
+
+/* Post-commit fan-out: called by writer threads AFTER the kv_lock unlock.
+ * value == NULL means the key was deleted.  Never blocks the writer on a
+ * slow consumer: see the block comment above. */
+static void qihse_resp_watch_notify(qihse_resp_server_t* server, const char* key, const char* value) {
+    if (!server || !key || !server->watch_entries) return;
+    bool is_del = value == NULL;
+    pthread_mutex_lock(&server->watch_lock);
+    if (server->watch_count == 0) {
+        pthread_mutex_unlock(&server->watch_lock);
+        return;
+    }
+    for (size_t i = 0; i < server->watch_count; i++) {
+        qihse_watch_entry_t* e = &server->watch_entries[i];
+        if (e->dead || fnmatch(e->prefix, key, 0) != 0) continue;
+        if (!qihse_resp_watch_deliver(e->session, e->prefix, e->prefix_len, key, is_del, value)) {
+            /* Slow consumer: unregister everything it watches, log once. */
+            for (size_t k = 0; k < server->watch_count; k++)
+                if (server->watch_entries[k].session == e->session) server->watch_entries[k].dead = true;
+            server->watch_drop_total++;
+            fprintf(stderr, "qihse watch: session %llu dropped (slow consumer — socket buffer full)\n",
+                    (unsigned long long)e->session->id);
+        }
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < server->watch_count; i++)
+        if (!server->watch_entries[i].dead) server->watch_entries[w++] = server->watch_entries[i];
+    server->watch_count = w;
+    pthread_mutex_unlock(&server->watch_lock);
+}
+
 static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 3) return qihse_resp_wrong_arity(session, "set");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -1386,6 +1701,8 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
     pthread_rwlock_unlock(&session->server->kv_lock);
     if (stored && condition) {
         qihse_resp_maybe_publish_killswitch(session, key, value);
+        /* R5 §13: post-commit watch fan-out (outside kv_lock). */
+        qihse_resp_watch_notify(session->server, key, value);
         if (session->server->redundancy_peer)
             qihse_resp_replicate_write(session->server, key, value, has_ttl ? (int64_t)ttl_ms : 0);
         /* AI fabric artifacts (ai_fabric.md build item 2): classify + index
@@ -1426,6 +1743,8 @@ static bool qihse_resp_handle_setex(qihse_resp_session_t* session, const qihse_r
     bool stored = qihse_kv_set_user(session->server->store, key, value, 0, 0, session->user) &&
                   qihse_kv_expire(session->server->store, key, ttl, session->user);
     pthread_rwlock_unlock(&session->server->kv_lock);
+    /* R5 §13: post-commit watch fan-out (outside kv_lock, before the frees). */
+    if (stored) qihse_resp_watch_notify(session->server, key, value);
     free(key);
     free(value);
     return stored ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR set failed");
@@ -1460,9 +1779,14 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
         if (key != keybuf) free(key);
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
-    if (remove && session->server->redundancy_peer) {
+    if (remove) {
+        /* R5 §13: post-commit watch fan-out (outside kv_lock). */
         for (size_t i = 0; i < deleted_count; i++)
-            qihse_resp_replicate_del(session->server, deleted_keys[i]);
+            qihse_resp_watch_notify(session->server, deleted_keys[i], NULL);
+        if (session->server->redundancy_peer) {
+            for (size_t i = 0; i < deleted_count; i++)
+                qihse_resp_replicate_del(session->server, deleted_keys[i]);
+        }
     }
     return qihse_resp_integer(session, count);
 }
@@ -1501,6 +1825,7 @@ static bool qihse_resp_handle_mset(qihse_resp_session_t* session, const qihse_re
         if (!text[i]) valid = false;
     }
     bool stored = valid;
+    size_t committed = 0;
     if (valid) {
         pthread_rwlock_wrlock(&session->server->kv_lock);
         for (size_t i = 0; i < text_count; i += 2u) {
@@ -1508,8 +1833,12 @@ static bool qihse_resp_handle_mset(qihse_resp_session_t* session, const qihse_re
                 stored = false;
                 break;
             }
+            committed = i + 2u;
         }
         pthread_rwlock_unlock(&session->server->kv_lock);
+        /* R5 §13: post-commit watch fan-out (outside kv_lock). */
+        for (size_t i = 0; i < committed; i += 2u)
+            qihse_resp_watch_notify(session->server, text[i], text[i + 1u]);
     }
     for (size_t i = 0; i < text_count; i++) free(text[i]);
     free(text);
@@ -4495,9 +4824,23 @@ static bool qihse_resp_handle_discard(qihse_resp_session_t* session, const qihse
     return qihse_resp_simple(session, "OK");
 }
 
+/* R5 §13: WATCH <prefix>… ALSO registers the session for key-prefix event
+ * streams (push frames on matching commits — wire format and caps documented
+ * at qihse_resp_watch_notify).  The legacy MULTI/EXEC optimistic-lock
+ * registration below is unchanged. */
 static bool qihse_resp_handle_watch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "watch");
     if (session->in_multi) return qihse_resp_error(session, "ERR WATCH inside MULTI is not allowed");
+    /* Validate everything BEFORE registering anything: WATCH is
+     * all-or-nothing across its arguments. */
+    for (size_t i = 1; i < request->argc; i++) {
+        if (request->argv[i].len >= QIHSE_WATCH_MAX_PREFIX)
+            return qihse_resp_error(session, "ERR watch prefix too long (max 255 bytes)");
+    }
+    qihse_watch_reg_rc_t rc = qihse_resp_watch_probe(session, &request->argv[1], request->argc - 1u);
+    if (rc == QIHSE_WATCH_REG_SESSION_LIMIT) return qihse_resp_error(session, "ERR too many WATCH prefixes for this session (max 64)");
+    if (rc == QIHSE_WATCH_REG_SERVER_LIMIT) return qihse_resp_error(session, "ERR too many watched sessions on this server (max 1024)");
+    if (rc == QIHSE_WATCH_REG_OOM) return qihse_resp_error(session, "OOM out of memory");
     for (size_t i = 1; i < request->argc; i++) {
         if (session->watch_count >= session->watch_cap) {
             session->watch_cap = session->watch_cap ? session->watch_cap * 2 : 8;
@@ -4507,12 +4850,22 @@ static bool qihse_resp_handle_watch(qihse_resp_session_t* session, const qihse_r
         session->watch_keys[session->watch_count] = qihse_resp_arg_text(&request->argv[i]);
         session->watch_key_lens[session->watch_count] = request->argv[i].len;
         session->watch_count++;
+        if (!qihse_resp_watch_add(session, request->argv[i].data, request->argv[i].len))
+            return qihse_resp_error(session, "OOM out of memory");
     }
     return qihse_resp_simple(session, "OK");
 }
 
+/* R5 §13: UNWATCH with prefixes removes only those stream watches (the
+ * MULTI/EXEC registration is untouched); with no argument it removes ALL
+ * stream watches and the legacy transaction watches. */
 static bool qihse_resp_handle_unwatch(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
-    (void)request;
+    if (request->argc >= 2) {
+        for (size_t i = 1; i < request->argc; i++)
+            qihse_resp_watch_remove_prefix(session, request->argv[i].data, request->argv[i].len);
+        return qihse_resp_simple(session, "OK");
+    }
+    qihse_resp_watch_detach(session);
     for (size_t i = 0; i < session->watch_count; i++) free(session->watch_keys[i]);
     free(session->watch_keys);
     free(session->watch_key_lens);
@@ -10188,6 +10541,8 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         used += (size_t)received;
     }
     qihse_resp_session_pubsub_cleanup(&session);
+    /* R5 §13: unregister any stream watches while the session is still valid. */
+    qihse_resp_watch_detach(&session);
     pthread_mutex_destroy(&session.io_lock);
     free(session.io_buf);
     free(buffer);
@@ -10467,6 +10822,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         pthread_mutex_init(&server->fts_meta_lock, NULL) != 0 ||
         pthread_mutex_init(&server->save_lock, NULL) != 0 ||
         pthread_mutex_init(&server->repl_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->watch_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
         pthread_mutex_init(&server->group_lock, NULL) != 0 ||
         pthread_mutex_init(&server->federation_lock, NULL) != 0) {
@@ -10906,6 +11262,11 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         }
         server->repl_marks = NULL;
     }
+    /* R5 §13: watches die with their sessions; the detach in the session
+     * teardown guarantees the registry is empty by the time clients drain. */
+    free(server->watch_entries);
+    server->watch_entries = NULL;
+    pthread_mutex_destroy(&server->watch_lock);
     pthread_mutex_destroy(&server->repl_lock);
     pthread_mutex_lock(&server->save_lock);
     bool join_bgsave = server->bgsave_thread_alive;
