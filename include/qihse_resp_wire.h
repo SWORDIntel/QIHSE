@@ -58,6 +58,12 @@ typedef struct {
      * [HMAC-SHA384-keystream-XORed frame] — transport obfuscation only; bus
      * auth is separate. NULL/empty = plain frames. */
     const char* veil_key;
+    /* R4 replicated namespaces: keys matching one of these globs are
+     * SOVEREIGN-LOCAL (never MOVED/CLUSTERDOWN-routed) and are expected to
+     * exist on every node. Boot-time source of truth; REPL.MARK adds more
+     * at runtime (in-memory only, lost on restart). */
+    const char* const* replicate_globs;
+    size_t replicate_glob_count;
     uint64_t guard_window_ms;        /* 0 = default 1000ms */
     double guard_saturation_fraction; /* 0 = default 0.8 */
     /* Phase 4: scatter-gather engine */
@@ -136,6 +142,28 @@ uint16_t qihse_resp_server_port(const qihse_resp_server_t* server);
 qihse_cluster_topology_t* qihse_resp_server_topology(qihse_resp_server_t* server);
 qihse_kv_store_t* qihse_resp_server_store(qihse_resp_server_t* server);
 bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_fd);
+
+/* ── R4 replicated namespaces (REPL.*) — internal API for the daemon ─────
+ * The registry lives in the engine so routing and REPL.STATUS share one
+ * source of truth; the daemon's anti-entropy thread drives it. */
+/* Add/remove a namespace glob. from_flag distinguishes boot-time
+ * (--replicate, re-added on every restart) from runtime (REPL.MARK,
+ * lost on restart). Fails on bad input or a full registry. */
+bool qihse_resp_server_repl_add(qihse_resp_server_t* server, const char* glob, bool from_flag);
+bool qihse_resp_server_repl_remove(qihse_resp_server_t* server, const char* glob);
+/* Snapshot the current globs (out arrays are caller-provided, capped);
+ * returns how many were written. from_flag_out[i] receives the source. */
+size_t qihse_resp_server_repl_list(qihse_resp_server_t* server,
+                                   char (*out_globs)[128], bool* from_flag_out, size_t cap);
+/* Sovereign-routing predicate: does this key match any marked namespace? */
+bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char* key, size_t key_len);
+/* Anti-entropy bookkeeping for REPL.STATUS. peer == NULL updates the
+ * pattern-level counters (local_count/orphaned); otherwise the per-peer
+ * record (pulled/divergent/ok/last_sync). UINT64_MAX leaves a counter
+ * untouched. Best effort: unknown globs or a full peer table are no-ops. */
+void qihse_resp_server_repl_note(qihse_resp_server_t* server, const char* glob, const char* peer,
+                                 uint64_t pulled, uint64_t divergent,
+                                 uint64_t local_count, uint64_t orphaned, bool ok);
 qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
 
 /* The dispatch listener's actual port, or 0 when dispatch is not running

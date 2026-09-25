@@ -26,13 +26,16 @@
 #include "qihse_kv_store.h"
 #include "qihse_fts.h"
 #include "qihse_platform.h"
+#include <netdb.h>
 #include <pthread.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define MAX_PEERS 64u
@@ -135,8 +138,369 @@ static void usage(const char* argv0) {
         "\n  --brain observes and journals always; --brain-act additionally re-homes\n"
         "  a failed owner's range to a healthy target (evidence-gated) and rolls\n"
         "  it back if the move did not complete or the target failed within\n"
-        "  --brain-rollback-window seconds.\n",
+        "  --brain-rollback-window seconds.\n"
+        "\n  --replicate GLOB marks a sovereign-local namespace: keys matching\n"
+        "  GLOB are served from this node's own store (never MOVED or\n"
+        "  CLUSTERDOWN-gated) and the anti-entropy thread pulls keys peers hold\n"
+        "  and this node lacks, every --replicate-interval seconds (default 60,\n"
+        "  0 disables). Divergent/orphaned keys are reported via REPL.STATUS,\n"
+        "  never auto-resolved; deletes are not propagated in phase 1.\n"
+        "  REPL.MARK/REPL.UNMARK manage globs at runtime (in-memory).\n",
         argv0);
+}
+
+/* ── R4 anti-entropy for replicated namespaces ──────────────────────────────
+ * Every --replicate-interval seconds, per marked glob and per static peer:
+ * dial the peer's RESP port, AUTH with the operator password, KEYS the glob,
+ * and pull keys the peer has and we lack (GET + local SET; legal because
+ * marked keys are sovereign-local). Divergent keys (both sides, different
+ * bytes) and orphans (local, missing on EVERY peer) are counted for
+ * REPL.STATUS and never auto-resolved; deletes are not propagated in
+ * phase 1. Bound: at most REPL_AE_MAX_KEYS key transfers per tick overall,
+ * so a large backfill amortizes across ticks. One summary log line/tick.
+ *
+ * The client below is deliberately minimal (AUTH/KEYS/GET/SET with simple,
+ * bulk and array replies) and dials by host:port — loopback for self reads,
+ * the peer's RESP endpoint otherwise. */
+#define REPL_AE_MAX_KEYS 10000u
+#define REPL_AE_GLOBS_MAX 64u
+#define REPL_AE_KEYLEN_MAX 512u
+
+typedef struct {
+    int fd;
+    char err[256];
+    char last[128]; /* most recent simple (+/-) reply line */
+    /* Small read buffer: one syscall per 4KB instead of one per byte —
+     * byte-at-a-time reads made a full tick over a 1.5k-key namespace take
+     * minutes instead of seconds. */
+    unsigned char buf[4096];
+    size_t buf_len;
+    size_t buf_pos;
+} mini_resp_t;
+
+static bool mini_resp_command(mini_resp_t* c, size_t argc, const char* const* argv);
+
+static int mini_resp_connect(mini_resp_t* c, const char* host, uint16_t port, const char* password) {
+    memset(c, 0, sizeof(*c));
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd); freeaddrinfo(res); return -1;
+    }
+    freeaddrinfo(res);
+    c->fd = fd;
+    if (password && *password) {
+        const char* argv[2] = {"AUTH", password};
+        if (!mini_resp_command(c, 2, argv)) {
+            close(fd);
+            c->fd = -1;
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void mini_resp_close(mini_resp_t* c) {
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+}
+
+static bool mini_resp_send(mini_resp_t* c, size_t argc, const char* const* argv) {
+    char head[64];
+    int len = snprintf(head, sizeof(head), "*%zu\r\n", argc);
+    if (len <= 0 || (size_t)len >= sizeof(head) || write(c->fd, head, (size_t)len) != len) return false;
+    for (size_t i = 0; i < argc; i++) {
+        size_t alen = strlen(argv[i]);
+        len = snprintf(head, sizeof(head), "$%zu\r\n", alen);
+        if (len <= 0 || (size_t)len >= sizeof(head) || write(c->fd, head, (size_t)len) != len) return false;
+        size_t done = 0;
+        while (done < alen) {
+            ssize_t w = write(c->fd, argv[i] + done, alen - done);
+            if (w <= 0) return false;
+            done += (size_t)w;
+        }
+        if (write(c->fd, "\r\n", 2u) != 2) return false;
+    }
+    return true;
+}
+
+static int mini_resp_read_line(mini_resp_t* c, char* buf, size_t cap) {
+    size_t used = 0;
+    while (used + 1u < cap) {
+        if (c->buf_pos >= c->buf_len) {
+            ssize_t r = read(c->fd, c->buf, sizeof(c->buf));
+            if (r <= 0) return -1;
+            c->buf_len = (size_t)r;
+            c->buf_pos = 0;
+        }
+        char ch = (char)c->buf[c->buf_pos++];
+        if (ch == '\n') {
+            if (used > 0 && buf[used - 1u] == '\r') used--;
+            buf[used] = '\0';
+            return (int)used;
+        }
+        buf[used++] = ch;
+    }
+    return -1;
+}
+
+/* Buffered bulk read into caller memory (used for value payloads). */
+static bool mini_resp_read_exact(mini_resp_t* c, char* out, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        if (c->buf_pos < c->buf_len) {
+            size_t take = c->buf_len - c->buf_pos;
+            if (take > len - got) take = len - got;
+            memcpy(out + got, c->buf + c->buf_pos, take);
+            c->buf_pos += take;
+            got += take;
+            continue;
+        }
+        ssize_t r = read(c->fd, out + got, len - got);
+        if (r <= 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+/* Execute a command. Replies:
+ *   MINI_REP_SIMPLE: +line (buf holds payload) or -line (buf holds error)
+ *   MINI_REP_BULK:   out_value = malloc'd string (NULL for nil)
+ *   MINI_REP_ARRAY:  out_items/out_count = malloc'd array of malloc'd strings
+ *   MINI_REP_ERROR:  transport/protocol failure (c->err set) */
+#define MINI_REP_SIMPLE 1
+#define MINI_REP_BULK   2
+#define MINI_REP_ARRAY  3
+#define MINI_REP_ERROR  4
+
+static void mini_resp_free_array(char** items, size_t count) {
+    if (!items) return;
+    for (size_t i = 0; i < count; i++) free(items[i]);
+    free(items);
+}
+
+static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
+                        char** out_value, char*** out_items, size_t* out_count) {
+    if (out_value) *out_value = NULL;
+    if (out_items) *out_items = NULL;
+    if (out_count) *out_count = 0;
+    if (!mini_resp_send(c, argc, argv)) {
+        snprintf(c->err, sizeof(c->err), "send failed");
+        return MINI_REP_ERROR;
+    }
+    char line[128];
+    if (mini_resp_read_line(c, line, sizeof(line)) < 0) {
+        snprintf(c->err, sizeof(c->err), "read failed");
+        return MINI_REP_ERROR;
+    }
+    if (line[0] == '+' || line[0] == '-') {
+        snprintf(c->last, sizeof(c->last), "%s", line);
+        return MINI_REP_SIMPLE;
+    }
+    if (line[0] == '$') {
+        if (!out_value) return MINI_REP_BULK;
+        long long len = strtoll(line + 1, NULL, 10);
+        if (len < 0) return MINI_REP_BULK; /* nil */
+        if (len > (16 << 20)) { snprintf(c->err, sizeof(c->err), "reply too large"); return MINI_REP_ERROR; }
+        char* v = malloc((size_t)len + 1u);
+        if (!v) { snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
+        if (!mini_resp_read_exact(c, v, (size_t)len)) {
+            free(v); snprintf(c->err, sizeof(c->err), "truncated"); return MINI_REP_ERROR;
+        }
+        char tail[2];
+        if (!mini_resp_read_exact(c, tail, 2u) || tail[0] != '\r' || tail[1] != '\n') {
+            free(v); snprintf(c->err, sizeof(c->err), "truncated"); return MINI_REP_ERROR;
+        }
+        v[len] = '\0';
+        *out_value = v;
+        return MINI_REP_BULK;
+    }
+    if (line[0] == '*' && out_items && out_count) {
+        long long count = strtoll(line + 1, NULL, 10);
+        if (count < 0 || count > 100000) { snprintf(c->err, sizeof(c->err), "bad array"); return MINI_REP_ERROR; }
+        char** items = calloc(count ? (size_t)count : 1u, sizeof(char*));
+        if (!items) { snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
+        for (long long i = 0; i < count; i++) {
+            char sub[64];
+            if (mini_resp_read_line(c, sub, sizeof(sub)) < 0 || sub[0] != '$') {
+                mini_resp_free_array(items, (size_t)i);
+                snprintf(c->err, sizeof(c->err), "bad array item");
+                return MINI_REP_ERROR;
+            }
+            long long len = strtoll(sub + 1, NULL, 10);
+            if (len < 0 || len > REPL_AE_KEYLEN_MAX) {
+                mini_resp_free_array(items, (size_t)i);
+                snprintf(c->err, sizeof(c->err), "bad item length");
+                return MINI_REP_ERROR;
+            }
+            items[i] = malloc((size_t)len + 1u);
+            if (!items[i]) { mini_resp_free_array(items, (size_t)i); snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
+            if (!mini_resp_read_exact(c, items[i], (size_t)len)) {
+                free(items[i]); mini_resp_free_array(items, (size_t)i);
+                snprintf(c->err, sizeof(c->err), "truncated"); return MINI_REP_ERROR;
+            }
+            items[i][len] = '\0';
+            char tail[2];
+            if (!mini_resp_read_exact(c, tail, 2u)) {
+                free(items[i]); mini_resp_free_array(items, (size_t)i);
+                snprintf(c->err, sizeof(c->err), "truncated"); return MINI_REP_ERROR;
+            }
+        }
+        *out_items = items;
+        *out_count = (size_t)count;
+        return MINI_REP_ARRAY;
+    }
+    snprintf(c->err, sizeof(c->err), "unexpected reply");
+    return MINI_REP_ERROR;
+}
+
+/* Fire-and-verify form for AUTH/SET: true on +OK. */
+static bool mini_resp_command(mini_resp_t* c, size_t argc, const char* const* argv) {
+    return mini_resp_do(c, argc, argv, NULL, NULL, NULL) == MINI_REP_SIMPLE && c->last[0] == '+';
+}
+
+typedef struct {
+    qihse_resp_server_t* server;
+    const peer_spec_t* peers;
+    size_t peer_count;
+    unsigned int self_index;
+    const char* password;      /* operator password (borrowed) */
+    const char* self_host;     /* bind address for loopback */
+    uint16_t self_port;
+    uint32_t interval_seconds;
+    volatile sig_atomic_t* stop;
+} ae_ctx_t;
+
+/* str-list helpers */
+static bool str_in_list(char** items, size_t count, const char* key) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(items[i], key) == 0) return true;
+    }
+    return false;
+}
+
+static void* ae_main(void* argument) {
+    ae_ctx_t* ae = (ae_ctx_t*)argument;
+    while (!*ae->stop) {
+        for (uint32_t slept = 0; slept < ae->interval_seconds && !*ae->stop; slept++) {
+            struct timespec ts = {1, 0};
+            nanosleep(&ts, NULL);
+        }
+        if (*ae->stop) break;
+
+        char globs[REPL_AE_GLOBS_MAX][128];
+        bool from_flag[REPL_AE_GLOBS_MAX];
+        size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, from_flag, REPL_AE_GLOBS_MAX);
+        if (glob_count == 0) continue;
+
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long tick_pulled = 0;
+
+        /* Loopback connection for local KEYS/GET/SET. */
+        mini_resp_t self;
+        bool self_ok = mini_resp_connect(&self, ae->self_host, ae->self_port, ae->password) >= 0;
+        if (!self_ok) fprintf(stderr, "qihse-cluster-daemon: repl AE: loopback connect failed\n");
+
+        for (size_t g = 0; g < glob_count && !*ae->stop; g++) {
+            size_t local_count = 0;
+            char** local_list = NULL;
+            if (self_ok) {
+                const char* keys_argv[2] = {"KEYS", globs[g]};
+                if (mini_resp_do(&self, 2, keys_argv, NULL, &local_list, &local_count) != MINI_REP_ARRAY) {
+                    mini_resp_free_array(local_list, local_count);
+                    local_list = NULL;
+                    local_count = 0;
+                }
+            }
+
+            /* Union of peer keysets for orphan detection. */
+            char* seen_anywhere[REPL_AE_MAX_KEYS];
+            size_t seen_count = 0;
+            unsigned long long divergent_total = 0;
+
+            for (size_t p = 0; p < ae->peer_count && !*ae->stop; p++) {
+                if (ae->peers[p].index == ae->self_index) continue;
+                char peer_addr[96];
+                snprintf(peer_addr, sizeof(peer_addr), "%s:%u", ae->peers[p].host, ae->peers[p].port);
+                mini_resp_t peer;
+                if (mini_resp_connect(&peer, ae->peers[p].host, ae->peers[p].port, ae->password) < 0) {
+                    qihse_resp_server_repl_note(ae->server, globs[g], peer_addr, 0, 0, UINT64_MAX, UINT64_MAX, false);
+                    continue;
+                }
+                char** peer_list = NULL;
+                size_t peer_n = 0;
+                const char* keys_argv[2] = {"KEYS", globs[g]};
+                unsigned long long pulled = 0, divergent = 0;
+                if (mini_resp_do(&peer, 2, keys_argv, NULL, &peer_list, &peer_n) == MINI_REP_ARRAY) {
+                    for (size_t i = 0; i < peer_n; i++) {
+                        if (seen_count < REPL_AE_MAX_KEYS) {
+                            char* dup = strdup(peer_list[i]);
+                            if (dup) seen_anywhere[seen_count++] = dup;
+                        }
+                        if (tick_pulled >= REPL_AE_MAX_KEYS) continue;
+                        bool have_local = local_list && str_in_list(local_list, local_count, peer_list[i]);
+                        const char* get_argv[2] = {"GET", peer_list[i]};
+                        char* peer_value = NULL;
+                        if (mini_resp_do(&peer, 2, get_argv, &peer_value, NULL, NULL) != MINI_REP_BULK || !peer_value) {
+                            free(peer_value);
+                            continue; /* vanished mid-tick */
+                        }
+                        if (!have_local && self_ok) {
+                            const char* set_argv[3] = {"SET", peer_list[i], peer_value};
+                            if (mini_resp_command(&self, 3, set_argv)) {
+                                pulled++;
+                                tick_pulled++;
+                            }
+                        } else if (have_local && self_ok) {
+                            const char* lget_argv[2] = {"GET", peer_list[i]};
+                            char* local_value = NULL;
+                            if (mini_resp_do(&self, 2, lget_argv, &local_value, NULL, NULL) == MINI_REP_BULK &&
+                                local_value && strcmp(local_value, peer_value) != 0) {
+                                divergent++; /* report-only in phase 1 */
+                            }
+                            free(local_value);
+                        }
+                        free(peer_value);
+                    }
+                }
+                mini_resp_free_array(peer_list, peer_n);
+                mini_resp_close(&peer);
+                qihse_resp_server_repl_note(ae->server, globs[g], peer_addr, pulled, divergent, UINT64_MAX, UINT64_MAX, true);
+                divergent_total += divergent;
+            }
+
+            /* Orphans: local keys no peer listed. Report-only. */
+            unsigned long long orphaned = 0;
+            if (local_list) {
+                for (size_t i = 0; i < local_count; i++) {
+                    if (!str_in_list(seen_anywhere, seen_count, local_list[i])) orphaned++;
+                }
+            }
+            qihse_resp_server_repl_note(ae->server, globs[g], NULL, UINT64_MAX, UINT64_MAX,
+                                        (uint64_t)local_count, orphaned, true);
+            for (size_t i = 0; i < seen_count; i++) free(seen_anywhere[i]);
+            mini_resp_free_array(local_list, local_count);
+            if (tick_pulled >= REPL_AE_MAX_KEYS) break;
+        }
+        if (self_ok) mini_resp_close(&self);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(stderr, "qihse-cluster-daemon: repl AE tick: %zu pattern(s), pulled %llu key(s) (%.0fms)\n",
+                glob_count, tick_pulled, ms);
+    }
+    return NULL;
 }
 
 typedef struct {
@@ -220,6 +584,10 @@ int main(int argc, char** argv) {
     uint32_t brain_rollback_window = 60;  /* R4 evaluation window (seconds) */
     uint32_t brain_prune_timeout = 0;     /* stale-node prune (0 = disabled) */
     uint32_t brain_rebalance_min = 0;     /* rebalance-on-join threshold (0 = disabled) */
+    char repl_globs[16][128];
+    const char* repl_glob_ptrs[16];
+    size_t repl_glob_count = 0;
+    uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -294,6 +662,17 @@ int main(int argc, char** argv) {
             unsigned long v = strtoul(argv[++i], &end, 10);
             if (errno != 0 || !end || *end || v > QIHSE_CLUSTER_SLOT_COUNT) return usage(argv[0]), 2;
             brain_rebalance_min = (uint32_t)v;
+        } else if (strcmp(a, "--replicate") == 0 && i + 1 < argc) {
+            if (repl_glob_count >= sizeof(repl_globs) / sizeof(repl_globs[0])) return usage(argv[0]), 2;
+            if (strlen(argv[++i]) >= sizeof(repl_globs[0])) return usage(argv[0]), 2;
+            snprintf(repl_globs[repl_glob_count], sizeof(repl_globs[0]), "%s", argv[i]);
+            repl_glob_ptrs[repl_glob_count] = repl_globs[repl_glob_count];
+            repl_glob_count++;
+        } else if (strcmp(a, "--replicate-interval") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v > 86400u) return usage(argv[0]), 2;
+            repl_interval = (uint32_t)v;
         } else if (strcmp(a, "--join") == 0 && i + 1 < argc) {
             if (seed_count >= 8u) return usage(argv[0]), 2;
             snprintf(seeds[seed_count++], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", argv[++i]);
@@ -446,6 +825,10 @@ int main(int argc, char** argv) {
     config.enable_task_scheduler = false;
     config.cluster_migrate_password = operator_password;
     config.redundancy_peer = redundancy_peer;
+    /* R4 replicated namespaces: must be set BEFORE server create — the
+     * engine ingests the globs into its registry during creation. */
+    config.replicate_globs = repl_glob_ptrs;
+    config.replicate_glob_count = repl_glob_count;
     /* The cluster password also keys the veiled bus framing: every bus
      * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
      * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
@@ -516,6 +899,24 @@ int main(int argc, char** argv) {
             fprintf(stderr, "qihse-cluster-daemon: brain active (%s)\n", brain_act ? "observe+act" : "observe");
         }
     }
+    pthread_t ae_thread;
+    static volatile sig_atomic_t ae_stop = 0;
+    ae_ctx_t ae_ctx;
+    bool ae_started = false;
+    if (repl_interval > 0) {
+        ae_ctx.server = server;
+        ae_ctx.peers = peers;
+        ae_ctx.peer_count = peer_count;
+        ae_ctx.self_index = self_index;
+        ae_ctx.password = operator_password;
+        ae_ctx.self_host = bind;
+        ae_ctx.self_port = port;
+        ae_ctx.interval_seconds = repl_interval;
+        ae_ctx.stop = &ae_stop;
+        if (pthread_create(&ae_thread, NULL, ae_main, &ae_ctx) == 0) ae_started = true;
+        else fprintf(stderr, "qihse-cluster-daemon: repl AE thread failed to start\n");
+    }
+
     pthread_t join_thread;
     join_ctx_t join_ctx = { server, {{0}}, seed_count };
     if (seed_count > 0) {
@@ -524,6 +925,8 @@ int main(int argc, char** argv) {
         if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
     }
     bool ok = qihse_resp_server_run(server);
+    ae_stop = 1;
+    if (ae_started) pthread_join(ae_thread, NULL); /* holds server: join before destroy */
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);

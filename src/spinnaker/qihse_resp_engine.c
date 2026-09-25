@@ -244,6 +244,11 @@ struct qihse_resp_server {
     bool bgsave_thread_alive;
     bool bgsave_in_progress;
     time_t last_save;
+    /* R4 replicated namespaces (REPL.*): globs whose keys are sovereign-
+     * local on every node, plus the anti-entropy bookkeeping REPL.STATUS
+     * renders. repl_lock guards the whole list. */
+    pthread_mutex_t repl_lock;
+    struct qihse_resp_repl_mark* repl_marks;
     pthread_mutex_t tsdb_lock;
     pthread_mutex_t column_lock;
     /* Phase 3: cluster bus + failover + guard throttling */
@@ -770,6 +775,23 @@ static bool qihse_resp_endpoint(const qihse_cluster_node_t* node, char* output, 
 static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys) {
     if (keys->count == 0) return true;
     qihse_resp_server_t* server = session->server;
+    /* R4 sovereign-local namespaces: when EVERY key in the request matches
+     * a replicated-namespace glob, this node serves it from its own store —
+     * no MOVED, no CLUSTERDOWN, no CROSSSLOT. Replicated keys live on every
+     * node by definition, so routing them is wrong even when the cluster
+     * view is healthy. Mixed marked/unmarked requests fall through to the
+     * strict sharded rules unchanged. */
+    if (server->repl_marks) {
+        bool all_marked = true;
+        for (size_t i = 0; i < keys->count && all_marked; i++) {
+            all_marked = qihse_resp_server_repl_key_matched(
+                server, (const char*)request->argv[keys->indexes[i]].data, request->argv[keys->indexes[i]].len);
+        }
+        if (all_marked) {
+            session->asking = false;
+            return true;
+        }
+    }
     uint16_t slot = qihse_cluster_key_slot(request->argv[keys->indexes[0]].data, request->argv[keys->indexes[0]].len);
     for (size_t i = 1; i < keys->count; i++) {
         uint16_t next_slot = qihse_cluster_key_slot(request->argv[keys->indexes[i]].data, request->argv[keys->indexes[i]].len);
@@ -5542,6 +5564,474 @@ static bool dsp_incrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)  
 static bool dsp_decrby(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_incrby(s, r, true); }
 static bool dsp_expireat(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_expireat(s, r, false); }
 static bool dsp_pexpireat(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expireat(s, r, true); }
+/* ── R4 replicated namespaces (REPL.*) — registry, sovereign routing, ops ──
+ *
+ * A replicated namespace is a glob (e.g. "sabot/*"). Keys matching one are
+ * SOVEREIGN-LOCAL: every node may hold them, so the routing layer never
+ * MOVED-redirects or CLUSTERDOWN-gates them (qihse_resp_route exempts a
+ * request whose EVERY key is marked). Unmarked keys route exactly as
+ * before. KEYS/SCAN/FTS were always node-local and need no change.
+ *
+ * The registry is in-memory: --replicate flags re-add their globs on every
+ * restart (source=flag); REPL.MARK globs live until process death
+ * (source=runtime). Convergence is the daemon's anti-entropy thread
+ * (missing-only repair) plus the operator's REPL.PULL (deterministic
+ * overwrite-from-peer). Divergent and orphaned keys are REPORTED, never
+ * auto-resolved, and deletes are not propagated in phase 1. */
+#define QIHSE_REPL_GLOB_MAX     128u
+#define QIHSE_REPL_MARKS_MAX    64u
+#define QIHSE_REPL_PEERS_MAX    8u
+#define QIHSE_REPL_PULL_MAX     10000u
+
+struct qihse_resp_repl_mark {
+    char glob[QIHSE_REPL_GLOB_MAX];
+    bool from_flag;
+    uint64_t local_count;   /* last anti-entropy observation */
+    uint64_t orphaned;      /* local-only vs every peer: report-only */
+    struct {
+        char peer[48];      /* "host:port" */
+        time_t last_sync;   /* 0 = never completed */
+        uint64_t pulled;
+        uint64_t divergent;
+        bool ok;            /* last tick reached the peer */
+    } peers[QIHSE_REPL_PEERS_MAX];
+    size_t peer_count;
+    struct qihse_resp_repl_mark* next;
+};
+
+bool qihse_resp_server_repl_add(qihse_resp_server_t* server, const char* glob, bool from_flag) {
+    if (!server || !glob || !*glob || strlen(glob) >= QIHSE_REPL_GLOB_MAX) return false;
+    pthread_mutex_lock(&server->repl_lock);
+    size_t count = 0;
+    for (struct qihse_resp_repl_mark* m = server->repl_marks; m; m = m->next) {
+        if (strcmp(m->glob, glob) == 0) {
+            m->from_flag = from_flag; /* re-mark keeps the newest source */
+            pthread_mutex_unlock(&server->repl_lock);
+            return true;
+        }
+        count++;
+    }
+    if (count >= QIHSE_REPL_MARKS_MAX) {
+        pthread_mutex_unlock(&server->repl_lock);
+        return false;
+    }
+    struct qihse_resp_repl_mark* m = (struct qihse_resp_repl_mark*)calloc(1, sizeof(*m));
+    if (!m) {
+        pthread_mutex_unlock(&server->repl_lock);
+        return false;
+    }
+    snprintf(m->glob, sizeof(m->glob), "%s", glob);
+    m->from_flag = from_flag;
+    m->next = server->repl_marks;
+    server->repl_marks = m;
+    pthread_mutex_unlock(&server->repl_lock);
+    return true;
+}
+
+bool qihse_resp_server_repl_remove(qihse_resp_server_t* server, const char* glob) {
+    if (!server || !glob) return false;
+    pthread_mutex_lock(&server->repl_lock);
+    struct qihse_resp_repl_mark** cursor = &server->repl_marks;
+    while (*cursor) {
+        if (strcmp((*cursor)->glob, glob) == 0) {
+            struct qihse_resp_repl_mark* dead = *cursor;
+            *cursor = dead->next;
+            free(dead);
+            pthread_mutex_unlock(&server->repl_lock);
+            return true;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&server->repl_lock);
+    return false;
+}
+
+size_t qihse_resp_server_repl_list(qihse_resp_server_t* server,
+                                   char (*out_globs)[128], bool* from_flag_out, size_t cap) {
+    if (!server || !out_globs) return 0;
+    size_t written = 0;
+    pthread_mutex_lock(&server->repl_lock);
+    for (struct qihse_resp_repl_mark* m = server->repl_marks; m && written < cap; m = m->next) {
+        snprintf(out_globs[written], 128, "%s", m->glob);
+        if (from_flag_out) from_flag_out[written] = m->from_flag;
+        written++;
+    }
+    pthread_mutex_unlock(&server->repl_lock);
+    return written;
+}
+
+bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char* key, size_t key_len) {
+    if (!server || !key || key_len == 0u) return false;
+    bool matched = false;
+    pthread_mutex_lock(&server->repl_lock);
+    for (struct qihse_resp_repl_mark* m = server->repl_marks; m && !matched; m = m->next) {
+        if (key_len < QIHSE_REPL_GLOB_MAX) {
+            char buf[QIHSE_REPL_GLOB_MAX];
+            memcpy(buf, key, key_len);
+            buf[key_len] = '\0';
+            matched = fnmatch(m->glob, buf, 0) == 0;
+        }
+    }
+    pthread_mutex_unlock(&server->repl_lock);
+    return matched;
+}
+
+void qihse_resp_server_repl_note(qihse_resp_server_t* server, const char* glob, const char* peer,
+                                 uint64_t pulled, uint64_t divergent,
+                                 uint64_t local_count, uint64_t orphaned, bool ok) {
+    if (!server || !glob) return;
+    pthread_mutex_lock(&server->repl_lock);
+    for (struct qihse_resp_repl_mark* m = server->repl_marks; m; m = m->next) {
+        if (strcmp(m->glob, glob) != 0) continue;
+        if (!peer) {
+            if (local_count != UINT64_MAX) m->local_count = local_count;
+            if (orphaned != UINT64_MAX) m->orphaned = orphaned;
+            break;
+        }
+        size_t slot = m->peer_count;
+        for (size_t i = 0; i < m->peer_count; i++) {
+            if (strcmp(m->peers[i].peer, peer) == 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == m->peer_count) {
+            if (m->peer_count >= QIHSE_REPL_PEERS_MAX) break; /* table full */
+            memset(&m->peers[slot], 0, sizeof(m->peers[slot]));
+            snprintf(m->peers[slot].peer, sizeof(m->peers[slot].peer), "%s", peer);
+            m->peer_count++;
+        }
+        if (pulled != UINT64_MAX) m->peers[slot].pulled = pulled;
+        if (divergent != UINT64_MAX) m->peers[slot].divergent = divergent;
+        m->peers[slot].ok = ok;
+        if (ok) m->peers[slot].last_sync = time(NULL);
+        break;
+    }
+    pthread_mutex_unlock(&server->repl_lock);
+}
+
+/* ---- REPL.MARK / REPL.MARKS / REPL.UNMARK / REPL.STATUS / REPL.PULL ----
+ * Dotted top-level commands: argv[1] is the first argument.
+ *  REPL.MARK <glob>            +OK (in-memory, lost on restart)
+ *  REPL.MARKS                  flat [glob, source(flag|runtime), ...]
+ *  REPL.UNMARK <glob>          +OK / -ERR not marked
+ *  REPL.STATUS                 array of report lines (see below)
+ *  REPL.PULL <glob> <host:port> integer = keys pulled; overwrites divergent
+ *                              local copies and pulls missing keys from that
+ *                              peer; local-only keys are LEFT IN PLACE and
+ *                              reported by REPL.STATUS (no tombstones in
+ *                              phase 1, so an overwrite never deletes). */
+
+/* Read one CRLF-terminated reply line (bounded). Returns length or -1. */
+static int qihse_resp_fd_read_line(int fd, char* buf, size_t cap) {
+    size_t used = 0;
+    while (used + 1u < cap) {
+        char c;
+        ssize_t received = recv(fd, &c, 1u, 0);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (received == 0) return -1;
+        if (c == '\n') {
+            if (used > 0 && buf[used - 1u] == '\r') used--;
+            buf[used] = '\0';
+            return (int)used;
+        }
+        buf[used++] = c;
+    }
+    return -1;
+}
+
+/* Writer half of qihse_resp_fd_command: frame and send argv only. */
+static bool qihse_resp_fd_send_command(int fd, size_t argc, const qihse_resp_arg_t* argv) {
+    char header[64];
+    int len = snprintf(header, sizeof(header), "*%zu\r\n", argc);
+    if (len <= 0 || (size_t)len >= sizeof(header) || !qihse_resp_fd_write(fd, header, (size_t)len)) return false;
+    for (size_t i = 0; i < argc; i++) {
+        len = snprintf(header, sizeof(header), "$%zu\r\n", argv[i].len);
+        if (len <= 0 || (size_t)len >= sizeof(header) || !qihse_resp_fd_write(fd, header, (size_t)len) ||
+            (argv[i].len > 0 && !qihse_resp_fd_write(fd, argv[i].data, argv[i].len)) ||
+            !qihse_resp_fd_write(fd, "\r\n", 2u)) return false;
+    }
+    return true;
+}
+
+/* Bulk reply: "$<len>\r<n bytes>\r\n" or nil. Malloc'd string or NULL
+ * (NULL + err[0] == '\0' means nil/not-found). */
+static char* qihse_resp_fd_bulk_reply(int fd, char* err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    char head[64];
+    if (qihse_resp_fd_read_line(fd, head, sizeof(head)) < 0) {
+        if (err && err_cap) snprintf(err, err_cap, "protocol error");
+        return NULL;
+    }
+    if (head[0] == '-' ) {
+        if (err && err_cap) snprintf(err, err_cap, "%s", head + 1);
+        return NULL;
+    }
+    if (head[0] != '$') {
+        if (err && err_cap) snprintf(err, err_cap, "unexpected reply type '%c'", head[0]);
+        return NULL;
+    }
+    long long len = strtoll(head + 1, NULL, 10);
+    if (len < 0) return NULL; /* nil */
+    if (len > (16u << 20)) {
+        if (err && err_cap) snprintf(err, err_cap, "reply too large");
+        return NULL;
+    }
+    char* value = (char*)malloc((size_t)len + 1u);
+    if (!value) {
+        if (err && err_cap) snprintf(err, err_cap, "out of memory");
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < (size_t)len) {
+        ssize_t received = recv(fd, value + got, (size_t)len - got, 0);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (received == 0) break;
+        got += (size_t)received;
+    }
+    if (got < (size_t)len) {
+        free(value);
+        if (err && err_cap) snprintf(err, err_cap, "truncated bulk reply");
+        return NULL;
+    }
+    char tail[2];
+    if (recv(fd, tail, 2u, 0) != 2 || tail[0] != '\r' || tail[1] != '\n') {
+        free(value);
+        if (err && err_cap) snprintf(err, err_cap, "missing CRLF");
+        return NULL;
+    }
+    value[len] = '\0';
+    return value;
+}
+
+/* Array-of-bulks reply (KEYS): "*<n>" then n bulks. Returns a malloc'd
+ * array of malloc'd strings (caller frees each + the array), count in
+ * *out_n; NULL on error. */
+static char** qihse_resp_fd_array_reply(int fd, size_t* out_n, char* err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (out_n) *out_n = 0;
+    char head[64];
+    if (qihse_resp_fd_read_line(fd, head, sizeof(head)) < 0) {
+        if (err && err_cap) snprintf(err, err_cap, "protocol error");
+        return NULL;
+    }
+    if (head[0] == '-') {
+        if (err && err_cap) snprintf(err, err_cap, "%s", head + 1);
+        return NULL;
+    }
+    if (head[0] != '*' || out_n == NULL) {
+        if (err && err_cap) snprintf(err, err_cap, "unexpected reply type");
+        return NULL;
+    }
+    long long count = strtoll(head + 1, NULL, 10);
+    if (count < 0 || count > 100000) {
+        if (err && err_cap) snprintf(err, err_cap, "unreasonable array size");
+        return NULL;
+    }
+    char** items = (char**)calloc((size_t)count ? (size_t)count : 1u, sizeof(char*));
+    if (!items) {
+        if (err && err_cap) snprintf(err, err_cap, "out of memory");
+        return NULL;
+    }
+    for (long long i = 0; i < count; i++) {
+        items[i] = qihse_resp_fd_bulk_reply(fd, err, err_cap);
+        if (!items[i]) {
+            for (long long k = 0; k < i; k++) free(items[k]);
+            free(items);
+            return NULL;
+        }
+    }
+    *out_n = (size_t)count;
+    return items;
+}
+
+static bool qihse_resp_handle_repl_mark(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "repl.mark");
+    char glob[QIHSE_REPL_GLOB_MAX + 1u];
+    if (request->argv[1].len == 0u || request->argv[1].len >= sizeof(glob)) {
+        return qihse_resp_error(session, "ERR invalid glob");
+    }
+    memcpy(glob, request->argv[1].data, request->argv[1].len);
+    glob[request->argv[1].len] = '\0';
+    if (!qihse_resp_server_repl_add(session->server, glob, false)) {
+        return qihse_resp_error(session, "ERR cannot add mark (invalid glob or registry full)");
+    }
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_repl_unmark(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "repl.unmark");
+    char glob[QIHSE_REPL_GLOB_MAX + 1u];
+    if (request->argv[1].len >= sizeof(glob)) return qihse_resp_error(session, "ERR invalid glob");
+    memcpy(glob, request->argv[1].data, request->argv[1].len);
+    glob[request->argv[1].len] = '\0';
+    if (!qihse_resp_server_repl_remove(session->server, glob)) {
+        return qihse_resp_error(session, "ERR not marked");
+    }
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_repl_marks(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 1) return qihse_resp_wrong_arity(session, "repl.marks");
+    char globs[QIHSE_REPL_MARKS_MAX][128];
+    bool from_flag[QIHSE_REPL_MARKS_MAX];
+    size_t count = qihse_resp_server_repl_list(session->server, globs, from_flag, QIHSE_REPL_MARKS_MAX);
+    if (!qihse_resp_array(session, count * 2u)) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (!qihse_resp_bulk_text(session, globs[i]) ||
+            !qihse_resp_bulk_text(session, from_flag[i] ? "flag" : "runtime")) return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_repl_status(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 1) return qihse_resp_wrong_arity(session, "repl.status");
+    /* Report lines, one bulk per line:
+     *   "glob <g> source=flag|runtime local=<n> orphaned=<n>"
+     *   "  peer <host:port> last=<unix|never> pulled=<n> divergent=<n> sync=ok|failed"
+     * divergent/orphaned are REPORT-ONLY in phase 1 (no auto-resolution,
+     * no delete propagation). */
+    pthread_mutex_lock(&session->server->repl_lock);
+    size_t lines = 0;
+    for (struct qihse_resp_repl_mark* m = session->server->repl_marks; m; m = m->next) lines += 1u + m->peer_count;
+    char** out = (char**)calloc(lines ? lines : 1u, sizeof(char*));
+    if (!out) {
+        pthread_mutex_unlock(&session->server->repl_lock);
+        return qihse_resp_error(session, "ERR out of memory");
+    }
+    size_t n = 0;
+    for (struct qihse_resp_repl_mark* m = session->server->repl_marks; m; m = m->next) {
+        char line[256];
+        snprintf(line, sizeof(line), "glob %s source=%s local=%llu orphaned=%llu",
+                 m->glob, m->from_flag ? "flag" : "runtime",
+                 (unsigned long long)m->local_count, (unsigned long long)m->orphaned);
+        out[n] = strdup(line);
+        if (!out[n]) break;
+        n++;
+        for (size_t i = 0; i < m->peer_count; i++) {
+            snprintf(line, sizeof(line), "  peer %s last=%lld pulled=%llu divergent=%llu sync=%s",
+                     m->peers[i].peer,
+                     m->peers[i].last_sync ? (long long)m->peers[i].last_sync : -1,
+                     (unsigned long long)m->peers[i].pulled,
+                     (unsigned long long)m->peers[i].divergent,
+                     m->peers[i].ok ? "ok" : "failed");
+            out[n] = strdup(line);
+            if (!out[n]) break;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&session->server->repl_lock);
+    bool built = qihse_resp_array(session, n);
+    for (size_t i = 0; i < n && built; i++) built = qihse_resp_bulk_text(session, out[i]);
+    for (size_t i = 0; i < n; i++) free(out[i]);
+    free(out);
+    return built;
+}
+
+static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 3) return qihse_resp_wrong_arity(session, "repl.pull");
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    if (request->argv[1].len == 0u || request->argv[1].len >= QIHSE_REPL_GLOB_MAX) {
+        return qihse_resp_error(session, "ERR invalid glob");
+    }
+    char glob[QIHSE_REPL_GLOB_MAX];
+    memcpy(glob, request->argv[1].data, request->argv[1].len);
+    glob[request->argv[1].len] = '\0';
+    char spec[256];
+    if (request->argv[2].len == 0u || request->argv[2].len >= sizeof(spec)) {
+        return qihse_resp_error(session, "ERR invalid host:port");
+    }
+    memcpy(spec, request->argv[2].data, request->argv[2].len);
+    spec[request->argv[2].len] = '\0';
+    char* colon = strrchr(spec, ':');
+    if (!colon) return qihse_resp_error(session, "ERR invalid host:port");
+    *colon = '\0';
+    uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
+    if (port == 0u || !*spec) return qihse_resp_error(session, "ERR invalid host:port");
+
+    int fd = qihse_resp_connect_timeout(spec, port, 5000);
+    if (fd < 0) return qihse_resp_error(session, "ERR cannot connect to peer");
+    char err[256] = {0};
+    const char* password = session->server->cluster_migrate_password;
+    if (password && *password) {
+        static const uint8_t auth_cmd[] = "AUTH";
+        qihse_resp_arg_t auth_args[2] = {
+            { auth_cmd, sizeof(auth_cmd) - 1u },
+            { (const uint8_t*)password, strlen(password) }
+        };
+        if (!qihse_resp_fd_command(fd, 2u, auth_args, err, sizeof(err))) {
+            close_socket(fd);
+            char msg[320];
+            snprintf(msg, sizeof(msg), "ERR peer authentication failed: %s", err);
+            return qihse_resp_error(session, msg);
+        }
+    }
+    static const uint8_t keys_cmd[] = "KEYS";
+    static const uint8_t get_cmd[] = "GET";
+    qihse_resp_arg_t keys_args[2] = {
+        { keys_cmd, sizeof(keys_cmd) - 1u },
+        { (const uint8_t*)glob, strlen(glob) }
+    };
+    if (!qihse_resp_fd_send_command(fd, 2u, keys_args)) {
+        close_socket(fd);
+        return qihse_resp_error(session, "ERR send failed");
+    }
+    size_t peer_count = 0;
+    char** peer_keys = qihse_resp_fd_array_reply(fd, &peer_count, err, sizeof(err));
+    if (!peer_keys) {
+        close_socket(fd);
+        char msg[320];
+        snprintf(msg, sizeof(msg), "ERR KEYS failed: %s", err);
+        return qihse_resp_error(session, msg);
+    }
+    qihse_user_t* system_user = qihse_auth_get_user(0);
+    if (!system_user) {
+        for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
+        free(peer_keys);
+        close_socket(fd);
+        return qihse_resp_error(session, "ERR system principal unavailable");
+    }
+    uint64_t pulled = 0;
+    int failures = 0;
+    for (size_t i = 0; i < peer_count && pulled < QIHSE_REPL_PULL_MAX; i++) {
+        qihse_resp_arg_t get_args[2] = {
+            { get_cmd, sizeof(get_cmd) - 1u },
+            { (const uint8_t*)peer_keys[i], strlen(peer_keys[i]) }
+        };
+        if (!qihse_resp_fd_send_command(fd, 2u, get_args)) {
+            failures++;
+            break;
+        }
+        char* value = qihse_resp_fd_bulk_reply(fd, err, sizeof(err));
+        if (!value) {
+            if (err[0]) failures++;
+            continue; /* nil = vanished mid-pull: fine */
+        }
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool stored = qihse_kv_set_user(session->server->store, peer_keys[i], value, 0, 0, system_user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        free(value);
+        if (stored) pulled++;
+        else failures++;
+    }
+    for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
+    free(peer_keys);
+    close_socket(fd);
+    if (failures) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "ERR pull incomplete: %llu pulled, %d failed",
+                 (unsigned long long)pulled, failures);
+        return qihse_resp_error(session, msg);
+    }
+    return qihse_resp_integer(session, (int64_t)pulled);
+}
+
 /* ---- SAVE / BGSAVE / LASTSAVE — operator-triggered durability ----------
  * SAVE flushes the memtable into a new SSTable, fsyncs it, the WAL and the
  * data directory (qihse_kv_sync_store), under the kv_lock write-side so
@@ -5723,6 +6213,11 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"dbsize", qihse_resp_handle_dbsize, 0}, {"time", qihse_resp_handle_time, 0},
     {"save", qihse_resp_handle_save, DSP_BUSY_WRITE}, {"bgsave", qihse_resp_handle_bgsave, 0},
     {"lastsave", dsp_lastsave, 0},
+    {"repl.mark", qihse_resp_handle_repl_mark, DSP_BUSY_WRITE},
+    {"repl.unmark", qihse_resp_handle_repl_unmark, DSP_BUSY_WRITE},
+    {"repl.marks", qihse_resp_handle_repl_marks, 0},
+    {"repl.status", qihse_resp_handle_repl_status, 0},
+    {"repl.pull", qihse_resp_handle_repl_pull, DSP_BUSY_WRITE},
     {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
     {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_ok_stub, 0},
     {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_ok_stub, 0},
@@ -9248,6 +9743,9 @@ static const qihse_resp_qtype_ent_t g_qtype_table[] = {
     /* multi-key / metadata reads */
     {"mget", QIHSE_QUERY_TYPE_SCAN}, {"keys", QIHSE_QUERY_TYPE_SCAN},
     {"fts.build", QIHSE_QUERY_TYPE_SCAN}, {"fts.search", QIHSE_QUERY_TYPE_SCAN},
+    {"repl.mark", QIHSE_QUERY_TYPE_SET}, {"repl.unmark", QIHSE_QUERY_TYPE_SET},
+    {"repl.pull", QIHSE_QUERY_TYPE_SET}, {"repl.marks", QIHSE_QUERY_TYPE_SCAN},
+    {"repl.status", QIHSE_QUERY_TYPE_SCAN},
     {"scan", QIHSE_QUERY_TYPE_SCAN}, {"dbsize", QIHSE_QUERY_TYPE_SCAN},
     {"randomkey", QIHSE_QUERY_TYPE_SCAN}, {"type", QIHSE_QUERY_TYPE_SCAN},
     {"exists", QIHSE_QUERY_TYPE_SCAN}, {"object", QIHSE_QUERY_TYPE_SCAN},
@@ -9968,6 +10466,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
         pthread_mutex_init(&server->fts_meta_lock, NULL) != 0 ||
         pthread_mutex_init(&server->save_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->repl_lock, NULL) != 0 ||
         pthread_mutex_init(&server->tsdb_lock, NULL) != 0 || pthread_mutex_init(&server->column_lock, NULL) != 0 ||
         pthread_mutex_init(&server->group_lock, NULL) != 0 ||
         pthread_mutex_init(&server->federation_lock, NULL) != 0) {
@@ -10249,6 +10748,11 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         }
     }
 
+    /* R4 replicated namespaces: ingest boot-time globs last — repl_lock
+     * must already exist (the registry API locks it). */
+    for (size_t i = 0; supplied->replicate_globs && i < supplied->replicate_glob_count; i++) {
+        (void)qihse_resp_server_repl_add(server, supplied->replicate_globs[i], true);
+    }
     return server;
 }
 
@@ -10393,6 +10897,16 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     /* A BGSAVE worker may still hold kv_lock write-side: join it BEFORE the
      * store and locks are torn down. Workers are one-shot; the join only
      * waits out the tail of a running save. */
+    if (server->repl_marks) {
+        struct qihse_resp_repl_mark* m = server->repl_marks;
+        while (m) {
+            struct qihse_resp_repl_mark* next = m->next;
+            free(m);
+            m = next;
+        }
+        server->repl_marks = NULL;
+    }
+    pthread_mutex_destroy(&server->repl_lock);
     pthread_mutex_lock(&server->save_lock);
     bool join_bgsave = server->bgsave_thread_alive;
     server->bgsave_thread_alive = false;
