@@ -87,7 +87,10 @@ The persistence stack includes:
 - write-ahead logging
 - checkpoint and replay
 - crash recovery
-- full backup and restore (incremental export is **not** implemented: it returns UNSUPPORTED because the KV store exposes no change sequence — see [Replication and backup](architecture/replication_backup.md))
+- full backup and restore, plus a real incremental (delta) export: the KV store
+  stamps a store-global change sequence, and `qihse_backup_incremental_user()`
+  writes a `BACKUP_INCREMENTAL` container of only the delta above a cursor
+  (see [Replication and backup](architecture/replication_backup.md))
 - replication slots and WAL shipping
 - replica-side WAL apply into a bound store
 - read-replica routing
@@ -126,13 +129,40 @@ UWP targets cover authentication plus database and operational services includin
 
 See [Operational protocols](architecture/operational_protocols.md) and the [AF_XDP operational guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md).
 
+## Federation data plane
+
+The federation layer turns a cluster of QIHSE instances into a
+partition-aware data plane without making local operation depend on global
+quorum. Landed and tested:
+
+- scoped consensus for strong namespaces (`include/qihse_consensus.h`):
+  persistent term/voted-for/fencing state, log matching, majority+current-term
+  commit, log compaction with snapshot install, single-server membership
+  changes — deliberately not called Raft; boundaries stated in the header
+  (`tests/test_consensus.c`, `make test-consensus`)
+- signed backup containers (v3: `[ header 464 ][ signature ][ data ][ WAL ]`,
+  ML-DSA over the header, classification-preserving WAL replay, v1/v2
+  retired) and a verify-only entry point (`tests/test_backup_auth.c`,
+  `tests/test_federation_backup.c`)
+- node-side CRL consumption composing with KV revocation state, plus the
+  out-of-process federation CA tool (`make federation-ca`)
+  (`tests/test_federation_crl.c`, `tests/test_federation_ca.c`)
+- controller SDKs over the `FEDERATION.*` RESP surface: C reference client
+  (`include/qihse_controller.h`), Python (`python/qihse/controller.py`,
+  `python/tests/test_controller_sdk.py`) and Rust
+  (`rust/qihse-rs/src/controller.rs`, `tests/controller_sdk.rs`)
+- incremental export from the KV change sequence, authorization-filtered with
+  a no-leak resume point (`tests/test_incremental_export.c`)
+
+See [Federation overview](architecture/federation_overview.md).
+
 ## Operations
 
 The operational layer includes:
 
 - streaming replication
 - read replicas
-- full backup and restore (no incremental export — see above)
+- full backup and restore with incremental (delta) export — see above
 - parallel query execution
 - connection pooling
 - change data capture
@@ -202,6 +232,11 @@ SDKs and compatibility bindings are grouped under [`sdks/`](../sdks/):
 - [`sdks/python/`](../sdks/python/) — Python bindings and compatibility clients
 - [`sdks/rust/`](../sdks/rust/) — Rust bindings
 - [`sdks/c/`](../sdks/c/) — C compatibility interfaces
+
+The federation controller SDKs are separate from the compatibility set: the C
+reference client (`include/qihse_controller.h`), the Python SDK
+([`python/qihse/controller.py`](../python/qihse/controller.py)) and the Rust
+SDK ([`rust/qihse-rs/src/controller.rs`](../rust/qihse-rs/src/controller.rs)).
 
 ## Benchmarks
 

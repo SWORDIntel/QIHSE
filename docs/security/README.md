@@ -9,7 +9,24 @@
 > API sketches for a `qihse_crypto_*` / `qihse_secure_log_*` /
 > `qihse_cnsa_checker_*` layer that does not exist in this repository. Those
 > symbols are absent from `include/`, from `src/`, and from the built
-> `libqihse.so`. Do not write code against them.
+> `libqihse.so`. Do not write code against them. The same applies to the
+> `qihse_auth_config_t` sketch in "Authentication and Authorization" and the
+> `qihse_mtls_config_t` / `qihse_service_mesh_*` sketch in "Mutual TLS" —
+> including their `.crl_path` / `.crl_check_enabled` fields, which sketch a
+> generic PKI configuration style rather than this codebase's API.
+>
+> **Revocation as actually built:** the federation node consumes CRL files in
+> the `QIHSE-FED-CRL-V1` format (`qihse_federation_crl_load/_check/_state` in
+> `include/qihse_federation_mtls.h`), which compose with the KV `fednode:`
+> revocation state so either source refuses a peer; a malformed configured
+> CRL fails closed (sticky) rather than verifying as clean, and loading one
+> requires an operator holding `QIHSE_SCOPE_NODE_REVOKE`. Established
+> sessions are re-checked per request
+> (`qihse_federation_tls_session_recheck()`). CA provisioning is an
+> out-of-process operator procedure: `tools/qihse_federation_ca.c` (`make
+> federation-ca`: init-ca / issue-node / revoke / verify) is deliberately not
+> linked into `libqihse.so`. Verified by `tests/test_federation_crl.c` and
+> `tests/test_federation_ca.c`.
 
 This guide details the security features, access control architecture, and CNSA 2.0 alignment in QIHSE. **Note:** QIHSE has not yet achieved formal third-party CNSA 2.0 compliance or FIPS 140-3 validation. Transport encryption requires certificate-backed TLS 1.3 by default for network listeners (`QIHSE_UWP_ALLOW_INSECURE=1` is required for cleartext/dev opt-in). Post-quantum cryptography (`liboqs` / `oqs-provider` with ML-DSA-87 and ML-KEM-1024) is built and enabled by default. Passwords use CNSA 2.0 / FIPS-aligned PBKDF2-HMAC-SHA-384. See [`UWP_AUDIT_2026-08.md`](UWP_AUDIT_2026-08.md) and [`hardening-report.md`](hardening-report.md) for the audit remediation history.
 

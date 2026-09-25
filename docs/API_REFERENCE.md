@@ -11,7 +11,15 @@
 > [§8](#8-additional-public-c-surfaces) adds the public surfaces that were
 > outside that set when this reference was first written: replication apply,
 > the table-store DML primitives, parallel query, AI memory, the KEYSTONE change
-> feed, the MongoDB wire adapter, and the derived cluster-node federation UUID.
+> feed, the MongoDB wire adapter, and the derived cluster-node federation UUID —
+> and, since the Phase 10 remainder landed, the scoped consensus module
+> ([§8.9](#89-scoped-consensus--includeqihse_consensush)), the controller C
+> client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and the
+> incremental (delta) export ([§8.11](#811-incremental-export--includeqihse_exporth)).
+> The node-side CRL loaders joined the mTLS section
+> ([§5.1](#51-federation-ca--includeqihse_federation_mtlsh)), the signed backup
+> container joined [§2.3](#23-snapshot-backup--includeqihse_backuph), and the
+> change-sequence/delta forms joined [§6](#6-key-value-store--includeqihse_kv_storeh).
 
 This is the reference surface for the public C API, the Python SDK, protocol
 compatibility, and configuration knobs. It is deliberately narrower than the
@@ -32,8 +40,9 @@ nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
 The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
-declare 252 `qihse_*` functions between them, and 249 of those resolve to a
-symbol in `libqihse.so`. The three that do not are the expected exception:
+declare 263 `qihse_*` functions between them (counted in the headers with
+comments stripped), and 260 of those resolve to a symbol in `libqihse.so`. The
+three that do not are the expected exception:
 `qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
 wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
 than appearing as library symbols. [§8](#8-additional-public-c-surfaces) adds
@@ -43,18 +52,19 @@ source file exists", so a function that appears here is safe to call; a
 function that does not appear here has not been verified and should be read in
 its header first.
 
-The per-header split, as counted by the command above:
+The per-header split, declared counted in the header and exported counted with
+the command above:
 
 | Header | Declared | Exported |
 |---|---|---|
-| `include/qihse_federation.h` | 118 | 118 |
-| `include/qihse_federation_mtls.h` | 8 | 8 |
+| `include/qihse_federation.h` | 119 | 119 |
+| `include/qihse_federation_mtls.h` | 11 | 11 |
 | `include/qihse_federation_repl.h` | 13 | 13 |
-| `include/qihse_federation_transport.h` | 15 | 15 |
+| `include/qihse_federation_transport.h` | 16 | 16 |
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
-| `include/qihse_backup.h` | 9 | 9 |
-| `include/qihse_kv_store.h` | 26 | 23 (3 `static inline`) |
+| `include/qihse_backup.h` | 11 | 11 |
+| `include/qihse_kv_store.h` | 30 | 27 (3 `static inline`) |
 | `include/qihse_auth.h` | 34 | 34 |
 
 ## Conventions
@@ -366,49 +376,75 @@ material). The writer that produces the data a manifest refers to is
 
 ### 2.3 Snapshot backup — `include/qihse_backup.h`
 
-Source: `src/federation/qihse_backup.c` (federation writer/reader),
-`src/tractable/qihse_backup.c` (legacy whole-store export).
-Test: `tests/test_federation_backup.c` (`make test-federation-backup`, part of
-the default `make test` list).
+Source: `src/federation/qihse_backup.c` (federation signed writer/reader),
+`src/tractable/qihse_backup.c` (whole-store and incremental export).
+Tests: `tests/test_backup_auth.c` (`make test-backup-auth`) for the signed
+container and its refusal paths, `tests/test_federation_backup.c`
+(`make test-federation-backup`) for the manifest-bound surface and the
+whole-store argument gates, `tests/test_incremental_export.c`
+(`make test-incremental-export`) for the delta container. All three are part of
+the default `make test` list.
 
 The federation backup surface takes a mandatory security context and propagates
 it to the KV layer on both export and import, so a principal that may not read a
 record may neither back it up nor restore it. A refused call leaves no container
 and no partial dataset behind.
 
+The container is the signed v3 form: `[ header 464 ][ signature ][ data ][ WAL ]`.
+The ML-DSA signature covers the whole fixed header, which carries the manifest
+checksum, the data section's SHA-384, and the WAL section's SHA-384, length and
+LSN range, plus the signer's node id, public-key fingerprint and algorithm id
+inside the signed region — so one detached signature authenticates the manifest
+binding, both payload digests and the signer identity at once, and an
+algorithm-downgrade or signer-substitution edit invalidates the signature
+instead of reinterpreting it. The signer is the node whose UUID the caller
+passes; it is resolved through the store's enrolled identity records
+(`fednode:<uuid>`), must be APPROVED right now, and its private key is loaded
+from the record's key handle — a filesystem reference, never a QIHSE record.
+An absent, unenrolled, unapproved or keyless identity fails the
+write with `QIHSE_BACKUP_ERR_SIGNER` — there is no unsigned fallback. Version
+1 (unsigned) and version 2 (signed, WAL-less) containers are retired: every
+entry point refuses them with `QIHSE_BACKUP_ERR_VERSION` rather than
+downgrading them, and no writer or reader for them remains in the tree. The
+WAL section's records carry classification and SCI, and replay is
+clearance-checked and all-or-nothing, so a WAL record above the restoring
+principal's clearance refuses the whole restore with nothing applied.
+
 | Function | Purpose | On failure |
 |---|---|---|
-| `qihse_backup_result_t qihse_backup_write(void* store, void* user, const qihse_snapshot_manifest_t* manifest, const char* path, qihse_backup_descriptor_t* out)` | Write the data `manifest` refers to. The manifest must already be recorded and verify, and the caller's authorized view must cover its declared object count. | `QIHSE_BACKUP_ERR_ARGUMENT` (including a `NULL` context), `_ERR_DENIED`, `_ERR_MANIFEST`, `_ERR_COVERAGE`, `_ERR_KEY_MATERIAL`, `_ERR_IO`. `out` is zeroed on entry, so a failed call never returns a partial descriptor |
-| `qihse_backup_result_t qihse_backup_restore(void* store, void* user, const qihse_snapshot_manifest_t* manifest, const char* path, qihse_backup_descriptor_t* out)` | Restore the data `manifest` refers to, after verifying the manifest, the container checksum, the snapshot id and the WAL continuation point. | the same enum, plus `_ERR_TRUNCATED`, `_ERR_CHECKSUM`, `_ERR_SNAPSHOT_MISMATCH`, `_ERR_WAL_POINT` |
+| `qihse_backup_result_t qihse_backup_write_signed(void* store, void* user, const qihse_snapshot_manifest_t* manifest, const qihse_uuid_t* signer_node, const char* path, qihse_backup_descriptor_t* out)` | Write the data `manifest` refers to as a signed container (no WAL section; the descriptor's WAL fields come back zeroed). The manifest must already be recorded and verify, the caller's authorized view must cover its declared object count, and the signer must be an enrolled, APPROVED, key-holding node identity. | `QIHSE_BACKUP_ERR_ARGUMENT` (including a `NULL` context), `_ERR_DENIED`, `_ERR_MANIFEST`, `_ERR_COVERAGE`, `_ERR_KEY_MATERIAL`, `_ERR_SIGNER`, `_ERR_IO`. `out` is zeroed on entry, so a failed call never returns a partial descriptor |
+| `qihse_backup_result_t qihse_backup_write_signed_wal(void* store, void* user, const qihse_snapshot_manifest_t* manifest, const qihse_uuid_t* signer_node, const char* path, const uint8_t* wal_segment, size_t wal_len, qihse_backup_descriptor_t* out)` | Same writer plus a bounded post-snapshot WAL segment captured at the manifest's continuation offset; the whole segment is validated (per-record CRC32, bounded NUL-free keys/values, strictly increasing LSNs) before anything is written, and its SHA-384, length and LSN range go into the signed header. | the same enum, plus `_ERR_TRUNCATED` for a segment that fails validation and `_ERR_WAL_POINT` for one that does not start exactly at the continuation offset |
+| `qihse_backup_result_t qihse_backup_restore_signed(void* store, void* user, const qihse_snapshot_manifest_t* manifest, const char* path, bool operator_override, qihse_backup_descriptor_t* out)` | Restore after verifying the manifest, the container version and structure, the signature against the recorded signer's currently enrolled key, both payload digests, the snapshot/WAL binding, and a clearance pre-flight over every WAL record — all before the dataset is replaced. The override skips ONLY the signature/signer gate, only for a principal holding `QIHSE_SCOPE_SECURITY_ADMIN`; every other gate stays in force. | the same enum, plus `_ERR_TRUNCATED`, `_ERR_CHECKSUM`, `_ERR_SIGNATURE`, `_ERR_VERSION`, `_ERR_SNAPSHOT_MISMATCH`, `_ERR_WAL_POINT` |
+| `qihse_backup_result_t qihse_backup_verify(void* store, void* user, const char* path, qihse_backup_descriptor_t* out)` | Verify-only entry point: structure, version, both digests, WAL-section coherence and the signature with signer admissibility re-checked — without materializing the payload or applying the WAL section. `out` is optional and carries the container's claims (signer identity, WAL LSN range) on success. | the same enum |
 | `const char* qihse_backup_result_name(qihse_backup_result_t r)` | Result name. | `NULL` |
 
 `qihse_backup_descriptor_t` reports what a written container holds: snapshot id,
 WAL continuation offset, max generation, object count, data bytes, the data
 SHA-384, the manifest body digest it was bound to, the encryption key id, and
-the schema header. **Known boundary, stated in the header:** the container is
-integrity-checked but not authenticated — a writer with filesystem access can
-substitute a container that agrees with the manifest, because the manifest
-carries no signature. Authenticating backups against the node identity key is
-the documented follow-up.
+the schema header. The earlier "known boundary" recorded here — that the
+container was integrity-checked but not authenticated — is closed by the signed
+v3 form above; the residual boundary that remains is the deliberate operator
+override parameter, which skips only the signature gate and nothing else.
 
-Legacy whole-store export, `src/tractable/qihse_backup.c` — **partial, stub**:
+Whole-store and incremental export, `src/tractable/qihse_backup.c` —
+**implemented**:
 
 | Function | Purpose | On failure |
 |---|---|---|
-| `int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, qihse_backup_info_t* info)` | Whole-store export. Requires an authenticated context. | `-1` argument, `-2` denied | `-1` |
-| `int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, uint64_t since_lsn, qihse_backup_info_t* info)` | Incremental export. | `-1` |
-| `int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path)` | Restore from a container. | `-1` argument, `-2` denied |
+| `int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, qihse_backup_info_t* info)` | Whole-store export through the KV layer's authorization-aware `qihse_kv_save_user()`; refuses the whole export when any live record is outside the caller's clearance/SCI, and renames into place only once every byte is down. | `-1` argument, `-2` denied |
+| `int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* output_path, uint64_t since_lsn, qihse_backup_info_t* info)` | Real delta export (`BACKUP_INCREMENTAL` container): only records whose change sequence is strictly greater than the cursor, tombstones included, clearance/SCI-filtered at the KV layer, carrying the no-leak resume point. It formerly returned `UNSUPPORTED`; it no longer does. | `-1` argument, `-2` denied |
+| `int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path)` | Restore from a whole-store container; deliberately refuses a `BACKUP_INCREMENTAL` container (a delta is not a whole-store image). | `-1` argument, `-2` denied, `UNSUPPORTED` for a delta container |
 | `int qihse_backup_list_user(qihse_user_t* user, const char* dir, qihse_backup_info_t** out_backups, size_t* out_count)` | List containers in a directory. | `-1` |
 | `int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path)` | Verify a container's checksum. | `-1` argument, `-2` denied |
 | `void qihse_backup_info_free(qihse_backup_info_t* info)` | Release a listing entry. | n/a |
 
-> **Contradiction with the code:** the legacy surface is a stub.
-> `qihse_backup_full_user()` in `src/tractable/qihse_backup.c` writes an empty data
-> section and carries an explicit `TODO: iterate KV store and write all
-> key-value pairs`; `data_len` is derived from the file size rather than from
-> captured records. These functions take no security context, so they can only
-> ever move unclassified data. Use `qihse_backup_write()`/`qihse_backup_restore()`
-> for real backups.
+An earlier revision of this section called the tractable surface a stub that
+wrote an empty data section (`qihse_backup_full_user` carried a `TODO: iterate
+KV store`). That was true then and is no longer: the writer now produces its
+data section through the KV layer's authorized export, the incremental writer
+produces a real delta, and the surface is exercised by
+`tests/test_incremental_export.c` plus the argument-refusal cases in
+`tests/test_federation_backup.c`.
 
 ### 2.4 Reconciliation sequence and rejoin state
 
@@ -482,7 +518,9 @@ carries `peer_verified` for exactly that reason.
 
 Sources: `src/federation/qihse_federation_mtls.c`,
 `src/federation/qihse_federation_transport.c`.
-Tests: `tests/test_federation_mtls.c`, `tests/test_federation_transport.c`.
+Tests: `tests/test_federation_mtls.c`, `tests/test_federation_transport.c`,
+`tests/test_federation_crl.c` (node-side CRL), `tests/test_federation_ca.c`
+(the out-of-process CA tool).
 
 ### 5.1 Federation CA — `include/qihse_federation_mtls.h`
 
@@ -496,6 +534,9 @@ Tests: `tests/test_federation_mtls.c`, `tests/test_federation_transport.c`.
 | `qihse_peer_verdict_t qihse_federation_peer_verify(void* store, void* user, const uint8_t* cert_fingerprint, size_t fingerprint_len, qihse_uuid_t* out_node_id, qihse_runtime_trust_t* out_trust)` | The three-layer peer decision, layers 2 and 3 (fingerprint match and runtime trust). Layer 1 (key possession) has already happened in the handshake. | `QIHSE_PEER_REJECT_NO_CERT` / `_UNKNOWN_FINGERPRINT` / `_NOT_YET_APPROVED` / `_REVOKED` / `_UNTRUSTED` / `_MALFORMED` |
 | `const char* qihse_federation_tls_group_list(void)` | Hybrid post-quantum key-exchange group list (X25519MLKEM768). | `NULL` |
 | `const char* qihse_federation_tls_min_version(void)` | Minimum accepted TLS version. | `NULL` |
+| `bool qihse_federation_crl_load(void* operator_user, const char* crl_path)` | Load (or reload) the append-only CRL file the out-of-process CA tool writes (format `QIHSE-FED-CRL-V1`). The file and the KV `fednode:` record compose: either source saying REVOKED refuses the peer at layer 2 of `qihse_federation_peer_verify()`, with the same verdict. A malformed configured record fails the whole load and leaves the check failing closed (sticky) until a valid CRL is loaded or `crl_path == NULL` explicitly clears the source. Requires an operator context holding `QIHSE_SCOPE_NODE_REVOKE`; `NULL` is refused. | `false` |
+| `bool qihse_federation_crl_check(const qihse_uuid_t* node_id, const uint8_t* node_fingerprint, bool* out_revoked)` | Strict lookup against the loaded snapshot, matching by node UUID or by fingerprint. No I/O, no context — the authority gate is at load time. | `false` only when the configured CRL failed to load (fail closed); never verifies as clean |
+| `void qihse_federation_crl_state(qihse_federation_crl_status_t* out)` | Snapshot state for diagnostics: entry count, whether a CRL path is configured, whether the last load failed. | n/a |
 
 `QIHSE_FEDERATION_PEM_MAX` is 16384 bytes: an ML-DSA-87 certificate carries a
 2592-byte public key and a 4627-byte signature, so a pre-quantum-sized buffer
@@ -529,7 +570,8 @@ would silently truncate.
 
 Source: `src/black_hole/qihse_kv_store.c`.
 Tests: `tests/test_kv_read_integrity.c`, `tests/test_kv_security_regression.c`,
-`tests/test_blob_persistence_regression.c`.
+`tests/test_blob_persistence_regression.c`, `tests/test_incremental_export.c`
+(change sequence and delta export, `make test-incremental-export`).
 
 The KV store is the storage substrate the federation APIs write through. The
 `_user` variants are the authorization-aware forms; the context-free forms are
@@ -557,6 +599,10 @@ intentionally restricted to unclassified data.
 | `void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data)` | Context-free enumeration. | n/a |
 | `size_t qihse_kv_clear_user(...)`, `size_t qihse_kv_clear(...)` | Clear entries; returns the number removed. | `0` |
 | `size_t qihse_kv_count_user(...)`, `size_t qihse_kv_count(...)` | Count entries. | `0` |
+| `uint64_t qihse_kv_change_seq(qihse_kv_store_t* store)` | The store-global atomic change sequence: advanced on every authorized mutation, never on reads or unauthorized mutations. Stored as the 7th field of the KV record header; older 5/6-field records decode with the default sequence 0. | `0` |
+| `int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq)` | In-memory delta: exactly the mutations strictly greater than `since_seq`, in ascending sequence order, tombstones included, authorization-filtered at the KV layer. The resume point is the highest sequence the principal may see — never the global high-water, so hidden mutations cannot be counted from it. | non-zero |
+| `int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user, uint64_t since_seq, uint64_t* out_resume_seq)` | File form of the same delta stream; `qihse_backup_incremental_user()` ([§2.3](#23-snapshot-backup--includeqihse_backuph)) seals it into a `BACKUP_INCREMENTAL` container. | non-zero |
+| `void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)` | Release a delta record array. | n/a |
 
 ---
 
@@ -859,6 +905,67 @@ make APPROVED; enrollment remains the gate, and the durable accessors re-read
 the identity record, so a discovered-but-unenrolled node resolves to nothing
 usable. Nothing may treat this UUID as evidence of identity.
 
+### 8.9 Scoped consensus — `include/qihse_consensus.h`
+
+Source: `src/federation/qihse_consensus.c`.
+Test: `tests/test_consensus.c` (`make test-consensus`, part of the default
+`make test` list; 20 deterministic scenarios).
+
+A tick-driven, single-threaded state machine that gives one scoped replication
+group a leader term, a replicated log, and majority commitment: persistent
+term/voted-for/fencing-epoch state written before it takes effect, log matching
+with conflicting-suffix truncation, election restricted to up-to-date
+candidates, commit only on strict majority plus the current-term rule,
+step-down on a higher term, stale fencing epochs rejected before any term or
+log logic, leader-side log compaction with digest/fencing-validated follower
+snapshot install, and single-server membership changes. It is deliberately NOT
+named Raft; the header states what is absent (joint consensus, pre-vote,
+leadership transfer, leader-lease reads, client-session dedup — the F2 ledger
+owns that — and peer authentication, which belongs to the injected transport).
+All time enters through the caller-supplied tick; there are no threads and no
+wall-clock reads, so a scenario reproduces exactly.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg, qihse_consensus_send_fn send)` | Open a group member (record file, base member set, timeouts). | `NULL` |
+| `void qihse_consensus_close(qihse_consensus_t* cs)` | Release the member. | n/a |
+| `void qihse_consensus_tick(qihse_consensus_t* cs, uint64_t now_ms)` | Advance time: elections, heartbeats, retries, compaction re-evaluation. | n/a |
+| `void qihse_consensus_receive(qihse_consensus_t* cs, const qihse_consensus_msg_t* msg)` | Ingest one message from the injected transport. | n/a |
+| `bool qihse_consensus_propose(qihse_consensus_t* cs, const qihse_user_t* user, const void* payload, size_t payload_len, uint16_t classif, uint16_t sci)` | Append a DATA entry on the leader. The classification metadata rides with the entry and is only disclosed through the committed-read path below, per entry, with an authenticated principal. | `false` |
+| `bool qihse_consensus_propose_membership(qihse_consensus_t* cs, const qihse_user_t* user, qihse_consensus_membership_op_t op, const qihse_uuid_t* member)` | Propose a one-member transition (leader only, one in flight, refused not queued). Operator-grade: `user` must be a non-NULL OPERATOR; a lesser role or `NULL` is refused outright. | `false` |
+| `bool qihse_consensus_read_committed(const qihse_consensus_t* cs, const qihse_user_t* user, uint64_t from_index, qihse_consensus_entry_t* out_entries, size_t max_entries, size_t* out_count)` | Read committed entries with per-entry authorization; entries at or below the snapshot index are served from the snapshot under the same check. | `false` |
+| `bool qihse_consensus_get_membership(const qihse_consensus_t* cs, qihse_consensus_membership_t* out)` | Introspection: effective member set, majority size, pending transition, self-removed. | `false` |
+| `qihse_consensus_role_t qihse_consensus_role(const qihse_consensus_t* cs)` | Current role. | n/a |
+| `uint64_t qihse_consensus_term(const qihse_consensus_t* cs)` / `qihse_consensus_fencing_epoch(...)` / `qihse_consensus_commit_index(...)` / `qihse_consensus_last_log_index(...)` / `qihse_consensus_last_log_term(...)` / `qihse_consensus_snapshot_index(...)` | Introspection getters; no payload disclosure. | `0` |
+| `bool qihse_consensus_voted_for(const qihse_consensus_t* cs, qihse_uuid_t* out)` / `bool qihse_consensus_leader_id(const qihse_consensus_t* cs, qihse_uuid_t* out)` | Vote/leader identity probes. | `false` when the vote is open / no leader is recognized |
+| `bool qihse_consensus_is_stale_epoch(const qihse_consensus_t* cs, uint64_t epoch)` | Fenced-off test for a caller-supplied epoch. | `false` |
+| `bool qihse_consensus_group_available(const qihse_consensus_t* cs, uint64_t now_ms)` | Strong-write availability for THIS GROUP ONLY — never for LOCAL namespaces. | `false` |
+| `void qihse_consensus_get_counters(const qihse_consensus_t* cs, qihse_consensus_counters_t* out)` | Observability counters (elections, rejections, snapshots, membership). | n/a |
+| `const char* qihse_consensus_role_name(qihse_consensus_role_t role)` | Role name. | `NULL` |
+
+### 8.10 Controller C client — `include/qihse_controller.h`
+
+Source: `src/controller/qihse_controller.c`.
+
+The C reference client for the `FEDERATION.*` RESP command surface:
+explicit authentication, RESP2/RESP3, and the same decoder bounds as the
+server (`QIHSE_CTRL_MAX_BULK` 16 MiB, `QIHSE_CTRL_MAX_ITEMS` 1 Mi items,
+`QIHSE_CTRL_MAX_DEPTH` 32). The 80 declared `qihse_ctrl_*` wrappers cover the
+node, trust, namespace, lease, epoch, group, watch, snapshot, schema, supply
+chain, build and security-audit command families. The Python and Rust SDKs are
+higher-level ports of the same surface — see
+[§9](#9-python-sdk--pythonqihse) and the note at the end of it.
+
+### 8.11 Incremental export — `include/qihse_export.h`
+
+Source: `src/black_hole/qihse_export.c`.
+Test: `tests/test_incremental_export.c` (`make test-incremental-export`).
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_export_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq, char* err, size_t err_cap)` | The export-layer form of the delta ([§6](#6-key-value-store--includeqihse_kv_storeh)): the mutations strictly above the cursor, filtered at the KV layer, with the no-leak resume point. Unlike the raw KV form, this surface REFUSES a `NULL` user outright. | `false`, with `*out_records` `NULL` and nothing partially returned |
+| `bool qihse_export_tenant_user(qihse_kv_store_t* kv, qihse_blob_store_t* blobs, uint32_t tenant_id, qihse_user_t* user, const char* out_path, char* err, size_t err_cap)` | Whole-tenant export; a principal may only export its own tenant, `NULL` is denied. | `false` |
+
 ---
 
 ## 9. Python SDK — `python/qihse/`
@@ -882,6 +989,7 @@ reachable only from their module (`Container` in `python/qihse/core.py`,
 | `python/qihse/neural.py` | `NeuralClassifier`, `KeystoneClass` | `classify(text) -> (class, name, confidence)` |
 | `python/qihse/anchor.py` | `AnchorIndex` | `lower_bound`, `search` |
 | `python/qihse/hardware.py` | `HardwareProfiler`, `HardwareProfile` | `get_profile()` |
+| `python/qihse/controller.py` | `Controller`, `Watch`, `Reply`, the `Controller*Error` hierarchy, and the `MAX_BULK_BYTES`/`MAX_ARRAY_ITEMS`/`MAX_DEPTH` bounds | A synchronous stdlib-only RESP client for the `FEDERATION.*` controller surface, with explicit authentication, a bounded exact parser using the same limits as the C client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and resumable watches. Verified by `python/tests/test_controller_sdk.py` (59 tests, run by CI's `unittest discover`) |
 
 Selected method signatures:
 
@@ -927,6 +1035,16 @@ default cleartext server path in the SDK.
 (`os.path.dirname` of the package), then from a list of system install
 locations. If your build lives elsewhere, make it discoverable to the dynamic
 linker rather than editing the search list.
+
+**Rust controller SDK.** The same controller surface has a Rust port at
+`rust/qihse-rs/src/controller.rs`: pure `std` (no Tokio, no unsafe), the
+`FEDERATION.*` command wrappers over a bounded RESP parser with the C
+client's limits, and a `Watch` type with at-least-once resume (a reconnect
+rewinds to the last acked cursor). Its tests live in
+`rust/qihse-rs/tests/controller_sdk.rs` and run in CI
+(`cargo test --locked --test controller_sdk`). The compatibility SDKs under
+`sdks/` are a separate, older surface — see
+[§12](#12-known-gaps-and-unverified-areas).
 
 ---
 
@@ -1119,38 +1237,52 @@ Federation and operations state is namespaced inside the caller's KV store:
 
 Stated plainly rather than omitted:
 
-1. **Backup writer — implemented; the roadmap entry is stale.** The ROADMAP
-   follow-up list still says "the writer that produces the referenced data is
-   not written". The writer and reader exist in `src/federation/qihse_backup.c`,
+1. **Backup writer — implemented.** An earlier revision of this list (and of
+   the ROADMAP) said the writer that produces the referenced data was not
+   written. The writer and reader exist in `src/federation/qihse_backup.c`,
    are declared in `include/qihse_backup.h`, are exported by `libqihse.so`, and
-   are verified by `tests/test_federation_backup.c`, which is part of the
-   default `make test` list. The *legacy* whole-store surface in
-   `src/tractable/qihse_backup.c` is still a stub — see
+   are verified by `tests/test_federation_backup.c`, `tests/test_backup_auth.c`
+   and `tests/test_incremental_export.c`, all part of the default `make test`
+   list. The *whole-store* surface in `src/tractable/qihse_backup.c` is no
+   longer a stub either — see [§2.3](#23-snapshot-backup--includeqihse_backuph).
+2. **Backup authentication — implemented.** The container is signed: the v3
+   form's ML-DSA signature covers the whole header (manifest checksum, data
+   and WAL digests, signer identity/algorithm inside the signed region), the
+   signer is re-checked against the enrolled identity at restore/verify time,
+   and v1/v2 are retired with wrong-version refusals. The residual boundary
+   is the deliberate `QIHSE_SCOPE_SECURITY_ADMIN` override, which skips only
+   the signature gate. Verified by `tests/test_backup_auth.c`. See
    [§2.3](#23-snapshot-backup--includeqihse_backuph).
-2. **Backup authentication — planned.** The backup container is
-   integrity-checked but not authenticated; the header states that
-   authenticating it against the node identity key is the follow-up.
-3. **Federation consensus — planned.** Scoped replication groups, terms and
-   voters exist as data structures, and `include/qihse_operations.h` implements
-   the ordered rejoin sequence. There is no Raft, no leader election and no
-   commit rule in the federation layer, and none is claimed.
+3. **Federation consensus — implemented, and still not called Raft.**
+   `include/qihse_consensus.h` / `src/federation/qihse_consensus.c` implement
+   the leader/term/log/commit/snapshot/membership mechanics for one scoped
+   group ([§8.9](#89-scoped-consensus--includeqihse_consensush)), verified by
+   `tests/test_consensus.c` (20 deterministic scenarios, `make test-consensus`).
+   The name is deliberately not Raft and the header's stated absences (joint
+   consensus, pre-vote, leadership transfer, leader-lease reads) still hold.
 4. **The `qihse_raft` module is separate and untested.** `include/qihse_raft.h`
    and `src/spinnaker/qihse_raft.c` implement a Raft-shaped state machine
    (election timeout, AppendEntries handling, ML-DSA-signed WAL entries) with no
    test target in `tests/` and no entry in the CI test list. The cluster
    failover path that *is* tested uses `qihse_cluster_failover`, a coordinator
-   rather than Raft. Treat the Raft module as unverified.
-5. **Python federation SDK — not written.** The Python package covers the
-   engines and UWP; it does not expose the `FEDERATION.*` controller surface.
-   Use RESP for controller work.
-6. **Rust SDK — implemented, unverified against the C surface.** An earlier
-   revision of this document said `sdks/rust/` contained only `Cargo.toml` and
-   `Cargo.lock`. It now contains nine modules under `sdks/rust/src/`
-   (`lib.rs`, `client.rs`, `query.rs`, `http.rs`, `mongo.rs`, `cdc.rs`,
-   `metrics.rs`, `types.rs`, `error.rs`). There is still no Rust test target and
-   no entry in the CI test list, so the honest label for this surface is
-   `partial — status unverified`: the source exists, nothing in the tree
-   exercises it.
+   rather than Raft. Treat the Raft module as unverified. It is unrelated to
+   the scoped consensus module of [§8.9](#89-scoped-consensus--includeqihse_consensush),
+   which does not use or embed it.
+5. **Python federation SDK — implemented.** `python/qihse/controller.py`
+   ([§9](#9-python-sdk--pythonqihse)) exposes the `FEDERATION.*` controller
+   surface with explicit authentication and the C client's RESP bounds;
+   `python/tests/test_controller_sdk.py` (59 tests) runs under CI's
+   `unittest discover`.
+6. **Rust compatibility SDK — implemented, unverified against the C surface.**
+   An earlier revision of this document said `sdks/rust/` contained only
+   `Cargo.toml` and `Cargo.lock`. It now contains nine modules under
+   `sdks/rust/src/` (`lib.rs`, `client.rs`, `query.rs`, `http.rs`, `mongo.rs`,
+   `cdc.rs`, `metrics.rs`, `types.rs`, `error.rs`). There is still no Rust test
+   target and no entry in the CI test list for this directory, so the honest
+   label for this surface is `partial — status unverified`: the source exists,
+   nothing in the tree exercises it. This is the older *compatibility* SDK; the
+   federation controller SDK at `rust/qihse-rs/` is separate and IS tested in
+   CI (see the end of [§9](#9-python-sdk--pythonqihse)).
 7. **Federation transport CA provisioning — external.** QIHSE can create and
    use a federation CA, but certificate provisioning for a real fleet is an
    operator procedure outside the process. The header states this.

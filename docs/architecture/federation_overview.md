@@ -7,13 +7,17 @@
 > `tests/test_federation_transport.c`, `tests/test_federation_rejoin.c`, and
 > `tests/test_federation_backup.c`.
 >
-> **Contradiction:** the "What is not implemented" section below is stale. The
-> replication transport (`src/federation/qihse_federation_repl.c`) and the mTLS
-> binding (`src/federation/qihse_federation_transport.c`) both exist and are
-> tested, as is the backup writer/reader (`src/federation/qihse_backup.c`,
-> `tests/test_federation_backup.c`). What remains true from that list is
-> consensus (there is deliberately no Raft in the federation layer) and the
-> controller SDKs (`planned`).
+> The tracked Phase 10 remainder has since landed: scoped consensus
+> (`tests/test_consensus.c`, `make test-consensus`, 20 deterministic
+> scenarios), the signed backup container and its authentication negative
+> tests (`tests/test_backup_auth.c`), the node-side CRL loader and the
+> out-of-process CA tool (`tests/test_federation_crl.c`,
+> `tests/test_federation_ca.c`, `make federation-ca`), the controller SDKs
+> (`python/tests/test_controller_sdk.py`, `rust/qihse-rs/tests/controller_sdk.rs`),
+> and the change-sequence delta export (`tests/test_incremental_export.c`,
+> `make test-incremental-export`). What remains open is the residual
+> boundaries each module states in its header — see
+> [What is not implemented](#what-is-not-implemented).
 
 QIHSE federation turns a cluster of QIHSE instances into a
 **partition-aware, security-first federation data plane**. It is designed to
@@ -58,37 +62,58 @@ anything, and it never holds private signing keys.
 | Area | Header | Source |
 |---|---|---|
 | Core federation | `include/qihse_federation.h` | `src/federation/qihse_federation.c` |
+| Scoped consensus | `include/qihse_consensus.h` | `src/federation/qihse_consensus.c` |
+| Replication sync | `include/qihse_federation_repl.h` | `src/federation/qihse_federation_repl.c` |
+| mTLS + node-side CRL | `include/qihse_federation_mtls.h` | `src/federation/qihse_federation_mtls.c` |
+| TLS transport | `include/qihse_federation_transport.h` | `src/federation/qihse_federation_transport.c` |
+| Rejoin | `include/qihse_federation_rejoin.h` | `src/federation/qihse_federation_rejoin.c` |
 | Supply chain | `include/qihse_supply_chain.h` | `src/federation/qihse_supply_chain.c` |
 | Runtime trust | `include/qihse_runtime_trust.h` | `src/federation/qihse_runtime_trust.c` |
 | Security audit | `include/qihse_security_audit.h` | `src/federation/qihse_security_audit.c` |
 | Operations | `include/qihse_operations.h` | `src/federation/qihse_operations.c` |
 | Backup writer/reader | `include/qihse_backup.h` | `src/federation/qihse_backup.c` |
 | Simulation | `include/qihse_federation_sim.h` | `src/federation/qihse_federation_sim.c` |
+| Controller C client | `include/qihse_controller.h` | `src/controller/qihse_controller.c` |
 | RESP surface | `include/qihse_resp_wire.h` | `src/spinnaker/qihse_resp_engine.c` |
 
 ## What is not implemented
 
-> **Section status: partial — this list is stale.** Three of its five entries
-> are now implemented and tested: the replication transport
-> (`src/federation/qihse_federation_repl.c`), the mTLS binding
-> (`src/federation/qihse_federation_transport.c`), and the backup
-> writer/reader (`src/federation/qihse_backup.c`, verified by
-> `tests/test_federation_backup.c`). What remains true is consensus (there is
-> deliberately no Raft) and the controller SDKs (`planned`). See the
-> contradiction note at the top of this document.
+> **Section status: implemented — the former gap list is closed.** The five
+> entries this section used to carry (replication transport, mTLS binding,
+> consensus, controller SDKs, backup execution) are all built and tested; the
+> landed state is recorded above in the module map. What this section now
+> carries is the honest residual inventory: the boundaries each landed module
+> states in its own header. None of these is a missing feature that silently
+> weakens a claim; each is a documented limit of what is built.
 
 Stated plainly so the documentation does not overstate the code:
 
-- **Replication transport.** Anti-entropy manifests and sync *plans* exist;
-  the transport that would execute a plan does not.
-- **mTLS binding.** Node identity and signed frames exist; the TLS binding for
-  federation RPC attaches where the overlay transport lands.
-- **Consensus.** Scoped replication groups and quorum evaluation exist. There
-  is deliberately no Raft: the brief forbids the label without the full safety
-  mechanics, so none is claimed.
-- **Controller SDKs.** The RESP surface is complete; Rust and Python SDKs are not.
-- **Backup execution.** Snapshot *manifests* are recorded and verified; the
-  backup writer that produces the referenced data is not part of this work.
+- **Consensus is deliberately not called Raft.** The scoped consensus module
+  (`include/qihse_consensus.h`, `src/federation/qihse_consensus.c`, verified by
+  `tests/test_consensus.c` via `make test-consensus`, 20 deterministic
+  scenarios) implements persistent
+  term/voted-for/fencing state, log matching, election restriction,
+  majority+current-term commit, higher-term step-down, log compaction with
+  follower snapshot install, and single-server membership changes. It is still
+  not named Raft, because the full algorithm's mechanics are not all present:
+  membership changes are single-server only (no joint consensus), there is no
+  pre-vote, leadership transfer, or leader-lease linearizable read, client
+  session dedup stays in the F2 request ledger, and peer authentication is the
+  injected transport's job (mTLS/signed gossip), not this module's. Snapshots
+  travel as a single message capped at 24 entries, and every member is an
+  equal voter — no weights, witnesses, or learners. The header states each
+  boundary where it applies.
+- **CA provisioning is out-of-process by design.** The node consumes
+  revocation state (`qihse_federation_crl_load/_check/_state`, composing the
+  QIHSE-FED-CRL-V1 file with the KV `fednode:` record so either source
+  refuses), but certificate provisioning for a real fleet is an operator
+  procedure: `tools/qihse_federation_ca.c` (`make federation-ca`) is a
+  standalone tool, deliberately not linked into `libqihse.so`. Verified by
+  `tests/test_federation_crl.c` and `tests/test_federation_ca.c`.
+- **The controller does not execute hypervisor actions, and never will.** The
+  SDKs (`python/qihse/controller.py`, `rust/qihse-rs/src/controller.rs`, C
+  reference `include/qihse_controller.h`) wrap the RESP command surface with
+  explicit authentication; the federation boundary table above still applies.
 
 ## Related documents
 

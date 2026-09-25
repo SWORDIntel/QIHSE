@@ -255,7 +255,7 @@ For a task-oriented index, use the **[documentation hub](docs/README.md)**.
 | Reproduce performance tests | [Benchmarks](docs/benchmarks/) |
 | Read the deepest technical treatment | [Technical Whitepaper v1.1](docs/architecture/qihse_whitepaper_v1.1.md) |
 | See what is being built and in what order | [Roadmap](ROADMAP.md) |
-| Follow the future direction | [Federation Upgrade Plan](docs/plans/qihse_federation_upgrade_plan.md) |
+| Read the federation design of record (landed; residual boundaries documented) | [Federation Upgrade Plan](docs/plans/qihse_federation_upgrade_plan.md) |
 
 The full documentation index is **[`docs/README.md`](docs/README.md)**.
 

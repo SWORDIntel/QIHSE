@@ -1,14 +1,20 @@
 # Replication, Backup & Operational Features
 
-> **Status: partial.** Streaming replication, read-replica routing, parallel
-> query and the connection pooler are implemented. Backup/restore has an
-> authenticated implementation under `src/tractable/qihse_backup.c`, but **no
-> test in `tests/` covers that API** — the only backup test in the tree is
-> `tests/test_federation_backup.c`, which covers the federation writer/reader
-> instead; see
+> **Status: implemented.** Streaming replication, read-replica routing,
+> parallel query, the connection pooler, and backup/restore on both sides are
+> implemented and tested: the whole-store/incremental surface under
+> `src/tractable/qihse_backup.c` is verified by
+> `tests/test_incremental_export.c` (`make test-incremental-export`) plus the
+> argument-refusal cases in `tests/test_federation_backup.c`, and the
+> manifest-bound federation container under `src/federation/qihse_backup.c`
+> is verified by `tests/test_federation_backup.c` and
+> `tests/test_backup_auth.c` (`make test-backup-auth`); see
 > [API_REFERENCE.md §2.3](../API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph).
+> What remains in the container family is documented residual choices, not
+> gaps (the operator override's narrow scope; whole-store restore refusing a
+> delta container on purpose).
 >
-> Two claims in earlier revisions of this document were wrong and are corrected
+> Three claims in earlier revisions of this document were wrong and are corrected
 > in place:
 >
 > - **`qihse_repl_apply_wal()` replays.** It no longer only records an LSN: the
@@ -21,10 +27,11 @@
 > - **Parallel query is implemented**, not a stub. Verified by
 >   `tests/test_parallel_query.c` (`make test-parallel-query`) and the
 >   `parallel-query` gold workload.
->
-> One limit remains: `qihse_backup_incremental_user()` is not a delta export —
-> it returns UNSUPPORTED by design, because the KV store exposes no change
-> sequence (documented in the API snippet below).
+> - **Incremental export is real**, not UNSUPPORTED. The KV store now stamps a
+>   store-global atomic change sequence (7th field of the record header), and
+>   `qihse_backup_incremental_user()` delivers a `BACKUP_INCREMENTAL` container
+>   built from the KV layer's clearance-filtered delta stream (documented in
+>   the API snippet below).
 
 ## Overview
 
@@ -76,35 +83,65 @@ qihse_read_replica_route(pool, &host, &port);
 ## Backup & Restore (`src/tractable/qihse_backup.c`)
 
 ### Backup Types
-- **Full**: Snapshot all KV store data
-- **Incremental**: Only keys modified since a given LSN
-- **WAL**: WAL segment archive
+- **Full**: Snapshot all KV store data, through the KV layer's
+  authorization-aware export (a record outside the caller's clearance/SCI
+  refuses the whole export — a full container claims complete coverage)
+- **Incremental**: A real delta container (`BACKUP_INCREMENTAL`) built from
+  the KV layer's change-sequence delta stream — only records whose stamped
+  sequence is strictly greater than the cursor, tombstones included,
+  clearance/SCI-filtered at the KV layer, carrying the no-leak resume point
+  (the highest sequence the principal may see, never the global high-water)
+  as its continuation
+- **WAL**: WAL segment archive (the federation container's WAL section below)
 
-### Backup Format
+### Backup Format (whole-store/incremental container)
 ```
 [8-byte magic: "QIHSEBAK"]
-[4-byte version]
+[4-byte version (2)]
 [4-byte type]
 [8-byte start_lsn]
 [8-byte end_lsn]
 [8-byte timestamp]
-[8-byte checksum (FNV-1a)]
 [8-byte data_length]
-[data: key-value tuples]
+[4-byte writer_user_id]
+[2-byte writer_classification]
+[2-byte writer_sci]
+[8-byte checksum (FNV-1a over header[0..56) + data)]
+[data: the KV layer's record stream, classification/SCI included]
 ```
+A 64-byte fixed header, little-endian, written atomically (renamed into place
+only once every byte is down, so a failed export leaves no container and no
+partial dataset).
 
 ### API
 ```c
 qihse_backup_info_t info;
 qihse_backup_full_user(kv, user, "/backups/full.bak", &info);
-/* Incremental export is NOT implemented: the KV store exposes no change
-   sequence, so this returns UNSUPPORTED rather than shipping a full snapshot
-   labelled incremental. Use the manifest-bound federation backup, which
-   carries a WAL continuation point, for delta restore. */
+/* Incremental export IS implemented: the KV store stamps a store-global
+   change sequence, so this writes a BACKUP_INCREMENTAL container holding
+   only the delta above since_lsn plus the no-leak resume point. */
 qihse_backup_incremental_user(kv, user, "/backups/incr.bak", since_lsn, &info);
+/* Whole-store restore deliberately refuses a delta container — a delta is
+   not a whole-store image (returns UNSUPPORTED). */
 qihse_restore_user(kv, user, "/backups/full.bak");
 qihse_backup_verify_user(user, "/backups/full.bak");
 ```
+
+### Federation containers (`src/federation/qihse_backup.c`)
+
+The manifest-bound federation backup writes an authenticated container in the
+signed v3 form: `[ header 464 ][ signature ][ data ][ WAL ]`. The ML-DSA
+signature covers the whole fixed header — manifest checksum, data and WAL
+SHA-384 digests, WAL LSN range, signer identity and algorithm inside the
+signed region — and the WAL section's records carry classification/SCI, with
+a clearance pre-flight and all-or-nothing replay. `qihse_backup_verify()` is
+the verify-only entry point (checks the WAL section without applying it), and
+the retired v1/v2 forms are refused by version with no downgrade. The single
+deliberate residual choice in this family is the operator override on
+`qihse_backup_restore_signed()`, which skips only the signature gate and only
+for a `QIHSE_SCOPE_SECURITY_ADMIN` principal. See
+[API_REFERENCE.md §2.3](../API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph)
+for the full surface.
 
 ## Parallel Query (`src/tractable/qihse_parallel_query.c`)
 
@@ -221,5 +258,15 @@ codes, the inherited security context and a real `pthread_create()` failure
 result. The speedup it measures is printed rather than asserted, because the
 traversal is serial.
 
-**Not covered because no test exists:** the authenticated backup/restore API in
-`src/tractable/qihse_backup.c`.
+**Backup coverage.** `tests/test_incremental_export.c`
+(`make test-incremental-export`) covers the change sequence and the whole
+delta-export family, including `qihse_backup_incremental_user`'s container
+(only the delta, no protected bytes for a low-clearance principal) and the
+whole-store restore's deliberate refusal of a delta container.
+`tests/test_federation_backup.c` covers the manifest-bound federation surface
+and the whole-store argument gates; `tests/test_backup_auth.c`
+(`make test-backup-auth`) covers the signed v3 container's refusal paths
+(tampered data/signature, wrong signer, revoked signer, retired v1/v2, the
+operator override's narrow scope, and the low-clearance negative test).
+An earlier revision of this section said no test covered the
+`src/tractable/qihse_backup.c` API; that was true then and is no longer.

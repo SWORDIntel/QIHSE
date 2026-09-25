@@ -3,7 +3,8 @@
 > **Status: implemented** — the lease primitive, fencing high-water mark,
 > request-id idempotency index, and scoped replication groups are verified by
 > `tests/test_federation_f4.c`. The document's statement that no consensus
-> algorithm is claimed matches the code.
+> algorithm runs *in this layer* matches the code; the scoped consensus module
+> the federation layer now has is a separate component (see the closing note).
 
 QIHSE provides a generic, auditable atomic primitive. It does **not** implement
 hypervisor HA policy — the controller decides when a lease may be acquired.
@@ -78,8 +79,18 @@ typedef struct {
 An outage in one group must not stop an unrelated group. A reachable witness
 breaks a tie between two voters but cannot form quorum on its own.
 
-**No consensus algorithm is claimed.** There is deliberately no Raft here,
-because the brief forbids the label without persistent term, voted-for
-persistence, log index/term, leader election, majority commitment, log
-matching, current-term commit rules, membership-change semantics,
-snapshot/install-snapshot, and the crash and partition tests that go with them.
+**No consensus algorithm runs in this layer.** The lease and epoch primitives
+evaluate quorum from group records; they do not elect leaders or replicate
+logs. Consensus-backed authority for a scoped group now exists as a separate
+module — `include/qihse_consensus.h` / `src/federation/qihse_consensus.c`,
+verified by `tests/test_consensus.c` — which implements exactly the mechanics
+this section once listed as the price of the label (persistent term and
+voted-for, log index/term, leader election, majority commitment, log matching,
+current-term commit, membership changes, snapshot/install-snapshot, with crash
+and partition scenarios) and still deliberately does not call itself Raft: the
+header states what is absent (joint consensus, pre-vote, leadership transfer,
+leader-lease reads) rather than claiming the name. Leases stay usable without
+it — the controller decides. `qihse_consensus` keeps its own per-group fencing
+epoch (`qihse_consensus_fencing_epoch()`, persisted in the group's record
+file), separate from the `fedepoch:` counter and the lease high-water mark
+above, which are unchanged.
