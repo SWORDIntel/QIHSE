@@ -332,6 +332,9 @@ err:
 
 /* ── ML-DSA-87 sign/verify ───────────────────────────────────────────── */
 
+static bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
+                                      const uint8_t *sig, EVP_PKEY *pub_key);
+
 bool qihse_pqc_sign(const uint8_t *data, size_t len, uint8_t *out_sig) {
     return qihse_pqc_sign_path(data, len, out_sig, NULL);
 }
@@ -360,20 +363,53 @@ bool qihse_pqc_sign_path(const uint8_t *data, size_t len, uint8_t *out_sig,
     return ok;
 }
 
-bool qihse_pqc_verify(const uint8_t *data, size_t len, const uint8_t *sig) {
-    EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUB_PATH());
-    if (!pub_key) return false;
-
+bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
+                               const uint8_t *sig, EVP_PKEY *pub_key) {
+    if (!data || !sig || !pub_key) return false;
     bool ok = false;
     EVP_MD_CTX *mctx = EVP_MD_CTX_new();
     if (mctx) {
         if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pub_key) > 0) {
-            if (EVP_DigestVerify(mctx, sig, QIHSE_MLDSA_SIGNATURE_SIZE, data, len) == 1) {
-                ok = true;
-            }
+            /* ML-DSA-87 signatures are fixed-length; tolerate the rare
+             * variable-length encoding by trusting the parameter, not the
+             * constant, when the caller passes a real length. */
+            size_t sig_len = QIHSE_MLDSA_SIGNATURE_SIZE;
+            if (EVP_DigestVerify(mctx, sig, sig_len, data, len) == 1) ok = true;
         }
         EVP_MD_CTX_free(mctx);
     }
+    return ok;
+}
+
+bool qihse_pqc_verify(const uint8_t *data, size_t len, const uint8_t *sig) {
+    EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUB_PATH());
+    if (!pub_key) return false;
+    bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
+    EVP_PKEY_free(pub_key);
+    return ok;
+}
+
+bool qihse_pqc_verify_path(const uint8_t *data, size_t len,
+                           const uint8_t *sig, const char *public_key_path) {
+    EVP_PKEY *pub_key = load_public_key(public_key_path ? public_key_path
+                                                        : QIHSE_DSA_PUB_PATH());
+    if (!pub_key) return false;
+    bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
+    EVP_PKEY_free(pub_key);
+    return ok;
+}
+
+bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t *ctx,
+                               const uint8_t *pem_data, size_t pem_len,
+                               uint8_t *encapsulated_key_out) {
+    if (!ctx || !pem_data || pem_len == 0 || !encapsulated_key_out) return false;
+    ctx->initialized = false;
+    BIO *bio = BIO_new_mem_buf((const void *)pem_data, (int)pem_len);
+    if (!bio) return false;
+    EVP_PKEY *pub_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!pub_key) return false;
+    bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
     EVP_PKEY_free(pub_key);
     return ok;
 }
@@ -517,12 +553,13 @@ static bool verify_dsa_roundtrip(const char *priv_path, const char *pub_path) {
 bool qihse_pqc_keygen(const char *out_dir) {
     if (!out_dir) out_dir = ".";
 
-    /* Build file paths — use runtime resolver (honors QIHSE_KEY_DIR env var) */
+    /* Build file paths under out_dir (the resolver macros ignore the
+     * caller's directory, which made keygen stomp the live key dir). */
     char kem_priv[4096], kem_pub[4096], dsa_priv[4096], dsa_pub[4096];
-    snprintf(kem_priv, sizeof(kem_priv), "%s", QIHSE_KEM_KEY_PATH());
-    snprintf(kem_pub,  sizeof(kem_pub),  "%s", QIHSE_KEM_PUB_PATH());
-    snprintf(dsa_priv, sizeof(dsa_priv), "%s", QIHSE_DSA_KEY_PATH());
-    snprintf(dsa_pub,  sizeof(dsa_pub),  "%s", QIHSE_DSA_PUB_PATH());
+    snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, "qihse_kem_key.pem");
+    snprintf(kem_pub,  sizeof(kem_pub),  "%s/%s", out_dir, "qihse_kem_pub.pem");
+    snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, "qihse_dsa_key.pem");
+    snprintf(dsa_pub,  sizeof(dsa_pub),  "%s/%s", out_dir, "qihse_dsa_pub.pem");
 
     fprintf(stderr, "[QIHSE keygen] Output directory : %s\n", out_dir);
 

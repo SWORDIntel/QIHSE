@@ -9,6 +9,7 @@
 #include "qihse_timeseries.h"
 #include "qihse_column.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_qkp.h"
 #include "qihse_resp_cluster.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_failover.h"
@@ -58,6 +59,9 @@ typedef struct {
      * [HMAC-SHA384-keystream-XORed frame] — transport obfuscation only; bus
      * auth is separate. NULL/empty = plain frames. */
     const char* veil_key;
+    /* R4c QKP1 (CNSA 2.0 RESP handshake): zero-initialized = disabled
+     * (opportunistic cleartext). Set by the daemon from --pqc-* flags. */
+    qihse_qkp_config_t pqc;
     /* R4 replicated namespaces: keys matching one of these globs are
      * SOVEREIGN-LOCAL (never MOVED/CLUSTERDOWN-routed) and are expected to
      * exist on every node. Boot-time source of truth; REPL.MARK adds more

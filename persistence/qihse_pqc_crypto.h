@@ -169,6 +169,22 @@ bool qihse_pqc_sign_path(const uint8_t* data, size_t len, uint8_t* out_sig,
 bool qihse_pqc_verify(const uint8_t* data, size_t len, const uint8_t* sig);
 
 /*
+ * qihse_pqc_verify_path - Verify an ML-DSA-87 signature against an
+ * ARBITRARY public key PEM path (QKP handshake trust anchors).
+ */
+bool qihse_pqc_verify_path(const uint8_t* data, size_t len,
+                           const uint8_t* sig, const char* public_key_path);
+
+/*
+ * qihse_pqc_encapsulate_mem - Encapsulate against an in-memory PEM public
+ * key (QKP handshake: the server's KEM pub arrives on the wire in H1).
+ * Same outputs as qihse_pqc_encapsulate_peer.
+ */
+bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t* ctx,
+                               const uint8_t* pem_data, size_t pem_len,
+                               uint8_t* encapsulated_key_out);
+
+/*
  * qihse_pqc_keygen - Generate CNSA 2.0 keypairs natively in C.
  *
  * Writes four PEM files into out_dir (pass NULL or "." for the current

@@ -25,6 +25,7 @@
 #include "qihse_overlay.h"
 #include "qihse_kv_store.h"
 #include "qihse_fts.h"
+#include "qihse_qkp.h"
 #include "qihse_platform.h"
 #include <netdb.h>
 #include <pthread.h>
@@ -588,6 +589,10 @@ int main(int argc, char** argv) {
     const char* repl_glob_ptrs[16];
     size_t repl_glob_count = 0;
     uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
+    const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
+    const char* pqc_trusted[16];
+    size_t pqc_trusted_count = 0;
+    bool pqc_require = false;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -668,6 +673,13 @@ int main(int argc, char** argv) {
             snprintf(repl_globs[repl_glob_count], sizeof(repl_globs[0]), "%s", argv[i]);
             repl_glob_ptrs[repl_glob_count] = repl_globs[repl_glob_count];
             repl_glob_count++;
+        } else if (strcmp(a, "--pqc-identity-dir") == 0 && i + 1 < argc) {
+            pqc_identity_dir = argv[++i];
+        } else if (strcmp(a, "--pqc-trusted-pub") == 0 && i + 1 < argc) {
+            if (pqc_trusted_count >= sizeof(pqc_trusted) / sizeof(pqc_trusted[0])) return usage(argv[0]), 2;
+            pqc_trusted[pqc_trusted_count++] = argv[++i];
+        } else if (strcmp(a, "--pqc-require") == 0) {
+            pqc_require = true;
         } else if (strcmp(a, "--replicate-interval") == 0 && i + 1 < argc) {
             char* end = NULL; errno = 0;
             unsigned long v = strtoul(argv[++i], &end, 10);
@@ -806,6 +818,47 @@ int main(int argc, char** argv) {
             return 1;
     }
 
+    /* R4c QKP1: resolve identity/trust from --pqc-* flags.
+     *   --pqc-require            → identity + ≥1 trust anchor MUST exist,
+     *                              otherwise refuse to start.
+     *   opportunistic (default)  → missing keys ⇒ warn once, serve cleartext
+     *                              (the pre-PQC warning spam disappears once
+     *                              keys exist on the host). */
+    qihse_qkp_config_t pqc;
+    memset(&pqc, 0, sizeof(pqc));
+    pqc.require = pqc_require;
+    pqc.node_id = bind;
+    static char pqc_dsa_key[512], pqc_kem_key[512], pqc_kem_pub[512];
+    const char* pqc_dir = pqc_identity_dir ? pqc_identity_dir : "/etc/qihse/keys";
+    snprintf(pqc_dsa_key, sizeof(pqc_dsa_key), "%s/qihse_dsa_key.pem", pqc_dir);
+    snprintf(pqc_kem_key, sizeof(pqc_kem_key), "%s/qihse_kem_key.pem", pqc_dir);
+    snprintf(pqc_kem_pub, sizeof(pqc_kem_pub), "%s/qihse_kem_pub.pem", pqc_dir);
+    pqc.dsa_key_path = pqc_dsa_key;
+    pqc.kem_key_path = pqc_kem_key;
+    pqc.kem_pub_path = pqc_kem_pub;
+    pqc.trusted_pubs = pqc_trusted;
+    pqc.trusted_count = pqc_trusted_count;
+    if (pqc_require || pqc_identity_dir) {
+        bool have_keys = access(pqc.dsa_key_path, R_OK) == 0 &&
+                         access(pqc.kem_key_path, R_OK) == 0 &&
+                         access(pqc.kem_pub_path, R_OK) == 0;
+        if (!have_keys) {
+            if (pqc_require) {
+                fprintf(stderr, "qihse-cluster-daemon: --pqc-require but identity keys are missing under %s "
+                                "(need qihse_dsa_key.pem, qihse_kem_key.pem, qihse_kem_pub.pem); refusing to start\n", pqc_dir);
+                return 1;
+            }
+            if (pqc_identity_dir) {
+                fprintf(stderr, "qihse-cluster-daemon: PQC identity keys not found under %s; "
+                                "serving cleartext (opportunistic mode)\n", pqc_dir);
+            }
+            memset(&pqc, 0, sizeof(pqc));
+        }
+    } else if (pqc_require) {
+        fprintf(stderr, "qihse-cluster-daemon: --pqc-require requires --pqc-identity-dir; refusing to start\n");
+        return 1;
+    }
+
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
     config.store = store;
@@ -833,6 +886,13 @@ int main(int argc, char** argv) {
      * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
      * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
     config.veil_key = operator_password;
+    /* R4c: PQC must be OFF unless explicitly requested via --pqc-* flags.
+     * pqc.dsa_key_path points at a static buffer and is therefore always
+     * non-NULL — gating on it silently enabled opportunistic PQC (with the
+     * default /etc/qihse/keys identity!) on daemons started with no flags. */
+    if ((pqc_identity_dir != NULL || pqc_require) && pqc.dsa_key_path) {
+        config.pqc = pqc; /* opportunistic default: PQC on QKP1 probe, cleartext allowed */
+    }
     /* BM25 full-text search surface (FTS.BUILD / FTS.SEARCH): unlike
      * VECHYBRID, which expects the caller to bring an index, every cluster
      * daemon owns one over its local KV. In-memory by design: after a
@@ -872,8 +932,9 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s\n",
-            self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off");
+    fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s%s\n",
+            self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off",
+            config.pqc.dsa_key_path ? (config.pqc.require ? ", pqc=required" : ", pqc=opportunistic") : ", pqc=off");
     if (brain_enabled) {
         char default_dir[600];
         if (!brain_dir) {

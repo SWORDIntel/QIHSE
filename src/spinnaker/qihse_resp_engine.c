@@ -74,6 +74,7 @@ typedef struct qihse_resp_client_ctx qihse_resp_client_ctx_t;
 typedef struct {
     qihse_resp_server_t* server;
     int fd;
+    qihse_qkp_session_t* qkp;   /* R4c: non-null ⇒ every wire byte is sealed */
     qihse_user_t* user;
     uint32_t user_id;            /* numeric user id for federation attribution */
     uint64_t id;
@@ -235,6 +236,7 @@ struct qihse_resp_server {
     int listen_fd;
     bool running;
     bool accept_thread_started;
+    qihse_qkp_session_t* qkp;
     pthread_t accept_thread;
     pthread_mutex_t state_lock;
     pthread_cond_t clients_drained;
@@ -261,6 +263,9 @@ struct qihse_resp_server {
     bool bgsave_thread_alive;
     bool bgsave_in_progress;
     time_t last_save;
+    /* R4c QKP1: caller-owned handshake config (identity, trust anchors,
+     * require flag). NULL/zeroed = opportunistic cleartext-only server. */
+    qihse_qkp_config_t pqc;
     /* R4 replicated namespaces (REPL.*): globs whose keys are sovereign-
      * local on every node, plus the anti-entropy bookkeeping REPL.STATUS
      * renders. repl_lock guards the whole list. */
@@ -631,6 +636,13 @@ static bool qihse_resp_write(qihse_resp_session_t* session, const void* data, si
         return true;
     }
     pthread_mutex_lock(&session->io_lock);
+    if (session->qkp) {
+        /* Sealed session: one AEAD frame per reply chunk. The frame carries
+         * its own 18-byte header, so size is bounded by the same limits. */
+        bool sealed_ok = qihse_qkp_send_sealed(session->qkp, session->fd, bytes, len);
+        pthread_mutex_unlock(&session->io_lock);
+        return sealed_ok;
+    }
     size_t written = 0;
     while (written < len) {
 #ifdef MSG_NOSIGNAL
@@ -1612,16 +1624,20 @@ static bool qihse_resp_watch_deliver(qihse_resp_session_t* session, const char* 
         return true; /* watcher mid-reply: transient, skip event, keep watch */
     }
     bool drop = false;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t w = send(session->fd, frame + sent, len - sent, QIHSE_WATCH_SEND_FLAGS);
-        if (w > 0) {
-            sent += (size_t)w;
-            continue;
+    if (session->qkp) {
+        drop = !qihse_qkp_send_sealed(session->qkp, session->fd, frame, len);
+    } else {
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t w = send(session->fd, frame + sent, len - sent, QIHSE_WATCH_SEND_FLAGS);
+            if (w > 0) {
+                sent += (size_t)w;
+                continue;
+            }
+            if (w < 0 && errno == EINTR) continue;
+            drop = true; /* EAGAIN: buffer full; EPIPE/ECONNRESET: peer gone */
+            break;
         }
-        if (w < 0 && errno == EINTR) continue;
-        drop = true; /* EAGAIN: buffer full; EPIPE/ECONNRESET: peer gone */
-        break;
     }
     pthread_mutex_unlock(&session->io_lock);
     free(frame);
@@ -8050,7 +8066,14 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
     }
 
     if (qihse_resp_arg_equal(sub, "LEASE.RENEW")) {
-        if (request->argc != 4) return qihse_resp_wrong_arity(session, "federation.lease.renew");
+        /* Phase-B (R7 fixes): fully-checked renewal.  The session principal
+         * is the holder candidate; an optional 5th argument carries the
+         * caller's expected generation (stale-renewal rejection).  Without
+         * it the caller explicitly declines ONLY the generation dimension
+         * (QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED) — server-side
+         * expiry and the holder check are always enforced core-side.
+         * Usage: FEDERATION LEASE.RENEW <lease_id> <expires_ms_abs> [expected_generation] */
+        if (request->argc != 4 && request->argc != 5) return qihse_resp_wrong_arity(session, "federation.lease.renew");
         char lid_str[QIHSE_UUID_STR_LEN + 1u];
         size_t ll = request->argv[2].len;
         if (ll == 0 || ll >= sizeof(lid_str)) return qihse_resp_error(session, "ERR invalid lease id");
@@ -8062,9 +8085,41 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid expiry");
         memcpy(exp_str, request->argv[3].data, xl); exp_str[xl] = '\0';
         uint64_t expires = (uint64_t)strtoull(exp_str, NULL, 10);
+        /* Wall-clock liveness (plan §42 partition risk documented in
+         * include/qihse_federation.h): the RESP layer has no HLC plumbed
+         * to the session yet, so physical ms comes from time(NULL). */
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000ULL;
+        uint64_t expected_generation = QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED;
+        if (request->argc == 5) {
+            char gen_str[32];
+            size_t gl = request->argv[4].len;
+            if (gl == 0 || gl >= sizeof(gen_str)) return qihse_resp_error(session, "ERR invalid expected generation");
+            memcpy(gen_str, request->argv[4].data, gl); gen_str[gl] = '\0';
+            expected_generation = (uint64_t)strtoull(gen_str, NULL, 10);
+        }
         qihse_federation_lease_t out;
-        if (!qihse_federation_lease_renew(session->server->store, session->user, &lid, expires, &out)) {
-            return qihse_resp_error(session, "ERR lease renew failed");
+        qihse_federation_lease_renew_status_t st =
+            qihse_federation_lease_renew_checked(session->server->store, session->user,
+                                                 &lid, expected_generation, now_ms,
+                                                 expires, &out);
+        if (st != QIHSE_LEASE_RENEW_OK) {
+            /* Distinct, honest errors — a client can finally tell WHY. */
+            switch (st) {
+                case QIHSE_LEASE_RENEW_ERR_EXPIRED:
+                    return qihse_resp_error(session, "ERR lease expired — re-acquire at a higher fencing epoch");
+                case QIHSE_LEASE_RENEW_ERR_HOLDER_MISMATCH:
+                    return qihse_resp_error(session, "ERR lease not held by this principal");
+                case QIHSE_LEASE_RENEW_ERR_GENERATION_MISMATCH:
+                    return qihse_resp_error(session, "ERR lease generation mismatch (stale renew) — LEASE.READ and retry");
+                case QIHSE_LEASE_RENEW_ERR_NOT_FOUND:
+                    return qihse_resp_error(session, "ERR lease not found");
+                case QIHSE_LEASE_RENEW_ERR_NOT_GRANTED:
+                    return qihse_resp_error(session, "ERR lease not granted (released)");
+                case QIHSE_LEASE_RENEW_ERR_STORE:
+                    return qihse_resp_error(session, "ERR lease store failure");
+                default:
+                    return qihse_resp_error(session, "ERR lease renew failed");
+            }
         }
         return qihse_resp_simple(session, "OK");
     }
@@ -10484,6 +10539,22 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         }
     }
 
+    /* R4c QKP1: peek the first byte. 'Q' ⇒ the client is starting the
+     * CNSA 2.0 handshake; anything else is cleartext RESP (refused when
+     * --pqc-require is on). On success every later byte on this socket is
+     * an AEAD frame decrypted below. */
+    if (server->pqc.dsa_key_path || server->pqc.require) {
+        qihse_qkp_session_t* qkp = NULL;
+        qihse_qkp_result_t qr = qihse_qkp_server_negotiate(fd, &server->pqc, &qkp);
+        if (qr == QIHSE_QKP_REJECTED) {
+            qihse_resp_session_pubsub_cleanup(&session);
+            qihse_resp_watch_detach(&session);
+            pthread_mutex_destroy(&session.io_lock);
+            return false;
+        }
+        session.qkp = qkp; /* NULL = opportunistic cleartext session */
+    }
+
     size_t capacity = QIHSE_RESP_INITIAL_BUFFER;
     if (capacity > server->max_request_bytes) capacity = server->max_request_bytes;
     uint8_t* buffer = (uint8_t*)malloc(capacity);
@@ -10534,12 +10605,43 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
             buffer = grown;
             capacity = next;
         }
-        ssize_t received = recv(fd, buffer + used, capacity - used, 0);
-        if (received == 0) break;
-        if (received < 0) {
-            if (errno == EINTR) continue;
-            successful = errno == ECONNRESET || errno == ENOTCONN;
-            break;
+        ssize_t received;
+        if (session.qkp) {
+            /* Sealed mode: one QSE1 frame per read; its plaintext is
+             * appended for the parser. Grow first if the largest frame
+             * cannot fit. */
+            if (capacity - used < QIHSE_QKP_MAX_FRAME + 64u && capacity < server->max_request_bytes) {
+                size_t next = capacity * 2u;
+                while (next - used < QIHSE_QKP_MAX_FRAME + 64u && next < server->max_request_bytes) next *= 2u;
+                uint8_t* grown = (uint8_t*)realloc(buffer, next);
+                if (!grown) {
+                    qihse_resp_error(&session, "OOM out of memory");
+                    successful = false;
+                    break;
+                }
+                buffer = grown;
+                capacity = next;
+            }
+            received = qihse_qkp_recv_sealed(session.qkp, fd, buffer + used, capacity - used);
+            if (received < 0) {
+                /* R4c: a sealed session that hits a crypto/replay failure
+                 * closes SILENTLY (per the QKP1 wire contract: "any mismatch,
+                 * tag failure, or unknown magic ⇒ connection closed"). No
+                 * cleartext reply on a failed sealed channel — the rejection
+                 * reason goes to the server log only. */
+                fprintf(stderr, "qihse qkp: sealed frame rejected on client %llu (rc=%zd)\n",
+                        (unsigned long long)session.id, received);
+                successful = false;
+                break;
+            }
+        } else {
+            received = recv(fd, buffer + used, capacity - used, 0);
+            if (received == 0) break;
+            if (received < 0) {
+                if (errno == EINTR) continue;
+                successful = errno == ECONNRESET || errno == ENOTCONN;
+                break;
+            }
         }
         used += (size_t)received;
     }
@@ -10549,6 +10651,9 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     pthread_mutex_destroy(&session.io_lock);
     free(session.io_buf);
     free(buffer);
+    /* R4c: release the sealed-session state (zeroes the derived keys) — it
+     * used to leak ~96 B of key material per closed sealed session. */
+    qihse_qkp_session_free(session.qkp);
     return successful;
 }
 
@@ -10759,6 +10864,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->tsdb = supplied->tsdb;
     server->column_store = supplied->column_store;
     server->fts = supplied->fts;
+    server->pqc = supplied->pqc;
     server->port = supplied->port;
     server->bus_port = supplied->bus_port;
     server->max_clients = supplied->max_clients;
