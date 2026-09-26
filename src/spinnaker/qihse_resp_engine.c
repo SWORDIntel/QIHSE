@@ -10638,13 +10638,24 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
             received = qihse_qkp_recv_sealed(session.qkp, fd, buffer + used, capacity - used);
             if (received < 0) {
                 /* R4c: a sealed session that hits a crypto/replay failure
+                 * (rc <= -2: tag failure, unknown magic, bad frame bounds)
                  * closes SILENTLY (per the QKP1 wire contract: "any mismatch,
                  * tag failure, or unknown magic ⇒ connection closed"). No
                  * cleartext reply on a failed sealed channel — the rejection
-                 * reason goes to the server log only. */
-                fprintf(stderr, "qihse qkp: sealed frame rejected on client %llu (rc=%zd)\n",
-                        (unsigned long long)session.id, received);
-                successful = false;
+                 * reason goes to the server log only.
+                 * rc == -1 is NOT a crypto rejection: it is plain transport
+                 * I/O (peer EOF, RST, or SO_RCVTIMEO expiry while the peer
+                 * idles). Logging those as "sealed frame rejected" misclassi-
+                 * fies normal disconnects — and redirects like -MOVED that
+                 * the peer chose not to answer — as tamper events. */
+                if (received <= -2) {
+                    fprintf(stderr, "qihse qkp: sealed frame rejected on client %llu (rc=%zd)\n",
+                            (unsigned long long)session.id, received);
+                    successful = false;
+                } else {
+                    fprintf(stderr, "qihse qkp: sealed session ended on client %llu (transport rc=-1)\n",
+                            (unsigned long long)session.id);
+                }
                 break;
             }
         } else {
