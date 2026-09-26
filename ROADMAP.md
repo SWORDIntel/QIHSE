@@ -122,15 +122,18 @@ distributed requirements apply to the consensus work).
   verifier store rejected (secret vault is a §7 non-goal; verifiers at rest
   are a new theft surface for zero capability). OPERATIONS §0.1 links the
   record. (Design)
-- [~] **5. QKP1 rollout completion.** LANDED: handshake/traffic counters
-  (`qihse_qkp_get_counters`: per-side negotiation success, categorized
-  rejections — cleartext/malformed/identity/crypto/replay — and sealed-frame
-  seal/unseal/failure counts), asserted in test-pqc-handshake scenario 9;
-  `qihse-federation-ca rotate-node` (issue successor + revoke predecessor
-  in one step, fail-closed on partial failure), verified live end to end.
-  REMAINING (tracked): the hybrid bus upgrade (HMAC-SHA-384 → ML-DSA-signed
-  bus frames) — a protocol change to the cluster bus requiring its own
-  negative-test sweep per invariant 3. (Function)
+- [x] **5. QKP1 rollout completion.** LANDED in two waves: (a) handshake/
+  traffic counters (`qihse_qkp_get_counters`: per-side negotiation success,
+  categorized rejections, sealed-frame counts; asserted in
+  test-pqc-handshake scenario 9) and `qihse-federation-ca rotate-node`
+  (issue successor + revoke predecessor, fail-closed; verified live);
+  (b) the hybrid bus upgrade — SLOT/NODE/GROUP ops frames carry ML-DSA
+  trailers verified against the signer's ENROLLED identity (algorithm of
+  record from the enrollment, never the wire), hardened mode
+  (`--require-signed-ops`) refuses unsigned ops frames. Evidence: commits
+  `8b1037e` + `4110a87` — tests s1-s4 (roundtrip / tamper-drop /
+  unenrolled-drop / hardened-refusal) plus the full aggregate 60/60.
+  (Function)
 - [ ] **6. Bolt result visibility + parallel-query de-stub.** RUN retains
   results, PULL streams them (removes the last documented COMPATIBILITY
   caveat); parallel query executes or is labelled a non-goal. (Function)
