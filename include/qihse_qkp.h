@@ -109,6 +109,27 @@ extern "C" {
 
 typedef struct qihse_qkp_session qihse_qkp_session_t;
 
+/* ── Observability (QKP1 rollout, roadmap improvement 5) ───────────────────
+ * Process-wide handshake/traffic counters.  Observability-grade: plain
+ * counters, no locking — approximate under concurrent negotiation, exact
+ * enough to answer "is the handshake healthy and why is it failing". */
+typedef struct {
+    uint64_t server_negotiations_ok;   /* server-side handshakes completed */
+    uint64_t client_negotiations_ok;   /* client-side handshakes completed */
+    uint64_t negotiations_failed;      /* any-side handshake failures */
+    uint64_t rejects_cleartext;        /* non-QKP probe refused */
+    uint64_t rejects_malformed;        /* bad probe / bad frame sizes */
+    uint64_t rejects_identity;         /* peer not in the trusted set */
+    uint64_t rejects_crypto;           /* sign/decap/AEAD failures */
+    uint64_t rejects_replay;           /* replayed or out-of-order frames */
+    uint64_t frames_sealed;            /* sealed records sent */
+    uint64_t frames_unsealed;          /* sealed records opened */
+    uint64_t unseal_failures;          /* sealed records refused */
+} qihse_qkp_counters_t;
+
+/* Snapshot the process-wide counters.  NULL out is refused. */
+void qihse_qkp_get_counters(qihse_qkp_counters_t* out);
+
 typedef struct {
     const char* dsa_key_path;             /* own ML-DSA-87 private key (sign) */
     const char* kem_key_path;             /* own ML-KEM-1024 private key (server decapsulate) */

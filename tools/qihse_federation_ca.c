@@ -384,6 +384,62 @@ static int cmd_issue_node(int argc, char** argv) {
 
 /* ── revoke ────────────────────────────────────────────────────────────── */
 
+static int cmd_revoke(int argc, char** argv);
+
+/* rotate-node: issue a successor identity and revoke the predecessor in
+ * one step.  Composition, not new crypto — it drives cmd_issue_node (new
+ * cert, new epoch) then cmd_revoke (predecessor onto the CRL, reason
+ * "rotated") so the well-tested paths stay the only paths. */
+static int cmd_rotate_node(int argc, char** argv) {
+    const char *ca_key = arg_value(argc, argv, "--ca-key");
+    const char *ca_cert = arg_value(argc, argv, "--ca-cert");
+    const char *crl = arg_value(argc, argv, "--crl");
+    const char *node_uuid = arg_value(argc, argv, "--node-uuid");
+    const char *out = arg_value(argc, argv, "--out");
+    if (!ca_key || !ca_cert || !crl || !node_uuid || !out) {
+        fprintf(stderr,
+                "rotate-node: --ca-key, --ca-cert, --crl, --node-uuid and "
+                "--out are required\n");
+        return 2;
+    }
+    /* The successor inherits whatever issue-node options the caller passed
+     * (alg/epoch/scope/pubkey) — they are already in argv. */
+    int rc = cmd_issue_node(argc, argv);
+    if (rc != 0) {
+        fprintf(stderr, "rotate-node: successor issuance failed (%d); "
+                        "predecessor left intact\n", rc);
+        return rc;
+    }
+    /* Revoke the predecessor: build the revoke argv in a child frame. */
+    char *rargv[12];
+    int rn = 0;
+    rargv[rn++] = (char *)"qihse-federation-ca";
+    rargv[rn++] = (char *)"revoke";
+    rargv[rn++] = (char *)"--crl";
+    rargv[rn++] = (char *)crl;
+    rargv[rn++] = (char *)"--node-uuid";
+    rargv[rn++] = (char *)node_uuid;
+    rargv[rn++] = (char *)"--reason";
+    rargv[rn++] = (char *)"rotated";
+    for (int i = 2; i < argc && rn < 11; i++) {
+        if (strncmp(argv[i], "--fingerprint", 13) == 0 ||
+            strncmp(argv[i], "--serial", 8) == 0) {
+            rargv[rn++] = argv[i];
+            if (i + 1 < argc && argv[i + 1][0] != '-') rargv[rn++] = argv[++i];
+        }
+    }
+    rc = cmd_revoke(rn, rargv);
+    if (rc != 0) {
+        fprintf(stderr, "rotate-node: successor issued to '%s' but predecessor "
+                        "revocation FAILED (%d) — revoke manually before the "
+                        "old cert is used again\n", out, rc);
+        return rc;
+    }
+    printf("rotate-node: successor at '%s'; predecessor %s on CRL '%s'\n",
+           out, node_uuid, crl);
+    return 0;
+}
+
 static int cmd_revoke(int argc, char** argv) {
     const char* crl = arg_value(argc, argv, "--crl");
     const char* node_uuid = arg_value(argc, argv, "--node-uuid");
@@ -514,6 +570,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "init-ca") == 0) return cmd_init_ca(argc, argv);
     if (strcmp(cmd, "issue-node") == 0) return cmd_issue_node(argc, argv);
     if (strcmp(cmd, "revoke") == 0) return cmd_revoke(argc, argv);
+    if (strcmp(cmd, "rotate-node") == 0) return cmd_rotate_node(argc, argv);
     if (strcmp(cmd, "verify") == 0) return cmd_verify(argc, argv);
     if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0 ||
         strcmp(cmd, "help") == 0) {

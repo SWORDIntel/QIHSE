@@ -188,9 +188,32 @@ static void qkp_make_nonce(uint8_t nonce[12], uint32_t dir, uint64_t seq) {
 
 /* ── negotiation ──────────────────────────────────────────────────────── */
 
+/* Process-wide QKP counters (see header).  Plain increments: observability
+ * grade, approximate under concurrency. */
+static qihse_qkp_counters_t g_qkp_counters = {0};
+
+void qihse_qkp_get_counters(qihse_qkp_counters_t* out) {
+    if (!out) return;
+    *out = g_qkp_counters;
+}
+
+static void qkp_count_reject(const char* reason) {
+    if (!reason) { g_qkp_counters.negotiations_failed++; return; }
+    if (strstr(reason, "cleartext")) g_qkp_counters.rejects_cleartext++;
+    else if (strstr(reason, "size") || strstr(reason, "malformed") ||
+             strstr(reason, "probe")) g_qkp_counters.rejects_malformed++;
+    else if (strstr(reason, "trusted") || strstr(reason, "identity"))
+        g_qkp_counters.rejects_identity++;
+    else if (strstr(reason, "replay") || strstr(reason, "order"))
+        g_qkp_counters.rejects_replay++;
+    else g_qkp_counters.rejects_crypto++;
+    g_qkp_counters.negotiations_failed++;
+}
+
 static void qkp_log_reject(const qihse_qkp_config_t* cfg, const char* reason) {
     fprintf(stderr, "qihse qkp: connection rejected: %s\n", reason);
     (void)cfg;
+    qkp_count_reject(reason);
 }
 
 qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* cfg,
@@ -380,6 +403,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     s->tx_seq++;
     if (!qkp_write_all(fd, sealed, 6u + plen)) { free(s); return QIHSE_QKP_REJECTED; }
 
+    g_qkp_counters.server_negotiations_ok++;
     if (out) *out = s; else free(s);
     return QIHSE_QKP_SECURE;
 }
@@ -431,7 +455,11 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
         return QIHSE_QKP_REJECTED;
     }
     free(h1_signed);
-    if (!server_trusted) return QIHSE_QKP_REJECTED;
+    if (!server_trusted) {
+        g_qkp_counters.rejects_identity++;
+        g_qkp_counters.negotiations_failed++;
+        return QIHSE_QKP_REJECTED;
+    }
 
     uint8_t cli_nonce[QIHSE_QKP_NONCE_LEN];
     if (RAND_bytes(cli_nonce, sizeof(cli_nonce)) != 1) return QIHSE_QKP_REJECTED;
@@ -512,6 +540,7 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     if (!ack_ok) { free(s); return QIHSE_QKP_REJECTED; }
     s->rx_seq = 2u;
 
+    g_qkp_counters.client_negotiations_ok++;
     if (out) *out = s; else free(s);
     return QIHSE_QKP_SECURE;
 }
@@ -550,7 +579,7 @@ static bool qkp_send_sealed_record(qihse_qkp_session_t* s, int fd,
     bool ok = qkp_aead_seal(key, nonce, head, 6u, data, len, frame + 6u + QIHSE_QKP_NONCE_WIRE_LEN);
     if (ok) ok = qkp_write_all(fd, frame, 6u + flen);
     free(frame);
-    if (ok) s->tx_seq++;
+    if (ok) { s->tx_seq++; g_qkp_counters.frames_sealed++; }
     return ok;
 }
 
@@ -596,12 +625,16 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
     bool ok = qkp_aead_open(key, nonce, head, 6u, frame + QIHSE_QKP_NONCE_WIRE_LEN,
                             flen - QIHSE_QKP_NONCE_WIRE_LEN, out);
     free(frame);
-    if (!ok) return -2; /* tag failure: forged, tampered, or replayed seq */
+    if (!ok) {
+        g_qkp_counters.unseal_failures++;
+        return -2; /* tag failure: forged, tampered, or replayed seq */
+    }
     /* Sequence check happens on the caller-visible nonce: expected seq was
      * baked into the nonce; a replayed frame carries an OLD seq, which fails
      * the tag against the expected nonce. Reaching here means seq matched.
      * Chunked streams reassemble by the caller reading records in order. */
     s->rx_seq = expected + 1u;
+    g_qkp_counters.frames_unsealed++;
     return (ssize_t)plen;
 }
 

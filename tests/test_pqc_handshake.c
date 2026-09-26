@@ -994,6 +994,23 @@ int main(void) {
     stop_daemon(g_daemon);
 
     system("rm -rf /tmp/qsb-pqc/n0");
+
+    /* 9: observability counters reflect the traffic this test generated
+     * (server side ran in the daemon; the client counters are ours). */
+    {
+        qihse_qkp_counters_t c;
+        qihse_qkp_get_counters(&c);
+        CHECK("9a. client negotiation counter counted our handshakes",
+              c.client_negotiations_ok >= 1u);
+        CHECK("9b. sealed-frame counters moved",
+              c.frames_sealed >= 1u && c.frames_unsealed >= 1u);
+        /* Server-side rejections (scenarios 5/7) count in the DAEMON's
+         * process, invisible here; scenario 2's untrusted-H1 abort is
+         * what THIS process exercised. */
+        CHECK("9c. untrusted-server-identity rejection categorized",
+              c.rejects_identity >= 1u);
+    }
+
     printf("%s (%d failure%s)\n", g_failures ? "FAILURES" : "ALL TESTS PASSED",
            g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
