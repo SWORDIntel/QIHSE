@@ -538,6 +538,11 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_sql_dml_exec_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_auth_init();
     qihse_user_t* operator_user = qihse_auth_get_user(0);
     assert(operator_user != NULL);

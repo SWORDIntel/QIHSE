@@ -1,4 +1,5 @@
 #include "qihse_cluster_slot.h"
+#include <stdlib.h>
 #include "qihse_cluster_migrate.h"
 #include "qihse_crc16.h"
 #include <assert.h>
@@ -29,6 +30,11 @@ static qihse_cluster_node_t make_node(const char* seed, const char* host, uint16
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_slot_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     static const unsigned char check[] = "123456789";
     assert(qihse_crc16_xmodem(check, 9) == 0x31c3u);
     assert(qihse_cluster_key_slot("foo", 3) == 12182u);

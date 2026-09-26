@@ -104,6 +104,11 @@ static void bench_gemm(const char* label, size_t M, size_t N, size_t K) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/bench_amx_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== QIHSE AMX/BF16/VNNI Benchmark ===\n\n");
 
     qihse_cpu_info_t info = qihse_cpu_detect();

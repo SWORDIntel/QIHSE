@@ -87,6 +87,11 @@ static gold_search_outcome_t search_with(qihse_vector_db_t db, const float* vect
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_security_null_context_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     if (!qihse_auth_init()) {
         fprintf(stderr, "%s: probe control failed: qihse_auth_init\n", GOLD_ID);
         return 1;

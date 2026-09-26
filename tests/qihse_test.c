@@ -17,6 +17,11 @@ static void generate_queries(const int64_t* data, size_t data_n,
 static inline uint64_t ns_now(void);
 
 int main(int argc, char* argv[]) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("🌀 QIHSE Test Program\n");
     printf("===================\n\n");
 

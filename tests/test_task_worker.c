@@ -27,6 +27,11 @@ static bool mock_custom_handler(
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_task_worker_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== Testing QIHSE Dedicated Task Worker Pool ===\n");
 
     qihse_kv_store_t* kv = qihse_kv_store_create();

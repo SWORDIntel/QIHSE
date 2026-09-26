@@ -125,6 +125,11 @@ static int verify_remove_and_old_container(const char* path) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_edge_persistence_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     const char* path = "/tmp/qihse_edge_persistence_test.qdb";
     pid_t child;
     int status = 0;

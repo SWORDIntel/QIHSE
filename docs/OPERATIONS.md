@@ -137,6 +137,14 @@ make` is only needed after changing flags or ISA paths.
 
 ### 2.1 The aggregate
 
+**Parallel invocation (default since 2026-09-26):** `make -j8 test` — every
+test binary isolates its audit chain/log under `QIHSE_DATA_DIR` (a per-test
+`build/<target>_XXXXXX` scratch dir), so targets run concurrently safely.
+Measured on the reference box: the full aggregate drops from ~40–50 min
+serial to **~5 min** (the gold suite is the critical path). One aggregate
+at a time still applies — two concurrent `make test` runs would race the
+shared `build/` compile artifacts.
+
 ```bash
 make test        # or ./qihse test
 ```
@@ -478,9 +486,10 @@ knobs) is [API reference §11](API_REFERENCE.md#11-configuration-knobs).
   and the `controller-api` gold failure — leases born expired under the
   Phase-B strictening — was fixed by the lease wire TTL contract, gold is
   60/60 again.)
-- **One `make test` at a time.** Aggregate targets share root-level and
-  `build/` scratch state; concurrent aggregates or concurrent runs of the
-  same target can interfere (e.g. `qihse_integrity.chain` removal races).
+- **One `make test` at a time** (parallel `-j` *within* one aggregate is
+  safe and now the recommended invocation — see [§2.1](#21-the-aggregate)).
+  Concurrent aggregates still race the shared `build/` compile artifacts
+  and root-level targets that clean `qihse_integrity.chain*`.
 - **`make docs` is a stub** — documentation is maintained by hand in
   markdown; there is no generated-docs pipeline.
 

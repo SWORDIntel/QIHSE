@@ -503,6 +503,11 @@ static void test_keystone_node_cap_cluster_bus_integration(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_keystone_qihse_integration_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==============================================================\n");
     printf("  QIHSE + KEYSTONE Integration & Ingestion Engine Tests        \n");
     printf("==============================================================\n");

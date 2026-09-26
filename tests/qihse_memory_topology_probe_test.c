@@ -1,4 +1,5 @@
 #include "../memory/include/qihse_memory_topology_probe.h"
+#include <stdlib.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -70,6 +71,11 @@ static bool test_probe_nodes(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_topology_probe_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     struct {
         const char* name;
         bool (*fn)(void);

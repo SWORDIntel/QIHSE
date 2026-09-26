@@ -16,6 +16,11 @@ static inline uint64_t ns_now(void) {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_vnni_bench_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     int8_t *a, *b;
     int32_t result;
     qihse_intel_hw_info_t hw_info;

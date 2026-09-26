@@ -476,6 +476,11 @@ static bool wait_port(int port) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_pqc_handshake_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     setvbuf(stdout, NULL, _IONBF, 0);   /* survive crashes with visible progress */
     /* A stray daemon on the sandbox port poisons every scenario (a previous
      * crashed run once held 7195 and the suite talked to the wrong process).

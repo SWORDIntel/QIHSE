@@ -68,6 +68,11 @@ static void test_cluster_rebalance_imbalanced_to_balanced() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_rebalance_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==============================================================\n");
     printf("  QIHSE Automated Zero-Downtime Cluster Rebalancer Tests      \n");
     printf("==============================================================\n");

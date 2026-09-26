@@ -3,6 +3,7 @@
  */
 
 #include "../memory/include/qihse_memory_allocation_policy.h"
+#include <stdlib.h>
 
 #include <assert.h>
 
@@ -115,6 +116,11 @@ static void test_stats_accounting(void)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_allocation_policy_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_fallback_order();
     test_stats_accounting();
     return 0;

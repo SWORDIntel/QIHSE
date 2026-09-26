@@ -80,6 +80,11 @@ static uint8_t* read_segment(const char* path, size_t* out_len) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_repl_apply_wal_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     if (mkdir(GOLD_TMP_DIR, 0700) != 0 && errno != EEXIST) {
         fprintf(stderr, "%s: probe control failed: mkdir %s: %s\n",
                 GOLD_ID, GOLD_TMP_DIR, strerror(errno));

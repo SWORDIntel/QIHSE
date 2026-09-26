@@ -5,6 +5,11 @@
 #include "qihse_bytecode.h"
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_bytecode_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     const char* clause = "WHERE age > 25 AND score >= 80";
     uint8_t bc[1024];
     size_t bc_len = 0;

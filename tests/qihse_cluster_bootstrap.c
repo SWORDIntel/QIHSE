@@ -397,6 +397,11 @@ static int measure_latency(uint16_t base_port) {
 }
 
 int main(int argc, char** argv) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_cluster_bootstrap_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     uint16_t base_port = 7000u;
     bool do_benchmark = false;
     bool do_latency = false;

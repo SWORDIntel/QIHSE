@@ -3,6 +3,7 @@
  */
 
 #include "../memory/include/qihse_memory_migration_backend.h"
+#include <stdlib.h>
 
 #include <assert.h>
 #include <string.h>
@@ -92,6 +93,11 @@ static void test_reports_unsupported_dma_cleanly(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_migration_backend_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_host_memcpy_preserves_bytes();
     test_zero_byte_copy_accepts_null_ranges();
     test_rejects_overlapping_host_memcpy_ranges();

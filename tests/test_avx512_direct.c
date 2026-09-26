@@ -9,6 +9,11 @@
 #include <time.h>
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_avx512_direct_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=================================================================\n");
     printf("AVX-512 DIRECT HARDWARE TEST - A00 Engineering Board\n");
     printf("=================================================================\n");

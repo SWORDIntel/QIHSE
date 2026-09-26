@@ -23,6 +23,11 @@
  * keygen and the dedicated PQC tests. */
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_e2e_roadmap_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==========================================\n");
     printf("   QIHSE E2E ROADMAP FEATURE VALIDATION   \n");
     printf("==========================================\n\n");

@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 #include "qihse_memory_device_placement.h"
@@ -78,6 +79,11 @@ static qihse_memory_workload_analysis_t cpu_workload(void)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_device_placement_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_memory_topology_t topology = test_topology();
     qihse_memory_workload_analysis_t host_work = random_host_workload();
     qihse_memory_workload_analysis_t gpu_work = gpu_workload();

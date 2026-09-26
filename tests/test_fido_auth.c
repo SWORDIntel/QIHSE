@@ -5,6 +5,11 @@
 #include "qihse_auth.h"
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_fido_auth_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Initializing QIHSE Auth Engine...\n");
     qihse_auth_init();
 

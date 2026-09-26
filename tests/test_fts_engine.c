@@ -6,6 +6,11 @@
 #include "qihse_auth.h"
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_fts_engine_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing Full-Text Search (Trigram/BM25)...\n");
 
     qihse_fts_index_t* index = qihse_fts_create();

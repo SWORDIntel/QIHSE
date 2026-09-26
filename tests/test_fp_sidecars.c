@@ -8,6 +8,11 @@
 
 // Basic mock/harness logic just to test the integration.
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_fp_sidecars_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
     if (!vdb) {
         printf("Failed to create vector DB\n");

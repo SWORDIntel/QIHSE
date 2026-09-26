@@ -83,6 +83,11 @@ static char* read_bulk(test_client_t* client) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_task_resp_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== Testing QIHSE RESP Task Queue & Scheduler Wire Protocol ===\n");
 
     qihse_kv_store_t* kv = qihse_kv_store_create();

@@ -1,4 +1,5 @@
 #include "../memory/include/qihse_memory_coherence.h"
+#include <stdlib.h>
 
 #include <assert.h>
 #include <string.h>
@@ -68,6 +69,11 @@ static void test_buffer_coherence_bridge(void)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_coherence_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_coherence_lifecycle();
     test_buffer_coherence_bridge();
     return 0;

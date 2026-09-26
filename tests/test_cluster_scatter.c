@@ -255,6 +255,11 @@ static void test_null_scatter(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_scatter_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_scatter_no_peers();
     test_ts_fanout_no_peers();
     test_col_sum_no_peers();

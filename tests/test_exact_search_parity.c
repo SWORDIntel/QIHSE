@@ -22,6 +22,11 @@ static bool keep_even(const void* metadata, size_t size, void* opaque) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_exact_search_parity_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     enum { ROWS = 1024, DIMS = 128, K = 10, ITERS = 50 };
     unsigned char random[24];
     char password[49];

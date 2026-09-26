@@ -99,6 +99,11 @@ static void test_write_read_pages() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_sqlite_vfs_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_vfs_register();
     test_basic_create_open();
     test_write_read_pages();

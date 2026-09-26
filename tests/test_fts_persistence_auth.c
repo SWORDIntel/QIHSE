@@ -75,6 +75,11 @@ static void test_ranking_isolation(qihse_user_t* guest, qihse_user_t* operator_u
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_fts_persistence_auth_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     cleanup();
     setenv("QIHSE_FIPS_MODE", "disabled", 1);
     assert(qihse_auth_init());

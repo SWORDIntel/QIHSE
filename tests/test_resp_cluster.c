@@ -173,10 +173,10 @@ static qihse_cluster_node_t node_from_seed(const char* seed, const char* host, u
 }
 
 int main(void) {
-    assert(qihse_auth_init());
     char data_dir[] = "/tmp/qihse-resp-test-XXXXXX";
     assert(mkdtemp(data_dir) != NULL);
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
+    assert(qihse_auth_init());
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);

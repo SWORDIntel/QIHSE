@@ -55,6 +55,8 @@ static void make_event_id(uint64_t seed, uint8_t out[QIHSE_ES_EVENT_ID_SIZE]) {
 static char* make_temp_dir(void) {
     char tmpl[] = "/tmp/qihse_es_test_XXXXXX";
     char* dir = strdup(mkdtemp(tmpl));
+    /* Isolate the audit chain/log per test (parallel aggregates). */
+    setenv("QIHSE_DATA_DIR", dir, 1);
     return dir;
 }
 

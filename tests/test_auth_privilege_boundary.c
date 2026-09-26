@@ -7,6 +7,11 @@
 #include "core/qihse_auth_internal.h"
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_auth_privilege_boundary_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     /* --- Validation: QIHSE_FIPS_MODE=required genuinely fails closed --- */
     setenv("QIHSE_FIPS_MODE", "required", 1);
     bool fips_init_res = qihse_auth_init();

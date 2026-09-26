@@ -79,6 +79,11 @@ int test_amx_tile(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_simple_exec_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Simple Direct Execution Test\n");
     printf("============================\n\n");
     

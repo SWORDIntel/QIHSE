@@ -3,6 +3,7 @@
  */
 
 #include "../memory/include/qihse_memory_planner_trace.h"
+#include <stdlib.h>
 
 #include <assert.h>
 #include <stdbool.h>
@@ -98,6 +99,11 @@ static void test_null_trace_is_rejected(void)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_planner_trace_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_record_captures_selection_and_workload();
     test_record_handles_missing_workload();
     test_format_reason_respects_buffer_size();

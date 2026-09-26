@@ -167,6 +167,11 @@ static bool test_memory_budget_search_pages_in_spilled(void);
 static bool test_memory_budget_zero_restores_spilled(void);
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_vector_db_persistence_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     const test_case_t tests[] = {
         {"create -> insert -> close -> reopen -> search",
          test_create_insert_close_reopen_search},

@@ -20,6 +20,7 @@
  * No on-disk state; every case runs against a fresh store and manager.
  */
 #include "qihse_txn.h"
+#include <stdlib.h>
 #include "qihse_mvcc.h"
 
 #include <assert.h>
@@ -378,6 +379,11 @@ static void test_update_after_delete(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_mvcc_delete_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_plain_delete();
     test_delete_after_aborted_update();
     test_delete_after_aborted_delete();

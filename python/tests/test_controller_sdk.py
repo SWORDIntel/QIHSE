@@ -1,3 +1,8 @@
+# Per-test audit/chain isolation FIRST — the shared library initializes
+# its audit state at import time, before any test code runs.
+__import__("os").environ.setdefault(
+    "QIHSE_DATA_DIR",
+    __import__("tempfile").mkdtemp(prefix="qihse_py_ctrl_sdk_root_"))
 """
 Tests for the QIHSE Python controller SDK (qihse/controller.py — the
 Python half of CITADEL v3 §25).

@@ -122,6 +122,11 @@ static float dot_int8_vnni(const float* a, const float* b, size_t dims) {
 #endif
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/bench_simd_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("================================================================\n");
     printf("QIHSE SIMD BENCHMARK — Distance Functions\n");
     printf("================================================================\n\n");

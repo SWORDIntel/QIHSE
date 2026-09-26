@@ -484,6 +484,11 @@ static void test_unknown_target(qihse_uwp_context_t* ctx, qihse_user_t* user)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_uwp_regression_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== QIHSE UWP Regression Tests ===\n\n");
 
     /* Initialize auth subsystem */

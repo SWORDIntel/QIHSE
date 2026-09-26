@@ -16,6 +16,11 @@ static void make_temp_path(char path[128]) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_vector_skip_integrity_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     char path[128];
     make_temp_path(path);
 

@@ -817,6 +817,8 @@ static void test_hostile_key_is_contained(const char* dir) {
 int main(void) {
     char root[] = "build/opt_gov_XXXXXX";
     assert(mkdtemp(root));
+    /* Isolate the audit chain/log per test so parallel aggregates never share root state. */
+    setenv("QIHSE_DATA_DIR", root, 1);
     char dir_a[600], dir_b[600], dir_c[600], dir_d[600], dir_e[600], dir_f[600];
     snprintf(dir_a, sizeof(dir_a), "%s/a", root);
     snprintf(dir_b, sizeof(dir_b), "%s/b", root);

@@ -1,4 +1,5 @@
 #include "../codecs/qihse_trinary_tryte_codec.h"
+#include <stdlib.h>
 
 #include <errno.h>
 #include <stdint.h>
@@ -519,6 +520,11 @@ static bool test_multibyte_topk_reference(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_trinary_codec_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     struct test_case {
         const char* name;
         bool (*run)(void);

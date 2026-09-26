@@ -3,6 +3,7 @@
  */
 
 #include "../memory/include/qihse_memory_migration_scheduler.h"
+#include <stdlib.h>
 
 #include <assert.h>
 #include <string.h>
@@ -116,6 +117,11 @@ static void test_queue_capacity_is_respected(void)
 
 int main(void)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_migration_scheduler_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_score_rejects_unschedulable_buffers();
     test_queue_orders_by_score_then_fifo();
     test_queue_capacity_is_respected();

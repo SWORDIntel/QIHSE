@@ -374,6 +374,11 @@ static void test_anchor_lookup_latency(void) {
 /* ------------------------------------------------------------------ */
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_column_tsdb_anchor_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==============================================================\n");
     printf("  QIHSE Idea 2: Keystone Anchor Search Integration            \n");
     printf("  (Frieze Column Store + Marmalade Time-Series Engine)        \n");

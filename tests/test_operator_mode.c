@@ -113,6 +113,11 @@ static void test_reinit_clears_state(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_operator_mode_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("======================================\n");
     printf("  QIHSE Operator-Only Mode Tests      \n");
     printf("======================================\n\n");

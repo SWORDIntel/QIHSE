@@ -294,6 +294,11 @@ static int check_mongo_surface(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_protocol_compat_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     if (check_signatures() != 0) return 1;
     if (check_reset_on_the_wire() != 0) return 1;
     if (check_mongo_surface() != 0) return 1;

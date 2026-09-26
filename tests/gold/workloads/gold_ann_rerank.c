@@ -293,6 +293,11 @@ static int check_graph_ann(gold_ann_t* ann) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_ann_rerank_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     gold_ann_t ann;
     memset(&ann, 0, sizeof(ann));
 

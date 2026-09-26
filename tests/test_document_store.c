@@ -11,6 +11,11 @@ qihse_kv_store_t* qihse_kv_store_create(void) { return NULL; }
 void qihse_kv_store_destroy(qihse_kv_store_t* store) { (void)store; }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_document_store_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing JIT Document Engine...\n");
     
     qihse_document_store_t* store = qihse_doc_store_create(NULL);

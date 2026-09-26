@@ -4,6 +4,11 @@
 #include "qihse_qql_parser.h"
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_qql_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing QQL Engine AST Generation...\n");
 
     const char* queries[] = {

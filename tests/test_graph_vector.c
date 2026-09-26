@@ -14,6 +14,7 @@
  *     cap, sorted descending.
  */
 #include "qihse_graph_vector.h"
+#include <stdlib.h>
 #include "qihse_auth.h"
 
 #include <assert.h>
@@ -61,6 +62,11 @@ static int contains(const uint64_t* ids, size_t n, uint64_t id) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_graph_vector_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_auth_init();
     qihse_user_t* op = qihse_auth_get_user(0);
     assert(op != NULL);

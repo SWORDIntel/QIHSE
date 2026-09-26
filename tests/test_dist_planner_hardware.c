@@ -344,6 +344,11 @@ static void test_existing_planner_regression(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_dist_planner_hardware_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("============================================================\n");
     printf("  QIHSE Idea 4 — Adaptive Hardware Backend Dispatcher Tests \n");
     printf("============================================================\n");

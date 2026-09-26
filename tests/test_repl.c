@@ -582,6 +582,11 @@ static void test_pooler(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_repl_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_repl_context_and_slots();
     test_repl_ship_wal();
     test_repl_apply_wal();

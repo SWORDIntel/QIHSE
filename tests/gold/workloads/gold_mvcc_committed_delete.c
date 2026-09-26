@@ -48,6 +48,11 @@ static int report(const char* check, const char* detail, int broken) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_mvcc_committed_delete_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_txn_manager_t* mgr = qihse_txn_manager_create();
     qihse_mvcc_store_t* store = qihse_mvcc_store_create(64);
     if (!mgr || !store) {

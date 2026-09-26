@@ -108,10 +108,14 @@ distributed requirements apply to the consensus work).
   epoch-teaching fix requires a dedicated epoch-sync message outside the
   election/step-down state machine — see the consensus receive-path note
   and the analysis in `900d8d4`. (Verification)
-- [ ] **3. Test isolation → parallel aggregate.** Per-target scratch
-  namespaces (`build/tests/<target>/`), TMPDIR default, unique port
-  allocation; `make test` becomes `-j`-safe; aggregate wall-time 40–50 min
-  → target ≤15 min. (Velocity)
+- [x] **3. Test isolation → parallel aggregate.** Every test binary now
+  isolates its audit chain/log under `QIHSE_DATA_DIR` (per-test
+  `build/<target>_XXXXXX` scratch; the audit module routes both the chain
+  and the log through one env-aware path builder). `make -j8 test` is the
+  documented default invocation. Evidence: commit (this one); measured
+  aggregate wall-time ~40–50 min serial → **~5 min** `-j8` (gold suite is
+  the critical path), 60/60 gold workloads pass, repo root left clean.
+  (Velocity)
 - [ ] **4. Auth persistence decision.** Either a design note blessing
   ephemeral credentials (external secret store is a §7 non-goal; restart =
   re-credential) or a persisted verifier store under the existing

@@ -8,6 +8,11 @@
 #include "qihse_task_scheduler.h"
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_task_scheduler_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== Testing QIHSE Periodic Task Scheduler ===\n");
 
     /* Test 1: Cron parsing calculations */

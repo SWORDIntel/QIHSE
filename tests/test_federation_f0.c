@@ -6,6 +6,7 @@
  * behaviour is touched by this stage.
  */
 #include "qihse_federation.h"
+#include <stdlib.h>
 
 #include <assert.h>
 #include <stdio.h>
@@ -122,6 +123,11 @@ static void test_fencing(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_federation_f0_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_uuid();
     test_hlc();
     test_object_version();

@@ -19,6 +19,11 @@
 extern bool qihse_spatial_insert_secure(qihse_spatial_index_t idx, uint64_t row_id, double lat, double lon, uint16_t classif, uint16_t sci);
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_spatial_engine_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing Geospatial Engine (GEOINT / Morton Z-order)...\n");
 
     qihse_spatial_index_t idx = qihse_spatial_create();

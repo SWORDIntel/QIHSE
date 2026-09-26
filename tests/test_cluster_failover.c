@@ -236,6 +236,11 @@ static void test_bus_failover_callback(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_failover_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_primary_failover();
     test_no_replica();
     test_replica_failure();

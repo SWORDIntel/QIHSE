@@ -53,6 +53,11 @@ static bool reply_has_id(const char* reply, uint64_t id) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_resp_hybrid_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("OperatorPass123!"));
     qihse_user_t* op = qihse_auth_get_user(0);

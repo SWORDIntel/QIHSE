@@ -5,6 +5,11 @@
 #include "quantization/include/qihse_pq.h"
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_qihse_pq_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("--- QIHSE Product Quantization Test ---\n");
     srand(42); // deterministic
 

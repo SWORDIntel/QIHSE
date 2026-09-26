@@ -839,6 +839,11 @@ static void test_wrapped_index(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_indexes_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_btree_insert_lookup();
     test_btree_range_scan();
     test_btree_delete();

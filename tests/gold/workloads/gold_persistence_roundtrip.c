@@ -253,6 +253,11 @@ static int check_delete_persists(gold_env_t* env) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/gold_persistence_roundtrip_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     if (mkdir(GOLD_TMP_DIR, 0700) != 0 && errno != EEXIST) {
         fprintf(stderr, "gold_persistence_roundtrip: cannot create %s: %s\n",
                 GOLD_TMP_DIR, strerror(errno));

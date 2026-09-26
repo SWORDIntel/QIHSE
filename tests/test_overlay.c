@@ -220,6 +220,11 @@ static void node_id_for(const char* seed, char out[QIHSE_CLUSTER_NODE_ID_LEN + 1
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_overlay_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     /* ── cluster bus (the overlay's MEET sink) ─────────────────────────── */
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
     assert(topo);

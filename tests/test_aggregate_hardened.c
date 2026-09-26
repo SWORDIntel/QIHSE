@@ -125,6 +125,11 @@ static void test_distinct_cardinality_cap(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_aggregate_hardened_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_group_cardinality_cap();
     test_distinct_cardinality_cap();
     printf("\nALL aggregate hardening tests PASSED!\n");

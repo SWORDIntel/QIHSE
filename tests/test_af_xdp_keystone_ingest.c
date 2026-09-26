@@ -243,6 +243,11 @@ static void test_malformed_and_null_safe(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_af_xdp_keystone_ingest_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("AFXDP-Security-Pass1!"));

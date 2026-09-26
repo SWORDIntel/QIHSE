@@ -67,6 +67,11 @@ static void* worker_thread(void* arg) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_uwp_concurrency_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     g_metrics = qihse_uwp_metrics_create();
     g_kv = qihse_kv_store_create();
     pthread_barrier_init(&g_barrier, NULL, NUM_THREADS);

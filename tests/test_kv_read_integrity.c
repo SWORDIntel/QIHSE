@@ -8,6 +8,11 @@
 #define READ_ITERATIONS 512
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_kv_read_integrity_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_kv_store_t* store = qihse_kv_store_create();
     if (store == NULL) {
         fprintf(stderr, "could not create KV store\n");

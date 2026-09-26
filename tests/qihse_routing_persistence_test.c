@@ -28,7 +28,10 @@ static int test_fail = 0;
 
 static char* make_temp_dir(void) {
     char tmpl[] = "/tmp/qihse_rp_test_XXXXXX";
-    return strdup(mkdtemp(tmpl));
+    char* d = mkdtemp(tmpl);
+    /* Isolate the audit chain/log per test (parallel aggregates). */
+    setenv("QIHSE_DATA_DIR", d, 1);
+    return strdup(d);
 }
 
 static void rm_rf(const char* path) {

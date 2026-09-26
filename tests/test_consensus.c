@@ -224,6 +224,9 @@ static void h_init_ex(harness_t* h, const char* seed, uint64_t snapshot_threshol
         snprintf(h->dir, sizeof(h->dir), "test_consensus_XXXXXX");
         assert(mkdtemp(h->dir));
     }
+    /* Isolate the audit chain/log per test so parallel aggregates never
+     * share root state. */
+    setenv("QIHSE_DATA_DIR", h->dir, 1);
 
     for (size_t i = 0; i < N; i++) {
         char buf[96];
@@ -3432,6 +3435,7 @@ int main(void) {
         snprintf(dir, sizeof(dir), "test_consensus_hostile_XXXXXX");
         assert(mkdtemp(dir));
     }
+    setenv("QIHSE_DATA_DIR", dir, 1);
 
     assert(qihse_auth_init());
     bool bootstrapped = qihse_auth_bootstrap_operator("ConsensusOperator1!");

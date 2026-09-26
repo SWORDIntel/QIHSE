@@ -510,6 +510,8 @@ static void test_determinism(const char* dir_one, const char* dir_eight) {
 int main(void) {
     char root[] = "build/brain_fed_XXXXXX";
     assert(mkdtemp(root));
+    /* Isolate the audit chain/log per test so parallel aggregates never share root state. */
+    setenv("QIHSE_DATA_DIR", root, 1);
     char dir_a[600], dir_b[600], dir_c[600], dir_d1[600], dir_d8[600], key_dir[600];
     char broken[600];
     snprintf(dir_a, sizeof(dir_a), "%s/obs", root);

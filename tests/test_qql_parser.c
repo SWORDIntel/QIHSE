@@ -33,6 +33,11 @@ void print_ast(qihse_qql_ast_t* ast) {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_qql_parser_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     const char* q1 = "SEARCH VECTOR [1.0, 2.0, 3.0] FROM documents JOIN metadata ON documents.id = metadata.doc_id WHERE rating > 4 WITHIN TIME '2023-01-01' TO '2024-01-01' LIMIT 5;";
     printf("--- Query 1: Temporal + JOIN ---\n");
     qihse_qql_ast_t* ast1 = qihse_parse_qql_to_ast(q1);

@@ -94,6 +94,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
 int main(int argc, char** argv)
 {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/fuzz_uwp_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     (void)argc;
     (void)argv;
 

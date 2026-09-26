@@ -40,14 +40,25 @@ static uint16_t g_ping_classif = 0, g_ping_sci = 0;
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
-/* Build integrity chain path from QIHSE_DATA_DIR env or fall back to CWD */
-static void build_chain_path(char *buf, size_t buflen) {
+/* Build a state-file path from QIHSE_DATA_DIR env or fall back to CWD */
+static void build_state_path(char *buf, size_t buflen, const char *leaf) {
     const char *dir = getenv("QIHSE_DATA_DIR");
     if (dir && *dir) {
-        snprintf(buf, buflen, "%s/%s", dir, INTEGRITY_CHAIN_FILE);
+        snprintf(buf, buflen, "%s/%s", dir, leaf);
     } else {
-        snprintf(buf, buflen, "%s", INTEGRITY_CHAIN_FILE);
+        snprintf(buf, buflen, "%s", leaf);
     }
+}
+
+/* Build integrity chain path from QIHSE_DATA_DIR env or fall back to CWD */
+static void build_chain_path(char *buf, size_t buflen) {
+    build_state_path(buf, buflen, INTEGRITY_CHAIN_FILE);
+}
+
+/* Audit log: same data-dir routing as the chain, so parallel test
+ * aggregates never share one root-level log file. */
+static void build_audit_path(char *buf, size_t buflen) {
+    build_state_path(buf, buflen, AUDIT_FILE);
 }
 /*
  * Asynchronous audit signing.
@@ -232,7 +243,9 @@ void qihse_audit_init(void) {
         }
     }
 
-    FILE *f = fopen(AUDIT_FILE, "ab");
+    char apath[512];
+    build_audit_path(apath, sizeof(apath));
+    FILE *f = fopen(apath, "ab");
     if (f) {
         if (audit_pkey) {
             write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
@@ -241,7 +254,7 @@ void qihse_audit_init(void) {
         }
         fclose(f);
 #ifndef _WIN32
-        chmod(AUDIT_FILE, 0600);
+        chmod(apath, 0600);
 #endif
     }
     /* Start the background signer so qihse_audit_log() never blocks on the
@@ -270,11 +283,15 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     }
 
 #ifndef _WIN32
-    int afd = open(AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    char apath2[512];
+    build_audit_path(apath2, sizeof(apath2));
+    int afd = open(apath2, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
     FILE *f = NULL;
     if (afd >= 0) f = fdopen(afd, "ab");
 #else
-    FILE *f = fopen(AUDIT_FILE, "ab");
+    char wpath[512];
+    build_audit_path(wpath, sizeof(wpath));
+    FILE *f = fopen(wpath, "ab");
 #endif
     if (f) {
         char out_buf[2048];

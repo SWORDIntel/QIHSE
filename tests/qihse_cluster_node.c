@@ -22,6 +22,11 @@ static qihse_cluster_node_t make_node(unsigned int index, uint16_t port) {
 }
 
 int main(int argc, char** argv) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_cluster_node_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     if (argc != 3) {
         fprintf(stderr, "usage: %s <node-index:0..2> <base-port>\n", argv[0]);
         return 2;

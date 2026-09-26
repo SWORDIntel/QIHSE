@@ -7,6 +7,11 @@
 #include "qihse_auth.h"
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_column_store_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing Columnar OLAP Engine...\n");
     
     qihse_column_store_t* store = qihse_column_store_create();

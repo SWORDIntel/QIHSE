@@ -1,4 +1,5 @@
 #include "../core/qihse_abi.h"
+#include <stdlib.h>
 #include "../memory/include/qihse_memory.h"
 #include "../memory/include/qihse_memory_coherence.h"
 
@@ -107,6 +108,11 @@ static bool test_zero_copy_migration_keeps_pointer(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/qihse_memory_migration_test_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     struct {
         const char* name;
         bool (*fn)(void);

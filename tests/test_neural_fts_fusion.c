@@ -202,6 +202,11 @@ static int test_hybrid_rrf_fusion(qihse_fts_index_t* idx, qihse_user_t* user) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_neural_fts_fusion_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== Idea 5: Neural Semantic Metadata Tagging & Hybrid FTS + Vector RRF Fusion ===\n");
 
     qihse_auth_init();

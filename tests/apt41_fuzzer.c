@@ -33,6 +33,11 @@ void generate_malformed_payload(char* buffer, size_t max_len) {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/apt41_fuzzer_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("[APT-41 CLEARANCE BYPASS SIMULATION] Booting fuzzer...\n");
     srand((unsigned int)time(NULL));
     assert(qihse_auth_init());

@@ -432,6 +432,11 @@ static void test_veiled_framing(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_bus_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_slot_update_inject();
     test_meet_inject();
     test_fail_inject();

@@ -10,6 +10,11 @@
 #include <string.h>
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_uwp_secure_default_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_auth_init();
 
     qihse_user_t* operator_user = qihse_auth_get_user(0);

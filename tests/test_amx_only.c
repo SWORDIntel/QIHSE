@@ -3,6 +3,11 @@
 #include <string.h>
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_amx_only_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing AMX-TILE...\n");
     
     struct __tilecfg {

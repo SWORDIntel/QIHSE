@@ -138,6 +138,11 @@ static int test_tls_handshake(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_uwp_tls_integration_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     signal(SIGALRM, SIG_DFL);
     alarm(15); /* timeout */
 

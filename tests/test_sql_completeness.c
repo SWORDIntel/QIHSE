@@ -794,6 +794,11 @@ static void report_known_gaps(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_sql_completeness_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_select_shape();
     test_aggregates_and_grouping();
     test_join_parsing();

@@ -67,6 +67,11 @@ static int resp_status(const char* resp) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_http_adapters_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     /* ── InfluxDB: real write→query roundtrip on the TSDB ────────────── */
     qihse_tsdb_t* tsdb = qihse_tsdb_create();
     assert(tsdb);

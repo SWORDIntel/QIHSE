@@ -114,6 +114,8 @@ static void snapshot_owners(qihse_cluster_topology_t* topo, uint16_t* owners) {
 int main(void) {
     char root[] = "build/brain_journal_XXXXXX";
     assert(mkdtemp(root));
+    /* Isolate the audit chain/log per test so parallel aggregates never share root state. */
+    setenv("QIHSE_DATA_DIR", root, 1);
     char dir_a[600], dir_b[600], dir_c[600];
     snprintf(dir_a, sizeof(dir_a), "%s/run_a", root);
     snprintf(dir_b, sizeof(dir_b), "%s/run_b", root);

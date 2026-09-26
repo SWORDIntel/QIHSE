@@ -138,6 +138,11 @@ int test_amx_bf16() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_all_isa_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("================================================================\n");
     printf("COMPREHENSIVE ISA FEATURE TEST - A00 Engineering Board\n");
     printf("Intel Core Ultra 7 165H (Meteor Lake)\n");

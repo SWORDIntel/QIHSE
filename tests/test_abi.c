@@ -260,6 +260,11 @@ void test_abi_stability(void) {
  * ============================================================================ */
 
 int main(int argc, char** argv) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_abi_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     (void)argc;
     (void)argv;
 

@@ -36,6 +36,11 @@ void generate_malformed_qql(char* buffer, size_t max_len) {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/apt41_qql_fuzzer_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("[APT-41 QQL PARSER FUZZER] Booting fuzzer...\n");
     srand(time(NULL));
 

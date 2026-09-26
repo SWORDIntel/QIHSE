@@ -194,6 +194,11 @@ static void test_pg_wire_handshake_and_queries() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_pg_wire_cluster_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==============================================================\n");
     printf("  QIHSE PostgreSQL Wire Protocol Sharded Multi-Model Tests     \n");
     printf("==============================================================\n");

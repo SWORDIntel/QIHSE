@@ -6,6 +6,11 @@
 #include "qihse_task_queue.h"
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_task_queue_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== Testing QIHSE Task Queue ===\n");
 
     qihse_kv_store_t* kv = qihse_kv_store_create();

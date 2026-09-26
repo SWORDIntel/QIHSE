@@ -131,6 +131,11 @@ static void test_af_xdp_kv_ingress() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_af_xdp_resp_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("====================================================\n");
     printf("  QIHSE eBPF / AF_XDP Kernel-Bypass Ingress Tests   \n");
     printf("====================================================\n");

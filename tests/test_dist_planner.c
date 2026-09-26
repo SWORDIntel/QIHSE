@@ -109,6 +109,11 @@ static void test_dist_plan_execution() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_dist_planner_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("========================================================\n");
     printf("  QIHSE Distributed SQL/QQL Multi-Engine Planner Tests  \n");
     printf("========================================================\n");

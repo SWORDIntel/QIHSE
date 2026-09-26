@@ -35,6 +35,11 @@ static void sigill_handler(int sig) {
     } while(0)
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_direct_execution_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     /* Set up signal handler FIRST before any SIMD instructions */
     signal(SIGILL, sigill_handler);
     

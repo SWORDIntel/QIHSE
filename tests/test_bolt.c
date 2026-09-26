@@ -697,6 +697,11 @@ static void test_bolt_negative_auth(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_bolt_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     test_packstream_primitives();
     test_packstream_containers();
     test_truncated_input_refused();

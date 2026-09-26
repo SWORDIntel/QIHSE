@@ -307,6 +307,11 @@ static void test_disabled_seeding_falls_back(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_hnsw_anchor_seeding_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("==============================================================\n");
     printf("  QIHSE HNSW Anchor-Guided Vector Proximity Seeding Tests     \n");
     printf("==============================================================\n");

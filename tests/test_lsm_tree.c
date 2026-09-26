@@ -6,6 +6,11 @@
 #include "qihse_auth.h"
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_lsm_tree_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Starting Native LSM-Tree Integration Test...\n");
     
     // First run: insert data

@@ -174,6 +174,11 @@ static int test_metrics_real(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_uwp_real_engines_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     qihse_auth_init();
     qihse_auth_bootstrap_operator("TestOperatorPass123!");
 

@@ -438,6 +438,11 @@ static void test_ingest_edges_jsonl(void) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_graph_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("=== QIHSE Graph Engine Tests ===\n");
     
     test_vertex_crud();

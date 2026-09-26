@@ -1,9 +1,15 @@
 #include "qihse_cluster_numa.h"
+#include <stdlib.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_cluster_numa_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     int cpus[256];
     size_t cpu_count = qihse_cluster_available_cpus(cpus, sizeof(cpus) / sizeof(cpus[0]));
     assert(cpu_count > 0);

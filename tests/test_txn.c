@@ -335,6 +335,8 @@ static bool wal_scan_cb(const qihse_wal_record_t* rec,
 static void test_wal_append_replay(void) {
     char dir[] = "build/test_txn_wal_XXXXXX";
     assert(mkdtemp(dir));
+    /* Isolate the audit chain/log per test so parallel aggregates never share root state. */
+    setenv("QIHSE_DATA_DIR", dir, 1);
 
     qihse_wal_t* wal = qihse_wal_create(dir, 64 * 1024,
                                         QIHSE_WAL_DURABILITY_FDATASYNC);

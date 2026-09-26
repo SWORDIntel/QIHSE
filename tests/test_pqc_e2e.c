@@ -11,6 +11,11 @@ void print_errors() {
 }
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_pqc_e2e_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Starting PQC E2E test...\n");
 
     OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");

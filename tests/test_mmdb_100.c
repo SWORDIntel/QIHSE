@@ -44,6 +44,11 @@ static const char* resolve_mmdb(const char* filename) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_mmdb_100_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     srand((unsigned)time(NULL));
     uint32_t rng = (uint32_t)time(NULL);
 

@@ -1,4 +1,5 @@
 #include "qihse_timeseries.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
@@ -7,6 +8,11 @@
 #define EPSILON 0.0001
 
 int main() {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_timeseries_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     printf("Testing Time-Series Engine...\n");
     qihse_tsdb_t* tsdb = qihse_tsdb_create();
     assert(tsdb != NULL);

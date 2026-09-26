@@ -43,6 +43,11 @@ static void* worker(void* arg) {
 }
 
 int main(void) {
+{
+    /* Per-test audit/chain isolation (parallel aggregates). */
+    char qdd[] = "build/test_distance_dispatch_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+}
     pthread_t threads[8];
     int status[8] = {0};
     for (size_t i = 0; i < 8; i++) {
