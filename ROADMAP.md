@@ -89,19 +89,25 @@ session's loop; 4–5 finish what Phase-B and QKP1 started. Each lands under
 the §5 gates (source + wiring + test in the same commit; plan §44
 distributed requirements apply to the consensus work).
 
-- [ ] **1. Joint consensus — membership-change safety.** Two-phase
-  C_old → C_old,new membership transitions in the scoped consensus module:
-  no membership change commits without a joint-majority quorum; single-phase
-  changes refused under any partition; crash-restart mid-transition resumes
-  the recorded joint state. Tests: joint-transition commit, minority
-  partition refused in both phases, restart-mid-joint resumption. (Function)
-- [ ] **2. Deterministic cluster simulation harness.** Seeded,
-  fault-injected histories over `qihse_federation_sim`: partition,
-  clock-skew and crash-restart schedules replay bit-identically; asserts
-  local-write survivability (§6 invariants 4/5), no quorum gate on ordinary
-  writes, fail-closed without bricking (7), idempotent attributable
-  mutations (8), never infer safety from silence (9). Wired as
-  `make test-fed-sim`. (Verification)
+- [x] **1. Joint consensus — membership-change safety.** Two-phase
+  C_old → C_old,new bulk transitions in the scoped consensus module with a
+  dual-majority quorum (majority of C_old AND of the current fold), the
+  survivor rule against mid-joint stranding, and restart-from-log
+  resumption. Single-server changes remain the one-member fast path.
+  Evidence: commit `faa298f` — tests (j1) atomic bulk replace, (j2)
+  minority partition commits nothing in either phase and resolves cleanly,
+  (j3) crash-restart mid-joint resumes from the record file, (j4) hostile
+  proposals refused pre-durability; full aggregate 60/60. (Function)
+- [x] **2. Deterministic cluster simulation harness.** Six seeded scenarios
+  (partition-majority, no-quorum-gate, crash-restart, crash-mid-membership,
+  never-infer-safety, clock-skew-chaos) over real consensus instances;
+  every scenario replayed bit-identically (digest-asserted); wired as
+  `make test-fed-sim`. Evidence: commit `900d8d4`, full aggregate 60/60.
+  FINDING recorded (module receive path): the stale-epoch fence can
+  silence healed peers permanently (drop precedes term sync); the
+  epoch-teaching fix requires a dedicated epoch-sync message outside the
+  election/step-down state machine — see the consensus receive-path note
+  and the analysis in `900d8d4`. (Verification)
 - [ ] **3. Test isolation → parallel aggregate.** Per-target scratch
   namespaces (`build/tests/<target>/`), TMPDIR default, unique port
   allocation; `make test` becomes `-j`-safe; aggregate wall-time 40–50 min
