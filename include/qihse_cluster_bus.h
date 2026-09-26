@@ -51,6 +51,37 @@ extern "C" {
  * and idempotent, so the fragmentation this implies on a lossy path costs
  * liveness at worst and never correctness. */
 #define QIHSE_CLUSTER_BUS_MAX_PAYLOAD 8192u
+
+/* ── Signed ops frames (hybrid bus upgrade, roadmap improvement 5) ────────
+ *
+ * The four authority-adjacent operational frame classes — SLOT_UPDATE,
+ * NODE_UPDATE, GROUP_UPDATE, GROUP_ACK — carry an optional ML-DSA signature
+ * trailer appended AFTER the payload (bootstrap/liveness/discovery frames
+ * never sign: they must work pre-enrollment and confer no authority; the
+ * federation statement pair already signs itself).
+ *
+ * Trailer (after payload, before any veiling):
+ *   uint8_t  magic[3]   = 'Q','B','S'
+ *   uint8_t  sig_alg    = 1 (ML-DSA-87)
+ *   uint16_t sig_len    (little-endian, byte count of signature)
+ *   uint8_t  sender[16] = signer node UUID
+ *   uint8_t  signature[sig_len]
+ * Signed region = the entire frame preceding the trailer (header + payload).
+ *
+ * Receiver policy: a trailer is verified against the SENDER's enrolled
+ * identity (qihse_federation_node_identity_read) — failure drops the frame
+ * with signed_ops_rejected.  cfg.require_signed_ops additionally refuses
+ * unsigned signed-class frames (hardened clusters).  Loopback/legacy
+ * senders without signing keys keep working while the flag is unset. */
+#define QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX (4u + 16u + 4627u)
+#define QIHSE_CLUSTER_BUS_MAX_DATAGRAM \
+    (QIHSE_CLUSTER_BUS_HEADER_SIZE + QIHSE_CLUSTER_BUS_MAX_PAYLOAD + \
+     QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX)
+
+/* Signed operational class: frames that change topology, node metadata, or
+ * group state.  Public so tests and the daemon assert against the same
+ * definition the transport enforces. */
+bool qihse_bus_msg_signed_class(uint32_t message_type);
 #define QIHSE_CLUSTER_BUS_HEADER_SIZE 16u
 #define QIHSE_CLUSTER_BUS_HEARTBEAT_MS 1000u
 #define QIHSE_CLUSTER_BUS_TIMEOUT_MS 5000u
@@ -199,6 +230,10 @@ typedef struct {
      * no enrolled identity is simply not given a sign key and mints nothing.
      * cluster_id may be nil (the accept path does not gate on it). */
     void* federation_sign_key;   /* EVP_PKEY* — borrowed */
+    /* Hardened mode: refuse unsigned signed-class ops frames (SLOT/NODE/
+     * GROUP updates) at receive.  Off by default so a rolling upgrade
+     * works; flip once every node runs signing keys. */
+    bool require_signed_ops;
     qihse_uuid_t federation_cluster_id;
     qihse_uuid_t federation_boot_id;
     uint32_t statement_ms;       /* 0 → QIHSE_CLUSTER_BUS_STATEMENT_MS */
@@ -367,7 +402,14 @@ typedef struct {
     uint64_t nodes_marked_unhealthy;
     uint64_t group_updates_received;
     uint64_t group_acks_received;
+    uint64_t signed_ops_accepted;   /* trailer verified on an ops frame */
+    uint64_t signed_ops_rejected;   /* trailer present but bad */
+    uint64_t unsigned_ops_refused;  /* require_signed_ops refusal */
 } qihse_cluster_bus_stats_t;
+
+/* Hardened receive policy switch (see cfg.require_signed_ops). */
+void qihse_cluster_bus_set_require_signed_ops(qihse_cluster_bus_t* bus,
+                                               bool require);
 
 void qihse_cluster_bus_stats(const qihse_cluster_bus_t* bus,
                              qihse_cluster_bus_stats_t* out_stats);

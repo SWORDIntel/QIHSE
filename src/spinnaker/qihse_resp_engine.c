@@ -11033,6 +11033,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         bus_cfg.bind_address = supplied->bind_address;
         bus_cfg.xdp_interface = supplied->xdp_interface;
         bus_cfg.veil_key = supplied->veil_key;
+        bus_cfg.federation_sign_key = supplied->federation_sign_key;
+        bus_cfg.require_signed_ops = supplied->require_signed_ops;
         server->bus = qihse_cluster_bus_create(&bus_cfg);
         server->owns_bus = server->bus != NULL;
         qihse_resp_group_wire_bus(server, server->bus);
@@ -11058,6 +11060,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             re_cfg.bind_address = supplied->bind_address;
             re_cfg.xdp_interface = supplied->xdp_interface;
             re_cfg.veil_key = supplied->veil_key;
+            re_cfg.federation_sign_key = supplied->federation_sign_key;
+            re_cfg.require_signed_ops = supplied->require_signed_ops;
             re_cfg.on_fail = qihse_cluster_failover_on_fail_cb;
             re_cfg.on_fail_user_data = server->failover;
             qihse_cluster_bus_destroy(server->bus);

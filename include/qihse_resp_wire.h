@@ -59,6 +59,10 @@ typedef struct {
      * [HMAC-SHA384-keystream-XORed frame] — transport obfuscation only; bus
      * auth is separate. NULL/empty = plain frames. */
     const char* veil_key;
+    /* Signed ops frames (hybrid bus upgrade): signing key (borrowed) and
+     * hardened receive policy — copied onto the cluster bus at create. */
+    void* federation_sign_key;
+    bool require_signed_ops;
     /* R4c QKP1 (CNSA 2.0 RESP handshake): zero-initialized = disabled
      * (opportunistic cleartext). Set by the daemon from --pqc-* flags. */
     qihse_qkp_config_t pqc;

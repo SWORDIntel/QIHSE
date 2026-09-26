@@ -2579,6 +2579,20 @@ bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
                              (qihse_user_t*)user_void);
 }
 
+bool qihse_federation_node_identity_read(void* store_void, void* user_void,
+                                          const qihse_uuid_t* node_id,
+                                          qihse_federation_node_identity_t* out) {
+    if (!store_void || !user_void || !node_id || !out) return false;
+    char key[128];
+    node_kv_key(node_id, key, sizeof(key));
+    char* blob = qihse_kv_get_user((qihse_kv_store_t*)store_void, key,
+                                   (qihse_user_t*)user_void);
+    if (!blob) return false;
+    bool ok = node_decode(blob, out);
+    free(blob);
+    return ok;
+}
+
 bool qihse_federation_node_revoke(void* store_void, void* user_void,
                                   const qihse_uuid_t* node_id) {
     if (!store_void || !user_void || !node_id) return false;

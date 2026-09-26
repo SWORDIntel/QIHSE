@@ -922,6 +922,14 @@ bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
 bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
                                          const qihse_uuid_t* node_id,
                                          uint64_t enrollment_epoch);
+/* Read an enrolled node's identity record (public key, trust state,
+ * fingerprint) by node UUID.  The caller decides policy — no trust
+ * filtering happens here, so a REVOKED record reads back as revoked.
+ * Refused (false) on invalid arguments or when no record exists. */
+bool qihse_federation_node_identity_read(void* store_void, void* user_void,
+                                          const qihse_uuid_t* node_id,
+                                          qihse_federation_node_identity_t* out);
+
 bool qihse_federation_node_revoke(void* store_void, void* user_void,
                                   const qihse_uuid_t* node_id);
 bool qihse_federation_node_lookup(void* store_void, void* user_void,

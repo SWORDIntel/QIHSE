@@ -120,7 +120,10 @@ static void usage(const char* argv0) {
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
         "          (the operator password also keys the veiled bus framing;\n"
         "           every cluster node must use the same password)\n"
-        "          [--brain] [--brain-act] [--brain-dir DIR] [--brain-interval S] [--brain-dsa-key PATH]\n"
+        "          [--node-key PATH] [--require-signed-ops]\n"
+ "          (signed ops frames: SLOT/NODE/GROUP updates carry ML-DSA\n"
+ "           signatures; require-signed-ops refuses unsigned ones)\n"
+ "          [--brain] [--brain-act] [--brain-dir DIR] [--brain-interval S] [--brain-dsa-key PATH]\n"
         "          [--brain-cooldown S] [--brain-rollback-window S]\n"
         "          [--brain-prune-timeout S] [--brain-rebalance-min-slots N]\n"
         "          [--brain-fed-dir DIR] [--brain-node-key PATH]\n"
@@ -556,6 +559,13 @@ static void* join_main(void* argument) {
 }
 
 int main(int argc, char** argv) {
+
+    /* Signed ops frames (hybrid bus upgrade): load this node's ML-DSA
+     * identity to sign SLOT/NODE/GROUP frames; optionally require
+     * signatures from peers on receive. */
+    const char* node_key_path = NULL;
+    bool require_signed_ops = false;
+
     unsigned int self_index = 0;
     const char* bind = "127.0.0.1";
     uint16_t port = 7100, bus_port = 17100;
@@ -606,6 +616,10 @@ int main(int argc, char** argv) {
             bind = argv[++i];
         } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &port)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--node-key") == 0 && i + 1 < argc) {
+            node_key_path = argv[++i];
+        } else if (strcmp(a, "--require-signed-ops") == 0) {
+            require_signed_ops = true;
         } else if (strcmp(a, "--bus-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &bus_port)) return usage(argv[0]), 2;
         } else if (strcmp(a, "--operator-password") == 0 && i + 1 < argc) {
@@ -887,6 +901,33 @@ int main(int argc, char** argv) {
      * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
      * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
     config.veil_key = operator_password;
+    /* Signed ops: without --node-key the daemon cannot sign its own ops
+     * frames; with --require-signed-ops it also refuses unsigned ones from
+     * peers (hardened mode — every node must then run --node-key). */
+    /* Signed ops (hybrid bus upgrade): load the node identity BEFORE the
+     * RESP server is created — the bus inherits signing/verification from
+     * the server config below. */
+    void* node_sign_pkey = NULL;
+    if (node_key_path) {
+        node_sign_pkey = qihse_federation_node_key_load(node_key_path);
+        if (!node_sign_pkey) {
+            fprintf(stderr,
+                    "[qihse-cluster-daemon] --node-key: cannot load '%s'\n",
+                    node_key_path);
+            return 2;
+        }
+        fprintf(stderr,
+                "[qihse-cluster-daemon] signing ops frames with %s\n",
+                node_key_path);
+    } else if (require_signed_ops) {
+        fprintf(stderr,
+                "[qihse-cluster-daemon] --require-signed-ops without --node-key: "
+                "this node cannot SIGN its own ops frames and will refuse to "
+                "start in hardened mode\n");
+        return 2;
+    }
+    config.federation_sign_key = node_sign_pkey;
+    config.require_signed_ops = require_signed_ops;
     /* R4c: PQC must be OFF unless explicitly requested via --pqc-* flags.
      * pqc.dsa_key_path points at a static buffer and is therefore always
      * non-NULL — gating on it silently enabled opportunistic PQC (with the

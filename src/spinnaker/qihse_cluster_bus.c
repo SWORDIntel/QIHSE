@@ -65,6 +65,8 @@ struct qihse_cluster_bus {
     qihse_uuid_t local_node_uuid;
     bool has_local_node_uuid;
     uint64_t last_cap_record_ms;
+    /* Hardened receive policy: unsigned signed-class ops frames refused. */
+    bool require_signed_ops;
     /* Statement production (see qihse_cluster_bus_config_t).  sign_key is
      * borrowed — the caller owns the node private key. */
     void* federation_sign_key;
@@ -345,6 +347,45 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
     const uint8_t* wire = data;
     size_t wire_len = len;
     uint8_t veiled[QIHSE_BUS_MAX_DATAGRAM + QIHSE_BUS_VEIL_OVERHEAD];
+
+    /* Signed ops class: append an ML-DSA trailer over header+payload when
+     * this node has a signing identity.  Bootstrap/liveness/discovery
+     * frames never sign (pre-enrollment, no authority). */
+    uint8_t signed_buf[QIHSE_CLUSTER_BUS_HEADER_SIZE +
+                       QIHSE_CLUSTER_BUS_MAX_PAYLOAD +
+                       QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX];
+    if (bus->federation_sign_key && bus->has_local_node_uuid && len >= 8u &&
+        qihse_bus_msg_signed_class(
+            (uint32_t)(data[4] | ((uint32_t)data[5] << 8) |
+                       ((uint32_t)data[6] << 16) |
+                       ((uint32_t)data[7] << 24)))) {
+        uint8_t sig[4627];
+        size_t sig_len = sizeof(sig);
+        if (qihse_federation_sign(bus->federation_sign_key, data, len, sig,
+                                  &sig_len) &&
+            len + 4u + 16u + sig_len <= sizeof(signed_buf)) {
+            uint8_t* t = signed_buf;
+            memcpy(t, data, len);
+            t += len;
+            *t++ = 1; /* sig_alg: ML-DSA-87 */
+            *t++ = (uint8_t)(sig_len & 0xFF);
+            *t++ = (uint8_t)(sig_len >> 8);
+            memcpy(t, bus->local_node_uuid.bytes, 16u);
+            t += 16u;
+            memcpy(t, sig, sig_len);
+            /* Footer mirrors alg+len so a reader can locate everything from
+             * the end of the datagram alone. */
+            *t++ = 1;
+            *t++ = (uint8_t)(sig_len & 0xFF);
+            *t++ = (uint8_t)(sig_len >> 8);
+            *t++ = 'Q'; *t++ = 'B'; *t++ = 'S'; /* end tag */
+            wire = signed_buf;
+            wire_len = len + 4u + 2u + 16u + sig_len + 6u;
+        }
+        /* Signing failure sends the frame UNSIGNED: the require_signed_ops
+         * policy on receivers is the enforcement point, not the sender. */
+    }
+
     if (bus->veil_key) {
         wire_len = qihse_bus_veil_encode(bus, data, len, veiled, sizeof(veiled));
         if (wire_len == 0) return false;
@@ -765,8 +806,71 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         data = plain;
         len = inner_len;
     }
+    /* Signature trailer verification, before the frame is parsed: a
+     * trailing 'QBS' block must verify against the SENDER's enrolled
+     * identity or the whole datagram is dropped (fail closed). */
+    size_t trailer_len = 0u;
+    bool trailer_present = false;
+    if (len > (size_t)(QIHSE_CLUSTER_BUS_HEADER_SIZE + 3u + 16u + 3u) &&
+        data[len - 3u] == 'Q' && data[len - 2u] == 'B' &&
+        data[len - 1u] == 'S') {
+        trailer_present = true;
+        /* layout: [alg][sig_len u16][uuid 16][sig][alg][sig_len u16][Q][B][S]
+         * — the footer mirrors the header so the reader locates everything
+         * from the end alone. */
+        if (len < (size_t)(QIHSE_CLUSTER_BUS_HEADER_SIZE + 3u + 2u + 16u + 6u))
+            return;
+        uint16_t sig_len = (uint16_t)(data[len - 5u] | (data[len - 4u] << 8));
+        /* front(alg+len = 3) + uuid(16) + sig + footer(6: alg+len+tag) */
+        size_t sig_total = 3u + 16u + (size_t)sig_len + 6u;
+        if (sig_len == 0u || sig_len > 4627u || sig_total > len) return;
+        size_t tr = len - sig_total; /* trailer start */
+        qihse_uuid_t signer;
+        memcpy(signer.bytes, data + tr + 3u, 16u);
+        bool verified = false;
+        /* The ALGORITHM OF RECORD is the enrolled identity's, not the
+         * trailer byte (advisory only) — the signature must verify under
+         * exactly the key material the enrollment recorded. */
+        if (bus->federation_store && bus->federation_user) {
+            qihse_federation_node_identity_t ident;
+            bool have = qihse_federation_node_identity_read(
+                bus->federation_store, bus->federation_user, &signer, &ident);
+            if (have && ident.trust == QIHSE_TRUST_APPROVED) {
+                verified = qihse_federation_verify(
+                    ident.sig_alg, ident.public_key, ident.public_key_len,
+                    data, tr, data + tr + 3u + 16u, sig_len);
+                if (getenv("QBS_DBG"))
+                    fprintf(stderr, "[qbs] verify=%d alg=%d pk=%zu tr=%zu sig=%u\n",
+                            (int)verified, (int)ident.sig_alg,
+                            ident.public_key_len, tr, sig_len);
+            } else if (getenv("QBS_DBG")) {
+                fprintf(stderr,
+                        "[qbs] have=0 signer=%02x%02x%02x%02x\n",
+                        signer.bytes[0], signer.bytes[1], signer.bytes[2],
+                        signer.bytes[3]);
+            }
+        }
+        if (!verified) {
+            __atomic_add_fetch(&bus->stats.signed_ops_rejected, 1u,
+                               __ATOMIC_RELAXED);
+            return; /* forged, tampered, or unenrolled signer */
+        }
+        __atomic_add_fetch(&bus->stats.signed_ops_accepted, 1u,
+                           __ATOMIC_RELAXED);
+        trailer_len = sig_total;
+    }
+
     uint32_t magic, type, sender32, payload_len;
-    if (!qihse_bus_parse_header(data, len, &magic, &type, &sender32, &payload_len)) return;
+    if (!qihse_bus_parse_header(data, len - trailer_len, &magic, &type,
+                                &sender32, &payload_len)) {
+        return;
+    }
+    if (bus->require_signed_ops && trailer_present == false &&
+        qihse_bus_msg_signed_class(type)) {
+        __atomic_add_fetch(&bus->stats.unsigned_ops_refused, 1u,
+                           __ATOMIC_RELAXED);
+        return;
+    }
     uint16_t sender = (uint16_t)sender32;
     const uint8_t* payload = data + QIHSE_CLUSTER_BUS_HEADER_SIZE;
     __atomic_add_fetch(&bus->stats.received, 1u, __ATOMIC_RELAXED);
@@ -795,6 +899,18 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
             (void)qihse_overlay_dht_handle_nodes(bus, payload, payload_len);
             break;
         default: break;
+    }
+}
+
+bool qihse_bus_msg_signed_class(uint32_t message_type) {
+    switch ((qihse_cluster_bus_msg_type_t)message_type) {
+        case QIHSE_BUS_MSG_SLOT_UPDATE:
+        case QIHSE_BUS_MSG_NODE_UPDATE:
+        case QIHSE_BUS_MSG_GROUP_UPDATE:
+        case QIHSE_BUS_MSG_GROUP_ACK:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -1084,6 +1200,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         bus->has_local_node_uuid = true;
     }
     bus->federation_sign_key = config->federation_sign_key;
+    bus->require_signed_ops = config->require_signed_ops;
     bus->federation_cluster_id = config->federation_cluster_id;
     bus->federation_boot_id = config->federation_boot_id;
     bus->statement_ms = config->statement_ms ? config->statement_ms
@@ -1459,6 +1576,12 @@ size_t qihse_cluster_bus_check_health(qihse_cluster_bus_t* bus) {
         }
     }
     return marked;
+}
+
+void qihse_cluster_bus_set_require_signed_ops(qihse_cluster_bus_t* bus,
+                                               bool require) {
+    if (!bus) return;
+    bus->require_signed_ops = require;
 }
 
 void qihse_cluster_bus_stats(const qihse_cluster_bus_t* bus,
