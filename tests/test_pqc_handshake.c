@@ -7,19 +7,28 @@
  *   3. server rejects a client identity it does not trust
  *   4. replayed H2 after handshake → connection closed
  *   5. tampered ciphertext → handshake/sealed traffic dies
+ *   9.  (a) 200 KiB sealed GET: chunked into records, reassembled byte-exact
+ *   10. (b) KEYS array reply >16 KiB over the sealed session
+ *   11. (c) max-size sealed record (16384 payload) round-trips both ways
+ *   12. (d) MITM wire audit: per-direction seqs strictly monotonic from 1,
+ *           no reuse, full-size records on the wire
+ *   13. (g) degraded daemon (keys missing): QKP1 probe gets
+ *           "-ERR PQC unavailable" + close; cleartext still served
  *   6. opportunistic mode: plain AUTH/PING without QKP1 still works
  *   7. --pqc-require: cleartext refused with -ERR
  *   8. --pqc-require with missing keys: daemon refuses to start
  *
- * Build: make test-pqc-handshake.  Sandbox-only (port 7195).
+ * Build: make test-pqc-handshake.  Sandbox-only (ports 7195/7196).
  */
 #include "qihse_pqc_crypto.h"
 #include "qihse_qkp.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/select.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +124,284 @@ static bool qkp_send_frame(int fd, uint8_t type, const void* payload, uint16_t l
     return wr(fd, head, 8) && (len == 0 || wr(fd, payload, len));
 }
 
+/* ── sealed stream reader: RESP reassembled from chunked QSE1 records ──
+ * A reply arrives as a run of sealed records (send-side chunking, one
+ * strictly monotonic seq per record); the RESP framing spans record
+ * boundaries, so everything is reassembled through a refill buffer. */
+typedef struct {
+    int fd;
+    qihse_qkp_session_t* s;
+    uint8_t buf[QIHSE_QKP_MAX_PAYLOAD];
+    size_t len, pos;
+    uint64_t records;
+} sstream;
+
+static sstream* sopen(qihse_qkp_session_t* s, int fd) {
+    sstream* st = calloc(1u, sizeof(*st));
+    if (st) { st->s = s; st->fd = fd; }
+    return st;
+}
+
+static void sclose(sstream* st) { free(st); }
+
+static bool sfill(sstream* st) {
+    st->pos = 0; st->len = 0;
+    ssize_t n = qihse_qkp_recv_sealed(st->s, st->fd, st->buf, sizeof(st->buf));
+    if (n <= 0) return false;
+    st->len = (size_t)n;
+    st->records++;
+    return true;
+}
+
+static int sgetc(sstream* st) {
+    if (st->pos >= st->len && !sfill(st)) return -1;
+    return st->buf[st->pos++];
+}
+
+static bool sread_exact(sstream* st, uint8_t* out, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        int c = sgetc(st);
+        if (c < 0) return false;
+        out[i] = (uint8_t)c;
+    }
+    return true;
+}
+
+static char* sline(sstream* st) {
+    size_t cap = 128, len = 0;
+    char* out = malloc(cap);
+    if (!out) return NULL;
+    for (;;) {
+        int c = sgetc(st);
+        if (c < 0) { free(out); return NULL; }
+        if (c == '\n') break;
+        if (len + 2 >= cap) {
+            cap *= 2u;
+            char* grown = realloc(out, cap);
+            if (!grown) { free(out); return NULL; }
+            out = grown;
+        }
+        out[len++] = (char)c;
+    }
+    if (len && out[len - 1] == '\r') len--;
+    out[len] = '\0';
+    return out;
+}
+
+typedef struct respval {
+    char type;                          /* '+', '-', ':', '$', '*' */
+    char* line;                         /* simple/error/integer line */
+    uint8_t* data; size_t dlen;         /* bulk payload */
+    struct respval* items; size_t count; /* array elements */
+} respval;
+
+static void resp_free(respval* v) {
+    if (!v) return;
+    free(v->line);
+    free(v->data);
+    for (size_t i = 0; i < v->count; i++) resp_free(&v->items[i]);
+    free(v->items);
+    memset(v, 0, sizeof(*v));
+}
+
+static bool resp_read(sstream* st, respval* v, int depth) {
+    memset(v, 0, sizeof(*v));
+    if (depth > 4) return false;
+    char* ln = sline(st);
+    if (!ln) return false;
+    v->type = ln[0];
+    if (ln[0] == '$') {
+        long long n = strtoll(ln + 1, NULL, 10);
+        free(ln);
+        if (n < 0) return true;                      /* null bulk */
+        v->data = malloc((size_t)n + 1u);
+        if (!v->data) return false;
+        if (!sread_exact(st, v->data, (size_t)n)) { free(v->data); v->data = NULL; return false; }
+        char tail[2];
+        if (!sread_exact(st, (uint8_t*)tail, 2u) || tail[0] != '\r' || tail[1] != '\n') {
+            free(v->data); v->data = NULL; return false;
+        }
+        v->dlen = (size_t)n;
+        return true;
+    }
+    if (ln[0] == '*') {
+        long long n = strtoll(ln + 1, NULL, 10);
+        free(ln);
+        if (n < 0) return true;                      /* null array */
+        if ((size_t)n > 1000000u) return false;
+        v->items = calloc((size_t)n, sizeof(respval));
+        if (!v->items) return false;
+        v->count = (size_t)n;
+        for (size_t i = 0; i < v->count; i++) {
+            if (!resp_read(st, &v->items[i], depth + 1)) return false;
+        }
+        return true;
+    }
+    v->line = ln;                                    /* '+', '-', ':' */
+    return true;
+}
+
+/* ── shared key paths (set in main) ──────────────────────────────────── */
+static char g_srv_dsapub[128], g_cli_dsa[128];
+
+/* Dial, negotiate QKP1, AUTH inside the sealed channel. The AUTH round trip
+ * also proves the channel before the caller's first real command. */
+static qihse_qkp_session_t* open_sealed_session(int port, const char* node_id, int* out_fd) {
+    qihse_qkp_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    static const char* trusted[1];
+    trusted[0] = g_srv_dsapub;
+    cfg.trusted_pubs = trusted;
+    cfg.trusted_count = 1;
+    cfg.dsa_key_path = g_cli_dsa;
+    cfg.node_id = node_id;
+    int fd = dial(port);
+    if (fd < 0) return NULL;
+    qihse_qkp_session_t* s = NULL;
+    if (qihse_qkp_client_negotiate(fd, &cfg, &s) != QIHSE_QKP_SECURE || !s) {
+        close(fd);
+        return NULL;
+    }
+    char auth[96];
+    int n = snprintf(auth, sizeof(auth), "AUTH " PW "\r\n");
+    if (n <= 0 || !qihse_qkp_send_sealed(s, fd, auth, (size_t)n)) {
+        close(fd); qihse_qkp_session_free(s); return NULL;
+    }
+    sstream* st = sopen(s, fd);
+    respval v = {0};
+    bool ok = st && resp_read(st, &v, 0) && v.type == '+';
+    resp_free(&v);
+    sclose(st);
+    if (!ok) { close(fd); qihse_qkp_session_free(s); return NULL; }
+    if (out_fd) *out_fd = fd;
+    return s;
+}
+
+/* Send one command, expect a '+' simple reply. */
+static bool sealed_ok_reply(qihse_qkp_session_t* s, int fd, const char* cmd) {
+    if (!qihse_qkp_send_sealed(s, fd, cmd, strlen(cmd))) return false;
+    sstream* st = sopen(s, fd);
+    respval v = {0};
+    bool ok = st && resp_read(st, &v, 0) && v.type == '+';
+    resp_free(&v);
+    sclose(st);
+    return ok;
+}
+
+/* ── in-harness MITM tee (d: nonce audit on the chunked path) ──────────
+ * Forwards 127.0.0.1:listen_port → 127.0.0.1:target_port for ONE
+ * connection, appending each direction's raw stream to its capture file
+ * (same wire-audit approach as the R4c verification). */
+static void mitm_child(int listen_port, int target_port,
+                       const char* cap_c2s, const char* cap_s2c) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) _exit(1);
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)listen_port);
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
+    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(lfd, 1) != 0) _exit(1);
+    int c = accept(lfd, NULL, NULL);
+    if (c < 0) _exit(1);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)target_port);
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
+    if (connect(t, (struct sockaddr*)&addr, sizeof(addr)) != 0) _exit(1);
+    int fc = open(cap_c2s, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int fs = open(cap_s2c, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    uint8_t buf[65536];
+    for (;;) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(c, &rf);
+        FD_SET(t, &rf);
+        int mx = (c > t ? c : t) + 1;
+        if (select(mx, &rf, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        bool dead = false;
+        if (FD_ISSET(c, &rf)) {
+            ssize_t n = recv(c, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            if (fc >= 0 && write(fc, buf, (size_t)n) != n) dead = true;
+            else if (!wr(t, buf, (size_t)n)) dead = true;
+        }
+        if (!dead && FD_ISSET(t, &rf)) {
+            ssize_t n = recv(t, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            if (fs >= 0 && write(fs, buf, (size_t)n) != n) dead = true;
+            else if (!wr(c, buf, (size_t)n)) dead = true;
+        }
+        if (dead) break;
+    }
+    if (fc >= 0) close(fc);
+    if (fs >= 0) close(fs);
+    close(c);
+    close(t);
+    close(lfd);
+    _exit(0);
+}
+
+/* Walk one captured direction: QKP1 handshake frames are skipped, every
+ * QSE1 record must carry the expected direction tag and the next seq
+ * (strictly monotonic, step exactly 1, no reuse). Returns the largest
+ * record payload seen and the record count. */
+static bool audit_cap(const char* path, uint32_t expected_dir,
+                      uint64_t* out_records, size_t* out_max_payload,
+                      uint64_t* out_first_seq) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return false; }
+    uint8_t* b = malloc((size_t)sz);
+    if (!b || fread(b, 1u, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return false; }
+    fclose(f);
+    size_t pos = 0;
+    uint64_t next_seq = 1, records = 0;
+    size_t max_payload = 0;
+    bool ok = true;
+    /* C2S streams open with the bare 4-byte "QKP1" probe followed by the H2
+     * frame; without skipping the probe, the frame parser reads "P1" as a
+     * length and desyncs. S2C opens with the H1 frame directly. */
+    if (sz >= 8u && memcmp(b, "QKP1", 4u) == 0 && memcmp(b + 4, "QKP1", 4u) == 0) pos = 4u;
+    while (pos < (size_t)sz) {
+        if ((size_t)sz - pos < 6u) { ok = false; break; }   /* stray tail */
+        if (memcmp(b + pos, "QKP1", 4u) == 0) {
+            if ((size_t)sz - pos < 8u) { ok = false; break; }
+            size_t flen = (size_t)(((uint16_t)b[pos + 6] << 8) | b[pos + 7]);
+            pos += 8u + flen;
+            continue;
+        }
+        if (memcmp(b + pos, "QSE1", 4u) != 0) { ok = false; break; }
+        size_t flen = (size_t)(((uint16_t)b[pos + 4] << 8) | b[pos + 5]);
+        if (flen < 28u || flen > QIHSE_QKP_MAX_FRAME) { ok = false; break; }
+        if ((size_t)sz - pos < 6u + flen) { ok = false; break; }
+        uint32_t dir = ((uint32_t)b[pos + 6] << 24) | ((uint32_t)b[pos + 7] << 16) |
+                       ((uint32_t)b[pos + 8] << 8) | (uint32_t)b[pos + 9];
+        uint64_t seq = 0;
+        for (int i = 0; i < 8; i++) seq = (seq << 8) | b[pos + 10 + (size_t)i];
+        if (dir != expected_dir) { ok = false; break; }
+        if (records == 0 && out_first_seq) *out_first_seq = seq;
+        if (seq != next_seq) { ok = false; break; }         /* gap/reuse/regression */
+        next_seq++;
+        records++;
+        if (flen - 28u > max_payload) max_payload = flen - 28u;
+        pos += 6u + flen;
+    }
+    free(b);
+    if (out_records) *out_records = records;
+    if (out_max_payload) *out_max_payload = max_payload;
+    return ok;
+}
+
 /* ── daemon lifecycle ────────────────────────────────────────────────── */
 
 static pid_t g_daemon = -1;
@@ -189,6 +476,20 @@ static bool wait_port(int port) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* survive crashes with visible progress */
+    /* A stray daemon on the sandbox port poisons every scenario (a previous
+     * crashed run once held 7195 and the suite talked to the wrong process).
+     * Refuse to run instead. */
+    {
+        int stray = dial(PORT);
+        if (stray >= 0) {
+            close(stray);
+            int stray2 = dial(7196);
+            if (stray2 >= 0) close(stray2);
+            printf("FAILURES (port %d already in use — kill the stray daemon and rerun)\n", PORT);
+            return 1;
+        }
+    }
     qihse_pqc_init_providers();
 
     /* Fresh keys: server set + two client sets (one trusted, one rogue). */
@@ -206,6 +507,8 @@ int main(void) {
     snprintf(cli_dsa, sizeof(cli_dsa), "/tmp/qsb-pqc/cli/qihse_dsa_key.pem");
     snprintf(cli_dsapub, sizeof(cli_dsapub), "/tmp/qsb-pqc/cli/qihse_dsa_pub.pem");
     snprintf(rogue_dsa, sizeof(rogue_dsa), "/tmp/qsb-pqc/rogue/qihse_dsa_key.pem");
+    snprintf(g_srv_dsapub, sizeof(g_srv_dsapub), "%s", srv_dsapub);
+    snprintf(g_cli_dsa, sizeof(g_cli_dsa), "%s", cli_dsa);
 
     /* Scenario 8 first: --pqc-require with missing keys refuses to start. */
     {
@@ -419,7 +722,238 @@ int main(void) {
         qihse_qkp_session_free(s);
     }
 
+    /* ── 9. (a) chunked sealed GET: a 200 KiB value round-trips intact ── */
+    {
+        const size_t N = 200u * 1024u;
+        uint8_t* payload = malloc(N);
+        uint64_t lcg = 0x9E3779B97F4A7C15ull;
+        for (size_t i = 0; i < N; i++) {
+            lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+            uint8_t b = (uint8_t)(lcg >> 56);
+            payload[i] = b ? b : 0x41u;   /* NUL-free: store rejects NUL values */
+        }
+        int fd = -1;
+        qihse_qkp_session_t* s = open_sealed_session(PORT, "chunk-client", &fd);
+        bool ok = (s != NULL);
+        if (ok) {
+            /* SET in ONE send_sealed call (~205 KB ⇒ 13 chunked records C2S;
+             * the old hard limit rejected any write over 16 KiB). */
+            char head[64];
+            int hl = snprintf(head, sizeof(head), "*3\r\n$3\r\nSET\r\n$5\r\nbig:1\r\n$%zu\r\n", N);
+            size_t total = (size_t)hl + N + 2u;
+            uint8_t* cmd = malloc(total);
+            memcpy(cmd, head, (size_t)hl);
+            memcpy(cmd + hl, payload, N);
+            memcpy(cmd + hl + N, "\r\n", 2u);
+            ok = qihse_qkp_send_sealed(s, fd, cmd, total);
+            if (!ok) fprintf(stderr, "diag: 200KiB SET send failed\n");
+            free(cmd);
+            sstream* st = sopen(s, fd);
+            respval v = {0};
+            bool set_reply = ok && st && resp_read(st, &v, 0);
+            if (!set_reply || v.type != '+')
+                fprintf(stderr, "diag: 200KiB SET reply: parsed=%d type='%c' line=%s\n",
+                        (int)set_reply, v.type ? v.type : '?', v.line ? v.line : "(none)");
+            ok = ok && set_reply && v.type == '+';
+            resp_free(&v);
+            sclose(st);
+            /* GET: the reply ($204800 + payload + CRLF = 204811 bytes S2C)
+             * crosses as ~13 chunked records reassembled by RESP framing. */
+            const char* get = "*2\r\n$3\r\nGET\r\n$5\r\nbig:1\r\n";
+            bool sent_get = qihse_qkp_send_sealed(s, fd, get, strlen(get));
+            if (!sent_get) fprintf(stderr, "diag: 200KiB GET send failed\n");
+            st = sopen(s, fd);
+            respval g = {0};
+            bool got = sent_get && st && resp_read(st, &g, 0);
+            if (!got || g.type != '$' || g.dlen != N)
+                fprintf(stderr, "diag: 200KiB GET reply: parsed=%d type='%c' dlen=%zu want=%zu\n",
+                        (int)got, g.type ? g.type : '?', g.dlen, N);
+            ok = ok && got && g.type == '$' &&
+                 g.dlen == N && g.data && memcmp(g.data, payload, N) == 0;
+            resp_free(&g);
+            sclose(st);
+        }
+        CHECK("9. (a) 200 KiB sealed GET byte-exact (chunked records)", ok);
+        if (s) { close(fd); qihse_qkp_session_free(s); }
+        free(payload);
+    }
+
+    /* ── 10. (b) an array reply >16 KiB over the sealed session ─────── */
+    {
+        int fd = -1;
+        qihse_qkp_session_t* s = open_sealed_session(PORT, "keys-client", &fd);
+        bool ok = (s != NULL);
+        char cmd[96];
+        const size_t K = 600;   /* 600 × 43 B elements ⇒ ~25.8 KB reply */
+        for (size_t i = 0; ok && i < K; i++) {
+            snprintf(cmd, sizeof(cmd), "SET arr:%04zu:pad-pad-pad-pad-pad-pad-pad v\r\n", i);
+            ok = sealed_ok_reply(s, fd, cmd);
+        }
+        const char* keys_cmd = "KEYS arr:*\r\n";
+        ok = ok && qihse_qkp_send_sealed(s, fd, keys_cmd, strlen(keys_cmd));
+        sstream* st = sopen(s, fd);
+        respval arr = {0};
+        ok = ok && st && resp_read(st, &arr, 0) && arr.type == '*' && arr.count == K;
+        bool sentinel = false;
+        if (ok) {
+            const char* want = "arr:0000:pad-pad-pad-pad-pad-pad-pad";
+            size_t want_len = strlen(want);
+            for (size_t i = 0; i < arr.count; i++) {
+                if (arr.items[i].type == '$' && arr.items[i].dlen == want_len &&
+                    memcmp(arr.items[i].data, want, want_len) == 0) { sentinel = true; break; }
+            }
+        }
+        ok = ok && sentinel;
+        CHECK("10. (b) KEYS array reply >16 KiB over sealed session", ok);
+        resp_free(&arr);
+        sclose(st);
+        if (s) { close(fd); qihse_qkp_session_free(s); }
+    }
+
+    /* ── 11. (c) max-size record (16384 payload) both directions ────── */
+    {
+        const size_t N = QIHSE_QKP_MAX_PAYLOAD;
+        uint8_t* payload = malloc(N);
+        for (size_t i = 0; i < N; i++) {
+            uint8_t b = (uint8_t)(i * 7u + (i >> 8));
+            payload[i] = b ? b : 0x41u;   /* NUL-free */
+        }
+        int fd = -1;
+        qihse_qkp_session_t* s = open_sealed_session(PORT, "maxrec-client", &fd);
+        bool ok = (s != NULL);
+        if (ok) {
+            /* Framing and value travel as separate sealed writes so the
+             * value lands in a record with EXACTLY 16384 payload bytes
+             * (flen 16412 — exactly what the old QIHSE_QKP_MAX_FRAME of
+             * 16392 rejected on receipt). */
+            const char* fr = "*3\r\n$3\r\nSET\r\n$5\r\nmax:1\r\n$16384\r\n";
+            ok = qihse_qkp_send_sealed(s, fd, fr, strlen(fr));
+            uint8_t* tail = malloc(N + 2u);
+            memcpy(tail, payload, N);
+            memcpy(tail + N, "\r\n", 2u);
+            ok = ok && qihse_qkp_send_sealed(s, fd, tail, N + 2u);   /* 16384+2 → max record + spillover */
+            free(tail);
+            sstream* st = sopen(s, fd);
+            respval v = {0};
+            ok = ok && st && resp_read(st, &v, 0) && v.type == '+';
+            resp_free(&v);
+            sclose(st);
+            /* GET back: the engine's bulk write puts all 16384 value bytes
+             * through ONE record on S2C. */
+            const char* get = "*2\r\n$3\r\nGET\r\n$5\r\nmax:1\r\n";
+            ok = ok && qihse_qkp_send_sealed(s, fd, get, strlen(get));
+            st = sopen(s, fd);
+            respval g = {0};
+            ok = ok && st && resp_read(st, &g, 0) && g.type == '$' &&
+                 g.dlen == N && g.data && memcmp(g.data, payload, N) == 0;
+            resp_free(&g);
+            sclose(st);
+        }
+        CHECK("11. (c) max-size record (16384 payload) round-trips both ways", ok);
+        if (s) { close(fd); qihse_qkp_session_free(s); }
+        free(payload);
+    }
+
+    /* ── 12. (d) MITM wire audit on the chunked path ────────────────── */
+    {
+        const char* c2s_cap = "/tmp/qsb-pqc/audit_c2s.cap";
+        const char* s2c_cap = "/tmp/qsb-pqc/audit_s2c.cap";
+        unlink(c2s_cap);
+        unlink(s2c_cap);
+        fflush(NULL);
+        pid_t mpid = fork();
+        if (mpid == 0) mitm_child(7196, PORT, c2s_cap, s2c_cap);
+        bool ok = mpid > 0;
+        const size_t N = 200u * 1024u;
+        uint8_t* payload = malloc(N);
+        uint64_t lcg = 0xC0FFEE123456789ull;
+        for (size_t i = 0; i < N; i++) {
+            lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+            uint8_t b = (uint8_t)(lcg >> 56);
+            payload[i] = b ? b : 0x42u;   /* NUL-free */
+        }
+        int fd = -1;
+        qihse_qkp_session_t* s = ok ? open_sealed_session(7196, "mitm-audit", &fd) : NULL;
+        ok = s != NULL;
+        uint64_t session_s2c_records = 0;
+        if (ok) {
+            char head[64];
+            int hl = snprintf(head, sizeof(head), "*3\r\n$3\r\nSET\r\n$5\r\nbig:2\r\n$%zu\r\n", N);
+            size_t total = (size_t)hl + N + 2u;
+            uint8_t* cmd = malloc(total);
+            memcpy(cmd, head, (size_t)hl);
+            memcpy(cmd + hl, payload, N);
+            memcpy(cmd + hl + N, "\r\n", 2u);
+            ok = qihse_qkp_send_sealed(s, fd, cmd, total);
+            free(cmd);
+            sstream* st = sopen(s, fd);
+            respval v = {0};
+            ok = ok && st && resp_read(st, &v, 0) && v.type == '+';
+            resp_free(&v);
+            sclose(st);
+            const char* get = "*2\r\n$3\r\nGET\r\n$5\r\nbig:2\r\n";
+            ok = ok && qihse_qkp_send_sealed(s, fd, get, strlen(get));
+            st = sopen(s, fd);
+            respval g = {0};
+            ok = ok && st && resp_read(st, &g, 0) && g.type == '$' &&
+                 g.dlen == N && g.data && memcmp(g.data, payload, N) == 0;
+            session_s2c_records = st ? st->records : 0;
+            resp_free(&g);
+            sclose(st);
+            ok = ok && session_s2c_records >= 13u;   /* 204811 B / 16384 B per record */
+        }
+        if (s) { shutdown(fd, SHUT_RDWR); close(fd); qihse_qkp_session_free(s); }
+        if (mpid > 0) {
+            for (int i = 0; i < 20; i++) {
+                if (waitpid(mpid, NULL, WNOHANG) == mpid) break;
+                usleep(100 * 1000);
+            }
+            kill(mpid, SIGKILL);
+            waitpid(mpid, NULL, 0);
+        }
+        uint64_t c2s_n = 0, s2c_n = 0, c2s_first = 0, s2c_first = 0;
+        size_t c2s_maxp = 0, s2c_maxp = 0;
+        bool c2s_ok = ok && audit_cap(c2s_cap, 1u, &c2s_n, &c2s_maxp, &c2s_first);
+        bool s2c_ok = ok && audit_cap(s2c_cap, 2u, &s2c_n, &s2c_maxp, &s2c_first);
+        ok = c2s_ok && s2c_ok &&
+             c2s_first == 1u && s2c_first == 1u &&        /* H2-ACK is S2C seq 1 */
+             c2s_n >= 14u && s2c_n >= 14u &&              /* chunked traffic crossed */
+             c2s_maxp == QIHSE_QKP_MAX_PAYLOAD &&         /* full 16384 B records on the wire */
+             s2c_maxp == QIHSE_QKP_MAX_PAYLOAD;
+        CHECK("12. (d) wire audit: seqs monotonic, no reuse, max record", ok);
+        free(payload);
+    }
+
     stop_daemon(g_daemon);
+
+    /* ── 13. (g) f6: degraded daemon (keys missing) answers QKP1 probes ── */
+    {
+        system("rm -rf /tmp/qsb-pqc/emptykeys && mkdir -p /tmp/qsb-pqc/emptykeys");
+        g_daemon = start_daemon("/tmp/qsb-pqc/emptykeys", cli_dsapub, 0);
+        bool up = wait_port(PORT);
+        bool clean_err = false, eof_after = false, cleartext_ok = false;
+        if (up) {
+            int fd = dial(PORT);
+            wr(fd, "QKP1", 4);
+            char* a = rd(fd);
+            clean_err = a && strcmp(a, "-ERR PQC unavailable") == 0;
+            if (a) {
+                char c;
+                eof_after = (read(fd, &c, 1) == 0);
+            }
+            free(a);
+            close(fd);
+            int fd2 = dial(PORT);
+            wr_cmd(fd2, "AUTH", PW);
+            char* b = rd(fd2);
+            cleartext_ok = b && strstr(b, "OK") != NULL;
+            free(b);
+            close(fd2);
+        }
+        CHECK("13. (g) keys missing: QKP1 probe gets -ERR PQC unavailable", up && clean_err && eof_after);
+        CHECK("13b. degraded daemon still serves cleartext", up && cleartext_ok);
+        stop_daemon(g_daemon);
+    }
 
     /* ── 6/7. opportunistic vs require ─────────────────────────────── */
     /* 6: already covered by the default-mode daemon above? No: the default

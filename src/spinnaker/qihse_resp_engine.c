@@ -637,8 +637,12 @@ static bool qihse_resp_write(qihse_resp_session_t* session, const void* data, si
     }
     pthread_mutex_lock(&session->io_lock);
     if (session->qkp) {
-        /* Sealed session: one AEAD frame per reply chunk. The frame carries
-         * its own 18-byte header, so size is bounded by the same limits. */
+        /* Sealed session (R4c): the sealed-write chunking hook. Writes of any
+         * size are handed straight to qihse_qkp_send_sealed, which splits
+         * payloads over QIHSE_QKP_MAX_PAYLOAD into consecutive sealed records
+         * (one strictly monotonic seq per record) that the peer reassembles
+         * from the record stream. false = a record could not be fully sent —
+         * the stream is unrecoverable, so the caller drops the connection. */
         bool sealed_ok = qihse_qkp_send_sealed(session->qkp, session->fd, bytes, len);
         pthread_mutex_unlock(&session->io_lock);
         return sealed_ok;

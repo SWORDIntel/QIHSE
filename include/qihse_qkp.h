@@ -37,28 +37,44 @@
  *     kem_pub         [kem_pub_len]   (server ML-KEM-1024 public key, PEM)
  *     sig             [QIHSE_MLDSA_SIGNATURE_SIZE]
  *     sig covers "QKP1-H1" ‖ protocol_version ‖ server_node_id ‖
- *                server_nonce ‖ kem_pub
+ *                server_nonce ‖ kem_pub_len ‖ kem_pub
  *
  *   H2 payload:
  *     client_node_id  [64]
  *     client_nonce    [32]   (random)
  *     kem_ct          [QIHSE_MLKEM_CIPHERTEXT_SIZE]   (encapsulated vs H1 pub)
  *     sig             [QIHSE_MLDSA_SIGNATURE_SIZE]
- *     sig covers "QKP1-H2" ‖ SHA384(H1 signed region ‖ kem_pub_len ‖ kem_pub)
+ *     sig covers "QKP1-H2" ‖ SHA384("QKP1-H1" ‖ H1 payload sans signature)
  *                             ‖ client_node_id ‖ client_nonce ‖ kem_ct
+ *     i.e. the transcript hash inside the H2 signed region is SHA384 of the
+ *     ENTIRE H1 signed region (domain separator included); kem_pub_len and
+ *     kem_pub are already part of that region and are NOT appended again.
  *
  *   Both sides derive (HKDF-SHA384):
- *     salt = SHA384(entire H1 signed region ‖ H2 signed region)
+ *     salt = SHA384(H1 signed region)   ← the H2 signed region is NOT part
+ *                                          of the salt material
  *     IKM  = ML-KEM shared secret(32) ‖ client_nonce(32) ‖ server_nonce(32)
  *     info = "QIHSE-QKP1-v1"
  *     OKM  = 64 bytes: [0..31] client→server key, [32..63] server→client key
  *
  *   Sealed frames (after H2-ACK): "QSE1" | len u16 | nonce[12] | ct[len]
+ *     len counts nonce ‖ ciphertext (payload + 16-byte Poly1305 tag) and is
+ *     bounded by QIHSE_QKP_MAX_FRAME (the 6-byte header is not counted).
+ *     Key usage (both derived from the same HKDF OKM): the client→server
+ *     key (OKM[0..31]) authenticates every C2S record, the server→client
+ *     key (OKM[32..63]) every S2C record — including the H2-ACK.
  *     nonce = direction tag u32 (1 = client→server, 2 = server→client)
  *             ‖ seq u64 BE (starts at 1, monotonic)
  *     ct    = ChaCha20-Poly1305(key, nonce, AAD = "QSE1"‖len, plaintext)
  *     Receiver tracks the expected seq per direction; any mismatch, tag
  *     failure, or unknown magic ⇒ connection closed (replay/forge guard).
+ *     CHUNKING: a payload larger than QIHSE_QKP_MAX_PAYLOAD is sent as
+ *     consecutive full records (one seq per record, strictly monotonic);
+ *     the receiver reassembles at the stream layer — a large reply is
+ *     simply a longer run of records. If a record cannot be fully sent
+ *     mid-chunk, the sender reports failure and the record stream is
+ *     unrecoverable: the caller MUST drop the connection (partial-write
+ *     policy, unchanged).
  *     The peer's first sealed frame MUST be the H2-ACK echo ("QKP1-ACK")
  *     for key confirmation before any application traffic.
  *
@@ -83,8 +99,13 @@ extern "C" {
 #define QIHSE_QKP_NONCE_LEN       32u
 #define QIHSE_QKP_NONCE_WIRE_LEN  12u
 #define QIHSE_QKP_KEY_LEN         32u
+#define QIHSE_QKP_TAG_LEN         16u   /* Poly1305 tag */
 #define QIHSE_QKP_MAX_PAYLOAD     16384u
-#define QIHSE_QKP_MAX_FRAME       (8u + QIHSE_QKP_MAX_PAYLOAD)
+/* Largest sealed-record body ("QSE1" | len u16 | nonce[12] | ct[len]):
+ * len = nonce(12) ‖ payload(≤16384) ‖ tag(16) ⇒ 16412. The old value,
+ * 8 + MAX_PAYLOAD = 16392, came from the handshake header shape and
+ * silently rejected every max-size record on receipt. */
+#define QIHSE_QKP_MAX_FRAME       (QIHSE_QKP_NONCE_WIRE_LEN + QIHSE_QKP_MAX_PAYLOAD + QIHSE_QKP_TAG_LEN)
 
 typedef struct qihse_qkp_session qihse_qkp_session_t;
 
@@ -112,8 +133,13 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
 qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* cfg,
                                               qihse_qkp_session_t** out_session);
 
-/* Seal `len` bytes and push the frame; true = fully sent. Direction follows
- * the session role. */
+/* Seal `len` bytes and push them as one or more sealed records: payloads
+ * above QIHSE_QKP_MAX_PAYLOAD are chunked into consecutive full records
+ * (one strictly monotonic seq per record; the peer reassembles from the
+ * record stream). Direction follows the session role. true = fully sent;
+ * false = some record could not be sent — earlier chunks may already be on
+ * the wire, so the stream is unrecoverable and the caller must drop the
+ * connection (partial-write policy, unchanged). */
 bool qihse_qkp_send_sealed(qihse_qkp_session_t* s, int fd, const void* data, size_t len);
 
 /* Read one sealed frame from `fd`, open it, copy plaintext into out (cap).

@@ -593,6 +593,7 @@ int main(int argc, char** argv) {
     const char* pqc_trusted[16];
     size_t pqc_trusted_count = 0;
     bool pqc_require = false;
+    bool pqc_degraded = false;            /* identity dir requested, keys missing */
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -848,15 +849,15 @@ int main(int argc, char** argv) {
                                 "(need qihse_dsa_key.pem, qihse_kem_key.pem, qihse_kem_pub.pem); refusing to start\n", pqc_dir);
                 return 1;
             }
-            if (pqc_identity_dir) {
-                fprintf(stderr, "qihse-cluster-daemon: PQC identity keys not found under %s; "
-                                "serving cleartext (opportunistic mode)\n", pqc_dir);
-            }
-            memset(&pqc, 0, sizeof(pqc));
+            /* f6: keys missing under an explicitly requested identity dir —
+             * stay ARMED (degraded) so the engine still probes connections:
+             * a QKP1 client gets a clean "-ERR PQC unavailable" line instead
+             * of the probe disappearing into the cleartext RESP parser
+             * (silence until timeout). Cleartext sessions are unaffected. */
+            pqc_degraded = true;
+            fprintf(stderr, "qihse-cluster-daemon: PQC identity keys not found under %s; "
+                            "serving cleartext, QKP1 probes answered with -ERR PQC unavailable\n", pqc_dir);
         }
-    } else if (pqc_require) {
-        fprintf(stderr, "qihse-cluster-daemon: --pqc-require requires --pqc-identity-dir; refusing to start\n");
-        return 1;
     }
 
     qihse_resp_server_config_t config;
@@ -934,7 +935,9 @@ int main(int argc, char** argv) {
     signal(SIGTERM, on_signal);
     fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s%s\n",
             self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off",
-            config.pqc.dsa_key_path ? (config.pqc.require ? ", pqc=required" : ", pqc=opportunistic") : ", pqc=off");
+            config.pqc.dsa_key_path ? (config.pqc.require ? ", pqc=required"
+                                      : (pqc_degraded ? ", pqc=unavailable (keys missing)" : ", pqc=opportunistic"))
+                                    : ", pqc=off");
     if (brain_enabled) {
         char default_dir[600];
         if (!brain_dir) {

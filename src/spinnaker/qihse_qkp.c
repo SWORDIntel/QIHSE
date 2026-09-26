@@ -209,7 +209,17 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     }
     if (!cfg->dsa_key_path || !cfg->kem_key_path || !cfg->kem_pub_path ||
         cfg->trusted_count == 0 || !cfg->trusted_pubs) {
-        qkp_send_err(fd, "PQC handshake required but server identity is not configured");
+        /* f6: a QKP1 probe against a server that cannot authenticate at all
+         * gets one clean error line instead of silence. */
+        qkp_send_err(fd, "PQC unavailable");
+        return QIHSE_QKP_REJECTED;
+    }
+    if (access(cfg->dsa_key_path, R_OK) != 0 || access(cfg->kem_key_path, R_OK) != 0 ||
+        access(cfg->kem_pub_path, R_OK) != 0) {
+        /* f6: identity configured but keys unreadable/missing (degraded
+         * opportunistic daemon) — same clean degradation, before any H1
+         * work happens. */
+        qkp_send_err(fd, "PQC unavailable");
         return QIHSE_QKP_REJECTED;
     }
 
@@ -282,7 +292,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     /* H2 */
     uint8_t h2[QIHSE_QKP_MAX_PAYLOAD];
     ssize_t h2_len = qkp_read_frame(fd, h2);
-    if (h2_len < 0) { free(h1); fprintf(stderr, "QKP-DBG: H2 read_frame failed\n"); return QIHSE_QKP_REJECTED; }
+    if (h2_len < 0) { free(h1); return QIHSE_QKP_REJECTED; }
     if ((size_t)h2_len != 64u + 32u + QIHSE_QKP_CT_LEN + QIHSE_QKP_SIG_LEN) {
         free(h1); qkp_log_reject(cfg, "H2 size invalid");
         qkp_send_err(fd, "PQC H2 size invalid");
@@ -306,12 +316,6 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
         memcpy(p, cli_id, 64u); p += 64u;
         memcpy(p, cli_nonce, 32u); p += 32u;
         memcpy(p, ct, QIHSE_QKP_CT_LEN);
-    }
-    {
-        uint8_t dbg[QIHSE_QKP_TR_LEN];
-        qkp_sha384(h2_signed, h2_signed_len, dbg);
-        fprintf(stderr, "QKP-DBG2 srv h1_hash=%02x%02x h2sig_hash=%02x%02x len=%zu\n",
-                h1_hash[0], h1_hash[1], dbg[0], dbg[1], h2_signed_len);
     }
     bool client_trusted = false;
     for (size_t i = 0; i < cfg->trusted_count && !client_trusted; i++) {
@@ -349,7 +353,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     }
 
     qihse_qkp_session_t* s = (qihse_qkp_session_t*)calloc(1u, sizeof(*s));
-    if (!s) { fprintf(stderr, "QKP-DBG: session calloc failed\n"); qkp_send_err(fd, "out of memory"); return QIHSE_QKP_REJECTED; }
+    if (!s) { qkp_send_err(fd, "out of memory"); return QIHSE_QKP_REJECTED; }
     s->role = QKP_ROLE_SERVER;
     memcpy(s->key_c2s, okm, 32u);
     memcpy(s->key_s2c, okm + 32u, 32u);
@@ -374,7 +378,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(sealed, head, 6u);
     memcpy(sealed + 6u, seal_nonce, 12u);
     s->tx_seq++;
-    if (!qkp_write_all(fd, sealed, 6u + plen)) { fprintf(stderr, "QKP-DBG: ACK send failed\n"); free(s); return QIHSE_QKP_REJECTED; }
+    if (!qkp_write_all(fd, sealed, 6u + plen)) { free(s); return QIHSE_QKP_REJECTED; }
 
     if (out) *out = s; else free(s);
     return QIHSE_QKP_SECURE;
@@ -451,13 +455,6 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
         memcpy(w, ct, QIHSE_QKP_CT_LEN);
     }
     uint8_t h2_sig[QIHSE_QKP_SIG_LEN];
-    {
-        uint8_t dbg[48];
-        unsigned int ol = 0;
-        EVP_Digest(h2_signed, h2_signed_len, dbg, &ol, EVP_sha384(), NULL);
-        fprintf(stderr, "QKP-DBG2 cli h1_hash=%02x%02x h2sig_hash=%02x%02x len=%zu\n",
-                h1_hash[0], h1_hash[1], dbg[0], dbg[1], h2_signed_len);
-    }
     bool signed_ok = qihse_pqc_sign_path(h2_signed, h2_signed_len, h2_sig, cfg->dsa_key_path);
     free(h2_signed);
     if (!signed_ok) return QIHSE_QKP_REJECTED;
@@ -521,24 +518,58 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
 
 /* ── sealed transport ─────────────────────────────────────────────────── */
 
-bool qihse_qkp_send_sealed(qihse_qkp_session_t* s, int fd, const void* data, size_t len) {
-    if (!s || !data || len > QIHSE_QKP_MAX_PAYLOAD) return false;
-    uint8_t nonce[12];
+/* Key usage (f3, per the documented key schedule): the client→server key
+ * protects every C2S record, the server→client key every S2C record. The
+ * server seals with key_s2c / opens with key_c2s; the client mirrors. */
+static const uint8_t* qkp_tx_key(const qihse_qkp_session_t* s) {
+    return (s->role == QKP_ROLE_SERVER) ? s->key_s2c : s->key_c2s;
+}
+
+static const uint8_t* qkp_rx_key(const qihse_qkp_session_t* s) {
+    return (s->role == QKP_ROLE_SERVER) ? s->key_c2s : s->key_s2c;
+}
+
+/* One sealed record; len must be ≤ QIHSE_QKP_MAX_PAYLOAD (callers: the
+ * chunking loop below). The record consumes the current tx_seq — exactly
+ * one seq per record — and the seq only advances when the record was FULLY
+ * sent, so seqs on the wire are strictly monotonic with no gaps. */
+static bool qkp_send_sealed_record(qihse_qkp_session_t* s, int fd,
+                                   const uint8_t* data, size_t len) {
     uint32_t dir = (s->role == QKP_ROLE_SERVER) ? DIR_S2C : DIR_C2S;
+    const uint8_t* key = qkp_tx_key(s);
+    uint8_t nonce[12];
     qkp_make_nonce(nonce, dir, s->tx_seq);
     uint8_t head[6];
-    uint16_t flen = (uint16_t)(12u + len + 16u);
+    uint16_t flen = (uint16_t)(QIHSE_QKP_NONCE_WIRE_LEN + len + QIHSE_QKP_TAG_LEN);
     memcpy(head, SEAL_MAGIC, 4u);
     head[4] = (uint8_t)(flen >> 8); head[5] = (uint8_t)flen;
     uint8_t* frame = (uint8_t*)malloc(6u + flen);
     if (!frame) return false;
     memcpy(frame, head, 6u);
     memcpy(frame + 6u, nonce, 12u);
-    bool ok = qkp_aead_seal(s->key_c2s, nonce, head, 6u, data, len, frame + 6u + 12u);
+    bool ok = qkp_aead_seal(key, nonce, head, 6u, data, len, frame + 6u + QIHSE_QKP_NONCE_WIRE_LEN);
     if (ok) ok = qkp_write_all(fd, frame, 6u + flen);
     free(frame);
     if (ok) s->tx_seq++;
     return ok;
+}
+
+bool qihse_qkp_send_sealed(qihse_qkp_session_t* s, int fd, const void* data, size_t len) {
+    if (!s || (!data && len != 0u)) return false;
+    /* Sender-side chunking: payloads beyond QIHSE_QKP_MAX_PAYLOAD travel as
+     * consecutive full records that the receiver reassembles from the record
+     * stream (one strictly monotonic seq per record). A record that cannot
+     * be fully sent leaves earlier chunks already on the wire — the record
+     * stream is then unrecoverable and the caller must drop the connection
+     * (partial-write policy, unchanged). */
+    size_t done = 0;
+    do {
+        size_t chunk = len - done;
+        if (chunk > QIHSE_QKP_MAX_PAYLOAD) chunk = QIHSE_QKP_MAX_PAYLOAD;
+        if (!qkp_send_sealed_record(s, fd, (const uint8_t*)data + done, chunk)) return false;
+        done += chunk;
+    } while (done < len);
+    return true;
 }
 
 ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
@@ -548,22 +579,28 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
     if (!qkp_read_exact(fd, head, 6u)) return -1;
     if (memcmp(head, SEAL_MAGIC, 4u) != 0) return -2;
     uint16_t flen = (uint16_t)((head[4] << 8) | head[5]);
-    if (flen < 12u + 16u || flen > QIHSE_QKP_MAX_FRAME) return -2;
+    /* QIHSE_QKP_MAX_FRAME = 12 + 16384 + 16 = 16412; the old 8+16384 bound
+     * came from the handshake frame shape and rejected every max-size
+     * record on receipt. */
+    if (flen < QIHSE_QKP_NONCE_WIRE_LEN + QIHSE_QKP_TAG_LEN || flen > QIHSE_QKP_MAX_FRAME) return -2;
     uint32_t dir = (s->role == QKP_ROLE_SERVER) ? DIR_C2S : DIR_S2C;
+    const uint8_t* key = qkp_rx_key(s);
     uint64_t expected = s->rx_seq;
     uint8_t* frame = (uint8_t*)malloc(flen);
     if (!frame) return -1;
     if (!qkp_read_exact(fd, frame, flen)) { free(frame); return -1; }
     uint8_t nonce[12];
     qkp_make_nonce(nonce, dir, expected);
-    size_t plen = flen - 12u - 16u;
+    size_t plen = flen - QIHSE_QKP_NONCE_WIRE_LEN - QIHSE_QKP_TAG_LEN;
     if (plen > cap) { free(frame); return -2; }
-    bool ok = qkp_aead_open(s->key_c2s, nonce, head, 6u, frame + 12u, flen - 12u, out);
+    bool ok = qkp_aead_open(key, nonce, head, 6u, frame + QIHSE_QKP_NONCE_WIRE_LEN,
+                            flen - QIHSE_QKP_NONCE_WIRE_LEN, out);
     free(frame);
     if (!ok) return -2; /* tag failure: forged, tampered, or replayed seq */
     /* Sequence check happens on the caller-visible nonce: expected seq was
      * baked into the nonce; a replayed frame carries an OLD seq, which fails
-     * the tag against the expected nonce. Reaching here means seq matched. */
+     * the tag against the expected nonce. Reaching here means seq matched.
+     * Chunked streams reassemble by the caller reading records in order. */
     s->rx_seq = expected + 1u;
     return (ssize_t)plen;
 }
