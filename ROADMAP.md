@@ -116,10 +116,12 @@ distributed requirements apply to the consensus work).
   aggregate wall-time ~40–50 min serial → **~5 min** `-j8` (gold suite is
   the critical path), 60/60 gold workloads pass, repo root left clean.
   (Velocity)
-- [ ] **4. Auth persistence decision.** Either a design note blessing
-  ephemeral credentials (external secret store is a §7 non-goal; restart =
-  re-credential) or a persisted verifier store under the existing
-  invariants; OPERATIONS §0 updated to match. (Function/Design)
+- [x] **4. Auth persistence decision.** Ephemeral credentials blessed —
+  decision record at [docs/architecture/auth_persistence.md](docs/architecture/auth_persistence.md):
+  restart = re-credential from the deployment's environment; a persisted
+  verifier store rejected (secret vault is a §7 non-goal; verifiers at rest
+  are a new theft surface for zero capability). OPERATIONS §0.1 links the
+  record. (Design)
 - [ ] **5. QKP1 rollout completion.** Hybrid bus upgrade (HMAC-SHA-384 →
   ML-DSA-signed bus frames), key-rotation command in
   `qihse-federation-ca`, handshake/AEAD metrics (handshake counts, failure

@@ -35,7 +35,7 @@ The build deliberately never requires an absolute home path.
 | Demo default | if `QIHSE_OPERATOR_PASSWORD` is unset, `./qihse demo` uses `qihse-demo-operator` | demo only, per-process (auth state is in-memory) |
 | RESP wire auth | `AUTH GODMODE_OP <password>` (or `AUTH <password>`); `PING` answers pre-auth | redis-server, cluster-daemon |
 | `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set (mismatch = exit 2) | `qihse-redis-server --require-auth` |
-| Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk | all tools |
+| Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk (decision record: [auth_persistence.md](architecture/auth_persistence.md)) | all tools |
 
 Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is
 deliberately expensive. This is normal.
