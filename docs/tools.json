@@ -1,0 +1,34 @@
+{
+  "$comment": "QIHSE tool manifest - machine-readable mirror of docs/OPERATIONS.md section 0. Facts here are verified-live; keep in sync with section 0 when either changes. All commands run from the repository root.",
+  "credentials": {
+    "operator_username": "GODMODE_OP",
+    "operator_password_env": "QIHSE_OPERATOR_PASSWORD",
+    "operator_password_min_chars": 12,
+    "demo_default_password": "qihse-demo-operator",
+    "resp_auth_form": "AUTH GODMODE_OP <password>",
+    "auth_is_in_memory": true,
+    "kdf_latency_note": "authentication paths cost multiple seconds (CNSA 2.0 KDF) - normal"
+  },
+  "tools": [
+    {"name": "make lib", "task": "build the shared library", "command": "make lib", "credential": "none"},
+    {"name": "make test", "task": "full test aggregate (~40-50 min)", "command": "make test", "credential": "none"},
+    {"name": "make test-gold", "task": "gold validation suite (60 workloads)", "command": "make test-gold", "credential": "none"},
+    {"name": "make check", "task": "upstream-workflow repo check", "command": "make check", "credential": "none"},
+    {"name": "qihse demo", "task": "native SDK smoke (KV/doc/columnar/TSDB/auth/proxies)", "command": "./qihse demo", "credential": "demo default or QIHSE_OPERATOR_PASSWORD"},
+    {"name": "qihse python", "task": "Python REPL with the native module importable", "command": "./qihse python", "credential": "as demo"},
+    {"name": "qihse-redis-server", "task": "standalone RESP server", "build": "make redis-server", "command_noauth": "./qihse-redis-server --port 6399", "command_auth": "QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'", "credential": "bootstraps from --password when unset; must match env when set (mismatch exits 2)"},
+    {"name": "qihse-cluster-daemon", "task": "cluster node (RESP + bus + brain options)", "build": "make cluster-daemon", "command": "./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'", "credential": "--operator-password keys both AUTH and the veiled bus; every node must share it", "peers": "--node INDEX:HOST:PORT:BUS-PORT (repeatable) or --join HOST:BUS-PORT"},
+    {"name": "qihse-federation-ca", "task": "federation CA provisioning (outside the process)", "build": "make federation-ca", "command": "QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca", "credential": "QIHSE_OPERATOR_PASSWORD"},
+    {"name": "qihse_keygen", "task": "key material generation", "build": "make keygen", "command": "./qihse_keygen", "credential": "none"},
+    {"name": "python-ctypes-sdk", "task": "Python controller SDK", "path": "python/qihse (import qihse.controller)", "test": "make test-controller-sdk-py", "credential": "username/password in connect config, then AUTH"},
+    {"name": "rust-controller-sdk", "task": "Rust controller SDK", "path": "rust/qihse-rs", "test": "cd rust/qihse-rs && cargo test --offline", "credential": "username/password in connect config, then AUTH"},
+    {"name": "cluster-smoke-drills", "task": "env-overridable cluster drills", "path": "tests/cluster_*_smoke.py", "example": "python3 tests/cluster_failover_smoke.py", "credential": "per drill"}
+  ],
+  "docs": {
+    "operations_manual": "docs/OPERATIONS.md",
+    "api_reference": "docs/API_REFERENCE.md",
+    "compatibility": "docs/COMPATIBILITY.md",
+    "security": "docs/security/README.md",
+    "repo_rules_for_agents": "AGENTS.md"
+  }
+}

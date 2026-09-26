@@ -19,6 +19,49 @@ The build deliberately never requires an absolute home path.
 
 ---
 
+## 0. Quick index — credentials and tools at a glance
+
+> **For AI agents and humans in a hurry.** Everything here is expanded in the
+> sections below; a machine-readable copy of the tool table lives in
+> [`tools.json`](tools.json). This index is the entry point — if a fact here
+> conflicts with prose below, this index wins and the prose needs fixing.
+
+### 0.1 Credentials (single source of truth)
+
+| What | Value / rule | Where it applies |
+|---|---|---|
+| Operator username | `GODMODE_OP` (user id 0, always exists) | every daemon, SDK, and `AUTH` |
+| Operator password | `QIHSE_OPERATOR_PASSWORD` env var, **minimum 12 chars**, read at auth init | redis-server, cluster-daemon, federation-ca, demo, controller SDKs |
+| Demo default | if `QIHSE_OPERATOR_PASSWORD` is unset, `./qihse demo` uses `qihse-demo-operator` | demo only, per-process (auth state is in-memory) |
+| RESP wire auth | `AUTH GODMODE_OP <password>` (or `AUTH <password>`); `PING` answers pre-auth | redis-server, cluster-daemon |
+| `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set (mismatch = exit 2) | `qihse-redis-server --require-auth` |
+| Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk | all tools |
+
+Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is
+deliberately expensive. This is normal.
+
+### 0.2 Tool index (task → command → credential)
+
+| Task | Command (from repo root) | Credential needed |
+|---|---|---|
+| Build library | `make lib` | none |
+| Full test aggregate | `make test` (~40–50 min) | none |
+| Gold validation suite | `make test-gold` | none |
+| Repo workflow check | `make check` | none |
+| Native SDK demo | `./qihse demo` | demo default or env |
+| Python REPL w/ native SDK | `./qihse python` | as demo |
+| RESP server (quick) | `make redis-server && ./qihse-redis-server --port 6399` | none (loopback, no auth) |
+| RESP server (auth) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'` | env + flag |
+| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'` | `--operator-password` (also keys the veiled bus — all nodes must match) |
+| Federation CA | `make federation-ca && QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca` | env |
+| Key generation | `./qihse_keygen` | none |
+| Python controller SDK | `make test-controller-sdk-py` (usage: §3.6) | AUTH in connect config |
+| Rust controller SDK | `cd rust/qihse-rs && cargo test --offline` | AUTH in connect config |
+| Cluster smoke drills | `python3 tests/cluster_failover_smoke.py` (env-overridable hosts, §4) | per drill |
+| All make targets | §1.2; test target list in §2.1 | — |
+
+---
+
 ## 1. Build
 
 ### 1.1 Toolchain

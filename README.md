@@ -319,9 +319,12 @@ If you are an AI agent working in this repository, orient in this order:
    decoders. Code that violates these is wrong even when it passes tests.
 2. **This README** — what QIHSE is, the docs map above, and the verified
    BUILD/TEST/RUN quickstart.
-3. **[docs/OPERATIONS.md](docs/OPERATIONS.md)** — how to actually run make
-   targets, daemons, tools, smoke drills, and what the known flakes are
-   (start here before running anything).
+3. **[docs/OPERATIONS.md §0](docs/OPERATIONS.md)** — quick index: the
+   credentials table (operator username/password rules, demo default) and a
+   task → command → credential table for every tool; machine-readable copy
+   in [docs/tools.json](docs/tools.json). Start here before running anything.
+   The full manual follows in §1–§7 (targets, daemons, smoke drills, known
+   flakes).
 4. [docs/API_REFERENCE.md](docs/API_REFERENCE.md) §Conventions before calling
    any C function; [ROADMAP.md](ROADMAP.md) and [docs/plans/](docs/plans/)
    are owned by active sessions — do not rewrite their status/checkbox
