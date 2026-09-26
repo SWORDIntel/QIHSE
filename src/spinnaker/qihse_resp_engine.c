@@ -8011,7 +8011,7 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
 
     if (qihse_resp_arg_equal(sub, "LEASE.ACQUIRE")) {
         if (request->argc < 5 || request->argc > 6) {
-            return qihse_resp_error(session, "ERR usage: FEDERATION.LEASE.ACQUIRE <namespace> <resource_id> <fencing_epoch> [expires_ms]");
+            return qihse_resp_error(session, "ERR usage: FEDERATION.LEASE.ACQUIRE <namespace> <resource_id> <fencing_epoch> [ttl_ms]");
         }
         qihse_federation_lease_t req;
         memset(&req, 0, sizeof(req));
@@ -8026,12 +8026,19 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         if (el == 0 || el >= sizeof(epoch_str)) return qihse_resp_error(session, "ERR invalid fencing epoch");
         memcpy(epoch_str, request->argv[4].data, el); epoch_str[el] = '\0';
         req.fencing_epoch = (uint64_t)strtoull(epoch_str, NULL, 10);
-        if (request->argc == 6) {
-            char exp_str[32];
-            size_t xl = request->argv[5].len;
-            if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid expiry");
-            memcpy(exp_str, request->argv[5].data, xl); exp_str[xl] = '\0';
-            req.expires_hlc_physical = (uint64_t)strtoull(exp_str, NULL, 10);
+        /* Wire contract: the argument is a TTL in ms from server now (an
+         * omitted TTL uses the default).  The absolute expiry is computed
+         * here — the core API and the stored record stay absolute. */
+        {
+            uint64_t ttl_ms = QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS;
+            if (request->argc == 6) {
+                char exp_str[32];
+                size_t xl = request->argv[5].len;
+                if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid ttl");
+                memcpy(exp_str, request->argv[5].data, xl); exp_str[xl] = '\0';
+                ttl_ms = (uint64_t)strtoull(exp_str, NULL, 10);
+            }
+            req.expires_hlc_physical = (uint64_t)time(NULL) * 1000ULL + ttl_ms;
         }
         req.owner_node = session->server->federation_node_id;
         req.issuer = session->server->federation_node_id;
@@ -8076,7 +8083,9 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
          * it the caller explicitly declines ONLY the generation dimension
          * (QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED) — server-side
          * expiry and the holder check are always enforced core-side.
-         * Usage: FEDERATION LEASE.RENEW <lease_id> <expires_ms_abs> [expected_generation] */
+         * The expiry argument is a TTL in ms from server now (stored
+         * absolute, matching LEASE.ACQUIRE's wire contract).
+         * Usage: FEDERATION LEASE.RENEW <lease_id> <ttl_ms> [expected_generation] */
         if (request->argc != 4 && request->argc != 5) return qihse_resp_wrong_arity(session, "federation.lease.renew");
         char lid_str[QIHSE_UUID_STR_LEN + 1u];
         size_t ll = request->argv[2].len;
@@ -8088,11 +8097,11 @@ static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
         size_t xl = request->argv[3].len;
         if (xl == 0 || xl >= sizeof(exp_str)) return qihse_resp_error(session, "ERR invalid expiry");
         memcpy(exp_str, request->argv[3].data, xl); exp_str[xl] = '\0';
-        uint64_t expires = (uint64_t)strtoull(exp_str, NULL, 10);
         /* Wall-clock liveness (plan §42 partition risk documented in
          * include/qihse_federation.h): the RESP layer has no HLC plumbed
          * to the session yet, so physical ms comes from time(NULL). */
         uint64_t now_ms = (uint64_t)time(NULL) * 1000ULL;
+        uint64_t expires = now_ms + (uint64_t)strtoull(exp_str, NULL, 10);
         uint64_t expected_generation = QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED;
         if (request->argc == 5) {
             char gen_str[32];

@@ -132,12 +132,15 @@ qihse_ctrl_reply_t* qihse_ctrl_object_cas(qihse_controller_t* ctrl,
  * caller already advanced to (EPOCH.NEXT); expires_ms 0 = server default.
  * Lease.Read → array [resource_id, state, fencing_epoch, generation,
  * expires_hlc_physical].  Renew/Release → +OK. */
+/* expires_ms is a TTL from the server's now (0 on acquire = server
+ * default); the server stores the absolute HLC-physical expiry, which
+ * LEASE.READ reports. */
 qihse_ctrl_reply_t* qihse_ctrl_lease_acquire(qihse_controller_t* ctrl,
                                             const char* ns, const char* resource_id,
-                                            uint64_t fencing_epoch, uint64_t expires_ms);
+                                            uint64_t fencing_epoch, uint64_t ttl_ms);
 qihse_ctrl_reply_t* qihse_ctrl_lease_read(qihse_controller_t* ctrl, const char* lease_id);
 qihse_ctrl_reply_t* qihse_ctrl_lease_renew(qihse_controller_t* ctrl,
-                                          const char* lease_id, uint64_t expires_ms);
+                                          const char* lease_id, uint64_t ttl_ms);
 qihse_ctrl_reply_t* qihse_ctrl_lease_release(qihse_controller_t* ctrl, const char* lease_id);
 
 /* Epoch.Next → :new fencing epoch.  Epoch.Current → :current. */

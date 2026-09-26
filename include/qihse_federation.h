@@ -664,6 +664,12 @@ const char* qihse_federation_lease_renew_status_name(
  * checks are NOT skippable. */
 #define QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED 0u
 
+/* Wire-layer lease TTL contract: FEDERATION LEASE.ACQUIRE / LEASE.RENEW take
+ * a TTL in milliseconds counted from the server's now; the server stores the
+ * absolute HLC-physical expiry.  An omitted TTL on acquire uses this
+ * default.  (Core APIs remain absolute-expires_hlc_physical.) */
+#define QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS 60000ULL
+
 /* Fully-checked renewal (Phase-B primary path): refuses a time-dead lease
  * (now_ms > expires_hlc_physical, 0 = never expires — evaluated against the
  * CALLER-SUPPLIED now_ms so the liveness clock is injectable/deterministic;
