@@ -36,7 +36,7 @@ static void usage(const char* program) {
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --dir PATH        persistence directory (default /var/lib/qihse or $QIHSE_DATA_DIR)\n"
             "  --require-auth    require AUTH per connection\n"
-            "  --password PASS   rotate the operator password to PASS at startup (required with --require-auth)\n"
+            "  --password PASS   operator password: bootstraps it when still default; on restart the value must match the configured one (refuses otherwise)\n"
             "  --pubsub-dir PATH durable pub/sub event-stream directory (default: in-memory pub/sub)\n"
             "  --channel-classif N   classification tag applied to pub/sub channels (default 0)\n"
             "  --channel-sci N       SCI compartment mask applied to pub/sub channels (default 0)\n"
@@ -107,8 +107,20 @@ int main(int argc, char** argv) {
         qihse_user_t* operator_user = qihse_auth_get_user(0);
         if (operator_user && qihse_auth_is_operator_password_default()) {
             if (!qihse_auth_bootstrap_operator(options.operator_password)) {
-                fprintf(stderr, "[qihse-redis-server] operator password rotation failed\n");
+                fprintf(stderr, "[qihse-redis-server] operator password bootstrap failed (min 12 chars)\n");
                 return 1;
+            }
+        } else if (operator_user) {
+            /* Already configured: never silently ignore --password. An
+             * idempotent restart must present the configured password; a
+             * stale one is a loud refusal, not a quiet serve-with-old. */
+            qihse_user_t* check = qihse_auth_authenticate_id(0, options.operator_password);
+            if (!check) {
+                fprintf(stderr,
+                        "[qihse-redis-server] --password rejected: the operator password is "
+                        "already configured and does not match. Rotate at runtime with "
+                        "operator credentials (USER.MODIFY) or start against a fresh --dir.\n");
+                return 2;
             }
         }
     }

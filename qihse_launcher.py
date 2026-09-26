@@ -129,13 +129,26 @@ def cmd_keygen(args: list[str]) -> int:
     return 1
 
 
+def _ensure_native_module() -> None:
+    """Expose the native Python module compiled into libqihse.so (PyInit_qihse)
+    as build/bin/qihse.so so `import qihse` resolves to it."""
+    native_dir = ROOT / "build" / "bin"
+    native_dir.mkdir(parents=True, exist_ok=True)
+    link = native_dir / "qihse.so"
+    if not link.exists():
+        link.symlink_to(Path("../../libqihse.so"))
+
+
 def cmd_demo(args: list[str]) -> int:
     """Run the Python SDK demo."""
     print("[qihse] Running Python SDK demo ...")
     env = {"LD_LIBRARY_PATH": str(ROOT)}
     full_env = os.environ.copy()
     full_env.update(env)
-    full_env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + full_env.get("PYTHONPATH", "")
+    _ensure_native_module()
+    if not full_env.get("QIHSE_OPERATOR_PASSWORD"):
+        full_env["QIHSE_OPERATOR_PASSWORD"] = "qihse-demo-operator"
+    full_env["PYTHONPATH"] = str(ROOT / "build" / "bin") + os.pathsep + str(ROOT / "python") + os.pathsep + full_env.get("PYTHONPATH", "")
     return subprocess.call(
         [sys.executable, str(SCRIPTS / "qihse_python_demo.py")] + args,
         cwd=str(ROOT), env=full_env,
@@ -146,7 +159,8 @@ def cmd_python(args: list[str]) -> int:
     """Start a Python REPL with qihse importable."""
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(ROOT) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-    env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
+    _ensure_native_module()
+    env["PYTHONPATH"] = str(ROOT / "build" / "bin") + os.pathsep + str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [sys.executable]
     if args:
         cmd.extend(args)

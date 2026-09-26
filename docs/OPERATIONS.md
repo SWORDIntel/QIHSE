@@ -218,11 +218,13 @@ Design/motivation: [docs/development/gold_validation_suite.md](development/gold_
 documented below (not re-run through the launcher here). Full command list
 is in `./qihse --help`.
 
-Known breakage: `./qihse demo` currently fails with
-`AttributeError: module 'qihse' has no attribute 'QihseDB'` — the demo script
-targets the native CPython extension under `sdks/python/`, while the launcher
-puts the ctypes package `python/qihse/` on `PYTHONPATH`. Use the ctypes
-example in [§3.6](#36-python-ctypes-sdk) instead.
+`./qihse demo` runs the native-SDK smoke (KV, document, columnar, time-series,
+auth, wire proxies) end to end. The launcher exposes the native CPython
+extension compiled into `libqihse.so` as `build/bin/qihse.so` (so `import
+qihse` resolves to it ahead of the ctypes package) and defaults
+`QIHSE_OPERATOR_PASSWORD` to `qihse-demo-operator` when unset, which the demo
+uses to establish the operator session. Expect several seconds of CNSA KDF
+work at startup.
 
 ### 3.2 `qihse-cluster-daemon`
 
@@ -285,13 +287,14 @@ Then `AUTH <password>` / `SET` / `GET` succeed over RESP; `PING` is answered
 before authentication (matches Redis). Non-loopback binds without auth are
 rejected by the engine itself.
 
-Operational gotcha (verified): with `--require-auth` the *effective*
-credential is the `QIHSE_OPERATOR_PASSWORD` environment variable (minimum 12
-characters, read at auth init). The `--password` flag is required by argument
-validation but its rotation branch is currently inert —
-`qihse_auth_is_operator_password_default()` returns false on a fresh store,
-so the flag neither sets nor rotates the credential. Setting only
-`--password` yields a server that refuses every `AUTH` (`WRONGPASS`).
+`--password` semantics (verified): on a store with no configured verifier
+it bootstraps the operator password from the flag (minimum 12 characters) and
+serving proceeds. When a verifier is already configured — i.e.
+`QIHSE_OPERATOR_PASSWORD` is set in the environment — the flag value must
+match it (idempotent restart); a mismatching value is refused loudly with
+exit code 2 rather than silently serving with the old credential. Runtime
+rotation of an existing credential goes through `USER.MODIFY` with operator
+credentials, per the auth invariants.
 
 ### 3.4 `qihse-federation-ca`
 
@@ -425,18 +428,13 @@ knobs) is [API reference §11](API_REFERENCE.md#11-configuration-knobs).
   `qihse_integrity.chain` to silence it. Several `make` targets
   (`test-e2e`, `test-omni`, `test-kv-read-integrity`) already remove it
   before running.
-- **`make check` / `check-upstream-workflow` fails** with
-  `missing qihse_vector_db.c` and `missing planning/qihse_upstream_workflow.md`
-  (verified 2026-09-26). The workflow checker expects an upstream-repo layout
-  this tree does not have. Do not use it as a gate until fixed.
-- **`make test-gold` is currently red on `controller-api`** —
-  `tests/test_controller_api.c:127` aborts after `qihse_ctrl_lease_renew`
-  (stale test expectation versus the lease-liveness strictening; see
-  [§2.4](#24-the-gold-validation-suite)). 59 of 60 workloads pass.
-- **`./qihse demo` is broken** (module mismatch, see [§3.1](#31-the-qihse-launcher-repository-root)).
-  The launcher's `python` hint referencing `qihse.QihseDB` is equally stale.
-- **`qihse-redis-server --password` is inert** — set
-  `QIHSE_OPERATOR_PASSWORD` instead (see [§3.3](#33-qihse-redis-server)).
+- (Resolved 2026-09-26: `make check` expected a stale upstream layout — the
+  workflow checker now verifies current paths; `./qihse demo` runs end to end
+  (native module exposed via `build/bin/qihse.so`, see [§3.1](#31-the-qihse-launcher-repository-root));
+  `qihse-redis-server --password` now bootstraps-or-verifies per [§3.3](#33-qihse-redis-server);
+  and the `controller-api` gold failure — leases born expired under the
+  Phase-B strictening — was fixed by the lease wire TTL contract, gold is
+  60/60 again.)
 - **One `make test` at a time.** Aggregate targets share root-level and
   `build/` scratch state; concurrent aggregates or concurrent runs of the
   same target can interfere (e.g. `qihse_integrity.chain` removal races).

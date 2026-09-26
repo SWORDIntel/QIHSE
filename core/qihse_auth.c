@@ -494,7 +494,12 @@ bool qihse_auth_is_operator_password_default(void) {
     pthread_rwlock_rdlock(&auth_rwlock);
     bool is_default = true;
     if (users[0] && authz_states[0].active) {
-        is_default = !authz_states[0].password_set;
+        /* Aligned with bootstrap's own gate: "default" means no password
+         * verifier is configured.  password_set is true from init even in
+         * operator-only mode, so it can never carry this signal — the old
+         * check made this function permanently false and every
+         * still-on-default guard unreachable. */
+        is_default = !authz_states[0].verifier_configured;
     }
     pthread_rwlock_unlock(&auth_rwlock);
     return is_default;

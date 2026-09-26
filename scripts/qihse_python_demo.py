@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import qihse
@@ -10,7 +11,8 @@ def run_demo():
     # 1. Initialize the Database Environment
     print("[*] Initializing QIHSE Database Instance...")
     db = qihse.QihseDB()
-    print("    -> Database initialized successfully.")
+    db.authenticate("GODMODE_OP", os.environ.get("QIHSE_OPERATOR_PASSWORD", "qihse-demo-operator"))
+    print("    -> Database initialized and operator session established.")
     
     # 2. Key-Value Store Testing
     print("\n[*] Testing Key-Value Store...")
@@ -40,8 +42,8 @@ def run_demo():
     
     # 6. Auth Testing
     print("\n[*] Testing Auth Subsystem (CNSA 2.0)...")
-    # Creator 0 (God-Mode), Target 42, Role 1, Clearance 5, SCI 1
-    db.auth_create_user(0, 42, 1, 5, 1)
+    # Creator = the session user (God-Mode); Target 42, Role 1, Clearance 5, SCI 1
+    db.auth_create_user(42, 1, 5, 1)
     
     # Check access for user 42 against required Clearance 3, SCI 1
     can_access = db.auth_can_access(42, 3, 1)

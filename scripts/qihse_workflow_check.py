@@ -28,9 +28,9 @@ def require_qihse_root(root: Path) -> list[str]:
     errors: list[str] = []
     required = [
         "Makefile",
-        "qihse_vector_db.c",
+        "src/broad_oak/qihse_vector_db.c",
         "benchmarks/reference_workloads.json",
-        "planning/qihse_upstream_workflow.md",
+        "docs/plans/qihse_general_db_engine_roadmap.md",
     ]
     for relative in required:
         if not (root / relative).exists():

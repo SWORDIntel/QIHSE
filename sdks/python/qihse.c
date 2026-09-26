@@ -22,6 +22,12 @@ typedef struct {
 static int QihseDB_init(QihseDBObject *self, PyObject *args, PyObject *kwds) {
     (void)args;
     (void)kwds;
+    /* The auth subsystem must be initialized for authenticate()/auth_* to
+     * function at all — without it users[] is empty and every login fails. */
+    if (!qihse_auth_init()) {
+        PyErr_SetString(PyExc_RuntimeError, "auth subsystem init failed (FIPS check)");
+        return -1;
+    }
     self->ctx = (qihse_uwp_context_t*)malloc(sizeof(qihse_uwp_context_t));
     memset(self->ctx, 0, sizeof(qihse_uwp_context_t));
     
