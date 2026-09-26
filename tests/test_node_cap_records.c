@@ -856,10 +856,18 @@ int main(void) {
     qihse_kv_store_destroy(g_store);
 
     /* Self-clean the scratch directory: .gitignore lists per-test prefixes
-     * and this test's prefix is not among them. */
+     * and this test's prefix is not among them. A daemon's last async probe
+     * write can race rm's traversal ("Directory not empty"), so retry a few
+     * times before failing. */
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", data_root);
-    assert(system(cmd) == 0);
+    int rc = -1;
+    for (int i = 0; i < 5 && rc != 0; i++) {
+        snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", data_root);
+        rc = system(cmd);
+        if (rc != 0)
+            usleep(200 * 1000);
+    }
+    assert(rc == 0);
 
     printf("node capability record tests passed\n");
     return 0;
