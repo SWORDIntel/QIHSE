@@ -81,6 +81,49 @@ proves nothing new is not feature progress, and a feature nobody has verified is
 not finished. This project has already been bitten by that confusion — six
 documents claimed test coverage whose test files did not exist.
 
+### 2026-09-26 improvement pass — ordered queue
+
+Safety, proof, velocity — in that order. Items 1–2 close the remaining safety
+and verification gaps in the federation core; 3 changes every future
+session's loop; 4–5 finish what Phase-B and QKP1 started. Each lands under
+the §5 gates (source + wiring + test in the same commit; plan §44
+distributed requirements apply to the consensus work).
+
+- [ ] **1. Joint consensus — membership-change safety.** Two-phase
+  C_old → C_old,new membership transitions in the scoped consensus module:
+  no membership change commits without a joint-majority quorum; single-phase
+  changes refused under any partition; crash-restart mid-transition resumes
+  the recorded joint state. Tests: joint-transition commit, minority
+  partition refused in both phases, restart-mid-joint resumption. (Function)
+- [ ] **2. Deterministic cluster simulation harness.** Seeded,
+  fault-injected histories over `qihse_federation_sim`: partition,
+  clock-skew and crash-restart schedules replay bit-identically; asserts
+  local-write survivability (§6 invariants 4/5), no quorum gate on ordinary
+  writes, fail-closed without bricking (7), idempotent attributable
+  mutations (8), never infer safety from silence (9). Wired as
+  `make test-fed-sim`. (Verification)
+- [ ] **3. Test isolation → parallel aggregate.** Per-target scratch
+  namespaces (`build/tests/<target>/`), TMPDIR default, unique port
+  allocation; `make test` becomes `-j`-safe; aggregate wall-time 40–50 min
+  → target ≤15 min. (Velocity)
+- [ ] **4. Auth persistence decision.** Either a design note blessing
+  ephemeral credentials (external secret store is a §7 non-goal; restart =
+  re-credential) or a persisted verifier store under the existing
+  invariants; OPERATIONS §0 updated to match. (Function/Design)
+- [ ] **5. QKP1 rollout completion.** Hybrid bus upgrade (HMAC-SHA-384 →
+  ML-DSA-signed bus frames), key-rotation command in
+  `qihse-federation-ca`, handshake/AEAD metrics (handshake counts, failure
+  reasons, KDF latency). New wire surface keeps the invariant-3 negative
+  test. (Function)
+- [ ] **6. Bolt result visibility + parallel-query de-stub.** RUN retains
+  results, PULL streams them (removes the last documented COMPATIBILITY
+  caveat); parallel query executes or is labelled a non-goal. (Function)
+- [ ] **7. Federation remainder: incremental export; DHT overlay phase 2.**
+  (Function)
+- [ ] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
+  recall; close the gold suite's three partial-coverage areas; decide
+  `make docs`. (Function/Verification)
+
 ### A. Function — behaviour added or fixed
 
 These change what QIHSE does. Ordered by risk, worst first.
