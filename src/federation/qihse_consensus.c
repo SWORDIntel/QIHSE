@@ -2253,7 +2253,21 @@ void qihse_consensus_receive(qihse_consensus_t* cs,
 
     /* Fencing first (plan §7.3, acceptance criterion 4): traffic below the
      * highest epoch durably observed is dropped before any term or log
-     * logic can act on it. */
+     * logic can act on it.
+     *
+     * KNOWN OPEN FINDING (deterministic-sim scenario `never-infer-safety`,
+     * 2026-09-26): a node whose epoch runs ahead while its peers were
+     * silent (campaigning through a partition) fence-silences them after
+     * the partition heals — their messages drop here before any term sync
+     * can run, and no channel carries the higher epoch back.  The obvious
+     * fix (an epoch-teaching rejection reply) was prototyped and REVERTED:
+     * any form that carries a term forces healthy leaders through
+     * step-down cycles, and the epoch-only form still destabilises the
+     * mid-single-transition revert path (test_membership_leader_change_
+     * midflight).  A correct fix needs a dedicated epoch-sync message that
+     * never interacts with election/step-down state — see ROADMAP §2
+     * improvement-pass findings.  Until then the fence is real: the
+     * healed node recovers only when a peer's epoch catches up. */
     if (msg->fencing_epoch < cs->epoch) {
         cs->counters.stale_epoch_rejections++;
         return;
