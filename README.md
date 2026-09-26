@@ -98,36 +98,64 @@ For implementation detail, start with the **[architecture documentation](docs/ar
 
 ---
 
-## Try it
+## Quickstart (BUILD / TEST / RUN)
 
-QIHSE targets Linux and has a unified launcher for the common development workflows.
+QIHSE targets Linux and has a unified launcher for the common development
+workflows. The commands below were verified on this branch; the full
+operational detail (flags, ports, env vars, known flakes) lives in
+**[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
 
-```bash
-git clone https://github.com/SWORDIntel/QIHSE.git
-cd QIHSE
-./qihse dev-setup
-./qihse build
-./qihse test
-./qihse status
-```
-
-Useful launcher commands:
+**BUILD**
 
 ```bash
-./qihse isa-info       # show detected CPU execution paths
-./qihse db --help      # database CLI
-./qihse server         # build/run the test server
-./qihse python         # Python with QIHSE importable
-./qihse demo           # bundled SDK demo
-./qihse bench          # benchmark workflow
+./qihse dev-setup   # toolchain check (gcc, make, python3)
+./qihse build       # liboqs + oqs-provider + libqihse.so + tools
+./qihse status      # confirm the library built and loads
+./qihse isa-info    # show detected CPU execution paths
 ```
 
-The Makefile remains available directly:
+**TEST**
 
 ```bash
-make clean && make
-make test
+make test           # full sequential aggregate, ends with the gold suite
+make test-gold      # the versioned workload pack alone (GOLD_STRICT=1 = strict)
 ```
+
+`make test` takes roughly 40–50 minutes. Run one aggregate at a time — several
+targets share scratch state at the repository root. Fast individually
+verified targets include `make test-sql-dml-exec`, `make test-bolt`,
+`make test-controller-sdk-py`, and `make test-pqc-handshake`. Current known
+red: the gold suite fails one workload (`controller-api`, a stale
+lease-renew expectation — see
+[OPERATIONS.md §2.4](docs/OPERATIONS.md#24-the-gold-validation-suite)), which
+also ends `make test` non-zero.
+
+**RUN** — a single cluster node on loopback (RESP + cluster bus):
+
+```bash
+make cluster-daemon
+./qihse-cluster-daemon \
+    --index 0 --bind 127.0.0.1 --port 7100 --bus-port 17100 \
+    --node 0:127.0.0.1:7100:17100 --slot-range 0-16383 \
+    --operator-password 'change-me-12+chars' --dir ./build/node0
+# then, in another shell: AUTH / SET / GET / FTS.BUILD / FTS.SEARCH over RESP
+```
+
+A standalone RESP server is `make redis-server` (`qihse-redis-server`,
+`--help` for flags — with `--require-auth` the credential comes from
+`QIHSE_OPERATOR_PASSWORD`). Other verified entry points:
+
+```bash
+./qihse db --help      # vector-DB CLI (create/insert/build-graph/search/stats)
+./qihse keygen [dir]   # ML-KEM-1024 + ML-DSA-87 key pairs
+```
+
+`./qihse bench` wraps the reference-benchmark workflow (not verified here —
+it clones external paper corpora; see
+[benchmarks documentation](docs/benchmarks/benchmarks.md)).
+
+Known launcher breakage: `./qihse demo` currently fails (module mismatch);
+see [OPERATIONS.md §6](docs/OPERATIONS.md#6-known-issues-and-workarounds).
 
 See **[Getting Started](docs/GETTING_STARTED.md)** for build dependencies, SDK usage, benchmark entry points, and links into the subsystem documentation.
 
@@ -141,15 +169,20 @@ The Python bindings expose the native engine without requiring a separate databa
 import numpy as np
 import qihse
 
-with qihse.VectorDB.create("/tmp/example-qihse", dims=128) as db:
+with qihse.VectorDB.create("./build/example-qihse", dims=128) as db:
     vectors = np.random.rand(100, 128).astype(np.float32)
     db.add_vectors(vectors, ids=list(range(100)))
+    db.build_graph()   # required for the default GRAPH (HNSW) query mode
 
     results = db.search(vectors[0], k=10)
     print(results)
 ```
 
-Python compatibility clients for other database interfaces are under [`sdks/python/`](sdks/python/), and C compatibility clients are under [`sdks/c/`](sdks/c/). [`sdks/rust/`](sdks/rust/) currently contains only `Cargo.toml` and `Cargo.lock` — the Rust SDK is not implemented yet.
+Run it with `PYTHONPATH=python LD_LIBRARY_PATH=. python3 example.py`; without
+`build_graph()`, pass `mode=qihse.QueryMode.FLOAT32` to search exactly without
+a graph index.
+
+Python compatibility clients for other database interfaces are under [`sdks/python/`](sdks/python/), and C compatibility clients are under [`sdks/c/`](sdks/c/). The older Rust compatibility SDK lives under [`sdks/rust/`](sdks/rust/) (untested surface); the tested Rust SDK is the federation controller client at [`rust/qihse-rs/`](rust/qihse-rs/) — `cargo test` there runs its suite against a mock controller.
 
 ---
 
@@ -240,9 +273,12 @@ For a task-oriented index, use the **[documentation hub](docs/README.md)**.
 
 ## Documentation
 
+Docs map — every document an operator, developer, or agent needs:
+
 | If you want to… | Start here |
 |---|---|
-| Build and run QIHSE | [Getting Started](docs/GETTING_STARTED.md) |
+| Build, test, and run every tool (verified commands, flags, ports, env vars, known flakes) | [Operations Manual](docs/OPERATIONS.md) |
+| Build and run QIHSE for the first time | [Getting Started](docs/GETTING_STARTED.md) |
 | Call the C API, Python SDK, or set configuration | [API Reference](docs/API_REFERENCE.md) |
 | Understand the database engines | [Features](docs/FEATURES.md) |
 | Integrate an existing DB client | [Compatibility](docs/COMPATIBILITY.md) |
@@ -253,11 +289,48 @@ For a task-oriented index, use the **[documentation hub](docs/README.md)**.
 | Understand replication/backup | [Replication & Backup](docs/architecture/replication_backup.md) |
 | Review protocol hardening | [Security](docs/security/) |
 | Reproduce performance tests | [Benchmarks](docs/benchmarks/) |
+| Deploy QIHSE | [Deployment](docs/deployment/) (partially stale; it says so itself) |
+| Work on the codebase / gold suite design | [Development](docs/development/) |
+| Run XDP networking in production | [AF_XDP Operational Guide](docs/manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md) |
 | Read the deepest technical treatment | [Technical Whitepaper v1.1](docs/architecture/qihse_whitepaper_v1.1.md) |
 | See what is being built and in what order | [Roadmap](ROADMAP.md) |
 | Read the federation design of record (landed; residual boundaries documented) | [Federation Upgrade Plan](docs/plans/qihse_federation_upgrade_plan.md) |
 
 The full documentation index is **[`docs/README.md`](docs/README.md)**.
+
+**Session-note files** (historical working notes, kept intact at the repository
+root — summarized here so you do not have to read them):
+
+| File | What it is, in one line |
+|---|---|
+| [FIXES.md](FIXES.md) | 2026-era fix log for the native Python ctypes test failures (stale WAL replay, QDD false positives, reopen bugs) — historical. |
+| [LOCAL_FIX_NOTES.md](LOCAL_FIX_NOTES.md) | Handoff note from the `security/keystone-regression-hardening-20260908` branch: CI state and the then-failing Python SDK job. |
+| [ZCODE_SESSION_RECOVERY.md](ZCODE_SESSION_RECOVERY.md) | Reconstructed agent-session context (2026-09-17) after the session database was lost — forensic artifact, not project docs. |
+| [SESSION_DELIVERY_UPGRADES.md](SESSION_DELIVERY_UPGRADES.md) | Design/landing notes for the session-delivery upgrades U1–U9 (2026-09-11); as-built detail lives in `docs/architecture/session_delivery.md`. |
+
+## Agent quickstart
+
+If you are an AI agent working in this repository, orient in this order:
+
+1. **[AGENTS.md](AGENTS.md)** — non-negotiable invariants: no classified read
+   without a security context; no principal creates or modifies a principal
+   above itself; every new protocol adapter ships a low-clearance/high-data
+   negative test in CI; relative paths only; bounded stack frames in record
+   decoders. Code that violates these is wrong even when it passes tests.
+2. **This README** — what QIHSE is, the docs map above, and the verified
+   BUILD/TEST/RUN quickstart.
+3. **[docs/OPERATIONS.md](docs/OPERATIONS.md)** — how to actually run make
+   targets, daemons, tools, smoke drills, and what the known flakes are
+   (start here before running anything).
+4. [docs/API_REFERENCE.md](docs/API_REFERENCE.md) §Conventions before calling
+   any C function; [ROADMAP.md](ROADMAP.md) and [docs/plans/](docs/plans/)
+   are owned by active sessions — do not rewrite their status/checkbox
+   semantics.
+
+Practical rules learned the hard way: never run two `make test` aggregates
+concurrently; delete stale `build/<prefix>_*` scratch dirs when a teardown
+assert trips; `make -f Makefile` bypasses the `GNUmakefile` TLS overlay and
+is not the tested configuration.
 
 ---
 

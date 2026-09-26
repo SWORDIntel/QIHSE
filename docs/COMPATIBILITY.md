@@ -6,8 +6,11 @@
 > `tests/test_pg_wire_cluster.c`, `tests/test_resp_security_regression.c`), and
 > SQLite VFS has `tests/test_sqlite_vfs.c`. MongoDB has `tests/test_mongo_wire.c`
 > and `tests/test_mongo_wire_security.c`. Bolt has `tests/test_bolt.c`, which
-> covers the codec, framing, handshake and message loop — it does **not** verify
-> driver compatibility, and the adapter still discards `RUN` results and has no
+> covers the codec, framing, handshake, message loop, Bolt 4.x spec compliance
+> (message signatures and PackStream tiny containers) and negative
+> authentication — the earlier wire defects there were fixed and re-verified
+> (2026-09-26, `make test-bolt`). The adapter still does **not** return `RUN`
+> query results to a driver: `PULL` answers with a single empty record and no
 > result cursor (see
 > [architecture/bolt_protocol.md](architecture/bolt_protocol.md)). The
 > ClickHouse, Elasticsearch and InfluxDB surfaces have no dedicated test beyond
@@ -117,9 +120,10 @@ Implementation: `src/spinnaker/qihse_mongo_wire.c`.
 ## Neo4j / Bolt / Cypher
 
 **Status: partial.** The Bolt 4.x protocol path (PackStream serialization,
-handshake, framing, message loop) is implemented and covered by
-`tests/test_bolt.c`, and Cypher executes through the graph engine
-(`tests/test_graph.c`). The adapter is **not** driver-compatible: `RUN`
+handshake, framing, message loop, spec-compliant message signatures) is
+implemented and covered by `tests/test_bolt.c`, and Cypher executes through the
+graph engine (`tests/test_graph.c`); refused or unauthenticated `RUN`s are
+reported as FAILURE frames. The adapter is **not** driver-compatible: `RUN`
 dispatches the Cypher and then discards the result, and `PULL` returns a single
 empty record with no result cursor, so a stock neo4j driver will not see query
 results. See [Bolt protocol](architecture/bolt_protocol.md) for the exact

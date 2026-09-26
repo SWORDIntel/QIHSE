@@ -7,11 +7,15 @@
 > `tests/test_sql_completeness.c`, `tests/test_sql_dml_exec.c`,
 > `tests/test_txn.c`, `tests/test_mvcc_delete.c` and `tests/test_indexes.c` —
 > an earlier revision of this document said those test files did not exist, and
-> that is no longer true. Read the per-area status lines in
+> that is no longer true. Two further stale claims are also fixed: SQL INSERT
+> now populates the mutable row store that UPDATE/DELETE execute against
+> (verified by `make test-sql-dml-exec`'s `test_insert_populates_row_store` on
+> 2026-09-26), and the Bolt adapter's wire compatibility was repaired
+> (Bolt 4.x message signatures, PackStream tiny containers, and FAILURE frames
+> for refused RUNs — `make test-bolt`) although it still does not return RUN
+> query results to a driver. Read the per-area status lines in
 > `tests/gold/pack.v1.gold` and in [architecture/](architecture/) for the
-> specific gaps that remain (SQL INSERT does not yet populate the mutable row
-> store that UPDATE/DELETE execute against, and the Bolt adapter does not
-> return query results to a driver).
+> specific gaps that remain.
 
 This document is the detailed feature map for QIHSE. The [root README](../README.md) intentionally stays higher level.
 

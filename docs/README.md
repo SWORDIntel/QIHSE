@@ -12,6 +12,7 @@ If you are new to the project, start with the [root README](../README.md), then 
 | I want to… | Read… |
 |---|---|
 | Build and run QIHSE | [Getting Started](GETTING_STARTED.md) |
+| Build, test, and operate every tool (make targets, daemons, CLIs, smoke drills, known flakes) | [Operations Manual](OPERATIONS.md) |
 | Call the C API, Python SDK, or set configuration | [API Reference](API_REFERENCE.md) |
 | See the major subsystems | [Features](FEATURES.md) |
 | Use an existing database client/protocol | [Compatibility](COMPATIBILITY.md) |
@@ -135,8 +136,14 @@ Language bindings are kept with the code rather than duplicated in this document
 - [Rust SDKs](../sdks/rust/)
 - [C SDKs](../sdks/c/)
 
+The tested controller SDKs live with the federation code instead: the Python
+SDK at [`python/qihse/controller.py`](../python/qihse/controller.py) and the
+Rust SDK at [`rust/qihse-rs/`](../rust/qihse-rs/) (see the
+[API reference §9](API_REFERENCE.md#9-python-sdk--pythonqihse)).
+
 ## Deployment and operations
 
+- [Operations manual](OPERATIONS.md) — the verified how-to for make targets, daemons, CLIs, test suites, and smoke drills
 - [Deployment documentation](deployment/)
 - [AF_XDP operational guide](manual/deployment/AF_XDP_OPERATIONAL_GUIDE.md)
 - [Replication and backup](architecture/replication_backup.md)

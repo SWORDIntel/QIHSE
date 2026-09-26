@@ -2,8 +2,12 @@
 
 > **Status: implemented** — the launcher commands described here exist in
 > `qihse` / `qihse_launcher.py` (`dev-setup`, `build`, `test`, `status`,
-> `isa-info`, `db`, `server`, `python`, `demo`, `bench`), and the Makefile
-> targets they wrap are present.
+> `isa-info`, `db`, `server`, `python`, `bench`) and were verified on this
+> branch (2026-09-26), and the Makefile targets they wrap are present.
+> Exception: `./qihse demo` currently fails (module mismatch — see
+> [OPERATIONS.md §6](OPERATIONS.md#6-known-issues-and-workarounds)); use the
+> Python example below instead. For every target, daemon, flag, and env var,
+> read [OPERATIONS.md](OPERATIONS.md).
 
 This guide covers the shortest path from a fresh checkout to a working local QIHSE build.
 
@@ -96,24 +100,27 @@ The launcher can start a Python environment with QIHSE importable:
 ./qihse python
 ```
 
-It can also run the bundled SDK demo:
+(The `QihseDB()` hint it prints is stale — that class belongs to the native
+extension under `sdks/python/`; the ctypes package exports `VectorDB`,
+`KVStore`, `TimeSeriesDB`, and friends.)
 
-```bash
-./qihse demo
-```
-
-A minimal vector example looks like this:
+A minimal vector example looks like this (verified):
 
 ```python
 import numpy as np
 import qihse
 
-with qihse.VectorDB.create("/tmp/example-qihse", dims=128) as db:
+with qihse.VectorDB.create("./build/example-qihse", dims=128) as db:
     vectors = np.random.rand(100, 128).astype(np.float32)
     db.add_vectors(vectors, ids=list(range(100)))
+    db.build_graph()   # required for the default GRAPH (HNSW) query mode
     results = db.search(vectors[0], k=10)
     print(results)
 ```
+
+Run it with `PYTHONPATH=python LD_LIBRARY_PATH=. python3 example.py`. Without
+`build_graph()`, search the exact path instead:
+`db.search(vectors[0], k=10, mode=qihse.QueryMode.FLOAT32)`.
 
 QIHSE also exposes KV, document, time-series, full-text, graph, task-queue, and protocol-compatibility interfaces. See [Features](FEATURES.md) and [Compatibility](COMPATIBILITY.md).
 
@@ -137,6 +144,7 @@ Do not treat benchmark numbers as portable constants. CPU generation, ISA select
 
 | Goal | Documentation |
 |---|---|
+| Operate: run any make target, daemon, tool, or smoke drill | [Operations Manual](OPERATIONS.md) |
 | Understand the major subsystems | [Features](FEATURES.md) |
 | See supported external protocols and compatibility layers | [Compatibility](COMPATIBILITY.md) |
 | Understand architecture | [Architecture docs](architecture/) |
@@ -147,4 +155,4 @@ Do not treat benchmark numbers as portable constants. CPU generation, ISA select
 | Review operational protocols | [Operational protocols](architecture/operational_protocols.md) |
 | Review security posture | [Security](security/README.md) |
 | Review performance methodology | [Benchmarks](benchmarks/) |
-| Read the deep technical treatment | [Technical whitepaper](architecture/qihse_whitepaper_v1.0.md) |
+| Read the deep technical treatment | [Technical whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md) |
