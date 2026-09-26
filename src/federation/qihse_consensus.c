@@ -5,8 +5,8 @@
  * replication group.  Read include/qihse_consensus.h first: it states the
  * honest scope of this module — the election, log-matching, majority-commit,
  * current-term-commit, step-down, fencing, log-compaction/snapshot-install,
- * single-server-membership-change, and restart mechanics that ARE
- * implemented, and the joint-consensus, pre-vote, read-lease, and
+ * single-server-membership-change, joint-consensus, and restart mechanics
+ * that ARE implemented, and the pre-vote, read-lease, and
  * transport-authentication mechanics that are NOT.
  *
  * Persistence is an append-only record file: one line per record, each
@@ -283,15 +283,33 @@ static uint64_t qcs_last_gen(const qihse_consensus_t* cs) {
 
 /* ── Membership fold ───────────────────────────────────────────────────────
  *
- * The effective member set is a PURE FUNCTION OF THE LOG: the static base
- * configuration captured at open, folded over every config entry (snapshot
- * prefix included) in index order.  A config entry takes effect when it is
+ * The effective member set is a PURE FUNCTION OF THE LOG (and, for the
+ * joint phase, of the commit index): the static base configuration
+ * captured at open, folded over every config entry (snapshot prefix
+ * included) in index order.  A config entry takes effect when it is
  * appended — never when its commit is learned — which is what keeps a
  * node's quorum basis equal to its log (the election-safety argument in
- * the header). */
+ * the header).  The one deliberate exception is the END of a joint
+ * transition: the UNION stays the voter set until END is COMMITTED (see
+ * the header's JOINT CONSENSUS safety arithmetic for why append-semantics
+ * there would be unsafe).
+ *
+ * Joint fold state, all derived — there is no separate durable joint
+ * record:
+ *   - C_old: the folded member set at the instant the latest
+ *     CONFIG_JOINT_BEGIN applied;
+ *   - begin/end: the indices of that BEGIN and of the first END after it;
+ *   - active: BEGIN exists AND (END not appended OR commit < END).
+ */
 
 static bool qcs_config_entry_valid(const qihse_consensus_entry_t* e) {
     if (e->type == QIHSE_CONSENSUS_ENTRY_DATA) return true;
+    if (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN ||
+        e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END) {
+        /* Phase markers carry NO payload; the fold is the source of
+         * truth, and nothing larger than one UUID ever appears. */
+        return e->payload_len == 0u && e->classif == 0u && e->sci == 0u;
+    }
     if (e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
         e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE) return false;
     if (e->payload_len != QIHSE_UUID_BYTES) return false;
@@ -320,34 +338,111 @@ static void qcs_fold_apply(qihse_uuid_t* members, size_t* count,
     }
 }
 
+/* Fold result: the current config plus the derived joint-phase state. */
+typedef struct {
+    qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* the fold */
+    size_t count;
+    qihse_uuid_t old_members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* C_old */
+    size_t old_count;
+    qihse_uuid_t union_members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* voters */
+    size_t union_count;             /* valid only while active */
+    uint64_t begin_index;           /* latest JOINT_BEGIN, 0 = none */
+    uint64_t end_index;             /* first END after it, 0 = none */
+    bool active;                    /* joint phase in force at `commit` */
+} qcs_fold_t;
+
+/* Fold ONE entry into the running fold state (members/old/joint indices).
+ * Fails (returns false) on any structurally illegal config entry — nested
+ * BEGIN, END without BEGIN, BEGIN on an empty fold — which is how hostile
+ * records and hostile leaders are refused before anything is durable. */
+static bool qcs_fold_step(qcs_fold_t* f,
+                          const qihse_consensus_entry_t* e,
+                          uint64_t index, bool* overflow) {
+    if (!qcs_config_entry_valid(e)) return false;
+    switch (e->type) {
+        case QIHSE_CONSENSUS_ENTRY_DATA:
+            return true;
+        case QIHSE_CONSENSUS_ENTRY_CONFIG_ADD:
+        case QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE:
+            qcs_fold_apply(f->members, &f->count, e, overflow);
+            return !*overflow;
+        case QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN: {
+            if (f->begin_index != 0u && f->end_index == 0u) {
+                return false; /* nested BEGIN: one joint at a time */
+            }
+            if (f->count < 1u) return false; /* C_old may never be empty */
+            memcpy(f->old_members, f->members, f->count * sizeof(*f->members));
+            f->old_count = f->count;
+            f->begin_index = index;
+            f->end_index = 0u;
+            return true;
+        }
+        case QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END:
+            if (f->begin_index == 0u || f->end_index != 0u) {
+                return false; /* END without an open joint */
+            }
+            f->end_index = index;
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* Fold the base config over every config entry in the log (snapshot
  * included), optionally with `extra` participating as the next appended
  * entry — used to validate a candidate config entry BEFORE it is
  * persisted.  Fails (returns false) when the result would be invalid:
- * empty, over MAX_MEMBERS, structurally malformed config entries, or a
- * log/snapshot hole.  Callers treat false as hostile input. */
-static bool qcs_fold_membership(const qihse_consensus_t* cs,
-                                const qihse_consensus_entry_t* extra,
-                                qihse_uuid_t* out_members,
-                                size_t* out_count) {
-    size_t count = cs->base_count;
-    memcpy(out_members, cs->base_members, count * sizeof(*out_members));
+ * empty, over MAX_MEMBERS, a joint voter set over MAX_MEMBERS, or a
+ * structurally malformed config sequence.  Callers treat false as hostile
+ * input. */
+static bool qcs_fold_full(const qihse_consensus_t* cs, uint64_t commit,
+                          const qihse_consensus_entry_t* extra,
+                          qcs_fold_t* out) {
+    memset(out, 0, sizeof(*out));
+    out->count = cs->base_count;
+    memcpy(out->members, cs->base_members, out->count * sizeof(*out->members));
     bool overflow = false;
     uint64_t last = qcs_abs_last_index(cs);
     for (uint64_t i = 1; i <= last; i++) {
         const qihse_consensus_entry_t* e = qcs_entry_at(cs, i);
-        if (!e || !qcs_config_entry_valid(e)) return false;
-        if (e->type == QIHSE_CONSENSUS_ENTRY_DATA) continue;
-        qcs_fold_apply(out_members, &count, e, &overflow);
-        if (overflow) return false;
+        if (!e) return false;
+        if (!qcs_fold_step(out, e, i, &overflow)) return false;
     }
     if (extra) {
-        if (!qcs_config_entry_valid(extra)) return false;
-        qcs_fold_apply(out_members, &count, extra, &overflow);
-        if (overflow) return false;
+        if (!qcs_fold_step(out, extra, last + 1u, &overflow)) return false;
     }
-    if (count < 1u) return false; /* a group may never fold to empty */
-    *out_count = count;
+    if (out->count < 1u) return false; /* a group may never fold to empty */
+    if (out->end_index != 0u && commit >= out->end_index) {
+        /* END committed: the joint is resolved; this fold describes the
+         * plain post-joint config.  (A committed END with a LATER BEGIN
+         * still opens the next joint, handled by begin/end bookkeeping.) */
+        out->active = false;
+    } else {
+        out->active = (out->begin_index != 0u);
+    }
+    /* The joint voter set is C_old ∪ C_current; populate union_members
+     * (never members — that is the effective config, not the voter set). */
+    memcpy(out->union_members, out->members,
+           out->count * sizeof(*out->union_members));
+    out->union_count = out->count;
+    if (out->active) {
+        for (size_t i = 0; i < out->old_count; i++) {
+            bool in = false;
+            for (size_t j = 0; j < out->union_count; j++) {
+                if (qihse_uuid_equal(&out->union_members[j],
+                                     &out->old_members[i])) {
+                    in = true;
+                    break;
+                }
+            }
+            if (!in) {
+                if (out->union_count >= QIHSE_CONSENSUS_MAX_MEMBERS) {
+                    return false;
+                }
+                out->union_members[out->union_count++] = out->old_members[i];
+            }
+        }
+    }
     return true;
 }
 
@@ -424,6 +519,24 @@ static bool qcs_persist_config_entry(qihse_consensus_t* cs,
     char op = (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD) ? 'A' : 'R';
     int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "LC %c %s %llu %llu %llu",
                      op, hex,
+                     (unsigned long long)e->index,
+                     (unsigned long long)e->term,
+                     (unsigned long long)e->journal_generation);
+    if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP) return false;
+    return qcs_record_append(cs, (size_t)n);
+}
+
+/* Phase markers (JOINT BEGIN/END) carry no member payload: the record is
+ * the marker letter plus the entry triple.  Same durability contract as
+ * LC — fsynced before any in-memory effect. */
+static bool qcs_persist_joint_marker(qihse_consensus_t* cs,
+                                     const qihse_consensus_entry_t* e) {
+    if (e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN &&
+        e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END) return false;
+    if (e->payload_len != 0u) return false;
+    char mk = (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN) ? 'B' : 'E';
+    int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "LJ %c %llu %llu %llu",
+                     mk,
                      (unsigned long long)e->index,
                      (unsigned long long)e->term,
                      (unsigned long long)e->journal_generation);
@@ -682,6 +795,53 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             next_index++;
             last_entry_term = e.term;
             last_gen = e.journal_generation;
+        } else if (strcmp(tok, "LJ") == 0) {
+            /* Joint phase marker: B|E plus the entry triple, no payload.
+             * Same in/out-of-snapshot discipline as LC. */
+            char* s_op = strtok_r(NULL, " ", &save);
+            char* s_idx = strtok_r(NULL, " ", &save);
+            char* s_term = strtok_r(NULL, " ", &save);
+            char* s_gen = strtok_r(NULL, " ", &save);
+            if (!s_op || !s_idx || !s_term || !s_gen) goto done;
+            if (strtok_r(NULL, " ", &save)) goto done;
+            if (strlen(s_op) != 1u || (s_op[0] != 'B' && s_op[0] != 'E')) goto done;
+
+            qihse_consensus_entry_t e;
+            memset(&e, 0, sizeof(e));
+            e.type = (s_op[0] == 'B') ? QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN
+                                      : QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END;
+            if (!qcs_parse_u64(s_idx, &e.index) ||
+                !qcs_parse_u64(s_term, &e.term) ||
+                !qcs_parse_u64(s_gen, &e.journal_generation)) goto done;
+
+            if (pend_active) {
+                /* Marker of a snapshot block: same discipline as SE/LC. */
+                if (pend_have >= pend_count) goto done;
+                if (e.index != pend_have + 1u) goto done;  /* contiguous */
+                if (e.term > cur_term) goto done;
+                if (e.term < pend_term_prev) goto done;
+                if (pend_have > 0u && e.journal_generation <= pend_gen_prev) {
+                    goto done;
+                }
+                if (e.index < next_index) {
+                    const qihse_consensus_entry_t* ex = qcs_entry_at(cs, e.index);
+                    if (!ex || !qcs_entry_identical(ex, &e)) goto done;
+                }
+                pend_run = qcs_digest_entry(pend_run, &e);
+                pend[pend_have++] = e;
+                pend_term_prev = e.term;
+                pend_gen_prev = e.journal_generation;
+            } else {
+                if (e.index != next_index) goto done;      /* gap or replay */
+                if (e.term > cur_term) goto done;          /* future */
+                if (e.term < last_entry_term) goto done;   /* regression */
+                if (qcs_abs_last_index(cs) >= 1u &&
+                    e.journal_generation <= last_gen) goto done;
+                if (!qcs_log_push(cs, &e)) goto done;
+                next_index++;
+                last_entry_term = e.term;
+                last_gen = e.journal_generation;
+            }
         } else if (strcmp(tok, "LC") == 0) {
             /* Config entry: A/R, the changed member UUID (hex, exactly
              * 2*UUID_BYTES chars — declared == encoded == fixed), then the
@@ -1003,6 +1163,7 @@ static int qcs_member_index(const qihse_consensus_t* cs, const qihse_uuid_t* id)
  * removed leader would wrongly count its own ack in the new config) and it
  * may never campaign — it keeps serving reads and its fencing floor. */
 static uint64_t qcs_last_config_index(const qihse_consensus_t* cs);
+static void qcs_joint_ensure_closed(qihse_consensus_t* cs);
 
 static void qcs_set_membership(qihse_consensus_t* cs,
                                const qihse_uuid_t* members, size_t count) {
@@ -1036,8 +1197,13 @@ static void qcs_set_membership(qihse_consensus_t* cs,
     memcpy(cs->match_index, nmatch, count * sizeof(*nmatch));
     memcpy(cs->last_ack_ms, nlast, count * sizeof(*nlast));
 
-    /* Record the members this change dropped (lame ducks, above). */
-    cs->rm_count = 0u;
+    /* Record the members this change dropped (lame ducks, above).
+     * ACCUMULATE, not rebuild: a member dropped by an earlier transition
+     * of a joint sequence must keep receiving grace catch-up after later
+     * deltas re-run this function — rebuilding here would wipe the list
+     * on every append and a reachable removed node would never learn it
+     * was dropped.  A tracked duck that re-enters the config stops being
+     * one; tracking is bounded by MAX_MEMBERS. */
     for (size_t j = 0; j < old_count; j++) {
         bool kept = false;
         for (size_t i = 0; i < count; i++) {
@@ -1046,16 +1212,36 @@ static void qcs_set_membership(qihse_consensus_t* cs,
                 break;
             }
         }
-        if (!kept) {
-            cs->rm_uuid[cs->rm_count] = old_members[j];
-            /* Start the grace cursor AT the transition entry: the removed
-             * node must vouch for exactly the entry that removed it (a
-             * failure hint walks further back if it was behind). */
-            cs->rm_next[cs->rm_count] =
-                qcs_last_config_index(cs) ? qcs_last_config_index(cs) : 1u;
-            cs->rm_committed[cs->rm_count] = false;
-            cs->rm_count++;
+        if (kept) {
+            /* Re-entered: stop treating it as a duck. */
+            for (size_t d = 0; d < cs->rm_count; d++) {
+                if (qihse_uuid_equal(&cs->rm_uuid[d], &old_members[j])) {
+                    cs->rm_uuid[d] = cs->rm_uuid[cs->rm_count - 1u];
+                    cs->rm_next[d] = cs->rm_next[cs->rm_count - 1u];
+                    cs->rm_committed[d] = cs->rm_committed[cs->rm_count - 1u];
+                    cs->rm_count--;
+                    break;
+                }
+            }
+            continue;
         }
+        bool tracked = false;
+        for (size_t d = 0; d < cs->rm_count; d++) {
+            if (qihse_uuid_equal(&cs->rm_uuid[d], &old_members[j])) {
+                tracked = true;
+                break;
+            }
+        }
+        if (tracked) continue;
+        if (cs->rm_count >= QIHSE_CONSENSUS_MAX_MEMBERS) continue;
+        cs->rm_uuid[cs->rm_count] = old_members[j];
+        /* Start the grace cursor AT the transition entry: the removed
+         * node must vouch for exactly the entry that removed it (a
+         * failure hint walks further back if it was behind). */
+        cs->rm_next[cs->rm_count] =
+            qcs_last_config_index(cs) ? qcs_last_config_index(cs) : 1u;
+        cs->rm_committed[cs->rm_count] = false;
+        cs->rm_count++;
     }
 
     int self = -1;
@@ -1076,6 +1262,29 @@ static void qcs_set_membership(qihse_consensus_t* cs,
  * of config entries (and after a snapshot install, whose prefix may carry
  * them).  Returns false when the fold is invalid — possible only for a
  * hostile record file, whose load then fails closed. */
+/* Plain fold: the effective member set only (base folded over every
+ * config entry in the log, plus `extra` as the next appended entry).
+ * Thin wrapper over qcs_fold_full at UINT64_MAX commit — every recorded
+ * END counts as resolved for membership-display purposes, since the
+ * config in force is a function of the LOG, not of commit knowledge. */
+static bool qcs_fold_membership(const qihse_consensus_t* cs,
+                                const qihse_consensus_entry_t* extra,
+                                qihse_uuid_t* out_members,
+                                size_t* out_count) {
+    qcs_fold_t f;
+    if (!qcs_fold_full(cs, UINT64_MAX, extra, &f)) return false;
+    if (f.count < 1u || f.count > QIHSE_CONSENSUS_MAX_MEMBERS) return false;
+    memcpy(out_members, f.members, f.count * sizeof(*out_members));
+    *out_count = f.count;
+    return true;
+}
+
+/* Fold at the current commit: the joint-phase view quorum arithmetic and
+ * introspection consume.  Returns false only on a hostile/illegal log. */
+static bool qcs_fold_at_commit(const qihse_consensus_t* cs, qcs_fold_t* f) {
+    return qcs_fold_full(cs, cs->commit, NULL, f);
+}
+
 static bool qcs_recompute_membership(qihse_consensus_t* cs) {
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t count = 0;
@@ -1271,19 +1480,56 @@ static void qcs_send_append_to(qihse_consensus_t* cs, size_t peer) {
 
 static void qcs_advance_commit(qihse_consensus_t* cs) {
     if (cs->role != QIHSE_CONSENSUS_LEADER) return;
+    /* Joint-phase quorum basis, computed once per call: while a joint is
+     * active, EVERY entry (deltas and the END included) commits only on a
+     * dual majority — majority of the current fold AND majority of C_old.
+     * Side A counts acks from members still in the config (a member
+     * removed mid-joint steps down and cannot ack); propose_joint's
+     * survivor rule guarantees that side can still reach its majority. */
+    qcs_fold_t jf;
+    bool joint = qcs_fold_at_commit(cs, &jf) && jf.active;
     for (uint64_t n = qcs_abs_last_index(cs); n > cs->commit; n--) {
         if (qcs_term_at(cs, n) != cs->term) continue; /* current-term rule */
-        size_t acks = 1u; /* self */
+        size_t acks = 0u;
+        size_t acks_old = 0u;
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
-            if ((int)i == cs->self_index) continue;
-            if (cs->match_index[i] >= n) acks++;
+            /* Self always vouches for its own log tail. */
+            bool acked = ((int)i == cs->self_index)
+                             ? true
+                             : (cs->match_index[i] >= n);
+            if (!acked) continue;
+            acks++;
+            if (joint) {
+                for (size_t k = 0; k < jf.old_count; k++) {
+                    if (qihse_uuid_equal(&jf.old_members[k],
+                                         &cs->cfg.members[i])) {
+                        acks_old++;
+                        break;
+                    }
+                }
+            }
         }
-        if (acks >= qcs_majority_needed(cs)) {
+        bool ok = acks >= qcs_majority_needed(cs);
+        if (joint) {
+            ok = ok && acks_old >= jf.old_count / 2u + 1u;
+        }
+        if (ok) {
             uint64_t old = cs->commit;
             cs->commit = n;
             if (!qcs_persist_commit(cs)) {
                 cs->commit = old; /* fail closed: stay uncommitted */
                 return;
+            }
+            /* A committed END in the advanced window closes a joint. */
+            if (joint) {
+                for (uint64_t x = old + 1u; x <= n; x++) {
+                    const qihse_consensus_entry_t* xe = qcs_entry_at(cs, x);
+                    if (xe &&
+                        xe->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END) {
+                        cs->counters.joint_transitions_completed++;
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -1577,7 +1823,27 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
 
     uint32_t votes = 0;
     for (uint32_t m = cs->votes_granted_mask; m; m >>= 1) votes += (m & 1u);
-    if ((size_t)votes >= qcs_majority_needed(cs)) {
+    /* Joint-phase election: the candidate needs a dual majority —
+     * majority of the current fold AND majority of C_old (votes from
+     * members still in the config; propose_joint's survivor rule keeps
+     * that side reachable).  Same fold basis the commit rule uses. */
+    qcs_fold_t jf;
+    bool joint = qcs_fold_at_commit(cs, &jf) && jf.active;
+    bool win = (size_t)votes >= qcs_majority_needed(cs);
+    if (win && joint) {
+        size_t votes_old = 0;
+        for (size_t i = 0; i < cs->cfg.member_count; i++) {
+            if (!(cs->votes_granted_mask & ((uint32_t)1u << i))) continue;
+            for (size_t k = 0; k < jf.old_count; k++) {
+                if (qihse_uuid_equal(&jf.old_members[k], &cs->cfg.members[i])) {
+                    votes_old++;
+                    break;
+                }
+            }
+        }
+        win = votes_old >= jf.old_count / 2u + 1u;
+    }
+    if (win) {
         cs->role = QIHSE_CONSENSUS_LEADER;
         cs->leader = cs->cfg.self;
         cs->has_leader = true;
@@ -1588,6 +1854,7 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
         }
         cs->match_index[cs->self_index] = qcs_abs_last_index(cs);
         cs->last_heartbeat_ms = cs->now_ms - cs->cfg.heartbeat_interval_ms;
+        qcs_joint_ensure_closed(cs);
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
             if ((int)i == cs->self_index) continue;
             qcs_send_append_to(cs, i);
@@ -1714,11 +1981,17 @@ static void qcs_handle_append(qihse_consensus_t* cs,
             config_touched = true;
         }
         /* Persist with the entry-kind encoder: a config entry must land
-         * as an LC record or its type would be lost to replay. */
-        bool persisted =
-            (e->type == QIHSE_CONSENSUS_ENTRY_DATA)
-                ? qcs_persist_entry(cs, e)
-                : qcs_persist_config_entry(cs, e);
+         * as an LC record (or LJ for a joint phase marker) or its type
+         * would be lost to replay. */
+        bool persisted;
+        if (e->type == QIHSE_CONSENSUS_ENTRY_DATA) {
+            persisted = qcs_persist_entry(cs, e);
+        } else if (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN ||
+                   e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END) {
+            persisted = qcs_persist_joint_marker(cs, e);
+        } else {
+            persisted = qcs_persist_config_entry(cs, e);
+        }
         if (!persisted) {
             qcs_reply_append(cs, &msg->from, false, idx - 1u);
             return;
@@ -2107,10 +2380,19 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
         return false;
     }
     /* ONE transition in flight: the latest config entry must be committed
-     * (or gone).  A second proposal is refused, not queued. */
+     * (or gone), and an unresolved joint phase blocks single-server
+     * changes outright — the dual majority is the quorum basis until the
+     * END commits.  A second proposal is refused, not queued. */
     if (qcs_last_config_index(cs) > cs->commit) {
         cs->counters.membership_proposals_refused++;
         return false;
+    }
+    {
+        qcs_fold_t g;
+        if (qcs_fold_at_commit(cs, &g) && g.active) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
     }
 
     bool present = qcs_member_index(cs, member) >= 0;
@@ -2169,6 +2451,241 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
         cs->match_index[cs->self_index] = qcs_abs_last_index(cs);
         qcs_advance_commit(cs);
     }
+    return true;
+}
+
+/* Append one planned joint-sequence entry: validate → durable → log →
+ * fold.  Every append is individually write-then-apply, so a crash at any
+ * point leaves a PREFIX of the planned sequence durable — resolved by the
+ * ordinary mid-transition rules (a leader holding the suffix completes it;
+ * one lacking it truncates and the fold reverts). */
+static bool qcs_joint_append_one(qihse_consensus_t* cs,
+                                 qihse_consensus_entry_t* e,
+                                 uint64_t index) {
+    e->index = index;
+    e->term = cs->term;
+    e->journal_generation = qcs_last_gen(cs) + 1u;
+    /* Pre-persist legality: fold the candidate as the next entry. */
+    qihse_uuid_t folded[QIHSE_CONSENSUS_MAX_MEMBERS];
+    size_t fcount = 0;
+    if (!qcs_fold_membership(cs, e, folded, &fcount)) return false;
+    bool persisted = (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN ||
+                      e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END)
+                         ? qcs_persist_joint_marker(cs, e)
+                         : qcs_persist_config_entry(cs, e);
+    if (!persisted) return false;
+    if (!qcs_log_push(cs, e)) return false;
+    (void)qcs_recompute_membership(cs);
+    return true;
+}
+
+/* Recovery for a crash mid-sequence: if the fold is active and the log
+ * has NO END after the BEGIN, the durable sequence was cut short — close
+ * it by appending END (the surviving deltas are the truth; log-matching
+ * makes every holder of the suffix identical).  Called on leadership
+ * acquisition; refuses cleanly when nothing is open. */
+static void qcs_joint_ensure_closed(qihse_consensus_t* cs) {
+    if (cs->role != QIHSE_CONSENSUS_LEADER) return;
+    qcs_fold_t f;
+    if (!qcs_fold_at_commit(cs, &f) || !f.active) return;
+    if (f.end_index != 0u) return; /* END appended; awaits dual quorum */
+    qihse_consensus_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END;
+    if (qcs_joint_append_one(cs, &e, qcs_abs_last_index(cs) + 1u)) {
+        cs->match_index[cs->self_index] = qcs_abs_last_index(cs);
+        qcs_advance_commit(cs);
+    }
+}
+
+bool qihse_consensus_propose_joint(qihse_consensus_t* cs,
+                                   const qihse_user_t* user,
+                                   const qihse_uuid_t* add, size_t add_count,
+                                   const qihse_uuid_t* remove,
+                                   size_t remove_count) {
+    if (!cs) return false;
+    if (cs->role != QIHSE_CONSENSUS_LEADER ||
+        qcs_last_config_index(cs) > cs->commit) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    /* Operator-grade act, same as single-server changes (invariants 1-2). */
+    if (!user || qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR ||
+        !qihse_auth_can_access(user, 0u, 0u)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    /* An unresolved joint blocks any new proposal (no nested BEGIN; the
+     * fold validates this too, but refuse before touching anything). */
+    {
+        qcs_fold_t g;
+        if (!qcs_fold_at_commit(cs, &g)) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+        if (g.active) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    if ((add_count > 0u && !add) || (remove_count > 0u && !remove) ||
+        add_count + remove_count == 0u) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    for (size_t i = 0; i < add_count; i++) {
+        if (qihse_uuid_is_nil(&add[i])) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    for (size_t i = 0; i < remove_count; i++) {
+        if (qihse_uuid_is_nil(&remove[i]) ||
+            qcs_member_index(cs, &remove[i]) < 0) {
+            /* Removing a non-member is refused explicitly — the fold
+             * would silently no-op it, hiding the caller's error. */
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    /* No duplicates within or across the two sets. */
+    for (size_t i = 0; i < add_count; i++) {
+        for (size_t j = i + 1; j < add_count; j++) {
+            if (qihse_uuid_equal(&add[i], &add[j])) {
+                cs->counters.membership_proposals_refused++;
+                return false;
+            }
+        }
+        for (size_t j = 0; j < remove_count; j++) {
+            if (qihse_uuid_equal(&add[i], &remove[j])) {
+                cs->counters.membership_proposals_refused++;
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < remove_count; i++) {
+        for (size_t j = i + 1; j < remove_count; j++) {
+            if (qihse_uuid_equal(&remove[i], &remove[j])) {
+                cs->counters.membership_proposals_refused++;
+                return false;
+            }
+        }
+    }
+    if (add_count > QIHSE_CONSENSUS_MAX_MEMBERS ||
+        remove_count > QIHSE_CONSENSUS_MAX_MEMBERS) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+
+    /* Survivor rule (the joint liveness guarantee): a strict majority of
+     * the CURRENT config must still be members after every delta, so side
+     * A of the dual majority stays reachable from live nodes until the
+     * END commits.  Without it a bulk remove could strand the old
+     * majority mid-joint and deadlock the phase. */
+    size_t survivors = 0;
+    for (size_t i = 0; i < cs->cfg.member_count; i++) {
+        bool removed = false;
+        for (size_t j = 0; j < remove_count; j++) {
+            if (qihse_uuid_equal(&cs->cfg.members[i], &remove[j])) {
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) survivors++;
+    }
+    if (survivors < cs->cfg.member_count / 2u + 1u) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+
+    /* Simulate the whole sequence through the same fold the replicated
+     * path uses: bounds, legality, bucket invariant, non-empty result. */
+    qcs_fold_t sim;
+    if (!qcs_fold_at_commit(cs, &sim)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    uint64_t seq_index = qcs_abs_last_index(cs);
+    bool overflow = false;
+    if (!qcs_fold_step(&sim,
+                       &(qihse_consensus_entry_t){.type =
+                               QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN},
+                       ++seq_index, &overflow)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    for (size_t i = 0; i < add_count; i++) {
+        qihse_consensus_entry_t d;
+        memset(&d, 0, sizeof(d));
+        d.type = QIHSE_CONSENSUS_ENTRY_CONFIG_ADD;
+        memcpy(d.payload, add[i].bytes, QIHSE_UUID_BYTES);
+        d.payload_len = QIHSE_UUID_BYTES;
+        if (!qcs_fold_step(&sim, &d, ++seq_index, &overflow) || overflow ||
+            sim.count > QIHSE_CONSENSUS_MAX_MEMBERS ||
+            sim.count > cs->cfg.election_timeout_spread_ms) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    for (size_t i = 0; i < remove_count; i++) {
+        qihse_consensus_entry_t d;
+        memset(&d, 0, sizeof(d));
+        d.type = QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE;
+        memcpy(d.payload, remove[i].bytes, QIHSE_UUID_BYTES);
+        d.payload_len = QIHSE_UUID_BYTES;
+        if (!qcs_fold_step(&sim, &d, ++seq_index, &overflow) || overflow ||
+            sim.count < 1u) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    if (!qcs_fold_step(&sim,
+                       &(qihse_consensus_entry_t){.type =
+                               QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END},
+                       ++seq_index, &overflow) ||
+        overflow) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+
+    /* Durable sequence: BEGIN, deltas, END. */
+    uint64_t idx = qcs_abs_last_index(cs);
+    qihse_consensus_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN;
+    if (!qcs_joint_append_one(cs, &e, ++idx)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    for (size_t i = 0; i < add_count; i++) {
+        memset(&e, 0, sizeof(e));
+        e.type = QIHSE_CONSENSUS_ENTRY_CONFIG_ADD;
+        memcpy(e.payload, add[i].bytes, QIHSE_UUID_BYTES);
+        e.payload_len = QIHSE_UUID_BYTES;
+        if (!qcs_joint_append_one(cs, &e, ++idx)) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    for (size_t i = 0; i < remove_count; i++) {
+        memset(&e, 0, sizeof(e));
+        e.type = QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE;
+        memcpy(e.payload, remove[i].bytes, QIHSE_UUID_BYTES);
+        e.payload_len = QIHSE_UUID_BYTES;
+        if (!qcs_joint_append_one(cs, &e, ++idx)) {
+            cs->counters.membership_proposals_refused++;
+            return false;
+        }
+    }
+    memset(&e, 0, sizeof(e));
+    e.type = QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END;
+    if (!qcs_joint_append_one(cs, &e, ++idx)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    /* Self-match the whole sequence and try to commit it immediately. */
+    cs->match_index[cs->self_index] = qcs_abs_last_index(cs);
+    qcs_advance_commit(cs);
     return true;
 }
 
@@ -2271,6 +2788,20 @@ bool qihse_consensus_get_membership(const qihse_consensus_t* cs,
     out->pending_config_index =
         (out->last_config_index > cs->commit) ? out->last_config_index : 0u;
     out->self_removed = cs->self_index < 0;
+    qcs_fold_t f;
+    if (qcs_fold_at_commit(cs, &f)) {
+        out->joint_active = f.active;
+        out->joint_begin_index = f.begin_index;
+        out->joint_end_index = f.end_index;
+        out->joint_old_count = f.old_count;
+        out->joint_fold_count = f.count;
+    } else {
+        out->joint_active = false;
+        out->joint_begin_index = 0u;
+        out->joint_end_index = 0u;
+        out->joint_old_count = 0u;
+        out->joint_fold_count = 0u;
+    }
     return true;
 }
 

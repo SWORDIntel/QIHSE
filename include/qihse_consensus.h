@@ -29,6 +29,11 @@
  *   - single-server membership changes: add/remove-one-member config
  *     entries in the replicated log, with one transition in flight at a
  *     time (see MEMBERSHIP CHANGES below);
+ *   - joint consensus: ATOMIC BULK membership transitions through a
+ *     C_old,new-style two-phase protocol in the same replicated log, with
+ *     a dual-majority quorum (majority of C_old AND majority of the
+ *     current folded config) in force for the whole joint phase (see
+ *     JOINT CONSENSUS below);
  *   - crash/restart through replay of the append-only record file.
  *
  * WHAT THIS IS NOT (honest naming, plan §16)
@@ -37,9 +42,6 @@
  * or documented as one.  Mechanics the full algorithm requires that are
  * deliberately absent here:
  *
- *   - joint consensus (C_old,new): membership changes are SINGLE-SERVER
- *     changes only (see MEMBERSHIP CHANGES below for the protocol, its
- *     safety argument, and what is traded away);
  *   - client session and dedup semantics at this layer (the F2 request
  *     ledger owns idempotency);
  *   - pre-vote, leadership transfer, and leader-lease linearizable reads;
@@ -109,12 +111,14 @@
  * majority of C_old and any majority of C_new intersect (|M_old|+|M_new| >
  * |C_old ∪ C_new| for a single-member delta); combined with the two rules
  * below, any two configs simultaneously in force anywhere in the group are
- * adjacent configs, never two steps apart.  Tradeoffs versus full joint
- * consensus: a multi-member change is a SEQUENCE of committed one-member
- * transitions (no atomic bulk reconfiguration), and there is no C_old,new
- * phase in which both configs must agree.  What is gained is a far smaller
- * state machine — no joint quorum arithmetic, no two-phase config records —
- * which fits this module's deterministic, bounded-buffer discipline.
+ * adjacent configs, never two steps apart.  Tradeoffs versus joint
+ * consensus: a multi-member change made only with this fast path is a
+ * SEQUENCE of committed one-member transitions (no atomic bulk
+ * reconfiguration, and each intermediate config briefly stands as the
+ * plain quorum basis) — atomic bulk changes use the joint protocol of
+ * the JOINT CONSENSUS section below instead.  What is gained here is a
+ * far smaller state machine for the common one-member delta — no joint
+ * quorum arithmetic, no two-phase config records.
  *
  * Shape of the implementation:
  *
@@ -136,7 +140,9 @@
  *     one-in-flight rule exists to close.
  *   - ONE transition in flight: qihse_consensus_propose_membership()
  *     refuses a second proposal while the latest config entry in the
- *     leader's log is uncommitted.  Refused — not queued.
+ *     leader's log is uncommitted, and refuses every call while a joint
+ *     phase is unresolved (the union is the quorum basis until END
+ *     commits).  Refused — not queued.
  *   - quorum evaluation (election majority, commit majority, message
  *     membership filtering) always uses the effective config above; a
  *     transition therefore needs no special joint arithmetic — the old
@@ -188,6 +194,93 @@
  *   - transitions to fewer than two members are refused (a single-member
  *     group cannot be emptied by remove), and additions stop at
  *     QIHSE_CONSENSUS_MAX_MEMBERS.
+ *
+ * JOINT CONSENSUS (implemented; two-phase bulk transitions; residual limits)
+ * ---------------------------------------------------------------------
+ * The single-server protocol above remains the fast path for one-member
+ * deltas.  For ATOMIC bulk transitions (replace several members at once)
+ * this module implements joint consensus in the same replicated log:
+ *
+ *   - a transition is a CONTIGUOUS ENTRY SEQUENCE: one CONFIG_JOINT_BEGIN
+ *     entry, then the ordinary one-member CONFIG_ADD / CONFIG_REMOVE
+ *     entries for the whole delta set (adds first, then removes), then one
+ *     CONFIG_JOINT_END entry.  BEGIN and END carry NO member list — the
+ *     per-member deltas reuse the existing 16-byte UUID payloads and the
+ *     fold is the source of truth, so nothing about the protocol needs a
+ *     payload larger than a single UUID.
+ *   - DUAL-MAJORITY QUORUM: from the moment BEGIN is appended until the
+ *     END entry is committed or the whole sequence is truncated away,
+ *     EVERY quorum evaluation (election majority, commit majority,
+ *     group-availability) requires BOTH a strict majority of C_old (the
+ *     folded config at the instant BEGIN applied) AND a strict majority of
+ *     the current folded config.  The voter set during the joint phase is
+ *     the UNION C_old ∪ C_fold: a member removed by one of the joint
+ *     deltas keeps voting (and keeps being replicated to) until END
+ *     commits — the group never operates under a plain intermediate
+ *     config, which is precisely the "fragile intermediate" a sequence of
+ *     single-server transitions would pass through.
+ *   - Safety arithmetic: every joint-phase quorum contains a majority of
+ *     the SAME set C_old, so any two joint-phase quorums intersect, and so
+ *     does any plain quorum of the pre-BEGIN config (which is C_old).
+ *     After END commits the group returns to ordinary single-server mode
+ *     with the final folded config C_final; a node that has appended but
+ *     not yet committed END still evaluates the dual quorum with its fold
+ *     already equal to C_final, so it intersects post-END quorums through
+ *     the shared majority of C_final.  The remaining pair — a candidate
+ *     whose log LACKS END versus a post-END candidate — is closed by the
+ *     election up-to-dateness rule: END only commits once a dual quorum
+ *     (hence a majority of C_old) has durably acknowledged it, and those
+ *     voters' logs are then longer than any END-lacking candidate's, so
+ *     they will not grant it the C_old majority it still needs.
+ *   - ONE joint transition in flight: qihse_consensus_propose_joint()
+ *     refuses while a joint phase is unresolved, and ordinary
+ *     qihse_consensus_propose_membership() calls are refused during a
+ *     joint phase (the union stays the quorum basis until END commits).
+ *   - Mid-transition leader change resolves through ordinary log
+ *     mechanics, exactly like the single-server rule: a new leader whose
+ *     log HOLDS the joint entries completes them by ordinary replication
+ *     and commit; one that LACKS them has its conflicting suffix truncate
+ *     them, and the fold reverts the group to the pre-BEGIN config.  A
+ *     leader that holds an UNTERMINATED joint (BEGIN and some deltas, no
+ *     END — possible after a crash between the record writes, or after
+ *     truncation of the tail) cannot know the original intent: BEGIN/END
+ *     carry no member list, so the OPERATOR must re-state the full
+ *     intended delta set via propose_joint, which then appends only the
+ *     still-missing deltas and the END.  This is the repair path; it is
+ *     refused once END exists in the log (the sequence then resolves
+ *     through replication alone).
+ *   - durability follows the same record-before-memory discipline: each
+ *     joint entry lands as its own checksummed record (LJ for BEGIN/END,
+ *     LC for the member deltas), fsynced BEFORE the in-memory fold or
+ *     joint state changes; crash/restart mid-joint resumes the joint state
+ *     PURELY from the log fold (C_old, begin/end indices, and the union
+ *     are all re-derived at replay — there is NO extra durable joint
+ *     state).  When the commit index crosses END — on a leader advancing
+ *     commit or a follower adopting leader_commit — the effective config
+ *     collapses from the union to C_final in one recompute, the members
+ *     that C_final drops become lame ducks of the ordinary grace-catch-up
+ *     machinery, and a leader that thereby removes itself steps down.
+ *
+ * Residual limits, stated honestly:
+ *
+ *   - the joint voter set is capped: |C_old ∪ C_final| must stay within
+ *     QIHSE_CONSENSUS_MAX_MEMBERS and within the election-timeout spread
+ *     (the bucket-disjointness guard), so a bulk transition plus its old
+ *     config cannot exceed 32 voters;
+ *   - during the joint phase availability requires BOTH majorities, which
+ *     is strictly harder than either config alone — a side holding only
+ *     the old majority or only the new majority can neither elect nor
+ *     commit (that is the point, and it is a real availability cost);
+ *   - C_old is derived per node from ITS fold; a node that first opens
+ *     with a post-transition baseline (the documented baseline residual
+ *     limit above) derives a different, conservative C_old.  The
+ *     incumbent nodes' baseline is the authoritative one;
+ *   - repair of an unterminated joint requires the operator to re-state
+ *     the whole intended delta set (see above); there is no in-band
+ *     record of intent, by the payload-size discipline;
+ *   - propose_joint is OPERATOR-only, exactly like propose_membership
+ *     (AGENTS.md invariants 1 and 2: reshaping the group that guards
+ *     classified replication is a privilege-bearing act).
  *
  * LOCAL NAMESPACES ARE NEVER GATED (plan §3.1, §3.2; acceptance criteria 1-2)
  * --------------------------------------------------------------------------
@@ -249,15 +342,22 @@ const char* qihse_consensus_role_name(qihse_consensus_role_t role);
  * classified-capable read primitive and is only disclosed through
  * qihse_consensus_read_committed() with an authenticated principal.
  *
- * A CONFIG entry is a membership transition: its payload is exactly the
- * 16-byte UUID of the one member being added or removed (classif and sci
- * are zero).  Config entries replicate, commit, and truncate like data
- * entries; see MEMBERSHIP CHANGES above for when they take effect. */
+ * A CONFIG entry is a membership transition: CONFIG_ADD / CONFIG_REMOVE
+ * carry exactly the 16-byte UUID of the one member being added or removed
+ * (classif and sci are zero).  CONFIG_JOINT_BEGIN / CONFIG_JOINT_END are
+ * the phase markers of a joint (bulk) transition: they carry NO payload
+ * (payload_len == 0, classif and sci zero) — the member deltas between
+ * them are ordinary CONFIG_ADD / CONFIG_REMOVE entries and the fold is
+ * the source of truth.  Config entries replicate, commit, and truncate
+ * like data entries; see MEMBERSHIP CHANGES and JOINT CONSENSUS above for
+ * when they take effect. */
 
 typedef enum {
     QIHSE_CONSENSUS_ENTRY_DATA = 0,         /* operator/journal payload */
     QIHSE_CONSENSUS_ENTRY_CONFIG_ADD = 1,   /* payload = added member UUID */
-    QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE = 2 /* payload = removed member UUID */
+    QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE = 2,/* payload = removed member UUID */
+    QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN = 3, /* no payload: open C_old,new */
+    QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END = 4    /* no payload: close C_old,new */
 } qihse_consensus_entry_type_t;
 
 typedef struct {
@@ -462,12 +562,55 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
                                         qihse_consensus_membership_op_t op,
                                         const qihse_uuid_t* member);
 
+/* Propose an ATOMIC BULK membership transition via joint consensus
+ * (leader only; see JOINT CONSENSUS above).  The transition is the entry
+ * sequence CONFIG_JOINT_BEGIN, one CONFIG_ADD per UUID in `add` (in call
+ * order), one CONFIG_REMOVE per UUID in `remove` (in call order), then
+ * CONFIG_JOINT_END — appended by this one call, durable on this node the
+ * moment true is returned, replicated and committed like any entries.
+ * Until END is COMMITTED, every quorum in the group is the dual majority
+ * (majority of the config at BEGIN — C_old — AND majority of the current
+ * fold), and the voter set is the union C_old ∪ fold; when END commits,
+ * the group collapses to the final folded config in one step.
+ *
+ * Privilege boundary: identical to propose_membership — `user` MUST be a
+ * non-NULL authenticated OPERATOR principal (AGENTS.md invariants 1 and
+ * 2); NULL and lesser roles are refused outright, never a bypass.
+ *
+ * Refused (returns false, nothing appended) when: this node is not the
+ * leader; a joint transition is already unresolved (one in flight —
+ * refused, not queued; the one exception is the REPAIR path: when the
+ * log holds an UNTERMINATED joint — BEGIN and some deltas, no END, e.g.
+ * after a crash between the record writes — the call appends only the
+ * still-missing deltas from these lists and the END, because the lists
+ * re-state the operator's full intent); an ordinary single-server
+ * transition is uncommitted; the lists are empty, malformed (nil UUIDs,
+ * duplicates within or across the lists), or name members inconsistent
+ * with a fresh transition (an add that is already a member, a remove of
+ * a non-member); the target fold would be empty or exceed
+ * QIHSE_CONSENSUS_MAX_MEMBERS; the joint voter set (C_old ∪ target)
+ * would exceed QIHSE_CONSENSUS_MAX_MEMBERS or break the election-timeout
+ * bucket invariant; or a durable record write fails (fail closed — the
+ * already-durable prefix of a partially-written sequence is exactly the
+ * unterminated-joint shape the repair path exists for). */
+bool qihse_consensus_propose_joint(qihse_consensus_t* cs,
+                                   const qihse_user_t* user,
+                                   const qihse_uuid_t* add, size_t add_count,
+                                   const qihse_uuid_t* remove,
+                                   size_t remove_count);
+
 typedef struct {
     /* Effective member set (base configuration folded over the config
-     * entries in the log).  Order: base order, added members appended. */
+     * entries in the log).  Order: base order, added members appended.
+     * During an active joint phase this is the VOTER SET, i.e. the union
+     * C_old ∪ current fold (removed-but-still-voting C_old members
+     * included). */
     size_t member_count;
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
-    /* Strict-majority size of the effective config. */
+    /* Strict-majority size of the effective member set.  While
+     * joint_active is true the REAL quorum is dual — a strict majority of
+     * joint_old_count members AND of joint_fold_count members — which is
+     * always at least as hard as this number; see JOINT CONSENSUS. */
     size_t majority_needed;
     /* Index of the latest config entry in the log (0 = none). */
     uint64_t last_config_index;
@@ -478,6 +621,14 @@ typedef struct {
     /* True when this node's own UUID is absent from the effective config:
      * it has been removed, has stepped down, and no longer campaigns. */
     bool self_removed;
+    /* Joint-phase state, derived purely from the log fold (see JOINT
+     * CONSENSUS above).  joint_active is true from BEGIN appended until
+     * END is committed or the sequence is truncated away. */
+    bool joint_active;
+    uint64_t joint_begin_index;  /* latest CONFIG_JOINT_BEGIN (0 = none) */
+    uint64_t joint_end_index;    /* first END after it (0 = not appended) */
+    size_t joint_old_count;      /* |C_old| — majority side A while active */
+    size_t joint_fold_count;     /* |current fold| — majority side B */
 } qihse_consensus_membership_t;
 
 /* Introspection only — member UUIDs and transition state, never payloads.
@@ -531,9 +682,13 @@ typedef struct {
     uint64_t membership_changes_applied; /* config entries that changed the
                                           * effective member set (append,
                                           * replay, or truncation-revert) */
-    uint64_t membership_proposals_refused; /* propose_membership denials:
+    uint64_t membership_proposals_refused; /* propose_membership AND
+                                            * propose_joint denials:
                                             * one-in-flight / non-leader /
                                             * authorization / bad request */
+    uint64_t joint_transitions_completed; /* joint END entries that went
+                                           * from appended to committed
+                                           * (union collapsed to C_final) */
 } qihse_consensus_counters_t;
 
 void qihse_consensus_get_counters(const qihse_consensus_t* cs,

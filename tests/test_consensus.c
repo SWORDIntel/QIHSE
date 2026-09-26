@@ -3050,6 +3050,307 @@ static void test_membership_determinism(void) {
 
 
 
+
+/* ── Joint consensus: atomic bulk membership transitions ─────────────────── */
+
+/* (j1) A bulk replace commits end to end: 2 of 5 members replaced in ONE
+ * two-phase transition; data commits mid-joint need the dual majority;
+ * after END the config is the target and single-server mode resumes. */
+static void test_joint_bulk_replace(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "joint1");
+    h_seed_extra(&h, "joint1");
+    int L = h_elect(&h);
+    assert(L >= 0);
+
+    /* Baseline entry. */
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 5000u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Bulk: remove L+1 and L+2, add the extra node — one transition. */
+    qihse_consensus_membership_t m;
+    t_membership(h.node[L], &m);
+    assert(m.member_count == 5u && !m.joint_active);
+    qihse_uuid_t rm[2] = {h.id[(L + 1) % (int)N], h.id[(L + 2) % (int)N]};
+    assert(qihse_consensus_propose_joint(h.node[L], op, &h.extra_id, 1u,
+                                          rm, 2u));
+    /* Effect on append: joint active immediately, both sides tracked. */
+    t_membership(h.node[L], &m);
+    assert(m.joint_active);
+    assert(m.joint_old_count == 5u);
+    assert(m.joint_fold_count == 4u);        /* -2 removed +1 added */
+    assert(m.joint_end_index != 0u);          /* END already appended */
+    assert(m.pending_config_index != 0u);     /* nothing committed yet */
+    /* Second joint while one is in flight: refused. */
+    qihse_uuid_t nobody = h.extra_id;
+    assert(!qihse_consensus_propose_joint(h.node[L], op, &nobody, 1u,
+                                          NULL, 0u));
+    /* Single-server during joint: refused. */
+    assert(!qihse_consensus_propose_membership(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &h.extra_id));
+
+    /* Dual majority: fold majority (3 of 4) AND old majority (3 of 5,
+     * exactly met by the leader + the two surviving followers).  Poll the
+     * leader: the two removed nodes step down and never learn commits. */
+    for (unsigned i = 0;
+         i < 80u && qihse_consensus_commit_index(h.node[L]) < 6u; i++) {
+        h_tick(&h, 10u);
+    }
+    assert(qihse_consensus_commit_index(h.node[L]) == 6u);  /* base + BEGIN + 2 deltas + END */
+
+    /* Let the commit propagate before asserting convergence: followers
+     * learn leader_commit only from the next heartbeat. */
+    for (unsigned i = 0; i < 40u; i++) h_tick(&h, 10u);
+
+    /* Every live node converged to the target config of 4. */
+    for (int j = 0; j < (int)N; j++) {
+        if (j == (L + 1) % (int)N || j == (L + 2) % (int)N) continue;
+        t_membership(h.node[j], &m);
+        assert(m.member_count == 4u);
+        assert(!m.joint_active);
+        assert(m.pending_config_index == 0u);
+    }
+    /* Removed nodes know they are out and never campaign. */
+    t_membership(h.node[(L + 1) % (int)N], &m);
+    assert(m.member_count == 4u);
+    /* Single-server mode works again post-END: remove the just-added
+     * extra (a member) — accepted where mid-joint it was refused. */
+    int L2 = h_elect(&h);
+    assert(L2 >= 0);
+    assert(qihse_consensus_propose_membership(
+        h.node[L2], op, QIHSE_CONSENSUS_MEMBER_REMOVE, &h.extra_id));
+    h_free(&h);
+    printf("PASS (j1) joint bulk replace commits atomically; single-server "
+           "refused mid-joint, restored after\n");
+}
+
+/* (j2) Minority partition in EITHER phase cannot commit: BEGIN alone
+ * (old side present, fold side missing... inverse) — partition the
+ * leader so only 2 of 5 see the sequence: nothing commits. */
+static void test_joint_minority_no_commit(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "joint2");
+    h_seed_extra(&h, "joint2");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 5100u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Sever the leader from three of four followers: its only peer is
+     * (L+1).  Any commit would need majority of 5 (=3) — unreachable. */
+    t_sever(&h, (L + 2) % (int)N);
+    t_sever(&h, (L + 3) % (int)N);
+    t_sever(&h, (L + 4) % (int)N);
+
+    qihse_uuid_t rm = h.id[(L + 2) % (int)N];
+    /* The proposal itself still appends on the leader (durable), and the
+     * BEGIN/deltas/END ride to the one reachable follower — but with 2
+     * of 5 old-side acks and 2 of 3 fold-side acks, neither majority is
+     * reachable and NOTHING commits. */
+    assert(qihse_consensus_propose_joint(h.node[L], op, NULL, 0u, &rm, 1u));
+    qihse_consensus_membership_t m;
+    t_membership(h.node[L], &m);
+    assert(m.joint_active);
+    assert(m.pending_config_index != 0u);
+    assert(qihse_consensus_commit_index(h.node[L]) == 1u); /* base only */
+    for (unsigned i = 0; i < 40u; i++) h_tick(&h, 10u);
+    assert(qihse_consensus_commit_index(h.node[L]) == 1u);
+
+    /* Heal.  During the partition the three severed nodes out-voted the
+     * old leader (a short-log leader in a higher term), so the documented
+     * mid-transition rule resolves the joint by TRUNCATION: the new
+     * leader overwrites the conflicting suffix, the fold reverts, and
+     * the group re-converges on the pre-joint config.  Safety assert: no
+     * unresolved joint survives, and every live node agrees. */
+    h.drop[(L + 2) % (int)N][L] = false;
+    h.drop[L][(L + 2) % (int)N] = false;
+    h.drop[(L + 3) % (int)N][L] = false;
+    h.drop[L][(L + 3) % (int)N] = false;
+    h.drop[(L + 4) % (int)N][L] = false;
+    h.drop[L][(L + 4) % (int)N] = false;
+    for (unsigned i = 0; i < 200u; i++) h_tick(&h, 10u);
+    {
+        int any = h_leader_any(&h);
+        assert(any >= 0); /* exactly one leader again */
+        qihse_consensus_t* lead = (any == (int)N) ? h.extra : h.node[any];
+        /* Drive resolution: a leader cannot commit the old term's joint
+         * entries until it appends one of its own (current-term rule).
+         * Propose a DATA entry — permitted mid-joint — so the leader
+         * commits its log and the joint resolves. */
+        for (unsigned i = 0; i < 50u; i++) {
+            if (qihse_consensus_role(lead) == QIHSE_CONSENSUS_LEADER) {
+                qihse_hlc_t hlc2 = {200u, 0u};
+                if (qihse_consensus_propose(lead, NULL, 5150u, hlc2, 0u, 0u,
+                                             "heal", 4u)) {
+                    break;
+                }
+            }
+            h_tick(&h, 10u);
+            any = h_leader_any(&h);
+            if (any >= 0) lead = (any == (int)N) ? h.extra : h.node[any];
+        }
+        for (unsigned i = 0; i < 100u; i++) h_tick(&h, 10u);
+        t_membership(lead, &m);
+        assert(!m.joint_active); /* resolved either way — never stuck */
+        if (m.member_count == 4u) {
+            /* Completed: the joint survived and committed (base, BEGIN,
+             * REMOVE, END, plus the heal entry = 5). */
+            assert(qihse_consensus_commit_index(lead) == 5u);
+        } else {
+            /* Reverted: back to the original 5, joint entries gone. */
+            assert(m.member_count == 5u);
+            assert(m.joint_begin_index == 0u);
+        }
+        uint64_t lc = qihse_consensus_commit_index(lead);
+        uint64_t ll = qihse_consensus_last_log_index(lead);
+        for (int j = 0; j < (int)N; j++) {
+            if (j == any) continue;
+            assert(qihse_consensus_commit_index(h.node[j]) == lc);
+            assert(qihse_consensus_last_log_index(h.node[j]) == ll);
+        }
+    }
+    h_free(&h);
+    printf("PASS (j2) minority partition commits nothing in either joint "
+           "phase; resolves cleanly on heal\n");
+}
+
+/* (j3) Crash-restart mid-joint: restart the leader after BEGIN+deltas
+ * but BEFORE END commits — joint state resumes from the record file,
+ * the sequence completes, config lands on the target. */
+static void test_joint_restart_midflight(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "joint3");
+    h_seed_extra(&h, "joint3");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 5200u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Drive the sequence manually: BEGIN + one delta on the leader only,
+     * then crash it before END.  (We call propose_joint on a partitioned
+     * leader so nothing commits, then kill it mid-phase.) */
+    t_sever(&h, (L + 2) % (int)N);
+    t_sever(&h, (L + 3) % (int)N);
+    t_sever(&h, (L + 4) % (int)N);
+    qihse_uuid_t add = h.extra_id;
+    assert(qihse_consensus_propose_joint(h.node[L], op, &add, 1u, NULL, 0u));
+    /* Joint is open on the leader's durable log (nothing committed). */
+    qihse_consensus_membership_t m;
+    t_membership(h.node[L], &m);
+    assert(m.joint_active);
+
+    /* Crash-restart the leader from its own record file. */
+    h_restart(&h, (size_t)L, "joint3");
+    t_membership(h.node[L], &m);
+    assert(m.joint_active);                    /* resumed from the fold */
+    assert(m.joint_old_count == 5u);
+    assert(m.joint_fold_count == 6u);          /* +1 added */
+
+    /* New election: whoever wins resumes/completes the phase. */
+    h.drop[(L + 2) % (int)N][L] = false;
+    h.drop[L][(L + 2) % (int)N] = false;
+    h.drop[(L + 3) % (int)N][L] = false;
+    h.drop[L][(L + 3) % (int)N] = false;
+    h.drop[(L + 4) % (int)N][L] = false;
+    h.drop[L][(L + 4) % (int)N] = false;
+    /* Open the extra so the final 6-member group can elect and commit.
+     * Baseline = the original five + itself (cfg.self must be a member);
+     * the replayed joint log folds on top of it. */
+    {
+        qihse_uuid_t base6[QIHSE_CONSENSUS_MAX_MEMBERS];
+        for (size_t z = 0; z < N; z++) base6[z] = h.id[z];
+        base6[N] = h.extra_id;
+        h_open_extra(&h, "joint3", base6, N + 1u);
+    }
+    int L2 = -1;
+    for (unsigned i = 0; i < 200u && L2 < 0; i++) {
+        h_tick(&h, 10u);
+        L2 = h_leader_any(&h);
+    }
+    assert(L2 >= 0);
+    /* The joint resolves: END commits, config = 6 members. */
+    qihse_consensus_t* lead = (L2 == (int)N) ? h.extra : h.node[L2];
+    for (unsigned i = 0; i < 80u; i++) {
+        t_membership(lead, &m);
+        if (!m.joint_active &&
+            qihse_consensus_commit_index(lead) >= m.joint_end_index &&
+            m.joint_end_index != 0u) break;
+        /* A restarted leader cannot commit the old term's entries until
+         * it appends one of its own (current-term rule) — drive it. */
+        if (qihse_consensus_role(lead) == QIHSE_CONSENSUS_LEADER) {
+            qihse_hlc_t hlc3 = {300u, (uint32_t)i};
+            (void)qihse_consensus_propose(lead, NULL, 5250u + i, hlc3, 0u,
+                                           0u, "resume", 6u);
+        }
+        h_tick(&h, 10u);
+    }
+    t_membership(lead, &m);
+    assert(!m.joint_active);
+    assert(m.member_count == 6u);              /* 5 + the one add */
+    h_free(&h);
+    printf("PASS (j3) crash-restart mid-joint resumes from the record "
+           "file and completes\n");
+}
+
+/* (j4) Hostile/invalid joint proposals are refused before anything is
+ * durable: unknown-remove, duplicate-add, and the survivor-rule
+ * violation (removing 3 of 5 strands the old majority). */
+static void test_joint_validation(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "joint4");
+    h_seed_extra(&h, "joint4");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 5300u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+    uint64_t idx0 = qihse_consensus_last_log_index(h.node[L]);
+
+    /* Remove a non-member (the not-yet-added extra). */
+    assert(!qihse_consensus_propose_joint(h.node[L], op, NULL, 0u,
+                                          &h.extra_id, 1u));
+    /* Duplicate across sets. */
+    qihse_uuid_t both = h.id[(L + 1) % (int)N];
+    assert(!qihse_consensus_propose_joint(h.node[L], op, &both, 1u,
+                                          &both, 1u));
+    /* Survivor violation: removing 3 of 5 strands the old majority. */
+    qihse_uuid_t rm[3] = {h.id[(L + 1) % (int)N], h.id[(L + 2) % (int)N],
+                          h.id[(L + 3) % (int)N]};
+    assert(!qihse_consensus_propose_joint(h.node[L], op, NULL, 0u, rm, 3u));
+    /* NULL/non-operator principals: never a bypass (invariants 1-2). */
+    qihse_uuid_t ok_rm = h.id[(L + 1) % (int)N];
+    assert(!qihse_consensus_propose_joint(h.node[L], NULL, NULL, 0u,
+                                          &ok_rm, 1u));
+    assert(!qihse_consensus_propose_joint(
+        h.node[L],
+        qihse_auth_create_user(op, 61999u, QIHSE_ROLE_ANALYST, 1u, 0u,
+                               "JtAnlystPass9!", false),
+        NULL, 0u, &ok_rm, 1u));
+    /* Nothing was appended: the log is untouched. */
+    assert(qihse_consensus_last_log_index(h.node[L]) == idx0);
+    qihse_consensus_counters_t c;
+    qihse_consensus_get_counters(h.node[L], &c);
+    assert(c.membership_proposals_refused >= 5u);
+    /* And a VALID minimal joint still works after all the refusals. */
+    assert(qihse_consensus_propose_joint(h.node[L], op, &h.extra_id, 1u,
+                                          &ok_rm, 1u));
+    assert(h_commit_reached(&h, 5u));
+    h_free(&h);
+    printf("PASS (j4) hostile joint proposals refused pre-durability; "
+           "valid joint still lands\n");
+}
+
 int main(void) {
     /* Relative record-file directory only (repo rule: no absolute paths). */
     char dir[128];
@@ -3095,6 +3396,10 @@ int main(void) {
 
     /* Membership-change scenarios (single-server transitions). */
     test_membership_transitions(op);
+    test_joint_bulk_replace(op);
+    test_joint_minority_no_commit(op);
+    test_joint_restart_midflight(op);
+    test_joint_validation(op);
     test_membership_election_safety(op);
     test_membership_leader_change_midflight();
     test_membership_restart(dir, &hostile_self, op);
