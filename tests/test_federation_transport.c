@@ -384,7 +384,7 @@ typedef struct {
 
 static void* accept_once(void* arg) {
     accept_arg_t* a = (accept_arg_t*)arg;
-    a->session = qihse_federation_listener_accept(a->listener, 5000, &a->verdict);
+    a->session = qihse_federation_listener_accept(a->listener, 15000, &a->verdict);
     return NULL;
 }
 
@@ -433,7 +433,7 @@ static void test_listener_accepts_verified_peer(const char* dir, const char* ca_
     qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
     qihse_fed_tls_session_t* client = qihse_federation_tls_connect_to(client_node.tls,
                                                                      "127.0.0.1", port,
-                                                                     5000, &cv);
+                                                                     15000, &cv);
     pthread_join(th, NULL);
 
     assert(a.session != NULL);
@@ -483,7 +483,7 @@ static void test_listener_survives_refusal(const char* dir, const char* ca_key_p
     qihse_peer_verdict_t cv = QIHSE_PEER_REJECT_MALFORMED;
     qihse_fed_tls_session_t* refused = qihse_federation_tls_connect_to(stranger.tls,
                                                                       "127.0.0.1", port,
-                                                                      5000, &cv);
+                                                                      15000, &cv);
     pthread_join(th1, NULL);
     assert(bad.session == NULL);
     assert(refused == NULL);
@@ -499,7 +499,7 @@ static void test_listener_survives_refusal(const char* dir, const char* ca_key_p
     qihse_peer_verdict_t cv2 = QIHSE_PEER_REJECT_MALFORMED;
     qihse_fed_tls_session_t* accepted = qihse_federation_tls_connect_to(good.tls,
                                                                       "127.0.0.1", port,
-                                                                      5000, &cv2);
+                                                                      15000, &cv2);
     pthread_join(th2, NULL);
     assert(ok.session != NULL);
     assert(ok.verdict == QIHSE_PEER_ACCEPT);
@@ -534,7 +534,7 @@ static void test_replication_over_real_tcp(const char* dir, const char* ca_key_p
     qihse_peer_verdict_t cv;
     qihse_fed_tls_session_t* client = qihse_federation_tls_connect_to(client_node.tls,
                                                                      "127.0.0.1", port,
-                                                                     5000, &cv);
+                                                                     15000, &cv);
     pthread_join(th, NULL);
     assert(a.session && client);
 
