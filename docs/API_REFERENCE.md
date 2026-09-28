@@ -1233,6 +1233,27 @@ Federation and operations state is namespaced inside the caller's KV store:
 
 ---
 
+## 11a. 2026-09-26/28 round — new public APIs
+
+These landed with the improvement pass; each carries its own tests (named
+below) and is wired into the `make test` aggregate.
+
+| API | Header | What it does | Test |
+|---|---|---|---|
+| `qihse_uwp_dispatch_streaming()` | `qihse_uwp.h` | In-process UWP dispatch that routes SQL/TXN/GRAPH2/INDEX/SCHEMA/REPL/POOL to the REAL dispatchers with the caller's write callback (row/status streams reach the adapter instead of being dropped). NULL user on non-AUTH targets refused, as `qihse_uwp_dispatch`. | `test_bolt_result_visibility` in `tests/test_bolt.c` |
+| `qihse_qkp_get_counters()` + `qihse_qkp_counters_t` | `qihse_qkp.h` | Process-wide QKP1 handshake/traffic counters: per-side negotiation success, categorized rejections (cleartext/malformed/identity/crypto/replay), sealed-frame seal/unseal/failure. | `test_pqc_handshake` scenario 9 |
+| `qihse_federation_node_identity_read()` | `qihse_federation.h` | Read an enrolled node's identity record (public key, trust state, fingerprint) by UUID. No trust filtering — the caller decides policy. | `test_bus_signed_ops` (s1–s4) |
+| `qihse_bus_msg_signed_class()` | `qihse_cluster_bus.h` | Predicate: which bus frame classes carry ML-DSA signature trailers (SLOT/NODE/GROUP updates). | `test_bus_signed_ops` |
+| `qihse_cluster_bus_set_require_signed_ops()` | `qihse_cluster_bus.h` | Hardened receive policy: refuse unsigned signed-class ops frames. | `test_bus_signed_ops` (s4) |
+| `qihse_federation_ca rotate-node` (CLI) | `tools/qihse_federation_ca.c` | Issue a successor node identity and revoke the predecessor onto the CRL in one step; fail-closed on partial failure. | verified live; composition of tested issue/revoke paths |
+
+Protocol changes in the same round:
+
+- **Joint consensus** in the scoped consensus module: `qihse_consensus_propose_joint()` — two-phase C_old,new bulk membership transitions with a dual-majority quorum (majority of C_old AND of the current fold) and a survivor rule against mid-joint stranding. Tests j1–j4 in `tests/test_consensus.c`.
+- **Signed bus ops frames**: SLOT/NODE/GROUP updates carry an ML-DSA-87 trailer verified against the signer's ENROLLED identity (algorithm of record from the enrollment, never a wire-claimed byte). Daemon flags: `--node-key PATH`, `--require-signed-ops`.
+- **Lease wire TTL contract**: FEDERATION LEASE.ACQUIRE/RENEW take a TTL in ms from the server's now (default `QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS`, 60s); the server stores the absolute expiry. The core APIs remain absolute.
+- **Audit fork safety**: `pthread_atfork` handlers fence the audit signer around fork and restart it in the child — a forked process no longer inherits frozen audit mutexes.
+
 ## 12. Known gaps and unverified areas
 
 Stated plainly rather than omitted:

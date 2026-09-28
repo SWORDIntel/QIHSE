@@ -52,11 +52,15 @@ deliberately expensive. This is normal.
 | Python REPL w/ native SDK | `./qihse python` | as demo |
 | RESP server (quick) | `make redis-server && ./qihse-redis-server --port 6399` | none (loopback, no auth) |
 | RESP server (auth) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'` | env + flag |
-| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'` | `--operator-password` (also keys the veiled bus — all nodes must match) |
+| Operator browser (web) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse browse --node <host:port> [--node …]` → `http://localhost:8090` — no login wall (operator-context default); UI asks only for the YubiKey touch on guarded actions; `--require-login` restores per-principal two-factor login | env or `--password`; YubiKey FIDO for actions |
+| Operator browser (headless) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse browse --dump overview\|cluster\|federation\|keys --node <host:port>` | env or `--password` |
+| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>' [--node-key PATH] [--require-signed-ops]` | `--operator-password` (also keys the veiled bus — all nodes must match); `--node-key` signs SLOT/NODE/GROUP ops frames (ML-DSA); `--require-signed-ops` refuses unsigned ones (hardened mode — requires `--node-key`) |
 | Federation CA | `make federation-ca && QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca` | env |
 | Key generation | `./qihse_keygen` | none |
 | Python controller SDK | `make test-controller-sdk-py` (usage: §3.6) | AUTH in connect config |
 | Rust controller SDK | `cd rust/qihse-rs && cargo test --offline` | AUTH in connect config |
+| Federation CA rotate-node | `QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca rotate-node --ca-key ./build/ca/ca.key --ca-cert ./build/ca/ca.pem --crl ./build/ca/revocations.crl --node-uuid <uuid> --pubkey-hex <hex> --out ./new.pem` | env |
+| Signed bus ops test | `make test-bus-signed-ops` | none |
 | Cluster smoke drills | `python3 tests/cluster_failover_smoke.py` (env-overridable hosts, §4) | per drill |
 | All make targets | §1.2; test target list in §2.1 | — |
 

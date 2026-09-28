@@ -12,8 +12,10 @@
 > (verified by `make test-sql-dml-exec`'s `test_insert_populates_row_store` on
 > 2026-09-26), and the Bolt adapter's wire compatibility was repaired
 > (Bolt 4.x message signatures, PackStream tiny containers, and FAILURE frames
-> for refused RUNs — `make test-bolt`) although it still does not return RUN
-> query results to a driver. Read the per-area status lines in
+> for refused RUNs — `make test-bolt`). RUN query results ARE now returned to
+> the driver: Bolt RUN routes to the SQL EXECUTE dispatcher through
+> `qihse_uwp_dispatch_streaming()`, and PULL drains the captured result
+> stream as records (commit ed8795d, 2026-09-28). Read the per-area status lines in
 > `tests/gold/pack.v1.gold` and in [architecture/](architecture/) for the
 > specific gaps that remain.
 
