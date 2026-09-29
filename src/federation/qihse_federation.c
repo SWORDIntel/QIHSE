@@ -704,6 +704,27 @@ uint64_t qihse_federation_journal_append(qihse_federation_journal_t* journal,
     return offset;
 }
 
+bool qihse_federation_event_is_tombstone(const qihse_federation_event_t* event) {
+    return event != NULL &&
+           (event->mutation.flags & QIHSE_FEDERATION_MUTATION_TOMBSTONE) != 0u;
+}
+
+uint64_t qihse_federation_journal_append_tombstone(
+    qihse_federation_journal_t* journal,
+    const qihse_federation_mutation_t* mutation,
+    const char* resource_id,
+    qihse_federation_event_t* out_event) {
+    if (!journal || !mutation || !resource_id || resource_id[0] == '\0') return 0;
+    qihse_federation_mutation_t m = *mutation;
+    m.flags |= QIHSE_FEDERATION_MUTATION_TOMBSTONE;
+    /* The deleted generation is the fencing fact consumers gate on; a
+     * tombstone without it cannot be ordered against upserts and is an
+     * argument error, never a silent unconditional delete. */
+    if (m.expected_generation == 0u) return 0;
+    return qihse_federation_journal_append(journal, &m, "object.delete",
+                                           resource_id, NULL, 0u, out_event);
+}
+
 uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
                                         uint64_t from_cursor,
                                         qihse_federation_journal_cb cb,
