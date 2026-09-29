@@ -56,9 +56,9 @@ This work was sitting outside git; it is now committed with tests and CI wiring 
 |---|---|---|
 | **Phase 10 — Federation data plane** (stages F0–F8, 28 acceptance criteria) | [federation upgrade plan](docs/plans/qihse_federation_upgrade_plan.md) | `[x]` F0–F8, the post-F8 follow-ups, the 2026-09-24 batch (§W1, §1.4: scoped consensus, backup-writer authentication, controller SDKs, CA provisioning), and the two 2026-09-25 waves (§W1, §1.4: node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export) landed; no tracked unbuilt items remain — the plan stays design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing) — these are now tracked with CITADEL-derived priorities as workstream W7 (§3) |
 | AI compute fabric | [ai_fabric.md](docs/architecture/ai_fabric.md) | `[x]` items 1–5 implemented, including embedding-backed semantic recall and remote job dispatch |
-| Cluster brain | [cluster_brain.md](docs/architecture/cluster_brain.md) | `[~]` observe + actuation (R1–R6) landed; federation-journal migration open |
-| Overlay protocol | [overlay_protocol.md](docs/architecture/overlay_protocol.md) | `[~]` phase 1 landed; DHT (phase 2) sequenced after F5 |
-| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[x]` gold validation suite: 67/72 workloads, 10/11 areas FULL (see §W5.3/§W7); the 3 remaining gaps are recorded non-CI surfaces |
+| Cluster brain | [cluster_brain.md](docs/architecture/cluster_brain.md) | `[x]` observe + actuation (R1–R6) + federation-journal migration (W3.4: signed observations/decisions on the journal) landed |
+| Overlay protocol | [overlay_protocol.md](docs/architecture/overlay_protocol.md) | `[x]` phase 1 + phase 2 (DHT peer exchange) landed — `make test-dht-peer-exchange` green |
+| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[x]` gold validation suite: 72/72 workloads pass, 11/11 areas FULL, zero recorded gaps (see §W5.3/§W7) |
 
 ### 1.5 Landed 2026-09-29 — the W6 browser + W7 CITADEL-substrate wave (committed 4453b6..)
 
@@ -69,7 +69,7 @@ KEYSTONE feed wire handshake + typed SDK access, `INTROSPECTION.*`, member
 roles/weights/learners, fabric+DHT and semantic recall and brain-journal
 migration (verified landed by the parallel waves), baseline-drift fail-closed,
 and the gold-pack extension (7 W7 workloads + the real-peer failover drill in
-CI — 67/67 pass, 10/11 areas FULL). Item-by-item with evidence in §3 W6/W7.
+CI — the wave closed with the pack at 72/72 pass, 11/11 areas FULL, zero recorded gaps). Item-by-item with evidence in §3 W6/W7.
 
 ### 1.4 Landed 2026-09-24/25 (in flight — working tree, not yet committed)
 
@@ -303,7 +303,7 @@ Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitive
 
 Whitepaper v1.1 §12 priorities, in its stated order:
 
-- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **72 workloads, 11 areas, 8 FULL — W7 wave extended it and brought the real-peer failover drill into CI (see §W7).**
+- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **72 workloads, 11 areas, 11 FULL, zero recorded gaps — the W7 wave extended it, brought the real-peer failover drill into CI, and closed every remaining gap (see §W7).**
 
 ### W6 — Operator browser: generalized DB browser + cluster/federation viewer
 
@@ -349,7 +349,7 @@ unblocks first:
 - [x] **Embedding-backed semantic recall** — landed in the parallel wave ("built this cycle"): BM25 | SEMANTIC | HYBRID with a provider interface and the honestly-named deterministic lexical `builtin-lexical-256` embedder; RRF fusion; every mode resolves candidates through the same authorization-aware read so an embedding cannot leak what the principal cannot see; vectors bound to their producing embedder
 - [x] **Automated config-drift healing** — the documented residual ("the open()-time member list is trusted as the fold baseline; editing it behind an existing record file's back is not detected") is closed: record creation pins a running FNV-1a digest of the baseline (members ∥ roles ∥ weights — role/weight drift from item 7 is caught too) as a `B` line right after the header; every open compares it and a drifted baseline FAILS CLOSED with a named diagnostic before any log replays over it; pre-W7 record files carry no B line and are tolerated unchanged; evidence: `make test-consensus` — new `test_baseline_drift` (same baseline reopens; role-drift and swapped-member drift both refused; sed-stripped pre-W7 file opens), full suite green, determinism hash stable across runs (ff322d346)
 - [x] **Brain federation-journal migration** — landed in the parallel wave as W3.4: observations and signed decisions on the federation journal, no action without a journaled pre-condition (byte-exact round-trip check), ML-DSA-87 over decisions, deterministic against the old library (see §W3)
-- [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with duplicated keys surviving; the gap is re-worded to the honest remainder (cross-machine discovery/loadshift drills target the live physical fleet — live-fleet validation, not hermetic CI). Board: **67/72 workloads pass, **11 of 11 areas FULL — every recorded gap closed****; zero recorded gaps: backend busy time now ships as qihse_backend_busy_microseconds_total (W7 gap closure, commit dd6564d). Evidence: `make test-gold` — PASS WITH CAVEATS, 0 failed, 0 stale
+- [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with duplicated keys surviving; the discovery and loadshift drills were then made hermetic too (loopback --self-spawn), closing that remainder outright. Final board: **72/72 workloads pass, 11/11 areas FULL, zero recorded gaps** — the last gap (backend busy time) closed with `qihse_backend_busy_microseconds_total` (commit 812fa41), and the three multi-process drills were hardened to run reliably under CPU starvation (by-condition readiness waits, leak-proof teardown, 900 s pack timeouts; verified green at load average 80). Evidence: `make test-gold` — VERDICT: PASS, 0 failed, 0 stale, 0 known-bug
 
 ---
 

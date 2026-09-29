@@ -173,10 +173,10 @@ Note on ordering and failure: `make` runs the prerequisites of `test` in
 declaration order — the `Makefile` list first, then the two `GNUmakefile`
 overlay targets — and stops at the first failure. Because the aggregate ends
 with `test-gold`. As of the 2026-09-29 W7 wave the pack is green
-(67/72 workloads, 10/11 areas FULL — see [§2.4](#24-the-gold-validation-suite)),
-so a plain `make test` runs to the end; historical note: it was red for a
-stretch and `make -k test` remains the way to attempt everything past a
-failure.
+(72/72 workloads, 11/11 areas FULL, zero recorded gaps — see
+[§2.4](#24-the-gold-validation-suite)), so a plain `make test` runs to the
+end; historical note: it was red for a stretch and `make -k test` remains
+the way to attempt everything past a failure.
 
 CI (`.github/workflows/build-and-test.yml`) runs the core suite plus the
 security-boundary regressions, the APT41 ASan/UBSan fuzz targets, the brain/
@@ -241,10 +241,12 @@ overlay-discovery, observability). The 2026-09-29 W7 wave added the consensus
 membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
 the browser negative-auth, QKP identity and feed-wire suites, and the
 self-spawning failover drill — the first workload that kills a REAL daemon
-peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive).
-Board: 67/67 pass, 10/11 areas FULL; the 3 recorded gaps are non-CI surfaces
-(scored recall/latency benchmark, live-fleet drills, non-vector index-bytes
-metrics). Workloads either build a gold-only binary
+peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive) —
+plus the hermetic discovery and loadshift drills (loopback --self-spawn),
+the fusion recall/latency gate, non-vector index byte accounting, and
+backend busy-time accounting. Board: **72/72 pass, 11/11 areas FULL, zero
+recorded gaps**; the drills were hardened to pass reliably under CPU
+starvation (by-condition readiness waits, leak-proof teardown). Workloads either build a gold-only binary
 (`bin=` under `tests/gold/workloads/`) or re-run existing make targets
 (`run="make -s …"`). The security-regressions area drives the matrix in
 `tests/security-regression.mk` (KV, tenant isolation, tenant privilege
@@ -257,14 +259,15 @@ Verdicts (see the header of `tests/gold/gold_runner.c`): `VERDICT: PASS`
 error, 2 non-green under strict. Adding a workload is a pack edit only — the
 Makefile extracts the `bin=` list from the pack.
 
-Verified on this branch (2026-09-26): `make test-gold` completes in ≈4.5
-minutes and currently reports **59/60 pass, `VERDICT: FAIL`** — the
-`protocol-compat/controller-api` workload aborts at
-`tests/test_controller_api.c:127` (`qihse_ctrl_reply_ok` after
-`qihse_ctrl_lease_renew`). Note that `test-controller-api` is *not* a member
-of the plain `make test` aggregate; the gold pack is what runs it, which is
-exactly the kind of coverage the pack exists to catch. Treat a red
-`controller-api` gold line as a real signal, not flake (reproduced twice).
+Verified on this branch (2026-09-29, under host load avg 80): `make
+test-gold` completes with **`VERDICT: PASS` — 72/72 workloads, 11/11 areas
+FULL, zero recorded gaps** (the drill workloads were hardened for exactly
+these conditions: by-condition readiness waits, leak-proof teardown, 900 s
+pack timeouts). On a quiet box the suite takes ≈4.5 minutes. Historical
+note for perspective: the pack was red at 59/60 for a stretch in the
+2026-09-26 round (a `controller-api` abort that `make test` alone never
+ran — exactly the kind of coverage the pack exists to catch); that defect
+is long fixed and the board is now fully green.
 
 Design/motivation: [docs/development/gold_validation_suite.md](development/gold_validation_suite.md).
 

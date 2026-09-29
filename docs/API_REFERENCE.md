@@ -1272,6 +1272,8 @@ the gold pack (`make test-gold`).
 | `qihse_kv_meta_user()` + `qihse_kv_record_meta_t` | `qihse_kv_store.h` | The metadata-only getter behind RECORD.META. | `make test-browser` |
 | `KEYSTONE.FEED.OPEN [prefix] [cursor]` | RESP engine | The §5.1 snapshot-bootstrap handshake in one round trip; the cursor is an END-of-record position from STATUS/ACK (positional grammar — a lone cursor argument would be read as a prefix filter). | `make test-keystone-feed-wire` |
 | `Controller.keystone_feed_open()` → `KeystoneFeed`/`FeedEvent`/`FeedStatus` | `python/qihse/controller.py` | Typed Python access to the 16-field §4 change-feed envelope with ack/resume/status. | `make test-keystone-feed-wire` (15 checks) |
+| `qihse_backend_busy_microseconds_total{backend}` | RESP engine telemetry | Cumulative wall time each engine backend spends inside command dispatch (atomic u64 µs at the same chokepoint as backend_queries_total) — utilization is busy time, not dispatch share. | `gold_backend_busy` in the gold pack |
+| `qihse_hash_index_bytes()` / `qihse_index_manager_bytes()` | `qihse_hash_index.h` / `qihse_index_manager.h` | Non-vector index byte accounting: the save-format accounting (struct + header words + capacity × slot_stride) per hash index, summed read-locked across the manager's list. | `gold_index_bytes` in the gold pack |
 | `./qihse browse` (operator browser) | `python/qihse/browser/` + `dashboard/` | Web dashboard + loopback bridge: operator-context default (no login wall, FIDO-touch-gated actions) or per-principal 2FA mode; records census, cluster/federation views, guarded action allowlist; `--dump` headless mode; `--qkp-*` sealed transport. | `make test-browser` + `make test-browser-unit` |
 
 ## 12. Known gaps and unverified areas

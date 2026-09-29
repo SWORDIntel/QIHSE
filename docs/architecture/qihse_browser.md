@@ -1,6 +1,6 @@
 # QIHSE Operator Browser (web bridge + dashboard views)
 
-> **Status: implemented** — tests: `make test-browser-unit` (`python/tests/test_browser_unit.py`, 31 checks), `make test-browser` (`tests/qihse_browser_fixture.c` + `python/tests/test_browser_negative_auth.py`, 24 checks, the AGENTS.md invariant-3 negative-authorization gate); frontend build verified (`dashboard/ npm ci && npm run build`, served by the bridge at `/`).
+> **Status: implemented** — tests: `make test-browser-unit` (`python/tests/test_browser_unit.py`, 41 checks incl. the extra-actions allowlist suite), `make test-browser` (`tests/qihse_browser_fixture.c` + `python/tests/test_browser_negative_auth.py`, 36 checks: the AGENTS.md invariant-3 negative-authorization gate across operator / system-analyst / tenant tiers, plus the INTROSPECTION surfaces); both wired into `make test` and the gold pack (`browser-negative-auth` in security-regressions). Frontend build verified (`dashboard/ npm ci && npm run build`, served by the bridge at `/`; SWORD house theme, self-hosted DejaVu fonts, sword logo).
 
 One tool to see the whole fleet: per-node cluster state, the federation
 plane, and keyspaces — web views over an authenticated Python bridge, with
