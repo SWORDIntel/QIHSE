@@ -134,14 +134,16 @@ distributed requirements apply to the consensus work).
   `8b1037e` + `4110a87` — tests s1-s4 (roundtrip / tamper-drop /
   unenrolled-drop / hardened-refusal) plus the full aggregate 60/60.
   (Function)
-- [ ] **6. Bolt result visibility + parallel-query de-stub.** RUN retains
-  results, PULL streams them (removes the last documented COMPATIBILITY
-  caveat); parallel query executes or is labelled a non-goal. (Function)
-- [ ] **7. Federation remainder: incremental export; DHT overlay phase 2.**
-  (Function)
-- [ ] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
-  recall; close the gold suite's three partial-coverage areas; decide
-  `make docs`. (Function/Verification)
+- [x] **6. Bolt result visibility** — landed (commit 23e2072: RUN results
+  visible to drivers, streaming dispatch + capture; PULL streams them).
+  Parallel-query de-stub remains the open sliver: execute or label a
+  non-goal.
+- [x] **7. Federation remainder** — incremental export (landed in the
+  2026-09-25 wave) and DHT overlay phase 2 (`src/spinnaker/qihse_overlay.c`
+  Layer 3; `make test-dht-peer-exchange` green) both verified in-tree.
+- [~] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
+  recall landed (parallel wave). Open: gold-suite partial areas (tracked
+  as W7 item 12) and the `make docs` decision.
 
 ### A. Function — behaviour added or fixed
 
