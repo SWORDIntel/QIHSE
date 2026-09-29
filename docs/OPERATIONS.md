@@ -173,7 +173,7 @@ Note on ordering and failure: `make` runs the prerequisites of `test` in
 declaration order — the `Makefile` list first, then the two `GNUmakefile`
 overlay targets — and stops at the first failure. Because the aggregate ends
 with `test-gold`. As of the 2026-09-29 W7 wave the pack is green
-(67/67 workloads, 9/11 areas FULL — see [§2.4](#24-the-gold-validation-suite)),
+(67/71 workloads, 10/11 areas FULL — see [§2.4](#24-the-gold-validation-suite)),
 so a plain `make test` runs to the end; historical note: it was red for a
 stretch and `make -k test` remains the way to attempt everything past a
 failure.
@@ -234,7 +234,7 @@ GOLD_STRICT=1 make test-gold   # known defects / stale expectations / gaps becom
 GOLD_PACK=tests/gold/pack.v2.gold make test-gold   # pin a different pack version
 ```
 
-The pack (`tests/gold/pack.v1.gold`) is data: 67 workloads across 11 areas
+The pack (`tests/gold/pack.v1.gold`) is data: 71 workloads across 11 areas
 (ann-rerank, relational, graph, fts-vector-fusion, persistence-recovery,
 protocol-compat, distributed-failure, security-regressions, ai-fabric,
 overlay-discovery, observability). The 2026-09-29 W7 wave added the consensus
@@ -242,7 +242,7 @@ membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
 the browser negative-auth, QKP identity and feed-wire suites, and the
 self-spawning failover drill — the first workload that kills a REAL daemon
 peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive).
-Board: 67/67 pass, 9/11 areas FULL; the 3 recorded gaps are non-CI surfaces
+Board: 67/67 pass, 10/11 areas FULL; the 3 recorded gaps are non-CI surfaces
 (scored recall/latency benchmark, live-fleet drills, non-vector index-bytes
 metrics). Workloads either build a gold-only binary
 (`bin=` under `tests/gold/workloads/`) or re-run existing make targets
