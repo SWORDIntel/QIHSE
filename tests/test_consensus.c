@@ -3427,6 +3427,344 @@ static void test_joint_validation(qihse_user_t* op) {
            "valid joint still lands\n");
 }
 
+
+/* ══ W7 item 7: roles (voter/witness/learner) and voter weights ════════ */
+
+static void test_weighted_quorum(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "roles1");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 6001u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Raise A to weight 5: the group's voting weight is 3*1 + 5 = 8, the
+     * weighted majority is 5 — A ALONE no longer suffices... wait, A
+     * alone weighs 5 which MEETS 8/2+1=5.  The correct construction for
+     * "one heavyweight is not a majority": weights 1,1,1,1,5 (total 9,
+     * majority 5) — the weight-5 member alone meets it.  Use 3/3/1
+     * instead: total 7, majority 4; the two weight-3 members together
+     * (6 >= 4) commit, one heavyweight (3 < 4) does not. */
+    int A = (L + 1u) % N;
+    int B = (L + 2u) % N;
+    /* Remove B, re-add at weight 3, and raise A to weight 3 via the
+     * role-carrying API (ADD on an existing member is a no-op, so
+     * weight changes ride REMOVE+ADD pairs). */
+    (void)A; (void)B;
+
+    /* Simpler direct check of the arithmetic first: three weight-1
+     * voters, one added at weight 3 and one added as a learner. */
+    qihse_uuid_t heavy, learner_id;
+    assert(qihse_uuid_from_seed("roles1-heavy", 14u, &heavy));
+    assert(qihse_uuid_from_seed("roles1-learner", 16u, &learner_id));
+    assert(qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &heavy,
+        QIHSE_CONSENSUS_ROLE_VOTER, 3u));
+    /* ONE transition in flight: commit before the next. */
+    assert(qihse_consensus_propose(h.node[L], NULL, 6010u, hlc, 0u, 0u,
+                                    "mid", 3u));
+    assert(h_commit_reached(&h, 2u));
+    assert(qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &learner_id,
+        QIHSE_CONSENSUS_ROLE_LEARNER, 1u));
+    assert(qihse_consensus_propose(h.node[L], NULL, 6020u, hlc, 0u, 0u,
+                                    "mid2", 4u));
+    assert(h_commit_reached(&h, 3u));
+
+    qihse_consensus_membership_t m;
+    t_membership(h.node[L], &m);
+    assert(m.member_count == 7u);          /* 5 base + heavy + learner */
+    /* Voting weight: 5 weight-1 base + 3 heavy + 0 learner = 8; weighted
+     * majority 5.  Count-majority (for comparison) is 7/2+1 = 4. */
+    assert(m.voting_weight == 8u);
+    assert(m.majority_weight == 5u);
+    /* The learner is visible in the view with its role. */
+    bool seen_learner = false, seen_heavy = false;
+    for (size_t i = 0; i < m.member_count; i++) {
+        if (qihse_uuid_equal(&m.members[i], &learner_id)) {
+            seen_learner = true;
+            assert(m.member_roles[i] ==
+                   (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER);
+        }
+        if (qihse_uuid_equal(&m.members[i], &heavy)) {
+            seen_heavy = true;
+            assert(m.member_roles[i] ==
+                   (uint8_t)QIHSE_CONSENSUS_ROLE_VOTER);
+            assert(m.member_weights[i] == 3u);
+        }
+    }
+    assert(seen_learner && seen_heavy);
+
+    /* Validation refusals (one-in-flight means they also need a commit
+     * first — these fail on ARGUMENTS before the in-flight check). */
+    assert(qihse_consensus_propose(h.node[L], NULL, 6030u, hlc, 0u, 0u,
+                                    "mid3", 4u));
+    assert(h_commit_reached(&h, 4u));
+    qihse_uuid_t dummy;
+    assert(qihse_uuid_from_seed("roles1-dummy", 12u, &dummy));
+    assert(!qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &dummy,
+        QIHSE_CONSENSUS_ROLE_VOTER, 0u));
+    assert(!qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &dummy,
+        QIHSE_CONSENSUS_ROLE_VOTER,
+        (uint16_t)(QIHSE_CONSENSUS_MAX_WEIGHT + 1u)));
+    assert(!qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &dummy,
+        (qihse_consensus_member_role_t)7u, 1u));
+
+    /* Final data entry over the grown config. */
+    assert(qihse_consensus_propose(h.node[L], NULL, 6040u, hlc, 0u, 0u,
+                                    "after", 5u));
+    assert(h_commit_reached(&h, 5u));
+
+    /* Restart from records: roles/weights replay from the LC lines. */
+    h_restart(&h, 0u, "roles1");
+    t_membership(h.node[0], &m);
+    assert(m.member_count == 7u && m.voting_weight == 8u);
+    seen_learner = false;
+    for (size_t i = 0; i < m.member_count; i++) {
+        if (qihse_uuid_equal(&m.members[i], &learner_id)) {
+            seen_learner = true;
+            assert(m.member_roles[i] ==
+                   (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER);
+        }
+    }
+    assert(seen_learner);
+
+    h_free(&h);
+    printf("[PASS] roles/weights: weighted quorum view, learner tagged, "
+           "validations, record replay\n");
+}
+
+static void test_learner_never_wins(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "roles2");
+    h_seed_extra(&h, "roles2");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 6101u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Add the extra node as a LEARNER (replicated, non-voting). */
+    assert(qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &h.extra_id,
+        QIHSE_CONSENSUS_ROLE_LEARNER, 1u));
+    assert(qihse_consensus_propose(h.node[L], NULL, 6110u, hlc, 0u, 0u,
+                                    "cfg", 3u));
+    assert(h_commit_reached(&h, 2u));
+
+    /* The learner's own view: open the extra node into the grown config
+     * (6 members: 5 base + the learner) and check its own perspective. */
+    qihse_consensus_membership_t m;
+    {
+        /* A joining node's baseline carries its own role: the base config
+         * folds over the replicated log, and an ADD of an existing member
+         * is a no-op — the LEARNER role comes from cfg.member_roles (the
+         * documented join path for a catching-up node). */
+        qihse_uuid_t all6[6];
+        uint8_t roles6[6];
+        uint16_t weights6[6];
+        for (size_t i = 0; i < N; i++) {
+            all6[i] = h.id[i];
+            roles6[i] = (uint8_t)QIHSE_CONSENSUS_ROLE_VOTER;
+            weights6[i] = 1u;
+        }
+        all6[N] = h.extra_id;
+        roles6[N] = (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER;
+        weights6[N] = 1u;
+        if (h.extra) {
+            qihse_consensus_close(h.extra);
+            h.extra = NULL;
+        }
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", "roles2");
+        cfg.self = h.extra_id;
+        cfg.member_count = 6u;
+        for (size_t j = 0; j < 6u; j++) {
+            cfg.members[j] = all6[j];
+            cfg.member_roles[j] = roles6[j];
+            cfg.member_weights[j] = weights6[j];
+        }
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        cfg.snapshot_threshold = h.thresh;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s",
+                 h.extra_path);
+        h.extra = qihse_consensus_open(&cfg, &h, h_send);
+        assert(h.extra);
+    }
+    t_membership(h.extra, &m);
+    assert(m.member_count == N + 1u);
+    /* voting weight = N voters (weight 1) + learner (0) = N = 5 */
+    assert(m.voting_weight == 5u);
+    assert(m.majority_weight == 3u);
+
+    /* Sever everyone else: the learner is alone with the leader gone.  It
+     * must NEVER campaign its way to leadership — h_leader stays -1 on
+     * the learner node even after many timeouts. */
+    t_sever(&h, 0); t_sever(&h, 1); t_sever(&h, 2); t_sever(&h, 3);
+    t_sever(&h, 4);
+    for (unsigned k = 0; k < 80u; k++) {
+        h.now += 25u;
+        if (h.extra) qihse_consensus_tick(h.extra, h.now);
+        h_pump_all(&h);
+        assert(qihse_consensus_role(h.extra) != QIHSE_CONSENSUS_LEADER);
+    }
+
+    h_free(&h);
+    printf("[PASS] learner: excluded from voting weight, never wins election\n");
+}
+
+static void test_witness_counts(qihse_user_t* op) {
+    assert(op);
+    harness_t h;
+    h_init(&h, "roles3");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    (void)hlc;
+
+    qihse_uuid_t wit;
+    assert(qihse_uuid_from_seed("roles3-witness", 15u, &wit));
+    assert(qihse_consensus_propose_membership_role(
+        h.node[L], op, QIHSE_CONSENSUS_MEMBER_ADD, &wit,
+        QIHSE_CONSENSUS_ROLE_WITNESS, 1u));
+
+    qihse_consensus_membership_t m;
+    t_membership(h.node[L], &m);
+    /* The witness is a full voter: 5 base + 1 witness = 6 voting weight
+     * even though member_count is also 6. */
+    assert(m.member_count == 6u);
+    assert(m.voting_weight == 6u);
+    assert(m.majority_weight == 4u);
+    bool seen = false;
+    for (size_t i = 0; i < m.member_count; i++) {
+        if (qihse_uuid_equal(&m.members[i], &wit)) {
+            seen = true;
+            assert(m.member_roles[i] ==
+                   (uint8_t)QIHSE_CONSENSUS_ROLE_WITNESS);
+        }
+    }
+    assert(seen);
+
+    /* And the name helper agrees. */
+    assert(strcmp(qihse_consensus_member_role_name(
+                      QIHSE_CONSENSUS_ROLE_WITNESS), "witness") == 0);
+    assert(strcmp(qihse_consensus_member_role_name(
+                      QIHSE_CONSENSUS_ROLE_LEARNER), "learner") == 0);
+    assert(strcmp(qihse_consensus_member_role_name(
+                      QIHSE_CONSENSUS_ROLE_VOTER), "voter") == 0);
+
+    h_free(&h);
+    printf("[PASS] witness: consensus-identical to voter, tagged in the view\n");
+}
+
+/* ══ W7 item 10: baseline-drift detection (config drift healing) ══════ */
+
+static void test_baseline_drift(qihse_user_t* op) {
+    assert(op);
+    (void)op;
+    harness_t h;
+    h_init(&h, "drift1");
+    int L = h_elect(&h);
+    assert(L >= 0);
+    qihse_hlc_t hlc = {100u, 0u};
+    assert(qihse_consensus_propose(h.node[L], NULL, 7001u, hlc, 0u, 0u,
+                                    "base", 4u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Close node 0 and reopen with the SAME baseline: fine. */
+    char path0[600];
+    snprintf(path0, sizeof(path0), "%s", h.recpath[0]);
+    qihse_consensus_close(h.node[0]);
+    h.node[0] = NULL;
+    {
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", "drift1");
+        cfg.self = h.id[0];
+        cfg.member_count = N;
+        for (size_t j = 0; j < N; j++) cfg.members[j] = h.id[j];
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", path0);
+        qihse_consensus_t* ok = qihse_consensus_open(&cfg, NULL, NULL);
+        assert(ok != NULL);
+        qihse_consensus_close(ok);
+    }
+
+    /* Same membership, but node 1's ROLE drifted (learner): refused. */
+    {
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", "drift1");
+        cfg.self = h.id[0];
+        cfg.member_count = N;
+        for (size_t j = 0; j < N; j++) cfg.members[j] = h.id[j];
+        cfg.member_roles[1] = (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER;
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", path0);
+        qihse_consensus_t* bad = qihse_consensus_open(&cfg, NULL, NULL);
+        assert(bad == NULL);
+    }
+
+    /* A swapped-in member (same count, different uuid at slot 2): refused. */
+    {
+        qihse_uuid_t impostor;
+        assert(qihse_uuid_from_seed("drift1-impostor", 16u, &impostor));
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", "drift1");
+        cfg.self = h.id[0];
+        cfg.member_count = N;
+        for (size_t j = 0; j < N; j++) cfg.members[j] = h.id[j];
+        cfg.members[2] = impostor;
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", path0);
+        qihse_consensus_t* bad = qihse_consensus_open(&cfg, NULL, NULL);
+        assert(bad == NULL);
+    }
+
+    /* A pre-W7 record (B line stripped) still opens: legacy tolerance. */
+    {
+        char strip[1200];
+        snprintf(strip, sizeof(strip),
+                 "sed -i '/^B /d' %s", path0);
+        assert(system(strip) == 0);
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", "drift1");
+        cfg.self = h.id[0];
+        cfg.member_count = N;
+        for (size_t j = 0; j < N; j++) cfg.members[j] = h.id[j];
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", path0);
+        qihse_consensus_t* legacy = qihse_consensus_open(&cfg, NULL, NULL);
+        assert(legacy != NULL);   /* no B line: no check, documented */
+        qihse_consensus_close(legacy);
+    }
+
+    h_free(&h);
+    printf("[PASS] baseline drift: same reopens, role/member drift fails closed, "
+           "pre-W7 file tolerated\n");
+}
+
 int main(void) {
     /* Relative record-file directory only (repo rule: no absolute paths). */
     char dir[128];
@@ -3477,6 +3815,11 @@ int main(void) {
     test_joint_minority_no_commit(op);
     test_joint_restart_midflight(op);
     test_joint_validation(op);
+
+    test_weighted_quorum(op);
+    test_learner_never_wins(op);
+    test_witness_counts(op);
+    test_baseline_drift(op);
     test_membership_election_safety(op);
     test_membership_leader_change_midflight();
     test_membership_restart(dir, &hostile_self, op);

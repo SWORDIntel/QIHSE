@@ -191,6 +191,8 @@ struct qihse_consensus {
      * folded over the config entries in the log); base_* is the static
      * baseline captured at open.  See the header's MEMBERSHIP CHANGES. */
     qihse_uuid_t base_members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint8_t base_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t base_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t base_count;
 
     /* Lame-duck members: uuids dropped by the latest config change.  While
@@ -312,14 +314,42 @@ static bool qcs_config_entry_valid(const qihse_consensus_entry_t* e) {
     }
     if (e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
         e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE) return false;
-    if (e->payload_len != QIHSE_UUID_BYTES) return false;
+    /* W7: ADD carries the UUID alone (legacy: weight-1 voter) or UUID +
+     * role(1) + weight(2) + pad(1).  REMOVE stays UUID-only. */
+    if (e->payload_len != QIHSE_UUID_BYTES &&
+        !(e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
+          e->payload_len == QIHSE_UUID_BYTES + 4u)) return false;
     if (e->classif != 0u || e->sci != 0u) return false;
     qihse_uuid_t uid;
     memcpy(uid.bytes, e->payload, QIHSE_UUID_BYTES);
-    return !qihse_uuid_is_nil(&uid);
+    if (qihse_uuid_is_nil(&uid)) return false;
+    if (e->payload_len == QIHSE_UUID_BYTES + 4u) {
+        uint8_t role = e->payload[QIHSE_UUID_BYTES];
+        uint16_t weight = (uint16_t)(e->payload[QIHSE_UUID_BYTES + 1u] |
+                                     (e->payload[QIHSE_UUID_BYTES + 2u] << 8));
+        if (role > (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) return false;
+        if (weight == 0u || weight > QIHSE_CONSENSUS_MAX_WEIGHT) return false;
+    }
+    return true;
 }
 
-static void qcs_fold_apply(qihse_uuid_t* members, size_t* count,
+/* W7: decode a config entry's carried role/weight (legacy payload = the
+ * defaults). */
+static void qcs_entry_role_weight(const qihse_consensus_entry_t* e,
+                                  qihse_consensus_member_role_t* role,
+                                  uint16_t* weight) {
+    *role = QIHSE_CONSENSUS_ROLE_VOTER;
+    *weight = 1u;
+    if (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
+        e->payload_len == QIHSE_UUID_BYTES + 4u) {
+        *role = (qihse_consensus_member_role_t)e->payload[QIHSE_UUID_BYTES];
+        *weight = (uint16_t)(e->payload[QIHSE_UUID_BYTES + 1u] |
+                             (e->payload[QIHSE_UUID_BYTES + 2u] << 8));
+    }
+}
+
+static void qcs_fold_apply(qihse_uuid_t* members, uint8_t* roles,
+                           uint16_t* weights, size_t* count,
                            const qihse_consensus_entry_t* e,
                            bool* overflow) {
     qihse_uuid_t uid;
@@ -329,11 +359,20 @@ static void qcs_fold_apply(qihse_uuid_t* members, size_t* count,
     if (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD) {
         if (at < *count) return;          /* already a member: no-op */
         if (*count >= QIHSE_CONSENSUS_MAX_MEMBERS) { *overflow = true; return; }
-        members[(*count)++] = uid;
+        qihse_consensus_member_role_t role;
+        uint16_t weight;
+        qcs_entry_role_weight(e, &role, &weight);
+        members[*count] = uid;
+        roles[*count] = (uint8_t)role;
+        weights[*count] = weight;
+        (*count)++;
     } else {
         if (at == *count) return;         /* not a member: no-op */
         memmove(members + at, members + at + 1u,
                 (*count - at - 1u) * sizeof(*members));
+        memmove(roles + at, roles + at + 1u, (*count - at - 1u));
+        memmove(weights + at, weights + at + 1u,
+                (*count - at - 1u) * sizeof(uint16_t));
         (*count)--;
     }
 }
@@ -341,10 +380,16 @@ static void qcs_fold_apply(qihse_uuid_t* members, size_t* count,
 /* Fold result: the current config plus the derived joint-phase state. */
 typedef struct {
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* the fold */
+    uint8_t roles[QIHSE_CONSENSUS_MAX_MEMBERS];        /* W7 */
+    uint16_t weights[QIHSE_CONSENSUS_MAX_MEMBERS];     /* W7 */
     size_t count;
     qihse_uuid_t old_members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* C_old */
+    uint8_t old_roles[QIHSE_CONSENSUS_MAX_MEMBERS];    /* W7 */
+    uint16_t old_weights[QIHSE_CONSENSUS_MAX_MEMBERS]; /* W7 */
     size_t old_count;
     qihse_uuid_t union_members[QIHSE_CONSENSUS_MAX_MEMBERS]; /* voters */
+    uint8_t union_roles[QIHSE_CONSENSUS_MAX_MEMBERS];  /* W7 */
+    uint16_t union_weights[QIHSE_CONSENSUS_MAX_MEMBERS];/* W7 */
     size_t union_count;             /* valid only while active */
     uint64_t begin_index;           /* latest JOINT_BEGIN, 0 = none */
     uint64_t end_index;             /* first END after it, 0 = none */
@@ -364,7 +409,8 @@ static bool qcs_fold_step(qcs_fold_t* f,
             return true;
         case QIHSE_CONSENSUS_ENTRY_CONFIG_ADD:
         case QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE:
-            qcs_fold_apply(f->members, &f->count, e, overflow);
+            qcs_fold_apply(f->members, f->roles, f->weights, &f->count, e,
+                           overflow);
             return !*overflow;
         case QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_BEGIN: {
             if (f->begin_index != 0u && f->end_index == 0u) {
@@ -372,6 +418,8 @@ static bool qcs_fold_step(qcs_fold_t* f,
             }
             if (f->count < 1u) return false; /* C_old may never be empty */
             memcpy(f->old_members, f->members, f->count * sizeof(*f->members));
+            memcpy(f->old_roles, f->roles, f->count);
+            memcpy(f->old_weights, f->weights, f->count * sizeof(uint16_t));
             f->old_count = f->count;
             f->begin_index = index;
             f->end_index = 0u;
@@ -401,6 +449,8 @@ static bool qcs_fold_full(const qihse_consensus_t* cs, uint64_t commit,
     memset(out, 0, sizeof(*out));
     out->count = cs->base_count;
     memcpy(out->members, cs->base_members, out->count * sizeof(*out->members));
+    memcpy(out->roles, cs->base_roles, out->count);
+    memcpy(out->weights, cs->base_weights, out->count * sizeof(uint16_t));
     bool overflow = false;
     uint64_t last = qcs_abs_last_index(cs);
     for (uint64_t i = 1; i <= last; i++) {
@@ -412,6 +462,17 @@ static bool qcs_fold_full(const qihse_consensus_t* cs, uint64_t commit,
         if (!qcs_fold_step(out, extra, last + 1u, &overflow)) return false;
     }
     if (out->count < 1u) return false; /* a group may never fold to empty */
+    /* W7: and never to zero voting weight — a learner-only group can
+     * commit nothing and elect no one; refuse before it is durable. */
+    {
+        uint64_t w = 0u;
+        for (size_t i = 0; i < out->count; i++) {
+            if (out->roles[i] != (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+                w += out->weights[i] ? out->weights[i] : 1u;
+            }
+        }
+        if (w == 0u) return false;
+    }
     if (out->end_index != 0u && commit >= out->end_index) {
         /* END committed: the joint is resolved; this fold describes the
          * plain post-joint config.  (A committed END with a LATER BEGIN
@@ -439,7 +500,10 @@ static bool qcs_fold_full(const qihse_consensus_t* cs, uint64_t commit,
                 if (out->union_count >= QIHSE_CONSENSUS_MAX_MEMBERS) {
                     return false;
                 }
-                out->union_members[out->union_count++] = out->old_members[i];
+                out->union_members[out->union_count] = out->old_members[i];
+                out->union_roles[out->union_count] = out->old_roles[i];
+                out->union_weights[out->union_count] = out->old_weights[i];
+                out->union_count++;
             }
         }
     }
@@ -513,10 +577,31 @@ static bool qcs_persist_config_entry(qihse_consensus_t* cs,
                                      const qihse_consensus_entry_t* e) {
     if (e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
         e->type != QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE) return false;
-    if (e->payload_len != QIHSE_UUID_BYTES) return false;
+    if (e->payload_len != QIHSE_UUID_BYTES &&
+        !(e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD &&
+          e->payload_len == QIHSE_UUID_BYTES + 4u)) return false;
     char hex[2 * QIHSE_UUID_BYTES + 1u];
     qcs_hex_encode(e->payload, QIHSE_UUID_BYTES, hex);
     char op = (e->type == QIHSE_CONSENSUS_ENTRY_CONFIG_ADD) ? 'A' : 'R';
+    /* W7: an ADD that carries role/weight persists it as two optional
+     * trailing fields; legacy lines (and every REMOVE) carry none, so
+     * pre-W7 record files replay unchanged. */
+    if (e->payload_len == QIHSE_UUID_BYTES + 4u) {
+        qihse_consensus_member_role_t role;
+        uint16_t weight;
+        qcs_entry_role_weight(e, &role, &weight);
+        char rc = (role == QIHSE_CONSENSUS_ROLE_WITNESS) ? 'W'
+                : (role == QIHSE_CONSENSUS_ROLE_LEARNER) ? 'L' : 'V';
+        int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP,
+                         "LC %c %s %llu %llu %llu %c %u",
+                         op, hex,
+                         (unsigned long long)e->index,
+                         (unsigned long long)e->term,
+                         (unsigned long long)e->journal_generation,
+                         rc, (unsigned)weight);
+        if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP) return false;
+        return qcs_record_append(cs, (size_t)n);
+    }
     int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "LC %c %s %llu %llu %llu",
                      op, hex,
                      (unsigned long long)e->index,
@@ -632,12 +717,17 @@ static bool qcs_entry_identical(const qihse_consensus_entry_t* a,
                                 const qihse_consensus_entry_t* b);
 static bool qcs_recompute_membership(qihse_consensus_t* cs);
 
+static uint64_t qcs_baseline_digest(const qihse_consensus_config_t* cfg);
+
 static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
                              bool* out_created) {
     bool ok = false;
     FILE* f = NULL;
     char* line = NULL; /* the single reusable heap buffer */
     bool header_seen = false;
+    bool baseline_have = false;
+    bool baseline_checked = false;
+    uint64_t baseline_digest = 0u;
 
     /* Replay state (absolute indices throughout). */
     uint64_t cur_term = 0, cur_epoch = 0;
@@ -719,6 +809,33 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             continue;
         }
         if (!header_seen) goto done; /* records before the header */
+
+        if (strcmp(tok, "B") == 0) {
+            /* W7 baseline digest: at most once, directly after the header
+             * (or after another B-less position tolerance for files whose
+             * creation pre-dates it — pre-W7 files simply have none). */
+            if (baseline_have || baseline_checked) goto done;
+            if (pend_active) goto done;
+            char* s_dig = strtok_r(NULL, " ", &save);
+            if (!s_dig || strtok_r(NULL, " ", &save)) goto done;
+            if (!qcs_parse_u64(s_dig, &baseline_digest)) goto done;
+            baseline_have = true;
+            /* Compare NOW: a drifted baseline must fail closed before any
+             * of the log replays over it. */
+            if (baseline_digest != qcs_baseline_digest(&cs->cfg)) {
+                fprintf(stderr,
+                        "[consensus] baseline drift: record %s was created "
+                        "with membership digest %llu, open() was given %llu "
+                        "- refusing to fold a log over a baseline it never "
+                        "saw (fail closed)\n",
+                        path,
+                        (unsigned long long)baseline_digest,
+                        (unsigned long long)qcs_baseline_digest(&cs->cfg));
+                goto done;
+            }
+            continue;
+        }
+        baseline_checked = true; /* first non-B record locks B out */
 
         if (strcmp(tok, "V") == 0) {
             if (pend_active) goto done; /* S transaction must finish first */
@@ -854,17 +971,42 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             char* s_idx = strtok_r(NULL, " ", &save);
             char* s_term = strtok_r(NULL, " ", &save);
             char* s_gen = strtok_r(NULL, " ", &save);
+            char* s_role = strtok_r(NULL, " ", &save);
+            char* s_weight = s_role ? strtok_r(NULL, " ", &save) : NULL;
             if (!s_op || !s_uuid || !s_idx || !s_term || !s_gen) goto done;
             if (strtok_r(NULL, " ", &save)) goto done;
             if (strlen(s_op) != 1u || (s_op[0] != 'A' && s_op[0] != 'R')) goto done;
             size_t hex_len = strlen(s_uuid);
             if (hex_len != 2u * QIHSE_UUID_BYTES) goto done;
+            /* W7: the optional role/weight pair is ADD-only and comes in
+             * pairs — a lone trailing token is a torn record, refused. */
+            if (s_role && (!s_weight || s_op[0] != 'A')) goto done;
 
             qihse_consensus_entry_t e;
             memset(&e, 0, sizeof(e));
             if (!qcs_hex_decode(s_uuid, hex_len, e.payload, QIHSE_UUID_BYTES,
                                 QIHSE_UUID_BYTES)) goto done;
             e.payload_len = QIHSE_UUID_BYTES;
+            if (s_role) {
+                qihse_consensus_member_role_t role;
+                if (s_role[0] == 'V' && s_role[1] == '\0') {
+                    role = QIHSE_CONSENSUS_ROLE_VOTER;
+                } else if (s_role[0] == 'W' && s_role[1] == '\0') {
+                    role = QIHSE_CONSENSUS_ROLE_WITNESS;
+                } else if (s_role[0] == 'L' && s_role[1] == '\0') {
+                    role = QIHSE_CONSENSUS_ROLE_LEARNER;
+                } else {
+                    goto done;
+                }
+                uint64_t w64 = 0u;
+                if (!qcs_parse_u64(s_weight, &w64) || w64 == 0u ||
+                    w64 > QIHSE_CONSENSUS_MAX_WEIGHT) goto done;
+                e.payload[QIHSE_UUID_BYTES] = (uint8_t)role;
+                e.payload[QIHSE_UUID_BYTES + 1u] = (uint8_t)(w64 & 0xFFu);
+                e.payload[QIHSE_UUID_BYTES + 2u] = (uint8_t)(w64 >> 8);
+                e.payload[QIHSE_UUID_BYTES + 3u] = 0u;
+                e.payload_len = QIHSE_UUID_BYTES + 4u;
+            }
             qihse_uuid_t uid;
             memcpy(uid.bytes, e.payload, QIHSE_UUID_BYTES);
             if (qihse_uuid_is_nil(&uid)) goto done;
@@ -1149,6 +1291,43 @@ static size_t qcs_majority_needed(const qihse_consensus_t* cs) {
     return cs->cfg.member_count / 2u + 1u;
 }
 
+const char* qihse_consensus_member_role_name(qihse_consensus_member_role_t role) {
+    switch (role) {
+    case QIHSE_CONSENSUS_ROLE_VOTER: return "voter";
+    case QIHSE_CONSENSUS_ROLE_WITNESS: return "witness";
+    case QIHSE_CONSENSUS_ROLE_LEARNER: return "learner";
+    }
+    return "unknown";
+}
+
+/* ── W7 roles/weights ──────────────────────────────────────────────────
+ * A member's vote weight is its configured weight unless it is a LEARNER
+ * (weight 0: replicated to, never counted).  WITNESS is consensus-
+ * identical to VOTER.  Default arrays (0 roles, 0 weights) mean every
+ * member a weight-1 VOTER, so legacy configs and record files need no
+ * migration. */
+
+static uint16_t qcs_member_weight_at(const qihse_consensus_t* cs, size_t i) {
+    if (i >= cs->cfg.member_count) return 0u;
+    if (cs->cfg.member_roles[i] == (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+        return 0u;
+    }
+    uint16_t w = cs->cfg.member_weights[i];
+    return w ? w : 1u;    /* 0-filled array = legacy weight 1 */
+}
+
+static uint64_t qcs_voting_weight(const qihse_consensus_t* cs) {
+    uint64_t w = 0u;
+    for (size_t i = 0; i < cs->cfg.member_count; i++) {
+        w += qcs_member_weight_at(cs, i);
+    }
+    return w;
+}
+
+static uint64_t qcs_majority_weight(const qihse_consensus_t* cs) {
+    return qcs_voting_weight(cs) / 2u + 1u;
+}
+
 static int qcs_member_index(const qihse_consensus_t* cs, const qihse_uuid_t* id) {
     for (size_t i = 0; i < cs->cfg.member_count; i++) {
         if (qihse_uuid_equal(&cs->cfg.members[i], id)) return (int)i;
@@ -1171,8 +1350,12 @@ static void qcs_set_membership(qihse_consensus_t* cs,
     uint64_t nmatch[QIHSE_CONSENSUS_MAX_MEMBERS];
     uint64_t nlast[QIHSE_CONSENSUS_MAX_MEMBERS];
     qihse_uuid_t old_members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint8_t old_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t old_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t old_count = cs->cfg.member_count;
     memcpy(old_members, cs->cfg.members, old_count * sizeof(*old_members));
+    memcpy(old_roles, cs->cfg.member_roles, old_count);
+    memcpy(old_weights, cs->cfg.member_weights, old_count * sizeof(uint16_t));
     for (size_t i = 0; i < count; i++) {
         int old = -1;
         for (size_t j = 0; j < cs->cfg.member_count; j++) {
@@ -1192,6 +1375,13 @@ static void qcs_set_membership(qihse_consensus_t* cs,
         }
     }
     memcpy(cs->cfg.members, members, count * sizeof(*members));
+    /* W7: preserve each member's role/weight across the reorder by UUID —
+     * new members carry their entry's values (fold before this call). */
+    {
+        /* caller re-folds roles into cfg.member_* right after; here we
+         * only keep old entries aligned so replication state matches. */
+        (void)old_roles; (void)old_weights;
+    }
     cs->cfg.member_count = count;
     memcpy(cs->next_index, nnext, count * sizeof(*nnext));
     memcpy(cs->match_index, nmatch, count * sizeof(*nmatch));
@@ -1287,14 +1477,26 @@ static bool qcs_fold_at_commit(const qihse_consensus_t* cs, qcs_fold_t* f) {
 
 static bool qcs_recompute_membership(qihse_consensus_t* cs) {
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint8_t roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t weights[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t count = 0;
-    if (!qcs_fold_membership(cs, NULL, members, &count)) return false;
+    qcs_fold_t f;
+    if (!qcs_fold_full(cs, UINT64_MAX, NULL, &f)) return false;
+    if (f.count < 1u || f.count > QIHSE_CONSENSUS_MAX_MEMBERS) return false;
+    memcpy(members, f.members, f.count * sizeof(*members));
+    memcpy(roles, f.roles, f.count);
+    memcpy(weights, f.weights, f.count * sizeof(uint16_t));
+    count = f.count;
     bool same = (count == cs->cfg.member_count);
     for (size_t i = 0; same && i < count; i++) {
-        same = qihse_uuid_equal(&cs->cfg.members[i], &members[i]);
+        same = qihse_uuid_equal(&cs->cfg.members[i], &members[i]) &&
+               cs->cfg.member_roles[i] == roles[i] &&
+               cs->cfg.member_weights[i] == weights[i];
     }
     if (same) return true;
     qcs_set_membership(cs, members, count);
+    memcpy(cs->cfg.member_roles, roles, count);
+    memcpy(cs->cfg.member_weights, weights, count * sizeof(uint16_t));
     return true;
 }
 
@@ -1378,6 +1580,12 @@ static bool qcs_sync_term_epoch(qihse_consensus_t* cs, uint64_t term,
 
 static void qcs_start_election(qihse_consensus_t* cs) {
     if (cs->self_index < 0) return; /* removed member: never campaigns */
+    /* W7: a LEARNER is replicated-to state, not a participant — it never
+     * campaigns (its quorum weight is zero; it could never win). */
+    if (cs->cfg.member_roles[cs->self_index] ==
+        (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+        return;
+    }
     uint64_t new_term = cs->term + 1u;
     uint64_t new_epoch = cs->epoch + 1u;
     if (new_epoch < new_term) new_epoch = new_term;
@@ -1490,28 +1698,40 @@ static void qcs_advance_commit(qihse_consensus_t* cs) {
     bool joint = qcs_fold_at_commit(cs, &jf) && jf.active;
     for (uint64_t n = qcs_abs_last_index(cs); n > cs->commit; n--) {
         if (qcs_term_at(cs, n) != cs->term) continue; /* current-term rule */
-        size_t acks = 0u;
-        size_t acks_old = 0u;
+        uint64_t ack_weight = 0u;   /* W7: acks weigh their member's vote */
+        uint64_t ack_weight_old = 0u;
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
             /* Self always vouches for its own log tail. */
             bool acked = ((int)i == cs->self_index)
                              ? true
                              : (cs->match_index[i] >= n);
             if (!acked) continue;
-            acks++;
+            uint16_t w = qcs_member_weight_at(cs, i);   /* learner: 0 */
+            ack_weight += w;
             if (joint) {
                 for (size_t k = 0; k < jf.old_count; k++) {
                     if (qihse_uuid_equal(&jf.old_members[k],
                                          &cs->cfg.members[i])) {
-                        acks_old++;
+                        uint16_t ow = jf.old_weights[k]
+                            ? jf.old_weights[k] : 1u;
+                        if (jf.old_roles[k] ==
+                            (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) ow = 0u;
+                        ack_weight_old += ow;
                         break;
                     }
                 }
             }
         }
-        bool ok = acks >= qcs_majority_needed(cs);
+        bool ok = ack_weight >= qcs_majority_weight(cs);
         if (joint) {
-            ok = ok && acks_old >= jf.old_count / 2u + 1u;
+            uint64_t old_total = 0u;
+            for (size_t k = 0; k < jf.old_count; k++) {
+                if (jf.old_roles[k] !=
+                    (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+                    old_total += jf.old_weights[k] ? jf.old_weights[k] : 1u;
+                }
+            }
+            ok = ok && ack_weight_old >= old_total / 2u + 1u;
         }
         if (ok) {
             uint64_t old = cs->commit;
@@ -1615,6 +1835,41 @@ static void qcs_try_compact(qihse_consensus_t* cs) {
 
 /* ── Open / close ────────────────────────────────────────────────────────── */
 
+/* W7: the baseline-membership digest — the fold baseline the record was
+ * CREATED with (members, roles, weights).  Persisted once at creation as
+ * a B line; compared at every open so a member list edited behind an
+ * existing record file's back is DETECTED and the open fails closed,
+ * instead of the fold silently rebasing onto state the log never saw.
+ * Pre-W7 record files carry no B line and skip the check (documented). */
+static uint64_t qcs_baseline_digest(const qihse_consensus_config_t* cfg) {
+    /* One RUNNING FNV-1a over count || (uuid||role||weight)* — order-
+     * sensitive and collision-uniform, chained inline because the module
+     * only exposes the fixed-basis qcs_fnv1a. */
+    uint64_t h = 0xCBF2CE48D222D25BULL; /* FNV-1a 64 offset basis */
+    uint8_t mc[8];
+    for (size_t b = 0; b < 8u; b++) {
+        mc[b] = (uint8_t)(((uint64_t)cfg->member_count >> (8u * b)) & 0xFFu);
+    }
+    for (size_t b = 0; b < sizeof(mc); b++) {
+        h ^= mc[b];
+        h *= 0x100000001B3ULL;
+    }
+    for (size_t i = 0; i < cfg->member_count; i++) {
+        uint8_t step[QIHSE_UUID_BYTES + 3u];
+        memcpy(step, cfg->members[i].bytes, QIHSE_UUID_BYTES);
+        step[QIHSE_UUID_BYTES] = cfg->member_roles[i];
+        step[QIHSE_UUID_BYTES + 1u] =
+            (uint8_t)(cfg->member_weights[i] & 0xFFu);
+        step[QIHSE_UUID_BYTES + 2u] =
+            (uint8_t)(cfg->member_weights[i] >> 8);
+        for (size_t b = 0; b < sizeof(step); b++) {
+            h ^= step[b];
+            h *= 0x100000001B3ULL;
+        }
+    }
+    return h;
+}
+
 qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
                                         void* transport,
                                         qihse_consensus_send_fn send) {
@@ -1675,6 +1930,9 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
     cs->base_count = cs->cfg.member_count;
     memcpy(cs->base_members, cs->cfg.members,
            cs->base_count * sizeof(qihse_uuid_t));
+    memcpy(cs->base_roles, cs->cfg.member_roles, cs->base_count);
+    memcpy(cs->base_weights, cs->cfg.member_weights,
+           cs->base_count * sizeof(uint16_t));
 
     cs->self_hash = qcs_fnv1a((const char*)cs->cfg.self.bytes, QIHSE_UUID_BYTES);
 
@@ -1702,6 +1960,14 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
     if (created) {
         int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "%s %u %s",
                          QCS_RECORD_MAGIC, QCS_RECORD_VERSION, cs->cfg.group_id);
+        if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP ||
+            !qcs_record_append(cs, (size_t)n)) {
+            qihse_consensus_close(cs);
+            return NULL;
+        }
+        /* W7: pin the creation baseline so later opens can detect drift. */
+        n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "B %llu",
+                     (unsigned long long)qcs_baseline_digest(&cs->cfg));
         if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP ||
             !qcs_record_append(cs, (size_t)n)) {
             qihse_consensus_close(cs);
@@ -1775,6 +2041,20 @@ static void qcs_handle_request_vote(qihse_consensus_t* cs,
                                     const qihse_consensus_msg_t* msg) {
     int from = qcs_member_index(cs, &msg->from);
     if (from < 0) { cs->counters.messages_ignored++; return; }
+    /* W7: a LEARNER holds replicated state but casts no vote — deny (and
+     * say so honestly rather than ignoring, so candidates converge fast
+     * on learners not being part of the electorate). */
+    if (cs->self_index >= 0 &&
+        cs->cfg.member_roles[cs->self_index] ==
+            (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+        qihse_consensus_msg_t deny;
+        memset(&deny, 0, sizeof(deny));
+        deny.type = QIHSE_CONSENSUS_MSG_VOTE_REPLY;
+        deny.to = msg->from;
+        deny.u.vote_reply.granted = false;
+        qcs_send(cs, &deny);
+        return;
+    }
 
     bool up_to_date =
         msg->u.vote.last_log_term > qcs_last_log_term(cs) ||
@@ -1821,27 +2101,47 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
     if (from < 0) { cs->counters.messages_ignored++; return; }
     cs->votes_granted_mask |= (uint32_t)1u << from;
 
-    uint32_t votes = 0;
-    for (uint32_t m = cs->votes_granted_mask; m; m >>= 1) votes += (m & 1u);
-    /* Joint-phase election: the candidate needs a dual majority —
-     * majority of the current fold AND majority of C_old (votes from
-     * members still in the config; propose_joint's survivor rule keeps
-     * that side reachable).  Same fold basis the commit rule uses. */
+    /* W7: votes weigh their member's vote weight (a learner's vote
+     * weighs nothing — and a learner never grants one, see the request
+     * handler; a witness counts like a voter). */
+    uint64_t vote_weight = 0u;
+    for (size_t i = 0; i < cs->cfg.member_count; i++) {
+        if (cs->votes_granted_mask & ((uint32_t)1u << i)) {
+            vote_weight += qcs_member_weight_at(cs, i);
+        }
+    }
+    /* Joint-phase election: the candidate needs a dual weighted majority
+     * — majority of the current fold's voting weight AND of C_old's —
+     * the same fold basis the commit rule uses. */
     qcs_fold_t jf;
     bool joint = qcs_fold_at_commit(cs, &jf) && jf.active;
-    bool win = (size_t)votes >= qcs_majority_needed(cs);
+    bool win = vote_weight >= qcs_majority_weight(cs);
     if (win && joint) {
-        size_t votes_old = 0;
+        uint64_t votes_old = 0u, old_total = 0u;
+        for (size_t k = 0; k < jf.old_count; k++) {
+            uint16_t ow = jf.old_weights[k] ? jf.old_weights[k] : 1u;
+            if (jf.old_roles[k] == (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+                ow = 0u;
+            }
+            old_total += ow;
+            if (!(cs->votes_granted_mask & ((uint32_t)1u << 0))) {
+                /* tallied below per member */
+            }
+        }
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
             if (!(cs->votes_granted_mask & ((uint32_t)1u << i))) continue;
             for (size_t k = 0; k < jf.old_count; k++) {
                 if (qihse_uuid_equal(&jf.old_members[k], &cs->cfg.members[i])) {
-                    votes_old++;
+                    uint16_t ow = jf.old_weights[k]
+                        ? jf.old_weights[k] : 1u;
+                    if (jf.old_roles[k] ==
+                        (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) ow = 0u;
+                    votes_old += ow;
                     break;
                 }
             }
         }
-        win = votes_old >= jf.old_count / 2u + 1u;
+        win = old_total > 0u && votes_old >= old_total / 2u + 1u;
     }
     if (win) {
         cs->role = QIHSE_CONSENSUS_LEADER;
@@ -2140,13 +2440,18 @@ static void qcs_handle_snapshot(qihse_consensus_t* cs,
      * state changes if its config sequence is illegal. */
     {
         qihse_uuid_t folded[QIHSE_CONSENSUS_MAX_MEMBERS];
+        uint8_t folded_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+        uint16_t folded_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
         size_t fcount = cs->base_count;
         memcpy(folded, cs->base_members, fcount * sizeof(*folded));
+        memcpy(folded_roles, cs->base_roles, fcount);
+        memcpy(folded_weights, cs->base_weights, fcount * sizeof(uint16_t));
         bool over = false;
         for (size_t i = 0; i < count && !over; i++) {
             const qihse_consensus_entry_t* e = &msg->u.snapshot.entries[i];
             if (e->type == QIHSE_CONSENSUS_ENTRY_DATA) continue;
-            qcs_fold_apply(folded, &fcount, e, &over);
+            qcs_fold_apply(folded, folded_roles, folded_weights, &fcount, e,
+                           &over);
         }
         if (over || fcount < 1u) {
             cs->counters.snapshot_rejections++;
@@ -2374,6 +2679,17 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
                                         const qihse_user_t* user,
                                         qihse_consensus_membership_op_t op,
                                         const qihse_uuid_t* member) {
+    /* W7: the plain form is a weight-1 VOTER transition. */
+    return qihse_consensus_propose_membership_role(
+        cs, user, op, member, QIHSE_CONSENSUS_ROLE_VOTER, 1u);
+}
+
+bool qihse_consensus_propose_membership_role(qihse_consensus_t* cs,
+                                             const qihse_user_t* user,
+                                             qihse_consensus_membership_op_t op,
+                                             const qihse_uuid_t* member,
+                                             qihse_consensus_member_role_t role,
+                                             uint16_t weight) {
     if (!cs) return false;
     if (cs->role != QIHSE_CONSENSUS_LEADER) {
         cs->counters.membership_proposals_refused++;
@@ -2390,6 +2706,13 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
     if (!member || qihse_uuid_is_nil(member) ||
         (op != QIHSE_CONSENSUS_MEMBER_ADD &&
          op != QIHSE_CONSENSUS_MEMBER_REMOVE)) {
+        cs->counters.membership_proposals_refused++;
+        return false;
+    }
+    /* W7: role/weight validation (only ADD consumes them). */
+    if (op == QIHSE_CONSENSUS_MEMBER_ADD &&
+        (role > QIHSE_CONSENSUS_ROLE_LEARNER ||
+         weight == 0u || weight > QIHSE_CONSENSUS_MAX_WEIGHT)) {
         cs->counters.membership_proposals_refused++;
         return false;
     }
@@ -2441,6 +2764,17 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
                  : QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE;
     memcpy(e.payload, member->bytes, QIHSE_UUID_BYTES);
     e.payload_len = QIHSE_UUID_BYTES;
+    if (op == QIHSE_CONSENSUS_MEMBER_ADD &&
+        (role != QIHSE_CONSENSUS_ROLE_VOTER || weight != 1u)) {
+        /* Carry the non-default role/weight in the entry (and thus in the
+         * LC record) only when they differ from the legacy default — old
+         * readers and old trajectories stay byte-identical. */
+        e.payload[QIHSE_UUID_BYTES] = (uint8_t)role;
+        e.payload[QIHSE_UUID_BYTES + 1u] = (uint8_t)(weight & 0xFFu);
+        e.payload[QIHSE_UUID_BYTES + 2u] = (uint8_t)(weight >> 8);
+        e.payload[QIHSE_UUID_BYTES + 3u] = 0u;
+        e.payload_len = QIHSE_UUID_BYTES + 4u;
+    }
     if (!qcs_fold_membership(cs, &e, folded, &fcount)) {
         cs->counters.membership_proposals_refused++;
         return false;
@@ -2797,6 +3131,11 @@ bool qihse_consensus_get_membership(const qihse_consensus_t* cs,
     out->member_count = cs->cfg.member_count;
     memcpy(out->members, cs->cfg.members,
            cs->cfg.member_count * sizeof(qihse_uuid_t));
+    memcpy(out->member_roles, cs->cfg.member_roles, cs->cfg.member_count);
+    memcpy(out->member_weights, cs->cfg.member_weights,
+           cs->cfg.member_count * sizeof(uint16_t));
+    out->voting_weight = qcs_voting_weight(cs);
+    out->majority_weight = qcs_majority_weight(cs);
     out->majority_needed = cs->cfg.member_count / 2u + 1u;
     out->last_config_index = qcs_last_config_index(cs);
     out->pending_config_index =
@@ -2824,15 +3163,18 @@ bool qihse_consensus_group_available(const qihse_consensus_t* cs, uint64_t now_m
     if (cs->self_index < 0) return false; /* removed from the config */
     uint64_t timeout = qcs_election_timeout_ms(cs, cs->term);
     if (cs->role == QIHSE_CONSENSUS_LEADER) {
-        size_t live = 1u; /* self */
+        /* W7: liveness is about QUORUM reachability, so learners (weight
+         * 0) are not live-membership evidence; their heartbeats are
+         * catch-up, not availability. */
+        uint64_t live_weight = qcs_member_weight_at(cs, (size_t)cs->self_index);
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
             if ((int)i == cs->self_index) continue;
             if (cs->last_ack_ms[i] != 0u &&
                 now_ms - cs->last_ack_ms[i] <= timeout) {
-                live++;
+                live_weight += qcs_member_weight_at(cs, i);
             }
         }
-        return live >= qcs_majority_needed(cs);
+        return live_weight >= qcs_majority_weight(cs);
     }
     if (cs->role == QIHSE_CONSENSUS_FOLLOWER && cs->has_leader) {
         return now_ms - cs->last_leader_contact_ms <= timeout;
