@@ -544,5 +544,7 @@ workload index-bytes-nonvector area=observability expect=pass timeout=120 \
     bin=tests/gold/workloads/gold_index_bytes \
     run="./tests/gold/workloads/gold_index_bytes"
 
-gap observability/backend-utilization area=observability \
-    reason="backend 'utilization' is DISPATCH SHARE (qihse_backend_queries_total), not busy time: engines are called synchronously and have no busy-time accounting. The ISA/compute reading of 'backend' (CPU/GPU/NPU) is not covered here — that dimension already has FABRIC.CAPS and the dist-planner surfaces."
+workload backend-busy-time area=observability expect=pass timeout=120 \
+    output="kv busy" \
+    bin=tests/gold/workloads/gold_backend_busy \
+    run="./tests/gold/workloads/gold_backend_busy"

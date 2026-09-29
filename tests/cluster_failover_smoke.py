@@ -22,6 +22,8 @@ Environment (all optional):
 import os
 import tempfile, shlex, socket, subprocess, sys, time
 
+def log(msg): print(msg, flush=True)
+
 PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
 BIN = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
 LIB_DIR = os.environ.get("QIHSE_LIB_DIR", ".")
@@ -136,8 +138,21 @@ def relaunch_cluster():
         time.sleep(8)
     else:
         _start_local(1, N1_HOST, PORT1, BUS1, "node1", join_extra)
-        time.sleep(3)
-    time.sleep(2)
+        # Wait until BOTH endpoints actually accept TCP: a fixed sleep
+        # races a loaded machine (the daemon binds seconds late under
+        # CPU contention) and the drill then fails at its first connect.
+        for addr in ((N0_HOST, PORT0), (N1_HOST, PORT1)):
+            for _ in range(80):           # up to 20 s each
+                try:
+                    s = socket.create_connection(addr, timeout=0.5)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.25)
+            else:
+                print(f"FAIL: daemon at {addr[0]}:{addr[1]} did not come up")
+                _teardown = True
+        time.sleep(2)
 
 
 def main():
@@ -151,23 +166,48 @@ def main():
     check("write on lead", (t, r) == ("+", "OK"), f"{t} {r}")
     time.sleep(1)
 
-    n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
-    n1.cmd("ASKING")
-    t, r = n1.cmd("GET", "redundant:k1")
+    # The redundancy replay is fire-and-forget: under CPU contention it
+    # lands seconds after the SET, so POLL for the duplicate rather than
+    # betting on a fixed sleep.
+    dup_ok = False
+    for _ in range(120):                  # up to 30 s (load-scaled)
+        n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
+        n1.cmd("ASKING")
+        t, r = n1.cmd("GET", "redundant:k1")
+        if (t, r) == ("$", "survives-lead-death"):
+            dup_ok = True
+            break
+        time.sleep(0.25)
     check("duplicate present on successor (ASKING local read)",
-          (t, r) == ("$", "survives-lead-death"), f"{t} {r}")
+          dup_ok, f"{t} {r}")
 
     lead = _daemons[0] if _daemons else None
     if lead is None or lead.poll() is not None:
-        print("FAIL: lead daemon is not running; cannot run the drill")
+        log("FAIL: lead daemon is not running; cannot run the drill")
         return 1
     lead.kill()
-    print(f"lead killed (SIGKILL, pid {lead.pid}).")
-    time.sleep(8)
+    log(f"lead killed (SIGKILL, pid {lead.pid}).")
+    # Settle by CONDITION, not a fixed sleep: wait until the successor
+    # reports itself owning the full ring (or 60 s under starvation).
+    for _ in range(240):
+        try:
+            s = socket.create_connection((N1_HOST, PORT1), timeout=1)
+            s.close()
+            break
+        except OSError:
+            time.sleep(0.25)
 
-    n1.fresh(); n1.cmd("AUTH", "GODMODE_OP", PW)
-    t, info = n1.cmd("CLUSTER", "INFO")
-    state = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+    # Failover must COMPLETE, not merely start: poll until the successor
+    # claims the full ring (or 60 s under starvation), then assert.
+    state = {}
+    for _ in range(240):
+        n1.fresh(); n1.cmd("AUTH", "GODMODE_OP", PW)
+        t, info = n1.cmd("CLUSTER", "INFO")
+        state = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+        if state.get("cluster_state") == "ok" and \
+           state.get("cluster_slots_assigned") == "16384":
+            break
+        time.sleep(0.25)
     check("successor cluster_state ok", state.get("cluster_state") == "ok", state.get("cluster_state"))
     check("successor owns all 16384 slots",
           state.get("cluster_slots_assigned") == "16384" and state.get("cluster_slots_ok") == "16384",
@@ -177,7 +217,7 @@ def main():
     t, r = n1.cmd("GET", "redundant:k1")
     check("duplicated key survives lead death", (t, r) == ("$", "survives-lead-death"), f"{t} {r}")
 
-    print(f"\nfailover drill: {sum(results)}/{len(results)} checks passed")
+    log(f"\nfailover drill: {sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
 if __name__ == "__main__":

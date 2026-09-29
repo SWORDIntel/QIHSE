@@ -189,6 +189,10 @@ typedef struct {
     qihse_metric_series_t* latency[QIHSE_QUERY_TYPE_COUNT];
     qihse_metric_series_t* backend_queries[QIHSE_ENGINE_BACKEND_COUNT];
     qihse_metric_series_t* backend_available[QIHSE_ENGINE_BACKEND_COUNT];
+    /* W7 gap closure: cumulative wall time each engine backend spent
+     * inside command dispatch — the busy-time counterpart of
+     * backend_queries_total (which is dispatch COUNT / share). */
+    qihse_metric_series_t* backend_busy[QIHSE_ENGINE_BACKEND_COUNT];
     /* Scrape-time status: cluster + replication. */
     qihse_metric_series_t* cluster_nodes_total;
     qihse_metric_series_t* cluster_nodes_healthy;
@@ -5691,6 +5695,14 @@ static void qihse_resp_telemetry_register(qihse_resp_server_t* server) {
             server->tlm.backend_queries[i] = qihse_metrics_series(reg, "qihse_backend_queries_total", backends[i]);
         }
     }
+    if (qihse_metrics_register_bounded(reg, "qihse_backend_busy_microseconds_total",
+                                       "Cumulative wall time spent inside command dispatch (microseconds), by engine backend",
+                                       METRIC_COUNTER, "backend",
+                                       backends, QIHSE_ENGINE_BACKEND_COUNT) == 0) {
+        for (size_t i = 0; i < QIHSE_ENGINE_BACKEND_COUNT; i++) {
+            server->tlm.backend_busy[i] = qihse_metrics_series(reg, "qihse_backend_busy_microseconds_total", backends[i]);
+        }
+    }
     if (qihse_metrics_register_bounded(reg, "qihse_backend_available",
                                        "Engine backend configured and usable on this node (1/0)",
                                        METRIC_GAUGE, "backend",
@@ -10435,6 +10447,13 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     if (server->tlm.queries[type]) qihse_metrics_series_increment(server->tlm.queries[type], 1u);
     qihse_engine_backend_t backend = qihse_resp_backend_for_type(type);
     if (server->tlm.backend_queries[backend]) qihse_metrics_series_increment(server->tlm.backend_queries[backend], 1u);
+    if (server->tlm.backend_busy[backend]) {
+        /* Atomic u64 in MICROseconds (the counter's own unit): sub-ms
+         * commands still move it, and the name says exactly what it is. */
+        qihse_metrics_series_increment(
+            server->tlm.backend_busy[backend],
+            (uint64_t)(seconds * 1000000.0));
+    }
     if (server->tlm.latency[type]) qihse_metrics_series_observe(server->tlm.latency[type], seconds);
     return ok;
 }
