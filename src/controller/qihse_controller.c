@@ -9,6 +9,7 @@
  */
 
 #include "qihse_controller.h"
+#include "qihse_qkp.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -34,13 +35,23 @@ struct qihse_controller {
     uint8_t* buf;       /* receive buffer, CTRL_RX_CAP bytes */
     size_t fill;
     bool dead;          /* transport failure — caller should reconnect */
+    qihse_qkp_session_t* qkp;   /* non-NULL → sealed transport */
 };
 
 /* ── Buffered reader ────────────────────────────────────────────────── */
 
 static bool ctrl_recv_more(qihse_controller_t* c) {
     if (c->fill >= CTRL_RX_CAP) return false;   /* no CRLF in a full buffer */
-    ssize_t n = recv(c->fd, c->buf + c->fill, CTRL_RX_CAP - c->fill, 0);
+    ssize_t n;
+    if (c->qkp) {
+        /* One sealed frame per call; plaintext payloads are bounded by
+         * QIHSE_QKP_MAX_PAYLOAD, well under the receive buffer.  -2 is a
+         * crypto/replay refusal: the stream is dead either way. */
+        n = qihse_qkp_recv_sealed(c->qkp, c->fd,
+                                  c->buf + c->fill, CTRL_RX_CAP - c->fill);
+    } else {
+        n = recv(c->fd, c->buf + c->fill, CTRL_RX_CAP - c->fill, 0);
+    }
     if (n <= 0) { c->dead = true; return false; }
     c->fill += (size_t)n;
     return true;
@@ -172,6 +183,15 @@ static qihse_ctrl_reply_t* ctrl_parse_reply(qihse_controller_t* c, unsigned dept
 /* ── Command path ───────────────────────────────────────────────────── */
 
 static bool ctrl_send_all(qihse_controller_t* c, const uint8_t* p, size_t len) {
+    if (c->qkp) {
+        /* Chunking is the seal layer's job; a partial send is an
+         * unrecoverable stream (documented partial-write policy). */
+        if (!qihse_qkp_send_sealed(c->qkp, c->fd, p, len)) {
+            c->dead = true;
+            return false;
+        }
+        return true;
+    }
     while (len) {
         ssize_t n = send(c->fd, p, len, 0);
         if (n <= 0) { c->dead = true; return false; }
@@ -269,6 +289,35 @@ qihse_controller_t* qihse_controller_connect(const qihse_controller_config_t* co
     (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    if (config->qkp_identity_dir && config->qkp_identity_dir[0]) {
+        char dsa_key[512];
+        snprintf(dsa_key, sizeof(dsa_key), "%s/%s",
+                 config->qkp_identity_dir, "qihse_dsa_key.pem");
+        char node_id[96];
+        if (config->qkp_node_id && *config->qkp_node_id) {
+            snprintf(node_id, sizeof(node_id), "%s", config->qkp_node_id);
+        } else {
+            snprintf(node_id, sizeof(node_id), "ctrl@%s:%u",
+                     config->host, (unsigned)config->port);
+        }
+        qihse_qkp_config_t qcfg;
+        memset(&qcfg, 0, sizeof(qcfg));
+        qcfg.dsa_key_path = dsa_key;
+        qcfg.kem_key_path = NULL;           /* client role: sign only */
+        qcfg.kem_pub_path = NULL;
+        qcfg.trusted_pubs = config->qkp_trusted_pubs;
+        qcfg.trusted_count = config->qkp_trusted_count;
+        qcfg.node_id = node_id;
+        qcfg.require = true;                /* never downgrade to cleartext */
+        qihse_qkp_session_t* s = NULL;
+        if (qihse_qkp_client_negotiate(c->fd, &qcfg, &s) != QIHSE_QKP_SECURE ||
+            !s) {
+            qihse_controller_destroy(c);    /* sealed connect refused */
+            return NULL;
+        }
+        c->qkp = s;
+    }
+
     if (config->username) {
         const char* auth[3] = { "AUTH", config->username,
                                 config->password ? config->password : "" };
@@ -282,6 +331,7 @@ qihse_controller_t* qihse_controller_connect(const qihse_controller_config_t* co
 
 void qihse_controller_destroy(qihse_controller_t* ctrl) {
     if (!ctrl) return;
+    if (ctrl->qkp) qihse_qkp_session_free(ctrl->qkp);
     if (ctrl->fd >= 0) close(ctrl->fd);
     free(ctrl->buf);
     free(ctrl);
