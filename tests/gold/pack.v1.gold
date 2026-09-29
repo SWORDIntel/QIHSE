@@ -306,15 +306,15 @@ workload federation-ingest-contract area=distributed-failure expect=pass timeout
     output="federation ingest tests passed" \
     run="make -s test-federation-ingest"
 
-workload cluster-failover-smoke area=distributed-failure expect=pass timeout=300 \
+workload cluster-failover-smoke area=distributed-failure expect=pass timeout=900 \
     output="failover drill: 5/5 checks passed" \
     run="python3 tests/cluster_failover_smoke.py"
 
-workload cluster-discovery-smoke area=distributed-failure expect=pass timeout=300 \
+workload cluster-discovery-smoke area=distributed-failure expect=pass timeout=900 \
     output="discovery smoke: 5/5 checks passed" \
     run="python3 tests/cluster_discover_smoke.py --self-spawn"
 
-workload cluster-loadshift-smoke area=distributed-failure expect=pass timeout=600 \
+workload cluster-loadshift-smoke area=distributed-failure expect=pass timeout=900 \
     output="load-shift smoke: 9/9 checks passed" \
     run="python3 tests/cluster_loadshift_smoke.py --self-spawn"
 

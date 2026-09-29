@@ -21,6 +21,7 @@ Environment (all optional):
 """
 import os
 import tempfile, shlex, socket, subprocess, sys, time
+import atexit, signal
 
 def log(msg): print(msg, flush=True)
 
@@ -106,6 +107,17 @@ def _start_remote(index, host, port, bus_port, data_sub, extra):
     subprocess.run(["ssh", "-o", "BatchMode=yes", SSH_TARGET, remote],
                    capture_output=True)
 
+
+def _kill_own_daemons():
+    for p in _daemons:
+        if p.poll() is None:
+            p.kill()
+    for p in _daemons:
+        p.wait()
+
+atexit.register(_kill_own_daemons)
+for _sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(_sig, lambda s, f: (sys.exit(1)))
 
 def relaunch_cluster():
     """The drill is destructive (SIGKILLs the lead): relaunch both nodes."""

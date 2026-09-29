@@ -13,6 +13,7 @@ Two modes:
 Run twice-safe: previous leftovers are re-collected by the next MOVESLOTS.
 """
 import os, socket, subprocess, sys, time
+import atexit, signal
 
 # Hosts/ports/password are overridable (defaults are the t420/T320 lab pair).
 PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
@@ -72,6 +73,11 @@ def set_follow(c, key, value, password=PW, hops=3):
 _SELF_SPAWN = "--self-spawn" in sys.argv
 _daemons = []
 
+def _register_teardown():
+    atexit.register(_teardown_hermetic)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: (sys.exit(1)))
+
 def _spawn_hermetic():
     bin_path = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
     lib = os.environ.get("QIHSE_LIB_DIR", ".")
@@ -105,6 +111,7 @@ def _spawn_hermetic():
     _daemons.append(joiner)
 
 def _teardown_hermetic():
+    # leak-proof: a killed drill (pack timeout) still tears its daemons down
     for p in _daemons:
         if p.poll() is None:
             p.kill()
@@ -113,8 +120,39 @@ def _teardown_hermetic():
 
 def main():
     if _SELF_SPAWN:
+        _register_teardown()
         _spawn_hermetic()
-        time.sleep(8)   # discovery + heartbeat health window
+        # MOVESLOTS validates the target is a known cluster node: wait
+        # until the SEED lists the joiner in CLUSTER NODES (membership
+        # gossip), not a fixed sleep.
+        for _ in range(240):
+            try:
+                c0 = C(N0); c0.cmd("AUTH", "GODMODE_OP", PW)
+                t, nodes = c0.cmd("CLUSTER", "NODES")
+                if N1_EP in nodes:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        # By-condition readiness: wait until BOTH endpoints accept TCP AND
+        # the joiner has discovered the seed (its CLUSTER NODES lists it),
+        # instead of a fixed sleep that races a loaded machine.
+        for _ in range(240):                   # up to 60 s
+            ready = True
+            for addr in (N0, N1):
+                try:
+                    s = socket.create_connection(addr, timeout=0.5); s.close()
+                except OSError:
+                    ready = False
+            if ready:
+                try:
+                    c = C(N1)
+                    t, nodes = c.cmd("CLUSTER", "NODES")
+                    if N0_EP in nodes:
+                        break
+                except OSError:
+                    pass
+            time.sleep(0.25)
     results = []
     def check(name, cond, detail=""):
         results.append(cond); print(f"{'PASS' if cond else 'FAIL'}: {name} {detail}")

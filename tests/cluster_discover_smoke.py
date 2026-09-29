@@ -13,6 +13,7 @@ Two modes:
                checks, tear everything down. No live fleet is touched.
 """
 import os, socket, subprocess, sys, time
+import atexit, signal
 
 # Hosts/ports/password are overridable (defaults are the t420/T320 lab pair).
 NODE0 = (os.environ.get("QIHSE_NODE0_HOST", "192.168.1.91"),
@@ -52,6 +53,11 @@ class C:
 _SELF_SPAWN = "--self-spawn" in sys.argv
 _daemons = []
 
+def _register_teardown():
+    atexit.register(_teardown_hermetic)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: (sys.exit(1)))
+
 def _spawn_hermetic():
     """Seed owns the full ring; the joiner knows only the seed's bus."""
     bin_path = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
@@ -87,6 +93,7 @@ def _spawn_hermetic():
     _daemons.append(joiner)
 
 def _teardown_hermetic():
+    # leak-proof: a killed drill (pack timeout) still tears its daemons down
     for p in _daemons:
         if p.poll() is None:
             p.kill()
@@ -95,6 +102,7 @@ def _teardown_hermetic():
 
 def main():
     if _SELF_SPAWN:
+        _register_teardown()
         _spawn_hermetic()
         time.sleep(8)   # heartbeat health window + discovery
     results = []
