@@ -1442,6 +1442,28 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
     char* value = r.value; r.value = NULL; lookup_result_free(&r); return value;
 }
 
+bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
+                        qihse_user_t* user, qihse_kv_record_meta_t* out) {
+    if (!store || !key || !out) return false;
+    memset(out, 0, sizeof(*out));
+    /* Same lookup and same authorization gate as the value path; the value
+     * is materialized by the lookup and freed here without ever leaving
+     * this function.  Miss/expired/not-cleared all return false and are
+     * deliberately indistinguishable (no classification oracle). */
+    kv_lookup_result_t r;
+    kv_lookup_state_t state = logical_lookup(store, key, &r);
+    bool ok = state == KV_LOOKUP_LIVE &&
+              qihse_auth_can_access(user, r.classification, r.sci_compartment);
+    if (ok) {
+        out->classification = r.classification;
+        out->sci_compartment = r.sci_compartment;
+        out->expire_time_ms = r.expire_time_ms;
+        out->flags = r.flags;
+    }
+    lookup_result_free(&r);
+    return ok;
+}
+
 bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     char* v = qihse_kv_get_user(store, key, user); if (!v) return false; free(v); return true;
 }

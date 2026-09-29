@@ -24,6 +24,23 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
                        qihse_user_t* user);
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
+
+/* Metadata-only lookup (W7 introspection): reports a live record's
+ * classification, SCI compartment, expiry and WAL flags WITHOUT ever
+ * returning the value.  The authorization gate is IDENTICAL to
+ * qihse_kv_get_user — a principal that could not read the record cannot
+ * read its metadata either (a record's classification is itself
+ * classified-adjacent information).  Returns false for miss, expired, or
+ * not-cleared, which are deliberately indistinguishable. */
+typedef struct {
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t expire_time_ms;   /* 0 = no expiry */
+    uint8_t  flags;            /* WAL record flags (tombstone bit etc.) */
+} qihse_kv_record_meta_t;
+
+bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
+                        qihse_user_t* user, qihse_kv_record_meta_t* out);
 static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_get_user(store, key, NULL);
 }
