@@ -133,3 +133,4 @@ lib/
 # vendored tree-sitter build artifacts
 vendor/tree-sitter/lib/src/lib.d
 vendor/tree-sitter/lib/src/*.o
+browser-credentials.json
