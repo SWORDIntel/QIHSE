@@ -1254,6 +1254,26 @@ Protocol changes in the same round:
 - **Lease wire TTL contract**: FEDERATION LEASE.ACQUIRE/RENEW take a TTL in ms from the server's now (default `QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS`, 60s); the server stores the absolute expiry. The core APIs remain absolute.
 - **Audit fork safety**: `pthread_atfork` handlers fence the audit signer around fork and restart it in the child — a forked process no longer inherits frozen audit mutexes.
 
+## 11b. W7 CITADEL-substrate round — new public APIs
+
+Every row carries its own tests, wired into the `make test` aggregate and
+the gold pack (`make test-gold`).
+
+| API | Header / Module | What it does | Test |
+|---|---|---|---|
+| `qihse_consensus_member_role_t` + weights, `qihse_consensus_propose_membership_role()` | `qihse_consensus.h` | VOTER/WITNESS/LEARNER roles and per-member u16 voter weights; weighted-majority quorum in commit, elections and liveness; a learner weighs 0, never campaigns, never grants votes. Zero-filled arrays = weight-1 voters, so every pre-W7 config/record decodes unchanged. | `make test-consensus` (roles/learner/witness suites) |
+| Baseline-drift fail-closed (`B` record line) | `qihse_consensus.c` | Record creation pins a digest of the baseline membership (members/roles/weights); an open() with a drifted baseline refuses before any log replays. Pre-W7 files carry no B line and are tolerated. | `make test-consensus` (`test_baseline_drift`) |
+| `qihse_federation_snapshot_xfer_*` (QSX1) | `qihse_federation_snapshot_xfer.h` | Chunked, resumable transfer of a sealed backup-container v3 over the verified replication transport; per-chunk CRC, atomic resume sidecar, container-signature authority. | `make test-snapshot-xfer` |
+| `QIHSE_FEDERATION_MUTATION_TOMBSTONE` + `qihse_federation_journal_append_tombstone()` | `qihse_federation.h` | Delete events in the F2 journal envelope (reserved flags bit — no on-disk format change); generation-gated so deletes order against upserts. | `make test-federation-ingest` |
+| `qihse_federation_ingest_*` | `qihse_federation_ingest.h` | The §5.2 consumer contract: `boot(C)` exact-cursor snapshot handshake, snapshot-seeded generation gates, event-id dedup ring, tombstone lifecycle reset, at-least-once/idempotent apply, fail-closed checkpoints. | `make test-federation-ingest` |
+| Controller QKP config (`qkp_*` fields) | `qihse_controller.h` | The C controller performs the CNSA 2.0 handshake at connect and runs sealed frames on both I/O paths — cleartext is never used; a failed handshake fails the connect. | `make test-controller-qkp` |
+| `Controller(qkp_identity_dir=…)` / `python/qihse/qkp.py` | `python/qihse/controller.py` | Python SDK over QKP1: ctypes bindings drive the library handshake on the caller's fd (the library is the only crypto); sealed-socket shim keeps the bounded parser unchanged. | `make test-controller-qkp` (Python 3/3) |
+| `INTROSPECTION.QKP / .BUS / .CRL / .RECORD.META` | RESP engine | System-domain-gated operator observability: QKP rollout counters, bus traffic counters incl. signed-ops verdicts, CRL snapshot state, and per-record classification/SCI/expiry/flags via a metadata-only KV getter with the IDENTICAL clearance gate as value reads (miss/expired/not-cleared indistinguishable — no classification oracle). | `make test-browser` (36 checks) |
+| `qihse_kv_meta_user()` + `qihse_kv_record_meta_t` | `qihse_kv_store.h` | The metadata-only getter behind RECORD.META. | `make test-browser` |
+| `KEYSTONE.FEED.OPEN [prefix] [cursor]` | RESP engine | The §5.1 snapshot-bootstrap handshake in one round trip; the cursor is an END-of-record position from STATUS/ACK (positional grammar — a lone cursor argument would be read as a prefix filter). | `make test-keystone-feed-wire` |
+| `Controller.keystone_feed_open()` → `KeystoneFeed`/`FeedEvent`/`FeedStatus` | `python/qihse/controller.py` | Typed Python access to the 16-field §4 change-feed envelope with ack/resume/status. | `make test-keystone-feed-wire` (15 checks) |
+| `./qihse browse` (operator browser) | `python/qihse/browser/` + `dashboard/` | Web dashboard + loopback bridge: operator-context default (no login wall, FIDO-touch-gated actions) or per-principal 2FA mode; records census, cluster/federation views, guarded action allowlist; `--dump` headless mode; `--qkp-*` sealed transport. | `make test-browser` + `make test-browser-unit` |
+
 ## 12. Known gaps and unverified areas
 
 Stated plainly rather than omitted:

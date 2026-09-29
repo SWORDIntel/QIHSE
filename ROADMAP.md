@@ -1,13 +1,13 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-09-25
+**Status date:** 2026-09-29
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
 ---
 
-## 1. Where we are now (verified against the working tree, 2026-09-25)
+## 1. Where we are now (verified against the working tree, 2026-09-29)
 
 ### 1.1 Landed and committed
 
@@ -55,10 +55,21 @@ This work was sitting outside git; it is now committed with tests and CI wiring 
 | Direction | Design doc | Status |
 |---|---|---|
 | **Phase 10 — Federation data plane** (stages F0–F8, 28 acceptance criteria) | [federation upgrade plan](docs/plans/qihse_federation_upgrade_plan.md) | `[x]` F0–F8, the post-F8 follow-ups, the 2026-09-24 batch (§W1, §1.4: scoped consensus, backup-writer authentication, controller SDKs, CA provisioning), and the two 2026-09-25 waves (§W1, §1.4: node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export) landed; no tracked unbuilt items remain — the plan stays design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing) — these are now tracked with CITADEL-derived priorities as workstream W7 (§3) |
-| AI compute fabric | [ai_fabric.md](docs/architecture/ai_fabric.md) | `[x]` items 1–5 implemented (embedding-backed semantic recall is the follow-up) |
+| AI compute fabric | [ai_fabric.md](docs/architecture/ai_fabric.md) | `[x]` items 1–5 implemented, including embedding-backed semantic recall and remote job dispatch |
 | Cluster brain | [cluster_brain.md](docs/architecture/cluster_brain.md) | `[~]` observe + actuation (R1–R6) landed; federation-journal migration open |
 | Overlay protocol | [overlay_protocol.md](docs/architecture/overlay_protocol.md) | `[~]` phase 1 landed; DHT (phase 2) sequenced after F5 |
-| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[~]` partly landed (telemetry, security); optimizer governance and gold validation suite open |
+| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[x]` gold validation suite: 67/67 workloads, 9/11 areas FULL (see §W5.3/§W7); the 3 remaining gaps are recorded non-CI surfaces |
+
+### 1.5 Landed 2026-09-29 — the W6 browser + W7 CITADEL-substrate wave (committed 4453b6..)
+
+The operator browser (W6) and the full W7 CITADEL substrate program — 12 of 12
+items: joint consensus (verified already-landed), QSX1 snapshot transfer,
+journal tombstones + the ingest contract, QKP-sealed external clients,
+KEYSTONE feed wire handshake + typed SDK access, `INTROSPECTION.*`, member
+roles/weights/learners, fabric+DHT and semantic recall and brain-journal
+migration (verified landed by the parallel waves), baseline-drift fail-closed,
+and the gold-pack extension (7 W7 workloads + the real-peer failover drill in
+CI — 67/67 pass, 9/11 areas FULL). Item-by-item with evidence in §3 W6/W7.
 
 ### 1.4 Landed 2026-09-24/25 (in flight — working tree, not yet committed)
 
