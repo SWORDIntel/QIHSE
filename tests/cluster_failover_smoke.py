@@ -19,12 +19,14 @@ Environment (all optional):
     QIHSE_SSH_TARGET        ssh target for node1 (default empty = run locally)
     QIHSE_CLUSTER_PASSWORD  operator password  (default lab password)
 """
-import os, shlex, socket, subprocess, sys, time
+import os
+import tempfile, shlex, socket, subprocess, sys, time
 
 PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
 BIN = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
 LIB_DIR = os.environ.get("QIHSE_LIB_DIR", ".")
-DATA_DIR = os.environ.get("QIHSE_DATA_DIR", "./build/cluster-smoke")
+DATA_DIR = os.environ.get("QIHSE_DATA_DIR") or tempfile.mkdtemp(
+    prefix="cluster-failover-", dir="./build")
 N0_HOST = os.environ.get("QIHSE_NODE0_HOST", "127.0.0.1")
 N1_HOST = os.environ.get("QIHSE_NODE1_HOST", N0_HOST)
 SSH_TARGET = os.environ.get("QIHSE_SSH_TARGET", "")
@@ -109,6 +111,17 @@ def relaunch_cluster():
         if p.poll() is None:
             p.kill()
     _daemons.clear()
+    # A leaked daemon from an aborted earlier run would hold our ports and
+    # the new lead would die at bind. Clear loopback stalemates for OUR
+    # exact ports only (the live fleet binds different addresses).
+    # Bind+port: matches only loopback drill daemons — the live fleet
+    # binds its LAN addresses, never this pattern.
+    subprocess.run(["pkill", "-9", "-f",
+                    f"cluster-daemon.*--bind 127.0.0.1 --port {PORT0}"],
+                   capture_output=True)
+    subprocess.run(["pkill", "-9", "-f",
+                    f"cluster-daemon.*--bind 127.0.0.1 --port {PORT1}"],
+                   capture_output=True)
     if SSH_TARGET:
         subprocess.run(["ssh", "-o", "BatchMode=yes", SSH_TARGET,
                         "pkill -9 qihse-cluster-d"], capture_output=True)

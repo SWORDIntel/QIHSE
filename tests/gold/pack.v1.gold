@@ -191,8 +191,11 @@ workload resp-hybrid-fusion area=fts-vector-fusion expect=pass timeout=300 \
     ref="src/spinnaker/qihse_resp_engine.c" \
     run="make -s test-resp-hybrid"
 
-gap fts-vector-fusion/recall-latency-gate area=fts-vector-fusion \
-    reason="the fused path is now driven over RESP (VECHYBRID) and verified end to end including the invariant-3 negative test; what remains uncovered is a recall/latency gate for the fused ranking — a scored benchmark workload, not a correctness path"
+workload fusion-recall-gate area=fts-vector-fusion expect=pass timeout=300 \
+    output="recall " \
+    bin=tests/gold/workloads/gold_fusion_recall \
+    run="./tests/gold/workloads/gold_fusion_recall"
+
 
 # ----------------------------------------------------------------------------
 # 5. Persistence / recovery
@@ -307,8 +310,13 @@ workload cluster-failover-smoke area=distributed-failure expect=pass timeout=300
     output="failover drill: 5/5 checks passed" \
     run="python3 tests/cluster_failover_smoke.py"
 
-gap distributed-failure/live-fleet-drills area=distributed-failure \
-    reason="the failover drill now runs in CI and kills a REAL spawned peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive); what remains outside the pack are the cross-machine discovery/loadshift drills, whose defaults target the live physical fleet (t420/T320) and are live-fleet validation, not hermetic CI — running them here would couple the verdict to machines being up"
+workload cluster-discovery-smoke area=distributed-failure expect=pass timeout=300 \
+    output="discovery smoke: 5/5 checks passed" \
+    run="python3 tests/cluster_discover_smoke.py --self-spawn"
+
+workload cluster-loadshift-smoke area=distributed-failure expect=pass timeout=600 \
+    output="load-shift smoke: 9/9 checks passed" \
+    run="python3 tests/cluster_loadshift_smoke.py --self-spawn"
 
 # ----------------------------------------------------------------------------
 # 8. Security regressions
@@ -531,8 +539,10 @@ workload telemetry-w52 area=observability expect=pass timeout=300 \
     output="test_metrics_w52_telemetry: all assertions passed" \
     run="make -s test-metrics-w52"
 
-gap observability/index-bytes-nonvector area=observability \
-    reason="qihse_index_bytes{index=\"hnsw\"} ships: qihse_hnsw_index_bytes counts layer/link/anchor topology and the vector db surfaces it through qihse_vector_db_index_bytes, sampled at scrape via METRICS.RENDER (asserted by resp-hybrid-fusion).  The remaining gap is the OTHER index types — the hash index reports entry count and the index manager count/ncols, but no byte accounting — and no RESP handle exists to sample them.  Recorded rather than fabricated."
+workload index-bytes-nonvector area=observability expect=pass timeout=120 \
+    output="hash index bytes" \
+    bin=tests/gold/workloads/gold_index_bytes \
+    run="./tests/gold/workloads/gold_index_bytes"
 
 gap observability/backend-utilization area=observability \
     reason="backend 'utilization' is DISPATCH SHARE (qihse_backend_queries_total), not busy time: engines are called synchronously and have no busy-time accounting. The ISA/compute reading of 'backend' (CPU/GPU/NPU) is not covered here — that dimension already has FABRIC.CAPS and the dist-planner surfaces."
