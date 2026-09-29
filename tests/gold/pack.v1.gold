@@ -291,8 +291,24 @@ workload federation-rejoin area=distributed-failure expect=pass timeout=600 \
     output="federation rejoin tests passed" \
     run="make -s test-federation-rejoin"
 
-gap distributed-failure/multi-process-cluster area=distributed-failure \
-    reason="failure scenarios run through the deterministic in-process simulator over the real F1-F7 entry points; the multi-process smoke scripts (tests/cluster_*_smoke.py) need a running cluster daemon and are not part of make test-gold, so no workload here kills a real peer process"
+workload consensus-membership area=distributed-failure expect=pass timeout=600 \
+    output="all consensus tests passed" \
+    run="make -s test-consensus"
+
+workload snapshot-transfer area=distributed-failure expect=pass timeout=300 \
+    output="snapshot transfer tests passed" \
+    run="make -s test-snapshot-xfer"
+
+workload federation-ingest-contract area=distributed-failure expect=pass timeout=300 \
+    output="federation ingest tests passed" \
+    run="make -s test-federation-ingest"
+
+workload cluster-failover-smoke area=distributed-failure expect=pass timeout=300 \
+    output="failover drill: 5/5 checks passed" \
+    run="python3 tests/cluster_failover_smoke.py"
+
+gap distributed-failure/live-fleet-drills area=distributed-failure \
+    reason="the failover drill now runs in CI and kills a REAL spawned peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive); what remains outside the pack are the cross-machine discovery/loadshift drills, whose defaults target the live physical fleet (t420/T320) and are live-fleet validation, not hermetic CI — running them here would couple the verdict to machines being up"
 
 # ----------------------------------------------------------------------------
 # 8. Security regressions
@@ -332,6 +348,18 @@ workload tenant-security-regression area=security-regressions expect=pass timeou
 workload tenant-privilege-ladder area=security-regressions expect=pass timeout=300 \
     output="test_tenant_privilege_ladder: all assertions passed" \
     run="make -s -f Makefile -f tests/security-regression.mk test-tenant-privilege-ladder"
+
+workload browser-negative-auth area=security-regressions expect=pass timeout=300 \
+    output="browser negative-auth (fixture + bridge asserts)" \
+    run="make -s test-browser"
+
+workload controller-qkp-identity area=security-regressions expect=pass timeout=600 \
+    output="controller QKP tests passed" \
+    run="make -s test-controller-qkp"
+
+workload keystone-feed-wire area=security-regressions expect=pass timeout=300 \
+    output="keystone feed wire (fixture + SDK asserts)" \
+    run="make -s test-keystone-feed-wire"
 
 workload sci-compartment-regression area=security-regressions expect=pass timeout=300 \
     output="test_sci_compartment_regression: all assertions passed" \
