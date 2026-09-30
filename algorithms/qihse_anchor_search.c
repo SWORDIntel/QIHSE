@@ -867,7 +867,29 @@ not_stisla_result_t not_stisla_search(const int64_t* arr, size_t n, int64_t key,
     }
 #endif
 
-    const size_t result = not_stisla_local_search(arr, lo, hi, key);
+    const size_t probed = not_stisla_local_search(arr, lo, hi, key);
+    size_t result = probed;
+
+    /* Correctness fallback: a single interpolation probe with a +/- tol
+     * window only guarantees a hit when values are smoothly distributed
+     * between the bounding anchors. Uniformly distributed keys (e.g. FNV
+     * string hashes) routinely land outside the window. The bracket
+     * [l->i, r->i] provably contains the key if it is present (arr is
+     * sorted, l->v <= key <= r->v), so finish misses with binary search. */
+    if (result == NOT_STISLA_NOT_FOUND) {
+        size_t blo = l->i, bhi = r->i;
+        while (blo < bhi) {
+            const size_t mid = blo + (bhi - blo) / 2;
+            if (arr[mid] < key) {
+                blo = mid + 1;
+            } else {
+                bhi = mid;
+            }
+        }
+        if (arr[blo] == key) {
+            result = blo;
+        }
+    }
 
     /* Step 4: Enhanced learning with usage tracking */
     if (result != NOT_STISLA_NOT_FOUND && table) {
