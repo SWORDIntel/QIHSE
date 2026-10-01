@@ -104,6 +104,13 @@ qihse_index_t* qihse_index_manager_find(const qihse_index_manager_t* mgr,
 bool qihse_index_manager_drop(qihse_index_manager_t* mgr, const char* name);
 size_t qihse_index_manager_count(const qihse_index_manager_t* mgr);
 
+/** Total byte footprint of every managed index (hash slot tables today,
+ * via qihse_hash_index_bytes; secondary B+ indexes contribute when they
+ * grow byte accounting).  Absent manager reports 0.  Closes the
+ * observability gap "index-bytes-nonvector": the byte accounting exists
+ * and is summable, sampled by tests/gold via the C API. */
+size_t qihse_index_manager_bytes(const qihse_index_manager_t* mgr);
+
 /* ---- Index operations ---- */
 
 /** Inserts a row into all indexes managed by this manager (synchronous). */

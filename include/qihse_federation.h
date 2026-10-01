@@ -320,6 +320,27 @@ uint64_t qihse_federation_journal_replay_window(qihse_federation_journal_t* jour
 /* Current journal length (offset of the next append). */
 uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal);
 
+/* ── Tombstones (W7: KEYSTONE live-ingestion contract, brief §5.2) ─────── */
+
+/* Mutation flag: this event DELETES resource_id at the carried generation.
+ * The flag rides the envelope's reserved `flags` field, so the on-disk
+ * record format is unchanged — pre-tombstone segments decode with the bit
+ * clear and old readers simply see an ordinary event. */
+#define QIHSE_FEDERATION_MUTATION_TOMBSTONE 0x00000001u
+
+bool qihse_federation_event_is_tombstone(const qihse_federation_event_t* event);
+
+/* Append a tombstone: event_type "object.delete", no payload, and the
+ * mutation's expected_generation carries the generation being deleted
+ * (consumers gate on it exactly as for upserts — a delete with a stale
+ * generation is refused, not applied).  Every other envelope rule of
+ * qihse_federation_journal_append() applies unchanged. */
+uint64_t qihse_federation_journal_append_tombstone(
+    qihse_federation_journal_t* journal,
+    const qihse_federation_mutation_t* mutation,
+    const char* resource_id,
+    qihse_federation_event_t* out_event);
+
 /* ── Resumable watches (plan §13) ───────────────────────────────────────── */
 
 typedef struct qihse_federation_watch qihse_federation_watch_t;

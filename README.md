@@ -295,6 +295,7 @@ Docs map — every document an operator, developer, or agent needs:
 | Read the deepest technical treatment | [Technical Whitepaper v1.1](docs/architecture/qihse_whitepaper_v1.1.md) |
 | See what is being built and in what order | [Roadmap](ROADMAP.md) |
 | Read the federation design of record (landed; residual boundaries documented) | [Federation Upgrade Plan](docs/plans/qihse_federation_upgrade_plan.md) |
+| Operate a running cluster from the browser (fleet, slots, federation, records census, touch-gated actions) | [Operator Browser](docs/architecture/qihse_browser.md) + runbook |
 
 The full documentation index is **[`docs/README.md`](docs/README.md)**.
 

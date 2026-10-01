@@ -317,6 +317,28 @@ extern "C" {
 
 #define QIHSE_CONSENSUS_GROUP_ID_MAX 63u
 #define QIHSE_CONSENSUS_MAX_MEMBERS 32u
+/* W7 item 7 — HA posture: roles and voter weights.
+ *
+ * Roles ride the membership arrays in parallel (0-filled arrays = every
+ * member a weight-1 VOTER, so pre-existing configs and record files are
+ * unchanged).  A LEARNER is replicated to but is excluded from quorum
+ * weight, never grants election votes and never campaigns — the join path
+ * for a node catching up before promotion.  A WITNESS is a full voter in
+ * every consensus decision (it exists so small clusters keep quorum
+ * availability); the distinction is a tag for the plane above, which may
+ * own no slots and hold no data.  Weights are per-member u16; quorum is
+ * weight-weighted (majority of TOTAL voting weight), which degenerates to
+ * the classic count-majority when all weights are 1 — including for every
+ * record file written before this existed. */
+#define QIHSE_CONSENSUS_MAX_WEIGHT 1000u
+
+typedef enum {
+    QIHSE_CONSENSUS_ROLE_VOTER = 0,
+    QIHSE_CONSENSUS_ROLE_WITNESS = 1,   /* consensus-identical to VOTER */
+    QIHSE_CONSENSUS_ROLE_LEARNER = 2    /* replicated, non-voting */
+} qihse_consensus_member_role_t;
+
+const char* qihse_consensus_member_role_name(qihse_consensus_member_role_t role);
 #define QIHSE_CONSENSUS_PAYLOAD_MAX 128u
 #define QIHSE_CONSENSUS_MAX_ENTRIES_PER_MSG 8u
 #define QIHSE_CONSENSUS_RECORD_PATH_MAX 255u
@@ -446,6 +468,10 @@ typedef struct {
     qihse_uuid_t self;          /* this node's member UUID; must be a member */
     size_t member_count;        /* 1..QIHSE_CONSENSUS_MAX_MEMBERS, no dupes */
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    /* W7: parallel per-member role and voter weight (see the enum above).
+     * Zero-filled = every member a weight-1 VOTER (legacy configs). */
+    uint8_t member_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t member_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
     /* Timing, in caller-supplied virtual milliseconds.  Election timeouts
      * are base + (member_index * spread / member_count) + jitter, with
      * jitter derived from (self UUID, term); spread must be >= member_count
@@ -562,6 +588,22 @@ bool qihse_consensus_propose_membership(qihse_consensus_t* cs,
                                         qihse_consensus_membership_op_t op,
                                         const qihse_uuid_t* member);
 
+/* W7: role- and weight-carrying form (the plain call is VOTER at weight
+ * 1).  ADD assigns `role`/`weight` to the new member; REMOVE ignores them
+ * (any role/weight is removed with its member).  Extra refusals beyond
+ * the plain call's: unknown role, weight 0 or above
+ * QIHSE_CONSENSUS_MAX_WEIGHT, and any change that would leave the fold
+ * with zero voting weight (a learner-only group can commit nothing and
+ * elect no one — refused rather than bricked).  On-disk form: the LC
+ * record carries optional trailing role/weight fields; pre-W7 record
+ * files replay as weight-1 voters byte-for-byte. */
+bool qihse_consensus_propose_membership_role(qihse_consensus_t* cs,
+                                             const qihse_user_t* user,
+                                             qihse_consensus_membership_op_t op,
+                                             const qihse_uuid_t* member,
+                                             qihse_consensus_member_role_t role,
+                                             uint16_t weight);
+
 /* Propose an ATOMIC BULK membership transition via joint consensus
  * (leader only; see JOINT CONSENSUS above).  The transition is the entry
  * sequence CONFIG_JOINT_BEGIN, one CONFIG_ADD per UUID in `add` (in call
@@ -607,6 +649,15 @@ typedef struct {
      * included). */
     size_t member_count;
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    /* W7: effective per-member roles/weights, same order as members[].
+     * During a joint phase these describe the VOTER SET (union). */
+    uint8_t member_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t member_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
+    /* Total voting weight (Σ weights of non-LEARNER members) and the
+     * weighted strict-majority threshold (voting_weight/2 + 1).  With all
+     * weights 1 these degenerate to member_count and count/2+1. */
+    uint64_t voting_weight;
+    uint64_t majority_weight;
     /* Strict-majority size of the effective member set.  While
      * joint_active is true the REAL quorum is dual — a strict majority of
      * joint_old_count members AND of joint_fold_count members — which is

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Slot load-shift smoke: seed keys across both slot ranges on node 0, then
-CLUSTER MOVESLOTS 8192-16383 -> T320. Verifies: data transfer (keys moved,
+CLUSTER MOVESLOTS 8192-16383 -> node 1. Verifies: data transfer (keys moved,
 source copies deleted), ownership flip + bus propagation (both nodes agree),
-routing (seed MOVED-redirects, new writes land on the T320).
+routing (seed MOVED-redirects, new writes land on the node 1).
 
-Prereq: dynamic cluster up (see tests/cluster_discover_smoke.py).
+Two modes:
+  default      Prereq: dynamic cluster up (see tests/cluster_discover_smoke.py);
+               endpoints default to the t420/T320 lab pair.
+  --self-spawn Hermetic (gold/CI): spawn BOTH nodes on loopback (seed owns
+               the full ring, joiner discovers via --join), run the checks,
+               tear everything down.
 Run twice-safe: previous leftovers are re-collected by the next MOVESLOTS.
 """
-import os, socket, sys, time
+import os, socket, subprocess, sys, time
+import atexit, signal
 
 # Hosts/ports/password are overridable (defaults are the t420/T320 lab pair).
 PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
@@ -64,7 +70,89 @@ def set_follow(c, key, value, password=PW, hops=3):
         t, r = c.cmd("SET", key, value); hops -= 1
     return t, r
 
+_SELF_SPAWN = "--self-spawn" in sys.argv
+_daemons = []
+
+def _register_teardown():
+    atexit.register(_teardown_hermetic)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: (sys.exit(1)))
+
+def _spawn_hermetic():
+    bin_path = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
+    lib = os.environ.get("QIHSE_LIB_DIR", ".")
+    # Fresh dir per run: stale state from a prior run (old slot tables,
+    # leftover WALs) must never leak into a hermetic drill.
+    import tempfile
+    data = os.environ.get("QIHSE_DATA_DIR") or tempfile.mkdtemp(
+        prefix="cluster-loadshift-smoke-", dir="./build")
+    env = dict(os.environ, LD_LIBRARY_PATH=lib)
+    d0 = os.path.join(data, "seed"); d1 = os.path.join(data, "joiner")
+    os.makedirs(d0, exist_ok=True); os.makedirs(d1, exist_ok=True)
+    global N0, N1, N0_EP, N1_EP
+    N0 = ("127.0.0.1", int(os.environ.get("QIHSE_LOADSHIFT_PORT0", "7112")))
+    N1 = ("127.0.0.1", int(os.environ.get("QIHSE_LOADSHIFT_PORT1", "7113")))
+    N0_EP = f"{N0[0]}:{N0[1]}"
+    N1_EP = f"{N1[0]}:{N1[1]}"
+    seed = subprocess.Popen(
+        [bin_path, "--index", "0", "--bind", "127.0.0.1",
+         "--port", str(N0[1]), "--bus-port", str(N0[1] + 10000),
+         "--slot-range", "0-16383",
+         "--operator-password", PW, "--dir", d0],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _daemons.append(seed)
+    time.sleep(2)
+    joiner = subprocess.Popen(
+        [bin_path, "--index", "1", "--bind", "127.0.0.1",
+         "--port", str(N1[1]), "--bus-port", str(N1[1] + 10000),
+         "--join", f"127.0.0.1:{N0[1] + 10000}",
+         "--operator-password", PW, "--dir", d1],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _daemons.append(joiner)
+
+def _teardown_hermetic():
+    # leak-proof: a killed drill (pack timeout) still tears its daemons down
+    for p in _daemons:
+        if p.poll() is None:
+            p.kill()
+    for p in _daemons:
+        p.wait()
+
 def main():
+    if _SELF_SPAWN:
+        _register_teardown()
+        _spawn_hermetic()
+        # MOVESLOTS validates the target is a known cluster node: wait
+        # until the SEED lists the joiner in CLUSTER NODES (membership
+        # gossip), not a fixed sleep.
+        for _ in range(240):
+            try:
+                c0 = C(N0); c0.cmd("AUTH", "GODMODE_OP", PW)
+                t, nodes = c0.cmd("CLUSTER", "NODES")
+                if N1_EP in nodes:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        # By-condition readiness: wait until BOTH endpoints accept TCP AND
+        # the joiner has discovered the seed (its CLUSTER NODES lists it),
+        # instead of a fixed sleep that races a loaded machine.
+        for _ in range(240):                   # up to 60 s
+            ready = True
+            for addr in (N0, N1):
+                try:
+                    s = socket.create_connection(addr, timeout=0.5); s.close()
+                except OSError:
+                    ready = False
+            if ready:
+                try:
+                    c = C(N1)
+                    t, nodes = c.cmd("CLUSTER", "NODES")
+                    if N0_EP in nodes:
+                        break
+                except OSError:
+                    pass
+            time.sleep(0.25)
     results = []
     def check(name, cond, detail=""):
         results.append(cond); print(f"{'PASS' if cond else 'FAIL'}: {name} {detail}")
@@ -126,6 +214,8 @@ def main():
     check("seed's view updated via bus broadcast", "8192-16383" in n0v and "0-8191" in n0v)
 
     print(f"\nload-shift smoke: {sum(results)}/{len(results)} checks passed")
+    if _SELF_SPAWN:
+        _teardown_hermetic()
     return 0 if all(results) else 1
 
 if __name__ == "__main__":

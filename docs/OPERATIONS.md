@@ -52,11 +52,15 @@ deliberately expensive. This is normal.
 | Python REPL w/ native SDK | `./qihse python` | as demo |
 | RESP server (quick) | `make redis-server && ./qihse-redis-server --port 6399` | none (loopback, no auth) |
 | RESP server (auth) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'` | env + flag |
-| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'` | `--operator-password` (also keys the veiled bus — all nodes must match) |
+| Operator browser (web) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse browse --node <host:port> [--node …]` → `http://localhost:8090` — no login wall (operator-context default); UI asks only for the YubiKey touch on guarded actions; `--require-login` restores per-principal two-factor login | env or `--password`; YubiKey FIDO for actions |
+| Operator browser (headless) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse browse --dump overview\|cluster\|federation\|keys --node <host:port>` | env or `--password` |
+| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>' [--node-key PATH] [--require-signed-ops]` | `--operator-password` (also keys the veiled bus — all nodes must match); `--node-key` signs SLOT/NODE/GROUP ops frames (ML-DSA); `--require-signed-ops` refuses unsigned ones (hardened mode — requires `--node-key`) |
 | Federation CA | `make federation-ca && QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca` | env |
 | Key generation | `./qihse_keygen` | none |
 | Python controller SDK | `make test-controller-sdk-py` (usage: §3.6) | AUTH in connect config |
 | Rust controller SDK | `cd rust/qihse-rs && cargo test --offline` | AUTH in connect config |
+| Federation CA rotate-node | `QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca rotate-node --ca-key ./build/ca/ca.key --ca-cert ./build/ca/ca.pem --crl ./build/ca/revocations.crl --node-uuid <uuid> --pubkey-hex <hex> --out ./new.pem` | env |
+| Signed bus ops test | `make test-bus-signed-ops` | none |
 | Cluster smoke drills | `python3 tests/cluster_failover_smoke.py` (env-overridable hosts, §4) | per drill |
 | All make targets | §1.2; test target list in §2.1 | — |
 
@@ -168,10 +172,11 @@ repository root (`qihse_integrity.chain*`) and under `build/`.
 Note on ordering and failure: `make` runs the prerequisites of `test` in
 declaration order — the `Makefile` list first, then the two `GNUmakefile`
 overlay targets — and stops at the first failure. Because the aggregate ends
-with `test-gold`, which is currently red (see [§2.4](#24-the-gold-validation-suite)),
-a plain `make test` today exits non-zero at the gold suite and skips the two
-overlay TLS targets; run `make -k test`, or those targets individually, when
-you need everything attempted.
+with `test-gold`. As of the 2026-09-29 W7 wave the pack is green
+(72/72 workloads, 11/11 areas FULL, zero recorded gaps — see
+[§2.4](#24-the-gold-validation-suite)), so a plain `make test` runs to the
+end; historical note: it was red for a stretch and `make -k test` remains
+the way to attempt everything past a failure.
 
 CI (`.github/workflows/build-and-test.yml`) runs the core suite plus the
 security-boundary regressions, the APT41 ASan/UBSan fuzz targets, the brain/
@@ -229,10 +234,19 @@ GOLD_STRICT=1 make test-gold   # known defects / stale expectations / gaps becom
 GOLD_PACK=tests/gold/pack.v2.gold make test-gold   # pin a different pack version
 ```
 
-The pack (`tests/gold/pack.v1.gold`) is data: 60 workloads across areas
+The pack (`tests/gold/pack.v1.gold`) is data: 72 workloads across 11 areas
 (ann-rerank, relational, graph, fts-vector-fusion, persistence-recovery,
 protocol-compat, distributed-failure, security-regressions, ai-fabric,
-overlay-discovery, observability). Workloads either build a gold-only binary
+overlay-discovery, observability). The 2026-09-29 W7 wave added the consensus
+membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
+the browser negative-auth, QKP identity and feed-wire suites, and the
+self-spawning failover drill — the first workload that kills a REAL daemon
+peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive) —
+plus the hermetic discovery and loadshift drills (loopback --self-spawn),
+the fusion recall/latency gate, non-vector index byte accounting, and
+backend busy-time accounting. Board: **72/72 pass, 11/11 areas FULL, zero
+recorded gaps**; the drills were hardened to pass reliably under CPU
+starvation (by-condition readiness waits, leak-proof teardown). Workloads either build a gold-only binary
 (`bin=` under `tests/gold/workloads/`) or re-run existing make targets
 (`run="make -s …"`). The security-regressions area drives the matrix in
 `tests/security-regression.mk` (KV, tenant isolation, tenant privilege
@@ -245,14 +259,15 @@ Verdicts (see the header of `tests/gold/gold_runner.c`): `VERDICT: PASS`
 error, 2 non-green under strict. Adding a workload is a pack edit only — the
 Makefile extracts the `bin=` list from the pack.
 
-Verified on this branch (2026-09-26): `make test-gold` completes in ≈4.5
-minutes and currently reports **59/60 pass, `VERDICT: FAIL`** — the
-`protocol-compat/controller-api` workload aborts at
-`tests/test_controller_api.c:127` (`qihse_ctrl_reply_ok` after
-`qihse_ctrl_lease_renew`). Note that `test-controller-api` is *not* a member
-of the plain `make test` aggregate; the gold pack is what runs it, which is
-exactly the kind of coverage the pack exists to catch. Treat a red
-`controller-api` gold line as a real signal, not flake (reproduced twice).
+Verified on this branch (2026-09-29, under host load avg 80): `make
+test-gold` completes with **`VERDICT: PASS` — 72/72 workloads, 11/11 areas
+FULL, zero recorded gaps** (the drill workloads were hardened for exactly
+these conditions: by-condition readiness waits, leak-proof teardown, 900 s
+pack timeouts). On a quiet box the suite takes ≈4.5 minutes. Historical
+note for perspective: the pack was red at 59/60 for a stretch in the
+2026-09-26 round (a `controller-api` abort that `make test` alone never
+ran — exactly the kind of coverage the pack exists to catch); that defect
+is long fixed and the board is now fully green.
 
 Design/motivation: [docs/development/gold_validation_suite.md](development/gold_validation_suite.md).
 

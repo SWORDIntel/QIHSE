@@ -690,6 +690,15 @@ static void bolt_send_record(int fd, const qihse_bolt_value_t* const* fields, si
  * Client handler
  * ============================================================ */
 
+/* Capture writer for qihse_uwp_dispatch_streaming: appends the target's
+ * output stream to the session's capture buffer. */
+static ssize_t bolt_capture_write(void* write_ctx, const void* data,
+                                  size_t len) {
+    qihse_bolt_buf_t* b = (qihse_bolt_buf_t*)write_ctx;
+    qihse_bolt_buf_append(b, data, len);
+    return (ssize_t)len;
+}
+
 void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
     if (client_fd < 0) return;
     uint32_t version = 0;
@@ -708,6 +717,13 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
      * that the in-process dispatch path enforces the same auth requirement
      * as the socket-facing uwp_route_payload(). */
     qihse_user_t* bolt_user = NULL;
+    /* Result capture (Bolt visibility): RUN streams the target's output
+     * here through qihse_uwp_dispatch_streaming; PULL drains it as records.
+     * The captured stream is dispatcher-defined text (one line per row,
+     * "OK ..." as the terminator/metadata line). */
+    qihse_bolt_buf_t captured;
+    qihse_bolt_buf_init(&captured, 1024);
+    bool has_captured = false;
 
     for (;;) {
         ssize_t r = read(client_fd, rbuf, sizeof(rbuf));
@@ -774,6 +790,9 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                         bolt_user = qihse_auth_authenticate_from(source_ip,
                                                                  username,
                                                                  password);
+                        if (getenv("BOLT_DBG"))
+                            fprintf(stderr, "[bolt] hello user=%s -> %s\n",
+                                    username, bolt_user ? "OK" : "NULL");
                         if (bolt_user) {
                             /* Successful auth: clear the per-IP counter. */
                             qihse_auth_rate_limit_reset(source_ip);
@@ -794,6 +813,8 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     free(payload);
                     goto done;
                 case QIHSE_BOLT_MSG_RESET:
+                    has_captured = false;
+                    captured.len = 0;
                     bolt_send_success(client_fd, NULL, NULL);
                     break;
                 case QIHSE_BOLT_MSG_RUN: {
@@ -814,7 +835,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                         qihse_bolt_value_free(cypher);
                         break;
                     }
-                    size_t uwp_cap = sizeof(qihse_uwp_header_t) + cypher_len;
+                    size_t uwp_cap = sizeof(qihse_uwp_header_t) + cypher_len + 1u; /* +NUL */
                     uint8_t* uwp_pkt = (uint8_t*)malloc(uwp_cap);
                     size_t uwp_len = 0;
                     int translate_rc = uwp_pkt
@@ -831,17 +852,30 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
+                    /* Bolt visibility: the target's output stream is
+                     * CAPTURED (qihse_uwp_dispatch_streaming) and drained by
+                     * PULL as records, instead of being dropped. */
+                    captured.len = 0;
+                    has_captured = false;
                     bool dispatched = ctx &&
-                        qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
-                                           uwp_pkt + sizeof(qihse_uwp_header_t),
-                                           uwp_len - sizeof(qihse_uwp_header_t),
-                                           resp, sizeof(resp), &resp_len);
+                        qihse_uwp_dispatch_streaming(ctx, bolt_user,
+                                                     (const qihse_uwp_header_t*)uwp_pkt,
+                                                     uwp_pkt + sizeof(qihse_uwp_header_t),
+                                                     uwp_len - sizeof(qihse_uwp_header_t),
+                                                     bolt_capture_write, &captured,
+                                                     resp, sizeof(resp), &resp_len);
                     /* A dispatch refusal is a FAILURE, not a SUCCESS: an
                      * unauthenticated RUN (bolt_user NULL) or a query the
                      * engine refused must not report success for work it did
                      * not do.  The refusal reason is the generic Bolt code —
                      * the response buffer is never echoed to the wire. */
                     if (!dispatched) {
+                        captured.len = 0;
+                        has_captured = false;
+                        if (getenv("BOLT_DBG"))
+                            fprintf(stderr, "[bolt] refused: cap=%.*s user=%s\n",
+                                    (int)captured.len, (char*)captured.buf,
+                                    bolt_user ? "set" : "NULL");
                         bolt_send_failure(client_fd,
                                           "Neo.ClientError.Security.Unauthorized",
                                           bolt_user ? "query refused" : "unauthenticated");
@@ -849,6 +883,11 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                         qihse_bolt_value_free(cypher);
                         break;
                     }
+                    has_captured = captured.len > 0;
+                    if (getenv("BOLT_DBG"))
+                        fprintf(stderr, "[bolt] captured %zu bytes: %.*s\n",
+                                captured.len, (int)captured.len,
+                                (char*)captured.buf);
                     bolt_send_success(client_fd, "t_first", "1");
                     bolt_send_success(client_fd, "qid", "0");
                     free(uwp_pkt);
@@ -856,12 +895,48 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     break;
                 }
                 case QIHSE_BOLT_MSG_PULL: {
-                    /* Return a single empty record then SUCCESS */
+                    /* Drain the captured stream: one line = one record with
+                     * a single STRING field; the "OK ..." metadata line is
+                     * the terminator and is not emitted as a record. */
+                    if (has_captured) {
+                        size_t i = 0;
+                        while (i < captured.len) {
+                            size_t j = i;
+                            while (j < captured.len && captured.buf[j] != '\n') j++;
+                            size_t line_len = j - i;
+                            if (j < captured.len) j++; /* consume \n */
+                            if (line_len == 0) { i = j; continue; }
+                            if (captured.buf[i] == 'O' &&
+                                i + 2 < captured.len &&
+                                captured.buf[i + 1] == 'K' &&
+                                captured.buf[i + 2] == ' ') {
+                                i = j; /* metadata terminator, not a record */
+                                continue;
+                            }
+                            qihse_bolt_value_t row;
+                            memset(&row, 0, sizeof(row));
+                            row.type = QIHSE_BOLT_STRING;
+                            row.v.s.data = (char*)malloc(line_len + 1u);
+                            if (row.v.s.data) {
+                                memcpy(row.v.s.data, captured.buf + i, line_len);
+                                row.v.s.data[line_len] = '\0';
+                                row.v.s.len = line_len;
+                                const qihse_bolt_value_t* fields[1] = { &row };
+                                bolt_send_record(client_fd, fields, 1u);
+                                free(row.v.s.data);
+                            }
+                            i = j;
+                        }
+                    }
+                    has_captured = false;
+                    captured.len = 0;
                     bolt_send_record(client_fd, NULL, 0);
                     bolt_send_success(client_fd, "bookmark", "qihse:0");
                     break;
                 }
                 case QIHSE_BOLT_MSG_DISCARD:
+                    has_captured = false;
+                    captured.len = 0;
                     bolt_send_success(client_fd, NULL, NULL);
                     break;
                 case QIHSE_BOLT_MSG_BEGIN: {
@@ -953,6 +1028,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
 
 done:
     qihse_bolt_buf_free(&accum);
+    qihse_bolt_buf_free(&captured);
     close(client_fd);
 }
 

@@ -1,13 +1,13 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-09-25
+**Status date:** 2026-09-29
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
 ---
 
-## 1. Where we are now (verified against the working tree, 2026-09-25)
+## 1. Where we are now (verified against the working tree, 2026-09-29)
 
 ### 1.1 Landed and committed
 
@@ -54,11 +54,22 @@ This work was sitting outside git; it is now committed with tests and CI wiring 
 
 | Direction | Design doc | Status |
 |---|---|---|
-| **Phase 10 — Federation data plane** (stages F0–F8, 28 acceptance criteria) | [federation upgrade plan](docs/plans/qihse_federation_upgrade_plan.md) | `[x]` F0–F8, the post-F8 follow-ups, the 2026-09-24 batch (§W1, §1.4: scoped consensus, backup-writer authentication, controller SDKs, CA provisioning), and the two 2026-09-25 waves (§W1, §1.4: node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export) landed; no tracked unbuilt items remain — the plan stays design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing) |
-| AI compute fabric | [ai_fabric.md](docs/architecture/ai_fabric.md) | `[x]` items 1–5 implemented (embedding-backed semantic recall is the follow-up) |
-| Cluster brain | [cluster_brain.md](docs/architecture/cluster_brain.md) | `[~]` observe + actuation (R1–R6) landed; federation-journal migration open |
-| Overlay protocol | [overlay_protocol.md](docs/architecture/overlay_protocol.md) | `[~]` phase 1 landed; DHT (phase 2) sequenced after F5 |
-| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[~]` partly landed (telemetry, security); optimizer governance and gold validation suite open |
+| **Phase 10 — Federation data plane** (stages F0–F8, 28 acceptance criteria) | [federation upgrade plan](docs/plans/qihse_federation_upgrade_plan.md) | `[x]` F0–F8, the post-F8 follow-ups, the 2026-09-24 batch (§W1, §1.4: scoped consensus, backup-writer authentication, controller SDKs, CA provisioning), and the two 2026-09-25 waves (§W1, §1.4: node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export) landed; no tracked unbuilt items remain — the plan stays design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing) — these are now tracked with CITADEL-derived priorities as workstream W7 (§3) |
+| AI compute fabric | [ai_fabric.md](docs/architecture/ai_fabric.md) | `[x]` items 1–5 implemented, including embedding-backed semantic recall and remote job dispatch |
+| Cluster brain | [cluster_brain.md](docs/architecture/cluster_brain.md) | `[x]` observe + actuation (R1–R6) + federation-journal migration (W3.4: signed observations/decisions on the journal) landed |
+| Overlay protocol | [overlay_protocol.md](docs/architecture/overlay_protocol.md) | `[x]` phase 1 + phase 2 (DHT peer exchange) landed — `make test-dht-peer-exchange` green |
+| Production hardening (whitepaper near-term priorities 1–5) | [whitepaper v1.1 §12](docs/architecture/qihse_whitepaper_v1.1.md) | `[x]` gold validation suite: 72/72 workloads pass, 11/11 areas FULL, zero recorded gaps (see §W5.3/§W7) |
+
+### 1.5 Landed 2026-09-29 — the W6 browser + W7 CITADEL-substrate wave (committed 4453b6..)
+
+The operator browser (W6) and the full W7 CITADEL substrate program — 12 of 12
+items: joint consensus (verified already-landed), QSX1 snapshot transfer,
+journal tombstones + the ingest contract, QKP-sealed external clients,
+KEYSTONE feed wire handshake + typed SDK access, `INTROSPECTION.*`, member
+roles/weights/learners, fabric+DHT and semantic recall and brain-journal
+migration (verified landed by the parallel waves), baseline-drift fail-closed,
+and the gold-pack extension (7 W7 workloads + the real-peer failover drill in
+CI — the wave closed with the pack at 72/72 pass, 11/11 areas FULL, zero recorded gaps). Item-by-item with evidence in §3 W6/W7.
 
 ### 1.4 Landed 2026-09-24/25 (in flight — working tree, not yet committed)
 
@@ -134,14 +145,16 @@ distributed requirements apply to the consensus work).
   `8b1037e` + `4110a87` — tests s1-s4 (roundtrip / tamper-drop /
   unenrolled-drop / hardened-refusal) plus the full aggregate 60/60.
   (Function)
-- [ ] **6. Bolt result visibility + parallel-query de-stub.** RUN retains
-  results, PULL streams them (removes the last documented COMPATIBILITY
-  caveat); parallel query executes or is labelled a non-goal. (Function)
-- [ ] **7. Federation remainder: incremental export; DHT overlay phase 2.**
-  (Function)
-- [ ] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
-  recall; close the gold suite's three partial-coverage areas; decide
-  `make docs`. (Function/Verification)
+- [x] **6. Bolt result visibility** — landed (commit 23e2072: RUN results
+  visible to drivers, streaming dispatch + capture; PULL streams them).
+  Parallel-query de-stub remains the open sliver: execute or label a
+  non-goal.
+- [x] **7. Federation remainder** — incremental export (landed in the
+  2026-09-25 wave) and DHT overlay phase 2 (`src/spinnaker/qihse_overlay.c`
+  Layer 3; `make test-dht-peer-exchange` green) both verified in-tree.
+- [~] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
+  recall landed (parallel wave). Open: gold-suite partial areas (tracked
+  as W7 item 12) and the `make docs` decision.
 
 ### A. Function — behaviour added or fixed
 
@@ -290,7 +303,53 @@ Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitive
 
 Whitepaper v1.1 §12 priorities, in its stated order:
 
-- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **35 workloads, 8 areas, 0 fully covered — all 8 PARTIAL with declared gaps.**
+- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **72 workloads, 11 areas, 11 FULL, zero recorded gaps — the W7 wave extended it, brought the real-peer failover drill into CI, and closed every remaining gap (see §W7).**
+
+### W6 — Operator browser: generalized DB browser + cluster/federation viewer
+
+Design reviewed externally (claude-fable-5.1 via bothub, 2026-09-27); all findings folded in.
+Architecture: [qihse_browser.md](docs/architecture/qihse_browser.md) — web dashboard views over an
+authenticated Python bridge (`python/qihse/browser/`), YubiKey-FIPS FIDO2 login (mandatory by
+default), guarded action allowlist, headless `--dump` mode. Bridge port **8090** (8080 is
+telemetry; 8000 is reserved and must never be used).
+
+- [x] Bridge client layer: explicit-seed `fleet.py` (no auto-dial of discovered peers — `CLUSTER NODES` is rendered, never dialed), local CRC16 slot routing with MOVED re-target, single-shot-SCAN-aware keyspace paging (`slots.py`, `keyspace.py`)
+- [x] Per-session principals: every read/action executes over Controllers authenticated as the logged-in principal; the bridge holds **no** ambient credentials (confused-deputy fix) and closes Controllers on idle timeout
+- [x] HTTP API with password login (rate-limited, single-seed AUTH first), loopback-only bind, session cookies + CSRF, bounded bodies/threads (`bridge.py`)
+- [x] WebAuthn RP on python-fido2: RP ID `localhost`, UV required, cross-platform authenticators, sign_count clone detection, credential store = public keys only (0600), login fail-closed when no credential is enrolled unless `--allow-password-only` (`webauthn.py`)
+- [x] Guarded actions: allowlist (CLUSTER MOVESLOTS, FEDERATION TRUST.SET, LEASE.RELEASE, FEDERATION STATE), typed validation, command-bound single-use UV challenges, server stays the authority (`actions.py`, `bridge.py`)
+- [x] Negative-authorization CI test (AGENTS.md invariant 3): C fixture node (`tests/qihse_browser_fixture.c`) + Python HTTP asserts (`python/tests/test_browser_negative_auth.py`) — unauth→401, low-clearance login hides classified key names **and** values, FEDERATION→NOPERM, single-factor actions→403, fail-closed no-credential login, login rate-limit; `make test-browser` wired into `test:`
+- [x] Headless mode: `./qihse browse --dump overview|cluster|federation|keys` (`dump.py`)
+- [x] Frontend: dashboard shell + Login/Overview/Cluster/Federation/Journal/Keyspace/Actions/Metrics views (no new npm deps)
+- [x] Docs + registration: OPERATIONS.md §0.2, tools.json, architecture doc, runbook
+
+### W7 — CITADEL substrate (what QIHSE owes ../CITADEL milestones 0.3–0.7)
+
+Derived from the CITADEL design of record (`../CITADEL/docs/ROADMAP.md` 0.3–0.7,
+`architecture/QIHSE_FEDERATION_DATABASE_UPGRADE_PREDESIGN_v3.md`,
+`architecture/KEYSTONE_FEDERATION_INTELLIGENCE_UPGRADE_BRIEF.md` §5,
+`working/TRUSTED_TIME_ARCHITECTURE.md`).  QIHSE builds the substrate; signing
+service, build workers, and the thermal daemon stay CITADEL-side (invariant 10:
+QIHSE records evidence, it does not sign or execute).  Ordered by what each
+unblocks first:
+
+- [x] **Joint-consensus bulk membership changes** — landed (was already complete in the working tree; the §1.3 residual prose was stale): C_old∪C_fold union quorums, one-joint-at-a-time, crash/restart mid-joint re-derivation; evidence: `make test-consensus` (joint suite: `test_joint_bulk_replace`, `test_joint_minority_no_commit`, `test_joint_restart_midflight`, `test_joint_validation`)
+- [x] **Chunked, resumable snapshot transfer** — `qihse_federation_snapshot_xfer` (QSX1 framed protocol over the verified replication transport; moves sealed backup-container v3 in bounded chunks with a persisted resume point, per-chunk CRC, verify-gate authority; both ends refuse unverified peers); evidence: `make test-snapshot-xfer` (round-trip byte-identical, interrupt+resume remainder-only, hostile CRC/bounds/oversize refusals, post-transfer tamper caught by the container signature)
+- [x] **Snapshot↔watch cursor handshake + F2 journal tombstones** — tombstones ride the mutation envelope's reserved `flags` bit (`QIHSE_FEDERATION_MUTATION_TOMBSTONE` + `journal_append_tombstone`, generation-gated, zero on-disk format change); `qihse_federation_ingest` implements the §5.2 consumer contract — `boot(C)` exact-cursor handshake with snapshot-seeded generation gates, event-id dedup ring, strict generation ordering with tombstone lifecycle reset, at-least-once/idempotent delivery, atomic fail-closed checkpoints; evidence: `make test-federation-ingest` (5 checks), adjacent suites `test-federation-f2`/`-rejoin`/`-repl` still green
+- [x] **QKP-sealed transport for external clients** — the client-side handshake already lived in the library (`qihse_qkp_client_negotiate`); wired through: C controller (config `qkp_*` fields, sealed send/recv at both I/O choke points), Python SDK (`python/qihse/qkp.py` ctypes bindings + sealed-socket shim; blocking fd + SO_RCVTIMEO timeval — a timeout-mode socket is non-blocking underneath and raw fd reads EAGAIN), and the browser bridge (`--qkp-identity-dir`, `--qkp-trusted-pub` repeatable, threaded through fleet/bridge/dump); evidence: `make test-controller-qkp` — C: sealed connect+AUTH+SET/GET, cleartext-to-require refused, rogue identity rejected; Python: sealed round-trip incl. FEDERATION wrapper, cleartext refused, rogue rejected (3/3); `test-controller-sdk-py` 55 and `test-browser` 30 still green
+- [x] **Classification-preserving export/watch over the wire** — the per-record delivery gate (clearance/SCI/tenant/payload-cap, revocation honored on next, malformed fail-closed) and the 16-field §4 envelope already lived in `KEYSTONE.FEED.*` (W2.5); W7 closes the external-consumer gaps: `KEYSTONE.FEED.OPEN [prefix] [cursor]` (the §5.1 snapshot-bootstrap handshake in one round trip — cursor is an END-of-record position from STATUS/ACK) and typed Python SDK access (`Controller.keystone_feed_open` → `KeystoneFeed` with `FeedEvent`/`FeedStatus`); evidence: `make test-keystone-feed-wire` (journal-backed socket fixture with a provisioned index identity c2/s1/t77 + a clearance-0 identity; 15 checks: envelope fields preserved end-to-end, denied SENTINEL payloads provably never cross the wire, exact STATUS denial counts, cursor handshake resumes at C, RESUME 0 replay, low identity sees only the unclassified record) + `test-keystone-feed-w25` still green
+- [x] **Additive introspection commands** — new `INTROSPECTION.*` wire family (system-domain gated like FEDERATION.*): `QKP` (10 rollout counters), `BUS` (12 traffic counters incl. signed-ops), `CRL` (entry count / configured / failed), `RECORD.META <key>` (classification/SCI/expiry/flags via a new metadata-only KV getter with the IDENTICAL clearance gate as value reads — miss/expired/not-cleared indistinguishable, no classification oracle); bridge `/api/introspection/{qkp,bus,crl}` + key-detail `record_meta`; browser Cluster view (QKP·bus·CRL panel) + Records view (classification/SCI row); evidence: `make test-browser` grown to 36 checks — operator reads counters + classified record meta (classif 4), system analyst's RECORD.META for the clearance-5 key is nil, tenant principal gets NOPERM on the whole family; verified live on the rebuilt 3-node cluster (bus gossip 378 sent / 372 received)
+- [x] **Voter weights / witnesses / learners** — `qihse_consensus_member_role_t` (VOTER/WITNESS/LEARNER) + per-member u16 weights in parallel config arrays (zero-filled = weight-1 VOTER, so every pre-W7 config and record file is unchanged — determinism hash verified identical); weighted quorum arithmetic in commit, elections and liveness (learner weighs 0, never campaigns, never grants votes — denies honestly; WITNESS is consensus-identical to VOTER, tagged for the plane above); LC record codec carries optional trailing role/weight (`V|W|L <weight>`, ADD-only, torn pair refused); fold validity refuses a zero-voting-weight group; `propose_membership_role()` with weight/role validation; membership view exposes roles/weights/voting_weight/majority_weight; evidence: `make test-consensus` — three new suites (weighted-quorum view + record replay, learner never wins while severed from all voters, witness counts + tagged) plus the full existing suite green including joint-consensus interaction and determinism (714abfb2)
+- [x] **Bolt result visibility (2026-09-28, commit ed8795d).** RUN routes
+  query text to SQL EXECUTE via qihse_uwp_dispatch_streaming; PULL drains
+  the captured target stream as records + SUCCESS. FINDING: SELECT through
+  the plan stream returns no rows for a row-store-populated table — the
+  row-store/plan-stream integration is the next database-engine item.
+- [x] **Fabric items 3–5 + overlay DHT phase 2** — verified LANDED in tree (mostly by the parallel waves): ai_fabric items 3 (job model: `FABRIC.SUBMIT` executes locally+remotely over signed capability tokens, dispatch-idempotent), 4 (brain governance phase 2 with durable-record preference + UUID resolution), 5 (local-first AI memory) all `implemented` per `docs/architecture/ai_fabric.md`; overlay Layer 3 DHT peer exchange (simplified Kademlia: FIND/NODES over the veiled bus, bounded dials, unauthenticated-hint semantics) in `src/spinnaker/qihse_overlay.c`; evidence: `make test-fabric-jobs`, `make test-fabric-dispatch`, `make test-dht-peer-exchange`, `make test-overlay` all green
+- [x] **Embedding-backed semantic recall** — landed in the parallel wave ("built this cycle"): BM25 | SEMANTIC | HYBRID with a provider interface and the honestly-named deterministic lexical `builtin-lexical-256` embedder; RRF fusion; every mode resolves candidates through the same authorization-aware read so an embedding cannot leak what the principal cannot see; vectors bound to their producing embedder
+- [x] **Automated config-drift healing** — the documented residual ("the open()-time member list is trusted as the fold baseline; editing it behind an existing record file's back is not detected") is closed: record creation pins a running FNV-1a digest of the baseline (members ∥ roles ∥ weights — role/weight drift from item 7 is caught too) as a `B` line right after the header; every open compares it and a drifted baseline FAILS CLOSED with a named diagnostic before any log replays over it; pre-W7 record files carry no B line and are tolerated unchanged; evidence: `make test-consensus` — new `test_baseline_drift` (same baseline reopens; role-drift and swapped-member drift both refused; sed-stripped pre-W7 file opens), full suite green, determinism hash stable across runs (ff322d346)
+- [x] **Brain federation-journal migration** — landed in the parallel wave as W3.4: observations and signed decisions on the federation journal, no action without a journaled pre-condition (byte-exact round-trip check), ML-DSA-87 over decisions, deterministic against the old library (see §W3)
+- [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with duplicated keys surviving; the discovery and loadshift drills were then made hermetic too (loopback --self-spawn), closing that remainder outright. Final board: **72/72 workloads pass, 11/11 areas FULL, zero recorded gaps** — the last gap (backend busy time) closed with `qihse_backend_busy_microseconds_total` (commit 812fa41), and the three multi-process drills were hardened to run reliably under CPU starvation (by-condition readiness waits, leak-proof teardown, 900 s pack timeouts; verified green at load average 80). Evidence: `make test-gold` — VERDICT: PASS, 0 failed, 0 stale, 0 known-bug
 
 ---
 

@@ -7,6 +7,8 @@
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
+#include "qihse_federation_mtls.h"
+#include "qihse_qkp.h"
 #include "qihse_supply_chain.h"
 #include "qihse_runtime_trust.h"
 #include "qihse_security_audit.h"
@@ -187,6 +189,10 @@ typedef struct {
     qihse_metric_series_t* latency[QIHSE_QUERY_TYPE_COUNT];
     qihse_metric_series_t* backend_queries[QIHSE_ENGINE_BACKEND_COUNT];
     qihse_metric_series_t* backend_available[QIHSE_ENGINE_BACKEND_COUNT];
+    /* W7 gap closure: cumulative wall time each engine backend spent
+     * inside command dispatch — the busy-time counterpart of
+     * backend_queries_total (which is dispatch COUNT / share). */
+    qihse_metric_series_t* backend_busy[QIHSE_ENGINE_BACKEND_COUNT];
     /* Scrape-time status: cluster + replication. */
     qihse_metric_series_t* cluster_nodes_total;
     qihse_metric_series_t* cluster_nodes_healthy;
@@ -2736,15 +2742,27 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
     }
 
     if (strcasecmp(sub, "OPEN") == 0) {
-        if (request->argc != 1 && request->argc != 2) {
-            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.OPEN [prefix]");
+        /* W7 item 5: the optional cursor is the §5.1 snapshot-bootstrap
+         * handshake — "my snapshot reflects everything <= C" — so an
+         * external indexer starts live consumption at C in one round
+         * trip (dedup/generation handling above the wire is the
+         * consumer's, exactly as in qihse_federation_ingest). */
+        if (request->argc < 1 || request->argc > 3) {
+            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.OPEN [prefix] [cursor]");
         }
         qihse_keystone_feed_config_t fcfg;
         memset(&fcfg, 0, sizeof(fcfg));
-        if (request->argc == 2) {
+        if (request->argc >= 2) {
             size_t pl = request->argv[1].len;
             if (pl >= sizeof(fcfg.prefix)) return qihse_resp_error(session, "ERR prefix too long");
             memcpy(fcfg.prefix, request->argv[1].data, pl); fcfg.prefix[pl] = '\0';
+        }
+        if (request->argc == 3) {
+            uint64_t cursor = 0;
+            if (!qihse_resp_parse_u64_arg(&request->argv[2], &cursor)) {
+                return qihse_resp_error(session, "ERR invalid cursor");
+            }
+            fcfg.cursor = cursor;
         }
         qihse_keystone_feed_t* feed = qihse_keystone_feed_open(
             session->server->federation_journal, session->user, &fcfg);
@@ -5677,6 +5695,14 @@ static void qihse_resp_telemetry_register(qihse_resp_server_t* server) {
             server->tlm.backend_queries[i] = qihse_metrics_series(reg, "qihse_backend_queries_total", backends[i]);
         }
     }
+    if (qihse_metrics_register_bounded(reg, "qihse_backend_busy_microseconds_total",
+                                       "Cumulative wall time spent inside command dispatch (microseconds), by engine backend",
+                                       METRIC_COUNTER, "backend",
+                                       backends, QIHSE_ENGINE_BACKEND_COUNT) == 0) {
+        for (size_t i = 0; i < QIHSE_ENGINE_BACKEND_COUNT; i++) {
+            server->tlm.backend_busy[i] = qihse_metrics_series(reg, "qihse_backend_busy_microseconds_total", backends[i]);
+        }
+    }
     if (qihse_metrics_register_bounded(reg, "qihse_backend_available",
                                        "Engine backend configured and usable on this node (1/0)",
                                        METRIC_GAUGE, "backend",
@@ -7486,6 +7512,108 @@ static bool qihse_fed_replay_emit_cb(const qihse_federation_event_t* event,
     if (!qihse_resp_bulk_text(session, event->resource_id)) return false;
     (void)payload; (void)payload_len;
     return true;
+}
+
+/* ── W7 item 6: INTROSPECTION.* — additive operator observability ─────
+ *
+ * Four surfaces that were C-API-only (the browser rendered them as typed
+ * errors): QKP rollout counters, cluster-bus traffic counters, the CRL
+ * snapshot state, and per-record metadata.  All are SYSTEM-DOMAIN gated
+ * like FEDERATION.*: operational metadata is operator surface, and
+ * RECORD.META discloses a record's classification — classified-adjacent
+ * information the metadata getter itself gates with the session's
+ * clearance, so a system-domain analyst still cannot probe above itself.
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_handle_introspection(qihse_resp_session_t* session,
+                                            const qihse_resp_request_t* request) {
+    if (request->argc < 2) {
+        return qihse_resp_error(session,
+            "ERR usage: INTROSPECTION.QKP|BUS|CRL|RECORD.META <key>");
+    }
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session,
+            "NOPERM INTROSPECTION.* is restricted to the system domain");
+    }
+    const qihse_resp_arg_t* sub = &request->argv[1];
+
+    if (qihse_resp_arg_equal(sub, "QKP")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.qkp");
+        qihse_qkp_counters_t c;
+        qihse_qkp_get_counters(&c);
+        if (!qihse_resp_array(session, 10u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.server_negotiations_ok)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.client_negotiations_ok)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.negotiations_failed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_cleartext)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_malformed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_identity)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_crypto)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.frames_sealed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.frames_unsealed)) return false;
+        return qihse_resp_integer(session, (int64_t)c.unseal_failures);
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUS")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.bus");
+        qihse_cluster_bus_t* bus = qihse_resp_server_bus(session->server);
+        if (!bus) return qihse_resp_error(session, "ERR cluster bus is not configured on this node");
+        qihse_cluster_bus_stats_t s;
+        qihse_cluster_bus_stats(bus, &s);
+        if (!qihse_resp_array(session, 12u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.sent)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.pings_sent)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.pongs_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.slot_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.fail_notices_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.nodes_marked_unhealthy)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_acks_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_accepted)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_rejected)) return false;
+        return qihse_resp_integer(session, (int64_t)s.unsigned_ops_refused);
+        if (!qihse_resp_integer(session, (int64_t)s.slot_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.fail_notices_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.nodes_marked_unhealthy)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_accepted)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_rejected)) return false;
+        return qihse_resp_integer(session, (int64_t)s.unsigned_ops_refused);
+    }
+
+    if (qihse_resp_arg_equal(sub, "CRL")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.crl");
+        qihse_federation_crl_status_t st;
+        qihse_federation_crl_state(&st);
+        if (!qihse_resp_array(session, 3u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)st.entry_count)) return false;
+        if (!qihse_resp_integer(session, st.configured ? 1 : 0)) return false;
+        return qihse_resp_integer(session, st.failed ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(sub, "RECORD.META")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "introspection.record.meta");
+        if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+        char key[512];
+        size_t kl = request->argv[2].len;
+        if (kl == 0 || kl >= sizeof(key)) return qihse_resp_error(session, "ERR invalid key");
+        memcpy(key, request->argv[2].data, kl); key[kl] = '\0';
+        qihse_kv_record_meta_t m;
+        /* The getter enforces the SAME clearance gate as a value read:
+         * miss / expired / not-cleared are one indistinguishable false —
+         * no classification oracle above the principal's own level. */
+        if (!qihse_kv_meta_user(session->server->store, key, session->user, &m)) {
+            if (!qihse_resp_array(session, 1u)) return false;
+            return qihse_resp_null(session);
+        }
+        if (!qihse_resp_array(session, 4u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.classification)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.sci_compartment)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.expire_time_ms)) return false;
+        return qihse_resp_integer(session, (int64_t)m.flags);
+    }
+
+    return qihse_resp_error(session, "ERR unknown INTROSPECTION subcommand");
 }
 
 static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
@@ -10319,6 +10447,13 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     if (server->tlm.queries[type]) qihse_metrics_series_increment(server->tlm.queries[type], 1u);
     qihse_engine_backend_t backend = qihse_resp_backend_for_type(type);
     if (server->tlm.backend_queries[backend]) qihse_metrics_series_increment(server->tlm.backend_queries[backend], 1u);
+    if (server->tlm.backend_busy[backend]) {
+        /* Atomic u64 in MICROseconds (the counter's own unit): sub-ms
+         * commands still move it, and the name says exactly what it is. */
+        qihse_metrics_series_increment(
+            server->tlm.backend_busy[backend],
+            (uint64_t)(seconds * 1000000.0));
+    }
     if (server->tlm.latency[type]) qihse_metrics_series_observe(server->tlm.latency[type], seconds);
     return ok;
 }
@@ -10435,6 +10570,9 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     }
     if (qihse_resp_command_is(request, "FEDERATION") && request->argc >= 2) {
         return qihse_resp_handle_federation(session, request);
+    }
+    if (qihse_resp_command_is(request, "INTROSPECTION") && request->argc >= 2) {
+        return qihse_resp_handle_introspection(session, request);
     }
     if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
         if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);

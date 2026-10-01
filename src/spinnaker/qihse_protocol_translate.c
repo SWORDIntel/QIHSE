@@ -84,7 +84,7 @@ int qihse_translate_pg_rollback_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t*
  * ============================================================ */
 
 /* Determine the graph command opcode from a Cypher keyword. */
-static uint8_t cypher_to_graph_command(const char* cypher) {
+__attribute__((unused)) static uint8_t cypher_to_graph_command(const char* cypher) {
     if (!cypher) return 0x01; /* MATCH default */
     /* skip leading whitespace */
     while (*cypher == ' ' || *cypher == '\t' || *cypher == '\n') cypher++;
@@ -101,20 +101,15 @@ static uint8_t cypher_to_graph_command(const char* cypher) {
 int qihse_translate_bolt_run_to_uwp(const char* cypher, const char* params_json,
                                     uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
     if (!cypher) return -1;
-    uint8_t cmd = cypher_to_graph_command(cypher);
-    size_t clen = strlen(cypher);
-    size_t plen = clen;
-    if (params_json) plen += 1 + strlen(params_json); /* cypher\0params */
-    uint8_t* payload = (uint8_t*)malloc(plen + 1);
-    if (!payload) return -1;
-    memcpy(payload, cypher, clen);
-    if (params_json) {
-        payload[clen] = 0;
-        memcpy(payload + clen + 1, params_json, strlen(params_json));
-    }
-    int rc = build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_GRAPH2, cmd, payload, plen);
-    free(payload);
-    return rc;
+    (void)params_json;
+    /* Bolt RUN carries the query TEXT; route it to the SQL EXECUTE opcode
+     * as raw SQL (payload = text, NUL-terminated like every SQL EXECUTE
+     * caller).  The previous form translated Cypher keywords into a
+     * GRAPH2 probe with the query text as payload — a shape the SQL engine
+     * never saw, which is why RUN could never return results. */
+    size_t clen = strlen(cypher) + 1u; /* include the NUL terminator */
+    return build_uwp(out_uwp, out_len, out_cap, QIHSE_UWP_TARGET_SQL, 0x02,
+                     (const uint8_t*)cypher, clen);
 }
 
 int qihse_translate_bolt_begin_to_uwp(uint8_t* out_uwp, size_t out_cap, size_t* out_len) {
