@@ -27,6 +27,8 @@
  * builds is non-authoritative by construction (auth resolves principals by
  * pointer identity) and can never carry more than unclassified access. */
 #include "qihse_auth_internal.h"
+#include "qihse_machine_auth.h"
+#include "qihse_audit.h"
 #include "qihse_ingest_guard.h"
 #include "qihse_metrics.h"
 #include "qihse_system_guard.h"
@@ -42,7 +44,10 @@
 #include <limits.h>
 #include <math.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -907,6 +912,34 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
     return false;
 }
 
+/* Best-effort peer IPv4 for the AUTH rate limiters. IPv4-mapped IPv6 is
+ * unwrapped to its IPv4 form; other IPv6 folds to a stable 32-bit bucket key
+ * (a fold collision widens a bucket, it never narrows one). Unknown/closed
+ * peers report 0, which both limiters treat as one shared local bucket —
+ * the same bucket every pre-existing caller of the no-IP authenticate API
+ * already shares. */
+static uint32_t qihse_session_peer_ip(const qihse_resp_session_t* session) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (!session || getpeername(session->fd, (struct sockaddr*)&ss, &sl) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ntohl(((const struct sockaddr_in*)&ss)->sin_addr.s_addr);
+    }
+    if (ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)&ss;
+        static const uint8_t v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        const uint8_t* b = a6->sin6_addr.s6_addr;
+        if (memcmp(b, v4mapped, sizeof(v4mapped)) == 0) {
+            return ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
+                   ((uint32_t)b[14] << 8) | (uint32_t)b[15];
+        }
+        uint32_t fold = 0;
+        for (int i = 0; i < 16; i++) fold = (fold << 1 | fold >> 31) ^ (uint32_t)b[i];
+        return fold;
+    }
+    return 0;
+}
+
 static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_resp_arg_t* username, const qihse_resp_arg_t* password, bool* authenticated) {
     *authenticated = false;
     char* user_text = qihse_resp_arg_text(username);
@@ -916,7 +949,9 @@ static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_r
         free(password_text);
         return qihse_resp_error(session, "ERR invalid credentials");
     }
-    qihse_user_t* user = qihse_auth_authenticate(user_text, password_text);
+    /* The real peer IP, so both auth rate limiters bucket per client instead
+     * of lumping every connection into the shared IP-0 bucket. */
+    qihse_user_t* user = qihse_auth_authenticate_from(qihse_session_peer_ip(session), user_text, password_text);
     free(user_text);
     free(password_text);
     if (!user) return qihse_resp_error(session, "WRONGPASS invalid username-password pair or user is disabled.");
@@ -1016,6 +1051,67 @@ static bool qihse_resp_handle_cluster_peerauth(qihse_resp_session_t* session,
     session->peer_claims_valid = true;
     session->user = &session->peer_claims;
     session->user_id = verified.principal_user_id;
+    return qihse_resp_simple(session, "OK");
+}
+
+/* MACHINEAUTH <token-hex> — machine-client authentication over plain RESP.
+ * A MACHINE-purpose fabric token signed by a trusted node ML-DSA key
+ * (qihse_machine_auth.h) authenticates the connection; the token's claims
+ * become the session context exactly as CLUSTER PEERAUTH installs them:
+ * role 0, no account capabilities, no verifier, and it dies with the
+ * connection. One token authenticates exactly once (nonce consumed), so a
+ * captured blob cannot be replayed. Like AUTH and PEERAUTH this runs BEFORE
+ * the NOAUTH gate because it IS the authentication. Refusals are typed
+ * errors and never echo token material back. */
+static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
+                                          const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "machineauth");
+    const qihse_resp_arg_t* hexarg = &request->argv[1];
+    size_t blob_len = hexarg->len / 2u;
+    if (hexarg->len == 0u || (hexarg->len & 1u) != 0u ||
+        blob_len > (size_t)QIHSE_FABRIC_TOKEN_MAX_BYTES)
+        return qihse_resp_error(session, "ERR machine auth refused: malformed-token");
+    uint8_t* blob = (uint8_t*)malloc(blob_len);
+    if (!blob) return qihse_resp_error(session, "ERR out of memory");
+    static const char hexv[] = "0123456789abcdef";
+    bool valid = true;
+    for (size_t i = 0; i < blob_len && valid; i++) {
+        const char* hi = (const char*)memchr(hexv, hexarg->data[i * 2u], 16u);
+        const char* lo = (const char*)memchr(hexv, hexarg->data[i * 2u + 1u], 16u);
+        if (!hi || !lo) { valid = false; break; }
+        blob[i] = (uint8_t)((unsigned)(hi - hexv) << 4 | (unsigned)(lo - hexv));
+    }
+    if (!valid) {
+        free(blob);
+        return qihse_resp_error(session, "ERR machine auth refused: malformed-token");
+    }
+
+    qihse_fabric_token_t verified;
+    qihse_machine_auth_verdict_t verdict =
+        qihse_machine_auth_check(blob, blob_len, 0u, &verified);
+    free(blob);
+    if (verdict != QIHSE_MACHINE_AUTH_OK) {
+        char err[96];
+        snprintf(err, sizeof(err), "ERR machine auth refused: %s",
+                 qihse_machine_auth_verdict_name(verdict));
+        return qihse_resp_error(session, err);
+    }
+
+    memset(&session->peer_claims, 0, sizeof(session->peer_claims));
+    session->peer_claims.user_id = verified.principal_user_id;
+    session->peer_claims.classification_level = verified.clearance;
+    session->peer_claims.sci_compartments = verified.sci;
+    session->peer_claims.tenant_id = verified.principal_tenant;
+    /* role 0, no account capabilities, no verifier: a claims context is a
+     * claim about clearance, nothing more. */
+    snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
+             "machine:%02x%02x", verified.submitter_node.bytes[0],
+             verified.submitter_node.bytes[1]);
+    session->peer_claims_valid = true;
+    session->user = &session->peer_claims;
+    session->user_id = verified.principal_user_id;
+    qihse_audit_log("MACHINEAUTH_OK", verified.principal_user_id, 0u,
+                    verified.clearance, verified.sci);
     return qihse_resp_simple(session, "OK");
 }
 
@@ -10478,6 +10574,10 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
         qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
         return qihse_resp_handle_cluster_peerauth(session, request);
+    }
+    /* MACHINEAUTH ditto: token authentication for machine clients. */
+    if (qihse_resp_command_is(request, "MACHINEAUTH")) {
+        return qihse_resp_handle_machineauth(session, request);
     }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     /* U2 revocation SLA: re-validate the session principal authoritatively

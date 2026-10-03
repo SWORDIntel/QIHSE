@@ -76,7 +76,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
             src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
             src/spinnaker/qihse_crc16.c src/spinnaker/qihse_qkp.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c src/spinnaker/qihse_resp_pubsub.c src/spinnaker/qihse_cluster_bus.c src/spinnaker/qihse_cluster_failover.c src/spinnaker/qihse_cluster_scatter.c src/spinnaker/qihse_cluster_rebalance.c \
-            src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c src/spinnaker/qihse_ingest_guard.c src/spinnaker/qihse_bundle.c src/spinnaker/qihse_fabric_index.c src/federation/qihse_fabric_dispatch.c \
+            src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c src/spinnaker/qihse_ingest_guard.c src/spinnaker/qihse_bundle.c src/spinnaker/qihse_fabric_index.c src/federation/qihse_fabric_dispatch.c src/spinnaker/qihse_machine_auth.c \
             src/black_hole/qihse_kv_store.c src/black_hole/qihse_blob.c src/black_hole/qihse_export.c src/black_hole/qihse_keystone.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c src/spinnaker/qihse_uwp_graph_index.c src/spinnaker/qihse_uwp_repl_pool.c src/spinnaker/qihse_uwp_sql_txn_schema.c src/spinnaker/qihse_uwp_tls.c src/spinnaker/qihse_uwp_metrics.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/frieze/qihse_btree.c src/frieze/qihse_hash_index.c src/frieze/qihse_index_manager.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
@@ -188,6 +188,26 @@ stress-session-delivery: lib
 cluster-daemon: lib
 	$(CC) $(CFLAGS) -o qihse-cluster-daemon tools/qihse_cluster_daemon.c -L. -lqihse $(LDFLAGS)
 	@echo "qihse-cluster-daemon build successful"
+
+machine-token: lib
+	$(CC) $(CFLAGS) -o qihse-machine-token tools/qihse_machine_token.c -L. -lqihse $(LDFLAGS)
+	@echo "qihse-machine-token build successful"
+
+test-auth-verifier-cache: lib
+	$(CC) $(CFLAGS) -o tests/test_auth_verifier_cache tests/test_auth_verifier_cache.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_auth_verifier_cache
+
+test-auth-volume-limit: lib
+	$(CC) $(CFLAGS) -o tests/test_auth_volume_limit tests/test_auth_volume_limit.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_auth_volume_limit
+
+test-machine-auth: lib
+	$(CC) $(CFLAGS) -o tests/test_machine_auth tests/test_machine_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_machine_auth
+
+test-audit-rotation: lib
+	$(CC) $(CFLAGS) -o tests/test_audit_rotation tests/test_audit_rotation.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_audit_rotation
 
 redis-cluster-bootstrap: lib
 	$(CC) $(CFLAGS) -o tests/qihse_cluster_bootstrap tests/qihse_cluster_bootstrap.c -L. -lqihse $(LDFLAGS)
@@ -1214,6 +1234,8 @@ clean:
 	    tests/test_direct_execution tests/test_simple_exec tests/test_timeseries \
 	    tests/test_column_tsdb_anchor tests/test_object_acl \
 	    tests/test_auth_privilege_boundary tests/test_aggregate_hardened \
+	    tests/test_auth_verifier_cache tests/test_auth_volume_limit \
+	    tests/test_machine_auth tests/test_audit_rotation \
 	    tests/test_uwp_regression tests/fuzz_uwp
 	@echo "Clean completed"
 

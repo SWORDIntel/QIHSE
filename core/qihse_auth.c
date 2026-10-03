@@ -81,6 +81,272 @@ void qihse_auth_rate_limit_cleanup(void) {
     pthread_mutex_unlock(&g_rate_limiter_mutex);
 }
 
+// ---------------------------------------------------------------------------
+// IP-based AUTH volume limiting (auth-storm protection)
+// ---------------------------------------------------------------------------
+// Second instance of the same generic limiter engine. Unlike the brute-force
+// limiter, a successful authentication never resets it: a client that
+// re-authenticates in a tight loop is throttled whether or not the
+// credentials are correct. Defaults are deliberately generous (120/min/IP);
+// QIHSE_AUTH_VOLUME_MAX / QIHSE_AUTH_VOLUME_WINDOW override them at first use.
+static qihse_rate_limiter_t* g_auth_volume_limiter = NULL;
+static pthread_mutex_t g_volume_limiter_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* QIHSE_AUTH_VOLUME_MAX / QIHSE_AUTH_VOLUME_WINDOW override the compiled-in
+ * defaults; an explicit nonzero argument always wins over both. */
+static void volume_limit_resolve_defaults(uint32_t* max_attempts, uint32_t* window_seconds) {
+    if (*max_attempts == 0) {
+        const char* env_max = getenv("QIHSE_AUTH_VOLUME_MAX");
+        if (env_max && *env_max) {
+            long v = strtol(env_max, NULL, 10);
+            if (v > 0 && v <= (long)INT_MAX) *max_attempts = (uint32_t)v;
+        }
+        if (*max_attempts == 0) *max_attempts = QIHSE_AUTH_VOLUME_DEFAULT_MAX_ATTEMPTS;
+    }
+    if (*window_seconds == 0) {
+        const char* env_window = getenv("QIHSE_AUTH_VOLUME_WINDOW");
+        if (env_window && *env_window) {
+            long v = strtol(env_window, NULL, 10);
+            if (v > 0 && v <= (long)INT_MAX) *window_seconds = (uint32_t)v;
+        }
+        if (*window_seconds == 0) *window_seconds = QIHSE_AUTH_VOLUME_DEFAULT_WINDOW_SEC;
+    }
+}
+
+static qihse_rate_limiter_t* volume_limiter_get_locked(void) {
+    if (g_auth_volume_limiter) return g_auth_volume_limiter;
+    uint32_t max_attempts = 0;
+    uint32_t window_seconds = 0;
+    volume_limit_resolve_defaults(&max_attempts, &window_seconds);
+    g_auth_volume_limiter = qihse_rate_limiter_create(
+        QIHSE_AUTH_VOLUME_DEFAULT_MAX_ENTRIES, max_attempts, window_seconds);
+    return g_auth_volume_limiter;
+}
+
+void qihse_auth_init_volume_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries) {
+    pthread_mutex_lock(&g_volume_limiter_mutex);
+    if (g_auth_volume_limiter) {
+        qihse_rate_limiter_destroy(g_auth_volume_limiter);
+        g_auth_volume_limiter = NULL;
+    }
+    volume_limit_resolve_defaults(&max_attempts, &window_seconds);
+    if (max_entries == 0) max_entries = QIHSE_AUTH_VOLUME_DEFAULT_MAX_ENTRIES;
+    g_auth_volume_limiter = qihse_rate_limiter_create(max_entries, max_attempts, window_seconds);
+    pthread_mutex_unlock(&g_volume_limiter_mutex);
+}
+
+void qihse_auth_shutdown_volume_limiter(void) {
+    pthread_mutex_lock(&g_volume_limiter_mutex);
+    if (g_auth_volume_limiter) {
+        qihse_rate_limiter_destroy(g_auth_volume_limiter);
+        g_auth_volume_limiter = NULL;
+    }
+    pthread_mutex_unlock(&g_volume_limiter_mutex);
+}
+
+bool qihse_auth_check_volume_limit(uint32_t source_ip) {
+    bool allowed = true;
+    pthread_mutex_lock(&g_volume_limiter_mutex);
+    qihse_rate_limiter_t* rl = volume_limiter_get_locked();
+    if (rl) allowed = qihse_rate_limiter_check(rl, source_ip);
+    pthread_mutex_unlock(&g_volume_limiter_mutex);
+    return allowed;
+}
+
+void qihse_auth_volume_limit_reset(uint32_t source_ip) {
+    pthread_mutex_lock(&g_volume_limiter_mutex);
+    if (g_auth_volume_limiter) {
+        qihse_rate_limiter_reset(g_auth_volume_limiter, source_ip);
+    }
+    pthread_mutex_unlock(&g_volume_limiter_mutex);
+}
+
+// ---------------------------------------------------------------------------
+// Password verifier cache
+// ---------------------------------------------------------------------------
+// Direct-mapped table of recent successful verifications. The stored value is
+// a SHA-256 key binding user_id, the verifier's salt and iteration count, and
+// the presented password — never the password and never the verifier. A hit
+// replaces ONLY the PBKDF2 computation: account liveness, per-user lockout,
+// both rate limiters, and the post-KDF verifier-identity re-validation all
+// still run on every authentication. Because the key includes the account's
+// current salt, a rotated password changes the key and the old cached entry
+// can never authenticate again.
+#define AUTH_CACHE_DOMAIN "QIHSE-AUTHCACHE-v1"
+
+typedef struct {
+    bool valid;
+    time_t expires;
+    uint8_t key[32];
+} auth_cache_entry_t;
+
+static auth_cache_entry_t* g_auth_cache = NULL;
+static size_t g_auth_cache_cap = 0;
+static uint32_t g_auth_cache_ttl = QIHSE_AUTH_CACHE_DEFAULT_TTL_SECONDS; /* 0 = disabled */
+static uint64_t g_auth_cache_hits = 0;
+static uint64_t g_auth_cache_misses = 0;
+static uint64_t g_auth_cache_stores = 0;
+static pthread_mutex_t g_auth_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void auth_cache_key_compute(uint32_t user_id,
+                                   const qihse_password_verifier_t* verifier,
+                                   const char* password,
+                                   uint8_t out_key[32]) {
+    uint8_t digest_in[64];
+    /* Fixed-width little-endian encoding so the key does not depend on
+     * struct packing or endianness. */
+    digest_in[0] = (uint8_t)(user_id & 0xFFu);
+    digest_in[1] = (uint8_t)((user_id >> 8) & 0xFFu);
+    digest_in[2] = (uint8_t)((user_id >> 16) & 0xFFu);
+    digest_in[3] = (uint8_t)((user_id >> 24) & 0xFFu);
+    digest_in[4] = (uint8_t)(verifier->version & 0xFFu);
+    digest_in[5] = (uint8_t)((verifier->version >> 8) & 0xFFu);
+    digest_in[6] = (uint8_t)(verifier->algorithm & 0xFFu);
+    digest_in[7] = (uint8_t)((verifier->algorithm >> 8) & 0xFFu);
+    digest_in[8] = (uint8_t)(verifier->iterations & 0xFFu);
+    digest_in[9] = (uint8_t)((verifier->iterations >> 8) & 0xFFu);
+    digest_in[10] = (uint8_t)((verifier->iterations >> 16) & 0xFFu);
+    digest_in[11] = (uint8_t)((verifier->iterations >> 24) & 0xFFu);
+    memcpy(digest_in + 12, verifier->salt, QIHSE_PW_SALT_BYTES);
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    bool ok = ctx != NULL &&
+              EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+              EVP_DigestUpdate(ctx, AUTH_CACHE_DOMAIN, sizeof(AUTH_CACHE_DOMAIN)) == 1 &&
+              EVP_DigestUpdate(ctx, digest_in, 12u + QIHSE_PW_SALT_BYTES) == 1 &&
+              EVP_DigestUpdate(ctx, password, strlen(password)) == 1;
+    unsigned int md_len = 0;
+    if (ok) ok = EVP_DigestFinal_ex(ctx, out_key, &md_len) == 1 && md_len == 32u;
+    EVP_MD_CTX_free(ctx);
+    OPENSSL_cleanse(digest_in, sizeof(digest_in));
+    if (!ok) memset(out_key, 0, 32u);
+}
+
+static size_t auth_cache_slot(const uint8_t key[32]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | key[i];
+    return (size_t)(v % (uint64_t)g_auth_cache_cap);
+}
+
+static void auth_cache_ensure_allocated_locked(void) {
+    if (g_auth_cache || g_auth_cache_cap == 0) return;
+    g_auth_cache = (auth_cache_entry_t*)calloc(g_auth_cache_cap, sizeof(auth_cache_entry_t));
+    if (g_auth_cache) {
+#ifndef _WIN32
+        /* Best effort: the cached keys are password-equivalent secrets. */
+        (void)mlock(g_auth_cache, g_auth_cache_cap * sizeof(auth_cache_entry_t));
+#endif
+    } else {
+        g_auth_cache_cap = 0; /* allocation failed: cache stays disabled */
+    }
+}
+
+static uint32_t auth_cache_ttl_effective(void) {
+    /* QIHSE_AUTH_CACHE_TTL_SECONDS overrides the compiled-in default on
+     * first use. Benign race: worst case the env var is parsed twice. */
+    static int env_read = 0;
+    static uint32_t env_ttl = UINT32_MAX;
+    if (!env_read) {
+        env_read = 1;
+        const char* env = getenv("QIHSE_AUTH_CACHE_TTL_SECONDS");
+        if (env && *env) {
+            char* end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end && *end == '\0' && v >= 0 && v <= (long)QIHSE_AUTH_CACHE_MAX_TTL_SECONDS) {
+                env_ttl = (uint32_t)v;
+            }
+        }
+    }
+    return env_ttl != UINT32_MAX ? env_ttl : g_auth_cache_ttl;
+}
+
+/* Returns true when this exact (user, verifier, password) presentation was
+ * successfully verified recently. Only ever called after the caller copied
+ * the verifier under the auth lock, mirroring the KDF contract. */
+static bool auth_cache_probe(uint32_t user_id,
+                             const qihse_password_verifier_t* verifier,
+                             const char* password) {
+    uint32_t ttl = auth_cache_ttl_effective();
+    if (ttl == 0 || !password || !verifier) return false;
+    uint8_t key[32];
+    auth_cache_key_compute(user_id, verifier, password, key);
+
+    pthread_mutex_lock(&g_auth_cache_mutex);
+    auth_cache_ensure_allocated_locked();
+    bool hit = false;
+    if (g_auth_cache) {
+        auth_cache_entry_t* entry = &g_auth_cache[auth_cache_slot(key)];
+        if (entry->valid && entry->expires > time(NULL) &&
+            CRYPTO_memcmp(entry->key, key, sizeof(key)) == 0) {
+            hit = true;
+        }
+    }
+    if (hit) g_auth_cache_hits++; else g_auth_cache_misses++;
+    pthread_mutex_unlock(&g_auth_cache_mutex);
+    return hit;
+}
+
+static void auth_cache_store(uint32_t user_id,
+                             const qihse_password_verifier_t* verifier,
+                             const char* password) {
+    uint32_t ttl = auth_cache_ttl_effective();
+    if (ttl == 0 || !password || !verifier) return;
+    uint8_t key[32];
+    auth_cache_key_compute(user_id, verifier, password, key);
+
+    pthread_mutex_lock(&g_auth_cache_mutex);
+    auth_cache_ensure_allocated_locked();
+    if (g_auth_cache) {
+        auth_cache_entry_t* entry = &g_auth_cache[auth_cache_slot(key)];
+        if (entry->valid) OPENSSL_cleanse(entry->key, sizeof(entry->key));
+        entry->valid = true;
+        entry->expires = time(NULL) + (time_t)ttl;
+        memcpy(entry->key, key, sizeof(entry->key));
+        g_auth_cache_stores++;
+    }
+    pthread_mutex_unlock(&g_auth_cache_mutex);
+    OPENSSL_cleanse(key, sizeof(key));
+}
+
+void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity) {
+    pthread_mutex_lock(&g_auth_cache_mutex);
+    if (capacity == 0) capacity = QIHSE_AUTH_CACHE_DEFAULT_CAPACITY;
+    if (ttl_seconds > QIHSE_AUTH_CACHE_MAX_TTL_SECONDS) ttl_seconds = QIHSE_AUTH_CACHE_MAX_TTL_SECONDS;
+    if (g_auth_cache && capacity != g_auth_cache_cap) {
+#ifndef _WIN32
+        munlock(g_auth_cache, g_auth_cache_cap * sizeof(auth_cache_entry_t));
+#endif
+        free(g_auth_cache);
+        g_auth_cache = NULL;
+    }
+    g_auth_cache_cap = capacity;
+    g_auth_cache_ttl = ttl_seconds;
+    auth_cache_ensure_allocated_locked();
+    pthread_mutex_unlock(&g_auth_cache_mutex);
+}
+
+void qihse_auth_cache_clear(void) {
+    pthread_mutex_lock(&g_auth_cache_mutex);
+    if (g_auth_cache) {
+        for (size_t i = 0; i < g_auth_cache_cap; i++) {
+            if (g_auth_cache[i].valid) OPENSSL_cleanse(g_auth_cache[i].key, sizeof(g_auth_cache[i].key));
+        }
+        memset(g_auth_cache, 0, g_auth_cache_cap * sizeof(auth_cache_entry_t));
+    }
+    g_auth_cache_hits = 0;
+    g_auth_cache_misses = 0;
+    g_auth_cache_stores = 0;
+    pthread_mutex_unlock(&g_auth_cache_mutex);
+}
+
+void qihse_auth_cache_stats(uint64_t* out_hits, uint64_t* out_misses, uint64_t* out_stores) {
+    pthread_mutex_lock(&g_auth_cache_mutex);
+    if (out_hits) *out_hits = g_auth_cache_hits;
+    if (out_misses) *out_misses = g_auth_cache_misses;
+    if (out_stores) *out_stores = g_auth_cache_stores;
+    pthread_mutex_unlock(&g_auth_cache_mutex);
+}
+
 /* Principal capacity per node. Sized for large multi-tenant fleets (65,536):
  * the registry and shadow-authz arrays are static but untouched pages cost
  * nothing until principals are created (~104 B/authz slot, ~1 KB mlocked per
@@ -1033,6 +1299,11 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
         return NULL;
     }
 
+    if (!qihse_auth_check_volume_limit(source_ip)) {
+        fprintf(stderr, "[AUTH] Volume limit exceeded for source IP %u. Authentication rejected.\n", source_ip);
+        return NULL;
+    }
+
     pthread_rwlock_wrlock(&auth_rwlock);
     qihse_user_t* u = users[user_id];
     if (!u || !authz_states[user_id].active || !authz_states[user_id].password_set) {
@@ -1054,7 +1325,14 @@ static qihse_user_t* authenticate_user_internal(uint32_t source_ip, uint32_t use
     qihse_password_verifier_t verifier_copy = authz_states[user_id].verifier;
     pthread_rwlock_unlock(&auth_rwlock);
 
-    bool matched = verify_password(password, &verifier_copy);
+    /* Verifier cache first: a repeat presentation of the same credentials
+     * skips only the KDF. Everything below — account re-validation, lockout,
+     * rate-limit reset — runs exactly as it did before this cache existed. */
+    bool matched = auth_cache_probe(user_id, &verifier_copy, password);
+    if (!matched) {
+        matched = verify_password(password, &verifier_copy);
+        if (matched) auth_cache_store(user_id, &verifier_copy, password);
+    }
 
     pthread_rwlock_wrlock(&auth_rwlock);
     now = time(NULL);

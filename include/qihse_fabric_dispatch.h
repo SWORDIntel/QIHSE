@@ -145,6 +145,15 @@ bool qihse_fabric_jobtype_is_idempotent(qihse_fabric_job_t type);
  * is the digest of zero bytes. */
 #define QIHSE_FABRIC_TOKEN_PURPOSE_SCATTER 3u
 
+/* A MACHINE token authenticates a machine client (fleet agent, exporter,
+ * bridge) to a plain RESP listener via MACHINEAUTH. It is verified by
+ * qihse_machine_auth (qihse_machine_auth.h) against the node's
+ * file-configured trusted ML-DSA public keys — the same trust anchors the
+ * cluster bus uses — NOT by qihse_fabric_token_check, which requires store
+ * enrollment and an mTLS channel. A MACHINE token claims NO scope: any scope
+ * bit set is refused, so it can never carry federation write/read authority. */
+#define QIHSE_FABRIC_TOKEN_PURPOSE_MACHINE 4u
+
 /* The scope a token must carry.  These are the federation infrastructure
  * scopes (qihse_federation.h): a RUN writes on the peer, a FETCH reads.  The
  * executor requires the token's scope to be a SUBSET of the submitter node's

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <openssl/sha.h>
 #endif
 #ifndef _WIN32
@@ -59,6 +61,116 @@ static void build_chain_path(char *buf, size_t buflen) {
  * aggregates never share one root-level log file. */
 static void build_audit_path(char *buf, size_t buflen) {
     build_state_path(buf, buflen, AUDIT_FILE);
+}
+
+/* ── Audit log rotation ────────────────────────────────────────────────────
+ * Size-threshold rename. The hash chain is logical (last_hash → new_hash,
+ * anchored in the integrity-chain file) and NOT file-bound, so rotating the
+ * container between records preserves tamper-evidence across the boundary.
+ * Only the signer thread (or a fallback caller while the signer is down)
+ * writes records, and every record opens the path fresh with
+ * O_APPEND|O_CREAT|O_NOFOLLOW, so a rename between records IS the rotation:
+ * the next record re-creates the live file. Concurrent fallback writers race
+ * harmlessly — an fd already open keeps writing into the renamed inode.
+ * Rotated names carry a decimal-seconds suffix so they sort chronologically
+ * by name. POSIX only; on Windows the log grows unbounded. */
+static uint64_t audit_rotate_threshold(void) {
+    const char* env = getenv("QIHSE_AUDIT_ROTATE_BYTES");
+    if (env && *env) {
+        char* end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        /* A threshold below one record (~4.8 KB with its ML-DSA-87
+         * signature) would rotate on every write; floor it. */
+        if (end && *end == '\0' && v >= 8192ull) return (uint64_t)v;
+    }
+    return 64ull * 1024ull * 1024ull;
+}
+
+static size_t audit_rotate_keep(void) {
+    const char* env = getenv("QIHSE_AUDIT_ROTATE_KEEP");
+    if (env && *env) {
+        char* end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end && *end == '\0') return (size_t)v; /* 0 = keep everything */
+    }
+    return 8;
+}
+
+static void audit_prune_rotated(const char* apath) {
+    size_t keep = audit_rotate_keep();
+    if (keep == 0) return;
+
+    char dirbuf[512];
+    const char* base = strrchr(apath, '/');
+    if (base) {
+        size_t dlen = (size_t)(base - apath);
+        if (dlen >= sizeof(dirbuf)) return;
+        memcpy(dirbuf, apath, dlen);
+        dirbuf[dlen] = '\0';
+        base++;
+    } else {
+        snprintf(dirbuf, sizeof(dirbuf), "%s", ".");
+        base = apath;
+    }
+    size_t base_len = strlen(base);
+
+    char names[64][320];
+    size_t count = 0;
+    DIR* d = opendir(dirbuf);
+    if (!d) return;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL && count < 64) {
+        if (strncmp(de->d_name, base, base_len) != 0) continue;
+        const char* suffix = de->d_name + base_len;
+        if (suffix[0] != '.' || !isdigit((unsigned char)suffix[1])) continue;
+        snprintf(names[count], sizeof(names[0]), "%s", de->d_name);
+        count++;
+    }
+    closedir(d);
+
+    /* Ascending strcmp == ascending timestamp for the numeric suffix. */
+    for (size_t i = 1; i < count; i++) {
+        char tmp[sizeof(names[0])];
+        memcpy(tmp, names[i], sizeof(tmp));
+        size_t j = i;
+        while (j > 0 && strcmp(names[j - 1], tmp) > 0) {
+            memcpy(names[j], names[j - 1], sizeof(names[0]));
+            j--;
+        }
+        memcpy(names[j], tmp, sizeof(tmp));
+    }
+    for (size_t i = 0; i + keep < count; i++) {
+        char full[640];
+        if (dirbuf[strlen(dirbuf) - 1] == '/') snprintf(full, sizeof(full), "%s%s", dirbuf, names[i]);
+        else snprintf(full, sizeof(full), "%s/%s", dirbuf, names[i]);
+        unlink(full);
+    }
+}
+
+static void audit_maybe_rotate(void) {
+    char apath[512];
+    build_audit_path(apath, sizeof(apath));
+    struct stat st;
+    if (stat(apath, &st) != 0) return;
+    if ((uint64_t)st.st_size < audit_rotate_threshold()) return;
+
+    char rotated[640];
+    long t = (long)time(NULL);
+    int attempt;
+    for (attempt = 0; attempt < 1000; attempt++) {
+        if (attempt == 0) snprintf(rotated, sizeof(rotated), "%s.%ld", apath, t);
+        else snprintf(rotated, sizeof(rotated), "%s.%ld.%d", apath, t, attempt);
+        if (access(rotated, F_OK) != 0) break;
+    }
+    if (attempt >= 1000) return; /* pathological; keep appending rather than lose records */
+
+    if (rename(apath, rotated) != 0) return;
+    audit_prune_rotated(apath);
+    /* Re-create the live file immediately so the next record — and any
+     * external tail — finds it in place with the right mode. */
+    int fd = open(apath, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (fd >= 0) close(fd);
+    chmod(apath, 0600);
 }
 /*
  * Asynchronous audit signing.
@@ -245,6 +357,12 @@ void qihse_audit_init(void) {
 
     char apath[512];
     build_audit_path(apath, sizeof(apath));
+#ifndef _WIN32
+    /* A file that already exceeds the threshold (e.g. after months of
+     * un-rotated runtime) is archived here at startup, before any new
+     * record lands. */
+    audit_maybe_rotate();
+#endif
     FILE *f = fopen(apath, "ab");
     if (f) {
         if (audit_pkey) {
@@ -283,6 +401,9 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     }
 
 #ifndef _WIN32
+    /* Rotate before this record is written so the oversized container is
+     * archived between records, never mid-record. */
+    audit_maybe_rotate();
     char apath2[512];
     build_audit_path(apath2, sizeof(apath2));
     int afd = open(apath2, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);

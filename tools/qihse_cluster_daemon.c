@@ -26,6 +26,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_fts.h"
 #include "qihse_qkp.h"
+#include "qihse_machine_auth.h"
 #include "qihse_platform.h"
 #include <netdb.h>
 #include <pthread.h>
@@ -853,6 +854,15 @@ int main(int argc, char** argv) {
     pqc.kem_pub_path = pqc_kem_pub;
     pqc.trusted_pubs = pqc_trusted;
     pqc.trusted_count = pqc_trusted_count;
+    /* MACHINEAUTH trust plane: the same file-configured ML-DSA anchors the
+     * bus trusts. Only explicitly configured anchors enable it (R4c
+     * philosophy: no flags → no machine auth → password AUTH only). */
+    if (pqc_trusted_count > 0) {
+        if (!qihse_machine_auth_configure(pqc_trusted, pqc_trusted_count)) {
+            fprintf(stderr, "qihse-cluster-daemon: warning: no --pqc-trusted-pub anchor loaded; "
+                            "MACHINEAUTH disabled (password AUTH only)\n");
+        }
+    }
     if (pqc_require || pqc_identity_dir) {
         bool have_keys = access(pqc.dsa_key_path, R_OK) == 0 &&
                          access(pqc.kem_key_path, R_OK) == 0 &&

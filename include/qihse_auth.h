@@ -138,17 +138,39 @@ bool qihse_auth_check_rate_limit(uint32_t source_ip);
 void qihse_auth_rate_limit_reset(uint32_t source_ip);
 void qihse_auth_rate_limit_cleanup(void);
 
-// --- IP-based auth rate limiting (brute-force protection) -------------------
-#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5
-#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC  60
-#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES 1024
+// --- IP-based AUTH volume limiting (auth-storm protection) ------------------
+// The brute-force limiter above counts attempts but RESETS on success, so a
+// client that authenticates correctly in a tight loop is never throttled.
+// The volume limiter counts every AUTH attempt per source IP regardless of
+// outcome and never resets on success. Defaults are deliberately generous
+// (120/min/IP): a legitimate fleet agent stays far below them, a reconnect
+// storm does not. Rejections apply for the remainder of the window.
+#define QIHSE_AUTH_VOLUME_DEFAULT_MAX_ATTEMPTS 120
+#define QIHSE_AUTH_VOLUME_DEFAULT_WINDOW_SEC   60
+#define QIHSE_AUTH_VOLUME_DEFAULT_MAX_ENTRIES  1024
 
-void qihse_auth_init_rate_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
-void qihse_auth_shutdown_rate_limiter(void);
+void qihse_auth_init_volume_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
+void qihse_auth_shutdown_volume_limiter(void);
+bool qihse_auth_check_volume_limit(uint32_t source_ip);
+void qihse_auth_volume_limit_reset(uint32_t source_ip);
 
-bool qihse_auth_check_rate_limit(uint32_t source_ip);
-void qihse_auth_rate_limit_reset(uint32_t source_ip);
-void qihse_auth_rate_limit_cleanup(void);
+// --- Password verifier cache -------------------------------------------------
+// A successful password verification is cached under a key that binds
+// (user_id, verifier salt, iteration count, presented password), so repeated
+// AUTHs with the same credentials skip the multi-second PBKDF2. No
+// authorization semantics change: account liveness, per-user lockout, the
+// rate limiters, and the post-KDF verifier-identity re-validation all still
+// run on every authentication — the cache replaces ONLY the KDF compute.
+// Because the key includes the account's current salt, a password rotation
+// invalidates the cached entry naturally. TTL 0 disables the cache.
+#define QIHSE_AUTH_CACHE_DEFAULT_TTL_SECONDS 300
+#define QIHSE_AUTH_CACHE_MAX_TTL_SECONDS     3600
+#define QIHSE_AUTH_CACHE_DEFAULT_CAPACITY    256
+
+void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity);
+void qihse_auth_cache_clear(void);
+// Hits/misses/stores since process start (stores == misses that then verified).
+void qihse_auth_cache_stats(uint64_t* out_hits, uint64_t* out_misses, uint64_t* out_stores);
 
 #ifdef __cplusplus
 }
