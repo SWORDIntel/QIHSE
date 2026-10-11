@@ -103,16 +103,30 @@ size_t qihse_graph_vector_search_user(qihse_graph_t* g, qihse_vector_db_t vdb,
 }
 
 /* Vector-guided traversal */
-size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
-                                   uint64_t start_vertex, const float* query, size_t dims,
-                                   float similarity_threshold, size_t max_hops,
-                                   uint64_t* out_vertex_ids, size_t max_out) {
+size_t qihse_graph_vector_traverse_user(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                        qihse_user_t* user,
+                                        uint64_t start_vertex, const float* query, size_t dims,
+                                        float similarity_threshold, size_t max_hops,
+                                        uint64_t* out_vertex_ids, size_t max_out) {
     if (!g || !out_vertex_ids || max_out == 0) return 0;
     
+    if (vdb && query && dims > 0) {
+        float* sv = (float*)malloc(dims * sizeof(float));
+        if (sv) {
+            size_t s_dims = 0;
+            bool got = qihse_vector_db_get_vector_by_id_user(vdb, user, start_vertex, sv, &s_dims);
+            free(sv);
+            if (!got && errno == EACCES) {
+                return 0;
+            }
+        }
+    }
+
     visited_t visited; vis_init(&visited);
     vis_add(&visited, start_vertex);
     
     uint64_t* frontier = malloc(256 * sizeof(uint64_t));
+    if (!frontier) { vis_free(&visited); return 0; }
     size_t fcount = 1; frontier[0] = start_vertex;
     size_t out_count = 0;
     
@@ -120,6 +134,7 @@ size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
     
     for (size_t h = 0; h < max_hops && fcount > 0; h++) {
         uint64_t* next_frontier = malloc(256 * sizeof(uint64_t));
+        if (!next_frontier) break;
         size_t next_count = 0;
         for (size_t f = 0; f < fcount; f++) {
             graph_adj_t adj[64];
@@ -136,8 +151,8 @@ size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
                     float* nbv = (float*)malloc(dims * sizeof(float));
                     if (!nbv) continue;
                     size_t nb_dims = 0;
-                    bool got = qihse_vector_db_get_vector_by_id(vdb, nb, nbv,
-                                                              &nb_dims);
+                    bool got = qihse_vector_db_get_vector_by_id_user(vdb, user, nb, nbv,
+                                                                    &nb_dims);
                     float score = -1.0f;
                     if (got && nb_dims == dims)
                         score = qihse_distance_cosine(query, nbv, dims);
@@ -155,14 +170,24 @@ size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
     return out_count;
 }
 
+size_t qihse_graph_vector_traverse(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                   uint64_t start_vertex, const float* query, size_t dims,
+                                   float similarity_threshold, size_t max_hops,
+                                   uint64_t* out_vertex_ids, size_t max_out) {
+    return qihse_graph_vector_traverse_user(g, vdb, NULL, start_vertex, query, dims,
+                                            similarity_threshold, max_hops,
+                                            out_vertex_ids, max_out);
+}
+
 /* Subgraph embedding: mean of the member vertices' embeddings.  A vertex
  * whose vector cannot be fetched (no embedding, dimension mismatch) is
  * skipped rather than folded in as a zero vector — a zero would bias the
  * mean toward the origin for no reason.  If NO vertex has a vector the
  * call fails: an all-zero "embedding" is not a subgraph embedding. */
-int qihse_graph_subgraph_embedding(qihse_graph_t* g, qihse_vector_db_t vdb,
-                                   const uint64_t* vertex_ids, size_t num_vertices,
-                                   size_t dims, float* out_embedding) {
+int qihse_graph_subgraph_embedding_user(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                        qihse_user_t* user,
+                                        const uint64_t* vertex_ids, size_t num_vertices,
+                                        size_t dims, float* out_embedding) {
     if (!g || !vdb || !vertex_ids || !out_embedding || dims == 0) return -1;
     memset(out_embedding, 0, dims * sizeof(float));
     float* buf = (float*)malloc(dims * sizeof(float));
@@ -170,8 +195,8 @@ int qihse_graph_subgraph_embedding(qihse_graph_t* g, qihse_vector_db_t vdb,
     size_t valid = 0;
     for (size_t i = 0; i < num_vertices; i++) {
         size_t got_dims = 0;
-        if (!qihse_vector_db_get_vector_by_id(vdb, vertex_ids[i], buf,
-                                              &got_dims)) continue;
+        if (!qihse_vector_db_get_vector_by_id_user(vdb, user, vertex_ids[i], buf,
+                                                  &got_dims)) continue;
         if (got_dims != dims) continue;
         for (size_t d = 0; d < dims; d++) out_embedding[d] += buf[d];
         valid++;
@@ -182,22 +207,47 @@ int qihse_graph_subgraph_embedding(qihse_graph_t* g, qihse_vector_db_t vdb,
     return 0;
 }
 
+int qihse_graph_subgraph_embedding(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                   const uint64_t* vertex_ids, size_t num_vertices,
+                                   size_t dims, float* out_embedding) {
+    return qihse_graph_subgraph_embedding_user(g, vdb, NULL, vertex_ids, num_vertices,
+                                               dims, out_embedding);
+}
+
 /* Hybrid recommendation */
-size_t qihse_graph_vector_recommend(qihse_graph_t* g, qihse_vector_db_t vdb,
-                                    uint64_t user_vertex, size_t k, size_t hops,
-                                    uint64_t* out_vertex_ids, float* out_scores, size_t max_out) {
+size_t qihse_graph_vector_recommend_user(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                         qihse_user_t* user,
+                                         uint64_t user_vertex, size_t k, size_t hops,
+                                         uint64_t* out_vertex_ids, float* out_scores, size_t max_out) {
     if (!g || !out_vertex_ids || max_out == 0) return 0;
     
+    if (vdb) {
+        size_t vdims = qihse_vector_db_get_dims(vdb);
+        if (vdims > 0) {
+            float* uv = (float*)malloc(vdims * sizeof(float));
+            if (uv) {
+                size_t uv_dims = 0;
+                bool got = qihse_vector_db_get_vector_by_id_user(vdb, user, user_vertex, uv, &uv_dims);
+                free(uv);
+                if (!got && errno == EACCES) {
+                    return 0;
+                }
+            }
+        }
+    }
+
     /* Step 1: Get graph neighbors of user_vertex */
     visited_t visited; vis_init(&visited);
     vis_add(&visited, user_vertex);
     
     uint64_t* frontier = malloc(256 * sizeof(uint64_t));
+    if (!frontier) { vis_free(&visited); return 0; }
     size_t fcount = 1; frontier[0] = user_vertex;
     scored_vertex_t* candidates = NULL; size_t ncand = 0, ccap = 0;
     
     for (size_t h = 0; h < hops && fcount > 0; h++) {
         uint64_t* next_frontier = malloc(256 * sizeof(uint64_t));
+        if (!next_frontier) break;
         size_t next_count = 0;
         for (size_t f = 0; f < fcount; f++) {
             graph_adj_t adj[64];
@@ -206,6 +256,20 @@ size_t qihse_graph_vector_recommend(qihse_graph_t* g, qihse_vector_db_t vdb,
                 uint64_t nb = adj[j].neighbor_id;
                 if (!vis_has(&visited, nb)) {
                     vis_add(&visited, nb);
+                    if (vdb) {
+                        size_t vdims = qihse_vector_db_get_dims(vdb);
+                        if (vdims > 0) {
+                            float* nbv = (float*)malloc(vdims * sizeof(float));
+                            if (nbv) {
+                                size_t nb_dims = 0;
+                                bool got = qihse_vector_db_get_vector_by_id_user(vdb, user, nb, nbv, &nb_dims);
+                                free(nbv);
+                                if (!got && errno == EACCES) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     /* Score: closer hops = higher score */
                     float score = 1.0f / (float)(h + 1);
                     sv_push(&candidates, &ncand, &ccap, nb, score);
@@ -234,6 +298,12 @@ size_t qihse_graph_vector_recommend(qihse_graph_t* g, qihse_vector_db_t vdb,
     }
     
     free(candidates); vis_free(&visited);
-    (void)vdb;
     return out_count;
+}
+
+size_t qihse_graph_vector_recommend(qihse_graph_t* g, qihse_vector_db_t vdb,
+                                    uint64_t user_vertex, size_t k, size_t hops,
+                                    uint64_t* out_vertex_ids, float* out_scores, size_t max_out) {
+    return qihse_graph_vector_recommend_user(g, vdb, NULL, user_vertex, k, hops,
+                                            out_vertex_ids, out_scores, max_out);
 }

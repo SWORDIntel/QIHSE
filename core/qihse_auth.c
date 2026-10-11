@@ -313,6 +313,12 @@ void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity) {
     if (capacity == 0) capacity = QIHSE_AUTH_CACHE_DEFAULT_CAPACITY;
     if (ttl_seconds > QIHSE_AUTH_CACHE_MAX_TTL_SECONDS) ttl_seconds = QIHSE_AUTH_CACHE_MAX_TTL_SECONDS;
     if (g_auth_cache && capacity != g_auth_cache_cap) {
+        for (size_t i = 0; i < g_auth_cache_cap; i++) {
+            if (g_auth_cache[i].valid) {
+                OPENSSL_cleanse(g_auth_cache[i].key, sizeof(g_auth_cache[i].key));
+            }
+        }
+        OPENSSL_cleanse(g_auth_cache, g_auth_cache_cap * sizeof(auth_cache_entry_t));
 #ifndef _WIN32
         munlock(g_auth_cache, g_auth_cache_cap * sizeof(auth_cache_entry_t));
 #endif
@@ -599,13 +605,18 @@ static bool resolve_authoritative_user_locked(const qihse_user_t* presented,
                                               uint32_t* out_user_id,
                                               authz_state_t* out_state) {
     if (!presented) return false;
-    uint32_t uid = presented->user_id;
-    if (uid < MAX_USERS && users[uid] == presented && authz_states[uid].active) {
-        if (out_user_id) *out_user_id = uid;
-        if (out_state) *out_state = authz_states[uid];
-        return true;
+    uint32_t uid = MAX_USERS;
+    for (uint32_t i = 0; i < MAX_USERS; i++) {
+        if (users[i] == presented && authz_states[i].active) {
+            uid = i;
+            break;
+        }
     }
-    return false;
+    if (uid == MAX_USERS) return false;
+
+    if (out_user_id) *out_user_id = uid;
+    if (out_state) *out_state = authz_states[uid];
+    return true;
 }
 
 static void set_authz_state_locked(uint32_t user_id, const qihse_user_t* user) {
@@ -785,7 +796,7 @@ static qihse_user_t* create_user_internal(const qihse_user_t* creator, uint32_t 
 
     // Operator password must be set before creating other users
     if (user_id != 0 && !authz_states[0].password_set) {
-        fprintf(stderr, "[SECURITY ERROR] Operator password must be configured before creating users.\n");
+        fprintf(stderr, "[SECURITY ERROR] Operator password must be set before creating users.\n");
         pthread_rwlock_unlock(&auth_rwlock);
         return NULL;
     }
@@ -954,7 +965,26 @@ bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id)
         return false;
     }
 
+    if (!users[target_user_id] || !authz_states[target_user_id].active) {
+        pthread_rwlock_unlock(&auth_rwlock);
+        return false;
+    }
+
+    // Tenant boundary scoping: non-system operator can only delete users in its own tenant
+    if (actor_authz.tenant_id != QIHSE_TENANT_SYSTEM &&
+        authz_states[target_user_id].tenant_id != actor_authz.tenant_id) {
+        pthread_rwlock_unlock(&auth_rwlock);
+        qihse_audit_log("USER_DESTROY_DENIED_TENANT", actor_id, target_user_id, 0, 0);
+        return false;
+    }
+
+    // Tenant operators cannot delete User 0; system operators require QIHSE_ALLOW_DESTROY_OPERATOR
     if (target_user_id == 0) {
+        if (actor_authz.tenant_id != QIHSE_TENANT_SYSTEM) {
+            pthread_rwlock_unlock(&auth_rwlock);
+            qihse_audit_log("USER_DESTROY_DENIED", actor_id, target_user_id, 0, 0);
+            return false;
+        }
         const char* allow_kill = getenv("QIHSE_ALLOW_DESTROY_OPERATOR");
         if (!allow_kill || strcmp(allow_kill, "1") != 0) {
             pthread_rwlock_unlock(&auth_rwlock);
@@ -1009,6 +1039,14 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
         return false;
     }
 
+    // Explicitly disallow modifying User 0 by any actor other than User 0 itself
+    if (target_user_id == 0 && operator_id != 0) {
+        fprintf(stderr, "[SECURITY ERROR] User 0 cannot be modified by any actor other than User 0 itself.\n");
+        pthread_rwlock_unlock(&auth_rwlock);
+        qihse_audit_log("USER_MODIFY_DENIED", operator_id, target_user_id, 0, 0);
+        return false;
+    }
+
     if (target_user_id != 0 && !authz_states[0].password_set) {
         fprintf(stderr, "[SECURITY ERROR] Operator password must be set before modifying other users.\n");
         pthread_rwlock_unlock(&auth_rwlock);
@@ -1018,6 +1056,15 @@ bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_u
     qihse_user_t* target = users[target_user_id];
     if (!target || !authz_states[target_user_id].active) {
         pthread_rwlock_unlock(&auth_rwlock);
+        return false;
+    }
+
+    // Enforce tenant boundary scoping: non-system operator can ONLY modify users within its own tenant,
+    // never in another tenant or in QIHSE_TENANT_SYSTEM
+    if (operator_authz.tenant_id != QIHSE_TENANT_SYSTEM &&
+        (target->tenant_id != operator_authz.tenant_id || target->tenant_id == QIHSE_TENANT_SYSTEM)) {
+        pthread_rwlock_unlock(&auth_rwlock);
+        qihse_audit_log("USER_MODIFY_DENIED", operator_id, target_user_id, 0, 0);
         return false;
     }
 
@@ -1373,6 +1420,20 @@ qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* usern
 
     if (target_id == MAX_USERS) {
         qihse_auth_check_rate_limit(source_ip);
+        /* SEC-29: Constant-time dummy PBKDF2 hash on username lookup miss to defeat timing enumeration. */
+        static const uint8_t dummy_salt[QIHSE_PW_SALT_BYTES] = {
+            0x24, 0x8a, 0x19, 0xf6, 0x93, 0xbb, 0x4e, 0x5a,
+            0x01, 0xd8, 0x3c, 0x77, 0x42, 0xe9, 0x6b, 0x1f
+        };
+        uint32_t iters = get_password_iterations();
+        if (iters < QIHSE_PW_MIN_ALLOWED_ITERATIONS) iters = QIHSE_PW_MIN_ITERATIONS;
+        qihse_password_verifier_t dummy_verifier;
+        memset(&dummy_verifier, 0, sizeof(dummy_verifier));
+        dummy_verifier.version = QIHSE_PW_VERIFIER_VERSION_1;
+        dummy_verifier.algorithm = QIHSE_PW_ALG_PBKDF2_HMAC_SHA384;
+        dummy_verifier.iterations = iters;
+        memcpy(dummy_verifier.salt, dummy_salt, QIHSE_PW_SALT_BYTES);
+        verify_password(password, &dummy_verifier);
         return NULL;
     }
 
@@ -1512,7 +1573,7 @@ bool qihse_user_can_create_users(const qihse_user_t* user) {
 }
 
 uint32_t qihse_user_get_tenant_id(const qihse_user_t* user) {
-    if (!user) return QIHSE_TENANT_SYSTEM;
+    if (!user) return QIHSE_TENANT_INVALID;
     pthread_rwlock_rdlock(&auth_rwlock);
     uint32_t uid;
     authz_state_t authz;
@@ -1521,7 +1582,7 @@ uint32_t qihse_user_get_tenant_id(const qihse_user_t* user) {
         return authz.tenant_id;
     }
     pthread_rwlock_unlock(&auth_rwlock);
-    return QIHSE_TENANT_SYSTEM;
+    return QIHSE_TENANT_INVALID;
 }
 
 bool qihse_auth_user_is_active(const qihse_user_t* user) {
@@ -1540,7 +1601,7 @@ bool qihse_auth_user_is_active(const qihse_user_t* user) {
 void qihse_auth_user_active_and_tenant(const qihse_user_t* user,
                                        bool* out_active, uint32_t* out_tenant) {
     bool active = false;
-    uint32_t tenant = QIHSE_TENANT_SYSTEM;
+    uint32_t tenant = QIHSE_TENANT_INVALID;
     if (user) {
         pthread_rwlock_rdlock(&auth_rwlock);
         uint32_t uid;

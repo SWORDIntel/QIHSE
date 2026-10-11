@@ -225,6 +225,22 @@ struct qihse_kv_store {
      * parallel when kv_lock is held read-side. */
     pthread_mutex_t sst_fd_lock;
     struct { int32_t sid; int fd; } sst_fds[8];
+    /* Store-internal operation lock (nil-GET fix 2026-10-02).  The store
+     * mutates its whole read structure in place: flush_memtable_to_sstable()
+     * swaps and destroys the memtable trie, sst_meta_index_grow() frees the
+     * index slot array mid-lookup, insert_internal() replaces payloads.  The
+     * RESP surface serializes with its engine kv_lock, but several modules
+     * (AI memory, federation, cluster brain, fabric dispatch, backup, the
+     * bus group path and the killswitch fan-out) call the public qihse_kv_*
+     * API directly on background threads with no external lock, so a lookup
+     * could land inside a flush window and answer nil for an existing key
+     * (or fault).  Every public operation now takes this lock: read-side for
+     * pure reads, write-side for mutations and for any path that may run
+     * compaction.  Lock ORDER with the engine kv_lock is strictly
+     * outer(kv_lock) -> inner(store_lock) and this lock never calls back
+     * out, so no cycle is possible.  Reader-preferring kind so enumeration
+     * callbacks may call qihse_kv_get_user re-entrantly (rd-over-rd). */
+    pthread_rwlock_t store_lock;
 };
 
 /* Drop and rebuild an empty SSTable metadata index.  Called whenever SSTables
@@ -1352,12 +1368,31 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     free(store);
 }
 
-void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) { if (store) store->bulk_load_mode = true; }
+void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
+    if (store) store->bulk_load_mode = true;
+}
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
     if (!store) return;
     store->bulk_load_mode = false;
     flush_wal_buffer(store);
 }
+
+/* ── Store-internal operation lock (nil-GET fix 2026-10-02) ──────────────
+ * Every public qihse_kv_* operation takes store_lock: read-side for pure
+ * reads, write-side for mutations and for paths that may run compaction.
+ * Internal *_impl helpers below carry the original bodies and NEVER take
+ * the lock themselves — only public entry points lock, so there is no
+ * same-thread wr->wr or rd->wr re-entry.  The one legal re-entry is
+ * rd-over-rd (enumeration callbacks calling qihse_kv_get_user), which the
+ * reader-preferring lock kind permits. */
+static void kv_store_rdlock(qihse_kv_store_t* store) { pthread_rwlock_rdlock(&store->store_lock); }
+static void kv_store_wrlock(qihse_kv_store_t* store) { pthread_rwlock_wrlock(&store->store_lock); }
+static void kv_store_unlock(qihse_kv_store_t* store) { pthread_rwlock_unlock(&store->store_lock); }
+
+/* Internal (lock-free) implementations, defined below near their public
+ * wrappers. */
+static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
+static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
 static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
                                  uint64_t expire_time_ms, uint16_t classification,
@@ -1410,7 +1445,11 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
 
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value,
                        uint16_t classification, uint16_t sci_compartment, qihse_user_t* user) {
-    return set_user_with_expiry(store, key, value, 0u, classification, sci_compartment, user);
+    if (!store) return false;
+    kv_store_wrlock(store);
+    bool ok = set_user_with_expiry(store, key, value, 0u, classification, sci_compartment, user);
+    kv_store_unlock(store);
+    return ok;
 }
 
 bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
@@ -1418,7 +1457,7 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
     return qihse_kv_set_user(store, key, value, classification, sci_compartment, NULL);
 }
 
-char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return NULL;
     if (!__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE)) {
         /* CAS-publish so concurrent readers (kv_lock read side) can't
@@ -1442,9 +1481,18 @@ char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* 
     char* value = r.value; r.value = NULL; lookup_result_free(&r); return value;
 }
 
+char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    if (!store) return NULL;
+    kv_store_rdlock(store);
+    char* value = kv_get_user_impl(store, key, user);
+    kv_store_unlock(store);
+    return value;
+}
+
 bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
                         qihse_user_t* user, qihse_kv_record_meta_t* out) {
     if (!store || !key || !out) return false;
+    kv_store_rdlock(store);
     memset(out, 0, sizeof(*out));
     /* Same lookup and same authorization gate as the value path; the value
      * is materialized by the lookup and freed here without ever leaving
@@ -1461,14 +1509,21 @@ bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
         out->flags = r.flags;
     }
     lookup_result_free(&r);
+    kv_store_unlock(store);
     return ok;
 }
 
 bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
-    char* v = qihse_kv_get_user(store, key, user); if (!v) return false; free(v); return true;
+    if (!store) return false;
+    kv_store_rdlock(store);
+    char* v = kv_get_user_impl(store, key, user);
+    kv_store_unlock(store);
+    if (!v) return false;
+    free(v);
+    return true;
 }
 
-bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return false;
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE) { lookup_result_free(&r); return false; }
@@ -1484,29 +1539,39 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* u
     return true;
 }
 
+bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    if (!store) return false;
+    kv_store_wrlock(store);
+    bool ok = kv_del_user_impl(store, key, user);
+    kv_store_unlock(store);
+    return ok;
+}
+
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user) {
     if (!store || !key) return false;
+    kv_store_wrlock(store);
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE || !qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
-        lookup_result_free(&r); return false;
+        lookup_result_free(&r); kv_store_unlock(store); return false;
     }
     uint64_t expire = current_time_ms();
-    if (UINT64_MAX - expire < ttl_ms) { lookup_result_free(&r); return false; }
+    if (UINT64_MAX - expire < ttl_ms) { lookup_result_free(&r); kv_store_unlock(store); return false; }
     expire += ttl_ms;
     bool ok = set_user_with_expiry(store, key, r.value, expire, r.classification, r.sci_compartment, user);
-    lookup_result_free(&r); return ok;
+    lookup_result_free(&r); kv_store_unlock(store); return ok;
 }
 
 int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return -2;
+    kv_store_rdlock(store);
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE || !qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
-        lookup_result_free(&r); return -2;
+        lookup_result_free(&r); kv_store_unlock(store); return -2;
     }
-    if (r.expire_time_ms == 0u) { lookup_result_free(&r); return -1; }
+    if (r.expire_time_ms == 0u) { lookup_result_free(&r); kv_store_unlock(store); return -1; }
     uint64_t now = current_time_ms();
-    if (r.expire_time_ms <= now) { lookup_result_free(&r); return -2; }
-    uint64_t remaining = r.expire_time_ms - now; lookup_result_free(&r);
+    if (r.expire_time_ms <= now) { lookup_result_free(&r); kv_store_unlock(store); return -2; }
+    uint64_t remaining = r.expire_time_ms - now; lookup_result_free(&r); kv_store_unlock(store);
     return remaining > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)remaining;
 }
 
@@ -1545,17 +1610,20 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
 }
 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
-    if (!store || !store->trie || store->bulk_load_mode) return;
+    if (!store || !store->trie) return;
+    kv_store_wrlock(store);
+    if (store->bulk_load_mode) { kv_store_unlock(store); return; }
     uint64_t now = current_time_ms();
     if (!store->sst_meta || store->sst_meta->degraded) {
         /* Index unavailable — expired SSTable records are invisible from RAM,
          * so keep the original merge-everything-then-sweep semantics. */
-        if (!compact_sstables_into_memtable(store)) return;
+        if (!compact_sstables_into_memtable(store)) { kv_store_unlock(store); return; }
         expired_collect_ctx_t ctx = { .now = now, .ok = true };
         qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx);
         if (ctx.ok) tombstone_expired_keys(store, ctx.keys, ctx.count);
         for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
         free(ctx.keys);
+        kv_store_unlock(store);
         return;
     }
     /* Fast path: tombstone expired memtable keys in RAM, and physically
@@ -1564,13 +1632,14 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
      * longer reads a single byte of SSTable data. */
     expired_collect_ctx_t ctx = { .now = now, .ok = true };
     qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx);
-    if (ctx.ok) tombstone_expired_keys(store, ctx.keys, ctx.count);
+        if (ctx.ok) tombstone_expired_keys(store, ctx.keys, ctx.count);
     for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
     free(ctx.keys);
     if (sst_meta_index_has_expired(store->sst_meta, now) ||
         store->sstable_counter >= KV_SSTABLE_COMPACT_THRESHOLD) {
         (void)compact_sstables_stream(store);
     }
+    kv_store_unlock(store);
 }
 
 typedef struct { qihse_user_t* user; qihse_kv_iter_cb cb; void* user_data; uint64_t now; bool ok; } foreach_user_ctx_t;
@@ -1592,17 +1661,35 @@ static bool foreach_sst_emit_cb(const char* key, const kv_disk_record_t* r, void
 bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
                            qihse_kv_iter_cb cb, void* user_data) {
     if (!store || !store->trie || !cb) return false;
-    if (!store->sst_meta || store->sst_meta->degraded) {
-        if (!compact_sstables_into_memtable(store)) return false;
-        foreach_user_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data, .now = current_time_ms(), .ok = true };
-        qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
-        return ctx.ok;
+    kv_store_rdlock(store);
+    bool compact_needed = store->sstable_counter > 0 &&
+                          (!store->sst_meta || store->sst_meta->degraded);
+    kv_store_unlock(store);
+    if (compact_needed) {
+        /* Degraded index: merge under the WRITE side, then restart so the
+         * user callback always runs with only a read lock (it may re-enter
+         * this store for another authorized read). */
+        kv_store_wrlock(store);
+        bool ok = store->sstable_counter == 0 ||
+                  ((store->sst_meta && !store->sst_meta->degraded) ||
+                   compact_sstables_into_memtable(store));
+        kv_store_unlock(store);
+        return ok && qihse_kv_foreach_user(store, user, cb, user_data);
     }
-    /* No compaction: iterate the memtable, then stream only the
-     * index-pinned newest live records from each SSTable. */
+    /* No compaction: iterate the memtable, then stream the index-pinned
+     * newest SSTable records. Callbacks may re-enter qihse_kv_get_user. */
+    /* Recheck after taking the read lock: a writer may have degraded the
+     * index between the first probe and this lock. */
+    kv_store_rdlock(store);
+    if (store->sstable_counter > 0 && (!store->sst_meta || store->sst_meta->degraded)) {
+        kv_store_unlock(store);
+        return qihse_kv_foreach_user(store, user, cb, user_data);
+    }
     foreach_user_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data, .now = current_time_ms(), .ok = true };
     qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
-    int rc = sst_foreach_newest(store, false, foreach_sst_emit_cb, &ctx);
+    int rc = store->sstable_counter > 0
+           ? sst_foreach_newest(store, false, foreach_sst_emit_cb, &ctx) : 0;
+    kv_store_unlock(store);
     return rc >= 0;
 }
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
@@ -1618,19 +1705,31 @@ static bool count_cb(const char* key, void* value, size_t value_size, void* user
 }
 size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
     if (!store || !store->trie) return 0u;
-    if (!store->sst_meta || store->sst_meta->degraded) {
-        if (!compact_sstables_into_memtable(store)) return 0u;
-        count_ctx_t ctx = { .user = user, .count = 0u, .now = current_time_ms() };
-        qihse_trinary_trie_foreach(store->trie, count_cb, &ctx);
-        return ctx.count;
+    kv_store_rdlock(store);
+    bool compact_needed = store->sstable_counter > 0 &&
+                          (!store->sst_meta || store->sst_meta->degraded);
+    kv_store_unlock(store);
+    if (compact_needed) {
+        kv_store_wrlock(store);
+        bool ok = store->sstable_counter == 0 ||
+                  ((store->sst_meta && !store->sst_meta->degraded) ||
+                   compact_sstables_into_memtable(store));
+        kv_store_unlock(store);
+        if (!ok) return 0u;
+        return qihse_kv_count_user(store, user);
     }
     /* No compaction: count live+authorized memtable keys, then live+
      * authorized index entries not shadowed by the memtable.  Pure RAM. */
+    kv_store_rdlock(store);
+    if (store->sstable_counter > 0 && (!store->sst_meta || store->sst_meta->degraded)) {
+        kv_store_unlock(store);
+        return qihse_kv_count_user(store, user);
+    }
     uint64_t now = current_time_ms();
     count_ctx_t ctx = { .user = user, .count = 0u, .now = now };
     qihse_trinary_trie_foreach(store->trie, count_cb, &ctx);
     const sst_meta_index_t* idx = store->sst_meta;
-    for (size_t i = 0; i < idx->cap; i++) {
+    for (size_t i = 0; idx && i < idx->cap; i++) {
         const sst_meta_entry_t* e = &idx->slots[i];
         if (!e->key) continue;
         if ((e->flags & KV_FLAG_TOMBSTONE) != 0u ||
@@ -1640,6 +1739,7 @@ size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
         if (qihse_trinary_trie_search(store->trie, e->key, &z) != NULL) continue;
         ctx.count++;
     }
+    kv_store_unlock(store);
     return ctx.count;
 }
 size_t qihse_kv_count(qihse_kv_store_t* store) { return qihse_kv_count_user(store, NULL); }
@@ -1656,24 +1756,26 @@ static bool fsync_dir_path(const char* dir) {
 
 bool qihse_kv_sync_store(qihse_kv_store_t* store) {
     if (!store || !store->trie) return false;
+    kv_store_wrlock(store);
     /* 1. WAL: stdio buffer to the kernel, then the fd itself. Without the
      * fsync the WAL lives only in the page cache -- fine against process
      * death, lost on power loss; SAVE promises both. */
     if (store->wal_fd) {
-        if (fflush(store->wal_fd) != 0) return false;
+        if (fflush(store->wal_fd) != 0) { kv_store_unlock(store); return false; }
         int wfd = fileno(store->wal_fd);
-        if (wfd >= 0 && fsync(wfd) != 0) return false;
+        if (wfd >= 0 && fsync(wfd) != 0) { kv_store_unlock(store); return false; }
         store->wal_unflushed_bytes = 0u;
     }
     /* 2. Memtable -> new SSTable (atomic rename, file fsynced inside the
      * atomic commit) + WAL rotation. Every mutation lands in BOTH the WAL
      * and the memtable, so an empty memtable means the WAL holds nothing
      * that is not already durable -- skip the flush, keep the fsyncs. */
-    if (store->mem_usage > 0u && !flush_memtable_to_sstable(store)) return false;
+    if (store->mem_usage > 0u && !flush_memtable_to_sstable(store)) { kv_store_unlock(store); return false; }
     /* 3. The renames above and in flush/rotate are only as durable as the
      * directory entry that points at them. */
     const char* dir = get_qihse_data_dir();
-    if (dir && !fsync_dir_path(dir)) return false;
+    if (dir && !fsync_dir_path(dir)) { kv_store_unlock(store); return false; }
+    kv_store_unlock(store);
     return true;
 }
 
@@ -1693,6 +1795,10 @@ static bool clear_collect_cb(const char* key, void* value, size_t value_size, vo
 }
 size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
     if (!store || !store->trie) return 0u;
+    /* Whole-operation write side: this enumerates, tombstones, and may
+     * compact — and the internal deletes use kv_del_user_impl so the lock
+     * is taken exactly once. */
+    kv_store_wrlock(store);
     uint64_t now = current_time_ms();
     clear_collect_ctx_t ctx = { .user = user, .now = now, .ok = true };
     bool fast = store->sst_meta && !store->sst_meta->degraded;
@@ -1721,13 +1827,14 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
         }
     }
     size_t removed = 0u;
-    if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (qihse_kv_del_user(store, ctx.keys[i], user)) removed++;
+    if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (kv_del_user_impl(store, ctx.keys[i], user)) removed++;
     for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
     free(ctx.keys);
     /* Physically purge the SSTable copies of everything just tombstoned —
      * same on-disk removal guarantee as the old compact-first version. */
     if (removed > 0 && fast && store->sstable_counter > 0)
         (void)compact_sstables_stream(store);
+    kv_store_unlock(store);
     return removed;
 }
 size_t qihse_kv_clear(qihse_kv_store_t* store) { return qihse_kv_clear_user(store, NULL); }
@@ -1761,9 +1868,13 @@ static bool export_sst_write_cb(const char* key, const kv_disk_record_t* r, void
 
 int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
     if (!store || !store->trie || !filepath) return -1;
+    /* The fast path only reads (trie + index + immutable SSTables), but the
+     * !fast path compacts; taking the WRITE side unconditionally keeps the
+     * snapshot internally consistent either way. */
+    kv_store_wrlock(store);
     uint64_t now = current_time_ms();
     bool fast = store->sst_meta && !store->sst_meta->degraded;
-    if (!fast && !compact_sstables_into_memtable(store)) return -1;
+    if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     /* Auth gate: refuse the whole snapshot if any live record is above the
      * caller's clearance.  The index carries classification metadata, so on
      * the fast path this check touches no values and no disk. */
@@ -1782,17 +1893,18 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
                 auth.authorized = false;
         }
     }
-    if (!auth.authorized) { errno = EACCES; return -2; }
+    if (!auth.authorized) { errno = EACCES; kv_store_unlock(store); return -2; }
     char tmp[8192]; FILE* f = NULL;
-    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
+    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) { kv_store_unlock(store); return -1; }
     export_write_ctx_t wr = { .f = f, .now = now, .ok = true };
     qihse_trinary_trie_foreach(store->trie, export_write_cb, &wr);
     if (wr.ok && fast) {
         int rc = sst_foreach_newest(store, false, export_sst_write_cb, &wr);
         if (rc < 0) wr.ok = false;
     }
-    if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
-    if (!atomic_file_commit(f, tmp, filepath)) return -1;
+    if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); kv_store_unlock(store); return -1; }
+    if (!atomic_file_commit(f, tmp, filepath)) { kv_store_unlock(store); return -1; }
+    kv_store_unlock(store);
     return 0;
 }
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_save_user(store, filepath, NULL); }
@@ -1842,14 +1954,21 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
                                   &replacement_max_seq))
         return errno == EACCES ? -2 : -1;
     char wal_path[4096], wal_tmp[8192];
-    if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) { qihse_trinary_trie_destroy(replacement); return -1; }
+    kv_store_wrlock(store);
+    if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) {
+        kv_store_unlock(store); qihse_trinary_trie_destroy(replacement); return -1;
+    }
     FILE* new_wal_tmp = NULL;
-    if (!atomic_file_begin(wal_path, wal_tmp, sizeof(wal_tmp), &new_wal_tmp)) { qihse_trinary_trie_destroy(replacement); return -1; }
-    if (!atomic_file_commit(new_wal_tmp, wal_tmp, wal_path)) { qihse_trinary_trie_destroy(replacement); return -1; }
+    if (!atomic_file_begin(wal_path, wal_tmp, sizeof(wal_tmp), &new_wal_tmp)) {
+        kv_store_unlock(store); qihse_trinary_trie_destroy(replacement); return -1;
+    }
+    if (!atomic_file_commit(new_wal_tmp, wal_tmp, wal_path)) {
+        kv_store_unlock(store); qihse_trinary_trie_destroy(replacement); return -1;
+    }
     int new_wal_fd = open(wal_path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
-    if (new_wal_fd < 0) { qihse_trinary_trie_destroy(replacement); return -1; }
+    if (new_wal_fd < 0) { kv_store_unlock(store); qihse_trinary_trie_destroy(replacement); return -1; }
     FILE* new_wal = fdopen(new_wal_fd, "ab");
-    if (!new_wal) { close(new_wal_fd); qihse_trinary_trie_destroy(replacement); return -1; }
+    if (!new_wal) { close(new_wal_fd); kv_store_unlock(store); qihse_trinary_trie_destroy(replacement); return -1; }
     qihse_trinary_trie_t* old = store->trie; FILE* old_wal = store->wal_fd;
     store->trie = replacement; store->mem_usage = replacement_usage; store->wal_fd = new_wal; store->wal_unflushed_bytes = 0u;
     /* A restore must not regress the change sequence: the loaded records
@@ -1869,6 +1988,7 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     store->sstable_counter = 0;
     sst_meta_index_reset(store);
     sst_fd_cache_clear(store);
+    kv_store_unlock(store);
     return 0;
 }
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
@@ -2021,8 +2141,12 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
                                * unless the principal sees something newer */
     ctx.ok = true;
 
+    /* This can compact a degraded index and otherwise reads both the trie
+     * and SSTable metadata as one snapshot.  Serialize the complete walk so
+     * concurrent writes cannot move records between those two sources. */
+    kv_store_wrlock(store);
     bool fast = store->sst_meta && !store->sst_meta->degraded;
-    if (!fast && !compact_sstables_into_memtable(store)) return -1;
+    if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
     if (ctx.ok && fast) {
         int rc = sst_foreach_newest(store, true, delta_sst_cb, &ctx);
@@ -2030,8 +2154,10 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
     }
     if (!ctx.ok) {
         qihse_kv_delta_records_free(ctx.recs, ctx.count);
+        kv_store_unlock(store);
         return -1;
     }
+    kv_store_unlock(store);
     if (ctx.count > 1u) {
         qsort(ctx.recs, ctx.count, sizeof(*ctx.recs), delta_record_cmp);
     }
@@ -2085,7 +2211,10 @@ int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath,
 
 bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
     if (!store) return false;
+    kv_store_rdlock(store);
     qihse_quantum_defense_ctx_t* ctx = __atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE);
-    return ctx && qihse_qdd_is_under_attack(ctx);
+    bool under_attack = ctx && qihse_qdd_is_under_attack(ctx);
+    kv_store_unlock(store);
+    return under_attack;
 }
 

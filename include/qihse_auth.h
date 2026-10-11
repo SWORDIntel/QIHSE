@@ -52,6 +52,7 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 // qihse_auth_create_user(). Tenant principals (tenant_id != 0) are scoped to
 // their own "t:<tenant_id>/" key namespace plus the shared "commons/" one.
 #define QIHSE_TENANT_SYSTEM 0u
+#define QIHSE_TENANT_INVALID UINT32_MAX
 
 // Create a tenant-scoped user. Same privilege ladder as qihse_auth_create_user,
 // plus (invariant #2): a tenant-scoped creator may only create principals

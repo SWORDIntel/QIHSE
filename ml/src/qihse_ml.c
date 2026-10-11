@@ -2237,30 +2237,82 @@ void qihse_telemetry_record_event(
     /* If full, could implement circular buffer or drop oldest */
 }
 
+static void qihse_json_escape_string(const char* src, char* dst, size_t dst_size) {
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0' && d + 1 < dst_size; s++) {
+        char c = src[s];
+        switch (c) {
+            case '"':
+                if (d + 2 < dst_size) { dst[d++] = '\\'; dst[d++] = '"'; }
+                break;
+            case '\\':
+                if (d + 2 < dst_size) { dst[d++] = '\\'; dst[d++] = '\\'; }
+                break;
+            case '\n':
+                if (d + 2 < dst_size) { dst[d++] = '\\'; dst[d++] = 'n'; }
+                break;
+            case '\r':
+                if (d + 2 < dst_size) { dst[d++] = '\\'; dst[d++] = 'r'; }
+                break;
+            case '\t':
+                if (d + 2 < dst_size) { dst[d++] = '\\'; dst[d++] = 't'; }
+                break;
+            default:
+                dst[d++] = c;
+                break;
+        }
+    }
+    dst[d] = '\0';
+}
+
 char* qihse_telemetry_export_json(const qihse_telemetry_collector_t* collector) {
     if (!collector) return NULL;
 
-    /* Simple JSON export - in production, use proper JSON library */
-    size_t json_size = 1024 + collector->num_events * 256;
+    /* Proper JSON export with string escaping and bounds-checked buffer sizing */
+    size_t json_size = 1024 + collector->num_events * 1024;
     char* json = calloc(json_size, sizeof(char));
     if (!json) return NULL;
 
-    snprintf(json, json_size, "%s", "{\"events\":[");
+    size_t offset = 0;
+    int written = snprintf(json + offset, json_size - offset, "%s", "{\"events\":[");
+    if (written < 0 || (size_t)written >= json_size - offset) {
+        free(json);
+        return NULL;
+    }
+    offset += (size_t)written;
 
     for (size_t i = 0; i < collector->num_events; i++) {
         const qihse_telemetry_event_data_t* event = &collector->events[i];
 
-        char event_json[256];
-        snprintf(event_json, sizeof(event_json),
-                "{\"type\":%d,\"timestamp\":%llu,\"component\":\"%s\",\"operation\":\"%s\",\"value\":%f,\"metadata\":\"%s\"}",
-                event->type, (unsigned long long)event->timestamp_us,
-                event->component, event->operation, event->value, event->metadata);
+        char esc_comp[128];
+        char esc_op[128];
+        char esc_meta[512];
+        qihse_json_escape_string(event->component, esc_comp, sizeof(esc_comp));
+        qihse_json_escape_string(event->operation, esc_op, sizeof(esc_op));
+        qihse_json_escape_string(event->metadata, esc_meta, sizeof(esc_meta));
 
-        if (i > 0) strcat(json, ",");
-        strcat(json, event_json);
+        written = snprintf(json + offset, json_size - offset,
+                "%s{\"type\":%d,\"timestamp\":%llu,\"component\":\"%s\",\"operation\":\"%s\",\"value\":%f,\"metadata\":\"%s\"}",
+                (i > 0 ? "," : ""),
+                event->type, (unsigned long long)event->timestamp_us,
+                esc_comp, esc_op, event->value, esc_meta);
+        if (written < 0 || (size_t)written >= json_size - offset) {
+            break;
+        }
+        offset += (size_t)written;
     }
 
-    strcat(json, "]}");
+    if (offset + 3 <= json_size) {
+        written = snprintf(json + offset, json_size - offset, "%s", "]}");
+        if (written > 0 && (size_t)written < json_size - offset) {
+            offset += (size_t)written;
+        }
+    }
     return json;
 }
 

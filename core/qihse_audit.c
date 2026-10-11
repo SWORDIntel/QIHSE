@@ -255,12 +255,12 @@ void qihse_audit_verify_integrity(void) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
             if (strncmp(stored_hash, last_hash, 96) != 0) {
-                // Security is optional by default — log warning but do not abort.
-                // This matches the README: "by default, QIHSE grants full access
-                // so you can build fast. If you don't need it, it stays out of your way."
-                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode).\n");
-                // Reset chain to current state instead of locking down
-                update_integrity_chain(last_hash);
+                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected!\n");
+                const char* strict = getenv("QIHSE_STRICT_AUDIT");
+                if (strict && strcmp(strict, "1") == 0) {
+                    fprintf(stderr, "[QIHSE AUDIT] Strict audit enforcement: aborting on integrity mismatch.\n");
+                    abort();
+                }
             }
         }
         fclose(sf);
@@ -277,8 +277,12 @@ void qihse_audit_verify_integrity(void) {
         char stored_hash[129];
         if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
             if (strncmp(stored_hash, last_hash, 96) != 0) {
-                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode).\n");
-                update_integrity_chain(last_hash);
+                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected!\n");
+                const char* strict = getenv("QIHSE_STRICT_AUDIT");
+                if (strict && strcmp(strict, "1") == 0) {
+                    fprintf(stderr, "[QIHSE AUDIT] Strict audit enforcement: aborting on integrity mismatch.\n");
+                    abort();
+                }
             }
         }
         fclose(sf);

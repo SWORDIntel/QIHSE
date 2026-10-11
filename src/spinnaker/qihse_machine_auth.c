@@ -160,8 +160,8 @@ static machine_ledger_outcome_t machine_ledger_consume_locked(
     ssize_t free_slot = -1;
     for (size_t i = 0; i < QIHSE_MACHINE_LEDGER_CAP; i++) {
         machine_ledger_entry_t* e = &g_machine.ledger[i];
-        if (e->used && e->expires_ms <= now) {
-            memset(e, 0, sizeof(*e)); /* expired: purge */
+        if (e->used && e->expires_ms + QIHSE_MACHINE_CLOCK_SKEW_MS <= now) {
+            memset(e, 0, sizeof(*e)); /* expired + skew grace elapsed: purge */
         }
         if (e->used && memcmp(e->nonce.bytes, nonce->bytes, QIHSE_UUID_BYTES) == 0) {
             return MACHINE_LEDGER_REPLAY;

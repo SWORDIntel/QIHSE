@@ -1,6 +1,7 @@
 #include "qihse_resp_wire.h"
 #include "qihse_resp_engine.h"
 #include "qihse_vector_db.h"
+#include "qihse_auth.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,7 +225,17 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                 snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(info), info);
                 resp_write_all(client_fd, reply, strlen(reply));
             } else if (strcasecmp(args[0], "VECSET") == 0 && argc >= 3) {
+                if (!current_user) {
+                    const char* reply = "-NOAUTH Authentication required.\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 uint64_t id = strtoull(args[1], NULL, 10);
+                if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_WRITE)) {
+                    const char* reply = "-ERR Access denied\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 int dim = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048) {
                     const char* reply = "-ERR invalid dimension\r\n";
@@ -243,7 +254,17 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "VECGET") == 0 && argc >= 2) {
+                if (!current_user) {
+                    const char* reply = "-NOAUTH Authentication required.\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 uint64_t id = strtoull(args[1], NULL, 10);
+                if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_READ)) {
+                    const char* reply = "-ERR Access denied\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 size_t dims = qihse_vector_db_get_dims(vdb);
                 if (dims == 0) {
                     const char* reply = "-ERR vector database not initialized\r\n";

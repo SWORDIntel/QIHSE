@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -306,6 +307,7 @@ static qihse_bolt_value_t* bolt_decode_string_payload(qihse_bolt_decoder_t* d, s
 }
 
 static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, size_t count) {
+    if (count > 65536u) return NULL;
     qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
     if (!v) return NULL;
     v->v.list.count = count;
@@ -319,6 +321,7 @@ static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, siz
 }
 
 static qihse_bolt_value_t* bolt_decode_map_entries(qihse_bolt_decoder_t* d, size_t count) {
+    if (count > 65536u) return NULL;
     qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
     if (!v) return NULL;
     v->v.map.count = count;
@@ -430,7 +433,9 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     }
     if (marker == 0xD6) {
         if (!bolt_have(d, 4)) return NULL;
-        return bolt_decode_list_entries(d, bolt_get_u32be(d));
+        uint32_t count = bolt_get_u32be(d);
+        if (count > 65536u) return NULL;
+        return bolt_decode_list_entries(d, count);
     }
 
     /* Maps: Map 8 (0xD8), Map 16 (0xD9), Map 32 (0xDA) */
@@ -444,7 +449,9 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     }
     if (marker == 0xDA) {
         if (!bolt_have(d, 4)) return NULL;
-        return bolt_decode_map_entries(d, bolt_get_u32be(d));
+        uint32_t count = bolt_get_u32be(d);
+        if (count > 65536u) return NULL;
+        return bolt_decode_map_entries(d, count);
     }
 
     /* Structs */
@@ -479,6 +486,7 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     if (marker == 0xB2) {
         if (!bolt_have(d, 5)) return NULL;
         uint32_t nfields = bolt_get_u32be(d);
+        if (nfields > 65536u) return NULL;
         uint8_t sig = d->data[d->pos++];
         qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRUCT);
         v->v.strct.signature = sig;
@@ -1036,6 +1044,22 @@ done:
  * Server
  * ============================================================ */
 
+typedef struct {
+    int client_fd;
+    qihse_uwp_context_t* ctx;
+} qihse_bolt_client_arg_t;
+
+static void* bolt_client_worker(void* arg) {
+    qihse_bolt_client_arg_t* carg = (qihse_bolt_client_arg_t*)arg;
+    int cfd = carg->client_fd;
+    qihse_uwp_context_t* ctx = carg->ctx;
+    free(carg);
+
+    pthread_detach(pthread_self());
+    qihse_bolt_handle_client(cfd, ctx);
+    return NULL;
+}
+
 bool qihse_start_bolt_server(qihse_uwp_context_t* ctx, uint16_t port, const char* bind_address) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("bolt socket"); return false; }
@@ -1073,7 +1097,19 @@ bool qihse_start_bolt_server(qihse_uwp_context_t* ctx, uint16_t port, const char
         socklen_t clen = sizeof(caddr);
         int cfd = accept(server_fd, (struct sockaddr*)&caddr, &clen);
         if (cfd < 0) continue;
-        qihse_bolt_handle_client(cfd, ctx);
+        qihse_bolt_client_arg_t* carg = (qihse_bolt_client_arg_t*)malloc(sizeof(*carg));
+        if (!carg) {
+            close(cfd);
+            continue;
+        }
+        carg->client_fd = cfd;
+        carg->ctx = ctx;
+        pthread_t th;
+        if (pthread_create(&th, NULL, bolt_client_worker, carg) != 0) {
+            close(cfd);
+            free(carg);
+            continue;
+        }
     }
     close(server_fd);
     return true;

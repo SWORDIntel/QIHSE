@@ -286,7 +286,7 @@ bool qihse_task_submit(
     char* out_task_id,
     size_t id_buf_len
 ) {
-    if (!queue || !payload || payload_len == 0) return false;
+    if (!queue || !payload || payload_len == 0 || payload_len > QIHSE_TASK_MAX_PAYLOAD_SIZE) return false;
     const char* qname = queue_name && queue_name[0] ? queue_name : "default";
 
     qihse_task_t* task = (qihse_task_t*)calloc(1, sizeof(qihse_task_t));
@@ -438,6 +438,26 @@ bool qihse_task_get_result(
         snprintf(key, sizeof(key), "result:%s", task_id);
         char* val = qihse_kv_get(queue->kv_store, key);
         if (val) {
+            if (strncmp(val, "hex:", 4) == 0) {
+                size_t hlen = strlen(val + 4);
+                size_t bin_len = hlen / 2;
+                uint8_t* bin = (uint8_t*)malloc(bin_len + 1);
+                if (bin) {
+                    for (size_t i = 0; i < bin_len; i++) {
+                        char byte_str[3] = { val[4 + i * 2], val[4 + i * 2 + 1], '\0' };
+                        bin[i] = (uint8_t)strtoul(byte_str, NULL, 16);
+                    }
+                    bin[bin_len] = '\0';
+                    free(val);
+                    if (out_result && out_result_len) {
+                        *out_result = bin;
+                        *out_result_len = bin_len;
+                    } else {
+                        free(bin);
+                    }
+                    return true;
+                }
+            }
             size_t len = strlen(val);
             if (out_result && out_result_len) {
                 *out_result = (uint8_t*)val;
@@ -739,9 +759,10 @@ bool qihse_task_complete(
 
     if (task->result) free(task->result);
     if (result && result_len > 0) {
-        task->result = (uint8_t*)malloc(result_len);
+        task->result = (uint8_t*)malloc(result_len + 1);
         if (task->result) {
             memcpy(task->result, result, result_len);
+            task->result[result_len] = '\0';
             task->result_len = result_len;
         }
     } else {
@@ -764,14 +785,32 @@ bool qihse_task_complete(
 
         if (task->result && task->result_len > 0) {
             snprintf(key, sizeof(key), "result:%s", task_id);
-            /* Store result with TTL */
-            char* res_str = (char*)malloc(task->result_len + 1);
-            if (res_str) {
-                memcpy(res_str, task->result, task->result_len);
-                res_str[task->result_len] = '\0';
-                qihse_kv_set(queue->kv_store, key, res_str, 0, 0);
-                qihse_kv_expire(queue->kv_store, key, task->opts.result_ttl_ms, NULL);
-                free(res_str);
+            /* Store result with TTL. For binary results with embedded nulls, hex encode */
+            bool has_null = (memchr(task->result, '\0', task->result_len) != NULL);
+            if (has_null) {
+                size_t hex_cap = 4 + task->result_len * 2 + 1;
+                char* hex_str = (char*)malloc(hex_cap);
+                if (hex_str) {
+                    memcpy(hex_str, "hex:", 4);
+                    static const char hex_digits[] = "0123456789abcdef";
+                    for (size_t i = 0; i < task->result_len; i++) {
+                        hex_str[4 + i * 2]     = hex_digits[(task->result[i] >> 4) & 0x0F];
+                        hex_str[4 + i * 2 + 1] = hex_digits[task->result[i] & 0x0F];
+                    }
+                    hex_str[4 + task->result_len * 2] = '\0';
+                    qihse_kv_set(queue->kv_store, key, hex_str, 0, 0);
+                    qihse_kv_expire(queue->kv_store, key, task->opts.result_ttl_ms, NULL);
+                    free(hex_str);
+                }
+            } else {
+                char* res_str = (char*)malloc(task->result_len + 1);
+                if (res_str) {
+                    memcpy(res_str, task->result, task->result_len);
+                    res_str[task->result_len] = '\0';
+                    qihse_kv_set(queue->kv_store, key, res_str, 0, 0);
+                    qihse_kv_expire(queue->kv_store, key, task->opts.result_ttl_ms, NULL);
+                    free(res_str);
+                }
             }
         }
     }

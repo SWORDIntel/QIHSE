@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <inttypes.h>
 
@@ -52,6 +53,11 @@ void qihse_task_worker_pool_config_init(qihse_task_worker_pool_config_t* config)
     config->custom_handler_ctx = NULL;
 }
 
+static void qihse_lua_worker_hook(lua_State* L, lua_Debug* ar) {
+    (void)ar;
+    luaL_error(L, "[QIHSE Security] Instruction count quota exceeded. Sandbox killed.");
+}
+
 static bool execute_lua_task(
     const qihse_task_t* task,
     uint8_t** out_result,
@@ -64,7 +70,55 @@ static bool execute_lua_task(
         snprintf(out_error, err_len, "Failed to initialize Lua state");
         return false;
     }
-    luaL_openlibs(L);
+
+    /* Open only safe standard libraries (base, table, string, math). Do NOT call luaL_openlibs(L). */
+    lua_pushcfunction(L, luaopen_base);
+    lua_pushstring(L, "");
+    lua_call(L, 1, 0);
+
+    lua_pushcfunction(L, luaopen_table);
+    lua_pushstring(L, LUA_TABLIBNAME);
+    lua_call(L, 1, 0);
+
+    lua_pushcfunction(L, luaopen_string);
+    lua_pushstring(L, LUA_STRLIBNAME);
+    lua_call(L, 1, 0);
+
+    lua_pushcfunction(L, luaopen_math);
+    lua_pushstring(L, LUA_MATHLIBNAME);
+    lua_call(L, 1, 0);
+
+    /* Explicitly remove/set nil on unsafe functions */
+    lua_pushnil(L);
+    lua_setglobal(L, "loadfile");
+    lua_pushnil(L);
+    lua_setglobal(L, "dofile");
+
+    lua_getglobal(L, "os");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "execute");
+        lua_pushnil(L);
+        lua_setfield(L, -2, "exit");
+    }
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "io");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "popen");
+    }
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "package");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "loadlib");
+    }
+    lua_pop(L, 1);
+
+    /* Set instruction count hook to prevent infinite loops */
+    lua_sethook(L, qihse_lua_worker_hook, LUA_MASKCOUNT, 1000000);
 
     const char* script = (const char*)task->payload;
     if (strncasecmp(script, "lua:", 4) == 0) script += 4;
@@ -117,8 +171,7 @@ static bool execute_python_subprocess(
 
     const char* py_script =
         "import sys, os, json, importlib\n"
-        "sys.path.insert(0, '')\n"
-        "sys.path.insert(0, os.getcwd())\n"
+        "ALLOWED_MODULES = {'math', 'datetime', 'qihse', 'qihse_task'}\n"
         "try:\n"
         "    try:\n"
         "        import msgpack\n"
@@ -130,17 +183,26 @@ static bool execute_python_subprocess(
         "    except ImportError:\n"
         "        raw = sys.stdin.read()\n"
         "        data = json.loads(raw)\n"
-        "    if isinstance(data, dict) and 'func' in data:\n"
-        "        mod_name, func_name = data['func'].rsplit('.', 1)\n"
-        "        mod = importlib.import_module(mod_name)\n"
-        "        fn = getattr(mod, func_name)\n"
-        "        args = data.get('args', [])\n"
-        "        kwargs = data.get('kwargs', {})\n"
-        "        res = fn(*args, **kwargs)\n"
-        "    elif isinstance(data, str):\n"
-        "        res = eval(data)\n"
-        "    else:\n"
-        "        res = data\n"
+        "    if not isinstance(data, dict) or 'func' not in data:\n"
+        "        raise PermissionError('Execution rejected: task payload must be a dict with allowlisted func')\n"
+        "    func_str = data['func']\n"
+        "    if not isinstance(func_str, str):\n"
+        "        raise ValueError('func must be a string')\n"
+        "    parts = func_str.split('.')\n"
+        "    if any(p.startswith('_') for p in parts):\n"
+        "        raise PermissionError('Access to private/internal attributes denied')\n"
+        "    mod_name = parts[0]\n"
+        "    if mod_name not in ALLOWED_MODULES:\n"
+        "        raise PermissionError(f'Module {mod_name} is not in allowlist')\n"
+        "    mod = importlib.import_module(mod_name)\n"
+        "    target = mod\n"
+        "    for p in parts[1:]:\n"
+        "        target = getattr(target, p)\n"
+        "    if not callable(target):\n"
+        "        raise TypeError(f'Target {func_str} is not callable')\n"
+        "    args = data.get('args', [])\n"
+        "    kwargs = data.get('kwargs', {})\n"
+        "    res = target(*args, **kwargs)\n"
         "    try:\n"
         "        import msgpack\n"
         "        sys.stdout.buffer.write(msgpack.packb(res))\n"
@@ -184,24 +246,32 @@ static bool execute_python_subprocess(
     close(out_pipe[1]);
     close(err_pipe[1]);
 
-    /* Write task payload to child stdin */
-    if (task->payload && task->payload_len > 0) {
-        size_t written = 0;
-        while (written < task->payload_len) {
-            ssize_t n = write(in_pipe[1], task->payload + written, task->payload_len - written);
-            if (n <= 0) break;
-            written += (size_t)n;
-        }
+    /* Ignore SIGPIPE during write to prevent crashing on closed pipe */
+    struct sigaction sa_ign, sa_old;
+    memset(&sa_ign, 0, sizeof(sa_ign));
+    sa_ign.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa_ign, &sa_old);
+
+    /* Set non-blocking on in_pipe[1] to avoid blocking pipe deadlocks */
+    int flags = fcntl(in_pipe[1], F_GETFL, 0);
+    if (flags >= 0) fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+
+    size_t written = 0;
+    size_t payload_len = (task->payload) ? task->payload_len : 0;
+    if (payload_len == 0) {
+        close(in_pipe[1]);
+        in_pipe[1] = -1;
     }
-    close(in_pipe[1]);
 
     /* Poll with timeout */
     uint64_t timeout_ms = task->opts.timeout_ms ? task->opts.timeout_ms : QIHSE_TASK_DEFAULT_TIMEOUT_MS;
-    struct pollfd pfd[2];
+    struct pollfd pfd[3];
     pfd[0].fd = out_pipe[0];
     pfd[0].events = POLLIN;
     pfd[1].fd = err_pipe[0];
     pfd[1].events = POLLIN;
+    pfd[2].fd = in_pipe[1];
+    pfd[2].events = (in_pipe[1] >= 0 && written < payload_len) ? POLLOUT : 0;
 
     size_t out_cap = 65536;
     size_t out_size = 0;
@@ -233,23 +303,62 @@ static bool execute_python_subprocess(
         int remaining_ms = (int)(timeout_ms - (now_ms - start_ms));
         if (remaining_ms > 100) remaining_ms = 100;
 
-        int prc = poll(pfd, 2, remaining_ms);
+        int prc = poll(pfd, 3, remaining_ms);
         if (prc > 0) {
             if (pfd[0].revents & POLLIN) {
                 if (out_size + 4096 >= out_cap) {
-                    out_cap *= 2;
-                    out_buf = (uint8_t*)realloc(out_buf, out_cap);
+                    size_t new_cap = out_cap * 2;
+                    uint8_t* nb = (uint8_t*)realloc(out_buf, new_cap);
+                    if (nb) {
+                        out_buf = nb;
+                        out_cap = new_cap;
+                    }
                 }
-                ssize_t n = read(out_pipe[0], out_buf + out_size, 4096);
-                if (n > 0) out_size += (size_t)n;
+                if (out_size + 4096 <= out_cap && out_buf) {
+                    ssize_t n = read(out_pipe[0], out_buf + out_size, 4096);
+                    if (n > 0) out_size += (size_t)n;
+                }
             }
             if (pfd[1].revents & POLLIN) {
-                if (err_size + 1024 >= err_cap) {
-                    err_cap *= 2;
-                    err_buf = (char*)realloc(err_buf, err_cap);
+                if (err_size + 1024 + 1 >= err_cap) {
+                    size_t new_cap = err_cap * 2;
+                    char* nb = (char*)realloc(err_buf, new_cap);
+                    if (nb) {
+                        err_buf = nb;
+                        err_cap = new_cap;
+                    }
                 }
-                ssize_t n = read(err_pipe[0], err_buf + err_size, 1024);
-                if (n > 0) err_size += (size_t)n;
+                if (err_size + 1024 + 1 <= err_cap && err_buf) {
+                    ssize_t n = read(err_pipe[0], err_buf + err_size, 1024);
+                    if (n > 0) err_size += (size_t)n;
+                }
+            }
+            if (pfd[2].fd >= 0 && (pfd[2].revents & POLLOUT)) {
+                size_t to_write = payload_len - written;
+                if (to_write > 4096) to_write = 4096;
+                ssize_t wn = write(in_pipe[1], task->payload + written, to_write);
+                if (wn > 0) {
+                    written += (size_t)wn;
+                    if (written >= payload_len) {
+                        close(in_pipe[1]);
+                        in_pipe[1] = -1;
+                        pfd[2].fd = -1;
+                        pfd[2].events = 0;
+                    }
+                } else if (wn < 0) {
+                    if (errno == EPIPE || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        close(in_pipe[1]);
+                        in_pipe[1] = -1;
+                        pfd[2].fd = -1;
+                        pfd[2].events = 0;
+                    }
+                }
+            }
+            if (pfd[2].fd >= 0 && (pfd[2].revents & (POLLHUP | POLLERR))) {
+                close(in_pipe[1]);
+                in_pipe[1] = -1;
+                pfd[2].fd = -1;
+                pfd[2].events = 0;
             }
             if ((pfd[0].revents & (POLLHUP | POLLERR)) && (pfd[1].revents & (POLLHUP | POLLERR))) {
                 child_done = true;
@@ -265,25 +374,50 @@ static bool execute_python_subprocess(
         }
     }
 
-    /* Drain any remaining output */
-    ssize_t n;
-    while ((n = read(out_pipe[0], out_buf + out_size, 4096)) > 0) {
-        out_size += (size_t)n;
-        if (out_size + 4096 >= out_cap) {
-            out_cap *= 2;
-            out_buf = (uint8_t*)realloc(out_buf, out_cap);
-        }
+    if (in_pipe[1] >= 0) {
+        close(in_pipe[1]);
+        in_pipe[1] = -1;
     }
-    while ((n = read(err_pipe[0], err_buf + err_size, 1024)) > 0) {
-        err_size += (size_t)n;
-        if (err_size + 1024 >= err_cap) {
-            err_cap *= 2;
-            err_buf = (char*)realloc(err_buf, err_cap);
+
+    /* Drain any remaining output verifying buffer capacity before read */
+    while (1) {
+        if (out_size + 4096 >= out_cap) {
+            size_t new_cap = out_cap * 2;
+            uint8_t* nb = (uint8_t*)realloc(out_buf, new_cap);
+            if (nb) {
+                out_buf = nb;
+                out_cap = new_cap;
+            } else {
+                break;
+            }
         }
+        if (out_size + 4096 > out_cap || !out_buf) break;
+        ssize_t n = read(out_pipe[0], out_buf + out_size, 4096);
+        if (n <= 0) break;
+        out_size += (size_t)n;
+    }
+    while (1) {
+        if (err_size + 1024 + 1 >= err_cap) {
+            size_t new_cap = err_cap * 2;
+            char* nb = (char*)realloc(err_buf, new_cap);
+            if (nb) {
+                err_buf = nb;
+                err_cap = new_cap;
+            } else {
+                break;
+            }
+        }
+        if (err_size + 1024 + 1 > err_cap || !err_buf) break;
+        ssize_t n = read(err_pipe[0], err_buf + err_size, 1024);
+        if (n <= 0) break;
+        err_size += (size_t)n;
     }
 
     close(out_pipe[0]);
     close(err_pipe[0]);
+
+    /* Restore SIGPIPE handler */
+    sigaction(SIGPIPE, &sa_old, NULL);
 
     if (!child_exited) {
         int status = 0;

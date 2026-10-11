@@ -492,37 +492,49 @@ static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx, const char* ra
 }
 
 static qihse_user_t* pg_send_auth_and_startup(int fd) {
-    uint8_t lenbuf[4];
-    if (pg_read_all(fd, lenbuf, 4) < 0) return NULL;
-    int32_t total_len = (int32_t)(((uint32_t)lenbuf[0] << 24) |
-                                  ((uint32_t)lenbuf[1] << 16) |
-                                  ((uint32_t)lenbuf[2] << 8)  |
-                                  ((uint32_t)lenbuf[3]));
+    uint8_t* startup_buf = NULL;
+    size_t rest = 0;
 
-    if (total_len < 8 || total_len > 65536) return NULL;
+    for (int ssl_attempt = 0; ssl_attempt < 2; ssl_attempt++) {
+        uint8_t lenbuf[4];
+        if (pg_read_all(fd, lenbuf, 4) < 0) return NULL;
+        int32_t total_len = (int32_t)(((uint32_t)lenbuf[0] << 24) |
+                                      ((uint32_t)lenbuf[1] << 16) |
+                                      ((uint32_t)lenbuf[2] << 8)  |
+                                      ((uint32_t)lenbuf[3]));
 
-    size_t rest = (size_t)(total_len - 4);
-    uint8_t* startup_buf = (uint8_t*)malloc(rest + 1);
+        if (total_len < 8 || total_len > 65536) return NULL;
+
+        rest = (size_t)(total_len - 4);
+        startup_buf = (uint8_t*)malloc(rest + 1);
+        if (!startup_buf) return NULL;
+        startup_buf[rest] = '\0';
+
+        if (pg_read_all(fd, startup_buf, rest) < 0) {
+            free(startup_buf);
+            return NULL;
+        }
+
+        uint32_t proto = ((uint32_t)startup_buf[0] << 24) |
+                         ((uint32_t)startup_buf[1] << 16) |
+                         ((uint32_t)startup_buf[2] << 8)  |
+                         ((uint32_t)startup_buf[3]);
+
+        if (proto == 80877103U) {
+            /* SSL request — reject and loop to read the real startup (bounded loop, max 1 retry) */
+            free(startup_buf);
+            startup_buf = NULL;
+            if (ssl_attempt > 0) return NULL; /* Reject second SSL probe */
+            uint8_t ssl_reject = 'N';
+            if (pg_write_all(fd, &ssl_reject, 1) < 0) return NULL;
+            continue;
+        }
+
+        /* Got non-SSL startup packet */
+        break;
+    }
+
     if (!startup_buf) return NULL;
-    startup_buf[rest] = '\0';
-
-    if (pg_read_all(fd, startup_buf, rest) < 0) {
-        free(startup_buf);
-        return NULL;
-    }
-
-    uint32_t proto = ((uint32_t)startup_buf[0] << 24) |
-                     ((uint32_t)startup_buf[1] << 16) |
-                     ((uint32_t)startup_buf[2] << 8)  |
-                     ((uint32_t)startup_buf[3]);
-
-    if (proto == 80877103U) {
-        /* SSL request — reject and recurse to read the real startup */
-        free(startup_buf);
-        uint8_t ssl_reject = 'N';
-        pg_write_all(fd, &ssl_reject, 1);
-        return pg_send_auth_and_startup(fd);
-    }
 
     /* Parse the startup message for the "user" parameter.
      * After the 4-byte protocol version, the body is a sequence of
@@ -806,20 +818,45 @@ void qihse_pg_wire_handle_client_multi(
                 break;
             /* ---- Parse (P): store prepared statement ---- */
             case 'P': {
-                const char* stmt_name = body ? (const char*)body : "";
-                size_t name_len = strlen(stmt_name) + 1;
-                const char* parsed_query = body ? (const char*)(body + name_len) : "";
-                /* skip parameter OID array (int16 count + int32 oids) */
-                const int16_t* nptr = (const int16_t*)(body + name_len + strlen(parsed_query) + 1);
+                const char* stmt_name = "";
+                const char* parsed_query = "";
                 int16_t num_params = 0;
-                const int32_t* param_oids = NULL;
-                if ((size_t)((const uint8_t*)nptr - body) + 2 <= body_len) {
-                    num_params = (int16_t)(((uint16_t)nptr[0] << 8) | (uint16_t)((const uint8_t*)nptr)[1]);
-                    /* big-endian */
-                    num_params = (int16_t)(((uint16_t)((const uint8_t*)nptr)[0] << 8) | (uint16_t)((const uint8_t*)nptr)[1]);
-                    param_oids = (const int32_t*)((const uint8_t*)nptr + 2);
+                int32_t parsed_oids[64];
+                memset(parsed_oids, 0, sizeof(parsed_oids));
+
+                if (body && body_len > 0) {
+                    const uint8_t* nul1 = (const uint8_t*)memchr(body, '\0', body_len);
+                    if (nul1) {
+                        stmt_name = (const char*)body;
+                        size_t rem1 = body_len - (size_t)(nul1 + 1 - body);
+                        const uint8_t* nul2 = rem1 > 0 ? (const uint8_t*)memchr(nul1 + 1, '\0', rem1) : NULL;
+                        if (nul2) {
+                            parsed_query = (const char*)(nul1 + 1);
+                            const uint8_t* nptr = nul2 + 1;
+                            if (nptr + 2 <= body + body_len) {
+                                num_params = (int16_t)(((uint16_t)nptr[0] << 8) | (uint16_t)nptr[1]);
+                                if (num_params > 0) {
+                                    if (nptr + 2 + (size_t)num_params * 4 <= body + body_len) {
+                                        const uint8_t* pptr = nptr + 2;
+                                        for (int16_t i = 0; i < num_params && i < 64; i++) {
+                                            uint32_t u = ((uint32_t)pptr[0] << 24) |
+                                                         ((uint32_t)pptr[1] << 16) |
+                                                         ((uint32_t)pptr[2] << 8)  |
+                                                         ((uint32_t)pptr[3]);
+                                            parsed_oids[i] = (int32_t)u;
+                                            pptr += 4;
+                                        }
+                                    } else {
+                                        num_params = 0;
+                                    }
+                                } else {
+                                    num_params = 0;
+                                }
+                            }
+                        }
+                    }
                 }
-                pg_stmt_cache_put(&stmt_cache, stmt_name, parsed_query, param_oids, num_params);
+                pg_stmt_cache_put(&stmt_cache, stmt_name, parsed_query, parsed_oids, num_params);
                 pg_send_msg(fd, '1', NULL, 0);  /* ParseComplete */
                 break;
             }

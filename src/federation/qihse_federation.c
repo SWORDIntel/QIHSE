@@ -1041,7 +1041,8 @@ static bool mutation_from_str(const char* str, qihse_federation_mutation_t* m) {
     return true;
 }
 
-static void conflict_encode(const qihse_federation_conflict_t* c, char* out, size_t cap) {
+static bool conflict_encode(const qihse_federation_conflict_t* c, char* out, size_t cap) {
+    if (!c || !out || cap == 0) return false;
     char local_m[512], remote_m[512];
     mutation_to_str(&c->local_mutation, local_m, sizeof(local_m));
     mutation_to_str(&c->remote_mutation, remote_m, sizeof(remote_m));
@@ -1050,14 +1051,15 @@ static void conflict_encode(const qihse_federation_conflict_t* c, char* out, siz
     value_hex(c->remote_value, c->remote_value_len, remote_val, sizeof(remote_val));
     char resolved_by[33];
     uuid_hex(&c->resolved_by, resolved_by);
-    snprintf(out, cap, "%u\t%s\t%s\t%d\t%s\t%s\t%llu\t%s\t%llu\t%s\t%s\t%s\t%llu",
-             (unsigned)c->policy, c->namespace_name, c->resource_id,
-             c->resolved ? 1 : 0,
-             local_m, remote_m,
-             (unsigned long long)c->local_value_len, local_val,
-             (unsigned long long)c->remote_value_len, remote_val,
-             c->reason, resolved_by,
-             (unsigned long long)c->resolved_at_hlc_physical);
+    int n = snprintf(out, cap, "%u\t%s\t%s\t%d\t%s\t%s\t%llu\t%s\t%llu\t%s\t%s\t%s\t%llu",
+                     (unsigned)c->policy, c->namespace_name, c->resource_id,
+                     c->resolved ? 1 : 0,
+                     local_m, remote_m,
+                     (unsigned long long)c->local_value_len, local_val,
+                     (unsigned long long)c->remote_value_len, remote_val,
+                     c->reason, resolved_by,
+                     (unsigned long long)c->resolved_at_hlc_physical);
+    return (n >= 0 && (size_t)n < cap);
 }
 
 static bool conflict_decode(const char* blob, qihse_federation_conflict_t* out) {
@@ -1577,7 +1579,8 @@ static void lease_kv_key(const qihse_uuid_t* lease_id, char* out, size_t cap) {
     snprintf(out, cap, QIHSE_FEDERATION_LEASE_PREFIX "%s", id_str);
 }
 
-static void lease_encode(const qihse_federation_lease_t* l, char* out, size_t cap) {
+static bool lease_encode(const qihse_federation_lease_t* l, char* out, size_t cap) {
+    if (!l || !out || cap == 0) return false;
     char lid[33], oid[33], rid[33], iss[33];
     uuid_hex(&l->lease_id, lid);
     uuid_hex(&l->owner_node, oid);
@@ -1591,13 +1594,16 @@ static void lease_encode(const qihse_federation_lease_t* l, char* out, size_t ca
                      (unsigned long long)l->issued_hlc_physical,
                      (unsigned long long)l->expires_hlc_physical,
                      rid, iss);
+    if (n < 0 || (size_t)n >= cap) return false;
     /* Phase-B field 11: the recorded holder principal.  Written only when a
      * holder was recorded, so a legacy record that is decoded and re-written
      * (e.g. reaped or released) stays legacy — and stays fail-closed for
      * renewals — instead of silently growing a holder it never had. */
-    if (n > 0 && l->has_holder && (size_t)n < cap) {
-        snprintf(out + n, cap - (size_t)n, "\t%u", l->holder_user_id);
+    if (l->has_holder) {
+        int m = snprintf(out + n, cap - (size_t)n, "\t%u", l->holder_user_id);
+        if (m < 0 || (size_t)(n + m) >= cap) return false;
     }
+    return true;
 }
 
 static bool lease_decode(const char* blob, qihse_federation_lease_t* out) {
@@ -1929,18 +1935,23 @@ static void group_kv_key(const char* group_id, char* out, size_t cap) {
     snprintf(out, cap, QIHSE_FEDERATION_GROUP_PREFIX "%s", group_id);
 }
 
-static void group_encode(const qihse_federation_group_t* g, char* out, size_t cap) {
-    size_t off = 0;
-    off += (size_t)snprintf(out + off, cap - off, "%s\t%llu\t%u\t%zu",
-                           g->group_id, (unsigned long long)g->term,
-                           (unsigned)g->consistency, g->member_count);
-    for (size_t i = 0; i < g->member_count && off < cap; i++) {
+static bool group_encode(const qihse_federation_group_t* g, char* out, size_t cap) {
+    if (!g || !out || cap == 0) return false;
+    int w = snprintf(out, cap, "%s\t%llu\t%u\t%zu",
+                     g->group_id, (unsigned long long)g->term,
+                     (unsigned)g->consistency, g->member_count);
+    if (w < 0 || (size_t)w >= cap) return false;
+    size_t off = (size_t)w;
+    for (size_t i = 0; i < g->member_count; i++) {
         char mid[33];
         uuid_hex(&g->members[i].member_id, mid);
-        off += (size_t)snprintf(out + off, cap - off, "\t%s\t%d\t%d",
-                               mid, g->members[i].is_voter ? 1 : 0,
-                               g->members[i].is_witness ? 1 : 0);
+        w = snprintf(out + off, cap - off, "\t%s\t%d\t%d",
+                     mid, g->members[i].is_voter ? 1 : 0,
+                     g->members[i].is_witness ? 1 : 0);
+        if (w < 0 || (size_t)w >= cap - off) return false;
+        off += (size_t)w;
     }
+    return true;
 }
 
 static bool group_decode(const char* blob, qihse_federation_group_t* out) {
@@ -1964,21 +1975,24 @@ static bool group_decode(const char* blob, qihse_federation_group_t* out) {
     /* Skip past the first 4 fields. */
     for (int i = 0; i < 4; i++) {
         p = strchr(p, '\t');
-        if (!p) return n >= 4; /* no members is valid */
+        if (!p) return (out->member_count == 0); /* only valid if 0 members */
         p++;
     }
-    for (size_t i = 0; i < out->member_count && i < QIHSE_FEDERATION_GROUP_MAX_MEMBERS; i++) {
+    for (size_t i = 0; i < out->member_count; i++) {
         char mid[33];
         int voter = 0, witness = 0;
         int mn = sscanf(p, "%32[^\t]\t%d\t%d", mid, &voter, &witness);
-        if (mn < 1) break;
+        if (mn < 3) return false; /* fail closed on incomplete member record */
         uuid_from_hex(mid, &out->members[i].member_id);
         out->members[i].is_voter = voter != 0;
         out->members[i].is_witness = witness != 0;
         /* Advance past member_id, voter, witness. */
         for (int j = 0; j < 3; j++) {
             p = strchr(p, '\t');
-            if (!p) return true;
+            if (!p) {
+                if (i + 1 == out->member_count) return true;
+                return false; /* unexpected truncated blob before all members decoded */
+            }
             p++;
         }
     }

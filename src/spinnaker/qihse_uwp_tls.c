@@ -34,6 +34,7 @@
 #include <unistd.h>     /* unlink, getpid                                */
 #include <fcntl.h>      /* O_WRONLY|O_CREAT|O_EXCL for safe temp files   */
 #include <errno.h>
+#include <poll.h>
 
 /* ------------------------------------------------------------------ */
 /* OpenSSL detection                                                   */
@@ -454,33 +455,47 @@ qihse_uwp_tls_ctx_t* qihse_uwp_tls_ctx_create_with_cert(const char* cert_pem,
         return NULL;
     }
 
-    /* SSL_CTX_use_certificate_chain_file / SSL_CTX_use_PrivateKey_file take
-     * file paths, so write the PEM blobs to temporary files first. */
-    char cert_path[256];
-    char key_path[256];
-    if (qihse_uwp_tls_pem_to_tmp(cert_pem, cert_path, sizeof(cert_path)) != 0) {
+    /* Load certificate and private key directly in memory via OpenSSL BIOs
+     * rather than writing secret keys to temporary files in /tmp. */
+    BIO* cbio = BIO_new_mem_buf(cert_pem, -1);
+    if (!cbio) {
         SSL_CTX_free(ssl_ctx);
         free(ctx);
         return NULL;
     }
-    if (qihse_uwp_tls_pem_to_tmp(key_pem, key_path, sizeof(key_path)) != 0) {
-        unlink(cert_path);
+    X509* cert = PEM_read_bio_X509(cbio, NULL, NULL, NULL);
+    BIO_free(cbio);
+    if (!cert) {
+        SSL_CTX_free(ssl_ctx);
+        free(ctx);
+        return NULL;
+    }
+
+    BIO* kbio = BIO_new_mem_buf(key_pem, -1);
+    if (!kbio) {
+        X509_free(cert);
+        SSL_CTX_free(ssl_ctx);
+        free(ctx);
+        return NULL;
+    }
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(kbio, NULL, NULL, NULL);
+    BIO_free(kbio);
+    if (!pkey) {
+        X509_free(cert);
         SSL_CTX_free(ssl_ctx);
         free(ctx);
         return NULL;
     }
 
     int loaded = 0;
-    if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_path) == 1 &&
-        SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) == 1) {
+    if (SSL_CTX_use_certificate(ssl_ctx, cert) == 1 &&
+        SSL_CTX_use_PrivateKey(ssl_ctx, pkey) == 1) {
         if (SSL_CTX_check_private_key(ssl_ctx) == 1) {
             loaded = 1;
         }
     }
-
-    /* Remove the temporary files regardless of outcome. */
-    unlink(cert_path);
-    unlink(key_path);
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
 
     if (!loaded) {
         SSL_CTX_free(ssl_ctx);
@@ -715,8 +730,22 @@ int qihse_uwp_tls_session_renegotiate(qihse_uwp_tls_session_t* session) {
         int ret = 0;
         do {
             ret = SSL_do_handshake(session->ssl);
-        } while (ret <= 0 &&
-                 SSL_get_error(session->ssl, ret) == SSL_ERROR_WANT_READ);
+            if (ret <= 0) {
+                int err = SSL_get_error(session->ssl, ret);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    struct pollfd pfd;
+                    pfd.fd = SSL_get_fd(session->ssl);
+                    pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+                    pfd.revents = 0;
+                    if (pfd.fd < 0 || poll(&pfd, 1, 5000) <= 0) {
+                        ret = -1;
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        } while (ret <= 0);
         if (ret <= 0) return -4;
         return 0;
     }
@@ -755,8 +784,15 @@ int qihse_uwp_tls_encrypt(qihse_uwp_tls_session_t* session,
             w = SSL_write(session->ssl, plaintext + off, (int)(len - off));
             if (w <= 0) {
                 int err = SSL_get_error(session->ssl, w);
-                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ)
+                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                    struct pollfd pfd;
+                    pfd.fd = SSL_get_fd(session->ssl);
+                    pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+                    pfd.revents = 0;
+                    if (pfd.fd < 0 || poll(&pfd, 1, 5000) <= 0)
+                        return -8;
                     continue;
+                }
                 return -8;
             }
             off += (size_t)w;
@@ -814,8 +850,15 @@ int qihse_uwp_tls_decrypt(qihse_uwp_tls_session_t* session,
             r = SSL_read(session->ssl, plaintext + off, (int)(cap - off));
             if (r <= 0) {
                 int err = SSL_get_error(session->ssl, r);
-                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    struct pollfd pfd;
+                    pfd.fd = SSL_get_fd(session->ssl);
+                    pfd.events = (err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+                    pfd.revents = 0;
+                    if (pfd.fd < 0 || poll(&pfd, 1, 5000) <= 0)
+                        return -8;
                     continue;
+                }
                 if (err == SSL_ERROR_ZERO_RETURN) break; /* clean EOF */
                 return -8;
             }

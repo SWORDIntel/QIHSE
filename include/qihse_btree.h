@@ -29,6 +29,9 @@ extern "C" {
 /** Page size used for node allocation (4 KB for TLB efficiency). */
 #define QIHSE_BTREE_PAGE_SIZE 4096
 
+/** Maximum key length for B+ tree entries to prevent buffer overflow (SEC-09). */
+#define QIHSE_BTREE_MAX_KEY_LEN 1024
+
 /** Opaque handle for a B+ tree index. */
 typedef struct qihse_btree qihse_btree_t;
 

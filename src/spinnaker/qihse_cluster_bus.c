@@ -346,24 +346,28 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
     if (!bus || bus->sock_fd < 0 || !host || !data || len == 0) return false;
     const uint8_t* wire = data;
     size_t wire_len = len;
-    uint8_t veiled[QIHSE_BUS_MAX_DATAGRAM + QIHSE_BUS_VEIL_OVERHEAD];
+    uint8_t* signed_buf = NULL;
+    uint8_t* veiled = NULL;
+    bool ok = false;
 
     /* Signed ops class: append an ML-DSA trailer over header+payload when
      * this node has a signing identity.  Bootstrap/liveness/discovery
      * frames never sign (pre-enrollment, no authority). */
-    uint8_t signed_buf[QIHSE_CLUSTER_BUS_HEADER_SIZE +
-                       QIHSE_CLUSTER_BUS_MAX_PAYLOAD +
-                       QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX];
     if (bus->federation_sign_key && bus->has_local_node_uuid && len >= 8u &&
         qihse_bus_msg_signed_class(
             (uint32_t)(data[4] | ((uint32_t)data[5] << 8) |
                        ((uint32_t)data[6] << 16) |
                        ((uint32_t)data[7] << 24)))) {
+        size_t signed_buf_cap = QIHSE_CLUSTER_BUS_HEADER_SIZE +
+                                QIHSE_CLUSTER_BUS_MAX_PAYLOAD +
+                                QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX;
+        signed_buf = (uint8_t*)malloc(signed_buf_cap);
+        if (!signed_buf) return false;
         uint8_t sig[4627];
         size_t sig_len = sizeof(sig);
         if (qihse_federation_sign(bus->federation_sign_key, data, len, sig,
                                   &sig_len) &&
-            len + 4u + 16u + sig_len <= sizeof(signed_buf)) {
+            len + 4u + 16u + sig_len <= signed_buf_cap) {
             uint8_t* t = signed_buf;
             memcpy(t, data, len);
             t += len;
@@ -381,14 +385,27 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
             *t++ = 'Q'; *t++ = 'B'; *t++ = 'S'; /* end tag */
             wire = signed_buf;
             wire_len = len + 4u + 2u + 16u + sig_len + 6u;
+        } else {
+            free(signed_buf);
+            signed_buf = NULL;
         }
         /* Signing failure sends the frame UNSIGNED: the require_signed_ops
          * policy on receivers is the enforcement point, not the sender. */
     }
 
     if (bus->veil_key) {
-        wire_len = qihse_bus_veil_encode(bus, data, len, veiled, sizeof(veiled));
-        if (wire_len == 0) return false;
+        size_t veiled_cap = wire_len + QIHSE_BUS_VEIL_OVERHEAD;
+        veiled = (uint8_t*)malloc(veiled_cap);
+        if (!veiled) {
+            free(signed_buf);
+            return false;
+        }
+        wire_len = qihse_bus_veil_encode(bus, wire, wire_len, veiled, veiled_cap);
+        if (wire_len == 0) {
+            free(veiled);
+            free(signed_buf);
+            return false;
+        }
         wire = veiled;
     }
     struct sockaddr_in addr;
@@ -399,13 +416,19 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
 #ifdef _WIN32
         /* inet_pton for 127.0.0.1 works on Windows too; fall through */
 #endif
+        free(veiled);
+        free(signed_buf);
         return false;
     }
     ssize_t sent = sendto(bus->sock_fd, (const char*)wire, (int)wire_len, 0,
                           (struct sockaddr*)&addr, sizeof(addr));
-    if (sent < 0 || (size_t)sent != wire_len) return false;
-    __atomic_add_fetch(&bus->stats.sent, 1u, __ATOMIC_RELAXED);
-    return true;
+    if (sent >= 0 && (size_t)sent == wire_len) {
+        __atomic_add_fetch(&bus->stats.sent, 1u, __ATOMIC_RELAXED);
+        ok = true;
+    }
+    free(veiled);
+    free(signed_buf);
+    return ok;
 }
 
 static bool qihse_bus_send_to_all_peers(qihse_cluster_bus_t* bus,
@@ -418,15 +441,16 @@ static bool qihse_bus_send_to_all_peers(qihse_cluster_bus_t* bus,
     if (payload_len > 0) memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, payload, payload_len);
     size_t total = QIHSE_CLUSTER_BUS_HEADER_SIZE + payload_len;
 
-    qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
-    size_t count = qihse_cluster_topology_nodes(bus->topology, nodes,
-                                                sizeof(nodes) / sizeof(nodes[0]));
+    qihse_cluster_node_t* nodes = (qihse_cluster_node_t*)malloc(sizeof(qihse_cluster_node_t) * QIHSE_CLUSTER_MAX_NODES);
+    if (!nodes) return false;
+    size_t count = qihse_cluster_topology_nodes(bus->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
     bool any = false;
     for (size_t i = 0; i < count; i++) {
         if (nodes[i].index == bus->local_node_index) continue;
         if (nodes[i].bus_port == 0) continue;
         if (qihse_bus_send_datagram(bus, nodes[i].host, nodes[i].bus_port, datagram, total)) any = true;
     }
+    free(nodes);
     return any;
 }
 
@@ -516,6 +540,7 @@ static void qihse_bus_announce_local_slots(qihse_cluster_bus_t* bus, const char*
             upd.end = (uint16_t)(slot - 1u);
             upd.owner_index = bus->local_node_index;
             memcpy(upd.owner_id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+            upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
             qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
                                    (uint32_t)sizeof(upd));
             memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
@@ -552,6 +577,7 @@ static void qihse_bus_announce_known_slots(qihse_cluster_bus_t* bus, const char*
                 upd.end = (uint16_t)end;
                 upd.owner_index = owner;
                 memcpy(upd.owner_id, owner_node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+                upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
                 qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
                                        (uint32_t)sizeof(upd));
                 memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
@@ -595,13 +621,16 @@ static void qihse_bus_handle_meet(qihse_cluster_bus_t* bus, const uint8_t* paylo
         qihse_bus_announce_known_slots(bus, node.host, node.bus_port);
         qihse_bus_announce_local_slots(bus, node.host, node.bus_port);
         /* Gossip the newcomer to our other peers. */
-        qihse_cluster_node_t peers[QIHSE_CLUSTER_MAX_NODES];
-        size_t count = qihse_cluster_topology_nodes(bus->topology, peers, QIHSE_CLUSTER_MAX_NODES);
-        for (size_t i = 0; i < count; i++) {
-            if (memcmp(peers[i].id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0 ||
-                memcmp(peers[i].id, node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0) continue;
-            if (peers[i].bus_port == 0 || peers[i].host[0] == '\0') continue;
-            qihse_bus_send_meet_node(bus, &node, peers[i].host, peers[i].bus_port);
+        qihse_cluster_node_t* peers = (qihse_cluster_node_t*)malloc(sizeof(qihse_cluster_node_t) * QIHSE_CLUSTER_MAX_NODES);
+        if (peers) {
+            size_t count = qihse_cluster_topology_nodes(bus->topology, peers, QIHSE_CLUSTER_MAX_NODES);
+            for (size_t i = 0; i < count; i++) {
+                if (memcmp(peers[i].id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0 ||
+                    memcmp(peers[i].id, node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u) == 0) continue;
+                if (peers[i].bus_port == 0 || peers[i].host[0] == '\0') continue;
+                qihse_bus_send_meet_node(bus, &node, peers[i].host, peers[i].bus_port);
+            }
+            free(peers);
         }
     }
 }
@@ -625,6 +654,10 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     if (payload_len < sizeof(qihse_cluster_bus_slot_update_t)) return;
     qihse_cluster_bus_slot_update_t upd;
     memcpy(&upd, payload, sizeof(upd));
+    uint64_t cur_epoch = qihse_cluster_topology_epoch(bus->topology);
+    if (upd.config_epoch > 0 && upd.config_epoch < cur_epoch) {
+        return; /* ignore updates with stale epoch to defeat replay attacks */
+    }
     /* Resolve the owner by node ID in the local topology */
     uint16_t local_owner = QIHSE_CLUSTER_NODE_NONE;
     if (upd.owner_id[0] != '\0') {
@@ -842,7 +875,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
                 if (getenv("QBS_DBG"))
                     fprintf(stderr, "[qbs] verify=%d alg=%d pk=%zu tr=%zu sig=%u\n",
                             (int)verified, (int)ident.sig_alg,
-                            ident.public_key_len, tr, sig_len);
+                            (size_t)ident.public_key_len, tr, sig_len);
             } else if (getenv("QBS_DBG")) {
                 fprintf(stderr,
                         "[qbs] have=0 signer=%02x%02x%02x%02x\n",
@@ -1324,6 +1357,7 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
     upd.end = end;
     upd.owner_index = owner_index;
     memcpy(upd.owner_id, owner.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+    upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
                                        (const uint8_t*)&upd, sizeof(upd));
 }

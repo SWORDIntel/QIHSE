@@ -26,11 +26,50 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <errno.h>
 
-/* Check if a Yubikey is present by invoking ykinfo -s */
+static const char* find_executable(const char* name) {
+    static const char* const standard_dirs[] = {
+        "/usr/bin", "/usr/local/bin", "/bin"
+    };
+    static char resolved[512];
+    for (size_t i = 0; i < sizeof(standard_dirs) / sizeof(standard_dirs[0]); i++) {
+        snprintf(resolved, sizeof(resolved), "%s/%s", standard_dirs[i], name);
+        if (access(resolved, X_OK) == 0) return resolved;
+    }
+    return NULL;
+}
+
+static int run_execve_safe(const char* bin_name, char* const argv[]) {
+    const char* full_path = find_executable(bin_name);
+    if (!full_path) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        char* const envp[] = { NULL };
+        execve(full_path, argv, envp);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/* Check if a Yubikey is present by invoking ykinfo -s safely via execve */
 static int yubikey_present(void) {
-    int rc = system("ykinfo -s >/dev/null 2>&1");
-    return rc == 0;
+    char* const argv[] = { (char*)"ykinfo", (char*)"-s", NULL };
+    return run_execve_safe("ykinfo", argv) == 0;
 }
 
 /* Generate a random operator password and optionally bind to HSM */
@@ -51,14 +90,18 @@ static int bind_operator_password(const char *out_dir) {
 
     char key_path[512];
     snprintf(key_path, sizeof(key_path), "%s/.ssh/qihse_operator_key", home);
-    FILE *f = fopen(key_path, "wb");
-    if (!f) {
+    unlink(key_path);
+    int fd = open(key_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
         fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", key_path);
         return 0;
     }
-    fwrite(pass, 1, sizeof(pass), f);
-    fclose(f);
-    chmod(key_path, 0600);
+    if (write(fd, pass, sizeof(pass)) != (ssize_t)sizeof(pass)) {
+        close(fd);
+        unlink(key_path);
+        return 0;
+    }
+    close(fd);
 
     fprintf(stderr, "[QIHSE keygen] Operator key stored: %s (chmod 600)\n", key_path);
 
@@ -74,23 +117,32 @@ static int bind_operator_password(const char *out_dir) {
 
         char hash_path[512];
         snprintf(hash_path, sizeof(hash_path), "%s/.ssh/.qihse_op_hash.tmp", home);
-        f = fopen(hash_path, "wb");
-        if (f) {
-            fwrite(hash, 1, 32, f);
-            fclose(f);
-            char sig_path[512];
-            snprintf(sig_path, sizeof(sig_path), "%s/.ssh/qihse_operator_key.sig", home);
-            char cmd[1024];
-            snprintf(cmd, sizeof(cmd),
-                     "yubico-piv-tool -a sign -s 9c -i %s -o %s 2>/dev/null",
-                     hash_path, sig_path);
-            int sign_rc = system(cmd);
-            unlink(hash_path);
-            if (sign_rc == 0) {
-                chmod(sig_path, 0600);
-                fprintf(stderr, "[QIHSE keygen] Operator key signed via Yubikey PIV slot 9c.\n");
+        unlink(hash_path);
+        int hfd = open(hash_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (hfd >= 0) {
+            if (write(hfd, hash, 32) == 32) {
+                close(hfd);
+                char sig_path[512];
+                snprintf(sig_path, sizeof(sig_path), "%s/.ssh/qihse_operator_key.sig", home);
+                char* const argv[] = {
+                    (char*)"yubico-piv-tool",
+                    (char*)"-a", (char*)"sign",
+                    (char*)"-s", (char*)"9c",
+                    (char*)"-i", hash_path,
+                    (char*)"-o", sig_path,
+                    NULL
+                };
+                int sign_rc = run_execve_safe("yubico-piv-tool", argv);
+                unlink(hash_path);
+                if (sign_rc == 0) {
+                    chmod(sig_path, 0600);
+                    fprintf(stderr, "[QIHSE keygen] Operator key signed via Yubikey PIV slot 9c.\n");
+                } else {
+                    fprintf(stderr, "[QIHSE keygen] Yubikey sign failed — key generated but unsigned.\n");
+                }
             } else {
-                fprintf(stderr, "[QIHSE keygen] Yubikey sign failed — key generated but unsigned.\n");
+                close(hfd);
+                unlink(hash_path);
             }
         }
     } else {

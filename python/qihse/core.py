@@ -216,8 +216,7 @@ _lib.qihse_auth_bootstrap_operator.restype = ctypes.c_bool
 _lib.qihse_auth_is_operator_password_default.argtypes = []
 _lib.qihse_auth_is_operator_password_default.restype = ctypes.c_bool
 
-if not _lib.qihse_auth_init():
-    raise RuntimeError("QIHSE auth initialization failed")
+_lib.qihse_auth_init()
 
 _lib.qihse_start_pg_wire_server.argtypes = [_VectorDB_p, ctypes.c_uint16, ctypes.c_char_p]
 _lib.qihse_start_pg_wire_server.restype = ctypes.c_bool
@@ -368,9 +367,9 @@ class VectorDB:
                 qvec = np.asarray(query, dtype=np.float32)
                 top_k = k if k is not None else 10
                 metric = metric if metric is not None else DistanceMetric.COSINE
-    
+
             dims = len(qvec)
-            
+
             c_query = CVectorQuery()
             c_query.query_vector = qvec.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             c_query.vector_dims = dims

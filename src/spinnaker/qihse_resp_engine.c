@@ -404,6 +404,7 @@ typedef struct { const char* name; qihse_resp_cmd_fn fn; uint32_t flags; } qihse
 #define DSP_SUB_OK     0x1u
 #define DSP_MULTI_OK   0x2u
 #define DSP_BUSY_WRITE 0x4u
+#define DSP_ADMIN      0x8u
 /* Key-extraction shape (upper nibble) — replaces the second command_is
  * chain in qihse_resp_extract_keys. */
 #define DSP_KEY_1KV       (1u << 4)  /* key at argv[1], is a KV-store key */
@@ -429,6 +430,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"col.sum", 2, QIHSE_COMMAND_READONLY, 1, 1, 1},
     {"command", -1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"decr", 2, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_FAST, 1, 1, 1},
+    {"debug", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"del", -2, QIHSE_COMMAND_WRITE, 1, -1, 1},
     {"echo", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"exists", -2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, -1, 1},
@@ -452,6 +454,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"select", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"set", -3, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
     {"setex", 4, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
+    {"shutdown", 1, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"ts.add", 4, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
     {"ts.range", -4, QIHSE_COMMAND_READONLY, 1, 1, 1},
     {"ttl", 2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, 1, 1},
@@ -2073,6 +2076,7 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
 }
 
 static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     if ((request->argc != 2 && request->argc != 4) || !session->server->vdb) return !session->server->vdb ? qihse_resp_error(session, "ERR vector database is not configured") : qihse_resp_wrong_arity(session, "vecget");
     if (request->argc == 4 && !qihse_resp_arg_equal(&request->argv[2], "TAG")) return qihse_resp_error(session, "ERR syntax error");
     uint64_t id;
@@ -2080,7 +2084,7 @@ static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_
     pthread_mutex_lock(&session->server->vdb_lock);
     size_t dims = qihse_vector_db_get_dims(session->server->vdb);
     float* vector = dims ? (float*)malloc(dims * sizeof(*vector)) : NULL;
-    bool found = vector && qihse_vector_db_get_vector_by_id(session->server->vdb, id, vector, &dims);
+    bool found = vector && qihse_vector_db_get_vector_by_id_user(session->server->vdb, session->user, id, vector, &dims);
     pthread_mutex_unlock(&session->server->vdb_lock);
     if (!found) {
         free(vector);
@@ -4858,6 +4862,13 @@ static bool qihse_resp_handle_time(qihse_resp_session_t* session, const qihse_re
 
 static bool qihse_resp_handle_shutdown(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
+    if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    if (session->user) {
+        if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+            return qihse_resp_error(session, "NOPERM SHUTDOWN is restricted to the system domain administrator");
+        }
+    }
     if (session->server->running) __atomic_store_n(&session->server->running, false, __ATOMIC_RELEASE);
     return qihse_resp_simple(session, "OK");
 }
@@ -4876,12 +4887,22 @@ static bool qihse_resp_handle_config(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_debug(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "debug");
-    if (qihse_resp_arg_equal(&request->argv[1], "SLEEP") && request->argc == 3) {
-        double seconds;
-        if (qihse_resp_parse_f64_arg(&request->argv[2], &seconds)) {
-            usleep((useconds_t)(seconds * 1000000.0));
+    if (qihse_resp_arg_equal(&request->argv[1], "SLEEP")) {
+        if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+        if (session->user) {
+            if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+                qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+                return qihse_resp_error(session, "NOPERM DEBUG SLEEP is restricted to the system domain administrator");
+            }
         }
-        return qihse_resp_simple(session, "OK");
+        if (request->argc == 3) {
+            double seconds;
+            if (qihse_resp_parse_f64_arg(&request->argv[2], &seconds)) {
+                usleep((useconds_t)(seconds * 1000000.0));
+            }
+            return qihse_resp_simple(session, "OK");
+        }
+        return qihse_resp_wrong_arity(session, "debug sleep");
     }
     if (qihse_resp_arg_equal(&request->argv[1], "OBJECT") && request->argc == 3)
         return qihse_resp_simple(session, "Value at:0x0 refcount:1 encoding:raw serializedlength:0");
@@ -6716,8 +6737,8 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"repl.marks", qihse_resp_handle_repl_marks, 0},
     {"repl.status", qihse_resp_handle_repl_status, 0},
     {"repl.pull", qihse_resp_handle_repl_pull, DSP_BUSY_WRITE},
-    {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
-    {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_ok_stub, 0},
+    {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE | DSP_ADMIN}, {"config", qihse_resp_handle_config, 0},
+    {"debug", qihse_resp_handle_debug, DSP_ADMIN}, {"slowlog", dsp_ok_stub, 0},
     {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_ok_stub, 0},
     {"multi", qihse_resp_handle_multi, DSP_MULTI_OK}, {"exec", qihse_resp_handle_exec, DSP_MULTI_OK},
     {"discard", qihse_resp_handle_discard, DSP_MULTI_OK}, {"watch", qihse_resp_handle_watch, DSP_MULTI_OK},
@@ -10588,11 +10609,13 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
      * a live lookup so revocation lands on the next command. */
     bool session_active = true;
     uint32_t session_tenant = QIHSE_TENANT_SYSTEM;
-    if (session->user && session->user != &session->peer_claims) {
+    if (session->user == &session->peer_claims) {
+        session_tenant = session->peer_claims.tenant_id;
+    } else if (session->user) {
         qihse_auth_user_active_and_tenant(session->user, &session_active, &session_tenant);
         if (!session_active) {
             session->user = NULL;
-            session_tenant = QIHSE_TENANT_SYSTEM;
+            session_tenant = QIHSE_TENANT_INVALID;
             if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
         }
     }
@@ -10758,7 +10781,22 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (keys.count > 0 && !qihse_resp_ingest_gate(session, request, &keys)) return true;
     if (keys.count > 0 && !qihse_resp_route(session, request, &keys)) return true;
 
-    if (dispatch_entry) return dispatch_entry->fn(session, request);
+    if (dispatch_entry) {
+        if (dispatch_entry->flags & DSP_ADMIN) {
+            bool is_admin_cmd = qihse_resp_command_is(request, "SHUTDOWN") ||
+                                (qihse_resp_command_is(request, "DEBUG") && request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "SLEEP"));
+            if (is_admin_cmd) {
+                if (session->server->auth_required && !session->user) {
+                    return qihse_resp_error(session, "NOAUTH Authentication required.");
+                }
+                if (session->user && (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+                                      session_tenant != QIHSE_TENANT_SYSTEM)) {
+                    return qihse_resp_error(session, "NOPERM command is restricted to the system domain administrator");
+                }
+            }
+        }
+        return dispatch_entry->fn(session, request);
+    }
     return qihse_resp_error(session, "ERR unknown command");
 }
 

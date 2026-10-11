@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <stdbool.h>
 
 qihse_http_server_t* qihse_http_server_create(uint16_t port) {
     qihse_http_server_t* srv = (qihse_http_server_t*)calloc(1, sizeof(qihse_http_server_t));
@@ -35,19 +36,30 @@ int qihse_http_server_add_route(qihse_http_server_t* srv, const char* path,
     return 0;
 }
 
-static http_route_t* find_route(qihse_http_server_t* srv, const char* path, http_method_t method) {
+static bool find_route(qihse_http_server_t* srv, const char* path, http_method_t method, http_route_t* out) {
+    if (!srv || !path || !out) return false;
+    pthread_mutex_lock(&srv->lock);
     for (size_t i = 0; i < srv->num_routes; i++) {
-        if (srv->routes[i].method == method && strcmp(srv->routes[i].path, path) == 0)
-            return &srv->routes[i];
+        if (srv->routes[i].method == method && strcmp(srv->routes[i].path, path) == 0) {
+            *out = srv->routes[i];
+            pthread_mutex_unlock(&srv->lock);
+            return true;
+        }
     }
-    /* Try prefix match for path parameters */
+    /* Try prefix match for path parameters with boundary check */
     for (size_t i = 0; i < srv->num_routes; i++) {
         if (srv->routes[i].method == method) {
             size_t plen = strlen(srv->routes[i].path);
-            if (strncmp(srv->routes[i].path, path, plen) == 0) return &srv->routes[i];
+            if (strncmp(srv->routes[i].path, path, plen) == 0 &&
+                (path[plen] == '/' || path[plen] == '\0')) {
+                *out = srv->routes[i];
+                pthread_mutex_unlock(&srv->lock);
+                return true;
+            }
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&srv->lock);
+    return false;
 }
 
 static void send_response(int fd, const http_response_t* res) {
@@ -87,13 +99,13 @@ static void* http_client_thread(void* arg) {
         return NULL;
     }
     
-    http_route_t* route = find_route(ctx->srv, req.path, req.method);
-    if (!route) {
+    http_route_t route;
+    if (!find_route(ctx->srv, req.path, req.method, &route)) {
         http_response_t* err = http_response_error(404, "Not Found");
         send_response(ctx->fd, err);
         http_response_free(err);
     } else {
-        http_response_t* res = route->handler(&req, route->user_data);
+        http_response_t* res = route.handler(&req, route.user_data);
         if (res) {
             send_response(ctx->fd, res);
             http_response_free(res);
@@ -113,11 +125,21 @@ static void* http_accept_thread(void* arg) {
         socklen_t addr_len = sizeof(addr);
         int fd = accept(srv->fd, (struct sockaddr*)&addr, &addr_len);
         if (fd < 0) continue;
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
         struct { int fd; qihse_http_server_t* srv; }* ctx = malloc(sizeof(*ctx));
+        if (!ctx) { close(fd); continue; }
         ctx->fd = fd;
         ctx->srv = srv;
         pthread_t tid;
-        pthread_create(&tid, NULL, http_client_thread, ctx);
+        if (pthread_create(&tid, NULL, http_client_thread, ctx) != 0) {
+            close(fd);
+            free(ctx);
+            continue;
+        }
         pthread_detach(tid);
     }
     return NULL;
