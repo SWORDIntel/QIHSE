@@ -60,6 +60,9 @@ __all__ = [
     "DEFAULT_TIMEOUT_MS",
     "Reply",
     "Watch",
+    "FeedEvent",
+    "FeedStatus",
+    "KeystoneFeed",
     "Controller",
     "ControllerError",
     "ControllerUsageError",
@@ -754,6 +757,136 @@ class Watch:
 
 # ── Controller client ──────────────────────────────────────────────────────
 
+
+# ── W7 item 5: KEYSTONE change-feed surface (classification-preserving) ──
+
+class FeedEvent:
+    """One delivered feed record — the full §4 envelope.
+
+    Fields (wire order):
+      offset        journal offset (also the ack/checkpoint unit)
+      event_type    publisher's type string
+      resource_id   publisher's resource id
+      classification / sci / tenant_id   the record's security context,
+                    preserved end-to-end so an indexer never loses them
+      generation    object generation (staleness bound)
+      payload       raw payload bytes
+      event_id      journal event id (hex) — the dedup key
+      origin_node   publishing node id (hex)
+      object_id     deterministic indexed-object id (hex)
+      fencing_epoch exclusive-state epoch at publish
+      hlc_physical_ms / hlc_logical   causal stamp
+      flags         publisher flags (deletion semantics per the brief)
+      object_type   publisher object-type tag
+    """
+
+    __slots__ = ("offset", "event_type", "resource_id", "classification",
+                 "sci", "tenant_id", "generation", "payload", "event_id",
+                 "origin_node", "object_id", "fencing_epoch",
+                 "hlc_physical_ms", "hlc_logical", "flags", "object_type")
+
+    def __init__(self, items):
+        def _bulk(i):
+            r = items[i]
+            return r.value if r.kind in ("bulk", "simple") else b""
+
+        def _int(i):
+            r = items[i]
+            return int(r.value) if r.kind in ("int", "bignum") else 0
+
+        self.offset = _int(0)
+        self.event_type = _bulk(1).decode("utf-8", "replace")
+        self.resource_id = _bulk(2).decode("utf-8", "replace")
+        self.classification = _int(3)
+        self.sci = _int(4)
+        self.tenant_id = _int(5)
+        self.generation = _int(6)
+        self.payload = _bulk(7)
+        self.event_id = _bulk(8).decode("ascii", "replace")
+        self.origin_node = _bulk(9).decode("ascii", "replace")
+        self.object_id = _bulk(10).decode("ascii", "replace")
+        self.fencing_epoch = _int(11)
+        self.hlc_physical_ms = _int(12)
+        self.hlc_logical = _int(13)
+        self.flags = _int(14)
+        self.object_type = _int(15)
+
+    def __repr__(self):
+        return (f"FeedEvent(offset={self.offset}, type={self.event_type!r}, "
+                f"resource={self.resource_id!r}, classif={self.classification}, "
+                f"sci={self.sci:#x}, tenant={self.tenant_id}, "
+                f"gen={self.generation}, {len(self.payload)}B)")
+
+
+class FeedStatus:
+    """KEYSTONE.FEED.STATUS — cursor, last ack, and the fail-closed
+    counters (denied = withheld by clearance/SCI/tenant/payload cap;
+    malformed = refused undecodable records)."""
+
+    __slots__ = ("cursor", "last_ack", "denied", "malformed")
+
+    def __init__(self, items):
+        self.cursor = int(items[0].value)
+        self.last_ack = int(items[1].value)
+        self.denied = int(items[2].value)
+        self.malformed = int(items[3].value)
+
+    def __repr__(self):
+        return (f"FeedStatus(cursor={self.cursor}, last_ack={self.last_ack}, "
+                f"denied={self.denied}, malformed={self.malformed})")
+
+
+class KeystoneFeed:
+    """A resumable, classification-filtered change feed (KEYSTONE.FEED.*).
+
+    Delivery filtering is SERVER-side and per record: events above the
+    session principal's clearance, outside its SCI compartments, in a
+    foreign tenant, or over the payload cap are skipped and counted in
+    STATUS — never delivered.  Nothing here can widen what the principal
+    may see; the SDK only decodes what the server chose to send.
+    """
+
+    def __init__(self, ctrl: "Controller", feed_id: int):
+        self._ctrl = ctrl
+        self.feed_id = feed_id
+
+    def next(self) -> "FeedEvent | None":
+        """Next cleared record, or None when the feed is drained."""
+        r = self._ctrl.call("KEYSTONE.FEED.NEXT", str(self.feed_id))
+        if r.kind == "int" and int(r.value) == 0:
+            return None
+        if r.kind != "array" or len(r.items) != 16:
+            raise ReplyShapeError(
+                f"FEED.NEXT reply kind={r.kind} items={len(r.items) if r.kind == 'array' else '-'}")
+        return FeedEvent(r.items)
+
+    def ack(self, offset: int) -> Reply:
+        return self._ctrl.call("KEYSTONE.FEED.ACK", str(self.feed_id),
+                               _u64(offset, "offset"))
+
+    def resume(self, cursor: int) -> Reply:
+        return self._ctrl.call("KEYSTONE.FEED.RESUME", str(self.feed_id),
+                               _u64(cursor, "cursor"))
+
+    def status(self) -> FeedStatus:
+        r = self._ctrl.call("KEYSTONE.FEED.STATUS", str(self.feed_id))
+        if r.kind != "array" or len(r.items) != 4:
+            raise ReplyShapeError("FEED.STATUS did not return a 4-array")
+        return FeedStatus(r.items)
+
+    def close(self) -> Reply:
+        return self._ctrl.call("KEYSTONE.FEED.CLOSE", str(self.feed_id))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.close()
+        except ControllerError:
+            pass
+
+
 class Controller:
     """Synchronous QIHSE controller client (Python mirror of
     qihse_controller.h).
@@ -789,6 +922,9 @@ class Controller:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         protocol: int = 2,
         connect: bool = True,
+        qkp_identity_dir: str | None = None,
+        qkp_trusted_pubs: "Sequence[str] | None" = None,
+        qkp_node_id: str | None = None,
     ):
         if not host:
             raise ControllerUsageError("host is required")
@@ -804,6 +940,13 @@ class Controller:
         self.password = password
         self.timeout_ms = timeout_ms
         self.protocol = protocol
+        # QKP1 sealed transport (W7): when set, connect() runs the CNSA
+        # 2.0 handshake over the socket and ALL RESP traffic rides sealed
+        # frames — this is how the SDK reaches --pqc-require nodes.
+        self.qkp_identity_dir = qkp_identity_dir
+        self.qkp_trusted_pubs = list(qkp_trusted_pubs) if qkp_trusted_pubs else []
+        self.qkp_node_id = qkp_node_id
+        self._qkp_session = None
         self.pushes: list[Reply] = []      # RESP3 push messages received
         self._watches: list[Watch] = []
         self._sock: socket.socket | None = None
@@ -811,6 +954,94 @@ class Controller:
         self._dead = True
         if connect:
             self.connect()
+
+    # — QKP sealed transport ─────────────────────────────────────────
+
+    def _start_qkp(self, sock: socket.socket):
+        """Handshake + wrap: the reader keeps working unchanged because
+        the shim offers recv()/sendall() over sealed frames.
+
+        The C negotiate does raw fd I/O, so the socket must be in BLOCKING
+        mode for the whole session (a Python timeout socket is
+        non-blocking underneath, and raw reads return EAGAIN, which the
+        handshake correctly treats as rejection).  Boundedness comes from
+        SO_RCVTIMEO in packed-timeval form instead."""
+        if not self.qkp_identity_dir:
+            return sock
+        import struct as _struct
+
+        from .qkp import negotiate_client, QKPHandshakeError, QKPSealError
+
+        timeout_s = sock.gettimeout()
+        if timeout_s is None or timeout_s <= 0:
+            timeout_s = self.timeout_ms / 1000.0
+        ms = max(1, int(timeout_s * 1000))
+        sock.setblocking(True)
+        timeval = _struct.pack('ll', ms // 1000, (ms % 1000) * 1000)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, timeval)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeval)
+
+        class _SealedSock:
+            __slots__ = ("_sock", "_session", "_timeout_s")
+
+            def __init__(self, sock, session, timeout_s):
+                self._sock = sock
+                self._session = session
+                self._timeout_s = timeout_s
+
+            def fileno(self):
+                return self._sock.fileno()
+
+            def gettimeout(self):
+                return self._timeout_s
+
+            def settimeout(self, v):
+                # keep the fd blocking; bound it via SO_RCVTIMEO instead
+                self._timeout_s = v if (v and v > 0) else self._timeout_s
+                ms = max(1, int(self._timeout_s * 1000))
+                tv = _struct.pack('ll', ms // 1000, (ms % 1000) * 1000)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, tv)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, tv)
+
+            def sendall(self, data):
+                self._session.send(data)
+
+            def recv(self, size):
+                try:
+                    return self._session.recv(size)
+                except QKPSealError:
+                    # The C client treats a crypto/transport failure as a
+                    # dead stream; surface it the same way as a reset.
+                    raise ConnectionResetError("sealed stream dead")
+
+            def recv_into(self, buffer, nbytes=0):
+                want = nbytes if nbytes > 0 else len(buffer)
+                want = min(want, 16384)
+                data = self.recv(want)
+                buffer[: len(data)] = data
+                return len(data)
+
+            def close(self):
+                try:
+                    self._session.close()
+                finally:
+                    self._sock.close()
+
+        try:
+            session = negotiate_client(
+                sock.fileno(),
+                identity_dir=self.qkp_identity_dir,
+                trusted_pubs=self.qkp_trusted_pubs,
+                node_id=self.qkp_node_id)
+        except QKPHandshakeError as exc:
+            # Uniform error surface: callers see the SDK's connection
+            # error, not the transport binding's class.  The fd is dead
+            # either way.
+            sock.close()
+            raise ControllerConnectionError(
+                f"QKP handshake refused: {exc}") from exc
+        self._qkp_session = session
+        return _SealedSock(sock, session, timeout_s)
 
     # — lifecycle ─—————————————————————————————————————
 
@@ -829,6 +1060,7 @@ class Controller:
             raise ControllerConnectionError(
                 f"cannot connect to {self.host}:{self.port}: {exc}"
             ) from exc
+        sock = self._start_qkp(sock)
         self._sock = sock
         self._reader = _SocketReader(sock)
         self._dead = False
@@ -963,6 +1195,25 @@ class Controller:
         return self.call("FEDERATION", sub, *args, check=check)
 
     # ── §25: Node inventory and trust ────────────────────────────────
+
+    def keystone_feed_open(self, prefix: "str | None" = None,
+                           cursor: int = 0) -> KeystoneFeed:
+        """KEYSTONE.FEED.OPEN [prefix] [cursor] — the §5.1 handshake: a
+        cursor of C declares "my snapshot reflects everything <= C", and
+        live delivery starts at C.  Allowed for the provisioned index
+        identity (and operators); everyone else is refused server-side."""
+        # Wire grammar is positional: [prefix] [cursor] — a cursor
+        # without a prefix still needs the empty-prefix placeholder.
+        if cursor:
+            args = [prefix or "", _u64(cursor, "cursor")]
+        elif prefix is not None:
+            args = [prefix]
+        else:
+            args = []
+        r = self.call("KEYSTONE.FEED.OPEN", *args)
+        if r.kind != "int":
+            raise ReplyShapeError("FEED.OPEN did not return a feed id")
+        return KeystoneFeed(self, int(r.value))
 
     def node_list(self) -> Reply:
         """FEDERATION NODE.LIST — array of triples

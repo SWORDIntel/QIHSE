@@ -7,6 +7,8 @@
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
+#include "qihse_federation_mtls.h"
+#include "qihse_qkp.h"
 #include "qihse_supply_chain.h"
 #include "qihse_runtime_trust.h"
 #include "qihse_security_audit.h"
@@ -25,6 +27,8 @@
  * builds is non-authoritative by construction (auth resolves principals by
  * pointer identity) and can never carry more than unclassified access. */
 #include "qihse_auth_internal.h"
+#include "qihse_machine_auth.h"
+#include "qihse_audit.h"
 #include "qihse_ingest_guard.h"
 #include "qihse_metrics.h"
 #include "qihse_system_guard.h"
@@ -40,7 +44,10 @@
 #include <limits.h>
 #include <math.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -189,6 +196,10 @@ typedef struct {
     qihse_metric_series_t* latency[QIHSE_QUERY_TYPE_COUNT];
     qihse_metric_series_t* backend_queries[QIHSE_ENGINE_BACKEND_COUNT];
     qihse_metric_series_t* backend_available[QIHSE_ENGINE_BACKEND_COUNT];
+    /* W7 gap closure: cumulative wall time each engine backend spent
+     * inside command dispatch — the busy-time counterpart of
+     * backend_queries_total (which is dispatch COUNT / share). */
+    qihse_metric_series_t* backend_busy[QIHSE_ENGINE_BACKEND_COUNT];
     /* Scrape-time status: cluster + replication. */
     qihse_metric_series_t* cluster_nodes_total;
     qihse_metric_series_t* cluster_nodes_healthy;
@@ -395,6 +406,7 @@ typedef struct { const char* name; qihse_resp_cmd_fn fn; uint32_t flags; } qihse
 #define DSP_SUB_OK     0x1u
 #define DSP_MULTI_OK   0x2u
 #define DSP_BUSY_WRITE 0x4u
+#define DSP_ADMIN      0x8u
 /* Key-extraction shape (upper nibble) — replaces the second command_is
  * chain in qihse_resp_extract_keys. */
 #define DSP_KEY_1KV       (1u << 4)  /* key at argv[1], is a KV-store key */
@@ -420,6 +432,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"col.sum", 2, QIHSE_COMMAND_READONLY, 1, 1, 1},
     {"command", -1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"decr", 2, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_FAST, 1, 1, 1},
+    {"debug", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"del", -2, QIHSE_COMMAND_WRITE, 1, -1, 1},
     {"echo", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"exists", -2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, -1, 1},
@@ -443,6 +456,7 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"select", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"set", -3, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
     {"setex", 4, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
+    {"shutdown", 1, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"ts.add", 4, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_DENYOOM, 1, 1, 1},
     {"ts.range", -4, QIHSE_COMMAND_READONLY, 1, 1, 1},
     {"ttl", 2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, 1, 1},
@@ -903,6 +917,34 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
     return false;
 }
 
+/* Best-effort peer IPv4 for the AUTH rate limiters. IPv4-mapped IPv6 is
+ * unwrapped to its IPv4 form; other IPv6 folds to a stable 32-bit bucket key
+ * (a fold collision widens a bucket, it never narrows one). Unknown/closed
+ * peers report 0, which both limiters treat as one shared local bucket —
+ * the same bucket every pre-existing caller of the no-IP authenticate API
+ * already shares. */
+static uint32_t qihse_session_peer_ip(const qihse_resp_session_t* session) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (!session || getpeername(session->fd, (struct sockaddr*)&ss, &sl) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ntohl(((const struct sockaddr_in*)&ss)->sin_addr.s_addr);
+    }
+    if (ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)&ss;
+        static const uint8_t v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        const uint8_t* b = a6->sin6_addr.s6_addr;
+        if (memcmp(b, v4mapped, sizeof(v4mapped)) == 0) {
+            return ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
+                   ((uint32_t)b[14] << 8) | (uint32_t)b[15];
+        }
+        uint32_t fold = 0;
+        for (int i = 0; i < 16; i++) fold = (fold << 1 | fold >> 31) ^ (uint32_t)b[i];
+        return fold;
+    }
+    return 0;
+}
+
 static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_resp_arg_t* username, const qihse_resp_arg_t* password, bool* authenticated) {
     *authenticated = false;
     char* user_text = qihse_resp_arg_text(username);
@@ -912,7 +954,9 @@ static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_r
         free(password_text);
         return qihse_resp_error(session, "ERR invalid credentials");
     }
-    qihse_user_t* user = qihse_auth_authenticate(user_text, password_text);
+    /* The real peer IP, so both auth rate limiters bucket per client instead
+     * of lumping every connection into the shared IP-0 bucket. */
+    qihse_user_t* user = qihse_auth_authenticate_from(qihse_session_peer_ip(session), user_text, password_text);
     free(user_text);
     free(password_text);
     if (!user) return qihse_resp_error(session, "WRONGPASS invalid username-password pair or user is disabled.");
@@ -1012,6 +1056,67 @@ static bool qihse_resp_handle_cluster_peerauth(qihse_resp_session_t* session,
     session->peer_claims_valid = true;
     session->user = &session->peer_claims;
     session->user_id = verified.principal_user_id;
+    return qihse_resp_simple(session, "OK");
+}
+
+/* MACHINEAUTH <token-hex> — machine-client authentication over plain RESP.
+ * A MACHINE-purpose fabric token signed by a trusted node ML-DSA key
+ * (qihse_machine_auth.h) authenticates the connection; the token's claims
+ * become the session context exactly as CLUSTER PEERAUTH installs them:
+ * role 0, no account capabilities, no verifier, and it dies with the
+ * connection. One token authenticates exactly once (nonce consumed), so a
+ * captured blob cannot be replayed. Like AUTH and PEERAUTH this runs BEFORE
+ * the NOAUTH gate because it IS the authentication. Refusals are typed
+ * errors and never echo token material back. */
+static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
+                                          const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "machineauth");
+    const qihse_resp_arg_t* hexarg = &request->argv[1];
+    size_t blob_len = hexarg->len / 2u;
+    if (hexarg->len == 0u || (hexarg->len & 1u) != 0u ||
+        blob_len > (size_t)QIHSE_FABRIC_TOKEN_MAX_BYTES)
+        return qihse_resp_error(session, "ERR machine auth refused: malformed-token");
+    uint8_t* blob = (uint8_t*)malloc(blob_len);
+    if (!blob) return qihse_resp_error(session, "ERR out of memory");
+    static const char hexv[] = "0123456789abcdef";
+    bool valid = true;
+    for (size_t i = 0; i < blob_len && valid; i++) {
+        const char* hi = (const char*)memchr(hexv, hexarg->data[i * 2u], 16u);
+        const char* lo = (const char*)memchr(hexv, hexarg->data[i * 2u + 1u], 16u);
+        if (!hi || !lo) { valid = false; break; }
+        blob[i] = (uint8_t)((unsigned)(hi - hexv) << 4 | (unsigned)(lo - hexv));
+    }
+    if (!valid) {
+        free(blob);
+        return qihse_resp_error(session, "ERR machine auth refused: malformed-token");
+    }
+
+    qihse_fabric_token_t verified;
+    qihse_machine_auth_verdict_t verdict =
+        qihse_machine_auth_check(blob, blob_len, 0u, &verified);
+    free(blob);
+    if (verdict != QIHSE_MACHINE_AUTH_OK) {
+        char err[96];
+        snprintf(err, sizeof(err), "ERR machine auth refused: %s",
+                 qihse_machine_auth_verdict_name(verdict));
+        return qihse_resp_error(session, err);
+    }
+
+    memset(&session->peer_claims, 0, sizeof(session->peer_claims));
+    session->peer_claims.user_id = verified.principal_user_id;
+    session->peer_claims.classification_level = verified.clearance;
+    session->peer_claims.sci_compartments = verified.sci;
+    session->peer_claims.tenant_id = verified.principal_tenant;
+    /* role 0, no account capabilities, no verifier: a claims context is a
+     * claim about clearance, nothing more. */
+    snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
+             "machine:%02x%02x", verified.submitter_node.bytes[0],
+             verified.submitter_node.bytes[1]);
+    session->peer_claims_valid = true;
+    session->user = &session->peer_claims;
+    session->user_id = verified.principal_user_id;
+    qihse_audit_log("MACHINEAUTH_OK", verified.principal_user_id, 0u,
+                    verified.clearance, verified.sci);
     return qihse_resp_simple(session, "OK");
 }
 
@@ -1973,6 +2078,7 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
 }
 
 static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     if ((request->argc != 2 && request->argc != 4) || !session->server->vdb) return !session->server->vdb ? qihse_resp_error(session, "ERR vector database is not configured") : qihse_resp_wrong_arity(session, "vecget");
     if (request->argc == 4 && !qihse_resp_arg_equal(&request->argv[2], "TAG")) return qihse_resp_error(session, "ERR syntax error");
     uint64_t id;
@@ -1980,7 +2086,7 @@ static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_
     pthread_mutex_lock(&session->server->vdb_lock);
     size_t dims = qihse_vector_db_get_dims(session->server->vdb);
     float* vector = dims ? (float*)malloc(dims * sizeof(*vector)) : NULL;
-    bool found = vector && qihse_vector_db_get_vector_by_id(session->server->vdb, id, vector, &dims);
+    bool found = vector && qihse_vector_db_get_vector_by_id_user(session->server->vdb, session->user, id, vector, &dims);
     pthread_mutex_unlock(&session->server->vdb_lock);
     if (!found) {
         free(vector);
@@ -2738,15 +2844,27 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
     }
 
     if (strcasecmp(sub, "OPEN") == 0) {
-        if (request->argc != 1 && request->argc != 2) {
-            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.OPEN [prefix]");
+        /* W7 item 5: the optional cursor is the §5.1 snapshot-bootstrap
+         * handshake — "my snapshot reflects everything <= C" — so an
+         * external indexer starts live consumption at C in one round
+         * trip (dedup/generation handling above the wire is the
+         * consumer's, exactly as in qihse_federation_ingest). */
+        if (request->argc < 1 || request->argc > 3) {
+            return qihse_resp_error(session, "ERR usage: KEYSTONE.FEED.OPEN [prefix] [cursor]");
         }
         qihse_keystone_feed_config_t fcfg;
         memset(&fcfg, 0, sizeof(fcfg));
-        if (request->argc == 2) {
+        if (request->argc >= 2) {
             size_t pl = request->argv[1].len;
             if (pl >= sizeof(fcfg.prefix)) return qihse_resp_error(session, "ERR prefix too long");
             memcpy(fcfg.prefix, request->argv[1].data, pl); fcfg.prefix[pl] = '\0';
+        }
+        if (request->argc == 3) {
+            uint64_t cursor = 0;
+            if (!qihse_resp_parse_u64_arg(&request->argv[2], &cursor)) {
+                return qihse_resp_error(session, "ERR invalid cursor");
+            }
+            fcfg.cursor = cursor;
         }
         qihse_keystone_feed_t* feed = qihse_keystone_feed_open(
             session->server->federation_journal, session->user, &fcfg);
@@ -4746,6 +4864,13 @@ static bool qihse_resp_handle_time(qihse_resp_session_t* session, const qihse_re
 
 static bool qihse_resp_handle_shutdown(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
+    if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+    if (session->user) {
+        if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+            return qihse_resp_error(session, "NOPERM SHUTDOWN is restricted to the system domain administrator");
+        }
+    }
     if (session->server->running) __atomic_store_n(&session->server->running, false, __ATOMIC_RELEASE);
     return qihse_resp_simple(session, "OK");
 }
@@ -4764,12 +4889,22 @@ static bool qihse_resp_handle_config(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_debug(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, "debug");
-    if (qihse_resp_arg_equal(&request->argv[1], "SLEEP") && request->argc == 3) {
-        double seconds;
-        if (qihse_resp_parse_f64_arg(&request->argv[2], &seconds)) {
-            usleep((useconds_t)(seconds * 1000000.0));
+    if (qihse_resp_arg_equal(&request->argv[1], "SLEEP")) {
+        if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
+        if (session->user) {
+            if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+                qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+                return qihse_resp_error(session, "NOPERM DEBUG SLEEP is restricted to the system domain administrator");
+            }
         }
-        return qihse_resp_simple(session, "OK");
+        if (request->argc == 3) {
+            double seconds;
+            if (qihse_resp_parse_f64_arg(&request->argv[2], &seconds)) {
+                usleep((useconds_t)(seconds * 1000000.0));
+            }
+            return qihse_resp_simple(session, "OK");
+        }
+        return qihse_resp_wrong_arity(session, "debug sleep");
     }
     if (qihse_resp_arg_equal(&request->argv[1], "OBJECT") && request->argc == 3)
         return qihse_resp_simple(session, "Value at:0x0 refcount:1 encoding:raw serializedlength:0");
@@ -5677,6 +5812,14 @@ static void qihse_resp_telemetry_register(qihse_resp_server_t* server) {
                                        backends, (size_t)QIHSE_ENGINE_BACKEND_COUNT) == 0) {
         for (size_t i = 0; i < (size_t)QIHSE_ENGINE_BACKEND_COUNT; i++) {
             server->tlm.backend_queries[i] = qihse_metrics_series(reg, "qihse_backend_queries_total", backends[i]);
+        }
+    }
+    if (qihse_metrics_register_bounded(reg, "qihse_backend_busy_microseconds_total",
+                                       "Cumulative wall time spent inside command dispatch (microseconds), by engine backend",
+                                       METRIC_COUNTER, "backend",
+                                       backends, QIHSE_ENGINE_BACKEND_COUNT) == 0) {
+        for (size_t i = 0; i < QIHSE_ENGINE_BACKEND_COUNT; i++) {
+            server->tlm.backend_busy[i] = qihse_metrics_series(reg, "qihse_backend_busy_microseconds_total", backends[i]);
         }
     }
     if (qihse_metrics_register_bounded(reg, "qihse_backend_available",
@@ -6958,8 +7101,8 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"repl.snapshot.begin", qihse_resp_handle_repl_snapshot_begin, DSP_BUSY_WRITE},
     {"repl.snapshot.read", qihse_resp_handle_repl_snapshot_read, 0},
     {"repl.snapshot.end", qihse_resp_handle_repl_snapshot_end, 0},
-    {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
-    {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_ok_stub, 0},
+    {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE | DSP_ADMIN}, {"config", qihse_resp_handle_config, 0},
+    {"debug", qihse_resp_handle_debug, DSP_ADMIN}, {"slowlog", dsp_ok_stub, 0},
     {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_ok_stub, 0},
     {"multi", qihse_resp_handle_multi, DSP_MULTI_OK}, {"exec", qihse_resp_handle_exec, DSP_MULTI_OK},
     {"discard", qihse_resp_handle_discard, DSP_MULTI_OK}, {"watch", qihse_resp_handle_watch, DSP_MULTI_OK},
@@ -7850,6 +7993,108 @@ static bool qihse_fed_replay_emit_cb(const qihse_federation_event_t* event,
     if (!qihse_resp_bulk_text(session, event->resource_id)) return false;
     (void)payload; (void)payload_len;
     return true;
+}
+
+/* ── W7 item 6: INTROSPECTION.* — additive operator observability ─────
+ *
+ * Four surfaces that were C-API-only (the browser rendered them as typed
+ * errors): QKP rollout counters, cluster-bus traffic counters, the CRL
+ * snapshot state, and per-record metadata.  All are SYSTEM-DOMAIN gated
+ * like FEDERATION.*: operational metadata is operator surface, and
+ * RECORD.META discloses a record's classification — classified-adjacent
+ * information the metadata getter itself gates with the session's
+ * clearance, so a system-domain analyst still cannot probe above itself.
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_handle_introspection(qihse_resp_session_t* session,
+                                            const qihse_resp_request_t* request) {
+    if (request->argc < 2) {
+        return qihse_resp_error(session,
+            "ERR usage: INTROSPECTION.QKP|BUS|CRL|RECORD.META <key>");
+    }
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        return qihse_resp_error(session,
+            "NOPERM INTROSPECTION.* is restricted to the system domain");
+    }
+    const qihse_resp_arg_t* sub = &request->argv[1];
+
+    if (qihse_resp_arg_equal(sub, "QKP")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.qkp");
+        qihse_qkp_counters_t c;
+        qihse_qkp_get_counters(&c);
+        if (!qihse_resp_array(session, 10u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.server_negotiations_ok)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.client_negotiations_ok)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.negotiations_failed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_cleartext)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_malformed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_identity)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.rejects_crypto)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.frames_sealed)) return false;
+        if (!qihse_resp_integer(session, (int64_t)c.frames_unsealed)) return false;
+        return qihse_resp_integer(session, (int64_t)c.unseal_failures);
+    }
+
+    if (qihse_resp_arg_equal(sub, "BUS")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.bus");
+        qihse_cluster_bus_t* bus = qihse_resp_server_bus(session->server);
+        if (!bus) return qihse_resp_error(session, "ERR cluster bus is not configured on this node");
+        qihse_cluster_bus_stats_t s;
+        qihse_cluster_bus_stats(bus, &s);
+        if (!qihse_resp_array(session, 12u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.sent)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.pings_sent)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.pongs_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.slot_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.fail_notices_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.nodes_marked_unhealthy)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_acks_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_accepted)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_rejected)) return false;
+        return qihse_resp_integer(session, (int64_t)s.unsigned_ops_refused);
+        if (!qihse_resp_integer(session, (int64_t)s.slot_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.fail_notices_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.nodes_marked_unhealthy)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.group_updates_received)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_accepted)) return false;
+        if (!qihse_resp_integer(session, (int64_t)s.signed_ops_rejected)) return false;
+        return qihse_resp_integer(session, (int64_t)s.unsigned_ops_refused);
+    }
+
+    if (qihse_resp_arg_equal(sub, "CRL")) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "introspection.crl");
+        qihse_federation_crl_status_t st;
+        qihse_federation_crl_state(&st);
+        if (!qihse_resp_array(session, 3u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)st.entry_count)) return false;
+        if (!qihse_resp_integer(session, st.configured ? 1 : 0)) return false;
+        return qihse_resp_integer(session, st.failed ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(sub, "RECORD.META")) {
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "introspection.record.meta");
+        if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+        char key[512];
+        size_t kl = request->argv[2].len;
+        if (kl == 0 || kl >= sizeof(key)) return qihse_resp_error(session, "ERR invalid key");
+        memcpy(key, request->argv[2].data, kl); key[kl] = '\0';
+        qihse_kv_record_meta_t m;
+        /* The getter enforces the SAME clearance gate as a value read:
+         * miss / expired / not-cleared are one indistinguishable false —
+         * no classification oracle above the principal's own level. */
+        if (!qihse_kv_meta_user(session->server->store, key, session->user, &m)) {
+            if (!qihse_resp_array(session, 1u)) return false;
+            return qihse_resp_null(session);
+        }
+        if (!qihse_resp_array(session, 4u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.classification)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.sci_compartment)) return false;
+        if (!qihse_resp_integer(session, (int64_t)m.expire_time_ms)) return false;
+        return qihse_resp_integer(session, (int64_t)m.flags);
+    }
+
+    return qihse_resp_error(session, "ERR unknown INTROSPECTION subcommand");
 }
 
 static bool qihse_resp_handle_federation(qihse_resp_session_t* session,
@@ -10683,6 +10928,13 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     if (server->tlm.queries[type]) qihse_metrics_series_increment(server->tlm.queries[type], 1u);
     qihse_engine_backend_t backend = qihse_resp_backend_for_type(type);
     if (server->tlm.backend_queries[backend]) qihse_metrics_series_increment(server->tlm.backend_queries[backend], 1u);
+    if (server->tlm.backend_busy[backend]) {
+        /* Atomic u64 in MICROseconds (the counter's own unit): sub-ms
+         * commands still move it, and the name says exactly what it is. */
+        qihse_metrics_series_increment(
+            server->tlm.backend_busy[backend],
+            (uint64_t)(seconds * 1000000.0));
+    }
     if (server->tlm.latency[type]) qihse_metrics_series_observe(server->tlm.latency[type], seconds);
     return ok;
 }
@@ -10708,6 +10960,10 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
         return qihse_resp_handle_cluster_peerauth(session, request);
     }
+    /* MACHINEAUTH ditto: token authentication for machine clients. */
+    if (qihse_resp_command_is(request, "MACHINEAUTH")) {
+        return qihse_resp_handle_machineauth(session, request);
+    }
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     /* U2 revocation SLA: re-validate the session principal authoritatively
      * once per command. A destroyed principal loses the session immediately —
@@ -10717,11 +10973,13 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
      * a live lookup so revocation lands on the next command. */
     bool session_active = true;
     uint32_t session_tenant = QIHSE_TENANT_SYSTEM;
-    if (session->user && session->user != &session->peer_claims) {
+    if (session->user == &session->peer_claims) {
+        session_tenant = session->peer_claims.tenant_id;
+    } else if (session->user) {
         qihse_auth_user_active_and_tenant(session->user, &session_active, &session_tenant);
         if (!session_active) {
             session->user = NULL;
-            session_tenant = QIHSE_TENANT_SYSTEM;
+            session_tenant = QIHSE_TENANT_INVALID;
             if (session->server->auth_required) return qihse_resp_error(session, "NOAUTH Session principal revoked.");
         }
     }
@@ -10799,6 +11057,9 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     }
     if (qihse_resp_command_is(request, "FEDERATION") && request->argc >= 2) {
         return qihse_resp_handle_federation(session, request);
+    }
+    if (qihse_resp_command_is(request, "INTROSPECTION") && request->argc >= 2) {
+        return qihse_resp_handle_introspection(session, request);
     }
     if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
         if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
@@ -10884,7 +11145,22 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (keys.count > 0 && !qihse_resp_ingest_gate(session, request, &keys)) return true;
     if (keys.count > 0 && !qihse_resp_route(session, request, &keys)) return true;
 
-    if (dispatch_entry) return dispatch_entry->fn(session, request);
+    if (dispatch_entry) {
+        if (dispatch_entry->flags & DSP_ADMIN) {
+            bool is_admin_cmd = qihse_resp_command_is(request, "SHUTDOWN") ||
+                                (qihse_resp_command_is(request, "DEBUG") && request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "SLEEP"));
+            if (is_admin_cmd) {
+                if (session->server->auth_required && !session->user) {
+                    return qihse_resp_error(session, "NOAUTH Authentication required.");
+                }
+                if (session->user && (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+                                      session_tenant != QIHSE_TENANT_SYSTEM)) {
+                    return qihse_resp_error(session, "NOPERM command is restricted to the system domain administrator");
+                }
+            }
+        }
+        return dispatch_entry->fn(session, request);
+    }
     return qihse_resp_error(session, "ERR unknown command");
 }
 

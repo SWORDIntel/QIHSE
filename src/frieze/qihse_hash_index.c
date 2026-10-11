@@ -289,6 +289,16 @@ size_t qihse_hash_index_size(const qihse_hash_index_t* idx) {
     return idx->count;
 }
 
+size_t qihse_hash_index_bytes(const qihse_hash_index_t* idx) {
+    if (!idx) return 0u;
+    /* Same accounting the save format documents: fixed header words
+     * (magic/version/key_type/capacity/count/tombstones/slot_stride)
+     * plus the slot table at capacity * slot_stride. */
+    const size_t header_words = 7u * sizeof(uint64_t);
+    return sizeof(*idx) + header_words +
+           idx->capacity * idx->slot_stride;
+}
+
 /* ------------------------------------------------------------------ */
 /* Persistence (save/load)                                             */
 /* ------------------------------------------------------------------ */

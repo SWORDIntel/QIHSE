@@ -2322,6 +2322,7 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
+        if (!qihse_auth_can_access(query->user, row->classification, row->sci_compartment)) continue;
         vector = qihse_vdb_vector_at(vdb, row);
         if (!vector) {
             continue;
@@ -3645,6 +3646,7 @@ static int qihse_vdb_search_sparse(qihse_vector_db_t vdb,
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
+        if (!qihse_auth_can_access(query->user, row->classification, row->sci_compartment)) continue;
         vector = qihse_vdb_vector_at(vdb, row);
         if (!vector) {
             continue;
@@ -5285,8 +5287,9 @@ bool qihse_vector_db_delete_by_id(
     return true;
 }
 
-bool qihse_vector_db_get_vector_by_id(
+bool qihse_vector_db_get_vector_by_id_user(
     qihse_vector_db_t vdb,
+    qihse_user_t* user,
     uint64_t vector_id,
     float* out_vector,
     size_t* out_dims
@@ -5303,6 +5306,11 @@ bool qihse_vector_db_get_vector_by_id(
     }
 
     const qihse_index_row_t* row = &vdb->rows[row_index];
+    if (!qihse_auth_can_access(user, row->classification, row->sci_compartment)) {
+        errno = EACCES;
+        return false;
+    }
+
     const float* vec = qihse_vdb_vector_at(vdb, row);
     if (!vec) {
         errno = ENOENT;
@@ -5312,6 +5320,15 @@ bool qihse_vector_db_get_vector_by_id(
     memcpy(out_vector, vec, vdb->vector_dims * sizeof(float));
     if (out_dims) *out_dims = vdb->vector_dims;
     return true;
+}
+
+bool qihse_vector_db_get_vector_by_id(
+    qihse_vector_db_t vdb,
+    uint64_t vector_id,
+    float* out_vector,
+    size_t* out_dims
+) {
+    return qihse_vector_db_get_vector_by_id_user(vdb, NULL, vector_id, out_vector, out_dims);
 }
 
 bool qihse_vector_db_delete_by_ids(

@@ -808,6 +808,104 @@ bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
     return true;
 }
 
+/* Streaming variant: the routing table for the REAL dispatchers (the same
+ * ones the socket path reaches through uwp_route_payload), called with the
+ * caller-supplied write callback so row/status streams reach the adapter
+ * instead of being dropped.  `current_txn` is NULL: Bolt RUN/PULL run each
+ * query in autocommit; a transactional Bolt session is future work. */
+bool qihse_uwp_dispatch_streaming(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                                  const qihse_uwp_header_t* header,
+                                  const uint8_t* payload, size_t payload_len,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx,
+                                  uint8_t* out_response, size_t out_cap,
+                                  size_t* out_len) {
+    if (!ctx || !header) return false;
+    if (memcmp(header->magic, qihse_uwp_magic, sizeof(header->magic)) != 0)
+        return false;
+    if (header->version != 0x01) return false;
+    uint64_t plen = uwp_payload_length(header);
+    if (plen > QIHSE_UWP_MAX_PAYLOAD || plen > payload_len) return false;
+    if (!user) {
+        static const char unauth[] = "ERR_AUTH\n";
+        if (out_response && out_cap >= sizeof(unauth) - 1) {
+            memcpy(out_response, unauth, sizeof(unauth) - 1);
+            if (out_len) *out_len = sizeof(unauth) - 1;
+        } else if (out_len) {
+            *out_len = 0;
+        }
+        return false;
+    }
+
+    qihse_txn_t* txn = NULL;
+    int fd = -1; /* no peer socket: dispatchers only use it for logging */
+
+    switch (header->target_engine) {
+        case QIHSE_UWP_TARGET_SQL:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x05) {
+                return uwp_dispatch_sql(ctx, header->command_opcode, payload,
+                                        payload_len, &txn, user, fd, write_fn,
+                                        write_ctx) == UWP_STS_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_TXN:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x05) {
+                return uwp_dispatch_txn(ctx, header->command_opcode, payload,
+                                        payload_len, &txn, user, fd, write_fn,
+                                        write_ctx) == UWP_STS_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_GRAPH2:
+            if ((header->command_opcode >= 0x01 &&
+                 header->command_opcode <= 0x06) ||
+                header->command_opcode == 0x10) {
+                return uwp_dispatch_graph2(ctx, header->command_opcode,
+                                           payload, payload_len, user, fd,
+                                           write_fn, write_ctx) == UWP_GI_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_INDEX:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x05) {
+                return uwp_dispatch_index(ctx, header->command_opcode, payload,
+                                          payload_len, user, fd, write_fn,
+                                          write_ctx) == UWP_GI_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_SCHEMA:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x06) {
+                return uwp_dispatch_schema(ctx, header->command_opcode,
+                                           payload, payload_len, user, fd,
+                                           write_fn, write_ctx) == UWP_STS_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_REPL:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x04) {
+                return uwp_dispatch_repl(ctx, header->command_opcode, payload,
+                                         payload_len, user, fd, write_fn,
+                                         write_ctx) == UWP_REPL_OK;
+            }
+            break;
+        case QIHSE_UWP_TARGET_POOL:
+            if (header->command_opcode >= 0x01 &&
+                header->command_opcode <= 0x03) {
+                return uwp_dispatch_pool(ctx, header->command_opcode, payload,
+                                         payload_len, user, fd, write_fn,
+                                         write_ctx) == UWP_REPL_OK;
+            }
+            break;
+        default:
+            break;
+    }
+    /* Not a streaming target (or a bad opcode): fall back to the classic
+     * in-process entry, which handles AUTH/RESP/KV and the stubbed targets. */
+    return qihse_uwp_dispatch(ctx, user, header, payload, payload_len,
+                              out_response, out_cap, out_len);
+}
+
 
 void qihse_uwp_handle_payload(qihse_uwp_context_t* ctx, const uint8_t* payload_data, size_t len) {
     if (len < sizeof(qihse_uwp_header_t)) return;

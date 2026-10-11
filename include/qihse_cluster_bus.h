@@ -175,6 +175,7 @@ typedef struct {
     uint16_t owner_index;       /* sender's local index (for sender's reference) */
     uint16_t reserved;
     char owner_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u]; /* owner's node ID (resolved by receiver) */
+    uint64_t config_epoch;
 } qihse_cluster_bus_slot_update_t;
 
 typedef struct qihse_cluster_bus qihse_cluster_bus_t;
@@ -231,9 +232,9 @@ typedef struct {
      * cluster_id may be nil (the accept path does not gate on it). */
     void* federation_sign_key;   /* EVP_PKEY* — borrowed */
     /* Hardened mode: refuse unsigned signed-class ops frames (SLOT/NODE/
-     * GROUP updates) at receive.  Off by default so a rolling upgrade
-     * works; flip once every node runs signing keys. */
+     * GROUP updates, FAIL, MEET) at receive. Default is true (SEC-15). */
     bool require_signed_ops;
+    bool allow_unsigned_ops;
     qihse_uuid_t federation_cluster_id;
     qihse_uuid_t federation_boot_id;
     uint32_t statement_ms;       /* 0 → QIHSE_CLUSTER_BUS_STATEMENT_MS */

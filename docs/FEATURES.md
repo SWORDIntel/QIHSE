@@ -12,8 +12,10 @@
 > (verified by `make test-sql-dml-exec`'s `test_insert_populates_row_store` on
 > 2026-09-26), and the Bolt adapter's wire compatibility was repaired
 > (Bolt 4.x message signatures, PackStream tiny containers, and FAILURE frames
-> for refused RUNs — `make test-bolt`) although it still does not return RUN
-> query results to a driver. Read the per-area status lines in
+> for refused RUNs — `make test-bolt`). RUN query results ARE now returned to
+> the driver: Bolt RUN routes to the SQL EXECUTE dispatcher through
+> `qihse_uwp_dispatch_streaming()`, and PULL drains the captured result
+> stream as records (commit ed8795d, 2026-09-28). Read the per-area status lines in
 > `tests/gold/pack.v1.gold` and in [architecture/](architecture/) for the
 > specific gaps that remain.
 
@@ -174,6 +176,15 @@ The operational layer includes:
 - OpenTelemetry-style tracing
 - background compaction and TTL
 - SQL extensions such as vector search, time bucketing, and full-text matching
+- the operator browser (`./qihse browse`) — a web dashboard over a loopback
+  authenticated bridge: fleet overview, cluster slot map, the federation
+  plane, journal, keyspace and whole-keyspace records census, guarded
+  actions behind a YubiKey FIDO touch, and a headless `--dump` mode; the C
+  controller, the Python SDK and the browser all reach `--pqc-require` nodes
+  over the QKP1 sealed transport
+- `INTROSPECTION.*` operator observability (QKP rollout counters, cluster-bus
+  traffic incl. signed-ops verdicts, CRL snapshot state, per-record
+  classification/SCI metadata under the same clearance gate as value reads)
 
 ## Task queue and scheduler
 
@@ -241,6 +252,9 @@ The federation controller SDKs are separate from the compatibility set: the C
 reference client (`include/qihse_controller.h`), the Python SDK
 ([`python/qihse/controller.py`](../python/qihse/controller.py)) and the Rust
 SDK ([`rust/qihse-rs/src/controller.rs`](../rust/qihse-rs/src/controller.rs)).
+All three can seal their transport (QKP1: ML-KEM-1024 + ML-DSA-87 +
+ChaCha20-Poly1305) against `--pqc-require` nodes, and the Python SDK ships
+typed KEYSTONE change-feed access (`Controller.keystone_feed_open()`).
 
 ## Benchmarks
 

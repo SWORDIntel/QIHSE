@@ -242,6 +242,10 @@ static btree_node_t* leaf_split(btree_node_t* n, uint32_t fanout,
     char* src = (char*)leaf_entry(n, mid);
     char* end = (char*)leaf_entry(n, total);
     size_t bytes = end - src;
+    if (bytes > right->data_capacity) {
+        node_free_recursive(right);
+        return NULL;
+    }
     memcpy(right->data, src, bytes);
     right->count = total - mid;
     right->data_size = (uint32_t)bytes;
@@ -326,7 +330,7 @@ void qihse_btree_destroy(qihse_btree_t* tree) {
 bool qihse_btree_insert(qihse_btree_t* tree,
                         const void* key, size_t key_len,
                         uint64_t row_id) {
-    if (!tree || !key) return false;
+    if (!tree || !key || key_len > QIHSE_BTREE_MAX_KEY_LEN) return false;
     pthread_rwlock_wrlock(&tree->lock);
 
     btree_node_t* leaf = descend_to_leaf(tree->root, key, key_len);
@@ -375,6 +379,12 @@ bool qihse_btree_insert(qihse_btree_t* tree,
             return false;
         }
         /* Copy left half back into original leaf */
+        if (big->data_size > leaf->data_capacity) {
+            node_free_recursive(right);
+            free(big);
+            pthread_rwlock_unlock(&tree->lock);
+            return false;
+        }
         memcpy(leaf->data, big->data, big->data_size);
         leaf->count = big->count;
         leaf->data_size = big->data_size;

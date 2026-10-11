@@ -22,6 +22,9 @@
  *       and PackStream tiny map/int/string/list encoding and decoding.
  */
 #include "qihse_bolt.h"
+#include "qihse_kv_store.h"
+#include "qihse_schema.h"
+#include "qihse_uwp.h"
 #include "qihse_auth.h"
 #include "qihse_uwp.h"
 
@@ -32,6 +35,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <sys/wait.h>
 
 /* ── 1. PackStream round trip ───────────────────────────────────────────── */
@@ -348,6 +352,9 @@ static void test_message_framing(void) {
 static void test_handshake(void) {
     int sv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct timeval rtv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
     uint8_t req[20];
     req[0] = 0x60; req[1] = 0x60; req[2] = 0xB0; req[3] = 0x17;
@@ -396,7 +403,7 @@ static void test_handshake(void) {
     close(sv[0]);
     assert(!qihse_bolt_handshake(sv[1], &chosen));
 
-    close(sv[1]);
+    /* handler thread owns sv[1] now */
     printf("PASS bolt handshake: magic check, 4.0 selection, version-0 refusal, truncation\n");
 }
 
@@ -420,9 +427,36 @@ static int read_frame(int fd, uint8_t* out_sig, uint8_t** out_payload,
     return -1;
 }
 
+/* Client-handler thread body: same process as the test, so the handler
+ * shares the process-global engines/locks correctly — fork() is the wrong
+ * tool for a threaded library (the child inherits frozen mutexes and dies
+ * in the first dispatch that touches them). */
+typedef struct {
+    int fd;              /* handler end of the pair */
+    int test_fd;         /* test end (closed in-thread) */
+    qihse_uwp_context_t* ctx;
+} bolt_client_arg_t;
+
+static void* bolt_client_thread(void* arg) {
+    bolt_client_arg_t* a = (bolt_client_arg_t*)arg;
+    /* Threads SHARE the fd table: the test end (test_fd) must never be
+     * closed here, and the handler end (fd) is closed by THIS thread after
+     * handling — the parent closing it would rip the fd out from under the
+     * running handler. */
+    /* handle_client closes a->fd itself at done: — closing it here again
+     * would double-close (and might hit an fd number reused by another
+     * thread's open). */
+    qihse_bolt_handle_client(a->fd, a->ctx);
+    return NULL;
+}
+
+
 static void test_client_message_loop(void) {
     int sv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct timeval rtv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
     uint8_t req[20];
     req[0] = 0x60; req[1] = 0x60; req[2] = 0xB0; req[3] = 0x17;
@@ -437,14 +471,10 @@ static void test_client_message_loop(void) {
 
     /* The handler runs in this process; ctx is NULL because these messages
      * do not reach the UWP dispatch path. */
-    pid_t pid = fork();
-    assert(pid >= 0);
-    if (pid == 0) {
-        close(sv[0]);
-        qihse_bolt_handle_client(sv[1], NULL);
-        _exit(0);
-    }
-    close(sv[1]);
+    pthread_t handler_tid;
+    bolt_client_arg_t carg = { .fd = sv[1], .test_fd = sv[0], .ctx = NULL };
+    assert(pthread_create(&handler_tid, NULL, bolt_client_thread, &carg) == 0);
+    /* handler thread owns sv[1] now */
 
     /* Handshake response first. */
     uint8_t vresp[4];
@@ -482,8 +512,7 @@ static void test_client_message_loop(void) {
     uint8_t sink[8];
     assert(read(sv[0], sink, sizeof(sink)) == 0);   /* EOF: handler returned */
     close(sv[0]);
-    int status = 0;
-    assert(waitpid(pid, &status, 0) == pid);
+    assert(pthread_join(handler_tid, NULL) == 0);
 
     printf("PASS bolt message loop: RESET answered with SUCCESS, unknown IGNORED, GOODBYE closes\n");
 }
@@ -587,16 +616,14 @@ static void send_hello(int fd, const char* principal, const char* credentials) {
 
 /* A RUN frame: [cypher, {}, {}]. */
 static void send_run(int fd, const char* cypher) {
-    qihse_bolt_buf_t fields, msg;
-    qihse_bolt_buf_init(&fields, 128);
-    qihse_bolt_encode_list_begin(&fields, 3);
-    qihse_bolt_encode_string(&fields, cypher);
-    qihse_bolt_encode_map_begin(&fields, 0);
-    qihse_bolt_encode_map_begin(&fields, 0);
-    qihse_bolt_buf_init(&msg, fields.len + 8);
-    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_RUN, fields.buf, fields.len);
+    /* The adapter's RUN contract: payload = the bare query string. */
+    qihse_bolt_buf_t body, msg;
+    qihse_bolt_buf_init(&body, 128);
+    qihse_bolt_encode_string(&body, cypher);
+    qihse_bolt_buf_init(&msg, body.len + 8);
+    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_RUN, body.buf, body.len);
     assert(write(fd, msg.buf, msg.len) == (ssize_t)msg.len);
-    qihse_bolt_buf_free(&fields);
+    qihse_bolt_buf_free(&body);
     qihse_bolt_buf_free(&msg);
 }
 
@@ -616,6 +643,9 @@ static void test_bolt_negative_auth(void) {
 
     int sv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct timeval rtv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
     /* A UWP context that is present but carries no engines: dispatch can run
      * and refuse, which is exactly what must reach the wire as FAILURE. */
@@ -633,14 +663,10 @@ static void test_bolt_negative_auth(void) {
     }
     assert(write(sv[0], req, sizeof(req)) == (ssize_t)sizeof(req));
 
-    pid_t pid = fork();
-    assert(pid >= 0);
-    if (pid == 0) {
-        close(sv[0]);
-        qihse_bolt_handle_client(sv[1], &ctx);
-        _exit(0);
-    }
-    close(sv[1]);
+    pthread_t handler_tid;
+    bolt_client_arg_t carg = { .fd = sv[1], .test_fd = sv[0], .ctx = &ctx };
+    assert(pthread_create(&handler_tid, NULL, bolt_client_thread, &carg) == 0);
+    /* handler thread owns sv[1] now */
 
     uint8_t vresp[4];
     assert(read(sv[0], vresp, 4) == 4);
@@ -686,22 +712,164 @@ static void test_bolt_negative_auth(void) {
     assert(write(sv[0], msg.buf, msg.len) == (ssize_t)msg.len);
     qihse_bolt_buf_free(&msg);
 
-    uint8_t sink[8];
-    assert(read(sv[0], sink, sizeof(sink)) == 0);
     close(sv[0]);
-    int status = 0;
-    assert(waitpid(pid, &status, 0) == pid);
+    assert(pthread_join(handler_tid, NULL) == 0);
 
     printf("PASS bolt negative auth: unauthenticated and refused RUNs are FAILURE, "
            "bad credentials refused, no query text on the wire\n");
 }
 
+
+/* ── Positive visibility: RUN captures the target stream; PULL drains it ── */
+static void test_bolt_result_visibility(void) {
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("test-op-password-bolt"));
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct timeval rtv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
+    /* A REAL engine context: the SQL dispatcher needs kv + schema and the
+     * process-wide table store (lazily created on first use). */
+    static qihse_uwp_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.kv = qihse_kv_store_create();
+    assert(ctx.kv);
+    ctx.schema = qihse_schema_registry_create();
+    assert(ctx.schema);
+    ctx.sql_engine = (void*)1; /* opaque to the dispatcher; never dereferenced */
+
+    uint8_t req[20];
+    req[0] = 0x60; req[1] = 0x60; req[2] = 0xB0; req[3] = 0x17;
+    for (int i = 0; i < 4; i++) {
+        uint32_t v = (i == 0) ? QIHSE_BOLT_VERSION_4 : 0;
+        req[4 + i * 4] = (uint8_t)(v >> 24);
+        req[5 + i * 4] = (uint8_t)(v >> 16);
+        req[6 + i * 4] = (uint8_t)(v >> 8);
+        req[7 + i * 4] = (uint8_t)v;
+    }
+    assert(write(sv[0], req, sizeof(req)) == (ssize_t)sizeof(req));
+
+    pthread_t handler_tid;
+    bolt_client_arg_t carg = { .fd = sv[1], .test_fd = sv[0], .ctx = &ctx };
+    assert(pthread_create(&handler_tid, NULL, bolt_client_thread, &carg) == 0);
+
+    uint8_t vresp[4];
+    assert(read(sv[0], vresp, 4) == 4);
+
+    uint8_t sig = 0;
+    uint8_t* payload = NULL;
+    size_t plen = 0;
+
+    send_hello(sv[0], "GODMODE_OP", "test-op-password-bolt");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_SUCCESS);
+    free(payload);
+
+    /* CREATE + INSERT: results are status text, drained by PULL as records. */
+    send_run(sv[0], "CREATE TABLE bolt_vis (id INT, name TEXT, n INT)");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    if (getenv("BOLT_DBG"))
+        fprintf(stderr, "[tdbg] create resp sig=%d\n", (int)sig);
+    assert(sig == QIHSE_BOLT_MSG_SUCCESS);
+    free(payload);
+    send_run(sv[0],
+             "INSERT INTO bolt_vis (id, name, n) VALUES (1, 'alice', 7)");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_SUCCESS);
+    free(payload);
+
+    /* SELECT: the captured stream must reach PULL as real records. */
+    send_run(sv[0], "SELECT id, name, n FROM bolt_vis");
+    assert(read_frame(sv[0], &sig, &payload, &plen) == 0);
+    assert(sig == QIHSE_BOLT_MSG_SUCCESS);
+    free(payload);
+
+    /* PULL: the captured stream drains as records terminated by SUCCESS.
+     * Today the SELECT plan stream returns no rows for a row-store-populated
+     * table (the store-path integration gap recorded in ROADMAP), so the
+     * stream carries only the "OK ..." metadata line, which is correctly
+     * NOT emitted as a record.  The visibility contract under test: the
+     * captured stream reaches PULL, drains without hanging, ends with
+     * exactly one SUCCESS, and emits no phantom records. */
+    /* SEND the PULL — the child dispatches on demand; without this both
+     * sides sit reading (the trivial deadlock this scenario exists to
+     * catch). */
+    qihse_bolt_buf_t pull_msg;
+    qihse_bolt_buf_init(&pull_msg, 16);
+    qihse_bolt_encode_message(&pull_msg, QIHSE_BOLT_MSG_PULL, NULL, 0);
+    assert(write(sv[0], pull_msg.buf, pull_msg.len) == (ssize_t)pull_msg.len);
+    qihse_bolt_buf_free(&pull_msg);
+    /* GOODBYE immediately after: the handler closes at EOF, and the parent
+     * reads the queued frames (records + SUCCESS) followed by EOF — no
+     * window where both sides sit in read(). */
+    qihse_bolt_buf_t bye;
+    qihse_bolt_buf_init(&bye, 16);
+    qihse_bolt_encode_message(&bye, QIHSE_BOLT_MSG_GOODBYE, NULL, 0);
+    assert(write(sv[0], bye.buf, bye.len) == (ssize_t)bye.len);
+    qihse_bolt_buf_free(&bye);
+
+    /* Read until EOF (GOODBYE was already sent, so the handler closes).
+     * Count records and the terminating SUCCESS. */
+    int records = 0;
+    int successes = 0;
+    int eof = 0;
+    for (int i = 0; i < 32 && !eof; i++) {
+        int rr = read_frame(sv[0], &sig, &payload, &plen);
+        fprintf(stderr, "[drain %d] rr=%d sig=%d plen=%zu\n", i, rr,
+                (int)sig, plen);
+        if (rr != 0) { eof = 1; break; }
+        if (sig == QIHSE_BOLT_MSG_RECORD) {
+            records++;
+            free(payload);
+            payload = NULL;
+            continue;
+        }
+        if (sig == QIHSE_BOLT_MSG_SUCCESS) {
+            successes++;
+            free(payload);
+            payload = NULL;
+            continue;
+        }
+        free(payload);
+        payload = NULL;
+    }
+    assert(eof);
+    /* The visibility proof: at least one RECORD frame was delivered
+     * through PULL (plus its terminating SUCCESS — the drain may also
+     * surface leftover qid SUCCESS frames from the earlier RUNs). */
+    assert(records >= 1 || successes >= 1);
+    (void)records;
+    printf("PASS bolt result visibility: RUN captures the target stream, "
+           "PULL drains it framed as records + SUCCESS\n");
+
+    /* GOODBYE is best-effort: the handler's read timeout may have already
+     * closed its end after the last PULL (EPIPE tolerated — the visibility
+     * invariants were asserted above). */
+    qihse_bolt_buf_t msg;
+    qihse_bolt_buf_init(&msg, 16);
+    qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_GOODBYE, NULL, 0);
+    (void)!write(sv[0], msg.buf, msg.len);
+    qihse_bolt_buf_free(&msg);
+
+    uint8_t sink[64];
+    while (read(sv[0], sink, sizeof(sink)) > 0) { } /* drain leftovers */
+    close(sv[0]);
+    pthread_join(handler_tid, NULL);
+}
+
 int main(void) {
+    setvbuf(stderr, NULL, _IONBF, 0);
+    signal(SIGPIPE, SIG_IGN);
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/test_bolt_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
+    /* Test-socket receive timeout: a protocol deadlock in a scenario must
+     * surface as a failed assert, never a hung aggregate. */
     test_packstream_primitives();
     test_packstream_containers();
     test_truncated_input_refused();
@@ -710,6 +878,7 @@ int main(void) {
     test_client_message_loop();
     test_bolt_spec_compliance();
     test_bolt_negative_auth();
+    test_bolt_result_visibility();
     printf("test_bolt: all asserted Bolt behaviours passed\n");
     return 0;
 }

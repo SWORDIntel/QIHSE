@@ -78,6 +78,7 @@ Use these when you need implementation-level detail rather than the project over
 - [Event stream](architecture/event_stream.md)
 - [Cluster brain](architecture/cluster_brain.md)
 - [AI compute fabric](architecture/ai_fabric.md)
+- [Operator browser](architecture/qihse_browser.md) (with the [usage runbook](manual/usage/qihse-browser-runbook.md))
 - [Overlay protocol](architecture/overlay_protocol.md)
 - [QMAG policy](architecture/qmag-policy.md)
 - [TRITON Lua injector](architecture/lua_injector.md)

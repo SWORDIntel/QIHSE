@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh QIHSE machine token (MACHINEAUTH bearer credential)
+
+[Service]
+Type=oneshot
+UMask=077
+Environment=LD_LIBRARY_PATH=/opt/qihse/lib
+ExecStart=/bin/sh -c 'LD_LIBRARY_PATH=/opt/qihse/lib /opt/qihse/bin/qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem --ttl-seconds 86400 > /etc/qihse/machine_token.tmp && mv /etc/qihse/machine_token.tmp /etc/qihse/machine_token'

@@ -200,6 +200,21 @@ size_t qihse_index_manager_count(const qihse_index_manager_t* mgr) {
     return mgr->count;
 }
 
+size_t qihse_index_manager_bytes(const qihse_index_manager_t* mgr) {
+    if (!mgr) return 0u;
+    /* The manager is a linked list under an rwlock; walk it read-locked.
+     * (Const-cast mirrors qihse_index_manager_count's lock discipline.) */
+    qihse_index_manager_t* m = (qihse_index_manager_t*)mgr;
+    pthread_rwlock_rdlock(&m->lock);
+    size_t total = 0u;
+    for (qihse_index_t* cur = m->head; cur; cur = cur->next) {
+        if (cur->hash) total += qihse_hash_index_bytes(cur->hash);
+    }
+    pthread_rwlock_unlock(&m->lock);
+    return total;
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Key serialization bridge                                            */
 /* ------------------------------------------------------------------ */

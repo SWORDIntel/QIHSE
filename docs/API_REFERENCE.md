@@ -616,9 +616,24 @@ Tests: `tests/test_auth_privilege_boundary.c`, `tests/test_object_acl.c`,
 
 Roles are `QIHSE_ROLE_OPERATOR` (0), `QIHSE_ROLE_ANALYST` (1),
 `QIHSE_ROLE_GUEST` (2). Object ACL flags are `QIHSE_ACL_READ` (0x01),
-`QIHSE_ACL_WRITE` (0x02), `QIHSE_ACL_ADMIN` (0x04). Password verifiers are
-PBKDF2-HMAC-SHA-384 with a 128-bit salt, a 48-byte hash, and a production
-iteration floor of `QIHSE_PW_MIN_ITERATIONS` (600000).
+`QIHSE_ACL_WRITE` (0x02), `QIHSE_ACL_ADMIN` (0x04). Tenant identifiers
+include `QIHSE_TENANT_SYSTEM` (0) and `QIHSE_TENANT_INVALID` (`UINT32_MAX`).
+Password verifiers are PBKDF2-HMAC-SHA-384 with a 128-bit salt, a 48-byte hash,
+and a production iteration floor of `QIHSE_PW_MIN_ITERATIONS` (600000).
+
+### Operating Modes: Default Single-User God-mode vs. Opt-In Security
+
+- **Default Single-User God-Mode (`auth_required == false`):**
+  By default, QIHSE runs in frictionless single-user god-mode. User 0 (`GODMODE_OP`,
+  clearance `0xFFFF`, SCI compartments `0xFFFF`) is pre-authorized and operates
+  without mandatory password bootstrapping or friction. Local and single-user
+  workflows incur zero security barriers.
+- **Opt-In Security Mode (`auth_required == true`):**
+  When opt-in security mode is enabled (via configuration, `--require-auth`, or
+  explicit operator password setup), strict security gates activate:
+  unauthenticated requests fail closed (`NOAUTH`), tenant boundaries (`t:<id>/`)
+  are strictly enforced, User 0 cannot be destroyed or modified by tenant operators,
+  and row-level clearance/SCI checks are mandatory.
 
 | Function | Purpose | On failure |
 |---|---|---|
@@ -664,6 +679,24 @@ Auth rate limiting (brute-force protection):
 | `bool qihse_auth_check_rate_limit(uint32_t source_ip)` | Is this source allowed to attempt? | `false` when limited |
 | `void qihse_auth_rate_limit_reset(uint32_t source_ip)` | Clear a source's counters. | n/a |
 | `void qihse_auth_rate_limit_cleanup(void)` | Expire stale entries. | n/a |
+
+Auth volume limiting (auth-storm protection):
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `void qihse_auth_init_volume_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries)` | Configure the volume limiter (defaults: 120 attempts / 60 s / 1024 entries). | n/a |
+| `void qihse_auth_shutdown_volume_limiter(void)` | Shut the volume limiter down. | n/a |
+| `bool qihse_auth_check_volume_limit(uint32_t source_ip)` | Check whether IP has exceeded the overall connection/attempt volume ceiling. | `false` when limited |
+| `void qihse_auth_volume_limit_reset(uint32_t source_ip)` | Reset volume limiter counters for an IP. | n/a |
+
+Password verifier cache:
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity)` | Configure PBKDF2 verifier cache TTL and capacity (defaults: 300 s / 256 entries). | n/a |
+| `void qihse_auth_cache_clear(void)` | Invalidate all cached password verifications. | n/a |
+| `void qihse_auth_cache_stats(uint64_t* out_hits, uint64_t* out_misses, uint64_t* out_stores)` | Retrieve cumulative cache hit, miss, and store metrics. | n/a |
+
 
 ---
 
@@ -966,6 +999,15 @@ Test: `tests/test_incremental_export.c` (`make test-incremental-export`).
 | `bool qihse_export_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq, char* err, size_t err_cap)` | The export-layer form of the delta ([§6](#6-key-value-store--includeqihse_kv_storeh)): the mutations strictly above the cursor, filtered at the KV layer, with the no-leak resume point. Unlike the raw KV form, this surface REFUSES a `NULL` user outright. | `false`, with `*out_records` `NULL` and nothing partially returned |
 | `bool qihse_export_tenant_user(qihse_kv_store_t* kv, qihse_blob_store_t* blobs, uint32_t tenant_id, qihse_user_t* user, const char* out_path, char* err, size_t err_cap)` | Whole-tenant export; a principal may only export its own tenant, `NULL` is denied. | `false` |
 
+### 8.12 Vector database classification access — `include/qihse_vector_db.h`
+
+Source: `src/broad_oak/qihse_vector_db.c`.
+Test: `tests/test_vector_db.c`, `tests/test_auth_privilege_boundary.c`.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_vector_db_get_vector_by_id_user(qihse_vector_db_t vdb, qihse_user_t* user, uint64_t vector_id, float* out_vector, size_t* out_dims)` | Retrieve a single vector by external ID with mandatory security-context enforcement. In default god-mode or when the principal satisfies clearance/SCI, returns vector float data and dimension count. Under opt-in security, unauthorized or low-clearance calls fail closed. | `false` (missing ID, insufficient clearance, or invalid user) |
+
 ---
 
 ## 9. Python SDK — `python/qihse/`
@@ -990,6 +1032,7 @@ reachable only from their module (`Container` in `python/qihse/core.py`,
 | `python/qihse/anchor.py` | `AnchorIndex` | `lower_bound`, `search` |
 | `python/qihse/hardware.py` | `HardwareProfiler`, `HardwareProfile` | `get_profile()` |
 | `python/qihse/controller.py` | `Controller`, `Watch`, `Reply`, the `Controller*Error` hierarchy, and the `MAX_BULK_BYTES`/`MAX_ARRAY_ITEMS`/`MAX_DEPTH` bounds | A synchronous stdlib-only RESP client for the `FEDERATION.*` controller surface, with explicit authentication, a bounded exact parser using the same limits as the C client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and resumable watches. Verified by `python/tests/test_controller_sdk.py` (59 tests, run by CI's `unittest discover`) |
+| `python/qihse/thermal.py` | `get_fleet_telemetry`, `collect_local_telemetry`, `publish_telemetry` | Fleet and node telemetry collection, fan speed, thermal zones, and Redis publishing (re-exported by `python/qihse/__init__.py`) |
 
 Selected method signatures:
 
@@ -1012,6 +1055,10 @@ EventStream.append(topic: str, payload: bytes) -> bool
 UWPServer.start(port, bind_address, kv=None, vdb=None, doc=None, tsdb=None,
                 tls_cert=None, tls_key=None) -> bool
 UWPClient.authenticate(username: str, password: str) -> None
+
+get_fleet_telemetry(redis_client=None) -> dict[str, dict]
+collect_local_telemetry() -> dict[str, float | str | int]
+publish_telemetry(redis_client, telemetry=None) -> None
 ```
 
 Failure behaviour is exception-based where the native call cannot express the
@@ -1232,6 +1279,49 @@ Federation and operations state is namespaced inside the caller's KV store:
 | `fabric:job:<job-id>` | fabric job records, and the result `FABRIC.RESULT` returns |
 
 ---
+
+## 11a. 2026-09-26/28 round — new public APIs
+
+These landed with the improvement pass; each carries its own tests (named
+below) and is wired into the `make test` aggregate.
+
+| API | Header | What it does | Test |
+|---|---|---|---|
+| `qihse_uwp_dispatch_streaming()` | `qihse_uwp.h` | In-process UWP dispatch that routes SQL/TXN/GRAPH2/INDEX/SCHEMA/REPL/POOL to the REAL dispatchers with the caller's write callback (row/status streams reach the adapter instead of being dropped). NULL user on non-AUTH targets refused, as `qihse_uwp_dispatch`. | `test_bolt_result_visibility` in `tests/test_bolt.c` |
+| `qihse_qkp_get_counters()` + `qihse_qkp_counters_t` | `qihse_qkp.h` | Process-wide QKP1 handshake/traffic counters: per-side negotiation success, categorized rejections (cleartext/malformed/identity/crypto/replay), sealed-frame seal/unseal/failure. | `test_pqc_handshake` scenario 9 |
+| `qihse_federation_node_identity_read()` | `qihse_federation.h` | Read an enrolled node's identity record (public key, trust state, fingerprint) by UUID. No trust filtering — the caller decides policy. | `test_bus_signed_ops` (s1–s4) |
+| `qihse_bus_msg_signed_class()` | `qihse_cluster_bus.h` | Predicate: which bus frame classes carry ML-DSA signature trailers (SLOT/NODE/GROUP updates). | `test_bus_signed_ops` |
+| `qihse_cluster_bus_set_require_signed_ops()` | `qihse_cluster_bus.h` | Hardened receive policy: refuse unsigned signed-class ops frames. | `test_bus_signed_ops` (s4) |
+| `qihse_federation_ca rotate-node` (CLI) | `tools/qihse_federation_ca.c` | Issue a successor node identity and revoke the predecessor onto the CRL in one step; fail-closed on partial failure. | verified live; composition of tested issue/revoke paths |
+
+Protocol changes in the same round:
+
+- **Joint consensus** in the scoped consensus module: `qihse_consensus_propose_joint()` — two-phase C_old,new bulk membership transitions with a dual-majority quorum (majority of C_old AND of the current fold) and a survivor rule against mid-joint stranding. Tests j1–j4 in `tests/test_consensus.c`.
+- **Signed bus ops frames**: SLOT/NODE/GROUP updates carry an ML-DSA-87 trailer verified against the signer's ENROLLED identity (algorithm of record from the enrollment, never a wire-claimed byte). Daemon flags: `--node-key PATH`, `--require-signed-ops`.
+- **Lease wire TTL contract**: FEDERATION LEASE.ACQUIRE/RENEW take a TTL in ms from the server's now (default `QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS`, 60s); the server stores the absolute expiry. The core APIs remain absolute.
+- **Audit fork safety**: `pthread_atfork` handlers fence the audit signer around fork and restart it in the child — a forked process no longer inherits frozen audit mutexes.
+
+## 11b. W7 CITADEL-substrate round — new public APIs
+
+Every row carries its own tests, wired into the `make test` aggregate and
+the gold pack (`make test-gold`).
+
+| API | Header / Module | What it does | Test |
+|---|---|---|---|
+| `qihse_consensus_member_role_t` + weights, `qihse_consensus_propose_membership_role()` | `qihse_consensus.h` | VOTER/WITNESS/LEARNER roles and per-member u16 voter weights; weighted-majority quorum in commit, elections and liveness; a learner weighs 0, never campaigns, never grants votes. Zero-filled arrays = weight-1 voters, so every pre-W7 config/record decodes unchanged. | `make test-consensus` (roles/learner/witness suites) |
+| Baseline-drift fail-closed (`B` record line) | `qihse_consensus.c` | Record creation pins a digest of the baseline membership (members/roles/weights); an open() with a drifted baseline refuses before any log replays. Pre-W7 files carry no B line and are tolerated. | `make test-consensus` (`test_baseline_drift`) |
+| `qihse_federation_snapshot_xfer_*` (QSX1) | `qihse_federation_snapshot_xfer.h` | Chunked, resumable transfer of a sealed backup-container v3 over the verified replication transport; per-chunk CRC, atomic resume sidecar, container-signature authority. | `make test-snapshot-xfer` |
+| `QIHSE_FEDERATION_MUTATION_TOMBSTONE` + `qihse_federation_journal_append_tombstone()` | `qihse_federation.h` | Delete events in the F2 journal envelope (reserved flags bit — no on-disk format change); generation-gated so deletes order against upserts. | `make test-federation-ingest` |
+| `qihse_federation_ingest_*` | `qihse_federation_ingest.h` | The §5.2 consumer contract: `boot(C)` exact-cursor snapshot handshake, snapshot-seeded generation gates, event-id dedup ring, tombstone lifecycle reset, at-least-once/idempotent apply, fail-closed checkpoints. | `make test-federation-ingest` |
+| Controller QKP config (`qkp_*` fields) | `qihse_controller.h` | The C controller performs the CNSA 2.0 handshake at connect and runs sealed frames on both I/O paths — cleartext is never used; a failed handshake fails the connect. | `make test-controller-qkp` |
+| `Controller(qkp_identity_dir=…)` / `python/qihse/qkp.py` | `python/qihse/controller.py` | Python SDK over QKP1: ctypes bindings drive the library handshake on the caller's fd (the library is the only crypto); sealed-socket shim keeps the bounded parser unchanged. | `make test-controller-qkp` (Python 3/3) |
+| `INTROSPECTION.QKP / .BUS / .CRL / .RECORD.META` | RESP engine | System-domain-gated operator observability: QKP rollout counters, bus traffic counters incl. signed-ops verdicts, CRL snapshot state, and per-record classification/SCI/expiry/flags via a metadata-only KV getter with the IDENTICAL clearance gate as value reads (miss/expired/not-cleared indistinguishable — no classification oracle). | `make test-browser` (36 checks) |
+| `qihse_kv_meta_user()` + `qihse_kv_record_meta_t` | `qihse_kv_store.h` | The metadata-only getter behind RECORD.META. | `make test-browser` |
+| `KEYSTONE.FEED.OPEN [prefix] [cursor]` | RESP engine | The §5.1 snapshot-bootstrap handshake in one round trip; the cursor is an END-of-record position from STATUS/ACK (positional grammar — a lone cursor argument would be read as a prefix filter). | `make test-keystone-feed-wire` |
+| `Controller.keystone_feed_open()` → `KeystoneFeed`/`FeedEvent`/`FeedStatus` | `python/qihse/controller.py` | Typed Python access to the 16-field §4 change-feed envelope with ack/resume/status. | `make test-keystone-feed-wire` (15 checks) |
+| `qihse_backend_busy_microseconds_total{backend}` | RESP engine telemetry | Cumulative wall time each engine backend spends inside command dispatch (atomic u64 µs at the same chokepoint as backend_queries_total) — utilization is busy time, not dispatch share. | `gold_backend_busy` in the gold pack |
+| `qihse_hash_index_bytes()` / `qihse_index_manager_bytes()` | `qihse_hash_index.h` / `qihse_index_manager.h` | Non-vector index byte accounting: the save-format accounting (struct + header words + capacity × slot_stride) per hash index, summed read-locked across the manager's list. | `gold_index_bytes` in the gold pack |
+| `./qihse browse` (operator browser) | `python/qihse/browser/` + `dashboard/` | Web dashboard + loopback bridge: operator-context default (no login wall, FIDO-touch-gated actions) or per-principal 2FA mode; records census, cluster/federation views, guarded action allowlist; `--dump` headless mode; `--qkp-*` sealed transport. | `make test-browser` + `make test-browser-unit` |
 
 ## 12. Known gaps and unverified areas
 

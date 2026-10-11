@@ -59,6 +59,7 @@ from .hardware import HardwareProfiler, HardwareProfile
 from .fts import FTSIndex, FTSResult
 from .fusion import MultimodalFusion, FusionResult
 from .controller import Controller, Reply, Watch, ControllerError, ControllerServerError
+from .thermal import get_fleet_telemetry, collect_local_telemetry, publish_telemetry
 
 __all__ = [
     "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode",
@@ -71,5 +72,7 @@ __all__ = [
     "FTSIndex", "FTSResult",
     "MultimodalFusion", "FusionResult",
     "Controller", "Reply", "Watch", "ControllerError", "ControllerServerError",
+    "get_fleet_telemetry", "collect_local_telemetry", "publish_telemetry",
 ]
 __version__ = "0.3.0"
+

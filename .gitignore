@@ -45,6 +45,7 @@ lib/
 /.learn/
 /.qlearn/
 /memory-bank/
+/.playwright-mcp/
 
 # CNSA 2.0 PQC key material (generate with scripts/qihse_keygen.sh)
 /qihse_kem_key.pem
@@ -133,3 +134,4 @@ lib/
 # vendored tree-sitter build artifacts
 vendor/tree-sitter/lib/src/lib.d
 vendor/tree-sitter/lib/src/*.o
+browser-credentials.json

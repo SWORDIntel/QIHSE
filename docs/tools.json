@@ -10,19 +10,102 @@
     "kdf_latency_note": "authentication paths cost multiple seconds (CNSA 2.0 KDF) - normal"
   },
   "tools": [
-    {"name": "make lib", "task": "build the shared library", "command": "make lib", "credential": "none"},
-    {"name": "make test", "task": "full test aggregate (~40-50 min)", "command": "make test", "credential": "none"},
-    {"name": "make test-gold", "task": "gold validation suite (60 workloads)", "command": "make test-gold", "credential": "none"},
-    {"name": "make check", "task": "upstream-workflow repo check", "command": "make check", "credential": "none"},
-    {"name": "qihse demo", "task": "native SDK smoke (KV/doc/columnar/TSDB/auth/proxies)", "command": "./qihse demo", "credential": "demo default or QIHSE_OPERATOR_PASSWORD"},
-    {"name": "qihse python", "task": "Python REPL with the native module importable", "command": "./qihse python", "credential": "as demo"},
-    {"name": "qihse-redis-server", "task": "standalone RESP server", "build": "make redis-server", "command_noauth": "./qihse-redis-server --port 6399", "command_auth": "QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'", "credential": "bootstraps from --password when unset; must match env when set (mismatch exits 2)"},
-    {"name": "qihse-cluster-daemon", "task": "cluster node (RESP + bus + brain options)", "build": "make cluster-daemon", "command": "./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'", "credential": "--operator-password keys both AUTH and the veiled bus; every node must share it", "peers": "--node INDEX:HOST:PORT:BUS-PORT (repeatable) or --join HOST:BUS-PORT"},
-    {"name": "qihse-federation-ca", "task": "federation CA provisioning (outside the process)", "build": "make federation-ca", "command": "QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca", "credential": "QIHSE_OPERATOR_PASSWORD"},
-    {"name": "qihse_keygen", "task": "key material generation", "build": "make keygen", "command": "./qihse_keygen", "credential": "none"},
-    {"name": "python-ctypes-sdk", "task": "Python controller SDK", "path": "python/qihse (import qihse.controller)", "test": "make test-controller-sdk-py", "credential": "username/password in connect config, then AUTH"},
-    {"name": "rust-controller-sdk", "task": "Rust controller SDK", "path": "rust/qihse-rs", "test": "cd rust/qihse-rs && cargo test --offline", "credential": "username/password in connect config, then AUTH"},
-    {"name": "cluster-smoke-drills", "task": "env-overridable cluster drills", "path": "tests/cluster_*_smoke.py", "example": "python3 tests/cluster_failover_smoke.py", "credential": "per drill"}
+    {
+      "name": "make lib",
+      "task": "build the shared library",
+      "command": "make lib",
+      "credential": "none"
+    },
+    {
+      "name": "make test",
+      "task": "full test aggregate (~40-50 min)",
+      "command": "make test",
+      "credential": "none"
+    },
+    {
+      "name": "make test-gold",
+      "task": "gold validation suite (60 workloads)",
+      "command": "make test-gold",
+      "credential": "none"
+    },
+    {
+      "name": "make check",
+      "task": "upstream-workflow repo check",
+      "command": "make check",
+      "credential": "none"
+    },
+    {
+      "name": "qihse demo",
+      "task": "native SDK smoke (KV/doc/columnar/TSDB/auth/proxies)",
+      "command": "./qihse demo",
+      "credential": "demo default or QIHSE_OPERATOR_PASSWORD"
+    },
+    {
+      "name": "qihse python",
+      "task": "Python REPL with the native module importable",
+      "command": "./qihse python",
+      "credential": "as demo"
+    },
+    {
+      "name": "qihse-redis-server",
+      "task": "standalone RESP server",
+      "build": "make redis-server",
+      "command_noauth": "./qihse-redis-server --port 6399",
+      "command_auth": "QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'",
+      "credential": "bootstraps from --password when unset; must match env when set (mismatch exits 2)"
+    },
+    {
+      "name": "qihse-cluster-daemon",
+      "task": "cluster node (RESP + bus + brain options)",
+      "build": "make cluster-daemon",
+      "command": "./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>' [--node-key PATH] [--require-signed-ops]",
+      "credential": "--operator-password keys both AUTH and the veiled bus; every node must share it",
+      "peers": "--node INDEX:HOST:PORT:BUS-PORT (repeatable) or --join HOST:BUS-PORT"
+    },
+    {
+      "name": "qihse-federation-ca",
+      "task": "federation CA provisioning (outside the process)",
+      "build": "make federation-ca",
+      "command": "QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca",
+      "credential": "QIHSE_OPERATOR_PASSWORD"
+    },
+    {
+      "name": "qihse_keygen",
+      "task": "key material generation",
+      "build": "make keygen",
+      "command": "./qihse_keygen",
+      "credential": "none"
+    },
+    {
+      "name": "python-ctypes-sdk",
+      "task": "Python controller SDK",
+      "path": "python/qihse (import qihse.controller)",
+      "test": "make test-controller-sdk-py",
+      "credential": "username/password in connect config, then AUTH"
+    },
+    {
+      "name": "rust-controller-sdk",
+      "task": "Rust controller SDK",
+      "path": "rust/qihse-rs",
+      "test": "cd rust/qihse-rs && cargo test --offline",
+      "credential": "username/password in connect config, then AUTH"
+    },
+    {
+      "name": "cluster-smoke-drills",
+      "task": "env-overridable cluster drills",
+      "path": "tests/cluster_*_smoke.py",
+      "example": "python3 tests/cluster_failover_smoke.py",
+      "credential": "per drill"
+    },
+    {
+      "name": "./qihse browse",
+      "task": "operator browser: no-login-wall web dashboard (operator-context default \u2014 bridge authenticates at startup, FIDO key-in-slot touch gates guarded actions); --require-login restores per-principal two-factor; headless --dump for scripts",
+      "command": "./qihse browse --node <host:port> [--node ...] [--dump overview|cluster|federation|keys]",
+      "credential": "QIHSE_OPERATOR_PASSWORD (or --password) at startup for the default mode; YubiKey FIDO touch for guarded actions; per-principal password+2FA under --require-login",
+      "notes": "python-fido2 1.2.0 + pyca/cryptography 43.0.0 (system-tested versions); tests: make test-browser-unit, make test-browser; docs: docs/architecture/qihse_browser.md"
+    },
+    {"name": "qihse-federation-ca rotate-node", "task": "issue successor node identity + revoke predecessor in one step", "build": "make federation-ca", "command": "QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca rotate-node --ca-key ./build/ca/ca.key --ca-cert ./build/ca/ca.pem --crl ./build/ca/revocations.crl --node-uuid <uuid> --pubkey-hex <hex> --out ./new.pem", "credential": "QIHSE_OPERATOR_PASSWORD"},
+    {"name": "test-bus-signed-ops", "task": "signed bus ops frames (ML-DSA trailers on SLOT/NODE/GROUP updates)", "command": "make test-bus-signed-ops", "credential": "none"}
   ],
   "docs": {
     "operations_manual": "docs/OPERATIONS.md",

@@ -66,6 +66,12 @@ bool qihse_hash_index_delete(qihse_hash_index_t* idx,
 /** @return number of live entries (excluding tombstones). */
 size_t qihse_hash_index_size(const qihse_hash_index_t* idx);
 
+/** @return the index's memory footprint in bytes (struct + slot table),
+ * the same accounting the save format implies: header words plus
+ * capacity * slot_stride.  An absent index reports 0.  (Feeds the
+ * qihse_index_bytes metric — observability gap "index-bytes-nonvector".) */
+size_t qihse_hash_index_bytes(const qihse_hash_index_t* idx);
+
 /* ------------------------------------------------------------------ */
 /* Optional persistence (save/load)                                    */
 /* ------------------------------------------------------------------ */

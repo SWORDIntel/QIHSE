@@ -44,6 +44,15 @@ typedef struct {
     const char* username;    /* NULL → connect unauthenticated */
     const char* password;    /* used only when username is set */
     uint32_t timeout_ms;     /* 0 → QIHSE_CTRL_DEFAULT_TIMEOUT_MS */
+    /* QKP1 sealed transport (W7 — lets this client reach --pqc-require
+     * nodes).  When qkp_identity_dir is set (a qihse_keygen output dir),
+     * the client runs the CNSA 2.0 handshake right after TCP connect and
+     * every RESP byte rides sealed frames.  Cleartext is never used: a
+     * failed handshake fails the connect. */
+    const char* qkp_identity_dir;         /* NULL → cleartext RESP */
+    const char* const* qkp_trusted_pubs;  /* server ML-DSA-87 PEM paths */
+    size_t      qkp_trusted_count;
+    const char* qkp_node_id;              /* NULL → "ctrl@host:port" */
 } qihse_controller_config_t;
 
 typedef enum {

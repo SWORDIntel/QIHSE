@@ -151,7 +151,7 @@ static const char* match_paren(const char* p) {
             if (depth == 0) return p + 1;
         } else if (*p == '\'' || *p == '`' || *p == '"') {
             char q = *p++;
-            while (*p && *p != q) { if (*p == '\\') p++; p++; }
+            while (*p && *p != q) { if (*p == '\\' && p[1] != '\0') p++; p++; }
             if (!*p) return NULL;
         }
     }
@@ -181,7 +181,7 @@ static char** split_commas(const char* body, size_t* out_n) {
             depth--;
         } else if (*p == '\'' || *p == '`' || *p == '"') {
             char q = *p++;
-            while (*p && *p != q) { if (*p == '\\') p++; p++; }
+            while (*p && *p != q) { if (*p == '\\' && p[1] != '\0') p++; p++; }
             if (!*p) break;
         }
     }
@@ -819,7 +819,7 @@ static char* lex_until_kw(ch_lex_t* L, const char** kws, size_t nkw) {
         else if (*p == ')' || *p == ']') { if (depth > 0) depth--; }
         else if (*p == '\'' || *p == '`' || *p == '"') {
             char q = *p++;
-            while (*p && *p != q) { if (*p == '\\') p++; p++; }
+            while (*p && *p != q) { if (*p == '\\' && p[1] != '\0') p++; p++; }
             if (!*p) break;
             p++;
             continue;
@@ -858,7 +858,7 @@ static char* lex_until_kw_or_char(ch_lex_t* L, const char** kws, size_t nkw,
         else if (*p == ')' || *p == ']') { if (depth > 0) depth--; }
         else if (*p == '\'' || *p == '`' || *p == '"') {
             char q = *p++;
-            while (*p && *p != q) { if (*p == '\\') p++; p++; }
+            while (*p && *p != q) { if (*p == '\\' && p[1] != '\0') p++; p++; }
             if (!*p) break;
             p++;
             continue;
@@ -2466,7 +2466,7 @@ static qihse_ch_result_t* parse_values_body(const char* data, const qihse_ch_tab
             if (*p == '\'') {
                 p++;
                 const char* start = p;
-                while (*p && *p != '\'') { if (*p == '\\') p++; p++; }
+                while (*p && *p != '\'') { if (*p == '\\' && p[1] != '\0') p++; p++; }
                 char* val = ch_strndup(start, (size_t)(p - start));
                 if (*p == '\'') p++;
                 if (col < ncols || ncols == 0)

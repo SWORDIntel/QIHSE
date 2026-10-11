@@ -3091,11 +3091,15 @@ static void* mongo_conn_thread(void* arg) {
     }
     free(buf);
     close(fd);
-    /* Last touch of the server: stop() joins this thread before the server
-     * (and the catalog) can be freed. */
+    /* Last touch of the server: reset slot and decrement live_conns under conn_lock
+     * resolving the permanent 64-connection server lockout defect. */
     pthread_mutex_lock(&srv->conn_lock);
     srv->conn_fds[slot] = -1;
+    srv->conn_threads[slot] = 0;
+    if (srv->live_conns > 0) srv->live_conns--;
+    if (srv->live_conns == 0) pthread_cond_broadcast(&srv->conn_idle);
     pthread_mutex_unlock(&srv->conn_lock);
+    pthread_detach(pthread_self());
     return NULL;
 }
 
@@ -3228,17 +3232,13 @@ int qihse_mongo_server_stop(qihse_mongo_server_t* srv) {
     /* No new connection can be registered now (the accept thread is joined), so
      * this snapshot is complete: wake every client out of recv() and join it
      * before the catalog may be freed. */
-    pthread_t tids[MONGO_MAX_CONNECTIONS];
-    size_t n = 0;
     pthread_mutex_lock(&srv->conn_lock);
     for (int i = 0; i < MONGO_MAX_CONNECTIONS; i++) {
-        if (srv->conn_threads[i] == 0) continue;
         if (srv->conn_fds[i] >= 0) shutdown(srv->conn_fds[i], SHUT_RDWR);
-        tids[n++] = srv->conn_threads[i];
     }
-    pthread_mutex_unlock(&srv->conn_lock);
-    for (size_t i = 0; i < n; i++) pthread_join(tids[i], NULL);
-    pthread_mutex_lock(&srv->conn_lock);
+    while (srv->live_conns > 0) {
+        pthread_cond_wait(&srv->conn_idle, &srv->conn_lock);
+    }
     for (int i = 0; i < MONGO_MAX_CONNECTIONS; i++) {
         srv->conn_fds[i] = -1;
         srv->conn_threads[i] = 0;

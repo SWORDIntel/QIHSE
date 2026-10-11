@@ -87,6 +87,20 @@ def cmd_build_tui(args: list[str]) -> int:
     return _run([sys.executable, str(SCRIPTS / "build-tui.py")] + args)
 
 
+def cmd_browse(args: list[str]) -> int:
+    """Operator browser: web bridge (default) or headless dump."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
+    return _run([sys.executable, "-m", "qihse.browser"] + args)
+
+
+def cmd_fans(args: list[str]) -> int:
+    """Thermal telemetry and fan control engine."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
+    return _run([sys.executable, "-m", "qihse.thermal"] + args)
+
+
 def cmd_test(args: list[str]) -> int:
     """Run the full test suite."""
     print("[qihse] Running test suite ...")
@@ -287,6 +301,9 @@ COMMANDS = {
     "build-ctypes":  cmd_build_ctypes,
     "build-native":  cmd_build_native,
     "build-tui":     cmd_build_tui,
+    "browse":        cmd_browse,
+    "fans":          cmd_fans,
+    "thermal":       cmd_fans,
     "test":          cmd_test,
     "bench":         cmd_bench,
     "db":            cmd_db,
@@ -312,6 +329,8 @@ def _help() -> None:
         "Usage: ./qihse [command] [args...]\n"
         "\n"
         "Commands:\n"
+        "  browse         Launch QIHSE Operator Browser (web dashboard)\n"
+        "  fans           Cluster thermal telemetry & fan engine (or: thermal)\n"
         "  build          Build libqihse.so (auto-detect SIMD)\n"
         "  build-ctypes   Build ctypes-only variant (no Python extension)\n"
         "  build-native   Build via build-native.sh (full SIMD auto-detect)\n"

@@ -431,10 +431,17 @@ static bool write_keypair(const char *algorithm,
         return false;
     }
 
-    /* Private key */
-    FILE *f = fopen(priv_path, "w");
-    if (!f) {
+    /* Private key: create with mode 0600 directly to avoid world-readable TOCTOU window */
+    int priv_fd = open(priv_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (priv_fd < 0) {
         fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", priv_path);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    FILE *f = fdopen(priv_fd, "w");
+    if (!f) {
+        close(priv_fd);
+        fprintf(stderr, "[QIHSE keygen] Cannot stream %s\n", priv_path);
         EVP_PKEY_free(pkey);
         return false;
     }
@@ -445,8 +452,6 @@ static bool write_keypair(const char *algorithm,
         EVP_PKEY_free(pkey);
         return false;
     }
-    /* chmod 600 on the private key */
-    chmod(priv_path, 0600);
 
     /* Public key */
     f = fopen(pub_path, "w");

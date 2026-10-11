@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the QIHSE machine token every 12h (token TTL is 24h)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=12h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

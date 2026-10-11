@@ -191,8 +191,11 @@ workload resp-hybrid-fusion area=fts-vector-fusion expect=pass timeout=300 \
     ref="src/spinnaker/qihse_resp_engine.c" \
     run="make -s test-resp-hybrid"
 
-gap fts-vector-fusion/recall-latency-gate area=fts-vector-fusion \
-    reason="the fused path is now driven over RESP (VECHYBRID) and verified end to end including the invariant-3 negative test; what remains uncovered is a recall/latency gate for the fused ranking — a scored benchmark workload, not a correctness path"
+workload fusion-recall-gate area=fts-vector-fusion expect=pass timeout=300 \
+    output="recall " \
+    bin=tests/gold/workloads/gold_fusion_recall \
+    run="./tests/gold/workloads/gold_fusion_recall"
+
 
 # ----------------------------------------------------------------------------
 # 5. Persistence / recovery
@@ -291,8 +294,29 @@ workload federation-rejoin area=distributed-failure expect=pass timeout=600 \
     output="federation rejoin tests passed" \
     run="make -s test-federation-rejoin"
 
-gap distributed-failure/multi-process-cluster area=distributed-failure \
-    reason="failure scenarios run through the deterministic in-process simulator over the real F1-F7 entry points; the multi-process smoke scripts (tests/cluster_*_smoke.py) need a running cluster daemon and are not part of make test-gold, so no workload here kills a real peer process"
+workload consensus-membership area=distributed-failure expect=pass timeout=600 \
+    output="all consensus tests passed" \
+    run="make -s test-consensus"
+
+workload snapshot-transfer area=distributed-failure expect=pass timeout=300 \
+    output="snapshot transfer tests passed" \
+    run="make -s test-snapshot-xfer"
+
+workload federation-ingest-contract area=distributed-failure expect=pass timeout=300 \
+    output="federation ingest tests passed" \
+    run="make -s test-federation-ingest"
+
+workload cluster-failover-smoke area=distributed-failure expect=pass timeout=900 \
+    output="failover drill: 5/5 checks passed" \
+    run="python3 tests/cluster_failover_smoke.py"
+
+workload cluster-discovery-smoke area=distributed-failure expect=pass timeout=900 \
+    output="discovery smoke: 5/5 checks passed" \
+    run="python3 tests/cluster_discover_smoke.py --self-spawn"
+
+workload cluster-loadshift-smoke area=distributed-failure expect=pass timeout=900 \
+    output="load-shift smoke: 9/9 checks passed" \
+    run="python3 tests/cluster_loadshift_smoke.py --self-spawn"
 
 # ----------------------------------------------------------------------------
 # 8. Security regressions
@@ -332,6 +356,18 @@ workload tenant-security-regression area=security-regressions expect=pass timeou
 workload tenant-privilege-ladder area=security-regressions expect=pass timeout=300 \
     output="test_tenant_privilege_ladder: all assertions passed" \
     run="make -s -f Makefile -f tests/security-regression.mk test-tenant-privilege-ladder"
+
+workload browser-negative-auth area=security-regressions expect=pass timeout=300 \
+    output="browser negative-auth (fixture + bridge asserts)" \
+    run="make -s test-browser"
+
+workload controller-qkp-identity area=security-regressions expect=pass timeout=600 \
+    output="controller QKP tests passed" \
+    run="make -s test-controller-qkp"
+
+workload keystone-feed-wire area=security-regressions expect=pass timeout=300 \
+    output="keystone feed wire (fixture + SDK asserts)" \
+    run="make -s test-keystone-feed-wire"
 
 workload sci-compartment-regression area=security-regressions expect=pass timeout=300 \
     output="test_sci_compartment_regression: all assertions passed" \
@@ -503,8 +539,12 @@ workload telemetry-w52 area=observability expect=pass timeout=300 \
     output="test_metrics_w52_telemetry: all assertions passed" \
     run="make -s test-metrics-w52"
 
-gap observability/index-bytes-nonvector area=observability \
-    reason="qihse_index_bytes{index=\"hnsw\"} ships: qihse_hnsw_index_bytes counts layer/link/anchor topology and the vector db surfaces it through qihse_vector_db_index_bytes, sampled at scrape via METRICS.RENDER (asserted by resp-hybrid-fusion).  The remaining gap is the OTHER index types — the hash index reports entry count and the index manager count/ncols, but no byte accounting — and no RESP handle exists to sample them.  Recorded rather than fabricated."
+workload index-bytes-nonvector area=observability expect=pass timeout=120 \
+    output="hash index bytes" \
+    bin=tests/gold/workloads/gold_index_bytes \
+    run="./tests/gold/workloads/gold_index_bytes"
 
-gap observability/backend-utilization area=observability \
-    reason="backend 'utilization' is DISPATCH SHARE (qihse_backend_queries_total), not busy time: engines are called synchronously and have no busy-time accounting. The ISA/compute reading of 'backend' (CPU/GPU/NPU) is not covered here — that dimension already has FABRIC.CAPS and the dist-planner surfaces."
+workload backend-busy-time area=observability expect=pass timeout=120 \
+    output="kv busy" \
+    bin=tests/gold/workloads/gold_backend_busy \
+    run="./tests/gold/workloads/gold_backend_busy"

@@ -9,10 +9,15 @@
 > covers the codec, framing, handshake, message loop, Bolt 4.x spec compliance
 > (message signatures and PackStream tiny containers) and negative
 > authentication — the earlier wire defects there were fixed and re-verified
-> (2026-09-26, `make test-bolt`). The adapter still does **not** return `RUN`
-> query results to a driver: `PULL` answers with a single empty record and no
-> result cursor (see
-> [architecture/bolt_protocol.md](architecture/bolt_protocol.md)). The
+> (2026-09-26, `make test-bolt`). `RUN` results ARE now visible to a driver:
+> the query text routes to the SQL EXECUTE dispatcher through the streaming
+> in-process entry (`qihse_uwp_dispatch_streaming`), the target's output
+> stream is captured per session, and `PULL` drains it as records (one
+> string field per line) terminated by a SUCCESS with a bookmark
+> (2026-09-26, `test_bolt_result_visibility`). SELECT row visibility through
+> the plan stream is gated on the row-store/plan-stream integration recorded
+> in ROADMAP; see
+> [architecture/bolt_protocol.md](architecture/bolt_protocol.md). The
 > ClickHouse, Elasticsearch and InfluxDB surfaces have no dedicated test beyond
 > the handler-entry-point coverage in `tests/test_phase_c.c`.
 >
@@ -121,13 +126,13 @@ Implementation: `src/spinnaker/qihse_mongo_wire.c`.
 
 **Status: partial.** The Bolt 4.x protocol path (PackStream serialization,
 handshake, framing, message loop, spec-compliant message signatures) is
-implemented and covered by `tests/test_bolt.c`, and Cypher executes through the
-graph engine (`tests/test_graph.c`); refused or unauthenticated `RUN`s are
-reported as FAILURE frames. The adapter is **not** driver-compatible: `RUN`
-dispatches the Cypher and then discards the result, and `PULL` returns a single
-empty record with no result cursor, so a stock neo4j driver will not see query
-results. See [Bolt protocol](architecture/bolt_protocol.md) for the exact
-deviations.
+implemented and covered by `tests/test_bolt.c`; refused or unauthenticated
+`RUN`s are reported as FAILURE frames. `RUN` carries SQL text routed to the
+SQL EXECUTE dispatcher (not Cypher — a stock neo4j driver will still fail on
+Cypher-specific syntax), the target's output stream is captured per session,
+and `PULL` drains it as records with a result cursor. SELECT row visibility
+is gated on the row-store/plan-stream integration tracked in ROADMAP. See
+[Bolt protocol](architecture/bolt_protocol.md) for the exact deviations.
 
 Graph-facing functionality includes:
 

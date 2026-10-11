@@ -111,6 +111,25 @@ bool qihse_uwp_dispatch(qihse_uwp_context_t* ctx, qihse_user_t* user,
  * nested calls such as SQL->TXN where the outer call handles the response). */
 typedef ssize_t (*qihse_uwp_write_fn)(void* write_ctx, const void* data, size_t len);
 
+/**
+ * Streaming in-process dispatch: identical routing to qihse_uwp_dispatch,
+ * but row/status output for the streaming targets (SQL, TXN, GRAPH2, INDEX,
+ * SCHEMA, REPL, POOL) is emitted through the caller's write callback instead
+ * of being dropped.  Protocol adapters that translate a streaming wire
+ * (e.g. Bolt RUN/PULL) capture the stream here and re-encode it in their own
+ * framing.  Security is identical to qihse_uwp_dispatch: a NULL user on any
+ * non-AUTH target is rejected, and the target's own authorization runs
+ * server-side.
+ *
+ * @return true when the packet routed and executed; false on refusal
+ *         (with out_response/out_len carrying a short diagnostic). */
+bool qihse_uwp_dispatch_streaming(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                                  const qihse_uwp_header_t* header,
+                                  const uint8_t* payload, size_t payload_len,
+                                  qihse_uwp_write_fn write_fn, void* write_ctx,
+                                  uint8_t* out_response, size_t out_cap,
+                                  size_t* out_len);
+
 #ifdef __cplusplus
 }
 #endif

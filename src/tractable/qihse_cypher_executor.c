@@ -662,12 +662,17 @@ static void exec_match_path(qihse_graph_t* g, const cypher_path_t* path, table_t
                     /* variable-length or single hop */
                     if (rp->var_len_min >= 0) {
                         /* BFS up to var_len_max, collect endpoints */
-                        int maxh = rp->var_len_max > 0 ? rp->var_len_max : 64;
+                        int maxh = (rp->var_len_max > 0 && rp->var_len_max <= 8) ? rp->var_len_max : 8;
                         int minh = rp->var_len_min > 0 ? rp->var_len_min : 1;
                         /* simple BFS: track (vertex, hops) */
-                        uint64_t* frontier = malloc(sizeof(uint64_t)); frontier[0] = from; size_t fc = 1;
+                        uint64_t* frontier = malloc(sizeof(uint64_t));
+                        if (!frontier) continue;
+                        frontier[0] = from; size_t fc = 1;
                         for (int h = 1; h <= maxh; ++h) {
-                            uint64_t* nextf = malloc(fc * 16 * sizeof(uint64_t)); size_t nf = 0;
+                            size_t nextf_cap = fc * 16 > 16 ? fc * 16 : 16;
+                            uint64_t* nextf = malloc(nextf_cap * sizeof(uint64_t));
+                            if (!nextf) break;
+                            size_t nf = 0;
                             for (size_t fi = 0; fi < fc; ++fi) {
                                 graph_adj_t adj[64];
                                 size_t na = qihse_graph_get_neighbors(g, frontier[fi], GRAPH_DIR_BOTH,
@@ -680,10 +685,19 @@ static void exec_match_path(qihse_graph_t* g, const cypher_path_t* path, table_t
                                         if (rp->var) { cypher_res_t rv = {0}; rv.type = CRES_EDGE; rv.val.id = adj[a].edge_id; brow_set(&nr, rp->var, rv); }
                                         table_add(&rnext, nr);
                                     }
+                                    if (nf >= nextf_cap) {
+                                        size_t new_cap = nextf_cap * 2;
+                                        if (new_cap < nf + 1) new_cap = nf + 1;
+                                        uint64_t* new_nextf = realloc(nextf, new_cap * sizeof(uint64_t));
+                                        if (!new_nextf) break;
+                                        nextf = new_nextf;
+                                        nextf_cap = new_cap;
+                                    }
                                     nextf[nf++] = adj[a].neighbor_id;
                                 }
                             }
                             free(frontier); frontier = nextf; fc = nf;
+                            if (fc == 0) { free(frontier); frontier = NULL; break; }
                         }
                         free(frontier);
                     } else {
@@ -922,6 +936,27 @@ static void exec_load_csv(qihse_graph_t* g, const qihse_cypher_clause_t* c, tabl
     const char* path = c->csv_uri;
     if (strncmp(path, "file:///", 8) == 0) path += 7; /* keep leading / */
     else if (strncmp(path, "file://", 7) == 0) path += 7;
+
+    /* SEC-13: Validate csv_uri: reject path traversal, device paths, and paths outside import directory */
+    if (strstr(path, "..")) return;
+    if (strncmp(path, "/dev/", 5) == 0 || strcmp(path, "/dev") == 0) return;
+    if (strncmp(path, "/proc/", 6) == 0 || strncmp(path, "/sys/", 5) == 0) return;
+
+    const char* import_dir = getenv("QIHSE_IMPORT_DIR");
+    if (!import_dir || import_dir[0] == '\0') {
+        import_dir = "/tmp";
+    }
+    size_t idlen = strlen(import_dir);
+    while (idlen > 1 && import_dir[idlen - 1] == '/') idlen--;
+
+    if (path[0] == '/') {
+        bool in_import = (strncmp(path, import_dir, idlen) == 0 &&
+                          (path[idlen] == '/' || path[idlen] == '\0' || idlen == 1));
+        if (!getenv("QIHSE_IMPORT_DIR")) {
+            if (strncmp(path, "/var/tmp/", 9) == 0) in_import = true;
+        }
+        if (!in_import) return;
+    }
 
     FILE* f = fopen(path, "rb");
     if (!f) return;

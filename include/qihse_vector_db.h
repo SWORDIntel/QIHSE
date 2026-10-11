@@ -589,6 +589,24 @@ bool qihse_vector_db_delete_by_id(
 );
 
 /**
+ * Retrieve a single vector by external ID with user context authorization.
+ *
+ * @param vdb Vector database handle
+ * @param user User context for authorization
+ * @param vector_id External vector ID to retrieve
+ * @param out_vector Output buffer for vector data (must be at least dims * sizeof(float))
+ * @param out_dims Optional output for vector dimensions
+ * @return true if found and authorized, false on failure, missing ID, or denied
+ */
+bool qihse_vector_db_get_vector_by_id_user(
+    qihse_vector_db_t vdb,
+    qihse_user_t* user,
+    uint64_t vector_id,
+    float* out_vector,
+    size_t* out_dims
+);
+
+/**
  * Retrieve a single vector by external ID.
  *
  * @param vdb Vector database handle

@@ -230,13 +230,21 @@ static qihse_fed_tls_session_t* session_from_ssl(SSL* ssl, qihse_fed_tls_server_
         /* A refusal in the verify callback lands here, as does a peer that
          * presented no certificate. */
         if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_UNTRUSTED;
+        uint8_t* stash = (uint8_t*)SSL_get_ex_data(ssl, 0);
+        if (stash) free(stash);
         SSL_free(ssl);
         return NULL;
     }
     /* The handshake cannot complete without the callback having accepted, so
      * reaching here means the peer was resolved. */
     qihse_fed_tls_session_t* session = (qihse_fed_tls_session_t*)calloc(1, sizeof(*session));
-    if (!session) { SSL_free(ssl); if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED; return NULL; }
+    if (!session) {
+        uint8_t* stash = (uint8_t*)SSL_get_ex_data(ssl, 0);
+        if (stash) free(stash);
+        SSL_free(ssl);
+        if (out_verdict) *out_verdict = QIHSE_PEER_REJECT_MALFORMED;
+        return NULL;
+    }
     session->ssl = ssl;
     session->server = server;
 
@@ -469,7 +477,7 @@ bool qihse_federation_tls_session_peer_gone(qihse_fed_tls_session_t* session,
     if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) return false;
 
     uint8_t scratch[1];
-    int n = SSL_read(session->ssl, scratch, 1);
+    int n = SSL_peek(session->ssl, scratch, 1);
     if (n > 0) return false;   /* real data, not an alert */
     int err = SSL_get_error(session->ssl, n);
     /* ZERO_RETURN is a clean close; SSL_ERROR_SSL is a fatal alert.  Both mean
