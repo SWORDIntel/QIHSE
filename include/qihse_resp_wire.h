@@ -165,6 +165,41 @@ size_t qihse_resp_server_repl_list(qihse_resp_server_t* server,
                                    char (*out_globs)[128], bool* from_flag_out, size_t cap);
 /* Sovereign-routing predicate: does this key match any marked namespace? */
 bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char* key, size_t key_len);
+/* In-process receiver seam for a daemon that has authenticated the source
+ * server with QKP1. These validate the client-side session against this
+ * server's configured upstream pin and require an active system Operator.
+ * Apply also requires an exact marked glob/key match and persists the row
+ * before advancing its durable per-peer cursor. Both methods take kv_lock. */
+bool qihse_resp_server_repl_apply_local(qihse_resp_server_t* server,
+                                        const qihse_qkp_session_t* source_session,
+                                        const char* glob,
+                                        const qihse_kv_replica_record_t* record,
+                                        qihse_user_t* principal);
+bool qihse_resp_server_repl_cursor_local(qihse_resp_server_t* server,
+                                         const qihse_qkp_session_t* source_session,
+                                         const char* glob,
+                                         qihse_user_t* principal,
+                                         uint64_t* out_seq);
+bool qihse_resp_server_repl_snapshot_installed_local(qihse_resp_server_t* server,
+                                                      const qihse_qkp_session_t* source_session,
+                                                      const char* glob,
+                                                      qihse_user_t* principal,
+                                                      bool* out_installed);
+bool qihse_resp_server_repl_snapshot_install_local(qihse_resp_server_t* server,
+                                                    const qihse_qkp_session_t* source_session,
+                                                    const char* glob,
+                                                    const char* filepath,
+                                                    uint64_t source_highwater,
+                                                    qihse_user_t* principal);
+/* QKP1-only, pinned-peer, operator-only replication data plane. REPL.DELTA
+ * returns flat bulk fields [cursor,count,op,seq,class,sci,expire_ms,key,value,...];
+ * REPL.APPLY accepts one version-1 record plus its namespace and durably
+ * advances that peer/namespace cursor only after the row is durable.
+ * REPL.CURSOR reads the corresponding receiver cursor. REPL.SNAPSHOT.BEGIN
+ * registers the source's durable baseline for that peer/namespace before
+ * releasing the snapshot view; REPL.ACK advances it after receiver durability.
+ * Streaming compaction retains matching tombstones until that acknowledgement.
+ * Legacy sequence-zero rows still require a full snapshot baseline. */
 /* Anti-entropy bookkeeping for REPL.STATUS. peer == NULL updates the
  * pattern-level counters (local_count/orphaned); otherwise the per-peer
  * record (pulled/divergent/ok/last_sync). UINT64_MAX leaves a counter

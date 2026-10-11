@@ -1,13 +1,48 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-09-25
+**Status date:** 2026-10-09
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
 ---
 
-## 1. Where we are now (verified against the working tree, 2026-09-25)
+## 1. Where we are now (verified against the working tree, 2026-10-09)
+
+### 1.5 W8 — I2P replica transport and durable KV handoff (implemented, 2026-10-09)
+
+W8 implementation and code-level regression gates are complete. Deployment
+through a real I2P network still needs a site-specific smoke test. W8 adds the
+QKP1-pinned, SOCKS5/I2P-only pull transport; operator-gated RESP
+replication commands; a read-only replica fence; metadata-preserving row apply;
+private snapshot transfer; and durable per-peer namespace cursors. The
+`test-replica-security` regression passes for KV-level low-clearance refusals,
+snapshot namespace filtering, replica write fencing, and cursor persistence.
+`test-replica-qkp` now proves a low-clearance guest is denied over a live pinned
+QKP1 session without protected payload bytes; it is wired into `make test`.
+
+The low-clearance RESP regression proves no protected bytes are returned from
+DELTA or APPLY. The test also verifies that an authenticated system operator
+can retrieve the replication delta through that same pinned connection. Source
+snapshot baselines and monotonic ACKs are durable;
+streaming compaction keeps matching tombstones until ACK, with tests for both
+retention and release. Delta export now filters inside the KV enumerator and
+retains only rows inside its row/byte limits; the daemon requests one row at a
+time. Snapshot installation records a durable intent and startup recovery
+rebuilds the image and cursor; the regression verifies recovery from a pending
+install with leftover candidate, old SSTable, and WAL files. A test-only build
+of the KV store exits abruptly at seven installer durability boundaries; each
+restart checks whether the snapshot and cursor should be committed or absent.
+
+W8 validation gates:
+- [x] Live pinned QKP1 operator success and low-clearance denial, no protected
+  bytes (`make test-replica-qkp`).
+- [x] Abrupt exit/restart at seven install image, intent, WAL, SSTable, cursor,
+  marker, and journal-removal boundaries (`make test-replica-crash`).
+
+The code-level W8 validation gates are closed. A deployment smoke test through
+the configured real I2P/SOCKS network remains site-specific and was not run in
+this workspace; Cryptogramd EventStream integration is a separate open item.
 
 ### 1.1 Landed and committed
 

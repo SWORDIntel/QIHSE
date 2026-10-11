@@ -25,7 +25,7 @@ stale-credential class of failure (env rotated, disk store not).
 |---|---|
 | Source of truth | the process environment (or flag bootstrap on first start) |
 | Lifetime | the process lifetime; nothing survives restart |
-| Multi-node clusters | the operator/orchestrator supplies the SAME `QIHSE_OPERATOR_PASSWORD` to every node (systemd `EnvironmentFile`, secret manager → env); mismatched nodes simply refuse each other's AUTH — visible, not silent |
+| Multi-node clusters | the operator/orchestrator supplies the SAME `QIHSE_OPERATOR_PASSWORD` to every node (systemd root-only `EnvironmentFile`, secret manager → env); mismatched nodes simply refuse each other's AUTH — visible, not silent. The cluster daemon reads this variable when `--operator-password` is omitted, avoiding a secret in process arguments. |
 | Rotation | runtime `USER.MODIFY` with operator credentials; the new verifier dies with the process, so rotation must also land in the deployment's env source |
 | Revealed state | `qihse_auth_is_operator_password_default()` reports whether a verifier is configured; tools must fail closed while none is |
 | Never allowed | writing verifiers, password material, or derived state to disk in any form |

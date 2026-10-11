@@ -75,6 +75,8 @@ typedef struct {
     qihse_resp_server_t* server;
     int fd;
     qihse_qkp_session_t* qkp;   /* R4c: non-null ⇒ every wire byte is sealed */
+    qihse_kv_replica_snapshot_t* repl_snapshot;
+    uint64_t repl_snapshot_seq;
     qihse_user_t* user;
     uint32_t user_id;            /* numeric user id for federation attribution */
     uint64_t id;
@@ -6052,6 +6054,83 @@ bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char*
     return matched;
 }
 
+static bool qihse_resp_replica_local_allowed(qihse_resp_server_t* server,
+                                             const qihse_qkp_session_t* source_session,
+                                             const char* glob,
+                                             qihse_user_t* principal) {
+    if (!server || !server->store || !source_session || !glob || !*glob || !principal ||
+        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR ||
+        !qihse_qkp_client_session_is_replication_peer(source_session,
+            server->pqc.replication_peer_node_id,
+            server->pqc.replication_peer_dsa_pub_path)) return false;
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_SYSTEM;
+    qihse_auth_user_active_and_tenant(principal, &active, &tenant);
+    if (!active || tenant != QIHSE_TENANT_SYSTEM) return false;
+    char marks[QIHSE_REPL_MARKS_MAX][128];
+    size_t n = qihse_resp_server_repl_list(server, marks, NULL, QIHSE_REPL_MARKS_MAX);
+    for (size_t i = 0; i < n; i++) if (strcmp(marks[i], glob) == 0) return true;
+    return false;
+}
+
+bool qihse_resp_server_repl_apply_local(qihse_resp_server_t* server,
+                                        const qihse_qkp_session_t* source_session,
+                                        const char* glob,
+                                        const qihse_kv_replica_record_t* record,
+                                        qihse_user_t* principal) {
+    if (!record || !record->key || !qihse_resp_replica_local_allowed(
+            server, source_session, glob, principal) || fnmatch(glob, record->key, 0) != 0) return false;
+    pthread_rwlock_wrlock(&server->kv_lock);
+    bool ok = qihse_kv_apply_replica_record(server->store, record, principal);
+    if (ok) ok = qihse_kv_replica_cursor_advance(server->store,
+        server->pqc.replication_peer_node_id, glob, record->change_seq, principal);
+    pthread_rwlock_unlock(&server->kv_lock);
+    return ok;
+}
+
+bool qihse_resp_server_repl_cursor_local(qihse_resp_server_t* server,
+                                         const qihse_qkp_session_t* source_session,
+                                         const char* glob,
+                                         qihse_user_t* principal,
+                                         uint64_t* out_seq) {
+    if (!out_seq || !qihse_resp_replica_local_allowed(
+            server, source_session, glob, principal)) return false;
+    pthread_rwlock_rdlock(&server->kv_lock);
+    bool ok = qihse_kv_replica_cursor_get(server->store,
+        server->pqc.replication_peer_node_id, glob, principal, out_seq);
+    pthread_rwlock_unlock(&server->kv_lock);
+    return ok;
+}
+
+bool qihse_resp_server_repl_snapshot_installed_local(qihse_resp_server_t* server,
+                                                      const qihse_qkp_session_t* source_session,
+                                                      const char* glob,
+                                                      qihse_user_t* principal,
+                                                      bool* out_installed) {
+    if (!out_installed || !qihse_resp_replica_local_allowed(
+            server, source_session, glob, principal)) return false;
+    pthread_rwlock_rdlock(&server->kv_lock);
+    bool ok = qihse_kv_replica_snapshot_installed(server->store,
+        server->pqc.replication_peer_node_id, glob, principal, out_installed);
+    pthread_rwlock_unlock(&server->kv_lock);
+    return ok;
+}
+
+bool qihse_resp_server_repl_snapshot_install_local(qihse_resp_server_t* server,
+                                                    const qihse_qkp_session_t* source_session,
+                                                    const char* glob,
+                                                    const char* filepath,
+                                                    uint64_t source_highwater,
+                                                    qihse_user_t* principal) {
+    if (!filepath || !qihse_resp_replica_local_allowed(
+            server, source_session, glob, principal)) return false;
+    pthread_rwlock_wrlock(&server->kv_lock);
+    bool ok = qihse_kv_replica_snapshot_install(server->store, filepath, principal,
+        server->pqc.replication_peer_node_id, glob, source_highwater);
+    pthread_rwlock_unlock(&server->kv_lock);
+    return ok;
+}
+
 void qihse_resp_server_repl_note(qihse_resp_server_t* server, const char* glob, const char* peer,
                                  uint64_t pulled, uint64_t divergent,
                                  uint64_t local_count, uint64_t orphaned, bool ok) {
@@ -6408,6 +6487,284 @@ static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qih
     return qihse_resp_integer(session, (int64_t)pulled);
 }
 
+/* REPL data plane: security is structural at this handler. QKP1 protects
+ * the complete RESP exchange; AUTH supplies a live operator principal. The
+ * KV apply/export APIs perform the row-level authorization checks as well. */
+#define QIHSE_REPL_DELTA_MAX_ROWS 128u
+#define QIHSE_REPL_DELTA_MAX_WIRE (17u * 1024u * 1024u)
+#define QIHSE_REPL_RECORD_MAX_KEY 4096u
+#define QIHSE_REPL_RECORD_MAX_VALUE (16u * 1024u * 1024u)
+
+static bool qihse_resp_repl_data_plane_allowed(qihse_resp_session_t* s) {
+    if (!s || !s->qkp || !s->user || qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+        !qihse_qkp_session_is_replication_peer(s->qkp,
+            s->server->pqc.replication_peer_node_id,
+            s->server->pqc.replication_peer_dsa_pub_path)) return false;
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_SYSTEM;
+    qihse_auth_user_active_and_tenant(s->user, &active, &tenant);
+    return active && tenant == QIHSE_TENANT_SYSTEM;
+}
+
+static bool qihse_resp_repl_arg_string(const qihse_resp_arg_t* arg, size_t max,
+                                       bool allow_empty, char** out) {
+    if (!arg || !out || arg->len > max || (!allow_empty && arg->len == 0u) ||
+        (arg->len && memchr(arg->data, '\0', arg->len))) return false;
+    char* text = (char*)malloc(arg->len + 1u);
+    if (!text) return false;
+    if (arg->len) memcpy(text, arg->data, arg->len);
+    text[arg->len] = '\0';
+    *out = text;
+    return true;
+}
+
+static bool qihse_resp_repl_glob_is_marked(qihse_resp_server_t* server, const char* glob) {
+    char marks[QIHSE_REPL_MARKS_MAX][128];
+    size_t n = qihse_resp_server_repl_list(server, marks, NULL, QIHSE_REPL_MARKS_MAX);
+    for (size_t i = 0; i < n; i++) if (strcmp(marks[i], glob) == 0) return true;
+    return false;
+}
+
+static bool qihse_resp_handle_repl_apply(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
+    if (r->argc != 10u) return qihse_resp_error(s, "ERR usage: REPL.APPLY 1 glob seq S|D class sci expire_ms key value");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
+    uint64_t seq, class_u64, sci_u64, expiry;
+    if (!qihse_resp_arg_equal(&r->argv[1], "1") ||
+        !qihse_resp_parse_u64_arg(&r->argv[3], &seq) || seq == 0u ||
+        !qihse_resp_parse_u64_arg(&r->argv[5], &class_u64) || class_u64 > UINT16_MAX ||
+        !qihse_resp_parse_u64_arg(&r->argv[6], &sci_u64) || sci_u64 > UINT16_MAX ||
+        !qihse_resp_parse_u64_arg(&r->argv[7], &expiry)) return qihse_resp_error(s, "ERR invalid REPL.APPLY fields");
+    bool tombstone = qihse_resp_arg_equal(&r->argv[4], "D");
+    if (!tombstone && !qihse_resp_arg_equal(&r->argv[4], "S")) return qihse_resp_error(s, "ERR invalid operation");
+    char* glob = NULL;
+    char *key = NULL, *value = NULL;
+    if (!qihse_resp_repl_arg_string(&r->argv[2], QIHSE_REPL_GLOB_MAX - 1u, false, &glob) ||
+        !qihse_resp_repl_arg_string(&r->argv[8], QIHSE_REPL_RECORD_MAX_KEY, false, &key) ||
+        !qihse_resp_repl_arg_string(&r->argv[9], QIHSE_REPL_RECORD_MAX_VALUE, true, &value) ||
+        (tombstone && r->argv[9].len != 0u)) {
+        free(glob); free(key); free(value);
+        return qihse_resp_error(s, "ERR invalid or oversized key/value");
+    }
+    if (!qihse_resp_repl_glob_is_marked(s->server, glob) || fnmatch(glob, key, 0) != 0) {
+        free(glob); free(key); free(value);
+        return qihse_resp_error(s, "ERR key is outside the marked replication namespace");
+    }
+    qihse_kv_replica_record_t record = {
+        .key = key, .value = tombstone ? NULL : value, .change_seq = seq,
+        .classification = (uint16_t)class_u64, .sci_compartment = (uint16_t)sci_u64,
+        .expire_time_ms = expiry, .tombstone = tombstone
+    };
+    pthread_rwlock_wrlock(&s->server->kv_lock);
+    bool applied = qihse_kv_apply_replica_record(s->server->store, &record, s->user);
+    /* Cursor advancement syncs the row WAL/SSTables before atomically
+     * persisting the per-peer checkpoint. This favors crash safety over
+     * throughput; a later batch form can amortize the sync. */
+    if (applied) applied = qihse_kv_replica_cursor_advance(
+        s->server->store, s->server->pqc.replication_peer_node_id, glob, seq, s->user);
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    free(glob); free(key); free(value);
+    if (!applied) return qihse_resp_error(s, "ERR replica record refused (authorization, sequence, or storage conflict)");
+    return qihse_resp_simple(s, "OK");
+}
+
+static bool qihse_resp_handle_repl_cursor(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
+    if (r->argc != 2u) return qihse_resp_error(s, "ERR usage: REPL.CURSOR glob");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
+    char* glob = NULL;
+    if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob))
+        return qihse_resp_error(s, "ERR invalid replication namespace");
+    if (!qihse_resp_repl_glob_is_marked(s->server, glob)) {
+        free(glob);
+        return qihse_resp_error(s, "ERR cursor namespace is not marked");
+    }
+    uint64_t seq = 0u;
+    pthread_rwlock_rdlock(&s->server->kv_lock);
+    bool ok = qihse_kv_replica_cursor_get(s->server->store,
+        s->server->pqc.replication_peer_node_id, glob, s->user, &seq);
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    free(glob);
+    if (!ok) return qihse_resp_error(s, "ERR cursor lookup failed");
+    char num[32];
+    int len = snprintf(num, sizeof(num), "%llu", (unsigned long long)seq);
+    return len > 0 && (size_t)len < sizeof(num) && qihse_resp_bulk(s, num, (size_t)len);
+}
+
+static bool qihse_resp_handle_repl_ack(qihse_resp_session_t* s,
+                                       const qihse_resp_request_t* r) {
+    if (r->argc != 3u) return qihse_resp_error(s, "ERR usage: REPL.ACK glob sequence");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
+    char* glob = NULL; uint64_t seq = 0u;
+    if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob) ||
+        !qihse_resp_parse_u64_arg(&r->argv[2], &seq)) {
+        free(glob);
+        return qihse_resp_error(s, "ERR invalid replication namespace or sequence");
+    }
+    if (!qihse_resp_repl_glob_is_marked(s->server, glob)) {
+        free(glob);
+        return qihse_resp_error(s, "ERR ACK namespace is not marked");
+    }
+    pthread_rwlock_wrlock(&s->server->kv_lock);
+    bool ok = seq <= qihse_kv_change_seq(s->server->store) &&
+        qihse_kv_replica_cursor_advance(s->server->store,
+        s->server->pqc.replication_peer_node_id, glob, seq, s->user);
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    free(glob);
+    return ok ? qihse_resp_simple(s, "OK") :
+        qihse_resp_error(s, "ERR ACK regressed or could not be persisted");
+}
+
+static bool qihse_resp_handle_repl_delta(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
+    if (r->argc != 4u) return qihse_resp_error(s, "ERR usage: REPL.DELTA glob since limit");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
+    char* glob = NULL;
+    uint64_t since, limit_u64;
+    if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob) ||
+        !qihse_resp_parse_u64_arg(&r->argv[2], &since) ||
+        !qihse_resp_parse_u64_arg(&r->argv[3], &limit_u64) ||
+        limit_u64 == 0u || limit_u64 > QIHSE_REPL_DELTA_MAX_ROWS) {
+        free(glob);
+        return qihse_resp_error(s, "ERR invalid glob, cursor, or limit");
+    }
+    if (!qihse_resp_repl_glob_is_marked(s->server, glob)) {
+        free(glob);
+        return qihse_resp_error(s, "ERR delta glob is not a marked replication namespace");
+    }
+    qihse_kv_delta_record_t* records = NULL;
+    size_t count = 0;
+    uint64_t unused_resume = 0;
+    /* The KV exporter may compact SSTables when its metadata index has
+     * degraded, so this path must be exclusive even though the common path
+     * only reads. */
+    pthread_rwlock_wrlock(&s->server->kv_lock);
+    int rc = qihse_kv_export_incremental_user_bounded(s->server->store, s->user,
+        glob, since, (size_t)limit_u64, QIHSE_REPL_DELTA_MAX_WIRE - 64u,
+        &records, &count, &unused_resume);
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    if (rc != 0) { free(glob); return qihse_resp_error(s, "ERR delta export failed"); }
+    /* The KV layer filters the namespace and retains only the earliest
+     * sequence rows fitting the row and byte budget. */
+    size_t selected[QIHSE_REPL_DELTA_MAX_ROWS];
+    size_t n = 0, wire_est = 64u;
+    uint64_t cursor = since;
+    for (size_t i = 0; i < count; i++) {
+        if (!records[i].key) continue;
+        if (n == (size_t)limit_u64) break;
+        size_t klen = strlen(records[i].key);
+        size_t vlen = records[i].value ? strlen(records[i].value) : 0u;
+        if (klen > QIHSE_REPL_RECORD_MAX_KEY || vlen > QIHSE_REPL_RECORD_MAX_VALUE ||
+            wire_est > QIHSE_REPL_DELTA_MAX_WIRE - klen - vlen - 160u) {
+            qihse_kv_delta_records_free(records, count); free(glob);
+            return qihse_resp_error(s, "ERR delta exceeds bounded response; request a smaller slice");
+        }
+        wire_est += klen + vlen + 160u;
+        selected[n++] = i;
+        cursor = records[i].change_seq;
+    }
+    free(glob);
+    bool ok = qihse_resp_array(s, 2u + n * 7u);
+    char num[32];
+    int len = snprintf(num, sizeof(num), "%llu", (unsigned long long)cursor);
+    ok = ok && len > 0 && (size_t)len < sizeof(num) && qihse_resp_bulk(s, num, (size_t)len);
+    len = snprintf(num, sizeof(num), "%zu", n);
+    ok = ok && len > 0 && (size_t)len < sizeof(num) && qihse_resp_bulk(s, num, (size_t)len);
+    for (size_t j = 0; j < n && ok; j++) {
+        const qihse_kv_delta_record_t* rec = &records[selected[j]];
+        const char* op = rec->tombstone ? "D" : "S";
+        ok = qihse_resp_bulk_text(s, op);
+        const uint64_t numbers[] = {rec->change_seq, rec->classification,
+                                    rec->sci_compartment, rec->expire_time_ms};
+        for (size_t k = 0; k < sizeof(numbers) / sizeof(numbers[0]) && ok; k++) {
+            len = snprintf(num, sizeof(num), "%llu", (unsigned long long)numbers[k]);
+            ok = len > 0 && (size_t)len < sizeof(num) && qihse_resp_bulk(s, num, (size_t)len);
+        }
+        ok = ok && qihse_resp_bulk_text(s, rec->key) &&
+             qihse_resp_bulk(s, rec->value ? rec->value : "", rec->value ? strlen(rec->value) : 0u);
+    }
+    qihse_kv_delta_records_free(records, count);
+    return ok;
+}
+
+/* A full, immutable snapshot pins one store view to this authenticated QKP
+ * session. SNAPSHOT.BEGIN holds the KV write lock while the authorized file
+ * export and source watermark are captured; READ returns bounded byte slices
+ * from the unlinked 0600 artifact. Closing the session discards the handle. */
+#define QIHSE_REPL_SNAPSHOT_READ_MAX (512u * 1024u)
+static bool qihse_resp_handle_repl_snapshot_begin(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    if (r->argc != 2u) return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.BEGIN glob");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    char* glob = NULL;
+    if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob))
+        return qihse_resp_error(s, "ERR invalid replication namespace");
+    if (!qihse_resp_repl_glob_is_marked(s->server, glob)) {
+        free(glob);
+        return qihse_resp_error(s, "ERR snapshot namespace is not marked");
+    }
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    pthread_rwlock_wrlock(&s->server->kv_lock);
+    int rc = qihse_kv_replica_snapshot_create(s->server->store, s->user, glob, &snapshot);
+    uint64_t source_seq = rc == 0 ? qihse_kv_change_seq(s->server->store) : 0u;
+    bool baseline_ok = rc == 0 && qihse_kv_replica_cursor_advance(
+        s->server->store, s->server->pqc.replication_peer_node_id, glob,
+        source_seq, s->user);
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    free(glob);
+    if (rc != 0 || !baseline_ok) {
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        return qihse_resp_error(s, rc == -2
+        ? "NOPERM snapshot principal cannot read the complete store"
+        : "ERR snapshot export or durable baseline registration failed");
+    }
+    qihse_kv_replica_snapshot_destroy(s->repl_snapshot);
+    s->repl_snapshot = snapshot;
+    s->repl_snapshot_seq = source_seq;
+    char size_buf[32], seq_buf[32];
+    int size_len = snprintf(size_buf, sizeof(size_buf), "%llu",
+        (unsigned long long)qihse_kv_replica_snapshot_size(snapshot));
+    int seq_len = snprintf(seq_buf, sizeof(seq_buf), "%llu", (unsigned long long)source_seq);
+    return size_len > 0 && (size_t)size_len < sizeof(size_buf) &&
+        seq_len > 0 && (size_t)seq_len < sizeof(seq_buf) && qihse_resp_array(s, 2u) &&
+        qihse_resp_bulk(s, size_buf, (size_t)size_len) &&
+        qihse_resp_bulk(s, seq_buf, (size_t)seq_len);
+}
+
+static bool qihse_resp_handle_repl_snapshot_read(qihse_resp_session_t* s,
+                                                  const qihse_resp_request_t* r) {
+    uint64_t offset = 0u, length = 0u;
+    if (r->argc != 3u || !qihse_resp_parse_u64_arg(&r->argv[1], &offset) ||
+        !qihse_resp_parse_u64_arg(&r->argv[2], &length) || length == 0u ||
+        length > QIHSE_REPL_SNAPSHOT_READ_MAX)
+        return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.READ offset length (length <= 524288)");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!s->repl_snapshot) return qihse_resp_error(s, "ERR begin a snapshot on this session first");
+    char* data = (char*)malloc((size_t)length);
+    if (!data) return qihse_resp_error(s, "ERR snapshot read allocation failed");
+    size_t got = 0u;
+    if (offset > qihse_kv_replica_snapshot_size(s->repl_snapshot) ||
+        !qihse_kv_replica_snapshot_read(s->repl_snapshot, offset, data,
+                                        (size_t)length, &got)) {
+        free(data);
+        return qihse_resp_error(s, "ERR snapshot read failed");
+    }
+    bool ok = qihse_resp_bulk(s, data, got);
+    free(data);
+    return ok;
+}
+
+static bool qihse_resp_handle_repl_snapshot_end(qihse_resp_session_t* s,
+                                                 const qihse_resp_request_t* r) {
+    if (r->argc != 1u) return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.END");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    qihse_kv_replica_snapshot_destroy(s->repl_snapshot);
+    s->repl_snapshot = NULL;
+    s->repl_snapshot_seq = 0u;
+    return qihse_resp_simple(s, "OK");
+}
+
 /* ---- SAVE / BGSAVE / LASTSAVE — operator-triggered durability ----------
  * SAVE flushes the memtable into a new SSTable, fsyncs it, the WAL and the
  * data directory (qihse_kv_sync_store), under the kv_lock write-side so
@@ -6594,6 +6951,13 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"repl.marks", qihse_resp_handle_repl_marks, 0},
     {"repl.status", qihse_resp_handle_repl_status, 0},
     {"repl.pull", qihse_resp_handle_repl_pull, DSP_BUSY_WRITE},
+    {"repl.apply", qihse_resp_handle_repl_apply, DSP_BUSY_WRITE},
+    {"repl.cursor", qihse_resp_handle_repl_cursor, 0},
+    {"repl.ack", qihse_resp_handle_repl_ack, DSP_BUSY_WRITE},
+    {"repl.delta", qihse_resp_handle_repl_delta, 0},
+    {"repl.snapshot.begin", qihse_resp_handle_repl_snapshot_begin, DSP_BUSY_WRITE},
+    {"repl.snapshot.read", qihse_resp_handle_repl_snapshot_read, 0},
+    {"repl.snapshot.end", qihse_resp_handle_repl_snapshot_end, 0},
     {"shutdown", qihse_resp_handle_shutdown, DSP_BUSY_WRITE}, {"config", qihse_resp_handle_config, 0},
     {"debug", qihse_resp_handle_debug, 0}, {"slowlog", dsp_ok_stub, 0},
     {"memory", qihse_resp_handle_memory, 0}, {"latency", dsp_ok_stub, 0},
@@ -10670,6 +11034,8 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         used += (size_t)received;
     }
     qihse_resp_session_pubsub_cleanup(&session);
+    qihse_kv_replica_snapshot_destroy(session.repl_snapshot);
+    session.repl_snapshot = NULL;
     /* R5 §13: unregister any stream watches while the session is still valid. */
     qihse_resp_watch_detach(&session);
     pthread_mutex_destroy(&session.io_lock);

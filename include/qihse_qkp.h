@@ -138,6 +138,10 @@ typedef struct {
     size_t trusted_count;
     const char* node_id;                  /* ≤ 64 bytes label */
     bool require;                         /* refuse cleartext connections */
+    /* Optional replication peer pin. Ordinary RESP sessions are unaffected;
+     * REPL.APPLY/DELTA require both values and match against the QKP signer. */
+    const char* replication_peer_node_id;
+    const char* replication_peer_dsa_pub_path;
 } qihse_qkp_config_t;
 
 typedef enum {
@@ -170,6 +174,18 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
                               uint8_t* out, size_t cap);
 
 void qihse_qkp_session_free(qihse_qkp_session_t* s);
+
+/* True only for a server-side session whose signed client label and exact
+ * ML-DSA public key match the configured replication pin. */
+bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
+                                           const char* expected_node_id,
+                                           const char* expected_dsa_pub_path);
+
+/* True only for a client-side session whose verified server H1 carries the
+ * expected canonical node label and was signed by the pinned ML-DSA key. */
+bool qihse_qkp_client_session_is_replication_peer(const qihse_qkp_session_t* s,
+                                                  const char* expected_node_id,
+                                                  const char* expected_dsa_pub_path);
 
 #ifdef __cplusplus
 }

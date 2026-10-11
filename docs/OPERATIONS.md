@@ -52,7 +52,7 @@ deliberately expensive. This is normal.
 | Python REPL w/ native SDK | `./qihse python` | as demo |
 | RESP server (quick) | `make redis-server && ./qihse-redis-server --port 6399` | none (loopback, no auth) |
 | RESP server (auth) | `QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-redis-server --port 6399 --require-auth --password '<same>'` | env + flag |
-| Cluster daemon | `make cluster-daemon && ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383 --operator-password '<12+ chars>'` | `--operator-password` (also keys the veiled bus — all nodes must match) |
+| Cluster daemon | `make cluster-daemon && QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-cluster-daemon --index 0 --bind 127.0.0.1 --port 7101 --bus-port 7001 --slot-range 0-16383` | Prefer a root-only systemd `EnvironmentFile`; all nodes must use the same value because it keys AUTH and the veiled bus. `--operator-password` remains available for development. |
 | Federation CA | `make federation-ca && QIHSE_DATA_DIR=./build/ca QIHSE_OPERATOR_PASSWORD='<12+ chars>' ./qihse-federation-ca init-ca` | env |
 | Key generation | `./qihse_keygen` | none |
 | Python controller SDK | `make test-controller-sdk-py` (usage: §3.6) | AUTH in connect config |
@@ -317,6 +317,37 @@ with anti-entropy pull; deletes are not propagated); `--max-clients N`;
 flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
+
+The one-way replica puller connects only through local SOCKS5 to an `.i2p`
+destination. Configure `--replication-source-host`, `--replication-source-port`,
+`--replica-read-only`, one or more `--replicate` globs, a stable
+`--pqc-node-id`, `--replication-peer-node-id`, and the matching
+`--replication-peer-dsa-pub`. QKP1 identity verification completes before the
+operator AUTH command is sent; no cleartext fallback or direct network path is
+used. `--pqc-trusted-pub` anchors the peer key. The replica fence blocks normal
+KV writes for that process lifetime while allowing authenticated replication
+apply. The source can pin a complete, namespace-filtered snapshot to a QKP
+session with `REPL.SNAPSHOT.BEGIN/READ/END`; the receiver writes the download
+to a private staging file, validates its namespace and metadata, then installs
+the image and baseline cursor. Configure exactly one dedicated replication
+glob on a replica: snapshot installation replaces that replica store's logical
+image. Deletes, expiry metadata, classifications, and compartments are carried
+in the ordered row format.
+
+Snapshot start now persists the source sequence as a per-peer baseline before
+releasing the consistent snapshot view. The source retains matching tombstones
+through compaction until `REPL.ACK` confirms the receiver has synced the applied
+rows and cursor. This closes the baseline-to-delta delete gap for the current
+KV transport. The W8 code-level gates are verified by `make test-replica-qkp`
+(operator success and low-clearance denial on a live pinned QKP1 session) and
+`make test-replica-crash` (abrupt exit and restart at seven install durability
+boundaries). Delta enumeration retains only the earliest rows fitting its row
+and byte budgets; the daemon pulls one row at a time, up to the KV value limit,
+over QKP1's framed stream. Before deploying a replica, run a site-specific
+smoke test through the configured real I2P/SOCKS network and verify peer
+convergence after restart; that network test was not run in this workspace.
+Cryptogramd's EventStream is not connected and remains a separate integration
+item; it is not used by this QIHSE KV replication path.
 
 ### 3.3 `qihse-redis-server`
 

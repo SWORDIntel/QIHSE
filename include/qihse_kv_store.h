@@ -9,6 +9,7 @@
 
 /** Opaque handle for the QIHSE Key-Value Store. */
 typedef struct qihse_kv_store qihse_kv_store_t;
+typedef struct qihse_kv_replica_snapshot qihse_kv_replica_snapshot_t;
 
 qihse_kv_store_t* qihse_kv_store_create(void);
 void qihse_kv_store_destroy(qihse_kv_store_t* store);
@@ -22,6 +23,69 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value,
                        uint16_t classification, uint16_t sci_compartment,
                        qihse_user_t* user);
+
+/* Apply one ordered record received from the configured single primary.
+ * The caller must serialize this with all other store writes (normally by
+ * holding the engine's kv_lock write-side).  Source sequence is preserved in
+ * the record and replica WAL; equal-sequence retries are idempotent only when
+ * every field and value matches.  A non-NULL active Operator principal
+ * authorized for both incoming metadata and any existing key is mandatory.
+ * Tombstones must have a NULL value and zero expiry. */
+typedef struct {
+    const char* key;
+    const char* value; /* NULL iff tombstone */
+    uint64_t change_seq; /* nonzero primary sequence */
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t expire_time_ms;
+    bool tombstone;
+} qihse_kv_replica_record_t;
+
+bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
+                                   const qihse_kv_replica_record_t* record,
+                                   qihse_user_t* principal);
+
+/* Permanently fence ordinary mutations for this process lifetime. Replica
+ * records may still be applied through qihse_kv_apply_replica_record(). */
+bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store);
+
+/* Immutable, private snapshot artifact for a consistent replica bootstrap.
+ * The caller must exclude writers while creating it and capture
+ * qihse_kv_change_seq() under the same lock. The artifact is unlinked as soon
+ * as it is opened and is readable only through this handle. Full-export
+ * authorization semantics apply: a principal unable to read any live row is
+ * refused rather than receiving a partial baseline. */
+int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user,
+                                     const char* namespace_glob,
+                                     qihse_kv_replica_snapshot_t** out_snapshot);
+uint64_t qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot);
+bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
+                                    uint64_t offset, void* out, size_t capacity,
+                                    size_t* out_read);
+void qihse_kv_replica_snapshot_destroy(qihse_kv_replica_snapshot_t* snapshot);
+bool qihse_kv_replica_snapshot_installed(qihse_kv_store_t* store,
+                                         const char* peer_id,
+                                         const char* namespace_glob,
+                                         qihse_user_t* principal,
+                                         bool* out_installed);
+bool qihse_kv_replica_snapshot_install(qihse_kv_store_t* store,
+                                       const char* filepath,
+                                       qihse_user_t* principal,
+                                       const char* peer_id,
+                                       const char* namespace_glob,
+                                       uint64_t source_highwater);
+
+/* Durable receiver progress, scoped to this store's data directory and keyed
+ * by authenticated peer plus namespace. Caller must serialize with store
+ * writes (normally engine kv_lock write-side). Only active Operators may
+ * inspect/update cursors. Advance is monotonic; success means the replacement
+ * cursor file and its directory entry were fsynced before return/ACK. */
+bool qihse_kv_replica_cursor_get(qihse_kv_store_t* store, const char* peer_id,
+                                const char* namespace_id, qihse_user_t* principal,
+                                uint64_t* out_seq);
+bool qihse_kv_replica_cursor_advance(qihse_kv_store_t* store, const char* peer_id,
+                                    const char* namespace_id, uint64_t seq,
+                                    qihse_user_t* principal);
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
@@ -172,6 +236,15 @@ void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)
  * whole — a partial-by-clearance delta IS the delta contract. */
 int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user,
                                      uint64_t since_seq,
+                                     qihse_kv_delta_record_t** out_records,
+                                     size_t* out_count, uint64_t* out_resume_seq);
+/* Bounded namespace form used by the replication wire handler. Retains only
+ * the earliest records that fit both limits; temporary record storage is
+ * bounded by max_bytes plus one candidate record. */
+int qihse_kv_export_incremental_user_bounded(qihse_kv_store_t* store,
+                                     qihse_user_t* user, const char* namespace_glob,
+                                     uint64_t since_seq, size_t max_records,
+                                     size_t max_bytes,
                                      qihse_kv_delta_record_t** out_records,
                                      size_t* out_count, uint64_t* out_resume_seq);
 

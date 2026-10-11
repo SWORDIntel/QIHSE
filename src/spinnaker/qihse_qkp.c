@@ -3,6 +3,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
 
 #include <errno.h>
@@ -33,13 +34,72 @@ static bool qkp_sha384(const uint8_t* in, size_t len, uint8_t out[QIHSE_QKP_TR_L
     return EVP_Digest(in, len, out, &olen, EVP_sha384(), NULL) == 1 && olen == QIHSE_QKP_TR_LEN;
 }
 
+static bool qkp_all_zero(const uint8_t* p, size_t n) {
+    if (!p) return false;
+    for (size_t i = 0; i < n; i++) if (p[i] != 0u) return false;
+    return true;
+}
+
 struct qihse_qkp_session {
     qkp_role_t role;
     uint8_t key_c2s[QIHSE_QKP_KEY_LEN];
     uint8_t key_s2c[QIHSE_QKP_KEY_LEN];
     uint64_t tx_seq;   /* per direction, starts at 1 */
     uint64_t rx_seq;
+    char peer_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
+    uint8_t peer_dsa_fingerprint[32];
+    bool has_peer_identity;
 };
+
+static bool qkp_dsa_pub_fingerprint(const char* path, uint8_t out[32]) {
+    if (!path || !*path || !out) return false;
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    EVP_PKEY* key = PEM_read_PUBKEY(f, NULL, NULL, NULL);
+    fclose(f);
+    if (!key) return false;
+    int der_len = i2d_PUBKEY(key, NULL);
+    unsigned char* der = der_len > 0 ? OPENSSL_malloc((size_t)der_len) : NULL;
+    unsigned char* cursor = der;
+    bool ok = der && i2d_PUBKEY(key, &cursor) == der_len;
+    unsigned int digest_len = 0;
+    if (ok) ok = EVP_Digest(der, (size_t)der_len, out, &digest_len, EVP_sha256(), NULL) == 1 && digest_len == 32u;
+    OPENSSL_clear_free(der, der_len > 0 ? (size_t)der_len : 0u);
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
+                                           const char* expected_node_id,
+                                           const char* expected_dsa_pub_path) {
+    if (!s || s->role != QKP_ROLE_SERVER || !s->has_peer_identity ||
+        !expected_node_id || !*expected_node_id || strlen(expected_node_id) > QIHSE_QKP_NODE_ID_LEN) return false;
+    uint8_t expected[32];
+    bool match = strcmp(s->peer_node_id, expected_node_id) == 0 &&
+                 qkp_dsa_pub_fingerprint(expected_dsa_pub_path, expected) &&
+                 CRYPTO_memcmp(s->peer_dsa_fingerprint, expected, sizeof(expected)) == 0;
+    OPENSSL_cleanse(expected, sizeof(expected));
+    return match;
+}
+
+bool qihse_qkp_client_session_is_replication_peer(const qihse_qkp_session_t* s,
+                                                  const char* expected_node_id,
+                                                  const char* expected_dsa_pub_path) {
+    if (!s || s->role != QKP_ROLE_CLIENT || !s->has_peer_identity ||
+        !expected_node_id || !*expected_node_id || strlen(expected_node_id) > QIHSE_QKP_NODE_ID_LEN) return false;
+    uint8_t expected_label[QIHSE_QKP_NODE_ID_LEN] = {0};
+    size_t expected_len = strlen(expected_node_id);
+    memcpy(expected_label, expected_node_id, expected_len);
+    uint8_t expected_fingerprint[32] = {0};
+    bool match = CRYPTO_memcmp((const uint8_t*)s->peer_node_id, expected_label,
+                               QIHSE_QKP_NODE_ID_LEN) == 0 &&
+                 qkp_dsa_pub_fingerprint(expected_dsa_pub_path, expected_fingerprint) &&
+                 CRYPTO_memcmp(s->peer_dsa_fingerprint, expected_fingerprint,
+                               sizeof(expected_fingerprint)) == 0;
+    OPENSSL_cleanse(expected_label, sizeof(expected_label));
+    OPENSSL_cleanse(expected_fingerprint, sizeof(expected_fingerprint));
+    return match;
+}
 
 /* ── fd helpers (bounded, EINTR-tolerant) ─────────────────────────────── */
 
@@ -341,13 +401,28 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
         memcpy(p, ct, QIHSE_QKP_CT_LEN);
     }
     bool client_trusted = false;
+    uint8_t client_dsa_fingerprint[32] = {0};
     for (size_t i = 0; i < cfg->trusted_count && !client_trusted; i++) {
-        client_trusted = qihse_pqc_verify_path(h2_signed, h2_signed_len, sig, cfg->trusted_pubs[i]);
+        if (qihse_pqc_verify_path(h2_signed, h2_signed_len, sig, cfg->trusted_pubs[i])) {
+            client_trusted = qkp_dsa_pub_fingerprint(cfg->trusted_pubs[i], client_dsa_fingerprint);
+        }
     }
     free(h2_signed);
     if (!client_trusted) {
         qkp_log_reject(cfg, "client identity not in the trusted set");
         qkp_send_err(fd, "PQC client identity untrusted");
+        return QIHSE_QKP_REJECTED;
+    }
+
+    /* The node ID is a signed, zero-padded label. Reject ambiguous encodings
+     * so replication's configured identity comparison is canonical. */
+    size_t peer_id_len = 0;
+    while (peer_id_len < QIHSE_QKP_NODE_ID_LEN && cli_id[peer_id_len] != 0u) peer_id_len++;
+    if (peer_id_len == 0u ||
+        (peer_id_len < QIHSE_QKP_NODE_ID_LEN &&
+         !qkp_all_zero(cli_id + peer_id_len, QIHSE_QKP_NODE_ID_LEN - peer_id_len))) {
+        qkp_log_reject(cfg, "client node identity encoding invalid");
+        qkp_send_err(fd, "PQC client identity invalid");
         return QIHSE_QKP_REJECTED;
     }
 
@@ -382,6 +457,10 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(s->key_s2c, okm + 32u, 32u);
     s->tx_seq = 1u;
     s->rx_seq = 1u;
+    memcpy(s->peer_node_id, cli_id, peer_id_len);
+    s->peer_node_id[peer_id_len] = '\0';
+    memcpy(s->peer_dsa_fingerprint, client_dsa_fingerprint, sizeof(client_dsa_fingerprint));
+    s->has_peer_identity = true;
 
     /* Sealed H2-ACK for key confirmation. */
     uint8_t seal_nonce[12], sealed[8 + 12 + sizeof(ACK_PAYLOAD) + 16];
@@ -443,8 +522,11 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(h1_signed, H1_DOMAIN, strlen(H1_DOMAIN));
     memcpy(h1_signed + strlen(H1_DOMAIN), h1, h1_body_len);
     bool server_trusted = false;
+    uint8_t server_dsa_fingerprint[32] = {0};
     for (size_t i = 0; i < cfg->trusted_count && !server_trusted; i++) {
-        server_trusted = qihse_pqc_verify_path(h1_signed, h1_signed_len, sig, cfg->trusted_pubs[i]);
+        if (qihse_pqc_verify_path(h1_signed, h1_signed_len, sig, cfg->trusted_pubs[i])) {
+            server_trusted = qkp_dsa_pub_fingerprint(cfg->trusted_pubs[i], server_dsa_fingerprint);
+        }
     }
     /* Transcript hash must be taken BEFORE the signed region is released —
      * this used to free h1_signed above and then hash it (use-after-free),
@@ -456,6 +538,17 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     }
     free(h1_signed);
     if (!server_trusted) {
+        g_qkp_counters.rejects_identity++;
+        g_qkp_counters.negotiations_failed++;
+        return QIHSE_QKP_REJECTED;
+    }
+
+    /* H1's server label is signed. Require one canonical zero-padded label
+     * encoding before retaining it for a later replication-peer pin check. */
+    size_t server_id_len = 0u;
+    while (server_id_len < QIHSE_QKP_NODE_ID_LEN && srv_id[server_id_len] != 0u) server_id_len++;
+    if (server_id_len < QIHSE_QKP_NODE_ID_LEN &&
+        !qkp_all_zero(srv_id + server_id_len, QIHSE_QKP_NODE_ID_LEN - server_id_len)) {
         g_qkp_counters.rejects_identity++;
         g_qkp_counters.negotiations_failed++;
         return QIHSE_QKP_REJECTED;
@@ -521,6 +614,10 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(s->key_s2c, okm + 32u, 32u);
     s->tx_seq = 1u;
     s->rx_seq = 1u;
+    memcpy(s->peer_node_id, srv_id, server_id_len);
+    s->peer_node_id[server_id_len] = '\0';
+    memcpy(s->peer_dsa_fingerprint, server_dsa_fingerprint, sizeof(server_dsa_fingerprint));
+    s->has_peer_identity = true;
 
     uint8_t ack_head[6], ack_plain[32], ack_nonce[12];
     if (!qkp_read_exact(fd, ack_head, 6u) || memcmp(ack_head, SEAL_MAGIC, 4u) != 0) {

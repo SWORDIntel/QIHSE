@@ -19,6 +19,7 @@
  * Build: make cluster-daemon
  */
 #include "qihse_resp_wire.h"
+#include "qihse_auth.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_brain.h"
@@ -28,6 +29,10 @@
 #include "qihse_qkp.h"
 #include "qihse_platform.h"
 #include <netdb.h>
+#include <fnmatch.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <errno.h>
 #include <signal.h>
@@ -143,97 +148,178 @@ static void usage(const char* argv0) {
         "  a failed owner's range to a healthy target (evidence-gated) and rolls\n"
         "  it back if the move did not complete or the target failed within\n"
         "  --brain-rollback-window seconds.\n"
-        "\n  --replicate GLOB marks a sovereign-local namespace: keys matching\n"
-        "  GLOB are served from this node's own store (never MOVED or\n"
-        "  CLUSTERDOWN-gated) and the anti-entropy thread pulls keys peers hold\n"
-        "  and this node lacks, every --replicate-interval seconds (default 60,\n"
-        "  0 disables). Divergent/orphaned keys are reported via REPL.STATUS,\n"
-        "  never auto-resolved; deletes are not propagated in phase 1.\n"
-        "  REPL.MARK/REPL.UNMARK manage globs at runtime (in-memory).\n",
+        "\n  --replicate GLOB marks a sovereign-local namespace.\n"
+        "  --replication-source-host DEST --replication-source-port PORT\n"
+        "  enables one-way QKP-protected I2P pull through local SOCKS\n"
+        "  (--replication-socks-port, default 4447); requires --replica-read-only.\n"
+        "  --replication-peer-node-id and --replication-peer-dsa-pub pin the\n"
+        "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n",
         argv0);
 }
 
-/* ── R4 anti-entropy for replicated namespaces ──────────────────────────────
- * Every --replicate-interval seconds, per marked glob and per static peer:
- * dial the peer's RESP port, AUTH with the operator password, KEYS the glob,
- * and pull keys the peer has and we lack (GET + local SET; legal because
- * marked keys are sovereign-local). Divergent keys (both sides, different
- * bytes) and orphans (local, missing on EVERY peer) are counted for
- * REPL.STATUS and never auto-resolved; deletes are not propagated in
- * phase 1. Bound: at most REPL_AE_MAX_KEYS key transfers per tick overall,
- * so a large backfill amortizes across ticks. One summary log line/tick.
- *
- * The client below is deliberately minimal (AUTH/KEYS/GET/SET with simple,
- * bulk and array replies) and dials by host:port — loopback for self reads,
- * the peer's RESP endpoint otherwise. */
+/* ── One-way, QKP-protected I2P replication puller ───────────────────────── */
 #define REPL_AE_MAX_KEYS 10000u
 #define REPL_AE_GLOBS_MAX 64u
-#define REPL_AE_KEYLEN_MAX 512u
+#define REPL_AE_VALUE_MAX (16u * 1024u * 1024u)
 
 typedef struct {
     int fd;
     char err[256];
     char last[128]; /* most recent simple (+/-) reply line */
-    /* Small read buffer: one syscall per 4KB instead of one per byte —
-     * byte-at-a-time reads made a full tick over a 1.5k-key namespace take
-     * minutes instead of seconds. */
-    unsigned char buf[4096];
+    /* QKP1 may return one plaintext record up to QIHSE_QKP_MAX_PAYLOAD. */
+    unsigned char buf[QIHSE_QKP_MAX_PAYLOAD];
     size_t buf_len;
     size_t buf_pos;
+    qihse_qkp_session_t* qkp; /* anti-entropy RESP always runs inside QKP1 */
+    qihse_qkp_config_t qkp_config; /* borrowed paths/anchors live for daemon lifetime */
 } mini_resp_t;
 
 static bool mini_resp_command(mini_resp_t* c, size_t argc, const char* const* argv);
+static void mini_resp_close(mini_resp_t* c);
 
-static int mini_resp_connect(mini_resp_t* c, const char* host, uint16_t port, const char* password) {
+static bool socket_send_all(int fd, const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += (size_t)n; len -= (size_t)n;
+    }
+    return true;
+}
+
+static bool socket_recv_all(int fd, void* data, size_t len) {
+    unsigned char* p = (unsigned char*)data;
+    while (len) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += (size_t)n; len -= (size_t)n;
+    }
+    return true;
+}
+
+/* Connect to an I2P destination only through the local i2pd SOCKS5 proxy.
+ * The proxy address is deliberately loopback-only; there is no direct-host
+ * fallback if SOCKS negotiation or remote-name resolution fails. */
+static int connect_i2p_socks5(const char* host, uint16_t port, uint16_t socks_port) {
+    if (!host || !*host || strlen(host) > 255u || socks_port == 0u) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in proxy;
+    memset(&proxy, 0, sizeof(proxy));
+    proxy.sin_family = AF_INET;
+    proxy.sin_port = htons(socks_port);
+    proxy.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr*)&proxy, sizeof(proxy)) != 0) { close(fd); return -1; }
+
+    const uint8_t greeting[] = {0x05u, 0x01u, 0x00u};
+    uint8_t reply[4];
+    if (!socket_send_all(fd, greeting, sizeof(greeting)) || !socket_recv_all(fd, reply, 2u) ||
+        reply[0] != 0x05u || reply[1] != 0x00u) { close(fd); return -1; }
+    uint8_t request[4u + 1u + 255u + 2u];
+    size_t host_len = strlen(host);
+    request[0] = 0x05u; request[1] = 0x01u; request[2] = 0x00u; request[3] = 0x03u;
+    request[4] = (uint8_t)host_len;
+    memcpy(request + 5u, host, host_len);
+    request[5u + host_len] = (uint8_t)(port >> 8);
+    request[6u + host_len] = (uint8_t)port;
+    if (!socket_send_all(fd, request, 7u + host_len) || !socket_recv_all(fd, reply, sizeof(reply)) ||
+        reply[0] != 0x05u || reply[1] != 0x00u || reply[2] != 0x00u) { close(fd); return -1; }
+    size_t bound_len = 0u;
+    if (reply[3] == 0x01u) bound_len = 4u;
+    else if (reply[3] == 0x04u) bound_len = 16u;
+    else if (reply[3] == 0x03u) {
+        uint8_t n = 0u;
+        if (!socket_recv_all(fd, &n, 1u)) { close(fd); return -1; }
+        bound_len = n;
+    } else { close(fd); return -1; }
+    uint8_t discard[16u + 2u];
+    if (bound_len > sizeof(discard) - 2u ||
+        !socket_recv_all(fd, discard, bound_len + 2u)) { close(fd); return -1; }
+    return fd;
+}
+
+static int mini_resp_connect_mode(mini_resp_t* c, const char* host, uint16_t port,
+                                  const qihse_qkp_config_t* qkp,
+                                  bool via_i2p, uint16_t socks_port) {
+    if (!c || !qkp || !qkp->dsa_key_path || !qkp->trusted_pubs || qkp->trusted_count == 0u) return -1;
     memset(c, 0, sizeof(*c));
+    c->fd = -1;
+    c->qkp_config = *qkp;
     char portstr[8];
     snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-    struct timeval tv = {5, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        close(fd); freeaddrinfo(res); return -1;
-    }
-    freeaddrinfo(res);
-    c->fd = fd;
-    if (password && *password) {
-        const char* argv[2] = {"AUTH", password};
-        if (!mini_resp_command(c, 2, argv)) {
-            close(fd);
-            c->fd = -1;
-            return -1;
+    int fd = -1;
+    if (via_i2p) {
+        fd = connect_i2p_socks5(host, port, socks_port);
+    } else {
+        if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+        fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd >= 0) {
+            struct timeval tv = {5, 0};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); fd = -1; }
         }
+        freeaddrinfo(res);
+    }
+    if (fd < 0) return -1;
+    c->fd = fd;
+    /* No cleartext fallback: the auth secret and every subsequent command
+     * must be protected by the daemon's signed, mutually authenticated QKP1
+     * session. */
+    if (qihse_qkp_client_negotiate(fd, &c->qkp_config, &c->qkp) != QIHSE_QKP_SECURE || !c->qkp) {
+        close(fd);
+        c->fd = -1;
+        return -1;
     }
     return fd;
+}
+
+static int mini_resp_connect_i2p(mini_resp_t* c, const char* destination, uint16_t port,
+                                 uint16_t socks_port, const qihse_qkp_config_t* qkp) {
+    return mini_resp_connect_mode(c, destination, port, qkp, true, socks_port);
+}
+
+static bool mini_resp_auth(mini_resp_t* c, const char* password) {
+    if (!password || !*password) return false;
+    const char* argv[2] = {"AUTH", password};
+    return mini_resp_command(c, 2u, argv);
 }
 
 static void mini_resp_close(mini_resp_t* c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
+    qihse_qkp_session_free(c->qkp);
+    c->qkp = NULL;
+}
+
+static bool mini_resp_write(mini_resp_t* c, const void* data, size_t len) {
+    if (!c || c->fd < 0 || !c->qkp || (!data && len != 0u)) return false;
+    return qihse_qkp_send_sealed(c->qkp, c->fd, data, len);
+}
+
+static ssize_t mini_resp_read(mini_resp_t* c, void* data, size_t cap) {
+    if (!c || c->fd < 0 || !c->qkp || !data || cap == 0u) return -1;
+    return qihse_qkp_recv_sealed(c->qkp, c->fd, (uint8_t*)data, cap);
 }
 
 static bool mini_resp_send(mini_resp_t* c, size_t argc, const char* const* argv) {
     char head[64];
     int len = snprintf(head, sizeof(head), "*%zu\r\n", argc);
-    if (len <= 0 || (size_t)len >= sizeof(head) || write(c->fd, head, (size_t)len) != len) return false;
+    if (len <= 0 || (size_t)len >= sizeof(head) || !mini_resp_write(c, head, (size_t)len)) return false;
     for (size_t i = 0; i < argc; i++) {
         size_t alen = strlen(argv[i]);
         len = snprintf(head, sizeof(head), "$%zu\r\n", alen);
-        if (len <= 0 || (size_t)len >= sizeof(head) || write(c->fd, head, (size_t)len) != len) return false;
-        size_t done = 0;
-        while (done < alen) {
-            ssize_t w = write(c->fd, argv[i] + done, alen - done);
-            if (w <= 0) return false;
-            done += (size_t)w;
-        }
-        if (write(c->fd, "\r\n", 2u) != 2) return false;
+        if (len <= 0 || (size_t)len >= sizeof(head) || !mini_resp_write(c, head, (size_t)len)) return false;
+        if (!mini_resp_write(c, argv[i], alen) || !mini_resp_write(c, "\r\n", 2u)) return false;
     }
     return true;
 }
@@ -242,17 +328,19 @@ static int mini_resp_read_line(mini_resp_t* c, char* buf, size_t cap) {
     size_t used = 0;
     while (used + 1u < cap) {
         if (c->buf_pos >= c->buf_len) {
-            ssize_t r = read(c->fd, c->buf, sizeof(c->buf));
+            ssize_t r = mini_resp_read(c, c->buf, sizeof(c->buf));
             if (r <= 0) return -1;
             c->buf_len = (size_t)r;
             c->buf_pos = 0;
         }
         char ch = (char)c->buf[c->buf_pos++];
         if (ch == '\n') {
-            if (used > 0 && buf[used - 1u] == '\r') used--;
+            if (used == 0u || buf[used - 1u] != '\r') return -1;
+            used--;
             buf[used] = '\0';
             return (int)used;
         }
+        if (ch == '\r') return -1;
         buf[used++] = ch;
     }
     return -1;
@@ -270,9 +358,10 @@ static bool mini_resp_read_exact(mini_resp_t* c, char* out, size_t len) {
             got += take;
             continue;
         }
-        ssize_t r = read(c->fd, out + got, len - got);
+        ssize_t r = mini_resp_read(c, c->buf, sizeof(c->buf));
         if (r <= 0) return false;
-        got += (size_t)r;
+        c->buf_len = (size_t)r;
+        c->buf_pos = 0;
     }
     return true;
 }
@@ -342,7 +431,7 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
                 return MINI_REP_ERROR;
             }
             long long len = strtoll(sub + 1, NULL, 10);
-            if (len < 0 || len > REPL_AE_KEYLEN_MAX) {
+            if (len < 0 || len > REPL_AE_VALUE_MAX) {
                 mini_resp_free_array(items, (size_t)i);
                 snprintf(c->err, sizeof(c->err), "bad item length");
                 return MINI_REP_ERROR;
@@ -355,7 +444,7 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
             }
             items[i][len] = '\0';
             char tail[2];
-            if (!mini_resp_read_exact(c, tail, 2u)) {
+            if (!mini_resp_read_exact(c, tail, 2u) || tail[0] != '\r' || tail[1] != '\n') {
                 free(items[i]); mini_resp_free_array(items, (size_t)i);
                 snprintf(c->err, sizeof(c->err), "truncated"); return MINI_REP_ERROR;
             }
@@ -381,128 +470,215 @@ typedef struct {
     const char* password;      /* operator password (borrowed) */
     const char* self_host;     /* bind address for loopback */
     uint16_t self_port;
+    const char* source_host;   /* operator-only I2P destination */
+    uint16_t source_port;
+    uint16_t socks_port;       /* local loopback i2pd SOCKS5 */
+    qihse_user_t* replica_principal;
+    const qihse_qkp_config_t* qkp; /* required signed/sealed peer transport */
+    const char* data_dir;
     uint32_t interval_seconds;
     volatile sig_atomic_t* stop;
 } ae_ctx_t;
 
-/* str-list helpers */
-static bool str_in_list(char** items, size_t count, const char* key) {
-    for (size_t i = 0; i < count; i++) {
-        if (strcmp(items[i], key) == 0) return true;
+static bool parse_u64_decimal(const char* text, uint64_t* value) {
+    if (!text || !*text || !value) return false;
+    for (const unsigned char* p = (const unsigned char*)text; *p; p++)
+        if (*p < '0' || *p > '9') return false;
+    errno = 0; char* end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno || !end || *end) return false;
+    *value = (uint64_t)parsed;
+    return true;
+}
+
+static bool fd_write_all(int fd, const char* data, size_t len) {
+    size_t done = 0u;
+    while (done < len) {
+        ssize_t n = write(fd, data + done, len - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
     }
-    return false;
+    return true;
+}
+
+static bool replica_snapshot_pull(ae_ctx_t* ae, mini_resp_t* source, const char* glob) {
+    const char* begin_argv[3] = {"REPL.SNAPSHOT.BEGIN", glob, NULL};
+    char** manifest = NULL; size_t manifest_count = 0u;
+    int reply = mini_resp_do(source, 2u, begin_argv, NULL, &manifest, &manifest_count);
+    uint64_t snapshot_size = 0u, source_seq = 0u;
+    bool ok = reply == MINI_REP_ARRAY && manifest_count == 2u &&
+        parse_u64_decimal(manifest[0], &snapshot_size) &&
+        parse_u64_decimal(manifest[1], &source_seq) && snapshot_size <= (uint64_t)INT64_MAX;
+    mini_resp_free_array(manifest, manifest_count);
+    if (!ok) return false;
+
+    const char* dir = ae->data_dir;
+    if (!dir || !*dir) dir = getenv("QIHSE_DATA_DIR");
+    if (!dir || !*dir) {
+        if (access("/opt/qihse-data", R_OK | W_OK) == 0) dir = "/opt/qihse-data";
+        else if (access("/var/lib/qihse", R_OK | W_OK) == 0) dir = "/var/lib/qihse";
+        else dir = "/opt/qihse-data";
+    }
+    if (!mkdirs(dir)) {
+        const char* end_argv[1] = {"REPL.SNAPSHOT.END"};
+        (void)mini_resp_command(source, 1u, end_argv);
+        return false;
+    }
+    char incoming[4096];
+    int path_len = snprintf(incoming, sizeof(incoming), "%s%sqihse-repl-snapshot-XXXXXX",
+        dir, dir[strlen(dir) - 1u] == '/' ? "" : "/");
+    if (path_len <= 0 || (size_t)path_len >= sizeof(incoming)) return false;
+    int fd = mkstemp(incoming);
+    if (fd < 0) {
+        const char* end_argv[1] = {"REPL.SNAPSHOT.END"};
+        (void)mini_resp_command(source, 1u, end_argv);
+        return false;
+    }
+    if (fchmod(fd, 0600) != 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        close(fd); (void)unlink(incoming);
+        const char* end_argv[1] = {"REPL.SNAPSHOT.END"};
+        (void)mini_resp_command(source, 1u, end_argv);
+        return false;
+    }
+    uint64_t offset = 0u;
+    while (ok && offset < snapshot_size) {
+        uint64_t request_len = snapshot_size - offset;
+        if (request_len > REPL_AE_VALUE_MAX) request_len = REPL_AE_VALUE_MAX;
+        char offset_buf[32], len_buf[32];
+        snprintf(offset_buf, sizeof(offset_buf), "%llu", (unsigned long long)offset);
+        snprintf(len_buf, sizeof(len_buf), "%llu", (unsigned long long)request_len);
+        const char* read_argv[3] = {"REPL.SNAPSHOT.READ", offset_buf, len_buf};
+        char* chunk = NULL;
+        reply = mini_resp_do(source, 3u, read_argv, &chunk, NULL, NULL);
+        ok = reply == MINI_REP_BULK && chunk && strlen(chunk) == (size_t)request_len &&
+             fd_write_all(fd, chunk, (size_t)request_len);
+        free(chunk);
+        if (ok) offset += request_len;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (ok) ok = qihse_resp_server_repl_snapshot_install_local(ae->server, source->qkp,
+        glob, incoming, source_seq, ae->replica_principal);
+    (void)unlink(incoming);
+    const char* end_argv[1] = {"REPL.SNAPSHOT.END"};
+    if (!mini_resp_command(source, 1u, end_argv)) ok = false;
+    return ok;
+}
+
+static bool replica_pull_glob(ae_ctx_t* ae, mini_resp_t* source, const char* glob,
+                              uint64_t* applied_total) {
+    bool snapshot_installed = false;
+    if (!qihse_resp_server_repl_snapshot_installed_local(ae->server, source->qkp,
+            glob, ae->replica_principal, &snapshot_installed)) return false;
+    if (!snapshot_installed && !replica_snapshot_pull(ae, source, glob)) return false;
+    uint64_t cursor = 0u;
+    if (!qihse_resp_server_repl_cursor_local(ae->server, source->qkp, glob,
+            ae->replica_principal, &cursor)) return false;
+    uint64_t start_cursor = cursor;
+    while (!*ae->stop && *applied_total < REPL_AE_MAX_KEYS) {
+        char since_buf[32];
+        snprintf(since_buf, sizeof(since_buf), "%llu", (unsigned long long)cursor);
+        /* One row keeps even a maximum-sized 16 MiB value within the
+         * bounded RESP delta reply. */
+        const char* argv[4] = {"REPL.DELTA", glob, since_buf, "1"};
+        char** fields = NULL; size_t field_count = 0u;
+        int reply = mini_resp_do(source, 4u, argv, NULL, &fields, &field_count);
+        if (reply != MINI_REP_ARRAY || field_count < 2u) {
+            mini_resp_free_array(fields, field_count);
+            return false;
+        }
+        uint64_t page_cursor = 0u, row_count_u64 = 0u;
+        bool valid = parse_u64_decimal(fields[0], &page_cursor) &&
+                     parse_u64_decimal(fields[1], &row_count_u64) &&
+                     row_count_u64 <= 1u && field_count == 2u + (size_t)row_count_u64 * 7u;
+        if (!valid || page_cursor < cursor) {
+            mini_resp_free_array(fields, field_count);
+            return false;
+        }
+        if (row_count_u64 == 0u) {
+            valid = page_cursor == cursor;
+            mini_resp_free_array(fields, field_count);
+            return valid;
+        }
+        uint64_t last_seq = cursor;
+        for (size_t j = 0; valid && j < (size_t)row_count_u64; j++) {
+            size_t base = 2u + j * 7u;
+            uint64_t seq = 0u, class_u64 = 0u, sci_u64 = 0u, expiry = 0u;
+            bool tombstone = strcmp(fields[base], "D") == 0;
+            valid = (tombstone || strcmp(fields[base], "S") == 0) &&
+                    parse_u64_decimal(fields[base + 1u], &seq) && seq > last_seq &&
+                    parse_u64_decimal(fields[base + 2u], &class_u64) && class_u64 <= UINT16_MAX &&
+                    parse_u64_decimal(fields[base + 3u], &sci_u64) && sci_u64 <= UINT16_MAX &&
+                    parse_u64_decimal(fields[base + 4u], &expiry) && fields[base + 5u][0] != '\0' &&
+                    fnmatch(glob, fields[base + 5u], 0) == 0 &&
+                    (!tombstone || (fields[base + 6u][0] == '\0' && expiry == 0u));
+            if (!valid) break;
+            qihse_kv_replica_record_t record = {
+                .key = fields[base + 5u], .value = tombstone ? NULL : fields[base + 6u],
+                .change_seq = seq, .classification = (uint16_t)class_u64,
+                .sci_compartment = (uint16_t)sci_u64, .expire_time_ms = expiry,
+                .tombstone = tombstone
+            };
+            if (!qihse_resp_server_repl_apply_local(ae->server, source->qkp, glob,
+                    &record, ae->replica_principal)) {
+                valid = false;
+                break;
+            }
+            last_seq = seq;
+            (*applied_total)++;
+        }
+        if (valid && page_cursor != last_seq) valid = false;
+        mini_resp_free_array(fields, field_count);
+        if (!valid) return false;
+        char ack_seq[32];
+        snprintf(ack_seq, sizeof(ack_seq), "%llu", (unsigned long long)last_seq);
+        const char* ack_argv[3] = {"REPL.ACK", glob, ack_seq};
+        if (!mini_resp_command(source, 3u, ack_argv)) return false;
+        cursor = last_seq;
+        if (row_count_u64 == 0u) return true;
+    }
+    return cursor >= start_cursor;
 }
 
 static void* ae_main(void* argument) {
     ae_ctx_t* ae = (ae_ctx_t*)argument;
-    while (!*ae->stop) {
-        for (uint32_t slept = 0; slept < ae->interval_seconds && !*ae->stop; slept++) {
+    while (!__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE)) {
+        for (uint32_t slept = 0; slept < ae->interval_seconds &&
+             !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); slept++) {
             struct timespec ts = {1, 0};
             nanosleep(&ts, NULL);
         }
-        if (*ae->stop) break;
-
+        if (__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE)) break;
         char globs[REPL_AE_GLOBS_MAX][128];
-        bool from_flag[REPL_AE_GLOBS_MAX];
-        size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, from_flag, REPL_AE_GLOBS_MAX);
-        if (glob_count == 0) continue;
-
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        unsigned long long tick_pulled = 0;
-
-        /* Loopback connection for local KEYS/GET/SET. */
-        mini_resp_t self;
-        bool self_ok = mini_resp_connect(&self, ae->self_host, ae->self_port, ae->password) >= 0;
-        if (!self_ok) fprintf(stderr, "qihse-cluster-daemon: repl AE: loopback connect failed\n");
-
-        for (size_t g = 0; g < glob_count && !*ae->stop; g++) {
-            size_t local_count = 0;
-            char** local_list = NULL;
-            if (self_ok) {
-                const char* keys_argv[2] = {"KEYS", globs[g]};
-                if (mini_resp_do(&self, 2, keys_argv, NULL, &local_list, &local_count) != MINI_REP_ARRAY) {
-                    mini_resp_free_array(local_list, local_count);
-                    local_list = NULL;
-                    local_count = 0;
-                }
-            }
-
-            /* Union of peer keysets for orphan detection. */
-            char* seen_anywhere[REPL_AE_MAX_KEYS];
-            size_t seen_count = 0;
-            unsigned long long divergent_total = 0;
-
-            for (size_t p = 0; p < ae->peer_count && !*ae->stop; p++) {
-                if (ae->peers[p].index == ae->self_index) continue;
-                char peer_addr[96];
-                snprintf(peer_addr, sizeof(peer_addr), "%s:%u", ae->peers[p].host, ae->peers[p].port);
-                mini_resp_t peer;
-                if (mini_resp_connect(&peer, ae->peers[p].host, ae->peers[p].port, ae->password) < 0) {
-                    qihse_resp_server_repl_note(ae->server, globs[g], peer_addr, 0, 0, UINT64_MAX, UINT64_MAX, false);
-                    continue;
-                }
-                char** peer_list = NULL;
-                size_t peer_n = 0;
-                const char* keys_argv[2] = {"KEYS", globs[g]};
-                unsigned long long pulled = 0, divergent = 0;
-                if (mini_resp_do(&peer, 2, keys_argv, NULL, &peer_list, &peer_n) == MINI_REP_ARRAY) {
-                    for (size_t i = 0; i < peer_n; i++) {
-                        if (seen_count < REPL_AE_MAX_KEYS) {
-                            char* dup = strdup(peer_list[i]);
-                            if (dup) seen_anywhere[seen_count++] = dup;
-                        }
-                        if (tick_pulled >= REPL_AE_MAX_KEYS) continue;
-                        bool have_local = local_list && str_in_list(local_list, local_count, peer_list[i]);
-                        const char* get_argv[2] = {"GET", peer_list[i]};
-                        char* peer_value = NULL;
-                        if (mini_resp_do(&peer, 2, get_argv, &peer_value, NULL, NULL) != MINI_REP_BULK || !peer_value) {
-                            free(peer_value);
-                            continue; /* vanished mid-tick */
-                        }
-                        if (!have_local && self_ok) {
-                            const char* set_argv[3] = {"SET", peer_list[i], peer_value};
-                            if (mini_resp_command(&self, 3, set_argv)) {
-                                pulled++;
-                                tick_pulled++;
-                            }
-                        } else if (have_local && self_ok) {
-                            const char* lget_argv[2] = {"GET", peer_list[i]};
-                            char* local_value = NULL;
-                            if (mini_resp_do(&self, 2, lget_argv, &local_value, NULL, NULL) == MINI_REP_BULK &&
-                                local_value && strcmp(local_value, peer_value) != 0) {
-                                divergent++; /* report-only in phase 1 */
-                            }
-                            free(local_value);
-                        }
-                        free(peer_value);
-                    }
-                }
-                mini_resp_free_array(peer_list, peer_n);
-                mini_resp_close(&peer);
-                qihse_resp_server_repl_note(ae->server, globs[g], peer_addr, pulled, divergent, UINT64_MAX, UINT64_MAX, true);
-                divergent_total += divergent;
-            }
-
-            /* Orphans: local keys no peer listed. Report-only. */
-            unsigned long long orphaned = 0;
-            if (local_list) {
-                for (size_t i = 0; i < local_count; i++) {
-                    if (!str_in_list(seen_anywhere, seen_count, local_list[i])) orphaned++;
-                }
-            }
-            qihse_resp_server_repl_note(ae->server, globs[g], NULL, UINT64_MAX, UINT64_MAX,
-                                        (uint64_t)local_count, orphaned, true);
-            for (size_t i = 0; i < seen_count; i++) free(seen_anywhere[i]);
-            mini_resp_free_array(local_list, local_count);
-            if (tick_pulled >= REPL_AE_MAX_KEYS) break;
+        size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, NULL, REPL_AE_GLOBS_MAX);
+        if (glob_count == 0u) continue;
+        mini_resp_t source;
+        int connected = mini_resp_connect_i2p(&source, ae->source_host, ae->source_port,
+            ae->socks_port, ae->qkp);
+        bool peer_ok = connected >= 0 && qihse_qkp_client_session_is_replication_peer(
+            source.qkp, ae->qkp->replication_peer_node_id,
+            ae->qkp->replication_peer_dsa_pub_path) && mini_resp_auth(&source, ae->password);
+        if (!peer_ok) {
+            if (connected >= 0) mini_resp_close(&source);
+            for (size_t i = 0; i < glob_count; i++)
+                qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
+                    0u, 0u, UINT64_MAX, UINT64_MAX, false);
+            fprintf(stderr, "qihse-cluster-daemon: replica pull: I2P/QKP source connection or identity pin failed\n");
+            continue;
         }
-        if (self_ok) mini_resp_close(&self);
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-        fprintf(stderr, "qihse-cluster-daemon: repl AE tick: %zu pattern(s), pulled %llu key(s) (%.0fms)\n",
-                glob_count, tick_pulled, ms);
+        uint64_t total = 0u;
+        bool all_ok = true;
+        for (size_t i = 0; i < glob_count && !*ae->stop && total < REPL_AE_MAX_KEYS; i++) {
+            uint64_t before = total;
+            bool ok = replica_pull_glob(ae, &source, globs[i], &total);
+            qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
+                total - before, 0u, UINT64_MAX, UINT64_MAX, ok);
+            if (!ok) { all_ok = false; break; }
+        }
+        mini_resp_close(&source);
+        fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned I2P source (%s)\n",
+                (unsigned long long)total, all_ok ? "ok" : "stopped on error");
     }
     return NULL;
 }
@@ -600,6 +776,13 @@ int main(int argc, char** argv) {
     size_t repl_glob_count = 0;
     uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
     const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
+    const char* pqc_node_id = NULL;
+    const char* replication_source_host = NULL;
+    uint16_t replication_source_port = 0;
+    uint16_t replication_socks_port = 4447;
+    bool replica_read_only = false;
+    const char* replication_peer_node_id = NULL;
+    const char* replication_peer_dsa_pub = NULL;
     const char* pqc_trusted[16];
     size_t pqc_trusted_count = 0;
     bool pqc_require = false;
@@ -690,9 +873,27 @@ int main(int argc, char** argv) {
             repl_glob_count++;
         } else if (strcmp(a, "--pqc-identity-dir") == 0 && i + 1 < argc) {
             pqc_identity_dir = argv[++i];
+        } else if (strcmp(a, "--pqc-node-id") == 0 && i + 1 < argc) {
+            pqc_node_id = argv[++i];
+            if (!*pqc_node_id || strlen(pqc_node_id) > QIHSE_QKP_NODE_ID_LEN) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-source-host") == 0 && i + 1 < argc) {
+            replication_source_host = argv[++i];
+            if (!*replication_source_host || strlen(replication_source_host) > 255u) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-source-port") == 0 && i + 1 < argc) {
+            if (!parse_u16(argv[++i], &replication_source_port)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-socks-port") == 0 && i + 1 < argc) {
+            if (!parse_u16(argv[++i], &replication_socks_port) || replication_socks_port == 0u) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replica-read-only") == 0) {
+            replica_read_only = true;
         } else if (strcmp(a, "--pqc-trusted-pub") == 0 && i + 1 < argc) {
             if (pqc_trusted_count >= sizeof(pqc_trusted) / sizeof(pqc_trusted[0])) return usage(argv[0]), 2;
             pqc_trusted[pqc_trusted_count++] = argv[++i];
+        } else if (strcmp(a, "--replication-peer-node-id") == 0 && i + 1 < argc) {
+            replication_peer_node_id = argv[++i];
+            if (!*replication_peer_node_id || strlen(replication_peer_node_id) > QIHSE_QKP_NODE_ID_LEN) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-peer-dsa-pub") == 0 && i + 1 < argc) {
+            replication_peer_dsa_pub = argv[++i];
+            if (!*replication_peer_dsa_pub) return usage(argv[0]), 2;
         } else if (strcmp(a, "--pqc-require") == 0) {
             pqc_require = true;
         } else if (strcmp(a, "--replicate-interval") == 0 && i + 1 < argc) {
@@ -745,6 +946,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    const bool replication_configured = replication_source_host != NULL ||
+        replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
+    if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
+        fprintf(stderr, "qihse-cluster-daemon: replication source host and port must be configured together\n");
+        return 2;
+    }
+    if (replication_source_host) {
+        size_t source_len = strlen(replication_source_host);
+        if (source_len < 4u || strcasecmp(replication_source_host + source_len - 4u, ".i2p") != 0) {
+            fprintf(stderr, "qihse-cluster-daemon: replication source must be an I2P destination name\n");
+            return 2;
+        }
+    }
+
+    /* Prefer a protected service environment over a command-line secret.
+     * Keep --operator-password for interactive development, but production
+     * systemd units should load QIHSE_OPERATOR_PASSWORD from a root-only
+     * EnvironmentFile so it does not appear in process listings. */
+    if (!operator_password) {
+        const char* configured_password = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (configured_password && *configured_password) {
+            operator_password = configured_password;
+        }
+    }
+
+    if (replication_source_host && (!replica_read_only || repl_glob_count != 1u ||
+            repl_interval == 0u || !operator_password || !replication_peer_node_id ||
+            !replication_peer_dsa_pub || !pqc_node_id)) {
+        fprintf(stderr, "qihse-cluster-daemon: I2P replica pull requires --replica-read-only, exactly one dedicated --replicate namespace, nonzero interval, operator password, stable --pqc-node-id, and a pinned upstream identity\n");
+        return 2;
+    }
+    if (replication_configured && !pqc_node_id) {
+        fprintf(stderr, "qihse-cluster-daemon: replication requires explicit stable --pqc-node-id\n");
+        return 2;
+    }
+    if (replication_configured) pqc_require = true;
+
     if (data_dir && *data_dir) {
         if (!mkdirs(data_dir)) {
             fprintf(stderr, "qihse-cluster-daemon: cannot create data dir %s\n", data_dir);
@@ -782,6 +1020,10 @@ int main(int argc, char** argv) {
     qihse_kv_store_t* store = qihse_kv_store_create();
     if (!store) {
         fprintf(stderr, "qihse-cluster-daemon: kv store create failed (data dir unusable?)\n");
+        return 1;
+    }
+    if (replica_read_only && !qihse_kv_store_enable_replica_read_only(store)) {
+        fprintf(stderr, "qihse-cluster-daemon: could not enable replica read-only fence\n");
         return 1;
     }
     qihse_cluster_topology_t* topology = qihse_cluster_topology_create();
@@ -842,7 +1084,13 @@ int main(int argc, char** argv) {
     qihse_qkp_config_t pqc;
     memset(&pqc, 0, sizeof(pqc));
     pqc.require = pqc_require;
-    pqc.node_id = bind;
+    pqc.node_id = pqc_node_id ? pqc_node_id : bind;
+    if ((replication_peer_node_id == NULL) != (replication_peer_dsa_pub == NULL)) {
+        fprintf(stderr, "qihse-cluster-daemon: replication peer node id and DSA public key must be configured together\n");
+        return 2;
+    }
+    pqc.replication_peer_node_id = replication_peer_node_id;
+    pqc.replication_peer_dsa_pub_path = replication_peer_dsa_pub;
     static char pqc_dsa_key[512], pqc_kem_key[512], pqc_kem_pub[512];
     const char* pqc_dir = pqc_identity_dir ? pqc_identity_dir : "/etc/qihse/keys";
     snprintf(pqc_dsa_key, sizeof(pqc_dsa_key), "%s/qihse_dsa_key.pem", pqc_dir);
@@ -872,6 +1120,17 @@ int main(int argc, char** argv) {
             fprintf(stderr, "qihse-cluster-daemon: PQC identity keys not found under %s; "
                             "serving cleartext, QKP1 probes answered with -ERR PQC unavailable\n", pqc_dir);
         }
+    }
+    /* Anti-entropy carries credentials and replicated values. Refuse to
+     * enable it unless every connection can use QKP1 with configured node
+     * trust anchors; the transport client has no cleartext fallback. */
+    if ((replication_configured || (repl_glob_count > 0u && repl_interval > 0u)) &&
+        (!pqc.dsa_key_path || access(pqc.dsa_key_path, R_OK) != 0 ||
+         !pqc.kem_key_path || access(pqc.kem_key_path, R_OK) != 0 ||
+         !pqc.kem_pub_path || access(pqc.kem_pub_path, R_OK) != 0 ||
+         pqc_trusted_count == 0u)) {
+        fprintf(stderr, "qihse-cluster-daemon: --replicate requires readable QKP1 DSA/KEM identity keys and at least one --pqc-trusted-pub; refusing unsafe replication\n");
+        return 2;
     }
 
     qihse_resp_server_config_t config;
@@ -928,11 +1187,11 @@ int main(int argc, char** argv) {
     }
     config.federation_sign_key = node_sign_pkey;
     config.require_signed_ops = require_signed_ops;
-    /* R4c: PQC must be OFF unless explicitly requested via --pqc-* flags.
-     * pqc.dsa_key_path points at a static buffer and is therefore always
-     * non-NULL — gating on it silently enabled opportunistic PQC (with the
-     * default /etc/qihse/keys identity!) on daemons started with no flags. */
-    if ((pqc_identity_dir != NULL || pqc_require) && pqc.dsa_key_path) {
+    /* R4c: PQC must be OFF unless explicitly requested via --pqc-* flags or
+     * required by anti-entropy. pqc.dsa_key_path points at a static buffer
+     * and is always non-NULL, so it cannot be the opt-in condition. */
+    if ((pqc_identity_dir != NULL || pqc_require || replication_configured ||
+         (repl_glob_count > 0u && repl_interval > 0u)) && pqc.dsa_key_path) {
         config.pqc = pqc; /* opportunistic default: PQC on QKP1 probe, cleartext allowed */
     }
     /* BM25 full-text search surface (FTS.BUILD / FTS.SEARCH): unlike
@@ -1008,18 +1267,24 @@ int main(int argc, char** argv) {
     static volatile sig_atomic_t ae_stop = 0;
     ae_ctx_t ae_ctx;
     bool ae_started = false;
-    if (repl_interval > 0) {
+    if (replication_source_host && repl_interval > 0u) {
         ae_ctx.server = server;
-        ae_ctx.peers = peers;
-        ae_ctx.peer_count = peer_count;
-        ae_ctx.self_index = self_index;
         ae_ctx.password = operator_password;
-        ae_ctx.self_host = bind;
-        ae_ctx.self_port = port;
+        ae_ctx.source_host = replication_source_host;
+        ae_ctx.source_port = replication_source_port;
+        ae_ctx.socks_port = replication_socks_port;
+        ae_ctx.replica_principal = qihse_auth_get_user(0u);
+        ae_ctx.qkp = &pqc;
+        ae_ctx.data_dir = data_dir;
         ae_ctx.interval_seconds = repl_interval;
         ae_ctx.stop = &ae_stop;
-        if (pthread_create(&ae_thread, NULL, ae_main, &ae_ctx) == 0) ae_started = true;
-        else fprintf(stderr, "qihse-cluster-daemon: repl AE thread failed to start\n");
+        if (!ae_ctx.replica_principal || pthread_create(&ae_thread, NULL, ae_main, &ae_ctx) != 0) {
+            fprintf(stderr, "qihse-cluster-daemon: replica pull thread failed to start (operator principal unavailable)\n");
+            qihse_resp_server_stop(server);
+            qihse_resp_server_destroy(server);
+            return 1;
+        }
+        ae_started = true;
     }
 
     pthread_t join_thread;
@@ -1030,7 +1295,7 @@ int main(int argc, char** argv) {
         if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
     }
     bool ok = qihse_resp_server_run(server);
-    ae_stop = 1;
+    __atomic_store_n(&ae_stop, 1, __ATOMIC_RELEASE);
     if (ae_started) pthread_join(ae_thread, NULL); /* holds server: join before destroy */
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     qihse_resp_server_stop(server);

@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fnmatch.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -29,8 +30,21 @@
 #define KV_FLAG_TOMBSTONE 0x01u
 #define KV_ALLOWED_FLAGS KV_FLAG_TOMBSTONE
 #define KV_WAL_MAGIC "QKV2"
+#define KV_WAL_MAGIC_REPLICA "QKV3"
+#define KV_REPLICA_CURSOR_MAGIC "QRC1"
+#define KV_REPLICA_CURSOR_MAX_ITEMS 4096u
+#define KV_REPLICA_CURSOR_MAX_ID 128u
 #define KV_WAL_OP_SET 1u
 #define KV_WAL_OP_DEL 2u
+
+#ifdef QIHSE_REPLICA_CRASH_TEST
+static void replica_install_test_crash_point(const char* point) {
+    const char* selected = getenv("QIHSE_REPLICA_CRASH_AT");
+    if (selected && point && strcmp(selected, point) == 0) _exit(86);
+}
+#else
+#define replica_install_test_crash_point(point) ((void)(point))
+#endif
 #define KV_HEADER_LINE_MAX 256u
 
 /* The text record header line, versioned by FIELD COUNT exactly the way the
@@ -205,6 +219,7 @@ struct qihse_kv_store {
     int sstable_counter;
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
+    bool replica_read_only;
     sst_meta_index_t* sst_meta;
     /* Store-global monotonic change sequence: the LAST sequence issued to an
      * authorized mutation (the high-water).  Advanced once per authorized
@@ -215,6 +230,7 @@ struct qihse_kv_store {
      * regresses it; it is never reset.  Exposed through
      * qihse_kv_change_seq(). */
     uint64_t change_seq;
+    struct kv_replica_cursor* replica_cursors;
     /* Read-side fd cache: keep a bounded set of SSTable fds open so a
      * point GET on flushed data does not pay open()+close() per request.
      * Safe because SSTable files are immutable once written and ids are
@@ -226,6 +242,22 @@ struct qihse_kv_store {
     pthread_mutex_t sst_fd_lock;
     struct { int32_t sid; int fd; } sst_fds[8];
 };
+
+struct qihse_kv_replica_snapshot {
+    int fd;
+    uint64_t size;
+};
+
+typedef struct kv_replica_cursor {
+    struct kv_replica_cursor* next;
+    char* peer_id;
+    char* namespace_id;
+    uint64_t seq;
+} kv_replica_cursor_t;
+
+static bool fsync_dir_path(const char* dir);
+bool qihse_kv_sync_store(qihse_kv_store_t* store);
+static void replica_snapshot_marker_namespace(const char* glob, char out[48]);
 
 /* Drop and rebuild an empty SSTable metadata index.  Called whenever SSTables
  * are merged back into the memtable (compaction / snapshot load), after which
@@ -301,6 +333,7 @@ typedef struct {
     uint16_t classification;
     uint16_t sci_compartment;
     uint8_t flags;
+    uint64_t change_seq;
 } kv_lookup_result_t;
 
 static uint64_t current_time_ms(void) {
@@ -444,6 +477,341 @@ static uint64_t fnv1a64_update(uint64_t h, const void* data, size_t len) {
     return h;
 }
 
+static uint64_t cursor_file_crc(uint32_t count, const kv_replica_cursor_t* entries) {
+    uint64_t h = 14695981039346656037ULL;
+    h = fnv1a64_update(h, KV_REPLICA_CURSOR_MAGIC, 4u);
+    h = fnv1a64_update(h, &count, sizeof(count));
+    for (const kv_replica_cursor_t* e = entries; e; e = e->next) {
+        uint16_t pl = (uint16_t)strlen(e->peer_id), nl = (uint16_t)strlen(e->namespace_id);
+        h = fnv1a64_update(h, &pl, sizeof(pl));
+        h = fnv1a64_update(h, &nl, sizeof(nl));
+        h = fnv1a64_update(h, &e->seq, sizeof(e->seq));
+        h = fnv1a64_update(h, e->peer_id, pl);
+        h = fnv1a64_update(h, e->namespace_id, nl);
+    }
+    return h;
+}
+
+static bool cursor_id_valid(const char* s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    if (n == 0u || n > KV_REPLICA_CURSOR_MAX_ID) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-' ||
+              c == '*' || c == '?' || c == '[' || c == ']' || c == '/')) return false;
+    }
+    return true;
+}
+
+static kv_replica_cursor_t* cursor_find(qihse_kv_store_t* store, const char* peer, const char* ns) {
+    for (kv_replica_cursor_t* e = store ? store->replica_cursors : NULL; e; e = e->next)
+        if (strcmp(e->peer_id, peer) == 0 && strcmp(e->namespace_id, ns) == 0) return e;
+    return NULL;
+}
+
+static void cursor_list_free(kv_replica_cursor_t* e) {
+    while (e) { kv_replica_cursor_t* next = e->next; free(e->peer_id); free(e->namespace_id); free(e); e = next; }
+}
+
+static bool cursor_write_file(const char* path, const kv_replica_cursor_t* entries, uint32_t count) {
+    char tmp[8192]; FILE* f = NULL;
+    if (!atomic_file_begin(path, tmp, sizeof(tmp), &f)) return false;
+    bool ok = fwrite_exact(KV_REPLICA_CURSOR_MAGIC, 1u, 4u, f) &&
+              fwrite_exact(&count, sizeof(count), 1u, f);
+    for (const kv_replica_cursor_t* e = entries; ok && e; e = e->next) {
+        uint16_t pl = (uint16_t)strlen(e->peer_id), nl = (uint16_t)strlen(e->namespace_id);
+        ok = fwrite_exact(&pl, sizeof(pl), 1u, f) && fwrite_exact(&nl, sizeof(nl), 1u, f) &&
+             fwrite_exact(&e->seq, sizeof(e->seq), 1u, f) &&
+             fwrite_exact(e->peer_id, 1u, pl, f) && fwrite_exact(e->namespace_id, 1u, nl, f);
+    }
+    uint64_t crc = cursor_file_crc(count, entries);
+    if (ok) ok = fwrite_exact(&crc, sizeof(crc), 1u, f);
+    if (!ok || ferror(f)) { fclose(f); unlink(tmp); return false; }
+    return atomic_file_commit(f, tmp, path);
+}
+
+static bool cursor_read_file(qihse_kv_store_t* store) {
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "replica-cursors.bin")) return false;
+    int fd = open_secure_read(path);
+    if (fd < 0) return errno == ENOENT;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    char magic[4]; uint32_t count = 0u; bool ok = fread(magic, 1u, 4u, f) == 4u &&
+        memcmp(magic, KV_REPLICA_CURSOR_MAGIC, 4u) == 0 && fread(&count, sizeof(count), 1u, f) == 1u &&
+        count <= KV_REPLICA_CURSOR_MAX_ITEMS;
+    kv_replica_cursor_t* list = NULL; kv_replica_cursor_t** tail = &list; uint32_t loaded = 0u;
+    while (ok && loaded < count) {
+        uint16_t pl = 0u, nl = 0u; uint64_t seq = 0u;
+        if (fread(&pl, sizeof(pl), 1u, f) != 1u || fread(&nl, sizeof(nl), 1u, f) != 1u ||
+            fread(&seq, sizeof(seq), 1u, f) != 1u || pl == 0u || nl == 0u ||
+            pl > KV_REPLICA_CURSOR_MAX_ID || nl > KV_REPLICA_CURSOR_MAX_ID) { ok = false; break; }
+        kv_replica_cursor_t* e = (kv_replica_cursor_t*)calloc(1u, sizeof(*e));
+        if (!e) { ok = false; break; }
+        e->peer_id = (char*)malloc((size_t)pl + 1u); e->namespace_id = (char*)malloc((size_t)nl + 1u); e->seq = seq;
+        if (!e->peer_id || !e->namespace_id || fread(e->peer_id, 1u, pl, f) != pl || fread(e->namespace_id, 1u, nl, f) != nl) {
+            free(e->peer_id); free(e->namespace_id); free(e); ok = false; break;
+        }
+        e->peer_id[pl] = '\0'; e->namespace_id[nl] = '\0';
+        bool duplicate = false;
+        for (kv_replica_cursor_t* prior = list; prior; prior = prior->next)
+            if (strcmp(prior->peer_id, e->peer_id) == 0 && strcmp(prior->namespace_id, e->namespace_id) == 0) duplicate = true;
+        if (!cursor_id_valid(e->peer_id) || !cursor_id_valid(e->namespace_id) || duplicate) {
+            free(e->peer_id); free(e->namespace_id); free(e); ok = false; break;
+        }
+        *tail = e; tail = &e->next; loaded++;
+    }
+    uint64_t stored_crc = 0u;
+    if (ok) ok = fread(&stored_crc, sizeof(stored_crc), 1u, f) == 1u && fgetc(f) == EOF &&
+                 stored_crc == cursor_file_crc(count, list);
+    fclose(f);
+    if (!ok) { cursor_list_free(list); return false; }
+    store->replica_cursors = list;
+    return true;
+}
+
+typedef struct {
+    char peer[KV_REPLICA_CURSOR_MAX_ID + 1u];
+    char glob[KV_REPLICA_CURSOR_MAX_ID + 1u];
+    uint64_t source_seq;
+    uint64_t image_hash;
+} replica_install_meta_t;
+
+static uint64_t replica_install_meta_crc(const replica_install_meta_t* m) {
+    uint64_t h = 14695981039346656037ULL;
+    uint16_t pl = (uint16_t)strlen(m->peer), gl = (uint16_t)strlen(m->glob);
+    h = fnv1a64_update(h, "QRIM1", 5u);
+    h = fnv1a64_update(h, &pl, sizeof(pl)); h = fnv1a64_update(h, &gl, sizeof(gl));
+    h = fnv1a64_update(h, &m->source_seq, sizeof(m->source_seq));
+    h = fnv1a64_update(h, &m->image_hash, sizeof(m->image_hash));
+    h = fnv1a64_update(h, m->peer, pl); h = fnv1a64_update(h, m->glob, gl);
+    return h;
+}
+
+static bool replica_install_meta_write(const char* path, const replica_install_meta_t* m) {
+    char tmp[8192]; FILE* f = NULL;
+    if (!m || !cursor_id_valid(m->peer) || !cursor_id_valid(m->glob) ||
+        !atomic_file_begin(path, tmp, sizeof(tmp), &f)) return false;
+    uint16_t pl = (uint16_t)strlen(m->peer), gl = (uint16_t)strlen(m->glob);
+    uint64_t crc = replica_install_meta_crc(m);
+    bool ok = fwrite_exact("QRIM1", 1u, 5u, f) && fwrite_exact(&pl, sizeof(pl), 1u, f) &&
+        fwrite_exact(&gl, sizeof(gl), 1u, f) &&
+        fwrite_exact(&m->source_seq, sizeof(m->source_seq), 1u, f) &&
+        fwrite_exact(&m->image_hash, sizeof(m->image_hash), 1u, f) &&
+        fwrite_exact(m->peer, 1u, pl, f) && fwrite_exact(m->glob, 1u, gl, f) &&
+        fwrite_exact(&crc, sizeof(crc), 1u, f);
+    if (!ok) { fclose(f); unlink(tmp); return false; }
+    if (!atomic_file_commit(f, tmp, path)) return false;
+    return fsync_dir_path(get_qihse_data_dir());
+}
+
+static bool replica_install_meta_read(const char* path, replica_install_meta_t* m,
+                                     bool* out_present) {
+    if (out_present) *out_present = false;
+    if (!path || !m || !out_present) return false;
+    int fd = open_secure_read(path);
+    if (fd < 0) return errno == ENOENT;
+    *out_present = true;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    memset(m, 0, sizeof(*m));
+    char magic[5]; uint16_t pl = 0u, gl = 0u; uint64_t crc = 0u;
+    bool ok = fread(magic, 1u, sizeof(magic), f) == sizeof(magic) &&
+        memcmp(magic, "QRIM1", sizeof(magic)) == 0 &&
+        fread(&pl, sizeof(pl), 1u, f) == 1u && fread(&gl, sizeof(gl), 1u, f) == 1u &&
+        fread(&m->source_seq, sizeof(m->source_seq), 1u, f) == 1u &&
+        fread(&m->image_hash, sizeof(m->image_hash), 1u, f) == 1u &&
+        pl != 0u && gl != 0u && pl <= KV_REPLICA_CURSOR_MAX_ID &&
+        gl <= KV_REPLICA_CURSOR_MAX_ID &&
+        fread(m->peer, 1u, pl, f) == pl && fread(m->glob, 1u, gl, f) == gl &&
+        fread(&crc, sizeof(crc), 1u, f) == 1u && fgetc(f) == EOF;
+    fclose(f);
+    if (pl > KV_REPLICA_CURSOR_MAX_ID || gl > KV_REPLICA_CURSOR_MAX_ID) return false;
+    m->peer[pl] = '\0'; m->glob[gl] = '\0';
+    return ok && cursor_id_valid(m->peer) && cursor_id_valid(m->glob) &&
+           crc == replica_install_meta_crc(m);
+}
+
+static bool copy_file_atomic_hash(const char* source, const char* destination,
+                                  uint64_t* out_hash) {
+    int fd = open_secure_read(source);
+    if (fd < 0) return false;
+    FILE* in = fdopen(fd, "rb");
+    if (!in) { close(fd); return false; }
+    char tmp[8192]; FILE* out = NULL;
+    if (!atomic_file_begin(destination, tmp, sizeof(tmp), &out)) { fclose(in); return false; }
+    uint8_t buffer[65536]; uint64_t hash = 14695981039346656037ULL; bool ok = true;
+    for (;;) {
+        size_t n = fread(buffer, 1u, sizeof(buffer), in);
+        if (n) {
+            hash = fnv1a64_update(hash, buffer, n);
+            if (!fwrite_exact(buffer, 1u, n, out)) { ok = false; break; }
+        }
+        if (n < sizeof(buffer)) {
+            if (ferror(in)) ok = false;
+            break;
+        }
+    }
+    fclose(in);
+    if (!ok) { fclose(out); unlink(tmp); return false; }
+    if (!atomic_file_commit(out, tmp, destination)) return false;
+    if (out_hash) *out_hash = hash;
+    return true;
+}
+
+static bool replica_install_recover_image(const char* dir) {
+    char meta_path[4096], image_path[4096], candidate[4096], sstable0[4096], wal_path[4096];
+    if (!dir) return false;
+    int a = snprintf(meta_path, sizeof(meta_path), "%sreplica-install.meta", dir);
+    int b = snprintf(image_path, sizeof(image_path), "%sreplica-install.image", dir);
+    int c = snprintf(candidate, sizeof(candidate), "%sreplica-install.candidate", dir);
+    int dpath = snprintf(sstable0, sizeof(sstable0), "%ssstable_0.db", dir);
+    int w = snprintf(wal_path, sizeof(wal_path), "%swal.log", dir);
+    if (a < 0 || (size_t)a >= sizeof(meta_path) || b < 0 || (size_t)b >= sizeof(image_path) ||
+        c < 0 || (size_t)c >= sizeof(candidate) || dpath < 0 || (size_t)dpath >= sizeof(sstable0) ||
+        w < 0 || (size_t)w >= sizeof(wal_path))
+        return false;
+    replica_install_meta_t meta; bool present = false;
+    if (!replica_install_meta_read(meta_path, &meta, &present)) return false;
+    if (!present) {
+        bool removed = false;
+        if (unlink(image_path) == 0) removed = true;
+        else if (errno != ENOENT) return false;
+        if (unlink(candidate) == 0) removed = true;
+        else if (errno != ENOENT) return false;
+        return !removed || fsync_dir_path(dir);
+    }
+    uint64_t image_hash = 0u;
+    (void)unlink(candidate);
+    if (!copy_file_atomic_hash(image_path, candidate, &image_hash)) return false;
+    if (image_hash != meta.image_hash) { (void)unlink(candidate); return false; }
+    if (rename(candidate, sstable0) != 0 || !fsync_dir_path(dir))
+        return false;
+    DIR* d = opendir(dir);
+    if (!d) return false;
+    struct dirent* ent;
+    bool ok = true;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "sstable_", 8u) != 0) continue;
+        char* end = NULL; long id = strtol(ent->d_name + 8u, &end, 10);
+        if (!end || strcmp(end, ".db") != 0 || id <= 0 || id >= INT_MAX) continue;
+        char path[4096]; int n = snprintf(path, sizeof(path), "%s%s", dir, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path) || unlink(path) != 0) { ok = false; break; }
+    }
+    closedir(d);
+    if (!ok) return false;
+    char tmp[8192]; FILE* empty_wal = NULL;
+    if (!atomic_file_begin(wal_path, tmp, sizeof(tmp), &empty_wal) ||
+        !atomic_file_commit(empty_wal, tmp, wal_path)) return false;
+    return fsync_dir_path(dir);
+}
+
+static bool replica_cursor_force_set(qihse_kv_store_t* store, const char* peer,
+                                     const char* ns, uint64_t seq) {
+    kv_replica_cursor_t* e = cursor_find(store, peer, ns);
+    if (e && seq < e->seq) return false;
+    uint32_t count = 0u;
+    for (kv_replica_cursor_t* p = store->replica_cursors; p; p = p->next) count++;
+    bool added = false; uint64_t prior = 0u;
+    if (!e) {
+        if (count >= KV_REPLICA_CURSOR_MAX_ITEMS) return false;
+        e = calloc(1u, sizeof(*e));
+        if (!e) return false;
+        e->peer_id = strdup(peer); e->namespace_id = strdup(ns);
+        if (!e->peer_id || !e->namespace_id) {
+            free(e->peer_id); free(e->namespace_id); free(e); return false;
+        }
+        e->next = store->replica_cursors; store->replica_cursors = e; added = true;
+    } else prior = e->seq;
+    e->seq = seq;
+    char path[4096];
+    bool ok = build_data_path(path, sizeof(path), "replica-cursors.bin") &&
+        cursor_write_file(path, store->replica_cursors, count + (added ? 1u : 0u)) &&
+        fsync_dir_path(get_qihse_data_dir());
+    if (!ok) {
+        if (added) { store->replica_cursors = e->next; free(e->peer_id); free(e->namespace_id); free(e); }
+        else e->seq = prior;
+    }
+    return ok;
+}
+
+static bool replica_install_finish_recovery(qihse_kv_store_t* store, const char* dir) {
+    char meta_path[4096], image_path[4096];
+    if (!dir) return false;
+    int a = snprintf(meta_path, sizeof(meta_path), "%sreplica-install.meta", dir);
+    int b = snprintf(image_path, sizeof(image_path), "%sreplica-install.image", dir);
+    if (a < 0 || (size_t)a >= sizeof(meta_path) || b < 0 || (size_t)b >= sizeof(image_path)) return false;
+    replica_install_meta_t meta; bool present = false;
+    if (!replica_install_meta_read(meta_path, &meta, &present)) return false;
+    if (!present) return true;
+    char marker[48]; replica_snapshot_marker_namespace(meta.glob, marker);
+    if (!replica_cursor_force_set(store, meta.peer, meta.glob, meta.source_seq) ||
+        !replica_cursor_force_set(store, meta.peer, marker, 1u)) return false;
+    if (unlink(meta_path) != 0 || !fsync_dir_path(dir)) return false;
+    if (unlink(image_path) != 0 && errno != ENOENT) return false;
+    return fsync_dir_path(dir);
+}
+
+static bool cursor_principal_ok(qihse_user_t* principal) {
+    return principal && qihse_auth_user_is_active(principal) &&
+           qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR;
+}
+
+bool qihse_kv_replica_cursor_get(qihse_kv_store_t* store, const char* peer_id,
+                                const char* namespace_id, qihse_user_t* principal,
+                                uint64_t* out_seq) {
+    if (!store || !cursor_id_valid(peer_id) || !cursor_id_valid(namespace_id) ||
+        !cursor_principal_ok(principal) || !out_seq) return false;
+    kv_replica_cursor_t* e = cursor_find(store, peer_id, namespace_id);
+    *out_seq = e ? e->seq : 0u;
+    return true;
+}
+
+bool qihse_kv_replica_cursor_advance(qihse_kv_store_t* store, const char* peer_id,
+                                    const char* namespace_id, uint64_t seq,
+                                    qihse_user_t* principal) {
+    if (!store || !cursor_id_valid(peer_id) || !cursor_id_valid(namespace_id) ||
+        !cursor_principal_ok(principal) || store->bulk_load_mode) return false;
+    kv_replica_cursor_t* e = cursor_find(store, peer_id, namespace_id);
+    if (e && seq < e->seq) return false;
+    if (e && seq == e->seq) {
+        /* The previous call may have renamed the cursor file successfully but
+         * failed its directory fsync.  Retrying the same sequence must retry
+         * both durable-store and cursor-directory synchronization. */
+        return qihse_kv_sync_store(store) &&
+               fsync_dir_path(get_qihse_data_dir());
+    }
+    uint32_t count = 0u;
+    for (kv_replica_cursor_t* p = store->replica_cursors; p; p = p->next) count++;
+    if (!e && count >= KV_REPLICA_CURSOR_MAX_ITEMS) return false;
+
+    /* Ensure every applied record preceding this checkpoint survives a crash
+     * before a caller can ACK the new cursor. */
+    if (!qihse_kv_sync_store(store)) return false;
+
+    bool added = false; uint64_t prior_seq = 0u;
+    if (!e) {
+        e = (kv_replica_cursor_t*)calloc(1u, sizeof(*e));
+        if (!e) return false;
+        e->peer_id = strdup(peer_id); e->namespace_id = strdup(namespace_id);
+        if (!e->peer_id || !e->namespace_id) { free(e->peer_id); free(e->namespace_id); free(e); return false; }
+        e->next = store->replica_cursors; store->replica_cursors = e; added = true;
+    } else prior_seq = e->seq;
+    e->seq = seq;
+    char path[4096]; bool persisted = build_data_path(path, sizeof(path), "replica-cursors.bin") &&
+        cursor_write_file(path, store->replica_cursors, count + (added ? 1u : 0u));
+    if (!persisted) {
+        if (added) { store->replica_cursors = e->next; free(e->peer_id); free(e->namespace_id); free(e); }
+        else e->seq = prior_seq;
+        return false;
+    }
+    /* A failed directory fsync means no ACK; retain the in-memory high-water
+     * so a retry in this process cannot overwrite it with a lower value. */
+    return fsync_dir_path(get_qihse_data_dir());
+}
+
 static uint64_t wal_record_crc(uint8_t op, uint8_t flags, uint16_t key_len, uint32_t val_len,
                                uint16_t classification, uint16_t sci_compartment,
                                uint64_t expire_time_ms, const char* key, const char* val) {
@@ -458,6 +826,15 @@ static uint64_t wal_record_crc(uint8_t op, uint8_t flags, uint16_t key_len, uint
     h = fnv1a64_update(h, key, key_len);
     if (val_len != 0u) h = fnv1a64_update(h, val, val_len);
     return h;
+}
+
+static uint64_t wal_replica_record_crc(uint8_t op, uint8_t flags, uint16_t key_len,
+                                       uint32_t val_len, uint16_t classification,
+                                       uint16_t sci_compartment, uint64_t expire_time_ms,
+                                       uint64_t change_seq, const char* key, const char* val) {
+    uint64_t h = wal_record_crc(op, flags, key_len, val_len, classification,
+                                sci_compartment, expire_time_ms, key, val);
+    return fnv1a64_update(h, &change_seq, sizeof(change_seq));
 }
 
 static bool payload_is_dead(const kv_payload_t* p, uint64_t now) {
@@ -714,6 +1091,36 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
     return true;
 }
 
+/* Replica records use a versioned WAL frame carrying the primary's sequence.
+ * QKV2 remains readable and keeps its historical local re-stamping behavior. */
+static bool wal_append_replica(qihse_kv_store_t* store, uint8_t op, const char* key,
+                               const char* value, uint64_t expire_time_ms,
+                               uint16_t classification, uint16_t sci_compartment,
+                               uint8_t flags, uint64_t change_seq) {
+    if (!store || !key || !store->wal_fd || store->bulk_load_mode || change_seq == 0u) return false;
+    size_t key_len_sz = strlen(key), val_len_sz = value ? strlen(value) : 0u;
+    if (key_len_sz == 0u || key_len_sz > KV_MAX_KEY_LEN || val_len_sz > KV_MAX_VALUE_LEN ||
+        (op != KV_WAL_OP_SET && op != KV_WAL_OP_DEL) || (flags & ~KV_ALLOWED_FLAGS) != 0u) return false;
+    uint16_t key_len = (uint16_t)key_len_sz;
+    uint32_t val_len = (uint32_t)val_len_sz;
+    uint64_t crc = wal_replica_record_crc(op, flags, key_len, val_len, classification,
+                                          sci_compartment, expire_time_ms, change_seq,
+                                          key, value ? value : "");
+    unsigned char hdr[40];
+    memcpy(hdr + 0, KV_WAL_MAGIC_REPLICA, 4u);
+    hdr[4] = op; hdr[5] = flags;
+    memcpy(hdr + 6, &key_len, 2u); memcpy(hdr + 8, &val_len, 4u);
+    memcpy(hdr + 12, &classification, 2u); memcpy(hdr + 14, &sci_compartment, 2u);
+    memcpy(hdr + 16, &expire_time_ms, 8u); memcpy(hdr + 24, &change_seq, 8u);
+    memcpy(hdr + 32, &crc, 8u);
+    if (!fwrite_exact(hdr, 1u, sizeof(hdr), store->wal_fd) ||
+        !fwrite_exact(key, 1u, key_len, store->wal_fd) ||
+        !fwrite_exact(value ? value : "", 1u, val_len, store->wal_fd)) return false;
+    store->wal_unflushed_bytes += sizeof(hdr) + key_len + val_len;
+    if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
+    return true;
+}
+
 /* Close every cached SSTable fd.  Called whenever SSTable files are deleted
  * or replaced (compaction, load, destroy) so a stale FILE* can never serve
  * data from an unlinked inode. */
@@ -819,6 +1226,7 @@ static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char*
     out->sci_compartment = r.sci_compartment;
     out->expire_time_ms = r.expire_time_ms;
     out->flags = r.flags;
+    out->change_seq = r.change_seq;
     bool dead = (r.flags & KV_FLAG_TOMBSTONE) != 0u ||
                 (r.expire_time_ms != 0u && r.expire_time_ms <= now);
     if (!dead) { out->value = r.val; r.val = NULL; }
@@ -848,6 +1256,7 @@ static kv_lookup_state_t lookup_sstables(qihse_kv_store_t* store, const char* ke
                 out->sci_compartment = r.sci_compartment;
                 out->expire_time_ms = r.expire_time_ms;
                 out->flags = r.flags;
+                out->change_seq = r.change_seq;
                 bool dead = (r.flags & KV_FLAG_TOMBSTONE) != 0u ||
                             (r.expire_time_ms != 0u && r.expire_time_ms <= now);
                 if (!dead) { out->value = r.val; r.val = NULL; }
@@ -875,6 +1284,7 @@ static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store, const char* key
         out->sci_compartment = p->sci_compartment;
         out->expire_time_ms = p->expire_time_ms;
         out->flags = p->flags;
+        out->change_seq = p->change_seq;
         if (payload_is_dead(p, current_time_ms())) { out->state = KV_LOOKUP_DEAD; return out->state; }
         out->value = strdup(p->val);
         if (!out->value) { out->state = KV_LOOKUP_ERROR; return out->state; }
@@ -1076,10 +1486,20 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
  * re-index.  Unlike compact_sstables_into_memtable() this never materializes
  * the whole dataset in a RAM trie and it physically drops tombstoned and
  * expired records. */
-typedef struct { FILE* f; bool ok; size_t written; } compact_emit_ctx_t;
+typedef struct { FILE* f; bool ok; size_t written; qihse_kv_store_t* store; } compact_emit_ctx_t;
+static bool tombstone_has_unacked_replica(qihse_kv_store_t* store, const char* key,
+                                          uint64_t change_seq) {
+    for (kv_replica_cursor_t* c = store ? store->replica_cursors : NULL; c; c = c->next) {
+        if (c->seq < change_seq && fnmatch(c->namespace_id, key, 0) == 0) return true;
+    }
+    return false;
+}
+
 static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     compact_emit_ctx_t* ctx = (compact_emit_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
+    if ((r->flags & KV_FLAG_TOMBSTONE) != 0u &&
+        !tombstone_has_unacked_replica(ctx->store, key, r->change_seq)) return true;
     if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
                                   r->classification, r->sci_compartment, r->flags,
                                   r->change_seq)) {
@@ -1103,8 +1523,8 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     if (n < 0 || (size_t)n >= sizeof(new_path)) return false;
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(new_path, tmp, sizeof(tmp), &out)) return false;
-    compact_emit_ctx_t wctx = { .f = out, .ok = true, .written = 0u };
-    int rc = sst_foreach_newest(store, false, compact_emit_cb, &wctx);
+    compact_emit_ctx_t wctx = { .f = out, .ok = true, .written = 0u, .store = store };
+    int rc = sst_foreach_newest(store, true, compact_emit_cb, &wctx);
     if (rc < 0 || !wctx.ok || ferror(out)) { fclose(out); unlink(tmp); return false; }
     if (wctx.written == 0u) {
         /* Nothing live left in SSTables — drop all old files, no new one. */
@@ -1131,15 +1551,17 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     return true;
 }
 
-static bool wal_replay_new_record(qihse_kv_store_t* store, FILE* f) {
+static bool wal_replay_new_record(qihse_kv_store_t* store, FILE* f, bool has_source_seq) {
     uint8_t op = 0u, flags = 0u;
     uint16_t key_len = 0u, classification = 0u, sci = 0u;
     uint32_t val_len = 0u;
-    uint64_t expire = 0u, crc = 0u;
+    uint64_t expire = 0u, crc = 0u, source_seq = 0u;
     if (fread(&op, sizeof(op), 1u, f) != 1u || fread(&flags, sizeof(flags), 1u, f) != 1u ||
         fread(&key_len, sizeof(key_len), 1u, f) != 1u || fread(&val_len, sizeof(val_len), 1u, f) != 1u ||
         fread(&classification, sizeof(classification), 1u, f) != 1u || fread(&sci, sizeof(sci), 1u, f) != 1u ||
-        fread(&expire, sizeof(expire), 1u, f) != 1u || fread(&crc, sizeof(crc), 1u, f) != 1u) return false;
+        fread(&expire, sizeof(expire), 1u, f) != 1u) return false;
+    if (has_source_seq && fread(&source_seq, sizeof(source_seq), 1u, f) != 1u) return false;
+    if (fread(&crc, sizeof(crc), 1u, f) != 1u) return false;
     if ((op != KV_WAL_OP_SET && op != KV_WAL_OP_DEL) || key_len == 0u ||
         val_len > KV_MAX_VALUE_LEN || (flags & ~KV_ALLOWED_FLAGS) != 0u) return false;
     if (op == KV_WAL_OP_DEL && (val_len != 0u || (flags & KV_FLAG_TOMBSTONE) == 0u)) return false;
@@ -1151,8 +1573,28 @@ static bool wal_replay_new_record(qihse_kv_store_t* store, FILE* f) {
     }
     if (memchr(key, '\0', key_len) || memchr(val, '\0', val_len)) { free(key); free(val); return false; }
     key[key_len] = '\0'; val[val_len] = '\0';
-    uint64_t actual = wal_record_crc(op, flags, key_len, val_len, classification, sci, expire, key, val);
+    uint64_t actual = has_source_seq
+        ? wal_replica_record_crc(op, flags, key_len, val_len, classification, sci,
+                                 expire, source_seq, key, val)
+        : wal_record_crc(op, flags, key_len, val_len, classification, sci, expire, key, val);
     if (actual != crc) { free(key); free(val); return false; }
+    if (has_source_seq) {
+        if (source_seq == 0u ||
+            (op == KV_WAL_OP_DEL && (val_len != 0u || expire != 0u || (flags & KV_FLAG_TOMBSTONE) == 0u)) ||
+            (op == KV_WAL_OP_SET && flags != 0u)) {
+            free(key); free(val); return false;
+        }
+        kv_payload_t* prior = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, NULL);
+        if (prior && prior->change_seq >= source_seq) {
+            bool duplicate = prior->change_seq == source_seq && prior->flags == flags &&
+                             prior->expire_time_ms == expire && prior->classification == classification &&
+                             prior->sci_compartment == sci && strcmp(prior->val, val) == 0;
+            free(key); free(val); return duplicate;
+        }
+        bool ok = insert_internal(store, key, val, expire, classification, sci, flags, source_seq);
+        if (ok) kv_change_seq_floor(store, source_seq);
+        free(key); free(val); return ok;
+    }
     /* The binary WAL format carries no sequence (unchanged, so existing
      * wal.log files keep decoding); recovery re-stamps each replayed
      * mutation with a fresh sequence.  Replay order is mutation order, so
@@ -1177,7 +1619,9 @@ static void recover_from_wal(qihse_kv_store_t* store) {
         if (c == 'Q') {
             char magic[4] = { 'Q', 0, 0, 0 };
             if (fread(magic + 1, 1u, 3u, f) != 3u) break;
-            if (memcmp(magic, KV_WAL_MAGIC, 4u) != 0 || !wal_replay_new_record(store, f)) break;
+            bool replica = memcmp(magic, KV_WAL_MAGIC_REPLICA, 4u) == 0;
+            if ((!replica && memcmp(magic, KV_WAL_MAGIC, 4u) != 0) ||
+                !wal_replay_new_record(store, f, replica)) break;
             continue;
         }
         if (c == 'S') {
@@ -1311,6 +1755,7 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
     }
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_kv_store_destroy(store); return NULL; }
+    if (!replica_install_recover_image(dir)) { qihse_kv_store_destroy(store); return NULL; }
     DIR* d = opendir(dir);
     if (d) {
         struct dirent* ent;
@@ -1332,6 +1777,8 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
         sst_index_load_file(store, sst_path, i);
     }
     recover_from_wal(store);
+    if (!cursor_read_file(store)) { qihse_kv_store_destroy(store); return NULL; }
+    if (!replica_install_finish_recovery(store, dir)) { qihse_kv_store_destroy(store); return NULL; }
     char wal_path[4096];
     if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) { qihse_kv_store_destroy(store); return NULL; }
     int fd = open(wal_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -1339,6 +1786,12 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
     store->wal_fd = fdopen(fd, "ab");
     if (!store->wal_fd) { close(fd); qihse_kv_store_destroy(store); return NULL; }
     return store;
+}
+
+bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store) {
+    if (!store || !store->trie) return false;
+    __atomic_store_n(&store->replica_read_only, true, __ATOMIC_RELEASE);
+    return true;
 }
 
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
@@ -1349,6 +1802,7 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     pthread_mutex_destroy(&store->sst_fd_lock);
     if (store->trie) qihse_trinary_trie_destroy(store->trie);
     sst_meta_index_destroy(store->sst_meta);
+    cursor_list_free(store->replica_cursors);
     free(store);
 }
 
@@ -1362,7 +1816,8 @@ void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
 static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
                                  uint64_t expire_time_ms, uint16_t classification,
                                  uint16_t sci_compartment, qihse_user_t* user) {
-    if (!store || !store->trie || !key || !value || key[0] == '\0') return false;
+    if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
+        !key || !value || key[0] == '\0') return false;
     if (strlen(key) > KV_MAX_KEY_LEN || strlen(value) > KV_MAX_VALUE_LEN) return false;
     if (!qihse_auth_can_access(user, classification, sci_compartment)) return false;
     /* Determine whether the key already exists, and at what classification, so
@@ -1447,7 +1902,7 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t
 }
 
 bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
-    if (!store || !key) return false;
+    if (!store || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) || !key) return false;
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE) { lookup_result_free(&r); return false; }
     if (!qihse_auth_can_access(user, r.classification, r.sci_compartment)) { lookup_result_free(&r); return false; }
@@ -1462,8 +1917,116 @@ bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* u
     return true;
 }
 
+/* Compare a retry against the stored bytes even if the key's TTL has elapsed.
+ * logical_lookup intentionally hides expired values from readers; this private
+ * comparison is used only after the replication principal passed authorization. */
+static bool replica_record_matches_stored(qihse_kv_store_t* store,
+                                          const qihse_kv_replica_record_t* record) {
+    if (!store || !record) return false;
+    const char* expected_value = record->tombstone ? "" : record->value;
+    size_t payload_size = 0u;
+    kv_payload_t* payload = (kv_payload_t*)qihse_trinary_trie_search(store->trie, record->key,
+                                                                     &payload_size);
+    if (payload) {
+        return payload->change_seq == record->change_seq &&
+               payload->classification == record->classification &&
+               payload->sci_compartment == record->sci_compartment &&
+               payload->expire_time_ms == record->expire_time_ms &&
+               payload->flags == (record->tombstone ? KV_FLAG_TOMBSTONE : 0u) &&
+               strcmp(payload->val, expected_value) == 0;
+    }
+    const char* dir = get_qihse_data_dir();
+    if (!dir) return false;
+    for (int sid = store->sstable_counter - 1; sid >= 0; --sid) {
+        char path[4096];
+        int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, sid);
+        if (n < 0 || (size_t)n >= sizeof(path)) return false;
+        int fd = open_secure_read(path);
+        if (fd < 0) { if (errno == ENOENT) continue; return false; }
+        FILE* f = fdopen(fd, "rb");
+        if (!f) { close(fd); return false; }
+        kv_disk_record_t disk;
+        int rc;
+        while ((rc = disk_record_read(f, &disk)) == 1) {
+            if (strcmp(disk.key, record->key) == 0) {
+                bool match = disk.change_seq == record->change_seq &&
+                    disk.classification == record->classification &&
+                    disk.sci_compartment == record->sci_compartment &&
+                    disk.expire_time_ms == record->expire_time_ms &&
+                    disk.flags == (record->tombstone ? KV_FLAG_TOMBSTONE : 0u) &&
+                    strcmp(disk.val, expected_value) == 0;
+                disk_record_free(&disk);
+                fclose(f);
+                return match;
+            }
+            disk_record_free(&disk);
+        }
+        fclose(f);
+        if (rc < 0) return false;
+    }
+    return false;
+}
+
+bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
+                                   const qihse_kv_replica_record_t* record,
+                                   qihse_user_t* principal) {
+    if (!store || !store->trie || !record || !principal || !record->key ||
+        record->key[0] == '\0' || record->change_seq == 0u ||
+        strlen(record->key) > KV_MAX_KEY_LEN ||
+        (record->tombstone ? (record->value != NULL || record->expire_time_ms != 0u) : record->value == NULL) ||
+        (!record->tombstone && strlen(record->value) > KV_MAX_VALUE_LEN) ||
+        !qihse_auth_user_is_active(principal) ||
+        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR ||
+        !qihse_auth_can_access(principal, record->classification, record->sci_compartment))
+        return false;
+
+    kv_lookup_result_t current;
+    kv_lookup_state_t state = logical_lookup(store, record->key, &current);
+    if (state == KV_LOOKUP_ERROR) return false;
+    if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
+        if (!qihse_auth_can_access(principal, current.classification, current.sci_compartment)) {
+            lookup_result_free(&current);
+            return false;
+        }
+        if (current.change_seq > record->change_seq) {
+            lookup_result_free(&current);
+            return false; /* stale source update */
+        }
+        if (current.change_seq == record->change_seq) {
+            bool same_tombstone = (((current.flags & KV_FLAG_TOMBSTONE) != 0u) == record->tombstone);
+            bool same = same_tombstone && current.classification == record->classification &&
+                        current.sci_compartment == record->sci_compartment &&
+                        current.expire_time_ms == record->expire_time_ms;
+            if (same && record->tombstone) {
+                lookup_result_free(&current);
+                return true;
+            }
+            if (same && replica_record_matches_stored(store, record)) {
+                lookup_result_free(&current);
+                return true;
+            }
+            lookup_result_free(&current);
+            return false; /* same sequence with different or unobservable payload */
+        }
+    }
+    lookup_result_free(&current);
+
+    uint8_t flags = record->tombstone ? KV_FLAG_TOMBSTONE : 0u;
+    uint8_t op = record->tombstone ? KV_WAL_OP_DEL : KV_WAL_OP_SET;
+    const char* value = record->tombstone ? "" : record->value;
+    if (!wal_append_replica(store, op, record->key, value, record->expire_time_ms,
+                            record->classification, record->sci_compartment,
+                            flags, record->change_seq)) return false;
+    if (!insert_internal(store, record->key, value, record->expire_time_ms,
+                         record->classification, record->sci_compartment,
+                         flags, record->change_seq)) return false;
+    kv_change_seq_floor(store, record->change_seq);
+    if (store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
+    return true;
+}
+
 bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user) {
-    if (!store || !key) return false;
+    if (!store || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) || !key) return false;
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE || !qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
         lookup_result_free(&r); return false;
@@ -1523,7 +2086,8 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
 }
 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
-    if (!store || !store->trie || store->bulk_load_mode) return;
+    if (!store || !store->trie || store->bulk_load_mode ||
+        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE)) return;
     uint64_t now = current_time_ms();
     if (!store->sst_meta || store->sst_meta->degraded) {
         /* Index unavailable — expired SSTable records are invisible from RAM,
@@ -1670,7 +2234,7 @@ static bool clear_collect_cb(const char* key, void* value, size_t value_size, vo
     ctx->count++; return true;
 }
 size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
-    if (!store || !store->trie) return 0u;
+    if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE)) return 0u;
     uint64_t now = current_time_ms();
     clear_collect_ctx_t ctx = { .user = user, .now = now, .ok = true };
     bool fast = store->sst_meta && !store->sst_meta->degraded;
@@ -1737,6 +2301,71 @@ static bool export_sst_write_cb(const char* key, const kv_disk_record_t* r, void
     return true;
 }
 
+typedef struct {
+    FILE* f;
+    qihse_user_t* user;
+    const char* glob;
+    uint64_t now;
+    bool ok;
+    bool authorized;
+} replica_snapshot_write_ctx_t;
+
+static bool replica_snapshot_write_mem_cb(const char* key, void* value,
+                                          size_t value_size, void* ud) {
+    (void)value_size;
+    replica_snapshot_write_ctx_t* ctx = (replica_snapshot_write_ctx_t*)ud;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (!ctx || !ctx->ok || !ctx->authorized || !key || !p) return false;
+    if (fnmatch(ctx->glob, key, 0) != 0 || payload_is_dead(p, ctx->now)) return true;
+    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
+        ctx->authorized = false;
+        return false;
+    }
+    if (!disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
+    return true;
+}
+
+static bool replica_snapshot_write_sst_cb(const char* key,
+                                          const kv_disk_record_t* r, void* ud) {
+    replica_snapshot_write_ctx_t* ctx = (replica_snapshot_write_ctx_t*)ud;
+    if (!ctx || !ctx->ok || !ctx->authorized || !key || !r) return false;
+    if (fnmatch(ctx->glob, key, 0) != 0) return true;
+    if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) {
+        ctx->authorized = false;
+        return false;
+    }
+    if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
+                                  r->classification, r->sci_compartment, r->flags,
+                                  r->change_seq)) {
+        ctx->ok = false;
+        return false;
+    }
+    return true;
+}
+
+static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
+                                               const char* filepath,
+                                               qihse_user_t* user,
+                                               const char* glob) {
+    if (!store || !store->trie || !filepath || !glob || !*glob) return -1;
+    bool fast = store->sst_meta && !store->sst_meta->degraded;
+    if (!fast && !compact_sstables_into_memtable(store)) return -1;
+    char tmp[8192]; FILE* f = NULL;
+    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
+    replica_snapshot_write_ctx_t ctx = {
+        .f = f, .user = user, .glob = glob, .now = current_time_ms(),
+        .ok = true, .authorized = true
+    };
+    qihse_trinary_trie_foreach(store->trie, replica_snapshot_write_mem_cb, &ctx);
+    if (ctx.ok && ctx.authorized && fast) {
+        int rc = sst_foreach_newest(store, false, replica_snapshot_write_sst_cb, &ctx);
+        if (rc < 0) ctx.ok = false;
+    }
+    if (!ctx.authorized) { fclose(f); unlink(tmp); errno = EACCES; return -2; }
+    if (!ctx.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
+    return atomic_file_commit(f, tmp, filepath) ? 0 : -1;
+}
+
 int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
     if (!store || !store->trie || !filepath) return -1;
     uint64_t now = current_time_ms();
@@ -1775,6 +2404,75 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
 }
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_save_user(store, filepath, NULL); }
 
+int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user,
+                                     const char* namespace_glob,
+                                     qihse_kv_replica_snapshot_t** out_snapshot) {
+    if (out_snapshot) *out_snapshot = NULL;
+    if (!store || !out_snapshot || !namespace_glob || !*namespace_glob) return -1;
+    const char* dir = get_qihse_data_dir();
+    if (!dir) return -1;
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%sqihse-repl-snapshot-XXXXXX", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    int seed_fd = mkstemp(path);
+    if (seed_fd < 0) return -1;
+    (void)fchmod(seed_fd, 0600);
+    close(seed_fd);
+    /* save_user() atomically replaces this unique path with the complete
+     * authorized snapshot. The name is never sent over the replication wire. */
+    if (qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob) != 0) {
+        int saved_errno = errno;
+        (void)unlink(path);
+        errno = saved_errno;
+        return saved_errno == EACCES ? -2 : -1;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int saved_errno = errno;
+    (void)unlink(path);
+    if (fd < 0) { errno = saved_errno; return -1; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(fd);
+        return -1;
+    }
+    qihse_kv_replica_snapshot_t* snapshot =
+        (qihse_kv_replica_snapshot_t*)calloc(1u, sizeof(*snapshot));
+    if (!snapshot) { close(fd); return -1; }
+    snapshot->fd = fd;
+    snapshot->size = (uint64_t)st.st_size;
+    *out_snapshot = snapshot;
+    return 0;
+}
+
+uint64_t qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot) {
+    return snapshot ? snapshot->size : 0u;
+}
+
+bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
+                                    uint64_t offset, void* out, size_t capacity,
+                                    size_t* out_read) {
+    if (out_read) *out_read = 0u;
+    if (!snapshot || snapshot->fd < 0 || !out_read || (capacity && !out) || offset > snapshot->size)
+        return false;
+    uint64_t remain = snapshot->size - offset;
+    size_t want = remain < (uint64_t)capacity ? (size_t)remain : capacity;
+    size_t done = 0u;
+    while (done < want) {
+        ssize_t n = pread(snapshot->fd, (char*)out + done, want - done, (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    *out_read = done;
+    return true;
+}
+
+void qihse_kv_replica_snapshot_destroy(qihse_kv_replica_snapshot_t* snapshot) {
+    if (!snapshot) return;
+    if (snapshot->fd >= 0) close(snapshot->fd);
+    free(snapshot);
+}
+
 /* Parse a snapshot file into a replacement trie, PRESERVING each record's
  * stamped sequence (a restore is not a mutation) and reporting the maximum
  * sequence seen so qihse_kv_load_user can raise — never lower — the store's
@@ -1812,8 +2510,10 @@ static bool parse_snapshot_into_trie(const char* filepath, qihse_user_t* user,
     return true;
 }
 
-int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
-    if (!store || !filepath) return -1;
+static int qihse_kv_load_user_internal(qihse_kv_store_t* store, const char* filepath,
+                                       qihse_user_t* user, bool replica_install) {
+    if (!store || !filepath ||
+        (__atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) && !replica_install)) return -1;
     qihse_trinary_trie_t* replacement = NULL; size_t replacement_usage = 0u;
     uint64_t replacement_max_seq = 0u;
     if (!parse_snapshot_into_trie(filepath, user, &replacement, &replacement_usage,
@@ -1849,6 +2549,119 @@ int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     sst_fd_cache_clear(store);
     return 0;
 }
+int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
+    return qihse_kv_load_user_internal(store, filepath, user, false);
+}
+
+static void replica_snapshot_marker_namespace(const char* glob, char out[48]) {
+    uint64_t a = 14695981039346656037ULL;
+    uint64_t b = 1099511628211ULL;
+    for (const unsigned char* p = (const unsigned char*)glob; *p; p++) {
+        a = fnv1a64_update(a, p, 1u);
+        b ^= (uint64_t)(*p + 0x9dU);
+        b *= 0x100000001b3ULL;
+    }
+    snprintf(out, 48u, "snapshot-%016llx%016llx",
+             (unsigned long long)a, (unsigned long long)b);
+}
+
+bool qihse_kv_replica_snapshot_installed(qihse_kv_store_t* store,
+                                         const char* peer_id,
+                                         const char* namespace_glob,
+                                         qihse_user_t* principal,
+                                         bool* out_installed) {
+    if (!store || !namespace_glob || !*namespace_glob || !out_installed) return false;
+    char marker[48]; uint64_t seq = 0u;
+    replica_snapshot_marker_namespace(namespace_glob, marker);
+    if (!qihse_kv_replica_cursor_get(store, peer_id, marker, principal, &seq)) return false;
+    *out_installed = seq != 0u;
+    return true;
+}
+
+static bool replica_snapshot_file_valid(const char* filepath, qihse_user_t* principal,
+                                        const char* glob, uint64_t source_highwater) {
+    int fd = open_secure_read(filepath);
+    if (fd < 0) return false;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    bool valid = true;
+    kv_disk_record_t record;
+    int rc;
+    while ((rc = disk_record_read(f, &record)) == 1) {
+        valid = fnmatch(glob, record.key, 0) == 0 &&
+            (record.flags & KV_FLAG_TOMBSTONE) == 0u &&
+            (record.change_seq == 0u || record.change_seq <= source_highwater) &&
+            qihse_auth_can_access(principal, record.classification,
+                                  record.sci_compartment);
+        disk_record_free(&record);
+        if (!valid) break;
+    }
+    if (rc < 0) valid = false;
+    fclose(f);
+    return valid;
+}
+
+bool qihse_kv_replica_snapshot_install(qihse_kv_store_t* store,
+                                       const char* filepath,
+                                       qihse_user_t* principal,
+                                       const char* peer_id,
+                                       const char* namespace_glob,
+                                       uint64_t source_highwater) {
+    if (!store || !filepath || !namespace_glob || !*namespace_glob ||
+        !__atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
+        !cursor_principal_ok(principal) || !cursor_id_valid(peer_id) ||
+        !cursor_id_valid(namespace_glob)) return false;
+    bool installed = false;
+    if (!qihse_kv_replica_snapshot_installed(store, peer_id, namespace_glob,
+                                              principal, &installed)) return false;
+    /* A snapshot replaces the logical KV image. It is safe only in a
+     * dedicated replica store (empty on first bootstrap, already owned by
+     * this exact peer/namespace on re-baseline). */
+    if (!installed && qihse_kv_count_user(store, principal) != 0u) return false;
+    uint64_t current = 0u;
+    if (!replica_snapshot_file_valid(filepath, principal, namespace_glob,
+                                     source_highwater) ||
+        !qihse_kv_replica_cursor_get(store, peer_id, namespace_glob, principal, &current) ||
+        current > source_highwater) return false;
+    const char* dir = get_qihse_data_dir();
+    char image_path[4096], meta_path[4096];
+    int image_len = dir ? snprintf(image_path, sizeof(image_path), "%sreplica-install.image", dir) : -1;
+    int meta_len = dir ? snprintf(meta_path, sizeof(meta_path), "%sreplica-install.meta", dir) : -1;
+    if (image_len < 0 || (size_t)image_len >= sizeof(image_path) ||
+        meta_len < 0 || (size_t)meta_len >= sizeof(meta_path)) return false;
+    replica_install_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    snprintf(meta.peer, sizeof(meta.peer), "%s", peer_id);
+    snprintf(meta.glob, sizeof(meta.glob), "%s", namespace_glob);
+    meta.source_seq = source_highwater;
+    if (!copy_file_atomic_hash(filepath, image_path, &meta.image_hash) ||
+        !fsync_dir_path(dir)) {
+        (void)unlink(image_path);
+        return false;
+    }
+    replica_install_test_crash_point("image");
+    if (!replica_install_meta_write(meta_path, &meta)) {
+        (void)unlink(image_path);
+        return false;
+    }
+    replica_install_test_crash_point("intent");
+    if (qihse_kv_load_user_internal(store, image_path, principal, true) != 0) return false;
+    replica_install_test_crash_point("wal-replaced");
+    if (!qihse_kv_sync_store(store)) return false;
+    replica_install_test_crash_point("sst-wal-durable");
+    if (!qihse_kv_replica_cursor_advance(store, peer_id, namespace_glob,
+                                         source_highwater, principal)) return false;
+    replica_install_test_crash_point("cursor-durable");
+    char marker[48];
+    replica_snapshot_marker_namespace(namespace_glob, marker);
+    if (!qihse_kv_replica_cursor_advance(store, peer_id, marker, 1u, principal)) return false;
+    replica_install_test_crash_point("marker-durable");
+    if (unlink(meta_path) != 0 || !fsync_dir_path(dir)) return false;
+    replica_install_test_crash_point("journal-removed");
+    if (unlink(image_path) != 0 && errno != ENOENT) return false;
+    return fsync_dir_path(dir);
+}
+
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
 
 /* ── Change sequence and incremental (delta) export ──────────────────────
@@ -1901,6 +2714,10 @@ typedef struct {
     size_t count;
     size_t cap;
     uint64_t resume;   /* highest sequence the principal was ALLOWED to see */
+    const char* glob;
+    size_t max_records;
+    size_t max_bytes;
+    size_t bytes;
     bool ok;
 } delta_collect_ctx_t;
 
@@ -1908,6 +2725,38 @@ typedef struct {
  * array (not one stack buffer per record) keeps frames bounded. */
 static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const char* val,
                                const kv_payload_t* p) {
+    size_t key_len = strlen(key);
+    bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
+    size_t value_len = tombstone ? 0u : strlen(val ? val : "");
+    size_t cost = key_len + value_len + 160u;
+    if (ctx->max_records != 0u) {
+        if (cost > ctx->max_bytes) return true;
+        size_t largest = SIZE_MAX;
+        for (size_t i = 0; i < ctx->count; i++) {
+            if (largest == SIZE_MAX || ctx->recs[i].change_seq > ctx->recs[largest].change_seq ||
+                (ctx->recs[i].change_seq == ctx->recs[largest].change_seq &&
+                 strcmp(ctx->recs[i].key, ctx->recs[largest].key) > 0)) largest = i;
+        }
+        bool before_largest = largest == SIZE_MAX || p->change_seq < ctx->recs[largest].change_seq ||
+            (p->change_seq == ctx->recs[largest].change_seq &&
+             strcmp(key, ctx->recs[largest].key) < 0);
+        if ((ctx->count >= ctx->max_records || ctx->bytes + cost > ctx->max_bytes) &&
+            !before_largest) return true;
+        while (ctx->count > 0u &&
+               (ctx->count >= ctx->max_records || ctx->bytes + cost > ctx->max_bytes)) {
+            largest = 0u;
+            for (size_t i = 1u; i < ctx->count; i++)
+                if (ctx->recs[i].change_seq > ctx->recs[largest].change_seq ||
+                    (ctx->recs[i].change_seq == ctx->recs[largest].change_seq &&
+                     strcmp(ctx->recs[i].key, ctx->recs[largest].key) > 0)) largest = i;
+            ctx->bytes -= strlen(ctx->recs[largest].key) +
+                (ctx->recs[largest].value ? strlen(ctx->recs[largest].value) : 0u) + 160u;
+            free(ctx->recs[largest].key); free(ctx->recs[largest].value);
+            ctx->count--;
+            if (largest != ctx->count) ctx->recs[largest] = ctx->recs[ctx->count];
+            memset(&ctx->recs[ctx->count], 0, sizeof(ctx->recs[ctx->count]));
+        }
+    }
     if (ctx->count == ctx->cap) {
         size_t new_cap = ctx->cap ? ctx->cap * 2u : 16u;
         qihse_kv_delta_record_t* next =
@@ -1920,7 +2769,6 @@ static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const 
     memset(out, 0, sizeof(*out));
     out->key = strdup(key);
     if (!out->key) { ctx->ok = false; return false; }
-    bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
     if (!tombstone) {
         out->value = strdup(val ? val : "");
         if (!out->value) { free(out->key); out->key = NULL; ctx->ok = false; return false; }
@@ -1931,7 +2779,8 @@ static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const 
     out->sci_compartment = p->sci_compartment;
     out->expire_time_ms = p->expire_time_ms;
     ctx->count++;
-    if (p->change_seq > ctx->resume) ctx->resume = p->change_seq;
+    ctx->bytes += cost;
+    if (ctx->max_records == 0u && p->change_seq > ctx->resume) ctx->resume = p->change_seq;
     return true;
 }
 
@@ -1945,6 +2794,7 @@ static bool delta_trie_cb(const char* key, void* value, size_t value_size, void*
     if (!ctx || !ctx->ok || !key || !p) return false;
     if (p->change_seq <= ctx->since || p->change_seq == 0u) return true; /* skip */
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
+    if (ctx->glob && fnmatch(ctx->glob, key, 0) != 0) return true;
     bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
     bool expired = !tombstone && p->expire_time_ms != 0u && p->expire_time_ms <= ctx->now;
     if (expired) return true;
@@ -1958,6 +2808,7 @@ static bool delta_sst_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     if (!ctx || !ctx->ok || !key || !r) return false;
     if (r->change_seq <= ctx->since || r->change_seq == 0u) return true;
     if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) return true;
+    if (ctx->glob && fnmatch(ctx->glob, key, 0) != 0) return true;
     kv_payload_t view;
     memset(&view, 0, sizeof(view));
     view.expire_time_ms = r->expire_time_ms;
@@ -1981,8 +2832,9 @@ static int delta_record_cmp(const void* a, const void* b) {
     return 0;
 }
 
-int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user,
-                                     uint64_t since_seq,
+static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* user,
+                                     const char* glob, uint64_t since_seq,
+                                     size_t max_records, size_t max_bytes,
                                      qihse_kv_delta_record_t** out_records,
                                      size_t* out_count, uint64_t* out_resume_seq) {
     if (out_records) *out_records = NULL;
@@ -1997,6 +2849,9 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
     ctx.now = current_time_ms();
     ctx.resume = since_seq;   /* the no-leak default: it does not move
                                * unless the principal sees something newer */
+    ctx.glob = glob;
+    ctx.max_records = max_records;
+    ctx.max_bytes = max_bytes;
     ctx.ok = true;
 
     bool fast = store->sst_meta && !store->sst_meta->degraded;
@@ -2013,10 +2868,32 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
     if (ctx.count > 1u) {
         qsort(ctx.recs, ctx.count, sizeof(*ctx.recs), delta_record_cmp);
     }
+    if (max_records != 0u && ctx.count != 0u)
+        ctx.resume = ctx.recs[ctx.count - 1u].change_seq;
     *out_records = ctx.recs;
     *out_count = ctx.count;
     *out_resume_seq = ctx.resume;
     return 0;
+}
+
+int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user,
+                                     uint64_t since_seq,
+                                     qihse_kv_delta_record_t** out_records,
+                                     size_t* out_count, uint64_t* out_resume_seq) {
+    return kv_export_incremental_common(store, user, NULL, since_seq, 0u, 0u,
+                                        out_records, out_count, out_resume_seq);
+}
+
+int qihse_kv_export_incremental_user_bounded(qihse_kv_store_t* store,
+                                     qihse_user_t* user, const char* namespace_glob,
+                                     uint64_t since_seq, size_t max_records,
+                                     size_t max_bytes,
+                                     qihse_kv_delta_record_t** out_records,
+                                     size_t* out_count, uint64_t* out_resume_seq) {
+    if (!namespace_glob || !*namespace_glob || max_records == 0u || max_bytes == 0u)
+        return -1;
+    return kv_export_incremental_common(store, user, namespace_glob, since_seq,
+        max_records, max_bytes, out_records, out_count, out_resume_seq);
 }
 
 /* File form of the delta: the same text record stream qihse_kv_save_user
