@@ -152,9 +152,10 @@ distributed requirements apply to the consensus work).
 - [x] **7. Federation remainder** — incremental export (landed in the
   2026-09-25 wave) and DHT overlay phase 2 (`src/spinnaker/qihse_overlay.c`
   Layer 3; `make test-dht-peer-exchange` green) both verified in-tree.
-- [~] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
-  recall landed (parallel wave). Open: gold-suite partial areas (tracked
-  as W7 item 12) and the `make docs` decision.
+- [x] **8. AI memory follow-ups and coverage.** Embedding-backed semantic
+  recall landed (parallel wave). Gold-suite: 72/72 workloads pass, 11/11 areas
+  FULL, zero recorded gaps (W7 item 12); API reference and docs updated.
+
 
 ### A. Function — behaviour added or fixed
 

@@ -616,9 +616,24 @@ Tests: `tests/test_auth_privilege_boundary.c`, `tests/test_object_acl.c`,
 
 Roles are `QIHSE_ROLE_OPERATOR` (0), `QIHSE_ROLE_ANALYST` (1),
 `QIHSE_ROLE_GUEST` (2). Object ACL flags are `QIHSE_ACL_READ` (0x01),
-`QIHSE_ACL_WRITE` (0x02), `QIHSE_ACL_ADMIN` (0x04). Password verifiers are
-PBKDF2-HMAC-SHA-384 with a 128-bit salt, a 48-byte hash, and a production
-iteration floor of `QIHSE_PW_MIN_ITERATIONS` (600000).
+`QIHSE_ACL_WRITE` (0x02), `QIHSE_ACL_ADMIN` (0x04). Tenant identifiers
+include `QIHSE_TENANT_SYSTEM` (0) and `QIHSE_TENANT_INVALID` (`UINT32_MAX`).
+Password verifiers are PBKDF2-HMAC-SHA-384 with a 128-bit salt, a 48-byte hash,
+and a production iteration floor of `QIHSE_PW_MIN_ITERATIONS` (600000).
+
+### Operating Modes: Default Single-User God-mode vs. Opt-In Security
+
+- **Default Single-User God-Mode (`auth_required == false`):**
+  By default, QIHSE runs in frictionless single-user god-mode. User 0 (`GODMODE_OP`,
+  clearance `0xFFFF`, SCI compartments `0xFFFF`) is pre-authorized and operates
+  without mandatory password bootstrapping or friction. Local and single-user
+  workflows incur zero security barriers.
+- **Opt-In Security Mode (`auth_required == true`):**
+  When opt-in security mode is enabled (via configuration, `--require-auth`, or
+  explicit operator password setup), strict security gates activate:
+  unauthenticated requests fail closed (`NOAUTH`), tenant boundaries (`t:<id>/`)
+  are strictly enforced, User 0 cannot be destroyed or modified by tenant operators,
+  and row-level clearance/SCI checks are mandatory.
 
 | Function | Purpose | On failure |
 |---|---|---|
@@ -664,6 +679,24 @@ Auth rate limiting (brute-force protection):
 | `bool qihse_auth_check_rate_limit(uint32_t source_ip)` | Is this source allowed to attempt? | `false` when limited |
 | `void qihse_auth_rate_limit_reset(uint32_t source_ip)` | Clear a source's counters. | n/a |
 | `void qihse_auth_rate_limit_cleanup(void)` | Expire stale entries. | n/a |
+
+Auth volume limiting (auth-storm protection):
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `void qihse_auth_init_volume_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries)` | Configure the volume limiter (defaults: 120 attempts / 60 s / 1024 entries). | n/a |
+| `void qihse_auth_shutdown_volume_limiter(void)` | Shut the volume limiter down. | n/a |
+| `bool qihse_auth_check_volume_limit(uint32_t source_ip)` | Check whether IP has exceeded the overall connection/attempt volume ceiling. | `false` when limited |
+| `void qihse_auth_volume_limit_reset(uint32_t source_ip)` | Reset volume limiter counters for an IP. | n/a |
+
+Password verifier cache:
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity)` | Configure PBKDF2 verifier cache TTL and capacity (defaults: 300 s / 256 entries). | n/a |
+| `void qihse_auth_cache_clear(void)` | Invalidate all cached password verifications. | n/a |
+| `void qihse_auth_cache_stats(uint64_t* out_hits, uint64_t* out_misses, uint64_t* out_stores)` | Retrieve cumulative cache hit, miss, and store metrics. | n/a |
+
 
 ---
 
@@ -966,6 +999,15 @@ Test: `tests/test_incremental_export.c` (`make test-incremental-export`).
 | `bool qihse_export_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq, char* err, size_t err_cap)` | The export-layer form of the delta ([§6](#6-key-value-store--includeqihse_kv_storeh)): the mutations strictly above the cursor, filtered at the KV layer, with the no-leak resume point. Unlike the raw KV form, this surface REFUSES a `NULL` user outright. | `false`, with `*out_records` `NULL` and nothing partially returned |
 | `bool qihse_export_tenant_user(qihse_kv_store_t* kv, qihse_blob_store_t* blobs, uint32_t tenant_id, qihse_user_t* user, const char* out_path, char* err, size_t err_cap)` | Whole-tenant export; a principal may only export its own tenant, `NULL` is denied. | `false` |
 
+### 8.12 Vector database classification access — `include/qihse_vector_db.h`
+
+Source: `src/broad_oak/qihse_vector_db.c`.
+Test: `tests/test_vector_db.c`, `tests/test_auth_privilege_boundary.c`.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_vector_db_get_vector_by_id_user(qihse_vector_db_t vdb, qihse_user_t* user, uint64_t vector_id, float* out_vector, size_t* out_dims)` | Retrieve a single vector by external ID with mandatory security-context enforcement. In default god-mode or when the principal satisfies clearance/SCI, returns vector float data and dimension count. Under opt-in security, unauthorized or low-clearance calls fail closed. | `false` (missing ID, insufficient clearance, or invalid user) |
+
 ---
 
 ## 9. Python SDK — `python/qihse/`
@@ -990,6 +1032,7 @@ reachable only from their module (`Container` in `python/qihse/core.py`,
 | `python/qihse/anchor.py` | `AnchorIndex` | `lower_bound`, `search` |
 | `python/qihse/hardware.py` | `HardwareProfiler`, `HardwareProfile` | `get_profile()` |
 | `python/qihse/controller.py` | `Controller`, `Watch`, `Reply`, the `Controller*Error` hierarchy, and the `MAX_BULK_BYTES`/`MAX_ARRAY_ITEMS`/`MAX_DEPTH` bounds | A synchronous stdlib-only RESP client for the `FEDERATION.*` controller surface, with explicit authentication, a bounded exact parser using the same limits as the C client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and resumable watches. Verified by `python/tests/test_controller_sdk.py` (59 tests, run by CI's `unittest discover`) |
+| `python/qihse/thermal.py` | `get_fleet_telemetry`, `collect_local_telemetry`, `publish_telemetry` | Fleet and node telemetry collection, fan speed, thermal zones, and Redis publishing (re-exported by `python/qihse/__init__.py`) |
 
 Selected method signatures:
 
@@ -1012,6 +1055,10 @@ EventStream.append(topic: str, payload: bytes) -> bool
 UWPServer.start(port, bind_address, kv=None, vdb=None, doc=None, tsdb=None,
                 tls_cert=None, tls_key=None) -> bool
 UWPClient.authenticate(username: str, password: str) -> None
+
+get_fleet_telemetry(redis_client=None) -> dict[str, dict]
+collect_local_telemetry() -> dict[str, float | str | int]
+publish_telemetry(redis_client, telemetry=None) -> None
 ```
 
 Failure behaviour is exception-based where the native call cannot express the

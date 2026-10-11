@@ -26,7 +26,16 @@ The build deliberately never requires an absolute home path.
 > [`tools.json`](tools.json). This index is the entry point — if a fact here
 > conflicts with prose below, this index wins and the prose needs fixing.
 
-### 0.1 Credentials (single source of truth)
+### 0.1 Credentials & Operating Modes (single source of truth)
+
+- **Default Single-User God-Mode (`auth_required == false`):**
+  By default, QIHSE operates in frictionless 1-user god-mode. User 0 (`GODMODE_OP`,
+  clearance `0xFFFF`, SCI compartments `0xFFFF`) is active without mandatory
+  password bootstrapping or authentication walls, allowing developers to build fast.
+- **Opt-In Security Mode (`auth_required == true`):**
+  When opt-in security is enabled (via `--require-auth` or explicit operator password
+  bootstrapping), network services require explicit authentication, tenant boundaries
+  are enforced, and low-clearance requests fail closed (`NOAUTH`/`NOPERM`).
 
 | What | Value / rule | Where it applies |
 |---|---|---|
@@ -38,7 +47,9 @@ The build deliberately never requires an absolute home path.
 | Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk (decision record: [auth_persistence.md](architecture/auth_persistence.md)) | all tools |
 
 Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is
-deliberately expensive. This is normal.
+deliberately expensive. This is normal. (Repeated authentications leverage the
+in-memory password verifier cache to reduce subsequent latency).
+
 
 ### 0.2 Tool index (task → command → credential)
 

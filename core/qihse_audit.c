@@ -202,6 +202,8 @@ static int g_signer_stop = 0;
  * first use.  If the thread cannot start, callers fall back to sync. */
 static void* audit_signer_main(void* arg);
 
+static void audit_register_atfork(void);
+
 static void audit_ensure_signer_locked(void) {
     if (!g_signer_started) {
         g_signer_stop = 0;
@@ -210,11 +212,62 @@ static void audit_ensure_signer_locked(void) {
             g_signer_started = 1;
         }
     }
+    audit_register_atfork();
     {
         static int atexit_registered = 0;
         if (!atexit_registered) { atexit_registered = 1; atexit(qihse_audit_shutdown); }
     }
 }
+
+/* ── fork safety ───────────────────────────────────────────────────────────
+ * The signer thread does not survive fork(): the child inherits a copy of
+ * the process with the signer thread GONE but every audit mutex frozen in
+ * whatever state the parent's threads left it — the first child action that
+ * logs (or drains the queue) then deadlocks on a mutex no surviving thread
+ * will ever release.  pthread_atfork handlers fence the signer around the
+ * fork and restart it fresh in the child, so a forked server (test harnesses
+ * fork per session; the cluster daemon forks workers) keeps a working audit
+ * path.  The child's queue is drained-to-nothing by design: entries queued
+ * pre-fork were signed and written by the PARENT's signer before the fence
+ * (prepare waits for the queue to empty), so nothing is lost and nothing is
+ * duplicated. */
+static void audit_atfork_prepare(void) {
+    pthread_mutex_lock(&audit_mutex);
+    /* Wait for the signer to drain the queue so pre-fork entries are on
+     * disk before the address space splits. */
+    while ((g_q_head || g_ping_pending) && g_signer_ok && !g_signer_stop) {
+        pthread_mutex_unlock(&audit_mutex);
+        usleep(1000);
+        pthread_mutex_lock(&audit_mutex);
+    }
+}
+
+static void audit_atfork_parent(void) {
+    pthread_mutex_unlock(&audit_mutex);
+}
+
+static void audit_atfork_child(void) {
+    /* The signer thread does not exist in the child: reset its bookkeeping
+     * so the next audit entry restarts it.  Mutexes are frozen-unlocked by
+     * the prepare fence above; the queue is empty (prepare drained it). */
+    g_q_head = NULL;
+    g_q_tail = NULL;
+    g_ping_pending = 0;
+    g_signer_tid = pthread_self(); /* mark invalid-ish; started flag drives */
+    g_signer_ok = 0;
+    g_signer_started = 0;
+    pthread_mutex_unlock(&audit_mutex);
+}
+
+static void audit_register_atfork(void) {
+    static int registered = 0;
+    if (!registered) {
+        registered = 1;
+        pthread_atfork(audit_atfork_prepare, audit_atfork_parent,
+                       audit_atfork_child);
+    }
+}
+
 static void send_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
 
 // CNSA 2.0: REAL SHA-384
