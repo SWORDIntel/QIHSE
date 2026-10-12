@@ -19,8 +19,8 @@ The build deliberately never requires an absolute home path.
 
 For the authenticated transaction bridge, `QIHSE.TXN.READ` routes through the
 leader and remains the application replay command. `QIHSE.TXN.READLOCAL`
-reads only the contacted member's committed prefix with the same principal
-and SCI checks. Its cursor is a local watermark; it must not be treated as a
+reads only the contacted member's committed prefix and requires an authenticated
+Operator principal. Its cursor is a local watermark; it must not be treated as a
 cluster-wide read or followed to another member. This recovery inspection
 command has not been exercised on a live daemon in this update.
 

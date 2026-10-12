@@ -1092,6 +1092,9 @@ static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
     if (qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
         qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL")) {
         bool local_read = qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL");
+        if (local_read && qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session,
+                                    "NOPERM node-local recovery read requires Operator");
         if (request->argc != 3u)
             return qihse_resp_wrong_arity(session,
                                           local_read ? "qihse.txn.readlocal" : "qihse.txn.read");
