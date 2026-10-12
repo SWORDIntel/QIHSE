@@ -17,6 +17,7 @@
 #include "qihse_system_guard.h"
 #include "qihse_quota.h"
 #include "qihse_blob.h"
+#include "qihse_consensus_mesh.h"
 #include "qihse_bundle.h"
 #include "qihse_task_queue.h"
 #include "qihse_task_worker.h"
@@ -123,6 +124,13 @@ typedef struct {
      * ("tenant-<id>-kem_pub.pem"); dsa_private_key_path signs manifests
      * (NULL = unsigned manifests). */
     qihse_blob_store_t* blobs;
+    /* Optional consensus transaction bridge. Commands fail closed unless
+     * both are supplied; mesh proposals and reads use session->user. */
+    qihse_consensus_mesh_t* consensus_mesh;
+    qihse_consensus_blob_context_t* consensus_blob_context;
+    /* Client proposals are separately gated per daemon. Keep false on a
+     * standby member until its emergency takeover is explicitly fenced. */
+    bool consensus_allow_client_proposals;
     const char* bundle_keys_dir;
     const char* bundle_dsa_private_key_path;
     /* U8: enable the fleet-wide "killswitch" channel — every authenticated

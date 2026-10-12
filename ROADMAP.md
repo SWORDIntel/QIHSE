@@ -9,11 +9,11 @@ Status marks: `[x]` implemented with repository evidence (source + build wiring 
 
 ## 1. Where we are now (verified against the working tree, 2026-10-09)
 
-### 1.5 W8 — I2P replica transport and durable KV handoff (implemented, 2026-10-09)
+### 1.5 Replica transport and durable KV handoff (implemented, 2026-10-09)
 
-W8 implementation and code-level regression gates are complete. Deployment
-through a real I2P network still needs a site-specific smoke test. W8 adds the
-QKP1-pinned, SOCKS5/I2P-only pull transport; operator-gated RESP
+The implementation and code-level regression gates are complete. Deployment
+through a configured SOCKS5 network still needs a site-specific smoke test.
+This work adds the QKP1-pinned SOCKS5 pull transport; operator-gated RESP
 replication commands; a read-only replica fence; metadata-preserving row apply;
 private snapshot transfer; and durable per-peer namespace cursors. The
 `test-replica-security` regression passes for KV-level low-clearance refusals,
@@ -34,15 +34,15 @@ install with leftover candidate, old SSTable, and WAL files. A test-only build
 of the KV store exits abruptly at seven installer durability boundaries; each
 restart checks whether the snapshot and cursor should be committed or absent.
 
-W8 validation gates:
+Replication validation gates:
 - [x] Live pinned QKP1 operator success and low-clearance denial, no protected
   bytes (`make test-replica-qkp`).
 - [x] Abrupt exit/restart at seven install image, intent, WAL, SSTable, cursor,
   marker, and journal-removal boundaries (`make test-replica-crash`).
 
-The code-level W8 validation gates are closed. A deployment smoke test through
-the configured real I2P/SOCKS network remains site-specific and was not run in
-this workspace; Cryptogramd EventStream integration is a separate open item.
+The code-level validation gates are closed. A deployment smoke test through
+the configured SOCKS5 network remains site-specific and was not run in this
+workspace. Application EventStream integration remains separate.
 
 ### 1.1 Landed and committed
 

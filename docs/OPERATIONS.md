@@ -364,16 +364,17 @@ Snapshot start now persists the source sequence as a per-peer baseline before
 releasing the consistent snapshot view. The source retains matching tombstones
 through compaction until `REPL.ACK` confirms the receiver has synced the applied
 rows and cursor. This closes the baseline-to-delta delete gap for the current
-KV transport. The W8 code-level gates are verified by `make test-replica-qkp`
-(operator success and low-clearance denial on a live pinned QKP1 session) and
+KV transport. The replication code-level gates are verified by
+`make test-replica-qkp` (operator success and low-clearance denial on a live
+pinned QKP1 session) and
 `make test-replica-crash` (abrupt exit and restart at seven install durability
 boundaries). Delta enumeration retains only the earliest rows fitting its row
 and byte budgets; the daemon pulls one row at a time, up to the KV value limit,
 over QKP1's framed stream. Before deploying a replica, run a site-specific
 smoke test through the configured real I2P/SOCKS network and verify peer
 convergence after restart; that network test was not run in this workspace.
-Cryptogramd's EventStream is not connected and remains a separate integration
-item; it is not used by this QIHSE KV replication path.
+Application EventStream consumers are separate integrations and are not used by
+this QIHSE KV replication path.
 
 ### 3.3 `qihse-redis-server`
 

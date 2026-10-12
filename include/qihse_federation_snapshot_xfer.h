@@ -34,6 +34,10 @@
  * remainder.  A BEGIN that does not match the persisted resume point is a
  * protocol error — the container changed mid-transfer and the receiver
  * must restart deliberately, not splice two containers together.
+ * Receiver ACKs follow fsync of destination bytes and fsync/rename/sync of
+ * the sidecar.  On restart, a malformed or ahead-of-file sidecar
+ * cannot silently turn into a fresh transfer; an unacknowledged destination
+ * tail is truncated back to the sidecar's durable offset.
  *
  * Security: both ends require a VERIFIED peer (the transport's
  * fingerprint gate — an unverified session may not carry state that holds
