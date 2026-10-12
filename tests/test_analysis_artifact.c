@@ -277,13 +277,16 @@ int main(void) {
     /* The signer is asynchronous. Drain it before checking fixture residue. */
     qihse_audit_shutdown();
 
-    /* The auth/audit fixture owns only these two files in its unique
+    /* The auth/audit fixture owns these three files in its unique
      * directory. Fail if future writes add residue without cleanup. */
     char path[sizeof(dir) + 32];
     int n = snprintf(path, sizeof(path), "%s/qihse_audit.log", dir);
     assert(n > 0 && (size_t)n < sizeof(path));
     assert(unlink(path) == 0 || errno == ENOENT);
     n = snprintf(path, sizeof(path), "%s/qihse_integrity.chain", dir);
+    assert(n > 0 && (size_t)n < sizeof(path));
+    assert(unlink(path) == 0 || errno == ENOENT);
+    n = snprintf(path, sizeof(path), "%s/qihse_audit.writer.lock", dir);
     assert(n > 0 && (size_t)n < sizeof(path));
     assert(unlink(path) == 0 || errno == ENOENT);
     assert(rmdir(dir) == 0);
