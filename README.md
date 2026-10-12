@@ -350,4 +350,4 @@ For deployment decisions, validate the exact subsystem you intend to use and rev
 
 ## License
 
-QIHSE is licensed under the **SWORD Restricted Source Licence (SRSL-1.0)**. See [LICENSE](LICENSE). Third-party components retain their own applicable licenses; see their individual notices.
+QIHSE is licensed under the **SWORD Restricted Source Licence (SRSL-1.0)**. Non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. See [LICENSE](LICENSE). Third-party components retain their own applicable licenses; see their individual notices.
