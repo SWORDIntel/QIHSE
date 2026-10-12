@@ -23,7 +23,6 @@ export default function LogView() {
   useEffect(() => {
     if (paused) return undefined;
     let cancelled = false;
-    let last = 0;
     const tick = async () => {
       const { status, body } = await apiGet('/log?limit=400', 5000);
       if (cancelled) return;

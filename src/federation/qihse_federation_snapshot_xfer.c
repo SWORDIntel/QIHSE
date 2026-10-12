@@ -198,15 +198,39 @@ typedef struct {
 } qsx_state_t;
 #pragma pack(pop)
 
-static bool state_load(const char* dest_path, qsx_state_t* st) {
+typedef enum { QSX_STATE_ABSENT, QSX_STATE_VALID, QSX_STATE_INVALID } qsx_state_status_t;
+
+/* Rename and unlink are not durable until the containing directory is
+ * synced.  Keep an acknowledged offset bound to a durable sidecar name. */
+static bool sync_parent(const char* path) {
+    const char* slash = strrchr(path, '/');
+    char* parent = NULL;
+    if (slash) {
+        size_t len = (size_t)(slash - path);
+        if (len == 0) len = 1; /* filesystem root */
+        parent = (char*)malloc(len + 1u);
+        if (!parent) return false;
+        memcpy(parent, path, len);
+        parent[len] = '\0';
+    }
+    int fd = open(parent ? parent : ".", O_RDONLY | O_DIRECTORY);
+    free(parent);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+static qsx_state_status_t state_load(const char* dest_path, qsx_state_t* st) {
     char path[512];
     qihse_snapshot_xfer_state_path(dest_path, path, sizeof(path));
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) return errno == ENOENT ? QSX_STATE_ABSENT : QSX_STATE_INVALID;
     bool ok = fread(st, sizeof(*st), 1u, f) == 1u &&
+              fgetc(f) == EOF && !ferror(f) &&
               st->magic == QSX_MAGIC && st->version == 1u;
-    fclose(f);
-    return ok;
+    if (fclose(f) != 0) ok = false;
+    return ok ? QSX_STATE_VALID : QSX_STATE_INVALID;
 }
 
 static bool state_save(const char* dest_path, const qsx_state_t* st) {
@@ -218,10 +242,14 @@ static bool state_save(const char* dest_path, const qsx_state_t* st) {
     if (fwrite(st, sizeof(*st), 1u, f) != 1u) { fclose(f); unlink(tmp); return false; }
     if (fflush(f) != 0) { fclose(f); unlink(tmp); return false; }
     int fd = fileno(f);
-    if (fd >= 0) (void)fsync(fd);
-    fclose(f);
+    bool synced = fd >= 0 && fsync(fd) == 0;
+    bool closed = fclose(f) == 0;
+    if (!synced || !closed) {
+        unlink(tmp);
+        return false;
+    }
     if (rename(tmp, path) != 0) { unlink(tmp); return false; }
-    return true;
+    return sync_parent(path);
 }
 
 /* ── sender ───────────────────────────────────────────────────────────── */
@@ -361,7 +389,8 @@ qihse_snapshot_xfer_result_t qihse_snapshot_xfer_fetch(
     uint32_t chunks_done = 0;
 
     if (out_offset) *out_offset = 0;
-    if (!t || !dest_path || (max_total != 0 && max_total > QIHSE_SNAPSHOT_XFER_MAX_TOTAL)) {
+    if (!t || !dest_path || strlen(dest_path) >= 507u ||
+        (max_total != 0 && max_total > QIHSE_SNAPSHOT_XFER_MAX_TOTAL)) {
         set_err(err, err_cap, "args");
         return QIHSE_SNAPSHOT_XFER_ERR_ARGS;
     }
@@ -374,7 +403,13 @@ qihse_snapshot_xfer_result_t qihse_snapshot_xfer_fetch(
     buf = (uint8_t*)malloc(QSX_PAYLOAD_CAP);
     if (!buf) { set_err(err, err_cap, "oom"); return QIHSE_SNAPSHOT_XFER_ERR_IO; }
 
-    resumed = state_load(dest_path, &st);
+    qsx_state_status_t state_status = state_load(dest_path, &st);
+    if (state_status == QSX_STATE_INVALID) {
+        set_err(err, err_cap, "invalid resume state; remove it deliberately to restart");
+        rc = QIHSE_SNAPSHOT_XFER_ERR_PROTOCOL;
+        goto done;
+    }
+    resumed = state_status == QSX_STATE_VALID;
     if (resumed) {
         if (st.total_len == 0 || st.total_len > max_total ||
             st.offset > st.total_len || st.chunk_size == 0 ||
@@ -385,6 +420,25 @@ qihse_snapshot_xfer_result_t qihse_snapshot_xfer_fetch(
         }
         f = fopen(dest_path, "r+b");
         if (!f) { set_err(err, err_cap, "resume: dest missing"); goto done; }
+        if (fseek(f, 0L, SEEK_END) != 0) {
+            set_err(err, err_cap, "resume: dest seek failed");
+            goto done;
+        }
+        long file_len = ftell(f);
+        if (file_len < 0 || (uint64_t)file_len < st.offset) {
+            set_err(err, err_cap, "resume: dest shorter than durable offset");
+            rc = QIHSE_SNAPSHOT_XFER_ERR_PROTOCOL;
+            goto done;
+        }
+        if ((uint64_t)file_len > st.offset) {
+            /* A crash may leave an unacknowledged tail.  Only the sidecar's
+             * synced prefix may be reused on the next transfer. */
+            if (ftruncate(fileno(f), (off_t)st.offset) != 0 ||
+                fsync(fileno(f)) != 0) {
+                set_err(err, err_cap, "resume: dest truncate failed");
+                goto done;
+            }
+        }
     } else {
         f = fopen(dest_path, "wb");
         if (!f) { set_err(err, err_cap, "dest create failed"); goto done; }
@@ -496,6 +550,10 @@ qihse_snapshot_xfer_result_t qihse_snapshot_xfer_fetch(
         offset += (uint64_t)data_len;
         received = offset;
         st.offset = offset;
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+            set_err(err, err_cap, "dest persist failed");
+            goto done;
+        }
         if (!state_save(dest_path, &st)) {
             set_err(err, err_cap, "resume state persist failed");
             goto done;
@@ -522,12 +580,24 @@ qihse_snapshot_xfer_result_t qihse_snapshot_xfer_fetch(
     if (fflush(f) != 0) { set_err(err, err_cap, "dest flush failed"); goto done; }
     {
         int fd = fileno(f);
-        if (fd >= 0) (void)fsync(fd);
+        if (fd < 0 || fsync(fd) != 0) {
+            set_err(err, err_cap, "dest persist failed");
+            goto done;
+        }
     }
+    if (fclose(f) != 0) {
+        f = NULL;
+        set_err(err, err_cap, "dest close failed");
+        goto done;
+    }
+    f = NULL;
     {
         char sidecar[512];
         qihse_snapshot_xfer_state_path(dest_path, sidecar, sizeof(sidecar));
-        (void)unlink(sidecar);
+        if (unlink(sidecar) != 0 || !sync_parent(sidecar)) {
+            set_err(err, err_cap, "resume state removal failed");
+            goto done;
+        }
     }
     if (out_offset) *out_offset = received;
     rc = QIHSE_SNAPSHOT_XFER_OK;

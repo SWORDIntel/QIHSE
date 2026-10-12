@@ -85,6 +85,10 @@ def _bind(lib: ctypes.CDLL):
     lib.qihse_qkp_recv_sealed.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                           ctypes.c_char_p, ctypes.c_size_t]
     lib.qihse_qkp_session_free.argtypes = [ctypes.c_void_p]
+    lib.qihse_qkp_client_session_is_replication_peer.restype = ctypes.c_bool
+    lib.qihse_qkp_client_session_is_replication_peer.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
 
 
 QIHSE_QKP_SECURE = 0
@@ -116,6 +120,13 @@ class QKPSession:
             raise QKPSealError(
                 f"sealed recv failed ({n}): crypto/replay refusal or dead fd")
         return buf.raw[:n]
+
+    def verify_peer(self, node_id: str, dsa_pub_path: str) -> bool:
+        """Require the exact signed QKP node label and pinned DSA key."""
+        if not node_id or not dsa_pub_path:
+            return False
+        return bool(self._lib.qihse_qkp_client_session_is_replication_peer(
+            self._handle, node_id.encode(), os.fsencode(dsa_pub_path)))
 
     def close(self) -> None:
         if self._handle:

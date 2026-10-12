@@ -92,6 +92,9 @@ typedef struct {
     uint64_t thresh;               /* snapshot_threshold all nodes open with */
     qihse_consensus_msg_t snap_msg; /* last SNAPSHOT message seen on the wire */
     bool snap_seen;
+    qihse_consensus_msg_t chunk_msg;
+    bool chunk_seen;
+    bool chunks_supported;
     /* Optional 6th node (index N in h_index) for ADD transitions; closed
      * and inert in every legacy scenario.  extra_down is its partition
      * switch; per-node drop[][] keeps governing the base five. */
@@ -109,6 +112,10 @@ static void h_send(void* transport, const qihse_consensus_msg_t* msg) {
         h->snap_msg = *msg; /* pristine copy for the tamper tests */
         h->snap_seen = true;
     }
+    if (msg->type == QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK) {
+        h->chunk_msg = *msg;
+        h->chunk_seen = true;
+    }
     if (h->msg_count == h->msg_cap) {
         size_t ncap = h->msg_cap ? h->msg_cap * 2u : QCAP_INIT;
         qihse_consensus_msg_t* nm = realloc(h->msgs, ncap * sizeof(*nm));
@@ -117,6 +124,12 @@ static void h_send(void* transport, const qihse_consensus_msg_t* msg) {
         h->msg_cap = ncap;
     }
     h->msgs[h->msg_count++] = *msg;
+}
+
+static bool h_snapshot_chunks_supported(void* opaque,
+                                        const qihse_uuid_t* peer) {
+    harness_t* h = (harness_t*)opaque;
+    return h && peer && h->chunks_supported;
 }
 
 static int h_index(const harness_t* h, const qihse_uuid_t* id) {
@@ -224,9 +237,8 @@ static void h_init_ex(harness_t* h, const char* seed, uint64_t snapshot_threshol
         snprintf(h->dir, sizeof(h->dir), "test_consensus_XXXXXX");
         assert(mkdtemp(h->dir));
     }
-    /* Isolate the audit chain/log per test so parallel aggregates never
-     * share root state. */
-    setenv("QIHSE_DATA_DIR", h->dir, 1);
+    /* Record files are isolated per case. The audit writer keeps the single
+     * process-wide data directory selected in main(). */
 
     for (size_t i = 0; i < N; i++) {
         char buf[96];
@@ -246,6 +258,8 @@ static void h_init_ex(harness_t* h, const char* seed, uint64_t snapshot_threshol
         cfg.election_timeout_spread_ms = 300u;
         cfg.heartbeat_interval_ms = 50u;
         cfg.snapshot_threshold = snapshot_threshold;
+        cfg.snapshot_chunks_supported = h_snapshot_chunks_supported;
+        cfg.snapshot_chunks_context = h;
         snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", h->recpath[i]);
         h->node[i] = qihse_consensus_open(&cfg, h, h_send);
         assert(h->node[i]);
@@ -1131,6 +1145,24 @@ static void test_invariant1_classified_access(qihse_user_t* op) {
     assert(out[1].classif == 3u);
     assert(memcmp(out[1].payload, "secret-payload", 14u) == 0);
 
+    /* A replication page must fail as a whole instead of advancing a cursor
+     * past a classified row. A one-entry page can still serve the preceding
+     * authorized row; the next page then fails closed. */
+    got = 99u;
+    memset(out, 0xA5, sizeof(out));
+    assert(!qihse_consensus_read_committed_exact(
+        h.node[leader], analyst, 1u, out, 4u, &got));
+    assert(got == 0u);
+    assert(out[0].payload[0] == 0u);
+    got = 0u;
+    assert(qihse_consensus_read_committed_exact(
+        h.node[leader], analyst, 1u, out, 1u, &got));
+    assert(got == 1u && out[0].index == 1u);
+    got = 99u;
+    assert(!qihse_consensus_read_committed_exact(
+        h.node[leader], analyst, 2u, out, 4u, &got));
+    assert(got == 0u);
+
     /* Analyst: the classified entry is withheld — never disclosed. */
     got = 0;
     memset(out, 0, sizeof(out));
@@ -1457,7 +1489,110 @@ static void test_compaction_churn(const qihse_user_t* op) {
            "compact/catch-up cycles across terms\n", (unsigned long long)total);
 }
 
-/* ── (j) Tampered / stale snapshots refused ──────────────────────────────── */
+/* ── Large compaction selects bounded snapshot chunks beyond legacy wire ── */
+
+static void test_snapshot_prefix_wire_bound(const qihse_user_t* op) {
+    harness_t h;
+    h_init_ex(&h, "wire-bound", 3u);
+    h.chunks_supported = true;
+
+    int leader = h_elect(&h);
+    assert(leader >= 0);
+    int lag = (leader + 2) % N;
+    t_sever(&h, lag);
+
+    const uint64_t total = QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES + 16u;
+    for (uint64_t i = 1u; i <= total; i++) {
+        char payload[40];
+        snprintf(payload, sizeof(payload), "wire-bound-%llu",
+                 (unsigned long long)i);
+        qihse_hlc_t hlc = {i * 10u, 0u};
+        assert(qihse_consensus_propose(h.node[leader], op, 9000u + i, hlc,
+                                        0u, 0u, payload, strlen(payload)));
+    }
+    assert(h_commit_reached_skip(&h, total, lag));
+    assert(qihse_consensus_snapshot_index(h.node[leader]) == total);
+
+    t_heal(&h);
+    for (unsigned i = 0u; i < 100u && !h.chunk_seen; i++) h_tick(&h, 10u);
+    assert(h.chunk_seen);
+    assert(h.chunk_msg.u.snapshot_chunk.total_entries == total);
+    assert(h.chunk_msg.u.snapshot_chunk.entry_count > 0u &&
+           h.chunk_msg.u.snapshot_chunk.entry_count <=
+               QIHSE_CONSENSUS_SNAPSHOT_CHUNK_MAX_ENTRIES);
+    h_free(&h);
+    printf("PASS large compaction: %llu-entry prefix persisted as S2 and "
+           "emitted as bounded chunks\n", (unsigned long long)total);
+}
+
+/* ── DATA entries require durable payload validation in production mode ── */
+
+typedef struct {
+    bool accept;
+} data_validator_state_t;
+
+static bool test_data_validator(void* opaque,
+                                const qihse_consensus_entry_t* entry) {
+    data_validator_state_t* state = (data_validator_state_t*)opaque;
+    return state && state->accept && entry && entry->payload_len == 5u &&
+           memcmp(entry->payload, "valid", 5u) == 0;
+}
+
+static void test_required_data_validator(const qihse_user_t* op) {
+    harness_t h;
+    h_init_ex(&h, "data-validator", 0u);
+    data_validator_state_t state = {true};
+    qihse_consensus_config_t cfg[N];
+    for (size_t i = 0; i < N; i++) {
+        qihse_consensus_close(h.node[i]);
+        h.node[i] = NULL;
+        memset(&cfg[i], 0, sizeof(cfg[i]));
+        snprintf(cfg[i].group_id, sizeof(cfg[i].group_id),
+                 "group/data-validator");
+        cfg[i].self = h.id[i];
+        cfg[i].member_count = N;
+        for (size_t j = 0; j < N; j++) cfg[i].members[j] = h.id[j];
+        cfg[i].election_timeout_base_ms = 150u;
+        cfg[i].election_timeout_spread_ms = 300u;
+        cfg[i].heartbeat_interval_ms = 50u;
+        cfg[i].require_data_validator = true;
+        cfg[i].validate_data = test_data_validator;
+        cfg[i].validate_data_context = &state;
+        snprintf(cfg[i].record_path, sizeof(cfg[i].record_path), "%s",
+                 h.recpath[i]);
+    }
+    qihse_consensus_config_t missing = cfg[0];
+    missing.validate_data = NULL;
+    missing.validate_data_context = NULL;
+    assert(qihse_consensus_open(&missing, &h, h_send) == NULL);
+    for (size_t i = 0; i < N; i++) {
+        h.node[i] = qihse_consensus_open(&cfg[i], &h, h_send);
+        assert(h.node[i]);
+    }
+
+    int leader = h_elect(&h);
+    assert(leader >= 0);
+
+    qihse_hlc_t hlc = {10000u, 0u};
+    assert(!qihse_consensus_propose(h.node[leader], op, 1u, hlc, 0u, 0u,
+                                    "other", 5u));
+    assert(qihse_consensus_last_log_index(h.node[leader]) == 0u);
+    assert(qihse_consensus_propose(h.node[leader], op, 1u, hlc, 0u, 0u,
+                                   "valid", 5u));
+    assert(h_commit_reached(&h, 1u));
+
+    /* Reopening a committed production DATA entry must revalidate its local
+     * durable payload and fail closed if that payload is no longer available. */
+    state.accept = false;
+    qihse_consensus_close(h.node[leader]);
+    h.node[leader] = NULL;
+    assert(qihse_consensus_open(&cfg[leader], &h, h_send) == NULL);
+    h_free(&h);
+    printf("PASS required DATA validator: mandatory config, proposal rejection, "
+           "and committed replay validation\n");
+}
+
+/* ── (j) Tampered, stale, and retransmitted snapshots ────────────────────── */
 
 static void test_snapshot_tamper_refused(void) {
     harness_t h;
@@ -1554,6 +1689,28 @@ static void test_snapshot_tamper_refused(void) {
     assert(qihse_consensus_snapshot_index(h.node[lag]) ==
            h.snap_msg.u.snapshot.last_included_index);
 
+    /* Simulate the sender retrying because the successful install ACK was
+     * lost. The exact same validated history must be acknowledged again;
+     * otherwise the sender keeps backing up and resending this snapshot. */
+    size_t queued_before_retry = h.msg_count;
+    qihse_consensus_receive(h.node[lag], &m);
+    bool retry_acked = false;
+    for (size_t i = queued_before_retry; i < h.msg_count; i++) {
+        const qihse_consensus_msg_t* reply = &h.msgs[i];
+        if (reply->type == QIHSE_CONSENSUS_MSG_SNAPSHOT_REPLY &&
+            qihse_uuid_equal(&reply->from, &h.id[lag]) &&
+            qihse_uuid_equal(&reply->to, &h.id[leader]) &&
+            reply->u.snapshot_reply.success &&
+            reply->u.snapshot_reply.match_index ==
+                m.u.snapshot.last_included_index) {
+            retry_acked = true;
+            break;
+        }
+    }
+    assert(retry_acked);
+    qihse_consensus_get_counters(h.node[lag], &after);
+    assert(after.snapshots_installed == before.snapshots_installed + 1u);
+
     /* And the group still converges after all the abuse. */
     t_heal(&h);
     bool converged = false;
@@ -1565,7 +1722,7 @@ static void test_snapshot_tamper_refused(void) {
 
     h_free(&h);
     printf("PASS (j) tampered digest/payload/count and stale-epoch snapshots "
-           "refused; counters increment; pristine installs; group converges\n");
+           "refused; exact retry re-ACKed; group converges\n");
 }
 
 /* ── (k) Snapshot persistence + crash-mid-compaction recovery ────────────── */
@@ -3803,6 +3960,8 @@ int main(void) {
     /* Log compaction / snapshot install scenarios. */
     test_snapshot_catchup(op);
     test_compaction_churn(op);
+    test_snapshot_prefix_wire_bound(op);
+    test_required_data_validator(op);
     test_snapshot_tamper_refused();
     test_snapshot_restart_and_crash(&hostile_self, op);
     test_decoder_hostile_snapshot(dir, &hostile_self);

@@ -32,6 +32,7 @@
  *     whole-store restore still refuses a delta container on purpose
  */
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_backup.h"
 #include "qihse_export.h"
 #include "qihse_kv_store.h"
@@ -421,6 +422,7 @@ static void test_persistence_round_trip(void) {
 
     /* Restart: destroy and recreate the store in the same data dir. */
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
     g_store = qihse_kv_store_create();
     assert(g_store);
 

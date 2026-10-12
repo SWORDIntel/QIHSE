@@ -3,7 +3,7 @@
 
 /* U1 — content-addressed object/blob tier for session-delivery workloads
  * (SESSION_DELIVERY_UPGRADES.md). Blobs are immutable, addressed by their
- * SHA-256, streamed to/from disk (never fully buffered by the store), and
+ * SHA-384, streamed to/from disk (never fully buffered by the store), and
  * bound to a tenant + class tag + classification/SCI at write time.
  *
  * SECURITY (AGENTS.md invariant #1): every operation takes an authenticated
@@ -31,7 +31,8 @@ typedef enum {
     QIHSE_BLOB_TAG_ENTITLEMENT_SEED  = 1,
     QIHSE_BLOB_TAG_PATTERN_BUNDLE    = 2,
     QIHSE_BLOB_TAG_SCRIPT_SET        = 3,
-    QIHSE_BLOB_TAG_COMMONS_SNAPSHOT  = 4
+    QIHSE_BLOB_TAG_COMMONS_SNAPSHOT  = 4,
+    QIHSE_BLOB_TAG_REPL_TRANSACTION  = 5 /* system Operator only */
 } qihse_blob_tag_t;
 
 typedef struct qihse_blob_store qihse_blob_store_t;
@@ -60,13 +61,24 @@ void qihse_blob_store_destroy(qihse_blob_store_t* store);
  * (tenant, tag, classif, sci) just bumps its refcount. A hash collision with
  * a DIFFERENT binding is refused — tenants cannot claim each other's blobs.
  * Commons-tagged blobs require a system-domain writer. out_hash receives the
- * SHA-256. */
+ * SHA-384 digest. */
 typedef int64_t (*qihse_blob_read_fn)(void* opaque, uint8_t* buffer, size_t capacity);
 bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
                          qihse_blob_tag_t tag, uint16_t classification,
                          uint16_t sci_compartment, qihse_user_t* user,
                          qihse_blob_read_fn read_fn, void* read_opaque,
                          uint8_t out_hash[QIHSE_BLOB_HASH_BYTES], uint64_t* out_size);
+
+/* Like put_user, but refuse a streamed object unless its complete SHA-384
+ * and byte length match the caller's declaration BEFORE the index is
+ * durably updated. Intended for authenticated replica payload import. */
+bool qihse_blob_put_expected_user(qihse_blob_store_t* store,
+                                  uint32_t tenant_id, qihse_blob_tag_t tag,
+                                  uint16_t classification,
+                                  uint16_t sci_compartment, qihse_user_t* user,
+                                  qihse_blob_read_fn read_fn, void* read_opaque,
+                                  const uint8_t expected_hash[QIHSE_BLOB_HASH_BYTES],
+                                  uint64_t expected_size);
 
 /* Convenience one-shot write of an in-memory buffer. */
 bool qihse_blob_put_buffer_user(qihse_blob_store_t* store, uint32_t tenant_id,
@@ -88,6 +100,21 @@ bool qihse_blob_size_user(qihse_blob_store_t* store, const uint8_t* hash,
  * Used by the bundle composer's sanity gate to verify a blob's binding. */
 bool qihse_blob_info_user(qihse_blob_store_t* store, const uint8_t* hash,
                           qihse_blob_info_t* out_info, qihse_user_t* user);
+
+/* Re-read a stored object and verify its size and SHA-384 digest against the
+ * indexed hash before a caller treats it as a durable replicated payload.
+ * This is a classified read: an explicit authorized principal is mandatory. */
+bool qihse_blob_verify_user(qihse_blob_store_t* store, const uint8_t* hash,
+                            qihse_user_t* user);
+
+/* Verify the complete object through one authorized file descriptor and
+ * return its indexed binding plus at most 256 leading bytes only on success.
+ * This lets a consensus validator check a transaction envelope against the
+ * same bytes whose SHA-384 was verified, without a second path-based read. */
+bool qihse_blob_verify_with_info_user(qihse_blob_store_t* store,
+                                      const uint8_t* hash, qihse_user_t* user,
+                                      qihse_blob_info_t* out_info,
+                                      uint8_t* out_prefix, size_t prefix_len);
 
 /* Pin/unpin: manifest references so GC (U6) cannot reap in-use blobs. */
 bool qihse_blob_ref_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);

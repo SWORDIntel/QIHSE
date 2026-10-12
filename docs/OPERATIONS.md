@@ -17,6 +17,13 @@ Repository rule that applies to everything here: paths in commands are
 relative to the repository root (`./qihse`, `make …`, `./qihse-cluster-daemon`).
 The build deliberately never requires an absolute home path.
 
+For the authenticated transaction bridge, `QIHSE.TXN.READ` routes through the
+leader and remains the application replay command. `QIHSE.TXN.READLOCAL`
+reads only the contacted member's committed prefix and requires an authenticated
+Operator principal. Its cursor is a local watermark; it must not be treated as a
+cluster-wide read or followed to another member. This recovery inspection
+command has not been exercised on a live daemon in this update.
+
 ---
 
 ## 0. Quick index — credentials and tools at a glance
@@ -364,15 +371,16 @@ Snapshot start now persists the source sequence as a per-peer baseline before
 releasing the consistent snapshot view. The source retains matching tombstones
 through compaction until `REPL.ACK` confirms the receiver has synced the applied
 rows and cursor. This closes the baseline-to-delta delete gap for the current
-KV transport. The W8 code-level gates are verified by `make test-replica-qkp`
-(operator success and low-clearance denial on a live pinned QKP1 session) and
+KV transport. The replication code-level gates are verified by
+`make test-replica-qkp` (operator success and low-clearance denial on a live
+pinned QKP1 session) and
 `make test-replica-crash` (abrupt exit and restart at seven install durability
 boundaries). Delta enumeration retains only the earliest rows fitting its row
 and byte budgets; the daemon pulls one row at a time, up to the KV value limit,
 over QKP1's framed stream. Before deploying a replica, run a site-specific
 smoke test through the configured real I2P/SOCKS network and verify peer
 convergence after restart; that network test was not run in this workspace.
-Cryptogramd's EventStream is not connected and remains a separate integration
+The external EventStream is not connected and remains a separate integration
 item; it is not used by this QIHSE KV replication path.
 
 ### 3.3 `qihse-redis-server`
@@ -529,13 +537,13 @@ knobs) is [API reference §11](API_REFERENCE.md#11-configuration-knobs).
   `rm -rf build/<prefix>_*` (safe — everything under `build/` is disposable)
   and re-run. (A retry was recently added to the `node_cap_records` teardown;
   older flakes may still surface elsewhere.)
-- **`[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode)`.**
-  Emitted by `core/qihse_audit.c` when a stale `qihse_integrity.chain` in the
-  working directory does not match the current state. Non-fatal by design in
-  the default development mode; delete the stale root-level
-  `qihse_integrity.chain` to silence it. Several `make` targets
-  (`test-e2e`, `test-omni`, `test-kv-read-integrity`) already remove it
-  before running.
+- **`[QIHSE AUDIT] Integrity chain mismatch detected`.** Preserve the audit
+  log, all rotated logs, and `qihse_integrity.chain` together before any
+  recovery action. A mismatch can indicate lost writes, a partial rotation,
+  or tampering. Do not delete the chain tip to silence the warning; inspect a
+  copy of the complete retained set and establish the last verified boundary
+  before restoring service. Disposable test directories may be reset only
+  when their audit history is explicitly out of scope.
 - (Resolved 2026-09-26: `make check` expected a stale upstream layout — the
   workflow checker now verifies current paths; `./qihse demo` runs end to end
   (native module exposed via `build/bin/qihse.so`, see [§3.1](#31-the-qihse-launcher-repository-root));

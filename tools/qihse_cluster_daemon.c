@@ -29,6 +29,9 @@
 #include "qihse_qkp.h"
 #include "qihse_machine_auth.h"
 #include "qihse_platform.h"
+#include "qihse_consensus_mesh.h"
+#include "qihse_consensus_rejoin_guard.h"
+#include "qihse_consensus_blob.h"
 #include <netdb.h>
 #include <fnmatch.h>
 #include <fcntl.h>
@@ -43,6 +46,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_PEERS 64u
@@ -151,17 +155,186 @@ static void usage(const char* argv0) {
         "  --brain-rollback-window seconds.\n"
         "\n  --replicate GLOB marks a sovereign-local namespace.\n"
         "  --replication-source-host DEST --replication-source-port PORT\n"
-        "  enables one-way QKP-protected I2P pull through local SOCKS\n"
-        "  (--replication-socks-port, default 4447); requires --replica-read-only.\n"
+        "  enables one-way QKP-protected replication. Default I2P uses local\n"
+        "  SOCKS (--replication-socks-port, default 4447); --replication-transport\n"
+        "  wireguard uses a private IPv4 mesh address. Both require --replica-read-only.\n"
         "  --replication-peer-node-id and --replication-peer-dsa-pub pin the\n"
-        "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n",
+        "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n"
+        "  --consensus-group ID --consensus-self UUID --consensus-member UUID\n"
+        "  (repeat for every voter) --consensus-listen-ip RFC1918-IP --consensus-port PORT\n"
+        "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (repeat for other voters)\n"
+        "  enables the durable QKP-pinned consensus mesh. Requires --dir and --pqc-require.\n"
+        "  --consensus-election-priority-delay-ms N delays this member's candidacy.\n"
+        "  --consensus-history-id SHA256 --consensus-writer-epoch N bind a new\n"
+        "  consensus record to one history and a durable fencing floor.\n"
+        "  --consensus-prefix-signer UUID enables a read-only signed exact-prefix\n"
+        "  challenge using an approved local federation node identity.\n"
+        "  --consensus-allow-client-proposals enables app writes on this member;\n"
+        "  omit on standby members except during a fenced emergency takeover.\n",
         argv0);
 }
 
-/* ── One-way, QKP-protected I2P replication puller ───────────────────────── */
+#define CONSENSUS_PEERS_MAX (QIHSE_CONSENSUS_MAX_MEMBERS - 1u)
+#define CONSENSUS_GROUP_ID_MAX QIHSE_CONSENSUS_GROUP_ID_MAX
+
+static bool parse_u16(const char* s, uint16_t* out);
+
+typedef struct {
+    qihse_consensus_mesh_peer_t mesh_peer;
+    char qkp_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
+    char dsa_public_key_path[512];
+    char wireguard_ipv4[64];
+} daemon_consensus_peer_t;
+
+typedef struct {
+    char group_id[CONSENSUS_GROUP_ID_MAX + 1u];
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
+    bool history_id_supplied;
+    bool writer_epoch_supplied;
+    qihse_uuid_t self;
+    qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    size_t member_count;
+    char listen_ipv4[64];
+    uint16_t port;
+    uint32_t election_priority_delay_ms;
+    daemon_consensus_peer_t peers[CONSENSUS_PEERS_MAX];
+    size_t peer_count;
+} daemon_consensus_options_t;
+
+static bool consensus_group_id_valid(const char* value) {
+    if (!value || !*value || !strcmp(value, ".") || !strcmp(value, "..") ||
+        strlen(value) > CONSENSUS_GROUP_ID_MAX) return false;
+    for (const unsigned char* p = (const unsigned char*)value; *p; p++)
+        if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+               (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' )) return false;
+    return true;
+}
+
+static bool consensus_history_id_parse(const char* value, uint8_t out[32]) {
+    if (!value || strlen(value) != 64u) return false;
+    for (size_t i = 0; i < 32u; i++) {
+        unsigned int high, low;
+        char a = value[2u * i], b = value[2u * i + 1u];
+        high = (a >= '0' && a <= '9') ? (unsigned int)(a - '0') :
+               (a >= 'a' && a <= 'f') ? (unsigned int)(a - 'a' + 10) :
+               (a >= 'A' && a <= 'F') ? (unsigned int)(a - 'A' + 10) : 16u;
+        low = (b >= '0' && b <= '9') ? (unsigned int)(b - '0') :
+              (b >= 'a' && b <= 'f') ? (unsigned int)(b - 'a' + 10) :
+              (b >= 'A' && b <= 'F') ? (unsigned int)(b - 'A' + 10) : 16u;
+        if (high > 15u || low > 15u) return false;
+        out[i] = (uint8_t)((high << 4u) | low);
+    }
+    return true;
+}
+
+static bool consensus_ipv4_private(const char* value) {
+    struct in_addr address;
+    if (!value || inet_pton(AF_INET, value, &address) != 1) return false;
+    uint32_t host = ntohl(address.s_addr);
+    return (host >> 24) == 10u ||
+           (host >> 20) == ((172u << 4) | 1u) ||
+           (host >> 16) == ((192u << 8) | 168u);
+}
+
+static bool parse_consensus_peer(char* value, daemon_consensus_options_t* out) {
+    if (!value || !out || out->peer_count >= CONSENSUS_PEERS_MAX) return false;
+    char* fields[5] = {0};
+    char* save = NULL;
+    size_t n = 0;
+    for (char* part = strtok_r(value, ":", &save); part; part = strtok_r(NULL, ":", &save)) {
+        if (n >= 5u) return false;
+        fields[n++] = part;
+    }
+    uint16_t port = 0;
+    daemon_consensus_peer_t* peer = &out->peers[out->peer_count];
+    if (n != 5u || !qihse_uuid_parse(fields[0], &peer->mesh_peer.member_uuid) ||
+        qihse_uuid_is_nil(&peer->mesh_peer.member_uuid) || !*fields[1] ||
+        strlen(fields[1]) > QIHSE_QKP_NODE_ID_LEN || !*fields[2] ||
+        fields[2][0] == '/' || strlen(fields[2]) >= sizeof(peer->dsa_public_key_path) ||
+        !*fields[3] || strlen(fields[3]) >= sizeof(peer->wireguard_ipv4) ||
+        !parse_u16(fields[4], &port) || port == 0u) return false;
+    snprintf(peer->qkp_node_id, sizeof(peer->qkp_node_id), "%s", fields[1]);
+    snprintf(peer->dsa_public_key_path, sizeof(peer->dsa_public_key_path), "%s", fields[2]);
+    snprintf(peer->wireguard_ipv4, sizeof(peer->wireguard_ipv4), "%s", fields[3]);
+    peer->mesh_peer.qkp_node_id = peer->qkp_node_id;
+    peer->mesh_peer.dsa_public_key_path = peer->dsa_public_key_path;
+    peer->mesh_peer.wireguard_ipv4 = peer->wireguard_ipv4;
+    peer->mesh_peer.port = port;
+    out->peer_count++;
+    return true;
+}
+
+static const char* consensus_options_error(const daemon_consensus_options_t* options,
+                                          const char* data_dir,
+                                          const char* qkp_node_id,
+                                          bool pqc_require,
+                                          bool replica_read_only,
+                                          bool replication_source) {
+    if (!options || !options->group_id[0]) return "missing group ID";
+    if (options->history_id_supplied != options->writer_epoch_supplied ||
+        (options->history_id_supplied &&
+         !qihse_consensus_history_identity_valid(
+            options->group_id, options->history_id,
+            options->writer_epoch_floor)))
+        return "history ID and writer epoch must be supplied together";
+    if (options->member_count < 3u || options->member_count > QIHSE_CONSENSUS_MAX_MEMBERS)
+        return "member count must be between 3 and the configured maximum";
+    if (options->peer_count + 1u != options->member_count)
+        return "peer count must be exactly member count minus one";
+    if (!options->port) return "consensus port is missing";
+    if (!consensus_ipv4_private(options->listen_ipv4)) return "listen address is not RFC1918 IPv4";
+    if (!data_dir || !*data_dir) return "--dir is required";
+    if (!qkp_node_id || !*qkp_node_id) return "--pqc-node-id is required";
+    if (!pqc_require) return "--pqc-require is required";
+    if (replica_read_only || replication_source) return "consensus cannot be combined with read-only replica pull";
+    bool self_found = false;
+    for (size_t i = 0; i < options->member_count; i++) {
+        if (qihse_uuid_equal(&options->members[i], &options->self)) self_found = true;
+        for (size_t j = i + 1u; j < options->member_count; j++)
+            if (qihse_uuid_equal(&options->members[i], &options->members[j]))
+                return "duplicate member UUID";
+    }
+    if (!self_found) return "self UUID is absent from the member set";
+    bool peer_member[QIHSE_CONSENSUS_MAX_MEMBERS] = {false};
+    for (size_t i = 0; i < options->peer_count; i++) {
+        const daemon_consensus_peer_t* peer = &options->peers[i];
+        if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &options->self))
+            return "peer list contains the local member";
+        if (!consensus_ipv4_private(peer->wireguard_ipv4))
+            return "peer address is not RFC1918 IPv4";
+        bool found = false;
+        for (size_t j = 0; j < options->member_count; j++) {
+            if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &options->members[j])) {
+                if (peer_member[j]) return "duplicate peer member UUID";
+                peer_member[j] = true;
+                found = true;
+            }
+        }
+        if (!found) return "peer UUID is absent from the member set";
+        if (!strcmp(peer->qkp_node_id, qkp_node_id)) return "peer reuses the local QKP node ID";
+        for (size_t j = i + 1u; j < options->peer_count; j++) {
+            const daemon_consensus_peer_t* other = &options->peers[j];
+            if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &other->mesh_peer.member_uuid))
+                return "duplicate peer member UUID";
+            if (!strcmp(peer->qkp_node_id, other->qkp_node_id))
+                return "duplicate peer QKP node ID";
+            if (!strcmp(peer->wireguard_ipv4, other->wireguard_ipv4) &&
+                peer->mesh_peer.port == other->mesh_peer.port)
+                return "duplicate peer endpoint";
+        }
+    }
+    for (size_t i = 0; i < options->member_count; i++)
+        if (!qihse_uuid_equal(&options->members[i], &options->self) && !peer_member[i])
+            return "a non-local voter has no peer endpoint";
+    return NULL;
+}
+
+/* ── One-way, QKP-protected replication puller ───────────────────────────── */
 #define REPL_AE_MAX_KEYS 10000u
 #define REPL_AE_GLOBS_MAX 64u
 #define REPL_AE_VALUE_MAX (16u * 1024u * 1024u)
+#define REPL_AE_SNAPSHOT_READ_MAX (512u * 1024u)
 
 typedef struct {
     int fd;
@@ -369,7 +542,8 @@ static bool mini_resp_read_exact(mini_resp_t* c, char* out, size_t len) {
 
 /* Execute a command. Replies:
  *   MINI_REP_SIMPLE: +line (buf holds payload) or -line (buf holds error)
- *   MINI_REP_BULK:   out_value = malloc'd string (NULL for nil)
+ *   MINI_REP_BULK:   out_value = malloc'd byte buffer (NULL for nil), with
+ *                    its exact length in out_value_len when requested
  *   MINI_REP_ARRAY:  out_items/out_count = malloc'd array of malloc'd strings
  *   MINI_REP_ERROR:  transport/protocol failure (c->err set) */
 #define MINI_REP_SIMPLE 1
@@ -384,8 +558,10 @@ static void mini_resp_free_array(char** items, size_t count) {
 }
 
 static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
-                        char** out_value, char*** out_items, size_t* out_count) {
+                        char** out_value, size_t* out_value_len,
+                        char*** out_items, size_t* out_count) {
     if (out_value) *out_value = NULL;
+    if (out_value_len) *out_value_len = 0u;
     if (out_items) *out_items = NULL;
     if (out_count) *out_count = 0;
     if (!mini_resp_send(c, argc, argv)) {
@@ -417,6 +593,7 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
         }
         v[len] = '\0';
         *out_value = v;
+        if (out_value_len) *out_value_len = (size_t)len;
         return MINI_REP_BULK;
     }
     if (line[0] == '*' && out_items && out_count) {
@@ -460,7 +637,7 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
 
 /* Fire-and-verify form for AUTH/SET: true on +OK. */
 static bool mini_resp_command(mini_resp_t* c, size_t argc, const char* const* argv) {
-    return mini_resp_do(c, argc, argv, NULL, NULL, NULL) == MINI_REP_SIMPLE && c->last[0] == '+';
+    return mini_resp_do(c, argc, argv, NULL, NULL, NULL, NULL) == MINI_REP_SIMPLE && c->last[0] == '+';
 }
 
 typedef struct {
@@ -471,9 +648,10 @@ typedef struct {
     const char* password;      /* operator password (borrowed) */
     const char* self_host;     /* bind address for loopback */
     uint16_t self_port;
-    const char* source_host;   /* operator-only I2P destination */
+    const char* source_host;   /* operator-only I2P destination or mesh address */
     uint16_t source_port;
     uint16_t socks_port;       /* local loopback i2pd SOCKS5 */
+    bool source_via_i2p;
     qihse_user_t* replica_principal;
     const qihse_qkp_config_t* qkp; /* required signed/sealed peer transport */
     const char* data_dir;
@@ -506,7 +684,7 @@ static bool fd_write_all(int fd, const char* data, size_t len) {
 static bool replica_snapshot_pull(ae_ctx_t* ae, mini_resp_t* source, const char* glob) {
     const char* begin_argv[3] = {"REPL.SNAPSHOT.BEGIN", glob, NULL};
     char** manifest = NULL; size_t manifest_count = 0u;
-    int reply = mini_resp_do(source, 2u, begin_argv, NULL, &manifest, &manifest_count);
+    int reply = mini_resp_do(source, 2u, begin_argv, NULL, NULL, &manifest, &manifest_count);
     uint64_t snapshot_size = 0u, source_seq = 0u;
     bool ok = reply == MINI_REP_ARRAY && manifest_count == 2u &&
         parse_u64_decimal(manifest[0], &snapshot_size) &&
@@ -545,15 +723,16 @@ static bool replica_snapshot_pull(ae_ctx_t* ae, mini_resp_t* source, const char*
     uint64_t offset = 0u;
     while (ok && offset < snapshot_size) {
         uint64_t request_len = snapshot_size - offset;
-        if (request_len > REPL_AE_VALUE_MAX) request_len = REPL_AE_VALUE_MAX;
+        if (request_len > REPL_AE_SNAPSHOT_READ_MAX) request_len = REPL_AE_SNAPSHOT_READ_MAX;
         char offset_buf[32], len_buf[32];
         snprintf(offset_buf, sizeof(offset_buf), "%llu", (unsigned long long)offset);
         snprintf(len_buf, sizeof(len_buf), "%llu", (unsigned long long)request_len);
         const char* read_argv[3] = {"REPL.SNAPSHOT.READ", offset_buf, len_buf};
         char* chunk = NULL;
-        reply = mini_resp_do(source, 3u, read_argv, &chunk, NULL, NULL);
-        ok = reply == MINI_REP_BULK && chunk && strlen(chunk) == (size_t)request_len &&
-             fd_write_all(fd, chunk, (size_t)request_len);
+        size_t chunk_len = 0u;
+        reply = mini_resp_do(source, 3u, read_argv, &chunk, &chunk_len, NULL, NULL);
+        ok = reply == MINI_REP_BULK && chunk && chunk_len == (size_t)request_len &&
+             fd_write_all(fd, chunk, chunk_len);
         free(chunk);
         if (ok) offset += request_len;
     }
@@ -584,7 +763,7 @@ static bool replica_pull_glob(ae_ctx_t* ae, mini_resp_t* source, const char* glo
          * bounded RESP delta reply. */
         const char* argv[4] = {"REPL.DELTA", glob, since_buf, "1"};
         char** fields = NULL; size_t field_count = 0u;
-        int reply = mini_resp_do(source, 4u, argv, NULL, &fields, &field_count);
+        int reply = mini_resp_do(source, 4u, argv, NULL, NULL, &fields, &field_count);
         if (reply != MINI_REP_ARRAY || field_count < 2u) {
             mini_resp_free_array(fields, field_count);
             return false;
@@ -655,8 +834,11 @@ static void* ae_main(void* argument) {
         size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, NULL, REPL_AE_GLOBS_MAX);
         if (glob_count == 0u) continue;
         mini_resp_t source;
-        int connected = mini_resp_connect_i2p(&source, ae->source_host, ae->source_port,
-            ae->socks_port, ae->qkp);
+        int connected = ae->source_via_i2p
+            ? mini_resp_connect_i2p(&source, ae->source_host, ae->source_port,
+                ae->socks_port, ae->qkp)
+            : mini_resp_connect_mode(&source, ae->source_host, ae->source_port,
+                ae->qkp, false, 0u);
         bool peer_ok = connected >= 0 && qihse_qkp_client_session_is_replication_peer(
             source.qkp, ae->qkp->replication_peer_node_id,
             ae->qkp->replication_peer_dsa_pub_path) && mini_resp_auth(&source, ae->password);
@@ -665,7 +847,7 @@ static void* ae_main(void* argument) {
             for (size_t i = 0; i < glob_count; i++)
                 qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
                     0u, 0u, UINT64_MAX, UINT64_MAX, false);
-            fprintf(stderr, "qihse-cluster-daemon: replica pull: I2P/QKP source connection or identity pin failed\n");
+            fprintf(stderr, "qihse-cluster-daemon: replica pull: protected source connection or identity pin failed\n");
             continue;
         }
         uint64_t total = 0u;
@@ -678,8 +860,8 @@ static void* ae_main(void* argument) {
             if (!ok) { all_ok = false; break; }
         }
         mini_resp_close(&source);
-        fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned I2P source (%s)\n",
-                (unsigned long long)total, all_ok ? "ok" : "stopped on error");
+        fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned %s source (%s)\n",
+                (unsigned long long)total, ae->source_via_i2p ? "I2P" : "WireGuard", all_ok ? "ok" : "stopped on error");
     }
     return NULL;
 }
@@ -779,6 +961,7 @@ int main(int argc, char** argv) {
     const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
     const char* pqc_node_id = NULL;
     const char* replication_source_host = NULL;
+    const char* replication_transport = "i2p";
     uint16_t replication_source_port = 0;
     uint16_t replication_socks_port = 4447;
     bool replica_read_only = false;
@@ -788,6 +971,13 @@ int main(int argc, char** argv) {
     size_t pqc_trusted_count = 0;
     bool pqc_require = false;
     bool pqc_degraded = false;            /* identity dir requested, keys missing */
+    daemon_consensus_options_t consensus_options;
+    memset(&consensus_options, 0, sizeof(consensus_options));
+    bool consensus_configured = false;
+    bool consensus_allow_client_proposals = false;
+    bool consensus_prefix_signer_configured = false;
+    qihse_uuid_t consensus_prefix_signer;
+    memset(&consensus_prefix_signer, 0, sizeof(consensus_prefix_signer));
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -882,6 +1072,10 @@ int main(int argc, char** argv) {
             if (!*replication_source_host || strlen(replication_source_host) > 255u) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-source-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &replication_source_port)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-transport") == 0 && i + 1 < argc) {
+            replication_transport = argv[++i];
+            if (strcmp(replication_transport, "i2p") != 0 &&
+                strcmp(replication_transport, "wireguard") != 0) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-socks-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &replication_socks_port) || replication_socks_port == 0u) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replica-read-only") == 0) {
@@ -902,6 +1096,62 @@ int main(int argc, char** argv) {
             unsigned long v = strtoul(argv[++i], &end, 10);
             if (errno != 0 || !end || *end || v > 86400u) return usage(argv[0]), 2;
             repl_interval = (uint32_t)v;
+        } else if (strcmp(a, "--consensus-group") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (!consensus_group_id_valid(argv[i + 1])) return usage(argv[0]), 2;
+            snprintf(consensus_options.group_id, sizeof(consensus_options.group_id), "%s", argv[++i]);
+        } else if (strcmp(a, "--consensus-self") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (!qihse_uuid_parse(argv[++i], &consensus_options.self) ||
+                qihse_uuid_is_nil(&consensus_options.self)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--consensus-member") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (consensus_options.member_count >= QIHSE_CONSENSUS_MAX_MEMBERS ||
+                !qihse_uuid_parse(argv[++i], &consensus_options.members[consensus_options.member_count]) ||
+                qihse_uuid_is_nil(&consensus_options.members[consensus_options.member_count])) return usage(argv[0]), 2;
+            consensus_options.member_count++;
+        } else if (strcmp(a, "--consensus-listen-ip") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (!*argv[i + 1] || strlen(argv[i + 1]) >= sizeof(consensus_options.listen_ipv4)) return usage(argv[0]), 2;
+            snprintf(consensus_options.listen_ipv4, sizeof(consensus_options.listen_ipv4), "%s", argv[++i]);
+        } else if (strcmp(a, "--consensus-port") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &consensus_options.port) || !consensus_options.port) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--consensus-election-priority-delay-ms") == 0 && i + 1 < argc) {
+            uint16_t delay_ms = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &delay_ms) ||
+                delay_ms > QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS)
+                return usage(argv[0]), 2;
+            consensus_options.election_priority_delay_ms = delay_ms;
+        } else if (strcmp(a, "--consensus-allow-client-proposals") == 0) {
+            consensus_allow_client_proposals = true;
+        } else if (strcmp(a, "--consensus-prefix-signer") == 0 && i + 1 < argc) {
+            if (consensus_prefix_signer_configured ||
+                !qihse_uuid_parse(argv[++i], &consensus_prefix_signer) ||
+                qihse_uuid_is_nil(&consensus_prefix_signer))
+                return usage(argv[0]), 2;
+            consensus_prefix_signer_configured = true;
+        } else if (strcmp(a, "--consensus-history-id") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (consensus_options.history_id_supplied) return usage(argv[0]), 2;
+            if (!consensus_history_id_parse(argv[++i], consensus_options.history_id))
+                return usage(argv[0]), 2;
+            consensus_options.history_id_supplied = true;
+        } else if (strcmp(a, "--consensus-writer-epoch") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (consensus_options.writer_epoch_supplied) return usage(argv[0]), 2;
+            if (!parse_u64_decimal(argv[++i],
+                                   &consensus_options.writer_epoch_floor) ||
+                consensus_options.writer_epoch_floor == 0)
+                return usage(argv[0]), 2;
+            consensus_options.writer_epoch_supplied = true;
+        } else if (strcmp(a, "--consensus-peer") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            char peer_arg[1200];
+            if (strlen(argv[i + 1]) >= sizeof(peer_arg)) return usage(argv[0]), 2;
+            snprintf(peer_arg, sizeof(peer_arg), "%s", argv[++i]);
+            if (!parse_consensus_peer(peer_arg, &consensus_options)) return usage(argv[0]), 2;
         } else if (strcmp(a, "--join") == 0 && i + 1 < argc) {
             if (seed_count >= 8u) return usage(argv[0]), 2;
             snprintf(seeds[seed_count++], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", argv[++i]);
@@ -947,16 +1197,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (consensus_allow_client_proposals && !consensus_configured) {
+        fprintf(stderr, "qihse-cluster-daemon: --consensus-allow-client-proposals requires a consensus mesh\n");
+        return 2;
+    }
+    if (consensus_prefix_signer_configured && !consensus_configured) {
+        fprintf(stderr, "qihse-cluster-daemon: --consensus-prefix-signer requires a consensus mesh\n");
+        return 2;
+    }
+
     const bool replication_configured = replication_source_host != NULL ||
         replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
     if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
         fprintf(stderr, "qihse-cluster-daemon: replication source host and port must be configured together\n");
         return 2;
     }
-    if (replication_source_host) {
+    if (replication_source_host && strcmp(replication_transport, "i2p") == 0) {
         size_t source_len = strlen(replication_source_host);
         if (source_len < 4u || strcasecmp(replication_source_host + source_len - 4u, ".i2p") != 0) {
             fprintf(stderr, "qihse-cluster-daemon: replication source must be an I2P destination name\n");
+            return 2;
+        }
+    }
+    if (replication_source_host && strcmp(replication_transport, "wireguard") == 0) {
+        struct in_addr address;
+        if (inet_pton(AF_INET, replication_source_host, &address) != 1) {
+            fprintf(stderr, "qihse-cluster-daemon: WireGuard replication source must be a private IPv4 address\n");
+            return 2;
+        }
+        uint32_t host_addr = ntohl(address.s_addr);
+        if (!((host_addr >> 24) == 10u ||
+              (host_addr >> 20) == ((172u << 4) | 1u) ||
+              (host_addr >> 16) == ((192u << 8) | 168u))) {
+            fprintf(stderr, "qihse-cluster-daemon: WireGuard replication source must be RFC1918 private IPv4\n");
             return 2;
         }
     }
@@ -971,11 +1244,15 @@ int main(int argc, char** argv) {
             operator_password = configured_password;
         }
     }
+    if (consensus_prefix_signer_configured && !operator_password) {
+        fprintf(stderr, "qihse-cluster-daemon: prefix challenges require authenticated RESP\n");
+        return 2;
+    }
 
     if (replication_source_host && (!replica_read_only || repl_glob_count != 1u ||
             repl_interval == 0u || !operator_password || !replication_peer_node_id ||
             !replication_peer_dsa_pub || !pqc_node_id)) {
-        fprintf(stderr, "qihse-cluster-daemon: I2P replica pull requires --replica-read-only, exactly one dedicated --replicate namespace, nonzero interval, operator password, stable --pqc-node-id, and a pinned upstream identity\n");
+        fprintf(stderr, "qihse-cluster-daemon: replica pull requires --replica-read-only, exactly one dedicated --replicate namespace, nonzero interval, operator password, stable --pqc-node-id, and a pinned upstream identity\n");
         return 2;
     }
     if (replication_configured && !pqc_node_id) {
@@ -983,6 +1260,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (replication_configured) pqc_require = true;
+    if (consensus_configured) {
+        const char* consensus_error = consensus_options_error(
+            &consensus_options, data_dir, pqc_node_id, pqc_require,
+            replica_read_only, replication_source_host != NULL);
+        if (consensus_error) {
+            fprintf(stderr, "qihse-cluster-daemon: invalid consensus mesh configuration: %s\n",
+                    consensus_error);
+            return 2;
+        }
+    }
 
     if (data_dir && *data_dir) {
         if (!mkdirs(data_dir)) {
@@ -1143,6 +1430,87 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    qihse_blob_store_t* consensus_blobs = NULL;
+    qihse_consensus_mesh_t* consensus_mesh = NULL;
+    qihse_consensus_blob_context_t consensus_blob_context;
+    memset(&consensus_blob_context, 0, sizeof(consensus_blob_context));
+    if (consensus_configured) {
+        char consensus_dir[1024], blob_dir[1100], record_path[1100];
+        char peer_pub_paths[CONSENSUS_PEERS_MAX][512];
+        const char* peer_trust[CONSENSUS_PEERS_MAX];
+        qihse_consensus_mesh_config_t mesh_cfg;
+        memset(&mesh_cfg, 0, sizeof(mesh_cfg));
+        if (snprintf(consensus_dir, sizeof(consensus_dir), "%s/consensus/%s", data_dir,
+                     consensus_options.group_id) >= (int)sizeof(consensus_dir) ||
+            snprintf(blob_dir, sizeof(blob_dir), "%s/blobs", consensus_dir) >= (int)sizeof(blob_dir) ||
+            snprintf(record_path, sizeof(record_path), "%s/consensus.log", consensus_dir) >= (int)sizeof(record_path) ||
+            !mkdirs(consensus_dir)) {
+            fprintf(stderr, "qihse-cluster-daemon: cannot prepare consensus data directory\n");
+            return 1;
+        }
+        if (snprintf(mesh_cfg.consensus.group_id, sizeof(mesh_cfg.consensus.group_id), "%s",
+                     consensus_options.group_id) >= (int)sizeof(mesh_cfg.consensus.group_id)) {
+            fprintf(stderr, "qihse-cluster-daemon: invalid consensus group configuration\n");
+            return 2;
+        }
+        mesh_cfg.consensus.self = consensus_options.self;
+        mesh_cfg.consensus.election_priority_delay_ms =
+            consensus_options.election_priority_delay_ms;
+        mesh_cfg.consensus.member_count = consensus_options.member_count;
+        memcpy(mesh_cfg.consensus.members, consensus_options.members,
+               consensus_options.member_count * sizeof(consensus_options.members[0]));
+        memcpy(mesh_cfg.consensus.history_id, consensus_options.history_id,
+               sizeof(mesh_cfg.consensus.history_id));
+        mesh_cfg.consensus.writer_epoch_floor =
+            consensus_options.writer_epoch_floor;
+        if (snprintf(mesh_cfg.consensus.record_path, sizeof(mesh_cfg.consensus.record_path),
+                     "%s", record_path) >= (int)sizeof(mesh_cfg.consensus.record_path)) {
+            fprintf(stderr, "qihse-cluster-daemon: consensus record path is too long\n");
+            return 2;
+        }
+        qihse_user_t* system_principal = qihse_auth_get_user(0u);
+        consensus_blobs = qihse_blob_store_create(blob_dir);
+        if (!system_principal || !consensus_blobs ||
+            !qihse_consensus_blob_context_init(&consensus_blob_context, consensus_blobs,
+                                               system_principal, consensus_options.group_id) ||
+            !qihse_consensus_blob_bind_config(&consensus_blob_context, &mesh_cfg.consensus)) {
+            fprintf(stderr, "qihse-cluster-daemon: consensus requires an active system Operator and durable blob store\n");
+            if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
+        mesh_cfg.qkp = pqc;
+        mesh_cfg.qkp.require = true;
+        mesh_cfg.qkp.node_id = pqc_node_id;
+        mesh_cfg.qkp.trusted_count = consensus_options.peer_count;
+        mesh_cfg.qkp.trusted_pubs = peer_trust;
+        mesh_cfg.system_principal = system_principal;
+        mesh_cfg.blob_context = &consensus_blob_context;
+        mesh_cfg.listen_wireguard_ipv4 = consensus_options.listen_ipv4;
+        mesh_cfg.listen_port = consensus_options.port;
+        mesh_cfg.peer_count = consensus_options.peer_count;
+        for (size_t i = 0; i < consensus_options.peer_count; i++) {
+            daemon_consensus_peer_t* peer = &consensus_options.peers[i];
+            if (snprintf(peer_pub_paths[i], sizeof(peer_pub_paths[i]), "%s/%s", data_dir,
+                         peer->dsa_public_key_path) >= (int)sizeof(peer_pub_paths[i]) ||
+                access(peer_pub_paths[i], R_OK) != 0) {
+                fprintf(stderr, "qihse-cluster-daemon: consensus peer DSA key is not readable under --dir\n");
+                qihse_blob_store_destroy(consensus_blobs);
+                return 1;
+            }
+            peer_trust[i] = peer_pub_paths[i];
+            peer->mesh_peer.dsa_public_key_path = peer_pub_paths[i];
+            mesh_cfg.peers[i] = peer->mesh_peer;
+        }
+        consensus_mesh = qihse_consensus_mesh_create(&mesh_cfg);
+        if (!consensus_mesh) {
+            fprintf(stderr, "qihse-cluster-daemon: consensus mesh configuration or durable state open failed\n");
+            qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
+        fprintf(stderr, "qihse-cluster-daemon: consensus mesh configured for group %s (%zu voters)\n",
+                consensus_options.group_id, consensus_options.member_count);
+    }
+
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
     config.store = store;
@@ -1160,6 +1528,31 @@ int main(int argc, char** argv) {
     config.enable_task_queue = false;
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
+    config.consensus_mesh = consensus_mesh;
+    config.consensus_blob_context = consensus_mesh ? &consensus_blob_context : NULL;
+    config.consensus_allow_client_proposals =
+        consensus_mesh && consensus_allow_client_proposals;
+    if (consensus_mesh && consensus_prefix_signer_configured) {
+        qihse_consensus_mesh_identity_t identity;
+        if (!qihse_consensus_mesh_history_identity(consensus_mesh, &identity)) {
+            fprintf(stderr, "qihse-cluster-daemon: prefix challenge history is unavailable\n");
+            qihse_consensus_mesh_destroy(consensus_mesh);
+            qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
+        qihse_consensus_prefix_expected_t* expected =
+            &config.consensus_prefix_expected;
+        memcpy(expected->group_id, identity.group_id,
+               sizeof(expected->group_id));
+        memcpy(expected->history_id, identity.history_id,
+               sizeof(expected->history_id));
+        expected->writer_epoch_floor = identity.writer_epoch_floor;
+        expected->member_uuid = consensus_options.self;
+        snprintf(expected->qkp_node_id, sizeof(expected->qkp_node_id),
+                 "%s", pqc_node_id);
+        expected->signer_node = consensus_prefix_signer;
+        config.consensus_prefix_challenge_enabled = true;
+    }
     config.cluster_migrate_password = operator_password;
     config.redundancy_peer = redundancy_peer;
     /* R4 replicated namespaces: must be set BEFORE server create — the
@@ -1217,6 +1610,15 @@ int main(int argc, char** argv) {
     if (!server) {
         fprintf(stderr, "qihse-cluster-daemon: server create failed (bind %s port %u): %s\n",
                 bind, port, strerror(errno));
+        if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
+        if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+        return 1;
+    }
+    if (consensus_mesh && !qihse_consensus_mesh_start(consensus_mesh)) {
+        fprintf(stderr, "qihse-cluster-daemon: consensus mesh listener/start failed\n");
+        qihse_consensus_mesh_destroy(consensus_mesh);
+        qihse_blob_store_destroy(consensus_blobs);
+        qihse_resp_server_destroy(server);
         return 1;
     }
     if (irc_server && irc_channel) {
@@ -1283,6 +1685,7 @@ int main(int argc, char** argv) {
         ae_ctx.source_host = replication_source_host;
         ae_ctx.source_port = replication_source_port;
         ae_ctx.socks_port = replication_socks_port;
+        ae_ctx.source_via_i2p = strcmp(replication_transport, "i2p") == 0;
         ae_ctx.replica_principal = qihse_auth_get_user(0u);
         ae_ctx.qkp = &pqc;
         ae_ctx.data_dir = data_dir;
@@ -1304,10 +1707,25 @@ int main(int argc, char** argv) {
             snprintf(join_ctx.seeds[i], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", seeds[i]);
         if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
     }
-    bool ok = qihse_resp_server_run(server);
+    /* Run the listener in its managed accept thread so the daemon's signal
+     * handler can drive an orderly stop. qihse_resp_server_run() owns its
+     * blocking accept loop and does not observe this process's g_stop flag,
+     * which otherwise makes systemd wait for SIGKILL at TimeoutStopSec. */
+    bool ok = qihse_resp_server_start(server);
+    if (ok) {
+        struct timespec wait = {0, 100000000L};
+        while (!g_stop) {
+            if (nanosleep(&wait, &wait) == 0) wait = (struct timespec){0, 100000000L};
+        }
+    }
     __atomic_store_n(&ae_stop, 1, __ATOMIC_RELEASE);
     if (ae_started) pthread_join(ae_thread, NULL); /* holds server: join before destroy */
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
+    if (consensus_mesh) {
+        qihse_consensus_mesh_stop(consensus_mesh);
+        qihse_consensus_mesh_destroy(consensus_mesh);
+        qihse_blob_store_destroy(consensus_blobs);
+    }
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
     if (fts) qihse_fts_destroy(fts); /* caller-owned: destroyed with the server */

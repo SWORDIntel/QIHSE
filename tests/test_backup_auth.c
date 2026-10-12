@@ -42,6 +42,7 @@
  *     closed by default)
  */
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_backup.h"
 #include "qihse_federation.h"
 #include "qihse_kv_store.h"
@@ -144,6 +145,9 @@ static bool dir_has_entry_containing(const char* dir, const char* needle) {
     bool found = false;
     struct dirent* entry;
     while (!found && (entry = readdir(d)) != NULL) {
+        if (strncmp(entry->d_name, "qihse_integrity.chain.tmp.",
+                    strlen("qihse_integrity.chain.tmp.")) == 0)
+            continue;
         if (strstr(entry->d_name, needle) != NULL) found = true;
     }
     closedir(d);
@@ -1081,10 +1085,9 @@ int main(void) {
     test_null_context_fails_closed();
 
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
 
-    /* The audit subsystem's signer thread may still be flushing the
-     * integrity chain into the data dir, so the removal is retried: the
-     * temp dir is repo-local build scratch and must not survive the run. */
+    /* Remove repo-local scratch only after the audit writer has drained. */
     char cmd[768];
     snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", g_dir);
     for (int attempt = 0; attempt < 5; attempt++) {

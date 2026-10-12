@@ -8,8 +8,9 @@ PYTHON_INCLUDES ?= $(shell python3-config --includes 2>/dev/null || pkg-config -
 PYTHON_LDFLAGS  ?= $(shell python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || pkg-config --libs python3 2>/dev/null || echo "-lpython3.13")
 
 INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
-CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(PYTHON_INCLUDES)
-CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3
+QIHSE_ARCH_FLAGS ?=
+CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS) $(PYTHON_INCLUDES)
+CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS)
 QIHSE_CFLAGS_EXTRA?=
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/frieze/qihse_column_store.c src/frieze/qihse_btree.c src/frieze/qihse_hash_index.c src/frieze/qihse_index_manager.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
             src/network_intelligence/bgp_route_probe.cpp src/network_intelligence/bgp_update_decoder.cpp src/network_intelligence/rpki_rtr_probe.cpp src/network_intelligence/rdap_probe.cpp src/network_intelligence/ptr_probe.cpp src/network_intelligence/route_helper.cpp \
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c src/tractable/qihse_index_scan.c src/tractable/qihse_txn.c src/tractable/qihse_mvcc.c src/tractable/qihse_wal.c src/tractable/qihse_recovery.c src/broad_oak/qihse_graph_store.c src/broad_oak/qihse_graph_ingest.c src/tractable/qihse_cypher_parser.c src/tractable/qihse_cypher_executor.c src/broad_oak/qihse_graph_algo.c src/broad_oak/qihse_graph_vector.c \
-            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
+            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_consensus_snapshot_stage.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
             vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c src/tractable/qihse_join_executor.c src/tractable/qihse_aggregate_executor.c src/tractable/qihse_sort_executor.c src/tractable/qihse_window_executor.c src/tractable/qihse_table_store.c src/tractable/qihse_schema.c src/tractable/qihse_optimizer.c src/tractable/qihse_optimizer_governance.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
@@ -107,6 +108,19 @@ SRCS_VFS = persistence/qihse_sqlite_vfs.c \
            persistence/qihse_vfs_wal.c
 
 SRCS_BASE += $(SRCS_VFS)
+SRCS_BASE += src/black_hole/qihse_analysis_artifact.c
+SRCS_BASE += src/federation/qihse_consensus_blob.c
+SRCS_BASE += src/federation/qihse_consensus_wire.c
+SRCS_BASE += src/federation/qihse_consensus_channel.c
+SRCS_BASE += src/federation/qihse_consensus_blob_channel.c
+SRCS_BASE += src/federation/qihse_consensus_mesh.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_attestation.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_attestation_adapter.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_point_challenge.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_pair.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_pair_nonce.c
+SRCS_BASE += src/federation/qihse_consensus_replay_verify.c
+SRCS_BASE += src/federation/qihse_consensus_rejoin_guard.c
 
 SRCS=$(SRCS_BASE)
 
@@ -494,6 +508,13 @@ test-backup-auth: lib
 test-controller-sdk-py: lib
 	PYTHONPATH=python LD_LIBRARY_PATH=. python3 -m unittest discover -s python/tests -p test_controller_sdk.py
 
+# KP14 canonical manifest and fail-closed candidate preflight; no durable write.
+test-kp14-artifact-contract: lib
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact tests/test_analysis_artifact.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact
+
+test: test-kp14-artifact-contract
+
 # W7 item 5: classification-preserving KEYSTONE feed over the wire.
 test-keystone-feed-wire: lib
 	$(CC) $(CFLAGS) -o tests/qihse_keystone_feed_fixture tests/qihse_keystone_feed_fixture.c -L. -lqihse $(LDFLAGS)
@@ -508,6 +529,26 @@ test-controller-qkp: lib
 test-consensus: lib
 	$(CC) $(CFLAGS) -o tests/test_consensus tests/test_consensus.c src/federation/qihse_consensus.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus
+
+test-consensus-wire: lib
+	$(CC) $(CFLAGS) -o tests/test_consensus_wire tests/test_consensus_wire.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_wire
+
+test-consensus-snapshot-stage: lib
+	$(CC) $(CFLAGS) -o tests/test_consensus_snapshot_stage tests/test_consensus_snapshot_stage.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_snapshot_stage
+
+test-consensus-channel: lib
+	$(CC) $(CFLAGS) -o tests/test_consensus_channel tests/test_consensus_channel.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_channel
+
+test-consensus-mesh: lib
+	$(CC) $(CFLAGS) -DQIHSE_CONSENSUS_MESH_TESTING -o tests/test_consensus_mesh tests/test_consensus_mesh.c src/federation/qihse_consensus_mesh.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_mesh
+
+test-consensus-blob-channel: lib
+	$(CC) $(CFLAGS) -o tests/test_consensus_blob_channel tests/test_consensus_blob_channel.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_blob_channel
 
 test-fed-sim: lib
 	$(CC) $(CFLAGS) -o tests/test_federation_sim tests/test_federation_sim.c -L. -lqihse $(LDFLAGS)
@@ -636,7 +677,7 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
+test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -648,7 +689,7 @@ test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-
 GOLD_PACK ?= tests/gold/pack.v1.gold
 GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^[:space:]]*\/[^[:space:]]*\).*/\1/p' $(GOLD_PACK) 2>/dev/null)
 
-test-gold: lib tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
+test-gold: lib cluster-daemon tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
 	LD_LIBRARY_PATH=. ./tests/gold/gold_runner $(GOLD_PACK)
 
 tests/gold/gold_runner: tests/gold/gold_runner.c libqihse.so

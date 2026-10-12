@@ -910,6 +910,10 @@ class Controller:
     re-establishes it, re-authenticates with the SAME explicit principal,
     re-opens every :class:`Watch` and resumes each from its last acked
     cursor.
+
+    For QKP connections, pass both ``qkp_expected_peer_node_id`` and
+    ``qkp_expected_peer_dsa_pub_path`` to require the exact signed server
+    identity before HELLO, AUTH, or any other RESP command is sent.
     """
 
     def __init__(
@@ -925,6 +929,8 @@ class Controller:
         qkp_identity_dir: str | None = None,
         qkp_trusted_pubs: "Sequence[str] | None" = None,
         qkp_node_id: str | None = None,
+        qkp_expected_peer_node_id: str | None = None,
+        qkp_expected_peer_dsa_pub_path: str | None = None,
     ):
         if not host:
             raise ControllerUsageError("host is required")
@@ -932,6 +938,18 @@ class Controller:
             raise ControllerUsageError(f"port {port} out of range")
         if protocol not in (2, 3):
             raise ControllerUsageError("protocol must be 2 or 3")
+        if (qkp_expected_peer_node_id is None) != (qkp_expected_peer_dsa_pub_path is None):
+            raise ControllerUsageError("QKP peer node ID and DSA public key path must be supplied together")
+        if qkp_expected_peer_node_id is not None:
+            if not qkp_identity_dir:
+                raise ControllerUsageError("QKP peer pinning requires qkp_identity_dir")
+            if (not isinstance(qkp_expected_peer_node_id, str)
+                    or not qkp_expected_peer_node_id
+                    or "\x00" in qkp_expected_peer_node_id
+                    or not isinstance(qkp_expected_peer_dsa_pub_path, str)
+                    or not qkp_expected_peer_dsa_pub_path
+                    or "\x00" in qkp_expected_peer_dsa_pub_path):
+                raise ControllerUsageError("QKP peer pin values must be nonempty strings without NUL bytes")
         if timeout_ms <= 0:
             timeout_ms = DEFAULT_TIMEOUT_MS
         self.host = host
@@ -946,6 +964,8 @@ class Controller:
         self.qkp_identity_dir = qkp_identity_dir
         self.qkp_trusted_pubs = list(qkp_trusted_pubs) if qkp_trusted_pubs else []
         self.qkp_node_id = qkp_node_id
+        self.qkp_expected_peer_node_id = qkp_expected_peer_node_id
+        self.qkp_expected_peer_dsa_pub_path = qkp_expected_peer_dsa_pub_path
         self._qkp_session = None
         self.pushes: list[Reply] = []      # RESP3 push messages received
         self._watches: list[Watch] = []
@@ -970,7 +990,7 @@ class Controller:
             return sock
         import struct as _struct
 
-        from .qkp import negotiate_client, QKPHandshakeError, QKPSealError
+        from .qkp import negotiate_client, QKPHandshakeError, QKPLibraryError, QKPSealError
 
         timeout_s = sock.gettimeout()
         if timeout_s is None or timeout_s <= 0:
@@ -1033,13 +1053,26 @@ class Controller:
                 identity_dir=self.qkp_identity_dir,
                 trusted_pubs=self.qkp_trusted_pubs,
                 node_id=self.qkp_node_id)
-        except QKPHandshakeError as exc:
+        except (QKPHandshakeError, QKPLibraryError) as exc:
             # Uniform error surface: callers see the SDK's connection
             # error, not the transport binding's class.  The fd is dead
             # either way.
             sock.close()
             raise ControllerConnectionError(
                 f"QKP handshake refused: {exc}") from exc
+        if self.qkp_expected_peer_node_id is not None:
+            try:
+                if not session.verify_peer(self.qkp_expected_peer_node_id,
+                                           self.qkp_expected_peer_dsa_pub_path):
+                    raise ControllerConnectionError("QKP peer identity does not match the configured pin")
+            except Exception as exc:
+                try:
+                    session.close()
+                finally:
+                    sock.close()
+                if isinstance(exc, ControllerConnectionError):
+                    raise
+                raise ControllerConnectionError("QKP peer identity verification failed") from exc
         self._qkp_session = session
         return _SealedSock(sock, session, timeout_s)
 
@@ -1104,6 +1137,7 @@ class Controller:
                 pass
         self._sock = None
         self._reader = None
+        self._qkp_session = None
         self._dead = True
 
     @property
