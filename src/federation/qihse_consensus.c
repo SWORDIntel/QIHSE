@@ -22,12 +22,15 @@
  */
 
 #include "qihse_consensus.h"
+#include "qihse_consensus_wire.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
@@ -108,10 +111,12 @@ static uint64_t qcs_digest_entry(uint64_t h, const qihse_consensus_entry_t* e) {
     return h;
 }
 
-static uint64_t qcs_snapshot_digest(const qihse_consensus_entry_t* entries,
-                                    size_t count) {
+uint64_t qihse_consensus_snapshot_entries_digest(
+    const qihse_consensus_entry_t* entries, size_t count) {
+    if (count > 0u && !entries) return 0u;
     uint64_t h = 0xCBF2CE48D222D25BULL;
     for (size_t i = 0; i < count; i++) {
+        if (entries[i].payload_len > QIHSE_CONSENSUS_PAYLOAD_MAX) return 0u;
         h = qcs_digest_entry(h, &entries[i]);
     }
     return h;
@@ -217,6 +222,7 @@ struct qihse_consensus {
     uint64_t next_index[QIHSE_CONSENSUS_MAX_MEMBERS];
     uint64_t match_index[QIHSE_CONSENSUS_MAX_MEMBERS];
     int self_index;
+    bool snapshot_peer_ready[QIHSE_CONSENSUS_MAX_MEMBERS];
     uint64_t self_hash;
 
     qihse_consensus_counters_t counters;
@@ -265,6 +271,24 @@ static const qihse_consensus_entry_t* qcs_entry_at(const qihse_consensus_t* cs,
         return &cs->snap.entries[index - 1u];
     }
     return &cs->log[index - (uint64_t)cs->snap.count - 1u];
+}
+
+static bool qcs_validate_data(const qihse_consensus_t* cs,
+                              const qihse_consensus_entry_t* entry) {
+    return entry && (entry->type != QIHSE_CONSENSUS_ENTRY_DATA ||
+           !cs->cfg.validate_data ||
+           cs->cfg.validate_data(cs->cfg.validate_data_context, entry));
+}
+
+static bool qcs_validate_data_range(const qihse_consensus_t* cs,
+                                    uint64_t first, uint64_t last) {
+    if (last < first) return true;
+    if (last > qcs_abs_last_index(cs)) return false;
+    if (!cs->cfg.validate_data) return true;
+    for (uint64_t index = first; index <= last; index++) {
+        if (!qcs_validate_data(cs, qcs_entry_at(cs, index))) return false;
+    }
+    return true;
 }
 
 static uint64_t qcs_term_at(const qihse_consensus_t* cs, uint64_t index) {
@@ -656,6 +680,24 @@ static bool qcs_persist_snapshot_begin(qihse_consensus_t* cs, uint64_t last_inde
     return qcs_record_append(cs, (size_t)n);
 }
 
+/* S2 is the versioned full-prefix transaction. Legacy S remains capped at
+ * SNAPSHOT_MAX_ENTRIES and is read unchanged; S2 uses the bounded streamed
+ * prefix limit while retaining the same append-only T swap point. */
+static bool qcs_persist_snapshot_begin_v2(
+    qihse_consensus_t* cs, uint64_t last_index, uint64_t last_term,
+    uint64_t epoch, uint64_t gen_hi, uint64_t digest, size_t count) {
+    int n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP,
+                     "S2 %llu %llu %llu %llu %016llx %llu",
+                     (unsigned long long)last_index,
+                     (unsigned long long)last_term,
+                     (unsigned long long)epoch,
+                     (unsigned long long)gen_hi,
+                     (unsigned long long)digest,
+                     (unsigned long long)count);
+    if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP) return false;
+    return qcs_record_append(cs, (size_t)n);
+}
+
 static bool qcs_persist_snapshot_entry(qihse_consensus_t* cs,
                                        const qihse_consensus_entry_t* e) {
     /* A config entry inside a snapshot transaction keeps its LC form —
@@ -677,6 +719,15 @@ static bool qcs_persist_snapshot_entry(qihse_consensus_t* cs,
                      (unsigned)e->classif, (unsigned)e->sci, hex);
     if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP) return false;
     return qcs_record_append(cs, (size_t)n);
+}
+
+static bool qcs_discard_pending_snapshot_tail(const char* path, off_t start) {
+    if (start < 0) return false;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = ftruncate(fd, start) == 0 && fsync(fd) == 0;
+    close(fd);
+    return ok;
 }
 
 /* ── Record file: decoding (fail closed) ───────────────────────────────────
@@ -748,6 +799,8 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
     uint64_t pend_run = 0;     /* digest recomputed over the SE stream */
     uint64_t pend_term_prev = 0, pend_gen_prev = 0;
     bool pend_active = false;
+    off_t pend_start = -1;
+    bool rollback_pending = false;
 
     *out_created = false;
 
@@ -765,7 +818,10 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
     line = malloc(QCS_RECORD_LINE_CAP + 1u);
     if (!line) goto done;
 
-    while (fgets(line, (int)(QCS_RECORD_LINE_CAP + 1u), f)) {
+    for (;;) {
+        off_t line_start = ftello(f);
+        if (line_start < 0) goto done;
+        if (!fgets(line, (int)(QCS_RECORD_LINE_CAP + 1u), f)) break;
         size_t len = strlen(line);
         if (len == 0u || line[len - 1u] != '\n') {
             /* Torn tail or overlong line: if more bytes follow it is an
@@ -778,6 +834,7 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             if (!more && pend_active) {
                 free(pend);
                 pend = NULL;
+                rollback_pending = true;
                 cs->term = cur_term;
                 cs->epoch = cur_epoch;
                 cs->has_vote = has_vote;
@@ -1045,7 +1102,8 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
                 last_entry_term = e.term;
                 last_gen = e.journal_generation;
             }
-        } else if (strcmp(tok, "S") == 0) {
+        } else if (strcmp(tok, "S") == 0 || strcmp(tok, "S2") == 0) {
+            bool version2 = strcmp(tok, "S2") == 0;
             if (pend_active) goto done; /* nested snapshot transaction */
             char* s_last = strtok_r(NULL, " ", &save);
             char* s_lterm = strtok_r(NULL, " ", &save);
@@ -1072,7 +1130,8 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
                 dig = (dig << 4) | (uint64_t)v;
             }
             if (last < 1u || cnt != last) goto done; /* contiguous 1..last */
-            if (cnt > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES) goto done;
+            if (cnt > (version2 ? QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES
+                                : QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES)) goto done;
             if (lterm < 1u || lterm > cur_term) goto done;
             if (ep < lterm || ep > cur_epoch) goto done; /* epoch fences */
             if (last <= (uint64_t)cs->snap.count) goto done; /* not newer */
@@ -1090,6 +1149,7 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             pend_term_prev = 0;
             pend_gen_prev = 0;
             pend_active = true;
+            pend_start = line_start;
         } else if (strcmp(tok, "SE") == 0) {
             if (!pend_active) goto done; /* SE outside an S transaction */
             if (pend_have >= pend_count) goto done; /* more than declared */
@@ -1199,6 +1259,7 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
                 /* commit never regresses and stays <= the (absolute) tail;
                  * a follower's installed snapshot may run ahead of the
                  * commit it had when it wrote the transaction. */
+                if (commit < pend_last_index) commit = pend_last_index;
             } else {
                 if (from < 1u || from > next_index) goto done; /* nothing to drop */
                 if (from <= (uint64_t)cs->snap.count) goto done; /* snapshot */
@@ -1238,6 +1299,7 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
          * transaction back — the uncompacted state above still stands. */
         free(pend);
         pend = NULL;
+        rollback_pending = true;
     }
 
     cs->term = cur_term;
@@ -1249,6 +1311,8 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
 
 done:
     if (f) fclose(f);
+    if (ok && rollback_pending &&
+        !qcs_discard_pending_snapshot_tail(path, pend_start)) ok = false;
     free(line);
     free(pend);
     /* Replay lands on the config of the LAST CONFIG ENTRY IN THE
@@ -1257,6 +1321,7 @@ done:
      * A history that folds to an invalid config (empty / oversized /
      * malformed) fails the whole load closed. */
     if (ok && !qcs_recompute_membership(cs)) ok = false;
+    if (ok && !qcs_validate_data_range(cs, 1u, cs->commit)) ok = false;
     if (!ok) {
         qcs_log_truncate(cs, 0u);
         free(cs->snap.entries);
@@ -1529,7 +1594,8 @@ static uint64_t qcs_election_timeout_ms(const qihse_consensus_t* cs,
     uint64_t bucket = self_index * spread / n;
     uint64_t jitter_range = spread / n ? spread / n : 1u;
     uint64_t jitter = qcs_splitmix64(cs->self_hash ^ (term * 0x9E3779B97F4A7C15ULL)) % jitter_range;
-    return cs->cfg.election_timeout_base_ms + bucket + jitter;
+    return cs->cfg.election_timeout_base_ms + bucket + jitter +
+           cs->cfg.election_priority_delay_ms;
 }
 
 static void qcs_send(qihse_consensus_t* cs, qihse_consensus_msg_t* m) {
@@ -1629,10 +1695,73 @@ static void qcs_start_election(qihse_consensus_t* cs) {
     }
 }
 
-/* A follower whose next-needed index has been compacted away gets the
- * snapshot instead of an append: one message carrying the whole compacted
- * prefix, over the same injected transport. */
-static void qcs_send_snapshot_to(qihse_consensus_t* cs, const qihse_uuid_t* to) {
+/* A follower whose next-needed index has been compacted away gets either a
+ * legacy whole-prefix SNAPSHOT or bounded chunks over the same transport. */
+static uint64_t qcs_snapshot_transfer_id(const qihse_consensus_t* cs) {
+    uint64_t id = cs->snap.digest ^
+        (cs->snap.last_included_index * UINT64_C(0x9E3779B97F4A7C15)) ^
+        cs->snap.epoch;
+    return id ? id : 1u;
+}
+
+static void qcs_send_snapshot_to(qihse_consensus_t* cs, const qihse_uuid_t* to,
+                                uint64_t first_index) {
+    if (cs->snap.count > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES) {
+        bool chunks_supported = cs->cfg.snapshot_chunks_supported &&
+            cs->cfg.snapshot_chunks_supported(cs->cfg.snapshot_chunks_context,
+                                               to);
+        if (!chunks_supported) {
+            /* Preserve leader contact with a legacy empty Append while
+             * refusing to send an oversized legacy SNAPSHOT. This keeps an
+             * old peer from campaigning during its deliberately gated
+             * catch-up; it remains behind until explicitly upgraded. */
+            qihse_consensus_msg_t heartbeat;
+            memset(&heartbeat, 0, sizeof(heartbeat));
+            heartbeat.type = QIHSE_CONSENSUS_MSG_APPEND;
+            heartbeat.to = *to;
+            heartbeat.u.append.leader_commit = 0u;
+            qcs_send(cs, &heartbeat);
+            return;
+        }
+        if (first_index == 0u || first_index > cs->snap.count) {
+            return;
+        }
+        int peer_index = qcs_member_index(cs, to);
+        if (peer_index >= 0 && !cs->snapshot_peer_ready[peer_index]) {
+            /* Bootstrap authenticated leader contact with a harmless empty
+             * Append at prefix zero before sending chunk data. */
+            qihse_consensus_msg_t probe;
+            memset(&probe, 0, sizeof(probe));
+            probe.type = QIHSE_CONSENSUS_MSG_APPEND;
+            probe.to = *to;
+            probe.u.append.leader_commit = cs->commit;
+            qcs_send(cs, &probe);
+            return;
+        }
+        qihse_consensus_msg_t chunk;
+        memset(&chunk, 0, sizeof(chunk));
+        chunk.type = QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK;
+        chunk.to = *to;
+        qihse_consensus_snapshot_chunk_t* c = &chunk.u.snapshot_chunk;
+        c->total_entries = cs->snap.count;
+        c->first_entry_index = first_index;
+        c->last_included_term = cs->snap.last_included_term;
+        c->snapshot_fencing_epoch = cs->snap.epoch;
+        c->journal_generation = cs->snap.journal_generation;
+        c->digest = cs->snap.digest;
+        c->transfer_id = qcs_snapshot_transfer_id(cs);
+        size_t available = cs->snap.count - (size_t)(first_index - 1u);
+        c->entry_count = available < QIHSE_CONSENSUS_SNAPSHOT_CHUNK_MAX_ENTRIES
+            ? available : QIHSE_CONSENSUS_SNAPSHOT_CHUNK_MAX_ENTRIES;
+        for (size_t i = 0u; i < c->entry_count; i++)
+            c->entries[i] = cs->snap.entries[(size_t)(first_index - 1u) + i];
+        uint64_t last = first_index + (uint64_t)c->entry_count - 1u;
+        c->final_chunk = last == c->total_entries;
+        c->chunk_digest = qihse_consensus_snapshot_chunk_digest(c);
+        qcs_send(cs, &chunk);
+        return;
+    }
+
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = QIHSE_CONSENSUS_MSG_SNAPSHOT;
@@ -1660,7 +1789,7 @@ static void qcs_send_append_from(qihse_consensus_t* cs, const qihse_uuid_t* to,
     /* The entry the log-matching check would anchor on has been compacted
      * on this leader: catch the peer up through the snapshot instead. */
     if (cs->snap.count > 0u && next - 1u < (uint64_t)cs->snap.count) {
-        qcs_send_snapshot_to(cs, to);
+        qcs_send_snapshot_to(cs, to, next);
         return;
     }
 
@@ -1734,6 +1863,7 @@ static void qcs_advance_commit(qihse_consensus_t* cs) {
             ok = ok && ack_weight_old >= old_total / 2u + 1u;
         }
         if (ok) {
+            if (!qcs_validate_data_range(cs, cs->commit + 1u, n)) return;
             uint64_t old = cs->commit;
             cs->commit = n;
             if (!qcs_persist_commit(cs)) {
@@ -1759,9 +1889,9 @@ static void qcs_advance_commit(qihse_consensus_t* cs) {
 /* ── Leader-side log compaction ────────────────────────────────────────────
  *
  * Trigger: the retained active log (last index − snapshot index) exceeds
- * cfg.snapshot_threshold entries.  Target: every committed entry, capped so
- * one snapshot transaction carries at most SNAPSHOT_MAX entries.  The
- * durable order is S header, SE line per compacted entry, T swap record —
+ * cfg.snapshot_threshold entries. Target: every committed entry. Large
+ * prefixes use versioned S2 records while smaller prefixes retain legacy S
+ * records. The durable order is S/S2 header, entry records, T swap record —
  * only after the T lands does the in-memory prefix disappear, so a crash at
  * any earlier point replays to the uncompacted state. */
 static void qcs_try_compact(qihse_consensus_t* cs) {
@@ -1775,9 +1905,15 @@ static void qcs_try_compact(qihse_consensus_t* cs) {
     if (tail - base <= cs->cfg.snapshot_threshold) return; /* under trigger */
 
     uint64_t target = cs->commit;
-    if (target - base > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES) {
-        target = base + QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES;
+    if (target > QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES) {
+        if (base >= QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES) return;
+        target = QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES;
     }
+    /* Snapshot messages carry the complete compacted prefix in a fixed
+     * array.  Do not let repeated compactions grow snap.count beyond that
+     * array and overflow qcs_send_snapshot_to(); the remaining active log
+     * can still replicate in ordinary append batches. */
+    if (target > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES) return;
     size_t new_count = (size_t)target;
 
     /* Build the new snapshot buffers FIRST; nothing observable changes
@@ -1789,12 +1925,16 @@ static void qcs_try_compact(qihse_consensus_t* cs) {
     }
     /* Active log position 0 is absolute index base + 1. */
     memcpy(entries + base, cs->log, (new_count - (size_t)base) * sizeof(*entries));
-    uint64_t digest = qcs_snapshot_digest(entries, new_count);
+    uint64_t digest = qihse_consensus_snapshot_entries_digest(entries, new_count);
     uint64_t last_term = entries[new_count - 1u].term;
     uint64_t gen_hi = entries[new_count - 1u].journal_generation;
 
-    if (!qcs_persist_snapshot_begin(cs, target, last_term, cs->epoch,
-                                    gen_hi, digest, new_count)) {
+    bool snapshot_started = new_count > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES
+        ? qcs_persist_snapshot_begin_v2(cs, target, last_term, cs->epoch,
+                                        gen_hi, digest, new_count)
+        : qcs_persist_snapshot_begin(cs, target, last_term, cs->epoch,
+                                     gen_hi, digest, new_count);
+    if (!snapshot_started) {
         free(entries);
         cs->rec_quarantined = true; /* trailing partial block must stay last */
         return; /* fail closed; a trailing partial block rolls back */
@@ -1874,6 +2014,7 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
                                         void* transport,
                                         qihse_consensus_send_fn send) {
     if (!cfg) return NULL;
+    if (cfg->require_data_validator && !cfg->validate_data) return NULL;
     if (!qcs_group_id_valid(cfg->group_id)) return NULL;
     if (!qcs_record_path_valid(cfg->record_path)) return NULL;
     if (cfg->member_count == 0u ||
@@ -1899,6 +2040,11 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
         return NULL;
     }
     if (cs->cfg.heartbeat_interval_ms >= cs->cfg.election_timeout_base_ms) {
+        free(cs);
+        return NULL;
+    }
+    if (cs->cfg.election_priority_delay_ms >
+        QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS) {
         free(cs);
         return NULL;
     }
@@ -2148,6 +2294,7 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
         cs->leader = cs->cfg.self;
         cs->has_leader = true;
         cs->counters.elections_won++;
+        memset(cs->snapshot_peer_ready, 0, sizeof(cs->snapshot_peer_ready));
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
             cs->next_index[i] = qcs_abs_last_index(cs) + 1u;
             cs->match_index[i] = 0u;
@@ -2209,13 +2356,8 @@ static void qcs_handle_append(qihse_consensus_t* cs,
         return;
     }
 
-    cs->role = QIHSE_CONSENSUS_FOLLOWER; /* same-term candidate steps down */
-    cs->leader = msg->from;
-    cs->has_leader = true;
-    cs->last_leader_contact_ms = cs->now_ms;
-
-    /* Log matching: the predecessor entry must agree exactly, whether it
-     * lives in the snapshot or at the head of the active log. */
+    /* Reject an impossible prefix and malformed indices before invoking a
+     * validator that may stream an entire local blob. */
     uint64_t abs_last = qcs_abs_last_index(cs);
     if (prev > abs_last) {
         qcs_reply_append(cs, &msg->from, false, abs_last);
@@ -2225,6 +2367,29 @@ static void qcs_handle_append(qihse_consensus_t* cs,
         qcs_reply_append(cs, &msg->from, false, prev - 1u);
         return;
     }
+
+    /* Preflight the entire incoming batch before a conflicting suffix can
+     * be truncated. Recheck our uncommitted prefix before vouching for it. */
+    for (size_t i = 0; i < msg->u.append.entry_count; i++) {
+        const qihse_consensus_entry_t* e = &msg->u.append.entries[i];
+        if (prev > UINT64_MAX - (uint64_t)i - 1u ||
+            e->index != prev + (uint64_t)i + 1u ||
+            e->payload_len > QIHSE_CONSENSUS_PAYLOAD_MAX ||
+            !qcs_validate_data(cs, e)) {
+            qcs_reply_append(cs, &msg->from, false, qcs_abs_last_index(cs));
+            return;
+        }
+    }
+    if (prev > cs->commit &&
+        !qcs_validate_data_range(cs, cs->commit + 1u, prev)) {
+        qcs_reply_append(cs, &msg->from, false, cs->commit);
+        return;
+    }
+
+    cs->role = QIHSE_CONSENSUS_FOLLOWER; /* same-term candidate steps down */
+    cs->leader = msg->from;
+    cs->has_leader = true;
+    cs->last_leader_contact_ms = cs->now_ms;
 
     uint64_t idx = prev;
     bool config_touched = false; /* a config entry appended or a suffix dropped */
@@ -2313,6 +2478,10 @@ static void qcs_handle_append(qihse_consensus_t* cs,
     uint64_t new_commit = msg->u.append.leader_commit;
     if (new_commit > qcs_abs_last_index(cs)) new_commit = qcs_abs_last_index(cs);
     if (new_commit > cs->commit) {
+        if (!qcs_validate_data_range(cs, cs->commit + 1u, new_commit)) {
+            qcs_reply_append(cs, &msg->from, false, cs->commit);
+            return;
+        }
         uint64_t old = cs->commit;
         cs->commit = new_commit;
         if (!qcs_persist_commit(cs)) {
@@ -2353,6 +2522,9 @@ static void qcs_handle_append_reply(qihse_consensus_t* cs,
     }
 
     if (success) {
+        if (match_index == 0u &&
+            cs->snap.count > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES)
+            cs->snapshot_peer_ready[from] = true;
         if (match_index > cs->match_index[from]) {
             cs->match_index[from] = match_index;
         }
@@ -2428,11 +2600,18 @@ static void qcs_handle_snapshot(qihse_consensus_t* cs,
         return;
     }
     /* Recompute the digest — never trust the wire's claim. */
-    if (qcs_snapshot_digest(msg->u.snapshot.entries, count) !=
+    if (qihse_consensus_snapshot_entries_digest(msg->u.snapshot.entries, count) !=
         msg->u.snapshot.digest) {
         cs->counters.snapshot_rejections++;
         qcs_send_reply_snapshot(cs, &r, false, qcs_abs_last_index(cs));
         return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!qcs_validate_data(cs, &msg->u.snapshot.entries[i])) {
+            cs->counters.snapshot_rejections++;
+            qcs_send_reply_snapshot(cs, &r, false, qcs_abs_last_index(cs));
+            return;
+        }
     }
     /* Pre-check the membership fold (base + this snapshot's config
      * entries; the install discards the whole log): a hostile snapshot
@@ -2459,11 +2638,32 @@ static void qcs_handle_snapshot(qihse_consensus_t* cs,
             return;
         }
     }
-    /* Nothing to learn: we already hold it committed, or an equal/newer
-     * snapshot.  Not an anomaly — the leader re-sent; answer with our own
-     * match so replication resumes past it. */
+    /* The leader may be retransmitting because our previous snapshot ACK
+     * was lost.  A negative reply here makes the leader back up toward the
+     * same snapshot again, so acknowledge the boundary only when our
+     * committed prefix is byte-for-byte the same history.  Keep the normal
+     * validation above (including epoch, digest, DATA/classification/SCI
+     * validation) before treating this as an idempotent install. */
     if (last <= cs->commit || last <= (uint64_t)cs->snap.count) {
-        qcs_send_reply_snapshot(cs, &r, false, qcs_abs_last_index(cs));
+        bool identical = true;
+        for (size_t i = 0; i < count; i++) {
+            const qihse_consensus_entry_t* local = qcs_entry_at(cs, (uint64_t)i + 1u);
+            const qihse_consensus_entry_t* incoming = &msg->u.snapshot.entries[i];
+            if (!local || local->index != incoming->index ||
+                !qcs_entry_identical(local, incoming)) {
+                identical = false;
+                break;
+            }
+        }
+        if (identical) {
+            cs->role = QIHSE_CONSENSUS_FOLLOWER;
+            cs->leader = msg->from;
+            cs->has_leader = true;
+            cs->last_leader_contact_ms = cs->now_ms;
+            qcs_send_reply_snapshot(cs, &r, true, last);
+        } else {
+            qcs_send_reply_snapshot(cs, &r, false, qcs_abs_last_index(cs));
+        }
         return;
     }
 
@@ -2519,6 +2719,7 @@ static void qcs_handle_snapshot(qihse_consensus_t* cs,
     cs->snap.journal_generation = msg->u.snapshot.journal_generation;
     cs->snap.digest = msg->u.snapshot.digest;
     cs->log_len = 0u; /* the old log is discarded whole, never half */
+    if (cs->commit < last) cs->commit = last;
     cs->counters.snapshots_installed++;
     /* The installed prefix may carry config entries: re-derive the
      * effective config from the new log state (digest-validated entries,
@@ -2526,6 +2727,139 @@ static void qcs_handle_snapshot(qihse_consensus_t* cs,
     (void)qcs_recompute_membership(cs);
 
     qcs_send_reply_snapshot(cs, &r, true, last);
+}
+
+bool qihse_consensus_install_snapshot_prefix(
+    qihse_consensus_t* cs, const qihse_user_t* user,
+    const qihse_consensus_snapshot_descriptor_t* d,
+    const qihse_consensus_entry_t* entries, size_t count) {
+    if (!cs || !d || !entries || !qihse_auth_user_is_active(user) ||
+        qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR || count == 0u ||
+        count > QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES ||
+        count != d->last_included_index ||
+        strcmp(d->group_id, cs->cfg.group_id) != 0 ||
+        !qihse_uuid_equal(&d->to, &cs->cfg.self) ||
+        qcs_member_index(cs, &d->from) < 0 ||
+        qihse_uuid_is_nil(&d->from) || qihse_uuid_is_nil(&d->to) ||
+        d->term < cs->term || d->fencing_epoch < cs->epoch ||
+        d->fencing_epoch < d->term ||
+        d->snapshot_fencing_epoch < d->last_included_term ||
+        d->snapshot_fencing_epoch > d->fencing_epoch ||
+        d->last_included_term == 0u || d->last_included_term > d->term ||
+        d->journal_generation == 0u) return false;
+
+    uint64_t prev_term = 0u, prev_gen = 0u;
+    qihse_uuid_t folded[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint8_t folded_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
+    uint16_t folded_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
+    size_t fcount = cs->base_count;
+    memcpy(folded, cs->base_members, fcount * sizeof(*folded));
+    memcpy(folded_roles, cs->base_roles, fcount);
+    memcpy(folded_weights, cs->base_weights, fcount * sizeof(*folded_weights));
+    bool over = false;
+    for (size_t i = 0u; i < count; i++) {
+        const qihse_consensus_entry_t* e = &entries[i];
+        if (e->index != (uint64_t)i + 1u || e->term > d->last_included_term ||
+            e->term < prev_term || e->journal_generation == 0u ||
+            (i && e->journal_generation <= prev_gen) ||
+            e->payload_len > QIHSE_CONSENSUS_PAYLOAD_MAX ||
+            e->type < QIHSE_CONSENSUS_ENTRY_DATA ||
+            e->type > QIHSE_CONSENSUS_ENTRY_CONFIG_JOINT_END ||
+            !qihse_auth_can_access(user, e->classif, e->sci) ||
+            !qcs_config_entry_valid(e) || !qcs_validate_data(cs, e)) return false;
+        if (e->type != QIHSE_CONSENSUS_ENTRY_DATA)
+            qcs_fold_apply(folded, folded_roles, folded_weights, &fcount,
+                           e, &over);
+        if (over || fcount < 1u || fcount > QIHSE_CONSENSUS_MAX_MEMBERS)
+            return false;
+        prev_term = e->term;
+        prev_gen = e->journal_generation;
+    }
+    if (prev_term != d->last_included_term ||
+        prev_gen != d->journal_generation ||
+        qihse_consensus_snapshot_entries_digest(entries, count) != d->digest)
+        return false;
+
+    qihse_consensus_t candidate = *cs;
+    candidate.snap.entries = (qihse_consensus_entry_t*)entries;
+    candidate.snap.count = candidate.snap.cap = count;
+    candidate.snap.last_included_index = d->last_included_index;
+    candidate.snap.last_included_term = d->last_included_term;
+    candidate.snap.epoch = d->snapshot_fencing_epoch;
+    candidate.snap.journal_generation = d->journal_generation;
+    candidate.snap.digest = d->digest;
+    candidate.log_len = 0u;
+    if (candidate.commit < d->last_included_index)
+        candidate.commit = d->last_included_index;
+    qcs_fold_t candidate_fold;
+    if (!qcs_fold_full(&candidate, UINT64_MAX, NULL, &candidate_fold))
+        return false;
+
+    if (d->last_included_index <= cs->commit ||
+        d->last_included_index <= (uint64_t)cs->snap.count) {
+        for (size_t i = 0u; i < count; i++) {
+            const qihse_consensus_entry_t* old = qcs_entry_at(cs, (uint64_t)i + 1u);
+            if (!old || !qcs_entry_identical(old, &entries[i])) return false;
+        }
+        if (!qcs_sync_term_epoch(cs, d->term, d->fencing_epoch, false))
+            return false;
+        cs->role = QIHSE_CONSENSUS_FOLLOWER;
+        cs->leader = d->from;
+        cs->has_leader = true;
+        return true;
+    }
+
+    qihse_consensus_entry_t* copy = malloc(count * sizeof(*copy));
+    if (!copy) return false;
+    memcpy(copy, entries, count * sizeof(*copy));
+
+    /* Adopt the sender's newer term/fencing floor before writing the snapshot
+     * transaction. A crash here retains the old log with only a higher term. */
+    if (!qcs_sync_term_epoch(cs, d->term, d->fencing_epoch, false)) {
+        free(copy);
+        return false;
+    }
+    if (!qcs_persist_snapshot_begin_v2(cs, d->last_included_index,
+            d->last_included_term, d->snapshot_fencing_epoch,
+            d->journal_generation, d->digest, count)) {
+        cs->rec_quarantined = true;
+        free(copy);
+        return false;
+    }
+    for (size_t i = 0u; i < count; i++) {
+        if (!qcs_persist_snapshot_entry(cs, &copy[i])) {
+            cs->rec_quarantined = true;
+            free(copy);
+            return false;
+        }
+    }
+    if (!qcs_persist_truncate(cs, d->last_included_index + 1u)) {
+        cs->rec_quarantined = true;
+        free(copy);
+        return false;
+    }
+
+    free(cs->snap.entries);
+    memset(&cs->snap, 0, sizeof(cs->snap));
+    cs->snap.entries = copy;
+    cs->snap.cap = cs->snap.count = count;
+    cs->snap.last_included_index = d->last_included_index;
+    cs->snap.last_included_term = d->last_included_term;
+    cs->snap.epoch = d->snapshot_fencing_epoch;
+    cs->snap.journal_generation = d->journal_generation;
+    cs->snap.digest = d->digest;
+    cs->log_len = 0u;
+    if (cs->commit < d->last_included_index)
+        cs->commit = d->last_included_index;
+    cs->role = QIHSE_CONSENSUS_FOLLOWER;
+    cs->leader = d->from;
+    cs->has_leader = true;
+    if (!qcs_recompute_membership(cs)) {
+        cs->rec_quarantined = true;
+        return false;
+    }
+    cs->counters.snapshots_installed++;
+    return true;
 }
 
 void qihse_consensus_receive(qihse_consensus_t* cs,
@@ -2665,6 +2999,8 @@ bool qihse_consensus_propose(qihse_consensus_t* cs, const qihse_user_t* user,
     e.sci = sci;
     if (payload_len > 0u) memcpy(e.payload, payload, payload_len);
     e.payload_len = payload_len;
+
+    if (!qcs_validate_data(cs, &e)) return false;
 
     if (!qcs_persist_entry(cs, &e)) return false; /* durable first */
     if (!qcs_log_push(cs, &e)) return false;
@@ -3037,11 +3373,12 @@ bool qihse_consensus_propose_joint(qihse_consensus_t* cs,
     return true;
 }
 
-bool qihse_consensus_read_committed(const qihse_consensus_t* cs,
-                                    const qihse_user_t* user,
-                                    uint64_t from_index,
-                                    qihse_consensus_entry_t* out_entries,
-                                    size_t out_cap, size_t* out_count) {
+static bool qcs_read_committed(const qihse_consensus_t* cs,
+                               const qihse_user_t* user,
+                               uint64_t from_index,
+                               qihse_consensus_entry_t* out_entries,
+                               size_t out_cap, size_t* out_count,
+                               bool exact) {
     if (!cs || !out_count) return false;
     if (out_cap > 0u && !out_entries) return false;
     *out_count = 0u;
@@ -3058,15 +3395,42 @@ bool qihse_consensus_read_committed(const qihse_consensus_t* cs,
     uint64_t start = from_index ? from_index : 1u;
     for (uint64_t idx = start; idx <= cs->commit && *out_count < out_cap; idx++) {
         const qihse_consensus_entry_t* e = qcs_entry_at(cs, idx);
-        if (!e) continue; /* below a follower's installed boundary (narrower,
-                           * never wider, than the un-compacted path) */
+        if (!e) {
+            if (!exact) continue;
+            if (*out_count > 0u)
+                memset(out_entries, 0, *out_count * sizeof(*out_entries));
+            *out_count = 0u;
+            return false;
+        }
         if (!qihse_auth_can_access(user, e->classif, e->sci)) {
             ((qihse_consensus_t*)cs)->counters.auth_failures++;
-            continue; /* withheld: never disclosed to this principal */
+            if (!exact) continue; /* filtered ordinary read */
+            if (*out_count > 0u)
+                memset(out_entries, 0, *out_count * sizeof(*out_entries));
+            *out_count = 0u;
+            return false;
         }
         out_entries[(*out_count)++] = *e;
     }
     return true;
+}
+
+bool qihse_consensus_read_committed(const qihse_consensus_t* cs,
+                                    const qihse_user_t* user,
+                                    uint64_t from_index,
+                                    qihse_consensus_entry_t* out_entries,
+                                    size_t out_cap, size_t* out_count) {
+    return qcs_read_committed(cs, user, from_index, out_entries, out_cap,
+                              out_count, false);
+}
+
+bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
+                                          const qihse_user_t* user,
+                                          uint64_t from_index,
+                                          qihse_consensus_entry_t* out_entries,
+                                          size_t out_cap, size_t* out_count) {
+    return qcs_read_committed(cs, user, from_index, out_entries, out_cap,
+                              out_count, true);
 }
 
 /* ── Introspection ───────────────────────────────────────────────────────── */
@@ -3102,6 +3466,10 @@ uint64_t qihse_consensus_last_log_index(const qihse_consensus_t* cs) {
 
 uint64_t qihse_consensus_last_log_term(const qihse_consensus_t* cs) {
     return cs ? qcs_last_log_term(cs) : 0u;
+}
+
+uint64_t qihse_consensus_last_journal_generation(const qihse_consensus_t* cs) {
+    return cs ? qcs_last_gen(cs) : 0u;
 }
 
 uint64_t qihse_consensus_snapshot_index(const qihse_consensus_t* cs) {

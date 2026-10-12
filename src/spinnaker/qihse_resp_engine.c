@@ -21,6 +21,8 @@
 #include "qihse_fabric_index.h"
 #include "qihse_fusion.h"
 #include "qihse_fts.h"
+#include "qihse_consensus_blob.h"
+#include "qihse_consensus_mesh.h"
 /* The claims context CLUSTER PEERAUTH installs needs the user STRUCT by
  * value — the same narrow, deliberate use of the internal representation
  * qihse_fabric_dispatch.c makes for its remote context: the struct it
@@ -353,6 +355,9 @@ struct qihse_resp_server {
     qihse_quota_table_t* quotas;
     /* U3 session-bundle delivery */
     qihse_blob_store_t* blobs;
+    qihse_consensus_mesh_t* consensus_mesh;
+    qihse_consensus_blob_context_t* consensus_blob_context;
+    bool consensus_allow_client_proposals;
     qihse_bundle_composer_t* composer;
     bool owns_composer;
     /* U6 background expiry sweeper */
@@ -980,6 +985,230 @@ static bool qihse_resp_handle_auth(qihse_resp_session_t* session, const qihse_re
     }
     if (!response || !authenticated) return response;
     return qihse_resp_simple(session, "OK");
+}
+
+#define QIHSE_TXN_READ_MAX_ENTRIES 32u
+#define QIHSE_TXN_READ_MAX_BYTES (8u * 1024u * 1024u)
+
+static bool qihse_resp_handle_consensus_status(qihse_resp_session_t* session,
+                                                const qihse_resp_request_t* request) {
+    if (!session || !request || !session->server ||
+        !session->server->auth_required || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
+    if (request->argc != 1u)
+        return qihse_resp_wrong_arity(session, "qihse.consensus.status");
+    if (!session->server->consensus_mesh)
+        return qihse_resp_error(session, "ERR consensus bridge is not configured");
+    qihse_consensus_mesh_status_t status;
+    if (!qihse_consensus_mesh_status(session->server->consensus_mesh, &status) ||
+        status.term > INT64_MAX || status.commit_index > INT64_MAX ||
+        status.last_log_index > INT64_MAX)
+        return qihse_resp_error(session, "ERR consensus status is unavailable");
+    char leader_text[QIHSE_UUID_STR_LEN + 1u];
+    if (status.has_leader &&
+        !qihse_uuid_format(&status.leader_id, leader_text))
+        return qihse_resp_error(session, "ERR consensus leader UUID is invalid");
+    return qihse_resp_array(session, 5u) &&
+           qihse_resp_bulk_text(session, qihse_consensus_role_name(status.role)) &&
+           (status.has_leader ? qihse_resp_bulk_text(session, leader_text)
+                              : qihse_resp_null(session)) &&
+           qihse_resp_integer(session, (int64_t)status.term) &&
+           qihse_resp_integer(session, (int64_t)status.commit_index) &&
+           qihse_resp_integer(session, (int64_t)status.last_log_index);
+}
+
+static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
+                                             const qihse_resp_request_t* request) {
+    if (!session || !request || !session->server ||
+        !session->server->auth_required || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
+    if (!session->server->consensus_mesh ||
+        !session->server->consensus_blob_context)
+        return qihse_resp_error(session, "ERR consensus bridge is not configured");
+
+    if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE")) {
+        if (!session->server->consensus_allow_client_proposals)
+            return qihse_resp_error(session,
+                "READONLY client proposals are disabled on this member");
+        if (request->argc != 5u)
+            return qihse_resp_wrong_arity(session, "qihse.txn.propose");
+        uint64_t classification = 0u, sci = 0u, expected_generation = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &classification) ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &sci) ||
+            !qihse_resp_parse_u64_arg(&request->argv[3], &expected_generation) ||
+            classification > UINT16_MAX || sci > UINT16_MAX ||
+            request->argv[4].len == 0u ||
+            request->argv[4].len > QIHSE_BLOB_MAX_SIZE - QIHSE_CONSENSUS_BLOB_HEADER_BYTES)
+            return qihse_resp_error(session, "ERR invalid consensus transaction envelope");
+        if (!qihse_auth_can_access(session->user, (uint16_t)classification,
+                                   (uint16_t)sci))
+            return qihse_resp_error(session, "NOPERM transaction exceeds principal clearance or SCI");
+        if (qihse_consensus_mesh_role(session->server->consensus_mesh) !=
+            QIHSE_CONSENSUS_LEADER) {
+            qihse_uuid_t leader;
+            char leader_text[QIHSE_UUID_STR_LEN + 1u];
+            char redirect[96];
+            if (qihse_consensus_mesh_leader_id(session->server->consensus_mesh,
+                                               &leader) &&
+                qihse_uuid_format(&leader, leader_text)) {
+                int n = snprintf(redirect, sizeof(redirect), "MOVED %s",
+                                 leader_text);
+                if (n > 0 && (size_t)n < sizeof(redirect))
+                    return qihse_resp_error(session, redirect);
+            }
+            return qihse_resp_error(session, "TRYAGAIN consensus leader unavailable");
+        }
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0)
+            return qihse_resp_error(session, "ERR consensus clock unavailable");
+        qihse_hlc_t hlc = {(uint64_t)now.tv_sec * 1000u +
+                           (uint64_t)now.tv_nsec / 1000000u, 0u};
+        uint64_t generation = 0u, index = 0u;
+        bool committed = qihse_consensus_mesh_propose_transaction_if_generation(
+            session->server->consensus_mesh, session->user,
+            expected_generation, hlc,
+            (uint16_t)classification, (uint16_t)sci,
+            request->argv[4].data, request->argv[4].len,
+            10000u, 20000u, &generation, &index);
+        if (generation == 0u)
+            return qihse_resp_error(session, "TRYAGAIN application generation changed");
+        if (!index)
+            return qihse_resp_error(session, "ERR transaction was not appended to consensus");
+        /* A timeout after local append is an unknown outcome, not proof of
+         * failure. The caller resolves it by reading this index before retry. */
+        uint64_t term = qihse_consensus_mesh_term(session->server->consensus_mesh);
+        if (generation > INT64_MAX || index > INT64_MAX || term > INT64_MAX)
+            return qihse_resp_error(session, "ERR consensus metadata exceeds RESP integer range");
+        return qihse_resp_array(session, 4u) &&
+               qihse_resp_integer(session, (int64_t)generation) &&
+               qihse_resp_integer(session, (int64_t)index) &&
+               qihse_resp_integer(session, committed ? 1 : 0) &&
+               qihse_resp_integer(session, (int64_t)term);
+    }
+
+    if (qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL")) {
+        bool local_read = qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL");
+        if (local_read && qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session,
+                                    "NOPERM node-local recovery read requires Operator");
+        if (request->argc != 3u)
+            return qihse_resp_wrong_arity(session,
+                                          local_read ? "qihse.txn.readlocal" : "qihse.txn.read");
+        uint64_t from = 0u, limit = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &from) ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &limit) ||
+            limit == 0u || limit > QIHSE_TXN_READ_MAX_ENTRIES)
+            return qihse_resp_error(session, "ERR invalid transaction cursor or page size");
+
+        /* Ordinary transaction consumers must read through the leader: a
+         * follower may lag. READLOCAL is an explicit node-local inspection
+         * for recovery tooling; its returned cursor is only this member's
+         * committed watermark and must never stand for a cluster-wide one. */
+        if (!local_read && qihse_consensus_mesh_role(session->server->consensus_mesh) !=
+            QIHSE_CONSENSUS_LEADER) {
+            qihse_uuid_t leader;
+            char leader_text[QIHSE_UUID_STR_LEN + 1u];
+            char redirect[96];
+            if (qihse_consensus_mesh_leader_id(session->server->consensus_mesh,
+                                               &leader) &&
+                qihse_uuid_format(&leader, leader_text)) {
+                int n = snprintf(redirect, sizeof(redirect), "MOVED %s",
+                                 leader_text);
+                if (n > 0 && (size_t)n < sizeof(redirect))
+                    return qihse_resp_error(session, redirect);
+            }
+            return qihse_resp_error(session, "TRYAGAIN consensus leader unavailable");
+        }
+
+        /* `from` is the next index requested by the consumer. The page API
+         * captures its rows and committed watermark under one state lock, so
+         * the response cursor cannot move past a commit that was absent from
+         * this page. Requiring the watermark to cover `from - 1` also makes
+         * this a read-after-watermark fence for the consumer's applied index. */
+        uint64_t minimum_commit_index = from ? from - 1u : 0u;
+        qihse_consensus_entry_t entries[QIHSE_TXN_READ_MAX_ENTRIES];
+        size_t count = 0u;
+        uint64_t committed_index = 0u;
+        if (!qihse_consensus_mesh_read_committed_page(
+                session->server->consensus_mesh, session->user, from,
+                entries, (size_t)limit, &count, &committed_index))
+            return qihse_resp_error(session, "NOPERM committed transaction read denied");
+        if (committed_index < minimum_commit_index)
+            return qihse_resp_error(session,
+                "TRYAGAIN committed history is below requested read watermark");
+        uint64_t cursor = count == (size_t)limit
+            ? entries[count - 1u].index
+            : committed_index;
+        size_t data_count = 0u;
+        for (size_t i = 0; i < count; i++)
+            if (entries[i].type == QIHSE_CONSENSUS_ENTRY_DATA) data_count++;
+        if (cursor > INT64_MAX)
+            return qihse_resp_error(session, "ERR consensus cursor exceeds RESP integer range");
+        uint8_t* transactions[QIHSE_TXN_READ_MAX_ENTRIES] = {0};
+        size_t transaction_sizes[QIHSE_TXN_READ_MAX_ENTRIES] = {0};
+        size_t total_bytes = 0u;
+        for (size_t i = 0; i < count; i++) {
+            qihse_consensus_entry_t* entry = &entries[i];
+            if (entry->type != QIHSE_CONSENSUS_ENTRY_DATA) continue;
+            if (entry->index > INT64_MAX || entry->journal_generation > INT64_MAX ||
+                entry->term > INT64_MAX) goto txn_read_invalid;
+            if (entry->payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
+                !qihse_consensus_blob_validate(session->server->consensus_blob_context,
+                                               entry)) goto txn_read_invalid;
+            uint64_t stored_size = 0u;
+            if (!qihse_blob_size_user(session->server->consensus_blob_context->blobs,
+                    entry->payload + 64u, &stored_size, session->user) ||
+                stored_size < QIHSE_CONSENSUS_BLOB_HEADER_BYTES) goto txn_read_invalid;
+            uint64_t transaction_size = stored_size - QIHSE_CONSENSUS_BLOB_HEADER_BYTES;
+            if (transaction_size > QIHSE_TXN_READ_MAX_BYTES - total_bytes ||
+                transaction_size > SIZE_MAX) goto txn_read_too_large;
+            transactions[i] = malloc((size_t)transaction_size);
+            if (!transactions[i]) goto txn_read_no_memory;
+            size_t read = 0u;
+            if (!qihse_blob_get_user(
+                session->server->consensus_blob_context->blobs,
+                entry->payload + 64u, QIHSE_CONSENSUS_BLOB_HEADER_BYTES,
+                transactions[i], (size_t)transaction_size, &read, session->user) ||
+                read != (size_t)transaction_size) goto txn_read_invalid;
+            transaction_sizes[i] = (size_t)transaction_size;
+            total_bytes += (size_t)transaction_size;
+        }
+        if (!qihse_resp_array(session, 2u) ||
+            !qihse_resp_integer(session, (int64_t)cursor) ||
+            !qihse_resp_array(session, data_count)) goto txn_read_write_failed;
+        for (size_t i = 0; i < count; i++) {
+            qihse_consensus_entry_t* entry = &entries[i];
+            if (entry->type != QIHSE_CONSENSUS_ENTRY_DATA) continue;
+            if (!qihse_resp_array(session, 6u) ||
+                !qihse_resp_integer(session, (int64_t)entry->index) ||
+                !qihse_resp_integer(session, (int64_t)entry->journal_generation) ||
+                !qihse_resp_integer(session, (int64_t)entry->term) ||
+                !qihse_resp_integer(session, entry->classif) ||
+                !qihse_resp_integer(session, entry->sci) ||
+                !qihse_resp_bulk(session, transactions[i], transaction_sizes[i]))
+                goto txn_read_write_failed;
+        }
+        for (size_t i = 0; i < count; i++) free(transactions[i]);
+        return true;
+
+txn_read_invalid:
+        for (size_t i = 0; i < count; i++) free(transactions[i]);
+        return qihse_resp_error(session, "ERR committed transaction payload failed validation or read");
+txn_read_too_large:
+        for (size_t i = 0; i < count; i++) free(transactions[i]);
+        return qihse_resp_error(session, "ERR transaction page exceeds response bound");
+txn_read_no_memory:
+        for (size_t i = 0; i < count; i++) free(transactions[i]);
+        return qihse_resp_error(session, "ERR transaction read allocation failed");
+txn_read_write_failed:
+        for (size_t i = 0; i < count; i++) free(transactions[i]);
+        return false;
+    }
+    return qihse_resp_error(session, "ERR unsupported consensus transaction command");
 }
 
 /* CLUSTER PEERAUTH <token-hex> — the peer end of scatter principal
@@ -10944,6 +11173,12 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (request->argc == 0) return true;
     if (qihse_resp_command_is(request, "AUTH")) return qihse_resp_handle_auth(session, request);
     if (qihse_resp_command_is(request, "HELLO")) return qihse_resp_handle_hello(session, request);
+    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.STATUS"))
+        return qihse_resp_handle_consensus_status(session, request);
+    if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
+        return qihse_resp_handle_consensus_txn(session, request);
     if (qihse_resp_command_is(request, "PING")) {
         if (request->argc == 1) return qihse_resp_simple(session, "PONG");
         if (request->argc == 2) return qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len);
@@ -11547,6 +11782,10 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->enable_uwp_bridge = supplied->enable_uwp_bridge;
     server->quotas = supplied->quotas;
     server->blobs = supplied->blobs;
+    server->consensus_mesh = supplied->consensus_mesh;
+    server->consensus_blob_context = supplied->consensus_blob_context;
+    server->consensus_allow_client_proposals =
+        supplied->consensus_allow_client_proposals;
     server->metrics = qihse_metrics_create();
     if (server->metrics) {
         qihse_metrics_register(server->metrics, "qihse_bundle_compose_total", "Session bundles composed", METRIC_COUNTER);

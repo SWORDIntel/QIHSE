@@ -10,6 +10,15 @@ class _KVStore(ctypes.Structure):
 
 _KVStore_p = ctypes.POINTER(_KVStore)
 
+
+class _KVRecordMeta(ctypes.Structure):
+    _fields_ = [
+        ("classification", ctypes.c_uint16),
+        ("sci_compartment", ctypes.c_uint16),
+        ("expire_time_ms", ctypes.c_uint64),
+        ("flags", ctypes.c_uint8),
+    ]
+
 _lib.qihse_kv_store_create.argtypes = []
 _lib.qihse_kv_store_create.restype = _KVStore_p
 _lib.qihse_kv_store_destroy.argtypes = [_KVStore_p]
@@ -26,6 +35,11 @@ _lib.qihse_kv_set_user.argtypes = [
 _lib.qihse_kv_set_user.restype = ctypes.c_bool
 _lib.qihse_kv_get_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_get_user.restype = ctypes.POINTER(ctypes.c_char)
+_lib.qihse_kv_meta_user.argtypes = [
+    _KVStore_p, ctypes.c_char_p, ctypes.c_void_p,
+    ctypes.POINTER(_KVRecordMeta),
+]
+_lib.qihse_kv_meta_user.restype = ctypes.c_bool
 _lib.qihse_kv_del_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_del_user.restype = ctypes.c_bool
 _lib.qihse_kv_exists_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
@@ -110,6 +124,17 @@ class KVStore:
             return raw.decode("utf-8") if raw is not None else ""
         finally:
             _libc.free(ptr)
+
+    def meta(self, key: str, *, user) -> Optional[tuple[int, int]]:
+        """Read class/SCI for a live row under an explicit principal."""
+        if user is None:
+            raise ValueError("QIHSE metadata read requires a principal")
+        record = _KVRecordMeta()
+        if not _lib.qihse_kv_meta_user(
+                self._ptr, key.encode("utf-8"), user,
+                ctypes.byref(record)):
+            return None
+        return int(record.classification), int(record.sci_compartment)
 
     def delete(self, key: str, user=None) -> bool:
         return bool(_lib.qihse_kv_del_user(self._ptr, key.encode("utf-8"), user))
