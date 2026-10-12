@@ -12,7 +12,7 @@
 #
 # Run: bash tests/test_keygen.sh
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-SRSL-1.0
 
 set -euo pipefail
 

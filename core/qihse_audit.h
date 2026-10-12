@@ -4,7 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Initialize the audit subsystem (ML-DSA-87 key generation + integrity chain check). */
+/* Initialize the audit subsystem and recover a durable log suffix before
+ * appending new records. Recovery uses a process-local, kernel-authenticated
+ * service identity scoped to owner-controlled audit files because the QIHSE
+ * operator account does not exist yet. It does not authorize general data
+ * reads. Unrepairable continuity errors terminate the process. */
 void qihse_audit_init(void);
 
 /* Set the audit notification webhook endpoint (IP:PORT format). Pass NULL to disable. */
@@ -17,8 +21,10 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
  * No-op if no endpoint has been configured. */
 void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
 
-/* Verify the integrity chain file matches the in-memory hash state.
- * Triggers an authenticated lockdown prompt on mismatch. */
+/* Scan retained audit logs using the process-local service identity established
+ * by qihse_audit_init(). Calling before initialization or after a process
+ * identity/directory change fails closed. Unrepairable continuity errors
+ * terminate the process. */
 void qihse_audit_verify_integrity(void);
 
 /* Block until every queued audit entry has been signed and written.

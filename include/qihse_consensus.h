@@ -90,10 +90,12 @@
  * qihse_auth_can_access() check as the un-compacted path (compaction never
  * widens visibility).  Residual limits, stated honestly:
  *
- *   - the snapshot transfers as ONE message carrying at most
- *     QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES entries; each compaction
- *     advances the boundary by at most that many entries, and there is no
- *     chunked/streamed or resumable cross-session snapshot transfer;
+ *   - the mesh sender streams large prefixes as bounded snapshot chunks only
+ *     to explicitly provisioned peers; a durable receiver stage resumes from
+ *     its contiguous high-watermark after restart, then S2 publishes the full
+ *     prefix. The sender cursor is volatile and restarts by retrying from its
+ *     ordinary append backtracking path; capability negotiation is out of
+ *     band and must be provisioned consistently on both peers;
  *   - the snapshot structure in memory retains the compacted prefix, so
  *     what compaction bounds is the active log and catch-up traffic, not
  *     the process footprint; likewise the append-only record file is
@@ -317,6 +319,7 @@ extern "C" {
 
 #define QIHSE_CONSENSUS_GROUP_ID_MAX 63u
 #define QIHSE_CONSENSUS_MAX_MEMBERS 32u
+#define QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS 60000u
 /* W7 item 7 — HA posture: roles and voter weights.
  *
  * Roles ride the membership arrays in parallel (0-filled arrays = every
@@ -345,6 +348,11 @@ const char* qihse_consensus_member_role_name(qihse_consensus_member_role_t role)
 /* One snapshot message / record transaction carries the compacted prefix
  * whole; this caps how far a single compaction advances the boundary. */
 #define QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES 24u
+/* Versioned S2 recovery records and local staged installs support full
+ * prefixes beyond the legacy single-message S snapshot ceiling. */
+#define QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES 65536u
+/* Bounded frame size for the independent chunked snapshot codec. */
+#define QIHSE_CONSENSUS_SNAPSHOT_CHUNK_MAX_ENTRIES 8u
 
 /* ── Roles ───────────────────────────────────────────────────────────────── */
 
@@ -396,6 +404,21 @@ typedef struct {
     size_t payload_len;
 } qihse_consensus_entry_t;
 
+/* Optional local durability gate for DATA entries. The callback must be
+ * read-only and verify that the referenced transaction is durably staged on
+ * THIS node, including its digest, group, generation, class and SCI binding.
+ * Return false if any check fails. It must not call back into consensus.
+ * A NULL callback preserves the standalone log-only behavior; a deployment
+ * using external transaction payloads must provide one on every member. */
+typedef bool (*qihse_consensus_validate_data_fn)(
+    void* context, const qihse_consensus_entry_t* entry);
+
+/* Optional transport capability gate for the additive QCS1 snapshot chunk
+ * message. A NULL callback keeps peers on legacy SNAPSHOT; deployments must
+ * provision this callback from authenticated, versioned peer configuration. */
+typedef bool (*qihse_consensus_snapshot_chunks_supported_fn)(
+    void* context, const qihse_uuid_t* peer);
+
 /* ── Messages ────────────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -404,8 +427,23 @@ typedef enum {
     QIHSE_CONSENSUS_MSG_APPEND = 3,
     QIHSE_CONSENSUS_MSG_APPEND_REPLY = 4,
     QIHSE_CONSENSUS_MSG_SNAPSHOT = 5,      /* leader -> lagging follower */
-    QIHSE_CONSENSUS_MSG_SNAPSHOT_REPLY = 6 /* follower -> leader */
+    QIHSE_CONSENSUS_MSG_SNAPSHOT_REPLY = 6, /* follower -> leader */
+    QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK = 7 /* chunk-capable peers only */
 } qihse_consensus_msg_type_t;
+
+typedef struct {
+    uint64_t transfer_id;       /* nonzero, stable across retries */
+    uint64_t total_entries;     /* complete prefix count/boundary */
+    uint64_t first_entry_index; /* 1-based chunk start */
+    uint64_t last_included_term;
+    uint64_t snapshot_fencing_epoch;
+    uint64_t journal_generation;
+    uint64_t digest;            /* complete-prefix digest */
+    uint64_t chunk_digest;      /* digest of this chunk's entries */
+    size_t entry_count;
+    bool final_chunk;
+    qihse_consensus_entry_t entries[QIHSE_CONSENSUS_SNAPSHOT_CHUNK_MAX_ENTRIES];
+} qihse_consensus_snapshot_chunk_t;
 
 typedef struct {
     qihse_consensus_msg_type_t type;
@@ -458,8 +496,17 @@ typedef struct {
                                         * on failure: highest index the
                                         * follower can vouch for */
         } snapshot_reply;
+        /* Additive v1 chunk consumed by the authenticated mesh adapter.
+         * `first_entry_index` is 1-based and entry indexes must be contiguous
+         * from that position. The final marker is true exactly for the chunk
+         * ending at `total_entries`. Existing SNAPSHOT messages are unchanged. */
+        qihse_consensus_snapshot_chunk_t snapshot_chunk;
     } u;
 } qihse_consensus_msg_t;
+
+/* Canonical digest used by full snapshots and snapshot chunks. */
+uint64_t qihse_consensus_snapshot_entries_digest(
+    const qihse_consensus_entry_t* entries, size_t count);
 
 /* ── Configuration ───────────────────────────────────────────────────────── */
 
@@ -472,13 +519,18 @@ typedef struct {
      * Zero-filled = every member a weight-1 VOTER (legacy configs). */
     uint8_t member_roles[QIHSE_CONSENSUS_MAX_MEMBERS];
     uint16_t member_weights[QIHSE_CONSENSUS_MAX_MEMBERS];
-    /* Timing, in caller-supplied virtual milliseconds.  Election timeouts
-     * are base + (member_index * spread / member_count) + jitter, with
+    /* Timing, in caller-supplied virtual milliseconds. Election timeouts
+     * are base + (member_index * spread / member_count) + jitter + the
+     * self-only election_priority_delay_ms, with
      * jitter derived from (self UUID, term); spread must be >= member_count
      * so the per-member buckets are disjoint and elections do not tie. */
     uint64_t election_timeout_base_ms;   /* 0 = default 150 */
     uint64_t election_timeout_spread_ms; /* 0 = default 300 */
     uint64_t heartbeat_interval_ms;      /* 0 = default 50 */
+    /* Additional self-only delay for candidate preference. A standby voter
+     * can use this so higher-priority voters win first when available.
+     * It does not grant write rights. */
+    uint32_t election_priority_delay_ms; /* 0..MAX_ELECTION_PRIORITY_DELAY_MS */
     /* Log-compaction trigger, in entries: when the retained log
      * (last log index − snapshot index) exceeds this many entries, the
      * leader durably snapshots the committed prefix and truncates it from
@@ -491,6 +543,19 @@ typedef struct {
      * or dynamically resolved paths only — never a hard-coded absolute
      * path.  One file per (node, group). */
     char record_path[QIHSE_CONSENSUS_RECORD_PATH_MAX + 1u];
+    /* Optional durable history binding for newly created groups. Supply a
+     * nonzero ID and epoch together. A protected record refuses opens whose
+     * configured identity differs or is omitted; an existing legacy record
+     * cannot be retroactively bound by configuration alone. */
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
+    /* A production group referencing external transaction bytes sets this
+     * true; open then fails closed if no validator was supplied. */
+    bool require_data_validator;
+    qihse_consensus_validate_data_fn validate_data;
+    void* validate_data_context;
+    qihse_consensus_snapshot_chunks_supported_fn snapshot_chunks_supported;
+    void* snapshot_chunks_context;
 } qihse_consensus_config_t;
 
 /* Transport: the implementation calls send(transport, msg) to emit.  The
@@ -502,6 +567,19 @@ typedef void (*qihse_consensus_send_fn)(void* transport,
 
 /* Opaque instance. */
 typedef struct qihse_consensus qihse_consensus_t;
+
+typedef struct {
+    char group_id[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u];
+    qihse_uuid_t from;
+    qihse_uuid_t to;
+    uint64_t term;
+    uint64_t fencing_epoch;
+    uint64_t last_included_index;
+    uint64_t last_included_term;
+    uint64_t snapshot_fencing_epoch;
+    uint64_t journal_generation;
+    uint64_t digest;
+} qihse_consensus_snapshot_descriptor_t;
 
 /* Open (or create) a group instance.  Replays the record file if it exists;
  * a corrupt, truncated, semantically inconsistent, or foreign-group record
@@ -519,6 +597,16 @@ void qihse_consensus_tick(qihse_consensus_t* cs, uint64_t now_ms);
 /* Deliver one message to this instance (already routed by the transport). */
 void qihse_consensus_receive(qihse_consensus_t* cs,
                              const qihse_consensus_msg_t* msg);
+
+/* Publish a complete, validated snapshot prefix to this node's recovery
+ * journal. The prefix is written as a versioned S2/SE/T transaction; memory
+ * changes only after the terminating T record is fsynced. `user` must be an
+ * active operator and entries must contain exactly indices 1..count. This
+ * local API does not send or acknowledge network messages. */
+bool qihse_consensus_install_snapshot_prefix(
+    qihse_consensus_t* cs, const qihse_user_t* user,
+    const qihse_consensus_snapshot_descriptor_t* descriptor,
+    const qihse_consensus_entry_t* entries, size_t count);
 
 /* ── Client paths ────────────────────────────────────────────────────────── */
 
@@ -556,6 +644,39 @@ bool qihse_consensus_read_committed(const qihse_consensus_t* cs,
                                     uint64_t from_index,
                                     qihse_consensus_entry_t* out_entries,
                                     size_t out_cap, size_t* out_count);
+
+/* Replication/transaction-bridge read: never turn an inaccessible or missing
+ * committed entry into a shortened page. On denial, return false with a zero
+ * count, so a caller cannot advance its cursor past an unseen transaction. */
+bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
+                                          const qihse_user_t* user,
+                                          uint64_t from_index,
+                                          qihse_consensus_entry_t* out_entries,
+                                          size_t out_cap, size_t* out_count);
+
+/* Compute a SHA-256 commitment to exactly the local committed entries at
+ * indices 1..through_index, including entries retained in a snapshot.
+ * through_index must be <= the commit index; zero yields an all-zero digest.
+ * Only a history-bound group and an active Operator authorized for EVERY
+ * included entry may use this API; legacy unbound groups fail closed.
+ * Failure clears out_sha256 and never returns a partial or filtered digest.
+ *
+ * Encoding v1: ASCII "QIHSE-COMMITTED-PREFIX-v1" (no NUL), group-ID byte
+ * length as big-endian u64, group-ID bytes, 32 history-ID bytes, writer-epoch
+ * floor and through_index as big-endian u64; then, per entry in index order,
+ * big-endian u64 for index, term, journal generation, HLC physical_ms, HLC
+ * logical, classification, SCI, type, payload length, followed by the exact
+ * payload bytes. No struct padding or host byte order enters the digest.
+ *
+ * The consensus core is a single-threaded state machine and holds no mutex.
+ * The caller must serialize this entire call with tick/receive/propose and
+ * snapshot installation (for a mesh caller, hold its state lock). Capture
+ * commit_index and choose through_index under that SAME lock. This local
+ * commitment is not peer authentication, application-state verification, or
+ * permission to rejoin; the caller must bind it to a trusted history anchor. */
+bool qihse_consensus_committed_prefix_sha256(
+    const qihse_consensus_t* cs, const qihse_user_t* user,
+    uint64_t through_index, uint8_t out_sha256[32]);
 
 /* ── Membership changes (single-server; see MEMBERSHIP CHANGES above) ────── */
 
@@ -695,6 +816,8 @@ uint64_t qihse_consensus_fencing_epoch(const qihse_consensus_t* cs);
 uint64_t qihse_consensus_commit_index(const qihse_consensus_t* cs);
 uint64_t qihse_consensus_last_log_index(const qihse_consensus_t* cs);
 uint64_t qihse_consensus_last_log_term(const qihse_consensus_t* cs);
+/* Highest journal generation in the active log or compacted snapshot. */
+uint64_t qihse_consensus_last_journal_generation(const qihse_consensus_t* cs);
 /* Highest index covered by the installed snapshot (0 = no snapshot).
  * Entries at or below it are served from the snapshot on committed reads,
  * under the same per-entry authorization as the un-compacted path. */
