@@ -6,9 +6,11 @@
 #include <time.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <errno.h>
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -39,6 +41,7 @@ static uint16_t g_ping_classif = 0, g_ping_sci = 0;
 
 #define AUDIT_FILE "qihse_audit.log"
 #define INTEGRITY_CHAIN_FILE "qihse_integrity.chain"
+#define AUDIT_WRITER_LOCK_FILE "qihse_audit.writer.lock"
 #define XOR_KEY 0x5A
 #define MLDSA87_SIG_BYTES 4627 // ML-DSA-87 signature size
 
@@ -68,10 +71,10 @@ static void build_audit_path(char *buf, size_t buflen) {
  * anchored in the integrity-chain file) and NOT file-bound, so rotating the
  * container between records preserves tamper-evidence across the boundary.
  * Only the signer thread (or a fallback caller while the signer is down)
- * writes records, and every record opens the path fresh with
+ * writes records in one process, and every record opens the path fresh with
  * O_APPEND|O_CREAT|O_NOFOLLOW, so a rename between records IS the rotation:
- * the next record re-creates the live file. Concurrent fallback writers race
- * harmlessly — an fd already open keeps writing into the renamed inode.
+ * the next record re-creates the live file. Separate processes require an
+ * external single-writer fence; this module does not coordinate them.
  * Rotated names carry a decimal-seconds suffix so they sort chronologically
  * by name. POSIX only; on Windows the log grows unbounded. */
 static uint64_t audit_rotate_threshold(void) {
@@ -86,25 +89,123 @@ static uint64_t audit_rotate_threshold(void) {
     return 64ull * 1024ull * 1024ull;
 }
 
+/* Both recovery and pruning use this bound and the same filename grammar.
+ * Exceeding it fails closed rather than silently omitting an older record. */
+#define AUDIT_MAX_ROTATED_LOGS 256u
+
+typedef struct {
+    char *names[AUDIT_MAX_ROTATED_LOGS];
+    size_t count;
+} audit_rotated_list_t;
+
+/* Recovery and rotation enumerate the same owner-controlled audit directory.
+ * This is a typed, process-bound service principal, not an ordinary QIHSE
+ * account or a bypass for classified database reads. */
+typedef struct {
+    uid_t effective_uid;
+    pid_t process_id;
+    dev_t directory_device;
+    ino_t directory_inode;
+} audit_recovery_context_t;
+
+static void audit_integrity_error(const char *reason);
+static void audit_context_create(audit_recovery_context_t *ctx);
+static void audit_context_authorize_directory(const audit_recovery_context_t *ctx,
+                                              int directory_fd);
+
+static int audit_decimal(const char **cursor, uint64_t *value) {
+    const unsigned char *p = (const unsigned char *)*cursor;
+    if (!isdigit(*p)) return 0;
+    uint64_t n = 0;
+    do {
+        unsigned int digit = *p - '0';
+        if (n > (UINT64_MAX - digit) / 10) return 0;
+        n = n * 10 + digit;
+        p++;
+    } while (isdigit(*p));
+    *cursor = (const char *)p;
+    *value = n;
+    return 1;
+}
+
+/* 0: unrelated name; 1: exact rotated name; -1: malformed candidate.
+ * A digit-prefixed malformed suffix could hide a retained audit record. */
+static int audit_rotated_name(const char *name, const char *base,
+                              uint64_t *stamp, uint64_t *retry) {
+    size_t n = strlen(base);
+    if (strncmp(name, base, n) != 0 || name[n] != '.' ||
+        !isdigit((unsigned char)name[n + 1])) return 0;
+    const char *p = name + n + 1;
+    if (*p == '0' && isdigit((unsigned char)p[1])) return -1;
+    if (!audit_decimal(&p, stamp)) return -1;
+    *retry = 0;
+    if (*p == '.') {
+        p++;
+        if (*p == '0' || !audit_decimal(&p, retry)) return -1;
+    }
+    return *p == '\0' ? 1 : -1;
+}
+
+static int audit_rotated_order(const char *an, const char *bn) {
+    uint64_t at, bt, ai, bi;
+    if (audit_rotated_name(an, AUDIT_FILE, &at, &ai) != 1 ||
+        audit_rotated_name(bn, AUDIT_FILE, &bt, &bi) != 1)
+        audit_integrity_error("invalid rotated audit filename in ordering");
+    if (at != bt) return at < bt ? -1 : 1;
+    if (ai != bi) return ai < bi ? -1 : 1;
+    /* Preserve a total order even for numerically equivalent inputs. */
+    return strcmp(an, bn);
+}
+
+static int audit_name_cmp(const void *a, const void *b) {
+    return audit_rotated_order(*(const char *const *)a,
+                               *(const char *const *)b);
+}
+
+static void audit_free_rotated(audit_rotated_list_t *list) {
+    for (size_t i = 0; i < list->count; i++) free(list->names[i]);
+    list->count = 0;
+}
+
+static int audit_collect_rotated(const audit_recovery_context_t *ctx,
+                                 DIR *dir, const char *base,
+                                 audit_rotated_list_t *list) {
+    audit_context_authorize_directory(ctx, dirfd(dir));
+    list->count = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dir);
+        if (!de) return errno == 0;
+        uint64_t stamp, retry;
+        int match = audit_rotated_name(de->d_name, base, &stamp, &retry);
+        if (match < 0 || (match > 0 && list->count == AUDIT_MAX_ROTATED_LOGS))
+            return 0;
+        if (!match) continue;
+        list->names[list->count] = strdup(de->d_name);
+        if (!list->names[list->count]) return 0;
+        list->count++;
+    }
+}
+
 static size_t audit_rotate_keep(void) {
     const char* env = getenv("QIHSE_AUDIT_ROTATE_KEEP");
     if (env && *env) {
         char* end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
-        if (end && *end == '\0') return (size_t)v; /* 0 = keep everything */
+        if (end && *end == '\0' && v <= AUDIT_MAX_ROTATED_LOGS)
+            return (size_t)v; /* 0 = keep everything up to the scan bound */
+        audit_integrity_error("invalid rotated audit retention limit");
     }
     return 8;
 }
 
-static void audit_prune_rotated(const char* apath) {
-    size_t keep = audit_rotate_keep();
-    if (keep == 0) return;
-
+static void audit_prune_rotated(const char* apath, size_t target) {
     char dirbuf[512];
     const char* base = strrchr(apath, '/');
     if (base) {
         size_t dlen = (size_t)(base - apath);
-        if (dlen >= sizeof(dirbuf)) return;
+        if (dlen == 0 || dlen >= sizeof(dirbuf))
+            audit_integrity_error("audit directory path too long");
         memcpy(dirbuf, apath, dlen);
         dirbuf[dlen] = '\0';
         base++;
@@ -112,65 +213,87 @@ static void audit_prune_rotated(const char* apath) {
         snprintf(dirbuf, sizeof(dirbuf), "%s", ".");
         base = apath;
     }
-    size_t base_len = strlen(base);
-
-    char names[64][320];
-    size_t count = 0;
     DIR* d = opendir(dirbuf);
-    if (!d) return;
-    struct dirent* de;
-    while ((de = readdir(d)) != NULL && count < 64) {
-        if (strncmp(de->d_name, base, base_len) != 0) continue;
-        const char* suffix = de->d_name + base_len;
-        if (suffix[0] != '.' || !isdigit((unsigned char)suffix[1])) continue;
-        snprintf(names[count], sizeof(names[0]), "%s", de->d_name);
-        count++;
+    if (!d) audit_integrity_error("cannot list rotated audit logs");
+    audit_recovery_context_t ctx;
+    audit_context_create(&ctx);
+    audit_rotated_list_t list = {0};
+    if (!audit_collect_rotated(&ctx, d, base, &list))
+        audit_integrity_error("invalid or excess rotated audit logs");
+    if (target == SIZE_MAX && list.count == AUDIT_MAX_ROTATED_LOGS)
+        audit_integrity_error("rotated audit scan limit reached");
+    qsort(list.names, list.count, sizeof(list.names[0]), audit_name_cmp);
+    size_t remove = list.count > target ? list.count - target : 0;
+    for (size_t i = 0; i < remove; i++) {
+        struct stat st;
+        if (fstatat(dirfd(d), list.names[i], &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+            (st.st_mode & 0077) != 0 ||
+            unlinkat(dirfd(d), list.names[i], 0) != 0)
+            audit_integrity_error("cannot safely prune rotated audit log");
     }
-    closedir(d);
-
-    /* Ascending strcmp == ascending timestamp for the numeric suffix. */
-    for (size_t i = 1; i < count; i++) {
-        char tmp[sizeof(names[0])];
-        memcpy(tmp, names[i], sizeof(tmp));
-        size_t j = i;
-        while (j > 0 && strcmp(names[j - 1], tmp) > 0) {
-            memcpy(names[j], names[j - 1], sizeof(names[0]));
-            j--;
-        }
-        memcpy(names[j], tmp, sizeof(tmp));
-    }
-    for (size_t i = 0; i + keep < count; i++) {
-        char full[640];
-        if (dirbuf[strlen(dirbuf) - 1] == '/') snprintf(full, sizeof(full), "%s%s", dirbuf, names[i]);
-        else snprintf(full, sizeof(full), "%s/%s", dirbuf, names[i]);
-        unlink(full);
-    }
+    if (remove && fsync(dirfd(d)) != 0)
+        audit_integrity_error("cannot persist rotated audit pruning");
+    audit_free_rotated(&list);
+    if (closedir(d) != 0)
+        audit_integrity_error("cannot close audit directory after pruning");
 }
 
 static void audit_maybe_rotate(void) {
     char apath[512];
+    const char *data_dir = getenv("QIHSE_DATA_DIR");
+    if (data_dir && *data_dir &&
+        strlen(data_dir) + 1 + strlen(AUDIT_FILE) >= sizeof(apath))
+        audit_integrity_error("audit path too long for rotation");
     build_audit_path(apath, sizeof(apath));
     struct stat st;
-    if (stat(apath, &st) != 0) return;
+    if (lstat(apath, &st) != 0) {
+        if (errno == ENOENT) return;
+        audit_integrity_error("cannot inspect audit log for rotation");
+    }
+    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & 0077) != 0)
+        audit_integrity_error("unsafe audit log for rotation");
     if ((uint64_t)st.st_size < audit_rotate_threshold()) return;
 
     char rotated[640];
     long t = (long)time(NULL);
     int attempt;
     for (attempt = 0; attempt < 1000; attempt++) {
-        if (attempt == 0) snprintf(rotated, sizeof(rotated), "%s.%ld", apath, t);
-        else snprintf(rotated, sizeof(rotated), "%s.%ld.%d", apath, t, attempt);
-        if (access(rotated, F_OK) != 0) break;
+        int n = attempt == 0
+            ? snprintf(rotated, sizeof(rotated), "%s.%ld", apath, t)
+            : snprintf(rotated, sizeof(rotated), "%s.%ld.%d", apath, t, attempt);
+        if (n < 0 || (size_t)n >= sizeof(rotated))
+            audit_integrity_error("rotated audit path too long");
+        if (lstat(rotated, &st) != 0) {
+            if (errno == ENOENT) break;
+            audit_integrity_error("cannot inspect rotated audit path");
+        }
     }
-    if (attempt >= 1000) return; /* pathological; keep appending rather than lose records */
+    if (attempt >= 1000) audit_integrity_error("rotated audit suffix exhausted");
 
-    if (rename(apath, rotated) != 0) return;
-    audit_prune_rotated(apath);
+    size_t keep = audit_rotate_keep();
+    /* Reserve one filename before rename. Even a crash between rename and
+     * post-rotation work must leave no more files than recovery can scan. */
+    audit_prune_rotated(apath, keep ? keep - 1 : SIZE_MAX);
+
+    if (rename(apath, rotated) != 0)
+        audit_integrity_error("cannot rotate audit log");
+    char dirbuf[sizeof(apath)];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", apath);
+    char *slash = strrchr(dirbuf, '/');
+    if (slash == dirbuf) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    else snprintf(dirbuf, sizeof(dirbuf), ".");
+    int dfd = open(dirbuf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd < 0 || fsync(dfd) != 0)
+        audit_integrity_error("cannot persist audit rotation");
     /* Re-create the live file immediately so the next record — and any
      * external tail — finds it in place with the right mode. */
     int fd = open(apath, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
-    if (fd >= 0) close(fd);
-    chmod(apath, 0600);
+    if (fd < 0 || fchmod(fd, 0600) != 0 || close(fd) != 0 ||
+        fsync(dfd) != 0 || close(dfd) != 0)
+        audit_integrity_error("cannot persist live audit log after rotation");
 }
 /*
  * Asynchronous audit signing.
@@ -196,6 +319,15 @@ static pthread_t g_signer_tid;
 static int g_signer_started = 0;
 static int g_signer_ok = 0;
 static int g_signer_stop = 0;
+static int g_signer_inflight = 0;
+static int g_sync_fallback = 0;
+#ifndef _WIN32
+/* One kernel-held lock covers log rotation, append and chain-tip publication.
+ * A forked child closes its inherited descriptor and must initialize afresh. */
+static int audit_writer_lock_fd = -1;
+static char audit_writer_lock_path[4096];
+static int audit_recovery_context_ready = 0;
+#endif
 
 /* Start the background signer if it isn't running yet.  Must be called
  * with audit_mutex held.  Also registers the atexit teardown handler on
@@ -220,22 +352,19 @@ static void audit_ensure_signer_locked(void) {
 }
 
 /* ── fork safety ───────────────────────────────────────────────────────────
- * The signer thread does not survive fork(): the child inherits a copy of
- * the process with the signer thread GONE but every audit mutex frozen in
- * whatever state the parent's threads left it — the first child action that
- * logs (or drains the queue) then deadlocks on a mutex no surviving thread
- * will ever release.  pthread_atfork handlers fence the signer around the
- * fork and restart it fresh in the child, so a forked server (test harnesses
- * fork per session; the cluster daemon forks workers) keeps a working audit
- * path.  The child's queue is drained-to-nothing by design: entries queued
- * pre-fork were signed and written by the PARENT's signer before the fence
- * (prepare waits for the queue to empty), so nothing is lost and nothing is
- * duplicated. */
+ * The signer thread does not survive fork(). The prepare handler drains it
+ * before the address space splits, so queued entries are written by the
+ * parent once. The child discards the inherited signer state and writer-lock
+ * descriptor. It cannot append or verify until it calls qihse_audit_init()
+ * and obtains its own exclusive lock; while the parent remains the writer,
+ * that initialization fails closed. Fork-and-exec children need no lock. */
 static void audit_atfork_prepare(void) {
     pthread_mutex_lock(&audit_mutex);
     /* Wait for the signer to drain the queue so pre-fork entries are on
      * disk before the address space splits. */
-    while ((g_q_head || g_ping_pending) && g_signer_ok && !g_signer_stop) {
+    while (g_sync_fallback ||
+           ((g_q_head || g_signer_inflight || g_ping_pending) &&
+            g_signer_ok && !g_signer_stop)) {
         pthread_mutex_unlock(&audit_mutex);
         usleep(1000);
         pthread_mutex_lock(&audit_mutex);
@@ -247,15 +376,21 @@ static void audit_atfork_parent(void) {
 }
 
 static void audit_atfork_child(void) {
-    /* The signer thread does not exist in the child: reset its bookkeeping
-     * so the next audit entry restarts it.  Mutexes are frozen-unlocked by
-     * the prepare fence above; the queue is empty (prepare drained it). */
+    /* The signer is gone; keep the child inert until exclusive reinit. */
     g_q_head = NULL;
     g_q_tail = NULL;
+    g_signer_inflight = 0;
+    g_sync_fallback = 0;
     g_ping_pending = 0;
     g_signer_tid = pthread_self(); /* mark invalid-ish; started flag drives */
     g_signer_ok = 0;
     g_signer_started = 0;
+#ifndef _WIN32
+    if (audit_writer_lock_fd >= 0) close(audit_writer_lock_fd);
+    audit_writer_lock_fd = -1;
+    audit_writer_lock_path[0] = '\0';
+    audit_recovery_context_ready = 0;
+#endif
     pthread_mutex_unlock(&audit_mutex);
 }
 
@@ -282,46 +417,315 @@ static void compute_sha384(const char *input, char *output) {
     output[96] = '\0';
 }
 
-static void write_obfuscated(FILE *f, const char* buffer) {
+static bool write_obfuscated(FILE *f, const char* buffer) {
     size_t len = strlen(buffer);
     if (len + 1u > 4096u) {
-        for (size_t i = 0; i < len; i++) fputc(buffer[i] ^ XOR_KEY, f);
-        fputc('\n' ^ XOR_KEY, f);
-        return;
+        for (size_t i = 0; i < len; i++) {
+            if (fputc(buffer[i] ^ XOR_KEY, f) == EOF) return false;
+        }
+        return fputc('\n' ^ XOR_KEY, f) != EOF;
     }
     char tmp[4096];
     for (size_t i = 0; i < len; i++) tmp[i] = (char)(buffer[i] ^ XOR_KEY);
     tmp[len] = (char)('\n' ^ XOR_KEY);
-    fwrite(tmp, 1u, len + 1u, f);
+    return fwrite(tmp, 1u, len + 1u, f) == len + 1u;
 }
 
-static void update_integrity_chain(const char* new_hash);
+static bool update_integrity_chain(const char* new_hash);
+
+static void audit_integrity_error(const char *reason) {
+    fprintf(stderr, "[QIHSE AUDIT] Integrity continuity failure: %s\n", reason);
+    /* The void initialization API has no safe degraded mode: writing after
+     * a broken anchor would make the evidence harder to recover. */
+    abort();
+}
+
+#ifndef _WIN32
+static int audit_hex_hash(const char *hash) {
+    for (size_t i = 0; i < 96; i++) {
+        if (!((hash[i] >= '0' && hash[i] <= '9') ||
+              (hash[i] >= 'a' && hash[i] <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static audit_recovery_context_t audit_recovery_context;
+
+static int audit_context_matches_process(const audit_recovery_context_t *ctx) {
+    return ctx && ctx->process_id == getpid() &&
+           ctx->effective_uid == geteuid();
+}
+
+static int audit_context_allows_file(const audit_recovery_context_t *ctx,
+                                     const struct stat *st) {
+    return audit_context_matches_process(ctx) && st && S_ISREG(st->st_mode) &&
+           st->st_uid == ctx->effective_uid && (st->st_mode & 0077) == 0;
+}
+
+static void audit_context_authorize_directory(const audit_recovery_context_t *ctx,
+                                              int directory_fd) {
+    struct stat st;
+    if (!audit_context_matches_process(ctx) || directory_fd < 0 ||
+        fstat(directory_fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != ctx->effective_uid || (st.st_mode & 0022) != 0 ||
+        (ctx->directory_inode &&
+         (ctx->directory_device != st.st_dev || ctx->directory_inode != st.st_ino))) {
+        audit_integrity_error("audit recovery context cannot access directory");
+    }
+}
+
+static void audit_context_create(audit_recovery_context_t *ctx) {
+    char apath[4096], dirbuf[4096];
+    build_audit_path(apath, sizeof(apath));
+    const char *slash = strrchr(apath, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - apath);
+        if (n >= sizeof(dirbuf)) audit_integrity_error("audit directory path too long");
+        if (n == 0) audit_integrity_error("root audit directory unsupported");
+        memcpy(dirbuf, apath, n);
+        dirbuf[n] = '\0';
+    } else {
+        snprintf(dirbuf, sizeof(dirbuf), ".");
+    }
+    int fd = open(dirbuf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) audit_integrity_error("cannot open audit directory");
+    audit_recovery_context_t candidate = {
+        .effective_uid = geteuid(), .process_id = getpid()
+    };
+    audit_context_authorize_directory(&candidate, fd);
+    struct stat st;
+    if (fstat(fd, &st) != 0) audit_integrity_error("cannot identify audit directory");
+    candidate.directory_device = st.st_dev;
+    candidate.directory_inode = st.st_ino;
+    close(fd);
+    *ctx = candidate;
+}
+
+static void audit_writer_lock_acquire(const audit_recovery_context_t *ctx) {
+    if (!audit_context_matches_process(ctx))
+        audit_integrity_error("invalid audit writer identity");
+    const char *data_dir = getenv("QIHSE_DATA_DIR");
+    char path[4096];
+    if (data_dir && *data_dir &&
+        strlen(data_dir) + 1 + strlen(AUDIT_WRITER_LOCK_FILE) >= sizeof(path))
+        audit_integrity_error("audit writer lock path too long");
+    build_state_path(path, sizeof(path), AUDIT_WRITER_LOCK_FILE);
+    if (audit_writer_lock_fd >= 0) {
+        struct stat held, named;
+        if (strcmp(path, audit_writer_lock_path) != 0 ||
+            fstat(audit_writer_lock_fd, &held) != 0 ||
+            lstat(path, &named) != 0 ||
+            !audit_context_allows_file(ctx, &held) ||
+            !audit_context_allows_file(ctx, &named) ||
+            held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+            flock(audit_writer_lock_fd, LOCK_EX | LOCK_NB) != 0)
+            audit_integrity_error("audit writer lock was replaced or released");
+        return;
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) audit_integrity_error("cannot open audit writer lock");
+    struct stat held, named;
+    if (fstat(fd, &held) != 0 || lstat(path, &named) != 0 ||
+        !audit_context_allows_file(ctx, &held) ||
+        !audit_context_allows_file(ctx, &named) ||
+        held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+        flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        audit_integrity_error("audit writer lock is unavailable or unsafe");
+    }
+    audit_writer_lock_fd = fd;
+    memcpy(audit_writer_lock_path, path, strlen(path) + 1);
+}
+
+/* The legacy log is an XOR-encoded line followed by a fixed-size signature.
+ * Validate each retained record, including links across rotated files. The
+ * first retained record can have a pruned predecessor; the chain file is the
+ * independent anchor for the latest retained suffix. */
+static int audit_scan_file(const audit_recovery_context_t *ctx,
+                           int directory_fd, const char *name,
+                           char tip[129], int *have_record,
+                           const char stored[129], int *anchor_seen,
+                           int *banner_since_record) {
+    if (!audit_context_matches_process(ctx) || directory_fd < 0 || !name ||
+        strchr(name, '/')) return 0;
+    int fd = openat(directory_fd, name, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !audit_context_allows_file(ctx, &st)) {
+        close(fd); return 0;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return 0; }
+    int ok = 1;
+    for (;;) {
+        char line[2048];
+        size_t len = 0;
+        int c;
+        while ((c = fgetc(f)) != EOF && ((unsigned char)c ^ XOR_KEY) != '\n') {
+            if (len + 1 >= sizeof(line)) { ok = 0; break; }
+            line[len++] = (char)((unsigned char)c ^ XOR_KEY);
+        }
+        if (!ok) break;
+        if (c == EOF) { if (len) ok = 0; break; }
+        line[len] = '\0';
+        if (memchr(line, '\0', len) != NULL) { ok = 0; break; }
+        static const char marker[] = "|SIG_MLDSA87_ATTACHED";
+        size_t marker_len = sizeof(marker) - 1;
+        if (len < marker_len || strcmp(line + len - marker_len, marker) != 0) {
+            /* Historical initialization banners have no signature. Accept
+             * only the two exact forms emitted by the legacy writer. */
+            static const char signed_banner[] =
+                "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---";
+            static const char hash_banner[] =
+                "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 SHA-384 HASH CHAIN (PQC UNAVAILABLE)] ---";
+            if (!((len == sizeof(signed_banner) - 1 &&
+                   memcmp(line, signed_banner, len) == 0) ||
+                  (len == sizeof(hash_banner) - 1 &&
+                   memcmp(line, hash_banner, len) == 0))) ok = 0;
+            if (!ok) break;
+            *banner_since_record = 1;
+            continue;
+        }
+        if (len < 96 + 1 + 1 + 96 + marker_len) { ok = 0; break; }
+        size_t hash_start = len - marker_len - 96;
+        if (line[hash_start - 1] != '|' || !audit_hex_hash(line) ||
+            line[96] != '|' || !audit_hex_hash(line + hash_start)) {
+            ok = 0; break;
+        }
+        char expected[129];
+        line[hash_start - 1] = '\0';
+        compute_sha384(line, expected);
+        if (memcmp(expected, line + hash_start, 96) != 0) { ok = 0; break; }
+        if (*have_record && memcmp(line, tip, 96) != 0) {
+            /* Older versions started every process from the all-zero hash.
+             * Accept that legacy boundary only after an initialization
+             * banner; never treat an arbitrary broken link as a restart. */
+            static const char zero[97] =
+                "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+            if (!*banner_since_record || memcmp(line, zero, 96) != 0) {
+                ok = 0; break;
+            }
+            *anchor_seen = 0;
+        }
+        if (stored && (memcmp(line, stored, 96) == 0 ||
+                       memcmp(expected, stored, 96) == 0)) *anchor_seen = 1;
+        memcpy(tip, expected, 97);
+        *have_record = 1;
+        *banner_since_record = 0;
+        unsigned char signature[MLDSA87_SIG_BYTES];
+        if (fread(signature, 1, sizeof(signature), f) != sizeof(signature)) {
+            ok = 0; break;
+        }
+    }
+    if (ferror(f)) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    return ok;
+}
+
+static void audit_load_continuity_locked(const audit_recovery_context_t *ctx) {
+    if (!audit_context_matches_process(ctx))
+        audit_integrity_error("missing audit recovery context");
+    char chain_path[4096], apath[4096], stored[129] = {0};
+    build_chain_path(chain_path, sizeof(chain_path));
+    build_audit_path(apath, sizeof(apath));
+    char dirbuf[4096];
+    const char *base = strrchr(apath, '/');
+    if (base) {
+        size_t n = (size_t)(base - apath);
+        if (n >= sizeof(dirbuf)) audit_integrity_error("audit path too long");
+        if (n == 0) audit_integrity_error("root audit directory unsupported");
+        memcpy(dirbuf, apath, n);
+        dirbuf[n] = '\0';
+        base++;
+    } else { snprintf(dirbuf, sizeof(dirbuf), "."); base = apath; }
+    DIR *dir = opendir(dirbuf);
+    if (!dir) audit_integrity_error("cannot list audit logs");
+    audit_context_authorize_directory(ctx, dirfd(dir));
+    int chain_present = 0;
+    const char *chain_name = strrchr(chain_path, '/');
+    chain_name = chain_name ? chain_name + 1 : chain_path;
+    int fd = openat(dirfd(dir), chain_name, O_RDONLY | O_NOFOLLOW);
+    if (fd >= 0) {
+        struct stat st;
+        char raw[98];
+        int valid = fstat(fd, &st) == 0 && audit_context_allows_file(ctx, &st) &&
+                    (st.st_size == 96 || st.st_size == 97);
+        ssize_t got = valid ? read(fd, raw, sizeof(raw)) : -1;
+        valid = valid && got == st.st_size &&
+                (st.st_size == 96 || raw[96] == '\n');
+        close(fd);
+        if (!valid || !audit_hex_hash(raw)) {
+            audit_integrity_error("invalid chain tip file");
+            return;
+        }
+        memcpy(stored, raw, 96);
+        stored[96] = '\0';
+        chain_present = 1;
+    } else if (errno != ENOENT) {
+        audit_integrity_error("cannot read chain tip file");
+        return;
+    }
+
+    audit_rotated_list_t list = {0};
+    if (!audit_collect_rotated(ctx, dir, base, &list))
+        audit_integrity_error("invalid or excess rotated audit logs");
+    qsort(list.names, list.count, sizeof(list.names[0]), audit_name_cmp);
+    char tip[129] = {0};
+    int have_record = 0, anchor_seen = 0, banner_since_record = 0;
+    int valid = 1;
+    for (size_t i = 0; i < list.count; i++) {
+        if (!audit_scan_file(ctx, dirfd(dir), list.names[i], tip, &have_record,
+                             chain_present ? stored : NULL, &anchor_seen,
+                             &banner_since_record)) valid = 0;
+        if (!valid) break;
+    }
+    audit_free_rotated(&list);
+    struct stat st;
+    if (valid && fstatat(dirfd(dir), base, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        valid = audit_scan_file(ctx, dirfd(dir), base, tip, &have_record,
+                                chain_present ? stored : NULL, &anchor_seen,
+                                &banner_since_record);
+    } else if (errno != ENOENT) valid = 0;
+    closedir(dir);
+    if (!valid) { audit_integrity_error("invalid or unreadable audit log"); return; }
+    if (!have_record && chain_present) {
+        audit_integrity_error("chain tip exists without retained audit records");
+        memcpy(last_hash, stored, 97);
+        return;
+    }
+    if (!have_record) return;
+    if (!chain_present) {
+        audit_integrity_error("audit records exist without a chain tip");
+        memcpy(last_hash, tip, 97);
+        return;
+    }
+    if (memcmp(stored, tip, 96) != 0) {
+        if (anchor_seen) {
+            /* The durable log contains a valid suffix beyond the old tip. */
+            if (!update_integrity_chain(tip)) {
+                audit_integrity_error("cannot advance lagging chain tip");
+                return;
+            }
+        } else {
+            audit_integrity_error("chain tip is not anchored in retained log");
+            return;
+        }
+    }
+    memcpy(last_hash, tip, 97);
+}
+#endif
 
 void qihse_audit_verify_integrity(void) {
 #ifndef _WIN32
-    char chain_path[4096];
-    build_chain_path(chain_path, sizeof(chain_path));
-    int sfd = open(chain_path, O_RDONLY | O_NOFOLLOW);
-    if (sfd >= 0) {
-    FILE *sf = fdopen(sfd, "r");
-    if (sf) {
-        char stored_hash[129];
-        if (fgets(stored_hash, sizeof(stored_hash), sf) != NULL) {
-            if (strncmp(stored_hash, last_hash, 96) != 0) {
-                fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected!\n");
-                const char* strict = getenv("QIHSE_STRICT_AUDIT");
-                if (strict && strcmp(strict, "1") == 0) {
-                    fprintf(stderr, "[QIHSE AUDIT] Strict audit enforcement: aborting on integrity mismatch.\n");
-                    abort();
-                }
-            }
-        }
-        fclose(sf);
-    } else {
-        close(sfd);
-    }
-    }
-    // No integrity chain file = fresh start, no lockdown
+    pthread_mutex_lock(&audit_mutex);
+    while (g_sync_fallback ||
+           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop))
+        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+    if (!audit_recovery_context_ready || audit_writer_lock_fd < 0)
+        audit_integrity_error("audit recovery has no authenticated context");
+    audit_writer_lock_acquire(&audit_recovery_context);
+    audit_load_continuity_locked(&audit_recovery_context);
+    pthread_mutex_unlock(&audit_mutex);
 #else
     char chain_path[4096];
     build_chain_path(chain_path, sizeof(chain_path));
@@ -343,20 +747,48 @@ void qihse_audit_verify_integrity(void) {
 #endif
 }
 
-static void update_integrity_chain(const char* new_hash) {
+static bool update_integrity_chain(const char* new_hash) {
 #ifndef _WIN32
     char chain_path[4096];
     build_chain_path(chain_path, sizeof(chain_path));
-    int sfd = open(chain_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (sfd >= 0) {
-        FILE *sf = fdopen(sfd, "w");
-        if (sf) {
-            fprintf(sf, "%s", new_hash);
-            fclose(sf);
-        } else {
-            close(sfd);
-        }
+    char temp_path[sizeof(chain_path) + 16];
+    int n = snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", chain_path);
+    if (n < 0 || (size_t)n >= sizeof(temp_path)) goto error;
+    int fd = mkstemp(temp_path);
+    if (fd < 0) goto error;
+    if (fchmod(fd, 0600) != 0) goto failed;
+    size_t offset = 0;
+    while (offset < 96u) {
+        ssize_t written = write(fd, new_hash + offset, 96u - offset);
+        if (written <= 0) goto failed;
+        offset += (size_t)written;
     }
+    if (fsync(fd) != 0) goto failed;
+    if (close(fd) != 0) {
+        fd = -1;
+        goto failed;
+    }
+    fd = -1;
+    if (rename(temp_path, chain_path) != 0) goto failed;
+    /* Persist the directory entry as well as the content. */
+    char dir_path[sizeof(chain_path)];
+    snprintf(dir_path, sizeof(dir_path), "%s", chain_path);
+    char *slash = strrchr(dir_path, '/');
+    if (slash == dir_path) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    else snprintf(dir_path, sizeof(dir_path), ".");
+    int dirfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dirfd < 0) goto error;
+    int synced = fsync(dirfd);
+    int closed = close(dirfd);
+    if (synced != 0 || closed != 0) goto error;
+    return true;
+failed:
+    if (fd >= 0) close(fd);
+    unlink(temp_path);
+error:
+    fprintf(stderr, "[QIHSE AUDIT] Could not persist integrity chain tip.\n");
+    return false;
 #else
     char chain_path[4096];
     build_chain_path(chain_path, sizeof(chain_path));
@@ -364,7 +796,9 @@ static void update_integrity_chain(const char* new_hash) {
     if (sf) {
         fprintf(sf, "%s", new_hash);
         fclose(sf);
+        return true;
     }
+    return false;
 #endif
 }
 
@@ -380,6 +814,23 @@ void qihse_audit_set_webhook(const char* url) {
 
 void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
+#ifndef _WIN32
+    while (g_sync_fallback ||
+           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop))
+        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+    /* Validate and restore the last durable tip before rotating, pruning or
+     * appending the startup banner. A strict mismatch aborts before mutation. */
+    audit_recovery_context_t candidate;
+    audit_context_create(&candidate);
+    if (audit_recovery_context_ready &&
+        (audit_recovery_context.directory_device != candidate.directory_device ||
+         audit_recovery_context.directory_inode != candidate.directory_inode))
+        audit_integrity_error("audit directory changed during process lifetime");
+    audit_writer_lock_acquire(&candidate);
+    audit_recovery_context = candidate;
+    audit_recovery_context_ready = 1;
+    audit_load_continuity_locked(&audit_recovery_context);
+#endif
     
     static OSSL_PROVIDER *default_provider = NULL;
     if (!default_provider) {
@@ -420,29 +871,54 @@ void qihse_audit_init(void) {
      * record lands. */
     audit_maybe_rotate();
 #endif
-    FILE *f = fopen(apath, "ab");
-    if (f) {
-        if (audit_pkey) {
-            write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
-        } else {
-            write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 SHA-384 HASH CHAIN (PQC UNAVAILABLE)] ---");
-        }
-        fclose(f);
 #ifndef _WIN32
-        chmod(apath, 0600);
+    int banner_fd = open(apath, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (banner_fd >= 0 && fchmod(banner_fd, 0600) != 0) {
+        close(banner_fd);
+        banner_fd = -1;
+    }
+    FILE *f = banner_fd >= 0 ? fdopen(banner_fd, "ab") : NULL;
+    if (banner_fd >= 0 && !f) close(banner_fd);
+#else
+    FILE *f = fopen(apath, "ab");
 #endif
+    if (f) {
+        bool banner_written;
+        if (audit_pkey) {
+            banner_written = write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 ML-DSA-87 ENABLED] ---");
+        } else {
+            banner_written = write_obfuscated(f, "--- SYSTEM AUTH CACHE INITIALIZED [CNSA 2.0 SHA-384 HASH CHAIN (PQC UNAVAILABLE)] ---");
+        }
+        int flushed = fflush(f);
+#ifndef _WIN32
+        int synced = flushed == 0 ? fsync(fileno(f)) : -1;
+#else
+        int synced = flushed;
+#endif
+        int closed = fclose(f);
+        if (!banner_written || flushed != 0 || synced != 0 || closed != 0) {
+            fprintf(stderr, "[QIHSE AUDIT] Startup banner could not be persisted.\n");
+            abort();
+        }
+    } else {
+        fprintf(stderr, "[QIHSE AUDIT] Audit log could not be opened.\n");
+        abort();
     }
     /* Start the background signer so qihse_audit_log() never blocks on the
      * ~6.5 ms/entry ML-DSA-87 signing path.  If the thread cannot start, the
      * log path transparently falls back to synchronous signing. */
     audit_ensure_signer_locked();
     pthread_mutex_unlock(&audit_mutex);
-    qihse_audit_verify_integrity();
 }
 
 /* The expensive part: ML-DSA-87 signature + audit file + integrity chain.
  * Runs on the signer thread (or inline as a fallback). */
 static void audit_sign_and_write(const char* buffer, const char* new_hash) {
+#ifndef _WIN32
+    if (!audit_recovery_context_ready || audit_writer_lock_fd < 0)
+        audit_integrity_error("audit writer is not initialized in this process");
+    audit_writer_lock_acquire(&audit_recovery_context);
+#endif
     unsigned char mldsa87_sig[MLDSA87_SIG_BYTES];
     size_t siglen = sizeof(mldsa87_sig);
     memset(mldsa87_sig, 0, sizeof(mldsa87_sig));
@@ -464,6 +940,10 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     char apath2[512];
     build_audit_path(apath2, sizeof(apath2));
     int afd = open(apath2, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (afd >= 0 && fchmod(afd, 0600) != 0) {
+        close(afd);
+        afd = -1;
+    }
     FILE *f = NULL;
     if (afd >= 0) f = fdopen(afd, "ab");
 #else
@@ -471,20 +951,52 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     build_audit_path(wpath, sizeof(wpath));
     FILE *f = fopen(wpath, "ab");
 #endif
+    int log_durable = 0;
     if (f) {
         char out_buf[2048];
         snprintf(out_buf, sizeof(out_buf), "%s|%s|SIG_MLDSA87_ATTACHED", buffer, new_hash);
-        write_obfuscated(f, out_buf);
+        bool record_written = write_obfuscated(f, out_buf);
         char sigbuf[MLDSA87_SIG_BYTES];
         for (int i = 0; i < MLDSA87_SIG_BYTES; i++) sigbuf[i] = (char)(mldsa87_sig[i] ^ XOR_KEY);
-        fwrite(sigbuf, 1u, sizeof(sigbuf), f);
-        fclose(f);
+        size_t sig_written = fwrite(sigbuf, 1u, sizeof(sigbuf), f);
+        int flushed = fflush(f);
+#ifndef _WIN32
+        int synced = flushed == 0 ? fsync(fileno(f)) : -1;
+#else
+        int synced = flushed;
+#endif
+        int closed = fclose(f);
+        log_durable = record_written && sig_written == sizeof(sigbuf) && flushed == 0 &&
+                      synced == 0 && closed == 0;
     }
 #ifndef _WIN32
     if (afd >= 0 && !f) close(afd);
+    if (log_durable) {
+        /* The append is durable only after its directory entry survives a
+         * crash too, including a newly created live file after rotation. */
+        char dir_path[sizeof(apath2)];
+        snprintf(dir_path, sizeof(dir_path), "%s", apath2);
+        char *slash = strrchr(dir_path, '/');
+        if (slash == dir_path) slash[1] = '\0';
+        else if (slash) *slash = '\0';
+        else snprintf(dir_path, sizeof(dir_path), ".");
+        int dfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (dfd < 0) log_durable = 0;
+        else {
+            if (fsync(dfd) != 0) log_durable = 0;
+            if (close(dfd) != 0) log_durable = 0;
+        }
+    }
 #endif
 
-    update_integrity_chain(new_hash);
+    /* Never publish a chain tip for a record that was not durably appended.
+     * Continuing would silently fork the chain after an I/O failure. */
+    if (!log_durable) {
+        fprintf(stderr, "[QIHSE AUDIT] Audit record could not be persisted.\n");
+        abort();
+    }
+
+    if (!update_integrity_chain(new_hash)) abort();
 }
 
 static void* audit_signer_main(void* arg) {
@@ -501,23 +1013,31 @@ static void* audit_signer_main(void* arg) {
         audit_pending_t* e = g_q_head;
         if (e) {
             g_q_head = e->next;
-            if (!g_q_head) { g_q_tail = NULL; pthread_cond_broadcast(&g_q_empty_cond); }
+            g_signer_inflight = 1;
+            if (!g_q_head) g_q_tail = NULL;
         }
         int ping = g_ping_pending;
         uint32_t pu = g_ping_uid; uint16_t pc = g_ping_classif, ps = g_ping_sci;
         g_ping_pending = 0;
         pthread_mutex_unlock(&audit_mutex);
 
-        if (e) { audit_sign_and_write(e->buffer, e->new_hash); free(e); }
+        if (e) {
+            audit_sign_and_write(e->buffer, e->new_hash);
+            free(e);
+            pthread_mutex_lock(&audit_mutex);
+            g_signer_inflight = 0;
+            if (!g_q_head) pthread_cond_broadcast(&g_q_empty_cond);
+            pthread_mutex_unlock(&audit_mutex);
+        }
         if (ping) send_webhook_ping(pu, pc, ps);
     }
 }
 
 /* Block until every queued audit entry has been signed and written. */
 void qihse_audit_flush(void) {
-    if (!g_signer_ok) return;
     pthread_mutex_lock(&audit_mutex);
-    while (g_q_head && !g_signer_stop) {
+    while (g_sync_fallback ||
+           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop)) {
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     }
     pthread_mutex_unlock(&audit_mutex);
@@ -543,6 +1063,13 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     /* Hash-chain step stays synchronous: it is cheap and preserves the exact
      * ordering and tamper-evidence of the chain. */
     pthread_mutex_lock(&audit_mutex);
+#ifndef _WIN32
+    if (!audit_recovery_context_ready || audit_writer_lock_fd < 0 ||
+        !audit_context_matches_process(&audit_recovery_context))
+        audit_integrity_error("audit writer is not initialized in this process");
+    audit_writer_lock_acquire(&audit_recovery_context);
+#endif
+    while (g_sync_fallback) pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     time_t now = time(NULL);
     snprintf(buffer, sizeof(buffer), "%s|%ld|%s|%u|%u|%u|%u",
              last_hash, (long)now, action, user_id, target_id, classif, sci);
@@ -563,11 +1090,17 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
             return;
         }
     }
+    /* Block subsequent chain steps while an allocation fallback waits for
+     * earlier queued records and writes its already-hashed record. */
+    g_sync_fallback = 1;
+    while ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop)
+        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     pthread_mutex_unlock(&audit_mutex);
-
-    /* Fallback (signer unavailable or allocation failure): sign inline so an
-     * entry is never silently dropped. */
     audit_sign_and_write(buffer, new_hash);
+    pthread_mutex_lock(&audit_mutex);
+    g_sync_fallback = 0;
+    pthread_cond_broadcast(&g_q_empty_cond);
+    pthread_mutex_unlock(&audit_mutex);
 }
 
 #include <fcntl.h>

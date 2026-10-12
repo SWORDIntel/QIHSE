@@ -2,6 +2,7 @@
 #include "qihse_audit.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/provider.h>
 
@@ -28,14 +30,14 @@ struct qihse_blob_store {
     blob_entry_t* slots[BLOB_INDEX_SLOTS];
     size_t entry_count;
     pthread_rwlock_t index_lock;   /* guards slots/entry_count */
-    uint64_t put_counter;          /* unique temp-file names; uploads run in parallel */
-    FILE* index_log;
+    int index_fd;
+    bool poisoned;                 /* failed rollback: no further mutations */
     pthread_mutex_t log_lock;
     EVP_MD* sha384;
 };
 
 /* --------------------------------------------------------------------------
- * SHA-256 helpers
+ * SHA-384 helpers
  * -------------------------------------------------------------------------- */
 static const EVP_MD* blob_sha384(qihse_blob_store_t* store) {
     return store->sha384 ? store->sha384 : EVP_sha384();
@@ -97,35 +99,63 @@ static void blob_object_path(qihse_blob_store_t* store, const uint8_t* hash,
     snprintf(path, path_cap, "%s/objects/%.2s/%s", store->base_dir, hex, hex + 2);
 }
 
-/* Append one metadata record and flush. log_lock held. */
+static bool blob_fsync_dir(const char* path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+/* Append one metadata record and durably sync it. log_lock held. */
 static bool blob_log_append(qihse_blob_store_t* store, char op, const qihse_blob_info_t* info) {
-    if (!store->index_log) return false;
-    unsigned char magic = BLOB_INDEX_MAGIC;
-    unsigned char version = BLOB_INDEX_VERSION;
-    if (fwrite(&magic, 1, 1, store->index_log) != 1 ||
-        fwrite(&version, 1, 1, store->index_log) != 1 ||
-        fwrite(&op, 1, 1, store->index_log) != 1) {
-        return false;
-    }
+    if (store->index_fd < 0 || store->poisoned || !info) return false;
+    unsigned char record[3u + sizeof(*info)];
+    record[0] = BLOB_INDEX_MAGIC;
+    record[1] = BLOB_INDEX_VERSION;
+    record[2] = (unsigned char)op;
+    size_t length = 3u;
     if (op == 'D') {
-        if (fwrite(info->hash, 1, QIHSE_BLOB_HASH_BYTES, store->index_log) != QIHSE_BLOB_HASH_BYTES) return false;
+        memcpy(record + length, info->hash, QIHSE_BLOB_HASH_BYTES);
+        length += QIHSE_BLOB_HASH_BYTES;
     } else {
-        if (fwrite(info, sizeof(*info), 1, store->index_log) != 1) return false;
+        memcpy(record + length, info, sizeof(*info));
+        length += sizeof(*info);
     }
-    if (fflush(store->index_log) != 0) return false;
-    return true;
+    off_t start = lseek(store->index_fd, 0, SEEK_END);
+    if (start < 0) return false;
+    size_t written = 0u;
+    while (written < length) {
+        ssize_t n = write(store->index_fd, record + written, length - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    if (written == length && fsync(store->index_fd) == 0) return true;
+    /* Never append past a partial record. If rollback itself is uncertain,
+     * refuse further mutation until the store is reopened and replayed. */
+    if (ftruncate(store->index_fd, start) != 0 || fsync(store->index_fd) != 0)
+        store->poisoned = true;
+    return false;
 }
 
 static bool blob_log_replay(qihse_blob_store_t* store) {
-    FILE* f = fopen(store->index_path, "rb");
-    if (!f) return true; /* fresh store */
+    FILE* f = fopen(store->index_path, "rb+");
+    if (!f) return errno == ENOENT; /* fresh store */
     unsigned char header[3];
     qihse_blob_info_t info;
-    while (fread(header, 1, sizeof(header), f) == sizeof(header)) {
-        if (header[0] != BLOB_INDEX_MAGIC || header[1] != BLOB_INDEX_VERSION) break; /* torn tail */
+    off_t valid_end = 0;
+    bool torn = false, ok = true;
+    for (;;) {
+        size_t got = fread(header, 1, sizeof(header), f);
+        if (got == 0u && feof(f)) break;
+        if (got != sizeof(header)) { torn = true; break; }
+        if (header[0] != BLOB_INDEX_MAGIC || header[1] != BLOB_INDEX_VERSION) {
+            ok = false; break;
+        }
         if (header[2] == 'D') {
             uint8_t hash[QIHSE_BLOB_HASH_BYTES];
-            if (fread(hash, 1, sizeof(hash), f) != sizeof(hash)) break;
+            if (fread(hash, 1, sizeof(hash), f) != sizeof(hash)) { torn = true; break; }
             blob_entry_t* e = blob_find_entry(store, hash);
             if (e) {
                 blob_entry_t** link = &store->slots[blob_slot(hash)];
@@ -134,25 +164,41 @@ static bool blob_log_replay(qihse_blob_store_t* store) {
                 free(e);
                 store->entry_count--;
             }
+            valid_end = ftello(f);
+            if (valid_end < 0) { ok = false; break; }
             continue;
         }
-        if (header[2] != 'P' && header[2] != 'R' && header[2] != 'U') break;
-        if (fread(&info, sizeof(info), 1, f) != 1) break;
+        if (header[2] != 'P' && header[2] != 'R' && header[2] != 'U') { ok = false; break; }
+        if (fread(&info, sizeof(info), 1, f) != 1) { torn = true; break; }
+        if (info.size > QIHSE_BLOB_MAX_SIZE || info.refcount == 0u ||
+            info.tag == 0u || info.tag > QIHSE_BLOB_TAG_REPL_TRANSACTION ||
+            (info.tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
+             info.tenant_id != QIHSE_TENANT_SYSTEM)) {
+            ok = false; break;
+        }
         blob_entry_t* e = blob_find_entry(store, info.hash);
         if (e) {
             e->info = info; /* last state wins */
         } else {
             e = calloc(1, sizeof(*e));
-            if (!e) break;
+            if (!e) { ok = false; break; }
             e->info = info;
             size_t slot = blob_slot(info.hash);
             e->next = store->slots[slot];
             store->slots[slot] = e;
             store->entry_count++;
         }
+        valid_end = ftello(f);
+        if (valid_end < 0) { ok = false; break; }
     }
-    fclose(f);
-    return true;
+    if (ferror(f)) ok = false;
+    if (ok && torn) {
+        clearerr(f);
+        if (valid_end < 0 || ftruncate(fileno(f), valid_end) != 0 ||
+            fsync(fileno(f)) != 0) ok = false;
+    }
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
 /* --------------------------------------------------------------------------
@@ -184,6 +230,7 @@ qihse_blob_store_t* qihse_blob_store_create(const char* base_dir) {
     }
     qihse_blob_store_t* store = calloc(1, sizeof(*store));
     if (!store) return NULL;
+    store->index_fd = -1;
     snprintf(store->base_dir, sizeof(store->base_dir), "%s", base_dir);
     snprintf(store->objects_dir, sizeof(store->objects_dir), "%s/objects", base_dir);
     snprintf(store->index_path, sizeof(store->index_path), "%s/index.log", base_dir);
@@ -207,8 +254,9 @@ qihse_blob_store_t* qihse_blob_store_create(const char* base_dir) {
         qihse_blob_store_destroy(store);
         return NULL;
     }
-    store->index_log = fopen(store->index_path, "ab");
-    if (!store->index_log) {
+    store->index_fd = open(store->index_path,
+                           O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (store->index_fd < 0 || !blob_fsync_dir(store->base_dir)) {
         qihse_blob_store_destroy(store);
         return NULL;
     }
@@ -228,7 +276,7 @@ void qihse_blob_store_destroy(qihse_blob_store_t* store) {
         store->slots[i] = NULL;
     }
     pthread_rwlock_unlock(&store->index_lock);
-    if (store->index_log) fclose(store->index_log);
+    if (store->index_fd >= 0) close(store->index_fd);
     if (store->sha384) EVP_MD_free(store->sha384);
     pthread_rwlock_destroy(&store->index_lock);
     pthread_mutex_destroy(&store->log_lock);
@@ -238,18 +286,26 @@ void qihse_blob_store_destroy(qihse_blob_store_t* store) {
 /* --------------------------------------------------------------------------
  * Write path
  * -------------------------------------------------------------------------- */
-bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
-                         qihse_blob_tag_t tag, uint16_t classification,
-                         uint16_t sci_compartment, qihse_user_t* user,
-                         qihse_blob_read_fn read_fn, void* read_opaque,
-                         uint8_t out_hash[QIHSE_BLOB_HASH_BYTES], uint64_t* out_size) {
+static bool blob_put_internal(qihse_blob_store_t* store, uint32_t tenant_id,
+                              qihse_blob_tag_t tag, uint16_t classification,
+                              uint16_t sci_compartment, qihse_user_t* user,
+                              qihse_blob_read_fn read_fn, void* read_opaque,
+                              uint8_t out_hash[QIHSE_BLOB_HASH_BYTES],
+                              uint64_t* out_size,
+                              const uint8_t* expected_hash,
+                              uint64_t expected_size) {
     if (!store || !read_fn || !out_hash) return false;
+    if (expected_hash && expected_size > QIHSE_BLOB_MAX_SIZE) return false;
     uint32_t user_tenant = 0;
     if (!blob_user_tenant(user, &user_tenant)) {
         qihse_audit_log("BLOB_DENIED_NULL_OR_DEAD_USER", 0xFFFFFFFFu, 0, classification, sci_compartment);
         return false;
     }
-    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_COMMONS_SNAPSHOT) return false;
+    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_REPL_TRANSACTION) return false;
+    if (tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
+        (tenant_id != QIHSE_TENANT_SYSTEM ||
+         user_tenant != QIHSE_TENANT_SYSTEM ||
+         qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR)) return false;
     if (user_tenant != QIHSE_TENANT_SYSTEM) {
         /* Tenant principals write only inside their own tenant and never to
          * the commons collection (operator-curated). */
@@ -262,7 +318,7 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
 
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     FILE* tmp = NULL;
-    char tmp_path[640];
+    char tmp_path[640] = {0};
     uint8_t hash[QIHSE_BLOB_HASH_BYTES];
     bool ok = false;
     uint64_t total = 0;
@@ -270,11 +326,17 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
     do {
         if (!ctx) break;
         if (EVP_DigestInit_ex(ctx, blob_sha384(store), NULL) != 1) break;
-        /* Unique per-put temp name: concurrent uploads never collide. */
-        uint64_t seq = __atomic_add_fetch(&store->put_counter, 1u, __ATOMIC_RELAXED);
-        snprintf(tmp_path, sizeof(tmp_path), "%s/tmp-put-%ld-%llu", store->base_dir,
-                 (long)getpid(), (unsigned long long)seq);
-        tmp = fopen(tmp_path, "wb");
+        /* mkstemp also avoids a collision with a temp file left by a
+         * previous process after a crash or PID reuse. */
+        snprintf(tmp_path, sizeof(tmp_path), "%s/tmp-put-XXXXXX", store->base_dir);
+        int tmp_fd = mkstemp(tmp_path);
+        if (tmp_fd < 0) break;
+        if (fcntl(tmp_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            close(tmp_fd);
+            break;
+        }
+        tmp = fdopen(tmp_fd, "wb");
+        if (!tmp) { close(tmp_fd); break; }
         if (!tmp) break;
 
         uint8_t buffer[QIHSE_BLOB_CHUNK_SIZE];
@@ -290,15 +352,25 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
         if (!ok) break;
 
         unsigned int md_len = 0;
-        if (EVP_DigestFinal_ex(ctx, hash, &md_len) != 1 || md_len != QIHSE_BLOB_HASH_BYTES) { ok = false; break; }
+        if (EVP_DigestFinal_ex(ctx, hash, &md_len) != 1 || md_len != QIHSE_BLOB_HASH_BYTES ||
+            (expected_hash && (total != expected_size ||
+             CRYPTO_memcmp(hash, expected_hash, QIHSE_BLOB_HASH_BYTES) != 0))) {
+            ok = false;
+            break;
+        }
         if (fflush(tmp) != 0 || fsync(fileno(tmp)) != 0) { ok = false; break; }
-        fclose(tmp);
+        if (fclose(tmp) != 0) { tmp = NULL; ok = false; break; }
         tmp = NULL;
 
         char object_path[640];
         blob_object_path(store, hash, object_path, sizeof(object_path));
 
         pthread_rwlock_wrlock(&store->index_lock);
+        if (store->poisoned) {
+            pthread_rwlock_unlock(&store->index_lock);
+            ok = false;
+            break;
+        }
         blob_entry_t* existing = blob_find_entry(store, hash);
         if (existing) {
             /* Content already present: identical binding bumps the refcount;
@@ -312,12 +384,19 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
                 ok = false;
                 break;
             }
-            existing->info.refcount++;
+            if (existing->info.refcount == UINT32_MAX) {
+                pthread_rwlock_unlock(&store->index_lock);
+                ok = false;
+                break;
+            }
             qihse_blob_info_t snapshot = existing->info;
+            snapshot.refcount++;
             pthread_mutex_lock(&store->log_lock);
-            blob_log_append(store, 'R', &snapshot);
+            bool logged = blob_log_append(store, 'R', &snapshot);
             pthread_mutex_unlock(&store->log_lock);
+            if (logged) existing->info = snapshot;
             pthread_rwlock_unlock(&store->index_lock);
+            if (!logged) { ok = false; break; }
             unlink(tmp_path);
             memcpy(out_hash, hash, QIHSE_BLOB_HASH_BYTES);
             if (out_size) *out_size = total;
@@ -335,7 +414,17 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
             ok = false;
             break;
         }
+        if (!blob_fsync_dir(store->objects_dir)) {
+            pthread_rwlock_unlock(&store->index_lock);
+            ok = false;
+            break;
+        }
         if (rename(tmp_path, object_path) != 0) {
+            pthread_rwlock_unlock(&store->index_lock);
+            ok = false;
+            break;
+        }
+        if (!blob_fsync_dir(shard_dir) || !blob_fsync_dir(store->base_dir)) {
             pthread_rwlock_unlock(&store->index_lock);
             ok = false;
             break;
@@ -354,16 +443,20 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
         e->info.classification = classification;
         e->info.sci_compartment = sci_compartment;
         e->info.refcount = 1;
-        size_t slot = blob_slot(hash);
-        e->next = store->slots[slot];
-        store->slots[slot] = e;
-        store->entry_count++;
-
         qihse_blob_info_t snapshot = e->info;
         pthread_mutex_lock(&store->log_lock);
-        blob_log_append(store, 'P', &snapshot);
+        bool logged = blob_log_append(store, 'P', &snapshot);
         pthread_mutex_unlock(&store->log_lock);
+        if (logged) {
+            size_t slot = blob_slot(hash);
+            e->next = store->slots[slot];
+            store->slots[slot] = e;
+            store->entry_count++;
+        } else {
+            free(e);
+        }
         pthread_rwlock_unlock(&store->index_lock);
+        if (!logged) { ok = false; break; }
 
         memcpy(out_hash, hash, QIHSE_BLOB_HASH_BYTES);
         if (out_size) *out_size = total;
@@ -372,9 +465,35 @@ bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
     } while (0);
 
     if (tmp) fclose(tmp);
-    unlink(tmp_path);
+    if (tmp_path[0]) unlink(tmp_path);
     if (ctx) EVP_MD_CTX_free(ctx);
     return false;
+}
+
+bool qihse_blob_put_user(qihse_blob_store_t* store, uint32_t tenant_id,
+                         qihse_blob_tag_t tag, uint16_t classification,
+                         uint16_t sci_compartment, qihse_user_t* user,
+                         qihse_blob_read_fn read_fn, void* read_opaque,
+                         uint8_t out_hash[QIHSE_BLOB_HASH_BYTES], uint64_t* out_size) {
+    return blob_put_internal(store, tenant_id, tag, classification,
+                             sci_compartment, user, read_fn, read_opaque,
+                             out_hash, out_size, NULL, 0u);
+}
+
+bool qihse_blob_put_expected_user(qihse_blob_store_t* store,
+                                  uint32_t tenant_id, qihse_blob_tag_t tag,
+                                  uint16_t classification,
+                                  uint16_t sci_compartment, qihse_user_t* user,
+                                  qihse_blob_read_fn read_fn, void* read_opaque,
+                                  const uint8_t expected_hash[QIHSE_BLOB_HASH_BYTES],
+                                  uint64_t expected_size) {
+    if (!expected_hash) return false;
+    uint8_t actual_hash[QIHSE_BLOB_HASH_BYTES];
+    uint64_t actual_size = 0u;
+    return blob_put_internal(store, tenant_id, tag, classification,
+                             sci_compartment, user, read_fn, read_opaque,
+                             actual_hash, &actual_size, expected_hash,
+                             expected_size);
 }
 
 typedef struct {
@@ -480,6 +599,70 @@ bool qihse_blob_info_user(qihse_blob_store_t* store, const uint8_t* hash,
     return true;
 }
 
+bool qihse_blob_verify_with_info_user(qihse_blob_store_t* store,
+                                      const uint8_t* hash, qihse_user_t* user,
+                                      qihse_blob_info_t* out_info,
+                                      uint8_t* out_prefix, size_t prefix_len) {
+    if (!store || !hash || !user || prefix_len > 256u ||
+        (prefix_len && !out_prefix)) return false;
+    blob_entry_t* e = NULL;
+    char object_path[640];
+    if (!blob_open_entry(store, hash, user, &e, object_path,
+                         sizeof(object_path))) return false;
+    qihse_blob_info_t info = e->info;
+    uint64_t expected_size = info.size;
+    int fd = open(object_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    pthread_rwlock_unlock(&store->index_lock);
+    if (fd < 0 || prefix_len > expected_size) {
+        if (fd >= 0) close(fd);
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size != expected_size) {
+        close(fd);
+        return false;
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    bool ok = ctx && EVP_DigestInit_ex(ctx, blob_sha384(store), NULL) == 1;
+    uint8_t buffer[64u * 1024u];
+    uint8_t prefix[256u];
+    uint64_t total = 0u;
+    while (ok && total < expected_size) {
+        size_t wanted = sizeof(buffer);
+        if (expected_size - total < wanted) wanted = (size_t)(expected_size - total);
+        ssize_t n = read(fd, buffer, wanted);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || EVP_DigestUpdate(ctx, buffer, (size_t)n) != 1) {
+            ok = false;
+            break;
+        }
+        if (total < prefix_len) {
+            size_t part = prefix_len - (size_t)total;
+            if (part > (size_t)n) part = (size_t)n;
+            memcpy(prefix + total, buffer, part);
+        }
+        total += (uint64_t)n;
+    }
+    uint8_t actual[QIHSE_BLOB_HASH_BYTES];
+    unsigned int actual_len = 0u;
+    if (ok) ok = EVP_DigestFinal_ex(ctx, actual, &actual_len) == 1 &&
+        actual_len == QIHSE_BLOB_HASH_BYTES &&
+        CRYPTO_memcmp(actual, hash, QIHSE_BLOB_HASH_BYTES) == 0;
+    EVP_MD_CTX_free(ctx);
+    if (close(fd) != 0) ok = false;
+    if (ok) {
+        if (out_info) *out_info = info;
+        if (prefix_len) memcpy(out_prefix, prefix, prefix_len);
+    }
+    return ok;
+}
+
+bool qihse_blob_verify_user(qihse_blob_store_t* store, const uint8_t* hash,
+                            qihse_user_t* user) {
+    return qihse_blob_verify_with_info_user(store, hash, user, NULL, NULL, 0u);
+}
+
 /* --------------------------------------------------------------------------
  * Reference management / deletion
  * -------------------------------------------------------------------------- */
@@ -490,6 +673,10 @@ static bool blob_mutate_ref(qihse_blob_store_t* store, const uint8_t* hash,
     if (!blob_user_tenant(user, &user_tenant)) return false;
 
     pthread_rwlock_wrlock(&store->index_lock);
+    if (store->poisoned) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
     blob_entry_t* e = blob_find_entry(store, hash);
     if (!e) {
         pthread_rwlock_unlock(&store->index_lock);
@@ -507,40 +694,53 @@ static bool blob_mutate_ref(qihse_blob_store_t* store, const uint8_t* hash,
             pthread_rwlock_unlock(&store->index_lock);
             return false;
         }
-        e->info.refcount++;
         qihse_blob_info_t snapshot = e->info;
+        snapshot.refcount++;
         pthread_mutex_lock(&store->log_lock);
-        blob_log_append(store, 'R', &snapshot);
+        bool logged = blob_log_append(store, 'R', &snapshot);
         pthread_mutex_unlock(&store->log_lock);
+        if (logged) e->info = snapshot;
         pthread_rwlock_unlock(&store->index_lock);
-        return true;
+        return logged;
     }
     if (e->info.refcount > 1) {
-        e->info.refcount--;
         qihse_blob_info_t snapshot = e->info;
+        snapshot.refcount--;
         pthread_mutex_lock(&store->log_lock);
-        blob_log_append(store, 'U', &snapshot);
+        bool logged = blob_log_append(store, 'U', &snapshot);
         pthread_mutex_unlock(&store->log_lock);
+        if (logged) e->info = snapshot;
         pthread_rwlock_unlock(&store->index_lock);
-        return true;
+        return logged;
     }
     if (!allow_delete) {
         pthread_rwlock_unlock(&store->index_lock);
         return false;
     }
-    /* Refcount drops to zero: remove the object. */
+    /* Durably remove the index reference before unlinking the object. A
+     * failed unlink can leave an orphan, never a live index to missing data. */
     char object_path[640];
     blob_object_path(store, hash, object_path, sizeof(object_path));
-    unlink(object_path);
     qihse_blob_info_t snapshot = e->info;
+    pthread_mutex_lock(&store->log_lock);
+    bool logged = blob_log_append(store, 'D', &snapshot);
+    pthread_mutex_unlock(&store->log_lock);
+    if (!logged) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
     blob_entry_t** link = &store->slots[blob_slot(hash)];
     while (*link && *link != e) link = &(*link)->next;
     if (*link) *link = e->next;
     free(e);
     store->entry_count--;
-    pthread_mutex_lock(&store->log_lock);
-    blob_log_append(store, 'D', &snapshot);
-    pthread_mutex_unlock(&store->log_lock);
+    if (unlink(object_path) == 0) {
+        char shard_dir[600];
+        char hex[QIHSE_BLOB_HASH_HEX];
+        qihse_blob_hash_to_hex(hash, hex);
+        snprintf(shard_dir, sizeof(shard_dir), "%s/objects/%.2s", store->base_dir, hex);
+        (void)blob_fsync_dir(shard_dir);
+    }
     pthread_rwlock_unlock(&store->index_lock);
     return true;
 }

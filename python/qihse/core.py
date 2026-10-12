@@ -10,15 +10,26 @@ import threading
 from enum import IntEnum
 from typing import List, Optional, Tuple, Union
 
-# Find libqihse.so — use absolute paths only to prevent CWD hijacking
-_LIB_PATHS = [
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
-    "/opt/qihse/libqihse.so",
-    "/opt/qihse/lib/libqihse.so",
-    "/opt/parrotagent/libqihse.so",
-    "/usr/local/lib/libqihse.so",
-    "/usr/lib/libqihse.so",
-]
+# Allow a service manager to pin the matched native runtime explicitly. Keep
+# the override absolute and fail closed so a stale fallback library cannot be
+# loaded accidentally in a mixed-runtime deployment.
+_configured_lib = os.environ.get("QIHSE_LIB_PATH")
+if _configured_lib:
+    if not os.path.isabs(_configured_lib):
+        raise ImportError("QIHSE_LIB_PATH must be an absolute file path")
+    if not os.path.isfile(_configured_lib):
+        raise ImportError("QIHSE_LIB_PATH does not name a regular file")
+    _LIB_PATHS = [_configured_lib]
+else:
+    # Use absolute paths only to prevent CWD hijacking.
+    _LIB_PATHS = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "libqihse.so"),
+        "/opt/qihse/libqihse.so",
+        "/opt/qihse/lib/libqihse.so",
+        "/opt/parrotagent/libqihse.so",
+        "/usr/local/lib/libqihse.so",
+        "/usr/lib/libqihse.so",
+    ]
 
 _lib = None
 for p in _LIB_PATHS:

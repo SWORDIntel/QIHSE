@@ -495,12 +495,21 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     if (!cfg || !cfg->dsa_key_path || cfg->trusted_count == 0 || !cfg->trusted_pubs) {
         return QIHSE_QKP_REJECTED;
     }
-    if (!qkp_write_all(fd, QKP_MAGIC, 4u)) return QIHSE_QKP_REJECTED;
+    if (!qkp_write_all(fd, QKP_MAGIC, 4u)) {
+        qkp_log_reject(cfg, "client QKP1 probe write failed");
+        return QIHSE_QKP_REJECTED;
+    }
 
     uint8_t h1[QIHSE_QKP_MAX_PAYLOAD];
     ssize_t h1_len = qkp_read_frame(fd, h1);
-    if (h1_len < 0) return QIHSE_QKP_REJECTED;
-    if ((size_t)h1_len < 2u + 64u + 32u + 2u + QIHSE_QKP_SIG_LEN) return QIHSE_QKP_REJECTED;
+    if (h1_len < 0) {
+        qkp_log_reject(cfg, "client H1 frame read failed");
+        return QIHSE_QKP_REJECTED;
+    }
+    if ((size_t)h1_len < 2u + 64u + 32u + 2u + QIHSE_QKP_SIG_LEN) {
+        qkp_log_reject(cfg, "client H1 frame is too short");
+        return QIHSE_QKP_REJECTED;
+    }
     const uint8_t* p = h1;
     uint16_t proto = (uint16_t)((p[0] << 8) | p[1]); p += 2u;
     const uint8_t* srv_id = p; p += 64u;
@@ -508,6 +517,7 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     uint16_t pem_len = (uint16_t)((p[0] << 8) | p[1]); p += 2u;
     if (proto != QIHSE_QKP_PROTO_VERSION || (size_t)pem_len > (size_t)h1_len ||
         (size_t)(p - h1) + pem_len + QIHSE_QKP_SIG_LEN != (size_t)h1_len) {
+        qkp_log_reject(cfg, "client H1 fields or lengths are invalid");
         return QIHSE_QKP_REJECTED;
     }
     const uint8_t* kem_pem = p;
@@ -518,7 +528,10 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     size_t h1_body_len = (size_t)h1_len - QIHSE_QKP_SIG_LEN;
     size_t h1_signed_len = strlen(H1_DOMAIN) + h1_body_len;
     uint8_t* h1_signed = (uint8_t*)malloc(h1_signed_len);
-    if (!h1_signed) return QIHSE_QKP_REJECTED;
+    if (!h1_signed) {
+        qkp_log_reject(cfg, "client H1 verification allocation failed");
+        return QIHSE_QKP_REJECTED;
+    }
     memcpy(h1_signed, H1_DOMAIN, strlen(H1_DOMAIN));
     memcpy(h1_signed + strlen(H1_DOMAIN), h1, h1_body_len);
     bool server_trusted = false;
@@ -534,6 +547,7 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     uint8_t h1_hash[QIHSE_QKP_TR_LEN];
     if (!qkp_sha384(h1_signed, h1_signed_len, h1_hash)) {
         free(h1_signed);
+        qkp_log_reject(cfg, "client H1 transcript hash failed");
         return QIHSE_QKP_REJECTED;
     }
     free(h1_signed);
@@ -555,18 +569,27 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     }
 
     uint8_t cli_nonce[QIHSE_QKP_NONCE_LEN];
-    if (RAND_bytes(cli_nonce, sizeof(cli_nonce)) != 1) return QIHSE_QKP_REJECTED;
+    if (RAND_bytes(cli_nonce, sizeof(cli_nonce)) != 1) {
+        qkp_log_reject(cfg, "client nonce generation failed");
+        return QIHSE_QKP_REJECTED;
+    }
     uint8_t ct[QIHSE_QKP_CT_LEN];
     qihse_pqc_ctx_t kem;
     memset(&kem, 0, sizeof(kem));
-    if (!qihse_pqc_encapsulate_mem(&kem, kem_pem, pem_len, ct)) return QIHSE_QKP_REJECTED;
+    if (!qihse_pqc_encapsulate_mem(&kem, kem_pem, pem_len, ct)) {
+        qkp_log_reject(cfg, "client ML-KEM encapsulation failed");
+        return QIHSE_QKP_REJECTED;
+    }
 
     /* H2 signed region mirrors the server's derivation. */
     size_t id_len = cfg->node_id ? strlen(cfg->node_id) : 0u;
     if (id_len > 64u) id_len = 64u;
     size_t h2_signed_len = strlen(H2_DOMAIN) + QIHSE_QKP_TR_LEN + 64u + 32u + QIHSE_QKP_CT_LEN;
     uint8_t* h2_signed = (uint8_t*)malloc(h2_signed_len);
-    if (!h2_signed) return QIHSE_QKP_REJECTED;
+    if (!h2_signed) {
+        qkp_log_reject(cfg, "client H2 signing allocation failed");
+        return QIHSE_QKP_REJECTED;
+    }
     {
         uint8_t* w = h2_signed;
         memcpy(w, H2_DOMAIN, strlen(H2_DOMAIN)); w += strlen(H2_DOMAIN);
@@ -578,11 +601,17 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     uint8_t h2_sig[QIHSE_QKP_SIG_LEN];
     bool signed_ok = qihse_pqc_sign_path(h2_signed, h2_signed_len, h2_sig, cfg->dsa_key_path);
     free(h2_signed);
-    if (!signed_ok) return QIHSE_QKP_REJECTED;
+    if (!signed_ok) {
+        qkp_log_reject(cfg, "client H2 signing failed");
+        return QIHSE_QKP_REJECTED;
+    }
 
     size_t h2_len = 64u + 32u + QIHSE_QKP_CT_LEN + QIHSE_QKP_SIG_LEN;
     uint8_t* h2 = (uint8_t*)malloc(h2_len);
-    if (!h2) return QIHSE_QKP_REJECTED;
+    if (!h2) {
+        qkp_log_reject(cfg, "client H2 frame allocation failed");
+        return QIHSE_QKP_REJECTED;
+    }
     {
         uint8_t* w = h2;
         memset(w, 0, 64u); memcpy(w, cfg->node_id ? cfg->node_id : "", id_len); w += 64u;
@@ -592,7 +621,10 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     }
     bool sent = qkp_send_frame(fd, 2u, h2, (uint16_t)h2_len);
     free(h2);
-    if (!sent) return QIHSE_QKP_REJECTED;
+    if (!sent) {
+        qkp_log_reject(cfg, "client H2 frame write failed");
+        return QIHSE_QKP_REJECTED;
+    }
 
     /* Sealed H2-ACK from the server: the key-confirmation gate. */
     uint8_t ss[QIHSE_MLKEM_SHARED_SIZE];
@@ -605,10 +637,14 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(ikm, ss, 32u); memcpy(ikm + 32u, cli_nonce, 32u); memcpy(ikm + 64u, srv_nonce, 32u);
     if (!qkp_hkdf_sha384(salt, QIHSE_QKP_TR_LEN, ikm, sizeof(ikm),
                          (const uint8_t*)HKDF_INFO, strlen(HKDF_INFO), okm, sizeof(okm))) {
+        qkp_log_reject(cfg, "client QKP key derivation failed");
         return QIHSE_QKP_REJECTED;
     }
     qihse_qkp_session_t* s = (qihse_qkp_session_t*)calloc(1u, sizeof(*s));
-    if (!s) return QIHSE_QKP_REJECTED;
+    if (!s) {
+        qkp_log_reject(cfg, "client QKP session allocation failed");
+        return QIHSE_QKP_REJECTED;
+    }
     s->role = QKP_ROLE_CLIENT;
     memcpy(s->key_c2s, okm, 32u);
     memcpy(s->key_s2c, okm + 32u, 32u);
@@ -620,13 +656,27 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     s->has_peer_identity = true;
 
     uint8_t ack_head[6], ack_plain[32], ack_nonce[12];
-    if (!qkp_read_exact(fd, ack_head, 6u) || memcmp(ack_head, SEAL_MAGIC, 4u) != 0) {
+    if (!qkp_read_exact(fd, ack_head, 6u)) {
+        qkp_log_reject(cfg, "client H2-ACK header read failed");
+        free(s); return QIHSE_QKP_REJECTED;
+    }
+    if (memcmp(ack_head, SEAL_MAGIC, 4u) != 0) {
+        fprintf(stderr, "qihse qkp: unexpected H2-ACK header %02x%02x%02x%02x%02x%02x\n",
+                ack_head[0], ack_head[1], ack_head[2], ack_head[3],
+                ack_head[4], ack_head[5]);
+        qkp_log_reject(cfg, "client H2-ACK magic invalid");
         free(s); return QIHSE_QKP_REJECTED;
     }
     uint16_t ack_len = (uint16_t)((ack_head[4] << 8) | ack_head[5]);
-    if (ack_len != 12u + 8u + 16u) { free(s); return QIHSE_QKP_REJECTED; }
+    if (ack_len != 12u + 8u + 16u) {
+        qkp_log_reject(cfg, "client H2-ACK length invalid");
+        free(s); return QIHSE_QKP_REJECTED;
+    }
     uint8_t* ack_ct = malloc(ack_len);
-    if (!ack_ct || !qkp_read_exact(fd, ack_ct, ack_len)) { free(ack_ct); free(s); return QIHSE_QKP_REJECTED; }
+    if (!ack_ct || !qkp_read_exact(fd, ack_ct, ack_len)) {
+        qkp_log_reject(cfg, "client H2-ACK payload read failed");
+        free(ack_ct); free(s); return QIHSE_QKP_REJECTED;
+    }
     qkp_make_nonce(ack_nonce, DIR_S2C, 1u);
     /* Frame body = nonce(12) ‖ ct ‖ tag — skip the nonce, exactly like
      * qihse_qkp_recv_sealed does; the whole body used to be passed as
@@ -634,7 +684,11 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     bool ack_ok = qkp_aead_open(s->key_s2c, ack_nonce, ack_head, 6u, ack_ct + 12u, ack_len - 12u, ack_plain) &&
                   memcmp(ack_plain, ACK_PAYLOAD, sizeof(ACK_PAYLOAD) - 1u) == 0;
     free(ack_ct);
-    if (!ack_ok) { free(s); return QIHSE_QKP_REJECTED; }
+    if (!ack_ok) {
+        qkp_log_reject(cfg, "H2-ACK authentication failed");
+        free(s);
+        return QIHSE_QKP_REJECTED;
+    }
     s->rx_seq = 2u;
 
     g_qkp_counters.client_negotiations_ok++;
