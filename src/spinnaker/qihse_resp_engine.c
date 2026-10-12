@@ -1089,21 +1089,23 @@ static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
                qihse_resp_integer(session, (int64_t)term);
     }
 
-    if (qihse_resp_command_is(request, "QIHSE.TXN.READ")) {
+    if (qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL")) {
+        bool local_read = qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL");
         if (request->argc != 3u)
-            return qihse_resp_wrong_arity(session, "qihse.txn.read");
+            return qihse_resp_wrong_arity(session,
+                                          local_read ? "qihse.txn.readlocal" : "qihse.txn.read");
         uint64_t from = 0u, limit = 0u;
         if (!qihse_resp_parse_u64_arg(&request->argv[1], &from) ||
             !qihse_resp_parse_u64_arg(&request->argv[2], &limit) ||
             limit == 0u || limit > QIHSE_TXN_READ_MAX_ENTRIES)
             return qihse_resp_error(session, "ERR invalid transaction cursor or page size");
 
-        /* A follower's committed index can lag the leader while a new entry
-         * is being replicated. Transaction consumers use this command to
-         * reconcile an application journal, so serving a stale page could
-         * make a caught-up read appear complete. Route reads through the
-         * current leader, just as proposals are routed. */
-        if (qihse_consensus_mesh_role(session->server->consensus_mesh) !=
+        /* Ordinary transaction consumers must read through the leader: a
+         * follower may lag. READLOCAL is an explicit node-local inspection
+         * for recovery tooling; its returned cursor is only this member's
+         * committed watermark and must never stand for a cluster-wide one. */
+        if (!local_read && qihse_consensus_mesh_role(session->server->consensus_mesh) !=
             QIHSE_CONSENSUS_LEADER) {
             qihse_uuid_t leader;
             char leader_text[QIHSE_UUID_STR_LEN + 1u];
@@ -11171,7 +11173,8 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.STATUS"))
         return qihse_resp_handle_consensus_status(session, request);
     if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
-        qihse_resp_command_is(request, "QIHSE.TXN.READ"))
+        qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
         return qihse_resp_handle_consensus_txn(session, request);
     if (qihse_resp_command_is(request, "PING")) {
         if (request->argc == 1) return qihse_resp_simple(session, "PONG");
