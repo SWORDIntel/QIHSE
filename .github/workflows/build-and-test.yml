@@ -38,6 +38,9 @@ jobs:
       run: |
         nm -D ./libqihse.so | grep qihse_search || true
 
+    - name: Run Classified Adapter Denial Regression
+      run: make test-consensus-mesh
+
     - name: Run Core Test Suite
       run: |
         set -o pipefail
