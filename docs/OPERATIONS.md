@@ -530,13 +530,14 @@ knobs) is [API reference §11](API_REFERENCE.md#11-configuration-knobs).
   `rm -rf build/<prefix>_*` (safe — everything under `build/` is disposable)
   and re-run. (A retry was recently added to the `node_cap_records` teardown;
   older flakes may still surface elsewhere.)
-- **`[QIHSE AUDIT] Integrity chain mismatch detected (non-fatal in default mode)`.**
-  Emitted by `core/qihse_audit.c` when a stale `qihse_integrity.chain` in the
-  working directory does not match the current state. Non-fatal by design in
-  the default development mode; delete the stale root-level
-  `qihse_integrity.chain` to silence it. Several `make` targets
-  (`test-e2e`, `test-omni`, `test-kv-read-integrity`) already remove it
-  before running.
+- **`[QIHSE AUDIT] Integrity chain mismatch detected`** is non-fatal unless
+  `QIHSE_STRICT_AUDIT=1`. The audit code now seeds its in-memory SHA-384 head
+  on restart only when the protected chain file matches the final decoded
+  audit record and that record's hash recomputes correctly. Preserve both
+  files and investigate a mismatch; deleting the chain discards evidence.
+  This is a final-record consistency check, not a full independent validation
+  of every rotated audit record. Disposable test data may still be reset by
+  the relevant `make` targets.
 - (Resolved 2026-09-26: `make check` expected a stale upstream layout — the
   workflow checker now verifies current paths; `./qihse demo` runs end to end
   (native module exposed via `build/bin/qihse.so`, see [§3.1](#31-the-qihse-launcher-repository-root));

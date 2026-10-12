@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -196,6 +197,7 @@ static pthread_t g_signer_tid;
 static int g_signer_started = 0;
 static int g_signer_ok = 0;
 static int g_signer_stop = 0;
+static int g_signer_busy = 0;
 
 /* Start the background signer if it isn't running yet.  Must be called
  * with audit_mutex held.  Also registers the atexit teardown handler on
@@ -235,7 +237,8 @@ static void audit_atfork_prepare(void) {
     pthread_mutex_lock(&audit_mutex);
     /* Wait for the signer to drain the queue so pre-fork entries are on
      * disk before the address space splits. */
-    while ((g_q_head || g_ping_pending) && g_signer_ok && !g_signer_stop) {
+    while ((g_q_head || g_ping_pending || g_signer_busy) &&
+           g_signer_ok && !g_signer_stop) {
         pthread_mutex_unlock(&audit_mutex);
         usleep(1000);
         pthread_mutex_lock(&audit_mutex);
@@ -253,6 +256,7 @@ static void audit_atfork_child(void) {
     g_q_head = NULL;
     g_q_tail = NULL;
     g_ping_pending = 0;
+    g_signer_busy = 0;
     g_signer_tid = pthread_self(); /* mark invalid-ish; started flag drives */
     g_signer_ok = 0;
     g_signer_started = 0;
@@ -295,7 +299,119 @@ static void write_obfuscated(FILE *f, const char* buffer) {
     fwrite(tmp, 1u, len + 1u, f);
 }
 
-static void update_integrity_chain(const char* new_hash);
+static int update_integrity_chain(const char* new_hash);
+
+#ifndef _WIN32
+static int audit_hex_hash(const char *value) {
+    for (size_t i = 0; i < 96u; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') ||
+              (value[i] >= 'a' && value[i] <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+/* Recover the previous process's chain head only when its final on-disk
+ * record agrees with the separate chain file. This verifies the final link,
+ * not an independently anchored history of every rotated record. */
+static int audit_recover_last_hash(void) {
+    char chain_path[4096], audit_path[4096], stored[97];
+    build_chain_path(chain_path, sizeof(chain_path));
+    int chain_fd = open(chain_path, O_RDONLY | O_NOFOLLOW);
+    if (chain_fd < 0) return 0; /* No chain file: new audit history. */
+    struct stat chain_stat;
+    int valid = fstat(chain_fd, &chain_stat) == 0 &&
+                S_ISREG(chain_stat.st_mode) && chain_stat.st_size == 96 &&
+                read(chain_fd, stored, 96u) == 96 && audit_hex_hash(stored);
+    close(chain_fd);
+    if (!valid) return -1;
+    stored[96] = '\0';
+
+    build_audit_path(audit_path, sizeof(audit_path));
+    int audit_fd = open(audit_path, O_RDONLY | O_NOFOLLOW);
+    if (audit_fd < 0) return -1;
+    struct stat audit_stat;
+    if (fstat(audit_fd, &audit_stat) != 0 ||
+        !S_ISREG(audit_stat.st_mode) || audit_stat.st_size <
+        (off_t)MLDSA87_SIG_BYTES + 100) {
+        close(audit_fd);
+        return -1;
+    }
+    /* Startup markers are not chained records. Earlier versions appended
+     * one on every restart, including restarts with no later audit event. */
+    size_t window = audit_stat.st_size < 65536 ?
+                    (size_t)audit_stat.st_size : 65536u;
+    char *scan = malloc(window);
+    if (!scan) { close(audit_fd); return -1; }
+    ssize_t scanned = pread(audit_fd, scan, window,
+                            audit_stat.st_size - (off_t)window);
+    if (scanned != (ssize_t)window) {
+        free(scan);
+        close(audit_fd);
+        return -1;
+    }
+    for (size_t i = 0; i < window; i++) scan[i] ^= XOR_KEY;
+    static const char suffix[] = "|SIG_MLDSA87_ATTACHED\n";
+    const size_t suffix_len = sizeof(suffix) - 1u;
+    static const char marker[] = "--- SYSTEM AUTH CACHE INITIALIZED [";
+    off_t record_end = -1;
+    for (size_t i = window; i-- > 0;) {
+        if (i + suffix_len + MLDSA87_SIG_BYTES > window ||
+            memcmp(scan + i, suffix, suffix_len) != 0) continue;
+        size_t trailing = i + suffix_len + MLDSA87_SIG_BYTES;
+        int valid_trailer = 1;
+        while (trailing < window) {
+            if (window - trailing < sizeof(marker) - 1u ||
+                memcmp(scan + trailing, marker, sizeof(marker) - 1u) != 0) {
+                valid_trailer = 0;
+                break;
+            }
+            char *newline = memchr(scan + trailing, '\n', window - trailing);
+            if (!newline || (size_t)(newline - (scan + trailing)) > 256u) {
+                valid_trailer = 0;
+                break;
+            }
+            trailing = (size_t)(newline - scan) + 1u;
+        }
+        if (valid_trailer) {
+            record_end = audit_stat.st_size - (off_t)window +
+                         (off_t)i + (off_t)suffix_len;
+            break;
+        }
+    }
+    free(scan);
+    if (record_end < 0) { close(audit_fd); return -1; }
+    size_t length = record_end < 4096 ? (size_t)record_end : 4096u;
+    char tail[4097];
+    ssize_t got = pread(audit_fd, tail, length, record_end - (off_t)length);
+    close(audit_fd);
+    if (got != (ssize_t)length) return -1;
+    for (size_t i = 0; i < length; i++) tail[i] ^= XOR_KEY;
+    tail[length] = '\0';
+    if (length < suffix_len + 97u ||
+        memcmp(tail + length - suffix_len, suffix, suffix_len) != 0) return -1;
+    size_t hash_at = length - suffix_len - 96u;
+    if (hash_at == 0 || tail[hash_at - 1u] != '|' ||
+        !audit_hex_hash(tail + hash_at) ||
+        memcmp(tail + hash_at, stored, 96u) != 0) return -1;
+    char saved = tail[hash_at - 1u];
+    tail[hash_at - 1u] = '\0';
+    int matched = 0;
+    for (size_t start = 0; start + 97u <= hash_at - 1u; start++) {
+        if (tail[start + 96u] != '|' || !audit_hex_hash(tail + start) ||
+            hash_at - 1u - start >= 1024u) continue;
+        char calculated[129];
+        compute_sha384(tail + start, calculated);
+        if (memcmp(calculated, stored, 96u) == 0) {
+            matched = 1;
+            break;
+        }
+    }
+    tail[hash_at - 1u] = saved;
+    if (!matched) return -1;
+    memcpy(last_hash, stored, sizeof(stored));
+    return 1;
+}
+#endif
 
 void qihse_audit_verify_integrity(void) {
 #ifndef _WIN32
@@ -343,28 +459,51 @@ void qihse_audit_verify_integrity(void) {
 #endif
 }
 
-static void update_integrity_chain(const char* new_hash) {
+static int update_integrity_chain(const char* new_hash) {
 #ifndef _WIN32
     char chain_path[4096];
     build_chain_path(chain_path, sizeof(chain_path));
-    int sfd = open(chain_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (sfd >= 0) {
-        FILE *sf = fdopen(sfd, "w");
-        if (sf) {
-            fprintf(sf, "%s", new_hash);
-            fclose(sf);
-        } else {
-            close(sfd);
-        }
+    char temporary[sizeof(chain_path) + 16u];
+    int n = snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX",
+                     chain_path);
+    if (n < 0 || (size_t)n >= sizeof(temporary)) return 0;
+    int fd = mkstemp(temporary);
+    if (fd < 0) return 0;
+    int ok = fchmod(fd, 0600) == 0;
+    size_t written = 0;
+    while (ok && written < 96u) {
+        ssize_t count = write(fd, new_hash + written, 96u - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ok = 0; break; }
+        written += (size_t)count;
     }
+    if (ok && fsync(fd) != 0) ok = 0;
+    if (close(fd) != 0) ok = 0;
+    if (ok && rename(temporary, chain_path) != 0) ok = 0;
+    if (!ok) { unlink(temporary); return 0; }
+    char directory[sizeof(chain_path)];
+    const char *slash = strrchr(chain_path, '/');
+    if (slash) {
+        size_t length = (size_t)(slash - chain_path);
+        if (length == 0 || length >= sizeof(directory)) return 0;
+        memcpy(directory, chain_path, length);
+        directory[length] = '\0';
+    } else {
+        memcpy(directory, ".", 2u);
+    }
+    int dir_fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0) return 0;
+    ok = fsync(dir_fd) == 0;
+    close(dir_fd);
+    return ok;
 #else
     char chain_path[4096];
     build_chain_path(chain_path, sizeof(chain_path));
     FILE *sf = fopen(chain_path, "w");
-    if (sf) {
-        fprintf(sf, "%s", new_hash);
-        fclose(sf);
-    }
+    if (!sf) return 0;
+    int ok = fprintf(sf, "%s", new_hash) == 96;
+    if (fclose(sf) != 0) ok = 0;
+    return ok;
 #endif
 }
 
@@ -412,6 +551,17 @@ void qihse_audit_init(void) {
         }
     }
 
+#ifndef _WIN32
+    if (audit_recover_last_hash() < 0) {
+        fprintf(stderr, "[QIHSE AUDIT] Integrity chain mismatch detected!\n");
+        const char *strict = getenv("QIHSE_STRICT_AUDIT");
+        if (strict && strcmp(strict, "1") == 0) {
+            fprintf(stderr, "[QIHSE AUDIT] Strict audit enforcement: aborting on integrity mismatch.\n");
+            abort();
+        }
+    }
+#endif
+
     char apath[512];
     build_audit_path(apath, sizeof(apath));
 #ifndef _WIN32
@@ -437,7 +587,9 @@ void qihse_audit_init(void) {
      * log path transparently falls back to synchronous signing. */
     audit_ensure_signer_locked();
     pthread_mutex_unlock(&audit_mutex);
+#ifdef _WIN32
     qihse_audit_verify_integrity();
+#endif
 }
 
 /* The expensive part: ML-DSA-87 signature + audit file + integrity chain.
@@ -471,20 +623,37 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     build_audit_path(wpath, sizeof(wpath));
     FILE *f = fopen(wpath, "ab");
 #endif
+    int recorded = 0;
     if (f) {
         char out_buf[2048];
         snprintf(out_buf, sizeof(out_buf), "%s|%s|SIG_MLDSA87_ATTACHED", buffer, new_hash);
         write_obfuscated(f, out_buf);
         char sigbuf[MLDSA87_SIG_BYTES];
         for (int i = 0; i < MLDSA87_SIG_BYTES; i++) sigbuf[i] = (char)(mldsa87_sig[i] ^ XOR_KEY);
-        fwrite(sigbuf, 1u, sizeof(sigbuf), f);
-        fclose(f);
+        size_t sig_written = fwrite(sigbuf, 1u, sizeof(sigbuf), f);
+        int write_error = ferror(f) || fflush(f) != 0;
+#ifndef _WIN32
+        if (!write_error && fsync(fileno(f)) != 0) write_error = 1;
+#endif
+        int close_error = fclose(f);
+        recorded = sig_written == sizeof(sigbuf) && !write_error &&
+                   close_error == 0;
     }
 #ifndef _WIN32
     if (afd >= 0 && !f) close(afd);
 #endif
 
-    update_integrity_chain(new_hash);
+    if (!recorded) {
+        fprintf(stderr, "[QIHSE AUDIT] Failed to persist audit record.\n");
+        const char *strict = getenv("QIHSE_STRICT_AUDIT");
+        if (strict && strcmp(strict, "1") == 0) abort();
+        return;
+    }
+    if (!update_integrity_chain(new_hash)) {
+        fprintf(stderr, "[QIHSE AUDIT] Failed to persist integrity chain.\n");
+        const char *strict = getenv("QIHSE_STRICT_AUDIT");
+        if (strict && strcmp(strict, "1") == 0) abort();
+    }
 }
 
 static void* audit_signer_main(void* arg) {
@@ -501,15 +670,21 @@ static void* audit_signer_main(void* arg) {
         audit_pending_t* e = g_q_head;
         if (e) {
             g_q_head = e->next;
-            if (!g_q_head) { g_q_tail = NULL; pthread_cond_broadcast(&g_q_empty_cond); }
+            if (!g_q_head) g_q_tail = NULL;
         }
         int ping = g_ping_pending;
         uint32_t pu = g_ping_uid; uint16_t pc = g_ping_classif, ps = g_ping_sci;
         g_ping_pending = 0;
+        g_signer_busy = 1;
         pthread_mutex_unlock(&audit_mutex);
 
         if (e) { audit_sign_and_write(e->buffer, e->new_hash); free(e); }
         if (ping) send_webhook_ping(pu, pc, ps);
+        pthread_mutex_lock(&audit_mutex);
+        g_signer_busy = 0;
+        if (!g_q_head && !g_ping_pending)
+            pthread_cond_broadcast(&g_q_empty_cond);
+        pthread_mutex_unlock(&audit_mutex);
     }
 }
 
@@ -517,7 +692,8 @@ static void* audit_signer_main(void* arg) {
 void qihse_audit_flush(void) {
     if (!g_signer_ok) return;
     pthread_mutex_lock(&audit_mutex);
-    while (g_q_head && !g_signer_stop) {
+    while ((g_q_head || g_ping_pending || g_signer_busy) &&
+           !g_signer_stop) {
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     }
     pthread_mutex_unlock(&audit_mutex);
