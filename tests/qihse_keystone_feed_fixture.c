@@ -23,6 +23,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
 #include "qihse_resp_wire.h"
+#include "qihse_audit.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -150,6 +151,8 @@ int main(int argc, char** argv) {
         printf("[feed-fixture] serve-only; Ctrl-C to stop\n");
         for (;;) sleep(60);
     }
+    /* The wire client is exec'd in a child and must acquire its own audit lock. */
+    qihse_audit_shutdown();
     pid_t pid = fork();
     if (pid == 0) {
         execvp("python3", child_argv);
