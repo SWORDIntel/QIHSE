@@ -39,6 +39,7 @@
 #include "qihse_pooler.h"
 #include "qihse_kv_store.h"
 #include "qihse_wal.h"
+#include "qihse_auth.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -587,6 +588,7 @@ int main(void) {
     char qdd[] = "build/test_repl_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
+    assert(qihse_auth_init());
     test_repl_context_and_slots();
     test_repl_ship_wal();
     test_repl_apply_wal();

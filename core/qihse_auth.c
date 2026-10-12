@@ -1256,8 +1256,10 @@ bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char*
 }
 
 bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint16_t data_sci) {
-    /* A failed startup has no audit writer. Deny before any audit operation. */
-    if (!__atomic_load_n(&auth_service_ready, __ATOMIC_ACQUIRE)) return false;
+    /* A failed startup has no audit writer. Preserve public, anonymous
+     * reads, but deny every classified or principal-bearing request. */
+    if (!__atomic_load_n(&auth_service_ready, __ATOMIC_ACQUIRE))
+        return !user && data_classif == 0 && data_sci == 0;
     if (data_classif > 0) {
         uint32_t uid = 0xFFFFFFFF;
         if (user) {
