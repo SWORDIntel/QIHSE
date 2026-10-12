@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Server } from 'lucide-react';
 import { apiGet, apiError } from '../api.js';
 import { keyslot, ownerForSlot } from '../slots.js';
-import { usePoll } from './FleetView.jsx';
+import { usePoll } from './usePoll.js';
 
 // Cluster topology: CLUSTER NODES rendered for display; the bridge never
 // dials discovered addresses (rendered truth only).

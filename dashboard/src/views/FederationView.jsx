@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { Globe2 } from 'lucide-react';
 import { apiGet, apiError } from '../api.js';
 
 const SECTIONS = [
