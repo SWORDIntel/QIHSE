@@ -60,4 +60,20 @@ bool qihse_consensus_blob_import_user(qihse_consensus_blob_context_t* context,
 bool qihse_consensus_blob_validate(void* context,
                                    const qihse_consensus_entry_t* entry);
 
+/* Read one committed DATA entry by exact index, verify its QBR1 reference,
+ * QTX1 envelope, system-domain blob binding, full SHA-384 and size, then
+ * return only the transaction bytes. The authenticated system Operator is
+ * checked independently by consensus and blob storage. A missing, denied,
+ * uncommitted, malformed, or oversized entry fails with out_len = 0 and no
+ * transaction bytes copied to out. This is an internal replay read, not a
+ * commit proof for caller-supplied entries. The caller must still enforce
+ * ordered application and validate the transaction's own record format.
+ * The context must have been bound to this consensus group at open, and the
+ * caller must serialize the complete read with consensus mutation/snapshot
+ * installation (for a mesh caller, hold its state lock). */
+bool qihse_consensus_blob_read_committed_transaction_user(
+    qihse_consensus_blob_context_t* context,
+    const qihse_consensus_t* consensus, qihse_user_t* user,
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len);
+
 #endif /* QIHSE_CONSENSUS_BLOB_H */

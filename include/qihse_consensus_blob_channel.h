@@ -23,7 +23,7 @@ bool qihse_consensus_blob_channel_send(
     const qihse_user_t* principal,
     const qihse_consensus_entry_t* entry);
 
-/* Receive one QBT1 stage request. The supplied principal must be the active
+/* Receive one QBT1 or history-bound QBT2 stage request. The supplied principal must be the active
  * local replication principal; classification and SCI are checked before
  * requesting payload bytes. out_entry is assigned only after HAVE or a full
  * digest-verified durable import succeeds. */
@@ -34,7 +34,7 @@ bool qihse_consensus_blob_channel_receive(
     const qihse_user_t* principal,
     qihse_consensus_entry_t* out_entry);
 
-/* Dispatcher variant: process a QBT1 prefix already read from this session. */
+/* Dispatcher variant: process a QBT1/QBT2 prefix already read from this session. */
 bool qihse_consensus_blob_channel_receive_prefix(
     qihse_consensus_blob_context_t* blobs,
     qihse_qkp_session_t* session, int fd,

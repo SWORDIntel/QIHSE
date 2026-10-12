@@ -84,18 +84,18 @@ int main(void) {
     assert(qihse_uuid_from_seed("member-a", 8u, &member_a));
     assert(qihse_uuid_from_seed("member-b", 8u, &member_b));
     qihse_consensus_channel_config_t client_channel = {
-        .group_id="sample.group", .local_member=member_a, .peer_member=member_b,
+        .group_id="qihse.test.app", .local_member=member_a, .peer_member=member_b,
         .peer_node_id="member-b", .peer_dsa_pub_path=server_pub
     };
     qihse_consensus_channel_config_t server_channel = {
-        .group_id="sample.group", .local_member=member_b, .peer_member=member_a,
+        .group_id="qihse.test.app", .local_member=member_b, .peer_member=member_a,
         .peer_node_id="member-a", .peer_dsa_pub_path=client_pub
     };
 
     qihse_consensus_msg_t message;
     memset(&message, 0, sizeof(message));
     message.type = QIHSE_CONSENSUS_MSG_APPEND;
-    snprintf(message.group_id, sizeof(message.group_id), "%s", "sample.group");
+    snprintf(message.group_id, sizeof(message.group_id), "%s", "qihse.test.app");
     message.from = member_a; message.to = member_b;
     message.term = 2u; message.fencing_epoch = 2u;
     message.u.append.entry_count = 1u;

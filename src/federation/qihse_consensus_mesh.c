@@ -410,6 +410,9 @@ static qihse_consensus_channel_config_t qcm_channel(
     qihse_consensus_channel_config_t channel;
     memset(&channel, 0, sizeof(channel));
     channel.group_id = mesh->consensus_config.group_id;
+    memcpy(channel.history_id, mesh->consensus_config.history_id,
+           sizeof(channel.history_id));
+    channel.writer_epoch = mesh->consensus_config.writer_epoch_floor;
     channel.local_member = mesh->consensus_config.self;
     channel.peer_member = mesh->peers[peer_index].uuid;
     channel.peer_node_id = mesh->peers[peer_index].node_id;
@@ -434,6 +437,7 @@ static void* qcm_rx_main(void* opaque) {
     qcm_rx_ctx_t* ctx = opaque;
     qihse_consensus_mesh_t* mesh = ctx->mesh;
     qihse_consensus_channel_config_t channel = qcm_channel(mesh, ctx->peer_index);
+    bool history_hello_seen = channel.writer_epoch == 0u;
     while (!qcm_stopping(mesh)) {
         struct pollfd pfd = {ctx->fd, POLLIN, 0};
         int ready = poll(&pfd, 1, 250);
@@ -447,7 +451,18 @@ static void* qcm_rx_main(void* opaque) {
             qcm_debug("receive from %s failed", mesh->peers[ctx->peer_index].node_id);
             break;
         }
-        if ((size_t)received >= 4u && memcmp(wire, "QBT1", 4u) == 0) {
+        if (!history_hello_seen) {
+            if (!qihse_consensus_channel_decode_hello(ctx->session, &channel,
+                    mesh->principal, wire, (size_t)received)) {
+                qcm_debug("history binding from %s rejected",
+                          mesh->peers[ctx->peer_index].node_id);
+                break;
+            }
+            history_hello_seen = true;
+            continue;
+        }
+        if ((size_t)received >= 4u &&
+            (memcmp(wire, "QBT1", 4u) == 0 || memcmp(wire, "QBT2", 4u) == 0)) {
             qihse_consensus_entry_t entry;
             if (!mesh->blob_context ||
                 !qihse_consensus_blob_channel_receive_prefix(mesh->blob_context,
@@ -574,6 +589,19 @@ static void* qcm_tx_main(void* opaque) {
             pthread_mutex_unlock(&mesh->queue_lock);
             close(fd);
             struct timespec pause = {0, 250000000L}; nanosleep(&pause, NULL);
+            continue;
+        }
+        if (channel.writer_epoch != 0u &&
+            !qihse_consensus_channel_send_hello(session, fd, &channel,
+                                                mesh->principal)) {
+            qcm_debug("history binding to %s failed",
+                      mesh->peers[peer_index].node_id);
+            qihse_qkp_session_free(session);
+            pthread_mutex_lock(&mesh->queue_lock);
+            if (mesh->peers[peer_index].tx_fd == fd)
+                mesh->peers[peer_index].tx_fd = -1;
+            pthread_mutex_unlock(&mesh->queue_lock);
+            close(fd);
             continue;
         }
         qcm_debug("connected to peer %s", mesh->peers[peer_index].node_id);
@@ -889,13 +917,26 @@ qihse_consensus_mesh_t* qihse_consensus_mesh_create(
     if (pthread_cond_init(&mesh->rx_changed, NULL) != 0) goto init_fail;
     mesh->rx_changed_ready = true;
     if (!qcm_copy_config(mesh, config)) goto init_fail;
-    if (mesh->snapshot_stage_path[0] &&
-        !qihse_consensus_snapshot_stage_open(mesh->snapshot_stage_path,
-            mesh->consensus_config.group_id, mesh->principal,
-            mesh->consensus_config.validate_data,
-            mesh->consensus_config.validate_data_context,
-            mesh->consensus_config.require_data_validator,
-            &mesh->snapshot_stage)) goto init_fail;
+    if (mesh->snapshot_stage_path[0]) {
+        bool stage_opened = mesh->consensus_config.writer_epoch_floor
+            ? qihse_consensus_snapshot_stage_open_bound(
+                  mesh->snapshot_stage_path,
+                  mesh->consensus_config.group_id,
+                  mesh->consensus_config.history_id,
+                  mesh->consensus_config.writer_epoch_floor,
+                  mesh->principal, mesh->consensus_config.validate_data,
+                  mesh->consensus_config.validate_data_context,
+                  mesh->consensus_config.require_data_validator,
+                  &mesh->snapshot_stage)
+            : qihse_consensus_snapshot_stage_open(
+                  mesh->snapshot_stage_path,
+                  mesh->consensus_config.group_id, mesh->principal,
+                  mesh->consensus_config.validate_data,
+                  mesh->consensus_config.validate_data_context,
+                  mesh->consensus_config.require_data_validator,
+                  &mesh->snapshot_stage);
+        if (!stage_opened) goto init_fail;
+    }
     mesh->consensus = qihse_consensus_open(&mesh->consensus_config, mesh, qcm_send);
     if (!mesh->consensus) goto init_fail;
     return mesh;
@@ -1001,6 +1042,110 @@ bool qihse_consensus_mesh_status(qihse_consensus_mesh_t* mesh,
     }
     pthread_mutex_unlock(&mesh->state_lock);
     return true;
+}
+
+bool qihse_consensus_mesh_history_identity(
+    qihse_consensus_mesh_t* mesh, qihse_consensus_mesh_identity_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!mesh || !out) return false;
+    pthread_mutex_lock(&mesh->state_lock);
+    bool opened = mesh->consensus != NULL;
+    if (opened) {
+        memcpy(out->group_id, mesh->consensus_config.group_id,
+               sizeof(out->group_id));
+        memcpy(out->history_id, mesh->consensus_config.history_id,
+               sizeof(out->history_id));
+        out->writer_epoch_floor = mesh->consensus_config.writer_epoch_floor;
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+    return opened;
+}
+
+bool qihse_consensus_mesh_export_prefix_evidence_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* requester,
+    uint64_t max_entries, qihse_consensus_mesh_prefix_evidence_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!mesh || !requester || !out ||
+        max_entries > QIHSE_MESH_EVIDENCE_MAX_ENTRIES) return false;
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_INVALID;
+    qihse_auth_user_active_and_tenant(requester, &active, &tenant);
+    if (!active || tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(requester) != QIHSE_ROLE_OPERATOR) return false;
+
+    pthread_mutex_lock(&mesh->state_lock);
+    uint64_t committed = mesh->consensus
+        ? qihse_consensus_commit_index(mesh->consensus) : UINT64_MAX;
+    bool ok = committed <= max_entries &&
+        qihse_consensus_committed_prefix_sha256(
+            mesh->consensus, requester, committed,
+            out->committed_prefix_sha256);
+    if (ok) {
+        memcpy(out->group_id, mesh->consensus_config.group_id,
+               sizeof(out->group_id));
+        memcpy(out->history_id, mesh->consensus_config.history_id,
+               sizeof(out->history_id));
+        out->writer_epoch_floor = mesh->consensus_config.writer_epoch_floor;
+        out->commit_index = committed;
+        out->member_uuid = mesh->consensus_config.self;
+        memcpy(out->qkp_node_id, mesh->qkp_node_id,
+               sizeof(out->qkp_node_id));
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+    /* Keep the final liveness check outside state_lock. The core hash must
+     * authorize each entry while the state is stable, but no extra auth
+     * lookup should extend that nested lock interval. */
+    if (ok) {
+        qihse_auth_user_active_and_tenant(requester, &active, &tenant);
+        ok = active && tenant == QIHSE_TENANT_SYSTEM &&
+             qihse_user_get_role(requester) == QIHSE_ROLE_OPERATOR;
+    }
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
+}
+
+bool qihse_consensus_mesh_export_prefix_point_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* requester,
+    uint64_t through_index, qihse_consensus_mesh_prefix_point_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!mesh || !requester || !out ||
+        through_index > QIHSE_MESH_EVIDENCE_MAX_ENTRIES) return false;
+
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_INVALID;
+    qihse_auth_user_active_and_tenant(requester, &active, &tenant);
+    if (!active || tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(requester) != QIHSE_ROLE_OPERATOR) return false;
+
+    pthread_mutex_lock(&mesh->state_lock);
+    uint64_t committed = mesh->consensus
+        ? qihse_consensus_commit_index(mesh->consensus) : 0u;
+    bool ok = mesh->consensus && through_index <= committed &&
+        qihse_consensus_committed_prefix_sha256(
+            mesh->consensus, requester, through_index,
+            out->prefix.committed_prefix_sha256);
+    if (ok) {
+        memcpy(out->prefix.group_id, mesh->consensus_config.group_id,
+               sizeof(out->prefix.group_id));
+        memcpy(out->prefix.history_id, mesh->consensus_config.history_id,
+               sizeof(out->prefix.history_id));
+        out->prefix.writer_epoch_floor =
+            mesh->consensus_config.writer_epoch_floor;
+        out->prefix.commit_index = through_index;
+        out->prefix.member_uuid = mesh->consensus_config.self;
+        memcpy(out->prefix.qkp_node_id, mesh->qkp_node_id,
+               sizeof(out->prefix.qkp_node_id));
+        out->observed_commit_index = committed;
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+
+    if (ok) {
+        qihse_auth_user_active_and_tenant(requester, &active, &tenant);
+        ok = active && tenant == QIHSE_TENANT_SYSTEM &&
+             qihse_user_get_role(requester) == QIHSE_ROLE_OPERATOR;
+    }
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
 }
 
 qihse_consensus_role_t qihse_consensus_mesh_role(qihse_consensus_mesh_t* mesh) {

@@ -380,8 +380,8 @@ and byte budgets; the daemon pulls one row at a time, up to the KV value limit,
 over QKP1's framed stream. Before deploying a replica, run a site-specific
 smoke test through the configured real I2P/SOCKS network and verify peer
 convergence after restart; that network test was not run in this workspace.
-Application EventStream consumers are separate integrations and are not used by
-this QIHSE KV replication path.
+The external EventStream is not connected and remains a separate integration
+item; it is not used by this QIHSE KV replication path.
 
 ### 3.3 `qihse-redis-server`
 
@@ -537,14 +537,13 @@ knobs) is [API reference §11](API_REFERENCE.md#11-configuration-knobs).
   `rm -rf build/<prefix>_*` (safe — everything under `build/` is disposable)
   and re-run. (A retry was recently added to the `node_cap_records` teardown;
   older flakes may still surface elsewhere.)
-- **`[QIHSE AUDIT] Integrity chain mismatch detected`** is non-fatal unless
-  `QIHSE_STRICT_AUDIT=1`. The audit code now seeds its in-memory SHA-384 head
-  on restart only when the protected chain file matches the final decoded
-  audit record and that record's hash recomputes correctly. Preserve both
-  files and investigate a mismatch; deleting the chain discards evidence.
-  This is a final-record consistency check, not a full independent validation
-  of every rotated audit record. Disposable test data may still be reset by
-  the relevant `make` targets.
+- **`[QIHSE AUDIT] Integrity chain mismatch detected`.** Preserve the audit
+  log, all rotated logs, and `qihse_integrity.chain` together before any
+  recovery action. A mismatch can indicate lost writes, a partial rotation,
+  or tampering. Do not delete the chain tip to silence the warning; inspect a
+  copy of the complete retained set and establish the last verified boundary
+  before restoring service. Disposable test directories may be reset only
+  when their audit history is explicitly out of scope.
 - (Resolved 2026-09-26: `make check` expected a stale upstream layout — the
   workflow checker now verifies current paths; `./qihse demo` runs end to end
   (native module exposed via `build/bin/qihse.so`, see [§3.1](#31-the-qihse-launcher-repository-root));

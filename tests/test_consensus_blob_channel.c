@@ -84,9 +84,9 @@ int main(void) {
     assert(blobs_a && blobs_b);
     qihse_consensus_blob_context_t ctx_a, ctx_b;
     assert(qihse_consensus_blob_context_init(&ctx_a, blobs_a, operator_user,
-                                              "sample.group"));
+                                              "qihse.test.app"));
     assert(qihse_consensus_blob_context_init(&ctx_b, blobs_b, operator_user,
-                                              "sample.group"));
+                                              "qihse.test.app"));
 
     uint8_t transaction[131071];
     for (size_t i = 0; i < sizeof(transaction); i++)
@@ -144,11 +144,11 @@ int main(void) {
     assert(qihse_uuid_from_seed("blob-voter-a", 12u, &member_a));
     assert(qihse_uuid_from_seed("blob-voter-b", 12u, &member_b));
     qihse_consensus_channel_config_t client_channel = {
-        .group_id="sample.group", .local_member=member_a, .peer_member=member_b,
+        .group_id="qihse.test.app", .local_member=member_a, .peer_member=member_b,
         .peer_node_id="blob-voter-b", .peer_dsa_pub_path=server_pub
     };
     qihse_consensus_channel_config_t server_channel = {
-        .group_id="sample.group", .local_member=member_b, .peer_member=member_a,
+        .group_id="qihse.test.app", .local_member=member_b, .peer_member=member_a,
         .peer_node_id="blob-voter-a", .peer_dsa_pub_path=client_pub
     };
 

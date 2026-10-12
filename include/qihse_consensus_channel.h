@@ -1,7 +1,7 @@
 #ifndef QIHSE_CONSENSUS_CHANNEL_H
 #define QIHSE_CONSENSUS_CHANNEL_H
 
-/* One-message QCS1 transport over an already-negotiated QKP1 session.
+/* One-message QCS1/QCS2 transport over an already-negotiated QKP1 session.
  * The caller must serialize concurrent access to a session and must enqueue
  * received messages before invoking qihse_consensus_receive() so transport
  * callbacks never re-enter the consensus state machine. */
@@ -15,11 +15,28 @@ extern "C" {
 
 typedef struct {
     const char* group_id;
+    /* Zero epoch and zero ID select legacy QCS1. Both set select QCS2.
+     * A partially populated binding is invalid and fails closed. */
+    uint8_t history_id[32];
+    uint64_t writer_epoch;
     qihse_uuid_t local_member;
     qihse_uuid_t peer_member;
     const char* peer_node_id;       /* exact QKP1 signed node label */
     const char* peer_dsa_pub_path;  /* exact pinned ML-DSA key */
 } qihse_consensus_channel_config_t;
+
+/* A bound peer sends QCH2 as the first sealed record on each new QKP stream.
+ * The receiver must authenticate it before accepting QCS2/QBT2 traffic.
+ * Legacy streams do not send a prelude. */
+bool qihse_consensus_channel_send_hello(
+    qihse_qkp_session_t* session, int fd,
+    const qihse_consensus_channel_config_t* channel,
+    const qihse_user_t* principal);
+bool qihse_consensus_channel_decode_hello(
+    qihse_qkp_session_t* session,
+    const qihse_consensus_channel_config_t* channel,
+    const qihse_user_t* principal,
+    const uint8_t* wire, size_t wire_len);
 
 /* Sends one canonical consensus message as one QKP1 sealed record. Message
  * group/from/to fields must match the channel binding. */
@@ -35,7 +52,7 @@ bool qihse_consensus_channel_receive(qihse_qkp_session_t* session, int fd,
                                      const qihse_user_t* principal,
                                      qihse_consensus_msg_t* out_message);
 
-/* Decode a QCS1 sealed payload already read by a protocol dispatcher. This
+/* Decode a QCS1/QCS2 sealed payload already read by a protocol dispatcher. This
  * preserves the same session pin, member/group binding, and SCI checks as
  * receive(). */
 bool qihse_consensus_channel_decode(qihse_qkp_session_t* session,

@@ -23,6 +23,7 @@
 #include "qihse_fts.h"
 #include "qihse_consensus_blob.h"
 #include "qihse_consensus_mesh.h"
+#include "qihse_consensus_prefix_point_challenge.h"
 /* The claims context CLUSTER PEERAUTH installs needs the user STRUCT by
  * value — the same narrow, deliberate use of the internal representation
  * qihse_fabric_dispatch.c makes for its remote context: the struct it
@@ -358,6 +359,8 @@ struct qihse_resp_server {
     qihse_consensus_mesh_t* consensus_mesh;
     qihse_consensus_blob_context_t* consensus_blob_context;
     bool consensus_allow_client_proposals;
+    bool consensus_prefix_challenge_enabled;
+    qihse_consensus_prefix_expected_t consensus_prefix_expected;
     qihse_bundle_composer_t* composer;
     bool owns_composer;
     /* U6 background expiry sweeper */
@@ -999,7 +1002,7 @@ static bool qihse_resp_handle_consensus_status(qihse_resp_session_t* session,
     if (request->argc != 1u)
         return qihse_resp_wrong_arity(session, "qihse.consensus.status");
     if (!session->server->consensus_mesh)
-        return qihse_resp_error(session, "ERR consensus bridge is not configured");
+        return qihse_resp_error(session, "ERR committed transaction bridge is not configured");
     qihse_consensus_mesh_status_t status;
     if (!qihse_consensus_mesh_status(session->server->consensus_mesh, &status) ||
         status.term > INT64_MAX || status.commit_index > INT64_MAX ||
@@ -1018,7 +1021,156 @@ static bool qihse_resp_handle_consensus_status(qihse_resp_session_t* session,
            qihse_resp_integer(session, (int64_t)status.last_log_index);
 }
 
-static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
+static bool qihse_resp_prefix_hex32(qihse_resp_session_t* session,
+                                    const uint8_t bytes[32]) {
+    static const char digits[] = "0123456789abcdef";
+    char encoded[64];
+    for (size_t i = 0u; i < 32u; i++) {
+        encoded[i * 2u] = digits[bytes[i] >> 4u];
+        encoded[i * 2u + 1u] = digits[bytes[i] & 0x0fu];
+    }
+    return qihse_resp_bulk(session, encoded, sizeof(encoded));
+}
+
+static bool qihse_resp_prefix_hex(qihse_resp_session_t* session,
+                                  const uint8_t* bytes, size_t length) {
+    static const char digits[] = "0123456789abcdef";
+    char encoded[QIHSE_FEDERATION_SIG_MAX_BYTES * 2u];
+    if (!bytes || length > QIHSE_FEDERATION_SIG_MAX_BYTES) return false;
+    for (size_t i = 0u; i < length; i++) {
+        encoded[i * 2u] = digits[bytes[i] >> 4u];
+        encoded[i * 2u + 1u] = digits[bytes[i] & 0x0fu];
+    }
+    return qihse_resp_bulk(session, encoded, length * 2u);
+}
+
+static bool qihse_resp_prefix_challenge_parse(
+    const qihse_resp_arg_t* arg,
+    uint8_t out[QIHSE_CONSENSUS_PREFIX_CHALLENGE_BYTES]) {
+    if (!arg || !arg->data ||
+        arg->len != QIHSE_CONSENSUS_PREFIX_CHALLENGE_BYTES * 2u) return false;
+    uint8_t bits = 0u;
+    for (size_t i = 0u; i < QIHSE_CONSENSUS_PREFIX_CHALLENGE_BYTES; i++) {
+        unsigned int pair[2];
+        for (size_t j = 0u; j < 2u; j++) {
+            uint8_t c = arg->data[2u * i + j];
+            pair[j] = (c >= '0' && c <= '9') ? (unsigned int)(c - '0') :
+                      (c >= 'a' && c <= 'f') ? (unsigned int)(c - 'a') + 10u :
+                      (c >= 'A' && c <= 'F') ? (unsigned int)(c - 'A') + 10u : 16u;
+        }
+        if (pair[0] > 15u || pair[1] > 15u) return false;
+        out[i] = (uint8_t)((pair[0] << 4u) | pair[1]);
+        bits |= out[i];
+    }
+    return bits != 0u;
+}
+
+/* This endpoint only signs a bounded, access-checked local historical point.
+ * The verifier owns nonce freshness/consumption and independent trust pins.
+ * Its response grants no replay, rejoin, serving, or writer authority. */
+static bool qihse_resp_handle_consensus_prefix_point_challenge(
+    qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session || !request || !session->server ||
+        !session->server->auth_required || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
+    if (request->argc != 3u)
+        return qihse_resp_wrong_arity(session, "qihse.consensus.prefix.point.challenge");
+    if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM)
+        return qihse_resp_error(session, "NOPERM system Operator required");
+    qihse_resp_server_t* server = session->server;
+    if (!server->consensus_mesh || !server->consensus_prefix_challenge_enabled)
+        return qihse_resp_error(session, "ERR prefix challenge is not configured");
+    uint64_t index = 0u;
+    uint8_t challenge[QIHSE_CONSENSUS_PREFIX_CHALLENGE_BYTES];
+    if (!qihse_resp_parse_u64_arg(&request->argv[1], &index) ||
+        index > QIHSE_MESH_EVIDENCE_MAX_ENTRIES ||
+        !qihse_resp_prefix_challenge_parse(&request->argv[2], challenge))
+        return qihse_resp_error(session, "ERR invalid prefix point challenge");
+    const qihse_consensus_prefix_expected_t* expected =
+        &server->consensus_prefix_expected;
+    qihse_consensus_prefix_point_challenge_t response;
+    if (!qihse_consensus_mesh_prefix_point_challenge_respond_user(
+            server->consensus_mesh, session->user, server->store, session->user,
+            &expected->signer_node, expected, index, challenge, &response))
+        return qihse_resp_error(session, "ERR prefix point challenge unavailable");
+    const qihse_consensus_prefix_attestation_t* signed_prefix = &response.prefix;
+    const qihse_consensus_prefix_evidence_t* evidence = &signed_prefix->evidence;
+    if (response.observed_commit_index > INT64_MAX ||
+        evidence->writer_epoch_floor > INT64_MAX ||
+        evidence->commit_index > INT64_MAX ||
+        response.signature_len == 0u ||
+        response.signature_len > QIHSE_FEDERATION_SIG_MAX_BYTES ||
+        signed_prefix->signature_len == 0u ||
+        signed_prefix->signature_len > QIHSE_FEDERATION_SIG_MAX_BYTES)
+        return qihse_resp_error(session, "ERR prefix challenge encoding unavailable");
+    char member[QIHSE_UUID_STR_LEN + 1u];
+    char signer[QIHSE_UUID_STR_LEN + 1u];
+    if (!qihse_uuid_format(&evidence->member_uuid, member) ||
+        !qihse_uuid_format(&signed_prefix->signer_node, signer))
+        return qihse_resp_error(session, "ERR prefix challenge identity unavailable");
+    return qihse_resp_array(session, 15u) &&
+           qihse_resp_bulk_text(session, "QIHSE-PREFIX-POINT-CHALLENGE-v1") &&
+           qihse_resp_bulk_text(session, evidence->group_id) &&
+           qihse_resp_prefix_hex32(session, evidence->history_id) &&
+           qihse_resp_integer(session, (int64_t)evidence->writer_epoch_floor) &&
+           qihse_resp_integer(session, (int64_t)evidence->commit_index) &&
+           qihse_resp_prefix_hex32(session, evidence->committed_prefix_sha256) &&
+           qihse_resp_bulk_text(session, member) &&
+           qihse_resp_bulk_text(session, evidence->qkp_node_id) &&
+           qihse_resp_integer(session, (int64_t)response.observed_commit_index) &&
+           qihse_resp_bulk_text(session, signer) &&
+           qihse_resp_prefix_hex(session, signed_prefix->signer_fingerprint,
+                                 sizeof(signed_prefix->signer_fingerprint)) &&
+           qihse_resp_integer(session, (int64_t)signed_prefix->sig_alg) &&
+           qihse_resp_prefix_hex(session, signed_prefix->signature,
+                                 signed_prefix->signature_len) &&
+           qihse_resp_prefix_hex(session, response.challenge,
+                                 sizeof(response.challenge)) &&
+           qihse_resp_prefix_hex(session, response.signature,
+                                 response.signature_len);
+}
+
+/* Local committed-prefix inventory. The mesh supplies one lock-consistent
+ * record; this command confers neither a remote signature nor rejoin rights. */
+static bool qihse_resp_handle_consensus_prefix_evidence(
+    qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session || !request || !session->server ||
+        !session->server->auth_required || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
+    if (request->argc != 1u)
+        return qihse_resp_wrong_arity(session, "qihse.consensus.prefix.evidence");
+    if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM)
+        return qihse_resp_error(session, "NOPERM system Operator required");
+    if (!session->server->consensus_mesh)
+        return qihse_resp_error(session, "ERR consensus mesh is not configured");
+    qihse_consensus_mesh_prefix_evidence_t evidence;
+    if (!qihse_consensus_mesh_export_prefix_evidence_user(
+            session->server->consensus_mesh, session->user,
+            QIHSE_MESH_EVIDENCE_MAX_ENTRIES, &evidence))
+        return qihse_resp_error(session,
+            "ERR committed-prefix evidence is unavailable or exceeds the work limit");
+    if (evidence.writer_epoch_floor > INT64_MAX ||
+        evidence.commit_index > INT64_MAX)
+        return qihse_resp_error(session, "ERR consensus metadata exceeds RESP integer range");
+    char member_text[QIHSE_UUID_STR_LEN + 1u];
+    if (!qihse_uuid_format(&evidence.member_uuid, member_text))
+        return qihse_resp_error(session, "ERR consensus member UUID is invalid");
+    return qihse_resp_array(session, 8u) &&
+           qihse_resp_bulk_text(session, "QIHSE-PREFIX-EVIDENCE-v1") &&
+           qihse_resp_bulk_text(session, evidence.group_id) &&
+           qihse_resp_prefix_hex32(session, evidence.history_id) &&
+           qihse_resp_integer(session, (int64_t)evidence.writer_epoch_floor) &&
+           qihse_resp_integer(session, (int64_t)evidence.commit_index) &&
+           qihse_resp_prefix_hex32(session, evidence.committed_prefix_sha256) &&
+           qihse_resp_bulk_text(session, member_text) &&
+           qihse_resp_bulk_text(session, evidence.qkp_node_id);
+}
+
+static bool qihse_resp_handle_committed_txn(qihse_resp_session_t* session,
                                              const qihse_resp_request_t* request) {
     if (!session || !request || !session->server ||
         !session->server->auth_required || !session->user ||
@@ -1026,7 +1178,7 @@ static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
         return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
     if (!session->server->consensus_mesh ||
         !session->server->consensus_blob_context)
-        return qihse_resp_error(session, "ERR consensus bridge is not configured");
+        return qihse_resp_error(session, "ERR committed transaction bridge is not configured");
 
     if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE")) {
         if (!session->server->consensus_allow_client_proposals)
@@ -1041,7 +1193,7 @@ static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
             classification > UINT16_MAX || sci > UINT16_MAX ||
             request->argv[4].len == 0u ||
             request->argv[4].len > QIHSE_BLOB_MAX_SIZE - QIHSE_CONSENSUS_BLOB_HEADER_BYTES)
-            return qihse_resp_error(session, "ERR invalid consensus transaction envelope");
+            return qihse_resp_error(session, "ERR invalid committed transaction envelope");
         if (!qihse_auth_can_access(session->user, (uint16_t)classification,
                                    (uint16_t)sci))
             return qihse_resp_error(session, "NOPERM transaction exceeds principal clearance or SCI");
@@ -1104,10 +1256,9 @@ static bool qihse_resp_handle_consensus_txn(qihse_resp_session_t* session,
             limit == 0u || limit > QIHSE_TXN_READ_MAX_ENTRIES)
             return qihse_resp_error(session, "ERR invalid transaction cursor or page size");
 
-        /* Ordinary transaction consumers must read through the leader: a
-         * follower may lag. READLOCAL is an explicit node-local inspection
-         * for recovery tooling; its returned cursor is only this member's
-         * committed watermark and must never stand for a cluster-wide one. */
+        /* Ordinary transaction consumers use the leader's watermark.
+         * READLOCAL is explicitly limited to node-local recovery inspection;
+         * its cursor must not be interpreted as a cluster-wide watermark. */
         if (!local_read && qihse_consensus_mesh_role(session->server->consensus_mesh) !=
             QIHSE_CONSENSUS_LEADER) {
             qihse_uuid_t leader;
@@ -1208,7 +1359,7 @@ txn_read_write_failed:
         for (size_t i = 0; i < count; i++) free(transactions[i]);
         return false;
     }
-    return qihse_resp_error(session, "ERR unsupported consensus transaction command");
+    return qihse_resp_error(session, "ERR unsupported committed transaction command");
 }
 
 /* CLUSTER PEERAUTH <token-hex> — the peer end of scatter principal
@@ -11175,10 +11326,14 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     if (qihse_resp_command_is(request, "HELLO")) return qihse_resp_handle_hello(session, request);
     if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.STATUS"))
         return qihse_resp_handle_consensus_status(session, request);
+    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.EVIDENCE"))
+        return qihse_resp_handle_consensus_prefix_evidence(session, request);
+    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.POINT.CHALLENGE"))
+        return qihse_resp_handle_consensus_prefix_point_challenge(session, request);
     if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
         qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
         qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
-        return qihse_resp_handle_consensus_txn(session, request);
+        return qihse_resp_handle_committed_txn(session, request);
     if (qihse_resp_command_is(request, "PING")) {
         if (request->argc == 1) return qihse_resp_simple(session, "PONG");
         if (request->argc == 2) return qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len);
@@ -11786,6 +11941,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->consensus_blob_context = supplied->consensus_blob_context;
     server->consensus_allow_client_proposals =
         supplied->consensus_allow_client_proposals;
+    server->consensus_prefix_challenge_enabled =
+        supplied->consensus_prefix_challenge_enabled;
+    server->consensus_prefix_expected = supplied->consensus_prefix_expected;
     server->metrics = qihse_metrics_create();
     if (server->metrics) {
         qihse_metrics_register(server->metrics, "qihse_bundle_compose_total", "Session bundles composed", METRIC_COUNTER);

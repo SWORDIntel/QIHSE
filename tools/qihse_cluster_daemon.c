@@ -30,6 +30,7 @@
 #include "qihse_machine_auth.h"
 #include "qihse_platform.h"
 #include "qihse_consensus_mesh.h"
+#include "qihse_consensus_rejoin_guard.h"
 #include "qihse_consensus_blob.h"
 #include <netdb.h>
 #include <fnmatch.h>
@@ -164,6 +165,10 @@ static void usage(const char* argv0) {
         "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (repeat for other voters)\n"
         "  enables the durable QKP-pinned consensus mesh. Requires --dir and --pqc-require.\n"
         "  --consensus-election-priority-delay-ms N delays this member's candidacy.\n"
+        "  --consensus-history-id SHA256 --consensus-writer-epoch N bind a new\n"
+        "  consensus record to one history and a durable fencing floor.\n"
+        "  --consensus-prefix-signer UUID enables a read-only signed exact-prefix\n"
+        "  challenge using an approved local federation node identity.\n"
         "  --consensus-allow-client-proposals enables app writes on this member;\n"
         "  omit on standby members except during a fenced emergency takeover.\n",
         argv0);
@@ -183,6 +188,10 @@ typedef struct {
 
 typedef struct {
     char group_id[CONSENSUS_GROUP_ID_MAX + 1u];
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
+    bool history_id_supplied;
+    bool writer_epoch_supplied;
     qihse_uuid_t self;
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t member_count;
@@ -199,6 +208,23 @@ static bool consensus_group_id_valid(const char* value) {
     for (const unsigned char* p = (const unsigned char*)value; *p; p++)
         if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
                (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' )) return false;
+    return true;
+}
+
+static bool consensus_history_id_parse(const char* value, uint8_t out[32]) {
+    if (!value || strlen(value) != 64u) return false;
+    for (size_t i = 0; i < 32u; i++) {
+        unsigned int high, low;
+        char a = value[2u * i], b = value[2u * i + 1u];
+        high = (a >= '0' && a <= '9') ? (unsigned int)(a - '0') :
+               (a >= 'a' && a <= 'f') ? (unsigned int)(a - 'a' + 10) :
+               (a >= 'A' && a <= 'F') ? (unsigned int)(a - 'A' + 10) : 16u;
+        low = (b >= '0' && b <= '9') ? (unsigned int)(b - '0') :
+              (b >= 'a' && b <= 'f') ? (unsigned int)(b - 'a' + 10) :
+              (b >= 'A' && b <= 'F') ? (unsigned int)(b - 'A' + 10) : 16u;
+        if (high > 15u || low > 15u) return false;
+        out[i] = (uint8_t)((high << 4u) | low);
+    }
     return true;
 }
 
@@ -246,6 +272,12 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
                                           bool replica_read_only,
                                           bool replication_source) {
     if (!options || !options->group_id[0]) return "missing group ID";
+    if (options->history_id_supplied != options->writer_epoch_supplied ||
+        (options->history_id_supplied &&
+         !qihse_consensus_history_identity_valid(
+            options->group_id, options->history_id,
+            options->writer_epoch_floor)))
+        return "history ID and writer epoch must be supplied together";
     if (options->member_count < 3u || options->member_count > QIHSE_CONSENSUS_MAX_MEMBERS)
         return "member count must be between 3 and the configured maximum";
     if (options->peer_count + 1u != options->member_count)
@@ -943,6 +975,9 @@ int main(int argc, char** argv) {
     memset(&consensus_options, 0, sizeof(consensus_options));
     bool consensus_configured = false;
     bool consensus_allow_client_proposals = false;
+    bool consensus_prefix_signer_configured = false;
+    qihse_uuid_t consensus_prefix_signer;
+    memset(&consensus_prefix_signer, 0, sizeof(consensus_prefix_signer));
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -1091,6 +1126,26 @@ int main(int argc, char** argv) {
             consensus_options.election_priority_delay_ms = delay_ms;
         } else if (strcmp(a, "--consensus-allow-client-proposals") == 0) {
             consensus_allow_client_proposals = true;
+        } else if (strcmp(a, "--consensus-prefix-signer") == 0 && i + 1 < argc) {
+            if (consensus_prefix_signer_configured ||
+                !qihse_uuid_parse(argv[++i], &consensus_prefix_signer) ||
+                qihse_uuid_is_nil(&consensus_prefix_signer))
+                return usage(argv[0]), 2;
+            consensus_prefix_signer_configured = true;
+        } else if (strcmp(a, "--consensus-history-id") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (consensus_options.history_id_supplied) return usage(argv[0]), 2;
+            if (!consensus_history_id_parse(argv[++i], consensus_options.history_id))
+                return usage(argv[0]), 2;
+            consensus_options.history_id_supplied = true;
+        } else if (strcmp(a, "--consensus-writer-epoch") == 0 && i + 1 < argc) {
+            consensus_configured = true;
+            if (consensus_options.writer_epoch_supplied) return usage(argv[0]), 2;
+            if (!parse_u64_decimal(argv[++i],
+                                   &consensus_options.writer_epoch_floor) ||
+                consensus_options.writer_epoch_floor == 0)
+                return usage(argv[0]), 2;
+            consensus_options.writer_epoch_supplied = true;
         } else if (strcmp(a, "--consensus-peer") == 0 && i + 1 < argc) {
             consensus_configured = true;
             char peer_arg[1200];
@@ -1146,6 +1201,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: --consensus-allow-client-proposals requires a consensus mesh\n");
         return 2;
     }
+    if (consensus_prefix_signer_configured && !consensus_configured) {
+        fprintf(stderr, "qihse-cluster-daemon: --consensus-prefix-signer requires a consensus mesh\n");
+        return 2;
+    }
 
     const bool replication_configured = replication_source_host != NULL ||
         replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
@@ -1184,6 +1243,10 @@ int main(int argc, char** argv) {
         if (configured_password && *configured_password) {
             operator_password = configured_password;
         }
+    }
+    if (consensus_prefix_signer_configured && !operator_password) {
+        fprintf(stderr, "qihse-cluster-daemon: prefix challenges require authenticated RESP\n");
+        return 2;
     }
 
     if (replication_source_host && (!replica_read_only || repl_glob_count != 1u ||
@@ -1396,6 +1459,10 @@ int main(int argc, char** argv) {
         mesh_cfg.consensus.member_count = consensus_options.member_count;
         memcpy(mesh_cfg.consensus.members, consensus_options.members,
                consensus_options.member_count * sizeof(consensus_options.members[0]));
+        memcpy(mesh_cfg.consensus.history_id, consensus_options.history_id,
+               sizeof(mesh_cfg.consensus.history_id));
+        mesh_cfg.consensus.writer_epoch_floor =
+            consensus_options.writer_epoch_floor;
         if (snprintf(mesh_cfg.consensus.record_path, sizeof(mesh_cfg.consensus.record_path),
                      "%s", record_path) >= (int)sizeof(mesh_cfg.consensus.record_path)) {
             fprintf(stderr, "qihse-cluster-daemon: consensus record path is too long\n");
@@ -1465,6 +1532,27 @@ int main(int argc, char** argv) {
     config.consensus_blob_context = consensus_mesh ? &consensus_blob_context : NULL;
     config.consensus_allow_client_proposals =
         consensus_mesh && consensus_allow_client_proposals;
+    if (consensus_mesh && consensus_prefix_signer_configured) {
+        qihse_consensus_mesh_identity_t identity;
+        if (!qihse_consensus_mesh_history_identity(consensus_mesh, &identity)) {
+            fprintf(stderr, "qihse-cluster-daemon: prefix challenge history is unavailable\n");
+            qihse_consensus_mesh_destroy(consensus_mesh);
+            qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
+        qihse_consensus_prefix_expected_t* expected =
+            &config.consensus_prefix_expected;
+        memcpy(expected->group_id, identity.group_id,
+               sizeof(expected->group_id));
+        memcpy(expected->history_id, identity.history_id,
+               sizeof(expected->history_id));
+        expected->writer_epoch_floor = identity.writer_epoch_floor;
+        expected->member_uuid = consensus_options.self;
+        snprintf(expected->qkp_node_id, sizeof(expected->qkp_node_id),
+                 "%s", pqc_node_id);
+        expected->signer_node = consensus_prefix_signer;
+        config.consensus_prefix_challenge_enabled = true;
+    }
     config.cluster_migrate_password = operator_password;
     config.redundancy_peer = redundancy_peer;
     /* R4 replicated namespaces: must be set BEFORE server create — the

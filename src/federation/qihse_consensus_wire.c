@@ -3,6 +3,7 @@
 #include <string.h>
 
 #define QCS_HEADER_SIZE (4u + 2u + 1u + 1u + 16u + 16u + 8u + 8u)
+#define QCS_BOUND_SIZE (32u + 8u)
 typedef struct {
     uint8_t* p;
     size_t cap;
@@ -70,6 +71,13 @@ static bool group_valid(const char* group, size_t* out_len) {
     }
     *out_len = n;
     return true;
+}
+
+static bool history_valid(const uint8_t history_id[32], uint64_t writer_epoch) {
+    if (!history_id || writer_epoch == 0u) return false;
+    uint8_t value = 0u;
+    for (size_t i = 0; i < 32u; i++) value |= history_id[i];
+    return value != 0u;
 }
 
 static bool entry_valid(const qihse_user_t* principal,
@@ -185,20 +193,27 @@ static bool prevalidate(const qihse_user_t* principal,
     }
 }
 
-bool qihse_consensus_wire_encode(const qihse_user_t* principal,
-                                 const qihse_consensus_msg_t* m,
-                                 uint8_t* out, size_t out_cap,
-                                 size_t* out_len) {
+static bool wire_encode(const qihse_user_t* principal,
+                        const qihse_consensus_msg_t* m,
+                        const uint8_t history_id[32], uint64_t writer_epoch,
+                        uint8_t* out, size_t out_cap, size_t* out_len) {
     size_t group_len = 0;
-    if (!out || !out_len || !prevalidate(principal, m, &group_len))
+    if (!out || !out_len || !prevalidate(principal, m, &group_len) ||
+        (history_id && !history_valid(history_id, writer_epoch)))
         return false;
     writer_t w = {out, out_cap, 0u, true};
-    static const uint8_t magic[4] = {'Q', 'C', 'S', '1'};
-    w_bytes(&w, magic, sizeof(magic)); w_u16(&w, 1u);
+    static const uint8_t magic_legacy[4] = {'Q', 'C', 'S', '1'};
+    static const uint8_t magic_bound[4] = {'Q', 'C', 'S', '2'};
+    w_bytes(&w, history_id ? magic_bound : magic_legacy, 4u);
+    w_u16(&w, history_id ? 2u : 1u);
     w_u8(&w, (uint8_t)m->type); w_u8(&w, (uint8_t)group_len);
     w_bytes(&w, m->from.bytes, sizeof(m->from.bytes));
     w_bytes(&w, m->to.bytes, sizeof(m->to.bytes));
     w_u64(&w, m->term); w_u64(&w, m->fencing_epoch);
+    if (history_id) {
+        w_bytes(&w, history_id, 32u);
+        w_u64(&w, writer_epoch);
+    }
     w_bytes(&w, m->group_id, group_len);
     switch (m->type) {
         case QIHSE_CONSENSUS_MSG_REQUEST_VOTE:
@@ -237,23 +252,54 @@ bool qihse_consensus_wire_encode(const qihse_user_t* principal,
     return true;
 }
 
-bool qihse_consensus_wire_decode(const qihse_user_t* principal,
-                                 const uint8_t* wire, size_t wire_len,
-                                 qihse_consensus_msg_t* out) {
-    if (!principal || !wire || !out || wire_len < QCS_HEADER_SIZE ||
+bool qihse_consensus_wire_encode(const qihse_user_t* principal,
+                                 const qihse_consensus_msg_t* message,
+                                 uint8_t* out, size_t out_cap,
+                                 size_t* out_len) {
+    return wire_encode(principal, message, NULL, 0u, out, out_cap, out_len);
+}
+
+bool qihse_consensus_wire_encode_bound(const qihse_user_t* principal,
+                                       const qihse_consensus_msg_t* message,
+                                       const uint8_t history_id[32],
+                                       uint64_t writer_epoch,
+                                       uint8_t* out, size_t out_cap,
+                                       size_t* out_len) {
+    if (!history_valid(history_id, writer_epoch)) return false;
+    return wire_encode(principal, message, history_id, writer_epoch,
+                       out, out_cap, out_len);
+}
+
+static bool wire_decode(const qihse_user_t* principal,
+                        const uint8_t* wire, size_t wire_len,
+                        const uint8_t history_id[32], uint64_t writer_epoch,
+                        qihse_consensus_msg_t* out) {
+    if (!principal || !wire || !out ||
+        wire_len < QCS_HEADER_SIZE + (history_id ? QCS_BOUND_SIZE : 0u) ||
         wire_len > QIHSE_CONSENSUS_WIRE_MAX) return false;
+    if (history_id && !history_valid(history_id, writer_epoch)) return false;
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     reader_t r = {wire, wire_len, 0u, true};
     uint8_t magic[4]; r_bytes(&r, magic, sizeof(magic));
-    const uint8_t expected[4] = {'Q', 'C', 'S', '1'};
+    const uint8_t expected_legacy[4] = {'Q', 'C', 'S', '1'};
+    const uint8_t expected_bound[4] = {'Q', 'C', 'S', '2'};
     uint16_t version = r_u16(&r);
     m.type = (qihse_consensus_msg_type_t)r_u8(&r);
     uint8_t group_len = r_u8(&r);
     r_bytes(&r, m.from.bytes, sizeof(m.from.bytes)); r_bytes(&r, m.to.bytes, sizeof(m.to.bytes));
     m.term = r_u64(&r); m.fencing_epoch = r_u64(&r);
-    if (!r.ok || memcmp(magic, expected, sizeof(magic)) != 0 || version != 1u ||
+    if (!r.ok || memcmp(magic, history_id ? expected_bound : expected_legacy,
+                        sizeof(magic)) != 0 ||
+        version != (history_id ? 2u : 1u) ||
         group_len == 0u || group_len > QIHSE_CONSENSUS_GROUP_ID_MAX) return false;
+    if (history_id) {
+        uint8_t remote_history[32];
+        r_bytes(&r, remote_history, sizeof(remote_history));
+        uint64_t remote_epoch = r_u64(&r);
+        if (!r.ok || memcmp(remote_history, history_id, 32u) != 0 ||
+            remote_epoch != writer_epoch) return false;
+    }
     r_bytes(&r, m.group_id, group_len); m.group_id[group_len] = '\0';
     if (!r.ok) return false;
     switch (m.type) {
@@ -307,4 +353,20 @@ bool qihse_consensus_wire_decode(const qihse_user_t* principal,
     if (!r.ok || r.n != r.len || !prevalidate(principal, &m, &ignored)) return false;
     *out = m;
     return true;
+}
+
+bool qihse_consensus_wire_decode(const qihse_user_t* principal,
+                                 const uint8_t* wire, size_t wire_len,
+                                 qihse_consensus_msg_t* out) {
+    return wire_decode(principal, wire, wire_len, NULL, 0u, out);
+}
+
+bool qihse_consensus_wire_decode_bound(const qihse_user_t* principal,
+                                       const uint8_t* wire, size_t wire_len,
+                                       const uint8_t history_id[32],
+                                       uint64_t writer_epoch,
+                                       qihse_consensus_msg_t* out) {
+    if (!history_valid(history_id, writer_epoch)) return false;
+    return wire_decode(principal, wire, wire_len, history_id,
+                       writer_epoch, out);
 }

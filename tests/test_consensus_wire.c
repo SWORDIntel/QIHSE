@@ -21,7 +21,7 @@ int main(void) {
     qihse_consensus_msg_t input;
     memset(&input, 0, sizeof(input));
     input.type = QIHSE_CONSENSUS_MSG_APPEND;
-    snprintf(input.group_id, sizeof(input.group_id), "%s", "sample.group");
+    snprintf(input.group_id, sizeof(input.group_id), "%s", "qihse.test.app");
     assert(qihse_uuid_from_seed("wire-from", 9u, &input.from));
     assert(qihse_uuid_from_seed("wire-to", 7u, &input.to));
     input.term = 4u;
@@ -64,7 +64,7 @@ int main(void) {
     qihse_consensus_msg_t variants[6];
     memset(variants, 0, sizeof(variants));
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-        snprintf(variants[i].group_id, sizeof(variants[i].group_id), "%s", "sample.group");
+        snprintf(variants[i].group_id, sizeof(variants[i].group_id), "%s", "qihse.test.app");
         variants[i].from = input.from; variants[i].to = input.to;
         variants[i].term = 4u; variants[i].fencing_epoch = 4u;
     }

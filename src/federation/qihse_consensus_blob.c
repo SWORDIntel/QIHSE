@@ -2,6 +2,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/sha.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define QCB_GROUP_OFF 4u
@@ -267,4 +268,70 @@ bool qihse_consensus_blob_import_user(qihse_consensus_blob_context_t* context,
     if (!valid) (void)qihse_blob_delete_user(context->blobs,
                     reference + QCB_HASH_OFF, context->principal);
     return valid;
+}
+
+bool qihse_consensus_blob_read_committed_transaction_user(
+    qihse_consensus_blob_context_t* context,
+    const qihse_consensus_t* consensus, qihse_user_t* user,
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len) {
+    if (out_len) *out_len = 0u;
+    if (!context || !context->blobs || !consensus || !out || !out_len ||
+        index == 0u || !qcb_system_operator(user) ||
+        !qcb_system_operator(context->principal)) return false;
+
+    qihse_consensus_entry_t entry;
+    size_t count = 0u;
+    if (!qihse_consensus_read_committed_exact(consensus, user, index,
+                                               &entry, 1u, &count) ||
+        count != 1u || entry.index != index ||
+        !qcb_reference_matches(context, &entry)) return false;
+
+    const uint8_t* reference = entry.payload;
+    const uint8_t* hash = reference + QCB_HASH_OFF;
+    uint64_t expected_size = qcb_get_u64(reference + QCB_SIZE_OFF);
+    uint64_t tx_size = expected_size - QIHSE_CONSENSUS_BLOB_HEADER_BYTES;
+    if (tx_size > out_cap || expected_size > SIZE_MAX) return false;
+
+    qihse_blob_info_t info;
+    uint8_t header[QIHSE_CONSENSUS_BLOB_HEADER_BYTES];
+    if (!qihse_blob_verify_with_info_user(context->blobs, hash, user,
+            &info, header, sizeof(header)) ||
+        info.tenant_id != QIHSE_TENANT_SYSTEM ||
+        info.tag != QIHSE_BLOB_TAG_REPL_TRANSACTION ||
+        info.classification != entry.classif ||
+        info.sci_compartment != entry.sci ||
+        info.size != expected_size ||
+        memcmp(header, "QTX1", 4u) != 0 ||
+        CRYPTO_memcmp(header + QCB_GROUP_OFF, context->group_hash,
+                      QIHSE_BLOB_HASH_BYTES) != 0 ||
+        qcb_get_u64(header + QCB_GEN_OFF) != entry.journal_generation ||
+        qcb_get_u16(header + QCB_CLASS_OFF) != entry.classif ||
+        qcb_get_u16(header + QCB_SCI_OFF) != entry.sci ||
+        qcb_get_u64(header + QCB_TX_LEN_OFF) != tx_size) return false;
+
+    uint8_t* complete = malloc((size_t)expected_size);
+    if (!complete) return false;
+    bool ok = true;
+    size_t offset = 0u;
+    while (ok && offset < (size_t)expected_size) {
+        size_t wanted = (size_t)expected_size - offset;
+        if (wanted > 65536u) wanted = 65536u;
+        size_t got = 0u;
+        ok = qihse_blob_get_user(context->blobs, hash, (uint64_t)offset,
+                                 complete + offset, wanted, &got, user) &&
+             got > 0u && got <= wanted;
+        if (ok) offset += got;
+    }
+    uint8_t actual[QIHSE_BLOB_HASH_BYTES];
+    if (ok) ok = SHA384(complete, (size_t)expected_size, actual) != NULL &&
+                 CRYPTO_memcmp(actual, hash, sizeof(actual)) == 0 &&
+                 CRYPTO_memcmp(complete, header, sizeof(header)) == 0;
+    if (ok) {
+        memcpy(out, complete + sizeof(header), (size_t)tx_size);
+        *out_len = (size_t)tx_size;
+    }
+    OPENSSL_cleanse(complete, (size_t)expected_size);
+    free(complete);
+    OPENSSL_cleanse(actual, sizeof(actual));
+    return ok;
 }

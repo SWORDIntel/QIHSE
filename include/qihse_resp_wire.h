@@ -18,6 +18,7 @@
 #include "qihse_quota.h"
 #include "qihse_blob.h"
 #include "qihse_consensus_mesh.h"
+#include "qihse_consensus_prefix_point_challenge.h"
 #include "qihse_bundle.h"
 #include "qihse_task_queue.h"
 #include "qihse_task_worker.h"
@@ -124,13 +125,26 @@ typedef struct {
      * ("tenant-<id>-kem_pub.pem"); dsa_private_key_path signs manifests
      * (NULL = unsigned manifests). */
     qihse_blob_store_t* blobs;
-    /* Optional consensus transaction bridge. Commands fail closed unless
+    /* Optional committed transaction bridge. Commands fail closed unless
      * both are supplied; mesh proposals and reads use session->user. */
     qihse_consensus_mesh_t* consensus_mesh;
     qihse_consensus_blob_context_t* consensus_blob_context;
-    /* Client proposals are separately gated per daemon. Keep false on a
-     * standby member until its emergency takeover is explicitly fenced. */
+    /* Client proposals are separately gated per daemon. Keep false on the
+     * Relay during normal operation; enabling it there requires an explicit
+     * emergency configuration change after the primary nodes are fenced. */
     bool consensus_allow_client_proposals;
+    /* Optional read-only exact-prefix challenge. RESP command:
+     * QIHSE.CONSENSUS.PREFIX.POINT.CHALLENGE <index> <64-hex nonce>.
+     * The 15-field response is version, group, history, writer epoch, index,
+     * prefix digest, member UUID, QKP ID, observed commit index, signer UUID,
+     * signer fingerprint, signature algorithm, prefix signature, challenge,
+     * challenge signature. The verifier must pin identity and consume its own
+     * fresh nonce once. No rejoin authority follows from this response.
+     * The expected identity comes from trusted local mesh configuration, never
+     * from a request. The signer must be enrolled and approved in the store.
+     * Merge requires low-clearance/high-data negative adapter coverage in CI. */
+    bool consensus_prefix_challenge_enabled;
+    qihse_consensus_prefix_expected_t consensus_prefix_expected;
     const char* bundle_keys_dir;
     const char* bundle_dsa_private_key_path;
     /* U8: enable the fleet-wide "killswitch" channel — every authenticated

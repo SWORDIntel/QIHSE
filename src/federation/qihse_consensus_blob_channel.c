@@ -4,8 +4,10 @@
 #include <stdio.h>
 #include <string.h>
 
-#define QBC_PREFIX_MAX (4u + 16u + 16u + 1u + QIHSE_CONSENSUS_GROUP_ID_MAX + 8u + 8u + 4u + 2u + 2u + 2u + QIHSE_CONSENSUS_BLOB_REF_BYTES)
-#define QBC_ACK_BYTES 53u
+#define QBC_BINDING_BYTES 40u
+#define QBC_PREFIX_MAX (4u + 16u + 16u + 1u + QIHSE_CONSENSUS_GROUP_ID_MAX + QBC_BINDING_BYTES + 8u + 8u + 4u + 2u + 2u + 2u + QIHSE_CONSENSUS_BLOB_REF_BYTES)
+#define QBC_ACK_LEGACY_BYTES 53u
+#define QBC_ACK_MAX_BYTES (QBC_ACK_LEGACY_BYTES + QBC_BINDING_BYTES)
 #define QBC_STREAM_CHUNK QIHSE_QKP_MAX_PAYLOAD
 
 typedef struct {
@@ -16,6 +18,15 @@ typedef struct {
 } qbc_stream_t;
 
 static bool qbc_group_valid(const char* group);
+
+static bool qbc_binding_valid(const qihse_consensus_channel_config_t* channel) {
+    if (!channel) return false;
+    uint8_t bits = 0u;
+    for (size_t i = 0; i < sizeof(channel->history_id); i++)
+        bits |= channel->history_id[i];
+    return (channel->writer_epoch == 0u && bits == 0u) ||
+           (channel->writer_epoch != 0u && bits != 0u);
+}
 
 static bool qbc_system_operator(const qihse_user_t* principal) {
     return principal && qihse_auth_user_is_active(principal) &&
@@ -38,6 +49,7 @@ static bool qbc_channel_valid(const qihse_qkp_session_t* session, int fd,
                               const qihse_user_t* principal) {
     return fd >= 0 && principal && qihse_auth_user_is_active(principal) &&
            channel && qbc_group_valid(channel->group_id) &&
+           qbc_binding_valid(channel) &&
            !qihse_uuid_is_nil(&channel->local_member) &&
            !qihse_uuid_is_nil(&channel->peer_member) &&
            !qihse_uuid_equal(&channel->local_member, &channel->peer_member) &&
@@ -91,16 +103,22 @@ static bool qbc_build_prefix(const qihse_consensus_channel_config_t* channel,
         entry->payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
         memcmp(entry->payload, "QBR1", 4u) != 0) return false;
     size_t group_len = strlen(channel->group_id);
-    size_t need = 4u + 16u + 16u + 1u + group_len + 8u + 8u + 4u + 2u + 2u + 2u + entry->payload_len;
+    size_t need = 4u + 16u + 16u + 1u + group_len +
+        (channel->writer_epoch ? QBC_BINDING_BYTES : 0u) +
+        8u + 8u + 4u + 2u + 2u + 2u + entry->payload_len;
     if (need > cap || group_len > QIHSE_CONSENSUS_GROUP_ID_MAX ||
         entry->journal_generation == 0u ||
         memcmp(entry->payload, "QBR1", 4u) != 0) return false;
     size_t p = 0u;
-    memcpy(out + p, "QBT1", 4u); p += 4u;
+    memcpy(out + p, channel->writer_epoch ? "QBT2" : "QBT1", 4u); p += 4u;
     memcpy(out + p, channel->local_member.bytes, 16u); p += 16u;
     memcpy(out + p, channel->peer_member.bytes, 16u); p += 16u;
     out[p++] = (uint8_t)group_len;
     memcpy(out + p, channel->group_id, group_len); p += group_len;
+    if (channel->writer_epoch) {
+        memcpy(out + p, channel->history_id, 32u); p += 32u;
+        qbc_put_u64(out + p, channel->writer_epoch); p += 8u;
+    }
     qbc_put_u64(out + p, entry->journal_generation); p += 8u;
     qbc_put_u64(out + p, entry->hlc.physical_ms); p += 8u;
     qbc_put_u32(out + p, entry->hlc.logical); p += 4u;
@@ -117,19 +135,26 @@ static bool qbc_parse_prefix(const qihse_consensus_channel_config_t* channel,
                              const uint8_t* wire, size_t wire_len,
                              qihse_consensus_entry_t* out) {
     if (!channel || !principal || !wire || !out || wire_len < 4u + 33u ||
-        memcmp(wire, "QBT1", 4u) != 0 ||
+        memcmp(wire, channel->writer_epoch ? "QBT2" : "QBT1", 4u) != 0 ||
         memcmp(wire + 4u, channel->peer_member.bytes, 16u) != 0 ||
         memcmp(wire + 20u, channel->local_member.bytes, 16u) != 0 ||
         !qbc_system_operator(principal)) return false;
     size_t p = 36u;
     size_t group_len = wire[p++];
     if (group_len == 0u || group_len > QIHSE_CONSENSUS_GROUP_ID_MAX ||
-        wire_len < p + group_len + 8u + 8u + 4u + 2u + 2u + 2u) return false;
+        wire_len < p + group_len +
+            (channel->writer_epoch ? QBC_BINDING_BYTES : 0u) +
+            8u + 8u + 4u + 2u + 2u + 2u) return false;
     if (strlen(channel->group_id) != group_len ||
         memcmp(wire + p, channel->group_id, group_len) != 0) return false;
     qihse_consensus_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     p += group_len;
+    if (channel->writer_epoch) {
+        if (memcmp(wire + p, channel->history_id, 32u) != 0 ||
+            qbc_get_u64(wire + p + 32u) != channel->writer_epoch) return false;
+        p += QBC_BINDING_BYTES;
+    }
     entry.journal_generation = qbc_get_u64(wire + p); p += 8u;
     entry.hlc.physical_ms = qbc_get_u64(wire + p); p += 8u;
     entry.hlc.logical = qbc_get_u32(wire + p); p += 4u;
@@ -150,23 +175,41 @@ static bool qbc_parse_prefix(const qihse_consensus_channel_config_t* channel,
     return true;
 }
 
-static bool qbc_send_ack(qihse_qkp_session_t* session, int fd, uint8_t status,
+static bool qbc_send_ack(qihse_qkp_session_t* session, int fd,
+                         const qihse_consensus_channel_config_t* channel,
+                         uint8_t status,
                          const uint8_t* reference) {
-    uint8_t ack[QBC_ACK_BYTES];
-    memcpy(ack, "QBA1", 4u);
-    ack[4] = status;
-    memcpy(ack + 5u, reference + 64u, QIHSE_BLOB_HASH_BYTES);
-    return qihse_qkp_send_sealed(session, fd, ack, sizeof(ack));
+    uint8_t ack[QBC_ACK_MAX_BYTES];
+    size_t p = 0u;
+    memcpy(ack + p, channel->writer_epoch ? "QBA2" : "QBA1", 4u); p += 4u;
+    if (channel->writer_epoch) {
+        memcpy(ack + p, channel->history_id, 32u); p += 32u;
+        qbc_put_u64(ack + p, channel->writer_epoch); p += 8u;
+    }
+    ack[p++] = status;
+    memcpy(ack + p, reference + 64u, QIHSE_BLOB_HASH_BYTES);
+    p += QIHSE_BLOB_HASH_BYTES;
+    return qihse_qkp_send_sealed(session, fd, ack, p);
 }
 
 static bool qbc_receive_status(qihse_qkp_session_t* session, int fd,
+                               const qihse_consensus_channel_config_t* channel,
                                const uint8_t* reference, uint8_t* out_status) {
-    uint8_t ack[QBC_ACK_BYTES];
+    uint8_t ack[QBC_ACK_MAX_BYTES];
+    size_t length = channel->writer_epoch ? QBC_ACK_MAX_BYTES : QBC_ACK_LEGACY_BYTES;
     ssize_t n = qihse_qkp_recv_sealed(session, fd, ack, sizeof(ack));
-    if (n != (ssize_t)sizeof(ack) || memcmp(ack, "QBA1", 4u) != 0 ||
-        CRYPTO_memcmp(ack + 5u, reference + 64u, QIHSE_BLOB_HASH_BYTES) != 0 ||
-        ack[4] > 2u) return false;
-    if (out_status) *out_status = ack[4];
+    if (n != (ssize_t)length ||
+        memcmp(ack, channel->writer_epoch ? "QBA2" : "QBA1", 4u) != 0) return false;
+    size_t p = 4u;
+    if (channel->writer_epoch) {
+        if (memcmp(ack + p, channel->history_id, 32u) != 0 ||
+            qbc_get_u64(ack + p + 32u) != channel->writer_epoch) return false;
+        p += QBC_BINDING_BYTES;
+    }
+    if (ack[p] > 2u ||
+        CRYPTO_memcmp(ack + p + 1u, reference + 64u,
+                      QIHSE_BLOB_HASH_BYTES) != 0) return false;
+    if (out_status) *out_status = ack[p];
     return true;
 }
 
@@ -201,7 +244,7 @@ bool qihse_consensus_blob_channel_send(
 
     const uint8_t* reference = entry->payload;
     uint8_t status = 0u;
-    if (!qbc_receive_status(session, fd, reference, &status)) return false;
+    if (!qbc_receive_status(session, fd, channel, reference, &status)) return false;
     if (status == 2u) return true;
     if (status != 1u) return false;
 
@@ -222,7 +265,7 @@ bool qihse_consensus_blob_channel_send(
     memcpy(end, "QBE1", 4u);
     memcpy(end + 4u, reference + 64u, QIHSE_BLOB_HASH_BYTES);
     if (!qihse_qkp_send_sealed(session, fd, end, sizeof(end))) return false;
-    return qbc_receive_status(session, fd, reference, &status) && status == 2u;
+    return qbc_receive_status(session, fd, channel, reference, &status) && status == 2u;
 }
 
 bool qihse_consensus_blob_channel_receive(
@@ -247,30 +290,23 @@ bool qihse_consensus_blob_channel_receive_prefix(
     qihse_consensus_entry_t entry;
     bool authorized = qbc_parse_prefix(channel, principal, prefix, prefix_len, &entry);
     if (!authorized) {
-        uint8_t denied[QBC_ACK_BYTES] = {0};
-        memcpy(denied, "QBA1", 4u); denied[4] = 0u;
-        if (prefix_len >= 36u + 1u) {
-            size_t glen = prefix[36u];
-            size_t hash_offset = 36u + 1u + glen + 8u + 8u + 4u + 2u + 2u + 2u + 64u;
-            if (glen <= QIHSE_CONSENSUS_GROUP_ID_MAX && prefix_len >= hash_offset + 48u)
-                memcpy(denied + 5u, prefix + hash_offset, 48u);
-        }
-        (void)qihse_qkp_send_sealed(session, fd, denied, sizeof(denied));
+        uint8_t empty_reference[64u + QIHSE_BLOB_HASH_BYTES] = {0};
+        (void)qbc_send_ack(session, fd, channel, 0u, empty_reference);
         return false;
     }
     const uint8_t* reference = entry.payload;
     if (qihse_consensus_blob_validate(blobs, &entry)) {
-        if (!qbc_send_ack(session, fd, 2u, reference)) return false;
+        if (!qbc_send_ack(session, fd, channel, 2u, reference)) return false;
         *out_entry = entry;
         return true;
     }
-    if (!qbc_send_ack(session, fd, 1u, reference)) return false;
+    if (!qbc_send_ack(session, fd, channel, 1u, reference)) return false;
     uint64_t expected = qbc_get_u64(reference + 112u);
     if (expected <= QIHSE_CONSENSUS_BLOB_HEADER_BYTES || expected > QIHSE_BLOB_MAX_SIZE) return false;
     qbc_stream_t stream = {.session=session, .fd=fd, .expected=expected, .received=0u};
     if (!qihse_consensus_blob_import_user(blobs, &entry, qbc_import_read, &stream) ||
         stream.received != expected) {
-        (void)qbc_send_ack(session, fd, 0u, reference);
+        (void)qbc_send_ack(session, fd, channel, 0u, reference);
         return false;
     }
     uint8_t end[4u + QIHSE_BLOB_HASH_BYTES];
@@ -278,10 +314,10 @@ bool qihse_consensus_blob_channel_receive_prefix(
     if (end_len != (ssize_t)sizeof(end) || memcmp(end, "QBE1", 4u) != 0 ||
         CRYPTO_memcmp(end + 4u, reference + 64u, QIHSE_BLOB_HASH_BYTES) != 0) {
         (void)qihse_blob_delete_user(blobs->blobs, reference + 64u, blobs->principal);
-        (void)qbc_send_ack(session, fd, 0u, reference);
+        (void)qbc_send_ack(session, fd, channel, 0u, reference);
         return false;
     }
-    if (!qbc_send_ack(session, fd, 2u, reference)) return false;
+    if (!qbc_send_ack(session, fd, channel, 2u, reference)) return false;
     *out_entry = entry;
     return true;
 }

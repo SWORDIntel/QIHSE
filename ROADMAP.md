@@ -1,15 +1,64 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-09
+**Status date:** 2026-10-12
+**License:** first-party QIHSE code uses SRSL-1.0; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
 ---
 
-## 1. Where we are now (verified against the working tree, 2026-10-09)
+## 1. Where we are now (reviewed 2026-10-12)
 
-### 1.5 Replica transport and durable KV handoff (implemented, 2026-10-09)
+### Audit continuity deployment gate (2026-10-12)
+
+The audit implementation recovers the retained SHA-384 chain on
+startup and persist appended records before advancing the tip. It now carries
+a process-local, typed OS-service recovery context through the lowest audit
+reader and restricts reads to owner-controlled audit files. This is a local
+security boundary, not historical signature verification: the current
+ML-DSA signing identity is regenerated at startup and prior public keys are
+not retained. It must remain undeployed until preserved log copies are
+reviewed for legacy reset boundaries, partial records, stale/missing tips,
+rotation/prune behavior, and historical format compatibility. The scanner's
+strict startup failure behavior must not be applied to live data before that
+review. Scanner and pruning now share strict numeric rotated-file parsing and
+a 256-file limit; rotation reserves capacity and fails closed on directory
+errors. The local edit now uses an owner-checked writer lock tied to the audit
+directory and process, invalidates the inherited context after fork, and
+checks banner/record write counts. Behavioral validation of the integrated
+source is required before deployment.
+
+A portable x86-64 review build of this dirty working tree completed on
+2026-10-12. Its native library SHA-256 is
+`e575b54e5e6413e792004d82df48ca3503f6525464b0a02b66d3f8fb71aac9f6`;
+the daemon SHA-256 is
+`4f15ecc5aa4ead46b0d799559aa66a750bca433f645d307b7344f85930619d44`.
+The build found no removed exported dynamic symbols relative to the deployed
+library, and both artifacts report x86-64-baseline. This is a dirty-source
+candidate, not a frozen release. Historical ML-DSA signatures remain
+unverifiable because signing keys are regenerated, and retained-log, crash,
+rotation, fork, and three-node recovery behavior has not been exercised.
+The candidate has not been installed on any server. The deployed three-node
+library and daemon pair is already byte-identical; see
+`docs/deployment/native_cluster_parity.md`.
+
+### Exact-prefix challenge deployment gate (2026-10-12)
+
+A read-only RESP endpoint accepts a bounded exact committed
+index and verifier-supplied 32-byte challenge from an authenticated system
+Operator. It signs a response bound to the group/history/epoch, index,
+observed watermark, and configured enrolled signer. The endpoint grants no
+replay, rejoin, or write authority. It remains default-off and undeployed.
+Before enabling it, retain low-clearance/high-data negative CI coverage required
+by `AGENTS.md`, implement independent one-use nonce issuance and protected
+verification records, and resolve the current 4,096-entry index limit for
+histories beyond that boundary. No behavioral validation has been run.
+The Python controller SDK also has an optional exact QKP peer node/key pin;
+when supplied, it checks the signed identity before HELLO or AUTH. This has
+not been used by an independent prefix verifier.
+
+### 1.5 W8 — I2P replica transport and durable KV handoff (implemented, 2026-10-09)
 
 The implementation and code-level regression gates are complete. Deployment
 through a configured SOCKS5 network still needs a site-specific smoke test.
@@ -40,9 +89,9 @@ Replication validation gates:
 - [x] Abrupt exit/restart at seven install image, intent, WAL, SSTable, cursor,
   marker, and journal-removal boundaries (`make test-replica-crash`).
 
-The code-level validation gates are closed. A deployment smoke test through
-the configured SOCKS5 network remains site-specific and was not run in this
-workspace. Application EventStream integration remains separate.
+The code-level W8 validation gates are closed. A deployment smoke test through
+the configured real I2P/SOCKS network remains site-specific and was not run in
+this workspace; external EventStream integration is a separate open item.
 
 ### 1.1 Landed and committed
 
@@ -388,6 +437,20 @@ unblocks first:
 - [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with duplicated keys surviving; the discovery and loadshift drills were then made hermetic too (loopback --self-spawn), closing that remainder outright. Final board: **72/72 workloads pass, 11/11 areas FULL, zero recorded gaps** — the last gap (backend busy time) closed with `qihse_backend_busy_microseconds_total` (commit 812fa41), and the three multi-process drills were hardened to run reliably under CPU starvation (by-condition readiness waits, leak-proof teardown, 900 s pack timeouts; verified green at load average 80). Evidence: `make test-gold` — VERDICT: PASS, 0 failed, 0 stale, 0 known-bug
 
 ---
+
+### W8 — KP14-SUITE analysis-output authority (planned)
+
+The rebuilt suite's cross-project delivery order lives in `../METHRA/docs/VM9211_CORE_ROADMAP.md`. METHRA already stores an unclassified artifact DAG in QIHSE, but its current `methra:v1:*` KV writes do not enter KEYSTONE's feed or `fabric:` index. QIHSE remains the sole authority for bytes, lineage, and authorization; KEYSTONE indexes only derived candidates. Existing `KEYSTONE.FEED.*` is a transport primitive, not an implemented analysis-output pipeline.
+
+Identity namespaces remain separate: METHRA's existing object keys use BLAKE3, this proposed QIHSE analysis-artifact manifest and blob references use SHA-384, and feed object/event IDs are UUIDs. A future feed projection must carry the QIHSE artifact ID as an explicit backreference, not reinterpret one identifier as another.
+
+- [x] Add a bounded v1 KP14 analysis-artifact manifest validator and canonical SHA-384 ID in `libqihse.so`, binding artifact kind/schema, producer, run/generation, source binary, ISA/mode, optional ISANITY/VEXEL pins, payload reference, input IDs and tenant/classification/SCI. Its read/export visibility gate rejects NULL, revoked, low-clearance, missing-SCI and cross-tenant principals; focused and sanitizer tests pass and the negative test is in `make test` CI. This is a contract, not durable ingest or feed publication.
+- [x] Add a fail-closed publisher/preflight boundary: tenant Analysts need a per-tenant KP14 WRITE ACL, Operators retain their existing cross-tenant ACL bypass, and streaming SHA-384/length plus canonical-ID checks verify candidate binary bytes. Derived lineage remains explicitly unresolved; this API does not write, pin, read back, or publish an artifact. Focused Make and ASan/UBSan tests pass, including low-clearance, missing-SCI, cross-tenant, tamper and revoked-principal negatives.
+- [x] Reproduce the durable transaction gap with `tests/test_analysis_artifact_transaction_gap.c` and [the transaction design note](docs/KP14_DURABLE_ARTIFACT_TRANSACTION_DESIGN.md): the public blob-delete path can consume a hypothetical manifest pin, so current blob and KV APIs do not provide an atomic artifact commit. The proposed immutable binary-only file tier is design only; no durable put/get claim follows from this diagnostic.
+- [ ] Turn the validated manifest into an authenticated durable ingest/read path for binary, disassembly, CFG/xref, trace, solver, verdict, and report artifacts: atomically bind the payload and manifest, verify input lineage, protect referenced blobs from deletion, support replacement/tombstones, and keep large payloads in QIHSE blobs rather than feed events.
+- [ ] Publish authorized, bounded index projections via the existing KEYSTONE feed with explicit cursor/replay and retention semantics; expose freshness and index-unavailable status without losing the authoritative artifact.
+- [ ] Require authenticated context on every classified-capable read, search, export, and blob access; add low-clearance/high-data CI negatives, including direct-ID, enumeration, search, and snapshot/export paths. Do not use context-free unclassified KV calls as a classified adapter or rename METHRA keys to trigger the best-effort `fabric:` hook.
+- [ ] Validate one complete suite fixture through storage, KEYSTONE candidate search, QIHSE reauthorization/exact verification, tombstone/rebuild, and selective invalidation before VM 9211 promotion.
 
 ## 4. Sequencing
 

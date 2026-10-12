@@ -12,7 +12,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define QCSS_MAGIC "QCSSTG1\n"
+#define QCSS_MAGIC_LEGACY "QCSSTG1\n"
+#define QCSS_MAGIC_BOUND "QCSSTG2\n"
 #define QCSS_MAGIC_SIZE 8u
 #define QCSS_RECORD_MAX 4096u
 #define QCSS_FILE_MAX (32u * 1024u * 1024u)
@@ -40,6 +41,8 @@ struct qihse_consensus_snapshot_stage {
     pthread_mutex_t lock;
     char path[QIHSE_CONSENSUS_RECORD_PATH_MAX + 1u];
     char group[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u];
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
     qihse_consensus_validate_data_fn validate_data;
     void* validate_data_context;
     bool require_data_validator;
@@ -67,6 +70,18 @@ struct qihse_consensus_snapshot_stage {
 
 static bool qcss_active(const qihse_user_t* principal) {
     return principal && qihse_auth_user_is_active(principal);
+}
+
+static bool qcss_history_valid(const uint8_t history_id[32],
+                               uint64_t writer_epoch_floor) {
+    if (!history_id || !writer_epoch_floor) return false;
+    uint8_t bits = 0u;
+    for (size_t i = 0u; i < 32u; i++) bits |= history_id[i];
+    return bits != 0u;
+}
+
+static const char* qcss_magic(const qihse_consensus_snapshot_stage_t* s) {
+    return s->writer_epoch_floor ? QCSS_MAGIC_BOUND : QCSS_MAGIC_LEGACY;
 }
 
 static bool qcss_group_valid(const char* s) {
@@ -357,7 +372,8 @@ static bool qcss_validate_message(const qihse_consensus_snapshot_stage_t* s,
     if (!m || m->type != QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK ||
         !qcss_group_valid(m->group_id) || strcmp(m->group_id, s->group) != 0 ||
         qihse_uuid_is_nil(&m->from) || qihse_uuid_is_nil(&m->to) ||
-        m->fencing_epoch < m->term) {
+        m->fencing_epoch < m->term ||
+        m->fencing_epoch < s->writer_epoch_floor) {
         *why = QIHSE_SNAPSHOT_STAGE_INVALID;
         return false;
     }
@@ -466,7 +482,8 @@ static bool qcss_set_header(qihse_consensus_snapshot_stage_t* s,
 }
 
 static void qcss_forget_transfer(qihse_consensus_snapshot_stage_t* s);
-static size_t qcss_encode_header(const qihse_consensus_msg_t* m,
+static size_t qcss_encode_header(const qihse_consensus_snapshot_stage_t* s,
+                                 const qihse_consensus_msg_t* m,
                                  uint8_t* out);
 
 /* Atomically swap the durable file for a new, empty descriptor. The current
@@ -481,10 +498,12 @@ static qihse_consensus_snapshot_stage_result_t qcss_replace_file(
     memset(&candidate, 0, sizeof(candidate));
     candidate.fd = -1;
     snprintf(candidate.group, sizeof(candidate.group), "%s", s->group);
+    memcpy(candidate.history_id, s->history_id, sizeof(candidate.history_id));
+    candidate.writer_epoch_floor = s->writer_epoch_floor;
     if (!qcss_set_header(&candidate, m)) return QIHSE_SNAPSHOT_STAGE_LIMIT;
 
     uint8_t header[QCSS_RECORD_MAX];
-    size_t header_len = qcss_encode_header(m, header);
+    size_t header_len = qcss_encode_header(s, m, header);
     size_t path_len = strlen(s->path);
     char temporary[QIHSE_CONSENSUS_RECORD_PATH_MAX + 32u];
     if (path_len + sizeof(".replace.XXXXXX") > sizeof(temporary)) {
@@ -506,7 +525,7 @@ static qihse_consensus_snapshot_stage_result_t qcss_replace_file(
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     bool ok = fchmod(fd, S_IRUSR | S_IWUSR) == 0 &&
               flock(fd, LOCK_EX | LOCK_NB) == 0 &&
-              qcss_write_all(fd, (const uint8_t*)QCSS_MAGIC, QCSS_MAGIC_SIZE) &&
+              qcss_write_all(fd, (const uint8_t*)qcss_magic(s), QCSS_MAGIC_SIZE) &&
               fdatasync(fd) == 0;
     qihse_consensus_snapshot_stage_t replacement_file;
     memset(&replacement_file, 0, sizeof(replacement_file));
@@ -572,13 +591,19 @@ static void qcss_forget_transfer(qihse_consensus_snapshot_stage_t* s) {
     memset(&s->to, 0, sizeof(s->to));
 }
 
-static size_t qcss_encode_header(const qihse_consensus_msg_t* m,
+static size_t qcss_encode_header(const qihse_consensus_snapshot_stage_t* s,
+                                 const qihse_consensus_msg_t* m,
                                  uint8_t* out) {
     const qihse_consensus_snapshot_chunk_t* c = &m->u.snapshot_chunk;
     size_t n = 0u, group_len = strlen(m->group_id);
     qcss_put_u8(out, &n, QCSS_HEADER_RECORD);
     qcss_put_u8(out, &n, (uint8_t)group_len);
     memcpy(out + n, m->group_id, group_len); n += group_len;
+    if (s->writer_epoch_floor) {
+        memcpy(out + n, s->history_id, sizeof(s->history_id));
+        n += sizeof(s->history_id);
+        qcss_put_u64(out, &n, s->writer_epoch_floor);
+    }
     memcpy(out + n, m->from.bytes, QIHSE_UUID_BYTES); n += QIHSE_UUID_BYTES;
     memcpy(out + n, m->to.bytes, QIHSE_UUID_BYTES); n += QIHSE_UUID_BYTES;
     qcss_put_u64(out, &n, m->term);
@@ -670,7 +695,7 @@ static qihse_consensus_snapshot_stage_result_t qcss_apply_chunk(
     uint8_t header_record[QCSS_RECORD_MAX];
     uint8_t record[QCSS_RECORD_MAX];
     size_t header_len = 0u;
-    if (new_header) header_len = qcss_encode_header(m, header_record);
+    if (new_header) header_len = qcss_encode_header(s, m, header_record);
     size_t record_len = qcss_encode_chunk(c, record);
     if (persist && ((new_header && !qcss_record_fits(s, header_len + 12u + record_len)) ||
                     (!new_header && !qcss_record_fits(s, record_len)))) {
@@ -711,6 +736,12 @@ static bool qcss_decode_header(qihse_consensus_snapshot_stage_t* s,
     char group[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u] = {0};
     if (!qcss_get_bytes(&r, group, group_len) || !qcss_group_valid(group) ||
         strcmp(group, s->group) != 0) return false;
+    if (s->writer_epoch_floor) {
+        uint8_t history_id[32];
+        if (!qcss_get_bytes(&r, history_id, sizeof(history_id)) ||
+            memcmp(history_id, s->history_id, sizeof(history_id)) != 0 ||
+            qcss_get_u64(&r) != s->writer_epoch_floor) return false;
+    }
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK;
@@ -729,6 +760,7 @@ static bool qcss_decode_header(qihse_consensus_snapshot_stage_t* s,
     c->digest = qcss_get_u64(&r);
     if (!r.ok || r.n != r.len || qihse_uuid_is_nil(&m.from) ||
         qihse_uuid_is_nil(&m.to) || m.fencing_epoch < m.term ||
+        m.fencing_epoch < s->writer_epoch_floor ||
         !c->transfer_id || !c->total_entries ||
         c->total_entries > QIHSE_CONSENSUS_SNAPSHOT_STAGE_MAX_ENTRIES ||
         c->total_entries > SIZE_MAX / sizeof(*s->entries) ||
@@ -818,14 +850,14 @@ static bool qcss_recover(qihse_consensus_snapshot_stage_t* s,
         st.st_uid != geteuid() || (st.st_mode & 0077) != 0 ||
         st.st_size < 0 || (uint64_t)st.st_size > QCSS_FILE_MAX) return false;
     if (st.st_size == 0) {
-        if (!qcss_write_all(s->fd, (const uint8_t*)QCSS_MAGIC, QCSS_MAGIC_SIZE) ||
+        if (!qcss_write_all(s->fd, (const uint8_t*)qcss_magic(s), QCSS_MAGIC_SIZE) ||
             fdatasync(s->fd) != 0) return false;
         return true;
     }
     if (st.st_size < (off_t)QCSS_MAGIC_SIZE) return false;
     uint8_t magic[QCSS_MAGIC_SIZE];
     if (pread(s->fd, magic, sizeof(magic), 0) != (ssize_t)sizeof(magic) ||
-        memcmp(magic, QCSS_MAGIC, sizeof(magic)) != 0) return false;
+        memcmp(magic, qcss_magic(s), sizeof(magic)) != 0) return false;
 
     off_t offset = QCSS_MAGIC_SIZE;
     off_t valid_end = offset;
@@ -866,14 +898,17 @@ static bool qcss_recover(qihse_consensus_snapshot_stage_t* s,
     return true;
 }
 
-bool qihse_consensus_snapshot_stage_open(
+static bool qcss_open(
     const char* path, const char* expected_group,
+    const uint8_t history_id[32], uint64_t writer_epoch_floor,
     const qihse_user_t* principal,
     qihse_consensus_validate_data_fn validate_data,
     void* validate_data_context, bool require_data_validator,
     qihse_consensus_snapshot_stage_t** out) {
     if (out) *out = NULL;
     if (!out || !qcss_path_valid(path) || !qcss_group_valid(expected_group) ||
+        ((history_id != NULL) != (writer_epoch_floor != 0u)) ||
+        (history_id && !qcss_history_valid(history_id, writer_epoch_floor)) ||
         !qcss_active(principal) || (require_data_validator && !validate_data))
         return false;
 
@@ -882,6 +917,8 @@ bool qihse_consensus_snapshot_stage_open(
     s->fd = -1;
     snprintf(s->group, sizeof(s->group), "%s", expected_group);
     snprintf(s->path, sizeof(s->path), "%s", path);
+    if (history_id) memcpy(s->history_id, history_id, sizeof(s->history_id));
+    s->writer_epoch_floor = writer_epoch_floor;
     s->validate_data = validate_data;
     s->validate_data_context = validate_data_context;
     s->require_data_validator = require_data_validator;
@@ -906,6 +943,29 @@ bool qihse_consensus_snapshot_stage_open(
     }
     *out = s;
     return true;
+}
+
+bool qihse_consensus_snapshot_stage_open(
+    const char* path, const char* expected_group,
+    const qihse_user_t* principal,
+    qihse_consensus_validate_data_fn validate_data,
+    void* validate_data_context, bool require_data_validator,
+    qihse_consensus_snapshot_stage_t** out) {
+    return qcss_open(path, expected_group, NULL, 0u, principal,
+                     validate_data, validate_data_context,
+                     require_data_validator, out);
+}
+
+bool qihse_consensus_snapshot_stage_open_bound(
+    const char* path, const char* expected_group,
+    const uint8_t history_id[32], uint64_t writer_epoch_floor,
+    const qihse_user_t* principal,
+    qihse_consensus_validate_data_fn validate_data,
+    void* validate_data_context, bool require_data_validator,
+    qihse_consensus_snapshot_stage_t** out) {
+    return qcss_open(path, expected_group, history_id, writer_epoch_floor,
+                     principal, validate_data, validate_data_context,
+                     require_data_validator, out);
 }
 
 void qihse_consensus_snapshot_stage_close(

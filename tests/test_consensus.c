@@ -237,9 +237,8 @@ static void h_init_ex(harness_t* h, const char* seed, uint64_t snapshot_threshol
         snprintf(h->dir, sizeof(h->dir), "test_consensus_XXXXXX");
         assert(mkdtemp(h->dir));
     }
-    /* Isolate the audit chain/log per test so parallel aggregates never
-     * share root state. */
-    setenv("QIHSE_DATA_DIR", h->dir, 1);
+    /* Record files are isolated per case. The audit writer keeps the single
+     * process-wide data directory selected in main(). */
 
     for (size_t i = 0; i < N; i++) {
         char buf[96];

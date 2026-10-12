@@ -22,8 +22,10 @@
  */
 
 #include "qihse_consensus.h"
+#include "qihse_consensus_rejoin_guard.h"
 #include "qihse_consensus_wire.h"
 
+#include <openssl/evp.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -778,6 +780,8 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
     bool header_seen = false;
     bool baseline_have = false;
     bool baseline_checked = false;
+    bool history_have = false;
+    bool history_checked = false;
     uint64_t baseline_digest = 0u;
 
     /* Replay state (absolute indices throughout). */
@@ -893,6 +897,29 @@ static bool qcs_load_records(qihse_consensus_t* cs, const char* path,
             continue;
         }
         baseline_checked = true; /* first non-B record locks B out */
+
+        if (strcmp(tok, "H") == 0) {
+            if (history_have || history_checked || pend_active ||
+                !qihse_consensus_history_identity_valid(
+                    cs->cfg.group_id, cs->cfg.history_id,
+                    cs->cfg.writer_epoch_floor)) goto done;
+            char* s_history = strtok_r(NULL, " ", &save);
+            char* s_epoch = strtok_r(NULL, " ", &save);
+            uint8_t history[32];
+            uint64_t floor = 0;
+            if (!s_history || !s_epoch || strtok_r(NULL, " ", &save) ||
+                !qcs_hex_decode(s_history, strlen(s_history), history,
+                                sizeof(history), sizeof(history)) ||
+                !qcs_parse_u64(s_epoch, &floor) ||
+                floor != cs->cfg.writer_epoch_floor ||
+                memcmp(history, cs->cfg.history_id, sizeof(history)) != 0)
+                goto done;
+            cur_epoch = floor;
+            history_have = true;
+            continue;
+        }
+        history_checked = true; /* no late or duplicate history identity */
+        if (cs->cfg.writer_epoch_floor != 0 && !history_have) goto done;
 
         if (strcmp(tok, "V") == 0) {
             if (pend_active) goto done; /* S transaction must finish first */
@@ -1320,6 +1347,8 @@ done:
      * that is the last committed config or the single pending transition.
      * A history that folds to an invalid config (empty / oversized /
      * malformed) fails the whole load closed. */
+    if (ok && cs->cfg.writer_epoch_floor != 0 && !history_have &&
+        !*out_created) ok = false;
     if (ok && !qcs_recompute_membership(cs)) ok = false;
     if (ok && !qcs_validate_data_range(cs, 1u, cs->commit)) ok = false;
     if (!ok) {
@@ -1909,11 +1938,8 @@ static void qcs_try_compact(qihse_consensus_t* cs) {
         if (base >= QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES) return;
         target = QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES;
     }
-    /* Snapshot messages carry the complete compacted prefix in a fixed
-     * array.  Do not let repeated compactions grow snap.count beyond that
-     * array and overflow qcs_send_snapshot_to(); the remaining active log
-     * can still replicate in ordinary append batches. */
-    if (target > QIHSE_CONSENSUS_SNAPSHOT_MAX_ENTRIES) return;
+    /* Larger prefixes use bounded chunk messages for capable peers. The
+     * stream cap above bounds both the retained prefix and durable replay. */
     size_t new_count = (size_t)target;
 
     /* Build the new snapshot buffers FIRST; nothing observable changes
@@ -2017,6 +2043,14 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
     if (cfg->require_data_validator && !cfg->validate_data) return NULL;
     if (!qcs_group_id_valid(cfg->group_id)) return NULL;
     if (!qcs_record_path_valid(cfg->record_path)) return NULL;
+    bool history_configured = qihse_consensus_history_identity_valid(
+        cfg->group_id, cfg->history_id, cfg->writer_epoch_floor);
+    if (history_configured != (cfg->writer_epoch_floor != 0)) return NULL;
+    if (!history_configured) {
+        uint8_t empty_history[32] = {0};
+        if (memcmp(cfg->history_id, empty_history, sizeof(empty_history)) != 0)
+            return NULL;
+    }
     if (cfg->member_count == 0u ||
         cfg->member_count > QIHSE_CONSENSUS_MAX_MEMBERS) return NULL;
     if (qihse_uuid_is_nil(&cfg->self)) return NULL;
@@ -2118,6 +2152,20 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
             !qcs_record_append(cs, (size_t)n)) {
             qihse_consensus_close(cs);
             return NULL;
+        }
+        if (history_configured) {
+            char history_hex[2u * sizeof(cs->cfg.history_id) + 1u];
+            qcs_hex_encode(cs->cfg.history_id, sizeof(cs->cfg.history_id),
+                           history_hex);
+            n = snprintf(cs->rec_buf, QCS_RECORD_LINE_CAP, "H %s %llu",
+                         history_hex,
+                         (unsigned long long)cs->cfg.writer_epoch_floor);
+            if (n < 0 || (size_t)n >= QCS_RECORD_LINE_CAP ||
+                !qcs_record_append(cs, (size_t)n)) {
+                qihse_consensus_close(cs);
+                return NULL;
+            }
+            cs->epoch = cs->cfg.writer_epoch_floor;
         }
     }
 
@@ -3431,6 +3479,71 @@ bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
                                           size_t out_cap, size_t* out_count) {
     return qcs_read_committed(cs, user, from_index, out_entries, out_cap,
                               out_count, true);
+}
+
+static bool qcs_sha256_u64(EVP_MD_CTX* ctx, uint64_t value) {
+    uint8_t encoded[8];
+    for (size_t i = sizeof(encoded); i > 0u; i--) {
+        encoded[i - 1u] = (uint8_t)value;
+        value >>= 8u;
+    }
+    return EVP_DigestUpdate(ctx, encoded, sizeof(encoded)) == 1;
+}
+
+bool qihse_consensus_committed_prefix_sha256(
+    const qihse_consensus_t* cs, const qihse_user_t* user,
+    uint64_t through_index, uint8_t out_sha256[32]) {
+    if (!out_sha256) return false;
+    memset(out_sha256, 0, 32u);
+    if (!cs || !qihse_auth_user_is_active(user) ||
+        qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR ||
+        !qihse_consensus_history_identity_valid(
+            cs->cfg.group_id, cs->cfg.history_id,
+            cs->cfg.writer_epoch_floor) ||
+        through_index > cs->commit) return false;
+    if (through_index == 0u) return true;
+
+    static const char domain[] = "QIHSE-COMMITTED-PREFIX-v1";
+    const size_t group_len = strlen(cs->cfg.group_id);
+    if (group_len == 0u || group_len > QIHSE_CONSENSUS_GROUP_ID_MAX)
+        return false;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(ctx, domain, sizeof(domain) - 1u) == 1 &&
+        qcs_sha256_u64(ctx, (uint64_t)group_len) &&
+        EVP_DigestUpdate(ctx, cs->cfg.group_id, group_len) == 1 &&
+        EVP_DigestUpdate(ctx, cs->cfg.history_id,
+                         sizeof(cs->cfg.history_id)) == 1 &&
+        qcs_sha256_u64(ctx, cs->cfg.writer_epoch_floor) &&
+        qcs_sha256_u64(ctx, through_index);
+    for (uint64_t index = 1u; ok && index <= through_index; index++) {
+        const qihse_consensus_entry_t* entry = qcs_entry_at(cs, index);
+        if (!entry || entry->index != index ||
+            entry->payload_len > QIHSE_CONSENSUS_PAYLOAD_MAX ||
+            !qihse_auth_can_access(user, entry->classif, entry->sci)) {
+            ok = false;
+            break;
+        }
+        ok = qcs_sha256_u64(ctx, entry->index) &&
+            qcs_sha256_u64(ctx, entry->term) &&
+            qcs_sha256_u64(ctx, entry->journal_generation) &&
+            qcs_sha256_u64(ctx, entry->hlc.physical_ms) &&
+            qcs_sha256_u64(ctx, entry->hlc.logical) &&
+            qcs_sha256_u64(ctx, entry->classif) &&
+            qcs_sha256_u64(ctx, entry->sci) &&
+            qcs_sha256_u64(ctx, (uint64_t)entry->type) &&
+            qcs_sha256_u64(ctx, (uint64_t)entry->payload_len) &&
+            EVP_DigestUpdate(ctx, entry->payload, entry->payload_len) == 1;
+        if (index == through_index) break;
+    }
+    uint8_t digest[32];
+    unsigned digest_len = 0u;
+    if (ok) ok = EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1 &&
+                 digest_len == sizeof(digest);
+    EVP_MD_CTX_free(ctx);
+    if (ok) memcpy(out_sha256, digest, sizeof(digest));
+    return ok;
 }
 
 /* ── Introspection ───────────────────────────────────────────────────────── */

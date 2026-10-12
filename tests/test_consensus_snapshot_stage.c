@@ -45,7 +45,7 @@ static qihse_consensus_msg_t make_chunk(
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK;
-    snprintf(m.group_id, sizeof(m.group_id), "%s", "sample.stage");
+    snprintf(m.group_id, sizeof(m.group_id), "%s", "qihse.test.stage");
     m.from = *from; m.to = *to;
     m.term = 4u; m.fencing_epoch = 4u;
     qihse_consensus_snapshot_chunk_t* c = &m.u.snapshot_chunk;
@@ -71,7 +71,7 @@ static qihse_consensus_msg_t make_prefix_chunk(
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK;
-    snprintf(m.group_id, sizeof(m.group_id), "%s", "sample.stage");
+    snprintf(m.group_id, sizeof(m.group_id), "%s", "qihse.test.stage");
     m.from = *from; m.to = *to;
     m.term = 4u; m.fencing_epoch = 4u;
     qihse_consensus_snapshot_chunk_t* c = &m.u.snapshot_chunk;
@@ -142,7 +142,7 @@ static qihse_consensus_t* open_stage_consensus(const char* path,
                                                const qihse_uuid_t* self) {
     qihse_consensus_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    snprintf(cfg.group_id, sizeof(cfg.group_id), "%s", "sample.stage");
+    snprintf(cfg.group_id, sizeof(cfg.group_id), "%s", "qihse.test.stage");
     cfg.self = *self;
     cfg.member_count = 2u;
     cfg.members[0] = *from;
@@ -160,7 +160,7 @@ static qihse_consensus_snapshot_stage_t* open_stage(
     bool require_validator) {
     qihse_consensus_snapshot_stage_t* s = NULL;
     assert(qihse_consensus_snapshot_stage_open(
-        path, "sample.stage", principal, validate_data, context,
+        path, "qihse.test.stage", principal, validate_data, context,
         require_validator, &s));
     assert(s);
     return s;
@@ -377,7 +377,7 @@ int main(void) {
     if (replacer == 0) {
         qihse_consensus_snapshot_stage_t* child_stage = NULL;
         if (!qihse_consensus_snapshot_stage_open(replacement_path,
-                "sample.stage", op, accept_any_data, &validate, true,
+                "qihse.test.stage", op, accept_any_data, &validate, true,
                 &child_stage)) _exit(10);
         qihse_consensus_snapshot_stage_result_t replaced =
             qihse_consensus_snapshot_stage_replace(
@@ -486,7 +486,7 @@ int main(void) {
                                                  digest, 1u, 1u);
     qihse_consensus_snapshot_stage_t* no_validator = NULL;
     assert(!qihse_consensus_snapshot_stage_open(
-        "build/missing-validator.stage", "sample.stage", op,
+        "build/missing-validator.stage", "qihse.test.stage", op,
         NULL, NULL, true, &no_validator));
     validate = false;
     assert(qihse_consensus_snapshot_stage_accept(s, op, &rejected) ==
@@ -556,7 +556,7 @@ int main(void) {
     qihse_consensus_snapshot_descriptor_t old_descriptor;
     memset(&old_descriptor, 0, sizeof(old_descriptor));
     snprintf(old_descriptor.group_id, sizeof(old_descriptor.group_id),
-             "%s", "sample.stage");
+             "%s", "qihse.test.stage");
     old_descriptor.from = from; old_descriptor.to = to;
     old_descriptor.term = old_descriptor.fencing_epoch = 4u;
     old_descriptor.last_included_index = 3u;

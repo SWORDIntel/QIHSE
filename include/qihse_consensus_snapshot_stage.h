@@ -51,6 +51,18 @@ bool qihse_consensus_snapshot_stage_open(
     void* validate_data_context, bool require_data_validator,
     qihse_consensus_snapshot_stage_t** out);
 
+/* A history-bound group must use this opener. It refuses legacy stage files
+ * and files bound to another history; there is no in-place upgrade. The
+ * identity must match the consensus configuration and authenticated QCS2
+ * channel supplied by the caller. */
+bool qihse_consensus_snapshot_stage_open_bound(
+    const char* path, const char* expected_group,
+    const uint8_t history_id[32], uint64_t writer_epoch_floor,
+    const qihse_user_t* principal,
+    qihse_consensus_validate_data_fn validate_data,
+    void* validate_data_context, bool require_data_validator,
+    qihse_consensus_snapshot_stage_t** out);
+
 void qihse_consensus_snapshot_stage_close(
     qihse_consensus_snapshot_stage_t* stage);
 

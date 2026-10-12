@@ -18,7 +18,7 @@
  *   qihse_kem_key.pem / qihse_kem_pub.pem  — ML-KEM-1024
  *   qihse_dsa_key.pem / qihse_dsa_pub.pem  — ML-DSA-87
  *
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-SRSL-1.0
  */
 
 #ifndef _GNU_SOURCE

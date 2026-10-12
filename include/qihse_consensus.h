@@ -529,8 +529,8 @@ typedef struct {
     uint64_t election_timeout_spread_ms; /* 0 = default 300 */
     uint64_t heartbeat_interval_ms;      /* 0 = default 50 */
     /* Additional self-only delay for candidate preference. A standby voter
-     * can use this so higher-priority members are elected first. It does not
-     * grant write rights. */
+     * can use this so higher-priority voters win first when available.
+     * It does not grant write rights. */
     uint32_t election_priority_delay_ms; /* 0..MAX_ELECTION_PRIORITY_DELAY_MS */
     /* Log-compaction trigger, in entries: when the retained log
      * (last log index − snapshot index) exceeds this many entries, the
@@ -544,6 +544,12 @@ typedef struct {
      * or dynamically resolved paths only — never a hard-coded absolute
      * path.  One file per (node, group). */
     char record_path[QIHSE_CONSENSUS_RECORD_PATH_MAX + 1u];
+    /* Optional durable history binding for newly created groups. Supply a
+     * nonzero ID and epoch together. A protected record refuses opens whose
+     * configured identity differs or is omitted; an existing legacy record
+     * cannot be retroactively bound by configuration alone. */
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
     /* A production group referencing external transaction bytes sets this
      * true; open then fails closed if no validator was supplied. */
     bool require_data_validator;
@@ -648,6 +654,30 @@ bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
                                           uint64_t from_index,
                                           qihse_consensus_entry_t* out_entries,
                                           size_t out_cap, size_t* out_count);
+
+/* Compute a SHA-256 commitment to exactly the local committed entries at
+ * indices 1..through_index, including entries retained in a snapshot.
+ * through_index must be <= the commit index; zero yields an all-zero digest.
+ * Only a history-bound group and an active Operator authorized for EVERY
+ * included entry may use this API; legacy unbound groups fail closed.
+ * Failure clears out_sha256 and never returns a partial or filtered digest.
+ *
+ * Encoding v1: ASCII "QIHSE-COMMITTED-PREFIX-v1" (no NUL), group-ID byte
+ * length as big-endian u64, group-ID bytes, 32 history-ID bytes, writer-epoch
+ * floor and through_index as big-endian u64; then, per entry in index order,
+ * big-endian u64 for index, term, journal generation, HLC physical_ms, HLC
+ * logical, classification, SCI, type, payload length, followed by the exact
+ * payload bytes. No struct padding or host byte order enters the digest.
+ *
+ * The consensus core is a single-threaded state machine and holds no mutex.
+ * The caller must serialize this entire call with tick/receive/propose and
+ * snapshot installation (for a mesh caller, hold its state lock). Capture
+ * commit_index and choose through_index under that SAME lock. This local
+ * commitment is not peer authentication, application-state verification, or
+ * permission to rejoin; the caller must bind it to a trusted history anchor. */
+bool qihse_consensus_committed_prefix_sha256(
+    const qihse_consensus_t* cs, const qihse_user_t* user,
+    uint64_t through_index, uint8_t out_sha256[32]);
 
 /* ── Membership changes (single-server; see MEMBERSHIP CHANGES above) ────── */
 

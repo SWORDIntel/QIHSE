@@ -63,6 +63,54 @@ typedef struct {
 bool qihse_consensus_mesh_status(qihse_consensus_mesh_t* mesh,
                                  qihse_consensus_mesh_status_t* out);
 
+/* Identity copied from the configuration with which the durable consensus
+ * instance was opened. Metadata only; no log payload is materialized. The
+ * state lock serializes this read with consensus mutation and rejoin. */
+typedef struct {
+    char group_id[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u];
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
+} qihse_consensus_mesh_identity_t;
+
+bool qihse_consensus_mesh_history_identity(
+    qihse_consensus_mesh_t* mesh, qihse_consensus_mesh_identity_t* out);
+
+/* Fixed-size local recovery inventory. The SHA-256 digest covers the exact
+ * committed prefix using the consensus-core v1 encoding; zero index has the
+ * documented all-zero digest. The caller must be a live system Operator and
+ * may bound work to at most QIHSE_MESH_EVIDENCE_MAX_ENTRIES. Refuse larger
+ * prefixes rather than holding the mesh state lock for unbounded work.
+ * This is local, unsigned evidence, not a peer attestation or rejoin grant. */
+#define QIHSE_MESH_EVIDENCE_MAX_ENTRIES 4096u
+typedef struct {
+    char group_id[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u];
+    uint8_t history_id[32];
+    uint64_t writer_epoch_floor;
+    uint64_t commit_index;
+    uint8_t committed_prefix_sha256[32];
+    qihse_uuid_t member_uuid;
+    char qkp_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
+} qihse_consensus_mesh_prefix_evidence_t;
+
+bool qihse_consensus_mesh_export_prefix_evidence_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* requester,
+    uint64_t max_entries, qihse_consensus_mesh_prefix_evidence_t* out);
+
+/* A point on the committed history, including the source's committed
+ * watermark captured under the same state lock. This lets a recovery caller
+ * ask whether a source still has the exact prefix held by a lagging node.
+ * The point is unsigned and is not a rejoin or writer-fence authorization.
+ * Hashing is bounded by QIHSE_MESH_EVIDENCE_MAX_ENTRIES and requires a live
+ * system Operator authorized for every included entry. */
+typedef struct {
+    qihse_consensus_mesh_prefix_evidence_t prefix;
+    uint64_t observed_commit_index;
+} qihse_consensus_mesh_prefix_point_t;
+
+bool qihse_consensus_mesh_export_prefix_point_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* requester,
+    uint64_t through_index, qihse_consensus_mesh_prefix_point_t* out);
+
 qihse_consensus_role_t qihse_consensus_mesh_role(qihse_consensus_mesh_t* mesh);
 uint64_t qihse_consensus_mesh_term(qihse_consensus_mesh_t* mesh);
 uint64_t qihse_consensus_mesh_commit_index(qihse_consensus_mesh_t* mesh);

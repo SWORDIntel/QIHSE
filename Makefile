@@ -8,8 +8,9 @@ PYTHON_INCLUDES ?= $(shell python3-config --includes 2>/dev/null || pkg-config -
 PYTHON_LDFLAGS  ?= $(shell python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || pkg-config --libs python3 2>/dev/null || echo "-lpython3.13")
 
 INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
-CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(PYTHON_INCLUDES)
-CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3
+QIHSE_ARCH_FLAGS ?=
+CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS) $(PYTHON_INCLUDES)
+CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS)
 QIHSE_CFLAGS_EXTRA?=
 
 # ---------------------------------------------------------------------------
@@ -107,11 +108,19 @@ SRCS_VFS = persistence/qihse_sqlite_vfs.c \
            persistence/qihse_vfs_wal.c
 
 SRCS_BASE += $(SRCS_VFS)
+SRCS_BASE += src/black_hole/qihse_analysis_artifact.c
 SRCS_BASE += src/federation/qihse_consensus_blob.c
 SRCS_BASE += src/federation/qihse_consensus_wire.c
 SRCS_BASE += src/federation/qihse_consensus_channel.c
 SRCS_BASE += src/federation/qihse_consensus_blob_channel.c
 SRCS_BASE += src/federation/qihse_consensus_mesh.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_attestation.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_attestation_adapter.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_point_challenge.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_pair.c
+SRCS_BASE += src/federation/qihse_consensus_prefix_pair_nonce.c
+SRCS_BASE += src/federation/qihse_consensus_replay_verify.c
+SRCS_BASE += src/federation/qihse_consensus_rejoin_guard.c
 
 SRCS=$(SRCS_BASE)
 
@@ -498,6 +507,13 @@ test-backup-auth: lib
 
 test-controller-sdk-py: lib
 	PYTHONPATH=python LD_LIBRARY_PATH=. python3 -m unittest discover -s python/tests -p test_controller_sdk.py
+
+# KP14 canonical manifest and fail-closed candidate preflight; no durable write.
+test-kp14-artifact-contract: lib
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact tests/test_analysis_artifact.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact
+
+test: test-kp14-artifact-contract
 
 # W7 item 5: classification-preserving KEYSTONE feed over the wire.
 test-keystone-feed-wire: lib
