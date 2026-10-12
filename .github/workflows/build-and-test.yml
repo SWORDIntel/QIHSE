@@ -9,21 +9,20 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    env:
-      OPENSSL_MODULES: ${{ github.workspace }}/.qihse-pqc/lib/ossl-modules
+    container: debian:trixie
 
     steps:
+    - name: Install Checkout Dependencies
+      run: apt-get update && apt-get install -y git ca-certificates
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
 
     - name: Install Build Dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
-
-    - name: Build and Verify PQC Provider
-      run: bash scripts/ci_pqc_deps.sh
+        apt-get update
+        apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
 
     - name: Build Shared Library & Binaries
       run: |
@@ -173,21 +172,20 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
-    env:
-      OPENSSL_MODULES: ${{ github.workspace }}/.qihse-pqc/lib/ossl-modules
+    container: debian:trixie
 
     steps:
+    - name: Install Checkout Dependencies
+      run: apt-get update && apt-get install -y git ca-certificates
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
 
     - name: Install Build Dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
-
-    - name: Build and Verify PQC Provider
-      run: bash scripts/ci_pqc_deps.sh
+        apt-get update
+        apt-get install -y build-essential gcc g++ libpthread-stubs0-dev libssl-dev liburing-dev libsqlite3-dev libluajit-5.1-dev libbpf-dev libxdp-dev clang ninja-build cmake python3-dev python3-pip python3-numpy libarchive-dev libzstd-dev nlohmann-json3-dev
 
     - name: Build Sanitized Shared Library
       run: |
