@@ -58,6 +58,54 @@ The Python controller SDK also has an optional exact QKP peer node/key pin;
 when supplied, it checks the signed identity before HELLO or AUTH. This has
 not been used by an independent prefix verifier.
 
+### Audit continuity working-tree gate (2026-10-12)
+
+The unmerged audit edit attempts to recover the retained SHA-384 chain on
+startup and persist appended records before advancing the tip. It now carries
+a process-local, typed OS-service recovery context through the lowest audit
+reader and restricts reads to owner-controlled audit files. This is a local
+security boundary, not historical signature verification: the current
+ML-DSA signing identity is regenerated at startup and prior public keys are
+not retained. The edit must remain undeployed until preserved log copies are
+reviewed for legacy reset boundaries, partial records, stale/missing tips,
+rotation/prune behavior, and historical format compatibility. The scanner's
+strict startup failure behavior must not be applied to live data before that
+review. Scanner and pruning now share strict numeric rotated-file parsing and
+a 256-file limit; rotation reserves capacity and fails closed on directory
+errors. The local edit now uses an owner-checked writer lock tied to the audit
+directory and process, invalidates the inherited context after fork, and
+checks banner/record write counts. No behavioral validation has been run for
+this working-tree edit.
+
+A portable x86-64 review build of this dirty working tree completed on
+2026-10-12. Its native library SHA-256 is
+`e575b54e5e6413e792004d82df48ca3503f6525464b0a02b66d3f8fb71aac9f6`;
+the daemon SHA-256 is
+`4f15ecc5aa4ead46b0d799559aa66a750bca433f645d307b7344f85930619d44`.
+The build found no removed exported dynamic symbols relative to the deployed
+library, and both artifacts report x86-64-baseline. This is a dirty-source
+candidate, not a frozen release. Historical ML-DSA signatures remain
+unverifiable because signing keys are regenerated, and retained-log, crash,
+rotation, fork, and three-node recovery behavior has not been exercised.
+The candidate has not been installed on any server. The deployed three-node
+library and daemon pair is already byte-identical; see
+`docs/deployment/native_cluster_parity.md`.
+
+### Exact-prefix challenge working-tree gate (2026-10-12)
+
+An unmerged read-only RESP endpoint now accepts a bounded exact committed
+index and verifier-supplied 32-byte challenge from an authenticated system
+Operator. It signs a response bound to the group/history/epoch, index,
+observed watermark, and configured enrolled signer. The endpoint grants no
+replay, rejoin, or write authority. It remains default-off and undeployed.
+Before merge, add the low-clearance/high-data negative CI coverage required
+by `AGENTS.md`, implement independent one-use nonce issuance and protected
+verification records, and resolve the current 4,096-entry index limit for
+histories beyond that boundary. No behavioral validation has been run.
+The Python controller SDK also has an optional exact QKP peer node/key pin;
+when supplied, it checks the signed identity before HELLO or AUTH. This is
+unmerged source and has not been used by an independent prefix verifier.
+
 ### 1.5 W8 — I2P replica transport and durable KV handoff (implemented, 2026-10-09)
 
 The implementation and code-level regression gates are complete. Deployment
