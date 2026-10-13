@@ -834,7 +834,7 @@ static void qcm_handle_snapshot_chunk(qihse_consensus_mesh_t* mesh,
 static bool qcm_copy_config(qihse_consensus_mesh_t* mesh,
                             const qihse_consensus_mesh_config_t* cfg) {
     if (!cfg || cfg->peer_count == 0u || cfg->peer_count >= QIHSE_CONSENSUS_MAX_MEMBERS ||
-        cfg->peer_count + 1u != cfg->consensus.member_count || !cfg->system_principal ||
+        !cfg->system_principal ||
         !cfg->blob_context || !cfg->blob_context->blobs ||
         !qihse_auth_user_is_active(cfg->system_principal) ||
         qihse_user_get_role(cfg->system_principal) != QIHSE_ROLE_OPERATOR ||
@@ -893,10 +893,11 @@ static bool qcm_copy_config(qihse_consensus_mesh_t* mesh,
         dst->rx_fd = -1;
         for (size_t j = i + 1u; j < cfg->peer_count; j++)
             if (qihse_uuid_equal(&src->member_uuid, &cfg->peers[j].member_uuid)) return false;
-        bool member_found = false;
-        for (size_t j = 0; j < cfg->consensus.member_count; j++)
-            if (qihse_uuid_equal(&src->member_uuid, &cfg->consensus.members[j])) member_found = true;
-        if (!member_found) return false;
+        /* Transport provisioning is independent of the durable membership
+         * baseline. A staged future member may be dialled before its logged
+         * ADD, and a removed member's peer can be omitted after restart. The
+         * consensus core still filters voting/append traffic by its folded
+         * log membership, never by this transport list. */
     }
     return true;
 }
@@ -1181,6 +1182,83 @@ bool qihse_consensus_mesh_leader_id(qihse_consensus_mesh_t* mesh,
     return ok;
 }
 
+bool qihse_consensus_mesh_propose_membership(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    qihse_consensus_membership_op_t op, const qihse_uuid_t* member,
+    uint32_t timeout_ms, uint64_t* out_index) {
+    if (out_index) *out_index = 0u;
+    if (!mesh || !mesh->started || !principal || !member || !out_index ||
+        !timeout_ms || qihse_uuid_is_nil(member) ||
+        (op != QIHSE_CONSENSUS_MEMBER_ADD &&
+         op != QIHSE_CONSENSUS_MEMBER_REMOVE)) return false;
+
+    bool active = false;
+    uint32_t tenant = 0u;
+    qihse_auth_user_active_and_tenant(principal, &active, &tenant);
+    if (!active || tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR) return false;
+
+    pthread_mutex_lock(&mesh->proposal_lock);
+    pthread_mutex_lock(&mesh->state_lock);
+    qihse_consensus_membership_t membership;
+    bool allowed = qihse_consensus_get_membership(mesh->consensus, &membership);
+    if (allowed && op == QIHSE_CONSENSUS_MEMBER_REMOVE) {
+        /* Do not allow this operational API to turn a two-voter deployment
+         * into a one-voter deployment, even though the consensus core permits
+         * that configuration. A leader cannot remove itself here. */
+        size_t remaining_voters = 0u;
+        for (size_t i = 0; i < membership.member_count; i++)
+            if (!qihse_uuid_equal(member, &membership.members[i]) &&
+                membership.member_roles[i] != QIHSE_CONSENSUS_ROLE_LEARNER)
+                remaining_voters++;
+        allowed = remaining_voters >= 2u &&
+            !qihse_uuid_equal(member, &mesh->consensus_config.self);
+    } else if (allowed && op == QIHSE_CONSENSUS_MEMBER_ADD) {
+        /* The mesh cannot dial an unprovisioned peer. Transport identity and
+         * trust must exist on every node before the logged addition. */
+        allowed = qcm_peer_index(mesh, member) >= 0;
+    }
+    if (allowed) allowed = qihse_consensus_propose_membership(
+        mesh->consensus, principal, op, member);
+    uint64_t index = allowed ? qihse_consensus_last_log_index(mesh->consensus) : 0u;
+    uint64_t term = allowed ? qihse_consensus_term(mesh->consensus) : 0u;
+    uint64_t generation = allowed ?
+        qihse_consensus_last_journal_generation(mesh->consensus) : 0u;
+    pthread_mutex_unlock(&mesh->state_lock);
+    if (!allowed) {
+        pthread_mutex_unlock(&mesh->proposal_lock);
+        return false;
+    }
+
+    *out_index = index;
+    const uint64_t deadline = qcm_now_ms() + timeout_ms;
+    bool committed = false;
+    do {
+        if (qcm_stopping(mesh)) break;
+        pthread_mutex_lock(&mesh->state_lock);
+        if (qihse_consensus_commit_index(mesh->consensus) >= index) {
+            qihse_consensus_entry_t entry;
+            size_t count = 0u;
+            committed = qihse_consensus_read_committed_exact(
+                mesh->consensus, principal, index, &entry, 1u, &count) &&
+                count == 1u && entry.index == index && entry.term == term &&
+                entry.journal_generation == generation &&
+                entry.type == (op == QIHSE_CONSENSUS_MEMBER_ADD
+                    ? QIHSE_CONSENSUS_ENTRY_CONFIG_ADD
+                    : QIHSE_CONSENSUS_ENTRY_CONFIG_REMOVE) &&
+                entry.payload_len == QIHSE_UUID_BYTES &&
+                memcmp(entry.payload, member->bytes, QIHSE_UUID_BYTES) == 0;
+            pthread_mutex_unlock(&mesh->state_lock);
+            break; /* An overwritten entry at this index is not success. */
+        }
+        pthread_mutex_unlock(&mesh->state_lock);
+        struct timespec pause = {0, 5000000L};
+        nanosleep(&pause, NULL);
+    } while (qcm_now_ms() < deadline);
+    pthread_mutex_unlock(&mesh->proposal_lock);
+    return committed;
+}
+
 static bool qcm_mesh_propose_locked(qihse_consensus_mesh_t* mesh,
                                     const qihse_user_t* principal,
                                     uint64_t generation, qihse_hlc_t hlc,
@@ -1228,9 +1306,32 @@ static bool qcm_mesh_propose_transaction_locked(
         !commit_timeout_ms || !out_index || !transaction || transaction_len == 0u ||
         !qihse_auth_user_is_active(principal) ||
         !qihse_auth_can_access((qihse_user_t*)principal, classification, sci)) return false;
-    size_t quorum = mesh->consensus_config.member_count / 2u + 1u;
-    size_t remote_required = quorum > 0u ? quorum - 1u : 0u;
-    if (remote_required == 0u || remote_required > mesh->peer_count) return false;
+    qihse_consensus_membership_t membership;
+    uint16_t peer_weight[QIHSE_CONSENSUS_MESH_MAX_PEERS] = {0};
+    uint64_t self_weight = 0u, available_remote_weight = 0u;
+    pthread_mutex_lock(&mesh->state_lock);
+    bool have_membership = qihse_consensus_get_membership(
+        mesh->consensus, &membership);
+    pthread_mutex_unlock(&mesh->state_lock);
+    if (!have_membership || membership.joint_active ||
+        membership.pending_config_index) return false;
+    for (size_t j = 0; j < membership.member_count; j++) {
+        if (membership.member_roles[j] == QIHSE_CONSENSUS_ROLE_LEARNER)
+            continue;
+        if (qihse_uuid_equal(&membership.members[j],
+                             &mesh->consensus_config.self)) {
+            self_weight = membership.member_weights[j];
+            continue;
+        }
+        int peer = qcm_peer_index(mesh, &membership.members[j]);
+        if (peer >= 0) {
+            peer_weight[peer] = membership.member_weights[j];
+            available_remote_weight += peer_weight[peer];
+        }
+    }
+    if (!self_weight || membership.majority_weight <= self_weight) return false;
+    uint64_t remote_required = membership.majority_weight - self_weight;
+    if (available_remote_weight < remote_required) return false;
 
     qihse_consensus_entry_t entry;
     memset(&entry, 0, sizeof(entry));
@@ -1247,11 +1348,11 @@ static bool qcm_mesh_propose_transaction_locked(
     qcm_stage_job_t* jobs[QIHSE_CONSENSUS_MESH_MAX_PEERS] = {0};
     bool staged_peer[QIHSE_CONSENSUS_MESH_MAX_PEERS] = {false};
     uint64_t deadline = qcm_now_ms() + stage_timeout_ms;
-    size_t staged = 0u;
+    uint64_t staged = 0u;
     while (staged < remote_required && qcm_now_ms() < deadline &&
            !qcm_stopping(mesh)) {
         for (size_t i = 0; i < mesh->peer_count; i++) {
-            if (staged_peer[i]) continue;
+            if (!peer_weight[i] || staged_peer[i]) continue;
             if (jobs[i]) {
                 bool done = false;
                 bool success = qcm_stage_state(jobs[i], &done);
@@ -1260,7 +1361,7 @@ static bool qcm_mesh_propose_transaction_locked(
                 jobs[i] = NULL;
                 if (success) {
                     staged_peer[i] = true;
-                    staged++;
+                    staged += peer_weight[i];
                     continue;
                 }
             }

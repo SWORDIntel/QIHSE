@@ -832,6 +832,20 @@ int main(int argc, char** argv) {
         if (!protected_committed) usleep(10000u);
     }
     assert(protected_committed);
+    /* A low-clearance principal must not be able to alter the voter set
+     * through the RESP adapter while classified transaction data exists. */
+    char member_text[QIHSE_UUID_STR_LEN + 1u];
+    assert(qihse_uuid_format(&members[follower_index], member_text));
+    const char* denied_member[] = {"QIHSE.CONSENSUS.MEMBER", "REMOVE", member_text};
+    uint64_t before_member_denial =
+        qihse_consensus_mesh_commit_index(meshes[leader_index]);
+    wire_reply = run_resp(resp, analyst, denied_member, 3u);
+    assert(strstr(wire_reply, "NOPERM system Operator required") &&
+           !strstr(wire_reply, protected_payload) &&
+           !strstr(wire_reply, "COMMITTED"));
+    free(wire_reply);
+    assert(qihse_consensus_mesh_commit_index(meshes[leader_index]) ==
+           before_member_denial);
     const char* stale_propose[] = {"QIHSE.TXN.PROPOSE", "0", "0", "2",
                                    "stale-generation-must-not-commit"};
     wire_reply = run_resp(resp, operator_user, stale_propose, 5u);

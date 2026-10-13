@@ -1,10 +1,11 @@
 #ifndef QIHSE_CONSENSUS_MESH_H
 #define QIHSE_CONSENSUS_MESH_H
 
-/* Static three-or-more-member QIHSE consensus mesh. Every node dials every
- * configured peer over a private IPv4 mesh address and accepts the matching
- * inbound streams. The QKP channel is the only transport; topology gossip is
- * not used as commit authority. */
+/* History-bound QIHSE consensus mesh. Each node dials its provisioned peers
+ * over private IPv4 and accepts only pinned QKP identities. The durable
+ * baseline member list stays fixed across restarts; logged config entries
+ * determine the effective voters. Transport peers may be provisioned before
+ * ADD or omitted after REMOVE. Gossip is never commit authority. */
 
 #include "qihse_consensus_blob_channel.h"
 #include "qihse_consensus_snapshot_stage.h"
@@ -116,6 +117,17 @@ uint64_t qihse_consensus_mesh_term(qihse_consensus_mesh_t* mesh);
 uint64_t qihse_consensus_mesh_commit_index(qihse_consensus_mesh_t* mesh);
 bool qihse_consensus_mesh_leader_id(qihse_consensus_mesh_t* mesh,
                                     qihse_uuid_t* out);
+
+/* Request one logged voter-set change through the live leader. The caller
+ * must be an active system Operator. REMOVE is permitted only when at least
+ * two voters remain; ADD requires an already provisioned, authenticated mesh
+ * peer. A true result means this exact config entry committed. On timeout,
+ * out_index identifies the locally appended entry, whose final state must
+ * be inspected before retrying. The durable opening baseline is never edited. */
+bool qihse_consensus_mesh_propose_membership(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    qihse_consensus_membership_op_t op, const qihse_uuid_t* member,
+    uint32_t timeout_ms, uint64_t* out_index);
 
 /* Propose locally and wait until the entry is committed or timeout expires.
  * On timeout, out_index still receives the locally durable index when the
