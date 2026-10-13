@@ -167,6 +167,8 @@ static void usage(const char* argv0) {
         "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (provisioned peers)\n"
         "  enables the durable QKP-pinned consensus mesh. Requires --dir and --pqc-require.\n"
         "  --consensus-election-priority-delay-ms N delays this member's candidacy.\n"
+        "  --consensus-election-base-ms N --consensus-election-spread-ms N\n"
+        "  --consensus-heartbeat-ms N tune mesh timing (defaults: 150/300/50).\n"
         "  --consensus-history-id SHA256 --consensus-writer-epoch N bind a new\n"
         "  consensus record to one history and a durable fencing floor.\n"
         "  --consensus-prefix-signer UUID enables a read-only signed exact-prefix\n"
@@ -201,6 +203,9 @@ typedef struct {
     char listen_ipv4[64];
     uint16_t port;
     uint32_t election_priority_delay_ms;
+    uint32_t election_timeout_base_ms;
+    uint32_t election_timeout_spread_ms;
+    uint32_t heartbeat_interval_ms;
     daemon_consensus_peer_t peers[CONSENSUS_PEERS_MAX];
     size_t peer_count;
 } daemon_consensus_options_t;
@@ -286,6 +291,16 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
     if (options->peer_count == 0u)
         return "at least one authenticated consensus peer is required";
     if (!options->port) return "consensus port is missing";
+    uint32_t election_base = options->election_timeout_base_ms ?
+        options->election_timeout_base_ms : 150u;
+    uint32_t election_spread = options->election_timeout_spread_ms ?
+        options->election_timeout_spread_ms : 300u;
+    uint32_t heartbeat = options->heartbeat_interval_ms ?
+        options->heartbeat_interval_ms : 50u;
+    if (election_spread < options->member_count)
+        return "election spread must cover all baseline members";
+    if (heartbeat >= election_base)
+        return "heartbeat interval must be below election base timeout";
     if (!consensus_ipv4_private(options->listen_ipv4)) return "listen address is not RFC1918 IPv4";
     if (!data_dir || !*data_dir) return "--dir is required";
     if (!qkp_node_id || !*qkp_node_id) return "--pqc-node-id is required";
@@ -1120,6 +1135,24 @@ int main(int argc, char** argv) {
                 delay_ms > QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS)
                 return usage(argv[0]), 2;
             consensus_options.election_priority_delay_ms = delay_ms;
+        } else if (strcmp(a, "--consensus-election-base-ms") == 0 && i + 1 < argc) {
+            uint16_t value = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &value) || !value || value > 60000u)
+                return usage(argv[0]), 2;
+            consensus_options.election_timeout_base_ms = value;
+        } else if (strcmp(a, "--consensus-election-spread-ms") == 0 && i + 1 < argc) {
+            uint16_t value = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &value) || !value || value > 60000u)
+                return usage(argv[0]), 2;
+            consensus_options.election_timeout_spread_ms = value;
+        } else if (strcmp(a, "--consensus-heartbeat-ms") == 0 && i + 1 < argc) {
+            uint16_t value = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &value) || !value || value > 60000u)
+                return usage(argv[0]), 2;
+            consensus_options.heartbeat_interval_ms = value;
         } else if (strcmp(a, "--consensus-allow-client-proposals") == 0) {
             consensus_allow_client_proposals = true;
         } else if (strcmp(a, "--consensus-prefix-signer") == 0 && i + 1 < argc) {
@@ -1454,6 +1487,12 @@ int main(int argc, char** argv) {
             consensus_options.bootstrap_unadmitted;
         mesh_cfg.consensus.election_priority_delay_ms =
             consensus_options.election_priority_delay_ms;
+        mesh_cfg.consensus.election_timeout_base_ms =
+            consensus_options.election_timeout_base_ms;
+        mesh_cfg.consensus.election_timeout_spread_ms =
+            consensus_options.election_timeout_spread_ms;
+        mesh_cfg.consensus.heartbeat_interval_ms =
+            consensus_options.heartbeat_interval_ms;
         mesh_cfg.consensus.member_count = consensus_options.member_count;
         memcpy(mesh_cfg.consensus.members, consensus_options.members,
                consensus_options.member_count * sizeof(consensus_options.members[0]));
