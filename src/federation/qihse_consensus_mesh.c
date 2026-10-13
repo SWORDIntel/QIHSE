@@ -854,7 +854,7 @@ static bool qcm_copy_config(qihse_consensus_mesh_t* mesh,
     bool self_found = false;
     for (size_t i = 0; i < cfg->consensus.member_count; i++)
         if (qihse_uuid_equal(&cfg->consensus.members[i], &cfg->consensus.self)) self_found = true;
-    if (!self_found) return false;
+    if (!self_found && !cfg->consensus.allow_unadmitted_self) return false;
     mesh->consensus_config = cfg->consensus;
     mesh->consensus_config.snapshot_chunks_supported =
         qcm_snapshot_chunks_supported;

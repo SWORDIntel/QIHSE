@@ -513,9 +513,13 @@ uint64_t qihse_consensus_snapshot_entries_digest(
 
 typedef struct {
     char group_id[QIHSE_CONSENSUS_GROUP_ID_MAX + 1u];
-    qihse_uuid_t self;          /* this node's member UUID; must be a member */
+    qihse_uuid_t self;          /* this node's UUID */
     size_t member_count;        /* 1..QIHSE_CONSENSUS_MAX_MEMBERS, no dupes */
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
+    /* Permit a future member to open an existing durable baseline before its
+     * logged ADD is received. It remains a nonvoting follower until admitted.
+     * A missing record file is refused in this mode. Default false. */
+    bool allow_unadmitted_self;
     /* W7: parallel per-member role and voter weight (see the enum above).
      * Zero-filled = every member a weight-1 VOTER (legacy configs). */
     uint8_t member_roles[QIHSE_CONSENSUS_MAX_MEMBERS];

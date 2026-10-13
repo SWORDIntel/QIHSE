@@ -161,6 +161,7 @@ static void usage(const char* argv0) {
         "  --replication-peer-node-id and --replication-peer-dsa-pub pin the\n"
         "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n"
         "  --consensus-group ID --consensus-self UUID --consensus-member UUID\n"
+        "  --consensus-bootstrap-unadmitted (existing record; no self vote)\n"
         "  (repeat for every durable baseline voter; never edit after first open)\n"
         "  --consensus-listen-ip RFC1918-IP --consensus-port PORT\n"
         "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (provisioned peers)\n"
@@ -194,6 +195,7 @@ typedef struct {
     bool history_id_supplied;
     bool writer_epoch_supplied;
     qihse_uuid_t self;
+    bool bootstrap_unadmitted;
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t member_count;
     char listen_ipv4[64];
@@ -296,7 +298,8 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
             if (qihse_uuid_equal(&options->members[i], &options->members[j]))
                 return "duplicate member UUID";
     }
-    if (!self_found) return "self UUID is absent from the member set";
+    if (!self_found && !options->bootstrap_unadmitted)
+        return "self UUID is absent from the member set";
     for (size_t i = 0; i < options->peer_count; i++) {
         const daemon_consensus_peer_t* peer = &options->peers[i];
         if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &options->self))
@@ -1094,6 +1097,9 @@ int main(int argc, char** argv) {
             consensus_configured = true;
             if (!qihse_uuid_parse(argv[++i], &consensus_options.self) ||
                 qihse_uuid_is_nil(&consensus_options.self)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--consensus-bootstrap-unadmitted") == 0) {
+            consensus_configured = true;
+            consensus_options.bootstrap_unadmitted = true;
         } else if (strcmp(a, "--consensus-member") == 0 && i + 1 < argc) {
             consensus_configured = true;
             if (consensus_options.member_count >= QIHSE_CONSENSUS_MAX_MEMBERS ||
@@ -1444,6 +1450,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         mesh_cfg.consensus.self = consensus_options.self;
+        mesh_cfg.consensus.allow_unadmitted_self =
+            consensus_options.bootstrap_unadmitted;
         mesh_cfg.consensus.election_priority_delay_ms =
             consensus_options.election_priority_delay_ms;
         mesh_cfg.consensus.member_count = consensus_options.member_count;

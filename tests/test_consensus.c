@@ -3922,6 +3922,69 @@ static void test_baseline_drift(qihse_user_t* op) {
            "pre-W7 file tolerated\n");
 }
 
+static void test_unadmitted_bootstrap(void) {
+    harness_t h;
+    h_init(&h, "unadmitted");
+    h_seed_extra(&h, "unadmitted");
+
+    qihse_consensus_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.group_id, sizeof(cfg.group_id), "group/unadmitted");
+    cfg.self = h.extra_id;
+    cfg.member_count = N;
+    for (size_t i = 0; i < N; i++) cfg.members[i] = h.id[i];
+    cfg.election_timeout_base_ms = 150u;
+    cfg.election_timeout_spread_ms = 300u;
+    cfg.heartbeat_interval_ms = 50u;
+    snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", h.extra_path);
+
+    cfg.allow_unadmitted_self = true;
+    assert(qihse_consensus_open(&cfg, &h, h_send) == NULL);
+
+    FILE* source = fopen(h.recpath[0], "rb");
+    FILE* target = fopen(h.extra_path, "wb");
+    assert(source && target);
+    char bytes[512];
+    size_t count;
+    while ((count = fread(bytes, 1u, sizeof(bytes), source)) != 0u)
+        assert(fwrite(bytes, 1u, count, target) == count);
+    assert(!ferror(source));
+    assert(fclose(source) == 0);
+    assert(fclose(target) == 0);
+
+    cfg.allow_unadmitted_self = false;
+    assert(qihse_consensus_open(&cfg, &h, h_send) == NULL);
+    cfg.allow_unadmitted_self = true;
+    h.extra = qihse_consensus_open(&cfg, &h, h_send);
+    assert(h.extra);
+
+    qihse_consensus_membership_t membership;
+    t_membership(h.extra, &membership);
+    assert(membership.self_removed);
+    for (unsigned i = 0; i < 100u; i++)
+        qihse_consensus_tick(h.extra, (uint64_t)i * 100u);
+    assert(qihse_consensus_role(h.extra) != QIHSE_CONSENSUS_LEADER);
+
+    qihse_consensus_msg_t request;
+    memset(&request, 0, sizeof(request));
+    request.type = QIHSE_CONSENSUS_MSG_REQUEST_VOTE;
+    snprintf(request.group_id, sizeof(request.group_id), "group/unadmitted");
+    request.from = h.id[1];
+    request.to = h.extra_id;
+    request.term = qihse_consensus_term(h.extra);
+    request.fencing_epoch = qihse_consensus_fencing_epoch(h.extra);
+    size_t queued = h.msg_count;
+    qihse_consensus_counters_t before, after;
+    qihse_consensus_get_counters(h.extra, &before);
+    qihse_consensus_receive(h.extra, &request);
+    qihse_consensus_get_counters(h.extra, &after);
+    assert(after.messages_ignored == before.messages_ignored + 1u);
+    assert(h.msg_count == queued); /* no vote reply from a nonmember */
+
+    h_free(&h);
+    printf("[PASS] unadmitted bootstrap: existing baseline only, no vote\n");
+}
+
 int main(void) {
     /* Relative record-file directory only (repo rule: no absolute paths). */
     char dir[128];
@@ -3979,6 +4042,7 @@ int main(void) {
     test_learner_never_wins(op);
     test_witness_counts(op);
     test_baseline_drift(op);
+    test_unadmitted_bootstrap();
     test_membership_election_safety(op);
     test_membership_leader_change_midflight();
     test_membership_restart(dir, &hostile_self, op);
