@@ -1318,14 +1318,17 @@ static bool qcm_mesh_propose_transaction_locked(
     for (size_t j = 0; j < membership.member_count; j++) {
         if (membership.member_roles[j] == QIHSE_CONSENSUS_ROLE_LEARNER)
             continue;
+        /* A zero role weight is the legacy encoding for a weight-one voter. */
+        uint16_t weight = membership.member_weights[j]
+            ? membership.member_weights[j] : 1u;
         if (qihse_uuid_equal(&membership.members[j],
                              &mesh->consensus_config.self)) {
-            self_weight = membership.member_weights[j];
+            self_weight = weight;
             continue;
         }
         int peer = qcm_peer_index(mesh, &membership.members[j]);
         if (peer >= 0) {
-            peer_weight[peer] = membership.member_weights[j];
+            peer_weight[peer] = weight;
             available_remote_weight += peer_weight[peer];
         }
     }
