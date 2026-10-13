@@ -691,7 +691,7 @@ test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-
 GOLD_PACK ?= tests/gold/pack.v1.gold
 GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^[:space:]]*\/[^[:space:]]*\).*/\1/p' $(GOLD_PACK) 2>/dev/null)
 
-test-gold: lib tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
+test-gold: lib cluster-daemon tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
 	LD_LIBRARY_PATH=. ./tests/gold/gold_runner $(GOLD_PACK)
 
 tests/gold/gold_runner: tests/gold/gold_runner.c libqihse.so

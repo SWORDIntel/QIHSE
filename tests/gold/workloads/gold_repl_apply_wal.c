@@ -26,6 +26,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_repl.h"
 #include "qihse_wal.h"
+#include "qihse_auth.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -85,6 +86,7 @@ int main(void) {
     char qdd[] = "build/gold_repl_apply_wal_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
+    if (!qihse_auth_init()) return 1;
     if (mkdir(GOLD_TMP_DIR, 0700) != 0 && errno != EEXIST) {
         fprintf(stderr, "%s: probe control failed: mkdir %s: %s\n",
                 GOLD_ID, GOLD_TMP_DIR, strerror(errno));

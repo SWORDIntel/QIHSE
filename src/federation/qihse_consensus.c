@@ -1938,6 +1938,8 @@ static void qcs_try_compact(qihse_consensus_t* cs) {
         if (base >= QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES) return;
         target = QIHSE_CONSENSUS_SNAPSHOT_STREAM_MAX_ENTRIES;
     }
+    /* Larger prefixes use bounded chunk messages for capable peers. The
+     * stream cap above bounds both the retained prefix and durable replay. */
     size_t new_count = (size_t)target;
 
     /* Build the new snapshot buffers FIRST; nothing observable changes
@@ -2096,7 +2098,7 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
             cs->self_index = (int)i;
         }
     }
-    if (cs->self_index < 0) {
+    if (cs->self_index < 0 && !cfg->allow_unadmitted_self) {
         free(cs);
         return NULL;
     }
@@ -2120,12 +2122,23 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
         return NULL;
     }
 
+    if (cs->self_index < 0 && access(cs->cfg.record_path, F_OK) != 0) {
+        free(cs->rec_buf);
+        free(cs);
+        return NULL; /* bootstrap must start from an existing record */
+    }
     bool created = false;
     if (!qcs_load_records(cs, cs->cfg.record_path, &created)) {
         free(cs->rec_buf);
         free(cs->log);
         free(cs);
         return NULL; /* corrupt / foreign / unreadable: fail closed */
+    }
+    if (created && cs->self_index < 0) {
+        free(cs->rec_buf);
+        free(cs->log);
+        free(cs);
+        return NULL; /* no unadmitted node may create a fresh group */
     }
 
     cs->rec = fopen(cs->cfg.record_path, created ? "w" : "a");
@@ -2233,6 +2246,10 @@ static void qcs_handle_request_vote(qihse_consensus_t* cs,
                                     const qihse_consensus_msg_t* msg) {
     int from = qcs_member_index(cs, &msg->from);
     if (from < 0) { cs->counters.messages_ignored++; return; }
+    if (cs->self_index < 0) {
+        cs->counters.messages_ignored++;
+        return; /* an unadmitted or removed node has no vote */
+    }
     /* W7: a LEARNER holds replicated state but casts no vote — deny (and
      * say so honestly rather than ignoring, so candidates converge fast
      * on learners not being part of the electorate). */

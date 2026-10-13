@@ -28,6 +28,7 @@
  *                  keeps working after the v3 extension.
  */
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_federation.h"
@@ -185,6 +186,7 @@ static void store_restart(void) {
     /* Simulated restart: everything in memory is dropped; the new store must
      * recover the records from the data directory's WAL. */
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
     g_store = qihse_kv_store_create();
     assert(g_store);
 }

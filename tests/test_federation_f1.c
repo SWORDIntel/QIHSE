@@ -28,11 +28,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static bool count_cb(const qihse_federation_namespace_t* n, void* ud) {
@@ -479,13 +481,33 @@ static void test_resp_federation(void) {
     printf("PASS RESP FEDERATION.STATUS/STATE/NS.REGISTER/LIST/WRITABLE/UNREGISTER (AC1+AC2) + tenant-guest NOPERM\n");
 }
 
-int main(void) {
+extern char** environ;
+
+static void run_isolated(const char* program, const char* mode) {
+    pid_t child = -1;
+    char* args[] = {(char*)program, (char*)mode, NULL};
+    assert(posix_spawn(&child, program, NULL, NULL, args, environ) == 0);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--registry") == 0) {
+        test_namespace_registry();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--resp") == 0) {
+        test_resp_federation();
+        return 0;
+    }
+    assert(argc == 1);
     test_consistency_classes();
     test_federation_states();
     test_namespace_writability();
     test_federation_status();
-    test_namespace_registry();
-    test_resp_federation();
+    run_isolated(argv[0], "--registry");
+    run_isolated(argv[0], "--resp");
     printf("federation F1 tests passed\n");
     return 0;
 }

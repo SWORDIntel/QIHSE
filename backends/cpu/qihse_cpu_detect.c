@@ -466,7 +466,7 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                         features |= QIHSE_CPU_FEATURE_AVX512F;
                         if (cpuInfo[1] & (1 << 30)) features |= QIHSE_CPU_FEATURE_AVX512BW;
                         if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
-                        if (cpuInfo[1] & (1 << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
+                        if ((unsigned int)cpuInfo[1] & (1u << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
                         if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
                     }
 

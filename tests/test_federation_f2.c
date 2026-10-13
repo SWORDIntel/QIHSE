@@ -22,11 +22,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ── Idempotency ledger ─────────────────────────────────────────────────── */
@@ -519,11 +521,31 @@ static void test_resp_federation_f2(void) {
     printf("PASS RESP FEDERATION.EVENT/WATCH + tenant-guest NOPERM\n");
 }
 
-int main(void) {
-    test_idempotency_ledger();
-    test_event_journal();
-    test_watches();
-    test_resp_federation_f2();
+extern char** environ;
+
+static void run_isolated(const char* program, const char* mode) {
+    pid_t child = -1;
+    char* args[] = {(char*)program, (char*)mode, NULL};
+    assert(posix_spawn(&child, program, NULL, NULL, args, environ) == 0);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--journal") == 0) {
+        test_idempotency_ledger();
+        test_event_journal();
+        test_watches();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--resp") == 0) {
+        test_resp_federation_f2();
+        return 0;
+    }
+    assert(argc == 1);
+    run_isolated(argv[0], "--journal");
+    run_isolated(argv[0], "--resp");
     printf("federation F2 tests passed\n");
     return 0;
 }

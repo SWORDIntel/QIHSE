@@ -44,6 +44,7 @@
 /* For the forged-handle probe: a handle that is not the live record must not
  * resolve as a principal.  The test builds one deliberately. */
 #include "qihse_auth_internal.h"
+#include "qihse_audit.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -130,14 +131,22 @@ static bool file_holds(const char* path, const char* needle) {
 
 /* No scratch or partial container may survive a refusal. */
 static bool dir_has_entry_containing(const char* dir, const char* needle) {
-    char cmd[768];
-    char out_path[512];
-    snprintf(out_path, sizeof(out_path), "%s/.listing", dir);
-    int n = snprintf(cmd, sizeof(cmd), "ls -1a '%s' > '%s' 2>/dev/null", dir, out_path);
-    assert(n > 0 && (size_t)n < sizeof(cmd));
-    assert(system(cmd) == 0);
-    bool found = file_holds(out_path, needle);
-    unlink(out_path);
+    DIR* stream = opendir(dir);
+    assert(stream);
+    bool found = false;
+    struct dirent* entry;
+    while ((entry = readdir(stream)) != NULL) {
+        /* The asynchronous audit writer may briefly hold its own chain
+         * replacement; it is not a backup export scratch file. */
+        if (strncmp(entry->d_name, "qihse_integrity.chain.tmp.",
+                    strlen("qihse_integrity.chain.tmp.")) == 0)
+            continue;
+        if (strstr(entry->d_name, needle)) {
+            found = true;
+            break;
+        }
+    }
+    closedir(stream);
     return found;
 }
 
@@ -1472,10 +1481,9 @@ int main(void) {
     test_wal_low_clearance_denied();
 
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
 
-    /* The audit subsystem's signer thread may still be flushing the
-     * integrity chain into the data dir, so the removal is retried: the
-     * temp dir is repo-local build scratch and must not survive the run. */
+    /* Remove repo-local scratch only after the audit writer has drained. */
     char cmd[768];
     snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", g_dir);
     for (int attempt = 0; attempt < 5; attempt++) {

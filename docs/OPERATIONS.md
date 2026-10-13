@@ -17,6 +17,13 @@ Repository rule that applies to everything here: paths in commands are
 relative to the repository root (`./qihse`, `make …`, `./qihse-cluster-daemon`).
 The build deliberately never requires an absolute home path.
 
+For the authenticated transaction bridge, `QIHSE.TXN.READ` routes through the
+leader and remains the application replay command. `QIHSE.TXN.READLOCAL`
+reads only the contacted member's committed prefix and requires an authenticated
+Operator principal. Its cursor is a local watermark; it must not be treated as a
+cluster-wide read or followed to another member. This recovery inspection
+command has not been exercised on a live daemon in this update.
+
 ---
 
 ## 0. Quick index — credentials and tools at a glance
@@ -364,8 +371,9 @@ Snapshot start now persists the source sequence as a per-peer baseline before
 releasing the consistent snapshot view. The source retains matching tombstones
 through compaction until `REPL.ACK` confirms the receiver has synced the applied
 rows and cursor. This closes the baseline-to-delta delete gap for the current
-KV transport. The W8 code-level gates are verified by `make test-replica-qkp`
-(operator success and low-clearance denial on a live pinned QKP1 session) and
+KV transport. The replication code-level gates are verified by
+`make test-replica-qkp` (operator success and low-clearance denial on a live
+pinned QKP1 session) and
 `make test-replica-crash` (abrupt exit and restart at seven install durability
 boundaries). Delta enumeration retains only the earliest rows fitting its row
 and byte budgets; the daemon pulls one row at a time, up to the KV value limit,

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_kv_store.h"
 
 static size_t iter_count = 0;
@@ -33,7 +34,7 @@ static void write_file(const char* path, const void* data, size_t len) {
 }
 
 int main(void) {
-    char data_dir[] = "/tmp/qihse-kv-sec-XXXXXX";
+    char data_dir[] = "build/qihse-kv-sec-XXXXXX";
     assert(mkdtemp(data_dir) != NULL);
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
@@ -118,6 +119,7 @@ int main(void) {
 
     qihse_kv_store_destroy(store);
 
+    qihse_audit_shutdown();
     unlink(guest_snapshot);
     unlink(op_snapshot);
     unlink(malformed);

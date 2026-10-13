@@ -73,8 +73,8 @@ static void build_audit_path(char *buf, size_t buflen) {
  * Only the signer thread (or a fallback caller while the signer is down)
  * writes records in one process, and every record opens the path fresh with
  * O_APPEND|O_CREAT|O_NOFOLLOW, so a rename between records IS the rotation:
- * the next record re-creates the live file. Separate processes require an
- * external single-writer fence; this module does not coordinate them.
+ * the next record re-creates the live file. The owner-checked writer lock
+ * serializes this path across processes sharing the audit directory.
  * Rotated names carry a decimal-seconds suffix so they sort chronologically
  * by name. POSIX only; on Windows the log grows unbounded. */
 static uint64_t audit_rotate_threshold(void) {

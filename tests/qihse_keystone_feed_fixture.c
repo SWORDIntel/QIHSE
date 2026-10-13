@@ -23,7 +23,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
 #include "qihse_resp_wire.h"
-#include "core/qihse_audit.h"
+#include "qihse_audit.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -149,6 +149,8 @@ int main(int argc, char** argv) {
         printf("[feed-fixture] serve-only; Ctrl-C to stop\n");
         for (;;) sleep(60);
     }
+    /* The wire client receives a separate QIHSE_DATA_DIR below, so the
+     * server retains its audit writer lock while serving the child. */
     pid_t pid = fork();
     if (pid == 0) {
         char client_qdd[] = "build/keystone_feed_client_XXXXXX";

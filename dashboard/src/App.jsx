@@ -37,7 +37,15 @@ export default function App() {
     setMe(status === 200 ? body : 'login');
   }, []);
 
-  useEffect(() => { check(); }, [check]);
+  useEffect(() => {
+    let active = true;
+    apiGet('/whoami').then(({ status, body }) => {
+      if (!active) return;
+      setChecking(false);
+      setMe(status === 200 ? body : 'login');
+    });
+    return () => { active = false; };
+  }, []);
 
   const logout = async () => {
     if (me && me !== 'login') await apiPost('/logout', {}, me.csrf);

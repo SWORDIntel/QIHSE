@@ -1170,6 +1170,52 @@ static bool qihse_resp_handle_consensus_prefix_evidence(
            qihse_resp_bulk_text(session, evidence.qkp_node_id);
 }
 
+/* QIHSE.CONSENSUS.MEMBER ADD|REMOVE <uuid> submits a durable config entry.
+ * The command is intentionally independent of client DATA proposal policy:
+ * membership is an Operator maintenance action, never an application write. */
+static bool qihse_resp_handle_consensus_member(qihse_resp_session_t* session,
+                                               const qihse_resp_request_t* request) {
+    if (!session || !request || !session->server ||
+        !session->server->auth_required || !session->user)
+        return qihse_resp_error(session, "NOAUTH authenticated QIHSE principal required");
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_SYSTEM;
+    qihse_auth_user_active_and_tenant(session->user, &active, &tenant);
+    if (!active || tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+        return qihse_resp_error(session, "NOPERM system Operator required");
+    if (!session->server->consensus_mesh)
+        return qihse_resp_error(session, "ERR consensus mesh is not configured");
+    if (request->argc != 3u)
+        return qihse_resp_wrong_arity(session, "qihse.consensus.member");
+    qihse_consensus_membership_op_t op;
+    if (qihse_resp_arg_equal(&request->argv[1], "ADD"))
+        op = QIHSE_CONSENSUS_MEMBER_ADD;
+    else if (qihse_resp_arg_equal(&request->argv[1], "REMOVE"))
+        op = QIHSE_CONSENSUS_MEMBER_REMOVE;
+    else return qihse_resp_error(session, "ERR expected ADD or REMOVE");
+    if (request->argv[2].len != QIHSE_UUID_STR_LEN)
+        return qihse_resp_error(session, "ERR invalid member UUID");
+    char uuid_text[QIHSE_UUID_STR_LEN + 1u];
+    memcpy(uuid_text, request->argv[2].data, QIHSE_UUID_STR_LEN);
+    uuid_text[QIHSE_UUID_STR_LEN] = '\0';
+    qihse_uuid_t member;
+    if (!qihse_uuid_parse(uuid_text, &member) || qihse_uuid_is_nil(&member))
+        return qihse_resp_error(session, "ERR invalid member UUID");
+    uint64_t index = 0u;
+    bool committed = qihse_consensus_mesh_propose_membership(
+        session->server->consensus_mesh, session->user, op, &member,
+        15000u, &index);
+    if (index > INT64_MAX)
+        return qihse_resp_error(session, "ERR config index exceeds RESP integer range");
+    /* A failed call may still have appended locally. Return its index so an
+     * operator can inspect history before retrying; never claim success. */
+    return qihse_resp_array(session, 2u) &&
+           qihse_resp_bulk_text(session, committed ? "COMMITTED" :
+                                (index ? "UNKNOWN" : "REFUSED")) &&
+           qihse_resp_integer(session, (int64_t)index);
+}
+
 static bool qihse_resp_handle_committed_txn(qihse_resp_session_t* session,
                                              const qihse_resp_request_t* request) {
     if (!session || !request || !session->server ||
@@ -1241,21 +1287,25 @@ static bool qihse_resp_handle_committed_txn(qihse_resp_session_t* session,
                qihse_resp_integer(session, (int64_t)term);
     }
 
-    if (qihse_resp_command_is(request, "QIHSE.TXN.READ")) {
+    if (qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL")) {
+        bool local_read = qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL");
+        if (local_read && qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session,
+                                    "NOPERM node-local recovery read requires Operator");
         if (request->argc != 3u)
-            return qihse_resp_wrong_arity(session, "qihse.txn.read");
+            return qihse_resp_wrong_arity(session,
+                                          local_read ? "qihse.txn.readlocal" : "qihse.txn.read");
         uint64_t from = 0u, limit = 0u;
         if (!qihse_resp_parse_u64_arg(&request->argv[1], &from) ||
             !qihse_resp_parse_u64_arg(&request->argv[2], &limit) ||
             limit == 0u || limit > QIHSE_TXN_READ_MAX_ENTRIES)
             return qihse_resp_error(session, "ERR invalid transaction cursor or page size");
 
-        /* A follower's committed index can lag the leader while a new entry
-         * is being replicated. Transaction consumers use this command to
-         * reconcile an application journal, so serving a stale page could
-         * make a caught-up read appear complete. Route reads through the
-         * current leader, just as proposals are routed. */
-        if (qihse_consensus_mesh_role(session->server->consensus_mesh) !=
+        /* Ordinary transaction consumers use the leader's watermark.
+         * READLOCAL is explicitly limited to node-local recovery inspection;
+         * its cursor must not be interpreted as a cluster-wide watermark. */
+        if (!local_read && qihse_consensus_mesh_role(session->server->consensus_mesh) !=
             QIHSE_CONSENSUS_LEADER) {
             qihse_uuid_t leader;
             char leader_text[QIHSE_UUID_STR_LEN + 1u];
@@ -11326,8 +11376,11 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         return qihse_resp_handle_consensus_prefix_evidence(session, request);
     if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.POINT.CHALLENGE"))
         return qihse_resp_handle_consensus_prefix_point_challenge(session, request);
+    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.MEMBER"))
+        return qihse_resp_handle_consensus_member(session, request);
     if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
-        qihse_resp_command_is(request, "QIHSE.TXN.READ"))
+        qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
         return qihse_resp_handle_committed_txn(session, request);
     if (qihse_resp_command_is(request, "PING")) {
         if (request->argc == 1) return qihse_resp_simple(session, "PONG");

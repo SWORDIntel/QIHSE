@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -39,7 +40,8 @@ static int run_mesh_leader_child(const char* root, uint16_t ports[NODE_COUNT]) {
     char kem_public[NODE_COUNT][384], dsa_public[NODE_COUNT][384];
     qihse_uuid_t members[NODE_COUNT];
     if (!root || !build_member_ids(members) ||
-        snprintf(data, sizeof(data), "%s/data", root) <= 0 ||
+        snprintf(data, sizeof(data), "%s/data-child", root) <= 0 ||
+        (mkdir(data, 0700) != 0 && errno != EEXIST) ||
         setenv("QIHSE_DATA_DIR", data, 1) != 0 ||
         setenv("QIHSE_FIPS_MODE", "disabled", 1) != 0 ||
         qihse_pqc_init_providers() != 0 || !qihse_auth_init() ||
@@ -448,7 +450,7 @@ int main(int argc, char** argv) {
         consensus->election_timeout_base_ms = 800u;
         consensus->election_timeout_spread_ms = 600u;
         consensus->heartbeat_interval_ms = 100u;
-        if (i == 1u) /* Relay waits for Main and Secondary candidates. */
+        if (i == 1u) /* Lower-priority voter waits for preferred candidates. */
             consensus->election_priority_delay_ms = 1200u;
         assert(qihse_consensus_blob_bind_config(&blob_contexts[i], consensus));
         assert(snprintf(consensus->record_path, sizeof(consensus->record_path),
@@ -483,7 +485,7 @@ int main(int argc, char** argv) {
             peer->dsa_public_key_path = dsa_public[j];
             peer->wireguard_ipv4 = "127.0.0.1";
             peer->port = ports[j];
-            /* The current Main image explicitly opts into chunk snapshots
+            /* The node 0 image explicitly opts into chunk snapshots
              * only for node 2. Node 1 exercises the safe legacy gate. */
             peer->snapshot_chunks_supported = (i == 0u && j == 2u);
         }
@@ -540,7 +542,7 @@ int main(int argc, char** argv) {
 
     size_t snapshot_receiver = 2u;
     qihse_consensus_snapshot_stage_progress_t stage_progress;
-    /* Main is provisioned to send chunks, but this receiver has not opted in.
+    /* Node 0 is provisioned to send chunks, but this receiver has not opted in.
      * The authenticated stream may carry type 7; it must be closed without
      * staging any data until the receiving side is provisioned too. */
     usleep(300000u);
@@ -567,7 +569,7 @@ int main(int argc, char** argv) {
     assert(!stage_progress.complete && stage_progress.next_entry_index == 9u);
     /* Keep node 2 from electing a competing leader during the restart window;
      * with only node 2 available it cannot form quorum, and the restarted
-     * up-to-date Main must obtain its vote. */
+     * up-to-date node 0 must obtain its vote. */
     qihse_consensus_mesh_stop(meshes[1u]);
     qihse_consensus_mesh_destroy(meshes[1u]);
     meshes[1u] = NULL;
@@ -830,6 +832,20 @@ int main(int argc, char** argv) {
         if (!protected_committed) usleep(10000u);
     }
     assert(protected_committed);
+    /* A low-clearance principal must not be able to alter the voter set
+     * through the RESP adapter while classified transaction data exists. */
+    char member_text[QIHSE_UUID_STR_LEN + 1u];
+    assert(qihse_uuid_format(&members[follower_index], member_text));
+    const char* denied_member[] = {"QIHSE.CONSENSUS.MEMBER", "REMOVE", member_text};
+    uint64_t before_member_denial =
+        qihse_consensus_mesh_commit_index(meshes[leader_index]);
+    wire_reply = run_resp(resp, analyst, denied_member, 3u);
+    assert(strstr(wire_reply, "NOPERM system Operator required") &&
+           !strstr(wire_reply, protected_payload) &&
+           !strstr(wire_reply, "COMMITTED"));
+    free(wire_reply);
+    assert(qihse_consensus_mesh_commit_index(meshes[leader_index]) ==
+           before_member_denial);
     const char* stale_propose[] = {"QIHSE.TXN.PROPOSE", "0", "0", "2",
                                    "stale-generation-must-not-commit"};
     wire_reply = run_resp(resp, operator_user, stale_propose, 5u);
@@ -842,13 +858,19 @@ int main(int argc, char** argv) {
            !strstr(wire_reply, "*2\r\n") &&
            !strstr(wire_reply, protected_payload));
     free(wire_reply);
+    const char* denied_local_read[] = {"QIHSE.TXN.READLOCAL", "35", "16"};
+    wire_reply = run_resp(resp, analyst, denied_local_read, 3u);
+    assert(strstr(wire_reply, "NOPERM") &&
+           !strstr(wire_reply, "*2\r\n") &&
+           !strstr(wire_reply, protected_payload));
+    free(wire_reply);
     wire_reply = run_resp(resp, operator_user, denied_read, 3u);
     assert(strstr(wire_reply, "*2\r\n") &&
            strstr(wire_reply, protected_payload));
     free(wire_reply);
     qihse_resp_server_destroy(resp);
 
-    /* Main loss must elect Secondary before the lower-priority Relay. */
+    /* Node 0 loss must elect node 2 before the lower-priority node 1. */
     qihse_consensus_mesh_destroy(meshes[0u]);
     meshes[0u] = NULL;
     bool secondary_leader = false;

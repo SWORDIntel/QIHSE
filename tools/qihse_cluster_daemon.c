@@ -161,8 +161,10 @@ static void usage(const char* argv0) {
         "  --replication-peer-node-id and --replication-peer-dsa-pub pin the\n"
         "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n"
         "  --consensus-group ID --consensus-self UUID --consensus-member UUID\n"
-        "  (repeat for every voter) --consensus-listen-ip RFC1918-IP --consensus-port PORT\n"
-        "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (repeat for other voters)\n"
+        "  --consensus-bootstrap-unadmitted (existing record; no self vote)\n"
+        "  (repeat for every durable baseline voter; never edit after first open)\n"
+        "  --consensus-listen-ip RFC1918-IP --consensus-port PORT\n"
+        "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (provisioned peers)\n"
         "  enables the durable QKP-pinned consensus mesh. Requires --dir and --pqc-require.\n"
         "  --consensus-election-priority-delay-ms N delays this member's candidacy.\n"
         "  --consensus-history-id SHA256 --consensus-writer-epoch N bind a new\n"
@@ -170,7 +172,7 @@ static void usage(const char* argv0) {
         "  --consensus-prefix-signer UUID enables a read-only signed exact-prefix\n"
         "  challenge using an approved local federation node identity.\n"
         "  --consensus-allow-client-proposals enables app writes on this member;\n"
-        "  omit on Relay except during an explicitly fenced emergency takeover.\n",
+        "  omit on standby members except during a fenced emergency takeover.\n",
         argv0);
 }
 
@@ -193,6 +195,7 @@ typedef struct {
     bool history_id_supplied;
     bool writer_epoch_supplied;
     qihse_uuid_t self;
+    bool bootstrap_unadmitted;
     qihse_uuid_t members[QIHSE_CONSENSUS_MAX_MEMBERS];
     size_t member_count;
     char listen_ipv4[64];
@@ -278,10 +281,10 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
             options->group_id, options->history_id,
             options->writer_epoch_floor)))
         return "history ID and writer epoch must be supplied together";
-    if (options->member_count < 3u || options->member_count > QIHSE_CONSENSUS_MAX_MEMBERS)
-        return "member count must be between 3 and the configured maximum";
-    if (options->peer_count + 1u != options->member_count)
-        return "peer count must be exactly member count minus one";
+    if (options->member_count < 2u || options->member_count > QIHSE_CONSENSUS_MAX_MEMBERS)
+        return "baseline member count must be between 2 and the configured maximum";
+    if (options->peer_count == 0u)
+        return "at least one authenticated consensus peer is required";
     if (!options->port) return "consensus port is missing";
     if (!consensus_ipv4_private(options->listen_ipv4)) return "listen address is not RFC1918 IPv4";
     if (!data_dir || !*data_dir) return "--dir is required";
@@ -295,23 +298,16 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
             if (qihse_uuid_equal(&options->members[i], &options->members[j]))
                 return "duplicate member UUID";
     }
-    if (!self_found) return "self UUID is absent from the member set";
-    bool peer_member[QIHSE_CONSENSUS_MAX_MEMBERS] = {false};
+    if (!self_found && !options->bootstrap_unadmitted)
+        return "self UUID is absent from the member set";
     for (size_t i = 0; i < options->peer_count; i++) {
         const daemon_consensus_peer_t* peer = &options->peers[i];
         if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &options->self))
             return "peer list contains the local member";
         if (!consensus_ipv4_private(peer->wireguard_ipv4))
             return "peer address is not RFC1918 IPv4";
-        bool found = false;
-        for (size_t j = 0; j < options->member_count; j++) {
-            if (qihse_uuid_equal(&peer->mesh_peer.member_uuid, &options->members[j])) {
-                if (peer_member[j]) return "duplicate peer member UUID";
-                peer_member[j] = true;
-                found = true;
-            }
-        }
-        if (!found) return "peer UUID is absent from the member set";
+        /* A peer may be provisioned ahead of a logged ADD, or omitted after
+         * a logged REMOVE. The durable baseline still comes from --member. */
         if (!strcmp(peer->qkp_node_id, qkp_node_id)) return "peer reuses the local QKP node ID";
         for (size_t j = i + 1u; j < options->peer_count; j++) {
             const daemon_consensus_peer_t* other = &options->peers[j];
@@ -324,9 +320,6 @@ static const char* consensus_options_error(const daemon_consensus_options_t* opt
                 return "duplicate peer endpoint";
         }
     }
-    for (size_t i = 0; i < options->member_count; i++)
-        if (!qihse_uuid_equal(&options->members[i], &options->self) && !peer_member[i])
-            return "a non-local voter has no peer endpoint";
     return NULL;
 }
 
@@ -1104,6 +1097,9 @@ int main(int argc, char** argv) {
             consensus_configured = true;
             if (!qihse_uuid_parse(argv[++i], &consensus_options.self) ||
                 qihse_uuid_is_nil(&consensus_options.self)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--consensus-bootstrap-unadmitted") == 0) {
+            consensus_configured = true;
+            consensus_options.bootstrap_unadmitted = true;
         } else if (strcmp(a, "--consensus-member") == 0 && i + 1 < argc) {
             consensus_configured = true;
             if (consensus_options.member_count >= QIHSE_CONSENSUS_MAX_MEMBERS ||
@@ -1454,6 +1450,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         mesh_cfg.consensus.self = consensus_options.self;
+        mesh_cfg.consensus.allow_unadmitted_self =
+            consensus_options.bootstrap_unadmitted;
         mesh_cfg.consensus.election_priority_delay_ms =
             consensus_options.election_priority_delay_ms;
         mesh_cfg.consensus.member_count = consensus_options.member_count;

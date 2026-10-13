@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2, ShieldAlert, KeyRound, Usb } from 'lucide-react';
-import { apiGet, apiPost, apiError } from '../api.js';
+import { apiGet, apiPost } from '../api.js';
 import { getAssertion, createAttestation } from '../webauthn.js';
 
 // Guarded actions: allowlist only, exact-command dialog, per-action

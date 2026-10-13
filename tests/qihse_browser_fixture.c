@@ -24,6 +24,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
 #include "qihse_resp_wire.h"
+#include "qihse_audit.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -109,6 +110,9 @@ int main(int argc, char** argv) {
            "analyst=%s clearance=2; classified keys seeded\n",
            qihse_resp_server_port(server), ANALYST_NAME);
     fflush(stdout);
+
+    /* The bridge is exec'd in a child and must acquire its own audit lock. */
+    qihse_audit_shutdown();
 
     /* Hand the port the server actually bound (0 = ephemeral). */
     char port_str[8];

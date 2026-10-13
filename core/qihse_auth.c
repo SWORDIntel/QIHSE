@@ -397,6 +397,8 @@ static bool auth_direct_mutations_fenced = false;
 /* Registry startup must be the first auth initialization in this process.
  * Until a committed snapshot is published, it issues no login handles. */
 static bool auth_initialized_once = false;
+/* Published only after both the audit writer and principal table are ready. */
+static bool auth_service_ready = false;
 static bool auth_registry_pre_serve = false;
 static bool auth_init_pending = false;
 static auth_rate_limit_t rate_limits[MAX_USERS];
@@ -681,9 +683,8 @@ static bool auth_init_mode(bool registry_pre_serve) {
     }
     pthread_rwlock_unlock(&auth_rwlock);
     if (!permitted) return false;
-
+    __atomic_store_n(&auth_service_ready, false, __ATOMIC_RELEASE);
     qihse_audit_init();
-
     if (!check_fips_compliance()) {
         pthread_rwlock_wrlock(&auth_rwlock);
         for (uint32_t i = 0; i < MAX_USERS; i++) {
@@ -782,6 +783,7 @@ static bool auth_init_mode(bool registry_pre_serve) {
         auth_init_pending = false;
     }
     pthread_rwlock_unlock(&auth_rwlock);
+    __atomic_store_n(&auth_service_ready, ready, __ATOMIC_RELEASE);
     return ready;
 }
 
@@ -1253,6 +1255,10 @@ bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char*
 }
 
 bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint16_t data_sci) {
+    /* A failed startup has no audit writer. Preserve public, anonymous
+     * reads, but deny every classified or principal-bearing request. */
+    if (!__atomic_load_n(&auth_service_ready, __ATOMIC_ACQUIRE))
+        return !user && data_classif == 0 && data_sci == 0;
     if (data_classif > 0) {
         uint32_t uid = 0xFFFFFFFF;
         if (user) {
