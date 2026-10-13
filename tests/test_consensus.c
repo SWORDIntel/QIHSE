@@ -237,9 +237,8 @@ static void h_init_ex(harness_t* h, const char* seed, uint64_t snapshot_threshol
         snprintf(h->dir, sizeof(h->dir), "test_consensus_XXXXXX");
         assert(mkdtemp(h->dir));
     }
-    /* Isolate the audit chain/log per test so parallel aggregates never
-     * share root state. */
-    setenv("QIHSE_DATA_DIR", h->dir, 1);
+    /* Consensus node records are stored directly in h->recpath[i] in h->dir;
+     * keep QIHSE_DATA_DIR bound to the test process root to preserve audit writer lock. */
 
     for (size_t i = 0; i < N; i++) {
         char buf[96];

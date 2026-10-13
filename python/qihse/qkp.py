@@ -54,9 +54,19 @@ def _load() -> ctypes.CDLL:
     global _lib_cache
     if _lib_cache is not None:
         return _lib_cache
+    repo_lib = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "libqihse.so"
+    )
+    candidates = [
+        os.environ.get("QIHSE_LIB"),
+        os.environ.get("QIHSE_LIB_PATH"),
+        repo_lib if os.path.isfile(repo_lib) else None,
+        os.path.join(os.environ.get("QIHSE_LIB_DIR", ""), "libqihse.so") if os.environ.get("QIHSE_LIB_DIR") else None,
+        "libqihse.so",
+    ]
     errors = []
-    for candidate in ("libqihse.so", os.path.join(
-            os.environ.get("QIHSE_LIB_DIR", ""), "libqihse.so") if os.environ.get("QIHSE_LIB_DIR") else None):
+    for candidate in candidates:
         if not candidate:
             continue
         try:
@@ -64,7 +74,7 @@ def _load() -> ctypes.CDLL:
             _bind(lib)
             _lib_cache = lib
             return lib
-        except OSError as exc:
+        except (OSError, AttributeError) as exc:
             errors.append(f"{candidate}: {exc}")
     raise QKPLibraryError(
         "cannot load libqihse.so for QKP (set LD_LIBRARY_PATH or "

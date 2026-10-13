@@ -77,6 +77,7 @@ int main(void) {
     qihse_audit_shutdown();
     remove_fixture_file(dir, "qihse_audit.log");
     remove_fixture_file(dir, "qihse_integrity.chain");
+    remove_fixture_file(dir, "qihse_audit.writer.lock");
     assert(rmdir(dir) == 0);
     puts("diagnostic: public blob deletion can consume a hypothetical manifest pin");
     return 0;

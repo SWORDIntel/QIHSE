@@ -28,6 +28,14 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "python"))
 
+_build_dir = os.path.join(REPO, "build")
+os.makedirs(_build_dir, exist_ok=True)
+_cli_data_dir = tempfile.mkdtemp(prefix="pyqkp_cli_data_", dir=_build_dir)
+os.chmod(_cli_data_dir, 0o700)
+os.environ.setdefault("QIHSE_DATA_DIR", _cli_data_dir)
+import atexit
+atexit.register(lambda: shutil.rmtree(_cli_data_dir, ignore_errors=True))
+
 PORT = 7396
 BUS = 17396
 PW = "PythonQkpPass1234!"
@@ -55,7 +63,8 @@ class QKPSDKTest(unittest.TestCase):
         cls.srv = os.path.join(cls.tmp, "srv")
         cls.cli = os.path.join(cls.tmp, "cli")
         for d in (cls.srv, cls.cli):
-            os.makedirs(d, exist_ok=True)
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
             assert _lib.qihse_pqc_keygen(d.encode()), f"keygen failed for {d}"
         srv_pub = os.path.join(cls.srv, "qihse_dsa_pub.pem")
         cli_pub = os.path.join(cls.cli, "qihse_dsa_pub.pem")
@@ -68,15 +77,18 @@ class QKPSDKTest(unittest.TestCase):
              "--pqc-trusted-pub", srv_pub,
              "--pqc-trusted-pub", cli_pub,
              "--pqc-require"],
-            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cwd=REPO)
+        atexit.register(lambda: (hasattr(cls, "daemon") and cls.daemon.poll() is None and cls.daemon.kill()))
         if not wait_port(PORT):
+            poll = cls.daemon.poll()
             cls.daemon.kill()
-            raise RuntimeError("sealed daemon did not come up")
+            raise RuntimeError(f"sealed daemon did not come up (poll={poll})")
 
     @classmethod
     def tearDownClass(cls):
-        cls.daemon.send_signal(signal.SIGKILL)
-        cls.daemon.wait()
+        if hasattr(cls, "daemon") and cls.daemon.poll() is None:
+            cls.daemon.send_signal(signal.SIGKILL)
+            cls.daemon.wait()
         for _ in range(5):
             try:
                 shutil.rmtree(cls.tmp)
@@ -112,7 +124,8 @@ class QKPSDKTest(unittest.TestCase):
     def test_rogue_identity_rejected(self):
         from qihse.controller import Controller, ControllerError
         rogue = os.path.join(self.tmp, "rogue")
-        os.makedirs(rogue, exist_ok=True)
+        os.makedirs(rogue, mode=0o700, exist_ok=True)
+        os.chmod(rogue, 0o700)
         assert _lib.qihse_pqc_keygen(rogue.encode())
         with self.assertRaises(ControllerError):
             Controller("127.0.0.1", PORT,

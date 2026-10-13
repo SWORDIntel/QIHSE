@@ -681,6 +681,9 @@ static bool auth_init_mode(bool registry_pre_serve) {
     }
     pthread_rwlock_unlock(&auth_rwlock);
     if (!permitted) return false;
+
+    qihse_audit_init();
+
     if (!check_fips_compliance()) {
         pthread_rwlock_wrlock(&auth_rwlock);
         for (uint32_t i = 0; i < MAX_USERS; i++) {
@@ -702,8 +705,6 @@ static bool auth_init_mode(bool registry_pre_serve) {
         pthread_rwlock_unlock(&auth_rwlock);
         return false;
     }
-
-    qihse_audit_init();
 
     pthread_rwlock_wrlock(&auth_rwlock);
     if (auth_direct_mutations_fenced) {

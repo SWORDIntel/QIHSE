@@ -139,6 +139,11 @@ def main() -> int:
     except ControllerError:
         ok("bad credentials refused", True)
 
+    data_dir = os.environ.get("QIHSE_DATA_DIR")
+    if data_dir and "keystone_feed_client_" in data_dir and os.path.isdir(data_dir):
+        import shutil
+        shutil.rmtree(data_dir, ignore_errors=True)
+
     print(f"\ntest_keystone_feed_wire: {PASS} checks passed")
     return 0
 

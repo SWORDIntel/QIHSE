@@ -512,6 +512,8 @@ test-controller-sdk-py: lib
 test-kp14-artifact-contract: lib
 	$(CC) $(CFLAGS) -o tests/test_analysis_artifact tests/test_analysis_artifact.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_transaction_gap tests/test_analysis_artifact_transaction_gap.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_transaction_gap
 
 test: test-kp14-artifact-contract
 

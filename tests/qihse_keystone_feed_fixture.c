@@ -23,6 +23,7 @@
 #include "qihse_kv_store.h"
 #include "qihse_vector_db.h"
 #include "qihse_resp_wire.h"
+#include "core/qihse_audit.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -59,10 +60,8 @@ int main(int argc, char** argv) {
     uint16_t port = DEFAULT_PORT;
     if (argc > 1) port = (uint16_t)atoi(argv[1]);
 
-    {
-        char qdd[] = "build/keystone_feed_fixture_XXXXXX";
-        if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
-    }
+    char qdd[128] = "build/keystone_feed_fixture_XXXXXX";
+    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 
     assert(qihse_auth_init());
     qihse_user_t* op = qihse_auth_get_user(0);
@@ -152,6 +151,9 @@ int main(int argc, char** argv) {
     }
     pid_t pid = fork();
     if (pid == 0) {
+        char client_qdd[] = "build/keystone_feed_client_XXXXXX";
+        if (mkdtemp(client_qdd)) setenv("QIHSE_DATA_DIR", client_qdd, 1);
+        else unsetenv("QIHSE_DATA_DIR");
         execvp("python3", child_argv);
         perror("execvp python3");
         _exit(127);
@@ -160,6 +162,12 @@ int main(int argc, char** argv) {
     waitpid(pid, &status, 0);
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
+    qihse_audit_shutdown();
+    if (qdd[0]) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", qdd);
+        (void)system(cmd);
+    }
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         printf("[PASS] keystone feed wire (fixture + SDK asserts)\n");
