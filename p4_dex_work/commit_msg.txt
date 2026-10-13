@@ -1,0 +1,31 @@
+feat(ghidra): Dalvik bug-pattern detector pack (DEX RNG/TLS/KEY)
+
+The VULN rules are x86-C-centric and produced zero findings on Dalvik
+programs while the mobile campaigns proved real bugs behind three
+reusable smali/Dalvik shapes. DalvikBugPatterns.java turns them into
+pipeline rules emitting the exact findings.jsonl line shape:
+
+- DEX.RNG.WEAK: new java.util.Random() constructions only (invoke-direct
+  to java::util::Random::<init>); method refs are deliberately ignored
+  because SecureRandom dispatches through Random's method table. HIGH
+  when the owning package matches transport/crypto/sync/connection/
+  session/protocol tokens, MEDIUM otherwise.
+- DEX.TLS.TRUSTALL: checkServerTrusted overrides whose body is only
+  return/nop instructions; the X509TrustManager sibling trio corroborates
+  (confidence HIGH), a name-only match degrades to MEDIUM.
+- DEX.KEY.HARDCODED: SecretKeySpec(byte[],...) whose array argument
+  traces (backward register slice + one internal producer call) to
+  fill-array-data or const-defined aput chains. Honest proximity
+  heuristic: LOW/MEDIUM confidence with the reason in the description.
+
+Registered as unified-pipeline stage "dalvik-bug-patterns", appended at
+the END of the stage list so existing chained stage-cache keys stay
+valid. Appends to the driver-post findings stream idempotently
+(ruleId|rva dedup) and always writes dalvik_bug_patterns.json (F4
+discipline: skipped non-Dalvik programs still report status=skipped).
+
+Rules registered in detector_registry.py (3 new canonical vuln types).
+Synthetic 6-class fixture (no case/sample content) + rebuild script +
+10-assertion headless test incl. the SecureRandom negative control; all
+rules verified end-to-end via universal_decompile.py --profile dex.
+SHA256SUMS.txt surgically refreshed for these files only.

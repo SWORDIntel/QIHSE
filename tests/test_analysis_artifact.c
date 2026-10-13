@@ -277,7 +277,7 @@ int main(void) {
     /* The signer is asynchronous. Drain it before checking fixture residue. */
     qihse_audit_shutdown();
 
-    /* The auth/audit fixture owns these three files in its unique
+    /* The auth/audit fixture owns only these three files in its unique
      * directory. Fail if future writes add residue without cleanup. */
     char path[sizeof(dir) + 32];
     int n = snprintf(path, sizeof(path), "%s/qihse_audit.log", dir);
