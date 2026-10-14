@@ -17,6 +17,8 @@
 #include "qihse_vector_db.h"
 #include "qihse_resp_wire.h"
 #include "qihse_uwp.h"
+#include "qihse_ai_memory.h"
+#include "qihse_aimem_onnx_embedder.h"
 
 typedef struct {
     uint16_t port;
@@ -27,6 +29,7 @@ typedef struct {
     uint16_t channel_sci;
     bool require_auth;
     const char* operator_password;
+    const char* embedder_onnx;  /* NULL = built-in lexical embedder */
 } server_options_t;
 
 static void usage(const char* program) {
@@ -40,7 +43,9 @@ static void usage(const char* program) {
             "  --pubsub-dir PATH durable pub/sub event-stream directory (default: in-memory pub/sub)\n"
             "  --channel-classif N   classification tag applied to pub/sub channels (default 0)\n"
             "  --channel-sci N       SCI compartment mask applied to pub/sub channels (default 0)\n"
-            "  --uwp-port N      also serve UWP on port N sharing the same stores (default: disabled)\n",
+            "  --uwp-port N      also serve UWP on port N sharing the same stores (default: disabled)\n"
+            "  --embedder-onnx DIR  install the ONNX embedding model in DIR as the AIMEM embedder\n"
+            "                      (env fallback QIHSE_AIMEM_EMBEDDER_ONNX; failure is fatal)\n",
             program);
 }
 
@@ -78,6 +83,7 @@ int main(int argc, char** argv) {
         else if (strcmp(arg, "--channel-sci") == 0 && has_next) options.channel_sci = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--require-auth") == 0) options.require_auth = true;
         else if (strcmp(arg, "--password") == 0 && has_next) options.operator_password = argv[++i];
+        else if (strcmp(arg, "--embedder-onnx") == 0 && has_next) options.embedder_onnx = argv[++i];
         else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown or incomplete option: %s\n", arg); usage(argv[0]); return 2; }
     }
@@ -88,6 +94,14 @@ int main(int argc, char** argv) {
             return 2;
         }
         /* Non-loopback binds without auth are rejected by the engine itself. */
+    }
+    if (!options.embedder_onnx) options.embedder_onnx = getenv("QIHSE_AIMEM_EMBEDDER_ONNX");
+    if (options.embedder_onnx && *options.embedder_onnx &&
+        !qihse_aimem_onnx_embedder_install(options.embedder_onnx)) {
+        /* Fail closed: serving semantic recall on the lexical hash while an
+         * operator asked for the real model would be a silent downgrade. */
+        fprintf(stderr, "[qihse-redis-server] ONNX embedder install failed for %s\n", options.embedder_onnx);
+        return 1;
     }
 
     setenv("QIHSE_DATA_DIR", data_dir, 1);
@@ -146,8 +160,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[qihse-redis-server] RESP server creation failed (auth gate or bind error)\n");
         return 1;
     }
-    printf("[qihse-redis-server] RESP listening on %s:%u (auth %s)\n",
-           options.bind, options.port, options.require_auth ? "required" : "disabled");
+    printf("[qihse-redis-server] RESP listening on %s:%u (auth %s, embedder %s)\n",
+           options.bind, options.port, options.require_auth ? "required" : "disabled",
+           qihse_ai_memory_embedder_name());
 
     pthread_t uwp_thread;
     uwp_thread_arg_t uwp_arg;

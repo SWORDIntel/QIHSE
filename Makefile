@@ -190,8 +190,14 @@ redis-cluster-node: lib
 	$(CC) $(CFLAGS) -o tests/qihse_cluster_node tests/qihse_cluster_node.c -L. -lqihse $(LDFLAGS)
 
 redis-server: lib
-	$(CC) $(CFLAGS) -o qihse-redis-server tools/qihse_redis_server.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -o qihse-redis-server tools/qihse_redis_server.c \
+	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
 	@echo "qihse-redis-server build successful"
+
+test-aimem-onnx-embedder: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_onnx_embedder tests/test_aimem_onnx_embedder.c \
+	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_onnx_embedder
 
 # Session-delivery stress: N tenants, 1-5 MB up/down each, for a time budget.
 # Tune via env: QIHSE_STRESS_TENANTS QIHSE_STRESS_SECONDS QIHSE_STRESS_MIN_MB QIHSE_STRESS_MAX_MB QIHSE_STRESS_CYCLE_MS
