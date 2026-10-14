@@ -137,3 +137,6 @@ vendor/tree-sitter/lib/src/lib.d
 vendor/tree-sitter/lib/src/*.o
 browser-credentials.json
 qihse_audit.writer.lock
+
+# local run artifacts
+advisor-dumps/

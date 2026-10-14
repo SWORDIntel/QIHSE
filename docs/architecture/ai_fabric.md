@@ -227,6 +227,18 @@ Postgres, no platform glue.
   no model present; a real model plugs into the same interface and everything
   downstream is unchanged. The maximum accepted dimension is
   `QIHSE_AIMEM_MAX_DIM` (1024).
+- A real model is now shipped, not just planned:
+  `src/spinnaker/qihse_aimem_onnx_embedder.c` wraps a C BERT WordPiece
+  tokenizer plus an onnxruntime session as a provider (name
+  `onnx:<model-dir>`), installed by the standalone server at startup with
+  `--embedder-onnx DIR` / `QIHSE_AIMEM_EMBEDDER_ONNX`. Install failure is
+  fatal — serving `semantic` on the lexical hash while claiming a real model
+  would be a silent downgrade. The staged model (bge-small-en-v1.5, 384-d)
+  is verified against HF transformers: vector parity within 2e-3, and a
+  query sharing no tokens with a stored memory recalls it at cos ≈ 0.74
+  (`make test-aimem-onnx-embedder`, skips cleanly when no model is
+  staged). See [AIMEM RESP protocol](aimem_resp_protocol.md) for the wire
+  surface and volatility note.
 - Every ranking mode resolves candidates through the same authorization-aware
   read, so no mode can rank, score, or even count a record the principal
   cannot see. That is the property that matters here, because an embedding is

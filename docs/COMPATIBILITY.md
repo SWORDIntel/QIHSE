@@ -88,7 +88,7 @@ Channels carry a configurable `(classification, SCI)` tag as before; since the s
 
 ### Standalone server and UWP bridge
 
-- `make redis-server` builds `qihse-redis-server`, a standalone daemon (`tools/qihse_redis_server.c`) serving RESP on port 6379 with optional `--require-auth`, durable pub/sub (`--pubsub-dir`), channel security policy (`--channel-classif` / `--channel-sci`), and an optional UWP listener on the same stores (`--uwp-port`).
+- `make redis-server` builds `qihse-redis-server`, a standalone daemon (`tools/qihse_redis_server.c`) serving RESP on port 6379 with optional `--require-auth`, durable pub/sub (`--pubsub-dir`), channel security policy (`--channel-classif` / `--channel-sci`), an optional UWP listener on the same stores (`--uwp-port`), and a real-model AIMEM embedder (`--embedder-onnx DIR` / `QIHSE_AIMEM_EMBEDDER_ONNX`: an ONNX BERT-family model + `vocab.txt`, installed via onnxruntime at startup; install failure is fatal — see [AIMEM RESP protocol](architecture/aimem_resp_protocol.md)).
 - `QIHSE_UWP_TARGET_RESP` (0x0F) routes UWP packets into the RESP dispatch path (`qihse_resp_server_execute`) with the UWP-authenticated `qihse_user_t`. Opcode `QIHSE_UWP_RESP_EXEC` (0x01) carries `u32 LE argc` followed by `argc × (u32 LE len + bytes)` and returns raw RESP reply bytes. There is no context-free fallback; see [RESP–UWP bridge](architecture/resp_uwp_bridge.md).
 
 Cluster-oriented work includes Redis-compatible hash-slot routing and sharding architecture. See [Cluster sharding](architecture/cluster_sharding.md).

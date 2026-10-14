@@ -824,6 +824,7 @@ score, or even count a record the principal cannot see.
 | `bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user, const char* id, qihse_ai_memory_hit_t* out)` | Fetch one memory by id (RBAC enforced by the store). | `false` |
 | `bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user, const char* id)` | Delete the record. The search index may retain a stale posting; recall skips records whose KV entry is gone. | `false` |
 | `size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user)` | How many memories the caller can see. | `0` |
+| `bool qihse_aimem_onnx_embedder_install(const char* model_dir)` (`qihse_aimem_onnx_embedder.h`) | Load an ONNX BERT-family model (`model.onnx` + `vocab.txt`) and install it as the active embedder (name `onnx:<dir>`). The standalone server calls this for `--embedder-onnx`; failure is fatal there. | `false` on any error; built-in embedder remains active |
 | `void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count)` | Release the `text` of every hit. | n/a |
 | `void qihse_ai_memory_reset(void)` | Drop the process-local search index (tests / shutdown). | n/a |
 
