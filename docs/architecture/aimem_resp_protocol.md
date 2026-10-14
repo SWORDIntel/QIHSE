@@ -55,12 +55,19 @@ through the same authorization-aware path; an embedding is derived from the
 text and can leak it, so no mode can rank, score, or count a record the
 principal cannot see.
 
-## Volatility
+## Durability
 
-The standalone server's AI-memory store is process-lifetime: a restart
-empties AIMEM records and vectors (the durable path is the mesh/upstream
-authoritative store, consumed through the export cursor). Callers must
-re-ingest after a restart; the idempotency key makes that replay safe.
+AIMEM records persist in the standalone server's KV store under `--dir`
+(WAL + SSTables) and survive restarts. Durability is eventual, not
+per-command: stores reach the store's durable state on the KV layer's own
+flush schedule, and a delete is a tombstone on that same schedule. In
+practice an immediate restart after `FORGET` can resurrect the deleted
+record until the tombstone reaches durable state — observed and reproduced.
+Treat AIMEM as eventually-durable: allow a grace period before assuming a
+store or delete survived a crash or restart, and rely on the idempotency
+key (stable source IDs + export cursor outside QIHSE) to make
+replay-after-loss safe. Upstream authoritative state (the mesh / committed
+transaction store) remains the durability story for anything that matters.
 
 ## Operational properties
 
