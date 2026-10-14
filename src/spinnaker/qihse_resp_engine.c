@@ -5347,6 +5347,188 @@ static bool qihse_resp_handle_memory(qihse_resp_session_t* session, const qihse_
     return qihse_resp_error(session, "ERR unknown MEMORY subcommand");
 }
 
+/* ---- Authenticated native AI-memory protocol ---------------------------
+ *
+ * AIMEM.* is deliberately separate from Redis-compatible MEMORY.*.  Every
+ * operation below requires a live session principal, including when the
+ * server is configured without the network auth gate (the in-process bridge
+ * can otherwise pass NULL).  The native memory implementation remains the
+ * authority for classification/SCI filtering and ranking.
+ */
+#define QIHSE_AIMEM_RESP_MAX_TEXT (256u * 1024u)
+#define QIHSE_AIMEM_RESP_MAX_IDEM 128u
+
+static bool qihse_resp_aimem_principal(qihse_resp_session_t* session) {
+    return session && session->user && qihse_auth_user_is_active(session->user);
+}
+
+static bool qihse_resp_aimem_u32(const qihse_resp_arg_t* arg, uint32_t* out) {
+    char* text;
+    char* end;
+    unsigned long value;
+    if (!arg || !out || arg->len == 0u || arg->len > 10u) return false;
+    text = qihse_resp_arg_text(arg);
+    if (!text) return false;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    bool ok = errno == 0 && end != text && *end == '\0' && value <= UINT32_MAX;
+    if (ok) *out = (uint32_t)value;
+    free(text);
+    return ok;
+}
+
+static bool qihse_resp_aimem_idem_valid(const qihse_resp_arg_t* arg) {
+    if (!arg || arg->len == 0u || arg->len > QIHSE_AIMEM_RESP_MAX_IDEM) return false;
+    for (size_t i = 0; i < arg->len; i++) {
+        unsigned char c = arg->data[i];
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.' || c == ':')) return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_aimem_emit_hit(qihse_resp_session_t* session,
+                                      const qihse_ai_memory_hit_t* hit) {
+    char created[32], kind[16], classification[16], sci[16];
+    snprintf(created, sizeof created, "%llu", (unsigned long long)hit->created_ms);
+    snprintf(kind, sizeof kind, "%u", (unsigned)hit->kind);
+    snprintf(classification, sizeof classification, "%u", (unsigned)hit->classification);
+    snprintf(sci, sizeof sci, "%u", (unsigned)hit->sci_compartment);
+    /* Stable field order: id, created_ms, kind, classification, sci, score,
+     * text.  Nested arrays avoid delimiters in user text. */
+    char score[64];
+    snprintf(score, sizeof score, "%.17g", hit->score);
+    return qihse_resp_array(session, 7u) &&
+           qihse_resp_bulk_text(session, hit->id) &&
+           qihse_resp_bulk_text(session, created) &&
+           qihse_resp_bulk_text(session, kind) &&
+           qihse_resp_bulk_text(session, classification) &&
+           qihse_resp_bulk_text(session, sci) &&
+           qihse_resp_bulk_text(session, score) &&
+           qihse_resp_bulk_text(session, hit->text ? hit->text : "");
+}
+
+static bool qihse_resp_aimem_store_one(qihse_resp_session_t* session,
+                                       uint32_t kind, const char* text,
+                                       const char* idem, char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+    char map_key[192];
+    if (!store || !text || !*text || strlen(text) > QIHSE_AIMEM_RESP_MAX_TEXT) return false;
+    if (idem) {
+        /* Keep idempotency metadata outside the native aimem: namespace so
+         * AIMEM COUNT and recall only describe memory records. */
+        snprintf(map_key, sizeof map_key, "aimem-idem:%u:%s",
+                 (unsigned)qihse_user_get_id(session->user), idem);
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        char* existing = qihse_kv_get_user(store, map_key, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (existing) {
+            bool valid = strlen(existing) == QIHSE_AIMEM_ID_LEN;
+            if (valid) memcpy(out_id, existing, QIHSE_AIMEM_ID_LEN + 1u);
+            free(existing);
+            return valid;
+        }
+    }
+    if (!qihse_ai_memory_store(session->server, session->user, text, kind, out_id)) return false;
+    if (idem) {
+        uint16_t cls = qihse_user_get_classification(session->user);
+        uint16_t sci = qihse_user_get_sci(session->user);
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool mapped = qihse_kv_set_user(store, map_key, out_id, cls, sci, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!mapped) return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
+                                    const qihse_resp_request_t* request) {
+    if (!qihse_resp_aimem_principal(session))
+        return qihse_resp_error(session, "NOAUTH AIMEM requires an authenticated active principal");
+    if (request->argc < 2u) return qihse_resp_wrong_arity(session, "AIMEM");
+
+    if (qihse_resp_arg_equal(&request->argv[1], "STORE")) {
+        if (request->argc != 4u && request->argc != 5u)
+            return qihse_resp_error(session, "ERR usage: AIMEM STORE <kind> <text> [idempotency-key]");
+        uint32_t kind = 0;
+        if (!qihse_resp_aimem_u32(&request->argv[2], &kind) ||
+            (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC))
+            return qihse_resp_error(session, "ERR kind must be 1 (episodic) or 2 (semantic)");
+        char* text = qihse_resp_arg_text(&request->argv[3]);
+        char* idem = NULL;
+        if (request->argc == 5u) {
+            if (!qihse_resp_aimem_idem_valid(&request->argv[4])) {
+                free(text);
+                return qihse_resp_error(session, "ERR invalid idempotency key");
+            }
+            idem = qihse_resp_arg_text(&request->argv[4]);
+        }
+        char id[QIHSE_AIMEM_ID_LEN + 1u];
+        bool ok = qihse_resp_aimem_store_one(session, kind, text, idem, id);
+        free(text); free(idem);
+        return ok ? qihse_resp_bulk_text(session, id) : qihse_resp_error(session, "ERR AIMEM store failed");
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "GET")) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "AIMEM GET");
+        char* id = qihse_resp_arg_text(&request->argv[2]);
+        qihse_ai_memory_hit_t hit;
+        memset(&hit, 0, sizeof hit);
+        bool ok = qihse_ai_memory_get(session->server, session->user, id, &hit);
+        free(id);
+        if (!ok) return qihse_resp_null(session);
+        bool emitted = qihse_resp_aimem_emit_hit(session, &hit);
+        free(hit.text);
+        return emitted;
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "FORGET") ||
+        qihse_resp_arg_equal(&request->argv[1], "DELETE")) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "AIMEM FORGET");
+        char* id = qihse_resp_arg_text(&request->argv[2]);
+        bool ok = qihse_ai_memory_forget(session->server, session->user, id);
+        free(id);
+        return qihse_resp_integer(session, ok ? 1 : 0);
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "COUNT")) {
+        if (request->argc > 3u) return qihse_resp_wrong_arity(session, "AIMEM COUNT");
+        uint32_t kind = QIHSE_AIMEM_KIND_ANY;
+        if (request->argc == 3u && !qihse_resp_aimem_u32(&request->argv[2], &kind))
+            return qihse_resp_error(session, "ERR invalid kind");
+        return qihse_resp_integer(session, (int64_t)qihse_ai_memory_count_kind(
+            session->server, session->user, kind));
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "RECALL")) {
+        if (request->argc < 4u || request->argc > 6u)
+            return qihse_resp_error(session, "ERR usage: AIMEM RECALL <query> <limit> [mode] [kind]");
+        uint32_t limit = 0, kind = QIHSE_AIMEM_KIND_ANY;
+        if (!qihse_resp_aimem_u32(&request->argv[3], &limit) || limit == 0u || limit > 256u)
+            return qihse_resp_error(session, "ERR limit must be 1..256");
+        qihse_ai_memory_mode_t mode = QIHSE_AIMEM_MODE_BM25;
+        if (request->argc >= 5u) {
+            if (qihse_resp_arg_equal(&request->argv[4], "semantic")) mode = QIHSE_AIMEM_MODE_SEMANTIC;
+            else if (qihse_resp_arg_equal(&request->argv[4], "hybrid")) mode = QIHSE_AIMEM_MODE_HYBRID;
+            else if (!qihse_resp_arg_equal(&request->argv[4], "bm25"))
+                return qihse_resp_error(session, "ERR mode must be bm25, semantic, or hybrid");
+        }
+        if (request->argc == 6u && !qihse_resp_aimem_u32(&request->argv[5], &kind))
+            return qihse_resp_error(session, "ERR invalid kind");
+        char* query = qihse_resp_arg_text(&request->argv[2]);
+        qihse_ai_memory_hit_t* hits = calloc(limit, sizeof *hits);
+        if (!query || !hits) { free(query); free(hits); return qihse_resp_error(session, "ERR out of memory"); }
+        size_t found = qihse_ai_memory_recall_kind(session->server, session->user, query,
+                                                    limit, mode, kind, hits, limit);
+        free(query);
+        bool emitted = qihse_resp_array(session, found);
+        for (size_t i = 0; emitted && i < found; i++) emitted = qihse_resp_aimem_emit_hit(session, &hits[i]);
+        qihse_ai_memory_hits_free(hits, found);
+        free(hits);
+        return emitted;
+    }
+    return qihse_resp_error(session, "ERR unknown AIMEM subcommand");
+}
+
 /* ---- Transaction commands ---- */
 
 static bool qihse_resp_handle_multi(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -11505,6 +11687,8 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         if (qihse_resp_arg_equal(&request->argv[1], "RESULT") && request->argc == 3) return qihse_resp_handle_fabric_result(session, request);
         if (qihse_resp_arg_equal(&request->argv[1], "FETCH")) return qihse_resp_handle_fabric_fetch(session, request);
     }
+    if (qihse_resp_command_is(request, "AIMEM"))
+        return qihse_resp_handle_aimem(session, request);
     if (qihse_resp_command_is(request, "CLUSTER")) {
         qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
                                                  qihse_resp_cluster_owner_cb, session->server };

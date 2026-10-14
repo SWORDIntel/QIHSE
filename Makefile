@@ -610,6 +610,10 @@ test-fabric-jobs: lib
 	$(CC) $(CFLAGS) -o tests/test_fabric_jobs tests/test_fabric_jobs.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fabric_jobs
 
+test-aimem-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_resp tests/test_aimem_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_resp
+
 test-fabric-dispatch: lib
 	$(CC) $(CFLAGS) -o tests/test_fabric_dispatch tests/test_fabric_dispatch.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fabric_dispatch
