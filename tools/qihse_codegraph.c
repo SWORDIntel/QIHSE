@@ -245,13 +245,19 @@ static bool validate_edge(struct json_object *item) {
     char *type = json_string(item, "relation");
     char *resolution = json_string(item, "resolution");
     bool traversable = json_flag(item, "traversable");
+    char *tier = json_string(item, "tier");
     return hex64(id) && file && safe_relative(file) &&
            src && (!*src || hex64(src)) && dst && (!*dst || hex64(dst)) &&
            type && strlen(type) < 32 && resolution &&
            json_num(item, "line") >= 0 && json_double(item, "confidence") >= 0.0 &&
            json_double(item, "confidence") <= 1.0 &&
-           (!traversable || (hex64(src) && hex64(dst) &&
+           (!traversable || (hex64(src) && hex64(dst) && tier &&
                              strcmp(resolution, "direct") == 0 &&
+                             strcmp(tier, "UNKNOWN") != 0 &&
+                             strcmp(tier, "HEURISTIC") != 0 &&
+                             strcmp(tier, "INFERRED") != 0 &&
+                             strcmp(tier, "AMBIGUOUS") != 0 &&
+                             strcmp(tier, "UNRESOLVED") != 0 &&
                              json_double(item, "confidence") >= 0.8));
 }
 
