@@ -82,6 +82,7 @@ lib/
 # Cluster daemon / server binaries (built by the Makefile)
 /qihse-cluster-daemon
 /qihse-redis-server
+/qihse-codegraph
 
 # Rust build output
 /rust/qihse-rs/target/
