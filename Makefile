@@ -1353,8 +1353,8 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 .PHONY: test-codegraph
 qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include \
-	  $< -o $@ -L. -lqihse $$(pkg-config --cflags --libs json-c openssl) \
-	  -lm -lpthread -Wl,-rpath,'$$ORIGIN'
+	  $< -o $@ -L. -lqihse $(pkg-config --cflags --libs json-c openssl) \
+	  $(LDFLAGS) -Wl,-rpath,'$ORIGIN'
 
 test-codegraph: qihse-codegraph
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
