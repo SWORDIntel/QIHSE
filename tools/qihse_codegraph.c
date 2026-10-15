@@ -688,18 +688,20 @@ static bool impact_edge(const char *type, bool incoming) {
            !strcmp(type, "INHERITS") || !strcmp(type, "IMPLEMENTS") ||
            !strcmp(type, "HANDLES") || !strcmp(type, "TRIGGERS");
 }
-static struct json_object *record_node(cg_node *n, int hop, double risk) {
+static struct json_object *record_node(cg_node *n, int hop, double risk,
+                                       bool compact) {
     struct json_object *record = json_object_new_object();
-    json_text(record, "id", n->id);
+    if (!compact) json_text(record, "id", n->id);
     json_text(record, "file", n->file);
     json_text(record, "symbol", n->name);
     json_text(record, "kind", n->kind);
     json_int(record, "line_start", n->line);
-    json_int(record, "line_end", n->end_line);
+    if (!compact) json_int(record, "line_end", n->end_line);
     json_int(record, "hop", hop);
     json_bool(record, "is_test", n->is_test);
-    json_object_object_add(record, "risk_hint",
-                           json_object_new_double(risk));
+    if (!compact)
+        json_object_object_add(record, "risk_hint",
+                               json_object_new_double(risk));
     return record;
 }
 static bool matches_symbol(const cg_node *node, const char *query) {
@@ -791,6 +793,8 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     struct json_object *found = json_object_new_array();
     struct json_object *tests = json_object_new_array();
     struct json_object *affected = json_object_new_array();
+    struct json_object *evidence = json_object_new_array();
+    struct json_object *gaps = json_object_new_array();
     bool truncated = false;
     size_t start = 0, used = 0, seeds = 0;
     if (!visited || !distance || !queue || !edges) {
@@ -798,6 +802,7 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
         if (changed) { for (size_t i = 0; i < nfiles; ++i) free(changed[i]); free(changed); }
         free(visited); free(distance); free(queue); free(edges);
         json_object_put(found); json_object_put(tests); json_object_put(affected);
+        json_object_put(evidence); json_object_put(gaps);
         return error_json("CodeGraph query allocation failed");
     }
     for (size_t i = 0; i < st->nn; ++i) {
@@ -817,7 +822,8 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
         if (strcasestr(node->name, "auth") || strcasestr(node->name, "crypto") ||
             strcasestr(node->name, "alloc")) risk += 0.2;
         if (risk > 1.0) risk = 1.0;
-        json_object_array_add(found, record_node(node, hop, risk));
+        json_object_array_add(found, record_node(node, hop, risk,
+                                                 strcmp(action, "context") == 0));
         shown++;
         if (node->is_test) {
             json_object_array_add(tests, json_object_new_string(node->file));
@@ -846,6 +852,59 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
                 visited[neighbor] = 1;
                 distance[neighbor] = (uint8_t)(hop + 1);
                 queue[used++] = neighbor;
+                /* Explain each included relationship with its original
+                 * source line and confidence. No guessed targets are here. */
+                if (json_object_array_length(evidence) < 40 &&
+                    strcmp(action, "context") != 0) {
+                    graph_edge_t *edge = qihse_graph_edge_get(st->graph, adj->edge_id);
+                    if (edge) {
+                        cg_node *related = st->by_vertex[neighbor];
+                        struct json_object *ev = json_object_new_object();
+                        json_text(ev, "relation", adj->edge_type);
+                        json_text(ev, "from", dir == GRAPH_DIR_INCOMING ?
+                                         related->name : node->name);
+                        json_text(ev, "to", dir == GRAPH_DIR_INCOMING ?
+                                         node->name : related->name);
+                        const graph_prop_t *file = graph_edge_get_property(edge, "file");
+                        const graph_prop_t *line = graph_edge_get_property(edge, "line");
+                        const graph_prop_t *confidence =
+                            graph_edge_get_property(edge, "confidence");
+                        if (file && file->type == GRAPH_PROP_STRING)
+                            json_text(ev, "file", file->val.s);
+                        if (line && line->type == GRAPH_PROP_INT64)
+                            json_int(ev, "line", line->val.i);
+                        if (confidence && confidence->type == GRAPH_PROP_DOUBLE)
+                            json_object_object_add(ev, "confidence",
+                                json_object_new_double(confidence->val.d));
+                        json_object_array_add(evidence, ev);
+                        graph_edge_free(edge);
+                    }
+                }
+            }
+        }
+    }
+    /* A missing direct test edge is a test-coverage hint, never a claim that
+     * the function is untested. Caller-level and dynamic coverage differ. */
+    if (!strcmp(action, "review")) {
+        for (size_t i = 0; i < st->nn && json_object_array_length(gaps) < 40; ++i) {
+            cg_node *node = &st->nodes[i];
+            if (!visited[node->vertex] || node->is_test || !node->file[0])
+                continue;
+            bool has_test = false;
+            size_t n = qihse_graph_get_neighbors(st->graph, node->vertex,
+                          GRAPH_DIR_OUTGOING, "TESTED_BY", edges, 2048);
+            if (n) has_test = true;
+            n = qihse_graph_get_neighbors(st->graph, node->vertex,
+                    GRAPH_DIR_INCOMING, "CALLS", edges, 2048);
+            for (size_t j = 0; j < n; ++j)
+                if (st->by_vertex[edges[j].neighbor_id]->is_test)
+                    has_test = true;
+            if (!has_test) {
+                struct json_object *gap = json_object_new_object();
+                json_text(gap, "symbol", node->name);
+                json_text(gap, "file", node->file);
+                json_text(gap, "kind", "no direct test relation in indexed graph");
+                json_object_array_add(gaps, gap);
             }
         }
     }
@@ -857,6 +916,13 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     json_object_object_add(report, "nodes", found);
     json_object_object_add(report, "affected_files", affected);
     json_object_object_add(report, "candidate_tests", tests);
+    if (strcmp(action, "context") == 0) {
+        json_object_put(evidence);
+        json_object_put(gaps);
+    } else {
+        json_object_object_add(report, "evidence", evidence);
+        json_object_object_add(report, "test_gap_candidates", gaps);
+    }
     if (!seeds && (symbol || nfiles)) {
         json_text(report, "error", "no indexed seed nodes; refresh or narrow query");
     } else if (st->unresolved) {
@@ -871,7 +937,7 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
 }
 
 static int usage(void) {
-    fputs("usage: qihse-codegraph <import|status|query|impact|review> "
+    fputs("usage: qihse-codegraph <import|status|query|impact|review|context> "
           "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
           "[--base GITREF] [--depth 1..5] [--limit 1..256] "
           "[--max-tokens 128..16000]\n", stderr);
@@ -902,7 +968,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(action, "import") && strcmp(action, "status") &&
         strcmp(action, "query") && strcmp(action, "impact") &&
-        strcmp(action, "review")) return usage();
+        strcmp(action, "review") && strcmp(action, "context")) return usage();
     if (tokens < 128 || tokens > 16000 || limit == 0 || limit > 256 ||
         depth < 1 || depth > 5) return usage();
     cg_state st;
