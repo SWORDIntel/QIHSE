@@ -409,3 +409,494 @@ static int import_snapshot(cg_state *st, const char *input) {
     close(lfd);
     return persisted ? 0 : error_json("manifest publication failed; previous generation retained");
 }
+
+
+/* Rebuild a memory-resident structural graph from one immutable QIHSE KV
+ * generation. The QIHSE graph engine provides indexed incident adjacency;
+ * raw CRG qualified names are never guessed or re-resolved here. */
+static int compare_node_id(const void *a, const void *b) {
+    return strcmp(((const cg_node *)a)->id, ((const cg_node *)b)->id);
+}
+static cg_node *find_node(cg_state *st, const char *id) {
+    cg_node probe = {0};
+    if (!id || !hex64(id)) return NULL;
+    memcpy(probe.id, id, 65);
+    return bsearch(&probe, st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
+}
+static bool nodes_from_kv(const char *key, const char *value, void *user) {
+    cg_state *st = user;
+    if (strncmp(key, "n:", 2) != 0) return true;
+    struct json_object *row = json_tokener_parse(value);
+    if (!row || !validate_node(row) || st->nn >= CG_MAX_NODES) {
+        if (row) json_object_put(row);
+        st->capacity = SIZE_MAX; /* record parse failure */
+        return false;
+    }
+    if (st->nn == st->capacity) {
+        size_t cap = st->capacity ? st->capacity * 2 : 256;
+        cg_node *grown = realloc(st->nodes, cap * sizeof(*st->nodes));
+        if (!grown) {
+            st->capacity = SIZE_MAX;
+            json_object_put(row);
+            return false;
+        }
+        st->nodes = grown; st->capacity = cap;
+    }
+    cg_node *node = &st->nodes[st->nn++];
+    memset(node, 0, sizeof(*node));
+    snprintf(node->id, sizeof(node->id), "%s", json_string(row, "id"));
+    node->file = strdup(json_string(row, "file"));
+    node->name = strdup(json_string(row, "name"));
+    node->kind = strdup(json_string(row, "kind"));
+    node->line = (int)json_num(row, "line_start");
+    node->end_line = (int)json_num(row, "line_end");
+    node->is_test = json_flag(row, "is_test");
+    const char *labels[] = {node->kind};
+    const char *keys[] = {"file", "name"};
+    graph_prop_t props[2] = {
+        graph_prop_make_string(node->file), graph_prop_make_string(node->name),
+    };
+    node->vertex = qihse_graph_vertex_create(st->graph, labels, 1, keys, props, 2);
+    graph_prop_free(&props[0]); graph_prop_free(&props[1]);
+    json_object_put(row);
+    if (!node->file || !node->name || !node->kind || !node->vertex) {
+        st->capacity = SIZE_MAX;
+        return false;
+    }
+    return true;
+}
+static bool edges_from_kv(const char *key, const char *value, void *user) {
+    cg_state *st = user;
+    if (strncmp(key, "e:", 2) != 0) return true;
+    struct json_object *row = json_tokener_parse(value);
+    if (!row || !validate_edge(row)) {
+        if (row) json_object_put(row);
+        st->edges = SIZE_MAX;
+        return false;
+    }
+    st->edges++;
+    if (json_flag(row, "traversable")) {
+        cg_node *src = find_node(st, json_string(row, "source"));
+        cg_node *dst = find_node(st, json_string(row, "target"));
+        if (!src || !dst) {
+            st->edges = SIZE_MAX; /* forged authoritative endpoint */
+        } else {
+            const char *keys[] = {"file", "line", "confidence"};
+            graph_prop_t props[3] = {
+                graph_prop_make_string(json_string(row, "file")),
+                graph_prop_make_int64(json_num(row, "line")),
+                graph_prop_make_double(json_double(row, "confidence")),
+            };
+            uint64_t id = qihse_graph_edge_create(
+                st->graph, json_string(row, "relation"), src->vertex, dst->vertex,
+                keys, props, 3);
+            graph_prop_free(&props[0]);
+            if (!id) st->edges = SIZE_MAX;
+        }
+    } else st->unresolved++;
+    json_object_put(row);
+    return st->edges != SIZE_MAX;
+}
+
+static struct json_object *read_json_file(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    struct stat info;
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size <= 0 || info.st_size > 32768) { close(fd); return NULL; }
+    char *buf = malloc((size_t)info.st_size + 1);
+    if (!buf) { close(fd); return NULL; }
+    size_t have = 0; bool ok = true;
+    while (have < (size_t)info.st_size) {
+        ssize_t n = read(fd, buf + have, (size_t)info.st_size - have);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        have += (size_t)n;
+    }
+    close(fd);
+    buf[have] = '\0';
+    struct json_object *row = ok ? json_tokener_parse(buf) : NULL;
+    free(buf);
+    if (row && !json_object_is_type(row, json_type_object)) {
+        json_object_put(row);
+        return NULL;
+    }
+    return row;
+}
+static bool load_snapshot(cg_state *st) {
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory);
+    st->manifest = read_json_file(manifest_path);
+    if (!st->manifest) return false;
+    char *snapshot = json_string(st->manifest, "snapshot");
+    char *sha = json_string(st->manifest, "sha256");
+    if (!snapshot || strncmp(snapshot, "graph-", 6) != 0 ||
+        strlen(snapshot) > 120 || strchr(snapshot, '/') ||
+        !strstr(snapshot, ".kv") || !hex64(sha)) return false;
+    char snapshot_path[PATH_MAX], actual[65];
+    if (snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s",
+                 st->directory, snapshot) >= (int)sizeof(snapshot_path) ||
+        !sha256_file(snapshot_path, actual) || strcmp(actual, sha)) return false;
+    if (qihse_kv_load(st->kv, snapshot_path) != 0) return false;
+    char *header = qihse_kv_get(st->kv, "_meta");
+    char *end = qihse_kv_get(st->kv, "_end");
+    if (!header || !end) { free(header); free(end); return false; }
+    st->meta = json_tokener_parse(header);
+    struct json_object *trailer = json_tokener_parse(end);
+    free(header); free(end);
+    bool ok = st->meta && trailer &&
+              strcmp(json_string(st->meta, "format") ?
+                     json_string(st->meta, "format") : "", "qihse-codegraph-v1") == 0 &&
+              json_num(st->manifest, "nodes") == json_num(trailer, "nodes") &&
+              json_num(st->manifest, "edges") == json_num(trailer, "edges") &&
+              json_num(st->manifest, "unresolved_edges") ==
+              json_num(trailer, "unresolved_edges");
+    if (trailer) json_object_put(trailer);
+    if (!ok) return false;
+    st->graph = qihse_graph_create();
+    if (!st->graph || !qihse_kv_foreach_user(st->kv, NULL, nodes_from_kv, st) ||
+        st->capacity == SIZE_MAX ||
+        st->nn != (size_t)json_num(st->manifest, "nodes")) return false;
+    qsort(st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
+    st->by_vertex = calloc(st->nn + 2, sizeof(*st->by_vertex));
+    if (!st->by_vertex) return false;
+    for (size_t i = 0; i < st->nn; ++i) {
+        if (st->nodes[i].vertex > st->nn) return false;
+        st->by_vertex[st->nodes[i].vertex] = &st->nodes[i];
+    }
+    return qihse_kv_foreach_user(st->kv, NULL, edges_from_kv, st) &&
+           st->edges != SIZE_MAX &&
+           st->edges == (size_t)json_num(st->manifest, "edges") &&
+           st->unresolved == (size_t)json_num(st->manifest, "unresolved_edges");
+}
+
+/* Git metadata is compared at request time. A changed HEAD, staged work or
+ * edited tracked files makes the old snapshot stale and review fails closed. */
+static bool git_capture(const char *repo, const char *const args[],
+                        unsigned char **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return false; }
+    if (pid == 0) {
+        close(fds[0]); dup2(fds[1], STDOUT_FILENO); close(fds[1]);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) { dup2(null, STDERR_FILENO); close(null); }
+        if (chdir(repo) != 0) _exit(127);
+        execvp("git", (char *const *)args);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t cap = 4096, used = 0;
+    unsigned char *buf = malloc(cap);
+    bool ok = buf != NULL;
+    while (ok) {
+        if (used == cap) {
+            if (cap >= 4 * 1024 * 1024) { ok = false; break; }
+            unsigned char *next = realloc(buf, cap * 2);
+            if (!next) { ok = false; break; }
+            buf = next; cap *= 2;
+        }
+        ssize_t n = read(fds[0], buf + used, cap - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) ok = false;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!ok || !WIFEXITED(status) || WEXITSTATUS(status)) { free(buf); return false; }
+    *out = buf; *out_len = used;
+    return true;
+}
+static bool freshness(cg_state *st, const char **reason) {
+    const char *const head_args[] = {"git", "--no-optional-locks",
+                                    "rev-parse", "--verify", "HEAD", NULL};
+    const char *const status_args[] = {"git", "--no-optional-locks",
+                                      "status", "--porcelain=v1", "-z",
+                                      "--untracked-files=normal", NULL};
+    unsigned char *head = NULL, *worktree = NULL;
+    size_t nhead = 0, nstatus = 0;
+    if (!git_capture(st->repository, head_args, &head, &nhead) ||
+        !git_capture(st->repository, status_args, &worktree, &nstatus)) {
+        free(head); free(worktree);
+        *reason = "git verification unavailable";
+        return false;
+    }
+    while (nhead && (head[nhead - 1] == '\n' || head[nhead - 1] == '\r')) nhead--;
+    char status_hash[65];
+    bool ok = sha256_buffer((const char *)worktree, nstatus, status_hash);
+    char *baseline = json_string(st->manifest, "head");
+    char *stored_worktree = json_string(st->manifest, "worktree");
+    if (!ok || !baseline || !stored_worktree ||
+        strlen(baseline) != nhead || memcmp(baseline, head, nhead) != 0 ||
+        strcmp(status_hash, stored_worktree) != 0) {
+        *reason = "repository changed since index publication";
+        ok = false;
+    }
+    free(head); free(worktree);
+    return ok;
+}
+static struct json_object *summary(cg_state *st) {
+    struct json_object *obj = json_object_new_object();
+    json_text(obj, "backend", "QIHSE native CodeGraph");
+    json_text(obj, "format", "qihse-codegraph-v1");
+    json_int(obj, "nodes", (int64_t)st->nn);
+    json_int(obj, "edges", (int64_t)st->edges);
+    json_int(obj, "unresolved_edges", (int64_t)st->unresolved);
+    json_text(obj, "head", json_string(st->manifest, "head"));
+    const char *reason = NULL;
+    bool fresh = freshness(st, &reason);
+    json_bool(obj, "fresh", fresh);
+    if (!fresh) json_text(obj, "stale_reason", reason);
+    return obj;
+}
+static bool impact_edge(const char *type, bool incoming) {
+    if (!strcmp(type, "TESTED_BY")) return !incoming;
+    if (!incoming) return false;
+    return !strcmp(type, "CALLS") || !strcmp(type, "IMPORTS_FROM") ||
+           !strcmp(type, "DEPENDS_ON") || !strcmp(type, "REFERENCES") ||
+           !strcmp(type, "INHERITS") || !strcmp(type, "IMPLEMENTS") ||
+           !strcmp(type, "HANDLES") || !strcmp(type, "TRIGGERS");
+}
+static struct json_object *record_node(cg_node *n, int hop, double risk) {
+    struct json_object *record = json_object_new_object();
+    json_text(record, "id", n->id);
+    json_text(record, "file", n->file);
+    json_text(record, "symbol", n->name);
+    json_text(record, "kind", n->kind);
+    json_int(record, "line_start", n->line);
+    json_int(record, "line_end", n->end_line);
+    json_int(record, "hop", hop);
+    json_bool(record, "is_test", n->is_test);
+    json_object_object_add(record, "risk_hint",
+                           json_object_new_double(risk));
+    return record;
+}
+static bool matches_symbol(const cg_node *node, const char *query) {
+    return query && *query && (strcasestr(node->name, query) != NULL);
+}
+static bool matches_file(const cg_node *node, const char *files[], size_t nfiles) {
+    for (size_t i = 0; i < nfiles; ++i)
+        if (strcmp(node->file, files[i]) == 0) return true;
+    return false;
+}
+static bool safe_git_ref(const char *ref) {
+    if (!ref || !*ref || strlen(ref) > 120 || ref[0] == '-') return false;
+    for (const char *p = ref; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || strchr("._/~^+-", *p)))
+            return false;
+    return true;
+}
+static size_t git_changed_files(cg_state *st, const char *base, char ***names) {
+    *names = NULL;
+    if (!safe_git_ref(base)) return SIZE_MAX;
+    const char *args[] = {"git", "--no-optional-locks", "diff", "--name-only",
+                          "-z", "--diff-filter=ACMRT", base, "--", NULL};
+    unsigned char *raw = NULL;
+    size_t bytes = 0;
+    if (!git_capture(st->repository, args, &raw, &bytes)) return SIZE_MAX;
+    char **result = calloc(CG_MAX_FILES, sizeof(*result));
+    if (!result) { free(raw); return SIZE_MAX; }
+    size_t count = 0;
+    for (size_t i = 0; i < bytes;) {
+        size_t end = i;
+        while (end < bytes && raw[end]) end++;
+        if (end == bytes || count == CG_MAX_FILES) { count = SIZE_MAX; break; }
+        if (end > i) {
+            char *path = strndup((const char *)raw + i, end - i);
+            if (!safe_relative(path)) { free(path); count = SIZE_MAX; break; }
+            result[count++] = path;
+        }
+        i = end + 1;
+    }
+    free(raw);
+    if (count == SIZE_MAX) {
+        for (size_t i = 0; i < CG_MAX_FILES; ++i) free(result[i]);
+        free(result); return SIZE_MAX;
+    }
+    *names = result;
+    return count;
+}
+
+/* A bounded BFS. Stop at the first hit of each vertex; never claim that a
+ * truncated traversal covers all callers/tests. Neighbor retrieval operates
+ * against native QIHSE indexed adjacency, never a global edge-table scan. */
+static int query_graph(cg_state *st, const char *action, const char *symbol,
+                       const char *files[], size_t nfiles, const char *base,
+                       int depth, size_t max_nodes, int token_budget) {
+    struct json_object *report = summary(st);
+    if (!json_flag(report, "fresh")) {
+        json_text(report, "error", "stale CodeGraph: run graph_index update");
+        print_json(report); json_object_put(report);
+        return 2;
+    }
+    char **changed = NULL;
+    if (base) {
+        size_t extra = git_changed_files(st, base, &changed);
+        if (extra == SIZE_MAX || extra + nfiles > CG_MAX_FILES) {
+            json_object_put(report);
+            if (changed) {
+                for (size_t i = 0; i < extra && i < CG_MAX_FILES; ++i) free(changed[i]);
+                free(changed);
+            }
+            return error_json("git diff failed or changed-file set exceeds limit");
+        }
+        nfiles = extra;
+        files = (const char **)changed;
+    }
+    if ((!symbol || !*symbol) && nfiles == 0 && strcmp(action, "query") == 0) {
+        json_object_put(report);
+        return error_json("query requires --symbol or --file");
+    }
+    depth = depth < 1 ? 1 : depth > 5 ? 5 : depth;
+    max_nodes = max_nodes < 1 ? 1 : max_nodes > 256 ? 256 : max_nodes;
+    if (token_budget > 0 && max_nodes > (size_t)(token_budget / 45))
+        max_nodes = (size_t)(token_budget / 45);
+    if (!max_nodes) max_nodes = 1;
+    uint8_t *visited = calloc(st->nn + 2, sizeof(*visited));
+    uint8_t *distance = calloc(st->nn + 2, sizeof(*distance));
+    uint64_t *queue = calloc(max_nodes + 1, sizeof(*queue));
+    graph_adj_t *edges = calloc(2048, sizeof(*edges));
+    struct json_object *found = json_object_new_array();
+    struct json_object *tests = json_object_new_array();
+    struct json_object *affected = json_object_new_array();
+    bool truncated = false;
+    size_t start = 0, used = 0, seeds = 0;
+    if (!visited || !distance || !queue || !edges) {
+        json_object_put(report);
+        if (changed) { for (size_t i = 0; i < nfiles; ++i) free(changed[i]); free(changed); }
+        free(visited); free(distance); free(queue); free(edges);
+        json_object_put(found); json_object_put(tests); json_object_put(affected);
+        return error_json("CodeGraph query allocation failed");
+    }
+    for (size_t i = 0; i < st->nn; ++i) {
+        cg_node *n = &st->nodes[i];
+        if (!matches_symbol(n, symbol) && !matches_file(n, files, nfiles)) continue;
+        seeds++;
+        if (used < max_nodes) { visited[n->vertex] = 1; queue[used++] = n->vertex; }
+        else truncated = true;
+    }
+    size_t shown = 0;
+    while (start < used) {
+        uint64_t id = queue[start++];
+        cg_node *node = st->by_vertex[id];
+        int hop = distance[id];
+        double risk = 0.10 + (node->is_test ? 0.0 : 0.25) +
+                      (hop == 0 ? 0.2 : 0.1 / (hop + 1));
+        if (strcasestr(node->name, "auth") || strcasestr(node->name, "crypto") ||
+            strcasestr(node->name, "alloc")) risk += 0.2;
+        if (risk > 1.0) risk = 1.0;
+        json_object_array_add(found, record_node(node, hop, risk));
+        shown++;
+        if (node->is_test) {
+            json_object_array_add(tests, json_object_new_string(node->file));
+        }
+        bool known = false;
+        for (size_t k = 0; k < json_object_array_length(affected); ++k) {
+            if (!strcmp(json_object_get_string(json_object_array_get_idx(affected, k)),
+                        node->file)) { known = true; break; }
+        }
+        if (!known && *node->file)
+            json_object_array_add(affected, json_object_new_string(node->file));
+        if (hop >= depth) continue;
+        for (int direction = 0; direction < 2; ++direction) {
+            graph_dir_t dir = direction == 0 ?
+                              GRAPH_DIR_INCOMING : GRAPH_DIR_OUTGOING;
+            size_t count = qihse_graph_get_neighbors(st->graph, id, dir, NULL, edges, 2048);
+            if (count == 2048) truncated = true;
+            for (size_t e = 0; e < count; ++e) {
+                graph_adj_t *adj = &edges[e];
+                if (strcmp(action, "query") != 0 &&
+                    !impact_edge(adj->edge_type, dir == GRAPH_DIR_INCOMING))
+                    continue;
+                uint64_t neighbor = adj->neighbor_id;
+                if (neighbor > st->nn || visited[neighbor]) continue;
+                if (used >= max_nodes) { truncated = true; continue; }
+                visited[neighbor] = 1;
+                distance[neighbor] = (uint8_t)(hop + 1);
+                queue[used++] = neighbor;
+            }
+        }
+    }
+    json_int(report, "seed_nodes", (int64_t)seeds);
+    json_int(report, "shown_nodes", (int64_t)shown);
+    json_int(report, "depth", depth);
+    json_bool(report, "truncated", truncated);
+    json_text(report, "risk_kind", "heuristic review priority; not vulnerability probability");
+    json_object_object_add(report, "nodes", found);
+    json_object_object_add(report, "affected_files", affected);
+    json_object_object_add(report, "candidate_tests", tests);
+    if (!seeds && (symbol || nfiles)) {
+        json_text(report, "error", "no indexed seed nodes; refresh or narrow query");
+    } else if (st->unresolved) {
+        json_text(report, "uncertainty",
+                  "unresolved/low-confidence relations excluded; review not exhaustive");
+    }
+    print_json(report);
+    json_object_put(report);
+    if (changed) { for (size_t i = 0; i < nfiles; ++i) free(changed[i]); free(changed); }
+    free(visited); free(distance); free(queue); free(edges);
+    return seeds || (!symbol && nfiles == 0) ? 0 : 2;
+}
+
+static int usage(void) {
+    fputs("usage: qihse-codegraph <import|status|query|impact|review> "
+          "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
+          "[--base GITREF] [--depth 1..5] [--limit 1..256] "
+          "[--max-tokens 128..16000]\n", stderr);
+    return 2;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return usage();
+    const char *action = argv[1], *repo = ".", *input = NULL;
+    const char *symbol = NULL, *base = NULL, *files[CG_MAX_FILES] = {0};
+    size_t nfiles = 0, limit = 80;
+    int depth = 2, tokens = 4000;
+    for (int i = 2; i < argc; i++) {
+        const char *flag = argv[i];
+        if (i + 1 >= argc) return usage();
+        const char *value = argv[++i];
+        if (!strcmp(flag, "--repo")) repo = value;
+        else if (!strcmp(flag, "--input")) input = value;
+        else if (!strcmp(flag, "--symbol")) symbol = value;
+        else if (!strcmp(flag, "--base")) base = value;
+        else if (!strcmp(flag, "--file")) {
+            if (nfiles == CG_MAX_FILES || !safe_relative(value)) return usage();
+            files[nfiles++] = value;
+        } else if (!strcmp(flag, "--depth")) depth = atoi(value);
+        else if (!strcmp(flag, "--limit")) limit = (size_t)atoi(value);
+        else if (!strcmp(flag, "--max-tokens")) tokens = atoi(value);
+        else return usage();
+    }
+    if (strcmp(action, "import") && strcmp(action, "status") &&
+        strcmp(action, "query") && strcmp(action, "impact") &&
+        strcmp(action, "review")) return usage();
+    if (tokens < 128 || tokens > 16000 || limit == 0 || limit > 256 ||
+        depth < 1 || depth > 5) return usage();
+    cg_state st;
+    if (!graph_open(&st, repo)) {
+        graph_close(&st);
+        return error_json("CodeGraph repo/runtime not available");
+    }
+    int rc;
+    if (!strcmp(action, "import")) {
+        rc = input ? import_snapshot(&st, input) : usage();
+    } else if (!load_snapshot(&st)) {
+        rc = error_json("no valid QIHSE CodeGraph generation; import a fresh CRG snapshot");
+    } else if (!strcmp(action, "status")) {
+        struct json_object *report = summary(&st);
+        print_json(report);
+        json_object_put(report);
+        rc = 0;
+    } else {
+        rc = query_graph(&st, action, symbol, files, nfiles, base,
+                         depth, limit, tokens);
+    }
+    graph_close(&st);
+    return rc;
+}
