@@ -263,6 +263,9 @@ static bool validate_edge(struct json_object *item) {
 
 /* A publication is all-or-nothing: validate the entire JSONL file and QIHSE
  * KV serialization before replacing the manifest naming the active snapshot. */
+static bool build_native_graph(cg_state *st, size_t expected_nodes,
+                               size_t expected_edges, size_t expected_unresolved);
+
 static int import_snapshot(cg_state *st, const char *input) {
     char lock_path[PATH_MAX], manifest_path[PATH_MAX];
     snprintf(lock_path, sizeof(lock_path), "%s/.import.lock", st->directory);
@@ -374,6 +377,13 @@ static int import_snapshot(cg_state *st, const char *input) {
     json_object_put(end);
     if (!ok) { json_object_put(meta); close(lfd);
         return error_json("failed to publish verified metadata in QIHSE KV"); }
+    /* Reject dangling authoritative endpoints before publishing a generation.
+     * The QIHSE graph itself is constructed using the same native validator
+     * as a subsequent review query. */
+    if (!build_native_graph(st, nodes, edges, unresolved)) {
+        json_object_put(meta); close(lfd);
+        return error_json("invalid CodeGraph structural endpoints or adjacency");
+    }
 
     char name[128], published[PATH_MAX], temporary[PATH_MAX];
     snprintf(name, sizeof(name), "graph-%s-%ld.kv", input_hash, (long)getpid());
@@ -504,6 +514,28 @@ static bool edges_from_kv(const char *key, const char *value, void *user) {
     return st->edges != SIZE_MAX;
 }
 
+static bool build_native_graph(cg_state *st, size_t expected_nodes,
+                               size_t expected_edges, size_t expected_unresolved) {
+    if (st->graph) return false;
+    st->graph = qihse_graph_create();
+    if (!st->graph ||
+        !qihse_kv_foreach_user(st->kv, NULL, nodes_from_kv, st) ||
+        st->capacity == SIZE_MAX || st->nn != expected_nodes)
+        return false;
+    qsort(st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
+    st->by_vertex = calloc(st->nn + 2, sizeof(*st->by_vertex));
+    if (!st->by_vertex) return false;
+    for (size_t i = 0; i < st->nn; ++i) {
+        if (st->nodes[i].vertex > st->nn) return false;
+        if (i > 0 && strcmp(st->nodes[i - 1].id, st->nodes[i].id) == 0)
+            return false;
+        st->by_vertex[st->nodes[i].vertex] = &st->nodes[i];
+    }
+    return qihse_kv_foreach_user(st->kv, NULL, edges_from_kv, st) &&
+           st->edges != SIZE_MAX && st->edges == expected_edges &&
+           st->unresolved == expected_unresolved;
+}
+
 static struct json_object *read_json_file(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return NULL;
@@ -559,21 +591,10 @@ static bool load_snapshot(cg_state *st) {
               json_num(trailer, "unresolved_edges");
     if (trailer) json_object_put(trailer);
     if (!ok) return false;
-    st->graph = qihse_graph_create();
-    if (!st->graph || !qihse_kv_foreach_user(st->kv, NULL, nodes_from_kv, st) ||
-        st->capacity == SIZE_MAX ||
-        st->nn != (size_t)json_num(st->manifest, "nodes")) return false;
-    qsort(st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
-    st->by_vertex = calloc(st->nn + 2, sizeof(*st->by_vertex));
-    if (!st->by_vertex) return false;
-    for (size_t i = 0; i < st->nn; ++i) {
-        if (st->nodes[i].vertex > st->nn) return false;
-        st->by_vertex[st->nodes[i].vertex] = &st->nodes[i];
-    }
-    return qihse_kv_foreach_user(st->kv, NULL, edges_from_kv, st) &&
-           st->edges != SIZE_MAX &&
-           st->edges == (size_t)json_num(st->manifest, "edges") &&
-           st->unresolved == (size_t)json_num(st->manifest, "unresolved_edges");
+    return build_native_graph(st,
+        (size_t)json_num(st->manifest, "nodes"),
+        (size_t)json_num(st->manifest, "edges"),
+        (size_t)json_num(st->manifest, "unresolved_edges"));
 }
 
 /* Git metadata is compared at request time. A changed HEAD, staged work or
