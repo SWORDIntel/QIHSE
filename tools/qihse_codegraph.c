@@ -644,17 +644,31 @@ static bool freshness(cg_state *st, const char **reason) {
     const char *const status_args[] = {"git", "--no-optional-locks",
                                       "status", "--porcelain=v1", "-z",
                                       "--untracked-files=normal", NULL};
-    unsigned char *head = NULL, *worktree = NULL;
-    size_t nhead = 0, nstatus = 0;
+    const char *const diff_args[] = {"git", "--no-optional-locks",
+                                    "diff", "--no-ext-diff", "--no-textconv",
+                                    "--binary", "HEAD", "--", NULL};
+    unsigned char *head = NULL, *worktree = NULL, *diff = NULL;
+    size_t nhead = 0, nstatus = 0, ndiff = 0;
     if (!git_capture(st->repository, head_args, &head, &nhead) ||
-        !git_capture(st->repository, status_args, &worktree, &nstatus)) {
-        free(head); free(worktree);
-        *reason = "git verification unavailable";
+        !git_capture(st->repository, status_args, &worktree, &nstatus) ||
+        !git_capture(st->repository, diff_args, &diff, &ndiff)) {
+        free(head); free(worktree); free(diff);
+        *reason = "git status/diff verification unavailable or too large";
         return false;
     }
     while (nhead && (head[nhead - 1] == '\n' || head[nhead - 1] == '\r')) nhead--;
-    char status_hash[65];
-    bool ok = sha256_buffer((const char *)worktree, nstatus, status_hash);
+    /* Match CRG's exact digest: SHA256(status + NUL + tracked diff).
+     * Comparing porcelain status alone misses edits to already-dirty files. */
+    char status_hash[65] = {0};
+    unsigned char sum[32]; unsigned int n = 0;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    bool ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
+    if (ok) ok = EVP_DigestUpdate(ctx, worktree, nstatus) == 1 &&
+                 EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
+                 EVP_DigestUpdate(ctx, diff, ndiff) == 1 &&
+                 EVP_DigestFinal_ex(ctx, sum, &n) == 1 && n == 32;
+    EVP_MD_CTX_free(ctx);
+    if (ok) digest_hex(sum, n, status_hash);
     char *baseline = json_string(st->manifest, "head");
     char *stored_worktree = json_string(st->manifest, "worktree");
     if (!ok || !baseline || !stored_worktree ||
@@ -663,7 +677,7 @@ static bool freshness(cg_state *st, const char **reason) {
         *reason = "repository changed since index publication";
         ok = false;
     }
-    free(head); free(worktree);
+    free(head); free(worktree); free(diff);
     return ok;
 }
 static struct json_object *summary(cg_state *st) {
