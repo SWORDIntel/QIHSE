@@ -98,6 +98,12 @@ def main():
 
         source = root / "graph.jsonl"
         snapshot(repo, source)
+        # The exporter might complete, then someone edits a source file
+        # before native import. Publication must fail closed.
+        (repo / "src/a.c").write_text("int target(void) { return 2; }\n")
+        late = invoke("import", "--input", str(source), expect=1)
+        assert "source changed" in late["error"], late
+        git(repo, "checkout", "--", "src/a.c")
         published = invoke("import", "--input", str(source))
         assert published["status"] == "published" and published["nodes"] == 3
         summary = invoke("status")
