@@ -1345,3 +1345,16 @@ qihse_vfs.so: $(SRCS_VFS) persistence/qihse_file_posix.c libqihse.so
 test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 	$(CC) $(CFLAGS) -o $@ tests/test_sqlite_vfs.c ./qihse_vfs.so \
 	    -L. -lqihse $$(pkg-config --cflags --libs sqlite3) -Wl,-rpath,'$$ORIGIN'
+
+
+# CodeGraph: optional native C review engine using QIHSE graph + KV snapshots.
+# Only requires json-c and OpenSSL in addition to the existing QIHSE library.
+# This is NOT linked into HAX and adds no mandatory dependency to libqihse.so.
+.PHONY: test-codegraph
+qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include \
+	  $< -o $@ -L. -lqihse $(pkg-config --cflags --libs json-c openssl) \
+	  $(LDFLAGS) -Wl,-rpath,'$ORIGIN'
+
+test-codegraph: qihse-codegraph
+	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph

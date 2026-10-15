@@ -309,6 +309,18 @@ root — summarized here so you do not have to read them):
 | [ZCODE_SESSION_RECOVERY.md](ZCODE_SESSION_RECOVERY.md) | Reconstructed agent-session context (2026-09-17) after the session database was lost — forensic artifact, not project docs. |
 | [SESSION_DELIVERY_UPGRADES.md](SESSION_DELIVERY_UPGRADES.md) | Design/landing notes for the session-delivery upgrades U1–U9 (2026-09-11); as-built detail lives in `docs/architecture/session_delivery.md`. |
 
+## Native structural CodeGraph (optional)
+
+The optional qihse-codegraph CLI ingests canonical structural snapshots from
+code-review-graph into immutable QIHSE KV generations, builds indexed native
+graph adjacency, and provides bounded query/impact/review/context results to
+HAX and other local tools. This is separate from the QIHSE AIMEM session
+recall and KEYSTONE/tgrep text search. Uncertain graph edges are retained
+without being treated as verified relationships; stale indexes fail closed.
+
+Build/test: `make qihse-codegraph && make test-codegraph`.
+Details: [Native CodeGraph architecture](docs/architecture/codegraph_native.md).
+
 ## Agent quickstart
 
 If you are an AI agent working in this repository, orient in this order:

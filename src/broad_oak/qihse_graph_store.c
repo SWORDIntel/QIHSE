@@ -100,6 +100,26 @@ static void simap_remove_id(str_id_map_t* m, const char* key, uint64_t id) {
     }
 }
 
+/* Preserve monotonic edge-ID ordering on adjacency removal. The general
+ * label/property index deliberately uses swap-delete instead. */
+static void simap_remove_sorted(str_id_map_t* m, const char* key, uint64_t id) {
+    id_set_t* b = simap_get(m, key);
+    if (!b) return;
+    for (size_t i = 0; i < b->count; ++i) {
+        if (b->ids[i] == id) {
+            if (i + 1 < b->count)
+                memmove(&b->ids[i], &b->ids[i + 1],
+                        (b->count - i - 1) * sizeof(*b->ids));
+            b->count--;
+            return;
+        }
+    }
+}
+
+static void vertex_key(uint64_t id, char buf[32]) {
+    snprintf(buf, 32, "%llu", (unsigned long long)id);
+}
+
 static void simap_destroy(str_id_map_t* m) {
     for (size_t i = 0; i < m->num_buckets; ++i) {
         if (m->buckets[i].key) {
@@ -229,6 +249,9 @@ struct qihse_graph_s {
 
     str_id_map_t label_index;
     str_id_map_t edge_type_index;
+    /* Incident-edge indexes: O(degree) neighbor enumeration rather than O(E). */
+    str_id_map_t outgoing_edges;
+    str_id_map_t incoming_edges;
     prop_map_t prop_index;
 
     qihse_arena_t* arena; /* scratch arena for returned transient objects */
@@ -356,6 +379,8 @@ qihse_graph_t* qihse_graph_create(void) {
     g->next_edge_id = 1;
     simap_init(&g->label_index, 256);
     simap_init(&g->edge_type_index, 256);
+    simap_init(&g->outgoing_edges, 256);
+    simap_init(&g->incoming_edges, 256);
     pmap_init(&g->prop_index, 256);
     g->arena = qihse_arena_create(65536);
     return g;
@@ -368,6 +393,8 @@ void qihse_graph_destroy(qihse_graph_t* g) {
     free(g->vertices); free(g->edges);
     simap_destroy(&g->label_index);
     simap_destroy(&g->edge_type_index);
+    simap_destroy(&g->outgoing_edges);
+    simap_destroy(&g->incoming_edges);
     pmap_destroy(&g->prop_index);
     if (g->arena) qihse_arena_destroy(g->arena);
     pthread_rwlock_destroy(&g->lock);
@@ -531,12 +558,16 @@ bool qihse_graph_vertex_delete(qihse_graph_t* g, uint64_t vertex_id) {
     if (!slot || !*slot) { pthread_rwlock_unlock(&g->lock); return false; }
     graph_vertex_t* v = *slot;
 
-    /* delete all connected edges */
-    for (size_t i = 0; i < g->e_cap; ++i) {
-        graph_edge_t* e = g->edges[i];
-        if (e && (e->start_vertex_id == vertex_id || e->end_vertex_id == vertex_id))
-            qihse_graph_edge_delete_locked(g, e->id);
-    }
+    /* Delete only incident edges; edge_delete_locked updates both indexes.
+     * Re-read the set after each deletion to handle self-loops safely. */
+    char vk[32];
+    vertex_key(vertex_id, vk);
+    id_set_t* edges = simap_get(&g->outgoing_edges, vk);
+    while (edges && edges->count > 0)
+        qihse_graph_edge_delete_locked(g, edges->ids[edges->count - 1]);
+    edges = simap_get(&g->incoming_edges, vk);
+    while (edges && edges->count > 0)
+        qihse_graph_edge_delete_locked(g, edges->ids[edges->count - 1]);
     /* remove from label index */
     for (size_t i = 0; i < v->num_labels; ++i)
         simap_remove_id(&g->label_index, v->labels[i], vertex_id);
@@ -583,6 +614,11 @@ uint64_t qihse_graph_edge_create(qihse_graph_t* g, const char* type,
     }
     g->edges[id] = e;
     simap_add(&g->edge_type_index, type, id);
+    char from[32], to[32];
+    vertex_key(start, from);
+    vertex_key(end, to);
+    simap_add(&g->outgoing_edges, from, id);
+    simap_add(&g->incoming_edges, to, id);
     pthread_rwlock_unlock(&g->lock);
     return id;
 }
@@ -666,6 +702,11 @@ static bool qihse_graph_edge_delete_locked(qihse_graph_t* g, uint64_t edge_id) {
     if (!slot || !*slot) return false;
     graph_edge_t* e = *slot;
     simap_remove_id(&g->edge_type_index, e->type, edge_id);
+    char from[32], to[32];
+    vertex_key(e->start_vertex_id, from);
+    vertex_key(e->end_vertex_id, to);
+    simap_remove_sorted(&g->outgoing_edges, from, edge_id);
+    simap_remove_sorted(&g->incoming_edges, to, edge_id);
     graph_edge_free(e);
     g->edges[edge_id] = NULL;
     return true;
@@ -688,30 +729,55 @@ size_t qihse_graph_get_neighbors(qihse_graph_t* g, uint64_t vertex_id,
     if (!g || !out || max_out == 0) return 0;
     pthread_rwlock_rdlock(&g->lock);
     if (vertex_id >= g->v_cap || !g->vertices[vertex_id]) {
-        pthread_rwlock_unlock(&g->lock); return 0;
+        pthread_rwlock_unlock(&g->lock);
+        return 0;
     }
-    size_t n = 0;
-    for (size_t i = 0; i < g->e_cap && n < max_out; ++i) {
-        graph_edge_t* e = g->edges[i];
-        if (!e) continue;
+    char key[32];
+    vertex_key(vertex_id, key);
+    id_set_t* out_set = simap_get(&g->outgoing_edges, key);
+    id_set_t* in_set = simap_get(&g->incoming_edges, key);
+    const size_t nout = out_set ? out_set->count : 0;
+    const size_t nin = in_set ? in_set->count : 0;
+    size_t oi = 0, ii = 0, count = 0;
+
+    /* Both adjacency sets are ordered by monotonically allocated edge ID.
+     * Merge them to preserve the old scan-order contract. A self-loop is
+     * reported once, as outgoing, exactly as the former implementation. */
+    while (count < max_out &&
+           ((direction != GRAPH_DIR_INCOMING && oi < nout) ||
+            (direction != GRAPH_DIR_OUTGOING && ii < nin))) {
+        uint64_t oid = oi < nout ? out_set->ids[oi] : UINT64_MAX;
+        uint64_t iid = ii < nin ? in_set->ids[ii] : UINT64_MAX;
         graph_dir_t dir;
-        uint64_t neighbor;
-        if (e->start_vertex_id == vertex_id) {
-            dir = GRAPH_DIR_OUTGOING; neighbor = e->end_vertex_id;
-        } else if (e->end_vertex_id == vertex_id) {
-            dir = GRAPH_DIR_INCOMING; neighbor = e->start_vertex_id;
-        } else continue;
-        if (direction != GRAPH_DIR_BOTH && direction != dir) continue;
-        if (edge_type_filter && strcmp(e->type, edge_type_filter) != 0) continue;
-        out[n].edge_id = e->id;
-        out[n].direction = dir;
-        out[n].neighbor_id = neighbor;
-        strncpy(out[n].edge_type, e->type, sizeof(out[n].edge_type) - 1);
-        out[n].edge_type[sizeof(out[n].edge_type) - 1] = '\0';
-        n++;
+        uint64_t edge_id;
+        if (direction == GRAPH_DIR_OUTGOING ||
+            (direction == GRAPH_DIR_BOTH && oid <= iid)) {
+            dir = GRAPH_DIR_OUTGOING;
+            edge_id = oid;
+            oi++;
+            if (direction == GRAPH_DIR_BOTH && oid == iid) ii++;
+        } else {
+            dir = GRAPH_DIR_INCOMING;
+            edge_id = iid;
+            ii++;
+        }
+        if (edge_id >= g->e_cap) continue;
+        graph_edge_t* edge = g->edges[edge_id];
+        if (!edge) continue;
+        /* Self-loops were previously considered outgoing only. */
+        if (dir == GRAPH_DIR_INCOMING && edge->start_vertex_id == vertex_id)
+            continue;
+        if (edge_type_filter && strcmp(edge->type, edge_type_filter) != 0)
+            continue;
+        graph_adj_t* slot = &out[count++];
+        slot->edge_id = edge->id;
+        slot->direction = dir;
+        slot->neighbor_id = dir == GRAPH_DIR_OUTGOING ?
+                            edge->end_vertex_id : edge->start_vertex_id;
+        snprintf(slot->edge_type, sizeof(slot->edge_type), "%s", edge->type);
     }
     pthread_rwlock_unlock(&g->lock);
-    return n;
+    return count;
 }
 
 size_t qihse_graph_get_vertices_by_label(qihse_graph_t* g, const char* label,
