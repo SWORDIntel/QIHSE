@@ -22,10 +22,12 @@ def node_id(key: str) -> str:
 
 def snapshot(repo: Path, dest: Path) -> None:
     head = git(repo, "rev-parse", "HEAD").strip().decode()
+    selected = ("--", ".", ":(exclude).code-review-graph")
     worktree = hashlib.sha256(
-        git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=normal") +
-        b"\0" +
-        git(repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--")
+        git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=normal",
+            *selected) + b"\0" +
+        git(repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD",
+            *selected)
     ).hexdigest()
     header = {"t": "h", "format": "qihse-codegraph-v1", "version": 1,
               "head": head, "worktree": worktree}
