@@ -437,6 +437,38 @@ static void test_ingest_edges_jsonl(void) {
     PASS();
 }
 
+static void test_indexed_incident_edges(void) {
+    TEST("indexed adjacency: ordering, deletion, direction and self-loop");
+    qihse_graph_t* g = qihse_graph_create();
+    ASSERT(g != NULL, "graph alloc");
+    uint64_t a = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t b = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t c = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t one = qihse_graph_edge_create(g, "CALLS", a, b, NULL, NULL, 0);
+    uint64_t two = qihse_graph_edge_create(g, "IMPORTS_FROM", c, a, NULL, NULL, 0);
+    uint64_t three = qihse_graph_edge_create(g, "CALLS", a, c, NULL, NULL, 0);
+    uint64_t loop = qihse_graph_edge_create(g, "CALLS", a, a, NULL, NULL, 0);
+    graph_adj_t out[12];
+    size_t count = qihse_graph_get_neighbors(g, a, GRAPH_DIR_BOTH, NULL, out, 12);
+    ASSERT(count == 4, "all incident edges returned once");
+    ASSERT(out[0].edge_id == one && out[1].edge_id == two &&
+           out[2].edge_id == three && out[3].edge_id == loop,
+           "old edge-ID order is preserved");
+    count = qihse_graph_get_neighbors(g, a, GRAPH_DIR_INCOMING, NULL, out, 12);
+    ASSERT(count == 1 && out[0].edge_id == two, "incoming excludes self-loop");
+    count = qihse_graph_get_neighbors(g, a, GRAPH_DIR_OUTGOING, "CALLS", out, 12);
+    ASSERT(count == 3, "outgoing type-filter includes self-loop");
+    ASSERT(qihse_graph_edge_delete(g, one), "delete edge");
+    count = qihse_graph_get_neighbors(g, a, GRAPH_DIR_BOTH, NULL, out, 12);
+    ASSERT(count == 3 && out[0].edge_id == two, "index updated after edge delete");
+    ASSERT(qihse_graph_vertex_delete(g, a), "delete vertex");
+    ASSERT(qihse_graph_edge_count(g) == 0, "all incident edges removed");
+    count = qihse_graph_get_neighbors(g, b, GRAPH_DIR_BOTH, NULL, out, 12);
+    ASSERT(count == 0, "no stale neighbors after vertex delete");
+    qihse_graph_destroy(g);
+    PASS();
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -447,6 +479,7 @@ int main(void) {
     
     test_vertex_crud();
     test_edge_crud();
+    test_indexed_incident_edges();
     test_label_index();
     test_bfs();
     test_dijkstra();
