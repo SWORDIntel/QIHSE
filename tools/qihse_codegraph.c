@@ -261,6 +261,7 @@ static bool validate_edge(struct json_object *item) {
  * KV serialization before replacing the manifest naming the active snapshot. */
 static bool build_native_graph(cg_state *st, size_t expected_nodes,
                                size_t expected_edges, size_t expected_unresolved);
+static bool freshness(cg_state *st, const char **reason);
 
 static int import_snapshot(cg_state *st, const char *input) {
     char lock_path[PATH_MAX], manifest_path[PATH_MAX];
@@ -379,6 +380,19 @@ static int import_snapshot(cg_state *st, const char *input) {
     if (!build_native_graph(st, nodes, edges, unresolved)) {
         json_object_put(meta); close(lfd);
         return error_json("invalid CodeGraph structural endpoints or adjacency");
+    }
+    /* The source may change between CRG export and QIHSE import. Verify the
+     * very same HEAD + porcelain + content-diff identity before publishing. */
+    st->manifest = json_object_new_object();
+    json_text(st->manifest, "head", json_string(meta, "head"));
+    json_text(st->manifest, "worktree", json_string(meta, "worktree"));
+    const char *stale_reason = NULL;
+    bool current = freshness(st, &stale_reason);
+    json_object_put(st->manifest);
+    st->manifest = NULL;
+    if (!current) {
+        json_object_put(meta); close(lfd);
+        return error_json("source changed since CRG export; rebuild before import");
     }
 
     char name[128], published[PATH_MAX], temporary[PATH_MAX];
