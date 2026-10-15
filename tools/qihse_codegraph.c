@@ -643,10 +643,12 @@ static bool freshness(cg_state *st, const char **reason) {
                                     "rev-parse", "--verify", "HEAD", NULL};
     const char *const status_args[] = {"git", "--no-optional-locks",
                                       "status", "--porcelain=v1", "-z",
-                                      "--untracked-files=normal", NULL};
+                                      "--untracked-files=normal", "--", ".",
+                                      ":(exclude).code-review-graph", NULL};
     const char *const diff_args[] = {"git", "--no-optional-locks",
                                     "diff", "--no-ext-diff", "--no-textconv",
-                                    "--binary", "HEAD", "--", NULL};
+                                    "--binary", "HEAD", "--", ".",
+                                    ":(exclude).code-review-graph", NULL};
     unsigned char *head = NULL, *worktree = NULL, *diff = NULL;
     size_t nhead = 0, nstatus = 0, ndiff = 0;
     if (!git_capture(st->repository, head_args, &head, &nhead) ||
