@@ -23,7 +23,9 @@ def node_id(key: str) -> str:
 def snapshot(repo: Path, dest: Path) -> None:
     head = git(repo, "rev-parse", "HEAD").strip().decode()
     worktree = hashlib.sha256(
-        git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+        git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=normal") +
+        b"\0" +
+        git(repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--")
     ).hexdigest()
     header = {"t": "h", "format": "qihse-codegraph-v1", "version": 1,
               "head": head, "worktree": worktree}
@@ -111,6 +113,21 @@ def main():
         refused = invoke("review", "--symbol", "target", expect=2)
         assert "stale" in refused["error"]
         git(repo, "checkout", "--", "src/a.c")
+        assert invoke("status")["fresh"] is True
+
+        # A pre-existing dirty file can be edited again without changing the
+        # porcelain filename/status row. Tracked diff content must still make
+        # the graph stale (rather than silently claim correctness).
+        (repo / "src/a.c").write_text("int target(void) { return 3; }\n")
+        snapshot(repo, source)
+        invoke("import", "--input", str(source))
+        assert invoke("status")["fresh"] is True
+        (repo / "src/a.c").write_text("int target(void) { return 4; }\n")
+        assert invoke("status")["fresh"] is False
+        git(repo, "checkout", "--", "src/a.c")
+        # Rebase on the published clean source for the next rollback test.
+        snapshot(repo, source)
+        invoke("import", "--input", str(source))
         assert invoke("status")["fresh"] is True
 
         # Reject a corrupt import without replacing the published generation.
