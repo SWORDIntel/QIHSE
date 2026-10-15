@@ -253,11 +253,7 @@ static bool validate_edge(struct json_object *item) {
            json_double(item, "confidence") <= 1.0 &&
            (!traversable || (hex64(src) && hex64(dst) && tier &&
                              strcmp(resolution, "direct") == 0 &&
-                             strcmp(tier, "UNKNOWN") != 0 &&
-                             strcmp(tier, "HEURISTIC") != 0 &&
-                             strcmp(tier, "INFERRED") != 0 &&
-                             strcmp(tier, "AMBIGUOUS") != 0 &&
-                             strcmp(tier, "UNRESOLVED") != 0 &&
+                             strcmp(tier, "EXTRACTED") == 0 &&
                              json_double(item, "confidence") >= 0.8));
 }
 
