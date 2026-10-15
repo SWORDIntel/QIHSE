@@ -908,6 +908,8 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
             }
         }
     }
+    if (!symbol && nfiles == 0 && base)
+        json_text(report, "scope", "no changed files at selected Git base");
     json_int(report, "seed_nodes", (int64_t)seeds);
     json_int(report, "shown_nodes", (int64_t)shown);
     json_int(report, "depth", depth);
@@ -969,6 +971,11 @@ int main(int argc, char **argv) {
     if (strcmp(action, "import") && strcmp(action, "status") &&
         strcmp(action, "query") && strcmp(action, "impact") &&
         strcmp(action, "review") && strcmp(action, "context")) return usage();
+    /* Bare impact/review means "changed since HEAD", never whole-repo
+     * pseudo-review with no seeds. Graph context requires an explicit seed. */
+    if (!symbol && !base && !nfiles &&
+        (!strcmp(action, "impact") || !strcmp(action, "review")))
+        base = "HEAD";
     if (tokens < 128 || tokens > 16000 || limit == 0 || limit > 256 ||
         depth < 1 || depth > 5) return usage();
     cg_state st;
