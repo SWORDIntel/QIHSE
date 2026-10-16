@@ -17,6 +17,7 @@ lib/
 /tests/qihse_*_test
 /tests/test_*
 !/tests/*.c
+/tests/bench_*
 /tests/test_aggregate_hardened
 /tests/test_auth_privilege_boundary
 /tests/test_object_acl
@@ -83,6 +84,7 @@ lib/
 /qihse-cluster-daemon
 /qihse-redis-server
 /qihse-codegraph
+/qihse-machine-token
 
 # Rust build output
 /rust/qihse-rs/target/

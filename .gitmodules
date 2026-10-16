@@ -8,3 +8,4 @@
 [submodule "vendor/oqs-provider"]
 	path = vendor/oqs-provider
 	url = https://github.com/open-quantum-safe/oqs-provider.git
+	ignore = dirty
