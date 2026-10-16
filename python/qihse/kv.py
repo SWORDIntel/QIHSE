@@ -61,6 +61,16 @@ _lib.qihse_kv_foreach_user.argtypes = [
     ctypes.c_void_p,
 ]
 _lib.qihse_kv_foreach_user.restype = ctypes.c_bool
+_foreach_prefix_native = getattr(_lib, "qihse_kv_foreach_prefix_user", None)
+if _foreach_prefix_native is not None:
+    _foreach_prefix_native.argtypes = [
+        _KVStore_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        _KV_ITER_CB,
+        ctypes.c_void_p,
+    ]
+    _foreach_prefix_native.restype = ctypes.c_bool
 _lib.qihse_kv_clear_user.argtypes = [_KVStore_p, ctypes.c_void_p]
 _lib.qihse_kv_clear_user.restype = ctypes.c_size_t
 _lib.qihse_kv_count_user.argtypes = [_KVStore_p, ctypes.c_void_p]
@@ -146,6 +156,20 @@ class KVStore:
         return bool(_lib.qihse_kv_expire(self._ptr, key.encode("utf-8"), int(ttl_ms), user))
 
     def foreach(self, callback: Callable[[str, str], bool], user=None) -> int:
+        return self._foreach(callback, user=user, prefix=None)
+
+    def foreach_prefix(self, prefix: str,
+                       callback: Callable[[str, str], bool], user=None) -> int:
+        """Enumerate one prefix with native filtering before row authorization."""
+        if not isinstance(prefix, str):
+            raise TypeError("prefix must be a string")
+        if "\x00" in prefix:
+            raise ValueError("prefix cannot contain NUL")
+        if _foreach_prefix_native is None:
+            raise RuntimeError("QIHSE native prefix enumeration is required")
+        return self._foreach(callback, user=user, prefix=prefix)
+
+    def _foreach(self, callback: Callable[[str, str], bool], *, user, prefix) -> int:
         count = [0]
 
         def _cb(key_ptr, value_ptr, _user_data):
@@ -159,7 +183,12 @@ class KVStore:
             return bool(callback(key_raw.decode("utf-8"), value_raw.decode("utf-8")))
 
         c_cb = _KV_ITER_CB(_cb)
-        if not _lib.qihse_kv_foreach_user(self._ptr, user, c_cb, None):
+        if prefix is None:
+            ok = _lib.qihse_kv_foreach_user(self._ptr, user, c_cb, None)
+        else:
+            ok = _foreach_prefix_native(
+                self._ptr, prefix.encode("utf-8"), user, c_cb, None)
+        if not ok:
             raise RuntimeError("KV enumeration failed")
         return count[0]
 
@@ -171,7 +200,10 @@ class KVStore:
                 result.append(key)
             return True
 
-        self.foreach(_cb, user=user)
+        if prefix is None:
+            self.foreach(_cb, user=user)
+        else:
+            self.foreach_prefix(prefix, _cb, user=user)
         return result
 
     def items(self, prefix: str = None, user=None) -> list:
@@ -187,7 +219,10 @@ class KVStore:
                 result.append((key, value))
             return True
 
-        self.foreach(_cb, user=user)
+        if prefix is None:
+            self.foreach(_cb, user=user)
+        else:
+            self.foreach_prefix(prefix, _cb, user=user)
         return result
 
     def iteritems(self, prefix: str = None, user=None):
@@ -223,7 +258,10 @@ class KVStore:
 
         def _run():
             try:
-                self.foreach(_cb, user=user)
+                if prefix is None:
+                    self.foreach(_cb, user=user)
+                else:
+                    self.foreach_prefix(prefix, _cb, user=user)
             except Exception as e:
                 q.put(e)
             finally:

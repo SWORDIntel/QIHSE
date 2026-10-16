@@ -1,6 +1,7 @@
 #include "qihse_keystone.h"
 #include "qihse_crc16.h"
 #include "qihse_audit.h"
+#include "qihse_analysis_artifact.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -629,7 +630,16 @@ bool qihse_keystone_feed_publish(qihse_federation_journal_t* journal,
     /* The write half of the feed is a federation control-plane operation. The
      * index identity holds FEDERATION_READ only, so this is where its write
      * denial is enforced. */
-    if (!qihse_infra_scope_check((void*)publisher, QIHSE_SCOPE_FEDERATION_WRITE)) return false;
+    bool has_write = qihse_infra_scope_check((void*)publisher, QIHSE_SCOPE_FEDERATION_WRITE);
+    if (!has_write &&
+        (strcmp(event_type, "kp14.analysis.artifact") == 0 ||
+         strcmp(event_type, "kp14.analysis.tombstone") == 0)) {
+        if (qihse_auth_can_access_object(publisher, QIHSE_ANALYSIS_PUBLISH_ACL_NAMESPACE,
+                                         record->tenant_id, QIHSE_ACL_WRITE)) {
+            has_write = true;
+        }
+    }
+    if (!has_write) return false;
     /* A publisher may not stamp a record above its own clearance/SCI, nor
      * place it in another tenant's stream. */
     uint32_t publisher_tenant = qihse_user_get_tenant_id(publisher);
@@ -840,6 +850,16 @@ size_t qihse_keystone_feed_denied(const qihse_keystone_feed_t* feed) {
 
 size_t qihse_keystone_feed_malformed(const qihse_keystone_feed_t* feed) {
     return feed ? feed->malformed : 0u;
+}
+
+bool qihse_keystone_feed_freshness(const qihse_keystone_feed_t* feed,
+                                   uint64_t* out_latest,
+                                   uint64_t* out_lag) {
+    if (!feed || !feed->journal) return false;
+    uint64_t len = qihse_federation_journal_length(feed->journal);
+    if (out_latest) *out_latest = len;
+    if (out_lag) *out_lag = (feed->cursor < len) ? (len - feed->cursor) : 0u;
+    return true;
 }
 
 /* ── Cursor persistence, bound to the identity that minted it ──────────── */

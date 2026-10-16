@@ -1312,7 +1312,9 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
     if (authz.role == QIHSE_ROLE_OPERATOR) {
         pthread_rwlock_unlock(&auth_rwlock);
         if (data_classif > 0) {
-            qihse_audit_log("ACCESS_GRANTED_OPERATOR", uid, 0, data_classif, data_sci);
+            /* Counted, not per-record: the signer emits one chained, signed
+             * ACCESS_COUNT summary per (uid, label) window. */
+            qihse_audit_access_granted(uid, data_classif, data_sci);
         }
         return true;
     }
@@ -1332,15 +1334,14 @@ bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint
     }
 
     pthread_rwlock_unlock(&auth_rwlock);
-    /* Only audit-log granted access to classified data, consistent with the
-     * operator path (which logs only when data_classif > 0) and the NULL-user
-     * path (which skips logging for unclassified data).  Logging every row of
-     * an unclassified search would generate one ML-DSA-87 signature per row,
-     * making multi-tenant search impractically slow without adding security
-     * value — unclassified access is already permitted to unauthenticated
-     * callers by design. */
+    /* Granted classified access is counted per (uid, classification, SCI)
+     * window and summarized by the signer as one chained, signed
+     * ACCESS_COUNT record per window — the old per-row record made every
+     * classified KV access an ML-DSA-87 signature plus an fsync, turning
+     * ordinary traffic into megabytes of audit I/O per minute. Denials
+     * above keep per-record logging. */
     if (data_classif > 0 || data_sci != 0) {
-        qihse_audit_log("ACCESS_GRANTED", uid, 0, data_classif, data_sci);
+        qihse_audit_access_granted(uid, data_classif, data_sci);
     }
     return true;
 }

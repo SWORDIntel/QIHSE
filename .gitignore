@@ -99,6 +99,7 @@ lib/
 /tests/qihse_cluster_bootstrap
 /tests/qihse_cluster_node
 /tests/stress_session_delivery
+/tests/qihse_keystone_feed_fixture
 
 # Agent session plans (local working notes)
 /.zcode/

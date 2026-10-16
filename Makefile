@@ -514,12 +514,24 @@ test-backup-auth: lib
 test-controller-sdk-py: lib
 	PYTHONPATH=python LD_LIBRARY_PATH=. python3 -m unittest discover -s python/tests -p test_controller_sdk.py
 
-# KP14 canonical manifest and fail-closed candidate preflight; no durable write.
+test-kp14-artifact-durable: lib
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_durable tests/test_analysis_artifact_durable.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_durable
+
+test-kp14-keystone-integration: lib
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_keystone_integration tests/test_analysis_artifact_keystone_integration.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_keystone_integration
+
+# KP14 canonical manifest, durable store, and Keystone integration tests.
 test-kp14-artifact-contract: lib
 	$(CC) $(CFLAGS) -o tests/test_analysis_artifact tests/test_analysis_artifact.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact
 	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_transaction_gap tests/test_analysis_artifact_transaction_gap.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_transaction_gap
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_durable tests/test_analysis_artifact_durable.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_durable
+	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_keystone_integration tests/test_analysis_artifact_keystone_integration.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_keystone_integration
 
 test: test-kp14-artifact-contract
 

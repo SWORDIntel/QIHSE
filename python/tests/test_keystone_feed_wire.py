@@ -82,6 +82,8 @@ def main() -> int:
             ok("STATUS counts the 3 denials exactly",
                st.denied == 3 and st.malformed == 0, repr(st))
             ok("cursor advanced past the journal", st.cursor > events[-1].offset)
+            latest, lag = feed.freshness()
+            ok("FRESHNESS reports journal latest and lag", latest > 0 and lag == 0)
 
         # §5.1 handshake: a cursor is an END-of-record position (what
         # STATUS/ACK hand back).  Consume exactly one record, checkpoint

@@ -145,6 +145,13 @@ typedef bool (*qihse_kv_iter_cb)(const char* key, const char* value, void* user_
 /* Authorization-aware enumeration. Returns false on compaction/storage failure. */
 bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
                            qihse_kv_iter_cb cb, void* user_data);
+/* Filter keys before authorization and callback.  A NULL principal may see
+ * only unclassified rows under the same access gate as foreach_user.  This
+ * uses the SST metadata index for matching records' disk offsets, avoiding
+ * unrelated SST value reads. It still scans in-memory keys/index metadata. */
+bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
+                                  qihse_user_t* user, qihse_kv_iter_cb cb,
+                                  void* user_data);
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data);
 
 size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user);

@@ -20,6 +20,7 @@
 
 typedef struct blob_entry {
     qihse_blob_info_t info;
+    uint32_t pin_count;
     struct blob_entry* next;
 } blob_entry_t;
 
@@ -115,7 +116,7 @@ static bool blob_log_append(qihse_blob_store_t* store, char op, const qihse_blob
     record[1] = BLOB_INDEX_VERSION;
     record[2] = (unsigned char)op;
     size_t length = 3u;
-    if (op == 'D') {
+    if (op == 'D' || op == 'I' || op == 'O') {
         memcpy(record + length, info->hash, QIHSE_BLOB_HASH_BYTES);
         length += QIHSE_BLOB_HASH_BYTES;
     } else {
@@ -168,10 +169,28 @@ static bool blob_log_replay(qihse_blob_store_t* store) {
             if (valid_end < 0) { ok = false; break; }
             continue;
         }
+        if (header[2] == 'I') {
+            uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+            if (fread(hash, 1, sizeof(hash), f) != sizeof(hash)) { torn = true; break; }
+            blob_entry_t* e = blob_find_entry(store, hash);
+            if (e) e->pin_count++;
+            valid_end = ftello(f);
+            if (valid_end < 0) { ok = false; break; }
+            continue;
+        }
+        if (header[2] == 'O') {
+            uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+            if (fread(hash, 1, sizeof(hash), f) != sizeof(hash)) { torn = true; break; }
+            blob_entry_t* e = blob_find_entry(store, hash);
+            if (e && e->pin_count > 0) e->pin_count--;
+            valid_end = ftello(f);
+            if (valid_end < 0) { ok = false; break; }
+            continue;
+        }
         if (header[2] != 'P' && header[2] != 'R' && header[2] != 'U') { ok = false; break; }
         if (fread(&info, sizeof(info), 1, f) != 1) { torn = true; break; }
         if (info.size > QIHSE_BLOB_MAX_SIZE || info.refcount == 0u ||
-            info.tag == 0u || info.tag > QIHSE_BLOB_TAG_REPL_TRANSACTION ||
+            info.tag == 0u || info.tag > QIHSE_BLOB_TAG_ANALYSIS_ARTIFACT ||
             (info.tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
              info.tenant_id != QIHSE_TENANT_SYSTEM)) {
             ok = false; break;
@@ -301,7 +320,7 @@ static bool blob_put_internal(qihse_blob_store_t* store, uint32_t tenant_id,
         qihse_audit_log("BLOB_DENIED_NULL_OR_DEAD_USER", 0xFFFFFFFFu, 0, classification, sci_compartment);
         return false;
     }
-    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_REPL_TRANSACTION) return false;
+    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_ANALYSIS_ARTIFACT) return false;
     if (tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
         (tenant_id != QIHSE_TENANT_SYSTEM ||
          user_tenant != QIHSE_TENANT_SYSTEM ||
@@ -713,7 +732,7 @@ static bool blob_mutate_ref(qihse_blob_store_t* store, const uint8_t* hash,
         pthread_rwlock_unlock(&store->index_lock);
         return logged;
     }
-    if (!allow_delete) {
+    if (!allow_delete || e->pin_count > 0) {
         pthread_rwlock_unlock(&store->index_lock);
         return false;
     }
@@ -755,6 +774,94 @@ bool qihse_blob_unref_user(qihse_blob_store_t* store, const uint8_t* hash, qihse
 
 bool qihse_blob_delete_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user) {
     return blob_mutate_ref(store, hash, user, -1, true);
+}
+
+bool qihse_blob_pin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user) {
+    if (!store || !hash || !user) return false;
+    uint32_t user_tenant = 0;
+    if (!blob_user_tenant(user, &user_tenant)) return false;
+
+    pthread_rwlock_wrlock(&store->index_lock);
+    if (store->poisoned) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    blob_entry_t* e = blob_find_entry(store, hash);
+    if (!e) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    bool owner = (user_tenant == QIHSE_TENANT_SYSTEM || e->info.tenant_id == user_tenant);
+    if (!owner || !qihse_auth_can_access(user, e->info.classification, e->info.sci_compartment)) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    if (e->pin_count == UINT32_MAX) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    qihse_blob_info_t snapshot = e->info;
+    pthread_mutex_lock(&store->log_lock);
+    bool logged = blob_log_append(store, 'I', &snapshot);
+    pthread_mutex_unlock(&store->log_lock);
+    if (logged) e->pin_count++;
+    pthread_rwlock_unlock(&store->index_lock);
+    return logged;
+}
+
+bool qihse_blob_unpin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user) {
+    if (!store || !hash || !user) return false;
+    uint32_t user_tenant = 0;
+    if (!blob_user_tenant(user, &user_tenant)) return false;
+
+    pthread_rwlock_wrlock(&store->index_lock);
+    if (store->poisoned) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    blob_entry_t* e = blob_find_entry(store, hash);
+    if (!e) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    bool owner = (user_tenant == QIHSE_TENANT_SYSTEM || e->info.tenant_id == user_tenant);
+    if (!owner || !qihse_auth_can_access(user, e->info.classification, e->info.sci_compartment)) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    if (e->pin_count == 0) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    qihse_blob_info_t snapshot = e->info;
+    pthread_mutex_lock(&store->log_lock);
+    bool logged = blob_log_append(store, 'O', &snapshot);
+    pthread_mutex_unlock(&store->log_lock);
+    if (logged) e->pin_count--;
+    pthread_rwlock_unlock(&store->index_lock);
+    return logged;
+}
+
+bool qihse_blob_is_pinned_user(qihse_blob_store_t* store, const uint8_t* hash,
+                               qihse_user_t* user, bool* out_pinned) {
+    if (!store || !hash || !user || !out_pinned) return false;
+    uint32_t user_tenant = 0;
+    if (!blob_user_tenant(user, &user_tenant)) return false;
+
+    pthread_rwlock_rdlock(&store->index_lock);
+    blob_entry_t* e = blob_find_entry(store, hash);
+    if (!e) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    bool owner = (user_tenant == QIHSE_TENANT_SYSTEM || e->info.tenant_id == user_tenant);
+    if (!owner || !qihse_auth_can_access(user, e->info.classification, e->info.sci_compartment)) {
+        pthread_rwlock_unlock(&store->index_lock);
+        return false;
+    }
+    *out_pinned = (e->pin_count > 0);
+    pthread_rwlock_unlock(&store->index_lock);
+    return true;
 }
 
 /* --------------------------------------------------------------------------

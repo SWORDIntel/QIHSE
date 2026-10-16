@@ -66,6 +66,36 @@ static void build_audit_path(char *buf, size_t buflen) {
     build_state_path(buf, buflen, AUDIT_FILE);
 }
 
+#ifndef _WIN32
+/* Distinguish a new directory entry from an append.  The writer lock
+ * serializes QIHSE writers; if the path disappears between the two opens,
+ * fail closed instead of silently creating an unsynced replacement. */
+static int audit_open_live(const char *path, int *created) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        *created = 1;
+        return fd;
+    }
+    if (errno != EEXIST) return -1;
+    *created = 0;
+    return open(path, O_WRONLY | O_APPEND | O_NOFOLLOW);
+}
+
+static int audit_sync_live_directory(const char *path) {
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s", path);
+    char *slash = strrchr(dir_path, '/');
+    if (slash == dir_path) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    else snprintf(dir_path, sizeof(dir_path), ".");
+    int fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    int synced = fsync(fd);
+    int closed = close(fd);
+    return synced == 0 && closed == 0 ? 0 : -1;
+}
+#endif
+
 /* ── Audit log rotation ────────────────────────────────────────────────────
  * Size-threshold rename. The hash chain is logical (last_hash → new_hash,
  * anchored in the integrity-chain file) and NOT file-bound, so rotating the
@@ -301,9 +331,9 @@ static void audit_maybe_rotate(void) {
  * The SHA-384 hash chain is computed synchronously (cheap, and it preserves
  * ordering + tamper-evidence), but the expensive ML-DSA-87 signature and the
  * audit-file / integrity-chain writes are performed by a background signer
- * thread.  qihse_audit_log() therefore no longer pays the ~6.5 ms/entry
- * signing cost on the calling thread, while the emitted records are
- * byte-identical and in the same order as the synchronous implementation.
+ * thread.  Normally qihse_audit_log() does not pay the signing cost on the
+ * calling thread; when the bounded queue fills it waits for signer capacity.
+ * Records remain byte-identical and ordered as in the synchronous path.
  */
 typedef struct audit_pending {
     char buffer[1024];
@@ -313,14 +343,87 @@ typedef struct audit_pending {
 
 static audit_pending_t* g_q_head = NULL;
 static audit_pending_t* g_q_tail = NULL;
+/* Bound queued shutdown work and memory while retaining every chain entry.
+ * Producers wait before advancing last_hash when the signer falls behind. */
+#define AUDIT_PENDING_LIMIT 128u
+static size_t g_q_count = 0u;
 static pthread_cond_t g_q_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_q_empty_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_q_space_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_signer_tid;
 static int g_signer_started = 0;
 static int g_signer_ok = 0;
 static int g_signer_stop = 0;
 static int g_signer_inflight = 0;
 static int g_sync_fallback = 0;
+
+/* ── Granted-access aggregation ────────────────────────────────────────────
+ * qihse_check_access() used to append one signed audit record per granted
+ * classified access. That made every classified KV row an ML-DSA-87
+ * signature plus an fsync — megabytes of audit I/O per minute of ordinary
+ * marketplace traffic — without adding evidence value over a counted
+ * summary. Grants are now counted per (uid, classification, SCI) window and
+ * the signer emits one chained, signed ACCESS_COUNT record per expired
+ * bucket. Denials stay per-record: they are rare and forensically load-
+ * bearing. QIHSE_AUDIT_ACCESS_WINDOW_MS overrides the window (1000..3600000;
+ * floor 1000 because a shorter window would rotate on every burst). */
+#define AUDIT_ACCESS_SLOTS 1024u
+typedef struct access_bucket {
+    uint32_t uid;
+    uint16_t classif;
+    uint16_t sci;
+    uint64_t window_id;   /* wall-clock seconds / window */
+    uint64_t count;
+    uint64_t last_seen;   /* window id of the last increment */
+    int used;
+} access_bucket_t;
+static access_bucket_t g_access_buckets[AUDIT_ACCESS_SLOTS];
+static size_t g_access_used = 0u;
+static uint64_t g_access_window_secs = 5u; /* read from env at first use */
+
+static uint64_t audit_access_window_secs(void) {
+    if (g_access_window_secs) return g_access_window_secs;
+    uint64_t w = 5u;
+    const char* env = getenv("QIHSE_AUDIT_ACCESS_WINDOW_MS");
+    if (env && *env) {
+        char* end = NULL;
+        unsigned long long ms = strtoull(env, &end, 10);
+        if (end && *end == '\0' && ms >= 1000u && ms <= 3600000000ull)
+            w = ms / 1000u;
+        if (w == 0u) w = 1u;
+    }
+    g_access_window_secs = w;
+    return w;
+}
+
+static size_t access_bucket_index(uint32_t uid, uint16_t classif,
+                                  uint16_t sci, uint64_t window_id) {
+    uint32_t h = uid * 0x9E3779B9u;
+    h ^= (uint32_t)classif * 0x85EBCA6Bu;
+    h ^= (uint32_t)sci * 0xC2B2AE35u;
+    h ^= (uint32_t)(window_id ^ (window_id >> 32));
+    h ^= h >> 15;
+    return (size_t)(h % AUDIT_ACCESS_SLOTS);
+}
+
+/* Snapshot expired buckets into out[]. Caller holds audit_mutex. */
+static size_t access_collect_expired_locked(access_bucket_t* out,
+                                            size_t cap, uint64_t now_window,
+                                            int flush_all) {
+    size_t n = 0u;
+    for (size_t i = 0; i < AUDIT_ACCESS_SLOTS && n < cap; ++i) {
+        access_bucket_t* b = &g_access_buckets[i];
+        if (!b->used) continue;
+        if (!flush_all && b->window_id + g_access_window_secs > now_window)
+            continue;
+        out[n++] = *b;
+        b->used = 0;
+        b->count = 0;
+        g_access_used--;
+    }
+    return n;
+}
+
 #ifndef _WIN32
 /* One kernel-held lock covers log rotation, append and chain-tip publication.
  * A forked child closes its inherited descriptor and must initialize afresh. */
@@ -335,6 +438,11 @@ static int audit_recovery_context_ready = 0;
 static void* audit_signer_main(void* arg);
 
 static void audit_register_atfork(void);
+
+/* Granted-access aggregation forward declarations. */
+static void access_emit_sync(const access_bucket_t* b);
+void qihse_audit_access_granted(uint32_t user_id, uint16_t classif, uint16_t sci);
+static size_t access_emit_via_queue(int flush_all);
 
 static void audit_ensure_signer_locked(void) {
     if (!g_signer_started) {
@@ -364,7 +472,7 @@ static void audit_atfork_prepare(void) {
      * disk before the address space splits. */
     while (g_sync_fallback ||
            ((g_q_head || g_signer_inflight || g_ping_pending) &&
-            g_signer_ok && !g_signer_stop)) {
+            g_signer_ok)) {
         pthread_mutex_unlock(&audit_mutex);
         usleep(1000);
         pthread_mutex_lock(&audit_mutex);
@@ -379,6 +487,7 @@ static void audit_atfork_child(void) {
     /* The signer is gone; keep the child inert until exclusive reinit. */
     g_q_head = NULL;
     g_q_tail = NULL;
+    g_q_count = 0u;
     g_signer_inflight = 0;
     g_sync_fallback = 0;
     g_ping_pending = 0;
@@ -719,7 +828,7 @@ void qihse_audit_verify_integrity(void) {
 #ifndef _WIN32
     pthread_mutex_lock(&audit_mutex);
     while (g_sync_fallback ||
-           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop))
+           ((g_q_head || g_signer_inflight) && g_signer_ok))
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     if (!audit_recovery_context_ready || audit_writer_lock_fd < 0)
         audit_integrity_error("audit recovery has no authenticated context");
@@ -816,7 +925,7 @@ void qihse_audit_init(void) {
     pthread_mutex_lock(&audit_mutex);
 #ifndef _WIN32
     while (g_sync_fallback ||
-           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop))
+           ((g_q_head || g_signer_inflight) && g_signer_ok))
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     /* Validate and restore the last durable tip before rotating, pruning or
      * appending the startup banner. A strict mismatch aborts before mutation. */
@@ -872,7 +981,8 @@ void qihse_audit_init(void) {
     audit_maybe_rotate();
 #endif
 #ifndef _WIN32
-    int banner_fd = open(apath, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    int banner_created = 0;
+    int banner_fd = audit_open_live(apath, &banner_created);
     if (banner_fd >= 0 && fchmod(banner_fd, 0600) != 0) {
         close(banner_fd);
         banner_fd = -1;
@@ -896,7 +1006,13 @@ void qihse_audit_init(void) {
         int synced = flushed;
 #endif
         int closed = fclose(f);
-        if (!banner_written || flushed != 0 || synced != 0 || closed != 0) {
+        int directory_synced = 1;
+#ifndef _WIN32
+        if (banner_created && flushed == 0 && synced == 0 && closed == 0)
+            directory_synced = audit_sync_live_directory(apath) == 0;
+#endif
+        if (!banner_written || flushed != 0 || synced != 0 || closed != 0 ||
+            !directory_synced) {
             fprintf(stderr, "[QIHSE AUDIT] Startup banner could not be persisted.\n");
             abort();
         }
@@ -904,9 +1020,9 @@ void qihse_audit_init(void) {
         fprintf(stderr, "[QIHSE AUDIT] Audit log could not be opened.\n");
         abort();
     }
-    /* Start the background signer so qihse_audit_log() never blocks on the
-     * ~6.5 ms/entry ML-DSA-87 signing path.  If the thread cannot start, the
-     * log path transparently falls back to synchronous signing. */
+    /* Start the background signer to remove ML-DSA-87 signing from the normal
+     * caller path. A full queue applies backpressure; signer startup failure
+     * falls back to synchronous signing. */
     audit_ensure_signer_locked();
     pthread_mutex_unlock(&audit_mutex);
 }
@@ -939,7 +1055,8 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     audit_maybe_rotate();
     char apath2[512];
     build_audit_path(apath2, sizeof(apath2));
-    int afd = open(apath2, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    int audit_created = 0;
+    int afd = audit_open_live(apath2, &audit_created);
     if (afd >= 0 && fchmod(afd, 0600) != 0) {
         close(afd);
         afd = -1;
@@ -971,22 +1088,11 @@ static void audit_sign_and_write(const char* buffer, const char* new_hash) {
     }
 #ifndef _WIN32
     if (afd >= 0 && !f) close(afd);
-    if (log_durable) {
-        /* The append is durable only after its directory entry survives a
-         * crash too, including a newly created live file after rotation. */
-        char dir_path[sizeof(apath2)];
-        snprintf(dir_path, sizeof(dir_path), "%s", apath2);
-        char *slash = strrchr(dir_path, '/');
-        if (slash == dir_path) slash[1] = '\0';
-        else if (slash) *slash = '\0';
-        else snprintf(dir_path, sizeof(dir_path), ".");
-        int dfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-        if (dfd < 0) log_durable = 0;
-        else {
-            if (fsync(dfd) != 0) log_durable = 0;
-            if (close(dfd) != 0) log_durable = 0;
-        }
-    }
+    /* An append changes file contents, not its directory entry.  Rotation
+     * syncs both rename and re-creation above; only an unexpected new live
+     * file needs a directory sync before publishing the chain tip. */
+    if (log_durable && audit_created &&
+        audit_sync_live_directory(apath2) != 0) log_durable = 0;
 #endif
 
     /* Never publish a chain tip for a record that was not durably appended.
@@ -1004,15 +1110,34 @@ static void* audit_signer_main(void* arg) {
     for (;;) {
         pthread_mutex_lock(&audit_mutex);
         while (!g_q_head && !g_ping_pending && !g_signer_stop) {
-            pthread_cond_wait(&g_q_cond, &audit_mutex);
+            /* One-second tick: an idle signer still expires access buckets
+             * so counted evidence lands promptly after each window. */
+            struct timespec tick;
+            clock_gettime(CLOCK_REALTIME, &tick);
+            tick.tv_sec += 1;
+            pthread_cond_timedwait(&g_q_cond, &audit_mutex, &tick);
         }
         if (!g_q_head && !g_ping_pending && g_signer_stop) {
             pthread_mutex_unlock(&audit_mutex);
             return NULL;
         }
+        if (!g_q_head && !g_ping_pending) {
+            /* Timed tick with an idle queue: flush expired access buckets
+             * synchronously. The signer owns this path — emitting through
+             * the producer queue here could wait on space only it frees. */
+            access_bucket_t snapshot[AUDIT_ACCESS_SLOTS];
+            uint64_t now_window = (uint64_t)time(NULL);
+            size_t n = access_collect_expired_locked(
+                snapshot, AUDIT_ACCESS_SLOTS, now_window, 0);
+            pthread_mutex_unlock(&audit_mutex);
+            for (size_t k = 0; k < n; ++k) access_emit_sync(&snapshot[k]);
+            continue;
+        }
         audit_pending_t* e = g_q_head;
         if (e) {
             g_q_head = e->next;
+            g_q_count--;
+            pthread_cond_signal(&g_q_space_cond);
             g_signer_inflight = 1;
             if (!g_q_head) g_q_tail = NULL;
         }
@@ -1033,11 +1158,14 @@ static void* audit_signer_main(void* arg) {
     }
 }
 
-/* Block until every queued audit entry has been signed and written. */
+/* Block until every queued audit entry has been signed and written.
+ * Pending granted-access buckets are flushed through the queue first, so
+ * after this returns the on-disk trail includes every counted access. */
 void qihse_audit_flush(void) {
+    if (g_signer_ok) access_emit_via_queue(1);
     pthread_mutex_lock(&audit_mutex);
     while (g_sync_fallback ||
-           ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop)) {
+           ((g_q_head || g_signer_inflight) && g_signer_ok)) {
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     }
     pthread_mutex_unlock(&audit_mutex);
@@ -1045,15 +1173,29 @@ void qihse_audit_flush(void) {
 
 /* Drain the queue and stop the signer thread. */
 void qihse_audit_shutdown(void) {
-    if (!g_signer_ok) return;
-    qihse_audit_flush();
     pthread_mutex_lock(&audit_mutex);
+    if (!g_signer_ok) {
+        pthread_mutex_unlock(&audit_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&audit_mutex);
+    /* Emit every live access bucket through the queue before the signer
+     * stops, so a clean exit loses no counted access. */
+    access_emit_via_queue(1);
+    pthread_mutex_lock(&audit_mutex);
+    /* Stop accepting asynchronous entries; the signer drains its existing
+     * queue before exit. Wake blocked producers to use the ordered fallback. */
     g_signer_stop = 1;
     pthread_cond_broadcast(&g_q_cond);
+    pthread_cond_broadcast(&g_q_space_cond);
     pthread_mutex_unlock(&audit_mutex);
     pthread_join(g_signer_tid, NULL);
+    pthread_mutex_lock(&audit_mutex);
+    while (g_sync_fallback)
+        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     g_signer_ok = 0;
     g_signer_started = 0;
+    pthread_mutex_unlock(&audit_mutex);
 }
 
 void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, uint16_t classif, uint16_t sci) {
@@ -1069,7 +1211,16 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
         audit_integrity_error("audit writer is not initialized in this process");
     audit_writer_lock_acquire(&audit_recovery_context);
 #endif
-    while (g_sync_fallback) pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+    for (;;) {
+        if (g_sync_fallback) {
+            pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+        } else if (g_q_count >= AUDIT_PENDING_LIMIT &&
+                   g_signer_ok && !g_signer_stop) {
+            pthread_cond_wait(&g_q_space_cond, &audit_mutex);
+        } else {
+            break;
+        }
+    }
     time_t now = time(NULL);
     snprintf(buffer, sizeof(buffer), "%s|%ld|%s|%u|%u|%u|%u",
              last_hash, (long)now, action, user_id, target_id, classif, sci);
@@ -1077,7 +1228,7 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     memcpy(last_hash, new_hash, 129);
 
     /* Offload the ML-DSA-87 signature + file writes to the signer thread. */
-    if (g_signer_ok) {
+    if (g_signer_ok && !g_signer_stop) {
         audit_pending_t* e = (audit_pending_t*)malloc(sizeof(*e));
         if (e) {
             memcpy(e->buffer, buffer, sizeof(e->buffer));
@@ -1085,6 +1236,7 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
             e->next = NULL;
             if (g_q_tail) g_q_tail->next = e; else g_q_head = e;
             g_q_tail = e;
+            g_q_count++;
             pthread_cond_signal(&g_q_cond);
             pthread_mutex_unlock(&audit_mutex);
             return;
@@ -1093,7 +1245,7 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     /* Block subsequent chain steps while an allocation fallback waits for
      * earlier queued records and writes its already-hashed record. */
     g_sync_fallback = 1;
-    while ((g_q_head || g_signer_inflight) && g_signer_ok && !g_signer_stop)
+    while ((g_q_head || g_signer_inflight) && g_signer_ok)
         pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
     pthread_mutex_unlock(&audit_mutex);
     audit_sign_and_write(buffer, new_hash);
@@ -1101,6 +1253,101 @@ void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, u
     g_sync_fallback = 0;
     pthread_cond_broadcast(&g_q_empty_cond);
     pthread_mutex_unlock(&audit_mutex);
+}
+
+/* ── Granted-access aggregation ────────────────────────────────────────────
+ * One chained, signed ACCESS_COUNT record per (uid, classif, SCI) window
+ * replaces one record per granted access. The summary record carries the
+ * hit count in the target_id field; the window covered is
+ * (record_time - window, record_time]. Denials and every other event keep
+ * the original per-record path unchanged. */
+
+/* Signer-thread-only emit: hash step + durable write without touching the
+ * producer queue (the signer is the queue's only consumer; going through
+ * qihse_audit_log here could wait on space it alone would free). */
+static void access_emit_sync(const access_bucket_t* b) {
+    char buffer[1024];
+    char new_hash[129];
+    uint64_t count = b->count > 0xFFFFFFFFull ? 0xFFFFFFFFull : b->count;
+    pthread_mutex_lock(&audit_mutex);
+    snprintf(buffer, sizeof(buffer), "%s|%ld|ACCESS_COUNT|%u|%u|%u|%u",
+             last_hash, (long)time(NULL), b->uid, (uint32_t)count,
+             b->classif, b->sci);
+    compute_sha384(buffer, new_hash);
+    memcpy(last_hash, new_hash, 129);
+    pthread_mutex_unlock(&audit_mutex);
+    audit_sign_and_write(buffer, new_hash);
+}
+
+void qihse_audit_access_granted(uint32_t user_id, uint16_t classif, uint16_t sci) {
+    pthread_mutex_lock(&audit_mutex);
+#ifndef _WIN32
+    if (!audit_recovery_context_ready || audit_writer_lock_fd < 0 ||
+        !audit_context_matches_process(&audit_recovery_context))
+        audit_integrity_error("audit writer is not initialized in this process");
+#endif
+    uint64_t window = (uint64_t)time(NULL) / audit_access_window_secs();
+    size_t i = access_bucket_index(user_id, classif, sci, window);
+    for (size_t probe = 0; probe < AUDIT_ACCESS_SLOTS; ++probe) {
+        access_bucket_t* b = &g_access_buckets[(i + probe) % AUDIT_ACCESS_SLOTS];
+        if (b->used && b->uid == user_id && b->classif == classif &&
+            b->sci == sci && b->window_id == window) {
+            if (b->count < UINT64_MAX) b->count++;
+            pthread_mutex_unlock(&audit_mutex);
+            return;
+        }
+        if (!b->used) {
+            /* Free slot. Occupied slots holding expired windows are left in
+             * place for the expiry sweep, so no counted access is lost. */
+            b->used = 1;
+            b->uid = user_id;
+            b->classif = classif;
+            b->sci = sci;
+            b->window_id = window;
+            b->count = 1;
+            b->last_seen = window;
+            g_access_used++;
+            pthread_mutex_unlock(&audit_mutex);
+            return;
+        }
+    }
+    /* Table full: snapshot every live bucket and emit each through the
+     * normal queue, then retry once into the emptied table. */
+    access_bucket_t snapshot[AUDIT_ACCESS_SLOTS];
+    size_t n = access_collect_expired_locked(snapshot, AUDIT_ACCESS_SLOTS,
+                                             (uint64_t)time(NULL), 1);
+    pthread_mutex_unlock(&audit_mutex);
+    for (size_t k = 0; k < n; ++k)
+        qihse_audit_log("ACCESS_COUNT", snapshot[k].uid,
+                        (uint32_t)(snapshot[k].count > 0xFFFFFFFFull
+                                       ? 0xFFFFFFFFull
+                                       : snapshot[k].count),
+                        snapshot[k].classif, snapshot[k].sci);
+    qihse_audit_access_granted(user_id, classif, sci);
+}
+
+/* Emit buckets through the producer queue. Called from threads other than
+ * the signer (flush, shutdown). flush_all also emits live windows, so a
+ * clean exit or completeness barrier loses no counted access. Returns the
+ * number of summaries emitted. */
+static size_t access_emit_via_queue(int flush_all) {
+    access_bucket_t snapshot[AUDIT_ACCESS_SLOTS];
+    pthread_mutex_lock(&audit_mutex);
+    if (!g_signer_ok || g_signer_stop) {
+        pthread_mutex_unlock(&audit_mutex);
+        return 0;
+    }
+    uint64_t now_window = (uint64_t)time(NULL);
+    size_t n = access_collect_expired_locked(snapshot, AUDIT_ACCESS_SLOTS,
+                                             now_window, flush_all);
+    pthread_mutex_unlock(&audit_mutex);
+    for (size_t k = 0; k < n; ++k)
+        qihse_audit_log("ACCESS_COUNT", snapshot[k].uid,
+                        (uint32_t)(snapshot[k].count > 0xFFFFFFFFull
+                                       ? 0xFFFFFFFFull
+                                       : snapshot[k].count),
+                        snapshot[k].classif, snapshot[k].sci);
+    return n;
 }
 
 #include <fcntl.h>

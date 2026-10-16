@@ -32,7 +32,8 @@ typedef enum {
     QIHSE_BLOB_TAG_PATTERN_BUNDLE    = 2,
     QIHSE_BLOB_TAG_SCRIPT_SET        = 3,
     QIHSE_BLOB_TAG_COMMONS_SNAPSHOT  = 4,
-    QIHSE_BLOB_TAG_REPL_TRANSACTION  = 5 /* system Operator only */
+    QIHSE_BLOB_TAG_REPL_TRANSACTION  = 5, /* system Operator only */
+    QIHSE_BLOB_TAG_ANALYSIS_ARTIFACT = 6  /* KP14 analysis artifact payload */
 } qihse_blob_tag_t;
 
 typedef struct qihse_blob_store qihse_blob_store_t;
@@ -119,6 +120,12 @@ bool qihse_blob_verify_with_info_user(qihse_blob_store_t* store,
 /* Pin/unpin: manifest references so GC (U6) cannot reap in-use blobs. */
 bool qihse_blob_ref_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
 bool qihse_blob_unref_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
+
+/* Protected manifest pin: prevents public delete (qihse_blob_delete_user) while held */
+bool qihse_blob_pin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
+bool qihse_blob_unpin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
+bool qihse_blob_is_pinned_user(qihse_blob_store_t* store, const uint8_t* hash,
+                               qihse_user_t* user, bool* out_pinned);
 
 /* Delete one reference; the object is unlinked when the refcount hits zero. */
 bool qihse_blob_delete_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);

@@ -230,6 +230,12 @@ uint64_t qihse_keystone_feed_last_ack(const qihse_keystone_feed_t* feed);
 size_t qihse_keystone_feed_denied(const qihse_keystone_feed_t* feed);
 size_t qihse_keystone_feed_malformed(const qihse_keystone_feed_t* feed);
 
+/* Expose stream freshness: returns true if available with latest journal offset
+ * and unread lag bytes relative to feed cursor. Returns false if feed/journal NULL. */
+bool qihse_keystone_feed_freshness(const qihse_keystone_feed_t* feed,
+                                   uint64_t* out_latest,
+                                   uint64_t* out_lag);
+
 /* Persist / restore the resume cursor. The cursor file records the principal
  * that minted it; loading it as a different principal is refused, so a cursor
  * minted for a wider identity cannot be transplanted onto the index identity

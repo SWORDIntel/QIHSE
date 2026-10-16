@@ -3393,6 +3393,17 @@ static bool qihse_resp_handle_keystone_feed(qihse_resp_session_t* session,
         return qihse_resp_integer(session, (int64_t)qihse_keystone_feed_malformed(feed));
     }
 
+    if (strcasecmp(sub, "FRESHNESS") == 0) {
+        if (request->argc != 2) return qihse_resp_wrong_arity(session, "keystone.feed.freshness");
+        uint64_t latest = 0, lag = 0;
+        if (!qihse_keystone_feed_freshness(feed, &latest, &lag)) {
+            return qihse_resp_error(session, "ERR journal unavailable");
+        }
+        if (!qihse_resp_array(session, 2u)) return false;
+        if (!qihse_resp_integer(session, (int64_t)latest)) return false;
+        return qihse_resp_integer(session, (int64_t)lag);
+    }
+
     return qihse_resp_error(session, "ERR unknown KEYSTONE.FEED subcommand");
 }
 

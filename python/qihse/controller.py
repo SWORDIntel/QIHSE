@@ -874,6 +874,13 @@ class KeystoneFeed:
             raise ReplyShapeError("FEED.STATUS did not return a 4-array")
         return FeedStatus(r.items)
 
+    def freshness(self) -> tuple[int, int]:
+        """(latest_offset, lag_bytes) from KEYSTONE.FEED.FRESHNESS."""
+        r = self._ctrl.call("KEYSTONE.FEED.FRESHNESS", str(self.feed_id))
+        if r.kind != "array" or len(r.items) != 2:
+            raise ReplyShapeError("FEED.FRESHNESS did not return a 2-array")
+        return (r.items[0].as_int(), r.items[1].as_int())
+
     def close(self) -> Reply:
         return self._ctrl.call("KEYSTONE.FEED.CLOSE", str(self.feed_id))
 

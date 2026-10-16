@@ -17,6 +17,14 @@ void qihse_audit_set_webhook(const char* url);
 /* Append a signed, hash-chained entry to the audit log. */
 void qihse_audit_log(const char* action, uint32_t user_id, uint32_t target_id, uint16_t classif, uint16_t sci);
 
+/* Count one granted classified access instead of appending a record.
+ * Bucketed per (uid, classification, SCI) window; the signer thread later
+ * emits one chained, signed ACCESS_COUNT summary per expired bucket. Grants
+ * are high-volume and low-information individually; the aggregate preserves
+ * tamper-evident per-principal access evidence at a bounded write rate.
+ * Denials and all other events keep per-record logging. */
+void qihse_audit_access_granted(uint32_t user_id, uint16_t classif, uint16_t sci);
+
 /* Fire-and-forget audit notification to the configured webhook endpoint.
  * No-op if no endpoint has been configured. */
 void qihse_audit_webhook_ping(uint32_t user_id, uint16_t classif, uint16_t sci);
