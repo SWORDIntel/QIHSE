@@ -10,7 +10,7 @@
 
 **A native-C, multi-model database runtime for vector, relational, graph, key-value, document, time-series, full-text, and event-stream workloads.**
 
-[![License: SRSL-1.0](https://img.shields.io/badge/License-SRSL--1.0-lightgrey.svg)](LICENSE)
+[![License: SRSL-1.1](https://img.shields.io/badge/License-SRSL--1.0-lightgrey.svg)](LICENSE)
 ![C](https://img.shields.io/badge/Core-C-00599C?logo=c&logoColor=white)
 ![Python](https://img.shields.io/badge/SDK-Python-3776AB?logo=python&logoColor=white)
 ![Rust](https://img.shields.io/badge/SDK-Rust-DEA584?logo=rust&logoColor=white)
@@ -362,4 +362,4 @@ For deployment decisions, validate the exact subsystem you intend to use and rev
 
 ## License
 
-QIHSE is licensed under the **SWORD Restricted Source Licence (SRSL-1.0)**. Non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. See [LICENSE](LICENSE). Third-party components retain their own applicable licenses; see their individual notices.
+First-party QIHSE code is available under the **SWORD Restricted Source Licence (SRSL-1.1)**. The permitted non-commercial uses are defined in [LICENSE](LICENSE); for-profit internal deployment and other business use require a separately executed Commercial Agreement. Existing SRSL-1.0 copies retain their previously granted rights; see [the archived text](LICENSES/SRSL-1.0.txt) and [migration notes](docs/SRSL_MIGRATION.md). Vendored and other third-party components remain subject to their original respective licences.

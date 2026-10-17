@@ -31,7 +31,7 @@
  * QIHSE_OPERATOR_PASSWORD — mirroring tests/test_federation_mtls.c.  The
  * CA private key is written 0600 and is never printed or returned.
  *
- * SPDX-License-Identifier: LicenseRef-SRSL-1.0
+ * SPDX-License-Identifier: LicenseRef-SRSL-1.1
  */
 
 #include "qihse_ca_provision.h"
