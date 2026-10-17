@@ -20,10 +20,9 @@ public class ClusterController : ControllerBase
     {
         var slots = new List<SlotRange>
         {
-            new(0, 4095, "node-0"),
-            new(4096, 8191, "node-5"),
-            new(8192, 12287, "node-sec"),
-            new(12288, 16383, "node-relay")
+            new(0, 4549, "node-0"),
+            new(4550, 10922, "node-5"),
+            new(10923, 16383, "node-1")
         };
         return Ok(slots);
     }

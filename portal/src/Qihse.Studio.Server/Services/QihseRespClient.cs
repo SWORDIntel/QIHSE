@@ -28,10 +28,25 @@ public class QihseRespClient : IDisposable
         await _lock.WaitAsync(ct);
         try
         {
-            if (IsConnected) return true;
+            return await ConnectInternalAsync(ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
 
-            _tcpClient?.Dispose();
-            _tcpClient = new TcpClient();
+    private async Task<bool> ConnectInternalAsync(CancellationToken ct)
+    {
+        if (IsConnected) return true;
+
+        _tcpClient?.Dispose();
+        _tcpClient = new TcpClient();
+        _tcpClient.SendTimeout = 2000;
+        _tcpClient.ReceiveTimeout = 2000;
+
+        try
+        {
             await _tcpClient.ConnectAsync(_host, _port, ct);
             _stream = _tcpClient.GetStream();
 
@@ -53,10 +68,6 @@ public class QihseRespClient : IDisposable
             _stream = null;
             return false;
         }
-        finally
-        {
-            _lock.Release();
-        }
     }
 
     public async Task<string> SendCommandAsync(string[] args, CancellationToken ct = default)
@@ -66,7 +77,7 @@ public class QihseRespClient : IDisposable
         {
             if (!IsConnected)
             {
-                var ok = await ConnectAsync(ct);
+                var ok = await ConnectInternalAsync(ct);
                 if (!ok) return "-ERR connection failed";
             }
 
@@ -106,9 +117,16 @@ public class QihseRespClient : IDisposable
         return await ReadRespAsync(_stream, ct);
     }
 
+    private static async Task<int> ReadByteAsync(NetworkStream stream, CancellationToken ct)
+    {
+        var buf = new byte[1];
+        int read = await stream.ReadAsync(buf.AsMemory(0, 1), ct);
+        return read == 0 ? -1 : buf[0];
+    }
+
     private static async Task<string> ReadRespAsync(NetworkStream stream, CancellationToken ct)
     {
-        var firstByte = stream.ReadByte();
+        var firstByte = await ReadByteAsync(stream, ct);
         if (firstByte == -1) return "-ERR EOF";
 
         char type = (char)firstByte;
@@ -135,8 +153,8 @@ public class QihseRespClient : IDisposable
                         totalRead += read;
                     }
                     // Discard trailing \r\n
-                    stream.ReadByte();
-                    stream.ReadByte();
+                    await ReadByteAsync(stream, ct);
+                    await ReadByteAsync(stream, ct);
                     return Encoding.UTF8.GetString(bulkBytes);
                 }
                 return line;
@@ -160,20 +178,22 @@ public class QihseRespClient : IDisposable
     private static async Task<string> ReadLineAsync(NetworkStream stream, CancellationToken ct)
     {
         var sb = new StringBuilder();
+        var buffer = new byte[1];
         while (true)
         {
-            var b = stream.ReadByte();
-            if (b == -1) break;
-            if (b == '\r')
+            int read = await stream.ReadAsync(buffer.AsMemory(0, 1), ct);
+            if (read == 0) break;
+            char c = (char)buffer[0];
+            if (c == '\r')
             {
-                var next = stream.ReadByte();
-                if (next == '\n' || next == -1) break;
-                sb.Append((char)b);
-                sb.Append((char)next);
+                read = await stream.ReadAsync(buffer.AsMemory(0, 1), ct);
+                if (read == 0 || (char)buffer[0] == '\n') break;
+                sb.Append(c);
+                sb.Append((char)buffer[0]);
             }
             else
             {
-                sb.Append((char)b);
+                sb.Append(c);
             }
         }
         return sb.ToString();

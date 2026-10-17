@@ -12,10 +12,9 @@ export const ClusterMeshView: React.FC<ClusterMeshViewProps> = ({ telemetry }) =
 
   // 16,384 Shard Slot allocation
   const slotRanges: SlotRange[] = [
-    { start: 0, end: 4095, masterNodeId: 'node-0 (Ivy Bridge)' },
-    { start: 4096, end: 8191, masterNodeId: 'node-5 (R730xd Broadwell)' },
-    { start: 8192, end: 12287, masterNodeId: 'node-sec (Zen 4 7950X)' },
-    { start: 12288, end: 16383, masterNodeId: 'node-relay (Zen 2 EPYC)' },
+    { start: 0, end: 4549, masterNodeId: 'node-0 (Ivy Bridge Host)' },
+    { start: 4550, end: 10922, masterNodeId: 'node-5 (R730xd Broadwell)' },
+    { start: 10923, end: 16383, masterNodeId: 'node-1 (Cluster Peer)' },
   ];
 
   const colors = ['#00f0ff', '#39ff14', '#a855f7', '#ffb700'];

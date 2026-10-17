@@ -31,21 +31,22 @@ public class ClusterMeshService : BackgroundService
         _hubContext = hubContext;
         _logger = logger;
 
+        const string clusterPassword = "QihseCluster2026x!";
         _configuredNodes = new List<QihseNodeConfig>
         {
-            new("node-0", "127.0.0.1", 7197, "Ivy Bridge-EP (Xeon E5-2470 v2)", 
-                new List<string> { "AVX", "F16C", "AES-NI", "PCLMUL", "POPCNT", "FSGSBASE", "CX16" }, "0-4095"),
-            new("node-5", "192.168.1.90", 7197, "Broadwell-EP (Dual Xeon E5-2690 v4)", 
-                new List<string> { "AVX2", "FMA3", "BMI1", "BMI2", "MOVBE", "TSX (RTM)", "RDSEED", "ADX", "PCLMUL (6.0 GiB/s)", "LZCNT" }, "4096-8191"),
-            new("node-sec", "192.168.1.92", 7197, "Zen 4 (Ryzen 9 7950X @ 4.5GHz)", 
-                new List<string> { "AVX-512F", "AVX-512 VNNI", "AVX-512 VPOPCNTDQ (8x)", "SHA-NI (2.0 GB/s)", "VPCLMULQDQ (>20 GiB/s)", "VAES", "CLZERO", "CLWB", "RDPID" }, "8192-12287"),
-            new("node-relay", "192.168.1.93", 7197, "Zen 2 (AMD EPYC 7662 64C/128T)", 
-                new List<string> { "AVX2", "SHA-NI", "CLZERO", "CLWB", "RDPID", "ADX", "RDSEED", "64 Cores" }, "12288-16383")
+            new("node-0", "127.0.0.1", 7100, "Ivy Bridge-EP (Xeon E5-2470 v2)", 
+                new List<string> { "AVX", "F16C", "AES-NI", "PCLMUL (Hardware CRC16)", "POPCNT", "FSGSBASE", "CX16" }, "0-4549"),
+            new("node-5", "192.168.1.90", 7115, "Broadwell-EP (Dual Xeon E5-2690 v4)", 
+                new List<string> { "AVX2", "FMA3", "BMI1", "BMI2", "MOVBE", "TSX (RTM)", "RDSEED", "ADX", "PCLMUL (6.0 GiB/s)", "LZCNT" }, "4550-10922"),
+            new("node-1", "192.168.1.250", 7101, "Zen 2 (AMD EPYC 7662 64C/128T)", 
+                new List<string> { "AVX2", "SHA-NI", "CLZERO", "CLWB", "RDPID", "ADX", "RDSEED", "64 Cores" }, "10923-16383"),
+            new("node-sec", "192.168.1.92", 7100, "Zen 4 (Ryzen 9 7950X @ 4.5GHz)", 
+                new List<string> { "AVX-512F", "AVX-512 VNNI", "AVX-512 VPOPCNTDQ (8x)", "SHA-NI (2.0 GB/s)", "VPCLMULQDQ (>20 GiB/s)", "VAES", "CLZERO", "CLWB", "RDPID" }, "Standby Vector Shard")
         };
 
         foreach (var n in _configuredNodes)
         {
-            _clients[n.Id] = new QihseRespClient(n.Host, n.Port);
+            _clients[n.Id] = new QihseRespClient(n.Host, n.Port, clusterPassword);
         }
 
         _latestFrame = BuildInitialFrame();
