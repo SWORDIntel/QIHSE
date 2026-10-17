@@ -156,6 +156,7 @@ The [`plans/`](plans/) directory contains design documents and implementation ro
 
 Notable documents include:
 
+- [QIHSE Studio Display Architecture](plans/QIHSE_STUDIO_DISPLAY_ARCHITECTURE.md) — Real-time telemetry, 16,384-slot cluster mesh, and vector exploration display platform using ASP.NET Core 8 SignalR streaming and React 18 SPA.
 - [AMD Zen 4 & Zen 2 Hardware Acceleration Roadmap](plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md) — Multi-tier SIMD (AVX-512 VPOPCNTDQ, AVX-512 VNNI), cryptographic (SHA-NI, VPCLMULQDQ), cache (CLZERO, CLWB), and concurrency (RDPID, CX16) acceleration across the Secondary node (AMD Ryzen 9 7950X) and Relay node (AMD EPYC 7662).
 - [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — **the accepted forward direction**: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Stages F0–F8 and the post-F8 follow-ups are implemented, through the two 2026-09-25 waves (node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export); no tracked unbuilt items remain — the plan stays the design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing).
 - [General database engine roadmap](plans/qihse_general_db_engine_roadmap.md)
