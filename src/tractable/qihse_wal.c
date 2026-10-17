@@ -94,92 +94,102 @@ static inline uint32_t crc32_slice8(const uint8_t* p, size_t len, uint32_t crc) 
 }
 
 #if defined(__PCLMUL__) && defined(__SSE4_1__)
-static inline uint32_t crc32_pclmul(const uint8_t* p, size_t len, uint32_t crc) {
-    if (len < 64) {
-        return crc32_slice8(p, len, crc);
+static inline uint32_t crc32_pclmul(const uint8_t* inbuf, size_t inlen, uint32_t crc) {
+    if (inlen < 64) {
+        return crc32_slice8(inbuf, inlen, crc);
     }
 
-    const __m128i r2r1 = _mm_set_epi64x(0x154442bd4ULL, 0x1c6e41596ULL);
-    const __m128i r4r3 = _mm_set_epi64x(0x1751997d0ULL, 0x0ccaa009eULL);
-    const __m128i rupoly = _mm_set_epi64x(0x1db710641ULL, 0x1f7011641ULL);
-    const __m128i r5 = _mm_set_epi64x(0x163cd6124ULL, 0);
+    const uint64_t k1k2_arr[2] = { 0x154442bd4ULL, 0x1c6e41596ULL };
+    const uint64_t k3k4_arr[2] = { 0x1751997d0ULL, 0x0ccaa009eULL };
+    const uint64_t k5_arr[2]   = { 0x163cd6124ULL, 0 };
+    const uint64_t my_p_arr[2] = { 0x1f7011641ULL, 0x1db710641ULL };
 
-    __m128i x0 = _mm_loadu_si128((const __m128i*)(p + 0));
-    __m128i x1 = _mm_loadu_si128((const __m128i*)(p + 16));
-    __m128i x2 = _mm_loadu_si128((const __m128i*)(p + 32));
-    __m128i x3 = _mm_loadu_si128((const __m128i*)(p + 48));
+    __m128i k1k2 = _mm_loadu_si128((const __m128i*)k1k2_arr);
+    __m128i k3k4 = _mm_loadu_si128((const __m128i*)k3k4_arr);
+    __m128i k5   = _mm_loadu_si128((const __m128i*)k5_arr);
+    __m128i my_p = _mm_loadu_si128((const __m128i*)my_p_arr);
+
+    __m128i x0 = _mm_loadu_si128((const __m128i*)(inbuf + 0 * 16));
+    __m128i x1 = _mm_loadu_si128((const __m128i*)(inbuf + 1 * 16));
+    __m128i x2 = _mm_loadu_si128((const __m128i*)(inbuf + 2 * 16));
+    __m128i x3 = _mm_loadu_si128((const __m128i*)(inbuf + 3 * 16));
 
     x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(crc));
 
-    p += 64;
-    len -= 64;
+    inbuf += 4 * 16;
+    inlen -= 4 * 16;
 
-    while (len >= 64) {
-        __m128i y0 = _mm_loadu_si128((const __m128i*)(p + 0));
-        __m128i y1 = _mm_loadu_si128((const __m128i*)(p + 16));
-        __m128i y2 = _mm_loadu_si128((const __m128i*)(p + 32));
-        __m128i y3 = _mm_loadu_si128((const __m128i*)(p + 48));
+    while (inlen >= 4 * 16) {
+        __m128i y0 = _mm_loadu_si128((const __m128i*)(inbuf + 0 * 16));
+        __m128i y1 = _mm_loadu_si128((const __m128i*)(inbuf + 1 * 16));
+        __m128i y2 = _mm_loadu_si128((const __m128i*)(inbuf + 2 * 16));
+        __m128i y3 = _mm_loadu_si128((const __m128i*)(inbuf + 3 * 16));
 
-        __m128i a0 = _mm_clmulepi64_si128(x0, r2r1, 0x00);
-        __m128i b0 = _mm_clmulepi64_si128(x0, r2r1, 0x11);
+        __m128i a0 = _mm_clmulepi64_si128(x0, k1k2, 0x00);
+        __m128i b0 = _mm_clmulepi64_si128(x0, k1k2, 0x11);
         x0 = _mm_xor_si128(_mm_xor_si128(a0, b0), y0);
 
-        __m128i a1 = _mm_clmulepi64_si128(x1, r2r1, 0x00);
-        __m128i b1 = _mm_clmulepi64_si128(x1, r2r1, 0x11);
+        __m128i a1 = _mm_clmulepi64_si128(x1, k1k2, 0x00);
+        __m128i b1 = _mm_clmulepi64_si128(x1, k1k2, 0x11);
         x1 = _mm_xor_si128(_mm_xor_si128(a1, b1), y1);
 
-        __m128i a2 = _mm_clmulepi64_si128(x2, r2r1, 0x00);
-        __m128i b2 = _mm_clmulepi64_si128(x2, r2r1, 0x11);
+        __m128i a2 = _mm_clmulepi64_si128(x2, k1k2, 0x00);
+        __m128i b2 = _mm_clmulepi64_si128(x2, k1k2, 0x11);
         x2 = _mm_xor_si128(_mm_xor_si128(a2, b2), y2);
 
-        __m128i a3 = _mm_clmulepi64_si128(x3, r2r1, 0x00);
-        __m128i b3 = _mm_clmulepi64_si128(x3, r2r1, 0x11);
+        __m128i a3 = _mm_clmulepi64_si128(x3, k1k2, 0x00);
+        __m128i b3 = _mm_clmulepi64_si128(x3, k1k2, 0x11);
         x3 = _mm_xor_si128(_mm_xor_si128(a3, b3), y3);
 
-        p += 64;
-        len -= 64;
+        inbuf += 4 * 16;
+        inlen -= 4 * 16;
     }
 
-    /* Fold 4 vectors into 1 vector */
-    __m128i a0 = _mm_clmulepi64_si128(x0, r4r3, 0x00);
-    __m128i b0 = _mm_clmulepi64_si128(x0, r4r3, 0x11);
-    x1 = _mm_xor_si128(x1, _mm_xor_si128(a0, b0));
+    /* Fold 4 to 1 */
+    __m128i f0 = _mm_clmulepi64_si128(x0, k3k4, 0x00);
+    __m128i g0 = _mm_clmulepi64_si128(x0, k3k4, 0x11);
+    x0 = _mm_xor_si128(_mm_xor_si128(f0, g0), x1);
 
-    __m128i a1 = _mm_clmulepi64_si128(x1, r4r3, 0x00);
-    __m128i b1 = _mm_clmulepi64_si128(x1, r4r3, 0x11);
-    x2 = _mm_xor_si128(x2, _mm_xor_si128(a1, b1));
+    __m128i f1 = _mm_clmulepi64_si128(x0, k3k4, 0x00);
+    __m128i g1 = _mm_clmulepi64_si128(x0, k3k4, 0x11);
+    x0 = _mm_xor_si128(_mm_xor_si128(f1, g1), x2);
 
-    __m128i a2 = _mm_clmulepi64_si128(x2, r4r3, 0x00);
-    __m128i b2 = _mm_clmulepi64_si128(x2, r4r3, 0x11);
-    x3 = _mm_xor_si128(x3, _mm_xor_si128(a2, b2));
+    __m128i f2 = _mm_clmulepi64_si128(x0, k3k4, 0x00);
+    __m128i g2 = _mm_clmulepi64_si128(x0, k3k4, 0x11);
+    x0 = _mm_xor_si128(_mm_xor_si128(f2, g2), x3);
 
     /* Fold remaining 16-byte blocks */
-    while (len >= 16) {
-        __m128i y = _mm_loadu_si128((const __m128i*)p);
-        __m128i a = _mm_clmulepi64_si128(x3, r4r3, 0x00);
-        __m128i b = _mm_clmulepi64_si128(x3, r4r3, 0x11);
-        x3 = _mm_xor_si128(_mm_xor_si128(a, b), y);
-        p += 16;
-        len -= 16;
+    while (inlen >= 16) {
+        __m128i y = _mm_loadu_si128((const __m128i*)inbuf);
+        __m128i a = _mm_clmulepi64_si128(x0, k3k4, 0x00);
+        __m128i b = _mm_clmulepi64_si128(x0, k3k4, 0x11);
+        x0 = _mm_xor_si128(_mm_xor_si128(a, b), y);
+        inbuf += 16;
+        inlen -= 16;
     }
 
-    /* Barrett reduction of 128-bit vector x3 */
-    __m128i t0 = _mm_clmulepi64_si128(x3, r4r3, 0x01);
-    __m128i t1 = _mm_srli_si128(x3, 8);
-    __m128i t2 = _mm_clmulepi64_si128(x3, r4r3, 0x10);
-    x3 = _mm_xor_si128(t1, _mm_xor_si128(t0, t2));
+    /* Final reduction: reduce 128-bits to 96-bits */
+    __m128i r0 = _mm_clmulepi64_si128(x0, k3k4, 0x10);
+    __m128i r1 = _mm_srli_si128(x0, 8);
+    x0 = _mm_xor_si128(r0, r1);
 
-    __m128i t3 = _mm_clmulepi64_si128(x3, r5, 0x00);
-    __m128i t4 = _mm_srli_si128(x3, 4);
-    x3 = _mm_xor_si128(t4, t3);
+    /* reduce 96-bits to 64-bits */
+    __m128i m1 = _mm_shuffle_epi32(x0, 0xfc);
+    x0 = _mm_shuffle_epi32(x0, 0xf9);
+    m1 = _mm_clmulepi64_si128(m1, k5, 0x00);
+    x0 = _mm_xor_si128(x0, m1);
 
-    __m128i q = _mm_clmulepi64_si128(_mm_and_si128(x3, _mm_set_epi32(0, 0, 0, 0xFFFFFFFF)), rupoly, 0x10);
-    q = _mm_clmulepi64_si128(_mm_and_si128(q, _mm_set_epi32(0, 0, 0, 0xFFFFFFFF)), rupoly, 0x00);
-    x3 = _mm_xor_si128(x3, q);
-    uint32_t res = (uint32_t)_mm_extract_epi32(x3, 1);
+    /* barrett reduction */
+    __m128i b1 = _mm_shuffle_epi32(x0, 0xf3);
+    x0 = _mm_slli_si128(x0, 4);
+    __m128i q0 = _mm_clmulepi64_si128(b1, my_p, 0x00);
+    __m128i q1 = _mm_clmulepi64_si128(q0, my_p, 0x10);
+    x0 = _mm_xor_si128(x0, q1);
 
-    if (len > 0) {
-        res = crc32_slice8(p, len, res);
+    uint32_t res = (uint32_t)_mm_extract_epi32(x0, 2);
+
+    if (inlen > 0) {
+        res = crc32_slice8(inbuf, inlen, res);
     }
     return res;
 }
