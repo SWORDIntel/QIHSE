@@ -272,14 +272,15 @@ test-audit-rotation: lib
 redis-cluster-bootstrap: lib
 	$(CC) $(CFLAGS) -o tests/qihse_cluster_bootstrap tests/qihse_cluster_bootstrap.c -L. -lqihse $(LDFLAGS)
 
-keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c
+keygen: persistence/qihse_pqc_crypto.c persistence/qihse_pqc_crypto.h tools/qihse_keygen.c backends/cpu/qihse_cpu_detect.c backends/cpu/qihse_cpu_detect.h
 	@echo "Building qihse_keygen..."
 	$(CC) -std=c99 -Wall -Wextra -O2 -fPIC \
 	    -DQIHSE_KEY_DIR='""' \
-	    -I. -I./persistence -I./include \
+	    -I. -I./persistence -I./include -I./backends/cpu \
 	    -o qihse_keygen \
 	    tools/qihse_keygen.c \
 	    persistence/qihse_pqc_crypto.c \
+	    backends/cpu/qihse_cpu_detect.c \
 	    -lssl -lcrypto -lpthread
 	@echo "qihse_keygen build successful"
 	@echo "  Usage: ./qihse_keygen [output-dir]  (default: /opt/qihse/keys)"
