@@ -2213,6 +2213,8 @@ static bool s_cpu_has_popcnt = false;
 static bool s_cpu_has_avx = false;
 static bool s_cpu_has_avx2 = false;
 static bool s_cpu_has_bmi2 = false;
+static bool s_cpu_has_avx512vnni = false;
+static bool s_cpu_has_avx512vpopcntdq = false;
 static pthread_once_t s_vdb_cpu_init_once = PTHREAD_ONCE_INIT;
 
 static void s_vdb_cpu_detect_init(void) {
@@ -2220,6 +2222,8 @@ static void s_vdb_cpu_detect_init(void) {
     s_cpu_has_popcnt = qihse_cpu_has_popcnt(&info);
     s_cpu_has_avx = qihse_cpu_has_avx(&info);
     s_cpu_has_avx2 = (info.features & QIHSE_CPU_FEATURE_AVX2) != 0;
+    s_cpu_has_avx512vnni = qihse_cpu_has_avx512vnni(&info);
+    s_cpu_has_avx512vpopcntdq = qihse_cpu_has_avx512vpopcntdq(&info);
 #ifdef __x86_64__
     s_cpu_has_bmi2 = __builtin_cpu_supports("bmi2");
 #endif
@@ -2352,11 +2356,89 @@ static float qihse_vdb_int8_dot_product_avx2(const int8_t* a, const int8_t* b, s
     }
     return (float)total;
 }
+
+__attribute__((target("avx512vnni,avx512vl,avx512f,avx512bw")))
+static float qihse_vdb_int8_dot_product_avx512vnni(const int8_t* a, const int8_t* b, size_t len) {
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    __m512i b_sum0 = _mm512_setzero_si512();
+    __m512i b_sum1 = _mm512_setzero_si512();
+    const __m512i v_ones = _mm512_set1_epi8(1);
+    const __m512i v_bias = _mm512_set1_epi8((char)0x80);
+
+    size_t i = 0;
+    /* 2x unrolled 512-bit loop (128 bytes per iter) to saturate Zen 4 execution ports */
+    for (; i + 128 <= len; i += 128) {
+        __m512i va0 = _mm512_loadu_si512((const __m512i*)(a + i));
+        __m512i vb0 = _mm512_loadu_si512((const __m512i*)(b + i));
+        __m512i u_a0 = _mm512_xor_si512(va0, v_bias);
+        acc0 = _mm512_dpbusd_epi32(acc0, u_a0, vb0);
+        b_sum0 = _mm512_dpbusd_epi32(b_sum0, v_ones, vb0);
+
+        __m512i va1 = _mm512_loadu_si512((const __m512i*)(a + i + 64));
+        __m512i vb1 = _mm512_loadu_si512((const __m512i*)(b + i + 64));
+        __m512i u_a1 = _mm512_xor_si512(va1, v_bias);
+        acc1 = _mm512_dpbusd_epi32(acc1, u_a1, vb1);
+        b_sum1 = _mm512_dpbusd_epi32(b_sum1, v_ones, vb1);
+    }
+    for (; i + 64 <= len; i += 64) {
+        __m512i va = _mm512_loadu_si512((const __m512i*)(a + i));
+        __m512i vb = _mm512_loadu_si512((const __m512i*)(b + i));
+        __m512i u_a = _mm512_xor_si512(va, v_bias);
+        acc0 = _mm512_dpbusd_epi32(acc0, u_a, vb);
+        b_sum0 = _mm512_dpbusd_epi32(b_sum0, v_ones, vb);
+    }
+
+    __m512i acc = _mm512_add_epi32(acc0, acc1);
+    __m512i b_sum = _mm512_add_epi32(b_sum0, b_sum1);
+
+    int64_t total_dot = (int64_t)_mm512_reduce_add_epi32(acc);
+    int64_t total_bsum = (int64_t)_mm512_reduce_add_epi32(b_sum);
+
+    /* 256-bit tail loop */
+    if (i + 32 <= len) {
+        __m256i va256 = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb256 = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m256i u_a256 = _mm256_xor_si256(va256, _mm256_set1_epi8((char)0x80));
+        __m256i a256 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u_a256, vb256);
+        __m256i b256 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_set1_epi8(1), vb256);
+
+        __m128i lo_a = _mm256_castsi256_si128(a256);
+        __m128i hi_a = _mm256_extracti128_si256(a256, 1);
+        __m128i sum_a128 = _mm_add_epi32(lo_a, hi_a);
+        __m128i hi64_a = _mm_unpackhi_epi64(sum_a128, sum_a128);
+        __m128i sum64_a = _mm_add_epi32(sum_a128, hi64_a);
+        __m128i hi32_a = _mm_shuffle_epi32(sum64_a, _MM_SHUFFLE(1, 1, 1, 1));
+        total_dot += _mm_cvtsi128_si32(_mm_add_epi32(sum64_a, hi32_a));
+
+        __m128i lo_b = _mm256_castsi256_si128(b256);
+        __m128i hi_b = _mm256_extracti128_si256(b256, 1);
+        __m128i sum_b128 = _mm_add_epi32(lo_b, hi_b);
+        __m128i hi64_b = _mm_unpackhi_epi64(sum_b128, sum_b128);
+        __m128i sum64_b = _mm_add_epi32(sum_b128, hi64_b);
+        __m128i hi32_b = _mm_shuffle_epi32(sum64_b, _MM_SHUFFLE(1, 1, 1, 1));
+        total_bsum += _mm_cvtsi128_si32(_mm_add_epi32(sum64_b, hi32_b));
+
+        i += 32;
+    }
+
+    int64_t total = total_dot - (total_bsum * 128LL);
+
+    for (; i < len; i++) {
+        total += (int64_t)a[i] * (int64_t)b[i];
+    }
+
+    _mm256_zeroupper();
+    return (float)total;
+}
 #endif
 
 static float qihse_vdb_int8_dot_product(const int8_t* a, const int8_t* b, size_t len) {
     pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
 #ifdef __x86_64__
+    if (s_cpu_has_avx512vnni) {
+        return qihse_vdb_int8_dot_product_avx512vnni(a, b, len);
+    }
     if (s_cpu_has_avx2) {
         return qihse_vdb_int8_dot_product_avx2(a, b, len);
     }
@@ -2602,6 +2684,53 @@ static uint32_t qihse_vdb_hamming_distance_popcnt(const uint64_t* a, const uint6
     }
     return (uint32_t)total;
 }
+
+__attribute__((target("avx512vpopcntdq,avx512vl,avx512f")))
+static uint32_t qihse_vdb_hamming_distance_avx512vpopcntdq(const uint64_t* a, const uint64_t* b, size_t words) {
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    size_t i = 0;
+
+    /* 2x unrolled 512-bit loop (16 words = 128 bytes per iter) */
+    for (; i + 16 <= words; i += 16) {
+        __m512i va0 = _mm512_loadu_si512((const __m512i*)(a + i));
+        __m512i vb0 = _mm512_loadu_si512((const __m512i*)(b + i));
+        __m512i diff0 = _mm512_xor_si512(va0, vb0);
+        acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(diff0));
+
+        __m512i va1 = _mm512_loadu_si512((const __m512i*)(a + i + 8));
+        __m512i vb1 = _mm512_loadu_si512((const __m512i*)(b + i + 8));
+        __m512i diff1 = _mm512_xor_si512(va1, vb1);
+        acc1 = _mm512_add_epi64(acc1, _mm512_popcnt_epi64(diff1));
+    }
+    for (; i + 8 <= words; i += 8) {
+        __m512i va = _mm512_loadu_si512((const __m512i*)(a + i));
+        __m512i vb = _mm512_loadu_si512((const __m512i*)(b + i));
+        __m512i diff = _mm512_xor_si512(va, vb);
+        acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(diff));
+    }
+
+    uint64_t total = (uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(acc0, acc1));
+
+    /* 256-bit tail loop */
+    for (; i + 4 <= words; i += 4) {
+        __m256i va256 = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb256 = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m256i diff256 = _mm256_xor_si256(va256, vb256);
+        __m256i pop256 = _mm256_popcnt_epi64(diff256);
+        __m128i lo = _mm256_castsi256_si128(pop256);
+        __m128i hi = _mm256_extracti128_si256(pop256, 1);
+        __m128i sum128 = _mm_add_epi64(lo, hi);
+        total += (uint64_t)_mm_cvtsi128_si64(sum128) + (uint64_t)_mm_extract_epi64(sum128, 1);
+    }
+
+    for (; i < words; i++) {
+        total += (uint64_t)__builtin_popcountll(a[i] ^ b[i]);
+    }
+
+    _mm256_zeroupper();
+    return (uint32_t)total;
+}
 #endif
 
 static void qihse_vdb_binarize_vector_scalar(const float* vec, size_t dims, uint64_t* out_binary, size_t words_per_vec) {
@@ -2636,6 +2765,9 @@ static inline uint32_t qihse_vdb_hamming_distance(const uint64_t* a, const uint6
     if (!a || !b) return UINT32_MAX;
     pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
 #ifdef __x86_64__
+    if (s_cpu_has_avx512vpopcntdq) {
+        return qihse_vdb_hamming_distance_avx512vpopcntdq(a, b, words);
+    }
     if (s_cpu_has_popcnt) {
         return qihse_vdb_hamming_distance_popcnt(a, b, words);
     }

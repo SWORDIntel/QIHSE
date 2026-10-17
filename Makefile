@@ -433,6 +433,10 @@ test-graph-vector: lib
 	$(CC) $(CFLAGS) -o tests/test_graph_vector tests/test_graph_vector.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_graph_vector
 
+test-zen-epyc-simd: lib
+	$(CC) $(CFLAGS) -o tests/test_zen_epyc_simd tests/test_zen_epyc_simd.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_zen_epyc_simd
+
 test-resp-hybrid: lib
 	$(CC) $(CFLAGS) -o tests/test_resp_hybrid tests/test_resp_hybrid.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_resp_hybrid

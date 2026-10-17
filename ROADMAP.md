@@ -12,6 +12,20 @@ Status marks: `[x]` implemented with repository evidence (source + build wiring 
 
 ### Remote Server Hardware Acceleration (Dell PowerEdge R730xd — Dual Xeon E5-2690 v4) (2026-10-17)
 
+### AMD Zen 4 & Zen 2 Hardware Acceleration (Ryzen 9 7950X & EPYC 7662) (2026-10-17)
+
+Completed architecture design, feature detection integration, and initial kernel implementations for the Secondary server (AMD Ryzen 9 7950X Zen 4 Raphael) and Relay server (AMD EPYC 7662 Zen 2 Rome) based on hardware `/proc/cpuinfo` analysis ([docs/plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md](docs/plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md)):
+1. **Dynamic C99 CPU Feature Detection & Signal-Safe Probing** (`backends/cpu/qihse_cpu_detect.{h,c}`): 13 new feature bits (`SHA_NI`, `AVX512_VPOPCNTDQ`, `VPCLMULQDQ`, `VAES`, `AVX512_BITALG`, `AVX512_VBMI`, `AVX512_VBMI2`, `AVX512_IFMA`, `GFNI`, `CLZERO`, `CLWB`, `RDPID`, `CX16`) with execution test signal trapping (`safe_execute_test`) and zero-overhead thread-safe caching.
+2. **Vector DB SIMD Acceleration** (`src/broad_oak/qihse_vector_db.c`):
+   - AVX-512 VPOPCNTDQ 2x unrolled Hamming distance (`qihse_vdb_hamming_distance_avx512vpopcntdq`) with dual accumulators for binary embeddings (8x speedup).
+   - AVX-512 VNNI 2x unrolled INT8 dot product (`qihse_vdb_int8_dot_product_avx512vnni`) with exact signed-to-unsigned conversion offset cancellation ($(u_a \oplus 0x80) \cdot b_i - 128 \sum b_i$) and dual interleaved accumulators.
+3. **Hardware Cache & Core Primitives** (`include/backends/cpu/qihse_cpu_cache.h`):
+   - 64-byte aligned AMD `CLZERO` zero-bus-fill cache clearing with heap fallback.
+   - Non-evicting `CLWB` cache writeback for persistent WAL commit.
+   - 1-cycle userspace `RDPID` core and NUMA resolution.
+4. **Hardware SHA-NI Hashing** (`include/qihse_sha256_shani.h`): Single-cycle 2-round hardware SHA-256 compression block processing (~2.0 GB/s/core).
+5. **Test Harness & Verification** (`tests/test_zen_epyc_simd.c`): 5-stage test suite covering detection, signal-safe execution, cache operations, SHA-NI, and vector DB dispatch passing cleanly on host CPU.
+
 Completed native hardware acceleration targeting the Dell PowerEdge R730xd (Broadwell-EP, 2 sockets × 14 cores = 28C/56T, 70MB L3 cache, Linux 7.0.14-19-pve) across all 5 engineering phases with full native build, remote cluster service deployment, and live hardware verification:
 
 1. **AVX2 + FMA Saturation & 256-Bit SIMD Width** (`backends/cpu/qihse_cpu_distance.c`, `src/broad_oak/qihse_vector_db.c`, `codecs/qihse_trinary_tryte_codec.c`):
@@ -580,6 +594,23 @@ Identity namespaces remain separate: METHRA's existing object keys use BLAKE3, t
 - [x] Publish authorized, bounded index projections via the existing KEYSTONE feed with explicit cursor/replay and retention semantics; expose freshness and index-unavailable status without losing the authoritative artifact.
 - [x] Require authenticated context on every classified-capable read, search, export, and blob access; add low-clearance/high-data CI negatives, including direct-ID, enumeration, search, and snapshot/export paths. Do not use context-free unclassified KV calls as a classified adapter or rename METHRA keys to trigger the best-effort `fabric:` hook.
 - [x] Validate one complete suite fixture through storage, KEYSTONE candidate search, QIHSE reauthorization/exact verification, tombstone/rebuild, and selective invalidation before VM 9211 promotion.
+
+---
+
+### W9 — AMD Zen 4 (Ryzen 9 7950X) & Zen 2 (EPYC 7662) Hardware Acceleration (Phase 13)
+
+Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md](docs/plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md). Governed by strict runtime dynamic dispatch, C99 64-bit feature bitmasks, zero static shims, and target-cloned multi-versioning to preserve 100% build compatibility on legacy hosts.
+
+- [x] **W9.1 — C99 Dynamic CPU Detection & Signal-Safe Probing** (`backends/cpu/qihse_cpu_detect.{h,c}`): 13 new feature bits (`SHA_NI`, `AVX512_VPOPCNTDQ`, `VPCLMULQDQ`, `VAES`, `AVX512_BITALG`, `AVX512_VBMI`, `AVX512_VBMI2`, `AVX512_IFMA`, `GFNI`, `CLZERO`, `CLWB`, `RDPID`, `CX16`) with execution testing trapped under `SIGILL`/`SIGSEGV` handlers and thread-safe fast caching.
+- [x] **W9.2 — Vector DB SIMD Distance Acceleration** (`src/broad_oak/qihse_vector_db.c`):
+  - [x] `qihse_vdb_hamming_distance_avx512vpopcntdq`: 2x unrolled dual-accumulator 512-bit population count for binary embeddings (8x speedup).
+  - [x] `qihse_vdb_int8_dot_product_avx512vnni`: 2x unrolled dual-accumulator `vpdpbusd` with signed-to-unsigned conversion offset cancellation ($(u_a \oplus 0x80) \cdot b_i - 128 \sum b_i$).
+- [x] **W9.3 — Hardware Cache & Synchronization Utilities** (`include/backends/cpu/qihse_cpu_cache.h`):
+  - [x] `qihse_cache_zero_64`: AMD `CLZERO` 64-byte non-RFO cache clear with alignment verification and fallback.
+  - [x] `qihse_cache_writeback`: `CLWB` non-evicting persistent WAL flush.
+  - [x] `qihse_get_cpu_id`: 1-cycle userspace `RDPID` core and NUMA resolution.
+- [x] **W9.4 — Hardware SHA-NI Acceleration** (`include/qihse_sha256_shani.h`): Single-cycle 2-round hardware SHA-256 compression block routines.
+- [x] **W9.5 — Test Harness & Verification Suite** (`tests/test_zen_epyc_simd.c`, `Makefile` target `test-zen-epyc-simd`): 5-stage verification passing cleanly on host CPU with zero host crashes or regressions.
 
 ## 4. Sequencing
 

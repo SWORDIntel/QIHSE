@@ -69,7 +69,7 @@ static bool qihse_force_full_features(void) {
 /**
  * Execute the test function while trapping illegal/segfault signals.
  */
-static __attribute__((unused)) bool safe_execute_test(bool (*test_func)(void)) {
+bool qihse_cpu_safe_execute_test(bool (*test_func)(void)) {
 #ifdef _WIN32
     (void)test_func;
     return false;
@@ -101,6 +101,10 @@ static __attribute__((unused)) bool safe_execute_test(bool (*test_func)(void)) {
     pthread_mutex_unlock(&cpu_test_mutex);
     return false;
 #endif
+}
+
+static __attribute__((unused)) bool safe_execute_test(bool (*test_func)(void)) {
+    return qihse_cpu_safe_execute_test(test_func);
 }
 
 /* ============================================================================
@@ -576,6 +580,165 @@ bool qihse_cpu_test_adx(void) {
 #endif
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+
+__attribute__((target("sha,sse4.1")))
+bool qihse_cpu_test_shani(void) {
+    __asm__ volatile (
+        "sha256msg1 %%xmm0, %%xmm1\n\t"
+        : : : "xmm0", "xmm1"
+    );
+    return true;
+}
+
+__attribute__((target("avx512vpopcntdq,avx512vl")))
+bool qihse_cpu_test_avx512vpopcntdq(void) {
+    __asm__ volatile (
+        "vpopcntq %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("vpclmulqdq,avx2")))
+bool qihse_cpu_test_vpclmul(void) {
+    __asm__ volatile (
+        "vpclmulqdq $0x00, %%ymm0, %%ymm0, %%ymm1\n\t"
+        "vzeroupper\n\t"
+        : : : "ymm0", "ymm1"
+    );
+    return true;
+}
+
+__attribute__((target("vaes,avx2")))
+bool qihse_cpu_test_vaes(void) {
+    __asm__ volatile (
+        "vaesenc %%ymm0, %%ymm0, %%ymm1\n\t"
+        "vzeroupper\n\t"
+        : : : "ymm0", "ymm1"
+    );
+    return true;
+}
+
+__attribute__((target("avx512bitalg,avx512vl")))
+bool qihse_cpu_test_avx512bitalg(void) {
+    __asm__ volatile (
+        "vpopcntb %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("avx512vbmi,avx512vl")))
+bool qihse_cpu_test_avx512vbmi(void) {
+    __asm__ volatile (
+        "vpermb %%xmm0, %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("avx512vbmi2,avx512vl")))
+bool qihse_cpu_test_avx512vbmi2(void) {
+    __asm__ volatile (
+        "vpcompressb %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("avx512ifma,avx512vl")))
+bool qihse_cpu_test_avx512ifma(void) {
+    __asm__ volatile (
+        "vpmadd52luq %%xmm0, %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("gfni")))
+bool qihse_cpu_test_gfni(void) {
+    __asm__ volatile (
+        "gf2p8affineqb $0x00, %%xmm0, %%xmm0\n\t"
+        : : : "xmm0"
+    );
+    return true;
+}
+
+__attribute__((target("clzero")))
+bool qihse_cpu_test_clzero(void) {
+    uint8_t buf[128] __attribute__((aligned(64))) = {0};
+    uintptr_t addr = ((uintptr_t)buf + 63) & ~63ULL;
+    __asm__ volatile (
+        "clzero\n\t"
+        :
+        : "a"(addr)
+        : "memory"
+    );
+    return true;
+}
+
+__attribute__((target("clwb")))
+bool qihse_cpu_test_clwb(void) {
+    uint8_t buf[64] __attribute__((aligned(64))) = {0};
+    __asm__ volatile (
+        "clwb %0\n\t"
+        :
+        : "m"(buf[0])
+        : "memory"
+    );
+    return true;
+}
+
+__attribute__((target("rdpid")))
+bool qihse_cpu_test_rdpid(void) {
+    unsigned long id = 0;
+    __asm__ volatile (
+        "rdpid %0\n\t"
+        : "=r"(id)
+    );
+    (void)id;
+    return true;
+}
+
+bool qihse_cpu_test_cx16(void) {
+    uint64_t val[2] __attribute__((aligned(16))) = {0, 0};
+    uint64_t old_lo = 0, old_hi = 0;
+    uint64_t new_lo = 1, new_hi = 1;
+    unsigned char ok = 0;
+    __asm__ volatile (
+        "lock cmpxchg16b %1\n\t"
+        "sete %0\n\t"
+        : "=qm"(ok), "+m"(*val), "+a"(old_lo), "+d"(old_hi)
+        : "b"(new_lo), "c"(new_hi)
+        : "cc", "memory"
+    );
+    return ok && val[0] == 1 && val[1] == 1;
+}
+
+#else
+
+bool qihse_cpu_test_shani(void) { return false; }
+bool qihse_cpu_test_avx512vpopcntdq(void) { return false; }
+bool qihse_cpu_test_vpclmul(void) { return false; }
+bool qihse_cpu_test_vaes(void) { return false; }
+bool qihse_cpu_test_avx512bitalg(void) { return false; }
+bool qihse_cpu_test_avx512vbmi(void) { return false; }
+bool qihse_cpu_test_avx512vbmi2(void) { return false; }
+bool qihse_cpu_test_avx512ifma(void) { return false; }
+bool qihse_cpu_test_gfni(void) { return false; }
+bool qihse_cpu_test_clzero(void) { return false; }
+bool qihse_cpu_test_clwb(void) { return false; }
+bool qihse_cpu_test_rdpid(void) { return false; }
+bool qihse_cpu_test_cx16(void) { return false; }
+
+#endif
+
 /* ============================================================================
  * CPU INFORMATION GATHERING
  * ============================================================================ */
@@ -595,11 +758,14 @@ static void init_cpu_info(qihse_cpu_info_t* info) {
  * MAIN DETECTION FUNCTION
  * ============================================================================ */
 
-qihse_cpu_info_t qihse_cpu_detect(void) {
-    qihse_cpu_info_t info;
-    init_cpu_info(&info);
+static qihse_cpu_info_t s_cached_cpu_info;
+static volatile int s_cached_cpu_info_ready = 0;
+static pthread_mutex_t s_cached_cpu_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+qihse_cpu_info_t qihse_cpu_detect(void) {
     if (qihse_force_full_features()) {
+        qihse_cpu_info_t info;
+        init_cpu_info(&info);
         uint64_t features = QIHSE_CPU_FEATURE_SSE |
                             QIHSE_CPU_FEATURE_SSE2 |
                             QIHSE_CPU_FEATURE_SSE3 |
@@ -633,13 +799,38 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                             QIHSE_CPU_FEATURE_BMI2 |
                             QIHSE_CPU_FEATURE_RTM |
                             QIHSE_CPU_FEATURE_RDSEED |
-                            QIHSE_CPU_FEATURE_ADX;
+                            QIHSE_CPU_FEATURE_ADX |
+                            QIHSE_CPU_FEATURE_SHANI |
+                            QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ |
+                            QIHSE_CPU_FEATURE_VPCLMUL |
+                            QIHSE_CPU_FEATURE_VAES |
+                            QIHSE_CPU_FEATURE_AVX512BITALG |
+                            QIHSE_CPU_FEATURE_AVX512VBMI |
+                            QIHSE_CPU_FEATURE_AVX512VBMI2 |
+                            QIHSE_CPU_FEATURE_AVX512IFMA |
+                            QIHSE_CPU_FEATURE_GFNI |
+                            QIHSE_CPU_FEATURE_CLZERO |
+                            QIHSE_CPU_FEATURE_CLWB |
+                            QIHSE_CPU_FEATURE_RDPID |
+                            QIHSE_CPU_FEATURE_CX16;
         info.has_osxsave = true;
         info.has_avx_support = true;
         info.has_avx512_support = true;
         info.features = features;
         return info;
     }
+
+    if (s_cached_cpu_info_ready) {
+        return s_cached_cpu_info;
+    }
+    pthread_mutex_lock(&s_cached_cpu_mutex);
+    if (s_cached_cpu_info_ready) {
+        pthread_mutex_unlock(&s_cached_cpu_mutex);
+        return s_cached_cpu_info;
+    }
+
+    qihse_cpu_info_t info;
+    init_cpu_info(&info);
 
 #if defined(_WIN32) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     uint64_t features = QIHSE_CPU_FEATURE_NONE;
@@ -664,6 +855,11 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         if (cpuInfo[2] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AESNI;
         if (cpuInfo[2] & (1 << 29)) features |= QIHSE_CPU_FEATURE_F16C;
         if (cpuInfo[2] & (1 << 30)) features |= QIHSE_CPU_FEATURE_RDRAND;
+        if (cpuInfo[2] & (1 << 13)) {
+            if (safe_execute_test(qihse_cpu_test_cx16)) {
+                features |= QIHSE_CPU_FEATURE_CX16;
+            }
+        }
 
         bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
         bool cpu_avx = (cpuInfo[2] & (1 << 28)) != 0;
@@ -693,6 +889,19 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                         features |= QIHSE_CPU_FEATURE_AVX2;
                     }
 
+                    if (info.has_avx_support) {
+                        if (cpuInfo[2] & (1 << 9)) {
+                            if (safe_execute_test(qihse_cpu_test_vaes)) {
+                                features |= QIHSE_CPU_FEATURE_VAES;
+                            }
+                        }
+                        if (cpuInfo[2] & (1 << 10)) {
+                            if (safe_execute_test(qihse_cpu_test_vpclmul)) {
+                                features |= QIHSE_CPU_FEATURE_VPCLMUL;
+                            }
+                        }
+                    }
+
                     /* Check AVX512: Foundation (EBX bit 16), OS support for ZMM (bits 5, 6, 7) */
                     bool cpu_avx512 = (cpuInfo[1] & (1 << 16)) != 0;
                     bool os_avx512 = (xcr0 & 0xe6) == 0xe6;
@@ -706,6 +915,31 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                         if (cpuInfo[1] & (1 << 17)) features |= QIHSE_CPU_FEATURE_AVX512DQ;
                         if ((unsigned int)cpuInfo[1] & (1u << 31)) features |= QIHSE_CPU_FEATURE_AVX512VL;
                         if (cpuInfo[2] & (1 << 11)) features |= QIHSE_CPU_FEATURE_AVX512VNNI;
+                        if (cpuInfo[1] & (1 << 21)) {
+                            if (safe_execute_test(qihse_cpu_test_avx512ifma)) {
+                                features |= QIHSE_CPU_FEATURE_AVX512IFMA;
+                            }
+                        }
+                        if (cpuInfo[2] & (1 << 1)) {
+                            if (safe_execute_test(qihse_cpu_test_avx512vbmi)) {
+                                features |= QIHSE_CPU_FEATURE_AVX512VBMI;
+                            }
+                        }
+                        if (cpuInfo[2] & (1 << 6)) {
+                            if (safe_execute_test(qihse_cpu_test_avx512vbmi2)) {
+                                features |= QIHSE_CPU_FEATURE_AVX512VBMI2;
+                            }
+                        }
+                        if (cpuInfo[2] & (1 << 12)) {
+                            if (safe_execute_test(qihse_cpu_test_avx512bitalg)) {
+                                features |= QIHSE_CPU_FEATURE_AVX512BITALG;
+                            }
+                        }
+                        if (cpuInfo[2] & (1 << 14)) {
+                            if (safe_execute_test(qihse_cpu_test_avx512vpopcntdq)) {
+                                features |= QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ;
+                            }
+                        }
                     }
 
                     /* AMX features: leaf 7 sub-leaf 0, EDX bits 22/24/25 */
@@ -757,9 +991,39 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
             if (cpuInfo[1] & (1 << 9))  features |= QIHSE_CPU_FEATURE_ERMS;
             if (cpuInfo[1] & (1 << 18)) features |= QIHSE_CPU_FEATURE_RDSEED;
             if (cpuInfo[1] & (1 << 19)) features |= QIHSE_CPU_FEATURE_ADX;
+            if (cpuInfo[1] & (1 << 24)) {
+                if (safe_execute_test(qihse_cpu_test_clwb)) {
+                    features |= QIHSE_CPU_FEATURE_CLWB;
+                }
+            }
+            if (cpuInfo[1] & (1 << 29)) {
+                if (safe_execute_test(qihse_cpu_test_shani)) {
+                    features |= QIHSE_CPU_FEATURE_SHANI;
+                }
+            }
+            if (cpuInfo[2] & (1 << 8)) {
+                if (safe_execute_test(qihse_cpu_test_gfni)) {
+                    features |= QIHSE_CPU_FEATURE_GFNI;
+                }
+            }
+            if (cpuInfo[2] & (1 << 22)) {
+                if (safe_execute_test(qihse_cpu_test_rdpid)) {
+                    features |= QIHSE_CPU_FEATURE_RDPID;
+                }
+            }
             if (cpuInfo[1] & (1 << 11)) {
                 if (safe_execute_test(qihse_cpu_test_rtm)) {
                     features |= QIHSE_CPU_FEATURE_RTM;
+                }
+            }
+        }
+
+        /* Extended Leaf 0x80000008: CLZERO in EBX bit 0 */
+        if (max_ext_leaf >= 0x80000008) {
+            qihse_raw_cpuid(cpuInfo, (int)0x80000008, 0);
+            if (cpuInfo[1] & (1 << 0)) {
+                if (safe_execute_test(qihse_cpu_test_clzero)) {
+                    features |= QIHSE_CPU_FEATURE_CLZERO;
                 }
             }
         }
@@ -773,6 +1037,9 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
     if (safe_execute_test(qihse_cpu_test_sse2)) features |= QIHSE_CPU_FEATURE_SSE2;
     info.features = features;
 #endif
+    s_cached_cpu_info = info;
+    s_cached_cpu_info_ready = 1;
+    pthread_mutex_unlock(&s_cached_cpu_mutex);
     return info;
 }
 
@@ -821,6 +1088,19 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_RTM: return "RTM";
         case QIHSE_CPU_FEATURE_RDSEED: return "RDSEED";
         case QIHSE_CPU_FEATURE_ADX: return "ADX";
+        case QIHSE_CPU_FEATURE_SHANI: return "SHA-NI";
+        case QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ: return "AVX-512 VPOPCNTDQ";
+        case QIHSE_CPU_FEATURE_VPCLMUL: return "VPCLMULQDQ";
+        case QIHSE_CPU_FEATURE_VAES: return "VAES";
+        case QIHSE_CPU_FEATURE_AVX512BITALG: return "AVX-512 BITALG";
+        case QIHSE_CPU_FEATURE_AVX512VBMI: return "AVX-512 VBMI";
+        case QIHSE_CPU_FEATURE_AVX512VBMI2: return "AVX-512 VBMI2";
+        case QIHSE_CPU_FEATURE_AVX512IFMA: return "AVX-512 IFMA";
+        case QIHSE_CPU_FEATURE_GFNI: return "GFNI";
+        case QIHSE_CPU_FEATURE_CLZERO: return "CLZERO";
+        case QIHSE_CPU_FEATURE_CLWB: return "CLWB";
+        case QIHSE_CPU_FEATURE_RDPID: return "RDPID";
+        case QIHSE_CPU_FEATURE_CX16: return "CX16";
         default: return "UNKNOWN";
     }
 }
@@ -862,6 +1142,19 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_RTM: return "Restricted Transactional Memory (TSX-RTM)";
         case QIHSE_CPU_FEATURE_RDSEED: return "Random Seed Generator (RDSEED)";
         case QIHSE_CPU_FEATURE_ADX: return "Multi-Precision Add-Carry Instruction Extensions (ADX)";
+        case QIHSE_CPU_FEATURE_SHANI: return "Secure Hash Algorithm New Instructions (SHA-NI)";
+        case QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ: return "AVX-512 Vector Population Count (Double/Quadword)";
+        case QIHSE_CPU_FEATURE_VPCLMUL: return "Vector Carry-Less Multiplication (VPCLMULQDQ)";
+        case QIHSE_CPU_FEATURE_VAES: return "Vector AES Instructions (VAES)";
+        case QIHSE_CPU_FEATURE_AVX512BITALG: return "AVX-512 Bit Algorithms (BITALG)";
+        case QIHSE_CPU_FEATURE_AVX512VBMI: return "AVX-512 Vector Byte Manipulation Instructions (VBMI)";
+        case QIHSE_CPU_FEATURE_AVX512VBMI2: return "AVX-512 Vector Byte Manipulation Instructions 2 (VBMI2)";
+        case QIHSE_CPU_FEATURE_AVX512IFMA: return "AVX-512 Integer Fused Multiply-Add (IFMA)";
+        case QIHSE_CPU_FEATURE_GFNI: return "Galois Field New Instructions (GFNI)";
+        case QIHSE_CPU_FEATURE_CLZERO: return "Zero Cache Line Instruction (CLZERO)";
+        case QIHSE_CPU_FEATURE_CLWB: return "Cache Line Write Back (CLWB)";
+        case QIHSE_CPU_FEATURE_RDPID: return "Read Processor ID (RDPID)";
+        case QIHSE_CPU_FEATURE_CX16: return "CMPXCHG16B 16-byte Atomic Compare-and-Swap";
         default: return "Unknown CPU feature";
     }
 }

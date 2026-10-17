@@ -66,6 +66,19 @@ typedef uint64_t qihse_cpu_feature_t;
 #define QIHSE_CPU_FEATURE_RTM           (1ULL << 32) /* RTM restricted transactional memory */
 #define QIHSE_CPU_FEATURE_RDSEED        (1ULL << 33) /* RDSEED random seed generator */
 #define QIHSE_CPU_FEATURE_ADX           (1ULL << 34) /* ADX multi-precision add-carry extensions */
+#define QIHSE_CPU_FEATURE_SHANI         (1ULL << 35) /* Intel SHA Extensions (SHA-NI) */
+#define QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ (1ULL << 36) /* AVX-512 Vector Population Count (Double/Quadword) */
+#define QIHSE_CPU_FEATURE_VPCLMUL       (1ULL << 37) /* VPCLMULQDQ carryless multiply 256/512-bit */
+#define QIHSE_CPU_FEATURE_VAES          (1ULL << 38) /* VAES Vector AES (256/512-bit) */
+#define QIHSE_CPU_FEATURE_AVX512BITALG  (1ULL << 39) /* AVX-512 Bit Algorithms */
+#define QIHSE_CPU_FEATURE_AVX512VBMI    (1ULL << 40) /* AVX-512 Vector Byte Manipulation Instructions */
+#define QIHSE_CPU_FEATURE_AVX512VBMI2   (1ULL << 41) /* AVX-512 Vector Byte Manipulation Instructions 2 */
+#define QIHSE_CPU_FEATURE_AVX512IFMA    (1ULL << 42) /* AVX-512 Integer Fused Multiply-Add */
+#define QIHSE_CPU_FEATURE_GFNI          (1ULL << 43) /* Galois Field New Instructions */
+#define QIHSE_CPU_FEATURE_CLZERO        (1ULL << 44) /* CLZERO Clear Cache Line (AMD Zen) */
+#define QIHSE_CPU_FEATURE_CLWB          (1ULL << 45) /* CLWB Cache Line Write Back */
+#define QIHSE_CPU_FEATURE_RDPID         (1ULL << 46) /* RDPID Read Processor ID */
+#define QIHSE_CPU_FEATURE_CX16          (1ULL << 47) /* CMPXCHG16B 16-byte atomic compare-and-swap */
 
 /* ============================================================================
  * BUILD-TIME ISA GUARD MACROS
@@ -241,6 +254,70 @@ typedef uint64_t qihse_cpu_feature_t;
 #  define QIHSE_HAS_ADX       0
 #endif
 
+#if defined(QIHSE_ENABLE_SHANI) && QIHSE_ENABLE_SHANI
+#  define QIHSE_HAS_SHANI     1
+#elif defined(__SHA__)
+#  define QIHSE_HAS_SHANI     1
+#else
+#  define QIHSE_HAS_SHANI     0
+#endif
+
+#if defined(QIHSE_ENABLE_AVX512VPOPCNTDQ) && QIHSE_ENABLE_AVX512VPOPCNTDQ
+#  define QIHSE_HAS_AVX512VPOPCNTDQ 1
+#elif defined(__AVX512VPOPCNTDQ__)
+#  define QIHSE_HAS_AVX512VPOPCNTDQ 1
+#else
+#  define QIHSE_HAS_AVX512VPOPCNTDQ 0
+#endif
+
+#if defined(QIHSE_ENABLE_VPCLMUL) && QIHSE_ENABLE_VPCLMUL
+#  define QIHSE_HAS_VPCLMUL   1
+#elif defined(__VPCLMULQDQ__)
+#  define QIHSE_HAS_VPCLMUL   1
+#else
+#  define QIHSE_HAS_VPCLMUL   0
+#endif
+
+#if defined(QIHSE_ENABLE_VAES) && QIHSE_ENABLE_VAES
+#  define QIHSE_HAS_VAES      1
+#elif defined(__VAES__)
+#  define QIHSE_HAS_VAES      1
+#else
+#  define QIHSE_HAS_VAES      0
+#endif
+
+#if defined(QIHSE_ENABLE_GFNI) && QIHSE_ENABLE_GFNI
+#  define QIHSE_HAS_GFNI      1
+#elif defined(__GFNI__)
+#  define QIHSE_HAS_GFNI      1
+#else
+#  define QIHSE_HAS_GFNI      0
+#endif
+
+#if defined(QIHSE_ENABLE_CLZERO) && QIHSE_ENABLE_CLZERO
+#  define QIHSE_HAS_CLZERO    1
+#elif defined(__CLZERO__)
+#  define QIHSE_HAS_CLZERO    1
+#else
+#  define QIHSE_HAS_CLZERO    0
+#endif
+
+#if defined(QIHSE_ENABLE_CLWB) && QIHSE_ENABLE_CLWB
+#  define QIHSE_HAS_CLWB      1
+#elif defined(__CLWB__)
+#  define QIHSE_HAS_CLWB      1
+#else
+#  define QIHSE_HAS_CLWB      0
+#endif
+
+#if defined(QIHSE_ENABLE_RDPID) && QIHSE_ENABLE_RDPID
+#  define QIHSE_HAS_RDPID     1
+#elif defined(__RDPID__)
+#  define QIHSE_HAS_RDPID     1
+#else
+#  define QIHSE_HAS_RDPID     0
+#endif
+
 /* ============================================================================
  * CPU DETECTION RESULTS
  * ============================================================================ */
@@ -305,6 +382,14 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature);
  * @return Feature description string
  */
 const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature);
+
+/**
+ * Execute a CPU instruction test function safely by trapping SIGILL/SIGSEGV.
+ *
+ * @param test_func Function pointer to the test function to execute
+ * @return true if the instruction executed successfully without faulting
+ */
+bool qihse_cpu_safe_execute_test(bool (*test_func)(void));
 
 /* ============================================================================
  * INDIVIDUAL FEATURE TESTS
@@ -425,6 +510,19 @@ bool qihse_cpu_test_bmi2(void);
 bool qihse_cpu_test_rtm(void);
 bool qihse_cpu_test_rdseed(void);
 bool qihse_cpu_test_adx(void);
+bool qihse_cpu_test_shani(void);
+bool qihse_cpu_test_avx512vpopcntdq(void);
+bool qihse_cpu_test_vpclmul(void);
+bool qihse_cpu_test_vaes(void);
+bool qihse_cpu_test_avx512bitalg(void);
+bool qihse_cpu_test_avx512vbmi(void);
+bool qihse_cpu_test_avx512vbmi2(void);
+bool qihse_cpu_test_avx512ifma(void);
+bool qihse_cpu_test_gfni(void);
+bool qihse_cpu_test_clzero(void);
+bool qihse_cpu_test_clwb(void);
+bool qihse_cpu_test_rdpid(void);
+bool qihse_cpu_test_cx16(void);
 
 static inline bool qihse_cpu_has_pclmul(const qihse_cpu_info_t* info) {
     return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_PCLMUL);
@@ -479,6 +577,48 @@ static inline bool qihse_cpu_has_avx2(const qihse_cpu_info_t* info) {
 }
 static inline bool qihse_cpu_has_ssse3(const qihse_cpu_info_t* info) {
     return info && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_SSSE3);
+}
+static inline bool qihse_cpu_has_shani(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_SHANI);
+}
+static inline bool qihse_cpu_has_avx512vpopcntdq(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512VPOPCNTDQ);
+}
+static inline bool qihse_cpu_has_vpclmul(const qihse_cpu_info_t* info) {
+    return info && info->has_avx_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_VPCLMUL);
+}
+static inline bool qihse_cpu_has_vaes(const qihse_cpu_info_t* info) {
+    return info && info->has_avx_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_VAES);
+}
+static inline bool qihse_cpu_has_avx512bitalg(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512BITALG);
+}
+static inline bool qihse_cpu_has_avx512vbmi(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512VBMI);
+}
+static inline bool qihse_cpu_has_avx512vbmi2(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512VBMI2);
+}
+static inline bool qihse_cpu_has_avx512ifma(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512IFMA);
+}
+static inline bool qihse_cpu_has_gfni(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_GFNI);
+}
+static inline bool qihse_cpu_has_clzero(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_CLZERO);
+}
+static inline bool qihse_cpu_has_clwb(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_CLWB);
+}
+static inline bool qihse_cpu_has_rdpid(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_RDPID);
+}
+static inline bool qihse_cpu_has_cx16(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_CX16);
+}
+static inline bool qihse_cpu_has_avx512vnni(const qihse_cpu_info_t* info) {
+    return info && info->has_avx512_support && (qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX512VNNI) || qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_VNNI));
 }
 
 /* ============================================================================

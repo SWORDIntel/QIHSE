@@ -47,6 +47,9 @@ make bench-cluster-crc
 
 # Run full system hotpath benchmark (KV, Gorilla, Trinary Trie):
 make bench-hotpath
+
+# Run Zen 4 & Zen 2 multi-architecture SIMD verification suite:
+make test-zen-epyc-simd
 ```
 
 ### Direct Binary Execution
@@ -56,4 +59,7 @@ LD_LIBRARY_PATH=. ./benchmarks/qihse_micro_bench
 
 # Carryless folding CRC benchmark:
 LD_LIBRARY_PATH=. ./benchmarks/qihse_cluster_crc_bench
+
+# Zen 4 & Zen 2 SIMD test binary:
+LD_LIBRARY_PATH=. ./tests/test_zen_epyc_simd
 ```
