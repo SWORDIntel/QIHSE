@@ -41,10 +41,108 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include <time.h>
+#include <pthread.h>
+#include <immintrin.h>
+#include "qihse_cpu_detect.h"
+
+#ifndef QIHSE_CPU_FEATURE_RDSEED
+#define QIHSE_CPU_FEATURE_RDSEED (1ULL << 33)
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#  if !defined(__RDSEED__)
+static inline int _rdseed64_step(unsigned long long *val) {
+    unsigned char ok;
+    __asm__ volatile("rdseed %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
+    return (int)ok;
+}
+#  endif
+#  if !defined(__RDRND__)
+static inline int _rdrand64_step(unsigned long long *val) {
+    unsigned char ok;
+    __asm__ volatile("rdrand %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
+    return (int)ok;
+}
+#  endif
+#  if !defined(__FSGSBASE__)
+static inline unsigned long long _readfsbase_u64(void) {
+    unsigned long long val;
+    __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a"(val));
+    return val;
+}
+#  endif
+#endif
+
 /* ── Provider initialisation ─────────────────────────────────────────── */
 
 static OSSL_PROVIDER *fips_provider    = NULL;
 static OSSL_PROVIDER *default_provider = NULL;
+
+static void qihse_pqc_inject_hardware_entropy(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    bool has_rdseed = false;
+    qihse_cpu_info_t cpu = qihse_cpu_detect();
+    if (cpu.features & QIHSE_CPU_FEATURE_RDSEED) {
+        has_rdseed = true;
+    } else {
+        /* Fallback direct CPUID leaf 7 subleaf 0 EBX[18] */
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+        if (eax >= 7) {
+            __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+            if (ebx & (1u << 18)) {
+                has_rdseed = true;
+            }
+        }
+    }
+
+    if (!has_rdseed) {
+        return;
+    }
+
+    uint64_t entropy_buf[8]; /* 64 bytes = 512 bits */
+    for (int i = 0; i < 8; i++) {
+        unsigned long long rdseed_val = 0;
+        for (int retry = 0; retry < 32; retry++) {
+            if (_rdseed64_step(&rdseed_val)) {
+                break;
+            }
+            _mm_pause();
+        }
+
+        unsigned long long rdrand_val = 0;
+        for (int retry = 0; retry < 10; retry++) {
+            if (_rdrand64_step(&rdrand_val)) {
+                break;
+            }
+            _mm_pause();
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t clock_entropy = ((uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32)) ^ (uint64_t)(uintptr_t)&ts;
+
+#if defined(__FSGSBASE__) || defined(QIHSE_ENABLE_FSGSBASE)
+        uint64_t fsbase = _readfsbase_u64();
+#else
+        uint64_t fsbase = (uint64_t)(uintptr_t)pthread_self();
+#endif
+        uint64_t mixed = rdseed_val ^ (uint64_t)rdrand_val ^ clock_entropy ^ fsbase;
+        /* SplitMix64 whitening */
+        mixed ^= (mixed >> 30);
+        mixed *= 0xbf58476d1ce4e5b9ULL;
+        mixed ^= (mixed >> 27);
+        mixed *= 0x94d049bb133111ebULL;
+        mixed ^= (mixed >> 31);
+
+        entropy_buf[i] = mixed;
+    }
+
+    RAND_add(entropy_buf, sizeof(entropy_buf), 64.0);
+    OPENSSL_cleanse(entropy_buf, sizeof(entropy_buf));
+#endif
+}
 
 /*
  * qihse_pqc_init_providers - Load the best available OpenSSL provider.
@@ -54,6 +152,7 @@ static OSSL_PROVIDER *default_provider = NULL;
  * back to the standard default provider.
  */
 int qihse_pqc_init_providers(void) {
+    int ret = 0;
     fips_provider = OSSL_PROVIDER_load(NULL, "fips");
     if (fips_provider) {
         /* Also load default so non-FIPS ops (e.g. rand seeding) still work */
@@ -62,14 +161,20 @@ int qihse_pqc_init_providers(void) {
             "[QIHSE PQC] FIPS 140-3 validated provider active "
             "(OpenSSL FIPS %s).\n",
             OSSL_PROVIDER_get0_name(fips_provider));
-        return 1;
+        ret = 1;
+    } else {
+        /* FIPS module not installed — fall back to standard provider */
+        default_provider = OSSL_PROVIDER_load(NULL, "default");
+        fprintf(stderr,
+            "[QIHSE PQC] FIPS provider not found; using standard OpenSSL provider.\n"
+            "            Install openssl-provider-fips for FIPS 140-3 validated operations.\n");
+        ret = 0;
     }
-    /* FIPS module not installed — fall back to standard provider */
-    default_provider = OSSL_PROVIDER_load(NULL, "default");
-    fprintf(stderr,
-        "[QIHSE PQC] FIPS provider not found; using standard OpenSSL provider.\n"
-        "            Install openssl-provider-fips for FIPS 140-3 validated operations.\n");
-    return 0;
+
+    /* NIST SP 800-90B/C compliant RDSEED physical quantum entropy injection */
+    qihse_pqc_inject_hardware_entropy();
+
+    return ret;
 }
 
 /* ── Internal key helpers ────────────────────────────────────────────── */
