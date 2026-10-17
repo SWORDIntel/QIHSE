@@ -430,14 +430,34 @@ float qihse_l2_sq_distance_f16c(const uint16_t *a, const uint16_t *b, size_t dim
 
 __attribute__((target("avx2,fma")))
 float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
     size_t i = 0;
+
+    for (; i + 32 <= dims; i += 32) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+        __m256 va2 = _mm256_loadu_ps(a + i + 16);
+        __m256 vb2 = _mm256_loadu_ps(b + i + 16);
+        __m256 va3 = _mm256_loadu_ps(a + i + 24);
+        __m256 vb3 = _mm256_loadu_ps(b + i + 24);
+
+        acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+        acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+        acc2 = _mm256_fmadd_ps(va2, vb2, acc2);
+        acc3 = _mm256_fmadd_ps(va3, vb3, acc3);
+    }
     for (; i + 8 <= dims; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
-        acc = _mm256_fmadd_ps(va, vb, acc);
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
     }
-    float result = hsum256(acc);
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    float result = hsum256(acc0);
     for (; i < dims; i++) result += a[i] * b[i];
     _mm256_zeroupper();
     return result;
@@ -445,45 +465,248 @@ float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
 
 __attribute__((target("avx2,fma")))
 float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims) {
-    __m256 acc_dot = _mm256_setzero_ps();
-    __m256 acc_na  = _mm256_setzero_ps();
-    __m256 acc_nb  = _mm256_setzero_ps();
+    __m256 dot0 = _mm256_setzero_ps(), dot1 = _mm256_setzero_ps();
+    __m256 na0  = _mm256_setzero_ps(), na1  = _mm256_setzero_ps();
+    __m256 nb0  = _mm256_setzero_ps(), nb1  = _mm256_setzero_ps();
     size_t i = 0;
+    for (; i + 16 <= dims; i += 16) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+
+        dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
+        na0  = _mm256_fmadd_ps(va0, va0, na0);
+        nb0  = _mm256_fmadd_ps(vb0, vb0, nb0);
+
+        dot1 = _mm256_fmadd_ps(va1, vb1, dot1);
+        na1  = _mm256_fmadd_ps(va1, va1, na1);
+        nb1  = _mm256_fmadd_ps(vb1, vb1, nb1);
+    }
     for (; i + 8 <= dims; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
-        acc_dot = _mm256_fmadd_ps(va, vb, acc_dot);
-        acc_na  = _mm256_fmadd_ps(va, va, acc_na);
-        acc_nb  = _mm256_fmadd_ps(vb, vb, acc_nb);
+        dot0 = _mm256_fmadd_ps(va, vb, dot0);
+        na0  = _mm256_fmadd_ps(va, va, na0);
+        nb0  = _mm256_fmadd_ps(vb, vb, nb0);
     }
-    float dot = hsum256(acc_dot), na = hsum256(acc_na), nb = hsum256(acc_nb);
+    __m256 dot = _mm256_add_ps(dot0, dot1);
+    __m256 na  = _mm256_add_ps(na0, na1);
+    __m256 nb  = _mm256_add_ps(nb0, nb1);
+    float dot_val = hsum256(dot);
+    float na_val  = hsum256(na);
+    float nb_val  = hsum256(nb);
     for (; i < dims; i++) {
-        dot += a[i] * b[i];
-        na  += a[i] * a[i];
-        nb  += b[i] * b[i];
+        dot_val += a[i] * b[i];
+        na_val  += a[i] * a[i];
+        nb_val  += b[i] * b[i];
     }
     _mm256_zeroupper();
-    if (na <= 0.0f || nb <= 0.0f) return 0.0f;
-    return dot / (sqrtf(na) * sqrtf(nb));
+    if (na_val <= 0.0f || nb_val <= 0.0f) return 0.0f;
+    return dot_val / (sqrtf(na_val) * sqrtf(nb_val));
+}
+
+__attribute__((target("avx2,fma")))
+float qihse_cosine_distance_avx2(const float *a, const float *b, size_t dim, float norm_a, float norm_b) {
+    if (norm_a <= 0.0f && norm_b <= 0.0f) {
+        return qihse_distance_cosine_avx2(a, b, dim);
+    }
+    if (norm_a <= 0.0f) {
+        float sq_a = qihse_distance_dot_avx2(a, a, dim);
+        if (sq_a <= 0.0f) return 0.0f;
+        norm_a = sqrtf(sq_a);
+    }
+    if (norm_b <= 0.0f) {
+        float sq_b = qihse_distance_dot_avx2(b, b, dim);
+        if (sq_b <= 0.0f) return 0.0f;
+        norm_b = sqrtf(sq_b);
+    }
+    if (norm_a <= 0.0f || norm_b <= 0.0f) return 0.0f;
+    float dot = qihse_distance_dot_avx2(a, b, dim);
+    return dot / (norm_a * norm_b);
 }
 
 __attribute__((target("avx2,fma")))
 float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
     size_t i = 0;
+
+    for (; i + 32 <= dims; i += 32) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+        __m256 va2 = _mm256_loadu_ps(a + i + 16);
+        __m256 vb2 = _mm256_loadu_ps(b + i + 16);
+        __m256 va3 = _mm256_loadu_ps(a + i + 24);
+        __m256 vb3 = _mm256_loadu_ps(b + i + 24);
+
+        __m256 diff0 = _mm256_sub_ps(va0, vb0);
+        __m256 diff1 = _mm256_sub_ps(va1, vb1);
+        __m256 diff2 = _mm256_sub_ps(va2, vb2);
+        __m256 diff3 = _mm256_sub_ps(va3, vb3);
+
+        acc0 = _mm256_fmadd_ps(diff0, diff0, acc0);
+        acc1 = _mm256_fmadd_ps(diff1, diff1, acc1);
+        acc2 = _mm256_fmadd_ps(diff2, diff2, acc2);
+        acc3 = _mm256_fmadd_ps(diff3, diff3, acc3);
+    }
     for (; i + 8 <= dims; i += 8) {
         __m256 va   = _mm256_loadu_ps(a + i);
         __m256 vb   = _mm256_loadu_ps(b + i);
         __m256 diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_fmadd_ps(diff, diff, acc);
+        acc0 = _mm256_fmadd_ps(diff, diff, acc0);
     }
-    float result = hsum256(acc);
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    float result = hsum256(acc0);
     for (; i < dims; i++) {
         float d = a[i] - b[i];
         result += d * d;
     }
     _mm256_zeroupper();
     return sqrtf(result);
+}
+
+__attribute__((target("avx2,fma,f16c")))
+float qihse_dot_product_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    size_t i = 0;
+    for (; i + 32 <= dim; i += 32) {
+        __m128i ha0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i hb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i ha1 = _mm_loadu_si128((const __m128i*)(a + i + 8));
+        __m128i hb1 = _mm_loadu_si128((const __m128i*)(b + i + 8));
+        __m128i ha2 = _mm_loadu_si128((const __m128i*)(a + i + 16));
+        __m128i hb2 = _mm_loadu_si128((const __m128i*)(b + i + 16));
+        __m128i ha3 = _mm_loadu_si128((const __m128i*)(a + i + 24));
+        __m128i hb3 = _mm_loadu_si128((const __m128i*)(b + i + 24));
+
+        __m256 va0 = _mm256_cvtph_ps(ha0);
+        __m256 vb0 = _mm256_cvtph_ps(hb0);
+        __m256 va1 = _mm256_cvtph_ps(ha1);
+        __m256 vb1 = _mm256_cvtph_ps(hb1);
+        __m256 va2 = _mm256_cvtph_ps(ha2);
+        __m256 vb2 = _mm256_cvtph_ps(hb2);
+        __m256 va3 = _mm256_cvtph_ps(ha3);
+        __m256 vb3 = _mm256_cvtph_ps(hb3);
+
+        acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+        acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+        acc2 = _mm256_fmadd_ps(va2, vb2, acc2);
+        acc3 = _mm256_fmadd_ps(va3, vb3, acc3);
+    }
+
+    for (; i + 8 <= dim; i += 8) {
+        __m128i ha = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i hb = _mm_loadu_si128((const __m128i*)(b + i));
+        __m256 va = _mm256_cvtph_ps(ha);
+        __m256 vb = _mm256_cvtph_ps(hb);
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
+    }
+
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    float result = hsum256(acc0);
+
+    if (i < dim) {
+        uint16_t tmp_a[8] = {0};
+        uint16_t tmp_b[8] = {0};
+        size_t rem = dim - i;
+        for (size_t r = 0; r < rem; r++) {
+            tmp_a[r] = a[i + r];
+            tmp_b[r] = b[i + r];
+        }
+        __m256 va = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp_a));
+        __m256 vb = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp_b));
+        float fa[8], fb[8];
+        _mm256_storeu_ps(fa, va);
+        _mm256_storeu_ps(fb, vb);
+        for (size_t r = 0; r < rem; r++) {
+            result += fa[r] * fb[r];
+        }
+    }
+
+    _mm256_zeroupper();
+    return result;
+}
+
+__attribute__((target("avx2,fma,f16c")))
+float qihse_l2_sq_distance_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    size_t i = 0;
+    for (; i + 32 <= dim; i += 32) {
+        __m128i ha0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i hb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i ha1 = _mm_loadu_si128((const __m128i*)(a + i + 8));
+        __m128i hb1 = _mm_loadu_si128((const __m128i*)(b + i + 8));
+        __m128i ha2 = _mm_loadu_si128((const __m128i*)(a + i + 16));
+        __m128i hb2 = _mm_loadu_si128((const __m128i*)(b + i + 16));
+        __m128i ha3 = _mm_loadu_si128((const __m128i*)(a + i + 24));
+        __m128i hb3 = _mm_loadu_si128((const __m128i*)(b + i + 24));
+
+        __m256 va0 = _mm256_cvtph_ps(ha0);
+        __m256 vb0 = _mm256_cvtph_ps(hb0);
+        __m256 va1 = _mm256_cvtph_ps(ha1);
+        __m256 vb1 = _mm256_cvtph_ps(hb1);
+        __m256 va2 = _mm256_cvtph_ps(ha2);
+        __m256 vb2 = _mm256_cvtph_ps(hb2);
+        __m256 va3 = _mm256_cvtph_ps(ha3);
+        __m256 vb3 = _mm256_cvtph_ps(hb3);
+
+        __m256 d0 = _mm256_sub_ps(va0, vb0);
+        __m256 d1 = _mm256_sub_ps(va1, vb1);
+        __m256 d2 = _mm256_sub_ps(va2, vb2);
+        __m256 d3 = _mm256_sub_ps(va3, vb3);
+
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm256_fmadd_ps(d3, d3, acc3);
+    }
+
+    for (; i + 8 <= dim; i += 8) {
+        __m128i ha = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i hb = _mm_loadu_si128((const __m128i*)(b + i));
+        __m256 va = _mm256_cvtph_ps(ha);
+        __m256 vb = _mm256_cvtph_ps(hb);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc0 = _mm256_fmadd_ps(diff, diff, acc0);
+    }
+
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    float result = hsum256(acc0);
+
+    if (i < dim) {
+        uint16_t tmp_a[8] = {0};
+        uint16_t tmp_b[8] = {0};
+        size_t rem = dim - i;
+        for (size_t r = 0; r < rem; r++) {
+            tmp_a[r] = a[i + r];
+            tmp_b[r] = b[i + r];
+        }
+        __m256 va = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp_a));
+        __m256 vb = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp_b));
+        float fa[8], fb[8];
+        _mm256_storeu_ps(fa, va);
+        _mm256_storeu_ps(fb, vb);
+        for (size_t r = 0; r < rem; r++) {
+            float diff = fa[r] - fb[r];
+            result += diff * diff;
+        }
+    }
+
+    _mm256_zeroupper();
+    return result;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -665,8 +888,18 @@ float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
 float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims) {
     return qihse_distance_cosine_scalar(a, b, dims);
 }
+float qihse_cosine_distance_avx2(const float *a, const float *b, size_t dim, float norm_a, float norm_b) {
+    return qihse_cosine_distance_avx(a, b, dim, norm_a, norm_b);
+}
 float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims) {
     return qihse_distance_euclidean_scalar(a, b, dims);
+}
+
+float qihse_dot_product_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    return qihse_dot_product_f16c(a, b, dim);
+}
+float qihse_l2_sq_distance_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    return qihse_l2_sq_distance_f16c(a, b, dim);
 }
 
 /* AVX-512 stubs for non-x86 platforms */
@@ -699,8 +932,10 @@ static void qihse_distance_init_once(void) {
         g_cosine_fn    = qihse_distance_cosine_avx512;
         g_dot_fn       = qihse_distance_dot_avx512;
         g_euclidean_fn = qihse_distance_euclidean_avx512;
-    } else if (info.has_avx_support && qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX2)) {
-        /* AVX2 + FMA path — 8 floats per instruction */
+    } else if (info.has_avx_support &&
+               qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_AVX2) &&
+               qihse_cpu_has_feature(&info, QIHSE_CPU_FEATURE_FMA)) {
+        /* AVX2 + FMA path — 8 floats per instruction, 4-way unrolled */
         g_cosine_fn    = qihse_distance_cosine_avx2;
         g_dot_fn       = qihse_distance_dot_avx2;
         g_euclidean_fn = qihse_distance_euclidean_avx2;

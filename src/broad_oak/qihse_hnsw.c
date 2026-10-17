@@ -95,6 +95,17 @@ static bool hnsw_has_f16c(void) {
     return s_has_f16c == 1;
 }
 
+static bool hnsw_has_f16c_fma(void) {
+    static int s_has_f16c_fma = -1;
+    if (s_has_f16c_fma < 0) {
+        qihse_cpu_info_t info = qihse_cpu_detect();
+        s_has_f16c_fma = (qihse_cpu_has_avx2(&info) &&
+                          qihse_cpu_has_fma(&info) &&
+                          qihse_cpu_has_f16c(&info)) ? 1 : 0;
+    }
+    return s_has_f16c_fma == 1;
+}
+
 /* Convert FP32 floats to FP16 half-precision */
 static void float_to_fp16_array(const float *src, uint16_t *dst, size_t dim) {
 #if defined(__x86_64__) && (defined(__F16C__) || defined(QIHSE_ENABLE_F16C))
@@ -176,7 +187,11 @@ static inline float hnsw_node_dist(qihse_hnsw_index_t *index, const float *query
         const uint16_t *fp16_vec = get_layer0_fp16_vector(index, node);
         if (fp16_vec) {
             index->last_search_dist_calls++;
-            return qihse_l2_sq_distance_f16c(query_fp16, fp16_vec, index->params.dim);
+            if (hnsw_has_f16c_fma()) {
+                return qihse_l2_sq_distance_f16c_fma(query_fp16, fp16_vec, index->params.dim);
+            } else {
+                return qihse_l2_sq_distance_f16c(query_fp16, fp16_vec, index->params.dim);
+            }
         }
     }
     return real_dist_q(index, query, node);

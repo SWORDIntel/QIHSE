@@ -28,36 +28,44 @@ extern "C" {
  * CPU SIMD capability flags.
  * Each flag represents a tested and verified SIMD feature.
  */
-typedef enum qihse_cpu_feature_e {
-    QIHSE_CPU_FEATURE_NONE      = 0,
-    QIHSE_CPU_FEATURE_SSE       = (1 << 0),  /* SSE instruction set */
-    QIHSE_CPU_FEATURE_SSE2      = (1 << 1),  /* SSE2 instruction set */
-    QIHSE_CPU_FEATURE_SSE3      = (1 << 2),  /* SSE3 instruction set */
-    QIHSE_CPU_FEATURE_SSSE3     = (1 << 3),  /* SSSE3 instruction set */
-    QIHSE_CPU_FEATURE_SSE4_1    = (1 << 4),  /* SSE4.1 instruction set */
-    QIHSE_CPU_FEATURE_SSE4_2    = (1 << 5),  /* SSE4.2 instruction set */
-    QIHSE_CPU_FEATURE_AVX       = (1 << 6),  /* AVX instruction set */
-    QIHSE_CPU_FEATURE_AVX2      = (1 << 7),  /* AVX2 instruction set */
-    QIHSE_CPU_FEATURE_AVX512F   = (1 << 8),  /* AVX-512 Foundation */
-    QIHSE_CPU_FEATURE_AVX512BW  = (1 << 9),  /* AVX-512 Byte/Word */
-    QIHSE_CPU_FEATURE_AVX512DQ  = (1 << 10), /* AVX-512 Doubleword/Quadword */
-    QIHSE_CPU_FEATURE_AVX512VL  = (1 << 11), /* AVX-512 Vector Length */
-    QIHSE_CPU_FEATURE_AMX       = (1 << 12), /* Advanced Matrix Extensions */
-    QIHSE_CPU_FEATURE_AMX_TILE  = (1 << 13), /* AMX Tile operations */
-    QIHSE_CPU_FEATURE_AMX_INT8  = (1 << 14), /* AMX INT8 operations */
-    QIHSE_CPU_FEATURE_VNNI       = (1 << 15), /* AVX-512 VNNI (512-bit) */
-    QIHSE_CPU_FEATURE_AVX512VNNI = (1 << 16), /* AVX-512 VNNI (alias) */
-    QIHSE_CPU_FEATURE_AVX_VNNI   = (1 << 17), /* AVX-VNNI: VEX vpdpbusd, no AVX-512 needed */
-    QIHSE_CPU_FEATURE_AMX_BF16   = (1 << 18), /* AMX BFloat16 tile multiply */
-    QIHSE_CPU_FEATURE_AVX512BF16 = (1 << 19), /* AVX-512 BFloat16 (dpbf16ps) */
-    QIHSE_CPU_FEATURE_PCLMUL     = (1ULL << 20), /* PCLMULQDQ carryless multiply */
-    QIHSE_CPU_FEATURE_POPCNT     = (1ULL << 21), /* POPCNT population count */
-    QIHSE_CPU_FEATURE_AESNI      = (1ULL << 22), /* AES-NI dedicated round instructions */
-    QIHSE_CPU_FEATURE_F16C       = (1ULL << 23), /* F16C half-precision float conversions */
-    QIHSE_CPU_FEATURE_RDRAND     = (1ULL << 24), /* RDRAND hardware random number generator */
-    QIHSE_CPU_FEATURE_FSGSBASE   = (1ULL << 25), /* FSGSBASE user-space base register access */
-    QIHSE_CPU_FEATURE_ERMS       = (1ULL << 26)  /* ERMS Enhanced REP MOVSB/STOSB */
-} qihse_cpu_feature_t;
+typedef uint64_t qihse_cpu_feature_t;
+
+#define QIHSE_CPU_FEATURE_NONE          0ULL
+#define QIHSE_CPU_FEATURE_SSE           (1ULL << 0)  /* SSE instruction set */
+#define QIHSE_CPU_FEATURE_SSE2          (1ULL << 1)  /* SSE2 instruction set */
+#define QIHSE_CPU_FEATURE_SSE3          (1ULL << 2)  /* SSE3 instruction set */
+#define QIHSE_CPU_FEATURE_SSSE3         (1ULL << 3)  /* SSSE3 instruction set */
+#define QIHSE_CPU_FEATURE_SSE4_1        (1ULL << 4)  /* SSE4.1 instruction set */
+#define QIHSE_CPU_FEATURE_SSE4_2        (1ULL << 5)  /* SSE4.2 instruction set */
+#define QIHSE_CPU_FEATURE_AVX           (1ULL << 6)  /* AVX instruction set */
+#define QIHSE_CPU_FEATURE_AVX2          (1ULL << 7)  /* AVX2 instruction set */
+#define QIHSE_CPU_FEATURE_AVX512F       (1ULL << 8)  /* AVX-512 Foundation */
+#define QIHSE_CPU_FEATURE_AVX512BW      (1ULL << 9)  /* AVX-512 Byte/Word */
+#define QIHSE_CPU_FEATURE_AVX512DQ      (1ULL << 10) /* AVX-512 Doubleword/Quadword */
+#define QIHSE_CPU_FEATURE_AVX512VL      (1ULL << 11) /* AVX-512 Vector Length */
+#define QIHSE_CPU_FEATURE_AMX           (1ULL << 12) /* Advanced Matrix Extensions */
+#define QIHSE_CPU_FEATURE_AMX_TILE      (1ULL << 13) /* AMX Tile operations */
+#define QIHSE_CPU_FEATURE_AMX_INT8      (1ULL << 14) /* AMX INT8 operations */
+#define QIHSE_CPU_FEATURE_VNNI          (1ULL << 15) /* AVX-512 VNNI (512-bit) */
+#define QIHSE_CPU_FEATURE_AVX512VNNI    (1ULL << 16) /* AVX-512 VNNI (alias) */
+#define QIHSE_CPU_FEATURE_AVX_VNNI      (1ULL << 17) /* AVX-VNNI: VEX vpdpbusd, no AVX-512 needed */
+#define QIHSE_CPU_FEATURE_AMX_BF16      (1ULL << 18) /* AMX BFloat16 tile multiply */
+#define QIHSE_CPU_FEATURE_AVX512BF16    (1ULL << 19) /* AVX-512 BFloat16 (dpbf16ps) */
+#define QIHSE_CPU_FEATURE_PCLMUL        (1ULL << 20) /* PCLMULQDQ carryless multiply */
+#define QIHSE_CPU_FEATURE_POPCNT        (1ULL << 21) /* POPCNT population count */
+#define QIHSE_CPU_FEATURE_AESNI         (1ULL << 22) /* AES-NI dedicated round instructions */
+#define QIHSE_CPU_FEATURE_F16C          (1ULL << 23) /* F16C half-precision float conversions */
+#define QIHSE_CPU_FEATURE_RDRAND        (1ULL << 24) /* RDRAND hardware random number generator */
+#define QIHSE_CPU_FEATURE_FSGSBASE      (1ULL << 25) /* FSGSBASE user-space base register access */
+#define QIHSE_CPU_FEATURE_ERMS          (1ULL << 26) /* ERMS Enhanced REP MOVSB/STOSB */
+#define QIHSE_CPU_FEATURE_FMA           (1ULL << 27) /* FMA fused multiply-add */
+#define QIHSE_CPU_FEATURE_MOVBE         (1ULL << 28) /* MOVBE move data after swapping bytes */
+#define QIHSE_CPU_FEATURE_LZCNT         (1ULL << 29) /* LZCNT leading zero count */
+#define QIHSE_CPU_FEATURE_BMI1          (1ULL << 30) /* BMI1 bit manipulation instruction set 1 */
+#define QIHSE_CPU_FEATURE_BMI2          (1ULL << 31) /* BMI2 bit manipulation instruction set 2 */
+#define QIHSE_CPU_FEATURE_RTM           (1ULL << 32) /* RTM restricted transactional memory */
+#define QIHSE_CPU_FEATURE_RDSEED        (1ULL << 33) /* RDSEED random seed generator */
+#define QIHSE_CPU_FEATURE_ADX           (1ULL << 34) /* ADX multi-precision add-carry extensions */
 
 /* ============================================================================
  * BUILD-TIME ISA GUARD MACROS
@@ -167,6 +175,70 @@ typedef enum qihse_cpu_feature_e {
 #  define QIHSE_HAS_AMX       1
 #else
 #  define QIHSE_HAS_AMX       0
+#endif
+
+#if defined(QIHSE_ENABLE_FMA) && QIHSE_ENABLE_FMA
+#  define QIHSE_HAS_FMA       1
+#elif defined(__FMA__)
+#  define QIHSE_HAS_FMA       1
+#else
+#  define QIHSE_HAS_FMA       0
+#endif
+
+#if defined(QIHSE_ENABLE_MOVBE) && QIHSE_ENABLE_MOVBE
+#  define QIHSE_HAS_MOVBE     1
+#elif defined(__MOVBE__)
+#  define QIHSE_HAS_MOVBE     1
+#else
+#  define QIHSE_HAS_MOVBE     0
+#endif
+
+#if defined(QIHSE_ENABLE_LZCNT) && QIHSE_ENABLE_LZCNT
+#  define QIHSE_HAS_LZCNT     1
+#elif defined(__LZCNT__)
+#  define QIHSE_HAS_LZCNT     1
+#else
+#  define QIHSE_HAS_LZCNT     0
+#endif
+
+#if defined(QIHSE_ENABLE_BMI1) && QIHSE_ENABLE_BMI1
+#  define QIHSE_HAS_BMI1      1
+#elif defined(__BMI__)
+#  define QIHSE_HAS_BMI1      1
+#else
+#  define QIHSE_HAS_BMI1      0
+#endif
+
+#if defined(QIHSE_ENABLE_BMI2) && QIHSE_ENABLE_BMI2
+#  define QIHSE_HAS_BMI2      1
+#elif defined(__BMI2__)
+#  define QIHSE_HAS_BMI2      1
+#else
+#  define QIHSE_HAS_BMI2      0
+#endif
+
+#if defined(QIHSE_ENABLE_RTM) && QIHSE_ENABLE_RTM
+#  define QIHSE_HAS_RTM       1
+#elif defined(__RTM__)
+#  define QIHSE_HAS_RTM       1
+#else
+#  define QIHSE_HAS_RTM       0
+#endif
+
+#if defined(QIHSE_ENABLE_RDSEED) && QIHSE_ENABLE_RDSEED
+#  define QIHSE_HAS_RDSEED    1
+#elif defined(__RDSEED__)
+#  define QIHSE_HAS_RDSEED    1
+#else
+#  define QIHSE_HAS_RDSEED    0
+#endif
+
+#if defined(QIHSE_ENABLE_ADX) && QIHSE_ENABLE_ADX
+#  define QIHSE_HAS_ADX       1
+#elif defined(__ADX__)
+#  define QIHSE_HAS_ADX       1
+#else
+#  define QIHSE_HAS_ADX       0
 #endif
 
 /* ============================================================================
@@ -345,6 +417,14 @@ bool qihse_cpu_test_f16c(void);
  * @return true if RDRAND instructions execute successfully
  */
 bool qihse_cpu_test_rdrand(void);
+bool qihse_cpu_test_fma(void);
+bool qihse_cpu_test_movbe(void);
+bool qihse_cpu_test_lzcnt(void);
+bool qihse_cpu_test_bmi1(void);
+bool qihse_cpu_test_bmi2(void);
+bool qihse_cpu_test_rtm(void);
+bool qihse_cpu_test_rdseed(void);
+bool qihse_cpu_test_adx(void);
 
 static inline bool qihse_cpu_has_pclmul(const qihse_cpu_info_t* info) {
     return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_PCLMUL);
@@ -367,8 +447,35 @@ static inline bool qihse_cpu_has_fsgsbase(const qihse_cpu_info_t* info) {
 static inline bool qihse_cpu_has_erms(const qihse_cpu_info_t* info) {
     return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_ERMS);
 }
+static inline bool qihse_cpu_has_fma(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_FMA);
+}
+static inline bool qihse_cpu_has_movbe(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_MOVBE);
+}
+static inline bool qihse_cpu_has_lzcnt(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_LZCNT);
+}
+static inline bool qihse_cpu_has_bmi1(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_BMI1);
+}
+static inline bool qihse_cpu_has_bmi2(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_BMI2);
+}
+static inline bool qihse_cpu_has_rtm(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_RTM);
+}
+static inline bool qihse_cpu_has_rdseed(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_RDSEED);
+}
+static inline bool qihse_cpu_has_adx(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_ADX);
+}
 static inline bool qihse_cpu_has_avx(const qihse_cpu_info_t* info) {
     return info && info->has_avx_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX);
+}
+static inline bool qihse_cpu_has_avx2(const qihse_cpu_info_t* info) {
+    return info && info->has_avx_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX2);
 }
 static inline bool qihse_cpu_has_ssse3(const qihse_cpu_info_t* info) {
     return info && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_SSSE3);

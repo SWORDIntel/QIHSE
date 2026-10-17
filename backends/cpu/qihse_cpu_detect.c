@@ -7,6 +7,9 @@
  * Author: DSMIL System
  * License: MIT
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include "qihse_cpu_detect.h"
 #include <string.h>
@@ -24,6 +27,7 @@
 #elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <signal.h>
 #include <setjmp.h>
+#include <immintrin.h>
 static inline void qihse_raw_cpuid(int cpuInfo[4], int leaf, int subleaf) {
     __asm__ volatile("cpuid"
                      : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]), "=c"(cpuInfo[2]), "=d"(cpuInfo[3])
@@ -443,6 +447,135 @@ bool qihse_cpu_test_rdrand(void) {
 #endif
 }
 
+bool qihse_cpu_test_fma(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __asm__ volatile (
+        "vxorps %%xmm0, %%xmm0, %%xmm0\n\t"
+        "vfmadd213ps %%xmm0, %%xmm0, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0"
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_movbe(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    uint32_t src = 0x12345678, dst = 0;
+    __asm__ volatile (
+        "movbe %1, %0\n\t"
+        : "=r"(dst)
+        : "m"(src)
+    );
+    return dst == 0x78563412;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_lzcnt(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    uint32_t val = 0x00010000;
+    uint32_t cnt = 0;
+    __asm__ volatile (
+        "lzcnt %1, %0\n\t"
+        : "=r"(cnt)
+        : "r"(val)
+    );
+    return cnt == 15;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_bmi1(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    uint32_t val = 0x00010000;
+    uint32_t res = 0;
+    __asm__ volatile (
+        "tzcnt %1, %0\n\t"
+        : "=r"(res)
+        : "r"(val)
+    );
+    return res == 16;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_bmi2(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    uint32_t val = 0x12345678;
+    uint32_t res = 0;
+    __asm__ volatile (
+        "rorx $4, %1, %0\n\t"
+        : "=r"(res)
+        : "r"(val)
+    );
+    return res != 0;
+#else
+    return false;
+#endif
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+#ifndef _XBEGIN_STARTED
+#define _XBEGIN_STARTED (~0u)
+#endif
+__attribute__((target("rtm")))
+bool qihse_cpu_test_rtm(void) {
+    unsigned int status = _xbegin();
+    if (status == _XBEGIN_STARTED) {
+        _xend();
+        return true;
+    }
+    return false;
+}
+#else
+bool qihse_cpu_test_rtm(void) {
+    return false;
+}
+#endif
+
+bool qihse_cpu_test_rdseed(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned long val = 0;
+    unsigned char ok = 0;
+    __asm__ volatile (
+        "rdseed %0\n\t"
+        "setc %1\n\t"
+        : "=r"(val), "=qm"(ok)
+        :
+        : "cc"
+    );
+    (void)val;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_adx(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned long a = 1, b = 2;
+    unsigned char carry = 0;
+    __asm__ volatile (
+        "clc\n\t"
+        "adcx %2, %0\n\t"
+        "setc %1\n\t"
+        : "+r"(a), "=qm"(carry)
+        : "r"(b)
+        : "cc"
+    );
+    (void)carry;
+    return a == 3;
+#else
+    return false;
+#endif
+}
+
 /* ============================================================================
  * CPU INFORMATION GATHERING
  * ============================================================================ */
@@ -492,7 +625,15 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                             QIHSE_CPU_FEATURE_F16C |
                             QIHSE_CPU_FEATURE_RDRAND |
                             QIHSE_CPU_FEATURE_FSGSBASE |
-                            QIHSE_CPU_FEATURE_ERMS;
+                            QIHSE_CPU_FEATURE_ERMS |
+                            QIHSE_CPU_FEATURE_FMA |
+                            QIHSE_CPU_FEATURE_MOVBE |
+                            QIHSE_CPU_FEATURE_LZCNT |
+                            QIHSE_CPU_FEATURE_BMI1 |
+                            QIHSE_CPU_FEATURE_BMI2 |
+                            QIHSE_CPU_FEATURE_RTM |
+                            QIHSE_CPU_FEATURE_RDSEED |
+                            QIHSE_CPU_FEATURE_ADX;
         info.has_osxsave = true;
         info.has_avx_support = true;
         info.has_avx512_support = true;
@@ -518,6 +659,7 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
 
         /* Ivy Bridge / Sandy Bridge crypto, bit manipulation, and FP16 */
         if (cpuInfo[2] & (1 << 1))  features |= QIHSE_CPU_FEATURE_PCLMUL;
+        if (cpuInfo[2] & (1 << 22)) features |= QIHSE_CPU_FEATURE_MOVBE;
         if (cpuInfo[2] & (1 << 23)) features |= QIHSE_CPU_FEATURE_POPCNT;
         if (cpuInfo[2] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AESNI;
         if (cpuInfo[2] & (1 << 29)) features |= QIHSE_CPU_FEATURE_F16C;
@@ -525,9 +667,10 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
 
         bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
         bool cpu_avx = (cpuInfo[2] & (1 << 28)) != 0;
+        bool cpu_fma = (cpuInfo[2] & (1 << 12)) != 0;
         info.has_osxsave = osxsave;
 
-        if (osxsave && cpu_avx) {
+        if (osxsave) {
             uint64_t xcr0 = 0;
 #ifdef _WIN32
             xcr0 = _xgetbv(0);
@@ -536,8 +679,13 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
 #endif
             /* Check if XMM (bit 1) and YMM (bit 2) are enabled by OS */
             if ((xcr0 & 0x6) == 0x6) {
-                info.has_avx_support = true;
-                features |= QIHSE_CPU_FEATURE_AVX;
+                if (cpu_avx) {
+                    info.has_avx_support = true;
+                    features |= QIHSE_CPU_FEATURE_AVX;
+                }
+                if (cpu_fma) {
+                    features |= QIHSE_CPU_FEATURE_FMA;
+                }
 
                 if (max_leaf >= 7) {
                     qihse_raw_cpuid(cpuInfo, 7, 0);
@@ -590,11 +738,30 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
             }
         }
 
+        /* Leaf 0x80000001: ECX[5] for LZCNT (ABM) */
+        qihse_raw_cpuid(cpuInfo, (int)0x80000000, 0);
+        uint32_t max_ext_leaf = (uint32_t)cpuInfo[0];
+        if (max_ext_leaf >= 0x80000001) {
+            qihse_raw_cpuid(cpuInfo, (int)0x80000001, 0);
+            if (cpuInfo[2] & (1 << 5)) {
+                features |= QIHSE_CPU_FEATURE_LZCNT;
+            }
+        }
+
         /* Leaf 7 Subleaf 0: non-vector features probed independently of AVX / OSXSAVE */
         if (max_leaf >= 7) {
             qihse_raw_cpuid(cpuInfo, 7, 0);
-            if (cpuInfo[1] & (1 << 0)) features |= QIHSE_CPU_FEATURE_FSGSBASE;
-            if (cpuInfo[1] & (1 << 9)) features |= QIHSE_CPU_FEATURE_ERMS;
+            if (cpuInfo[1] & (1 << 0))  features |= QIHSE_CPU_FEATURE_FSGSBASE;
+            if (cpuInfo[1] & (1 << 3))  features |= QIHSE_CPU_FEATURE_BMI1;
+            if (cpuInfo[1] & (1 << 8))  features |= QIHSE_CPU_FEATURE_BMI2;
+            if (cpuInfo[1] & (1 << 9))  features |= QIHSE_CPU_FEATURE_ERMS;
+            if (cpuInfo[1] & (1 << 18)) features |= QIHSE_CPU_FEATURE_RDSEED;
+            if (cpuInfo[1] & (1 << 19)) features |= QIHSE_CPU_FEATURE_ADX;
+            if (cpuInfo[1] & (1 << 11)) {
+                if (safe_execute_test(qihse_cpu_test_rtm)) {
+                    features |= QIHSE_CPU_FEATURE_RTM;
+                }
+            }
         }
     }
 
@@ -614,7 +781,7 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
  * ============================================================================ */
 
 bool qihse_cpu_has_feature(const qihse_cpu_info_t* info, qihse_cpu_feature_t feature) {
-    return (info->features & feature) != 0;
+    return info && (info->features & feature) != 0;
 }
 
 const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
@@ -646,6 +813,14 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_RDRAND: return "RDRAND";
         case QIHSE_CPU_FEATURE_FSGSBASE: return "FSGSBASE";
         case QIHSE_CPU_FEATURE_ERMS: return "ERMS";
+        case QIHSE_CPU_FEATURE_FMA: return "FMA";
+        case QIHSE_CPU_FEATURE_MOVBE: return "MOVBE";
+        case QIHSE_CPU_FEATURE_LZCNT: return "LZCNT";
+        case QIHSE_CPU_FEATURE_BMI1: return "BMI1";
+        case QIHSE_CPU_FEATURE_BMI2: return "BMI2";
+        case QIHSE_CPU_FEATURE_RTM: return "RTM";
+        case QIHSE_CPU_FEATURE_RDSEED: return "RDSEED";
+        case QIHSE_CPU_FEATURE_ADX: return "ADX";
         default: return "UNKNOWN";
     }
 }
@@ -679,6 +854,14 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_RDRAND: return "Digital Random Number Generator (RDRAND)";
         case QIHSE_CPU_FEATURE_FSGSBASE: return "User-space FS/GS Base Access (FSGSBASE)";
         case QIHSE_CPU_FEATURE_ERMS: return "Enhanced REP MOVSB/STOSB (ERMS)";
+        case QIHSE_CPU_FEATURE_FMA: return "Fused Multiply-Add (FMA3)";
+        case QIHSE_CPU_FEATURE_MOVBE: return "Move Data After Swapping Bytes (MOVBE)";
+        case QIHSE_CPU_FEATURE_LZCNT: return "Count the Number of Leading Zero Bits (LZCNT/ABM)";
+        case QIHSE_CPU_FEATURE_BMI1: return "Bit Manipulation Instruction Set 1 (BMI1)";
+        case QIHSE_CPU_FEATURE_BMI2: return "Bit Manipulation Instruction Set 2 (BMI2)";
+        case QIHSE_CPU_FEATURE_RTM: return "Restricted Transactional Memory (TSX-RTM)";
+        case QIHSE_CPU_FEATURE_RDSEED: return "Random Seed Generator (RDSEED)";
+        case QIHSE_CPU_FEATURE_ADX: return "Multi-Precision Add-Carry Instruction Extensions (ADX)";
         default: return "Unknown CPU feature";
     }
 }

@@ -47,10 +47,15 @@ float qihse_cosine_distance_avx(const float *a, const float *b, size_t dim, floa
 float qihse_l2_sq_distance_f16c(const uint16_t *a, const uint16_t *b, size_t dim);
 float qihse_dot_product_f16c(const uint16_t *a, const uint16_t *b, size_t dim);
 
+/* Fused F16C+FMA distance kernels (Broadwell+ tier) */
+float qihse_l2_sq_distance_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim);
+float qihse_dot_product_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim);
+
 /* Explicit SIMD implementations (for benchmarking/comparison) */
 float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims);
 float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims);
 float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims);
+float qihse_cosine_distance_avx2(const float *a, const float *b, size_t dim, float norm_a, float norm_b);
 
 /* AVX-512 implementations — 16 floats per instruction, 2x unrolled for ILP */
 float qihse_distance_cosine_avx512(const float* a, const float* b, size_t dims);
