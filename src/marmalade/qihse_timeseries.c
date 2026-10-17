@@ -293,7 +293,7 @@ bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestam
     return true;
 }
 
-__attribute__((target_clones("avx512f", "avx2", "default")))
+__attribute__((target_clones("avx512f", "avx2", "avx", "default")))
 double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user) {
     if (!tsdb) return 0.0;
 

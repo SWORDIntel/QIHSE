@@ -9,6 +9,7 @@
 #define QIHSE_CPU_DISTANCE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +37,15 @@ float qihse_distance_euclidean(const float* a, const float* b, size_t dims);
 float qihse_distance_cosine_avx1(const float* a, const float* b, size_t dims);
 float qihse_distance_dot_avx1(const float* a, const float* b, size_t dims);
 float qihse_distance_euclidean_avx1(const float* a, const float* b, size_t dims);
+
+/* 4-way ILP unrolled AVX 1.0 distance kernels (Ivy Bridge 3-cycle vaddps saturation) */
+float qihse_l2_sq_distance_avx(const float *a, const float *b, size_t dim);
+float qihse_dot_product_avx(const float *a, const float *b, size_t dim);
+float qihse_cosine_distance_avx(const float *a, const float *b, size_t dim, float norm_a, float norm_b);
+
+/* F16C half-precision distance kernels (dynamic precision tiering) */
+float qihse_l2_sq_distance_f16c(const uint16_t *a, const uint16_t *b, size_t dim);
+float qihse_dot_product_f16c(const uint16_t *a, const uint16_t *b, size_t dim);
 
 /* Explicit SIMD implementations (for benchmarking/comparison) */
 float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims);
