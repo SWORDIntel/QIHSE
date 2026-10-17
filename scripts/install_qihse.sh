@@ -953,6 +953,15 @@ else
     fi
 fi
 
+# ── Step 8: QIHSE Studio Display Platform (LAN-Only) ─────────────────────────
+echo ""
+echo "[8/8] Provisioning QIHSE Studio Display Platform (LAN-Only)..."
+if [ -f "${ROOT_DIR}/portal/install-studio.sh" ] && (command -v dotnet >/dev/null 2>&1 || [ -x "${DOTNET_ROOT:-$HOME/.dotnet}/dotnet" ]); then
+    "${ROOT_DIR}/portal/install-studio.sh" "${PREFIX}/studio" || true
+else
+    echo "  • Skipping Studio setup (dotnet not found or installer missing)."
+fi
+
 # ── Summary Box ───────────────────────────────────────────────────────────────
 CONNECTED_COUNT="${CONNECTED_COUNT:-1}"
 [ -z "$EXPECTED_NODES" ] && EXPECTED_NODES=1

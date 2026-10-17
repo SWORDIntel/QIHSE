@@ -145,6 +145,16 @@ portal/
    - Backend: `~/.dotnet/dotnet run --project portal/src/Qihse.Studio.Server` (listens on `http://localhost:5000`)
    - Frontend: `cd portal/src/Qihse.Studio.Client && npm run dev` (Vite dev server with hot reload on `http://localhost:5173`, proxying `/api` and `/hub` to port 5000).
 
-2. **Production Single-Binary Deployment**:
+2. **Production Deployment & Systemd Service**:
    - `npm run build` in `Qihse.Studio.Client` bundles the SPA into `Qihse.Studio.Server/wwwroot`.
-   - `dotnet publish -c Release -o bin/portal` packages the entire platform into a single standalone deployment.
+   - `portal/install-studio.sh` (or `make install-studio`) publishes the Release server to `/opt/QIHSE/studio` and provisions `/etc/systemd/system/qihse-studio.service`.
+   - Service listens on `http://0.0.0.0:5100` (port 5000 is reserved by SPECTRA Panel).
+
+3. **Default LAN-Only Security Enforcement**:
+   - `LanOnlyMiddleware` intercepts all requests before the application pipeline.
+   - Allowed sources: Loopback (`127.0.0.1`, `::1`) and RFC1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, Link-Local `169.254.0.0/16`).
+   - Non-private/public WAN sources: Rejected with HTTP 403 Forbidden.
+
+4. **Multi-Node Cluster Auto-Linking**:
+   - `ClusterMeshService` queries `CLUSTER NODES` at startup and periodically over RESP.
+   - Automatically maps and links to Node 0 (`192.168.1.91:7100`), Node 5 (`192.168.1.90:7115`), and other cluster peers across the LAN mesh.

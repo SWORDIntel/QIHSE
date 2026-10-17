@@ -1468,6 +1468,9 @@ test-codegraph: qihse-codegraph
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
 
 # QIHSE Studio: ASP.NET Core 8 + React SPA real-time operations display
-.PHONY: studio
+.PHONY: studio install-studio
 studio:
 	@./portal/run-studio.sh
+
+install-studio:
+	@./portal/install-studio.sh

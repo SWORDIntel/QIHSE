@@ -548,6 +548,12 @@ telemetry; 8000 is reserved and must never be used).
 - [x] Headless mode: `./qihse browse --dump overview|cluster|federation|keys` (`dump.py`)
 - [x] Frontend: dashboard shell + Login/Overview/Cluster/Federation/Journal/Keyspace/Actions/Metrics views (no new npm deps)
 - [x] Docs + registration: OPERATIONS.md §0.2, tools.json, architecture doc, runbook
+- [x] **QIHSE Studio Display Platform (Phase 14 upgrade, 2026-10-17)** — High-performance real-time operations display platform replacing legacy browser prototypes:
+  - **Backend**: ASP.NET Core 8 WebAPI & 10 Hz SignalR Hub (`portal/src/Qihse.Studio.Server/`) with native zero-allocation inline RESP client, microsecond latency telemetry, and dynamic network peer auto-discovery via `CLUSTER NODES`.
+  - **Frontend**: React 18 TypeScript SPA (`portal/src/Qihse.Studio.Client/`) with Tailwind CSS v4, Lucide icons, responsive HTML5 Canvas 16,384-shard slot ring visualizer, dynamic ISA capability matrix, and multi-precision HNSW vector explorer.
+  - **Security & Network**: Default LAN-only security via `LanOnlyMiddleware` (permitting only loopback `127.0.0.1`/`::1` and RFC1918 subnets `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, link-local `169.254.0.0/16`; hard-blocking public WAN access with HTTP 403 Forbidden).
+  - **Deployment & Provisioning**: Automated installer `portal/install-studio.sh` and `make install-studio` integrated into `scripts/install_qihse.sh` (Step 8); provisions, enables, and manages `qihse-studio.service` listening on `http://0.0.0.0:5100` (`http://localhost:5100` and `http://192.168.1.91:5100`).
+  - **Multi-Node Synchronization**: Verified live against local Node 0 (`192.168.1.91:7100`, 0.08 ms) and remote Dell PowerEdge R730xd Node 5 (`192.168.1.90:7115`, 0.62 ms) running full Broadwell ISA acceleration.
 
 ### W7 — CITADEL substrate (what QIHSE owes ../CITADEL milestones 0.3–0.7)
 

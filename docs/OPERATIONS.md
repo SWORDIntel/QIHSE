@@ -627,7 +627,43 @@ by configuration.
 
 ---
 
-## 7. See also
+## 7. QIHSE Studio Operations & Real-Time Display Platform
+
+The QIHSE Studio display platform replaces legacy browser mockups with a unified ASP.NET Core 8 WebAPI backend and React 18 TypeScript SPA.
+
+### 7.1 Quickstart & Service Provisioning
+
+```bash
+# Provision, build, and register systemd service (qihse-studio.service)
+make install-studio
+# Or directly via installer:
+./portal/install-studio.sh
+
+# Ad-hoc development run (interactive):
+make studio
+```
+
+### 7.2 Service Management
+
+The platform runs as a supervised systemd service across boots:
+
+```bash
+sudo systemctl status qihse-studio.service
+sudo systemctl restart qihse-studio.service
+sudo journalctl -u qihse-studio.service -f
+```
+
+### 7.3 Network & Security Policy (Default LAN-Only)
+
+- **Default Binding**: `http://0.0.0.0:5100` (Local & LAN interface access; port 5000 is reserved by SPECTRA Panel).
+- **Strict LAN-Only Enforcement**: Built-in `LanOnlyMiddleware` inspects all incoming TCP connections:
+  - **Permitted**: Localhost (`127.0.0.1`, `::1`), RFC1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and Link-Local (`169.254.0.0/16`).
+  - **Blocked**: Non-private / public WAN addresses receive HTTP 403 Forbidden.
+- **Cluster Auto-Linking**: `ClusterMeshService` polls `CLUSTER NODES` over RESP to auto-link and stream real-time 10 Hz telemetry for local Node 0 (`192.168.1.91:7100`), remote Dell PowerEdge R730xd Node 5 (`192.168.1.90:7115`), and other cluster peers.
+
+---
+
+## 8. See also
 
 - [API reference §11 — configuration knobs](API_REFERENCE.md#11-configuration-knobs)
 - [Deployment guide](deployment/README.md) (partially stale; it says so itself)

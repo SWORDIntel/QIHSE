@@ -1,7 +1,14 @@
 using Qihse.Studio.Server.Hubs;
+using Qihse.Studio.Server.Middleware;
 using Qihse.Studio.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Ensure default listening on 0.0.0.0:5100 if not specified in environment
+if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
+{
+    builder.WebHost.UseUrls("http://0.0.0.0:5100");
+}
 
 // Add services to the container.
 builder.Services.AddControllers();
@@ -24,6 +31,9 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Strict LAN-only & loopback security middleware
+app.UseMiddleware<LanOnlyMiddleware>();
 
 app.UseCors("AllowViteDev");
 

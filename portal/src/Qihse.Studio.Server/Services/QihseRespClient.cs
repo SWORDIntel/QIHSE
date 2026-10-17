@@ -100,16 +100,9 @@ public class QihseRespClient : IDisposable
     {
         if (_stream == null) throw new InvalidOperationException("Not connected");
 
-        // Format RESP Array: *<len>\r\n$<arg0_len>\r\n<arg0>\r\n...
-        var sb = new StringBuilder();
-        sb.Append($"*{args.Length}\r\n");
-        foreach (var arg in args)
-        {
-            var bytes = Encoding.UTF8.GetByteCount(arg);
-            sb.Append($"${bytes}\r\n{arg}\r\n");
-        }
-
-        var writeBuf = Encoding.UTF8.GetBytes(sb.ToString());
+        // Format command as standard inline string: <cmd> [arg1] [arg2]...\r\n
+        var cmd = string.Join(" ", args) + "\r\n";
+        var writeBuf = Encoding.UTF8.GetBytes(cmd);
         await _stream.WriteAsync(writeBuf, ct);
         await _stream.FlushAsync(ct);
 

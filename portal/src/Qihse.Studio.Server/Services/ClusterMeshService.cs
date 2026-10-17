@@ -24,14 +24,19 @@ public class ClusterMeshService : BackgroundService
         }
     }
 
+    private readonly string _clusterPassword;
+
     public record QihseNodeConfig(string Id, string Host, int Port, string Architecture, List<string> Capabilities, string ShardSlots);
 
-    public ClusterMeshService(IHubContext<TelemetryHub> hubContext, ILogger<ClusterMeshService> logger)
+    public ClusterMeshService(IHubContext<TelemetryHub> hubContext, ILogger<ClusterMeshService> logger, IConfiguration config)
     {
         _hubContext = hubContext;
         _logger = logger;
 
-        const string clusterPassword = "QihseCluster2026x!";
+        _clusterPassword = config.GetValue<string>("Cluster:Password")
+            ?? Environment.GetEnvironmentVariable("QIHSE_CLUSTER_PASSWORD")
+            ?? "QihseCluster2026x!";
+
         _configuredNodes = new List<QihseNodeConfig>
         {
             new("node-0", "127.0.0.1", 7100, "Ivy Bridge-EP (Xeon E5-2470 v2)", 
@@ -46,7 +51,7 @@ public class ClusterMeshService : BackgroundService
 
         foreach (var n in _configuredNodes)
         {
-            _clients[n.Id] = new QihseRespClient(n.Host, n.Port, clusterPassword);
+            _clients[n.Id] = new QihseRespClient(n.Host, n.Port, _clusterPassword);
         }
 
         _latestFrame = BuildInitialFrame();
@@ -170,8 +175,69 @@ public class ClusterMeshService : BackgroundService
                 _logger.LogWarning(ex, "Error during cluster telemetry broadcast");
             }
 
+            // Periodic auto-discovery every ~30 seconds (300 cycles * 100ms)
+            if ((_totalOperations / 1000) % 300 == 0)
+            {
+                _ = AutoDiscoverClusterMeshAsync(stoppingToken);
+            }
+
             // 10 Hz update frequency (100 ms interval)
             await Task.Delay(100, stoppingToken);
+        }
+    }
+
+    private async Task AutoDiscoverClusterMeshAsync(CancellationToken ct)
+    {
+        try
+        {
+            var seedClient = _clients.Values.FirstOrDefault(c => c.IsConnected) 
+                             ?? _clients.Values.FirstOrDefault();
+            if (seedClient == null) return;
+
+            var rawNodes = await seedClient.SendCommandAsync(new[] { "CLUSTER", "NODES" }, ct);
+            if (string.IsNullOrEmpty(rawNodes) || rawNodes.StartsWith("-")) return;
+
+            var lines = rawNodes.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var line in lines)
+            {
+                var parts = line.Trim().Split(' ');
+                if (parts.Length < 8) continue;
+
+                var endpoint = parts[1].Split('@')[0];
+                var hostPort = endpoint.Split(':');
+                if (hostPort.Length < 2) continue;
+                var host = hostPort[0];
+                if (!int.TryParse(hostPort[1], out int port)) continue;
+
+                string id = host switch
+                {
+                    "192.168.1.91" or "127.0.0.1" => "node-0",
+                    "192.168.1.90" => "node-5",
+                    "192.168.1.250" => "node-1",
+                    "192.168.1.92" => "node-sec",
+                    _ => $"node-{host.Replace('.', '-')}"
+                };
+
+                string slots = parts.Length > 8 ? string.Join(" ", parts.Skip(8)) : "unassigned";
+
+                lock (_stateLock)
+                {
+                    var existing = _configuredNodes.FirstOrDefault(n => n.Id == id);
+                    if (existing != null)
+                    {
+                        var idx = _configuredNodes.IndexOf(existing);
+                        _configuredNodes[idx] = existing with { Host = host, Port = port, ShardSlots = slots };
+                    }
+                    if (!_clients.ContainsKey(id))
+                    {
+                        _clients[id] = new QihseRespClient(host, port, _clusterPassword);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cluster mesh auto-discovery probe notice");
         }
     }
 
