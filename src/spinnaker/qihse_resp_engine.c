@@ -59,6 +59,35 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <time.h>
+#include <immintrin.h>
+#include <nmmintrin.h>
+#include <tmmintrin.h>
+#include <smmintrin.h>
+
+#define QIHSE_SWAR4(a, b, c, d) \
+    (((uint32_t)((uint8_t)(a) & 0xDFu)) | \
+    (((uint32_t)((uint8_t)(b) & 0xDFu)) << 8) | \
+    (((uint32_t)((uint8_t)(c) & 0xDFu)) << 16) | \
+    (((uint32_t)((uint8_t)(d) & 0xDFu)) << 24))
+
+static inline uint32_t qihse_resp_cmd_swar4(const uint8_t* data, size_t len) {
+    uint32_t raw = 0;
+    if (len >= 4u) {
+        memcpy(&raw, data, 4u);
+    } else {
+        memcpy(&raw, data, len);
+    }
+    return raw & 0xDFDFDFDFu;
+}
+
+static inline bool qihse_resp_suffix_is(const qihse_resp_arg_t* name, size_t offset, const char* suffix) {
+    size_t slen = strlen(suffix);
+    if (name->len != offset + slen) return false;
+    for (size_t i = 0; i < slen; i++) {
+        if ((name->data[offset + i] & 0xDFu) != (uint8_t)(suffix[i] & 0xDFu)) return false;
+    }
+    return true;
+}
 
 #define QIHSE_RESP_MAX_ARGS 2048u
 #define QIHSE_RESP_INITIAL_BUFFER 16384u
@@ -505,7 +534,23 @@ static bool qihse_resp_arg_equal(const qihse_resp_arg_t* arg, const char* text) 
 
 static bool qihse_resp_find_crlf(const uint8_t* data, size_t len, size_t start, size_t* line_end) {
     if (!data || start > len) return false;
-    for (size_t i = start; i + 1u < len; i++) {
+    size_t i = start;
+    const __m128i needle = _mm_setr_epi8('\r', '\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    while (i + 16u <= len) {
+        __m128i chunk = _mm_loadu_si128((const __m128i*)(data + i));
+        int idx = _mm_cmpistri(needle, chunk, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY);
+        if (idx < 16) {
+            *line_end = i + (size_t)idx;
+            return true;
+        }
+        if (i + 16u < len && data[i + 15u] == '\r' && data[i + 16u] == '\n') {
+            *line_end = i + 15u;
+            return true;
+        }
+        i += 16u;
+    }
+    for (; i + 1u < len; i++) {
         if (data[i] == '\r' && data[i + 1u] == '\n') {
             *line_end = i;
             return true;
@@ -525,6 +570,36 @@ static bool qihse_resp_parse_i64_bytes(const uint8_t* data, size_t len, int64_t*
     } else if (data[index] == '+') {
         index++;
         if (index == len) return false;
+    }
+    size_t digits_len = len - index;
+    if (digits_len >= 1u && digits_len <= 8u) {
+        if (digits_len == 8u) {
+            uint64_t raw;
+            memcpy(&raw, data + index, 8u);
+            uint64_t sub = raw - 0x3030303030303030ULL;
+            uint64_t add = raw + 0x4646464646464646ULL;
+            if ((sub | add) & 0x8080808080808080ULL) return false;
+            __m128i v = _mm_cvtsi64_si128(sub);
+            const __m128i mul1 = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+            __m128i p1 = _mm_maddubs_epi16(v, mul1);
+            const __m128i mul2 = _mm_setr_epi16(100, 1, 100, 1, 0, 0, 0, 0);
+            __m128i p2 = _mm_madd_epi16(p1, mul2);
+            uint64_t dw = (uint64_t)_mm_cvtsi128_si64(p2);
+            uint32_t lo = (uint32_t)dw;
+            uint32_t hi = (uint32_t)(dw >> 32);
+            uint64_t val = (uint64_t)lo * 10000ULL + (uint64_t)hi;
+            *out = negative ? -(int64_t)val : (int64_t)val;
+            return true;
+        } else {
+            uint64_t val = 0;
+            for (size_t d = 0; d < digits_len; d++) {
+                uint8_t c = data[index + d];
+                if (c < '0' || c > '9') return false;
+                val = val * 10u + (uint64_t)(c - '0');
+            }
+            *out = negative ? -(int64_t)val : (int64_t)val;
+            return true;
+        }
     }
     uint64_t limit = negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
     uint64_t value = 0;
@@ -601,7 +676,14 @@ static qihse_resp_parse_status_t qihse_resp_parse_request(const uint8_t* data, s
         size_t end;
         if (!qihse_resp_find_crlf(data, len, 0, &end)) return QIHSE_RESP_PARSE_MORE;
         size_t cursor = 0;
+        const __m128i ws_needle = _mm_setr_epi8(' ', '\t', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         while (cursor < end) {
+            while (cursor + 16u <= end) {
+                __m128i chunk = _mm_loadu_si128((const __m128i*)(data + cursor));
+                int idx = _mm_cmpistri(ws_needle, chunk, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_NEGATIVE_POLARITY);
+                cursor += (size_t)idx;
+                if (idx < 16) break;
+            }
             while (cursor < end && (data[cursor] == ' ' || data[cursor] == '\t')) cursor++;
             if (cursor == end) break;
             if (request->argc == QIHSE_RESP_MAX_ARGS) return QIHSE_RESP_PARSE_ERROR;
@@ -698,6 +780,14 @@ static bool qihse_resp_cluster_output(void* context, const void* data, size_t le
 }
 
 static bool qihse_resp_simple(qihse_resp_session_t* session, const char* value) {
+    if (value[0] == 'O' && value[1] == 'K' && value[2] == '\0') {
+        static const uint64_t imm_ok = 0x0000000A0D4B4F2BULL; /* +OK\r\n */
+        return qihse_resp_write(session, &imm_ok, 5u);
+    }
+    if (value[0] == 'P' && value[1] == 'O' && value[2] == 'N' && value[3] == 'G' && value[4] == '\0') {
+        static const uint64_t imm_pong = 0x000A0D474E4F502BULL; /* +PONG\r\n */
+        return qihse_resp_write(session, &imm_pong, 7u);
+    }
     return qihse_resp_write(session, "+", 1u) && qihse_resp_write(session, value, strlen(value)) && qihse_resp_write(session, "\r\n", 2u);
 }
 
@@ -714,6 +804,14 @@ static bool qihse_resp_error(qihse_resp_session_t* session, const char* value) {
 }
 
 static bool qihse_resp_integer(qihse_resp_session_t* session, int64_t value) {
+    if (value == 1) {
+        static const uint64_t imm_1 = 0x000000000A0D313AULL; /* :1\r\n */
+        return qihse_resp_write(session, &imm_1, 4u);
+    }
+    if (value == 0) {
+        static const uint64_t imm_0 = 0x000000000A0D303AULL; /* :0\r\n */
+        return qihse_resp_write(session, &imm_0, 4u);
+    }
     char buffer[64];
     int len = snprintf(buffer, sizeof(buffer), ":%" PRId64 "\r\n", value);
     return len > 0 && (size_t)len < sizeof(buffer) && qihse_resp_write(session, buffer, (size_t)len);
@@ -739,7 +837,11 @@ static bool qihse_resp_bulk_text(qihse_resp_session_t* session, const char* text
 }
 
 static bool qihse_resp_null(qihse_resp_session_t* session) {
-    return qihse_resp_write(session, session->protocol_version == 3 ? "_\r\n" : "$-1\r\n", session->protocol_version == 3 ? 3u : 5u);
+    if (session->protocol_version != 3) {
+        static const uint64_t imm_null = 0x0000000A0D312D24ULL; /* $-1\r\n */
+        return qihse_resp_write(session, &imm_null, 5u);
+    }
+    return qihse_resp_write(session, "_\r\n", 3u);
 }
 
 static bool qihse_resp_wrong_arity(qihse_resp_session_t* session, const char* command) {
@@ -7822,7 +7924,245 @@ static void qihse_resp_dispatch_map_build(void) {
 }
 
 static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(const qihse_resp_arg_t* name) {
-    if (!name) return NULL;
+    if (!name || name->len == 0) return NULL;
+    uint32_t key = qihse_resp_cmd_swar4(name->data, name->len);
+    switch (key) {
+        case QIHSE_SWAR4('S','E','T', 0):
+            if (name->len == 3u) return &g_dispatch_table[1];
+            if (qihse_resp_suffix_is(name, 3u, "EX")) return &g_dispatch_table[2];
+            if (qihse_resp_suffix_is(name, 3u, "RANGE")) return &g_dispatch_table[88];
+            if (qihse_resp_suffix_is(name, 3u, "BIT")) return &g_dispatch_table[136];
+            break;
+        case QIHSE_SWAR4('G','E','T', 0):
+            if (name->len == 3u) return &g_dispatch_table[0];
+            if (qihse_resp_suffix_is(name, 3u, "SET")) return &g_dispatch_table[83];
+            if (qihse_resp_suffix_is(name, 3u, "DEL")) return &g_dispatch_table[84];
+            if (qihse_resp_suffix_is(name, 3u, "RANGE")) return &g_dispatch_table[87];
+            if (qihse_resp_suffix_is(name, 3u, "BIT")) return &g_dispatch_table[137];
+            break;
+        case QIHSE_SWAR4('H','S','E','T'):
+            if (name->len == 4u) return &g_dispatch_table[39];
+            if (qihse_resp_suffix_is(name, 4u, "NX")) return &g_dispatch_table[50];
+            break;
+        case QIHSE_SWAR4('H','G','E','T'):
+            if (name->len == 4u) return &g_dispatch_table[41];
+            if (qihse_resp_suffix_is(name, 4u, "ALL")) return &g_dispatch_table[42];
+            break;
+        case QIHSE_SWAR4('E','V','A','L'):
+            if (name->len == 4u) return &g_dispatch_table[144];
+            if (qihse_resp_suffix_is(name, 4u, "SHA")) return &g_dispatch_table[145];
+            break;
+        case QIHSE_SWAR4('D','E','L', 0):
+            if (name->len == 3u) return &g_dispatch_table[4];
+            break;
+        case QIHSE_SWAR4('E','X','I','S'):
+            if (qihse_resp_suffix_is(name, 4u, "TS")) return &g_dispatch_table[6];
+            break;
+        case QIHSE_SWAR4('M','G','E','T'):
+            if (name->len == 4u) return &g_dispatch_table[7];
+            break;
+        case QIHSE_SWAR4('M','S','E','T'):
+            if (name->len == 4u) return &g_dispatch_table[8];
+            if (qihse_resp_suffix_is(name, 4u, "NX")) return &g_dispatch_table[92];
+            break;
+        case QIHSE_SWAR4('I','N','C','R'):
+            if (name->len == 4u) return &g_dispatch_table[14];
+            if (qihse_resp_suffix_is(name, 4u, "BY")) return &g_dispatch_table[89];
+            if (qihse_resp_suffix_is(name, 4u, "BYFLOAT")) return &g_dispatch_table[91];
+            break;
+        case QIHSE_SWAR4('D','E','C','R'):
+            if (name->len == 4u) return &g_dispatch_table[15];
+            if (qihse_resp_suffix_is(name, 4u, "BY")) return &g_dispatch_table[90];
+            break;
+        case QIHSE_SWAR4('E','X','P','I'):
+            if (qihse_resp_suffix_is(name, 4u, "RE")) return &g_dispatch_table[10];
+            if (qihse_resp_suffix_is(name, 4u, "REAT")) return &g_dispatch_table[94];
+            break;
+        case QIHSE_SWAR4('P','E','X','P'):
+            if (qihse_resp_suffix_is(name, 4u, "IRE")) return &g_dispatch_table[11];
+            if (qihse_resp_suffix_is(name, 4u, "IREAT")) return &g_dispatch_table[95];
+            break;
+        case QIHSE_SWAR4('P','S','E','T'):
+            if (qihse_resp_suffix_is(name, 4u, "EX")) return &g_dispatch_table[3];
+            break;
+        case QIHSE_SWAR4('T','T','L', 0):
+            if (name->len == 3u) return &g_dispatch_table[12];
+            break;
+        case QIHSE_SWAR4('P','T','T','L'):
+            if (name->len == 4u) return &g_dispatch_table[13];
+            break;
+        case QIHSE_SWAR4('T','Y','P','E'):
+            if (name->len == 4u) return &g_dispatch_table[16];
+            break;
+        case QIHSE_SWAR4('V','E','C','S'):
+            if (qihse_resp_suffix_is(name, 4u, "ET")) return &g_dispatch_table[17];
+            if (qihse_resp_suffix_is(name, 4u, "EARCH")) return &g_dispatch_table[20];
+            if (qihse_resp_suffix_is(name, 4u, "CATTER")) return &g_dispatch_table[21];
+            break;
+        case QIHSE_SWAR4('V','E','C','G'):
+            if (qihse_resp_suffix_is(name, 4u, "ET")) return &g_dispatch_table[18];
+            break;
+        case QIHSE_SWAR4('V','E','C','H'):
+            if (qihse_resp_suffix_is(name, 4u, "YBRID")) return &g_dispatch_table[19];
+            break;
+        case QIHSE_SWAR4('L','P','U','S'):
+            if (qihse_resp_suffix_is(name, 4u, "H")) return &g_dispatch_table[27];
+            break;
+        case QIHSE_SWAR4('R','P','U','S'):
+            if (qihse_resp_suffix_is(name, 4u, "H")) return &g_dispatch_table[28];
+            break;
+        case QIHSE_SWAR4('L','P','O','P'):
+            if (name->len == 4u) return &g_dispatch_table[29];
+            break;
+        case QIHSE_SWAR4('R','P','O','P'):
+            if (name->len == 4u) return &g_dispatch_table[30];
+            if (qihse_resp_suffix_is(name, 4u, "LPUSH")) return &g_dispatch_table[38];
+            break;
+        case QIHSE_SWAR4('L','L','E','N'):
+            if (name->len == 4u) return &g_dispatch_table[31];
+            break;
+        case QIHSE_SWAR4('L','R','A','N'):
+            if (qihse_resp_suffix_is(name, 4u, "GE")) return &g_dispatch_table[32];
+            break;
+        case QIHSE_SWAR4('L','I','N','D'):
+            if (qihse_resp_suffix_is(name, 4u, "EX")) return &g_dispatch_table[33];
+            break;
+        case QIHSE_SWAR4('L','S','E','T'):
+            if (name->len == 4u) return &g_dispatch_table[34];
+            break;
+        case QIHSE_SWAR4('L','R','E','M'):
+            if (name->len == 4u) return &g_dispatch_table[35];
+            break;
+        case QIHSE_SWAR4('L','T','R','I'):
+            if (qihse_resp_suffix_is(name, 4u, "M")) return &g_dispatch_table[36];
+            break;
+        case QIHSE_SWAR4('H','D','E','L'):
+            if (name->len == 4u) return &g_dispatch_table[43];
+            break;
+        case QIHSE_SWAR4('H','E','X','I'):
+            if (qihse_resp_suffix_is(name, 4u, "STS")) return &g_dispatch_table[44];
+            break;
+        case QIHSE_SWAR4('H','K','E','Y'):
+            if (qihse_resp_suffix_is(name, 4u, "S")) return &g_dispatch_table[45];
+            break;
+        case QIHSE_SWAR4('H','V','A','L'):
+            if (qihse_resp_suffix_is(name, 4u, "S")) return &g_dispatch_table[46];
+            break;
+        case QIHSE_SWAR4('H','L','E','N'):
+            if (name->len == 4u) return &g_dispatch_table[47];
+            break;
+        case QIHSE_SWAR4('H','I','N','C'):
+            if (qihse_resp_suffix_is(name, 4u, "RBY")) return &g_dispatch_table[48];
+            break;
+        case QIHSE_SWAR4('H','M','G','E'):
+            if (qihse_resp_suffix_is(name, 4u, "T")) return &g_dispatch_table[49];
+            break;
+        case QIHSE_SWAR4('H','M','S','E'):
+            if (qihse_resp_suffix_is(name, 4u, "T")) return &g_dispatch_table[40];
+            break;
+        case QIHSE_SWAR4('H','S','T','R'):
+            if (qihse_resp_suffix_is(name, 4u, "LEN")) return &g_dispatch_table[51];
+            break;
+        case QIHSE_SWAR4('S','A','D','D'):
+            if (name->len == 4u) return &g_dispatch_table[52];
+            break;
+        case QIHSE_SWAR4('S','R','E','M'):
+            if (name->len == 4u) return &g_dispatch_table[53];
+            break;
+        case QIHSE_SWAR4('S','M','E','M'):
+            if (qihse_resp_suffix_is(name, 4u, "BERS")) return &g_dispatch_table[54];
+            break;
+        case QIHSE_SWAR4('S','I','S','M'):
+            if (qihse_resp_suffix_is(name, 4u, "EMBER")) return &g_dispatch_table[55];
+            break;
+        case QIHSE_SWAR4('S','C','A','R'):
+            if (qihse_resp_suffix_is(name, 4u, "D")) return &g_dispatch_table[56];
+            break;
+        case QIHSE_SWAR4('S','P','O','P'):
+            if (name->len == 4u) return &g_dispatch_table[57];
+            break;
+        case QIHSE_SWAR4('S','M','O','V'):
+            if (qihse_resp_suffix_is(name, 4u, "E")) return &g_dispatch_table[58];
+            break;
+        case QIHSE_SWAR4('S','D','I','F'):
+            if (qihse_resp_suffix_is(name, 4u, "F")) return &g_dispatch_table[59];
+            break;
+        case QIHSE_SWAR4('S','I','N','T'):
+            if (qihse_resp_suffix_is(name, 4u, "ER")) return &g_dispatch_table[60];
+            break;
+        case QIHSE_SWAR4('S','U','N','I'):
+            if (qihse_resp_suffix_is(name, 4u, "ON")) return &g_dispatch_table[61];
+            break;
+        case QIHSE_SWAR4('Z','A','D','D'):
+            if (name->len == 4u) return &g_dispatch_table[63];
+            break;
+        case QIHSE_SWAR4('Z','R','E','M'):
+            if (name->len == 4u) return &g_dispatch_table[64];
+            break;
+        case QIHSE_SWAR4('Z','S','C','O'):
+            if (qihse_resp_suffix_is(name, 4u, "RE")) return &g_dispatch_table[65];
+            break;
+        case QIHSE_SWAR4('Z','C','A','R'):
+            if (qihse_resp_suffix_is(name, 4u, "D")) return &g_dispatch_table[66];
+            break;
+        case QIHSE_SWAR4('Z','C','O','U'):
+            if (qihse_resp_suffix_is(name, 4u, "NT")) return &g_dispatch_table[67];
+            break;
+        case QIHSE_SWAR4('Z','I','N','C'):
+            if (qihse_resp_suffix_is(name, 4u, "RBY")) return &g_dispatch_table[68];
+            break;
+        case QIHSE_SWAR4('Z','R','A','N'):
+            if (qihse_resp_suffix_is(name, 4u, "GE")) return &g_dispatch_table[69];
+            if (qihse_resp_suffix_is(name, 4u, "K")) return &g_dispatch_table[71];
+            if (qihse_resp_suffix_is(name, 4u, "GEBYSCORE")) return &g_dispatch_table[75];
+            break;
+        case QIHSE_SWAR4('Z','R','E','V'):
+            if (qihse_resp_suffix_is(name, 4u, "RANGE")) return &g_dispatch_table[70];
+            if (qihse_resp_suffix_is(name, 4u, "RANK")) return &g_dispatch_table[72];
+            if (qihse_resp_suffix_is(name, 4u, "RANGEBYSCORE")) return &g_dispatch_table[76];
+            break;
+        case QIHSE_SWAR4('K','E','Y','S'):
+            if (name->len == 4u) return &g_dispatch_table[77];
+            break;
+        case QIHSE_SWAR4('S','C','A','N'):
+            if (name->len == 4u) return &g_dispatch_table[78];
+            break;
+        case QIHSE_SWAR4('M','U','L','T'):
+            if (qihse_resp_suffix_is(name, 4u, "I")) return &g_dispatch_table[125];
+            break;
+        case QIHSE_SWAR4('E','X','E','C'):
+            if (name->len == 4u) return &g_dispatch_table[126];
+            break;
+        case QIHSE_SWAR4('D','I','S','C'):
+            if (qihse_resp_suffix_is(name, 4u, "ARD")) return &g_dispatch_table[127];
+            break;
+        case QIHSE_SWAR4('W','A','T','C'):
+            if (qihse_resp_suffix_is(name, 4u, "H")) return &g_dispatch_table[128];
+            break;
+        case QIHSE_SWAR4('U','N','W','A'):
+            if (qihse_resp_suffix_is(name, 4u, "TCH")) return &g_dispatch_table[129];
+            break;
+        case QIHSE_SWAR4('P','U','B','L'):
+            if (qihse_resp_suffix_is(name, 4u, "ISH")) return &g_dispatch_table[130];
+            break;
+        case QIHSE_SWAR4('S','U','B','S'):
+            if (qihse_resp_suffix_is(name, 4u, "CRIBE")) return &g_dispatch_table[131];
+            break;
+        case QIHSE_SWAR4('U','N','S','U'):
+            if (qihse_resp_suffix_is(name, 4u, "BSCRIBE")) return &g_dispatch_table[132];
+            break;
+        case QIHSE_SWAR4('P','S','U','B'):
+            if (qihse_resp_suffix_is(name, 4u, "SCRIBE")) return &g_dispatch_table[133];
+            break;
+        case QIHSE_SWAR4('P','U','N','S'):
+            if (qihse_resp_suffix_is(name, 4u, "UBSCRIBE")) return &g_dispatch_table[134];
+            break;
+        case QIHSE_SWAR4('P','U','B','S'):
+            if (qihse_resp_suffix_is(name, 4u, "UB")) return &g_dispatch_table[135];
+            break;
+        default:
+            break;
+    }
     pthread_once(&g_dispatch_map_once, qihse_resp_dispatch_map_build);
     uint32_t h = qihse_resp_cmd_hash(name->data, name->len) & (RESP_DISPATCH_MAP_CAP - 1u);
     for (size_t i = 0; i < RESP_DISPATCH_MAP_CAP; i++) {
@@ -11625,40 +11965,62 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
-    if (qihse_resp_command_is(request, "AUTH")) return qihse_resp_handle_auth(session, request);
-    if (qihse_resp_command_is(request, "HELLO")) return qihse_resp_handle_hello(session, request);
-    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.STATUS"))
-        return qihse_resp_handle_consensus_status(session, request);
-    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.EVIDENCE"))
-        return qihse_resp_handle_consensus_prefix_evidence(session, request);
-    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.POINT.CHALLENGE"))
-        return qihse_resp_handle_consensus_prefix_point_challenge(session, request);
-    if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.MEMBER"))
-        return qihse_resp_handle_consensus_member(session, request);
-    if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
-        qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
-        qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
-        return qihse_resp_handle_committed_txn(session, request);
-    if (qihse_resp_command_is(request, "PING")) {
-        if (request->argc == 1) return qihse_resp_simple(session, "PONG");
-        if (request->argc == 2) return qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len);
-        return qihse_resp_wrong_arity(session, "ping");
+
+    const uint8_t* cmd_data = request->argv[0].data;
+    size_t cmd_len = request->argv[0].len;
+    uint32_t key = qihse_resp_cmd_swar4(cmd_data, cmd_len);
+
+    /* Fast-path pre-auth / control commands via SWAR switch */
+    switch (key) {
+        case QIHSE_SWAR4('A', 'U', 'T', 'H'):
+            if (cmd_len == 4u) return qihse_resp_handle_auth(session, request);
+            break;
+        case QIHSE_SWAR4('H', 'E', 'L', 'L'):
+            if (cmd_len == 5u && (cmd_data[4] & 0xDFu) == 'O') return qihse_resp_handle_hello(session, request);
+            break;
+        case QIHSE_SWAR4('P', 'I', 'N', 'G'):
+            if (cmd_len == 4u) {
+                if (request->argc == 1) return qihse_resp_simple(session, "PONG");
+                if (request->argc == 2) return qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len);
+                return qihse_resp_wrong_arity(session, "ping");
+            }
+            break;
+        case QIHSE_SWAR4('Q', 'U', 'I', 'T'):
+            if (cmd_len == 4u) {
+                if (request->argc != 1) return qihse_resp_wrong_arity(session, "quit");
+                *keep_open = false;
+                return qihse_resp_simple(session, "OK");
+            }
+            break;
+        case QIHSE_SWAR4('C', 'L', 'U', 'S'):
+            if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
+                qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
+                return qihse_resp_handle_cluster_peerauth(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('M', 'A', 'C', 'H'):
+            if (cmd_len == 11u && qihse_resp_command_is(request, "MACHINEAUTH")) {
+                return qihse_resp_handle_machineauth(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('Q', 'I', 'H', 'S'):
+            if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.STATUS"))
+                return qihse_resp_handle_consensus_status(session, request);
+            if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.EVIDENCE"))
+                return qihse_resp_handle_consensus_prefix_evidence(session, request);
+            if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.PREFIX.POINT.CHALLENGE"))
+                return qihse_resp_handle_consensus_prefix_point_challenge(session, request);
+            if (qihse_resp_command_is(request, "QIHSE.CONSENSUS.MEMBER"))
+                return qihse_resp_handle_consensus_member(session, request);
+            if (qihse_resp_command_is(request, "QIHSE.TXN.PROPOSE") ||
+                qihse_resp_command_is(request, "QIHSE.TXN.READ") ||
+                qihse_resp_command_is(request, "QIHSE.TXN.READLOCAL"))
+                return qihse_resp_handle_committed_txn(session, request);
+            break;
+        default:
+            break;
     }
-    if (qihse_resp_command_is(request, "QUIT")) {
-        if (request->argc != 1) return qihse_resp_wrong_arity(session, "quit");
-        *keep_open = false;
-        return qihse_resp_simple(session, "OK");
-    }
-    /* CLUSTER PEERAUTH is authentication, not a data command: it must run
-     * before the NOAUTH gate, exactly like AUTH and HELLO. */
-    if (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
-        qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
-        return qihse_resp_handle_cluster_peerauth(session, request);
-    }
-    /* MACHINEAUTH ditto: token authentication for machine clients. */
-    if (qihse_resp_command_is(request, "MACHINEAUTH")) {
-        return qihse_resp_handle_machineauth(session, request);
-    }
+
     if (session->server->auth_required && !session->user) return qihse_resp_error(session, "NOAUTH Authentication required.");
     /* U2 revocation SLA: re-validate the session principal authoritatively
      * once per command. A destroyed principal loses the session immediately —
@@ -11732,108 +12094,156 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             if (is_write) return qihse_resp_error(session, "BUSY Bus saturation: try again later");
         }
     }
-    if (qihse_resp_command_is(request, "ASKING")) {
-        if (request->argc != 1) return qihse_resp_wrong_arity(session, "asking");
-        session->asking = true;
-        return qihse_resp_simple(session, "OK");
-    }
-    if (qihse_resp_command_is(request, "READONLY") || qihse_resp_command_is(request, "READWRITE")) {
-        if (request->argc != 1) return qihse_resp_wrong_arity(session, qihse_resp_command_is(request, "READONLY") ? "readonly" : "readwrite");
-        session->readonly = qihse_resp_command_is(request, "READONLY");
-        return qihse_resp_simple(session, "OK");
-    }
-    if (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
-        qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
-        /* Before the generic CLUSTER dispatch: MOVESLOTS needs store + bus. */
-        return qihse_resp_handle_moveslots(session, request);
-    }
-    if (qihse_resp_command_is(request, "GROUP") && request->argc >= 2) {
-        return qihse_resp_handle_group(session, request);
-    }
-    if (qihse_resp_command_is(request, "FEDERATION") && request->argc >= 2) {
-        return qihse_resp_handle_federation(session, request);
-    }
-    if (qihse_resp_command_is(request, "INTROSPECTION") && request->argc >= 2) {
-        return qihse_resp_handle_introspection(session, request);
-    }
-    if (qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
-        if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
-        if (qihse_resp_arg_equal(&request->argv[1], "SUBMIT")) return qihse_resp_handle_fabric_submit(session, request);
-        if (qihse_resp_arg_equal(&request->argv[1], "RESULT") && request->argc == 3) return qihse_resp_handle_fabric_result(session, request);
-        if (qihse_resp_arg_equal(&request->argv[1], "FETCH")) return qihse_resp_handle_fabric_fetch(session, request);
-    }
-    if (qihse_resp_command_is(request, "AIMEM"))
-        return qihse_resp_handle_aimem(session, request);
-    if (qihse_resp_command_is(request, "CLUSTER")) {
-        qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
-                                                 qihse_resp_cluster_owner_cb, session->server };
-        return qihse_resp_cluster_dispatch(&context, request->argc, request->argv);
-    }
-    if (qihse_resp_command_is(request, "CLIENT")) return qihse_resp_handle_client_command(session, request);
-    if (qihse_resp_command_is(request, "COMMAND")) return qihse_resp_handle_command(session, request);
-    if (qihse_resp_command_is(request, "INFO")) return qihse_resp_handle_info(session);
-    if (qihse_resp_command_is(request, "METRICS.RENDER")) return qihse_resp_handle_metrics_render(session, request);
-    if (qihse_resp_command_is(request, "ECHO")) return request->argc == 2 ? qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len) : qihse_resp_wrong_arity(session, "echo");
-    if (qihse_resp_command_is(request, "SELECT")) {
-        uint64_t database;
-        if (request->argc != 2) return qihse_resp_wrong_arity(session, "select");
-        if (!qihse_resp_parse_u64_arg(&request->argv[1], &database) || database != 0) return qihse_resp_error(session, "ERR SELECT is not allowed in cluster mode");
-        return qihse_resp_simple(session, "OK");
-    }
-    if (qihse_resp_command_is(request, "ROLE")) {
-        qihse_cluster_node_t node;
-        bool replica = qihse_cluster_topology_get_node(session->server->topology, qihse_cluster_topology_local_node(session->server->topology), &node) && node.role == QIHSE_CLUSTER_NODE_REPLICA;
-        if (!qihse_resp_array(session, 3u) || !qihse_resp_bulk_text(session, replica ? "slave" : "master") || !qihse_resp_integer(session, 0)) return false;
-        return qihse_resp_array(session, 0u);
-    }
 
-    /* U3 session-bundle delivery */
-    if (qihse_resp_command_is(request, "BUNDLE.PREPARE")) return qihse_resp_handle_bundle_prepare(session, request);
-    if (qihse_resp_command_is(request, "BUNDLE.CHUNK")) return qihse_resp_handle_bundle_chunk(session, request);
-
-    /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
-    if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
-    if (qihse_resp_command_is(request, "KEYSTONE.CLASSIFY")) return qihse_resp_handle_keystone_classify(session, request);
-    /* W2.5: KEYSTONE change feed (read/index identity) */
-    if (qihse_resp_command_is_keystone_feed(request)) return qihse_resp_handle_keystone_feed(session, request);
-
-    /* TASK.* commands */
-    if (qihse_resp_command_is(request, "TASK.SUBMIT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "SUBMIT"))) {
-        return qihse_resp_handle_task_submit(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.RESULT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RESULT"))) {
-        return qihse_resp_handle_task_result(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.STATUS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATUS"))) {
-        return qihse_resp_handle_task_status(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.CANCEL") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "CANCEL"))) {
-        return qihse_resp_handle_task_cancel(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.RETRY") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RETRY"))) {
-        return qihse_resp_handle_task_retry(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.DELETE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "DELETE"))) {
-        return qihse_resp_handle_task_delete(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.QUEUE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "QUEUE"))) {
-        return qihse_resp_handle_task_queue(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.STATS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATS"))) {
-        return qihse_resp_handle_task_stats(session, request);
-    }
-    if (qihse_resp_command_is(request, "TASK.WORKERS") || qihse_resp_command_is(request, "TASK.WORKERS.PAUSE") ||
-        qihse_resp_command_is(request, "TASK.WORKERS.RESUME") || qihse_resp_command_is(request, "TASK.WORKERS.SET") ||
-        (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "WORKERS"))) {
-        return qihse_resp_handle_task_workers(session, request);
-    }
-
-    /* SCHEDULE.* commands */
-    if (qihse_resp_command_is(request, "SCHEDULE.ADD") || qihse_resp_command_is(request, "SCHEDULE.REMOVE") ||
-        qihse_resp_command_is(request, "SCHEDULE.LIST") || qihse_resp_command_is(request, "SCHEDULE.ENABLE") ||
-        qihse_resp_command_is(request, "SCHEDULE.DISABLE") || qihse_resp_command_is(request, "SCHEDULE.NEXT") ||
-        qihse_resp_command_is(request, "SCHEDULE")) {
-        return qihse_resp_handle_schedule(session, request);
+    switch (key) {
+        case QIHSE_SWAR4('A', 'S', 'K', 'I'):
+            if (cmd_len == 6u && qihse_resp_command_is(request, "ASKING")) {
+                if (request->argc != 1) return qihse_resp_wrong_arity(session, "asking");
+                session->asking = true;
+                return qihse_resp_simple(session, "OK");
+            }
+            break;
+        case QIHSE_SWAR4('R', 'E', 'A', 'D'):
+            if (cmd_len == 8u && qihse_resp_command_is(request, "READONLY")) {
+                if (request->argc != 1) return qihse_resp_wrong_arity(session, "readonly");
+                session->readonly = true;
+                return qihse_resp_simple(session, "OK");
+            }
+            if (cmd_len == 9u && qihse_resp_command_is(request, "READWRITE")) {
+                if (request->argc != 1) return qihse_resp_wrong_arity(session, "readwrite");
+                session->readonly = false;
+                return qihse_resp_simple(session, "OK");
+            }
+            break;
+        case QIHSE_SWAR4('C', 'L', 'U', 'S'):
+            if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER")) {
+                if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
+                    return qihse_resp_handle_moveslots(session, request);
+                }
+                qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
+                                                         qihse_resp_cluster_owner_cb, session->server };
+                return qihse_resp_cluster_dispatch(&context, request->argc, request->argv);
+            }
+            break;
+        case QIHSE_SWAR4('G', 'R', 'O', 'U'):
+            if (cmd_len == 5u && qihse_resp_command_is(request, "GROUP") && request->argc >= 2) {
+                return qihse_resp_handle_group(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('F', 'E', 'D', 'E'):
+            if (cmd_len == 10u && qihse_resp_command_is(request, "FEDERATION") && request->argc >= 2) {
+                return qihse_resp_handle_federation(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('I', 'N', 'T', 'R'):
+            if (cmd_len == 13u && qihse_resp_command_is(request, "INTROSPECTION") && request->argc >= 2) {
+                return qihse_resp_handle_introspection(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('F', 'A', 'B', 'R'):
+            if (cmd_len == 6u && qihse_resp_command_is(request, "FABRIC") && request->argc >= 2) {
+                if (qihse_resp_arg_equal(&request->argv[1], "CAPS")) return qihse_resp_handle_fabric_caps(session);
+                if (qihse_resp_arg_equal(&request->argv[1], "SUBMIT")) return qihse_resp_handle_fabric_submit(session, request);
+                if (qihse_resp_arg_equal(&request->argv[1], "RESULT") && request->argc == 3) return qihse_resp_handle_fabric_result(session, request);
+                if (qihse_resp_arg_equal(&request->argv[1], "FETCH")) return qihse_resp_handle_fabric_fetch(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('A', 'I', 'M', 'E'):
+            if (cmd_len == 5u && qihse_resp_command_is(request, "AIMEM")) {
+                return qihse_resp_handle_aimem(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('C', 'L', 'I', 'E'):
+            if (cmd_len == 6u && qihse_resp_command_is(request, "CLIENT")) {
+                return qihse_resp_handle_client_command(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('C', 'O', 'M', 'M'):
+            if (cmd_len == 7u && qihse_resp_command_is(request, "COMMAND")) {
+                return qihse_resp_handle_command(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('I', 'N', 'F', 'O'):
+            if (cmd_len == 4u && qihse_resp_command_is(request, "INFO")) {
+                return qihse_resp_handle_info(session);
+            }
+            break;
+        case QIHSE_SWAR4('M', 'E', 'T', 'R'):
+            if (cmd_len == 14u && qihse_resp_command_is(request, "METRICS.RENDER")) {
+                return qihse_resp_handle_metrics_render(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('E', 'C', 'H', 'O'):
+            if (cmd_len == 4u && qihse_resp_command_is(request, "ECHO")) {
+                return request->argc == 2 ? qihse_resp_bulk(session, request->argv[1].data, request->argv[1].len) : qihse_resp_wrong_arity(session, "echo");
+            }
+            break;
+        case QIHSE_SWAR4('S', 'E', 'L', 'E'):
+            if (cmd_len == 6u && qihse_resp_command_is(request, "SELECT")) {
+                uint64_t database;
+                if (request->argc != 2) return qihse_resp_wrong_arity(session, "select");
+                if (!qihse_resp_parse_u64_arg(&request->argv[1], &database) || database != 0) return qihse_resp_error(session, "ERR SELECT is not allowed in cluster mode");
+                return qihse_resp_simple(session, "OK");
+            }
+            break;
+        case QIHSE_SWAR4('R', 'O', 'L', 'E'):
+            if (cmd_len == 4u && qihse_resp_command_is(request, "ROLE")) {
+                qihse_cluster_node_t node;
+                bool replica = qihse_cluster_topology_get_node(session->server->topology, qihse_cluster_topology_local_node(session->server->topology), &node) && node.role == QIHSE_CLUSTER_NODE_REPLICA;
+                if (!qihse_resp_array(session, 3u) || !qihse_resp_bulk_text(session, replica ? "slave" : "master") || !qihse_resp_integer(session, 0)) return false;
+                return qihse_resp_array(session, 0u);
+            }
+            break;
+        case QIHSE_SWAR4('B', 'U', 'N', 'D'):
+            if (cmd_len == 14u && qihse_resp_command_is(request, "BUNDLE.PREPARE")) return qihse_resp_handle_bundle_prepare(session, request);
+            if (cmd_len == 12u && qihse_resp_command_is(request, "BUNDLE.CHUNK")) return qihse_resp_handle_bundle_chunk(session, request);
+            break;
+        case QIHSE_SWAR4('K', 'E', 'Y', 'S'):
+            if (cmd_len == 15u && qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
+            if (cmd_len == 17u && qihse_resp_command_is(request, "KEYSTONE.CLASSIFY")) return qihse_resp_handle_keystone_classify(session, request);
+            if (qihse_resp_command_is_keystone_feed(request)) return qihse_resp_handle_keystone_feed(session, request);
+            break;
+        case QIHSE_SWAR4('T', 'A', 'S', 'K'):
+            if (qihse_resp_command_is(request, "TASK.SUBMIT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "SUBMIT"))) {
+                return qihse_resp_handle_task_submit(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.RESULT") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RESULT"))) {
+                return qihse_resp_handle_task_result(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.STATUS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATUS"))) {
+                return qihse_resp_handle_task_status(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.CANCEL") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "CANCEL"))) {
+                return qihse_resp_handle_task_cancel(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.RETRY") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "RETRY"))) {
+                return qihse_resp_handle_task_retry(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.DELETE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "DELETE"))) {
+                return qihse_resp_handle_task_delete(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.QUEUE") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "QUEUE"))) {
+                return qihse_resp_handle_task_queue(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.STATS") || (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "STATS"))) {
+                return qihse_resp_handle_task_stats(session, request);
+            }
+            if (qihse_resp_command_is(request, "TASK.WORKERS") || qihse_resp_command_is(request, "TASK.WORKERS.PAUSE") ||
+                qihse_resp_command_is(request, "TASK.WORKERS.RESUME") || qihse_resp_command_is(request, "TASK.WORKERS.SET") ||
+                (qihse_resp_command_is(request, "TASK") && request->argc > 1 && qihse_resp_arg_equal(&request->argv[1], "WORKERS"))) {
+                return qihse_resp_handle_task_workers(session, request);
+            }
+            break;
+        case QIHSE_SWAR4('S', 'C', 'H', 'E'):
+            if (qihse_resp_command_is(request, "SCHEDULE.ADD") || qihse_resp_command_is(request, "SCHEDULE.REMOVE") ||
+                qihse_resp_command_is(request, "SCHEDULE.LIST") || qihse_resp_command_is(request, "SCHEDULE.ENABLE") ||
+                qihse_resp_command_is(request, "SCHEDULE.DISABLE") || qihse_resp_command_is(request, "SCHEDULE.NEXT") ||
+                qihse_resp_command_is(request, "SCHEDULE")) {
+                return qihse_resp_handle_schedule(session, request);
+            }
+            break;
+        default:
+            break;
     }
 
     qihse_resp_keyset_t keys;
