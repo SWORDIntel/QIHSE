@@ -208,16 +208,24 @@ has_flag() {
 }
 
 # ISA Variables for QIHSE Build
+QIHSE_ENABLE_AVX=0
 QIHSE_ENABLE_AVX2=0
 QIHSE_ENABLE_AVX512=0
 QIHSE_ENABLE_AVX_VNNI=0
 QIHSE_ENABLE_AMX=0
+QIHSE_ENABLE_F16C=0
+QIHSE_ENABLE_AESNI=0
+QIHSE_ENABLE_PCLMUL=0
+QIHSE_ENABLE_POPCNT=0
+QIHSE_ENABLE_RDRAND=0
+QIHSE_ENABLE_FSGSBASE=0
+QIHSE_ENABLE_ERMS=0
 QIHSE_ARCH_FLAGS="-march=native -mtune=native"
 
 if [ "$ARCH" = "x86_64" ]; then
-    HAS_AVX=0; has_flag "avx" && HAS_AVX=1
-    HAS_FMA=0; has_flag "fma" && HAS_FMA=1
-    HAS_AVX2=0; has_flag "avx2" && [ "$HAS_FMA" -eq 1 ] && HAS_AVX2=1
+    HAS_AVX=0;      has_flag "avx" && HAS_AVX=1
+    HAS_FMA=0;      has_flag "fma" && HAS_FMA=1
+    HAS_AVX2=0;     has_flag "avx2" && [ "$HAS_FMA" -eq 1 ] && HAS_AVX2=1
     
     HAS_AVX512F=0;  has_flag "avx512f" && HAS_AVX512F=1
     HAS_AVX512DQ=0; has_flag "avx512dq" && HAS_AVX512DQ=1
@@ -228,20 +236,42 @@ if [ "$ARCH" = "x86_64" ]; then
         HAS_AVX512=1
     fi
 
-    HAS_VNNI=0; (has_flag "avx_vnni" || has_flag "avx512_vnni") && HAS_VNNI=1
-    HAS_AMX=0; (has_flag "amx_tile" && has_flag "amx_int8" && has_flag "amx_bf16") && HAS_AMX=1
+    HAS_VNNI=0;     (has_flag "avx_vnni" || has_flag "avx512_vnni") && HAS_VNNI=1
+    HAS_AMX=0;      (has_flag "amx_tile" && has_flag "amx_int8" && has_flag "amx_bf16") && HAS_AMX=1
+    HAS_F16C=0;     has_flag "f16c" && HAS_F16C=1
+    HAS_AES=0;      has_flag "aes" && HAS_AES=1
+    HAS_PCLMUL=0;   has_flag "pclmulqdq" && HAS_PCLMUL=1
+    HAS_POPCNT=0;   has_flag "popcnt" && HAS_POPCNT=1
+    HAS_RDRAND=0;   has_flag "rdrand" && HAS_RDRAND=1
+    HAS_FSGSBASE=0; has_flag "fsgsbase" && HAS_FSGSBASE=1
+    HAS_ERMS=0;     has_flag "erms" && HAS_ERMS=1
 
     echo "  • Instruction Sets     :"
-    [ "$HAS_AVX" -eq 1 ]    && echo "    [✓] AVX         (256-bit Vector Floating Point)" || echo "    [ ] AVX         (Not supported)"
-    [ "$HAS_AVX2" -eq 1 ]   && echo "    [✓] AVX2 + FMA  (256-bit Vector Integer & Fused Multiply-Add)" || echo "    [ ] AVX2 + FMA  (Not supported)"
-    [ "$HAS_AVX512" -eq 1 ] && echo "    [✓] AVX-512     (512-bit Vector Extensions F/DQ/BW/VL)" || echo "    [ ] AVX-512     (Not supported)"
-    [ "$HAS_VNNI" -eq 1 ]   && echo "    [✓] AVX-VNNI    (Vector Neural Network Instructions)" || echo "    [ ] AVX-VNNI    (Not supported)"
-    [ "$HAS_AMX" -eq 1 ]    && echo "    [✓] Intel AMX   (Advanced Matrix Extensions TILE/INT8/BF16)" || echo "    [ ] Intel AMX   (Not supported)"
+    [ "$HAS_AVX" -eq 1 ]      && echo "    [✓] AVX         (256-bit Vector Floating Point)" || echo "    [ ] AVX         (Not supported)"
+    [ "$HAS_AVX2" -eq 1 ]     && echo "    [✓] AVX2 + FMA  (256-bit Vector Integer & Fused Multiply-Add)" || echo "    [ ] AVX2 + FMA  (Not supported)"
+    [ "$HAS_AVX512" -eq 1 ]   && echo "    [✓] AVX-512     (512-bit Vector Extensions F/DQ/BW/VL)" || echo "    [ ] AVX-512     (Not supported)"
+    [ "$HAS_VNNI" -eq 1 ]     && echo "    [✓] AVX-VNNI    (Vector Neural Network Instructions)" || echo "    [ ] AVX-VNNI    (Not supported)"
+    [ "$HAS_AMX" -eq 1 ]      && echo "    [✓] Intel AMX   (Advanced Matrix Extensions TILE/INT8/BF16)" || echo "    [ ] Intel AMX   (Not supported)"
+    [ "$HAS_F16C" -eq 1 ]     && echo "    [✓] F16C        (Half-Precision Floating Point Conversions)" || echo "    [ ] F16C        (Not supported)"
+    [ "$HAS_AES" -eq 1 ]      && echo "    [✓] AES-NI      (Hardware Accelerated Encryption)" || echo "    [ ] AES-NI      (Not supported)"
+    [ "$HAS_PCLMUL" -eq 1 ]   && echo "    [✓] PCLMULQDQ   (Carry-Less Multiplication for GCM & CRC)" || echo "    [ ] PCLMULQDQ   (Not supported)"
+    [ "$HAS_POPCNT" -eq 1 ]   && echo "    [✓] POPCNT      (Hardware Population Count)" || echo "    [ ] POPCNT      (Not supported)"
+    [ "$HAS_RDRAND" -eq 1 ]   && echo "    [✓] RDRAND      (On-Chip Digital Random Number Generator)" || echo "    [ ] RDRAND      (Not supported)"
+    [ "$HAS_FSGSBASE" -eq 1 ] && echo "    [✓] FSGSBASE    (User-Space Fast Base Register Access)" || echo "    [ ] FSGSBASE    (Not supported)"
+    [ "$HAS_ERMS" -eq 1 ]     && echo "    [✓] ERMS        (Enhanced REP MOVSB/STOSB Fast Copy)" || echo "    [ ] ERMS        (Not supported)"
 
-    [ "$HAS_AVX2" -eq 1 ]   && QIHSE_ENABLE_AVX2=1
-    [ "$HAS_AVX512" -eq 1 ] && QIHSE_ENABLE_AVX512=1
-    [ "$HAS_VNNI" -eq 1 ]   && QIHSE_ENABLE_AVX_VNNI=1
-    [ "$HAS_AMX" -eq 1 ]    && QIHSE_ENABLE_AMX=1
+    [ "$HAS_AVX" -eq 1 ]      && QIHSE_ENABLE_AVX=1
+    [ "$HAS_AVX2" -eq 1 ]     && QIHSE_ENABLE_AVX2=1
+    [ "$HAS_AVX512" -eq 1 ]   && QIHSE_ENABLE_AVX512=1
+    [ "$HAS_VNNI" -eq 1 ]     && QIHSE_ENABLE_AVX_VNNI=1
+    [ "$HAS_AMX" -eq 1 ]      && QIHSE_ENABLE_AMX=1
+    [ "$HAS_F16C" -eq 1 ]     && QIHSE_ENABLE_F16C=1
+    [ "$HAS_AES" -eq 1 ]      && QIHSE_ENABLE_AESNI=1
+    [ "$HAS_PCLMUL" -eq 1 ]   && QIHSE_ENABLE_PCLMUL=1
+    [ "$HAS_POPCNT" -eq 1 ]   && QIHSE_ENABLE_POPCNT=1
+    [ "$HAS_RDRAND" -eq 1 ]   && QIHSE_ENABLE_RDRAND=1
+    [ "$HAS_FSGSBASE" -eq 1 ] && QIHSE_ENABLE_FSGSBASE=1
+    [ "$HAS_ERMS" -eq 1 ]     && QIHSE_ENABLE_ERMS=1
 
 elif [ "$ARCH" = "aarch64" ]; then
     HAS_NEON=0; has_flag "asimd" && HAS_NEON=1
@@ -534,10 +564,18 @@ fi
 
 echo "  • Invoking make with detected ISA parameters..."
 make -j "${JOBS}" \
+    QIHSE_ENABLE_AVX="${QIHSE_ENABLE_AVX}" \
     QIHSE_ENABLE_AVX2="${QIHSE_ENABLE_AVX2}" \
     QIHSE_ENABLE_AVX512="${QIHSE_ENABLE_AVX512}" \
     QIHSE_ENABLE_AVX_VNNI="${QIHSE_ENABLE_AVX_VNNI}" \
     QIHSE_ENABLE_AMX="${QIHSE_ENABLE_AMX}" \
+    QIHSE_ENABLE_F16C="${QIHSE_ENABLE_F16C}" \
+    QIHSE_ENABLE_AESNI="${QIHSE_ENABLE_AESNI}" \
+    QIHSE_ENABLE_PCLMUL="${QIHSE_ENABLE_PCLMUL}" \
+    QIHSE_ENABLE_POPCNT="${QIHSE_ENABLE_POPCNT}" \
+    QIHSE_ENABLE_RDRAND="${QIHSE_ENABLE_RDRAND}" \
+    QIHSE_ENABLE_FSGSBASE="${QIHSE_ENABLE_FSGSBASE}" \
+    QIHSE_ENABLE_ERMS="${QIHSE_ENABLE_ERMS}" \
     QIHSE_ARCH_FLAGS="${QIHSE_ARCH_FLAGS}" \
     all
 

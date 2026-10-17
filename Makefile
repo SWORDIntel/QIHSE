@@ -30,10 +30,18 @@ HOST_CPU_FLAGS ?= $(shell awk -F: '/^flags/{sub(/^ /, "", $$2); print $$2; exit}
 cpu_has = $(if $(filter $(1),$(HOST_CPU_FLAGS)),1,0)
 
 # ---- per-ISA defaults (auto-detect unless already set in env/CLI) ----------
+QIHSE_ENABLE_AVX      ?= $(call cpu_has,avx)
 QIHSE_ENABLE_AVX2     ?= $(call cpu_has,avx2)
 QIHSE_ENABLE_AVX512   ?= $(if $(and $(filter avx512f,$(HOST_CPU_FLAGS)),$(filter avx512dq,$(HOST_CPU_FLAGS)),$(filter avx512bw,$(HOST_CPU_FLAGS)),$(filter avx512vl,$(HOST_CPU_FLAGS))),1,0)
 QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has,avx_vnni)
 QIHSE_ENABLE_AMX      ?= $(if $(and $(filter amx_tile,$(HOST_CPU_FLAGS)),$(filter amx_int8,$(HOST_CPU_FLAGS)),$(filter amx_bf16,$(HOST_CPU_FLAGS))),1,0)
+QIHSE_ENABLE_F16C     ?= $(call cpu_has,f16c)
+QIHSE_ENABLE_AESNI    ?= $(call cpu_has,aes)
+QIHSE_ENABLE_PCLMUL   ?= $(call cpu_has,pclmulqdq)
+QIHSE_ENABLE_POPCNT   ?= $(call cpu_has,popcnt)
+QIHSE_ENABLE_RDRAND   ?= $(call cpu_has,rdrand)
+QIHSE_ENABLE_FSGSBASE ?= $(call cpu_has,fsgsbase)
+QIHSE_ENABLE_ERMS     ?= $(call cpu_has,erms)
 
 # ---------------------------------------------------------------------------
 # Security & Audit Configuration
@@ -144,6 +152,38 @@ ifeq ($(LIB_TARGET),qihse.dll)
   LDFLAGS = -L. -lm -lpthread -lws2_32
 endif
 
+
+ifeq ($(QIHSE_ENABLE_AVX),1)
+CFLAGS += -mavx -DQIHSE_ENABLE_AVX=1
+endif
+
+ifeq ($(QIHSE_ENABLE_F16C),1)
+CFLAGS += -mf16c -DQIHSE_ENABLE_F16C=1
+endif
+
+ifeq ($(QIHSE_ENABLE_AESNI),1)
+CFLAGS += -maes -DQIHSE_ENABLE_AESNI=1
+endif
+
+ifeq ($(QIHSE_ENABLE_PCLMUL),1)
+CFLAGS += -mpclmul -DQIHSE_ENABLE_PCLMUL=1
+endif
+
+ifeq ($(QIHSE_ENABLE_POPCNT),1)
+CFLAGS += -mpopcnt -DQIHSE_ENABLE_POPCNT=1
+endif
+
+ifeq ($(QIHSE_ENABLE_RDRAND),1)
+CFLAGS += -mrdrnd -DQIHSE_ENABLE_RDRAND=1
+endif
+
+ifeq ($(QIHSE_ENABLE_FSGSBASE),1)
+CFLAGS += -mfsgsbase -DQIHSE_ENABLE_FSGSBASE=1
+endif
+
+ifeq ($(QIHSE_ENABLE_ERMS),1)
+CFLAGS += -DQIHSE_ENABLE_ERMS=1
+endif
 
 ifeq ($(QIHSE_ENABLE_AVX2),1)
 CFLAGS += -mavx2 -mfma -DQIHSE_ENABLE_AVX2=1
@@ -1305,12 +1345,20 @@ check-upstream-workflow-strict:
 
 isa-info:
 	@echo "=== QIHSE ISA build-time detection ==="
+	@echo "  QIHSE_ENABLE_AVX      = $(QIHSE_ENABLE_AVX)"
+	@echo "  QIHSE_ENABLE_F16C     = $(QIHSE_ENABLE_F16C)"
+	@echo "  QIHSE_ENABLE_AESNI    = $(QIHSE_ENABLE_AESNI)"
+	@echo "  QIHSE_ENABLE_PCLMUL   = $(QIHSE_ENABLE_PCLMUL)"
+	@echo "  QIHSE_ENABLE_POPCNT   = $(QIHSE_ENABLE_POPCNT)"
+	@echo "  QIHSE_ENABLE_RDRAND   = $(QIHSE_ENABLE_RDRAND)"
+	@echo "  QIHSE_ENABLE_FSGSBASE = $(QIHSE_ENABLE_FSGSBASE)"
+	@echo "  QIHSE_ENABLE_ERMS     = $(QIHSE_ENABLE_ERMS)"
 	@echo "  QIHSE_ENABLE_AVX2     = $(QIHSE_ENABLE_AVX2)"
 	@echo "  QIHSE_ENABLE_AVX512   = $(QIHSE_ENABLE_AVX512)"
 	@echo "  QIHSE_ENABLE_AVX_VNNI = $(QIHSE_ENABLE_AVX_VNNI)"
 	@echo "  QIHSE_ENABLE_AMX      = $(QIHSE_ENABLE_AMX)"
 	@echo "  CC                    = $(CC)"
-	@echo "  CFLAGS (ISA portion)  = $(filter -mavx% -mfma -mamx% -mfpmath%,$(CFLAGS))"
+	@echo "  CFLAGS (ISA portion)  = $(filter -mavx% -mfma -mamx% -mfpmath% -mf16c -maes -mpclmul -mpopcnt -mrdrnd -mfsgsbase,$(CFLAGS))"
 
 clean:
 	rm -f $(OBJS) *.o libqihse.so qihse.dll qihse_benchmark qihse_benchmark_a00 \

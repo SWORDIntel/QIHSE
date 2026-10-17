@@ -367,6 +367,82 @@ bool qihse_cpu_test_avx512vnni(void) {
     return qihse_cpu_test_vnni();
 }
 
+bool qihse_cpu_test_pclmul(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __asm__ volatile (
+        "pxor %%xmm0, %%xmm0\n\t"
+        "pxor %%xmm1, %%xmm1\n\t"
+        "pclmulqdq $0x00, %%xmm1, %%xmm0\n\t"
+        : : : "xmm0", "xmm1"
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_popcnt(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    uint32_t val = 0x12345678U;
+    uint32_t cnt = 0;
+    __asm__ volatile (
+        "popcnt %1, %0\n\t"
+        : "=r"(cnt)
+        : "r"(val)
+    );
+    return cnt == 13;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_aesni(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __asm__ volatile (
+        "pxor %%xmm0, %%xmm0\n\t"
+        "pxor %%xmm1, %%xmm1\n\t"
+        "aesenc %%xmm1, %%xmm0\n\t"
+        : : : "xmm0", "xmm1"
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_f16c(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __asm__ volatile (
+        "vxorps %%xmm0, %%xmm0, %%xmm0\n\t"
+        "vcvtph2ps %%xmm0, %%ymm1\n\t"
+        "vcvtps2ph $0, %%ymm1, %%xmm0\n\t"
+        "vzeroupper\n\t"
+        : : : "xmm0", "ymm1"
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool qihse_cpu_test_rdrand(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned long val = 0;
+    unsigned char ok = 0;
+    __asm__ volatile (
+        "rdrand %0\n\t"
+        "setc %1\n\t"
+        : "=r"(val), "=qm"(ok)
+        :
+        : "cc"
+    );
+    (void)val;
+    return true;
+#else
+    return false;
+#endif
+}
+
 /* ============================================================================
  * CPU INFORMATION GATHERING
  * ============================================================================ */
@@ -409,7 +485,14 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                             QIHSE_CPU_FEATURE_AMX_INT8 |
                             QIHSE_CPU_FEATURE_AMX_BF16 |
                             QIHSE_CPU_FEATURE_AVX512BF16 |
-                            QIHSE_CPU_FEATURE_VNNI;
+                            QIHSE_CPU_FEATURE_VNNI |
+                            QIHSE_CPU_FEATURE_PCLMUL |
+                            QIHSE_CPU_FEATURE_POPCNT |
+                            QIHSE_CPU_FEATURE_AESNI |
+                            QIHSE_CPU_FEATURE_F16C |
+                            QIHSE_CPU_FEATURE_RDRAND |
+                            QIHSE_CPU_FEATURE_FSGSBASE |
+                            QIHSE_CPU_FEATURE_ERMS;
         info.has_osxsave = true;
         info.has_avx_support = true;
         info.has_avx512_support = true;
@@ -432,6 +515,13 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
         if (cpuInfo[2] & (1 << 9))  features |= QIHSE_CPU_FEATURE_SSSE3;
         if (cpuInfo[2] & (1 << 19)) features |= QIHSE_CPU_FEATURE_SSE4_1;
         if (cpuInfo[2] & (1 << 20)) features |= QIHSE_CPU_FEATURE_SSE4_2;
+
+        /* Ivy Bridge / Sandy Bridge crypto, bit manipulation, and FP16 */
+        if (cpuInfo[2] & (1 << 1))  features |= QIHSE_CPU_FEATURE_PCLMUL;
+        if (cpuInfo[2] & (1 << 23)) features |= QIHSE_CPU_FEATURE_POPCNT;
+        if (cpuInfo[2] & (1 << 25)) features |= QIHSE_CPU_FEATURE_AESNI;
+        if (cpuInfo[2] & (1 << 29)) features |= QIHSE_CPU_FEATURE_F16C;
+        if (cpuInfo[2] & (1 << 30)) features |= QIHSE_CPU_FEATURE_RDRAND;
 
         bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
         bool cpu_avx = (cpuInfo[2] & (1 << 28)) != 0;
@@ -499,6 +589,13 @@ qihse_cpu_info_t qihse_cpu_detect(void) {
                 }
             }
         }
+
+        /* Leaf 7 Subleaf 0: non-vector features probed independently of AVX / OSXSAVE */
+        if (max_leaf >= 7) {
+            qihse_raw_cpuid(cpuInfo, 7, 0);
+            if (cpuInfo[1] & (1 << 0)) features |= QIHSE_CPU_FEATURE_FSGSBASE;
+            if (cpuInfo[1] & (1 << 9)) features |= QIHSE_CPU_FEATURE_ERMS;
+        }
     }
 
     info.features = features;
@@ -524,6 +621,10 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
     switch (feature) {
         case QIHSE_CPU_FEATURE_SSE: return "SSE";
         case QIHSE_CPU_FEATURE_SSE2: return "SSE2";
+        case QIHSE_CPU_FEATURE_SSE3: return "SSE3";
+        case QIHSE_CPU_FEATURE_SSSE3: return "SSSE3";
+        case QIHSE_CPU_FEATURE_SSE4_1: return "SSE4.1";
+        case QIHSE_CPU_FEATURE_SSE4_2: return "SSE4.2";
         case QIHSE_CPU_FEATURE_AVX: return "AVX";
         case QIHSE_CPU_FEATURE_AVX2: return "AVX2";
         case QIHSE_CPU_FEATURE_AVX512F: return "AVX-512F";
@@ -538,6 +639,13 @@ const char* qihse_cpu_feature_name(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512VNNI";
         case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI";
         case QIHSE_CPU_FEATURE_AVX512BF16: return "AVX-512BF16";
+        case QIHSE_CPU_FEATURE_PCLMUL: return "PCLMULQDQ";
+        case QIHSE_CPU_FEATURE_POPCNT: return "POPCNT";
+        case QIHSE_CPU_FEATURE_AESNI: return "AES-NI";
+        case QIHSE_CPU_FEATURE_F16C: return "F16C";
+        case QIHSE_CPU_FEATURE_RDRAND: return "RDRAND";
+        case QIHSE_CPU_FEATURE_FSGSBASE: return "FSGSBASE";
+        case QIHSE_CPU_FEATURE_ERMS: return "ERMS";
         default: return "UNKNOWN";
     }
 }
@@ -546,6 +654,10 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
     switch (feature) {
         case QIHSE_CPU_FEATURE_SSE: return "Streaming SIMD Extensions";
         case QIHSE_CPU_FEATURE_SSE2: return "Streaming SIMD Extensions 2";
+        case QIHSE_CPU_FEATURE_SSE3: return "Streaming SIMD Extensions 3";
+        case QIHSE_CPU_FEATURE_SSSE3: return "Supplemental Streaming SIMD Extensions 3";
+        case QIHSE_CPU_FEATURE_SSE4_1: return "Streaming SIMD Extensions 4.1";
+        case QIHSE_CPU_FEATURE_SSE4_2: return "Streaming SIMD Extensions 4.2";
         case QIHSE_CPU_FEATURE_AVX: return "Advanced Vector Extensions";
         case QIHSE_CPU_FEATURE_AVX2: return "Advanced Vector Extensions 2";
         case QIHSE_CPU_FEATURE_AVX512F: return "AVX-512 Foundation";
@@ -560,6 +672,13 @@ const char* qihse_cpu_feature_description(qihse_cpu_feature_t feature) {
         case QIHSE_CPU_FEATURE_AVX512VNNI: return "AVX-512 VNNI (alias)";
         case QIHSE_CPU_FEATURE_AVX_VNNI: return "AVX-VNNI: VEX vpdpbusd/vpdpwssd (256-bit, no AVX-512)";
         case QIHSE_CPU_FEATURE_AVX512BF16: return "AVX-512 BFloat16 (dpbf16ps)";
+        case QIHSE_CPU_FEATURE_PCLMUL: return "Carry-Less Multiplication (PCLMULQDQ)";
+        case QIHSE_CPU_FEATURE_POPCNT: return "Hardware Population Count (POPCNT)";
+        case QIHSE_CPU_FEATURE_AESNI: return "Advanced Encryption Standard New Instructions (AES-NI)";
+        case QIHSE_CPU_FEATURE_F16C: return "16-bit Floating-Point Conversion Instructions (F16C)";
+        case QIHSE_CPU_FEATURE_RDRAND: return "Digital Random Number Generator (RDRAND)";
+        case QIHSE_CPU_FEATURE_FSGSBASE: return "User-space FS/GS Base Access (FSGSBASE)";
+        case QIHSE_CPU_FEATURE_ERMS: return "Enhanced REP MOVSB/STOSB (ERMS)";
         default: return "Unknown CPU feature";
     }
 }

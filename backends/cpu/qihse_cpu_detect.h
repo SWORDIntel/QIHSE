@@ -49,7 +49,14 @@ typedef enum qihse_cpu_feature_e {
     QIHSE_CPU_FEATURE_AVX512VNNI = (1 << 16), /* AVX-512 VNNI (alias) */
     QIHSE_CPU_FEATURE_AVX_VNNI   = (1 << 17), /* AVX-VNNI: VEX vpdpbusd, no AVX-512 needed */
     QIHSE_CPU_FEATURE_AMX_BF16   = (1 << 18), /* AMX BFloat16 tile multiply */
-    QIHSE_CPU_FEATURE_AVX512BF16 = (1 << 19)  /* AVX-512 BFloat16 (dpbf16ps) */
+    QIHSE_CPU_FEATURE_AVX512BF16 = (1 << 19), /* AVX-512 BFloat16 (dpbf16ps) */
+    QIHSE_CPU_FEATURE_PCLMUL     = (1ULL << 20), /* PCLMULQDQ carryless multiply */
+    QIHSE_CPU_FEATURE_POPCNT     = (1ULL << 21), /* POPCNT population count */
+    QIHSE_CPU_FEATURE_AESNI      = (1ULL << 22), /* AES-NI dedicated round instructions */
+    QIHSE_CPU_FEATURE_F16C       = (1ULL << 23), /* F16C half-precision float conversions */
+    QIHSE_CPU_FEATURE_RDRAND     = (1ULL << 24), /* RDRAND hardware random number generator */
+    QIHSE_CPU_FEATURE_FSGSBASE   = (1ULL << 25), /* FSGSBASE user-space base register access */
+    QIHSE_CPU_FEATURE_ERMS       = (1ULL << 26)  /* ERMS Enhanced REP MOVSB/STOSB */
 } qihse_cpu_feature_t;
 
 /* ============================================================================
@@ -59,14 +66,72 @@ typedef enum qihse_cpu_feature_e {
  * compiler intrinsic availability.  Use these in source files to gate code
  * that requires a specific ISA extension, e.g.:
  *
- *   #if QIHSE_HAS_AVX2
+ *   #if QIHSE_HAS_AVX
  *   ... __m256 code ...
  *   #endif
- *
- * The QIHSE_HAS_* forms normalise the Makefile flag with the compiler's own
- * predefined macros, so the guard works even when the Makefile flag was not
- * passed (e.g. direct compilation outside Make).
  * ============================================================================ */
+
+#if defined(QIHSE_ENABLE_AVX) && QIHSE_ENABLE_AVX
+#  define QIHSE_HAS_AVX       1
+#elif defined(__AVX__)
+#  define QIHSE_HAS_AVX       1
+#else
+#  define QIHSE_HAS_AVX       0
+#endif
+
+#if defined(QIHSE_ENABLE_F16C) && QIHSE_ENABLE_F16C
+#  define QIHSE_HAS_F16C      1
+#elif defined(__F16C__)
+#  define QIHSE_HAS_F16C      1
+#else
+#  define QIHSE_HAS_F16C      0
+#endif
+
+#if defined(QIHSE_ENABLE_AESNI) && QIHSE_ENABLE_AESNI
+#  define QIHSE_HAS_AESNI     1
+#elif defined(__AES__)
+#  define QIHSE_HAS_AESNI     1
+#else
+#  define QIHSE_HAS_AESNI     0
+#endif
+
+#if defined(QIHSE_ENABLE_PCLMUL) && QIHSE_ENABLE_PCLMUL
+#  define QIHSE_HAS_PCLMUL    1
+#elif defined(__PCLMUL__)
+#  define QIHSE_HAS_PCLMUL    1
+#else
+#  define QIHSE_HAS_PCLMUL    0
+#endif
+
+#if defined(QIHSE_ENABLE_POPCNT) && QIHSE_ENABLE_POPCNT
+#  define QIHSE_HAS_POPCNT    1
+#elif defined(__POPCNT__)
+#  define QIHSE_HAS_POPCNT    1
+#else
+#  define QIHSE_HAS_POPCNT    0
+#endif
+
+#if defined(QIHSE_ENABLE_RDRAND) && QIHSE_ENABLE_RDRAND
+#  define QIHSE_HAS_RDRAND    1
+#elif defined(__RDRND__)
+#  define QIHSE_HAS_RDRAND    1
+#else
+#  define QIHSE_HAS_RDRAND    0
+#endif
+
+#if defined(QIHSE_ENABLE_FSGSBASE) && QIHSE_ENABLE_FSGSBASE
+#  define QIHSE_HAS_FSGSBASE  1
+#elif defined(__FSGSBASE__)
+#  define QIHSE_HAS_FSGSBASE  1
+#else
+#  define QIHSE_HAS_FSGSBASE  0
+#endif
+
+#if defined(QIHSE_ENABLE_ERMS) && QIHSE_ENABLE_ERMS
+#  define QIHSE_HAS_ERMS      1
+#else
+#  define QIHSE_HAS_ERMS      0
+#endif
 
 #if defined(QIHSE_ENABLE_AVX2) && QIHSE_ENABLE_AVX2
 #  define QIHSE_HAS_AVX2      1
@@ -250,6 +315,58 @@ bool qihse_cpu_test_vnni(void);
  * @return true if AVX-512 VNNI instructions execute successfully
  */
 bool qihse_cpu_test_avx512vnni(void);
+
+/**
+ * Test PCLMULQDQ instruction execution.
+ * @return true if PCLMULQDQ instructions execute successfully
+ */
+bool qihse_cpu_test_pclmul(void);
+
+/**
+ * Test POPCNT instruction execution.
+ * @return true if POPCNT instructions execute successfully
+ */
+bool qihse_cpu_test_popcnt(void);
+
+/**
+ * Test AES-NI instruction execution.
+ * @return true if AES-NI instructions execute successfully
+ */
+bool qihse_cpu_test_aesni(void);
+
+/**
+ * Test F16C half-precision float conversion instruction execution.
+ * @return true if F16C instructions execute successfully
+ */
+bool qihse_cpu_test_f16c(void);
+
+/**
+ * Test RDRAND hardware random number generator instruction execution.
+ * @return true if RDRAND instructions execute successfully
+ */
+bool qihse_cpu_test_rdrand(void);
+
+static inline bool qihse_cpu_has_pclmul(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_PCLMUL);
+}
+static inline bool qihse_cpu_has_popcnt(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_POPCNT);
+}
+static inline bool qihse_cpu_has_aesni(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AESNI);
+}
+static inline bool qihse_cpu_has_f16c(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_F16C);
+}
+static inline bool qihse_cpu_has_rdrand(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_RDRAND);
+}
+static inline bool qihse_cpu_has_fsgsbase(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_FSGSBASE);
+}
+static inline bool qihse_cpu_has_erms(const qihse_cpu_info_t* info) {
+    return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_ERMS);
+}
 
 /* ============================================================================
  * CPU OPTIMIZATION HINTS
