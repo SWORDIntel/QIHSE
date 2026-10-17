@@ -79,9 +79,15 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
 
 /*
  * Accelerated tryte dot product over two rows of packed trytes.
- * Uses SSSE3 pshufb and pmaddubsw when available with dynamic fallback to scalar LUT.
+ * Uses AVX2 or SSSE3 when available with dynamic fallback to scalar LUT.
  */
 int32_t qihse_tryte_dot_product(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes);
+
+/*
+ * 256-Bit AVX2 tryte dot product over two rows of packed trytes.
+ * Unpacks and scores 32 trytes (160 trits) per iteration using 256-bit YMM registers.
+ */
+int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes);
 
 /*
  * Deterministic top-k candidate selection over encoded rows.

@@ -337,11 +337,13 @@ bool qihse_trinary_tryte_encode_matrix(const float* vectors,
 }
 
 static bool s_codec_has_ssse3 = false;
+static bool s_codec_has_avx2 = false;
 static pthread_once_t s_codec_cpu_init_once = PTHREAD_ONCE_INIT;
 
 static void s_codec_cpu_detect_init(void) {
     qihse_cpu_info_t info = qihse_cpu_detect();
     s_codec_has_ssse3 = qihse_cpu_has_ssse3(&info);
+    s_codec_has_avx2 = (info.features & QIHSE_CPU_FEATURE_AVX2) != 0;
 }
 
 #ifdef __x86_64__
@@ -432,6 +434,108 @@ static int32_t qihse_tryte_dot_product_ssse3(const uint8_t* lhs, const uint8_t* 
     }
     return total;
 }
+
+__attribute__((target("avx2")))
+static inline void qihse_unpack_32_trytes_avx2(
+    __m256i T,
+    __m256i lut_lo, __m256i lut_hi, __m256i lut_mid,
+    __m256i* out_t0, __m256i* out_t1, __m256i* out_t2, __m256i* out_t3, __m256i* out_t4)
+{
+    __m256i T_even = _mm256_and_si256(T, _mm256_set1_epi16(0x00FF));
+    __m256i T_odd  = _mm256_srli_epi16(T, 8);
+    __m256i h_even = _mm256_srli_epi16(_mm256_mullo_epi16(T_even, _mm256_set1_epi16(19)), 9);
+    __m256i h_odd  = _mm256_srli_epi16(_mm256_mullo_epi16(T_odd, _mm256_set1_epi16(19)), 9);
+
+    __m256i h27_even = _mm256_mullo_epi16(h_even, _mm256_set1_epi16(27));
+    __m256i h27_odd  = _mm256_mullo_epi16(h_odd, _mm256_set1_epi16(27));
+    __m256i high27   = _mm256_or_si256(h27_even, _mm256_slli_epi16(h27_odd, 8));
+    __m256i high     = _mm256_or_si256(h_even, _mm256_slli_epi16(h_odd, 8));
+    __m256i rem      = _mm256_sub_epi8(T, high27);
+
+    __m256i r_even  = _mm256_and_si256(rem, _mm256_set1_epi16(0x00FF));
+    __m256i r_odd   = _mm256_srli_epi16(rem, 8);
+    __m256i t2_even = _mm256_srli_epi16(_mm256_mullo_epi16(r_even, _mm256_set1_epi16(29)), 8);
+    __m256i t2_odd  = _mm256_srli_epi16(_mm256_mullo_epi16(r_odd, _mm256_set1_epi16(29)), 8);
+    __m256i t2_val  = _mm256_or_si256(t2_even, _mm256_slli_epi16(t2_odd, 8));
+
+    __m256i t2_9_even = _mm256_mullo_epi16(t2_even, _mm256_set1_epi16(9));
+    __m256i t2_9_odd  = _mm256_mullo_epi16(t2_odd, _mm256_set1_epi16(9));
+    __m256i t2_9      = _mm256_or_si256(t2_9_even, _mm256_slli_epi16(t2_9_odd, 8));
+    __m256i low       = _mm256_sub_epi8(rem, t2_9);
+
+    *out_t0 = _mm256_shuffle_epi8(lut_lo, low);
+    *out_t1 = _mm256_shuffle_epi8(lut_hi, low);
+    *out_t2 = _mm256_shuffle_epi8(lut_mid, t2_val);
+    *out_t3 = _mm256_shuffle_epi8(lut_lo, high);
+    *out_t4 = _mm256_shuffle_epi8(lut_hi, high);
+}
+
+__attribute__((target("avx2")))
+int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
+    size_t i = 0;
+    __m256i acc_32 = _mm256_setzero_si256();
+
+    __m256i lut_lo = _mm256_setr_epi8(
+        -1,  0,  1, -1,  0,  1, -1,  0,  1, 0, 0, 0, 0, 0, 0, 0,
+        -1,  0,  1, -1,  0,  1, -1,  0,  1, 0, 0, 0, 0, 0, 0, 0);
+    __m256i lut_hi = _mm256_setr_epi8(
+        -1, -1, -1,  0,  0,  0,  1,  1,  1, 0, 0, 0, 0, 0, 0, 0,
+        -1, -1, -1,  0,  0,  0,  1,  1,  1, 0, 0, 0, 0, 0, 0, 0);
+    __m256i lut_mid = _mm256_setr_epi8(
+        -1,  0,  1,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0,
+        -1,  0,  1,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0);
+
+    size_t unrolled = row_bytes & ~31ULL;
+    for (; i < unrolled; i += 32) {
+        __m256i lhs_T = _mm256_loadu_si256((const __m256i*)(lhs + i));
+        __m256i rhs_T = _mm256_loadu_si256((const __m256i*)(rhs + i));
+
+        __m256i L0, L1, L2, L3, L4;
+        __m256i R0, R1, R2, R3, R4;
+        qihse_unpack_32_trytes_avx2(lhs_T, lut_lo, lut_hi, lut_mid, &L0, &L1, &L2, &L3, &L4);
+        qihse_unpack_32_trytes_avx2(rhs_T, lut_lo, lut_hi, lut_mid, &R0, &R1, &R2, &R3, &R4);
+
+        __m256i p0 = _mm256_sign_epi8(L0, R0);
+        __m256i p1 = _mm256_sign_epi8(L1, R1);
+        __m256i p2 = _mm256_sign_epi8(L2, R2);
+        __m256i p3 = _mm256_sign_epi8(L3, R3);
+        __m256i p4 = _mm256_sign_epi8(L4, R4);
+
+        __m256i p01 = _mm256_add_epi8(p0, p1);
+        __m256i p23 = _mm256_add_epi8(p2, p3);
+        __m256i p0123 = _mm256_add_epi8(p01, p23);
+        __m256i p_all = _mm256_add_epi8(p0123, p4);
+
+        __m256i ones = _mm256_set1_epi8(1);
+        __m256i sum_16 = _mm256_maddubs_epi16(ones, p_all);
+        __m256i ones_16 = _mm256_set1_epi16(1);
+        __m256i sum_32 = _mm256_madd_epi16(sum_16, ones_16);
+
+        acc_32 = _mm256_add_epi32(acc_32, sum_32);
+    }
+
+    __m128i low128 = _mm256_castsi256_si128(acc_32);
+    __m128i high128 = _mm256_extracti128_si256(acc_32, 1);
+    __m128i sum128 = _mm_add_epi32(low128, high128);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    __m128i sum64 = _mm_add_epi32(sum128, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(1, 1, 1, 1));
+    int32_t total = _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+
+    _mm256_zeroupper();
+
+    for (; i < row_bytes; i++) {
+        unsigned l = lhs[i];
+        unsigned r = rhs[i];
+        total += qihse_tryte_dot3[l % 27u][r % 27u] +
+                 qihse_tryte_dot3[l / 27u + 9u][r / 27u + 9u];
+    }
+    return total;
+}
+#else
+int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
+    return qihse_tryte_dot_product_scalar(lhs, rhs, row_bytes);
+}
 #endif
 
 static int32_t qihse_tryte_dot_product_scalar(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
@@ -448,6 +552,9 @@ static int32_t qihse_tryte_dot_product_scalar(const uint8_t* lhs, const uint8_t*
 int32_t qihse_tryte_dot_product(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
     pthread_once(&s_codec_cpu_init_once, s_codec_cpu_detect_init);
 #ifdef __x86_64__
+    if (s_codec_has_avx2) {
+        return qihse_tryte_dot_product_avx2(lhs, rhs, row_bytes);
+    }
     if (s_codec_has_ssse3) {
         return qihse_tryte_dot_product_ssse3(lhs, rhs, row_bytes);
     }

@@ -7,6 +7,7 @@
 #if defined(__x86_64__) || defined(__i386__)
 #include <nmmintrin.h>   /* SSE4.2 _mm_crc32_u64 */
 #include <wmmintrin.h>   /* PCLMULQDQ _mm_clmulepi64_si128 */
+#include <immintrin.h>   /* BMI _tzcnt_u32, _blsr_u32 */
 #define QIHSE_HAVE_SSE42 1
 #endif
 
@@ -88,7 +89,19 @@ static uint32_t crc32c_soft(const void* data, size_t size) {
  * where shift(n, crc) = process n zero bytes starting from state crc.
  */
 
-/* Apply a 32x32 GF(2) matrix to a CRC state using ctz for fast non-zero bit scan */
+/* Apply a 32x32 GF(2) matrix to a CRC state using tzcnt and blsr for fast non-zero bit scan */
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target("bmi")))
+static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
+    uint32_t result = 0;
+    while (crc) {
+        uint32_t i = _tzcnt_u32(crc);
+        result ^= mat[i];
+        crc = _blsr_u32(crc);
+    }
+    return result;
+}
+#else
 static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
     uint32_t result = 0;
     while (crc) {
@@ -98,6 +111,7 @@ static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
     }
     return result;
 }
+#endif
 
 /* Compose two 32x32 GF(2) matrices: result = A ∘ B (apply B first, then A) */
 static void compose_matrix(uint32_t out[32], const uint32_t a[32], const uint32_t b[32]) {
