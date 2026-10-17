@@ -2209,7 +2209,43 @@ static bool qihse_vdb_int8_build(qihse_vector_db_t vdb) {
     return true;
 }
 
+static bool s_cpu_has_popcnt = false;
+static bool s_cpu_has_avx = false;
+static bool s_cpu_has_avx2 = false;
+static bool s_cpu_has_bmi2 = false;
+static pthread_once_t s_vdb_cpu_init_once = PTHREAD_ONCE_INIT;
+
+static void s_vdb_cpu_detect_init(void) {
+    qihse_cpu_info_t info = qihse_cpu_detect();
+    s_cpu_has_popcnt = qihse_cpu_has_popcnt(&info);
+    s_cpu_has_avx = qihse_cpu_has_avx(&info);
+    s_cpu_has_avx2 = (info.features & QIHSE_CPU_FEATURE_AVX2) != 0;
 #ifdef __x86_64__
+    s_cpu_has_bmi2 = __builtin_cpu_supports("bmi2");
+#endif
+}
+
+#ifdef __x86_64__
+__attribute__((target("bmi2")))
+static inline uint16_t qihse_fp8_pack_pair_bmi2(uint64_t pair_bits) {
+    return (uint16_t)_pext_u64(pair_bits, 0x87F0000087F00000ULL);
+}
+
+__attribute__((target("bmi2")))
+static inline uint64_t qihse_fp8_unpack_pair_bmi2(uint16_t fp8_pair) {
+    return _pdep_u64((uint64_t)fp8_pair, 0x87F0000087F00000ULL);
+}
+
+__attribute__((target("bmi2")))
+static inline uint8_t qihse_fp4_pack_pair_bmi2(uint64_t pair_bits) {
+    return (uint8_t)_pext_u64(pair_bits, 0x81C0000081C00000ULL);
+}
+
+__attribute__((target("bmi2")))
+static inline uint64_t qihse_fp4_unpack_pair_bmi2(uint8_t packed) {
+    return _pdep_u64((uint64_t)packed, 0x81C0000081C00000ULL);
+}
+
 __attribute__((target("sse4.1")))
 static float qihse_vdb_int8_dot_product_sse41(const int8_t* a, const int8_t* b, size_t len) {
     __m128i acc0 = _mm_setzero_si128();
@@ -2257,10 +2293,73 @@ static float qihse_vdb_int8_dot_product_sse41(const int8_t* a, const int8_t* b, 
     }
     return (float)total;
 }
+
+__attribute__((target("avx2")))
+static float qihse_vdb_int8_dot_product_avx2(const int8_t* a, const int8_t* b, size_t len) {
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    __m256i acc2 = _mm256_setzero_si256();
+    __m256i acc3 = _mm256_setzero_si256();
+
+    size_t i = 0;
+    for (; i + 64 <= len; i += 64) {
+        __m128i va0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i va1 = _mm_loadu_si128((const __m128i*)(a + i + 16));
+        __m128i vb1 = _mm_loadu_si128((const __m128i*)(b + i + 16));
+        __m128i va2 = _mm_loadu_si128((const __m128i*)(a + i + 32));
+        __m128i vb2 = _mm_loadu_si128((const __m128i*)(b + i + 32));
+        __m128i va3 = _mm_loadu_si128((const __m128i*)(a + i + 48));
+        __m128i vb3 = _mm_loadu_si128((const __m128i*)(b + i + 48));
+
+        __m256i ea0 = _mm256_cvtepi8_epi16(va0);
+        __m256i eb0 = _mm256_cvtepi8_epi16(vb0);
+        __m256i ea1 = _mm256_cvtepi8_epi16(va1);
+        __m256i eb1 = _mm256_cvtepi8_epi16(vb1);
+        __m256i ea2 = _mm256_cvtepi8_epi16(va2);
+        __m256i eb2 = _mm256_cvtepi8_epi16(vb2);
+        __m256i ea3 = _mm256_cvtepi8_epi16(va3);
+        __m256i eb3 = _mm256_cvtepi8_epi16(vb3);
+
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(ea0, eb0));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(ea1, eb1));
+        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(ea2, eb2));
+        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(ea3, eb3));
+    }
+    for (; i + 16 <= len; i += 16) {
+        __m128i va0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m256i ea0 = _mm256_cvtepi8_epi16(va0);
+        __m256i eb0 = _mm256_cvtepi8_epi16(vb0);
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(ea0, eb0));
+    }
+    __m256i acc01 = _mm256_add_epi32(acc0, acc1);
+    __m256i acc23 = _mm256_add_epi32(acc2, acc3);
+    __m256i acc = _mm256_add_epi32(acc01, acc23);
+
+    __m128i low128 = _mm256_castsi256_si128(acc);
+    __m128i high128 = _mm256_extracti128_si256(acc, 1);
+    __m128i sum128 = _mm_add_epi32(low128, high128);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    __m128i sum64 = _mm_add_epi32(sum128, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(1, 1, 1, 1));
+    int32_t total = _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+
+    _mm256_zeroupper();
+
+    for (; i < len; i++) {
+        total += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return (float)total;
+}
 #endif
 
 static float qihse_vdb_int8_dot_product(const int8_t* a, const int8_t* b, size_t len) {
+    pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
 #ifdef __x86_64__
+    if (s_cpu_has_avx2) {
+        return qihse_vdb_int8_dot_product_avx2(a, b, len);
+    }
     return qihse_vdb_int8_dot_product_sse41(a, b, len);
 #else
     int64_t sum = 0;
@@ -2456,15 +2555,6 @@ static void qihse_vdb_binary_destroy(qihse_vector_db_t vdb) {
     vdb->binary_status = QIHSE_VDB_BINARY_ABSENT;
 }
 
-static bool s_cpu_has_popcnt = false;
-static bool s_cpu_has_avx = false;
-static pthread_once_t s_vdb_cpu_init_once = PTHREAD_ONCE_INIT;
-
-static void s_vdb_cpu_detect_init(void) {
-    qihse_cpu_info_t info = qihse_cpu_detect();
-    s_cpu_has_popcnt = qihse_cpu_has_popcnt(&info);
-    s_cpu_has_avx = qihse_cpu_has_avx(&info);
-}
 
 #ifdef __x86_64__
 __attribute__((target("avx")))
@@ -5423,22 +5513,61 @@ bool qihse_vector_db_add_model_weights(
             fp32_expanded[i] = (float)w8[i] / 127.0f;
         }
     } else if (category == QIHSE_VDB_QUERY_FP8) {
+        pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
         const uint8_t* w8 = (const uint8_t*)weights;
-        for (size_t i = 0; i < num_vectors * vector_dims; i++) {
-            uint32_t f32 = ((w8[i] & 0x80) << 24) | (((w8[i] & 0x78) >> 3) << 23) | ((w8[i] & 0x07) << 20);
-            memcpy(&fp32_expanded[i], &f32, sizeof(float));
+        size_t total_elements = num_vectors * vector_dims;
+#ifdef __x86_64__
+        if (s_cpu_has_bmi2) {
+            size_t i = 0;
+            for (; i + 2 <= total_elements; i += 2) {
+                uint16_t fp8_pair;
+                memcpy(&fp8_pair, &w8[i], sizeof(uint16_t));
+                uint64_t f32_pair = qihse_fp8_unpack_pair_bmi2(fp8_pair);
+                memcpy(&fp32_expanded[i], &f32_pair, sizeof(uint64_t));
+            }
+            for (; i < total_elements; i++) {
+                uint32_t f32 = ((w8[i] & 0x80) << 24) | (((w8[i] & 0x78) >> 3) << 23) | ((w8[i] & 0x07) << 20);
+                memcpy(&fp32_expanded[i], &f32, sizeof(float));
+            }
+        } else
+#endif
+        {
+            for (size_t i = 0; i < total_elements; i++) {
+                uint32_t f32 = ((w8[i] & 0x80) << 24) | (((w8[i] & 0x78) >> 3) << 23) | ((w8[i] & 0x07) << 20);
+                memcpy(&fp32_expanded[i], &f32, sizeof(float));
+            }
         }
     } else if (category == QIHSE_VDB_QUERY_FP4) {
+        pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
         const uint8_t* w4 = (const uint8_t*)weights;
         size_t packed_dims = vector_dims / 2 + (vector_dims % 2);
-        for (size_t i = 0; i < num_vectors; i++) {
-            for (size_t j = 0; j < packed_dims; j++) {
-                uint8_t byte = w4[i * packed_dims + j];
-                for (int k = 0; k < 2; k++) {
-                    if (j * 2 + k < vector_dims) {
-                        uint8_t val = (byte >> (k * 4)) & 0x0F;
+#ifdef __x86_64__
+        if (s_cpu_has_bmi2) {
+            for (size_t i = 0; i < num_vectors; i++) {
+                for (size_t j = 0; j < packed_dims; j++) {
+                    uint8_t byte = w4[i * packed_dims + j];
+                    if (j * 2 + 1 < vector_dims) {
+                        uint64_t f32_pair = qihse_fp4_unpack_pair_bmi2(byte);
+                        memcpy(&fp32_expanded[i * vector_dims + j * 2], &f32_pair, sizeof(uint64_t));
+                    } else {
+                        uint8_t val = byte & 0x0F;
                         uint32_t f32 = ((val & 0x08) << 28) | (((val & 0x06) >> 1) << 23) | ((val & 0x01) << 22);
-                        memcpy(&fp32_expanded[i * vector_dims + j * 2 + k], &f32, sizeof(float));
+                        memcpy(&fp32_expanded[i * vector_dims + j * 2], &f32, sizeof(float));
+                    }
+                }
+            }
+        } else
+#endif
+        {
+            for (size_t i = 0; i < num_vectors; i++) {
+                for (size_t j = 0; j < packed_dims; j++) {
+                    uint8_t byte = w4[i * packed_dims + j];
+                    for (int k = 0; k < 2; k++) {
+                        if (j * 2 + k < vector_dims) {
+                            uint8_t val = (byte >> (k * 4)) & 0x0F;
+                            uint32_t f32 = ((val & 0x08) << 28) | (((val & 0x06) >> 1) << 23) | ((val & 0x01) << 22);
+                            memcpy(&fp32_expanded[i * vector_dims + j * 2 + k], &f32, sizeof(float));
+                        }
                     }
                 }
             }
@@ -7828,18 +7957,40 @@ bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
     vdb->fp8_vectors = (uint8_t*)malloc(vdb->fp8_bytes);
     if (!vdb->fp8_vectors) return false;
     
+    pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
     for (size_t i = 0; i < n_rows; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
             float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
-            for (size_t j = 0; j < dims; j++) {
-                uint32_t bits;
-                memcpy(&bits, &src[j], sizeof(float));
-                uint8_t fp8 = (bits >> 24) & 0x80;
-                fp8 |= ((bits >> 23) & 0x0F) << 3;
-                fp8 |= ((bits >> 20) & 0x07);
-                vdb->fp8_vectors[i * dims + j] = fp8;
+#ifdef __x86_64__
+            if (s_cpu_has_bmi2) {
+                size_t j = 0;
+                for (; j + 2 <= dims; j += 2) {
+                    uint64_t pair_bits;
+                    memcpy(&pair_bits, &src[j], sizeof(uint64_t));
+                    uint16_t fp8_pair = qihse_fp8_pack_pair_bmi2(pair_bits);
+                    memcpy(&vdb->fp8_vectors[i * dims + j], &fp8_pair, sizeof(uint16_t));
+                }
+                for (; j < dims; j++) {
+                    uint32_t bits;
+                    memcpy(&bits, &src[j], sizeof(float));
+                    uint8_t fp8 = (bits >> 24) & 0x80;
+                    fp8 |= ((bits >> 23) & 0x0F) << 3;
+                    fp8 |= ((bits >> 20) & 0x07);
+                    vdb->fp8_vectors[i * dims + j] = fp8;
+                }
+            } else
+#endif
+            {
+                for (size_t j = 0; j < dims; j++) {
+                    uint32_t bits;
+                    memcpy(&bits, &src[j], sizeof(float));
+                    uint8_t fp8 = (bits >> 24) & 0x80;
+                    fp8 |= ((bits >> 23) & 0x0F) << 3;
+                    fp8 |= ((bits >> 20) & 0x07);
+                    vdb->fp8_vectors[i * dims + j] = fp8;
+                }
             }
         } else {
             memset(&vdb->fp8_vectors[i * dims], 0, dims * sizeof(uint8_t));
@@ -7874,24 +8025,46 @@ bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
     vdb->fp4_vectors = (uint8_t*)malloc(vdb->fp4_bytes);
     if (!vdb->fp4_vectors) return false;
     
+    pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
     for (size_t i = 0; i < n_rows; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
             float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
-            for (size_t j = 0; j < packed_dims; j++) {
-                uint8_t packed = 0;
-                for (int k = 0; k < 2; k++) {
-                    if (j * 2 + k < dims) {
+#ifdef __x86_64__
+            if (s_cpu_has_bmi2) {
+                for (size_t j = 0; j < packed_dims; j++) {
+                    if (j * 2 + 1 < dims) {
+                        uint64_t pair_bits;
+                        memcpy(&pair_bits, &src[j * 2], sizeof(uint64_t));
+                        uint8_t packed = qihse_fp4_pack_pair_bmi2(pair_bits);
+                        vdb->fp4_vectors[i * packed_dims + j] = packed;
+                    } else {
                         uint32_t bits;
-                        memcpy(&bits, &src[j * 2 + k], sizeof(float));
+                        memcpy(&bits, &src[j * 2], sizeof(float));
                         uint8_t fp4 = (bits >> 28) & 0x08;
                         fp4 |= ((bits >> 23) & 0x03) << 1;
                         fp4 |= ((bits >> 22) & 0x01);
-                        packed |= (fp4 << (k * 4));
+                        vdb->fp4_vectors[i * packed_dims + j] = fp4;
                     }
                 }
-                vdb->fp4_vectors[i * packed_dims + j] = packed;
+            } else
+#endif
+            {
+                for (size_t j = 0; j < packed_dims; j++) {
+                    uint8_t packed = 0;
+                    for (int k = 0; k < 2; k++) {
+                        if (j * 2 + k < dims) {
+                            uint32_t bits;
+                            memcpy(&bits, &src[j * 2 + k], sizeof(float));
+                            uint8_t fp4 = (bits >> 28) & 0x08;
+                            fp4 |= ((bits >> 23) & 0x03) << 1;
+                            fp4 |= ((bits >> 22) & 0x01);
+                            packed |= (fp4 << (k * 4));
+                        }
+                    }
+                    vdb->fp4_vectors[i * packed_dims + j] = packed;
+                }
             }
         } else {
             memset(&vdb->fp4_vectors[i * packed_dims], 0, packed_dims * sizeof(uint8_t));
