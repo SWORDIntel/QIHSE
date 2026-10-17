@@ -49,6 +49,10 @@ struct qihse_qkp_session {
     char peer_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
     uint8_t peer_dsa_fingerprint[32];
     bool has_peer_identity;
+    EVP_CIPHER_CTX* tx_ctx;
+    EVP_CIPHER_CTX* rx_ctx;
+    uint8_t tx_scratch[6u + QIHSE_QKP_MAX_FRAME];
+    uint8_t rx_scratch[QIHSE_QKP_MAX_FRAME];
 };
 
 static bool qkp_dsa_pub_fingerprint(const char* path, uint8_t out[32]) {
@@ -193,50 +197,78 @@ static bool qkp_hkdf_sha384(const uint8_t* salt, size_t salt_len,
 
 /* ── AEAD (ChaCha20-Poly1305) ─────────────────────────────────────────── */
 
-static bool qkp_aead_seal(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t* aad, size_t aad_len,
-                          const uint8_t* plain, size_t plain_len,
-                          uint8_t* ct_out /* plain_len + 16 */) {
-    EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
-    if (!cctx) return false;
+static const uint8_t* qkp_tx_key(const qihse_qkp_session_t* s) {
+    return (s->role == QKP_ROLE_SERVER) ? s->key_s2c : s->key_c2s;
+}
+
+static const uint8_t* qkp_rx_key(const qihse_qkp_session_t* s) {
+    return (s->role == QKP_ROLE_SERVER) ? s->key_c2s : s->key_s2c;
+}
+
+static bool qkp_session_init_cipher_contexts(qihse_qkp_session_t* s) {
+    if (!s) return false;
+    if (s->tx_ctx) { EVP_CIPHER_CTX_free(s->tx_ctx); s->tx_ctx = NULL; }
+    if (s->rx_ctx) { EVP_CIPHER_CTX_free(s->rx_ctx); s->rx_ctx = NULL; }
+
+    s->tx_ctx = EVP_CIPHER_CTX_new();
+    s->rx_ctx = EVP_CIPHER_CTX_new();
+    if (!s->tx_ctx || !s->rx_ctx) return false;
+
+    const uint8_t* tx_key = qkp_tx_key(s);
+    const uint8_t* rx_key = qkp_rx_key(s);
+
+    if (EVP_EncryptInit_ex(s->tx_ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(s->tx_ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
+        EVP_EncryptInit_ex(s->tx_ctx, NULL, NULL, tx_key, NULL) != 1) {
+        return false;
+    }
+
+    if (EVP_DecryptInit_ex(s->rx_ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(s->rx_ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
+        EVP_DecryptInit_ex(s->rx_ctx, NULL, NULL, rx_key, NULL) != 1) {
+        return false;
+    }
+    return true;
+}
+
+static bool qkp_ctx_seal(EVP_CIPHER_CTX* ctx, const uint8_t nonce[12],
+                         const uint8_t* aad, size_t aad_len,
+                         const uint8_t* plain, size_t plain_len,
+                         uint8_t* ct_out /* plain_len + 16 */) {
+    if (!ctx) return false;
     int len = 0;
-    bool ok = EVP_EncryptInit_ex(cctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
-              EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
-              EVP_EncryptInit_ex(cctx, NULL, NULL, key, nonce) == 1 &&
-              (aad_len == 0 || EVP_EncryptUpdate(cctx, NULL, &len, aad, (int)aad_len) == 1) &&
-              EVP_EncryptUpdate(cctx, ct_out, &len, plain, (int)plain_len) == 1;
+    bool ok = EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, -1) == 1 &&
+              (aad_len == 0 || EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) == 1) &&
+              EVP_EncryptUpdate(ctx, ct_out, &len, plain, (int)plain_len) == 1;
     size_t produced = ok ? (size_t)len : 0;
-    if (ok && EVP_EncryptFinal_ex(cctx, ct_out + produced, &len) == 1) {
+    if (ok && EVP_EncryptFinal_ex(ctx, ct_out + produced, &len) == 1) {
         produced += (size_t)len;
-        ok = EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_AEAD_GET_TAG, 16, ct_out + produced) == 1;
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, ct_out + produced) == 1;
     } else {
         ok = false;
     }
-    EVP_CIPHER_CTX_free(cctx);
     return ok;
 }
 
-static bool qkp_aead_open(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t* aad, size_t aad_len,
-                          const uint8_t* ct, size_t ct_len,
-                          uint8_t* plain_out /* ct_len - 16 */) {
-    EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
-    if (!cctx) return false;
+static bool qkp_ctx_open(EVP_CIPHER_CTX* ctx, const uint8_t nonce[12],
+                         const uint8_t* aad, size_t aad_len,
+                         const uint8_t* ct, size_t ct_len,
+                         uint8_t* plain_out /* ct_len - 16 */) {
+    if (!ctx) return false;
     int len = 0;
     size_t dec_len = ct_len > 16u ? ct_len - 16u : 0u;
-    bool ok = EVP_DecryptInit_ex(cctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
-              EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
-              EVP_DecryptInit_ex(cctx, NULL, NULL, key, nonce) == 1 &&
-              (aad_len == 0 || EVP_DecryptUpdate(cctx, NULL, &len, aad, (int)aad_len) == 1) &&
-              EVP_DecryptUpdate(cctx, plain_out, &len, ct, (int)dec_len) == 1;
-    size_t produced = ok ? (size_t)len : 0;
+    bool ok = EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, -1) == 1;
     if (ok) {
         uint8_t tag[16];
         memcpy(tag, ct + dec_len, 16u);
-        ok = EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) == 1 &&
-             EVP_DecryptFinal_ex(cctx, plain_out + produced, &len) > 0;
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) == 1 &&
+             (aad_len == 0 || EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) == 1) &&
+             EVP_DecryptUpdate(ctx, plain_out, &len, ct, (int)dec_len) == 1;
+        size_t produced = ok ? (size_t)len : 0;
+        if (ok) {
+            ok = EVP_DecryptFinal_ex(ctx, plain_out + produced, &len) > 0;
+        }
     }
-    EVP_CIPHER_CTX_free(cctx);
     return ok;
 }
 
@@ -462,6 +494,10 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(s->peer_dsa_fingerprint, client_dsa_fingerprint, sizeof(client_dsa_fingerprint));
     s->has_peer_identity = true;
 
+    if (!qkp_session_init_cipher_contexts(s)) {
+        qihse_qkp_session_free(s); qkp_send_err(fd, "internal"); return QIHSE_QKP_REJECTED;
+    }
+
     /* Sealed H2-ACK for key confirmation. */
     uint8_t seal_nonce[12], sealed[8 + 12 + sizeof(ACK_PAYLOAD) + 16];
     qkp_make_nonce(seal_nonce, DIR_S2C, s->tx_seq);
@@ -474,16 +510,16 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(head, SEAL_MAGIC, 4u);
     head[4] = (uint8_t)(plen >> 8); head[5] = (uint8_t)plen;
     uint8_t* ack_ct = sealed + 6u + 12u;
-    if (!qkp_aead_seal(s->key_s2c, seal_nonce, head, 6u, (const uint8_t*)ACK_PAYLOAD, sizeof(ACK_PAYLOAD) - 1u, ack_ct)) {
-        free(s); qkp_send_err(fd, "internal"); return QIHSE_QKP_REJECTED;
+    if (!qkp_ctx_seal(s->tx_ctx, seal_nonce, head, 6u, (const uint8_t*)ACK_PAYLOAD, sizeof(ACK_PAYLOAD) - 1u, ack_ct)) {
+        qihse_qkp_session_free(s); qkp_send_err(fd, "internal"); return QIHSE_QKP_REJECTED;
     }
     memcpy(sealed, head, 6u);
     memcpy(sealed + 6u, seal_nonce, 12u);
     s->tx_seq++;
-    if (!qkp_write_all(fd, sealed, 6u + plen)) { free(s); return QIHSE_QKP_REJECTED; }
+    if (!qkp_write_all(fd, sealed, 6u + plen)) { qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED; }
 
     g_qkp_counters.server_negotiations_ok++;
-    if (out) *out = s; else free(s);
+    if (out) *out = s; else qihse_qkp_session_free(s);
     return QIHSE_QKP_SECURE;
 }
 
@@ -655,59 +691,54 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
     memcpy(s->peer_dsa_fingerprint, server_dsa_fingerprint, sizeof(server_dsa_fingerprint));
     s->has_peer_identity = true;
 
+    if (!qkp_session_init_cipher_contexts(s)) {
+        qkp_log_reject(cfg, "client cipher context initialization failed");
+        qihse_qkp_session_free(s);
+        return QIHSE_QKP_REJECTED;
+    }
+
     uint8_t ack_head[6], ack_plain[32], ack_nonce[12];
     if (!qkp_read_exact(fd, ack_head, 6u)) {
         qkp_log_reject(cfg, "client H2-ACK header read failed");
-        free(s); return QIHSE_QKP_REJECTED;
+        qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
     }
     if (memcmp(ack_head, SEAL_MAGIC, 4u) != 0) {
         fprintf(stderr, "qihse qkp: unexpected H2-ACK header %02x%02x%02x%02x%02x%02x\n",
                 ack_head[0], ack_head[1], ack_head[2], ack_head[3],
                 ack_head[4], ack_head[5]);
         qkp_log_reject(cfg, "client H2-ACK magic invalid");
-        free(s); return QIHSE_QKP_REJECTED;
+        qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
     }
     uint16_t ack_len = (uint16_t)((ack_head[4] << 8) | ack_head[5]);
     if (ack_len != 12u + 8u + 16u) {
         qkp_log_reject(cfg, "client H2-ACK length invalid");
-        free(s); return QIHSE_QKP_REJECTED;
+        qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
     }
     uint8_t* ack_ct = malloc(ack_len);
     if (!ack_ct || !qkp_read_exact(fd, ack_ct, ack_len)) {
         qkp_log_reject(cfg, "client H2-ACK payload read failed");
-        free(ack_ct); free(s); return QIHSE_QKP_REJECTED;
+        free(ack_ct); qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
     }
     qkp_make_nonce(ack_nonce, DIR_S2C, 1u);
     /* Frame body = nonce(12) ‖ ct ‖ tag — skip the nonce, exactly like
      * qihse_qkp_recv_sealed does; the whole body used to be passed as
      * ciphertext, so the tag never verified. */
-    bool ack_ok = qkp_aead_open(s->key_s2c, ack_nonce, ack_head, 6u, ack_ct + 12u, ack_len - 12u, ack_plain) &&
+    bool ack_ok = qkp_ctx_open(s->rx_ctx, ack_nonce, ack_head, 6u, ack_ct + 12u, ack_len - 12u, ack_plain) &&
                   memcmp(ack_plain, ACK_PAYLOAD, sizeof(ACK_PAYLOAD) - 1u) == 0;
     free(ack_ct);
     if (!ack_ok) {
         qkp_log_reject(cfg, "H2-ACK authentication failed");
-        free(s);
+        qihse_qkp_session_free(s);
         return QIHSE_QKP_REJECTED;
     }
     s->rx_seq = 2u;
 
     g_qkp_counters.client_negotiations_ok++;
-    if (out) *out = s; else free(s);
+    if (out) *out = s; else qihse_qkp_session_free(s);
     return QIHSE_QKP_SECURE;
 }
 
 /* ── sealed transport ─────────────────────────────────────────────────── */
-
-/* Key usage (f3, per the documented key schedule): the client→server key
- * protects every C2S record, the server→client key every S2C record. The
- * server seals with key_s2c / opens with key_c2s; the client mirrors. */
-static const uint8_t* qkp_tx_key(const qihse_qkp_session_t* s) {
-    return (s->role == QKP_ROLE_SERVER) ? s->key_s2c : s->key_c2s;
-}
-
-static const uint8_t* qkp_rx_key(const qihse_qkp_session_t* s) {
-    return (s->role == QKP_ROLE_SERVER) ? s->key_c2s : s->key_s2c;
-}
 
 /* One sealed record; len must be ≤ QIHSE_QKP_MAX_PAYLOAD (callers: the
  * chunking loop below). The record consumes the current tx_seq — exactly
@@ -716,20 +747,17 @@ static const uint8_t* qkp_rx_key(const qihse_qkp_session_t* s) {
 static bool qkp_send_sealed_record(qihse_qkp_session_t* s, int fd,
                                    const uint8_t* data, size_t len) {
     uint32_t dir = (s->role == QKP_ROLE_SERVER) ? DIR_S2C : DIR_C2S;
-    const uint8_t* key = qkp_tx_key(s);
     uint8_t nonce[12];
     qkp_make_nonce(nonce, dir, s->tx_seq);
     uint8_t head[6];
     uint16_t flen = (uint16_t)(QIHSE_QKP_NONCE_WIRE_LEN + len + QIHSE_QKP_TAG_LEN);
     memcpy(head, SEAL_MAGIC, 4u);
     head[4] = (uint8_t)(flen >> 8); head[5] = (uint8_t)flen;
-    uint8_t* frame = (uint8_t*)malloc(6u + flen);
-    if (!frame) return false;
+    uint8_t* frame = s->tx_scratch;
     memcpy(frame, head, 6u);
     memcpy(frame + 6u, nonce, 12u);
-    bool ok = qkp_aead_seal(key, nonce, head, 6u, data, len, frame + 6u + QIHSE_QKP_NONCE_WIRE_LEN);
+    bool ok = qkp_ctx_seal(s->tx_ctx, nonce, head, 6u, data, len, frame + 6u + QIHSE_QKP_NONCE_WIRE_LEN);
     if (ok) ok = qkp_write_all(fd, frame, 6u + flen);
-    free(frame);
     if (ok) { s->tx_seq++; g_qkp_counters.frames_sealed++; }
     return ok;
 }
@@ -764,18 +792,15 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
      * record on receipt. */
     if (flen < QIHSE_QKP_NONCE_WIRE_LEN + QIHSE_QKP_TAG_LEN || flen > QIHSE_QKP_MAX_FRAME) return -2;
     uint32_t dir = (s->role == QKP_ROLE_SERVER) ? DIR_C2S : DIR_S2C;
-    const uint8_t* key = qkp_rx_key(s);
     uint64_t expected = s->rx_seq;
-    uint8_t* frame = (uint8_t*)malloc(flen);
-    if (!frame) return -1;
-    if (!qkp_read_exact(fd, frame, flen)) { free(frame); return -1; }
+    uint8_t* frame = s->rx_scratch;
+    if (!qkp_read_exact(fd, frame, flen)) return -1;
     uint8_t nonce[12];
     qkp_make_nonce(nonce, dir, expected);
     size_t plen = flen - QIHSE_QKP_NONCE_WIRE_LEN - QIHSE_QKP_TAG_LEN;
-    if (plen > cap) { free(frame); return -2; }
-    bool ok = qkp_aead_open(key, nonce, head, 6u, frame + QIHSE_QKP_NONCE_WIRE_LEN,
-                            flen - QIHSE_QKP_NONCE_WIRE_LEN, out);
-    free(frame);
+    if (plen > cap) return -2;
+    bool ok = qkp_ctx_open(s->rx_ctx, nonce, head, 6u, frame + QIHSE_QKP_NONCE_WIRE_LEN,
+                           flen - QIHSE_QKP_NONCE_WIRE_LEN, out);
     if (!ok) {
         g_qkp_counters.unseal_failures++;
         return -2; /* tag failure: forged, tampered, or replayed seq */
@@ -791,6 +816,14 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
 
 void qihse_qkp_session_free(qihse_qkp_session_t* s) {
     if (!s) return;
+    if (s->tx_ctx) {
+        EVP_CIPHER_CTX_free(s->tx_ctx);
+        s->tx_ctx = NULL;
+    }
+    if (s->rx_ctx) {
+        EVP_CIPHER_CTX_free(s->rx_ctx);
+        s->rx_ctx = NULL;
+    }
     memset(s->key_c2s, 0, sizeof(s->key_c2s));
     memset(s->key_s2c, 0, sizeof(s->key_s2c));
     free(s);

@@ -11,6 +11,14 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__SSE4_2__) && defined(__AES__)
+#include <nmmintrin.h>
+#include <wmmintrin.h>
+#define QIHSE_HW_HASH 1
+#endif
+#endif
+
 /* Slot states. */
 enum { SLOT_EMPTY = 0, SLOT_OCCUPIED = 1, SLOT_TOMBSTONE = 2 };
 
@@ -39,23 +47,69 @@ struct qihse_hash_index {
 /* Hashing                                                             */
 /* ------------------------------------------------------------------ */
 
-static uint64_t fnv1a(const void* data, size_t len) {
+static inline uint64_t qihse_hardware_hash(const void* data, size_t len) {
+#if defined(QIHSE_HW_HASH)
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t crc0 = 0x9e3779b97f4a7c15ULL ^ (uint64_t)len;
+    uint64_t crc1 = 0x517cc1b727220a95ULL ^ ((uint64_t)len << 32);
+
+    while (len >= 16) {
+        uint64_t v0, v1;
+        memcpy(&v0, p, 8);
+        memcpy(&v1, p + 8, 8);
+        crc0 = _mm_crc32_u64(crc0, v0);
+        crc1 = _mm_crc32_u64(crc1, v1);
+        p += 16;
+        len -= 16;
+    }
+    if (len >= 8) {
+        uint64_t v0;
+        memcpy(&v0, p, 8);
+        crc0 = _mm_crc32_u64(crc0, v0);
+        p += 8;
+        len -= 8;
+    }
+    if (len & 4) {
+        uint32_t v4;
+        memcpy(&v4, p, 4);
+        crc1 = _mm_crc32_u32((uint32_t)crc1, v4);
+        p += 4;
+    }
+    if (len & 2) {
+        uint16_t v2;
+        memcpy(&v2, p, 2);
+        crc0 = _mm_crc32_u16((uint32_t)crc0, v2);
+        p += 2;
+    }
+    if (len & 1) {
+        crc1 = _mm_crc32_u8((uint32_t)crc1, *p);
+    }
+
+    __m128i state = _mm_set_epi64x((int64_t)crc1, (int64_t)crc0);
+    const __m128i rk = _mm_set_epi64x((int64_t)0x76543210fedcba98ULL, (int64_t)0x0123456789abcdefULL);
+    state = _mm_aesenc_si128(state, rk);
+
+    uint64_t low = (uint64_t)_mm_cvtsi128_si64(state);
+    uint64_t high = (uint64_t)_mm_extract_epi64(state, 1);
+    return low ^ high;
+#else
     const unsigned char* p = (const unsigned char*)data;
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < len; i++) {
-        h ^= p[i];
+        h ^= (uint64_t)p[i];
         h *= 1099511628211ULL;
     }
     return h;
+#endif
 }
 
 static uint64_t hash_key(qihse_hash_index_t* idx,
                          const void* key, size_t key_len) {
     if (idx->key_type == QIHSE_HASH_KEY_INT64) {
         /* key_len should be 8; use the raw bytes */
-        return fnv1a(key, key_len ? key_len : 8);
+        return qihse_hardware_hash(key, key_len ? key_len : 8);
     }
-    return fnv1a(key, key_len);
+    return qihse_hardware_hash(key, key_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -122,7 +176,7 @@ static bool table_resize(qihse_hash_index_t* idx, size_t new_cap) {
         hash_slot_t* s = (hash_slot_t*)(old_table + i * old_stride);
         if (s->state != SLOT_OCCUPIED) continue;
         /* Re-insert into new table. */
-        uint64_t h = fnv1a(slot_key(s), s->key_len);
+        uint64_t h = hash_key(idx, slot_key(s), s->key_len);
         size_t mask = idx->capacity - 1;
         size_t j = h & mask;
         for (;;) {

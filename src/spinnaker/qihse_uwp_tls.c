@@ -109,6 +109,8 @@ struct qihse_uwp_tls_session {
     qihse_uwp_tls_ctx_t* ctx; /* back-reference for renegotiate/rotate    */
 #ifdef QIHSE_UWP_TLS_HAVE_OPENSSL
     SSL*     ssl;          /* OpenSSL SSL* for real TLS 1.3               */
+    EVP_CIPHER_CTX* tx_ctx;
+    EVP_CIPHER_CTX* rx_ctx;
 #endif
 };
 
@@ -170,8 +172,40 @@ static void qihse_uwp_tls_build_nonce(const uint8_t* salt, uint64_t counter,
     }
 }
 
+#ifdef QIHSE_UWP_TLS_HAVE_OPENSSL
+static int qihse_uwp_tls_session_init_cipher_ctx(qihse_uwp_tls_session_t* session) {
+    if (!session || !session->has_key) return -1;
+    if (session->tx_ctx) { EVP_CIPHER_CTX_free(session->tx_ctx); session->tx_ctx = NULL; }
+    if (session->rx_ctx) { EVP_CIPHER_CTX_free(session->rx_ctx); session->rx_ctx = NULL; }
+
+    session->tx_ctx = EVP_CIPHER_CTX_new();
+    session->rx_ctx = EVP_CIPHER_CTX_new();
+    if (!session->tx_ctx || !session->rx_ctx) return -1;
+
+    const EVP_CIPHER* cipher = EVP_chacha20_poly1305();
+    if (!cipher) return -1;
+
+    if (EVP_EncryptInit_ex(session->tx_ctx, cipher, NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(session->tx_ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                            QIHSE_UWP_TLS_NONCE_LEN, NULL) != 1 ||
+        EVP_EncryptInit_ex(session->tx_ctx, NULL, NULL,
+                           session->session_key, NULL) != 1) {
+        return -1;
+    }
+
+    if (EVP_DecryptInit_ex(session->rx_ctx, cipher, NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(session->rx_ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                            QIHSE_UWP_TLS_NONCE_LEN, NULL) != 1 ||
+        EVP_DecryptInit_ex(session->rx_ctx, NULL, NULL,
+                           session->session_key, NULL) != 1) {
+        return -1;
+    }
+    return 0;
+}
+
 /*
- * Core AEAD routine. mode = 1 encrypt, mode = 0 decrypt.
+ * Core AEAD routine. Reuses persistent pre-keyed tx_ctx / rx_ctx.
+ * mode = 1 encrypt, mode = 0 decrypt.
  */
 static int qihse_uwp_tls_aead(qihse_uwp_tls_session_t* session,
                               const uint8_t* in, size_t in_len,
@@ -181,73 +215,61 @@ static int qihse_uwp_tls_aead(qihse_uwp_tls_session_t* session,
     if (!session || !session->has_key || !in || !out || !out_len)
         return -2;
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!session->tx_ctx || !session->rx_ctx) {
+        if (qihse_uwp_tls_session_init_cipher_ctx(session) != 0)
+            return -3;
+    }
+
+    EVP_CIPHER_CTX* ctx = mode ? session->tx_ctx : session->rx_ctx;
     if (!ctx) return -3;
 
-    int rc = -4;
-    const EVP_CIPHER* cipher = EVP_chacha20_poly1305();
-    if (!cipher) goto done;
-
     if (mode) {
-        /* Encrypt */
-        if (EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1) goto done;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
-                                QIHSE_UWP_TLS_NONCE_LEN, NULL) != 1) goto done;
-        if (EVP_EncryptInit_ex(ctx, NULL, NULL,
-                               session->session_key, nonce) != 1) goto done;
+        /* Encrypt: reuse pre-keyed tx_ctx with per-packet nonce */
+        if (EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, -1) != 1) return -4;
 
         int len = 0;
-        if (EVP_EncryptUpdate(ctx, NULL, &len, NULL, 0) != 1) goto done; /* no AAD */
-        if (cap < in_len) goto done;
-        if (EVP_EncryptUpdate(ctx, out, &len, in, (int)in_len) != 1) goto done;
+        if (EVP_EncryptUpdate(ctx, NULL, &len, NULL, 0) != 1) return -4; /* no AAD */
+        if (cap < in_len) return -4;
+        if (EVP_EncryptUpdate(ctx, out, &len, in, (int)in_len) != 1) return -4;
         int total = len;
         int finlen = 0;
-        if (EVP_EncryptFinal_ex(ctx, out + total, &finlen) != 1) goto done;
+        if (EVP_EncryptFinal_ex(ctx, out + total, &finlen) != 1) return -4;
         total += finlen;
 
         uint8_t tag[QIHSE_UWP_TLS_TAG_LEN];
         if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
-                                QIHSE_UWP_TLS_TAG_LEN, tag) != 1) goto done;
+                                QIHSE_UWP_TLS_TAG_LEN, tag) != 1) return -4;
         memcpy(out + total, tag, QIHSE_UWP_TLS_TAG_LEN);
         *out_len = (size_t)total + QIHSE_UWP_TLS_TAG_LEN;
-        rc = 0;
+        return 0;
     } else {
-        /* Decrypt */
-        if (in_len < QIHSE_UWP_TLS_TAG_LEN) goto done;
+        /* Decrypt: reuse pre-keyed rx_ctx with per-packet nonce */
+        if (in_len < QIHSE_UWP_TLS_TAG_LEN) return -4;
         size_t ct_len = in_len - QIHSE_UWP_TLS_TAG_LEN;
-        if (cap < ct_len) goto done;
+        if (cap < ct_len) return -4;
 
-        if (EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1) goto done;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
-                                QIHSE_UWP_TLS_NONCE_LEN, NULL) != 1) goto done;
-        if (EVP_DecryptInit_ex(ctx, NULL, NULL,
-                               session->session_key, nonce) != 1) goto done;
-
-        int len = 0;
-        if (EVP_DecryptUpdate(ctx, NULL, &len, NULL, 0) != 1) goto done; /* no AAD */
-        if (EVP_DecryptUpdate(ctx, out, &len, in, (int)ct_len) != 1) goto done;
-        int total = len;
-
+        if (EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, -1) != 1) return -4;
         /* Set the expected tag (located at the end of the input). */
         if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
                                 QIHSE_UWP_TLS_TAG_LEN,
-                                (void*)(in + ct_len)) != 1) goto done;
+                                (void*)(in + ct_len)) != 1) return -4;
+
+        int len = 0;
+        if (EVP_DecryptUpdate(ctx, NULL, &len, NULL, 0) != 1) return -4; /* no AAD */
+        if (EVP_DecryptUpdate(ctx, out, &len, in, (int)ct_len) != 1) return -4;
+        int total = len;
 
         int finlen = 0;
         if (EVP_DecryptFinal_ex(ctx, out + total, &finlen) != 1) {
             /* Authentication failure: tag mismatch. */
-            rc = -1;
-            goto done;
+            return -1;
         }
         total += finlen;
         *out_len = (size_t)total;
-        rc = 0;
+        return 0;
     }
-
-done:
-    EVP_CIPHER_CTX_free(ctx);
-    return rc;
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Certificate / SSL_CTX helpers                                       */
@@ -371,11 +393,13 @@ static SSL_CTX* qihse_uwp_tls_make_ssl_ctx(void) {
         return NULL;
     }
 
-    /* Prefer server ciphers and disable old/weak ones. */
+    /* Prefer server ciphers and disable old/weak ones. Prioritize TLS_AES_256_GCM_SHA384. */
     SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
                                   SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 |
                                   SSL_OP_NO_TLSv1_2 |
-                                  SSL_OP_NO_COMPRESSION);
+                                  SSL_OP_NO_COMPRESSION |
+                                  SSL_OP_CIPHER_SERVER_PREFERENCE);
+    SSL_CTX_set_ciphersuites(ssl_ctx, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
     return ssl_ctx;
 }
 
@@ -642,6 +666,7 @@ qihse_uwp_tls_session_t* qihse_uwp_tls_session_create(qihse_uwp_tls_ctx_t* ctx) 
     s->counter = 0;
     s->has_key = 1;
     s->ctx = ctx;
+    qihse_uwp_tls_session_init_cipher_ctx(s);
 #else
     s->has_key = 0;
 #endif
@@ -673,6 +698,7 @@ qihse_uwp_tls_session_t* qihse_uwp_tls_session_create_with_fd(
         }
         s->counter = 0;
         s->has_key = 1;
+        qihse_uwp_tls_session_init_cipher_ctx(s);
         return s;
     }
 
@@ -708,6 +734,14 @@ qihse_uwp_tls_session_t* qihse_uwp_tls_session_create_with_fd(
 void qihse_uwp_tls_session_destroy(qihse_uwp_tls_session_t* session) {
     if (!session) return;
 #ifdef QIHSE_UWP_TLS_HAVE_OPENSSL
+    if (session->tx_ctx) {
+        EVP_CIPHER_CTX_free(session->tx_ctx);
+        session->tx_ctx = NULL;
+    }
+    if (session->rx_ctx) {
+        EVP_CIPHER_CTX_free(session->rx_ctx);
+        session->rx_ctx = NULL;
+    }
     if (session->ssl) {
         SSL_shutdown(session->ssl);
         SSL_free(session->ssl);
@@ -759,6 +793,7 @@ int qihse_uwp_tls_session_renegotiate(qihse_uwp_tls_session_t* session) {
                                      QIHSE_UWP_TLS_NONCE_LEN,
                                      session->session_key) != 0) return -7;
     session->counter = 0;
+    qihse_uwp_tls_session_init_cipher_ctx(session);
     return 0;
 #else
     return -100;

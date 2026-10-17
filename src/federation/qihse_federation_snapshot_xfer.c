@@ -8,6 +8,7 @@
  */
 
 #include "qihse_federation_snapshot_xfer.h"
+#include "qihse_wal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -46,25 +47,8 @@ static uint64_t get_u64(const uint8_t* p) {
 
 /* ── CRC32 (IEEE reflected) for early per-chunk refusal ───────────────── */
 
-static uint32_t s_crc_table[256];
-static int s_crc_ready = 0;
-
-static void crc_init(void) {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++)
-            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        s_crc_table[i] = c;
-    }
-    s_crc_ready = 1;
-}
-
-static uint32_t crc32_buf(const uint8_t* p, size_t len) {
-    if (!s_crc_ready) crc_init();
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++)
-        c = s_crc_table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+static inline uint32_t crc32_buf(const uint8_t* p, size_t len) {
+    return qihse_wal_crc32(p, len);
 }
 
 /* ── framing ──────────────────────────────────────────────────────────── */

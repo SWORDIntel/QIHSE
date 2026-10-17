@@ -23,9 +23,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <pthread.h>
 
-
-
+#if defined(__x86_64__) || defined(_M_X64)
+#include <wmmintrin.h>
+#include <x86intrin.h>
+#endif
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -46,19 +49,149 @@ struct qihse_wal {
     char                   seg_path[PATH_MAX];
 };
 
-/* ── CRC32 ──────────────────────────────────────────────────────────────── */
+/* ── CRC32 (IEEE 802.3 0xEDB88320) with PCLMULQDQ 4-way folding & Slice-by-8 ─ */
 
-uint32_t qihse_wal_crc32(const void* data, size_t len) {
-    const uint8_t* p = (const uint8_t*)data;
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int j = 0; j < 8; j++) {
-            uint32_t mask = -(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+static uint32_t s_crc32_table[8][256];
+static pthread_once_t s_crc32_table_once = PTHREAD_ONCE_INIT;
+
+static void init_crc32_slice8(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) {
+            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        s_crc32_table[0][i] = c;
+    }
+    for (int j = 1; j < 8; j++) {
+        for (uint32_t i = 0; i < 256; i++) {
+            s_crc32_table[j][i] = (s_crc32_table[j - 1][i] >> 8) ^
+                                  s_crc32_table[0][s_crc32_table[j - 1][i] & 0xFFu];
         }
     }
-    return ~crc;
+}
+
+static inline uint32_t crc32_slice8(const uint8_t* p, size_t len, uint32_t crc) {
+    pthread_once(&s_crc32_table_once, init_crc32_slice8);
+    while (len >= 8) {
+        uint32_t w;
+        memcpy(&w, p, 4);
+        crc ^= w;
+        crc = s_crc32_table[7][crc & 0xFF] ^
+              s_crc32_table[6][(crc >> 8) & 0xFF] ^
+              s_crc32_table[5][(crc >> 16) & 0xFF] ^
+              s_crc32_table[4][(crc >> 24)] ^
+              s_crc32_table[3][p[4]] ^
+              s_crc32_table[2][p[5]] ^
+              s_crc32_table[1][p[6]] ^
+              s_crc32_table[0][p[7]];
+        p += 8;
+        len -= 8;
+    }
+    while (len--) {
+        crc = s_crc32_table[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+#if defined(__PCLMUL__) && defined(__SSE4_1__)
+static inline uint32_t crc32_pclmul(const uint8_t* p, size_t len, uint32_t crc) {
+    if (len < 64) {
+        return crc32_slice8(p, len, crc);
+    }
+
+    const __m128i r2r1 = _mm_set_epi64x(0x154442bd4ULL, 0x1c6e41596ULL);
+    const __m128i r4r3 = _mm_set_epi64x(0x1751997d0ULL, 0x0ccaa009eULL);
+    const __m128i rupoly = _mm_set_epi64x(0x1db710641ULL, 0x1f7011641ULL);
+    const __m128i r5 = _mm_set_epi64x(0x163cd6124ULL, 0);
+
+    __m128i x0 = _mm_loadu_si128((const __m128i*)(p + 0));
+    __m128i x1 = _mm_loadu_si128((const __m128i*)(p + 16));
+    __m128i x2 = _mm_loadu_si128((const __m128i*)(p + 32));
+    __m128i x3 = _mm_loadu_si128((const __m128i*)(p + 48));
+
+    x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(crc));
+
+    p += 64;
+    len -= 64;
+
+    while (len >= 64) {
+        __m128i y0 = _mm_loadu_si128((const __m128i*)(p + 0));
+        __m128i y1 = _mm_loadu_si128((const __m128i*)(p + 16));
+        __m128i y2 = _mm_loadu_si128((const __m128i*)(p + 32));
+        __m128i y3 = _mm_loadu_si128((const __m128i*)(p + 48));
+
+        __m128i a0 = _mm_clmulepi64_si128(x0, r2r1, 0x00);
+        __m128i b0 = _mm_clmulepi64_si128(x0, r2r1, 0x11);
+        x0 = _mm_xor_si128(_mm_xor_si128(a0, b0), y0);
+
+        __m128i a1 = _mm_clmulepi64_si128(x1, r2r1, 0x00);
+        __m128i b1 = _mm_clmulepi64_si128(x1, r2r1, 0x11);
+        x1 = _mm_xor_si128(_mm_xor_si128(a1, b1), y1);
+
+        __m128i a2 = _mm_clmulepi64_si128(x2, r2r1, 0x00);
+        __m128i b2 = _mm_clmulepi64_si128(x2, r2r1, 0x11);
+        x2 = _mm_xor_si128(_mm_xor_si128(a2, b2), y2);
+
+        __m128i a3 = _mm_clmulepi64_si128(x3, r2r1, 0x00);
+        __m128i b3 = _mm_clmulepi64_si128(x3, r2r1, 0x11);
+        x3 = _mm_xor_si128(_mm_xor_si128(a3, b3), y3);
+
+        p += 64;
+        len -= 64;
+    }
+
+    /* Fold 4 vectors into 1 vector */
+    __m128i a0 = _mm_clmulepi64_si128(x0, r4r3, 0x00);
+    __m128i b0 = _mm_clmulepi64_si128(x0, r4r3, 0x11);
+    x1 = _mm_xor_si128(x1, _mm_xor_si128(a0, b0));
+
+    __m128i a1 = _mm_clmulepi64_si128(x1, r4r3, 0x00);
+    __m128i b1 = _mm_clmulepi64_si128(x1, r4r3, 0x11);
+    x2 = _mm_xor_si128(x2, _mm_xor_si128(a1, b1));
+
+    __m128i a2 = _mm_clmulepi64_si128(x2, r4r3, 0x00);
+    __m128i b2 = _mm_clmulepi64_si128(x2, r4r3, 0x11);
+    x3 = _mm_xor_si128(x3, _mm_xor_si128(a2, b2));
+
+    /* Fold remaining 16-byte blocks */
+    while (len >= 16) {
+        __m128i y = _mm_loadu_si128((const __m128i*)p);
+        __m128i a = _mm_clmulepi64_si128(x3, r4r3, 0x00);
+        __m128i b = _mm_clmulepi64_si128(x3, r4r3, 0x11);
+        x3 = _mm_xor_si128(_mm_xor_si128(a, b), y);
+        p += 16;
+        len -= 16;
+    }
+
+    /* Barrett reduction of 128-bit vector x3 */
+    __m128i t0 = _mm_clmulepi64_si128(x3, r4r3, 0x01);
+    __m128i t1 = _mm_srli_si128(x3, 8);
+    __m128i t2 = _mm_clmulepi64_si128(x3, r4r3, 0x10);
+    x3 = _mm_xor_si128(t1, _mm_xor_si128(t0, t2));
+
+    __m128i t3 = _mm_clmulepi64_si128(x3, r5, 0x00);
+    __m128i t4 = _mm_srli_si128(x3, 4);
+    x3 = _mm_xor_si128(t4, t3);
+
+    __m128i q = _mm_clmulepi64_si128(_mm_and_si128(x3, _mm_set_epi32(0, 0, 0, 0xFFFFFFFF)), rupoly, 0x10);
+    q = _mm_clmulepi64_si128(_mm_and_si128(q, _mm_set_epi32(0, 0, 0, 0xFFFFFFFF)), rupoly, 0x00);
+    x3 = _mm_xor_si128(x3, q);
+    uint32_t res = (uint32_t)_mm_extract_epi32(x3, 1);
+
+    if (len > 0) {
+        res = crc32_slice8(p, len, res);
+    }
+    return res;
+}
+#endif
+
+uint32_t qihse_wal_crc32(const void* data, size_t len) {
+    if (!data || len == 0) return 0;
+#if defined(__PCLMUL__) && defined(__SSE4_1__)
+    return crc32_pclmul((const uint8_t*)data, len, 0xFFFFFFFFu) ^ 0xFFFFFFFFu;
+#else
+    return crc32_slice8((const uint8_t*)data, len, 0xFFFFFFFFu) ^ 0xFFFFFFFFu;
+#endif
 }
 
 /* ── Segment management ─────────────────────────────────────────────────── */
