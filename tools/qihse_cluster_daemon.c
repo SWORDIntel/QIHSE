@@ -155,9 +155,11 @@ static void usage(const char* argv0) {
         "  --brain-rollback-window seconds.\n"
         "\n  --replicate GLOB marks a sovereign-local namespace.\n"
         "  --replication-source-host DEST --replication-source-port PORT\n"
-        "  enables one-way QKP-protected replication. Default I2P uses local\n"
-        "  SOCKS (--replication-socks-port, default 4447); --replication-transport\n"
-        "  wireguard uses a private IPv4 mesh address. Both require --replica-read-only.\n"
+        "  enables one-way QKP-protected replication. Default transport is WireGuard\n"
+        "  private mesh (--replication-transport wireguard), except over LAN\n"
+        "  (192.168.x.x) where it defaults to direct (--replication-transport direct);\n"
+        "  I2P garlic transport is strictly opt-in (--replication-transport i2p,\n"
+        "  SOCKS port --replication-socks-port, default 4447). All require --replica-read-only.\n"
         "  --replication-peer-node-id and --replication-peer-dsa-pub pin the\n"
         "  sole upstream identity; --pqc-node-id sets this daemon's stable ID.\n"
         "  --consensus-group ID --consensus-self UUID --consensus-member UUID\n"
@@ -522,7 +524,6 @@ static int mini_resp_read_line(mini_resp_t* c, char* buf, size_t cap) {
             buf[used] = '\0';
             return (int)used;
         }
-        if (ch == '\r') return -1;
         buf[used++] = ch;
     }
     return -1;
@@ -660,6 +661,7 @@ typedef struct {
     uint16_t source_port;
     uint16_t socks_port;       /* local loopback i2pd SOCKS5 */
     bool source_via_i2p;
+    const char* transport_name;
     qihse_user_t* replica_principal;
     const qihse_qkp_config_t* qkp; /* required signed/sealed peer transport */
     const char* data_dir;
@@ -841,35 +843,88 @@ static void* ae_main(void* argument) {
         char globs[REPL_AE_GLOBS_MAX][128];
         size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, NULL, REPL_AE_GLOBS_MAX);
         if (glob_count == 0u) continue;
-        mini_resp_t source;
-        int connected = ae->source_via_i2p
-            ? mini_resp_connect_i2p(&source, ae->source_host, ae->source_port,
-                ae->socks_port, ae->qkp)
-            : mini_resp_connect_mode(&source, ae->source_host, ae->source_port,
-                ae->qkp, false, 0u);
-        bool peer_ok = connected >= 0 && qihse_qkp_client_session_is_replication_peer(
-            source.qkp, ae->qkp->replication_peer_node_id,
-            ae->qkp->replication_peer_dsa_pub_path) && mini_resp_auth(&source, ae->password);
-        if (!peer_ok) {
-            if (connected >= 0) mini_resp_close(&source);
-            for (size_t i = 0; i < glob_count; i++)
-                qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
-                    0u, 0u, UINT64_MAX, UINT64_MAX, false);
-            fprintf(stderr, "qihse-cluster-daemon: replica pull: protected source connection or identity pin failed\n");
-            continue;
+        if (ae->source_host) {
+            mini_resp_t source;
+            int connected = ae->source_via_i2p
+                ? mini_resp_connect_i2p(&source, ae->source_host, ae->source_port,
+                    ae->socks_port, ae->qkp)
+                : mini_resp_connect_mode(&source, ae->source_host, ae->source_port,
+                    ae->qkp, false, 0u);
+            bool peer_ok = connected >= 0 && qihse_qkp_client_session_is_replication_peer(
+                source.qkp, ae->qkp->replication_peer_node_id,
+                ae->qkp->replication_peer_dsa_pub_path) && mini_resp_auth(&source, ae->password);
+            if (!peer_ok) {
+                if (connected >= 0) mini_resp_close(&source);
+                for (size_t i = 0; i < glob_count; i++)
+                    qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
+                        0u, 0u, UINT64_MAX, UINT64_MAX, false);
+                fprintf(stderr, "qihse-cluster-daemon: replica pull: protected source connection or identity pin failed\n");
+            } else {
+                uint64_t total = 0u;
+                bool all_ok = true;
+                for (size_t i = 0; i < glob_count && !*ae->stop && total < REPL_AE_MAX_KEYS; i++) {
+                    uint64_t before = total;
+                    bool ok = replica_pull_glob(ae, &source, globs[i], &total);
+                    qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
+                        total - before, 0u, UINT64_MAX, UINT64_MAX, ok);
+                    if (!ok) { all_ok = false; break; }
+                }
+                mini_resp_close(&source);
+                fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned %s source (%s)\n",
+                        (unsigned long long)total, ae->transport_name ? ae->transport_name : (ae->source_via_i2p ? "I2P" : "direct"), all_ok ? "ok" : "stopped on error");
+            }
         }
-        uint64_t total = 0u;
-        bool all_ok = true;
-        for (size_t i = 0; i < glob_count && !*ae->stop && total < REPL_AE_MAX_KEYS; i++) {
-            uint64_t before = total;
-            bool ok = replica_pull_glob(ae, &source, globs[i], &total);
-            qihse_resp_server_repl_note(ae->server, globs[i], ae->source_host,
-                total - before, 0u, UINT64_MAX, UINT64_MAX, ok);
-            if (!ok) { all_ok = false; break; }
+
+        /* Peer anti-entropy across cluster peers (LAN cluster / mesh) */
+        qihse_cluster_topology_t* topology =
+            (qihse_cluster_topology_t*)qihse_resp_server_topology(ae->server);
+        if (topology) {
+            qihse_cluster_node_t nodes[64];
+            size_t node_count = qihse_cluster_topology_nodes(topology, nodes, 64);
+            uint16_t local_idx = qihse_cluster_topology_local_node(topology);
+            for (size_t p = 0; p < node_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); p++) {
+                if (nodes[p].index == local_idx) continue;
+                if (!nodes[p].healthy) continue;
+                if (nodes[p].host[0] == '\0') continue;
+                if (ae->self_host && strcmp(nodes[p].host, ae->self_host) == 0 && nodes[p].port == ae->self_port) continue;
+                for (size_t g = 0; g < glob_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); g++) {
+                    char err[128] = {0};
+                    uint64_t pulled = 0;
+                    bool ok = qihse_resp_server_repl_pull(ae->server, globs[g],
+                                                          nodes[p].host,
+                                                          nodes[p].port,
+                                                          true, /* missing_only */
+                                                          &pulled, err, sizeof(err));
+                    char peer_spec[280];
+                    snprintf(peer_spec, sizeof(peer_spec), "%s:%u", nodes[p].host, (unsigned)nodes[p].port);
+                    qihse_resp_server_repl_note(ae->server, globs[g], peer_spec, pulled, 0, UINT64_MAX, UINT64_MAX, ok);
+                    if (ok && pulled > 0) {
+                        fprintf(stderr, "qihse-cluster-daemon: repl peer sync: pulled %llu missing key(s) from %s for '%s'\n",
+                                (unsigned long long)pulled, peer_spec, globs[g]);
+                    }
+                }
+            }
+        } else if (ae->peers && ae->peer_count > 0) {
+            for (size_t p = 0; p < ae->peer_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); p++) {
+                if (ae->peers[p].index == ae->self_index) continue;
+                for (size_t g = 0; g < glob_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); g++) {
+                    char err[128] = {0};
+                    uint64_t pulled = 0;
+                    bool ok = qihse_resp_server_repl_pull(ae->server, globs[g],
+                                                          ae->peers[p].host,
+                                                          ae->peers[p].port,
+                                                          true, /* missing_only */
+                                                          &pulled, err, sizeof(err));
+                    char peer_spec[280];
+                    snprintf(peer_spec, sizeof(peer_spec), "%s:%u", ae->peers[p].host, (unsigned)ae->peers[p].port);
+                    qihse_resp_server_repl_note(ae->server, globs[g], peer_spec, pulled, 0, UINT64_MAX, UINT64_MAX, ok);
+                    if (ok && pulled > 0) {
+                        fprintf(stderr, "qihse-cluster-daemon: repl peer sync: pulled %llu missing key(s) from %s for '%s'\n",
+                                (unsigned long long)pulled, peer_spec, globs[g]);
+                    }
+                }
+            }
         }
-        mini_resp_close(&source);
-        fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned %s source (%s)\n",
-                (unsigned long long)total, ae->source_via_i2p ? "I2P" : "WireGuard", all_ok ? "ok" : "stopped on error");
     }
     return NULL;
 }
@@ -925,6 +980,21 @@ static void* join_main(void* argument) {
     }
 }
 
+static bool is_lan_host(const char* host) {
+    if (!host || !*host) return false;
+    struct in_addr address;
+    if (inet_pton(AF_INET, host, &address) == 1) {
+        uint32_t host_addr = ntohl(address.s_addr);
+        if ((host_addr >> 16) == ((192u << 8) | 168u) ||
+            (host_addr >> 24) == 127u ||
+            (host_addr >> 24) == 10u ||
+            (host_addr >> 20) == ((172u << 4) | 1u)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
 
     /* Signed ops frames (hybrid bus upgrade): load this node's ML-DSA
@@ -965,11 +1035,12 @@ int main(int argc, char** argv) {
     char repl_globs[16][128];
     const char* repl_glob_ptrs[16];
     size_t repl_glob_count = 0;
+    bool replicate_disabled = false;
     uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
     const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
     const char* pqc_node_id = NULL;
     const char* replication_source_host = NULL;
-    const char* replication_transport = "i2p";
+    const char* replication_transport = NULL; /* default resolved dynamically: "direct" over LAN (192.168.x.x), else "wireguard" */
     uint16_t replication_source_port = 0;
     uint16_t replication_socks_port = 4447;
     bool replica_read_only = false;
@@ -1064,12 +1135,22 @@ int main(int argc, char** argv) {
             unsigned long v = strtoul(argv[++i], &end, 10);
             if (errno != 0 || !end || *end || v > QIHSE_CLUSTER_SLOT_COUNT) return usage(argv[0]), 2;
             brain_rebalance_min = (uint32_t)v;
+        } else if (strcmp(a, "--no-replicate") == 0 || strcmp(a, "--replicate-none") == 0) {
+            replicate_disabled = true;
+            repl_glob_count = 0;
         } else if (strcmp(a, "--replicate") == 0 && i + 1 < argc) {
-            if (repl_glob_count >= sizeof(repl_globs) / sizeof(repl_globs[0])) return usage(argv[0]), 2;
-            if (strlen(argv[++i]) >= sizeof(repl_globs[0])) return usage(argv[0]), 2;
-            snprintf(repl_globs[repl_glob_count], sizeof(repl_globs[0]), "%s", argv[i]);
-            repl_glob_ptrs[repl_glob_count] = repl_globs[repl_glob_count];
-            repl_glob_count++;
+            const char* val = argv[++i];
+            if (strcmp(val, "none") == 0) {
+                replicate_disabled = true;
+                repl_glob_count = 0;
+            } else {
+                if (repl_glob_count >= sizeof(repl_globs) / sizeof(repl_globs[0])) return usage(argv[0]), 2;
+                if (strlen(val) >= sizeof(repl_globs[0])) return usage(argv[0]), 2;
+                if (strcmp(val, "all") == 0) val = "*";
+                snprintf(repl_globs[repl_glob_count], sizeof(repl_globs[0]), "%s", val);
+                repl_glob_ptrs[repl_glob_count] = repl_globs[repl_glob_count];
+                repl_glob_count++;
+            }
         } else if (strcmp(a, "--pqc-identity-dir") == 0 && i + 1 < argc) {
             pqc_identity_dir = argv[++i];
         } else if (strcmp(a, "--pqc-node-id") == 0 && i + 1 < argc) {
@@ -1083,7 +1164,8 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--replication-transport") == 0 && i + 1 < argc) {
             replication_transport = argv[++i];
             if (strcmp(replication_transport, "i2p") != 0 &&
-                strcmp(replication_transport, "wireguard") != 0) return usage(argv[0]), 2;
+                strcmp(replication_transport, "wireguard") != 0 &&
+                strcmp(replication_transport, "direct") != 0) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-socks-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &replication_socks_port) || replication_socks_port == 0u) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replica-read-only") == 0) {
@@ -1241,25 +1323,56 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: replication source host and port must be configured together\n");
         return 2;
     }
-    if (replication_source_host && strcmp(replication_transport, "i2p") == 0) {
+    if (replication_source_host) {
         size_t source_len = strlen(replication_source_host);
-        if (source_len < 4u || strcasecmp(replication_source_host + source_len - 4u, ".i2p") != 0) {
-            fprintf(stderr, "qihse-cluster-daemon: replication source must be an I2P destination name\n");
-            return 2;
+        bool is_i2p_name = (source_len >= 4u && strcasecmp(replication_source_host + source_len - 4u, ".i2p") == 0);
+
+        if (!replication_transport) {
+            /* Default to WireGuard for private overlay, except over LAN where it is direct */
+            if (is_i2p_name) {
+                fprintf(stderr, "qihse-cluster-daemon: I2P replication transport is opt-in only; pass --replication-transport i2p explicitly to enable I2P garlic routing\n");
+                return 2;
+            }
+            struct in_addr address;
+            if (inet_pton(AF_INET, replication_source_host, &address) == 1) {
+                uint32_t host_addr = ntohl(address.s_addr);
+                if ((host_addr >> 16) == ((192u << 8) | 168u) || (host_addr >> 24) == 127u) {
+                    replication_transport = "direct";
+                } else if ((host_addr >> 24) == 10u || (host_addr >> 20) == ((172u << 4) | 1u)) {
+                    replication_transport = "wireguard";
+                } else {
+                    fprintf(stderr, "qihse-cluster-daemon: replication source must be RFC1918 private IPv4 (e.g. 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n");
+                    return 2;
+                }
+            } else {
+                fprintf(stderr, "qihse-cluster-daemon: replication source must be a private IPv4 address or an .i2p destination\n");
+                return 2;
+            }
         }
-    }
-    if (replication_source_host && strcmp(replication_transport, "wireguard") == 0) {
-        struct in_addr address;
-        if (inet_pton(AF_INET, replication_source_host, &address) != 1) {
-            fprintf(stderr, "qihse-cluster-daemon: WireGuard replication source must be a private IPv4 address\n");
-            return 2;
-        }
-        uint32_t host_addr = ntohl(address.s_addr);
-        if (!((host_addr >> 24) == 10u ||
-              (host_addr >> 20) == ((172u << 4) | 1u) ||
-              (host_addr >> 16) == ((192u << 8) | 168u))) {
-            fprintf(stderr, "qihse-cluster-daemon: WireGuard replication source must be RFC1918 private IPv4\n");
-            return 2;
+
+        if (strcmp(replication_transport, "i2p") == 0) {
+            if (!is_i2p_name) {
+                fprintf(stderr, "qihse-cluster-daemon: replication source must be an I2P destination name when --replication-transport i2p is specified\n");
+                return 2;
+            }
+        } else if (strcmp(replication_transport, "wireguard") == 0 || strcmp(replication_transport, "direct") == 0) {
+            struct in_addr address;
+            if (inet_pton(AF_INET, replication_source_host, &address) != 1) {
+                if (is_i2p_name) {
+                    fprintf(stderr, "qihse-cluster-daemon: I2P replication transport is opt-in only; pass --replication-transport i2p explicitly to enable I2P garlic routing\n");
+                } else {
+                    fprintf(stderr, "qihse-cluster-daemon: replication source must be a private RFC1918 IPv4 address (e.g. LAN or WireGuard)\n");
+                }
+                return 2;
+            }
+            uint32_t host_addr = ntohl(address.s_addr);
+            if (!((host_addr >> 24) == 10u ||
+                  (host_addr >> 20) == ((172u << 4) | 1u) ||
+                  (host_addr >> 16) == ((192u << 8) | 168u) ||
+                  (host_addr >> 24) == 127u)) {
+                fprintf(stderr, "qihse-cluster-daemon: replication source must be RFC1918 private IPv4 (e.g. 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n");
+                return 2;
+            }
         }
     }
 
@@ -1450,12 +1563,12 @@ int main(int argc, char** argv) {
     /* Anti-entropy carries credentials and replicated values. Refuse to
      * enable it unless every connection can use QKP1 with configured node
      * trust anchors; the transport client has no cleartext fallback. */
-    if ((replication_configured || (repl_glob_count > 0u && repl_interval > 0u)) &&
+    if ((replication_configured || (replication_source_host && repl_glob_count > 0u && repl_interval > 0u)) &&
         (!pqc.dsa_key_path || access(pqc.dsa_key_path, R_OK) != 0 ||
          !pqc.kem_key_path || access(pqc.kem_key_path, R_OK) != 0 ||
          !pqc.kem_pub_path || access(pqc.kem_pub_path, R_OK) != 0 ||
          pqc_trusted_count == 0u)) {
-        fprintf(stderr, "qihse-cluster-daemon: --replicate requires readable QKP1 DSA/KEM identity keys and at least one --pqc-trusted-pub; refusing unsafe replication\n");
+        fprintf(stderr, "qihse-cluster-daemon: --replication-source-host requires readable QKP1 DSA/KEM identity keys and at least one --pqc-trusted-pub; refusing unsafe replication\n");
         return 2;
     }
 
@@ -1592,6 +1705,13 @@ int main(int argc, char** argv) {
     }
     config.cluster_migrate_password = operator_password;
     config.redundancy_peer = redundancy_peer;
+    /* Replicate all by default in LAN cluster (when in cluster mesh and bind is private/LAN) */
+    if (repl_glob_count == 0 && !replicate_disabled && (peer_count > 0 || seed_count > 0) && is_lan_host(bind)) {
+        snprintf(repl_globs[0], sizeof(repl_globs[0]), "*");
+        repl_glob_ptrs[0] = repl_globs[0];
+        repl_glob_count = 1;
+        fprintf(stderr, "qihse-cluster-daemon: LAN cluster default: replicating all namespaces ('*')\n");
+    }
     /* R4 replicated namespaces: must be set BEFORE server create — the
      * engine ingests the globs into its registry during creation. */
     config.replicate_globs = repl_glob_ptrs;
@@ -1716,13 +1836,19 @@ int main(int argc, char** argv) {
     static volatile sig_atomic_t ae_stop = 0;
     ae_ctx_t ae_ctx;
     bool ae_started = false;
-    if (replication_source_host && repl_interval > 0u) {
+    if (repl_interval > 0u && (replication_source_host != NULL || ((peer_count > 0 || seed_count > 0) && repl_glob_count > 0))) {
         ae_ctx.server = server;
+        ae_ctx.peers = peers;
+        ae_ctx.peer_count = peer_count;
+        ae_ctx.self_index = self_index;
         ae_ctx.password = operator_password;
+        ae_ctx.self_host = bind;
+        ae_ctx.self_port = port;
         ae_ctx.source_host = replication_source_host;
         ae_ctx.source_port = replication_source_port;
         ae_ctx.socks_port = replication_socks_port;
-        ae_ctx.source_via_i2p = strcmp(replication_transport, "i2p") == 0;
+        ae_ctx.source_via_i2p = replication_transport && strcmp(replication_transport, "i2p") == 0;
+        ae_ctx.transport_name = replication_transport;
         ae_ctx.replica_principal = qihse_auth_get_user(0u);
         ae_ctx.qkp = &pqc;
         ae_ctx.data_dir = data_dir;

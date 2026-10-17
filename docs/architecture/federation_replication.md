@@ -52,16 +52,18 @@ which is what makes a merge outcome reproducible.
 | `QIHSE_SYNC_FETCH` | the peer has objects local lacks |
 | `QIHSE_SYNC_CONFLICT` | both have objects and they diverge |
 
-## What is not implemented
+## Replication Transports
 
-> **Section status: partial — this list is stale.** The transport, the
-> resumable cursor and checksum verification all exist in
-> `src/federation/qihse_federation_repl.c`. See the contradiction note at the
-> top of this document.
+QIHSE decouples the logical replication engine from physical transport:
 
-- The transport that carries ranges between peers.
-- Rate limiting and resumable transfer (the plan is a plan, not a cursor).
-- Checksum verification of transferred data, because nothing is transferred.
+| Transport | Configuration | Status | Threat Model & Policy |
+|---|---|---|---|
+| **Direct LAN / WireGuard Mesh** | `--replication-transport direct` or `wireguard` | **Default** | Private RFC1918 IPv4 (e.g. `192.168.1.0/24` or `10.0.0.0/8`); hardware kernel crypto |
+| **I2P Garlic Routing** | `--replication-transport i2p` | **Strictly Opt-in** | Covert transport via loopback SOCKS5; metadata-hiding multi-hop garlic tunnels |
 
-A node offline for days can currently be *compared* against a peer but not
-*repaired* from one. That gap is the remaining work in this stage.
+### Opt-In Enforcement & Mutual Pinning
+
+- **Default Transport**: WireGuard / private RFC1918 mesh is standard.
+- **Opt-in Only**: The daemon requires `--replication-transport i2p` explicitly when connecting to an `.i2p` destination. Unconfigured attempts fail fast at CLI validation.
+- **Mutual Pinning**: Both primary and replica cryptographically verify peer identities (`--replication-peer-node-id` and `--replication-peer-dsa-pub`) using Post-Quantum CNSA 2.0 signatures (ML-DSA-87) over sealed QKP1 sessions.
+- **Automated Provisioning**: PQC certificate generation, i2pd hardening, and tunnel configuration are automated via [scripts/setup_i2p_replication.sh](file:///home/john/Documents/QIHSE/scripts/setup_i2p_replication.sh).

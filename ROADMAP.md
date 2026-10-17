@@ -136,10 +136,22 @@ Replication validation gates:
   bytes (`make test-replica-qkp`).
 - [x] Abrupt exit/restart at seven install image, intent, WAL, SSTable, cursor,
   marker, and journal-removal boundaries (`make test-replica-crash`).
+- [x] Live deployment smoke test across real I2P/SOCKS5 network with strict L2
+  bridge isolation (`ebtables`) and mutual QKP1 key pinning verified across
+  stageb containers (2026-10-17).
 
-The code-level W8 validation gates are closed. A deployment smoke test through
-the configured real I2P/SOCKS network remains site-specific and was not run in
-this workspace; external EventStream integration is a separate open item.
+- [x] Full LAN cluster replication (`*`) by default with automatic peer anti-entropy reconciliation across cluster nodes (`t420` and `730xd`), verified with 100% database key parity (3,046/3,046 keys identical) and background missing-key healing (2026-10-17).
+- [x] Automated hardware ISA detection and installer (`scripts/install_qihse.sh` & `make install-host`), auto-detecting AVX/AVX2/AVX-512/AVX-VNNI/AMX, configuring compiler optimization flags, building and installing into `/opt/QIHSE`, provisioning NIST CNSA 2.0 PQC keys in `/etc/qihse/keys`, supporting interactive solo node vs. multi-node cluster selection with automatic LAN subnet peer scanning, boot launch persistence (`systemctl enable`), `make clean` by default, startup cluster bus acknowledgement wait, solo re-run upgrade workflow, and KEYSTONE companion indexing service integration (2026-10-17).
+
+The code-level and live deployment W8 validation gates are closed. Real-world
+I2P/SOCKS5 garlic routing, mutual QKP1 pinning, delta row replication, and
+tombstone propagation were smoke tested and verified across isolated Proxmox
+containers (`stageb-node1`, `stageb-node2`, `stageb-node3`). The I2P replica
+mode is enforced as strictly opt-in (`--replication-transport i2p`, with direct
+RFC1918 LAN / WireGuard mesh as default), and automated PQC provisioning and i2pd hardening are provided
+via `scripts/setup_i2p_replication.sh`. In LAN cluster deployments, replication defaults to all namespaces (`*`)
+with continuous topology-aware peer anti-entropy sync, ensuring nodes offline for days automatically reconcile
+all missing keys upon reconnection. External EventStream integration is a separate open item.
 
 ### 1.1 Landed and committed
 

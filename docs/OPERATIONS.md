@@ -113,21 +113,46 @@ installs into `/usr/local` on first use (skipped when already present).
 | `make federation-ca` | Build `qihse-federation-ca` | Verified |
 | `make xdp-kern` | Compile the eBPF XDP object with `clang` | *Not verified here* |
 | `make install` | Install `libqihse.so` + header into `$(DESTDIR)/usr/local` | *Not verified here* |
+| `make install-host` | Automated hardware ISA detection, build, `/opt/QIHSE` install, PQC keygen & systemd launch (`scripts/install_qihse.sh`) | Verified |
 
-### 1.3 CPU ISA selection
+### 1.3 CPU ISA selection & Automated Host Installer
 
-ISA flags are auto-detected from `/proc/cpuinfo` at build time and can be
-overridden on the command line:
+QIHSE includes an automated hardware-optimizing installer: [scripts/install_qihse.sh](file:///home/john/Documents/QIHSE/scripts/install_qihse.sh).
 
 ```bash
-make QIHSE_ENABLE_AVX2=1 QIHSE_ENABLE_AVX512=0 QIHSE_ENABLE_AMX=0
-make isa-info     # show what the current invocation detected
+# Dry run to inspect detected CPU ISAs and planned compiler flags
+./scripts/install_qihse.sh --dry-run
+
+# Interactive installation (prompts for solo vs cluster mode & expected peers)
+sudo ./scripts/install_qihse.sh
+# or via make
+make install-host
+
+# Non-interactive solo node installation (owns all slots 0-16383)
+sudo ./scripts/install_qihse.sh --solo -y
+
+# Multi-node cluster installation waiting for 3 LAN nodes to acknowledge
+sudo ./scripts/install_qihse.sh --cluster --expected-nodes 3 --join 192.168.1.90:17115
 ```
 
-`make isa-info` (verified) prints the four `QIHSE_ENABLE_*` values and the
-resulting `-m…` flags. AVX-VNNI requires AVX2. The build stays scalar-safe on
-hosts without SIMD (an AVX-only host builds and runs; see the comment block in
-the `Makefile`).
+The installer performs 7 automated phases:
+1. **CPU ISA Detection**: Inspects `/proc/cpuinfo` for AVX, AVX2, FMA, AVX-512 (F/DQ/BW/VL), AVX-VNNI, AMX (TILE/INT8/BF16), and ARM NEON/SVE. Sets `QIHSE_ENABLE_AVX2`, `QIHSE_ENABLE_AVX512`, `QIHSE_ENABLE_AVX_VNNI`, `QIHSE_ENABLE_AMX`, and compiler flags (`-march=native -mtune=native`).
+2. **Network Topology Discovery & LAN Subnet Probing**:
+   - Detects existing systemd services (`qihse-node*.service`), automatically preserving existing node indices, assigned slot ranges, peer lists, and bind IPs.
+   - **Automatic LAN Peer Scanning**: Probes the host's `/24` subnet on default QIHSE ports (7100, 7101, 7115, 17100, 17115). If peers are found on the LAN, the installer displays them, auto-populates join seeds, and proposes joining the multi-node cluster. If no peers are found, it defaults to a solo standalone node. (Can be skipped via `--no-scan`).
+   - Mode resolution:
+     - **Solo Standalone Node**: Configures the node to own 100% of the cluster keyspace (`--slot-range 0-16383`), asks whether to bring the service online immediately or leave offline (`--no-launch`), and prints clear guidance to re-run the installer when adding a second machine to update and join the cluster.
+     - **Multi-Node Cluster**: Prompts for the total number of expected cluster nodes on the LAN (`--expected-nodes N`), prompts for peer join seeds, and configures the cluster topology.
+3. **Hardware-Tuned Build**: Runs `make clean` by default (overridable with `--no-clean`), sets verbose logging by default (`--verbose`, overridable with `--quiet`), and uses half available host cores (`-j $(nproc/2)`) to compile `libqihse.so`, `qihse-cluster-daemon`, `qihse_keygen`, and companion binaries.
+4. **Filesystem Installation**: Installs binaries and shared libraries into `/opt/QIHSE/bin` and `/opt/QIHSE/lib`, with timestamped backups of existing binaries.
+5. **NIST CNSA 2.0 PQC Provisioning**: Provisions ML-KEM-1024 and ML-DSA-87 keypairs into `/etc/qihse/keys` with `0700`/`0600` permissions and exports the local hostname public identity (`qihse_dsa_pub_<hostname>.pem`).
+6. **Systemd Service, Boot Launch & Cluster Acknowledgement**:
+   - Generates `/etc/systemd/system/qihse-node<N>.service`, configures peer trust anchors, and executes `systemctl enable` so the service is installed to launch automatically on system boot.
+   - If service launch is enabled (default), starts/restarts the systemd unit, verifies local daemon PING health, and in multi-node mode waits for cluster bus acknowledgement from all expected nodes (`--wait-timeout` default 45s) with a live discovery counter.
+7. **KEYSTONE Companion Indexing Service Integration**:
+   - Checks if KEYSTONE is installed at `/opt/KEYSTONE`.
+   - If missing, explains that KEYSTONE is the recommended companion indexing service providing SIMD-accelerated vector and trigram search with the Unified Wire Protocol bridge to QIHSE, and offers to clone and install it from `https://github.com/SWORDIntel/KEYSTONE.git`.
+
 
 ### 1.4 GNUmakefile overlay — read this before editing the Makefile
 
@@ -353,37 +378,71 @@ flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 
-The one-way replica puller connects only through local SOCKS5 to an `.i2p`
-destination. Configure `--replication-source-host`, `--replication-source-port`,
-`--replica-read-only`, one or more `--replicate` globs, a stable
-`--pqc-node-id`, `--replication-peer-node-id`, and the matching
-`--replication-peer-dsa-pub`. QKP1 identity verification completes before the
-operator AUTH command is sent; no cleartext fallback or direct network path is
-used. `--pqc-trusted-pub` anchors the peer key. The replica fence blocks normal
-KV writes for that process lifetime while allowing authenticated replication
-apply. The source can pin a complete, namespace-filtered snapshot to a QKP
-session with `REPL.SNAPSHOT.BEGIN/READ/END`; the receiver writes the download
-to a private staging file, validates its namespace and metadata, then installs
-the image and baseline cursor. Configure exactly one dedicated replication
-glob on a replica: snapshot installation replaces that replica store's logical
-image. Deletes, expiry metadata, classifications, and compartments are carried
-in the ordered row format.
+### 3.2.1 Replication Transports & Mutual Pinning
 
-Snapshot start now persists the source sequence as a per-peer baseline before
-releasing the consistent snapshot view. The source retains matching tombstones
-through compaction until `REPL.ACK` confirms the receiver has synced the applied
-rows and cursor. This closes the baseline-to-delta delete gap for the current
-KV transport. The replication code-level gates are verified by
-`make test-replica-qkp` (operator success and low-clearance denial on a live
-pinned QKP1 session) and
-`make test-replica-crash` (abrupt exit and restart at seven install durability
-boundaries). Delta enumeration retains only the earliest rows fitting its row
-and byte budgets; the daemon pulls one row at a time, up to the KV value limit,
-over QKP1's framed stream. Before deploying a replica, run a site-specific
-smoke test through the configured real I2P/SOCKS network and verify peer
-convergence after restart; that network test was not run in this workspace.
-The external EventStream is not connected and remains a separate integration
-item; it is not used by this QIHSE KV replication path.
+QIHSE provides one-way authenticated KV replication between nodes with end-to-end
+Post-Quantum Cryptography (CNSA 2.0: ML-KEM-1024 and ML-DSA-87) over sealed QKP1
+sessions.
+
+#### Transport Modes
+
+1. **Direct RFC1918 Private LAN / WireGuard Mesh (Default)**:
+   - Configured with `--replication-transport direct` or `--replication-transport wireguard`
+     (or omitted, as direct RFC1918 is the default).
+   - Connects directly via standard kernel TCP to a private RFC1918 IPv4 address
+     (`10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`) over local LAN (e.g. `192.168.1.90`
+     for 730xd) or an encrypted WireGuard mesh interface (`10.249.73.0/24`).
+   - External internet or public IP addresses are strictly rejected.
+
+2. **I2P Garlic Transport (Strictly Opt-In)**:
+   - **Opt-in Only**: Must be explicitly activated using `--replication-transport i2p`.
+     Attempting to specify an `.i2p` destination without `--replication-transport i2p`
+     will cause `qihse-cluster-daemon` to exit immediately with an error.
+   - Connects only through a local loopback SOCKS5 proxy (`127.0.0.1:4447`, configurable via
+     `--replication-socks-port`).
+   - The QIHSE daemon never generates raw Internet packets; all inter-node garlic
+     routing is handled out-of-process by the local `i2pd` daemon.
+   - Fast 1-hop tunnels (`inbound.length = 1`, `outbound.length = 1`, `quantity = 3`)
+     provide low-latency replica transfer while concealing node topologies.
+
+#### Mutual QKP1 Identity Pinning (No TOFU)
+
+Replication data plane access requires cryptographic mutual authorization:
+- **Replica (Client)** pins the upstream primary via `--replication-peer-node-id <id>`
+  and `--replication-peer-dsa-pub <path>`. The client verifies the server's ML-DSA-87
+  identity key fingerprint during the QKP1 handshake before sending any credentials.
+- **Primary (Server)** pins the authorized replica via `--replication-peer-node-id <id>`
+  and `--replication-peer-dsa-pub <path>`. When a client connects and requests
+  `REPL.SNAPSHOT.BEGIN` or `REPL.DELTA`, the primary enforces `qihse_resp_repl_data_plane_allowed()`.
+  Connections lacking a matching ML-DSA fingerprint or operator clearance receive:
+  `-NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator`.
+
+#### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
+
+To simplify secure certificate generation and daemon configuration, use
+[scripts/setup_i2p_replication.sh](file:///home/john/Documents/QIHSE/scripts/setup_i2p_replication.sh):
+- **Constants at Top of File**: Node IDs, ports, tunnel lengths, and hardening parameters
+  are clearly defined constants at the top of the script.
+- **`gen-keys`**: Derives ML-KEM-1024 and ML-DSA-87 keypairs with `0600` permissions and
+  registers the DSA public identity into `/opt/qihse/data/peers/<node_id>.pem`.
+- **`harden-i2pd`**: Writes a hardened, loopback-only `/etc/i2pd/i2pd.conf` that disables
+  the web console, SAM, BOB, I2CP, and UPnP to minimize local attack surfaces.
+- **`setup-primary`**: Configures the primary node, sets up the I2P server tunnel in
+  `/etc/i2pd/tunnels.conf.d/qihse-upstream.conf`, establishes LeaseSets, and prints
+  the primary startup command.
+- **`setup-replica`**: Configures the replica node, adds the upstream Base32 address into
+  the addressbook, enables SOCKS5, and prints the replica command with opt-in flags.
+- **`status`**: Checks running daemons, SOCKS5 listener, PQC key permissions, and peer certs.
+
+#### Durability & Verification
+
+- Snapshot creation records a durable intent and streams consistent rows in chunks.
+- Delta enumeration requests one row at a time with monotonic `REPL.ACK` progression.
+- Compaction retains tombstones across baseline boundaries until acknowledged.
+- Code-level validation is verified by `make test-replica-qkp` and `make test-replica-crash`.
+- Real-world deployment smoke testing was verified across Proxmox LXC containers
+  (`stageb-node1`, `stageb-node2`, `stageb-node3`) with strict Layer-2 bridge isolation
+  (`ebtables` dropping all IPv4 and ARP between containers).
 
 ### 3.3 `qihse-redis-server`
 

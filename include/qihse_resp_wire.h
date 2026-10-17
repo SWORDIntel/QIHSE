@@ -229,6 +229,12 @@ bool qihse_resp_server_repl_snapshot_install_local(qihse_resp_server_t* server,
 void qihse_resp_server_repl_note(qihse_resp_server_t* server, const char* glob, const char* peer,
                                  uint64_t pulled, uint64_t divergent,
                                  uint64_t local_count, uint64_t orphaned, bool ok);
+/* Trigger a pull from a peer host:port for a given glob.
+ * If missing_only is true, existing keys in store are skipped without GET.
+ * Returns true if the connection and pull completed, with out_pulled set. */
+bool qihse_resp_server_repl_pull(qihse_resp_server_t* server, const char* glob,
+                                 const char* host, uint16_t port, bool missing_only,
+                                 uint64_t* out_pulled, char* err, size_t err_cap);
 qihse_cluster_bus_t* qihse_resp_server_bus(qihse_resp_server_t* server);
 
 /* The dispatch listener's actual port, or 0 when dispatch is not running

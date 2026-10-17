@@ -6805,11 +6805,23 @@ bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char*
     bool matched = false;
     pthread_mutex_lock(&server->repl_lock);
     for (struct qihse_resp_repl_mark* m = server->repl_marks; m && !matched; m = m->next) {
-        if (key_len < QIHSE_REPL_GLOB_MAX) {
-            char buf[QIHSE_REPL_GLOB_MAX];
+        if (m->glob[0] == '*' && m->glob[1] == '\0') {
+            matched = true;
+            break;
+        }
+        if (key_len < 4096u) {
+            char buf[4096];
             memcpy(buf, key, key_len);
             buf[key_len] = '\0';
             matched = fnmatch(m->glob, buf, 0) == 0;
+        } else {
+            char* buf = (char*)malloc(key_len + 1u);
+            if (buf) {
+                memcpy(buf, key, key_len);
+                buf[key_len] = '\0';
+                matched = fnmatch(m->glob, buf, 0) == 0;
+                free(buf);
+            }
         }
     }
     pthread_mutex_unlock(&server->repl_lock);
@@ -7018,7 +7030,17 @@ static char* qihse_resp_fd_bulk_reply(int fd, char* err, size_t err_cap) {
         return NULL;
     }
     char tail[2];
-    if (recv(fd, tail, 2u, 0) != 2 || tail[0] != '\r' || tail[1] != '\n') {
+    size_t tail_got = 0;
+    while (tail_got < 2u) {
+        ssize_t received = recv(fd, tail + tail_got, 2u - tail_got, 0);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (received == 0) break;
+        tail_got += (size_t)received;
+    }
+    if (tail_got != 2u || tail[0] != '\r' || tail[1] != '\n') {
         free(value);
         if (err && err_cap) snprintf(err, err_cap, "missing CRLF");
         return NULL;
@@ -7151,6 +7173,114 @@ static bool qihse_resp_handle_repl_status(qihse_resp_session_t* session, const q
     return built;
 }
 
+bool qihse_resp_server_repl_pull(qihse_resp_server_t* server, const char* glob,
+                                 const char* host, uint16_t port, bool missing_only,
+                                 uint64_t* out_pulled, char* err, size_t err_cap) {
+    if (out_pulled) *out_pulled = 0u;
+    if (err && err_cap) err[0] = '\0';
+    if (!server || !server->store || !glob || !*glob || !host || !*host || port == 0u) {
+        if (err && err_cap) snprintf(err, err_cap, "invalid arguments");
+        return false;
+    }
+
+    int fd = qihse_resp_connect_timeout(host, port, 3000);
+    if (fd < 0) {
+        if (err && err_cap) snprintf(err, err_cap, "cannot connect to peer %s:%u", host, (unsigned)port);
+        return false;
+    }
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    const char* password = server->cluster_migrate_password;
+    if (password && *password) {
+        static const uint8_t auth_cmd[] = "AUTH";
+        qihse_resp_arg_t auth_args[2] = {
+            { auth_cmd, sizeof(auth_cmd) - 1u },
+            { (const uint8_t*)password, strlen(password) }
+        };
+        if (!qihse_resp_fd_command(fd, 2u, auth_args, err, err_cap)) {
+            close_socket(fd);
+            return false;
+        }
+    }
+
+    static const uint8_t keys_cmd[] = "KEYS";
+    static const uint8_t get_cmd[] = "GET";
+    qihse_resp_arg_t keys_args[2] = {
+        { keys_cmd, sizeof(keys_cmd) - 1u },
+        { (const uint8_t*)glob, strlen(glob) }
+    };
+    if (!qihse_resp_fd_send_command(fd, 2u, keys_args)) {
+        close_socket(fd);
+        if (err && err_cap) snprintf(err, err_cap, "send KEYS failed");
+        return false;
+    }
+
+    size_t peer_count = 0;
+    char** peer_keys = qihse_resp_fd_array_reply(fd, &peer_count, err, err_cap);
+    if (!peer_keys) {
+        close_socket(fd);
+        return false;
+    }
+
+    qihse_user_t* system_user = qihse_auth_get_user(0);
+    if (!system_user) {
+        for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
+        free(peer_keys);
+        close_socket(fd);
+        if (err && err_cap) snprintf(err, err_cap, "system principal unavailable");
+        return false;
+    }
+
+    uint64_t pulled = 0;
+    int failures = 0;
+    for (size_t i = 0; i < peer_count && pulled < QIHSE_REPL_PULL_MAX; i++) {
+        if (!peer_keys[i] || !peer_keys[i][0]) continue;
+
+        if (missing_only) {
+            pthread_rwlock_rdlock(&server->kv_lock);
+            bool exists = qihse_kv_exists_user(server->store, peer_keys[i], system_user);
+            pthread_rwlock_unlock(&server->kv_lock);
+            if (exists) continue;
+        }
+
+        qihse_resp_arg_t get_args[2] = {
+            { get_cmd, sizeof(get_cmd) - 1u },
+            { (const uint8_t*)peer_keys[i], strlen(peer_keys[i]) }
+        };
+        if (!qihse_resp_fd_send_command(fd, 2u, get_args)) {
+            failures++;
+            break;
+        }
+        char* value = qihse_resp_fd_bulk_reply(fd, err, err_cap);
+        if (!value) {
+            if (err && err[0]) {
+                failures++;
+                break;
+            }
+            continue; /* nil = vanished mid-pull: fine */
+        }
+        pthread_rwlock_wrlock(&server->kv_lock);
+        bool stored = qihse_kv_set_user(server->store, peer_keys[i], value, 0, 0, system_user);
+        pthread_rwlock_unlock(&server->kv_lock);
+        free(value);
+        if (stored) pulled++;
+        else failures++;
+    }
+
+    for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
+    free(peer_keys);
+    close_socket(fd);
+
+    if (out_pulled) *out_pulled = pulled;
+    if (failures) {
+        if (err && err_cap) snprintf(err, err_cap, "pull incomplete: %llu pulled, %d failed", (unsigned long long)pulled, failures);
+        return false;
+    }
+    return true;
+}
+
 static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 3) return qihse_resp_wrong_arity(session, "repl.pull");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -7172,78 +7302,12 @@ static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qih
     uint16_t port = (uint16_t)strtoul(colon + 1, NULL, 10);
     if (port == 0u || !*spec) return qihse_resp_error(session, "ERR invalid host:port");
 
-    int fd = qihse_resp_connect_timeout(spec, port, 5000);
-    if (fd < 0) return qihse_resp_error(session, "ERR cannot connect to peer");
     char err[256] = {0};
-    const char* password = session->server->cluster_migrate_password;
-    if (password && *password) {
-        static const uint8_t auth_cmd[] = "AUTH";
-        qihse_resp_arg_t auth_args[2] = {
-            { auth_cmd, sizeof(auth_cmd) - 1u },
-            { (const uint8_t*)password, strlen(password) }
-        };
-        if (!qihse_resp_fd_command(fd, 2u, auth_args, err, sizeof(err))) {
-            close_socket(fd);
-            char msg[320];
-            snprintf(msg, sizeof(msg), "ERR peer authentication failed: %s", err);
-            return qihse_resp_error(session, msg);
-        }
-    }
-    static const uint8_t keys_cmd[] = "KEYS";
-    static const uint8_t get_cmd[] = "GET";
-    qihse_resp_arg_t keys_args[2] = {
-        { keys_cmd, sizeof(keys_cmd) - 1u },
-        { (const uint8_t*)glob, strlen(glob) }
-    };
-    if (!qihse_resp_fd_send_command(fd, 2u, keys_args)) {
-        close_socket(fd);
-        return qihse_resp_error(session, "ERR send failed");
-    }
-    size_t peer_count = 0;
-    char** peer_keys = qihse_resp_fd_array_reply(fd, &peer_count, err, sizeof(err));
-    if (!peer_keys) {
-        close_socket(fd);
-        char msg[320];
-        snprintf(msg, sizeof(msg), "ERR KEYS failed: %s", err);
-        return qihse_resp_error(session, msg);
-    }
-    qihse_user_t* system_user = qihse_auth_get_user(0);
-    if (!system_user) {
-        for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
-        free(peer_keys);
-        close_socket(fd);
-        return qihse_resp_error(session, "ERR system principal unavailable");
-    }
     uint64_t pulled = 0;
-    int failures = 0;
-    for (size_t i = 0; i < peer_count && pulled < QIHSE_REPL_PULL_MAX; i++) {
-        qihse_resp_arg_t get_args[2] = {
-            { get_cmd, sizeof(get_cmd) - 1u },
-            { (const uint8_t*)peer_keys[i], strlen(peer_keys[i]) }
-        };
-        if (!qihse_resp_fd_send_command(fd, 2u, get_args)) {
-            failures++;
-            break;
-        }
-        char* value = qihse_resp_fd_bulk_reply(fd, err, sizeof(err));
-        if (!value) {
-            if (err[0]) failures++;
-            continue; /* nil = vanished mid-pull: fine */
-        }
-        pthread_rwlock_wrlock(&session->server->kv_lock);
-        bool stored = qihse_kv_set_user(session->server->store, peer_keys[i], value, 0, 0, system_user);
-        pthread_rwlock_unlock(&session->server->kv_lock);
-        free(value);
-        if (stored) pulled++;
-        else failures++;
-    }
-    for (size_t i = 0; i < peer_count; i++) free(peer_keys[i]);
-    free(peer_keys);
-    close_socket(fd);
-    if (failures) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "ERR pull incomplete: %llu pulled, %d failed",
-                 (unsigned long long)pulled, failures);
+    bool ok = qihse_resp_server_repl_pull(session->server, glob, spec, port, false, &pulled, err, sizeof(err));
+    if (!ok && err[0]) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "ERR %s", err);
         return qihse_resp_error(session, msg);
     }
     return qihse_resp_integer(session, (int64_t)pulled);

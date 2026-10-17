@@ -10,6 +10,8 @@ lib/
 /qihse-server
 /qihse_keygen
 /qihse-federation-ca
+/qihse-cluster-daemon
+/qihse-machine-token
 /test_recall_db
 /test_mldsa
 /test-sqlite-vfs
@@ -144,3 +146,7 @@ qihse_audit.writer.lock
 
 # local run artifacts
 advisor-dumps/
+/QIHSE
+tools/qihse_i2p_test_cli
+tools/test_i2p_qkp_diag
+

@@ -51,7 +51,10 @@ The default profile enables `FEDERATION_PEERS` and `LOCAL_CITADEL` only.
 **QIHSE itself never requires unrestricted Internet egress** (acceptance
 criterion 26). Package and source fetching, CVE-database updates and build
 dependency retrieval belong to dedicated update and build domains, not to the
-QIHSE process.
+QIHSE process. Furthermore, even when the opt-in I2P replica transport is
+active, the QIHSE daemon connects strictly to the local loopback SOCKS5 interface
+(`127.0.0.1:4447`). The database process never contacts external IP addresses
+directly, maintaining complete egress isolation.
 
 ## Drift detection
 
