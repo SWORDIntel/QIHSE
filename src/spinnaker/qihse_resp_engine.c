@@ -539,7 +539,7 @@ static bool qihse_resp_find_crlf(const uint8_t* data, size_t len, size_t start, 
 
     while (i + 16u <= len) {
         __m128i chunk = _mm_loadu_si128((const __m128i*)(data + i));
-        int idx = _mm_cmpistri(needle, chunk, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY);
+        int idx = _mm_cmpestri(needle, 2, chunk, 16, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY);
         if (idx < 16) {
             *line_end = i + (size_t)idx;
             return true;
@@ -7929,16 +7929,30 @@ static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(const qihse_res
     switch (key) {
         case QIHSE_SWAR4('S','E','T', 0):
             if (name->len == 3u) return &g_dispatch_table[1];
-            if (qihse_resp_suffix_is(name, 3u, "EX")) return &g_dispatch_table[2];
-            if (qihse_resp_suffix_is(name, 3u, "RANGE")) return &g_dispatch_table[88];
-            if (qihse_resp_suffix_is(name, 3u, "BIT")) return &g_dispatch_table[136];
+            break;
+        case QIHSE_SWAR4('S','E','T','E'):
+            if (qihse_resp_suffix_is(name, 4u, "X")) return &g_dispatch_table[2];
+            break;
+        case QIHSE_SWAR4('S','E','T','R'):
+            if (qihse_resp_suffix_is(name, 4u, "ANGE")) return &g_dispatch_table[88];
+            break;
+        case QIHSE_SWAR4('S','E','T','B'):
+            if (qihse_resp_suffix_is(name, 4u, "IT")) return &g_dispatch_table[136];
             break;
         case QIHSE_SWAR4('G','E','T', 0):
             if (name->len == 3u) return &g_dispatch_table[0];
-            if (qihse_resp_suffix_is(name, 3u, "SET")) return &g_dispatch_table[83];
-            if (qihse_resp_suffix_is(name, 3u, "DEL")) return &g_dispatch_table[84];
-            if (qihse_resp_suffix_is(name, 3u, "RANGE")) return &g_dispatch_table[87];
-            if (qihse_resp_suffix_is(name, 3u, "BIT")) return &g_dispatch_table[137];
+            break;
+        case QIHSE_SWAR4('G','E','T','S'):
+            if (qihse_resp_suffix_is(name, 4u, "ET")) return &g_dispatch_table[83];
+            break;
+        case QIHSE_SWAR4('G','E','T','D'):
+            if (qihse_resp_suffix_is(name, 4u, "EL")) return &g_dispatch_table[84];
+            break;
+        case QIHSE_SWAR4('G','E','T','R'):
+            if (qihse_resp_suffix_is(name, 4u, "ANGE")) return &g_dispatch_table[87];
+            break;
+        case QIHSE_SWAR4('G','E','T','B'):
+            if (qihse_resp_suffix_is(name, 4u, "IT")) return &g_dispatch_table[137];
             break;
         case QIHSE_SWAR4('H','S','E','T'):
             if (name->len == 4u) return &g_dispatch_table[39];
