@@ -4,9 +4,66 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
-#ifndef _WIN32
-#include <openssl/rand.h>
+#include <immintrin.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Thread-local xoshiro256** PRNG state seeded once per thread from hardware RDRAND */
+static __thread uint64_t qihse_hnsw_xoshiro_state[4];
+static __thread bool qihse_hnsw_xoshiro_initialized = false;
+
+static inline uint64_t qihse_hnsw_rotl(const uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+static inline uint64_t qihse_hnsw_xoshiro256ss_next(void) {
+    const uint64_t result = qihse_hnsw_rotl(qihse_hnsw_xoshiro_state[1] * 5, 7) * 9;
+    const uint64_t t = qihse_hnsw_xoshiro_state[1] << 17;
+
+    qihse_hnsw_xoshiro_state[2] ^= qihse_hnsw_xoshiro_state[0];
+    qihse_hnsw_xoshiro_state[3] ^= qihse_hnsw_xoshiro_state[1];
+    qihse_hnsw_xoshiro_state[1] ^= qihse_hnsw_xoshiro_state[2];
+    qihse_hnsw_xoshiro_state[0] ^= qihse_hnsw_xoshiro_state[3];
+
+    qihse_hnsw_xoshiro_state[2] ^= t;
+    qihse_hnsw_xoshiro_state[3] = qihse_hnsw_rotl(qihse_hnsw_xoshiro_state[3], 45);
+
+    return result;
+}
+
+static inline uint64_t qihse_hnsw_rdrand64(void) {
+    unsigned long long val = 0;
+#if defined(__RDRND__) || defined(QIHSE_ENABLE_RDRAND)
+    for (int retry = 0; retry < 10; retry++) {
+        if (_rdrand64_step(&val)) {
+            return (uint64_t)val;
+        }
+    }
 #endif
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t seed = (uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32) ^ (uint64_t)(uintptr_t)&val;
+    seed ^= (seed >> 30); seed *= 0xbf58476d1ce4e5b9ULL;
+    seed ^= (seed >> 27); seed *= 0x94d049bb133111ebULL;
+    seed ^= (seed >> 31);
+    return seed ? seed : 0x853c49e6748fea9bULL;
+}
+
+static inline void qihse_hnsw_xoshiro_init_tls(void) {
+    if (__builtin_expect(!qihse_hnsw_xoshiro_initialized, 0)) {
+        for (int i = 0; i < 4; i++) {
+            qihse_hnsw_xoshiro_state[i] = qihse_hnsw_rdrand64();
+        }
+        if ((qihse_hnsw_xoshiro_state[0] | qihse_hnsw_xoshiro_state[1] |
+             qihse_hnsw_xoshiro_state[2] | qihse_hnsw_xoshiro_state[3]) == 0) {
+            qihse_hnsw_xoshiro_state[0] = 0x853c49e6748fea9bULL;
+            qihse_hnsw_xoshiro_state[1] = 0xda3e39cb94b95bdbULL;
+            qihse_hnsw_xoshiro_state[2] = 0xbf58476d1ce4e5b9ULL;
+            qihse_hnsw_xoshiro_state[3] = 0x94d049bb133111ebULL;
+        }
+        qihse_hnsw_xoshiro_initialized = true;
+    }
+}
 
 // Real distance function using user-provided callbacks
 static float real_dist_q(qihse_hnsw_index_t *index, const float *query, uint32_t node) {
@@ -388,21 +445,12 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
         qihse_hnsw_register_projection(index, node_id, vector, index->params.dim);
     }
 
-    double r;
-#ifndef _WIN32
-    unsigned char rand_buf[8];
-    if (RAND_bytes(rand_buf, 8) == 1) {
-        uint64_t rv = 0;
-        for (int i = 0; i < 8; i++) rv = (rv << 8) | rand_buf[i];
-        r = (double)(rv >> 11) / (double)(1ULL << 53);
-    } else {
-        r = (double)rand() / (double)RAND_MAX;
+    qihse_hnsw_xoshiro_init_tls();
+    uint64_t rng_val = qihse_hnsw_xoshiro256ss_next();
+    if (__builtin_expect(rng_val == 0, 0)) {
+        rng_val = 1;
     }
-#else
-    r = (double)rand() / (double)RAND_MAX;
-#endif
-    if (r == 0.0) r = 0.000001;
-    int l = (int)(-log(r) * index->params.mult);
+    int l = (int)(__builtin_clzll(rng_val) * index->params.mult * 0.693147f);
 
     // Expand layers array if needed
     if (l > index->max_level || index->max_level == -1) {

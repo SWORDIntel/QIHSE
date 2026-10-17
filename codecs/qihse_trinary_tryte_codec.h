@@ -78,6 +78,12 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
                                         int32_t* out_score);
 
 /*
+ * Accelerated tryte dot product over two rows of packed trytes.
+ * Uses SSSE3 pshufb and pmaddubsw when available with dynamic fallback to scalar LUT.
+ */
+int32_t qihse_tryte_dot_product(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes);
+
+/*
  * Deterministic top-k candidate selection over encoded rows.
  *
  * Results are ordered by descending signed-trit similarity score. Equal scores

@@ -367,6 +367,12 @@ static inline bool qihse_cpu_has_fsgsbase(const qihse_cpu_info_t* info) {
 static inline bool qihse_cpu_has_erms(const qihse_cpu_info_t* info) {
     return qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_ERMS);
 }
+static inline bool qihse_cpu_has_avx(const qihse_cpu_info_t* info) {
+    return info && info->has_avx_support && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_AVX);
+}
+static inline bool qihse_cpu_has_ssse3(const qihse_cpu_info_t* info) {
+    return info && qihse_cpu_has_feature(info, QIHSE_CPU_FEATURE_SSSE3);
+}
 
 /* ============================================================================
  * CPU OPTIMIZATION HINTS

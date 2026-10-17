@@ -15,6 +15,8 @@ static inline int munmap(void *addr, size_t length) { return -1; }
 
 #include "qihse_vector_db.h"
 #include "backends/cpu/qihse_cpu_distance.h"
+#include "backends/cpu/qihse_cpu_detect.h"
+#include <immintrin.h>
 
 #include "codecs/qihse_trinary_tryte_codec.h"
 #include "persistence/qihse_container.h"
@@ -2386,8 +2388,109 @@ static void qihse_vdb_binary_destroy(qihse_vector_db_t vdb) {
     vdb->binary_status = QIHSE_VDB_BINARY_ABSENT;
 }
 
+static bool s_cpu_has_popcnt = false;
+static bool s_cpu_has_avx = false;
+static pthread_once_t s_vdb_cpu_init_once = PTHREAD_ONCE_INIT;
+
+static void s_vdb_cpu_detect_init(void) {
+    qihse_cpu_info_t info = qihse_cpu_detect();
+    s_cpu_has_popcnt = qihse_cpu_has_popcnt(&info);
+    s_cpu_has_avx = qihse_cpu_has_avx(&info);
+}
+
+#ifdef __x86_64__
+__attribute__((target("avx")))
+static void qihse_vdb_binarize_vector_avx(const float* vec, size_t dims, uint64_t* out_binary, size_t words_per_vec) {
+    memset(out_binary, 0, words_per_vec * sizeof(uint64_t));
+    size_t d = 0;
+    size_t d_avx = dims & ~63ULL;
+    for (; d < d_avx; d += 64) {
+        uint64_t word = 0;
+        for (int j = 0; j < 8; j++) {
+            __m256 v = _mm256_loadu_ps(&vec[d + j * 8]);
+            uint32_t mask = (~_mm256_movemask_ps(v)) & 0xFFu;
+            word |= ((uint64_t)mask) << (j * 8);
+        }
+        out_binary[d / 64] = word;
+    }
+    size_t d_8 = dims & ~7ULL;
+    for (; d < d_8; d += 8) {
+        __m256 v = _mm256_loadu_ps(&vec[d]);
+        uint32_t mask = (~_mm256_movemask_ps(v)) & 0xFFu;
+        out_binary[d / 64] |= ((uint64_t)mask) << (d % 64);
+    }
+    for (; d < dims; d++) {
+        if (vec[d] >= 0.0f) {
+            out_binary[d / 64u] |= (1ULL << (d % 64u));
+        }
+    }
+}
+
+__attribute__((target("popcnt")))
+static uint32_t qihse_vdb_hamming_distance_popcnt(const uint64_t* a, const uint64_t* b, size_t words) {
+    uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    size_t i = 0;
+    size_t words_unrolled = words & ~3ULL;
+    for (; i < words_unrolled; i += 4) {
+        c0 += (uint64_t)_mm_popcnt_u64(a[i + 0] ^ b[i + 0]);
+        c1 += (uint64_t)_mm_popcnt_u64(a[i + 1] ^ b[i + 1]);
+        c2 += (uint64_t)_mm_popcnt_u64(a[i + 2] ^ b[i + 2]);
+        c3 += (uint64_t)_mm_popcnt_u64(a[i + 3] ^ b[i + 3]);
+    }
+    uint64_t total = (c0 + c1) + (c2 + c3);
+    for (; i < words; i++) {
+        total += (uint64_t)_mm_popcnt_u64(a[i] ^ b[i]);
+    }
+    return (uint32_t)total;
+}
+#endif
+
+static void qihse_vdb_binarize_vector_scalar(const float* vec, size_t dims, uint64_t* out_binary, size_t words_per_vec) {
+    memset(out_binary, 0, words_per_vec * sizeof(uint64_t));
+    for (size_t d = 0; d < dims; d++) {
+        if (vec[d] >= 0.0f) {
+            out_binary[d / 64u] |= (1ULL << (d % 64u));
+        }
+    }
+}
+
+static inline void qihse_vdb_binarize_vector(const float* vec, size_t dims, uint64_t* out_binary, size_t words_per_vec) {
+    pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
+#ifdef __x86_64__
+    if (s_cpu_has_avx) {
+        qihse_vdb_binarize_vector_avx(vec, dims, out_binary, words_per_vec);
+        return;
+    }
+#endif
+    qihse_vdb_binarize_vector_scalar(vec, dims, out_binary, words_per_vec);
+}
+
+static inline uint32_t qihse_vdb_hamming_distance_scalar(const uint64_t* a, const uint64_t* b, size_t words) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < words; i++) {
+        total += (uint64_t)__builtin_popcountll(a[i] ^ b[i]);
+    }
+    return (uint32_t)total;
+}
+
+static inline uint32_t qihse_vdb_hamming_distance(const uint64_t* a, const uint64_t* b, size_t words) {
+    if (!a || !b) return UINT32_MAX;
+    pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
+#ifdef __x86_64__
+    if (s_cpu_has_popcnt) {
+        return qihse_vdb_hamming_distance_popcnt(a, b, words);
+    }
+#endif
+    return qihse_vdb_hamming_distance_scalar(a, b, words);
+}
+
+static inline int qihse_vdb_binary_hamming_distance(const uint64_t* a, const uint64_t* b, size_t words) {
+    uint32_t d = qihse_vdb_hamming_distance(a, b, words);
+    return (d == UINT32_MAX) ? INT_MAX : (int)d;
+}
+
 static bool qihse_vdb_binary_build(qihse_vector_db_t vdb) {
-    size_t i, d;
+    size_t i;
     size_t n_rows;
     size_t dims;
     size_t words_per_vec;
@@ -2409,7 +2512,6 @@ static bool qihse_vdb_binary_build(qihse_vector_db_t vdb) {
     for (i = 0u; i < n_rows; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
         const float* vec;
-        size_t w;
 
         if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
@@ -2419,12 +2521,7 @@ static bool qihse_vdb_binary_build(qihse_vector_db_t vdb) {
         if (!vec) {
             continue;
         }
-        for (d = 0u; d < dims; d++) {
-            if (vec[d] >= 0.0f) {
-                w = d / 64u;
-                binary[i * words_per_vec + w] |= (1ULL << (d % 64u));
-            }
-        }
+        qihse_vdb_binarize_vector(vec, dims, &binary[i * words_per_vec], words_per_vec);
     }
 
     qihse_vdb_binary_destroy(vdb);
@@ -2435,22 +2532,21 @@ static bool qihse_vdb_binary_build(qihse_vector_db_t vdb) {
     vdb->binary_status = QIHSE_VDB_BINARY_VALID;
     return true;
 }
-#if 0
-static int qihse_vdb_binary_hamming_distance(
-    const uint64_t* a, const uint64_t* b, size_t words) {
-    size_t i;
-    int dist = 0;
-    if (!a || !b) {
-        return INT_MAX;
-    }
-    for (i = 0u; i < words; i++) {
-        dist += __builtin_popcountll(a[i] ^ b[i]);
-    }
-    return dist;
-}
-#endif
 
-#if 0
+typedef struct {
+    uint32_t id;
+    uint32_t dist;
+} qihse_binary_cand_t;
+
+static int qihse_binary_cand_cmp_asc(const void* a, const void* b) {
+    const qihse_binary_cand_t* ca = (const qihse_binary_cand_t*)a;
+    const qihse_binary_cand_t* cb = (const qihse_binary_cand_t*)b;
+    if (ca->dist != cb->dist) {
+        return (ca->dist < cb->dist) ? -1 : 1;
+    }
+    return (ca->id < cb->id) ? -1 : (ca->id > cb->id ? 1 : 0);
+}
+
 static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
                                                const qihse_vector_query_t* query,
                                                size_t candidate_count,
@@ -2461,6 +2557,7 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
     size_t top_k;
     uint64_t* q_binary = NULL;
     qihse_vdb_graph_neighbor_t* pool = NULL;
+    qihse_binary_cand_t* raw_cands = NULL;
     size_t pool_count = 0u;
 
     if (!vdb || !query || !query->query_vector || !results ||
@@ -2479,63 +2576,84 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
         candidate_count = top_k;
     }
 
-    /* Quantize query to binary */
+    /* Quantize query to binary via AVX movemask / scalar fallback */
     q_binary = (uint64_t*)calloc(vdb->binary_words_per_vec, sizeof(uint64_t));
     if (!q_binary) {
         errno = ENOMEM;
         return -1;
     }
-    for (i = 0u; i < vdb->vector_dims; i++) {
-        if (query->query_vector[i] >= 0.0f) {
-            q_binary[i / 64u] |= (1ULL << (i % 64u));
-        }
-    }
+    qihse_vdb_binarize_vector(query->query_vector, vdb->vector_dims, q_binary, vdb->binary_words_per_vec);
 
-    /* Score all live vectors with Hamming distance */
-    pool = (qihse_vdb_graph_neighbor_t*)calloc(candidate_count, sizeof(*pool));
-    if (!pool) {
+    /* Allocate candidate tracking array */
+    raw_cands = (qihse_binary_cand_t*)calloc(candidate_count, sizeof(*raw_cands));
+    if (!raw_cands) {
         free(q_binary);
         errno = ENOMEM;
         return -1;
     }
 
+    uint32_t worst_dist = UINT32_MAX;
+    size_t worst_idx = 0;
+
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
-        int hamming;
-        float score;
 
         if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
 
-        hamming = qihse_vdb_binary_hamming_distance(
+        uint32_t hamming = qihse_vdb_hamming_distance(
             q_binary,
             &vdb->binary_vectors[i * vdb->binary_words_per_vec],
             vdb->binary_words_per_vec);
-        /* Convert Hamming distance to similarity score (lower distance = higher score) */
-        score = 1.0f / (1.0f + (float)hamming);
 
         if (pool_count < candidate_count) {
-            pool[pool_count].id = i;
-            pool[pool_count].score = score;
+            raw_cands[pool_count].id = (uint32_t)i;
+            raw_cands[pool_count].dist = hamming;
             pool_count++;
-        } else {
-            size_t w = 0u;
-            size_t k;
-            for (k = 1u; k < pool_count; k++) {
-                if (pool[k].score < pool[w].score) {
-                    w = k;
+            if (pool_count == candidate_count) {
+                worst_dist = raw_cands[0].dist;
+                worst_idx = 0;
+                for (size_t k = 1; k < pool_count; k++) {
+                    if (raw_cands[k].dist > worst_dist) {
+                        worst_dist = raw_cands[k].dist;
+                        worst_idx = k;
+                    }
                 }
             }
-            if (score > pool[w].score) {
-                pool[w].id = i;
-                pool[w].score = score;
+        } else if (hamming < worst_dist) {
+            raw_cands[worst_idx].id = (uint32_t)i;
+            raw_cands[worst_idx].dist = hamming;
+            worst_dist = raw_cands[0].dist;
+            worst_idx = 0;
+            for (size_t k = 1; k < pool_count; k++) {
+                if (raw_cands[k].dist > worst_dist) {
+                    worst_dist = raw_cands[k].dist;
+                    worst_idx = k;
+                }
             }
         }
     }
 
-    qsort(pool, pool_count, sizeof(*pool), qihse_vdb_graph_neighbor_cmp_desc);
+    /* Sort raw candidates ascending by integer distance */
+    qsort(raw_cands, pool_count, sizeof(*raw_cands), qihse_binary_cand_cmp_asc);
+
+    /* Allocate and convert only top-M promoted candidates to score */
+    pool = (qihse_vdb_graph_neighbor_t*)calloc(pool_count, sizeof(*pool));
+    if (!pool && pool_count > 0) {
+        free(raw_cands);
+        free(q_binary);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    for (i = 0; i < pool_count; i++) {
+        pool[i].id = raw_cands[i].id;
+        /* Compute float division score ONLY for final promoted candidates */
+        pool[i].score = 1.0f / (1.0f + (float)raw_cands[i].dist);
+    }
+    free(raw_cands);
 
     memset(results, 0, max_results * sizeof(*results));
 
@@ -2578,7 +2696,22 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
     free(pool);
     return (int)out_count;
 }
-#endif
+
+int qihse_vdb_binary_search_candidates(qihse_vector_db_t vdb,
+                                       const qihse_vector_query_t* query,
+                                       size_t candidate_count,
+                                       qihse_vector_result_t* results,
+                                       size_t max_results) {
+    return qihse_vdb_search_binary_candidates(vdb, query, candidate_count, results, max_results);
+}
+
+int qihse_vector_db_search_binary_candidates(qihse_vector_db_t vdb,
+                                             const qihse_vector_query_t* query,
+                                             size_t candidate_count,
+                                             qihse_vector_result_t* results,
+                                             size_t max_results) {
+    return qihse_vdb_search_binary_candidates(vdb, query, candidate_count, results, max_results);
+}
 
 /* ============================================================================
  * QUERY RESULT CACHE
@@ -5924,6 +6057,17 @@ int qihse_vector_db_search(
             return -1;
         }
         ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, max_results);
+    } else if (query && query->query_mode == QIHSE_VDB_QUERY_BINARY) {
+        size_t candidate_count;
+        if (vdb->binary_status != QIHSE_VDB_BINARY_VALID) {
+            errno = ENOENT;
+            return -1;
+        }
+        candidate_count = query->candidate_pool_size > 0u ? query->candidate_pool_size : query->top_k * 12u;
+        if (candidate_count > vdb->live_vectors) {
+            candidate_count = vdb->live_vectors;
+        }
+        ret = qihse_vdb_search_binary_candidates(vdb, query, candidate_count, results, max_results);
     } else if (query && query->use_trinary_candidates) {
         ret = qihse_vector_db_search_trinary_candidates(vdb, query,
                                                          query->candidate_count,

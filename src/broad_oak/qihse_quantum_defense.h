@@ -84,4 +84,10 @@ bool qihse_qdd_geoip_lookup(const char* ip, char* out_country, char* out_city, c
  */
 const char* qihse_qdd_get_threat_location(qihse_quantum_defense_ctx_t* ctx, const char* ip);
 
+/*
+ * Generate cryptographically secure random bytes using hardware RDRAND
+ * with 10-retry loop, XOR-mixed with a per-thread monotonic counter and OS seed.
+ */
+bool qihse_secure_random_bytes(void* buf, size_t len);
+
 #endif // QIHSE_QUANTUM_DEFENSE_H

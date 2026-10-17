@@ -198,7 +198,8 @@ typedef enum qihse_vector_db_query_mode_e {
     QIHSE_VDB_QUERY_FP32 = 8,            /* Explicit FP32 candidate selection */
     QIHSE_VDB_QUERY_FP8 = 9,             /* FP8 candidate selection */
     QIHSE_VDB_QUERY_FP4 = 10,            /* FP4 candidate selection */
-    QIHSE_VDB_QUERY_INT4 = 11            /* INT4 candidate selection */
+    QIHSE_VDB_QUERY_INT4 = 11,           /* INT4 candidate selection */
+    QIHSE_VDB_QUERY_BINARY = 12          /* Binary quantization candidate selection */
 } qihse_vector_db_query_mode_t;
 
 /**
@@ -1084,6 +1085,17 @@ bool qihse_vector_db_build_int4(
  */
 bool qihse_vector_db_build_binary(
     qihse_vector_db_t vdb
+);
+
+/**
+ * Search candidate vectors using the binary quantization sidecar and Hamming distance.
+ */
+int qihse_vector_db_search_binary_candidates(
+    qihse_vector_db_t vdb,
+    const qihse_vector_query_t* query,
+    size_t candidate_count,
+    qihse_vector_result_t* results,
+    size_t max_results
 );
 
 /**
