@@ -439,6 +439,7 @@ float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
     }
     float result = hsum256(acc);
     for (; i < dims; i++) result += a[i] * b[i];
+    _mm256_zeroupper();
     return result;
 }
 
@@ -461,6 +462,7 @@ float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims) {
         na  += a[i] * a[i];
         nb  += b[i] * b[i];
     }
+    _mm256_zeroupper();
     if (na <= 0.0f || nb <= 0.0f) return 0.0f;
     return dot / (sqrtf(na) * sqrtf(nb));
 }
@@ -480,6 +482,7 @@ float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims)
         float d = a[i] - b[i];
         result += d * d;
     }
+    _mm256_zeroupper();
     return sqrtf(result);
 }
 
