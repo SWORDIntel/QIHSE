@@ -69,50 +69,7 @@ static uint32_t crc32c_soft(const void* data, size_t size) {
     return crc ^ 0xFFFFFFFFu;
 }
 
-/* ---- Hardware CRC32C (SSE4.2) ---- */
-
-#if defined(QIHSE_HAVE_SSE42)
-
-__attribute__((target("sse4.2")))
-static uint32_t crc32c_hw(const void* data, size_t size) {
-    const uint8_t* p = (const uint8_t*)data;
-    uint64_t crc = 0xFFFFFFFFFFFFFFFFull;
-
-    /* Process 8 bytes at a time using _mm_crc32_u64 */
-    size_t i = 0;
-    while (i + 8 <= size) {
-        uint64_t val;
-        memcpy(&val, p + i, 8);
-        crc = _mm_crc32_u64(crc, val);
-        i += 8;
-    }
-
-    /* Process remaining bytes */
-    uint32_t crc32 = (uint32_t)crc;
-    while (i < size) {
-        crc32 = _mm_crc32_u8(crc32, p[i]);
-        i++;
-    }
-
-    return crc32 ^ 0xFFFFFFFFu;
-}
-
-#endif /* QIHSE_HAVE_SSE42 */
-
-/* ---- Public CRC32C API ---- */
-
-uint32_t qihse_crc32c(const void* data, size_t size) {
-    if (!data || size == 0) return 0;
-
-#if defined(QIHSE_HAVE_SSE42)
-    if (qihse_crc32c_available()) {
-        return crc32c_hw(data, size);
-    }
-#endif
-    return crc32c_soft(data, size);
-}
-
-/* ---- CRC32C combination (for parallel computation) ---- */
+/* ---- CRC32C combination (for parallel computation & 3-way interleaved streams) ---- */
 
 /*
  * For reflected CRC32C, the "shift" operation (processing n zero bytes
@@ -131,13 +88,13 @@ uint32_t qihse_crc32c(const void* data, size_t size) {
  * where shift(n, crc) = process n zero bytes starting from state crc.
  */
 
-/* Apply a 32x32 GF(2) matrix to a CRC state */
-static uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
+/* Apply a 32x32 GF(2) matrix to a CRC state using ctz for fast non-zero bit scan */
+static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
     uint32_t result = 0;
-    for (int i = 0; i < 32; i++) {
-        if (crc & (1u << i)) {
-            result ^= mat[i];
-        }
+    while (crc) {
+        int i = __builtin_ctz(crc);
+        result ^= mat[i];
+        crc &= crc - 1;
     }
     return result;
 }
@@ -196,35 +153,120 @@ static void shift_matrix(uint32_t mat[32], uint64_t nbytes) {
  * shift(n, crc) = the CRC state after processing n zero bytes
  * starting from state crc (without init/finalize).
  */
+static __thread uint64_t s_cached_shift_bytes = 0;
+static __thread uint32_t s_cached_shift_mat[32];
+static __thread int s_cached_shift_valid = 0;
+
 static uint32_t crc32c_shift(uint64_t nbytes, uint32_t crc) {
     if (nbytes == 0) return crc;
     uint32_t mat[32];
+    if (s_cached_shift_valid && s_cached_shift_bytes == nbytes) {
+        return apply_matrix(s_cached_shift_mat, crc);
+    }
     shift_matrix(mat, nbytes);
+    memcpy(s_cached_shift_mat, mat, sizeof(mat));
+    s_cached_shift_bytes = nbytes;
+    s_cached_shift_valid = 1;
     return apply_matrix(mat, crc);
 }
 
 uint32_t qihse_crc32c_combine(uint32_t crc1, uint32_t crc2, size_t len2) {
     if (len2 == 0) return crc1;
     /*
-     * Combination formula (verified by simulation):
-     *
+     * Combination formula:
      *   CRC(D1 || D2) = crc2 ^ shift(len2, crc1)
-     *
-     * where shift(n, crc) processes n zero bytes starting from crc state.
-     *
-     * Derivation:
-     *   raw_crc(D, s) is linear in s: raw_crc(D, s) = raw_crc(D, 0) ^ shift(len(D), s)
-     *   raw_crc(D1, init) = crc1 ^ 0xFFFFFFFF  (unfinalize)
-     *   raw_crc(D2, crc1 ^ 0xFFFFFFFF) = raw_crc(D2, 0) ^ shift(len2, crc1 ^ 0xFFFFFFFF)
-     *   raw_crc(D2, 0xFFFFFFFF) = crc2 ^ 0xFFFFFFFF
-     *   raw_crc(D2, 0) = (crc2 ^ 0xFFFFFFFF) ^ shift(len2, 0xFFFFFFFF)
-     *   raw_crc(D2, crc1 ^ 0xFFFFFFFF) = (crc2 ^ 0xFFFFFFFF) ^ shift(len2, 0xFFFFFFFF) ^ shift(len2, crc1 ^ 0xFFFFFFFF)
-     *                                  = (crc2 ^ 0xFFFFFFFF) ^ shift(len2, 0xFFFFFFFF ^ crc1 ^ 0xFFFFFFFF)
-     *                                  = (crc2 ^ 0xFFFFFFFF) ^ shift(len2, crc1)
-     *   CRC(D1||D2) = raw_crc(D2, crc1 ^ 0xFFFFFFFF) ^ 0xFFFFFFFF
-     *              = crc2 ^ shift(len2, crc1)
      */
     return crc2 ^ crc32c_shift((uint64_t)len2, crc1);
+}
+
+/* ---- Hardware CRC32C (SSE4.2) ---- */
+
+#if defined(QIHSE_HAVE_SSE42)
+
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_hw(const void* data, size_t size) {
+    const uint8_t* p = (const uint8_t*)data;
+    if (size == 0) return 0;
+
+    /* For buffers >= 256 bytes, use 3-way interleaved _mm_crc32_u64 streams
+     * to eliminate instruction latency bottlenecks and saturate the execution port. */
+    if (size >= 256) {
+        size_t chunk_len = (size / 24) * 8;
+        const uint8_t* p0 = p;
+        const uint8_t* p1 = p0 + chunk_len;
+        const uint8_t* p2 = p1 + chunk_len;
+        size_t n = chunk_len / 8;
+
+        uint64_t crc0 = 0xFFFFFFFFFFFFFFFFull;
+        uint64_t crc1 = 0xFFFFFFFFFFFFFFFFull;
+        uint64_t crc2 = 0xFFFFFFFFFFFFFFFFull;
+
+        for (size_t k = 0; k < n; k++) {
+            uint64_t v0, v1, v2;
+            memcpy(&v0, p0 + k * 8, 8);
+            memcpy(&v1, p1 + k * 8, 8);
+            memcpy(&v2, p2 + k * 8, 8);
+            crc0 = _mm_crc32_u64(crc0, v0);
+            crc1 = _mm_crc32_u64(crc1, v1);
+            crc2 = _mm_crc32_u64(crc2, v2);
+        }
+
+        uint32_t c0 = (uint32_t)crc0 ^ 0xFFFFFFFFu;
+        uint32_t c1 = (uint32_t)crc1 ^ 0xFFFFFFFFu;
+        uint32_t c2 = (uint32_t)crc2 ^ 0xFFFFFFFFu;
+
+        uint32_t comb = qihse_crc32c_combine(c0, c1, chunk_len);
+        comb = qihse_crc32c_combine(comb, c2, chunk_len);
+
+        size_t rem = 3 * chunk_len;
+        uint64_t crc = (uint64_t)(comb ^ 0xFFFFFFFFu);
+        while (rem + 8 <= size) {
+            uint64_t val;
+            memcpy(&val, p + rem, 8);
+            crc = _mm_crc32_u64(crc, val);
+            rem += 8;
+        }
+
+        uint32_t crc32 = (uint32_t)crc;
+        while (rem < size) {
+            crc32 = _mm_crc32_u8(crc32, p[rem]);
+            rem++;
+        }
+        return crc32 ^ 0xFFFFFFFFu;
+    }
+
+    /* Small buffer sequential path */
+    uint64_t crc = 0xFFFFFFFFFFFFFFFFull;
+    size_t i = 0;
+    while (i + 8 <= size) {
+        uint64_t val;
+        memcpy(&val, p + i, 8);
+        crc = _mm_crc32_u64(crc, val);
+        i += 8;
+    }
+
+    uint32_t crc32 = (uint32_t)crc;
+    while (i < size) {
+        crc32 = _mm_crc32_u8(crc32, p[i]);
+        i++;
+    }
+
+    return crc32 ^ 0xFFFFFFFFu;
+}
+
+#endif /* QIHSE_HAVE_SSE42 */
+
+/* ---- Public CRC32C API ---- */
+
+uint32_t qihse_crc32c(const void* data, size_t size) {
+    if (!data || size == 0) return 0;
+
+#if defined(QIHSE_HAVE_SSE42)
+    if (qihse_crc32c_available()) {
+        return crc32c_hw(data, size);
+    }
+#endif
+    return crc32c_soft(data, size);
 }
 
 /* ---- Parallel CRC32C ---- */
