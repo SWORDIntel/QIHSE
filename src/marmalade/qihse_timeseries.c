@@ -4,8 +4,45 @@
 
 #include "qihse_timeseries.h"
 #include "qihse_keystone.h"
+#include "qihse_endian.h"
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+#if defined(__BMI2__)
+static inline uint64_t qihse_bzhi_u64(uint64_t val, unsigned int index) {
+    return _bzhi_u64(val, index);
+}
+#else
+static inline uint64_t qihse_bzhi_u64(uint64_t val, unsigned int index) {
+    return (index >= 64) ? val : (val & ((1ULL << index) - 1ULL));
+}
+#endif
+
+#if defined(__BMI__)
+static inline uint64_t qihse_bextr_u64(uint64_t val, unsigned int start, unsigned int len) {
+    return _bextr_u64(val, start, len);
+}
+#else
+static inline uint64_t qihse_bextr_u64(uint64_t val, unsigned int start, unsigned int len) {
+    return (len >= 64) ? (val >> start) : ((val >> start) & ((1ULL << len) - 1ULL));
+}
+#endif
+
+#if defined(__LZCNT__)
+#define qihse_lzcnt_u64(x) ((int)_lzcnt_u64(x))
+#else
+#define qihse_lzcnt_u64(x) __builtin_clzll(x)
+#endif
+
+#if defined(__BMI__)
+#define qihse_tzcnt_u64(x) ((int)_tzcnt_u64(x))
+#else
+#define qihse_tzcnt_u64(x) __builtin_ctzll(x)
+#endif
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -68,6 +105,19 @@ typedef struct {
 } bit_stream_t;
 
 static inline void bw_write(bit_stream_t* bw, uint64_t val, int bits) {
+    if (bits <= 0) return;
+    if (bits <= 57 && bw->bit_pos + 64 <= bw->max_bits) {
+        size_t byte_idx = bw->bit_pos >> 3;
+        int bit_idx = (int)(bw->bit_pos & 7);
+        int shift = 64 - bit_idx - bits;
+        uint64_t word = qihse_load_be64(bw->buf + byte_idx);
+        uint64_t mask = (bits == 64) ? ~0ULL : (((1ULL << bits) - 1ULL) << shift);
+        uint64_t val_bits = (qihse_bzhi_u64(val, (unsigned int)bits)) << shift;
+        word = (word & ~mask) | val_bits;
+        qihse_store_be64(bw->buf + byte_idx, word);
+        bw->bit_pos += (size_t)bits;
+        return;
+    }
     while (bits > 0) {
         size_t byte_idx = bw->bit_pos / 8;
         if (byte_idx >= bw->max_bits / 8) return;
@@ -87,6 +137,16 @@ static inline void bw_write(bit_stream_t* bw, uint64_t val, int bits) {
 }
 
 static inline uint64_t br_read(bit_stream_t* br, int bits) {
+    if (bits <= 0) return 0;
+    if (bits <= 57 && br->bit_pos + 64 <= br->max_bits) {
+        size_t byte_idx = br->bit_pos >> 3;
+        int bit_idx = (int)(br->bit_pos & 7);
+        uint64_t word = qihse_load_be64(br->buf + byte_idx);
+        int shift = 64 - bit_idx - bits;
+        uint64_t val = (shift == 64) ? 0 : (word >> shift);
+        br->bit_pos += (size_t)bits;
+        return qihse_bzhi_u64(val, (unsigned int)bits);
+    }
     uint64_t res = 0;
     while (bits > 0) {
         size_t byte_idx = br->bit_pos / 8;
@@ -202,14 +262,14 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
             if (xor_val == 0) {
                 bw_write(&bs, 0, 1);
             } else {
-                int lz = __builtin_clzll(xor_val);
-                int tz = __builtin_ctzll(xor_val);
+                int lz = qihse_lzcnt_u64(xor_val);
+                int tz = qihse_tzcnt_u64(xor_val);
                 if (lz >= 31) lz = 31;
                 
                 if (lz >= prev_lz && tz >= prev_tz) {
                     bw_write(&bs, 2, 2);
                     int len = 64 - prev_lz - prev_tz;
-                    bw_write(&bs, xor_val >> prev_tz, len);
+                    bw_write(&bs, qihse_bextr_u64(xor_val, (unsigned int)prev_tz, (unsigned int)len), len);
                 } else {
                     bw_write(&bs, 3, 2);
                     bw_write(&bs, lz, 5);
@@ -217,7 +277,7 @@ void qihse_tsdb_compress_flush(qihse_tsdb_t* tsdb) {
                     if (len < 1) len = 1;
                     if (len > 64) len = 64;
                     bw_write(&bs, len - 1, 6);
-                    bw_write(&bs, xor_val >> tz, len);
+                    bw_write(&bs, qihse_bextr_u64(xor_val, (unsigned int)tz, (unsigned int)len), len);
                     prev_lz = lz;
                     prev_tz = tz;
                 }

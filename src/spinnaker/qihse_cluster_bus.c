@@ -1,4 +1,9 @@
 #include "qihse_cluster_bus.h"
+#include "qihse_endian.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "qihse_cpu_detect.h" /* the one ISA detector */
 #include "qihse_federation.h"
@@ -240,13 +245,10 @@ static bool qihse_bus_deserialise_node(const uint8_t* data, size_t len, qihse_cl
 
 static size_t qihse_bus_build_header(uint8_t* buf, qihse_cluster_bus_msg_type_t type,
                                      uint16_t sender, uint32_t payload_len) {
-    uint32_t magic = QIHSE_CLUSTER_BUS_MAGIC;
-    uint32_t msg = (uint32_t)type;
-    uint32_t sender32 = (uint32_t)sender;
-    memcpy(buf, &magic, 4u);
-    memcpy(buf + 4u, &msg, 4u);
-    memcpy(buf + 8u, &sender32, 4u);
-    memcpy(buf + 12u, &payload_len, 4u);
+    qihse_store_be32(buf, QIHSE_CLUSTER_BUS_MAGIC);
+    qihse_store_be32(buf + 4u, (uint32_t)type);
+    qihse_store_be32(buf + 8u, (uint32_t)sender);
+    qihse_store_be32(buf + 12u, payload_len);
     return QIHSE_CLUSTER_BUS_HEADER_SIZE;
 }
 
@@ -254,10 +256,18 @@ static bool qihse_bus_parse_header(const uint8_t* buf, size_t len,
                                    uint32_t* magic, uint32_t* type,
                                    uint32_t* sender, uint32_t* payload_len) {
     if (len < QIHSE_CLUSTER_BUS_HEADER_SIZE) return false;
-    memcpy(magic, buf, 4u);
-    memcpy(type, buf + 4u, 4u);
-    memcpy(sender, buf + 8u, 4u);
-    memcpy(payload_len, buf + 12u, 4u);
+    uint32_t m_be = qihse_load_be32(buf);
+    if (m_be == QIHSE_CLUSTER_BUS_MAGIC) {
+        *magic = m_be;
+        *type = qihse_load_be32(buf + 4u);
+        *sender = qihse_load_be32(buf + 8u);
+        *payload_len = qihse_load_be32(buf + 12u);
+    } else {
+        *magic = qihse_load_le32(buf);
+        *type = qihse_load_le32(buf + 4u);
+        *sender = qihse_load_le32(buf + 8u);
+        *payload_len = qihse_load_le32(buf + 12u);
+    }
     return *magic == QIHSE_CLUSTER_BUS_MAGIC &&
            *payload_len <= QIHSE_CLUSTER_BUS_MAX_PAYLOAD &&
            len >= QIHSE_CLUSTER_BUS_HEADER_SIZE + *payload_len;
@@ -278,6 +288,75 @@ static void qihse_bus_random_bytes(uint8_t* out, size_t len) {
     }
 }
 
+/* Vectorized 48-byte HMAC keystream XOR */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__AVX2__)
+static inline void qihse_bus_keystream_xor_block(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t i = 0;
+    if (n >= 32) {
+        __m256i d0 = _mm256_loadu_si256((const __m256i*)(const void*)(dst + i));
+        __m256i s0 = _mm256_loadu_si256((const __m256i*)(const void*)(src + i));
+        _mm256_storeu_si256((__m256i*)(void*)(dst + i), _mm256_xor_si256(d0, s0));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i d1 = _mm_loadu_si128((const __m128i*)(const void*)(dst + i));
+        __m128i s1 = _mm_loadu_si128((const __m128i*)(const void*)(src + i));
+        _mm_storeu_si128((__m128i*)(void*)(dst + i), _mm_xor_si128(d1, s1));
+        i += 16;
+    }
+    for (; i < n; i++) dst[i] ^= src[i];
+}
+#else
+__attribute__((target("avx2")))
+static void qihse_bus_keystream_xor_block_avx2(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t i = 0;
+    if (n >= 32) {
+        __m256i d0 = _mm256_loadu_si256((const __m256i*)(const void*)(dst + i));
+        __m256i s0 = _mm256_loadu_si256((const __m256i*)(const void*)(src + i));
+        _mm256_storeu_si256((__m256i*)(void*)(dst + i), _mm256_xor_si256(d0, s0));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i d1 = _mm_loadu_si128((const __m128i*)(const void*)(dst + i));
+        __m128i s1 = _mm_loadu_si128((const __m128i*)(const void*)(src + i));
+        _mm_storeu_si128((__m128i*)(void*)(dst + i), _mm_xor_si128(d1, s1));
+        i += 16;
+    }
+    for (; i < n; i++) dst[i] ^= src[i];
+}
+
+static void qihse_bus_keystream_xor_block_sse2(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t i = 0;
+    while (i + 16 <= 32 && i + 16 <= n) {
+        __m128i d0 = _mm_loadu_si128((const __m128i*)(const void*)(dst + i));
+        __m128i s0 = _mm_loadu_si128((const __m128i*)(const void*)(src + i));
+        _mm_storeu_si128((__m128i*)(void*)(dst + i), _mm_xor_si128(d0, s0));
+        i += 16;
+    }
+    if (i + 16 <= n) {
+        __m128i d1 = _mm_loadu_si128((const __m128i*)(const void*)(dst + i));
+        __m128i s1 = _mm_loadu_si128((const __m128i*)(const void*)(src + i));
+        _mm_storeu_si128((__m128i*)(void*)(dst + i), _mm_xor_si128(d1, s1));
+        i += 16;
+    }
+    for (; i < n; i++) dst[i] ^= src[i];
+}
+
+static inline void qihse_bus_keystream_xor_block(uint8_t* dst, const uint8_t* src, size_t n) {
+    if (__builtin_cpu_supports("avx2")) {
+        qihse_bus_keystream_xor_block_avx2(dst, src, n);
+    } else {
+        qihse_bus_keystream_xor_block_sse2(dst, src, n);
+    }
+}
+#endif
+#else
+static inline void qihse_bus_keystream_xor_block(uint8_t* dst, const uint8_t* src, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] ^= src[i];
+}
+#endif
+
 /* XOR `len` bytes at `data` with the veil keystream: HMAC-SHA384(veil_key,
  * nonce || BE32 block counter) per 48-byte block, truncated to length. */
 static void qihse_bus_veil_xor(const qihse_cluster_bus_t* bus,
@@ -288,17 +367,14 @@ static void qihse_bus_veil_xor(const qihse_cluster_bus_t* bus,
     memcpy(input, nonce, QIHSE_BUS_VEIL_NONCE_LEN);
     size_t done = 0;
     for (uint32_t counter = 0; done < len; counter++) {
-        input[QIHSE_BUS_VEIL_NONCE_LEN + 0u] = (uint8_t)(counter >> 24);
-        input[QIHSE_BUS_VEIL_NONCE_LEN + 1u] = (uint8_t)(counter >> 16);
-        input[QIHSE_BUS_VEIL_NONCE_LEN + 2u] = (uint8_t)(counter >> 8);
-        input[QIHSE_BUS_VEIL_NONCE_LEN + 3u] = (uint8_t)counter;
+        qihse_store_be32(input + QIHSE_BUS_VEIL_NONCE_LEN, counter);
         if (!HMAC(EVP_sha384(), bus->veil_key, (int)bus->veil_key_len,
                   input, sizeof(input), block, &md_len) || md_len == 0) {
             return; /* keystream unavailable: frame arrives garbled and is dropped */
         }
         size_t n = len - done;
         if (n > (size_t)md_len) n = (size_t)md_len;
-        for (size_t i = 0; i < n; i++) data[done + i] ^= block[i];
+        qihse_bus_keystream_xor_block(data + done, block, n);
         done += n;
     }
 }

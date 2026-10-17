@@ -1,4 +1,5 @@
 #include "qihse_consensus_wire.h"
+#include "qihse_endian.h"
 
 #include <string.h>
 
@@ -26,15 +27,18 @@ static void w_bytes(writer_t* w, const void* data, size_t n) {
 
 static void w_u8(writer_t* w, uint8_t v) { w_bytes(w, &v, 1u); }
 static void w_u16(writer_t* w, uint16_t v) {
-    uint8_t b[2] = {(uint8_t)(v >> 8), (uint8_t)v}; w_bytes(w, b, sizeof(b));
+    uint8_t b[2];
+    qihse_store_be16(b, v);
+    w_bytes(w, b, sizeof(b));
 }
 static void w_u32(writer_t* w, uint32_t v) {
-    uint8_t b[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+    uint8_t b[4];
+    qihse_store_be32(b, v);
     w_bytes(w, b, sizeof(b));
 }
 static void w_u64(writer_t* w, uint64_t v) {
     uint8_t b[8];
-    for (size_t i = 0; i < sizeof(b); i++) b[i] = (uint8_t)(v >> (56u - 8u * i));
+    qihse_store_be64(b, v);
     w_bytes(w, b, sizeof(b));
 }
 
@@ -46,16 +50,15 @@ static void r_bytes(reader_t* r, void* out, size_t n) {
 static uint8_t r_u8(reader_t* r) { uint8_t v = 0; r_bytes(r, &v, 1u); return v; }
 static uint16_t r_u16(reader_t* r) {
     uint8_t b[2] = {0}; r_bytes(r, b, sizeof(b));
-    return (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
+    return qihse_load_be16(b);
 }
 static uint32_t r_u32(reader_t* r) {
     uint8_t b[4] = {0}; r_bytes(r, b, sizeof(b));
-    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+    return qihse_load_be32(b);
 }
 static uint64_t r_u64(reader_t* r) {
-    uint8_t b[8] = {0}; uint64_t v = 0; r_bytes(r, b, sizeof(b));
-    for (size_t i = 0; i < sizeof(b); i++) v = (v << 8) | b[i];
-    return v;
+    uint8_t b[8] = {0}; r_bytes(r, b, sizeof(b));
+    return qihse_load_be64(b);
 }
 
 static bool group_valid(const char* group, size_t* out_len) {

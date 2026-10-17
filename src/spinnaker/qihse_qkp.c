@@ -1,5 +1,6 @@
 #include "qihse_qkp.h"
 #include "qihse_pqc_crypto.h"
+#include "qihse_endian.h"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -144,8 +145,7 @@ static bool qkp_send_frame(int fd, uint8_t type, const void* payload, uint16_t l
     memcpy(head, QKP_MAGIC, 4u);
     head[4] = type;
     head[5] = 0u;
-    head[6] = (uint8_t)(len >> 8);
-    head[7] = (uint8_t)(len & 0xffu);
+    qihse_store_be16(head + 6, len);
     return qkp_write_all(fd, head, sizeof(head)) &&
            (len == 0u || qkp_write_all(fd, payload, len));
 }
@@ -156,7 +156,7 @@ static ssize_t qkp_read_frame(int fd, uint8_t* frame_out) {
     uint8_t head[8];
     if (!qkp_read_exact(fd, head, sizeof(head))) return -1;
     if (memcmp(head, QKP_MAGIC, 4u) != 0 || head[5] != 0u) return -1;
-    uint16_t len = (uint16_t)((head[6] << 8) | head[7]);
+    uint16_t len = qihse_load_be16(head + 6);
     if (len > QIHSE_QKP_MAX_PAYLOAD) return -1;
     if (len && !qkp_read_exact(fd, frame_out, len)) return -1;
     return (ssize_t)len;
@@ -174,7 +174,7 @@ static bool qkp_hkdf_sha384(const uint8_t* salt, size_t salt_len,
         prk_len != 48u) return false;
     uint8_t block[48];
     size_t block_len = 48u, done = 0;
-    unsigned char counter = 1u;
+    unsigned int counter = 1u;
     while (done < out_len) {
         size_t feed = done ? block_len : 0u;
         unsigned int maclen = 0;
@@ -273,9 +273,8 @@ static bool qkp_ctx_open(EVP_CIPHER_CTX* ctx, const uint8_t nonce[12],
 }
 
 static void qkp_make_nonce(uint8_t nonce[12], uint32_t dir, uint64_t seq) {
-    nonce[0] = (uint8_t)(dir >> 24); nonce[1] = (uint8_t)(dir >> 16);
-    nonce[2] = (uint8_t)(dir >> 8);  nonce[3] = (uint8_t)dir;
-    for (int i = 0; i < 8; i++) nonce[4 + i] = (uint8_t)(seq >> (56 - 8 * i));
+    qihse_store_be32(nonce, dir);
+    qihse_store_be64(nonce + 4, seq);
 }
 
 /* ── negotiation ──────────────────────────────────────────────────────── */
@@ -372,11 +371,10 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     if (!h1) { qkp_send_err(fd, "out of memory"); return QIHSE_QKP_REJECTED; }
     {
         uint8_t* p = h1;
-        *p++ = (uint8_t)(QIHSE_QKP_PROTO_VERSION >> 8);
-        *p++ = (uint8_t)QIHSE_QKP_PROTO_VERSION;
+        qihse_store_be16(p, QIHSE_QKP_PROTO_VERSION); p += 2u;
         memset(p, 0, 64u); memcpy(p, cfg->node_id ? cfg->node_id : "", id_len); p += 64u;
         memcpy(p, nonce, 32u); p += 32u;
-        *p++ = (uint8_t)(pem_len >> 8); *p++ = (uint8_t)pem_len;
+        qihse_store_be16(p, pem_len); p += 2u;
         memcpy(p, pem, pem_len); p += pem_len;
         (void)body_len;
     }
@@ -508,7 +506,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
      * 6-byte uninitialized prefix and a length one byte too long. */
     uint16_t plen = (uint16_t)(12u + (sizeof(ACK_PAYLOAD) - 1u) + 16u);
     memcpy(head, SEAL_MAGIC, 4u);
-    head[4] = (uint8_t)(plen >> 8); head[5] = (uint8_t)plen;
+    qihse_store_be16(head + 4, plen);
     uint8_t* ack_ct = sealed + 6u + 12u;
     if (!qkp_ctx_seal(s->tx_ctx, seal_nonce, head, 6u, (const uint8_t*)ACK_PAYLOAD, sizeof(ACK_PAYLOAD) - 1u, ack_ct)) {
         qihse_qkp_session_free(s); qkp_send_err(fd, "internal"); return QIHSE_QKP_REJECTED;
@@ -547,10 +545,10 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
         return QIHSE_QKP_REJECTED;
     }
     const uint8_t* p = h1;
-    uint16_t proto = (uint16_t)((p[0] << 8) | p[1]); p += 2u;
+    uint16_t proto = qihse_load_be16(p); p += 2u;
     const uint8_t* srv_id = p; p += 64u;
     const uint8_t* srv_nonce = p; p += 32u;
-    uint16_t pem_len = (uint16_t)((p[0] << 8) | p[1]); p += 2u;
+    uint16_t pem_len = qihse_load_be16(p); p += 2u;
     if (proto != QIHSE_QKP_PROTO_VERSION || (size_t)pem_len > (size_t)h1_len ||
         (size_t)(p - h1) + pem_len + QIHSE_QKP_SIG_LEN != (size_t)h1_len) {
         qkp_log_reject(cfg, "client H1 fields or lengths are invalid");
@@ -709,7 +707,7 @@ qihse_qkp_result_t qihse_qkp_client_negotiate(int fd, const qihse_qkp_config_t* 
         qkp_log_reject(cfg, "client H2-ACK magic invalid");
         qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
     }
-    uint16_t ack_len = (uint16_t)((ack_head[4] << 8) | ack_head[5]);
+    uint16_t ack_len = qihse_load_be16(ack_head + 4);
     if (ack_len != 12u + 8u + 16u) {
         qkp_log_reject(cfg, "client H2-ACK length invalid");
         qihse_qkp_session_free(s); return QIHSE_QKP_REJECTED;
@@ -752,7 +750,7 @@ static bool qkp_send_sealed_record(qihse_qkp_session_t* s, int fd,
     uint8_t head[6];
     uint16_t flen = (uint16_t)(QIHSE_QKP_NONCE_WIRE_LEN + len + QIHSE_QKP_TAG_LEN);
     memcpy(head, SEAL_MAGIC, 4u);
-    head[4] = (uint8_t)(flen >> 8); head[5] = (uint8_t)flen;
+    qihse_store_be16(head + 4, flen);
     uint8_t* frame = s->tx_scratch;
     memcpy(frame, head, 6u);
     memcpy(frame + 6u, nonce, 12u);
@@ -786,7 +784,7 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
     uint8_t head[6];
     if (!qkp_read_exact(fd, head, 6u)) return -1;
     if (memcmp(head, SEAL_MAGIC, 4u) != 0) return -2;
-    uint16_t flen = (uint16_t)((head[4] << 8) | head[5]);
+    uint16_t flen = qihse_load_be16(head + 4);
     /* QIHSE_QKP_MAX_FRAME = 12 + 16384 + 16 = 16412; the old 8+16384 bound
      * came from the handshake frame shape and rejected every max-size
      * record on receipt. */
