@@ -2424,6 +2424,7 @@ static void qihse_vdb_binarize_vector_avx(const float* vec, size_t dims, uint64_
             out_binary[d / 64u] |= (1ULL << (d % 64u));
         }
     }
+    _mm256_zeroupper();
 }
 
 __attribute__((target("popcnt")))

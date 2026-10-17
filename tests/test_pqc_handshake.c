@@ -498,7 +498,7 @@ int main(void) {
     qihse_pqc_init_providers();
 
     /* Fresh keys: server set + two client sets (one trusted, one rogue). */
-    system("rm -rf /tmp/qsb-pqc && mkdir -p /tmp/qsb-pqc/srv /tmp/qsb-pqc/cli /tmp/qsb-pqc/rogue /tmp/qsb-pqc/n0");
+    system("rm -rf /tmp/qsb-pqc && mkdir -m 0700 -p /tmp/qsb-pqc/srv /tmp/qsb-pqc/cli /tmp/qsb-pqc/rogue /tmp/qsb-pqc/n0");
     if (!qihse_pqc_keygen("/tmp/qsb-pqc/srv")) { printf("keygen srv FAILED\n"); return 1; }
     if (!qihse_pqc_keygen("/tmp/qsb-pqc/cli")) { printf("keygen cli FAILED\n"); return 1; }
     if (!qihse_pqc_keygen("/tmp/qsb-pqc/rogue")) { printf("keygen rogue FAILED\n"); return 1; }
@@ -933,7 +933,7 @@ int main(void) {
 
     /* ── 13. (g) f6: degraded daemon (keys missing) answers QKP1 probes ── */
     {
-        system("rm -rf /tmp/qsb-pqc/emptykeys && mkdir -p /tmp/qsb-pqc/emptykeys");
+        system("rm -rf /tmp/qsb-pqc/emptykeys && mkdir -m 0700 -p /tmp/qsb-pqc/emptykeys");
         g_daemon = start_daemon("/tmp/qsb-pqc/emptykeys", cli_dsapub, 0);
         bool up = wait_port(PORT);
         bool clean_err = false, eof_after = false, cleartext_ok = false;

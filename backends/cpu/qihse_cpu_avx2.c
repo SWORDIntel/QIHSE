@@ -434,8 +434,8 @@ int qihse_superposition_avx2_normalize(qihse_superposition_avx2_t* superposition
 
     /* Compute squared magnitude sum for normalization */
     for (size_t i = 0; i < total_elements; i += 8) {
-        __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-        __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+        __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+        __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
 
         __m256 real_sq = _mm256_mul_ps(real_vec, real_vec);
         __m256 imag_sq = _mm256_mul_ps(imag_vec, imag_vec);
@@ -459,16 +459,17 @@ int qihse_superposition_avx2_normalize(qihse_superposition_avx2_t* superposition
 
         /* Normalize real and imaginary parts */
         for (size_t i = 0; i < total_elements; i += 8) {
-            __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-            __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+            __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+            __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
 
             real_vec = _mm256_mul_ps(real_vec, norm_vec);
             imag_vec = _mm256_mul_ps(imag_vec, norm_vec);
 
-            _mm256_store_ps(&superposition->real[i], real_vec);
-            _mm256_store_ps(&superposition->imag[i], imag_vec);
+            _mm256_storeu_ps(&superposition->real[i], real_vec);
+            _mm256_storeu_ps(&superposition->imag[i], imag_vec);
         }
     }
+    _mm256_zeroupper();
 #else
     /* Fallback scalar implementation */
     float norm_factor = 0.0f;
@@ -526,8 +527,8 @@ void qihse_superposition_avx2_apply_phase(
 
     /* Apply phase rotation: z' = z * e^(i*phase) = (a + bi) * (cos + i*sin) */
     for (size_t i = 0; i < total_elements; i += 8) {
-        __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-        __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+        __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+        __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
 
         /* real' = real*cos - imag*sin */
         __m256 new_real = _mm256_sub_ps(
@@ -541,9 +542,10 @@ void qihse_superposition_avx2_apply_phase(
             _mm256_mul_ps(imag_vec, cos_phase)
         );
 
-        _mm256_store_ps(&superposition->real[i], new_real);
-        _mm256_store_ps(&superposition->imag[i], new_imag);
+        _mm256_storeu_ps(&superposition->real[i], new_real);
+        _mm256_storeu_ps(&superposition->imag[i], new_imag);
     }
+    _mm256_zeroupper();
 #else
     /* Fallback scalar implementation */
     float cos_phase = cosf(phase_shift);
@@ -581,18 +583,19 @@ void qihse_superposition_avx2_oracle_mark(
         size_t start_idx = target_idx * superposition->dims_per_state;
 
         for (size_t i = start_idx; i < start_idx + superposition->dims_per_state; i += 8) {
-            __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-            __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+            __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+            __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
 
             /* Apply selective phase flip with selectivity */
             __m256 flip_mask = _mm256_cmp_ps(selectivity_vec, _mm256_set1_ps((float)rand() / RAND_MAX), _CMP_LT_OQ);
             real_vec = _mm256_blendv_ps(real_vec, _mm256_mul_ps(real_vec, minus_one), flip_mask);
             imag_vec = _mm256_blendv_ps(imag_vec, _mm256_mul_ps(imag_vec, minus_one), flip_mask);
 
-            _mm256_store_ps(&superposition->real[i], real_vec);
-            _mm256_store_ps(&superposition->imag[i], imag_vec);
+            _mm256_storeu_ps(&superposition->real[i], real_vec);
+            _mm256_storeu_ps(&superposition->imag[i], imag_vec);
         }
     }
+    _mm256_zeroupper();
 #else
     /* Fallback scalar implementation */
     for (size_t t = 0; t < num_targets; t++) {
@@ -626,8 +629,8 @@ void qihse_superposition_avx2_diffusion(qihse_superposition_avx2_t* superpositio
     size_t count = 0;
 
     for (size_t i = 0; i < total_elements; i += 8) {
-        __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-        __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+        __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+        __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
         mean_real = _mm256_add_ps(mean_real, real_vec);
         mean_imag = _mm256_add_ps(mean_imag, imag_vec);
         count += 8;
@@ -654,16 +657,17 @@ void qihse_superposition_avx2_diffusion(qihse_superposition_avx2_t* superpositio
 
     /* Second pass: apply diffusion */
     for (size_t i = 0; i < total_elements; i += 8) {
-        __m256 real_vec = _mm256_load_ps(&superposition->real[i]);
-        __m256 imag_vec = _mm256_load_ps(&superposition->imag[i]);
+        __m256 real_vec = _mm256_loadu_ps(&superposition->real[i]);
+        __m256 imag_vec = _mm256_loadu_ps(&superposition->imag[i]);
 
         /* |ψ⟩ → 2|mean⟩ - |ψ⟩ */
         real_vec = _mm256_sub_ps(_mm256_mul_ps(two_vec, mean_r_vec), real_vec);
         imag_vec = _mm256_sub_ps(_mm256_mul_ps(two_vec, mean_i_vec), imag_vec);
 
-        _mm256_store_ps(&superposition->real[i], real_vec);
-        _mm256_store_ps(&superposition->imag[i], imag_vec);
+        _mm256_storeu_ps(&superposition->real[i], real_vec);
+        _mm256_storeu_ps(&superposition->imag[i], imag_vec);
     }
+    _mm256_zeroupper();
 #else
     /* Fallback scalar implementation */
     float mean_real = 0.0f, mean_imag = 0.0f;
