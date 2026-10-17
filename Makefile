@@ -42,6 +42,14 @@ QIHSE_ENABLE_POPCNT   ?= $(call cpu_has,popcnt)
 QIHSE_ENABLE_RDRAND   ?= $(call cpu_has,rdrand)
 QIHSE_ENABLE_FSGSBASE ?= $(call cpu_has,fsgsbase)
 QIHSE_ENABLE_ERMS     ?= $(call cpu_has,erms)
+QIHSE_ENABLE_FMA      ?= $(call cpu_has,fma)
+QIHSE_ENABLE_BMI1     ?= $(call cpu_has,bmi1)
+QIHSE_ENABLE_BMI2     ?= $(call cpu_has,bmi2)
+QIHSE_ENABLE_MOVBE    ?= $(call cpu_has,movbe)
+QIHSE_ENABLE_RDSEED   ?= $(call cpu_has,rdseed)
+QIHSE_ENABLE_ADX      ?= $(call cpu_has,adx)
+QIHSE_ENABLE_RTM      ?= $(call cpu_has,rtm)
+QIHSE_ENABLE_ABM      ?= $(call cpu_has,abm)
 
 # ---------------------------------------------------------------------------
 # Security & Audit Configuration
@@ -183,6 +191,38 @@ endif
 
 ifeq ($(QIHSE_ENABLE_ERMS),1)
 CFLAGS += -DQIHSE_ENABLE_ERMS=1
+endif
+
+ifeq ($(QIHSE_ENABLE_FMA),1)
+CFLAGS += -mfma -DQIHSE_ENABLE_FMA=1
+endif
+
+ifeq ($(QIHSE_ENABLE_BMI1),1)
+CFLAGS += -mbmi -DQIHSE_ENABLE_BMI1=1
+endif
+
+ifeq ($(QIHSE_ENABLE_BMI2),1)
+CFLAGS += -mbmi2 -DQIHSE_ENABLE_BMI2=1
+endif
+
+ifeq ($(QIHSE_ENABLE_MOVBE),1)
+CFLAGS += -mmovbe -DQIHSE_ENABLE_MOVBE=1
+endif
+
+ifeq ($(QIHSE_ENABLE_RDSEED),1)
+CFLAGS += -mrdseed -DQIHSE_ENABLE_RDSEED=1
+endif
+
+ifeq ($(QIHSE_ENABLE_ADX),1)
+CFLAGS += -madx -DQIHSE_ENABLE_ADX=1
+endif
+
+ifeq ($(QIHSE_ENABLE_RTM),1)
+CFLAGS += -mrtm -DQIHSE_ENABLE_RTM=1
+endif
+
+ifeq ($(QIHSE_ENABLE_ABM),1)
+CFLAGS += -mlzcnt -DQIHSE_ENABLE_ABM=1
 endif
 
 ifeq ($(QIHSE_ENABLE_AVX2),1)

@@ -220,6 +220,13 @@ QIHSE_ENABLE_POPCNT=0
 QIHSE_ENABLE_RDRAND=0
 QIHSE_ENABLE_FSGSBASE=0
 QIHSE_ENABLE_ERMS=0
+QIHSE_ENABLE_BMI1=0
+QIHSE_ENABLE_BMI2=0
+QIHSE_ENABLE_MOVBE=0
+QIHSE_ENABLE_RDSEED=0
+QIHSE_ENABLE_ADX=0
+QIHSE_ENABLE_RTM=0
+QIHSE_ENABLE_ABM=0
 QIHSE_ARCH_FLAGS="-march=native -mtune=native"
 
 if [ "$ARCH" = "x86_64" ]; then
@@ -245,6 +252,13 @@ if [ "$ARCH" = "x86_64" ]; then
     HAS_RDRAND=0;   has_flag "rdrand" && HAS_RDRAND=1
     HAS_FSGSBASE=0; has_flag "fsgsbase" && HAS_FSGSBASE=1
     HAS_ERMS=0;     has_flag "erms" && HAS_ERMS=1
+    HAS_BMI1=0;     has_flag "bmi1" && HAS_BMI1=1
+    HAS_BMI2=0;     has_flag "bmi2" && HAS_BMI2=1
+    HAS_MOVBE=0;    has_flag "movbe" && HAS_MOVBE=1
+    HAS_RDSEED=0;   has_flag "rdseed" && HAS_RDSEED=1
+    HAS_ADX=0;      has_flag "adx" && HAS_ADX=1
+    HAS_RTM=0;      has_flag "rtm" && HAS_RTM=1
+    HAS_ABM=0;      has_flag "abm" && HAS_ABM=1
 
     echo "  • Instruction Sets     :"
     [ "$HAS_AVX" -eq 1 ]      && echo "    [✓] AVX         (256-bit Vector Floating Point)" || echo "    [ ] AVX         (Not supported)"
@@ -259,6 +273,13 @@ if [ "$ARCH" = "x86_64" ]; then
     [ "$HAS_RDRAND" -eq 1 ]   && echo "    [✓] RDRAND      (On-Chip Digital Random Number Generator)" || echo "    [ ] RDRAND      (Not supported)"
     [ "$HAS_FSGSBASE" -eq 1 ] && echo "    [✓] FSGSBASE    (User-Space Fast Base Register Access)" || echo "    [ ] FSGSBASE    (Not supported)"
     [ "$HAS_ERMS" -eq 1 ]     && echo "    [✓] ERMS        (Enhanced REP MOVSB/STOSB Fast Copy)" || echo "    [ ] ERMS        (Not supported)"
+    [ "$HAS_BMI1" -eq 1 ]     && echo "    [✓] BMI1        (Bit Manipulation Set 1: andn, bextr, blsr, tzcnt)" || echo "    [ ] BMI1        (Not supported)"
+    [ "$HAS_BMI2" -eq 1 ]     && echo "    [✓] BMI2        (Bit Manipulation Set 2: pext, pdep, bzhi, mulx)" || echo "    [ ] BMI2        (Not supported)"
+    [ "$HAS_MOVBE" -eq 1 ]    && echo "    [✓] MOVBE       (Single-Cycle Byte-Swapping Move)" || echo "    [ ] MOVBE       (Not supported)"
+    [ "$HAS_RDSEED" -eq 1 ]   && echo "    [✓] RDSEED      (True Thermal Quantum Entropy NIST 800-90B/C)" || echo "    [ ] RDSEED      (Not supported)"
+    [ "$HAS_ADX" -eq 1 ]      && echo "    [✓] ADX         (Multi-Precision Add-Carry: adcx, adox)" || echo "    [ ] ADX         (Not supported)"
+    [ "$HAS_RTM" -eq 1 ]      && echo "    [✓] RTM/TSX     (Transactional Synchronization Extensions)" || echo "    [ ] RTM/TSX     (Not supported)"
+    [ "$HAS_ABM" -eq 1 ]      && echo "    [✓] ABM/LZCNT   (Advanced Bit Manipulation: lzcnt)" || echo "    [ ] ABM/LZCNT   (Not supported)"
 
     [ "$HAS_AVX" -eq 1 ]      && QIHSE_ENABLE_AVX=1
     [ "$HAS_AVX2" -eq 1 ]     && QIHSE_ENABLE_AVX2=1
@@ -272,6 +293,13 @@ if [ "$ARCH" = "x86_64" ]; then
     [ "$HAS_RDRAND" -eq 1 ]   && QIHSE_ENABLE_RDRAND=1
     [ "$HAS_FSGSBASE" -eq 1 ] && QIHSE_ENABLE_FSGSBASE=1
     [ "$HAS_ERMS" -eq 1 ]     && QIHSE_ENABLE_ERMS=1
+    [ "$HAS_BMI1" -eq 1 ]     && QIHSE_ENABLE_BMI1=1
+    [ "$HAS_BMI2" -eq 1 ]     && QIHSE_ENABLE_BMI2=1
+    [ "$HAS_MOVBE" -eq 1 ]    && QIHSE_ENABLE_MOVBE=1
+    [ "$HAS_RDSEED" -eq 1 ]   && QIHSE_ENABLE_RDSEED=1
+    [ "$HAS_ADX" -eq 1 ]      && QIHSE_ENABLE_ADX=1
+    [ "$HAS_RTM" -eq 1 ]      && QIHSE_ENABLE_RTM=1
+    [ "$HAS_ABM" -eq 1 ]      && QIHSE_ENABLE_ABM=1
 
 elif [ "$ARCH" = "aarch64" ]; then
     HAS_NEON=0; has_flag "asimd" && HAS_NEON=1
@@ -576,6 +604,13 @@ make -j "${JOBS}" \
     QIHSE_ENABLE_RDRAND="${QIHSE_ENABLE_RDRAND}" \
     QIHSE_ENABLE_FSGSBASE="${QIHSE_ENABLE_FSGSBASE}" \
     QIHSE_ENABLE_ERMS="${QIHSE_ENABLE_ERMS}" \
+    QIHSE_ENABLE_BMI1="${QIHSE_ENABLE_BMI1}" \
+    QIHSE_ENABLE_BMI2="${QIHSE_ENABLE_BMI2}" \
+    QIHSE_ENABLE_MOVBE="${QIHSE_ENABLE_MOVBE}" \
+    QIHSE_ENABLE_RDSEED="${QIHSE_ENABLE_RDSEED}" \
+    QIHSE_ENABLE_ADX="${QIHSE_ENABLE_ADX}" \
+    QIHSE_ENABLE_RTM="${QIHSE_ENABLE_RTM}" \
+    QIHSE_ENABLE_ABM="${QIHSE_ENABLE_ABM}" \
     QIHSE_ARCH_FLAGS="${QIHSE_ARCH_FLAGS}" \
     all
 
