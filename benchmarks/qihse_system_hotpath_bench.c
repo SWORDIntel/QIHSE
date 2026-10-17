@@ -17,7 +17,11 @@
 #include <time.h>
 #include <math.h>
 #include <sqlite3.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "include/qihse_auth.h"
+#include "core/qihse_audit.h"
 #include "include/qihse_vector_db.h"
 #include "include/qihse_kv_store.h"
 #include "include/qihse_column.h"
@@ -433,11 +437,28 @@ int main(void) {
     printf("  QIHSE FULL-SYSTEM ARCHITECTURAL BENCHMARK & HOT-PATH PROFILING       \n");
     printf("=======================================================================\n");
 
+    char data_dir[] = "/tmp/qihse-bench-hotpath-XXXXXX";
+    bool has_data_dir = (mkdtemp(data_dir) != NULL);
+    if (has_data_dir) {
+        chmod(data_dir, 0700);
+        setenv("QIHSE_DATA_DIR", data_dir, 1);
+    }
+    setenv("QIHSE_FIPS_MODE", "disabled", 1);
+    qihse_auth_init();
+    qihse_auth_bootstrap_operator("BenchOperator123!");
+
     bench_vector_engine();
     bench_kv_engine();
     bench_sqlite_vfs_engine();
     bench_columnar_engine();
     bench_timeseries_engine();
+
+    qihse_audit_shutdown();
+    if (has_data_dir) {
+        char rm_cmd[512];
+        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf -- '%s'", data_dir);
+        (void)system(rm_cmd);
+    }
 
     printf("\n=======================================================================\n");
     printf("  PROFILING COMPLETE                                                   \n");
