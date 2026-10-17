@@ -213,17 +213,20 @@ QIHSE treats performance as a systems problem rather than only an indexing probl
 
 The codebase combines:
 
-- candidate-reduction structures with exact verification;
-- CPU feature detection and multiple execution paths;
-- SIMD-accelerated vector and analytical kernels where supported;
-- topology-aware memory work;
+- candidate-reduction structures with exact verification (dynamic F16C leaf tiering with FP32 candidate promotion);
+- CPU feature detection and runtime dynamic dispatch (`qihse_cpu_detect()`) without static shims or aliases;
+- SIMD-accelerated vector and analytical kernels (4-way ILP unrolling 128 bytes/iter, SSE4.1 INT8, SSSE3 trytes);
+- hardware cryptographic and hashing acceleration (PCLMULQDQ 1.836 GiB/s carryless CRC32, AES-NI/CRC32 ~11 cycles/key hashing);
+- high-throughput wire parsing ($O(1)$ 4-byte uppercase SWAR jump tables, explicit-length SSE4.2 CRLF scanning);
+- lock-free hardware entropy (`_rdrand64_step` + thread-local `xoshiro256**`) and userspace `_readfsbase_u64()` thread IDs;
+- topology-aware memory work and non-blocking software prefetching (`_mm_prefetch`);
 - native persistence and indexing;
 - optional kernel-bypass networking paths;
 - integrated benchmark and regression tooling.
 
 Benchmark numbers are deliberately kept out of this front page because they are only meaningful with hardware, dataset, compiler, ISA, and workload context.
 
-Measured results, methodology, and comparative experiments are in **[`docs/benchmarks/`](docs/benchmarks/)**, including the **[QIHSE + KEYSTONE integrated benchmark report](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**.
+Measured results, methodology, and comparative experiments are in **[`docs/benchmarks/`](docs/benchmarks/)**, including the **[Host Hardware Acceleration Benchmark Suite](docs/benchmarks/benchmarks.md#6-host-hardware-acceleration-benchmark-suite-dual-intel-xeon-e5-2470-v2)** and the **[QIHSE + KEYSTONE integrated benchmark report](docs/benchmarks/keystone_qihse_integrated_benchmarks.md)**.
 
 ---
 

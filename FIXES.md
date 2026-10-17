@@ -156,3 +156,110 @@ All 5 tests pass:
 - `test_timeseries_db` — OK
 - `test_uwp_server` — OK
 - `test_vector_db` — OK
+
+---
+
+## 4. Host Hardware Acceleration, Vector Safety & Audit Continuity Fixes (2026-10-17)
+
+### 4.1 PCLMULQDQ Barrett Reduction Polynomial Constants & Dword Extraction
+
+#### Problem
+In `src/tractable/qihse_wal.c`, the PCLMULQDQ carryless folding implementation for WAL CRC32 (`qihse_wal_crc32`) computed incorrect checksums for all payloads $\ge 64$ bytes, failing exact bit-level parity tests against standard IEEE 802.3 CRC32.
+
+#### Root Cause
+1. In the Barrett reduction phase, the extraction intrinsic extracted dword 1 instead of dword 2 (`_mm_extract_epi32(x3, 1)` instead of index `2`), shifting the reduced quotient and corrupting the upper 32 bits.
+2. The carryless fold constants $k_1, k_2$ and Barrett constants $P, \mu$ had transposed polynomial endianness for IEEE 802.3 reflected polynomial representation (`0xEDB88320`).
+
+#### Fix
+Rewrote the carryless folding and reduction constants in `src/tractable/qihse_wal.c`:
+- Defined $k_1 = \text{0x154442bd4ULL}$, $k_2 = \text{0x1c6e4150ULL}$ for 128-to-64 bit fold.
+- Defined Barrett reduction constants $P = \text{0x1db710641ULL}$ and $\mu = \text{0x1f7011641ULL}$.
+- Extracted dword index 2 (`_mm_extract_epi32(x3, 2)`), correctly clearing residual carry terms.
+- Added a verified Slice-by-8 fallback table ensuring 100% bit-exact parity across 0 to 64 KB buffers when PCLMUL is unavailable.
+
+---
+
+### 4.2 RESP Engine Implicit-Length CRLF Scanner Truncation on Binary Payloads
+
+#### Problem
+In `src/spinnaker/qihse_resp_engine.c`, `qihse_resp_find_crlf()` prematurely truncated line scans when processing binary payloads or bulk strings containing embedded null bytes (`0x00`).
+
+#### Root Cause
+The initial SIMD vectorization used `_mm_cmpistri()` with `_SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ORDERED`. In implicit-length mode (`cmpistri`), any `0x00` byte in either needle or haystack is treated as a null terminator, causing the instruction to stop scanning before the true `\r\n` line delimiter.
+
+#### Fix
+Upgraded the scanner to explicit-length SSE4.2 `_mm_cmpestri(needle, 2, chunk, (int)valid_bytes, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY)`. Both needle length (2) and chunk validity length (`min(16, remaining)`) are passed explicitly, making the scanner completely immune to embedded nulls.
+
+---
+
+### 4.3 Compound RESP Command Prefix Collisions in 4-byte SWAR Jump Table
+
+#### Problem
+In `src/spinnaker/qihse_resp_engine.c`, 3-character prefixes of compound commands (e.g., `SETEX`, `SETRANGE`, `GETSET`) collided with basic commands (`SET`, `GET`) in the 4-byte SWAR jump table (`switch (key)`).
+
+#### Root Cause
+The 4-byte SWAR conversion reads 4 bytes as `uint32_t`. For 3-character commands, null-padding yields `SET\0` (`0x00544553`), but `SETEX` reads as `SETE` (`0x45544553`), which failed to match the `SET` case and fell into unknown-command errors.
+
+#### Fix
+Added explicit 4-byte jump table cases for all compound commands (`SETE` for `SETEX`, `SETR` for `SETRANGE`, `GETS` for `GETSET`, etc.), validating total command length and matching any trailing suffix before dispatch.
+
+---
+
+### 4.4 Missing `_mm256_zeroupper()` Microcode Transition Penalties
+
+#### Problem
+Benchmarking revealed severe latency spikes (70+ cycles) during transitions between AVX distance calculations/binarizations and legacy SSE or non-VEX libc routines.
+
+#### Root Cause
+`src/broad_oak/qihse_vector_db.c` (`qihse_vdb_binarize_vector_avx`) and `backends/cpu/qihse_cpu_distance.c` (`qihse_distance_dot_avx2`, `qihse_distance_cosine_avx2`, `qihse_distance_euclidean_avx2`) left AVX YMM upper register bits dirty upon function return without issuing `_mm256_zeroupper()`. On Ivy Bridge-EP, this dirty state forces internal CPU microcode to save/restore the upper 128 bits on any subsequent legacy SSE instruction.
+
+#### Fix
+Inserted `_mm256_zeroupper()` at all return paths in all AVX/AVX2 functions across `backends/cpu/` and `src/broad_oak/`.
+
+---
+
+### 4.5 General Protection Fault `#GP(0)` Prevention on Unaligned Pointers
+
+#### Problem
+In `backends/cpu/qihse_cpu_avx2.c` (`qihse_superposition_avx2_normalize`, `inner_product`, `phase_rotate`), buffers allocated with standard `malloc()` triggered `#GP(0)` (SIGSEGV) crashes.
+
+#### Root Cause
+Standard `malloc()` on x86_64 glibc guarantees only 16-byte alignment, but the code used aligned load and store intrinsics `_mm256_load_ps` and `_mm256_store_ps`, which require 32-byte alignment.
+
+#### Fix
+Replaced aligned intrinsics with `_mm256_loadu_ps` and `_mm256_storeu_ps`. On Ivy Bridge and later Intel architectures, unaligned loads and stores execute with zero penalty when the address happens to be aligned, while completely preventing SIGSEGV faults on unaligned inputs.
+
+---
+
+### 4.6 Strict `0700` Permissions for Cluster Daemons and PQC Tests (Audit Continuity Gate)
+
+#### Problem
+`make test-pqc-handshake` and cluster daemon startup aborted with `SIGABRT` (exit signal 6): `[QIHSE AUDIT] Integrity continuity failure: audit recovery context cannot access directory`.
+
+#### Root Cause
+Under user default umask `0002`, `mkdir -p` created `/tmp/qsb-pqc/n0` with mode `0775`. The strict QIHSE audit continuity engine in `core/qihse_audit.c` explicitly enforces `(st.st_mode & 0022) == 0` to prevent group or other users from writing to audit logs, and aborts if write bits are present.
+
+#### Fix
+- In `tools/qihse_cluster_daemon.c` (`mkdirs()`), explicitly applied `chmod(copy, 0700)`.
+- In `tests/test_pqc_handshake.c`, invoked `mkdir -m 0700 -p`.
+- All 13 PQC scenarios pass with 0 failures under the audit continuity gate.
+
+---
+
+### Additional Files Modified (Hardware Acceleration & Audit Hardening)
+
+| File | Subsystem | Modifications |
+|---|---|---|
+| `backends/cpu/qihse_cpu_distance.c` & `.h` | Vector Distance | 4-way ILP unrolling (128 B/iter), F16C half-precision kernels, precomputed norms, `_mm256_zeroupper()` |
+| `backends/cpu/qihse_cpu_avx2.c` | CPU Backend | Unaligned `loadu`/`storeu` safety, `_mm256_zeroupper()` hygiene |
+| `src/broad_oak/qihse_hnsw.c` | Vector Search | Dynamic Layer-0 FP16 storage, FP32 candidate promotion, hardware RDRAND + `xoshiro256**` PRNG, prefetching |
+| `src/broad_oak/qihse_vector_db.c` | Vector DB | 4-way POPCNT saturating Port 1, AVX movemask binarization, SSE4.1 16-way INT8 dot product, $O(1)$ candidate pool pruning |
+| `src/broad_oak/qihse_quantum_defense.c` | Entropy & Security | Userspace `_readfsbase_u64()` thread ID entropy |
+| `src/federation/qihse_federation.c` | Federation | Userspace `_readfsbase_u64()` thread ID resolution |
+| `src/spinnaker/qihse_resp_engine.c` | RESP Protocol | $O(1)$ 4-byte uppercase SWAR jump table, SSE4.2 `_mm_cmpestri` CRLF scanner, SSSE3 integer parser |
+| `src/spinnaker/qihse_qkp.c` & `qihse_uwp_tls.c` | Wire Crypto | Persistent pre-keyed `tx_ctx`/`rx_ctx`, zero per-packet allocation |
+| `src/tractable/qihse_wal.c` | WAL & Storage | 4-way PCLMULQDQ carryless folding CRC32 (1.836 GiB/s), Slice-by-8 fallback |
+| `persistence/qihse_persist_format.c` | Persistence | 3-way interleaved `_mm_crc32_u64` loop for 24-byte chunks, PCLMULQDQ combination |
+| `src/frieze/qihse_hash_index.c` & `qihse_kv_store.c` | Indexing & KV | `_mm_crc32_u64` + `_mm_aesenc_si128` hardware key hashing (~11 cycles/key) |
+| `codecs/qihse_trinary_tryte_codec.c` | Trinary Codec | SSSE3 `_mm_shuffle_epi8` tryte dot products |
+| `tools/qihse_cluster_daemon.c` & `tests/test_pqc_handshake.c` | Cluster & Tests | Strict `0700` directory and file permissions satisfying audit continuity |

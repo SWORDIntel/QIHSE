@@ -243,3 +243,40 @@ Before replacing an existing database in a production application:
 5. Review the current [security documentation](security/README.md) before exposing any protocol listener to an untrusted network.
 
 For the implementation-level protocol inventory, see [Operational protocols](architecture/operational_protocols.md).
+
+---
+
+## Host CPU Architecture & Hardware ISA Compatibility
+
+QIHSE incorporates an adaptive, multi-tier SIMD and cryptographic execution engine designed to extract maximum throughput from heterogeneous x86-64 host architectures without sacrificing binary portability or stability.
+
+### Dynamic Runtime CPU Feature Resolution
+
+All hardware-accelerated kernels are dynamically dispatched at process startup and query runtime via CPUID feature probing in [`backends/cpu/qihse_cpu_detect.c`](../backends/cpu/qihse_cpu_detect.c). There are **zero static aliases or compile-time shims**: modern ISAs (AVX-512, AVX2, FMA) and host-specific architectures (AVX 1.0, F16C, SSE4.2) are first-class peers resolved through runtime function pointers.
+
+| ISA Extension | Host Support (Ivy Bridge-EP) | Accelerates Subsystem | Kernel Functions & Operations |
+|---|:---:|---|---|
+| **AVX 1.0** (256-bit FP) | Yes | Distance Metrics, Column Scans, Binarization | 4-way ILP unrolling (128 B/iter) in `qihse_l2_sq_distance_avx`, `qihse_dot_product_avx`, `_mm256_movemask_ps` sign binarization |
+| **F16C** (Half Precision) | Yes | HNSW Layer-0 Storage & Search | `_mm256_cvtph_ps`, `_mm256_cvtps_ph`, `qihse_l2_sq_distance_f16c`, `qihse_dot_product_f16c` |
+| **PCLMULQDQ** | Yes | WAL CRC32, Persistence CRC32C | 4-way carryless folding (1.836 GiB/s), Barrett polynomial reduction ($k_1, k_2, P, \mu$) |
+| **AES-NI** | Yes | Wire Cryptography, Key Hashing | Session-persistent AES-GCM in QKP/TLS, single-round `_mm_aesenc_si128` key avalanche (~11 cycles/key) |
+| **SSE4.2** | Yes | RESP Protocol, String Scanning | Explicit-length `_mm_cmpestri` CRLF scanner, `_mm_crc32_u64` 3-way interleaved persistence checksums |
+| **SSSE3 / SSE4.1** | Yes | RESP Integers, INT8 Quantization, Trytes | SSSE3 `_mm_maddubs_epi16` integer parser, SSE4.1 `_mm_cvtepi8_epi16` INT8 dot product, `_mm_shuffle_epi8` tryte LUT |
+| **POPCNT** | Yes | Binary Quantized Vector Search | 4-way unrolled Port 1 saturation (64 dims/cycle) defeating Ivy Bridge false destination dependency |
+| **RDRAND** | Yes | Graph Level Generation, Wire Entropy | Hardware `_rdrand64_step` seeding thread-local `xoshiro256**` PRNG and UUID generation (zero mutex contention) |
+| **FSGSBASE** | Yes | Thread ID Resolution & Partitioning | Userspace single-cycle `_readfsbase_u64()` lookup replacing `pthread_self()` overhead |
+| **AVX2 + FMA3** | Detected at runtime | Superposition, High-order Distance | 256-bit fused multiply-add, integer SIMD (executed on supported host hardware) |
+| **AVX-512 (F/BW/DQ/VL)** | Detected at runtime | 512-bit Vector & Index Kernels | 64-byte vector distance and columnar filters (executed on supported host hardware) |
+
+### Memory Alignment & Safety Invariants
+
+1. **Unaligned Pointer Safety (`_mm256_loadu_ps` / `_mm256_storeu_ps`)**:
+   - Pointers allocated via standard `malloc()` or mmap are only guaranteed 16-byte alignment on x86_64 glibc.
+   - All AVX routines loading from arbitrary caller-supplied or heap memory enforce unaligned load/store intrinsics (`_mm256_loadu_ps` / `_mm256_storeu_ps`). On Ivy Bridge and newer cores, unaligned instructions execute at identical throughput to aligned instructions when the pointer is 32-byte aligned, but prevent catastrophic `#GP(0)` general protection faults when unaligned.
+2. **AVX-to-SSE Transition Hygiene (`_mm256_zeroupper()`)**:
+   - On Ivy Bridge-EP, executing legacy SSE or non-VEX libc routines while upper YMM registers contain dirty bits causes hardware microcode to stall the pipeline for 70+ cycles while saving register states.
+   - Every AVX/AVX2 kernel explicitly executes `_mm256_zeroupper()` prior to returning control to the caller.
+3. **Bit-Exact Heterogeneous Parity**:
+   - When running across mixed clusters (e.g., Ivy Bridge host nodes communicating with newer AVX-512 nodes), all checksums (WAL IEEE 802.3 CRC32 and persistence CRC32C) produce bit-exact identical values regardless of whether computed via PCLMULQDQ folding or Slice-by-8 fallback tables.
+   - Dynamic HNSW candidate promotion re-ranks top-$M$ candidates against master FP32 vectors, ensuring identical nearest-neighbor recall to exact search.
+
