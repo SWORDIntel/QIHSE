@@ -1,7 +1,10 @@
 #include "qihse_trinary_tryte_codec.h"
+#include "backends/cpu/qihse_cpu_detect.h"
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
+#include <immintrin.h>
 
 static bool qihse_tryte_checked_add_size(size_t a, size_t b, size_t* out) {
     if (!out) {
@@ -333,13 +336,130 @@ bool qihse_trinary_tryte_encode_matrix(const float* vectors,
     return true;
 }
 
+static bool s_codec_has_ssse3 = false;
+static pthread_once_t s_codec_cpu_init_once = PTHREAD_ONCE_INIT;
+
+static void s_codec_cpu_detect_init(void) {
+    qihse_cpu_info_t info = qihse_cpu_detect();
+    s_codec_has_ssse3 = qihse_cpu_has_ssse3(&info);
+}
+
+#ifdef __x86_64__
+__attribute__((target("ssse3")))
+static inline void qihse_unpack_16_trytes_ssse3(
+    __m128i T,
+    __m128i lut_lo, __m128i lut_hi, __m128i lut_mid,
+    __m128i* out_t0, __m128i* out_t1, __m128i* out_t2, __m128i* out_t3, __m128i* out_t4)
+{
+    __m128i T_even = _mm_and_si128(T, _mm_set1_epi16(0x00FF));
+    __m128i T_odd  = _mm_srli_epi16(T, 8);
+    __m128i h_even = _mm_srli_epi16(_mm_mullo_epi16(T_even, _mm_set1_epi16(19)), 9);
+    __m128i h_odd  = _mm_srli_epi16(_mm_mullo_epi16(T_odd, _mm_set1_epi16(19)), 9);
+
+    __m128i h27_even = _mm_mullo_epi16(h_even, _mm_set1_epi16(27));
+    __m128i h27_odd  = _mm_mullo_epi16(h_odd, _mm_set1_epi16(27));
+    __m128i high27   = _mm_or_si128(h27_even, _mm_slli_epi16(h27_odd, 8));
+    __m128i high     = _mm_or_si128(h_even, _mm_slli_epi16(h_odd, 8));
+    __m128i rem      = _mm_sub_epi8(T, high27);
+
+    __m128i r_even  = _mm_and_si128(rem, _mm_set1_epi16(0x00FF));
+    __m128i r_odd   = _mm_srli_epi16(rem, 8);
+    __m128i t2_even = _mm_srli_epi16(_mm_mullo_epi16(r_even, _mm_set1_epi16(29)), 8);
+    __m128i t2_odd  = _mm_srli_epi16(_mm_mullo_epi16(r_odd, _mm_set1_epi16(29)), 8);
+    __m128i t2_val  = _mm_or_si128(t2_even, _mm_slli_epi16(t2_odd, 8));
+
+    __m128i t2_9_even = _mm_mullo_epi16(t2_even, _mm_set1_epi16(9));
+    __m128i t2_9_odd  = _mm_mullo_epi16(t2_odd, _mm_set1_epi16(9));
+    __m128i t2_9      = _mm_or_si128(t2_9_even, _mm_slli_epi16(t2_9_odd, 8));
+    __m128i low       = _mm_sub_epi8(rem, t2_9);
+
+    *out_t0 = _mm_shuffle_epi8(lut_lo, low);
+    *out_t1 = _mm_shuffle_epi8(lut_hi, low);
+    *out_t2 = _mm_shuffle_epi8(lut_mid, t2_val);
+    *out_t3 = _mm_shuffle_epi8(lut_lo, high);
+    *out_t4 = _mm_shuffle_epi8(lut_hi, high);
+}
+
+__attribute__((target("ssse3")))
+static int32_t qihse_tryte_dot_product_ssse3(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
+    size_t i = 0;
+    __m128i acc_32 = _mm_setzero_si128();
+
+    __m128i lut_lo  = _mm_setr_epi8(-1,  0,  1, -1,  0,  1, -1,  0,  1, 0, 0, 0, 0, 0, 0, 0);
+    __m128i lut_hi  = _mm_setr_epi8(-1, -1, -1,  0,  0,  0,  1,  1,  1, 0, 0, 0, 0, 0, 0, 0);
+    __m128i lut_mid = _mm_setr_epi8(-1,  0,  1,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0);
+
+    size_t unrolled = row_bytes & ~15ULL;
+    for (; i < unrolled; i += 16) {
+        __m128i lhs_T = _mm_loadu_si128((const __m128i*)(lhs + i));
+        __m128i rhs_T = _mm_loadu_si128((const __m128i*)(rhs + i));
+        
+        __m128i L0, L1, L2, L3, L4;
+        __m128i R0, R1, R2, R3, R4;
+        qihse_unpack_16_trytes_ssse3(lhs_T, lut_lo, lut_hi, lut_mid, &L0, &L1, &L2, &L3, &L4);
+        qihse_unpack_16_trytes_ssse3(rhs_T, lut_lo, lut_hi, lut_mid, &R0, &R1, &R2, &R3, &R4);
+
+        __m128i p0 = _mm_sign_epi8(L0, R0);
+        __m128i p1 = _mm_sign_epi8(L1, R1);
+        __m128i p2 = _mm_sign_epi8(L2, R2);
+        __m128i p3 = _mm_sign_epi8(L3, R3);
+        __m128i p4 = _mm_sign_epi8(L4, R4);
+
+        __m128i p01 = _mm_add_epi8(p0, p1);
+        __m128i p23 = _mm_add_epi8(p2, p3);
+        __m128i p0123 = _mm_add_epi8(p01, p23);
+        __m128i p_all = _mm_add_epi8(p0123, p4);
+
+        __m128i ones = _mm_set1_epi8(1);
+        __m128i sum_16 = _mm_maddubs_epi16(ones, p_all);
+        __m128i ones_16 = _mm_set1_epi16(1);
+        __m128i sum_32 = _mm_madd_epi16(sum_16, ones_16);
+
+        acc_32 = _mm_add_epi32(acc_32, sum_32);
+    }
+
+    int32_t total = 0;
+    __m128i hi64 = _mm_unpackhi_epi64(acc_32, acc_32);
+    __m128i sum64 = _mm_add_epi32(acc_32, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(1, 1, 1, 1));
+    total = _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+
+    for (; i < row_bytes; i++) {
+        unsigned l = lhs[i];
+        unsigned r = rhs[i];
+        total += qihse_tryte_dot3[l % 27u][r % 27u] +
+                 qihse_tryte_dot3[l / 27u + 9u][r / 27u + 9u];
+    }
+    return total;
+}
+#endif
+
+static int32_t qihse_tryte_dot_product_scalar(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
+    int32_t score = 0;
+    for (size_t byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
+        unsigned l = lhs[byte_idx];
+        unsigned r = rhs[byte_idx];
+        score += qihse_tryte_dot3[l % 27u][r % 27u] +
+                 qihse_tryte_dot3[l / 27u + 9u][r / 27u + 9u];
+    }
+    return score;
+}
+
+int32_t qihse_tryte_dot_product(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
+    pthread_once(&s_codec_cpu_init_once, s_codec_cpu_detect_init);
+#ifdef __x86_64__
+    if (s_codec_has_ssse3) {
+        return qihse_tryte_dot_product_ssse3(lhs, rhs, row_bytes);
+    }
+#endif
+    return qihse_tryte_dot_product_scalar(lhs, rhs, row_bytes);
+}
+
 bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
                                         const uint8_t* rhs_trytes,
                                         size_t dims,
                                         int32_t* out_score) {
     size_t row_bytes;
-    size_t byte_idx;
-    int32_t score = 0;
 
     if (!out_score || dims > (size_t)INT32_MAX) {
         errno = out_score ? EOVERFLOW : EINVAL;
@@ -356,13 +476,7 @@ bool qihse_trinary_tryte_similarity_i32(const uint8_t* lhs_trytes,
         !qihse_trinary_tryte_validate_row(rhs_trytes, dims)) {
         return false;
     }
-    for (byte_idx = 0u; byte_idx < row_bytes; byte_idx++) {
-        unsigned lhs = lhs_trytes[byte_idx];
-        unsigned rhs = rhs_trytes[byte_idx];
-        score += qihse_tryte_dot3[lhs % 27u][rhs % 27u] +
-                 qihse_tryte_dot3[lhs / 27u + 9u][rhs / 27u + 9u];
-    }
-    *out_score = score;
+    *out_score = qihse_tryte_dot_product(lhs_trytes, rhs_trytes, row_bytes);
     return true;
 }
 

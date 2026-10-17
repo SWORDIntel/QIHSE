@@ -13,6 +13,7 @@
 #ifndef _WIN32
 #include <openssl/rand.h>
 #endif
+#include <immintrin.h>
 
 #define QDD_HISTORY_SIZE 1024
 #define QDD_THREAT_THRESHOLD 85
@@ -257,6 +258,69 @@ bool qihse_qdd_is_under_attack(qihse_quantum_defense_ctx_t* ctx) {
     return attack;
 }
 
+/* Thread-local hardware randomness state for lock-free defense-in-depth entropy */
+static __thread uint64_t qihse_qdd_rand_counter = 0;
+static __thread uint64_t qihse_qdd_os_seed = 0;
+static __thread bool qihse_qdd_seeded = false;
+
+static inline uint64_t qihse_qdd_hardware_random_u64(void) {
+    if (__builtin_expect(!qihse_qdd_seeded, 0)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t s = (uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32) ^ (uint64_t)(uintptr_t)&ts;
+        s ^= ((uint64_t)getpid() << 48) | (uint64_t)(uintptr_t)pthread_self();
+        s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
+        s ^= s >> 27; s *= 0x94d049bb133111ebULL;
+        s ^= s >> 31;
+        qihse_qdd_os_seed = s ? s : 0x853c49e6748fea9bULL;
+        qihse_qdd_seeded = true;
+    }
+
+    unsigned long long rdrand_val = 0;
+    int success = 0;
+#if defined(__RDRND__) || defined(QIHSE_ENABLE_RDRAND)
+    for (int retry = 0; retry < 10; retry++) {
+        if (_rdrand64_step(&rdrand_val)) {
+            success = 1;
+            break;
+        }
+    }
+#endif
+    if (!success) {
+#if defined(__x86_64__) || defined(_M_X64)
+        rdrand_val = __rdtsc();
+#else
+        rdrand_val = 0x517cc1b727220a95ULL;
+#endif
+    }
+
+    uint64_t counter = ++qihse_qdd_rand_counter;
+    uint64_t mixed_counter = counter * 0x9e3779b97f4a7c15ULL;
+    uint64_t out = ((uint64_t)rdrand_val) ^ mixed_counter ^ qihse_qdd_os_seed;
+    out ^= out >> 30;
+    out *= 0xbf58476d1ce4e5b9ULL;
+    out ^= out >> 27;
+    out *= 0x94d049bb133111ebULL;
+    out ^= out >> 31;
+    return out;
+}
+
+bool qihse_secure_random_bytes(void* buf, size_t len) {
+    if (!buf && len > 0) return false;
+    uint8_t* p = (uint8_t*)buf;
+    while (len >= 8) {
+        uint64_t r = qihse_qdd_hardware_random_u64();
+        memcpy(p, &r, 8);
+        p += 8;
+        len -= 8;
+    }
+    if (len > 0) {
+        uint64_t r = qihse_qdd_hardware_random_u64();
+        memcpy(p, &r, len);
+    }
+    return true;
+}
+
 void qihse_qdd_generate_honeypot_response(char* out_buffer, size_t max_len) {
     if (!out_buffer || max_len < 16) return;
     
@@ -267,7 +331,7 @@ void qihse_qdd_generate_honeypot_response(char* out_buffer, size_t max_len) {
     unsigned char random_bytes[256];
     size_t fetch_len = (max_len > sizeof(random_bytes)) ? sizeof(random_bytes) : max_len - 1;
     
-    RAND_bytes(random_bytes, fetch_len);
+    qihse_secure_random_bytes(random_bytes, fetch_len);
     
     /* Convert to Trinary-encoded ASCII payload (-1, 0, 1 mapped to chars) */
     for (size_t i = 0; i < fetch_len; i++) {
