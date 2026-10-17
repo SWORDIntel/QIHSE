@@ -38,7 +38,12 @@ static inline uint64_t qihse_fed_hardware_random_u64(void) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t s = (uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32) ^ (uint64_t)(uintptr_t)&ts;
-        s ^= ((uint64_t)getpid() << 48) | (uint64_t)(uintptr_t)pthread_self();
+#if defined(__x86_64__) && (defined(__FSGSBASE__) || defined(QIHSE_ENABLE_FSGSBASE))
+        uint64_t tid = _readfsbase_u64();
+#else
+        uint64_t tid = (uint64_t)(uintptr_t)pthread_self();
+#endif
+        s ^= ((uint64_t)getpid() << 48) | tid;
         s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
         s ^= s >> 27; s *= 0x94d049bb133111ebULL;
         s ^= s >> 31;

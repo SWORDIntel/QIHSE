@@ -2209,13 +2209,66 @@ static bool qihse_vdb_int8_build(qihse_vector_db_t vdb) {
     return true;
 }
 
+#ifdef __x86_64__
+__attribute__((target("sse4.1")))
+static float qihse_vdb_int8_dot_product_sse41(const int8_t* a, const int8_t* b, size_t len) {
+    __m128i acc0 = _mm_setzero_si128();
+    __m128i acc1 = _mm_setzero_si128();
+    size_t i = 0;
+    for (; i + 32 <= len; i += 32) {
+        __m128i va0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i va1 = _mm_loadu_si128((const __m128i*)(a + i + 16));
+        __m128i vb1 = _mm_loadu_si128((const __m128i*)(b + i + 16));
+
+        __m128i a0_lo = _mm_cvtepi8_epi16(va0);
+        __m128i a0_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va0, 8));
+        __m128i b0_lo = _mm_cvtepi8_epi16(vb0);
+        __m128i b0_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb0, 8));
+
+        __m128i a1_lo = _mm_cvtepi8_epi16(va1);
+        __m128i a1_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va1, 8));
+        __m128i b1_lo = _mm_cvtepi8_epi16(vb1);
+        __m128i b1_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb1, 8));
+
+        acc0 = _mm_add_epi32(acc0, _mm_madd_epi16(a0_lo, b0_lo));
+        acc0 = _mm_add_epi32(acc0, _mm_madd_epi16(a0_hi, b0_hi));
+        acc1 = _mm_add_epi32(acc1, _mm_madd_epi16(a1_lo, b1_lo));
+        acc1 = _mm_add_epi32(acc1, _mm_madd_epi16(a1_hi, b1_hi));
+    }
+    for (; i + 16 <= len; i += 16) {
+        __m128i va0 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb0 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i a0_lo = _mm_cvtepi8_epi16(va0);
+        __m128i a0_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va0, 8));
+        __m128i b0_lo = _mm_cvtepi8_epi16(vb0);
+        __m128i b0_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb0, 8));
+        acc0 = _mm_add_epi32(acc0, _mm_madd_epi16(a0_lo, b0_lo));
+        acc0 = _mm_add_epi32(acc0, _mm_madd_epi16(a0_hi, b0_hi));
+    }
+    __m128i acc = _mm_add_epi32(acc0, acc1);
+    __m128i hi64 = _mm_unpackhi_epi64(acc, acc);
+    __m128i sum64 = _mm_add_epi32(acc, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(1, 1, 1, 1));
+    int32_t total = _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+
+    for (; i < len; i++) {
+        total += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return (float)total;
+}
+#endif
+
 static float qihse_vdb_int8_dot_product(const int8_t* a, const int8_t* b, size_t len) {
+#ifdef __x86_64__
+    return qihse_vdb_int8_dot_product_sse41(a, b, len);
+#else
     int64_t sum = 0;
-    size_t i;
-    for (i = 0u; i < len; i++) {
+    for (size_t i = 0u; i < len; i++) {
         sum += (int64_t)a[i] * (int64_t)b[i];
     }
     return (float)sum;
+#endif
 }
 
 static int8_t* qihse_vdb_int8_quantize_query(qihse_vector_db_t vdb,
@@ -2276,6 +2329,8 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
     }
 
     vdb->row_access_batch_ns = qihse_vdb_monotonic_ns();
+    float worst_score = -FLT_MAX;
+    size_t worst_idx = 0;
 
     for (i = 0u; i < vdb->total_vectors; i++) {
         const qihse_index_row_t* row = &vdb->rows[i];
@@ -2284,6 +2339,10 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
         if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
+        }
+
+        if (i + 4 < vdb->total_vectors) {
+            _mm_prefetch((const char*)&vdb->int8_vectors[(i + 4) * vdb->int8_dims], _MM_HINT_T0);
         }
 
         score = qihse_vdb_int8_dot_product(q_quantized,
@@ -2295,17 +2354,26 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
             pool[pool_count].id = i;
             pool[pool_count].score = score;
             pool_count++;
-        } else {
-            size_t w = 0u;
-            size_t k;
-            for (k = 1u; k < pool_count; k++) {
-                if (pool[k].score < pool[w].score) {
-                    w = k;
+            if (pool_count == candidate_count) {
+                worst_score = pool[0].score;
+                worst_idx = 0;
+                for (size_t k = 1; k < pool_count; k++) {
+                    if (pool[k].score < worst_score) {
+                        worst_score = pool[k].score;
+                        worst_idx = k;
+                    }
                 }
             }
-            if (score > pool[w].score) {
-                pool[w].id = i;
-                pool[w].score = score;
+        } else if (score > worst_score) {
+            pool[worst_idx].id = i;
+            pool[worst_idx].score = score;
+            worst_score = pool[0].score;
+            worst_idx = 0;
+            for (size_t k = 1; k < pool_count; k++) {
+                if (pool[k].score < worst_score) {
+                    worst_score = pool[k].score;
+                    worst_idx = k;
+                }
             }
         }
     }
@@ -2597,6 +2665,10 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
     size_t worst_idx = 0;
 
     for (i = 0u; i < vdb->total_vectors; i++) {
+        if (i + 8 < vdb->total_vectors) {
+            _mm_prefetch((const char*)&vdb->binary_vectors[(i + 8) * vdb->binary_words_per_vec], _MM_HINT_T0);
+        }
+
         const qihse_index_row_t* row = &vdb->rows[i];
 
         if ((row->row_flags & QIHSE_ROW_F_LIVE) == 0u ||
@@ -2660,6 +2732,13 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
 
     /* Exact rerank of binary candidates */
     for (i = 0u; i < pool_count && i < candidate_count && out_count < top_k; i++) {
+        if (i + 1 < pool_count && i + 1 < candidate_count) {
+            const qihse_index_row_t* next_row = &vdb->rows[pool[i + 1].id];
+            const float* next_vec = qihse_vdb_vector_at(vdb, next_row);
+            if (next_vec) {
+                _mm_prefetch((const char*)next_vec, _MM_HINT_T0);
+            }
+        }
         const qihse_index_row_t* row = &vdb->rows[pool[i].id];
         const float* vector;
         float score;
