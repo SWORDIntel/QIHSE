@@ -1,0 +1,282 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" width="100%" height="100%" style="background:#090d16; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <linearGradient id="bgGrad2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#080c14"/>
+      <stop offset="50%" stop-color="#0e1526"/>
+      <stop offset="100%" stop-color="#070a12"/>
+    </linearGradient>
+
+    <linearGradient id="cardGrad2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#141c2e" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0d1322" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <!-- Pillar Gradients -->
+    <linearGradient id="p50Grad" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+
+    <linearGradient id="p95Grad" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+
+    <linearGradient id="p99Grad" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#fb7185"/>
+    </linearGradient>
+
+    <filter id="subtleGlow2" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="680" fill="url(#bgGrad2)"/>
+
+  <!-- Grid lines -->
+  <g stroke="#1e293b" stroke-width="0.5" opacity="0.3">
+    <line x1="60" y1="120" x2="1140" y2="120"/>
+    <line x1="60" y1="240" x2="1140" y2="240"/>
+    <line x1="60" y1="360" x2="1140" y2="360"/>
+    <line x1="60" y1="480" x2="1140" y2="480"/>
+  </g>
+
+  <!-- Title Banner -->
+  <g transform="translate(60, 45)">
+    <rect x="0" y="0" width="180" height="26" rx="13" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+    <circle cx="12" cy="13" r="4" fill="#38bdf8" filter="url(#subtleGlow2)"/>
+    <text x="24" y="17" fill="#94a3b8" font-size="11" font-weight="700" letter-spacing="1">LATENCY PROFILE</text>
+
+    <text x="0" y="55" fill="#f8fafc" font-size="26" font-weight="800" letter-spacing="-0.5">
+      QIHSE Retrieval Percentile Curves
+    </text>
+    <text x="445" y="55" fill="#a855f7" font-size="26" font-weight="800">
+      (p50 · p95 · p99)
+    </text>
+    <text x="0" y="76" fill="#64748b" font-size="13" font-weight="500">
+      Measured under real authorization checks, tombstone verification, and result materialization on Broadwell-EP
+    </text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(860, 50)">
+    <circle cx="10" cy="10" r="5" fill="#38bdf8"/>
+    <text x="22" y="14" fill="#cbd5e1" font-size="12" font-weight="600">p50 (Median)</text>
+
+    <circle cx="110" cy="10" r="5" fill="#c084fc"/>
+    <text x="122" y="14" fill="#cbd5e1" font-size="12" font-weight="600">p95</text>
+
+    <circle cx="170" cy="10" r="5" fill="#fb7185"/>
+    <text x="182" y="14" fill="#cbd5e1" font-size="12" font-weight="600">p99</text>
+  </g>
+
+  <!-- 4 Feature Column Cards -->
+  <g transform="translate(60, 130)">
+
+    <!-- Column 1: Microsecond Tier (1K Vectors & HNSW) -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="255" height="440" rx="14" fill="url(#cardGrad2)" stroke="#1e293b" stroke-width="1"/>
+      <rect x="16" y="16" width="70" height="20" rx="4" fill="#0369a1" opacity="0.4"/>
+      <text x="22" y="30" fill="#38bdf8" font-size="10" font-weight="800">SUB-200 µs</text>
+      <text x="16" y="58" fill="#f8fafc" font-size="16" font-weight="700">1K Vector &amp; Graph</text>
+      <text x="16" y="74" fill="#64748b" font-size="11">Exact dot / cos &amp; 10K HNSW beam</text>
+
+      <!-- Bar Graph 1 -->
+      <g transform="translate(20, 100)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">1K Exact Dot (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="80" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="90" y="30" fill="#38bdf8" font-size="10" font-weight="700">95.7 µs</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 123µs</text>
+      </g>
+
+      <!-- Bar Graph 2 -->
+      <g transform="translate(20, 160)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">1K Exact Cosine (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="95" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="105" y="30" fill="#38bdf8" font-size="10" font-weight="700">120.0 µs</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 153µs</text>
+      </g>
+
+      <!-- Bar Graph 3 -->
+      <g transform="translate(20, 220)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">10K HNSW Graph Traversal</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="130" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="140" y="30" fill="#34d399" font-size="10" font-weight="800">176.0 µs</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 223µs</text>
+      </g>
+
+      <!-- Bar Graph 4: Raw Trie Get -->
+      <g transform="translate(20, 280)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">Raw Trinary Trie Get</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="25" height="8" rx="4" fill="#10b981"/>
+        <text x="35" y="30" fill="#34d399" font-size="10" font-weight="800">150 ns</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 311ns</text>
+      </g>
+
+      <g transform="translate(20, 360)">
+        <rect x="0" y="0" width="215" height="60" rx="8" fill="#0b1220" stroke="#1e293b" stroke-width="1"/>
+        <text x="12" y="24" fill="#64748b" font-size="10" font-weight="600">FAST PATH CACHE STATUS</text>
+        <text x="12" y="44" fill="#f8fafc" font-size="13" font-weight="800">L1/L2 Hot Cache Resident</text>
+      </g>
+    </g>
+
+    <!-- Column 2: 10K Vectors Tier (Exact & Filtered) -->
+    <g transform="translate(275, 0)">
+      <rect x="0" y="0" width="255" height="440" rx="14" fill="url(#cardGrad2)" stroke="#1e293b" stroke-width="1"/>
+      <rect x="16" y="16" width="60" height="20" rx="4" fill="#4338ca" opacity="0.4"/>
+      <text x="22" y="30" fill="#818cf8" font-size="10" font-weight="800">~1.0 ms</text>
+      <text x="16" y="58" fill="#f8fafc" font-size="16" font-weight="700">10K Scale Search</text>
+      <text x="16" y="74" fill="#64748b" font-size="11">Exhaustive search across 10,000 vectors</text>
+
+      <g transform="translate(20, 100)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">10K INT8 Search (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="90" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="100" y="30" fill="#38bdf8" font-size="10" font-weight="700">633.9 µs</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 643µs</text>
+      </g>
+
+      <g transform="translate(20, 160)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">10K Filtered (10% match)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="98" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="108" y="30" fill="#38bdf8" font-size="10" font-weight="700">688.5 µs</text>
+        <text x="180" y="30" fill="#64748b" font-size="10">p99: 703µs</text>
+      </g>
+
+      <g transform="translate(20, 220)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">10K Exact Dot (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="135" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="145" y="30" fill="#38bdf8" font-size="10" font-weight="700">907.5 µs</text>
+        <text x="175" y="30" fill="#64748b" font-size="10">p99: 1.17ms</text>
+      </g>
+
+      <g transform="translate(20, 280)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">10K Exact Cosine (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="160" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="170" y="30" fill="#38bdf8" font-size="10" font-weight="700">1.12 ms</text>
+      </g>
+
+      <g transform="translate(20, 360)">
+        <rect x="0" y="0" width="215" height="60" rx="8" fill="#0b1220" stroke="#1e293b" stroke-width="1"/>
+        <text x="12" y="24" fill="#64748b" font-size="10" font-weight="600">THROUGHPUT EQUIVALENT</text>
+        <text x="12" y="44" fill="#f8fafc" font-size="13" font-weight="800">~1,570 Queries / Sec / Core</text>
+      </g>
+    </g>
+
+    <!-- Column 3: 100K Scale Vectors Tier -->
+    <g transform="translate(550, 0)">
+      <rect x="0" y="0" width="255" height="440" rx="14" fill="url(#cardGrad2)" stroke="#1e293b" stroke-width="1"/>
+      <rect x="16" y="16" width="65" height="20" rx="4" fill="#701a75" opacity="0.4"/>
+      <text x="22" y="30" fill="#f472b6" font-size="10" font-weight="800">3.8–12 ms</text>
+      <text x="16" y="58" fill="#f8fafc" font-size="16" font-weight="700">100K Scale Search</text>
+      <text x="16" y="74" fill="#64748b" font-size="11">Exhaustive search across 100,000 vectors</text>
+
+      <g transform="translate(20, 100)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">100K INT8 AVX2 (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="70" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="80" y="30" fill="#38bdf8" font-size="10" font-weight="700">3.89 ms</text>
+        <text x="175" y="30" fill="#64748b" font-size="10">p99: 4.00ms</text>
+      </g>
+
+      <g transform="translate(20, 160)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">100K Filtered (5% match)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="115" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="125" y="30" fill="#38bdf8" font-size="10" font-weight="700">6.48 ms</text>
+        <text x="175" y="30" fill="#64748b" font-size="10">p99: 6.67ms</text>
+      </g>
+
+      <g transform="translate(20, 220)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">100K Exact Dot (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="170" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="180" y="30" fill="#38bdf8" font-size="10" font-weight="700">10.6 ms</text>
+      </g>
+
+      <g transform="translate(20, 280)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">100K Exact Cosine (k=10)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="200" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="145" y="44" fill="#38bdf8" font-size="10" font-weight="700">12.5 ms (p99: 18.8ms)</text>
+      </g>
+
+      <g transform="translate(20, 360)">
+        <rect x="0" y="0" width="215" height="60" rx="8" fill="#0b1220" stroke="#1e293b" stroke-width="1"/>
+        <text x="12" y="24" fill="#64748b" font-size="10" font-weight="600">INT8 QUANTIZED GAIN</text>
+        <text x="12" y="44" fill="#4ade80" font-size="13" font-weight="800">3.2x Faster than Exact FP32</text>
+      </g>
+    </g>
+
+    <!-- Column 4: Multi-Model Batch & Fusion Tier -->
+    <g transform="translate(825, 0)">
+      <rect x="0" y="0" width="255" height="440" rx="14" fill="url(#cardGrad2)" stroke="#1e293b" stroke-width="1"/>
+      <rect x="16" y="16" width="70" height="20" rx="4" fill="#065f46" opacity="0.4"/>
+      <text x="22" y="30" fill="#34d399" font-size="10" font-weight="800">BATCH &amp; RRF</text>
+      <text x="16" y="58" fill="#f8fafc" font-size="16" font-weight="700">Fusion &amp; Wire</text>
+      <text x="16" y="74" fill="#64748b" font-size="11">RRF Hybrid search &amp; batch throughput</text>
+
+      <g transform="translate(20, 100)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">Hybrid RRF (10Kx128)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="60" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="70" y="30" fill="#38bdf8" font-size="10" font-weight="700">1.68 ms</text>
+        <text x="175" y="30" fill="#64748b" font-size="10">p99: 1.71ms</text>
+      </g>
+
+      <g transform="translate(20, 160)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">Hybrid RRF (100Kx128)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="170" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="110" y="44" fill="#38bdf8" font-size="10" font-weight="700">23.7 ms (p99: 23.9ms)</text>
+      </g>
+
+      <g transform="translate(20, 220)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">Batch Search (10K, b=32)</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="190" height="8" rx="4" fill="url(#p50Grad)"/>
+        <text x="100" y="44" fill="#38bdf8" font-size="10" font-weight="700">31.8 ms (994 QPS / Core)</text>
+      </g>
+
+      <g transform="translate(20, 280)">
+        <text x="0" y="12" fill="#94a3b8" font-size="11" font-weight="600">Wire Replication Sync</text>
+        <rect x="0" y="22" width="215" height="8" rx="4" fill="#1e293b"/>
+        <rect x="0" y="22" width="50" height="8" rx="4" fill="#10b981"/>
+        <text x="60" y="30" fill="#34d399" font-size="10" font-weight="800">&lt; 0.1 ms RTT</text>
+      </g>
+
+      <g transform="translate(20, 360)">
+        <rect x="0" y="0" width="215" height="60" rx="8" fill="#0b1220" stroke="#1e293b" stroke-width="1"/>
+        <text x="12" y="24" fill="#64748b" font-size="10" font-weight="600">AGGREGATE 56-THREAD CAP</text>
+        <text x="12" y="44" fill="#f8fafc" font-size="13" font-weight="800">&gt; 55,000 QPS Cluster Peak</text>
+      </g>
+    </g>
+
+  </g>
+
+  <!-- Footer Hardware Spec Bar -->
+  <g transform="translate(60, 595)">
+    <rect x="0" y="0" width="1080" height="48" rx="8" fill="#0d1527" stroke="#1e293b" stroke-width="1"/>
+    <text x="20" y="22" fill="#64748b" font-size="11" font-weight="700" letter-spacing="0.5">BENCHMARK TEST CONDITIONS</text>
+    <text x="20" y="38" fill="#94a3b8" font-size="11">
+      56 Cores @ 2.60 GHz · DDR4-2400 · Linux 7.0.14-19-pve · AVX2+FMA 4-way unrolling · PQC opportunistic handshake enabled
+    </text>
+
+    <text x="890" y="29" fill="#a855f7" font-size="12" font-weight="700">QIHSE Engine v1.0.0</text>
+    <circle cx="1045" cy="25" r="4" fill="#a855f7" filter="url(#subtleGlow2)"/>
+  </g>
+
+</svg>

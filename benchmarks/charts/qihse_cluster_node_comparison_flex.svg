@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" width="100%" height="100%" style="background:#090d16; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <linearGradient id="bgGrad3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#080c14"/>
+      <stop offset="50%" stop-color="#0e1526"/>
+      <stop offset="100%" stop-color="#070a12"/>
+    </linearGradient>
+
+    <linearGradient id="nodeAGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e293b" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0f172a" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <linearGradient id="nodeBGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e1b4b" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0f172a" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <linearGradient id="wireGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+
+    <filter id="wireGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="680" fill="url(#bgGrad3)"/>
+
+  <!-- Header Banner -->
+  <g transform="translate(60, 45)">
+    <rect x="0" y="0" width="190" height="26" rx="13" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+    <circle cx="12" cy="13" r="4" fill="#a855f7" filter="url(#wireGlow)"/>
+    <text x="24" y="17" fill="#94a3b8" font-size="11" font-weight="700" letter-spacing="1">CLUSTER TOPOLOGY</text>
+
+    <text x="0" y="55" fill="#f8fafc" font-size="26" font-weight="800" letter-spacing="-0.5">
+      Dual-Node Distributed Compute &amp; Replication Flex
+    </text>
+    <text x="0" y="76" fill="#64748b" font-size="13" font-weight="500">
+      Comparing Host Ivy Bridge Node (192.168.1.91) vs Dell PowerEdge R730xd Broadwell Node (192.168.1.90)
+    </text>
+  </g>
+
+  <!-- Node A Container (Left) -->
+  <g transform="translate(60, 130)">
+    <rect x="0" y="0" width="460" height="440" rx="16" fill="url(#nodeAGrad)" stroke="#334155" stroke-width="1"/>
+    
+    <!-- Node A Header -->
+    <rect x="20" y="20" width="110" height="24" rx="12" fill="#0f172a" stroke="#475569" stroke-width="1"/>
+    <circle cx="32" cy="32" r="4" fill="#38bdf8"/>
+    <text x="44" y="36" fill="#cbd5e1" font-size="11" font-weight="700">THIS NODE</text>
+
+    <text x="20" y="74" fill="#f8fafc" font-size="20" font-weight="800">Host (192.168.1.91)</text>
+    <text x="20" y="94" fill="#64748b" font-size="12">Dual Intel Xeon E5-2470 v2 · Ivy Bridge-EP</text>
+
+    <!-- Specs Box -->
+    <g transform="translate(20, 115)">
+      <rect x="0" y="0" width="420" height="110" rx="10" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+      <text x="16" y="24" fill="#64748b" font-size="10" font-weight="700">CPU TOPOLOGY</text>
+      <text x="16" y="44" fill="#f1f5f9" font-size="14" font-weight="700">20 Cores / 40 Threads @ 2.40 GHz</text>
+      <text x="16" y="64" fill="#94a3b8" font-size="12">50 MB L3 Cache · 112 GB DDR3-1600 (102 GB/s)</text>
+
+      <text x="16" y="90" fill="#38bdf8" font-size="11" font-weight="600">
+        AVX 1.0 · F16C · AES-NI · PCLMUL · POPCNT · RDRAND · FSGSBASE
+      </text>
+    </g>
+
+    <!-- Metrics Box -->
+    <g transform="translate(20, 245)">
+      <g transform="translate(0, 0)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">CRC32 Checksum Throughput</text>
+        <text x="420" y="16" fill="#38bdf8" font-size="14" font-weight="700" text-anchor="end">1.867 GiB/s</text>
+      </g>
+      <g transform="translate(0, 36)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">100K INT8 Vector Search</text>
+        <text x="420" y="16" fill="#cbd5e1" font-size="14" font-weight="700" text-anchor="end">4.21 ms</text>
+      </g>
+      <g transform="translate(0, 72)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Hybrid RRF Fusion (100K)</text>
+        <text x="420" y="16" fill="#cbd5e1" font-size="14" font-weight="700" text-anchor="end">28.77 ms</text>
+      </g>
+      <g transform="translate(0, 108)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Entropy Engine</text>
+        <text x="420" y="16" fill="#cbd5e1" font-size="13" font-weight="600" text-anchor="end">RDRAND (DRBG)</text>
+      </g>
+      <g transform="translate(0, 144)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Hash Index Concurrency</text>
+        <text x="420" y="16" fill="#cbd5e1" font-size="13" font-weight="600" text-anchor="end">Pthread Mutex</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- Center Inter-Node Wire Pipe -->
+  <g transform="translate(520, 260)">
+    <rect x="0" y="0" width="160" height="96" rx="12" fill="#0f172a" stroke="url(#wireGrad)" stroke-width="2" filter="url(#wireGlow)"/>
+    <text x="80" y="24" fill="#a855f7" font-size="11" font-weight="800" text-anchor="middle" letter-spacing="1">10G/LAN WIRE</text>
+    <text x="80" y="48" fill="#38bdf8" font-size="18" font-weight="800" text-anchor="middle">943 Mbps</text>
+    <text x="80" y="68" fill="#34d399" font-size="12" font-weight="700" text-anchor="middle">&lt; 0.1 ms RTT</text>
+    <text x="80" y="84" fill="#64748b" font-size="10" text-anchor="middle">QKP + AES-GCM</text>
+  </g>
+
+  <!-- Node B Container (Right) -->
+  <g transform="translate(680, 130)">
+    <rect x="0" y="0" width="460" height="440" rx="16" fill="url(#nodeBGrad)" stroke="#6366f1" stroke-width="1.5"/>
+    
+    <!-- Node B Header -->
+    <rect x="20" y="20" width="130" height="24" rx="12" fill="#1e1b4b" stroke="#818cf8" stroke-width="1"/>
+    <circle cx="32" cy="32" r="4" fill="#00F260" filter="url(#wireGlow)"/>
+    <text x="44" y="36" fill="#a5b4fc" font-size="11" font-weight="700">THAT NODE (730xd)</text>
+
+    <text x="20" y="74" fill="#f8fafc" font-size="20" font-weight="800">Dell PowerEdge R730xd</text>
+    <text x="20" y="94" fill="#818cf8" font-size="12">Dual Intel Xeon E5-2690 v4 · Broadwell-EP (192.168.1.90)</text>
+
+    <!-- Specs Box -->
+    <g transform="translate(20, 115)">
+      <rect x="0" y="0" width="420" height="110" rx="10" fill="#0b1120" stroke="#312e81" stroke-width="1"/>
+      <text x="16" y="24" fill="#818cf8" font-size="10" font-weight="700">CPU TOPOLOGY</text>
+      <text x="16" y="44" fill="#f1f5f9" font-size="14" font-weight="700">28 Cores / 56 Threads @ 2.60 GHz</text>
+      <text x="16" y="64" fill="#94a3b8" font-size="12">70 MB L3 Cache · 96 GB DDR4-2400 (153 GB/s)</text>
+
+      <text x="16" y="90" fill="#34d399" font-size="11" font-weight="700">
+        AVX2 · FMA3 · BMI1/2 · MOVBE · RDSEED · ADX · TSX (RTM) · ABM
+      </text>
+    </g>
+
+    <!-- Metrics Box -->
+    <g transform="translate(20, 245)">
+      <g transform="translate(0, 0)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">CRC32 Checksum Throughput</text>
+        <text x="420" y="16" fill="#00F2FE" font-size="15" font-weight="800" text-anchor="end">6.018 GiB/s (3.22x)</text>
+      </g>
+      <g transform="translate(0, 36)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">100K INT8 Vector Search</text>
+        <text x="420" y="16" fill="#c084fc" font-size="15" font-weight="800" text-anchor="end">3.89 ms (1.08x)</text>
+      </g>
+      <g transform="translate(0, 72)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Hybrid RRF Fusion (100K)</text>
+        <text x="420" y="16" fill="#c084fc" font-size="15" font-weight="800" text-anchor="end">23.71 ms (1.21x)</text>
+      </g>
+      <g transform="translate(0, 108)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Entropy Engine</text>
+        <text x="420" y="16" fill="#34d399" font-size="13" font-weight="700" text-anchor="end">RDSEED (NIST 800-90B/C)</text>
+      </g>
+      <g transform="translate(0, 144)">
+        <text x="0" y="16" fill="#94a3b8" font-size="12">Hash Index Concurrency</text>
+        <text x="420" y="16" fill="#34d399" font-size="13" font-weight="700" text-anchor="end">Intel TSX (RTM) Elision</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- Footer Hardware Spec Bar -->
+  <g transform="translate(60, 595)">
+    <rect x="0" y="0" width="1080" height="48" rx="8" fill="#0d1527" stroke="#1e293b" stroke-width="1"/>
+    <text x="20" y="22" fill="#64748b" font-size="11" font-weight="700" letter-spacing="0.5">PEER ANTI-ENTROPY REPLICATION</text>
+    <text x="20" y="38" fill="#94a3b8" font-size="11">
+      Automatic background healing: pulls delta updates every 30s across cluster slots 0–16383 with zero manual resync needed.
+    </text>
+
+    <text x="910" y="29" fill="#10b981" font-size="12" font-weight="700">Cluster Status: HEALTHY</text>
+    <circle cx="1060" cy="25" r="4" fill="#00F260" filter="url(#wireGlow)"/>
+  </g>
+
+</svg>

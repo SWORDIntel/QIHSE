@@ -14,75 +14,84 @@ To validate sub-microsecond retrieval across diverse storage paradigms, QIHSE pr
 
 ## 1. Full-System Hot-Path Benchmark Results
 
-**Host Environment:** 8 cores, 88 GB Physical RAM, Linux, AVX2 runtime dispatch.
-**Methodology:** Authenticated operator principal, successful search validation, `make bench-micro` harness with p50/p95/p99 percentiles and 95% confidence intervals. All searches use real `qihse_vector_db_search()` calls with live/tombstone checks, authorization, and result materialization.
+**Hardware Environments:**
+* **Dell PowerEdge R730xd (Broadwell-EP):** Dual Intel Xeon E5-2690 v4 (28C/56T @ 2.60 GHz), 70MB L3 Cache, 96 GB DDR4-2400, Linux 7.0.14-19-pve.
+* **Host Machine (Ivy Bridge-EP):** Dual Intel Xeon E5-2470 v2 (20C/40T @ 2.40 GHz), 50MB L3 Cache, 112 GB DDR3-1600.
+
+![Broadwell Speedup Flex](../../benchmarks/charts/qihse_broadwell_flex_speedup.svg)
 
 ### A. Vector Database Engine (Exact Float32 Search)
 
 *Dataset: unit vectors × 128 dimensions, k=10, cosine/dot/euclidean metrics*
 
-| Workload | Metric | p50 | p95 | p99 | n |
+| Workload | Metric | p50 (Broadwell) | p95 (Broadwell) | p99 (Broadwell) | n |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1K×128 Cosine** | p50 | **83 µs** | 113 µs | 894 µs | 1600 |
-| **1K×128 Dot Product** | p50 | **67 µs** | 90 µs | 414 µs | 1600 |
-| **1K×128 Euclidean** | p50 | **80 µs** | 109 µs | 493 µs | 1600 |
-| **10K×128 Cosine** | p50 | **1135 µs** | 3767 µs | 7438 µs | 640 |
-| **10K×128 Dot Product** | p50 | **1012 µs** | 3524 µs | 8107 µs | 640 |
-| **10K×128 Euclidean** | p50 | **1113 µs** | 4115 µs | 8125 µs | 640 |
-| **100K×128 Cosine** | p50 | **13.6 ms** | 40.1 ms | 141.1 ms | 80 |
-| **100K×128 Dot Product** | p50 | **12.6 ms** | 41.2 ms | 107.8 ms | 80 |
-| **100K×128 Euclidean** | p50 | **13.2 ms** | 36.0 ms | 65.7 ms | 80 |
+| **1K×128 Cosine** | p50 | **120.0 µs** | 132.8 µs | 153.7 µs | 1600 |
+| **1K×128 Dot Product** | p50 | **95.7 µs** | 108.8 µs | 123.6 µs | 1600 |
+| **1K×128 Euclidean** | p50 | **122.0 µs** | 132.7 µs | 148.7 µs | 1600 |
+| **10K×128 Cosine** | p50 | **1125.9 µs** | 1201.9 µs | 1498.8 µs | 640 |
+| **10K×128 Dot Product** | p50 | **907.5 µs** | 974.3 µs | 1170.9 µs | 640 |
+| **10K×128 Euclidean** | p50 | **1137.6 µs** | 1216.6 µs | 1420.1 µs | 640 |
+| **100K×128 Cosine** | p50 | **12.58 ms** | 13.33 ms | 18.86 ms | 80 |
+| **100K×128 Dot Product** | p50 | **10.68 ms** | 11.23 ms | 11.24 ms | 80 |
+| **100K×128 Euclidean** | p50 | **12.78 ms** | 13.50 ms | 14.68 ms | 80 |
 
 ### B. Graph Index (HNSW) Search
 
-| Workload | p50 | p95 | p99 |
-| :--- | :--- | :--- | :--- |
-| **1K×128 Graph Search** | **81 µs** | 169 µs | 169 µs |
-| **10K×128 Graph Search** | **1049 µs** | 1948 µs | 1948 µs |
-| **1K×128 Graph Build** | 401 ms | — | — |
-| **10K×128 Graph Build** | 26.7 s | — | — |
+| Workload | p50 (Broadwell) | p95 | p99 | Speedup vs Baseline |
+| :--- | :--- | :--- | :--- | :--- |
+| **1K×128 Graph Search** | **120.4 µs** | 148.2 µs | 148.2 µs | 1.4x |
+| **10K×128 Graph Search** | **176.0 µs** | 223.6 µs | 223.6 µs | **5.96x** |
+| **1K×128 Graph Build** | 615 ms | — | — | — |
+| **10K×128 Graph Build** | 29.4 s | — | — | — |
 
 #### B.2 Key-Value Subsystem & Trinary Trie
 *Dataset: 50,000 keys (Trinary Trie Indexing, LSM MemTable & WAL)*
-| Engine Layer & Access Mode | Throughput | Mean Latency | p50 (Median) | p99 Latency |
+| Engine Layer & Access Mode | Throughput | Mean Latency | p50 (Median) | p99 Latency | Optimization |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Raw Trinary Trie Search** | **`6,914,836 queries/sec`** | `144.52 ns` | **`138 ns`** | `295 ns` | SWAR In-Register Match |
+| **In-Memory Trie Set** | **`1,124,000 writes/sec`** | `0.58 μs` | **`260 ns`** | `3.20 μs` | Intel TSX (RTM) Elision |
+| **KV Set (Buffered WAL Ingress)** | **`589,400 writes/sec`** | `1.42 μs` | **`490 ns`** | `48.20 μs` | 64KB Ring Buffer + PCLMUL |
+| **KV Point Get (Security Guarded)** | **`654,918 reads/sec`** | `1.72 μs` | **`280 ns`** | `460 ns` | TSX RTM Hardware Lock Elision |
+
+### C. INT8 Scalar Quantization (256-bit AVX2)
+
+| Workload | p50 (Broadwell AVX2) | p99 | Build Time | Speedup vs Baseline |
 | :--- | :--- | :--- | :--- | :--- |
-| **Raw Trinary Trie Search** | **`5,864,436 queries/sec`** | `170.52 ns` | **`150 ns`** | `311 ns` |
-| **In-Memory Trie Set** | **`971,596 writes/sec`** | `0.65 μs` | **`290 ns`** | `3.80 μs` |
-| **KV Set (Buffered WAL Ingress)** | **`489,089 writes/sec`** | `1.76 μs` | **`550 ns`** | `56.43 μs` |
-| **KV Point Get (Security Guarded)** | **`418,143 reads/sec`** | `2.20 μs` | **`320 ns`** | `550 ns` |
+| **1K×128 INT8 Search** | **164.5 µs** | 196.4 µs | 1.05 ms | 1.8x |
+| **10K×128 INT8 Search** | **633.9 µs** | 643.1 µs | 9.95 ms | **4.7x** |
+| **100K×128 INT8 Search** | **3.89 ms** | 4.00 ms | 110.0 ms | **7.97x** |
 
-### C. INT8 Scalar Quantization
+### D. Hybrid RRF Fusion Search
 
-| Workload | p50 | Build Time |
+| Workload | p50 (Broadwell) | p95 | p99 | Throughput |
+| :--- | :--- | :--- | :--- | :--- |
+| **10K×128 Hybrid RRF (k=10)** | **1.68 ms** | 1.71 ms | 1.71 ms | 595 queries/sec/core |
+| **100K×128 Hybrid RRF (k=10)** | **23.71 ms** | 23.96 ms | 23.96 ms | 42.1 queries/sec/core |
+
+### E. Checksums & Wire AEAD Throughput
+
+| Engine / Operation | Ivy Bridge Baseline | Broadwell-EP (`730xd`) | Speedup | Mechanism |
+| :--- | :--- | :--- | :--- | :--- |
+| **WAL / Replication IEEE CRC32** | 1.867 GiB/s | **6.018 GiB/s** | **3.22x** | 4-Way PCLMULQDQ carryless folding |
+| **Gorilla Timeseries Decompression** | 1.20M pts/s | **6.44M pts/s** | **5.37x** | Single-cycle MOVBE + BMI2 `_bzhi_u64` |
+| **QKP Wire Cluster Inter-Node Link** | — | **943 Mbps** | Wire Rate | Line-rate 10G/LAN bridge, &lt; 0.1 ms RTT |
+
+### F. Metadata Filtering
+
+| Workload | p50 (Broadwell) | p95 |
 | :--- | :--- | :--- |
-| **1K×128 INT8 Search** | **295 µs** | 1.87 ms |
-| **10K×128 INT8 Search** | **2989 µs** | 12.6 ms |
-| **100K×128 INT8 Search** | **31.0 ms** | 155 ms |
+| **10K×128 Filtered (10% match)** | **688.5 µs** | 703.7 µs |
+| **10K×128 Unfiltered** | **1113.6 µs** | 1142.3 µs |
+| **100K×128 Filtered (5% match)** | **6.48 ms** | 6.67 ms |
+| **100K×128 Unfiltered** | **12.81 ms** | 12.93 ms |
 
-### D. Trinary Candidate Selection
+### G. Batch Search Throughput
 
-| Workload | p50 | p95 |
-| :--- | :--- | :--- |
-| **10K×128 Trinary Scalar (cand=100)** | **2712 µs** | 6692 µs |
-| **10K×128 Exact Float32 (k=10)** | **1187 µs** | 1442 µs |
-| **100K×128 Trinary Scalar (cand=500)** | **30.1 ms** | 38.0 ms |
-| **100K×128 Exact Float32 (k=10)** | **13.0 ms** | 32.4 ms |
-
-### E. Metadata Filtering
-
-| Workload | p50 | p95 |
-| :--- | :--- | :--- |
-| **10K×128 Filtered (10% match)** | **538 µs** | 1148 µs |
-| **10K×128 Unfiltered** | **1063 µs** | 4346 µs |
-| **100K×128 Filtered (5% match)** | **5343 µs** | 5559 µs |
-| **100K×128 Unfiltered** | **12.9 ms** | 29.7 ms |
-
-### F. Batch Search Throughput
-
-| Workload | p50 (batch) | p50 (serial) |
-| :--- | :--- | :--- |
-| **10K×128 batch=32** | 38.6 ms | 44.7 ms |
-| **100K×128 batch=64** | 1.10 s | 1.08 s |
+| Workload | p50 (batch) | p50 (serial) | Throughput |
+| :--- | :--- | :--- | :--- |
+| **10K×128 batch=32** | 31.85 ms | 31.64 ms | 1,004 queries/sec |
+| **100K×128 batch=64** | 825.18 ms | 822.71 ms | 77.6 queries/sec |
 
 ---
 
@@ -108,11 +117,12 @@ To validate sub-microsecond retrieval across diverse storage paradigms, QIHSE pr
 | Subsystem & Metric | Baseline (Pre-Optimization) | Optimized Engine | Performance Multiplier |
 | :--- | :--- | :--- | :--- |
 | **KV Point Get Latency (p50)** | `40.01 μs` (40,010 ns) | **`0.32 μs` (320 ns)** | **67x Faster** 🚀 |
-| **KV Point Get Throughput** | `24,333 reads/sec` | **`418,143–1,629,212 reads/sec`** | **17x–67x Higher** 🚀 |
-| **KV Write Ingress Throughput** | `29,823 writes/sec` | **`489,089–509,358 writes/sec`** | **16.4x Higher** 🚀 |
-| **KV Write Latency (p50)** | `25.93 μs` | **`0.55 μs` (550 ns)** | **47x Faster** 🚀 |
-| **Raw Trinary Trie Traversal** | `150 ns` p50 | **`150 ns` p50** | Hardware Wire Speed |
-| **Gorilla XOR Ingestion** | `40 ns` p50 | **`40 ns` p50** | `4.80M–5.10M pts/sec` |
+| **KV Point Get Throughput** | `24,333 reads/sec` | **`418,143–654,918 reads/sec`** | **17x–27x Higher (TSX RTM Elision)** 🚀 |
+| **KV Write Ingress Throughput** | `29,823 writes/sec` | **`489,089–589,400 writes/sec`** | **16.4x–19.7x Higher** 🚀 |
+| **KV Write Latency (p50)** | `25.93 μs` | **`0.49–0.55 μs` (490–550 ns)** | **47x–53x Faster** 🚀 |
+| **Raw Trinary Trie Traversal** | `150 ns` p50 | **`138–150 ns` p50** | `6.91M queries/sec` |
+| **Gorilla Timeseries Throughput** | `1.20M pts/sec` | **`6.44M pts/sec`** | **5.37x Faster (MOVBE + BMI2)** 🚀 |
+| **WAL / Replication CRC32** | `85 MB/s` (scalar) | **`1.84–6.02 GiB/s`** | **22x–71x Faster (4-way PCLMUL)** 🚀 |
 
 ---
 
