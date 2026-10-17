@@ -14,6 +14,44 @@
 #include <openssl/rand.h>
 #endif
 #include <immintrin.h>
+#include "qihse_tsx_lock.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#  if !defined(__RDSEED__)
+static inline int _rdseed64_step(unsigned long long *val) {
+    unsigned char ok;
+    __asm__ volatile("rdseed %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
+    return (int)ok;
+}
+#  endif
+#  if !defined(__FSGSBASE__)
+static inline unsigned long long _readfsbase_u64(void) {
+    unsigned long long val;
+    __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a"(val));
+    return val;
+}
+#  endif
+#endif
+
+static inline bool qihse_qdd_has_rdseed(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached != -1, 1)) {
+        return cached == 1;
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    if (eax >= 7) {
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+        if (ebx & (1u << 18)) {
+            cached = 1;
+            return true;
+        }
+    }
+#endif
+    cached = 0;
+    return false;
+}
 
 #define QDD_HISTORY_SIZE 1024
 #define QDD_THREAT_THRESHOLD 85
@@ -35,7 +73,7 @@ typedef struct {
 } qihse_qdd_ip_threat_t;
 
 struct qihse_quantum_defense_ctx_t {
-    pthread_mutex_t lock;
+    qihse_tsx_rwlock_t lock;
     uint64_t access_history[QDD_HISTORY_SIZE];
     uint64_t access_timestamps[QDD_HISTORY_SIZE];
     uint32_t head;
@@ -58,10 +96,8 @@ static bool qihse_qdd_geoip_lookup_ctx(qihse_quantum_defense_ctx_t* ctx,
                                         char* out_city,    size_t city_len,
                                         char* out_asn,     size_t asn_len);
 
-static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const char* ip) {
+static void qihse_qdd_track_ip_threat(qihse_quantum_defense_ctx_t* ctx, const char* ip, uint64_t now) {
     if (!ctx || !ip) return;
-    
-    uint64_t now = (uint64_t)time(NULL);
 
     /* Same accessor dominates (e.g. the KV path reports a fixed source) —
      * check the last-seen slot before scanning all entries. */
@@ -150,7 +186,7 @@ static const char* qihse_qdd_resolve_mmdb(const char* filename) {
 qihse_quantum_defense_ctx_t* qihse_qdd_init(void) {
     qihse_quantum_defense_ctx_t* ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
-    pthread_mutex_init(&ctx->lock, NULL);
+    qihse_tsx_rwlock_init(&ctx->lock);
 
     const char* country_path = qihse_qdd_resolve_mmdb("GeoLite2-Country.mmdb");
     const char* city_path    = qihse_qdd_resolve_mmdb("GeoLite2-City.mmdb");
@@ -183,79 +219,157 @@ void qihse_qdd_free(qihse_quantum_defense_ctx_t* ctx) {
         qihse_mmdb_close(ctx->mmdb_country);
         qihse_mmdb_close(ctx->mmdb_city);
         qihse_mmdb_close(ctx->mmdb_asn);
-        pthread_mutex_destroy(&ctx->lock);
+        qihse_tsx_rwlock_destroy(&ctx->lock);
         free(ctx);
     }
 }
 
 void qihse_qdd_report_access(qihse_quantum_defense_ctx_t* ctx, uint64_t target_id, const char* accessor_ip) {
     if (!ctx) return;
-    
-    pthread_mutex_lock(&ctx->lock);
-    
-    if (accessor_ip) {
-        qihse_qdd_track_ip_threat(ctx, accessor_ip);
-    }
-    
+
+    /* Hoist time(NULL) OUTSIDE the lock to avoid syscall aborts inside RTM */
     uint64_t now = (uint64_t)time(NULL);
-    uint64_t key_hash = target_id;
-    ctx->access_history[ctx->head] = key_hash;
+
+    /* Fast-path check: when accessor_ip matches ctx->last_ip_idx and no threat
+     * threshold is crossed, use TSX elision */
+    uint32_t last_idx = __atomic_load_n(&ctx->last_ip_idx, __ATOMIC_ACQUIRE);
+    uint32_t threat = __atomic_load_n(&ctx->threat_level, __ATOMIC_ACQUIRE);
+    bool under_atk = __atomic_load_n(&ctx->under_attack, __ATOMIC_ACQUIRE);
+
+    bool same_ip = false;
+    if (accessor_ip && last_idx < ctx->ip_threat_count &&
+        strcmp(ctx->ip_threats[last_idx].ip, accessor_ip) == 0) {
+        same_ip = true;
+    } else if (!accessor_ip) {
+        same_ip = true;
+    }
+
+    if (same_ip && !under_atk && (threat < (QDD_THREAT_THRESHOLD - 15)) && qihse_has_rtm_support()) {
+        int retries = 3;
+        while (retries > 0) {
+            while (__atomic_load_n(&ctx->lock.fallback_held, __ATOMIC_RELAXED) != 0) {
+                _mm_pause();
+            }
+
+            unsigned int status = qihse_rtm_xbegin();
+            if (status == _XBEGIN_STARTED) {
+                if (ctx->lock.fallback_held != 0) {
+                    qihse_rtm_xabort(0xff);
+                }
+
+                if (accessor_ip && last_idx < ctx->ip_threat_count) {
+                    qihse_qdd_ip_threat_t* e = &ctx->ip_threats[last_idx];
+                    uint64_t time_delta = now - e->last_access_time;
+                    if (time_delta < 1) {
+                        e->burst_count++;
+                        if (e->burst_count > 10) e->threat_contribution += 5;
+                    } else {
+                        e->burst_count = 1;
+                    }
+                    e->last_access_time = now;
+                }
+
+                ctx->access_history[ctx->head] = target_id;
+                ctx->access_timestamps[ctx->head] = now;
+                ctx->head = (ctx->head + 1) % QDD_HISTORY_SIZE;
+                if (ctx->history_count < QDD_HISTORY_SIZE) ctx->history_count++;
+
+                int equidistant_hits = 0;
+                uint32_t comparisons = ctx->history_count > 1 ? ctx->history_count - 1 : 0;
+                if (comparisons > 10) comparisons = 10;
+                for (uint32_t i = 0; i < comparisons; i++) {
+                    uint32_t idx1 = (ctx->head - 1u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
+                    uint32_t idx2 = (ctx->head - 2u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
+
+                    uint64_t diff = ctx->access_history[idx1] ^ ctx->access_history[idx2];
+                    uint64_t time_delta = ctx->access_timestamps[idx1] >= ctx->access_timestamps[idx2]
+                                              ? ctx->access_timestamps[idx1] - ctx->access_timestamps[idx2]
+                                              : ctx->access_timestamps[idx2] - ctx->access_timestamps[idx1];
+
+                    if (__builtin_popcountll(diff) == 1 && time_delta <= 1u) {
+                        equidistant_hits++;
+                    }
+                }
+
+                uint32_t new_threat = ctx->threat_level;
+                if (comparisons >= 7 && equidistant_hits > 6) {
+                    new_threat += 15;
+                } else if (new_threat > 0) {
+                    new_threat -= 1;
+                }
+                if (new_threat > 100) new_threat = 100;
+
+                if (new_threat >= QDD_THREAT_THRESHOLD) {
+                    qihse_rtm_xabort(0xfe);
+                }
+
+                ctx->threat_level = new_threat;
+                qihse_rtm_xend();
+                return;
+            }
+
+            if ((status & _XABORT_RETRY) || (status & _XABORT_CONFLICT)) {
+                _mm_pause();
+                retries--;
+            } else {
+                break;
+            }
+        }
+    }
+
+    qihse_tsx_wrlock(&ctx->lock);
+
+    if (accessor_ip) {
+        qihse_qdd_track_ip_threat(ctx, accessor_ip, now);
+    }
+
+    ctx->access_history[ctx->head] = target_id;
     ctx->access_timestamps[ctx->head] = now;
-    
     ctx->head = (ctx->head + 1) % QDD_HISTORY_SIZE;
     if (ctx->history_count < QDD_HISTORY_SIZE) ctx->history_count++;
-    
-    /* 
-     * Grover's Algorithm Detection Heuristic:
-     * Quantum parallel brute-force attacks often manifest as perfectly distributed,
-     * high-velocity state queries across orthogonal ID spaces.
-     * Here, we analyze the access variance using a Trinary differential.
-     */
+
     int equidistant_hits = 0;
     uint32_t comparisons = ctx->history_count > 1 ? ctx->history_count - 1 : 0;
     if (comparisons > 10) comparisons = 10;
     for (uint32_t i = 0; i < comparisons; i++) {
         uint32_t idx1 = (ctx->head - 1u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
         uint32_t idx2 = (ctx->head - 2u - i + QDD_HISTORY_SIZE) % QDD_HISTORY_SIZE;
-        
+
         uint64_t diff = ctx->access_history[idx1] ^ ctx->access_history[idx2];
         uint64_t time_delta = ctx->access_timestamps[idx1] >= ctx->access_timestamps[idx2]
                                   ? ctx->access_timestamps[idx1] - ctx->access_timestamps[idx2]
                                   : ctx->access_timestamps[idx2] - ctx->access_timestamps[idx1];
-        
-        /* If queries are exploring mathematically perfectly structured Hamming distances... */
+
         if (__builtin_popcountll(diff) == 1 && time_delta <= 1u) {
             equidistant_hits++;
         }
     }
-    
+
+    uint32_t level = ctx->threat_level;
     if (comparisons >= 7 && equidistant_hits > 6) {
-        ctx->threat_level += 15;
-    } else if (ctx->threat_level > 0) {
-        ctx->threat_level -= 1; // Decay
+        level += 15;
+    } else if (level > 0) {
+        level -= 1;
     }
-    
-    if (ctx->threat_level > 100) ctx->threat_level = 100;
-    
-    if (ctx->threat_level >= QDD_THREAT_THRESHOLD && !ctx->under_attack) {
+    if (level > 100) level = 100;
+    __atomic_store_n(&ctx->threat_level, level, __ATOMIC_RELEASE);
+
+    if (level >= QDD_THREAT_THRESHOLD && !ctx->under_attack) {
         char details[256];
-        snprintf(details, sizeof(details), "Threat level %u - Suspected Grover's Algorithm attack detected", ctx->threat_level);
+        snprintf(details, sizeof(details), "Threat level %u - Suspected Grover's Algorithm attack detected", level);
         qihse_qdd_audit_log("QUANTUM_ATTACK_DETECTED", details);
-        ctx->under_attack = true;
-    } else if (ctx->threat_level < (QDD_THREAT_THRESHOLD / 2) && ctx->under_attack) {
+        __atomic_store_n(&ctx->under_attack, true, __ATOMIC_RELEASE);
+    } else if (level < (QDD_THREAT_THRESHOLD / 2) && ctx->under_attack) {
         qihse_qdd_audit_log("THREAT_SUBSIDED", "Resuming classical operations");
-        ctx->under_attack = false;
+        __atomic_store_n(&ctx->under_attack, false, __ATOMIC_RELEASE);
     }
-    
-    pthread_mutex_unlock(&ctx->lock);
+
+    qihse_tsx_unlock(&ctx->lock);
 }
 
 bool qihse_qdd_is_under_attack(qihse_quantum_defense_ctx_t* ctx) {
     if (!ctx) return false;
-    pthread_mutex_lock(&ctx->lock);
-    bool attack = ctx->under_attack;
-    pthread_mutex_unlock(&ctx->lock);
-    return attack;
+    return __atomic_load_n(&ctx->under_attack, __ATOMIC_ACQUIRE);
 }
 
 /* Thread-local hardware randomness state for lock-free defense-in-depth entropy */
@@ -274,11 +388,43 @@ static inline uint64_t qihse_qdd_hardware_random_u64(void) {
         uint64_t tid = (uint64_t)(uintptr_t)pthread_self();
 #endif
         s ^= ((uint64_t)getpid() << 48) | tid;
+
+        if (qihse_qdd_has_rdseed()) {
+            unsigned long long rdseed_val = 0;
+            for (int retry = 0; retry < 32; retry++) {
+                if (_rdseed64_step(&rdseed_val)) {
+                    s ^= (uint64_t)rdseed_val;
+                    break;
+                }
+                _mm_pause();
+            }
+        }
+
         s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
         s ^= s >> 27; s *= 0x94d049bb133111ebULL;
         s ^= s >> 31;
         qihse_qdd_os_seed = s ? s : 0x853c49e6748fea9bULL;
         qihse_qdd_seeded = true;
+    }
+
+    uint64_t counter = ++qihse_qdd_rand_counter;
+
+    /* Re-seed thread-local state every 65,536 calls from RDSEED when available */
+    if (__builtin_expect((counter & 0xFFFFULL) == 0, 0)) {
+        if (qihse_qdd_has_rdseed()) {
+            unsigned long long rdseed_val = 0;
+            for (int retry = 0; retry < 32; retry++) {
+                if (_rdseed64_step(&rdseed_val)) {
+                    uint64_t s = qihse_qdd_os_seed ^ (uint64_t)rdseed_val;
+                    s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
+                    s ^= s >> 27; s *= 0x94d049bb133111ebULL;
+                    s ^= s >> 31;
+                    qihse_qdd_os_seed = s ? s : 0x853c49e6748fea9bULL;
+                    break;
+                }
+                _mm_pause();
+            }
+        }
     }
 
     unsigned long long rdrand_val = 0;
@@ -299,7 +445,6 @@ static inline uint64_t qihse_qdd_hardware_random_u64(void) {
 #endif
     }
 
-    uint64_t counter = ++qihse_qdd_rand_counter;
     uint64_t mixed_counter = counter * 0x9e3779b97f4a7c15ULL;
     uint64_t out = ((uint64_t)rdrand_val) ^ mixed_counter ^ qihse_qdd_os_seed;
     out ^= out >> 30;
@@ -396,10 +541,7 @@ void qihse_qdd_execute_active_measure(int attacker_fd) {
 
 uint32_t qihse_qdd_get_threat_level(qihse_quantum_defense_ctx_t* ctx) {
     if (!ctx) return 0;
-    pthread_mutex_lock(&ctx->lock);
-    uint32_t level = ctx->threat_level;
-    pthread_mutex_unlock(&ctx->lock);
-    return level;
+    return __atomic_load_n(&ctx->threat_level, __ATOMIC_ACQUIRE);
 }
 
 qihse_qdd_response_tier_t qihse_qdd_get_response_tier(qihse_quantum_defense_ctx_t* ctx) {
@@ -490,16 +632,16 @@ static bool qihse_qdd_geoip_lookup_ctx(qihse_quantum_defense_ctx_t* ctx,
 const char* qihse_qdd_get_threat_location(qihse_quantum_defense_ctx_t* ctx, const char* ip) {
     if (!ctx || !ip) return NULL;
     
-    pthread_mutex_lock(&ctx->lock);
+    qihse_tsx_rdlock(&ctx->lock);
     
     for (uint32_t i = 0; i < ctx->ip_threat_count; i++) {
         if (strcmp(ctx->ip_threats[i].ip, ip) == 0) {
             const char* country = ctx->ip_threats[i].country;
-            pthread_mutex_unlock(&ctx->lock);
+            qihse_tsx_unlock(&ctx->lock);
             return country;
         }
     }
     
-    pthread_mutex_unlock(&ctx->lock);
+    qihse_tsx_unlock(&ctx->lock);
     return NULL;
 }

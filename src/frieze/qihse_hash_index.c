@@ -6,6 +6,7 @@
  */
 #include "qihse_hash_index.h"
 #include "qihse_platform.h"
+#include "qihse_tsx_lock.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,7 @@ struct qihse_hash_index {
     size_t capacity;           /* number of slots */
     size_t count;              /* occupied (non-tombstone, non-empty) entries */
     size_t tombstones;         /* tombstone count */
-    pthread_rwlock_t lock;
+    qihse_tsx_rwlock_t lock;
 };
 
 /* ------------------------------------------------------------------ */
@@ -207,27 +208,26 @@ qihse_hash_index_t* qihse_hash_index_create(qihse_hash_key_type_t key_type,
     idx->key_type = key_type;
     size_t cap = initial_capacity ? next_pow2(initial_capacity) : 1024;
     if (!table_init(idx, cap)) { free(idx); return NULL; }
-    pthread_rwlock_init(&idx->lock, NULL);
+    qihse_tsx_rwlock_init(&idx->lock);
     return idx;
 }
 
 void qihse_hash_index_destroy(qihse_hash_index_t* idx) {
     if (!idx) return;
-    pthread_rwlock_wrlock(&idx->lock);
+    qihse_tsx_wrlock(&idx->lock);
     free(idx->table);
-    pthread_rwlock_unlock(&idx->lock);
-    pthread_rwlock_destroy(&idx->lock);
+    qihse_tsx_unlock(&idx->lock);
+    qihse_tsx_rwlock_destroy(&idx->lock);
     free(idx);
 }
 
-/* Internal insert assuming write lock held. Does NOT resize. */
+/* Internal insert assuming write lock or TSX transaction held. Does NOT resize. */
 static bool hash_insert_internal(qihse_hash_index_t* idx,
                                  const void* key, size_t key_len,
-                                 uint64_t row_id) {
+                                 uint64_t row_id, uint64_t h) {
     if (idx->key_type == QIHSE_HASH_KEY_INT64) key_len = 8;
     if (idx->key_type == QIHSE_HASH_KEY_STRING && key_len > 255) return false;
 
-    uint64_t h = hash_key(idx, key, key_len);
     size_t mask = idx->capacity - 1;
     size_t i = h & mask;
     size_t first_tomb = (size_t)-1;
@@ -264,20 +264,59 @@ bool qihse_hash_index_insert(qihse_hash_index_t* idx,
                              uint64_t row_id) {
     if (!idx || !key) return false;
     if (idx->key_type == QIHSE_HASH_KEY_INT64) key_len = 8;
+    if (idx->key_type == QIHSE_HASH_KEY_STRING && key_len > 255) return false;
 
-    pthread_rwlock_wrlock(&idx->lock);
+    /* Pre-compute AES-NI hash outside critical section */
+    uint64_t h = hash_key(idx, key, key_len);
+
+    /* Fast path: non-resizing insert when lf <= 0.7 wrapped in TSX elision */
+    double lf = (double)(idx->count + idx->tombstones + 1) / (double)idx->capacity;
+    if (lf <= 0.7 && qihse_has_rtm_support()) {
+        int retries = 3;
+        while (retries > 0) {
+            while (__atomic_load_n(&idx->lock.fallback_held, __ATOMIC_RELAXED) != 0) {
+                _mm_pause();
+            }
+
+            unsigned int status = qihse_rtm_xbegin();
+            if (status == _XBEGIN_STARTED) {
+                if (idx->lock.fallback_held != 0) {
+                    qihse_rtm_xabort(0xff);
+                }
+
+                double cur_lf = (double)(idx->count + idx->tombstones + 1) / (double)idx->capacity;
+                if (cur_lf > 0.7) {
+                    qihse_rtm_xabort(0xfe); /* Table filled up; abort to trigger resize on fallback */
+                }
+
+                bool ok = hash_insert_internal(idx, key, key_len, row_id, h);
+                qihse_rtm_xend();
+                return ok;
+            }
+
+            if ((status & _XABORT_RETRY) || (status & _XABORT_CONFLICT)) {
+                _mm_pause();
+                retries--;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /* Fallback / slow path: acquire write lock */
+    qihse_tsx_wrlock(&idx->lock);
 
     /* Check load factor: (count + tombstones) / capacity > 0.7 => resize. */
-    double lf = (double)(idx->count + idx->tombstones + 1) / (double)idx->capacity;
-    if (lf > 0.7) {
+    double cur_lf = (double)(idx->count + idx->tombstones + 1) / (double)idx->capacity;
+    if (cur_lf > 0.7) {
         if (!table_resize(idx, idx->capacity * 2)) {
-            pthread_rwlock_unlock(&idx->lock);
+            qihse_tsx_unlock(&idx->lock);
             return false;
         }
     }
 
-    bool ok = hash_insert_internal(idx, key, key_len, row_id);
-    pthread_rwlock_unlock(&idx->lock);
+    bool ok = hash_insert_internal(idx, key, key_len, row_id, h);
+    qihse_tsx_unlock(&idx->lock);
     return ok;
 }
 
@@ -287,8 +326,11 @@ bool qihse_hash_index_lookup(qihse_hash_index_t* idx,
     if (!idx || !key) return false;
     if (idx->key_type == QIHSE_HASH_KEY_INT64) key_len = 8;
 
-    pthread_rwlock_rdlock(&idx->lock);
+    /* Hoist hash_key OUTSIDE the lock so AES-NI hashing runs before entering critical section */
     uint64_t h = hash_key(idx, key, key_len);
+
+    /* Wrap the critical table search in qihse_tsx_rdlock() / qihse_tsx_unlock() */
+    qihse_tsx_rdlock(&idx->lock);
     size_t mask = idx->capacity - 1;
     size_t i = h & mask;
     bool found = false;
@@ -302,7 +344,7 @@ bool qihse_hash_index_lookup(qihse_hash_index_t* idx,
         }
         i = (i + 1) & mask;
     }
-    pthread_rwlock_unlock(&idx->lock);
+    qihse_tsx_unlock(&idx->lock);
     return found;
 }
 
@@ -312,8 +354,58 @@ bool qihse_hash_index_delete(qihse_hash_index_t* idx,
     if (!idx || !key) return false;
     if (idx->key_type == QIHSE_HASH_KEY_INT64) key_len = 8;
 
-    pthread_rwlock_wrlock(&idx->lock);
+    /* Hoist hash_key OUTSIDE the lock so AES-NI hashing runs before entering critical section */
     uint64_t h = hash_key(idx, key, key_len);
+
+    /* Fast path: non-resizing delete wrapped in TSX elision */
+    if (qihse_has_rtm_support() && (idx->tombstones + 1 <= idx->capacity / 4)) {
+        int retries = 3;
+        while (retries > 0) {
+            while (__atomic_load_n(&idx->lock.fallback_held, __ATOMIC_RELAXED) != 0) {
+                _mm_pause();
+            }
+
+            unsigned int status = qihse_rtm_xbegin();
+            if (status == _XBEGIN_STARTED) {
+                if (idx->lock.fallback_held != 0) {
+                    qihse_rtm_xabort(0xff);
+                }
+
+                size_t mask = idx->capacity - 1;
+                size_t i = h & mask;
+                bool found = false;
+                for (;;) {
+                    hash_slot_t* s = slot_at(idx, i);
+                    if (s->state == SLOT_EMPTY) break;
+                    if (s->state == SLOT_OCCUPIED && slot_key_match(s, key, key_len)) {
+                        if (row_id_out) *row_id_out = s->row_id;
+                        s->state = SLOT_TOMBSTONE;
+                        s->key_len = 0;
+                        idx->count--;
+                        idx->tombstones++;
+                        found = true;
+                        if (idx->tombstones > idx->capacity / 4) {
+                            qihse_rtm_xabort(0xfe); /* abort to purge tombstones via resize on fallback */
+                        }
+                        break;
+                    }
+                    i = (i + 1) & mask;
+                }
+                qihse_rtm_xend();
+                return found;
+            }
+
+            if ((status & _XABORT_RETRY) || (status & _XABORT_CONFLICT)) {
+                _mm_pause();
+                retries--;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /* Fallback path: acquire write lock */
+    qihse_tsx_wrlock(&idx->lock);
     size_t mask = idx->capacity - 1;
     size_t i = h & mask;
     bool found = false;
@@ -334,7 +426,7 @@ bool qihse_hash_index_delete(qihse_hash_index_t* idx,
         }
         i = (i + 1) & mask;
     }
-    pthread_rwlock_unlock(&idx->lock);
+    qihse_tsx_unlock(&idx->lock);
     return found;
 }
 
@@ -365,11 +457,11 @@ size_t qihse_hash_index_bytes(const qihse_hash_index_t* idx) {
 int qihse_hash_index_save(const qihse_hash_index_t* idx, const char* path) {
     if (!idx || !path) return -1;
 
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&idx->lock);
+    qihse_tsx_rdlock((qihse_tsx_rwlock_t*)&idx->lock);
 
     FILE* f = fopen(path, "wb");
     if (!f) {
-        pthread_rwlock_unlock((pthread_rwlock_t*)&idx->lock);
+        qihse_tsx_unlock((qihse_tsx_rwlock_t*)&idx->lock);
         return -1;
     }
 
@@ -391,7 +483,7 @@ int qihse_hash_index_save(const qihse_hash_index_t* idx, const char* path) {
     fwrite(idx->table, 1, total, f);
 
     fclose(f);
-    pthread_rwlock_unlock((pthread_rwlock_t*)&idx->lock);
+    qihse_tsx_unlock((qihse_tsx_rwlock_t*)&idx->lock);
     return 0;
 }
 
@@ -446,6 +538,6 @@ qihse_hash_index_t* qihse_hash_index_load(const char* path) {
     }
 
     fclose(f);
-    pthread_rwlock_init(&idx->lock, NULL);
+    qihse_tsx_rwlock_init(&idx->lock);
     return idx;
 }

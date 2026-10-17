@@ -28,6 +28,43 @@
 
 #include <immintrin.h>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#  if !defined(__RDSEED__)
+static inline int _rdseed64_step(unsigned long long *val) {
+    unsigned char ok;
+    __asm__ volatile("rdseed %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
+    return (int)ok;
+}
+#  endif
+#  if !defined(__FSGSBASE__)
+static inline unsigned long long _readfsbase_u64(void) {
+    unsigned long long val;
+    __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a"(val));
+    return val;
+}
+#  endif
+#endif
+
+static inline bool qihse_fed_has_rdseed(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached != -1, 1)) {
+        return cached == 1;
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    if (eax >= 7) {
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+        if (ebx & (1u << 18)) {
+            cached = 1;
+            return true;
+        }
+    }
+#endif
+    cached = 0;
+    return false;
+}
+
 /* Thread-local hardware randomness state for lock-free defense-in-depth entropy */
 static __thread uint64_t qihse_fed_rand_counter = 0;
 static __thread uint64_t qihse_fed_os_seed = 0;
@@ -44,11 +81,43 @@ static inline uint64_t qihse_fed_hardware_random_u64(void) {
         uint64_t tid = (uint64_t)(uintptr_t)pthread_self();
 #endif
         s ^= ((uint64_t)getpid() << 48) | tid;
+
+        if (qihse_fed_has_rdseed()) {
+            unsigned long long rdseed_val = 0;
+            for (int retry = 0; retry < 32; retry++) {
+                if (_rdseed64_step(&rdseed_val)) {
+                    s ^= (uint64_t)rdseed_val;
+                    break;
+                }
+                _mm_pause();
+            }
+        }
+
         s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
         s ^= s >> 27; s *= 0x94d049bb133111ebULL;
         s ^= s >> 31;
         qihse_fed_os_seed = s ? s : 0x853c49e6748fea9bULL;
         qihse_fed_seeded = true;
+    }
+
+    uint64_t counter = ++qihse_fed_rand_counter;
+
+    /* Re-seed thread-local state every 65,536 calls from RDSEED when available */
+    if (__builtin_expect((counter & 0xFFFFULL) == 0, 0)) {
+        if (qihse_fed_has_rdseed()) {
+            unsigned long long rdseed_val = 0;
+            for (int retry = 0; retry < 32; retry++) {
+                if (_rdseed64_step(&rdseed_val)) {
+                    uint64_t s = qihse_fed_os_seed ^ (uint64_t)rdseed_val;
+                    s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
+                    s ^= s >> 27; s *= 0x94d049bb133111ebULL;
+                    s ^= s >> 31;
+                    qihse_fed_os_seed = s ? s : 0x853c49e6748fea9bULL;
+                    break;
+                }
+                _mm_pause();
+            }
+        }
     }
 
     unsigned long long rdrand_val = 0;
@@ -69,7 +138,6 @@ static inline uint64_t qihse_fed_hardware_random_u64(void) {
 #endif
     }
 
-    uint64_t counter = ++qihse_fed_rand_counter;
     uint64_t mixed_counter = counter * 0x9e3779b97f4a7c15ULL;
     uint64_t out = ((uint64_t)rdrand_val) ^ mixed_counter ^ qihse_fed_os_seed;
     out ^= out >> 30;
