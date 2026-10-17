@@ -76,6 +76,10 @@ typedef struct {
     // Diagnostic counter: number of distance evaluations in the last search.
     uint64_t last_search_dist_calls;
     bool prebuilt;            // true when loaded from sidecar (skip rebuild)
+
+    // --- Dynamic precision tiering (F16C Layer 0 Storage) ---
+    uint16_t **layer0_fp16_vectors; // FP16 vectors for Layer 0
+    size_t layer0_fp16_capacity;    // capacity of layer0_fp16_vectors array
 } __attribute__((aligned(64))) qihse_hnsw_index_t;
 
 // Function prototypes

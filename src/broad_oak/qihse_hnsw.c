@@ -1,11 +1,16 @@
 #include "qihse_hnsw.h"
 #include "qihse_keystone.h"
+#include "backends/cpu/qihse_cpu_detect.h"
+#include "backends/cpu/qihse_cpu_distance.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #ifndef _WIN32
 #include <openssl/rand.h>
+#endif
+#ifdef __x86_64__
+#include <immintrin.h>
 #endif
 
 // Real distance function using user-provided callbacks
@@ -24,6 +29,103 @@ static float real_dist_n(qihse_hnsw_index_t *index, uint32_t n1, uint32_t n2) {
     if (!vec1 || !vec2) return 1e9f;
     index->last_search_dist_calls++;
     return index->params.distance_fn(vec1, vec2, index->params.dim);
+}
+
+/* Dynamic runtime F16C support detection */
+static bool hnsw_has_f16c(void) {
+    static int s_has_f16c = -1;
+    if (s_has_f16c < 0) {
+        qihse_cpu_info_t info = qihse_cpu_detect();
+        s_has_f16c = qihse_cpu_has_f16c(&info) ? 1 : 0;
+    }
+    return s_has_f16c == 1;
+}
+
+/* Convert FP32 floats to FP16 half-precision */
+static void float_to_fp16_array(const float *src, uint16_t *dst, size_t dim) {
+#if defined(__x86_64__) && (defined(__F16C__) || defined(QIHSE_ENABLE_F16C))
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m128i h = _mm256_cvtps_ph(v, 0);
+        _mm_storeu_si128((__m128i*)(dst + i), h);
+    }
+    if (i < dim) {
+        float tmp[8] = {0};
+        size_t rem = dim - i;
+        for (size_t r = 0; r < rem; r++) tmp[r] = src[i + r];
+        __m256 v = _mm256_loadu_ps(tmp);
+        __m128i h = _mm256_cvtps_ph(v, 0);
+        uint16_t h_tmp[8];
+        _mm_storeu_si128((__m128i*)h_tmp, h);
+        for (size_t r = 0; r < rem; r++) dst[i + r] = h_tmp[r];
+    }
+    _mm256_zeroupper();
+#else
+    for (size_t i = 0; i < dim; i++) {
+        union { float f; uint32_t u; } val;
+        val.f = src[i];
+        uint32_t sign = (val.u >> 16) & 0x8000;
+        int32_t exp = ((val.u >> 23) & 0xff) - 127 + 15;
+        uint32_t mant = val.u & 0x7fffff;
+        if (exp <= 0) {
+            dst[i] = (uint16_t)sign;
+        } else if (exp >= 31) {
+            dst[i] = (uint16_t)(sign | 0x7c00);
+        } else {
+            dst[i] = (uint16_t)(sign | (exp << 10) | (mant >> 13));
+        }
+    }
+#endif
+}
+
+static void store_layer0_fp16_vector(qihse_hnsw_index_t *index, uint32_t node_id, const float *vec, size_t dim) {
+    if (!index || !vec || dim == 0) return;
+    if (node_id >= index->layer0_fp16_capacity) {
+        size_t new_cap = node_id + 1;
+        if (new_cap < index->layer0_fp16_capacity * 2) new_cap = index->layer0_fp16_capacity * 2;
+        if (new_cap < 64) new_cap = 64;
+        uint16_t **new_vecs = (uint16_t**)realloc(index->layer0_fp16_vectors, new_cap * sizeof(uint16_t*));
+        if (!new_vecs) return;
+        for (size_t i = index->layer0_fp16_capacity; i < new_cap; i++) {
+            new_vecs[i] = NULL;
+        }
+        index->layer0_fp16_vectors = new_vecs;
+        index->layer0_fp16_capacity = new_cap;
+    }
+    if (!index->layer0_fp16_vectors[node_id]) {
+        index->layer0_fp16_vectors[node_id] = (uint16_t*)malloc(dim * sizeof(uint16_t));
+    }
+    if (!index->layer0_fp16_vectors[node_id]) return;
+    float_to_fp16_array(vec, index->layer0_fp16_vectors[node_id], dim);
+}
+
+static const uint16_t* get_layer0_fp16_vector(qihse_hnsw_index_t *index, uint32_t node_id) {
+    if (!index) return NULL;
+    if (index->layer0_fp16_vectors && node_id < index->layer0_fp16_capacity && index->layer0_fp16_vectors[node_id]) {
+        return index->layer0_fp16_vectors[node_id];
+    }
+    if (index->params.get_vector_fn) {
+        const float *fp32_vec = index->params.get_vector_fn(index->params.user_context, node_id);
+        if (fp32_vec) {
+            store_layer0_fp16_vector(index, node_id, fp32_vec, index->params.dim);
+            if (index->layer0_fp16_vectors && node_id < index->layer0_fp16_capacity) {
+                return index->layer0_fp16_vectors[node_id];
+            }
+        }
+    }
+    return NULL;
+}
+
+static inline float hnsw_node_dist(qihse_hnsw_index_t *index, const float *query, const uint16_t *query_fp16, uint32_t node, bool use_f16c) {
+    if (use_f16c) {
+        const uint16_t *fp16_vec = get_layer0_fp16_vector(index, node);
+        if (fp16_vec) {
+            index->last_search_dist_calls++;
+            return qihse_l2_sq_distance_f16c(query_fp16, fp16_vec, index->params.dim);
+        }
+    }
+    return real_dist_q(index, query, node);
 }
 
 typedef struct {
@@ -299,20 +401,40 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
     if (!index || level > index->max_level || level < 0 || ef <= 0 || !index->layers[level]) return;
     qihse_hnsw_layer_t *layer = index->layers[level];
 
+    bool use_f16c = (level == 0 && hnsw_has_f16c());
+    uint16_t *query_fp16 = NULL;
+    if (use_f16c) {
+        query_fp16 = (uint16_t*)malloc(index->params.dim * sizeof(uint16_t));
+        if (query_fp16) {
+            float_to_fp16_array(query, query_fp16, index->params.dim);
+        } else {
+            use_f16c = false;
+        }
+    }
+
+    size_t target_ef = (size_t)ef;
+    size_t ef_search_layer = target_ef;
+    if (use_f16c) {
+        /* Re-rank top-M (M = max(2*k, 64)) candidates against master FP32 vectors */
+        size_t M_prom = target_ef * 2;
+        if (M_prom < 64) M_prom = 64;
+        ef_search_layer = (target_ef > M_prom) ? target_ef : M_prom;
+    }
+
     visited_set_t *vset = visited_set_create();
-    if (!vset) return;
-    size_t cand_capacity = (size_t)ef * 10;
-    if (cand_capacity == 0) { visited_set_free(vset); return; }
+    if (!vset) { free(query_fp16); return; }
+    size_t cand_capacity = ef_search_layer * 10;
+    if (cand_capacity == 0) { free(query_fp16); visited_set_free(vset); return; }
     cand_t *cand_heap = (cand_t*)malloc(cand_capacity * sizeof(cand_t));
-    cand_t *top_heap = (cand_t*)malloc((size_t)ef * sizeof(cand_t));
+    cand_t *top_heap = (cand_t*)malloc(ef_search_layer * sizeof(cand_t));
     if (!cand_heap || !top_heap) {
-        free(cand_heap); free(top_heap); visited_set_free(vset); return;
+        free(cand_heap); free(top_heap); free(query_fp16); visited_set_free(vset); return;
     }
 
     size_t cand_count = 0;
     size_t top_count = 0;
 
-    float d = real_dist_q(index, query, ep);
+    float d = hnsw_node_dist(index, query, query_fp16, ep, use_f16c);
     min_heap_push(cand_heap, &cand_count, (cand_t){ep, d});
     max_heap_push(top_heap, &top_count, (cand_t){ep, d});
     mark_visited(vset, ep);
@@ -322,7 +444,7 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
         cand_t c = min_heap_pop(cand_heap, &cand_count);
 
         /* If the closest candidate is worse than the worst top result, stop */
-        if (top_count == (size_t)ef && c.dist > top_heap[0].dist) {
+        if (top_count == ef_search_layer && c.dist > top_heap[0].dist) {
             break;
         }
 
@@ -333,8 +455,20 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                 if (!is_visited(vset, e)) {
                     mark_visited(vset, e);
 
-                    float dist_e = real_dist_q(index, query, e);
-                    if (top_count < (size_t)ef || dist_e < top_heap[0].dist) {
+                    if (use_f16c) {
+                        const uint16_t *neighbor_vec = get_layer0_fp16_vector(index, e);
+                        if (neighbor_vec) {
+                            _mm_prefetch((const char*)neighbor_vec, _MM_HINT_T0);
+                        }
+                    } else if (index->params.get_vector_fn) {
+                        const float *neighbor_vec = index->params.get_vector_fn(index->params.user_context, e);
+                        if (neighbor_vec) {
+                            _mm_prefetch((const char*)neighbor_vec, _MM_HINT_T0);
+                        }
+                    }
+
+                    float dist_e = hnsw_node_dist(index, query, query_fp16, e, use_f16c);
+                    if (top_count < ef_search_layer || dist_e < top_heap[0].dist) {
                         if (cand_count >= cand_capacity) {
                             cand_capacity *= 2;
                             cand_t *new_cands = (cand_t*)realloc(cand_heap, cand_capacity * sizeof(cand_t));
@@ -343,7 +477,7 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                         }
                         min_heap_push(cand_heap, &cand_count, (cand_t){e, dist_e});
 
-                        if (top_count < (size_t)ef) {
+                        if (top_count < ef_search_layer) {
                             max_heap_push(top_heap, &top_count, (cand_t){e, dist_e});
                         } else {
                             /* Replace the max (worst) element — O(log n) instead of O(ef) */
@@ -355,21 +489,47 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
         }
     }
 
-    /* Extract all from top_heap, sort ascending for output */
-    cand_t *sorted = (cand_t*)malloc(top_count * sizeof(cand_t));
-    size_t sorted_count = 0;
-    while (top_count > 0) {
-        sorted[sorted_count++] = max_heap_pop(top_heap, &top_count);
-    }
-    /* Reverse to get ascending order (max-heap pops largest first) */
-    if (results && num_results) {
-        *num_results = sorted_count;
-        for (size_t i = 0; i < sorted_count; i++) {
-            results[i] = sorted[sorted_count - 1 - i].id;
+    if (use_f16c) {
+        /* Candidate Promotion: Re-rank the top candidates against master FP32 vectors */
+        cand_t *promoted = (cand_t*)malloc(top_count * sizeof(cand_t));
+        if (promoted) {
+            size_t num_promoted = 0;
+            while (top_count > 0) {
+                cand_t item = max_heap_pop(top_heap, &top_count);
+                /* Re-evaluate against master FP32 vectors for 100% exact recall */
+                item.dist = real_dist_q(index, query, item.id);
+                promoted[num_promoted++] = item;
+            }
+            qsort(promoted, num_promoted, sizeof(cand_t), compare_cand_asc);
+
+            size_t final_count = (num_promoted < target_ef) ? num_promoted : target_ef;
+            if (results && num_results) {
+                *num_results = final_count;
+                for (size_t i = 0; i < final_count; i++) {
+                    results[i] = promoted[i].id;
+                }
+            }
+            free(promoted);
+        }
+        free(query_fp16);
+    } else {
+        /* Standard extraction for upper layers or non-F16C fallback */
+        cand_t *sorted = (cand_t*)malloc(top_count * sizeof(cand_t));
+        if (sorted) {
+            size_t sorted_count = 0;
+            while (top_count > 0) {
+                sorted[sorted_count++] = max_heap_pop(top_heap, &top_count);
+            }
+            if (results && num_results) {
+                *num_results = sorted_count;
+                for (size_t i = 0; i < sorted_count; i++) {
+                    results[i] = sorted[sorted_count - 1 - i].id;
+                }
+            }
+            free(sorted);
         }
     }
 
-    free(sorted);
     visited_set_free(vset);
     free(cand_heap);
     free(top_heap);
@@ -378,6 +538,10 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
 void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vector, size_t dim) {
     (void)dim;
     if (!index) return;
+
+    if (hnsw_has_f16c() && vector) {
+        store_layer0_fp16_vector(index, node_id, vector, index->params.dim);
+    }
 
     /* Maintain the anchor projection table for Anchor-Guided Vector Proximity
      * Seeding. Registered up-front so every insert path (including the very
@@ -506,6 +670,14 @@ void hnsw_destroy(qihse_hnsw_index_t *index) {
         }
         free(index->layers);
     }
+    if (index->layer0_fp16_vectors) {
+        for (size_t i = 0; i < index->layer0_fp16_capacity; i++) {
+            free(index->layer0_fp16_vectors[i]);
+        }
+        free(index->layer0_fp16_vectors);
+        index->layer0_fp16_vectors = NULL;
+        index->layer0_fp16_capacity = 0;
+    }
     qihse_hnsw_anchor_destroy(index);
     free(index);
 }
@@ -526,6 +698,14 @@ size_t qihse_hnsw_index_bytes(const qihse_hnsw_index_t *index) {
                 if (!links) continue;
                 total += sizeof(*links);
                 total += (size_t)links->capacity * sizeof(uint32_t);
+            }
+        }
+    }
+    if (index->layer0_fp16_vectors) {
+        total += index->layer0_fp16_capacity * sizeof(uint16_t*);
+        for (size_t i = 0; i < index->layer0_fp16_capacity; i++) {
+            if (index->layer0_fp16_vectors[i]) {
+                total += index->params.dim * sizeof(uint16_t);
             }
         }
     }
