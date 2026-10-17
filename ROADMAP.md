@@ -1,7 +1,7 @@
 # QIHSE Roadmap
 
 **Status date:** 2026-10-12
-**License:** first-party QIHSE code uses SRSL-1.0; vendored and other third-party components retain their own applicable licenses.
+**License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded

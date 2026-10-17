@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LicenseRef-SRSL-1.0 */
+/* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 /*
  * QIHSE CodeGraph v1: offline, durable, structural-code graph CLI.
  * CRG supplies canonical, evidence-tagged JSONL. QIHSE KV owns snapshot

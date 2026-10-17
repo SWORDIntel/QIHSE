@@ -15,7 +15,7 @@
  * /opt/qihse/keys, then ./keys — so the keygen is safe to invoke with no
  * args from any working directory (e.g. from a container).
  *
- * SPDX-License-Identifier: LicenseRef-SRSL-1.0
+ * SPDX-License-Identifier: LicenseRef-SRSL-1.1
  */
 
 #include "../persistence/qihse_pqc_crypto.h"

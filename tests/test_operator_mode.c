@@ -13,7 +13,7 @@
  * Build: make tests/test_operator_mode
  * Run:   LD_LIBRARY_PATH=. ./tests/test_operator_mode
  *
- * SPDX-License-Identifier: LicenseRef-SRSL-1.0
+ * SPDX-License-Identifier: LicenseRef-SRSL-1.1
  */
 
 #define _GNU_SOURCE /* unsetenv */

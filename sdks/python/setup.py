@@ -25,7 +25,7 @@ qihse_ext = Extension(
 setup(
     name='qihse',
     version='1.0.0',
-    license='SWORD Restricted Source Licence (SRSL-1.0)',
+    license='SWORD Restricted Source Licence (SRSL-1.1)',
     description='Native Python C-Bindings for QIHSE',
     ext_modules=[qihse_ext],
 )

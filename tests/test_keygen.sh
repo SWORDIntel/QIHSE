@@ -12,7 +12,7 @@
 #
 # Run: bash tests/test_keygen.sh
 #
-# SPDX-License-Identifier: LicenseRef-SRSL-1.0
+# SPDX-License-Identifier: LicenseRef-SRSL-1.1
 
 set -euo pipefail
 
