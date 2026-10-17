@@ -33,6 +33,24 @@ static inline unsigned long long _readfsbase_u64(void) {
 #  endif
 #endif
 
+static inline bool qihse_qdd_has_fsgsbase(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached != -1, 1)) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    if (eax >= 7) {
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+        if (ebx & (1u << 0)) {
+            cached = 1;
+            return true;
+        }
+    }
+#endif
+    cached = 0;
+    return false;
+}
+
 static inline bool qihse_qdd_has_rdseed(void) {
     static int cached = -1;
     if (__builtin_expect(cached != -1, 1)) {
@@ -382,10 +400,15 @@ static inline uint64_t qihse_qdd_hardware_random_u64(void) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t s = (uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32) ^ (uint64_t)(uintptr_t)&ts;
-#if defined(__x86_64__) && (defined(__FSGSBASE__) || defined(QIHSE_ENABLE_FSGSBASE))
-        uint64_t tid = _readfsbase_u64();
+        uint64_t tid;
+#if defined(__x86_64__) || defined(_M_X64)
+        if (qihse_qdd_has_fsgsbase()) {
+            tid = _readfsbase_u64();
+        } else {
+            tid = (uint64_t)(uintptr_t)pthread_self();
+        }
 #else
-        uint64_t tid = (uint64_t)(uintptr_t)pthread_self();
+        tid = (uint64_t)(uintptr_t)pthread_self();
 #endif
         s ^= ((uint64_t)getpid() << 48) | tid;
 

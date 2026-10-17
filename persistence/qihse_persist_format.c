@@ -89,10 +89,27 @@ static uint32_t crc32c_soft(const void* data, size_t size) {
  * where shift(n, crc) = process n zero bytes starting from state crc.
  */
 
-/* Apply a 32x32 GF(2) matrix to a CRC state using tzcnt and blsr for fast non-zero bit scan */
+static inline bool qihse_has_bmi1(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached != -1, 1)) return cached == 1;
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    if (eax >= 7) {
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+        if (ebx & (1u << 3)) {
+            cached = 1;
+            return true;
+        }
+    }
+#endif
+    cached = 0;
+    return false;
+}
+
 #if defined(__x86_64__) && defined(__GNUC__)
 __attribute__((target("bmi")))
-static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
+static inline uint32_t apply_matrix_bmi(const uint32_t mat[32], uint32_t crc) {
     uint32_t result = 0;
     while (crc) {
         uint32_t i = _tzcnt_u32(crc);
@@ -101,8 +118,9 @@ static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
     }
     return result;
 }
-#else
-static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
+#endif
+
+static inline uint32_t apply_matrix_scalar(const uint32_t mat[32], uint32_t crc) {
     uint32_t result = 0;
     while (crc) {
         int i = __builtin_ctz(crc);
@@ -111,7 +129,16 @@ static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
     }
     return result;
 }
+
+/* Apply a 32x32 GF(2) matrix to a CRC state with dynamic BMI1 acceleration and scalar fallback */
+static inline uint32_t apply_matrix(const uint32_t mat[32], uint32_t crc) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    if (qihse_has_bmi1()) {
+        return apply_matrix_bmi(mat, crc);
+    }
 #endif
+    return apply_matrix_scalar(mat, crc);
+}
 
 /* Compose two 32x32 GF(2) matrices: result = A ∘ B (apply B first, then A) */
 static void compose_matrix(uint32_t out[32], const uint32_t a[32], const uint32_t b[32]) {

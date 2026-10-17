@@ -19,40 +19,6 @@ extern "C" {
  * ensuring strict alignment safety and auto-vectorization across all architectures.
  */
 
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__MOVBE__) || defined(__movbe__))
-
-static inline uint16_t qihse_load_be16(const void* ptr) {
-    uint16_t val;
-    __asm__ ("movbew %1, %0" : "=r"(val) : "m"(*(const uint16_t*)ptr));
-    return val;
-}
-
-static inline uint32_t qihse_load_be32(const void* ptr) {
-    uint32_t val;
-    __asm__ ("movbel %1, %0" : "=r"(val) : "m"(*(const uint32_t*)ptr));
-    return val;
-}
-
-static inline uint64_t qihse_load_be64(const void* ptr) {
-    uint64_t val;
-    __asm__ ("movbeq %1, %0" : "=r"(val) : "m"(*(const uint64_t*)ptr));
-    return val;
-}
-
-static inline void qihse_store_be16(void* ptr, uint16_t val) {
-    __asm__ ("movbew %1, %0" : "=m"(*(uint16_t*)ptr) : "r"(val));
-}
-
-static inline void qihse_store_be32(void* ptr, uint32_t val) {
-    __asm__ ("movbel %1, %0" : "=m"(*(uint32_t*)ptr) : "r"(val));
-}
-
-static inline void qihse_store_be64(void* ptr, uint64_t val) {
-    __asm__ ("movbeq %1, %0" : "=m"(*(uint64_t*)ptr) : "r"(val));
-}
-
-#else
-
 static inline uint16_t qihse_load_be16(const void* ptr) {
     uint16_t v;
     memcpy(&v, ptr, sizeof(v));
@@ -85,8 +51,6 @@ static inline void qihse_store_be64(void* ptr, uint64_t val) {
     uint64_t s = __builtin_bswap64(val);
     memcpy(ptr, &s, sizeof(s));
 }
-
-#endif
 
 /* Standard intrinsic aliases for MOVBE compatibility */
 #ifndef _loadbe_i16

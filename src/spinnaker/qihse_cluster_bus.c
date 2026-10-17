@@ -306,6 +306,7 @@ static inline void qihse_bus_keystream_xor_block(uint8_t* dst, const uint8_t* sr
         i += 16;
     }
     for (; i < n; i++) dst[i] ^= src[i];
+    _mm256_zeroupper();
 }
 #else
 __attribute__((target("avx2")))
@@ -324,6 +325,7 @@ static void qihse_bus_keystream_xor_block_avx2(uint8_t* dst, const uint8_t* src,
         i += 16;
     }
     for (; i < n; i++) dst[i] ^= src[i];
+    _mm256_zeroupper();
 }
 
 static void qihse_bus_keystream_xor_block_sse2(uint8_t* dst, const uint8_t* src, size_t n) {

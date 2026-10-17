@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "backends/cpu/qihse_cpu_distance.h"
 #include <math.h>
 #include <pthread.h>
