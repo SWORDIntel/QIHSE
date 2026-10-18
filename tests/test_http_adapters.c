@@ -113,9 +113,9 @@ int main(void) {
             if (strstr(response, "\r\n")) break;
         }
         assert(received > 0);
-        if (resp_status(response) != 200)
+        if (resp_status(response) != 204)
             fprintf(stderr, "split-header response: %s\n", response);
-        assert(resp_status(response) == 200);
+        assert(resp_status(response) == 204);
         close(fd);
     }
 

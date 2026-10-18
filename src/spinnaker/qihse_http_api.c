@@ -95,6 +95,11 @@ static void send_response(int fd, const http_response_t* res) {
     switch (res->status_code) {
         case 200: status_text = "OK"; break;
         case 201: status_text = "Created"; break;
+        case 204: status_text = "No Content"; break;
+        case 401: status_text = "Unauthorized"; break;
+        case 403: status_text = "Forbidden"; break;
+        case 413: status_text = "Content Too Large"; break;
+        case 501: status_text = "Not Implemented"; break;
         case 400: status_text = "Bad Request"; break;
         case 404: status_text = "Not Found"; break;
         case 405: status_text = "Method Not Allowed"; break;
