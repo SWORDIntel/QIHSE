@@ -50,6 +50,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
@@ -93,6 +95,15 @@ typedef struct {
     int protocol_version;
     bool asking;
     bool readonly;
+    FILE* artifact_file;
+    uint64_t artifact_size, artifact_received;
+    uint8_t artifact_hash[QIHSE_BLOB_HASH_BYTES];
+    uint32_t artifact_tenant;
+    uint16_t artifact_classification, artifact_sci;
+    qihse_user_t* artifact_user;
+    struct timeval artifact_old_recv_timeout;
+    bool artifact_recv_timeout_saved;
+    struct timespec artifact_started;
     char name[128];
     /* F2: per-session federation watch handles. */
     qihse_federation_watch_t* federation_watches[QIHSE_RESP_MAX_WATCHES];
@@ -356,6 +367,11 @@ struct qihse_resp_server {
     qihse_quota_table_t* quotas;
     /* U3 session-bundle delivery */
     qihse_blob_store_t* blobs;
+    bool enable_artifact_uploads;
+    char artifact_staging_dir[512];
+    size_t active_artifact_uploads; /* state_lock */
+    qihse_vector_db_t forensic_vdb;
+    pthread_mutex_t forensic_lock;
     qihse_consensus_mesh_t* consensus_mesh;
     qihse_consensus_blob_context_t* consensus_blob_context;
     bool consensus_allow_client_proposals;
@@ -6297,6 +6313,283 @@ static bool qihse_resp_handle_bundle_prepare(qihse_resp_session_t* session, cons
     return ok;
 }
 
+/* The forensic VDB is never exposed through generic VEC commands. */
+static bool qihse_resp_artifact_hash_arg(const qihse_resp_arg_t* arg,
+                                         uint8_t hash[QIHSE_BLOB_HASH_BYTES]);
+static bool qihse_resp_handle_forensic(qihse_resp_session_t* session,
+                                       const qihse_resp_request_t* request) {
+    qihse_resp_server_t* server = session->server;
+    if (!server->forensic_vdb || !server->blobs || !server->enable_artifact_uploads)
+        return qihse_resp_error(session, "ERR forensic index is disabled");
+    if (!session->user || session->user == &session->peer_claims ||
+        !qihse_auth_user_is_active(session->user) ||
+        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+        return qihse_resp_error(session, "NOPERM forensic index requires system operator");
+    if (!session->qkp && !qihse_resp_is_loopback(server->bind_address))
+        return qihse_resp_error(session, "NOPERM forensic index requires a sealed connection");
+    if (qihse_resp_command_is(request, "FORENSIC.SET")) {
+        if (request->argc != 6) return qihse_resp_wrong_arity(session, "forensic.set");
+        uint64_t id, offset, length;
+        uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+        qihse_blob_info_t info;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &id) ||
+            !qihse_resp_artifact_hash_arg(&request->argv[2], hash) ||
+            !qihse_resp_parse_u64_arg(&request->argv[3], &offset) ||
+            !qihse_resp_parse_u64_arg(&request->argv[4], &length) ||
+            request->argv[5].len != 1024u * sizeof(float) ||
+            !qihse_blob_info_user(server->blobs, hash, &info, session->user) ||
+            info.tag != QIHSE_BLOB_TAG_DUMP_ARTIFACT || offset > info.size ||
+            length > info.size - offset)
+            return qihse_resp_error(session, "ERR invalid forensic artifact reference");
+        float vector[1024];
+        memcpy(vector, request->argv[5].data, sizeof(vector));
+        double norm = 0.0;
+        for (size_t i = 0; i < 1024u; i++) {
+            if (!isfinite(vector[i])) return qihse_resp_error(session, "ERR non-finite vector");
+            norm += (double)vector[i] * vector[i];
+        }
+        if (norm < 0.95 || norm > 1.05)
+            return qihse_resp_error(session, "ERR vector must be normalized");
+        char hex[QIHSE_BLOB_HASH_HEX], metadata[256];
+        qihse_blob_hash_to_hex(hash, hex);
+        int n = snprintf(metadata, sizeof(metadata), "%s:%" PRIu64 ":%" PRIu64 ":%u:%u:%u:bge-large-en-v1.5",
+                         hex, offset, length, info.tenant_id, info.classification,
+                         info.sci_compartment);
+        if (n <= 0 || (size_t)n >= sizeof(metadata))
+            return qihse_resp_error(session, "ERR forensic metadata too long");
+        const void* metas[1] = {metadata};
+        size_t sizes[1] = {(size_t)n};
+        pthread_mutex_lock(&server->forensic_lock);
+        bool ok = qihse_vector_db_upsert_by_ids(server->forensic_vdb, &id, vector,
+                           1u, 1024u, metas, sizes, NULL, NULL) &&
+                  qihse_vector_db_flush(server->forensic_vdb);
+        pthread_mutex_unlock(&server->forensic_lock);
+        return ok ? qihse_resp_simple(session, "OK") :
+                    qihse_resp_error(session, "ERR forensic vector publication failed");
+    }
+    if (qihse_resp_command_is(request, "FORENSIC.SEARCH")) {
+        uint64_t top;
+        if (request->argc != 3) return qihse_resp_wrong_arity(session, "forensic.search");
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &top) || top == 0 || top > 32u ||
+            request->argv[2].len != 1024u * sizeof(float))
+            return qihse_resp_error(session, "ERR invalid forensic query");
+        float vector[1024];
+        memcpy(vector, request->argv[2].data, sizeof(vector));
+        double norm = 0.0;
+        for (size_t i = 0; i < 1024u; i++) {
+            if (!isfinite(vector[i])) return qihse_resp_error(session, "ERR non-finite vector");
+            norm += (double)vector[i] * vector[i];
+        }
+        if (norm < 0.95 || norm > 1.05)
+            return qihse_resp_error(session, "ERR vector must be normalized");
+        qihse_vector_result_t results[32] = {{0}};
+        qihse_vector_query_t query = {0};
+        query.query_vector = vector;
+        query.vector_dims = 1024u;
+        query.top_k = (size_t)top;
+        query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
+        query.include_metadata = true;
+        query.user = session->user;
+        pthread_mutex_lock(&server->forensic_lock);
+        int count = qihse_vector_db_search(server->forensic_vdb, &query, results, (size_t)top);
+        pthread_mutex_unlock(&server->forensic_lock);
+        if (count < 0) return qihse_resp_error(session, "ERR forensic search failed");
+        bool ok = qihse_resp_array(session, (size_t)count);
+        for (int i = 0; i < count; i++) {
+            char id[32];
+            snprintf(id, sizeof(id), "%" PRIu64, results[i].id);
+            if (ok) ok = qihse_resp_array(session, 3u) &&
+                          qihse_resp_bulk_text(session, id) &&
+                          qihse_resp_reply_double(session, results[i].score) &&
+                          qihse_resp_bulk(session, results[i].metadata, results[i].metadata_size);
+            free(results[i].metadata);
+            free(results[i].vector);
+        }
+        return ok;
+    }
+    return qihse_resp_error(session, "ERR unknown forensic command");
+}
+
+/* One unlinked private staging file per session; never trust a client path. */
+static void qihse_resp_artifact_abort(qihse_resp_session_t* session) {
+    if (!session->artifact_file) return;
+    fclose(session->artifact_file);
+    session->artifact_file = NULL;
+    if (session->artifact_recv_timeout_saved)
+        (void)setsockopt(session->fd, SOL_SOCKET, SO_RCVTIMEO,
+                         &session->artifact_old_recv_timeout,
+                         sizeof(session->artifact_old_recv_timeout));
+    session->artifact_recv_timeout_saved = false;
+    session->artifact_user = NULL;
+    session->artifact_received = 0;
+    pthread_mutex_lock(&session->server->state_lock);
+    session->server->active_artifact_uploads--;
+    pthread_mutex_unlock(&session->server->state_lock);
+}
+
+static bool qihse_resp_artifact_hash_arg(const qihse_resp_arg_t* arg,
+                                         uint8_t hash[QIHSE_BLOB_HASH_BYTES]) {
+    if (arg->len != QIHSE_BLOB_HASH_HEX - 1u) return false;
+    char hex[QIHSE_BLOB_HASH_HEX];
+    memcpy(hex, arg->data, arg->len);
+    hex[arg->len] = '\0';
+    return qihse_blob_hash_from_hex(hex, hash);
+}
+
+static int64_t qihse_resp_artifact_read(void* opaque, uint8_t* buffer, size_t cap) {
+    FILE* file = opaque;
+    size_t got = fread(buffer, 1, cap, file);
+    return got || !ferror(file) ? (int64_t)got : -1;
+}
+
+static bool qihse_resp_handle_artifact(qihse_resp_session_t* session,
+                                       const qihse_resp_request_t* request) {
+    qihse_resp_server_t* server = session->server;
+    if (!server->enable_artifact_uploads || !server->blobs || session->fd < 0)
+        return qihse_resp_error(session, "ERR artifact upload is disabled");
+    if (!session->user || session->user == &session->peer_claims ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH active local principal required");
+    if (!session->qkp && !qihse_resp_is_loopback(server->bind_address))
+        return qihse_resp_error(session, "NOPERM artifact transfer requires a sealed connection");
+
+    if (qihse_resp_command_is(request, "ARTIFACT.BEGIN")) {
+        uint64_t tenant, classification, sci, size;
+        uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+        if (request->argc != 6) return qihse_resp_wrong_arity(session, "artifact.begin");
+        if (session->artifact_file) return qihse_resp_error(session, "ERR upload already active");
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &tenant) || tenant > UINT32_MAX ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &classification) || classification > UINT16_MAX ||
+            !qihse_resp_parse_u64_arg(&request->argv[3], &sci) || sci > UINT16_MAX ||
+            !qihse_resp_parse_u64_arg(&request->argv[4], &size) || size > QIHSE_BLOB_ARTIFACT_MAX_SIZE ||
+            !qihse_resp_artifact_hash_arg(&request->argv[5], hash))
+            return qihse_resp_error(session, "ERR invalid artifact declaration");
+        /* No tenant-wide disk quota exists yet: only the system operator may
+         * commit large artifacts, including ones bound to another tenant. */
+        if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+            qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+            !qihse_auth_can_access(session->user, (uint16_t)classification, (uint16_t)sci))
+            return qihse_resp_error(session, "NOPERM artifact write denied");
+        pthread_mutex_lock(&server->state_lock);
+        if (server->active_artifact_uploads >= 4u) {
+            pthread_mutex_unlock(&server->state_lock);
+            return qihse_resp_error(session, "BUSY artifact upload capacity reached");
+        }
+        server->active_artifact_uploads++;
+        pthread_mutex_unlock(&server->state_lock);
+        socklen_t timeout_len = sizeof(session->artifact_old_recv_timeout);
+        struct timeval idle_timeout = {.tv_sec = 60};
+        if (getsockopt(session->fd, SOL_SOCKET, SO_RCVTIMEO,
+                       &session->artifact_old_recv_timeout, &timeout_len) != 0 ||
+            timeout_len != sizeof(session->artifact_old_recv_timeout))
+            goto begin_failed;
+        session->artifact_recv_timeout_saved = true;
+        if (setsockopt(session->fd, SOL_SOCKET, SO_RCVTIMEO,
+                       &idle_timeout, sizeof(idle_timeout)) != 0) goto begin_failed;
+        char path[sizeof(server->artifact_staging_dir) + 32u];
+        snprintf(path, sizeof(path), "%s/upload-XXXXXX", server->artifact_staging_dir);
+        int fd = mkstemp(path);
+        if (fd < 0) goto begin_failed;
+        if (unlink(path) != 0) { close(fd); goto begin_failed; }
+        session->artifact_file = fdopen(fd, "w+b");
+        if (!session->artifact_file) { close(fd); goto begin_failed; }
+        session->artifact_tenant = (uint32_t)tenant;
+        session->artifact_classification = (uint16_t)classification;
+        session->artifact_sci = (uint16_t)sci;
+        session->artifact_size = size;
+        session->artifact_received = 0;
+        session->artifact_user = session->user;
+        clock_gettime(CLOCK_MONOTONIC, &session->artifact_started);
+        memcpy(session->artifact_hash, hash, sizeof(hash));
+        return qihse_resp_simple(session, "OK");
+begin_failed:
+        if (session->artifact_recv_timeout_saved)
+            (void)setsockopt(session->fd, SOL_SOCKET, SO_RCVTIMEO,
+                             &session->artifact_old_recv_timeout,
+                             sizeof(session->artifact_old_recv_timeout));
+        session->artifact_recv_timeout_saved = false;
+        pthread_mutex_lock(&server->state_lock);
+        server->active_artifact_uploads--;
+        pthread_mutex_unlock(&server->state_lock);
+        return qihse_resp_error(session, "ERR artifact staging failed");
+    }
+    if (qihse_resp_command_is(request, "ARTIFACT.ABORT")) {
+        if (request->argc != 1) return qihse_resp_wrong_arity(session, "artifact.abort");
+        qihse_resp_artifact_abort(session);
+        return qihse_resp_simple(session, "OK");
+    }
+    if (qihse_resp_command_is(request, "ARTIFACT.CHUNK") ||
+        qihse_resp_command_is(request, "ARTIFACT.COMMIT")) {
+        if (!session->artifact_file) return qihse_resp_error(session, "ERR no active artifact upload");
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec - session->artifact_started.tv_sec >= 3600) {
+            qihse_resp_artifact_abort(session);
+            return qihse_resp_error(session, "ERR artifact upload deadline exceeded");
+        }
+        if (session->artifact_user != session->user) {
+            qihse_resp_artifact_abort(session);
+            return qihse_resp_error(session, "NOPERM upload principal changed");
+        }
+        if (qihse_resp_command_is(request, "ARTIFACT.CHUNK")) {
+            uint64_t offset;
+            if (request->argc != 3) return qihse_resp_wrong_arity(session, "artifact.chunk");
+            if (!qihse_resp_parse_u64_arg(&request->argv[1], &offset) ||
+                offset != session->artifact_received ||
+                request->argv[2].len > QIHSE_BLOB_CHUNK_SIZE ||
+                request->argv[2].len > session->artifact_size - session->artifact_received)
+                return qihse_resp_error(session, "ERR invalid artifact chunk");
+            if (fwrite(request->argv[2].data, 1, request->argv[2].len,
+                       session->artifact_file) != request->argv[2].len) {
+                qihse_resp_artifact_abort(session);
+                return qihse_resp_error(session, "ERR artifact staging failed");
+            }
+            session->artifact_received += request->argv[2].len;
+            return qihse_resp_integer(session, (int64_t)session->artifact_received);
+        }
+        if (request->argc != 1) return qihse_resp_wrong_arity(session, "artifact.commit");
+        if (session->artifact_received != session->artifact_size)
+            return qihse_resp_error(session, "ERR incomplete artifact upload");
+        bool ok = fflush(session->artifact_file) == 0 &&
+                  fseeko(session->artifact_file, 0, SEEK_SET) == 0 &&
+                  qihse_blob_put_expected_user(server->blobs, session->artifact_tenant,
+                      QIHSE_BLOB_TAG_DUMP_ARTIFACT, session->artifact_classification,
+                      session->artifact_sci, session->user, qihse_resp_artifact_read,
+                      session->artifact_file, session->artifact_hash, session->artifact_size);
+        char hex[QIHSE_BLOB_HASH_HEX];
+        if (ok) qihse_blob_hash_to_hex(session->artifact_hash, hex);
+        qihse_resp_artifact_abort(session);
+        return ok ? qihse_resp_bulk_text(session, hex) :
+                    qihse_resp_error(session, "ERR artifact verification or publication failed");
+    }
+    if (qihse_resp_command_is(request, "ARTIFACT.GET")) {
+        if (request->argc != 4) return qihse_resp_wrong_arity(session, "artifact.get");
+        uint64_t offset, length;
+        uint8_t hash[QIHSE_BLOB_HASH_BYTES];
+        qihse_blob_info_t info;
+        if (!qihse_resp_artifact_hash_arg(&request->argv[1], hash) ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &offset) ||
+            !qihse_resp_parse_u64_arg(&request->argv[3], &length) ||
+            length > QIHSE_BLOB_CHUNK_SIZE)
+            return qihse_resp_error(session, "ERR invalid artifact range");
+        if (!qihse_blob_info_user(server->blobs, hash, &info, session->user) ||
+            info.tag != QIHSE_BLOB_TAG_DUMP_ARTIFACT ||
+            offset > info.size || length > info.size - offset)
+            return qihse_resp_error(session, "ERR artifact read denied");
+        if (length == 0) return qihse_resp_bulk(session, "", 0);
+        uint8_t* data = malloc((size_t)length);
+        if (!data) return qihse_resp_error(session, "OOM out of memory");
+        size_t nread = 0;
+        bool ok = qihse_blob_get_user(server->blobs, hash, offset, data,
+                                       (size_t)length, &nread, session->user) && nread == length;
+        if (ok) ok = qihse_resp_bulk(session, data, nread);
+        free(data);
+        return ok ? true : qihse_resp_error(session, "ERR artifact read denied");
+    }
+    return qihse_resp_error(session, "ERR unknown artifact command");
+}
+
 static bool qihse_resp_handle_bundle_chunk(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (!session->server->blobs) return qihse_resp_error(session, "ERR bundle delivery is not configured on this server");
     if (request->argc != 3) return qihse_resp_wrong_arity(session, "bundle.chunk");
@@ -11634,6 +11927,11 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     }
     /* U2 per-tenant quota enforcement (ann queries, ingest, kv writes) */
     if (!qihse_resp_tenant_quota(session, request, session_tenant)) return true;
+    /* Upload files are session state, never a MULTI side effect. */
+    if (session->in_multi && request->argv[0].len >= 9u &&
+        (strncasecmp((const char*)request->argv[0].data, "ARTIFACT.", 9u) == 0 ||
+         strncasecmp((const char*)request->argv[0].data, "FORENSIC.", 9u) == 0))
+        return qihse_resp_error(session, "ERR artifact transfer is not allowed in MULTI");
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
         !(dispatch_entry && (dispatch_entry->flags & DSP_MULTI_OK))) {
@@ -11715,6 +12013,12 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     /* U3 session-bundle delivery */
     if (qihse_resp_command_is(request, "BUNDLE.PREPARE")) return qihse_resp_handle_bundle_prepare(session, request);
     if (qihse_resp_command_is(request, "BUNDLE.CHUNK")) return qihse_resp_handle_bundle_chunk(session, request);
+    if (request->argv[0].len >= 9u &&
+        strncasecmp((const char*)request->argv[0].data, "ARTIFACT.", 9u) == 0)
+        return qihse_resp_handle_artifact(session, request);
+    if (request->argv[0].len >= 9u &&
+        strncasecmp((const char*)request->argv[0].data, "FORENSIC.", 9u) == 0)
+        return qihse_resp_handle_forensic(session, request);
 
     /* KEYSTONE Ingestion and Semantic Extensions (Cluster Scoped) */
     if (qihse_resp_command_is(request, "KEYSTONE.INGEST")) return qihse_resp_handle_keystone_ingest(session, request);
@@ -11841,6 +12145,14 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     bool keep_open = true;
     bool successful = true;
     while (keep_open && __atomic_load_n(&server->running, __ATOMIC_ACQUIRE)) {
+        if (session.artifact_file) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                now.tv_sec - session.artifact_started.tv_sec >= 3600) {
+                successful = false;
+                break;
+            }
+        }
         size_t offset = 0;
         while (offset < used) {
             qihse_resp_request_t request;
@@ -11931,6 +12243,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         }
         used += (size_t)received;
     }
+    qihse_resp_artifact_abort(&session);
     qihse_resp_session_pubsub_cleanup(&session);
     qihse_kv_replica_snapshot_destroy(session.repl_snapshot);
     session.repl_snapshot = NULL;
@@ -12145,6 +12458,18 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         errno = EACCES;
         return NULL;
     }
+    if (supplied->enable_artifact_uploads) {
+        struct stat staging;
+        if (!supplied->auth_required || !supplied->blobs ||
+            !supplied->artifact_staging_dir ||
+            strlen(supplied->artifact_staging_dir) >= sizeof(((qihse_resp_server_t*)0)->artifact_staging_dir) - 32u ||
+            lstat(supplied->artifact_staging_dir, &staging) != 0 ||
+            !S_ISDIR(staging.st_mode) || staging.st_uid != geteuid() ||
+            (staging.st_mode & 077u) != 0u) {
+            errno = EACCES;
+            return NULL;
+        }
+    }
     qihse_resp_server_t* server = (qihse_resp_server_t*)calloc(1, sizeof(*server));
     if (!server) return NULL;
     server->store = supplied->store;
@@ -12169,6 +12494,11 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->enable_uwp_bridge = supplied->enable_uwp_bridge;
     server->quotas = supplied->quotas;
     server->blobs = supplied->blobs;
+    server->forensic_vdb = supplied->forensic_vdb;
+    server->enable_artifact_uploads = supplied->enable_artifact_uploads;
+    if (supplied->artifact_staging_dir)
+        snprintf(server->artifact_staging_dir, sizeof(server->artifact_staging_dir),
+                 "%s", supplied->artifact_staging_dir);
     server->consensus_mesh = supplied->consensus_mesh;
     server->consensus_blob_context = supplied->consensus_blob_context;
     server->consensus_allow_client_proposals =
@@ -12223,6 +12553,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     }
     if (pthread_mutex_init(&server->state_lock, NULL) != 0 || pthread_cond_init(&server->clients_drained, NULL) != 0 ||
         pthread_rwlock_init(&server->kv_lock, NULL) != 0 || pthread_mutex_init(&server->vdb_lock, NULL) != 0 ||
+        pthread_mutex_init(&server->forensic_lock, NULL) != 0 ||
         pthread_mutex_init(&server->fts_meta_lock, NULL) != 0 ||
         pthread_mutex_init(&server->save_lock, NULL) != 0 ||
         pthread_mutex_init(&server->repl_lock, NULL) != 0 ||
@@ -12652,6 +12983,7 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (server->pubsub) qihse_resp_pubsub_destroy(server->pubsub);
     pthread_mutex_destroy(&server->column_lock);
     pthread_mutex_destroy(&server->tsdb_lock);
+    pthread_mutex_destroy(&server->forensic_lock);
     pthread_mutex_destroy(&server->vdb_lock);
     if (server->fts_keys) {
         for (uint64_t i = 0; i < server->fts_key_count; i++) free(server->fts_keys[i]);

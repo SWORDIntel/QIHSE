@@ -140,3 +140,4 @@ qihse_audit.writer.lock
 
 # local run artifacts
 advisor-dumps/
+/studio/

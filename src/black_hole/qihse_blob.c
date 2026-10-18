@@ -139,6 +139,11 @@ static bool blob_log_append(qihse_blob_store_t* store, char op, const qihse_blob
     return false;
 }
 
+static uint64_t blob_size_limit(uint16_t tag) {
+    return tag == QIHSE_BLOB_TAG_DUMP_ARTIFACT ? QIHSE_BLOB_ARTIFACT_MAX_SIZE
+                                                : QIHSE_BLOB_MAX_SIZE;
+}
+
 static bool blob_log_replay(qihse_blob_store_t* store) {
     FILE* f = fopen(store->index_path, "rb+");
     if (!f) return errno == ENOENT; /* fresh store */
@@ -170,8 +175,9 @@ static bool blob_log_replay(qihse_blob_store_t* store) {
         }
         if (header[2] != 'P' && header[2] != 'R' && header[2] != 'U') { ok = false; break; }
         if (fread(&info, sizeof(info), 1, f) != 1) { torn = true; break; }
-        if (info.size > QIHSE_BLOB_MAX_SIZE || info.refcount == 0u ||
-            info.tag == 0u || info.tag > QIHSE_BLOB_TAG_REPL_TRANSACTION ||
+        if (info.refcount == 0u || info.tag == 0u ||
+            info.tag > QIHSE_BLOB_TAG_DUMP_ARTIFACT ||
+            info.size > blob_size_limit(info.tag) ||
             (info.tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
              info.tenant_id != QIHSE_TENANT_SYSTEM)) {
             ok = false; break;
@@ -295,13 +301,13 @@ static bool blob_put_internal(qihse_blob_store_t* store, uint32_t tenant_id,
                               const uint8_t* expected_hash,
                               uint64_t expected_size) {
     if (!store || !read_fn || !out_hash) return false;
-    if (expected_hash && expected_size > QIHSE_BLOB_MAX_SIZE) return false;
+    if (expected_hash && expected_size > blob_size_limit((uint16_t)tag)) return false;
     uint32_t user_tenant = 0;
     if (!blob_user_tenant(user, &user_tenant)) {
         qihse_audit_log("BLOB_DENIED_NULL_OR_DEAD_USER", 0xFFFFFFFFu, 0, classification, sci_compartment);
         return false;
     }
-    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_REPL_TRANSACTION) return false;
+    if (tag == (qihse_blob_tag_t)0 || tag > QIHSE_BLOB_TAG_DUMP_ARTIFACT) return false;
     if (tag == QIHSE_BLOB_TAG_REPL_TRANSACTION &&
         (tenant_id != QIHSE_TENANT_SYSTEM ||
          user_tenant != QIHSE_TENANT_SYSTEM ||
@@ -339,16 +345,19 @@ static bool blob_put_internal(qihse_blob_store_t* store, uint32_t tenant_id,
         if (!tmp) { close(tmp_fd); break; }
         if (!tmp) break;
 
-        uint8_t buffer[QIHSE_BLOB_CHUNK_SIZE];
+        uint8_t* buffer = (uint8_t*)malloc(QIHSE_BLOB_CHUNK_SIZE);
+        if (!buffer) break;
         for (;;) {
-            int64_t chunk = read_fn(read_opaque, buffer, sizeof(buffer));
+            int64_t chunk = read_fn(read_opaque, buffer, QIHSE_BLOB_CHUNK_SIZE);
             if (chunk < 0) break;              /* source error */
             if (chunk == 0) { ok = true; break; } /* EOF */
-            if ((uint64_t)chunk > QIHSE_BLOB_MAX_SIZE - total) { chunk = -1; break; }
+            if ((uint64_t)chunk > QIHSE_BLOB_CHUNK_SIZE ||
+                (uint64_t)chunk > blob_size_limit((uint16_t)tag) - total) break;
             if (fwrite(buffer, 1, (size_t)chunk, tmp) != (size_t)chunk) break;
             if (EVP_DigestUpdate(ctx, buffer, (size_t)chunk) != 1) break;
             total += (uint64_t)chunk;
         }
+        free(buffer);
         if (!ok) break;
 
         unsigned int md_len = 0;

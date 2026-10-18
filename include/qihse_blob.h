@@ -24,7 +24,8 @@ extern "C" {
 
 #define QIHSE_BLOB_HASH_BYTES 48u  /* SHA-384 (CNSA 2.0 aligned; auth uses PBKDF2-HMAC-SHA-384) */
 #define QIHSE_BLOB_HASH_HEX   (2u * QIHSE_BLOB_HASH_BYTES + 1u)
-#define QIHSE_BLOB_MAX_SIZE   (64u * 1024u * 1024u) /* 64 MiB per blob */
+#define QIHSE_BLOB_MAX_SIZE   (64u * 1024u * 1024u) /* Existing session/consensus blobs */
+#define QIHSE_BLOB_ARTIFACT_MAX_SIZE (4ull * 1024ull * 1024ull * 1024ull) /* Dump artifacts only */
 #define QIHSE_BLOB_CHUNK_SIZE (256u * 1024u)
 
 typedef enum {
@@ -32,7 +33,8 @@ typedef enum {
     QIHSE_BLOB_TAG_PATTERN_BUNDLE    = 2,
     QIHSE_BLOB_TAG_SCRIPT_SET        = 3,
     QIHSE_BLOB_TAG_COMMONS_SNAPSHOT  = 4,
-    QIHSE_BLOB_TAG_REPL_TRANSACTION  = 5 /* system Operator only */
+    QIHSE_BLOB_TAG_REPL_TRANSACTION  = 5, /* system Operator only */
+    QIHSE_BLOB_TAG_DUMP_ARTIFACT     = 6  /* tenant-bound, classified large object */
 } qihse_blob_tag_t;
 
 typedef struct qihse_blob_store qihse_blob_store_t;

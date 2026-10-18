@@ -1661,9 +1661,19 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                 free(key); free(val); continue;
             }
             if (tag[1] == 'E' && tag[2] == 'T' && tag[3] == ' ') {
-                char line[65536];
-                if (!fgets(line, sizeof(line), f)) break;
-                unsigned int classif = 0u, sci = 0u; char key[256], rest[63488];
+                char* line = (char*)malloc(65536);
+                char* rest = (char*)malloc(63488);
+                if (!line || !rest) {
+                    free(line);
+                    free(rest);
+                    break;
+                }
+                if (!fgets(line, 65536, f)) {
+                    free(line);
+                    free(rest);
+                    break;
+                }
+                unsigned int classif = 0u, sci = 0u; char key[256];
                 if (sscanf(line, "%255s %63487[^\n]", key, rest) >= 2) {
                     char* end = rest + strlen(rest);
                     while (end > rest && (end[-1] == ' ' || end[-1] == '\n')) --end;
@@ -1680,6 +1690,8 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                                                   (uint16_t)sci, 0u, seq);
                     }
                 }
+                free(line);
+                free(rest);
                 continue;
             }
             break;

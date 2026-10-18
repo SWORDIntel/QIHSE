@@ -539,29 +539,29 @@ static size_t prov_walk(void* store_void, void* user_void,
     if (!store_void || !user_void || !id) return 0;
     if (max_depth == 0 || max_depth > 16u) max_depth = 16u;
 
-    prov_walk_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.cb = cb;
-    ctx.user_data = user_data;
-    prov_walk_mark(&ctx, qihse_prov_entity_name(entity), id);
+    prov_walk_ctx_t* ctx = (prov_walk_ctx_t*)calloc(1, sizeof(prov_walk_ctx_t));
+    if (!ctx) return 0;
+    ctx->cb = cb;
+    ctx->user_data = user_data;
+    prov_walk_mark(ctx, qihse_prov_entity_name(entity), id);
 
     size_t queue_cap = 256u;
     char** queue = (char**)calloc(queue_cap, sizeof(char*));
-    if (!queue) return 0;
+    if (!queue) { free(ctx); return 0; }
     size_t queue_len = 0;
     size_t root_need = strlen(qihse_prov_entity_name(entity)) + 1u + strlen(id) + 1u;
     char* root = (char*)malloc(root_need);
-    if (!root) { free(queue); return 0; }
+    if (!root) { free(queue); free(ctx); return 0; }
     snprintf(root, root_need, "%s:%s", qihse_prov_entity_name(entity), id);
     queue[queue_len++] = root;
 
-    for (uint32_t depth = 1; depth <= max_depth && queue_len > 0 && !ctx.stop; depth++) {
+    for (uint32_t depth = 1; depth <= max_depth && queue_len > 0 && !ctx->stop; depth++) {
         size_t next_cap = 256u;
         char** next = (char**)calloc(next_cap, sizeof(char*));
         if (!next) break;
         size_t next_len = 0;
 
-        for (size_t i = 0; i < queue_len && !ctx.stop; i++) {
+        for (size_t i = 0; i < queue_len && !ctx->stop; i++) {
             const char* entry = queue[i];
             const char* colon = strrchr(entry, ':');
             if (!colon) continue;
@@ -573,7 +573,7 @@ static size_t prov_walk(void* store_void, void* user_void,
 
             prov_scan_ctx_t scan;
             memset(&scan, 0, sizeof(scan));
-            scan.ctx = &ctx;
+            scan.ctx = ctx;
             scan.depth = depth;
             scan.want_upstream = want_upstream;
             scan.filter_entity = filter_entity;
@@ -606,7 +606,9 @@ static size_t prov_walk(void* store_void, void* user_void,
 
     for (size_t i = 0; i < queue_len; i++) free(queue[i]);
     free(queue);
-    return ctx.hits;
+    size_t hits = ctx->hits;
+    free(ctx);
+    return hits;
 }
 
 size_t qihse_provenance_trace_forward(void* store_void, void* user_void,

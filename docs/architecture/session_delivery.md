@@ -53,13 +53,73 @@ binary blobs — so blobs are a dedicated content-addressed store:
   identical bytes with an identical binding (tenant, tag, classification, SCI)
   bumps a refcount; the same hash with a *different* binding is refused, so a
   tenant can never claim another tenant's object.
+- Session/consensus blobs retain the 64 MiB ceiling. The separate
+  `dump_artifact` tag permits up to 4 GiB through the principal-bearing
+  streaming blob API (including replay, verification and range reads); it is
+  tenant-bound and subject to normal classification/SCI checks. This does
+  **not** relax consensus transaction and transfer limits. The external
+  upload path is the separately enabled adapter below.
 - Class tags: `entitlement_seed`, `pattern_bundle`, `script_set`,
-  `commons_snapshot`. Commons blobs are readable by every authenticated tenant
-  but writable only by the system domain.
+  `commons_snapshot`, `dump_artifact`. Commons blobs are readable by every
+  authenticated tenant but writable only by the system domain.
 - **Every** API takes `qihse_user_t*` and NULL is unconditionally denied
   (invariant #1) — there are no context-free convenience variants. Range
   reads re-check authorization per call so a revoked principal cannot drain a
   transfer.
+
+### Opt-in dump artifact upload
+
+The `qihse-redis-server` opt-in `--artifact-blob-dir` and
+`--artifact-staging-dir` options enable `ARTIFACT.BEGIN`, `ARTIFACT.CHUNK`,
+`ARTIFACT.COMMIT`, `ARTIFACT.ABORT` and `ARTIFACT.GET` on an authenticated,
+loopback-bound RESP server. The blob directory should be **dedicated** to this
+daemon; the staging directory must already exist, be owned by its process,
+and have mode 0700. `--require-auth` is mandatory. Supply the existing
+operator password through `QIHSE_OPERATOR_PASSWORD` (not a process argument)
+and the client username/password through `QIHSE_UPLOAD_USER` and
+`QIHSE_UPLOAD_PASSWORD`. For example, with both directories supplied via
+environment-specific relative paths or explicit operator configuration:
+
+```
+qihse-redis-server --require-auth --artifact-blob-dir "$BLOB_DIR" \
+  --artifact-staging-dir "$STAGING_DIR"
+python3 tools/qihse_artifact_upload.py "$DUMP_FILE" --tenant 7 \
+  --classification 95 --sci 0
+```
+
+`ARTIFACT.BEGIN tenant classification sci bytes sha384-hex` is restricted to
+an authenticated system-domain operator and reserves one session-local upload;
+tenant principals can only read artifacts authorized by the blob store.
+`ARTIFACT.CHUNK offset binary` requires contiguous
+offsets and at most 256 KiB per request; `COMMIT` publishes only if declared
+size and SHA-384 match. An uncommitted file is unlinked at creation and closed
+on abort/disconnect. A maximum of four uploads can be active per server;
+an active upload has a 60-second socket idle timeout and a one-hour deadline.
+Allow room for both the staging file and blob store's temporary copy during
+publication (up to twice each dump's size). `ARTIFACT.GET sha384-hex offset length` rechecks authorization and returns at
+most 256 KiB; it rejects other blob tags. Plaintext transport is allowed only
+when the server is bound to loopback; remote clients must use a sealed QKP
+session and are not supported by the supplied Python client. Upload remains
+**off by default** and does not populate vector or text indexes by itself.
+
+### Isolated forensic vector index
+
+`--forensic-vdb PATH` requires the artifact options and opens a dedicated,
+file-backed vector DB, separate from generic `VECSET`/`VECGET`/`VECSEARCH`.
+Both `FORENSIC.SET id sha384-hex offset length vector` and
+`FORENSIC.SEARCH top-k vector` require an authenticated active system-domain
+operator and loopback or a sealed QKP session. `id` is a nonnegative **signed
+63-bit** RESP integer. `FORENSIC.SET` requires an existing authorized
+`dump_artifact` SHA-384, an in-bounds source range, and exactly 4,096 bytes
+of little-endian finite, near-unit-length float32 (1,024 dimensions). It
+returns `OK` after durable upsert. `FORENSIC.SEARCH` accepts `top-k` 1..32
+and the same vector format and returns rows `[id, score, metadata]`; metadata
+encodes `sha384:offset:length:tenant:classification:sci:bge-large-en-v1.5`.
+The returned source bytes remain subject to `ARTIFACT.GET` authorization.
+The supplied `dump_onnx_ingest.py` journals each successful batch of byte
+windows and can resume without re-embedding already published ranges. Empty
+or opaque binary artifacts remain byte-range-readable without embeddings.
+The existing AIMEM BGE-small 384-dimensional model is not changed.
 
 ## PII-free ingest gate (U4)
 
