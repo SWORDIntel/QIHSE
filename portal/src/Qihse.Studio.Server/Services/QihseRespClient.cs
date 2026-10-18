@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
@@ -39,6 +40,11 @@ public class QihseRespClient : IDisposable
     private async Task<bool> ConnectInternalAsync(CancellationToken ct)
     {
         if (IsConnected) return true;
+
+        // Plain RESP transport is not authenticated or confidential; do not send
+        // operator credentials to remote peers until TLS/mTLS support exists.
+        if (!IPAddress.TryParse(_host, out var remote) || !IPAddress.IsLoopback(remote))
+            return false;
 
         _tcpClient?.Dispose();
         _tcpClient = new TcpClient();

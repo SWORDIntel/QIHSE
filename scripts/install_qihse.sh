@@ -18,7 +18,7 @@ set -euo pipefail
 DEFAULT_PREFIX="/opt/QIHSE"
 DEFAULT_DATA_DIR="/opt/qihse-data"
 DEFAULT_KEYS_DIR="/etc/qihse/keys"
-DEFAULT_OPERATOR_PASSWORD="QihseCluster2026x!"
+DEFAULT_OPERATOR_PASSWORD="${QIHSE_OPERATOR_PASSWORD:-}"
 DEFAULT_PORT="7100"
 DEFAULT_BUS_PORT="17100"
 DEFAULT_REPL_INTERVAL="30"
@@ -82,7 +82,7 @@ Installation Options:
   --bind IP                Listening IPv4 address (default: auto-detected primary LAN IP)
   --port PORT              RESP client port (default: ${DEFAULT_PORT})
   --bus-port BUSPORT       Cluster bus port (default: ${DEFAULT_BUS_PORT})
-  --operator-password PW   Cluster operator password (default: cluster default)
+  --operator-password PW   Deprecated: may expose password via process list; prefer QIHSE_OPERATOR_PASSWORD
   --slot-range RANGE       Slot range to serve (e.g. 0-4549 or 0-16383)
   --node SPEC              Cluster peer spec INDEX:HOST:PORT:BUSPORT (repeatable)
   --join SPEC              Cluster join seed HOST:BUSPORT (repeatable)
@@ -150,6 +150,17 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+# Reject known defaults; do not bootstrap a network daemon with published secrets.
+if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "${#OPERATOR_PASSWORD}" -lt 12 ] ||
+       [[ ! "$OPERATOR_PASSWORD" =~ ^[A-Za-z0-9_.!@%+=:-]+$ ]]; then
+        echo "[ERROR] Set QIHSE_OPERATOR_PASSWORD to 12+ safe printable characters before installation." >&2
+        echo "Example: export QIHSE_OPERATOR_PASSWORD=\$(openssl rand -hex 32)" >&2
+        echo "Use the same new credential on each cluster node; rotate any published credential." >&2
+        exit 1
+    fi
+fi
 
 # Privilege check: real system installation requires root, but allow dry-run and help
 if [ "$DRY_RUN" -eq 0 ] && [ "$IS_ROOT" -eq 0 ]; then
@@ -786,11 +797,14 @@ if [ "$DO_SERVICE" -eq 1 ]; then
         CMD_ARGS+=("$t_arg")
     done
 
-    # Authentication and Data Directory
-    CMD_ARGS+=(
-        "--operator-password" "${OPERATOR_PASSWORD}"
-        "--dir" "${DATA_DIR}/node${NODE_INDEX}"
-    )
+    # Keep operator secret out of systemd ExecStart and /proc/<pid>/cmdline.
+    # Cluster daemon reads QIHSE_OPERATOR_PASSWORD from the environment.
+    CMD_ARGS+=("--dir" "${DATA_DIR}/node${NODE_INDEX}")
+
+    SECRET_ENV="/etc/qihse/cluster-node${NODE_INDEX}.env"
+    install -d -m 0700 /etc/qihse
+    (umask 077; printf 'QIHSE_OPERATOR_PASSWORD=%s\n' "$OPERATOR_PASSWORD" > "$SECRET_ENV")
+    chmod 0600 "$SECRET_ENV"
 
     EXEC_START_LINE="${CMD_ARGS[*]}"
 
@@ -809,6 +823,7 @@ Wants=network-online.target
 [Service]
 ExecStart=${EXEC_START_LINE}
 Environment=LD_LIBRARY_PATH=${PREFIX}/lib:${PREFIX}/bin
+EnvironmentFile=${SECRET_ENV}
 Restart=always
 RestartSec=3
 
@@ -832,7 +847,7 @@ EOF
         for _ in $(seq 1 15); do
             sleep 1
             if command -v redis-cli >/dev/null 2>&1; then
-                if redis-cli -h "${BIND_IP}" -p "${PORT}" -a "${OPERATOR_PASSWORD}" ping 2>/dev/null | grep -q "PONG"; then
+                if REDISCLI_AUTH="${OPERATOR_PASSWORD}" redis-cli -h "${BIND_IP}" -p "${PORT}" ping 2>/dev/null | grep -q "PONG"; then
                     HEALTHY=1
                     break
                 fi
@@ -857,7 +872,7 @@ EOF
                     ELAPSED=$((NOW - START_TIME))
 
                     if command -v redis-cli >/dev/null 2>&1; then
-                        NODES_OUTPUT="$(redis-cli -h "${BIND_IP}" -p "${PORT}" -a "${OPERATOR_PASSWORD}" cluster nodes 2>/dev/null || true)"
+                        NODES_OUTPUT="$(REDISCLI_AUTH="${OPERATOR_PASSWORD}" redis-cli -h "${BIND_IP}" -p "${PORT}" cluster nodes 2>/dev/null || true)"
                         if [ -n "$NODES_OUTPUT" ]; then
                             CONNECTED_COUNT="$(echo "$NODES_OUTPUT" | grep -c ' connected' || echo 1)"
                         fi
@@ -1028,11 +1043,7 @@ EOF
     echo ""
 fi
 
-echo "Verify connection:"
-echo "  redis-cli -h ${BIND_IP} -p ${PORT} -a '${OPERATOR_PASSWORD}' ping"
-echo "  redis-cli -h ${BIND_IP} -p ${PORT} -a '${OPERATOR_PASSWORD}' cluster info"
-if [ "$IS_SOLO" -eq 0 ]; then
-    echo "  redis-cli -h ${BIND_IP} -p ${PORT} -a '${OPERATOR_PASSWORD}' cluster nodes"
-    echo "  redis-cli -h ${BIND_IP} -p ${PORT} -a '${OPERATOR_PASSWORD}' repl.marks"
-fi
-echo ""
+echo "Verify connection (do not place passwords in argv):"
+echo "  Load QIHSE_OPERATOR_PASSWORD from the root-owned /etc/qihse/cluster-node${NODE_INDEX}.env into REDISCLI_AUTH."
+echo "  redis-cli -h ${BIND_IP} -p ${PORT} ping"
+echo "  unset REDISCLI_AUTH"

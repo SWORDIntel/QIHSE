@@ -15,7 +15,7 @@ import subprocess
 import re
 import json
 
-DEFAULT_AUTH = os.environ.get("QIHSE_OPERATOR_PASSWORD", "QihseCluster2026x!")
+DEFAULT_AUTH = os.environ.get("QIHSE_OPERATOR_PASSWORD")
 CLUSTER_SEEDS = [
     ("192.168.1.91", 7100, "t420"),
     ("192.168.1.90", 7115, "730xd"),
@@ -72,8 +72,10 @@ def run_cmd(cmd: str, timeout: int = 5) -> str:
         return ""
 
 
-def send_resp(host: str, port: int, auth: str, args: list, timeout: int = 3):
+def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int = 3):
     """Zero-dependency minimal RESP client."""
+    if not auth:
+        return None, "QIHSE_OPERATOR_PASSWORD is required; no default credential exists"
     try:
         s = socket.create_connection((host, port), timeout=timeout)
         f = s.makefile('rb')

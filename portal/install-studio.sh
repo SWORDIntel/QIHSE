@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Install Studio loopback-only with operator-owned credentials (never embedded in units).
 set -euo pipefail
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Run as a dedicated unprivileged service user with sudo access; root execution refused." >&2
+    exit 1
+fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-/opt/QIHSE/studio}"
 DOTNET="$(command -v dotnet || printf '%s' "${DOTNET_ROOT:-$HOME/.dotnet}/dotnet")"
