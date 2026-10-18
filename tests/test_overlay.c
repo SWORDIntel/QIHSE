@@ -212,6 +212,10 @@ static bool expect_meet(int fd, int timeout_ms) {
     uint32_t magic = 0, type = 0;
     memcpy(&magic, datagram, 4u);
     memcpy(&type, datagram + 4u, 4u);
+    /* The production bus serializes u32 fields in network (big-endian) order;
+     * previously this test interpreted the bytes as native little-endian. */
+    magic = ntohl(magic);
+    type = ntohl(type);
     return magic == QIHSE_CLUSTER_BUS_MAGIC && type == QIHSE_BUS_MSG_MEET;
 }
 
