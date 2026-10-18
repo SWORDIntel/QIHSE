@@ -155,7 +155,7 @@ workload optimizer-governance area=relational expect=pass timeout=300 \
 area graph "Graph store, Cypher parse/execute, ingest and graph algorithms"
 
 workload graph-engine area=graph expect=pass timeout=300 \
-    output="=== Results: 18 passed, 0 failed ===" \
+    output="=== Results: 19 passed, 0 failed ===" \
     run="make -s test-graph"
 
 # Hybrid graph+vector: HNSW seed + hop-decayed BFS expansion, vector-guided

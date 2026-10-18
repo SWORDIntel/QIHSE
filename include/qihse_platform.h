@@ -45,6 +45,8 @@
     // Dynamic Loading Abstractions (dlopen -> LoadLibrary)
     #define RTLD_NOW 0
     #define RTLD_GLOBAL 0
+    #define RTLD_LOCAL 0
+    #define RTLD_NODELETE 0
     static inline void* dlopen(const char* filename, int flags) {
         (void)flags;
         return (void*)LoadLibraryA(filename);

@@ -253,6 +253,8 @@ static int check_delete_persists(gold_env_t* env) {
 }
 
 int main(void) {
+    setenv("QIHSE_ALLOW_INSECURE_CONTAINER", "1", 0);
+    setenv("QIHSE_ENFORCE_INTEGRITY", "1", 1);
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/gold_persistence_roundtrip_XXXXXX";

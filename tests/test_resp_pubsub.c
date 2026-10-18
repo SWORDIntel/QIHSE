@@ -27,12 +27,16 @@ typedef struct {
 
 static void* server_thread(void* argument) {
     server_thread_arg_t* args = (server_thread_arg_t*)argument;
-    assert(qihse_resp_server_handle_client_fd(args->server, args->fd));
+    qihse_resp_server_t* server = args->server;
+    int fd = args->fd;
+    free(args);
+    (void)qihse_resp_server_handle_client_fd(server, fd);
     return NULL;
 }
 
 typedef struct {
     int fd;
+    pthread_t thread;
 } test_client_t;
 
 static bool count_record(const qihse_es_record_header_t* header, const uint8_t* payload,                         size_t payload_size, void* user_data) {
@@ -50,9 +54,7 @@ static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     assert(args != NULL);
     args->server = server;
     args->fd = sockets[1];
-    pthread_t thread;
-    assert(pthread_create(&thread, NULL, server_thread, args) == 0);
-    pthread_detach(thread);
+    assert(pthread_create(&client->thread, NULL, server_thread, args) == 0);
     client->fd = sockets[0];
 }
 
@@ -211,6 +213,8 @@ int main(void) {
     close(subscriber.fd);
     close(publisher.fd);
     qihse_resp_server_destroy(server);
+    assert(pthread_join(subscriber.thread, NULL) == 0);
+    assert(pthread_join(publisher.thread, NULL) == 0);
     qihse_kv_store_destroy(store);
     printf("test_resp_pubsub: all assertions passed\n");
     return 0;

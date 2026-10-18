@@ -382,8 +382,11 @@ static void fabric_lazy_init_locked(void) {
         }
     }
 
+#ifndef RTLD_NODELETE
+#define RTLD_NODELETE 0
+#endif
     for (size_t i = 0u; i < tries && !g_available; i++) {
-        g_dl = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+        g_dl = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
         if (!g_dl) continue;
         if (fabric_resolve_symbols_locked()) {
             g_available = true;

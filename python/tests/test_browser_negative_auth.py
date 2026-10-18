@@ -99,6 +99,10 @@ def start_bridge(port: int, creds_path: str, extra: list[str],
     env["PYTHONPATH"] = os.path.join(REPO, "python")
     env["LD_LIBRARY_PATH"] = REPO
     env.pop("QIHSE_OPERATOR_PASSWORD", None)
+    bridge_data = os.path.join(os.path.dirname(creds_path), "bridge_audit")
+    os.makedirs(bridge_data, mode=0o700, exist_ok=True)
+    os.chmod(bridge_data, 0o700)
+    env["QIHSE_DATA_DIR"] = bridge_data
     env.update(extra_env or {})
     proc = subprocess.Popen(
         [sys.executable, "-m", "qihse.browser",

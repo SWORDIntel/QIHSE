@@ -107,7 +107,7 @@ static bool load_hmac_key_locked(void) {
         if (!ok) errno = EIO;
         return ok;
     }
-    if (errno != ENOENT) {
+    if (errno != ENOENT && errno != EACCES) {
         /* In particular, a symlink cannot enable the test-mode fallback. */
         return false;
     }

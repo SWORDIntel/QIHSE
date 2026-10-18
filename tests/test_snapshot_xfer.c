@@ -18,6 +18,7 @@
  * classified payload) so the transferred container is a real signed v3.
  */
 
+#include "qihse_audit.h"
 #include "qihse_auth.h"
 #include "qihse_backup.h"
 #include "qihse_federation.h"
@@ -502,6 +503,7 @@ int main(void) {
     test_container_authority();
 
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
 
     char cmd[768];
     snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", g_dir);

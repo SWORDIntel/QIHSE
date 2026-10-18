@@ -317,6 +317,9 @@ int main(void) {
          test_memory_budget_zero_restores_spilled},
     };
 
+    setenv("QIHSE_ALLOW_INSECURE_CONTAINER", "1", 0);
+    setenv("QIHSE_ENFORCE_INTEGRITY", "1", 1);
+
     if (!qihse_auth_init() || !qihse_auth_bootstrap_operator("PersistenceTestPass123!")) {
         fprintf(stderr, "FAIL: auth init or operator bootstrap failed\n");
         return 1;

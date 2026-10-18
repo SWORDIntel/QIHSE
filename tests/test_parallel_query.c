@@ -37,6 +37,7 @@
  * Test data uses the module's documented row model: key
  * <table><sep><row_id>[<sep><column>].
  */
+#include "qihse_audit.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
 #include "qihse_parallel_query.h"
@@ -705,6 +706,7 @@ int main(void) {
     test_measurement();
 
     qihse_kv_store_destroy(g_kv);
+    qihse_audit_shutdown();
     char command[768];
     snprintf(command, sizeof(command), "rm -rf -- '%s'", g_data_dir);
     assert(system(command) == 0);

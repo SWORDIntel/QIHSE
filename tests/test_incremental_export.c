@@ -423,6 +423,7 @@ static void test_persistence_round_trip(void) {
     /* Restart: destroy and recreate the store in the same data dir. */
     qihse_kv_store_destroy(g_store);
     qihse_audit_shutdown();
+    qihse_audit_init();
     g_store = qihse_kv_store_create();
     assert(g_store);
 
@@ -723,6 +724,7 @@ int main(void) {
     test_backup_incremental_wired();
 
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
 
     char cmd[600];
     snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", g_dir);

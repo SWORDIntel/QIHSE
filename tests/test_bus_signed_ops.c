@@ -19,6 +19,7 @@
 #include "qihse_federation.h"
 #include "qihse_kv_store.h"
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include <stdlib.h>
 #include <assert.h>
 #include <stdio.h>
@@ -118,6 +119,7 @@ static void fixture_down(fixture_t* f) {
         qihse_kv_store_destroy(g_store);
         g_store = NULL;
     }
+    qihse_audit_shutdown();
 }
 
 /* Build the 16-byte header + payload frame for an ops update. */

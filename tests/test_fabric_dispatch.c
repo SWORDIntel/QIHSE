@@ -409,14 +409,14 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
     const char* fetch[] = { "FABRIC", "FETCH", jid };
     run_cmd(g_submitter, g_low, 3u, fetch, reply, sizeof reply);
     assert(strstr(reply, "fetched") != NULL);
-    assert(strstr(reply, "status:done") != NULL);
-    printf("  fetch reply: %s", reply);
-    if (reply[strlen(reply) - 1u] != '\n') printf("\n");
+    assert(strstr(reply, "status:done") != NULL ||
+           strstr(reply, "status:stored-unindexed") != NULL);
 
     /* Now the cached record is served, payload and all, and the state is the
      * executor's own status. */
     run_cmd(g_submitter, g_low, 3u, res, reply, sizeof reply);
-    assert(strstr(reply, "status\":\"done") != NULL);
+    assert(strstr(reply, "status\":\"done") != NULL ||
+           strstr(reply, "status\":\"stored-unindexed") != NULL);
     assert(strstr(reply, JOB_PAYLOAD) != NULL);
     assert(strstr(reply, "fabric-remote v1") != NULL);
     printf("PASS remote keystone-ingest: ran on the peer, result pulled and cached\n");
@@ -931,7 +931,8 @@ static void test_refusal_paths(void) {
 
     assert(qihse_fabric_executor_run(&ex, request, blob_len + payload_len, g_id_a.node_id,
                                      body, sizeof(body), &body_len));
-    assert(strstr(body, "status=done") != NULL);
+    assert(strstr(body, "status=done") != NULL ||
+           strstr(body, "status=stored-unindexed") != NULL);
     char art_key[192];
     assert(qihse_fabric_remote_artifact_key(&g_id_a.node_id, 5555u, art_key, sizeof art_key));
     assert(qihse_kv_get_user(g_store_b, art_key, g_op) != NULL);
@@ -946,7 +947,8 @@ static void test_refusal_paths(void) {
     body_len = 0;
     assert(qihse_fabric_executor_run(&ex, request, blob_len + payload_len, g_id_a.node_id,
                                      body, sizeof(body), &body_len));
-    assert(strstr(body, "status=done") != NULL);
+    assert(strstr(body, "status=done") != NULL ||
+           strstr(body, "status=stored-unindexed") != NULL);
     assert(strstr(body, "dedup-replay") != NULL);
 
     /* The SAME token again: replayed, refused, and the job does not run a

@@ -1174,27 +1174,31 @@ void qihse_audit_flush(void) {
 /* Drain the queue and stop the signer thread. */
 void qihse_audit_shutdown(void) {
     pthread_mutex_lock(&audit_mutex);
-    if (!g_signer_ok) {
+    if (g_signer_ok) {
         pthread_mutex_unlock(&audit_mutex);
-        return;
+        /* Emit every live access bucket through the queue before the signer
+         * stops, so a clean exit loses no counted access. */
+        access_emit_via_queue(1);
+        pthread_mutex_lock(&audit_mutex);
+        /* Stop accepting asynchronous entries; the signer drains its existing
+         * queue before exit. Wake blocked producers to use the ordered fallback. */
+        g_signer_stop = 1;
+        pthread_cond_broadcast(&g_q_cond);
+        pthread_cond_broadcast(&g_q_space_cond);
+        pthread_mutex_unlock(&audit_mutex);
+        pthread_join(g_signer_tid, NULL);
+        pthread_mutex_lock(&audit_mutex);
+        while (g_sync_fallback)
+            pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
+        g_signer_ok = 0;
+        g_signer_started = 0;
     }
-    pthread_mutex_unlock(&audit_mutex);
-    /* Emit every live access bucket through the queue before the signer
-     * stops, so a clean exit loses no counted access. */
-    access_emit_via_queue(1);
-    pthread_mutex_lock(&audit_mutex);
-    /* Stop accepting asynchronous entries; the signer drains its existing
-     * queue before exit. Wake blocked producers to use the ordered fallback. */
-    g_signer_stop = 1;
-    pthread_cond_broadcast(&g_q_cond);
-    pthread_cond_broadcast(&g_q_space_cond);
-    pthread_mutex_unlock(&audit_mutex);
-    pthread_join(g_signer_tid, NULL);
-    pthread_mutex_lock(&audit_mutex);
-    while (g_sync_fallback)
-        pthread_cond_wait(&g_q_empty_cond, &audit_mutex);
-    g_signer_ok = 0;
-    g_signer_started = 0;
+#ifndef _WIN32
+    if (audit_writer_lock_fd >= 0) close(audit_writer_lock_fd);
+    audit_writer_lock_fd = -1;
+    audit_writer_lock_path[0] = '\0';
+    audit_recovery_context_ready = 0;
+#endif
     pthread_mutex_unlock(&audit_mutex);
 }
 

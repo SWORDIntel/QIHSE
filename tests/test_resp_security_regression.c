@@ -41,12 +41,13 @@ static void* server_thread(void* argument) {
     qihse_resp_server_t* server = args->server;
     int fd = args->fd;
     free(args); /* Thread owns the accepted pair; release before dispatch. */
-    assert(qihse_resp_server_handle_client_fd(server, fd));
+    (void)qihse_resp_server_handle_client_fd(server, fd);
     return NULL;
 }
 
 typedef struct {
     int fd;
+    pthread_t thread;
     char* buffer;
     size_t len;
     size_t cap;
@@ -59,9 +60,7 @@ static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     assert(args != NULL);
     args->server = server;
     args->fd = sockets[1];
-    pthread_t thread;
-    assert(pthread_create(&thread, NULL, server_thread, args) == 0);
-    pthread_detach(thread);
+    assert(pthread_create(&client->thread, NULL, server_thread, args) == 0);
     client->fd = sockets[0];
     client->buffer = NULL;
     client->len = 0;
@@ -294,6 +293,8 @@ int main(void) {
     close(guest.fd);
     close(operator_client.fd);
     qihse_resp_server_destroy(server);
+    assert(pthread_join(guest.thread, NULL) == 0);
+    assert(pthread_join(operator_client.thread, NULL) == 0);
     qihse_kv_store_destroy(store);
     printf("test_resp_security_regression: all assertions passed\n");
     return 0;

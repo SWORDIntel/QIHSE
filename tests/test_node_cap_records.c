@@ -187,6 +187,7 @@ static void store_restart(void) {
      * recover the records from the data directory's WAL. */
     qihse_kv_store_destroy(g_store);
     qihse_audit_shutdown();
+    qihse_audit_init();
     g_store = qihse_kv_store_create();
     assert(g_store);
 }
@@ -856,6 +857,7 @@ int main(void) {
     test_classified_record_not_disclosed(key_dir);
 
     qihse_kv_store_destroy(g_store);
+    qihse_audit_shutdown();
 
     /* Self-clean the scratch directory: .gitignore lists per-test prefixes
      * and this test's prefix is not among them. A daemon's last async probe

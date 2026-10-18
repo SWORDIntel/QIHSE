@@ -111,9 +111,6 @@ int main(int argc, char** argv) {
            qihse_resp_server_port(server), ANALYST_NAME);
     fflush(stdout);
 
-    /* The bridge is exec'd in a child and must acquire its own audit lock. */
-    qihse_audit_shutdown();
-
     /* Hand the port the server actually bound (0 = ephemeral). */
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", qihse_resp_server_port(server));
@@ -135,6 +132,7 @@ int main(int argc, char** argv) {
 
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
+    qihse_audit_shutdown();
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         printf("[PASS] browser negative-auth (fixture + bridge asserts)\n");

@@ -16,7 +16,7 @@ import os, socket, subprocess, sys, time
 import atexit, signal
 
 # Hosts/ports/password are overridable (defaults are the t420/T320 lab pair).
-PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "")
+PW = os.environ.get("QIHSE_CLUSTER_PASSWORD") or "SmokeTestPass123!"
 N0 = (os.environ.get("QIHSE_NODE0_HOST", "192.168.1.91"),
       int(os.environ.get("QIHSE_NODE0_PORT", "7100")))
 N1 = (os.environ.get("QIHSE_NODE1_HOST", "192.168.1.250"),

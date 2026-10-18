@@ -20,7 +20,7 @@ NODE0 = (os.environ.get("QIHSE_NODE0_HOST", "192.168.1.91"),
          int(os.environ.get("QIHSE_NODE0_PORT", "7100")))
 NODE1 = (os.environ.get("QIHSE_NODE1_HOST", "192.168.1.250"),
          int(os.environ.get("QIHSE_NODE1_PORT", "7101")))
-PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "")
+PW = os.environ.get("QIHSE_CLUSTER_PASSWORD") or "SmokeTestPass123!"
 NODE0_EP = f"{NODE0[0]}:{NODE0[1]}"
 NODE1_EP = f"{NODE1[0]}:{NODE1[1]}"
 
@@ -42,6 +42,7 @@ class C:
         if t in b"+-:": return (t.decode(), rest.decode())
         if t == b"$":
             n = int(rest)
+            if n == -1: return ("$", None)
             while len(s.buf) < n + 2: s.buf += s.s.recv(65536)
             d, s.buf = s.buf[:n], s.buf[n+2:]
             return ("$", d.decode())
@@ -79,7 +80,7 @@ def _spawn_hermetic():
         [bin_path, "--index", "0", "--bind", "127.0.0.1",
          "--port", str(NODE0[1]), "--bus-port",
          str(NODE0[1] + 10000), "--slot-range", "0-16383",
-         "--operator-password", PW, "--dir", d0],
+         "--operator-password", PW, "--no-replicate", "--dir", d0],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _daemons.append(seed)
     time.sleep(2)
@@ -88,7 +89,7 @@ def _spawn_hermetic():
          "--port", str(NODE1[1]), "--bus-port",
          str(NODE1[1] + 10000),
          "--join", f"127.0.0.1:{NODE0[1] + 10000}",
-         "--operator-password", PW, "--dir", d1],
+         "--operator-password", PW, "--no-replicate", "--dir", d1],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _daemons.append(joiner)
 
