@@ -8,6 +8,10 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <errno.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 qihse_http_server_t* qihse_http_server_create(uint16_t port) {
     qihse_http_server_t* srv = (qihse_http_server_t*)calloc(1, sizeof(qihse_http_server_t));
@@ -15,7 +19,15 @@ qihse_http_server_t* qihse_http_server_create(uint16_t port) {
     srv->port = port;
     srv->fd = -1;
     srv->running = 0;
-    pthread_mutex_init(&srv->lock, NULL);
+    if (pthread_mutex_init(&srv->lock, NULL) != 0) {
+        free(srv);
+        return NULL;
+    }
+    if (pthread_cond_init(&srv->workers_drained, NULL) != 0) {
+        pthread_mutex_destroy(&srv->lock);
+        free(srv);
+        return NULL;
+    }
     return srv;
 }
 
@@ -24,10 +36,25 @@ int qihse_http_server_add_route(qihse_http_server_t* srv, const char* path,
     if (!srv || !path || !handler) return -1;
     pthread_mutex_lock(&srv->lock);
     if (srv->num_routes >= srv->routes_cap) {
-        srv->routes_cap = srv->routes_cap ? srv->routes_cap * 2 : 8;
-        srv->routes = (http_route_t*)realloc(srv->routes, srv->routes_cap * sizeof(http_route_t));
+        size_t cap = srv->routes_cap ? srv->routes_cap * 2u : 8u;
+        if (cap <= srv->routes_cap || cap > SIZE_MAX / sizeof(http_route_t)) {
+            pthread_mutex_unlock(&srv->lock);
+            return -1;
+        }
+        http_route_t* tmp = realloc(srv->routes, cap * sizeof(http_route_t));
+        if (!tmp) {
+            pthread_mutex_unlock(&srv->lock);
+            return -1;
+        }
+        srv->routes = tmp;
+        srv->routes_cap = cap;
     }
-    srv->routes[srv->num_routes].path = strdup(path);
+    char* path_copy = strdup(path);
+    if (!path_copy) {
+        pthread_mutex_unlock(&srv->lock);
+        return -1;
+    }
+    srv->routes[srv->num_routes].path = path_copy;
     srv->routes[srv->num_routes].method = method;
     srv->routes[srv->num_routes].handler = handler;
     srv->routes[srv->num_routes].user_data = user_data;
@@ -78,42 +105,56 @@ static void send_response(int fd, const http_response_t* res) {
     int hlen = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
         res->status_code, status_text, ct, res->body_len);
-    send(fd, header, hlen, 0);
-    if (res->body && res->body_len > 0) send(fd, res->body, res->body_len, 0);
-}
-
-static void* http_client_thread(void* arg) {
-    struct { int fd; qihse_http_server_t* srv; }* ctx = arg;
-    char buf[65536];
-    ssize_t n = recv(ctx->fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) { close(ctx->fd); free(ctx); return NULL; }
-    buf[n] = '\0';
-    
-    http_request_t req;
-    if (http_parse_request(buf, n, &req) != 0) {
-        http_response_t* err = http_response_error(400, "Bad Request");
-        send_response(ctx->fd, err);
-        http_response_free(err);
-        close(ctx->fd);
-        free(ctx);
-        return NULL;
-    }
-    
-    http_route_t route;
-    if (!find_route(ctx->srv, req.path, req.method, &route)) {
-        http_response_t* err = http_response_error(404, "Not Found");
-        send_response(ctx->fd, err);
-        http_response_free(err);
-    } else {
-        http_response_t* res = route.handler(&req, route.user_data);
-        if (res) {
-            send_response(ctx->fd, res);
-            http_response_free(res);
+    /* snprintf returns the would-be length, not the available buffer size. */
+    if (hlen <= 0 || (size_t)hlen >= sizeof(header)) return;
+    const char* segments[2] = {header, res->body};
+    size_t lengths[2] = {(size_t)hlen, res->body ? res->body_len : 0u};
+    for (unsigned i = 0; i < 2; ++i) {
+        size_t off = 0;
+        while (off < lengths[i]) {
+            ssize_t n = send(fd, segments[i] + off, lengths[i] - off, MSG_NOSIGNAL);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return;
+            off += (size_t)n;
         }
     }
-    
-    http_request_free(&req);
-    close(ctx->fd);
+}
+
+/* The acceptor increments active_workers before creating a detached worker.
+ * Every exit decrements it; shutdown waits until no worker can touch srv. */
+static void* http_client_thread(void* arg) {
+    struct { int fd; qihse_http_server_t* srv; }* ctx = arg;
+    int fd = ctx->fd;
+    qihse_http_server_t* srv = ctx->srv;
+    char buf[65536];
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    if (n > 0) {
+        buf[n] = '\0';
+        http_request_t req;
+        if (http_parse_request(buf, (size_t)n, &req) != 0) {
+            http_response_t* err = http_response_error(400, "Bad Request");
+            if (err) send_response(fd, err);
+            http_response_free(err);
+        } else {
+            http_route_t route;
+            if (!find_route(srv, req.path, req.method, &route)) {
+                http_response_t* err = http_response_error(404, "Not Found");
+                if (err) send_response(fd, err);
+                http_response_free(err);
+            } else {
+                http_response_t* res = route.handler(&req, route.user_data);
+                if (res) {
+                    send_response(fd, res);
+                    http_response_free(res);
+                }
+            }
+            http_request_free(&req);
+        }
+    }
+    close(fd);
+    pthread_mutex_lock(&srv->lock);
+    if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
+    pthread_mutex_unlock(&srv->lock);
     free(ctx);
     return NULL;
 }
@@ -134,8 +175,20 @@ static void* http_accept_thread(void* arg) {
         if (!ctx) { close(fd); continue; }
         ctx->fd = fd;
         ctx->srv = srv;
+        pthread_mutex_lock(&srv->lock);
+        if (srv->active_workers >= 128u) {
+            pthread_mutex_unlock(&srv->lock);
+            close(fd);
+            free(ctx);
+            continue;
+        }
+        ++srv->active_workers;
+        pthread_mutex_unlock(&srv->lock);
         pthread_t tid;
         if (pthread_create(&tid, NULL, http_client_thread, ctx) != 0) {
+            pthread_mutex_lock(&srv->lock);
+            if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
+            pthread_mutex_unlock(&srv->lock);
             close(fd);
             free(ctx);
             continue;
@@ -167,7 +220,12 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
             srv->port = ntohs(bound.sin_port);
     }
     srv->running = 1;
-    pthread_create(&srv->thread, NULL, http_accept_thread, srv);
+    if (pthread_create(&srv->thread, NULL, http_accept_thread, srv) != 0) {
+        srv->running = 0;
+        close(srv->fd);
+        srv->fd = -1;
+        return -1;
+    }
     return 0;
 }
 
@@ -184,6 +242,10 @@ int qihse_http_server_stop(qihse_http_server_t* srv) {
         srv->fd = -1;
     }
     pthread_join(srv->thread, NULL);
+    pthread_mutex_lock(&srv->lock);
+    while (srv->active_workers != 0u)
+        pthread_cond_wait(&srv->workers_drained, &srv->lock);
+    pthread_mutex_unlock(&srv->lock);
     return 0;
 }
 
@@ -192,6 +254,7 @@ void qihse_http_server_destroy(qihse_http_server_t* srv) {
     qihse_http_server_stop(srv);
     for (size_t i = 0; i < srv->num_routes; i++) free(srv->routes[i].path);
     free(srv->routes);
+    pthread_cond_destroy(&srv->workers_drained);
     pthread_mutex_destroy(&srv->lock);
     free(srv);
 }

@@ -52,6 +52,8 @@ typedef struct {
     size_t num_routes;
     size_t routes_cap;
     pthread_mutex_t lock;
+    pthread_cond_t workers_drained;
+    size_t active_workers;
 } qihse_http_server_t;
 
 qihse_http_server_t* qihse_http_server_create(uint16_t port);
