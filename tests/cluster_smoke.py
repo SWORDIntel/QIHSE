@@ -16,7 +16,7 @@ NODE0 = (os.environ.get("QIHSE_NODE0_HOST", "192.168.1.91"),
          int(os.environ.get("QIHSE_NODE0_PORT", "7100")))
 NODE1 = (os.environ.get("QIHSE_NODE1_HOST", "192.168.1.250"),
          int(os.environ.get("QIHSE_NODE1_PORT", "7101")))
-PASSWORD = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
+PASSWORD = os.environ.get("QIHSE_CLUSTER_PASSWORD", "")
 
 def encode(*args):
     out = f"*{len(args)}\r\n".encode()

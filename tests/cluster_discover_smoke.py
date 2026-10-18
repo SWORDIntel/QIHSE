@@ -20,7 +20,7 @@ NODE0 = (os.environ.get("QIHSE_NODE0_HOST", "192.168.1.91"),
          int(os.environ.get("QIHSE_NODE0_PORT", "7100")))
 NODE1 = (os.environ.get("QIHSE_NODE1_HOST", "192.168.1.250"),
          int(os.environ.get("QIHSE_NODE1_PORT", "7101")))
-PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
+PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "")
 NODE0_EP = f"{NODE0[0]}:{NODE0[1]}"
 NODE1_EP = f"{NODE1[0]}:{NODE1[1]}"
 

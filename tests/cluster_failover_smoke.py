@@ -25,7 +25,7 @@ import atexit, signal
 
 def log(msg): print(msg, flush=True)
 
-PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "QihseCluster2026x!")
+PW = os.environ.get("QIHSE_CLUSTER_PASSWORD", "")
 BIN = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
 LIB_DIR = os.environ.get("QIHSE_LIB_DIR", ".")
 DATA_DIR = os.environ.get("QIHSE_DATA_DIR") or tempfile.mkdtemp(
