@@ -446,6 +446,10 @@ test-container-flush-locking: lib
 	$(CC) $(CFLAGS) -o tests/test_container_flush_locking tests/test_container_flush_locking.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_container_flush_locking
 
+test-rate-limit-fail-closed: lib
+	$(CC) $(CFLAGS) -o tests/test_rate_limit_fail_closed tests/test_rate_limit_fail_closed.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_rate_limit_fail_closed
+
 test-container-key-gate: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -o tests/test_container_key_gate tests/test_container_key_gate.c -L. -lqihse $(LDFLAGS)

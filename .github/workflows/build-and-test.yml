@@ -65,6 +65,9 @@ jobs:
         python3 -m py_compile python/qihse/thermal.py tools/fleet/qihse-fan-agent.py
         python3 -m unittest discover -s python/tests -p 'test_fleet_resp_security.py' -v
 
+    - name: Verify authentication rate limiter is fail-closed
+      run: make test-rate-limit-fail-closed
+
     - name: Verify persistence rejects missing HMAC material
       run: make test-container-key-gate
 

@@ -51,7 +51,7 @@ void qihse_auth_shutdown_rate_limiter(void) {
 }
 
 bool qihse_auth_check_rate_limit(uint32_t source_ip) {
-    bool allowed = true;
+    bool allowed = false;
     pthread_mutex_lock(&g_rate_limiter_mutex);
     if (!g_auth_rate_limiter) {
         g_auth_rate_limiter = qihse_rate_limiter_create(
@@ -146,7 +146,7 @@ void qihse_auth_shutdown_volume_limiter(void) {
 }
 
 bool qihse_auth_check_volume_limit(uint32_t source_ip) {
-    bool allowed = true;
+    bool allowed = false;
     pthread_mutex_lock(&g_volume_limiter_mutex);
     qihse_rate_limiter_t* rl = volume_limiter_get_locked();
     if (rl) allowed = qihse_rate_limiter_check(rl, source_ip);

@@ -84,10 +84,11 @@ void qihse_rate_limiter_destroy(qihse_rate_limiter_t* rl) {
 }
 
 bool qihse_rate_limiter_check(qihse_rate_limiter_t* rl, uint32_t source_ip) {
-    if (!rl) return true; // fail-open if no limiter configured
+    if (!rl) return false; // no limiter must never authorize authentication
 
     time_t now = time(NULL);
-    bool allowed = true;
+    if (now == (time_t)-1) return false;
+    bool allowed = false;
 
     pthread_mutex_lock(&rl->mutex);
 
@@ -111,8 +112,8 @@ bool qihse_rate_limiter_check(qihse_rate_limiter_t* rl, uint32_t source_ip) {
             rl->buckets[idx]    = e;
             allowed = true; // first attempt is always allowed
         } else {
-            // allocation failure: fail-open
-            allowed = true;
+            // Allocation failure is denial, not an authorization bypass.
+            allowed = false;
         }
     } else {
         // Existing entry: check window expiry.
