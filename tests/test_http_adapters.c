@@ -102,7 +102,19 @@ int main(void) {
         assert(send(fd, part1, strlen(part1), 0) == (ssize_t)strlen(part1));
         assert(send(fd, "\r\n", 2, 0) == 2);
         char response[512] = {0};
-        assert(recv(fd, response, sizeof(response)-1, 0) > 0);
+        size_t received = 0u;
+        ssize_t n;
+        /* TCP does not guarantee a whole status line in the first recv(). */
+        while (received < sizeof(response)-1u &&
+               (n = recv(fd, response + received,
+                         sizeof(response)-1u-received, 0)) > 0) {
+            received += (size_t)n;
+            response[received] = '\0';
+            if (strstr(response, "\r\n")) break;
+        }
+        assert(received > 0);
+        if (resp_status(response) != 200)
+            fprintf(stderr, "split-header response: %s\n", response);
         assert(resp_status(response) == 200);
         close(fd);
     }
