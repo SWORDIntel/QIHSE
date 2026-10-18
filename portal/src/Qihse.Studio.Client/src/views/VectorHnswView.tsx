@@ -2,25 +2,29 @@ import { useState } from 'react';
 import { Database, Search, Cpu, Zap } from 'lucide-react';
 import type { VectorSearchResult } from '../types';
 
-export const VectorHnswView: React.FC = () => {
+export const VectorHnswView: React.FC<{ apiToken: string }> = ({ apiToken }) => {
   const [topK, setTopK] = useState<number>(10);
   const [metric, setMetric] = useState<string>('cosine');
   const [precision, setPrecision] = useState<string>('int8');
   const [loading, setLoading] = useState<boolean>(false);
   const [results, setResults] = useState<VectorSearchResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSearch = async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch('/api/vector/search', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiToken}` },
         body: JSON.stringify({ topK, metric, precision }),
       });
+      if (!res.ok) throw new Error(`Native vector backend unavailable (HTTP ${res.status})`);
       const data = await res.json();
       setResults(data);
     } catch (err) {
-      console.error('Vector search failed', err);
+      setResults([]);
+      setError(String(err));
     } finally {
       setLoading(false);
     }
@@ -99,6 +103,7 @@ export const VectorHnswView: React.FC = () => {
         </div>
       </div>
 
+      {error && <p role="alert" className="text-red-400 text-sm">{error}</p>}
       {/* Latency Comparison Across Precision Modes */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="p-4 rounded-lg bg-[#12151d] border border-slate-800">

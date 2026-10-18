@@ -4,9 +4,10 @@ import type { TelemetryFrame, SlotRange } from '../types';
 
 interface ClusterMeshViewProps {
   telemetry: TelemetryFrame | null;
+  apiToken: string;
 }
 
-export const ClusterMeshView: React.FC<ClusterMeshViewProps> = ({ telemetry }) => {
+export const ClusterMeshView: React.FC<ClusterMeshViewProps> = ({ telemetry, apiToken }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [migrationStatus, setMigrationStatus] = useState<string | null>(null);
 
@@ -71,13 +72,14 @@ export const ClusterMeshView: React.FC<ClusterMeshViewProps> = ({ telemetry }) =
     try {
       const res = await fetch('/api/cluster/moveslots', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiToken}` },
         body: JSON.stringify({ start: 1000, end: 1100, masterNodeId: 'node-5' }),
       });
       const data = await res.json();
-      setMigrationStatus(data.message || 'Slot migration complete.');
-    } catch {
-      setMigrationStatus('Migration scheduled: CRC32 validated, 0 keys dropped.');
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setMigrationStatus(data.message || 'Migration request accepted.');
+    } catch (err) {
+      setMigrationStatus(`Migration unavailable: ${String(err)}`);
     }
   };
 
@@ -181,7 +183,7 @@ export const ClusterMeshView: React.FC<ClusterMeshViewProps> = ({ telemetry }) =
                     </div>
                     <div>
                       <div className="text-slate-400 text-[10px]">STATUS</div>
-                      <div className="text-cyan-400 font-bold">ONLINE</div>
+                      <div className="text-cyan-400 font-bold">{node.status.toUpperCase()}</div>
                     </div>
                   </div>
                 </div>

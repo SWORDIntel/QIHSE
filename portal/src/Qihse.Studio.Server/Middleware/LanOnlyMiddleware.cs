@@ -24,19 +24,24 @@ public class LanOnlyMiddleware
         if (_lanOnlyEnabled)
         {
             var remoteIp = context.Connection.RemoteIpAddress;
-            if (remoteIp != null)
+            if (remoteIp == null)
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
             {
                 if (remoteIp.IsIPv4MappedToIPv6)
                 {
                     remoteIp = remoteIp.MapToIPv4();
                 }
 
-                if (!IsPrivateOrLoopback(remoteIp))
+                if (!IsPrivateOrLoopback(remoteIp) ||
+                    (!IPAddress.IsLoopback(remoteIp) && !context.Request.IsHttps))
                 {
                     _logger.LogWarning("Blocked non-LAN connection attempt from {RemoteIp}", remoteIp);
                     context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
                     context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync($"{{\"error\":\"Access denied: QIHSE Studio is default LAN-only. Non-private IP addresses are blocked.\",\"client_ip\":\"{remoteIp}\"}}");
+                    await context.Response.WriteAsync("{\"error\":\"access denied\"}");
                     return;
                 }
             }
