@@ -1388,6 +1388,12 @@ int main(int argc, char** argv) {
             operator_password = configured_password;
         }
     }
+    /* Never expose a daemon without a configured operator verifier. */
+    if (!operator_password && strcmp(bind, "127.0.0.1") != 0 &&
+            strcmp(bind, "::1") != 0 && strcmp(bind, "localhost") != 0) {
+        fprintf(stderr, "qihse-cluster-daemon: remote binding requires QIHSE_OPERATOR_PASSWORD\n");
+        return 2;
+    }
     if (consensus_prefix_signer_configured && !operator_password) {
         fprintf(stderr, "qihse-cluster-daemon: prefix challenges require authenticated RESP\n");
         return 2;

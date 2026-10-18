@@ -35,7 +35,6 @@ QIHSE_RESP_PORT=7101
 QIHSE_BUS_PORT=17101
 QIHSE_REPL_INTERVAL=5
 REPL_GLOB="public:*"
-OPERATOR_PASSWORD="stageb-local-operator-password"
 
 # Transport Mode (I2P is strictly opt-in; WireGuard private mesh is default)
 ENABLE_I2P_OPT_IN=true
@@ -256,6 +255,9 @@ generate_pqc_keys() {
 
 setup_primary_tunnel() {
     require_root
+    if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
+        log_err "Supply QIHSE_OPERATOR_PASSWORD through a protected environment (12+ characters)."; exit 2
+    fi
     log_info "Configuring I2P server tunnel for primary node (forwarding to 127.0.0.1:${QIHSE_RESP_PORT})..."
 
     install_i2pd
@@ -308,8 +310,7 @@ EOF
     # Display primary daemon command
     printf "To start the primary daemon, run:\n\n"
     printf "  qihse-cluster-daemon \\\n"
-    printf "    --index 0 --bind 0.0.0.0 --port %s --bus-port %s \\\n" "$QIHSE_RESP_PORT" "$QIHSE_BUS_PORT"
-    printf "    --operator-password \"%s\" \\\n" "$OPERATOR_PASSWORD"
+    printf "    --index 0 --bind 127.0.0.1 --port %s --bus-port %s \\\n" "$QIHSE_RESP_PORT" "$QIHSE_BUS_PORT"
     printf "    --dir \"%s\" \\\n" "$QIHSE_DATA_DIR"
     printf "    --pqc-identity-dir \"%s\" --pqc-node-id \"%s\" --pqc-require \\\n" "$QIHSE_KEYS_DIR" "$NODE_ID"
     printf "    --replication-peer-node-id \"<REPLICA_NODE_ID>\" \\\n"
@@ -323,6 +324,9 @@ EOF
 
 setup_replica_client() {
     require_root
+    if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
+        log_err "Supply QIHSE_OPERATOR_PASSWORD through a protected environment (12+ characters)."; exit 2
+    fi
     local upstream_dest="${UPSTREAM_I2P_DEST}"
     local upstream_id="${UPSTREAM_NODE_ID}"
 
@@ -359,8 +363,7 @@ setup_replica_client() {
     # Display replica daemon command
     printf "To start the replica daemon with opt-in I2P transport, run:\n\n"
     printf "  qihse-cluster-daemon \\\n"
-    printf "    --index 1 --bind 0.0.0.0 --port %s --bus-port %s \\\n" "$QIHSE_RESP_PORT" "$QIHSE_BUS_PORT"
-    printf "    --operator-password \"%s\" \\\n" "$OPERATOR_PASSWORD"
+    printf "    --index 1 --bind 127.0.0.1 --port %s --bus-port %s \\\n" "$QIHSE_RESP_PORT" "$QIHSE_BUS_PORT"
     printf "    --dir \"%s\" \\\n" "$QIHSE_DATA_DIR"
     printf "    --pqc-identity-dir \"%s\" --pqc-node-id \"%s\" --pqc-require \\\n" "$QIHSE_KEYS_DIR" "$NODE_ID"
     printf "    --replica-read-only \\\n"
@@ -460,7 +463,7 @@ Options:
   --socks-port PORT    Set i2pd SOCKS5 proxy port (default: 4447)
   --upstream-dest DEST Set upstream .b32.i2p address (required for setup-replica)
   --upstream-node-id ID Set upstream node ID for mutual pinning (default: node0)
-  --password PASS      Set cluster operator password
+  QIHSE_OPERATOR_PASSWORD must be set in the protected service environment
 
 Examples:
   # On Primary Node:
@@ -484,7 +487,7 @@ while [[ $# -gt 0 ]]; do
         --socks-port) I2P_SOCKS_PORT="$2"; shift 2 ;;
         --upstream-dest) UPSTREAM_I2P_DEST="$2"; shift 2 ;;
         --upstream-node-id) UPSTREAM_NODE_ID="$2"; shift 2 ;;
-        --password) OPERATOR_PASSWORD="$2"; shift 2 ;;
+        --password) log_err "Do not pass operator passwords in argv. Set QIHSE_OPERATOR_PASSWORD securely."; exit 2 ;;
         -h|--help) usage; exit 0 ;;
         *) log_err "Unknown argument: $1"; usage; exit 1 ;;
     esac

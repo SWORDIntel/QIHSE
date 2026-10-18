@@ -154,7 +154,7 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(srv->port);
     if (bind(srv->fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(srv->fd); return -1; }
     if (listen(srv->fd, 128) < 0) { close(srv->fd); return -1; }
@@ -173,6 +173,7 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
 
 int qihse_http_server_stop(qihse_http_server_t* srv) {
     if (!srv) return -1;
+    if (!srv->running) return 0;
     srv->running = 0;
     if (srv->fd >= 0) {
         /* shutdown() before close(): closing a listen fd does NOT reliably
