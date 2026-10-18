@@ -51,6 +51,12 @@ jobs:
     - name: Run Classified Adapter Denial Regression
       run: make test-consensus-mesh
 
+    - name: Run Machine Token Security Regression
+      run: make test-machine-auth
+
+    - name: Run Fabric Index Authorization Regression (independent)
+      run: make test-fabric-index
+
     - name: Run Core Test Suite
       run: |
         set -o pipefail

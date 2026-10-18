@@ -395,8 +395,16 @@ static void test_resp_keystone_commands(void) {
 static void test_keystone_node_cap_cluster_bus_integration(void) {
     printf("Testing KEYSTONE NODE_CAP Frame Integration into QIHSE Cluster Bus...\n");
 
-    /* Initialize fabric index to bind libkeystone.so */
-    assert(qihse_fabric_index_init(NULL, NULL) == QIHSE_FABRIC_INDEX_OK);
+    /* KEYSTONE is a soft dependency; negative auth paths still run in CI.
+     * Explicit integration gating must fail if a required library is absent. */
+    int init_rc = qihse_fabric_index_init(NULL, NULL);
+    if (init_rc == QIHSE_FABRIC_INDEX_EUNAVAILABLE &&
+        !getenv("QIHSE_REQUIRE_KEYSTONE_INTEGRATION")) {
+        fprintf(stderr, "[SKIP] Native KEYSTONE NODE_CAP integration: optional libkeystone.so unavailable\n");
+        qihse_fabric_index_shutdown();
+        return;
+    }
+    assert(init_rc == QIHSE_FABRIC_INDEX_OK);
     assert(qihse_fabric_index_is_available());
 
     /* 1. Derive valid 40-character node ID and export capability frame from KEYSTONE */

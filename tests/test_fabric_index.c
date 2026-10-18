@@ -38,14 +38,6 @@ static int g_failures = 0;
 
 static const char* SECRET_SNIPPET = "quarterly-revenue-swift";
 
-static void rmtree(const char* path) {
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    if (system(cmd) != 0) {
-        /* best effort cleanup */
-    }
-}
-
 /* Loads the whole file and searches for needle in the raw bytes. */
 static int file_contains(const char* path, const char* needle) {
     FILE* fp = fopen(path, "rb");
@@ -64,20 +56,16 @@ static int file_contains(const char* path, const char* needle) {
 }
 
 int main(void) {
-{
-    /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/test_fabric_index_XXXXXX";
-    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
-}
-    const char* tmp_base = getenv("TMPDIR");
-    if (!tmp_base || !*tmp_base) tmp_base = "/tmp";
-
-    char dir_unavail[512];
-    char dir_live[512];
-    snprintf(dir_unavail, sizeof(dir_unavail), "%s/qihse_fabric_test_unavail", tmp_base);
-    snprintf(dir_live, sizeof(dir_live), "%s/qihse_fabric_test_live", tmp_base);
-    rmtree(dir_unavail);
-    rmtree(dir_live);
+    char* private_root = mkdtemp(qdd);
+    if (!private_root) {
+        perror("mkdtemp fabric fixture");
+        return 1;
+    }
+    setenv("QIHSE_DATA_DIR", private_root, 1);
+    char dir_unavail[512], dir_live[512];
+    snprintf(dir_unavail, sizeof(dir_unavail), "%s/unavailable", private_root);
+    snprintf(dir_live, sizeof(dir_live), "%s/live", private_root);
 
     /* Auth state first: the fabric index authorization-gates every surface. */
     CHECK(qihse_auth_init(), "auth init");
@@ -208,8 +196,6 @@ int main(void) {
     qihse_fabric_index_shutdown();
     qihse_fabric_index_shutdown(); /* idempotent teardown */
 
-    rmtree(dir_unavail);
-    rmtree(dir_live);
 
     if (g_failures) {
         printf("fabric index regression: %d failure(s)\n", g_failures);

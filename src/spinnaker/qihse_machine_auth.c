@@ -65,9 +65,7 @@ static uint64_t machine_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000u);
 }
 
-/* SHA-384 of the empty payload — the only digest a MACHINE token may bind.
- * Computed once (a hardcoded constant here would be an unverified trust
- * anchor in its own right). */
+/* Fixed standard SHA-384(empty) digest; thread-safe immutable payload binding. */
 static const uint8_t* machine_empty_payload_digest(void) {
     /* SHA-384(empty), immutable. Avoid a cross-thread non-atomic lazy-init race. */
     static const uint8_t digest[48] = {
@@ -96,7 +94,7 @@ bool qihse_machine_auth_configure(const char* const* trusted_pub_paths, size_t c
 
     pthread_mutex_lock(&g_machine.mutex);
     machine_anchor_free_locked();
-    memset(g_machine.ledger, 0, sizeof(g_machine.ledger));
+    /* Preserve replay nonces across live trust reconfiguration. */
     if (!trusted_pub_paths || count == 0) {
         pthread_mutex_unlock(&g_machine.mutex);
         return false; /* disabled, not an error: callers may run without anchors */
@@ -240,19 +238,21 @@ qihse_machine_auth_verdict_t qihse_machine_auth_check(
 
     /* The signature covers the serialized region only; it follows it in the
      * blob at the length parse() validated. */
-    if (total_len < region_len || region_len == 0) return QIHSE_MACHINE_AUTH_MALFORMED;
+    if (total_len != blob_len || total_len < region_len || region_len == 0)
+        return QIHSE_MACHINE_AUTH_MALFORMED;
     const uint8_t* region = blob;
     const uint8_t* sig = blob + region_len;
     size_t sig_len = total_len - region_len;
 
     pthread_mutex_lock(&g_machine.mutex);
+    /* A concurrent trust-anchor update must not race between signature
+     * acceptance and nonce consumption. This also prevents replay reopening. */
     bool trusted = machine_signature_verifies_locked(region, region_len, sig, sig_len);
+    machine_ledger_outcome_t ledger = trusted ?
+        machine_ledger_consume_locked(&parsed.nonce, parsed.expires_ms, now) :
+        MACHINE_LEDGER_OK;
     pthread_mutex_unlock(&g_machine.mutex);
     if (!trusted) return QIHSE_MACHINE_AUTH_NO_TRUST;
-
-    pthread_mutex_lock(&g_machine.mutex);
-    machine_ledger_outcome_t ledger = machine_ledger_consume_locked(&parsed.nonce, parsed.expires_ms, now);
-    pthread_mutex_unlock(&g_machine.mutex);
     if (ledger == MACHINE_LEDGER_REPLAY) return QIHSE_MACHINE_AUTH_REPLAY;
     if (ledger == MACHINE_LEDGER_FULL) return QIHSE_MACHINE_AUTH_LEDGER_FULL;
 

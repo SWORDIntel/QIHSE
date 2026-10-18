@@ -119,7 +119,9 @@ int main(void) {
     printf("[PASS] valid MACHINE token authenticates, nonce consumed\n");
 
     assert(qihse_machine_auth_check(blob, len, 0, &claims) == QIHSE_MACHINE_AUTH_REPLAY);
-    printf("[PASS] replayed token nonce refused\n");
+    assert(qihse_machine_auth_configure(anchors, 1));
+    assert(qihse_machine_auth_check(blob, len, 0, &claims) == QIHSE_MACHINE_AUTH_REPLAY);
+    printf("[PASS] replay nonce refused, including after trust reconfiguration\n");
 
     /* ---- Forged signature: flip one byte inside the signature region ---- */
     len = mint_token(g_signer, blob, sizeof(blob), 3600000ull, 0,

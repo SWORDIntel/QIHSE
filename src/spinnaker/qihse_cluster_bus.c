@@ -1337,7 +1337,6 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         bus->veil_key_len = strlen(config->veil_key);
         bus->veil_key = (char*)malloc(bus->veil_key_len + 1u);
         if (!bus->veil_key) {
-            pthread_mutex_destroy(&bus->lock);
             free(bus);
             return NULL;
         }

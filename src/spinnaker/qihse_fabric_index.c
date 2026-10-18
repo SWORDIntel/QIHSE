@@ -31,13 +31,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define FABRIC_MAX_KEY 255u
 #define FABRIC_MANIFEST "manifest.tsv"
 #define FABRIC_SEG_CACHE_SIZE 32u
 #define FABRIC_MAX_RECORDS (1024u * 1024u)
 #define FABRIC_DEFAULT_DIR "/var/lib/qihse/fabric_index"
-#define FABRIC_FALLBACK_DIR "/tmp/qihse_fabric_index"
 
 /* ------------------------------------------------------------------ */
 /* KEYSTONE ABI (replicated; see KEYSTONE include/ headers)            */
@@ -169,18 +170,30 @@ static void fabric_state_reset_locked(void) {
     g_lib_path[0] = '\0';
 }
 
-static void fabric_ensure_directory(const char* path) {
+/* No symlink components, attacker-writable ancestors, foreign-owned
+ * ancestors, or shared leaf directory. Reject an insecure path instead of
+ * silently opening files or truncating an attacker-chosen pathname. */
+static bool fabric_ensure_directory(const char* path) {
     char tmp[512];
-    size_t len = strlen(path);
-    if (len == 0u || len >= sizeof(tmp)) return;
+    size_t len = path ? strlen(path) : 0;
+    if (!len || len >= sizeof(tmp)) return false;
     memcpy(tmp, path, len + 1u);
-    for (size_t i = 1u; i < len; i++) {
-        if (tmp[i] != '/') continue;
+    for (size_t i = 1u; i <= len; i++) {
+        if (i != len && tmp[i] != '/') continue;
+        char saved = tmp[i];
         tmp[i] = '\0';
-        if (tmp[0] != '\0') (void)mkdir(tmp, 0700);
-        tmp[i] = '/';
+        if (tmp[0]) {
+            if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return false;
+            struct stat st;
+            if (lstat(tmp, &st) != 0 || !S_ISDIR(st.st_mode) ||
+                (st.st_mode & 0022u) != 0u ||
+                (st.st_uid != geteuid() && st.st_uid != 0u)) return false;
+            if (i == len && (st.st_uid != geteuid() ||
+                             (st.st_mode & 0077u) != 0u)) return false;
+        }
+        tmp[i] = saved;
     }
-    (void)mkdir(tmp, 0700);
+    return true;
 }
 
 static bool fabric_key_is_indexable(const char* key) {
@@ -335,26 +348,16 @@ static void fabric_lazy_init_locked(void) {
     if (g_initialized) return;
     g_initialized = true;
 
-    /* Index directory: explicit > env > default with /tmp fallback. */
+    /* Refuse insecure storage; no fixed-name /tmp fallback and no
+     * fopen("w") probe that may truncate a symlink target. */
     const char* dir = g_index_dir[0] ? g_index_dir : getenv("QIHSE_FABRIC_INDEX_DIR");
     if (!dir || !*dir) dir = FABRIC_DEFAULT_DIR;
-    fabric_ensure_directory(dir);
-    /* Verify the directory is usable before committing to it. */
-    char probe[640];
-    snprintf(probe, sizeof(probe), "%s/.access", dir);
-    FILE* pf = fopen(probe, "w");
-    if (pf) {
-        fclose(pf);
-        (void)remove(probe);
-    } else {
-        dir = FABRIC_FALLBACK_DIR;
-        fabric_ensure_directory(dir);
+    if (!fabric_ensure_directory(dir)) {
+        g_available = false;
+        return;
     }
-    if (dir != g_index_dir) {
-        /* Never snprintf a buffer onto itself: overlapping copy is UB and
-         * glibc demonstrably produces an empty string for exact aliasing. */
+    if (dir != g_index_dir)
         snprintf(g_index_dir, sizeof(g_index_dir), "%s", dir);
-    }
 
     /* KEYSTONE library resolution. An explicitly configured path (argument or
      * QIHSE_KEYSTONE_LIB) is authoritative: if it fails to load, the index
