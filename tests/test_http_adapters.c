@@ -89,6 +89,24 @@ int main(void) {
     assert(qihse_http_server_start(influx) == 0 && influx->port != 0);
     assert_loopback_listener(influx);
 
+    /* Actual split TCP headers: no single recv is assumed to be a frame. */
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        struct sockaddr_in local = {0};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        local.sin_port = htons(influx->port);
+        assert(connect(fd, (struct sockaddr*)&local, sizeof(local)) == 0);
+        const char* part1 = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+        assert(send(fd, part1, strlen(part1), 0) == (ssize_t)strlen(part1));
+        assert(send(fd, "\r\n", 2, 0) == 2);
+        char response[512] = {0};
+        assert(recv(fd, response, sizeof(response)-1, 0) > 0);
+        assert(resp_status(response) == 200);
+        close(fd);
+    }
+
     char* r = http_req(influx->port, "POST", "/write?db=test",
                        "cpu value=42.5 1000000000\nmem value=7 1000000000\n");
     assert(resp_status(r) == 204);

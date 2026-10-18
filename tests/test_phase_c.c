@@ -263,6 +263,23 @@ static void test_http_api(void) {
     assert(strcmp(req.path, "/ping") == 0);
     http_request_free(&req);
 
+    /* Malformed/truncated frames must not materialize a request. */
+    const char partial[] = {'G','E','T',' ','/',' ','H'};
+    assert(http_parse_request(partial, sizeof(partial), &req) == 1);
+    const char* duplicate_len =
+        "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx";
+    assert(http_parse_request(duplicate_len, strlen(duplicate_len), &req) == -1);
+    const char* chunked =
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    assert(http_parse_request(chunked, strlen(chunked), &req) == -1);
+    const char* pipelined = "GET / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n";
+    assert(http_parse_request(pipelined, strlen(pipelined), &req) == -1);
+    const char* missing_body = "POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab";
+    assert(http_parse_request(missing_body, strlen(missing_body), &req) == 1);
+    const char malformed_nul[] = {'G','E','T',' ','/',' ','H','T','T','P','/','1','.','1',
+                                  '\r','\n','X',':',' ',0,'\r','\n','\r','\n'};
+    assert(http_parse_request(malformed_nul, sizeof(malformed_nul), &req) == -1);
+
     /* JSON helpers. */
     char* esc = json_escape("he said \"hi\"\n");
     assert(esc);

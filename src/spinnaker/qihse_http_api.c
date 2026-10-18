@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <strings.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -126,31 +127,35 @@ static void* http_client_thread(void* arg) {
     struct { int fd; qihse_http_server_t* srv; }* ctx = arg;
     int fd = ctx->fd;
     qihse_http_server_t* srv = ctx->srv;
-    char buf[65536];
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (n > 0) {
-        buf[n] = '\0';
-        http_request_t req;
-        if (http_parse_request(buf, (size_t)n, &req) != 0) {
-            http_response_t* err = http_response_error(400, "Bad Request");
-            if (err) send_response(fd, err);
+    char* buf = malloc(65536u);
+    size_t used = 0;
+    int parsed = -1;
+    http_request_t req = {0};
+    if (buf) while (used < 65535u) {
+        ssize_t n = recv(fd, buf + used, 65535u - used, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+        parsed = http_parse_request(buf, used, &req);
+        if (parsed != 1) break;
+    }
+    if (parsed != 0) {
+        http_response_t* err = http_response_error(400,"Malformed or incomplete request");
+        if (err) send_response(fd,err);
+        http_response_free(err);
+    } else {
+        http_route_t route;
+        if (!find_route(srv,req.path,req.method,&route)) {
+            http_response_t* err = http_response_error(404,"Not Found");
+            if (err) send_response(fd,err);
             http_response_free(err);
         } else {
-            http_route_t route;
-            if (!find_route(srv, req.path, req.method, &route)) {
-                http_response_t* err = http_response_error(404, "Not Found");
-                if (err) send_response(fd, err);
-                http_response_free(err);
-            } else {
-                http_response_t* res = route.handler(&req, route.user_data);
-                if (res) {
-                    send_response(fd, res);
-                    http_response_free(res);
-                }
-            }
-            http_request_free(&req);
+            http_response_t* res = route.handler(&req,route.user_data);
+            if (res) { send_response(fd,res); http_response_free(res); }
         }
     }
+    http_request_free(&req);
+    free(buf);
     close(fd);
     pthread_mutex_lock(&srv->lock);
     if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
@@ -293,56 +298,130 @@ void http_response_free(http_response_t* res) {
     free(res);
 }
 
-/* Request parsing */
+/* A complete HTTP/1.x frame is 0, incomplete is 1, malformed is -1.
+ * Strict Content-Length framing rejects request smuggling and C-string input
+ * truncation in existing protocol-shape adapters. No chunked encoding. */
+enum { HTTP_HEADER_CAP = 8192, HTTP_FRAME_CAP = 65535, HTTP_TARGET_CAP = 4096 };
+static int http_header_info(const char* raw, size_t len, size_t* header_end,
+                            size_t* body_len, char** type_out) {
+    *header_end = *body_len = 0;
+    *type_out = NULL;
+    if (len > HTTP_FRAME_CAP) return -1;
+    size_t end = 0;
+    for (size_t i = 3; i < len && i < HTTP_HEADER_CAP; i++) {
+        if (!memcmp(raw + i - 3, "\r\n\r\n", 4)) { end = i + 1; break; }
+    }
+    if (!end) return len >= HTTP_HEADER_CAP ? -1 : 1;
+    if (memchr(raw, '\0', end)) return -1;
+    const char* begin = raw;
+    const char* limit = raw + end - 2;
+    const char* cr = memchr(begin, '\r', (size_t)(limit - begin));
+    if (!cr || cr == begin || cr[1] != '\n') return -1;
+    const char* sp = memchr(begin, ' ', (size_t)(cr - begin));
+    if (!sp) return -1;
+    const char* version_sp = memchr(sp + 1, ' ', (size_t)(cr - sp - 1));
+    if (!version_sp || version_sp == sp + 1) return -1;
+    const char* version = version_sp + 1;
+    if ((cr - version) != 8 ||
+        (memcmp(version, "HTTP/1.1", 8) && memcmp(version, "HTTP/1.0", 8)))
+        return -1;
+    const char* line = cr + 2;
+    bool seen_length = false, seen_type = false;
+    unsigned fields = 0;
+    while (line < limit) {
+        if (++fields > 64) return -1;
+        cr = memchr(line, '\r', (size_t)(limit - line));
+        if (!cr || cr == line || cr[1] != '\n') return -1;
+        const char* colon = memchr(line, ':', (size_t)(cr - line));
+        if (!colon || colon == line) return -1;
+        for (const char* p = line; p < colon; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || strchr("!#$%&'*+-.^_|~",c)))
+                return -1;
+        }
+        const char* val = colon + 1;
+        while (val < cr && (*val == ' ' || *val == '\t')) val++;
+        const char* stop = cr;
+        while (stop > val && (stop[-1] == ' ' || stop[-1] == '\t')) stop--;
+        for (const char* p = val; p < stop; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (c < 32 || c == 127) return -1;
+        }
+        size_t namelen = (size_t)(colon - line);
+        if (namelen == 14 && !strncasecmp(line, "Content-Length", 14)) {
+            if (seen_length || stop == val) return -1;
+            seen_length = true;
+            for (const char* p = val; p < stop; p++) {
+                if (*p < '0' || *p > '9') return -1;
+                unsigned d = (unsigned)(*p - '0');
+                if (*body_len > (HTTP_FRAME_CAP - d)/10u) return -1;
+                *body_len = *body_len * 10u + d;
+            }
+        } else if (namelen == 17 && !strncasecmp(line,"Transfer-Encoding",17)) {
+            return -1;
+        } else if (namelen == 12 && !strncasecmp(line,"Content-Type",12)) {
+            if (seen_type || stop - val > 255) return -1;
+            seen_type = true;
+            *type_out = strndup(val, (size_t)(stop - val));
+            if (!*type_out) return -1;
+        }
+        line = cr + 2;
+    }
+    if (line != limit || *body_len > HTTP_FRAME_CAP - end) return -1;
+    *header_end = end;
+    return 0;
+}
+
 int http_parse_request(const char* raw, size_t len, http_request_t* out) {
     if (!raw || !out) return -1;
     memset(out, 0, sizeof(*out));
-    /* Parse method */
-    const char* p = raw;
-    const char* sp = strchr(p, ' ');
-    if (!sp) return -1;
-    size_t mlen = sp - p;
-    if (mlen == 3 && strncmp(p, "GET", 3) == 0) out->method = HTTP_GET;
-    else if (mlen == 4 && strncmp(p, "POST", 4) == 0) out->method = HTTP_POST;
-    else if (mlen == 3 && strncmp(p, "PUT", 3) == 0) out->method = HTTP_PUT;
-    else if (mlen == 6 && strncmp(p, "DELETE", 6) == 0) out->method = HTTP_DELETE;
-    else if (mlen == 5 && strncmp(p, "PATCH", 5) == 0) out->method = HTTP_PATCH;
-    else if (mlen == 4 && strncmp(p, "HEAD", 4) == 0) out->method = HTTP_HEAD;
-    else return -1;
-    
-    /* Parse path */
-    p = sp + 1;
-    sp = strchr(p, ' ');
-    if (!sp) return -1;
-    const char* q = strchr(p, '?');
-    if (q && q < sp) {
-        out->path = strndup(p, q - p);
-        out->query_string = strndup(q + 1, sp - q - 1);
-    } else {
-        out->path = strndup(p, sp - p);
+    size_t head = 0, body = 0;
+    char* type = NULL;
+    int rc = http_header_info(raw, len, &head, &body, &type);
+    if (rc != 0) { free(type); return rc; }
+    if (len < head + body) { free(type); return 1; }
+    if (len != head + body || memchr(raw + head, '\0', body)) {
+        free(type);
+        return -1;
     }
-    
-    /* Find body (after \r\n\r\n) */
-    const char* body_start = strstr(raw, "\r\n\r\n");
-    if (body_start) {
-        body_start += 4;
-        out->body_len = len - (body_start - raw);
-        if (out->body_len > 0) {
-            out->body = (char*)malloc(out->body_len + 1);
-            memcpy(out->body, body_start, out->body_len);
-            out->body[out->body_len] = '\0';
+    const char* sp = memchr(raw, ' ', head);
+    if (!sp) { free(type); return -1; }
+    size_t method_len = (size_t)(sp - raw);
+    if (method_len == 3 && !memcmp(raw,"GET",3)) out->method = HTTP_GET;
+    else if (method_len == 4 && !memcmp(raw,"POST",4)) out->method = HTTP_POST;
+    else if (method_len == 3 && !memcmp(raw,"PUT",3)) out->method = HTTP_PUT;
+    else if (method_len == 6 && !memcmp(raw,"DELETE",6)) out->method = HTTP_DELETE;
+    else if (method_len == 5 && !memcmp(raw,"PATCH",5)) out->method = HTTP_PATCH;
+    else if (method_len == 4 && !memcmp(raw,"HEAD",4)) out->method = HTTP_HEAD;
+    else { free(type); return -1; }
+    const char* target = sp + 1;
+    const char* next = memchr(target,' ', (size_t)(raw + head - target));
+    if (!next || target == next || target[0] != '/' ||
+        next - target > HTTP_TARGET_CAP) { free(type); return -1; }
+    for (const char* c = target; c < next; ++c) {
+        unsigned char v = (unsigned char)*c;
+        if (v <= 32 || v >= 127 || v == '\\') { free(type); return -1; }
+    }
+    const char* qm = memchr(target,'?',(size_t)(next - target));
+    size_t plen = (size_t)((qm ? qm : next) - target);
+    if (!plen) { free(type); return -1; }
+    out->path = strndup(target, plen);
+    if (qm) out->query_string = strndup(qm + 1, (size_t)(next - qm - 1));
+    out->content_type = type;
+    if (body) {
+        out->body = malloc(body + 1);
+        if (out->body) {
+            memcpy(out->body, raw + head, body);
+            out->body[body] = '\0';
+            out->body_len = body;
         }
     }
-    
-    /* Parse Content-Type */
-    const char* ct = strcasestr(raw, "Content-Type:");
-    if (ct) {
-        ct += 13;
-        while (*ct == ' ' || *ct == '\t') ct++;
-        const char* eol = strstr(ct, "\r\n");
-        if (eol) out->content_type = strndup(ct, eol - ct);
+    if (!out->path || (qm && !out->query_string) || (body && !out->body)) {
+        http_request_free(out);
+        memset(out, 0, sizeof(*out));
+        return -1;
     }
-    
     return 0;
 }
 

@@ -69,12 +69,15 @@ static uint64_t machine_now_ms(void) {
  * Computed once (a hardcoded constant here would be an unverified trust
  * anchor in its own right). */
 static const uint8_t* machine_empty_payload_digest(void) {
-    static uint8_t digest[48];
-    static int computed = 0;
-    if (!computed) {
-        SHA384((const unsigned char*)"", 0u, digest);
-        computed = 1;
-    }
+    /* SHA-384(empty), immutable. Avoid a cross-thread non-atomic lazy-init race. */
+    static const uint8_t digest[48] = {
+        0x38,0xb0,0x60,0xa7,0x51,0xac,0x96,0x38,
+        0x4c,0xd9,0x32,0x7e,0xb1,0xb1,0xe3,0x6a,
+        0x21,0xfd,0xb7,0x11,0x14,0xbe,0x07,0x43,
+        0x4c,0x0c,0xc7,0xbf,0x63,0xf6,0xe1,0xda,
+        0x27,0x4e,0xde,0xbf,0xe7,0x6f,0x65,0xfb,
+        0xd5,0x1a,0xd2,0xf1,0x48,0x98,0xb9,0x5b
+    };
     return digest;
 }
 
@@ -89,7 +92,7 @@ static void machine_anchor_free_locked(void) {
 }
 
 bool qihse_machine_auth_configure(const char* const* trusted_pub_paths, size_t count) {
-    if (trusted_pub_paths && count > QIHSE_MACHINE_MAX_ANCHORS) count = QIHSE_MACHINE_MAX_ANCHORS;
+    if (count > QIHSE_MACHINE_MAX_ANCHORS) return false; /* no silent partial trust roster */
 
     pthread_mutex_lock(&g_machine.mutex);
     machine_anchor_free_locked();
@@ -160,7 +163,8 @@ static machine_ledger_outcome_t machine_ledger_consume_locked(
     ssize_t free_slot = -1;
     for (size_t i = 0; i < QIHSE_MACHINE_LEDGER_CAP; i++) {
         machine_ledger_entry_t* e = &g_machine.ledger[i];
-        if (e->used && e->expires_ms + QIHSE_MACHINE_CLOCK_SKEW_MS <= now) {
+        if (e->used && e->expires_ms <= now &&
+            now - e->expires_ms >= QIHSE_MACHINE_CLOCK_SKEW_MS) {
             memset(e, 0, sizeof(*e)); /* expired + skew grace elapsed: purge */
         }
         if (e->used && memcmp(e->nonce.bytes, nonce->bytes, QIHSE_UUID_BYTES) == 0) {
@@ -219,7 +223,8 @@ qihse_machine_auth_verdict_t qihse_machine_auth_check(
     }
 
     uint64_t now = now_ms ? now_ms : machine_now_ms();
-    if (parsed.issued_ms > now + QIHSE_MACHINE_CLOCK_SKEW_MS) {
+    if (parsed.issued_ms > now &&
+        parsed.issued_ms - now > QIHSE_MACHINE_CLOCK_SKEW_MS) {
         return QIHSE_MACHINE_AUTH_ISSUED_IN_FUTURE;
     }
     if (parsed.expires_ms < parsed.issued_ms) {
@@ -228,7 +233,8 @@ qihse_machine_auth_verdict_t qihse_machine_auth_check(
     if (parsed.expires_ms - parsed.issued_ms > QIHSE_MACHINE_TOKEN_MAX_TTL_MS) {
         return QIHSE_MACHINE_AUTH_TTL_TOO_LONG;
     }
-    if (parsed.expires_ms + QIHSE_MACHINE_CLOCK_SKEW_MS < now) {
+    if (parsed.expires_ms < now &&
+        now - parsed.expires_ms > QIHSE_MACHINE_CLOCK_SKEW_MS) {
         return QIHSE_MACHINE_AUTH_EXPIRED;
     }
 
