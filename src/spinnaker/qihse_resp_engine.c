@@ -287,6 +287,7 @@ struct qihse_resp_server {
     pthread_cond_t clients_drained;
     qihse_resp_client_ctx_t* clients;
     size_t active_clients;
+    bool stopping; /* serialized with state_lock; reject direct sessions during teardown */
     uint64_t next_client_id;
     uint64_t next_worker;
     pthread_rwlock_t kv_lock;
@@ -5833,14 +5834,32 @@ static void qihse_resp_sub_remove_at(char*** values, size_t** lens, size_t* coun
 static bool qihse_resp_sub_add(char*** values, size_t** lens, size_t* count, size_t* cap,
                                char* value, size_t len) {
     if (*count >= *cap) {
-        *cap = *cap ? *cap * 2u : 8u;
-        *values = realloc(*values, *cap * sizeof(char*));
-        *lens = realloc(*lens, *cap * sizeof(size_t));
-        if (!*values || !*lens) return false;
+        size_t next_cap = *cap ? *cap * 2u : 8u;
+        if (next_cap <= *cap || next_cap > SIZE_MAX / sizeof(char*) ||
+            next_cap > SIZE_MAX / sizeof(size_t)) return false;
+        /* Two dependent realloc calls cannot be committed separately:
+         * failure of the second used to lose an owned array and corrupt
+         * the advertised capacity. Allocate both before publishing. */
+        char** grown_values = malloc(next_cap * sizeof(*grown_values));
+        size_t* grown_lens = malloc(next_cap * sizeof(*grown_lens));
+        if (!grown_values || !grown_lens) {
+            free(grown_values);
+            free(grown_lens);
+            return false;
+        }
+        if (*count) {
+            memcpy(grown_values, *values, *count * sizeof(*grown_values));
+            memcpy(grown_lens, *lens, *count * sizeof(*grown_lens));
+        }
+        free(*values);
+        free(*lens);
+        *values = grown_values;
+        *lens = grown_lens;
+        *cap = next_cap;
     }
     (*values)[*count] = value;
     (*lens)[*count] = len;
-    (*count)++;
+    ++*count;
     return true;
 }
 
@@ -12455,7 +12474,11 @@ static void qihse_resp_remove_client(qihse_resp_client_ctx_t* client) {
         *cursor = client->next;
         if (server->active_clients > 0) server->active_clients--;
     }
-    if (server->active_clients == 0) pthread_cond_broadcast(&server->clients_drained);
+    if (server->active_clients == 0) {
+        if (!server->stopping && server->listen_fd < 0)
+            __atomic_store_n(&server->running, false, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&server->clients_drained);
+    }
     pthread_mutex_unlock(&server->state_lock);
 }
 
@@ -13034,6 +13057,7 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
         errno = EALREADY;
         return false;
     }
+    server->stopping = false;
     server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
@@ -13076,6 +13100,7 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
         errno = EALREADY;
         return false;
     }
+    server->stopping = false;
     server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
@@ -13106,6 +13131,7 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
     pthread_t accept_thread;
     bool join_accept = false;
     pthread_mutex_lock(&server->state_lock);
+    server->stopping = true;
     __atomic_store_n(&server->running, false, __ATOMIC_RELEASE);
     if (server->listen_fd >= 0) shutdown(server->listen_fd, SHUT_RDWR);
     for (qihse_resp_client_ctx_t* client = server->clients; client; client = client->next) shutdown(client->fd, SHUT_RDWR);
@@ -13239,12 +13265,40 @@ bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_
         errno = EINVAL;
         return false;
     }
-    bool was_running = __atomic_load_n(&server->running, __ATOMIC_ACQUIRE);
-    if (!was_running) __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
+    /* Direct-handled sockets MUST participate in stop()/destroy() draining.
+     * Otherwise the caller can free server after stop() observes zero
+     * listener-accepted clients but before this session cleans up pub/sub,
+     * resulting in a reproducible ASan heap-use-after-free.
+     * Ownership of client_fd transfers to this function on valid invocation. */
+    qihse_resp_client_ctx_t* client = calloc(1, sizeof(*client));
+    if (!client) {
+        shutdown(client_fd, SHUT_RDWR);
+        close_socket(client_fd);
+        errno = ENOMEM;
+        return false;
+    }
+    client->server = server;
+    client->fd = client_fd;
+    pthread_mutex_lock(&server->state_lock);
+    if (server->stopping || server->active_clients >= server->max_clients) {
+        pthread_mutex_unlock(&server->state_lock);
+        free(client);
+        shutdown(client_fd, SHUT_RDWR);
+        close_socket(client_fd);
+        errno = EBUSY;
+        return false;
+    }
+    client->next = server->clients;
+    server->clients = client;
+    ++server->active_clients;
+    __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&server->state_lock);
+
     bool result = qihse_resp_session_loop(server, client_fd);
-    shutdown(client_fd, SHUT_RDWR);
-    close_socket(client_fd);
-    if (!was_running) __atomic_store_n(&server->running, false, __ATOMIC_RELEASE);
+    qihse_resp_remove_client(client);
+    free(client);
+    /* Do not touch server here: destroy() may proceed immediately after the
+     * last client is unregistered and clients_drained is broadcast. */
     return result;
 }
 

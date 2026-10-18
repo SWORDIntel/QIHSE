@@ -44,12 +44,16 @@ typedef struct {
 
 static void* server_thread(void* argument) {
     server_thread_arg_t* args = (server_thread_arg_t*)argument;
-    assert(qihse_resp_server_handle_client_fd(args->server, args->fd));
+    qihse_resp_server_t* server = args->server;
+    int fd = args->fd;
+    free(args);
+    (void)qihse_resp_server_handle_client_fd(server, fd);
     return NULL;
 }
 
 typedef struct {
     int fd;
+    pthread_t thread;
 } test_client_t;
 
 static void client_init(test_client_t* client, qihse_resp_server_t* server) {
@@ -59,9 +63,7 @@ static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     assert(args != NULL);
     args->server = server;
     args->fd = sockets[1];
-    pthread_t thread;
-    assert(pthread_create(&thread, NULL, server_thread, args) == 0);
-    pthread_detach(thread);
+    assert(pthread_create(&client->thread, NULL, server_thread, args) == 0);
     client->fd = sockets[0];
 }
 
@@ -281,7 +283,13 @@ int main(void) {
     close(tenant8_client.fd);
     close(anon.fd);
     close(operator_client.fd);
+    /* Server teardown must not race with detached session cleanup. In
+     * addition, direct API handlers now participate in destroy() draining. */
     qihse_resp_server_destroy(server);
+    assert(pthread_join(tenant7_client.thread, NULL) == 0);
+    assert(pthread_join(tenant8_client.thread, NULL) == 0);
+    assert(pthread_join(anon.thread, NULL) == 0);
+    assert(pthread_join(operator_client.thread, NULL) == 0);
     qihse_quota_table_destroy(quotas);
     qihse_kv_store_destroy(store);
     printf("test_tenant_security_regression: all assertions passed\n");
