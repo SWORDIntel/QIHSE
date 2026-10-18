@@ -58,35 +58,55 @@ def detect_node_name() -> str:
     return hostname
 
 
-def run_cmd(cmd: str, timeout: int = 5) -> str:
+def run_cmd(cmd: list[str], timeout: int = 5) -> str:
     try:
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return res.stdout.strip()
-    except Exception:
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=timeout, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
         return ""
 
+
+
+def _resp_socket(host, port, timeout):
+    """Explicit TLS for remote RESP; loopback-only plaintext for local tunnels."""
+    import ipaddress
+    import ssl
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    ca = os.environ.get("QIHSE_RESP_CA_FILE")
+    peer = os.environ.get("QIHSE_RESP_SERVER_NAME")
+    if not loopback and (not ca or not peer):
+        raise ConnectionError("remote RESP requires a pinned CA and TLS server identity")
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    if not loopback:
+        try:
+            tls = ssl.create_default_context(cafile=ca)
+            tls.minimum_version = ssl.TLSVersion.TLSv1_3
+            sock = tls.wrap_socket(sock, server_hostname=peer)
+        except Exception:
+            sock.close()
+            raise
+    return sock
 
 def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int = 3):
     """Zero-dependency minimal RESP client."""
     if not auth:
         return None, "QIHSE_OPERATOR_PASSWORD is required; no default credential exists"
     try:
-        s = socket.create_connection((host, port), timeout=timeout)
+        s = _resp_socket(host, port, timeout)
         f = s.makefile('rb')
 
         # AUTH
-        auth_payload = f"*2\r\n$4\r\nAUTH\r\n${len(auth)}\r\n{auth}\r\n".encode()
+        password = auth.encode("utf-8")
+        auth_payload = b"*2\r\n$4\r\nAUTH\r\n$" + str(len(password)).encode("ascii") + b"\r\n" + password + b"\r\n"
         s.sendall(auth_payload)
-        auth_res = f.readline().decode()
-        if not auth_res.startswith('+OK'):
+        auth_res = f.readline(8193)
+        if auth_res != b"+OK\r\n":
             s.close()
-            return None, f"AUTH failed: {auth_res.strip()}"
+            return None, "AUTH refused or malformed"
 
         # Command
         lines = [f"*{len(args)}".encode()]
@@ -98,10 +118,11 @@ def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int =
         s.sendall(b"\r\n".join(lines))
 
         # Response
-        resp_line = f.readline().decode()
-        if not resp_line:
+        resp_line_bytes = f.readline(8193)
+        if not resp_line_bytes.endswith(b"\r\n") or len(resp_line_bytes) > 8192:
             s.close()
-            return None, "Empty response"
+            return None, "Invalid or oversized RESP header"
+        resp_line = resp_line_bytes.decode("utf-8", "strict")
 
         prefix = resp_line[0]
         line = resp_line[1:].strip()
@@ -114,12 +135,15 @@ def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int =
             val = int(line)
         elif prefix == '$':
             length = int(line)
-            if length >= 0:
-                content = f.read(length)
-                f.read(2)
-                val = content.decode('utf-8', 'replace')
-            else:
+            if length == -1:
                 val = None
+            elif 0 <= length <= 1048576:
+                content = f.read(length + 2)
+                if len(content) != length + 2 or not content.endswith(b"\r\n"):
+                    raise ValueError("Truncated RESP bulk")
+                val = content[:-2].decode('utf-8', 'replace')
+            else:
+                raise ValueError("Invalid or oversized RESP bulk")
         else:
             val = line
 
@@ -142,7 +166,7 @@ def collect_local_telemetry(node_name: str | None = None) -> dict:
         try:
             mtime = os.path.getmtime(csv_path)
             if time.time() - mtime < 35:
-                tail_line = run_cmd(f"tail -n 1 {csv_path}", timeout=2)
+                tail_line = run_cmd(["tail", "-n", "1", "--", csv_path], timeout=2)
                 cols = [c.strip() for c in tail_line.split(",")]
                 if len(cols) >= 10:
                     csv_data = {
@@ -162,12 +186,11 @@ def collect_local_telemetry(node_name: str | None = None) -> dict:
             pass
 
     # IPMI sensor read (15s timeout)
-    if os.geteuid() != 0:
-        cmd = "sudo ipmitool sdr type temperature; sudo ipmitool sdr type fan"
-    else:
-        cmd = "ipmitool sdr type temperature; ipmitool sdr type fan"
-
-    raw_ipmi = run_cmd(cmd, timeout=15)
+    prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
+    raw_ipmi = "\n".join(
+        run_cmd(prefix + ["ipmitool", "sdr", "type", kind], timeout=15)
+        for kind in ("temperature", "fan")
+    )
 
     cpu_temps = []
     inlet_temp = csv_data.get("inlet_temp")

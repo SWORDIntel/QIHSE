@@ -80,17 +80,11 @@ def detect_node_name():
     return hostname
 
 
-def run_cmd(cmd, timeout=5):
+def run_cmd(cmd: list[str], timeout=5):
     try:
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return res.stdout.strip()
-    except Exception as e:
+        result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=timeout, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
@@ -104,13 +98,20 @@ def _encode_command(args):
     return b"\r\n".join(lines)
 
 
-def _read_reply(f):
-    """Read one RESP reply. Returns ('ok'|'err'|'int'|'bulk'|'null'|'array', value)."""
-    line = f.readline()
-    if not line:
-        raise ConnectionError("empty reply (connection closed)")
-    line = line.decode("utf-8", "replace").rstrip("\r\n")
-    kind, body = line[0], line[1:]
+def _read_reply(f, depth=0, budget=None):
+    """Bounded RESP2 reply parser; no attacker-sized reads or recursive storms."""
+    if budget is None:
+        budget = [4 * 1024 * 1024]
+    if depth > 16:
+        raise ConnectionError("RESP nesting limit exceeded")
+    line = f.readline(8193)
+    if not line.endswith(b"\r\n") or len(line) > 8192 or not line:
+        raise ConnectionError("malformed or oversized RESP header")
+    budget[0] -= len(line)
+    if budget[0] < 0:
+        raise ConnectionError("RESP byte budget exceeded")
+    kind = chr(line[0])
+    body = line[1:-2].decode("utf-8", "strict")
     if kind == "+":
         return "ok", body
     if kind == "-":
@@ -119,18 +120,48 @@ def _read_reply(f):
         return "int", int(body)
     if kind == "$":
         length = int(body)
-        if length < 0:
+        if length == -1:
             return "null", None
-        data = f.read(length)
-        f.read(2)  # trailing \r\n
-        return "bulk", data.decode("utf-8", "replace")
+        if length < 0 or length > 1048576 or length + 2 > budget[0]:
+            raise ConnectionError("invalid or oversized RESP bulk")
+        data = f.read(length + 2)
+        if len(data) != length + 2 or not data.endswith(b"\r\n"):
+            raise ConnectionError("truncated RESP bulk")
+        budget[0] -= len(data)
+        return "bulk", data[:-2].decode("utf-8", "replace")
     if kind == "*":
         count = int(body)
-        if count < 0:
+        if count == -1:
             return "null", None
-        return "array", [_read_reply(f) for _ in range(count)]
-    raise ConnectionError(f"unknown reply type {kind!r}")
+        if count < 0 or count > 4096 or count > budget[0] // 3:
+            raise ConnectionError("oversized RESP array")
+        return "array", [_read_reply(f, depth + 1, budget) for _ in range(count)]
+    raise ConnectionError("unknown RESP reply type")
 
+
+def _resp_socket(host, port, timeout):
+    """TLS with configured CA/identity for remote endpoints; plaintext only on IP loopback."""
+    import ipaddress
+    import ssl
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    ca = os.environ.get("QIHSE_RESP_CA_FILE")
+    peer = os.environ.get("QIHSE_RESP_SERVER_NAME")
+    if not loopback and (not ca or not peer):
+        raise ConnectionError("remote RESP requires pinned CA and TLS server identity")
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    if not loopback:
+        try:
+            tls = ssl.create_default_context(cafile=ca)
+            tls.minimum_version = ssl.TLSVersion.TLSv1_3
+            sock = tls.wrap_socket(sock, server_hostname=peer)
+        except Exception:
+            sock.close()
+            raise
+    return sock
 
 class QihseConnection:
     """One authenticated, persistent RESP connection to one node."""
@@ -144,7 +175,7 @@ class QihseConnection:
 
     def _open_and_auth(self):
         self.close()
-        s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        s = _resp_socket(self.host, self.port, self.timeout)
         s.settimeout(self.timeout)
         self.sock = s
         self.f = s.makefile("rb")
@@ -152,13 +183,11 @@ class QihseConnection:
         token = self._load_machine_token()
         if token is not None:
             kind, value = self._roundtrip(["MACHINEAUTH", token])
-            if kind == "ok":
+            if kind == "ok" and value == "OK":
                 return
-            # No machine trust on this node, or token refused: fall back to
-            # the password path if one is configured. Never print the token.
-            sys.stderr.write(
-                f"[fan-agent] MACHINEAUTH on {self.host}:{self.port} refused "
-                f"({value}); falling back to password AUTH\n")
+            # A failed machine-token exchange must not downgrade to a password.
+            self.close()
+            raise ConnectionError("MACHINEAUTH refused; password downgrade prohibited")
 
         password = os.environ.get("QIHSE_OPERATOR_PASSWORD")
         if not password:
@@ -166,17 +195,21 @@ class QihseConnection:
                 f"no machine token usable at {MACHINE_TOKEN_PATH} and "
                 "QIHSE_OPERATOR_PASSWORD not set — cannot authenticate")
         kind, value = self._roundtrip(["AUTH", password])
-        if kind != "ok":
-            raise ConnectionError(f"AUTH refused by {self.host}:{self.port}: {value}")
+        if (kind, value) != ("ok", "OK"):
+            raise ConnectionError("AUTH refused")
 
     @staticmethod
     def _load_machine_token():
         try:
             with open(MACHINE_TOKEN_PATH, "r", encoding="ascii") as tf:
-                token = tf.read().strip()
-            return token or None
-        except OSError:
+                token = tf.read(8193).strip()
+            if not token or len(token) > 8192:
+                raise ConnectionError("configured machine token is empty or oversized")
+            return token
+        except FileNotFoundError:
             return None
+        except (OSError, UnicodeError) as exc:
+            raise ConnectionError("configured machine token cannot be read") from exc
 
     def _roundtrip(self, args):
         self.sock.sendall(_encode_command(args))
@@ -269,6 +302,8 @@ class QihsePool:
 
     def _run_redirect(self, args, redirect, hops):
         slot, host, port = redirect
+        if slot < 0 or slot >= 16384 or (host, port) not in {(h, p) for h, p, _ in CLUSTER_SEEDS}:
+            raise ConnectionError("untrusted cluster redirect refused")
         try:
             conn = self._conn_for(host, port)
             kind, value = conn.command(args)
@@ -324,7 +359,7 @@ def collect_local_telemetry(node_name):
         try:
             mtime = os.path.getmtime(csv_path)
             if time.time() - mtime < 35:
-                tail_line = run_cmd(f"tail -n 1 {csv_path}", timeout=2)
+                tail_line = run_cmd(["tail", "-n", "1", "--", csv_path], timeout=2)
                 cols = [c.strip() for c in tail_line.split(",")]
                 if len(cols) >= 10:
                     # timestamp,profile,cpu_max,cpu_avg,sys_max,inlet,load,pwm,target,fan_avg,manual,dt_dt,ttc,exhaust_delta,nvme_max,prediction_boost
@@ -345,12 +380,11 @@ def collect_local_telemetry(node_name):
             pass
 
     # ipmitool sensor reads (15s timeout to handle busy BMCs)
-    if os.geteuid() != 0:
-        cmd = "sudo ipmitool sdr type temperature; sudo ipmitool sdr type fan"
-    else:
-        cmd = "ipmitool sdr type temperature; ipmitool sdr type fan"
-
-    raw_ipmi = run_cmd(cmd, timeout=15)
+    prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
+    raw_ipmi = "\n".join(
+        run_cmd(prefix + ["ipmitool", "sdr", "type", kind], timeout=15)
+        for kind in ("temperature", "fan")
+    )
 
     cpu_temps = []
     inlet_temp = csv_data.get("inlet_temp")

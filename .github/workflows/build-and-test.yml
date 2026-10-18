@@ -57,6 +57,11 @@ jobs:
     - name: Run Fabric Index Authorization Regression (independent)
       run: make test-fabric-index
 
+    - name: Python Fleet Protocol Security Regressions
+      run: |
+        python3 -m py_compile python/qihse/thermal.py tools/fleet/qihse-fan-agent.py
+        python3 -m unittest discover -s python/tests -p 'test_fleet_resp_security.py' -v
+
     - name: Run Core Test Suite
       run: |
         set -o pipefail
