@@ -3,51 +3,27 @@ using Qihse.Studio.Server.Middleware;
 using Qihse.Studio.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
-
-// Ensure default listening on 0.0.0.0:5100 if not specified in environment
 if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
-{
-    builder.WebHost.UseUrls("http://0.0.0.0:5100");
-}
+    builder.WebHost.UseUrls("http://127.0.0.1:5100");
 
-// Add services to the container.
 builder.Services.AddControllers();
 builder.Services.AddSignalR();
-
-// Register background telemetry & mesh service
 builder.Services.AddSingleton<ClusterMeshService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterMeshService>());
-
-// CORS for Vite dev server (port 5173)
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowViteDev", policy =>
-    {
-        policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials();
-    });
-});
+builder.Services.AddCors(options => options.AddPolicy("AllowViteDev", policy =>
+    policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
+          .AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
 var app = builder.Build();
-
-// Strict LAN-only & loopback security middleware
+// Neither private source addresses nor CORS are authentication.
 app.UseMiddleware<LanOnlyMiddleware>();
-
+app.UseMiddleware<StudioAuthMiddleware>();
 app.UseCors("AllowViteDev");
-
-// Static files for production built SPA
 app.UseDefaultFiles();
 app.UseStaticFiles();
-
 app.UseRouting();
 app.UseAuthorization();
-
 app.MapControllers();
 app.MapHub<TelemetryHub>("/hub/telemetry");
-
-// Fallback to SPA index.html for client-side routing
 app.MapFallbackToFile("index.html");
-
 app.Run();

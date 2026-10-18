@@ -13,7 +13,7 @@ public class ClusterMeshService : BackgroundService
     private readonly Dictionary<string, QihseRespClient> _clients = new();
     private TelemetryFrame _latestFrame;
     private readonly object _stateLock = new();
-    private long _totalOperations = 1420800;
+    private long _totalOperations = 0;
     private readonly Random _rand = new();
 
     public TelemetryFrame LatestFrame
@@ -33,9 +33,9 @@ public class ClusterMeshService : BackgroundService
         _hubContext = hubContext;
         _logger = logger;
 
-        _clusterPassword = config.GetValue<string>("Cluster:Password")
-            ?? Environment.GetEnvironmentVariable("QIHSE_CLUSTER_PASSWORD")
-            ?? "QihseCluster2026x!";
+        _clusterPassword = Environment.GetEnvironmentVariable("QIHSE_CLUSTER_PASSWORD")
+            ?? config.GetValue<string>("Cluster:Password")
+            ?? string.Empty;
 
         _configuredNodes = new List<QihseNodeConfig>
         {
@@ -60,20 +60,20 @@ public class ClusterMeshService : BackgroundService
     private TelemetryFrame BuildInitialFrame()
     {
         var nodes = _configuredNodes.Select(n => new QihseNode(
-            n.Id, n.Host, n.Port, "master", "online", n.Architecture, n.Capabilities, n.ShardSlots, 0.42, 4294967296, 12500
+            n.Id, n.Host, n.Port, "unknown", "unavailable", n.Architecture, n.Capabilities, n.ShardSlots, 0, 0, 0
         )).ToList();
 
         return new TelemetryFrame(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            654918,
-            144.5,
-            176.0,
-            295.0,
-            100000,
+            0,
+            0,
+            0,
+            0,
+            0,
             _totalOperations,
             nodes,
             16384,
-            "HEALTHY_OK"
+            "UNAVAILABLE"
         );
     }
 
@@ -91,49 +91,39 @@ public class ClusterMeshService : BackgroundService
                 foreach (var cfg in _configuredNodes)
                 {
                     var client = _clients[cfg.Id];
-                    double ping = 0.15;
-                    string status = "online";
+                    double ping = 0;
+                    string status = "unavailable";
 
-                    try
+                    if (string.IsNullOrEmpty(_clusterPassword))
+                    {
+                        status = "unconfigured";
+                    }
+                    else try
                     {
                         var pingSw = Stopwatch.StartNew();
                         var resp = await client.SendCommandAsync(new[] { "PING" }, stoppingToken);
                         pingSw.Stop();
 
-                        if (resp.Contains("PONG"))
+                        if (resp == "PONG")
                         {
                             ping = pingSw.Elapsed.TotalMilliseconds;
                             status = "online";
                         }
                         else
                         {
-                            // If remote server is mock/standby, provide realistic microsecond RTT
-                            ping = cfg.Id == "node-0" ? 0.08 : cfg.Id == "node-5" ? 0.35 : 1.25;
-                            status = "online";
+                            ping = 0;
+                            status = "unavailable";
                         }
                     }
                     catch
                     {
-                        ping = cfg.Id == "node-0" ? 0.08 : 0.45;
-                        status = "online";
+                        ping = 0;
+                        status = "unavailable";
                     }
 
-                    // Calculate live dynamic QPS per node
-                    double nodeQps = cfg.Id switch
-                    {
-                        "node-5" => 284500 + _rand.Next(-5000, 5000),   // Broadwell R730xd (high throughput)
-                        "node-sec" => 395000 + _rand.Next(-8000, 8000), // Zen 4 (vector engine)
-                        "node-0" => 142000 + _rand.Next(-3000, 3000),   // Ivy Bridge Host
-                        _ => 85000 + _rand.Next(-2000, 2000)            // Relay Node
-                    };
-
-                    long mem = cfg.Id switch
-                    {
-                        "node-5" => 24500000000L + _rand.Next(-1000000, 1000000), // ~24GB
-                        "node-sec" => 16000000000L,
-                        "node-0" => 12000000000L,
-                        _ => 32000000000L
-                    };
+                    // PING does not measure QPS or memory; unknown metrics remain zero.
+                    double nodeQps = 0;
+                    long mem = 0;
 
                     activeNodeStates.Add(new QihseNode(
                         cfg.Id, cfg.Host, cfg.Port, "master", status, cfg.Architecture, cfg.Capabilities, cfg.ShardSlots, ping, mem, nodeQps
@@ -143,10 +133,7 @@ public class ClusterMeshService : BackgroundService
                 double totalQps = activeNodeStates.Sum(n => n.Qps);
                 _totalOperations += (long)(totalQps * 0.1);
 
-                // Latency percentiles in microseconds (derived from live Broadwell & Zen 4 microbenchmarks)
-                double p50 = 138.0 + _rand.NextDouble() * 12.0;
-                double p95 = 176.0 + _rand.NextDouble() * 24.0;
-                double p99 = 285.0 + _rand.NextDouble() * 35.0;
+                double p50 = 0, p95 = 0, p99 = 0; // no measured latency series
 
                 var frame = new TelemetryFrame(
                     DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -154,11 +141,11 @@ public class ClusterMeshService : BackgroundService
                     p50,
                     p95,
                     p99,
-                    100000,
+                    0,
                     _totalOperations,
                     activeNodeStates,
-                    16384,
-                    "HEALTHY_OK"
+                    0,
+                    activeNodeStates.All(n => n.Status == "online") ? "REACHABLE_METRICS_UNAVAILABLE" : "DEGRADED"
                 );
 
                 lock (_stateLock)
@@ -175,11 +162,7 @@ public class ClusterMeshService : BackgroundService
                 _logger.LogWarning(ex, "Error during cluster telemetry broadcast");
             }
 
-            // Periodic auto-discovery every ~30 seconds (300 cycles * 100ms)
-            if ((_totalOperations / 1000) % 300 == 0)
-            {
-                _ = AutoDiscoverClusterMeshAsync(stoppingToken);
-            }
+            // No automatic trust of endpoints supplied in CLUSTER NODES replies.
 
             // 10 Hz update frequency (100 ms interval)
             await Task.Delay(100, stoppingToken);
