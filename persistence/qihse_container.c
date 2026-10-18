@@ -190,6 +190,10 @@ static void ctr_read_section_entry(const uint8_t* p, qihse_ctr_section_t* s) {
 /* ── pread / pwrite wrappers ──────────────────────────────────────── */
 
 static bool ctr_pread(int fd, void* buf, size_t size, uint64_t offset) {
+    if (offset > INT64_MAX || size > (uint64_t)INT64_MAX - offset) {
+        errno = EOVERFLOW;
+        return false;
+    }
     uint8_t* p = (uint8_t*)buf;
     size_t done = 0u;
     while (done < size) {
@@ -211,6 +215,10 @@ static bool ctr_pread(int fd, void* buf, size_t size, uint64_t offset) {
 }
 
 static bool ctr_pwrite(int fd, const void* buf, size_t size, uint64_t offset) {
+    if (offset > INT64_MAX || size > (uint64_t)INT64_MAX - offset) {
+        errno = EOVERFLOW;
+        return false;
+    }
     const uint8_t* p = (const uint8_t*)buf;
     size_t done = 0u;
     while (done < size) {
@@ -330,6 +338,40 @@ static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
         }
         ctr_read_section_entry(entry, &sections[i]);
     }
+    /* Header HMAC currently does not bind metadata in the section table.
+     * Until an authenticated v2 table exists, at minimum refuse malformed
+     * offsets, aliases and overlapping sections before any materialization. */
+    struct stat file_stat;
+    if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode) ||
+        file_stat.st_size < (off_t)QIHSE_CTR_PAYLOAD_BASE) {
+        errno = EINVAL;
+        return false;
+    }
+    const uint64_t file_size = (uint64_t)file_stat.st_size;
+    for (i = 0u; i < count; ++i) {
+        const qihse_ctr_section_t* s = &sections[i];
+        if (s->section_id == 0u ||
+            (s->length != 0u &&
+             (s->offset < QIHSE_CTR_PAYLOAD_BASE ||
+              s->offset > file_size ||
+              s->length > file_size - s->offset))) {
+            errno = EINVAL;
+            return false;
+        }
+        for (uint32_t j = 0u; j < i; ++j) {
+            const qihse_ctr_section_t* prior = &sections[j];
+            if (s->section_id == prior->section_id) {
+                errno = EINVAL;
+                return false;
+            }
+            if (s->length && prior->length &&
+                s->offset < prior->offset + prior->length &&
+                prior->offset < s->offset + s->length) {
+                errno = EINVAL;
+                return false;
+            }
+        }
+    }
     *count_out = count;
     return true;
 }
@@ -383,7 +425,7 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
     ctr->fd = -1;
     if (!load_hmac_key()) return false;
 
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         return false;
     }
@@ -454,9 +496,9 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
     if (!load_hmac_key()) return false;
 
     if (create) {
-        fd = open(path, O_RDWR | O_CREAT, 0600);
+        fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     } else {
-        fd = open(path, O_RDWR);
+        fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     }
     if (fd < 0) {
         return false;
@@ -475,16 +517,22 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
             close(fd);
             return false;
         }
-        /* Verify the file hasn't been replaced between open() and flock() */
+        if (!S_ISREG(st_after_lock.st_mode) || st_after_lock.st_nlink != 1u ||
+            (st_after_lock.st_mode & 0002) != 0) {
+            ctr_lock_release(fd);
+            close(fd);
+            errno = EACCES;
+            return false;
+        }
+        /* Verify the file hasn't been replaced between open() and fcntl() */
         struct stat st_path;
-        if (stat(path, &st_path) == 0) {
-            if (st_path.st_dev != st_after_lock.st_dev ||
-                st_path.st_ino != st_after_lock.st_ino) {
-                ctr_lock_release(fd);
-                close(fd);
-                errno = EINVAL;
-                return false;
-            }
+        if (stat(path, &st_path) != 0 ||
+            st_path.st_dev != st_after_lock.st_dev ||
+            st_path.st_ino != st_after_lock.st_ino) {
+            ctr_lock_release(fd);
+            close(fd);
+            errno = ESTALE;
+            return false;
         }
     }
 
@@ -672,10 +720,11 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     uint64_t write_offset = QIHSE_CTR_PAYLOAD_BASE;
 
     if (!ctr || !ctr->path || ctr->fd < 0 || !ctr->locked ||
-        (!bufs && buf_count != 0u) || !load_hmac_key()) {
+        (!bufs && buf_count != 0u)) {
         errno = EINVAL;
         return false;
     }
+    if (!load_hmac_key()) return false;
 
     /* A writer must never flush an inode already replaced by another writer. */
     struct stat src_stat, path_stat;
@@ -720,6 +769,7 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
         const qihse_ctr_section_buf_t* section = &bufs[i];
         if (!section->data || section->size == 0u) continue;
         if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
+            section->size > INT64_MAX ||
             write_offset > (uint64_t)INT64_MAX - (uint64_t)section->size) {
             errno = EOVERFLOW;
             goto out;
