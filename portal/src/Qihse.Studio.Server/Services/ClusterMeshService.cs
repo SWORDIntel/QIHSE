@@ -33,9 +33,7 @@ public class ClusterMeshService : BackgroundService
         _hubContext = hubContext;
         _logger = logger;
 
-        _clusterPassword = Environment.GetEnvironmentVariable("QIHSE_CLUSTER_PASSWORD")
-            ?? config.GetValue<string>("Cluster:Password")
-            ?? string.Empty;
+        _clusterPassword = Environment.GetEnvironmentVariable("QIHSE_CLUSTER_PASSWORD") ?? string.Empty;
 
         _configuredNodes = new List<QihseNodeConfig>
         {
@@ -72,7 +70,7 @@ public class ClusterMeshService : BackgroundService
             0,
             _totalOperations,
             nodes,
-            16384,
+            0,
             "UNAVAILABLE"
         );
     }

@@ -9,11 +9,10 @@ public sealed class StudioAuthMiddleware
     private readonly RequestDelegate _next;
     private readonly byte[] _expectedHash;
 
-    public StudioAuthMiddleware(RequestDelegate next, IConfiguration config)
+    public StudioAuthMiddleware(RequestDelegate next)
     {
         _next = next;
-        var token = Environment.GetEnvironmentVariable("QIHSE_STUDIO_API_TOKEN")
-                    ?? config["Studio:ApiToken"];
+        var token = Environment.GetEnvironmentVariable("QIHSE_STUDIO_API_TOKEN");
         if (string.IsNullOrWhiteSpace(token) || token.Length < 32)
             throw new InvalidOperationException("QIHSE_STUDIO_API_TOKEN must contain at least 32 characters.");
         _expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
