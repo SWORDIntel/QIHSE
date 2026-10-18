@@ -66,6 +66,15 @@ static int resp_status(const char* resp) {
     return code;
 }
 
+static void assert_loopback_listener(qihse_http_server_t* srv) {
+    struct sockaddr_in bound;
+    socklen_t len = sizeof(bound);
+    memset(&bound, 0, sizeof(bound));
+    assert(getsockname(srv->fd, (struct sockaddr*)&bound, &len) == 0);
+    assert(bound.sin_family == AF_INET);
+    assert(ntohl(bound.sin_addr.s_addr) == INADDR_LOOPBACK);
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -78,6 +87,7 @@ int main(void) {
     qihse_http_server_t* influx = qihse_http_server_create(0);
     assert(influx && qihse_influx_register_routes(influx, tsdb) == 0);
     assert(qihse_http_server_start(influx) == 0 && influx->port != 0);
+    assert_loopback_listener(influx);
 
     char* r = http_req(influx->port, "POST", "/write?db=test",
                        "cpu value=42.5 1000000000\nmem value=7 1000000000\n");
@@ -126,6 +136,7 @@ int main(void) {
     qihse_http_server_t* ch = qihse_http_server_create(0);
     assert(ch && qihse_clickhouse_register_routes(ch, NULL) == 0);
     assert(qihse_http_server_start(ch) == 0 && ch->port != 0);
+    assert_loopback_listener(ch);
 
     r = http_req(ch->port, "GET", "/ping", NULL);
     assert(resp_status(r) == 200 && strstr(r, "Ok.") != NULL);
@@ -150,6 +161,7 @@ int main(void) {
     qihse_http_server_t* es = qihse_http_server_create(0);
     assert(es && qihse_es_register_routes(es, NULL, NULL) == 0);
     assert(qihse_http_server_start(es) == 0 && es->port != 0);
+    assert_loopback_listener(es);
 
     r = http_req(es->port, "GET", "/_cluster/health", NULL);
     assert(resp_status(r) == 200 && strstr(r, "\"status\":\"green\"") != NULL);

@@ -29,7 +29,9 @@ public class QihseRespClient : IDisposable
         await _lock.WaitAsync(ct);
         try
         {
-            return await ConnectInternalAsync(ct);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            return await ConnectInternalAsync(deadline.Token);
         }
         finally
         {
@@ -59,7 +61,7 @@ public class QihseRespClient : IDisposable
             if (!string.IsNullOrEmpty(_password))
             {
                 var authResp = await SendCommandInternalAsync(new[] { "AUTH", _password }, ct);
-                if (authResp.StartsWith("-"))
+                if (authResp != "OK")
                 {
                     _tcpClient?.Dispose();
                     _tcpClient = null;
@@ -99,7 +101,7 @@ public class QihseRespClient : IDisposable
             _tcpClient?.Dispose();
             _tcpClient = null;
             _stream = null;
-            return $"-ERR {ex.Message}";
+            return "-ERR transport failure";
         }
         finally
         {

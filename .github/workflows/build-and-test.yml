@@ -45,6 +45,9 @@ jobs:
     - name: Prepare isolated test state
       run: mkdir -p build && chmod 0700 build
 
+    - name: Verify I2P setup syntax
+      run: bash -n scripts/setup_i2p_replication.sh
+
     - name: Run Classified Adapter Denial Regression
       run: make test-consensus-mesh
 

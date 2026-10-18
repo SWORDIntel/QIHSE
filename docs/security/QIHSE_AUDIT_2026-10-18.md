@@ -45,3 +45,14 @@ A credential removed from Git HEAD remains exposed in Git history and potentiall
 - [ ] **Full source audit still outstanding:** all 1,698 files (including vendored components), complete external input to native parser boundary mapping, concurrent state, lifetime invariants, secure protocol adapter audit, SBOM/advisories, Rust/Python code paths, fuzz campaign and persistence/backup recovery tests.
 
 Do not interpret CI green alone as proof of freedom from vulnerabilities. Document residual risks and retest at the exact merge commit.
+
+## Second-pass findings — 2026-10-18
+
+- **Critical:** I2P setup contained a second published static operator credential and printed it as an argv example. Removed default and argv display, required explicit environment credential, rejected CLI password option. Existing deployed credentials MUST be rotated; Git history still exposes the old one.
+- **High:** Non-loopback daemon startup was permitted without a configured operator verifier (`auth_required=false`). Refuse such startup. Development on loopback without auth remains a risk and is not production-safe.
+- **High:** Generic native HTTP server listened on all interfaces but has no trusted user context; now loopback-only, with real socket bind assertions in the adapter harness. This is containment, not authenticated authorization, and the adapters MUST NOT be exposed through remote proxies.
+- **Medium:** Native telemetry fabricated healthy load/latency/vector cardinality. Replaced with actual cumulative operations, measured mean latency when available and explicit unmeasured flags for QPS/vector cardinality.
+- **Medium:** Studio allowed remote plaintext when `Studio:LanOnly=false`. Non-loopback connections now require HTTPS regardless of the LAN ACL toggle.
+- **Medium:** Studio RESP accepted any non-error AUTH response and had unbounded async initial connect waiting. Require `+OK` response and bound initial connection to three seconds.
+
+**Residual risks:** Native HTTP worker lifetime and parser framing remain unaudited for production guarantees. Loopback is not an authorization principal; enforce `qihse_user_t` on adapters before remote exposure. Replay/federation/key rotation, classified reads through all protocols, persistence crash recovery and third-party dependency advisories require additional review. The above changes are NOT locally compiled or tested; run CI at the new exact commit before merging.
