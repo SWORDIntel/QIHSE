@@ -38,7 +38,10 @@ typedef struct {
 
 static void* server_thread(void* argument) {
     server_thread_arg_t* args = (server_thread_arg_t*)argument;
-    assert(qihse_resp_server_handle_client_fd(args->server, args->fd));
+    qihse_resp_server_t* server = args->server;
+    int fd = args->fd;
+    free(args); /* Thread owns the accepted pair; release before dispatch. */
+    assert(qihse_resp_server_handle_client_fd(server, fd));
     return NULL;
 }
 

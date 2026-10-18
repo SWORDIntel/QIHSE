@@ -441,6 +441,11 @@ test-resp-hybrid: lib
 	$(CC) $(CFLAGS) -o tests/test_resp_hybrid tests/test_resp_hybrid.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_resp_hybrid
 
+test-container-key-gate: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_container_key_gate tests/test_container_key_gate.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_container_key_gate
+
 test-http-adapters: lib
 	$(CC) $(CFLAGS) -o tests/test_http_adapters tests/test_http_adapters.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_http_adapters

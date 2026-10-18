@@ -74,3 +74,11 @@ Second-pass changes on the same draft branch, committed after `b7e03c2`:
 ### HTTP utility hardening
 
 The native HTTP response constructors now check allocation failure instead of dereferencing NULL, escaped error JSON is dynamically sized and bounded, and JSON object keys/values are escaped before insertion. `json_build_object` treats its fixed first argument as the first key (matching natural callers, previously broken); regression fixtures assert escaped keys/values and rejected missing values. HTTP listener state uses atomic loads/stores across accept and stop paths. This remains a targeted parser/utilities review, not a substitute for typed authorization or fuzz coverage.
+
+### Container storage: fail-closed integrity boundary
+
+**Critical**: `persistence/qihse_container.c` previously derived an all-zero HMAC key whenever the ML-KEM private key was missing, then suppressed data checks automatically. A public zero key is not an authentication secret. The production default now refuses container opening/writes before modifying a file if no key can be loaded; checksum/HMAC bypass requires **both** `QIHSE_ALLOW_INSECURE_CONTAINER=1` (test-only) and the existing skip conditions. CI explicitly enables insecure fixtures but runs `test-container-key-gate` in a child process with the opt-in unset and an empty key directory. Production must never define that variable.
+
+Also replaced fixed `<path>.tmp` plus `O_TRUNC` in atomic flush with randomized exclusive `mkstemp` to eliminate symlink-clobber attacks on the staging filename. Existing pre-production containers written with a zero HMAC key will **not** automatically migrate to new keys; use an offline, independently verified export/rebuild plan before production switch. The authenticated manifest, path ownership, crash-recovery and fsync-directory durability require separate audit; this is not complete persistence certification.
+
+CI sanitizer run `39121059685` identified a 32-byte leak in the RESP **test fixture** (`tests/test_resp_security_regression.c:client_init`); the thread-owned argument is now freed in the handler. Distinguish this fixture leak from an unproven production server leak.

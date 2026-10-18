@@ -7,7 +7,7 @@
  *   [Section payloads at declared offsets]
  *
  * All multi-byte values are little-endian.
- * Atomic flush: write to <path>.tmp, fsync, rename over destination.
+ * Atomic flush: mkstemp on private <path>.tmp.XXXXXX, fsync, rename over destination.
  * The file lock is held via POSIX fcntl(F_SETLK) on the open fd.
  */
 
@@ -73,7 +73,7 @@ typedef struct qihse_container_s {
     char* path;            /* Owned copy of the file path */
     bool locked;
     bool read_only;        /* True when opened via qihse_ctr_open_read */
-    bool skip_integrity;   /* Skip CRC64/HMAC verification on read (pre-prod) */
+    bool skip_integrity;   /* Only in explicit QIHSE_ALLOW_INSECURE_CONTAINER=1 test mode */
     bool parallel_crc;     /* Use parallel fingerprint for CRC (production fast path) */
     bool use_crc32c;       /* Use CRC32C (SSE4.2) instead of FNV-1a for verification */
     int  crc_threads;      /* Thread count for parallel CRC (0 = auto) */

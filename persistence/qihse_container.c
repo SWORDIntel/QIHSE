@@ -72,9 +72,17 @@ static bool load_hmac_key(void) {
         return s_hmac_key_loaded;
     }
 #endif
-    fprintf(stderr, "[CONTAINER WARNING] No KEM key file — HMAC integrity uses zero key (pre-prod mode).\n");
-    s_hmac_key_loaded = true;
-    return true;
+    /* Never silently authenticate persistence with a public all-zero key.
+     * Existing pre-production fixtures require an explicit isolated opt-in. */
+    const char* insecure = getenv("QIHSE_ALLOW_INSECURE_CONTAINER");
+    if (insecure && strcmp(insecure, "1") == 0) {
+        fprintf(stderr, "[CONTAINER INSECURE TEST MODE] zero HMAC key enabled explicitly; do not deploy\n");
+        s_hmac_key_loaded = true;
+        return true;
+    }
+    fprintf(stderr, "[CONTAINER SECURITY] missing KEM key: refusing container access\n");
+    errno = EACCES;
+    return false;
 }
 
 static void qihse_ctr_cleanup_hmac_key(void) {
@@ -320,6 +328,7 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
     }
     memset(ctr, 0, sizeof(*ctr));
     ctr->fd = -1;
+    if (!load_hmac_key()) return false;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -352,9 +361,12 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
         FILE *kf = fopen(QIHSE_KEM_KEY_PATH(), "rb");
         if (kf) { fclose(kf); key_exists = true; }
 #endif
-        ctr->skip_integrity = (!key_exists &&
-                               getenv("QIHSE_ENFORCE_INTEGRITY") == NULL) ||
-                              (getenv("QIHSE_SKIP_INTEGRITY") != NULL);
+        const char* insecure = getenv("QIHSE_ALLOW_INSECURE_CONTAINER");
+        bool test_only = insecure && strcmp(insecure, "1") == 0;
+        const char* skip = getenv("QIHSE_SKIP_INTEGRITY");
+        ctr->skip_integrity = test_only &&
+                              getenv("QIHSE_ENFORCE_INTEGRITY") == NULL &&
+                              ((!key_exists) || (skip && strcmp(skip, "1") == 0));
         ctr->parallel_crc = (getenv("QIHSE_PARALLEL_CRC") != NULL);
         ctr->use_crc32c = (getenv("QIHSE_CRC32C") != NULL);
         const char* threads_env = getenv("QIHSE_CRC_THREADS");
@@ -386,6 +398,7 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
     }
     memset(ctr, 0, sizeof(*ctr));
     ctr->fd = -1;
+    if (!load_hmac_key()) return false;
 
     if (create) {
         fd = open(path, O_RDWR | O_CREAT, 0600);
@@ -611,14 +624,16 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     }
 
     path_len = strlen(ctr->path);
-    if (path_len + 5u >= PATH_MAX) {
+    const char* suffix = ".tmp.XXXXXX";
+    size_t suffix_len = strlen(suffix);
+    if (path_len >= PATH_MAX || suffix_len >= PATH_MAX - path_len) {
         errno = ENAMETOOLONG;
         return false;
     }
     memcpy(tmp_path, ctr->path, path_len);
-    memcpy(tmp_path + path_len, ".tmp", 5u);
+    memcpy(tmp_path + path_len, suffix, suffix_len + 1u);
 
-    tmp_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    tmp_fd = mkstemp(tmp_path);
     if (tmp_fd < 0) {
         return false;
     }

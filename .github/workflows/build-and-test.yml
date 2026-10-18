@@ -9,6 +9,9 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    # CI fixtures have no persistent ML-KEM material. Production has no opt-in.
+    env:
+      QIHSE_ALLOW_INSECURE_CONTAINER: '1'
     container: debian:trixie
 
     steps:
@@ -61,6 +64,9 @@ jobs:
       run: |
         python3 -m py_compile python/qihse/thermal.py tools/fleet/qihse-fan-agent.py
         python3 -m unittest discover -s python/tests -p 'test_fleet_resp_security.py' -v
+
+    - name: Verify persistence rejects missing HMAC material
+      run: make test-container-key-gate
 
     - name: Run Native HTTP API Hardening Regressions
       run: make test-http-adapters test-phase-c
@@ -164,6 +170,8 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
+    env:
+      QIHSE_ALLOW_INSECURE_CONTAINER: '1'
     container: debian:trixie
 
     steps:
@@ -194,6 +202,9 @@ jobs:
 
     - name: Prepare isolated sanitizer state
       run: mkdir -p build && chmod 0700 build
+
+    - name: Verify fail-closed container key admission under sanitizers
+      run: make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-container-key-gate
 
     - name: Run Sanitized Security Regressions (ASan + UBSan)
       run: |
