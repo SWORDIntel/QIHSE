@@ -68,6 +68,9 @@ jobs:
     - name: Verify persistence rejects missing HMAC material
       run: make test-container-key-gate
 
+    - name: Validate atomic container flush and WAL inode continuity
+      run: make test-container-flush-locking
+
     - name: Run Native HTTP API Hardening Regressions
       run: make test-http-adapters test-phase-c
 

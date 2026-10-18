@@ -147,8 +147,9 @@ typedef struct qihse_ctr_section_buf_s {
 
 /*
  * Write a new container to <path>.tmp with the provided section payloads,
- * fsync, then rename over <path>.  The lock fd (ctr->fd) is kept open
- * and the section table in *ctr is updated to reflect the new layout.
+ * fsync, then rename over <path>. The replacement inode is locked before
+ * rename, becomes ctr->fd, and the parent directory is fsynced. A failed
+ * directory fsync means durability is uncertain even though rename succeeded.
  * Sections not listed in bufs[] are preserved from the existing ctr if
  * present; pass NULL data or size==0 to omit a section.
  */

@@ -23,6 +23,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #else
 #include <io.h>
 #endif
@@ -45,68 +46,120 @@ static uint8_t s_hmac_key[32] = {0};
 static bool s_hmac_key_loaded = false;
 static bool s_hmac_key_mlocked = false;
 
-static bool load_hmac_key(void) {
-    if (s_hmac_key_loaded) return true;
-#ifndef _WIN32
-    FILE *kf = fopen(QIHSE_KEM_KEY_PATH(), "rb");
-    if (kf) {
-        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-        if (mdctx && EVP_DigestInit_ex(mdctx, EVP_sha384(), NULL) > 0) {
-            uint8_t buf[4096];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), kf)) > 0)
-                EVP_DigestUpdate(mdctx, buf, n);
-            unsigned char digest[SHA384_DIGEST_LENGTH];
-            unsigned int md_len = 0;
-            EVP_DigestFinal_ex(mdctx, digest, &md_len);
-            memcpy(s_hmac_key, digest, 32);
-            OPENSSL_cleanse(digest, sizeof(digest));
-#ifndef _WIN32
-            mlock(s_hmac_key, 32);
-            s_hmac_key_mlocked = true;
-#endif
-            s_hmac_key_loaded = true;
+static pthread_mutex_t s_hmac_key_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool s_hmac_test_key = false;
+
+/* Caller holds s_hmac_key_mutex. A readable file is not necessarily a secret:
+ * reject symlinks, publicly accessible files, empty/short and truncated keys.
+ * The derivation remains SHA-384(private key PEM) for on-disk compatibility.
+ * New on-disk key identities require an explicit migration, not a silent KDF swap. */
+static bool load_hmac_key_locked(void) {
+    if (s_hmac_key_loaded) {
+        /* Do not allow a test-mode zero key to survive removal of its opt-in. */
+        if (s_hmac_test_key) {
+            const char* insecure = getenv("QIHSE_ALLOW_INSECURE_CONTAINER");
+            if (!insecure || strcmp(insecure, "1") != 0) {
+                errno = EACCES;
+                return false;
+            }
         }
-        if (mdctx) EVP_MD_CTX_free(mdctx);
+        return true;
+    }
+#ifndef _WIN32
+    const char* key_path = QIHSE_KEM_KEY_PATH();
+    int fd = open(key_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+            (st.st_mode & 077) != 0 || st.st_size < 512 ||
+            st.st_size > 1024 * 1024 ||
+            (st.st_uid != geteuid() && st.st_uid != 0)) {
+            close(fd);
+            errno = EACCES;
+            return false;
+        }
+        FILE* kf = fdopen(fd, "rb");
+        if (!kf) { close(fd); return false; }
+
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        unsigned char digest[SHA384_DIGEST_LENGTH] = {0};
+        uint8_t buf[4096] = {0};
+        unsigned int md_len = 0;
+        size_t total = 0, n;
+        bool ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha384(), NULL) == 1;
+        while (ok && (n = fread(buf, 1, sizeof(buf), kf)) > 0) {
+            total += n;
+            ok = EVP_DigestUpdate(ctx, buf, n) == 1;
+        }
+        if (ferror(kf) || total != (size_t)st.st_size) ok = false;
+        if (ok) ok = EVP_DigestFinal_ex(ctx, digest, &md_len) == 1 &&
+                     md_len == SHA384_DIGEST_LENGTH;
+        if (ok) {
+            memcpy(s_hmac_key, digest, sizeof(s_hmac_key));
+            s_hmac_key_mlocked = (mlock(s_hmac_key, sizeof(s_hmac_key)) == 0);
+            s_hmac_key_loaded = true;
+            s_hmac_test_key = false;
+        }
+        OPENSSL_cleanse(buf, sizeof(buf));
+        OPENSSL_cleanse(digest, sizeof(digest));
+        EVP_MD_CTX_free(ctx);
         fclose(kf);
-        return s_hmac_key_loaded;
+        if (!ok) errno = EIO;
+        return ok;
+    }
+    if (errno != ENOENT) {
+        /* In particular, a symlink cannot enable the test-mode fallback. */
+        return false;
     }
 #endif
-    /* Never silently authenticate persistence with a public all-zero key.
-     * Existing pre-production fixtures require an explicit isolated opt-in. */
     const char* insecure = getenv("QIHSE_ALLOW_INSECURE_CONTAINER");
     if (insecure && strcmp(insecure, "1") == 0) {
         fprintf(stderr, "[CONTAINER INSECURE TEST MODE] zero HMAC key enabled explicitly; do not deploy\n");
         s_hmac_key_loaded = true;
+        s_hmac_test_key = true;
         return true;
     }
-    fprintf(stderr, "[CONTAINER SECURITY] missing KEM key: refusing container access\n");
     errno = EACCES;
     return false;
 }
 
+static bool load_hmac_key(void) {
+    pthread_mutex_lock(&s_hmac_key_mutex);
+    bool ok = load_hmac_key_locked();
+    pthread_mutex_unlock(&s_hmac_key_mutex);
+    return ok;
+}
+
 static void qihse_ctr_cleanup_hmac_key(void) {
+    pthread_mutex_lock(&s_hmac_key_mutex);
     if (s_hmac_key_loaded) {
-        OPENSSL_cleanse(s_hmac_key, 32);
+        OPENSSL_cleanse(s_hmac_key, sizeof(s_hmac_key));
 #ifndef _WIN32
-        if (s_hmac_key_mlocked) {
-            munlock(s_hmac_key, 32);
-            s_hmac_key_mlocked = false;
-        }
+        if (s_hmac_key_mlocked) munlock(s_hmac_key, sizeof(s_hmac_key));
 #endif
+        s_hmac_key_mlocked = false;
         s_hmac_key_loaded = false;
+        s_hmac_test_key = false;
     }
+    pthread_mutex_unlock(&s_hmac_key_mutex);
 }
 
 static void compute_hmac_sha384(const void* data, size_t len, uint8_t out[48]) {
 #ifndef _WIN32
-    if (load_hmac_key()) {
-        unsigned int md_len = 48;
-        HMAC(EVP_sha384(), s_hmac_key, 32,
-             (const unsigned char*)data, len, out, &md_len);
-        return;
+    pthread_mutex_lock(&s_hmac_key_mutex);
+    if (load_hmac_key_locked()) {
+        unsigned int md_len = 0;
+        if (HMAC(EVP_sha384(), s_hmac_key, (int)sizeof(s_hmac_key),
+                 (const unsigned char*)data, len, out, &md_len) &&
+            md_len == 48u) {
+            pthread_mutex_unlock(&s_hmac_key_mutex);
+            return;
+        }
     }
+    pthread_mutex_unlock(&s_hmac_key_mutex);
 #endif
+    /* Headers/sections with this digest will NOT validate against a real
+     * authenticated key. The public open/flush entry points gate missing keys. */
     memset(out, 0, 48);
 }
 
@@ -604,141 +657,172 @@ uint64_t qihse_ctr_section_length(const qihse_container_t* ctr, uint16_t section
     return ctr->sections[idx].length;
 }
 
-/* ── Atomic flush ───────────────────────────────────────────────────── */
-
+/* ── Atomic flush ──────────────────────────────────────────────────── */
+/* Retain a lock on BOTH the old file and replacement inode through rename.
+ * POSIX fcntl record locks are inode-specific: keeping a lock on the old fd
+ * alone would protect a now-unlinked file, not the published container. */
 bool qihse_ctr_flush(qihse_container_t* ctr,
                      const qihse_ctr_section_buf_t* bufs,
                      size_t buf_count) {
-    char tmp_path[PATH_MAX];
+    char tmp_path[PATH_MAX] = {0};
     int tmp_fd = -1;
-    size_t path_len;
-    qihse_ctr_section_t new_sections[QIHSE_CTR_MAX_SECTIONS];
-    uint32_t new_count = 0u;
+    bool ok = false, renamed = false;
+    qihse_ctr_section_t new_sections[QIHSE_CTR_MAX_SECTIONS] = {{0}};
+    uint32_t new_count = 0;
     uint64_t write_offset = QIHSE_CTR_PAYLOAD_BASE;
-    size_t i;
-    bool ok = false;
 
-    if (!ctr || !ctr->path || ctr->fd < 0) {
+    if (!ctr || !ctr->path || ctr->fd < 0 || !ctr->locked ||
+        (!bufs && buf_count != 0u) || !load_hmac_key()) {
         errno = EINVAL;
         return false;
     }
 
-    path_len = strlen(ctr->path);
+    /* A writer must never flush an inode already replaced by another writer. */
+    struct stat src_stat, path_stat;
+    if (fstat(ctr->fd, &src_stat) != 0 ||
+        stat(ctr->path, &path_stat) != 0 ||
+        !S_ISREG(src_stat.st_mode) ||
+        src_stat.st_dev != path_stat.st_dev ||
+        src_stat.st_ino != path_stat.st_ino) {
+        errno = ESTALE;
+        return false;
+    }
+
+    /* Duplicate section IDs are ambiguous and could conceal an earlier
+     * entry when readers resolve the first matching section. */
+    for (size_t i = 0; i < buf_count; ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (bufs[j].section_id == bufs[i].section_id) {
+                errno = EINVAL;
+                return false;
+            }
+        }
+    }
+
+    size_t path_len = strlen(ctr->path);
     const char* suffix = ".tmp.XXXXXX";
     size_t suffix_len = strlen(suffix);
-    if (path_len >= PATH_MAX || suffix_len >= PATH_MAX - path_len) {
+    if (path_len >= sizeof(tmp_path) ||
+        suffix_len >= sizeof(tmp_path) - path_len) {
         errno = ENAMETOOLONG;
         return false;
     }
     memcpy(tmp_path, ctr->path, path_len);
     memcpy(tmp_path + path_len, suffix, suffix_len + 1u);
-
     tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0) {
-        return false;
-    }
+    if (tmp_fd < 0) return false;
+    if (fchmod(tmp_fd, S_IRUSR | S_IWUSR) != 0) goto out;
 
-    /* Reserve header + table space */
-    {
-        uint8_t zeros[QIHSE_CTR_HEADER_SIZE + QIHSE_CTR_TABLE_SIZE];
-        memset(zeros, 0, sizeof(zeros));
-        if (!ctr_pwrite(tmp_fd, zeros, sizeof(zeros), 0u)) {
+    uint8_t zeros[QIHSE_CTR_HEADER_SIZE + QIHSE_CTR_TABLE_SIZE] = {0};
+    if (!ctr_pwrite(tmp_fd, zeros, sizeof(zeros), 0u)) goto out;
+
+    for (size_t i = 0; i < buf_count; ++i) {
+        const qihse_ctr_section_buf_t* section = &bufs[i];
+        if (!section->data || section->size == 0u) continue;
+        if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
+            write_offset > (uint64_t)INT64_MAX - (uint64_t)section->size) {
+            errno = EOVERFLOW;
             goto out;
         }
+        if (!ctr_pwrite(tmp_fd, section->data, section->size, write_offset))
+            goto out;
+        qihse_ctr_section_t* entry = &new_sections[new_count++];
+        entry->section_id = section->section_id;
+        entry->offset = write_offset;
+        entry->length = (uint64_t)section->size;
+        compute_hmac_sha384(section->data, section->size, entry->hmac_sha384);
+        write_offset += (uint64_t)section->size;
     }
 
-    /* Write each section provided in bufs[] */
-    for (i = 0u; i < buf_count; i++) {
-        const qihse_ctr_section_buf_t* b = &bufs[i];
-        if (!b->data || b->size == 0u) continue;
-        if (new_count >= QIHSE_CTR_MAX_SECTIONS) { errno = ENOMEM; goto out; }
-        if (!ctr_pwrite(tmp_fd, b->data, b->size, write_offset)) goto out;
-        new_sections[new_count].section_id = b->section_id;
-        new_sections[new_count].flags      = 0u;
-        new_sections[new_count].reserved   = 0u;
-        new_sections[new_count].offset     = write_offset;
-        new_sections[new_count].length     = (uint64_t)b->size;
-        compute_hmac_sha384(b->data, b->size, new_sections[new_count].hmac_sha384);
-        write_offset += (uint64_t)b->size;
-        new_count++;
-    }
-
-    /* Carry over existing sections that were NOT supplied in bufs[] */
-    for (i = 0u; i < ctr->section_count; i++) {
+    /* Copy unchanged sections with bounded memory rather than malloc'ing
+     * an attacker-declared section length in one allocation. */
+    uint8_t* copy_buf = malloc(64u * 1024u);
+    if (!copy_buf) { errno = ENOMEM; goto out; }
+    for (uint32_t i = 0; i < ctr->section_count; ++i) {
         const qihse_ctr_section_t* old = &ctr->sections[i];
-        size_t j;
-        bool replaced = false;
         if (old->length == 0u) continue;
-        for (j = 0u; j < buf_count; j++) {
+        bool replaced = false;
+        for (size_t j = 0; j < buf_count; ++j) {
             if (bufs[j].section_id == old->section_id) {
                 replaced = true;
                 break;
             }
         }
         if (replaced) continue;
-        if (new_count >= QIHSE_CTR_MAX_SECTIONS) { errno = ENOMEM; goto out; }
-        /* Copy payload from existing fd */
-        {
-            uint8_t* tmp_buf = (uint8_t*)malloc((size_t)old->length);
-            if (!tmp_buf) { errno = ENOMEM; goto out; }
-            if (!ctr_pread(ctr->fd, tmp_buf, (size_t)old->length, old->offset)) {
-                free(tmp_buf);
-                goto out;
-            }
-            if (!ctr_pwrite(tmp_fd, tmp_buf, (size_t)old->length, write_offset)) {
-                free(tmp_buf);
-                goto out;
-            }
-            free(tmp_buf);
+        if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
+            old->length > (uint64_t)INT64_MAX - write_offset) {
+            errno = EOVERFLOW;
+            goto copy_failed;
+        }
+        uint64_t done = 0u;
+        while (done < old->length) {
+            size_t n = (old->length - done > 65536u)
+                     ? 65536u : (size_t)(old->length - done);
+            if (!ctr_pread(ctr->fd, copy_buf, n, old->offset + done) ||
+                !ctr_pwrite(tmp_fd, copy_buf, n, write_offset + done))
+                goto copy_failed;
+            done += n;
         }
         new_sections[new_count] = *old;
         new_sections[new_count].offset = write_offset;
+        ++new_count;
         write_offset += old->length;
-        new_count++;
     }
+    free(copy_buf);
+    copy_buf = NULL;
 
-    /* Write updated table */
     if (!ctr_write_table(tmp_fd, new_sections, new_count)) goto out;
 
+    /* Acquire the new inode's lock BEFORE replacing the pathname. */
+    if (!ctr_lock_acquire(tmp_fd)) goto out;
 #ifndef _WIN32
-    ok = fsync(tmp_fd) == 0;
+    if (fsync(tmp_fd) != 0) goto out;
 #else
-    ok = _commit(tmp_fd) == 0;
+    if (_commit(tmp_fd) != 0) goto out;
 #endif
-    if (!ok) goto out;
+    if (rename(tmp_path, ctr->path) != 0) goto out;
+    renamed = true;
 
-    if (close(tmp_fd) != 0) { tmp_fd = -1; ok = false; goto out; }
+    /* New fd already locked: transfer ownership rather than reading an
+     * obsolete table from the old, now-unlinked inode. */
+    int old_fd = ctr->fd;
+    ctr->fd = tmp_fd;
     tmp_fd = -1;
-
-    if (rename(tmp_path, ctr->path) == 0) {
-        ok = true;
-    } else {
-        ok = false;
-        goto out;
-    }
-
-    /* Re-read the table into ctr from the live file (fd still valid for lock) */
-    {
-        uint32_t count = 0u;
-        if (!ctr_read_table(ctr->fd, ctr->sections, &count)) {
-            /* The file was replaced; reopen */
-            close(ctr->fd);
-            ctr->fd = open(ctr->path, O_RDWR);
-            if (ctr->fd < 0) { ok = false; goto out; }
-            if (!ctr_lock_acquire(ctr->fd)) { ok = false; goto out; }
-            if (!ctr_read_table(ctr->fd, ctr->sections, &count)) {
-                ok = false; goto out;
-            }
-        }
-        ctr->section_count = count;
-    }
+    memcpy(ctr->sections, new_sections, new_count * sizeof(new_sections[0]));
+    ctr->section_count = new_count;
+    (void)ctr_lock_release(old_fd);
+    close(old_fd);
     ok = true;
 
-out:
-    if (tmp_fd >= 0) {
-        close(tmp_fd);
-        (void)unlink(tmp_path);
+#ifndef _WIN32
+    /* fsync of the parent directory makes the rename durable after crashes.
+     * On fsync failure the new fd remains live, but durable publication is
+     * NOT claimed. Callers must handle a false return as uncertain commit. */
+    char dir[PATH_MAX];
+    memcpy(dir, ctr->path, path_len + 1u);
+    char* slash = strrchr(dir, '/');
+    if (!slash) {
+        strcpy(dir, ".");
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
     }
+    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        ok = false;
+    } else {
+        if (fsync(dir_fd) != 0) ok = false;
+        close(dir_fd);
+    }
+#endif
+    goto out;
+
+copy_failed:
+    free(copy_buf);
+out:
+    if (tmp_fd >= 0) close(tmp_fd);
+    if (!renamed && tmp_path[0]) (void)unlink(tmp_path);
     return ok;
 }
 
