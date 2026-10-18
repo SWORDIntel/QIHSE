@@ -55,6 +55,9 @@ public class QihseRespClient : IDisposable
                 var authResp = await SendCommandInternalAsync(new[] { "AUTH", _password }, ct);
                 if (authResp.StartsWith("-"))
                 {
+                    _tcpClient?.Dispose();
+                    _tcpClient = null;
+                    _stream = null;
                     return false;
                 }
             }
@@ -75,13 +78,15 @@ public class QihseRespClient : IDisposable
         await _lock.WaitAsync(ct);
         try
         {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
             if (!IsConnected)
             {
-                var ok = await ConnectInternalAsync(ct);
+                var ok = await ConnectInternalAsync(deadline.Token);
                 if (!ok) return "-ERR connection failed";
             }
 
-            return await SendCommandInternalAsync(args, ct);
+            return await SendCommandInternalAsync(args, deadline.Token);
         }
         catch (Exception ex)
         {
@@ -100,10 +105,17 @@ public class QihseRespClient : IDisposable
     {
         if (_stream == null) throw new InvalidOperationException("Not connected");
 
-        // Format command as standard inline string: <cmd> [arg1] [arg2]...\r\n
-        var cmd = string.Join(" ", args) + "\r\n";
-        var writeBuf = Encoding.UTF8.GetBytes(cmd);
-        await _stream.WriteAsync(writeBuf, ct);
+        // RESP bulk arrays preserve argument boundaries and stop CR/LF injection.
+        using var frame = new MemoryStream();
+        frame.Write(Encoding.ASCII.GetBytes($"*{args.Length}\r\n"));
+        foreach (var arg in args)
+        {
+            var bytes = Encoding.UTF8.GetBytes(arg);
+            frame.Write(Encoding.ASCII.GetBytes($"${bytes.Length}\r\n"));
+            frame.Write(bytes);
+            frame.Write(new byte[] { 13, 10 });
+        }
+        await _stream.WriteAsync(frame.ToArray(), ct);
         await _stream.FlushAsync(ct);
 
         // Read Response
@@ -117,79 +129,62 @@ public class QihseRespClient : IDisposable
         return read == 0 ? -1 : buf[0];
     }
 
-    private static async Task<string> ReadRespAsync(NetworkStream stream, CancellationToken ct)
+    private static async Task<string> ReadRespAsync(NetworkStream stream, CancellationToken ct,
+        int depth = 0, int[]? budget = null)
     {
-        var firstByte = await ReadByteAsync(stream, ct);
-        if (firstByte == -1) return "-ERR EOF";
-
-        char type = (char)firstByte;
-        var line = await ReadLineAsync(stream, ct);
-
-        switch (type)
+        budget ??= new[] { 4 * 1024 * 1024 };
+        if (depth > 16) throw new InvalidDataException("RESP nesting exceeds limit");
+        int first = await ReadByteAsync(stream, ct);
+        if (first < 0) throw new EndOfStreamException("Truncated RESP reply");
+        string line = await ReadLineAsync(stream, ct);
+        if (line.Length > budget[0]) throw new InvalidDataException("RESP response too large");
+        budget[0] -= line.Length;
+        switch ((char)first)
         {
-            case '+': // Simple String
-                return line;
-            case '-': // Error
-                return $"-{line}";
-            case ':': // Integer
-                return line;
-            case '$': // Bulk String
-                if (int.TryParse(line, out int len))
-                {
-                    if (len == -1) return "(nil)";
-                    var bulkBytes = new byte[len];
-                    int totalRead = 0;
-                    while (totalRead < len)
-                    {
-                        int read = await stream.ReadAsync(bulkBytes.AsMemory(totalRead, len - totalRead), ct);
-                        if (read == 0) break;
-                        totalRead += read;
-                    }
-                    // Discard trailing \r\n
-                    await ReadByteAsync(stream, ct);
-                    await ReadByteAsync(stream, ct);
-                    return Encoding.UTF8.GetString(bulkBytes);
-                }
-                return line;
-            case '*': // Array
-                if (int.TryParse(line, out int arrayLen))
-                {
-                    if (arrayLen == -1) return "(nil)";
-                    var items = new List<string>();
-                    for (int i = 0; i < arrayLen; i++)
-                    {
-                        items.Add(await ReadRespAsync(stream, ct));
-                    }
-                    return string.Join("\n", items);
-                }
-                return line;
+            case '+': return line;
+            case '-': return "-" + line;
+            case ':': return line;
+            case '$':
+                if (!int.TryParse(line, out int len) || len < -1 || len > 1048576)
+                    throw new InvalidDataException("Invalid RESP bulk length");
+                if (len == -1) return "(nil)";
+                if (len > budget[0]) throw new InvalidDataException("RESP response budget exceeded");
+                budget[0] -= len;
+                var data = new byte[len];
+                await stream.ReadExactlyAsync(data.AsMemory(), ct);
+                if (await ReadByteAsync(stream, ct) != 13 || await ReadByteAsync(stream, ct) != 10)
+                    throw new InvalidDataException("Invalid RESP bulk terminator");
+                return Encoding.UTF8.GetString(data);
+            case '*':
+                if (!int.TryParse(line, out int count) || count < -1 || count > 4096)
+                    throw new InvalidDataException("Invalid RESP array length");
+                if (count == -1) return "(nil)";
+                var items = new List<string>(count);
+                for (int i = 0; i < count; i++)
+                    items.Add(await ReadRespAsync(stream, ct, depth + 1, budget));
+                return string.Join("\n", items);
             default:
-                return $"{type}{line}";
+                throw new InvalidDataException("Unknown RESP response prefix");
         }
     }
 
     private static async Task<string> ReadLineAsync(NetworkStream stream, CancellationToken ct)
     {
-        var sb = new StringBuilder();
-        var buffer = new byte[1];
+        var bytes = new List<byte>();
         while (true)
         {
-            int read = await stream.ReadAsync(buffer.AsMemory(0, 1), ct);
-            if (read == 0) break;
-            char c = (char)buffer[0];
-            if (c == '\r')
+            int value = await ReadByteAsync(stream, ct);
+            if (value < 0) throw new EndOfStreamException("Truncated RESP header");
+            if (value == 13)
             {
-                read = await stream.ReadAsync(buffer.AsMemory(0, 1), ct);
-                if (read == 0 || (char)buffer[0] == '\n') break;
-                sb.Append(c);
-                sb.Append((char)buffer[0]);
+                if (await ReadByteAsync(stream, ct) != 10)
+                    throw new InvalidDataException("Malformed RESP CRLF");
+                return Encoding.UTF8.GetString(bytes.ToArray());
             }
-            else
-            {
-                sb.Append(c);
-            }
+            if (value == 10 || bytes.Count >= 8192)
+                throw new InvalidDataException("Malformed or oversized RESP header");
+            bytes.Add((byte)value);
         }
-        return sb.ToString();
     }
 
     public void Dispose()

@@ -42,6 +42,9 @@ jobs:
       run: |
         nm -D ./libqihse.so | grep qihse_search || true
 
+    - name: Prepare isolated test state
+      run: mkdir -p build && chmod 0700 build
+
     - name: Run Classified Adapter Denial Regression
       run: make test-consensus-mesh
 
@@ -57,30 +60,6 @@ jobs:
         name: qihse-core-test-log
         path: qihse-core-test.log
         if-no-files-found: error
-
-    - name: Run Auth Privilege Boundary Regression
-      run: |
-        make test-auth-privilege-boundary
-
-    - name: Run Object ACL Regression
-      run: |
-        make test-object-acl
-
-    - name: Run Fabric Index Authorization Regression
-      run: |
-        make test-fabric-index
-
-    - name: Run Aggregate Hardening Regression
-      run: |
-        make test-aggregate-hardened
-
-    - name: Run FTS Persistence Authorization Regression
-      run: |
-        make test-fts-persistence-auth
-
-    - name: Run Security Boundary Regressions
-      run: |
-        make -f Makefile -f tests/security-regression.mk test-security-regressions
 
     - name: Run APT41 Fuzz Testing (ASan & UBSan)
       run: |
@@ -154,10 +133,6 @@ jobs:
       run: |
         make test-ai-memory
 
-    - name: Run APT41 Fuzz Testing (ASan & UBSan)
-      run: |
-        make test-apt41
-
     - name: Run Python SDK Tests
       run: |
         export LD_LIBRARY_PATH=$PWD
@@ -199,6 +174,9 @@ jobs:
         name: qihse-sanitizer-build-log
         path: qihse-sanitizer-build.log
         if-no-files-found: error
+
+    - name: Prepare isolated sanitizer state
+      run: mkdir -p build && chmod 0700 build
 
     - name: Run Sanitized Security Regressions (ASan + UBSan)
       run: |
@@ -245,3 +223,39 @@ jobs:
 
     - name: Build dashboard
       run: npm run build
+
+  studio-security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: portal/src/Qihse.Studio.Client/package-lock.json
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+    - name: Validate Studio client and server
+      run: |
+        set -euo pipefail
+        npm --prefix portal/src/Qihse.Studio.Client ci
+        npm --prefix portal/src/Qihse.Studio.Client run build
+        dotnet build portal/src/Qihse.Studio.Server -c Release
+    - name: Test Studio authentication boundaries
+      run: |
+        set -euo pipefail
+        export QIHSE_STUDIO_API_TOKEN=CI-test-secret-0123456789abcdef0123456789abcdef
+        dotnet run --no-build -c Release --no-launch-profile --project portal/src/Qihse.Studio.Server --urls http://127.0.0.1:5100 > studio.log 2>&1 &
+        child=$!
+        trap 'kill "$child" 2>/dev/null || true' EXIT
+        for attempt in $(seq 1 30); do
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:5100/api/telemetry/snapshot || true)
+          [ "$status" = 401 ] && break
+          sleep 1
+        done
+        test "$status" = 401
+        test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:5100/api/telemetry/snapshot)" = 401
+        test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $QIHSE_STUDIO_API_TOKEN" http://127.0.0.1:5100/api/telemetry/snapshot)" = 200
+        test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $QIHSE_STUDIO_API_TOKEN" -H 'Content-Type: application/json' -d '{"topK":5}' http://127.0.0.1:5100/api/vector/search)" = 501
+        test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:5100/hub/telemetry/negotiate)" = 401

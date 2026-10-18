@@ -450,6 +450,7 @@ test-object-acl: lib
 	LD_LIBRARY_PATH=. ./tests/test_object_acl
 
 test-auth-privilege-boundary: lib
+	mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -o tests/test_auth_privilege_boundary tests/test_auth_privilege_boundary.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_auth_privilege_boundary
 
@@ -648,6 +649,7 @@ test-consensus-channel: lib
 	LD_LIBRARY_PATH=. ./tests/test_consensus_channel
 
 test-consensus-mesh: lib
+	mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -DQIHSE_CONSENSUS_MESH_TESTING -o tests/test_consensus_mesh tests/test_consensus_mesh.c src/federation/qihse_consensus_mesh.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus_mesh
 
