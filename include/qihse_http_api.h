@@ -75,7 +75,7 @@ void http_request_free(http_request_t* req);
 
 /* JSON helpers */
 char* json_escape(const char* s);
-char* json_build_object(const char* fmt, ...);
+char* json_build_object(const char* first_key, ...);
 
 #ifdef __cplusplus
 }

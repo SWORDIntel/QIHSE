@@ -62,6 +62,9 @@ jobs:
         python3 -m py_compile python/qihse/thermal.py tools/fleet/qihse-fan-agent.py
         python3 -m unittest discover -s python/tests -p 'test_fleet_resp_security.py' -v
 
+    - name: Run Native HTTP API Hardening Regressions
+      run: make test-http-adapters test-phase-c
+
     - name: Run Core Test Suite
       run: |
         set -o pipefail

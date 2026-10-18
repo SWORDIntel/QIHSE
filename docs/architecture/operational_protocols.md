@@ -23,8 +23,7 @@
 >
 > Defects reproduced by that test as `NOTE` lines rather than asserted:
 > `qihse_span_start()` does not inherit the parent's trace id (every span starts
-> a new trace); `json_build_object()` ignores its declared format argument and
-> consumes it as the first key; and `qihse_sql_parse_sample()` drops
+> a new trace); `qihse_sql_parse_sample()` drops
 > `SAMPLE ... OFFSET`.
 
 ## Overview
@@ -103,12 +102,16 @@ written.
 covered by `tests/test_phase_c.c` (request parsing, route registration, response
 helpers). Two limits:
 
-- `json_build_object()`'s first parameter is declared as a format string but is
-  ignored: the key/value pairs are read from the varargs, so the first argument
-  is consumed as the first key and
-  `json_build_object("n", "42", NULL)` produces `{"42":"}`. Pass a placeholder
-  first argument, as `tests/test_phase_c.c` does.
-- The server socket loop itself is not covered by any test.
+- `json_build_object()` now treats its first argument as the first key;
+  escaped keys/values are bounded by checked allocations. Missing values fail
+  rather than fabricating malformed JSON.
+- Native HTTP is **loopback-only**, has bounded HTTP/1.x framing, strict
+  Content-Length handling and a 128-worker cap. The server rejects chunked
+  transfer coding and pipelined requests. It is **not an authenticated API**:
+  do not expose it through a reverse proxy without typed principal enforcement.
+- The native socket API has tests for real TCP, split headers, parser rejections
+  and shutdown lifetime; the wider middleware and hostile-input fuzz surface
+  remain under audit.
 
 ```c
 qihse_http_server_t* srv = qihse_http_server_create(8080);

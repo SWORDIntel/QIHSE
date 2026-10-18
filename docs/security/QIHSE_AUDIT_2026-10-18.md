@@ -70,3 +70,7 @@ Second-pass changes on the same draft branch, committed after `b7e03c2`:
 **Deployment compatibility warning:** Existing direct private-LAN RESP clients will now fail closed unless backed by a TLS 1.3 listener/proxy with a dedicated CA and matching peer identity, or explicitly configured loopback tunnels. This does not create TLS support in the native RESP server. Do not disable verification to preserve connectivity.
 
 **Remaining:** No production credential rotation, TLS-proxy deployment, network partition test, full protocol-adapter classified-read coverage, full dependency advisory review, or full fuzz campaign has been performed. Native HTTP response JSON helper OOM/format consistency, persistent manifests, systemd isolation and overlay CI failure still require attention. All changes remain unmerged until exact-commit CI and independent review.
+
+### HTTP utility hardening
+
+The native HTTP response constructors now check allocation failure instead of dereferencing NULL, escaped error JSON is dynamically sized and bounded, and JSON object keys/values are escaped before insertion. `json_build_object` treats its fixed first argument as the first key (matching natural callers, previously broken); regression fixtures assert escaped keys/values and rejected missing values. HTTP listener state uses atomic loads/stores across accept and stop paths. This remains a targeted parser/utilities review, not a substitute for typed authorization or fuzz coverage.

@@ -166,7 +166,7 @@ static void* http_client_thread(void* arg) {
 
 static void* http_accept_thread(void* arg) {
     qihse_http_server_t* srv = (qihse_http_server_t*)arg;
-    while (srv->running) {
+    while (__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE)) {
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
         int fd = accept(srv->fd, (struct sockaddr*)&addr, &addr_len);
@@ -224,9 +224,9 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
         if (getsockname(srv->fd, (struct sockaddr*)&bound, &blen) == 0)
             srv->port = ntohs(bound.sin_port);
     }
-    srv->running = 1;
+    __atomic_store_n(&srv->running, 1, __ATOMIC_RELEASE);
     if (pthread_create(&srv->thread, NULL, http_accept_thread, srv) != 0) {
-        srv->running = 0;
+        __atomic_store_n(&srv->running, 0, __ATOMIC_RELEASE);
         close(srv->fd);
         srv->fd = -1;
         return -1;
@@ -236,8 +236,8 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
 
 int qihse_http_server_stop(qihse_http_server_t* srv) {
     if (!srv) return -1;
-    if (!srv->running) return 0;
-    srv->running = 0;
+    if (!__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE)) return 0;
+    __atomic_store_n(&srv->running, 0, __ATOMIC_RELEASE);
     if (srv->fd >= 0) {
         /* shutdown() before close(): closing a listen fd does NOT reliably
          * wake a thread blocked in accept() on it, and the join below would
@@ -264,31 +264,45 @@ void qihse_http_server_destroy(qihse_http_server_t* srv) {
     free(srv);
 }
 
-/* Response helpers */
-http_response_t* http_response_json(int status, const char* json) {
-    http_response_t* res = (http_response_t*)calloc(1, sizeof(http_response_t));
+/* Response helpers: all allocations and serialized lengths must be checked. */
+static http_response_t* http_response_make(int status, const char* body, const char* type) {
+    if (!body || !type) return NULL;
+    http_response_t* res = calloc(1, sizeof(*res));
+    if (!res) return NULL;
     res->status_code = status;
-    res->body_len = strlen(json);
-    res->body = strdup(json);
-    res->content_type = strdup("application/json");
+    res->body_len = strlen(body);
+    res->body = strdup(body);
+    res->content_type = strdup(type);
+    if (!res->body || !res->content_type) {
+        free(res->body);
+        free(res->content_type);
+        free(res);
+        return NULL;
+    }
     return res;
+}
+
+http_response_t* http_response_json(int status, const char* json) {
+    return http_response_make(status, json, "application/json");
 }
 
 http_response_t* http_response_text(int status, const char* text) {
-    http_response_t* res = (http_response_t*)calloc(1, sizeof(http_response_t));
-    res->status_code = status;
-    res->body_len = strlen(text);
-    res->body = strdup(text);
-    res->content_type = strdup("text/plain");
-    return res;
+    return http_response_make(status, text, "text/plain");
 }
 
 http_response_t* http_response_error(int status, const char* message) {
-    char json[1024];
-    char* escaped = json_escape(message);
-    snprintf(json, sizeof(json), "{\"error\":{\"code\":%d,\"message\":\"%s\"}}", status, escaped);
+    char* escaped = json_escape(message ? message : "Internal Error");
+    if (!escaped) return NULL;
+    const char* fmt = "{\"error\":{\"code\":%d,\"message\":\"%s\"}}";
+    int n = snprintf(NULL, 0, fmt, status, escaped);
+    if (n < 0 || n > 65535) { free(escaped); return NULL; }
+    char* json = malloc((size_t)n + 1u);
+    if (!json) { free(escaped); return NULL; }
+    snprintf(json, (size_t)n + 1u, fmt, status, escaped);
+    http_response_t* res = http_response_json(status, json);
+    free(json);
     free(escaped);
-    return http_response_json(status, json);
+    return res;
 }
 
 void http_response_free(http_response_t* res) {
@@ -433,55 +447,81 @@ void http_request_free(http_request_t* req) {
     free(req->content_type);
 }
 
-/* JSON helpers */
-char* json_escape(const char* s) {
-    if (!s) return strdup("");
-    size_t len = strlen(s);
-    char* out = (char*)malloc(len * 6 + 1);
-    size_t j = 0;
-    for (size_t i = 0; i < len; i++) {
-        switch (s[i]) {
+/* JSON strings are escaped before insertion into any object. */
+char* json_escape(const char* input) {
+    const char* value = input ? input : "";
+    size_t len = strlen(value);
+    if (len > (SIZE_MAX - 1u) / 6u) return NULL;
+    char* out = malloc(len * 6u + 1u);
+    if (!out) return NULL;
+    size_t j = 0u;
+    for (size_t i = 0u; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        switch (c) {
             case '"': out[j++] = '\\'; out[j++] = '"'; break;
             case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
             case '\n': out[j++] = '\\'; out[j++] = 'n'; break;
             case '\r': out[j++] = '\\'; out[j++] = 'r'; break;
             case '\t': out[j++] = '\\'; out[j++] = 't'; break;
             default:
-                if ((unsigned char)s[i] < 32) {
-                    j += snprintf(out + j, 7, "\\u%04x", s[i]);
-                } else {
-                    out[j++] = s[i];
-                }
+                if (c < 32) {
+                    int n = snprintf(out + j, 7u, "\\u%04x", c);
+                    if (n != 6) { free(out); return NULL; }
+                    j += 6u;
+                } else out[j++] = (char)c;
         }
     }
     out[j] = '\0';
     return out;
 }
 
-char* json_build_object(const char* fmt, ...) {
-    /* Simple format: key1, val1, key2, val2, ... */
+/* The fixed first argument is the FIRST KEY, not an ignored format marker.
+ * Pairs terminate at a NULL key: json_build_object("a", "1", NULL). */
+char* json_build_object(const char* first_key, ...) {
+    if (!first_key) return strdup("{}");
+    size_t cap = 128u, used = 1u;
+    char* result = malloc(cap);
+    if (!result) return NULL;
+    result[0] = '{';
     va_list ap;
-    va_start(ap, fmt);
-    size_t cap = 1024;
-    char* result = (char*)malloc(cap);
-    size_t len = 0;
-    result[len++] = '{';
-    
-    const char* key;
-    int first = 1;
-    while ((key = va_arg(ap, const char*)) != NULL) {
-        const char* val = va_arg(ap, const char*);
-        if (!val) break;
-        if (!first) result[len++] = ',';
-        first = 0;
-        char* esc_val = json_escape(val);
-        size_t need = strlen(key) + strlen(esc_val) + 8;
-        if (len + need > cap) { cap = (len + need) * 2; result = realloc(result, cap); }
-        len += snprintf(result + len, cap - len, "\"%s\":\"%s\"", key, esc_val);
-        free(esc_val);
+    va_start(ap, first_key);
+    const char* key = first_key;
+    bool first = true;
+    while (key) {
+        const char* value = va_arg(ap, const char*);
+        if (!value) { free(result); result = NULL; break; }
+        char* k = json_escape(key);
+        char* v = json_escape(value);
+        if (!k || !v) { free(k); free(v); free(result); result = NULL; break; }
+        size_t kl = strlen(k), vl = strlen(v);
+        if (kl > SIZE_MAX - vl - used - 8u) {
+            free(k); free(v); free(result); result = NULL; break;
+        }
+        size_t need = used + kl + vl + 8u;
+        if (need > cap) {
+            char* grown = realloc(result, need);
+            if (!grown) {
+                free(k); free(v); free(result); result = NULL; break;
+            }
+            result = grown;
+            cap = need;
+        }
+        if (!first) result[used++] = ',';
+        result[used++] = '"';
+        memcpy(result + used, k, kl); used += kl;
+        result[used++] = '"';
+        result[used++] = ':';
+        result[used++] = '"';
+        memcpy(result + used, v, vl); used += vl;
+        result[used++] = '"';
+        free(k); free(v);
+        first = false;
+        key = va_arg(ap, const char*);
     }
-    result[len++] = '}';
-    result[len] = '\0';
     va_end(ap);
+    if (result) {
+        result[used++] = '}';
+        result[used] = '\0';
+    }
     return result;
 }

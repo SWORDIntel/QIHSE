@@ -287,25 +287,14 @@ static void test_http_api(void) {
     assert(strstr(esc, "\\n") != NULL);
     free(esc);
 
-    /* json_build_object()'s first parameter is declared as a format string but
-     * is ignored: the key/value pairs are read from the varargs, so the first
-     * argument is consumed as the first *key*.  The call below therefore passes
-     * a placeholder first argument.  See the defect note in
-     * docs/architecture/operational_protocols.md. */
-    char* obj = json_build_object("(ignored)", "n", "42", "s", "x", NULL);
-    assert(obj);
-    assert(strstr(obj, "\"n\":\"42\"") != NULL);
-    assert(strstr(obj, "\"s\":\"x\"") != NULL);
+    /* The first argument is the first KEY; both keys and values are escaped. */
+    char* obj = json_build_object("n", "42", "s", "x", NULL);
+    assert(obj && strstr(obj, "\"n\":\"42\"") && strstr(obj, "\"s\":\"x\""));
     free(obj);
-    /* The natural call silently drops the first pair. */
-    obj = json_build_object("n", "42", NULL);
-    assert(obj);
-    assert(strcmp(obj, "{\"42\":\"}") == 0 || strstr(obj, "\"n\"") == NULL);
+    obj = json_build_object("bad\"key", "line\nbreak", NULL);
+    assert(obj && strstr(obj, "bad\\\"key") && strstr(obj, "line\\nbreak"));
     free(obj);
-    printf("NOTE http api: json_build_object() ignores its first (format) argument and "
-           "consumes it as the first key, so json_build_object(\"n\", \"42\", NULL) "
-           "yields %s -- see docs/architecture/operational_protocols.md\n",
-           "{\"42\":\"}");
+    assert(json_build_object("missing_value", NULL) == NULL);
 
     /* Responses. */
     http_response_t* res = http_response_json(200, "{\"ok\":true}");
