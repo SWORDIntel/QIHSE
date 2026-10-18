@@ -88,9 +88,34 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "Unknown or incomplete option: %s\n", arg); usage(argv[0]); return 2; }
     }
 
+    static char s_file_pw[256];
+    if (!options.operator_password) {
+        const char* env_pw = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (env_pw && *env_pw) {
+            options.operator_password = env_pw;
+        } else {
+            FILE* ef = fopen("/etc/qihse/cluster-node0.env", "r");
+            if (ef) {
+                char line[512];
+                while (fgets(line, sizeof(line), ef)) {
+                    if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
+                        char* p = line + 24;
+                        p[strcspn(p, "\r\n")] = '\0';
+                        if (strlen(p) >= 12 && strlen(p) < sizeof(s_file_pw)) {
+                            snprintf(s_file_pw, sizeof(s_file_pw), "%s", p);
+                            options.operator_password = s_file_pw;
+                            break;
+                        }
+                    }
+                }
+                fclose(ef);
+            }
+        }
+    }
+
     if (options.require_auth) {
         if (!options.operator_password) {
-            fprintf(stderr, "--require-auth requires --password (default operator password cannot serve)\n");
+            fprintf(stderr, "--require-auth requires --password (or QIHSE_OPERATOR_PASSWORD / /etc/qihse/cluster-node0.env)\n");
             return 2;
         }
         /* Non-loopback binds without auth are rejected by the engine itself. */

@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
     const char* node_id = "node0";
     const char* keys_dir = "/etc/qihse/keys";
     const char* peers_dir = "/opt/qihse/data/peers";
-    const char* password = "stageb-local-operator-password";
+    const char* password = NULL;
     int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -307,6 +307,35 @@ int main(int argc, char** argv) {
 
     if (cmd_start < 0) {
         fprintf(stderr, "Usage: %s [--host H|--i2p DEST] [--port P] [--socks S] [--node-id ID] [--keys-dir D] [--peers-dir D] [--password PW] --cmd ARGS...\n", argv[0]);
+        return 1;
+    }
+
+    static char s_file_pw[256];
+    if (!password) {
+        const char* env_pw = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (env_pw && *env_pw) {
+            password = env_pw;
+        } else {
+            FILE* ef = fopen("/etc/qihse/cluster-node0.env", "r");
+            if (ef) {
+                char line[512];
+                while (fgets(line, sizeof(line), ef)) {
+                    if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
+                        char* p = line + 24;
+                        p[strcspn(p, "\r\n")] = '\0';
+                        if (strlen(p) >= 12 && strlen(p) < sizeof(s_file_pw)) {
+                            snprintf(s_file_pw, sizeof(s_file_pw), "%s", p);
+                            password = s_file_pw;
+                            break;
+                        }
+                    }
+                }
+                fclose(ef);
+            }
+        }
+    }
+    if (!password) {
+        fprintf(stderr, "qihse_i2p_test_cli: operator password required (--password, QIHSE_OPERATOR_PASSWORD, or /etc/qihse/cluster-node0.env)\n");
         return 1;
     }
 
@@ -338,7 +367,6 @@ int main(int argc, char** argv) {
 
     // Authenticate
     const char* auth_argv[2] = { "AUTH", password };
-    char auth_last[128] = {0};
     int r = mini_resp_do(&c, 2, auth_argv, NULL, NULL, NULL, NULL);
     if (r != MINI_REP_SIMPLE || c.last[0] != '+') {
         fprintf(stderr, "AUTH failed: %s (%s)\n", c.last, c.err);

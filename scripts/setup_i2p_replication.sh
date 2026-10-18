@@ -67,6 +67,50 @@ QIHSE_BIN_DIR="/opt/qihse/bin"
 # HELPER FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
+derive_hwid_password() {
+    python3 -c '
+import os, hashlib
+
+hw_parts = []
+for p in ["/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/class/dmi/id/product_uuid"]:
+    if os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                c = f.read().strip()
+                if c: hw_parts.append(c)
+        except Exception:
+            pass
+
+try:
+    for iface in sorted(os.listdir("/sys/class/net")):
+        ap = os.path.join("/sys/class/net", iface, "address")
+        tp = os.path.join("/sys/class/net", iface, "type")
+        if os.path.exists(ap) and os.path.exists(tp):
+            with open(tp) as tf, open(ap) as af:
+                if tf.read().strip() == "1":
+                    mac = af.read().strip()
+                    if mac and mac != "00:00:00:00:00:00":
+                        hw_parts.append(mac.encode())
+                        break
+except Exception:
+    pass
+
+try:
+    with open("/proc/cpuinfo", "rb") as f:
+        for line in f:
+            if b"model name" in line:
+                hw_parts.append(line.strip())
+                break
+except Exception:
+    pass
+
+hw_digest = hashlib.sha256(b":".join(hw_parts)).digest()
+rand_bytes = os.urandom(32)
+xored = bytes(h ^ r for h, r in zip(hw_digest, rand_bytes))
+print(hashlib.sha256(xored + rand_bytes).hexdigest())
+' 2>/dev/null || openssl rand -hex 32 2>/dev/null || (head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+}
+
 log_info() {
     printf "\033[1;34m[INFO]\033[0m %s\n" "$*"
 }
@@ -256,7 +300,13 @@ generate_pqc_keys() {
 setup_primary_tunnel() {
     require_root
     if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
-        log_err "Supply QIHSE_OPERATOR_PASSWORD through a protected environment (12+ characters)."; exit 2
+        if [[ -f /etc/qihse/cluster-node0.env ]]; then
+            QIHSE_OPERATOR_PASSWORD=$(sed -n 's/^QIHSE_OPERATOR_PASSWORD=//p' /etc/qihse/cluster-node0.env 2>/dev/null | head -n1 || true)
+        fi
+        if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
+            log_info "Deriving operator password from HWID XOR CSPRNG entropy..."
+            QIHSE_OPERATOR_PASSWORD=$(derive_hwid_password)
+        fi
     fi
     log_info "Configuring I2P server tunnel for primary node (forwarding to 127.0.0.1:${QIHSE_RESP_PORT})..."
 
@@ -325,7 +375,12 @@ EOF
 setup_replica_client() {
     require_root
     if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
-        log_err "Supply QIHSE_OPERATOR_PASSWORD through a protected environment (12+ characters)."; exit 2
+        if [[ -f /etc/qihse/cluster-node1.env ]]; then
+            QIHSE_OPERATOR_PASSWORD=$(sed -n 's/^QIHSE_OPERATOR_PASSWORD=//p' /etc/qihse/cluster-node1.env 2>/dev/null | head -n1 || true)
+        fi
+        if [[ -z "${QIHSE_OPERATOR_PASSWORD:-}" || "${#QIHSE_OPERATOR_PASSWORD}" -lt 12 ]]; then
+            log_err "Supply QIHSE_OPERATOR_PASSWORD matching the primary node through a protected environment (12+ characters)."; exit 2
+        fi
     fi
     local upstream_dest="${UPSTREAM_I2P_DEST}"
     local upstream_id="${UPSTREAM_NODE_ID}"

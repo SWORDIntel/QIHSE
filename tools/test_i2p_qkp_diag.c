@@ -117,9 +117,50 @@ int main(int argc, char** argv) {
            is_peer ? "TRUE (MATCH!)" : "FALSE (MISMATCH!)");
 
     // Test sending sealed AUTH command
-    const char auth_cmd[] = "*2\r\n$4\r\nAUTH\r\n$29\r\nstageb-local-operator-password\r\n";
+    const char* password = getenv("QIHSE_OPERATOR_PASSWORD");
+    char file_pw[256] = {0};
+    if (!password || !*password) {
+        const char* env_files[] = {
+            "/etc/qihse/cluster-node0.env",
+            "/etc/qihse/cluster-node1.env"
+        };
+        for (size_t i = 0; i < sizeof(env_files) / sizeof(env_files[0]); i++) {
+            FILE* ef = fopen(env_files[i], "r");
+            if (ef) {
+                char line[512];
+                while (fgets(line, sizeof(line), ef)) {
+                    if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
+                        char* p = line + 24;
+                        p[strcspn(p, "\r\n")] = '\0';
+                        if (strlen(p) >= 12 && strlen(p) < sizeof(file_pw)) {
+                            snprintf(file_pw, sizeof(file_pw), "%s", p);
+                            password = file_pw;
+                            break;
+                        }
+                    }
+                }
+                fclose(ef);
+                if (password) break;
+            }
+        }
+    }
+    if (!password) {
+        fprintf(stderr, "test_i2p_qkp_diag: operator password required (QIHSE_OPERATOR_PASSWORD or /etc/qihse/cluster-node0.env)\n");
+        qihse_qkp_session_free(s);
+        close(fd);
+        return 2;
+    }
+
+    char auth_cmd[512];
+    int auth_len = snprintf(auth_cmd, sizeof(auth_cmd), "*2\r\n$4\r\nAUTH\r\n$%zu\r\n%s\r\n", strlen(password), password);
+    if (auth_len <= 0 || (size_t)auth_len >= sizeof(auth_cmd)) {
+        fprintf(stderr, "test_i2p_qkp_diag: auth command formatting failed\n");
+        qihse_qkp_session_free(s);
+        close(fd);
+        return 2;
+    }
     printf("[6] Sending sealed AUTH command over I2P...\n");
-    if (!qihse_qkp_send_sealed(s, fd, auth_cmd, strlen(auth_cmd))) {
+    if (!qihse_qkp_send_sealed(s, fd, auth_cmd, (size_t)auth_len)) {
         fprintf(stderr, "Failed to send sealed AUTH\n");
     } else {
         uint8_t reply[1024];

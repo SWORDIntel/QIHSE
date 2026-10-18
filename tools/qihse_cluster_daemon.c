@@ -1388,10 +1388,32 @@ int main(int argc, char** argv) {
             operator_password = configured_password;
         }
     }
+    static char s_env_operator_password[256];
+    if (!operator_password) {
+        char env_path[256];
+        snprintf(env_path, sizeof(env_path), "/etc/qihse/cluster-node%u.env", self_index);
+        FILE* ef = fopen(env_path, "r");
+        if (ef) {
+            char line[512];
+            while (fgets(line, sizeof(line), ef)) {
+                if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
+                    char* p = line + 24;
+                    p[strcspn(p, "\r\n")] = '\0';
+                    if (strlen(p) >= 12 && strlen(p) < sizeof(s_env_operator_password)) {
+                        snprintf(s_env_operator_password, sizeof(s_env_operator_password), "%s", p);
+                        operator_password = s_env_operator_password;
+                        break;
+                    }
+                }
+            }
+            fclose(ef);
+        }
+    }
     /* Never expose a daemon without a configured operator verifier. */
     if (!operator_password && strcmp(bind, "127.0.0.1") != 0 &&
             strcmp(bind, "::1") != 0 && strcmp(bind, "localhost") != 0) {
-        fprintf(stderr, "qihse-cluster-daemon: remote binding requires QIHSE_OPERATOR_PASSWORD\n");
+        fprintf(stderr, "qihse-cluster-daemon: remote binding requires QIHSE_OPERATOR_PASSWORD (or /etc/qihse/cluster-node%u.env)\n",
+                self_index);
         return 2;
     }
     if (consensus_prefix_signer_configured && !operator_password) {

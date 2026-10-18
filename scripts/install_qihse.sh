@@ -40,6 +40,51 @@ if [ "$TARGET_USER" != "root" ]; then
     TARGET_GROUP="$(id -gn "${TARGET_USER}" 2>/dev/null || echo "${TARGET_USER}")"
 fi
 
+# ── Hardware-Fingerprint + CSPRNG Credential Derivation ───────────────────────
+derive_hwid_password() {
+    python3 -c '
+import os, hashlib
+
+hw_parts = []
+for p in ["/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/class/dmi/id/product_uuid"]:
+    if os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                c = f.read().strip()
+                if c: hw_parts.append(c)
+        except Exception:
+            pass
+
+try:
+    for iface in sorted(os.listdir("/sys/class/net")):
+        ap = os.path.join("/sys/class/net", iface, "address")
+        tp = os.path.join("/sys/class/net", iface, "type")
+        if os.path.exists(ap) and os.path.exists(tp):
+            with open(tp) as tf, open(ap) as af:
+                if tf.read().strip() == "1":
+                    mac = af.read().strip()
+                    if mac and mac != "00:00:00:00:00:00":
+                        hw_parts.append(mac.encode())
+                        break
+except Exception:
+    pass
+
+try:
+    with open("/proc/cpuinfo", "rb") as f:
+        for line in f:
+            if b"model name" in line:
+                hw_parts.append(line.strip())
+                break
+except Exception:
+    pass
+
+hw_digest = hashlib.sha256(b":".join(hw_parts)).digest()
+rand_bytes = os.urandom(32)
+xored = bytes(h ^ r for h, r in zip(hw_digest, rand_bytes))
+print(hashlib.sha256(xored + rand_bytes).hexdigest())
+' 2>/dev/null || openssl rand -hex 32 2>/dev/null || (head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+}
+
 # ── Options & Defaults ────────────────────────────────────────────────────────
 PREFIX="$DEFAULT_PREFIX"
 DATA_DIR="$DEFAULT_DATA_DIR"
@@ -151,13 +196,37 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# Reject known defaults; do not bootstrap a network daemon with published secrets.
+# Operator password resolution:
+# 1. Use user-supplied QIHSE_OPERATOR_PASSWORD or --operator-password if provided
+# 2. Re-use existing secret from /etc/qihse/cluster-node${NODE_INDEX:-0}.env if present
+# 3. Auto-derive a 256-bit high-entropy secret by XORing HWID fingerprint with CSPRNG entropy
+DERIVED_AUTOPASS=0
 if [ "$DRY_RUN" -eq 0 ]; then
+    if [ -z "${OPERATOR_PASSWORD}" ]; then
+        TARGET_ENV="/etc/qihse/cluster-node${NODE_INDEX:-0}.env"
+        if [ -f "$TARGET_ENV" ]; then
+            EXISTING_PW=$(sed -n 's/^QIHSE_OPERATOR_PASSWORD=//p' "$TARGET_ENV" 2>/dev/null | head -n1 || true)
+            if [ "${#EXISTING_PW}" -ge 12 ]; then
+                OPERATOR_PASSWORD="$EXISTING_PW"
+                echo "[SECURITY] Reusing existing operator password from ${TARGET_ENV}."
+            fi
+        fi
+    fi
+
+    if [ -z "${OPERATOR_PASSWORD}" ]; then
+        if [ ${#JOIN_SEEDS[@]} -gt 0 ]; then
+            echo "[ERROR] Joining an existing cluster (--join) requires the cluster operator password." >&2
+            echo "Set QIHSE_OPERATOR_PASSWORD before running, matching the primary cluster node." >&2
+            exit 1
+        fi
+        echo "[SECURITY] Deriving high-entropy operator password from HWID XOR CSPRNG entropy..."
+        OPERATOR_PASSWORD=$(derive_hwid_password)
+        DERIVED_AUTOPASS=1
+    fi
+
     if [ "${#OPERATOR_PASSWORD}" -lt 12 ] ||
        [[ ! "$OPERATOR_PASSWORD" =~ ^[A-Za-z0-9_.!@%+=:-]+$ ]]; then
-        echo "[ERROR] Set QIHSE_OPERATOR_PASSWORD to 12+ safe printable characters before installation." >&2
-        echo "Example: export QIHSE_OPERATOR_PASSWORD=\$(openssl rand -hex 32)" >&2
-        echo "Use the same new credential on each cluster node; rotate any published credential." >&2
+        echo "[ERROR] Operator password must be 12+ safe printable characters." >&2
         exit 1
     fi
 fi
@@ -1040,6 +1109,20 @@ if [ "$IS_SOLO" -eq 1 ]; then
 │      node's ${KEYS_DIR}/ directory, and vice versa.                  │
 └──────────────────────────────────────────────────────────────────────┘
 EOF
+    echo ""
+fi
+
+if [ "${DERIVED_AUTOPASS:-0}" -eq 1 ]; then
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo " [SECURITY] Cluster Operator Password Derived from HWID XOR CSPRNG:"
+    echo "   QIHSE_OPERATOR_PASSWORD=${OPERATOR_PASSWORD}"
+    echo ""
+    echo " Stored securely in: /etc/qihse/cluster-node${NODE_INDEX}.env (mode 0600)"
+    if [ "$IS_SOLO" -eq 0 ]; then
+        echo " To connect other nodes to this cluster, configure them with:"
+        echo "   export QIHSE_OPERATOR_PASSWORD=${OPERATOR_PASSWORD}"
+    fi
+    echo "══════════════════════════════════════════════════════════════════════"
     echo ""
 fi
 
