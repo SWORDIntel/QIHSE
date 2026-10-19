@@ -1116,7 +1116,7 @@ test-trinary-codec:
 	    tests/qihse_trinary_codec_test.c \
 	    codecs/qihse_trinary_tryte_codec.c \
 	    $(LDFLAGS)
-	./tests/qihse_trinary_codec_test
+	LD_LIBRARY_PATH=. ./tests/qihse_trinary_codec_test
 
 test-memory-planner: lib
 	$(CC) $(CFLAGS) -o tests/qihse_memory_planner_test \
@@ -1186,7 +1186,7 @@ test-memory-migration-scheduler: lib
 
 test-all-isa:
 	$(CC) $(CFLAGS) -o tests/test_all_isa tests/test_all_isa.c $(LDFLAGS)
-	./tests/test_all_isa
+	LD_LIBRARY_PATH=. ./tests/test_all_isa
 
 test-vnni-bench:
 	$(CC) $(CFLAGS) -o tests/test_vnni_bench tests/test_vnni_bench.c \
@@ -1195,27 +1195,27 @@ test-vnni-bench:
 
 test-vnni-only:
 	$(CC) $(CFLAGS) -mavx2 -mfma -mavxvnni -o tests/test_vnni_only tests/test_vnni_only.c $(LDFLAGS)
-	./tests/test_vnni_only
+	LD_LIBRARY_PATH=. ./tests/test_vnni_only
 
 test-avx2-only:
 	$(CC) $(CFLAGS) -mavx2 -mfma -o tests/test_avx2_only tests/test_avx2_only.c $(LDFLAGS)
-	./tests/test_avx2_only
+	LD_LIBRARY_PATH=. ./tests/test_avx2_only
 
 test-avx512-direct:
 	$(CC) $(CFLAGS) -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -o tests/test_avx512_direct tests/test_avx512_direct.c $(LDFLAGS)
-	./tests/test_avx512_direct
+	LD_LIBRARY_PATH=. ./tests/test_avx512_direct
 
 test-amx-only:
 	$(CC) $(CFLAGS) -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_amx_only tests/test_amx_only.c $(LDFLAGS)
-	./tests/test_amx_only
+	LD_LIBRARY_PATH=. ./tests/test_amx_only
 
 test-direct-execution:
 	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
-	./tests/test_direct_execution
+	LD_LIBRARY_PATH=. ./tests/test_direct_execution
 
 test-simple-exec:
 	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_simple_exec tests/test_simple_exec.c $(LDFLAGS)
-	./tests/test_simple_exec
+	LD_LIBRARY_PATH=. ./tests/test_simple_exec
 
 bench-cluster-crc: lib
 	$(CC) $(CFLAGS) -o benchmarks/qihse_cluster_crc_bench benchmarks/qihse_cluster_crc_bench.c -L. -lqihse $(LDFLAGS)
