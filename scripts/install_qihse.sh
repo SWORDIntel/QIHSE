@@ -707,6 +707,11 @@ echo "  [✓] Compilation completed successfully."
 echo ""
 echo "[4/7] Installing Binaries and Libraries into ${PREFIX}..."
 
+# Ensure parent install root (e.g. /opt) preserves standard traversal permissions
+if [ -d "/opt" ]; then
+    $SUDO chmod 755 /opt
+fi
+$SUDO install -d -m 755 "${PREFIX}"
 $SUDO install -d -m 755 "${PREFIX}/bin"
 $SUDO install -d -m 755 "${PREFIX}/lib"
 $SUDO install -d -m 755 "${PREFIX}/include/qihse"

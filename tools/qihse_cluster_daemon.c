@@ -71,8 +71,7 @@ static bool mkdirs(const char* path) {
     for (char* p = copy + 1u; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(copy, 0700) != 0 && errno != EEXIST) return false;
-            chmod(copy, 0700);
+            if (mkdir(copy, 0755) != 0 && errno != EEXIST) return false;
             *p = '/';
         }
     }
