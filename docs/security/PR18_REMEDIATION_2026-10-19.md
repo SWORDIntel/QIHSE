@@ -3,7 +3,9 @@
 Base of this follow-up: `356a13bb8c3acad64b1f1fadf53a8b62298c3504`.
 
 This is an incremental remediation, not a complete security certification.
-Keep the PR draft until the complete required CI and deployment checks pass.
+The owner explicitly requested publication to main before full CI completed.
+That publication is not a release-validation claim; the complete required CI
+and deployment checks must still pass.
 The operator-password configuration is deliberately unchanged in this follow-up.
 
 ## Implemented boundaries
@@ -67,3 +69,21 @@ Source changes do not rotate existing deployed credentials, authenticate a local
 reverse proxy, or prove production recovery and rollout safety. Existing rotation,
 ownership, rollout/rollback, real-topology and full negative-authorization gates
 remain mandatory. No merge or production deployment is performed by this patch.
+
+## Follow-up CI evidence
+
+Run `39204517500` on `c9ca6c74676569e5cc0a68df9e76d1ea10014ff7`
+passed both builds, Studio/dashboard, the new native and sanitized lifecycle
+checks, and the corrected DHT/ingest fixtures. It then exposed later failures:
+
+- Four leaked bundle-fixture thread arguments (64 bytes). The same ownership
+  pattern also existed in killswitch, vector-tenant, retention and metrics
+  fixtures. These tests now free transferred arguments and join all handlers
+  before destroying shared state, without changing authorization assertions.
+- The remote fabric-dispatch test expected indexed completion even though the
+  optional KEYSTONE backend was absent. Its observed outcome must be checked
+  against the real index-availability condition and durable result, not relabeled
+  as fully indexed success or fixed by increasing a timeout.
+
+These later failures were previously hidden by earlier aborts. New workflow
+results, rather than this document, establish whether the full suite is green.

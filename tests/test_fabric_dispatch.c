@@ -36,6 +36,7 @@
 #include "qihse_auth.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_fabric_dispatch.h"
+#include "qihse_fabric_index.h"
 #include "qihse_kv_store.h"
 #include "qihse_resp_wire.h"
 #include "qihse_runtime_trust.h"
@@ -369,7 +370,17 @@ static bool parse_job_id(const char* reply, char* out, size_t out_cap) {
     return i > 0u;
 }
 
-static void test_remote_dispatch_runs_on_the_peer(void) {
+/* The optional index determines the expected outcome independently of the
+ * dispatch response. An available but broken index must NOT pass as done. */
+static const char* ingest_status(void) {
+    return qihse_fabric_index_is_available() ? "done" : "stored-unindexed";
+}
+
+static const char* ingest_reason(void) {
+    return qihse_fabric_index_is_available() ? "-" : "keystone-index-unavailable";
+}
+
+static void test_remote_ingest_roundtrip(const char* endpoint) {
     char reply[8192];
 
     /* ── keystone-ingest: a job that must run on the PEER ─────────────── */
@@ -394,32 +405,64 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
      * in either direction. */
     assert(qihse_kv_get_user(g_store_a, art_key, g_op) == NULL);
 
+    /* Check the durable executor record, not merely a successful transport. */
+    char result_key[192];
+    assert(qihse_fabric_remote_result_key(&g_id_a.node_id, strtoull(jid, NULL, 10),
+                                         result_key, sizeof result_key));
+    char* record = qihse_kv_get_user(g_store_b, result_key, g_op);
+    assert(record != NULL);
+    qihse_fabric_response_t parsed;
+    assert(qihse_fabric_response_parse(record, strlen(record), &parsed));
+    assert(strcmp(parsed.status, ingest_status()) == 0);
+    assert(strcmp(parsed.reason, ingest_reason()) == 0);
+    assert(parsed.payload_len == strlen(JOB_PAYLOAD));
+    assert(strcmp(record + parsed.payload_offset, JOB_PAYLOAD) == 0);
+    assert(strcmp(parsed.result, art_key) == 0);
+
     /* Before the pull, the state is `pending-fetch`, NOT `done`. */
     const char* res[] = { "FABRIC", "RESULT", jid };
     run_cmd(g_submitter, g_low, 3u, res, reply, sizeof reply);
     assert(strstr(reply, "pending-fetch") != NULL);
-    assert(strstr(reply, "done") == NULL);
+    assert(strstr(reply, "\"status\":\"done\"") == NULL);
+    char expected[128];
+    snprintf(expected, sizeof expected, "\"remote_status\":\"%s\"", ingest_status());
+    assert(strstr(reply, expected) != NULL);
     assert(strstr(reply, "exec\":\"remote") != NULL);
     assert(strstr(reply, "remote_gen") != NULL);
-    /* No signed statement has been accepted for the peer yet, so the dial
-     * target came from the topology hint — and the record says so. */
-    assert(strstr(reply, "\"ep\":\"topology\"") != NULL);
+    /* The record must identify the endpoint actually selected for this run. */
+    snprintf(expected, sizeof expected, "\"ep\":\"%s\"", endpoint);
+    assert(strstr(reply, expected) != NULL);
 
     /* The pull: the result comes back and is cached. */
     const char* fetch[] = { "FABRIC", "FETCH", jid };
     run_cmd(g_submitter, g_low, 3u, fetch, reply, sizeof reply);
-    assert(strstr(reply, "fetched") != NULL);
-    assert(strstr(reply, "status:done") != NULL);
     printf("  fetch reply: %s", reply);
     if (reply[strlen(reply) - 1u] != '\n') printf("\n");
+    assert(strstr(reply, "fetched") != NULL);
+    snprintf(expected, sizeof expected, "fetched job:%s status:%s", jid, ingest_status());
+    assert(strstr(reply, expected) != NULL);
 
     /* Now the cached record is served, payload and all, and the state is the
      * executor's own status. */
     run_cmd(g_submitter, g_low, 3u, res, reply, sizeof reply);
-    assert(strstr(reply, "status\":\"done") != NULL);
+    snprintf(expected, sizeof expected, "\"status\":\"%s\"", ingest_status());
+    assert(strstr(reply, expected) != NULL);
+    assert(strstr(reply, record) != NULL);
+    char cache_key[128];
+    snprintf(cache_key, sizeof cache_key, "fabric:remote-cache:%s", jid);
+    char* cached = qihse_kv_get_user(g_store_a, cache_key, g_low);
+    assert(cached != NULL && strcmp(cached, record) == 0);
+    free(cached);
+    free(record);
     assert(strstr(reply, JOB_PAYLOAD) != NULL);
     assert(strstr(reply, "fabric-remote v1") != NULL);
-    printf("PASS remote keystone-ingest: ran on the peer, result pulled and cached\n");
+    printf("PASS remote keystone-ingest: peer artifact persisted, %s result pulled and cached\n",
+           ingest_status());
+}
+
+static void test_remote_dispatch_runs_on_the_peer(void) {
+    char reply[8192];
+    test_remote_ingest_roundtrip("topology");
 
     /* ── embed at clearance 0 runs on the peer too ────────────────────── */
     const char* sub2[] = { "FABRIC", "SUBMIT", "embed", "0", "0", "remote embed marker" };
@@ -931,7 +974,10 @@ static void test_refusal_paths(void) {
 
     assert(qihse_fabric_executor_run(&ex, request, blob_len + payload_len, g_id_a.node_id,
                                      body, sizeof(body), &body_len));
-    assert(strstr(body, "status=done") != NULL);
+    qihse_fabric_response_t ack;
+    assert(qihse_fabric_response_parse(body, body_len, &ack));
+    assert(strcmp(ack.status, ingest_status()) == 0);
+    assert(strcmp(ack.reason, ingest_reason()) == 0);
     char art_key[192];
     assert(qihse_fabric_remote_artifact_key(&g_id_a.node_id, 5555u, art_key, sizeof art_key));
     assert(qihse_kv_get_user(g_store_b, art_key, g_op) != NULL);
@@ -946,7 +992,8 @@ static void test_refusal_paths(void) {
     body_len = 0;
     assert(qihse_fabric_executor_run(&ex, request, blob_len + payload_len, g_id_a.node_id,
                                      body, sizeof(body), &body_len));
-    assert(strstr(body, "status=done") != NULL);
+    assert(qihse_fabric_response_parse(body, body_len, &ack));
+    assert(strcmp(ack.status, ingest_status()) == 0);
     assert(strstr(body, "dedup-replay") != NULL);
 
     /* The SAME token again: replayed, refused, and the job does not run a
@@ -1004,9 +1051,17 @@ static void test_refusal_paths(void) {
 }
 
 int main(void) {
+    /* Preserve the last protocol reply in CI logs if an assertion aborts. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     char data_root[] = "build/fabric_dispatch_XXXXXX";
     assert(mkdtemp(data_root));
     setenv("QIHSE_DATA_DIR", data_root, 1);
+    /* Keep index state private; retain real KEYSTONE coverage when installed. */
+    char index_dir[512], missing_library[512];
+    snprintf(index_dir, sizeof index_dir, "%s/index", data_root);
+    int index_rc = qihse_fabric_index_init(index_dir, NULL);
+    assert(index_rc == QIHSE_FABRIC_INDEX_OK ||
+           index_rc == QIHSE_FABRIC_INDEX_EUNAVAILABLE);
 
     char key_dir[512], ca_dir[512];
     snprintf(key_dir, sizeof(key_dir), "%s/keys", data_root);
@@ -1198,6 +1253,16 @@ int main(void) {
     test_retry_policy();
     test_scatter_peerauth();
     test_remote_dispatch_runs_on_the_peer();
+    /* Also force the degraded path on hosts with KEYSTONE installed. The
+     * explicit nonexistent path is authoritative, so no loader fallback can
+     * accidentally turn this into the indexed case. */
+    qihse_fabric_index_shutdown();
+    snprintf(missing_library, sizeof missing_library, "%s/no-keystone.so", data_root);
+    assert(access(missing_library, F_OK) != 0);
+    assert(qihse_fabric_index_init(index_dir, missing_library) ==
+           QIHSE_FABRIC_INDEX_EUNAVAILABLE);
+    assert(!qihse_fabric_index_is_available());
+    test_remote_ingest_roundtrip("signed");
     test_cache_coherence();
     test_negative_low_clearance_high_data();
     test_session_recheck();
@@ -1210,6 +1275,7 @@ int main(void) {
     qihse_resp_server_destroy(g_executor);
     qihse_kv_store_destroy(g_store_a);
     qihse_kv_store_destroy(g_store_b);
+    qihse_fabric_index_shutdown();
     free(ca);
     printf("fabric dispatch tests passed\n");
     return 0;
