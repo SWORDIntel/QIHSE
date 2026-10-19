@@ -171,6 +171,9 @@ static void usage(const char* argv0) {
         "  --consensus-peer UUID:QKP-ID:DSA-PUB:WG-IP:PORT (provisioned peers)\n"
         "  enables the durable QKP-pinned consensus mesh. Requires --dir and --pqc-require.\n"
         "  --consensus-election-priority-delay-ms N delays this member's candidacy.\n"
+        "  --consensus-priority-tier N sets deterministic priority tier (0=primary, 1=warm, 2=cold/arbiter).\n"
+        "  --consensus-wan-rtt-ms N adds WAN RTT offset in milliseconds to priority delay.\n"
+        "  --consensus-prevote enables Raft Pre-Vote protocol to guard against disruptive elections.\n"
         "  --consensus-election-base-ms N --consensus-election-spread-ms N\n"
         "  --consensus-heartbeat-ms N tune mesh timing (defaults: 150/300/50).\n"
         "  --consensus-history-id SHA256 --consensus-writer-epoch N bind a new\n"
@@ -207,6 +210,9 @@ typedef struct {
     char listen_ipv4[64];
     uint16_t port;
     uint32_t election_priority_delay_ms;
+    uint32_t priority_tier;
+    uint32_t wan_rtt_ms;
+    bool enable_prevote;
     uint32_t election_timeout_base_ms;
     uint32_t election_timeout_spread_ms;
     uint32_t heartbeat_interval_ms;
@@ -1219,6 +1225,21 @@ int main(int argc, char** argv) {
                 delay_ms > QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS)
                 return usage(argv[0]), 2;
             consensus_options.election_priority_delay_ms = delay_ms;
+        } else if (strcmp(a, "--consensus-priority-tier") == 0 && i + 1 < argc) {
+            uint16_t tier = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &tier))
+                return usage(argv[0]), 2;
+            consensus_options.priority_tier = tier;
+        } else if (strcmp(a, "--consensus-wan-rtt-ms") == 0 && i + 1 < argc) {
+            uint16_t rtt = 0u;
+            consensus_configured = true;
+            if (!parse_u16(argv[++i], &rtt))
+                return usage(argv[0]), 2;
+            consensus_options.wan_rtt_ms = rtt;
+        } else if (strcmp(a, "--consensus-prevote") == 0) {
+            consensus_configured = true;
+            consensus_options.enable_prevote = true;
         } else if (strcmp(a, "--consensus-election-base-ms") == 0 && i + 1 < argc) {
             uint16_t value = 0u;
             consensus_configured = true;
@@ -1630,6 +1651,9 @@ int main(int argc, char** argv) {
             consensus_options.bootstrap_unadmitted;
         mesh_cfg.consensus.election_priority_delay_ms =
             consensus_options.election_priority_delay_ms;
+        mesh_cfg.consensus.priority_tier = consensus_options.priority_tier;
+        mesh_cfg.consensus.wan_rtt_ms = consensus_options.wan_rtt_ms;
+        mesh_cfg.consensus.enable_prevote = consensus_options.enable_prevote;
         mesh_cfg.consensus.election_timeout_base_ms =
             consensus_options.election_timeout_base_ms;
         mesh_cfg.consensus.election_timeout_spread_ms =

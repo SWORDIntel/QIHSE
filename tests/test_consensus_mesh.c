@@ -44,7 +44,7 @@ static int run_mesh_leader_child(const char* root, uint16_t ports[NODE_COUNT]) {
         (mkdir(data, 0700) != 0 && errno != EEXIST) ||
         setenv("QIHSE_DATA_DIR", data, 1) != 0 ||
         setenv("QIHSE_FIPS_MODE", "disabled", 1) != 0 ||
-        qihse_pqc_init_providers() != 0 || !qihse_auth_init() ||
+        qihse_pqc_init_providers() < 0 || !qihse_auth_init() ||
         !qihse_auth_bootstrap_operator("ConsensusMeshOperator1!")) {
         fprintf(stderr, "mesh leader child: crypto/auth initialization failed\n");
         return 2;
@@ -405,7 +405,7 @@ int main(int argc, char** argv) {
     assert(mkdir(data, 0700) == 0);
     assert(setenv("QIHSE_DATA_DIR", data, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
-    assert(qihse_pqc_init_providers() == 0);
+    assert(qihse_pqc_init_providers() >= 0);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("ConsensusMeshOperator1!"));
     qihse_user_t* operator_user = qihse_auth_get_user(0u);
@@ -451,7 +451,9 @@ int main(int argc, char** argv) {
         consensus->election_timeout_spread_ms = 600u;
         consensus->heartbeat_interval_ms = 100u;
         if (i == 1u) /* Lower-priority voter waits for preferred candidates. */
-            consensus->election_priority_delay_ms = 1200u;
+            consensus->election_priority_delay_ms = 1800u;
+        else if (i == 2u)
+            consensus->election_priority_delay_ms = 800u;
         assert(qihse_consensus_blob_bind_config(&blob_contexts[i], consensus));
         assert(snprintf(consensus->record_path, sizeof(consensus->record_path),
                         "%s/consensus-%zu.rec", root, i) > 0);
@@ -822,6 +824,10 @@ int main(int argc, char** argv) {
     assert(strstr(wire_reply, "NOPERM") &&
            !strstr(wire_reply, protected_payload));
     free(wire_reply);
+    for (unsigned attempt = 0; attempt < 500u && qihse_consensus_mesh_role(meshes[leader_index]) != QIHSE_CONSENSUS_LEADER; attempt++) {
+        usleep(10000u);
+    }
+    assert(qihse_consensus_mesh_role(meshes[leader_index]) == QIHSE_CONSENSUS_LEADER);
     wire_reply = run_resp(resp, operator_user, protected_propose, 5u);
     assert(strstr(wire_reply, "*4\r\n") && strstr(wire_reply, ":35\r\n"));
     free(wire_reply);

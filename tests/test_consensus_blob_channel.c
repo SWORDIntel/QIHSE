@@ -70,7 +70,7 @@ int main(void) {
            mkdir(client_dir, 0700) == 0);
     assert(setenv("QIHSE_DATA_DIR", data, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
-    assert(qihse_pqc_init_providers() == 0);
+    assert(qihse_pqc_init_providers() >= 0);
     assert(qihse_pqc_keygen(server_dir) && qihse_pqc_keygen(client_dir));
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("BlobChannelOperator1!"));

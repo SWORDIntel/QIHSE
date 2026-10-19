@@ -61,7 +61,7 @@ int main(void) {
     assert(decoded.u.append.entries[1].payload_len == 6u);
     assert(memcmp(decoded.u.append.entries[1].payload, "secret", 6u) == 0);
 
-    qihse_consensus_msg_t variants[6];
+    qihse_consensus_msg_t variants[8];
     memset(variants, 0, sizeof(variants));
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
         snprintf(variants[i].group_id, sizeof(variants[i].group_id), "%s", "qihse.test.app");
@@ -101,6 +101,10 @@ int main(void) {
     variants[5].u.snapshot_chunk.entries[0].journal_generation = 91u;
     variants[5].u.snapshot_chunk.chunk_digest =
         qihse_consensus_snapshot_chunk_digest(&variants[5].u.snapshot_chunk);
+    variants[6].type = QIHSE_CONSENSUS_MSG_PRE_VOTE;
+    variants[6].u.vote.last_log_index = 40u; variants[6].u.vote.last_log_term = 3u;
+    variants[7].type = QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY;
+    variants[7].u.vote_reply.granted = true;
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
         assert(qihse_consensus_wire_encode(op, &variants[i], wire, sizeof(wire), &wire_len));
         assert(qihse_consensus_wire_decode(op, wire, wire_len, &decoded));
@@ -118,6 +122,11 @@ int main(void) {
             assert(decoded.u.snapshot_chunk.final_chunk);
             assert(decoded.u.snapshot_chunk.chunk_digest ==
                    variants[i].u.snapshot_chunk.chunk_digest);
+        } else if (decoded.type == QIHSE_CONSENSUS_MSG_PRE_VOTE) {
+            assert(decoded.u.vote.last_log_index == 40u);
+            assert(decoded.u.vote.last_log_term == 3u);
+        } else if (decoded.type == QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY) {
+            assert(decoded.u.vote_reply.granted);
         }
     }
 

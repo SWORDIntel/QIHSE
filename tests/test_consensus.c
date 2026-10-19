@@ -270,6 +270,36 @@ static void h_init(harness_t* h, const char* seed) {
     h_init_ex(h, seed, 0u); /* compaction disabled: legacy behavior */
 }
 
+static void h_init_prevote(harness_t* h, const char* seed) {
+    memset(h, 0, sizeof(*h));
+    snprintf(h->dir, sizeof(h->dir), "build/test_consensus_XXXXXX");
+    if (!mkdtemp(h->dir)) {
+        snprintf(h->dir, sizeof(h->dir), "test_consensus_XXXXXX");
+        assert(mkdtemp(h->dir));
+    }
+    for (size_t i = 0; i < N; i++) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "consensus-%s-%zu", seed, i);
+        assert(qihse_uuid_from_seed(buf, strlen(buf), &h->id[i]));
+        snprintf(h->recpath[i], sizeof(h->recpath[i]), "%s/node%zu.rec", h->dir, i);
+    }
+    for (size_t i = 0; i < N; i++) {
+        qihse_consensus_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.group_id, sizeof(cfg.group_id), "group/%s", seed);
+        cfg.self = h->id[i];
+        cfg.member_count = N;
+        for (size_t j = 0; j < N; j++) cfg.members[j] = h->id[j];
+        cfg.election_timeout_base_ms = 150u;
+        cfg.election_timeout_spread_ms = 300u;
+        cfg.heartbeat_interval_ms = 50u;
+        cfg.enable_prevote = true;
+        snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", h->recpath[i]);
+        h->node[i] = qihse_consensus_open(&cfg, h, h_send);
+        assert(h->node[i]);
+    }
+}
+
 static void h_free(harness_t* h) {
     for (size_t i = 0; i < N; i++) {
         if (h->node[i]) qihse_consensus_close(h->node[i]);
@@ -3985,6 +4015,120 @@ static void test_unadmitted_bootstrap(void) {
     printf("[PASS] unadmitted bootstrap: existing baseline only, no vote\n");
 }
 
+static void test_prevote_and_priority_tiers(void) {
+    /* 1. Deterministic delay formula verification */
+    uint32_t d0 = qihse_consensus_calculate_priority_delay(0u, 150u, 300u, 0u);
+    assert(d0 == 0u);
+    uint32_t d1 = qihse_consensus_calculate_priority_delay(1u, 150u, 300u, 25u);
+    assert(d1 == 500u); /* 1 * (150 + 300) + 2 * 25 = 500ms */
+    uint32_t d2 = qihse_consensus_calculate_priority_delay(2u, 150u, 300u, 50u);
+    assert(d2 == 1000u); /* 2 * (150 + 300) + 2 * 50 = 1000ms */
+    uint32_t d_overflow = qihse_consensus_calculate_priority_delay(500u, 1000u, 1000u, 1000u);
+    assert(d_overflow == QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS);
+
+    /* 2. Auto-derivation of election_priority_delay_ms and heartbeat clamping */
+    char dir[128];
+    snprintf(dir, sizeof(dir), "build/test_prevote_XXXXXX");
+    if (!mkdtemp(dir)) {
+        snprintf(dir, sizeof(dir), "test_prevote_XXXXXX");
+        assert(mkdtemp(dir));
+    }
+    char path0[192];
+    snprintf(path0, sizeof(path0), "%s/node0.rec", dir);
+
+    qihse_uuid_t self;
+    assert(qihse_uuid_from_seed("prevote-self", 12u, &self));
+
+    qihse_consensus_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.group_id, sizeof(cfg.group_id), "group/prevote_test");
+    cfg.self = self;
+    cfg.member_count = 1u;
+    cfg.members[0] = self;
+    cfg.election_timeout_base_ms = 150u;
+    cfg.election_timeout_spread_ms = 300u;
+    cfg.heartbeat_interval_ms = 120u; /* > base / 2 (75ms): auto-adjusted to base / 3 (50ms) */
+    cfg.priority_tier = 2u;
+    cfg.wan_rtt_ms = 50u;
+    cfg.enable_prevote = true;
+    snprintf(cfg.record_path, sizeof(cfg.record_path), "%s", path0);
+
+    qihse_consensus_t* cs = qihse_consensus_open(&cfg, NULL, NULL);
+    assert(cs != NULL);
+    qihse_consensus_close(cs);
+    remove(path0);
+    rmdir(dir);
+
+    /* 3. Pre-vote in harness: partitioned node does NOT disrupt healthy leader or bump term */
+    harness_t h;
+    h_init_prevote(&h, "pvtest");
+
+    /* Initial election succeeds with pre-vote enabled */
+    int L = h_elect(&h);
+    assert(L >= 0);
+    assert(qihse_consensus_role(h.node[L]) == QIHSE_CONSENSUS_LEADER);
+    uint64_t term1 = qihse_consensus_term(h.node[L]);
+    assert(term1 == 1u);
+
+    /* Pick a follower (different from leader L) */
+    size_t F = (size_t)((L + 1) % (int)N);
+    assert(qihse_consensus_role(h.node[F]) == QIHSE_CONSENSUS_FOLLOWER);
+
+    /* Fully isolate follower F from all other nodes */
+    for (size_t j = 0; j < N; j++) {
+        h.drop[F][j] = true;
+        h.drop[j][F] = true;
+    }
+
+    /* Advance time only on follower F until its election timeout fires */
+    for (unsigned i = 0; i < 60u; i++) {
+        h_tick_one(&h, F, 10u);
+    }
+    /* Follower F entered PRE_CANDIDATE, NOT CANDIDATE! */
+    assert(qihse_consensus_role(h.node[F]) == QIHSE_CONSENSUS_PRE_CANDIDATE);
+    /* In pre-candidate, its term is NOT incremented; it remains in term 1 */
+    assert(qihse_consensus_term(h.node[F]) == 1u);
+
+    /* Heal the network partition to follower F */
+    for (size_t j = 0; j < N; j++) {
+        h.drop[F][j] = false;
+        h.drop[j][F] = false;
+    }
+
+    /* Advance the cluster time: leader L sends heartbeats, healthy peers reject F's pre-vote */
+    for (unsigned i = 0; i < 20u; i++) {
+        h_tick(&h, 10u);
+    }
+
+    /* Leader L is STILL leader in term 1! Term 1 was NOT disrupted! */
+    assert(qihse_consensus_role(h.node[L]) == QIHSE_CONSENSUS_LEADER);
+    assert(qihse_consensus_term(h.node[L]) == 1u);
+    /* Follower F stepped down back to follower upon receiving leader's heartbeat */
+    assert(qihse_consensus_role(h.node[F]) == QIHSE_CONSENSUS_FOLLOWER);
+
+    /* 4. Real leader failure: when leader L actually dies, pre-vote succeeds and elects new leader in term 2 */
+    qihse_consensus_close(h.node[L]);
+    h.node[L] = NULL;
+
+    /* Advance time until followers' leader leases expire and new election completes */
+    int new_L = -1;
+    for (unsigned i = 0; i < 200u; i++) {
+        h_tick(&h, 10u);
+        for (size_t j = 0; j < N; j++) {
+            if (h.node[j] && qihse_consensus_role(h.node[j]) == QIHSE_CONSENSUS_LEADER) {
+                new_L = (int)j;
+                break;
+            }
+        }
+        if (new_L >= 0) break;
+    }
+    assert(new_L >= 0 && new_L != L);
+    assert(qihse_consensus_term(h.node[new_L]) == 2u);
+
+    h_free(&h);
+    printf("[PASS] prevote & priority tiers: lease-protected leader, term invariance, real failover\n");
+}
+
 int main(void) {
     /* Relative record-file directory only (repo rule: no absolute paths). */
     char dir[128];
@@ -4048,6 +4192,7 @@ int main(void) {
     test_membership_restart(dir, &hostile_self, op);
     test_decoder_hostile_config(dir, &hostile_self);
     test_membership_determinism();
+    test_prevote_and_priority_tiers();
 
     rmdir(dir);
     printf("all consensus tests passed\n");

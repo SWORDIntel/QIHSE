@@ -211,7 +211,16 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
         if (!items) { snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
         for (long long i = 0; i < count; i++) {
             char sub[64];
-            if (mini_resp_read_line(c, sub, sizeof(sub)) < 0 || sub[0] != '$') {
+            if (mini_resp_read_line(c, sub, sizeof(sub)) < 0) {
+                mini_resp_free_array(items, (size_t)i);
+                snprintf(c->err, sizeof(c->err), "bad array item");
+                return MINI_REP_ERROR;
+            }
+            if (sub[0] == ':') {
+                items[i] = strdup(sub + 1);
+                continue;
+            }
+            if (sub[0] != '$') {
                 mini_resp_free_array(items, (size_t)i);
                 snprintf(c->err, sizeof(c->err), "bad array item");
                 return MINI_REP_ERROR;

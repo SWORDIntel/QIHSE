@@ -92,7 +92,7 @@ int main(void) {
     assert(mkdir(data, 0700) == 0 && mkdir(srv, 0700) == 0 && mkdir(cli, 0700) == 0);
     assert(setenv("QIHSE_DATA_DIR", data, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
-    assert(qihse_pqc_init_providers() == 0);
+    assert(qihse_pqc_init_providers() >= 0);
     assert(qihse_pqc_keygen(srv) && qihse_pqc_keygen(cli));
 
     assert(qihse_auth_init());

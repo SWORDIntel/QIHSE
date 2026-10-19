@@ -148,6 +148,8 @@ static bool prevalidate(const qihse_user_t* principal,
     switch (m->type) {
         case QIHSE_CONSENSUS_MSG_REQUEST_VOTE:
         case QIHSE_CONSENSUS_MSG_VOTE_REPLY:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY:
         case QIHSE_CONSENSUS_MSG_APPEND_REPLY:
         case QIHSE_CONSENSUS_MSG_SNAPSHOT_REPLY:
             return true;
@@ -220,8 +222,10 @@ static bool wire_encode(const qihse_user_t* principal,
     w_bytes(&w, m->group_id, group_len);
     switch (m->type) {
         case QIHSE_CONSENSUS_MSG_REQUEST_VOTE:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE:
             w_u64(&w, m->u.vote.last_log_index); w_u64(&w, m->u.vote.last_log_term); break;
         case QIHSE_CONSENSUS_MSG_VOTE_REPLY:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY:
             w_u8(&w, m->u.vote_reply.granted ? 1u : 0u); break;
         case QIHSE_CONSENSUS_MSG_APPEND:
             w_u64(&w, m->u.append.prev_log_index); w_u64(&w, m->u.append.prev_log_term);
@@ -307,8 +311,10 @@ static bool wire_decode(const qihse_user_t* principal,
     if (!r.ok) return false;
     switch (m.type) {
         case QIHSE_CONSENSUS_MSG_REQUEST_VOTE:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE:
             m.u.vote.last_log_index = r_u64(&r); m.u.vote.last_log_term = r_u64(&r); break;
-        case QIHSE_CONSENSUS_MSG_VOTE_REPLY: {
+        case QIHSE_CONSENSUS_MSG_VOTE_REPLY:
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY: {
             uint8_t v = r_u8(&r); if (v > 1u) r.ok = false; m.u.vote_reply.granted = v != 0u; break;
         }
         case QIHSE_CONSENSUS_MSG_APPEND: {

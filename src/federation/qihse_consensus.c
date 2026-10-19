@@ -1378,9 +1378,6 @@ static void qcs_log_truncate(qihse_consensus_t* cs, size_t keep) {
 
 /* ── Internal state helpers ──────────────────────────────────────────────── */
 
-static size_t qcs_majority_needed(const qihse_consensus_t* cs) {
-    return cs->cfg.member_count / 2u + 1u;
-}
 
 const char* qihse_consensus_member_role_name(qihse_consensus_member_role_t role) {
     switch (role) {
@@ -1627,7 +1624,9 @@ static uint64_t qcs_election_timeout_ms(const qihse_consensus_t* cs,
 static void qcs_send(qihse_consensus_t* cs, qihse_consensus_msg_t* m) {
     snprintf(m->group_id, sizeof(m->group_id), "%s", cs->cfg.group_id);
     m->from = cs->cfg.self;
-    m->term = cs->term;
+    if (m->type != QIHSE_CONSENSUS_MSG_PRE_VOTE) {
+        m->term = cs->term;
+    }
     m->fencing_epoch = cs->epoch;
     cs->counters.messages_sent++;
     if (cs->send_fn) cs->send_fn(cs->transport, m);
@@ -1712,6 +1711,37 @@ static void qcs_start_election(qihse_consensus_t* cs) {
     qihse_consensus_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = QIHSE_CONSENSUS_MSG_REQUEST_VOTE;
+    m.u.vote.last_log_index = qcs_abs_last_index(cs);
+    m.u.vote.last_log_term = qcs_last_log_term(cs);
+    for (size_t i = 0; i < cs->cfg.member_count; i++) {
+        if ((int)i == cs->self_index) continue;
+        m.to = cs->cfg.members[i];
+        qcs_send(cs, &m);
+    }
+}
+
+static void qcs_start_prevote(qihse_consensus_t* cs) {
+    if (cs->self_index < 0) return;
+    if (cs->cfg.member_roles[cs->self_index] ==
+        (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+        return;
+    }
+    cs->role = QIHSE_CONSENSUS_PRE_CANDIDATE;
+    cs->has_leader = false;
+    cs->votes_granted_mask = (uint32_t)1u << cs->self_index;
+    cs->last_leader_contact_ms = cs->now_ms;
+    cs->counters.election_timeouts++;
+
+    if (cs->cfg.member_count == 1u) {
+        qcs_start_election(cs);
+        return;
+    }
+
+    qihse_consensus_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = QIHSE_CONSENSUS_MSG_PRE_VOTE;
+    m.term = cs->term + 1u;
+    m.fencing_epoch = cs->epoch > m.term ? cs->epoch : m.term;
     m.u.vote.last_log_index = qcs_abs_last_index(cs);
     m.u.vote.last_log_term = qcs_last_log_term(cs);
     for (size_t i = 0; i < cs->cfg.member_count; i++) {
@@ -2065,6 +2095,19 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
     cs->cfg.heartbeat_interval_ms =
         cfg->heartbeat_interval_ms ? cfg->heartbeat_interval_ms
                                    : QCS_DEFAULT_HEARTBEAT_MS;
+    cs->cfg.priority_tier = cfg->priority_tier;
+    cs->cfg.wan_rtt_ms = cfg->wan_rtt_ms;
+    cs->cfg.enable_prevote = cfg->enable_prevote;
+
+    if ((cs->cfg.priority_tier > 0u || cs->cfg.wan_rtt_ms > 0u) &&
+        cs->cfg.election_priority_delay_ms == 0u) {
+        cs->cfg.election_priority_delay_ms = qihse_consensus_calculate_priority_delay(
+            cs->cfg.priority_tier,
+            cs->cfg.election_timeout_base_ms,
+            cs->cfg.election_timeout_spread_ms,
+            cs->cfg.wan_rtt_ms);
+    }
+
     if (cs->cfg.election_timeout_spread_ms < (uint64_t)cs->cfg.member_count) {
         /* Disjoint per-member buckets are what keep elections from tying. */
         free(cs);
@@ -2073,6 +2116,10 @@ qihse_consensus_t* qihse_consensus_open(const qihse_consensus_config_t* cfg,
     if (cs->cfg.heartbeat_interval_ms >= cs->cfg.election_timeout_base_ms) {
         free(cs);
         return NULL;
+    }
+    if (cs->cfg.heartbeat_interval_ms > cs->cfg.election_timeout_base_ms / 2u) {
+        cs->cfg.heartbeat_interval_ms = cs->cfg.election_timeout_base_ms / 3u;
+        if (cs->cfg.heartbeat_interval_ms == 0u) cs->cfg.heartbeat_interval_ms = 1u;
     }
     if (cs->cfg.election_priority_delay_ms >
         QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS) {
@@ -2233,7 +2280,11 @@ void qihse_consensus_tick(qihse_consensus_t* cs, uint64_t now_ms) {
     if (cs->self_index < 0) return; /* removed member: no campaign, no leader */
     if (cs->now_ms - cs->last_leader_contact_ms >=
         qcs_election_timeout_ms(cs, cs->term)) {
-        qcs_start_election(cs);
+        if (cs->cfg.enable_prevote) {
+            qcs_start_prevote(cs);
+        } else {
+            qcs_start_election(cs);
+        }
     }
 }
 
@@ -2298,27 +2349,13 @@ static void qcs_handle_request_vote(qihse_consensus_t* cs,
     qcs_send(cs, &r);
 }
 
-static void qcs_handle_vote_reply(qihse_consensus_t* cs,
-                                  const qihse_consensus_msg_t* msg) {
-    if (cs->role != QIHSE_CONSENSUS_CANDIDATE) return;
-    if (!msg->u.vote_reply.granted) return;
-
-    int from = qcs_member_index(cs, &msg->from);
-    if (from < 0) { cs->counters.messages_ignored++; return; }
-    cs->votes_granted_mask |= (uint32_t)1u << from;
-
-    /* W7: votes weigh their member's vote weight (a learner's vote
-     * weighs nothing — and a learner never grants one, see the request
-     * handler; a witness counts like a voter). */
+static bool qcs_has_vote_majority(const qihse_consensus_t* cs, uint32_t granted_mask) {
     uint64_t vote_weight = 0u;
     for (size_t i = 0; i < cs->cfg.member_count; i++) {
-        if (cs->votes_granted_mask & ((uint32_t)1u << i)) {
+        if (granted_mask & ((uint32_t)1u << i)) {
             vote_weight += qcs_member_weight_at(cs, i);
         }
     }
-    /* Joint-phase election: the candidate needs a dual weighted majority
-     * — majority of the current fold's voting weight AND of C_old's —
-     * the same fold basis the commit rule uses. */
     qcs_fold_t jf;
     bool joint = qcs_fold_at_commit(cs, &jf) && jf.active;
     bool win = vote_weight >= qcs_majority_weight(cs);
@@ -2330,12 +2367,9 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
                 ow = 0u;
             }
             old_total += ow;
-            if (!(cs->votes_granted_mask & ((uint32_t)1u << 0))) {
-                /* tallied below per member */
-            }
         }
         for (size_t i = 0; i < cs->cfg.member_count; i++) {
-            if (!(cs->votes_granted_mask & ((uint32_t)1u << i))) continue;
+            if (!(granted_mask & ((uint32_t)1u << i))) continue;
             for (size_t k = 0; k < jf.old_count; k++) {
                 if (qihse_uuid_equal(&jf.old_members[k], &cs->cfg.members[i])) {
                     uint16_t ow = jf.old_weights[k]
@@ -2349,7 +2383,19 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
         }
         win = old_total > 0u && votes_old >= old_total / 2u + 1u;
     }
-    if (win) {
+    return win;
+}
+
+static void qcs_handle_vote_reply(qihse_consensus_t* cs,
+                                  const qihse_consensus_msg_t* msg) {
+    if (cs->role != QIHSE_CONSENSUS_CANDIDATE) return;
+    if (!msg->u.vote_reply.granted) return;
+
+    int from = qcs_member_index(cs, &msg->from);
+    if (from < 0) { cs->counters.messages_ignored++; return; }
+    cs->votes_granted_mask |= (uint32_t)1u << from;
+
+    if (qcs_has_vote_majority(cs, cs->votes_granted_mask)) {
         cs->role = QIHSE_CONSENSUS_LEADER;
         cs->leader = cs->cfg.self;
         cs->has_leader = true;
@@ -2366,6 +2412,68 @@ static void qcs_handle_vote_reply(qihse_consensus_t* cs,
             if ((int)i == cs->self_index) continue;
             qcs_send_append_to(cs, i);
         }
+    }
+}
+
+static void qcs_handle_pre_vote(qihse_consensus_t* cs,
+                                const qihse_consensus_msg_t* msg) {
+    int from = qcs_member_index(cs, &msg->from);
+    if (from < 0 || cs->self_index < 0) {
+        cs->counters.messages_ignored++;
+        return;
+    }
+    if (cs->self_index >= 0 &&
+        cs->cfg.member_roles[cs->self_index] ==
+            (uint8_t)QIHSE_CONSENSUS_ROLE_LEARNER) {
+        qihse_consensus_msg_t deny;
+        memset(&deny, 0, sizeof(deny));
+        deny.type = QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY;
+        deny.to = msg->from;
+        deny.u.vote_reply.granted = false;
+        qcs_send(cs, &deny);
+        return;
+    }
+
+    qihse_consensus_msg_t r;
+    memset(&r, 0, sizeof(r));
+    r.type = QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY;
+    r.to = msg->from;
+    r.term = cs->term;
+    r.u.vote_reply.granted = false;
+
+    /* Leader lease / stickiness: if receiver is leader, or receiver currently has an active leader within base election timeout,
+     * do not grant pre-vote. */
+    if (cs->role == QIHSE_CONSENSUS_LEADER ||
+        (cs->has_leader && cs->role == QIHSE_CONSENSUS_FOLLOWER &&
+         (cs->now_ms - cs->last_leader_contact_ms) < cs->cfg.election_timeout_base_ms)) {
+        qcs_send(cs, &r);
+        return;
+    }
+
+    bool up_to_date =
+        msg->u.vote.last_log_term > qcs_last_log_term(cs) ||
+        (msg->u.vote.last_log_term == qcs_last_log_term(cs) &&
+         msg->u.vote.last_log_index >= qcs_abs_last_index(cs));
+
+    if (up_to_date && msg->term > cs->term) {
+        r.u.vote_reply.granted = true;
+    }
+    qcs_send(cs, &r);
+}
+
+static void qcs_handle_pre_vote_reply(qihse_consensus_t* cs,
+                                      const qihse_consensus_msg_t* msg) {
+    if (cs->role != QIHSE_CONSENSUS_PRE_CANDIDATE) return;
+    if (msg->term < cs->term) return;
+    if (!msg->u.vote_reply.granted) return;
+
+    int from = qcs_member_index(cs, &msg->from);
+    if (from < 0) { cs->counters.messages_ignored++; return; }
+    cs->votes_granted_mask |= (uint32_t)1u << from;
+
+    if (qcs_has_vote_majority(cs, cs->votes_granted_mask)) {
+        /* Quorum granted Pre-Vote! Transition to real election. */
+        qcs_start_election(cs);
     }
 }
 
@@ -2973,27 +3081,38 @@ void qihse_consensus_receive(qihse_consensus_t* cs,
     }
 
     if (msg->term < cs->term) {
-    /* Stale-term traffic: reject and answer with the current term so a
-     * lagging leader can step down. */
-    cs->counters.term_rejections++;
-    if (msg->type == QIHSE_CONSENSUS_MSG_REQUEST_VOTE) {
-        qihse_consensus_msg_t r;
-        memset(&r, 0, sizeof(r));
-        r.type = QIHSE_CONSENSUS_MSG_VOTE_REPLY;
-        r.to = msg->from;
-        r.u.vote_reply.granted = false;
-        qcs_send(cs, &r);
-    } else if (msg->type == QIHSE_CONSENSUS_MSG_APPEND) {
-        qcs_reply_append(cs, &msg->from, false, 0u);
-    }
-    /* A stale-term snapshot carries nothing worth answering: drop it. */
-    return;
+        /* Stale-term traffic: reject and answer with the current term so a
+         * lagging leader can step down. */
+        cs->counters.term_rejections++;
+        if (msg->type == QIHSE_CONSENSUS_MSG_REQUEST_VOTE) {
+            qihse_consensus_msg_t r;
+            memset(&r, 0, sizeof(r));
+            r.type = QIHSE_CONSENSUS_MSG_VOTE_REPLY;
+            r.to = msg->from;
+            r.u.vote_reply.granted = false;
+            qcs_send(cs, &r);
+        } else if (msg->type == QIHSE_CONSENSUS_MSG_APPEND) {
+            qcs_reply_append(cs, &msg->from, false, 0u);
+        } else if (msg->type == QIHSE_CONSENSUS_MSG_PRE_VOTE) {
+            qihse_consensus_msg_t r;
+            memset(&r, 0, sizeof(r));
+            r.type = QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY;
+            r.to = msg->from;
+            r.u.vote_reply.granted = false;
+            qcs_send(cs, &r);
+        }
+        /* A stale-term snapshot carries nothing worth answering: drop it. */
+        return;
     }
 
-    /* Adopt a higher term / floor a higher epoch, durably, before acting. */
-    if (msg->term > cs->term || msg->fencing_epoch > cs->epoch) {
-        if (!qcs_sync_term_epoch(cs, msg->term, msg->fencing_epoch, false)) {
-            return; /* could not persist: ignore, fail closed */
+    /* Adopt a higher term / floor a higher epoch, durably, before acting.
+     * Note: PRE_VOTE carries a prospective term (term + 1) and must not bump
+     * the recipient's term or step down healthy leaders/followers. */
+    if (msg->type != QIHSE_CONSENSUS_MSG_PRE_VOTE) {
+        if (msg->term > cs->term || msg->fencing_epoch > cs->epoch) {
+            if (!qcs_sync_term_epoch(cs, msg->term, msg->fencing_epoch, false)) {
+                return; /* could not persist: ignore, fail closed */
+            }
         }
     }
 
@@ -3003,6 +3122,12 @@ void qihse_consensus_receive(qihse_consensus_t* cs,
             break;
         case QIHSE_CONSENSUS_MSG_VOTE_REPLY:
             qcs_handle_vote_reply(cs, msg);
+            break;
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE:
+            qcs_handle_pre_vote(cs, msg);
+            break;
+        case QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY:
+            qcs_handle_pre_vote_reply(cs, msg);
             break;
         case QIHSE_CONSENSUS_MSG_APPEND:
             qcs_handle_append(cs, msg);
@@ -3565,8 +3690,20 @@ const char* qihse_consensus_role_name(qihse_consensus_role_t role) {
         case QIHSE_CONSENSUS_FOLLOWER: return "FOLLOWER";
         case QIHSE_CONSENSUS_CANDIDATE: return "CANDIDATE";
         case QIHSE_CONSENSUS_LEADER: return "LEADER";
+        case QIHSE_CONSENSUS_PRE_CANDIDATE: return "PRE_CANDIDATE";
     }
     return "UNKNOWN";
+}
+
+uint32_t qihse_consensus_calculate_priority_delay(uint32_t priority_tier,
+                                                  uint64_t base_timeout_ms,
+                                                  uint64_t spread_ms,
+                                                  uint32_t wan_rtt_ms) {
+    uint64_t delay = (uint64_t)priority_tier * (base_timeout_ms + spread_ms) + 2u * (uint64_t)wan_rtt_ms;
+    if (delay > QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS) {
+        delay = QIHSE_CONSENSUS_MAX_ELECTION_PRIORITY_DELAY_MS;
+    }
+    return (uint32_t)delay;
 }
 
 qihse_consensus_role_t qihse_consensus_role(const qihse_consensus_t* cs) {

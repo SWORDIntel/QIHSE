@@ -3571,9 +3571,19 @@ static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx) {
             : vdb->vectors;
         if (base) {
             memset(base + row->vector_offset, 0, vec_bytes);
-            /* Advise kernel to drop the pages */
-            (void)madvise(base + row->vector_offset, vec_bytes,
-                          MADV_DONTNEED);
+            if (vdb->mapped_vectors) {
+                uintptr_t page_size = (uintptr_t)sysconf(_SC_PAGESIZE);
+                if (page_size > 0) {
+                    uintptr_t start = (uintptr_t)(base + row->vector_offset);
+                    uintptr_t end = start + vec_bytes;
+                    uintptr_t page_start = (start + page_size - 1) & ~(page_size - 1);
+                    uintptr_t page_end = end & ~(page_size - 1);
+                    if (page_end > page_start) {
+                        (void)madvise((void*)page_start, (size_t)(page_end - page_start),
+                                      MADV_DONTNEED);
+                    }
+                }
+            }
         }
     }
 

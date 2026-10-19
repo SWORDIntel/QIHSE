@@ -360,10 +360,16 @@ const char* qihse_consensus_member_role_name(qihse_consensus_member_role_t role)
 typedef enum {
     QIHSE_CONSENSUS_FOLLOWER = 0,
     QIHSE_CONSENSUS_CANDIDATE,
-    QIHSE_CONSENSUS_LEADER
+    QIHSE_CONSENSUS_LEADER,
+    QIHSE_CONSENSUS_PRE_CANDIDATE
 } qihse_consensus_role_t;
 
 const char* qihse_consensus_role_name(qihse_consensus_role_t role);
+
+uint32_t qihse_consensus_calculate_priority_delay(uint32_t priority_tier,
+                                                  uint64_t base_timeout_ms,
+                                                  uint64_t spread_ms,
+                                                  uint32_t wan_rtt_ms);
 
 /* ── Log entries ───────────────────────────────────────────────────────────
  *
@@ -429,7 +435,9 @@ typedef enum {
     QIHSE_CONSENSUS_MSG_APPEND_REPLY = 4,
     QIHSE_CONSENSUS_MSG_SNAPSHOT = 5,      /* leader -> lagging follower */
     QIHSE_CONSENSUS_MSG_SNAPSHOT_REPLY = 6, /* follower -> leader */
-    QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK = 7 /* chunk-capable peers only */
+    QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK = 7, /* chunk-capable peers only */
+    QIHSE_CONSENSUS_MSG_PRE_VOTE = 8,       /* pre-candidate -> peers */
+    QIHSE_CONSENSUS_MSG_PRE_VOTE_REPLY = 9  /* peer -> pre-candidate */
 } qihse_consensus_msg_type_t;
 
 typedef struct {
@@ -536,6 +544,15 @@ typedef struct {
      * can use this so higher-priority voters win first when available.
      * It does not grant write rights. */
     uint32_t election_priority_delay_ms; /* 0..MAX_ELECTION_PRIORITY_DELAY_MS */
+    /* Automated priority tier: 0 = primary/default, 1 = warm standby, 2 = cold standby / arbiter.
+     * If election_priority_delay_ms is 0 and priority_tier > 0 or wan_rtt_ms > 0,
+     * the delay is automatically derived: tier * (base + spread) + 2 * wan_rtt_ms. */
+    uint32_t priority_tier;
+    /* Optional topology RTT offset in milliseconds (adds 2 * wan_rtt_ms). */
+    uint32_t wan_rtt_ms;
+    /* Enable Raft Pre-Vote protocol: followers run speculative pre-candidate
+     * phase before incrementing term, preventing rogue nodes from disrupting healthy leaders. */
+    bool enable_prevote;
     /* Log-compaction trigger, in entries: when the retained log
      * (last log index − snapshot index) exceeds this many entries, the
      * leader durably snapshots the committed prefix and truncates it from
