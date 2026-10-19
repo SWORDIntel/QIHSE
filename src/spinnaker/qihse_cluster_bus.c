@@ -1322,6 +1322,11 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_membership_user_data = config->on_membership_user_data;
     bus->sock_fd = -1;
     bus->running = false;
+    if (config->bind_address && strlen(config->bind_address) > QIHSE_CLUSTER_HOST_LEN) {
+        free(bus);
+        errno = EINVAL;
+        return NULL;
+    }
     if (config->bind_address) {
         strncpy(bus->bind_address, config->bind_address, QIHSE_CLUSTER_HOST_LEN);
         bus->bind_address[QIHSE_CLUSTER_HOST_LEN] = '\0';
@@ -1350,8 +1355,24 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     return bus;
 }
 
+/* This transport sends and receives IPv4 datagrams only. Resolve localhost
+ * deliberately without DNS; unsupported families/names must never widen bind. */
+static bool qihse_bus_bind_ipv4(const char* host, struct in_addr* out) {
+    if (!host || !out) return false;
+    if (strcmp(host, "localhost") == 0) {
+        out->s_addr = htonl(INADDR_LOOPBACK);
+        return true;
+    }
+    return inet_pton(AF_INET, host, out) == 1;
+}
+
 bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
     if (!bus || bus->running) return false;
+    struct in_addr bind_addr;
+    if (!qihse_bus_bind_ipv4(bus->bind_address, &bind_addr)) {
+        errno = EINVAL;
+        return false;
+    }
     bus->sock_fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
     if (bus->sock_fd < 0) return false;
     int opt = 1;
@@ -1364,9 +1385,7 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(bus->bus_port);
-    if (inet_pton(AF_INET, bus->bind_address, &addr.sin_addr) != 1) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    }
+    addr.sin_addr = bind_addr;
     if (bind(bus->sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(bus->sock_fd);
         bus->sock_fd = -1;
@@ -1472,6 +1491,14 @@ void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
     if (hl >= QIHSE_FEDERATION_ENDPOINT_HOST_LEN) return;
     memcpy(bus->dispatch_endpoint.host, host, hl + 1u);
     bus->dispatch_endpoint.port = port;
+}
+
+void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,
+                                        qihse_cluster_bus_on_fail_cb on_fail,
+                                        void* user_data) {
+    if (!bus) return;
+    bus->on_fail = on_fail;
+    bus->on_fail_user_data = user_data;
 }
 
 void qihse_cluster_bus_set_group_callbacks(

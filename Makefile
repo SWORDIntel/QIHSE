@@ -441,6 +441,26 @@ test-resp-hybrid: lib
 	$(CC) $(CFLAGS) -o tests/test_resp_hybrid tests/test_resp_hybrid.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_resp_hybrid
 
+.PHONY: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
+
+test-container-lifecycle: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_container_lifecycle tests/test_container_lifecycle.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_container_lifecycle
+
+# Standalone bounded regressions do not require a complete engine build.
+test-http-lifecycle:
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o build/test_http_lifecycle tests/test_http_lifecycle.c -pthread
+	./build/test_http_lifecycle
+
+test-cluster-bus-bind:
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c -Wl,--gc-sections -pthread
+	./build/test_cluster_bus_bind
+
+test: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
+
 test-container-flush-locking: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -o tests/test_container_flush_locking tests/test_container_flush_locking.c -L. -lqihse $(LDFLAGS)

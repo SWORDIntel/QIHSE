@@ -118,6 +118,7 @@ static long recv_frame_type(int fd, int timeout_ms, uint8_t* out, size_t cap,
     uint32_t magic = 0, type = 0;
     memcpy(&magic, out, 4u);
     memcpy(&type, out + 4u, 4u);
+    /* The bus emits headers in network byte order, regardless of the host. */
     magic = ntohl(magic);
     type = ntohl(type);
     if (magic != QIHSE_CLUSTER_BUS_MAGIC) return -1;
@@ -170,12 +171,13 @@ static bool send_datagram(int fd, const char* host, uint16_t port,
 static size_t build_frame(uint8_t* out, size_t cap, uint32_t type,
                           const uint8_t* payload, size_t payload_len) {
     assert(cap >= BUS_HDR + payload_len);
+    /* Exercise the canonical wire format, not the legacy LE receive path. */
     uint32_t magic = htonl(QIHSE_CLUSTER_BUS_MAGIC);
-    uint32_t net_type = htonl(type);
-    uint32_t sender = 0;
+    uint32_t wire_type = htonl(type);
     uint32_t plen = htonl((uint32_t)payload_len);
+    uint32_t sender = 0;
     memcpy(out, &magic, 4u);
-    memcpy(out + 4u, &net_type, 4u);
+    memcpy(out + 4u, &wire_type, 4u);
     memcpy(out + 8u, &sender, 4u);
     memcpy(out + 12u, &plen, 4u);
     if (payload_len) memcpy(out + BUS_HDR, payload, payload_len);

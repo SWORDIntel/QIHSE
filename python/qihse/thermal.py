@@ -67,45 +67,114 @@ def run_cmd(cmd: list[str], timeout: int = 5) -> str:
 
 
 
-def _resp_socket(host, port, timeout):
-    """Explicit TLS for remote RESP; loopback-only plaintext for local tunnels."""
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("RESP operation deadline exceeded")
+    return remaining
+
+
+class _DeadlineReader:
+    """Read bounded RESP frames without resetting the budget on trickle traffic."""
+
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+        self.buffer = bytearray()
+
+    def _recv(self, size):
+        self.sock.settimeout(_remaining(self.deadline))
+        data = self.sock.recv(size)
+        _remaining(self.deadline)
+        return data
+
+    def readline(self, limit):
+        while True:
+            _remaining(self.deadline)
+            end = self.buffer.find(b"\n", 0, limit)
+            if end >= 0 or len(self.buffer) >= limit:
+                size = end + 1 if end >= 0 else limit
+                data = bytes(self.buffer[:size])
+                del self.buffer[:size]
+                return data
+            data = self._recv(min(4096, limit - len(self.buffer)))
+            if not data:
+                data = bytes(self.buffer)
+                self.buffer.clear()
+                return data
+            self.buffer.extend(data)
+
+    def read(self, size):
+        data = bytearray(self.buffer[:size])
+        del self.buffer[:size]
+        while len(data) < size:
+            chunk = self._recv(min(65536, size - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        _remaining(self.deadline)
+        return bytes(data)
+
+    def close(self):
+        self.buffer.clear()
+
+
+def _resp_socket(host, port, timeout, deadline=None):
+    """Bounded TCP/TLS connection; endpoints are IPs, TLS identity is separate.
+
+    Literal addresses avoid unbounded system DNS resolution. Remote endpoints
+    still require a configured CA and verified TLS server name.
+    """
     import ipaddress
     import ssl
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = False
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ConnectionError("RESP endpoint must be a literal IP address") from exc
+    loopback = address.is_loopback
     ca = os.environ.get("QIHSE_RESP_CA_FILE")
     peer = os.environ.get("QIHSE_RESP_SERVER_NAME")
     if not loopback and (not ca or not peer):
-        raise ConnectionError("remote RESP requires a pinned CA and TLS server identity")
-    sock = socket.create_connection((host, port), timeout=timeout)
-    sock.settimeout(timeout)
-    if not loopback:
-        try:
+        raise ConnectionError("remote RESP requires pinned CA and TLS server identity")
+    sock = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
+                         socket.SOCK_STREAM)
+    try:
+        sock.settimeout(_remaining(deadline))
+        sock.connect((host, port))
+        _remaining(deadline)
+        if not loopback:
             tls = ssl.create_default_context(cafile=ca)
             tls.minimum_version = ssl.TLSVersion.TLSv1_3
+            sock.settimeout(_remaining(deadline))
             sock = tls.wrap_socket(sock, server_hostname=peer)
-        except Exception:
-            sock.close()
-            raise
-    return sock
+        _remaining(deadline)
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
-def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int = 3):
+
+def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int = 3, deadline=None):
     """Zero-dependency minimal RESP client."""
     if not auth:
         return None, "QIHSE_OPERATOR_PASSWORD is required; no default credential exists"
+    if deadline is None:
+        deadline = time.monotonic() + timeout
+    s = None
+    f = None
     try:
-        s = _resp_socket(host, port, timeout)
-        f = s.makefile('rb')
+        s = _resp_socket(host, port, timeout, deadline)
+        f = _DeadlineReader(s, deadline)
 
         # AUTH
         password = auth.encode("utf-8")
         auth_payload = b"*2\r\n$4\r\nAUTH\r\n$" + str(len(password)).encode("ascii") + b"\r\n" + password + b"\r\n"
+        s.settimeout(_remaining(deadline))
         s.sendall(auth_payload)
         auth_res = f.readline(8193)
         if auth_res != b"+OK\r\n":
-            s.close()
             return None, "AUTH refused or malformed"
 
         # Command
@@ -115,12 +184,12 @@ def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int =
             lines.append(f"${len(b)}".encode())
             lines.append(b)
         lines.append(b"")
+        s.settimeout(_remaining(deadline))
         s.sendall(b"\r\n".join(lines))
 
         # Response
         resp_line_bytes = f.readline(8193)
         if not resp_line_bytes.endswith(b"\r\n") or len(resp_line_bytes) > 8192:
-            s.close()
             return None, "Invalid or oversized RESP header"
         resp_line = resp_line_bytes.decode("utf-8", "strict")
 
@@ -147,10 +216,15 @@ def send_resp(host: str, port: int, auth: str | None, args: list, timeout: int =
         else:
             val = line
 
-        s.close()
+        _remaining(deadline)
         return val, None
     except Exception as e:
         return None, str(e)
+    finally:
+        if f is not None:
+            f.close()
+        if s is not None:
+            s.close()
 
 
 def collect_local_telemetry(node_name: str | None = None) -> dict:
@@ -249,29 +323,36 @@ def collect_local_telemetry(node_name: str | None = None) -> dict:
     }
 
 
-def publish_telemetry(data: dict, auth: str = DEFAULT_AUTH) -> bool:
+def publish_telemetry(data: dict, auth: str = DEFAULT_AUTH, timeout=3) -> bool:
+    deadline = time.monotonic() + timeout
     payload = json.dumps(data)
     node_name = data["node"]
     seeds_to_try = [s for s in CLUSTER_SEEDS if s[2] == node_name] + [s for s in CLUSTER_SEEDS if s[2] != node_name]
 
     for host, port, _ in seeds_to_try:
+        if time.monotonic() >= deadline:
+            break
         key_obs = f"citadel/thermal/nodes/{node_name}/observed"
         key_ks = f"keystone/thermal/nodes/{node_name}/observed"
-        res, _ = send_resp(host, port, auth, ["SET", key_obs, payload])
+        res, _ = send_resp(host, port, auth, ["SET", key_obs, payload], deadline=deadline)
         if res == "OK":
-            send_resp(host, port, auth, ["PUBLISH", f"citadel.thermal.{node_name}", payload])
-            send_resp(host, port, auth, ["SET", key_ks, payload])
+            send_resp(host, port, auth, ["PUBLISH", f"citadel.thermal.{node_name}", payload], deadline=deadline)
+            send_resp(host, port, auth, ["SET", key_ks, payload], deadline=deadline)
             return True
     return False
 
 
-def fetch_node_telemetry(node_info: tuple[str, int, str], auth: str = DEFAULT_AUTH) -> tuple[str, dict]:
+def fetch_node_telemetry(node_info: tuple[str, int, str], auth: str = DEFAULT_AUTH, deadline=None) -> tuple[str, dict]:
+    if deadline is None:
+        deadline = time.monotonic() + 3
     _, _, node_name = node_info
     key = f"citadel/thermal/nodes/{node_name}/observed"
     seeds = [s for s in CLUSTER_SEEDS if s[2] == node_name] + [s for s in CLUSTER_SEEDS if s[2] != node_name]
     val = None
     for host, port, _ in seeds:
-        v, _ = send_resp(host, port, auth, ["GET", key], timeout=3)
+        if time.monotonic() >= deadline:
+            break
+        v, _ = send_resp(host, port, auth, ["GET", key], timeout=3, deadline=deadline)
         if v:
             try:
                 val = json.loads(v)
@@ -287,17 +368,24 @@ def fetch_node_telemetry(node_info: tuple[str, int, str], auth: str = DEFAULT_AU
     return node_name, {"node": node_name, "status": "OFFLINE"}
 
 
-def get_fleet_telemetry(auth: str = DEFAULT_AUTH) -> dict:
+def get_fleet_telemetry(auth: str = DEFAULT_AUTH, timeout=4) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     fleet = {}
+    if not CLUSTER_SEEDS:
+        return fleet
+    deadline = time.monotonic() + timeout
+    # Every worker shares the same deadline, including seed fallback and reads.
+    # Joining the executor therefore cannot wait on renewed per-read timeouts.
     with ThreadPoolExecutor(max_workers=len(CLUSTER_SEEDS)) as ex:
-        futures = [ex.submit(fetch_node_telemetry, seed, auth) for seed in CLUSTER_SEEDS]
-        for f in futures:
-            try:
-                name, data = f.result(timeout=4)
-                fleet[name] = data
-            except Exception:
-                pass
+        futures = [ex.submit(fetch_node_telemetry, seed, auth, deadline) for seed in CLUSTER_SEEDS]
+    # Shutdown has joined all deadline-bounded workers. Collect settled results
+    # even when an earlier seed used the budget: fast peers are still online.
+    for f in futures:
+        try:
+            name, data = f.result(timeout=0)
+            fleet[name] = data
+        except Exception:
+            pass
     return {seed[2]: fleet.get(seed[2], {"node": seed[2], "status": "OFFLINE"}) for seed in CLUSTER_SEEDS}
 
 

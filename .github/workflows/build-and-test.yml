@@ -77,6 +77,14 @@ jobs:
     - name: Run Native HTTP API Hardening Regressions
       run: make test-http-adapters test-phase-c
 
+    - name: Verify remediation lifecycle and bind boundaries
+      run: make test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
+
+    - name: Verify repaired CI fixtures independently
+      run: |
+        make test-dht-peer-exchange
+        make -f Makefile -f tests/security-regression.mk test-ingest-guard-regression
+
     - name: Run Core Test Suite
       run: |
         set -o pipefail
@@ -211,6 +219,12 @@ jobs:
 
     - name: Verify fail-closed container key admission under sanitizers
       run: make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-container-key-gate
+
+    - name: Verify remediation lifecycles under sanitizers
+      run: |
+        export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1"
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+        make QIHSE_CFLAGS_EXTRA="-fsanitize=address,undefined -g -fno-omit-frame-pointer" test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
     - name: Run Sanitized Security Regressions (ASan + UBSan)
       run: |
