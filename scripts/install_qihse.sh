@@ -770,6 +770,57 @@ echo "[5/7] Provisioning Post-Quantum Cryptographic Keys in ${KEYS_DIR}..."
 
 $SUDO install -d -m 700 "${KEYS_DIR}"
 
+# Ensure OpenSSL FIPS 140-3 Provider is Installed & Active
+echo "  • Verifying OpenSSL FIPS 140-3 provider status..."
+FIPS_ACTIVE=0
+if openssl list -providers 2>/dev/null | grep -q "fips"; then
+    FIPS_ACTIVE=1
+fi
+
+if [ "$FIPS_ACTIVE" -eq 0 ]; then
+    echo "  • OpenSSL FIPS provider not active. Attempting automatic provisioning..."
+    if command -v apt-get >/dev/null 2>&1; then
+        if ! dpkg -s openssl-provider-fips >/dev/null 2>&1; then
+            echo "    Installing openssl-provider-fips package..."
+            $SUDO apt-get update -qq && $SUDO apt-get install -y -qq openssl-provider-fips >/dev/null 2>&1 || true
+        fi
+    fi
+
+    MODULES_DIR="$(openssl version -m 2>/dev/null | awk -F'"' '{print $2}' || true)"
+    OPENSSL_DIR="$(openssl version -d 2>/dev/null | awk -F'"' '{print $2}' || true)"
+    [ -z "$MODULES_DIR" ] && MODULES_DIR="/usr/lib/x86_64-linux-gnu/ossl-modules"
+    [ -z "$OPENSSL_DIR" ] && OPENSSL_DIR="/usr/lib/ssl"
+
+    FIPS_SO="${MODULES_DIR}/fips.so"
+    FIPS_CNF="${OPENSSL_DIR}/fipsmodule.cnf"
+    OPENSSL_MAIN_CNF="${OPENSSL_DIR}/openssl.cnf"
+
+    # Ensure openssl.cnf includes fipsmodule.cnf and activates fips
+    if [ -f "$OPENSSL_MAIN_CNF" ]; then
+        if grep -q "^#.*\.include.*fipsmodule\.cnf" "$OPENSSL_MAIN_CNF"; then
+            $SUDO sed -i 's/^# *\(\.include.*fipsmodule\.cnf\)/\1/' "$OPENSSL_MAIN_CNF"
+        fi
+        if grep -q "^# *fips = fips_sect" "$OPENSSL_MAIN_CNF"; then
+            $SUDO sed -i 's/^# *\(fips = fips_sect\)/\1/' "$OPENSSL_MAIN_CNF"
+        fi
+    fi
+
+    if [ -f "$FIPS_SO" ]; then
+        echo "    Configuring and running self-test installation via openssl fipsinstall..."
+        $SUDO env OPENSSL_CONF=/dev/null openssl fipsinstall -out "$FIPS_CNF" -module "$FIPS_SO" >/dev/null 2>&1 || true
+        if openssl list -providers 2>/dev/null | grep -q "fips"; then
+            FIPS_ACTIVE=1
+            echo "  [✓] OpenSSL FIPS 140-3 provider successfully installed and active."
+        else
+            echo "  [!] OpenSSL FIPS provider installed but not active in default provider set."
+        fi
+    else
+        echo "  [!] OpenSSL FIPS module ($FIPS_SO) not found. Continuing with standard OpenSSL provider."
+    fi
+else
+    echo "  [✓] OpenSSL FIPS 140-3 validated provider is ACTIVE."
+fi
+
 # Check if keys exist
 KEYS_EXIST=1
 for k in qihse_kem_key.pem qihse_kem_pub.pem qihse_dsa_key.pem qihse_dsa_pub.pem; do
