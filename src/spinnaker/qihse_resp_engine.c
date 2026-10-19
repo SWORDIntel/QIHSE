@@ -12834,13 +12834,17 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         bus_cfg.topology = server->topology;
         bus_cfg.local_node_index = local;
         bus_cfg.bus_port = server->bus_port;
-        bus_cfg.bind_address = supplied->bind_address;
+        bus_cfg.bind_address = bind_address;
         bus_cfg.xdp_interface = supplied->xdp_interface;
         bus_cfg.veil_key = supplied->veil_key;
         bus_cfg.federation_sign_key = supplied->federation_sign_key;
         bus_cfg.require_signed_ops = supplied->require_signed_ops;
         server->bus = qihse_cluster_bus_create(&bus_cfg);
         server->owns_bus = server->bus != NULL;
+        if (!server->bus) {
+            qihse_resp_server_destroy(server);
+            return NULL;
+        }
         qihse_resp_group_wire_bus(server, server->bus);
     }
     /* Phase 3: create failover coordinator if requested */
@@ -12853,25 +12857,12 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         fo_cfg.single_coordinator = false;
         server->failover = qihse_cluster_failover_create(&fo_cfg);
         server->owns_failover = server->failover != NULL;
-        /* Wire the failover callback into the bus by recreating it with
-         * the callback set. */
+        /* The coordinator retains this exact bus. Install the callback in
+         * place rather than replacing the bus and dangling fo_cfg.bus. */
         if (server->bus && server->failover) {
-            qihse_cluster_bus_config_t re_cfg;
-            memset(&re_cfg, 0, sizeof(re_cfg));
-            re_cfg.topology = server->topology;
-            re_cfg.local_node_index = local;
-            re_cfg.bus_port = server->bus_port;
-            re_cfg.bind_address = supplied->bind_address;
-            re_cfg.xdp_interface = supplied->xdp_interface;
-            re_cfg.veil_key = supplied->veil_key;
-            re_cfg.federation_sign_key = supplied->federation_sign_key;
-            re_cfg.require_signed_ops = supplied->require_signed_ops;
-            re_cfg.on_fail = qihse_cluster_failover_on_fail_cb;
-            re_cfg.on_fail_user_data = server->failover;
-            qihse_cluster_bus_destroy(server->bus);
-            server->bus = qihse_cluster_bus_create(&re_cfg);
-            server->owns_bus = server->bus != NULL;
-            qihse_resp_group_wire_bus(server, server->bus);
+            qihse_cluster_bus_set_fail_callback(server->bus,
+                                               qihse_cluster_failover_on_fail_cb,
+                                               server->failover);
         }
     }
     /* Phase 3: create system guard throttling window if requested */
@@ -13065,6 +13056,16 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
                 server->bind_address, server->port, strerror(errno));
         return false;
     }
+    /* A requested bus is part of startup, not an optional best-effort listener.
+     * Reject unsupported bind addresses before accepting any clients. */
+    if (server->bus && !qihse_cluster_bus_start(server->bus)) {
+        int error = errno;
+        close_socket(server->listen_fd);
+        server->listen_fd = -1;
+        pthread_mutex_unlock(&server->state_lock);
+        errno = error;
+        return false;
+    }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
     int error = pthread_create(&server->accept_thread, NULL, qihse_resp_accept_main, server);
     if (error != 0) {
@@ -13072,13 +13073,12 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
         close_socket(server->listen_fd);
         server->listen_fd = -1;
         pthread_mutex_unlock(&server->state_lock);
+        if (server->bus) qihse_cluster_bus_stop(server->bus);
         errno = error;
         return false;
     }
     server->accept_thread_started = true;
     pthread_mutex_unlock(&server->state_lock);
-    /* Phase 3: start cluster bus if present */
-    if (server->bus) qihse_cluster_bus_start(server->bus);
     /* Start Task Workers & Scheduler */
     if (server->task_workers) qihse_task_worker_pool_start(server->task_workers);
     if (server->task_scheduler) qihse_task_scheduler_start(server->task_scheduler);
@@ -13108,12 +13108,18 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
                 server->bind_address, server->port, strerror(errno));
         return false;
     }
+    /* A requested bus is part of startup, not an optional best-effort listener.
+     * Reject unsupported bind addresses before accepting any clients. */
+    if (server->bus && !qihse_cluster_bus_start(server->bus)) {
+        int error = errno;
+        close_socket(server->listen_fd);
+        server->listen_fd = -1;
+        pthread_mutex_unlock(&server->state_lock);
+        errno = error;
+        return false;
+    }
     __atomic_store_n(&server->running, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&server->state_lock);
-    /* Phase 3: start cluster bus if present (mirrors qihse_resp_server_start;
-     * run() previously never started the bus, silently disabling clustering
-     * for run()-only deployments). */
-    if (server->bus) qihse_cluster_bus_start(server->bus);
     /* Start Task Workers & Scheduler */
     if (server->task_workers) qihse_task_worker_pool_start(server->task_workers);
     if (server->task_scheduler) qihse_task_scheduler_start(server->task_scheduler);

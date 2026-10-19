@@ -10,9 +10,71 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <strings.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <time.h>
+#include <limits.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+
+/* A fixed budget, not a timeout restarted by each successful byte. */
+#ifndef QIHSE_HTTP_REQUEST_TIMEOUT_MS
+#define QIHSE_HTTP_REQUEST_TIMEOUT_MS 10000
+#endif
+
+typedef struct qihse_http_client {
+    int fd;
+    qihse_http_server_t* srv;
+    struct timespec deadline;
+    struct qihse_http_client* next;
+} qihse_http_client_t;
+
+static int http_deadline_init(struct timespec* deadline) {
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+    deadline->tv_sec += QIHSE_HTTP_REQUEST_TIMEOUT_MS / 1000;
+    deadline->tv_nsec += (QIHSE_HTTP_REQUEST_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        ++deadline->tv_sec;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
+
+static int http_deadline_remaining(const struct timespec* deadline) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    int64_t ns = (int64_t)(deadline->tv_sec - now.tv_sec) * 1000000000LL
+               + deadline->tv_nsec - now.tv_nsec;
+    if (ns <= 0) return 0;
+    int64_t ms = (ns + 999999) / 1000000;
+    return ms > INT_MAX ? INT_MAX : (int)ms;
+}
+
+static bool http_wait_io(int fd, short events, const struct timespec* deadline) {
+    for (;;) {
+        int remaining = http_deadline_remaining(deadline);
+        if (remaining == 0) return false;
+        struct pollfd pfd = {fd, events, 0};
+        int rc = poll(&pfd, 1, remaining);
+        if (rc < 0 && errno == EINTR) continue;
+        return rc > 0 && (pfd.revents & events) != 0;
+    }
+}
+
+/* Unlink and close under the same lock used by stop's cancellation walk:
+ * shutdown must never target a descriptor already recycled by another user. */
+static void http_client_release(qihse_http_client_t* ctx) {
+    qihse_http_server_t* srv = ctx->srv;
+    pthread_mutex_lock(&srv->lock);
+    qihse_http_client_t** link = &srv->clients;
+    while (*link && *link != ctx) link = &(*link)->next;
+    if (*link) *link = ctx->next;
+    close(ctx->fd);
+    if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
+    pthread_mutex_unlock(&srv->lock);
+    free(ctx);
+}
 
 qihse_http_server_t* qihse_http_server_create(uint16_t port) {
     qihse_http_server_t* srv = (qihse_http_server_t*)calloc(1, sizeof(qihse_http_server_t));
@@ -90,7 +152,8 @@ static bool find_route(qihse_http_server_t* srv, const char* path, http_method_t
     return false;
 }
 
-static void send_response(int fd, const http_response_t* res) {
+static void send_response(int fd, const http_response_t* res,
+                          const struct timespec* deadline) {
     const char* status_text = "OK";
     switch (res->status_code) {
         case 200: status_text = "OK"; break;
@@ -118,8 +181,9 @@ static void send_response(int fd, const http_response_t* res) {
     for (unsigned i = 0; i < 2; ++i) {
         size_t off = 0;
         while (off < lengths[i]) {
+            if (!http_wait_io(fd, POLLOUT, deadline)) return;
             ssize_t n = send(fd, segments[i] + off, lengths[i] - off, MSG_NOSIGNAL);
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (n <= 0) return;
             off += (size_t)n;
         }
@@ -129,7 +193,7 @@ static void send_response(int fd, const http_response_t* res) {
 /* The acceptor increments active_workers before creating a detached worker.
  * Every exit decrements it; shutdown waits until no worker can touch srv. */
 static void* http_client_thread(void* arg) {
-    struct { int fd; qihse_http_server_t* srv; }* ctx = arg;
+    qihse_http_client_t* ctx = arg;
     int fd = ctx->fd;
     qihse_http_server_t* srv = ctx->srv;
     char* buf = malloc(65536u);
@@ -137,8 +201,9 @@ static void* http_client_thread(void* arg) {
     int parsed = -1;
     http_request_t req = {0};
     if (buf) while (used < 65535u) {
+        if (!http_wait_io(fd, POLLIN, &ctx->deadline)) break;
         ssize_t n = recv(fd, buf + used, 65535u - used, 0);
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         if (n <= 0) break;
         used += (size_t)n;
         parsed = http_parse_request(buf, used, &req);
@@ -146,26 +211,23 @@ static void* http_client_thread(void* arg) {
     }
     if (parsed != 0) {
         http_response_t* err = http_response_error(400,"Malformed or incomplete request");
-        if (err) send_response(fd,err);
+        if (err) send_response(fd,err,&ctx->deadline);
         http_response_free(err);
-    } else {
+    } else if (__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE) &&
+               http_deadline_remaining(&ctx->deadline) > 0) {
         http_route_t route;
         if (!find_route(srv,req.path,req.method,&route)) {
             http_response_t* err = http_response_error(404,"Not Found");
-            if (err) send_response(fd,err);
+            if (err) send_response(fd,err,&ctx->deadline);
             http_response_free(err);
         } else {
             http_response_t* res = route.handler(&req,route.user_data);
-            if (res) { send_response(fd,res); http_response_free(res); }
+            if (res) { send_response(fd,res,&ctx->deadline); http_response_free(res); }
         }
     }
     http_request_free(&req);
     free(buf);
-    close(fd);
-    pthread_mutex_lock(&srv->lock);
-    if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
-    pthread_mutex_unlock(&srv->lock);
-    free(ctx);
+    http_client_release(ctx);
     return NULL;
 }
 
@@ -176,31 +238,35 @@ static void* http_accept_thread(void* arg) {
         socklen_t addr_len = sizeof(addr);
         int fd = accept(srv->fd, (struct sockaddr*)&addr, &addr_len);
         if (fd < 0) continue;
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-        struct { int fd; qihse_http_server_t* srv; }* ctx = malloc(sizeof(*ctx));
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(fd);
+            continue;
+        }
+        qihse_http_client_t* ctx = malloc(sizeof(*ctx));
         if (!ctx) { close(fd); continue; }
         ctx->fd = fd;
         ctx->srv = srv;
+        if (http_deadline_init(&ctx->deadline) != 0) {
+            close(fd);
+            free(ctx);
+            continue;
+        }
         pthread_mutex_lock(&srv->lock);
-        if (srv->active_workers >= 128u) {
+        if (!__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE) ||
+            srv->active_workers >= 128u) {
             pthread_mutex_unlock(&srv->lock);
             close(fd);
             free(ctx);
             continue;
         }
+        ctx->next = srv->clients;
+        srv->clients = ctx;
         ++srv->active_workers;
         pthread_mutex_unlock(&srv->lock);
         pthread_t tid;
         if (pthread_create(&tid, NULL, http_client_thread, ctx) != 0) {
-            pthread_mutex_lock(&srv->lock);
-            if (--srv->active_workers == 0u) pthread_cond_broadcast(&srv->workers_drained);
-            pthread_mutex_unlock(&srv->lock);
-            close(fd);
-            free(ctx);
+            http_client_release(ctx);
             continue;
         }
         pthread_detach(tid);
@@ -209,9 +275,14 @@ static void* http_accept_thread(void* arg) {
 }
 
 int qihse_http_server_start(qihse_http_server_t* srv) {
-    if (!srv || srv->running) return -1;
+    if (!srv) return -1;
+    pthread_mutex_lock(&srv->lock);
+    if (srv->stopping || __atomic_load_n(&srv->running, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&srv->lock);
+        return -1;
+    }
     srv->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv->fd < 0) return -1;
+    if (srv->fd < 0) { pthread_mutex_unlock(&srv->lock); return -1; }
     int opt = 1;
     setsockopt(srv->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr;
@@ -219,8 +290,8 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(srv->port);
-    if (bind(srv->fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(srv->fd); return -1; }
-    if (listen(srv->fd, 128) < 0) { close(srv->fd); return -1; }
+    if (bind(srv->fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(srv->fd); srv->fd = -1; pthread_mutex_unlock(&srv->lock); return -1; }
+    if (listen(srv->fd, 128) < 0) { close(srv->fd); srv->fd = -1; pthread_mutex_unlock(&srv->lock); return -1; }
     /* Port 0 means ephemeral: read back the bound port so callers can reach
      * the server without racing a fixed port. */
     if (srv->port == 0) {
@@ -234,27 +305,41 @@ int qihse_http_server_start(qihse_http_server_t* srv) {
         __atomic_store_n(&srv->running, 0, __ATOMIC_RELEASE);
         close(srv->fd);
         srv->fd = -1;
+        pthread_mutex_unlock(&srv->lock);
         return -1;
     }
+    pthread_mutex_unlock(&srv->lock);
     return 0;
 }
 
 int qihse_http_server_stop(qihse_http_server_t* srv) {
     if (!srv) return -1;
-    if (!__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&srv->lock);
+    while (srv->stopping) pthread_cond_wait(&srv->workers_drained, &srv->lock);
+    if (!__atomic_load_n(&srv->running, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&srv->lock);
+        return 0;
+    }
+    srv->stopping = 1;
     __atomic_store_n(&srv->running, 0, __ATOMIC_RELEASE);
     if (srv->fd >= 0) {
         /* shutdown() before close(): closing a listen fd does NOT reliably
          * wake a thread blocked in accept() on it, and the join below would
          * hang forever. */
         shutdown(srv->fd, SHUT_RDWR);
-        close(srv->fd);
-        srv->fd = -1;
     }
+    for (qihse_http_client_t* ctx = srv->clients; ctx; ctx = ctx->next)
+        shutdown(ctx->fd, SHUT_RDWR);
+    pthread_mutex_unlock(&srv->lock);
     pthread_join(srv->thread, NULL);
+    /* The acceptor has exited; its descriptor can no longer be reused by it. */
     pthread_mutex_lock(&srv->lock);
+    if (srv->fd >= 0) close(srv->fd);
+    srv->fd = -1;
     while (srv->active_workers != 0u)
         pthread_cond_wait(&srv->workers_drained, &srv->lock);
+    srv->stopping = 0;
+    pthread_cond_broadcast(&srv->workers_drained);
     pthread_mutex_unlock(&srv->lock);
     return 0;
 }

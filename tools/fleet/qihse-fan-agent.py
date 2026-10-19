@@ -139,29 +139,94 @@ def _read_reply(f, depth=0, budget=None):
     raise ConnectionError("unknown RESP reply type")
 
 
-def _resp_socket(host, port, timeout):
-    """TLS with configured CA/identity for remote endpoints; plaintext only on IP loopback."""
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("RESP operation deadline exceeded")
+    return remaining
+
+
+class _DeadlineReader:
+    """Read bounded RESP frames without resetting the budget on trickle traffic."""
+
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+        self.buffer = bytearray()
+
+    def _recv(self, size):
+        self.sock.settimeout(_remaining(self.deadline))
+        data = self.sock.recv(size)
+        _remaining(self.deadline)
+        return data
+
+    def readline(self, limit):
+        while True:
+            _remaining(self.deadline)
+            end = self.buffer.find(b"\n", 0, limit)
+            if end >= 0 or len(self.buffer) >= limit:
+                size = end + 1 if end >= 0 else limit
+                data = bytes(self.buffer[:size])
+                del self.buffer[:size]
+                return data
+            data = self._recv(min(4096, limit - len(self.buffer)))
+            if not data:
+                data = bytes(self.buffer)
+                self.buffer.clear()
+                return data
+            self.buffer.extend(data)
+
+    def read(self, size):
+        data = bytearray(self.buffer[:size])
+        del self.buffer[:size]
+        while len(data) < size:
+            chunk = self._recv(min(65536, size - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        _remaining(self.deadline)
+        return bytes(data)
+
+    def close(self):
+        self.buffer.clear()
+
+
+def _resp_socket(host, port, timeout, deadline=None):
+    """Bounded TCP/TLS connection; endpoints are IPs, TLS identity is separate.
+
+    Literal addresses avoid unbounded system DNS resolution. Remote endpoints
+    still require a configured CA and verified TLS server name.
+    """
     import ipaddress
     import ssl
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = False
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ConnectionError("RESP endpoint must be a literal IP address") from exc
+    loopback = address.is_loopback
     ca = os.environ.get("QIHSE_RESP_CA_FILE")
     peer = os.environ.get("QIHSE_RESP_SERVER_NAME")
     if not loopback and (not ca or not peer):
         raise ConnectionError("remote RESP requires pinned CA and TLS server identity")
-    sock = socket.create_connection((host, port), timeout=timeout)
-    sock.settimeout(timeout)
-    if not loopback:
-        try:
+    sock = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
+                         socket.SOCK_STREAM)
+    try:
+        sock.settimeout(_remaining(deadline))
+        sock.connect((host, port))
+        _remaining(deadline)
+        if not loopback:
             tls = ssl.create_default_context(cafile=ca)
             tls.minimum_version = ssl.TLSVersion.TLSv1_3
+            sock.settimeout(_remaining(deadline))
             sock = tls.wrap_socket(sock, server_hostname=peer)
-        except Exception:
-            sock.close()
-            raise
-    return sock
+        _remaining(deadline)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
 
 class QihseConnection:
     """One authenticated, persistent RESP connection to one node."""
@@ -173,16 +238,17 @@ class QihseConnection:
         self.sock = None
         self.f = None
 
-    def _open_and_auth(self):
+    def _open_and_auth(self, deadline=None):
         self.close()
-        s = _resp_socket(self.host, self.port, self.timeout)
-        s.settimeout(self.timeout)
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
+        s = _resp_socket(self.host, self.port, self.timeout, deadline)
         self.sock = s
-        self.f = s.makefile("rb")
+        self.f = _DeadlineReader(s, deadline)
 
         token = self._load_machine_token()
         if token is not None:
-            kind, value = self._roundtrip(["MACHINEAUTH", token])
+            kind, value = self._roundtrip(["MACHINEAUTH", token], deadline)
             if kind == "ok" and value == "OK":
                 return
             # A failed machine-token exchange must not downgrade to a password.
@@ -194,7 +260,7 @@ class QihseConnection:
             raise ConnectionError(
                 f"no machine token usable at {MACHINE_TOKEN_PATH} and "
                 "QIHSE_OPERATOR_PASSWORD not set — cannot authenticate")
-        kind, value = self._roundtrip(["AUTH", password])
+        kind, value = self._roundtrip(["AUTH", password], deadline)
         if (kind, value) != ("ok", "OK"):
             raise ConnectionError("AUTH refused")
 
@@ -211,23 +277,31 @@ class QihseConnection:
         except (OSError, UnicodeError) as exc:
             raise ConnectionError("configured machine token cannot be read") from exc
 
-    def _roundtrip(self, args):
+    def _roundtrip(self, args, deadline):
+        self.sock.settimeout(_remaining(deadline))
         self.sock.sendall(_encode_command(args))
-        return _read_reply(self.f)
+        self.f.deadline = deadline
+        reply = _read_reply(self.f)
+        _remaining(deadline)
+        return reply
 
-    def command(self, args):
-        """Run one command, reconnecting + re-authenticating once if the
-        connection went stale between ticks."""
+    def command(self, args, deadline=None, asking=False):
+        """One total deadline covers reconnect, authentication and the command."""
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
         for attempt in (0, 1):
             try:
+                _remaining(deadline)
                 if self.sock is None:
-                    self._open_and_auth()
-                return self._roundtrip(args)
+                    self._open_and_auth(deadline)
+                if asking and self._roundtrip(["ASKING"], deadline) != ("ok", "OK"):
+                    raise ConnectionError("ASKING refused")
+                return self._roundtrip(args, deadline)
             except (OSError, ConnectionError, ValueError):
                 self.close()
                 if attempt == 1:
                     raise
-                time.sleep(0.2)
+                time.sleep(min(0.2, _remaining(deadline)))
         raise ConnectionError("unreachable")
 
     def close(self):
@@ -250,6 +324,8 @@ def _parse_redirect(err_text):
     parts = err_text.split()
     if len(parts) == 3 and parts[0] in ("MOVED", "ASK") and ":" in parts[2]:
         host, _, port = parts[2].rpartition(":")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         try:
             return int(parts[1]), host, int(port)
         except ValueError:
@@ -262,59 +338,66 @@ class QihsePool:
 
     MAX_HOPS = 3
 
-    def __init__(self):
+    def __init__(self, timeout=10):
         self._conns = {}
+        self.timeout = timeout
 
     def _conn_for(self, host, port):
         key = (host, port)
         conn = self._conns.get(key)
         if conn is None:
-            conn = QihseConnection(host, port)
+            conn = QihseConnection(host, port, self.timeout)
             self._conns[key] = conn
         return conn
 
-    def run(self, args, hops=0):
-        if hops > self.MAX_HOPS:
-            raise ConnectionError(f"too many cluster redirects for {' '.join(map(str, args[:2]))}")
-        # Local seed first; other seeds as fallback for the first hop.
-        if hops == 0:
-            ordered = sorted(CLUSTER_SEEDS, key=lambda s: 0 if s[0] == _local_ip_hint() else 1)
-        else:
-            ordered = [(None, None, None)]  # redirect target chosen below
-        if hops == 0:
-            last_err = None
-            for host, port, _ in ordered:
-                try:
-                    conn = self._conn_for(host, port)
-                    kind, value = conn.command(args)
-                except (OSError, ConnectionError) as e:
-                    self._conns.pop((host, port), None)
-                    last_err = e
-                    continue
-                if kind == "err":
-                    redirect = _parse_redirect(value)
-                    if redirect:
-                        return self._run_redirect(args, redirect, hops)
-                    return kind, value
-                return kind, value
-            raise ConnectionError(f"no seed reachable: {last_err}")
-        raise ConnectionError("unreachable")
+    def _discard(self, host, port):
+        conn = self._conns.pop((host, port), None)
+        if conn is not None:
+            conn.close()
 
-    def _run_redirect(self, args, redirect, hops):
-        slot, host, port = redirect
-        if slot < 0 or slot >= 16384 or (host, port) not in {(h, p) for h, p, _ in CLUSTER_SEEDS}:
-            raise ConnectionError("untrusted cluster redirect refused")
-        try:
-            conn = self._conn_for(host, port)
-            kind, value = conn.command(args)
-        except (OSError, ConnectionError) as e:
-            self._conns.pop((host, port), None)
-            raise ConnectionError(f"redirect target {host}:{port} failed: {e}")
-        if kind == "err":
-            redirect2 = _parse_redirect(value)
-            if redirect2:
-                return self._run_redirect(args, redirect2, hops + 1)
-        return kind, value
+    def run(self, args, hops=0):
+        deadline = time.monotonic() + self.timeout
+        if hops < 0 or hops > self.MAX_HOPS:
+            raise ConnectionError("too many cluster redirects")
+        ordered = sorted(CLUSTER_SEEDS, key=lambda s: 0 if s[0] == _local_ip_hint() else 1)
+        last_err = None
+        for host, port, _ in ordered:
+            _remaining(deadline)
+            try:
+                kind, value = self._conn_for(host, port).command(args, deadline=deadline)
+            except (OSError, ConnectionError) as exc:
+                self._discard(host, port)
+                last_err = exc
+                continue
+            redirect = _parse_redirect(value) if kind == "err" else None
+            if redirect:
+                return self._run_redirect(args, redirect, hops, deadline,
+                                          asking=value.split()[0] == "ASK")
+            return kind, value
+        raise ConnectionError(f"no seed reachable: {last_err}")
+
+    def _run_redirect(self, args, redirect, hops, deadline=None, asking=False):
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
+        allowed = {(h, p) for h, p, _ in CLUSTER_SEEDS}
+        while True:
+            _remaining(deadline)
+            if hops < 0 or hops >= self.MAX_HOPS:
+                raise ConnectionError("too many cluster redirects")
+            slot, host, port = redirect
+            if slot < 0 or slot >= 16384 or (host, port) not in allowed:
+                raise ConnectionError("untrusted cluster redirect refused")
+            hops += 1
+            try:
+                kind, value = self._conn_for(host, port).command(
+                    args, deadline=deadline, asking=asking)
+            except (OSError, ConnectionError) as exc:
+                self._discard(host, port)
+                raise ConnectionError(f"redirect target {host}:{port} failed: {exc}") from exc
+            redirect = _parse_redirect(value) if kind == "err" else None
+            if not redirect:
+                return kind, value
+            asking = value.split()[0] == "ASK"
 
     def close_all(self):
         for conn in self._conns.values():

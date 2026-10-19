@@ -54,6 +54,8 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t workers_drained;
     size_t active_workers;
+    int stopping; /* protected by lock; serializes stop/drain */
+    struct qihse_http_client* clients; /* protected by lock; workers own close() */
 } qihse_http_server_t;
 
 qihse_http_server_t* qihse_http_server_create(uint16_t port);

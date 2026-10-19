@@ -310,6 +310,12 @@ void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
 void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
                                               const char* host, uint16_t port);
 
+/* Install the failure callback before starting the bus (or after stopping
+ * it). This preserves bus identity for coordinators that retain its pointer. */
+void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,
+                                        qihse_cluster_bus_on_fail_cb on_fail,
+                                        void* user_data);
+
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
  * qihse_cluster_bus_config_t). */

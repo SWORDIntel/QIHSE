@@ -8,7 +8,8 @@
  *
  * All multi-byte values are little-endian.
  * Atomic flush: mkstemp on private <path>.tmp.XXXXXX, fsync, rename over destination.
- * The file lock is held via POSIX fcntl(F_SETLK) on the open fd.
+ * The writer lock uses fcntl(F_OFD_SETLK), tied to the open description.
+ * Platforms without OFD locks fail closed; there is no F_SETLK fallback.
  */
 
 #ifndef QIHSE_CONTAINER_H
@@ -92,7 +93,7 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr);
 
 /*
  * Open or create a .qdb file for read/write access.
- * Acquires a POSIX write lock; fails if another writer holds the lock.
+ * Acquires an OFD write lock; fails if any independent writer holds the lock.
  * On create, initialises an empty section table.
  */
 bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr);
@@ -114,7 +115,9 @@ const qihse_ctr_section_t* qihse_ctr_find_section(const qihse_container_t* ctr,
 /*
  * Allocate a buffer and read the full payload for section_id.
  * Sets *out and *out_size.  Caller must free(*out).
- * Returns false if the section is missing, empty, or fails HMAC-SHA-384 verification.
+ * Returns false if the section is missing, empty, or MAC computation fails.
+ * Non-WAL payloads are HMAC-verified unless explicit insecure mode is enabled.
+ * WARNING: v1 does not authenticate section identities/metadata or WAL payloads.
  */
 bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
                                   uint16_t section_id,
@@ -124,7 +127,10 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
 /*
  * Read exactly `size` bytes of section_id at byte offset `sec_offset`
  * within the section payload into caller-supplied `buf`.
- * Used for streaming reads (e.g. partial WAL replay).
+ * Streams verification of the full section before copying the requested slice.
+ * Costs O(section length) I/O and O(size + 64 KiB) temporary memory: v1 has
+ * no independently authenticated chunks. Zero-size reads do not access buf.
+ * v1 WAL remains subject to the documented legacy integrity limitation.
  */
 bool qihse_ctr_read_section_at(const qihse_container_t* ctr,
                                 uint16_t section_id,
@@ -162,8 +168,8 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
 /*
  * Append `size` bytes at the end of the WAL section, extending the
  * section.  Updates the section table entry (length only; HMAC is
- * intentionally not maintained for the WAL — individual WAL records
- * carry their own integrity per the existing protocol).
+ * intentionally not maintained for the legacy v1 WAL. Record checksums
+ * are NOT cryptographic authentication; v1 WAL remains an integrity limitation).
  * Does NOT fsync; caller is responsible.
  */
 bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size);

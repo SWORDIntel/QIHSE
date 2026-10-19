@@ -33,12 +33,14 @@
 typedef struct { qihse_resp_server_t* server; int fd; } server_thread_arg_t;
 
 static void* server_thread(void* argument) {
-    server_thread_arg_t* args = (server_thread_arg_t*)argument;
-    assert(qihse_resp_server_handle_client_fd(args->server, args->fd));
+    /* The worker owns the argument after pthread_create succeeds. */
+    server_thread_arg_t args = *(server_thread_arg_t*)argument;
+    free(argument);
+    assert(qihse_resp_server_handle_client_fd(args.server, args.fd));
     return NULL;
 }
 
-typedef struct { int fd; } test_client_t;
+typedef struct { int fd; pthread_t thread; } test_client_t;
 
 static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     int sockets[2];
@@ -47,9 +49,7 @@ static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     assert(args != NULL);
     args->server = server;
     args->fd = sockets[1];
-    pthread_t thread;
-    assert(pthread_create(&thread, NULL, server_thread, args) == 0);
-    pthread_detach(thread);
+    assert(pthread_create(&client->thread, NULL, server_thread, args) == 0);
     client->fd = sockets[0];
 }
 
@@ -216,6 +216,8 @@ int main(void) {
     expect_contains(&client, "+OK");
 
     close(client.fd);
+    /* Wait for session cleanup before releasing the server and its store. */
+    assert(pthread_join(client.thread, NULL) == 0);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
     printf("test_ingest_guard_regression: all assertions passed\n");

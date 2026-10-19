@@ -144,23 +144,29 @@ static void qihse_ctr_cleanup_hmac_key(void) {
     pthread_mutex_unlock(&s_hmac_key_mutex);
 }
 
-static void compute_hmac_sha384(const void* data, size_t len, uint8_t out[48]) {
+/* Never publish a digest on failure. Callers must check the result before
+ * comparing or serializing it, including in explicit insecure test mode. */
+static bool compute_hmac_sha384(const void* data, size_t len, uint8_t out[48]) {
 #ifndef _WIN32
+    uint8_t digest[48];
+    unsigned int md_len = 0;
     pthread_mutex_lock(&s_hmac_key_mutex);
-    if (load_hmac_key_locked()) {
-        unsigned int md_len = 0;
-        if (HMAC(EVP_sha384(), s_hmac_key, (int)sizeof(s_hmac_key),
-                 (const unsigned char*)data, len, out, &md_len) &&
-            md_len == 48u) {
-            pthread_mutex_unlock(&s_hmac_key_mutex);
-            return;
-        }
+    bool ok = load_hmac_key_locked();
+    if (ok) {
+        ok = HMAC(EVP_sha384(), s_hmac_key, (int)sizeof(s_hmac_key),
+                  (const unsigned char*)data, len, digest, &md_len) != NULL &&
+             md_len == sizeof(digest);
+        if (!ok) errno = EIO;
     }
     pthread_mutex_unlock(&s_hmac_key_mutex);
+    if (ok) memcpy(out, digest, sizeof(digest));
+    OPENSSL_cleanse(digest, sizeof(digest));
+    return ok;
+#else
+    (void)data; (void)len; (void)out;
+    errno = ENOTSUP;
+    return false;
 #endif
-    /* Headers/sections with this digest will NOT validate against a real
-     * authenticated key. The public open/flush entry points gate missing keys. */
-    memset(out, 0, 48);
 }
 
 /* ── Serialisation helpers ────────────────────────────────────────── */
@@ -246,7 +252,7 @@ static bool ctr_pwrite(int fd, const void* buf, size_t size, uint64_t offset) {
  *   [20..67] header_hmac_sha384 (HMAC-SHA-384 over bytes 0..19)
  *   [68..79] reserved
  */
-static void ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
+static bool ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
                               uint32_t section_count) {
     memset(hdr, 0, QIHSE_CTR_HEADER_SIZE);
     memcpy(hdr, QIHSE_CTR_MAGIC, 8u);
@@ -254,8 +260,9 @@ static void ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
     qihse_le_write_u32(hdr + 12u, 0u); /* flags */
     qihse_le_write_u32(hdr + 16u, section_count);
     uint8_t hmac[48];
-    compute_hmac_sha384(hdr, 20u, hmac);
+    if (!compute_hmac_sha384(hdr, 20u, hmac)) return false;
     memcpy(hdr + 20u, hmac, 48u);
+    return true;
 }
 
 static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
@@ -270,7 +277,7 @@ static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
         errno = EINVAL;
         return false;
     }
-    compute_hmac_sha384(hdr, 20u, expected_hmac);
+    if (!compute_hmac_sha384(hdr, 20u, expected_hmac)) return false;
     if (CRYPTO_memcmp(hdr + 20u, expected_hmac, 48u) != 0) {
         errno = EINVAL;
         return false;
@@ -279,35 +286,41 @@ static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
     return true;
 }
 
-/* ── POSIX advisory lock helpers ──────────────────────────────────── */
+/* Open-file-description locks survive closure of an independently opened
+ * reader in the same process and exclude independent same-process writers.
+ * They also conflict with legacy POSIX locks on Linux. Never fall back to
+ * F_SETLK: its process-wide close semantics invalidate our writer guarantee.
+ * Platforms/kernels lacking OFD locks fail closed with ENOTSUP/EINVAL. */
 
 static bool ctr_lock_acquire(int fd) {
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(F_OFD_SETLK)
     struct flock fl;
     memset(&fl, 0, sizeof(fl));
     fl.l_type   = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start  = 0;
     fl.l_len    = 0;
-    return fcntl(fd, F_SETLK, &fl) == 0;
+    return fcntl(fd, F_OFD_SETLK, &fl) == 0;
 #else
     (void)fd;
-    return true;
+    errno = ENOTSUP;
+    return false;
 #endif
 }
 
 static bool ctr_lock_release(int fd) {
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(F_OFD_SETLK)
     struct flock fl;
     memset(&fl, 0, sizeof(fl));
     fl.l_type   = F_UNLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start  = 0;
     fl.l_len    = 0;
-    return fcntl(fd, F_SETLK, &fl) == 0;
+    return fcntl(fd, F_OFD_SETLK, &fl) == 0;
 #else
     (void)fd;
-    return true;
+    errno = ENOTSUP;
+    return false;
 #endif
 }
 
@@ -384,7 +397,7 @@ static bool ctr_write_table(int fd, const qihse_ctr_section_t* sections,
     uint32_t i;
     uint8_t entry[QIHSE_CTR_SECTION_ENTRY_SIZE];
 
-    ctr_encode_header(hdr, count);
+    if (!ctr_encode_header(hdr, count)) return false;
     if (!ctr_pwrite(fd, hdr, sizeof(hdr), 0u)) {
         return false;
     }
@@ -547,9 +560,9 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
             /* New file: write an empty table */
             uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
             uint8_t table[QIHSE_CTR_TABLE_SIZE];
-            ctr_encode_header(hdr, 0u);
             memset(table, 0, sizeof(table));
-            if (!ctr_pwrite(fd, hdr, sizeof(hdr), 0u) ||
+            if (!ctr_encode_header(hdr, 0u) ||
+                !ctr_pwrite(fd, hdr, sizeof(hdr), 0u) ||
                 !ctr_pwrite(fd, table, sizeof(table), QIHSE_CTR_TABLE_OFFSET)) {
                 ctr_lock_release(fd);
                 close(fd);
@@ -655,7 +668,10 @@ bool qihse_ctr_read_section_alloc(const qihse_container_t* ctr,
         return false;
     }
     uint8_t computed_hmac[48];
-    compute_hmac_sha384(buf, (size_t)sec->length, computed_hmac);
+    if (!compute_hmac_sha384(buf, (size_t)sec->length, computed_hmac)) {
+        free(buf);
+        return false;
+    }
     if (!ctr->skip_integrity &&
         sec->section_id != QIHSE_CTR_SEC_WAL &&
         CRYPTO_memcmp(computed_hmac, sec->hmac_sha384, 48u) != 0) {
@@ -675,8 +691,6 @@ bool qihse_ctr_read_section_at(const qihse_container_t* ctr,
                                 size_t size,
                                 uint64_t sec_offset) {
     const qihse_ctr_section_t* sec;
-    uint64_t end;
-
     if (!ctr || (!buf && size != 0u)) {
         errno = EINVAL;
         return false;
@@ -693,8 +707,58 @@ bool qihse_ctr_read_section_at(const qihse_container_t* ctr,
         errno = EINVAL;
         return false;
     }
-    end = sec->offset + sec_offset;
-    return ctr_pread(ctr->fd, buf, size, end);
+    /* Verify once while retaining only the requested slice plus a fixed-size
+     * I/O buffer. Never copy into caller memory until authentication succeeds.
+     * v1 has no chunk MACs, so even a short slice needs O(section length) I/O. */
+    uint8_t* staged = malloc(size);
+    uint8_t* chunk = malloc(64u * 1024u);
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    EVP_PKEY* key = NULL;
+    bool ok = false;
+    if (!staged || !chunk || !md) { errno = ENOMEM; goto done; }
+    pthread_mutex_lock(&s_hmac_key_mutex);
+    bool key_ok = load_hmac_key_locked();
+    if (key_ok) {
+        key = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, NULL,
+                                           s_hmac_key, sizeof(s_hmac_key));
+        if (!key) errno = EIO;
+    }
+    pthread_mutex_unlock(&s_hmac_key_mutex);
+    if (!key) goto done;
+    if (EVP_DigestSignInit(md, NULL, EVP_sha384(), NULL, key) != 1) {
+        errno = EIO;
+        goto done;
+    }
+    uint64_t slice_end = sec_offset + size;
+    for (uint64_t pos = 0; pos < sec->length;) {
+        size_t n = sec->length - pos > 65536u ? 65536u : (size_t)(sec->length - pos);
+        if (!ctr_pread(ctr->fd, chunk, n, sec->offset + pos)) goto done;
+        if (EVP_DigestSignUpdate(md, chunk, n) != 1) { errno = EIO; goto done; }
+        uint64_t start = pos > sec_offset ? pos : sec_offset;
+        uint64_t end = pos + n < slice_end ? pos + n : slice_end;
+        if (start < end) {
+            memcpy(staged + (size_t)(start - sec_offset),
+                   chunk + (size_t)(start - pos), (size_t)(end - start));
+        }
+        pos += n;
+    }
+    uint8_t digest[48];
+    size_t digest_size = sizeof(digest);
+    if (EVP_DigestSignFinal(md, digest, &digest_size) != 1 ||
+        digest_size != sizeof(digest)) { errno = EIO; goto done; }
+    if (!ctr->skip_integrity && sec->section_id != QIHSE_CTR_SEC_WAL &&
+        CRYPTO_memcmp(digest, sec->hmac_sha384, sizeof(digest)) != 0) {
+        errno = EINVAL;
+        goto done;
+    }
+    memcpy(buf, staged, size);
+    ok = true;
+done:
+    EVP_PKEY_free(key);
+    EVP_MD_CTX_free(md);
+    free(chunk);
+    free(staged);
+    return ok;
 }
 
 uint64_t qihse_ctr_section_length(const qihse_container_t* ctr, uint16_t section_id) {
@@ -707,7 +771,7 @@ uint64_t qihse_ctr_section_length(const qihse_container_t* ctr, uint16_t section
 
 /* ── Atomic flush ──────────────────────────────────────────────────── */
 /* Retain a lock on BOTH the old file and replacement inode through rename.
- * POSIX fcntl record locks are inode-specific: keeping a lock on the old fd
+ * OFD record locks are inode-specific: keeping a lock on the old fd
  * alone would protect a now-unlinked file, not the published container. */
 bool qihse_ctr_flush(qihse_container_t* ctr,
                      const qihse_ctr_section_buf_t* bufs,
@@ -780,7 +844,8 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
         entry->section_id = section->section_id;
         entry->offset = write_offset;
         entry->length = (uint64_t)section->size;
-        compute_hmac_sha384(section->data, section->size, entry->hmac_sha384);
+        if (!compute_hmac_sha384(section->data, section->size, entry->hmac_sha384))
+            goto out;
         write_offset += (uint64_t)section->size;
     }
 
@@ -879,79 +944,60 @@ out:
 /* ── WAL helpers ────────────────────────────────────────────────────── */
 
 bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size) {
-    int idx;
-    uint64_t wal_end;
-    uint64_t new_length;
-    bool is_new_section = false;
-
-    if (!ctr || ctr->fd < 0 || (!data && size != 0u)) {
+    if (!ctr || ctr->fd < 0 || !ctr->locked || ctr->read_only ||
+        (!data && size != 0u)) {
         errno = EINVAL;
         return false;
     }
+    if (!load_hmac_key()) return false;
     if (size == 0u) return true;
 
-    idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
-    if (idx < 0) {
-        /* First WAL write — add a new section entry */
+    int idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
+    bool is_new = idx < 0;
+    qihse_ctr_section_t next = {0};
+    if (is_new) {
         if (ctr->section_count >= QIHSE_CTR_MAX_SECTIONS) {
-            errno = ENOMEM;
+            errno = ENOSPC;
             return false;
         }
         idx = (int)ctr->section_count;
-        memset(&ctr->sections[idx], 0, sizeof(ctr->sections[idx]));
-        ctr->sections[idx].section_id = QIHSE_CTR_SEC_WAL;
-        /* Place WAL after all existing payloads */
-        wal_end = QIHSE_CTR_PAYLOAD_BASE;
-        {
-            uint32_t i;
-            for (i = 0u; i < ctr->section_count; i++) {
-                uint64_t end = ctr->sections[i].offset + ctr->sections[i].length;
-                if (end > wal_end) wal_end = end;
-            }
+        next.section_id = QIHSE_CTR_SEC_WAL;
+        next.offset = QIHSE_CTR_PAYLOAD_BASE;
+        for (uint32_t i = 0; i < ctr->section_count; ++i) {
+            uint64_t end = ctr->sections[i].offset + ctr->sections[i].length;
+            if (end > next.offset) next.offset = end;
         }
-        ctr->sections[idx].offset = wal_end;
-        ctr->sections[idx].length = 0u;
-        ctr->section_count++;
-        is_new_section = true;
+    } else {
+        next = ctr->sections[idx];
     }
-
-    wal_end = ctr->sections[idx].offset + ctr->sections[idx].length;
-    if (!ctr_pwrite(ctr->fd, data, size, wal_end)) {
+    if (next.offset > INT64_MAX || next.length > (uint64_t)INT64_MAX - next.offset ||
+        size > (uint64_t)INT64_MAX - next.offset - next.length) {
+        errno = EOVERFLOW;
         return false;
     }
-
-    new_length = ctr->sections[idx].length + (uint64_t)size;
-    ctr->sections[idx].length = new_length;
-
-    /* Update the section table entry on disk (length field at entry+16) */
-    {
-        uint8_t len_bytes[8];
-        uint32_t entry_idx = (uint32_t)idx;
-        uint64_t field_off = QIHSE_CTR_TABLE_OFFSET +
-                             (uint64_t)entry_idx * QIHSE_CTR_SECTION_ENTRY_SIZE + 16u;
-        qihse_le_write_u64(len_bytes, new_length);
-        if (!ctr_pwrite(ctr->fd, len_bytes, 8u, field_off)) {
+    uint64_t wal_end = next.offset + next.length;
+    uint64_t write_end = wal_end + size;
+    for (uint32_t i = 0; i < ctr->section_count; ++i) {
+        const qihse_ctr_section_t* other = &ctr->sections[i];
+        if ((int)i != idx && other->length &&
+            wal_end < other->offset + other->length && other->offset < write_end) {
+            errno = EINVAL;
             return false;
         }
-        /* Also update section_count in header if new entry was added */
-        if (is_new_section) {
-            uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
-            ctr_encode_header(hdr, ctr->section_count);
-            if (!ctr_pwrite(ctr->fd, hdr, sizeof(hdr), 0u)) {
-                return false;
-            }
-            /* Write the full new entry */
-            {
-                uint8_t entry_buf[QIHSE_CTR_SECTION_ENTRY_SIZE];
-                uint64_t entry_off = QIHSE_CTR_TABLE_OFFSET +
-                                     (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE;
-                ctr_write_section_entry(entry_buf, &ctr->sections[idx]);
-                if (!ctr_pwrite(ctr->fd, entry_buf, sizeof(entry_buf), entry_off)) {
-                    return false;
-                }
-            }
-        }
     }
+    next.length += size;
+    uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
+    /* Prepare authentication before modifying either payload or metadata. */
+    if (is_new && !ctr_encode_header(hdr, ctr->section_count + 1u)) return false;
+    uint8_t entry[QIHSE_CTR_SECTION_ENTRY_SIZE];
+    ctr_write_section_entry(entry, &next);
+    uint64_t entry_off = QIHSE_CTR_TABLE_OFFSET +
+                        (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE;
+    if (!ctr_pwrite(ctr->fd, data, size, wal_end) ||
+        !ctr_pwrite(ctr->fd, entry, sizeof(entry), entry_off) ||
+        (is_new && !ctr_pwrite(ctr->fd, hdr, sizeof(hdr), 0u))) return false;
+    ctr->sections[idx] = next;
+    if (is_new) ++ctr->section_count;
     return true;
 }
 
@@ -960,11 +1006,12 @@ bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
     uint8_t len_bytes[8];
     uint64_t field_off;
 
-    if (!ctr || ctr->fd < 0) {
+    if (!ctr || ctr->fd < 0 || !ctr->locked || ctr->read_only) {
         errno = EINVAL;
         return false;
     }
 
+    if (!load_hmac_key()) return false;
     idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
     if (idx < 0) return true; /* Nothing to truncate */
 
@@ -973,15 +1020,15 @@ bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
         return false;
     }
 
-    ctr->sections[idx].length = new_length;
-
-    /* Update length on disk */
+    /* Update length on disk before publishing it to this handle. */
     field_off = QIHSE_CTR_TABLE_OFFSET +
                 (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE + 16u;
     qihse_le_write_u64(len_bytes, new_length);
     if (!ctr_pwrite(ctr->fd, len_bytes, 8u, field_off)) {
         return false;
     }
+
+    ctr->sections[idx].length = new_length;
 
     /* Physically truncate the file if WAL is the last section */
     {
@@ -998,9 +1045,9 @@ bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
         }
         if (is_last) {
 #ifndef _WIN32
-            (void)ftruncate(ctr->fd, (off_t)file_end);
+            if (ftruncate(ctr->fd, (off_t)file_end) != 0) return false;
 #else
-            (void)_chsize(ctr->fd, (long)file_end);
+            if (_chsize(ctr->fd, (long)file_end) != 0) return false;
 #endif
         }
     }
