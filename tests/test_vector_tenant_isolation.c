@@ -39,18 +39,14 @@
 typedef struct { qihse_resp_server_t* server; int fd; } server_thread_arg_t;
 
 static void* server_thread(void* argument) {
-    server_thread_arg_t* args = (server_thread_arg_t*)argument;
-    qihse_resp_server_t* server = args->server;
-    int fd = args->fd;
-    free(args);
-    (void)qihse_resp_server_handle_client_fd(server, fd);
+    /* The worker owns the argument after pthread_create succeeds. */
+    server_thread_arg_t args = *(server_thread_arg_t*)argument;
+    free(argument);
+    assert(qihse_resp_server_handle_client_fd(args.server, args.fd));
     return NULL;
 }
 
-typedef struct {
-    int fd;
-    pthread_t thread;
-} test_client_t;
+typedef struct { int fd; pthread_t thread; } test_client_t;
 
 static void client_init(test_client_t* client, qihse_resp_server_t* server) {
     int sockets[2];
@@ -184,9 +180,10 @@ int main(void) {
 
     close(t8.fd);
     close(op.fd);
-    qihse_resp_server_destroy(server);
+    /* Finish every client handler before freeing its server and stores. */
     assert(pthread_join(t8.thread, NULL) == 0);
     assert(pthread_join(op.thread, NULL) == 0);
+    qihse_resp_server_destroy(server);
 
     /* --- Library surface: the ANN leakage trap --------------------------- */
     float t7_vec[2] = { 0.9f, 0.1f };
