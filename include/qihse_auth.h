@@ -1,52 +1,59 @@
 #ifndef QIHSE_AUTH_H
 #define QIHSE_AUTH_H
 
-#include <stdint.h>
+#include "qihse_rate_limit.h"
 #include <stdbool.h>
 #include <stddef.h>
-#include "qihse_rate_limit.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Define Roles
-#define QIHSE_ROLE_OPERATOR 0  // Full God-Mode Access
-#define QIHSE_ROLE_CHUCK    0  // Full God-Mode Access (Supernatural Alias)
-#define QIHSE_ROLE_ANALYST  1  // Restricted by Clearance & SCI
-#define QIHSE_ROLE_GUEST    2  // Unclassified Only
+#define QIHSE_ROLE_OPERATOR 0 // Full God-Mode Access
+#define QIHSE_ROLE_CHUCK 0    // Full God-Mode Access (Supernatural Alias)
+#define QIHSE_ROLE_ANALYST 1  // Restricted by Clearance & SCI
+#define QIHSE_ROLE_GUEST 2    // Unclassified Only
 
 // CNSA 2.0 / FIPS-aligned PBKDF2 Password Parameters
-#define QIHSE_PW_ALGORITHM       "PBKDF2-HMAC-SHA384"
+#define QIHSE_PW_ALGORITHM "PBKDF2-HMAC-SHA384"
 #define QIHSE_PW_VERIFIER_VERSION_1 1u
 #define QIHSE_PW_ALG_PBKDF2_HMAC_SHA384 1u
-#define QIHSE_PW_SALT_BYTES      16
-#define QIHSE_PW_HASH_BYTES      48
-#define QIHSE_PW_MIN_ITERATIONS  600000u
+#define QIHSE_PW_SALT_BYTES 16
+#define QIHSE_PW_HASH_BYTES 48
+#define QIHSE_PW_MIN_ITERATIONS 600000u
 
-#define QIHSE_AUTH_USERNAME_MAX  64
+#define QIHSE_AUTH_USERNAME_MAX 64
 #define QIHSE_OBJECT_ACL_MAX_ENTRIES 64
-#define QIHSE_ACL_READ  0x01u
+#define QIHSE_ACL_READ 0x01u
 #define QIHSE_ACL_WRITE 0x02u
 #define QIHSE_ACL_ADMIN 0x04u
 
 typedef struct qihse_acl_entry_s {
-    uint32_t namespace_id;
-    uint64_t resource_id;
-    uint8_t access_flags;
+  uint32_t namespace_id;
+  uint64_t resource_id;
+  uint8_t access_flags;
 } qihse_acl_entry_t;
 
-// Opaque user handle. Internal representation is isolated in core/qihse_auth_internal.h.
+// Opaque user handle. Internal representation is isolated in
+// core/qihse_auth_internal.h.
 typedef struct qihse_user_s qihse_user_t;
 
-// Global Auth Context. Returns true on success; returns false and fails closed if FIPS/crypto policies fail.
+// Global Auth Context. Returns true on success; returns false and fails closed
+// if FIPS/crypto policies fail.
 bool qihse_auth_init(void);
 
 // Bootstrap system operator with explicit password.
-bool qihse_auth_bootstrap_operator(const char* initial_password);
+bool qihse_auth_bootstrap_operator(const char *initial_password);
 
-// Create a user. An OPERATOR or a user with `can_create_users` flag can create a user.
-qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
+// Create a user. An OPERATOR or a user with `can_create_users` flag can create
+// a user.
+qihse_user_t *qihse_auth_create_user(const qihse_user_t *creator,
+                                     uint32_t user_id, uint16_t role,
+                                     uint16_t classif, uint16_t sci,
+                                     const char *plaintext_password,
+                                     bool requires_hw_token);
 
 // System-domain tenant assigned to the operator and to users created via
 // qihse_auth_create_user(). Tenant principals (tenant_id != 0) are scoped to
@@ -58,81 +65,142 @@ qihse_user_t* qihse_auth_create_user(const qihse_user_t* creator, uint32_t user_
 // plus (invariant #2): a tenant-scoped creator may only create principals
 // within its own tenant; a system-domain creator may create in any tenant;
 // a tenant-scoped creator can never create system-domain (tenant 0) principals.
-qihse_user_t* qihse_auth_create_tenant_user(const qihse_user_t* creator, uint32_t tenant_id, uint32_t user_id, uint16_t role, uint16_t classif, uint16_t sci, const char* plaintext_password, bool requires_hw_token);
+qihse_user_t *qihse_auth_create_tenant_user(const qihse_user_t *creator,
+                                            uint32_t tenant_id,
+                                            uint32_t user_id, uint16_t role,
+                                            uint16_t classif, uint16_t sci,
+                                            const char *plaintext_password,
+                                            bool requires_hw_token);
 
-qihse_user_t* qihse_auth_get_user(uint32_t user_id);
+qihse_user_t *qihse_auth_get_user(uint32_t user_id);
 
 // Only an OPERATOR may destroy a user.
-bool qihse_auth_destroy_user(const qihse_user_t* actor, uint32_t target_user_id);
+bool qihse_auth_destroy_user(const qihse_user_t *actor,
+                             uint32_t target_user_id);
 
-// Operator can modify any user's settings, passwords, names, and hardware token mandates.
-// Use -1 for integers/booleans to indicate "do not change", and NULL for strings to indicate "do not change".
-// new_classification / new_sci let the operator set (or raise) a principal's
-// clearance and SCI compartments after creation — an operator-exclusive
-// action, mirroring qihse_auth_create_user. OPERATOR-role targets always
-// carry 0xFFFF/0xFFFF regardless of the values passed.
-bool qihse_auth_modify_user(const qihse_user_t* operator_user, uint32_t target_user_id, const char* new_username, const char* new_password, int new_requires_hw_token, int new_can_create_users, int new_classification, int new_sci);
+// Operator can modify any user's settings, passwords, names, and hardware token
+// mandates. Use -1 for integers/booleans to indicate "do not change", and NULL
+// for strings to indicate "do not change". new_classification / new_sci let the
+// operator set (or raise) a principal's clearance and SCI compartments after
+// creation — an operator-exclusive action, mirroring qihse_auth_create_user.
+// OPERATOR-role targets always carry 0xFFFF/0xFFFF regardless of the values
+// passed.
+bool qihse_auth_modify_user(const qihse_user_t *operator_user,
+                            uint32_t target_user_id, const char *new_username,
+                            const char *new_password, int new_requires_hw_token,
+                            int new_can_create_users, int new_classification,
+                            int new_sci);
 
 // Set hardware token state on user.
-bool qihse_auth_set_hardware_token(qihse_user_t* user, bool present, const char* credential_id);
+bool qihse_auth_set_hardware_token(qihse_user_t *user, bool present,
+                                   const char *credential_id);
 
 // Check if a user can access a specific data row's clearance
-bool qihse_auth_can_access(const qihse_user_t* user, uint16_t data_classif, uint16_t data_sci);
+bool qihse_auth_can_access(const qihse_user_t *user, uint16_t data_classif,
+                           uint16_t data_sci);
 
-// Check access to an object requiring specific access flags (QIHSE_ACL_READ, QIHSE_ACL_WRITE, QIHSE_ACL_ADMIN)
-bool qihse_auth_can_access_object(const qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id, uint8_t required_flags);
-
-// Only an OPERATOR may change another user's object ACL.
-bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
-                             uint32_t namespace_id, uint64_t resource_id, uint8_t access_flags);
-bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
-                              uint32_t namespace_id, uint64_t resource_id);
-
-// Check access to an object requiring specific access flags (QIHSE_ACL_READ, QIHSE_ACL_WRITE, QIHSE_ACL_ADMIN)
-bool qihse_auth_can_access_object(const qihse_user_t* user, uint32_t namespace_id, uint64_t resource_id, uint8_t required_flags);
+// Check access to an object requiring specific access flags (QIHSE_ACL_READ,
+// QIHSE_ACL_WRITE, QIHSE_ACL_ADMIN)
+bool qihse_auth_can_access_object(const qihse_user_t *user,
+                                  uint32_t namespace_id, uint64_t resource_id,
+                                  uint8_t required_flags);
 
 // Only an OPERATOR may change another user's object ACL.
-bool qihse_auth_grant_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
-                             uint32_t namespace_id, uint64_t resource_id, uint8_t access_flags);
-bool qihse_auth_revoke_object(const qihse_user_t* operator_user, qihse_user_t* target_user,
-                              uint32_t namespace_id, uint64_t resource_id);
+bool qihse_auth_grant_object(const qihse_user_t *operator_user,
+                             qihse_user_t *target_user, uint32_t namespace_id,
+                             uint64_t resource_id, uint8_t access_flags);
+bool qihse_auth_revoke_object(const qihse_user_t *operator_user,
+                              qihse_user_t *target_user, uint32_t namespace_id,
+                              uint64_t resource_id);
+
+// Check access to an object requiring specific access flags (QIHSE_ACL_READ,
+// QIHSE_ACL_WRITE, QIHSE_ACL_ADMIN)
+bool qihse_auth_can_access_object(const qihse_user_t *user,
+                                  uint32_t namespace_id, uint64_t resource_id,
+                                  uint8_t required_flags);
+
+// Only an OPERATOR may change another user's object ACL.
+bool qihse_auth_grant_object(const qihse_user_t *operator_user,
+                             qihse_user_t *target_user, uint32_t namespace_id,
+                             uint64_t resource_id, uint8_t access_flags);
+bool qihse_auth_revoke_object(const qihse_user_t *operator_user,
+                              qihse_user_t *target_user, uint32_t namespace_id,
+                              uint64_t resource_id);
 
 bool qihse_auth_is_operator_password_default(void);
-qihse_user_t* qihse_auth_authenticate(const char* username, const char* password);
-qihse_user_t* qihse_auth_authenticate_from(uint32_t source_ip, const char* username, const char* password);
-qihse_user_t* qihse_auth_authenticate_id(uint32_t user_id, const char* password);
-qihse_user_t* qihse_auth_authenticate_id_from(uint32_t source_ip, uint32_t user_id, const char* password);
+qihse_user_t *qihse_auth_authenticate(const char *username,
+                                      const char *password);
+qihse_user_t *qihse_auth_authenticate_from(uint32_t source_ip,
+                                           const char *username,
+                                           const char *password);
+qihse_user_t *qihse_auth_authenticate_id(uint32_t user_id,
+                                         const char *password);
+qihse_user_t *qihse_auth_authenticate_id_from(uint32_t source_ip,
+                                              uint32_t user_id,
+                                              const char *password);
 
 // Read-only user accessors (authoritatively resolved)
-uint32_t qihse_user_get_id(const qihse_user_t* user);
-uint16_t qihse_user_get_role(const qihse_user_t* user);
-uint16_t qihse_user_get_classification(const qihse_user_t* user);
-uint16_t qihse_user_get_sci(const qihse_user_t* user);
-uint32_t qihse_user_get_tenant_id(const qihse_user_t* user);
-const char* qihse_user_get_username(const qihse_user_t* user);
-const char* qihse_user_get_fido2_credential_id(const qihse_user_t* user);
-bool qihse_user_has_hardware_token(const qihse_user_t* user);
-bool qihse_user_requires_hardware_token(const qihse_user_t* user);
-bool qihse_user_can_create_users(const qihse_user_t* user);
+uint32_t qihse_user_get_id(const qihse_user_t *user);
+uint16_t qihse_user_get_role(const qihse_user_t *user);
+uint16_t qihse_user_get_classification(const qihse_user_t *user);
+uint16_t qihse_user_get_sci(const qihse_user_t *user);
+uint32_t qihse_user_get_tenant_id(const qihse_user_t *user);
+const char *qihse_user_get_username(const qihse_user_t *user);
+bool qihse_user_copy_username(const qihse_user_t *user, char *dst,
+                              size_t dst_capacity);
+const char *qihse_user_get_fido2_credential_id(const qihse_user_t *user);
+bool qihse_user_has_hardware_token(const qihse_user_t *user);
+bool qihse_user_requires_hardware_token(const qihse_user_t *user);
+bool qihse_user_can_create_users(const qihse_user_t *user);
 
 // Authoritatively re-validate a presented user handle against the shadow
 // authorization table. Returns false once the principal has been destroyed
 // (revocation) or the handle was forged. Callers should use this once per
 // command/request — not per data row — to enforce the revocation SLA without
 // giving up the per-row unclassified fast path.
-bool qihse_auth_user_is_active(const qihse_user_t* user);
+bool qihse_auth_user_is_active(const qihse_user_t *user);
 
 // Combined liveness + tenant probe under a single auth_rwlock round-trip.
 // Live lookup — no caching; revocation is honored on the next command.
-void qihse_auth_user_active_and_tenant(const qihse_user_t* user,
-                                       bool* out_active, uint32_t* out_tenant);
+void qihse_auth_user_active_and_tenant(const qihse_user_t *user,
+                                       bool *out_active, uint32_t *out_tenant);
+
+// In-Process Hydration API (ROADMAP Item 8):
+// Hydrates the Hypercube service principal (ID 1) from an authenticated cluster
+// attestation. Verifies peer DSA public key, history binding, writer epoch
+// floor, and committed index prefix.
+bool qihse_auth_hydrate_from_attestation(
+    const uint8_t *expected_history_id, uint64_t expected_writer_epoch,
+    uint64_t expected_committed_index, const uint8_t *attestation_payload,
+    size_t attestation_len, const uint8_t *peer_dsa_pub,
+    size_t peer_dsa_pub_len, qihse_user_t **out_principal,
+    uint64_t *out_generation);
+
+// Generation-Bound Handle Liveness Verification:
+// Authoritatively validates that a presented user handle remains active and
+// matches the expected principal generation in the shadow authorization table.
+bool qihse_auth_validate_handle_generation(const qihse_user_t *user,
+                                           uint64_t expected_generation);
+
+// Atomic Scoped Borrow API:
+// Borrows an active principal handle with reference-counted lifetime and
+// reports its generation.
+qihse_user_t *qihse_auth_borrow_principal_scoped(uint32_t user_id,
+                                                 uint64_t *out_generation);
+
+// Releases a previously borrowed principal handle.
+void qihse_auth_release_principal_scoped(qihse_user_t *user);
+
+// Administrative / test control for direct auth mutations fence.
+void qihse_auth_set_direct_mutations_fenced(bool fenced);
 
 // --- IP-based auth rate limiting (brute-force protection) -------------------
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ATTEMPTS 5
-#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC  60
+#define QIHSE_AUTH_RATE_LIMIT_DEFAULT_WINDOW_SEC 60
 #define QIHSE_AUTH_RATE_LIMIT_DEFAULT_MAX_ENTRIES 1024
 
-void qihse_auth_init_rate_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
+void qihse_auth_init_rate_limiter(uint32_t max_attempts,
+                                  uint32_t window_seconds, size_t max_entries);
 void qihse_auth_shutdown_rate_limiter(void);
 
 bool qihse_auth_check_rate_limit(uint32_t source_ip);
@@ -147,10 +215,12 @@ void qihse_auth_rate_limit_cleanup(void);
 // (120/min/IP): a legitimate fleet agent stays far below them, a reconnect
 // storm does not. Rejections apply for the remainder of the window.
 #define QIHSE_AUTH_VOLUME_DEFAULT_MAX_ATTEMPTS 120
-#define QIHSE_AUTH_VOLUME_DEFAULT_WINDOW_SEC   60
-#define QIHSE_AUTH_VOLUME_DEFAULT_MAX_ENTRIES  1024
+#define QIHSE_AUTH_VOLUME_DEFAULT_WINDOW_SEC 60
+#define QIHSE_AUTH_VOLUME_DEFAULT_MAX_ENTRIES 1024
 
-void qihse_auth_init_volume_limiter(uint32_t max_attempts, uint32_t window_seconds, size_t max_entries);
+void qihse_auth_init_volume_limiter(uint32_t max_attempts,
+                                    uint32_t window_seconds,
+                                    size_t max_entries);
 void qihse_auth_shutdown_volume_limiter(void);
 bool qihse_auth_check_volume_limit(uint32_t source_ip);
 void qihse_auth_volume_limit_reset(uint32_t source_ip);
@@ -165,13 +235,14 @@ void qihse_auth_volume_limit_reset(uint32_t source_ip);
 // Because the key includes the account's current salt, a password rotation
 // invalidates the cached entry naturally. TTL 0 disables the cache.
 #define QIHSE_AUTH_CACHE_DEFAULT_TTL_SECONDS 300
-#define QIHSE_AUTH_CACHE_MAX_TTL_SECONDS     3600
-#define QIHSE_AUTH_CACHE_DEFAULT_CAPACITY    256
+#define QIHSE_AUTH_CACHE_MAX_TTL_SECONDS 3600
+#define QIHSE_AUTH_CACHE_DEFAULT_CAPACITY 256
 
 void qihse_auth_cache_configure(uint32_t ttl_seconds, size_t capacity);
 void qihse_auth_cache_clear(void);
 // Hits/misses/stores since process start (stores == misses that then verified).
-void qihse_auth_cache_stats(uint64_t* out_hits, uint64_t* out_misses, uint64_t* out_stores);
+void qihse_auth_cache_stats(uint64_t *out_hits, uint64_t *out_misses,
+                            uint64_t *out_stores);
 
 #ifdef __cplusplus
 }

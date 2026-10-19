@@ -26,121 +26,126 @@
 #endif
 
 #include "qihse_pqc_crypto.h"
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/pem.h>
-#include <openssl/err.h>
-#include <openssl/provider.h>
-#include <openssl/crypto.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <limits.h>
+#include <openssl/crypto.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/provider.h>
+#include <openssl/rand.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#include <time.h>
-#include <pthread.h>
-#include <immintrin.h>
 #include "qihse_cpu_detect.h"
+#include <immintrin.h>
+#include <pthread.h>
+#include <time.h>
 
 #ifndef QIHSE_CPU_FEATURE_RDSEED
 #define QIHSE_CPU_FEATURE_RDSEED (1ULL << 33)
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
-#  if !defined(__RDSEED__)
+#if !defined(__RDSEED__)
 static inline int _rdseed64_step(unsigned long long *val) {
-    unsigned char ok;
-    __asm__ volatile("rdseed %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
-    return (int)ok;
+  unsigned char ok;
+  __asm__ volatile("rdseed %0\n\tsetc %1" : "=r"(*val), "=qm"(ok)::"cc");
+  return (int)ok;
 }
-#  endif
-#  if !defined(__RDRND__)
+#endif
+#if !defined(__RDRND__)
 static inline int _rdrand64_step(unsigned long long *val) {
-    unsigned char ok;
-    __asm__ volatile("rdrand %0\n\tsetc %1" : "=r"(*val), "=qm"(ok) :: "cc");
-    return (int)ok;
+  unsigned char ok;
+  __asm__ volatile("rdrand %0\n\tsetc %1" : "=r"(*val), "=qm"(ok)::"cc");
+  return (int)ok;
 }
-#  endif
-#  if !defined(__FSGSBASE__)
+#endif
+#if !defined(__FSGSBASE__)
 static inline unsigned long long _readfsbase_u64(void) {
-    unsigned long long val;
-    __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a"(val));
-    return val;
+  unsigned long long val;
+  __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a"(val));
+  return val;
 }
-#  endif
+#endif
 #endif
 
 /* ── Provider initialisation ─────────────────────────────────────────── */
 
-static OSSL_PROVIDER *fips_provider    = NULL;
+static OSSL_PROVIDER *fips_provider = NULL;
 static OSSL_PROVIDER *default_provider = NULL;
 
 static void qihse_pqc_inject_hardware_entropy(void) {
 #if defined(__x86_64__) || defined(_M_X64)
-    bool has_rdseed = false;
-    qihse_cpu_info_t cpu = qihse_cpu_detect();
-    if (cpu.features & QIHSE_CPU_FEATURE_RDSEED) {
+  bool has_rdseed = false;
+  qihse_cpu_info_t cpu = qihse_cpu_detect();
+  if (cpu.features & QIHSE_CPU_FEATURE_RDSEED) {
+    has_rdseed = true;
+  } else {
+    /* Fallback direct CPUID leaf 7 subleaf 0 EBX[18] */
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0), "c"(0));
+    if (eax >= 7) {
+      __asm__ volatile("cpuid"
+                       : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                       : "a"(7), "c"(0));
+      if (ebx & (1u << 18)) {
         has_rdseed = true;
-    } else {
-        /* Fallback direct CPUID leaf 7 subleaf 0 EBX[18] */
-        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
-        if (eax >= 7) {
-            __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
-            if (ebx & (1u << 18)) {
-                has_rdseed = true;
-            }
-        }
+      }
+    }
+  }
+
+  if (!has_rdseed) {
+    return;
+  }
+
+  uint64_t entropy_buf[8]; /* 64 bytes = 512 bits */
+  for (int i = 0; i < 8; i++) {
+    unsigned long long rdseed_val = 0;
+    for (int retry = 0; retry < 32; retry++) {
+      if (_rdseed64_step(&rdseed_val)) {
+        break;
+      }
+      _mm_pause();
     }
 
-    if (!has_rdseed) {
-        return;
+    unsigned long long rdrand_val = 0;
+    for (int retry = 0; retry < 10; retry++) {
+      if (_rdrand64_step(&rdrand_val)) {
+        break;
+      }
+      _mm_pause();
     }
 
-    uint64_t entropy_buf[8]; /* 64 bytes = 512 bits */
-    for (int i = 0; i < 8; i++) {
-        unsigned long long rdseed_val = 0;
-        for (int retry = 0; retry < 32; retry++) {
-            if (_rdseed64_step(&rdseed_val)) {
-                break;
-            }
-            _mm_pause();
-        }
-
-        unsigned long long rdrand_val = 0;
-        for (int retry = 0; retry < 10; retry++) {
-            if (_rdrand64_step(&rdrand_val)) {
-                break;
-            }
-            _mm_pause();
-        }
-
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t clock_entropy = ((uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32)) ^ (uint64_t)(uintptr_t)&ts;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t clock_entropy =
+        ((uint64_t)ts.tv_sec ^ ((uint64_t)ts.tv_nsec << 32)) ^
+        (uint64_t)(uintptr_t)&ts;
 
 #if defined(__FSGSBASE__) || defined(QIHSE_ENABLE_FSGSBASE)
-        uint64_t fsbase = _readfsbase_u64();
+    uint64_t fsbase = _readfsbase_u64();
 #else
-        uint64_t fsbase = (uint64_t)(uintptr_t)pthread_self();
+    uint64_t fsbase = (uint64_t)(uintptr_t)pthread_self();
 #endif
-        uint64_t mixed = rdseed_val ^ (uint64_t)rdrand_val ^ clock_entropy ^ fsbase;
-        /* SplitMix64 whitening */
-        mixed ^= (mixed >> 30);
-        mixed *= 0xbf58476d1ce4e5b9ULL;
-        mixed ^= (mixed >> 27);
-        mixed *= 0x94d049bb133111ebULL;
-        mixed ^= (mixed >> 31);
+    uint64_t mixed = rdseed_val ^ (uint64_t)rdrand_val ^ clock_entropy ^ fsbase;
+    /* SplitMix64 whitening */
+    mixed ^= (mixed >> 30);
+    mixed *= 0xbf58476d1ce4e5b9ULL;
+    mixed ^= (mixed >> 27);
+    mixed *= 0x94d049bb133111ebULL;
+    mixed ^= (mixed >> 31);
 
-        entropy_buf[i] = mixed;
-    }
+    entropy_buf[i] = mixed;
+  }
 
-    RAND_add(entropy_buf, sizeof(entropy_buf), 64.0);
-    OPENSSL_cleanse(entropy_buf, sizeof(entropy_buf));
+  RAND_add(entropy_buf, sizeof(entropy_buf), 64.0);
+  OPENSSL_cleanse(entropy_buf, sizeof(entropy_buf));
 #endif
 }
 
@@ -152,371 +157,407 @@ static void qihse_pqc_inject_hardware_entropy(void) {
  * back to the standard default provider.
  */
 int qihse_pqc_init_providers(void) {
-    int ret = 0;
-    fips_provider = OSSL_PROVIDER_load(NULL, "fips");
-    if (fips_provider) {
-        /* Also load default so non-FIPS ops (e.g. rand seeding) still work */
-        default_provider = OSSL_PROVIDER_load(NULL, "default");
-        fprintf(stderr,
+  int ret = 0;
+  fips_provider = OSSL_PROVIDER_load(NULL, "fips");
+  if (fips_provider) {
+    /* Also load default so non-FIPS ops (e.g. rand seeding) still work */
+    default_provider = OSSL_PROVIDER_load(NULL, "default");
+    fprintf(stderr,
             "[QIHSE PQC] FIPS 140-3 validated provider active "
             "(OpenSSL FIPS %s).\n",
             OSSL_PROVIDER_get0_name(fips_provider));
-        ret = 1;
-    } else {
-        /* FIPS module not installed — fall back to standard provider */
-        default_provider = OSSL_PROVIDER_load(NULL, "default");
-        fprintf(stderr,
-            "[QIHSE PQC] FIPS provider not found; using standard OpenSSL provider.\n"
-            "            Install openssl-provider-fips for FIPS 140-3 validated operations.\n");
-        ret = 0;
-    }
+    ret = 1;
+  } else {
+    /* FIPS module not installed — fall back to standard provider */
+    default_provider = OSSL_PROVIDER_load(NULL, "default");
+    fprintf(stderr, "[QIHSE PQC] FIPS provider not found; using standard "
+                    "OpenSSL provider.\n"
+                    "            Install openssl-provider-fips for FIPS 140-3 "
+                    "validated operations.\n");
+    ret = 0;
+  }
 
-    /* NIST SP 800-90B/C compliant RDSEED physical quantum entropy injection */
-    qihse_pqc_inject_hardware_entropy();
+  /* NIST SP 800-90B/C compliant RDSEED physical quantum entropy injection */
+  qihse_pqc_inject_hardware_entropy();
 
-    return ret;
+  return ret;
 }
 
 /* ── Internal key helpers ────────────────────────────────────────────── */
 
 static EVP_PKEY *load_private_key(const char *path) {
-    FILE *f = NULL;
+  FILE *f = NULL;
 #ifndef _WIN32
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) {
-        fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
-        return NULL;
-    }
-    f = fdopen(fd, "r");
-    if (!f) { close(fd); return NULL; }
+  int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  if (fd < 0) {
+    fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
+    return NULL;
+  }
+  f = fdopen(fd, "r");
+  if (!f) {
+    close(fd);
+    return NULL;
+  }
 #else
-    f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
-        return NULL;
-    }
+  f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "[QIHSE PQC] Cannot open private key: %s\n", path);
+    return NULL;
+  }
 #endif
-    EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
-    fclose(f);
-    if (!pkey) {
-        fprintf(stderr, "[QIHSE PQC] Failed to parse private key: %s\n", path);
-        ERR_print_errors_fp(stderr);
-    }
-    return pkey;
+  EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+  fclose(f);
+  if (!pkey) {
+    fprintf(stderr, "[QIHSE PQC] Failed to parse private key: %s\n", path);
+    ERR_print_errors_fp(stderr);
+  }
+  return pkey;
 }
 
 static EVP_PKEY *load_public_key(const char *path) {
-    FILE *f = NULL;
+  FILE *f = NULL;
 #ifndef _WIN32
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) {
-        fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
-        return NULL;
-    }
-    f = fdopen(fd, "r");
-    if (!f) { close(fd); return NULL; }
+  int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  if (fd < 0) {
+    fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
+    return NULL;
+  }
+  f = fdopen(fd, "r");
+  if (!f) {
+    close(fd);
+    return NULL;
+  }
 #else
-    f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
-        return NULL;
-    }
+  f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "[QIHSE PQC] Cannot open public key: %s\n", path);
+    return NULL;
+  }
 #endif
-    EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
-    fclose(f);
-    if (!pkey) {
-        fprintf(stderr, "[QIHSE PQC] Failed to parse public key: %s\n", path);
-        ERR_print_errors_fp(stderr);
-    }
-    return pkey;
+  EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
+  fclose(f);
+  if (!pkey) {
+    fprintf(stderr, "[QIHSE PQC] Failed to parse public key: %s\n", path);
+    ERR_print_errors_fp(stderr);
+  }
+  return pkey;
 }
 
 /* ── ML-KEM-1024 key encapsulation ───────────────────────────────────── */
 
 static bool pqc_encapsulate_with_key(qihse_pqc_ctx_t *ctx, EVP_PKEY *pub_key,
                                      uint8_t *encapsulated_key_out) {
-    bool ok = false;
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pub_key, NULL);
-    if (pctx && EVP_PKEY_encapsulate_init(pctx, NULL) > 0) {
-        uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
-        size_t ct_len  = QIHSE_MLKEM_CIPHERTEXT_SIZE;
-        size_t ss_len  = sizeof(shared_secret);
+  bool ok = false;
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pub_key, NULL);
+  if (pctx && EVP_PKEY_encapsulate_init(pctx, NULL) > 0) {
+    uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
+    size_t ct_len = QIHSE_MLKEM_CIPHERTEXT_SIZE;
+    size_t ss_len = sizeof(shared_secret);
 
-        if (EVP_PKEY_encapsulate(pctx,
-                                 encapsulated_key_out, &ct_len,
-                                 shared_secret, &ss_len) > 0
-            && ct_len == QIHSE_MLKEM_CIPHERTEXT_SIZE
-            && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
-            memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
-            OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-            ctx->initialized = true;
-            ok = true;
-        } else {
-            ERR_print_errors_fp(stderr);
-        }
-        EVP_PKEY_CTX_free(pctx);
+    if (EVP_PKEY_encapsulate(pctx, encapsulated_key_out, &ct_len, shared_secret,
+                             &ss_len) > 0 &&
+        ct_len == QIHSE_MLKEM_CIPHERTEXT_SIZE &&
+        ss_len == QIHSE_MLKEM_SHARED_SIZE) {
+      memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
+      OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+      ctx->initialized = true;
+      ok = true;
+    } else {
+      ERR_print_errors_fp(stderr);
     }
-    return ok;
+    EVP_PKEY_CTX_free(pctx);
+  }
+  return ok;
 }
 
 static bool pqc_decapsulate_with_key(qihse_pqc_ctx_t *ctx, EVP_PKEY *priv_key,
                                      const uint8_t *encapsulated_key_in) {
-    bool ok = false;
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv_key, NULL);
-    if (pctx && EVP_PKEY_decapsulate_init(pctx, NULL) > 0) {
-        uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
-        size_t ss_len = sizeof(shared_secret);
+  bool ok = false;
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv_key, NULL);
+  if (pctx && EVP_PKEY_decapsulate_init(pctx, NULL) > 0) {
+    uint8_t shared_secret[QIHSE_MLKEM_SHARED_SIZE];
+    size_t ss_len = sizeof(shared_secret);
 
-        if (EVP_PKEY_decapsulate(pctx,
-                                 shared_secret, &ss_len,
-                                 encapsulated_key_in,
-                                 QIHSE_MLKEM_CIPHERTEXT_SIZE) > 0
-            && ss_len == QIHSE_MLKEM_SHARED_SIZE) {
-            memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
-            OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-            ctx->initialized = true;
-            ok = true;
-        } else {
-            ERR_print_errors_fp(stderr);
-        }
-        EVP_PKEY_CTX_free(pctx);
+    if (EVP_PKEY_decapsulate(pctx, shared_secret, &ss_len, encapsulated_key_in,
+                             QIHSE_MLKEM_CIPHERTEXT_SIZE) > 0 &&
+        ss_len == QIHSE_MLKEM_SHARED_SIZE) {
+      memcpy(ctx->aes_key, shared_secret, QIHSE_AES_256_KEY_SIZE);
+      OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+      ctx->initialized = true;
+      ok = true;
+    } else {
+      ERR_print_errors_fp(stderr);
     }
-    return ok;
+    EVP_PKEY_CTX_free(pctx);
+  }
+  return ok;
 }
 
-bool qihse_pqc_init(qihse_pqc_ctx_t *ctx,
-                    const uint8_t *encapsulated_key_in,
+bool qihse_pqc_init(qihse_pqc_ctx_t *ctx, const uint8_t *encapsulated_key_in,
                     uint8_t *encapsulated_key_out) {
-    if (!ctx) return false;
-    ctx->initialized = false;
-
-    if (encapsulated_key_in == NULL && encapsulated_key_out != NULL) {
-        /*
-         * Encapsulate path: generate a fresh session key under the server's
-         * static public key (at-rest AES key wrapping).
-         */
-        EVP_PKEY *pub_key = load_public_key(QIHSE_KEM_PUB_PATH());
-        if (!pub_key) return false;
-        bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
-        EVP_PKEY_free(pub_key);
-        return ok;
-
-    } else if (encapsulated_key_in != NULL) {
-        /*
-         * Decapsulate path: recover the session key from a stored ciphertext
-         * with the server's static private key.
-         */
-        EVP_PKEY *priv_key = load_private_key(QIHSE_KEM_KEY_PATH());
-        if (!priv_key) return false;
-        bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
-        EVP_PKEY_free(priv_key);
-        return ok;
-    }
-
+  if (!ctx)
     return false;
+  ctx->initialized = false;
+
+  if (encapsulated_key_in == NULL && encapsulated_key_out != NULL) {
+    /*
+     * Encapsulate path: generate a fresh session key under the server's
+     * static public key (at-rest AES key wrapping).
+     */
+    EVP_PKEY *pub_key = load_public_key(QIHSE_KEM_PUB_PATH());
+    if (!pub_key)
+      return false;
+    bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
+    EVP_PKEY_free(pub_key);
+    return ok;
+
+  } else if (encapsulated_key_in != NULL) {
+    /*
+     * Decapsulate path: recover the session key from a stored ciphertext
+     * with the server's static private key.
+     */
+    EVP_PKEY *priv_key = load_private_key(QIHSE_KEM_KEY_PATH());
+    if (!priv_key)
+      return false;
+    bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
+    EVP_PKEY_free(priv_key);
+    return ok;
+  }
+
+  return false;
 }
 
 bool qihse_pqc_encapsulate_peer(qihse_pqc_ctx_t *ctx,
                                 const char *peer_public_key_path,
                                 uint8_t *encapsulated_key_out) {
-    if (!ctx || !peer_public_key_path || !encapsulated_key_out) return false;
-    ctx->initialized = false;
-    EVP_PKEY *pub_key = load_public_key(peer_public_key_path);
-    if (!pub_key) return false;
-    bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
-    EVP_PKEY_free(pub_key);
-    return ok;
+  if (!ctx || !peer_public_key_path || !encapsulated_key_out)
+    return false;
+  ctx->initialized = false;
+  EVP_PKEY *pub_key = load_public_key(peer_public_key_path);
+  if (!pub_key)
+    return false;
+  bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
+  EVP_PKEY_free(pub_key);
+  return ok;
 }
 
 bool qihse_pqc_decapsulate_private(qihse_pqc_ctx_t *ctx,
                                    const char *private_key_path,
                                    const uint8_t *encapsulated_key_in) {
-    if (!ctx || !private_key_path || !encapsulated_key_in) return false;
-    ctx->initialized = false;
-    EVP_PKEY *priv_key = load_private_key(private_key_path);
-    if (!priv_key) return false;
-    bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
-    EVP_PKEY_free(priv_key);
-    return ok;
+  if (!ctx || !private_key_path || !encapsulated_key_in)
+    return false;
+  ctx->initialized = false;
+  EVP_PKEY *priv_key = load_private_key(private_key_path);
+  if (!priv_key)
+    return false;
+  bool ok = pqc_decapsulate_with_key(ctx, priv_key, encapsulated_key_in);
+  EVP_PKEY_free(priv_key);
+  return ok;
 }
 
 void qihse_pqc_destroy(qihse_pqc_ctx_t *ctx) {
-    if (!ctx) return;
-    OPENSSL_cleanse(ctx->aes_key, sizeof(ctx->aes_key));
-    ctx->initialized = false;
+  if (!ctx)
+    return;
+  OPENSSL_cleanse(ctx->aes_key, sizeof(ctx->aes_key));
+  ctx->initialized = false;
 }
 
 /* ── AES-256-GCM encrypt/decrypt ─────────────────────────────────────── */
 
-size_t qihse_pqc_encrypt(qihse_pqc_ctx_t *ctx,
-                         const uint8_t *in_data, size_t in_len,
-                         uint8_t *out_buffer) {
-    if (!ctx || !ctx->initialized || !in_data || !out_buffer) return 0;
+size_t qihse_pqc_encrypt(qihse_pqc_ctx_t *ctx, const uint8_t *in_data,
+                         size_t in_len, uint8_t *out_buffer) {
+  if (!ctx || !ctx->initialized || !in_data || !out_buffer)
+    return 0;
 
-    EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
-    if (!cctx) return 0;
+  EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
+  if (!cctx)
+    return 0;
 
-    /* Fresh random 96-bit IV per encryption */
-    uint8_t iv[QIHSE_AES_GCM_IV_SIZE];
-    if (RAND_bytes(iv, sizeof(iv)) != 1) {
-        EVP_CIPHER_CTX_free(cctx);
-        return 0;
-    }
-
-    int len;
-    size_t ciphertext_len = 0;
-
-    if (EVP_EncryptInit_ex(cctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto err;
-    if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(iv), NULL) != 1) goto err;
-    if (EVP_EncryptInit_ex(cctx, NULL, NULL, ctx->aes_key, iv) != 1) goto err;
-
-    /* Output layout: [IV][ciphertext][tag] */
-    memcpy(out_buffer, iv, sizeof(iv));
-    uint8_t *out_ct = out_buffer + sizeof(iv);
-
-    if (EVP_EncryptUpdate(cctx, out_ct, &len, in_data, (int)(in_len > INT_MAX ? INT_MAX : in_len)) != 1) goto err;
-    ciphertext_len = (size_t)len;
-
-    if (EVP_EncryptFinal_ex(cctx, out_ct + len, &len) != 1) goto err;
-    ciphertext_len += (size_t)len;
-
-    if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_GET_TAG, QIHSE_AES_GCM_TAG_SIZE,
-                             out_ct + ciphertext_len) != 1) goto err;
-
-    EVP_CIPHER_CTX_free(cctx);
-    return QIHSE_AES_GCM_IV_SIZE + ciphertext_len + QIHSE_AES_GCM_TAG_SIZE;
-
-err:
-    ERR_print_errors_fp(stderr);
+  /* Fresh random 96-bit IV per encryption */
+  uint8_t iv[QIHSE_AES_GCM_IV_SIZE];
+  if (RAND_bytes(iv, sizeof(iv)) != 1) {
     EVP_CIPHER_CTX_free(cctx);
     return 0;
+  }
+
+  int len;
+  size_t ciphertext_len = 0;
+
+  if (EVP_EncryptInit_ex(cctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+    goto err;
+  if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(iv), NULL) != 1)
+    goto err;
+  if (EVP_EncryptInit_ex(cctx, NULL, NULL, ctx->aes_key, iv) != 1)
+    goto err;
+
+  /* Output layout: [IV][ciphertext][tag] */
+  memcpy(out_buffer, iv, sizeof(iv));
+  uint8_t *out_ct = out_buffer + sizeof(iv);
+
+  if (EVP_EncryptUpdate(cctx, out_ct, &len, in_data,
+                        (int)(in_len > INT_MAX ? INT_MAX : in_len)) != 1)
+    goto err;
+  ciphertext_len = (size_t)len;
+
+  if (EVP_EncryptFinal_ex(cctx, out_ct + len, &len) != 1)
+    goto err;
+  ciphertext_len += (size_t)len;
+
+  if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_GET_TAG, QIHSE_AES_GCM_TAG_SIZE,
+                          out_ct + ciphertext_len) != 1)
+    goto err;
+
+  EVP_CIPHER_CTX_free(cctx);
+  return QIHSE_AES_GCM_IV_SIZE + ciphertext_len + QIHSE_AES_GCM_TAG_SIZE;
+
+err:
+  ERR_print_errors_fp(stderr);
+  EVP_CIPHER_CTX_free(cctx);
+  return 0;
 }
 
-size_t qihse_pqc_decrypt(qihse_pqc_ctx_t *ctx,
-                         const uint8_t *in_data, size_t in_len,
-                         uint8_t *out_buffer) {
-    if (!ctx || !ctx->initialized || !in_data || !out_buffer) return 0;
-    if (in_len <= QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE) return 0;
-    if (in_len > (size_t)INT_MAX + QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE) return 0;
+size_t qihse_pqc_decrypt(qihse_pqc_ctx_t *ctx, const uint8_t *in_data,
+                         size_t in_len, uint8_t *out_buffer) {
+  if (!ctx || !ctx->initialized || !in_data || !out_buffer)
+    return 0;
+  if (in_len <= QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE)
+    return 0;
+  if (in_len > (size_t)INT_MAX + QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE)
+    return 0;
 
-    const uint8_t *iv         = in_data;
-    const uint8_t *ciphertext = in_data + QIHSE_AES_GCM_IV_SIZE;
-    size_t ct_len             = in_len - QIHSE_AES_GCM_IV_SIZE - QIHSE_AES_GCM_TAG_SIZE;
-    const uint8_t *tag        = ciphertext + ct_len;
+  const uint8_t *iv = in_data;
+  const uint8_t *ciphertext = in_data + QIHSE_AES_GCM_IV_SIZE;
+  size_t ct_len = in_len - QIHSE_AES_GCM_IV_SIZE - QIHSE_AES_GCM_TAG_SIZE;
+  const uint8_t *tag = ciphertext + ct_len;
 
-    EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
-    if (!cctx) return 0;
+  EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
+  if (!cctx)
+    return 0;
 
-    int len;
-    size_t plaintext_len = 0;
+  int len;
+  size_t plaintext_len = 0;
 
-    if (EVP_DecryptInit_ex(cctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto err;
-    if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, QIHSE_AES_GCM_IV_SIZE, NULL) != 1) goto err;
-    if (EVP_DecryptInit_ex(cctx, NULL, NULL, ctx->aes_key, iv) != 1) goto err;
+  if (EVP_DecryptInit_ex(cctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+    goto err;
+  if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, QIHSE_AES_GCM_IV_SIZE,
+                          NULL) != 1)
+    goto err;
+  if (EVP_DecryptInit_ex(cctx, NULL, NULL, ctx->aes_key, iv) != 1)
+    goto err;
 
-    if (EVP_DecryptUpdate(cctx, out_buffer, &len, ciphertext, (int)ct_len) != 1) goto err;
-    plaintext_len = (size_t)len;
+  if (EVP_DecryptUpdate(cctx, out_buffer, &len, ciphertext, (int)ct_len) != 1)
+    goto err;
+  plaintext_len = (size_t)len;
 
-    if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_TAG, QIHSE_AES_GCM_TAG_SIZE,
-                             (void *)tag) != 1) goto err;
+  if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_TAG, QIHSE_AES_GCM_TAG_SIZE,
+                          (void *)tag) != 1)
+    goto err;
 
-    if (EVP_DecryptFinal_ex(cctx, out_buffer + len, &len) <= 0) {
-        /* GCM authentication tag mismatch — data integrity failure */
-        fprintf(stderr, "[QIHSE PQC] AES-256-GCM authentication failure.\n");
-        goto err;
-    }
-    plaintext_len += (size_t)len;
+  if (EVP_DecryptFinal_ex(cctx, out_buffer + len, &len) <= 0) {
+    /* GCM authentication tag mismatch — data integrity failure */
+    fprintf(stderr, "[QIHSE PQC] AES-256-GCM authentication failure.\n");
+    goto err;
+  }
+  plaintext_len += (size_t)len;
 
-    EVP_CIPHER_CTX_free(cctx);
-    return plaintext_len;
+  EVP_CIPHER_CTX_free(cctx);
+  return plaintext_len;
 
 err:
-    EVP_CIPHER_CTX_free(cctx);
-    return 0;
+  EVP_CIPHER_CTX_free(cctx);
+  return 0;
 }
 
 /* ── ML-DSA-87 sign/verify ───────────────────────────────────────────── */
 
-static bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
-                                      const uint8_t *sig, EVP_PKEY *pub_key);
+bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
+                               const uint8_t *sig, EVP_PKEY *pub_key);
 
 bool qihse_pqc_sign(const uint8_t *data, size_t len, uint8_t *out_sig) {
-    return qihse_pqc_sign_path(data, len, out_sig, NULL);
+  return qihse_pqc_sign_path(data, len, out_sig, NULL);
 }
 
 bool qihse_pqc_sign_path(const uint8_t *data, size_t len, uint8_t *out_sig,
                          const char *private_key_path) {
-    if (!data || !out_sig) return false;
-    EVP_PKEY *priv_key = load_private_key(private_key_path ? private_key_path
-                                                           : QIHSE_DSA_KEY_PATH());
-    if (!priv_key) return false;
+  if (!data || !out_sig)
+    return false;
+  EVP_PKEY *priv_key = load_private_key(
+      private_key_path ? private_key_path : QIHSE_DSA_KEY_PATH());
+  if (!priv_key)
+    return false;
 
-    bool ok = false;
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    if (mctx) {
-        if (EVP_DigestSignInit(mctx, NULL, NULL, NULL, priv_key) > 0) {
-            size_t siglen = QIHSE_MLDSA_SIGNATURE_SIZE;
-            if (EVP_DigestSign(mctx, out_sig, &siglen, data, len) > 0) {
-                ok = true;
-            } else {
-                ERR_print_errors_fp(stderr);
-            }
-        }
-        EVP_MD_CTX_free(mctx);
+  bool ok = false;
+  EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+  if (mctx) {
+    if (EVP_DigestSignInit(mctx, NULL, NULL, NULL, priv_key) > 0) {
+      size_t siglen = QIHSE_MLDSA_SIGNATURE_SIZE;
+      if (EVP_DigestSign(mctx, out_sig, &siglen, data, len) > 0) {
+        ok = true;
+      } else {
+        ERR_print_errors_fp(stderr);
+      }
     }
-    EVP_PKEY_free(priv_key);
-    return ok;
+    EVP_MD_CTX_free(mctx);
+  }
+  EVP_PKEY_free(priv_key);
+  return ok;
 }
 
 bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
                                const uint8_t *sig, EVP_PKEY *pub_key) {
-    if (!data || !sig || !pub_key) return false;
-    bool ok = false;
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    if (mctx) {
-        if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pub_key) > 0) {
-            /* ML-DSA-87 signatures are fixed-length; tolerate the rare
-             * variable-length encoding by trusting the parameter, not the
-             * constant, when the caller passes a real length. */
-            size_t sig_len = QIHSE_MLDSA_SIGNATURE_SIZE;
-            if (EVP_DigestVerify(mctx, sig, sig_len, data, len) == 1) ok = true;
-        }
-        EVP_MD_CTX_free(mctx);
+  if (!data || !sig || !pub_key)
+    return false;
+  bool ok = false;
+  EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+  if (mctx) {
+    if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pub_key) > 0) {
+      /* ML-DSA-87 signatures are fixed-length; tolerate the rare
+       * variable-length encoding by trusting the parameter, not the
+       * constant, when the caller passes a real length. */
+      size_t sig_len = QIHSE_MLDSA_SIGNATURE_SIZE;
+      if (EVP_DigestVerify(mctx, sig, sig_len, data, len) == 1)
+        ok = true;
     }
-    return ok;
+    EVP_MD_CTX_free(mctx);
+  }
+  return ok;
 }
 
 bool qihse_pqc_verify(const uint8_t *data, size_t len, const uint8_t *sig) {
-    EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUB_PATH());
-    if (!pub_key) return false;
-    bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
-    EVP_PKEY_free(pub_key);
-    return ok;
+  EVP_PKEY *pub_key = load_public_key(QIHSE_DSA_PUB_PATH());
+  if (!pub_key)
+    return false;
+  bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
+  EVP_PKEY_free(pub_key);
+  return ok;
 }
 
-bool qihse_pqc_verify_path(const uint8_t *data, size_t len,
-                           const uint8_t *sig, const char *public_key_path) {
-    EVP_PKEY *pub_key = load_public_key(public_key_path ? public_key_path
-                                                        : QIHSE_DSA_PUB_PATH());
-    if (!pub_key) return false;
-    bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
-    EVP_PKEY_free(pub_key);
-    return ok;
+bool qihse_pqc_verify_path(const uint8_t *data, size_t len, const uint8_t *sig,
+                           const char *public_key_path) {
+  EVP_PKEY *pub_key =
+      load_public_key(public_key_path ? public_key_path : QIHSE_DSA_PUB_PATH());
+  if (!pub_key)
+    return false;
+  bool ok = qihse_pqc_verify_with_key(data, len, sig, pub_key);
+  EVP_PKEY_free(pub_key);
+  return ok;
 }
 
-bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t *ctx,
-                               const uint8_t *pem_data, size_t pem_len,
-                               uint8_t *encapsulated_key_out) {
-    if (!ctx || !pem_data || pem_len == 0 || !encapsulated_key_out) return false;
-    ctx->initialized = false;
-    BIO *bio = BIO_new_mem_buf((const void *)pem_data, (int)pem_len);
-    if (!bio) return false;
-    EVP_PKEY *pub_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (!pub_key) return false;
-    bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
-    EVP_PKEY_free(pub_key);
-    return ok;
+bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t *ctx, const uint8_t *pem_data,
+                               size_t pem_len, uint8_t *encapsulated_key_out) {
+  if (!ctx || !pem_data || pem_len == 0 || !encapsulated_key_out)
+    return false;
+  ctx->initialized = false;
+  BIO *bio = BIO_new_mem_buf((const void *)pem_data, (int)pem_len);
+  if (!bio)
+    return false;
+  EVP_PKEY *pub_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+  BIO_free(bio);
+  if (!pub_key)
+    return false;
+  bool ok = pqc_encapsulate_with_key(ctx, pub_key, encapsulated_key_out);
+  EVP_PKEY_free(pub_key);
+  return ok;
 }
 
 /* ── Native key generation ───────────────────────────────────────────── */
@@ -526,123 +567,147 @@ bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t *ctx,
  * private + public PEM files into out_dir.
  * Returns true on success.
  */
-static bool write_keypair(const char *algorithm,
-                          const char *priv_path,
+static bool write_keypair(const char *algorithm, const char *priv_path,
                           const char *pub_path) {
-    EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, algorithm);
-    if (!pkey) {
-        fprintf(stderr, "[QIHSE keygen] Failed to generate %s keypair.\n", algorithm);
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
+  EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, algorithm);
+  if (!pkey) {
+    fprintf(stderr, "[QIHSE keygen] Failed to generate %s keypair.\n",
+            algorithm);
+    ERR_print_errors_fp(stderr);
+    return false;
+  }
 
-    /* Private key: create with mode 0600 directly to avoid world-readable TOCTOU window */
-    int priv_fd = open(priv_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (priv_fd < 0) {
-        fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", priv_path);
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-    FILE *f = fdopen(priv_fd, "w");
-    if (!f) {
-        close(priv_fd);
-        fprintf(stderr, "[QIHSE keygen] Cannot stream %s\n", priv_path);
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-    bool ok = (PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL) == 1);
-    fclose(f);
-    if (!ok) {
-        fprintf(stderr, "[QIHSE keygen] Failed to write private key %s\n", priv_path);
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-
-    /* Public key */
-    f = fopen(pub_path, "w");
-    if (!f) {
-        fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", pub_path);
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-    ok = (PEM_write_PUBKEY(f, pkey) == 1);
-    fclose(f);
-    if (!ok) {
-        fprintf(stderr, "[QIHSE keygen] Failed to write public key %s\n", pub_path);
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-
+  /* Private key: create with mode 0600 directly to avoid world-readable TOCTOU
+   * window */
+  int priv_fd = open(priv_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (priv_fd < 0) {
+    fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", priv_path);
     EVP_PKEY_free(pkey);
-    return true;
+    return false;
+  }
+  FILE *f = fdopen(priv_fd, "w");
+  if (!f) {
+    close(priv_fd);
+    fprintf(stderr, "[QIHSE keygen] Cannot stream %s\n", priv_path);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+  bool ok = (PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL) == 1);
+  fclose(f);
+  if (!ok) {
+    fprintf(stderr, "[QIHSE keygen] Failed to write private key %s\n",
+            priv_path);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+
+  /* Public key */
+  f = fopen(pub_path, "w");
+  if (!f) {
+    fprintf(stderr, "[QIHSE keygen] Cannot write %s\n", pub_path);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+  ok = (PEM_write_PUBKEY(f, pkey) == 1);
+  fclose(f);
+  if (!ok) {
+    fprintf(stderr, "[QIHSE keygen] Failed to write public key %s\n", pub_path);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+
+  EVP_PKEY_free(pkey);
+  return true;
 }
 
 /* Verify ML-KEM-1024 encapsulate→decapsulate round-trip. */
 static bool verify_kem_roundtrip(const char *priv_path, const char *pub_path) {
-    EVP_PKEY *pub  = load_public_key(pub_path);
-    EVP_PKEY *priv = load_private_key(priv_path);
-    if (!pub || !priv) { EVP_PKEY_free(pub); EVP_PKEY_free(priv); return false; }
+  EVP_PKEY *pub = load_public_key(pub_path);
+  EVP_PKEY *priv = load_private_key(priv_path);
+  if (!pub || !priv) {
+    EVP_PKEY_free(pub);
+    EVP_PKEY_free(priv);
+    return false;
+  }
 
-    bool ok = false;
+  bool ok = false;
 
-    /* Encapsulate */
-    EVP_PKEY_CTX *ectx = EVP_PKEY_CTX_new_from_pkey(NULL, pub, NULL);
-    if (!ectx || EVP_PKEY_encapsulate_init(ectx, NULL) <= 0) goto kem_done;
+  /* Encapsulate */
+  EVP_PKEY_CTX *ectx = EVP_PKEY_CTX_new_from_pkey(NULL, pub, NULL);
+  if (!ectx || EVP_PKEY_encapsulate_init(ectx, NULL) <= 0)
+    goto kem_done;
 
-    size_t ct_len = 0, ss_enc_len = 0;
-    EVP_PKEY_encapsulate(ectx, NULL, &ct_len, NULL, &ss_enc_len);
+  size_t ct_len = 0, ss_enc_len = 0;
+  EVP_PKEY_encapsulate(ectx, NULL, &ct_len, NULL, &ss_enc_len);
 
-    uint8_t *ct     = malloc(ct_len);
-    uint8_t *ss_enc = malloc(ss_enc_len);
-    uint8_t *ss_dec = malloc(ss_enc_len);
-    if (!ct || !ss_enc || !ss_dec) goto kem_mem;
+  uint8_t *ct = malloc(ct_len);
+  uint8_t *ss_enc = malloc(ss_enc_len);
+  uint8_t *ss_dec = malloc(ss_enc_len);
+  if (!ct || !ss_enc || !ss_dec)
+    goto kem_mem;
 
-    if (EVP_PKEY_encapsulate(ectx, ct, &ct_len, ss_enc, &ss_enc_len) <= 0) goto kem_mem;
+  if (EVP_PKEY_encapsulate(ectx, ct, &ct_len, ss_enc, &ss_enc_len) <= 0)
+    goto kem_mem;
 
-    /* Decapsulate */
-    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv, NULL);
-    size_t ss_dec_len = ss_enc_len;
-    if (!dctx || EVP_PKEY_decapsulate_init(dctx, NULL) <= 0) { EVP_PKEY_CTX_free(dctx); goto kem_mem; }
-    if (EVP_PKEY_decapsulate(dctx, ss_dec, &ss_dec_len, ct, ct_len) <= 0) { EVP_PKEY_CTX_free(dctx); goto kem_mem; }
+  /* Decapsulate */
+  EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new_from_pkey(NULL, priv, NULL);
+  size_t ss_dec_len = ss_enc_len;
+  if (!dctx || EVP_PKEY_decapsulate_init(dctx, NULL) <= 0) {
     EVP_PKEY_CTX_free(dctx);
+    goto kem_mem;
+  }
+  if (EVP_PKEY_decapsulate(dctx, ss_dec, &ss_dec_len, ct, ct_len) <= 0) {
+    EVP_PKEY_CTX_free(dctx);
+    goto kem_mem;
+  }
+  EVP_PKEY_CTX_free(dctx);
 
-    ok = (ss_enc_len == ss_dec_len &&
-          CRYPTO_memcmp(ss_enc, ss_dec, ss_enc_len) == 0);
+  ok = (ss_enc_len == ss_dec_len &&
+        CRYPTO_memcmp(ss_enc, ss_dec, ss_enc_len) == 0);
 
 kem_mem:
-    OPENSSL_cleanse(ss_enc, ss_enc_len);
-    OPENSSL_cleanse(ss_dec, ss_dec_len);
-    free(ct); free(ss_enc); free(ss_dec);
+  OPENSSL_cleanse(ss_enc, ss_enc_len);
+  OPENSSL_cleanse(ss_dec, ss_dec_len);
+  free(ct);
+  free(ss_enc);
+  free(ss_dec);
 kem_done:
-    EVP_PKEY_CTX_free(ectx);
-    EVP_PKEY_free(pub); EVP_PKEY_free(priv);
-    return ok;
+  EVP_PKEY_CTX_free(ectx);
+  EVP_PKEY_free(pub);
+  EVP_PKEY_free(priv);
+  return ok;
 }
 
 /* Verify ML-DSA-87 sign→verify round-trip. */
 static bool verify_dsa_roundtrip(const char *priv_path, const char *pub_path) {
-    EVP_PKEY *priv = load_private_key(priv_path);
-    EVP_PKEY *pub  = load_public_key(pub_path);
-    if (!priv || !pub) { EVP_PKEY_free(priv); EVP_PKEY_free(pub); return false; }
+  EVP_PKEY *priv = load_private_key(priv_path);
+  EVP_PKEY *pub = load_public_key(pub_path);
+  if (!priv || !pub) {
+    EVP_PKEY_free(priv);
+    EVP_PKEY_free(pub);
+    return false;
+  }
 
-    const uint8_t test_msg[] = "qihse-cnsa-2.0-selftest";
-    uint8_t sig[QIHSE_MLDSA_SIGNATURE_SIZE];
-    bool ok = false;
+  const uint8_t test_msg[] = "qihse-cnsa-2.0-selftest";
+  uint8_t sig[QIHSE_MLDSA_SIGNATURE_SIZE];
+  bool ok = false;
 
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    if (mctx && EVP_DigestSignInit(mctx, NULL, NULL, NULL, priv) > 0) {
-        size_t siglen = sizeof(sig);
-        if (EVP_DigestSign(mctx, sig, &siglen, test_msg, sizeof(test_msg) - 1) > 0) {
-            EVP_MD_CTX_reset(mctx);
-            if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pub) > 0) {
-                ok = (EVP_DigestVerify(mctx, sig, siglen,
-                                       test_msg, sizeof(test_msg) - 1) == 1);
-            }
-        }
+  EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+  if (mctx && EVP_DigestSignInit(mctx, NULL, NULL, NULL, priv) > 0) {
+    size_t siglen = sizeof(sig);
+    if (EVP_DigestSign(mctx, sig, &siglen, test_msg, sizeof(test_msg) - 1) >
+        0) {
+      EVP_MD_CTX_reset(mctx);
+      if (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pub) > 0) {
+        ok = (EVP_DigestVerify(mctx, sig, siglen, test_msg,
+                               sizeof(test_msg) - 1) == 1);
+      }
     }
-    EVP_MD_CTX_free(mctx);
-    EVP_PKEY_free(priv); EVP_PKEY_free(pub);
-    return ok;
+  }
+  EVP_MD_CTX_free(mctx);
+  EVP_PKEY_free(priv);
+  EVP_PKEY_free(pub);
+  return ok;
 }
 
 /*
@@ -661,46 +726,50 @@ static bool verify_dsa_roundtrip(const char *priv_path, const char *pub_path) {
  * available the keys are generated through the validated module.
  */
 bool qihse_pqc_keygen(const char *out_dir) {
-    if (!out_dir) out_dir = ".";
+  if (!out_dir)
+    out_dir = ".";
 
-    /* Build file paths under out_dir (the resolver macros ignore the
-     * caller's directory, which made keygen stomp the live key dir). */
-    char kem_priv[4096], kem_pub[4096], dsa_priv[4096], dsa_pub[4096];
-    snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, "qihse_kem_key.pem");
-    snprintf(kem_pub,  sizeof(kem_pub),  "%s/%s", out_dir, "qihse_kem_pub.pem");
-    snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, "qihse_dsa_key.pem");
-    snprintf(dsa_pub,  sizeof(dsa_pub),  "%s/%s", out_dir, "qihse_dsa_pub.pem");
+  /* Build file paths under out_dir (the resolver macros ignore the
+   * caller's directory, which made keygen stomp the live key dir). */
+  char kem_priv[4096], kem_pub[4096], dsa_priv[4096], dsa_pub[4096];
+  snprintf(kem_priv, sizeof(kem_priv), "%s/%s", out_dir, "qihse_kem_key.pem");
+  snprintf(kem_pub, sizeof(kem_pub), "%s/%s", out_dir, "qihse_kem_pub.pem");
+  snprintf(dsa_priv, sizeof(dsa_priv), "%s/%s", out_dir, "qihse_dsa_key.pem");
+  snprintf(dsa_pub, sizeof(dsa_pub), "%s/%s", out_dir, "qihse_dsa_pub.pem");
 
-    fprintf(stderr, "[QIHSE keygen] Output directory : %s\n", out_dir);
+  fprintf(stderr, "[QIHSE keygen] Output directory : %s\n", out_dir);
 
-    /* 1. ML-KEM-1024 */
-    fprintf(stderr, "[QIHSE keygen] [1/4] Generating ML-KEM-1024 private key...\n");
-    if (!write_keypair("ML-KEM-1024", kem_priv, kem_pub)) return false;
-    fprintf(stderr, "[QIHSE keygen]       Written: %s\n", kem_priv);
-    fprintf(stderr, "[QIHSE keygen] [2/4] Deriving ML-KEM-1024 public key...\n");
-    fprintf(stderr, "[QIHSE keygen]       Written: %s\n", kem_pub);
+  /* 1. ML-KEM-1024 */
+  fprintf(stderr,
+          "[QIHSE keygen] [1/4] Generating ML-KEM-1024 private key...\n");
+  if (!write_keypair("ML-KEM-1024", kem_priv, kem_pub))
+    return false;
+  fprintf(stderr, "[QIHSE keygen]       Written: %s\n", kem_priv);
+  fprintf(stderr, "[QIHSE keygen] [2/4] Deriving ML-KEM-1024 public key...\n");
+  fprintf(stderr, "[QIHSE keygen]       Written: %s\n", kem_pub);
 
-    /* 2. ML-DSA-87 */
-    fprintf(stderr, "[QIHSE keygen] [3/4] Generating ML-DSA-87 private key...\n");
-    if (!write_keypair("ML-DSA-87", dsa_priv, dsa_pub)) return false;
-    fprintf(stderr, "[QIHSE keygen]       Written: %s\n", dsa_priv);
-    fprintf(stderr, "[QIHSE keygen] [4/4] Deriving ML-DSA-87 public key...\n");
-    fprintf(stderr, "[QIHSE keygen]       Written: %s\n", dsa_pub);
+  /* 2. ML-DSA-87 */
+  fprintf(stderr, "[QIHSE keygen] [3/4] Generating ML-DSA-87 private key...\n");
+  if (!write_keypair("ML-DSA-87", dsa_priv, dsa_pub))
+    return false;
+  fprintf(stderr, "[QIHSE keygen]       Written: %s\n", dsa_priv);
+  fprintf(stderr, "[QIHSE keygen] [4/4] Deriving ML-DSA-87 public key...\n");
+  fprintf(stderr, "[QIHSE keygen]       Written: %s\n", dsa_pub);
 
-    /* 3. Round-trip verification */
-    fprintf(stderr, "[QIHSE keygen] Verifying ML-KEM-1024 round-trip...\n");
-    if (!verify_kem_roundtrip(kem_priv, kem_pub)) {
-        fprintf(stderr, "[QIHSE keygen] FAIL: ML-KEM-1024 round-trip mismatch.\n");
-        return false;
-    }
-    fprintf(stderr, "[QIHSE keygen]       ML-KEM-1024 round-trip: PASS\n");
+  /* 3. Round-trip verification */
+  fprintf(stderr, "[QIHSE keygen] Verifying ML-KEM-1024 round-trip...\n");
+  if (!verify_kem_roundtrip(kem_priv, kem_pub)) {
+    fprintf(stderr, "[QIHSE keygen] FAIL: ML-KEM-1024 round-trip mismatch.\n");
+    return false;
+  }
+  fprintf(stderr, "[QIHSE keygen]       ML-KEM-1024 round-trip: PASS\n");
 
-    fprintf(stderr, "[QIHSE keygen] Verifying ML-DSA-87 round-trip...\n");
-    if (!verify_dsa_roundtrip(dsa_priv, dsa_pub)) {
-        fprintf(stderr, "[QIHSE keygen] FAIL: ML-DSA-87 round-trip mismatch.\n");
-        return false;
-    }
-    fprintf(stderr, "[QIHSE keygen]       ML-DSA-87 round-trip:   PASS\n");
+  fprintf(stderr, "[QIHSE keygen] Verifying ML-DSA-87 round-trip...\n");
+  if (!verify_dsa_roundtrip(dsa_priv, dsa_pub)) {
+    fprintf(stderr, "[QIHSE keygen] FAIL: ML-DSA-87 round-trip mismatch.\n");
+    return false;
+  }
+  fprintf(stderr, "[QIHSE keygen]       ML-DSA-87 round-trip:   PASS\n");
 
-    return true;
+  return true;
 }

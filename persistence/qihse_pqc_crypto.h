@@ -1,22 +1,24 @@
 #ifndef QIHSE_PQC_CRYPTO_H
 #define QIHSE_PQC_CRYPTO_H
 
-#include <stdint.h>
+#include <openssl/evp.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 /* ── Algorithm constants ──────────────────────────────────────────────── */
 
-#define QIHSE_AES_256_KEY_SIZE      32   /* AES-256 key */
-#define QIHSE_AES_GCM_IV_SIZE       12   /* 96-bit IV for AES-256-GCM */
-#define QIHSE_AES_GCM_TAG_SIZE      16   /* 128-bit GCM authentication tag */
+#define QIHSE_AES_256_KEY_SIZE 32 /* AES-256 key */
+#define QIHSE_AES_GCM_IV_SIZE 12  /* 96-bit IV for AES-256-GCM */
+#define QIHSE_AES_GCM_TAG_SIZE 16 /* 128-bit GCM authentication tag */
 
 #define QIHSE_MLKEM_CIPHERTEXT_SIZE 1568 /* ML-KEM-1024 ciphertext */
-#define QIHSE_MLKEM_SHARED_SIZE       32 /* ML-KEM-1024 shared secret (= AES-256 key) */
-#define QIHSE_MLDSA_SIGNATURE_SIZE  4627 /* ML-DSA-87 signature */
+#define QIHSE_MLKEM_SHARED_SIZE                                                \
+  32 /* ML-KEM-1024 shared secret (= AES-256 key) */
+#define QIHSE_MLDSA_SIGNATURE_SIZE 4627 /* ML-DSA-87 signature */
 
 /* ── Key file locations ───────────────────────────────────────────────── */
 
@@ -26,48 +28,53 @@
 
 /* ML-KEM-1024: used for key encapsulation (at-build AES key wrapping).
  * Generate with: scripts/qihse_keygen.sh  */
-#define QIHSE_KEM_PRIVATE_KEY_FILE  QIHSE_KEY_DIR "qihse_kem_key.pem"
-#define QIHSE_KEM_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_kem_pub.pem"
+#define QIHSE_KEM_PRIVATE_KEY_FILE QIHSE_KEY_DIR "qihse_kem_key.pem"
+#define QIHSE_KEM_PUBLIC_KEY_FILE QIHSE_KEY_DIR "qihse_kem_pub.pem"
 
 /* ML-DSA-87: used for signing container manifests and audit log entries.
  * Generate with: scripts/qihse_keygen.sh  */
-#define QIHSE_DSA_PRIVATE_KEY_FILE  QIHSE_KEY_DIR "qihse_dsa_key.pem"
-#define QIHSE_DSA_PUBLIC_KEY_FILE   QIHSE_KEY_DIR "qihse_dsa_pub.pem"
+#define QIHSE_DSA_PRIVATE_KEY_FILE QIHSE_KEY_DIR "qihse_dsa_key.pem"
+#define QIHSE_DSA_PUBLIC_KEY_FILE QIHSE_KEY_DIR "qihse_dsa_pub.pem"
 
-#define QIHSE_TLS_CERT_FILE         QIHSE_KEY_DIR "qihse_dsa_cert.pem"
+#define QIHSE_TLS_CERT_FILE QIHSE_KEY_DIR "qihse_dsa_cert.pem"
 
 /* ── Runtime key path resolver ────────────────────────────────────────── */
 /* Checks QIHSE_KEY_DIR env var at runtime, falling back to the compile-time
  * default.  Returns a pointer to a thread-local static buffer. */
 static inline const char *qihse_resolve_key_path(const char *default_path,
-                                                 const char *filename)
-{
-    const char *env_dir = getenv("QIHSE_KEY_DIR");
-    if (env_dir && env_dir[0]) {
-        static __thread char buf[4096];
-        size_t dlen = strlen(env_dir);
-        /* Ensure exactly one separator between dir and filename */
-        if (dlen > 0 && env_dir[dlen - 1] == '/') {
-            snprintf(buf, sizeof(buf), "%s%s", env_dir, filename);
-        } else {
-            snprintf(buf, sizeof(buf), "%s/%s", env_dir, filename);
-        }
-        return buf;
+                                                 const char *filename) {
+  const char *env_dir = getenv("QIHSE_KEY_DIR");
+  if (env_dir && env_dir[0]) {
+    static __thread char buf[4096];
+    size_t dlen = strlen(env_dir);
+    /* Ensure exactly one separator between dir and filename */
+    if (dlen > 0 && env_dir[dlen - 1] == '/') {
+      snprintf(buf, sizeof(buf), "%s%s", env_dir, filename);
+    } else {
+      snprintf(buf, sizeof(buf), "%s/%s", env_dir, filename);
     }
-    return default_path;
+    return buf;
+  }
+  return default_path;
 }
 
-#define QIHSE_KEM_KEY_PATH()    qihse_resolve_key_path(QIHSE_KEM_PRIVATE_KEY_FILE,  "qihse_kem_key.pem")
-#define QIHSE_KEM_PUB_PATH()    qihse_resolve_key_path(QIHSE_KEM_PUBLIC_KEY_FILE,   "qihse_kem_pub.pem")
-#define QIHSE_DSA_KEY_PATH()    qihse_resolve_key_path(QIHSE_DSA_PRIVATE_KEY_FILE, "qihse_dsa_key.pem")
-#define QIHSE_DSA_PUB_PATH()    qihse_resolve_key_path(QIHSE_DSA_PUBLIC_KEY_FILE,  "qihse_dsa_pub.pem")
-#define QIHSE_TLS_CERT_PATH()   qihse_resolve_key_path(QIHSE_TLS_CERT_FILE,        "qihse_dsa_cert.pem")
+#define QIHSE_KEM_KEY_PATH()                                                   \
+  qihse_resolve_key_path(QIHSE_KEM_PRIVATE_KEY_FILE, "qihse_kem_key.pem")
+#define QIHSE_KEM_PUB_PATH()                                                   \
+  qihse_resolve_key_path(QIHSE_KEM_PUBLIC_KEY_FILE, "qihse_kem_pub.pem")
+#define QIHSE_DSA_KEY_PATH()                                                   \
+  qihse_resolve_key_path(QIHSE_DSA_PRIVATE_KEY_FILE, "qihse_dsa_key.pem")
+#define QIHSE_DSA_PUB_PATH()                                                   \
+  qihse_resolve_key_path(QIHSE_DSA_PUBLIC_KEY_FILE, "qihse_dsa_pub.pem")
+#define QIHSE_TLS_CERT_PATH()                                                  \
+  qihse_resolve_key_path(QIHSE_TLS_CERT_FILE, "qihse_dsa_cert.pem")
 
 /* ── Context ──────────────────────────────────────────────────────────── */
 
 typedef struct {
-    uint8_t aes_key[QIHSE_AES_256_KEY_SIZE]; /* AES-256 session key (zeroed on destroy) */
-    bool initialized;
+  uint8_t aes_key[QIHSE_AES_256_KEY_SIZE]; /* AES-256 session key (zeroed on
+                                              destroy) */
+  bool initialized;
 } qihse_pqc_ctx_t;
 
 #ifdef __cplusplus
@@ -88,9 +95,9 @@ int qihse_pqc_init_providers(void);
  *
  * Encapsulate path (encapsulated_key_in == NULL):
  *   Reads qihse_kem_pub.pem, runs EVP_PKEY_encapsulate() to generate a fresh
- *   ML-KEM ciphertext and 32-byte shared secret. The shared secret IS the AES-256
- *   session key. Writes the ciphertext to encapsulated_key_out
- *   (must be QIHSE_MLKEM_CIPHERTEXT_SIZE bytes).
+ *   ML-KEM ciphertext and 32-byte shared secret. The shared secret IS the
+ * AES-256 session key. Writes the ciphertext to encapsulated_key_out (must be
+ * QIHSE_MLKEM_CIPHERTEXT_SIZE bytes).
  *
  * Decapsulate path (encapsulated_key_in != NULL):
  *   Reads qihse_kem_key.pem, runs EVP_PKEY_decapsulate() on the provided
@@ -100,9 +107,8 @@ int qihse_pqc_init_providers(void);
  * Returns false and leaves ctx uninitialized on any failure. No silent
  * fallback to plaintext.
  */
-bool qihse_pqc_init(qihse_pqc_ctx_t* ctx,
-                    const uint8_t* encapsulated_key_in,
-                    uint8_t* encapsulated_key_out);
+bool qihse_pqc_init(qihse_pqc_ctx_t *ctx, const uint8_t *encapsulated_key_in,
+                    uint8_t *encapsulated_key_out);
 
 /*
  * qihse_pqc_encapsulate_peer - Session-key issuance against an ARBITRARY
@@ -116,73 +122,78 @@ bool qihse_pqc_init(qihse_pqc_ctx_t* ctx,
  * session key exists only in server memory for the duration of the bundle
  * compose — it is never persisted.
  */
-bool qihse_pqc_encapsulate_peer(qihse_pqc_ctx_t* ctx,
-                                const char* peer_public_key_path,
-                                uint8_t* encapsulated_key_out);
+bool qihse_pqc_encapsulate_peer(qihse_pqc_ctx_t *ctx,
+                                const char *peer_public_key_path,
+                                uint8_t *encapsulated_key_out);
 
 /*
  * qihse_pqc_decapsulate_private - Recover a session key from a ciphertext
  * using an ARBITRARY ML-KEM-1024 private key path (the tenant client side
  * of qihse_pqc_encapsulate_peer; also used by tests).
  */
-bool qihse_pqc_decapsulate_private(qihse_pqc_ctx_t* ctx,
-                                   const char* private_key_path,
-                                   const uint8_t* encapsulated_key_in);
+bool qihse_pqc_decapsulate_private(qihse_pqc_ctx_t *ctx,
+                                   const char *private_key_path,
+                                   const uint8_t *encapsulated_key_in);
 
 /* Zero and release the session key. Always call when done. */
-void qihse_pqc_destroy(qihse_pqc_ctx_t* ctx);
+void qihse_pqc_destroy(qihse_pqc_ctx_t *ctx);
 
 /*
  * qihse_pqc_encrypt - Encrypt with AES-256-GCM.
  * Output layout: [12-byte IV][ciphertext][16-byte GCM tag]
- * out_buffer must be at least (in_len + QIHSE_AES_GCM_IV_SIZE + QIHSE_AES_GCM_TAG_SIZE).
- * Returns total bytes written, or 0 on failure.
+ * out_buffer must be at least (in_len + QIHSE_AES_GCM_IV_SIZE +
+ * QIHSE_AES_GCM_TAG_SIZE). Returns total bytes written, or 0 on failure.
  */
-size_t qihse_pqc_encrypt(qihse_pqc_ctx_t* ctx,
-                         const uint8_t* in_data, size_t in_len,
-                         uint8_t* out_buffer);
+size_t qihse_pqc_encrypt(qihse_pqc_ctx_t *ctx, const uint8_t *in_data,
+                         size_t in_len, uint8_t *out_buffer);
 
 /*
- * qihse_pqc_decrypt - Decrypt AES-256-GCM ciphertext produced by qihse_pqc_encrypt.
- * Returns plaintext bytes written, or 0 on failure (including authentication failure).
+ * qihse_pqc_decrypt - Decrypt AES-256-GCM ciphertext produced by
+ * qihse_pqc_encrypt. Returns plaintext bytes written, or 0 on failure
+ * (including authentication failure).
  */
-size_t qihse_pqc_decrypt(qihse_pqc_ctx_t* ctx,
-                         const uint8_t* in_data, size_t in_len,
-                         uint8_t* out_buffer);
+size_t qihse_pqc_decrypt(qihse_pqc_ctx_t *ctx, const uint8_t *in_data,
+                         size_t in_len, uint8_t *out_buffer);
 
 /*
  * qihse_pqc_sign - Sign data with ML-DSA-87 (reads qihse_dsa_key.pem).
  * out_sig must be QIHSE_MLDSA_SIGNATURE_SIZE bytes.
  */
-bool qihse_pqc_sign(const uint8_t* data, size_t len, uint8_t* out_sig);
+bool qihse_pqc_sign(const uint8_t *data, size_t len, uint8_t *out_sig);
 
 /*
  * qihse_pqc_sign_path - Sign with an explicit ML-DSA-87 private key path
  * (NULL = the standard qihse_dsa_key.pem location).
  */
-bool qihse_pqc_sign_path(const uint8_t* data, size_t len, uint8_t* out_sig,
-                         const char* private_key_path);
+bool qihse_pqc_sign_path(const uint8_t *data, size_t len, uint8_t *out_sig,
+                         const char *private_key_path);
 
 /*
  * qihse_pqc_verify - Verify an ML-DSA-87 signature (reads qihse_dsa_pub.pem).
  */
-bool qihse_pqc_verify(const uint8_t* data, size_t len, const uint8_t* sig);
+bool qihse_pqc_verify(const uint8_t *data, size_t len, const uint8_t *sig);
 
 /*
  * qihse_pqc_verify_path - Verify an ML-DSA-87 signature against an
  * ARBITRARY public key PEM path (QKP handshake trust anchors).
  */
-bool qihse_pqc_verify_path(const uint8_t* data, size_t len,
-                           const uint8_t* sig, const char* public_key_path);
+bool qihse_pqc_verify_path(const uint8_t *data, size_t len, const uint8_t *sig,
+                           const char *public_key_path);
+
+/*
+ * qihse_pqc_verify_with_key - Verify an ML-DSA-87 signature against an
+ * OpenSSL EVP_PKEY public key handle.
+ */
+bool qihse_pqc_verify_with_key(const uint8_t *data, size_t len,
+                               const uint8_t *sig, EVP_PKEY *pub_key);
 
 /*
  * qihse_pqc_encapsulate_mem - Encapsulate against an in-memory PEM public
  * key (QKP handshake: the server's KEM pub arrives on the wire in H1).
  * Same outputs as qihse_pqc_encapsulate_peer.
  */
-bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t* ctx,
-                               const uint8_t* pem_data, size_t pem_len,
-                               uint8_t* encapsulated_key_out);
+bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t *ctx, const uint8_t *pem_data,
+                               size_t pem_len, uint8_t *encapsulated_key_out);
 
 /*
  * qihse_pqc_keygen - Generate CNSA 2.0 keypairs natively in C.
@@ -198,7 +209,7 @@ bool qihse_pqc_encapsulate_mem(qihse_pqc_ctx_t* ctx,
  * Call qihse_pqc_init_providers() first to route generation through the
  * FIPS 140-3 validated module when available.
  */
-bool qihse_pqc_keygen(const char* out_dir);
+bool qihse_pqc_keygen(const char *out_dir);
 
 #ifdef __cplusplus
 }
