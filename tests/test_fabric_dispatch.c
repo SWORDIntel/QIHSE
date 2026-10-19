@@ -419,16 +419,25 @@ static void test_remote_ingest_roundtrip(const char* endpoint) {
     assert(strcmp(record + parsed.payload_offset, JOB_PAYLOAD) == 0);
     assert(strcmp(parsed.result, art_key) == 0);
 
-    /* Before the pull, the state is `pending-fetch`, NOT `done`. */
+    /* Before the pull, SUBMIT records an ACK, not the executor's terminal
+     * status. Only FETCH promotes the cached job to that terminal status. */
     const char* res[] = { "FABRIC", "RESULT", jid };
     run_cmd(g_submitter, g_low, 3u, res, reply, sizeof reply);
-    assert(strstr(reply, "pending-fetch") != NULL);
+    printf("  pre-fetch RESULT reply: %s", reply);
+    if (reply[strlen(reply) - 1u] != '\n') printf("\n");
+    assert(strstr(reply, "\"status\":\"pending-fetch\"") != NULL);
     assert(strstr(reply, "\"status\":\"done\"") == NULL);
+    assert(strstr(reply, "\"remote_status\":\"acked\"") != NULL);
     char expected[128];
-    snprintf(expected, sizeof expected, "\"remote_status\":\"%s\"", ingest_status());
-    assert(strstr(reply, expected) != NULL);
     assert(strstr(reply, "exec\":\"remote") != NULL);
-    assert(strstr(reply, "remote_gen") != NULL);
+    snprintf(expected, sizeof expected, "\"remote_gen\":%llu,",
+             (unsigned long long)parsed.gen);
+    assert(strstr(reply, expected) != NULL);
+    char record_digest[97];
+    assert(qihse_fabric_sha384_hex(record, strlen(record), record_digest,
+                                  sizeof record_digest));
+    snprintf(expected, sizeof expected, "\"remote_digest\":\"%s\"", record_digest);
+    assert(strstr(reply, expected) != NULL);
     /* The record must identify the endpoint actually selected for this run. */
     snprintf(expected, sizeof expected, "\"ep\":\"%s\"", endpoint);
     assert(strstr(reply, expected) != NULL);
@@ -445,7 +454,11 @@ static void test_remote_ingest_roundtrip(const char* endpoint) {
     /* Now the cached record is served, payload and all, and the state is the
      * executor's own status. */
     run_cmd(g_submitter, g_low, 3u, res, reply, sizeof reply);
+    printf("  post-fetch RESULT reply: %s", reply);
+    if (reply[strlen(reply) - 1u] != '\n') printf("\n");
     snprintf(expected, sizeof expected, "\"status\":\"%s\"", ingest_status());
+    assert(strstr(reply, expected) != NULL);
+    snprintf(expected, sizeof expected, "\"remote_status\":\"%s\"", ingest_status());
     assert(strstr(reply, expected) != NULL);
     assert(strstr(reply, record) != NULL);
     char cache_key[128];
