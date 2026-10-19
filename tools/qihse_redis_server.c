@@ -30,6 +30,9 @@ typedef struct {
     bool require_auth;
     const char* operator_password;
     const char* embedder_onnx;  /* NULL = built-in lexical embedder */
+    const char* artifact_blob_dir;
+    const char* artifact_staging_dir;
+    const char* forensic_vdb_path;
 } server_options_t;
 
 static void usage(const char* program) {
@@ -39,11 +42,14 @@ static void usage(const char* program) {
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --dir PATH        persistence directory (default /var/lib/qihse or $QIHSE_DATA_DIR)\n"
             "  --require-auth    require AUTH per connection\n"
-            "  --password PASS   operator password: bootstraps it when still default; on restart the value must match the configured one (refuses otherwise)\n"
+            "  --password PASS   operator password (prefer QIHSE_OPERATOR_PASSWORD env; avoid argv exposure)\n"
             "  --pubsub-dir PATH durable pub/sub event-stream directory (default: in-memory pub/sub)\n"
             "  --channel-classif N   classification tag applied to pub/sub channels (default 0)\n"
             "  --channel-sci N       SCI compartment mask applied to pub/sub channels (default 0)\n"
             "  --uwp-port N      also serve UWP on port N sharing the same stores (default: disabled)\n"
+            "  --artifact-blob-dir DIR  enable classified dump blobs in a dedicated store (loopback + auth only)\n"
+            "  --artifact-staging-dir DIR  required private 0700 upload staging directory\n"
+            "  --forensic-vdb PATH  isolated operator-only 1024-dimensional persistent index\n"
             "  --embedder-onnx DIR  install the ONNX embedding model in DIR as the AIMEM embedder\n"
             "                      (env fallback QIHSE_AIMEM_EMBEDDER_ONNX; failure is fatal)\n",
             program);
@@ -84,6 +90,9 @@ int main(int argc, char** argv) {
         else if (strcmp(arg, "--require-auth") == 0) options.require_auth = true;
         else if (strcmp(arg, "--password") == 0 && has_next) options.operator_password = argv[++i];
         else if (strcmp(arg, "--embedder-onnx") == 0 && has_next) options.embedder_onnx = argv[++i];
+        else if (strcmp(arg, "--artifact-blob-dir") == 0 && has_next) options.artifact_blob_dir = argv[++i];
+        else if (strcmp(arg, "--artifact-staging-dir") == 0 && has_next) options.artifact_staging_dir = argv[++i];
+        else if (strcmp(arg, "--forensic-vdb") == 0 && has_next) options.forensic_vdb_path = argv[++i];
         else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown or incomplete option: %s\n", arg); usage(argv[0]); return 2; }
     }
@@ -114,11 +123,23 @@ int main(int argc, char** argv) {
     }
 
     if (options.require_auth) {
+        if (!options.operator_password) options.operator_password = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (!options.operator_password && getenv("QIHSE_AUTH_USER") &&
+            strcmp(getenv("QIHSE_AUTH_USER"), "GODMODE_OP") == 0)
+            options.operator_password = getenv("QIHSE_AUTH_PASSWORD");
         if (!options.operator_password) {
-            fprintf(stderr, "--require-auth requires --password (or QIHSE_OPERATOR_PASSWORD / /etc/qihse/cluster-node0.env)\n");
+            fprintf(stderr, "--require-auth requires QIHSE_OPERATOR_PASSWORD, QIHSE_AUTH_PASSWORD, --password, or /etc/qihse/cluster-node0.env\n");
             return 2;
         }
         /* Non-loopback binds without auth are rejected by the engine itself. */
+    }
+    if (options.artifact_blob_dir || options.artifact_staging_dir || options.forensic_vdb_path) {
+        if (!options.artifact_blob_dir || !options.artifact_staging_dir ||
+            !options.require_auth ||
+            (strcmp(options.bind, "127.0.0.1") != 0 && strcmp(options.bind, "::1") != 0)) {
+            fprintf(stderr, "artifact upload requires both directories, --require-auth, and a loopback bind\n");
+            return 2;
+        }
     }
     if (!options.embedder_onnx) options.embedder_onnx = getenv("QIHSE_AIMEM_EMBEDDER_ONNX");
     if (options.embedder_onnx && *options.embedder_onnx &&
@@ -179,10 +200,35 @@ int main(int argc, char** argv) {
     config.enable_task_queue = false;
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
+    qihse_blob_store_t* artifact_blobs = NULL;
+    qihse_vector_db_t forensic_vdb = NULL;
+    if (options.artifact_blob_dir) {
+        artifact_blobs = qihse_blob_store_create(options.artifact_blob_dir);
+        if (!artifact_blobs) {
+            fprintf(stderr, "artifact blob store initialization failed\n");
+            return 1;
+        }
+        config.blobs = artifact_blobs;
+        config.enable_artifact_uploads = true;
+        config.artifact_staging_dir = options.artifact_staging_dir;
+    }
+    if (options.forensic_vdb_path) {
+        forensic_vdb = qihse_vector_db_open(QIHSE_VECTOR_DB_INMEMORY, NULL,
+                         options.forensic_vdb_path,
+                         QIHSE_VDB_OPEN_CREATE | QIHSE_VDB_OPEN_FILE_BACKED);
+        if (!forensic_vdb) {
+            fprintf(stderr, "forensic index initialization failed\n");
+            qihse_blob_store_destroy(artifact_blobs);
+            return 1;
+        }
+        config.forensic_vdb = forensic_vdb;
+    }
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     if (!server) {
         fprintf(stderr, "[qihse-redis-server] RESP server creation failed (auth gate or bind error)\n");
+        qihse_vector_db_destroy(forensic_vdb);
+        qihse_blob_store_destroy(artifact_blobs);
         return 1;
     }
     printf("[qihse-redis-server] RESP listening on %s:%u (auth %s, embedder %s)\n",
@@ -216,5 +262,7 @@ int main(int argc, char** argv) {
     if (uwp_started) pthread_join(uwp_thread, NULL);
     qihse_vector_db_destroy(vdb);
     qihse_kv_store_destroy(store);
+    qihse_vector_db_destroy(forensic_vdb);
+    qihse_blob_store_destroy(artifact_blobs);
     return 0;
 }

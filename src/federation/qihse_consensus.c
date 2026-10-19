@@ -548,11 +548,8 @@ static bool qcs_fold_full(const qihse_consensus_t* cs, uint64_t commit,
  * quarantined: it keeps serving reads but makes no durable progress). */
 static bool qcs_record_append(qihse_consensus_t* cs, size_t body_len) {
     if (cs->rec_quarantined) return false;
-    char cksum[24];
-    snprintf(cksum, sizeof(cksum), " %016llx",
+    snprintf(cs->rec_buf + body_len, 32u, " %016llx\n",
              (unsigned long long)qcs_fnv1a(cs->rec_buf, body_len));
-    memcpy(cs->rec_buf + body_len, cksum, strlen(cksum) + 1u);
-    strcat(cs->rec_buf, "\n");
 
     if (fputs(cs->rec_buf, cs->rec) == EOF) return false;
     if (fflush(cs->rec) != 0) return false;

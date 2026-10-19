@@ -363,7 +363,7 @@ static void fabric_lazy_init_locked(void) {
      * QIHSE_KEYSTONE_LIB) is authoritative: if it fails to load, the index
      * stays unavailable rather than silently falling back elsewhere. Without
      * explicit configuration, well-known locations are probed in order. */
-    char paths[4][512];
+    char paths[8][512];
     size_t tries = 0u;
     size_t loaded = 0u;
     if (g_lib_path[0]) {
@@ -374,9 +374,12 @@ static void fabric_lazy_init_locked(void) {
         if (env_lib && *env_lib) {
             snprintf(paths[tries++], sizeof(paths[0]), "%s", env_lib);
         } else {
-            if (home && *home)
+            if (home && *home) {
+                snprintf(paths[tries++], sizeof(paths[0]),
+                         "%s/KEYSTONE/libkeystone.so", home);
                 snprintf(paths[tries++], sizeof(paths[0]),
                          "%s/Documents/KEYSTONE/libkeystone.so", home);
+            }
             snprintf(paths[tries++], sizeof(paths[0]), "%s", "./libkeystone.so");
             snprintf(paths[tries++], sizeof(paths[0]), "%s", "libkeystone.so");
         }

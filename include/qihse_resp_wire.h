@@ -125,6 +125,13 @@ typedef struct {
      * ("tenant-<id>-kem_pub.pem"); dsa_private_key_path signs manifests
      * (NULL = unsigned manifests). */
     qihse_blob_store_t* blobs;
+    /* Optional authenticated, bounded dump upload. Disabled by default.
+     * Staging directory must be private (0700), owned by this daemon, and
+     * on a volume with room for up to four concurrent 4 GiB uploads. */
+    bool enable_artifact_uploads;
+    const char* artifact_staging_dir;
+    /* Isolated operator-only 1024-dim collection, never exposed by VEC*. */
+    qihse_vector_db_t forensic_vdb;
     /* Optional committed transaction bridge. Commands fail closed unless
      * both are supplied; mesh proposals and reads use session->user. */
     qihse_consensus_mesh_t* consensus_mesh;

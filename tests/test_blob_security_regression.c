@@ -29,6 +29,20 @@ typedef struct {
     int foreign_seen;
 } list_counter_t;
 
+typedef struct { uint64_t offset, length; } generated_blob_t;
+
+static int64_t generated_read(void* opaque, uint8_t* buffer, size_t capacity) {
+    generated_blob_t* source = opaque;
+    if (source->offset == source->length) return 0;
+    size_t count = capacity;
+    if (source->length - source->offset < count)
+        count = (size_t)(source->length - source->offset);
+    for (size_t i = 0; i < count; i++)
+        buffer[i] = (uint8_t)(source->offset + i);
+    source->offset += count;
+    return (int64_t)count;
+}
+
 static bool count_cb(const qihse_blob_info_t* info, void* opaque) {
     list_counter_t* c = opaque;
     c->seen++;
@@ -159,6 +173,48 @@ int main(void) {
     assert(nread == sizeof(script));
     assert(qihse_blob_delete_user(blobs, hash_script, tenant7));  /* refs = 0 → gone */
     assert(!qihse_blob_get_user(blobs, hash_script, 0, out, sizeof(out), &nread, tenant7));
+
+    /* Artifacts may exceed 64 MiB; the legacy tag and consensus bound cannot. */
+    const uint64_t artifact_len = (uint64_t)QIHSE_BLOB_MAX_SIZE + 4096u;
+    generated_blob_t source = {.length = artifact_len};
+    uint8_t artifact_hash[QIHSE_BLOB_HASH_BYTES];
+    uint64_t artifact_size = 0;
+    uint8_t no_hash[QIHSE_BLOB_HASH_BYTES] = {0};
+    assert(!qihse_blob_put_expected_user(blobs, 7, QIHSE_BLOB_TAG_SCRIPT_SET,
+                                         95, 0, operator_user, generated_read,
+                                         &source, no_hash, artifact_len));
+    assert(source.offset == 0); /* reject before consuming an oversized stream */
+    assert(!qihse_blob_put_user(blobs, 7, QIHSE_BLOB_TAG_SCRIPT_SET,
+                                95, 0, operator_user, generated_read, &source,
+                                artifact_hash, &artifact_size));
+    assert(source.offset > QIHSE_BLOB_MAX_SIZE);
+    source.offset = 0;
+    assert(qihse_blob_put_user(blobs, 7, QIHSE_BLOB_TAG_DUMP_ARTIFACT,
+                               95, 0, operator_user, generated_read, &source,
+                               artifact_hash, &artifact_size));
+    assert(artifact_size == artifact_len);
+    assert(qihse_blob_size_user(blobs, artifact_hash, &artifact_size, operator_user));
+    assert(artifact_size == artifact_len);
+    memset(window, 0, sizeof(window));
+    assert(qihse_blob_get_user(blobs, artifact_hash, QIHSE_BLOB_MAX_SIZE - 50u,
+                               window, sizeof(window), &nread, operator_user));
+    assert(nread == sizeof(window));
+    for (size_t i = 0; i < nread; i++)
+        assert(window[i] == (uint8_t)(QIHSE_BLOB_MAX_SIZE - 50u + i));
+    memset(window, 0, sizeof(window));
+    assert(!qihse_blob_get_user(blobs, artifact_hash, 0, window,
+                                sizeof(window), &nread, tenant7));
+    for (size_t i = 0; i < sizeof(window); i++) assert(window[i] == 0);
+    assert(!qihse_blob_get_user(blobs, artifact_hash, 0, window,
+                                sizeof(window), &nread, tenant8));
+    assert(!qihse_blob_size_user(blobs, artifact_hash, &artifact_size, tenant7));
+    assert(qihse_blob_verify_user(blobs, artifact_hash, operator_user));
+    qihse_blob_store_destroy(blobs);
+    blobs = qihse_blob_store_create(blob_dir);
+    assert(blobs != NULL); /* replay accepts the larger artifact tag */
+    assert(qihse_blob_verify_user(blobs, artifact_hash, operator_user));
+    assert(!qihse_blob_get_user(blobs, artifact_hash, 0, window,
+                                sizeof(window), &nread, tenant7));
 
     /* --- Revocation: destroyed principal loses access immediately -------- */
     qihse_user_t* ephemeral = qihse_auth_create_tenant_user(operator_user, 7, 73,

@@ -3,7 +3,7 @@
 
 export QIHSE_ALLOW_INSECURE_CONTAINER ?= 1
 
-.PHONY: test-kv-security-regression test-keystone-qihse-security test-vector-skip-integrity test-resp-security-regression test-tenant-security-regression test-tenant-privilege-ladder test-blob-security-regression test-ingest-guard-regression test-bundle-security-regression test-killswitch-regression test-vector-tenant-isolation test-retention-regression test-export-regression test-metrics-regression test-sci-compartment-regression test-blob-persistence-regression test-security-regressions
+.PHONY: test-kv-security-regression test-keystone-qihse-security test-vector-skip-integrity test-resp-security-regression test-tenant-security-regression test-tenant-privilege-ladder test-blob-security-regression test-artifact-upload-regression test-ingest-guard-regression test-bundle-security-regression test-killswitch-regression test-vector-tenant-isolation test-retention-regression test-export-regression test-metrics-regression test-sci-compartment-regression test-blob-persistence-regression test-security-regressions
 
 test-kv-security-regression: lib
 	$(CC) $(CFLAGS) -o tests/test_kv_security_regression tests/test_kv_security_regression.c -L. -lqihse $(LDFLAGS)
@@ -32,6 +32,10 @@ test-tenant-privilege-ladder: lib
 test-blob-security-regression: lib
 	$(CC) $(CFLAGS) -o tests/test_blob_security_regression tests/test_blob_security_regression.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_blob_security_regression
+
+test-artifact-upload-regression: lib
+	$(CC) $(CFLAGS) -o tests/test_artifact_upload_regression tests/test_artifact_upload_regression.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_artifact_upload_regression
 
 test-ingest-guard-regression: lib
 	$(CC) $(CFLAGS) -o tests/test_ingest_guard_regression tests/test_ingest_guard_regression.c -L. -lqihse $(LDFLAGS)
@@ -69,4 +73,4 @@ test-blob-persistence-regression: lib
 	$(CC) $(CFLAGS) -o tests/test_blob_persistence_regression tests/test_blob_persistence_regression.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_blob_persistence_regression
 
-test-security-regressions: test-kv-security-regression test-keystone-qihse-security test-vector-skip-integrity test-resp-security-regression test-tenant-security-regression test-tenant-privilege-ladder test-blob-security-regression test-ingest-guard-regression test-bundle-security-regression test-killswitch-regression test-vector-tenant-isolation test-retention-regression test-export-regression test-metrics-regression test-sci-compartment-regression test-blob-persistence-regression test-mongo-wire-security
+test-security-regressions: test-kv-security-regression test-keystone-qihse-security test-vector-skip-integrity test-resp-security-regression test-tenant-security-regression test-tenant-privilege-ladder test-blob-security-regression test-artifact-upload-regression test-ingest-guard-regression test-bundle-security-regression test-killswitch-regression test-vector-tenant-isolation test-retention-regression test-export-regression test-metrics-regression test-sci-compartment-regression test-blob-persistence-regression test-mongo-wire-security

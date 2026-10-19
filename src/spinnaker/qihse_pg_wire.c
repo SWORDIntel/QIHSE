@@ -771,8 +771,12 @@ void qihse_pg_wire_handle_client_multi(
         return;
     }
 
-    pg_stmt_cache_t stmt_cache;
-    pg_stmt_cache_init(&stmt_cache);
+    pg_stmt_cache_t* stmt_cache = (pg_stmt_cache_t*)calloc(1, sizeof(*stmt_cache));
+    if (!stmt_cache) {
+        close(fd);
+        return;
+    }
+    pg_stmt_cache_init(stmt_cache);
     char last_portal_query[4096] = {0};
     char last_stmt_name[128] = {0};
 
@@ -856,7 +860,7 @@ void qihse_pg_wire_handle_client_multi(
                         }
                     }
                 }
-                pg_stmt_cache_put(&stmt_cache, stmt_name, parsed_query, parsed_oids, num_params);
+                pg_stmt_cache_put(stmt_cache, stmt_name, parsed_query, parsed_oids, num_params);
                 pg_send_msg(fd, '1', NULL, 0);  /* ParseComplete */
                 break;
             }
@@ -866,7 +870,7 @@ void qihse_pg_wire_handle_client_multi(
                 const char* portal_name = body ? (const char*)body : "";
                 size_t portal_len = strlen(portal_name) + 1;
                 const char* stmt_name = body ? (const char*)(body + portal_len) : "";
-                pg_prepared_stmt_t* ps = pg_stmt_cache_lookup(&stmt_cache, stmt_name);
+                pg_prepared_stmt_t* ps = pg_stmt_cache_lookup(stmt_cache, stmt_name);
                 if (ps) {
                     strncpy(last_portal_query, ps->query, sizeof(last_portal_query) - 1);
                     last_portal_query[sizeof(last_portal_query)-1] = '\0';
@@ -898,7 +902,7 @@ void qihse_pg_wire_handle_client_multi(
                 const char* close_type = body ? (const char*)(const uint8_t*)body : "";
                 if (body && body_len > 0 && close_type[0] == 'S') {
                     const char* sname = (const char*)(const uint8_t*)body + 1;
-                    pg_stmt_cache_remove(&stmt_cache, sname);
+                    pg_stmt_cache_remove(stmt_cache, sname);
                 }
                 pg_send_msg(fd, '3', NULL, 0);  /* CloseComplete */
                 break;
@@ -911,6 +915,7 @@ void qihse_pg_wire_handle_client_multi(
     }
 
 done:
+    free(stmt_cache);
     close(fd);
 }
 
