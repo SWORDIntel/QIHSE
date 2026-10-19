@@ -103,7 +103,7 @@ static bool test_torn_wal_tail_ignored_and_truncated(void);
 static bool test_checkpoint_publishes_snapshot_and_clears_wal(void);
 static bool test_checkpoint_ignores_stale_complete_wal(void);
 static bool test_read_only_mmap_reopen_searches(void);
-static bool test_corrupt_vectors_qvec_magic_rejected(void);
+static bool test_corrupt_vectors_section_payload_rejected(void);
 static bool test_truncated_vectors_qvec_payload_rejected(void);
 static bool test_corrupt_metadata_qmeta_rejected(void);
 static bool test_truncated_metadata_qmeta_payload_rejected(void);
@@ -167,6 +167,13 @@ static bool test_memory_budget_search_pages_in_spilled(void);
 static bool test_memory_budget_zero_restores_spilled(void);
 
 int main(void) {
+    /* CI explicitly permits a keyless test container. Keep MAC and
+     * checksum verification enabled: this suite asserts corruption rejection,
+     * not the separate insecure skip-integrity mode. */
+    if (setenv("QIHSE_ENFORCE_INTEGRITY", "1", 1) != 0) {
+        perror("enable persistence test integrity checks");
+        return EXIT_FAILURE;
+    }
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/qihse_vector_db_persistence_test_XXXXXX";
@@ -193,8 +200,8 @@ int main(void) {
          test_checkpoint_ignores_stale_complete_wal},
         {"read-only mmap reopen searches mapped vector file",
          test_read_only_mmap_reopen_searches},
-        {"corrupt vectors.qvec magic fails open cleanly",
-         test_corrupt_vectors_qvec_magic_rejected},
+        {"corrupt VECTORS section payload rejects open",
+         test_corrupt_vectors_section_payload_rejected},
         {"truncated vectors.qvec payload fails open cleanly",
          test_truncated_vectors_qvec_payload_rejected},
         {"corrupt metadata.qmeta fails open cleanly",
@@ -1255,7 +1262,7 @@ static bool test_read_only_mmap_reopen_searches(void) {
     return true;
 }
 
-static bool test_corrupt_vectors_qvec_magic_rejected(void) {
+static bool test_corrupt_vectors_section_payload_rejected(void) {
     test_env_t env;
     TEST_ASSERT(env_init(&env), "environment should initialize");
 
@@ -1270,8 +1277,9 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void) {
                 "insert before corrupting qvec should succeed");
     TEST_ASSERT(close_db(db), "database should close before qvec corruption");
 
+    /* VECTORS contains raw float bytes, not a legacy qvec file header. */
     TEST_ASSERT(ctr_corrupt_section_byte(path, QIHSE_CTR_SEC_VECTORS, 0, (uint8_t)'X'),
-                "test should corrupt VECTORS section magic");
+                "test should corrupt VECTORS section payload");
 
     db = qihse_vector_db_open(
         QIHSE_VECTOR_DB_INMEMORY,
@@ -1279,7 +1287,7 @@ static bool test_corrupt_vectors_qvec_magic_rejected(void) {
         path,
         QIHSE_TEST_OPEN_FILE_BACKED
     );
-    TEST_ASSERT(db == NULL, "corrupt vectors.qvec magic should fail open");
+    TEST_ASSERT(db == NULL, "corrupt VECTORS section payload should reject open");
 
     remove_tree(path);
     free(path);
