@@ -2099,6 +2099,601 @@ bool qihse_ai_memory_knowledge_get(qihse_resp_server_t* server,
     return find.found;
 }
 
+/* ── QH-05..08: stable query projections and reversible operations ───── */
+
+typedef struct {
+    qihse_ai_memory_knowledge_version_t version;
+    uint32_t owner_id;
+    uint16_t classification;
+    uint16_t sci;
+    double lexical_score;
+} aimem_query_row_t;
+
+struct qihse_ai_memory_query_snapshot {
+    qihse_resp_server_t* server;
+    uint32_t tenant_id;
+    uint32_t user_id;
+    qihse_ai_memory_scope_t scope;
+    aimem_query_row_t* rows;
+    size_t count;
+    size_t offset;
+};
+
+static uint64_t g_aimem_query_snapshots;
+static uint64_t g_aimem_maintenance_versions;
+static uint64_t g_aimem_exports;
+static uint64_t g_aimem_imports;
+static uint64_t g_aimem_rejected;
+static uint64_t g_aimem_index_generation;
+
+static void aimem_counter_inc(uint64_t* value) {
+    (void)__atomic_add_fetch(value, 1u, __ATOMIC_RELAXED);
+}
+
+static bool aimem_contains_fold(const char* text, const char* needle) {
+    if (!needle || !*needle) return true;
+    if (!text) return false;
+    size_t n = strlen(needle);
+    for (const char* p = text; *p; p++) {
+        size_t i = 0u;
+        while (i < n && p[i] && tolower((unsigned char)p[i]) ==
+               tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static int aimem_query_row_compare(const void* a, const void* b) {
+    const aimem_query_row_t* x = a;
+    const aimem_query_row_t* y = b;
+    if (x->version.valid_from_ingest_ms < y->version.valid_from_ingest_ms) return -1;
+    if (x->version.valid_from_ingest_ms > y->version.valid_from_ingest_ms) return 1;
+    return strcmp(x->version.version_id, y->version.version_id);
+}
+
+typedef struct {
+    qihse_resp_server_t* server;
+    qihse_user_t* user;
+    const qihse_ai_memory_query_v1_t* query;
+    aimem_query_row_t* rows;
+    size_t count;
+    bool failed;
+} aimem_query_build_t;
+
+static bool aimem_query_build_cb(const char* key, const char* value, void* opaque) {
+    aimem_query_build_t* b = opaque;
+    aimem_knowledge_chain_t chain;
+    if (!aimem_knowledge_chain_parse(value, &chain)) return true;
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    bool allowed = aimem_scope_matches(&chain.scope, &b->query->scope) &&
+        aimem_scope_owner_allowed(store, b->user, chain.owner_id, &b->query->scope) &&
+        (!b->query->type || b->query->type == chain.type);
+    qihse_kv_record_meta_t meta;
+    if (allowed) allowed = qihse_kv_meta_user(store, key, b->user, &meta);
+    for (size_t i = 0; allowed && i < chain.count; i++) {
+        qihse_ai_memory_knowledge_version_t* v = &chain.versions[i];
+        bool current = i + 1u == chain.count;
+        if ((b->query->current_only && !current) ||
+            (b->query->status && b->query->status != v->status) ||
+            (b->query->ingest_from_ms && v->valid_from_ingest_ms < b->query->ingest_from_ms) ||
+            (b->query->ingest_to_ms && v->valid_from_ingest_ms > b->query->ingest_to_ms) ||
+            !aimem_contains_fold(v->content, b->query->text)) continue;
+        if (b->count >= b->query->max_rows) { b->failed = true; break; }
+        aimem_query_row_t* row = &b->rows[b->count];
+        if (!aimem_knowledge_copy(v, &row->version)) { b->failed = true; break; }
+        row->owner_id = chain.owner_id;
+        row->classification = meta.classification;
+        row->sci = meta.sci_compartment;
+        row->lexical_score = b->query->text && *b->query->text ? 1.0 : 0.0;
+        b->count++;
+    }
+    aimem_knowledge_chain_free(&chain);
+    return !b->failed;
+}
+
+qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_query_v1_t* query) {
+    if (!server || !user || !qihse_auth_user_is_active(user) || !query ||
+        !aimem_scope_valid(&query->scope) || !query->max_rows ||
+        query->max_rows > QIHSE_AIMEM_QUERY_MAX_ROWS ||
+        (query->type && !aimem_knowledge_type_valid(query->type)) ||
+        (query->status && (query->status < QIHSE_AIMEM_KNOWLEDGE_PROPOSED ||
+                           query->status > QIHSE_AIMEM_KNOWLEDGE_RETRACTED))) {
+        aimem_counter_inc(&g_aimem_rejected); return NULL;
+    }
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    qihse_ai_memory_query_snapshot_t* snap = calloc(1u, sizeof(*snap));
+    if (!store || !snap) { free(snap); return NULL; }
+    snap->rows = calloc(query->max_rows, sizeof(*snap->rows));
+    if (!snap->rows) { free(snap); return NULL; }
+    aimem_query_build_t build = { server, user, query, snap->rows, 0u, false };
+    char prefix[48];
+    int n = snprintf(prefix, sizeof prefix, "t:%u/aimem-knowledge:",
+                     (unsigned)qihse_user_get_tenant_id(user));
+    bool iterated = n > 0 && (size_t)n < sizeof prefix &&
+        qihse_kv_foreach_prefix_user(store, prefix, user, aimem_query_build_cb, &build);
+    if (!iterated || build.failed) {
+        for (size_t i = 0; i < build.count; i++)
+            qihse_ai_memory_knowledge_free(&snap->rows[i].version);
+        free(snap->rows); free(snap); aimem_counter_inc(&g_aimem_rejected); return NULL;
+    }
+    snap->server = server;
+    snap->tenant_id = qihse_user_get_tenant_id(user);
+    snap->user_id = qihse_user_get_id(user);
+    snap->scope = query->scope;
+    snap->count = build.count;
+    qsort(snap->rows, snap->count, sizeof(*snap->rows), aimem_query_row_compare);
+    aimem_counter_inc(&g_aimem_query_snapshots);
+    return snap;
+}
+
+size_t qihse_ai_memory_query_next(qihse_ai_memory_query_snapshot_t* snap,
+        qihse_user_t* user, qihse_ai_memory_query_hit_t* out, size_t out_cap) {
+    if (!snap || !user || !out || !out_cap || !qihse_auth_user_is_active(user) ||
+        qihse_user_get_tenant_id(user) != snap->tenant_id ||
+        qihse_user_get_id(user) != snap->user_id) {
+        aimem_counter_inc(&g_aimem_rejected); return 0u;
+    }
+    qihse_kv_store_t* store = qihse_resp_server_store(snap->server);
+    size_t count = 0u;
+    while (count < out_cap && snap->offset < snap->count) {
+        aimem_query_row_t* row = &snap->rows[snap->offset];
+        if (!qihse_auth_can_access(user, row->classification, row->sci) ||
+            !aimem_scope_owner_allowed(store, user, row->owner_id, &snap->scope)) {
+            aimem_counter_inc(&g_aimem_rejected); return 0u;
+        }
+        memset(&out[count], 0, sizeof(out[count]));
+        if (!aimem_knowledge_copy(&row->version, &out[count].version)) break;
+        out[count].lexical_score = row->lexical_score;
+        out[count].current = row->version.valid_to_ingest_ms == 0u;
+        out[count].explain_flags =
+            (row->lexical_score > 0.0 ? QIHSE_AIMEM_QUERY_EXPLAIN_TEXT_MATCH : 0u) |
+            (out[count].current ? QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT : 0u);
+        count++; snap->offset++;
+    }
+    return count;
+}
+
+void qihse_ai_memory_query_hits_free(qihse_ai_memory_query_hit_t* hits,
+                                      size_t count) {
+    if (!hits) return;
+    for (size_t i = 0; i < count; i++)
+        qihse_ai_memory_knowledge_free(&hits[i].version);
+}
+
+void qihse_ai_memory_query_end(qihse_ai_memory_query_snapshot_t* snap) {
+    if (!snap) return;
+    for (size_t i = 0; i < snap->count; i++)
+        qihse_ai_memory_knowledge_free(&snap->rows[i].version);
+    free(snap->rows); free(snap);
+}
+
+#define AIMEM_MAINT_MAX_ENCODED (AIMEM_KNOWLEDGE_MAX_CONTENT * 4u + 1024u)
+
+static bool aimem_maintenance_key(char* out, size_t cap, qihse_user_t* user,
+                                  const char* plan_id) {
+    qihse_uuid_t id;
+    if (!out || !user || !qihse_auth_user_is_active(user) ||
+        !plan_id || !qihse_uuid_parse(plan_id, &id)) return false;
+    int n = snprintf(out, cap, "t:%u/aimem-maint:%s",
+        (unsigned)qihse_user_get_tenant_id(user), plan_id);
+    return n > 0 && (size_t)n < cap;
+}
+
+void qihse_ai_memory_maintenance_free(qihse_ai_memory_maintenance_plan_t* plan) {
+    if (!plan) return;
+    free(plan->original_content); free(plan->replacement_content);
+    memset(plan, 0, sizeof(*plan));
+}
+
+static char* aimem_maintenance_encode(const qihse_ai_memory_maintenance_plan_t* p,
+                                      uint32_t owner_id) {
+    char* a = aimem_hex_encode(p->original_content);
+    char* b = aimem_hex_encode(p->replacement_content);
+    if (!a || !b) { free(a); free(b); return NULL; }
+    char* out = malloc(AIMEM_MAINT_MAX_ENCODED);
+    if (out) {
+        int n = snprintf(out, AIMEM_MAINT_MAX_ENCODED,
+            "QHM1|%s|%s|%s|%s|%s|%s|%s|%u|%u|%s|%s|%s",
+            p->plan_id, p->knowledge_id, p->source_version_id,
+            p->output_version_id, p->scope.project, p->scope.worktree,
+            p->scope.workstream, (unsigned)owner_id, (unsigned)p->state,
+            p->scope.session, a, b);
+        if (n < 0 || (size_t)n >= AIMEM_MAINT_MAX_ENCODED) { free(out); out = NULL; }
+    }
+    free(a); free(b); return out;
+}
+
+static bool aimem_maintenance_parse(const char* raw,
+        qihse_ai_memory_maintenance_plan_t* out, uint32_t* owner_id) {
+    if (!raw || !out || !owner_id) return false;
+    memset(out, 0, sizeof(*out));
+    char* copy = strdup(raw); if (!copy) return false;
+    char* cur = copy; char* f[13];
+    for (size_t i = 0; i < 13u; i++) f[i] = strsep(&cur, "|");
+    uint32_t state = 0u, owner = 0u; qihse_uuid_t id;
+    bool ok = cur == NULL && f[0] && strcmp(f[0], "QHM1") == 0 &&
+        f[1] && qihse_uuid_parse(f[1], &id) && f[2] && qihse_uuid_parse(f[2], &id) &&
+        f[3] && qihse_uuid_parse(f[3], &id) && f[4] &&
+        (!*f[4] || qihse_uuid_parse(f[4], &id)) &&
+        aimem_token_u32(f[8], &owner) && aimem_token_u32(f[9], &state) &&
+        state >= QIHSE_AIMEM_MAINT_PLANNED && state <= QIHSE_AIMEM_MAINT_ROLLED_BACK;
+    if (ok) {
+        snprintf(out->plan_id, sizeof out->plan_id, "%s", f[1]);
+        snprintf(out->knowledge_id, sizeof out->knowledge_id, "%s", f[2]);
+        snprintf(out->source_version_id, sizeof out->source_version_id, "%s", f[3]);
+        snprintf(out->output_version_id, sizeof out->output_version_id, "%s", f[4]);
+        snprintf(out->scope.project, sizeof out->scope.project, "%s", f[5]);
+        snprintf(out->scope.worktree, sizeof out->scope.worktree, "%s", f[6]);
+        snprintf(out->scope.workstream, sizeof out->scope.workstream, "%s", f[7]);
+        snprintf(out->scope.session, sizeof out->scope.session, "%s", f[10]);
+        out->state = state; *owner_id = owner;
+        out->original_content = aimem_hex_decode(f[11]);
+        out->replacement_content = aimem_hex_decode(f[12]);
+        ok = aimem_scope_valid(&out->scope) && out->original_content &&
+             out->replacement_content;
+    }
+    free(copy);
+    if (!ok) qihse_ai_memory_maintenance_free(out);
+    return ok;
+}
+
+static bool aimem_maintenance_copy(const qihse_ai_memory_maintenance_plan_t* in,
+                                   qihse_ai_memory_maintenance_plan_t* out) {
+    *out = *in;
+    out->original_content = strdup(in->original_content);
+    out->replacement_content = strdup(in->replacement_content);
+    if (!out->original_content || !out->replacement_content) {
+        qihse_ai_memory_maintenance_free(out); return false;
+    }
+    return true;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_plan(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* knowledge_id,
+        const qihse_ai_memory_scope_t* scope, const char* replacement,
+        bool dry_run, qihse_ai_memory_maintenance_plan_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!server || !user || !knowledge_id || !scope || !replacement || !*replacement ||
+        strlen(replacement) > AIMEM_KNOWLEDGE_MAX_CONTENT || !out ||
+        !qihse_ai_memory_project_owner_allowed(server, user, scope->project))
+        return QIHSE_AIMEM_WRITE_FAILED;
+    qihse_ai_memory_knowledge_version_t latest;
+    if (!qihse_ai_memory_knowledge_latest(server, user, knowledge_id, scope, &latest))
+        return QIHSE_AIMEM_WRITE_FAILED;
+    qihse_uuid_t uuid;
+    bool ok = qihse_uuid_generate(&uuid) && qihse_uuid_format(&uuid, out->plan_id);
+    snprintf(out->knowledge_id, sizeof out->knowledge_id, "%s", knowledge_id);
+    snprintf(out->source_version_id, sizeof out->source_version_id, "%s", latest.version_id);
+    out->scope = *scope; out->state = QIHSE_AIMEM_MAINT_PLANNED;
+    out->original_content = strdup(latest.content);
+    out->replacement_content = strdup(replacement);
+    qihse_ai_memory_knowledge_free(&latest);
+    ok = ok && out->original_content && out->replacement_content;
+    if (ok && !dry_run) {
+        char key[128]; char* encoded = aimem_maintenance_encode(out, qihse_user_get_id(user));
+        qihse_kv_store_t* store = qihse_resp_server_store(server);
+        ok = encoded && aimem_maintenance_key(key, sizeof key, user, out->plan_id) &&
+            qihse_kv_compare_set_user(store, key, NULL, encoded,
+                qihse_user_get_classification(user), qihse_user_get_sci(user), user) ==
+                QIHSE_KV_CAS_UPDATED;
+        free(encoded);
+    }
+    if (!ok) { qihse_ai_memory_maintenance_free(out); return QIHSE_AIMEM_WRITE_FAILED; }
+    return QIHSE_AIMEM_WRITE_NEW;
+}
+
+static bool aimem_maintenance_read(qihse_resp_server_t* server, qihse_user_t* user,
+        const char* plan_id, char** raw, qihse_ai_memory_maintenance_plan_t* plan,
+        uint32_t* owner) {
+    char key[128]; qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store || !aimem_maintenance_key(key, sizeof key, user, plan_id)) return false;
+    *raw = qihse_kv_get_user(store, key, user);
+    return *raw && aimem_maintenance_parse(*raw, plan, owner) &&
+        (*owner == qihse_user_get_id(user) || qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR);
+}
+
+static qihse_ai_memory_write_result_t aimem_maintenance_transition(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* plan_id,
+        bool rollback, qihse_ai_memory_maintenance_plan_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!server || !user || !plan_id || !out) return QIHSE_AIMEM_WRITE_FAILED;
+    char* raw = NULL; uint32_t owner = 0u;
+    qihse_ai_memory_maintenance_plan_t plan = {0};
+    bool ok = aimem_maintenance_read(server, user, plan_id, &raw, &plan, &owner);
+    uint32_t wanted = rollback ? QIHSE_AIMEM_MAINT_ROLLED_BACK : QIHSE_AIMEM_MAINT_APPLIED;
+    if (ok && plan.state == wanted) {
+        ok = aimem_maintenance_copy(&plan, out);
+        free(raw); qihse_ai_memory_maintenance_free(&plan);
+        return ok ? QIHSE_AIMEM_WRITE_REPLAY : QIHSE_AIMEM_WRITE_FAILED;
+    }
+    if (!ok || (rollback && plan.state != QIHSE_AIMEM_MAINT_APPLIED) ||
+        (!rollback && plan.state != QIHSE_AIMEM_MAINT_PLANNED)) goto done;
+    qihse_ai_memory_knowledge_version_t latest = {0}, next = {0};
+    ok = qihse_ai_memory_knowledge_latest(server, user, plan.knowledge_id,
+                                           &plan.scope, &latest);
+    const char* expected = rollback ? plan.output_version_id : plan.source_version_id;
+    const char* content = rollback ? plan.original_content : plan.replacement_content;
+    if (ok && strcmp(latest.version_id, expected) == 0) {
+        ok = qihse_ai_memory_knowledge_revise(server, user, plan.knowledge_id,
+            latest.version_id, latest.revision, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+            content, &next) == QIHSE_AIMEM_WRITE_NEW;
+    } else if (ok && strcmp(latest.content, content) == 0 &&
+               strcmp(latest.supersedes_version, expected) == 0) {
+        ok = aimem_knowledge_copy(&latest, &next);
+    } else ok = false;
+    qihse_ai_memory_knowledge_free(&latest);
+    if (!ok) { qihse_ai_memory_knowledge_free(&next); goto done; }
+    if (!rollback) snprintf(plan.output_version_id, sizeof plan.output_version_id,
+                            "%s", next.version_id);
+    plan.state = wanted;
+    char key[128]; char* encoded = aimem_maintenance_encode(&plan, owner);
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    qihse_kv_record_meta_t meta;
+    ok = encoded && aimem_maintenance_key(key, sizeof key, user, plan_id) &&
+         qihse_kv_meta_user(store, key, user, &meta) &&
+         qihse_kv_compare_set_user(store, key, raw, encoded, meta.classification,
+             meta.sci_compartment, user) == QIHSE_KV_CAS_UPDATED;
+    free(encoded); qihse_ai_memory_knowledge_free(&next);
+    if (ok) { aimem_counter_inc(&g_aimem_maintenance_versions); ok = aimem_maintenance_copy(&plan, out); }
+done:
+    free(raw); qihse_ai_memory_maintenance_free(&plan);
+    return ok ? QIHSE_AIMEM_WRITE_NEW : QIHSE_AIMEM_WRITE_FAILED;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_apply(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* plan_id,
+        qihse_ai_memory_maintenance_plan_t* out) {
+    return aimem_maintenance_transition(server, user, plan_id, false, out);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_rollback(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* plan_id,
+        qihse_ai_memory_maintenance_plan_t* out) {
+    return aimem_maintenance_transition(server, user, plan_id, true, out);
+}
+
+typedef struct { char* raw; uint16_t classification, sci; char id[37]; } aimem_export_row_t;
+typedef struct {
+    qihse_resp_server_t* server; qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope;
+    aimem_export_row_t* rows; size_t count, cap; bool failed;
+} aimem_export_build_t;
+
+static bool aimem_export_collect_cb(const char* key, const char* value, void* opaque) {
+    aimem_export_build_t* b = opaque; aimem_knowledge_chain_t chain;
+    if (!aimem_knowledge_chain_parse(value, &chain)) return true;
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    bool include = aimem_scope_matches(&chain.scope, b->scope) &&
+        aimem_scope_owner_allowed(store, b->user, chain.owner_id, b->scope);
+    qihse_kv_record_meta_t meta;
+    if (include) include = qihse_kv_meta_user(store, key, b->user, &meta);
+    if (include) {
+        if (b->count == b->cap) {
+            size_t cap = b->cap ? b->cap * 2u : 8u;
+            aimem_export_row_t* rows = realloc(b->rows, cap * sizeof(*rows));
+            if (!rows) b->failed = true; else { b->rows = rows; b->cap = cap; }
+        }
+        if (!b->failed) {
+            aimem_export_row_t* row = &b->rows[b->count]; memset(row, 0, sizeof(*row));
+            row->raw = strdup(value); row->classification = meta.classification;
+            row->sci = meta.sci_compartment;
+            snprintf(row->id, sizeof row->id, "%s", chain.knowledge_id);
+            if (!row->raw) b->failed = true; else b->count++;
+        }
+    }
+    aimem_knowledge_chain_free(&chain); return !b->failed;
+}
+
+static int aimem_export_row_compare(const void* a, const void* b) {
+    return strcmp(((const aimem_export_row_t*)a)->id,
+                  ((const aimem_export_row_t*)b)->id);
+}
+
+static bool aimem_sha256_hex(const void* data, size_t len, char out[65]) {
+    unsigned char digest[32]; unsigned int n = 0u;
+    if (EVP_Digest(data, len, digest, &n, EVP_sha256(), NULL) != 1 || n != 32u)
+        return false;
+    for (size_t i = 0; i < 32u; i++) {
+        out[i * 2u] = aimem_hex_digit(digest[i] >> 4);
+        out[i * 2u + 1u] = aimem_hex_digit(digest[i] & 15u);
+    }
+    out[64] = '\0'; return true;
+}
+
+bool qihse_ai_memory_export_scope(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+        qihse_ai_memory_export_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !aimem_scope_valid(scope) || !out) return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    aimem_export_build_t b = { server, user, scope, NULL, 0u, 0u, false };
+    char prefix[48]; int pn = snprintf(prefix, sizeof prefix, "t:%u/aimem-knowledge:",
+        (unsigned)qihse_user_get_tenant_id(user));
+    bool ok = store && pn > 0 && (size_t)pn < sizeof prefix &&
+        qihse_kv_foreach_prefix_user(store, prefix, user, aimem_export_collect_cb, &b) && !b.failed;
+    qsort(b.rows, b.count, sizeof(*b.rows), aimem_export_row_compare);
+    size_t cap = 512u;
+    for (size_t i = 0; ok && i < b.count; i++) {
+        size_t n = strlen(b.rows[i].raw);
+        if (n > AIMEM_KNOWLEDGE_MAX_ENCODED || cap > SIZE_MAX - n * 2u - 64u) ok = false;
+        else cap += n * 2u + 64u;
+    }
+    char* blob = ok ? malloc(cap + 66u) : NULL; size_t used = 0u;
+#define EAPPEND(...) do { int z = snprintf(blob + used, cap + 66u - used, __VA_ARGS__); if (z < 0 || (size_t)z >= cap + 66u - used) { ok = false; } else used += (size_t)z; } while (0)
+    if (blob) EAPPEND("QAX1|%u|%s|%s|%s|%s|%zu", (unsigned)qihse_user_get_tenant_id(user),
+        scope->project, scope->worktree, scope->workstream, scope->session, b.count);
+    else ok = false;
+    for (size_t i = 0; ok && i < b.count; i++) {
+        char* hex = aimem_hex_encode(b.rows[i].raw);
+        if (!hex) { ok = false; break; }
+        EAPPEND("|%u|%u|%s", (unsigned)b.rows[i].classification,
+                (unsigned)b.rows[i].sci, hex); free(hex);
+    }
+    char digest[65];
+    if (ok) ok = aimem_sha256_hex(blob, used, digest);
+    if (ok) EAPPEND("|%s", digest);
+#undef EAPPEND
+    for (size_t i = 0; i < b.count; i++) free(b.rows[i].raw);
+    free(b.rows);
+    if (!ok) { free(blob); return false; }
+    out->data = (uint8_t*)blob; out->len = used;
+    aimem_counter_inc(&g_aimem_exports); return true;
+}
+
+void qihse_ai_memory_export_free(qihse_ai_memory_export_t* value) {
+    if (!value) return;
+    free(value->data);
+    memset(value, 0, sizeof(*value));
+}
+
+qihse_ai_memory_import_result_t qihse_ai_memory_import_scope(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const uint8_t* data, size_t len,
+        bool dry_run, size_t* out_imported) {
+    if (out_imported) *out_imported = 0u;
+    if (!server || !user || !qihse_auth_user_is_active(user) || !scope ||
+        !aimem_scope_valid(scope) || !data || !len || len > 16u * 1024u * 1024u ||
+        !qihse_ai_memory_project_owner_allowed(server, user, scope->project))
+        return QIHSE_AIMEM_IMPORT_FAILED;
+    char* copy = malloc(len + 1u); if (!copy) return QIHSE_AIMEM_IMPORT_FAILED;
+    memcpy(copy, data, len); copy[len] = '\0';
+    char* last = strrchr(copy, '|'); char digest[65];
+    bool ok = last && strlen(last + 1u) == 64u &&
+        aimem_sha256_hex(copy, (size_t)(last - copy), digest) &&
+        strcmp(digest, last + 1u) == 0;
+    if (last) *last = '\0';
+    char* cur = copy; char* magic = strsep(&cur, "|"); char* tenant = strsep(&cur, "|");
+    char* project = strsep(&cur, "|"); char* tree = strsep(&cur, "|");
+    char* stream = strsep(&cur, "|"); char* session = strsep(&cur, "|");
+    char* count_text = strsep(&cur, "|"); uint32_t tenant_id = 0u; uint64_t count64 = 0u;
+    ok = ok && magic && strcmp(magic, "QAX1") == 0 &&
+        aimem_token_u32(tenant, &tenant_id) && tenant_id == qihse_user_get_tenant_id(user) &&
+        project && tree && stream && session && count_text &&
+        strcmp(project, scope->project) == 0 && strcmp(tree, scope->worktree) == 0 &&
+        strcmp(stream, scope->workstream) == 0 && strcmp(session, scope->session) == 0 &&
+        aimem_token_u64(count_text, &count64) && count64 <= QIHSE_AIMEM_QUERY_MAX_ROWS;
+    size_t count = (size_t)count64;
+    aimem_export_row_t* rows = ok ? calloc(count ? count : 1u, sizeof(*rows)) : NULL;
+    if (ok && !rows) ok = false;
+    for (size_t i = 0; ok && i < count; i++) {
+        char* cls = strsep(&cur, "|"); char* sci = strsep(&cur, "|");
+        char* hex = strsep(&cur, "|"); uint32_t c = 0u, s = 0u;
+        ok = cls && sci && hex && aimem_token_u32(cls, &c) && c <= UINT16_MAX &&
+            aimem_token_u32(sci, &s) && s <= UINT16_MAX &&
+            qihse_auth_can_access(user, (uint16_t)c, (uint16_t)s);
+        if (ok) rows[i].raw = aimem_hex_decode(hex);
+        rows[i].classification = (uint16_t)c; rows[i].sci = (uint16_t)s;
+        aimem_knowledge_chain_t chain = {0};
+        if (ok) {
+            ok = rows[i].raw && aimem_knowledge_chain_parse(rows[i].raw, &chain) &&
+                aimem_scope_matches(&chain.scope, scope) &&
+                (chain.owner_id == qihse_user_get_id(user) ||
+                 qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR);
+            qihse_user_t* owner = ok ? qihse_auth_get_user(chain.owner_id) : NULL;
+            ok = ok && owner && qihse_auth_user_is_active(owner) &&
+                qihse_user_get_tenant_id(owner) == tenant_id;
+        }
+        if (ok) snprintf(rows[i].id, sizeof rows[i].id, "%s", chain.knowledge_id);
+        aimem_knowledge_chain_free(&chain);
+    }
+    ok = ok && cur == NULL;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    bool conflict = false;
+    for (size_t i = 0; ok && i < count; i++) {
+        char key[128]; ok = aimem_knowledge_key(key, sizeof key, user, rows[i].id);
+        char* existing = ok ? qihse_kv_get_user(store, key, user) : NULL;
+        if (existing && strcmp(existing, rows[i].raw) != 0) conflict = true;
+        free(existing);
+    }
+    if (ok && !conflict && !dry_run) for (size_t i = 0; i < count; i++) {
+        char key[128]; (void)aimem_knowledge_key(key, sizeof key, user, rows[i].id);
+        qihse_kv_cas_result_t r = qihse_kv_compare_set_user(store, key, NULL,
+            rows[i].raw, rows[i].classification, rows[i].sci, user);
+        if (r == QIHSE_KV_CAS_MISMATCH) {
+            char* existing = qihse_kv_get_user(store, key, user);
+            bool same = existing && strcmp(existing, rows[i].raw) == 0; free(existing);
+            if (!same) { conflict = true; break; }
+        } else if (r != QIHSE_KV_CAS_UPDATED) { ok = false; break; }
+        if (out_imported) (*out_imported)++;
+    }
+    for (size_t i = 0; i < count; i++) free(rows ? rows[i].raw : NULL);
+    free(rows); free(copy);
+    if (!ok) { aimem_counter_inc(&g_aimem_rejected); return QIHSE_AIMEM_IMPORT_FAILED; }
+    if (conflict) return QIHSE_AIMEM_IMPORT_CONFLICT;
+    if (!dry_run) aimem_counter_inc(&g_aimem_imports);
+    return dry_run ? QIHSE_AIMEM_IMPORT_VALID : QIHSE_AIMEM_IMPORT_APPLIED;
+}
+
+typedef struct { qihse_resp_server_t* server; qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope; bool valid; } aimem_index_rebuild_validate_t;
+static bool aimem_rebuild_validate_cb(const char* key, const char* value, void* opaque) {
+    (void)key; aimem_index_rebuild_validate_t* b = opaque; aimem_knowledge_chain_t chain;
+    if (!aimem_knowledge_chain_parse(value, &chain)) { b->valid = false; return false; }
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    if (aimem_scope_matches(&chain.scope, b->scope) &&
+        !aimem_scope_owner_allowed(store, b->user, chain.owner_id, b->scope)) b->valid = false;
+    aimem_knowledge_chain_free(&chain); return b->valid;
+}
+
+static bool aimem_index_state_key(char* out, size_t cap, qihse_user_t* user,
+                                  const qihse_ai_memory_scope_t* scope) {
+    int n = snprintf(out, cap, "t:%u/aimem-index-state:%s:%s:%s:%s",
+        (unsigned)qihse_user_get_tenant_id(user), scope->project,
+        scope->worktree, scope->workstream, scope->session);
+    return n > 0 && (size_t)n < cap;
+}
+
+bool qihse_ai_memory_index_rebuild(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope) {
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !aimem_scope_valid(scope) ||
+        !qihse_ai_memory_project_owner_allowed(server, user, scope->project)) return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server); char prefix[48];
+    int n = snprintf(prefix, sizeof prefix, "t:%u/aimem-knowledge:",
+        (unsigned)qihse_user_get_tenant_id(user));
+    aimem_index_rebuild_validate_t b = { server, user, scope, true };
+    bool ok = store && n > 0 && (size_t)n < sizeof prefix &&
+        qihse_kv_foreach_prefix_user(store, prefix, user, aimem_rebuild_validate_cb, &b) && b.valid;
+    uint64_t generation = __atomic_add_fetch(&g_aimem_index_generation, 1u, __ATOMIC_RELAXED);
+    char key[512], record[256];
+    int written = snprintf(record, sizeof record, "QHI1|%llu|READY|%s|%zu|%llu",
+        (unsigned long long)generation, qihse_ai_memory_embedder_name(),
+        qihse_ai_memory_embedding_dim(), (unsigned long long)qihse_kv_change_seq(store));
+    return ok && written > 0 && (size_t)written < sizeof record &&
+        aimem_index_state_key(key, sizeof key, user, scope) &&
+        qihse_kv_set_user(store, key, record, qihse_user_get_classification(user),
+                          qihse_user_get_sci(user), user);
+}
+
+bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, qihse_ai_memory_health_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !aimem_scope_valid(scope) || !out ||
+        (!qihse_ai_memory_project_owner_allowed(server, user, scope->project) &&
+         !qihse_ai_memory_project_reader_allowed(server, user, scope->project))) return false;
+    snprintf(out->provider, sizeof out->provider, "%s", qihse_ai_memory_embedder_name());
+    out->dimension = qihse_ai_memory_embedding_dim();
+    qihse_kv_store_t* store = qihse_resp_server_store(server); char key[512];
+    char* raw = aimem_index_state_key(key, sizeof key, user, scope) ?
+        qihse_kv_get_user(store, key, user) : NULL;
+    unsigned long long generation = 0u, highwater = 0u; char state[16], provider[65]; size_t dim = 0u;
+    out->ready = raw && sscanf(raw, "QHI1|%llu|%15[^|]|%64[^|]|%zu|%llu",
+        &generation, state, provider, &dim, &highwater) == 5 && strcmp(state, "READY") == 0;
+    if (qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR) {
+        out->generation = generation; out->source_highwater = highwater;
+        out->query_snapshots = __atomic_load_n(&g_aimem_query_snapshots, __ATOMIC_RELAXED);
+        out->maintenance_versions = __atomic_load_n(&g_aimem_maintenance_versions, __ATOMIC_RELAXED);
+        out->exports = __atomic_load_n(&g_aimem_exports, __ATOMIC_RELAXED);
+        out->imports = __atomic_load_n(&g_aimem_imports, __ATOMIC_RELAXED);
+        out->rejected = __atomic_load_n(&g_aimem_rejected, __ATOMIC_RELAXED);
+    }
+    free(raw); return true;
+}
+
 bool qihse_ai_memory_forget_scoped(qihse_resp_server_t* server,
                                    qihse_user_t* user, const char* id,
                                    const qihse_ai_memory_scope_t* scope) {

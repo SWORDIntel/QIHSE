@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 are partial. QH-04 now has a tenant-scoped single-record lineage ledger, authorization-aware KV CAS, durable RESP create/revise, exact/latest/as-of reads, and native/wire security regressions. It still needs source-event validation, content hashes and review metadata, typed relations, audit and crash/retry coverage. QH-00–QH-03 retain the remaining gates described below; QH-05–QH-10 remain planned. Integrated into the master roadmap as W10.
+> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-08 are partial. QH-04 has a tenant-scoped single-record lineage ledger and authorization-aware KV CAS. QH-05–QH-08 now have native bounded query snapshots, reversible one-lineage maintenance, authenticated canonical projection and redacted rebuild health, with focused restart/security coverage. Their remaining wire, provenance, paging, signing, atomic-import, telemetry and generation-cutover gates are described below. QH-09/QH-10 remain planned. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -184,6 +184,14 @@ Query pagination must be stable across concurrent writes using a snapshot/index 
 
 **Acceptance:** Pagination has no gaps/duplicates under a fixed generation; expired/superseded default filters obey declared semantics; replaying one page under a lower-clearance principal fails safely; BM25/ANN/RRF share identical authorization criteria.
 
+**First implementation:** the native `query_begin/next/end` contract
+materializes at most 4,096 already-authorized QHK versions, applies explicit
+scope/type/status/current/time/text filters and stable `(ingest time, UUID)`
+ordering, then rechecks actor, grant and labels on every page. This gives a
+fixed process-local view under concurrent writes and fails closed after grant
+revocation. It remains **partial** pending wire cursors, changed-since listing,
+BM25/ANN/RRF integration, relation/as-of projection and bounded explain output.
+
 ## QH-06 — Conservative maintenance primitives
 
 Only after QH-04's reversible versions exist, enable memory decay/dedup/compaction building blocks.
@@ -197,6 +205,13 @@ Only after QH-04's reversible versions exist, enable memory decay/dedup/compacti
 
 **Acceptance:** No cross-tenant/scope/SCI compaction; deterministic rollback reconstructs original records; abort mid-sweep leaves index and KV consistent; default settings reproduce pre-maintenance retrieval behavior.
 
+**First implementation:** native dry-run/durable `QHM1` plans apply a
+replacement only to one expected QHK head and rollback by appending the exact
+pre-maintenance content as another immutable successor. Applied plans survive
+restart and replay idempotently. This remains **partial** pending retention
+tiers, source hashes/provenance, cross-record transaction semantics, recall A/B
+fixtures and crash injection at every transition.
+
 ## QH-07 — Authorized snapshot/export/import projection
 
 Provide an authenticated scoped export that allows Supermemory to produce Markdown/OKF pages, immutable event capsules and a signed/hashed manifest. Export is **not** a raw KV filesystem dump and does not bypass the QIHSE principal or SCI policy.
@@ -207,6 +222,15 @@ Import through authenticated, idempotent QIHSE APIs; never let a supplied file s
 
 **Acceptance:** Export with low-clearance principal contains no higher-label files, filenames, link targets, totals or metadata. Round-trip to disposable store reproduces authorized current contents, version lineage and source IDs; a malformed or tampered manifest is rejected.
 
+**First implementation:** authenticated native export emits deterministic
+tenant/scope-bound `QAX1` logical QHK records with effective labels and a
+SHA-256 trailer. Import validates the whole archive before writes, supports dry
+run and idempotent identical rows, and rejects altered manifests or conflicting
+IDs. A focused low-clearance round-trip preserves visible lineage while
+excluding a high-label row. This remains **partial** pending signatures,
+streaming handles, complete event/relation projection and atomic multi-record
+import with crash recovery.
+
 ## QH-08 — Audit, metrics, index repair, operational gates
 
 Add content-free counters and logs for event admission, dedup, durable checkpoint lag, rejected scope attempts, replay, handoff CAS conflict, index generation, re-embedding backlog and maintenance version growth. A dashboard is optional; an authenticated CLI/RESP health route is sufficient initially.
@@ -216,6 +240,13 @@ Tests must prove that metrics do not disclose hidden record cardinality to an un
 Expose a deterministic index-repair/rebuild workflow from authoritative QIHSE records, with generation-aware cutover and zero undocumented semantic fallback. When switching embedding providers, preserve current model-binding guarantees; plan re-embedding rather than comparing unlike vector spaces.
 
 **Acceptance:** Kill backend during rebuild and restart safely; configured semantic model load failures remain fail-closed; fail/retry counters and logs never include bearer secrets or memory plaintext.
+
+**First implementation:** an authenticated rebuild validates the authoritative
+QHK projection and persists `QHI1` provider, dimension, generation and KV
+high-water state. Ordinary health reports only provider/dimension/readiness;
+Operator health adds content-free counters. This remains **partial** pending
+side-index generation swap, durable BUILDING/FAILED recovery, metrics registry
+wiring, audit events and semantic-provider failure/cutover crash tests.
 
 ## QH-09 / QH-10 — Defer until justified
 

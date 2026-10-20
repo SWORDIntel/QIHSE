@@ -251,8 +251,43 @@ IDs, which must be restored consistently across process restarts.
 
 Index rebuild is derived from authoritative KV documents; a durable ACK
 does not certify semantic-index freshness if embedding/indexing fails.
-QH-01 through QH-04 have partial implementations with their remaining gates
+QH-01 through QH-08 have partial implementations with their remaining gates
 tracked in `ROADMAP.md` and `QIHSE_ENGINE_ROADMAP.md`.
+
+## Native QH-05 through QH-08 contracts
+
+The C interface now exposes a bounded curated-knowledge projection without
+changing the existing RESP verbs. `qihse_ai_memory_query_begin()` materializes
+only rows visible to the explicit principal and requested scope, applies type,
+status, current-version, ingestion-time and text filters, then sorts by
+ingestion time and version UUID. `query_next()` pages that immutable result and
+rechecks the same actor, current project membership, classification and SCI on
+every row. A revoked grant therefore cannot continue draining already
+materialized content. Each hit includes a bounded lexical score and explicit
+text-match/current explanation flags. Snapshots are bounded to 4,096 rows and
+are process-local; callers must restart a query after process loss.
+
+One-lineage maintenance uses durable `QHM1` plans. Planning can be side-effect
+free; apply appends a normal `QHK1` successor and rollback appends another
+successor containing the pre-maintenance content. Original versions are never
+deleted. Repeated apply is idempotent, and an applied plan is recoverable after
+restart. Multi-lineage merges, automatic retention and autonomous dedup remain
+outside this first slice.
+
+`qihse_ai_memory_export_scope()` emits a canonical `QAX1` logical projection,
+not KV/SSTable bytes. It contains only authorized `QHK1` lineages, their
+effective labels and a SHA-256 trailer. Import verifies the complete digest,
+tenant, scope, labels, ownership and every ledger before writing; dry run is
+available and collisions with different bytes fail closed. This first format
+is integrity checked but not yet signed, chunk streamed or multi-record atomic.
+
+Index rebuild validation writes a durable `QHI1` ready record containing the
+provider binding, dimension, generation and authoritative KV high-water.
+Health returned to ordinary principals is redacted to provider, dimension and
+readiness. Only an Operator receives generation, high-water and content-free
+operation counters. The current rebuild validates the authorized QHK
+projection; generation-swapped BM25/vector side indexes and crash injection
+during cutover remain follow-up work.
 
 ## Operational properties
 
