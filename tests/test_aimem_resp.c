@@ -258,7 +258,16 @@ int main(void) {
         QIHSE_ROLE_GUEST, 0u, 0u, "Tenant8Pass123!", false);
     qihse_user_t* tenant7_reader = qihse_auth_create_tenant_user(op, 7u, 9044u,
         QIHSE_ROLE_GUEST, 0u, 0u, "Tenant7Reader123!", false);
-    assert(tenant7 && tenant8 && tenant7_reader);
+    qihse_user_t* aimem_service = qihse_auth_create_tenant_user(op, 77u, 9047u,
+        QIHSE_ROLE_ANALYST, UINT16_MAX, UINT16_MAX,
+        "AimemServicePass123!", false);
+    qihse_user_t* low_migration_target = qihse_auth_create_tenant_user(op, 78u,
+        9048u, QIHSE_ROLE_GUEST, 0u, 0u, "AimemLowTarget123!", false);
+    qihse_user_t* foreign_full = qihse_auth_create_tenant_user(op, 79u, 9049u,
+        QIHSE_ROLE_ANALYST, UINT16_MAX, UINT16_MAX,
+        "AimemForeignFull123!", false);
+    assert(tenant7 && tenant8 && tenant7_reader && aimem_service &&
+           low_migration_target && foreign_full);
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     assert(store);
@@ -266,8 +275,15 @@ int main(void) {
     qihse_resp_server_config_init(&cfg);
     cfg.store = store;
     cfg.auth_required = true;
+    cfg.aimem_service_user_id = qihse_user_get_id(aimem_service);
     cfg.enable_uwp_bridge = true;
     cfg.port = 0;
+    qihse_resp_server_config_t invalid_service_cfg = cfg;
+    invalid_service_cfg.aimem_service_user_id = qihse_user_get_id(op);
+    assert(qihse_resp_server_create(&invalid_service_cfg) == NULL);
+    invalid_service_cfg = cfg;
+    invalid_service_cfg.auth_required = false;
+    assert(qihse_resp_server_create(&invalid_service_cfg) == NULL);
     server = qihse_resp_server_create(&cfg);
     assert(server);
 
@@ -344,6 +360,77 @@ int main(void) {
     /* The historical unscoped idempotency mapping is deliberately not
      * redirected across scopes; replay fails closed after migration. */
     expect_contains(op, 5u, store_secret, "ERR CONFLICT");
+
+    /* Dedicated-principal migration derives the destination tenant from the
+     * target and binds owner metadata to that target. A low-clearance target
+     * cannot receive the Operator-labelled source, and the refusal leaves the
+     * legacy row intact. */
+    const char* target_store[] = { "AIMEM", "STORE", "2",
+        "target principal classified memory", "target-secret-1" };
+    reply = NULL;
+    reply_len = run(op, 5u, target_store, &reply);
+    char* target_secret_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* migrate_low_target[] = { "AIMEM", "MIGRATE-LEGACY-TO",
+        "placeholder", "9048", "project-service", "tree-a", "stream-a",
+        "session-a" };
+    migrate_low_target[2] = target_secret_id;
+    expect_contains(op, 8u, migrate_low_target,
+                    "ERR AIMEM legacy migration failed");
+    const char* target_legacy_get[] = { "AIMEM", "GET", "placeholder" };
+    target_legacy_get[2] = target_secret_id;
+    expect_contains(op, 3u, target_legacy_get,
+                    "target principal classified memory");
+    expect_contains(guest, 8u, migrate_low_target,
+                    "NOPERM AIMEM legacy migration requires a system Operator");
+
+    const char* migrate_to_service[] = { "AIMEM", "MIGRATE-LEGACY-TO",
+        "placeholder", "9047", "project-service", "tree-a", "stream-a",
+        "session-a" };
+    migrate_to_service[2] = target_secret_id;
+    reply = NULL;
+    reply_len = run(op, 8u, migrate_to_service, &reply);
+    migrated_id = extract_bulk_id(reply, reply_len);
+    assert(strcmp(migrated_id, target_secret_id) == 0);
+    free(migrated_id); free(reply);
+    expect_contains(op, 3u, target_legacy_get, "$-1\r\n");
+    const char* target_scoped_get[] = { "AIMEM", "GET-SCOPED", "placeholder",
+        "project-service", "tree-a", "stream-a", "session-a" };
+    target_scoped_get[2] = target_secret_id;
+    expect_contains(aimem_service, 7u, target_scoped_get,
+                    "target principal classified memory");
+    expect_contains(tenant8, 7u, target_scoped_get, "$-1\r\n");
+    expect_contains(foreign_full, 7u, target_scoped_get, "$-1\r\n");
+    reply = NULL;
+    reply_len = run(op, 8u, migrate_to_service, &reply);
+    migrated_id = extract_bulk_id(reply, reply_len);
+    assert(strcmp(migrated_id, target_secret_id) == 0);
+    free(migrated_id); free(reply);
+    const char* mismatched_target_scope[] = { "AIMEM", "MIGRATE-LEGACY-TO",
+        "placeholder", "9047", "project-service-other", "", "", "" };
+    mismatched_target_scope[2] = target_secret_id;
+    expect_contains(op, 8u, mismatched_target_scope, "ERR CONFLICT");
+
+    /* The target has labels broad enough to read this raw row at the KV
+     * layer. The centralized command allowlist must still deny both payload
+     * materialization and mutation through generic RESP commands. */
+    assert(qihse_kv_set_user(store, "raw-high-secret",
+        "AIMEM_RAW_HIGH_MARKER", UINT16_MAX, UINT16_MAX, op));
+    const char* raw_get[] = { "GET", "raw-high-secret" };
+    const char* raw_set[] = { "SET", "raw-high-secret", "overwritten" };
+    const char* machineauth[] = { "MACHINEAUTH", "spoofed-claim" };
+    expect_contains(aimem_service, 2u, raw_get,
+        "NOPERM the AIMEM service identity may only execute AIMEM");
+    expect_contains(aimem_service, 3u, raw_set,
+        "NOPERM the AIMEM service identity may only execute AIMEM");
+    expect_contains(aimem_service, 2u, machineauth,
+        "NOPERM the AIMEM service identity may only execute AIMEM");
+    char* raw_value = qihse_kv_get_user(store, "raw-high-secret", op);
+    assert(raw_value && strcmp(raw_value, "AIMEM_RAW_HIGH_MARKER") == 0);
+    free(raw_value);
+    const char* service_inventory[] = { "AIMEM", "LEGACY", "SCAN", "0", "10" };
+    expect_contains(aimem_service, 5u, service_inventory,
+        "ERR tenant AIMEM access requires explicit project scope");
 
     const char* forget[] = { "AIMEM", "FORGET", "placeholder" };
     forget[2] = public_id;
@@ -744,6 +831,7 @@ int main(void) {
 
     free(public_id);
     free(secret_id);
+    free(target_secret_id);
     free(scoped_id);
     free(high_scoped_id);
     free(worktree_id);

@@ -274,6 +274,16 @@ qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
     qihse_resp_server_t* server, qihse_user_t* operator_user,
     const char* id, const qihse_ai_memory_scope_t* destination);
 
+/* Operator-authorized variant that assigns the scoped record to a distinct,
+ * active non-Operator principal in a nonzero tenant.  The target must be able
+ * to read the source classification/SCI labels. Its tenant selects the
+ * destination namespace; UUID, timestamp, kind, labels and content remain
+ * unchanged. */
+qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy_to(
+    qihse_resp_server_t* server, qihse_user_t* operator_user,
+    qihse_user_t* target_user, const char* id,
+    const qihse_ai_memory_scope_t* destination);
+
 /* QH-04 immutable curated-knowledge chains. Create/revise replace one
  * tenant-scoped chain record atomically; callers that promise a durable ACK
  * must serialize the call and qihse_kv_sync_store() under the server KV lock. */
