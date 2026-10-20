@@ -1083,19 +1083,28 @@ static uint32_t qihse_session_peer_ip(const qihse_resp_session_t* session) {
     return 0;
 }
 
+static void qihse_resp_cleanse(void* memory, size_t length) {
+    volatile uint8_t* p = (volatile uint8_t*)memory;
+    while (p && length--) *p++ = 0u;
+}
+
 static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_resp_arg_t* username, const qihse_resp_arg_t* password, bool* authenticated) {
     *authenticated = false;
     char* user_text = qihse_resp_arg_text(username);
     char* password_text = qihse_resp_arg_text(password);
     if (!user_text || !password_text) {
         free(user_text);
-        free(password_text);
+        if (password_text) {
+            qihse_resp_cleanse(password_text, password->len + 1u);
+            free(password_text);
+        }
         return qihse_resp_error(session, "ERR invalid credentials");
     }
     /* The real peer IP, so both auth rate limiters bucket per client instead
      * of lumping every connection into the shared IP-0 bucket. */
     qihse_user_t* user = qihse_auth_authenticate_from(qihse_session_peer_ip(session), user_text, password_text);
     free(user_text);
+    qihse_resp_cleanse(password_text, password->len + 1u);
     free(password_text);
     if (!user) return qihse_resp_error(session, "WRONGPASS invalid username-password pair or user is disabled.");
     session->user = user;
@@ -1114,8 +1123,14 @@ static bool qihse_resp_handle_auth(qihse_resp_session_t* session, const qihse_re
         response = qihse_resp_authenticate(session, &username, &request->argv[1], &authenticated);
     } else if (request->argc == 3) {
         response = qihse_resp_authenticate(session, &request->argv[1], &request->argv[2], &authenticated);
-    } else {
-        return qihse_resp_wrong_arity(session, "auth");
+    } else response = qihse_resp_wrong_arity(session, "auth");
+    /* Socket request arguments alias the mutable receive buffer. Scrub every
+     * AUTH operand even for malformed arities. In-process callers may supply
+     * read-only literals, so only mutate network input. */
+    if (session->fd >= 0) {
+        for (size_t i = 1u; i < request->argc; i++)
+            qihse_resp_cleanse((void*)request->argv[i].data,
+                               request->argv[i].len);
     }
     if (!response || !authenticated) return response;
     return qihse_resp_simple(session, "OK");
@@ -1677,9 +1692,24 @@ static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
             "ERR machine auth refused: principal-not-authoritative");
     }
 
-    /* The signed token selects an existing restricted principal; it cannot
-     * synthesize a system-domain or more highly cleared identity. */
-    session->peer_claims_valid = false;
+    /* Preserve the token's deliberate clearance/SCI attenuation after
+     * proving that it names a live authoritative restricted principal. */
+    memset(&session->peer_claims, 0, sizeof(session->peer_claims));
+    session->peer_claims.user_id = verified.principal_user_id;
+    /* Command scope remains fixed by MACHINEAUTH's capability allowlist.  Use
+     * the authoritative principal's non-Operator role so its permitted
+     * telemetry writes still pass the storage RBAC layer. */
+    session->peer_claims.role = qihse_user_get_role(principal);
+    session->peer_claims.classification_level = verified.clearance;
+    session->peer_claims.sci_compartments = verified.sci;
+    session->peer_claims.tenant_id = verified.principal_tenant;
+    snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
+             "machine:%02x%02x", verified.submitter_node.bytes[0],
+             verified.submitter_node.bytes[1]);
+    session->peer_claims_valid = true;
+    /* Storage primitives accept authoritative registry identities only. The
+     * machine label cap is enforced before GET/SET below; the fixed command
+     * and key-prefix capability prevents any other use of this authority. */
     session->user = principal;
     session->user_id = verified.principal_user_id;
     session->auth_kind = QIHSE_RESP_AUTH_MACHINE_CLAIMS;
@@ -1702,7 +1732,13 @@ static bool qihse_resp_handle_hello(qihse_resp_session_t* session, const qihse_r
     while (cursor < request->argc) {
         if (qihse_resp_arg_equal(&request->argv[cursor], "AUTH") && cursor + 2u < request->argc) {
             bool authenticated;
-            if (!qihse_resp_authenticate(session, &request->argv[cursor + 1u], &request->argv[cursor + 2u], &authenticated)) return false;
+            bool response = qihse_resp_authenticate(session,
+                &request->argv[cursor + 1u], &request->argv[cursor + 2u],
+                &authenticated);
+            if (session->fd >= 0)
+                qihse_resp_cleanse((void*)request->argv[cursor + 2u].data,
+                                   request->argv[cursor + 2u].len);
+            if (!response) return false;
             if (!authenticated) return true;
             cursor += 3u;
         } else if (qihse_resp_arg_equal(&request->argv[cursor], "SETNAME") && cursor + 1u < request->argc) {
@@ -1895,6 +1931,21 @@ static bool qihse_resp_handle_get(qihse_resp_session_t* session, const qihse_res
     if (!key) key = qihse_resp_arg_text(&request->argv[1]);
     if (!key) return qihse_resp_error(session, "ERR keys containing NUL bytes are not supported by this storage backend");
     pthread_rwlock_rdlock(&session->server->kv_lock);
+    if (session->auth_kind == QIHSE_RESP_AUTH_MACHINE_CLAIMS) {
+        qihse_kv_record_meta_t meta;
+        bool exists = qihse_kv_meta_user(session->server->store, key,
+                                         session->user, &meta);
+        if (exists &&
+            (meta.classification > session->peer_claims.classification_level ||
+             (meta.sci_compartment & session->peer_claims.sci_compartments) !=
+                 meta.sci_compartment)) {
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            qihse_audit_log("MACHINE_ACCESS_DENIED_LABEL", session->user_id, 0u,
+                            meta.classification, meta.sci_compartment);
+            if (key != keybuf) free(key);
+            return qihse_resp_null(session);
+        }
+    }
     char* value = qihse_kv_get_user(session->server->store, key, session->user);
     bool under_attack = qihse_kv_store_is_under_attack(session->server->store);
     pthread_rwlock_unlock(&session->server->kv_lock);
@@ -2391,6 +2442,23 @@ static bool qihse_resp_handle_set(qihse_resp_session_t* session, const qihse_res
         return qihse_resp_error(session, "OOM command not allowed by QIHSE system guard");
     }
     pthread_rwlock_wrlock(&session->server->kv_lock);
+    if (session->auth_kind == QIHSE_RESP_AUTH_MACHINE_CLAIMS) {
+        qihse_kv_record_meta_t meta;
+        bool exists = qihse_kv_meta_user(session->server->store, key,
+                                         session->user, &meta);
+        if (exists &&
+            (meta.classification > session->peer_claims.classification_level ||
+             (meta.sci_compartment & session->peer_claims.sci_compartments) !=
+                 meta.sci_compartment)) {
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            qihse_audit_log("MACHINE_ACCESS_DENIED_LABEL", session->user_id, 0u,
+                            meta.classification, meta.sci_compartment);
+            if (key && key != keybuf) free(key);
+            free(value);
+            return qihse_resp_error(session,
+                "NOPERM machine claim is below the existing record label");
+        }
+    }
     bool exists = qihse_kv_exists_user(session->server->store, key, session->user);
     char* old = return_old && exists ? qihse_kv_get_user(session->server->store, key, session->user) : NULL;
     bool condition = (!nx || !exists) && (!xx || exists);
@@ -13620,14 +13688,13 @@ static bool qihse_resp_is_machine_command(
     if (qihse_resp_command_is(request, "ASKING")) return true;
     if (!session || !session->user || request->argc < 2u ||
         (!qihse_resp_command_is(request, "GET") &&
-         !qihse_resp_command_is(request, "SET") &&
-         !qihse_resp_command_is(request, "PUBLISH"))) return false;
-    uint32_t tenant = qihse_user_get_tenant_id(session->user);
+         !qihse_resp_command_is(request, "SET"))) return false;
+    uint32_t tenant = session->peer_claims.tenant_id;
     if (tenant == QIHSE_TENANT_SYSTEM || tenant == QIHSE_TENANT_INVALID)
         return false;
     char prefix[64];
     int len = snprintf(prefix, sizeof(prefix), "t:%u/machine/%u/", tenant,
-                       qihse_user_get_id(session->user));
+                       session->peer_claims.user_id);
     return len > 0 && (size_t)len < sizeof(prefix) &&
            request->argv[1].len >= (size_t)len &&
            memcmp(request->argv[1].data, prefix, (size_t)len) == 0;
@@ -13655,6 +13722,25 @@ static bool qihse_resp_session_command_allowed(
     }
 }
 
+static void qihse_resp_scrub_denied_auth(
+        qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session || session->fd < 0 || !request) return;
+    if (qihse_resp_command_is(request, "AUTH")) {
+        for (size_t i = 1u; i < request->argc; i++)
+            qihse_resp_cleanse((void*)request->argv[i].data,
+                               request->argv[i].len);
+        return;
+    }
+    if (!qihse_resp_command_is(request, "HELLO")) return;
+    for (size_t i = 1u; i + 2u < request->argc; i++) {
+        if (qihse_resp_arg_equal(&request->argv[i], "AUTH")) {
+            qihse_resp_cleanse((void*)request->argv[i + 2u].data,
+                               request->argv[i + 2u].len);
+            i += 2u;
+        }
+    }
+}
+
 static bool qihse_resp_session_is_aimem_service(
         const qihse_resp_session_t* session) {
     if (!session || !session->server || !session->user ||
@@ -13671,9 +13757,11 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
 
     /* Capability restrictions precede every fast path, including AUTH,
      * PING, admin commands, exports and raw compatibility commands. */
-    if (!qihse_resp_session_command_allowed(session, request))
+    if (!qihse_resp_session_command_allowed(session, request)) {
+        qihse_resp_scrub_denied_auth(session, request);
         return qihse_resp_error(session,
             "NOPERM command is outside the authenticated service capability");
+    }
 
     const uint8_t* cmd_data = request->argv[0].data;
     size_t cmd_len = request->argv[0].len;
@@ -13752,7 +13840,29 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
      * a live lookup so revocation lands on the next command. */
     bool session_active = true;
     uint32_t session_tenant = QIHSE_TENANT_SYSTEM;
-    if (session->user == &session->peer_claims) {
+    if (session->auth_kind == QIHSE_RESP_AUTH_MACHINE_CLAIMS) {
+        session_tenant = session->peer_claims.tenant_id;
+        qihse_user_t* authority = qihse_auth_get_user(session->user_id);
+        bool authority_active = false;
+        uint32_t authority_tenant = QIHSE_TENANT_INVALID;
+        if (authority) qihse_auth_user_active_and_tenant(
+            authority, &authority_active, &authority_tenant);
+        if (!authority_active || authority != session->user ||
+            authority_tenant != session_tenant ||
+            authority_tenant == QIHSE_TENANT_SYSTEM ||
+            qihse_user_get_role(authority) == QIHSE_ROLE_OPERATOR ||
+            session->peer_claims.role != qihse_user_get_role(authority) ||
+            session->peer_claims.classification_level >
+                qihse_user_get_classification(authority) ||
+            (session->peer_claims.sci_compartments &
+                qihse_user_get_sci(authority)) !=
+                session->peer_claims.sci_compartments) {
+            session->user = NULL;
+            session_tenant = QIHSE_TENANT_INVALID;
+            return qihse_resp_error(session,
+                "NOAUTH Machine principal revoked or changed.");
+        }
+    } else if (session->user == &session->peer_claims) {
         session_tenant = session->peer_claims.tenant_id;
     } else if (session->user) {
         qihse_auth_user_active_and_tenant(session->user, &session_active, &session_tenant);
