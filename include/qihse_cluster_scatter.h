@@ -81,6 +81,8 @@ void qihse_cluster_scatter_set_identity(qihse_cluster_scatter_t* sg,
 int qihse_cluster_scatter_vecsearch(qihse_cluster_scatter_t* sg,
                                     const float* query_vector, size_t dims,
                                     size_t top_k, const qihse_user_t* user,
+                                    const void* collection_tag,
+                                    size_t collection_tag_len,
                                     qihse_vector_result_t* out_results);
 
 /*

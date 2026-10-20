@@ -177,6 +177,9 @@ int main(void) {
     const char* cross_search[] = { "VECSEARCH", "2", "5", "0.9", "0.1", "TAG", "t:7/private" };
     send_command(t8.fd, 7, cross_search);
     expect_contains(t8.fd, "NOPERM");
+    const char* unscoped_search[] = { "VECSEARCH", "2", "5", "0.9", "0.1" };
+    send_command(t8.fd, 5, unscoped_search);
+    expect_contains(t8.fd, "NOPERM");
 
     close(t8.fd);
     close(op.fd);

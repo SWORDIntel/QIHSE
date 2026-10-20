@@ -1661,19 +1661,26 @@ static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
         return qihse_resp_error(session, err);
     }
 
-    memset(&session->peer_claims, 0, sizeof(session->peer_claims));
-    session->peer_claims.user_id = verified.principal_user_id;
-    session->peer_claims.role = QIHSE_ROLE_GUEST;
-    session->peer_claims.classification_level = verified.clearance;
-    session->peer_claims.sci_compartments = verified.sci;
-    session->peer_claims.tenant_id = verified.principal_tenant;
-    /* Guest role, no account capabilities, no verifier: a claims context is a
-     * claim about clearance, nothing more. */
-    snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
-             "machine:%02x%02x", verified.submitter_node.bytes[0],
-             verified.submitter_node.bytes[1]);
-    session->peer_claims_valid = true;
-    session->user = &session->peer_claims;
+    qihse_user_t* principal = qihse_auth_get_user(verified.principal_user_id);
+    bool principal_active = false;
+    uint32_t principal_tenant = QIHSE_TENANT_INVALID;
+    if (principal) {
+        qihse_auth_user_active_and_tenant(principal, &principal_active,
+                                          &principal_tenant);
+    }
+    if (!principal_active || principal_tenant == QIHSE_TENANT_SYSTEM ||
+        principal_tenant != verified.principal_tenant ||
+        qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR ||
+        verified.clearance > qihse_user_get_classification(principal) ||
+        (verified.sci & qihse_user_get_sci(principal)) != verified.sci) {
+        return qihse_resp_error(session,
+            "ERR machine auth refused: principal-not-authoritative");
+    }
+
+    /* The signed token selects an existing restricted principal; it cannot
+     * synthesize a system-domain or more highly cleared identity. */
+    session->peer_claims_valid = false;
+    session->user = principal;
     session->user_id = verified.principal_user_id;
     session->auth_kind = QIHSE_RESP_AUTH_MACHINE_CLAIMS;
     qihse_audit_log("MACHINEAUTH_OK", verified.principal_user_id, 0u,
@@ -2740,6 +2747,7 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
         }
         int remote_found = qihse_cluster_scatter_vecsearch(session->server->scatter,
                                                            vector, dims, top_k, session->user,
+                                                           tag_filter.tag, tag_filter.len,
                                                            remote_results);
         /* Merge local and remote results using RRF in-place */
         if (local_found > 0 || remote_found > 0) {
@@ -13595,22 +13603,41 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
 
 static bool qihse_resp_is_repl_data_plane_command(
         const qihse_resp_request_t* request) {
-    return qihse_resp_command_is(request, "REPL.APPLY") ||
-           qihse_resp_command_is(request, "REPL.CURSOR") ||
-           qihse_resp_command_is(request, "REPL.ACK") ||
+    /* A pinned downstream peer reads from this source. Receiver-side APPLY
+     * and CURSOR are deliberately excluded: the puller applies records and
+     * advances its cursor through the in-process adapter, so exposing those
+     * verbs here would let the downstream identity mutate its source. */
+    return qihse_resp_command_is(request, "REPL.ACK") ||
            qihse_resp_command_is(request, "REPL.DELTA") ||
            qihse_resp_command_is(request, "REPL.SNAPSHOT.BEGIN") ||
            qihse_resp_command_is(request, "REPL.SNAPSHOT.READ") ||
            qihse_resp_command_is(request, "REPL.SNAPSHOT.END");
 }
 
-static bool qihse_resp_is_machine_command(const qihse_resp_request_t* request) {
-    /* The deployed fleet agent uses only these unclassified telemetry verbs.
-     * Their handlers retain tenant and row-label authorization. */
-    return qihse_resp_command_is(request, "GET") ||
-           qihse_resp_command_is(request, "SET") ||
-           qihse_resp_command_is(request, "PUBLISH") ||
-           qihse_resp_command_is(request, "ASKING");
+static bool qihse_resp_is_machine_command(
+        const qihse_resp_session_t* session,
+        const qihse_resp_request_t* request) {
+    if (qihse_resp_command_is(request, "ASKING")) return true;
+    if (!session || !session->user || request->argc < 2u ||
+        (!qihse_resp_command_is(request, "GET") &&
+         !qihse_resp_command_is(request, "SET") &&
+         !qihse_resp_command_is(request, "PUBLISH"))) return false;
+    uint32_t tenant = qihse_user_get_tenant_id(session->user);
+    if (tenant == QIHSE_TENANT_SYSTEM || tenant == QIHSE_TENANT_INVALID)
+        return false;
+    char prefix[64];
+    int len = snprintf(prefix, sizeof(prefix), "t:%u/machine/%u/", tenant,
+                       qihse_user_get_id(session->user));
+    return len > 0 && (size_t)len < sizeof(prefix) &&
+           request->argv[1].len >= (size_t)len &&
+           memcmp(request->argv[1].data, prefix, (size_t)len) == 0;
+}
+
+static bool qihse_resp_vecsearch_has_collection_tag(
+        const qihse_resp_request_t* request) {
+    return request && request->argc >= 2u &&
+           qihse_resp_arg_equal(&request->argv[request->argc - 2u], "TAG") &&
+           request->argv[request->argc - 1u].len > 0u;
 }
 
 static bool qihse_resp_session_command_allowed(
@@ -13619,9 +13646,10 @@ static bool qihse_resp_session_command_allowed(
         case QIHSE_RESP_AUTH_QKP_REPLICATION:
             return qihse_resp_is_repl_data_plane_command(request);
         case QIHSE_RESP_AUTH_MACHINE_CLAIMS:
-            return qihse_resp_is_machine_command(request);
+            return qihse_resp_is_machine_command(session, request);
         case QIHSE_RESP_AUTH_PEER_CLAIMS:
-            return qihse_resp_command_is(request, "VECSEARCH");
+            return qihse_resp_command_is(request, "VECSEARCH") &&
+                   qihse_resp_vecsearch_has_collection_tag(request);
         default:
             return true;
     }
@@ -13745,6 +13773,13 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         !qihse_resp_command_is_keystone_feed(request)) {
         return qihse_resp_error(session,
             "NOPERM the KEYSTONE index identity may only consume KEYSTONE.FEED.*");
+    }
+    if (session_tenant != QIHSE_TENANT_SYSTEM &&
+        (qihse_resp_command_is(request, "VECSEARCH") ||
+         qihse_resp_command_is(request, "VECSCATTER")) &&
+        !qihse_resp_vecsearch_has_collection_tag(request)) {
+        return qihse_resp_error(session,
+            "NOPERM tenant vector search requires an explicit collection TAG");
     }
     /* One hash probe per command — reused by the subscribed, MULTI-queue,
      * guard-write and final-dispatch checks below. */

@@ -58,6 +58,7 @@ static char* mint_machine_token_hex(const char* private_key_path) {
     token.purpose = QIHSE_FABRIC_TOKEN_PURPOSE_MACHINE;
     token.job_type = QIHSE_FABRIC_JOB_NONE;
     token.principal_user_id = 71u;
+    token.principal_tenant = 7u;
     uint8_t* der = NULL;
     int der_len = i2d_PUBKEY(key, &der);
     assert(der_len > 0 && der);
@@ -150,8 +151,8 @@ int main(void) {
     assert(qihse_auth_bootstrap_operator("QkpOperatorPass1!"));
     qihse_user_t* op = qihse_auth_get_user(0u);
     assert(op);
-    qihse_user_t* guest = qihse_auth_create_user(op, 71u, QIHSE_ROLE_GUEST,
-        0u, 0u, "QkpGuestPass1!", false);
+    qihse_user_t* guest = qihse_auth_create_tenant_user(op, 7u, 71u,
+        QIHSE_ROLE_GUEST, 0u, 0u, "QkpGuestPass1!", false);
     assert(guest);
     assert(qihse_auth_modify_user(op, 71u, "QIHSE_GUEST_71", NULL,
                                   -1, -1, -1, -1));
@@ -218,6 +219,19 @@ int main(void) {
     reply = read_reply(session, fd);
     assert(reply[0] == '-' && strstr(reply, "NOPERM"));
     free(reply);
+    const char* forged_apply[] = {
+        "REPL.APPLY", "1", "vendor:7:*", "99", "S", "0", "0", "0",
+        "vendor:7:injected", "downstream-controlled"
+    };
+    write_args(session, fd, 10u, forged_apply);
+    reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
+    free(reply);
+    assert(qihse_kv_get_user(store, "vendor:7:injected", op) == NULL);
+    write_command(session, fd, "REPL.CURSOR", "vendor:7:*", NULL, NULL);
+    reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
+    free(reply);
 
     shutdown(fd, SHUT_RDWR);
     close(fd);
@@ -278,7 +292,17 @@ int main(void) {
     free(reply);
     write_command(session, fd, "GET", "vendor:7:secret", NULL, NULL);
     reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
     assert(!strstr(reply, "protected-replica-payload"));
+    free(reply);
+    write_command(session, fd, "SET", "global:forged", "machine-write", NULL);
+    reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
+    free(reply);
+    assert(qihse_kv_get_user(store, "global:forged", op) == NULL);
+    write_command(session, fd, "SET", "t:7/machine/71/thermal", "ok", NULL);
+    reply = read_reply(session, fd);
+    assert(strstr(reply, "+OK\r\n"));
     free(reply);
     const char* denied[][3] = {
         {"USER", "LIST", NULL}, {"SAVE", NULL, NULL},
