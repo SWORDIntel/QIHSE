@@ -291,6 +291,7 @@ bool qihse_ai_memory_knowledge_as_of(qihse_resp_server_t* server,
  * gives paging a stable generation even while the authoritative KV changes.
  * Every page call repeats the principal and project-grant checks. */
 #define QIHSE_AIMEM_QUERY_MAX_ROWS 4096u
+#define QIHSE_AIMEM_QUERY_MAX_TEXT_BYTES 1024u
 typedef struct qihse_ai_memory_query_snapshot qihse_ai_memory_query_snapshot_t;
 typedef struct {
     qihse_ai_memory_scope_t scope;
@@ -299,17 +300,26 @@ typedef struct {
     bool current_only;   /* default public behavior: no superseded version */
     uint64_t ingest_from_ms;
     uint64_t ingest_to_ms; /* inclusive; 0 = unbounded */
+    uint64_t changed_since_ms; /* exclusive incremental sync watermark */
+    uint64_t as_of_ingest_ms; /* 0 = list versions; otherwise one version per lineage */
     const char* text;      /* optional case-insensitive substring */
+    qihse_ai_memory_mode_t mode; /* BM25, semantic, or RRF hybrid */
     size_t max_rows;       /* 1..QIHSE_AIMEM_QUERY_MAX_ROWS */
 } qihse_ai_memory_query_v1_t;
 typedef struct {
     qihse_ai_memory_knowledge_version_t version;
     double lexical_score;
+    double semantic_score;
+    double ranking_score;
     bool current;
+    uint32_t ranking_mode;
     uint32_t explain_flags;
 } qihse_ai_memory_query_hit_t;
 #define QIHSE_AIMEM_QUERY_EXPLAIN_TEXT_MATCH 0x01u
 #define QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT    0x02u
+#define QIHSE_AIMEM_QUERY_EXPLAIN_BM25       0x04u
+#define QIHSE_AIMEM_QUERY_EXPLAIN_SEMANTIC   0x08u
+#define QIHSE_AIMEM_QUERY_EXPLAIN_RRF        0x10u
 qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
     qihse_resp_server_t* server, qihse_user_t* user,
     const qihse_ai_memory_query_v1_t* query);

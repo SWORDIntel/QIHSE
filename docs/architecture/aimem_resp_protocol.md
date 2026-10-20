@@ -39,6 +39,9 @@ AIMEM KNOWLEDGE REVISE <knowledge-id> <expected-version-id> <expected-revision> 
 AIMEM KNOWLEDGE GET <version-id> <project> <worktree> <workstream> <session>
 AIMEM KNOWLEDGE LATEST <knowledge-id> <project> <worktree> <workstream> <session>
 AIMEM KNOWLEDGE AS-OF <knowledge-id> <ingestion-time-ms> <project> <worktree> <workstream> <session>
+AIMEM QUERY V1 BEGIN <project> <worktree> <workstream> <session> <type> <status> <current:0|1> <from-ms> <to-ms> <changed-since-ms> <as-of-ms> <bm25|semantic|hybrid> <text> <max-rows>
+AIMEM QUERY V1 NEXT <cursor-uuid> <page-size>
+AIMEM QUERY V1 END <cursor-uuid>
 ```
 
 `kind` is `1` for episodic or `2` for semantic; `0` selects either kind for
@@ -292,21 +295,31 @@ IDs, which must be restored consistently across process restarts.
 
 Index rebuild is derived from authoritative KV documents; a durable ACK
 does not certify semantic-index freshness if embedding/indexing fails.
-QH-01 through QH-08 have partial implementations with their remaining gates
-tracked in `ROADMAP.md` and `QIHSE_ENGINE_ROADMAP.md`.
+QH-01 through QH-05 are implemented; QH-06 through QH-08 retain the remaining
+gates tracked in `ROADMAP.md` and `QIHSE_ENGINE_ROADMAP.md`.
 
 ## Native QH-05 through QH-08 contracts
 
-The C interface now exposes a bounded curated-knowledge projection without
-changing the existing RESP verbs. `qihse_ai_memory_query_begin()` materializes
-only rows visible to the explicit principal and requested scope, applies type,
-status, current-version, ingestion-time and text filters, then sorts by
-ingestion time and version UUID. `query_next()` pages that immutable result and
-rechecks the same actor, current project membership, classification and SCI on
-every row. A revoked grant therefore cannot continue draining already
-materialized content. Each hit includes a bounded lexical score and explicit
-text-match/current explanation flags. Snapshots are bounded to 4,096 rows and
-are process-local; callers must restart a query after process loss.
+`AIMEM QUERY V1` adds a typed RESP cursor without changing legacy verbs. BEGIN
+accepts exact scope, type/status/current filters, inclusive ingestion bounds,
+an exclusive changed-since watermark, an optional ingestion-time as-of view,
+ranking mode and a maximum of 4,096 rows. NEXT accepts 1..128 rows. Cursor
+tokens are random UUIDs bound to the active principal and server, expire after
+five minutes, and are removed when the server is destroyed. Cursor lookup
+errors do not distinguish an unknown token from a token owned by another
+principal. Results are process-local; restart requires a new query.
+
+The native query snapshot materializes only rows visible to the explicit
+principal and requested scope. BM25 builds a bounded FTS projection from that
+authorized materialization; semantic ranking embeds only those visible
+versions; hybrid ranking uses reciprocal-rank fusion over the same candidate
+set. Every page re-reads each version through the authenticated knowledge API
+and rechecks project membership, classification and SCI, so a revoked grant or
+raised label stops paging. Each result carries bounded BM25/cosine/fused scores,
+ranking-leg flags, and only relations whose targets the caller can currently
+read. As-of returns the version whose half-open ingestion interval contains the
+cutoff; it describes QIHSE's knowledge at that ingestion time, not world-time
+truth. Explain output exposes no hidden candidate count or content.
 
 One-lineage maintenance uses durable `QHM1` plans. Planning can be side-effect
 free; apply appends a normal `QHK1` successor and rollback appends another
