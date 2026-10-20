@@ -583,7 +583,8 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
         qihse_resp_server_t* server, qihse_user_t* user,
         const char* text, uint32_t kind, const qihse_ai_memory_scope_t* scope,
         const qihse_uuid_t* uuid,
-        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     if (!server || !user || !qihse_auth_user_is_active(user) ||
         (!scope && qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM) ||
         !text || !*text || !uuid) return QIHSE_AIMEM_WRITE_FAILED;
@@ -626,6 +627,9 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
         free(hit.text);
         free(existing);
         if (!equal) return QIHSE_AIMEM_WRITE_CONFLICT;
+        bool tombstone = false;
+        if (out_change_seq && !qihse_kv_change_seq_user(store, key, user,
+                out_change_seq, &tombstone)) return QIHSE_AIMEM_WRITE_FAILED;
         if (out_id) memcpy(out_id, id, sizeof id);
         return QIHSE_AIMEM_WRITE_REPLAY;
     }
@@ -656,7 +660,8 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
     /* A hidden colliding record is deliberately indistinguishable from a
      * storage refusal: qihse_kv_set_user denies overwriting inaccessible
      * rows even though the authorized get above returns NULL. */
-    bool ok = qihse_kv_set_user(store, key, value, classification, sci, user);
+    bool ok = qihse_kv_set_user_with_seq(store, key, value, classification,
+                                         sci, user, out_change_seq);
     free(value);
     if (!ok) return QIHSE_AIMEM_WRITE_FAILED;
 
@@ -701,7 +706,7 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                            char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
     qihse_uuid_t uuid;
     if (!qihse_uuid_generate(&uuid)) return false;
-    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id) ==
+    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id, NULL) ==
            QIHSE_AIMEM_WRITE_NEW;
 }
 
@@ -709,6 +714,15 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
         qihse_resp_server_t* server, qihse_user_t* user, const char* text,
         uint32_t kind, const char* idempotency_key,
         char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    return qihse_ai_memory_store_idempotent_with_seq(server, user, text, kind,
+        idempotency_key, out_id, NULL);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent_with_seq(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+        uint32_t kind, const char* idempotency_key,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     if (!user || !qihse_auth_user_is_active(user) ||
         qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM || !idempotency_key)
         return QIHSE_AIMEM_WRITE_FAILED;
@@ -727,7 +741,8 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
     qihse_uuid_t uuid;
     if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
         return QIHSE_AIMEM_WRITE_FAILED;
-    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id);
+    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id,
+                            out_change_seq);
 }
 
 bool qihse_ai_memory_store_scoped(qihse_resp_server_t* server,
@@ -739,7 +754,7 @@ bool qihse_ai_memory_store_scoped(qihse_resp_server_t* server,
         (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC)) return false;
     qihse_uuid_t uuid;
     if (!qihse_uuid_generate(&uuid)) return false;
-    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id) ==
+    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL) ==
            QIHSE_AIMEM_WRITE_NEW;
 }
 
@@ -769,7 +784,23 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
     qihse_uuid_t uuid;
     if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
         return QIHSE_AIMEM_WRITE_FAILED;
-    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id);
+    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL);
+}
+
+bool qihse_ai_memory_change_seq(qihse_resp_server_t* server,
+        qihse_user_t* user, const char* id, uint64_t* out_change_seq,
+        bool* out_tombstone) {
+    if (out_change_seq) *out_change_seq = 0u;
+    if (out_tombstone) *out_tombstone = false;
+    qihse_uuid_t uuid;
+    if (!server || !user || !id || !out_change_seq || !out_tombstone ||
+        !qihse_uuid_parse(id, &uuid)) return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store) return false;
+    char key[64];
+    aimem_key(key, sizeof key, aimem_doc_id(&uuid));
+    return qihse_kv_change_seq_user(store, key, user, out_change_seq,
+                                    out_tombstone);
 }
 
 static bool aimem_migrated_record_matches(const char* raw, const char* id,
@@ -988,7 +1019,7 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
                 free(prior.text);
             } else {
                 result = aimem_store_uuid(server, user, envelope,
-                                          QIHSE_AIMEM_EVENT, scope, &uuid, out_id);
+                    QIHSE_AIMEM_EVENT, scope, &uuid, out_id, NULL);
             }
         }
     }
@@ -1268,10 +1299,13 @@ size_t qihse_ai_memory_recall(qihse_resp_server_t* server, qihse_user_t* user,
                                        QIHSE_AIMEM_MODE_BM25, out, out_cap);
 }
 
-bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
-                            const char* id) {
+bool qihse_ai_memory_forget_with_seq(qihse_resp_server_t* server,
+                            qihse_user_t* user, const char* id,
+                            bool* out_removed, uint64_t* out_change_seq) {
+    if (out_removed) *out_removed = false;
+    if (out_change_seq) *out_change_seq = 0u;
     if (!server || !user || qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM ||
-        !id) return false;
+        !id || !out_removed || !out_change_seq) return false;
     qihse_uuid_t uuid;
     if (!qihse_uuid_parse(id, &uuid)) return false;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
@@ -1280,12 +1314,16 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
      * record: an unrelated UUID with the same prefix is not authority. */
     qihse_ai_memory_hit_t existing;
     memset(&existing, 0, sizeof existing);
-    if (!qihse_ai_memory_get(server, user, id, &existing)) return false;
-    free(existing.text);
     char key[64];
     aimem_key(key, sizeof key, aimem_doc_id(&uuid));
-    bool ok = qihse_kv_del_user(store, key, user);
-    if (!ok) return false;
+    if (!qihse_ai_memory_get(server, user, id, &existing)) {
+        bool tombstone = false;
+        return qihse_kv_change_seq_user(store, key, user, out_change_seq,
+                                        &tombstone) && tombstone;
+    }
+    free(existing.text);
+    if (!qihse_kv_del_user_with_seq(store, key, user, out_change_seq)) return false;
+    *out_removed = true;
     /* Drop the vector as well, or a forgotten memory would keep ranking in
      * semantic recall — from the in-memory index too, not only the KV record:
      * a stale entry consumes a candidate slot and can push a visible memory
@@ -1296,7 +1334,15 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
     pthread_mutex_lock(&g_aimem_lock);
     aimem_vecs_remove(aimem_doc_id(&uuid));
     pthread_mutex_unlock(&g_aimem_lock);
-    return ok;
+    return true;
+}
+
+bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
+                            const char* id) {
+    bool removed = false;
+    uint64_t change_seq = 0u;
+    return qihse_ai_memory_forget_with_seq(server, user, id, &removed,
+                                           &change_seq) && removed;
 }
 
 typedef struct {

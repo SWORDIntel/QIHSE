@@ -5764,7 +5764,8 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
         qihse_resp_session_t* session, uint32_t kind, const char* text,
         const char* idem, bool durable,
         const qihse_ai_memory_scope_t* scope,
-        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     qihse_kv_store_t* store = qihse_resp_server_store(session->server);
     char map_key[512];
     if (!store || !text || !*text || strlen(text) > QIHSE_AIMEM_RESP_MAX_TEXT)
@@ -5804,6 +5805,15 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
                 pthread_rwlock_unlock(&session->server->kv_lock);
                 return QIHSE_AIMEM_ADMIT_CONFLICT;
             }
+            if (out_change_seq && !scope) {
+                bool tombstone = false;
+                if (!qihse_ai_memory_change_seq(session->server,
+                        session->user, out_id, out_change_seq, &tombstone) ||
+                    tombstone || !*out_change_seq) {
+                    pthread_rwlock_unlock(&session->server->kv_lock);
+                    return QIHSE_AIMEM_ADMIT_FAILED;
+                }
+            }
             bool fenced = !durable || qihse_kv_sync_store(store);
             pthread_rwlock_unlock(&session->server->kv_lock);
             return fenced ? QIHSE_AIMEM_ADMIT_OK : QIHSE_AIMEM_ADMIT_NOT_DURABLE;
@@ -5813,10 +5823,14 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
      * If a SIGKILL interrupts admission before the separate map write, a
      * replay finds the original document and repairs the missing mapping. */
     qihse_ai_memory_write_result_t write_result = idem
-        ? (scope ? qihse_ai_memory_store_scoped_idempotent(
+        ? (out_change_seq && !scope
+           ? qihse_ai_memory_store_idempotent_with_seq(
+              session->server, session->user, text, kind, idem, out_id,
+              out_change_seq)
+           : (scope ? qihse_ai_memory_store_scoped_idempotent(
               session->server, session->user, text, kind, scope, idem, out_id)
                  : qihse_ai_memory_store_idempotent(
-              session->server, session->user, text, kind, idem, out_id))
+              session->server, session->user, text, kind, idem, out_id)))
         : ((scope ? qihse_ai_memory_store_scoped(session->server, session->user,
                          text, kind, scope, out_id)
                   : qihse_ai_memory_store(session->server, session->user, text, kind, out_id))
@@ -5840,7 +5854,29 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
      * WAL/SSTable/directory fsync fence returns successfully. */
     bool fenced = !durable || qihse_kv_sync_store(store);
     pthread_rwlock_unlock(&session->server->kv_lock);
+    if (fenced && out_change_seq && !*out_change_seq)
+        return QIHSE_AIMEM_ADMIT_FAILED;
     return fenced ? QIHSE_AIMEM_ADMIT_OK : QIHSE_AIMEM_ADMIT_NOT_DURABLE;
+}
+
+static bool qihse_resp_aimem_emit_receipt(qihse_resp_session_t* session,
+        const char* operation, const char* id, uint64_t lsn) {
+    char seed[192], receipt[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_uuid_t token;
+    int n = snprintf(seed, sizeof seed, "QH00:receipt:v1:%u:%u:%s:%s:%llu",
+        (unsigned)qihse_user_get_tenant_id(session->user),
+        (unsigned)qihse_user_get_id(session->user), operation, id,
+        (unsigned long long)lsn);
+    if (n <= 0 || (size_t)n >= sizeof seed ||
+        !qihse_uuid_from_seed(seed, (size_t)n, &token) ||
+        !qihse_uuid_format(&token, receipt)) return false;
+    /* The receipt token is opaque: the stable monotonic local KV LSN is bound
+     * into it without exposing the global sequence of hidden mutations. */
+    return qihse_resp_array(session, 4u) &&
+           qihse_resp_bulk_text(session, operation) &&
+           qihse_resp_bulk_text(session, id) &&
+           qihse_resp_bulk_text(session, receipt) &&
+           qihse_resp_bulk_text(session, "local-fsync");
 }
 
 static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
@@ -6235,7 +6271,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         }
         char id[QIHSE_AIMEM_ID_LEN + 1u];
         qihse_aimem_admit_result_t result = qihse_resp_aimem_store_one(
-            session, kind, text, idem, scoped_durable, &scope, id);
+            session, kind, text, idem, scoped_durable, &scope, id, NULL);
         free(text); free(idem);
         if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
             return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
@@ -6246,9 +6282,12 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     }
 
     bool durable_store = qihse_resp_arg_equal(&request->argv[1], "STORE-DURABLE");
-    if (qihse_resp_arg_equal(&request->argv[1], "STORE") || durable_store) {
+    bool receipt_store = qihse_resp_arg_equal(&request->argv[1], "STORE-RECEIPT");
+    if (qihse_resp_arg_equal(&request->argv[1], "STORE") || durable_store || receipt_store) {
         if (request->argc != 4u && request->argc != 5u)
-            return qihse_resp_error(session, "ERR usage: AIMEM STORE[-DURABLE] <kind> <text> [idempotency-key]");
+            return qihse_resp_error(session, "ERR usage: AIMEM STORE[-DURABLE|-RECEIPT] <kind> <text> [idempotency-key]");
+        if (receipt_store && request->argc != 5u)
+            return qihse_resp_error(session, "ERR STORE-RECEIPT requires an idempotency-key");
         if (request->argv[3].len == 0u || request->argv[3].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
             memchr(request->argv[3].data, '\0', request->argv[3].len))
             return qihse_resp_error(session, "ERR AIMEM invalid or oversized text");
@@ -6266,15 +6305,21 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             idem = qihse_resp_arg_text(&request->argv[4]);
         }
         char id[QIHSE_AIMEM_ID_LEN + 1u];
+        uint64_t change_seq = 0u;
         qihse_aimem_admit_result_t result =
-            qihse_resp_aimem_store_one(session, kind, text, idem, durable_store, NULL, id);
+            qihse_resp_aimem_store_one(session, kind, text, idem,
+                durable_store || receipt_store, NULL, id,
+                receipt_store ? &change_seq : NULL);
         free(text); free(idem);
         if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
             return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
         if (result == QIHSE_AIMEM_ADMIT_NOT_DURABLE)
             return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM admission not confirmed durable");
-        return result == QIHSE_AIMEM_ADMIT_OK ? qihse_resp_bulk_text(session, id)
-                                               : qihse_resp_error(session, "ERR AIMEM store failed");
+        if (result != QIHSE_AIMEM_ADMIT_OK)
+            return qihse_resp_error(session, "ERR AIMEM store failed");
+        return receipt_store
+            ? qihse_resp_aimem_emit_receipt(session, "STORE", id, change_seq)
+            : qihse_resp_bulk_text(session, id);
     }
 
     if (qihse_resp_arg_equal(&request->argv[1], "GET")) {
@@ -6308,12 +6353,13 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     }
 
     bool durable_forget = qihse_resp_arg_equal(&request->argv[1], "FORGET-DURABLE");
+    bool receipt_forget = qihse_resp_arg_equal(&request->argv[1], "FORGET-RECEIPT");
     if (qihse_resp_arg_equal(&request->argv[1], "FORGET") ||
-        qihse_resp_arg_equal(&request->argv[1], "DELETE") || durable_forget) {
+        qihse_resp_arg_equal(&request->argv[1], "DELETE") || durable_forget || receipt_forget) {
         if (request->argc != 3u) return qihse_resp_wrong_arity(session, "AIMEM FORGET[-DURABLE]");
         char* id = qihse_resp_arg_text(&request->argv[2]);
         if (!id) return qihse_resp_error(session, "ERR out of memory");
-        if (!durable_forget) {
+        if (!durable_forget && !receipt_forget) {
             bool ok = qihse_ai_memory_forget(session->server, session->user, id);
             free(id);
             return qihse_resp_integer(session, ok ? 1 : 0);
@@ -6321,6 +6367,20 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         qihse_kv_store_t* store = qihse_resp_server_store(session->server);
         if (!store) { free(id); return qihse_resp_error(session, "ERR AIMEM store unavailable"); }
         pthread_rwlock_wrlock(&session->server->kv_lock);
+        if (receipt_forget) {
+            bool removed = false;
+            uint64_t change_seq = 0u;
+            bool found = qihse_ai_memory_forget_with_seq(session->server,
+                session->user, id, &removed, &change_seq);
+            bool fenced = found && qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            bool emitted = fenced && qihse_resp_aimem_emit_receipt(
+                session, "FORGET", id, change_seq);
+            free(id);
+            if (!fenced)
+                return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete receipt unavailable");
+            return emitted;
+        }
         bool removed = qihse_ai_memory_forget(session->server, session->user, id);
         /* Miss/denial has no AIMEM mutation; do not force a global fsync
          * from an unprivileged probe of a hidden/nonexistent UUID. */

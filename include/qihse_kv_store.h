@@ -114,11 +114,26 @@ typedef struct {
     uint16_t classification;
     uint16_t sci_compartment;
     uint64_t expire_time_ms;   /* 0 = no expiry */
+    uint64_t change_seq;       /* immutable local mutation LSN */
     uint8_t  flags;            /* WAL record flags (tombstone bit etc.) */
 } qihse_kv_record_meta_t;
 
 bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
                         qihse_user_t* user, qihse_kv_record_meta_t* out);
+
+/* Authenticated mutations with the exact local WAL LSN assigned to the
+ * resulting live record/tombstone. The LSN is stable across QKV4 recovery. */
+bool qihse_kv_set_user_with_seq(qihse_kv_store_t* store, const char* key,
+                                const char* value, uint16_t classification,
+                                uint16_t sci_compartment, qihse_user_t* user,
+                                uint64_t* out_change_seq);
+bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
+                                qihse_user_t* user, uint64_t* out_change_seq);
+/* Read the sequence only for an authorized live record or tombstone. Expired
+ * live rows and misses are indistinguishable from denied rows. */
+bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
+                              qihse_user_t* user, uint64_t* out_change_seq,
+                              bool* out_tombstone);
 static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_get_user(store, key, NULL);
 }

@@ -760,8 +760,17 @@ test-aimem-knowledge: lib
 # QH-00: separate process instances; SIGKILL immediately after durable ACK.
 test-aimem-durable-crash: lib
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -o tests/test_aimem_durable_crash tests/test_aimem_durable_crash.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_aimem_durable_crash tests/test_aimem_durable_crash.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_durable_crash
+
+test-aimem-idem-migration: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_idem_migration tests/test_aimem_idem_migration.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_idem_migration
+
+bench-aimem-durability: lib
+	$(CC) $(CFLAGS) -o benchmarks/qihse_aimem_durability_bench benchmarks/qihse_aimem_durability_bench.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./benchmarks/qihse_aimem_durability_bench $(ARGS)
 
 # QH-00 stage 2: kill after the canonical record but before the map exists.
 test-aimem-replay-recovery: lib
@@ -772,7 +781,7 @@ test-aimem-replay-recovery: lib
 # Focused aggregate for the active W10 AIMEM workstream.
 test-w10-aimem: test-ai-memory test-ai-memory-embed test-ai-memory-ext \
 		test-aimem-resp test-aimem-durable-crash \
-		test-aimem-replay-recovery test-aimem-knowledge
+		test-aimem-replay-recovery test-aimem-knowledge test-aimem-idem-migration
 
 test-fabric-dispatch: lib
 	$(CC) $(CFLAGS) -o tests/test_fabric_dispatch tests/test_fabric_dispatch.c -L. -lqihse $(LDFLAGS)

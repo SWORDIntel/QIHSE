@@ -13,10 +13,12 @@ ranking, and record visibility. A missing or revoked principal fails closed.
 ```text
 AIMEM STORE <kind> <text> [idempotency-key]
 AIMEM STORE-DURABLE <kind> <text> [idempotency-key]
+AIMEM STORE-RECEIPT <kind> <text> <idempotency-key>
 AIMEM RECALL <query> <limit> [bm25|semantic|hybrid] [kind]
 AIMEM GET <uuid>
 AIMEM FORGET <uuid>
 AIMEM FORGET-DURABLE <uuid>
+AIMEM FORGET-RECEIPT <uuid>
 AIMEM COUNT [kind]
 AIMEM STORE-SCOPED[-DURABLE] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]
 AIMEM RECALL-SCOPED <query> <limit> [bm25|semantic|hybrid] <kind> <project> <worktree> <workstream> <session>
@@ -49,6 +51,23 @@ returns the same 7-field nested array as a recall hit; `FORGET` returns a
 RESP integer — `1` when the record was deleted, `0` when the id is unknown
 or already gone; `COUNT` returns a RESP integer. Errors are `-ERR …`, and
 authentication failures are `NOAUTH`/`NOPERM` as everywhere else.
+
+`STORE-DURABLE` and `FORGET-DURABLE` keep their UUID-bulk-string and integer
+reply shapes. The opt-in `STORE-RECEIPT` and `FORGET-RECEIPT` variants return
+`[operation, uuid, receipt, durability]` as a four-element RESP array; the
+durability label is `local-fsync`. A receipt is a deterministic opaque token
+bound to the authenticated tenant and principal, operation, memory UUID, and
+local mutation LSN. It remains stable across an exact retry and does not expose
+the database-wide LSN. QIHSE returns it only after the local KV WAL/SSTable
+fence succeeds; it does not imply replication or global quorum. `STORE-RECEIPT`
+requires an idempotency key. `FORGET-RECEIPT` returns the same receipt when
+retried against its tombstone. Legacy idempotency-map entries pointing to
+random UUIDs remain authoritative when the canonical record exists and
+matches; malformed, stale, or mismatched maps fail closed. Local WAL frames
+persist their mutation sequence while legacy frames remain readable.
+`make test-aimem-idem-migration` covers old-map recovery, and
+`make bench-aimem-durability ARGS="100 256"` compares ordinary and fsync-fenced
+store/delete pairs on the selected data filesystem.
 
 `EVENT APPEND` accepts the registered kinds `session_start`, `session_end`,
 `task_started`, `task_completed`, `observation`, `decision`, `blocker`, and
