@@ -21,6 +21,7 @@ UUIDS = (
     "22222222-2222-4222-8222-222222222222",
     "33333333-3333-4333-8333-333333333333",
 )
+TARGET_USER_ID = 73
 
 
 def read_resp(stream):
@@ -75,7 +76,7 @@ class Handler(socketserver.StreamRequestHandler):
             if command is None:
                 return
             with self.server.state.lock:
-                self.server.state.commands.append(command[:2])
+                self.server.state.commands.append(command)
             if command[0] == "AUTH":
                 if len(command) != 3 or command[2] != "test-secret":
                     self.wfile.write(b"-ERR invalid credentials\r\n")
@@ -100,20 +101,25 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.write(array([str(next_cursor), page]))
             elif command[:2] == ["AIMEM", "GET-SCOPED"]:
                 key = (command[2], *command[3:7])
-                self.wfile.write(bulk("discarded-payload" if key in self.server.state.scoped else None))
-            elif command[:2] == ["AIMEM", "MIGRATE-LEGACY"]:
+                present = any(stored[:5] == key for stored in self.server.state.scoped)
+                self.wfile.write(bulk("discarded-payload" if present else None))
+            elif command[:2] == ["AIMEM", "MIGRATE-LEGACY-TO"]:
                 if role != "operator":
                     self.wfile.write(b"-NOPERM system Operator required\r\n")
                     continue
                 record_id = command[2]
-                scope = tuple(command[3:7])
+                target_user_id = int(command[3])
+                scope = tuple(command[4:8])
+                destination = (record_id, *scope, target_user_id)
                 with self.server.state.lock:
-                    if record_id in self.server.state.legacy:
+                    if target_user_id != TARGET_USER_ID:
+                        self.wfile.write(b"-ERR unknown target principal\r\n")
+                    elif record_id in self.server.state.legacy:
                         self.server.state.legacy.remove(record_id)
-                        self.server.state.scoped[(record_id, *scope)] = True
+                        self.server.state.scoped[destination] = True
                         self.server.state.migrations += 1
                         self.wfile.write(bulk(record_id))
-                    elif (record_id, *scope) in self.server.state.scoped:
+                    elif destination in self.server.state.scoped:
                         self.wfile.write(bulk(record_id))
                     else:
                         self.wfile.write(b"-ERR migration failed\r\n")
@@ -140,7 +146,9 @@ class MigrationCliTest(unittest.TestCase):
             for value in UUIDS
         ]
         self.manifest = self.directory / "manifest.json"
-        self.manifest.write_text(json.dumps({"version": 1, "records": records}), encoding="utf-8")
+        self.manifest.write_text(json.dumps({"version": 2,
+                                             "target_user_id": TARGET_USER_ID,
+                                             "records": records}), encoding="utf-8")
         self.checkpoint = self.directory / "checkpoint.json"
 
     def tearDown(self):
@@ -182,6 +190,12 @@ class MigrationCliTest(unittest.TestCase):
         third = self.run_tool("operator")
         self.assertEqual(third.returncode, 0, third.stderr)
         self.assertEqual(self.state.migrations, 3)
+        migration_commands = [command for command in self.state.commands
+                              if command[:2] == ["AIMEM", "MIGRATE-LEGACY-TO"]]
+        self.assertEqual(len(migration_commands), 8)
+        self.assertTrue(all(command[3] == str(TARGET_USER_ID)
+                            for command in migration_commands))
+        self.assertTrue(all(len(command) == 8 for command in migration_commands))
 
     def test_low_clearance_and_no_auth_are_denied_without_mutation(self):
         low = self.run_tool("guest", "--dry-run")
@@ -204,6 +218,43 @@ class MigrationCliTest(unittest.TestCase):
         self.assertIn("duplicate uuid", result.stderr)
         self.assertEqual(len(self.state.commands), before)
 
+    def test_version_one_manifest_is_rejected_before_connecting(self):
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["version"] = 1
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        before = len(self.state.commands)
+        result = self.run_tool("operator")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("version 2", result.stderr)
+        self.assertEqual(len(self.state.commands), before)
+
+    def test_missing_or_invalid_target_user_is_rejected_before_connecting(self):
+        original = json.loads(self.manifest.read_text(encoding="utf-8"))
+        invalid_values = (None, True, 0, 65536, "73")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                document = dict(original)
+                if value is None:
+                    document.pop("target_user_id")
+                else:
+                    document["target_user_id"] = value
+                self.manifest.write_text(json.dumps(document), encoding="utf-8")
+                before = len(self.state.commands)
+                result = self.run_tool("operator")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("target_user_id", result.stderr)
+                self.assertEqual(len(self.state.commands), before)
+
+    def test_per_record_target_override_is_rejected_before_connecting(self):
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["records"][0]["target_user_id"] = TARGET_USER_ID
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        before = len(self.state.commands)
+        result = self.run_tool("operator")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must not override target_user_id", result.stderr)
+        self.assertEqual(len(self.state.commands), before)
+
     def test_all_scopes_are_validated_before_connecting(self):
         document = json.loads(self.manifest.read_text(encoding="utf-8"))
         document["records"][2]["project"] = "invalid/project"
@@ -221,6 +272,40 @@ class MigrationCliTest(unittest.TestCase):
         result = self.run_tool("operator")
         self.assertEqual(result.returncode, 2)
         self.assertIn("absent from manifest", result.stderr)
+        self.assertEqual(self.state.migrations, 0)
+
+    def test_checkpoint_is_bound_to_target_user(self):
+        first = self.run_tool("operator", "--max-records", "1")
+        self.assertEqual(first.returncode, 3, first.stderr)
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["target_user_id"] = TARGET_USER_ID + 1
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        result = self.run_tool("operator")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("checkpoint does not match", result.stderr)
+        self.assertEqual(self.state.migrations, 1)
+
+    def test_preflight_exact_replay_rejects_wrong_target_without_new_mutation(self):
+        first = self.run_tool("operator", "--max-records", "1")
+        self.assertEqual(first.returncode, 3, first.stderr)
+        self.checkpoint.unlink()
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["target_user_id"] = TARGET_USER_ID + 1
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        result = self.run_tool("operator", "--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exact destination", result.stderr)
+        self.assertNotIn(UUIDS[0], result.stdout + result.stderr)
+        self.assertEqual(self.state.migrations, 1)
+
+    def test_checkpoint_symlink_is_rejected(self):
+        target = self.directory / "foreign-checkpoint.json"
+        target.write_text("{}", encoding="utf-8")
+        target.chmod(0o600)
+        self.checkpoint.symlink_to(target)
+        result = self.run_tool("operator")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("checkpoint is unreadable", result.stderr)
         self.assertEqual(self.state.migrations, 0)
 
 
