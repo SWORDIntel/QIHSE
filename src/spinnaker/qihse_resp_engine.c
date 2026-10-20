@@ -112,6 +112,14 @@ typedef struct qihse_resp_client_ctx qihse_resp_client_ctx_t;
 
 #define QIHSE_RESP_MAX_WATCHES 8u
 
+typedef enum {
+    QIHSE_RESP_AUTH_NONE = 0,
+    QIHSE_RESP_AUTH_LOCAL_PRINCIPAL,
+    QIHSE_RESP_AUTH_PEER_CLAIMS,
+    QIHSE_RESP_AUTH_MACHINE_CLAIMS,
+    QIHSE_RESP_AUTH_QKP_REPLICATION
+} qihse_resp_auth_kind_t;
+
 typedef struct {
     qihse_resp_server_t* server;
     int fd;
@@ -119,6 +127,7 @@ typedef struct {
     qihse_kv_replica_snapshot_t* repl_snapshot;
     uint64_t repl_snapshot_seq;
     qihse_user_t* user;
+    qihse_resp_auth_kind_t auth_kind;
     uint32_t user_id;            /* numeric user id for federation attribution */
     uint64_t id;
     int protocol_version;
@@ -323,6 +332,7 @@ struct qihse_resp_server {
     /* R4c QKP1: caller-owned handshake config (identity, trust anchors,
      * require flag). NULL/zeroed = opportunistic cleartext-only server. */
     qihse_qkp_config_t pqc;
+    qihse_user_t* replication_service_principal;
     /* R4 replicated namespaces (REPL.*): globs whose keys are sovereign-
      * local on every node, plus the anti-entropy bookkeeping REPL.STATUS
      * renders. repl_lock guards the whole list. */
@@ -1089,6 +1099,7 @@ static bool qihse_resp_authenticate(qihse_resp_session_t* session, const qihse_r
     if (!user) return qihse_resp_error(session, "WRONGPASS invalid username-password pair or user is disabled.");
     session->user = user;
     session->user_id = qihse_user_get_id(user);
+    session->auth_kind = QIHSE_RESP_AUTH_LOCAL_PRINCIPAL;
     *authenticated = true;
     return true;
 }
@@ -1591,16 +1602,18 @@ static bool qihse_resp_handle_cluster_peerauth(qihse_resp_session_t* session,
 
     memset(&session->peer_claims, 0, sizeof(session->peer_claims));
     session->peer_claims.user_id = verified.principal_user_id;
+    session->peer_claims.role = QIHSE_ROLE_GUEST;
     session->peer_claims.classification_level = verified.clearance;
     session->peer_claims.sci_compartments = verified.sci;
     session->peer_claims.tenant_id = verified.principal_tenant;
-    /* role 0, no account capabilities, no verifier: a claims context is a
+    /* Guest role, no account capabilities, no verifier: a claims context is a
      * claim about read clearance, nothing more. */
     snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
              "scatter-peer:%u", (unsigned)verified.principal_user_id);
     session->peer_claims_valid = true;
     session->user = &session->peer_claims;
     session->user_id = verified.principal_user_id;
+    session->auth_kind = QIHSE_RESP_AUTH_PEER_CLAIMS;
     return qihse_resp_simple(session, "OK");
 }
 
@@ -1608,7 +1621,7 @@ static bool qihse_resp_handle_cluster_peerauth(qihse_resp_session_t* session,
  * A MACHINE-purpose fabric token signed by a trusted node ML-DSA key
  * (qihse_machine_auth.h) authenticates the connection; the token's claims
  * become the session context exactly as CLUSTER PEERAUTH installs them:
- * role 0, no account capabilities, no verifier, and it dies with the
+ * explicit Guest role, no account capabilities, no verifier, and it dies with the
  * connection. One token authenticates exactly once (nonce consumed), so a
  * captured blob cannot be replayed. Like AUTH and PEERAUTH this runs BEFORE
  * the NOAUTH gate because it IS the authentication. Refusals are typed
@@ -1649,10 +1662,11 @@ static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
 
     memset(&session->peer_claims, 0, sizeof(session->peer_claims));
     session->peer_claims.user_id = verified.principal_user_id;
+    session->peer_claims.role = QIHSE_ROLE_GUEST;
     session->peer_claims.classification_level = verified.clearance;
     session->peer_claims.sci_compartments = verified.sci;
     session->peer_claims.tenant_id = verified.principal_tenant;
-    /* role 0, no account capabilities, no verifier: a claims context is a
+    /* Guest role, no account capabilities, no verifier: a claims context is a
      * claim about clearance, nothing more. */
     snprintf(session->peer_claims.username, sizeof(session->peer_claims.username),
              "machine:%02x%02x", verified.submitter_node.bytes[0],
@@ -1660,6 +1674,7 @@ static bool qihse_resp_handle_machineauth(qihse_resp_session_t* session,
     session->peer_claims_valid = true;
     session->user = &session->peer_claims;
     session->user_id = verified.principal_user_id;
+    session->auth_kind = QIHSE_RESP_AUTH_MACHINE_CLAIMS;
     qihse_audit_log("MACHINEAUTH_OK", verified.principal_user_id, 0u,
                     verified.clearance, verified.sci);
     return qihse_resp_simple(session, "OK");
@@ -8519,7 +8534,8 @@ static bool qihse_resp_replica_local_allowed(qihse_resp_server_t* server,
                                              const char* glob,
                                              qihse_user_t* principal) {
     if (!server || !server->store || !source_session || !glob || !*glob || !principal ||
-        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR ||
+        principal != server->replication_service_principal ||
+        qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR ||
         !qihse_qkp_client_session_is_replication_peer(source_session,
             server->pqc.replication_peer_node_id,
             server->pqc.replication_peer_dsa_pub_path)) return false;
@@ -8999,16 +9015,19 @@ static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qih
     return qihse_resp_integer(session, (int64_t)pulled);
 }
 
-/* REPL data plane: security is structural at this handler. QKP1 protects
- * the complete RESP exchange; AUTH supplies a live operator principal. The
- * KV apply/export APIs perform the row-level authorization checks as well. */
+/* REPL data plane: security is structural at this handler. QKP1 authenticates
+ * the exact pinned node and maps it to one configured, locally authoritative
+ * non-Operator principal. The KV APIs still perform row-level checks. */
 #define QIHSE_REPL_DELTA_MAX_ROWS 128u
 #define QIHSE_REPL_DELTA_MAX_WIRE (17u * 1024u * 1024u)
 #define QIHSE_REPL_RECORD_MAX_KEY 4096u
 #define QIHSE_REPL_RECORD_MAX_VALUE (16u * 1024u * 1024u)
 
 static bool qihse_resp_repl_data_plane_allowed(qihse_resp_session_t* s) {
-    if (!s || !s->qkp || !s->user || qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+    if (!s || !s->server || !s->qkp || !s->user ||
+        s->auth_kind != QIHSE_RESP_AUTH_QKP_REPLICATION ||
+        s->user != s->server->replication_service_principal ||
+        qihse_user_get_role(s->user) == QIHSE_ROLE_OPERATOR ||
         !qihse_qkp_session_is_replication_peer(s->qkp,
             s->server->pqc.replication_peer_node_id,
             s->server->pqc.replication_peer_dsa_pub_path)) return false;
@@ -9039,7 +9058,7 @@ static bool qihse_resp_repl_glob_is_marked(qihse_resp_server_t* server, const ch
 
 static bool qihse_resp_handle_repl_apply(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
     if (r->argc != 10u) return qihse_resp_error(s, "ERR usage: REPL.APPLY 1 glob seq S|D class sci expire_ms key value");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
     uint64_t seq, class_u64, sci_u64, expiry;
     if (!qihse_resp_arg_equal(&r->argv[1], "1") ||
@@ -9082,7 +9101,7 @@ static bool qihse_resp_handle_repl_apply(qihse_resp_session_t* s, const qihse_re
 
 static bool qihse_resp_handle_repl_cursor(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
     if (r->argc != 2u) return qihse_resp_error(s, "ERR usage: REPL.CURSOR glob");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
     char* glob = NULL;
     if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob))
@@ -9106,7 +9125,7 @@ static bool qihse_resp_handle_repl_cursor(qihse_resp_session_t* s, const qihse_r
 static bool qihse_resp_handle_repl_ack(qihse_resp_session_t* s,
                                        const qihse_resp_request_t* r) {
     if (r->argc != 3u) return qihse_resp_error(s, "ERR usage: REPL.ACK glob sequence");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
     char* glob = NULL; uint64_t seq = 0u;
     if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob) ||
@@ -9130,7 +9149,7 @@ static bool qihse_resp_handle_repl_ack(qihse_resp_session_t* s,
 
 static bool qihse_resp_handle_repl_delta(qihse_resp_session_t* s, const qihse_resp_request_t* r) {
     if (r->argc != 4u) return qihse_resp_error(s, "ERR usage: REPL.DELTA glob since limit");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->server->store) return qihse_resp_error(s, "ERR key-value store is not configured");
     char* glob = NULL;
     uint64_t since, limit_u64;
@@ -9208,7 +9227,7 @@ static bool qihse_resp_handle_repl_delta(qihse_resp_session_t* s, const qihse_re
 static bool qihse_resp_handle_repl_snapshot_begin(qihse_resp_session_t* s,
                                                    const qihse_resp_request_t* r) {
     if (r->argc != 2u) return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.BEGIN glob");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     char* glob = NULL;
     if (!qihse_resp_repl_arg_string(&r->argv[1], QIHSE_REPL_GLOB_MAX - 1u, false, &glob))
         return qihse_resp_error(s, "ERR invalid replication namespace");
@@ -9251,7 +9270,7 @@ static bool qihse_resp_handle_repl_snapshot_read(qihse_resp_session_t* s,
         !qihse_resp_parse_u64_arg(&r->argv[2], &length) || length == 0u ||
         length > QIHSE_REPL_SNAPSHOT_READ_MAX)
         return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.READ offset length (length <= 524288)");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->repl_snapshot) return qihse_resp_error(s, "ERR begin a snapshot on this session first");
     char* data = (char*)malloc((size_t)length);
     if (!data) return qihse_resp_error(s, "ERR snapshot read allocation failed");
@@ -9270,7 +9289,7 @@ static bool qihse_resp_handle_repl_snapshot_read(qihse_resp_session_t* s,
 static bool qihse_resp_handle_repl_snapshot_end(qihse_resp_session_t* s,
                                                  const qihse_resp_request_t* r) {
     if (r->argc != 1u) return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.END");
-    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator");
+    if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     qihse_kv_replica_snapshot_destroy(s->repl_snapshot);
     s->repl_snapshot = NULL;
     s->repl_snapshot_seq = 0u;
@@ -13560,9 +13579,49 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     return ok;
 }
 
+static bool qihse_resp_is_repl_data_plane_command(
+        const qihse_resp_request_t* request) {
+    return qihse_resp_command_is(request, "REPL.APPLY") ||
+           qihse_resp_command_is(request, "REPL.CURSOR") ||
+           qihse_resp_command_is(request, "REPL.ACK") ||
+           qihse_resp_command_is(request, "REPL.DELTA") ||
+           qihse_resp_command_is(request, "REPL.SNAPSHOT.BEGIN") ||
+           qihse_resp_command_is(request, "REPL.SNAPSHOT.READ") ||
+           qihse_resp_command_is(request, "REPL.SNAPSHOT.END");
+}
+
+static bool qihse_resp_is_machine_command(const qihse_resp_request_t* request) {
+    /* The deployed fleet agent uses only these unclassified telemetry verbs.
+     * Their handlers retain tenant and row-label authorization. */
+    return qihse_resp_command_is(request, "GET") ||
+           qihse_resp_command_is(request, "SET") ||
+           qihse_resp_command_is(request, "PUBLISH") ||
+           qihse_resp_command_is(request, "ASKING");
+}
+
+static bool qihse_resp_session_command_allowed(
+        qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    switch (session->auth_kind) {
+        case QIHSE_RESP_AUTH_QKP_REPLICATION:
+            return qihse_resp_is_repl_data_plane_command(request);
+        case QIHSE_RESP_AUTH_MACHINE_CLAIMS:
+            return qihse_resp_is_machine_command(request);
+        case QIHSE_RESP_AUTH_PEER_CLAIMS:
+            return qihse_resp_command_is(request, "VECSEARCH");
+        default:
+            return true;
+    }
+}
+
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
+
+    /* Capability restrictions precede every fast path, including AUTH,
+     * PING, admin commands, exports and raw compatibility commands. */
+    if (!qihse_resp_session_command_allowed(session, request))
+        return qihse_resp_error(session,
+            "NOPERM command is outside the authenticated service capability");
 
     const uint8_t* cmd_data = request->argv[0].data;
     size_t cmd_len = request->argv[0].len;
@@ -13889,7 +13948,10 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     /* W5.2: an error raised before the first command is classified must not
      * be attributed to query type 0 (GET). */
     session.query_type = QIHSE_QUERY_TYPE_OTHER;
-    if (!server->auth_required) session.user = server->unauthenticated_user;
+    if (!server->auth_required) {
+        session.user = server->unauthenticated_user;
+        session.auth_kind = QIHSE_RESP_AUTH_LOCAL_PRINCIPAL;
+    }
     if (pthread_mutex_init(&session.io_lock, NULL) != 0) return false;
     session.id = __atomic_add_fetch(&server->next_client_id, 1u, __ATOMIC_RELAXED);
     if (server->pin_workers) {
@@ -13922,6 +13984,22 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
             return false;
         }
         session.qkp = qkp; /* NULL = opportunistic cleartext session */
+        if (qkp && server->replication_service_principal &&
+            qihse_qkp_session_is_replication_peer(qkp,
+                server->pqc.replication_peer_node_id,
+                server->pqc.replication_peer_dsa_pub_path)) {
+            bool active = false;
+            uint32_t tenant = QIHSE_TENANT_INVALID;
+            qihse_auth_user_active_and_tenant(
+                server->replication_service_principal, &active, &tenant);
+            if (active && tenant == QIHSE_TENANT_SYSTEM &&
+                qihse_user_get_role(server->replication_service_principal) !=
+                    QIHSE_ROLE_OPERATOR) {
+                session.user = server->replication_service_principal;
+                session.user_id = qihse_user_get_id(session.user);
+                session.auth_kind = QIHSE_RESP_AUTH_QKP_REPLICATION;
+            }
+        }
     }
 
     size_t capacity = QIHSE_RESP_INITIAL_BUFFER;
@@ -14252,6 +14330,22 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         errno = EACCES;
         return NULL;
     }
+    if (supplied->replication_service_principal) {
+        bool active = false;
+        uint32_t tenant = QIHSE_TENANT_INVALID;
+        qihse_auth_user_active_and_tenant(supplied->replication_service_principal,
+                                          &active, &tenant);
+        if (!active || tenant != QIHSE_TENANT_SYSTEM ||
+            qihse_user_get_role(supplied->replication_service_principal) ==
+                QIHSE_ROLE_OPERATOR ||
+            !supplied->pqc.replication_peer_node_id ||
+            !*supplied->pqc.replication_peer_node_id ||
+            !supplied->pqc.replication_peer_dsa_pub_path ||
+            !*supplied->pqc.replication_peer_dsa_pub_path) {
+            errno = EACCES;
+            return NULL;
+        }
+    }
     if (supplied->enable_artifact_uploads) {
         struct stat staging;
         if (!supplied->auth_required || !supplied->blobs ||
@@ -14272,6 +14366,8 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->column_store = supplied->column_store;
     server->fts = supplied->fts;
     server->pqc = supplied->pqc;
+    server->replication_service_principal =
+        supplied->replication_service_principal;
     server->port = supplied->port;
     server->bus_port = supplied->bus_port;
     server->max_clients = supplied->max_clients;
@@ -14960,6 +15056,7 @@ bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,
     memset(&session, 0, sizeof(session));
     session.server = server;
     session.user = user;
+    session.auth_kind = QIHSE_RESP_AUTH_LOCAL_PRINCIPAL;
     session.query_type = QIHSE_QUERY_TYPE_OTHER;
     session.fd = -1;
     session.protocol_version = 2;

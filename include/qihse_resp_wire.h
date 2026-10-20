@@ -68,6 +68,13 @@ typedef struct {
     /* R4c QKP1 (CNSA 2.0 RESP handshake): zero-initialized = disabled
      * (opportunistic cleartext). Set by the daemon from --pqc-* flags. */
     qihse_qkp_config_t pqc;
+    /* Locally authoritative identity used by the pinned QKP replication
+     * peer. The caller owns this principal and must recreate the same user
+     * and tenant ids on restart. It must be an active system-domain
+     * non-Operator. A matching server-side QKP handshake maps directly to
+     * this identity; no password AUTH is performed. NULL disables the
+     * passwordless replication data plane. */
+    qihse_user_t* replication_service_principal;
     /* R4 replicated namespaces: keys matching one of these globs are
      * SOVEREIGN-LOCAL (never MOVED/CLUSTERDOWN-routed) and are expected to
      * exist on every node. Boot-time source of truth; REPL.MARK adds more
@@ -196,7 +203,8 @@ size_t qihse_resp_server_repl_list(qihse_resp_server_t* server,
 bool qihse_resp_server_repl_key_matched(qihse_resp_server_t* server, const char* key, size_t key_len);
 /* In-process receiver seam for a daemon that has authenticated the source
  * server with QKP1. These validate the client-side session against this
- * server's configured upstream pin and require an active system Operator.
+ * server's configured upstream pin and require the exact configured active
+ * replication service principal.
  * Apply also requires an exact marked glob/key match and persists the row
  * before advancing its durable per-peer cursor. Both methods take kv_lock. */
 bool qihse_resp_server_repl_apply_local(qihse_resp_server_t* server,
@@ -220,7 +228,7 @@ bool qihse_resp_server_repl_snapshot_install_local(qihse_resp_server_t* server,
                                                     const char* filepath,
                                                     uint64_t source_highwater,
                                                     qihse_user_t* principal);
-/* QKP1-only, pinned-peer, operator-only replication data plane. REPL.DELTA
+/* QKP1-only, pinned-peer, replication-service data plane. REPL.DELTA
  * returns flat bulk fields [cursor,count,op,seq,class,sci,expire_ms,key,value,...];
  * REPL.APPLY accepts one version-1 record plus its namespace and durably
  * advances that peer/namespace cursor only after the row is durable.
