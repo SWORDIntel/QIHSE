@@ -20,8 +20,8 @@ static qihse_resp_server_t* server;
 
 static size_t run(qihse_user_t* user, size_t argc, const char* const* argv,
                   uint8_t** out) {
-    qihse_resp_arg_t args[12];
-    assert(argc <= 12u);
+    qihse_resp_arg_t args[16];
+    assert(argc <= 16u);
     for (size_t i = 0; i < argc; i++) {
         args[i].data = (const uint8_t*)argv[i];
         args[i].len = strlen(argv[i]);
@@ -693,7 +693,6 @@ int main(void) {
     low_event_read[3] = high_event_id;
     expect_contains(guest, 8u, low_event_read, "$-1\r\n");
     free(high_event_id);
-    free(event_doc_id);
     free(tenant7_id);
     free(tenant8_id);
 
@@ -709,6 +708,7 @@ int main(void) {
     reply_len = run(tenant7, 11u, process_offer, &reply);
     char* process_handoff_id = extract_bulk_id(reply, reply_len);
     free(reply);
+    free(event_doc_id);
     assert(qihse_resp_server_start(server));
     uint16_t listener_port = qihse_resp_server_port(server);
     assert(listener_port != 0u);
