@@ -5488,6 +5488,8 @@ static bool qihse_resp_handle_memory(qihse_resp_session_t* session, const qihse_
 #define QIHSE_AIMEM_RESP_MAX_TEXT (64u * 1024u)
 #define QIHSE_AIMEM_RESP_MAX_IDEM 128u
 #define QIHSE_AIMEM_HANDOFF_MAX_SUMMARY 4096u
+#define QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE 8u
+#define QIHSE_AIMEM_HANDOFF_RECORD_CAP (QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE * (QIHSE_AIMEM_ID_LEN + 1u) + 512u)
 
 typedef enum {
     QIHSE_AIMEM_HANDOFF_OPEN = 1,
@@ -5506,6 +5508,8 @@ typedef struct {
     qihse_aimem_handoff_state_t state;
     uint32_t accepted_by;
     qihse_ai_memory_scope_t scope;
+    char evidence_ids[QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE][QIHSE_AIMEM_ID_LEN + 1u];
+    size_t evidence_count;
     char* summary;
 } qihse_aimem_handoff_t;
 
@@ -5553,19 +5557,41 @@ static bool qihse_resp_aimem_handoff_scope_token_valid(const char* text,
 static bool qihse_resp_aimem_handoff_parse(const char* text,
         qihse_aimem_handoff_t* out) {
     char state[16];
+    char evidence[QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE * (QIHSE_AIMEM_ID_LEN + 1u)];
     int summary_offset = 0;
     unsigned long long created = 0u, expires = 0u, revision = 0u;
     if (!text || !out) return false;
     memset(out, 0, sizeof(*out));
     int fields = sscanf(text,
+        "QHH2|%36[^|]|%u|%u|%llu|%llu|%llu|%15[^|]|%u|%63[^|]|%63[^|]|%63[^|]|%63[^|]|%295[^|]|%n",
+        out->id, &out->owner_id, &out->recipient_id,
+        &created, &expires, &revision, state, &out->accepted_by,
+        out->scope.project, out->scope.worktree, out->scope.workstream,
+        out->scope.session, evidence, &summary_offset);
+    if (fields != 13) {
+        memset(out, 0, sizeof(*out));
+        fields = sscanf(text,
         "QHH1|%36[^|]|%u|%u|%llu|%llu|%llu|%15[^|]|%u|%63[^|]|%63[^|]|%63[^|]|%63[^|]|%n",
         out->id, &out->owner_id, &out->recipient_id,
         &created, &expires, &revision, state, &out->accepted_by,
         out->scope.project, out->scope.worktree, out->scope.workstream,
         out->scope.session, &summary_offset);
+        evidence[0] = '\0';
+    }
     qihse_uuid_t parsed_id;
-    if (fields != 12 || summary_offset <= 0 || !qihse_uuid_parse(out->id, &parsed_id))
+    bool v2 = fields == 13;
+    if ((!v2 && fields != 12) || summary_offset <= 0 || !qihse_uuid_parse(out->id, &parsed_id))
         return false;
+    if (v2 && strcmp(evidence, "-") != 0) {
+        char* save = NULL;
+        for (char* token = strtok_r(evidence, ",", &save); token;
+             token = strtok_r(NULL, ",", &save)) {
+            qihse_uuid_t evidence_uuid;
+            if (out->evidence_count >= QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE ||
+                !qihse_uuid_parse(token, &evidence_uuid)) return false;
+            snprintf(out->evidence_ids[out->evidence_count++], QIHSE_AIMEM_ID_LEN + 1u, "%s", token);
+        }
+    }
     out->created_ms = (uint64_t)created;
     out->expires_ms = (uint64_t)expires;
     out->revision = (uint64_t)revision;
@@ -5587,13 +5613,25 @@ static bool qihse_resp_aimem_handoff_parse(const char* text,
 static bool qihse_resp_aimem_handoff_encode(const qihse_aimem_handoff_t* h,
         char* out, size_t cap) {
     if (!h || !out || !qihse_resp_aimem_handoff_summary_valid(h->summary)) return false;
-    int n = snprintf(out, cap, "QHH1|%s|%u|%u|%llu|%llu|%llu|%s|%u|%s|%s|%s|%s|%s",
+    char evidence[QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE * (QIHSE_AIMEM_ID_LEN + 1u)];
+    size_t used = 0u;
+    if (h->evidence_count > QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE) return false;
+    for (size_t i = 0; i < h->evidence_count; i++) {
+        qihse_uuid_t parsed;
+        int n = snprintf(evidence + used, sizeof evidence - used, "%s%s",
+            i ? "," : "", h->evidence_ids[i]);
+        if (!qihse_uuid_parse(h->evidence_ids[i], &parsed) || n <= 0 || (size_t)n >= sizeof evidence - used)
+            return false;
+        used += (size_t)n;
+    }
+    if (!used) snprintf(evidence, sizeof evidence, "-");
+    int n = snprintf(out, cap, "QHH2|%s|%u|%u|%llu|%llu|%llu|%s|%u|%s|%s|%s|%s|%s|%s",
         h->id, (unsigned)h->owner_id, (unsigned)h->recipient_id,
         (unsigned long long)h->created_ms, (unsigned long long)h->expires_ms,
         (unsigned long long)h->revision,
         qihse_resp_aimem_handoff_state_name(h->state), (unsigned)h->accepted_by,
         h->scope.project, h->scope.worktree, h->scope.workstream, h->scope.session,
-        h->summary);
+        evidence, h->summary);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -5614,7 +5652,7 @@ static bool qihse_resp_aimem_emit_handoff(qihse_resp_session_t* session,
     snprintf(expires, sizeof expires, "%llu", (unsigned long long)h->expires_ms);
     snprintf(revision, sizeof revision, "%llu", (unsigned long long)h->revision);
     snprintf(accepted, sizeof accepted, "%u", (unsigned)h->accepted_by);
-    return qihse_resp_array(session, 14u) &&
+    return qihse_resp_array(session, 15u) &&
            qihse_resp_bulk_text(session, h->id) &&
            qihse_resp_bulk_text(session, owner) &&
            qihse_resp_bulk_text(session, recipient) &&
@@ -5628,6 +5666,8 @@ static bool qihse_resp_aimem_emit_handoff(qihse_resp_session_t* session,
            qihse_resp_bulk_text(session, h->scope.workstream) &&
            qihse_resp_bulk_text(session, h->scope.session) &&
            qihse_resp_bulk_text(session, h->summary) &&
+           qihse_resp_array(session, (int64_t)h->evidence_count) &&
+           ({ bool emitted = true; for (size_t i = 0; emitted && i < h->evidence_count; i++) emitted = qihse_resp_bulk_text(session, h->evidence_ids[i]); emitted; }) &&
            qihse_resp_bulk_text(session, "accepted-handoff-stays-accepted");
 }
 
@@ -6081,8 +6121,8 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (!store) return qihse_resp_error(session, "ERR AIMEM store unavailable");
 
         if (qihse_resp_arg_equal(&request->argv[2], "OFFER")) {
-            if (request->argc != 10u)
-                return qihse_resp_error(session, "ERR usage: AIMEM HANDOFF OFFER <recipient-user-id> <ttl-ms> <project> <worktree> <workstream> <session> <summary>");
+            if (request->argc < 10u || request->argc > 10u + QIHSE_AIMEM_HANDOFF_MAX_EVIDENCE)
+                return qihse_resp_error(session, "ERR usage: AIMEM HANDOFF OFFER <recipient-user-id> <ttl-ms> <project> <worktree> <workstream> <session> <summary> [evidence-uuid ...]");
             uint32_t recipient_id = 0u;
             uint64_t ttl_ms = 0u;
             qihse_ai_memory_scope_t scope;
@@ -6104,7 +6144,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                 return qihse_resp_error(session, "NOPERM AIMEM handoff recipient or project policy denied");
             }
             qihse_uuid_t uuid;
-            char id[QIHSE_AIMEM_ID_LEN + 1u], key[128], record[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+            char id[QIHSE_AIMEM_ID_LEN + 1u], key[128], record[QIHSE_AIMEM_HANDOFF_RECORD_CAP];
             bool ok = qihse_uuid_generate(&uuid) && qihse_uuid_format(&uuid, id) &&
                 qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
             qihse_aimem_handoff_t handoff;
@@ -6119,7 +6159,24 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                 handoff.state = QIHSE_AIMEM_HANDOFF_OPEN;
                 handoff.scope = scope;
                 handoff.summary = summary;
-                ok = qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record);
+                for (size_t i = 10u; ok && i < request->argc; i++) {
+                    char* evidence_id = qihse_resp_arg_text(&request->argv[i]);
+                    qihse_uuid_t evidence_uuid;
+                    qihse_ai_memory_hit_t evidence;
+                    memset(&evidence, 0, sizeof evidence);
+                    ok = evidence_id && qihse_uuid_parse(evidence_id, &evidence_uuid) &&
+                        qihse_ai_memory_get_scoped(session->server, session->user,
+                            evidence_id, &scope, &evidence) &&
+                        qihse_auth_can_access(session->user, evidence.classification,
+                                              evidence.sci_compartment);
+                    if (ok) {
+                        snprintf(handoff.evidence_ids[handoff.evidence_count++],
+                            QIHSE_AIMEM_ID_LEN + 1u, "%s", evidence_id);
+                    }
+                    free(evidence.text);
+                    free(evidence_id);
+                }
+                ok = ok && qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record);
             }
             pthread_rwlock_wrlock(&session->server->kv_lock);
             if (ok) ok = qihse_kv_set_user(store, key, record,
@@ -6156,7 +6213,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                 handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
                 handoff.revision++;
                 qihse_kv_record_meta_t meta;
-                char replacement[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+                char replacement[QIHSE_AIMEM_HANDOFF_RECORD_CAP];
                 bool durable = qihse_kv_meta_user(store, key, session->user, &meta) &&
                     qihse_resp_aimem_handoff_encode(&handoff, replacement, sizeof replacement) &&
                     qihse_kv_compare_set_user(store, key, raw, replacement,
@@ -6209,7 +6266,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             if (handoff.state == QIHSE_AIMEM_HANDOFF_OPEN && now >= handoff.expires_ms) {
                 handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
                 handoff.revision++;
-                char expired[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+                char expired[QIHSE_AIMEM_HANDOFF_RECORD_CAP];
                 bool durable = qihse_resp_aimem_handoff_encode(&handoff, expired, sizeof expired) &&
                     qihse_kv_compare_set_user(store, key, raw, expired,
                         meta.classification, meta.sci_compartment, session->user) == QIHSE_KV_CAS_UPDATED &&
@@ -6236,7 +6293,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             handoff.state = accept ? QIHSE_AIMEM_HANDOFF_ACCEPTED : QIHSE_AIMEM_HANDOFF_CANCELLED;
             handoff.accepted_by = accept ? qihse_user_get_id(session->user) : 0u;
             handoff.revision++;
-            char record[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+            char record[QIHSE_AIMEM_HANDOFF_RECORD_CAP];
             ok = qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record) &&
                  qihse_kv_set_user(store, key, record, meta.classification,
                                    meta.sci_compartment, session->user) &&

@@ -11,6 +11,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static qihse_resp_server_t* server;
 
@@ -141,6 +145,83 @@ static void* handoff_claim_worker(void* opaque) {
         w->denied++;
     free(reply);
     return NULL;
+}
+
+static bool fd_write_all(int fd, const void* buffer, size_t length) {
+    const char* p = buffer;
+    while (length) {
+        ssize_t n = write(fd, p, length);
+        if (n <= 0) return false;
+        p += n; length -= (size_t)n;
+    }
+    return true;
+}
+
+static bool fd_read_line(int fd, char* out, size_t cap) {
+    size_t used = 0;
+    while (used + 1u < cap) {
+        char c;
+        if (read(fd, &c, 1u) != 1) return false;
+        out[used++] = c;
+        if (used >= 2u && out[used - 2u] == '\r' && out[used - 1u] == '\n') {
+            out[used] = '\0'; return true;
+        }
+    }
+    return false;
+}
+
+static bool fd_send3(int fd, const char* a, const char* b, const char* c) {
+    const char* values[] = { a, b, c };
+    char line[64];
+    if (!fd_write_all(fd, "*3\r\n", 4u)) return false;
+    for (size_t i = 0; i < 3u; i++) {
+        int n = snprintf(line, sizeof line, "$%zu\r\n", strlen(values[i]));
+        if (n <= 0 || !fd_write_all(fd, line, (size_t)n) ||
+            !fd_write_all(fd, values[i], strlen(values[i])) ||
+            !fd_write_all(fd, "\r\n", 2u)) return false;
+    }
+    return true;
+}
+
+static int network_claim_child(uint16_t port, const char* username,
+        const char* password, const char* handoff_id, bool recipient) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 10;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr); addr.sin_family = AF_INET;
+    addr.sin_port = htons(port); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof addr) != 0 ||
+        !fd_send3(fd, "AUTH", username, password)) { close(fd); return 11; }
+    char line[256];
+    if (!fd_read_line(fd, line, sizeof line) || strncmp(line, "+OK", 3u) != 0) {
+        close(fd); return 12;
+    }
+    char accepts[128];
+    snprintf(accepts, sizeof accepts, "AIMEM HANDOFF ACCEPT %s 1", handoff_id);
+    /* Build the five-element command directly. */
+    const char* args[] = { "AIMEM", "HANDOFF", "ACCEPT", handoff_id, "1" };
+    for (size_t attempt = 0; attempt < 4u; attempt++) {
+        char header[32];
+        if (!fd_write_all(fd, "*5\r\n", 4u)) { close(fd); return 13; }
+        for (size_t i = 0; i < 5u; i++) {
+            int n = snprintf(header, sizeof header, "$%zu\r\n", strlen(args[i]));
+            if (n <= 0 || !fd_write_all(fd, header, (size_t)n) ||
+                !fd_write_all(fd, args[i], strlen(args[i])) || !fd_write_all(fd, "\r\n", 2u)) {
+                close(fd); return 14;
+            }
+        }
+        if (!fd_read_line(fd, line, sizeof line)) { close(fd); return 15; }
+        bool accepted = strncmp(line, "$8\r\n", 4u) == 0;
+        if (accepted) {
+            char body[32];
+            if (!fd_read_line(fd, body, sizeof body) || strcmp(body, "ACCEPTED\r\n") != 0) {
+                close(fd); return 16;
+            }
+        }
+        if (accepted != recipient) { close(fd); return 17; }
+        (void)accepts;
+    }
+    close(fd); return 0;
 }
 
 int main(void) {
@@ -448,10 +529,15 @@ int main(void) {
     expect_contains(tenant7, 5u, project_grant, "+OK\r\n");
     const char* competitor_grant[] = { "AIMEM", "PROJECT", "GRANT", "project-events", "9045" };
     expect_contains(tenant7, 5u, competitor_grant, "+OK\r\n");
+    const char* bad_evidence_offer[] = { "AIMEM", "HANDOFF", "OFFER", "9044", "60000",
+        "project-events", "checkout-a", "stream-a", "session-1", "bad pointer", "placeholder" };
+    bad_evidence_offer[10] = tenant8_id;
+    expect_contains(tenant7, 11u, bad_evidence_offer, "NOPERM");
     const char* handoff_offer[] = { "AIMEM", "HANDOFF", "OFFER", "9044", "60000",
-        "project-events", "checkout-a", "stream-a", "session-1", "review durable handoff" };
+        "project-events", "checkout-a", "stream-a", "session-1", "review durable handoff", "placeholder" };
+    handoff_offer[10] = event_doc_id;
     reply = NULL;
-    reply_len = run(tenant7, 10u, handoff_offer, &reply);
+    reply_len = run(tenant7, 11u, handoff_offer, &reply);
     char* handoff_id = extract_bulk_id(reply, reply_len);
     free(reply);
     pthread_t handoff_threads[HANDOFF_CLAIM_THREADS];
@@ -616,6 +702,32 @@ int main(void) {
     free(scoped_id);
     free(high_scoped_id);
     free(worktree_id);
+    const char* process_offer[] = { "AIMEM", "HANDOFF", "OFFER", "9044", "60000",
+        "project-events", "checkout-a", "stream-a", "session-1", "fork race evidence", "placeholder" };
+    process_offer[10] = event_doc_id;
+    reply = NULL;
+    reply_len = run(tenant7, 11u, process_offer, &reply);
+    char* process_handoff_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    assert(qihse_resp_server_start(server));
+    uint16_t listener_port = qihse_resp_server_port(server);
+    assert(listener_port != 0u);
+    pid_t recipient_child = fork();
+    assert(recipient_child >= 0);
+    if (recipient_child == 0) _exit(network_claim_child(listener_port,
+        qihse_user_get_username(tenant7_reader), "Tenant7Reader123!",
+        process_handoff_id, true));
+    pid_t competitor_child = fork();
+    assert(competitor_child >= 0);
+    if (competitor_child == 0) _exit(network_claim_child(listener_port,
+        qihse_user_get_username(tenant7_competitor), "Tenant7Competitor123!",
+        process_handoff_id, false));
+    int recipient_status = 0, competitor_status = 0;
+    assert(waitpid(recipient_child, &recipient_status, 0) == recipient_child);
+    assert(waitpid(competitor_child, &competitor_status, 0) == competitor_child);
+    assert(WIFEXITED(recipient_status) && WEXITSTATUS(recipient_status) == 0);
+    assert(WIFEXITED(competitor_status) && WEXITSTATUS(competitor_status) == 0);
+    free(process_handoff_id);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
     puts("PASS authenticated AIMEM RESP protocol and principal enforcement");
