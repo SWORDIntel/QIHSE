@@ -233,13 +233,13 @@ bool qihse_resp_server_repl_snapshot_install_local(qihse_resp_server_t* server,
                                                     const char* filepath,
                                                     uint64_t source_highwater,
                                                     qihse_user_t* principal);
-/* QKP1-only, pinned-peer, replication-service data plane. REPL.DELTA
- * returns flat bulk fields [cursor,count,op,seq,class,sci,expire_ms,key,value,...];
- * REPL.APPLY accepts one version-1 record plus its namespace and durably
- * advances that peer/namespace cursor only after the row is durable.
- * REPL.CURSOR reads the corresponding receiver cursor. REPL.SNAPSHOT.BEGIN
- * registers the source's durable baseline for that peer/namespace before
- * releasing the snapshot view; REPL.ACK advances it after receiver durability.
+/* QKP1 pinned-peer source data plane. REPL.DELTA returns flat bulk fields
+ * [cursor,count,op,seq,class,sci,expire_ms,key,value,...]. Network peers may
+ * call DELTA, SNAPSHOT.BEGIN/READ/END and ACK only. Receiver-side APPLY and
+ * CURSOR remain available solely to local authenticated/in-process adapters.
+ * REPL.SNAPSHOT.BEGIN registers the source's durable baseline for that
+ * peer/namespace before releasing the snapshot view; REPL.ACK advances it
+ * after receiver durability.
  * Streaming compaction retains matching tombstones until that acknowledgement.
  * Legacy sequence-zero rows still require a full snapshot baseline. */
 /* Anti-entropy bookkeeping for REPL.STATUS. peer == NULL updates the

@@ -54,7 +54,7 @@ static void test_scatter_no_peers(void) {
     /* With no peers, scatter should return 0 results */
     float vec[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     qihse_vector_result_t results[10];
-    int found = qihse_cluster_scatter_vecsearch(sg, vec, 4, 10, NULL, results);
+    int found = qihse_cluster_scatter_vecsearch(sg, vec, 4, 10, NULL, "commons/test", 12u, results);
     assert(found == 0);
 
     qihse_cluster_scatter_stats_t stats;
@@ -178,7 +178,7 @@ static void test_scatter_unhealthy_peer(void) {
 
     float vec[2] = {1.0f, 2.0f};
     qihse_vector_result_t results[10];
-    int found = qihse_cluster_scatter_vecsearch(sg, vec, 2, 10, NULL, results);
+    int found = qihse_cluster_scatter_vecsearch(sg, vec, 2, 10, NULL, "commons/test", 12u, results);
     /* Unhealthy peer should be skipped, so 0 results */
     assert(found == 0);
 
@@ -215,7 +215,7 @@ static void test_scatter_peer_connection_failure(void) {
 
     float vec[2] = {1.0f, 2.0f};
     qihse_vector_result_t results[10];
-    int found = qihse_cluster_scatter_vecsearch(sg, vec, 2, 10, NULL, results);
+    int found = qihse_cluster_scatter_vecsearch(sg, vec, 2, 10, NULL, "commons/test", 12u, results);
     /* Connection should fail, so 0 results */
     assert(found == 0);
 
@@ -234,7 +234,7 @@ static void test_scatter_peer_connection_failure(void) {
 static void test_null_scatter(void) {
     float vec[2] = {1.0f, 2.0f};
     qihse_vector_result_t results[10];
-    int found = qihse_cluster_scatter_vecsearch(NULL, vec, 2, 10, NULL, results);
+    int found = qihse_cluster_scatter_vecsearch(NULL, vec, 2, 10, NULL, "commons/test", 12u, results);
     assert(found == -1);
 
     double value;

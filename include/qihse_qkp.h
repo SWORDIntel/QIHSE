@@ -81,8 +81,9 @@
  * TRUST: H1 is verified by the client against --pqc-trusted-pub anchors and
  * H2 by the server against the same class of anchors. There is no
  * trust-on-first-use and no hostname/IP-derived identity (predesign §17/§18).
- * AUTH still applies inside the secure channel: QKP proves node identity,
- * AUTH proves the operator principal.
+ * A specifically pinned replication peer is mapped to the configured local
+ * replication service principal. Other QKP sessions remain unauthenticated;
+ * no node-to-node path carries or retains an operator password.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 #include <stdbool.h>
@@ -139,7 +140,8 @@ typedef struct {
     const char* node_id;                  /* ≤ 64 bytes label */
     bool require;                         /* refuse cleartext connections */
     /* Optional replication peer pin. Ordinary RESP sessions are unaffected;
-     * REPL.APPLY/DELTA require both values and match against the QKP signer. */
+     * source-side REPL.DELTA/SNAPSHOT/ACK require both values and match the
+     * QKP signer. Receiver APPLY/CURSOR remain local in-process operations. */
     const char* replication_peer_node_id;
     const char* replication_peer_dsa_pub_path;
 } qihse_qkp_config_t;

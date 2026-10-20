@@ -38,6 +38,8 @@ import argparse
 
 # Cluster topology and defaults
 MACHINE_TOKEN_PATH = os.environ.get("QIHSE_MACHINE_TOKEN", "/etc/qihse/machine_token")
+MACHINE_TENANT = int(os.environ.get("QIHSE_MACHINE_TENANT", "0"))
+MACHINE_USER_ID = int(os.environ.get("QIHSE_MACHINE_USER_ID", "0"))
 CLUSTER_SEEDS = [
     ("192.168.1.91", 7100, "t420"),
     ("192.168.1.90", 7115, "730xd"),
@@ -545,17 +547,20 @@ def publish_telemetry(data):
     node owns the key's slot. Authentication happens once per connection
     lifetime — zero steady-state AUTH traffic.
     """
+    if MACHINE_TENANT <= 0 or MACHINE_USER_ID <= 0:
+        raise RuntimeError("QIHSE_MACHINE_TENANT and QIHSE_MACHINE_USER_ID are required")
     payload = json.dumps(data)
     node_name = data["node"]
-    key_obs = f"citadel/thermal/nodes/{node_name}/observed"
-    key_ks = f"keystone/thermal/nodes/{node_name}/observed"
+    prefix = f"t:{MACHINE_TENANT}/machine/{MACHINE_USER_ID}"
+    key_obs = f"{prefix}/thermal/{node_name}/observed"
+    key_ks = f"{prefix}/keystone-thermal/{node_name}/observed"
 
     kind, value = _POOL.run(["SET", key_obs, payload])
     if kind != "ok":
         return False
     # Best-effort companions on the same tick.
     try:
-        _POOL.run(["PUBLISH", f"citadel.thermal.{node_name}", payload])
+        _POOL.run(["PUBLISH", f"{prefix}/thermal-events", payload])
         _POOL.run(["SET", key_ks, payload])
     except (OSError, ConnectionError) as e:
         sys.stderr.write(f"[fan-agent] companion publish failed: {e}\n")
@@ -563,10 +568,21 @@ def publish_telemetry(data):
 
 
 def get_fleet_telemetry():
-    """Queries the cluster for all nodes' observed state (persistent conns)."""
+    """Return the current machine principal's own telemetry.
+
+    Cross-machine fleet aggregation requires a separate authorized operator
+    surface; a MACHINEAUTH capability is deliberately bound to one prefix.
+    """
+    if MACHINE_TENANT <= 0 or MACHINE_USER_ID <= 0:
+        raise RuntimeError("QIHSE_MACHINE_TENANT and QIHSE_MACHINE_USER_ID are required")
     fleet = {}
+    local_node = detect_node_name()
     for _, _, node_name in CLUSTER_SEEDS:
-        key = f"citadel/thermal/nodes/{node_name}/observed"
+        if node_name != local_node:
+            fleet[node_name] = {"status": "restricted to the owning machine principal"}
+            continue
+        key = (f"t:{MACHINE_TENANT}/machine/{MACHINE_USER_ID}/thermal/"
+               f"{node_name}/observed")
         val = None
         try:
             kind, value = _POOL.run(["GET", key])

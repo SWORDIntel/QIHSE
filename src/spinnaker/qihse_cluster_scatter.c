@@ -397,6 +397,8 @@ static int qihse_scatter_query_peer_vecsearch(qihse_cluster_scatter_t* sg,
                                               uint32_t timeout_ms,
                                               const qihse_user_t* user,
                                               const float* query_vector, size_t dims, size_t top_k,
+                                              const void* collection_tag,
+                                              size_t collection_tag_len,
                                               qihse_vector_result_t* results, size_t max_results) {
     int fd = qihse_scatter_connect(host, port, timeout_ms);
     if (fd < 0) return -1;
@@ -406,16 +408,30 @@ static int qihse_scatter_query_peer_vecsearch(qihse_cluster_scatter_t* sg,
         close(fd);
         return -1;
     }
-    /* Build VECSEARCH command: VECSEARCH dims top_k v0 v1 ... */
-    /* Format: *(3+dims)\r\n$9\r\nVECSEARCH\r\n$dims_len\r\ndims\r\n$topk_len\r\ntop_k\r\n$vlen\r\nv0\r\n... */
-    size_t cmd_cap = 64 + dims * 32;
+    /* PEERAUTH VECSEARCH always carries the caller-selected collection TAG;
+     * the receiving tenant gate validates it before ANN materialization. */
+    if (!collection_tag || collection_tag_len == 0u) { close(fd); return -1; }
+    size_t cmd_cap = 96u + dims * 32u + collection_tag_len;
     char* cmd = (char*)malloc(cmd_cap);
     if (!cmd) { close(fd); return -1; }
     int pos = snprintf(cmd, cmd_cap, "*%zu\r\n$9\r\nVECSEARCH\r\n$%zu\r\n%zu\r\n$%zu\r\n%zu\r\n",
-                       3u + dims, digits(dims), dims, digits(top_k), top_k);
+                       5u + dims, digits(dims), dims, digits(top_k), top_k);
     for (size_t i = 0; i < dims && pos < (int)cmd_cap; i++) {
         pos += snprintf(cmd + pos, cmd_cap - pos, "$%d\r\n%.8g\r\n", (int)snprintf(NULL, 0, "%.8g", query_vector[i]), query_vector[i]);
     }
+    if (pos < 0 || (size_t)pos >= cmd_cap ||
+        (size_t)pos + 9u + collection_tag_len > cmd_cap) {
+        free(cmd); close(fd); return -1;
+    }
+    pos += snprintf(cmd + pos, cmd_cap - (size_t)pos, "$3\r\nTAG\r\n$%zu\r\n",
+                    collection_tag_len);
+    if (pos < 0 || (size_t)pos + collection_tag_len + 2u > cmd_cap) {
+        free(cmd); close(fd); return -1;
+    }
+    memcpy(cmd + pos, collection_tag, collection_tag_len);
+    pos += (int)collection_tag_len;
+    memcpy(cmd + pos, "\r\n", 2u);
+    pos += 2;
     size_t cmd_len = (size_t)pos;
     bool sent = qihse_scatter_send_all(fd, cmd, cmd_len, timeout_ms);
     free(cmd);
@@ -431,6 +447,8 @@ static int qihse_scatter_query_peer_vecsearch(qihse_cluster_scatter_t* sg,
 int qihse_cluster_scatter_vecsearch(qihse_cluster_scatter_t* sg,
                                     const float* query_vector, size_t dims,
                                     size_t top_k, const qihse_user_t* user,
+                                    const void* collection_tag,
+                                    size_t collection_tag_len,
                                     qihse_vector_result_t* out_results) {
     if (!sg || !query_vector || !out_results || dims == 0 || top_k == 0) return -1;
     /* `user` is propagated to each peer as a signed PEERAUTH claim (or not
@@ -459,6 +477,7 @@ int qihse_cluster_scatter_vecsearch(qihse_cluster_scatter_t* sg,
         int found = qihse_scatter_query_peer_vecsearch(sg, peers[p].host, peers[p].port,
                                                         sg->timeout_ms, user,
                                                         query_vector, dims, ask,
+                                                        collection_tag, collection_tag_len,
                                                         peer_results, ask);
         pthread_mutex_lock(&sg->lock);
         if (found > 0) {

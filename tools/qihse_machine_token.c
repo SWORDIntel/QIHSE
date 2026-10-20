@@ -13,8 +13,8 @@
  *
  * Usage:
  *   qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem \
- *       [--label name] [--ttl-seconds 43200] [--user-id 0]
- *       [--clearance 0] [--sci 0] [--tenant 0]
+ *       --user-id N --tenant N [--ttl-seconds 43200]
+ *       [--clearance 0] [--sci 0]
  *
  * Prints the token as lowercase hex on stdout. Store it root-only (0600) —
  * it is a bearer credential until it expires. Default TTL 12h; the verifier
@@ -41,8 +41,8 @@
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s --identity <priv-pem> [--ttl-seconds N] [--user-id N]\n"
-            "                     [--clearance N] [--sci N] [--tenant N]\n",
+            "usage: %s --identity <priv-pem> --user-id N --tenant N\n"
+            "                     [--ttl-seconds N] [--clearance N] [--sci N]\n",
             prog);
 }
 
@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
     const char* identity = NULL;
     uint64_t ttl_ms = 12ull * 3600ull * 1000ull; /* 12h default */
     uint32_t user_id = 0, tenant = 0;
+    bool have_user_id = false, have_tenant = false;
     uint16_t clearance = 0, sci = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -65,18 +66,20 @@ int main(int argc, char** argv) {
             ttl_ms = (uint64_t)v * 1000ull;
         } else if (strcmp(argv[i], "--user-id") == 0 && i + 1 < argc) {
             user_id = (uint32_t)strtoul(argv[++i], NULL, 10);
+            have_user_id = true;
         } else if (strcmp(argv[i], "--clearance") == 0 && i + 1 < argc) {
             clearance = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sci") == 0 && i + 1 < argc) {
             sci = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--tenant") == 0 && i + 1 < argc) {
             tenant = (uint32_t)strtoul(argv[++i], NULL, 10);
+            have_tenant = true;
         } else {
             usage(argv[0]);
             return 2;
         }
     }
-    if (!identity) {
+    if (!identity || !have_user_id || !have_tenant || tenant == 0u) {
         usage(argv[0]);
         return 2;
     }

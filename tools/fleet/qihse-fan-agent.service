@@ -4,11 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/qihse/machine-principal.env
 ExecStart=/usr/local/bin/qihse-fan-agent --daemon --interval 5
 Restart=always
 RestartSec=5
 # Authentication: MACHINEAUTH token at /etc/qihse/machine_token, minted by
-# `qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem` and
+# `qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem
+#   --tenant "$QIHSE_MACHINE_TENANT" --user-id "$QIHSE_MACHINE_USER_ID"` and
 # installed 0600 root. The server consumes the token nonce once per
 # connection, and this agent keeps connections persistent, so re-minting is
 # needed only rarely (token TTL). QIHSE_OPERATOR_PASSWORD may be exported as
