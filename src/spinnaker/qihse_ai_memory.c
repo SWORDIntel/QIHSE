@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #define AIMEM_PREFIX "aimem:"
 #define AIMEM_PREFIX_LEN (sizeof(AIMEM_PREFIX) - 1u)
@@ -46,6 +47,7 @@ static pthread_mutex_t g_aimem_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_event_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_knowledge_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_migration_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_aimem_archive_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_scope_index_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Defined with the embedding block below; reset() needs it earlier. */
@@ -1074,22 +1076,19 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append_evidence(
     return result;
 }
 
-bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
-        const char* id, const qihse_ai_memory_scope_t* scope,
-        qihse_ai_memory_hit_t* out) {
-    if (!qihse_ai_memory_get_scoped(server, user, id, scope, out)) return false;
-    if (out->kind == QIHSE_AIMEM_EVENT && out->text &&
-        (strncmp(out->text, "QHEV1|", 6u) == 0 ||
-         strncmp(out->text, "QHEV2|", 6u) == 0)) {
-        bool has_evidence = strncmp(out->text, "QHEV2|", 6u) == 0;
+static bool aimem_event_envelope_valid(const char* text,
+        char out_producer[64], char out_event_id[QIHSE_AIMEM_IDEM_MAX_LEN + 1u]) {
+    if (text && (strncmp(text, "QHEV1|", 6u) == 0 ||
+                 strncmp(text, "QHEV2|", 6u) == 0)) {
+        bool has_evidence = strncmp(text, "QHEV2|", 6u) == 0;
         char producer[64], event_id[QIHSE_AIMEM_IDEM_MAX_LEN + 1u];
         char kind[32], source[24], received[24], status[16], digest_hex[65];
         char evidence_id[QIHSE_AIMEM_ID_LEN + 1u];
         int offset = 0;
-        int fields = has_evidence ? sscanf(out->text,
+        int fields = has_evidence ? sscanf(text,
             "QHEV2|%63[^|]|%128[^|]|%31[^|]|%23[^|]|%23[^|]|%15[^|]|%36[^|]|%64[^|]|%n",
             producer, event_id, kind, source, received, status, evidence_id, digest_hex, &offset)
-            : sscanf(out->text,
+            : sscanf(text,
             "QHEV1|%63[^|]|%128[^|]|%31[^|]|%23[^|]|%23[^|]|%15[^|]|%64[^|]|%n",
             producer, event_id, kind, source, received, status, digest_hex, &offset);
         bool valid = fields == (has_evidence ? 8 : 7) && offset > 0 && aimem_event_token(producer, 63u) &&
@@ -1104,7 +1103,7 @@ bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
         for (size_t i = 0; valid && i < 64u; i++)
             if (!((digest_hex[i] >= '0' && digest_hex[i] <= '9') ||
                   (digest_hex[i] >= 'a' && digest_hex[i] <= 'f'))) valid = false;
-        const char* summary = out->text + offset;
+        const char* summary = text + offset;
         if (!*summary || strlen(summary) > QIHSE_AIMEM_EVENT_MAX_SUMMARY) valid = false;
         for (const unsigned char* p = (const unsigned char*)summary; valid && *p; p++)
             if (*p < 0x20u || *p == 0x7fu) valid = false;
@@ -1118,8 +1117,22 @@ bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
                 snprintf(actual_hex + i * 2u, 3u, "%02x", digest[i]);
             valid = strcmp(actual_hex, digest_hex) == 0;
         }
-        if (valid) return true;
+        if (valid) {
+            if (out_producer) snprintf(out_producer, 64u, "%s", producer);
+            if (out_event_id)
+                snprintf(out_event_id, QIHSE_AIMEM_IDEM_MAX_LEN + 1u, "%s", event_id);
+            return true;
+        }
     }
+    return false;
+}
+
+bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
+        const char* id, const qihse_ai_memory_scope_t* scope,
+        qihse_ai_memory_hit_t* out) {
+    if (!qihse_ai_memory_get_scoped(server, user, id, scope, out)) return false;
+    if (out->kind == QIHSE_AIMEM_EVENT &&
+        aimem_event_envelope_valid(out->text, NULL, NULL)) return true;
     free(out->text);
     memset(out, 0, sizeof(*out));
     return false;
@@ -3366,6 +3379,376 @@ qihse_ai_memory_import_result_t qihse_ai_memory_import_scope(
     if (conflict) return QIHSE_AIMEM_IMPORT_CONFLICT;
     if (!dry_run) aimem_counter_inc(&g_aimem_imports);
     return dry_run ? QIHSE_AIMEM_IMPORT_VALID : QIHSE_AIMEM_IMPORT_APPLIED;
+}
+
+typedef struct {
+    char kind;
+    char key[128];
+    char* raw;
+    uint16_t classification;
+    uint16_t sci;
+} aimem_archive_row_t;
+
+typedef struct {
+    qihse_resp_server_t* server;
+    qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope;
+    aimem_archive_row_t* rows;
+    size_t count;
+    size_t cap;
+    size_t raw_bytes;
+    bool failed;
+} aimem_archive_build_t;
+
+static bool aimem_archive_push(aimem_archive_build_t* b, char kind,
+        const char* key, const char* raw, uint16_t classification, uint16_t sci) {
+    size_t n = raw ? strlen(raw) : 0u;
+    if (!b || !key || !n || b->count >= QIHSE_AIMEM_ARCHIVE_MAX_RECORDS ||
+        n > QIHSE_AIMEM_ARCHIVE_MAX_BYTES ||
+        b->raw_bytes > QIHSE_AIMEM_ARCHIVE_MAX_BYTES - n) return false;
+    if (b->count == b->cap) {
+        size_t next = b->cap ? b->cap * 2u : 16u;
+        if (next > QIHSE_AIMEM_ARCHIVE_MAX_RECORDS)
+            next = QIHSE_AIMEM_ARCHIVE_MAX_RECORDS;
+        aimem_archive_row_t* rows = realloc(b->rows, next * sizeof(*rows));
+        if (!rows) return false;
+        b->rows = rows; b->cap = next;
+    }
+    aimem_archive_row_t* row = &b->rows[b->count];
+    memset(row, 0, sizeof(*row));
+    row->kind = kind; row->raw = strdup(raw);
+    if (!row->raw || snprintf(row->key, sizeof row->key, "%s", key) <= 0) {
+        free(row->raw); row->raw = NULL; return false;
+    }
+    row->classification = classification; row->sci = sci;
+    b->raw_bytes += n; b->count++;
+    return true;
+}
+
+static bool aimem_archive_knowledge_cb(const char* key, const char* value,
+                                       void* opaque) {
+    aimem_archive_build_t* b = opaque;
+    aimem_knowledge_chain_t chain = {0};
+    if (!aimem_knowledge_chain_parse(value, &chain)) return true;
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    qihse_kv_record_meta_t meta;
+    bool include = aimem_scope_matches(&chain.scope, b->scope) &&
+        aimem_scope_owner_allowed(store, b->user, chain.owner_id, b->scope) &&
+        qihse_kv_meta_user(store, key, b->user, &meta);
+    if (include && !aimem_archive_push(b, 'K', key, value,
+                                       meta.classification, meta.sci_compartment))
+        b->failed = true;
+    aimem_knowledge_chain_free(&chain);
+    return !b->failed;
+}
+
+static bool aimem_archive_event_cb(const char* key, const char* value,
+                                   void* opaque) {
+    aimem_archive_build_t* b = opaque;
+    qihse_ai_memory_hit_t hit = {0}; aimem_record_meta_t meta;
+    if (!aimem_parse_record_meta(value, &hit, &meta)) return true;
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    bool include = hit.kind == QIHSE_AIMEM_EVENT &&
+        aimem_event_envelope_valid(hit.text, NULL, NULL) &&
+        aimem_scope_matches(&meta.scope, b->scope) &&
+        aimem_scope_owner_allowed(store, b->user, meta.owner_id, b->scope);
+    qihse_kv_record_meta_t labels;
+    if (include) include = qihse_kv_meta_user(store, key, b->user, &labels);
+    if (include) include = hit.classification == labels.classification &&
+                           hit.sci_compartment == labels.sci_compartment;
+    if (include && !aimem_archive_push(b, 'E', key, value,
+                                       labels.classification, labels.sci_compartment))
+        b->failed = true;
+    free(hit.text);
+    return !b->failed;
+}
+
+static int aimem_archive_row_compare(const void* left, const void* right) {
+    const aimem_archive_row_t* a = left; const aimem_archive_row_t* b = right;
+    if (a->kind != b->kind) return (int)a->kind - (int)b->kind;
+    return strcmp(a->key, b->key);
+}
+
+static char* aimem_archive_hex_encode(const char* value) {
+    size_t n = value ? strlen(value) : 0u;
+    if (!n || n > QIHSE_AIMEM_ARCHIVE_MAX_BYTES || n > (SIZE_MAX - 1u) / 2u)
+        return NULL;
+    char* hex = malloc(n * 2u + 1u); if (!hex) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)value[i];
+        hex[i * 2u] = aimem_hex_digit(c >> 4);
+        hex[i * 2u + 1u] = aimem_hex_digit(c & 15u);
+    }
+    hex[n * 2u] = '\0'; return hex;
+}
+
+static char* aimem_archive_hex_decode(const char* hex) {
+    size_t n = hex ? strlen(hex) : 0u;
+    if (!n || (n & 1u) || n / 2u > QIHSE_AIMEM_ARCHIVE_MAX_BYTES) return NULL;
+    char* value = malloc(n / 2u + 1u); if (!value) return NULL;
+    for (size_t i = 0; i < n; i += 2u) {
+        int hi = aimem_hex_value(hex[i]), lo = aimem_hex_value(hex[i + 1u]);
+        if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) { free(value); return NULL; }
+        value[i / 2u] = (char)((hi << 4) | lo);
+    }
+    value[n / 2u] = '\0'; return value;
+}
+
+static bool aimem_archive_hmac(const uint8_t* key, size_t key_len,
+        const void* data, size_t len, char out[65]) {
+    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int n = 0u;
+    if (!key || key_len < 16u || key_len > 128u || !data ||
+        !HMAC(EVP_sha256(), key, (int)key_len, data, len, digest, &n) || n != 32u)
+        return false;
+    for (size_t i = 0; i < 32u; i++) {
+        out[i * 2u] = aimem_hex_digit(digest[i] >> 4);
+        out[i * 2u + 1u] = aimem_hex_digit(digest[i] & 15u);
+    }
+    out[64] = '\0'; return true;
+}
+
+bool qihse_ai_memory_export_authenticated(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+        const uint8_t* authentication_key, size_t authentication_key_len,
+        qihse_ai_memory_export_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !aimem_scope_valid(scope) || !authentication_key ||
+        authentication_key_len < 16u || authentication_key_len > 128u || !out)
+        return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    aimem_archive_build_t b = { .server = server, .user = user, .scope = scope };
+    char knowledge_prefix[48], event_prefix[32];
+    int kn = snprintf(knowledge_prefix, sizeof knowledge_prefix,
+        "t:%u/aimem-knowledge:", (unsigned)qihse_user_get_tenant_id(user));
+    int en = snprintf(event_prefix, sizeof event_prefix, "t:%u/aimem:",
+        (unsigned)qihse_user_get_tenant_id(user));
+    bool ok = store && kn > 0 && (size_t)kn < sizeof knowledge_prefix &&
+        en > 0 && (size_t)en < sizeof event_prefix &&
+        qihse_kv_foreach_prefix_user(store, knowledge_prefix, user,
+                                     aimem_archive_knowledge_cb, &b) && !b.failed &&
+        qihse_kv_foreach_prefix_user(store, event_prefix, user,
+                                     aimem_archive_event_cb, &b) && !b.failed;
+    qsort(b.rows, b.count, sizeof(*b.rows), aimem_archive_row_compare);
+    size_t cap = 512u;
+    for (size_t i = 0; ok && i < b.count; i++) {
+        size_t n = strlen(b.rows[i].raw);
+        if (n > (QIHSE_AIMEM_ARCHIVE_MAX_BYTES - 192u) / 2u ||
+            cap > QIHSE_AIMEM_ARCHIVE_MAX_BYTES - (n * 2u + 192u)) ok = false;
+        else cap += n * 2u + 192u;
+    }
+    char* blob = ok && cap + 66u <= QIHSE_AIMEM_ARCHIVE_MAX_BYTES ?
+        malloc(cap + 66u) : NULL;
+    size_t used = 0u;
+#define AAPPEND(...) do { int z = snprintf(blob + used, cap + 66u - used, __VA_ARGS__); \
+    if (z < 0 || (size_t)z >= cap + 66u - used) ok = false; else used += (size_t)z; } while (0)
+    if (blob) AAPPEND("QAX2|%u|%u|%s|%s|%s|%s|%zu",
+        (unsigned)qihse_user_get_tenant_id(user), (unsigned)qihse_user_get_id(user),
+        scope->project, scope->worktree, scope->workstream, scope->session, b.count);
+    else ok = false;
+    for (size_t i = 0; ok && i < b.count; i++) {
+        char* hex = aimem_archive_hex_encode(b.rows[i].raw);
+        if (!hex) { ok = false; break; }
+        AAPPEND("|%c|%u|%u|1|%s", b.rows[i].kind,
+            (unsigned)b.rows[i].classification, (unsigned)b.rows[i].sci, hex);
+        free(hex);
+    }
+    char tag[65];
+    if (ok) ok = aimem_archive_hmac(authentication_key, authentication_key_len,
+                                     blob, used, tag);
+    if (ok) AAPPEND("|%s", tag);
+#undef AAPPEND
+    for (size_t i = 0; i < b.count; i++) free(b.rows[i].raw);
+    free(b.rows);
+    if (!ok || used > QIHSE_AIMEM_ARCHIVE_MAX_BYTES) { free(blob); return false; }
+    out->data = (uint8_t*)blob; out->len = used;
+    aimem_counter_inc(&g_aimem_exports); return true;
+}
+
+bool qihse_ai_memory_export_stream(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+        const uint8_t* authentication_key, size_t authentication_key_len,
+        size_t chunk_size, qihse_ai_memory_archive_write_fn write_fn,
+        void* write_ctx, size_t* out_bytes) {
+    if (out_bytes) *out_bytes = 0u;
+    if (!write_fn || !chunk_size || chunk_size > QIHSE_AIMEM_ARCHIVE_CHUNK_MAX)
+        return false;
+    qihse_ai_memory_export_t archive = {0};
+    if (!qihse_ai_memory_export_authenticated(server, user, scope,
+            authentication_key, authentication_key_len, &archive)) return false;
+    bool ok = true;
+    for (size_t at = 0; ok && at < archive.len; at += chunk_size) {
+        size_t n = archive.len - at; if (n > chunk_size) n = chunk_size;
+        ok = write_fn(write_ctx, archive.data + at, n);
+    }
+    if (ok && out_bytes) *out_bytes = archive.len;
+    qihse_ai_memory_export_free(&archive); return ok;
+}
+
+qihse_ai_memory_import_result_t qihse_ai_memory_import_authenticated(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+        size_t authentication_key_len, const uint8_t* data, size_t len,
+        bool dry_run, size_t* out_imported) {
+    if (out_imported) *out_imported = 0u;
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !aimem_scope_valid(scope) || !authentication_key ||
+        authentication_key_len < 16u || authentication_key_len > 128u ||
+        !data || !len || len > QIHSE_AIMEM_ARCHIVE_MAX_BYTES ||
+        !qihse_ai_memory_project_owner_allowed(server, user, scope->project))
+        return QIHSE_AIMEM_IMPORT_FAILED;
+    char* copy = malloc(len + 1u); if (!copy) return QIHSE_AIMEM_IMPORT_FAILED;
+    memcpy(copy, data, len); copy[len] = '\0';
+    char* last = strrchr(copy, '|'); char expected[65];
+    bool ok = last && strlen(last + 1u) == 64u &&
+        aimem_archive_hmac(authentication_key, authentication_key_len, copy,
+                           (size_t)(last - copy), expected) &&
+        CRYPTO_memcmp(expected, last + 1u, 64u) == 0;
+    if (last) *last = '\0';
+    char* cur = copy; char* magic = strsep(&cur, "|"); char* tenant = strsep(&cur, "|");
+    char* actor = strsep(&cur, "|"); char* project = strsep(&cur, "|");
+    char* tree = strsep(&cur, "|"); char* stream = strsep(&cur, "|");
+    char* session = strsep(&cur, "|"); char* count_text = strsep(&cur, "|");
+    uint32_t tenant_id = 0u, actor_id = 0u; uint64_t count64 = 0u;
+    ok = ok && magic && strcmp(magic, "QAX2") == 0 &&
+        aimem_token_u32(tenant, &tenant_id) &&
+        tenant_id == qihse_user_get_tenant_id(user) &&
+        aimem_token_u32(actor, &actor_id) &&
+        project && tree && stream && session && count_text &&
+        strcmp(project, scope->project) == 0 && strcmp(tree, scope->worktree) == 0 &&
+        strcmp(stream, scope->workstream) == 0 && strcmp(session, scope->session) == 0 &&
+        aimem_token_u64(count_text, &count64) &&
+        count64 <= QIHSE_AIMEM_ARCHIVE_MAX_RECORDS;
+    qihse_user_t* manifest_actor = ok ? qihse_auth_get_user(actor_id) : NULL;
+    ok = ok && manifest_actor && qihse_auth_user_is_active(manifest_actor) &&
+         qihse_user_get_tenant_id(manifest_actor) == tenant_id;
+    size_t count = (size_t)count64;
+    aimem_archive_row_t* rows = ok ? calloc(count ? count : 1u, sizeof(*rows)) : NULL;
+    if (ok && !rows) ok = false;
+    for (size_t i = 0; ok && i < count; i++) {
+        char* kind = strsep(&cur, "|"); char* cls = strsep(&cur, "|");
+        char* sci = strsep(&cur, "|"); char* current = strsep(&cur, "|");
+        char* hex = strsep(&cur, "|"); uint32_t c = 0u, s = 0u, current_u32 = 0u;
+        ok = kind && strlen(kind) == 1u && (kind[0] == 'K' || kind[0] == 'E') &&
+            cls && sci && current && hex && aimem_token_u32(cls, &c) &&
+            c <= UINT16_MAX && aimem_token_u32(sci, &s) && s <= UINT16_MAX &&
+            aimem_token_u32(current, &current_u32) && current_u32 == 1u &&
+            qihse_auth_can_access(user, (uint16_t)c, (uint16_t)s);
+        rows[i].kind = ok ? kind[0] : 0; rows[i].classification = (uint16_t)c;
+        rows[i].sci = (uint16_t)s;
+        if (ok) rows[i].raw = aimem_archive_hex_decode(hex);
+        if (ok && rows[i].kind == 'K') {
+            aimem_knowledge_chain_t chain = {0};
+            ok = rows[i].raw && aimem_knowledge_chain_parse(rows[i].raw, &chain) &&
+                aimem_scope_matches(&chain.scope, scope) &&
+                (chain.owner_id == qihse_user_get_id(user) ||
+                 qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR) &&
+                aimem_knowledge_key(rows[i].key, sizeof rows[i].key, user,
+                                    chain.knowledge_id);
+            qihse_user_t* owner = ok ? qihse_auth_get_user(chain.owner_id) : NULL;
+            ok = ok && owner && qihse_auth_user_is_active(owner) &&
+                qihse_user_get_tenant_id(owner) == tenant_id;
+            aimem_knowledge_chain_free(&chain);
+        } else if (ok) {
+            qihse_ai_memory_hit_t hit = {0}; aimem_record_meta_t meta;
+            char producer[64], event_id[QIHSE_AIMEM_IDEM_MAX_LEN + 1u];
+            ok = rows[i].raw && aimem_parse_record_meta(rows[i].raw, &hit, &meta) &&
+                hit.kind == QIHSE_AIMEM_EVENT && hit.text &&
+                aimem_event_envelope_valid(hit.text, producer, event_id) &&
+                hit.classification == (uint16_t)c &&
+                hit.sci_compartment == (uint16_t)s &&
+                aimem_scope_matches(&meta.scope, scope) &&
+                (meta.owner_id == qihse_user_get_id(user) ||
+                 qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR);
+            qihse_uuid_t uuid;
+            ok = ok && qihse_uuid_parse(hit.id, &uuid) &&
+                aimem_scoped_key(rows[i].key, sizeof rows[i].key, user,
+                                 aimem_doc_id(&uuid));
+            char idem[QIHSE_AIMEM_IDEM_MAX_LEN + 80u];
+            char seed[QIHSE_AIMEM_IDEM_MAX_LEN + 512u];
+            qihse_uuid_t expected_uuid; char expected_id[QIHSE_AIMEM_ID_LEN + 1u];
+            int idem_n = ok ? snprintf(idem, sizeof idem, "event:%s:%s",
+                                       producer, event_id) : -1;
+            int seed_n = idem_n > 0 && (size_t)idem_n < sizeof idem ?
+                snprintf(seed, sizeof seed, "QIHSE:AIMEM:scoped:v1:%u:%u:%s:%s:%s:%s:%s",
+                    (unsigned)tenant_id, (unsigned)meta.owner_id, scope->project,
+                    scope->worktree, scope->workstream, scope->session, idem) : -1;
+            ok = ok && seed_n > 0 && (size_t)seed_n < sizeof seed &&
+                qihse_uuid_from_seed(seed, (size_t)seed_n, &expected_uuid) &&
+                qihse_uuid_format(&expected_uuid, expected_id) && strcmp(hit.id, expected_id) == 0;
+            qihse_user_t* owner = ok ? qihse_auth_get_user(meta.owner_id) : NULL;
+            ok = ok && owner && qihse_auth_user_is_active(owner) &&
+                qihse_user_get_tenant_id(owner) == tenant_id;
+            free(hit.text);
+        }
+        for (size_t j = 0; ok && j < i; j++)
+            if (strcmp(rows[j].key, rows[i].key) == 0) ok = false;
+    }
+    ok = ok && cur == NULL;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    bool conflict = false;
+    pthread_mutex_lock(&g_aimem_archive_lock);
+    for (size_t i = 0; ok && !conflict && i < count; i++) {
+        char* existing = qihse_kv_get_user(store, rows[i].key, user);
+        if (existing && strcmp(existing, rows[i].raw) != 0) conflict = true;
+        free(existing);
+    }
+    if (ok && !conflict && !dry_run) for (size_t i = 0; i < count; i++) {
+        char* existing = qihse_kv_get_user(store, rows[i].key, user);
+        if (existing) { bool same = strcmp(existing, rows[i].raw) == 0; free(existing);
+            if (!same) { conflict = true; break; } continue; }
+        qihse_kv_cas_result_t result = qihse_kv_compare_set_user(store, rows[i].key,
+            NULL, rows[i].raw, rows[i].classification, rows[i].sci, user);
+        if (result != QIHSE_KV_CAS_UPDATED) {
+            existing = qihse_kv_get_user(store, rows[i].key, user);
+            bool same = existing && strcmp(existing, rows[i].raw) == 0; free(existing);
+            if (!same) { conflict = true; break; }
+        } else {
+            if (!qihse_kv_sync_store(store)) { ok = false; break; }
+            if (out_imported) (*out_imported)++;
+            const char* fail_after = getenv("QIHSE_AIMEM_IMPORT_FAIL_AFTER");
+            if (fail_after && *fail_after) {
+                char* end = NULL; unsigned long threshold = strtoul(fail_after, &end, 10);
+                if (end && *end == '\0' && threshold > 0u && out_imported &&
+                    *out_imported >= (size_t)threshold) { ok = false; break; }
+            }
+        }
+    }
+    if (ok && !conflict && !dry_run) ok = qihse_kv_sync_store(store);
+    pthread_mutex_unlock(&g_aimem_archive_lock);
+    for (size_t i = 0; i < count; i++) free(rows ? rows[i].raw : NULL);
+    free(rows); free(copy);
+    if (!ok) { aimem_counter_inc(&g_aimem_rejected); return QIHSE_AIMEM_IMPORT_FAILED; }
+    if (conflict) return QIHSE_AIMEM_IMPORT_CONFLICT;
+    if (!dry_run) aimem_counter_inc(&g_aimem_imports);
+    return dry_run ? QIHSE_AIMEM_IMPORT_VALID : QIHSE_AIMEM_IMPORT_APPLIED;
+}
+
+qihse_ai_memory_import_result_t qihse_ai_memory_import_stream(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+        size_t authentication_key_len, qihse_ai_memory_archive_read_fn read_fn,
+        void* read_ctx, bool dry_run, size_t* out_imported) {
+    if (out_imported) *out_imported = 0u;
+    if (!read_fn) return QIHSE_AIMEM_IMPORT_FAILED;
+    uint8_t* data = malloc(QIHSE_AIMEM_ARCHIVE_MAX_BYTES);
+    if (!data) return QIHSE_AIMEM_IMPORT_FAILED;
+    size_t used = 0u; bool overflow = false;
+    while (used < QIHSE_AIMEM_ARCHIVE_MAX_BYTES) {
+        size_t cap = QIHSE_AIMEM_ARCHIVE_MAX_BYTES - used;
+        if (cap > QIHSE_AIMEM_ARCHIVE_CHUNK_MAX) cap = QIHSE_AIMEM_ARCHIVE_CHUNK_MAX;
+        size_t n = read_fn(read_ctx, data + used, cap);
+        if (n > cap) { overflow = true; break; }
+        if (!n) break;
+        used += n;
+    }
+    if (used == QIHSE_AIMEM_ARCHIVE_MAX_BYTES) {
+        uint8_t probe; if (read_fn(read_ctx, &probe, 1u) != 0u) overflow = true;
+    }
+    qihse_ai_memory_import_result_t result = overflow ? QIHSE_AIMEM_IMPORT_FAILED :
+        qihse_ai_memory_import_authenticated(server, user, scope, authentication_key,
+            authentication_key_len, data, used, dry_run, out_imported);
+    free(data); return result;
 }
 
 typedef struct { qihse_resp_server_t* server; qihse_user_t* user;

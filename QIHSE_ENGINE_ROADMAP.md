@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, and QHK2 provenance/approval policy. QH-05–QH-08 now have native bounded query snapshots, reversible one-lineage maintenance, authenticated canonical projection and redacted rebuild health, with focused restart/security coverage; their remaining wire, richer projection, multi-record, telemetry and generation-cutover gates are described below. QH-09 is closed through scoped `RULE` reuse and QH-10 remains conditional. Integrated into the master roadmap as W10.
+> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 and QH-07 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, QHK2 provenance/approval policy, and authenticated resumable streaming archives. QH-05, QH-06 and QH-08 retain the wire, maintenance, telemetry and generation-cutover gates described below. QH-09 is closed through scoped `RULE` reuse and QH-10 remains conditional. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -241,14 +241,17 @@ Import through authenticated, idempotent QIHSE APIs; never let a supplied file s
 
 **Acceptance:** Export with low-clearance principal contains no higher-label files, filenames, link targets, totals or metadata. Round-trip to disposable store reproduces authorized current contents, version lineage and source IDs; a malformed or tampered manifest is rejected.
 
-**First implementation:** authenticated native export emits deterministic
-tenant/scope-bound `QAX1` logical QHK records with effective labels and a
-SHA-256 trailer. Import validates the whole archive before writes, supports dry
-run and idempotent identical rows, and rejects altered manifests or conflicting
-IDs. A focused low-clearance round-trip preserves visible lineage while
-excluding a high-label row. This remains **partial** pending signatures,
-streaming handles, complete event/relation projection and atomic multi-record
-import with crash recovery.
+**Implementation:** authenticated native export emits deterministic
+tenant/exporter/scope-bound `QAX2` logical records with effective labels,
+events, full QHK2 lineage/provenance/relations, and explicit current markers.
+HMAC-SHA-256 authenticates the manifest and payload using caller-managed key
+material. Callback I/O uses caller-selected chunks capped at 64 KiB; the
+archive is capped at 16 MiB and 4,096 records. Import validates every record
+before writing, supports dry run and exact replay, rejects different-byte ID
+collisions, and durably fences each new row. A crash or injected interruption
+therefore resumes by skipping identical rows. Focused tests cover low-clearance
+exclusion, tamper and wrong-key rejection, stream round-trip, an interrupted
+multi-record import, and successful retry. **QH-07 is complete.**
 
 ## QH-08 — Audit, metrics, index repair, operational gates
 
