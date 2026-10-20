@@ -9,6 +9,10 @@ The server inventory contract used here is::
 The next cursor is ``0`` at end of scan.  A flat response containing the
 cursor followed by UUIDs is also accepted to simplify staged deployments.
 Record contents are never requested during inventory and are never logged.
+
+Version 2 manifests bind every record to one non-Operator target principal.
+Migration uses ``AIMEM MIGRATE-LEGACY-TO <uuid> <target-user-id> ...``; an
+exact retry validates target ownership and scope without disclosing content.
 """
 
 from __future__ import annotations
@@ -20,7 +24,9 @@ import json
 import os
 import re
 import socket
+import stat
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +35,7 @@ from typing import Any, Iterable
 
 MAX_BATCH = 1000
 MAX_INVENTORY = 1_000_000
+MAX_USER_ID = 65535
 SCOPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
 
 
@@ -107,6 +114,13 @@ class ManifestRecord:
         return self.project, self.worktree, self.workstream, self.session
 
 
+@dataclass(frozen=True)
+class MigrationManifest:
+    target_user_id: int
+    records: tuple[ManifestRecord, ...]
+    digest: str
+
+
 def _canonical_uuid(value: Any, ordinal: int) -> str:
     if not isinstance(value, str):
         raise MigrationError(f"manifest record {ordinal} has a non-string uuid")
@@ -126,14 +140,19 @@ def _scope_value(item: dict[str, Any], name: str, ordinal: int, required: bool) 
     return value
 
 
-def load_manifest(path: Path) -> tuple[list[ManifestRecord], str]:
+def load_manifest(path: Path) -> MigrationManifest:
     raw = path.read_bytes()
     try:
         document = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MigrationError("manifest is not valid UTF-8 JSON") from exc
-    if not isinstance(document, dict) or document.get("version") != 1:
-        raise MigrationError("manifest must be an object with version 1")
+    if not isinstance(document, dict) or document.get("version") != 2:
+        raise MigrationError("manifest must be an object with version 2")
+    target_user_id = document.get("target_user_id")
+    if (isinstance(target_user_id, bool) or not isinstance(target_user_id, int) or
+            not 1 <= target_user_id <= MAX_USER_ID):
+        raise MigrationError(
+            f"manifest target_user_id must be an integer between 1 and {MAX_USER_ID}")
     rows = document.get("records")
     if not isinstance(rows, list) or not rows:
         raise MigrationError("manifest records must be a non-empty array")
@@ -142,6 +161,9 @@ def load_manifest(path: Path) -> tuple[list[ManifestRecord], str]:
     for ordinal, item in enumerate(rows, 1):
         if not isinstance(item, dict):
             raise MigrationError(f"manifest record {ordinal} is not an object")
+        if "target_user_id" in item:
+            raise MigrationError(
+                f"manifest record {ordinal} must not override target_user_id")
         record_id = _canonical_uuid(item.get("uuid"), ordinal)
         if record_id in seen:
             raise MigrationError(f"manifest contains duplicate uuid at record {ordinal}")
@@ -157,7 +179,7 @@ def load_manifest(path: Path) -> tuple[list[ManifestRecord], str]:
         records.append(ManifestRecord(record_id, project, worktree, workstream, session))
     records.sort()
     digest = hashlib.sha256(raw).hexdigest()
-    return records, digest
+    return MigrationManifest(target_user_id, tuple(records), digest)
 
 
 def authenticate(client: RespClient, username: str, password: str) -> None:
@@ -197,7 +219,9 @@ def scan_legacy(client: RespClient, batch_size: int) -> set[str]:
         seen_cursors.add(cursor)
 
 
-def preflight(client: RespClient, records: list[ManifestRecord], batch_size: int) -> list[ManifestRecord]:
+def preflight(client: RespClient, manifest: MigrationManifest,
+              batch_size: int) -> list[ManifestRecord]:
+    records = manifest.records
     by_id = {record.record_id: record for record in records}
     legacy = scan_legacy(client, batch_size)
     unmanaged = legacy.difference(by_id)
@@ -209,37 +233,71 @@ def preflight(client: RespClient, records: list[ManifestRecord], batch_size: int
         if record.record_id in legacy:
             pending.append(record)
             continue
-        # An absent legacy UUID is valid only if the exact scoped destination
-        # already exists.  The authenticated payload is discarded immediately.
-        reply = client.command("AIMEM", "GET-SCOPED", record.record_id, *record.scope)
-        if reply is None:
-            raise MigrationError(f"manifest record {ordinal} is neither legacy nor present at its destination")
+        # The destination is in the target principal's tenant, so an
+        # operator-side GET-SCOPED cannot address it. MIGRATE-LEGACY-TO is an
+        # exact replay check when the legacy source is absent: it verifies the
+        # target owner and full scope without returning record content or
+        # mutating an already migrated record.
+        try:
+            reply = client.command(
+                "AIMEM", "MIGRATE-LEGACY-TO", record.record_id,
+                str(manifest.target_user_id), *record.scope)
+        except RespError as exc:
+            raise MigrationError(
+                f"manifest record {ordinal} is neither legacy nor present at its exact destination") from exc
+        if reply != record.record_id:
+            raise MigrationError(
+                f"manifest record {ordinal} failed exact destination validation")
     return pending
 
 
-def load_checkpoint(path: Path, manifest_digest: str, total: int) -> int:
+def load_checkpoint(path: Path, manifest: MigrationManifest) -> int:
     if not path.exists():
         return 0
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or
+                    metadata.st_mode & 0o077):
+                raise MigrationError(
+                    "checkpoint must be an owner-only regular file owned by this user")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = -1
+                state = json.load(stream)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MigrationError("checkpoint is unreadable") from exc
-    if not isinstance(state, dict) or state.get("version") != 1 or state.get("manifest_sha256") != manifest_digest:
+    if (not isinstance(state, dict) or state.get("version") != 2 or
+            state.get("manifest_sha256") != manifest.digest or
+            state.get("target_user_id") != manifest.target_user_id):
         raise MigrationError("checkpoint does not match this manifest")
     completed = state.get("completed", 0)
+    total = len(manifest.records)
     if state.get("total") != total or not isinstance(completed, int) or not 0 <= completed <= total:
         raise MigrationError("checkpoint completed count is invalid")
     return completed
 
 
-def save_checkpoint(path: Path, manifest_digest: str, completed: int, total: int) -> None:
+def save_checkpoint(path: Path, manifest: MigrationManifest,
+                    completed: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    state = {"version": 1, "manifest_sha256": manifest_digest,
+    total = len(manifest.records)
+    state = {"version": 2, "manifest_sha256": manifest.digest,
+             "target_user_id": manifest.target_user_id,
              "completed": completed, "total": total}
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
             json.dump(state, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
@@ -251,6 +309,8 @@ def save_checkpoint(path: Path, manifest_digest: str, completed: int, total: int
         finally:
             os.close(directory)
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -261,20 +321,24 @@ def emit(event: str, **counts: int) -> None:
     print(json.dumps({"event": event, **counts}, sort_keys=True, separators=(",", ":")), flush=True)
 
 
-def migrate(client: RespClient, pending: list[ManifestRecord], batch_size: int,
-            checkpoint: Path, digest: str, initial_completed: int,
+def migrate(client: RespClient, manifest: MigrationManifest,
+            pending: list[ManifestRecord], batch_size: int,
+            checkpoint: Path, initial_completed: int,
             max_records: int | None) -> int:
     completed = initial_completed
     limit = len(pending) if max_records is None else min(len(pending), max_records)
     for start in range(0, limit, batch_size):
         batch = pending[start:min(start + batch_size, limit)]
-        for record in batch:
-            reply = client.command("AIMEM", "MIGRATE-LEGACY", record.record_id, *record.scope)
+        for offset, record in enumerate(batch):
+            reply = client.command(
+                "AIMEM", "MIGRATE-LEGACY-TO", record.record_id,
+                str(manifest.target_user_id), *record.scope)
             if reply != record.record_id:
-                raise MigrationError(f"migration failed at pending record {start + 1}")
+                raise MigrationError(
+                    f"migration failed at pending record {start + offset + 1}")
             completed += 1
-        save_checkpoint(checkpoint, digest, completed, initial_completed + len(pending))
-        emit("batch", completed=completed, remaining=initial_completed + len(pending) - completed)
+        save_checkpoint(checkpoint, manifest, completed)
+        emit("batch", completed=completed, remaining=len(manifest.records) - completed)
     return completed
 
 
@@ -323,21 +387,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
-        records, digest = load_manifest(args.manifest)
-        load_checkpoint(args.checkpoint, digest, len(records))
+        manifest = load_manifest(args.manifest)
+        load_checkpoint(args.checkpoint, manifest)
         password = password_from_args(args)
         client = RespClient(args.host, args.port, args.timeout)
         try:
             authenticate(client, args.username, password)
             password = ""
-            pending = preflight(client, records, args.batch_size)
-            already = len(records) - len(pending)
-            emit("preflight", total=len(records), pending=len(pending), already_migrated=already)
+            pending = preflight(client, manifest, args.batch_size)
+            already = len(manifest.records) - len(pending)
+            emit("preflight", total=len(manifest.records), pending=len(pending),
+                 already_migrated=already)
             if args.dry_run:
                 emit("complete", migrated=0, remaining=len(pending))
                 return 0
-            completed = migrate(client, pending, args.batch_size, args.checkpoint,
-                                digest, already, args.max_records)
+            completed = migrate(client, manifest, pending, args.batch_size,
+                                args.checkpoint, already, args.max_records)
             remaining = already + len(pending) - completed
             emit("complete", migrated=completed - already, remaining=remaining)
             return 0 if remaining == 0 else 3
