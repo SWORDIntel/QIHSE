@@ -85,6 +85,7 @@ lib/
 # Cluster daemon / server binaries (built by the Makefile)
 /qihse-cluster-daemon
 /qihse-redis-server
+/qihse-backup
 /qihse-codegraph
 /qihse-machine-token
 
