@@ -808,6 +808,10 @@ negative test) and `tests/test_ai_memory_embed.c`
 `tests/gold/pack.v1.gold`. W10 coverage is grouped by `make test-w10-aimem`;
 `tests/test_aimem_knowledge.c` covers QH-04 lineage, competing writers,
 temporal reads, project grants and low-clearance/high-data denial.
+`tests/test_aimem_qh05_08.c` covers stable authorized query snapshots,
+revocation between pages, restart-safe reversible maintenance, restricted-row
+export exclusion, manifest tamper rejection, logical round-trip import and
+redacted index health.
 
 Legacy records live in the system-domain `aimem:` KV namespace. Scoped records
 and their idempotency keys use tenant-prefixed namespaces, and are indexed for
@@ -834,6 +838,10 @@ score, or even count a record the principal cannot see.
 | `size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, size_t, qihse_ai_memory_mode_t, uint32_t, const qihse_ai_memory_scope_t*, qihse_ai_memory_hit_t*, size_t)` | BM25, semantic or hybrid recall over an authenticated scope-filtered corpus. Classification, SCI, actor and scope checks precede candidate ranking. | `0` |
 | `bool qihse_ai_memory_get_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, const qihse_ai_memory_scope_t*, qihse_ai_memory_hit_t*)` | Direct-ID read constrained to the requested scope and owner, explicit project reader grant, or Operator context; record labels still apply. | `false` |
 | `bool qihse_ai_memory_forget_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, const qihse_ai_memory_scope_t*)` | Delete only by the record owner or Operator; a read grant does not grant delete authority. | `false` |
+| `qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(...)` / `qihse_ai_memory_query_next(...)` | Materialize and page a bounded, stable QH-05 curated-knowledge result. Type, status, current-only, ingestion-time and text filters run after KV authorization and before materialization. Every page rechecks actor, grant and labels. | `NULL` / `0` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_plan/apply/rollback(...)` | Create a dry-run or durable one-lineage `QHM1` plan, append its replacement as an immutable QHK successor, and reversibly append the original content. | `FAILED`; stale/conflicting lineage is not overwritten |
+| `bool qihse_ai_memory_export_scope(...)` / `qihse_ai_memory_import_scope(...)` | Export an authenticated canonical `QAX1` projection with SHA-256 trailer; validate or idempotently import it without exposing raw KV files. Labels, scope, owner and every QHK ledger are checked. | `false`, `FAILED`, or `CONFLICT` |
+| `bool qihse_ai_memory_index_rebuild(...)` / `qihse_ai_memory_health(...)` | Validate an authorized QHK projection and persist `QHI1` provider/dimension/generation/high-water state. Ordinary health is redacted; Operator health includes content-free counters. | `false` |
 | `size_t qihse_ai_memory_count_scoped(qihse_resp_server_t*, qihse_user_t*, uint32_t, const qihse_ai_memory_scope_t*)` | Count only classified/SCI-visible records in the requested scope and actor boundary. | `0` |
 | `qihse_ai_memory_write_result_t qihse_ai_memory_event_append(...)` | Append a bounded registered `QHEV1` lifecycle event with immutable producer/event identity, source/receive times and summary digest. The RESP wrapper provides the durable ACK fence. | `WRITE_FAILED` or `WRITE_CONFLICT` |
 | `bool qihse_ai_memory_event_get(...)` | Read and verify the event envelope through scoped, classification/SCI-authorized retrieval. | `false` |

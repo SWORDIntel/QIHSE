@@ -287,6 +287,104 @@ bool qihse_ai_memory_knowledge_as_of(qihse_resp_server_t* server,
     const qihse_ai_memory_scope_t* scope, uint64_t ingestion_time_ms,
     qihse_ai_memory_knowledge_version_t* out);
 
+/* QH-05: a bounded, materialized query snapshot.  Materialization is what
+ * gives paging a stable generation even while the authoritative KV changes.
+ * Every page call repeats the principal and project-grant checks. */
+#define QIHSE_AIMEM_QUERY_MAX_ROWS 4096u
+typedef struct qihse_ai_memory_query_snapshot qihse_ai_memory_query_snapshot_t;
+typedef struct {
+    qihse_ai_memory_scope_t scope;
+    uint32_t type;       /* 0 = every curated knowledge type */
+    uint32_t status;     /* 0 = every status (subject to current_only) */
+    bool current_only;   /* default public behavior: no superseded version */
+    uint64_t ingest_from_ms;
+    uint64_t ingest_to_ms; /* inclusive; 0 = unbounded */
+    const char* text;      /* optional case-insensitive substring */
+    size_t max_rows;       /* 1..QIHSE_AIMEM_QUERY_MAX_ROWS */
+} qihse_ai_memory_query_v1_t;
+typedef struct {
+    qihse_ai_memory_knowledge_version_t version;
+    double lexical_score;
+    bool current;
+    uint32_t explain_flags;
+} qihse_ai_memory_query_hit_t;
+#define QIHSE_AIMEM_QUERY_EXPLAIN_TEXT_MATCH 0x01u
+#define QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT    0x02u
+qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_query_v1_t* query);
+size_t qihse_ai_memory_query_next(qihse_ai_memory_query_snapshot_t* snapshot,
+    qihse_user_t* user, qihse_ai_memory_query_hit_t* out, size_t out_cap);
+void qihse_ai_memory_query_hits_free(qihse_ai_memory_query_hit_t* hits,
+    size_t count);
+void qihse_ai_memory_query_end(qihse_ai_memory_query_snapshot_t* snapshot);
+
+/* QH-06: a durable, one-lineage maintenance plan.  PLAN is dry-run capable;
+ * APPLY and ROLLBACK append ordinary immutable QHK successors. */
+typedef enum {
+    QIHSE_AIMEM_MAINT_PLANNED = 1u,
+    QIHSE_AIMEM_MAINT_APPLIED,
+    QIHSE_AIMEM_MAINT_ROLLED_BACK
+} qihse_ai_memory_maintenance_state_t;
+typedef struct {
+    char plan_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char knowledge_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char source_version_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char output_version_id[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_ai_memory_scope_t scope;
+    uint32_t state;
+    char* original_content;
+    char* replacement_content;
+} qihse_ai_memory_maintenance_plan_t;
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_plan(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* knowledge_id,
+    const qihse_ai_memory_scope_t* scope, const char* replacement_content,
+    bool dry_run, qihse_ai_memory_maintenance_plan_t* out);
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_apply(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* plan_id,
+    qihse_ai_memory_maintenance_plan_t* out);
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_rollback(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* plan_id,
+    qihse_ai_memory_maintenance_plan_t* out);
+void qihse_ai_memory_maintenance_free(qihse_ai_memory_maintenance_plan_t* plan);
+
+/* QH-07 canonical authenticated projection.  The blob is self-hashed and
+ * contains logical QHK ledgers rather than raw filesystem/SSTable data. */
+typedef struct { uint8_t* data; size_t len; } qihse_ai_memory_export_t;
+typedef enum {
+    QIHSE_AIMEM_IMPORT_FAILED = 0,
+    QIHSE_AIMEM_IMPORT_VALID = 1,
+    QIHSE_AIMEM_IMPORT_APPLIED = 2,
+    QIHSE_AIMEM_IMPORT_CONFLICT = 3
+} qihse_ai_memory_import_result_t;
+bool qihse_ai_memory_export_scope(qihse_resp_server_t* server,
+    qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+    qihse_ai_memory_export_t* out);
+qihse_ai_memory_import_result_t qihse_ai_memory_import_scope(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const uint8_t* data, size_t len,
+    bool dry_run, size_t* out_imported);
+void qihse_ai_memory_export_free(qihse_ai_memory_export_t* value);
+
+/* QH-08 redacted operational state.  Non-Operators receive provider/readiness
+ * only; generation, high-water and counters are zeroed. */
+typedef struct {
+    char provider[65];
+    size_t dimension;
+    bool ready;
+    uint64_t generation;
+    uint64_t source_highwater;
+    uint64_t query_snapshots;
+    uint64_t maintenance_versions;
+    uint64_t exports;
+    uint64_t imports;
+    uint64_t rejected;
+} qihse_ai_memory_health_t;
+bool qihse_ai_memory_index_rebuild(qihse_resp_server_t* server,
+    qihse_user_t* user, const qihse_ai_memory_scope_t* scope);
+bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, qihse_ai_memory_health_t* out);
+
 qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
     qihse_resp_server_t* server, qihse_user_t* user, const char* text,
     uint32_t kind, const char* idempotency_key,
