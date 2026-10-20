@@ -1,0 +1,206 @@
+/* QH-00: synchronous durable AIMEM ACK / SIGKILL recovery regression.
+ * The parent never opens the store. Each child has an independent process
+ * lifecycle; SIGKILL occurs immediately AFTER the protocol returns an ACK,
+ * without destroying the server or flushing during normal exit. */
+#define _GNU_SOURCE
+#include "qihse_ai_memory.h"
+#include "qihse_auth.h"
+#include "qihse_kv_store.h"
+#include "qihse_resp_wire.h"
+
+#include <assert.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define TEST_IDEM "qh00-crash-replay-01"
+#define TEST_TEXT "QH00-DURABLE-SECRET-FIXTURE"
+
+static qihse_resp_server_t* server;
+static qihse_kv_store_t* store;
+static qihse_user_t* operator_user;
+
+static void open_instance(void) {
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("OperatorPass123!"));
+    operator_user = qihse_auth_get_user(0u);
+    assert(operator_user);
+    store = qihse_kv_store_create();
+    assert(store);
+    qihse_resp_server_config_t cfg;
+    qihse_resp_server_config_init(&cfg);
+    cfg.store = store;
+    cfg.auth_required = true;
+    cfg.port = 0;
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+}
+
+static char* command(qihse_user_t* user, size_t argc,
+                     const char* const argv[]) {
+    assert(argc <= 5u);
+    qihse_resp_arg_t args[5];
+    for (size_t i = 0; i < argc; i++) {
+        args[i].data = (const uint8_t*)argv[i];
+        args[i].len = strlen(argv[i]);
+    }
+    uint8_t* reply = NULL;
+    size_t length = 0;
+    assert(qihse_resp_server_execute(server, user, argc, args, &reply, &length));
+    char* text = calloc(length + 1u, 1u);
+    assert(text);
+    memcpy(text, reply, length);
+    free(reply);
+    return text;
+}
+
+static void assert_response(qihse_user_t* user, size_t argc,
+                            const char* const argv[], const char* expected) {
+    char* reply = command(user, argc, argv);
+    assert(strstr(reply, expected) != NULL);
+    free(reply);
+}
+
+static void id_from_store(const char* reply,
+                          char out[QIHSE_AIMEM_ID_LEN + 1u]) {
+    assert(strncmp(reply, "$36\r\n", 5u) == 0);
+    const char* id = reply + 5u;
+    assert(strlen(id) >= QIHSE_AIMEM_ID_LEN + 2u);
+    assert(id[QIHSE_AIMEM_ID_LEN] == '\r');
+    assert(id[QIHSE_AIMEM_ID_LEN + 1u] == '\n');
+    memcpy(out, id, QIHSE_AIMEM_ID_LEN);
+    out[QIHSE_AIMEM_ID_LEN] = '\0';
+}
+
+static void write_exact(int fd, const void* data, size_t count) {
+    size_t written = 0;
+    while (written < count) {
+        ssize_t n = write(fd, (const char*)data + written, count - written);
+        assert(n > 0);
+        written += (size_t)n;
+    }
+}
+static void read_exact(int fd, void* data, size_t count) {
+    size_t received = 0;
+    while (received < count) {
+        ssize_t n = read(fd, (char*)data + received, count - received);
+        assert(n > 0);
+        received += (size_t)n;
+    }
+}
+
+static void store_then_kill(int pipe_fd) {
+    open_instance();
+    const char* store_args[] = { "AIMEM", "STORE-DURABLE", "2", TEST_TEXT, TEST_IDEM };
+    char* reply = command(operator_user, 5u, store_args);
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    id_from_store(reply, id);
+    free(reply);
+    write_exact(pipe_fd, id, sizeof id);
+    kill(getpid(), SIGKILL); /* no normal destructor/flush */
+    _exit(100);
+}
+
+static void verify_then_forget_then_kill(const char* id, int pipe_fd) {
+    open_instance();
+    const char* get_args[] = { "AIMEM", "GET", id };
+    assert_response(operator_user, 3u, get_args, TEST_TEXT);
+
+    /* Direct-ID and delete denial controls on the new durable adapter. */
+    qihse_user_t* guest = qihse_auth_create_user(
+        operator_user, 9042u, QIHSE_ROLE_GUEST, 0u, 0u,
+        "GuestPass123!", false);
+    assert(guest);
+    assert_response(guest, 3u, get_args, "$-1\r\n");
+    const char* count_args[] = { "AIMEM", "COUNT" };
+    assert_response(guest, 2u, count_args, ":0\r\n");
+    const char* remove_args[] = { "AIMEM", "FORGET-DURABLE", id };
+    assert_response(guest, 3u, remove_args, ":0\r\n");
+    assert_response(operator_user, 3u, get_args, TEST_TEXT);
+
+    const char* replay_args[] = { "AIMEM", "STORE-DURABLE", "2", TEST_TEXT, TEST_IDEM };
+    char* retry = command(operator_user, 5u, replay_args);
+    char replay_id[QIHSE_AIMEM_ID_LEN + 1u];
+    id_from_store(retry, replay_id);
+    free(retry);
+    assert(strcmp(id, replay_id) == 0);
+
+    const char* conflict_args[] = { "AIMEM", "STORE-DURABLE", "2", "changed payload", TEST_IDEM };
+    assert_response(operator_user, 5u, conflict_args, "-ERR CONFLICT");
+    const char* conflict_kind[] = { "AIMEM", "STORE-DURABLE", "1", TEST_TEXT, TEST_IDEM };
+    assert_response(operator_user, 5u, conflict_kind, "-ERR CONFLICT");
+    assert_response(operator_user, 3u, remove_args, ":1\r\n");
+    write_exact(pipe_fd, "D", 1u);
+    kill(getpid(), SIGKILL);
+    _exit(100);
+}
+
+static void verify_tombstone(const char* id) {
+    open_instance();
+    const char* get_args[] = { "AIMEM", "GET", id };
+    assert_response(operator_user, 3u, get_args, "$-1\r\n");
+    const char* stale_replay[] = { "AIMEM", "STORE-DURABLE", "2", TEST_TEXT, TEST_IDEM };
+    /* A deleted ID's idempotency key must not resurrect the original. */
+    assert_response(operator_user, 5u, stale_replay, "-ERR CONFLICT");
+    const char* count_args[] = { "AIMEM", "COUNT" };
+    assert_response(operator_user, 2u, count_args, ":0\r\n");
+    qihse_resp_server_destroy(server);
+    qihse_kv_store_destroy(store);
+}
+
+static void expect_killed(pid_t pid) {
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+}
+
+int main(void) {
+    char data_root[] = "build/aimem_qh00_XXXXXX";
+    assert(mkdtemp(data_root));
+    assert(setenv("QIHSE_DATA_DIR", data_root, 1) == 0);
+
+    int fd[2];
+    assert(pipe(fd) == 0);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fd[0]);
+        store_then_kill(fd[1]);
+    }
+    close(fd[1]);
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    read_exact(fd[0], id, sizeof id);
+    close(fd[0]);
+    expect_killed(pid);
+
+    assert(pipe(fd) == 0);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fd[0]);
+        verify_then_forget_then_kill(id, fd[1]);
+    }
+    close(fd[1]);
+    char marker;
+    read_exact(fd[0], &marker, 1u);
+    close(fd[0]);
+    assert(marker == 'D');
+    expect_killed(pid);
+
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        verify_tombstone(id);
+        _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    puts("PASS QH-00 durable store/delete survive immediate SIGKILL, replay conflicts denied");
+    return 0;
+}
