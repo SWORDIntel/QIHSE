@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
@@ -44,6 +45,45 @@ typedef int socklen_t;
 #define QIHSE_BUS_VEIL_PAD_MAX 64u
 #define QIHSE_BUS_VEIL_HEADER_LEN (QIHSE_BUS_VEIL_NONCE_LEN + 1u)
 #define QIHSE_BUS_VEIL_OVERHEAD (QIHSE_BUS_VEIL_HEADER_LEN + QIHSE_BUS_VEIL_PAD_MAX)
+
+static bool qihse_cluster_derive_transport_key(
+        const char* credential, const char* label,
+        char out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u]) {
+    if (!credential || !*credential || !label || !*label || !out_hex) return false;
+
+    unsigned char derived[EVP_MAX_MD_SIZE];
+    unsigned int derived_len = 0u;
+    static const char hex[] = "0123456789abcdef";
+    bool ok = HMAC(EVP_sha384(), credential, (int)strlen(credential),
+                   (const unsigned char*)label, strlen(label),
+                   derived, &derived_len) != NULL &&
+              derived_len == QIHSE_CLUSTER_DERIVED_KEY_BYTES;
+    if (ok) {
+        for (size_t i = 0; i < derived_len; i++) {
+            out_hex[i * 2u] = hex[derived[i] >> 4];
+            out_hex[i * 2u + 1u] = hex[derived[i] & 0x0fu];
+        }
+        out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN] = '\0';
+    } else {
+        out_hex[0] = '\0';
+    }
+    OPENSSL_cleanse(derived, sizeof(derived));
+    return ok;
+}
+
+bool qihse_cluster_derive_bus_veil_key(
+        const char* cluster_credential,
+        char out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u]) {
+    return qihse_cluster_derive_transport_key(
+        cluster_credential, "QIHSE/cluster-bus/veil/v1", out_hex);
+}
+
+bool qihse_cluster_derive_overlay_hmac_key(
+        const char* cluster_credential,
+        char out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u]) {
+    return qihse_cluster_derive_transport_key(
+        cluster_credential, "QIHSE/overlay/bootstrap-hmac/v1", out_hex);
+}
 
 struct qihse_cluster_bus {
     qihse_cluster_topology_t* topology;
@@ -1340,7 +1380,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         /* Own a private copy: the config may be stack-scoped and the key is
          * sensitive enough to outlive it inside the bus only. */
         bus->veil_key_len = strlen(config->veil_key);
-        bus->veil_key = (char*)malloc(bus->veil_key_len + 1u);
+        bus->veil_key = (char*)OPENSSL_malloc(bus->veil_key_len + 1u);
         if (!bus->veil_key) {
             free(bus);
             return NULL;
@@ -1348,7 +1388,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         memcpy(bus->veil_key, config->veil_key, bus->veil_key_len + 1u);
     }
     if (pthread_mutex_init(&bus->lock, NULL) != 0) {
-        free(bus->veil_key);
+        OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
         free(bus);
         return NULL;
     }
@@ -1437,7 +1477,7 @@ void qihse_cluster_bus_destroy(qihse_cluster_bus_t* bus) {
     free(bus->cap_free_ram_mb);
     free(bus->cap_load_pct);
     free(bus->cap_present);
-    free(bus->veil_key);
+    OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
     free(bus);
 }
 
