@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 are partial. QH-04 now has a tenant-scoped single-record lineage ledger, authorization-aware KV CAS, durable RESP create/revise, exact/latest/as-of reads, and native/wire security regressions. It still needs source-event validation, content hashes and review metadata, typed relations, audit and crash/retry coverage. QH-00–QH-03 retain the remaining gates described below; QH-05–QH-10 remain planned. Integrated into the master roadmap as W10.
+> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-04 is complete with tenant-scoped atomic lineage, validated evidence, content integrity, reviewer/generator provenance, typed relations, content-free audit, retry/restart recovery, and approval/retraction policy. QH-09 is closed through scoped `RULE` reuse. QH-00–QH-03 retain the remaining gates described below; QH-05–QH-08 and conditional QH-10 remain planned. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -155,17 +155,21 @@ ai-memory keeps [page/version history](https://github.com/akitaonrails/ai-memory
 
 **Version update:** CAS on existing version; append successor and close predecessor validity within one atomic transaction; keep prior version recoverable under a version-aware authorized read. An authorized forget/privacy purge needs a separate explicit semantics definition; a superseded version is not "deleted".
 
-**First implementation:** native and RESP `CREATE`, `REVISE`, exact `GET`,
-`LATEST`, and ingestion-time `AS-OF` use a bounded `QHK1` ledger stored as one
+**Implementation:** native and RESP `CREATE`, `REVISE`, exact `GET`, `LATEST`,
+and ingestion-time `AS-OF` use a bounded `QHK2` ledger stored as one
 tenant-scoped KV value. A KV compare-and-set atomically closes the predecessor
-and appends its successor. The durable wire mutations fsync before reply.
+and appends its successor. The extended native mutations add principal-bound
+retry identity, validated source events, content hashes, confidence,
+generator/reviewer identities, and strict typed relations. The durable wire
+mutations fsync before reply.
 Readers pass explicit principal and scope contexts; project grants convey read
 access only, and record classification/SCI still gates the KV materialization.
 The focused native regression proves one winner/one conflict, exact historical
 recovery, half-open as-of intervals, grant/revoke and label isolation; the RESP
-suite includes the mandatory low-clearance/high-data negative. This is
-**partial** until the rest of the minimal schema, typed relations, audit,
-retry identity and crash-boundary recovery are implemented.
+suite includes the mandatory low-clearance/high-data negative. Restart replay,
+changed-payload conflict, content-free audit, approval/retraction, and the
+post-approval owner attack are covered by the focused native regression. The
+legacy `QHK1` decoder remains for migration reads. **QH-04 is complete.**
 
 **Acceptance:** Two writers updating the same version → one accepted, one conflict. `as_known_at` yields a reproducible previous state; latest state excludes superseded instruction from default retrieval; audit names actor and cited evidence without exposing restricted content.
 
@@ -219,7 +223,11 @@ Expose a deterministic index-repair/rebuild workflow from authoritative QIHSE re
 
 ## QH-09 / QH-10 — Defer until justified
 
-**Profile and curation records (QH-09):** The engine may eventually maintain typed human-approved preferences, promotions and revocations per principal/project. First prefer QH-04's versioned knowledge types and avoid a special profile engine unless measurable limitations appear. The critical feature is approval/provenance and visibility, not an extra database.
+**Profile and curation records (QH-09, closed by QH-04 reuse):** Scoped `RULE`
+versions provide typed human-approved preferences, promotion history, and
+terminal revocation per project. Approval binds the authenticated Operator as
+reviewer; an agent-owned proposal cannot self-promote or replace an approved
+head. No measurable limitation requires a separate profile database.
 
 **Cross-project mailbox (QH-10):** An explicit sender/recipient-grant-aware message queue with durable `pending → claimed|cancelled|expired` state and one consumer. Reuse QH-03's atomic transition machinery and QH-01 scope. Default-deny arbitrary cross-project communication; a project name match is not permission to message or read it.
 
