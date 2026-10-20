@@ -189,6 +189,12 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
     const qihse_ai_memory_scope_t* scope, const char* producer_namespace,
     const char* event_id, const char* event_kind, uint64_t source_time_ms,
     const char* summary, char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+qihse_ai_memory_write_result_t qihse_ai_memory_event_append_evidence(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const char* producer_namespace,
+    const char* event_id, const char* event_kind, uint64_t source_time_ms,
+    const char* summary, const char* source_evidence_id,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
 bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
     const char* id, const qihse_ai_memory_scope_t* scope,
     qihse_ai_memory_hit_t* out);

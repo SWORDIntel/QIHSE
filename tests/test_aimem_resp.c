@@ -403,15 +403,22 @@ int main(void) {
     free(reply);
     assert(strcmp(tenant7_id, tenant8_id) != 0);
 
+    const char* evidence_store[] = { "AIMEM", "STORE-SCOPED", "1", "evidence source",
+        "project-events", "checkout-a", "stream-a", "session-1" };
+    reply = NULL;
+    reply_len = run(tenant7, 8u, evidence_store, &reply);
+    char* evidence_id = extract_bulk_id(reply, reply_len);
+    free(reply);
     const char* event_append[] = { "AIMEM", "EVENT", "APPEND", "project-events",
         "checkout-a", "stream-a", "session-1", "hax", "evt-0001",
-        "task_completed", "1792500000000", "completed typed event" };
+        "task_completed", "1792500000000", "completed typed event", "placeholder" };
+    event_append[12] = evidence_id;
     reply = NULL;
-    reply_len = run(tenant7, 12u, event_append, &reply);
+    reply_len = run(tenant7, 13u, event_append, &reply);
     char* event_doc_id = extract_bulk_id(reply, reply_len);
     free(reply);
     reply = NULL;
-    reply_len = run(tenant7, 12u, event_append, &reply);
+    reply_len = run(tenant7, 13u, event_append, &reply);
     char* event_retry_id = extract_bulk_id(reply, reply_len);
     assert(strcmp(event_doc_id, event_retry_id) == 0);
     free(event_retry_id);
@@ -419,11 +426,11 @@ int main(void) {
     const char* event_read[] = { "AIMEM", "EVENT", "READ", "placeholder",
         "project-events", "checkout-a", "stream-a", "session-1" };
     event_read[3] = event_doc_id;
-    expect_contains(tenant7, 8u, event_read, "QHEV1|hax|evt-0001|task_completed|");
+    expect_contains(tenant7, 8u, event_read, "QHEV2|hax|evt-0001|task_completed|");
     expect_contains(tenant8, 8u, event_read, "$-1\r\n");
     const char* project_grant[] = { "AIMEM", "PROJECT", "GRANT", "project-events", "9044" };
     expect_contains(tenant7, 5u, project_grant, "+OK\r\n");
-    expect_contains(tenant7_reader, 8u, event_read, "QHEV1|hax|evt-0001|task_completed|");
+    expect_contains(tenant7_reader, 8u, event_read, "QHEV2|hax|evt-0001|task_completed|");
     const char* grantee_forget[] = { "AIMEM", "FORGET-SCOPED", "placeholder",
         "project-events", "checkout-a", "stream-a", "session-1" };
     grantee_forget[2] = event_doc_id;
@@ -433,6 +440,7 @@ int main(void) {
     const char* project_revoke[] = { "AIMEM", "PROJECT", "REVOKE", "project-events", "9044" };
     expect_contains(tenant7, 5u, project_revoke, "+OK\r\n");
     expect_contains(tenant7_reader, 8u, event_read, "$-1\r\n");
+    free(evidence_id);
 
     qihse_user_t* tenant7_competitor = qihse_auth_create_tenant_user(op, 7u, 9045u,
         QIHSE_ROLE_GUEST, 0u, 0u, "Tenant7Competitor123!", false);
@@ -475,6 +483,19 @@ int main(void) {
     handoff_cancel[3] = handoff_id;
     expect_contains(tenant7, 5u, handoff_cancel, "ERR CONFLICT");
     free(handoff_id);
+
+    const char* expiry_offer[] = { "AIMEM", "HANDOFF", "OFFER", "9044", "1",
+        "project-events", "checkout-a", "stream-a", "session-1", "expires soon" };
+    reply = NULL;
+    reply_len = run(tenant7, 10u, expiry_offer, &reply);
+    char* expiry_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    usleep(5000u);
+    const char* expiry_get[] = { "AIMEM", "HANDOFF", "GET", "placeholder" };
+    expiry_get[3] = expiry_id;
+    expect_contains(tenant7, 4u, expiry_get, "EXPIRED");
+    expect_contains(tenant7, 4u, expiry_get, "$1\r\n2\r\n");
+    free(expiry_id);
 
     /* QH-04 wire adapter: durable create/revise, exact/history/latest, and
      * the mandatory low-clearance/high-data direct-ID denial. */
