@@ -48,6 +48,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <openssl/crypto.h>
+#include <openssl/rand.h>
 
 #define MAX_PEERS 64u
 
@@ -100,6 +103,83 @@ static void fill_node(const char* host, uint16_t port, uint16_t bus_port,
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
+typedef struct {
+    char* value;
+    size_t length;
+    bool locked;
+} operator_credential_t;
+
+static operator_credential_t g_operator_credential;
+
+typedef struct {
+    char bus_veil[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u];
+    char overlay_hmac[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u];
+} cluster_transport_keys_t;
+
+static cluster_transport_keys_t g_transport_keys;
+
+static void cluster_transport_keys_release(void) {
+    OPENSSL_cleanse(&g_transport_keys, sizeof(g_transport_keys));
+}
+
+static void operator_credential_release(void) {
+    if (!g_operator_credential.value) return;
+    OPENSSL_cleanse(g_operator_credential.value,
+                    g_operator_credential.length + 1u);
+    if (g_operator_credential.locked)
+        (void)munlock(g_operator_credential.value, g_operator_credential.length + 1u);
+    OPENSSL_free(g_operator_credential.value);
+    memset(&g_operator_credential, 0, sizeof(g_operator_credential));
+}
+
+static bool operator_credential_capture(const char* source) {
+    if (!source || !*source || g_operator_credential.value) return false;
+    size_t length = strlen(source);
+    if (length < 12u || length > 4096u) return false;
+    char* owned = (char*)OPENSSL_malloc(length + 1u);
+    if (!owned) return false;
+    memcpy(owned, source, length + 1u);
+    g_operator_credential.value = owned;
+    g_operator_credential.length = length;
+    g_operator_credential.locked = mlock(owned, length + 1u) == 0;
+    return true;
+}
+
+/* argv and environ are mutable process-owned storage on the supported Linux
+ * hosts.  Scrub a source after copying it into the locked credential buffer so
+ * neither /proc/<pid>/cmdline nor /proc/<pid>/environ retains the secret. */
+static void operator_credential_scrub_source(char* source) {
+    if (source && *source) OPENSSL_cleanse(source, strlen(source));
+}
+
+static void operator_credential_clear_environment(void) {
+    char* exposed = getenv("QIHSE_OPERATOR_PASSWORD");
+    operator_credential_scrub_source(exposed);
+    (void)unsetenv("QIHSE_OPERATOR_PASSWORD");
+}
+
+static qihse_user_t* replication_service_principal_create(uint32_t user_id) {
+    unsigned char random_secret[32];
+    char one_time_password[sizeof(random_secret) * 2u + 1u];
+    static const char hex[] = "0123456789abcdef";
+    qihse_user_t* principal = NULL;
+
+    if (RAND_bytes(random_secret, (int)sizeof(random_secret)) != 1) goto done;
+    for (size_t i = 0; i < sizeof(random_secret); i++) {
+        one_time_password[i * 2u] = hex[random_secret[i] >> 4];
+        one_time_password[i * 2u + 1u] = hex[random_secret[i] & 0x0fu];
+    }
+    one_time_password[sizeof(one_time_password) - 1u] = '\0';
+    principal = qihse_auth_create_user(
+        qihse_auth_get_user(0u), user_id, QIHSE_ROLE_ANALYST,
+        UINT16_MAX, UINT16_MAX, one_time_password, false);
+
+done:
+    OPENSSL_cleanse(one_time_password, sizeof(one_time_password));
+    OPENSSL_cleanse(random_secret, sizeof(random_secret));
+    return principal;
+}
+
 static bool parse_u16(const char* s, uint16_t* out) {
     if (!s || !*s) return false;
     char* end = NULL;
@@ -129,8 +209,8 @@ static void usage(const char* argv0) {
         "          (--node INDEX:HOST:PORT:BUS-PORT [--node …] | --join HOST:BUS-PORT [--join …])\n"
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
-        "          (the operator password also keys the veiled bus framing;\n"
-        "           every cluster node must use the same password)\n"
+        "          (the shared credential authenticates clients and derives\n"
+        "           independent bus and overlay transport keys)\n"
         "          [--node-key PATH] [--require-signed-ops]\n"
  "          (signed ops frames: SLOT/NODE/GROUP updates carry ML-DSA\n"
  "           signatures; require-signed-ops refuses unsigned ones)\n"
@@ -139,6 +219,7 @@ static void usage(const char* argv0) {
         "          [--brain-prune-timeout S] [--brain-rebalance-min-slots N]\n"
         "          [--brain-fed-dir DIR] [--brain-node-key PATH]\n"
         "          [--redundancy-peer HOST:PORT]\n"
+        "          [--replication-principal-id N] (default 65535)\n"
         "          [--max-clients N]\n"
         "          (each daemon owns an in-memory BM25 index over its local KV:\n"
         "           FTS.BUILD <pattern> indexes matching keys, FTS.SEARCH <query>\n"
@@ -479,12 +560,6 @@ static int mini_resp_connect_i2p(mini_resp_t* c, const char* destination, uint16
     return mini_resp_connect_mode(c, destination, port, qkp, true, socks_port);
 }
 
-static bool mini_resp_auth(mini_resp_t* c, const char* password) {
-    if (!password || !*password) return false;
-    const char* argv[2] = {"AUTH", password};
-    return mini_resp_command(c, 2u, argv);
-}
-
 static void mini_resp_close(mini_resp_t* c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
@@ -658,13 +733,7 @@ static bool mini_resp_command(mini_resp_t* c, size_t argc, const char* const* ar
 
 typedef struct {
     qihse_resp_server_t* server;
-    const peer_spec_t* peers;
-    size_t peer_count;
-    unsigned int self_index;
-    const char* password;      /* operator password (borrowed) */
-    const char* self_host;     /* bind address for loopback */
-    uint16_t self_port;
-    const char* source_host;   /* operator-only I2P destination or mesh address */
+    const char* source_host;   /* pinned I2P destination or mesh address */
     uint16_t source_port;
     uint16_t socks_port;       /* local loopback i2pd SOCKS5 */
     bool source_via_i2p;
@@ -859,7 +928,7 @@ static void* ae_main(void* argument) {
                     ae->qkp, false, 0u);
             bool peer_ok = connected >= 0 && qihse_qkp_client_session_is_replication_peer(
                 source.qkp, ae->qkp->replication_peer_node_id,
-                ae->qkp->replication_peer_dsa_pub_path) && mini_resp_auth(&source, ae->password);
+                ae->qkp->replication_peer_dsa_pub_path);
             if (!peer_ok) {
                 if (connected >= 0) mini_resp_close(&source);
                 for (size_t i = 0; i < glob_count; i++)
@@ -882,56 +951,6 @@ static void* ae_main(void* argument) {
             }
         }
 
-        /* Peer anti-entropy across cluster peers (LAN cluster / mesh) */
-        qihse_cluster_topology_t* topology =
-            (qihse_cluster_topology_t*)qihse_resp_server_topology(ae->server);
-        if (topology) {
-            qihse_cluster_node_t nodes[64];
-            size_t node_count = qihse_cluster_topology_nodes(topology, nodes, 64);
-            uint16_t local_idx = qihse_cluster_topology_local_node(topology);
-            for (size_t p = 0; p < node_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); p++) {
-                if (nodes[p].index == local_idx) continue;
-                if (!nodes[p].healthy) continue;
-                if (nodes[p].host[0] == '\0') continue;
-                if (ae->self_host && strcmp(nodes[p].host, ae->self_host) == 0 && nodes[p].port == ae->self_port) continue;
-                for (size_t g = 0; g < glob_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); g++) {
-                    char err[128] = {0};
-                    uint64_t pulled = 0;
-                    bool ok = qihse_resp_server_repl_pull(ae->server, globs[g],
-                                                          nodes[p].host,
-                                                          nodes[p].port,
-                                                          true, /* missing_only */
-                                                          &pulled, err, sizeof(err));
-                    char peer_spec[280];
-                    snprintf(peer_spec, sizeof(peer_spec), "%s:%u", nodes[p].host, (unsigned)nodes[p].port);
-                    qihse_resp_server_repl_note(ae->server, globs[g], peer_spec, pulled, 0, UINT64_MAX, UINT64_MAX, ok);
-                    if (ok && pulled > 0) {
-                        fprintf(stderr, "qihse-cluster-daemon: repl peer sync: pulled %llu missing key(s) from %s for '%s'\n",
-                                (unsigned long long)pulled, peer_spec, globs[g]);
-                    }
-                }
-            }
-        } else if (ae->peers && ae->peer_count > 0) {
-            for (size_t p = 0; p < ae->peer_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); p++) {
-                if (ae->peers[p].index == ae->self_index) continue;
-                for (size_t g = 0; g < glob_count && !__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE); g++) {
-                    char err[128] = {0};
-                    uint64_t pulled = 0;
-                    bool ok = qihse_resp_server_repl_pull(ae->server, globs[g],
-                                                          ae->peers[p].host,
-                                                          ae->peers[p].port,
-                                                          true, /* missing_only */
-                                                          &pulled, err, sizeof(err));
-                    char peer_spec[280];
-                    snprintf(peer_spec, sizeof(peer_spec), "%s:%u", ae->peers[p].host, (unsigned)ae->peers[p].port);
-                    qihse_resp_server_repl_note(ae->server, globs[g], peer_spec, pulled, 0, UINT64_MAX, UINT64_MAX, ok);
-                    if (ok && pulled > 0) {
-                        fprintf(stderr, "qihse-cluster-daemon: repl peer sync: pulled %llu missing key(s) from %s for '%s'\n",
-                                (unsigned long long)pulled, peer_spec, globs[g]);
-                    }
-                }
-            }
-        }
     }
     return NULL;
 }
@@ -1014,6 +1033,8 @@ int main(int argc, char** argv) {
     const char* bind = "127.0.0.1";
     uint16_t port = 7100, bus_port = 17100;
     const char* operator_password = NULL;
+    char* operator_password_arg = NULL;
+    uint32_t replication_principal_id = 65535u;
     const char* data_dir = NULL;
     bool enable_scatter = false;
     size_t max_clients = 4096u;
@@ -1083,7 +1104,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--bus-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &bus_port)) return usage(argv[0]), 2;
         } else if (strcmp(a, "--operator-password") == 0 && i + 1 < argc) {
-            operator_password = argv[++i];
+            operator_password_arg = argv[++i];
         } else if (strcmp(a, "--dir") == 0 && i + 1 < argc) {
             data_dir = argv[++i];
         } else if (strcmp(a, "--enable-scatter") == 0) {
@@ -1168,6 +1189,12 @@ int main(int argc, char** argv) {
             if (!*replication_source_host || strlen(replication_source_host) > 255u) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-source-port") == 0 && i + 1 < argc) {
             if (!parse_u16(argv[++i], &replication_source_port)) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replication-principal-id") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v == 0u || v > 65535u)
+                return usage(argv[0]), 2;
+            replication_principal_id = (uint32_t)v;
         } else if (strcmp(a, "--replication-transport") == 0 && i + 1 < argc) {
             replication_transport = argv[++i];
             if (strcmp(replication_transport, "i2p") != 0 &&
@@ -1338,6 +1365,14 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: --consensus-prefix-signer requires a consensus mesh\n");
         return 2;
     }
+    if (redundancy_peer) {
+        fprintf(stderr, "qihse-cluster-daemon: --redundancy-peer is unavailable until duplicate writes use pinned QKP replication\n");
+        return 2;
+    }
+    if (brain_act) {
+        fprintf(stderr, "qihse-cluster-daemon: --brain-act is unavailable until slot migration uses pinned QKP replication\n");
+        return 2;
+    }
 
     const bool replication_configured = replication_source_host != NULL ||
         replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
@@ -1398,17 +1433,30 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Prefer a protected service environment over a command-line secret.
-     * Keep --operator-password for interactive development, but production
-     * systemd units should load QIHSE_OPERATOR_PASSWORD from a root-only
-     * EnvironmentFile so it does not appear in process listings. */
-    if (!operator_password) {
-        const char* configured_password = getenv("QIHSE_OPERATOR_PASSWORD");
-        if (configured_password && *configured_password) {
-            operator_password = configured_password;
+    /* Capture the credential in mutable owned memory.  The legacy CLI option
+     * remains for development, but its argv bytes are erased immediately after
+     * capture. Production units should use a root-only EnvironmentFile. */
+    char* configured_password = getenv("QIHSE_OPERATOR_PASSWORD");
+    char* selected_password = operator_password_arg && *operator_password_arg
+        ? operator_password_arg : configured_password;
+    if (selected_password && *selected_password) {
+        if (!operator_credential_capture(selected_password)) {
+            operator_credential_scrub_source(operator_password_arg);
+            operator_credential_clear_environment();
+            fprintf(stderr, "qihse-cluster-daemon: operator password must be 12..4096 characters\n");
+            return 2;
         }
+        if (atexit(operator_credential_release) != 0) {
+            operator_credential_release();
+            operator_credential_scrub_source(operator_password_arg);
+            operator_credential_clear_environment();
+            fprintf(stderr, "qihse-cluster-daemon: could not register credential cleanup\n");
+            return 1;
+        }
+        operator_password = g_operator_credential.value;
+        operator_credential_scrub_source(operator_password_arg);
+        operator_credential_clear_environment();
     }
-    static char s_env_operator_password[256];
     if (!operator_password) {
         char env_path[256];
         snprintf(env_path, sizeof(env_path), "/etc/qihse/cluster-node%u.env", self_index);
@@ -1419,14 +1467,19 @@ int main(int argc, char** argv) {
                 if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
                     char* p = line + 24;
                     p[strcspn(p, "\r\n")] = '\0';
-                    if (strlen(p) >= 12 && strlen(p) < sizeof(s_env_operator_password)) {
-                        snprintf(s_env_operator_password, sizeof(s_env_operator_password), "%s", p);
-                        operator_password = s_env_operator_password;
-                        break;
-                    }
+                    if (operator_credential_capture(p))
+                        operator_password = g_operator_credential.value;
+                    OPENSSL_cleanse(line, sizeof(line));
+                    break;
                 }
+                OPENSSL_cleanse(line, sizeof(line));
             }
             fclose(ef);
+        }
+        if (operator_password && atexit(operator_credential_release) != 0) {
+            operator_credential_release();
+            fprintf(stderr, "qihse-cluster-daemon: could not register credential cleanup\n");
+            return 1;
         }
     }
     /* Never expose a daemon without a configured operator verifier. */
@@ -1480,6 +1533,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!qihse_auth_init()) {
+        operator_credential_clear_environment();
         fprintf(stderr, "qihse-cluster-daemon: auth init failed\n");
         return 1;
     }
@@ -1491,11 +1545,39 @@ int main(int argc, char** argv) {
              * tools/qihse_redis_server.c do it. */
             setenv("QIHSE_OPERATOR_PASSWORD", operator_password, 1);
             if (!qihse_auth_init()) {
+                operator_credential_clear_environment();
                 fprintf(stderr, "qihse-cluster-daemon: auth re-init failed\n");
                 return 1;
             }
         }
     }
+    operator_credential_clear_environment();
+
+    qihse_user_t* replication_service_principal = replication_configured
+        ? replication_service_principal_create(replication_principal_id) : NULL;
+    if (replication_configured && !replication_service_principal) {
+        fprintf(stderr, "qihse-cluster-daemon: could not provision replication service principal %u\n",
+                (unsigned)replication_principal_id);
+        return 1;
+    }
+
+    const bool auth_required = operator_password != NULL;
+    if (auth_required &&
+        (!qihse_cluster_derive_bus_veil_key(operator_password,
+             g_transport_keys.bus_veil) ||
+         !qihse_cluster_derive_overlay_hmac_key(operator_password,
+             g_transport_keys.overlay_hmac))) {
+        cluster_transport_keys_release();
+        fprintf(stderr, "qihse-cluster-daemon: cluster transport key derivation failed\n");
+        return 1;
+    }
+    if (atexit(cluster_transport_keys_release) != 0) {
+        cluster_transport_keys_release();
+        fprintf(stderr, "qihse-cluster-daemon: could not register transport key cleanup\n");
+        return 1;
+    }
+    operator_credential_release();
+    operator_password = NULL;
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     if (!store) {
@@ -1724,7 +1806,7 @@ int main(int argc, char** argv) {
     config.port = port;
     config.bus_port = bus_port;
     config.max_clients = max_clients;
-    config.auth_required = (operator_password != NULL);
+    config.auth_required = auth_required;
     config.enable_bus = true;
     config.enable_failover = true;
     config.enable_scatter = enable_scatter;
@@ -1756,8 +1838,10 @@ int main(int argc, char** argv) {
         expected->signer_node = consensus_prefix_signer;
         config.consensus_prefix_challenge_enabled = true;
     }
-    config.cluster_migrate_password = operator_password;
-    config.redundancy_peer = redundancy_peer;
+    config.cluster_migrate_password = NULL;
+    config.redundancy_peer = NULL;
+    config.replication_service_principal = replication_configured
+        ? replication_service_principal : NULL;
     /* Replicate all by default in LAN cluster (when in cluster mesh and bind is private/LAN) */
     if (repl_glob_count == 0 && !replicate_disabled && (peer_count > 0 || seed_count > 0) && is_lan_host(bind)) {
         snprintf(repl_globs[0], sizeof(repl_globs[0]), "*");
@@ -1765,14 +1849,19 @@ int main(int argc, char** argv) {
         repl_glob_count = 1;
         fprintf(stderr, "qihse-cluster-daemon: LAN cluster default: replicating all namespaces ('*')\n");
     }
+    if (repl_interval > 0u && repl_glob_count > 0u && !replication_source_host) {
+        fprintf(stderr, "qihse-cluster-daemon: outbound anti-entropy disabled; configure an exact pinned --replication-source-host and peer identity\n");
+    }
     /* R4 replicated namespaces: must be set BEFORE server create — the
      * engine ingests the globs into its registry during creation. */
     config.replicate_globs = repl_glob_ptrs;
     config.replicate_glob_count = repl_glob_count;
-    /* The cluster password also keys the veiled bus framing: every bus
+    /* A domain-separated key derived from the cluster credential keys the
+     * veiled bus framing. The operator password itself never enters the bus:
+     * every bus
      * datagram is wrapped as [nonce][pad][XOR(HMAC-SHA384 keystream)] so the
      * UDP gossip is not scannable as a known protocol. NULL = plain frames. */
-    config.veil_key = operator_password;
+    config.veil_key = auth_required ? g_transport_keys.bus_veil : NULL;
     /* Signed ops: without --node-key the daemon cannot sign its own ops
      * frames; with --require-signed-ops it also refuses unsigned ones from
      * peers (hardened mode — every node must then run --node-key). */
@@ -1817,6 +1906,9 @@ int main(int argc, char** argv) {
     config.fts = fts;
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
+    OPENSSL_cleanse(g_transport_keys.bus_veil,
+                    sizeof(g_transport_keys.bus_veil));
+    config.veil_key = NULL;
     if (!server) {
         fprintf(stderr, "qihse-cluster-daemon: server create failed (bind %s port %u): %s\n",
                 bind, port, strerror(errno));
@@ -1843,15 +1935,28 @@ int main(int argc, char** argv) {
                 ocfg.node_id = self_node.id;
                 ocfg.bind_host = bind;
                 ocfg.bind_port = bus_port;
-                ocfg.hmac_password = operator_password;
+                if (!auth_required) {
+                    fprintf(stderr, "qihse-cluster-daemon: overlay key derivation failed\n");
+                    OPENSSL_cleanse(g_transport_keys.overlay_hmac,
+                                    sizeof(g_transport_keys.overlay_hmac));
+                    qihse_resp_server_destroy(server);
+                    return 1;
+                }
+                ocfg.hmac_password = g_transport_keys.overlay_hmac;
                 ocfg.bus = bus;
-                if (qihse_overlay_start(&ocfg))
+                bool overlay_started = qihse_overlay_start(&ocfg);
+                OPENSSL_cleanse(g_transport_keys.overlay_hmac,
+                                sizeof(g_transport_keys.overlay_hmac));
+                ocfg.hmac_password = NULL;
+                if (overlay_started)
                     fprintf(stderr, "qihse-cluster-daemon: overlay bootstrap active on %s\n", irc_channel);
                 else
                     fprintf(stderr, "qihse-cluster-daemon: overlay bootstrap failed to start\n");
             }
         }
     }
+    OPENSSL_cleanse(g_transport_keys.overlay_hmac,
+                    sizeof(g_transport_keys.overlay_hmac));
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1889,20 +1994,14 @@ int main(int argc, char** argv) {
     static volatile sig_atomic_t ae_stop = 0;
     ae_ctx_t ae_ctx;
     bool ae_started = false;
-    if (repl_interval > 0u && (replication_source_host != NULL || ((peer_count > 0 || seed_count > 0) && repl_glob_count > 0))) {
+    if (repl_interval > 0u && replication_source_host != NULL) {
         ae_ctx.server = server;
-        ae_ctx.peers = peers;
-        ae_ctx.peer_count = peer_count;
-        ae_ctx.self_index = self_index;
-        ae_ctx.password = operator_password;
-        ae_ctx.self_host = bind;
-        ae_ctx.self_port = port;
         ae_ctx.source_host = replication_source_host;
         ae_ctx.source_port = replication_source_port;
         ae_ctx.socks_port = replication_socks_port;
         ae_ctx.source_via_i2p = replication_transport && strcmp(replication_transport, "i2p") == 0;
         ae_ctx.transport_name = replication_transport;
-        ae_ctx.replica_principal = qihse_auth_get_user(0u);
+        ae_ctx.replica_principal = replication_service_principal;
         ae_ctx.qkp = &pqc;
         ae_ctx.data_dir = data_dir;
         ae_ctx.interval_seconds = repl_interval;
