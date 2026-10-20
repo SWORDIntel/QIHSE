@@ -27,11 +27,13 @@
 #define HANDOFF_OWNER_ID 9201u
 #define HANDOFF_RECIPIENT_ID 9202u
 #define HANDOFF_COMPETITOR_ID 9203u
+#define AIMEM_SERVICE_ID 9204u
 #define MIGRATION_TEXT "QH01-LEGACY-MIGRATION-FIXTURE"
 
 static qihse_resp_server_t* server;
 static qihse_kv_store_t* store;
 static qihse_user_t* operator_user;
+static qihse_user_t* aimem_service_user;
 static char data_root[64];
 
 static void open_instance(void) {
@@ -39,12 +41,17 @@ static void open_instance(void) {
     assert(qihse_auth_bootstrap_operator("OperatorPass123!"));
     operator_user = qihse_auth_get_user(0u);
     assert(operator_user);
+    aimem_service_user = qihse_auth_create_tenant_user(operator_user, 77u,
+        AIMEM_SERVICE_ID, QIHSE_ROLE_ANALYST, UINT16_MAX, UINT16_MAX,
+        "AimemServicePass123!", false);
+    assert(aimem_service_user);
     store = qihse_kv_store_create();
     assert(store);
     qihse_resp_server_config_t cfg;
     qihse_resp_server_config_init(&cfg);
     cfg.store = store;
     cfg.auth_required = true;
+    cfg.aimem_service_user_id = AIMEM_SERVICE_ID;
     cfg.port = 0;
     server = qihse_resp_server_create(&cfg);
     assert(server);
@@ -292,15 +299,16 @@ static void migration_destination_then_kill(int pipe_fd) {
     memset(&hit, 0, sizeof hit);
     assert(qihse_ai_memory_get(server, operator_user, id, &hit));
     char destination_key[64];
-    snprintf(destination_key, sizeof destination_key, "t:0/aimem:%016llx",
+    snprintf(destination_key, sizeof destination_key, "t:77/aimem:%016llx",
              (unsigned long long)test_doc_id(id));
     size_t cap = strlen(hit.text) + 512u;
     char* migrated = malloc(cap);
     assert(migrated);
     int n = snprintf(migrated, cap,
-        "v2|%s|%llu|%u|%u|%u|0|qh01-migrated|tree-a|stream-a|session-a|%s",
+        "v2|%s|%llu|%u|%u|%u|%u|qh01-migrated|tree-a|stream-a|session-a|%s",
         id, (unsigned long long)hit.created_ms, (unsigned)hit.kind,
-        (unsigned)hit.classification, (unsigned)hit.sci_compartment, hit.text);
+        (unsigned)hit.classification, (unsigned)hit.sci_compartment,
+        (unsigned)AIMEM_SERVICE_ID, hit.text);
     assert(n > 0 && (size_t)n < cap);
     assert(qihse_kv_set_user(store, destination_key, migrated,
                              hit.classification, hit.sci_compartment,
@@ -315,9 +323,9 @@ static void migration_destination_then_kill(int pipe_fd) {
 
 static void verify_migration_recovery(const char* id) {
     open_instance();
-    const char* migrate[] = { "AIMEM", "MIGRATE-LEGACY", id,
+    const char* migrate[] = { "AIMEM", "MIGRATE-LEGACY-TO", id, "9204",
         "qh01-migrated", "tree-a", "stream-a", "session-a" };
-    char* reply = command(operator_user, 7u, migrate);
+    char* reply = command(operator_user, 8u, migrate);
     char migrated_id[QIHSE_AIMEM_ID_LEN + 1u];
     id_from_store(reply, migrated_id);
     free(reply);
@@ -326,11 +334,14 @@ static void verify_migration_recovery(const char* id) {
     assert_response(operator_user, 3u, legacy_get, "$-1\r\n");
     const char* scoped_get[] = { "AIMEM", "GET-SCOPED", id,
         "qh01-migrated", "tree-a", "stream-a", "session-a" };
-    assert_response(operator_user, 7u, scoped_get, MIGRATION_TEXT);
-    reply = command(operator_user, 7u, migrate);
+    assert_response(aimem_service_user, 7u, scoped_get, MIGRATION_TEXT);
+    reply = command(operator_user, 8u, migrate);
     id_from_store(reply, migrated_id);
     free(reply);
     assert(strcmp(id, migrated_id) == 0);
+    const char* conflict[] = { "AIMEM", "MIGRATE-LEGACY-TO", id, "9204",
+        "qh01-other", "", "", "" };
+    assert_response(operator_user, 8u, conflict, "ERR CONFLICT");
     qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);

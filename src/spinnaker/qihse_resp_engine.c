@@ -284,6 +284,7 @@ struct qihse_resp_server {
     size_t max_clients;
     size_t max_request_bytes;
     bool auth_required;
+    uint32_t aimem_service_user_id;
     qihse_user_t* unauthenticated_user;
     bool require_full_coverage;
     bool pin_workers;
@@ -6230,20 +6231,33 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             qihse_resp_error(session, "ERR AIMEM health unavailable");
     }
 
-    if (qihse_resp_arg_equal(&request->argv[1], "MIGRATE-LEGACY")) {
-        if (request->argc != 7u)
-            return qihse_resp_error(session, "ERR usage: AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>");
+    if (qihse_resp_arg_equal(&request->argv[1], "MIGRATE-LEGACY") ||
+        qihse_resp_arg_equal(&request->argv[1], "MIGRATE-LEGACY-TO")) {
+        bool targeted = qihse_resp_arg_equal(&request->argv[1],
+                                              "MIGRATE-LEGACY-TO");
+        if (request->argc != (targeted ? 8u : 7u))
+            return qihse_resp_error(session, targeted
+                ? "ERR usage: AIMEM MIGRATE-LEGACY-TO <uuid> <target-user-id> <project> <worktree> <workstream> <session>"
+                : "ERR usage: AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>");
         if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
             qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
             return qihse_resp_error(session, "NOPERM AIMEM legacy migration requires a system Operator");
+        uint32_t target_id = qihse_user_get_id(session->user);
+        if (targeted && !qihse_resp_aimem_u32(&request->argv[3], &target_id))
+            return qihse_resp_error(session, "ERR invalid AIMEM migration target");
         qihse_ai_memory_scope_t scope;
-        if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
+        if (!qihse_resp_aimem_scope_parse(request, targeted ? 4u : 3u, &scope))
             return qihse_resp_error(session, "ERR invalid or incomplete AIMEM migration scope");
         char* id = qihse_resp_arg_text(&request->argv[2]);
         if (!id) return qihse_resp_error(session, "ERR out of memory");
+        qihse_user_t* target = targeted ? qihse_auth_get_user(target_id) :
+                                          session->user;
         pthread_rwlock_wrlock(&session->server->kv_lock);
-        qihse_ai_memory_write_result_t result = qihse_ai_memory_migrate_legacy(
-            session->server, session->user, id, &scope);
+        qihse_ai_memory_write_result_t result = targeted
+            ? qihse_ai_memory_migrate_legacy_to(session->server, session->user,
+                                                 target, id, &scope)
+            : qihse_ai_memory_migrate_legacy(session->server, session->user,
+                                              id, &scope);
         pthread_rwlock_unlock(&session->server->kv_lock);
         if (result == QIHSE_AIMEM_WRITE_CONFLICT) {
             free(id);
@@ -13560,6 +13574,16 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
     return ok;
 }
 
+static bool qihse_resp_session_is_aimem_service(
+        const qihse_resp_session_t* session) {
+    if (!session || !session->server || !session->user ||
+        session->user == &session->peer_claims ||
+        session->server->aimem_service_user_id == UINT32_MAX) return false;
+    uint32_t configured = session->server->aimem_service_user_id;
+    return qihse_user_get_id(session->user) == configured &&
+           qihse_auth_get_user(configured) == session->user;
+}
+
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -13567,6 +13591,19 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     const uint8_t* cmd_data = request->argv[0].data;
     size_t cmd_len = request->argv[0].len;
     uint32_t key = qihse_resp_cmd_swar4(cmd_data, cmd_len);
+
+    /* This must precede every special command fast path. Otherwise a service
+     * session could escape its capability through MACHINEAUTH, PEERAUTH or a
+     * consensus control command before reaching the ordinary auth gate. */
+    if (qihse_resp_session_is_aimem_service(session) &&
+        !qihse_resp_command_is(request, "AIMEM") &&
+        !qihse_resp_command_is(request, "AUTH") &&
+        !qihse_resp_command_is(request, "HELLO") &&
+        !qihse_resp_command_is(request, "PING") &&
+        !qihse_resp_command_is(request, "QUIT")) {
+        return qihse_resp_error(session,
+            "NOPERM the AIMEM service identity may only execute AIMEM");
+    }
 
     /* Fast-path pre-auth / control commands via SWAR switch */
     switch (key) {
@@ -14218,6 +14255,7 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->max_clients = QIHSE_RESP_DEFAULT_MAX_CLIENTS;
     config->max_request_bytes = QIHSE_RESP_DEFAULT_MAX_REQUEST;
     config->auth_required = true;
+    config->aimem_service_user_id = UINT32_MAX;
     config->require_full_coverage = true;
     config->numa_node_id = -1;
     config->enable_bus = false;
@@ -14245,6 +14283,17 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     if (!supplied || supplied->max_request_bytes < 64u || supplied->max_request_bytes > (size_t)INT_MAX || supplied->max_clients == 0) {
         errno = EINVAL;
         return NULL;
+    }
+    if (supplied->aimem_service_user_id != UINT32_MAX) {
+        qihse_user_t* aimem_service =
+            qihse_auth_get_user(supplied->aimem_service_user_id);
+        if (!supplied->auth_required || !aimem_service ||
+            !qihse_auth_user_is_active(aimem_service) ||
+            qihse_user_get_role(aimem_service) == QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_tenant_id(aimem_service) == QIHSE_TENANT_SYSTEM) {
+            errno = EACCES;
+            return NULL;
+        }
     }
     const char* bind_address = supplied->bind_address ? supplied->bind_address : "127.0.0.1";
     const char* advertise_address = supplied->advertise_address ? supplied->advertise_address : bind_address;
@@ -14277,6 +14326,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->max_clients = supplied->max_clients;
     server->max_request_bytes = supplied->max_request_bytes;
     server->auth_required = supplied->auth_required;
+    server->aimem_service_user_id = supplied->aimem_service_user_id;
     server->unauthenticated_user = qihse_auth_get_user(0);
     server->require_full_coverage = supplied->require_full_coverage;
     server->pin_workers = supplied->pin_workers;

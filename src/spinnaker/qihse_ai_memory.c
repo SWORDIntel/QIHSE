@@ -942,13 +942,18 @@ static bool aimem_migrated_record_matches(const char* raw, const char* id,
         strcmp(text, source_text) == 0);
 }
 
-qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
+static qihse_ai_memory_write_result_t aimem_migrate_legacy_to(
         qihse_resp_server_t* server, qihse_user_t* operator_user,
+        qihse_user_t* target_user, bool require_nonoperator_target,
         const char* id, const qihse_ai_memory_scope_t* destination) {
     qihse_uuid_t uuid;
     if (!server || !operator_user || !qihse_auth_user_is_active(operator_user) ||
         qihse_user_get_role(operator_user) != QIHSE_ROLE_OPERATOR ||
         qihse_user_get_tenant_id(operator_user) != QIHSE_TENANT_SYSTEM ||
+        !target_user || !qihse_auth_user_is_active(target_user) ||
+        (require_nonoperator_target &&
+         (qihse_user_get_role(target_user) == QIHSE_ROLE_OPERATOR ||
+          qihse_user_get_tenant_id(target_user) == QIHSE_TENANT_SYSTEM)) ||
         !id || !qihse_uuid_parse(id, &uuid) || !aimem_scope_valid(destination))
         return QIHSE_AIMEM_WRITE_FAILED;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
@@ -958,19 +963,22 @@ qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
     aimem_key(source_key, sizeof source_key, doc_id);
     aimem_vec_key(vector_key, sizeof vector_key, doc_id);
     if (!aimem_scoped_key(destination_key, sizeof destination_key,
-                          operator_user, doc_id)) return QIHSE_AIMEM_WRITE_FAILED;
+                          target_user, doc_id)) return QIHSE_AIMEM_WRITE_FAILED;
 
     pthread_mutex_lock(&g_aimem_migration_lock);
     char* source_raw = qihse_kv_get_user(store, source_key, operator_user);
     char* destination_raw = qihse_kv_get_user(store, destination_key, operator_user);
-    uint32_t owner_id = qihse_user_get_id(operator_user);
+    uint32_t owner_id = qihse_user_get_id(target_user);
     if (!source_raw) {
         bool replay = aimem_migrated_record_matches(destination_raw, id, owner_id,
                                                      destination, NULL, NULL) &&
                       qihse_kv_sync_store(store);
+        bool conflict = destination_raw && !replay;
         free(destination_raw);
         pthread_mutex_unlock(&g_aimem_migration_lock);
-        return replay ? QIHSE_AIMEM_WRITE_REPLAY : QIHSE_AIMEM_WRITE_FAILED;
+        return replay ? QIHSE_AIMEM_WRITE_REPLAY :
+               conflict ? QIHSE_AIMEM_WRITE_CONFLICT :
+                          QIHSE_AIMEM_WRITE_FAILED;
     }
 
     aimem_record_meta_t source;
@@ -980,7 +988,9 @@ qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
         !source.scope.project[0] && strcmp(source.id, id) == 0 &&
         qihse_kv_meta_user(store, source_key, operator_user, &stored_meta) &&
         stored_meta.classification == source.classification &&
-        stored_meta.sci_compartment == source.sci_compartment;
+        stored_meta.sci_compartment == source.sci_compartment &&
+        qihse_auth_can_access(target_user, stored_meta.classification,
+                              stored_meta.sci_compartment);
     if (!source_ok) {
         free(source_raw); free(destination_raw);
         pthread_mutex_unlock(&g_aimem_migration_lock);
@@ -1031,6 +1041,21 @@ qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
     pthread_mutex_unlock(&g_aimem_migration_lock);
     if (!durable) return QIHSE_AIMEM_WRITE_FAILED;
     return existed ? QIHSE_AIMEM_WRITE_REPLAY : QIHSE_AIMEM_WRITE_NEW;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
+        qihse_resp_server_t* server, qihse_user_t* operator_user,
+        const char* id, const qihse_ai_memory_scope_t* destination) {
+    return aimem_migrate_legacy_to(server, operator_user, operator_user, false,
+                                   id, destination);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy_to(
+        qihse_resp_server_t* server, qihse_user_t* operator_user,
+        qihse_user_t* target_user, const char* id,
+        const qihse_ai_memory_scope_t* destination) {
+    return aimem_migrate_legacy_to(server, operator_user, target_user, true,
+                                   id, destination);
 }
 
 static bool aimem_event_token(const char* s, size_t max_len) {

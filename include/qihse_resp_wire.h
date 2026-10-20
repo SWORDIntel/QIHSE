@@ -47,6 +47,11 @@ typedef struct {
     size_t max_clients;
     size_t max_request_bytes;
     bool auth_required;
+    /* Optional least-privilege AIMEM service identity.  UINT32_MAX disables
+     * the restriction.  Once this principal authenticates, the RESP
+     * dispatcher admits AIMEM commands only (plus the pre-auth/control
+     * AUTH/HELLO/PING/QUIT control commands). */
+    uint32_t aimem_service_user_id;
     bool require_full_coverage;
     bool pin_workers;
     bool strict_hardware_affinity;
