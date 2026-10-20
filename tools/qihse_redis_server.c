@@ -353,6 +353,7 @@ int main(int argc, char** argv) {
     config.bind_address = options.bind;
     config.advertise_address = options.bind;
     config.auth_required = options.require_auth;
+    config.aimem_service_user_id = options.aimem_service_user_id;
     config.pubsub_log_directory = options.pubsub_dir;
     config.channel_classification = options.channel_classification;
     config.channel_sci = options.channel_sci;
