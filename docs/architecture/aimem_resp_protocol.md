@@ -334,13 +334,34 @@ skips byte-identical collisions, rejects changed collisions, and durably
 fences each new row. An interrupted multi-record import is safely resumable.
 The legacy `QAX1` whole-buffer functions remain available for compatibility.
 
-Index rebuild validation writes a durable `QHI1` ready record containing the
-provider binding, dimension, generation and authoritative KV high-water.
-Health returned to ordinary principals is redacted to provider, dimension and
-readiness. Only an Operator receives generation, high-water and content-free
-operation counters. The current rebuild validates the authorized QHK
-projection; generation-swapped BM25/vector side indexes and crash injection
-during cutover remain follow-up work.
+Index repair derives immutable vector generations from authoritative QHK
+records and publishes only a fully fenced generation. Health returned to
+ordinary principals is limited to provider, dimension and readiness. Only an
+Operator receives state, generation, high-water and content-free counters.
+
+### QH-08 index control
+
+```
+AIMEM REBUILD <project> <worktree> <workstream> <session>
+AIMEM HEALTH  <project> <worktree> <workstream> <session>
+```
+
+Both RESP operations require an authenticated, fully cleared tenant Operator
+so a hidden higher-label row cannot produce a false complete generation. `REBUILD`
+durably publishes `BUILDING` before creating an immutable, label-preserving
+vector generation. It fsyncs the candidate entries before the exact state CAS
+publishes `READY`; interrupted `BUILDING` attempts recover to durable `FAILED`
+and the next attempt uses a larger persisted generation. Provider inference
+failure records `FAILED` and never substitutes the lexical provider.
+
+`HEALTH` returns alternating RESP2 key/value fields: provider, dimension,
+ready, state, active and candidate generations, source high-water, indexed
+record count, rebuild counters, provider failures, recovered builds, audit
+events, query snapshots, maintenance versions, exports, imports and rejected
+operations. The native health API gives ordinary authorized project members
+only provider, dimension and readiness; every generation, cardinality and
+counter field is zero. Opaque scope hashes are used in state and generation
+keys. A separate public readiness record contains no generation or count.
 
 ## Operational properties
 

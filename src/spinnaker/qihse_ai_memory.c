@@ -4054,32 +4054,420 @@ static bool aimem_rebuild_validate_cb(const char* key, const char* value, void* 
 
 static bool aimem_index_state_key(char* out, size_t cap, qihse_user_t* user,
                                   const qihse_ai_memory_scope_t* scope) {
-    int n = snprintf(out, cap, "t:%u/aimem-index-state:%s:%s:%s:%s",
-        (unsigned)qihse_user_get_tenant_id(user), scope->project,
+    char canonical[4u * (QIHSE_AIMEM_SCOPE_ID_MAX + 1u) + 4u], digest[65];
+    int c = snprintf(canonical, sizeof canonical, "%s|%s|%s|%s", scope->project,
         scope->worktree, scope->workstream, scope->session);
+    if (c < 0 || (size_t)c >= sizeof canonical ||
+        !aimem_sha256_hex(canonical, (size_t)c, digest)) return false;
+    int n = snprintf(out, cap, "t:%u/aimem-index-state:%s:private",
+        (unsigned)qihse_user_get_tenant_id(user), digest);
     return n > 0 && (size_t)n < cap;
+}
+
+static bool aimem_index_public_key(char* out, size_t cap, qihse_user_t* user,
+                                   const qihse_ai_memory_scope_t* scope) {
+    char private_key[512];
+    if (!aimem_index_state_key(private_key, sizeof private_key, user, scope)) return false;
+    char* suffix = strrchr(private_key, ':');
+    if (!suffix) return false;
+    *suffix = '\0';
+    int n = snprintf(out, cap, "%s:public", private_key);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool aimem_index_public_write(qihse_kv_store_t* store, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const char* provider,
+        size_t dimension, bool ready) {
+    char key[512]; char* hex = aimem_hex_encode(provider); char record[512];
+    int n = hex ? snprintf(record, sizeof record, "QHIP1|%s|%zu|%s", hex,
+                           dimension, ready ? "READY" : "NOT_READY") : -1;
+    bool ok = n > 0 && (size_t)n < sizeof record &&
+        aimem_index_public_key(key, sizeof key, user, scope) &&
+        qihse_kv_set_user(store, key, record, 0u, 0u, user) &&
+        qihse_kv_sync_store(store);
+    free(hex); return ok;
+}
+
+static bool aimem_index_public_parse(const char* raw, char provider[65],
+                                     size_t* dimension, bool* ready) {
+    if (!raw || !provider || !dimension || !ready) return false;
+    char* copy = strdup(raw); if (!copy) return false;
+    char* cur = copy; char* magic = strsep(&cur, "|"); char* encoded = strsep(&cur, "|");
+    char* dim = strsep(&cur, "|"); char* status = strsep(&cur, "|"); uint64_t parsed_dim = 0u;
+    char* decoded = encoded ? aimem_hex_decode(encoded) : NULL;
+    bool ok = cur == NULL && magic && strcmp(magic, "QHIP1") == 0 && decoded &&
+        *decoded && strlen(decoded) <= AIMEM_EMBEDDER_NAME_MAX &&
+        aimem_token_u64(dim, &parsed_dim) && parsed_dim > 0u &&
+        parsed_dim <= QIHSE_AIMEM_MAX_DIM && status &&
+        (strcmp(status, "READY") == 0 || strcmp(status, "NOT_READY") == 0);
+    if (ok) {
+        snprintf(provider, 65u, "%s", decoded); *dimension = (size_t)parsed_dim;
+        *ready = strcmp(status, "READY") == 0;
+    }
+    free(decoded); free(copy); return ok;
+}
+
+typedef struct {
+    uint64_t active_generation;
+    uint64_t candidate_generation;
+    uint32_t state;
+    char provider[AIMEM_EMBEDDER_NAME_MAX + 1u];
+    size_t dimension;
+    uint64_t source_highwater;
+    uint64_t indexed_records;
+    uint64_t rebuild_started;
+    uint64_t rebuild_ready;
+    uint64_t rebuild_failed;
+    uint64_t provider_failures;
+    uint64_t recovered_builds;
+    uint64_t audit_events;
+    uint32_t last_event;
+} aimem_index_state_t;
+
+enum {
+    AIMEM_INDEX_AUDIT_STARTED = 1u,
+    AIMEM_INDEX_AUDIT_READY = 2u,
+    AIMEM_INDEX_AUDIT_FAILED = 3u,
+    AIMEM_INDEX_AUDIT_RECOVERED = 4u
+};
+
+static const char* aimem_index_state_name(uint32_t state) {
+    switch (state) {
+        case QIHSE_AIMEM_INDEX_BUILDING: return "BUILDING";
+        case QIHSE_AIMEM_INDEX_READY: return "READY";
+        case QIHSE_AIMEM_INDEX_FAILED: return "FAILED";
+        default: return "NONE";
+    }
+}
+
+static uint32_t aimem_index_state_parse_name(const char* value) {
+    if (!value) return QIHSE_AIMEM_INDEX_NONE;
+    if (strcmp(value, "BUILDING") == 0) return QIHSE_AIMEM_INDEX_BUILDING;
+    if (strcmp(value, "READY") == 0) return QIHSE_AIMEM_INDEX_READY;
+    if (strcmp(value, "FAILED") == 0) return QIHSE_AIMEM_INDEX_FAILED;
+    return QIHSE_AIMEM_INDEX_NONE;
+}
+
+static char* aimem_index_state_encode(const aimem_index_state_t* state) {
+    char* provider = aimem_hex_encode(state->provider);
+    if (!provider) return NULL;
+    char* encoded = malloc(1024u);
+    if (encoded) {
+        int n = snprintf(encoded, 1024u,
+            "QHI2|%llu|%llu|%s|%s|%zu|%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu|%u",
+            (unsigned long long)state->active_generation,
+            (unsigned long long)state->candidate_generation,
+            aimem_index_state_name(state->state), provider, state->dimension,
+            (unsigned long long)state->source_highwater,
+            (unsigned long long)state->indexed_records,
+            (unsigned long long)state->rebuild_started,
+            (unsigned long long)state->rebuild_ready,
+            (unsigned long long)state->rebuild_failed,
+            (unsigned long long)state->provider_failures,
+            (unsigned long long)state->recovered_builds,
+            (unsigned long long)state->audit_events, state->last_event);
+        if (n < 0 || n >= 1024) { free(encoded); encoded = NULL; }
+    }
+    free(provider);
+    return encoded;
+}
+
+static bool aimem_index_state_parse(const char* raw, aimem_index_state_t* out) {
+    if (!raw || !out) return false;
+    memset(out, 0, sizeof(*out));
+    if (strncmp(raw, "QHI1|", 5u) == 0) {
+        unsigned long long generation = 0u, highwater = 0u;
+        char status[16], provider[AIMEM_EMBEDDER_NAME_MAX + 1u]; size_t dimension = 0u;
+        if (sscanf(raw, "QHI1|%llu|%15[^|]|%63[^|]|%zu|%llu", &generation,
+                   status, provider, &dimension, &highwater) != 5) return false;
+        out->active_generation = out->candidate_generation = generation;
+        out->state = aimem_index_state_parse_name(status);
+        memcpy(out->provider, provider, strlen(provider) + 1u);
+        out->dimension = dimension; out->source_highwater = highwater;
+        return out->state != QIHSE_AIMEM_INDEX_NONE;
+    }
+    char* copy = strdup(raw); if (!copy) return false;
+    char* cur = copy; char* f[15];
+    for (size_t i = 0; i < 15u; i++) f[i] = strsep(&cur, "|");
+    uint64_t dim = 0u, state = 0u, last = 0u;
+    bool ok = cur == NULL && f[0] && strcmp(f[0], "QHI2") == 0 &&
+        aimem_token_u64(f[1], &out->active_generation) &&
+        aimem_token_u64(f[2], &out->candidate_generation) &&
+        (state = aimem_index_state_parse_name(f[3])) != QIHSE_AIMEM_INDEX_NONE &&
+        aimem_token_u64(f[5], &dim) && dim > 0u && dim <= QIHSE_AIMEM_MAX_DIM &&
+        aimem_token_u64(f[6], &out->source_highwater) &&
+        aimem_token_u64(f[7], &out->indexed_records) &&
+        aimem_token_u64(f[8], &out->rebuild_started) &&
+        aimem_token_u64(f[9], &out->rebuild_ready) &&
+        aimem_token_u64(f[10], &out->rebuild_failed) &&
+        aimem_token_u64(f[11], &out->provider_failures) &&
+        aimem_token_u64(f[12], &out->recovered_builds) &&
+        aimem_token_u64(f[13], &out->audit_events) &&
+        aimem_token_u64(f[14], &last) && last <= UINT32_MAX;
+    char* provider = ok ? aimem_hex_decode(f[4]) : NULL;
+    ok = ok && provider && *provider && strlen(provider) <= AIMEM_EMBEDDER_NAME_MAX;
+    if (ok) {
+        out->state = (uint32_t)state; out->dimension = (size_t)dim;
+        out->last_event = (uint32_t)last;
+        snprintf(out->provider, sizeof out->provider, "%s", provider);
+    }
+    free(provider); free(copy);
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
+}
+
+static bool aimem_index_state_load(qihse_kv_store_t* store, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, char** raw, aimem_index_state_t* state) {
+    char key[512];
+    if (!store || !raw || !state ||
+        !aimem_index_state_key(key, sizeof key, user, scope)) return false;
+    *raw = qihse_kv_get_user(store, key, user);
+    if (!*raw) { memset(state, 0, sizeof(*state)); return true; }
+    return aimem_index_state_parse(*raw, state);
+}
+
+static bool aimem_index_state_cas(qihse_kv_store_t* store, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const char* expected,
+        const aimem_index_state_t* state, char** committed) {
+    char key[512]; char* encoded = aimem_index_state_encode(state);
+    bool ok = encoded && aimem_index_state_key(key, sizeof key, user, scope) &&
+        qihse_kv_compare_set_user(store, key, expected, encoded,
+            qihse_user_get_classification(user), qihse_user_get_sci(user), user) ==
+            QIHSE_KV_CAS_UPDATED && qihse_kv_sync_store(store);
+    if (committed) *committed = ok ? strdup(encoded) : NULL;
+    free(encoded);
+    return ok && (!committed || *committed);
+}
+
+static void aimem_index_audit(qihse_user_t* user, uint32_t event,
+                              uint64_t generation) {
+    /* Fault-injection children intentionally terminate without audit-thread
+     * teardown. Their durable QHI2 audit counter is recovered by the parent;
+     * never touch inherited asynchronous audit state in that crash window. */
+    if (getenv("QIHSE_AIMEM_QH08_FAIL_AT")) return;
+    const char* action = event == AIMEM_INDEX_AUDIT_STARTED ? "AIMEM_INDEX_BUILDING" :
+        event == AIMEM_INDEX_AUDIT_READY ? "AIMEM_INDEX_READY" :
+        event == AIMEM_INDEX_AUDIT_RECOVERED ? "AIMEM_INDEX_RECOVERED" :
+        "AIMEM_INDEX_FAILED";
+    qihse_audit_log(action, qihse_user_get_id(user), (uint32_t)generation, 0u, 0u);
+}
+
+static bool aimem_index_operator(qihse_user_t* user) {
+    return user && qihse_auth_user_is_active(user) &&
+           qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR &&
+           qihse_user_get_classification(user) == UINT16_MAX &&
+           qihse_user_get_sci(user) == UINT16_MAX;
+}
+
+bool qihse_ai_memory_index_recover(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope) {
+    if (!server || !aimem_index_operator(user) || !aimem_scope_valid(scope)) return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    char* raw = NULL; aimem_index_state_t state;
+    if (!aimem_index_state_load(store, user, scope, &raw, &state)) { free(raw); return false; }
+    if (!raw || state.state != QIHSE_AIMEM_INDEX_BUILDING) { free(raw); return true; }
+    state.state = QIHSE_AIMEM_INDEX_FAILED;
+    state.rebuild_failed++; state.recovered_builds++; state.audit_events++;
+    state.last_event = AIMEM_INDEX_AUDIT_RECOVERED;
+    bool ok = aimem_index_state_cas(store, user, scope, raw, &state, NULL);
+    if (ok) ok = aimem_index_public_write(store, user, scope, state.provider,
+                                           state.dimension, false);
+    if (ok) aimem_index_audit(user, AIMEM_INDEX_AUDIT_RECOVERED,
+                              state.candidate_generation);
+    free(raw); return ok;
+}
+
+typedef struct {
+    char key[768];
+    char* value;
+    uint16_t classification;
+    uint16_t sci;
+} aimem_index_entry_t;
+
+typedef struct {
+    qihse_resp_server_t* server;
+    qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope;
+    uint64_t generation;
+    const char* provider;
+    size_t dimension;
+    aimem_index_entry_t* entries;
+    size_t count;
+    bool failed;
+    bool provider_failed;
+} aimem_index_build_t;
+
+static bool aimem_index_entry_key(char* out, size_t cap, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, uint64_t generation,
+        const char* knowledge_id) {
+    char canonical[4u * (QIHSE_AIMEM_SCOPE_ID_MAX + 1u) + 4u];
+    char scope_digest[65], id_digest[65];
+    int c = snprintf(canonical, sizeof canonical, "%s|%s|%s|%s", scope->project,
+        scope->worktree, scope->workstream, scope->session);
+    if (c < 0 || (size_t)c >= sizeof canonical ||
+        !aimem_sha256_hex(canonical, (size_t)c, scope_digest) ||
+        !aimem_sha256_hex(knowledge_id, strlen(knowledge_id), id_digest)) return false;
+    int n = snprintf(out, cap, "t:%u/aimem-index-gen:%s:%llu:%s",
+        (unsigned)qihse_user_get_tenant_id(user), scope_digest,
+        (unsigned long long)generation, id_digest);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool aimem_index_build_cb(const char* key, const char* value, void* opaque) {
+    aimem_index_build_t* b = opaque; aimem_knowledge_chain_t chain;
+    if (!aimem_knowledge_chain_parse(value, &chain)) { b->failed = true; return false; }
+    if (!aimem_scope_matches(&chain.scope, b->scope)) {
+        aimem_knowledge_chain_free(&chain); return true;
+    }
+    if (b->count >= QIHSE_AIMEM_QUERY_MAX_ROWS) {
+        b->failed = true; aimem_knowledge_chain_free(&chain); return false;
+    }
+    qihse_ai_memory_knowledge_version_t* current = &chain.versions[chain.count - 1u];
+    float* vector = calloc(b->dimension, sizeof(*vector));
+    bool ok = vector && strcmp(qihse_ai_memory_embedder_name(), b->provider) == 0 &&
+        qihse_ai_memory_embedding_dim() == b->dimension &&
+        qihse_ai_memory_embed_text(current->content, vector, b->dimension);
+    for (size_t i = 0; ok && i < b->dimension; i++) ok = isfinite(vector[i]);
+    if (!ok) b->provider_failed = true;
+    qihse_kv_record_meta_t meta;
+    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
+    if (ok) ok = qihse_kv_meta_user(store, key, b->user, &meta);
+    char* provider = ok ? aimem_hex_encode(b->provider) : NULL;
+    size_t cap = 256u + b->dimension * 18u;
+    char* encoded = provider ? malloc(cap) : NULL; size_t used = 0u;
+    if (encoded) {
+        int n = snprintf(encoded, cap, "QHIX1|%s|%zu|%s|", provider,
+            b->dimension, current->version_id);
+        ok = n > 0 && (size_t)n < cap; used = ok ? (size_t)n : 0u;
+    } else ok = false;
+    for (size_t i = 0; ok && i < b->dimension; i++) {
+        int n = snprintf(encoded + used, cap - used, "%s%.9g", i ? "," : "",
+                         (double)vector[i]);
+        if (n < 0 || (size_t)n >= cap - used) ok = false;
+        else used += (size_t)n;
+    }
+    aimem_index_entry_t* entry = ok ? &b->entries[b->count] : NULL;
+    if (ok) ok = aimem_index_entry_key(entry->key, sizeof entry->key, b->user,
+        b->scope, b->generation, chain.knowledge_id);
+    if (ok) {
+        entry->value = encoded; entry->classification = meta.classification;
+        entry->sci = meta.sci_compartment; b->count++;
+    } else free(encoded);
+    free(provider); free(vector); aimem_knowledge_chain_free(&chain);
+    if (!ok) b->failed = true;
+    return ok;
+}
+
+static void aimem_index_entries_free(aimem_index_build_t* build) {
+    for (size_t i = 0; i < build->count; i++) free(build->entries[i].value);
+    free(build->entries); build->entries = NULL; build->count = 0u;
+}
+
+static bool aimem_index_fail(qihse_kv_store_t* store, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const char* building_raw,
+        aimem_index_state_t* state, bool provider_failed) {
+    state->state = QIHSE_AIMEM_INDEX_FAILED; state->rebuild_failed++;
+    if (provider_failed) state->provider_failures++;
+    state->audit_events++; state->last_event = AIMEM_INDEX_AUDIT_FAILED;
+    bool ok = aimem_index_state_cas(store, user, scope, building_raw, state, NULL);
+    if (ok) ok = aimem_index_public_write(store, user, scope, state->provider,
+                                           state->dimension, false);
+    if (ok) aimem_index_audit(user, AIMEM_INDEX_AUDIT_FAILED,
+                              state->candidate_generation);
+    return ok;
 }
 
 bool qihse_ai_memory_index_rebuild(qihse_resp_server_t* server,
         qihse_user_t* user, const qihse_ai_memory_scope_t* scope) {
-    if (!server || !user || !qihse_auth_user_is_active(user) ||
-        !aimem_scope_valid(scope) ||
-        !qihse_ai_memory_project_owner_allowed(server, user, scope->project)) return false;
-    qihse_kv_store_t* store = qihse_resp_server_store(server); char prefix[48];
-    int n = snprintf(prefix, sizeof prefix, "t:%u/aimem-knowledge:",
+    if (!server || !aimem_index_operator(user) || !aimem_scope_valid(scope)) return false;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store || !qihse_ai_memory_index_recover(server, user, scope)) return false;
+    char* prior_raw = NULL; aimem_index_state_t state;
+    if (!aimem_index_state_load(store, user, scope, &prior_raw, &state)) {
+        free(prior_raw); return false;
+    }
+    uint64_t largest = state.active_generation > state.candidate_generation ?
+        state.active_generation : state.candidate_generation;
+    state.candidate_generation = largest + 1u;
+    if (!state.candidate_generation) { free(prior_raw); return false; }
+    state.state = QIHSE_AIMEM_INDEX_BUILDING;
+    snprintf(state.provider, sizeof state.provider, "%s", qihse_ai_memory_embedder_name());
+    state.dimension = qihse_ai_memory_embedding_dim();
+    if (!state.provider[0] || !state.dimension) { free(prior_raw); return false; }
+    if (!aimem_index_public_write(store, user, scope, state.provider,
+                                  state.dimension, false)) {
+        free(prior_raw); return false;
+    }
+    state.source_highwater = qihse_kv_change_seq(store);
+    if (state.source_highwater == UINT64_MAX) { free(prior_raw); return false; }
+    state.source_highwater++; /* the BUILDING CAS is the next local mutation */
+    state.indexed_records = 0u;
+    state.rebuild_started++; state.audit_events++; state.last_event = AIMEM_INDEX_AUDIT_STARTED;
+    char* building_raw = NULL;
+    bool ok = aimem_index_state_cas(store, user, scope, prior_raw, &state, &building_raw);
+    free(prior_raw);
+    if (!ok) { free(building_raw); return false; }
+    aimem_index_audit(user, AIMEM_INDEX_AUDIT_STARTED, state.candidate_generation);
+    const char* fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
+    if (fail_at && strcmp(fail_at, "after-building") == 0) {
+        free(building_raw); return false;
+    }
+
+    float* probe = calloc(state.dimension, sizeof(*probe));
+    bool provider_ok = probe && qihse_ai_memory_embed_text(
+        "qihse-index-provider-preflight", probe, state.dimension);
+    for (size_t i = 0; provider_ok && i < state.dimension; i++)
+        provider_ok = isfinite(probe[i]);
+    free(probe);
+    if (!provider_ok) {
+        (void)aimem_index_fail(store, user, scope, building_raw, &state, true);
+        free(building_raw); return false;
+    }
+
+    aimem_index_build_t build = { .server = server, .user = user, .scope = scope,
+        .generation = state.candidate_generation, .provider = state.provider,
+        .dimension = state.dimension };
+    build.entries = calloc(QIHSE_AIMEM_QUERY_MAX_ROWS, sizeof(*build.entries));
+    char prefix[48]; int n = snprintf(prefix, sizeof prefix, "t:%u/aimem-knowledge:",
         (unsigned)qihse_user_get_tenant_id(user));
-    aimem_index_rebuild_validate_t b = { server, user, scope, true };
-    bool ok = store && n > 0 && (size_t)n < sizeof prefix &&
-        qihse_kv_foreach_prefix_user(store, prefix, user, aimem_rebuild_validate_cb, &b) && b.valid;
-    uint64_t generation = __atomic_add_fetch(&g_aimem_index_generation, 1u, __ATOMIC_RELAXED);
-    char key[512], record[256];
-    int written = snprintf(record, sizeof record, "QHI1|%llu|READY|%s|%zu|%llu",
-        (unsigned long long)generation, qihse_ai_memory_embedder_name(),
-        qihse_ai_memory_embedding_dim(), (unsigned long long)qihse_kv_change_seq(store));
-    return ok && written > 0 && (size_t)written < sizeof record &&
-        aimem_index_state_key(key, sizeof key, user, scope) &&
-        qihse_kv_set_user(store, key, record, qihse_user_get_classification(user),
-                          qihse_user_get_sci(user), user);
+    ok = build.entries && n > 0 && (size_t)n < sizeof prefix &&
+        qihse_kv_foreach_prefix_user(store, prefix, user, aimem_index_build_cb, &build) &&
+        !build.failed && qihse_kv_change_seq(store) == state.source_highwater &&
+        strcmp(qihse_ai_memory_embedder_name(), state.provider) == 0 &&
+        qihse_ai_memory_embedding_dim() == state.dimension;
+    if (ok) for (size_t i = 0; i < build.count; i++) {
+        if (!qihse_kv_set_user(store, build.entries[i].key, build.entries[i].value,
+                build.entries[i].classification, build.entries[i].sci, user)) {
+            ok = false; break;
+        }
+    }
+    if (ok) ok = qihse_kv_sync_store(store);
+    fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
+    if (ok && fail_at && strcmp(fail_at, "after-entries") == 0) {
+        aimem_index_entries_free(&build); free(building_raw); return false;
+    }
+    state.indexed_records = build.count;
+    bool provider_failed = build.provider_failed ||
+        strcmp(qihse_ai_memory_embedder_name(), state.provider) != 0;
+    aimem_index_entries_free(&build);
+    if (!ok) {
+        (void)aimem_index_fail(store, user, scope, building_raw, &state, provider_failed);
+        free(building_raw); return false;
+    }
+    state.active_generation = state.candidate_generation;
+    state.state = QIHSE_AIMEM_INDEX_READY; state.rebuild_ready++;
+    state.audit_events++; state.last_event = AIMEM_INDEX_AUDIT_READY;
+    ok = aimem_index_state_cas(store, user, scope, building_raw, &state, NULL);
+    if (ok) {
+        ok = aimem_index_public_write(store, user, scope, state.provider,
+                                      state.dimension, true);
+    }
+    if (ok) {
+        aimem_index_audit(user, AIMEM_INDEX_AUDIT_READY, state.active_generation);
+        __atomic_store_n(&g_aimem_index_generation, state.active_generation,
+                         __ATOMIC_RELAXED);
+    }
+    free(building_raw); return ok;
 }
 
 bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
@@ -4089,16 +4477,58 @@ bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
         !aimem_scope_valid(scope) || !out ||
         (!qihse_ai_memory_project_owner_allowed(server, user, scope->project) &&
          !qihse_ai_memory_project_reader_allowed(server, user, scope->project))) return false;
-    snprintf(out->provider, sizeof out->provider, "%s", qihse_ai_memory_embedder_name());
-    out->dimension = qihse_ai_memory_embedding_dim();
     qihse_kv_store_t* store = qihse_resp_server_store(server); char key[512];
-    char* raw = aimem_index_state_key(key, sizeof key, user, scope) ?
-        qihse_kv_get_user(store, key, user) : NULL;
-    unsigned long long generation = 0u, highwater = 0u; char state[16], provider[65]; size_t dim = 0u;
-    out->ready = raw && sscanf(raw, "QHI1|%llu|%15[^|]|%64[^|]|%zu|%llu",
-        &generation, state, provider, &dim, &highwater) == 5 && strcmp(state, "READY") == 0;
-    if (qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR) {
-        out->generation = generation; out->source_highwater = highwater;
+    bool is_operator = qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+    char* raw = NULL; aimem_index_state_t state; bool parsed = false;
+    bool private_parsed = false;
+    if (is_operator && aimem_index_state_key(key, sizeof key, user, scope)) {
+        raw = qihse_kv_get_user(store, key, user);
+        parsed = raw && aimem_index_state_parse(raw, &state);
+        private_parsed = parsed;
+    }
+    if (is_operator && parsed) {
+        snprintf(out->provider, sizeof out->provider, "%s", state.provider);
+        out->dimension = state.dimension;
+        char public_provider[65] = {0}; size_t public_dimension = 0u;
+        bool public_ready = false;
+        char* public_raw = aimem_index_public_key(key, sizeof key, user, scope) ?
+            qihse_kv_get_user(store, key, user) : NULL;
+        bool public_valid = public_raw && aimem_index_public_parse(public_raw,
+            public_provider, &public_dimension, &public_ready);
+        free(public_raw);
+        out->ready = public_valid && public_ready &&
+            strcmp(public_provider, state.provider) == 0 &&
+            public_dimension == state.dimension &&
+            state.state == QIHSE_AIMEM_INDEX_READY &&
+            strcmp(state.provider, qihse_ai_memory_embedder_name()) == 0 &&
+            state.dimension == qihse_ai_memory_embedding_dim();
+    } else {
+        free(raw); raw = aimem_index_public_key(key, sizeof key, user, scope) ?
+            qihse_kv_get_user(store, key, user) : NULL;
+        bool public_ready = false;
+        parsed = raw && aimem_index_public_parse(raw, out->provider,
+                                                  &out->dimension, &public_ready);
+        if (!parsed) {
+            snprintf(out->provider, sizeof out->provider, "%s",
+                     qihse_ai_memory_embedder_name());
+            out->dimension = qihse_ai_memory_embedding_dim();
+        }
+        out->ready = parsed && public_ready &&
+            strcmp(out->provider, qihse_ai_memory_embedder_name()) == 0 &&
+            out->dimension == qihse_ai_memory_embedding_dim();
+    }
+    if (is_operator) {
+        out->index_state = private_parsed ? state.state : QIHSE_AIMEM_INDEX_NONE;
+        out->generation = private_parsed ? state.active_generation : 0u;
+        out->candidate_generation = private_parsed ? state.candidate_generation : 0u;
+        out->source_highwater = private_parsed ? state.source_highwater : 0u;
+        out->indexed_records = private_parsed ? state.indexed_records : 0u;
+        out->rebuild_started = private_parsed ? state.rebuild_started : 0u;
+        out->rebuild_ready = private_parsed ? state.rebuild_ready : 0u;
+        out->rebuild_failed = private_parsed ? state.rebuild_failed : 0u;
+        out->provider_failures = private_parsed ? state.provider_failures : 0u;
+        out->recovered_builds = private_parsed ? state.recovered_builds : 0u;
+        out->audit_events = private_parsed ? state.audit_events : 0u;
         out->query_snapshots = __atomic_load_n(&g_aimem_query_snapshots, __ATOMIC_RELAXED);
         out->maintenance_versions = __atomic_load_n(&g_aimem_maintenance_versions, __ATOMIC_RELAXED);
         out->exports = __atomic_load_n(&g_aimem_exports, __ATOMIC_RELAXED);

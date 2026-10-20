@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-05 and QH-07 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, QHK2 provenance/approval policy, bounded versioned query cursors, and authenticated resumable streaming archives. QH-06 and QH-08 retain the maintenance, telemetry and generation-cutover gates described below. QH-09 is closed through scoped `RULE` reuse and QH-10 remains conditional. Integrated into the master roadmap as W10.
+> **Status (2026-10-20):** W10 QH-00–QH-09 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, QHK2 provenance/approval policy, bounded versioned query cursors, reversible maintenance, authenticated resumable streaming archives, and generation-swapped operational repair. QH-10 remains conditional and has no demonstrated consumer requirement. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -266,12 +266,16 @@ Expose a deterministic index-repair/rebuild workflow from authoritative QIHSE re
 
 **Acceptance:** Kill backend during rebuild and restart safely; configured semantic model load failures remain fail-closed; fail/retry counters and logs never include bearer secrets or memory plaintext.
 
-**First implementation:** an authenticated rebuild validates the authoritative
-QHK projection and persists `QHI1` provider, dimension, generation and KV
-high-water state. Ordinary health reports only provider/dimension/readiness;
-Operator health adds content-free counters. This remains **partial** pending
-side-index generation swap, durable BUILDING/FAILED recovery, metrics registry
-wiring, audit events and semantic-provider failure/cutover crash tests.
+**Implemented:** authenticated, fully cleared tenant Operators drive a persisted `QHI2`
+BUILDING/READY/FAILED state machine. Rebuild creates immutable, label-preserving
+vector generation entries, binds them to the exact provider/dimension and
+source high-water, fsyncs candidates, then publishes the generation with an
+exact CAS and durability fence. Restart recovery marks interrupted generations
+FAILED before a larger generation may build. Provider inference failure is
+explicit and never falls back. Native and RESP health expose content-free
+metrics and audit counts to Operators while ordinary authorized principals see
+only provider/dimension/readiness. Crash/restart fault points, provider
+failure, tenant isolation and redaction are covered by focused tests.
 
 ## QH-09 / QH-10 — Defer until justified
 
