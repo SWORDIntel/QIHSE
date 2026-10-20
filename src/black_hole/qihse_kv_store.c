@@ -39,6 +39,7 @@
 #define KV_ALLOWED_FLAGS KV_FLAG_TOMBSTONE
 #define KV_WAL_MAGIC "QKV2"
 #define KV_WAL_MAGIC_REPLICA "QKV3"
+#define KV_WAL_MAGIC_LOCAL_SEQ "QKV4"
 #define KV_REPLICA_CURSOR_MAGIC "QRC1"
 #define KV_REPLICA_CURSOR_MAX_ITEMS 4096u
 #define KV_REPLICA_CURSOR_MAX_ID 128u
@@ -52,6 +53,20 @@ static void replica_install_test_crash_point(const char* point) {
 }
 #else
 #define replica_install_test_crash_point(point) ((void)(point))
+#endif
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+static bool aimem_durability_test_fail_once(const char* point) {
+    static bool fired;
+    const char* selected = getenv("QIHSE_AIMEM_FAIL_AT");
+    if (!fired && selected && point && strcmp(selected, point) == 0) {
+        fired = true;
+        errno = EIO;
+        return true;
+    }
+    return false;
+}
+#else
+#define aimem_durability_test_fail_once(point) false
 #endif
 #define KV_HEADER_LINE_MAX 256u
 
@@ -514,6 +529,7 @@ static bool finish_file(FILE* f) {
     if (!f) return false;
     bool ok = fflush(f) == 0;
     int fd = fileno(f);
+    if (ok && aimem_durability_test_fail_once("sstable-file-fsync")) ok = false;
     if (ok && fd >= 0 && fsync(fd) != 0) ok = false;
     if (fclose(f) != 0) ok = false;
     return ok;
@@ -535,7 +551,8 @@ static bool atomic_file_begin(const char* final_path, char* tmp_path, size_t tmp
 static bool atomic_file_commit(FILE* f, const char* tmp_path, const char* final_path) {
     if (!f || !tmp_path || !final_path) return false;
     if (!finish_file(f)) { unlink(tmp_path); return false; }
-    if (rename(tmp_path, final_path) != 0) { unlink(tmp_path); return false; }
+    if (aimem_durability_test_fail_once("sstable-rename") ||
+        rename(tmp_path, final_path) != 0) { unlink(tmp_path); return false; }
     return true;
 }
 
@@ -1064,7 +1081,8 @@ static bool write_memtable_cb(const char* key, void* value, size_t value_size, v
     if (!ctx || !ctx->ok || !key || !value || !ctx->f) return false;
     const kv_payload_t* p = (const kv_payload_t*)value;
     long rec_off = ftell(ctx->f);
-    if (!disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
+    if (aimem_durability_test_fail_once("sstable-record-write") ||
+        !disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
     /* Record the flushed key's metadata so the write/read paths can answer
      * existence and location in memory instead of scanning this file. */
     if (ctx->store && ctx->store->sst_meta) {
@@ -1130,7 +1148,8 @@ static void flush_wal_buffer(qihse_kv_store_t* store) {
 
 static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, const char* value,
                        uint64_t expire_time_ms, uint16_t classification,
-                       uint16_t sci_compartment, uint8_t flags) {
+                       uint16_t sci_compartment, uint8_t flags,
+                       uint64_t change_seq) {
     if (!store || !key) return false;
     if (store->bulk_load_mode) return true;
     if (!store->wal_fd) return false;
@@ -1140,12 +1159,11 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
     if ((flags & ~KV_ALLOWED_FLAGS) != 0u) return false;
     uint16_t key_len = (uint16_t)key_len_sz;
     uint32_t val_len = (uint32_t)val_len_sz;
-    uint64_t crc = wal_record_crc(op, flags, key_len, val_len, classification,
-                                  sci_compartment, expire_time_ms, key, value ? value : "");
-    /* Coalesce the fixed 32-byte header into one buffer so the record is
-     * written with 3 stdio calls (header, key, value) instead of 11. */
-    unsigned char hdr[32];
-    memcpy(hdr + 0, KV_WAL_MAGIC, 4u);
+    if (change_seq == 0u) return false;
+    /* QKV4 carries the stable local mutation LSN. QKV2 remains readable; QKV3
+     * remains the replica frame. */
+    unsigned char hdr[40];
+    memcpy(hdr + 0, KV_WAL_MAGIC_LOCAL_SEQ, 4u);
     hdr[4] = op;
     hdr[5] = flags;
     memcpy(hdr + 6,  &key_len, 2u);
@@ -1153,12 +1171,23 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
     memcpy(hdr + 12, &classification, 2u);
     memcpy(hdr + 14, &sci_compartment, 2u);
     memcpy(hdr + 16, &expire_time_ms, 8u);
-    memcpy(hdr + 24, &crc, 8u);
-    bool ok = fwrite_exact(hdr, 1u, sizeof(hdr), store->wal_fd) &&
+    memcpy(hdr + 24, &change_seq, 8u);
+    uint64_t seq_crc = wal_replica_record_crc(op, flags, key_len, val_len,
+        classification, sci_compartment, expire_time_ms, change_seq,
+        key, value ? value : "");
+    memcpy(hdr + 32, &seq_crc, 8u);
+    if (aimem_durability_test_fail_once("wal-partial-header")) {
+        (void)fwrite(hdr, 1u, sizeof(hdr) / 2u, store->wal_fd);
+        return false;
+    }
+    bool ok = !aimem_durability_test_fail_once("wal-write-header") &&
+              fwrite_exact(hdr, 1u, sizeof(hdr), store->wal_fd) &&
+              !aimem_durability_test_fail_once("wal-write-key") &&
               fwrite_exact(key, 1u, key_len, store->wal_fd) &&
+              !aimem_durability_test_fail_once("wal-write-value") &&
               fwrite_exact(value ? value : "", 1u, val_len, store->wal_fd);
     if (!ok) return false;
-    store->wal_unflushed_bytes += 32u + key_len + val_len;
+    store->wal_unflushed_bytes += sizeof(hdr) + key_len + val_len;
     if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
     return true;
 }
@@ -1685,15 +1714,18 @@ static void recover_from_wal(qihse_kv_store_t* store) {
     if (fd < 0) return;
     FILE* f = fdopen(fd, "rb");
     if (!f) { close(fd); return; }
+    off_t last_good = 0;
     for (;;) {
         int c = fgetc(f);
         if (c == EOF) break;
         if (c == 'Q') {
             char magic[4] = { 'Q', 0, 0, 0 };
             if (fread(magic + 1, 1u, 3u, f) != 3u) break;
-            bool replica = memcmp(magic, KV_WAL_MAGIC_REPLICA, 4u) == 0;
-            if ((!replica && memcmp(magic, KV_WAL_MAGIC, 4u) != 0) ||
-                !wal_replay_new_record(store, f, replica)) break;
+            bool sequenced = memcmp(magic, KV_WAL_MAGIC_REPLICA, 4u) == 0 ||
+                             memcmp(magic, KV_WAL_MAGIC_LOCAL_SEQ, 4u) == 0;
+            if ((!sequenced && memcmp(magic, KV_WAL_MAGIC, 4u) != 0) ||
+                !wal_replay_new_record(store, f, sequenced)) break;
+            last_good = ftello(f);
             continue;
         }
         if (c == 'S') {
@@ -1714,7 +1746,7 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                 if (seq == 0u || !insert_internal(store, key, val, 0u, classification, sci, 0u, seq)) {
                     free(key); free(val); break;
                 }
-                free(key); free(val); continue;
+                free(key); free(val); last_good = ftello(f); continue;
             }
             if (tag[1] == 'E' && tag[2] == 'T' && tag[3] == ' ') {
                 char* line = (char*)malloc(65536);
@@ -1748,6 +1780,7 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                 }
                 free(line);
                 free(rest);
+                last_good = ftello(f);
                 continue;
             }
             break;
@@ -1785,13 +1818,24 @@ static void recover_from_wal(qihse_kv_store_t* store) {
                         (void)insert_internal(store, line, "", 0u, cclass, csci,
                                               KV_FLAG_TOMBSTONE, seq);
                 }
+                last_good = ftello(f);
                 continue;
             }
             break;
         }
         break;
     }
+    off_t end = ftello(f);
     fclose(f);
+    /* A short/invalid final frame is an unacknowledged write tail. Remove it
+     * before opening the append handle so a retry's valid frame is replayable. */
+    if (end >= 0 && last_good >= 0 && end > last_good) {
+        int repair_fd = open(wal_path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (repair_fd >= 0) {
+            if (ftruncate(repair_fd, last_good) == 0) (void)fsync(repair_fd);
+            close(repair_fd);
+        }
+    }
 }
 
 /* Populate the in-memory SSTable metadata index from one on-disk SSTable.
@@ -1914,11 +1958,14 @@ static void kv_store_unlock(qihse_kv_store_t* store) { pthread_rwlock_unlock(&st
 /* Internal (lock-free) implementations, defined below near their public
  * wrappers. */
 static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
-static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
+static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
+                             qihse_user_t* user, uint64_t* out_change_seq);
 
 static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
                                  uint64_t expire_time_ms, uint16_t classification,
-                                 uint16_t sci_compartment, qihse_user_t* user) {
+                                 uint16_t sci_compartment, qihse_user_t* user,
+                                 uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
         !key || !value || key[0] == '\0') return false;
     if (strlen(key) > KV_MAX_KEY_LEN || strlen(value) > KV_MAX_VALUE_LEN) return false;
@@ -1960,17 +2007,28 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
      * or receives one. */
     uint64_t seq = kv_change_seq_next(store);
     if (seq == 0u) return false;
-    if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms, classification, sci_compartment, 0u)) return false;
+    if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms,
+                    classification, sci_compartment, 0u, seq)) return false;
     if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u, seq)) return false;
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
+    if (out_change_seq) *out_change_seq = seq;
     return true;
 }
 
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value,
                        uint16_t classification, uint16_t sci_compartment, qihse_user_t* user) {
+    return qihse_kv_set_user_with_seq(store, key, value, classification,
+                                      sci_compartment, user, NULL);
+}
+
+bool qihse_kv_set_user_with_seq(qihse_kv_store_t* store, const char* key,
+                       const char* value, uint16_t classification,
+                       uint16_t sci_compartment, qihse_user_t* user,
+                       uint64_t* out_change_seq) {
     if (!store) return false;
     kv_store_wrlock(store);
-    bool ok = set_user_with_expiry(store, key, value, 0u, classification, sci_compartment, user);
+    bool ok = set_user_with_expiry(store, key, value, 0u, classification,
+                                   sci_compartment, user, out_change_seq);
     kv_store_unlock(store);
     return ok;
 }
@@ -2002,7 +2060,7 @@ qihse_kv_cas_result_t qihse_kv_compare_set_user(
         return result;
     }
     bool updated = set_user_with_expiry(store, key, new_value, 0u,
-        classification, sci_compartment, user);
+        classification, sci_compartment, user, NULL);
     free(current);
     kv_store_unlock(store);
     return updated ? QIHSE_KV_CAS_UPDATED : QIHSE_KV_CAS_FAILED;
@@ -2056,7 +2114,30 @@ bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
         out->classification = r.classification;
         out->sci_compartment = r.sci_compartment;
         out->expire_time_ms = r.expire_time_ms;
+        out->change_seq = r.change_seq;
         out->flags = r.flags;
+    }
+    lookup_result_free(&r);
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
+                              qihse_user_t* user, uint64_t* out_change_seq,
+                              bool* out_tombstone) {
+    if (out_change_seq) *out_change_seq = 0u;
+    if (out_tombstone) *out_tombstone = false;
+    if (!store || !key || !out_change_seq || !out_tombstone) return false;
+    kv_store_rdlock(store);
+    kv_lookup_result_t r;
+    kv_lookup_state_t state = logical_lookup(store, key, &r);
+    bool tombstone = state == KV_LOOKUP_DEAD && (r.flags & KV_FLAG_TOMBSTONE) != 0u;
+    bool ok = (state == KV_LOOKUP_LIVE || tombstone) &&
+              qihse_auth_can_access(user, r.classification, r.sci_compartment) &&
+              r.change_seq != 0u;
+    if (ok) {
+        *out_change_seq = r.change_seq;
+        *out_tombstone = tombstone;
     }
     lookup_result_free(&r);
     kv_store_unlock(store);
@@ -2073,7 +2154,9 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t
     return true;
 }
 
-static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
+                             qihse_user_t* user, uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     if (!store || !key) return false;
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE) { lookup_result_free(&r); return false; }
@@ -2083,16 +2166,23 @@ static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key, qihse_use
      * delta can carry the deletion. */
     uint64_t seq = kv_change_seq_next(store);
     if (seq == 0u) return false;
-    if (!wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE)) return false;
+    if (!wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci,
+                    KV_FLAG_TOMBSTONE, seq)) return false;
     if (!insert_internal(store, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE, seq)) return false;
     if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
+    if (out_change_seq) *out_change_seq = seq;
     return true;
 }
 
 bool qihse_kv_del_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
+    return qihse_kv_del_user_with_seq(store, key, user, NULL);
+}
+
+bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
+                                qihse_user_t* user, uint64_t* out_change_seq) {
     if (!store || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) || !key) return false;
     kv_store_wrlock(store);
-    bool ok = kv_del_user_impl(store, key, user);
+    bool ok = kv_del_user_impl(store, key, user, out_change_seq);
     kv_store_unlock(store);
     return ok;
 }
@@ -2225,7 +2315,8 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
     uint64_t expire = current_time_ms();
     if (UINT64_MAX - expire < ttl_ms) { lookup_result_free(&r); kv_store_unlock(store); return false; }
     expire += ttl_ms;
-    bool ok = set_user_with_expiry(store, key, r.value, expire, r.classification, r.sci_compartment, user);
+    bool ok = set_user_with_expiry(store, key, r.value, expire, r.classification,
+                                   r.sci_compartment, user, NULL);
     lookup_result_free(&r); kv_store_unlock(store); return ok;
 }
 
@@ -2271,7 +2362,8 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
              * delta consumer learns the key is gone. */
             uint64_t seq = kv_change_seq_next(store);
             if (seq == 0u) continue;
-            (void)wal_append(store, KV_WAL_OP_DEL, keys[i], "", 0u, c, s, KV_FLAG_TOMBSTONE);
+            (void)wal_append(store, KV_WAL_OP_DEL, keys[i], "", 0u, c, s,
+                             KV_FLAG_TOMBSTONE, seq);
             (void)insert_internal(store, keys[i], "", 0u, c, s, KV_FLAG_TOMBSTONE, seq);
         }
     }
@@ -2484,6 +2576,7 @@ size_t qihse_kv_count(qihse_kv_store_t* store) { return qihse_kv_count_user(stor
 /* fsync a directory so renames inside it survive power loss. */
 static bool fsync_dir_path(const char* dir) {
     if (!dir) return false;
+    if (aimem_durability_test_fail_once("directory-fsync")) return false;
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return false;
     bool ok = fsync(fd) == 0;
@@ -2498,8 +2591,10 @@ bool qihse_kv_sync_store(qihse_kv_store_t* store) {
      * fsync the WAL lives only in the page cache -- fine against process
      * death, lost on power loss; SAVE promises both. */
     if (store->wal_fd) {
+        if (aimem_durability_test_fail_once("wal-fflush")) { kv_store_unlock(store); return false; }
         if (fflush(store->wal_fd) != 0) { kv_store_unlock(store); return false; }
         int wfd = fileno(store->wal_fd);
+        if (aimem_durability_test_fail_once("wal-fsync")) { kv_store_unlock(store); return false; }
         if (wfd >= 0 && fsync(wfd) != 0) { kv_store_unlock(store); return false; }
         store->wal_unflushed_bytes = 0u;
     }
@@ -2564,7 +2659,7 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
         }
     }
     size_t removed = 0u;
-    if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (kv_del_user_impl(store, ctx.keys[i], user)) removed++;
+    if (ctx.ok) for (size_t i = 0; i < ctx.count; i++) if (kv_del_user_impl(store, ctx.keys[i], user, NULL)) removed++;
     for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
     free(ctx.keys);
     /* Physically purge the SSTable copies of everything just tombstoned —

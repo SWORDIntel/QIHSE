@@ -235,6 +235,15 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
     qihse_resp_server_t* server, qihse_user_t* user, const char* text,
     uint32_t kind, const char* idempotency_key,
     char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+/* Same retry-safe admission with the stable KV mutation LSN for the canonical
+ * memory row. A replay returns the row's original LSN. */
+qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent_with_seq(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq);
+bool qihse_ai_memory_change_seq(qihse_resp_server_t* server,
+        qihse_user_t* user, const char* id, uint64_t* out_change_seq,
+        bool* out_tombstone);
 
 /* QH-01 scoped variants. Scope is mandatory and project must be nonempty.
  * Scoped records are never visible through legacy global AIMEM reads. */
@@ -302,6 +311,12 @@ bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user,
  * the id; recall skips records whose KV entry is gone. */
 bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
                             const char* id);
+/* Idempotent receipt variant: returns the tombstone LSN on both the initial
+ * delete and retries after the row is already tombstoned. `out_removed` is
+ * false on such a retry. */
+bool qihse_ai_memory_forget_with_seq(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* id, bool* out_removed,
+    uint64_t* out_change_seq);
 
 /* How many memories the caller can see. */
 size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user);

@@ -332,15 +332,15 @@ static void verify_migration_recovery(const char* id) {
     qihse_kv_store_destroy(store);
 }
 
-static void fail_sstable_boundary_then_kill(int pipe_fd) {
+static void fail_wal_fsync_boundary_then_kill(int pipe_fd) {
     open_instance();
-    char moved_root[96];
-    snprintf(moved_root, sizeof moved_root, "%s-moved", data_root);
     assert(qihse_kv_set_user(store, "qh00-sync-boundary", FAULT_TEXT,
                              0u, 0u, operator_user));
-    assert(rename(data_root, moved_root) == 0);
+    /* Inject a real fsync error after the WAL record has been admitted. The
+     * RESP durable adapter must withhold its ACK, and restart must replay the
+     * retained WAL mutation. The failpoint exists only in this test build. */
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "wal-fsync", 1) == 0);
     bool durable = qihse_kv_sync_store(store);
-    assert(rename(moved_root, data_root) == 0);
     assert(!durable);
     qihse_audit_flush();
     write_exact(pipe_fd, "F", 1u);
@@ -491,7 +491,7 @@ int main(void) {
     assert(pid >= 0);
     if (pid == 0) {
         close(fault_pipe[0]);
-        fail_sstable_boundary_then_kill(fault_pipe[1]);
+        fail_wal_fsync_boundary_then_kill(fault_pipe[1]);
     }
     close(fault_pipe[1]);
     read_exact(fault_pipe[0], &marker, 1u);
