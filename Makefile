@@ -312,6 +312,10 @@ test-auth-verifier-cache: lib
 	$(CC) $(CFLAGS) -o tests/test_auth_verifier_cache tests/test_auth_verifier_cache.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_auth_verifier_cache
 
+test-standalone-credentials: lib
+	$(CC) $(CFLAGS) -o tests/test_standalone_credentials tests/test_standalone_credentials.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_standalone_credentials
+
 test-auth-volume-limit: lib
 	$(CC) $(CFLAGS) -o tests/test_auth_volume_limit tests/test_auth_volume_limit.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_auth_volume_limit

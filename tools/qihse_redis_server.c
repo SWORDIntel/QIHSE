@@ -11,6 +11,9 @@
 #include <strings.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#include <openssl/crypto.h>
 
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
@@ -28,13 +31,102 @@ typedef struct {
     uint16_t channel_classification;
     uint16_t channel_sci;
     bool require_auth;
-    const char* operator_password;
+    /* Parsed bootstrap identity; passed into the RESP service-principal gate
+     * when that configuration field is present in the integration branch. */
+    uint32_t aimem_service_user_id;
     const char* embedder_onnx;  /* NULL = built-in lexical embedder */
     const char* artifact_blob_dir;
     const char* artifact_staging_dir;
     const char* forensic_vdb_path;
 } server_options_t;
 
+#define QIHSE_STANDALONE_SECRET_MAX 256u
+#define QIHSE_AIMEM_SERVICE_DEFAULT_USER_ID 65000u
+#define QIHSE_AIMEM_SERVICE_DEFAULT_TENANT_ID 1u
+
+typedef struct {
+    char operator_password[QIHSE_STANDALONE_SECRET_MAX];
+    char aimem_service_password[QIHSE_STANDALONE_SECRET_MAX];
+    bool operator_set;
+    bool aimem_service_set;
+} standalone_credentials_t;
+
+static void standalone_cleanse_env(const char* name) {
+    char* value = getenv(name);
+    if (value) OPENSSL_cleanse(value, strlen(value));
+    unsetenv(name);
+}
+
+static void standalone_credentials_clear(standalone_credentials_t* credentials) {
+    standalone_cleanse_env("QIHSE_OPERATOR_PASSWORD");
+    standalone_cleanse_env("QIHSE_AUTH_PASSWORD");
+    standalone_cleanse_env("QIHSE_AIMEM_SERVICE_PASSWORD");
+    if (credentials) OPENSSL_cleanse(credentials, sizeof(*credentials));
+}
+
+static bool standalone_secret_copy(char out[QIHSE_STANDALONE_SECRET_MAX],
+                                   bool* configured, const char* value) {
+    if (!out || !configured || !value || !*value) return false;
+    size_t len = strlen(value);
+    if (len >= QIHSE_STANDALONE_SECRET_MAX) return false;
+    memcpy(out, value, len + 1u);
+    *configured = true;
+    return true;
+}
+
+/* Command-line secrets are supported for compatibility only. argv storage is
+ * writable on the supported Unix targets; erase it as soon as the daemon owns
+ * a private mutable copy so process listings cannot retain the value. */
+static bool standalone_secret_take_argv(
+        char out[QIHSE_STANDALONE_SECRET_MAX], bool* configured, char* value) {
+    if (!value) return false;
+    size_t len = strlen(value);
+    bool ok = len > 0u && len < QIHSE_STANDALONE_SECRET_MAX;
+    if (ok) {
+        memcpy(out, value, len + 1u);
+        *configured = true;
+    }
+    OPENSSL_cleanse(value, len);
+    return ok;
+}
+
+static bool standalone_parse_nonzero_id(const char* variable,
+                                        uint32_t default_value,
+                                        uint32_t maximum,
+                                        uint32_t* out) {
+    if (!out) return false;
+    const char* text = getenv(variable);
+    if (!text || !*text) {
+        *out = default_value;
+        return true;
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || !end || *end || value == 0ul || value > maximum) return false;
+    *out = (uint32_t)value;
+    return true;
+}
+
+/* Isolated integration point for the standalone AIMEM identity. The RESP
+ * server configuration has no service-principal field: registering this
+ * authoritative principal before server creation makes regular named AUTH
+ * resolve it while keeping it non-Operator and bounded by row labels. */
+static qihse_user_t* standalone_bootstrap_aimem_service(
+        const char* password, uint32_t tenant_id, uint32_t user_id) {
+    qihse_user_t* operator_user = qihse_auth_get_user(0u);
+    if (!operator_user || !password || !*password || tenant_id == 0u ||
+        qihse_auth_get_user(user_id))
+        return NULL;
+    qihse_user_t* service = qihse_auth_create_tenant_user(
+        operator_user, tenant_id, user_id, QIHSE_ROLE_ANALYST,
+        UINT16_MAX, UINT16_MAX, password, false);
+    if (!service || !qihse_auth_modify_user(operator_user, user_id,
+            "AIMEM_SERVICE", NULL, -1, -1, -1, -1)) return NULL;
+    return qihse_auth_authenticate("AIMEM_SERVICE", password);
+}
+
+#ifndef QIHSE_STANDALONE_CREDENTIAL_TEST
 static void usage(const char* program) {
     fprintf(stderr,
             "Usage: %s [options]\n"
@@ -43,6 +135,9 @@ static void usage(const char* program) {
             "  --dir PATH        persistence directory (default /var/lib/qihse or $QIHSE_DATA_DIR)\n"
             "  --require-auth    require AUTH per connection\n"
             "  --password PASS   operator password (prefer QIHSE_OPERATOR_PASSWORD env; avoid argv exposure)\n"
+            "                     AIMEM service password: QIHSE_AIMEM_SERVICE_PASSWORD\n"
+            "                     stable service ID: QIHSE_AIMEM_SERVICE_USER_ID (default 65000)\n"
+            "                     dedicated tenant: QIHSE_AIMEM_SERVICE_TENANT_ID (default 1)\n"
             "  --pubsub-dir PATH durable pub/sub event-stream directory (default: in-memory pub/sub)\n"
             "  --channel-classif N   classification tag applied to pub/sub channels (default 0)\n"
             "  --channel-sci N       SCI compartment mask applied to pub/sub channels (default 0)\n"
@@ -72,8 +167,11 @@ static void* uwp_run_thread(void* argument) {
 int main(int argc, char** argv) {
     server_options_t options;
     memset(&options, 0, sizeof(options));
+    standalone_credentials_t credentials;
+    memset(&credentials, 0, sizeof(credentials));
     options.port = 6379;
     options.bind = "127.0.0.1";
+    options.aimem_service_user_id = UINT32_MAX;
     const char* data_dir = getenv("QIHSE_DATA_DIR");
     if (!data_dir) data_dir = "/var/lib/qihse";
 
@@ -88,47 +186,70 @@ int main(int argc, char** argv) {
         else if (strcmp(arg, "--channel-classif") == 0 && has_next) options.channel_classification = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--channel-sci") == 0 && has_next) options.channel_sci = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--require-auth") == 0) options.require_auth = true;
-        else if (strcmp(arg, "--password") == 0 && has_next) options.operator_password = argv[++i];
+        else if (strcmp(arg, "--password") == 0 && has_next) {
+            if (!standalone_secret_take_argv(credentials.operator_password,
+                    &credentials.operator_set, argv[++i])) {
+                fprintf(stderr, "--password is empty or too long\n");
+                standalone_credentials_clear(&credentials);
+                return 2;
+            }
+        }
         else if (strcmp(arg, "--embedder-onnx") == 0 && has_next) options.embedder_onnx = argv[++i];
         else if (strcmp(arg, "--artifact-blob-dir") == 0 && has_next) options.artifact_blob_dir = argv[++i];
         else if (strcmp(arg, "--artifact-staging-dir") == 0 && has_next) options.artifact_staging_dir = argv[++i];
         else if (strcmp(arg, "--forensic-vdb") == 0 && has_next) options.forensic_vdb_path = argv[++i];
-        else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown or incomplete option: %s\n", arg); usage(argv[0]); return 2; }
-    }
-
-    static char s_file_pw[256];
-    if (!options.operator_password) {
-        const char* env_pw = getenv("QIHSE_OPERATOR_PASSWORD");
-        if (env_pw && *env_pw) {
-            options.operator_password = env_pw;
+        else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            usage(argv[0]);
+            standalone_credentials_clear(&credentials);
+            return 0;
         } else {
-            FILE* ef = fopen("/etc/qihse/cluster-node0.env", "r");
-            if (ef) {
-                char line[512];
-                while (fgets(line, sizeof(line), ef)) {
-                    if (strncmp(line, "QIHSE_OPERATOR_PASSWORD=", 24) == 0) {
-                        char* p = line + 24;
-                        p[strcspn(p, "\r\n")] = '\0';
-                        if (strlen(p) >= 12 && strlen(p) < sizeof(s_file_pw)) {
-                            snprintf(s_file_pw, sizeof(s_file_pw), "%s", p);
-                            options.operator_password = s_file_pw;
-                            break;
-                        }
-                    }
-                }
-                fclose(ef);
-            }
+            fprintf(stderr, "Unknown or incomplete option: %s\n", arg);
+            usage(argv[0]);
+            standalone_credentials_clear(&credentials);
+            return 2;
         }
     }
 
+    if (!credentials.operator_set) {
+        const char* env_pw = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (env_pw && *env_pw) {
+            standalone_secret_copy(credentials.operator_password,
+                                   &credentials.operator_set, env_pw);
+        } else if (getenv("QIHSE_AUTH_USER") &&
+                   strcmp(getenv("QIHSE_AUTH_USER"), "GODMODE_OP") == 0 &&
+                   getenv("QIHSE_AUTH_PASSWORD")) {
+            standalone_secret_copy(credentials.operator_password,
+                                   &credentials.operator_set,
+                                   getenv("QIHSE_AUTH_PASSWORD"));
+        }
+    }
+    const char* auth_user = getenv("QIHSE_AUTH_USER");
+    bool aimem_service_requested =
+        getenv("QIHSE_AIMEM_SERVICE_PASSWORD") != NULL ||
+        getenv("QIHSE_AIMEM_SERVICE_USER_ID") != NULL ||
+        getenv("QIHSE_AIMEM_SERVICE_TENANT_ID") != NULL ||
+        (auth_user && strcmp(auth_user, "AIMEM_SERVICE") == 0);
+    const char* aimem_password = getenv("QIHSE_AIMEM_SERVICE_PASSWORD");
+    if ((!aimem_password || !*aimem_password) && auth_user &&
+        strcmp(auth_user, "AIMEM_SERVICE") == 0)
+        aimem_password = getenv("QIHSE_AUTH_PASSWORD");
+    if (aimem_password && *aimem_password &&
+        !standalone_secret_copy(credentials.aimem_service_password,
+                                &credentials.aimem_service_set, aimem_password)) {
+        fprintf(stderr, "AIMEM service password is too long\n");
+        standalone_credentials_clear(&credentials);
+        return 2;
+    }
+    if (aimem_service_requested && !credentials.aimem_service_set) {
+        fprintf(stderr, "AIMEM service mode requires QIHSE_AIMEM_SERVICE_PASSWORD or QIHSE_AUTH_PASSWORD\n");
+        standalone_credentials_clear(&credentials);
+        return 2;
+    }
+
     if (options.require_auth) {
-        if (!options.operator_password) options.operator_password = getenv("QIHSE_OPERATOR_PASSWORD");
-        if (!options.operator_password && getenv("QIHSE_AUTH_USER") &&
-            strcmp(getenv("QIHSE_AUTH_USER"), "GODMODE_OP") == 0)
-            options.operator_password = getenv("QIHSE_AUTH_PASSWORD");
-        if (!options.operator_password) {
-            fprintf(stderr, "--require-auth requires QIHSE_OPERATOR_PASSWORD, QIHSE_AUTH_PASSWORD, --password, or /etc/qihse/cluster-node0.env\n");
+        if (!credentials.operator_set) {
+            fprintf(stderr, "--require-auth requires QIHSE_OPERATOR_PASSWORD, QIHSE_AUTH_PASSWORD, or --password\n");
+            standalone_credentials_clear(&credentials);
             return 2;
         }
         /* Non-loopback binds without auth are rejected by the engine itself. */
@@ -138,8 +259,14 @@ int main(int argc, char** argv) {
             !options.require_auth ||
             (strcmp(options.bind, "127.0.0.1") != 0 && strcmp(options.bind, "::1") != 0)) {
             fprintf(stderr, "artifact upload requires both directories, --require-auth, and a loopback bind\n");
+            standalone_credentials_clear(&credentials);
             return 2;
         }
+    }
+    if (aimem_service_requested && !options.require_auth) {
+        fprintf(stderr, "AIMEM service credentials require --require-auth\n");
+        standalone_credentials_clear(&credentials);
+        return 2;
     }
     if (!options.embedder_onnx) options.embedder_onnx = getenv("QIHSE_AIMEM_EMBEDDER_ONNX");
     if (options.embedder_onnx && *options.embedder_onnx &&
@@ -147,42 +274,75 @@ int main(int argc, char** argv) {
         /* Fail closed: serving semantic recall on the lexical hash while an
          * operator asked for the real model would be a silent downgrade. */
         fprintf(stderr, "[qihse-redis-server] ONNX embedder install failed for %s\n", options.embedder_onnx);
+        standalone_credentials_clear(&credentials);
         return 1;
     }
 
     setenv("QIHSE_DATA_DIR", data_dir, 1);
+    if (credentials.operator_set) {
+        const char* current = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (!current || strcmp(current, credentials.operator_password) != 0) {
+            /* If argv or QIHSE_AUTH_PASSWORD won precedence, erase a stale
+             * operator environment value before publishing the owned copy. */
+            standalone_cleanse_env("QIHSE_OPERATOR_PASSWORD");
+            if (setenv("QIHSE_OPERATOR_PASSWORD",
+                       credentials.operator_password, 1) != 0) {
+                fprintf(stderr, "[qihse-redis-server] operator credential setup failed\n");
+                standalone_credentials_clear(&credentials);
+                return 1;
+            }
+        }
+    }
     if (!qihse_auth_init()) {
         fprintf(stderr, "[qihse-redis-server] auth subsystem init failed\n");
-        return 1;
-    }
-
-    qihse_kv_store_t* store = qihse_kv_store_create();
-    qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
-    if (!store || !vdb) {
-        fprintf(stderr, "[qihse-redis-server] engine initialization failed\n");
+        standalone_credentials_clear(&credentials);
         return 1;
     }
 
     if (options.require_auth) {
         qihse_user_t* operator_user = qihse_auth_get_user(0);
         if (operator_user && qihse_auth_is_operator_password_default()) {
-            if (!qihse_auth_bootstrap_operator(options.operator_password)) {
+            if (!qihse_auth_bootstrap_operator(credentials.operator_password)) {
                 fprintf(stderr, "[qihse-redis-server] operator password bootstrap failed (min 12 chars)\n");
+                standalone_credentials_clear(&credentials);
                 return 1;
             }
-        } else if (operator_user) {
-            /* Already configured: never silently ignore --password. An
-             * idempotent restart must present the configured password; a
-             * stale one is a loud refusal, not a quiet serve-with-old. */
-            qihse_user_t* check = qihse_auth_authenticate_id(0, options.operator_password);
-            if (!check) {
-                fprintf(stderr,
-                        "[qihse-redis-server] --password rejected: the operator password is "
-                        "already configured and does not match. Rotate at runtime with "
-                        "operator credentials (USER.MODIFY) or start against a fresh --dir.\n");
-                return 2;
-            }
+        } else if (operator_user &&
+                   !qihse_auth_authenticate_id(0, credentials.operator_password)) {
+            fprintf(stderr,
+                    "[qihse-redis-server] --password rejected: the operator password is "
+                    "already configured and does not match. Rotate at runtime with "
+                    "operator credentials (USER.MODIFY) or start against a fresh --dir.\n");
+            standalone_credentials_clear(&credentials);
+            return 2;
         }
+    }
+    if (credentials.aimem_service_set) {
+        uint32_t service_tenant_id = 0u;
+        if (!standalone_parse_nonzero_id("QIHSE_AIMEM_SERVICE_USER_ID",
+                QIHSE_AIMEM_SERVICE_DEFAULT_USER_ID, 65535u,
+                &options.aimem_service_user_id) ||
+            !standalone_parse_nonzero_id("QIHSE_AIMEM_SERVICE_TENANT_ID",
+                QIHSE_AIMEM_SERVICE_DEFAULT_TENANT_ID, UINT32_MAX - 1u,
+                &service_tenant_id) ||
+            !standalone_bootstrap_aimem_service(
+                credentials.aimem_service_password, service_tenant_id,
+                options.aimem_service_user_id)) {
+            fprintf(stderr, "[qihse-redis-server] AIMEM service principal bootstrap failed\n");
+            standalone_credentials_clear(&credentials);
+            return 1;
+        }
+    }
+    /* Password verifiers and the optional service principal now own all state
+     * required for AUTH. Remove environment and temporary plaintext copies
+     * before initializing any long-lived store, server, or worker thread. */
+    standalone_credentials_clear(&credentials);
+
+    qihse_kv_store_t* store = qihse_kv_store_create();
+    qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
+    if (!store || !vdb) {
+        fprintf(stderr, "[qihse-redis-server] engine initialization failed\n");
+        return 1;
     }
 
     qihse_resp_server_config_t config;
@@ -266,3 +426,4 @@ int main(int argc, char** argv) {
     qihse_blob_store_destroy(artifact_blobs);
     return 0;
 }
+#endif
