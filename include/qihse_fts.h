@@ -17,6 +17,14 @@ typedef struct {
     qihse_keystone_class_t semantic_class;
 } qihse_fts_result_t;
 
+/* Optional live policy check applied to each document before corpus
+ * statistics or top-K selection. Use this for scope and membership rules that
+ * may change independently of a persisted FTS projection. */
+typedef bool (*qihse_fts_visibility_fn)(uint64_t doc_id,
+                                       uint16_t classification,
+                                       uint16_t sci_compartment,
+                                       void* user_data);
+
 qihse_fts_index_t* qihse_fts_create(void);
 void qihse_fts_destroy(qihse_fts_index_t* index);
 
@@ -63,6 +71,18 @@ int qihse_fts_search_user_filtered(
     qihse_fts_result_t* results,
     int top_k,
     uint8_t semantic_class_mask);
+
+/* Authorization plus caller policy. The callback is part of the visibility
+ * bitmap, so denied rows do not affect N, document frequency, average length,
+ * scores, result count, or top-K. */
+int qihse_fts_search_user_visible(
+    qihse_fts_index_t* index,
+    const char* query,
+    qihse_user_t* user,
+    qihse_fts_result_t* results,
+    int top_k,
+    qihse_fts_visibility_fn visible,
+    void* user_data);
 
 qihse_keystone_class_t qihse_fts_get_doc_semantic_class_user(
     qihse_fts_index_t* index,

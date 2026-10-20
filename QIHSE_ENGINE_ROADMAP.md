@@ -89,8 +89,23 @@ record and vector projection. Exact retries recognize the destination;
 mismatches fail closed. The wire regression denies a low-clearance caller
 without returning protected content. A restart regression reconstructs the
 destination-first/source-still-present crash state and verifies retry completes
-the deletion without changing the scoped record. Persistent scope indexes and
-hierarchy restart/load evidence remain open.
+the deletion without changing the scoped record.
+
+**Persistent scoped index:** BM25 uses an FTS projection keyed by tenant,
+authenticated principal and role/clearance/SCI, canonical scope coordinates,
+and kind filter. Save/load operations use that principal. Its generation marker records the
+KV change sequence. A missing/stale marker or invalid projection triggers a
+rebuild from authorization-aware tenant-prefix enumeration; the projection is
+saved atomically before the marker is replaced and the containing directory is
+fsynced. A torn update therefore causes rebuild. The persisted projection may
+contain records from several owners, so a live FTS predicate checks current
+clearance, SCI, project owner/grant, canonical scope, and kind *before* corpus
+statistics and top-K selection. Canonical records are re-read and checked
+again before return. Semantic vectors remain computed from authorized scoped
+records on demand. `make test-aimem-scope-index` exercises hierarchy boundaries
+after store reopen, checks that an ungranted owner's 48 matching records do not
+change the caller's BM25 score, and reports P50/P95 recall for a 512-record,
+eight-project corpus after projection reload.
 
 **Acceptance:** Concurrent 10-agent test with same authenticated principal and multiple repos; each scoped query returns only its own authorized hits. Repeat with another principal and disjoint SCI compartments; no cross-scope/label influence on rank, count, zero-result response or pagination. Deliberately typo the project and assert rejection, not fallback.
 
