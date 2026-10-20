@@ -4041,17 +4041,6 @@ qihse_ai_memory_import_result_t qihse_ai_memory_import_stream(
     free(data); return result;
 }
 
-typedef struct { qihse_resp_server_t* server; qihse_user_t* user;
-    const qihse_ai_memory_scope_t* scope; bool valid; } aimem_index_rebuild_validate_t;
-static bool aimem_rebuild_validate_cb(const char* key, const char* value, void* opaque) {
-    (void)key; aimem_index_rebuild_validate_t* b = opaque; aimem_knowledge_chain_t chain;
-    if (!aimem_knowledge_chain_parse(value, &chain)) { b->valid = false; return false; }
-    qihse_kv_store_t* store = qihse_resp_server_store(b->server);
-    if (aimem_scope_matches(&chain.scope, b->scope) &&
-        !aimem_scope_owner_allowed(store, b->user, chain.owner_id, b->scope)) b->valid = false;
-    aimem_knowledge_chain_free(&chain); return b->valid;
-}
-
 static bool aimem_index_state_key(char* out, size_t cap, qihse_user_t* user,
                                   const qihse_ai_memory_scope_t* scope) {
     char canonical[4u * (QIHSE_AIMEM_SCOPE_ID_MAX + 1u) + 4u], digest[65];
