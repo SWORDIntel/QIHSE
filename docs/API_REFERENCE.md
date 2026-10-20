@@ -805,11 +805,15 @@ Source: `src/spinnaker/qihse_ai_memory.c`.
 Tests: `tests/test_ai_memory.c` (`make test-ai-memory`, including the RBAC
 negative test) and `tests/test_ai_memory_embed.c`
 (`make test-ai-memory-embed`); also the `fabric-semantic-recall` workload in
-`tests/gold/pack.v1.gold`.
+`tests/gold/pack.v1.gold`. W10 coverage is grouped by `make test-w10-aimem`;
+`tests/test_aimem_knowledge.c` covers QH-04 lineage, competing writers,
+temporal reads, project grants and low-clearance/high-data denial.
 
-Records live in the `aimem:` KV namespace and are indexed by the FTS engine for
-recall; vectors are stored under `aimemv:<id>`, bound to the name of the
-embedder that produced them. Every entry point takes an explicit security
+Legacy records live in the system-domain `aimem:` KV namespace. Scoped records
+and their idempotency keys use tenant-prefixed namespaces, and are indexed for
+authorized scope recall; vectors are stored under `aimemv:<id>`, bound to the
+name of the embedder that produced them. Tenant principals cannot use legacy
+unscoped APIs. Every entry point takes an explicit security
 context — there is no context-free variant — and every ranking mode resolves
 candidates through the same authorization-aware read, so no mode can rank,
 score, or even count a record the principal cannot see.
@@ -825,6 +829,22 @@ score, or even count a record the principal cannot see.
 | `bool qihse_ai_memory_get(qihse_resp_server_t* server, qihse_user_t* user, const char* id, qihse_ai_memory_hit_t* out)` | Fetch one memory by id (RBAC enforced by the store). | `false` |
 | `bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user, const char* id)` | Delete the record. The search index may retain a stale posting; recall skips records whose KV entry is gone. | `false` |
 | `size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user)` | How many memories the caller can see. | `0` |
+| `bool qihse_ai_memory_store_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, uint32_t, const qihse_ai_memory_scope_t*, char out_id[QIHSE_AIMEM_ID_LEN + 1u])` | Store a versioned record under a required project and optional worktree, workstream and session coordinates; bind ownership to the authenticated actor. | `false` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(qihse_resp_server_t*, qihse_user_t*, const char*, uint32_t, const qihse_ai_memory_scope_t*, const char*, char out_id[QIHSE_AIMEM_ID_LEN + 1u])` | Retry-safe scoped admission. The deterministic identity includes tenant, actor, scope and idempotency key. | `QIHSE_AIMEM_WRITE_FAILED` or `QIHSE_AIMEM_WRITE_CONFLICT` |
+| `size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, size_t, qihse_ai_memory_mode_t, uint32_t, const qihse_ai_memory_scope_t*, qihse_ai_memory_hit_t*, size_t)` | BM25, semantic or hybrid recall over an authenticated scope-filtered corpus. Classification, SCI, actor and scope checks precede candidate ranking. | `0` |
+| `bool qihse_ai_memory_get_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, const qihse_ai_memory_scope_t*, qihse_ai_memory_hit_t*)` | Direct-ID read constrained to the requested scope and owner, explicit project reader grant, or Operator context; record labels still apply. | `false` |
+| `bool qihse_ai_memory_forget_scoped(qihse_resp_server_t*, qihse_user_t*, const char*, const qihse_ai_memory_scope_t*)` | Delete only by the record owner or Operator; a read grant does not grant delete authority. | `false` |
+| `size_t qihse_ai_memory_count_scoped(qihse_resp_server_t*, qihse_user_t*, uint32_t, const qihse_ai_memory_scope_t*)` | Count only classified/SCI-visible records in the requested scope and actor boundary. | `0` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_event_append(...)` | Append a bounded registered `QHEV1` lifecycle event with immutable producer/event identity, source/receive times and summary digest. The RESP wrapper provides the durable ACK fence. | `WRITE_FAILED` or `WRITE_CONFLICT` |
+| `bool qihse_ai_memory_event_get(...)` | Read and verify the event envelope through scoped, classification/SCI-authorized retrieval. | `false` |
+| `bool qihse_ai_memory_project_grant(...)` / `..._project_revoke(...)` | Add/remove durable, same-tenant read membership for a project. Grants do not bypass per-record labels and do not permit a grantee to delete another owner's record. | `false` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(...)` | System-Operator-only two-phase migration from a legacy global record into an explicit scope. Preserves UUID, timestamp, kind, payload and labels; fences the destination before deleting and fencing the source. Exact retries return `WRITE_REPLAY`. | `WRITE_FAILED` or `WRITE_CONFLICT` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create(...)` | Create revision 1 of a bounded tenant-scoped `QHK1` knowledge chain. Only an Operator may create directly in approved state. The RESP command fsyncs before acknowledging. | `WRITE_FAILED` or `WRITE_CONFLICT` |
+| `qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(...)` | Atomically close the expected predecessor and append one successor using the authorization-aware KV compare-and-set primitive. The expected version and revision prevent lost updates. Project read grants do not grant revision authority. | `WRITE_FAILED` or `WRITE_CONFLICT` |
+| `bool qihse_ai_memory_knowledge_get(...)` | Resolve an exact historical version through authenticated tenant, scope, classification and SCI checks. | `false` |
+| `bool qihse_ai_memory_knowledge_latest(...)` | Read the current version of a named knowledge chain through the same authorization boundary. | `false` |
+| `bool qihse_ai_memory_knowledge_as_of(...)` | Read the version whose half-open ingestion interval contains the requested timestamp. | `false` |
+| `void qihse_ai_memory_knowledge_free(...)` | Release content owned by a returned knowledge-version value. | n/a |
 | `bool qihse_aimem_onnx_embedder_install(const char* model_dir)` (`qihse_aimem_onnx_embedder.h`) | Load an ONNX BERT-family model (`model.onnx` + `vocab.txt`) and install it as the active embedder (name `onnx:<dir>`). The standalone server calls this for `--embedder-onnx`; failure is fatal there. | `false` on any error; built-in embedder remains active |
 | `void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count)` | Release the `text` of every hit. | n/a |
 | `void qihse_ai_memory_reset(void)` | Drop the process-local search index (tests / shutdown). | n/a |
@@ -1277,6 +1297,7 @@ Federation and operations state is namespaced inside the caller's KV store:
 | `security/audit/<node>/<service>/<hlc>` | self-audit evidence records |
 | `aimem:` | AI memory records (FTS-indexed) |
 | `aimemv:<id>` | AI memory embedding vectors, bound to the embedder name that produced them |
+| `t:<tenant>/aimem-knowledge:<uuid>` | Bounded `QHK1` immutable knowledge-version chain; classification and SCI remain in KV metadata |
 | `fabric:ingest:<job-id>` | fabric artifacts indexed through KEYSTONE |
 | `fabric:job:<job-id>` | fabric job records, and the result `FABRIC.RESULT` returns |
 

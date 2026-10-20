@@ -89,6 +89,20 @@ bool qihse_kv_replica_cursor_advance(qihse_kv_store_t* store, const char* peer_i
 
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user);
 
+/* Authorization-aware single-key compare-and-set. expected_value == NULL
+ * means the key must be absent. The comparison and replacement occur under
+ * one store write lock; inaccessible existing records return FAILED rather
+ * than revealing whether they exist. */
+typedef enum {
+    QIHSE_KV_CAS_FAILED = 0,
+    QIHSE_KV_CAS_UPDATED = 1,
+    QIHSE_KV_CAS_MISMATCH = 2
+} qihse_kv_cas_result_t;
+qihse_kv_cas_result_t qihse_kv_compare_set_user(
+    qihse_kv_store_t* store, const char* key, const char* expected_value,
+    const char* new_value, uint16_t classification, uint16_t sci_compartment,
+    qihse_user_t* user);
+
 /* Metadata-only lookup (W7 introspection): reports a live record's
  * classification, SCI compartment, expiry and WAL flags WITHOUT ever
  * returning the value.  The authorization gate is IDENTICAL to

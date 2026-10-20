@@ -5487,6 +5487,174 @@ static bool qihse_resp_handle_memory(qihse_resp_session_t* session, const qihse_
  */
 #define QIHSE_AIMEM_RESP_MAX_TEXT (64u * 1024u)
 #define QIHSE_AIMEM_RESP_MAX_IDEM 128u
+#define QIHSE_AIMEM_HANDOFF_MAX_SUMMARY 4096u
+
+typedef enum {
+    QIHSE_AIMEM_HANDOFF_OPEN = 1,
+    QIHSE_AIMEM_HANDOFF_ACCEPTED,
+    QIHSE_AIMEM_HANDOFF_CANCELLED,
+    QIHSE_AIMEM_HANDOFF_EXPIRED
+} qihse_aimem_handoff_state_t;
+
+typedef struct {
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    uint32_t owner_id;
+    uint32_t recipient_id;
+    uint64_t created_ms;
+    uint64_t expires_ms;
+    uint64_t revision;
+    qihse_aimem_handoff_state_t state;
+    uint32_t accepted_by;
+    qihse_ai_memory_scope_t scope;
+    char* summary;
+} qihse_aimem_handoff_t;
+
+static void qihse_resp_aimem_handoff_free(qihse_aimem_handoff_t* h) {
+    if (!h) return;
+    free(h->summary);
+    memset(h, 0, sizeof(*h));
+}
+
+static const char* qihse_resp_aimem_handoff_state_name(qihse_aimem_handoff_state_t state) {
+    switch (state) {
+        case QIHSE_AIMEM_HANDOFF_OPEN: return "OPEN";
+        case QIHSE_AIMEM_HANDOFF_ACCEPTED: return "ACCEPTED";
+        case QIHSE_AIMEM_HANDOFF_CANCELLED: return "CANCELLED";
+        case QIHSE_AIMEM_HANDOFF_EXPIRED: return "EXPIRED";
+        default: return "";
+    }
+}
+
+static qihse_aimem_handoff_state_t qihse_resp_aimem_handoff_state_parse(const char* text) {
+    if (strcmp(text, "OPEN") == 0) return QIHSE_AIMEM_HANDOFF_OPEN;
+    if (strcmp(text, "ACCEPTED") == 0) return QIHSE_AIMEM_HANDOFF_ACCEPTED;
+    if (strcmp(text, "CANCELLED") == 0) return QIHSE_AIMEM_HANDOFF_CANCELLED;
+    if (strcmp(text, "EXPIRED") == 0) return QIHSE_AIMEM_HANDOFF_EXPIRED;
+    return 0;
+}
+
+static bool qihse_resp_aimem_handoff_summary_valid(const char* text) {
+    if (!text || !*text || strnlen(text, QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 1u) >
+        QIHSE_AIMEM_HANDOFF_MAX_SUMMARY) return false;
+    for (const unsigned char* p = (const unsigned char*)text; *p; p++)
+        if (*p < 0x20u || *p == 0x7fu || *p == '|') return false;
+    return true;
+}
+
+static bool qihse_resp_aimem_handoff_scope_token_valid(const char* text,
+        bool required) {
+    if (!text || (!*text && required) || strlen(text) > QIHSE_AIMEM_SCOPE_ID_MAX)
+        return false;
+    for (const unsigned char* p = (const unsigned char*)text; *p; p++)
+        if (!(isalnum(*p) || *p == '-' || *p == '_' || *p == '.')) return false;
+    return true;
+}
+
+static bool qihse_resp_aimem_handoff_parse(const char* text,
+        qihse_aimem_handoff_t* out) {
+    char state[16];
+    int summary_offset = 0;
+    unsigned long long created = 0u, expires = 0u, revision = 0u;
+    if (!text || !out) return false;
+    memset(out, 0, sizeof(*out));
+    int fields = sscanf(text,
+        "QHH1|%36[^|]|%u|%u|%llu|%llu|%llu|%15[^|]|%u|%63[^|]|%63[^|]|%63[^|]|%63[^|]|%n",
+        out->id, &out->owner_id, &out->recipient_id,
+        &created, &expires, &revision, state, &out->accepted_by,
+        out->scope.project, out->scope.worktree, out->scope.workstream,
+        out->scope.session, &summary_offset);
+    qihse_uuid_t parsed_id;
+    if (fields != 12 || summary_offset <= 0 || !qihse_uuid_parse(out->id, &parsed_id))
+        return false;
+    out->created_ms = (uint64_t)created;
+    out->expires_ms = (uint64_t)expires;
+    out->revision = (uint64_t)revision;
+    out->state = qihse_resp_aimem_handoff_state_parse(state);
+    if (!out->state || !out->owner_id || !out->recipient_id || !out->revision ||
+        out->expires_ms < out->created_ms ||
+        !qihse_resp_aimem_handoff_scope_token_valid(out->scope.project, true) ||
+        !qihse_resp_aimem_handoff_scope_token_valid(out->scope.worktree, false) ||
+        !qihse_resp_aimem_handoff_scope_token_valid(out->scope.workstream, false) ||
+        !qihse_resp_aimem_handoff_scope_token_valid(out->scope.session, false)) return false;
+    out->summary = strdup(text + summary_offset);
+    if (!qihse_resp_aimem_handoff_summary_valid(out->summary)) {
+        qihse_resp_aimem_handoff_free(out);
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_aimem_handoff_encode(const qihse_aimem_handoff_t* h,
+        char* out, size_t cap) {
+    if (!h || !out || !qihse_resp_aimem_handoff_summary_valid(h->summary)) return false;
+    int n = snprintf(out, cap, "QHH1|%s|%u|%u|%llu|%llu|%llu|%s|%u|%s|%s|%s|%s|%s",
+        h->id, (unsigned)h->owner_id, (unsigned)h->recipient_id,
+        (unsigned long long)h->created_ms, (unsigned long long)h->expires_ms,
+        (unsigned long long)h->revision,
+        qihse_resp_aimem_handoff_state_name(h->state), (unsigned)h->accepted_by,
+        h->scope.project, h->scope.worktree, h->scope.workstream, h->scope.session,
+        h->summary);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool qihse_resp_aimem_handoff_key(char* out, size_t cap,
+        qihse_user_t* user, const char* id) {
+    if (!out || !user || !id || !qihse_auth_user_is_active(user)) return false;
+    int n = snprintf(out, cap, "t:%u/aimem-handoff:%s",
+        (unsigned)qihse_user_get_tenant_id(user), id);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool qihse_resp_aimem_emit_handoff(qihse_resp_session_t* session,
+        const qihse_aimem_handoff_t* h) {
+    char owner[16], recipient[16], created[32], expires[32], revision[32], accepted[16];
+    snprintf(owner, sizeof owner, "%u", (unsigned)h->owner_id);
+    snprintf(recipient, sizeof recipient, "%u", (unsigned)h->recipient_id);
+    snprintf(created, sizeof created, "%llu", (unsigned long long)h->created_ms);
+    snprintf(expires, sizeof expires, "%llu", (unsigned long long)h->expires_ms);
+    snprintf(revision, sizeof revision, "%llu", (unsigned long long)h->revision);
+    snprintf(accepted, sizeof accepted, "%u", (unsigned)h->accepted_by);
+    return qihse_resp_array(session, 14u) &&
+           qihse_resp_bulk_text(session, h->id) &&
+           qihse_resp_bulk_text(session, owner) &&
+           qihse_resp_bulk_text(session, recipient) &&
+           qihse_resp_bulk_text(session, created) &&
+           qihse_resp_bulk_text(session, expires) &&
+           qihse_resp_bulk_text(session, revision) &&
+           qihse_resp_bulk_text(session, qihse_resp_aimem_handoff_state_name(h->state)) &&
+           qihse_resp_bulk_text(session, accepted) &&
+           qihse_resp_bulk_text(session, h->scope.project) &&
+           qihse_resp_bulk_text(session, h->scope.worktree) &&
+           qihse_resp_bulk_text(session, h->scope.workstream) &&
+           qihse_resp_bulk_text(session, h->scope.session) &&
+           qihse_resp_bulk_text(session, h->summary) &&
+           qihse_resp_bulk_text(session, "accepted-handoff-stays-accepted");
+}
+
+static bool qihse_resp_aimem_emit_knowledge(qihse_resp_session_t* session,
+        const qihse_ai_memory_knowledge_version_t* value) {
+    char type[16], status[16], revision[32], created[32], from[32], to[32], actor[16];
+    snprintf(type, sizeof type, "%u", (unsigned)value->type);
+    snprintf(status, sizeof status, "%u", (unsigned)value->status);
+    snprintf(revision, sizeof revision, "%llu", (unsigned long long)value->revision);
+    snprintf(created, sizeof created, "%llu", (unsigned long long)value->created_at_ms);
+    snprintf(from, sizeof from, "%llu", (unsigned long long)value->valid_from_ingest_ms);
+    snprintf(to, sizeof to, "%llu", (unsigned long long)value->valid_to_ingest_ms);
+    snprintf(actor, sizeof actor, "%u", (unsigned)value->created_by);
+    return qihse_resp_array(session, 15u) &&
+        qihse_resp_bulk_text(session, value->knowledge_id) &&
+        qihse_resp_bulk_text(session, value->version_id) &&
+        qihse_resp_bulk_text(session, value->supersedes_version) &&
+        qihse_resp_bulk_text(session, type) && qihse_resp_bulk_text(session, status) &&
+        qihse_resp_bulk_text(session, revision) && qihse_resp_bulk_text(session, created) &&
+        qihse_resp_bulk_text(session, from) && qihse_resp_bulk_text(session, to) &&
+        qihse_resp_bulk_text(session, actor) &&
+        qihse_resp_bulk_text(session, value->scope.project) &&
+        qihse_resp_bulk_text(session, value->scope.worktree) &&
+        qihse_resp_bulk_text(session, value->scope.workstream) &&
+        qihse_resp_bulk_text(session, value->scope.session) &&
+        qihse_resp_bulk_text(session, value->content);
+}
 
 static bool qihse_resp_aimem_principal(qihse_resp_session_t* session) {
     return session && session->user && qihse_auth_user_is_active(session->user);
@@ -5507,13 +5675,57 @@ static bool qihse_resp_aimem_u32(const qihse_resp_arg_t* arg, uint32_t* out) {
     return ok;
 }
 
+static bool qihse_resp_aimem_u64(const qihse_resp_arg_t* arg, uint64_t* out) {
+    char* text;
+    char* end;
+    unsigned long long value;
+    if (!arg || !out || arg->len == 0u || arg->len > 20u) return false;
+    text = qihse_resp_arg_text(arg);
+    if (!text) return false;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    bool ok = errno == 0 && end != text && *end == '\0';
+    if (ok) *out = (uint64_t)value;
+    free(text);
+    return ok;
+}
+
 static bool qihse_resp_aimem_idem_valid(const qihse_resp_arg_t* arg) {
     if (!arg || arg->len == 0u || arg->len > QIHSE_AIMEM_RESP_MAX_IDEM) return false;
     for (size_t i = 0; i < arg->len; i++) {
         unsigned char c = arg->data[i];
-        if (!(isalnum(c) || c == '-' || c == '_' || c == '.' || c == ':')) return false;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) return false;
     }
     return true;
+}
+
+static bool qihse_resp_aimem_scope_field(const qihse_resp_arg_t* arg,
+                                         char out[QIHSE_AIMEM_SCOPE_ID_MAX + 1u],
+                                         bool required) {
+    if (!arg || arg->len > QIHSE_AIMEM_SCOPE_ID_MAX ||
+        (required && arg->len == 0u) || memchr(arg->data, '\0', arg->len)) return false;
+    for (size_t i = 0; i < arg->len; i++) {
+        unsigned char c = arg->data[i];
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.')) return false;
+    }
+    if (arg->len) memcpy(out, arg->data, arg->len);
+    out[arg->len] = '\0';
+    return true;
+}
+
+static bool qihse_resp_aimem_scope_parse(const qihse_resp_request_t* request,
+                                         size_t first,
+                                         qihse_ai_memory_scope_t* scope) {
+    memset(scope, 0, sizeof(*scope));
+    if (request->argc < first + 4u ||
+        !qihse_resp_aimem_scope_field(&request->argv[first], scope->project, true) ||
+        !qihse_resp_aimem_scope_field(&request->argv[first + 1u], scope->worktree, false) ||
+        !qihse_resp_aimem_scope_field(&request->argv[first + 2u], scope->workstream, false) ||
+        !qihse_resp_aimem_scope_field(&request->argv[first + 3u], scope->session, false))
+        return false;
+    return (!scope->workstream[0] || scope->worktree[0]) &&
+           (!scope->session[0] || scope->workstream[0]);
 }
 
 static bool qihse_resp_aimem_emit_hit(qihse_resp_session_t* session,
@@ -5550,17 +5762,26 @@ typedef enum {
 
 static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
         qihse_resp_session_t* session, uint32_t kind, const char* text,
-        const char* idem, bool durable, char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+        const char* idem, bool durable,
+        const qihse_ai_memory_scope_t* scope,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
     qihse_kv_store_t* store = qihse_resp_server_store(session->server);
-    char map_key[192];
+    char map_key[512];
     if (!store || !text || !*text || strlen(text) > QIHSE_AIMEM_RESP_MAX_TEXT)
         return QIHSE_AIMEM_ADMIT_FAILED;
 
     pthread_rwlock_wrlock(&session->server->kv_lock);
     if (idem) {
         /* The existing map key/UUID layout is preserved for old clients. */
-        snprintf(map_key, sizeof map_key, "aimem-idem:%u:%s",
-                 (unsigned)qihse_user_get_id(session->user), idem);
+        if (scope) {
+            snprintf(map_key, sizeof map_key, "t:%u/aimem-idem:%u:%s:%s:%s:%s:%s",
+                     (unsigned)qihse_user_get_tenant_id(session->user),
+                     (unsigned)qihse_user_get_id(session->user), scope->project,
+                     scope->worktree, scope->workstream, scope->session, idem);
+        } else {
+            snprintf(map_key, sizeof map_key, "aimem-idem:%u:%s",
+                     (unsigned)qihse_user_get_id(session->user), idem);
+        }
         char* existing = qihse_kv_get_user(store, map_key, session->user);
         if (existing) {
             /* An idempotency key is bound to its original kind AND bytes.
@@ -5568,8 +5789,10 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
             qihse_ai_memory_hit_t hit;
             memset(&hit, 0, sizeof hit);
             bool same = strlen(existing) == QIHSE_AIMEM_ID_LEN &&
-                        qihse_ai_memory_get(session->server, session->user,
-                                            existing, &hit);
+                        (scope ? qihse_ai_memory_get_scoped(session->server,
+                                            session->user, existing, scope, &hit)
+                               : qihse_ai_memory_get(session->server, session->user,
+                                            existing, &hit));
             if (same) {
                 same = strcmp(hit.id, existing) == 0 && hit.kind == kind &&
                        hit.text && strcmp(hit.text, text) == 0;
@@ -5590,9 +5813,13 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
      * If a SIGKILL interrupts admission before the separate map write, a
      * replay finds the original document and repairs the missing mapping. */
     qihse_ai_memory_write_result_t write_result = idem
-        ? qihse_ai_memory_store_idempotent(
-              session->server, session->user, text, kind, idem, out_id)
-        : (qihse_ai_memory_store(session->server, session->user, text, kind, out_id)
+        ? (scope ? qihse_ai_memory_store_scoped_idempotent(
+              session->server, session->user, text, kind, scope, idem, out_id)
+                 : qihse_ai_memory_store_idempotent(
+              session->server, session->user, text, kind, idem, out_id))
+        : ((scope ? qihse_ai_memory_store_scoped(session->server, session->user,
+                         text, kind, scope, out_id)
+                  : qihse_ai_memory_store(session->server, session->user, text, kind, out_id))
                ? QIHSE_AIMEM_WRITE_NEW : QIHSE_AIMEM_WRITE_FAILED);
     if (write_result == QIHSE_AIMEM_WRITE_CONFLICT) {
         pthread_rwlock_unlock(&session->server->kv_lock);
@@ -5622,6 +5849,402 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         return qihse_resp_error(session, "NOAUTH AIMEM requires an authenticated active principal");
     if (request->argc < 2u) return qihse_resp_wrong_arity(session, "AIMEM");
 
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM &&
+        !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") &&
+        !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-DURABLE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "RECALL-SCOPED") &&
+        !qihse_resp_arg_equal(&request->argv[1], "GET-SCOPED") &&
+        !qihse_resp_arg_equal(&request->argv[1], "FORGET-SCOPED") &&
+        !qihse_resp_arg_equal(&request->argv[1], "FORGET-SCOPED-DURABLE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "COUNT-SCOPED") &&
+        !qihse_resp_arg_equal(&request->argv[1], "EVENT") &&
+        !qihse_resp_arg_equal(&request->argv[1], "PROJECT") &&
+        !qihse_resp_arg_equal(&request->argv[1], "KNOWLEDGE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "HANDOFF"))
+        return qihse_resp_error(session, "ERR tenant AIMEM access requires explicit project scope");
+
+    if (qihse_resp_arg_equal(&request->argv[1], "MIGRATE-LEGACY")) {
+        if (request->argc != 7u)
+            return qihse_resp_error(session, "ERR usage: AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>");
+        if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+            qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session, "NOPERM AIMEM legacy migration requires a system Operator");
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
+            return qihse_resp_error(session, "ERR invalid or incomplete AIMEM migration scope");
+        char* id = qihse_resp_arg_text(&request->argv[2]);
+        if (!id) return qihse_resp_error(session, "ERR out of memory");
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        qihse_ai_memory_write_result_t result = qihse_ai_memory_migrate_legacy(
+            session->server, session->user, id, &scope);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (result == QIHSE_AIMEM_WRITE_CONFLICT) {
+            free(id);
+            return qihse_resp_error(session, "ERR CONFLICT AIMEM migration destination mismatch");
+        }
+        if (result != QIHSE_AIMEM_WRITE_NEW && result != QIHSE_AIMEM_WRITE_REPLAY) {
+            free(id);
+            return qihse_resp_error(session, "ERR AIMEM legacy migration failed");
+        }
+        bool emitted = qihse_resp_bulk_text(session, id);
+        free(id);
+        return emitted;
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "EVENT")) {
+        if (request->argc >= 3u && qihse_resp_arg_equal(&request->argv[2], "APPEND")) {
+            if (request->argc != 12u)
+                return qihse_resp_error(session, "ERR usage: AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <kind> <source-ms> <summary>");
+            qihse_ai_memory_scope_t scope;
+            if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
+                return qihse_resp_error(session, "ERR invalid or incomplete AIMEM event scope");
+            if (!request->argv[11].len ||
+                request->argv[11].len > QIHSE_AIMEM_EVENT_MAX_SUMMARY ||
+                memchr(request->argv[11].data, '\0', request->argv[11].len))
+                return qihse_resp_error(session, "ERR invalid or oversized AIMEM event summary");
+            char* producer = qihse_resp_arg_text(&request->argv[7]);
+            char* event_id = qihse_resp_arg_text(&request->argv[8]);
+            char* event_kind = qihse_resp_arg_text(&request->argv[9]);
+            char* source_text = qihse_resp_arg_text(&request->argv[10]);
+            char* summary = qihse_resp_arg_text(&request->argv[11]);
+            if (!producer || !event_id || !event_kind || !source_text || !summary) {
+                free(producer); free(event_id); free(event_kind); free(source_text); free(summary);
+                return qihse_resp_error(session, "ERR out of memory");
+            }
+            bool source_valid = *source_text != '\0';
+            for (const char* p = source_text; *p; p++)
+                if (*p < '0' || *p > '9') source_valid = false;
+            char* end = NULL;
+            errno = 0;
+            unsigned long long source_ms = source_valid ? strtoull(source_text, &end, 10) : 0u;
+            source_valid = source_valid && errno == 0 && end && *end == '\0';
+            if (!source_valid) {
+                free(producer); free(event_id); free(event_kind); free(source_text); free(summary);
+                return qihse_resp_error(session, "ERR invalid AIMEM event source time");
+            }
+            char id[QIHSE_AIMEM_ID_LEN + 1u];
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            qihse_ai_memory_write_result_t result = qihse_ai_memory_event_append(
+                session->server, session->user, &scope, producer, event_id,
+                event_kind, (uint64_t)source_ms, summary, id);
+            qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+            bool durable = result == QIHSE_AIMEM_WRITE_NEW ||
+                           result == QIHSE_AIMEM_WRITE_REPLAY;
+            if (durable) durable = store && qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(producer); free(event_id); free(event_kind); free(source_text); free(summary);
+            if (result == QIHSE_AIMEM_WRITE_CONFLICT)
+                return qihse_resp_error(session, "ERR CONFLICT AIMEM event identity already has different content");
+            if (result == QIHSE_AIMEM_WRITE_FAILED)
+                return qihse_resp_error(session, "ERR invalid AIMEM event fields or store unavailable");
+            if (!durable)
+                return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM event was not durably acknowledged");
+            return qihse_resp_bulk_text(session, id);
+        }
+        if (request->argc >= 3u && qihse_resp_arg_equal(&request->argv[2], "READ")) {
+            if (request->argc != 8u)
+                return qihse_resp_error(session, "ERR usage: AIMEM EVENT READ <uuid> <project> <worktree> <workstream> <session>");
+            qihse_ai_memory_scope_t scope;
+            if (!qihse_resp_aimem_scope_parse(request, 4u, &scope))
+                return qihse_resp_error(session, "ERR invalid or incomplete AIMEM event scope");
+            char* id = qihse_resp_arg_text(&request->argv[3]);
+            qihse_ai_memory_hit_t hit;
+            memset(&hit, 0, sizeof hit);
+            bool ok = id && qihse_ai_memory_event_get(session->server, session->user,
+                                                       id, &scope, &hit);
+            free(id);
+            if (!ok) return qihse_resp_null(session);
+            bool emitted = qihse_resp_aimem_emit_hit(session, &hit);
+            free(hit.text);
+            return emitted;
+        }
+        return qihse_resp_error(session, "ERR unknown AIMEM EVENT operation");
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "PROJECT")) {
+        if (request->argc != 5u ||
+            (!qihse_resp_arg_equal(&request->argv[2], "GRANT") &&
+             !qihse_resp_arg_equal(&request->argv[2], "REVOKE")))
+            return qihse_resp_error(session,
+                "ERR usage: AIMEM PROJECT GRANT|REVOKE <project> <reader-user-id>");
+        char* project = qihse_resp_arg_text(&request->argv[3]);
+        uint32_t reader_id = 0u;
+        if (!project || !qihse_resp_aimem_u32(&request->argv[4], &reader_id)) {
+            free(project);
+            return qihse_resp_error(session, "ERR invalid AIMEM project grant arguments");
+        }
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool ok = qihse_resp_arg_equal(&request->argv[2], "GRANT")
+            ? qihse_ai_memory_project_grant(session->server, session->user,
+                                            project, reader_id)
+            : qihse_ai_memory_project_revoke(session->server, session->user,
+                                             project, reader_id);
+        qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+        bool durable = ok && store && qihse_kv_sync_store(store);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        free(project);
+        if (!ok) return qihse_resp_error(session, "NOPERM AIMEM project membership change denied");
+        if (!durable) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM project grant not confirmed durable");
+        return qihse_resp_simple(session, "OK");
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "KNOWLEDGE")) {
+        if (request->argc < 3u)
+            return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE CREATE|REVISE|GET|LATEST|AS-OF ...");
+        qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+        if (!store) return qihse_resp_error(session, "ERR AIMEM store unavailable");
+        qihse_ai_memory_knowledge_version_t value;
+        memset(&value, 0, sizeof value);
+        if (qihse_resp_arg_equal(&request->argv[2], "CREATE")) {
+            if (request->argc != 10u)
+                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE CREATE <type> <status> <content> <project> <worktree> <workstream> <session>");
+            uint32_t type = 0u, status = 0u;
+            qihse_ai_memory_scope_t scope;
+            if (!qihse_resp_aimem_u32(&request->argv[3], &type) ||
+                !qihse_resp_aimem_u32(&request->argv[4], &status) ||
+                !qihse_resp_aimem_scope_parse(request, 6u, &scope) ||
+                request->argv[5].len == 0u || request->argv[5].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
+                memchr(request->argv[5].data, '\0', request->argv[5].len))
+                return qihse_resp_error(session, "ERR invalid AIMEM knowledge fields");
+            char* content = qihse_resp_arg_text(&request->argv[5]);
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            qihse_ai_memory_write_result_t result = content ? qihse_ai_memory_knowledge_create(
+                session->server, session->user, &scope, type, status, content, &value)
+                : QIHSE_AIMEM_WRITE_FAILED;
+            bool durable = result == QIHSE_AIMEM_WRITE_NEW && qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(content);
+            if (result != QIHSE_AIMEM_WRITE_NEW)
+                return qihse_resp_error(session, "NOPERM AIMEM knowledge creation denied");
+            if (!durable) { qihse_ai_memory_knowledge_free(&value); return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM knowledge create not confirmed durable"); }
+            bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
+            qihse_ai_memory_knowledge_free(&value); return emitted;
+        }
+        if (qihse_resp_arg_equal(&request->argv[2], "REVISE")) {
+            if (request->argc != 8u)
+                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE REVISE <knowledge-id> <expected-version-id> <expected-revision> <status> <content>");
+            char* knowledge = qihse_resp_arg_text(&request->argv[3]);
+            char* expected = qihse_resp_arg_text(&request->argv[4]);
+            uint64_t revision = 0u; uint32_t status = 0u;
+            bool valid = knowledge && expected && qihse_resp_aimem_u64(&request->argv[5], &revision) &&
+                qihse_resp_aimem_u32(&request->argv[6], &status) && request->argv[7].len > 0u &&
+                request->argv[7].len <= QIHSE_AIMEM_RESP_MAX_TEXT &&
+                !memchr(request->argv[7].data, '\0', request->argv[7].len);
+            char* content = valid ? qihse_resp_arg_text(&request->argv[7]) : NULL;
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            qihse_ai_memory_write_result_t result = content ? qihse_ai_memory_knowledge_revise(
+                session->server, session->user, knowledge, expected, revision, status, content, &value)
+                : QIHSE_AIMEM_WRITE_FAILED;
+            bool durable = result == QIHSE_AIMEM_WRITE_NEW && qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(knowledge); free(expected); free(content);
+            if (result == QIHSE_AIMEM_WRITE_CONFLICT)
+                return qihse_resp_error(session, "ERR CONFLICT AIMEM knowledge revision changed");
+            if (result != QIHSE_AIMEM_WRITE_NEW)
+                return qihse_resp_error(session, "NOPERM AIMEM knowledge revision denied");
+            if (!durable) { qihse_ai_memory_knowledge_free(&value); return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM knowledge revision not confirmed durable"); }
+            bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
+            qihse_ai_memory_knowledge_free(&value); return emitted;
+        }
+        qihse_ai_memory_scope_t scope;
+        bool get = qihse_resp_arg_equal(&request->argv[2], "GET");
+        bool latest = qihse_resp_arg_equal(&request->argv[2], "LATEST");
+        bool as_of = qihse_resp_arg_equal(&request->argv[2], "AS-OF");
+        if ((!as_of && request->argc != 8u) || (as_of && request->argc != 9u) ||
+            (!get && !latest && !as_of))
+            return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE GET|LATEST <id> <project> <worktree> <workstream> <session>; AS-OF <knowledge-id> <time-ms> <scope...>");
+        size_t scope_at = as_of ? 5u : 4u;
+        if (!qihse_resp_aimem_scope_parse(request, scope_at, &scope))
+            return qihse_resp_error(session, "ERR invalid AIMEM knowledge scope");
+        char* id = qihse_resp_arg_text(&request->argv[3]);
+        uint64_t cutoff = 0u;
+        bool found = id && (!as_of || qihse_resp_aimem_u64(&request->argv[4], &cutoff)) &&
+            (get ? qihse_ai_memory_knowledge_get(session->server, session->user, id, &scope, &value) :
+             latest ? qihse_ai_memory_knowledge_latest(session->server, session->user, id, &scope, &value) :
+                      qihse_ai_memory_knowledge_as_of(session->server, session->user, id, &scope, cutoff, &value));
+        free(id);
+        if (!found) return qihse_resp_null(session);
+        bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
+        qihse_ai_memory_knowledge_free(&value); return emitted;
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "HANDOFF")) {
+        if (request->argc < 3u)
+            return qihse_resp_error(session, "ERR usage: AIMEM HANDOFF OFFER|ACCEPT|CANCEL|GET ...");
+        qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+        if (!store) return qihse_resp_error(session, "ERR AIMEM store unavailable");
+
+        if (qihse_resp_arg_equal(&request->argv[2], "OFFER")) {
+            if (request->argc != 10u)
+                return qihse_resp_error(session, "ERR usage: AIMEM HANDOFF OFFER <recipient-user-id> <ttl-ms> <project> <worktree> <workstream> <session> <summary>");
+            uint32_t recipient_id = 0u;
+            uint64_t ttl_ms = 0u;
+            qihse_ai_memory_scope_t scope;
+            if (!qihse_resp_aimem_u32(&request->argv[3], &recipient_id) ||
+                !qihse_resp_aimem_u64(&request->argv[4], &ttl_ms) ||
+                ttl_ms == 0u || ttl_ms > 7u * 24u * 60u * 60u * 1000u ||
+                !qihse_resp_aimem_scope_parse(request, 5u, &scope))
+                return qihse_resp_error(session, "ERR invalid AIMEM handoff offer fields");
+            char* summary = qihse_resp_arg_text(&request->argv[9]);
+            qihse_user_t* recipient = qihse_auth_get_user(recipient_id);
+            bool allowed = summary && qihse_resp_aimem_handoff_summary_valid(summary) &&
+                recipient && qihse_auth_user_is_active(recipient) &&
+                recipient_id != qihse_user_get_id(session->user) &&
+                qihse_user_get_tenant_id(recipient) == qihse_user_get_tenant_id(session->user) &&
+                qihse_ai_memory_project_owner_allowed(session->server, session->user, scope.project) &&
+                qihse_ai_memory_project_reader_allowed(session->server, recipient, scope.project);
+            if (!allowed) {
+                free(summary);
+                return qihse_resp_error(session, "NOPERM AIMEM handoff recipient or project policy denied");
+            }
+            qihse_uuid_t uuid;
+            char id[QIHSE_AIMEM_ID_LEN + 1u], key[128], record[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+            bool ok = qihse_uuid_generate(&uuid) && qihse_uuid_format(&uuid, id) &&
+                qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
+            qihse_aimem_handoff_t handoff;
+            memset(&handoff, 0, sizeof handoff);
+            if (ok) {
+                memcpy(handoff.id, id, sizeof id);
+                handoff.owner_id = qihse_user_get_id(session->user);
+                handoff.recipient_id = recipient_id;
+                handoff.created_ms = qihse_resp_now_ms();
+                handoff.expires_ms = handoff.created_ms + ttl_ms;
+                handoff.revision = 1u;
+                handoff.state = QIHSE_AIMEM_HANDOFF_OPEN;
+                handoff.scope = scope;
+                handoff.summary = summary;
+                ok = qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record);
+            }
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            if (ok) ok = qihse_kv_set_user(store, key, record,
+                qihse_user_get_classification(session->user),
+                qihse_user_get_sci(session->user), session->user);
+            if (ok) ok = qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(summary);
+            if (!ok) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM handoff offer not confirmed durable");
+            return qihse_resp_bulk_text(session, id);
+        }
+
+        if (qihse_resp_arg_equal(&request->argv[2], "GET")) {
+            if (request->argc != 4u) return qihse_resp_error(session, "ERR usage: AIMEM HANDOFF GET <uuid>");
+            char* id = qihse_resp_arg_text(&request->argv[3]);
+            char key[128];
+            bool keyed = id && qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
+            char* raw = keyed ? qihse_kv_get_user(store, key, session->user) : NULL;
+            free(id);
+            qihse_aimem_handoff_t handoff;
+            bool parsed = raw && qihse_resp_aimem_handoff_parse(raw, &handoff);
+            free(raw);
+            if (!parsed) return qihse_resp_null(session);
+            if (qihse_resp_now_ms() >= handoff.expires_ms && handoff.state == QIHSE_AIMEM_HANDOFF_OPEN)
+                handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
+            bool authorized = qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR ||
+                qihse_user_get_id(session->user) == handoff.owner_id ||
+                qihse_user_get_id(session->user) == handoff.recipient_id;
+            if (!authorized) { qihse_resp_aimem_handoff_free(&handoff); return qihse_resp_null(session); }
+            bool emitted = qihse_resp_aimem_emit_handoff(session, &handoff);
+            qihse_resp_aimem_handoff_free(&handoff);
+            return emitted;
+        }
+
+        if (qihse_resp_arg_equal(&request->argv[2], "ACCEPT") ||
+            qihse_resp_arg_equal(&request->argv[2], "CANCEL")) {
+            bool accept = qihse_resp_arg_equal(&request->argv[2], "ACCEPT");
+            if (request->argc != 5u)
+                return qihse_resp_error(session, accept ?
+                    "ERR usage: AIMEM HANDOFF ACCEPT <uuid> <expected-revision>" :
+                    "ERR usage: AIMEM HANDOFF CANCEL <uuid> <expected-revision>");
+            char* id = qihse_resp_arg_text(&request->argv[3]);
+            uint64_t expected = 0u;
+            if (!id || !qihse_resp_aimem_u64(&request->argv[4], &expected)) {
+                free(id); return qihse_resp_error(session, "ERR invalid AIMEM handoff revision");
+            }
+            char key[128];
+            bool keyed = qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
+            free(id);
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            char* raw = keyed ? qihse_kv_get_user(store, key, session->user) : NULL;
+            qihse_aimem_handoff_t handoff;
+            bool ok = raw && qihse_resp_aimem_handoff_parse(raw, &handoff);
+            qihse_kv_record_meta_t meta;
+            if (ok) ok = qihse_kv_meta_user(store, key, session->user, &meta);
+            if (!ok) {
+                free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                return qihse_resp_null(session);
+            }
+            bool is_owner = qihse_user_get_id(session->user) == handoff.owner_id ||
+                            qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR;
+            bool is_recipient = qihse_user_get_id(session->user) == handoff.recipient_id;
+            bool grant_ok = accept && qihse_ai_memory_project_reader_allowed(
+                session->server, session->user, handoff.scope.project);
+            uint64_t now = qihse_resp_now_ms();
+            if (accept && handoff.state == QIHSE_AIMEM_HANDOFF_ACCEPTED &&
+                handoff.accepted_by == qihse_user_get_id(session->user) &&
+                expected + 1u == handoff.revision) {
+                free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                qihse_resp_aimem_handoff_free(&handoff);
+                return qihse_resp_bulk_text(session, "ACCEPTED");
+            }
+            if ((!accept && !is_owner) || (accept && (!is_recipient || !grant_ok)) ||
+                handoff.state != QIHSE_AIMEM_HANDOFF_OPEN || expected != handoff.revision ||
+                now >= handoff.expires_ms) {
+                free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                qihse_resp_aimem_handoff_free(&handoff);
+                return qihse_resp_error(session, "ERR CONFLICT AIMEM handoff not open at requested revision");
+            }
+            handoff.state = accept ? QIHSE_AIMEM_HANDOFF_ACCEPTED : QIHSE_AIMEM_HANDOFF_CANCELLED;
+            handoff.accepted_by = accept ? qihse_user_get_id(session->user) : 0u;
+            handoff.revision++;
+            char record[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+            ok = qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record) &&
+                 qihse_kv_set_user(store, key, record, meta.classification,
+                                   meta.sci_compartment, session->user) &&
+                 qihse_kv_sync_store(store);
+            free(raw);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            qihse_resp_aimem_handoff_free(&handoff);
+            if (!ok) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM handoff transition not confirmed durable");
+            return qihse_resp_bulk_text(session, accept ? "ACCEPTED" : "CANCELLED");
+        }
+        return qihse_resp_error(session, "ERR unknown AIMEM HANDOFF operation");
+    }
+
+    bool scoped_durable = qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-DURABLE");
+    if (qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") || scoped_durable) {
+        if (request->argc != 8u && request->argc != 9u)
+            return qihse_resp_error(session, "ERR usage: AIMEM STORE-SCOPED[-DURABLE] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]");
+        if (request->argv[3].len == 0u || request->argv[3].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
+            memchr(request->argv[3].data, '\0', request->argv[3].len))
+            return qihse_resp_error(session, "ERR AIMEM invalid or oversized text");
+        uint32_t kind = 0;
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_u32(&request->argv[2], &kind) ||
+            (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC))
+            return qihse_resp_error(session, "ERR kind must be 1 (episodic) or 2 (semantic)");
+        if (!qihse_resp_aimem_scope_parse(request, 4u, &scope))
+            return qihse_resp_error(session, "ERR invalid or incomplete AIMEM project scope");
+        char* text = qihse_resp_arg_text(&request->argv[3]);
+        char* idem = NULL;
+        if (request->argc == 9u) {
+            if (!qihse_resp_aimem_idem_valid(&request->argv[8])) {
+                free(text);
+                return qihse_resp_error(session, "ERR invalid idempotency key");
+            }
+            idem = qihse_resp_arg_text(&request->argv[8]);
+        }
+        char id[QIHSE_AIMEM_ID_LEN + 1u];
+        qihse_aimem_admit_result_t result = qihse_resp_aimem_store_one(
+            session, kind, text, idem, scoped_durable, &scope, id);
+        free(text); free(idem);
+        if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
+            return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
+        if (result == QIHSE_AIMEM_ADMIT_NOT_DURABLE)
+            return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM admission not confirmed durable");
+        return result == QIHSE_AIMEM_ADMIT_OK ? qihse_resp_bulk_text(session, id)
+                                               : qihse_resp_error(session, "ERR AIMEM store failed");
+    }
+
     bool durable_store = qihse_resp_arg_equal(&request->argv[1], "STORE-DURABLE");
     if (qihse_resp_arg_equal(&request->argv[1], "STORE") || durable_store) {
         if (request->argc != 4u && request->argc != 5u)
@@ -5644,7 +6267,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         }
         char id[QIHSE_AIMEM_ID_LEN + 1u];
         qihse_aimem_admit_result_t result =
-            qihse_resp_aimem_store_one(session, kind, text, idem, durable_store, id);
+            qihse_resp_aimem_store_one(session, kind, text, idem, durable_store, NULL, id);
         free(text); free(idem);
         if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
             return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
@@ -5660,6 +6283,23 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         qihse_ai_memory_hit_t hit;
         memset(&hit, 0, sizeof hit);
         bool ok = qihse_ai_memory_get(session->server, session->user, id, &hit);
+        free(id);
+        if (!ok) return qihse_resp_null(session);
+        bool emitted = qihse_resp_aimem_emit_hit(session, &hit);
+        free(hit.text);
+        return emitted;
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "GET-SCOPED")) {
+        if (request->argc != 7u) return qihse_resp_wrong_arity(session, "AIMEM GET-SCOPED");
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
+            return qihse_resp_error(session, "ERR invalid or incomplete AIMEM project scope");
+        char* id = qihse_resp_arg_text(&request->argv[2]);
+        qihse_ai_memory_hit_t hit;
+        memset(&hit, 0, sizeof hit);
+        bool ok = id && qihse_ai_memory_get_scoped(session->server, session->user,
+                                                    id, &scope, &hit);
         free(id);
         if (!ok) return qihse_resp_null(session);
         bool emitted = qihse_resp_aimem_emit_hit(session, &hit);
@@ -5691,6 +6331,26 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         return qihse_resp_integer(session, removed ? 1 : 0);
     }
 
+    bool scoped_forget_durable = qihse_resp_arg_equal(&request->argv[1], "FORGET-SCOPED-DURABLE");
+    if (qihse_resp_arg_equal(&request->argv[1], "FORGET-SCOPED") || scoped_forget_durable) {
+        if (request->argc != 7u) return qihse_resp_wrong_arity(session, "AIMEM FORGET-SCOPED");
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
+            return qihse_resp_error(session, "ERR invalid or incomplete AIMEM project scope");
+        char* id = qihse_resp_arg_text(&request->argv[2]);
+        if (!id) return qihse_resp_error(session, "ERR out of memory");
+        qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+        if (scoped_forget_durable && !store) { free(id); return qihse_resp_error(session, "ERR AIMEM store unavailable"); }
+        if (scoped_forget_durable) pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool removed = qihse_ai_memory_forget_scoped(session->server, session->user,
+                                                      id, &scope);
+        bool fenced = !scoped_forget_durable || !removed || qihse_kv_sync_store(store);
+        if (scoped_forget_durable) pthread_rwlock_unlock(&session->server->kv_lock);
+        free(id);
+        if (!fenced) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete not confirmed durable");
+        return qihse_resp_integer(session, removed ? 1 : 0);
+    }
+
     if (qihse_resp_arg_equal(&request->argv[1], "COUNT")) {
         if (request->argc > 3u) return qihse_resp_wrong_arity(session, "AIMEM COUNT");
         uint32_t kind = QIHSE_AIMEM_KIND_ANY;
@@ -5698,6 +6358,18 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             return qihse_resp_error(session, "ERR invalid kind");
         return qihse_resp_integer(session, (int64_t)qihse_ai_memory_count_kind(
             session->server, session->user, kind));
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "COUNT-SCOPED")) {
+        if (request->argc != 6u && request->argc != 7u)
+            return qihse_resp_error(session, "ERR usage: AIMEM COUNT-SCOPED <project> <worktree> <workstream> <session> [kind]");
+        qihse_ai_memory_scope_t scope;
+        uint32_t kind = QIHSE_AIMEM_KIND_ANY;
+        if (!qihse_resp_aimem_scope_parse(request, 2u, &scope) ||
+            (request->argc == 7u && !qihse_resp_aimem_u32(&request->argv[6], &kind)))
+            return qihse_resp_error(session, "ERR invalid AIMEM scoped count arguments");
+        return qihse_resp_integer(session, (int64_t)qihse_ai_memory_count_scoped(
+            session->server, session->user, kind, &scope));
     }
 
     if (qihse_resp_arg_equal(&request->argv[1], "RECALL")) {
@@ -5723,6 +6395,34 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         free(query);
         bool emitted = qihse_resp_array(session, found);
         for (size_t i = 0; emitted && i < found; i++) emitted = qihse_resp_aimem_emit_hit(session, &hits[i]);
+        qihse_ai_memory_hits_free(hits, found);
+        free(hits);
+        return emitted;
+    }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "RECALL-SCOPED")) {
+        if (request->argc != 10u)
+            return qihse_resp_error(session, "ERR usage: AIMEM RECALL-SCOPED <query> <limit> <mode> <kind> <project> <worktree> <workstream> <session>");
+        uint32_t limit = 0u, kind = 0u;
+        qihse_ai_memory_mode_t mode = QIHSE_AIMEM_MODE_BM25;
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_u32(&request->argv[3], &limit) || limit == 0u || limit > 256u ||
+            !qihse_resp_aimem_u32(&request->argv[5], &kind) ||
+            !qihse_resp_aimem_scope_parse(request, 6u, &scope))
+            return qihse_resp_error(session, "ERR invalid AIMEM scoped recall arguments");
+        if (qihse_resp_arg_equal(&request->argv[4], "semantic")) mode = QIHSE_AIMEM_MODE_SEMANTIC;
+        else if (qihse_resp_arg_equal(&request->argv[4], "hybrid")) mode = QIHSE_AIMEM_MODE_HYBRID;
+        else if (!qihse_resp_arg_equal(&request->argv[4], "bm25"))
+            return qihse_resp_error(session, "ERR mode must be bm25, semantic, or hybrid");
+        char* query = qihse_resp_arg_text(&request->argv[2]);
+        qihse_ai_memory_hit_t* hits = calloc(limit, sizeof(*hits));
+        if (!query || !hits) { free(query); free(hits); return qihse_resp_error(session, "ERR out of memory"); }
+        size_t found = qihse_ai_memory_recall_scoped(session->server, session->user,
+            query, limit, mode, kind, &scope, hits, limit);
+        free(query);
+        bool emitted = qihse_resp_array(session, found);
+        for (size_t i = 0; emitted && i < found; i++)
+            emitted = qihse_resp_aimem_emit_hit(session, &hits[i]);
         qihse_ai_memory_hits_free(hits, found);
         free(hits);
         return emitted;

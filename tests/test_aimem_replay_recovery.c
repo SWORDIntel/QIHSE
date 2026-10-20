@@ -5,8 +5,8 @@
  * A fresh process must recover the original UUID through RESP, materialize
  * only one logical memory, enforce classification/SCI and survive another
  * immediate SIGKILL after a durable delete. No privileged test-only hooks. */
-#define _GNU_SOURCE
 #include "qihse_ai_memory.h"
+#include "qihse_audit.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
 #include "qihse_resp_wire.h"
@@ -110,6 +110,7 @@ static void simulate_crash_before_idempotency_map(int fd) {
             server, op, MEMORY_TEXT, QIHSE_AIMEM_SEMANTIC,
             IDEM_KEY, id) == QIHSE_AIMEM_WRITE_NEW);
     assert(qihse_kv_sync_store(kv));  /* force primary durable, map absent */
+    qihse_audit_flush();
     transfer(fd, id, sizeof id);
     kill(getpid(), SIGKILL);
     _exit(71);
@@ -164,6 +165,7 @@ static void recover_and_check_access(const char* original, int fd) {
     expect(op, 3u, get, MEMORY_TEXT);
     expect(op, 2u, count, ":1\r\n");
 
+    qihse_audit_flush();
     transfer(fd, "R", 1u);
     kill(getpid(), SIGKILL);
     _exit(72);
@@ -175,6 +177,7 @@ static void delete_durably(const char* id, int fd) {
     expect(op, 2u, count, ":1\r\n");
     const char* forget[] = { "AIMEM", "FORGET-DURABLE", id };
     expect(op, 3u, forget, ":1\r\n");
+    qihse_audit_flush();
     transfer(fd, "D", 1u);
     kill(getpid(), SIGKILL);
     _exit(73);

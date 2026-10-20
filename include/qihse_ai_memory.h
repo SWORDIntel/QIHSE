@@ -27,11 +27,66 @@ extern "C" {
 
 #define QIHSE_AIMEM_ID_LEN 36u /* formatted UUID */
 #define QIHSE_AIMEM_IDEM_MAX_LEN 128u
+#define QIHSE_AIMEM_SCOPE_ID_MAX 63u
+
+/* Client-selected names are opaque identifiers, never authority claims.
+ * Project is mandatory; the other dimensions narrow a project query. */
+typedef struct {
+    char project[QIHSE_AIMEM_SCOPE_ID_MAX + 1u];
+    char worktree[QIHSE_AIMEM_SCOPE_ID_MAX + 1u];
+    char workstream[QIHSE_AIMEM_SCOPE_ID_MAX + 1u];
+    char session[QIHSE_AIMEM_SCOPE_ID_MAX + 1u];
+} qihse_ai_memory_scope_t;
 
 typedef enum {
     QIHSE_AIMEM_EPISODIC = 1u, /* what happened */
-    QIHSE_AIMEM_SEMANTIC = 2u  /* what is known  */
+    QIHSE_AIMEM_SEMANTIC = 2u, /* what is known  */
+    QIHSE_AIMEM_EVENT = 3u     /* immutable lifecycle event */
 } qihse_ai_memory_kind_t;
+
+/* QH-04 curated knowledge uses immutable version records.  These values are
+ * deliberately separate from recall kinds: a caller cannot pass a claimed
+ * knowledge type through an ordinary free-text memory admission path. */
+typedef enum {
+    QIHSE_AIMEM_KNOWLEDGE_DECISION = 1u,
+    QIHSE_AIMEM_KNOWLEDGE_GOTCHA,
+    QIHSE_AIMEM_KNOWLEDGE_PROCEDURE,
+    QIHSE_AIMEM_KNOWLEDGE_ARCHITECTURE,
+    QIHSE_AIMEM_KNOWLEDGE_RULE,
+    QIHSE_AIMEM_KNOWLEDGE_SESSION_CAPSULE
+} qihse_ai_memory_knowledge_type_t;
+
+typedef enum {
+    QIHSE_AIMEM_KNOWLEDGE_PROPOSED = 1u,
+    QIHSE_AIMEM_KNOWLEDGE_APPROVED,
+    QIHSE_AIMEM_KNOWLEDGE_SUPERSEDED,
+    QIHSE_AIMEM_KNOWLEDGE_RETRACTED
+} qihse_ai_memory_knowledge_status_t;
+
+/* Immutable QH-04 version metadata. `content` and all IDs are owned by the
+ * caller on input and by the result owner on output. */
+typedef struct {
+    char knowledge_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char version_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char supersedes_version[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_ai_memory_scope_t scope;
+    uint32_t type;
+    uint32_t status;
+    uint64_t revision;
+    uint64_t created_at_ms;
+    uint64_t valid_from_ingest_ms;
+    uint64_t valid_to_ingest_ms;
+    uint32_t created_by;
+    char* content;
+} qihse_ai_memory_knowledge_version_t;
+
+bool qihse_ai_memory_knowledge_get(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* version_id,
+    const qihse_ai_memory_scope_t* scope,
+    qihse_ai_memory_knowledge_version_t* out);
+void qihse_ai_memory_knowledge_free(qihse_ai_memory_knowledge_version_t* value);
+
+#define QIHSE_AIMEM_EVENT_MAX_SUMMARY (16u * 1024u)
 
 /* A read FILTER value, not a storable kind: it selects both kinds.
  * `qihse_ai_memory_store()` still accepts only EPISODIC and SEMANTIC. */
@@ -127,10 +182,89 @@ typedef enum {
     QIHSE_AIMEM_WRITE_CONFLICT = 3
 } qihse_ai_memory_write_result_t;
 
+/* Append a registered, immutable lifecycle event. Event identity is
+ * producer_namespace + event_id within the authenticated tenant/actor/scope. */
+qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const char* producer_namespace,
+    const char* event_id, const char* event_kind, uint64_t source_time_ms,
+    const char* summary, char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
+    const char* id, const qihse_ai_memory_scope_t* scope,
+    qihse_ai_memory_hit_t* out);
+bool qihse_ai_memory_project_grant(qihse_resp_server_t* server,
+    qihse_user_t* grantor, const char* project, uint32_t reader_id);
+bool qihse_ai_memory_project_revoke(qihse_resp_server_t* server,
+    qihse_user_t* grantor, const char* project, uint32_t reader_id);
+bool qihse_ai_memory_project_reader_allowed(qihse_resp_server_t* server,
+    qihse_user_t* reader, const char* project);
+bool qihse_ai_memory_project_owner_allowed(qihse_resp_server_t* server,
+    qihse_user_t* owner, const char* project);
+
+/* Move one system-domain legacy memory into an explicit scoped record while
+ * preserving UUID, timestamp, kind, classification, SCI and content. Only an
+ * active system Operator may call this. The operation fences the destination
+ * before deleting and fencing the source, so retries complete safely after a
+ * crash between phases. Callers must serialize against other AIMEM writes. */
+qihse_ai_memory_write_result_t qihse_ai_memory_migrate_legacy(
+    qihse_resp_server_t* server, qihse_user_t* operator_user,
+    const char* id, const qihse_ai_memory_scope_t* destination);
+
+/* QH-04 immutable curated-knowledge chains. Create/revise replace one
+ * tenant-scoped chain record atomically; callers that promise a durable ACK
+ * must serialize the call and qihse_kv_sync_store() under the server KV lock. */
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, uint32_t type, uint32_t status,
+    const char* content, qihse_ai_memory_knowledge_version_t* out);
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const char* knowledge_id, const char* expected_version_id,
+    uint64_t expected_revision, uint32_t status, const char* content,
+    qihse_ai_memory_knowledge_version_t* out);
+bool qihse_ai_memory_knowledge_latest(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* knowledge_id,
+    const qihse_ai_memory_scope_t* scope,
+    qihse_ai_memory_knowledge_version_t* out);
+bool qihse_ai_memory_knowledge_as_of(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* knowledge_id,
+    const qihse_ai_memory_scope_t* scope, uint64_t ingestion_time_ms,
+    qihse_ai_memory_knowledge_version_t* out);
+
 qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
     qihse_resp_server_t* server, qihse_user_t* user, const char* text,
     uint32_t kind, const char* idempotency_key,
     char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+
+/* QH-01 scoped variants. Scope is mandatory and project must be nonempty.
+ * Scoped records are never visible through legacy global AIMEM reads. */
+bool qihse_ai_memory_store_scoped(qihse_resp_server_t* server,
+                                  qihse_user_t* user, const char* text,
+                                  uint32_t kind,
+                                  const qihse_ai_memory_scope_t* scope,
+                                  char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const qihse_ai_memory_scope_t* scope,
+    const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
+                                     qihse_user_t* user, const char* query,
+                                     size_t limit, qihse_ai_memory_mode_t mode,
+                                     uint32_t kind,
+                                     const qihse_ai_memory_scope_t* scope,
+                                     qihse_ai_memory_hit_t* out,
+                                     size_t out_cap);
+bool qihse_ai_memory_get_scoped(qihse_resp_server_t* server,
+                                qihse_user_t* user, const char* id,
+                                const qihse_ai_memory_scope_t* scope,
+                                qihse_ai_memory_hit_t* out);
+bool qihse_ai_memory_forget_scoped(qihse_resp_server_t* server,
+                                   qihse_user_t* user, const char* id,
+                                   const qihse_ai_memory_scope_t* scope);
+size_t qihse_ai_memory_count_scoped(qihse_resp_server_t* server,
+                                    qihse_user_t* user, uint32_t kind,
+                                    const qihse_ai_memory_scope_t* scope);
 
 /* Recall with an explicit ranking mode. */
 size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,

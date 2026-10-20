@@ -1980,6 +1980,34 @@ bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value,
     return qihse_kv_set_user(store, key, value, classification, sci_compartment, NULL);
 }
 
+qihse_kv_cas_result_t qihse_kv_compare_set_user(
+        qihse_kv_store_t* store, const char* key, const char* expected_value,
+        const char* new_value, uint16_t classification,
+        uint16_t sci_compartment, qihse_user_t* user) {
+    if (!store || !key || !new_value || !user || !qihse_auth_user_is_active(user))
+        return QIHSE_KV_CAS_FAILED;
+    kv_store_wrlock(store);
+    char* current = kv_get_user_impl(store, key, user);
+    bool matches = expected_value ? current && strcmp(current, expected_value) == 0
+                                  : current == NULL;
+    if (!matches) {
+        /* An absent result can also mean an inaccessible existing record.
+         * set_user_with_expiry performs the overwrite authorization check;
+         * never report MISMATCH for the create-if-absent case until that
+         * distinction is known to be harmless. */
+        qihse_kv_cas_result_t result = expected_value && current
+            ? QIHSE_KV_CAS_MISMATCH : QIHSE_KV_CAS_FAILED;
+        free(current);
+        kv_store_unlock(store);
+        return result;
+    }
+    bool updated = set_user_with_expiry(store, key, new_value, 0u,
+        classification, sci_compartment, user);
+    free(current);
+    kv_store_unlock(store);
+    return updated ? QIHSE_KV_CAS_UPDATED : QIHSE_KV_CAS_FAILED;
+}
+
 static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return NULL;
     if (!__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE)) {

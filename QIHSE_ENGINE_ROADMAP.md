@@ -1,8 +1,8 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status:** QH-00 initial implementation slice (durable RESP commands + serialized idempotency) in progress; full QH-00 crash atomicity, receipt/LSN contract and QH-01–QH-10 remain planned. Integrated into the master roadmap as W10.  
-> **Date:** 2026-10-20  
-> **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-planned-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).  
+> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 are partial. QH-04 now has a tenant-scoped single-record lineage ledger, authorization-aware KV CAS, durable RESP create/revise, exact/latest/as-of reads, and native/wire security regressions. It still needs source-event validation, content hashes and review metadata, typed relations, audit and crash/retry coverage. QH-00–QH-03 retain the remaining gates described below; QH-05–QH-10 remain planned. Integrated into the master roadmap as W10.
+> **Date:** 2026-10-20
+> **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
 > **Source:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory), `main` at `11ab1003d9ef3788f5fc40b87fff54abf7f17dc0`.  
 > **Consumer:** [QIHSE-backed Supermemory](https://github.com/SWORDIntel/supermemory/tree/qihse-backend/qihse-backend). Its companion feature roadmap uses SM-XX items; this document uses QH-XX item numbers.  
@@ -81,11 +81,26 @@ Use server-generated/validated scopes for writes. On reads: require explicit sco
 
 **Compatibility:** Existing legacy text records need an explicit `legacy/unassigned` scope visible only according to operator migration policy. Do not guess project from text or search keywords. Add a permission-reviewed migration path that stamps historical records with confidence/known provenance or leaves them unassigned.
 
+**First migration slice:** `AIMEM MIGRATE-LEGACY` is restricted to an active
+system Operator and requires the exact source UUID plus explicit destination
+coordinates. It preserves UUID, creation time, kind, content, classification
+and SCI, fences the scoped destination, then deletes and fences the legacy
+record and vector projection. Exact retries recognize the destination;
+mismatches fail closed. The wire regression denies a low-clearance caller
+without returning protected content. A restart regression reconstructs the
+destination-first/source-still-present crash state and verifies retry completes
+the deletion without changing the scoped record. Persistent scope indexes and
+hierarchy restart/load evidence remain open.
+
 **Acceptance:** Concurrent 10-agent test with same authenticated principal and multiple repos; each scoped query returns only its own authorized hits. Repeat with another principal and disjoint SCI compartments; no cross-scope/label influence on rank, count, zero-result response or pagination. Deliberately typo the project and assert rejection, not fallback.
 
 ## QH-02 — Authenticated lifecycle event journal
 
-Store lifecycle observations as typed events in QIHSE, rather than indistinguishable free-text `AIMEM STORE` entries. Candidate commands: `AIMEM EVENT APPEND` and `AIMEM EVENT READ` (names TBD after inspecting existing QIHSE journal APIs). The engine should bind event actor, scope and label itself and validate a versioned envelope against bounded schemas.
+Store lifecycle observations as typed events in QIHSE, rather than indistinguishable free-text `AIMEM STORE` entries. The first implementation exposes `AIMEM EVENT APPEND` and `AIMEM EVENT READ`. QIHSE binds authenticated actor, tenant, scope, labels and receive time; it validates the registered event vocabulary and bounded fields, stores a SHA-256 digest, makes event identity deterministic within tenant/actor/scope, rejects conflicting reuse, and fsyncs before acknowledging append. The event record itself is the idempotency authority, so no separate mapping write is needed. Schema `QHEV1` currently records status `observed`.
+
+**Verified:** `make test-aimem-resp` simulates ten agents issuing 10,000 durable append calls over ten projects (100 deterministic identities per project), then asserts per-project cardinality 100. It reports per-call p50/p95 latency and aggregate throughput on the test host. The regression also covers same-ID replay, conflicting bytes, unsupported event kind, authorized read, tenant isolation, and low-clearance/high-data denial. `make test-aimem-durable-crash` kills the process after a durable append result is produced but before the simulated client receives it; restart/replay resolves one stable event and rejects conflicting reuse.
+
+**Remaining before QH-02 is complete:** optional source-evidence handles, an explicit bounded admission/backpressure contract, and fault coverage at the earlier append/fence boundaries.
 
 **Required fields:** `schema_version`, `producer_namespace`, `event_id`, `event_kind`, `session_id`, `workstream_id`, source time and server receive time, content digest, sanitized summary, optional source-evidence handle, `status`, and an authenticated idempotency composite. Event kinds are from a registered vocabulary; extensions are versioned and may be stored without activating any privileged handler.
 
@@ -111,6 +126,21 @@ OPEN  --accept(CAS)-->  ACCEPTED
 
 An accept operation is a single server transaction/CAS requiring `state=OPEN`, current revision, unexpired offer, matching recipient, matching project grant and required SCI access. Return the accepted ID and source state; concurrent accept is deterministic. Prefer offering handoffs at session start without mutating their state. Explicit acceptance makes them claim-once. Keep an audit of acceptance without automatically importing previous agent's credentials, tools or executable instructions.
 
+**First implementation:** `AIMEM HANDOFF OFFER/GET/ACCEPT/CANCEL` stores a
+tenant-prefixed `QHH1` record with owner, named recipient, scope, summary,
+timestamps, revision and state. Offer and transition replies are fsync fenced.
+The recipient must retain an active project-reader grant at acceptance; label
+and SCI access are enforced by the authenticated KV read. A server KV write
+lock serializes the record's compare-and-swap, and an accepted record is a
+stable recovery result for that recipient's immediate previous-revision retry.
+`make test-aimem-resp` races 100 in-process claims and checks that all
+authorized retry callers observe `ACCEPTED` while the competing principal is
+denied. `make test-aimem-durable-crash` also kills the process after durable
+acceptance but before delivering the simulated reply; restart returns the same
+`ACCEPTED` result to the recipient's retry and hides it from a competitor.
+This is **partial**: a multiprocess network-client race, evidence pointers and
+persisted expiry are still required.
+
 Decide a **recovery policy** for an interrupted consumer: either the accepted handoff remains accepted and is queryable by the same recipient/session, or a bounded lease permits authenticated re-offer. Never allow automatic double execution simply because an ACK was lost.
 
 **Acceptance:** Race 100 concurrent claimers across multiple processes and two principals. Exactly one authorized acceptance; wrong-project and lower-clearance actors receive no baton or diagnostic revealing restricted content. Forced crash between state transition and reply returns the same accepted result to the same idempotent retry.
@@ -124,6 +154,18 @@ ai-memory keeps [page/version history](https://github.com/akitaonrails/ai-memory
 **Relations:** Start with `fixes`, `causes`, `contradicts` and `supersedes` with strict target resolution. Relations can resolve across scope boundaries **only on an explicitly authorized query**; each target retrieval rechecks its own label. An LLM must not mint an approved rule or higher-trust evidence field.
 
 **Version update:** CAS on existing version; append successor and close predecessor validity within one atomic transaction; keep prior version recoverable under a version-aware authorized read. An authorized forget/privacy purge needs a separate explicit semantics definition; a superseded version is not "deleted".
+
+**First implementation:** native and RESP `CREATE`, `REVISE`, exact `GET`,
+`LATEST`, and ingestion-time `AS-OF` use a bounded `QHK1` ledger stored as one
+tenant-scoped KV value. A KV compare-and-set atomically closes the predecessor
+and appends its successor. The durable wire mutations fsync before reply.
+Readers pass explicit principal and scope contexts; project grants convey read
+access only, and record classification/SCI still gates the KV materialization.
+The focused native regression proves one winner/one conflict, exact historical
+recovery, half-open as-of intervals, grant/revoke and label isolation; the RESP
+suite includes the mandatory low-clearance/high-data negative. This is
+**partial** until the rest of the minimal schema, typed relations, audit,
+retry identity and crash-boundary recovery are implemented.
 
 **Acceptance:** Two writers updating the same version → one accepted, one conflict. `as_known_at` yields a reproducible previous state; latest state excludes superseded instruction from default retrieval; audit names actor and cited evidence without exposing restricted content.
 
@@ -229,4 +271,4 @@ Before adding a second event or transaction subsystem, inspect existing native Q
 
 Not a port of ai-memory's full Rust stack; not a second SQL/graph/vector database; not a blanket exception to SCI isolation; not model-driven reclassification; not forced deployment of an LLM; not cloud-based persistence; not a guarantee of quorum durability without cluster-specific evidence; not automatic merging of contradictory memories; not deletion of superseded evidence under the word "forget".
 
-**Next implementation action for QIHSE:** write QH-00's durability design and crash test first, then QH-01's scoped query semantics and authorization-negative tests. Implement the typed event API (QH-02) on those foundations. Everything else can be sequenced independently.
+**Next implementation action for QIHSE:** close QH-00's remaining WAL/fsync fault injection, receipt/LSN contract, migration coverage and P50/P95 overhead measurement, and QH-01's authorized migration, persistent scope indexes/load evidence and hierarchy tests. Then close QH-02 through QH-04 acceptance gaps before starting QH-05 querying.
