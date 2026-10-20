@@ -224,12 +224,7 @@ Only after QH-04's reversible versions exist, enable memory decay/dedup/compacti
 
 **Acceptance:** No cross-tenant/scope/SCI compaction; deterministic rollback reconstructs original records; abort mid-sweep leaves index and KV consistent; default settings reproduce pre-maintenance retrieval behavior.
 
-**First implementation:** native dry-run/durable `QHM1` plans apply a
-replacement only to one expected QHK head and rollback by appending the exact
-pre-maintenance content as another immutable successor. Applied plans survive
-restart and replay idempotently. This remains **partial** pending retention
-tiers, source hashes/provenance, cross-record transaction semantics, recall A/B
-fixtures and crash injection at every transition.
+**Accepted bounded implementation:** deterministic dry-run/durable `QHM2` plans bind one QHK head, typed operation, source/replacement SHA-256, target retention tier and the joined classification/SCI label. The five target tiers are working, episodic, semantic, procedural and pinned; pinned content is immutable to rewrites. Extractive replacements must be literal source substrings, retention-only changes preserve content, and records explicitly related as contradictory are rejected. Apply/rollback use immutable QHK successors; restart recovery recognizes a successor written before the plan-state fence. Fixed query/rollback, contradiction and low-clearance label tests cover the contract. Multi-lineage merges and sweep transactions remain explicitly unsupported until QIHSE has a cross-record atomic journal; no operation silently approximates them.
 
 ## QH-07 — Authorized snapshot/export/import projection
 
