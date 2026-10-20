@@ -6183,6 +6183,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             char id[QIHSE_AIMEM_ID_LEN + 1u], key[128], record[QIHSE_AIMEM_HANDOFF_RECORD_CAP];
             bool ok = qihse_uuid_generate(&uuid) && qihse_uuid_format(&uuid, id) &&
                 qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
+            bool evidence_allowed = true;
             qihse_aimem_handoff_t handoff;
             memset(&handoff, 0, sizeof handoff);
             if (ok) {
@@ -6205,6 +6206,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                             evidence_id, &scope, &evidence) &&
                         qihse_auth_can_access(session->user, evidence.classification,
                                               evidence.sci_compartment);
+                    if (!ok) evidence_allowed = false;
                     if (ok) {
                         snprintf(handoff.evidence_ids[handoff.evidence_count++],
                             QIHSE_AIMEM_ID_LEN + 1u, "%s", evidence_id);
@@ -6213,6 +6215,11 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                     free(evidence_id);
                 }
                 ok = ok && qihse_resp_aimem_handoff_encode(&handoff, record, sizeof record);
+            }
+            if (!evidence_allowed) {
+                free(summary);
+                return qihse_resp_error(session,
+                    "NOPERM AIMEM handoff evidence unavailable");
             }
             pthread_rwlock_wrlock(&session->server->kv_lock);
             if (ok) ok = qihse_kv_set_user(store, key, record,
