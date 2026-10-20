@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status:** proposed and not yet implemented; integrated into the QIHSE master roadmap as Workstream W10.  
+> **Status:** QH-00 initial implementation slice (durable RESP commands + serialized idempotency) in progress; full QH-00 crash atomicity, receipt/LSN contract and QH-01–QH-10 remain planned. Integrated into the master roadmap as W10.  
 > **Date:** 2026-10-20  
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-planned-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).  
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -56,6 +56,8 @@ They already provide authenticated local storage, lexical/semantic/hybrid recall
 **Minimum useful first batch:** QH-00, QH-01 and QH-02. Versioned curated memory, cross-project inboxes and LLM dreaming are not reasons to delay the simpler lifecycle improvements in the Supermemory roadmap.
 
 ## QH-00 — Durable acknowledgement and idempotent recovery
+
+**Implementation slice:** `AIMEM STORE-DURABLE` and `FORGET-DURABLE` are wired to `qihse_kv_sync_store()` under the RESP KV lock. Existing commands retain their old response shape and eventual durability. Idempotency key reuse with changed kind/content is refused; the key check and insertion are serialized, and a SIGKILL-after-ACK regression is included. This is **partial**: record + mapping remain two KV mutations, and crash before the mapping can create an orphan. Receipt/LSN tracking, exhaustive crash fault injection and measured overhead are still required. See [RESP protocol](docs/architecture/aimem_resp_protocol.md).
 
 **Existing constraint:** QIHSE [explicitly documents eventual durability](https://github.com/SWORDIntel/QIHSE/blob/main/docs/architecture/aimem_resp_protocol.md): recent `STORE` or `FORGET` mutations can disappear or revert after an immediate restart, despite a successful RESP acknowledgement.
 

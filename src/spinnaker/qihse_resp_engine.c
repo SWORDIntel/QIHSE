@@ -5485,7 +5485,7 @@ static bool qihse_resp_handle_memory(qihse_resp_session_t* session, const qihse_
  * can otherwise pass NULL).  The native memory implementation remains the
  * authority for classification/SCI filtering and ranking.
  */
-#define QIHSE_AIMEM_RESP_MAX_TEXT (256u * 1024u)
+#define QIHSE_AIMEM_RESP_MAX_TEXT (64u * 1024u)
 #define QIHSE_AIMEM_RESP_MAX_IDEM 128u
 
 static bool qihse_resp_aimem_principal(qihse_resp_session_t* session) {
@@ -5537,37 +5537,70 @@ static bool qihse_resp_aimem_emit_hit(qihse_resp_session_t* session,
            qihse_resp_bulk_text(session, hit->text ? hit->text : "");
 }
 
-static bool qihse_resp_aimem_store_one(qihse_resp_session_t* session,
-                                       uint32_t kind, const char* text,
-                                       const char* idem, char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+/* A committed QH-00 fence covers the memory, vector (when present) and its
+ * idempotency mapping.  Both STORE variants serialize the lookup/write path
+ * on kv_lock, otherwise two callers can observe the same absent key and both
+ * create different UUIDs.  The KV store's own lock protects native callers. */
+typedef enum {
+    QIHSE_AIMEM_ADMIT_FAILED = 0,
+    QIHSE_AIMEM_ADMIT_OK,
+    QIHSE_AIMEM_ADMIT_CONFLICT,
+    QIHSE_AIMEM_ADMIT_NOT_DURABLE
+} qihse_aimem_admit_result_t;
+
+static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
+        qihse_resp_session_t* session, uint32_t kind, const char* text,
+        const char* idem, bool durable, char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
     qihse_kv_store_t* store = qihse_resp_server_store(session->server);
     char map_key[192];
-    if (!store || !text || !*text || strlen(text) > QIHSE_AIMEM_RESP_MAX_TEXT) return false;
+    if (!store || !text || !*text || strlen(text) > QIHSE_AIMEM_RESP_MAX_TEXT)
+        return QIHSE_AIMEM_ADMIT_FAILED;
+
+    pthread_rwlock_wrlock(&session->server->kv_lock);
     if (idem) {
-        /* Keep idempotency metadata outside the native aimem: namespace so
-         * AIMEM COUNT and recall only describe memory records. */
+        /* The existing map key/UUID layout is preserved for old clients. */
         snprintf(map_key, sizeof map_key, "aimem-idem:%u:%s",
                  (unsigned)qihse_user_get_id(session->user), idem);
-        pthread_rwlock_rdlock(&session->server->kv_lock);
         char* existing = qihse_kv_get_user(store, map_key, session->user);
-        pthread_rwlock_unlock(&session->server->kv_lock);
         if (existing) {
-            bool valid = strlen(existing) == QIHSE_AIMEM_ID_LEN;
-            if (valid) memcpy(out_id, existing, QIHSE_AIMEM_ID_LEN + 1u);
+            /* An idempotency key is bound to its original kind AND bytes.
+             * A stale, malformed, hidden or altered target fails closed. */
+            qihse_ai_memory_hit_t hit;
+            memset(&hit, 0, sizeof hit);
+            bool same = strlen(existing) == QIHSE_AIMEM_ID_LEN &&
+                        qihse_ai_memory_get(session->server, session->user,
+                                            existing, &hit);
+            if (same) {
+                same = strcmp(hit.id, existing) == 0 && hit.kind == kind &&
+                       hit.text && strcmp(hit.text, text) == 0;
+                free(hit.text);
+            }
+            if (same) memcpy(out_id, existing, QIHSE_AIMEM_ID_LEN + 1u);
             free(existing);
-            return valid;
+            if (!same) {
+                pthread_rwlock_unlock(&session->server->kv_lock);
+                return QIHSE_AIMEM_ADMIT_CONFLICT;
+            }
+            bool fenced = !durable || qihse_kv_sync_store(store);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            return fenced ? QIHSE_AIMEM_ADMIT_OK : QIHSE_AIMEM_ADMIT_NOT_DURABLE;
         }
     }
-    if (!qihse_ai_memory_store(session->server, session->user, text, kind, out_id)) return false;
-    if (idem) {
+    bool ok = qihse_ai_memory_store(session->server, session->user, text, kind, out_id);
+    if (ok && idem) {
         uint16_t cls = qihse_user_get_classification(session->user);
         uint16_t sci = qihse_user_get_sci(session->user);
-        pthread_rwlock_wrlock(&session->server->kv_lock);
-        bool mapped = qihse_kv_set_user(store, map_key, out_id, cls, sci, session->user);
-        pthread_rwlock_unlock(&session->server->kv_lock);
-        if (!mapped) return false;
+        ok = qihse_kv_set_user(store, map_key, out_id, cls, sci, session->user);
     }
-    return true;
+    if (!ok) {
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        return QIHSE_AIMEM_ADMIT_FAILED; /* earlier steps may have admitted data */
+    }
+    /* No timing heuristic: a durable ACK is issued only after the native
+     * WAL/SSTable/directory fsync fence returns successfully. */
+    bool fenced = !durable || qihse_kv_sync_store(store);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    return fenced ? QIHSE_AIMEM_ADMIT_OK : QIHSE_AIMEM_ADMIT_NOT_DURABLE;
 }
 
 static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
@@ -5576,9 +5609,13 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         return qihse_resp_error(session, "NOAUTH AIMEM requires an authenticated active principal");
     if (request->argc < 2u) return qihse_resp_wrong_arity(session, "AIMEM");
 
-    if (qihse_resp_arg_equal(&request->argv[1], "STORE")) {
+    bool durable_store = qihse_resp_arg_equal(&request->argv[1], "STORE-DURABLE");
+    if (qihse_resp_arg_equal(&request->argv[1], "STORE") || durable_store) {
         if (request->argc != 4u && request->argc != 5u)
-            return qihse_resp_error(session, "ERR usage: AIMEM STORE <kind> <text> [idempotency-key]");
+            return qihse_resp_error(session, "ERR usage: AIMEM STORE[-DURABLE] <kind> <text> [idempotency-key]");
+        if (request->argv[3].len == 0u || request->argv[3].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
+            memchr(request->argv[3].data, '\0', request->argv[3].len))
+            return qihse_resp_error(session, "ERR AIMEM invalid or oversized text");
         uint32_t kind = 0;
         if (!qihse_resp_aimem_u32(&request->argv[2], &kind) ||
             (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC))
@@ -5593,9 +5630,15 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             idem = qihse_resp_arg_text(&request->argv[4]);
         }
         char id[QIHSE_AIMEM_ID_LEN + 1u];
-        bool ok = qihse_resp_aimem_store_one(session, kind, text, idem, id);
+        qihse_aimem_admit_result_t result =
+            qihse_resp_aimem_store_one(session, kind, text, idem, durable_store, id);
         free(text); free(idem);
-        return ok ? qihse_resp_bulk_text(session, id) : qihse_resp_error(session, "ERR AIMEM store failed");
+        if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
+            return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
+        if (result == QIHSE_AIMEM_ADMIT_NOT_DURABLE)
+            return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM admission not confirmed durable");
+        return result == QIHSE_AIMEM_ADMIT_OK ? qihse_resp_bulk_text(session, id)
+                                               : qihse_resp_error(session, "ERR AIMEM store failed");
     }
 
     if (qihse_resp_arg_equal(&request->argv[1], "GET")) {
@@ -5611,13 +5654,26 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         return emitted;
     }
 
+    bool durable_forget = qihse_resp_arg_equal(&request->argv[1], "FORGET-DURABLE");
     if (qihse_resp_arg_equal(&request->argv[1], "FORGET") ||
-        qihse_resp_arg_equal(&request->argv[1], "DELETE")) {
-        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "AIMEM FORGET");
+        qihse_resp_arg_equal(&request->argv[1], "DELETE") || durable_forget) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "AIMEM FORGET[-DURABLE]");
         char* id = qihse_resp_arg_text(&request->argv[2]);
-        bool ok = qihse_ai_memory_forget(session->server, session->user, id);
+        if (!id) return qihse_resp_error(session, "ERR out of memory");
+        if (!durable_forget) {
+            bool ok = qihse_ai_memory_forget(session->server, session->user, id);
+            free(id);
+            return qihse_resp_integer(session, ok ? 1 : 0);
+        }
+        qihse_kv_store_t* store = qihse_resp_server_store(session->server);
+        if (!store) { free(id); return qihse_resp_error(session, "ERR AIMEM store unavailable"); }
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool removed = qihse_ai_memory_forget(session->server, session->user, id);
+        bool fenced = qihse_kv_sync_store(store);
+        pthread_rwlock_unlock(&session->server->kv_lock);
         free(id);
-        return qihse_resp_integer(session, ok ? 1 : 0);
+        if (!fenced) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete not confirmed durable");
+        return qihse_resp_integer(session, removed ? 1 : 0);
     }
 
     if (qihse_resp_arg_equal(&request->argv[1], "COUNT")) {

@@ -169,6 +169,8 @@ jobs:
     - name: Run AI Memory Tests
       run: |
         make test-ai-memory
+        make test-aimem-resp
+        make test-aimem-durable-crash
 
     - name: Run Python SDK Tests
       run: |
