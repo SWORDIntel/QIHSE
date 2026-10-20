@@ -190,7 +190,7 @@ typedef struct {
     uint16_t bus_port;
     const char* bind_address;
     const char* xdp_interface;   /* NULL = standard UDP; set to enable AF_XDP */
-    const char* veil_key;        /* veiled framing key (cluster operator password);
+    const char* veil_key;        /* domain-separated veiled-framing key;
                                   * NULL/empty = passthrough (plain bus frames) */
     uint32_t heartbeat_ms;
     uint32_t timeout_ms;
@@ -257,6 +257,22 @@ typedef struct {
                           void* user_data);
     void* on_membership_user_data;
 } qihse_cluster_bus_config_t;
+
+/* The daemon derives independent transport keys from the shared cluster
+ * credential before handing them to the bus and overlay.  Keeping the labels
+ * here makes the separation part of the wire contract: every node derives the
+ * same key for a given plane, while compromise of one derived value does not
+ * disclose the credential or the other plane's key. */
+#define QIHSE_CLUSTER_DERIVED_KEY_BYTES 48u
+#define QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN (QIHSE_CLUSTER_DERIVED_KEY_BYTES * 2u)
+
+bool qihse_cluster_derive_bus_veil_key(
+    const char* cluster_credential,
+    char out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u]);
+
+bool qihse_cluster_derive_overlay_hmac_key(
+    const char* cluster_credential,
+    char out_hex[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u]);
 
 /* True when a bus message type is allowed to carry federation authority.
  *

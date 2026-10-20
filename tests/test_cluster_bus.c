@@ -431,6 +431,34 @@ static void test_veiled_framing(void) {
     printf("PASS veiled framing\n");
 }
 
+static void test_transport_key_derivation(void) {
+    static const char credential[] = "CorrectHorseBatteryStaple!";
+    static const char expected_bus[] =
+        "63252b580ac802b05e4a15d2ee4e00041c67783aaea3bb51cc1a0036bcce2423"
+        "b9bc34296733d46b577900a2703e71cd";
+    static const char expected_overlay[] =
+        "0c31e36be529a7d2418ee03a250b575aea52a47553757e466e324ee98b150db47"
+        "aee22dec6ab4d489087b184c7a225a6";
+    char bus[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u];
+    char overlay[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u];
+    char bus_again[QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN + 1u];
+
+    assert(!qihse_cluster_derive_bus_veil_key(NULL, bus));
+    assert(!qihse_cluster_derive_bus_veil_key("", bus));
+    assert(!qihse_cluster_derive_bus_veil_key(credential, NULL));
+    assert(qihse_cluster_derive_bus_veil_key(credential, bus));
+    assert(qihse_cluster_derive_overlay_hmac_key(credential, overlay));
+    assert(qihse_cluster_derive_bus_veil_key(credential, bus_again));
+    assert(strlen(bus) == QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN);
+    assert(strlen(overlay) == QIHSE_CLUSTER_DERIVED_KEY_HEX_LEN);
+    assert(strcmp(bus, expected_bus) == 0);
+    assert(strcmp(overlay, expected_overlay) == 0);
+    assert(strcmp(bus, overlay) != 0);
+    assert(strcmp(bus, credential) != 0);
+    assert(strcmp(bus, bus_again) == 0);
+    printf("PASS transport key derivation\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -441,6 +469,7 @@ int main(void) {
     test_meet_inject();
     test_fail_inject();
     test_bad_magic();
+    test_transport_key_derivation();
     test_veiled_framing();
     test_live_udp_roundtrip();
     printf("cluster bus tests passed\n");
