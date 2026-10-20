@@ -813,6 +813,114 @@ bool qihse_ai_memory_change_seq(qihse_resp_server_t* server,
                                     out_tombstone);
 }
 
+typedef struct {
+    const char* cursor;
+    qihse_kv_store_t* store;
+    qihse_user_t* user;
+    qihse_ai_memory_legacy_inventory_item_t* rows;
+    size_t limit;
+    size_t count;
+    bool extra;
+    bool failed;
+} aimem_legacy_inventory_scan_t;
+
+static bool aimem_legacy_inventory_cb(const char* key, const char* value,
+                                      void* user_data) {
+    aimem_legacy_inventory_scan_t* scan = user_data;
+    aimem_record_meta_t meta;
+    qihse_kv_record_meta_t stored_meta;
+    qihse_uuid_t uuid;
+    char canonical_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char canonical_key[64];
+    if (!scan || scan->failed) return true;
+    if (!key || strncmp(key, AIMEM_PREFIX, AIMEM_PREFIX_LEN) != 0 ||
+        !aimem_parse_meta(value, &meta, NULL) || meta.scope.project[0] ||
+        !qihse_uuid_parse(meta.id, &uuid) ||
+        !qihse_uuid_format(&uuid, canonical_id) ||
+        strcmp(meta.id, canonical_id) != 0 ||
+        !qihse_kv_meta_user(scan->store, key, scan->user, &stored_meta) ||
+        stored_meta.classification != meta.classification ||
+        stored_meta.sci_compartment != meta.sci_compartment) {
+        scan->failed = true;
+        return true;
+    }
+
+    /* Ignore malformed/colliding rows: an inventory item must identify the
+     * same canonical key that MIGRATE-LEGACY will resolve. */
+    aimem_key(canonical_key, sizeof canonical_key, aimem_doc_id(&uuid));
+    if (strcmp(key, canonical_key) != 0 ||
+        (scan->cursor[0] && strcmp(meta.id, scan->cursor) <= 0)) return true;
+
+    qihse_ai_memory_legacy_inventory_item_t item;
+    memset(&item, 0, sizeof item);
+    memcpy(item.id, meta.id, sizeof item.id);
+    item.created_ms = meta.created_ms;
+    item.kind = meta.kind;
+    item.classification = meta.classification;
+    item.sci_compartment = meta.sci_compartment;
+
+    size_t at = 0u;
+    while (at < scan->count && strcmp(scan->rows[at].id, item.id) < 0) at++;
+    if (scan->count < scan->limit) {
+        memmove(&scan->rows[at + 1u], &scan->rows[at],
+                (scan->count - at) * sizeof(*scan->rows));
+        scan->rows[at] = item;
+        scan->count++;
+    } else {
+        scan->extra = true;
+        if (at < scan->limit) {
+            memmove(&scan->rows[at + 1u], &scan->rows[at],
+                    (scan->limit - at - 1u) * sizeof(*scan->rows));
+            scan->rows[at] = item;
+        }
+    }
+    return true;
+}
+
+bool qihse_ai_memory_legacy_inventory(
+        qihse_resp_server_t* server, qihse_user_t* operator_user,
+        const char* cursor, size_t limit,
+        qihse_ai_memory_legacy_inventory_item_t* out, size_t* out_count,
+        char next_cursor[QIHSE_AIMEM_ID_LEN + 1u], bool* out_done) {
+    if (out_count) *out_count = 0u;
+    if (next_cursor) next_cursor[0] = '\0';
+    if (out_done) *out_done = false;
+    if (!server || !operator_user || !qihse_auth_user_is_active(operator_user) ||
+        qihse_user_get_tenant_id(operator_user) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(operator_user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_classification(operator_user) != UINT16_MAX ||
+        qihse_user_get_sci(operator_user) != UINT16_MAX || !cursor || !out ||
+        !out_count || !next_cursor || !out_done || !limit ||
+        limit > QIHSE_AIMEM_LEGACY_INVENTORY_PAGE_MAX) return false;
+
+    char normalized_cursor[QIHSE_AIMEM_ID_LEN + 1u] = "";
+    if (cursor[0]) {
+        qihse_uuid_t parsed;
+        if (!qihse_uuid_parse(cursor, &parsed) ||
+            !qihse_uuid_format(&parsed, normalized_cursor) ||
+            strcmp(cursor, normalized_cursor) != 0) return false;
+    }
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!store) return false;
+    memset(out, 0, limit * sizeof(*out));
+    aimem_legacy_inventory_scan_t scan = {
+        .cursor = normalized_cursor, .store = store, .user = operator_user,
+        .rows = out, .limit = limit
+    };
+    if (!qihse_kv_foreach_prefix_user(store, AIMEM_PREFIX, operator_user,
+                                      aimem_legacy_inventory_cb, &scan) ||
+        scan.failed) {
+        memset(out, 0, limit * sizeof(*out));
+        return false;
+    }
+    *out_count = scan.count;
+    *out_done = !scan.extra;
+    if (scan.extra && scan.count)
+        memcpy(next_cursor, scan.rows[scan.count - 1u].id,
+               QIHSE_AIMEM_ID_LEN + 1u);
+    return true;
+}
+
 static bool aimem_migrated_record_matches(const char* raw, const char* id,
         uint32_t owner_id, const qihse_ai_memory_scope_t* scope,
         const aimem_record_meta_t* source, const char* source_text) {

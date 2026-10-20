@@ -245,6 +245,26 @@ bool qihse_ai_memory_project_reader_allowed(qihse_resp_server_t* server,
 bool qihse_ai_memory_project_owner_allowed(qihse_resp_server_t* server,
     qihse_user_t* owner, const char* project);
 
+/* Metadata-only inventory for converting the historical, unscoped AIMEM
+ * namespace.  This surface deliberately omits record content.  It requires
+ * an active, fully cleared system Operator so an inventory can never be a
+ * partial view caused by classification filtering.  Pages are ordered by
+ * UUID; pass "" for the first page and the returned next_cursor thereafter.
+ * The store must be quiesced for a stable multi-page migration inventory. */
+#define QIHSE_AIMEM_LEGACY_INVENTORY_PAGE_MAX 1000u
+typedef struct {
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    uint64_t created_ms;
+    uint32_t kind;
+    uint16_t classification;
+    uint16_t sci_compartment;
+} qihse_ai_memory_legacy_inventory_item_t;
+bool qihse_ai_memory_legacy_inventory(
+    qihse_resp_server_t* server, qihse_user_t* operator_user,
+    const char* cursor, size_t limit,
+    qihse_ai_memory_legacy_inventory_item_t* out, size_t* out_count,
+    char next_cursor[QIHSE_AIMEM_ID_LEN + 1u], bool* out_done);
+
 /* Move one system-domain legacy memory into an explicit scoped record while
  * preserving UUID, timestamp, kind, classification, SCI and content. Only an
  * active system Operator may call this. The operation fences the destination
