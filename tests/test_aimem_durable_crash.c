@@ -357,6 +357,48 @@ static void verify_failed_fence_retry(void) {
     qihse_kv_store_destroy(store);
 }
 
+static void fail_event_fence_then_kill(int pipe_fd) {
+    open_instance();
+    char moved_root[96];
+    snprintf(moved_root, sizeof moved_root, "%s-moved", data_root);
+    const char* append[] = { "AIMEM", "EVENT", "APPEND", "qh02-fence",
+        "tree", "stream", "session", "fence-test", "qh02-fence-event",
+        "checkpoint", "1792500000000", "QH02-FENCE-RETRY" };
+    assert(rename(data_root, moved_root) == 0);
+    char* reply = command(operator_user, 12u, append);
+    assert(strstr(reply, "NOT_DURABLE"));
+    free(reply);
+    assert(rename(moved_root, data_root) == 0);
+    qihse_audit_flush();
+    write_exact(pipe_fd, "F", 1u);
+    kill(getpid(), SIGKILL);
+    _exit(100);
+}
+
+static void verify_event_fence_retry(void) {
+    open_instance();
+    const char* append[] = { "AIMEM", "EVENT", "APPEND", "qh02-fence",
+        "tree", "stream", "session", "fence-test", "qh02-fence-event",
+        "checkpoint", "1792500000000", "QH02-FENCE-RETRY" };
+    char* first = command(operator_user, 12u, append);
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    id_from_store(first, id);
+    free(first);
+    char* replay = command(operator_user, 12u, append);
+    char replay_id[QIHSE_AIMEM_ID_LEN + 1u];
+    id_from_store(replay, replay_id);
+    free(replay);
+    assert(strcmp(id, replay_id) == 0);
+    const char* count[] = { "AIMEM", "COUNT-SCOPED", "qh02-fence", "tree",
+        "stream", "session", "3" };
+    assert_response(operator_user, 7u, count, ":1\r\n");
+    const char* read[] = { "AIMEM", "EVENT", "READ", id,
+        "qh02-fence", "tree", "stream", "session" };
+    assert_response(operator_user, 8u, read, "QH02-FENCE-RETRY");
+    qihse_resp_server_destroy(server);
+    qihse_kv_store_destroy(store);
+}
+
 static void expect_killed(pid_t pid) {
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
@@ -369,6 +411,7 @@ int main(void) {
     assert(setenv("QIHSE_DATA_DIR", data_root, 1) == 0);
 
     int fd[2];
+    int fault_pipe[2];
     assert(pipe(fd) == 0);
     pid_t pid = fork();
     assert(pid >= 0);
@@ -403,6 +446,30 @@ int main(void) {
         _exit(0);
     }
     int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* QH-02: the RESP durability fence must report failure when the SSTable
+     * phase cannot reach its directory; restart/retry must recover one event. */
+    assert(pipe(fault_pipe) == 0);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fault_pipe[0]);
+        fail_event_fence_then_kill(fault_pipe[1]);
+    }
+    close(fault_pipe[1]);
+    read_exact(fault_pipe[0], &marker, 1u);
+    close(fault_pipe[0]);
+    assert(marker == 'F');
+    expect_killed(pid);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        verify_event_fence_retry();
+        _exit(0);
+    }
+    status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
@@ -485,7 +552,6 @@ int main(void) {
      * the SSTable phase cannot create its output, so the native durability
      * fence must fail. Restart then recovers the WAL record that crossed its
      * earlier fsync boundary. */
-    int fault_pipe[2];
     assert(pipe(fault_pipe) == 0);
     pid = fork();
     assert(pid >= 0);
@@ -508,6 +574,6 @@ int main(void) {
     status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    puts("PASS QH-00 crash/fence; QH-01 migration recovery; QH-02 event replay; QH-03 handoff recovery");
+    puts("PASS QH-00 crash/fence; QH-01 migration recovery; QH-02 event replay/fence; QH-03 handoff recovery");
     return 0;
 }

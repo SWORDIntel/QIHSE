@@ -77,7 +77,7 @@ classification/SCI and receive timestamp, stores a SHA-256 summary digest, and
 fsyncs the KV store before returning the deterministic event UUID. Replaying
 the same producer/event ID with identical immutable fields returns the same
 UUID; conflicting source time, kind or summary fails. Event records use schema
-`QHEV1` and status `observed`; unsupported event kinds are rejected. `EVENT
+`QHEV1` (or `QHEV2` when it carries evidence) and status `observed`; unsupported event kinds are rejected. `EVENT
 READ` returns the normal authorized hit shape and revalidates the envelope
 digest. `make test-aimem-durable-crash` kills the process after the durable
 append result is produced but before the simulated client receives it;
@@ -93,8 +93,8 @@ clients should retry a closed/failed request with the same producer/event ID.
 ## Claim-once handoffs (QH-03, first slice)
 
 `AIMEM HANDOFF OFFER <recipient-user-id> <ttl-ms> <project> <worktree>
-<workstream> <session> <summary>` creates a tenant-local, durable `QHH1`
-record and returns its UUID. The offering principal must own an in-project
+<workstream> <session> <summary> [evidence-uuid ...]` creates a tenant-local, durable `QHH2`
+record and returns its UUID. QHH1 records remain readable. Up to eight evidence IDs may be attached; each must resolve to a visible memory record in the exact scope, and the IDs are returned as a nested array. The offering principal must own an in-project
 record (or be an Operator), the named recipient must be active in the same
 tenant, and that recipient must hold an active project-reader grant. The scope
 and summary are bounded tokens/text; the server binds the owner, labels, SCI
@@ -111,14 +111,14 @@ than being re-offered automatically. Other callers receive a generic conflict
 or null reply, without a handoff summary. An authorized GET persists an OPEN to
 EXPIRED transition with a revision increment and fsync before returning it.
 
-The current lock and KV compare-and-set provide claim-once behavior among concurrent requests in one
-RESP server process; the regression races 100 callers and verifies the
-authorized recipient receives the durable accepted result while a competing
-principal is denied. The crash regression kills the server after durable
+The current lock and KV compare-and-set provide claim-once behavior across
+processes. The regression races 100 in-process callers and forked TCP clients,
+verifying that the authorized recipient receives the durable accepted result
+while a competing principal is denied. The crash regression kills the server after durable
 acceptance but before delivering the simulated reply; restart returns the same
 `ACCEPTED` result to the recipient's retry and hides the record from a
-competitor. A multiprocess network-client race, evidence pointers and an expiry
-persistence policy remain open before QH-03 is complete.
+competitor. Handoff evidence pointers are bounded and authorization-checked;
+expiry is persisted with a revision increment before the state is returned.
 
 ## Curated knowledge lineage (QH-04, first slice)
 
