@@ -12,9 +12,11 @@ ranking, and record visibility. A missing or revoked principal fails closed.
 
 ```text
 AIMEM STORE <kind> <text> [idempotency-key]
+AIMEM STORE-DURABLE <kind> <text> [idempotency-key]
 AIMEM RECALL <query> <limit> [bm25|semantic|hybrid] [kind]
 AIMEM GET <uuid>
 AIMEM FORGET <uuid>
+AIMEM FORGET-DURABLE <uuid>
 AIMEM COUNT [kind]
 ```
 
@@ -30,9 +32,12 @@ or already gone; `COUNT` returns a RESP integer. Errors are `-ERR …`, and
 authentication failures are `NOAUTH`/`NOPERM` as everywhere else.
 
 The optional idempotency key is scoped to the authenticated principal and
-returns the original UUID when a request is replayed. It is deliberately not a
-caller-supplied memory UUID: QIHSE still owns identifier generation and record
-layout.
+returns the original UUID **only when both the memory kind and exact text
+match** the original. Reusing a key with different kind/content (or a stale,
+deleted or inaccessible target) returns `-ERR CONFLICT`; it never silently
+replaces an earlier memory. RESP key lookup, admission and mapping are
+serialized under the server KV write lock, including concurrent agent retries.
+A caller never supplies the UUID: QIHSE still owns identifier generation.
 
 ## Embeddings and ranking
 
@@ -55,19 +60,53 @@ through the same authorization-aware path; an embedding is derived from the
 text and can leak it, so no mode can rank, score, or count a record the
 principal cannot see.
 
-## Durability
+## Durability — two distinct acknowledgement contracts (QH-00 partial)
 
-AIMEM records persist in the standalone server's KV store under `--dir`
-(WAL + SSTables) and survive restarts. Durability is eventual, not
-per-command: stores reach the store's durable state on the KV layer's own
-flush schedule, and a delete is a tombstone on that same schedule. In
-practice an immediate restart after `FORGET` can resurrect the deleted
-record until the tombstone reaches durable state — observed and reproduced.
-Treat AIMEM as eventually-durable: allow a grace period before assuming a
-store or delete survived a crash or restart, and rely on the idempotency
-key (stable source IDs + export cursor outside QIHSE) to make
-replay-after-loss safe. Upstream authoritative state (the mesh / committed
-transaction store) remains the durability story for anything that matters.
+The original `STORE` and `FORGET` commands preserve their **eventually
+durable** acknowledgement semantics. A successful legacy reply says that the
+KV operation was accepted, not that it survived power loss or immediate
+`SIGKILL`. No caller may treat a legacy acknowledgement as an fsync receipt.
+
+`STORE-DURABLE` and `FORGET-DURABLE` are additive, synchronous commands.
+They return the same UUID bulk string and integer result shapes, respectively,
+as the matching legacy commands, but only after
+`qihse_kv_sync_store()` succeeds. The existing KV fence flushes the WAL
+stdio buffer, `fsync`s it, commits the memtable to fsynced/renamed SSTables
+when needed, and `fsync`s the storage directory. The fence occurs while
+the RESP server holds its KV write lock. It covers the memory record or
+tombstone, any successful vector write, and its idempotency mapping.
+
+A failed fence responds `-ERR NOT_DURABLE`, **not** a success reply.
+The command may already have modified memory; the failure is not a rollback.
+Retry with an unchanged idempotency key after investigating the durability
+failure, and do not advance an upstream export/outbox cursor until a durable
+success. No ordinary AIMEM ACK certifies quorum/remote replication, and the
+local durability guarantee assumes the underlying filesystem/storage honors
+`fsync` and rename semantics.
+
+**Pre-ACK recovery (QH-00 second slice):** for new requests with an
+idempotency key, QIHSE derives a deterministic canonical UUID using the
+existing SHA-384 federation UUID helper, namespaced by authenticated
+tenant, principal and key. Before allocating a new memory, the native store
+checks this UUID's KV entry and refuses conflicting kind/text or full UUID
+mismatches. After a crash between the primary record write and the separate
+idempotency-map write, a retry locates the original document, verifies its
+content and repairs the missing map. Legacy random UUIDs with existing
+idempotency mappings retain their original IDs; no migration rewrites them.
+
+**Remaining QH-00 work:** this is **recoverable identity**, not atomic
+multi-key commit. Durable ACK still certifies only the local KV fence, not
+remote replication. Complete WAL-phase fault injection (including partial
+I/O errors and fsync faults), receipt/LSN design, idempotency-map migration
+behaviour, and measured P50/P95 fsync overhead remain required before
+declaring QH-00 complete. A failed admission may already have left a primary
+record; the caller must retry with the same key, not invent a new key.
+Deterministic identity binds to the authenticated numeric tenant/principal
+IDs, which must be restored consistently across process restarts.
+
+Index rebuild is derived from authoritative KV documents; a durable ACK
+does not certify semantic-index freshness if embedding/indexing fails.
+QH-01 scoped identity and QH-02 typed event journaling remain planned.
 
 ## Operational properties
 

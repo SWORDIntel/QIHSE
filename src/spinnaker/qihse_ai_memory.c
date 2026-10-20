@@ -463,56 +463,85 @@ static size_t aimem_vec_search(const float* qvec, size_t qdim, size_t want,
 
 /* ── write path ─────────────────────────────────────────────────────────── */
 
-bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
-                           const char* text, uint32_t kind,
-                           char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
-    if (!server || !user || !text || !*text) return false;
-    if (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC) return false;
+/* QH-00: the canonical ID of an idempotent memory is derived from a stable
+ * tenant/principal/key seed, not from a random UUID generated *before* the
+ * separate idempotency map is written. This makes a pre-map crash recoverable:
+ * replay resolves the original KV document rather than allocating a second.
+ *
+ * Writes through RESP are serialized by the server kv_lock. Native callers
+ * requiring exactly-once concurrent admission must provide equivalent
+ * serialization; the KV layer still enforces classification and SCI. */
+static qihse_ai_memory_write_result_t aimem_store_uuid(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const char* text, uint32_t kind, const qihse_uuid_t* uuid,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    if (!server || !user || !qihse_auth_user_is_active(user) ||
+        !text || !*text || !uuid) return QIHSE_AIMEM_WRITE_FAILED;
+    if (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC)
+        return QIHSE_AIMEM_WRITE_FAILED;
     size_t text_len = strlen(text);
-    if (text_len == 0 || text_len > AIMEM_MAX_TEXT) return false;
+    if (!text_len || text_len > AIMEM_MAX_TEXT) return QIHSE_AIMEM_WRITE_FAILED;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
-    if (!store) return false;
+    if (!store) return QIHSE_AIMEM_WRITE_FAILED;
 
-    qihse_uuid_t uuid;
-    if (!qihse_uuid_generate(&uuid)) return false;
     char id[QIHSE_AIMEM_ID_LEN + 1u];
-    if (!qihse_uuid_format(&uuid, id)) return false;
+    if (!qihse_uuid_format(uuid, id)) return QIHSE_AIMEM_WRITE_FAILED;
+    uint64_t doc_id = aimem_doc_id(uuid);
+    char key[64];
+    aimem_key(key, sizeof key, doc_id);
+
+    /* Before any write, resolve an existing *authorized* record, compare the
+     * complete UUID (only the top 64 bits appear in the KV key), then compare
+     * immutable kind and exact body. Never overwrite an existing record with
+     * a colliding or conflicting document ID. */
+    char* existing = qihse_kv_get_user(store, key, user);
+    if (existing) {
+        qihse_ai_memory_hit_t hit;
+        memset(&hit, 0, sizeof hit);
+        bool valid = aimem_parse_record(existing, &hit);
+        bool equal = valid && strcmp(hit.id, id) == 0 &&
+                     hit.kind == kind && hit.text &&
+                     strcmp(hit.text, text) == 0;
+        free(hit.text);
+        free(existing);
+        if (!equal) return QIHSE_AIMEM_WRITE_CONFLICT;
+        if (out_id) memcpy(out_id, id, sizeof id);
+        return QIHSE_AIMEM_WRITE_REPLAY;
+    }
 
     uint16_t classification = qihse_user_get_classification(user);
     uint16_t sci = qihse_user_get_sci(user);
-
     char* value = malloc(text_len + 128u);
-    if (!value) return false;
+    if (!value) return QIHSE_AIMEM_WRITE_FAILED;
     int n = snprintf(value, text_len + 128u, "%s|%llu|%u|%u|%u|%s", id,
                      (unsigned long long)aimem_now_ms(), (unsigned)kind,
                      (unsigned)classification, (unsigned)sci, text);
-    if (n <= 0) {
+    if (n <= 0 || (size_t)n >= text_len + 128u) {
         free(value);
-        return false;
+        return QIHSE_AIMEM_WRITE_FAILED;
     }
 
-    char key[64];
-    aimem_key(key, sizeof key, aimem_doc_id(&uuid));
+    /* A hidden colliding record is deliberately indistinguishable from a
+     * storage refusal: qihse_kv_set_user denies overwriting inaccessible
+     * rows even though the authorized get above returns NULL. */
     bool ok = qihse_kv_set_user(store, key, value, classification, sci, user);
     free(value);
-    if (!ok) return false;
+    if (!ok) return QIHSE_AIMEM_WRITE_FAILED;
 
-    /* Embed and persist the vector. A failure here is NOT fatal: the record is
-     * durable and still recallable lexically, so semantic ranking simply does
-     * not see it. Losing recall quality is better than losing the memory. */
+    /* Index and vector states are rebuildable projections, not canonical
+     * evidence. The primary document is authoritative for replay. */
     {
         float vec[QIHSE_AIMEM_MAX_DIM];
         size_t dim = g_aimem_embedder.dim;
         if (dim && dim <= QIHSE_AIMEM_MAX_DIM &&
             g_aimem_embedder.embed(text, vec, dim, g_aimem_embedder.ctx)) {
-            if (!aimem_vec_store(store, user, aimem_doc_id(&uuid), vec, dim,
+            if (!aimem_vec_store(store, user, doc_id, vec, dim,
                                  classification, sci)) {
-                fprintf(stderr, "qihse-ai-memory: record stored without a vector (id %s)\n", id);
+                fprintf(stderr, "qihse-ai-memory: record stored without vector\n");
             } else {
                 pthread_mutex_lock(&g_aimem_lock);
                 if (g_aimem_vecs_loaded) {
-                    (void)aimem_vecs_push(aimem_doc_id(&uuid), vec, dim,
-                                          classification, sci);
+                    (void)aimem_vecs_push(doc_id, vec, dim, classification, sci);
                 }
                 pthread_mutex_unlock(&g_aimem_lock);
             }
@@ -524,16 +553,46 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
     bool have_index = aimem_index_ensure(server, &rebuilt_now);
     bool indexed = have_index &&
                    (rebuilt_now ||
-                    qihse_fts_add_document_user(g_aimem_index, aimem_doc_id(&uuid), text,
+                    qihse_fts_add_document_user(g_aimem_index, doc_id, text,
                                                 text_len, classification, sci,
                                                 QIHSE_KEYSTONE_CLASS_UNKNOWN, user));
     pthread_mutex_unlock(&g_aimem_lock);
-    if (!indexed) {
-        /* Durable record without an index entry: recall by id still works. */
-        fprintf(stderr, "qihse-ai-memory: record stored but not indexed (id %s)\n", id);
-    }
+    if (!indexed) fprintf(stderr, "qihse-ai-memory: record stored without search index\n");
     if (out_id) memcpy(out_id, id, sizeof id);
-    return true;
+    return QIHSE_AIMEM_WRITE_NEW;
+}
+
+bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
+                           const char* text, uint32_t kind,
+                           char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    qihse_uuid_t uuid;
+    if (!qihse_uuid_generate(&uuid)) return false;
+    return aimem_store_uuid(server, user, text, kind, &uuid, out_id) ==
+           QIHSE_AIMEM_WRITE_NEW;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+        uint32_t kind, const char* idempotency_key,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    if (!user || !qihse_auth_user_is_active(user) || !idempotency_key)
+        return QIHSE_AIMEM_WRITE_FAILED;
+    size_t len = strnlen(idempotency_key, QIHSE_AIMEM_IDEM_MAX_LEN + 1u);
+    if (!len || len > QIHSE_AIMEM_IDEM_MAX_LEN) return QIHSE_AIMEM_WRITE_FAILED;
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)idempotency_key[i];
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.' || c == ':'))
+            return QIHSE_AIMEM_WRITE_FAILED;
+    }
+    char seed[QIHSE_AIMEM_IDEM_MAX_LEN + 80u];
+    int n = snprintf(seed, sizeof seed, "QIHSE:AIMEM:v2:%u:%u:%s",
+                     (unsigned)qihse_user_get_tenant_id(user),
+                     (unsigned)qihse_user_get_id(user), idempotency_key);
+    if (n <= 0 || (size_t)n >= sizeof seed) return QIHSE_AIMEM_WRITE_FAILED;
+    qihse_uuid_t uuid;
+    if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
+        return QIHSE_AIMEM_WRITE_FAILED;
+    return aimem_store_uuid(server, user, text, kind, &uuid, out_id);
 }
 
 /* ── read path ──────────────────────────────────────────────────────────── */
@@ -566,6 +625,15 @@ static bool aimem_fetch(qihse_resp_server_t* server, qihse_user_t* user,
     if (!value) return false;
     bool ok = aimem_parse_record(value, out);
     free(value);
+    /* KV keys encode only the UUID's first 64 bits. A different UUID with
+     * that prefix must never allow direct GET or FORGET of this document. */
+    char canonical[QIHSE_AIMEM_ID_LEN + 1u];
+    ok = ok && qihse_uuid_format(uuid, canonical) &&
+         strcmp(out->id, canonical) == 0;
+    if (!ok) {
+        free(out->text);
+        memset(out, 0, sizeof(*out));
+    }
     return ok;
 }
 
@@ -755,9 +823,16 @@ bool qihse_ai_memory_forget(qihse_resp_server_t* server, qihse_user_t* user,
     if (!qihse_uuid_parse(id, &uuid)) return false;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
     if (!store) return false;
+    /* Authenticate the complete UUID before deleting its truncated-key
+     * record: an unrelated UUID with the same prefix is not authority. */
+    qihse_ai_memory_hit_t existing;
+    memset(&existing, 0, sizeof existing);
+    if (!qihse_ai_memory_get(server, user, id, &existing)) return false;
+    free(existing.text);
     char key[64];
     aimem_key(key, sizeof key, aimem_doc_id(&uuid));
     bool ok = qihse_kv_del_user(store, key, user);
+    if (!ok) return false;
     /* Drop the vector as well, or a forgotten memory would keep ranking in
      * semantic recall — from the in-memory index too, not only the KV record:
      * a stale entry consumes a candidate slot and can push a visible memory

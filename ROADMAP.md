@@ -1,10 +1,12 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-17
+**Status date:** 2026-10-20
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
+
+**New planned workstream:** [W10 — AIMEM durability, scoped agent memory and versioned knowledge](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-planned-2026-10-20), with [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md). QH-00 now includes durable RESP verbs, deterministic idempotency recovery and direct-ID collision hardening; QH-01 through QH-10 remain planned.
 
 ---
 
@@ -618,6 +620,28 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 - [x] **W9.4 — Hardware SHA-NI Acceleration** (`include/qihse_sha256_shani.h`): Single-cycle 2-round hardware SHA-256 compression block routines.
 - [x] **W9.5 — Test Harness & Verification Suite** (`tests/test_zen_epyc_simd.c`, `Makefile` target `test-zen-epyc-simd`): 5-stage verification passing cleanly on host CPU with zero host crashes or regressions.
 
+### W10 — QIHSE AIMEM: durable, scoped, versioned agent memory (planned 2026-10-20)
+
+**Status:** QH-00 is partially implemented (synchronous durable RESP admission/forget, serialized idempotency, crash and authorization tests). New idempotent writes recover the same deterministic UUID after a pre-map crash instead of duplicating the original memory; QH-00 remains partial pending the full WAL/fault-injection/receipt gates. QH-01 through QH-10 remain planned. Full scope, wire-contract constraints, dependencies and acceptance tests: **[QIHSE_ENGINE_ROADMAP.md](QIHSE_ENGINE_ROADMAP.md)** at repository root. Consumer: [SWORDIntel/supermemory](https://github.com/SWORDIntel/supermemory/tree/qihse-backend/qihse-backend) and HAX lifecycle adapters. This is a **separate implementation lane**, not a replacement for W0–W9 or for existing authenticated AIMEM search.
+
+**Existing substrate — do not rebuild:** QIHSE AIMEM already supports authenticated `STORE`, `RECALL` (BM25 / real-ONNX semantic / hybrid), `GET`, `FORGET` and `COUNT`, with principal, tenant/classification/SCI checks, and principal-scoped idempotency. Legacy AIMEM commands remain **eventually durable**; opt-in `STORE-DURABLE`/`FORGET-DURABLE` use the native KV fsync fence and return success only after it completes. Current AIMEM RESP recall has no native project/worktree/session filter and no transactional handoff/version API. Preserve the documented five existing verbs and QIHSE as the sole authoritative store.
+
+- [~] **W10.1 / QH-00 — Durable AIMEM mutation receipts:** opt-in `STORE-DURABLE`/`FORGET-DURABLE` fence via `qihse_kv_sync_store()`; serialized replay now derives a stable SHA-384 UUID from authenticated tenant/principal/key, recovers the pre-map primary without duplicating it, rejects mismatched kind/text, and checks full UUID on direct GET/FORGET. Local `make test-aimem-replay-recovery` simulates a real SIGKILL before idempotency-map insertion. **Remaining:** comprehensive WAL/fence fault-injection (including failed fsync), immutable receipt/LSN semantics, migration cases and measured P50/P95 fsync overhead; multi-key writes are still not atomic. No GitHub Actions gate required for local validation.
+- [ ] **W10.2 / QH-01 — Native scoped memory with server-side authorization:** project, worktree, workstream and session identity; resolve actor and effective classification/SCI inside QIHSE, apply scope **before** top-K candidate selection/ranking/counts. Gate: low-clearance/high-data and same-actor/different-project negative controls; no post-top-K Python workaround.
+- [ ] **W10.3 / QH-02 — Authenticated typed lifecycle event journal:** immutable producer/event/session IDs, bounded schemas, owner-bound idempotent admission, replay/backpressure, versioned event vocabulary. Gate: at-least-once replays converge to one logical event; conflicting reuse of an ID fails closed.
+- [ ] **W10.4 / QH-03 — Claim-once agent handoffs:** typed offer/accept/cancel/expire state, recipient policy, atomic compare-and-swap, restart recovery; **offer, do not automatically claim on unrelated session start**. Gate: 100 concurrent claims admit exactly one authorized winner.
+- [ ] **W10.5 / QH-04 — Immutable knowledge/version lineage:** supersession with source-event IDs, distinct ingestion time and world-time claims, typed fixes/causes/contradicts edges, reversible evidence and approved-vs-proposed state. Gate: conflicting writers yield CAS conflict; historical facts remain accurately queryable.
+- [ ] **W10.6 / QH-05 — Rich authorized querying:** scoped/as-of search, exact version reads, keyset-paginated change listing, bounded ranking explanation and index-generation semantics. Gate: no hidden-record influence in results, scores, counts, page cursors, or related traversals.
+- [ ] **W10.7 / QH-06 — Conservative reversible memory maintenance:** type/tier retention, opt-in dedup/compaction, cross-session learning proposals and provenance preservation, never automatic cross-SCI merging. Gate: recall A/B and rollback tests pass without security regression.
+- [ ] **W10.8 / QH-07 — Authenticated memory export/import:** bounded snapshot with manifest, version lineage and label-aware Markdown/OKF projection. Gate: low-clearance export contains no restricted bytes, filenames or metadata; round-trip in disposable store reproduces authorized state.
+- [ ] **W10.9 / QH-08 — Operational assurance:** audit, content-free metrics, WAL durability lag, replay and index-rebuild health, unchanged real embedder-model identity and explicit failure. Gate: no log/metric disclosure of protected contents or cardinality.
+- [ ] **W10.10 / QH-09 — Scoped profile approvals (conditional):** try reusing QH-04's types before creating any new profile subsystem. Gate: assistant guesses never become operator-approved rules.
+- [ ] **W10.11 / QH-10 — Cross-project inbox (conditional):** explicit grants, bounded claim-once messages and leases over QH-01/QH-03. Gate: no unsolicited cross-project context or unauthorized read/pop.
+
+**Independent W10 critical path:** QH-00 (durability) + QH-01 (native scoping) → QH-02 (event journal) → QH-03/QH-04 (atomic handoffs and version lineage) → QH-05/06/07/08, with QH-09/10 only after demonstrated need. Client-side improvements may proceed separately; **do not merge QIHSE implementation changes without `5 gates and AGENTS.md's mandatory clearance/SCI negative tests**.
+
+---
+
 ## 4. Sequencing
 
 **Critical path:** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`
@@ -629,6 +653,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 | **Then** | F3 and F4 (can overlap), then F5 | Replication correctness before strong namespaces; trust plane lands before anything treats peers as authenticated |
 | **Later** | F6, then F7 | Supply-chain substrate needs journal + leases + trust; chaos/regression budgets gate the whole thing |
 | **Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
+| **Separate QIHSE AIMEM lane (planned)** | W10.1/QH-00 + W10.2/QH-01, then QH-02; remaining QH items dependency-gated | Native durable admission and authorization-aware project scoping before coordination, versioning or automated consolidation |
 
 Dependency notes:
 
@@ -653,6 +678,7 @@ Workstream-specific gates:
 - **Brain:** journal entries are reproducible from recorded inputs; no action without a journaled pre-condition; `--brain-act` off by default.
 - **Overlay:** a forged/expired IRC record never yields a MEET; a DHT record never yields membership.
 - **AI fabric:** every artifact path respects the fabric index authorization model (existing CI job) and the AGENTS.md security invariants.
+- **W10 AIMEM:** record and tombstone durability must be proved by crash tests; project/SCI restrictions precede every ranking/graph/count leg; new adapters require AGENTS.md low-clearance/high-data negative tests; versioned knowledge transformations remain reversible.
 
 ---
 
