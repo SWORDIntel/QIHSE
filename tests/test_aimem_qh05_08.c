@@ -41,7 +41,9 @@ int main(void) {
         QIHSE_ROLE_GUEST, 0u, 0u, "Qh0508Foreign123!", false);
     qihse_user_t* high = qihse_auth_create_tenant_user(op, 17u, 9504u,
         QIHSE_ROLE_GUEST, 5u, 0u, "Qh0508High123!", false);
-    assert(op && owner && reader && foreign && high);
+    qihse_user_t* tenant_op = qihse_auth_create_tenant_user(op, 17u, 9505u,
+        QIHSE_ROLE_OPERATOR, UINT16_MAX, UINT16_MAX, "Qh0508TenantOp123!", false);
+    assert(op && owner && reader && foreign && high && tenant_op);
 
     qihse_kv_store_t* store = qihse_kv_store_create(); assert(store);
     qihse_resp_server_t* server = make_server(store);
@@ -145,7 +147,8 @@ int main(void) {
         low_export.len, true, &imported) == QIHSE_AIMEM_IMPORT_FAILED);
     assert(imported == 0u); free(tampered);
 
-    assert(qihse_ai_memory_index_rebuild(server, owner, &scope));
+    assert(!qihse_ai_memory_index_rebuild(server, owner, &scope));
+    assert(qihse_ai_memory_index_rebuild(server, tenant_op, &scope));
     qihse_ai_memory_health_t health;
     assert(qihse_ai_memory_health(server, owner, &scope, &health));
     assert(health.ready && health.provider[0] && health.dimension > 0u);

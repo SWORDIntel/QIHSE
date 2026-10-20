@@ -366,14 +366,33 @@ qihse_ai_memory_import_result_t qihse_ai_memory_import_scope(
     bool dry_run, size_t* out_imported);
 void qihse_ai_memory_export_free(qihse_ai_memory_export_t* value);
 
-/* QH-08 redacted operational state.  Non-Operators receive provider/readiness
- * only; generation, high-water and counters are zeroed. */
+/* QH-08 generation-swapped derived index state.  A BUILDING generation is
+ * never selected for reads.  Recovery converts an interrupted BUILDING state
+ * to FAILED before a later rebuild may publish a new READY generation. */
+typedef enum {
+    QIHSE_AIMEM_INDEX_NONE = 0u,
+    QIHSE_AIMEM_INDEX_BUILDING = 1u,
+    QIHSE_AIMEM_INDEX_READY = 2u,
+    QIHSE_AIMEM_INDEX_FAILED = 3u
+} qihse_ai_memory_index_state_t;
+
+/* Non-Operators receive provider/dimension/readiness only.  State,
+ * generations, high-water marks and all content-free counters are zeroed. */
 typedef struct {
     char provider[65];
     size_t dimension;
     bool ready;
+    uint32_t index_state;
     uint64_t generation;
+    uint64_t candidate_generation;
     uint64_t source_highwater;
+    uint64_t indexed_records;
+    uint64_t rebuild_started;
+    uint64_t rebuild_ready;
+    uint64_t rebuild_failed;
+    uint64_t provider_failures;
+    uint64_t recovered_builds;
+    uint64_t audit_events;
     uint64_t query_snapshots;
     uint64_t maintenance_versions;
     uint64_t exports;
@@ -381,6 +400,8 @@ typedef struct {
     uint64_t rejected;
 } qihse_ai_memory_health_t;
 bool qihse_ai_memory_index_rebuild(qihse_resp_server_t* server,
+    qihse_user_t* user, const qihse_ai_memory_scope_t* scope);
+bool qihse_ai_memory_index_recover(qihse_resp_server_t* server,
     qihse_user_t* user, const qihse_ai_memory_scope_t* scope);
 bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
     const qihse_ai_memory_scope_t* scope, qihse_ai_memory_health_t* out);

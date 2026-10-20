@@ -5696,6 +5696,55 @@ static bool qihse_resp_aimem_emit_knowledge(qihse_resp_session_t* session,
         qihse_resp_bulk_text(session, value->content);
 }
 
+static const char* qihse_resp_aimem_index_state_name(uint32_t state) {
+    switch (state) {
+        case QIHSE_AIMEM_INDEX_BUILDING: return "BUILDING";
+        case QIHSE_AIMEM_INDEX_READY: return "READY";
+        case QIHSE_AIMEM_INDEX_FAILED: return "FAILED";
+        default: return "NONE";
+    }
+}
+
+static bool qihse_resp_aimem_emit_health(qihse_resp_session_t* session,
+        const qihse_ai_memory_health_t* health) {
+    char dim[32], ready[4], generation[32], candidate[32], highwater[32];
+    char indexed[32], started[32], completed[32], failed[32], provider_failed[32];
+    char recovered[32], audit[32], query[32], maintenance[32], exports[32];
+    char imports[32], rejected[32];
+#define QH08_NUM(buf, value) snprintf((buf), sizeof(buf), "%llu", (unsigned long long)(value))
+    snprintf(dim, sizeof dim, "%zu", health->dimension);
+    snprintf(ready, sizeof ready, "%u", health->ready ? 1u : 0u);
+    QH08_NUM(generation, health->generation); QH08_NUM(candidate, health->candidate_generation);
+    QH08_NUM(highwater, health->source_highwater); QH08_NUM(indexed, health->indexed_records);
+    QH08_NUM(started, health->rebuild_started); QH08_NUM(completed, health->rebuild_ready);
+    QH08_NUM(failed, health->rebuild_failed); QH08_NUM(provider_failed, health->provider_failures);
+    QH08_NUM(recovered, health->recovered_builds); QH08_NUM(audit, health->audit_events);
+    QH08_NUM(query, health->query_snapshots); QH08_NUM(maintenance, health->maintenance_versions);
+    QH08_NUM(exports, health->exports); QH08_NUM(imports, health->imports);
+    QH08_NUM(rejected, health->rejected);
+#undef QH08_NUM
+    return qihse_resp_array(session, 38u) &&
+        qihse_resp_bulk_text(session, "provider") && qihse_resp_bulk_text(session, health->provider) &&
+        qihse_resp_bulk_text(session, "dimension") && qihse_resp_bulk_text(session, dim) &&
+        qihse_resp_bulk_text(session, "ready") && qihse_resp_bulk_text(session, ready) &&
+        qihse_resp_bulk_text(session, "state") && qihse_resp_bulk_text(session, qihse_resp_aimem_index_state_name(health->index_state)) &&
+        qihse_resp_bulk_text(session, "generation") && qihse_resp_bulk_text(session, generation) &&
+        qihse_resp_bulk_text(session, "candidate-generation") && qihse_resp_bulk_text(session, candidate) &&
+        qihse_resp_bulk_text(session, "source-highwater") && qihse_resp_bulk_text(session, highwater) &&
+        qihse_resp_bulk_text(session, "indexed-records") && qihse_resp_bulk_text(session, indexed) &&
+        qihse_resp_bulk_text(session, "rebuild-started") && qihse_resp_bulk_text(session, started) &&
+        qihse_resp_bulk_text(session, "rebuild-ready") && qihse_resp_bulk_text(session, completed) &&
+        qihse_resp_bulk_text(session, "rebuild-failed") && qihse_resp_bulk_text(session, failed) &&
+        qihse_resp_bulk_text(session, "provider-failures") && qihse_resp_bulk_text(session, provider_failed) &&
+        qihse_resp_bulk_text(session, "recovered-builds") && qihse_resp_bulk_text(session, recovered) &&
+        qihse_resp_bulk_text(session, "audit-events") && qihse_resp_bulk_text(session, audit) &&
+        qihse_resp_bulk_text(session, "query-snapshots") && qihse_resp_bulk_text(session, query) &&
+        qihse_resp_bulk_text(session, "maintenance-versions") && qihse_resp_bulk_text(session, maintenance) &&
+        qihse_resp_bulk_text(session, "exports") && qihse_resp_bulk_text(session, exports) &&
+        qihse_resp_bulk_text(session, "imports") && qihse_resp_bulk_text(session, imports) &&
+        qihse_resp_bulk_text(session, "rejected") && qihse_resp_bulk_text(session, rejected);
+}
+
 static bool qihse_resp_aimem_principal(qihse_resp_session_t* session) {
     return session && session->user && qihse_auth_user_is_active(session->user);
 }
@@ -5936,8 +5985,40 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         !qihse_resp_arg_equal(&request->argv[1], "EVENT") &&
         !qihse_resp_arg_equal(&request->argv[1], "PROJECT") &&
         !qihse_resp_arg_equal(&request->argv[1], "KNOWLEDGE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "REBUILD") &&
+        !qihse_resp_arg_equal(&request->argv[1], "HEALTH") &&
         !qihse_resp_arg_equal(&request->argv[1], "HANDOFF"))
         return qihse_resp_error(session, "ERR tenant AIMEM access requires explicit project scope");
+
+    if (qihse_resp_arg_equal(&request->argv[1], "REBUILD") ||
+        qihse_resp_arg_equal(&request->argv[1], "HEALTH")) {
+        bool rebuild = qihse_resp_arg_equal(&request->argv[1], "REBUILD");
+        if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_classification(session->user) != UINT16_MAX ||
+            qihse_user_get_sci(session->user) != UINT16_MAX)
+            return qihse_resp_error(session,
+                "NOPERM AIMEM index control requires a fully cleared Operator");
+        if (request->argc != 6u)
+            return qihse_resp_error(session, rebuild
+                ? "ERR usage: AIMEM REBUILD <project> <worktree> <workstream> <session>"
+                : "ERR usage: AIMEM HEALTH <project> <worktree> <workstream> <session>");
+        qihse_ai_memory_scope_t scope;
+        if (!qihse_resp_aimem_scope_parse(request, 2u, &scope))
+            return qihse_resp_error(session, "ERR invalid AIMEM index scope");
+        if (rebuild) {
+            pthread_rwlock_wrlock(&session->server->kv_lock);
+            bool ok = qihse_ai_memory_index_rebuild(session->server, session->user, &scope);
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            return ok ? qihse_resp_simple(session, "OK") : qihse_resp_error(session,
+                "ERR NOT_DURABLE AIMEM index rebuild failed or was not durably confirmed");
+        }
+        qihse_ai_memory_health_t health;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = qihse_ai_memory_health(session->server, session->user, &scope, &health);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        return ok ? qihse_resp_aimem_emit_health(session, &health) :
+            qihse_resp_error(session, "ERR AIMEM health unavailable");
+    }
 
     if (qihse_resp_arg_equal(&request->argv[1], "MIGRATE-LEGACY")) {
         if (request->argc != 7u)
