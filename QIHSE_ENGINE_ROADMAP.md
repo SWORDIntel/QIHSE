@@ -1,6 +1,6 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
-> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-04 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, and QHK2 provenance/approval policy. QH-05–QH-08 now have native bounded query snapshots, reversible one-lineage maintenance, authenticated canonical projection and redacted rebuild health, with focused restart/security coverage; their remaining wire, richer projection, multi-record, telemetry and generation-cutover gates are described below. QH-09 is closed through scoped `RULE` reuse and QH-10 remains conditional. Integrated into the master roadmap as W10.
+> **Status (2026-10-20):** W10 is the only open implementation workstream. QH-00–QH-05 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, QHK2 provenance/approval policy, and bounded versioned query cursors with secure ranking/time projections. QH-06–QH-08 retain reversible-maintenance, multi-record projection and operational index-generation gates described below. QH-09 is closed through scoped `RULE` reuse and QH-10 remains conditional. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
 > **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
@@ -208,8 +208,16 @@ materializes at most 4,096 already-authorized QHK versions, applies explicit
 scope/type/status/current/time/text filters and stable `(ingest time, UUID)`
 ordering, then rechecks actor, grant and labels on every page. This gives a
 fixed process-local view under concurrent writes and fails closed after grant
-revocation. It remains **partial** pending wire cursors, changed-since listing,
-BM25/ANN/RRF integration, relation/as-of projection and bounded explain output.
+revocation. `AIMEM QUERY V1 BEGIN/NEXT/END` provides a random principal-bound
+RESP cursor with a five-minute expiry; changed-since is exclusive and bounded
+by `max_rows`; BM25, active-embedder cosine and RRF rank the same already
+authorized materialization; as-of selects the version whose half-open ingestion
+interval contains the cutoff; relation output is reauthorized target-by-target;
+explain reports bounded scores and ranking-leg flags. Focused native and RESP
+tests cover concurrent paging, cursor principal isolation, mid-query writes,
+revocation, time windows and semantic/hybrid evidence. Query text is capped at
+1 KiB, snapshots at 4,096 rows and wire pages at 128 rows. Snapshots are
+process-local and must be restarted after process loss.
 
 ## QH-06 — Conservative maintenance primitives
 

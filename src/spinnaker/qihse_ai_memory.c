@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -2848,6 +2849,9 @@ typedef struct {
     uint16_t classification;
     uint16_t sci;
     double lexical_score;
+    double semantic_score;
+    double ranking_score;
+    uint32_t explain_flags;
 } aimem_query_row_t;
 
 struct qihse_ai_memory_query_snapshot {
@@ -2855,6 +2859,7 @@ struct qihse_ai_memory_query_snapshot {
     uint32_t tenant_id;
     uint32_t user_id;
     qihse_ai_memory_scope_t scope;
+    qihse_ai_memory_mode_t mode;
     aimem_query_row_t* rows;
     size_t count;
     size_t offset;
@@ -2892,6 +2897,14 @@ static int aimem_query_row_compare(const void* a, const void* b) {
     return strcmp(x->version.version_id, y->version.version_id);
 }
 
+static int aimem_query_result_compare(const void* a, const void* b) {
+    const aimem_query_row_t* x = a;
+    const aimem_query_row_t* y = b;
+    if (x->ranking_score > y->ranking_score) return -1;
+    if (x->ranking_score < y->ranking_score) return 1;
+    return aimem_query_row_compare(a, b);
+}
+
 typedef struct {
     qihse_resp_server_t* server;
     qihse_user_t* user;
@@ -2911,25 +2924,124 @@ static bool aimem_query_build_cb(const char* key, const char* value, void* opaqu
         (!b->query->type || b->query->type == chain.type);
     qihse_kv_record_meta_t meta;
     if (allowed) allowed = qihse_kv_meta_user(store, key, b->user, &meta);
-    for (size_t i = 0; allowed && i < chain.count; i++) {
+    size_t first = 0u, last = chain.count;
+    if (b->query->as_of_ingest_ms) {
+        last = 0u;
+        for (size_t i = 0u; i < chain.count; i++) {
+            qihse_ai_memory_knowledge_version_t* v = &chain.versions[i];
+            if (v->valid_from_ingest_ms <= b->query->as_of_ingest_ms &&
+                (!v->valid_to_ingest_ms || b->query->as_of_ingest_ms < v->valid_to_ingest_ms)) {
+                first = i; last = i + 1u; break;
+            }
+        }
+    }
+    for (size_t i = first; allowed && i < last; i++) {
         qihse_ai_memory_knowledge_version_t* v = &chain.versions[i];
-        bool current = i + 1u == chain.count;
+        bool current = b->query->as_of_ingest_ms ? true : i + 1u == chain.count;
         if ((b->query->current_only && !current) ||
             (b->query->status && b->query->status != v->status) ||
             (b->query->ingest_from_ms && v->valid_from_ingest_ms < b->query->ingest_from_ms) ||
             (b->query->ingest_to_ms && v->valid_from_ingest_ms > b->query->ingest_to_ms) ||
-            !aimem_contains_fold(v->content, b->query->text)) continue;
+            (b->query->changed_since_ms && v->valid_from_ingest_ms <= b->query->changed_since_ms) ||
+            (b->query->mode == QIHSE_AIMEM_MODE_BM25 &&
+             !aimem_contains_fold(v->content, b->query->text))) continue;
         if (b->count >= b->query->max_rows) { b->failed = true; break; }
         aimem_query_row_t* row = &b->rows[b->count];
         if (!aimem_knowledge_copy(v, &row->version)) { b->failed = true; break; }
         row->owner_id = chain.owner_id;
         row->classification = meta.classification;
         row->sci = meta.sci_compartment;
-        row->lexical_score = b->query->text && *b->query->text ? 1.0 : 0.0;
+        row->lexical_score = 0.0;
+        row->semantic_score = 0.0;
+        row->ranking_score = 0.0;
+        row->explain_flags = current ? QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT : 0u;
         b->count++;
     }
     aimem_knowledge_chain_free(&chain);
     return !b->failed;
+}
+
+typedef struct { size_t index; double score; } aimem_query_rank_t;
+
+static int aimem_query_rank_desc(const void* a, const void* b) {
+    const aimem_query_rank_t* x = a;
+    const aimem_query_rank_t* y = b;
+    if (x->score > y->score) return -1;
+    if (x->score < y->score) return 1;
+    return x->index < y->index ? -1 : x->index > y->index ? 1 : 0;
+}
+
+static bool aimem_query_rank(aimem_query_row_t* rows, size_t count,
+        const qihse_ai_memory_query_v1_t* query, qihse_user_t* user) {
+    if (!count || !query->text || !*query->text) return true;
+    bool want_lexical = query->mode != QIHSE_AIMEM_MODE_SEMANTIC;
+    bool want_semantic = query->mode != QIHSE_AIMEM_MODE_BM25;
+    aimem_query_rank_t* ranks = calloc(count, sizeof(*ranks));
+    if (!ranks) return false;
+    if (want_lexical) {
+        qihse_fts_index_t* index = qihse_fts_create();
+        bool ok = index != NULL;
+        for (size_t i = 0; ok && i < count; i++)
+            ok = qihse_fts_add_document_user(index, (uint64_t)i + 1u,
+                rows[i].version.content, strlen(rows[i].version.content),
+                rows[i].classification, rows[i].sci,
+                QIHSE_KEYSTONE_CLASS_CORPORATE, user);
+        qihse_fts_result_t* hits = ok ? calloc(count, sizeof(*hits)) : NULL;
+        if (ok && !hits) ok = false;
+        int found = ok ? qihse_fts_search_user(index, query->text, user, hits,
+            count > INT_MAX ? INT_MAX : (int)count) : -1;
+        if (found < 0) ok = false;
+        for (int i = 0; ok && i < found; i++) {
+            uint64_t id = hits[i].doc_id;
+            if (!id || id > count) { ok = false; break; }
+            aimem_query_row_t* row = &rows[id - 1u];
+            row->lexical_score = hits[i].bm25_score;
+            row->explain_flags |= QIHSE_AIMEM_QUERY_EXPLAIN_BM25 |
+                                  QIHSE_AIMEM_QUERY_EXPLAIN_TEXT_MATCH;
+            ranks[i].index = (size_t)(id - 1u);
+            ranks[i].score = hits[i].bm25_score;
+        }
+        if (ok && !want_semantic)
+            for (int i = 0; i < found; i++)
+                rows[ranks[i].index].ranking_score = (double)(found - i);
+        if (ok && want_semantic)
+            for (int i = 0; i < found; i++)
+                rows[ranks[i].index].ranking_score = 1.0 / (60.0 + (double)i + 1.0);
+        free(hits); qihse_fts_destroy(index);
+        if (!ok) { free(ranks); return false; }
+    }
+    if (want_semantic) {
+        size_t dim = qihse_ai_memory_embedding_dim();
+        float qvec[QIHSE_AIMEM_MAX_DIM];
+        if (!dim || dim > QIHSE_AIMEM_MAX_DIM ||
+            !qihse_ai_memory_embed_text(query->text, qvec, dim)) {
+            free(ranks); return false;
+        }
+        for (size_t i = 0; i < count; i++) {
+            float vec[QIHSE_AIMEM_MAX_DIM];
+            if (!qihse_ai_memory_embed_text(rows[i].version.content, vec, dim)) {
+                free(ranks); return false;
+            }
+            double dot = 0.0, qn = 0.0, vn = 0.0;
+            for (size_t j = 0; j < dim; j++) {
+                dot += (double)qvec[j] * vec[j];
+                qn += (double)qvec[j] * qvec[j];
+                vn += (double)vec[j] * vec[j];
+            }
+            rows[i].semantic_score = qn > 0.0 && vn > 0.0 ? dot / sqrt(qn * vn) : 0.0;
+            rows[i].explain_flags |= QIHSE_AIMEM_QUERY_EXPLAIN_SEMANTIC;
+            ranks[i].index = i; ranks[i].score = rows[i].semantic_score;
+        }
+        qsort(ranks, count, sizeof(*ranks), aimem_query_rank_desc);
+        for (size_t i = 0; i < count; i++) {
+            if (query->mode == QIHSE_AIMEM_MODE_HYBRID) {
+                rows[ranks[i].index].ranking_score += 1.0 / (60.0 + (double)i + 1.0);
+                rows[ranks[i].index].explain_flags |= QIHSE_AIMEM_QUERY_EXPLAIN_RRF;
+            } else rows[ranks[i].index].ranking_score = (double)(count - i);
+        }
+    }
+    free(ranks);
+    return true;
 }
 
 qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
@@ -2938,6 +3050,12 @@ qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
     if (!server || !user || !qihse_auth_user_is_active(user) || !query ||
         !aimem_scope_valid(&query->scope) || !query->max_rows ||
         query->max_rows > QIHSE_AIMEM_QUERY_MAX_ROWS ||
+        (query->text && strlen(query->text) > QIHSE_AIMEM_QUERY_MAX_TEXT_BYTES) ||
+        (query->mode != QIHSE_AIMEM_MODE_BM25 &&
+         query->mode != QIHSE_AIMEM_MODE_SEMANTIC &&
+         query->mode != QIHSE_AIMEM_MODE_HYBRID) ||
+        (query->as_of_ingest_ms && (query->changed_since_ms ||
+         query->ingest_from_ms || query->ingest_to_ms)) ||
         (query->type && !aimem_knowledge_type_valid(query->type)) ||
         (query->status && (query->status < QIHSE_AIMEM_KNOWLEDGE_PROPOSED ||
                            query->status > QIHSE_AIMEM_KNOWLEDGE_RETRACTED))) {
@@ -2959,12 +3077,19 @@ qihse_ai_memory_query_snapshot_t* qihse_ai_memory_query_begin(
             qihse_ai_memory_knowledge_free(&snap->rows[i].version);
         free(snap->rows); free(snap); aimem_counter_inc(&g_aimem_rejected); return NULL;
     }
+    if (!aimem_query_rank(snap->rows, build.count, query, user)) {
+        for (size_t i = 0; i < build.count; i++)
+            qihse_ai_memory_knowledge_free(&snap->rows[i].version);
+        free(snap->rows); free(snap); aimem_counter_inc(&g_aimem_rejected); return NULL;
+    }
     snap->server = server;
     snap->tenant_id = qihse_user_get_tenant_id(user);
     snap->user_id = qihse_user_get_id(user);
     snap->scope = query->scope;
+    snap->mode = query->mode;
     snap->count = build.count;
-    qsort(snap->rows, snap->count, sizeof(*snap->rows), aimem_query_row_compare);
+    qsort(snap->rows, snap->count, sizeof(*snap->rows),
+          query->text && *query->text ? aimem_query_result_compare : aimem_query_row_compare);
     aimem_counter_inc(&g_aimem_query_snapshots);
     return snap;
 }
@@ -2980,17 +3105,47 @@ size_t qihse_ai_memory_query_next(qihse_ai_memory_query_snapshot_t* snap,
     size_t count = 0u;
     while (count < out_cap && snap->offset < snap->count) {
         aimem_query_row_t* row = &snap->rows[snap->offset];
-        if (!qihse_auth_can_access(user, row->classification, row->sci) ||
+        qihse_ai_memory_knowledge_version_t live;
+        bool live_visible = qihse_ai_memory_knowledge_get(snap->server, user,
+            row->version.version_id, &snap->scope, &live);
+        if (!live_visible || !qihse_auth_can_access(user, row->classification, row->sci) ||
             !aimem_scope_owner_allowed(store, user, row->owner_id, &snap->scope)) {
+            if (live_visible) qihse_ai_memory_knowledge_free(&live);
             aimem_counter_inc(&g_aimem_rejected); return 0u;
         }
+        qihse_ai_memory_knowledge_free(&live);
         memset(&out[count], 0, sizeof(out[count]));
         if (!aimem_knowledge_copy(&row->version, &out[count].version)) break;
+        qihse_ai_memory_knowledge_version_t* projected = &out[count].version;
+        size_t relations_kept = 0u;
+        for (size_t i = 0; i < projected->relation_count; i++) {
+            qihse_ai_memory_knowledge_version_t target;
+            if (!qihse_ai_memory_knowledge_get(snap->server, user,
+                projected->relations[i].target_version_id,
+                &projected->relations[i].target_scope, &target)) continue;
+            qihse_ai_memory_knowledge_free(&target);
+            if (relations_kept != i) projected->relations[relations_kept] = projected->relations[i];
+            relations_kept++;
+        }
+        projected->relation_count = relations_kept;
+        size_t sources_kept = 0u;
+        for (size_t i = 0; i < projected->source_event_count; i++) {
+            qihse_ai_memory_hit_t event;
+            if (!qihse_ai_memory_event_get(snap->server, user,
+                projected->source_event_ids[i], &projected->scope, &event)) continue;
+            free(event.text);
+            if (sources_kept != i)
+                memcpy(projected->source_event_ids[sources_kept],
+                    projected->source_event_ids[i], QIHSE_AIMEM_ID_LEN + 1u);
+            sources_kept++;
+        }
+        projected->source_event_count = sources_kept;
         out[count].lexical_score = row->lexical_score;
-        out[count].current = row->version.valid_to_ingest_ms == 0u;
-        out[count].explain_flags =
-            (row->lexical_score > 0.0 ? QIHSE_AIMEM_QUERY_EXPLAIN_TEXT_MATCH : 0u) |
-            (out[count].current ? QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT : 0u);
+        out[count].semantic_score = row->semantic_score;
+        out[count].ranking_score = row->ranking_score;
+        out[count].current = row->explain_flags & QIHSE_AIMEM_QUERY_EXPLAIN_CURRENT;
+        out[count].ranking_mode = (uint32_t)snap->mode;
+        out[count].explain_flags = row->explain_flags;
         count++; snap->offset++;
     }
     return count;

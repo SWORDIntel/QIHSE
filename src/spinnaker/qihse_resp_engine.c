@@ -5696,6 +5696,96 @@ static bool qihse_resp_aimem_emit_knowledge(qihse_resp_session_t* session,
         qihse_resp_bulk_text(session, value->content);
 }
 
+#define QIHSE_AIMEM_RESP_QUERY_CURSORS 128u
+#define QIHSE_AIMEM_RESP_QUERY_TTL_SEC 300u
+typedef struct {
+    bool used;
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    uint32_t tenant_id;
+    uint32_t user_id;
+    qihse_user_t* principal;
+    uint64_t expires_at;
+    qihse_resp_server_t* server;
+    qihse_ai_memory_query_snapshot_t* snapshot;
+} qihse_resp_aimem_query_cursor_t;
+static qihse_resp_aimem_query_cursor_t g_aimem_query_cursors[QIHSE_AIMEM_RESP_QUERY_CURSORS];
+static pthread_mutex_t g_aimem_query_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t qihse_resp_monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return (uint64_t)now.tv_sec;
+}
+
+static void qihse_resp_aimem_query_cursor_expire(uint64_t now) {
+    for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++) {
+        qihse_resp_aimem_query_cursor_t* entry = &g_aimem_query_cursors[i];
+        if (entry->used && entry->expires_at <= now) {
+            qihse_ai_memory_query_end(entry->snapshot);
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+}
+
+static void qihse_resp_aimem_query_cursors_clear_server(qihse_resp_server_t* server) {
+    if (!server) return;
+    pthread_mutex_lock(&g_aimem_query_cursor_lock);
+    for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++) {
+        qihse_resp_aimem_query_cursor_t* entry = &g_aimem_query_cursors[i];
+        if (entry->used && entry->server == server) {
+            qihse_ai_memory_query_end(entry->snapshot);
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+}
+
+static bool qihse_resp_aimem_emit_query_hit(qihse_resp_session_t* session,
+        const qihse_ai_memory_query_hit_t* hit) {
+    char score[64], lexical[64], semantic[64], current[2], mode[16], flags[16];
+    snprintf(score, sizeof score, "%.17g", hit->ranking_score);
+    snprintf(lexical, sizeof lexical, "%.17g", hit->lexical_score);
+    snprintf(semantic, sizeof semantic, "%.17g", hit->semantic_score);
+    snprintf(current, sizeof current, "%u", hit->current ? 1u : 0u);
+    snprintf(mode, sizeof mode, "%u", hit->ranking_mode);
+    snprintf(flags, sizeof flags, "%u", hit->explain_flags);
+    qihse_ai_memory_relation_t visible[QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS];
+    size_t visible_count = 0u;
+    for (size_t i = 0; i < hit->version.relation_count && i < QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS; i++) {
+        qihse_ai_memory_knowledge_version_t target;
+        if (qihse_ai_memory_knowledge_get(session->server, session->user,
+            hit->version.relations[i].target_version_id,
+            &hit->version.relations[i].target_scope, &target)) {
+            qihse_ai_memory_knowledge_free(&target);
+            visible[visible_count++] = hit->version.relations[i];
+        }
+    }
+    bool ok = qihse_resp_array(session, 9u) &&
+        qihse_resp_aimem_emit_knowledge(session, &hit->version) &&
+        qihse_resp_bulk_text(session, score) &&
+        qihse_resp_bulk_text(session, lexical) &&
+        qihse_resp_bulk_text(session, semantic) &&
+        qihse_resp_bulk_text(session, current) &&
+        qihse_resp_bulk_text(session, mode) &&
+        qihse_resp_bulk_text(session, flags) &&
+        qihse_resp_array(session, (int64_t)visible_count);
+    for (size_t i = 0; ok && i < visible_count; i++) {
+        char type[16];
+        snprintf(type, sizeof type, "%u", visible[i].type);
+        ok = qihse_resp_array(session, 6u) &&
+            qihse_resp_bulk_text(session, type) &&
+            qihse_resp_bulk_text(session, visible[i].target_version_id) &&
+            qihse_resp_bulk_text(session, visible[i].target_scope.project) &&
+            qihse_resp_bulk_text(session, visible[i].target_scope.worktree) &&
+            qihse_resp_bulk_text(session, visible[i].target_scope.workstream) &&
+            qihse_resp_bulk_text(session, visible[i].target_scope.session);
+    }
+    ok = ok && qihse_resp_array(session, (int64_t)hit->version.source_event_count);
+    for (size_t i = 0; ok && i < hit->version.source_event_count; i++)
+        ok = qihse_resp_bulk_text(session, hit->version.source_event_ids[i]);
+    return ok;
+}
+
 static bool qihse_resp_aimem_principal(qihse_resp_session_t* session) {
     return session && session->user && qihse_auth_user_is_active(session->user);
 }
@@ -5919,6 +6009,125 @@ static bool qihse_resp_aimem_emit_receipt(qihse_resp_session_t* session,
            qihse_resp_bulk_text(session, "local-fsync");
 }
 
+static bool qihse_resp_handle_aimem_query(qihse_resp_session_t* session,
+        const qihse_resp_request_t* request) {
+    if (request->argc < 4u || !qihse_resp_arg_equal(&request->argv[2], "V1"))
+        return qihse_resp_error(session, "ERR usage: AIMEM QUERY V1 BEGIN|NEXT|END ...");
+    if (qihse_resp_arg_equal(&request->argv[3], "BEGIN")) {
+        if (request->argc != 18u)
+            return qihse_resp_error(session, "ERR usage: AIMEM QUERY V1 BEGIN <project> <worktree> <workstream> <session> <type> <status> <current:0|1> <from-ms> <to-ms> <changed-since-ms> <as-of-ms> <bm25|semantic|hybrid> <text> <max-rows>");
+        qihse_ai_memory_query_v1_t query;
+        memset(&query, 0, sizeof query);
+        uint32_t current = 0u, max_rows = 0u;
+        if (!qihse_resp_aimem_scope_parse(request, 4u, &query.scope) ||
+            !qihse_resp_aimem_u32(&request->argv[8], &query.type) ||
+            !qihse_resp_aimem_u32(&request->argv[9], &query.status) ||
+            !qihse_resp_aimem_u32(&request->argv[10], &current) || current > 1u ||
+            !qihse_resp_aimem_u64(&request->argv[11], &query.ingest_from_ms) ||
+            !qihse_resp_aimem_u64(&request->argv[12], &query.ingest_to_ms) ||
+            !qihse_resp_aimem_u64(&request->argv[13], &query.changed_since_ms) ||
+            !qihse_resp_aimem_u64(&request->argv[14], &query.as_of_ingest_ms) ||
+            !qihse_resp_aimem_u32(&request->argv[17], &max_rows) ||
+            !max_rows || max_rows > QIHSE_AIMEM_QUERY_MAX_ROWS)
+            return qihse_resp_error(session, "ERR invalid AIMEM query parameters");
+        query.current_only = current != 0u;
+        query.max_rows = max_rows;
+        if (qihse_resp_arg_equal(&request->argv[15], "semantic")) query.mode = QIHSE_AIMEM_MODE_SEMANTIC;
+        else if (qihse_resp_arg_equal(&request->argv[15], "hybrid")) query.mode = QIHSE_AIMEM_MODE_HYBRID;
+        else if (qihse_resp_arg_equal(&request->argv[15], "bm25")) query.mode = QIHSE_AIMEM_MODE_BM25;
+        else return qihse_resp_error(session, "ERR mode must be bm25, semantic, or hybrid");
+        if (request->argv[16].len > 1024u)
+            return qihse_resp_error(session, "ERR AIMEM query text exceeds 1024 bytes");
+        char* text = qihse_resp_arg_text(&request->argv[16]);
+        if (!text) return qihse_resp_error(session, "ERR invalid AIMEM query text");
+        query.text = *text ? text : NULL;
+        qihse_ai_memory_query_snapshot_t* snapshot = qihse_ai_memory_query_begin(
+            session->server, session->user, &query);
+        free(text);
+        if (!snapshot) return qihse_resp_error(session, "ERR AIMEM query unavailable or invalid");
+        qihse_uuid_t uuid;
+        qihse_resp_aimem_query_cursor_t* slot = NULL;
+        uint64_t now = qihse_resp_monotonic_seconds();
+        pthread_mutex_lock(&g_aimem_query_cursor_lock);
+        qihse_resp_aimem_query_cursor_expire(now);
+        for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++)
+            if (!g_aimem_query_cursors[i].used) { slot = &g_aimem_query_cursors[i]; break; }
+        bool ok = slot && qihse_uuid_generate(&uuid) && qihse_uuid_format(&uuid, slot->id);
+        if (ok) {
+            slot->used = true;
+            slot->tenant_id = qihse_user_get_tenant_id(session->user);
+            slot->user_id = qihse_user_get_id(session->user);
+            slot->principal = session->user;
+            slot->expires_at = now + QIHSE_AIMEM_RESP_QUERY_TTL_SEC;
+            slot->server = session->server;
+            slot->snapshot = snapshot;
+        }
+        pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+        if (!ok) {
+            qihse_ai_memory_query_end(snapshot);
+            return qihse_resp_error(session, "ERR AIMEM query cursor capacity reached");
+        }
+        return qihse_resp_bulk_text(session, slot->id);
+    }
+    if (qihse_resp_arg_equal(&request->argv[3], "NEXT")) {
+        if (request->argc != 6u) return qihse_resp_error(session, "ERR usage: AIMEM QUERY V1 NEXT <cursor> <page-size>");
+        uint32_t page_size = 0u;
+        if (request->argv[4].len != QIHSE_AIMEM_ID_LEN)
+            return qihse_resp_error(session, "ERR cursor expired or unknown");
+        char* id = qihse_resp_arg_text(&request->argv[4]);
+        if (!id || !qihse_resp_aimem_u32(&request->argv[5], &page_size) ||
+            !page_size || page_size > 128u) { free(id); return qihse_resp_error(session, "ERR invalid cursor or page-size"); }
+        uint64_t now = qihse_resp_monotonic_seconds();
+        pthread_mutex_lock(&g_aimem_query_cursor_lock);
+        qihse_resp_aimem_query_cursor_expire(now);
+        qihse_resp_aimem_query_cursor_t* slot = NULL;
+        for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++)
+            if (g_aimem_query_cursors[i].used && strcmp(g_aimem_query_cursors[i].id, id) == 0) { slot = &g_aimem_query_cursors[i]; break; }
+        free(id);
+        if (!slot) { pthread_mutex_unlock(&g_aimem_query_cursor_lock); return qihse_resp_error(session, "ERR cursor expired or unknown"); }
+        if (slot->principal != session->user ||
+            slot->tenant_id != qihse_user_get_tenant_id(session->user) ||
+            slot->user_id != qihse_user_get_id(session->user)) {
+            pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+            return qihse_resp_error(session, "ERR cursor expired or unknown");
+        }
+        qihse_ai_memory_query_hit_t* hits = calloc(page_size, sizeof(*hits));
+        if (!hits) { pthread_mutex_unlock(&g_aimem_query_cursor_lock); return qihse_resp_error(session, "ERR out of memory"); }
+        size_t found = qihse_ai_memory_query_next(slot->snapshot, session->user, hits, page_size);
+        slot->expires_at = now + QIHSE_AIMEM_RESP_QUERY_TTL_SEC;
+        bool emitted = qihse_resp_array(session, (int64_t)found);
+        for (size_t i = 0; emitted && i < found; i++) emitted = qihse_resp_aimem_emit_query_hit(session, &hits[i]);
+        qihse_ai_memory_query_hits_free(hits, found);
+        free(hits);
+        pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+        return emitted;
+    }
+    if (qihse_resp_arg_equal(&request->argv[3], "END")) {
+        if (request->argc != 5u) return qihse_resp_error(session, "ERR usage: AIMEM QUERY V1 END <cursor>");
+        if (request->argv[4].len != QIHSE_AIMEM_ID_LEN)
+            return qihse_resp_error(session, "ERR cursor expired or unknown");
+        char* id = qihse_resp_arg_text(&request->argv[4]);
+        if (!id) return qihse_resp_error(session, "ERR invalid cursor");
+        pthread_mutex_lock(&g_aimem_query_cursor_lock);
+        qihse_resp_aimem_query_cursor_t* slot = NULL;
+        for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++)
+            if (g_aimem_query_cursors[i].used && strcmp(g_aimem_query_cursors[i].id, id) == 0) { slot = &g_aimem_query_cursors[i]; break; }
+        free(id);
+        if (!slot) { pthread_mutex_unlock(&g_aimem_query_cursor_lock); return qihse_resp_error(session, "ERR cursor expired or unknown"); }
+        if (slot->principal != session->user ||
+            slot->tenant_id != qihse_user_get_tenant_id(session->user) ||
+            slot->user_id != qihse_user_get_id(session->user)) {
+            pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+            return qihse_resp_error(session, "ERR cursor expired or unknown");
+        }
+        qihse_ai_memory_query_end(slot->snapshot);
+        memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+        return qihse_resp_simple(session, "OK");
+    }
+    return qihse_resp_error(session, "ERR unknown AIMEM QUERY V1 operation");
+}
+
 static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                                     const qihse_resp_request_t* request) {
     if (!qihse_resp_aimem_principal(session))
@@ -5936,6 +6145,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         !qihse_resp_arg_equal(&request->argv[1], "EVENT") &&
         !qihse_resp_arg_equal(&request->argv[1], "PROJECT") &&
         !qihse_resp_arg_equal(&request->argv[1], "KNOWLEDGE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "QUERY") &&
         !qihse_resp_arg_equal(&request->argv[1], "HANDOFF"))
         return qihse_resp_error(session, "ERR tenant AIMEM access requires explicit project scope");
 
@@ -6149,6 +6359,9 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
         qihse_ai_memory_knowledge_free(&value); return emitted;
     }
+
+    if (qihse_resp_arg_equal(&request->argv[1], "QUERY"))
+        return qihse_resp_handle_aimem_query(session, request);
 
     if (qihse_resp_arg_equal(&request->argv[1], "HANDOFF")) {
         if (request->argc < 3u)
@@ -14428,6 +14641,7 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
 void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (!server) return;
     qihse_resp_server_stop(server);
+    qihse_resp_aimem_query_cursors_clear_server(server);
     if (server->owns_task_scheduler && server->task_scheduler) qihse_task_scheduler_destroy(server->task_scheduler);
     if (server->owns_task_workers && server->task_workers) qihse_task_worker_pool_destroy(server->task_workers);
     if (server->owns_task_queue && server->task_queue) qihse_task_queue_destroy(server->task_queue);

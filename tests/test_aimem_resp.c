@@ -20,8 +20,8 @@ static qihse_resp_server_t* server;
 
 static size_t run(qihse_user_t* user, size_t argc, const char* const* argv,
                   uint8_t** out) {
-    qihse_resp_arg_t args[16];
-    assert(argc <= 16u);
+    qihse_resp_arg_t args[20];
+    assert(argc <= 20u);
     for (size_t i = 0; i < argc; i++) {
         args[i].data = (const uint8_t*)argv[i];
         args[i].len = strlen(argv[i]);
@@ -147,6 +147,20 @@ static void* handoff_claim_worker(void* opaque) {
     return NULL;
 }
 
+typedef struct {
+    qihse_user_t* user;
+    const char* cursor;
+    uint8_t* reply;
+    size_t reply_len;
+} query_cursor_worker_t;
+
+static void* query_cursor_next_worker(void* opaque) {
+    query_cursor_worker_t* w = opaque;
+    const char* args[] = { "AIMEM", "QUERY", "V1", "NEXT", w->cursor, "1" };
+    w->reply_len = run(w->user, 6u, args, &w->reply);
+    return NULL;
+}
+
 static bool fd_write_all(int fd, const void* buffer, size_t length) {
     const char* p = buffer;
     while (length) {
@@ -225,7 +239,7 @@ static int network_claim_child(uint16_t port, const char* username,
 }
 
 int main(void) {
-    char data_root[] = "build/aimem_resp_XXXXXX";
+    char data_root[] = "./aimem_resp_XXXXXX";
     assert(mkdtemp(data_root));
     setenv("QIHSE_DATA_DIR", data_root, 1);
     assert(qihse_auth_init());
@@ -608,6 +622,38 @@ int main(void) {
         "project-events", "checkout-a", "stream-a", "session-1" };
     knowledge_latest[3] = knowledge_id;
     expect_contains(tenant7_reader, 8u, knowledge_latest, "curated lineage v2");
+
+    /* QH-05 V1 cursor is principal-bound and pages a stable authorized query. */
+    const char* query_begin[] = { "AIMEM", "QUERY", "V1", "BEGIN", "project-events",
+        "checkout-a", "stream-a", "session-1", "0", "0", "0", "0", "0", "0",
+        "0", "bm25", "curated", "16" };
+    reply = NULL;
+    reply_len = run(tenant7_reader, 18u, query_begin, &reply);
+    char* cursor_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* query_next[] = { "AIMEM", "QUERY", "V1", "NEXT", "placeholder", "1" };
+    query_next[4] = cursor_id;
+    expect_contains(tenant7, 6u, query_next, "cursor expired or unknown");
+    query_cursor_worker_t page_a = { .user = tenant7_reader, .cursor = cursor_id };
+    query_cursor_worker_t page_b = { .user = tenant7_reader, .cursor = cursor_id };
+    pthread_t page_threads[2];
+    assert(pthread_create(&page_threads[0], NULL, query_cursor_next_worker, &page_a) == 0);
+    assert(pthread_create(&page_threads[1], NULL, query_cursor_next_worker, &page_b) == 0);
+    assert(pthread_join(page_threads[0], NULL) == 0);
+    assert(pthread_join(page_threads[1], NULL) == 0);
+    assert(page_a.reply_len > 0u && page_a.reply[0] == '*');
+    assert(page_b.reply_len > 0u && page_b.reply[0] == '*');
+    bool saw_v1 = memmem(page_a.reply, page_a.reply_len, "curated lineage v1", 18u) ||
+                  memmem(page_b.reply, page_b.reply_len, "curated lineage v1", 18u);
+    bool saw_v2 = memmem(page_a.reply, page_a.reply_len, "curated lineage v2", 18u) ||
+                  memmem(page_b.reply, page_b.reply_len, "curated lineage v2", 18u);
+    assert(saw_v1 && saw_v2);
+    free(page_a.reply); free(page_b.reply);
+    const char* query_end[] = { "AIMEM", "QUERY", "V1", "END", "placeholder" };
+    query_end[4] = cursor_id;
+    expect_contains(tenant7_reader, 5u, query_end, "+OK");
+    expect_contains(tenant7_reader, 6u, query_next, "cursor expired or unknown");
+    free(cursor_id);
 
     const char* high_knowledge_create[] = { "AIMEM", "KNOWLEDGE", "CREATE", "2", "1",
         "QH04_WIRE_HIGH_MARKER", "project-high", "", "", "" };

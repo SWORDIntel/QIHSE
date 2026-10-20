@@ -27,7 +27,7 @@ static size_t export_count(const qihse_ai_memory_export_t* value) {
 }
 
 int main(void) {
-    char source_root[] = "build/aimem_qh05_08_source_XXXXXX";
+    char source_root[] = "./aimem_qh05_08_source_XXXXXX";
     assert(mkdtemp(source_root));
     assert(setenv("QIHSE_DATA_DIR", source_root, 1) == 0);
     assert(qihse_auth_init());
@@ -86,6 +86,48 @@ int main(void) {
     qihse_ai_memory_query_hits_free(page, 1u);
     qihse_ai_memory_query_end(snapshot);
 
+    qihse_ai_memory_query_v1_t changed = query;
+    changed.text = NULL;
+    changed.current_only = false;
+    changed.changed_since_ms = first.valid_from_ingest_ms ? first.valid_from_ingest_ms - 1u : 0u;
+    snapshot = qihse_ai_memory_query_begin(server, reader, &changed); assert(snapshot);
+    memset(page, 0, sizeof page);
+    assert(qihse_ai_memory_query_next(snapshot, reader, page, 2u) == 2u);
+    qihse_ai_memory_query_hits_free(page, 2u);
+    qihse_ai_memory_query_end(snapshot);
+
+    qihse_ai_memory_query_v1_t as_of = query;
+    as_of.text = NULL;
+    as_of.as_of_ingest_ms = first.valid_from_ingest_ms;
+    snapshot = qihse_ai_memory_query_begin(server, reader, &as_of); assert(snapshot);
+    memset(page, 0, sizeof page);
+    assert(qihse_ai_memory_query_next(snapshot, reader, page, 2u) == 1u);
+    assert(strcmp(page[0].version.version_id, first.version_id) == 0);
+    qihse_ai_memory_query_hits_free(page, 1u);
+    qihse_ai_memory_query_end(snapshot);
+
+    qihse_ai_memory_query_v1_t semantic = query;
+    semantic.mode = QIHSE_AIMEM_MODE_SEMANTIC;
+    semantic.text = "stable paging";
+    snapshot = qihse_ai_memory_query_begin(server, reader, &semantic); assert(snapshot);
+    memset(page, 0, sizeof page);
+    assert(qihse_ai_memory_query_next(snapshot, reader, page, 1u) == 1u);
+    assert(page[0].explain_flags & QIHSE_AIMEM_QUERY_EXPLAIN_SEMANTIC);
+    assert(page[0].semantic_score > 0.0);
+    qihse_ai_memory_query_hits_free(page, 1u);
+    qihse_ai_memory_query_end(snapshot);
+
+    qihse_ai_memory_query_v1_t hybrid = query;
+    hybrid.mode = QIHSE_AIMEM_MODE_HYBRID;
+    snapshot = qihse_ai_memory_query_begin(server, reader, &hybrid); assert(snapshot);
+    memset(page, 0, sizeof page);
+    assert(qihse_ai_memory_query_next(snapshot, reader, page, 1u) == 1u);
+    assert(page[0].explain_flags & QIHSE_AIMEM_QUERY_EXPLAIN_BM25);
+    assert(page[0].explain_flags & QIHSE_AIMEM_QUERY_EXPLAIN_SEMANTIC);
+    assert(page[0].explain_flags & QIHSE_AIMEM_QUERY_EXPLAIN_RRF);
+    qihse_ai_memory_query_hits_free(page, 1u);
+    qihse_ai_memory_query_end(snapshot);
+
     snapshot = qihse_ai_memory_query_begin(server, reader, &query); assert(snapshot);
     assert(qihse_ai_memory_project_revoke(server, owner, scope.project, 9502u));
     assert(qihse_ai_memory_query_next(snapshot, reader, page, 1u) == 0u);
@@ -132,7 +174,15 @@ int main(void) {
     qihse_ai_memory_knowledge_version_t secret;
     assert(qihse_ai_memory_knowledge_create(server, high, &scope,
         QIHSE_AIMEM_KNOWLEDGE_GOTCHA, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
-        "QH0508_HIGH_SECRET", &secret) == QIHSE_AIMEM_WRITE_NEW);
+        "stable paging QH0508_HIGH_SECRET", &secret) == QIHSE_AIMEM_WRITE_NEW);
+    qihse_ai_memory_query_v1_t hidden_query = query;
+    hidden_query.text = "QH0508_HIGH_SECRET";
+    qihse_ai_memory_query_snapshot_t* hidden_snapshot =
+        qihse_ai_memory_query_begin(server, reader, &hidden_query);
+    assert(hidden_snapshot);
+    memset(page, 0, sizeof page);
+    assert(qihse_ai_memory_query_next(hidden_snapshot, reader, page, 2u) == 0u);
+    qihse_ai_memory_query_end(hidden_snapshot);
     qihse_ai_memory_export_t low_export = {0};
     assert(qihse_ai_memory_export_scope(server, reader, &scope, &low_export));
     assert(export_count(&low_export) == 2u);
