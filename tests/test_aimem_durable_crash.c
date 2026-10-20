@@ -364,16 +364,14 @@ static void verify_failed_fence_retry(void) {
 
 static void fail_event_fence_then_kill(int pipe_fd) {
     open_instance();
-    char moved_root[96];
-    snprintf(moved_root, sizeof moved_root, "%s-moved", data_root);
     const char* append[] = { "AIMEM", "EVENT", "APPEND", "qh02-fence",
         "tree", "stream", "session", "fence-test", "qh02-fence-event",
         "checkpoint", "1792500000000", "QH02-FENCE-RETRY" };
-    assert(rename(data_root, moved_root) == 0);
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "wal-fsync", 1) == 0);
     char* reply = command(operator_user, 12u, append);
     assert(strstr(reply, "NOT_DURABLE"));
     free(reply);
-    assert(rename(moved_root, data_root) == 0);
+    assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
     qihse_audit_flush();
     write_exact(pipe_fd, "F", 1u);
     kill(getpid(), SIGKILL);
