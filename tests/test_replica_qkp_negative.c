@@ -152,7 +152,7 @@ int main(void) {
     qihse_user_t* op = qihse_auth_get_user(0u);
     assert(op);
     qihse_user_t* guest = qihse_auth_create_tenant_user(op, 7u, 71u,
-        QIHSE_ROLE_GUEST, 0u, 0u, "QkpGuestPass1!", false);
+        QIHSE_ROLE_ANALYST, 5u, 9u, "QkpGuestPass1!", false);
     assert(guest);
     assert(qihse_auth_modify_user(op, 71u, "QIHSE_GUEST_71", NULL,
                                   -1, -1, -1, -1));
@@ -164,6 +164,8 @@ int main(void) {
     qihse_kv_store_t* store = qihse_kv_store_create();
     assert(store);
     assert(qihse_kv_set_user(store, "vendor:7:secret", "protected-replica-payload",
+                             5u, 9u, op));
+    assert(qihse_kv_set_user(store, "t:7/machine/71/high", "MACHINE-HIGH-DATA",
                              5u, 9u, op));
 
     snprintf(client_pub, sizeof(client_pub), "%s/qihse_dsa_pub.pem", cli);
@@ -300,6 +302,21 @@ int main(void) {
     assert(reply[0] == '-' && strstr(reply, "NOPERM"));
     free(reply);
     assert(qihse_kv_get_user(store, "global:forged", op) == NULL);
+    write_command(session, fd, "PUBLISH", "t:7/machine/71/high", "forged", NULL);
+    reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
+    free(reply);
+    write_command(session, fd, "GET", "t:7/machine/71/high", NULL, NULL);
+    reply = read_reply(session, fd);
+    assert(!strstr(reply, "MACHINE-HIGH-DATA"));
+    free(reply);
+    write_command(session, fd, "SET", "t:7/machine/71/high", "downgraded", NULL);
+    reply = read_reply(session, fd);
+    assert(reply[0] == '-' && strstr(reply, "NOPERM"));
+    free(reply);
+    char* preserved = qihse_kv_get_user(store, "t:7/machine/71/high", op);
+    assert(preserved && strcmp(preserved, "MACHINE-HIGH-DATA") == 0);
+    free(preserved);
     write_command(session, fd, "SET", "t:7/machine/71/thermal", "ok", NULL);
     reply = read_reply(session, fd);
     assert(strstr(reply, "+OK\r\n"));
