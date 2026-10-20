@@ -169,6 +169,7 @@ static void verify_tombstone(const char* id) {
     assert_response(operator_user, 5u, stale_replay, "-ERR CONFLICT");
     const char* count_args[] = { "AIMEM", "COUNT" };
     assert_response(operator_user, 2u, count_args, ":0\r\n");
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
@@ -212,6 +213,7 @@ static void verify_event_replay(void) {
         "qh02-tree", "qh02-stream", "qh02-session", "crash-test", EVENT_ID,
         "checkpoint", "1792500000000", "changed event payload" };
     assert_response(operator_user, 12u, conflict, "-ERR CONFLICT");
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
@@ -268,6 +270,7 @@ static void verify_handoff_replay(const char* id) {
     assert_response(recipient, 4u, get, "ACCEPTED");
     assert_response(competitor, 4u, get, "$-1\r\n");
     (void)owner;
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
@@ -328,6 +331,7 @@ static void verify_migration_recovery(const char* id) {
     id_from_store(reply, migrated_id);
     free(reply);
     assert(strcmp(id, migrated_id) == 0);
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
@@ -353,6 +357,7 @@ static void verify_failed_fence_retry(void) {
     char* recovered = qihse_kv_get_user(store, "qh00-sync-boundary", operator_user);
     assert(recovered && strcmp(recovered, FAULT_TEXT) == 0);
     free(recovered);
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
@@ -395,6 +400,7 @@ static void verify_event_fence_retry(void) {
     const char* read[] = { "AIMEM", "EVENT", "READ", id,
         "qh02-fence", "tree", "stream", "session" };
     assert_response(operator_user, 8u, read, "QH02-FENCE-RETRY");
+    qihse_audit_flush();
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
 }
