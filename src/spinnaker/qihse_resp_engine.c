@@ -6258,6 +6258,49 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         return emitted;
     }
 
+    if (qihse_resp_arg_equal(&request->argv[1], "LEGACY")) {
+        if (request->argc != 5u ||
+            !qihse_resp_arg_equal(&request->argv[2], "SCAN"))
+            return qihse_resp_error(session,
+                "ERR usage: AIMEM LEGACY SCAN <cursor> <count>");
+        if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+            qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_classification(session->user) != UINT16_MAX ||
+            qihse_user_get_sci(session->user) != UINT16_MAX)
+            return qihse_resp_error(session,
+                "NOPERM AIMEM legacy inventory requires a fully cleared system Operator");
+        uint32_t limit = 0u;
+        char* cursor_arg = qihse_resp_arg_text(&request->argv[3]);
+        if (!cursor_arg || !qihse_resp_aimem_u32(&request->argv[4], &limit) ||
+            !limit || limit > QIHSE_AIMEM_LEGACY_INVENTORY_PAGE_MAX) {
+            free(cursor_arg);
+            return qihse_resp_error(session, "ERR invalid AIMEM legacy inventory page");
+        }
+        const char* cursor = strcmp(cursor_arg, "0") == 0 ? "" : cursor_arg;
+        qihse_ai_memory_legacy_inventory_item_t* rows =
+            calloc(limit, sizeof(*rows));
+        size_t count = 0u;
+        char next[QIHSE_AIMEM_ID_LEN + 1u];
+        bool done = false;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = rows && qihse_ai_memory_legacy_inventory(session->server,
+            session->user, cursor, limit, rows, &count, next, &done);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        free(cursor_arg);
+        if (!ok) {
+            free(rows);
+            return qihse_resp_error(session,
+                "ERR invalid cursor or AIMEM legacy inventory unavailable");
+        }
+        bool emitted = qihse_resp_array(session, 2u) &&
+            qihse_resp_bulk_text(session, done ? "0" : next) &&
+            qihse_resp_array(session, count);
+        for (size_t i = 0u; emitted && i < count; i++)
+            emitted = qihse_resp_bulk_text(session, rows[i].id);
+        free(rows);
+        return emitted;
+    }
+
     if (qihse_resp_arg_equal(&request->argv[1], "EVENT")) {
         if (request->argc >= 3u && qihse_resp_arg_equal(&request->argv[2], "APPEND")) {
             if (request->argc != 12u && request->argc != 13u)
