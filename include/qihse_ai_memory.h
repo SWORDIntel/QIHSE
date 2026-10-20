@@ -63,6 +63,36 @@ typedef enum {
     QIHSE_AIMEM_KNOWLEDGE_RETRACTED
 } qihse_ai_memory_knowledge_status_t;
 
+#define QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES 32u
+#define QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS 32u
+#define QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN 64u
+#define QIHSE_AIMEM_CONFIDENCE_MAX 1000000u
+
+typedef enum {
+    QIHSE_AIMEM_RELATION_FIXES = 1u,
+    QIHSE_AIMEM_RELATION_CAUSES,
+    QIHSE_AIMEM_RELATION_CONTRADICTS,
+    QIHSE_AIMEM_RELATION_SUPERSEDES
+} qihse_ai_memory_relation_type_t;
+
+typedef struct {
+    uint32_t type;
+    char target_version_id[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_ai_memory_scope_t target_scope;
+} qihse_ai_memory_relation_t;
+
+/* Evidence supplied by the caller. Actor identities are server-bound: the
+ * authenticated principal becomes generated_by, and only an Operator making
+ * an approval/retraction becomes reviewed_by. */
+typedef struct {
+    const char* idempotency_key;
+    const char* const* source_event_ids;
+    size_t source_event_count;
+    const qihse_ai_memory_relation_t* relations;
+    size_t relation_count;
+    uint32_t confidence_ppm;
+} qihse_ai_memory_knowledge_provenance_t;
+
 /* Immutable QH-04 version metadata. `content` and all IDs are owned by the
  * caller on input and by the result owner on output. */
 typedef struct {
@@ -77,6 +107,14 @@ typedef struct {
     uint64_t valid_from_ingest_ms;
     uint64_t valid_to_ingest_ms;
     uint32_t created_by;
+    uint32_t generated_by;
+    uint32_t reviewed_by;
+    uint32_t confidence_ppm;
+    char content_sha256[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
+    char (*source_event_ids)[QIHSE_AIMEM_ID_LEN + 1u];
+    size_t source_event_count;
+    qihse_ai_memory_relation_t* relations;
+    size_t relation_count;
     char* content;
 } qihse_ai_memory_knowledge_version_t;
 
@@ -227,6 +265,18 @@ qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
     qihse_resp_server_t* server, qihse_user_t* user,
     const char* knowledge_id, const char* expected_version_id,
     uint64_t expected_revision, uint32_t status, const char* content,
+    qihse_ai_memory_knowledge_version_t* out);
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create_ex(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, uint32_t type, uint32_t status,
+    const char* content,
+    const qihse_ai_memory_knowledge_provenance_t* provenance,
+    qihse_ai_memory_knowledge_version_t* out);
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise_ex(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const char* knowledge_id, const char* expected_version_id,
+    uint64_t expected_revision, uint32_t status, const char* content,
+    const qihse_ai_memory_knowledge_provenance_t* provenance,
     qihse_ai_memory_knowledge_version_t* out);
 bool qihse_ai_memory_knowledge_latest(qihse_resp_server_t* server,
     qihse_user_t* user, const char* knowledge_id,

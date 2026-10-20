@@ -22,6 +22,7 @@
 #include "qihse_federation.h"
 #include "qihse_fts.h"
 #include "qihse_kv_store.h"
+#include "qihse_audit.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1974,6 +1975,8 @@ bool qihse_ai_memory_get_scoped(qihse_resp_server_t* server,
 void qihse_ai_memory_knowledge_free(qihse_ai_memory_knowledge_version_t* value) {
     if (!value) return;
     free(value->content);
+    free(value->source_event_ids);
+    free(value->relations);
     memset(value, 0, sizeof(*value));
 }
 
@@ -1992,7 +1995,11 @@ typedef struct {
 
 static void aimem_knowledge_chain_free(aimem_knowledge_chain_t* chain) {
     if (!chain) return;
-    for (size_t i = 0; i < chain->count; i++) free(chain->versions[i].content);
+    for (size_t i = 0; i < chain->count; i++) {
+        free(chain->versions[i].content);
+        free(chain->versions[i].source_event_ids);
+        free(chain->versions[i].relations);
+    }
     free(chain->versions);
     memset(chain, 0, sizeof(*chain));
 }
@@ -2004,7 +2011,8 @@ static bool aimem_knowledge_type_valid(uint32_t type) {
 
 static bool aimem_knowledge_status_writable(qihse_user_t* user, uint32_t status) {
     if (status == QIHSE_AIMEM_KNOWLEDGE_PROPOSED) return true;
-    return status == QIHSE_AIMEM_KNOWLEDGE_APPROVED &&
+    return (status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ||
+            status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED) &&
            qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
 }
 
@@ -2075,8 +2083,24 @@ static bool aimem_token_u32(const char* text, uint32_t* out) {
     return true;
 }
 
-static bool aimem_knowledge_chain_parse(const char* raw,
-                                        aimem_knowledge_chain_t* out) {
+static bool aimem_content_sha256(const char* content,
+        char out[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u]) {
+    unsigned char digest[32];
+    unsigned int digest_len = 0u;
+    if (!content || !*content || !out ||
+        EVP_Digest(content, strlen(content), digest, &digest_len,
+                   EVP_sha256(), NULL) != 1 || digest_len != sizeof digest)
+        return false;
+    for (size_t i = 0; i < sizeof digest; i++) {
+        out[i * 2u] = aimem_hex_digit(digest[i] >> 4);
+        out[i * 2u + 1u] = aimem_hex_digit(digest[i] & 0x0fu);
+    }
+    out[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
+static bool aimem_knowledge_chain_parse_v1(const char* raw,
+                                           aimem_knowledge_chain_t* out) {
     if (!raw || !out) return false;
     memset(out, 0, sizeof(*out));
     char* copy = strdup(raw);
@@ -2108,6 +2132,7 @@ static bool aimem_knowledge_chain_parse(const char* raw,
     tok = ok ? NEXT_TOKEN() : NULL; ok = tok && aimem_token_u32(tok, &count32) && count32 && count32 <= AIMEM_KNOWLEDGE_MAX_VERSIONS;
     if (ok) out->versions = calloc(count32, sizeof(*out->versions));
     ok = ok && out->versions;
+    if (ok) out->count = count32;
     for (uint32_t i = 0; ok && i < count32; i++) {
         qihse_ai_memory_knowledge_version_t* v = &out->versions[i];
         char* id = NEXT_TOKEN(); char* revision = NEXT_TOKEN();
@@ -2129,6 +2154,8 @@ static bool aimem_knowledge_chain_parse(const char* raw,
             snprintf(v->version_id, sizeof v->version_id, "%s", id);
             snprintf(v->supersedes_version, sizeof v->supersedes_version, "%s", supersedes);
             v->scope = out->scope; v->type = out->type;
+            v->generated_by = v->created_by;
+            ok = aimem_content_sha256(v->content, v->content_sha256);
             bool status_ok = v->status >= QIHSE_AIMEM_KNOWLEDGE_PROPOSED &&
                              v->status <= QIHSE_AIMEM_KNOWLEDGE_RETRACTED;
             ok = status_ok && v->revision == (uint64_t)i + 1u &&
@@ -2142,7 +2169,6 @@ static bool aimem_knowledge_chain_parse(const char* raw,
                                            QIHSE_AIMEM_KNOWLEDGE_SUPERSEDED;
         }
     }
-    out->count = ok ? count32 : 0u;
     ok = ok && cursor == NULL && out->versions[count32 - 1u].valid_to_ingest_ms == 0u;
     free(copy);
     if (!ok) aimem_knowledge_chain_free(out);
@@ -2150,31 +2176,198 @@ static bool aimem_knowledge_chain_parse(const char* raw,
     return ok;
 }
 
+static bool aimem_relation_type_valid(uint32_t type) {
+    return type >= QIHSE_AIMEM_RELATION_FIXES &&
+           type <= QIHSE_AIMEM_RELATION_SUPERSEDES;
+}
+
+static bool aimem_knowledge_chain_parse_v2(const char* raw,
+                                           aimem_knowledge_chain_t* out) {
+    memset(out, 0, sizeof(*out));
+    char* copy = raw ? strdup(raw) : NULL;
+    if (!copy) return false;
+    char* cursor = copy;
+#define NEXT_V2() strsep(&cursor, "|")
+    char* tok = NEXT_V2();
+    bool ok = tok && strcmp(tok, "QHK2") == 0;
+    qihse_uuid_t uuid;
+    tok = ok ? NEXT_V2() : NULL;
+    ok = tok && qihse_uuid_parse(tok, &uuid);
+    if (ok) snprintf(out->knowledge_id, sizeof out->knowledge_id, "%s", tok);
+    tok = ok ? NEXT_V2() : NULL; ok = tok && aimem_token_u32(tok, &out->owner_id);
+    char* scope[4];
+    for (size_t i = 0; ok && i < 4u; i++) {
+        scope[i] = NEXT_V2();
+        ok = scope[i] && strlen(scope[i]) <= QIHSE_AIMEM_SCOPE_ID_MAX;
+    }
+    if (ok) {
+        snprintf(out->scope.project, sizeof out->scope.project, "%s", scope[0]);
+        snprintf(out->scope.worktree, sizeof out->scope.worktree, "%s", scope[1]);
+        snprintf(out->scope.workstream, sizeof out->scope.workstream, "%s", scope[2]);
+        snprintf(out->scope.session, sizeof out->scope.session, "%s", scope[3]);
+        ok = aimem_scope_valid(&out->scope);
+    }
+    tok = ok ? NEXT_V2() : NULL;
+    ok = tok && aimem_token_u32(tok, &out->type) && aimem_knowledge_type_valid(out->type);
+    uint32_t count = 0u;
+    tok = ok ? NEXT_V2() : NULL;
+    ok = tok && aimem_token_u32(tok, &count) && count &&
+         count <= AIMEM_KNOWLEDGE_MAX_VERSIONS;
+    if (ok) out->versions = calloc(count, sizeof(*out->versions));
+    ok = ok && out->versions;
+    if (ok) out->count = count;
+    for (uint32_t i = 0; ok && i < count; i++) {
+        qihse_ai_memory_knowledge_version_t* v = &out->versions[i];
+        char* id = NEXT_V2(); char* revision = NEXT_V2();
+        char* created = NEXT_V2(); char* from = NEXT_V2(); char* to = NEXT_V2();
+        char* status = NEXT_V2(); char* actor = NEXT_V2();
+        char* generated = NEXT_V2(); char* reviewed = NEXT_V2();
+        char* confidence = NEXT_V2(); char* supersedes = NEXT_V2();
+        char* digest = NEXT_V2(); char* source_count_text = NEXT_V2();
+        uint32_t source_count = 0u;
+        ok = id && revision && created && from && to && status && actor && generated &&
+             reviewed && confidence && supersedes && digest && source_count_text &&
+             qihse_uuid_parse(id, &uuid) && aimem_token_u64(revision, &v->revision) &&
+             aimem_token_u64(created, &v->created_at_ms) &&
+             aimem_token_u64(from, &v->valid_from_ingest_ms) &&
+             aimem_token_u64(to, &v->valid_to_ingest_ms) &&
+             aimem_token_u32(status, &v->status) &&
+             aimem_token_u32(actor, &v->created_by) &&
+             aimem_token_u32(generated, &v->generated_by) &&
+             aimem_token_u32(reviewed, &v->reviewed_by) &&
+             aimem_token_u32(confidence, &v->confidence_ppm) &&
+             v->confidence_ppm <= QIHSE_AIMEM_CONFIDENCE_MAX &&
+             strlen(digest) == QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN &&
+             aimem_token_u32(source_count_text, &source_count) &&
+             source_count <= QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES;
+        if (ok && supersedes[0] && !qihse_uuid_parse(supersedes, &uuid)) ok = false;
+        if (ok && source_count)
+            v->source_event_ids = calloc(source_count, sizeof(*v->source_event_ids));
+        if (ok && source_count && !v->source_event_ids) ok = false;
+        v->source_event_count = ok ? source_count : 0u;
+        for (uint32_t j = 0; ok && j < source_count; j++) {
+            char* source = NEXT_V2();
+            ok = source && qihse_uuid_parse(source, &uuid);
+            if (ok) snprintf(v->source_event_ids[j], sizeof v->source_event_ids[j],
+                             "%s", source);
+        }
+        uint32_t relation_count = 0u;
+        tok = ok ? NEXT_V2() : NULL;
+        ok = tok && aimem_token_u32(tok, &relation_count) &&
+             relation_count <= QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS;
+        if (ok && relation_count)
+            v->relations = calloc(relation_count, sizeof(*v->relations));
+        if (ok && relation_count && !v->relations) ok = false;
+        v->relation_count = ok ? relation_count : 0u;
+        for (uint32_t j = 0; ok && j < relation_count; j++) {
+            qihse_ai_memory_relation_t* relation = &v->relations[j];
+            char* type = NEXT_V2(); char* target = NEXT_V2();
+            char* project = NEXT_V2(); char* worktree = NEXT_V2();
+            char* workstream = NEXT_V2(); char* session = NEXT_V2();
+            ok = type && target && project && worktree && workstream && session &&
+                 aimem_token_u32(type, &relation->type) &&
+                 aimem_relation_type_valid(relation->type) &&
+                 qihse_uuid_parse(target, &uuid) &&
+                 strlen(project) <= QIHSE_AIMEM_SCOPE_ID_MAX &&
+                 strlen(worktree) <= QIHSE_AIMEM_SCOPE_ID_MAX &&
+                 strlen(workstream) <= QIHSE_AIMEM_SCOPE_ID_MAX &&
+                 strlen(session) <= QIHSE_AIMEM_SCOPE_ID_MAX;
+            if (ok) {
+                snprintf(relation->target_version_id, sizeof relation->target_version_id,
+                         "%s", target);
+                snprintf(relation->target_scope.project, sizeof relation->target_scope.project,
+                         "%s", project);
+                snprintf(relation->target_scope.worktree, sizeof relation->target_scope.worktree,
+                         "%s", worktree);
+                snprintf(relation->target_scope.workstream, sizeof relation->target_scope.workstream,
+                         "%s", workstream);
+                snprintf(relation->target_scope.session, sizeof relation->target_scope.session,
+                         "%s", session);
+                ok = aimem_scope_valid(&relation->target_scope);
+            }
+        }
+        char* hex = ok ? NEXT_V2() : NULL;
+        if (ok) v->content = aimem_hex_decode(hex);
+        char computed[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
+        ok = ok && v->content && aimem_content_sha256(v->content, computed) &&
+             strcmp(computed, digest) == 0;
+        if (ok) {
+            snprintf(v->knowledge_id, sizeof v->knowledge_id, "%s", out->knowledge_id);
+            snprintf(v->version_id, sizeof v->version_id, "%s", id);
+            snprintf(v->supersedes_version, sizeof v->supersedes_version, "%s", supersedes);
+            snprintf(v->content_sha256, sizeof v->content_sha256, "%s", digest);
+            v->scope = out->scope; v->type = out->type;
+            ok = v->status >= QIHSE_AIMEM_KNOWLEDGE_PROPOSED &&
+                 v->status <= QIHSE_AIMEM_KNOWLEDGE_RETRACTED &&
+                 v->revision == (uint64_t)i + 1u && v->created_at_ms &&
+                 v->valid_from_ingest_ms &&
+                 ((v->status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ||
+                   v->status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED) ?
+                    v->reviewed_by != 0u : true);
+            if (ok && i == 0u) ok = !v->supersedes_version[0];
+            if (ok && i > 0u) ok = strcmp(v->supersedes_version,
+                out->versions[i - 1u].version_id) == 0 &&
+                out->versions[i - 1u].valid_to_ingest_ms == v->valid_from_ingest_ms &&
+                out->versions[i - 1u].status == QIHSE_AIMEM_KNOWLEDGE_SUPERSEDED;
+        }
+    }
+    ok = ok && cursor == NULL && out->versions[count - 1u].valid_to_ingest_ms == 0u;
+    free(copy);
+    if (!ok) aimem_knowledge_chain_free(out);
+#undef NEXT_V2
+    return ok;
+}
+
+static bool aimem_knowledge_chain_parse(const char* raw,
+                                        aimem_knowledge_chain_t* out) {
+    if (!raw || !out) return false;
+    if (strncmp(raw, "QHK2|", 5u) == 0) return aimem_knowledge_chain_parse_v2(raw, out);
+    return aimem_knowledge_chain_parse_v1(raw, out);
+}
+
 static char* aimem_knowledge_chain_encode(const aimem_knowledge_chain_t* chain) {
     if (!chain || !chain->count || chain->count > AIMEM_KNOWLEDGE_MAX_VERSIONS) return NULL;
     size_t cap = 512u;
     for (size_t i = 0; i < chain->count; i++) {
         size_t n = chain->versions[i].content ? strlen(chain->versions[i].content) : 0u;
-        if (!n || n > AIMEM_KNOWLEDGE_MAX_CONTENT || cap > SIZE_MAX - n * 2u - 256u) return NULL;
-        cap += n * 2u + 256u;
+        size_t extra = n * 2u + 512u +
+            chain->versions[i].source_event_count * 40u +
+            chain->versions[i].relation_count * 360u;
+        if (!n || n > AIMEM_KNOWLEDGE_MAX_CONTENT || cap > SIZE_MAX - extra) return NULL;
+        cap += extra;
     }
     if (cap > AIMEM_KNOWLEDGE_MAX_ENCODED) return NULL;
     char* out = malloc(cap), *p = out;
     if (!out) return NULL;
     size_t left = cap;
 #define APPEND(...) do { int written = snprintf(p, left, __VA_ARGS__); if (written < 0 || (size_t)written >= left) { free(out); return NULL; } p += written; left -= (size_t)written; } while (0)
-    APPEND("QHK1|%s|%u|%s|%s|%s|%s|%u|%zu", chain->knowledge_id,
+    APPEND("QHK2|%s|%u|%s|%s|%s|%s|%u|%zu", chain->knowledge_id,
            (unsigned)chain->owner_id, chain->scope.project, chain->scope.worktree,
            chain->scope.workstream, chain->scope.session, (unsigned)chain->type, chain->count);
     for (size_t i = 0; i < chain->count; i++) {
         const qihse_ai_memory_knowledge_version_t* v = &chain->versions[i];
         char* hex = aimem_hex_encode(v->content);
         if (!hex) { free(out); return NULL; }
-        APPEND("|%s|%llu|%llu|%llu|%llu|%u|%u|%s|%s", v->version_id,
+        char digest[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
+        if (!aimem_content_sha256(v->content, digest)) { free(hex); free(out); return NULL; }
+        APPEND("|%s|%llu|%llu|%llu|%llu|%u|%u|%u|%u|%u|%s|%s|%zu", v->version_id,
                (unsigned long long)v->revision, (unsigned long long)v->created_at_ms,
                (unsigned long long)v->valid_from_ingest_ms,
                (unsigned long long)v->valid_to_ingest_ms, (unsigned)v->status,
-               (unsigned)v->created_by, v->supersedes_version, hex);
+               (unsigned)v->created_by, (unsigned)v->generated_by,
+               (unsigned)v->reviewed_by, (unsigned)v->confidence_ppm,
+               v->supersedes_version, digest, v->source_event_count);
+        for (size_t j = 0; j < v->source_event_count; j++)
+            APPEND("|%s", v->source_event_ids[j]);
+        APPEND("|%zu", v->relation_count);
+        for (size_t j = 0; j < v->relation_count; j++) {
+            const qihse_ai_memory_relation_t* relation = &v->relations[j];
+            APPEND("|%u|%s|%s|%s|%s|%s", (unsigned)relation->type,
+                   relation->target_version_id, relation->target_scope.project,
+                   relation->target_scope.worktree, relation->target_scope.workstream,
+                   relation->target_scope.session);
+        }
+        APPEND("|%s", hex);
         free(hex);
     }
 #undef APPEND
@@ -2186,8 +2379,27 @@ static bool aimem_knowledge_copy(const qihse_ai_memory_knowledge_version_t* src,
     if (!src || !out || !src->content) return false;
     *out = *src;
     out->content = strdup(src->content);
-    if (!out->content) memset(out, 0, sizeof(*out));
-    return out->content != NULL;
+    out->source_event_ids = NULL;
+    out->relations = NULL;
+    if (src->source_event_count) {
+        out->source_event_ids = calloc(src->source_event_count,
+                                       sizeof(*out->source_event_ids));
+        if (out->source_event_ids)
+            memcpy(out->source_event_ids, src->source_event_ids,
+                   src->source_event_count * sizeof(*out->source_event_ids));
+    }
+    if (src->relation_count) {
+        out->relations = calloc(src->relation_count, sizeof(*out->relations));
+        if (out->relations)
+            memcpy(out->relations, src->relations,
+                   src->relation_count * sizeof(*out->relations));
+    }
+    if (!out->content || (src->source_event_count && !out->source_event_ids) ||
+        (src->relation_count && !out->relations)) {
+        qihse_ai_memory_knowledge_free(out);
+        return false;
+    }
+    return true;
 }
 
 static bool aimem_knowledge_chain_read(qihse_resp_server_t* server,
@@ -2211,23 +2423,159 @@ static bool aimem_knowledge_chain_read(qihse_resp_server_t* server,
     return true;
 }
 
-qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create(
+static bool aimem_idempotency_key_valid(const char* key) {
+    if (!key) return true;
+    size_t n = strnlen(key, QIHSE_AIMEM_IDEM_MAX_LEN + 1u);
+    if (!n || n > QIHSE_AIMEM_IDEM_MAX_LEN) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)key[i];
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.' || c == ':'))
+            return false;
+    }
+    return true;
+}
+
+static bool aimem_prepare_provenance(qihse_resp_server_t* server,
+        qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+        const qihse_ai_memory_knowledge_provenance_t* provenance,
+        const char* supersedes, qihse_ai_memory_knowledge_version_t* value) {
+    size_t source_count = provenance ? provenance->source_event_count : 0u;
+    size_t relation_count = provenance ? provenance->relation_count : 0u;
+    if (!value || source_count > QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES ||
+        relation_count + (supersedes ? 1u : 0u) > QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS ||
+        (provenance && provenance->confidence_ppm > QIHSE_AIMEM_CONFIDENCE_MAX) ||
+        (source_count && !provenance->source_event_ids) ||
+        (relation_count && !provenance->relations) ||
+        (provenance && !aimem_idempotency_key_valid(provenance->idempotency_key)))
+        return false;
+    if (source_count) {
+        value->source_event_ids = calloc(source_count, sizeof(*value->source_event_ids));
+        if (!value->source_event_ids) return false;
+    }
+    for (size_t i = 0; i < source_count; i++) {
+        const char* id = provenance->source_event_ids[i];
+        qihse_uuid_t parsed;
+        qihse_ai_memory_hit_t event = {0};
+        if (!id || !qihse_uuid_parse(id, &parsed) ||
+            !qihse_ai_memory_event_get(server, user, id, scope, &event)) {
+            free(event.text); return false;
+        }
+        free(event.text);
+        for (size_t j = 0; j < i; j++)
+            if (strcmp(value->source_event_ids[j], id) == 0) return false;
+        snprintf(value->source_event_ids[i], sizeof value->source_event_ids[i], "%s", id);
+    }
+    value->source_event_count = source_count;
+    size_t total_relations = relation_count + (supersedes ? 1u : 0u);
+    if (total_relations) {
+        value->relations = calloc(total_relations, sizeof(*value->relations));
+        if (!value->relations) return false;
+    }
+    for (size_t i = 0; i < relation_count; i++) {
+        const qihse_ai_memory_relation_t* relation = &provenance->relations[i];
+        qihse_ai_memory_knowledge_version_t target = {0};
+        if (!aimem_relation_type_valid(relation->type) ||
+            relation->type == QIHSE_AIMEM_RELATION_SUPERSEDES ||
+            !aimem_scope_valid(&relation->target_scope) ||
+            !qihse_ai_memory_knowledge_get(server, user, relation->target_version_id,
+                                            &relation->target_scope, &target))
+            return false;
+        qihse_ai_memory_knowledge_free(&target);
+        for (size_t j = 0; j < i; j++)
+            if (value->relations[j].type == relation->type &&
+                strcmp(value->relations[j].target_version_id,
+                       relation->target_version_id) == 0) return false;
+        value->relations[i] = *relation;
+    }
+    if (supersedes) {
+        qihse_ai_memory_relation_t* relation = &value->relations[relation_count];
+        relation->type = QIHSE_AIMEM_RELATION_SUPERSEDES;
+        snprintf(relation->target_version_id, sizeof relation->target_version_id,
+                 "%s", supersedes);
+        relation->target_scope = *scope;
+    }
+    value->relation_count = total_relations;
+    value->generated_by = qihse_user_get_id(user);
+    value->confidence_ppm = provenance ? provenance->confidence_ppm : 0u;
+    return true;
+}
+
+static bool aimem_knowledge_payload_matches(
+        const qihse_ai_memory_knowledge_version_t* value, uint32_t status,
+        const char* content,
+        const qihse_ai_memory_knowledge_provenance_t* provenance) {
+    size_t source_count = provenance ? provenance->source_event_count : 0u;
+    size_t relation_count = provenance ? provenance->relation_count : 0u;
+    uint32_t confidence = provenance ? provenance->confidence_ppm : 0u;
+    if (!value || (value->status != status &&
+                   value->status != QIHSE_AIMEM_KNOWLEDGE_SUPERSEDED) ||
+        strcmp(value->content, content) != 0 ||
+        value->confidence_ppm != confidence || value->source_event_count != source_count ||
+        value->relation_count != relation_count + (value->revision > 1u ? 1u : 0u))
+        return false;
+    for (size_t i = 0; i < source_count; i++)
+        if (strcmp(value->source_event_ids[i], provenance->source_event_ids[i]) != 0)
+            return false;
+    for (size_t i = 0; i < relation_count; i++)
+        if (memcmp(&value->relations[i], &provenance->relations[i],
+                   sizeof(value->relations[i])) != 0) return false;
+    return true;
+}
+
+static void aimem_knowledge_audit(qihse_user_t* user, const char* action,
+        const qihse_ai_memory_knowledge_version_t* value, uint16_t classification,
+        uint16_t sci) {
+    qihse_audit_log(action, qihse_user_get_id(user),
+                    (uint32_t)value->source_event_count, classification, sci);
+    for (size_t i = 0; i < value->source_event_count; i++) {
+        qihse_uuid_t event;
+        if (!qihse_uuid_parse(value->source_event_ids[i], &event)) continue;
+        uint32_t citation = ((uint32_t)event.bytes[0] << 24) |
+                            ((uint32_t)event.bytes[1] << 16) |
+                            ((uint32_t)event.bytes[2] << 8) |
+                            (uint32_t)event.bytes[3];
+        qihse_audit_log("AIMEM_KNOWLEDGE_EVIDENCE", qihse_user_get_id(user),
+                        citation, classification, sci);
+    }
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create_ex(
         qihse_resp_server_t* server, qihse_user_t* user,
         const qihse_ai_memory_scope_t* scope, uint32_t type, uint32_t status,
-        const char* content, qihse_ai_memory_knowledge_version_t* out) {
+        const char* content,
+        const qihse_ai_memory_knowledge_provenance_t* provenance,
+        qihse_ai_memory_knowledge_version_t* out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!server || !user || !qihse_auth_user_is_active(user) ||
         !aimem_scope_valid(scope) || !aimem_knowledge_type_valid(type) ||
-        !aimem_knowledge_status_writable(user, status) || !content || !*content ||
+        !aimem_knowledge_status_writable(user, status) ||
+        status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED || !content || !*content ||
         strlen(content) > AIMEM_KNOWLEDGE_MAX_CONTENT || !out ||
+        (provenance && !aimem_idempotency_key_valid(provenance->idempotency_key)) ||
         !qihse_ai_memory_project_owner_allowed(server, user, scope->project))
         return QIHSE_AIMEM_WRITE_FAILED;
     qihse_uuid_t knowledge_uuid, version_uuid;
     aimem_knowledge_chain_t chain;
     memset(&chain, 0, sizeof chain);
-    if (!qihse_uuid_generate(&knowledge_uuid) ||
-        !qihse_uuid_format(&knowledge_uuid, chain.knowledge_id) ||
-        !qihse_uuid_generate(&version_uuid)) return QIHSE_AIMEM_WRITE_FAILED;
+    const char* idem = provenance ? provenance->idempotency_key : NULL;
+    if (idem) {
+        char seed[QIHSE_AIMEM_IDEM_MAX_LEN + 512u];
+        int n = snprintf(seed, sizeof seed, "QIHSE:AIMEM:knowledge:create:v2:%u:%u:%s:%s:%s:%s:%s:%s",
+            (unsigned)qihse_user_get_tenant_id(user), (unsigned)qihse_user_get_id(user),
+            scope->project, scope->worktree, scope->workstream, scope->session, idem,
+            "knowledge");
+        if (n <= 0 || (size_t)n >= sizeof seed ||
+            !qihse_uuid_from_seed(seed, (size_t)n, &knowledge_uuid))
+            return QIHSE_AIMEM_WRITE_FAILED;
+        n = snprintf(seed, sizeof seed, "QIHSE:AIMEM:knowledge:version:v2:%s:1",
+                     qihse_uuid_format(&knowledge_uuid, chain.knowledge_id) ?
+                     chain.knowledge_id : "");
+        if (n <= 0 || (size_t)n >= sizeof seed ||
+            !qihse_uuid_from_seed(seed, (size_t)n, &version_uuid))
+            return QIHSE_AIMEM_WRITE_FAILED;
+    } else if (!qihse_uuid_generate(&knowledge_uuid) ||
+               !qihse_uuid_format(&knowledge_uuid, chain.knowledge_id) ||
+               !qihse_uuid_generate(&version_uuid)) return QIHSE_AIMEM_WRITE_FAILED;
     chain.owner_id = qihse_user_get_id(user); chain.scope = *scope; chain.type = type;
     chain.versions = calloc(1u, sizeof(*chain.versions));
     if (!chain.versions) return QIHSE_AIMEM_WRITE_FAILED;
@@ -2239,30 +2587,66 @@ qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create(
     }
     v->scope = *scope; v->type = type; v->status = status; v->revision = 1u;
     v->created_at_ms = v->valid_from_ingest_ms = aimem_now_ms();
-    v->created_by = chain.owner_id; v->content = strdup(content);
+    v->created_by = chain.owner_id;
+    v->reviewed_by = status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ? chain.owner_id : 0u;
+    v->content = strdup(content);
+    bool prepared = v->content && aimem_content_sha256(content, v->content_sha256) &&
+        aimem_prepare_provenance(server, user, scope, provenance, NULL, v);
     char* encoded = v->content ? aimem_knowledge_chain_encode(&chain) : NULL;
     char key[128];
     bool keyed = encoded && aimem_knowledge_key(key, sizeof key, user, chain.knowledge_id);
     qihse_kv_store_t* store = qihse_resp_server_store(server);
-    qihse_kv_cas_result_t result = keyed && store ? qihse_kv_compare_set_user(
+    qihse_kv_cas_result_t result = prepared && keyed && store ? qihse_kv_compare_set_user(
         store, key, NULL, encoded, qihse_user_get_classification(user),
         qihse_user_get_sci(user), user) : QIHSE_KV_CAS_FAILED;
+    bool replay = false;
+    bool existing_conflict = false;
+    if (result != QIHSE_KV_CAS_UPDATED && idem) {
+        char* raw = qihse_kv_get_user(store, key, user);
+        aimem_knowledge_chain_t existing = {0};
+        bool parsed_existing = raw && aimem_knowledge_chain_parse(raw, &existing);
+        if (parsed_existing && existing.count >= 1u &&
+            existing.type == type && aimem_scope_matches(&existing.scope, scope) &&
+            strcmp(existing.versions[0].version_id, v->version_id) == 0 &&
+            aimem_knowledge_payload_matches(&existing.versions[0], status, content, provenance)) {
+            replay = aimem_knowledge_copy(&existing.versions[0], out);
+        }
+        existing_conflict = raw != NULL && !replay;
+        free(raw); aimem_knowledge_chain_free(&existing);
+    }
     bool copied = result == QIHSE_KV_CAS_UPDATED && aimem_knowledge_copy(v, out);
+    if (copied) aimem_knowledge_audit(user,
+        status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ?
+        "AIMEM_KNOWLEDGE_APPROVE" : "AIMEM_KNOWLEDGE_CREATE",
+        v, qihse_user_get_classification(user), qihse_user_get_sci(user));
     free(encoded); aimem_knowledge_chain_free(&chain);
-    return copied ? QIHSE_AIMEM_WRITE_NEW : QIHSE_AIMEM_WRITE_FAILED;
+    if (copied) return QIHSE_AIMEM_WRITE_NEW;
+    if (replay) return QIHSE_AIMEM_WRITE_REPLAY;
+    return result == QIHSE_KV_CAS_MISMATCH || existing_conflict ?
+        QIHSE_AIMEM_WRITE_CONFLICT : QIHSE_AIMEM_WRITE_FAILED;
 }
 
-qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_create(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, uint32_t type, uint32_t status,
+        const char* content, qihse_ai_memory_knowledge_version_t* out) {
+    return qihse_ai_memory_knowledge_create_ex(server, user, scope, type, status,
+                                                content, NULL, out);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise_ex(
         qihse_resp_server_t* server, qihse_user_t* user,
         const char* knowledge_id, const char* expected_version_id,
         uint64_t expected_revision, uint32_t status, const char* content,
+        const qihse_ai_memory_knowledge_provenance_t* provenance,
         qihse_ai_memory_knowledge_version_t* out) {
     if (out) memset(out, 0, sizeof(*out));
     qihse_uuid_t parsed;
     if (!server || !user || !qihse_auth_user_is_active(user) || !knowledge_id ||
         !expected_version_id || !qihse_uuid_parse(expected_version_id, &parsed) ||
         !expected_revision || !aimem_knowledge_status_writable(user, status) ||
-        !content || !*content || strlen(content) > AIMEM_KNOWLEDGE_MAX_CONTENT || !out)
+        !content || !*content || strlen(content) > AIMEM_KNOWLEDGE_MAX_CONTENT || !out ||
+        (provenance && !aimem_idempotency_key_valid(provenance->idempotency_key)))
         return QIHSE_AIMEM_WRITE_FAILED;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
     char key[128];
@@ -2278,6 +2662,38 @@ qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
         pthread_mutex_unlock(&g_aimem_knowledge_lock); return QIHSE_AIMEM_WRITE_FAILED;
     }
     qihse_ai_memory_knowledge_version_t* prior = &chain.versions[chain.count - 1u];
+    bool is_operator = qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+    const char* idem = provenance ? provenance->idempotency_key : NULL;
+    char deterministic_id[QIHSE_AIMEM_ID_LEN + 1u] = {0};
+    if (idem) {
+        char seed[QIHSE_AIMEM_IDEM_MAX_LEN + 192u];
+        int n = snprintf(seed, sizeof seed, "QIHSE:AIMEM:knowledge:revise:v2:%u:%s:%u:%s",
+            (unsigned)qihse_user_get_tenant_id(user), knowledge_id,
+            (unsigned)qihse_user_get_id(user), idem);
+        qihse_uuid_t deterministic;
+        if (n <= 0 || (size_t)n >= sizeof seed ||
+            !qihse_uuid_from_seed(seed, (size_t)n, &deterministic) ||
+            !qihse_uuid_format(&deterministic, deterministic_id)) {
+            free(raw); aimem_knowledge_chain_free(&chain);
+            pthread_mutex_unlock(&g_aimem_knowledge_lock); return QIHSE_AIMEM_WRITE_FAILED;
+        }
+        if (strcmp(prior->version_id, deterministic_id) == 0) {
+            bool replay = prior->revision == expected_revision + 1u &&
+                strcmp(prior->supersedes_version, expected_version_id) == 0 &&
+                aimem_knowledge_payload_matches(prior, status, content, provenance) &&
+                aimem_knowledge_copy(prior, out);
+            free(raw); aimem_knowledge_chain_free(&chain);
+            pthread_mutex_unlock(&g_aimem_knowledge_lock);
+            return replay ? QIHSE_AIMEM_WRITE_REPLAY : QIHSE_AIMEM_WRITE_CONFLICT;
+        }
+    }
+    if ((prior->status == QIHSE_AIMEM_KNOWLEDGE_APPROVED &&
+         (!is_operator || (status != QIHSE_AIMEM_KNOWLEDGE_APPROVED &&
+                           status != QIHSE_AIMEM_KNOWLEDGE_RETRACTED))) ||
+        prior->status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED) {
+        free(raw); aimem_knowledge_chain_free(&chain);
+        pthread_mutex_unlock(&g_aimem_knowledge_lock); return QIHSE_AIMEM_WRITE_FAILED;
+    }
     if (prior->revision != expected_revision ||
         strcmp(prior->version_id, expected_version_id) != 0 ||
         chain.count >= AIMEM_KNOWLEDGE_MAX_VERSIONS) {
@@ -2298,13 +2714,21 @@ qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
     qihse_ai_memory_knowledge_version_t* next = &chain.versions[chain.count];
     memset(next, 0, sizeof(*next));
     qihse_uuid_t version_uuid;
-    ok = qihse_uuid_generate(&version_uuid) && qihse_uuid_format(&version_uuid, next->version_id);
+    ok = idem ? (snprintf(next->version_id, sizeof next->version_id, "%s",
+                          deterministic_id) > 0) :
+        (qihse_uuid_generate(&version_uuid) && qihse_uuid_format(&version_uuid, next->version_id));
     snprintf(next->knowledge_id, sizeof next->knowledge_id, "%s", chain.knowledge_id);
     snprintf(next->supersedes_version, sizeof next->supersedes_version, "%s", prior->version_id);
     next->scope = chain.scope; next->type = chain.type; next->status = status;
     next->revision = prior->revision + 1u; next->created_at_ms = boundary;
     next->valid_from_ingest_ms = boundary; next->created_by = qihse_user_get_id(user);
+    next->reviewed_by = (status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ||
+                         status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED) ?
+                        qihse_user_get_id(user) : 0u;
     next->content = ok ? strdup(content) : NULL;
+    ok = next->content && aimem_content_sha256(content, next->content_sha256) &&
+         aimem_prepare_provenance(server, user, &chain.scope, provenance,
+                                  prior->version_id, next);
     chain.count++;
     char* encoded = next->content ? aimem_knowledge_chain_encode(&chain) : NULL;
     qihse_kv_record_meta_t meta;
@@ -2312,11 +2736,25 @@ qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
     qihse_kv_cas_result_t cas = ok ? qihse_kv_compare_set_user(store, key, raw,
         encoded, meta.classification, meta.sci_compartment, user) : QIHSE_KV_CAS_FAILED;
     bool copied = cas == QIHSE_KV_CAS_UPDATED && aimem_knowledge_copy(next, out);
+    if (copied) aimem_knowledge_audit(user,
+        status == QIHSE_AIMEM_KNOWLEDGE_APPROVED ?
+        "AIMEM_KNOWLEDGE_APPROVE" : status == QIHSE_AIMEM_KNOWLEDGE_RETRACTED ?
+        "AIMEM_KNOWLEDGE_RETRACT" : "AIMEM_KNOWLEDGE_REVISE",
+        next, meta.classification, meta.sci_compartment);
     free(encoded); free(raw); aimem_knowledge_chain_free(&chain);
     pthread_mutex_unlock(&g_aimem_knowledge_lock);
     if (copied) return QIHSE_AIMEM_WRITE_NEW;
     return cas == QIHSE_KV_CAS_MISMATCH ? QIHSE_AIMEM_WRITE_CONFLICT
                                          : QIHSE_AIMEM_WRITE_FAILED;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_knowledge_revise(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const char* knowledge_id, const char* expected_version_id,
+        uint64_t expected_revision, uint32_t status, const char* content,
+        qihse_ai_memory_knowledge_version_t* out) {
+    return qihse_ai_memory_knowledge_revise_ex(server, user, knowledge_id,
+        expected_version_id, expected_revision, status, content, NULL, out);
 }
 
 bool qihse_ai_memory_knowledge_latest(qihse_resp_server_t* server,
