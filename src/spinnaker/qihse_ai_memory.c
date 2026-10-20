@@ -918,12 +918,36 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
         const qihse_ai_memory_scope_t* scope, const char* producer_namespace,
         const char* event_id, const char* event_kind, uint64_t source_time_ms,
         const char* summary, char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    return qihse_ai_memory_event_append_evidence(server, user, scope,
+        producer_namespace, event_id, event_kind, source_time_ms, summary,
+        NULL, out_id);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_event_append_evidence(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, const char* producer_namespace,
+        const char* event_id, const char* event_kind, uint64_t source_time_ms,
+        const char* summary, const char* source_evidence_id,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
     if (!server || !user || !qihse_auth_user_is_active(user) ||
         !aimem_scope_valid(scope) || !aimem_event_token(producer_namespace, 63u) ||
         !aimem_event_token(event_id, QIHSE_AIMEM_IDEM_MAX_LEN) ||
         !aimem_event_kind_valid(event_kind) || !summary || !*summary ||
         strnlen(summary, QIHSE_AIMEM_EVENT_MAX_SUMMARY + 1u) > QIHSE_AIMEM_EVENT_MAX_SUMMARY)
         return QIHSE_AIMEM_WRITE_FAILED;
+    if (source_evidence_id) {
+        qihse_uuid_t evidence_uuid;
+        qihse_ai_memory_hit_t evidence;
+        memset(&evidence, 0, sizeof evidence);
+        if (!qihse_uuid_parse(source_evidence_id, &evidence_uuid) ||
+            !qihse_ai_memory_get_scoped(server, user, source_evidence_id,
+                                         scope, &evidence))
+            return QIHSE_AIMEM_WRITE_FAILED;
+        bool visible = qihse_auth_can_access(user, evidence.classification,
+                                              evidence.sci_compartment);
+        free(evidence.text);
+        if (!visible) return QIHSE_AIMEM_WRITE_FAILED;
+    }
     for (const unsigned char* p = (const unsigned char*)summary; *p; p++)
         if (*p < 0x20u || *p == 0x7fu) return QIHSE_AIMEM_WRITE_FAILED;
     unsigned char digest[EVP_MAX_MD_SIZE];
@@ -933,13 +957,20 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
     char digest_hex[65];
     for (size_t i = 0; i < 32u; i++)
         snprintf(digest_hex + i * 2u, 3u, "%02x", digest[i]);
-    char* envelope = malloc(QIHSE_AIMEM_EVENT_MAX_SUMMARY + 512u);
+    char* envelope = malloc(QIHSE_AIMEM_EVENT_MAX_SUMMARY + 640u);
     if (!envelope) return QIHSE_AIMEM_WRITE_FAILED;
-    int n = snprintf(envelope, QIHSE_AIMEM_EVENT_MAX_SUMMARY + 512u,
-        "QHEV1|%s|%s|%s|%llu|%llu|observed|%s|%s", producer_namespace, event_id,
-        event_kind, (unsigned long long)source_time_ms,
-        (unsigned long long)aimem_now_ms(), digest_hex, summary);
-    if (n <= 0 || (size_t)n >= QIHSE_AIMEM_EVENT_MAX_SUMMARY + 512u) {
+    int n = source_evidence_id
+        ? snprintf(envelope, QIHSE_AIMEM_EVENT_MAX_SUMMARY + 640u,
+            "QHEV2|%s|%s|%s|%llu|%llu|observed|%s|%s|%s",
+            producer_namespace, event_id, event_kind,
+            (unsigned long long)source_time_ms,
+            (unsigned long long)aimem_now_ms(), source_evidence_id,
+            digest_hex, summary)
+        : snprintf(envelope, QIHSE_AIMEM_EVENT_MAX_SUMMARY + 640u,
+            "QHEV1|%s|%s|%s|%llu|%llu|observed|%s|%s", producer_namespace,
+            event_id, event_kind, (unsigned long long)source_time_ms,
+            (unsigned long long)aimem_now_ms(), digest_hex, summary);
+    if (n <= 0 || (size_t)n >= QIHSE_AIMEM_EVENT_MAX_SUMMARY + 640u) {
         free(envelope);
         return QIHSE_AIMEM_WRITE_FAILED;
     }
@@ -965,16 +996,24 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append(
             if (qihse_ai_memory_get_scoped(server, user, canonical, scope, &prior)) {
                 char invariant_prefix[384];
                 int pn = snprintf(invariant_prefix, sizeof invariant_prefix,
-                    "QHEV1|%s|%s|%s|%llu|", producer_namespace, event_id,
-                    event_kind, (unsigned long long)source_time_ms);
+                    "QHEV%u|%s|%s|%s|%llu|", source_evidence_id ? 2u : 1u,
+                    producer_namespace, event_id, event_kind,
+                    (unsigned long long)source_time_ms);
                 char* receive_end = pn > 0 && (size_t)pn < sizeof invariant_prefix &&
                     strncmp(prior.text, invariant_prefix, (size_t)pn) == 0
                     ? strchr(prior.text + pn, '|') : NULL;
-                size_t suffix_len = strlen("observed|") + strlen(digest_hex) + 1u + strlen(summary);
+                size_t suffix_len = strlen("observed|") +
+                    (source_evidence_id ? strlen(source_evidence_id) + 1u : 0u) +
+                    strlen(digest_hex) + 1u + strlen(summary);
                 char* suffix = malloc(suffix_len + 1u);
                 bool same = false;
                 if (suffix) {
-                    snprintf(suffix, suffix_len + 1u, "observed|%s|%s", digest_hex, summary);
+                    if (source_evidence_id)
+                        snprintf(suffix, suffix_len + 1u, "observed|%s|%s|%s",
+                                 source_evidence_id, digest_hex, summary);
+                    else
+                        snprintf(suffix, suffix_len + 1u, "observed|%s|%s",
+                                 digest_hex, summary);
                     same = prior.kind == QIHSE_AIMEM_EVENT && receive_end &&
                            strcmp(receive_end + 1u, suffix) == 0;
                     free(suffix);
@@ -1002,17 +1041,27 @@ bool qihse_ai_memory_event_get(qihse_resp_server_t* server, qihse_user_t* user,
         qihse_ai_memory_hit_t* out) {
     if (!qihse_ai_memory_get_scoped(server, user, id, scope, out)) return false;
     if (out->kind == QIHSE_AIMEM_EVENT && out->text &&
-        strncmp(out->text, "QHEV1|", 6u) == 0) {
+        (strncmp(out->text, "QHEV1|", 6u) == 0 ||
+         strncmp(out->text, "QHEV2|", 6u) == 0)) {
+        bool has_evidence = strncmp(out->text, "QHEV2|", 6u) == 0;
         char producer[64], event_id[QIHSE_AIMEM_IDEM_MAX_LEN + 1u];
         char kind[32], source[24], received[24], status[16], digest_hex[65];
+        char evidence_id[QIHSE_AIMEM_ID_LEN + 1u];
         int offset = 0;
-        int fields = sscanf(out->text,
+        int fields = has_evidence ? sscanf(out->text,
+            "QHEV2|%63[^|]|%128[^|]|%31[^|]|%23[^|]|%23[^|]|%15[^|]|%36[^|]|%64[^|]|%n",
+            producer, event_id, kind, source, received, status, evidence_id, digest_hex, &offset)
+            : sscanf(out->text,
             "QHEV1|%63[^|]|%128[^|]|%31[^|]|%23[^|]|%23[^|]|%15[^|]|%64[^|]|%n",
             producer, event_id, kind, source, received, status, digest_hex, &offset);
-        bool valid = fields == 7 && offset > 0 && aimem_event_token(producer, 63u) &&
+        bool valid = fields == (has_evidence ? 8 : 7) && offset > 0 && aimem_event_token(producer, 63u) &&
             aimem_event_token(event_id, QIHSE_AIMEM_IDEM_MAX_LEN) &&
             aimem_event_kind_valid(kind) && strcmp(status, "observed") == 0 &&
             strlen(digest_hex) == 64u;
+        if (has_evidence) {
+            qihse_uuid_t evidence_uuid;
+            valid = valid && qihse_uuid_parse(evidence_id, &evidence_uuid);
+        }
         valid = valid && aimem_event_u64_valid(source) && aimem_event_u64_valid(received);
         for (size_t i = 0; valid && i < 64u; i++)
             if (!((digest_hex[i] >= '0' && digest_hex[i] <= '9') ||

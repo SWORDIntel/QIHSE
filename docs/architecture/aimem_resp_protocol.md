@@ -24,7 +24,7 @@ AIMEM GET-SCOPED <uuid> <project> <worktree> <workstream> <session>
 AIMEM FORGET-SCOPED[-DURABLE] <uuid> <project> <worktree> <workstream> <session>
 AIMEM COUNT-SCOPED <project> <worktree> <workstream> <session> [kind]
 AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>
-AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <event-kind> <source-ms> <summary>
+AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <event-kind> <source-ms> <summary> [source-evidence-uuid]
 AIMEM EVENT READ <uuid> <project> <worktree> <workstream> <session>
 AIMEM PROJECT GRANT <project> <reader-user-id>
 AIMEM PROJECT REVOKE <project> <reader-user-id>
@@ -63,8 +63,13 @@ READ` returns the normal authorized hit shape and revalidates the envelope
 digest. `make test-aimem-durable-crash` kills the process after the durable
 append result is produced but before the simulated client receives it;
 restart/replay returns the same UUID and conflicting reuse stays denied.
-Optional source-evidence handles and an explicit bounded admission/backpressure
-contract are not implemented yet.
+An optional source-evidence UUID is accepted only when it resolves to a memory
+record visible to the authenticated actor in the exact event scope; the UUID is
+persisted in the immutable event envelope and participates in replay matching.
+Admission is synchronous and bounded: the RESP server limits active clients and
+request bytes, event summaries are capped at 16 KiB, and requests wait on the
+server's bounded lock/fsync path. There is no unbounded in-memory event queue;
+clients should retry a closed/failed request with the same producer/event ID.
 
 ## Claim-once handoffs (QH-03, first slice)
 
@@ -84,9 +89,10 @@ unexpired offer, then writes and fsyncs the new record before reply. Repeating
 the same recipient's lost-ACK accept at the immediately preceding revision
 returns `ACCEPTED`; accepted handoffs remain accepted and queryable rather
 than being re-offered automatically. Other callers receive a generic conflict
-or null reply, without a handoff summary.
+or null reply, without a handoff summary. An authorized GET persists an OPEN to
+EXPIRED transition with a revision increment and fsync before returning it.
 
-The current lock provides claim-once behavior among concurrent requests in one
+The current lock and KV compare-and-set provide claim-once behavior among concurrent requests in one
 RESP server process; the regression races 100 callers and verifies the
 authorized recipient receives the durable accepted result while a competing
 principal is denied. The crash regression kills the server after durable

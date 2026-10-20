@@ -5893,8 +5893,8 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
 
     if (qihse_resp_arg_equal(&request->argv[1], "EVENT")) {
         if (request->argc >= 3u && qihse_resp_arg_equal(&request->argv[2], "APPEND")) {
-            if (request->argc != 12u)
-                return qihse_resp_error(session, "ERR usage: AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <kind> <source-ms> <summary>");
+            if (request->argc != 12u && request->argc != 13u)
+                return qihse_resp_error(session, "ERR usage: AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <kind> <source-ms> <summary> [source-evidence-uuid]");
             qihse_ai_memory_scope_t scope;
             if (!qihse_resp_aimem_scope_parse(request, 3u, &scope))
                 return qihse_resp_error(session, "ERR invalid or incomplete AIMEM event scope");
@@ -5924,15 +5924,21 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             }
             char id[QIHSE_AIMEM_ID_LEN + 1u];
             pthread_rwlock_wrlock(&session->server->kv_lock);
-            qihse_ai_memory_write_result_t result = qihse_ai_memory_event_append(
+            char* evidence_id = request->argc == 13u ? qihse_resp_arg_text(&request->argv[12]) : NULL;
+            if (request->argc == 13u && !evidence_id) {
+                pthread_rwlock_unlock(&session->server->kv_lock);
+                free(producer); free(event_id); free(event_kind); free(source_text); free(summary);
+                return qihse_resp_error(session, "ERR invalid source evidence handle");
+            }
+            qihse_ai_memory_write_result_t result = qihse_ai_memory_event_append_evidence(
                 session->server, session->user, &scope, producer, event_id,
-                event_kind, (uint64_t)source_ms, summary, id);
+                event_kind, (uint64_t)source_ms, summary, evidence_id, id);
             qihse_kv_store_t* store = qihse_resp_server_store(session->server);
             bool durable = result == QIHSE_AIMEM_WRITE_NEW ||
                            result == QIHSE_AIMEM_WRITE_REPLAY;
             if (durable) durable = store && qihse_kv_sync_store(store);
             pthread_rwlock_unlock(&session->server->kv_lock);
-            free(producer); free(event_id); free(event_kind); free(source_text); free(summary);
+            free(producer); free(event_id); free(event_kind); free(source_text); free(summary); free(evidence_id);
             if (result == QIHSE_AIMEM_WRITE_CONFLICT)
                 return qihse_resp_error(session, "ERR CONFLICT AIMEM event identity already has different content");
             if (result == QIHSE_AIMEM_WRITE_FAILED)
@@ -6131,18 +6137,39 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             char* id = qihse_resp_arg_text(&request->argv[3]);
             char key[128];
             bool keyed = id && qihse_resp_aimem_handoff_key(key, sizeof key, session->user, id);
+            pthread_rwlock_wrlock(&session->server->kv_lock);
             char* raw = keyed ? qihse_kv_get_user(store, key, session->user) : NULL;
-            free(id);
             qihse_aimem_handoff_t handoff;
             bool parsed = raw && qihse_resp_aimem_handoff_parse(raw, &handoff);
-            free(raw);
-            if (!parsed) return qihse_resp_null(session);
-            if (qihse_resp_now_ms() >= handoff.expires_ms && handoff.state == QIHSE_AIMEM_HANDOFF_OPEN)
-                handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
+            if (!parsed) {
+                free(id); free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                return qihse_resp_null(session);
+            }
             bool authorized = qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR ||
                 qihse_user_get_id(session->user) == handoff.owner_id ||
                 qihse_user_get_id(session->user) == handoff.recipient_id;
-            if (!authorized) { qihse_resp_aimem_handoff_free(&handoff); return qihse_resp_null(session); }
+            if (!authorized) {
+                free(id); free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                qihse_resp_aimem_handoff_free(&handoff); return qihse_resp_null(session);
+            }
+            if (qihse_resp_now_ms() >= handoff.expires_ms && handoff.state == QIHSE_AIMEM_HANDOFF_OPEN) {
+                handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
+                handoff.revision++;
+                qihse_kv_record_meta_t meta;
+                char replacement[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+                bool durable = qihse_kv_meta_user(store, key, session->user, &meta) &&
+                    qihse_resp_aimem_handoff_encode(&handoff, replacement, sizeof replacement) &&
+                    qihse_kv_compare_set_user(store, key, raw, replacement,
+                        meta.classification, meta.sci_compartment, session->user) == QIHSE_KV_CAS_UPDATED &&
+                    qihse_kv_sync_store(store);
+                if (!durable) {
+                    free(id); free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                    qihse_resp_aimem_handoff_free(&handoff);
+                    return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM expiry transition not confirmed durable");
+                }
+            }
+            free(id); free(raw);
+            pthread_rwlock_unlock(&session->server->kv_lock);
             bool emitted = qihse_resp_aimem_emit_handoff(session, &handoff);
             qihse_resp_aimem_handoff_free(&handoff);
             return emitted;
@@ -6179,6 +6206,19 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             bool grant_ok = accept && qihse_ai_memory_project_reader_allowed(
                 session->server, session->user, handoff.scope.project);
             uint64_t now = qihse_resp_now_ms();
+            if (handoff.state == QIHSE_AIMEM_HANDOFF_OPEN && now >= handoff.expires_ms) {
+                handoff.state = QIHSE_AIMEM_HANDOFF_EXPIRED;
+                handoff.revision++;
+                char expired[QIHSE_AIMEM_HANDOFF_MAX_SUMMARY + 512u];
+                bool durable = qihse_resp_aimem_handoff_encode(&handoff, expired, sizeof expired) &&
+                    qihse_kv_compare_set_user(store, key, raw, expired,
+                        meta.classification, meta.sci_compartment, session->user) == QIHSE_KV_CAS_UPDATED &&
+                    qihse_kv_sync_store(store);
+                free(raw); pthread_rwlock_unlock(&session->server->kv_lock);
+                qihse_resp_aimem_handoff_free(&handoff);
+                return durable ? qihse_resp_error(session, "ERR CONFLICT AIMEM handoff expired") :
+                    qihse_resp_error(session, "ERR NOT_DURABLE AIMEM expiry transition not confirmed durable");
+            }
             if (accept && handoff.state == QIHSE_AIMEM_HANDOFF_ACCEPTED &&
                 handoff.accepted_by == qihse_user_get_id(session->user) &&
                 expected + 1u == handoff.revision) {
