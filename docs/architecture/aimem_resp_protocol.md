@@ -84,15 +84,29 @@ success. No ordinary AIMEM ACK certifies quorum/remote replication, and the
 local durability guarantee assumes the underlying filesystem/storage honors
 `fsync` and rename semantics.
 
-**Remaining QH-00 gap:** the document and its idempotency mapping are
-currently separate KV writes. A crash *before* the new durable ACK, after
-the document write but before the map write, can leave an orphan document
-whose retry creates a second record. This needs a transactional KV write or
-deterministic recoverable identity before QH-00 can be marked complete.
-Index rebuild is derived from authoritative KV documents; a successful
-durable ACK does not certify semantic-index freshness if embedding/indexing
-fails separately. QH-01 scoped identity and QH-02 typed event journaling
-are not yet part of these commands.
+**Pre-ACK recovery (QH-00 second slice):** for new requests with an
+idempotency key, QIHSE derives a deterministic canonical UUID using the
+existing SHA-384 federation UUID helper, namespaced by authenticated
+tenant, principal and key. Before allocating a new memory, the native store
+checks this UUID's KV entry and refuses conflicting kind/text or full UUID
+mismatches. After a crash between the primary record write and the separate
+idempotency-map write, a retry locates the original document, verifies its
+content and repairs the missing map. Legacy random UUIDs with existing
+idempotency mappings retain their original IDs; no migration rewrites them.
+
+**Remaining QH-00 work:** this is **recoverable identity**, not atomic
+multi-key commit. Durable ACK still certifies only the local KV fence, not
+remote replication. Complete WAL-phase fault injection (including partial
+I/O errors and fsync faults), receipt/LSN design, idempotency-map migration
+behaviour, and measured P50/P95 fsync overhead remain required before
+declaring QH-00 complete. A failed admission may already have left a primary
+record; the caller must retry with the same key, not invent a new key.
+Deterministic identity binds to the authenticated numeric tenant/principal
+IDs, which must be restored consistently across process restarts.
+
+Index rebuild is derived from authoritative KV documents; a durable ACK
+does not certify semantic-index freshness if embedding/indexing fails.
+QH-01 scoped identity and QH-02 typed event journaling remain planned.
 
 ## Operational properties
 

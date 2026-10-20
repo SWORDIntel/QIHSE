@@ -5586,7 +5586,20 @@ static qihse_aimem_admit_result_t qihse_resp_aimem_store_one(
             return fenced ? QIHSE_AIMEM_ADMIT_OK : QIHSE_AIMEM_ADMIT_NOT_DURABLE;
         }
     }
-    bool ok = qihse_ai_memory_store(session->server, session->user, text, kind, out_id);
+    /* A stable UUID is derived before writing the canonical document.
+     * If a SIGKILL interrupts admission before the separate map write, a
+     * replay finds the original document and repairs the missing mapping. */
+    qihse_ai_memory_write_result_t write_result = idem
+        ? qihse_ai_memory_store_idempotent(
+              session->server, session->user, text, kind, idem, out_id)
+        : (qihse_ai_memory_store(session->server, session->user, text, kind, out_id)
+               ? QIHSE_AIMEM_WRITE_NEW : QIHSE_AIMEM_WRITE_FAILED);
+    if (write_result == QIHSE_AIMEM_WRITE_CONFLICT) {
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        return QIHSE_AIMEM_ADMIT_CONFLICT;
+    }
+    bool ok = write_result == QIHSE_AIMEM_WRITE_NEW ||
+              write_result == QIHSE_AIMEM_WRITE_REPLAY;
     if (ok && idem) {
         uint16_t cls = qihse_user_get_classification(session->user);
         uint16_t sci = qihse_user_get_sci(session->user);
@@ -5669,7 +5682,9 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (!store) { free(id); return qihse_resp_error(session, "ERR AIMEM store unavailable"); }
         pthread_rwlock_wrlock(&session->server->kv_lock);
         bool removed = qihse_ai_memory_forget(session->server, session->user, id);
-        bool fenced = qihse_kv_sync_store(store);
+        /* Miss/denial has no AIMEM mutation; do not force a global fsync
+         * from an unprivileged probe of a hidden/nonexistent UUID. */
+        bool fenced = !removed || qihse_kv_sync_store(store);
         pthread_rwlock_unlock(&session->server->kv_lock);
         free(id);
         if (!fenced) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete not confirmed durable");

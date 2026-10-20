@@ -26,6 +26,7 @@ extern "C" {
 #endif
 
 #define QIHSE_AIMEM_ID_LEN 36u /* formatted UUID */
+#define QIHSE_AIMEM_IDEM_MAX_LEN 128u
 
 typedef enum {
     QIHSE_AIMEM_EPISODIC = 1u, /* what happened */
@@ -110,6 +111,26 @@ bool qihse_ai_memory_embed_text(const char* text, float* out, size_t dim);
 bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                            const char* text, uint32_t kind,
                            char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+
+/* QH-00 retry-safe admission. When the same (tenant, actor, idempotency-key)
+ * is retried after a pre-ACK crash, derive the same UUID from the existing
+ * federation SHA-384 UUID helper. A conflicting kind/text is never replaced.
+ *
+ * This is a trusted native API: caller supplies an authenticated user and
+ * must serialize same-key concurrent admission (RESP uses its KV write lock).
+ * The old random-UUID store API and its return contract are unchanged.
+ * Durable ACK still requires a separate KV sync fence. */
+typedef enum {
+    QIHSE_AIMEM_WRITE_FAILED = 0,
+    QIHSE_AIMEM_WRITE_NEW = 1,
+    QIHSE_AIMEM_WRITE_REPLAY = 2,
+    QIHSE_AIMEM_WRITE_CONFLICT = 3
+} qihse_ai_memory_write_result_t;
+
+qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
 
 /* Recall with an explicit ranking mode. */
 size_t qihse_ai_memory_recall_mode(qihse_resp_server_t* server, qihse_user_t* user,
