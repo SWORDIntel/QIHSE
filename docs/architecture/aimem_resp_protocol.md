@@ -26,6 +26,7 @@ AIMEM GET-SCOPED <uuid> <project> <worktree> <workstream> <session>
 AIMEM FORGET-SCOPED[-DURABLE] <uuid> <project> <worktree> <workstream> <session>
 AIMEM COUNT-SCOPED <project> <worktree> <workstream> <session> [kind]
 AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>
+AIMEM LEGACY SCAN <cursor> <count>
 AIMEM EVENT APPEND <project> <worktree> <workstream> <session> <producer> <event-id> <event-kind> <source-ms> <summary> [source-evidence-uuid]
 AIMEM EVENT READ <uuid> <project> <worktree> <workstream> <session>
 AIMEM PROJECT GRANT <project> <reader-user-id>
@@ -196,6 +197,17 @@ scope match and optional kind filter. Thus out-of-scope or high-label records
 cannot change scoped ranking statistics or occupy top-K slots. Direct-ID get
 and forget repeat the same scope and actor checks.
 
+`LEGACY SCAN` provides the content-free inventory needed to prepare a reviewed
+migration manifest. It requires an active, fully cleared system Operator and
+returns `[next-cursor, [uuid ...]]`, with cursor `0` marking the final page.
+Pages are ordered by canonical UUID and capped at 1,000 rows. The command
+returns UUIDs only; it never returns memory text. Keep legacy writes quiescent
+for a stable multi-page inventory. `tools/qihse_aimem_migrate.py` requires a
+complete version-1 JSON manifest that assigns each UUID to an explicit project,
+worktree, workstream and session, inventories the server before mutation, and
+then applies the existing idempotent `MIGRATE-LEGACY` operation. It refuses a
+manifest that omits any inventoried legacy UUID.
+
 Scoped BM25 recall uses a persistent FTS projection keyed by tenant, principal,
 role/clearance/SCI, canonical project/worktree/workstream/session coordinates,
 and kind filter. Save/load operations use that authenticated principal. Its
@@ -249,7 +261,7 @@ through the same authorization-aware path; an embedding is derived from the
 text and can leak it, so no mode can rank, score, or count a record the
 principal cannot see.
 
-## Durability — two distinct acknowledgement contracts (QH-00 partial)
+## Durability — two distinct acknowledgement contracts (QH-00)
 
 The original `STORE` and `FORGET` commands preserve their **eventually
 durable** acknowledgement semantics. A successful legacy reply says that the

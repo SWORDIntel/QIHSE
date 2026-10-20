@@ -537,6 +537,66 @@ query mode is HNSW (`QueryMode.GRAPH`) and searching an unbuilt graph raises
 `insert`, `build-graph`, `build-int8`, `search`, `stats`
 (`./qihse db --help` verified).
 
+### 3.7 AIMEM backup and legacy-scope migration
+
+Build the authenticated whole-store backup utility with `make backup-cli`.
+Stop the service that owns the data directory before creating a backup. Supply
+the Operator credential through `QIHSE_OPERATOR_PASSWORD` or a regular file
+readable only by its owner; the utility does not accept a password argument.
+
+```bash
+QIHSE_DATA_DIR=./build/aimem-data \
+QIHSE_OPERATOR_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
+    ./qihse-backup backup --output ./build/aimem-pre-migration.qbak
+
+QIHSE_DATA_DIR=./build/aimem-data \
+QIHSE_OPERATOR_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
+    ./qihse-backup verify --input ./build/aimem-pre-migration.qbak
+```
+
+Legacy unscoped memories require a reviewed destination for every UUID. With
+the service running and legacy writes quiescent, a fully cleared system
+Operator can page through the content-free UUID inventory using `AIMEM LEGACY
+SCAN <cursor> <count>`. Cursor `0` starts and ends an inventory.
+
+The migration client accepts a version-1 JSON manifest:
+
+```json
+{
+  "version": 1,
+  "records": [
+    {
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "project": "reviewed-project",
+      "worktree": "",
+      "workstream": "",
+      "session": ""
+    }
+  ]
+}
+```
+
+Run a complete preflight before mutation, then retain the checkpoint beside
+the manifest for restartable execution:
+
+```bash
+QIHSE_AIMEM_MIGRATION_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
+    python3 tools/qihse_aimem_migrate.py --username GODMODE_OP \
+    --manifest ./build/aimem-scopes.json \
+    --dry-run
+
+QIHSE_AIMEM_MIGRATION_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
+    python3 tools/qihse_aimem_migrate.py --username GODMODE_OP \
+    --manifest ./build/aimem-scopes.json \
+    --checkpoint ./build/aimem-migration.checkpoint
+```
+
+The client refuses incomplete inventories, duplicate UUIDs, invalid scope
+chains and records that are neither still legacy nor already present at the
+exact manifest destination. Do not infer scope from memory text. Older QKV,
+QHEV, QHH, QHK, QHM and QHI versions remain readable and upgrade through their
+normal mutation or rebuild paths; they do not require a blanket conversion.
+
 ---
 
 ## 4. Cluster smoke drills

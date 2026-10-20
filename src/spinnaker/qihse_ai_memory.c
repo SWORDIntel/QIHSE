@@ -845,11 +845,15 @@ static bool aimem_legacy_inventory_cb(const char* key, const char* value,
         return true;
     }
 
-    /* Ignore malformed/colliding rows: an inventory item must identify the
-     * same canonical key that MIGRATE-LEGACY will resolve. */
+    /* An inventory item must identify the same canonical key that
+     * MIGRATE-LEGACY will resolve.  Fail the whole scan on a collision so a
+     * migration preflight can never mistake an omitted row for a clean set. */
     aimem_key(canonical_key, sizeof canonical_key, aimem_doc_id(&uuid));
-    if (strcmp(key, canonical_key) != 0 ||
-        (scan->cursor[0] && strcmp(meta.id, scan->cursor) <= 0)) return true;
+    if (strcmp(key, canonical_key) != 0) {
+        scan->failed = true;
+        return true;
+    }
+    if (scan->cursor[0] && strcmp(meta.id, scan->cursor) <= 0) return true;
 
     qihse_ai_memory_legacy_inventory_item_t item;
     memset(&item, 0, sizeof item);
