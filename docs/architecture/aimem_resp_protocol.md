@@ -321,12 +321,7 @@ read. As-of returns the version whose half-open ingestion interval contains the
 cutoff; it describes QIHSE's knowledge at that ingestion time, not world-time
 truth. Explain output exposes no hidden candidate count or content.
 
-One-lineage maintenance uses durable `QHM1` plans. Planning can be side-effect
-free; apply appends a normal `QHK1` successor and rollback appends another
-successor containing the pre-maintenance content. Original versions are never
-deleted. Repeated apply is idempotent, and an applied plan is recoverable after
-restart. Multi-lineage merges, automatic retention and autonomous dedup remain
-outside this first slice.
+One-lineage maintenance uses durable `QHM2` plans (legacy `QHM1` remains readable). Dry runs and durable plans derive a deterministic plan UUID from the actor, scope, source version/hash, replacement hash, typed operation and target retention tier. Plans preserve source and replacement SHA-256, the joined source/actor classification and SCI labels, and typed operation provenance. The five tiers are working, episodic, semantic, procedural and pinned; pinned content cannot be rewritten. Extractive plans only accept a literal substring of the source. Retention-change plans preserve exact content. A source explicitly related as `CONTRADICTS` is refused for maintenance, so it cannot be silently merged. Apply appends a normal QHK successor; rollback appends the exact pre-maintenance content. Crash recovery recognizes a successor written before its plan transition and completes the plan idempotently. Multi-lineage merges/sweeps and automatic expiry are intentionally unsupported because no cross-record atomic journal exists.
 
 `qihse_ai_memory_export_authenticated()` emits a canonical `QAX2` logical
 projection, not KV/SSTable bytes. It contains only authorized lifecycle events

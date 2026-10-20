@@ -329,13 +329,29 @@ void qihse_ai_memory_query_hits_free(qihse_ai_memory_query_hit_t* hits,
     size_t count);
 void qihse_ai_memory_query_end(qihse_ai_memory_query_snapshot_t* snapshot);
 
-/* QH-06: a durable, one-lineage maintenance plan.  PLAN is dry-run capable;
- * APPLY and ROLLBACK append ordinary immutable QHK successors. */
+/* QH-06: durable single-lineage maintenance only. PLAN carries one source
+ * version, typed operation, source/replacement hashes, target retention tier,
+ * and the label join. Multi-lineage merge/sweep is intentionally unsupported
+ * until a cross-record atomic journal exists. APPLY/ROLLBACK append immutable
+ * QHK successors. */
 typedef enum {
     QIHSE_AIMEM_MAINT_PLANNED = 1u,
     QIHSE_AIMEM_MAINT_APPLIED,
     QIHSE_AIMEM_MAINT_ROLLED_BACK
 } qihse_ai_memory_maintenance_state_t;
+typedef enum {
+    QIHSE_AIMEM_RETENTION_WORKING = 1u,
+    QIHSE_AIMEM_RETENTION_EPISODIC,
+    QIHSE_AIMEM_RETENTION_SEMANTIC,
+    QIHSE_AIMEM_RETENTION_PROCEDURAL,
+    QIHSE_AIMEM_RETENTION_PINNED
+} qihse_ai_memory_retention_tier_t;
+typedef enum {
+    QIHSE_AIMEM_MAINT_REWRITE = 1u,
+    QIHSE_AIMEM_MAINT_EXTRACTIVE,
+    QIHSE_AIMEM_MAINT_RETENTION_CHANGE,
+    QIHSE_AIMEM_MAINT_RESTORE
+} qihse_ai_memory_maintenance_operation_t;
 typedef struct {
     char plan_id[QIHSE_AIMEM_ID_LEN + 1u];
     char knowledge_id[QIHSE_AIMEM_ID_LEN + 1u];
@@ -343,9 +359,20 @@ typedef struct {
     char output_version_id[QIHSE_AIMEM_ID_LEN + 1u];
     qihse_ai_memory_scope_t scope;
     uint32_t state;
+    uint32_t retention_tier;
+    uint32_t operation;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    char source_content_sha256[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
+    char replacement_content_sha256[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
     char* original_content;
     char* replacement_content;
 } qihse_ai_memory_maintenance_plan_t;
+qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_plan_ex(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* knowledge_id,
+    const qihse_ai_memory_scope_t* scope, const char* replacement_content,
+    uint32_t retention_tier, uint32_t operation, bool dry_run,
+    qihse_ai_memory_maintenance_plan_t* out);
 qihse_ai_memory_write_result_t qihse_ai_memory_maintenance_plan(
     qihse_resp_server_t* server, qihse_user_t* user, const char* knowledge_id,
     const qihse_ai_memory_scope_t* scope, const char* replacement_content,
