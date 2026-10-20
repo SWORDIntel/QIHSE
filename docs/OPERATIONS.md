@@ -559,11 +559,14 @@ the service running and legacy writes quiescent, a fully cleared system
 Operator can page through the content-free UUID inventory using `AIMEM LEGACY
 SCAN <cursor> <count>`. Cursor `0` starts and ends an inventory.
 
-The migration client accepts a version-1 JSON manifest:
+The migration client accepts a version-2 JSON manifest. The manifest binds
+every legacy UUID to one existing non-Operator target principal; individual
+records cannot override that identity:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "target_user_id": 65000,
   "records": [
     {
       "uuid": "00000000-0000-4000-8000-000000000000",
@@ -592,8 +595,9 @@ QIHSE_AIMEM_MIGRATION_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
 ```
 
 The client refuses incomplete inventories, duplicate UUIDs, invalid scope
-chains and records that are neither still legacy nor already present at the
-exact manifest destination. Do not infer scope from memory text. Older QKV,
+chains, per-record target overrides, and records that are neither still legacy
+nor already owned by the target principal at the exact manifest destination.
+Do not infer scope from memory text. Older QKV,
 QHEV, QHH, QHK, QHM and QHI versions remain readable and upgrade through their
 normal mutation or rebuild paths; they do not require a blanket conversion.
 
