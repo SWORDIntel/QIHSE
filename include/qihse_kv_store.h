@@ -14,6 +14,12 @@ typedef struct qihse_kv_replica_snapshot qihse_kv_replica_snapshot_t;
 qihse_kv_store_t* qihse_kv_store_create(void);
 void qihse_kv_store_destroy(qihse_kv_store_t* store);
 
+/* Authenticated internal components may place derived projections beneath
+ * the configured private store directory. The returned path is borrowed and
+ * remains valid for process lifetime; callers must still use private,
+ * no-follow, atomic file operations. */
+const char* qihse_kv_store_data_directory(qihse_kv_store_t* store);
+
 /*
  * Context-free writes are intentionally restricted to unclassified data.
  * Classified/SCI writes MUST use qihse_kv_set_user().

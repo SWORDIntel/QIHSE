@@ -163,18 +163,29 @@ scope match and optional kind filter. Thus out-of-scope or high-label records
 cannot change scoped ranking statistics or occupy top-K slots. Direct-ID get
 and forget repeat the same scope and actor checks.
 
-Scoped BM25 and vector recall construct their ranking candidates only from the
-authorized matching scope. Hybrid mode fuses those two scoped rankings. The
-current implementation rebuilds a bounded in-memory candidate corpus per
-request; persistent per-scope indexes are a performance follow-up.
+Scoped BM25 recall uses a persistent FTS projection keyed by tenant, principal,
+role/clearance/SCI, canonical project/worktree/workstream/session coordinates,
+and kind filter. Save/load operations use that authenticated principal. Its
+generation is bound to the KV change sequence; a missing, stale, or invalid projection is
+rebuilt from the tenant AIMEM namespace and atomically replaced. A crash between
+projection and generation-marker writes leaves a mismatch, which forces a
+rebuild. The caller's clearance, SCI, project ownership/grant, scope, and kind
+are applied before BM25 corpus statistics and top-K selection. Every candidate
+is then re-read through the caller's authorized KV path and checked again
+before disclosure. The projection is derived acceleration state, never
+authorization evidence. Semantic recall still computes vectors from
+authorized scoped records on demand; hybrid mode fuses those candidates with
+the persistent BM25 projection.
 `PROJECT GRANT` can be issued by an active principal that owns a record in the
 project, and only to an active principal in the same tenant. The grant conveys
 read membership only; each record's classification and SCI authorization still
 apply, and a grantee cannot forget another owner's record. Grant and revoke
 changes are fsynced before `OK`. The crash regression starts with a durably
 written destination and retained legacy source, then proves restart/retry
-finishes deletion and preserves the scoped record. Persistent per-scope indexes
-and restart/load evidence for the hierarchy remain open QH-01 work.
+finishes deletion and preserves the scoped record. The QH-01 scoped-index test
+checks project/worktree/workstream/session containment after reopen, verifies
+out-of-scope owners do not influence BM25 score, and reports recall latency
+after loading a projection for a 512-record, eight-project corpus.
 
 The optional idempotency key is scoped to the authenticated principal and
 returns the original UUID **only when both the memory kind and exact text

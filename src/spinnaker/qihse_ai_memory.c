@@ -5,10 +5,12 @@
  *   legacy value <uuid>|<created_ms>|<kind>|<classif>|<sci>|<text>
  *   scoped value v2|<uuid>|<created_ms>|<kind>|<classif>|<sci>|<owner>|<project>|<worktree>|<workstream>|<session>|<text>
  *
- * The search index is process-local and rebuilt lazily from the KV namespace,
- * so a restart re-derives it from the durable records. Forgetting a memory
- * removes the KV record; the index posting is ignored at read time when the
- * record is gone (the FTS engine has no delete primitive).
+ * The legacy unscoped search index is process-local and rebuilt from KV.
+ * Scoped BM25 projections are persisted under the private QIHSE data root and
+ * generation-bound to the KV change sequence. Canonical KV records remain
+ * authoritative; every returned candidate is resolved and reauthorized.
+ * Forgetting a memory removes the KV record, and any stale posting is ignored
+ * at read time (the FTS engine has no delete primitive).
  *
  * Reads are narrowed, never widened: every candidate is resolved through the
  * authorization-aware KV read first, and the kind filter is applied to the
@@ -23,12 +25,15 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #include <openssl/evp.h>
 
 #define AIMEM_PREFIX "aimem:"
@@ -40,6 +45,7 @@ static pthread_mutex_t g_aimem_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_event_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_knowledge_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_migration_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_aimem_scope_index_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Defined with the embedding block below; reset() needs it earlier. */
 static void aimem_vecs_clear(void);
@@ -1471,6 +1477,198 @@ typedef struct {
     size_t added;
 } aimem_scoped_rebuild_t;
 
+typedef struct {
+    qihse_fts_index_t* index;
+    qihse_kv_store_t* store;
+    qihse_user_t* user;
+    uint32_t tenant_id;
+    const qihse_ai_memory_scope_t* scope;
+    uint32_t kind;
+    char key_prefix[32];
+    size_t added;
+    bool failed;
+} aimem_scope_index_build_t;
+
+typedef struct {
+    qihse_kv_store_t* store;
+    qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope;
+    uint32_t kind;
+} aimem_scope_visibility_t;
+
+static bool aimem_scope_index_paths(qihse_kv_store_t* store, qihse_user_t* user,
+        const qihse_ai_memory_scope_t* scope, uint32_t kind,
+        char index_path[4096], char generation_path[4096]) {
+    const char* directory = qihse_kv_store_data_directory(store);
+    if (!directory || !user || !scope) return false;
+    char identity[5u * QIHSE_AIMEM_SCOPE_ID_MAX + 128u];
+    int used = snprintf(identity, sizeof identity, "v1|%u|%u|%u|%u|%u|%u|%s|%s|%s|%s",
+        (unsigned)qihse_user_get_tenant_id(user), (unsigned)qihse_user_get_id(user),
+        (unsigned)qihse_user_get_role(user),
+        (unsigned)qihse_user_get_classification(user),
+        (unsigned)qihse_user_get_sci(user), (unsigned)kind, scope->project,
+        scope->worktree, scope->workstream, scope->session);
+    if (used <= 0 || (size_t)used >= sizeof identity) return false;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0u;
+    if (EVP_Digest(identity, (size_t)used, digest, &digest_len,
+                   EVP_sha256(), NULL) != 1 || digest_len != 32u) return false;
+    char hex[65];
+    for (size_t i = 0u; i < 32u; i++)
+        snprintf(hex + i * 2u, 3u, "%02x", digest[i]);
+    int a = snprintf(index_path, 4096u, "%s%saimem-scope-%s.qfts", directory,
+                     directory[strlen(directory) - 1u] == '/' ? "" : "/", hex);
+    int b = snprintf(generation_path, 4096u, "%s%saimem-scope-%s.gen", directory,
+                     directory[strlen(directory) - 1u] == '/' ? "" : "/", hex);
+    return a > 0 && a < 4096 && b > 0 && b < 4096;
+}
+
+static bool aimem_scope_index_read_generation(const char* path, uint64_t* out) {
+    if (!path || !out) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat st;
+    char bytes[32];
+    ssize_t n = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+        st.st_size < (off_t)sizeof bytes) n = read(fd, bytes, sizeof bytes);
+    close(fd);
+    if (n <= 0 || n >= (ssize_t)sizeof bytes) return false;
+    bytes[n] = '\0';
+    char* end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(bytes, &end, 10);
+    if (errno || end == bytes || (*end != '\n' && *end != '\0') ||
+        (end[0] == '\n' && end[1] != '\0')) return false;
+    *out = (uint64_t)value;
+    return true;
+}
+
+static bool aimem_scope_index_sync_directory(const char* filepath) {
+    if (!filepath) return false;
+    char directory[4096];
+    size_t len = strnlen(filepath, sizeof directory);
+    if (len == 0u || len >= sizeof directory) return false;
+    memcpy(directory, filepath, len + 1u);
+    char* slash = strrchr(directory, '/');
+    if (!slash) return false;
+    if (slash == directory) slash[1] = '\0';
+    else *slash = '\0';
+    int fd = open(directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    close(fd);
+    return ok;
+}
+
+static bool aimem_scope_index_write_generation(const char* path, uint64_t seq) {
+    if (!path) return false;
+    char tmp[4096];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof tmp) return false;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    char text[32];
+    int len = snprintf(text, sizeof text, "%llu\n", (unsigned long long)seq);
+    bool ok = len > 0 && (size_t)len < sizeof text &&
+              write(fd, text, (size_t)len) == len && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    return ok && aimem_scope_index_sync_directory(path);
+}
+
+static bool aimem_scope_index_build_cb(const char* key, const char* value,
+                                       void* opaque) {
+    aimem_scope_index_build_t* build = (aimem_scope_index_build_t*)opaque;
+    size_t prefix_len = strlen(build->key_prefix);
+    if (strncmp(key, build->key_prefix, prefix_len) != 0) return true;
+    aimem_record_meta_t meta;
+    const char* text = NULL;
+    if (!aimem_parse_meta(value, &meta, &text) || !meta.scope.project[0] ||
+        !aimem_scope_matches(&meta.scope, build->scope) ||
+        !aimem_kind_ok(build->kind, meta.kind) ||
+        !aimem_scope_owner_allowed(build->store, build->user, meta.owner_id,
+                                   build->scope)) return true;
+    qihse_uuid_t uuid;
+    if (!qihse_uuid_parse(meta.id, &uuid)) return true;
+    uint64_t doc_id = aimem_doc_id(&uuid);
+    char expected[96];
+    int n = snprintf(expected, sizeof expected, "t:%u/aimem:%016llx",
+        (unsigned)build->tenant_id, (unsigned long long)doc_id);
+    if (n <= 0 || (size_t)n >= sizeof expected || strcmp(expected, key) != 0) return true;
+    if (!build->user || !qihse_auth_user_is_active(build->user) ||
+        !qihse_fts_add_document_user(build->index, doc_id, text, strlen(text),
+            meta.classification, meta.sci_compartment,
+            QIHSE_KEYSTONE_CLASS_UNKNOWN, build->user)) {
+        build->failed = true;
+        return false;
+    }
+    build->added++;
+    return true;
+}
+
+/* Persistent FTS is a principal-label-, scope-, and kind-specific projection.
+ * It may contain records across owners, so the query-time predicate applies
+ * live project-grant policy before BM25 statistics. */
+static qihse_fts_index_t* aimem_scope_index_load_or_build(
+        qihse_kv_store_t* store, qihse_user_t* caller,
+        const qihse_ai_memory_scope_t* scope, uint32_t kind) {
+    if (!store || !caller || !scope) return NULL;
+    char index_path[4096], generation_path[4096];
+    if (!aimem_scope_index_paths(store, caller, scope, kind, index_path,
+                                 generation_path)) return NULL;
+    uint64_t before = qihse_kv_change_seq(store), stored = 0u;
+    if (aimem_scope_index_read_generation(generation_path, &stored) && stored == before) {
+        qihse_fts_index_t* loaded = qihse_fts_load(index_path, caller);
+        if (loaded && qihse_kv_change_seq(store) == before) return loaded;
+        qihse_fts_destroy(loaded);
+    }
+
+    qihse_fts_index_t* index = qihse_fts_create();
+    if (!index) return NULL;
+    aimem_scope_index_build_t build = {
+        .index = index, .store = store, .user = caller,
+        .tenant_id = qihse_user_get_tenant_id(caller),
+        .scope = scope, .kind = kind, .added = 0u, .failed = false
+    };
+    snprintf(build.key_prefix, sizeof build.key_prefix, "t:%u/aimem:",
+             (unsigned)build.tenant_id);
+    bool enumerated = qihse_kv_foreach_prefix_user(store, build.key_prefix,
+        caller, aimem_scope_index_build_cb, &build);
+    uint64_t after = qihse_kv_change_seq(store);
+    if (!enumerated || build.failed || before != after ||
+        !qihse_fts_save(index, index_path, caller) ||
+        !aimem_scope_index_sync_directory(index_path) ||
+        !aimem_scope_index_write_generation(generation_path, after)) {
+        qihse_fts_destroy(index);
+        return NULL;
+    }
+    return index;
+}
+
+static bool aimem_scope_index_visible(uint64_t doc_id, uint16_t classification,
+        uint16_t sci, void* opaque) {
+    aimem_scope_visibility_t* visibility = (aimem_scope_visibility_t*)opaque;
+    if (!visibility || !visibility->store || !visibility->user ||
+        !qihse_auth_can_access(visibility->user, classification, sci)) return false;
+    char key[96];
+    if (!aimem_scoped_key(key, sizeof key, visibility->user, doc_id)) return false;
+    char* raw = qihse_kv_get_user(visibility->store, key, visibility->user);
+    if (!raw) return false;
+    aimem_record_meta_t meta;
+    bool allowed = aimem_parse_meta(raw, &meta, NULL) && meta.scope.project[0] &&
+        aimem_scope_matches(&meta.scope, visibility->scope) &&
+        aimem_kind_ok(visibility->kind, meta.kind) &&
+        aimem_scope_owner_allowed(visibility->store, visibility->user,
+                                  meta.owner_id, visibility->scope);
+    qihse_uuid_t uuid;
+    allowed = allowed && qihse_uuid_parse(meta.id, &uuid) &&
+              aimem_doc_id(&uuid) == doc_id;
+    free(raw);
+    return allowed;
+}
+
 static bool aimem_scoped_rebuild_cb(const char* key, const char* value,
                                     void* user_data) {
     aimem_scoped_rebuild_t* rb = (aimem_scoped_rebuild_t*)user_data;
@@ -1544,8 +1742,7 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
     if (want > out_cap) want = out_cap;
     if (want > AIMEM_CAND_MAX) want = AIMEM_CAND_MAX;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
-    qihse_fts_index_t* scoped_index = qihse_fts_create();
-    if (!store || !scoped_index) { qihse_fts_destroy(scoped_index); return 0u; }
+    if (!store) return 0u;
     aimem_cand_t vector[AIMEM_CAND_MAX];
     float query_vec[QIHSE_AIMEM_MAX_DIM];
     size_t query_dim = 0u;
@@ -1556,13 +1753,28 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
         if (!query_dim || query_dim > QIHSE_AIMEM_MAX_DIM ||
             !g_aimem_embedder.embed(query, query_vec, query_dim,
                                     g_aimem_embedder.ctx)) {
-            qihse_fts_destroy(scoped_index);
             return 0u;
         }
     }
+    qihse_fts_index_t* scoped_index = NULL;
+    qihse_fts_result_t results[AIMEM_CAND_MAX];
+    int found = 0;
+    if (mode != QIHSE_AIMEM_MODE_SEMANTIC) {
+        pthread_mutex_lock(&g_aimem_scope_index_lock);
+        scoped_index = aimem_scope_index_load_or_build(store, user, scope, kind);
+        if (scoped_index) {
+            aimem_scope_visibility_t visibility = {
+                .store = store, .user = user, .scope = scope, .kind = kind
+            };
+            found = qihse_fts_search_user_visible(scoped_index, query, user,
+                results, (int)(AIMEM_CAND_MAX), aimem_scope_index_visible,
+                &visibility);
+        }
+        pthread_mutex_unlock(&g_aimem_scope_index_lock);
+    }
     aimem_scoped_rebuild_t rb = {
-        .index = scoped_index, .store = store, .user = user, .scope = scope, .kind = kind,
-        .lexical = mode != QIHSE_AIMEM_MODE_SEMANTIC,
+        .index = NULL, .store = store, .user = user, .scope = scope, .kind = kind,
+        .lexical = false,
         .query_vec = want_vector ? query_vec : NULL,
         .query_dim = want_vector ? query_dim : 0u,
         .vector = want_vector ? vector : NULL,
@@ -1571,13 +1783,9 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
     };
     snprintf(rb.key_prefix, sizeof rb.key_prefix, "t:%u/aimem:",
              (unsigned)qihse_user_get_tenant_id(user));
-    qihse_kv_foreach_prefix_user(store, rb.key_prefix, user,
-                                 aimem_scoped_rebuild_cb, &rb);
-    qihse_fts_result_t results[AIMEM_CAND_MAX];
-    int found = 0;
-    if (rb.lexical)
-        found = qihse_fts_search_user(scoped_index, query, user, results,
-                                      (int)(want < AIMEM_CAND_MAX ? AIMEM_CAND_MAX : want));
+    if (want_vector)
+        (void)qihse_kv_foreach_prefix_user(store, rb.key_prefix, user,
+                                           aimem_scoped_rebuild_cb, &rb);
     for (size_t i = 0; i + 1u < rb.vector_count; i++) {
         for (size_t j = i + 1u; j < rb.vector_count; j++) {
             if (vector[j].score > vector[i].score) {

@@ -250,9 +250,26 @@ static posting_list_t* lookup_word_trigram(qihse_fts_index_t* index, const char 
     return e ? e->list : NULL;
 }
 
+static int fts_search_user_internal(qihse_fts_index_t* index, const char* query,
+                                    qihse_user_t* user,
+                                    qihse_fts_result_t* results, int top_k,
+                                    uint8_t semantic_class_mask,
+                                    qihse_fts_visibility_fn policy,
+                                    void* user_data);
+
 int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query,
                                    qihse_user_t* user, qihse_fts_result_t* results,
                                    int top_k, uint8_t semantic_class_mask) {
+    return fts_search_user_internal(index, query, user, results, top_k,
+                                    semantic_class_mask, NULL, NULL);
+}
+
+static int fts_search_user_internal(qihse_fts_index_t* index, const char* query,
+                                    qihse_user_t* user,
+                                    qihse_fts_result_t* results, int top_k,
+                                    uint8_t semantic_class_mask,
+                                    qihse_fts_visibility_fn policy,
+                                    void* user_data) {
     if (!index || !index->valid || !query || !results || top_k <= 0 || index->doc_count == 0u) return 0;
     uint8_t* visible = (uint8_t*)calloc(index->doc_count, 1u);
     float* scores = (float*)calloc(index->doc_count, sizeof(float));
@@ -260,7 +277,10 @@ int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query,
     uint32_t visible_n = 0u;
     uint64_t visible_total_len = 0u;
     for (uint32_t j = 0u; j < index->doc_count; j++) {
-        if (doc_visible(index, j, user, semantic_class_mask)) {
+        if (doc_visible(index, j, user, semantic_class_mask) &&
+            (!policy || policy(index->docs[j].doc_id,
+                               index->docs[j].classification,
+                               index->docs[j].sci_compartment, user_data))) {
             visible[j] = 1u;
             visible_n++;
             visible_total_len += index->docs[j].length;
@@ -327,6 +347,14 @@ int qihse_fts_search_user_filtered(qihse_fts_index_t* index, const char* query,
     free(visible);
     free(scores);
     return out;
+}
+
+int qihse_fts_search_user_visible(qihse_fts_index_t* index, const char* query,
+                                  qihse_user_t* user, qihse_fts_result_t* results,
+                                  int top_k, qihse_fts_visibility_fn policy,
+                                  void* user_data) {
+    return fts_search_user_internal(index, query, user, results, top_k, 0u,
+                                    policy, user_data);
 }
 
 int qihse_fts_search_user(qihse_fts_index_t* index, const char* query,

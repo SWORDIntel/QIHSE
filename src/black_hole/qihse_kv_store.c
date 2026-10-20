@@ -1890,6 +1890,11 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     free(store);
 }
 
+const char* qihse_kv_store_data_directory(qihse_kv_store_t* store) {
+    if (!store) return NULL;
+    return get_qihse_data_dir();
+}
+
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
     if (store) store->bulk_load_mode = true;
 }
