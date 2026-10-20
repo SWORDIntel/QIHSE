@@ -57,7 +57,7 @@ They already provide authenticated local storage, lexical/semantic/hybrid recall
 
 ## QH-00 — Durable acknowledgement and idempotent recovery
 
-**Implementation slices:** `AIMEM STORE-DURABLE` and `FORGET-DURABLE` call `qihse_kv_sync_store()` under the RESP KV lock. Existing verbs keep their response shape and eventual durability. Key replay mismatches are rejected, and new idempotent admissions derive a stable UUID from authenticated tenant/principal/key. A crash before the auxiliary map is written can recover the original primary record without creating a second UUID. A regression simulates SIGKILL both before that map and immediately after durable ACK; full UUID matching prevents truncated-doc-key alias reads/deletions. This is **partial**: the two KV writes remain nontransactional; exhaustive fault injection, receipt/LSN contract and measured durability overhead are still required. See [RESP protocol](docs/architecture/aimem_resp_protocol.md).
+**Implemented:** `AIMEM STORE-DURABLE` and `FORGET-DURABLE` call the native fsync fence under the RESP KV lock and return stable opaque receipts backed by the QKV4 mutation sequence. Existing verbs keep their response shape and eventual durability. Replay mismatches are rejected, and a crash before the auxiliary map is written deterministically recovers the original primary record without creating a second UUID. WAL write/fsync and SSTable fence failpoints, WAL-tail repair, legacy idempotency migration and SIGKILL regressions cover the durability boundaries. The two KV writes are deliberately recovered rather than presented as one transaction. The 120-operation, 256-byte benchmark measured ordinary p50/p95 at 222/392 us and durable p50/p95 at 10,320/12,752 us. See [RESP protocol](docs/architecture/aimem_resp_protocol.md).
 
 **Existing constraint:** QIHSE [explicitly documents eventual durability](https://github.com/SWORDIntel/QIHSE/blob/main/docs/architecture/aimem_resp_protocol.md): recent `STORE` or `FORGET` mutations can disappear or revert after an immediate restart, despite a successful RESP acknowledgement.
 
@@ -115,11 +115,11 @@ Store lifecycle observations as typed events in QIHSE, rather than indistinguish
 
 **Verified:** `make test-aimem-resp` simulates ten agents issuing 10,000 durable append calls over ten projects (100 deterministic identities per project), then asserts per-project cardinality 100. It reports per-call p50/p95 latency and aggregate throughput on the test host. The regression also covers same-ID replay, conflicting bytes, unsupported event kind, authorized read, tenant isolation, and low-clearance/high-data denial. `make test-aimem-durable-crash` kills the process after a durable append result is produced but before the simulated client receives it; restart/replay resolves one stable event and rejects conflicting reuse.
 
-**Remaining before QH-02 is complete:** optional source-evidence handles, an explicit bounded admission/backpressure contract, and fault coverage at the earlier append/fence boundaries.
+**Completed:** schema `QHEV2` adds bounded optional source-evidence handles with scope and authorization checks. Admission is synchronous and bounded, providing direct caller backpressure without an asynchronous queue. WAL append/fsync and fence failpoints cover the earlier durability boundaries.
 
 **Required fields:** `schema_version`, `producer_namespace`, `event_id`, `event_kind`, `session_id`, `workstream_id`, source time and server receive time, content digest, sanitized summary, optional source-evidence handle, `status`, and an authenticated idempotency composite. Event kinds are from a registered vocabulary; extensions are versioned and may be stored without activating any privileged handler.
 
-**Data path:** Admit payload → authorize scope/labels → reject/flag maliciously long, invalid or duplicate events → persist event and stable idempotency mapping together → append to the appropriate index → emit durable receipt according to QH-00. Implement a bounded write queue and backpressure instead of accepting unbounded hook-driven data.
+**Data path:** Admit payload → authorize scope/labels/evidence → reject maliciously long, invalid or conflicting events → persist the self-identifying event → emit its durable identity according to QH-00. The synchronous request caps are the bounded admission and backpressure mechanism.
 
 Retention may differ for raw observation vs curated knowledge, but a session summary must not create provenance edges to event IDs that a scheduled cleanup has already destroyed without recording that event's disposal.
 
@@ -141,9 +141,10 @@ OPEN  --accept(CAS)-->  ACCEPTED
 
 An accept operation is a single server transaction/CAS requiring `state=OPEN`, current revision, unexpired offer, matching recipient, matching project grant and required SCI access. Return the accepted ID and source state; concurrent accept is deterministic. Prefer offering handoffs at session start without mutating their state. Explicit acceptance makes them claim-once. Keep an audit of acceptance without automatically importing previous agent's credentials, tools or executable instructions.
 
-**First implementation:** `AIMEM HANDOFF OFFER/GET/ACCEPT/CANCEL` stores a
-tenant-prefixed `QHH1` record with owner, named recipient, scope, summary,
-timestamps, revision and state. Offer and transition replies are fsync fenced.
+**Implementation:** `AIMEM HANDOFF OFFER/GET/ACCEPT/CANCEL` stores a
+tenant-prefixed `QHH2` record with owner, named recipient, scope, summary,
+timestamps, revision, state and up to eight authorized evidence IDs; `QHH1`
+remains readable for migration. Offer and transition replies are fsync fenced.
 The recipient must retain an active project-reader grant at acceptance; label
 and SCI access are enforced by the authenticated KV read. A server KV write
 lock serializes the record's compare-and-swap, and an accepted record is a
@@ -153,8 +154,9 @@ authorized retry callers observe `ACCEPTED` while the competing principal is
 denied. `make test-aimem-durable-crash` also kills the process after durable
 acceptance but before delivering the simulated reply; restart returns the same
 `ACCEPTED` result to the recipient's retry and hides it from a competitor.
-This is **partial**: a multiprocess network-client race, evidence pointers and
-persisted expiry are still required.
+Expiry is a persisted CAS transition with a durability fence. A forked
+network-client race, evidence authorization and the in-process 100-caller race
+complete the concurrency and disclosure acceptance cases.
 
 Decide a **recovery policy** for an interrupted consumer: either the accepted handoff remains accepted and is queryable by the same recipient/session, or a bounded lease permits authenticated re-offer. Never allow automatic double execution simply because an ACK was lost.
 
@@ -285,7 +287,7 @@ terminal revocation per project. Approval binds the authenticated Operator as
 reviewer; an agent-owned proposal cannot self-promote or replace an approved
 head. No measurable limitation requires a separate profile database.
 
-**Cross-project mailbox (QH-10):** An explicit sender/recipient-grant-aware message queue with durable `pending → claimed|cancelled|expired` state and one consumer. Reuse QH-03's atomic transition machinery and QH-01 scope. Default-deny arbitrary cross-project communication; a project name match is not permission to message or read it.
+**Cross-project mailbox (QH-10, superseded conditional):** Repository and consumer audits found no demonstrated cross-project delivery requirement; QH-03 covers current tenant-local continuity. Reopen only when a concrete consumer exists. Any future design must use a separate destination-owner `SEND` grant, bounded recipient-bound leases and durable `pending → claimed|cancelled|expired` transitions. A QH-01 read grant or matching project name never grants send or pop authority.
 
 ## Proposed interface / schema design rules
 
@@ -335,4 +337,4 @@ Before adding a second event or transaction subsystem, inspect existing native Q
 
 Not a port of ai-memory's full Rust stack; not a second SQL/graph/vector database; not a blanket exception to SCI isolation; not model-driven reclassification; not forced deployment of an LLM; not cloud-based persistence; not a guarantee of quorum durability without cluster-specific evidence; not automatic merging of contradictory memories; not deletion of superseded evidence under the word "forget".
 
-**Next implementation action for QIHSE:** close QH-00's remaining WAL/fsync fault injection, receipt/LSN contract, migration coverage and P50/P95 overhead measurement, and QH-01's authorized migration, persistent scope indexes/load evidence and hierarchy tests. Then close QH-02 through QH-04 acceptance gaps before starting QH-05 querying.
+**Implementation status:** QH-00 through QH-09 are complete and covered by the W10 aggregate. QH-10 is closed as a superseded conditional item because its consumer gate was not triggered. Future work begins only from a newly demonstrated requirement and must preserve the security and durability invariants above.
