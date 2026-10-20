@@ -315,12 +315,16 @@ deleted. Repeated apply is idempotent, and an applied plan is recoverable after
 restart. Multi-lineage merges, automatic retention and autonomous dedup remain
 outside this first slice.
 
-`qihse_ai_memory_export_scope()` emits a canonical `QAX1` logical projection,
-not KV/SSTable bytes. It contains only authorized `QHK1` lineages, their
-effective labels and a SHA-256 trailer. Import verifies the complete digest,
-tenant, scope, labels, ownership and every ledger before writing; dry run is
-available and collisions with different bytes fail closed. This first format
-is integrity checked but not yet signed, chunk streamed or multi-record atomic.
+`qihse_ai_memory_export_authenticated()` emits a canonical `QAX2` logical
+projection, not KV/SSTable bytes. It contains only authorized lifecycle events
+and QHK2 lineages, including provenance, relations, effective labels and
+current markers. HMAC-SHA-256 binds tenant, exporter, scope and every payload
+byte to caller-managed authentication key material. Streaming callbacks use
+chunks no larger than 64 KiB; archives are capped at 16 MiB and 4,096 records.
+Import preflights the complete archive before mutation, supports dry run,
+skips byte-identical collisions, rejects changed collisions, and durably
+fences each new row. An interrupted multi-record import is safely resumable.
+The legacy `QAX1` whole-buffer functions remain available for compatibility.
 
 Index rebuild validation writes a durable `QHI1` ready record containing the
 provider binding, dimension, generation and authoritative KV high-water.

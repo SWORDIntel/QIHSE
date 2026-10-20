@@ -351,6 +351,13 @@ void qihse_ai_memory_maintenance_free(qihse_ai_memory_maintenance_plan_t* plan);
 /* QH-07 canonical authenticated projection.  The blob is self-hashed and
  * contains logical QHK ledgers rather than raw filesystem/SSTable data. */
 typedef struct { uint8_t* data; size_t len; } qihse_ai_memory_export_t;
+#define QIHSE_AIMEM_ARCHIVE_MAX_BYTES (16u * 1024u * 1024u)
+#define QIHSE_AIMEM_ARCHIVE_MAX_RECORDS 4096u
+#define QIHSE_AIMEM_ARCHIVE_CHUNK_MAX (64u * 1024u)
+typedef bool (*qihse_ai_memory_archive_write_fn)(void* ctx,
+    const uint8_t* data, size_t len);
+typedef size_t (*qihse_ai_memory_archive_read_fn)(void* ctx,
+    uint8_t* data, size_t cap);
 typedef enum {
     QIHSE_AIMEM_IMPORT_FAILED = 0,
     QIHSE_AIMEM_IMPORT_VALID = 1,
@@ -365,6 +372,26 @@ qihse_ai_memory_import_result_t qihse_ai_memory_import_scope(
     const qihse_ai_memory_scope_t* scope, const uint8_t* data, size_t len,
     bool dry_run, size_t* out_imported);
 void qihse_ai_memory_export_free(qihse_ai_memory_export_t* value);
+bool qihse_ai_memory_export_authenticated(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+    size_t authentication_key_len, qihse_ai_memory_export_t* out);
+bool qihse_ai_memory_export_stream(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+    size_t authentication_key_len, size_t chunk_size,
+    qihse_ai_memory_archive_write_fn write_fn, void* write_ctx,
+    size_t* out_bytes);
+qihse_ai_memory_import_result_t qihse_ai_memory_import_authenticated(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+    size_t authentication_key_len, const uint8_t* data, size_t len,
+    bool dry_run, size_t* out_imported);
+qihse_ai_memory_import_result_t qihse_ai_memory_import_stream(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const qihse_ai_memory_scope_t* scope, const uint8_t* authentication_key,
+    size_t authentication_key_len, qihse_ai_memory_archive_read_fn read_fn,
+    void* read_ctx, bool dry_run, size_t* out_imported);
 
 /* QH-08 redacted operational state.  Non-Operators receive provider/readiness
  * only; generation, high-water and counters are zeroed. */

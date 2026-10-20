@@ -26,6 +26,36 @@ static size_t export_count(const qihse_ai_memory_export_t* value) {
     free(copy); return count;
 }
 
+static size_t authenticated_export_count(const qihse_ai_memory_export_t* value) {
+    char* copy = strndup((const char*)value->data, value->len);
+    assert(copy); char* cur = copy; char* token = NULL;
+    for (size_t i = 0; i < 8u; i++) token = strsep(&cur, "|");
+    assert(token); size_t count = (size_t)strtoull(token, NULL, 10);
+    free(copy); return count;
+}
+
+typedef struct { uint8_t* data; size_t len; size_t cap; size_t at; } stream_t;
+static bool stream_write(void* opaque, const uint8_t* data, size_t len) {
+    stream_t* s = opaque;
+    if (s->len > SIZE_MAX - len) return false;
+    if (s->len + len > s->cap) {
+        size_t cap = s->cap ? s->cap * 2u : 1024u;
+        while (cap < s->len + len) cap *= 2u;
+        uint8_t* grown = realloc(s->data, cap); if (!grown) return false;
+        s->data = grown; s->cap = cap;
+    }
+    memcpy(s->data + s->len, data, len); s->len += len; return true;
+}
+static size_t stream_read(void* opaque, uint8_t* data, size_t cap) {
+    stream_t* s = opaque; size_t n = s->len - s->at;
+    if (n > cap) n = cap;
+    if (n) memcpy(data, s->data + s->at, n);
+    s->at += n; return n;
+}
+static size_t invalid_stream_read(void* opaque, uint8_t* data, size_t cap) {
+    (void)opaque; (void)data; return cap + 1u;
+}
+
 int main(void) {
     char source_root[] = "build/aimem_qh05_08_source_XXXXXX";
     assert(mkdtemp(source_root));
@@ -50,6 +80,10 @@ int main(void) {
     assert(qihse_ai_memory_store_scoped(server, owner, "owner seed",
         QIHSE_AIMEM_EPISODIC, &scope, seed));
     assert(qihse_ai_memory_project_grant(server, owner, scope.project, 9502u));
+    char event_id[QIHSE_AIMEM_ID_LEN + 1u];
+    assert(qihse_ai_memory_event_append_evidence(server, owner, &scope, "qh07-test",
+        "event-1", "checkpoint", 1234u, "QH07_EVENT_ROUND_TRIP", seed, event_id) ==
+        QIHSE_AIMEM_WRITE_NEW);
 
     qihse_ai_memory_knowledge_version_t first, second;
     assert(qihse_ai_memory_knowledge_create(server, owner, &scope,
@@ -58,6 +92,22 @@ int main(void) {
     assert(qihse_ai_memory_knowledge_create(server, owner, &scope,
         QIHSE_AIMEM_KNOWLEDGE_RULE, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
         "stable paging second", &second) == QIHSE_AIMEM_WRITE_NEW);
+    const char* sources[] = { event_id };
+    qihse_ai_memory_relation_t relation = {
+        .type = QIHSE_AIMEM_RELATION_CAUSES, .target_scope = scope
+    };
+    snprintf(relation.target_version_id, sizeof relation.target_version_id,
+             "%s", first.version_id);
+    qihse_ai_memory_knowledge_provenance_t provenance = {
+        .idempotency_key = "qh07-provenance", .source_event_ids = sources,
+        .source_event_count = 1u, .relations = &relation, .relation_count = 1u,
+        .confidence_ppm = 800000u
+    };
+    qihse_ai_memory_knowledge_version_t related;
+    assert(qihse_ai_memory_knowledge_create_ex(server, owner, &scope,
+        QIHSE_AIMEM_KNOWLEDGE_ARCHITECTURE, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        "QH07 provenance and relation round trip", &provenance, &related) ==
+        QIHSE_AIMEM_WRITE_NEW);
 
     qihse_ai_memory_query_v1_t query = {
         .scope = scope, .current_only = true, .text = "stable paging", .max_rows = 8u
@@ -135,7 +185,7 @@ int main(void) {
         "QH0508_HIGH_SECRET", &secret) == QIHSE_AIMEM_WRITE_NEW);
     qihse_ai_memory_export_t low_export = {0};
     assert(qihse_ai_memory_export_scope(server, reader, &scope, &low_export));
-    assert(export_count(&low_export) == 2u);
+    assert(export_count(&low_export) == 3u);
     assert(!memmem(low_export.data, low_export.len, secret.version_id,
                    strlen(secret.version_id)));
     uint8_t* tampered = malloc(low_export.len); assert(tampered);
@@ -144,6 +194,37 @@ int main(void) {
     assert(qihse_ai_memory_import_scope(server, owner, &scope, tampered,
         low_export.len, true, &imported) == QIHSE_AIMEM_IMPORT_FAILED);
     assert(imported == 0u); free(tampered);
+
+    static const uint8_t archive_key[] = "QH07-test-authentication-key-32";
+    static const uint8_t wrong_key[] = "QH07-wrong-authentication-key-32";
+    qihse_ai_memory_export_t authenticated = {0};
+    assert(qihse_ai_memory_export_authenticated(server, reader, &scope,
+        archive_key, sizeof archive_key - 1u, &authenticated));
+    assert(authenticated_export_count(&authenticated) == 4u);
+    assert(memmem(authenticated.data, authenticated.len, "QH0508_HIGH_SECRET",
+                  strlen("QH0508_HIGH_SECRET")) == NULL);
+    uint8_t* auth_tampered = malloc(authenticated.len); assert(auth_tampered);
+    memcpy(auth_tampered, authenticated.data, authenticated.len);
+    auth_tampered[authenticated.len / 2u] ^= 1u;
+    assert(qihse_ai_memory_import_authenticated(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, auth_tampered, authenticated.len,
+        true, &imported) == QIHSE_AIMEM_IMPORT_FAILED);
+    assert(qihse_ai_memory_import_authenticated(server, owner, &scope,
+        wrong_key, sizeof wrong_key - 1u, authenticated.data, authenticated.len,
+        true, &imported) == QIHSE_AIMEM_IMPORT_FAILED);
+    free(auth_tampered);
+    stream_t streamed = {0}; size_t streamed_bytes = 0u;
+    assert(qihse_ai_memory_export_stream(server, reader, &scope,
+        archive_key, sizeof archive_key - 1u, 97u, stream_write, &streamed,
+        &streamed_bytes));
+    assert(streamed_bytes == streamed.len && streamed.len == authenticated.len &&
+           memcmp(streamed.data, authenticated.data, streamed.len) == 0);
+    assert(!qihse_ai_memory_export_stream(server, reader, &scope,
+        archive_key, sizeof archive_key - 1u, QIHSE_AIMEM_ARCHIVE_CHUNK_MAX + 1u,
+        stream_write, &streamed, &streamed_bytes));
+    assert(qihse_ai_memory_import_stream(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, invalid_stream_read, NULL,
+        true, &imported) == QIHSE_AIMEM_IMPORT_FAILED);
 
     assert(qihse_ai_memory_index_rebuild(server, owner, &scope));
     qihse_ai_memory_health_t health;
@@ -158,25 +239,62 @@ int main(void) {
     assert(qihse_kv_clear_user(store, owner) > 0u);
     assert(qihse_ai_memory_store_scoped(server, owner, "destination owner seed",
         QIHSE_AIMEM_EPISODIC, &scope, seed));
-    assert(qihse_ai_memory_import_scope(server, owner, &scope,
-        low_export.data, low_export.len, true, &imported) == QIHSE_AIMEM_IMPORT_VALID);
+    streamed.at = 0u;
+    assert(qihse_ai_memory_import_stream(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, stream_read, &streamed,
+        true, &imported) == QIHSE_AIMEM_IMPORT_VALID);
     assert(imported == 0u);
-    qihse_ai_memory_import_result_t import_result = qihse_ai_memory_import_scope(
-        server, owner, &scope, low_export.data, low_export.len, false, &imported);
+    assert(setenv("QIHSE_AIMEM_IMPORT_FAIL_AFTER", "1", 1) == 0);
+    qihse_ai_memory_import_result_t import_result = qihse_ai_memory_import_authenticated(
+        server, owner, &scope, archive_key, sizeof archive_key - 1u,
+        authenticated.data, authenticated.len, false, &imported);
+    assert(import_result == QIHSE_AIMEM_IMPORT_FAILED && imported == 1u);
+    assert(unsetenv("QIHSE_AIMEM_IMPORT_FAIL_AFTER") == 0);
+    qihse_resp_server_destroy(server); qihse_kv_store_destroy(store);
+    qihse_ai_memory_reset();
+    store = qihse_kv_store_create(); assert(store); server = make_server(store);
+    import_result = qihse_ai_memory_import_authenticated(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, authenticated.data,
+        authenticated.len, false, &imported);
     if (import_result != QIHSE_AIMEM_IMPORT_APPLIED)
         fprintf(stderr, "import result=%u imported=%zu\n", (unsigned)import_result, imported);
     assert(import_result == QIHSE_AIMEM_IMPORT_APPLIED);
-    assert(imported == 2u);
+    assert(imported == 3u);
     assert(qihse_ai_memory_knowledge_latest(server, owner, first.knowledge_id, &scope, &latest));
     assert(strcmp(latest.content, "post-snapshot replacement") == 0);
     qihse_ai_memory_knowledge_free(&latest);
     assert(!qihse_ai_memory_knowledge_get(server, owner, secret.version_id, &scope, &latest));
+    assert(qihse_ai_memory_knowledge_latest(server, owner, related.knowledge_id,
+        &scope, &latest));
+    assert(latest.source_event_count == 1u && latest.relation_count == 1u &&
+           strcmp(latest.source_event_ids[0], event_id) == 0 &&
+           latest.relations[0].type == QIHSE_AIMEM_RELATION_CAUSES &&
+           latest.confidence_ppm == 800000u);
+    qihse_ai_memory_knowledge_free(&latest);
+    qihse_ai_memory_hit_t restored_event = {0};
+    assert(qihse_ai_memory_event_get(server, owner, event_id, &scope, &restored_event));
+    assert(strstr(restored_event.text, "QH07_EVENT_ROUND_TRIP") != NULL);
+    free(restored_event.text);
+    assert(qihse_ai_memory_import_authenticated(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, authenticated.data,
+        authenticated.len, false, &imported) == QIHSE_AIMEM_IMPORT_APPLIED);
+    assert(imported == 0u);
+    char collision_key[160];
+    assert(snprintf(collision_key, sizeof collision_key,
+        "t:17/aimem-knowledge:%s", first.knowledge_id) > 0);
+    assert(qihse_kv_set_user(store, collision_key, "QHK-COLLISION", 0u, 0u, owner));
+    assert(qihse_ai_memory_import_authenticated(server, owner, &scope,
+        archive_key, sizeof archive_key - 1u, authenticated.data,
+        authenticated.len, false, &imported) == QIHSE_AIMEM_IMPORT_CONFLICT);
 
     qihse_ai_memory_export_free(&low_export);
+    qihse_ai_memory_export_free(&authenticated);
+    free(streamed.data);
     qihse_ai_memory_knowledge_free(&first);
     qihse_ai_memory_knowledge_free(&second);
     qihse_ai_memory_knowledge_free(&updated);
     qihse_ai_memory_knowledge_free(&secret);
+    qihse_ai_memory_knowledge_free(&related);
     qihse_ai_memory_maintenance_free(&dry);
     qihse_ai_memory_maintenance_free(&plan);
     qihse_ai_memory_maintenance_free(&applied);
