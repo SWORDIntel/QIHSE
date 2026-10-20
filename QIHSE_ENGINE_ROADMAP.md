@@ -2,7 +2,7 @@
 
 > **Status:** proposed and not yet implemented; integrated into the QIHSE master roadmap as Workstream W10.  
 > **Date:** 2026-10-20  
-> **Master sequencing:** [ROADMAP.md §W10](ROADMAP.md#W10) (see W10 workstream; this document is the detailed scope and acceptance criteria).  
+> **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-planned-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).  
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
 > **Source:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory), `main` at `11ab1003d9ef3788f5fc40b87fff54abf7f17dc0`.  
 > **Consumer:** [QIHSE-backed Supermemory](https://github.com/SWORDIntel/supermemory/tree/qihse-backend/qihse-backend). Its companion feature roadmap uses SM-XX items; this document uses QH-XX item numbers.  
