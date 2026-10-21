@@ -593,6 +593,47 @@ static uint32_t uwp_fnv1a(const char* s) {
     return h;
 }
 
+/* Authorize a parsed statement immediately before execution.  Parsing and
+ * describing SQL do not touch data, but EXECUTE must revalidate the live
+ * principal and enforce the target table's write boundary.  DDL remains an
+ * Operator-only surface until QIHSE has a dedicated schema capability. */
+static bool uwp_sql_statement_allowed(const qihse_sql_ast_t* ast,
+                                      qihse_user_t* user) {
+    if (!ast || !user || !qihse_auth_user_is_active(user)) return false;
+
+    switch (ast->stmt_type) {
+        case QIHSE_SQL_INSERT:
+        case QIHSE_SQL_UPDATE:
+        case QIHSE_SQL_DELETE:
+            return ast->table_name && ast->table_name[0] != '\0' &&
+                   qihse_auth_can_access_object(
+                       user, 0, (uint64_t)uwp_fnv1a(ast->table_name),
+                       QIHSE_ACL_WRITE);
+
+        case QIHSE_SQL_CREATE:
+        case QIHSE_SQL_DROP:
+        case QIHSE_SQL_ALTER:
+        case QIHSE_SQL_CREATE_VIEW:
+        case QIHSE_SQL_DROP_VIEW:
+        case QIHSE_SQL_CREATE_MATVIEW:
+        case QIHSE_SQL_REFRESH:
+        case QIHSE_SQL_CREATE_SEQ:
+        case QIHSE_SQL_DROP_SEQ:
+        case QIHSE_SQL_TRUNCATE:
+        case QIHSE_SQL_REINDEX:
+        case QIHSE_SQL_CLUSTER:
+        case QIHSE_SQL_GRANT:
+        case QIHSE_SQL_REVOKE:
+        case QIHSE_SQL_CREATE_ROLE:
+        case QIHSE_SQL_DROP_ROLE:
+        case QIHSE_SQL_ALTER_ROLE:
+            return qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+
+        default:
+            return true;
+    }
+}
+
 /* Lazily initialise the hash table buckets. */
 static void uwp_ps_hash_ensure(uwp_ps_hash_t* h) {
     if (h->buckets) return;
@@ -1955,7 +1996,7 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                                   qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
                                   qihse_uwp_write_fn write_fn, void* write_ctx) {
     (void)client_fd;
-    if (!user) {
+    if (!user || !qihse_auth_user_is_active(user)) {
         uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
@@ -2132,6 +2173,13 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
         free(ps_sql);
         uwp_reply_cb(write_fn, write_ctx, "ERR_PARSE\n");
         return UWP_STS_ERR_FAILED;
+    }
+
+    if (command_opcode == 0x02 && !uwp_sql_statement_allowed(ast, user)) {
+        qihse_sql_ast_free(ast);
+        free(ps_sql);
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
+        return UWP_STS_ERR_PERM;
     }
 
     uwp_sts_result_t result = UWP_STS_OK;

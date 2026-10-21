@@ -82,6 +82,14 @@ static void expect_reply(const uwp_reply_buf_t* out, const char* needle) {
     }
 }
 
+static void expect_reply_absent(const uwp_reply_buf_t* out, const char* needle) {
+    if (strstr(out->data, needle)) {
+        fprintf(stderr, "FAIL: reply disclosed forbidden marker '%s': %s\n",
+                needle, out->data);
+        assert(0);
+    }
+}
+
 /* ── Table fixtures ─────────────────────────────────────────────────────── */
 
 static void insert_row(qihse_table_t* table, int32_t id, const char* name,
@@ -458,12 +466,12 @@ static void test_write_permission(qihse_uwp_context_t* ctx,
     uwp_reply_buf_t reply;
 
     /* Without a grant the analyst is refused and nothing changes. */
-    assert(run_sql(ctx, analyst, "DELETE FROM t_acl WHERE id = 1", &reply) == UWP_STS_OK);
-    expect_reply(&reply, "refused: no write access to table t_acl");
+    assert(run_sql(ctx, analyst, "DELETE FROM t_acl WHERE id = 1", &reply) == UWP_STS_ERR_PERM);
+    expect_reply(&reply, "ERR_PERM");
     assert(qihse_table_row_count(table) == 2);
 
-    assert(run_sql(ctx, analyst, "UPDATE t_acl SET n = 5 WHERE id = 1", &reply) == UWP_STS_OK);
-    expect_reply(&reply, "refused: no write access to table t_acl");
+    assert(run_sql(ctx, analyst, "UPDATE t_acl SET n = 5 WHERE id = 1", &reply) == UWP_STS_ERR_PERM);
+    expect_reply(&reply, "ERR_PERM");
     expect_row(table, 1, "alice", 10);
 
     /* A WRITE grant on the table's resource id allows both. */
@@ -479,6 +487,103 @@ static void test_write_permission(qihse_uwp_context_t* ctx,
 
     printf("PASS sql dml: non-operator without a WRITE grant is refused; a "
            "grant allows it\n");
+}
+
+static void test_statement_authorization(qihse_uwp_context_t* ctx,
+                                         qihse_user_t* operator_user) {
+    static const char protected_marker[] = "SQL-PROTECTED-MARKER-71e3";
+    uwp_reply_buf_t reply;
+
+    qihse_user_t* low = qihse_auth_create_user(
+        operator_user, 101, QIHSE_ROLE_GUEST, 0, 0,
+        "sql-low-principal-password", false);
+    assert(low != NULL);
+
+    assert(run_sql(ctx, operator_user,
+                   "CREATE TABLE t_stmt_auth (id INT, name TEXT, n INT)",
+                   &reply) == UWP_STS_OK);
+    expect_reply(&reply, "OK stmt_type=CREATE");
+
+    /* A live low principal cannot mutate the table or execute DDL before an
+     * explicit table WRITE grant.  Denials are protocol errors and never echo
+     * the protected value. */
+    assert(run_sql(ctx, low,
+                   "INSERT INTO t_stmt_auth VALUES (1, 'SQL-PROTECTED-MARKER-71e3', 10)",
+                   &reply) == UWP_STS_ERR_PERM);
+    expect_reply(&reply, "ERR_PERM");
+    expect_reply_absent(&reply, protected_marker);
+
+    assert(run_sql(ctx, low,
+                   "UPDATE t_stmt_auth SET name = 'SQL-PROTECTED-MARKER-71e3' WHERE id = 1",
+                   &reply) == UWP_STS_ERR_PERM);
+    expect_reply_absent(&reply, protected_marker);
+    assert(run_sql(ctx, low, "DELETE FROM t_stmt_auth WHERE id = 1", &reply) ==
+           UWP_STS_ERR_PERM);
+
+    assert(run_sql(ctx, low,
+                   "CREATE TABLE SQL_PROTECTED_MARKER_71e3 (id INT)", &reply) ==
+           UWP_STS_ERR_PERM);
+    expect_reply_absent(&reply, "SQL_PROTECTED_MARKER_71e3");
+    assert(run_sql(ctx, low, "ALTER TABLE t_stmt_auth ADD COLUMN extra INT", &reply) ==
+           UWP_STS_ERR_PERM);
+    assert(run_sql(ctx, low, "DROP TABLE t_stmt_auth", &reply) == UWP_STS_ERR_PERM);
+
+    qihse_table_t* table =
+        qihse_table_store_find_table(qihse_uwp_sql_table_store(), "t_stmt_auth");
+    assert(table == NULL || qihse_table_row_count(table) == 0);
+
+    /* A table WRITE grant covers INSERT, UPDATE and DELETE. */
+    assert(qihse_auth_grant_object(operator_user, low, 0,
+                                   table_resource_id("t_stmt_auth"),
+                                   QIHSE_ACL_WRITE));
+    assert(run_sql(ctx, low,
+                   "INSERT INTO t_stmt_auth VALUES (1, 'allowed', 10)", &reply) ==
+           UWP_STS_OK);
+    expect_reply(&reply, "OK stmt_type=INSERT rows=1");
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(),
+                                         "t_stmt_auth");
+    assert(table != NULL);
+    expect_row(table, 1, "allowed", 10);
+
+    assert(run_sql(ctx, low, "UPDATE t_stmt_auth SET n = 11 WHERE id = 1", &reply) ==
+           UWP_STS_OK);
+    expect_row(table, 1, "allowed", 11);
+    assert(run_sql(ctx, low, "DELETE FROM t_stmt_auth WHERE id = 1", &reply) ==
+           UWP_STS_OK);
+    expect_row_absent(table, 1);
+
+    /* NULL and revoked handles fail at the command boundary for every
+     * mutation family, even if the revoked principal used to hold WRITE. */
+    const char* denied_sql[] = {
+        "INSERT INTO t_stmt_auth VALUES (2, 'denied', 20)",
+        "UPDATE t_stmt_auth SET n = 20 WHERE id = 2",
+        "DELETE FROM t_stmt_auth WHERE id = 2",
+        "CREATE TABLE t_null_ddl (id INT)",
+        "ALTER TABLE t_stmt_auth ADD COLUMN denied_col INT",
+        "DROP TABLE t_stmt_auth",
+    };
+    for (size_t i = 0; i < sizeof(denied_sql) / sizeof(denied_sql[0]); i++) {
+        assert(run_sql(ctx, NULL, denied_sql[i], &reply) == UWP_STS_ERR_PERM);
+        expect_reply(&reply, "ERR_PERM");
+    }
+
+    assert(qihse_auth_destroy_user(operator_user, 101));
+    for (size_t i = 0; i < sizeof(denied_sql) / sizeof(denied_sql[0]); i++) {
+        assert(run_sql(ctx, low, denied_sql[i], &reply) == UWP_STS_ERR_PERM);
+        expect_reply(&reply, "ERR_PERM");
+    }
+
+    /* Operator DDL remains available through the same execution path. */
+    assert(run_sql(ctx, operator_user,
+                   "ALTER TABLE t_stmt_auth ADD COLUMN operator_col INT", &reply) ==
+           UWP_STS_OK);
+    expect_reply(&reply, "OK stmt_type=ALTER");
+    assert(run_sql(ctx, operator_user, "DROP TABLE t_stmt_auth", &reply) ==
+           UWP_STS_OK);
+    expect_reply(&reply, "OK stmt_type=DROP");
+
+    printf("PASS sql authorization: active principal revalidation, WRITE-gated "
+           "DML, Operator-only DDL, and non-disclosing denials\n");
 }
 
 static void test_missing_table(qihse_uwp_context_t* ctx, qihse_user_t* user) {
@@ -563,6 +668,7 @@ int main(void) {
     test_delete_executes(&ctx, operator_user);
     test_delete_zero_condition_guard(&ctx, operator_user);
     test_write_permission(&ctx, operator_user);
+    test_statement_authorization(&ctx, operator_user);
     test_missing_table(&ctx, operator_user);
     test_insert_populates_row_store(&ctx, operator_user);
 
