@@ -475,26 +475,31 @@ static void test_serializable_occ(void) {
     qihse_txn_manager_t* mgr = qihse_txn_manager_create();
     assert(mgr);
 
-    /* Write-write conflict: both transactions write key "x". */
+    /* Write-write conflict where the winner has already left the active list.
+     * The second transaction must still see its retained committed writes. */
     qihse_txn_t* a = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
     assert(a && qihse_txn_record_write(a, 0, "x", 1) == 0);
     qihse_txn_t* b = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
     assert(b && qihse_txn_record_write(b, 0, "x", 1) == 0);
-    assert(qihse_txn_commit(mgr, a) == -1);
-    assert(a->state == QIHSE_TXN_ABORTED);
-    assert(qihse_txn_is_aborted(mgr, a->id));
-    assert(qihse_txn_commit(mgr, b) == 0);
+    assert(qihse_txn_commit(mgr, a) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 1);
+    assert(qihse_txn_validate_occ(mgr, b) == -1);
+    assert(qihse_txn_commit(mgr, b) == -1);
+    assert(b->state == QIHSE_TXN_ABORTED);
+    assert(qihse_txn_is_aborted(mgr, b->id));
+    assert(qihse_txn_committed_history_count(mgr) == 0);
 
-    /* Read-write conflict: one reads what the other writes. */
+    /* Read-write conflict with the writer committed before validation. */
     qihse_txn_t* c = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
     assert(c && qihse_txn_record_read(c, 0, "y", 1) == 0);
-    qihse_txn_t* d = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    qihse_txn_t* d = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
     assert(d && qihse_txn_record_write(d, 0, "y", 1) == 0);
+    assert(qihse_txn_commit(mgr, d) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 1);
     assert(qihse_txn_commit(mgr, c) == -1);
     assert(qihse_txn_is_aborted(mgr, c->id));
-    assert(qihse_txn_commit(mgr, d) == 0);
 
-    /* Disjoint keys commit cleanly. */
+    /* Disjoint committed writes do not create false conflicts. */
     qihse_txn_t* e = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
     qihse_txn_t* f = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
     assert(e && f);
@@ -503,6 +508,37 @@ static void test_serializable_occ(void) {
     assert(qihse_txn_validate_occ(mgr, e) == 0);
     assert(qihse_txn_commit(mgr, e) == 0);
     assert(qihse_txn_commit(mgr, f) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 0);
+
+    /* A long-lived snapshot keeps every later committed write set until it
+     * ends.  The matching third commit is detected even after several other
+     * transactions have committed and left the active list. */
+    qihse_txn_t* long_lived = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    assert(long_lived && qihse_txn_record_read(long_lived, 0, "hot", 3) == 0);
+    const char* committed_keys[] = {"cold-1", "cold-2", "hot", "cold-3"};
+    for (size_t i = 0; i < sizeof(committed_keys) / sizeof(committed_keys[0]); i++) {
+        qihse_txn_t* writer = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
+        assert(writer);
+        assert(qihse_txn_record_write(writer, 0, committed_keys[i],
+                                      strlen(committed_keys[i])) == 0);
+        assert(qihse_txn_commit(mgr, writer) == 0);
+    }
+    assert(qihse_txn_committed_history_count(mgr) == 4);
+    assert(qihse_txn_commit(mgr, long_lived) == -1);
+    assert(qihse_txn_committed_history_count(mgr) == 0);
+
+    /* Pruning uses the oldest active SERIALIZABLE commit-sequence snapshot.
+     * A newer snapshot cannot need summaries at or before its own snapshot. */
+    qihse_txn_t* old = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    qihse_txn_t* w = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
+    assert(old && w && qihse_txn_record_write(w, 0, "prune", 5) == 0);
+    assert(qihse_txn_commit(mgr, w) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 1);
+    qihse_txn_t* newer = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    assert(newer);
+    assert(qihse_txn_rollback(mgr, old) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 0);
+    assert(qihse_txn_rollback(mgr, newer) == 0);
 
     /* Non-serializable levels skip validation entirely. */
     qihse_txn_t* g = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
@@ -514,7 +550,20 @@ static void test_serializable_occ(void) {
     assert(qihse_txn_commit(mgr, h) == 0);
 
     qihse_txn_manager_destroy(mgr);
-    printf("PASS SERIALIZABLE OCC: read-write and write-write conflicts abort, disjoint commits\n");
+
+    /* Manager destruction owns and releases retained summaries. */
+    mgr = qihse_txn_manager_create();
+    assert(mgr);
+    qihse_txn_t* keeper = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    qihse_txn_t* retained = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
+    assert(keeper && retained);
+    assert(qihse_txn_record_write(retained, 0, "retained", 8) == 0);
+    assert(qihse_txn_commit(mgr, retained) == 0);
+    assert(qihse_txn_committed_history_count(mgr) == 1);
+    qihse_txn_manager_destroy(mgr);
+
+    printf("PASS SERIALIZABLE OCC: committed read/write and write/write conflicts, "
+           "disjoint commits, long-lived retention, safe pruning and destroy\n");
 }
 
 /* ── 7. Two-phase commit ────────────────────────────────────────────────── */

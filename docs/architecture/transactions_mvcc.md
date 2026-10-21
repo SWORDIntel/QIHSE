@@ -6,12 +6,10 @@
 > `tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`). Two limits are
 > stated plainly rather than glossed over:
 >
-> 1. **SERIALIZABLE OCC validation only sees transactions that are still active
->    at commit time.** `qihse_txn_validate_occ()` walks the active list; the
->    read/write sets of transactions that already committed are not retained, so
->    a conflict with an already-committed concurrent transaction is not
->    detected. The source says so in place, and `tests/test_txn.c` therefore
->    asserts only the active-transaction cases.
+> 1. **The SQL row store and public SQL transaction commands are not yet wired
+>    through this transaction manager.** The guarantees below describe callers
+>    that record every read and write through this API; they do not make direct
+>    row-store mutations transactional.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >
@@ -28,11 +26,13 @@
 
 ## 1. Overview
 
-QIHSE provides transactional storage over the KV, document, columnar, vector and
-event engines: a transaction manager, an MVCC version store, a unified
-Write-Ahead Log, and a crash recovery module. The guarantee is snapshot-based
-multi-version visibility with per-transaction commit/abort state; it is not a
-distributed-systems-grade serializable engine (see the OCC limitation above).
+QIHSE provides transaction, MVCC, WAL and recovery components intended for the
+KV, document, columnar, vector and event engines. The transaction manager now
+retains committed point-key write sets for every active SERIALIZABLE snapshot,
+so an already-committed concurrent transaction cannot disappear from OCC
+validation. A caller receives that guarantee only when it records all reads and
+writes. Predicate/range conflicts, public SQL integration and durable 2PC
+coordinator recovery remain outside this component's current contract.
 
 ## 2. Transaction Manager
 
@@ -81,6 +81,7 @@ bool qihse_txn_is_committed(qihse_txn_manager_t* mgr, uint64_t txn_id);
 bool qihse_txn_is_aborted(qihse_txn_manager_t* mgr, uint64_t txn_id);
 int  qihse_txn_active_list(qihse_txn_manager_t* mgr, uint64_t** out_ids, int* out_count);
 int  qihse_txn_active_count(qihse_txn_manager_t* mgr);
+size_t qihse_txn_committed_history_count(qihse_txn_manager_t* mgr);
 
 // LSN plumbing
 void     qihse_txn_set_start_lsn(qihse_txn_t* txn, uint64_t lsn);
@@ -93,26 +94,39 @@ uint64_t qihse_txn_get_start_lsn(const qihse_txn_t* txn);
 |---|---|---|---|
 | READ COMMITTED | Per-statement | None | Each statement sees the latest committed data |
 | REPEATABLE READ | Per-transaction | Write-write | Snapshot taken at BEGIN, held for entire transaction |
-| SERIALIZABLE | Per-transaction | Read-write + Write-write | OCC validation at commit time against *active* transactions; aborts on conflict |
+| SERIALIZABLE | Per-transaction commit-sequence snapshot | Read-write + Write-write for recorded point keys | OCC validation against retained writes from every transaction committed after BEGIN; aborts on conflict |
 
 ### SERIALIZABLE OCC Validation
 
-At commit time the transaction's read set and write set are compared against the
-read/write sets of the transactions that are **still active**:
+At BEGIN, each SERIALIZABLE transaction captures the manager's monotonically
+increasing commit sequence. At commit, its read and write sets are compared
+against the retained writes of every transaction with a later commit sequence:
 
-1. **Read-write conflict**: if an active transaction with a newer id wrote a key
-   this transaction read, abort.
-2. **Write-write conflict**: if an active transaction with a newer id wrote a key
-   this transaction wrote, abort.
+1. **Read-write conflict**: if a transaction committed after the snapshot and
+   wrote a recorded key this transaction read, abort.
+2. **Write-write conflict**: if a transaction committed after the snapshot and
+   wrote a recorded key this transaction wrote, abort.
 
-If validation passes, the transaction commits. If it fails, the transaction is
-aborted and the application must retry.
+Validation and commit-sequence assignment run under the manager lock. The first
+committer can therefore publish its summary before the next committer validates.
+If retaining a required summary cannot allocate memory, the committing
+transaction aborts: silently dropping the summary would allow a conflicting
+SERIALIZABLE transaction to commit.
 
-*Limitation*: because only active transactions are scanned, a conflict with a
-transaction that already committed is not detected. `tests/test_txn.c` asserts
-the active-transaction cases (both conflict kinds plus a disjoint-keys commit)
-and does not assert the committed-conflict case, which the implementation does
-not provide.
+Committed summaries are ordered by commit sequence. They are pruned only when
+their sequence is at or before the oldest active SERIALIZABLE snapshot; when no
+SERIALIZABLE transaction remains, all summaries can be released. A long-lived
+transaction therefore retains every later write summary it might need.
+`qihse_txn_committed_history_count()` exposes the retained-summary count for
+inspection and tests.
+
+This is point-key OCC. It does not detect predicate phantoms unless the caller
+records a key representing the protected predicate/range, and it provides no
+protection for an engine that bypasses `qihse_txn_record_read()` or
+`qihse_txn_record_write()`. `tests/test_txn.c` covers committed-after-snapshot
+read/write and write/write conflicts, disjoint commits, a long-lived snapshot
+across several commits, safe pruning and manager destruction with retained
+history.
 
 ### Two-Phase Commit (2PC)
 
