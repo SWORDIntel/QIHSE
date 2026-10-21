@@ -1,20 +1,20 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-20
+**Status date:** 2026-10-21
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
-**Current program status (2026-10-20):** 134 items implemented, 0 partial, 0 planned, and 1 superseded conditional item (100% of applicable scope complete). W0–W10 are closed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20) and the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md).
+**Current program status (2026-10-21):** 134 items implemented, 2 partial, 5 planned stretch deliverables, and 1 superseded conditional item. W0–W10 are closed (100% of their applicable scope complete). W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), and [W11](#w11--general-database-application-platform-active-stretch-goal).
 
 ---
 
-## 1. Where we are now (reviewed 2026-10-20)
+## 1. Where we are now (reviewed 2026-10-21)
 
 The historical program is closed. W0–W9 are implemented, including the W8 I2P replica transport live SOCKS5 smoke test across stageb containers and W9 runtime-dispatched hardware acceleration on the R730xd, dual E5-2470 v2 host, and AMD Zen 4/Zen 2 hosts. Audit continuity and exact-prefix challenge gates are implemented but intentionally undeployed pending retained-log review and the required negative CI coverage. The verification gold suite is non-vacuous; remaining verification work is documentation.
 
-The implementation program is closed. The current count is **134 implemented, 0 partial, 0 planned, and 1 superseded conditional item (100% of applicable scope complete)**. Functionality and security defects in the existing workstreams are fixed, including NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need.
+The W0–W10 implementation program is closed with **134 implemented and 1 superseded conditional item (100% of its applicable scope complete)**. Functionality and security defects in the existing workstreams are fixed, including NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need. W11 adds **7 stretch deliverables** for QIHSE's role as the general database foundation for commerce, inventories, fuzzing findings, agent memory, and other applications; W11.1 and W11.5 are now partial.
 
 ### Remote Server Hardware Acceleration (Dell PowerEdge R730xd — Dual Xeon E5-2690 v4) (2026-10-17)
 
@@ -646,9 +646,31 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 
 ---
 
+### W11 — General database application platform (active stretch goal)
+
+**Recorded 2026-10-21; status: active, foundation in progress.** Make QIHSE's supported data models work together as one dependable application platform: structured records, documents, relationships, blobs, and semantic search with explicit transaction, authorization, and recovery guarantees. Commerce, inventories, fuzzing findings, and agent memory are representative consumers; the platform contract must remain general.
+
+**Existing substrate — reuse and verify:** the roadmap already records ACID transactions, MVCC, cross-engine coordination, indexes, CDC, backup/PITR, federation, and AIMEM history. Establish their actual coverage through public interfaces before extending them. W10's single-record CAS and per-row durable import do not establish arbitrary cross-record atomicity.
+
+**SQL foundation slice (2026-10-21):** SERIALIZABLE OCC now retains committed point-write summaries until every active serialization snapshot has advanced, so a concurrent writer cannot disappear after commit. Terminal commit/rollback races have one mutex-serialized winner. The mutable row store has failure-atomic updates and generation-fenced transaction shadows, and UWP SQL uses them for one-table INSERT/UPDATE/DELETE with private uncommitted state, COMMIT, ROLLBACK, disconnect rollback and conflict abort. DML revalidates the active principal and enforces WRITE ACLs; direct TXN commands revalidate revocation; connection AUTH cannot replace identity during a transaction; SQL and SCHEMA mutations require an active Operator, while schema metadata requires READ. Unsupported SQL savepoints, transaction-time DDL and local-resource PREPARE fail closed. This advances W11.1 and W11.5 but does not close either item: real authorized SELECT, savepoint data restoration, multi-table commit, SQL WAL/restart durability and pgwire transaction integration remain open.
+
+- [ ] **W11.0 — Capability and guarantee map:** trace each supported model and public API to its transaction boundary, isolation level, durability acknowledgement, authorization enforcement, retry behavior, and recovery path. Record working evidence and unsupported combinations. Define representative workloads and numerical latency, throughput, resource, recovery-time, and recovery-point acceptance budgets before implementation measurements.
+- [~] **W11.1 — Consistent application transactions:** close demonstrated gaps in atomic updates across participating models and interfaces. One-table UWP SQL DML now has private transaction shadows, rollback, generation-fenced commit and retained committed-write OCC; cross-table/model atomicity, WAL recovery and pgwire integration remain. Prove that an order, stock reservation, and durable outbound event commit together, and that a fuzzing finding, reproducer reference, and provenance commit together. Test concurrency, constraint violations, retries, lost replies, crashes, and recovery without partial committed state or duplicate logical operations. External payment and message delivery remain explicit application workflows; a database transaction cannot atomically commit an external service. Document asynchronous search projections and their freshness separately from authoritative commits.
+- [ ] **W11.2 — Isolation between workloads:** enforce scoped CPU, memory, I/O, storage, and concurrency budgets with bounded queues and explicit backpressure. Run bulk finding ingestion and vector-index rebuilds alongside checkout, inventory updates, and memory retrieval; demonstrate the W11.0 latency and resource budgets under contention, including slow storage. Report hardware, dataset sizes, load, errors, throughput, and p50/p95/p99 latency.
+- [ ] **W11.3 — Safe online evolution:** expose progress, compatibility requirements, cancellation boundaries, and recovery for schema changes, index builds, record migrations, and rolling upgrades. Prove resumable interruption, mixed-version behavior, and safe cutover under concurrent application traffic. Specify reversibility per operation; validate restore or forward recovery where reversal is unavailable.
+- [ ] **W11.4 — Authorized history across models:** provide bounded historical reads and dependency traversal for supported models, with explicit retention, time/version meaning, and consistency boundaries. Demonstrate inventory state before an import and findings derived from a particular binary version. Reuse existing lineage facilities; enforce current tenant, clearance, SCI, and revocation policy on historical records, relations, counts, exports, and restored data.
+- [~] **W11.5 — Coherent developer and operator interfaces:** UWP SQL/TXN/SCHEMA now align active-principal checks, mutation ACLs, revocation behavior and unsupported transaction errors, with adapter-level negative coverage. Continue by aligning SDK transaction and retry behavior, typed errors, migration tooling, and query explanations with W11.0 guarantees. Extend Studio to inspect slow queries, resource budgets, permissions, replication, migration progress, and recovery state. Provide runnable examples for commerce, inventory, fuzzing, and memory consumers; CI must exercise their actual public APIs and negative authorization paths.
+- [ ] **W11.6 — Combined workload and failure proof:** run all four representative workloads concurrently, interrupt and restart nodes, inject partitions and storage faults, rebuild indexes, and restore an authenticated backup into an isolated test deployment. Check recorded histories against declared consistency guarantees, stock/order invariants, finding/provenance integrity, tenant isolation, and the agreed performance/recovery budgets. Publish reproducible commands, seeds, workload definitions, hardware, results, and remaining limitations; a happy-path demonstration alone does not close this item.
+
+**Architecture constraints:** preserve local survivability and no global quorum gate on ordinary LOCAL writes. Declare which exclusive operations require ownership or coordination and fail those operations closed when unavailable. Application scheduling, payments, build execution, and cluster management remain outside QIHSE. All new access surfaces inherit §5 security gates.
+
+**Sequence:** W11.0 → W11.1–W11.5 according to demonstrated gaps and dependencies → W11.6. Build the combined workload harness early and extend it as capabilities land. Detailed designs and acceptance budgets belong in `docs/plans/` when this workstream enters implementation.
+
+---
+
 ## 4. Sequencing
 
-**Critical path:** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`
+**Historical W0–W10 sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6.
 
 | Horizon | Work | Why now |
 |---|---|---|
@@ -658,6 +680,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 | **Later** | F6, then F7 | Supply-chain substrate needs journal + leases + trust; chaos/regression budgets gate the whole thing |
 | **Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
 | **QIHSE AIMEM lane (complete)** | QH-00 through QH-09 complete; QH-10 conditional gate not triggered | Durable scoped lifecycle, coordination, lineage, querying, maintenance, archives and assurance are integrated and tested |
+| **Active stretch program** | W11.0–W11.6; W11.1 and W11.5 partial | General database guarantees across application models, workload isolation, online evolution, history, developer tooling, and combined failure validation |
 
 Dependency notes:
 
@@ -683,6 +706,7 @@ Workstream-specific gates:
 - **Overlay:** a forged/expired IRC record never yields a MEET; a DHT record never yields membership.
 - **AI fabric:** every artifact path respects the fabric index authorization model (existing CI job) and the AGENTS.md security invariants.
 - **W10 AIMEM:** record and tombstone durability must be proved by crash tests; project/SCI restrictions precede every ranking/graph/count leg; new adapters require AGENTS.md low-clearance/high-data negative tests; versioned knowledge transformations remain reversible.
+- **W11 application platform:** public-interface evidence must establish each advertised guarantee; combined workloads must meet predeclared correctness, resource, latency, and recovery budgets under documented faults. Historical queries, migrations, diagnostics, and restore paths retain explicit principal and label enforcement. Publish unsupported combinations and measured limits; individual feature tests do not establish combined application guarantees.
 
 ---
 
