@@ -957,6 +957,10 @@ test-sql-dml-exec: lib
 	$(CC) $(CFLAGS) -o tests/test_sql_dml_exec tests/test_sql_dml_exec.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_sql_dml_exec
 
+test-table-store-txn: lib
+	$(CC) $(CFLAGS) -o tests/test_table_store_txn tests/test_table_store_txn.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_table_store_txn
+
 test-bolt: lib
 	$(CC) $(CFLAGS) -o tests/test_bolt tests/test_bolt.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_bolt
