@@ -4,6 +4,9 @@ namespace Qihse.Studio.Server.Models;
 
 public record QihseNode(
     [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("cluster")] string Cluster,
+    [property: JsonPropertyName("clusterType")] string ClusterType,
     [property: JsonPropertyName("host")] string Host,
     [property: JsonPropertyName("port")] int Port,
     [property: JsonPropertyName("role")] string Role,
@@ -13,7 +16,8 @@ public record QihseNode(
     [property: JsonPropertyName("shardSlots")] string ShardSlots,
     [property: JsonPropertyName("pingMs")] double PingMs,
     [property: JsonPropertyName("memoryBytes")] long MemoryBytes,
-    [property: JsonPropertyName("qps")] double Qps
+    [property: JsonPropertyName("qps")] double Qps,
+    [property: JsonPropertyName("networkTier")] string NetworkTier
 );
 
 public record TelemetryFrame(

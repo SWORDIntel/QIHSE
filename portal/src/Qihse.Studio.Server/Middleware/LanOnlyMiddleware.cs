@@ -2,7 +2,7 @@ using System.Net;
 
 namespace Qihse.Studio.Server.Middleware;
 
-/// <summary>Reject remote plaintext traffic even if the optional LAN ACL is disabled.</summary>
+/// <summary>Reject remote non-private traffic when LAN ACL is enabled.</summary>
 public sealed class LanOnlyMiddleware
 {
     private readonly RequestDelegate _next;
@@ -22,11 +22,9 @@ public sealed class LanOnlyMiddleware
         if (remoteIp != null && remoteIp.IsIPv4MappedToIPv6)
             remoteIp = remoteIp.MapToIPv4();
 
-        if (remoteIp == null ||
-            (!IPAddress.IsLoopback(remoteIp) && !context.Request.IsHttps) ||
-            (_lanOnlyEnabled && !IsPrivateOrLoopback(remoteIp)))
+        if (remoteIp == null || (_lanOnlyEnabled && !IsPrivateOrLoopback(remoteIp)))
         {
-            _logger.LogWarning("Rejected insecure or forbidden Studio transport from {RemoteIp}", remoteIp);
+            _logger.LogWarning("Rejected forbidden Studio transport from {RemoteIp}", remoteIp);
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             context.Response.Headers.CacheControl = "no-store";
             await context.Response.WriteAsync("{\"error\":\"access denied\"}");

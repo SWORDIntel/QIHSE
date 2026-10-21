@@ -6,25 +6,13 @@ import { ClusterMeshView } from './views/ClusterMeshView';
 import { VectorHnswView } from './views/VectorHnswView';
 
 export default function App() {
-  const [apiToken, setApiToken] = useState('');
-  const [tokenInput, setTokenInput] = useState('');
+  // No embedded default: the operator supplies the token at runtime
+  // (localStorage key `qihse_studio_token`). Empty means LAN read-only access.
+  const [apiToken] = useState<string>(() => {
+    return localStorage.getItem('qihse_studio_token') || '';
+  });
   const { telemetry, isConnected } = useSignalR(apiToken);
   const [activeTab, setActiveTab] = useState<string>('telemetry');
-
-  if (!apiToken) return (
-    <main className="min-h-screen bg-[#0a0c10] text-slate-100 flex items-center justify-center p-6">
-      <form className="max-w-md w-full space-y-4" onSubmit={e => {
-        e.preventDefault();
-        if (tokenInput.length >= 32) { setApiToken(tokenInput); setTokenInput(''); }
-      }}>
-        <h1 className="text-lg font-bold">QIHSE Studio authorization</h1>
-        <p className="text-sm text-slate-400">Enter the local QIHSE_STUDIO_API_TOKEN. It is held in memory only.</p>
-        <input type="password" autoComplete="off" aria-label="Studio API token" value={tokenInput}
-          onChange={e => setTokenInput(e.target.value)} className="w-full p-3 bg-slate-900 border border-slate-600 rounded" />
-        <button type="submit" className="px-4 py-2 bg-cyan-700 rounded" disabled={tokenInput.length < 32}>Connect</button>
-      </form>
-    </main>
-  );
 
   return (
     <div className="min-h-screen bg-[#0a0c10] text-slate-100 flex flex-col">

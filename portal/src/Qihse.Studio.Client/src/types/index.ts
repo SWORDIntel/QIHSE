@@ -1,5 +1,8 @@
 export interface QihseNode {
   id: string;
+  name: string;
+  cluster: string;
+  clusterType: string;
   host: string;
   port: number;
   role: string;
@@ -10,6 +13,7 @@ export interface QihseNode {
   pingMs: number;
   memoryBytes: number;
   qps: number;
+  networkTier: string;
 }
 
 export interface TelemetryFrame {

@@ -3,8 +3,7 @@ using Qihse.Studio.Server.Middleware;
 using Qihse.Studio.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
-if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
-    builder.WebHost.UseUrls("http://127.0.0.1:5100");
+builder.WebHost.UseUrls(Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? "http://0.0.0.0:5100");
 
 builder.Services.AddControllers();
 builder.Services.AddSignalR();

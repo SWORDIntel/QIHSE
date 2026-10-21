@@ -29,29 +29,38 @@ public class QihseRespClient : IDisposable
         await _lock.WaitAsync(ct);
         try
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            deadline.CancelAfter(TimeSpan.FromSeconds(3));
-            return await ConnectInternalAsync(deadline.Token);
-        }
-        finally
-        {
-            _lock.Release();
-        }
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromMilliseconds(500));
+        return await ConnectInternalAsync(deadline.Token);
     }
-
-    private async Task<bool> ConnectInternalAsync(CancellationToken ct)
+    finally
     {
-        if (IsConnected) return true;
+        _lock.Release();
+    }
+}
 
-        // Plain RESP transport is not authenticated or confidential; do not send
-        // operator credentials to remote peers until TLS/mTLS support exists.
-        if (!IPAddress.TryParse(_host, out var remote) || !IPAddress.IsLoopback(remote))
-            return false;
+private static bool IsAllowedClusterNetwork(IPAddress ip)
+{
+    if (IPAddress.IsLoopback(ip)) return true;
+    if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
+    byte[] bytes = ip.GetAddressBytes();
+    if (bytes[0] == 10) return true; // WireGuard overlay (10.x.x.x)
+    if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) return true; // Private
+    if (bytes[0] == 192 && bytes[1] == 168) return true; // LAN (192.168.x.x)
+    return false;
+}
 
-        _tcpClient?.Dispose();
-        _tcpClient = new TcpClient();
-        _tcpClient.SendTimeout = 2000;
-        _tcpClient.ReceiveTimeout = 2000;
+private async Task<bool> ConnectInternalAsync(CancellationToken ct)
+{
+    if (IsConnected) return true;
+
+    if (!IPAddress.TryParse(_host, out var remote) || !IsAllowedClusterNetwork(remote))
+        return false;
+
+    _tcpClient?.Dispose();
+    _tcpClient = new TcpClient();
+    _tcpClient.SendTimeout = 800;
+    _tcpClient.ReceiveTimeout = 800;
 
         try
         {
