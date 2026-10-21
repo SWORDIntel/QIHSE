@@ -34,8 +34,15 @@
 >    changed, and a zero-condition DELETE refuses instead of becoming a
 >    match-all. Earlier revisions documented the opposite — that the executor
 >    reported a document-store match count because no in-place update/delete
->    API existed. See §3.5. INSERT still writes to the append-only column
->    store, not the row store.
+>    API existed. See §3.5. INSERT now writes to the mutable row store and,
+>    when configured, also appends its analytic copy to the column store.
+> 6. **SQL mutations have a command-bound authorization gate.** Every SQL
+>    command revalidates its principal. INSERT, UPDATE and DELETE require WRITE
+>    on the target table's namespace-0 FNV-1a resource id. CREATE, DROP, ALTER
+>    and related schema-changing statements require an active Operator until a
+>    dedicated DDL capability exists. Authorization denial returns
+>    `UWP_STS_ERR_PERM` and `ERR_PERM`; it is not reported as a successful
+>    statement-level refusal.
 >
 > Also unverified here: the pgwire prepared-statement cache (see §6). No test in
 > the tree exercises it.
@@ -239,11 +246,29 @@ the raw SQL text is never re-parsed for execution.
   (`qihse_uwp_sql_table_store()`), matching the prepared-statement cache; the
   UWP SQL path has no per-connection engine state yet, and `ctx->sql_engine`
   is not dereferenced. Tables must be created in the store before DML can
-  target them. INSERT still writes to the column store, so it does not yet
-  populate the row store.
+  target them. INSERT populates the row store and also writes the configured
+  column-store analytic copy.
 - **Permission**: the same model as the KV / column / document targets — the
   ACL resource id is the FNV-1a hash of the table name, namespace 0; the
   operator role passes and every other role needs a `QIHSE_ACL_WRITE` grant.
+  The dispatcher enforces this for INSERT, UPDATE and DELETE before any row
+  store mutation. It revalidates the principal on every command, so NULL,
+  forged and revoked handles fail closed. The direct UPDATE/DELETE helper
+  retains its refusal text for internal API compatibility, but externally
+  dispatched SQL receives `ERR_PERM` with `UWP_STS_ERR_PERM`.
+
+### 3.6 SQL statement authorization
+
+DDL is restricted to an active Operator. This includes CREATE, DROP, ALTER,
+view and sequence DDL, TRUNCATE, REINDEX and CLUSTER. QIHSE does not currently
+expose a narrower schema-administration capability, so object WRITE grants do
+not confer DDL authority.
+
+SELECT is deliberately outside this mutation gate. The current plan executor
+does not materialize table-store rows, and the table store does not carry row
+classification or SCI metadata. A future SELECT implementation must add a
+typed principal to the scan boundary and enforce READ plus per-row labels
+before returning any stored value.
 
 ## 4. Cost-Based Optimizer
 
