@@ -69,6 +69,7 @@ typedef struct qihse_txn_s {
     qihse_txn_state_t       state;
     qihse_isolation_level_t isolation;
     uint64_t                snapshot;     /* txn ID at BEGIN for MVCC visibility */
+    uint64_t                serialization_snapshot; /* committed sequence at BEGIN */
     uint64_t                start_lsn;    /* WAL LSN at BEGIN */
     qihse_savepoint_t       savepoints[QIHSE_TXN_MAX_SAVEPOINTS];
     int                     savepoint_count;
@@ -164,6 +165,10 @@ int qihse_txn_active_list(qihse_txn_manager_t* mgr,
 
 /* Get the number of active transactions. */
 int qihse_txn_active_count(qihse_txn_manager_t* mgr);
+
+/* Number of committed write-set summaries retained for active SERIALIZABLE
+ * transactions.  Exposed for operational inspection and pruning tests. */
+size_t qihse_txn_committed_history_count(qihse_txn_manager_t* mgr);
 
 /* ── LSN tracking ───────────────────────────────────────────────────────── */
 
