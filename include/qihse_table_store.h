@@ -54,6 +54,9 @@ typedef struct qihse_table qihse_table_t;
 /* Opaque table store handle. */
 typedef struct qihse_table_store qihse_table_store_t;
 
+/* Opaque optimistic transaction over exactly one table. */
+typedef struct qihse_table_txn qihse_table_txn_t;
+
 /* Row callback for scanning.  Return false to stop the scan. */
 typedef bool (*qihse_table_row_cb)(const qihse_col_value_t* values,
                                    size_t num_cols, void* ctx);
@@ -123,6 +126,43 @@ size_t qihse_table_row_count(const qihse_table_t* table);
  * Return false from the callback to stop the scan. */
 void qihse_table_scan(const qihse_table_t* table,
                       qihse_table_row_cb cb, void* ctx);
+
+/* --- Optimistic single-table transactions ----------------------------- */
+
+/* Capture a deep transaction-local snapshot and the table generation.
+ * Returns NULL on invalid input, generation exhaustion, or allocation
+ * failure.  The transaction is owned by the calling thread. */
+qihse_table_txn_t* qihse_table_txn_begin(qihse_table_t* table);
+
+/* Mutations and reads below operate only on the transaction-local snapshot.
+ * Strings are deep-copied.  No uncommitted state is visible through the live
+ * table APIs. */
+int qihse_table_txn_insert(qihse_table_txn_t* txn,
+                           const qihse_col_value_t* values,
+                           size_t num_values);
+bool qihse_table_txn_update(qihse_table_txn_t* txn,
+                            int (*pred)(const qihse_col_value_t* values,
+                                        size_t num_cols, void* ctx),
+                            void* pred_ctx,
+                            const int* update_cols,
+                            const qihse_col_value_t* new_values,
+                            size_t num_updates);
+bool qihse_table_txn_delete(qihse_table_txn_t* txn,
+                            int (*pred)(const qihse_col_value_t* values,
+                                        size_t num_cols, void* ctx),
+                            void* pred_ctx);
+size_t qihse_table_txn_row_count(const qihse_table_txn_t* txn);
+void qihse_table_txn_scan(const qihse_table_txn_t* txn,
+                          qihse_table_row_cb cb, void* ctx);
+
+/* Commit succeeds only when the live table generation still equals the
+ * generation captured by begin.  Success atomically replaces the live rows;
+ * a conflict leaves the live table unchanged.  Commit consumes txn on both
+ * success and failure. */
+bool qihse_table_txn_commit(qihse_table_txn_t* txn);
+
+/* Discard the transaction-local snapshot. */
+void qihse_table_txn_rollback(qihse_table_txn_t* txn);
 
 /* --- Introspection ----------------------------------------------------- */
 

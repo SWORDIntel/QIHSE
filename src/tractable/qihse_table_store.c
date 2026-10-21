@@ -37,7 +37,14 @@ struct qihse_table {
     size_t              num_rows;     /* total slots (live + tombstone) */
     size_t              cap_rows;     /* allocated capacity */
     size_t              num_tomb;     /* number of tombstoned slots */
+    uint64_t            generation;   /* optimistic transaction fence */
     pthread_rwlock_t    lock;
+};
+
+struct qihse_table_txn {
+    qihse_table_t* table;              /* borrowed; store outlives txn */
+    qihse_table_t  shadow;             /* rows owned; schema borrowed */
+    uint64_t       base_generation;
 };
 
 struct qihse_table_store {
@@ -101,6 +108,31 @@ static qihse_col_value_t* ts_dup_row(const qihse_col_value_t* values,
         }
     }
     return row;
+}
+
+static void ts_free_rows(qihse_col_value_t** rows, size_t num_rows,
+                         size_t num_cols) {
+    if (!rows) return;
+    for (size_t i = 0; i < num_rows; i++)
+        ts_free_row(rows[i], num_cols);
+    free(rows);
+}
+
+static qihse_col_value_t** ts_dup_rows(qihse_col_value_t* const* rows,
+                                       size_t num_rows, size_t num_cols) {
+    if (num_rows == 0) return NULL;
+    qihse_col_value_t** copy =
+        (qihse_col_value_t**)calloc(num_rows, sizeof(*copy));
+    if (!copy) return NULL;
+    for (size_t i = 0; i < num_rows; i++) {
+        if (!rows[i]) continue;
+        copy[i] = ts_dup_row(rows[i], num_cols, num_cols);
+        if (!copy[i]) {
+            ts_free_rows(copy, num_rows, num_cols);
+            return NULL;
+        }
+    }
+    return copy;
 }
 
 static bool ts_ensure_cap(qihse_table_t* t, size_t needed) {
@@ -270,6 +302,9 @@ int qihse_table_insert(qihse_table_t* table,
                        const qihse_col_value_t* values, size_t num_values) {
     if (!table || !values) return -1;
 
+    qihse_col_value_t* row = ts_dup_row(values, num_values, table->num_cols);
+    if (!row) return -1;
+
     pthread_rwlock_wrlock(&table->lock);
 
     /* Find a free slot (reuse a tombstone if available). */
@@ -278,7 +313,6 @@ int qihse_table_insert(qihse_table_t* table,
         for (size_t i = 0; i < table->num_rows; i++) {
             if (table->rows[i] == NULL) {
                 slot = i;
-                table->num_tomb--;
                 break;
             }
         }
@@ -287,18 +321,17 @@ int qihse_table_insert(qihse_table_t* table,
     if (slot >= table->num_rows) {
         if (!ts_ensure_cap(table, table->num_rows + 1)) {
             pthread_rwlock_unlock(&table->lock);
+            ts_free_row(row, table->num_cols);
             return -1;
         }
         slot = table->num_rows;
         table->num_rows++;
+    } else {
+        table->num_tomb--;
     }
 
-    qihse_col_value_t* row = ts_dup_row(values, num_values, table->num_cols);
-    if (!row) {
-        pthread_rwlock_unlock(&table->lock);
-        return -1;
-    }
     table->rows[slot] = row;
+    table->generation++;
 
     pthread_rwlock_unlock(&table->lock);
     return (int)slot;
@@ -344,6 +377,7 @@ bool qihse_table_update(qihse_table_t* table,
             any = true;
         }
     }
+    if (any) table->generation++;
     pthread_rwlock_unlock(&table->lock);
     return any;
 }
@@ -370,6 +404,7 @@ bool qihse_table_delete(qihse_table_t* table,
         table->num_tomb * 4 >= table->cap_rows) {
         ts_compact(table);
     }
+    if (any) table->generation++;
 
     pthread_rwlock_unlock(&table->lock);
     return any;
@@ -396,6 +431,199 @@ void qihse_table_scan(const qihse_table_t* table,
         if (!cb(table->rows[i], table->num_cols, ctx)) break;
     }
     pthread_rwlock_unlock((pthread_rwlock_t*)&table->lock);
+}
+
+/* -------------------------------------------------------------------------
+ * Optimistic single-table transactions
+ * ------------------------------------------------------------------------- */
+
+static void ts_txn_destroy(qihse_table_txn_t* txn) {
+    if (!txn) return;
+    ts_free_rows(txn->shadow.rows, txn->shadow.num_rows,
+                 txn->shadow.num_cols);
+    free(txn);
+}
+
+qihse_table_txn_t* qihse_table_txn_begin(qihse_table_t* table) {
+    if (!table) return NULL;
+    qihse_table_txn_t* txn =
+        (qihse_table_txn_t*)calloc(1, sizeof(*txn));
+    if (!txn) return NULL;
+
+    pthread_rwlock_rdlock(&table->lock);
+    if (table->generation == UINT64_MAX) {
+        pthread_rwlock_unlock(&table->lock);
+        free(txn);
+        return NULL;
+    }
+    qihse_col_value_t** rows =
+        ts_dup_rows(table->rows, table->num_rows, table->num_cols);
+    if (table->num_rows > 0 && !rows) {
+        pthread_rwlock_unlock(&table->lock);
+        free(txn);
+        return NULL;
+    }
+    txn->table = table;
+    txn->base_generation = table->generation;
+    txn->shadow.cols = table->cols;
+    txn->shadow.num_cols = table->num_cols;
+    txn->shadow.rows = rows;
+    txn->shadow.num_rows = table->num_rows;
+    txn->shadow.cap_rows = table->num_rows;
+    txn->shadow.num_tomb = table->num_tomb;
+    pthread_rwlock_unlock(&table->lock);
+    return txn;
+}
+
+int qihse_table_txn_insert(qihse_table_txn_t* txn,
+                           const qihse_col_value_t* values,
+                           size_t num_values) {
+    if (!txn || !values) return -1;
+    qihse_table_t* shadow = &txn->shadow;
+    qihse_col_value_t* row =
+        ts_dup_row(values, num_values, shadow->num_cols);
+    if (!row) return -1;
+
+    size_t slot = shadow->num_rows;
+    if (shadow->num_tomb > 0) {
+        for (size_t i = 0; i < shadow->num_rows; i++) {
+            if (!shadow->rows[i]) { slot = i; break; }
+        }
+    }
+    if (slot >= shadow->num_rows) {
+        if (!ts_ensure_cap(shadow, shadow->num_rows + 1)) {
+            ts_free_row(row, shadow->num_cols);
+            return -1;
+        }
+        slot = shadow->num_rows++;
+    } else {
+        shadow->num_tomb--;
+    }
+    shadow->rows[slot] = row;
+    return (int)slot;
+}
+
+static bool ts_assign_value(qihse_col_value_t* cell,
+                            const qihse_col_value_t* value) {
+    char* string_copy = NULL;
+    if (value->type == QIHSE_TS_STRING && value->v.str) {
+        string_copy = strdup(value->v.str);
+        if (!string_copy) return false;
+    }
+    ts_free_col_value(cell);
+    cell->type = value->type;
+    switch (value->type) {
+        case QIHSE_TS_INT32: cell->v.i32 = value->v.i32; break;
+        case QIHSE_TS_INT64: cell->v.i64 = value->v.i64; break;
+        case QIHSE_TS_FLOAT: cell->v.f32 = value->v.f32; break;
+        case QIHSE_TS_STRING: cell->v.str = string_copy; break;
+        default:
+            free(string_copy);
+            return false;
+    }
+    return true;
+}
+
+bool qihse_table_txn_update(qihse_table_txn_t* txn,
+                            int (*pred)(const qihse_col_value_t*, size_t,
+                                        void*),
+                            void* pred_ctx,
+                            const int* update_cols,
+                            const qihse_col_value_t* new_values,
+                            size_t num_updates) {
+    if (!txn || !pred || !update_cols || !new_values || num_updates == 0)
+        return false;
+    qihse_table_t* shadow = &txn->shadow;
+    qihse_col_value_t** candidate =
+        ts_dup_rows(shadow->rows, shadow->num_rows, shadow->num_cols);
+    if (shadow->num_rows > 0 && !candidate) return false;
+
+    bool any = false;
+    for (size_t i = 0; i < shadow->num_rows; i++) {
+        if (!candidate[i] ||
+            !pred(candidate[i], shadow->num_cols, pred_ctx)) continue;
+        for (size_t u = 0; u < num_updates; u++) {
+            int col = update_cols[u];
+            if (col < 0 || (size_t)col >= shadow->num_cols) continue;
+            if (!ts_assign_value(&candidate[i][col], &new_values[u])) {
+                ts_free_rows(candidate, shadow->num_rows, shadow->num_cols);
+                return false;
+            }
+        }
+        any = true;
+    }
+    if (!any) {
+        ts_free_rows(candidate, shadow->num_rows, shadow->num_cols);
+        return false;
+    }
+    ts_free_rows(shadow->rows, shadow->num_rows, shadow->num_cols);
+    shadow->rows = candidate;
+    shadow->cap_rows = shadow->num_rows;
+    return true;
+}
+
+bool qihse_table_txn_delete(qihse_table_txn_t* txn,
+                            int (*pred)(const qihse_col_value_t*, size_t,
+                                        void*),
+                            void* pred_ctx) {
+    if (!txn || !pred) return false;
+    qihse_table_t* shadow = &txn->shadow;
+    bool any = false;
+    for (size_t i = 0; i < shadow->num_rows; i++) {
+        if (!shadow->rows[i] ||
+            !pred(shadow->rows[i], shadow->num_cols, pred_ctx)) continue;
+        ts_free_row(shadow->rows[i], shadow->num_cols);
+        shadow->rows[i] = NULL;
+        shadow->num_tomb++;
+        any = true;
+    }
+    if (any && shadow->cap_rows > 0 &&
+        shadow->num_tomb * 4 >= shadow->cap_rows)
+        ts_compact(shadow);
+    return any;
+}
+
+size_t qihse_table_txn_row_count(const qihse_table_txn_t* txn) {
+    return txn ? txn->shadow.num_rows - txn->shadow.num_tomb : 0;
+}
+
+void qihse_table_txn_scan(const qihse_table_txn_t* txn,
+                          qihse_table_row_cb cb, void* ctx) {
+    if (!txn || !cb) return;
+    for (size_t i = 0; i < txn->shadow.num_rows; i++) {
+        if (!txn->shadow.rows[i]) continue;
+        if (!cb(txn->shadow.rows[i], txn->shadow.num_cols, ctx)) break;
+    }
+}
+
+bool qihse_table_txn_commit(qihse_table_txn_t* txn) {
+    if (!txn || !txn->table) return false;
+    qihse_table_t* table = txn->table;
+    pthread_rwlock_wrlock(&table->lock);
+    if (table->generation != txn->base_generation) {
+        pthread_rwlock_unlock(&table->lock);
+        ts_txn_destroy(txn);
+        return false;
+    }
+
+    qihse_col_value_t** old_rows = table->rows;
+    size_t old_num_rows = table->num_rows;
+    table->rows = txn->shadow.rows;
+    table->num_rows = txn->shadow.num_rows;
+    table->cap_rows = txn->shadow.cap_rows;
+    table->num_tomb = txn->shadow.num_tomb;
+    table->generation++;
+    txn->shadow.rows = NULL;
+    txn->shadow.num_rows = 0;
+    pthread_rwlock_unlock(&table->lock);
+
+    ts_free_rows(old_rows, old_num_rows, table->num_cols);
+    free(txn);
+    return true;
+}
+
+void qihse_table_txn_rollback(qihse_table_txn_t* txn) {
+    ts_txn_destroy(txn);
 }
 
 /* -------------------------------------------------------------------------
