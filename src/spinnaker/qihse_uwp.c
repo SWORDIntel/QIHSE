@@ -362,6 +362,10 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
 
     if (header->target_engine == QIHSE_UWP_TARGET_AUTH && header->command_opcode == 0x01) {
         if (!ctx || len == 0 || !user_slot) return UWP_ROUTE_ERR_AUTH;
+        /* A transaction is owned by the authenticated connection identity
+         * that began it.  Refuse identity replacement until COMMIT/ROLLBACK
+         * clears the handle. */
+        if (current_txn && *current_txn) return UWP_ROUTE_ERR_AUTH;
         size_t username_len = strnlen((char*)payload, len);
         if (username_len >= len - 1) return UWP_ROUTE_ERR_AUTH;
         char* username = (char*)payload;
@@ -645,6 +649,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
             /* 0x01=CREATE_TABLE 0x02=DROP_TABLE 0x03=ALTER_TABLE 0x04=GET_TABLE
              * 0x05=CREATE_INDEX 0x06=DROP_INDEX */
             if (header->command_opcode >= 0x01 && header->command_opcode <= 0x06) {
+                if (header->command_opcode != 0x04 && current_txn &&
+                    *current_txn) {
+                    if (write_fn) (void)write_fn(write_ctx, "ERR\n", 4);
+                    if (ctx->uwp_metrics)
+                        qihse_uwp_metrics_inc_dispatch_error(
+                            ctx->uwp_metrics, header->target_engine);
+                    return UWP_ROUTE_ERR_DISPATCH;
+                }
                 uwp_sts_result_t r = uwp_dispatch_schema(ctx, header->command_opcode,
                                                          payload, len, current_user, client_fd,
                                                          write_fn, write_ctx);
@@ -1419,7 +1431,10 @@ static void uwp_conn_reset(uwp_conn_t* conn) {
     conn->rbuf_len = 0;
     conn->payload_length = 0;
     conn->state = READING_HEADER;
-    conn->current_txn = NULL;
+    /* Authentication and transaction state belong to the connection, not to
+     * one wire frame.  COMMIT/ROLLBACK clear current_txn through the
+     * transaction dispatcher; disconnect cleanup rolls an active transaction
+     * back. */
 }
 
 #ifdef _WIN32

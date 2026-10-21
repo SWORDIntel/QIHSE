@@ -74,6 +74,33 @@ static uwp_sts_result_t run_sql(qihse_uwp_context_t* ctx, qihse_user_t* user,
                             &txn, user, -1, test_write, out);
 }
 
+static uwp_sts_result_t run_sql_txn(qihse_uwp_context_t* ctx,
+                                    qihse_user_t* user, const char* sql,
+                                    qihse_txn_t** txn, uwp_reply_buf_t* out) {
+    memset(out, 0, sizeof(*out));
+    return uwp_dispatch_sql(ctx, 0x02, (const uint8_t*)sql, strlen(sql) + 1,
+                            txn, user, -1, test_write, out);
+}
+
+static uwp_sts_result_t run_txn_command(qihse_uwp_context_t* ctx,
+                                        qihse_user_t* user, uint8_t opcode,
+                                        const char* arg, qihse_txn_t** txn,
+                                        uwp_reply_buf_t* out) {
+    memset(out, 0, sizeof(*out));
+    return uwp_dispatch_txn(ctx, opcode, (const uint8_t*)arg,
+                            arg ? strlen(arg) + 1 : 0, txn, user, -1,
+                            test_write, out);
+}
+
+static uwp_sts_result_t run_schema(qihse_uwp_context_t* ctx,
+                                   qihse_user_t* user, uint8_t opcode,
+                                   const char* arg, uwp_reply_buf_t* out) {
+    memset(out, 0, sizeof(*out));
+    return uwp_dispatch_schema(ctx, opcode, (const uint8_t*)arg,
+                               arg ? strlen(arg) + 1 : 0, user, -1,
+                               test_write, out);
+}
+
 static void expect_reply(const uwp_reply_buf_t* out, const char* needle) {
     if (!strstr(out->data, needle)) {
         fprintf(stderr, "FAIL: expected reply containing '%s', got: %s\n",
@@ -642,6 +669,142 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
            "UPDATE/DELETE-able end to end\n");
 }
 
+static void test_transactional_dml_commit_rollback(
+    qihse_uwp_context_t* ctx, qihse_user_t* user) {
+    uwp_reply_buf_t out;
+    qihse_txn_t* txn = NULL;
+
+    assert(run_sql(ctx, user,
+                   "CREATE TABLE t_txn_dml (id INT, name TEXT, n INT)",
+                   &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "INSERT INTO t_txn_dml VALUES (1, 'base', 10)",
+                   &out) == UWP_STS_OK);
+    qihse_table_t* table = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "t_txn_dml");
+    assert(table != NULL);
+
+    assert(run_sql_txn(ctx, user, "BEGIN SERIALIZABLE", &txn, &out) == UWP_STS_OK);
+    assert(txn != NULL);
+    assert(run_sql_txn(ctx, user,
+                       "UPDATE t_txn_dml SET n = 20 WHERE id = 1",
+                       &txn, &out) == UWP_STS_OK);
+    expect_reply(&out, "rows=1");
+    expect_row(table, 1, "base", 10); /* uncommitted shadow is private */
+    assert(run_sql_txn(ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
+    assert(txn == NULL);
+    expect_row(table, 1, "base", 10);
+
+    assert(run_sql_txn(ctx, user, "BEGIN SERIALIZABLE", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "UPDATE t_txn_dml SET n = 30 WHERE id = 1",
+                       &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    assert(txn == NULL);
+    expect_row(table, 1, "base", 30);
+
+    assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "INSERT INTO t_txn_dml VALUES (2, 'rolled-back', 40)",
+                       &txn, &out) == UWP_STS_OK);
+    expect_row_absent(table, 2);
+    assert(run_sql_txn(ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
+    expect_row_absent(table, 2);
+
+    assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "INSERT INTO t_txn_dml VALUES (2, 'committed', 50)",
+                       &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    expect_row(table, 2, "committed", 50);
+
+    /* Optimistic conflict: a live autocommit write after the transaction's
+     * snapshot makes COMMIT abort without overwriting the live change. */
+    assert(run_sql_txn(ctx, user, "BEGIN SERIALIZABLE", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "UPDATE t_txn_dml SET n = 60 WHERE id = 1",
+                       &txn, &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "UPDATE t_txn_dml SET n = 70 WHERE id = 1",
+                   &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_ERR_FAILED);
+    assert(txn == NULL);
+    expect_row(table, 1, "base", 70);
+
+    /* SQL savepoints and transactional DDL are refused until the row/schema
+     * resources can snapshot and restore those operations. */
+    assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user, "SAVEPOINT s1", &txn, &out) ==
+           UWP_STS_ERR_FAILED);
+    assert(run_sql_txn(ctx, user, "CREATE TABLE t_txn_ddl (id INT)",
+                       &txn, &out) == UWP_STS_ERR_FAILED);
+    assert(qihse_schema_get_table((qihse_schema_registry_t*)ctx->schema,
+                                  "t_txn_ddl") == NULL);
+    assert(run_sql_txn(ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
+
+    printf("PASS sql transactions: private DML shadows commit, rollback, and "
+           "abort on concurrent live mutation\n");
+}
+
+static void test_txn_revocation_and_schema_authorization(
+    qihse_uwp_context_t* ctx, qihse_user_t* operator_user) {
+    uwp_reply_buf_t out;
+    qihse_txn_t* txn = NULL;
+    qihse_user_t* low = qihse_auth_create_user(
+        operator_user, 102, QIHSE_ROLE_GUEST, 0, 0,
+        "schema-low-principal-password", false);
+    assert(low != NULL);
+
+    assert(run_schema(ctx, operator_user, 0x01,
+                      "CREATE TABLE t_schema_auth (id INT)", &out) == UWP_STS_OK);
+    assert(run_schema(ctx, low, 0x04, "t_schema_auth", &out) ==
+           UWP_STS_ERR_PERM);
+    expect_reply(&out, "ERR_PERM");
+    assert(run_schema(ctx, low, 0x02, "t_schema_auth", &out) ==
+           UWP_STS_ERR_PERM);
+    assert(qihse_auth_grant_object(operator_user, low, 0,
+                                   table_resource_id("t_schema_auth"),
+                                   QIHSE_ACL_READ));
+    assert(run_schema(ctx, low, 0x04, "t_schema_auth", &out) == UWP_STS_OK);
+    expect_reply(&out, "OK table=t_schema_auth");
+
+    assert(run_sql(ctx, operator_user,
+                   "CREATE TABLE t_revoked_commit (id INT, name TEXT, n INT)",
+                   &out) == UWP_STS_OK);
+    assert(qihse_auth_grant_object(operator_user, low, 0,
+                                   table_resource_id("t_revoked_commit"),
+                                   QIHSE_ACL_WRITE));
+
+    uint8_t isolation = (uint8_t)QIHSE_ISO_SERIALIZABLE;
+    memset(&out, 0, sizeof(out));
+    assert(uwp_dispatch_txn(ctx, 0x01, &isolation, 1, &txn, low, -1,
+                            test_write, &out) == UWP_STS_OK);
+    assert(txn != NULL);
+    assert(run_sql_txn(ctx, low,
+                       "INSERT INTO t_revoked_commit VALUES (1, 'private', 9)",
+                       &txn, &out) == UWP_STS_OK);
+    qihse_table_t* revoke_table = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "t_revoked_commit");
+    assert(revoke_table != NULL && qihse_table_row_count(revoke_table) == 0);
+    assert(qihse_auth_destroy_user(operator_user, 102));
+    assert(run_txn_command(ctx, low, 0x02, NULL, &txn, &out) ==
+           UWP_STS_ERR_PERM);
+    expect_reply(&out, "ERR_PERM");
+    assert(txn != NULL && txn->state == QIHSE_TXN_ACTIVE);
+    assert(qihse_txn_rollback((qihse_txn_manager_t*)ctx->txn_manager, txn) == 0);
+    txn = NULL;
+    assert(qihse_table_row_count(revoke_table) == 0);
+    assert(run_schema(ctx, low, 0x04, "t_schema_auth", &out) ==
+           UWP_STS_ERR_PERM);
+    assert(run_schema(ctx, operator_user, 0x02, "t_schema_auth", &out) ==
+           UWP_STS_OK);
+    assert(run_sql(ctx, operator_user, "DROP TABLE t_revoked_commit", &out) ==
+           UWP_STS_OK);
+
+    printf("PASS SQL adapters: SCHEMA enforces active READ/Operator boundaries "
+           "and TXN revalidates revocation before commit\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -661,6 +824,8 @@ int main(void) {
     /* INSERT resolves its table through the schema registry. */
     ctx.schema = qihse_schema_registry_create();
     assert(ctx.schema != NULL);
+    ctx.txn_manager = qihse_txn_manager_create();
+    assert(ctx.txn_manager != NULL);
 
     test_update_executes(&ctx, operator_user);
     test_update_qualified_and_quoted(&ctx, operator_user);
@@ -671,7 +836,10 @@ int main(void) {
     test_statement_authorization(&ctx, operator_user);
     test_missing_table(&ctx, operator_user);
     test_insert_populates_row_store(&ctx, operator_user);
+    test_transactional_dml_commit_rollback(&ctx, operator_user);
+    test_txn_revocation_and_schema_authorization(&ctx, operator_user);
 
+    qihse_txn_manager_destroy((qihse_txn_manager_t*)ctx.txn_manager);
     qihse_schema_registry_destroy((qihse_schema_registry_t*)ctx.schema);
     printf("test_sql_dml_exec: all SQL UPDATE/DELETE/INSERT execution tests passed\n");
     return 0;

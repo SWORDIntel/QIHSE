@@ -377,7 +377,8 @@ static int uwp_execute_select_plan(qihse_uwp_context_t* ctx,
  * -1 if no row store / schema is wired,
  * -2 on error (table not found, INSERT...SELECT, etc.). */
 static int uwp_execute_insert(qihse_uwp_context_t* ctx,
-                              const qihse_sql_ast_t* ast) {
+                              const qihse_sql_ast_t* ast,
+                              qihse_table_txn_t* table_txn) {
     /* The schema registry is required — it is the table definition.  The
      * column store is optional; the mutable row store is process-wide and
      * needs no ctx. */
@@ -476,7 +477,9 @@ static int uwp_execute_insert(qihse_uwp_context_t* ctx,
                 }
             }
             if (row_ok) {
-                int rid = qihse_table_insert(row_table, row_vals, row_cols);
+                int rid = table_txn
+                              ? qihse_table_txn_insert(table_txn, row_vals, row_cols)
+                              : qihse_table_insert(row_table, row_vals, row_cols);
                 if (rid < 0) row_ok = 0;
             }
             /* uwp_dml_set_value deep-copies strings into the value slots;
@@ -491,7 +494,7 @@ static int uwp_execute_insert(qihse_uwp_context_t* ctx,
         }
 
         /* Column-store pass: unchanged from before. */
-        if (ctx->col) {
+        if (ctx->col && !table_txn) {
             for (size_t c = 0; c < num_cols && col_ok; c++) {
                 if (!row[c]) { col_ok = 0; break; }
 
@@ -862,6 +865,34 @@ static char* uwp_ps_substitute(const uwp_ps_slot_t* s) {
 static qihse_table_store_t* uwp_sql_row_store;
 static pthread_mutex_t uwp_sql_row_store_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#define UWP_SQL_TXN_MAGIC 0x51535458u
+typedef struct {
+    uint32_t magic;
+    char* table_name;
+    qihse_table_txn_t* table_txn;
+} uwp_sql_txn_resource_t;
+
+static int uwp_sql_txn_commit(void* opaque) {
+    uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return -1;
+    bool committed = qihse_table_txn_commit(resource->table_txn);
+    resource->table_txn = NULL;
+    resource->magic = 0;
+    free(resource->table_name);
+    free(resource);
+    return committed ? 0 : -1;
+}
+
+static void uwp_sql_txn_rollback(void* opaque) {
+    uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return;
+    qihse_table_txn_rollback(resource->table_txn);
+    resource->table_txn = NULL;
+    resource->magic = 0;
+    free(resource->table_name);
+    free(resource);
+}
+
 qihse_table_store_t* qihse_uwp_sql_table_store(void) {
     pthread_mutex_lock(&uwp_sql_row_store_mutex);
     if (!uwp_sql_row_store)
@@ -922,6 +953,39 @@ static qihse_table_t* uwp_sql_row_table(qihse_schema_registry_t* schema,
     free(defs);
     if (!t) t = qihse_table_store_find_table(store, table_name);
     return t;
+}
+
+/* Return the transaction-local table shadow for this statement.  The first
+ * DML statement enlists one row table in the connection transaction.  This
+ * bounded first slice refuses a second table; arbitrary cross-table commit
+ * requires the durable coordinator described by W11.1. */
+static qihse_table_txn_t* uwp_sql_txn_table(qihse_txn_t* txn,
+                                           qihse_table_t* table,
+                                           const char* table_name) {
+    if (!txn || !table || !table_name) return NULL;
+    if (txn->resource_ctx) {
+        uwp_sql_txn_resource_t* resource =
+            (uwp_sql_txn_resource_t*)txn->resource_ctx;
+        if (resource->magic != UWP_SQL_TXN_MAGIC ||
+            strcmp(resource->table_name, table_name) != 0)
+            return NULL;
+        return resource->table_txn;
+    }
+
+    uwp_sql_txn_resource_t* resource = calloc(1, sizeof(*resource));
+    if (!resource) return NULL;
+    resource->magic = UWP_SQL_TXN_MAGIC;
+    resource->table_name = strdup(table_name);
+    resource->table_txn = qihse_table_txn_begin(table);
+    if (!resource->table_name || !resource->table_txn ||
+        qihse_txn_attach_resource(txn, resource, uwp_sql_txn_commit,
+                                  uwp_sql_txn_rollback) != 0) {
+        if (resource->table_txn) qihse_table_txn_rollback(resource->table_txn);
+        free(resource->table_name);
+        free(resource);
+        return NULL;
+    }
+    return resource->table_txn;
 }
 
 /* Single-line DML reply, malloc'd; NULL on allocation failure. */
@@ -1298,7 +1362,10 @@ static bool uwp_dml_set_value(const qihse_col_def_t* def, const char* text,
     }
 }
 
-char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast, qihse_user_t* user) {
+static char* uwp_sql_execute_dml_on_table(const qihse_sql_ast_t* ast,
+                                           qihse_user_t* user,
+                                           qihse_table_t* table,
+                                           qihse_table_txn_t* table_txn) {
     if (!ast || (ast->stmt_type != QIHSE_SQL_UPDATE &&
                  ast->stmt_type != QIHSE_SQL_DELETE))
         return NULL;
@@ -1325,9 +1392,6 @@ char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast, qihse_user_t* user) 
                               "assignments; no rows changed)\n");
     }
 
-    qihse_table_store_t* store = qihse_uwp_sql_table_store();
-    qihse_table_t* table =
-        store ? qihse_table_store_find_table(store, ast->table_name) : NULL;
     if (!table) {
         return uwp_dml_replyf("OK stmt_type=%s (table %s not found in the SQL "
                               "row store; no rows changed)\n", stmt,
@@ -1457,10 +1521,20 @@ char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast, qihse_user_t* user) 
     scan.num_conds = num_conds;
     scan.matched = 0;
     if (ast->stmt_type == QIHSE_SQL_UPDATE) {
-        (void)qihse_table_update(table, uwp_dml_pred, &scan, set_cols, set_vals,
-                                 num_set);
+        if (table_txn) {
+            int update_rc = qihse_table_txn_update(
+                table_txn, uwp_dml_pred, &scan, set_cols, set_vals, num_set);
+            if (update_rc < 0) goto done;
+        } else {
+            int update_rc = qihse_table_update(
+                table, uwp_dml_pred, &scan, set_cols, set_vals, num_set);
+            if (update_rc < 0) goto done;
+        }
     } else {
-        (void)qihse_table_delete(table, uwp_dml_pred, &scan);
+        if (table_txn)
+            (void)qihse_table_txn_delete(table_txn, uwp_dml_pred, &scan);
+        else
+            (void)qihse_table_delete(table, uwp_dml_pred, &scan);
     }
     reply = uwp_dml_replyf("OK stmt_type=%s rows=%zu\n", stmt, scan.matched);
 
@@ -1474,6 +1548,16 @@ done:
     free(set_vals);
     free(cond_cols);
     return reply;
+}
+
+char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast,
+                                qihse_user_t* user) {
+    qihse_table_store_t* store = qihse_uwp_sql_table_store();
+    qihse_table_t* table = (store && ast && ast->table_name)
+                               ? qihse_table_store_find_table(store,
+                                                              ast->table_name)
+                               : NULL;
+    return uwp_sql_execute_dml_on_table(ast, user, table, NULL);
 }
 
 /* -------------------------------------------------------------------------
@@ -1944,12 +2028,14 @@ static uwp_sts_result_t uwp_sql_execute(qihse_uwp_context_t* ctx,
     int rc = 0;
     switch (ast->stmt_type) {
         case QIHSE_SQL_CREATE:
+            if (current_txn && *current_txn) return UWP_STS_ERR_FAILED;
             if (!ctx->schema) return UWP_STS_ERR_NO_CTX;
             rc = ast->index_def
                      ? qihse_schema_create_index((qihse_schema_registry_t*)ctx->schema, ast)
                      : qihse_schema_create_table((qihse_schema_registry_t*)ctx->schema, ast);
             break;
         case QIHSE_SQL_DROP:
+            if (current_txn && *current_txn) return UWP_STS_ERR_FAILED;
             if (!ctx->schema) return UWP_STS_ERR_NO_CTX;
             rc = ast->drop_is_index
                      ? qihse_schema_drop_index((qihse_schema_registry_t*)ctx->schema,
@@ -1958,9 +2044,16 @@ static uwp_sts_result_t uwp_sql_execute(qihse_uwp_context_t* ctx,
                                                ast->drop_name);
             break;
         case QIHSE_SQL_ALTER:
+            if (current_txn && *current_txn) return UWP_STS_ERR_FAILED;
             if (!ctx->schema) return UWP_STS_ERR_NO_CTX;
             rc = qihse_schema_alter_table((qihse_schema_registry_t*)ctx->schema, ast);
             break;
+        case QIHSE_SQL_SAVEPOINT:
+        case QIHSE_SQL_RELEASE:
+            /* Row-store resources do not yet expose reversible savepoint
+             * snapshots.  Refuse SQL savepoints rather than acknowledge a
+             * rollback boundary that cannot restore row data. */
+            return UWP_STS_ERR_FAILED;
         case QIHSE_SQL_BEGIN: {
             uint8_t isolation = (uint8_t)uwp_sql_isolation(sql);
             return uwp_dispatch_txn(ctx, 0x01, &isolation, 1, current_txn, user, -1,
@@ -2269,8 +2362,35 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                     uwp_text_appendf(&response,
                         "OK stmt_type=INSERT (no row store wired)\n");
                 } else {
-                    int rows = uwp_execute_insert(ctx, ast);
-                    if (rows >= 0) {
+                    qihse_table_txn_t* table_txn = NULL;
+                    if (current_txn && *current_txn) {
+                        qihse_table_t* table = uwp_sql_row_table(
+                            (qihse_schema_registry_t*)ctx->schema,
+                            ast->table_name);
+                        table_txn = uwp_sql_txn_table(*current_txn, table,
+                                                      ast->table_name);
+                        if (!table_txn ||
+                            qihse_txn_record_write(*current_txn, 2,
+                                                   ast->table_name,
+                                                   strlen(ast->table_name)) != 0) {
+                            result = UWP_STS_ERR_FAILED;
+                        }
+                    }
+                    int rows = result == UWP_STS_OK
+                                   ? uwp_execute_insert(ctx, ast, table_txn)
+                                   : -2;
+                    if (table_txn && rows != (int)ast->num_insert_rows) {
+                        qihse_txn_t* failing = *current_txn;
+                        int rollback_rc = qihse_txn_rollback(
+                            (qihse_txn_manager_t*)ctx->txn_manager, failing);
+                        if (rollback_rc == 0 || failing->state != QIHSE_TXN_ACTIVE)
+                            *current_txn = NULL;
+                        result = UWP_STS_ERR_FAILED;
+                    }
+                    if (result != UWP_STS_OK) {
+                        /* The transaction was aborted above; the generic
+                         * dispatcher error is emitted after AST cleanup. */
+                    } else if (rows >= 0) {
                         uwp_text_appendf(&response,
                             "OK stmt_type=INSERT rows=%d\n", rows);
                     } else if (rows == -1) {
@@ -2289,8 +2409,31 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                  * raw SQL text is never re-parsed for execution.  The reply
                  * carries the number of rows actually changed, or states that
                  * the statement was refused and nothing changed. --- */
-                char* dml_reply = qihse_uwp_sql_execute_dml(ast, user);
+                qihse_table_store_t* store = qihse_uwp_sql_table_store();
+                qihse_table_t* table = store
+                    ? qihse_table_store_find_table(store, ast->table_name)
+                    : NULL;
+                qihse_table_txn_t* table_txn = NULL;
+                if (current_txn && *current_txn) {
+                    table_txn = uwp_sql_txn_table(*current_txn, table,
+                                                  ast->table_name);
+                    if (!table_txn ||
+                        qihse_txn_record_write(*current_txn, 2,
+                                               ast->table_name,
+                                               strlen(ast->table_name)) != 0)
+                        result = UWP_STS_ERR_FAILED;
+                }
+                char* dml_reply = result == UWP_STS_OK
+                    ? uwp_sql_execute_dml_on_table(ast, user, table, table_txn)
+                    : NULL;
                 if (!dml_reply) {
+                    if (table_txn && current_txn && *current_txn) {
+                        qihse_txn_t* failing = *current_txn;
+                        int rollback_rc = qihse_txn_rollback(
+                            (qihse_txn_manager_t*)ctx->txn_manager, failing);
+                        if (rollback_rc == 0 || failing->state != QIHSE_TXN_ACTIVE)
+                            *current_txn = NULL;
+                    }
                     result = UWP_STS_ERR_FAILED;
                 } else {
                     (void)uwp_text_appendf(&response, "%s", dml_reply);
@@ -2324,7 +2467,7 @@ uwp_sts_result_t uwp_dispatch_txn(qihse_uwp_context_t* ctx,
                                   qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
                                   qihse_uwp_write_fn write_fn, void* write_ctx) {
     (void)client_fd;
-    if (!user) {
+    if (!user || !qihse_auth_user_is_active(user)) {
         uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
@@ -2360,10 +2503,15 @@ uwp_sts_result_t uwp_dispatch_txn(qihse_uwp_context_t* ctx,
                 uwp_reply_cb(write_fn, write_ctx, "ERR\n");
                 return UWP_STS_ERR_FAILED;
             }
+            qihse_txn_t* finishing = *current_txn;
             rc = command_opcode == 0x02
-                     ? qihse_txn_commit(manager, (*current_txn))
-                     : qihse_txn_rollback(manager, (*current_txn));
-            (*current_txn) = NULL;
+                     ? qihse_txn_commit(manager, finishing)
+                     : qihse_txn_rollback(manager, finishing);
+            /* Allocation failure can leave a rollbackable transaction active;
+             * retain the handle in that case.  Successful completion and
+             * conflict aborts clear it. */
+            if (rc == 0 || finishing->state != QIHSE_TXN_ACTIVE)
+                (*current_txn) = NULL;
             uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
             return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
         case 0x04:
@@ -2417,7 +2565,7 @@ uwp_sts_result_t uwp_dispatch_schema(qihse_uwp_context_t* ctx,
                                      qihse_user_t* user, int client_fd,
                                      qihse_uwp_write_fn write_fn, void* write_ctx) {
     (void)client_fd;
-    if (!user) {
+    if (!user || !qihse_auth_user_is_active(user)) {
         uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
         return UWP_STS_ERR_PERM;
     }
@@ -2436,6 +2584,17 @@ uwp_sts_result_t uwp_dispatch_schema(qihse_uwp_context_t* ctx,
         return UWP_STS_ERR_ARGS;
     }
     qihse_schema_registry_t* schema = (qihse_schema_registry_t*)ctx->schema;
+    bool is_operator = qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+    if (command_opcode != 0x04 && !is_operator) {
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
+        return UWP_STS_ERR_PERM;
+    }
+    if (command_opcode == 0x04 && !is_operator &&
+        !qihse_auth_can_access_object(user, 0, (uint64_t)uwp_fnv1a(input),
+                                      QIHSE_ACL_READ)) {
+        uwp_reply_cb(write_fn, write_ctx, "ERR_PERM\n");
+        return UWP_STS_ERR_PERM;
+    }
     if (command_opcode == 0x02 || command_opcode == 0x06) {
         int rc = command_opcode == 0x02 ? qihse_schema_drop_table(schema, input)
                                         : qihse_schema_drop_index(schema, input);

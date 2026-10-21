@@ -337,49 +337,51 @@ int qihse_table_insert(qihse_table_t* table,
     return (int)slot;
 }
 
-bool qihse_table_update(qihse_table_t* table,
-                        int (*pred)(const qihse_col_value_t*, size_t, void*),
-                        void* pred_ctx,
-                        const int* update_cols,
-                        const qihse_col_value_t* new_values,
-                        size_t num_updates) {
+static bool ts_assign_value(qihse_col_value_t* cell,
+                            const qihse_col_value_t* value);
+
+int qihse_table_update(qihse_table_t* table,
+                       int (*pred)(const qihse_col_value_t*, size_t, void*),
+                       void* pred_ctx,
+                       const int* update_cols,
+                       const qihse_col_value_t* new_values,
+                       size_t num_updates) {
     if (!table || !pred || !update_cols || !new_values || num_updates == 0)
-        return false;
+        return -1;
 
     pthread_rwlock_wrlock(&table->lock);
+    qihse_col_value_t** candidate =
+        ts_dup_rows(table->rows, table->num_rows, table->num_cols);
+    if (table->num_rows > 0 && !candidate) {
+        pthread_rwlock_unlock(&table->lock);
+        return -1;
+    }
     bool any = false;
     for (size_t i = 0; i < table->num_rows; i++) {
-        if (!table->rows[i]) continue;  /* tombstone */
-        if (pred(table->rows[i], table->num_cols, pred_ctx)) {
+        if (!candidate[i]) continue;  /* tombstone */
+        if (pred(candidate[i], table->num_cols, pred_ctx)) {
             for (size_t u = 0; u < num_updates; u++) {
                 int col = update_cols[u];
                 if (col < 0 || (size_t)col >= table->num_cols) continue;
-                qihse_col_value_t* cell = &table->rows[i][col];
-                /* Free old string value. */
-                ts_free_col_value(cell);
-                cell->type = new_values[u].type;
-                switch (new_values[u].type) {
-                    case QIHSE_TS_INT32:
-                        cell->v.i32 = new_values[u].v.i32;
-                        break;
-                    case QIHSE_TS_INT64:
-                        cell->v.i64 = new_values[u].v.i64;
-                        break;
-                    case QIHSE_TS_FLOAT:
-                        cell->v.f32 = new_values[u].v.f32;
-                        break;
-                    case QIHSE_TS_STRING:
-                        cell->v.str = new_values[u].v.str
-                            ? strdup(new_values[u].v.str) : NULL;
-                        break;
+                if (!ts_assign_value(&candidate[i][col], &new_values[u])) {
+                    ts_free_rows(candidate, table->num_rows, table->num_cols);
+                    pthread_rwlock_unlock(&table->lock);
+                    return -1;
                 }
             }
             any = true;
         }
     }
-    if (any) table->generation++;
+    if (any) {
+        ts_free_rows(table->rows, table->num_rows, table->num_cols);
+        table->rows = candidate;
+        table->cap_rows = table->num_rows;
+        table->generation++;
+    } else {
+        ts_free_rows(candidate, table->num_rows, table->num_cols);
+    }
     pthread_rwlock_unlock(&table->lock);
-    return any;
+    return any ? 1 : 0;
 }
 
 bool qihse_table_delete(qihse_table_t* table,
@@ -524,19 +526,19 @@ static bool ts_assign_value(qihse_col_value_t* cell,
     return true;
 }
 
-bool qihse_table_txn_update(qihse_table_txn_t* txn,
-                            int (*pred)(const qihse_col_value_t*, size_t,
-                                        void*),
-                            void* pred_ctx,
-                            const int* update_cols,
-                            const qihse_col_value_t* new_values,
-                            size_t num_updates) {
+int qihse_table_txn_update(qihse_table_txn_t* txn,
+                           int (*pred)(const qihse_col_value_t*, size_t,
+                                       void*),
+                           void* pred_ctx,
+                           const int* update_cols,
+                           const qihse_col_value_t* new_values,
+                           size_t num_updates) {
     if (!txn || !pred || !update_cols || !new_values || num_updates == 0)
-        return false;
+        return -1;
     qihse_table_t* shadow = &txn->shadow;
     qihse_col_value_t** candidate =
         ts_dup_rows(shadow->rows, shadow->num_rows, shadow->num_cols);
-    if (shadow->num_rows > 0 && !candidate) return false;
+    if (shadow->num_rows > 0 && !candidate) return -1;
 
     bool any = false;
     for (size_t i = 0; i < shadow->num_rows; i++) {
@@ -547,19 +549,19 @@ bool qihse_table_txn_update(qihse_table_txn_t* txn,
             if (col < 0 || (size_t)col >= shadow->num_cols) continue;
             if (!ts_assign_value(&candidate[i][col], &new_values[u])) {
                 ts_free_rows(candidate, shadow->num_rows, shadow->num_cols);
-                return false;
+                return -1;
             }
         }
         any = true;
     }
     if (!any) {
         ts_free_rows(candidate, shadow->num_rows, shadow->num_cols);
-        return false;
+        return 0;
     }
     ts_free_rows(shadow->rows, shadow->num_rows, shadow->num_cols);
     shadow->rows = candidate;
     shadow->cap_rows = shadow->num_rows;
-    return true;
+    return 1;
 }
 
 bool qihse_table_txn_delete(qihse_table_txn_t* txn,

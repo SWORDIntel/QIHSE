@@ -27,11 +27,11 @@ typedef enum {
  * The mutable table store (src/tractable/qihse_table_store.c) is the only
  * in-tree store with in-place update and delete primitives, so parsed UPDATE
  * and DELETE statements execute against it.  The store is process-wide and
- * lazily created, matching the prepared-statement cache in the executor: the
- * UWP SQL path has no per-connection engine state yet, and ctx->sql_engine is
- * an opaque caller-owned pointer the executor never dereferences.  Tables
- * must be created in it with qihse_table_store_create_table() before DML can
- * target them.
+ * lazily created, matching the prepared-statement cache in the executor.
+ * Explicit UWP transactions attach a private optimistic shadow for one table;
+ * COMMIT publishes it through a generation fence and ROLLBACK discards it.
+ * ctx->sql_engine remains an opaque caller-owned pointer the executor never
+ * dereferences. Tables must exist in the row store before UPDATE/DELETE.
  * ------------------------------------------------------------------------- */
 qihse_table_store_t* qihse_uwp_sql_table_store(void);
 

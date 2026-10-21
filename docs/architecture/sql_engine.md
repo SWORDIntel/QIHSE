@@ -42,7 +42,9 @@
 >    and related schema-changing statements require an active Operator until a
 >    dedicated DDL capability exists. Authorization denial returns
 >    `UWP_STS_ERR_PERM` and `ERR_PERM`; it is not reported as a successful
->    statement-level refusal.
+>    statement-level refusal. The direct UWP SCHEMA adapter applies the same
+>    active-Operator rule to mutations and requires READ on the named table
+>    before serializing its metadata.
 >
 > Also unverified here: the pgwire prepared-statement cache (see §6). No test in
 > the tree exercises it.
@@ -236,12 +238,21 @@ the raw SQL text is never re-parsed for execution.
   quoted, so a value that names a column (`SET name = other_col`) refuses
   rather than being stored as text; the refusal conservatively also catches a
   quoted literal that happens to equal a column name.
-- **Atomicity**: all validation happens before the store call, and the store
-  then holds the table's write lock for the whole scan, so a statement cannot
-  interleave with another writer. Statements are **not** integrated with the
-  transaction manager: ROLLBACK does not undo an applied UPDATE/DELETE, and
-  there is no cross-table atomicity. A second identical DELETE reports
-  `rows=0` (idempotent).
+- **Atomicity**: autocommit validation finishes before the store call, whose
+  write lock covers the statement. Inside a UWP SQL transaction, the first DML
+  statement captures a private optimistic table shadow. INSERT, UPDATE and
+  DELETE change that shadow; COMMIT atomically swaps it into the live table if
+  its generation is unchanged, while ROLLBACK or disconnect discards it. A
+  concurrent live mutation makes COMMIT abort without overwriting that change.
+  This slice deliberately supports one table per transaction. SQL savepoint
+  commands and transactional DDL fail closed until their storage resources can
+  snapshot and restore those operations. Cross-table atomicity and SQL WAL
+  recovery remain open. A second identical DELETE reports `rows=0`
+  (idempotent).
+- **Failure atomicity**: live and transaction-shadow UPDATE clone the current
+  rows before applying assignments. Invalid values or allocation failure return
+  an execution error and discard the candidate, so an old string cannot be
+  freed and replaced by NULL under memory pressure.
 - **Store scope**: the row store is process-wide and lazily created
   (`qihse_uwp_sql_table_store()`), matching the prepared-statement cache; the
   UWP SQL path has no per-connection engine state yet, and `ctx->sql_engine`
@@ -262,7 +273,13 @@ the raw SQL text is never re-parsed for execution.
 DDL is restricted to an active Operator. This includes CREATE, DROP, ALTER,
 view and sequence DDL, TRUNCATE, REINDEX and CLUSTER. QIHSE does not currently
 expose a narrower schema-administration capability, so object WRITE grants do
-not confer DDL authority.
+not confer DDL authority. The UWP SCHEMA adapter enforces the same rule and
+requires an active principal with table READ permission before returning table
+or index metadata. DDL inside an open SQL transaction is refused because the
+schema registry does not yet provide a rollbackable transaction resource;
+direct SCHEMA mutations on that connection are refused for the same reason.
+AUTH also refuses identity replacement while a transaction handle is active,
+so another principal cannot inherit and commit staged changes.
 
 SELECT is deliberately outside this mutation gate. The current plan executor
 does not materialize table-store rows, and the table store does not carry row
@@ -417,10 +434,14 @@ and DELETE execution against the mutable table store:
   nothing changes; a grant on the table's FNV-1a resource id allows the
   statement.
 
-Not covered: the pgwire prepared-statement cache, window functions, and
-`INSERT ... SELECT` execution. INSERT is still wired to the column store, not
-the row store, so SQL INSERT does not yet populate the store that UPDATE and
-DELETE execute against; the row store must be populated through
-`qihse_uwp_sql_table_store()`. UPDATE/DELETE are also not integrated with the
-transaction manager, so ROLLBACK does not undo them.
+The suite also covers INSERT into the same mutable row store, active-principal
+revalidation, WRITE-gated DML, Operator-only DDL, private transactional changes,
+COMMIT, ROLLBACK and generation-conflict abort. Transactional INSERT defers the
+column-store analytic projection; the authoritative row commit succeeds
+independently of that asynchronous projection boundary.
+
+Not covered: real row-producing SELECT, pgwire transactions and prepared
+statements, savepoint data restoration (SQL savepoints currently refuse),
+multi-table atomicity, SQL WAL recovery, window functions, and
+`INSERT ... SELECT` execution.
 

@@ -84,30 +84,45 @@ static qihse_txn_registry_entry_t* registry_find(
     return NULL;
 }
 
+static qihse_txn_registry_entry_t* registry_alloc(
+    qihse_txn_manager_t* mgr, uint64_t txn_id, qihse_txn_state_t state)
+{
+    if (!mgr->registry_buckets) return NULL;
+    qihse_txn_registry_entry_t* e =
+        qihse_arena_alloc(mgr->arena, sizeof(*e));
+    if (!e) return NULL;
+    e->txn_id = txn_id;
+    e->state  = state;
+    e->next = NULL;
+    return e;
+}
+
+static void registry_link(qihse_txn_manager_t* mgr,
+                          qihse_txn_registry_entry_t* e) {
+    size_t b = registry_hash(e->txn_id, mgr->registry_n_buckets);
+    e->next   = mgr->registry_buckets[b];
+    mgr->registry_buckets[b] = e;
+}
+
 static bool registry_insert(qihse_txn_manager_t* mgr,
                             uint64_t txn_id, qihse_txn_state_t state)
 {
-    if (!mgr->registry_buckets) return false;
-    size_t b = registry_hash(txn_id, mgr->registry_n_buckets);
-    qihse_txn_registry_entry_t* e =
-        qihse_arena_alloc(mgr->arena, sizeof(*e));
+    qihse_txn_registry_entry_t* e = registry_alloc(mgr, txn_id, state);
     if (!e) return false;
-    e->txn_id = txn_id;
-    e->state  = state;
-    e->next   = mgr->registry_buckets[b];
-    mgr->registry_buckets[b] = e;
+    registry_link(mgr, e);
     return true;
 }
 
 /* ── Active list management ─────────────────────────────────────────────── */
 
-static void active_add(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
+static bool active_add(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     qihse_active_node_t* node = qihse_arena_alloc(mgr->arena, sizeof(*node));
-    if (!node) return;
+    if (!node) return false;
     node->txn  = txn;
     node->next = mgr->active_head;
     mgr->active_head = node;
     mgr->active_count++;
+    return true;
 }
 
 static void active_remove(qihse_txn_manager_t* mgr, uint64_t txn_id) {
@@ -211,6 +226,15 @@ static bool rw_keys_equal(const qihse_rw_entry_t* a,
            memcmp(a->key, b->key, a->key_len) == 0;
 }
 
+static void txn_resource_rollback(qihse_txn_t* txn) {
+    if (!txn || !txn->resource_ctx) return;
+    if (txn->resource_rollback)
+        txn->resource_rollback(txn->resource_ctx);
+    txn->resource_ctx = NULL;
+    txn->resource_commit = NULL;
+    txn->resource_rollback = NULL;
+}
+
 static int validate_occ_locked(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (txn->isolation != QIHSE_ISO_SERIALIZABLE) return 0;
     for (qihse_committed_summary_t* summary = mgr->committed_head;
@@ -267,6 +291,7 @@ void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr) {
     /* Free any remaining txn handles (rw_set) */
     qihse_active_node_t* node = mgr->active_head;
     while (node) {
+        txn_resource_rollback(node->txn);
         if (node->txn && node->txn->rw_set) {
             free(node->txn->rw_set);
             node->txn->rw_set = NULL;
@@ -305,6 +330,9 @@ qihse_txn_t* qihse_txn_begin(qihse_txn_manager_t* mgr,
     txn->rw_count   = 0;
     txn->rw_capacity = 0;
     txn->write_count = 0;
+    txn->resource_ctx = NULL;
+    txn->resource_commit = NULL;
+    txn->resource_rollback = NULL;
 
     /* Snapshot: for REPEATABLE READ and SERIALIZABLE, snapshot = current
      * next_txn_id - 1 (i.e. all txns that have started so far).
@@ -312,7 +340,11 @@ qihse_txn_t* qihse_txn_begin(qihse_txn_manager_t* mgr,
     txn->snapshot = txn->id - 1;  /* see all transactions that started before us */
     txn->serialization_snapshot = mgr->commit_seq;
 
-    active_add(mgr, txn);
+    if (!active_add(mgr, txn)) {
+        pthread_mutex_unlock(&mgr->lock);
+        free(txn);
+        return NULL;
+    }
     pthread_mutex_unlock(&mgr->lock);
 
     return txn;
@@ -322,9 +354,12 @@ qihse_txn_t* qihse_txn_begin(qihse_txn_manager_t* mgr,
 
 int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (!mgr || !txn) return -1;
-    if (txn->state != QIHSE_TXN_ACTIVE) return -1;
 
     pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_ACTIVE) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     /* SERIALIZABLE: validate against every commit after our BEGIN snapshot. */
     if (txn->isolation == QIHSE_ISO_SERIALIZABLE) {
@@ -333,6 +368,7 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
             txn->state = QIHSE_TXN_ABORTED;
             registry_insert(mgr, txn->id, QIHSE_TXN_ABORTED);
             active_remove(mgr, txn->id);
+            txn_resource_rollback(txn);
             prune_committed_history_locked(mgr);
             pthread_mutex_unlock(&mgr->lock);
             return -1;
@@ -343,6 +379,7 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
         txn->state = QIHSE_TXN_ABORTED;
         (void)registry_insert(mgr, txn->id, QIHSE_TXN_ABORTED);
         active_remove(mgr, txn->id);
+        txn_resource_rollback(txn);
         prune_committed_history_locked(mgr);
         pthread_mutex_unlock(&mgr->lock);
         return -1;
@@ -357,14 +394,33 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
             txn->state = QIHSE_TXN_ABORTED;
             (void)registry_insert(mgr, txn->id, QIHSE_TXN_ABORTED);
             active_remove(mgr, txn->id);
+            txn_resource_rollback(txn);
             prune_committed_history_locked(mgr);
             pthread_mutex_unlock(&mgr->lock);
             return -1;
         }
     }
 
-    if (!registry_insert(mgr, txn->id, QIHSE_TXN_COMMITTED)) {
+    qihse_txn_registry_entry_t* registry_entry =
+        registry_alloc(mgr, txn->id, QIHSE_TXN_COMMITTED);
+    if (!registry_entry) {
         committed_summary_free(summary);
+        txn->state = QIHSE_TXN_ABORTED;
+        active_remove(mgr, txn->id);
+        txn_resource_rollback(txn);
+        prune_committed_history_locked(mgr);
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+
+    if (txn->resource_ctx &&
+        (!txn->resource_commit || txn->resource_commit(txn->resource_ctx) != 0)) {
+        committed_summary_free(summary);
+        registry_entry->state = QIHSE_TXN_ABORTED;
+        registry_link(mgr, registry_entry);
+        txn->resource_ctx = NULL; /* commit callback consumes on both outcomes */
+        txn->resource_commit = NULL;
+        txn->resource_rollback = NULL;
         txn->state = QIHSE_TXN_ABORTED;
         active_remove(mgr, txn->id);
         prune_committed_history_locked(mgr);
@@ -372,6 +428,10 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
         return -1;
     }
 
+    registry_link(mgr, registry_entry);
+    txn->resource_ctx = NULL;
+    txn->resource_commit = NULL;
+    txn->resource_rollback = NULL;
     txn->state = QIHSE_TXN_COMMITTED;
     mgr->commit_seq = commit_seq;
     committed_summary_append_locked(mgr, summary);
@@ -386,11 +446,17 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
 
 int qihse_txn_rollback(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (!mgr || !txn) return -1;
-    if (txn->state != QIHSE_TXN_ACTIVE) return -1;
 
     pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_ACTIVE) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+    qihse_txn_registry_entry_t* registry_entry =
+        registry_alloc(mgr, txn->id, QIHSE_TXN_ABORTED);
+    txn_resource_rollback(txn);
     txn->state = QIHSE_TXN_ABORTED;
-    registry_insert(mgr, txn->id, QIHSE_TXN_ABORTED);
+    if (registry_entry) registry_link(mgr, registry_entry);
     active_remove(mgr, txn->id);
     prune_committed_history_locked(mgr);
     pthread_mutex_unlock(&mgr->lock);
@@ -403,12 +469,24 @@ int qihse_txn_rollback(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
 int qihse_txn_savepoint(qihse_txn_manager_t* mgr, qihse_txn_t* txn,
                         const char* name)
 {
-    (void)mgr;
-    if (!txn || !name) return -1;
-    if (txn->state != QIHSE_TXN_ACTIVE) return -1;
+    if (!mgr || !txn || !name) return -1;
+    pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_ACTIVE) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+    /* A local resource needs its own snapshot callback before savepoints can
+     * safely include it.  Refuse instead of recording a partial savepoint. */
+    if (txn->resource_ctx) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
     /* savepoint_count is always in [0, QIHSE_TXN_MAX_SAVEPOINTS]; compare as
      * int so the signed counter is not promoted to unsigned. */
-    if (txn->savepoint_count >= (int)QIHSE_TXN_MAX_SAVEPOINTS) return -1;
+    if (txn->savepoint_count >= (int)QIHSE_TXN_MAX_SAVEPOINTS) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     qihse_savepoint_t* sp = &txn->savepoints[txn->savepoint_count];
     strncpy(sp->name, name, sizeof(sp->name) - 1);
@@ -416,15 +494,19 @@ int qihse_txn_savepoint(qihse_txn_manager_t* mgr, qihse_txn_t* txn,
     sp->lsn = txn->start_lsn;
     sp->write_count = txn->write_count;
     txn->savepoint_count++;
+    pthread_mutex_unlock(&mgr->lock);
     return 0;
 }
 
 int qihse_txn_rollback_to_savepoint(qihse_txn_manager_t* mgr,
                                     qihse_txn_t* txn, const char* name)
 {
-    (void)mgr;
-    if (!txn || !name) return -1;
-    if (txn->state != QIHSE_TXN_ACTIVE) return -1;
+    if (!mgr || !txn || !name) return -1;
+    pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_ACTIVE || txn->resource_ctx) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     /* Find the savepoint (search from top of stack) */
     int found = -1;
@@ -434,7 +516,10 @@ int qihse_txn_rollback_to_savepoint(qihse_txn_manager_t* mgr,
             break;
         }
     }
-    if (found < 0) return -1;
+    if (found < 0) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     /* Truncate the savepoint stack to the found savepoint.
      * The savepoint itself remains (like SQL ROLLBACK TO SAVEPOINT). */
@@ -465,6 +550,7 @@ int qihse_txn_rollback_to_savepoint(qihse_txn_manager_t* mgr,
         txn->rw_count = new_count;
     }
 
+    pthread_mutex_unlock(&mgr->lock);
     return 0;
 }
 
@@ -543,6 +629,18 @@ int qihse_txn_validate_occ(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     return rc;
 }
 
+int qihse_txn_attach_resource(qihse_txn_t* txn, void* resource_ctx,
+                              qihse_txn_resource_commit_fn commit_fn,
+                              qihse_txn_resource_rollback_fn rollback_fn) {
+    if (!txn || txn->state != QIHSE_TXN_ACTIVE || !resource_ctx ||
+        !commit_fn || !rollback_fn || txn->resource_ctx)
+        return -1;
+    txn->resource_ctx = resource_ctx;
+    txn->resource_commit = commit_fn;
+    txn->resource_rollback = rollback_fn;
+    return 0;
+}
+
 /* ── 2PC interface ──────────────────────────────────────────────────────── */
 
 int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
@@ -562,9 +660,19 @@ int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
 
 int qihse_txn_prepare(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (!mgr || !txn) return -1;
-    if (txn->state != QIHSE_TXN_ACTIVE) return -1;
 
     pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_ACTIVE) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+    /* Local resources have an atomic one-phase publish callback, not a durable
+     * prepare record.  Mixing them with 2PC would allow COMMIT PREPARED to
+     * report success without publishing the resource. */
+    if (txn->resource_ctx) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     /* Call prepare() on all participants */
     for (int i = 0; i < mgr->participant_count; i++) {
@@ -590,9 +698,12 @@ int qihse_txn_prepare(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
 
 int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (!mgr || !txn) return -1;
-    if (txn->state != QIHSE_TXN_PREPARED) return -1;
 
     pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_PREPARED) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     if (validate_occ_locked(mgr, txn) != 0 || mgr->commit_seq == UINT64_MAX) {
         for (int i = 0; i < mgr->participant_count; i++) {
@@ -657,9 +768,12 @@ int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
 
 int qihse_txn_abort_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     if (!mgr || !txn) return -1;
-    if (txn->state != QIHSE_TXN_PREPARED) return -1;
 
     pthread_mutex_lock(&mgr->lock);
+    if (txn->state != QIHSE_TXN_PREPARED) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
 
     /* Call abort() on all participants */
     for (int i = 0; i < mgr->participant_count; i++) {

@@ -97,14 +97,15 @@ int qihse_table_insert(qihse_table_t* table,
  *   update_cols  — array of column indices to update.
  *   new_values   — new values for the listed columns (strings deep-copied).
  *   num_updates  — number of entries in update_cols / new_values.
- * Returns true if at least one row was updated, false otherwise. */
-bool qihse_table_update(qihse_table_t* table,
-                        int (*pred)(const qihse_col_value_t* values,
-                                    size_t num_cols, void* ctx),
-                        void* pred_ctx,
-                        const int* update_cols,
-                        const qihse_col_value_t* new_values,
-                        size_t num_updates);
+ * Returns 1 when rows changed, 0 when none matched, and -1 on invalid input or
+ * allocation failure.  On -1 the live table is unchanged. */
+int qihse_table_update(qihse_table_t* table,
+                       int (*pred)(const qihse_col_value_t* values,
+                                   size_t num_cols, void* ctx),
+                       void* pred_ctx,
+                       const int* update_cols,
+                       const qihse_col_value_t* new_values,
+                       size_t num_updates);
 
 /* Delete rows matching the predicate.  Matching rows are tombstoned and
  * the table is compacted periodically.
@@ -140,13 +141,15 @@ qihse_table_txn_t* qihse_table_txn_begin(qihse_table_t* table);
 int qihse_table_txn_insert(qihse_table_txn_t* txn,
                            const qihse_col_value_t* values,
                            size_t num_values);
-bool qihse_table_txn_update(qihse_table_txn_t* txn,
-                            int (*pred)(const qihse_col_value_t* values,
-                                        size_t num_cols, void* ctx),
-                            void* pred_ctx,
-                            const int* update_cols,
-                            const qihse_col_value_t* new_values,
-                            size_t num_updates);
+/* Returns 1 when rows changed, 0 when none matched, and -1 on invalid input or
+ * allocation failure.  On -1 the transaction-local snapshot is unchanged. */
+int qihse_table_txn_update(qihse_table_txn_t* txn,
+                           int (*pred)(const qihse_col_value_t* values,
+                                       size_t num_cols, void* ctx),
+                           void* pred_ctx,
+                           const int* update_cols,
+                           const qihse_col_value_t* new_values,
+                           size_t num_updates);
 bool qihse_table_txn_delete(qihse_table_txn_t* txn,
                             int (*pred)(const qihse_col_value_t* values,
                                         size_t num_cols, void* ctx),

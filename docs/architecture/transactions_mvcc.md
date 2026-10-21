@@ -6,10 +6,12 @@
 > `tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`). Two limits are
 > stated plainly rather than glossed over:
 >
-> 1. **The SQL row store and public SQL transaction commands are not yet wired
->    through this transaction manager.** The guarantees below describe callers
->    that record every read and write through this API; they do not make direct
->    row-store mutations transactional.
+> 1. **The UWP SQL row-store path now uses this manager for one-table DML
+>    transactions.** INSERT, UPDATE and DELETE run against a private optimistic
+>    table shadow; COMMIT publishes it behind a generation fence and ROLLBACK
+>    discards it. Arbitrary cross-table transactions, SQL SELECT visibility,
+>    savepoint data restoration, WAL durability and pgwire integration remain
+>    outside this bounded slice.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >
@@ -31,8 +33,10 @@ KV, document, columnar, vector and event engines. The transaction manager now
 retains committed point-key write sets for every active SERIALIZABLE snapshot,
 so an already-committed concurrent transaction cannot disappear from OCC
 validation. A caller receives that guarantee only when it records all reads and
-writes. Predicate/range conflicts, public SQL integration and durable 2PC
-coordinator recovery remain outside this component's current contract.
+writes. Predicate/range conflicts, durable 2PC coordinator recovery and the
+SQL limits stated above remain outside this component's current contract.
+Terminal state transitions recheck state under the manager mutex, so concurrent
+commit/commit and commit/rollback calls on one handle have exactly one winner.
 
 ## 2. Transaction Manager
 
@@ -154,6 +158,13 @@ Each engine implements the participant interface:
 
 A participant whose `prepare()` fails aborts the whole transaction; the
 participant callback sequencing is covered by `tests/test_txn.c`.
+
+The manager also accepts one atomic local resource for ordinary one-phase
+commit. Its callbacks run while the manager lock is held and must not call back
+into transaction-manager APIs. Because this resource has no durable prepare or
+savepoint callback, `PREPARE`, savepoint creation and rollback-to-savepoint are
+refused while it is attached. Full rollback always discards it, including when
+the transaction-status registry cannot allocate an advisory aborted entry.
 
 ## 3. MVCC Version Store
 
@@ -359,16 +370,24 @@ Checkpoint procedure:
    committed delete hides the row (including when an aborted writer preceded
    it); deleting a missing key is an error rather than a silent success; vacuum
    reclaims dead versions.
-3. **SAVEPOINT and partial rollback**: savepoint stack and write-set trim.
+3. **SAVEPOINT and partial rollback**: savepoint stack and write-set trim for
+   recorded keys; transactions with a local storage resource refuse savepoints
+   until that resource supports data snapshots.
 4. **WAL append and replay**: LSN ordering, payload survival, `start_lsn`
    filtering, and refusal to replay a record whose CRC does not match.
 5. **Crash recovery**: a committed transaction's insert is redone and visible; a
    transaction that never committed is registered aborted and its data stays
    invisible; transaction ids stay monotonic; checkpointing runs.
-6. **SERIALIZABLE conflict detection**: read-write and write-write conflicts
-   against active transactions abort; disjoint keys commit.
-7. **Two-phase commit**: prepare / commit_prepared / abort_prepared callback
-   sequencing, and a participant whose prepare fails aborting the transaction.
+6. **SERIALIZABLE conflict detection**: retained committed write summaries
+   detect read-write and write-write conflicts after the conflicting writer has
+   left the active list; disjoint commits pass, long-lived snapshots retain all
+   required summaries, and pruning waits for the oldest active SERIALIZABLE
+   snapshot.
+7. **Two-phase commit and local resource boundaries**: prepared participant
+   callback sequencing, failing prepare abort, and refusal to mix a one-phase
+   local resource with PREPARE or savepoints while preserving full rollback.
+8. **Concurrent terminal calls**: repeated simultaneous commit/commit and
+   commit/rollback attempts allow one transition and record one final state.
 
 `tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`) covers delete
 semantics in both directions: a committed DELETE hides the row for readers at or
@@ -384,5 +403,5 @@ The `mvcc-committed-delete` gold workload
 (`tests/gold/workloads/gold_mvcc_committed_delete.c`) asserts the same rule
 independently.
 
-Not covered: the committed-transaction OCC case (not implemented, see the status
-note) and WAL segment rotation under load.
+Not covered: predicate/range serialization, SQL WAL recovery, and WAL segment
+rotation under load.

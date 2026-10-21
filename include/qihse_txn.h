@@ -51,6 +51,15 @@ typedef struct qihse_rw_entry_s {
     bool     is_write;
 } qihse_rw_entry_t;
 
+/* Optional transaction-local resource.  The commit callback publishes the
+ * resource atomically and consumes resource_ctx on either success or failure;
+ * rollback consumes unpublished state.  Callbacks run under the manager lock
+ * and must not call transaction-manager APIs.  Savepoints and PREPARE are
+ * refused while a resource is attached.  A transaction may attach one
+ * resource; a coordinator for multiple resources belongs in durable 2PC. */
+typedef int  (*qihse_txn_resource_commit_fn)(void* resource_ctx);
+typedef void (*qihse_txn_resource_rollback_fn)(void* resource_ctx);
+
 /* ── 2PC participant interface ──────────────────────────────────────────── */
 
 typedef struct qihse_txn_participant_s {
@@ -78,6 +87,9 @@ typedef struct qihse_txn_s {
     int                     rw_count;
     int                     rw_capacity;
     int                     write_count;
+    void*                   resource_ctx;
+    qihse_txn_resource_commit_fn resource_commit;
+    qihse_txn_resource_rollback_fn resource_rollback;
 } qihse_txn_t;
 
 /* ── Transaction manager (opaque) ───────────────────────────────────────── */
@@ -133,6 +145,13 @@ int qihse_txn_record_write(qihse_txn_t* txn, uint8_t engine_id,
  * against all concurrent committed transactions.
  * Returns 0 if validation passes, -1 on conflict. */
 int qihse_txn_validate_occ(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+
+/* Attach one transaction-local resource.  Commit publishes it after OCC
+ * validation and before the transaction becomes visible as committed;
+ * rollback and failed commit discard it. */
+int qihse_txn_attach_resource(qihse_txn_t* txn, void* resource_ctx,
+                              qihse_txn_resource_commit_fn commit_fn,
+                              qihse_txn_resource_rollback_fn rollback_fn);
 
 /* ── 2PC interface ──────────────────────────────────────────────────────── */
 

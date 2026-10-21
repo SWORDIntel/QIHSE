@@ -149,6 +149,22 @@ static void test_conflict_preserves_live_mutation(qihse_table_t* table) {
     assert_live_row(table, 6, "live", 60);
 }
 
+static void test_failed_update_is_atomic(qihse_table_t* table) {
+    int id = 1;
+    int name_col = 1;
+    qihse_col_value_t invalid = { .type = (qihse_ts_type_t)255 };
+    assert(qihse_table_update(table, id_matches, &id, &name_col, &invalid, 1) ==
+           -1);
+    assert_live_row(table, 1, "alicia", 10);
+
+    qihse_table_txn_t* txn = qihse_table_txn_begin(table);
+    assert(txn != NULL);
+    assert(qihse_table_txn_update(txn, id_matches, &id, &name_col, &invalid,
+                                  1) == -1);
+    assert_txn_row(txn, 1, "alicia", 10);
+    qihse_table_txn_rollback(txn);
+}
+
 int main(void) {
     qihse_col_def_t defs[3] = {
         { .name = "id", .type = QIHSE_TS_INT32 },
@@ -166,6 +182,7 @@ int main(void) {
     test_rollback_and_read_your_writes(table);
     test_commit_and_string_copy(table);
     test_conflict_preserves_live_mutation(table);
+    test_failed_update_is_atomic(table);
 
     qihse_table_store_destroy(store);
     puts("PASS table store optimistic transaction commit, rollback, isolation, conflict, and string ownership");

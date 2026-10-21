@@ -20,10 +20,8 @@
  * All on-disk state lives under a mkdtemp() directory in build/ (relative),
  * per the repository path policy.
  *
- * Not covered here, and not claimed by the document: the OCC validator only
- * compares against transactions that are still *active* at commit time, so a
- * write by a transaction that already committed is not detected (see
- * qihse_txn_validate_occ in src/tractable/qihse_txn.c).
+ * Committed-write retention tests below cover the case where a conflicting
+ * writer commits while an older SERIALIZABLE transaction remains active.
  */
 #include "qihse_txn.h"
 #include "qihse_mvcc.h"
@@ -32,6 +30,7 @@
 
 #include <assert.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -592,6 +591,77 @@ static int part_abort(void* ctx, uint64_t txn_id) {
     return 0;
 }
 
+typedef struct {
+    int commits;
+    int rollbacks;
+} local_resource_state_t;
+
+static int local_resource_commit(void* ctx) {
+    ((local_resource_state_t*)ctx)->commits++;
+    return 0;
+}
+
+static void local_resource_rollback(void* ctx) {
+    ((local_resource_state_t*)ctx)->rollbacks++;
+}
+
+typedef struct {
+    qihse_txn_manager_t* mgr;
+    qihse_txn_t* txn;
+    pthread_barrier_t* barrier;
+    bool rollback;
+    int result;
+} terminal_race_arg_t;
+
+static void* terminal_race_worker(void* opaque) {
+    terminal_race_arg_t* arg = (terminal_race_arg_t*)opaque;
+    (void)pthread_barrier_wait(arg->barrier);
+    arg->result = arg->rollback
+                      ? qihse_txn_rollback(arg->mgr, arg->txn)
+                      : qihse_txn_commit(arg->mgr, arg->txn);
+    return NULL;
+}
+
+static void test_terminal_transition_races(void) {
+    qihse_txn_manager_t* mgr = qihse_txn_manager_create();
+    assert(mgr);
+
+    for (int round = 0; round < 64; round++) {
+        local_resource_state_t local = {0};
+        qihse_txn_t* txn = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+        assert(txn);
+        assert(qihse_txn_attach_resource(txn, &local, local_resource_commit,
+                                         local_resource_rollback) == 0);
+
+        pthread_barrier_t barrier;
+        assert(pthread_barrier_init(&barrier, NULL, 3) == 0);
+        terminal_race_arg_t a = {mgr, txn, &barrier, false, -2};
+        terminal_race_arg_t b = {mgr, txn, &barrier, (round & 1) != 0, -2};
+        pthread_t ta, tb;
+        assert(pthread_create(&ta, NULL, terminal_race_worker, &a) == 0);
+        assert(pthread_create(&tb, NULL, terminal_race_worker, &b) == 0);
+        (void)pthread_barrier_wait(&barrier);
+        assert(pthread_join(ta, NULL) == 0);
+        assert(pthread_join(tb, NULL) == 0);
+        assert(pthread_barrier_destroy(&barrier) == 0);
+
+        assert((a.result == 0) != (b.result == 0));
+        if (txn->state == QIHSE_TXN_COMMITTED) {
+            assert(local.commits == 1 && local.rollbacks == 0);
+            assert(qihse_txn_is_committed(mgr, txn->id));
+            assert(!qihse_txn_is_aborted(mgr, txn->id));
+        } else {
+            assert(txn->state == QIHSE_TXN_ABORTED);
+            assert(local.commits == 0 && local.rollbacks == 1);
+            assert(qihse_txn_is_aborted(mgr, txn->id));
+            assert(!qihse_txn_is_committed(mgr, txn->id));
+        }
+    }
+
+    qihse_txn_manager_destroy(mgr);
+    printf("PASS transaction terminal races: exactly one commit/rollback wins\n");
+}
+
 static void test_two_phase_commit(void) {
     qihse_txn_manager_t* mgr = qihse_txn_manager_create();
     assert(mgr);
@@ -639,8 +709,28 @@ static void test_two_phase_commit(void) {
     /* commit_prepared on a non-prepared transaction is refused. */
     assert(qihse_txn_commit_prepared(mgr, v) == -1);
 
+    /* A one-phase local resource cannot cross a 2PC or savepoint boundary.
+     * It remains rollbackable after those operations are refused. */
+    local_resource_state_t local = {0};
+    qihse_txn_t* w = qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    assert(w);
+    assert(qihse_txn_attach_resource(w, &local, local_resource_commit,
+                                     local_resource_rollback) == 0);
+    assert(qihse_txn_prepare(mgr, w) == -1);
+    assert(qihse_txn_savepoint(mgr, w, "unsafe") == -1);
+    assert(w->state == QIHSE_TXN_ACTIVE);
+    assert(qihse_txn_rollback(mgr, w) == 0);
+    assert(local.commits == 0 && local.rollbacks == 1);
+
+    qihse_txn_t* x = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
+    assert(x);
+    assert(qihse_txn_attach_resource(x, &local, local_resource_commit,
+                                     local_resource_rollback) == 0);
+    assert(qihse_txn_commit(mgr, x) == 0);
+    assert(local.commits == 1 && local.rollbacks == 1);
+
     qihse_txn_manager_destroy(mgr);
-    printf("PASS 2PC: prepare/commit_prepared/abort_prepared, failing prepare aborts\n");
+    printf("PASS 2PC: prepare lifecycle and one-phase resource boundaries\n");
 }
 
 int main(void) {
@@ -651,6 +741,7 @@ int main(void) {
     test_crash_recovery();
     test_serializable_occ();
     test_two_phase_commit();
+    test_terminal_transition_races();
     printf("test_txn: all transaction tests passed\n");
     return 0;
 }
