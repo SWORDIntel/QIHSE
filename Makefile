@@ -1591,3 +1591,6 @@ install-studio:
 
 # Isolated W12 synthetic FP32 baseline and contract tests.
 include benchmarks/w12.mk
+
+# Standalone experimental W12.1 scalar reference, never linked by lib targets.
+include quantization/w12.mk

@@ -1,6 +1,6 @@
 # W12 — TurboQuant derived vector index (research and implementation plan)
 
-**Status:** W12.0 in progress (2026-10-22). The [first substrate audit and synthetic FP32 kernel baseline](qihse_w12_baseline_audit.md) exist; no TurboQuant codec, engine integration, or completed stage gate is claimed.
+**Status:** W12.0 in progress (2026-10-22). The [first substrate audit and synthetic FP32 kernel baseline](qihse_w12_baseline_audit.md) exist. A [standalone experimental W12.1 scalar reference](qihse_w12_scalar_reference.md) is under validation; no engine integration, optimization, promotion or completed stage gate is claimed.
 **Master:** [QIHSE ROADMAP.md, W12](../../ROADMAP.md#w12--turboquant-vector-candidate-index-planned).
 **Scope:** QIHSE-native vector retrieval and optional AIMEM semantic retrieval, not HAX, NAT, or model KV-cache integration.
 **Primary reference:** Zandieh, Daliri, Hadian, Mirrokni, *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*, ICLR 2026: https://proceedings.iclr.cc/paper_files/paper/2026/hash/5c802ef38ab6e366c2ea06eee554c088-Abstract-Conference.html ; https://arxiv.org/abs/2504.19874 .
@@ -29,7 +29,7 @@ TurboQuant is an online/data-oblivious method for high-dimensional vector quanti
 | `QIHSE_ENGINE_ROADMAP.md` (W10, QH-01/QH-05) | Authorized scoped AIMEM query, security-before-ranking | Non-regression and negative test requirements |
 | `backends/cpu/`, `backends/gpu/` and `benchmarks/` | ISA dispatch, accelerator backends, benchmark framework | Measured optional speedups |
 
-The proposed paths below are **not implemented artifacts**. Inspect actual build wiring and storage APIs before edits.
+Paths below remain proposed unless explicitly linked to an implementation. The standalone W12.1 reference is not wired to production; inspect actual build/storage APIs before integration.
 
 ## Deliverables
 
@@ -44,7 +44,7 @@ The proposed paths below are **not implemented artifacts**. Inspect actual build
 
 ### W12.1 — Correct native C scalar codec (P0)
 
-**Candidate paths:** `quantization/include/qihse_turboquant.h`, `quantization/src/qihse_turboquant.c`, `tests/test_turboquant.c`.
+**Experimental paths now implemented:** `quantization/include/qihse_turboquant.h`, `quantization/src/qihse_turboquant.c`, dimension-aware `qihse_turboquant_tables` helpers and `tests/test_turboquant*.c`. See the [reference contract and open gates](qihse_w12_scalar_reference.md). This research increment does not close the W12.0 or W12.1 gate.
 
 - Implement paper-defined deterministic random orthogonal rotation, normalization, scalar quantization, packed bit codes and decoder/score; include dimension, norm, seed, quantizer-table version and bit-width metadata.
 - Separate MSE-only and inner-product-corrected variants. QJL must sketch the **residual** after MSE reconstruction, with the proper random projection and normalization; statistically verify inner-product bias and variance.
