@@ -63,3 +63,12 @@ LD_LIBRARY_PATH=. ./benchmarks/qihse_cluster_crc_bench
 # Zen 4 & Zen 2 SIMD test binary:
 LD_LIBRARY_PATH=. ./tests/test_zen_epyc_simd
 ```
+
+## 4. W12 synthetic FP32 baseline (first increment)
+
+`make test-w12-fp32` runs isolated C/ABI and Python tests without building the
+full engine. `make bench-w12-fp32` records a seeded FP32 kernel baseline with an
+independent higher-precision exhaustive oracle and raw JSON measurements.
+This is not a TurboQuant codec, full-engine benchmark, or security validation.
+See the [W12.0 audit and reproduction contract](../docs/plans/qihse_w12_baseline_audit.md)
+for exact scope, current wired alternatives and open gates.

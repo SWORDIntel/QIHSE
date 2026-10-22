@@ -1588,3 +1588,6 @@ studio:
 
 install-studio:
 	@./portal/install-studio.sh
+
+# Isolated W12 synthetic FP32 baseline and contract tests.
+include benchmarks/w12.mk

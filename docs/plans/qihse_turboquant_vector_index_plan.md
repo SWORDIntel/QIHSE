@@ -1,6 +1,6 @@
 # W12 — TurboQuant derived vector index (research and implementation plan)
 
-**Status:** planned / not implemented (2026-10-22).
+**Status:** W12.0 in progress (2026-10-22). The [first substrate audit and synthetic FP32 kernel baseline](qihse_w12_baseline_audit.md) exist; no TurboQuant codec, engine integration, or completed stage gate is claimed.
 **Master:** [QIHSE ROADMAP.md, W12](../../ROADMAP.md#w12--turboquant-vector-candidate-index-planned).
 **Scope:** QIHSE-native vector retrieval and optional AIMEM semantic retrieval, not HAX, NAT, or model KV-cache integration.
 **Primary reference:** Zandieh, Daliri, Hadian, Mirrokni, *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*, ICLR 2026: https://proceedings.iclr.cc/paper_files/paper/2026/hash/5c802ef38ab6e366c2ea06eee554c088-Abstract-Conference.html ; https://arxiv.org/abs/2504.19874 .
@@ -109,4 +109,4 @@ The proposed paths below are **not implemented artifacts**. Inspect actual build
 
 **Stop if:** recall cannot meet intended workloads at useful bit rates; encode/rebuild costs offset savings; true pre-top-K auth isolation is infeasible; no end-to-end resource/performance benefit. Publish a negative result rather than shipping a slower or weaker default.
 
-**Non-claims:** no guarantee of “lossless 3.5-bit” quality for QIHSE vector search (the well-known near-quality-neutral 3.5-bit finding is for the paper's KV-cache experiments); no guarantee that FP32 rerank makes an approximate candidate set exact; no claim that any W12 code or benchmark exists yet.
+**Non-claims:** no guarantee of “lossless 3.5-bit” quality for QIHSE vector search (the well-known near-quality-neutral 3.5-bit finding is for the paper's KV-cache experiments); no guarantee that FP32 rerank makes an approximate candidate set exact; the first synthetic FP32 kernel harness does not establish a full-engine baseline, a TurboQuant codec, or any promotion gate.

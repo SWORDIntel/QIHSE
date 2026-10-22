@@ -152,3 +152,6 @@ tools/qihse_i2p_test_cli
 tools/test_i2p_qkp_diag
 /studio/
 
+
+# W12 Python test source (not a generated test executable).
+!/tests/test_w12_fp32_baseline.py
