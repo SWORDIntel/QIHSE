@@ -256,3 +256,45 @@ directory so the engine next to the launcher is always the one loaded.
       ~/.config/qihse-aimem/operator-password.cred - | ...
     # documented password rule
     QIHSE_OPERATOR_PASSWORD=… ./qihse-redis-server --require-auth --password other  # exit 2
+
+---
+
+# Suite remediation — 2026-10-23 (round 2)
+
+Full `make test-*` sweep (183 targets) after the RESP fixes. 10 more targets
+were failing; root causes fixed and committed (`bb8e49d`):
+
+| target | root cause | fix |
+|---|---|---|
+| test-codegraph | `json_bool` collided with json-c's typedef; `$(pkg-config)` was a make function (empty) not shell; header validator demanded 64-hex `head` but the format carries 40-hex SHA-1; auth init ran before the scratch `QIHSE_DATA_DIR` existed; scratch cleanup raced the audit signer (ENOENT -> chain-integrity abort) | rename helper; `$(shell pkg-config)`; accept 40/64-hex; init after scratch; `qihse_audit_flush()` before `nftw` cleanup |
+| test-direct-execution | rule forced `-mavx2 -mavx512* AMX` and SIGILL'd on non-supporting hosts | conditional CFLAGS + per-ISA `#ifdef` guards; absent ISA = SKIP, advertised ISA SIGILL = FAIL |
+| test-operator-mode | assertion predated the verifier-configured contract | assert current semantics (plain init = default; bootstrap clears) |
+| test-uwp-concurrency | audited UWP paths aborted without an audit writer | auth init + operator bootstrap (same as AF_XDP test) — see open defect below |
+| test-edge-persistence | stale `/tmp/qihse_edge_persistence_test.qdb` from a root run (EACCES); real gate: container HMAC key must be 0600 + owned by the service user | per-run pid path; `/etc/qihse` 0755, private keys 0600 john, public keys 0644 |
+| test-cluster-bus-bind | OpenSSL used without `-lcrypto` | link fix |
+| test-amx-only / avx512-direct / vnni-only / zen-epyc / all-isa | forced ISAs the host lacks | capability-gated SKIP (see §6a) |
+
+## Still open — pre-existing WIP defects (not test hygiene)
+
+1. **fabric remote embed is impossible by construction.**
+   `qihse_ai_memory_store()` fails the claims-built remote context because
+   `qihse_auth_user_is_active()` resolves by **pointer identity** against the
+   local auth registry (`users[i] == presented`); a remote principal can never
+   be live on the executor, so the embed job always ends `embed-refused` /
+   `executor-reported-failure`. Needs a design decision: materialise remote
+   principals, or let the memory store take (live user, explicit classification)
+   separately.
+2. **gold battery: pg-wire-cluster workload hangs under the runner**
+   (`tests/gold/pack.v1.gold` line 241). The workload subprocess sits in wait
+   with no children; passes standalone (`make test-pg-wire-cluster`). Runner
+   cwd/env differences (the runner runs workloads from its own directory with
+   inherited `LD_LIBRARY_PATH`) are the suspect; needs the pack/runner env
+   pinned like the other workloads.
+3. **test-uwp-concurrency deadlocks** once the audit writer exists: 18 threads
+   in `futex_do_wait` — 16 workers + audit signer, consistent with bounded-queue
+   backpressure across the kv_lock/audit ordering. Previously it aborted at the
+   same path ("audit writer is not initialized"), so this failure predates the
+   auth-init fix; the fix merely exposed the deeper lock-ordering issue.
+   `test` (the aggregate) inherits these three.
+
+Net: 183 targets, everything green except the three pre-existing WIP defects above.
