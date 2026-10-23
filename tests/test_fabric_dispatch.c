@@ -15,11 +15,10 @@
  *      it.
  *
  *   2. FAILURE SEMANTICS — idempotency is declared per type and a retry is
- *      attempted ONLY for a type that declares it.  `embed` does not (a retry
- *      would create a SECOND memory) and `keystone-ingest` does (a retry
- *      overwrites the same artifact key).  A non-idempotent dispatch that gets
- *      no answer is terminal `gave-up` after ONE attempt; an idempotent one is
- *      retried, and exhausting the budget is `gave-up`, never `failed`.
+ *      attempted ONLY for a type that declares it.  `embed` relies on the
+ *      executor's durable submitter/job dedup record, while `keystone-ingest`
+ *      overwrites the same artifact key. Exhausting the retry budget is
+ *      `gave-up`, never `failed`.
  *
  *   3. PRINCIPAL — a signed capability token.  A token that cannot be
  *      verified, has expired, has been replayed, names another node, or claims
@@ -494,6 +493,13 @@ static void test_remote_dispatch_runs_on_the_peer(void) {
                                           &hit, 1u);
     assert(found == 1u && hit.text != NULL);
     assert(strstr(hit.text, "remote embed marker") != NULL);
+    assert(hit.classification == 0u && hit.sci_compartment == 0u);
+    free(hit.text);
+    memset(&hit, 0, sizeof hit);
+    found = qihse_ai_memory_recall(g_executor, g_low, "remote embed marker", 5u,
+                                    &hit, 1u);
+    assert(found == 1u && hit.classification == 0u &&
+           hit.sci_compartment == 0u);
     free(hit.text);
     printf("PASS remote embed: executed on the peer at the token's clearance, "
            "memory in the peer's store\n");
@@ -761,6 +767,52 @@ static void test_session_recheck(void) {
 
 static void test_negative_low_clearance_high_data(void) {
     char reply[8192];
+
+    /* Fabric embed cannot be relabeled upward by a signed token, and the
+     * privileged executor's handle must not silently supply its own label. */
+    const char* embed[] = { "FABRIC", "SUBMIT", "embed", "0", "0", PROTECTED_MARKER };
+    run_cmd(g_submitter, g_mid, 6u, embed, reply, sizeof reply);
+    assert(strstr(reply, "status:denied") != NULL);
+    assert(strstr(reply, "principal-not-representable") != NULL);
+    assert(strstr(reply, PROTECTED_MARKER) == NULL);
+    qihse_ai_memory_hit_t hit;
+    memset(&hit, 0, sizeof hit);
+    size_t protected_found = qihse_ai_memory_recall(g_executor, g_op,
+        PROTECTED_MARKER, 5u, &hit, 1u);
+    assert(protected_found == 0u ||
+           (hit.text && strstr(hit.text, PROTECTED_MARKER) == NULL));
+    free(hit.text);
+
+    /* The lower level write entry point must reject an inactive handle and
+     * a live principal that is not the executor Operator. */
+    qihse_user_t* forged = (qihse_user_t*)((char*)g_op + 1u);
+    char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
+    assert(!qihse_ai_memory_store_fabric_unclassified(
+        g_executor, forged, PROTECTED_MARKER, QIHSE_AIMEM_SEMANTIC, mem_id));
+    assert(!qihse_ai_memory_store_fabric_unclassified(
+        g_executor, g_low, PROTECTED_MARKER, QIHSE_AIMEM_SEMANTIC, mem_id));
+
+    /* A zero-label index job must neither count nor index a high record,
+     * even though its local executor handle can read that record. */
+    const char* protected_index_key = "fabric:ingest:r:protected-only";
+    assert(qihse_kv_set_user(g_store_b, protected_index_key, PROTECTED_MARKER,
+                             5u, 0u, g_op));
+    const char* index_job[] = { "FABRIC", "SUBMIT", "index-build", "0", "0",
+                                "fabric:ingest:r:protected-only" };
+    run_cmd(g_submitter, g_low, 6u, index_job, reply, sizeof reply);
+    assert(strstr(reply, "status:pending-fetch") != NULL);
+    char index_jid[32];
+    assert(parse_job_id(reply, index_jid, sizeof index_jid));
+    const char* index_fetch[] = { "FABRIC", "FETCH", index_jid };
+    run_cmd(g_submitter, g_low, 3u, index_fetch, reply, sizeof reply);
+    assert(strstr(reply, "status:done") != NULL);
+    char index_key[192];
+    assert(qihse_fabric_remote_index_key(&g_id_a.node_id,
+        strtoull(index_jid, NULL, 10), index_key, sizeof index_key));
+    char* index_report = qihse_kv_get_user(g_store_b, index_key, g_low);
+    assert(index_report && strstr(index_report, "scanned:0") != NULL);
+    assert(strstr(index_report, PROTECTED_MARKER) == NULL);
+    free(index_report);
 
     /* (a) The normal path: a clearance-1 principal submits a job.  The
      * executor cannot represent that principal, so it REFUSES — it does NOT

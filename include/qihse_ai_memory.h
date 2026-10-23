@@ -205,6 +205,15 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                            const char* text, uint32_t kind,
                            char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
 
+/* Trusted fabric executor admission for a verified clearance-0/SCI-0 token.
+ * Requires a live system Operator handle. The memory, vector and index entry
+ * are all labeled unclassified; the caller must verify the signed token and
+ * its zero label before passing its payload here. */
+bool qihse_ai_memory_store_fabric_unclassified(
+    qihse_resp_server_t* server, qihse_user_t* executor,
+    const char* text, uint32_t kind,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+
 /* QH-00 retry-safe admission. When the same (tenant, actor, idempotency-key)
  * is retried after a pre-ACK crash, derive the same UUID from the existing
  * federation SHA-384 UUID helper. A conflicting kind/text is never replaced.

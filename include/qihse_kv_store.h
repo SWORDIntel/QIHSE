@@ -201,6 +201,12 @@ typedef bool (*qihse_kv_iter_meta_cb)(const char* key, const char* value,
 bool qihse_kv_foreach_meta_user(qihse_kv_store_t* store, qihse_user_t* user,
                                 qihse_kv_iter_meta_cb cb, void* user_data);
 
+/* Enumerate only records both visible to a live actor and within an explicit
+ * delegated label. The label filter runs before any callback sees a value. */
+bool qihse_kv_foreach_meta_bounded_user(qihse_kv_store_t* store,
+    qihse_user_t* actor, uint16_t max_classification, uint16_t allowed_sci,
+    qihse_kv_iter_meta_cb cb, void* user_data);
+
 size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user);
 size_t qihse_kv_clear(qihse_kv_store_t* store);
 
