@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #ifdef __AMX_TILE__
 #include <immintrin.h>
@@ -137,6 +138,46 @@ int test_amx_bf16() {
     #endif
 }
 
+
+/* ---- host ISA probe -------------------------------------------------------
+ * The build enables -m<isa> per detected CPU flag, so this battery must judge
+ * only the ISAs the host actually advertises: an ISA the CPU lacks is a SKIP,
+ * not a failure (previously it required >=2 passes and failed on any CPU
+ * without AVX2/AVX-512/AMX). */
+static char host_flags[8192];
+
+static void load_host_flags(void) {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return;
+    char line[8192];
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "flags", 5) != 0) continue;
+        char* colon = strchr(line, ':');
+        if (!colon) continue;
+        colon++;
+        size_t len = strcspn(colon, "\n");
+        if (len >= sizeof host_flags) len = sizeof host_flags - 1u;
+        memcpy(host_flags, colon, len);
+        host_flags[len] = '\0';
+        break;
+    }
+    fclose(f);
+}
+
+static int host_has(const char* flag) {
+    size_t n = strlen(flag);
+    const char* p = host_flags;
+    while ((p = strstr(p, flag)) != NULL) {
+        bool start_ok = (p == host_flags) || (p[-1] == ' ');
+        bool end_ok = (p[n] == ' ' || p[n] == '\0');
+        if (start_ok && end_ok) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+typedef struct { const char* name; const char* flag; int (*fn)(void); } isa_case_t;
+
 int main() {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -148,31 +189,42 @@ int main() {
     printf("Intel Core Ultra 7 165H (Meteor Lake)\n");
     printf("================================================================\n");
     
-    int passed = 0;
-    int total = 6;
-    
-    // Test each feature
-    if (test_avx2() == 0) passed++;
-    if (test_avx_vnni() == 0) passed++;
-    if (test_avx512f() == 0) passed++;
-    if (test_amx_tile() == 0) passed++;
-    if (test_amx_int8() == 0) passed++;
-    if (test_amx_bf16() == 0) passed++;
-    
+    load_host_flags();
+
+    const isa_case_t cases[] = {
+        { "AVX2",      "avx2",      test_avx2 },
+        { "AVX-VNNI",  "avx_vnni",  test_avx_vnni },
+        { "AVX-512F",  "avx512f",   test_avx512f },
+        { "AMX-TILE",  "amx_tile",  test_amx_tile },
+        { "AMX-INT8",  "amx_int8",  test_amx_int8 },
+        { "AMX-BF16",  "amx_bf16",  test_amx_bf16 },
+    };
+    const size_t total = sizeof cases / sizeof cases[0];
+
+    size_t advertised = 0, passed = 0, skipped = 0, failed = 0;
+    for (size_t i = 0; i < total; i++) {
+        if (!host_has(cases[i].flag)) {
+            printf("\n[SKIP] %s: host CPU does not advertise %s\n", cases[i].name, cases[i].flag);
+            skipped++;
+            continue;
+        }
+        advertised++;
+        if (cases[i].fn() == 0) passed++; else failed++;
+    }
+
     printf("\n================================================================\n");
-    printf("RESULTS: %d/%d tests passed\n", passed, total);
+    printf("RESULTS: %zu advertised ISAs, %zu passed, %zu failed, %zu skipped\n",
+           advertised, passed, failed, skipped);
     printf("================================================================\n");
-    
-    if (passed >= 2) {
-        printf("✓ Basic vector operations working (AVX2/AVX-VNNI)\n");
+
+    if (advertised == 0) {
+        printf("skip: host advertises none of the tested ISA extensions\n");
+        return 0;      /* nothing to validate on this CPU, not a failure */
     }
-    if (passed >= 3) {
-        printf("✓ Advanced features detected!\n");
+    if (failed != 0) {
+        printf("FAIL: %zu advertised ISA extension(s) did not work\n", failed);
+        return 1;
     }
-    
-    printf("\nNote: Tests that compile but crash indicate hardware doesn't\n");
-    printf("      support the feature despite compiler flags.\n");
-    printf("================================================================\n");
-    
-    return (passed >= 2) ? 0 : 1;
+    printf("OK: every ISA extension this host advertises works\n");
+    return 0;
 }

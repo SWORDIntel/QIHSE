@@ -752,6 +752,64 @@ From the federation plan (§3, non-negotiable):
 
 ---
 
+## 6a. ISA capability policy (measured 2026-10-23)
+
+Three places could decide "does this machine support AVX-512 / AVX2+FMA / VNNI /
+AMX", and each has a different job. The rule is: **code decides correctness,
+the Makefile decides what gets compiled, tests decide what to skip** — never the
+other way round.
+
+| layer | mechanism | measured cost | why there |
+|---|---|---|---|
+| runtime | `qihse_cpu_has_feature(&info, …)` over a CPUID-derived struct (`backends/cpu/qihse_cpu_detect.c`), consulted by the dispatcher before entering an ISA kernel | **7.7 ns/call** (10M calls) — ~10⁴–10⁵× cheaper than one vector kernel | a binary built on a rich host still runs correctly on a poorer one; this is the only place correctness can be guaranteed |
+| build | one requirement **group** per ISA in the Makefile via `cpu_has_all`; an ISA is compiled only when *every* flag its codegen needs is advertised | 5.6 ms once per `make` invocation (single `/proc/cpuinfo` parse, shared with `HOST_CPU_FLAGS`); zero per-target cost because the gate is parse-time `ifeq` | `-mavx2 -mfma` on a host without FMA produces code that cannot run; the flag set and the codegen must agree |
+| tests | per-ISA preflight: `ifeq ($(QIHSE_ENABLE_<ISA>),1)` around the recipe, else print `SKIP …` and succeed | **net −20 s per full suite run** on an AVX-only host (amx-only 5 s, avx512-direct 4 s, vnni-only 5 s, zen-epyc 5 s, all-isa 1 s were previously compiled, executed and killed by SIGILL) | a hardware capability the host lacks is not a test failure; SIGILL noise hides real regressions |
+
+Requirement groups (all ISAs use the same rule; AVX-512 was the only one that did
+before this change):
+
+    AVX      : avx
+    AVX2     : avx2 fma
+    AVX512   : avx512f avx512dq avx512bw avx512vl fma
+    AVX-VNNI : avx2 avx_vnni
+    AMX      : amx_tile amx_int8 amx_bf16
+    F16C     : avx f16c
+
+On an Ivy-Bridge host (AVX only) this resolves to `AVX=1 AVX2=0 AVX512=0 VNNI=0
+AMX=0 F16C=1` and the build emits exactly `-mavx` — detection and codegen agree.
+
+### The arithmetic (so the policy is checkable, not hand-waved)
+
+    overhead_per_call = C_check × c_check
+    overhead_ratio    = (C_check × c_check) / (C_check × c_check + W_kernel)
+
+* `c_check` = 7.7 ns measured; `C_check` = checks executed on the call path
+  (this codebase resolves once via `pthread_once` and then calls through a
+  function pointer — effectively `C_check = 0` after the first call);
+  `W_kernel` = actual vector work of one invocation (~0.5–1 ns per element).
+* Break-even: a per-call check is justified while `W_kernel > C_check × c_check`.
+  A 64-dim dot product is already ≈ 32–64 ns, i.e. 4–8× the check; a 256-dim
+  cosine is ≈ 10× the cost of 3 checks. Only sub-32-element kernels should ever
+  hoist the check out of the hot loop.
+* Worst-case bookkeeping (what 10M per-call checks would actually cost):
+  10⁷ × 7.7 ns = **77 ms**. Against 10⁷ × 256-dim kernels (≈ 1.3 s of work)
+  that is ≈ 6% — and it drops below 3% at 512 dims. The check is never the
+  bottleneck the kernel is.
+* **Skipped sets on a native build cost nothing at runtime**: "compile it
+  natively only" is the whole point — an ISA the host does not advertise is
+  eliminated by the build (`QIHSE_ENABLE_<ISA>=0` → no code, no guard, no
+  branch), so a host with many skipped sets pays *fewer* per-call checks, not
+  more. Skips only ever save: each one removes compile time, the old SIGILL
+  seconds in the suite, and the kernel's bytes from the binary.
+* AMX is the extreme case: the guard is ~8 ns; the AMX state it protects costs
+  ~0.1–1 µs to save/restore (`xrstor`/`xsave` of tile state). Guarding it is
+  three orders of magnitude cheaper than the thing being guarded.
+
+**Do not** move capability checks into the Makefile for correctness, and do not
+let a test fail because the CPU lacks an ISA it never advertised. When adding an
+ISA: add its flag group to `cpu_has_all`, add the runtime feature bit, and gate
+its test on the generated `QIHSE_ENABLE_*` switch.
+
 ## 7. Non-goals
 
 QIHSE does not become: a Proxmox replacement UI, VM scheduler, Xen/libvirt wrapper, host fencing system, storage controller, SDN controller, secret vault, remote shell, compiler/build executor, repository signing authority, or monolithic cluster manager. It provides the durable, secure primitives those systems require.

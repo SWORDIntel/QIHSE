@@ -31,12 +31,54 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
+static bool dir_has_model(const char* d);
+
+/* First subdirectory of `root` that holds a complete model. */
+static const char* first_model_under(const char* root) {
+    static char found[1024];
+    DIR* dir = root ? opendir(root) : NULL;
+    if (!dir) return NULL;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (snprintf(found, sizeof found, "%s/%s", root, entry->d_name) >= (int)sizeof found) continue;
+        if (dir_has_model(found)) { closedir(dir); return found; }
+    }
+    closedir(dir);
+    return NULL;
+}
+
+/* Resolution order: explicit env override, then the standard install
+ * locations, so a model that is installed on the host is actually exercised
+ * instead of silently skipping the model-dependent checks. */
 static const char* model_dir(void) {
     const char* d = getenv("QIHSE_AIMEM_EMBEDDER_ONNX_TEST_DIR");
     if (d && *d) return d;
     d = getenv("QIHSE_AIMEM_EMBEDDER_ONNX");
-    return (d && *d) ? d : NULL;
+    if (d && *d) return d;
+
+    static char candidate[1024];
+    const char* home = getenv("HOME");
+    const char* named[] = {
+        "/usr/share/qihse-aimem/models/bge-small-en-v1.5",
+        "/usr/local/share/qihse-aimem/models/bge-small-en-v1.5",
+    };
+    for (size_t i = 0; i < sizeof named / sizeof named[0]; i++)
+        if (dir_has_model(named[i])) return named[i];
+    if (home && *home) {
+        if (snprintf(candidate, sizeof candidate,
+                     "%s/.local/share/qihse-aimem/models/bge-small-en-v1.5", home) < (int)sizeof candidate
+            && dir_has_model(candidate)) return candidate;
+        if (snprintf(candidate, sizeof candidate,
+                     "%s/.local/share/qihse-aimem/models", home) < (int)sizeof candidate) {
+            const char* found = first_model_under(candidate);
+            if (found) return found;
+        }
+    }
+    const char* rel = first_model_under("models");
+    return rel;
 }
 
 static bool dir_has_model(const char* d) {
