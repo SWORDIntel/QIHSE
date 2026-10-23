@@ -1,12 +1,12 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-21
+**Status date:** 2026-10-22
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
-**Current program status (2026-10-21):** 134 items implemented, 2 partial, 5 planned stretch deliverables, and 1 superseded conditional item. W0–W10 are closed (100% of their applicable scope complete). W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), and [W11](#w11--general-database-application-platform-active-stretch-goal).
+**Current program status (2026-10-22):** 134 items implemented, 2 partial, 12 planned deliverables (5 in W11 and 7 in the new W12 research/implementation lane), and 1 superseded conditional item. W0–W10 are closed (100% of their applicable scope complete). W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), [W11](#w11--general-database-application-platform-active-stretch-goal), and the independent [W12 TurboQuant plan](docs/plans/qihse_turboquant_vector_index_plan.md). W12 is a proposal, not a claim of implementation.
 
 ---
 
@@ -668,9 +668,29 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 
 ---
 
+### W12 — TurboQuant vector candidate index (planned)
+
+**Recorded 2026-10-22; status: planned, none implemented.** Add the research-backed TurboQuant algorithm as an **optional QIHSE-native, derived numerical vector candidate-index tier**, not as KV-cache optimization, a new canonical database, or a HAX/NAT integration. Preserve authoritative FP32 vectors, existing exact-rerank semantics, old query modes and the security-first W10 AIMEM contracts. Exact-reranking an approximate candidate set does **not** make the overall search exact. The algorithm supports online/data-oblivious quantization (randomized rotation + coordinate scalar quantization), with optional QJL 1-bit correction **of the residual** for inner-product estimation; quality and bit budgets must be established on QIHSE's corpora, not inferred from reported KV-cache results.
+
+**Implementation and acceptance design:** [docs/plans/qihse_turboquant_vector_index_plan.md](docs/plans/qihse_turboquant_vector_index_plan.md). Grounded starting points: `include/qihse_vector_db.h`, `src/broad_oak/qihse_vector_db.c`, `quantization/src/qihse_pq.c`, `include/qihse_hnsw.h`, `backends/cpu/` and `backends/gpu/`. Primary source: [TurboQuant, ICLR 2026](https://proceedings.iclr.cc/paper_files/paper/2026/hash/5c802ef38ab6e366c2ea06eee554c088-Abstract-Conference.html). Independently implement or review upstream source licences before reuse; do not imply paper-proven QIHSE benchmark results.
+
+- [ ] **W12.0 — Validity contract + baseline:** map VectorDB/AIMEM authoritative, index-generation and authorization paths; produce exact FP32 oracle, benchmark existing wired HNSW/trinary/INT8/INT4/FP16/PQ alternatives, pin datasets/seeds/ISA and predeclare recall, effective bits-per-dimension, p95/p99, build/update and throughput thresholds.
+- [ ] **W12.1 — Native C reference codec:** deterministic rotation and distribution-aware scalar quantizer, optional residual QJL for inner products, packed validated codes, dimension/norm/metric handling, deterministic seeds, scalar fallback, cross-platform reproducibility, fuzzing and sanitizer tests. Do not call ordinary low-bit conversion TurboQuant.
+- [ ] **W12.2 — Generation-safe disposable sidecar:** proposed versioned `vectors.qtq` with bit widths, parameters, integrity, IDs and source committed-generation metadata; atomic publication, stale/malformed rejection, tombstone/update invalidation, crash/restart tests and safe optional removal without modifying FP32.
+- [ ] **W12.3 — Authenticated candidate search + FP32 rerank:** additive opt-in `QIHSE_VDB_QUERY_TURBOQUANT` after ABI review; authorization/tenant/project/SCI/revocation filter **before candidate selection, top-K, counting and explain**; stable IDs/generations, exact scoring of selected candidates, bounded oversampling; only then consider AIMEM semantic/hybrid integration. Negative low-clearance/high-data tests are mandatory.
+- [ ] **W12.4 — Optional CPU SIMD and Vulkan compute:** dynamic scalar/SSE/AVX paths with benchmark gates; independently investigate QIHSE-local Vulkan compute for resident compressed codes and batch scoring, including total transfer cost and an experimental <=1.2 GB decimal device-memory budget. No mandatory accelerator, no external terminal integration, CPU fallback on device loss.
+- [ ] **W12.5 — Differential accuracy, security and fault evidence:** compare against exhaustive FP32 truth across real/scoped AIMEM and adversarial corpora; record Recall@K, approximation bias, p50/p95/p99, bytes/vector including metadata, index build/rebuild, CPU/GPU resource cost, malformed files, concurrent updates, kill/restart and hidden-record/noninterference tests; make CI reproducible.
+- [ ] **W12.6 — Shadow/canary, rollback, promotion gate:** default off; compare shadow queries against FP32 authority, promote only with predeclared per-corpus/precision targets and all security gates, preserve strict-exact mode, and roll back by disabling the optional mode and dropping derived sidecars. Record implementation SHA, provenance/licence check, benchmarks, tests and limitations.
+
+**W12 promotion criteria (proposed; not measurements):** on the *declared primary* semantic corpus aim for candidate Recall@10 >= 0.99; require either >=1.5x end-to-end query throughput at equivalent recall or >=2x index-memory reduction with <=5% p95 regression, plus zero security/correctness regressions. Do not advertise universal lossless quality or exact top-K. Stop if authorization-safe early filtering, compression value or operational overhead fails these gates. No stage is marked complete without source + build integration + CI and repository evidence.
+
+**Independent order:** W12.0 -> W12.1 -> W12.2 -> W12.3 -> W12.5 -> W12.6; optional W12.4 follows proven scalar correctness. Coordinate with W11.2 workload isolation and W11.3 index evolution but **do not block** the active W11 transaction/platform critical path.
+
+---
+
 ## 4. Sequencing
 
-**Historical W0–W10 sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6.
+**Historical W0–W10 sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
 
 | Horizon | Work | Why now |
 |---|---|---|
@@ -681,6 +701,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 | **Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
 | **QIHSE AIMEM lane (complete)** | QH-00 through QH-09 complete; QH-10 conditional gate not triggered | Durable scoped lifecycle, coordination, lineage, querying, maintenance, archives and assurance are integrated and tested |
 | **Active stretch program** | W11.0–W11.6; W11.1 and W11.5 partial | General database guarantees across application models, workload isolation, online evolution, history, developer tooling, and combined failure validation |
+| **Optional vector-index research lane** | W12.0–W12.6; all planned | Independent TurboQuant candidate index with authenticated pre-top-K filtering, FP32 rerank, benchmark-gated optional SIMD/Vulkan and reversible sidecars |
 
 Dependency notes:
 
@@ -707,6 +728,7 @@ Workstream-specific gates:
 - **AI fabric:** every artifact path respects the fabric index authorization model (existing CI job) and the AGENTS.md security invariants.
 - **W10 AIMEM:** record and tombstone durability must be proved by crash tests; project/SCI restrictions precede every ranking/graph/count leg; new adapters require AGENTS.md low-clearance/high-data negative tests; versioned knowledge transformations remain reversible.
 - **W11 application platform:** public-interface evidence must establish each advertised guarantee; combined workloads must meet predeclared correctness, resource, latency, and recovery budgets under documented faults. Historical queries, migrations, diagnostics, and restore paths retain explicit principal and label enforcement. Publish unsupported combinations and measured limits; individual feature tests do not establish combined application guarantees.
+- **W12 TurboQuant:** candidate stages cannot read or rank hidden records; every new classified-capable adapter requires low-clearance/high-data negative CI; sidecars are generation-fenced and disposable; FP32 is authoritative; recall and end-to-end cost are measured against FP32 truth and current QIHSE baselines, never inferred from KV-cache papers.
 
 ---
 
