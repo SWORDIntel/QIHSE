@@ -1319,7 +1319,7 @@ else
 endif
 
 test-direct-execution:
-	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_direct_execution
 
 test-simple-exec:
@@ -1607,7 +1607,7 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 .PHONY: test-codegraph
 qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include \
-	  $< -o $@ -L. -lqihse $(pkg-config --cflags --libs json-c openssl) \
+	  $< -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl) \
 	  $(LDFLAGS) -Wl,-rpath,'$ORIGIN'
 
 test-codegraph: qihse-codegraph

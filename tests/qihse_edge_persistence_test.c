@@ -130,7 +130,11 @@ int main(void) {
     char qdd[] = "build/qihse_edge_persistence_test_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
-    const char* path = "/tmp/qihse_edge_persistence_test.qdb";
+    /* Per-run path: a fixed /tmp name broke with EACCES whenever a previous
+     * (root) run left a file behind with different ownership. */
+    char pathbuf[128];
+    snprintf(pathbuf, sizeof pathbuf, "/tmp/qihse_edge_persistence_test_%d.qdb", (int)getpid());
+    const char* path = pathbuf;
     pid_t child;
     int status = 0;
     unlink(path);

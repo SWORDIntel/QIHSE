@@ -72,6 +72,16 @@ int main(void) {
     char qdd[] = "build/test_uwp_concurrency_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
+    /* Audited UWP paths fail closed (abort) without the audit writer, the same
+     * as the AF_XDP ingress test: initialize auth first. */
+    if (!qihse_auth_init()) {
+        fprintf(stderr, "uwp_concurrency: auth init failed\n");
+        return 1;
+    }
+    if (!qihse_auth_bootstrap_operator("UwpConcurrencySystem123!")) {
+        fprintf(stderr, "uwp_concurrency: operator bootstrap failed\n");
+        return 1;
+    }
     g_metrics = qihse_uwp_metrics_create();
     g_kv = qihse_kv_store_create();
     pthread_barrier_init(&g_barrier, NULL, NUM_THREADS);

@@ -50,7 +50,13 @@ static void test_operator_bootstrapped(void) {
 }
 
 static void test_password_is_set(void) {
-    /* In operator-only mode, password_set should be true */
+    /* Current contract (core/qihse_auth.c): "default" means no password
+     * verifier is configured. Plain operator-only init (no
+     * QIHSE_OPERATOR_PASSWORD) is therefore the default state; bootstrapping
+     * a real password must clear the flag. The old assertion (always
+     * non-default) made the still-on-default guards unreachable. */
+    assert(qihse_auth_is_operator_password_default());
+    assert(qihse_auth_bootstrap_operator("OperatorModeTestPass123!"));
     assert(!qihse_auth_is_operator_password_default());
 }
 
