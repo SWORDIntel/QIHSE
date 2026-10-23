@@ -50,7 +50,7 @@ command has not been exercised on a live daemon in this update.
 | Operator password | `QIHSE_OPERATOR_PASSWORD` env var, **minimum 12 chars**, read at auth init | redis-server, cluster-daemon, federation-ca, demo, controller SDKs |
 | Demo default | if `QIHSE_OPERATOR_PASSWORD` is unset, `./qihse demo` uses `qihse-demo-operator` | demo only, per-process (auth state is in-memory) |
 | RESP wire auth | `AUTH GODMODE_OP <password>` (or `AUTH <password>`); `PING` answers pre-auth | redis-server, cluster-daemon |
-| `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set (mismatch = exit 2) | `qihse-redis-server --require-auth` |
+| `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set — mismatch exits 2 (enforced in `tools/qihse_redis_server.c`: the server refuses rather than silently rotating the credential) | `qihse-redis-server --require-auth` |
 | Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk (decision record: [auth_persistence.md](architecture/auth_persistence.md)) | all tools |
 
 Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is

@@ -157,3 +157,102 @@ FTS.SEARCH "port scan"
 GET cve:record:CVE-2020-1472
 GET cve:record:CVE-2026-0001   # top range: readable from node0 and node1
 ```
+
+---
+
+# RESP compatibility fixes — 2026-10-23
+
+Applied to `/opt/QIHSE` (now the single source of truth; `Documents/QIHSE`
+is a symlink to it). Verified with a raw RESP probe suite (22 checks) and a
+Celery/broker-primitive suite (7 checks): **22/22 and 7/7** against the live
+AIMEM service on `127.0.0.1:6401`.
+
+## 1. `MULTI`/`EXEC` segfaulted and lost every queued write
+
+`EXEC` dispatched the queue **while `in_multi` was still true**, so each queued
+command was re-queued into the array being iterated: the `realloc` invalidated
+the iterator (SIGSEGV; second client saw EOF) and nothing executed. `EXEC` also
+replied `*1` and left the client in transaction state.
+Fix: detach the queue and clear the transaction **before** dispatch
+(`src/spinnaker/qihse_resp_engine.c`, `qihse_resp_handle_exec`).
+
+## 2. Queued commands held dangling `argv` pointers
+
+`memcpy(slot, request, sizeof(...))` copied the struct only; `argv[].data`
+points into the connection read buffer, which the next command reuses.
+Fix: deep-clone each queued request (`qihse_resp_request_clone`), free on
+EXEC/DISCARD/MULTI.
+
+## 3. Every collection member lost its last character
+
+`"__h__:KEY:FIELD"` builders allocated `5 + klen + 1 + mlen + 1`, but the family
+prefix is **six** characters (`__h__:`), so `snprintf` truncated one byte:
+`f1`→`f`, `m1`/`m2`→`m`. `HSET h f1 a f2 b` stored a single field, `SADD` one
+member, `ZADD` one score.
+Fix: one `qihse_resp_member_key()` helper sized from the literals.
+Known limitation (pre-existing key format): a KEY or MEMBER containing `:` is
+ambiguous; changing the format would orphan stored members.
+
+## 4. Reads were stubs returning nothing
+
+`HGETALL`/`HKEYS`/`HVALS`/`HLEN`/`SCARD`/`SMEMBERS`/`ZCARD`/`ZRANGE`/`ZRANGEBYSCORE`
+returned empty arrays or `0` (`hgetall` carried "Without iteration, return empty").
+Fix: implemented over `qihse_kv_foreach_prefix_user` under the session
+principal — the same authorization gate `GET` uses — with `WITHSCORES`, `LIMIT`,
+`-inf/+inf` and `(exclusive` bounds.
+
+## 5. `BLPOP`/`BRPOP`/`BRPOPLPUSH` did not exist
+
+`-ERR unknown command`; a Celery worker cannot consume a queue without them.
+Fix: implemented with a 20 ms poll bounded at 30 s (a forever-block would pin a
+session thread), plus the push side for `BRPOPLPUSH`.
+
+## 6. `DEL` leaked collection records
+
+A hash/set/zset key exists only as `__h__:k:*` records, so `DEL` answered `0` and
+the members survived. Fix: `DEL` also removes the list record and every h/s/z
+member record, counting keys as Redis does.
+
+## 7. Standalone servers enforced cluster rules
+
+`qihse_resp_route` rejected ordinary multi-key `DEL` with `CROSSSLOT` with no
+sharded topology. Fix: a single-node view executes locally; cluster rules still
+apply with ≥2 nodes.
+
+## 8. `--password` silently overrode `QIHSE_OPERATOR_PASSWORD`
+
+`docs/OPERATIONS.md` promises "mismatch = exit 2", but the argv value won
+silently and rotated the operator credential (`AUTH env` → WRONGPASS,
+`AUTH flag` → OK).
+Fix: `tools/qihse_redis_server.c` refuses the mismatch with exit 2 and a clear
+message; match / env-only paths unchanged.
+
+## 9. Binaries could load a stale `libqihse.so`
+
+`qihse-redis-server` resolved `libqihse.so` from `ld.so.cache`
+(`/rpool/data/db/qihse/lib`) instead of its freshly built sibling; the resulting
+header/ABI mismatch corrupted `qihse_resp_server_config_t` and every start
+failed with a generic "auth gate or bind error".
+Fix: link with `-Wl,-rpath,'$ORIGIN'` (DT_RUNPATH) — **and** keep the loader copy
+in sync, since a cache hit still wins for other consumers — plus the create()
+failure path now prints errno, auth state, bind, port and the limits.
+
+## 10. Operator credential held an unexpanded placeholder
+
+`~/.config/qihse-aimem/operator-password.cred` decrypted to the literal string
+`${QIHSE_AUTH_PASSWORD}`; the launcher assigns it verbatim, so the daemon's
+operator password was the placeholder and the real 48-character secret in
+`~/.config/qihse-aimem/env` was unused.
+Fix: re-encrypted the credential with the real secret (old cred kept as
+`.bak-*`), and `start-qihse-aimem` now pins `LD_LIBRARY_PATH` to its own
+directory so the engine next to the launcher is always the one loaded.
+
+## Verification commands
+
+    # engine build + probe suites (reply-level, no redis-cli required)
+    make redis-server && ./qihse-redis-server --require-auth ...
+    # live service (AIMEM, :6401)
+    systemd-creds decrypt --user --name=operator-password \
+      ~/.config/qihse-aimem/operator-password.cred - | ...
+    # documented password rule
+    QIHSE_OPERATOR_PASSWORD=… ./qihse-redis-server --require-auth --password other  # exit 2

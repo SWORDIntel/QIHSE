@@ -271,7 +271,8 @@ redis-cluster-node: lib
 
 redis-server: lib
 	$(CC) $(CFLAGS) -o qihse-redis-server tools/qihse_redis_server.c \
-	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
+	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime \
+	    -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,'$$ORIGIN/lib' $(LDFLAGS)
 	@echo "qihse-redis-server build successful"
 
 backup-cli: lib
@@ -1588,3 +1589,11 @@ studio:
 
 install-studio:
 	@./portal/install-studio.sh
+
+# FTS.SAVE/FTS.LOAD adapter: durable per-node projection plus the mandatory
+# low-clearance/high-data negative (AGENTS.md invariant #3) and autoload.
+test-fts-persist-adapter: lib
+	$(CC) $(CFLAGS) -o tests/test_fts_persist_adapter tests/test_fts_persist_adapter.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_fts_persist_adapter
+
+test: test-fts-persist-adapter

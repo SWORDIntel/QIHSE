@@ -41,6 +41,7 @@
 #endif
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <float.h>
 #include <inttypes.h>
@@ -147,10 +148,14 @@ typedef struct {
     qihse_federation_watch_t* federation_watches[QIHSE_RESP_MAX_WATCHES];
     /* W2.5: per-session KEYSTONE change-feed handles (read/index identity). */
     qihse_keystone_feed_t* keystone_feeds[QIHSE_RESP_MAX_WATCHES];
-    /* Transaction (MULTI/EXEC) state */
+    /* Transaction (MULTI/EXEC) state.
+     * multi_queue owns deep copies of the queued requests: argv[].data points
+     * into the connection read buffer, which the very next command reuses, so a
+     * shallow copy made EXEC dispatch dangling pointers (segfault) and let a
+     * re-queued command realloc the array EXEC was iterating. */
     bool in_multi;
     bool multi_dirty;            /* a queued command had an error */
-    qihse_resp_request_t* multi_queue;
+    qihse_resp_request_t** multi_queue;
     size_t multi_queue_len;
     size_t multi_queue_cap;
     char** watch_keys;
@@ -322,6 +327,21 @@ struct qihse_resp_server {
     char** fts_keys;
     uint64_t fts_key_count;
     uint64_t fts_key_cap;
+    /* Durable FTS projection (FTS.SAVE/FTS.LOAD + startup autoload).
+     * fts_persist_dir is copied from config at create; empty = the commands
+     * refuse and the autoload is skipped. fts_autoload_principal stays
+     * caller-owned and may be NULL (no autoload, no invented identity). */
+    char fts_persist_dir[1024];
+    qihse_user_t* fts_autoload_principal;
+    pthread_t fts_autoload_thread;
+    bool fts_autoload_started;
+    /* KV change sequence the LIVE index was built (or loaded) against. This
+     * is the generation of the CONTENT, not of the store, so a snapshot is
+     * always stamped with what it actually describes. */
+    uint64_t fts_generation;
+    /* An index that was never built describes nothing; saving it would
+     * produce an authoritative-looking empty artifact. */
+    bool fts_built;
     /* SAVE/BGSAVE/LASTSAVE. save_lock guards the state below; the worker
      * thread is one-shot per BGSAVE and joined before the server goes away.
      * last_save is a completed-save timestamp (unix, 0 = never this run). */
@@ -986,6 +1006,18 @@ static bool qihse_resp_route(qihse_resp_session_t* session, const qihse_resp_req
                 server, (const char*)request->argv[keys->indexes[i]].data, request->argv[keys->indexes[i]].len);
         }
         if (all_marked) {
+            session->asking = false;
+            return true;
+        }
+    }
+    /* Standalone (no sharded topology, or a single-node view) must execute
+     * locally: CROSSSLOT and CLUSTERDOWN are cluster-mode rules, and enforcing
+     * them on a single node rejects ordinary multi-key DEL/MSET/EXISTS. */
+    {
+        qihse_cluster_node_t nodes[2];
+        size_t node_count = server->topology
+            ? qihse_cluster_topology_nodes(server->topology, nodes, 2u) : 0u;
+        if (node_count <= 1u) {
             session->asking = false;
             return true;
         }
@@ -2516,6 +2548,146 @@ static bool qihse_resp_handle_setex(qihse_resp_session_t* session, const qihse_r
     return stored ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR set failed");
 }
 
+/* Declared here because DEL (below) also removes list records. */
+static char* qihse_resp_list_key(const char* key);
+
+/* ---- Collection readers --------------------------------------------------
+ * Hashes, sets and sorted sets are stored one KV record per member
+ * ("__h__:KEY:FIELD", "__s__:KEY:MEMBER", "__z__:KEY:MEMBER" -> score). Reads
+ * enumerate those records by prefix under the session principal — the same
+ * authorization gate GET uses — instead of the empty stubs these commands
+ * used to be. */
+typedef struct {
+    char** member;
+    char** value;
+    size_t count;
+    size_t cap;
+} qihse_resp_members_t;
+
+typedef struct {
+    const char* prefix;
+    qihse_resp_members_t* out;
+    bool oom;
+} qihse_resp_collect_ctx_t;
+
+typedef struct {
+    const char* member;
+    double score;
+} qihse_resp_zitem_t;
+
+static void qihse_resp_members_free(qihse_resp_members_t* m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->count; i++) { free(m->member[i]); free(m->value[i]); }
+    free(m->member); free(m->value);
+    m->member = NULL; m->value = NULL; m->count = 0; m->cap = 0;
+}
+
+static bool qihse_resp_members_push(qihse_resp_members_t* m, const char* member, const char* value) {
+    if (m->count == m->cap) {
+        size_t cap = m->cap ? m->cap * 2u : 16u;
+        char** grown_members = (char**)realloc(m->member, cap * sizeof(*grown_members));
+        if (!grown_members) return false;
+        m->member = grown_members;
+        char** grown_values = (char**)realloc(m->value, cap * sizeof(*grown_values));
+        if (!grown_values) return false;
+        m->value = grown_values;
+        m->cap = cap;
+    }
+    char* member_copy = strdup(member ? member : "");
+    char* value_copy = strdup(value ? value : "");
+    if (!member_copy || !value_copy) { free(member_copy); free(value_copy); return false; }
+    m->member[m->count] = member_copy;
+    m->value[m->count] = value_copy;
+    m->count++;
+    return true;
+}
+
+static bool qihse_resp_collect_cb(const char* key, const char* value, void* user_data) {
+    qihse_resp_collect_ctx_t* ctx = (qihse_resp_collect_ctx_t*)user_data;
+    size_t prefix_len = strlen(ctx->prefix);
+    const char* member = key ? key + prefix_len : "";
+    if (!qihse_resp_members_push(ctx->out, member, value)) {
+        ctx->oom = true;
+        return false;   /* stop iterating; the caller frees what it has */
+    }
+    return true;
+}
+
+static bool qihse_resp_collect(qihse_resp_session_t* session, const char* prefix,
+                               qihse_resp_members_t* out) {
+    if (!session->server->store || !prefix) return false;
+    qihse_resp_collect_ctx_t ctx = { .prefix = prefix, .out = out, .oom = false };
+    qihse_kv_foreach_prefix_user(session->server->store, prefix, session->user,
+                                 qihse_resp_collect_cb, &ctx);
+    return !ctx.oom;
+}
+
+/* "__h__:KEY:" / "__s__:KEY:" / "__z__:KEY:" — caller frees. */
+static char* qihse_resp_coll_prefix(char family, const char* key) {
+    size_t klen = strlen(key);
+    char* out = (char*)malloc(klen + 16u);
+    if (out) snprintf(out, klen + 16u, "__%c__:%s:", family, key);
+    return out;
+}
+
+static int qihse_resp_zitem_cmp(const void* a, const void* b) {
+    const qihse_resp_zitem_t* x = (const qihse_resp_zitem_t*)a;
+    const qihse_resp_zitem_t* y = (const qihse_resp_zitem_t*)b;
+    if (x->score < y->score) return -1;
+    if (x->score > y->score) return 1;
+    return strcmp(x->member, y->member);
+}
+
+/* Collect one sorted set ordered by (score, member). Caller frees items->member. */
+static bool qihse_resp_collect_zset(qihse_resp_session_t* session, const char* key,
+                                    qihse_resp_zitem_t** out_items, size_t* out_count) {
+    *out_items = NULL; *out_count = 0;
+    char* prefix = qihse_resp_coll_prefix('z', key);
+    if (!prefix) return false;
+    qihse_resp_members_t members = {0};
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    free(prefix);
+    if (!ok) { qihse_resp_members_free(&members); return false; }
+    qihse_resp_zitem_t* items = members.count ? (qihse_resp_zitem_t*)calloc(members.count, sizeof(*items)) : NULL;
+    if (members.count && !items) { qihse_resp_members_free(&members); return false; }
+    for (size_t i = 0; i < members.count; i++) {
+        items[i].member = members.member[i];          /* ownership moves to items */
+        items[i].score = strtod(members.value[i], NULL);
+        free(members.value[i]);
+    }
+    free(members.member); free(members.value);
+    qsort(items, members.count, sizeof(*items), qihse_resp_zitem_cmp);
+    *out_items = items; *out_count = members.count;
+    return true;
+}
+
+static void qihse_resp_zitems_free(qihse_resp_zitem_t* items, size_t count) {
+    if (!items) return;
+    for (size_t i = 0; i < count; i++) free((void*)items[i].member);
+    free(items);
+}
+
+/* Redis-style range bound: "5", "-inf", "+inf", "(5" (exclusive). */
+static bool qihse_resp_parse_score_bound(const qihse_resp_arg_t* arg, double* out, bool* exclusive) {
+    if (!arg || !arg->data) return false;
+    char buffer[64];
+    size_t len = arg->len < sizeof(buffer) - 1u ? arg->len : sizeof(buffer) - 1u;
+    memcpy(buffer, arg->data, len);
+    buffer[len] = '\0';
+    *exclusive = false;
+    const char* text = buffer;
+    if (*text == '(') { *exclusive = true; text++; }
+    if (strcasecmp(text, "-inf") == 0) { *out = -INFINITY; return true; }
+    if (strcasecmp(text, "+inf") == 0 || strcasecmp(text, "inf") == 0) { *out = INFINITY; return true; }
+    char* end = NULL;
+    double value = strtod(text, &end);
+    if (end == text) return false;
+    *out = value;
+    return true;
+}
+
+/* ---- end collection readers -------------------------------------------- */
+
 static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool remove) {
     if (request->argc < 2) return qihse_resp_wrong_arity(session, remove ? "del" : "exists");
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
@@ -2532,6 +2704,33 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
         int64_t removed_now = 0;
         if (remove) {
             removed_now = qihse_kv_del_user(session->server->store, key, session->user);
+            /* A logical key can exist ONLY as derived records: DEL of a hash
+             * used to leave "__h__:key:*" behind, so DEL answered 0 and the
+             * members survived (HGETALL kept working after the delete). */
+            char* del_list_key = qihse_resp_list_key(key);
+            if (del_list_key) {
+                removed_now += qihse_kv_del_user(session->server->store, del_list_key, session->user);
+                free(del_list_key);
+            }
+            static const char del_families[3] = { 'h', 's', 'z' };
+            for (size_t f = 0; f < 3u; f++) {
+                char* del_prefix = qihse_resp_coll_prefix(del_families[f], key);
+                if (!del_prefix) continue;
+                qihse_resp_members_t del_members = {0};
+                if (qihse_resp_collect(session, del_prefix, &del_members)) {
+                    for (size_t m = 0; m < del_members.count; m++) {
+                        size_t need = strlen(del_prefix) + strlen(del_members.member[m]) + 1u;
+                        char* full = (char*)malloc(need);
+                        if (full) {
+                            snprintf(full, need, "%s%s", del_prefix, del_members.member[m]);
+                            removed_now += qihse_kv_del_user(session->server->store, full, session->user);
+                            free(full);
+                        }
+                    }
+                }
+                qihse_resp_members_free(&del_members);
+                free(del_prefix);
+            }
             if (removed_now && deleted_count < 16u && strlen(key) < 256u) {
                 snprintf(deleted_keys[deleted_count], sizeof(deleted_keys[0]), "%s", key);
                 deleted_count++;
@@ -2541,7 +2740,7 @@ static bool qihse_resp_handle_del_exists(qihse_resp_session_t* session, const qi
              * answered 0. */
             removed_now = qihse_kv_exists_user(session->server->store, key, session->user) ? 1 : 0;
         }
-        count += removed_now;
+        if (removed_now > 0) count++;   /* DEL counts keys, not member records */
         if (key != keybuf) free(key);
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
@@ -4048,28 +4247,34 @@ static char* qihse_resp_prefixed_key(const char* prefix, const char* key) {
     return out;
 }
 
+/* Member-record keys: "<family>KEY:MEMBER" where family is "__h__:", "__s__:"
+ * or "__z__:" — six characters. The previous hand-counted
+ * "5 + klen + 1 + mlen + 1" sizing was one byte short, so every member lost its
+ * LAST character: HSET h f1 a f2 b stored a single field "f", SADD kept one
+ * member and ZADD one score. Size from the literals instead.
+ * Known limitation (pre-existing key format): a KEY or MEMBER containing ':'
+ * is ambiguous here; changing the format would orphan stored members. */
+static char* qihse_resp_member_key(const char* family, const char* key, const char* member) {
+    size_t flen = strlen(family), klen = strlen(key), mlen = strlen(member);
+    size_t need = flen + klen + 1u + mlen + 1u;
+    char* out = (char*)malloc(need);
+    if (out) snprintf(out, need, "%s%s:%s", family, key, member);
+    return out;
+}
+
 /* Helper: build a hash field key "__h__:KEY:FIELD". Caller frees. */
 static char* qihse_resp_hash_key(const char* key, const char* field) {
-    size_t klen = strlen(key), flen = strlen(field);
-    char* out = malloc(5 + klen + 1 + flen + 1);
-    if (out) snprintf(out, 5 + klen + 1 + flen + 1, "__h__:%s:%s", key, field);
-    return out;
+    return qihse_resp_member_key("__h__:", key, field);
 }
 
 /* Helper: build a set member key "__s__:KEY:MEMBER". Caller frees. */
 static char* qihse_resp_set_key(const char* key, const char* member) {
-    size_t klen = strlen(key), mlen = strlen(member);
-    char* out = malloc(5 + klen + 1 + mlen + 1);
-    if (out) snprintf(out, 5 + klen + 1 + mlen + 1, "__s__:%s:%s", key, member);
-    return out;
+    return qihse_resp_member_key("__s__:", key, member);
 }
 
 /* Helper: build a zset member key "__z__:KEY:MEMBER". Caller frees. */
 static char* qihse_resp_zset_key(const char* key, const char* member) {
-    size_t klen = strlen(key), mlen = strlen(member);
-    char* out = malloc(5 + klen + 1 + mlen + 1);
-    if (out) snprintf(out, 5 + klen + 1 + mlen + 1, "__z__:%s:%s", key, member);
-    return out;
+    return qihse_resp_member_key("__z__:", key, member);
 }
 
 /* Helper: build a zset meta key "__zmeta__:KEY". Caller frees. */
@@ -4179,6 +4384,160 @@ static bool qihse_resp_handle_lpush(qihse_resp_session_t* session, const qihse_r
     free(parts);
     free(lk);
     return qihse_resp_integer(session, (int64_t)new_count);
+}
+
+/* ---- Blocking list commands (BLPOP/BRPOP/BRPOPLPUSH) --------------------
+ * Lists are one joined value under "__list__:KEY", so a pop is
+ * read-split-rewrite under the KV write lock. Waiters poll at 20 ms and are
+ * bounded at 30 s: a worker blocking forever on an empty queue would pin a
+ * session thread indefinitely. */
+#define QIHSE_RESP_BLOCK_POLL_NS (20L * 1000L * 1000L)
+#define QIHSE_RESP_BLOCK_MAX_SECONDS 30.0
+
+static char* qihse_resp_list_pop_locked(qihse_resp_session_t* session, const char* key, bool left) {
+    if (!session->server->store || !key) return NULL;
+    char* lk = qihse_resp_list_key(key);
+    if (!lk) return NULL;
+    char* popped = NULL;
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    if (existing) {
+        size_t count = 0;
+        char** parts = qihse_resp_list_split(existing, &count);
+        if (parts && count) {
+            size_t index = left ? 0u : count - 1u;
+            popped = strdup(parts[index]);
+            free(parts[index]);
+            size_t remaining = count - 1u;
+            if (remaining == 0u) {
+                qihse_kv_del_user(session->server->store, lk, session->user);
+            } else {
+                size_t value_len = 0;
+                char* joined = qihse_resp_list_join(parts, remaining, &value_len);
+                if (joined) {
+                    qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+                    free(joined);
+                }
+            }
+            for (size_t i = 0; i < count; i++)
+                if (i != index) free(parts[i]);
+            free(parts);
+        } else {
+            free(parts);
+        }
+        free(existing);
+    }
+    free(lk);
+    return popped;
+}
+
+static char* qihse_resp_list_pop(qihse_resp_session_t* session, const char* key, bool left) {
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    char* popped = qihse_resp_list_pop_locked(session, key, left);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    return popped;
+}
+
+static void qihse_resp_list_push_value(qihse_resp_session_t* session, const char* key,
+                                       const char* value, bool left) {
+    if (!session->server->store || !key || !value) return;
+    char* lk = qihse_resp_list_key(key);
+    if (!lk) return;
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    char* existing = qihse_kv_get_user(session->server->store, lk, session->user);
+    size_t count = 0;
+    char** parts = existing ? qihse_resp_list_split(existing, &count) : NULL;
+    size_t new_count = count + 1u;
+    char** merged = (char**)calloc(new_count, sizeof(*merged));
+    if (merged) {
+        size_t idx = 0;
+        if (left) {
+            merged[idx++] = (char*)value;
+            for (size_t i = 0; i < count; i++) merged[idx++] = parts[i];
+        } else {
+            for (size_t i = 0; i < count; i++) merged[idx++] = parts[i];
+            merged[idx++] = (char*)value;
+        }
+        size_t value_len = 0;
+        char* joined = qihse_resp_list_join(merged, new_count, &value_len);
+        if (joined) {
+            qihse_kv_set_user(session->server->store, lk, joined, 0, 0, session->user);
+            free(joined);
+        }
+        free(merged);
+    }
+    for (size_t i = 0; i < count; i++) free(parts[i]);
+    free(parts);
+    free(existing);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(lk);
+}
+
+static bool qihse_resp_handle_blpop(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool left) {
+    const char* name = left ? "blpop" : "brpop";
+    if (request->argc < 3) return qihse_resp_wrong_arity(session, name);
+    double timeout = 0.0;
+    if (!qihse_resp_parse_f64_arg(&request->argv[request->argc - 1u], &timeout))
+        return qihse_resp_error(session, "ERR timeout is not a float or out of range");
+    double limit = timeout > 0.0 ? timeout : QIHSE_RESP_BLOCK_MAX_SECONDS;
+    if (limit > QIHSE_RESP_BLOCK_MAX_SECONDS) limit = QIHSE_RESP_BLOCK_MAX_SECONDS;
+    size_t key_count = request->argc - 2u;
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (;;) {
+        for (size_t i = 0; i < key_count; i++) {
+            char* key = qihse_resp_arg_text(&request->argv[1u + i]);
+            if (!key) continue;
+            char* value = qihse_resp_list_pop(session, key, left);
+            if (value) {
+                bool emitted = qihse_resp_array(session, 2);
+                emitted = emitted && qihse_resp_bulk_text(session, key);
+                emitted = emitted && qihse_resp_bulk_text(session, value);
+                free(key); free(value);
+                return emitted;
+            }
+            free(key);
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec - started.tv_sec) +
+                         (double)(now.tv_nsec - started.tv_nsec) / 1e9;
+        if (elapsed >= limit) break;
+        struct timespec nap = { 0, QIHSE_RESP_BLOCK_POLL_NS };
+        nanosleep(&nap, NULL);
+    }
+    return qihse_resp_null(session);
+}
+
+static bool qihse_resp_handle_brpoplpush(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 4) return qihse_resp_wrong_arity(session, "brpoplpush");
+    double timeout = 0.0;
+    if (!qihse_resp_parse_f64_arg(&request->argv[3], &timeout))
+        return qihse_resp_error(session, "ERR timeout is not a float or out of range");
+    double limit = timeout > 0.0 ? timeout : QIHSE_RESP_BLOCK_MAX_SECONDS;
+    if (limit > QIHSE_RESP_BLOCK_MAX_SECONDS) limit = QIHSE_RESP_BLOCK_MAX_SECONDS;
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (;;) {
+        char* src = qihse_resp_arg_text(&request->argv[1]);
+        char* dst = qihse_resp_arg_text(&request->argv[2]);
+        if (!src || !dst) { free(src); free(dst); return qihse_resp_error(session, "ERR invalid key"); }
+        char* value = qihse_resp_list_pop(session, src, false);
+        if (value) {
+            qihse_resp_list_push_value(session, dst, value, true);
+            bool emitted = qihse_resp_bulk_text(session, value);
+            free(src); free(dst); free(value);
+            return emitted;
+        }
+        free(src); free(dst);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec - started.tv_sec) +
+                         (double)(now.tv_nsec - started.tv_nsec) / 1e9;
+        if (elapsed >= limit) break;
+        struct timespec nap = { 0, QIHSE_RESP_BLOCK_POLL_NS };
+        nanosleep(&nap, NULL);
+    }
+    return qihse_resp_null(session);
 }
 
 static bool qihse_resp_handle_lpop(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool left) {
@@ -4540,6 +4899,7 @@ static bool qihse_resp_handle_rpoplpush(qihse_resp_session_t* session, const qih
 
 /* ---- Hash commands ---- */
 
+
 static bool qihse_resp_handle_hset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 4 || (request->argc % 2) != 0) return qihse_resp_wrong_arity(session, "hset");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
@@ -4585,8 +4945,24 @@ static bool qihse_resp_handle_hget(qihse_resp_session_t* session, const qihse_re
 static bool qihse_resp_handle_hgetall(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "hgetall");
     if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
-    /* Without iteration, return empty. In a full impl we'd iterate KV keys. */
-    return qihse_resp_array(session, 0);
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('h', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    if (!ok) { qihse_resp_members_free(&members); return qihse_resp_error(session, "ERR out of memory"); }
+    bool emitted = qihse_resp_array(session, members.count * 2u);
+    for (size_t i = 0; emitted && i < members.count; i++) {
+        emitted = qihse_resp_bulk_text(session, members.member[i]) &&
+                   qihse_resp_bulk_text(session, members.value[i]);
+    }
+    qihse_resp_members_free(&members);
+    return emitted;
 }
 
 static bool qihse_resp_handle_hdel(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4622,17 +4998,63 @@ static bool qihse_resp_handle_hexists(qihse_resp_session_t* session, const qihse
 
 static bool qihse_resp_handle_hkeys(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "hkeys");
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('h', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    if (!ok) { qihse_resp_members_free(&members); return qihse_resp_error(session, "ERR out of memory"); }
+    bool emitted = qihse_resp_array(session, members.count);
+    for (size_t i = 0; emitted && i < members.count; i++)
+        emitted = qihse_resp_bulk_text(session, members.member[i]);
+    qihse_resp_members_free(&members);
+    return emitted;
 }
 
 static bool qihse_resp_handle_hvals(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "hvals");
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('h', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    if (!ok) { qihse_resp_members_free(&members); return qihse_resp_error(session, "ERR out of memory"); }
+    bool emitted = qihse_resp_array(session, members.count);
+    for (size_t i = 0; emitted && i < members.count; i++)
+        emitted = qihse_resp_bulk_text(session, members.value[i]);
+    qihse_resp_members_free(&members);
+    return emitted;
 }
 
 static bool qihse_resp_handle_hlen(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "hlen");
-    return qihse_resp_integer(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('h', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    size_t count = members.count;
+    qihse_resp_members_free(&members);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    return qihse_resp_integer(session, (int64_t)count);
 }
 
 static bool qihse_resp_handle_hincrby(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4751,7 +5173,23 @@ static bool qihse_resp_handle_srem(qihse_resp_session_t* session, const qihse_re
 
 static bool qihse_resp_handle_smembers(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "smembers");
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('s', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    if (!ok) { qihse_resp_members_free(&members); return qihse_resp_error(session, "ERR out of memory"); }
+    bool emitted = qihse_resp_array(session, members.count);
+    for (size_t i = 0; emitted && i < members.count; i++)
+        emitted = qihse_resp_bulk_text(session, members.member[i]);
+    qihse_resp_members_free(&members);
+    return emitted;
 }
 
 static bool qihse_resp_handle_sismember(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4770,7 +5208,21 @@ static bool qihse_resp_handle_sismember(qihse_resp_session_t* session, const qih
 
 static bool qihse_resp_handle_scard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "scard");
-    return qihse_resp_integer(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    char* prefix = qihse_resp_coll_prefix('s', key);
+    free(key);
+    if (!prefix) return qihse_resp_error(session, "ERR out of memory");
+    qihse_resp_members_t members = {0};
+    pthread_rwlock_rdlock(&session->server->kv_lock);
+    bool ok = qihse_resp_collect(session, prefix, &members);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    free(prefix);
+    size_t count = members.count;
+    qihse_resp_members_free(&members);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    return qihse_resp_integer(session, (int64_t)count);
 }
 
 static bool qihse_resp_handle_spop(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4878,7 +5330,15 @@ static bool qihse_resp_handle_zscore(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_zcard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "zcard");
-    return qihse_resp_integer(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    free(key);
+    qihse_resp_zitems_free(items, count);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    return qihse_resp_integer(session, (int64_t)count);
 }
 
 static bool qihse_resp_handle_zcount(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -4888,7 +5348,37 @@ static bool qihse_resp_handle_zcount(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_zrange(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
     if (request->argc < 4) return qihse_resp_wrong_arity(session, rev ? "zrevrange" : "zrange");
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t start = 0, stop = 0;
+    if (!qihse_resp_parse_i64_arg(&request->argv[2], &start) ||
+        !qihse_resp_parse_i64_arg(&request->argv[3], &stop))
+        return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    bool with_scores = false;
+    if (request->argc >= 5 && qihse_resp_arg_equal(&request->argv[4], "WITHSCORES")) with_scores = true;
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    free(key);
+    if (!ok) { qihse_resp_zitems_free(items, count); return qihse_resp_error(session, "ERR out of memory"); }
+    int64_t last = (int64_t)count - 1;
+    if (start < 0) start = (int64_t)count + start;
+    if (stop < 0) stop = (int64_t)count + stop;
+    if (start < 0) start = 0;
+    if (stop > last) stop = last;
+    size_t emitted_count = (start > stop || count == 0) ? 0u : (size_t)(stop - start + 1);
+    bool emitted = qihse_resp_array(session, emitted_count * (with_scores ? 2u : 1u));
+    for (size_t n = 0; emitted && n < emitted_count; n++) {
+        size_t index = rev ? (size_t)(last - (int64_t)(start + (int64_t)n)) : (size_t)(start + (int64_t)n);
+        emitted = qihse_resp_bulk_text(session, items[index].member);
+        if (emitted && with_scores) {
+            char score[40];
+            snprintf(score, sizeof(score), "%.17g", items[index].score);
+            emitted = qihse_resp_bulk_text(session, score);
+        }
+    }
+    qihse_resp_zitems_free(items, count);
+    return emitted;
 }
 
 static bool qihse_resp_handle_zrank(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
@@ -4925,7 +5415,64 @@ static bool qihse_resp_handle_zpop(qihse_resp_session_t* session, const qihse_re
 
 static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
     if (request->argc < 4) return qihse_resp_wrong_arity(session, rev ? "zrevrangebyscore" : "zrangebyscore");
-    return qihse_resp_array(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    double min_score = 0.0, max_score = 0.0;
+    bool min_exclusive = false, max_exclusive = false;
+    /* ZREVRANGEBYSCORE takes max first */
+    const qihse_resp_arg_t* first = &request->argv[rev ? 3 : 2];
+    const qihse_resp_arg_t* second = &request->argv[rev ? 2 : 3];
+    if (!qihse_resp_parse_score_bound(first, &min_score, &min_exclusive) ||
+        !qihse_resp_parse_score_bound(second, &max_score, &max_exclusive))
+        return qihse_resp_error(session, "ERR min or max is not a float");
+    bool with_scores = false;
+    long limit_offset = 0, limit_count = -1;
+    for (size_t i = 4; i < request->argc; i++) {
+        if (qihse_resp_arg_equal(&request->argv[i], "WITHSCORES")) with_scores = true;
+        else if (qihse_resp_arg_equal(&request->argv[i], "LIMIT") && i + 2u < request->argc) {
+            int64_t off = 0, cnt = 0;
+            if (!qihse_resp_parse_i64_arg(&request->argv[i + 1], &off) ||
+                !qihse_resp_parse_i64_arg(&request->argv[i + 2], &cnt))
+                return qihse_resp_error(session, "ERR value is not an integer or out of range");
+            limit_offset = (long)off; limit_count = (long)cnt;
+            i += 2u;
+        }
+    }
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    free(key);
+    if (!ok) { qihse_resp_zitems_free(items, count); return qihse_resp_error(session, "ERR out of memory"); }
+    size_t matched = 0;
+    for (size_t i = 0; i < count; i++) {
+        double s = items[i].score;
+        bool above_min = min_exclusive ? (s > min_score) : (s >= min_score);
+        bool below_max = max_exclusive ? (s < max_score) : (s <= max_score);
+        if (above_min && below_max) matched++;
+    }
+    size_t skip = (size_t)(limit_offset > 0 ? limit_offset : 0);
+    size_t take = matched;
+    if (skip >= take) take = 0; else take -= skip;
+    if (limit_count >= 0 && (size_t)limit_count < take) take = (size_t)limit_count;
+    bool emitted = qihse_resp_array(session, take * (with_scores ? 2u : 1u));
+    size_t seen = 0, written = 0;
+    for (size_t n = 0; emitted && n < count && written < take; n++) {
+        size_t index = rev ? (count - 1u - n) : n;
+        double s = items[index].score;
+        bool above_min = min_exclusive ? (s > min_score) : (s >= min_score);
+        bool below_max = max_exclusive ? (s < max_score) : (s <= max_score);
+        if (!(above_min && below_max)) continue;
+        if (seen++ < skip) continue;
+        emitted = qihse_resp_bulk_text(session, items[index].member);
+        if (emitted && with_scores) {
+            char score[40];
+            snprintf(score, sizeof(score), "%.17g", items[index].score);
+            emitted = qihse_resp_bulk_text(session, score);
+        }
+        written++;
+    }
+    qihse_resp_zitems_free(items, count);
+    return emitted;
 }
 
 /* ---- Key/generic commands ---- */
@@ -5043,20 +5590,39 @@ static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_re
     return built;
 }
 
-/* ---- FTS.BUILD / FTS.SEARCH — BM25 search over the KV store -------------
+/* ---- FTS.* — BM25 search over the KV store -------------------------------
  * The index is caller-owned (config.fts; the cluster daemon installs one).
- * BUILD iterates the store with the poison-tolerant qihse_kv_foreach_user
- * (documents are only ever records the BUILDING principal can read), feeds
- * each match as one document (text = key + "\n" + value), and swaps the
- * index destroy+create so rebuilds start clean; doc ids restart at 1.
+ * BUILD iterates the store with the poison-tolerant
+ * qihse_kv_foreach_meta_user (documents are only ever records the BUILDING
+ * principal can read), feeds each match as one document (text = key + "\n" +
+ * value), and swaps the index destroy+create so rebuilds start clean; doc ids
+ * restart at 1.
+ *
+ * Every document carries the classification and SCI of the record it was
+ * built from — taken from the same record read as the value, never from a
+ * second lookup — so BM25 corpus statistics, scores and result counts are
+ * computed only over rows the QUERYING principal may read. A projection
+ * built by an operator therefore does not become a low-clearance key
+ * oracle through SEARCH or VECHYBRID.
+ *
  * SEARCH replies with a FLAT array [key, score, key, score, ...] — score is
- * the BM25 relevance as text. The index is in-memory by design: after a
- * restart FTS.SEARCH returns an empty array until the next FTS.BUILD.
+ * the BM25 relevance as text.
+ *
+ * Persistence (FTS.SAVE / FTS.LOAD + the startup autoload) is opt-in via
+ * config.fts_persist_directory. The index alone is not a usable projection:
+ * the engine keeps a separate dense map from doc id to KV key, so the
+ * artifact is a PAIR — `fts-index.qfts` (the engine's own format) and
+ * `fts-index.keys` (this file's sidecar, holding that map plus the store
+ * generation the index was built against). Neither file is trusted on its
+ * own: LOAD requires the sidecar's index digest to match the file it is
+ * paired with, the doc counts to agree, and the recorded generation to equal
+ * the live KV change sequence. Anything else is reported as stale or corrupt
+ * rather than silently serving an index that no longer describes the store.
  *
  * Bounds: pattern ≤ 256B, query ≤ 1024B, limit ∈ [1,100] (default 20),
- * 100k documents max, 1MB of text per document. BUILD holds fts_meta_lock
- * for its whole run, so concurrent SEARCHes wait rather than race the
- * destroy+create swap; lock order is kv_lock → fts_meta_lock only. */
+ * 100k documents max, 1MB of text per document. BUILD and LOAD hold
+ * fts_meta_lock across the swap, so concurrent SEARCHes wait rather than race
+ * it; lock order is fts_meta_lock → kv_lock only. */
 
 #define QIHSE_RESP_FTS_MAX_DOCS      100000u
 #define QIHSE_RESP_FTS_MAX_PATTERN   256u
@@ -5064,6 +5630,13 @@ static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_re
 #define QIHSE_RESP_FTS_DEFAULT_LIMIT 20u
 #define QIHSE_RESP_FTS_MAX_LIMIT     100u
 #define QIHSE_RESP_FTS_MAX_DOC_BYTES (1u << 20)
+/* KV_MAX_KEY_LEN in the store. A sidecar key longer than this cannot exist
+ * as a record, so a larger declared length is corruption by definition. */
+#define QIHSE_RESP_FTS_MAX_KEY_BYTES 65535u
+#define QIHSE_RESP_FTS_INDEX_NAME    "fts-index.qfts"
+#define QIHSE_RESP_FTS_KEYS_NAME     "fts-index.keys"
+#define QIHSE_RESP_FTS_KEYS_MAGIC    0x53594B51u /* "QKYS", little-endian */
+#define QIHSE_RESP_FTS_KEYS_VERSION  1u
 
 typedef struct {
     qihse_fts_index_t* index;
@@ -5075,7 +5648,9 @@ typedef struct {
     bool map_full;      /* engine map allocation failed: stop cleanly */
 } fts_build_ctx_t;
 
-static bool qihse_resp_fts_build_cb(const char* key, const char* value, void* user_data) {
+static bool qihse_resp_fts_build_cb(const char* key, const char* value,
+                                    uint16_t classification, uint16_t sci_compartment,
+                                    void* user_data) {
     fts_build_ctx_t* b = (fts_build_ctx_t*)user_data;
     if (!b || !b->keys || !key) return false;
     if (b->pattern && fnmatch(b->pattern, key, 0) != 0) return true;
@@ -5094,8 +5669,8 @@ static bool qihse_resp_fts_build_cb(const char* key, const char* value, void* us
     /* doc ids are dense: doc_id == count + 1, so keys[doc_id - 1] is exact. */
     uint64_t doc_id = b->count + 1u;
     bool added = qihse_fts_add_document_user(b->index, doc_id, text, klen + 1u + vlen,
-                                             0u, 0u, QIHSE_KEYSTONE_CLASS_UNKNOWN,
-                                             b->user);
+                                             classification, sci_compartment,
+                                             QIHSE_KEYSTONE_CLASS_UNKNOWN, b->user);
     free(text);
     if (!added) return true; /* unusable document: skip, keep the run alive */
     b->keys[b->count] = strdup(key);
@@ -5104,10 +5679,548 @@ static bool qihse_resp_fts_build_cb(const char* key, const char* value, void* us
     return true;
 }
 
+/* Rebuild the live index from the store as `user`, replacing the current one.
+ * Takes no session so the startup autoload can run the identical path. */
+static bool qihse_resp_fts_rebuild(qihse_resp_server_t* server, qihse_user_t* user,
+                                   const char* pattern, uint64_t* out_count,
+                                   char* err, size_t err_cap) {
+    if (!server->store) {
+        snprintf(err, err_cap, "key-value store is not configured");
+        return false;
+    }
+    if (!server->fts) {
+        snprintf(err, err_cap, "full-text index is not configured");
+        return false;
+    }
+    if (!user) {
+        snprintf(err, err_cap, "no authenticated principal");
+        return false;
+    }
+
+    fts_build_ctx_t b;
+    memset(&b, 0, sizeof(b));
+    b.pattern = pattern;
+    b.cap = QIHSE_RESP_FTS_MAX_DOCS;
+    b.user = user;
+
+    pthread_mutex_lock(&server->fts_meta_lock);
+    /* Rebuild semantics: destroy+create, so postings, doc stats and the
+     * doc-id space all start clean. VECHYBRID reads server->fts per call
+     * and takes the same lock's discipline, so the swap is safe. */
+    qihse_fts_index_t* fresh = qihse_fts_create();
+    if (!fresh) {
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "out of memory");
+        return false;
+    }
+    b.keys = (char**)calloc(b.cap + 1u, sizeof(char*));
+    if (!b.keys) {
+        qihse_fts_destroy(fresh);
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "out of memory");
+        return false;
+    }
+    qihse_fts_index_t* old = server->fts;
+    char** old_keys = server->fts_keys;
+    uint64_t old_count = server->fts_key_count;
+    server->fts = fresh;
+    server->fts_keys = b.keys;
+    server->fts_key_count = 0u;
+    server->fts_key_cap = b.cap;
+
+    pthread_rwlock_rdlock(&server->kv_lock);
+    b.index = fresh;
+    /* Read BEFORE the scan: a write that lands mid-build must leave the
+     * recorded generation behind the store, never ahead of it. */
+    server->fts_generation = qihse_kv_change_seq(server->store);
+    server->fts_built = true;
+    qihse_kv_foreach_meta_user(server->store, user,
+                               qihse_resp_fts_build_cb, &b);
+    pthread_rwlock_unlock(&server->kv_lock);
+    server->fts_key_count = b.count;
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    for (uint64_t i = 0; i < old_count; i++) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    /* b.count == cap means the bound was reached: remaining records were
+     * not indexed. The count is the honest reply either way. */
+    *out_count = b.count;
+    return true;
+}
+
+/* ── Durable projection ───────────────────────────────────────────────────
+ * Artifact paths are derived from the server's configured directory only; a
+ * request can never choose where a classified projection is written. */
+
+static bool qihse_resp_fts_paths(const qihse_resp_server_t* server,
+                                 char* index_path, size_t index_cap,
+                                 char* keys_path, size_t keys_cap) {
+    if (!server->fts_persist_dir[0]) return false;
+    int n = snprintf(index_path, index_cap, "%s/%s", server->fts_persist_dir,
+                     QIHSE_RESP_FTS_INDEX_NAME);
+    if (n < 0 || (size_t)n >= index_cap) return false;
+    n = snprintf(keys_path, keys_cap, "%s/%s", server->fts_persist_dir,
+                 QIHSE_RESP_FTS_KEYS_NAME);
+    return n > 0 && (size_t)n < keys_cap;
+}
+
+static bool qihse_resp_fts_sync_directory(const char* file_path) {
+    if (!file_path) return false;
+    char directory[1100];
+    size_t len = strlen(file_path);
+    if (len == 0u || len >= sizeof(directory)) return false;
+    memcpy(directory, file_path, len + 1u);
+    char* slash = strrchr(directory, '/');
+    if (!slash) return false;
+    if (slash == directory) slash[1] = '\0';
+    else *slash = '\0';
+    int fd = open(directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    close(fd);
+    return ok;
+}
+
+/* Streamed FNV-1a over the index file: the sidecar's coherence token. This is
+ * a torn-pair detector, not a security boundary — the directory is 0700 and
+ * both files are 0600, so an attacker able to rewrite them has already won. */
+static bool qihse_resp_fts_file_digest(const char* path, uint64_t* out_size,
+                                       uint64_t* out_digest) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(fd);
+        return false;
+    }
+    uint64_t hash = 0xcbf29ce484222325ull;
+    uint8_t buffer[8192];
+    uint64_t total = 0u;
+    bool ok = true;
+    for (;;) {
+        ssize_t got = read(fd, buffer, sizeof(buffer));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (got == 0) break;
+        total += (uint64_t)got;
+        for (ssize_t i = 0; i < got; i++) {
+            hash ^= buffer[i];
+            hash *= 0x100000001b3ull;
+        }
+    }
+    close(fd);
+    if (!ok) return false;
+    *out_size = total;
+    *out_digest = hash;
+    return true;
+}
+
+typedef struct {
+    uint64_t generation;      /* KV change sequence the index was built against */
+    uint64_t index_size;
+    uint64_t index_digest;
+    uint32_t doc_count;
+    char** keys;              /* keys[doc_id - 1]; caller frees */
+} qihse_resp_fts_sidecar_t;
+
+static void qihse_resp_fts_sidecar_free(qihse_resp_fts_sidecar_t* sidecar) {
+    if (!sidecar || !sidecar->keys) return;
+    for (uint32_t i = 0; i < sidecar->doc_count; i++) free(sidecar->keys[i]);
+    free(sidecar->keys);
+    sidecar->keys = NULL;
+    sidecar->doc_count = 0u;
+}
+
+/* Atomic sidecar write: a 0600 temp file, an fsynced rename, and an fsynced
+ * directory. A failed write leaves no temp file behind. */
+static bool qihse_resp_fts_write_sidecar(const char* path, uint64_t generation,
+                                         uint64_t index_size, uint64_t index_digest,
+                                         char* const* keys, uint64_t count) {
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return false;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    FILE* f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(tmp); return false; }
+
+    uint32_t magic = QIHSE_RESP_FTS_KEYS_MAGIC;
+    uint32_t version = QIHSE_RESP_FTS_KEYS_VERSION;
+    uint32_t doc_count = (uint32_t)count;
+    uint32_t reserved = 0u;
+    bool ok = fwrite(&magic, sizeof(magic), 1u, f) == 1u &&
+              fwrite(&version, sizeof(version), 1u, f) == 1u &&
+              fwrite(&doc_count, sizeof(doc_count), 1u, f) == 1u &&
+              fwrite(&reserved, sizeof(reserved), 1u, f) == 1u &&
+              fwrite(&generation, sizeof(generation), 1u, f) == 1u &&
+              fwrite(&index_size, sizeof(index_size), 1u, f) == 1u &&
+              fwrite(&index_digest, sizeof(index_digest), 1u, f) == 1u;
+    for (uint64_t i = 0u; ok && i < count; i++) {
+        size_t klen = keys[i] ? strlen(keys[i]) : 0u;
+        if (klen == 0u || klen > QIHSE_RESP_FTS_MAX_KEY_BYTES) { ok = false; break; }
+        uint32_t klen32 = (uint32_t)klen;
+        ok = fwrite(&klen32, sizeof(klen32), 1u, f) == 1u &&
+             fwrite(keys[i], 1u, klen, f) == klen;
+    }
+    if (ok && fflush(f) != 0) ok = false;
+    if (ok && fsync(fileno(f)) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { unlink(tmp); return false; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return false; }
+    return qihse_resp_fts_sync_directory(path);
+}
+
+/* Read and structurally validate the sidecar. Declared lengths are checked
+ * against the actual file size before any allocation is sized by them. */
+static bool qihse_resp_fts_read_sidecar(const char* path,
+                                        qihse_resp_fts_sidecar_t* out) {
+    memset(out, 0, sizeof(*out));
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(fd);
+        return false;
+    }
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    uint64_t file_size = (uint64_t)st.st_size;
+
+    uint32_t magic = 0u, version = 0u, doc_count = 0u, reserved = 0u;
+    uint64_t generation = 0u, index_size = 0u, index_digest = 0u;
+    /* Declared before the first goto: every failure path below unwinds
+     * through `fail`, and an uninitialised `keys` there would free garbage. */
+    char** keys = NULL;
+    if (fread(&magic, sizeof(magic), 1u, f) != 1u || magic != QIHSE_RESP_FTS_KEYS_MAGIC ||
+        fread(&version, sizeof(version), 1u, f) != 1u || version != QIHSE_RESP_FTS_KEYS_VERSION ||
+        fread(&doc_count, sizeof(doc_count), 1u, f) != 1u ||
+        fread(&reserved, sizeof(reserved), 1u, f) != 1u ||
+        fread(&generation, sizeof(generation), 1u, f) != 1u ||
+        fread(&index_size, sizeof(index_size), 1u, f) != 1u ||
+        fread(&index_digest, sizeof(index_digest), 1u, f) != 1u) goto fail;
+    if (doc_count > QIHSE_RESP_FTS_MAX_DOCS) goto fail;
+    if (doc_count > 0u) {
+        keys = (char**)calloc(doc_count, sizeof(*keys));
+        if (!keys) goto fail;
+    }
+    for (uint32_t i = 0u; i < doc_count; i++) {
+        uint32_t klen = 0u;
+        long pos = ftell(f);
+        if (pos < 0 || (uint64_t)pos > file_size) goto fail;
+        uint64_t remaining = file_size - (uint64_t)pos;
+        if (remaining < sizeof(klen)) goto fail;
+        if (fread(&klen, sizeof(klen), 1u, f) != 1u) goto fail;
+        if (klen == 0u || klen > QIHSE_RESP_FTS_MAX_KEY_BYTES ||
+            (uint64_t)klen > remaining - sizeof(klen)) goto fail;
+        char* key = (char*)malloc((size_t)klen + 1u);
+        if (!key) goto fail;
+        if (fread(key, 1u, klen, f) != klen) { free(key); goto fail; }
+        key[klen] = '\0';
+        keys[i] = key;
+    }
+    if (fgetc(f) != EOF) goto fail;
+    fclose(f);
+    out->generation = generation;
+    out->index_size = index_size;
+    out->index_digest = index_digest;
+    out->doc_count = doc_count;
+    out->keys = keys;
+    return true;
+fail:
+    if (keys) {
+        for (uint32_t i = 0u; i < doc_count; i++) free(keys[i]);
+        free(keys);
+    }
+    fclose(f);
+    return false;
+}
+
+typedef enum {
+    QIHSE_RESP_FTS_LOAD_OK = 0,
+    QIHSE_RESP_FTS_LOAD_UNAVAILABLE, /* persistence off or nothing to load */
+    QIHSE_RESP_FTS_LOAD_CORRUPT,
+    QIHSE_RESP_FTS_LOAD_DENIED
+} qihse_resp_fts_load_status_t;
+
+static const char* qihse_resp_fts_load_reason(qihse_resp_fts_load_status_t status) {
+    switch (status) {
+        case QIHSE_RESP_FTS_LOAD_UNAVAILABLE: return "no saved full-text index to load";
+        case QIHSE_RESP_FTS_LOAD_CORRUPT:     return "saved full-text index is corrupt, torn, or ahead of the store";
+        case QIHSE_RESP_FTS_LOAD_DENIED:      return "saved full-text index is not authorized for this principal";
+        default: break;
+    }
+    return "ok";
+}
+
+/* Load the artifact as `user` and install it. The engine index format and the
+ * doc-id map are validated independently and only then swapped in together. */
+static qihse_resp_fts_load_status_t qihse_resp_fts_load_artifact(
+        qihse_resp_server_t* server, qihse_user_t* user, uint64_t* out_count,
+        uint64_t* out_lag) {
+    if (!server->fts_persist_dir[0] || !server->store || !server->fts || !user)
+        return QIHSE_RESP_FTS_LOAD_UNAVAILABLE;
+    char index_path[1200], keys_path[1200];
+    if (!qihse_resp_fts_paths(server, index_path, sizeof(index_path),
+                              keys_path, sizeof(keys_path)))
+        return QIHSE_RESP_FTS_LOAD_UNAVAILABLE;
+
+    qihse_resp_fts_sidecar_t sidecar;
+    if (!qihse_resp_fts_read_sidecar(keys_path, &sidecar))
+        return QIHSE_RESP_FTS_LOAD_UNAVAILABLE;
+
+    uint64_t index_size = 0u, index_digest = 0u;
+    if (!qihse_resp_fts_file_digest(index_path, &index_size, &index_digest)) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_UNAVAILABLE;
+    }
+    /* The pair must describe each other before either is trusted. */
+    if (index_size != sidecar.index_size || index_digest != sidecar.index_digest) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_CORRUPT;
+    }
+    /* The store is the source of truth. An artifact is a snapshot of some
+     * earlier mutation sequence, so it is valid when it is at or behind the
+     * live one; only an artifact claiming a FUTURE sequence is impossible and
+     * therefore corrupt. Checked before decoding so a bad pair costs one
+     * digest pass, not a full load. */
+    uint64_t live_generation = qihse_kv_change_seq(server->store);
+    if (sidecar.generation > live_generation) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_CORRUPT;
+    }
+
+    qihse_fts_index_t* loaded = qihse_fts_load(index_path, user);
+    if (!loaded) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_DENIED;
+    }
+    if (qihse_fts_doc_count(loaded) != sidecar.doc_count) {
+        qihse_fts_destroy(loaded);
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_CORRUPT;
+    }
+
+    pthread_mutex_lock(&server->fts_meta_lock);
+    /* Re-check under the lock: the snapshot must still be at or behind the
+     * store. Writes that landed during the decode only widen the lag, which
+     * is reported; a snapshot ahead of the store is corruption. */
+    live_generation = qihse_kv_change_seq(server->store);
+    if (sidecar.generation > live_generation) {
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        qihse_fts_destroy(loaded);
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_CORRUPT;
+    }
+    uint64_t lag = live_generation - sidecar.generation;
+    qihse_fts_index_t* old = server->fts;
+    char** old_keys = server->fts_keys;
+    uint64_t old_count = server->fts_key_count;
+    uint32_t installed = sidecar.doc_count;
+    server->fts = loaded;
+    server->fts_keys = sidecar.keys;
+    server->fts_key_count = installed;
+    server->fts_key_cap = installed;
+    server->fts_generation = sidecar.generation;
+    server->fts_built = true;
+    pthread_mutex_unlock(&server->fts_meta_lock);
+
+    for (uint64_t i = 0; i < old_count; i++) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    *out_count = installed;
+    if (out_lag) *out_lag = lag;
+    return QIHSE_RESP_FTS_LOAD_OK;
+}
+
+/* FTS.SAVE / FTS.LOAD move a whole-node, possibly classified projection to
+ * and from one shared file, so they are system-domain operator commands: a
+ * low-clearance principal must not be able to replace the node's artifact
+ * with its own narrower one (durability downgrade) and must not learn from a
+ * refusal whether the artifact is stale. Authorization inside the artifact is
+ * separate and still enforced: qihse_fts_save/load refuse a principal that
+ * cannot read every document in the index.
+ *
+ * Returns true only when the command may proceed. On refusal the error is
+ * already written to the session — returning true there would let the caller
+ * fall through and execute the command anyway. */
+static bool qihse_resp_fts_persistence_admin(qihse_resp_session_t* session, const char* command) {
+    if (!session->user) {
+        qihse_resp_error(session, session->server->auth_required
+                                    ? "NOAUTH Authentication required."
+                                    : "NOPERM command requires an authenticated principal");
+        return false;
+    }
+    if (qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "NOPERM %s is restricted to the system domain administrator", command);
+        qihse_resp_error(session, msg);
+        return false;
+    }
+    return true;
+}
+
+/* Write the pair: the engine's own index format plus the doc-id sidecar that
+ * makes it searchable. Both replace their target atomically, and the sidecar
+ * records this index file's digest so a torn pair is never accepted. */
+static bool qihse_resp_fts_save_artifact(qihse_resp_server_t* server,
+                                         qihse_user_t* user,
+                                         char* err, size_t err_cap) {
+    if (!server->fts_persist_dir[0]) {
+        snprintf(err, err_cap, "full-text persistence is not configured");
+        return false;
+    }
+    if (!server->store) {
+        snprintf(err, err_cap, "key-value store is not configured");
+        return false;
+    }
+    if (!user) {
+        snprintf(err, err_cap, "no authenticated principal");
+        return false;
+    }
+    char index_path[1200], keys_path[1200];
+    if (!qihse_resp_fts_paths(server, index_path, sizeof(index_path),
+                              keys_path, sizeof(keys_path))) {
+        snprintf(err, err_cap, "full-text persistence path is unusable");
+        return false;
+    }
+
+    pthread_mutex_lock(&server->fts_meta_lock);
+    if (!server->fts) {
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "full-text index is not configured");
+        return false;
+    }
+    /* Make the mutation sequence durable BEFORE recording it, so the
+     * generation stamped into the sidecar still describes the store after a
+     * crash and a WAL replay. */
+    pthread_rwlock_wrlock(&server->kv_lock);
+    bool synced = qihse_kv_sync_store(server->store);
+    uint64_t generation = qihse_kv_change_seq(server->store);
+    pthread_rwlock_unlock(&server->kv_lock);
+    if (!synced) {
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "could not flush the key-value store");
+        return false;
+    }
+    /* A store that keeps moving (a replicating node always does) must still
+     * be able to persist its projection. The artifact records the generation
+     * its CONTENT describes, so it is a true snapshot of an earlier state
+     * rather than a claim about the present; LOAD reports how far behind it
+     * is. Stamping the current sequence onto older contents is what would be
+     * the lie. */
+    if (!server->fts_built) {
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "the index has never been built; run FTS.BUILD first");
+        return false;
+    }
+    generation = server->fts_generation;
+
+    uint64_t key_count = server->fts_key_count;
+    bool saved = qihse_fts_save(server->fts, index_path, user);
+    uint64_t index_size = 0u, index_digest = 0u;
+    if (saved) {
+        saved = qihse_resp_fts_file_digest(index_path, &index_size, &index_digest) &&
+                qihse_resp_fts_write_sidecar(keys_path, generation, index_size,
+                                             index_digest, server->fts_keys,
+                                             key_count);
+    }
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    if (!saved) {
+        snprintf(err, err_cap, "could not write the index artifact or its doc-id "
+                               "sidecar (or the index holds documents this principal "
+                               "cannot read)");
+        return false;
+    }
+    return true;
+}
+
+/* Startup autoload, run once from server create before anything can connect.
+ * Runs as the explicitly configured principal — never as an inferred or NULL
+ * identity — and is best effort: on any failure FTS.* stays memory-only. */
+/* Startup autoload. Runs on its own thread so restoring a projection never
+ * delays the listener: on a real corpus the artifact is hundreds of MB and
+ * decoding it costs minutes of CPU and gigabytes of RSS, which is exactly the
+ * kind of work that must not sit between "service start" and "accepting
+ * connections".
+ *
+ * Load-only. An artifact left stale by traffic since the last FTS.SAVE is
+ * reported, never silently rebuilt: a rebuild is the same minutes of CPU
+ * every restart, and that decision belongs to the operator (FTS.BUILD), not
+ * to a restart. Search stays empty until then, which is the long-standing
+ * behaviour of an unbuilt index. */
+static void* qihse_resp_fts_autoload_worker(void* argument) {
+    qihse_resp_server_t* server = (qihse_resp_server_t*)argument;
+    uint64_t count = 0u;
+    uint64_t lag = 0u;
+    qihse_resp_fts_load_status_t status =
+        qihse_resp_fts_load_artifact(server, server->fts_autoload_principal, &count, &lag);
+    if (status == QIHSE_RESP_FTS_LOAD_OK) {
+        fprintf(stderr, "qihse: fts autoload restored %llu documents (%llu mutations "
+                        "behind the store)\n",
+                (unsigned long long)count, (unsigned long long)lag);
+    } else {
+        fprintf(stderr, "qihse: fts autoload skipped (%s); run FTS.BUILD to "
+                        "rebuild, then FTS.SAVE\n",
+                qihse_resp_fts_load_reason(status));
+    }
+    return NULL;
+}
+
+static void qihse_resp_fts_autoload_start(qihse_resp_server_t* server) {
+    if (!server->fts_persist_dir[0] || !server->fts_autoload_principal ||
+        !server->fts || !server->store)
+        return;
+    if (pthread_create(&server->fts_autoload_thread, NULL,
+                       qihse_resp_fts_autoload_worker, server) == 0) {
+        server->fts_autoload_started = true;
+    } else {
+        fprintf(stderr, "qihse: fts autoload could not start a thread; "
+                        "the index stays memory-only\n");
+    }
+}
+
+static bool qihse_resp_handle_fts_save(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 1) return qihse_resp_wrong_arity(session, "fts.save");
+    if (!qihse_resp_fts_persistence_admin(session, "FTS.SAVE")) return true;
+    char err[192];
+    if (!qihse_resp_fts_save_artifact(session->server, session->user, err, sizeof(err))) {
+        char msg[224];
+        snprintf(msg, sizeof(msg), "ERR %s", err);
+        return qihse_resp_error(session, msg);
+    }
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_fts_load(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 1) return qihse_resp_wrong_arity(session, "fts.load");
+    if (!qihse_resp_fts_persistence_admin(session, "FTS.LOAD")) return true;
+    if (!session->server->fts_persist_dir[0])
+        return qihse_resp_error(session, "ERR full-text persistence is not configured");
+
+    uint64_t count = 0u, lag = 0u;
+    qihse_resp_fts_load_status_t status =
+        qihse_resp_fts_load_artifact(session->server, session->user, &count, &lag);
+    if (status != QIHSE_RESP_FTS_LOAD_OK) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "ERR %s", qihse_resp_fts_load_reason(status));
+        return qihse_resp_error(session, msg);
+    }
+    /* [documents, mutations behind the store, fresh|stale]: a projection is
+     * a snapshot, and the caller is told exactly how old it is rather than
+     * being refused or left to assume it is current. */
+    return qihse_resp_array(session, 3u) &&
+           qihse_resp_integer(session, (int64_t)count) &&
+           qihse_resp_integer(session, (int64_t)lag) &&
+           qihse_resp_bulk_text(session, lag == 0u ? "fresh" : "stale");
+}
+
 static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.build");
-    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    if (!session->server->fts) return qihse_resp_error(session, "ERR full-text index is not configured");
     if (request->argv[1].len == 0u || request->argv[1].len > QIHSE_RESP_FTS_MAX_PATTERN) {
         return qihse_resp_error(session, "ERR invalid key pattern");
     }
@@ -5115,46 +6228,15 @@ static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qih
     memcpy(pattern_buf, request->argv[1].data, request->argv[1].len);
     pattern_buf[request->argv[1].len] = '\0';
 
-    fts_build_ctx_t b;
-    memset(&b, 0, sizeof(b));
-    b.pattern = pattern_buf;
-    b.cap = QIHSE_RESP_FTS_MAX_DOCS;
-    b.user = session->user;
-
-    pthread_mutex_lock(&session->server->fts_meta_lock);
-    /* Rebuild semantics: destroy+create, so postings, doc stats and the
-     * doc-id space all start clean. VECHYBRID reads server->fts per call
-     * and takes the same lock's discipline, so the swap is safe. */
-    qihse_fts_index_t* fresh = qihse_fts_create();
-    if (!fresh) {
-        pthread_mutex_unlock(&session->server->fts_meta_lock);
-        return qihse_resp_error(session, "ERR out of memory");
+    uint64_t count = 0u;
+    char err[128];
+    if (!qihse_resp_fts_rebuild(session->server, session->user, pattern_buf,
+                                &count, err, sizeof(err))) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "ERR %s", err);
+        return qihse_resp_error(session, msg);
     }
-    b.keys = (char**)calloc(b.cap + 1u, sizeof(char*));
-    if (!b.keys) {
-        qihse_fts_destroy(fresh);
-        pthread_mutex_unlock(&session->server->fts_meta_lock);
-        return qihse_resp_error(session, "ERR out of memory");
-    }
-    qihse_fts_index_t* old = session->server->fts;
-    session->server->fts = fresh;
-    for (uint64_t i = 0; i < session->server->fts_key_count; i++) free(session->server->fts_keys[i]);
-    free(session->server->fts_keys);
-    session->server->fts_keys = b.keys;
-    session->server->fts_key_count = 0u;
-    session->server->fts_key_cap = b.cap;
-
-    pthread_rwlock_rdlock(&session->server->kv_lock);
-    b.index = fresh;
-    qihse_kv_foreach_user(session->server->store, session->user,
-                          qihse_resp_fts_build_cb, &b);
-    pthread_rwlock_unlock(&session->server->kv_lock);
-    session->server->fts_key_count = b.count;
-    pthread_mutex_unlock(&session->server->fts_meta_lock);
-    qihse_fts_destroy(old);
-    /* b.count == cap means the bound was reached: remaining records were
-     * not indexed. The count is the honest reply either way. */
-    return qihse_resp_integer(session, (int64_t)b.count);
+    return qihse_resp_integer(session, (int64_t)count);
 }
 
 static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -5174,8 +6256,8 @@ static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qi
     memcpy(query_buf, request->argv[1].data, request->argv[1].len);
     query_buf[request->argv[1].len] = '\0';
 
-    /* Snapshot the hits under the lock: BUILD may swap the index and free
-     * the key map the moment we unlock, so copy the key strings out. */
+    /* Snapshot the hits under the lock: BUILD/LOAD may swap the index and
+     * free the key map the moment we unlock, so copy the key strings out. */
     qihse_fts_result_t hits[QIHSE_RESP_FTS_MAX_LIMIT];
     char* hit_keys[QIHSE_RESP_FTS_MAX_LIMIT];
     int n = 0;
@@ -5206,6 +6288,7 @@ static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qi
     for (int i = 0; i < n && i < QIHSE_RESP_FTS_MAX_LIMIT; i++) free(hit_keys[i]);
     return built;
 }
+
 
 static bool qihse_resp_handle_rename(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool nx) {
     if (request->argc != 3) return qihse_resp_wrong_arity(session, "rename");
@@ -7038,11 +8121,37 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
 
 /* ---- Transaction commands ---- */
 
+static void qihse_resp_request_free(qihse_resp_request_t* req) {
+    if (!req) return;
+    for (size_t i = 0; i < req->argc; i++) free((void*)req->argv[i].data);
+    free(req);
+}
+
+/* Deep-copy a parsed request so a queued command owns its argv bytes. */
+static qihse_resp_request_t* qihse_resp_request_clone(const qihse_resp_request_t* src) {
+    if (!src) return NULL;
+    qihse_resp_request_t* dst = (qihse_resp_request_t*)calloc(1, sizeof(*dst));
+    if (!dst) return NULL;
+    dst->argc = src->argc;
+    dst->consumed = src->consumed;
+    for (size_t i = 0; i < src->argc; i++) {
+        size_t len = src->argv[i].len;
+        if (len == 0 || !src->argv[i].data) continue;
+        uint8_t* copy = (uint8_t*)malloc(len);
+        if (!copy) { qihse_resp_request_free(dst); return NULL; }
+        memcpy(copy, src->argv[i].data, len);
+        dst->argv[i].data = copy;
+        dst->argv[i].len = len;
+    }
+    return dst;
+}
+
 static bool qihse_resp_handle_multi(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
     if (session->in_multi) return qihse_resp_error(session, "ERR MULTI calls can not be nested");
     session->in_multi = true;
     session->multi_dirty = false;
+    for (size_t i = 0; i < session->multi_queue_len; i++) qihse_resp_request_free(session->multi_queue[i]);
     session->multi_queue_len = 0;
     return qihse_resp_simple(session, "OK");
 }
@@ -7058,18 +8167,25 @@ static bool qihse_resp_handle_exec(qihse_resp_session_t* session, const qihse_re
         session->watch_dirty = false;
         return true;
     }
-    /* Execute queued commands */
-    qihse_resp_array(session, session->multi_queue_len);
-    for (size_t i = 0; i < session->multi_queue_len; i++) {
-        bool keep_open = true;
-        qihse_resp_dispatch(session, &session->multi_queue[i], &keep_open);
-    }
-    /* Cleanup */
-    free(session->multi_queue);
+    /* Detach the queue and leave the transaction state BEFORE dispatching:
+     * a queued command that still saw in_multi set was re-queued into the
+     * array being iterated (and realloc'd it) instead of executing — that was
+     * both the lost writes and the segfault. */
+    size_t queued_count = session->multi_queue_len;
+    qihse_resp_request_t** queued = session->multi_queue;
     session->multi_queue = NULL;
     session->multi_queue_len = 0;
     session->multi_queue_cap = 0;
     session->in_multi = false;
+    session->multi_dirty = false;
+
+    bool emitted = qihse_resp_array(session, queued_count);
+    for (size_t i = 0; emitted && i < queued_count; i++) {
+        bool keep_open = true;
+        emitted = qihse_resp_dispatch(session, queued[i], &keep_open);
+        qihse_resp_request_free(queued[i]);
+    }
+    free(queued);
     for (size_t i = 0; i < session->watch_count; i++) free(session->watch_keys[i]);
     free(session->watch_keys);
     free(session->watch_key_lens);
@@ -7083,6 +8199,7 @@ static bool qihse_resp_handle_exec(qihse_resp_session_t* session, const qihse_re
 static bool qihse_resp_handle_discard(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
     if (!session->in_multi) return qihse_resp_error(session, "ERR DISCARD without MULTI");
+    for (size_t i = 0; i < session->multi_queue_len; i++) qihse_resp_request_free(session->multi_queue[i]);
     free(session->multi_queue);
     session->multi_queue = NULL;
     session->multi_queue_len = 0;
@@ -8481,6 +9598,9 @@ static bool dsp_lpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)   
 static bool dsp_rpush(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_lpush(s, r, false); }
 static bool dsp_lpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_lpop(s, r, true); }
 static bool dsp_rpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)     { return qihse_resp_handle_lpop(s, r, false); }
+static bool dsp_blpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_blpop(s, r, true); }
+static bool dsp_brpop(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_blpop(s, r, false); }
+static bool dsp_brpoplpush(qihse_resp_session_t* s, const qihse_resp_request_t* r) { return qihse_resp_handle_brpoplpush(s, r); }
 static bool dsp_zrange(qihse_resp_session_t* s, const qihse_resp_request_t* r)   { return qihse_resp_handle_zrange(s, r, false); }
 static bool dsp_zrevrange(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_zrange(s, r, true); }
 static bool dsp_zrank(qihse_resp_session_t* s, const qihse_resp_request_t* r)    { return qihse_resp_handle_zrank(s, r, false); }
@@ -9597,6 +10717,15 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"pfmerge", qihse_resp_handle_pfmerge, DSP_BUSY_WRITE | DSP_KEY_FROM2KV},
     {"eval", qihse_resp_handle_eval, 0}, {"evalsha", qihse_resp_handle_evalsha, 0},
     {"script", qihse_resp_handle_script, 0},
+    /* Appended, never inserted: the fast-path resolver above pins table
+     * positions, so an entry added mid-table silently remaps indexes. */
+    {"fts.save", qihse_resp_handle_fts_save, DSP_BUSY_WRITE | DSP_ADMIN},
+    {"fts.load", qihse_resp_handle_fts_load, DSP_BUSY_WRITE | DSP_ADMIN},
+    /* blocking list ops — appended: the SWAR switch addresses g_dispatch_table
+     * by index, so a new entry must never be inserted mid-table. */
+    {"blpop", dsp_blpop, DSP_BUSY_WRITE},
+    {"brpop", dsp_brpop, DSP_BUSY_WRITE},
+    {"brpoplpush", dsp_brpoplpush, DSP_BUSY_WRITE},
 };
 
 #define RESP_DISPATCH_MAP_CAP 256u
@@ -9866,6 +10995,13 @@ static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(const qihse_res
             break;
         case QIHSE_SWAR4('P','U','B','S'):
             if (qihse_resp_suffix_is(name, 4u, "UB")) return &g_dispatch_table[135];
+            break;
+        case QIHSE_SWAR4('B','L','P','O'):
+            if (name->len == 5u) return &g_dispatch_table[149];
+            break;
+        case QIHSE_SWAR4('B','R','P','O'):
+            if (name->len == 5u) return &g_dispatch_table[150];
+            if (qihse_resp_suffix_is(name, 4u, "PLPUSH")) return &g_dispatch_table[151];
             break;
         default:
             break;
@@ -13918,12 +15054,17 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
         !(dispatch_entry && (dispatch_entry->flags & DSP_MULTI_OK))) {
+        qihse_resp_request_t* queued_copy = qihse_resp_request_clone(request);
+        if (!queued_copy) return qihse_resp_error(session, "ERR out of memory queueing command");
         if (session->multi_queue_len >= session->multi_queue_cap) {
-            session->multi_queue_cap = session->multi_queue_cap ? session->multi_queue_cap * 2 : 16;
-            session->multi_queue = realloc(session->multi_queue, session->multi_queue_cap * sizeof(qihse_resp_request_t));
+            size_t grown_cap = session->multi_queue_cap ? session->multi_queue_cap * 2 : 16;
+            qihse_resp_request_t** grown =
+                realloc(session->multi_queue, grown_cap * sizeof(*grown));
+            if (!grown) { qihse_resp_request_free(queued_copy); return qihse_resp_error(session, "ERR out of memory queueing command"); }
+            session->multi_queue = grown;
+            session->multi_queue_cap = grown_cap;
         }
-        qihse_resp_request_t* slot = &session->multi_queue[session->multi_queue_len++];
-        memcpy(slot, request, sizeof(qihse_resp_request_t));
+        session->multi_queue[session->multi_queue_len++] = queued_copy;
         return qihse_resp_simple(session, "QUEUED");
     }
     /* Phase 3: System Guard bus-saturation throttling for DENYOOM commands */
@@ -14559,6 +15700,16 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->tsdb = supplied->tsdb;
     server->column_store = supplied->column_store;
     server->fts = supplied->fts;
+    server->fts_autoload_principal = supplied->fts_autoload_principal;
+    if (supplied->fts_persist_directory && supplied->fts_persist_directory[0]) {
+        int path_len = snprintf(server->fts_persist_dir, sizeof(server->fts_persist_dir),
+                                "%s", supplied->fts_persist_directory);
+        if (path_len <= 0 || (size_t)path_len >= sizeof(server->fts_persist_dir)) {
+            fprintf(stderr, "qihse: fts persistence directory is too long; "
+                            "FTS.SAVE/FTS.LOAD stay disabled\n");
+            server->fts_persist_dir[0] = '\0';
+        }
+    }
     server->pqc = supplied->pqc;
     server->replication_service_principal =
         supplied->replication_service_principal;
@@ -14924,6 +16075,11 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     for (size_t i = 0; supplied->replicate_globs && i < supplied->replicate_glob_count; i++) {
         (void)qihse_resp_server_repl_add(server, supplied->replicate_globs[i], true);
     }
+    /* Full-text projection: the store is already recovered by this point, so
+     * the saved generation can be compared against the live one. Started
+     * after the listener is configured; SEARCH returns an empty array until
+     * it lands, and the restore never blocks startup. */
+    qihse_resp_fts_autoload_start(server);
     return server;
 }
 
@@ -15080,10 +16236,18 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     pthread_mutex_destroy(&server->tsdb_lock);
     pthread_mutex_destroy(&server->forensic_lock);
     pthread_mutex_destroy(&server->vdb_lock);
+    /* The autoload thread reads the artifact and installs through
+     * fts_meta_lock; it must be joined before those locks and the index go
+     * away. It never writes anything but its own log line. */
+    if (server->fts_autoload_started) {
+        pthread_join(server->fts_autoload_thread, NULL);
+        server->fts_autoload_started = false;
+    }
     if (server->fts_keys) {
         for (uint64_t i = 0; i < server->fts_key_count; i++) free(server->fts_keys[i]);
         free(server->fts_keys);
     }
+    qihse_fts_destroy(server->fts);
     pthread_mutex_destroy(&server->fts_meta_lock);
     /* A BGSAVE worker may still hold kv_lock write-side: join it BEFORE the
      * store and locks are torn down. Workers are one-shot; the join only
