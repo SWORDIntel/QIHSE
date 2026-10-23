@@ -381,6 +381,11 @@ qihse_keystone_class_t qihse_fts_get_doc_semantic_class(qihse_fts_index_t* index
     return qihse_fts_get_doc_semantic_class_user(index, doc_id, NULL);
 }
 
+uint32_t qihse_fts_doc_count(const qihse_fts_index_t* index) {
+    if (!index || !index->valid) return 0u;
+    return index->doc_count;
+}
+
 static int secure_open_read(const char* path, off_t* size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;

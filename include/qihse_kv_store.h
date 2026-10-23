@@ -189,6 +189,18 @@ bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   void* user_data);
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data);
 
+/* Metadata-carrying enumeration.  The classification and SCI are read from
+ * the SAME record read that produced value, so a projection that copies them
+ * onto derived state (an inverted index, a cache) cannot pick up a newer ACL
+ * than the bytes it copied.  A per-key qihse_kv_meta_user() lookup would open
+ * exactly that race.  Same authorization gate as qihse_kv_foreach_user. */
+typedef bool (*qihse_kv_iter_meta_cb)(const char* key, const char* value,
+                                      uint16_t classification,
+                                      uint16_t sci_compartment,
+                                      void* user_data);
+bool qihse_kv_foreach_meta_user(qihse_kv_store_t* store, qihse_user_t* user,
+                                qihse_kv_iter_meta_cb cb, void* user_data);
+
 size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user);
 size_t qihse_kv_clear(qihse_kv_store_t* store);
 

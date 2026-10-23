@@ -94,6 +94,9 @@ qihse_keystone_class_t qihse_fts_get_doc_semantic_class(
     qihse_fts_index_t* index,
     uint64_t doc_id);
 
+/* Number of documents currently in the index (0 for NULL/invalid). */
+uint32_t qihse_fts_doc_count(const qihse_fts_index_t* index);
+
 /* All-or-nothing authorized, mode-0600, no-follow, atomic persistence. */
 bool qihse_fts_save(
     qihse_fts_index_t* index,

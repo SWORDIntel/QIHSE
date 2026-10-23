@@ -38,6 +38,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -101,7 +102,83 @@ static void fill_node(const char* host, uint16_t port, uint16_t bus_port,
 }
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_teardown_done = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/* Shutdown is expected to finish in a few seconds; this is the point at which
+ * it is declared wedged. Kept well under systemd's TimeoutStopUSec so a stuck
+ * teardown yields a diagnostic and a clean exit instead of a SIGKILL. */
+#define QIHSE_SHUTDOWN_GRACE_DEFAULT 60u
+
+static unsigned int shutdown_grace_seconds(void) {
+    const char* raw = getenv("QIHSE_SHUTDOWN_GRACE");
+    if (raw && *raw) {
+        char* end = NULL;
+        unsigned long value = strtoul(raw, &end, 10);
+        if (end != raw && *end == '\0' && value >= 5u && value <= 3000u)
+            return (unsigned int)value;
+    }
+    return QIHSE_SHUTDOWN_GRACE_DEFAULT;
+}
+
+/* Name every thread that is still alive, from /proc rather than from any
+ * library state: at this point teardown may hold locks, so the dump must not
+ * take one. comm/wchan are enough to identify the subsystem that failed to
+ * stop, which is what the previous behaviour (an unexplained hang until
+ * systemd SIGKILLed the process) never told an operator. */
+static void dump_live_threads(const char* reason) {
+    DIR* tasks = opendir("/proc/self/task");
+    if (!tasks) {
+        fprintf(stderr, "qihse-cluster-daemon: shutdown watchdog fired (%s); thread list unavailable\n",
+                reason);
+        return;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(tasks)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char path[320]; /* /proc/self/task/<tid>/comm; d_name is up to 255 */
+        char name[64] = "?";
+        char wchan[64] = "?";
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", entry->d_name);
+        FILE* f = fopen(path, "r");
+        if (f) { if (fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = '\0'; fclose(f); }
+        snprintf(path, sizeof(path), "/proc/self/task/%s/wchan", entry->d_name);
+        f = fopen(path, "r");
+        if (f) { if (fgets(wchan, sizeof(wchan), f)) wchan[strcspn(wchan, "\n")] = '\0'; fclose(f); }
+        fprintf(stderr, "qihse-cluster-daemon: shutdown watchdog fired (%s); live thread %s still in %s\n",
+                reason, entry->d_name, name);
+        fprintf(stderr, "qihse-cluster-daemon:   tid %s wchan=%s\n", entry->d_name, wchan);
+    }
+    closedir(tasks);
+}
+
+/* The teardown path joins threads and closes sockets owned by subsystems that
+ * do not all honour g_stop. Rather than let an unbounded wait turn a restart
+ * into a 5-minute outage ending in SIGKILL, a watchdog bounds it and reports
+ * where it stopped. The process is exiting, so _exit() is the correct way to
+ * leave a half-torn-down state behind: no atexit handler gets a chance to
+ * touch memory an orphaned thread may still be using. */
+static void* shutdown_watchdog(void* argument) {
+    (void)argument;
+    unsigned int grace = shutdown_grace_seconds();
+    while (!g_stop) {
+        struct timespec idle = {0, 200 * 1000 * 1000L};
+        nanosleep(&idle, NULL);
+    }
+    for (unsigned int waited = 0; waited < grace; waited++) {
+        if (g_teardown_done) return NULL;
+        struct timespec tick = {1, 0};
+        nanosleep(&tick, NULL);
+    }
+    if (!g_teardown_done) {
+        const char* reason = "teardown exceeded the shutdown grace period";
+        dump_live_threads(reason);
+        fprintf(stderr, "qihse-cluster-daemon: exiting without completing teardown "
+                        "(raise QIHSE_SHUTDOWN_GRACE above %u if this is a slow flush)\n", grace);
+        _exit(0);
+    }
+    return NULL;
+}
 
 typedef struct {
     char* value;
@@ -221,9 +298,13 @@ static void usage(const char* argv0) {
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--replication-principal-id N] (default 65535)\n"
         "          [--max-clients N]\n"
-        "          (each daemon owns an in-memory BM25 index over its local KV:\n"
+        "          (each daemon owns a BM25 index over its LOCAL KV:\n"
         "           FTS.BUILD <pattern> indexes matching keys, FTS.SEARCH <query>\n"
-        "           [limit] replies [key, score, ...]; the index resets on restart)\n"
+        "           [limit] replies [key, score, ...]. The index is persisted\n"
+        "           under the store's data dir as fts/node<INDEX>/: FTS.SAVE\n"
+        "           writes it and FTS.LOAD reloads it, and a restart reloads or\n"
+        "           rebuilds it automatically as the system operator. Both\n"
+        "           commands are operator-only; the projection is per node)\n"
         "\n  --join sends MEET frames to a seed node's bus port; membership is\n"
         "  learned dynamically over the cluster bus (gossip). Without --join, the\n"
         "  static --node list defines the topology.\n"
@@ -979,7 +1060,7 @@ static void* join_main(void* argument) {
     /* Retry indefinitely while the daemon lives: lossy/asymmetric paths
      * (WiFi, firewalled segments) can take far longer than a fixed window
      * to come up, and a node that stopped trying never joins. */
-    for (int round = 0; ; round++) {
+    while (!g_stop) {
         for (size_t i = 0; i < j->seed_count; i++) {
             char spec[QIHSE_CLUSTER_HOST_LEN + 8u];
             snprintf(spec, sizeof(spec), "%s", j->seeds[i]);
@@ -1004,6 +1085,7 @@ static void* join_main(void* argument) {
         struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
     }
+    return NULL; /* shutdown requested: stop probing a server being torn down */
 }
 
 static bool is_lan_host(const char* host) {
@@ -1896,14 +1978,42 @@ int main(int argc, char** argv) {
          (repl_glob_count > 0u && repl_interval > 0u)) && pqc.dsa_key_path) {
         config.pqc = pqc; /* opportunistic default: PQC on QKP1 probe, cleartext allowed */
     }
-    /* BM25 full-text search surface (FTS.BUILD / FTS.SEARCH): unlike
-     * VECHYBRID, which expects the caller to bring an index, every cluster
-     * daemon owns one over its local KV. In-memory by design: after a
-     * restart FTS.SEARCH returns an empty array until the next FTS.BUILD. */
+    /* BM25 full-text search surface (FTS.*): unlike VECHYBRID, which expects
+     * the caller to bring an index, every cluster daemon owns one over its
+     * LOCAL KV. Nodes hold different data, so the projection is per node and
+     * never shared between them. Persistence lives under --dir, namespaced by
+     * node identity, and the startup autoload runs as the system operator —
+     * an authorized principal acting on the node's behalf, never a
+     * context-free read (AGENTS.md invariant #1). */
     qihse_fts_index_t* fts = qihse_fts_create();
     if (!fts)
         fprintf(stderr, "qihse-cluster-daemon: FTS index create failed (FTS.* unavailable)\n");
     config.fts = fts;
+    if (fts) {
+        /* Anchor the projection on the store's OWN resolved data directory,
+         * not on --dir: a unit may supply QIHSE_DATA_DIR through its env
+         * file, and /opt/qihse-data is the default. Namespacing by
+         * --index keeps two daemons that share a data directory apart. */
+        const char* store_dir = qihse_kv_store_data_directory(store);
+        char fts_dir[600];
+        int n = 0;
+        if (store_dir && *store_dir) {
+            size_t dir_len = strlen(store_dir);
+            const char* sep = store_dir[dir_len - 1u] == '/' ? "" : "/";
+            n = snprintf(fts_dir, sizeof(fts_dir), "%s%sfts/node%u", store_dir, sep,
+                         self_index);
+        }
+        if (n <= 0 || (size_t)n >= sizeof(fts_dir) || !mkdirs(fts_dir)) {
+            fprintf(stderr, "qihse-cluster-daemon: cannot prepare the FTS persistence "
+                            "directory; FTS.SAVE/FTS.LOAD stay disabled\n");
+        } else {
+            config.fts_persist_directory = fts_dir;
+            config.fts_autoload_principal = qihse_auth_get_user(0u);
+            if (!config.fts_autoload_principal)
+                fprintf(stderr, "qihse-cluster-daemon: no system principal; FTS autoload "
+                                "disabled\n");
+        }
+    }
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     OPENSSL_cleanse(g_transport_keys.bus_veil,
@@ -1960,6 +2070,13 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    /* Bounds teardown and names whatever refused to stop, so a wedged
+     * shutdown reports itself instead of waiting for systemd's SIGKILL. */
+    pthread_t shutdown_watch_thread;
+    if (pthread_create(&shutdown_watch_thread, NULL, shutdown_watchdog, NULL) == 0)
+        pthread_detach(shutdown_watch_thread);
+    else
+        fprintf(stderr, "qihse-cluster-daemon: shutdown watchdog unavailable\n");
     fprintf(stderr, "qihse-cluster-daemon: node %u serving %s:%u (bus %u), %zu peers, %zu join seeds, auth=%s%s\n",
             self_index, bind, port, bus_port, peer_count, seed_count, config.auth_required ? "on" : "off",
             config.pqc.dsa_key_path ? (config.pqc.require ? ", pqc=required"
@@ -2034,7 +2151,21 @@ int main(int argc, char** argv) {
         }
     }
     __atomic_store_n(&ae_stop, 1, __ATOMIC_RELEASE);
-    if (ae_started) pthread_join(ae_thread, NULL); /* holds server: join before destroy */
+    if (ae_started) {
+        /* ae_main can be inside a blocking pull from an unresponsive source;
+         * never let that hold the whole process open. */
+        unsigned int join_wait = shutdown_grace_seconds();
+        if (join_wait > 15u) join_wait = 15u; /* report this before the generic watchdog */
+        struct timespec join_deadline;
+        clock_gettime(CLOCK_REALTIME, &join_deadline);
+        join_deadline.tv_sec += (time_t)join_wait;
+        int joined = pthread_timedjoin_np(ae_thread, NULL, &join_deadline);
+        if (joined != 0) {
+            fprintf(stderr, "qihse-cluster-daemon: replica pull thread did not stop within "
+                            "%u s; leaving teardown to the shutdown watchdog\n", join_wait);
+            for (;;) pause(); /* the watchdog owns the exit from here */
+        }
+    }
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     if (consensus_mesh) {
         qihse_consensus_mesh_stop(consensus_mesh);
@@ -2043,7 +2174,9 @@ int main(int argc, char** argv) {
     }
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
-    if (fts) qihse_fts_destroy(fts); /* caller-owned: destroyed with the server */
+    /* The server owns the index from create onward and frees whatever it
+     * holds at destroy, including any index BUILD/LOAD replaced. */
     fprintf(stderr, "qihse-cluster-daemon: stopped\n");
+    g_teardown_done = 1;
     return ok ? 0 : 1;
 }

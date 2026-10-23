@@ -35,8 +35,21 @@ typedef struct {
     qihse_tsdb_t* tsdb;
     qihse_column_store_t* column_store;
     /* Optional full-text index for VECHYBRID (hybrid FTS+vector RRF
-     * fusion).  Caller-owned; NULL = VECHYBRID refuses explicitly. */
+     * fusion). The server owns it from create onward: FTS.BUILD/LOAD replace
+     * and free it, and it is destroyed with the server. NULL = VECHYBRID and
+     * FTS.* refuse explicitly. */
     qihse_fts_index_t* fts;
+    /* Optional durable FTS projection (FTS.SAVE / FTS.LOAD). The engine
+     * writes `<dir>/fts-index.qfts` plus a `<dir>/fts-index.keys` sidecar
+     * holding the doc-id -> KV key map the index is defined over. NULL or
+     * empty disables both commands and the startup autoload, and the index
+     * stays memory-only. Never taken from a request. */
+    const char* fts_persist_directory;
+    /* Principal the startup autoload runs as. NULL disables autoload even
+     * when a directory is configured. It must be supplied explicitly: a
+     * forgotten principal must not decay into a context-free read of a
+     * classified projection (AGENTS.md invariant #1). */
+    qihse_user_t* fts_autoload_principal;
     qihse_cluster_topology_t* topology;
     const char* bind_address;
     const char* advertise_address;
