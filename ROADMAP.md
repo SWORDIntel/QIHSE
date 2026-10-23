@@ -783,18 +783,25 @@ AMX=0 F16C=1` and the build emits exactly `-mavx` — detection and codegen agre
     overhead_per_call = C_check × c_check
     overhead_ratio    = (C_check × c_check) / (C_check × c_check + W_kernel)
 
-* `c_check` = 7.7 ns measured; `C_check` = checks executed on the call path
-  (this codebase resolves once via `pthread_once` and then calls through a
-  function pointer — effectively `C_check = 0` after the first call);
-  `W_kernel` = actual vector work of one invocation (~0.5–1 ns per element).
-* Break-even: a per-call check is justified while `W_kernel > C_check × c_check`.
-  A 64-dim dot product is already ≈ 32–64 ns, i.e. 4–8× the check; a 256-dim
-  cosine is ≈ 10× the cost of 3 checks. Only sub-32-element kernels should ever
-  hoist the check out of the hot loop.
-* Worst-case bookkeeping (what 10M per-call checks would actually cost):
-  10⁷ × 7.7 ns = **77 ms**. Against 10⁷ × 256-dim kernels (≈ 1.3 s of work)
-  that is ≈ 6% — and it drops below 3% at 512 dims. The check is never the
-  bottleneck the kernel is.
+* Measured on the Ivy-Bridge host (20M-iteration microbench, then a real
+  384-dim workload): the call itself (direct **or** function-pointer) costs
+  ≈ 7.6–8.0 ns and an **inline** capability guard on the hot path adds
+  **0.0–0.4 ns — pure noise** (a predicted branch on a cached flag is hidden by
+  out-of-order execution). The 7.7 ns figure is a full helper *function call*;
+  never call the helper per invocation — inline the flag.
+* Real 384-dim kernels (bge-small embedder dims, the deployed workload):
+  scalar ≈ 917 ns/call, AVX ≈ 133 ns/call, AVX-512-shaped ≈ 111 ns/call.
+  A 100-query × 1 000-candidate run (10⁵ calls) therefore takes ≈ 92.6 ms
+  scalar / 13.3 ms AVX / ≈10 ms AVX-512 — while the *entire* dispatch overhead
+  for that run (resolve-once) is ≈ 10 µs and guard-per-call ≈ 20 µs: **0.1%**.
+* Conclusion: dispatch strategy is a rounding error. The kernel width is the
+  entire game (AVX512 vs AVX saves ~5 ms/run, AVX vs scalar ~79 ms/run — 500×
+  more than the whole dispatch budget). Choose dispatch by engineering merit,
+  never by these numbers: resolve once per pathway (the distance-path pattern)
+  because it costs ~5 µs per process and makes cross-host binaries safe; keep
+  the Makefile groups because they save build time and binary size on native
+  builds; never guard inside the hot loop because it buys nothing the
+  resolve-once pattern does not already give.
 * **Skipped sets on a native build cost nothing at runtime**: "compile it
   natively only" is the whole point — an ISA the host does not advertise is
   eliminated by the build (`QIHSE_ENABLE_<ISA>=0` → no code, no guard, no
