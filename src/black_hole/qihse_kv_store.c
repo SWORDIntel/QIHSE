@@ -2416,8 +2416,17 @@ typedef struct {
     const char* prefix;
     size_t prefix_len;
     uint64_t now;
+    bool bounded_label;
+    uint16_t max_classification;
+    uint16_t allowed_sci;
     bool ok;
 } foreach_user_ctx_t;
+static bool foreach_label_allowed(const foreach_user_ctx_t* ctx,
+                                  uint16_t classification, uint16_t sci) {
+    return !ctx->bounded_label ||
+           (classification <= ctx->max_classification &&
+            (sci & (uint16_t)~ctx->allowed_sci) == 0u);
+}
 /* One delivery helper: a plain enumeration calls cb, a metadata enumeration
  * calls meta_cb with the ACL read from the same record. */
 static bool foreach_user_deliver(foreach_user_ctx_t* ctx, const char* key,
@@ -2435,6 +2444,7 @@ static bool foreach_user_cb(const char* key, void* value, size_t value_size, voi
     if (!ctx || !ctx->ok || !key || !p) return false;
     if (ctx->prefix && strncmp(key, ctx->prefix, ctx->prefix_len) != 0) return true;
     if (payload_is_dead(p, ctx->now)) return true;
+    if (!foreach_label_allowed(ctx, p->classification, p->sci_compartment)) return true;
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
     return foreach_user_deliver(ctx, key, p->val, p->classification, p->sci_compartment);
 }
@@ -2443,6 +2453,7 @@ static bool foreach_sst_emit_cb(const char* key, const kv_disk_record_t* r, void
     foreach_user_ctx_t* ctx = (foreach_user_ctx_t*)ud;
     if (!ctx || !key || !r) return false;
     if (ctx->prefix && strncmp(key, ctx->prefix, ctx->prefix_len) != 0) return true;
+    if (!foreach_label_allowed(ctx, r->classification, r->sci_compartment)) return true;
     if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) return true;
     return foreach_user_deliver(ctx, key, r->val, r->classification, r->sci_compartment);
 }
@@ -2474,9 +2485,12 @@ static int sst_foreach_prefix_indexed(qihse_kv_store_t* store,
             return -1;
         }
         if (state == KV_LOOKUP_LIVE &&
+            foreach_label_allowed(ctx, record.classification,
+                                  record.sci_compartment) &&
             qihse_auth_can_access(ctx->user, record.classification,
                                   record.sci_compartment)) {
-            bool keep_going = ctx->cb(e->key, record.value, ctx->user_data);
+            bool keep_going = foreach_user_deliver(ctx, e->key, record.value,
+                record.classification, record.sci_compartment);
             lookup_result_free(&record);
             if (!keep_going) return 0;
         } else {
@@ -2489,7 +2503,9 @@ static int sst_foreach_prefix_indexed(qihse_kv_store_t* store,
 static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   qihse_kv_iter_meta_cb meta_cb,
-                                  void* user_data) {
+                                  void* user_data, bool bounded_label,
+                                  uint16_t max_classification,
+                                  uint16_t allowed_sci) {
     if (!store || !store->trie || (!cb && !meta_cb)) return false;
     kv_store_rdlock(store);
     bool compact_needed = store->sstable_counter > 0 &&
@@ -2504,7 +2520,9 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
                   ((store->sst_meta && !store->sst_meta->degraded) ||
                    compact_sstables_into_memtable(store));
         kv_store_unlock(store);
-        return ok && foreach_user_filtered(store, prefix, user, cb, meta_cb, user_data);
+        return ok && foreach_user_filtered(store, prefix, user, cb, meta_cb,
+                                           user_data, bounded_label,
+                                           max_classification, allowed_sci);
     }
     /* No compaction: iterate the memtable, then stream the index-pinned
      * newest SSTable records. Callbacks may re-enter qihse_kv_get_user. */
@@ -2513,12 +2531,16 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
     kv_store_rdlock(store);
     if (store->sstable_counter > 0 && (!store->sst_meta || store->sst_meta->degraded)) {
         kv_store_unlock(store);
-        return foreach_user_filtered(store, prefix, user, cb, meta_cb, user_data);
+        return foreach_user_filtered(store, prefix, user, cb, meta_cb,
+                                     user_data, bounded_label,
+                                     max_classification, allowed_sci);
     }
     foreach_user_ctx_t ctx = {
         .user = user, .cb = cb, .meta_cb = meta_cb, .user_data = user_data,
         .prefix = prefix, .prefix_len = prefix ? strlen(prefix) : 0u,
-        .now = current_time_ms(), .ok = true
+        .now = current_time_ms(), .bounded_label = bounded_label,
+        .max_classification = max_classification, .allowed_sci = allowed_sci,
+        .ok = true
     };
     qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
     int rc = 0;
@@ -2532,18 +2554,28 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
 }
 bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
                            qihse_kv_iter_cb cb, void* user_data) {
-    return foreach_user_filtered(store, NULL, user, cb, NULL, user_data);
+    return foreach_user_filtered(store, NULL, user, cb, NULL, user_data,
+                                 false, 0u, 0u);
 }
 bool qihse_kv_foreach_meta_user(qihse_kv_store_t* store, qihse_user_t* user,
                                 qihse_kv_iter_meta_cb cb, void* user_data) {
     if (!cb) return false;
-    return foreach_user_filtered(store, NULL, user, NULL, cb, user_data);
+    return foreach_user_filtered(store, NULL, user, NULL, cb, user_data,
+                                 false, 0u, 0u);
+}
+bool qihse_kv_foreach_meta_bounded_user(qihse_kv_store_t* store,
+    qihse_user_t* actor, uint16_t max_classification, uint16_t allowed_sci,
+    qihse_kv_iter_meta_cb cb, void* user_data) {
+    if (!actor || !qihse_auth_user_is_active(actor) || !cb) return false;
+    return foreach_user_filtered(store, NULL, actor, NULL, cb, user_data,
+                                 true, max_classification, allowed_sci);
 }
 bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   void* user_data) {
     if (!prefix) return false;
-    return foreach_user_filtered(store, prefix, user, cb, NULL, user_data);
+    return foreach_user_filtered(store, prefix, user, cb, NULL, user_data,
+                                 false, 0u, 0u);
 }
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
     (void)qihse_kv_foreach_user(store, NULL, cb, user_data);

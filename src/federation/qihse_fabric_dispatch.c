@@ -21,14 +21,6 @@
  */
 #include "qihse_fabric_dispatch.h"
 
-/* The token-derived context below is a deliberate, narrow use of the auth
- * layer's representation: QIHSE resolves a principal by pointer identity
- * against its node-local table, so a context built here is NON-AUTHORITATIVE
- * by construction and can never carry more authority than "unclassified".
- * That is exactly what a clearance-0/SCI-0 token claims, and it is why a
- * token above that is refused rather than mapped onto a local principal. */
-#include "qihse_auth_internal.h"
-
 #include "qihse_ai_memory.h"
 #include "qihse_fabric_index.h"
 
@@ -214,9 +206,9 @@ bool qihse_fabric_jobtype_is_idempotent(qihse_fabric_job_t type) {
  * the deterministic artifact key for the job binding, so a retry overwrites
  * it rather than accumulating.
  *
- * The scan runs as the CALLER's principal: qihse_kv_foreach_user already
- * filters by qihse_auth_can_access, so records above the caller's claims are
- * not merely unindexed — they are never seen.  Job bookkeeping keys are
+ * The scan runs with a live executor principal and a separate token label
+ * bound: the KV iterator filters above that bound before invoking this
+ * callback. Job bookkeeping keys are
  * excluded: `fabric:job:`, `fabric:result:`, `fabric:index:` are fabric
  * metadata, not artifacts, and a rebuild must not index its own report. */
 
@@ -226,15 +218,14 @@ typedef struct {
     const char* prefix;
     size_t prefix_len;
     qihse_user_t* user;
-    uint16_t classification;
-    uint16_t sci;
     uint64_t scanned;
     uint64_t indexed;
     uint64_t unindexed;
 } fabric_index_build_ctx_t;
 
 static bool fabric_index_build_cb(const char* key, const char* value,
-                                  void* user_data) {
+                                  uint16_t record_classification,
+                                  uint16_t record_sci, void* user_data) {
     fabric_index_build_ctx_t* c = (fabric_index_build_ctx_t*)user_data;
     if (!key || !value) return true;
     if (strncmp(key, c->prefix, c->prefix_len) != 0) return true;
@@ -245,7 +236,8 @@ static bool fabric_index_build_cb(const char* key, const char* value,
         strncmp(key, "fabric:index:", 13u) == 0) return true;
     c->scanned++;
     int irc = qihse_fabric_index_artifact_user(key, value, strlen(value),
-                                             c->classification, c->sci, c->user);
+                                               record_classification, record_sci,
+                                               c->user);
     if (irc == 0) c->indexed++; else c->unindexed++;
     return true;
 }
@@ -254,7 +246,8 @@ bool qihse_fabric_index_build(void* store_void, const char* prefix,
                               qihse_user_t* user,
                               uint16_t classification, uint16_t sci,
                               char* out_report, size_t out_cap) {
-    if (!store_void || !user || !out_report || out_cap == 0u) return false;
+    if (!store_void || !user || !qihse_auth_user_is_active(user) ||
+        !out_report || out_cap == 0u) return false;
     if (!prefix || prefix[0] == '\0') prefix = "fabric:";
     size_t prefix_len = strlen(prefix);
     if (prefix_len > QIHSE_FABRIC_INDEX_BUILD_PREFIX_MAX) return false;
@@ -264,10 +257,9 @@ bool qihse_fabric_index_build(void* store_void, const char* prefix,
     ctx.prefix = prefix;
     ctx.prefix_len = prefix_len;
     ctx.user = user;
-    ctx.classification = classification;
-    ctx.sci = sci;
-    if (!qihse_kv_foreach_user((qihse_kv_store_t*)store_void, user,
-                               fabric_index_build_cb, &ctx)) {
+    if (!qihse_kv_foreach_meta_bounded_user((qihse_kv_store_t*)store_void,
+                                            user, classification, sci,
+                                            fabric_index_build_cb, &ctx)) {
         return false;
     }
     int n = snprintf(out_report, out_cap,
@@ -871,24 +863,6 @@ bool qihse_fabric_response_parse(const char* body, size_t body_len,
 
 /* ── Executor: job execution ────────────────────────────────────────────── */
 
-/* A context that carries the VERIFIED remote claims and nothing else.
- *
- * It is deliberately non-authoritative: QIHSE's authorization resolves a
- * principal by pointer identity against the node-local table, so this
- * structure can never grant more than unclassified access.  It is therefore a
- * faithful representation of a clearance-0/SCI-0 principal and of no other,
- * which is exactly the rule qihse_fabric_executor_run() enforces. */
-static void fabric_remote_context(qihse_user_t* out, const qihse_fabric_token_t* claims) {
-    memset(out, 0, sizeof(*out));
-    out->user_id = claims->principal_user_id;
-    out->role = 0;                       /* no role: role is not a claim */
-    out->classification_level = claims->clearance;
-    out->sci_compartments = claims->sci;
-    out->tenant_id = claims->principal_tenant;
-    snprintf(out->username, sizeof(out->username), "fabric-remote:%u",
-             (unsigned)claims->principal_user_id);
-}
-
 static bool fabric_remote_result_key(const qihse_uuid_t* submitter_node,
                                      uint64_t job_id, char* out, size_t out_cap,
                                      const char* prefix) {
@@ -991,17 +965,14 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
     /*
      * THE EXECUTION RULE.
      *
-     * The job runs only when the executor can run it as EXACTLY the principal
-     * the token names.  QIHSE resolves principals by identity against its
-     * node-local authorization table, so a principal from another node has no
-     * entry there and the only context the executor can construct carries no
-     * authority beyond unclassified.  That is a faithful representation of a
-     * clearance-0/SCI-0 principal and of nothing else.
+     * The executor accepts only the zero label from the remote token. The
+     * live local principal authenticates writes, and their label is passed
+     * explicitly as clearance 0 / SCI 0. QIHSE resolves principals by identity
+     * against its node-local authorization table, so a principal from another
+     * node has no entry there. Only a clearance-0/SCI-0 job is executable.
      *
-     * Any token above that is REFUSED here.  It is NOT run under the
-     * executor's own principal: the executor's clearance is 0xFFFF on a
-     * system node, so running there would read data the submitter cannot and
-     * return it — the disclosure path this whole design exists to prevent.
+     * Any token above that is REFUSED here: running a higher claim under the
+     * executor's principal could read data the submitter cannot and return it.
      */
     if (claims->clearance != 0u || claims->sci != 0u) {
         fabric_refusal_body("principal-not-representable", claims->job_type,
@@ -1019,9 +990,6 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
     payload_str[payload_len] = '\0';
     payload = payload_str;
     payload_len = strlen(payload_str);
-
-    qihse_user_t remote_ctx;
-    fabric_remote_context(&remote_ctx, claims);
 
     char result_key[128];
     if (!qihse_fabric_remote_result_key(&claims->submitter_node, claims->job_id,
@@ -1140,9 +1108,8 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
         }
     } else if (claims->job_type == QIHSE_FABRIC_JOB_INDEX_BUILD) {
         /* `index-build`: the payload is the key prefix to rebuild ("fabric:"
-         * when empty).  The scan runs as the token's claims context, so
-         * records above those claims are never even seen — and the report is
-         * persisted at the claims' classification like every artifact here. */
+         * when empty). The live executor authenticates the bounded scan;
+         * only records within the token's zero label reach its callback. */
         char art_key[192];
         if (!qihse_fabric_remote_index_key(&claims->submitter_node, claims->job_id,
                                            art_key, sizeof(art_key))) {
@@ -1150,7 +1117,7 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
         }
         infer_out = (char*)malloc(QIHSE_FABRIC_MAX_RESPONSE);
         if (!infer_out) return false;
-        if (!qihse_fabric_index_build(store, payload, &remote_ctx,
+        if (!qihse_fabric_index_build(store, payload, ex->local_user,
                                       claims->clearance, claims->sci,
                                       infer_out, QIHSE_FABRIC_MAX_RESPONSE)) {
             status = "failed";
@@ -1173,10 +1140,11 @@ static bool fabric_execute_job(qihse_fabric_executor_t* ex,
     } else {
         char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
         mem_id[0] = '\0';
-        /* `embed` takes its classification from the context, which is why the
-         * context must be exactly the principal's — see the rule above. */
-        if (qihse_ai_memory_store(ex->server, &remote_ctx, payload,
-                                  QIHSE_AIMEM_SEMANTIC, mem_id)) {
+        /* The token's verified zero label is retained on the memory and its
+         * projections while the live executor authenticates every write. */
+        if (qihse_ai_memory_store_fabric_unclassified(
+                ex->server, ex->local_user, payload, QIHSE_AIMEM_SEMANTIC,
+                mem_id)) {
             status = "done";
             reason = "-";
             snprintf(result_ref, sizeof(result_ref), "%s", mem_id);

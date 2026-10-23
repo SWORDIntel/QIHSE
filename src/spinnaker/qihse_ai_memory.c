@@ -593,7 +593,8 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
         qihse_resp_server_t* server, qihse_user_t* user,
         const char* text, uint32_t kind, const qihse_ai_memory_scope_t* scope,
         const qihse_uuid_t* uuid,
-        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq,
+        bool fabric_unclassified) {
     if (out_change_seq) *out_change_seq = 0u;
     if (!server || !user || !qihse_auth_user_is_active(user) ||
         (!scope && qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM) ||
@@ -644,8 +645,12 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
         return QIHSE_AIMEM_WRITE_REPLAY;
     }
 
-    uint16_t classification = qihse_user_get_classification(user);
-    uint16_t sci = qihse_user_get_sci(user);
+    /* A verified fabric clearance-0 job runs with a live local executor
+     * handle, but its output must retain the remote token's zero label.
+     * The fabric entry point below admits only system Operators, and all
+     * primary/vector/index writes receive these same label values. */
+    uint16_t classification = fabric_unclassified ? 0u : qihse_user_get_classification(user);
+    uint16_t sci = fabric_unclassified ? 0u : qihse_user_get_sci(user);
     size_t overhead = scope ? 512u : 128u;
     char* value = malloc(text_len + overhead);
     if (!value) return QIHSE_AIMEM_WRITE_FAILED;
@@ -716,8 +721,23 @@ bool qihse_ai_memory_store(qihse_resp_server_t* server, qihse_user_t* user,
                            char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
     qihse_uuid_t uuid;
     if (!qihse_uuid_generate(&uuid)) return false;
-    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id, NULL) ==
+    return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id, NULL,
+                            false) ==
            QIHSE_AIMEM_WRITE_NEW;
+}
+
+bool qihse_ai_memory_store_fabric_unclassified(
+        qihse_resp_server_t* server, qihse_user_t* executor,
+        const char* text, uint32_t kind,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    if (!executor || !qihse_auth_user_is_active(executor) ||
+        qihse_user_get_role(executor) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(executor) != QIHSE_TENANT_SYSTEM)
+        return false;
+    qihse_uuid_t uuid;
+    if (!qihse_uuid_generate(&uuid)) return false;
+    return aimem_store_uuid(server, executor, text, kind, NULL, &uuid, out_id,
+                            NULL, true) == QIHSE_AIMEM_WRITE_NEW;
 }
 
 qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent(
@@ -752,7 +772,7 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_idempotent_with_seq(
     if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
         return QIHSE_AIMEM_WRITE_FAILED;
     return aimem_store_uuid(server, user, text, kind, NULL, &uuid, out_id,
-                            out_change_seq);
+                            out_change_seq, false);
 }
 
 bool qihse_ai_memory_store_scoped(qihse_resp_server_t* server,
@@ -764,7 +784,8 @@ bool qihse_ai_memory_store_scoped(qihse_resp_server_t* server,
         (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC)) return false;
     qihse_uuid_t uuid;
     if (!qihse_uuid_generate(&uuid)) return false;
-    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL) ==
+    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL,
+                            false) ==
            QIHSE_AIMEM_WRITE_NEW;
 }
 
@@ -794,7 +815,8 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
     qihse_uuid_t uuid;
     if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
         return QIHSE_AIMEM_WRITE_FAILED;
-    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL);
+    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL,
+                            false);
 }
 
 bool qihse_ai_memory_change_seq(qihse_resp_server_t* server,
@@ -1205,7 +1227,7 @@ qihse_ai_memory_write_result_t qihse_ai_memory_event_append_evidence(
                 free(prior.text);
             } else {
                 result = aimem_store_uuid(server, user, envelope,
-                    QIHSE_AIMEM_EVENT, scope, &uuid, out_id, NULL);
+                    QIHSE_AIMEM_EVENT, scope, &uuid, out_id, NULL, false);
             }
         }
     }
