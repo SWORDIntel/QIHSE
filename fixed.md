@@ -298,3 +298,38 @@ were failing; root causes fixed and committed (`bb8e49d`):
    `test` (the aggregate) inherits these three.
 
 Net: 183 targets, everything green except the three pre-existing WIP defects above.
+
+---
+
+# Suite remediation — 2026-10-24 (round 3)
+
+Follow-up to the three defects above:
+
+1. **Fabric remote embed and index-build:** resolved. The executor now uses its
+   live system Operator handle for an unclassified AIMEM write after verifying
+   the signed zero-label token. The stored memory and projections retain the
+   token's 0/0 label. Index-build uses a live actor and a bounded-label KV
+   iterator that filters records before the callback. Nonzero token labels
+   remain refused. The fabric dispatch test covers forged handles and
+   low-clearance/high-data denial. `test-fabric-dispatch`, `test-ai-memory`, and
+   `test-ai-memory-embed` pass on the integrated branch.
+2. **Gold pg-wire-cluster:** the cwd/`LD_LIBRARY_PATH` hypothesis was not
+   reproduced. The protocol test assumed each `read()` returned a full frame
+   and had no socket deadline. It now uses complete framed reads/writes and
+   bounded socket and thread waits. `test-pg-wire-cluster` passes, and the
+   `pg-wire-shard` workload passed inside the full gold runner (8.21 s). The
+   earlier full-suite hang was not reproduced, so its exact cause remains
+   unproven.
+3. **UWP concurrency:** the observed long stall was 16 workers running
+   16,000 constant-time dummy PBKDF2 hashes for nonexistent usernames; the
+   audit signer was idle in the debugger. The test now authenticates a real
+   principal concurrently, exercises grants/denials and authenticated KV
+   reads/writes, and flushes audit. `test-uwp-concurrency` passes on the
+   integrated branch (16/16 authentications, 5,344 grants, 10,656 denials).
+
+The full gold battery was stopped by a 10-minute outer timeout after its
+`pg-wire-shard` PASS. It also reported a `cluster-failover-smoke` failure.
+Standalone reproduction showed both daemons exit before binding: the smoke
+passes `--redundancy-peer`, which the daemon explicitly rejects until duplicate
+writes use pinned QKP replication (`tools/qihse_cluster_daemon.c`). This is a
+separate unresolved feature/test-contract mismatch, not a pg runner hang.
