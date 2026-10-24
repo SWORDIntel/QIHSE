@@ -333,3 +333,10 @@ Standalone reproduction showed both daemons exit before binding: the smoke
 passes `--redundancy-peer`, which the daemon explicitly rejects until duplicate
 writes use pinned QKP replication (`tools/qihse_cluster_daemon.c`). This is a
 separate unresolved feature/test-contract mismatch, not a pg runner hang.
+
+The gold smoke now asserts that the unsafe flag remains disabled, then checks
+slot takeover and survival of an authenticated, preseeded unclassified key.
+Its focused run passed 6/6. The gold pack expects that exact result. Pinned
+QKP replica pull still requires a read-only replica; live authenticated write
+duplication to a promotable successor remains unimplemented and is not claimed
+by this drill.
