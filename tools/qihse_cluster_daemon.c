@@ -257,6 +257,33 @@ done:
     return principal;
 }
 
+/* Tenant-scoped, non-Operator machine principal for MACHINEAUTH-over-QKP
+ * admin access (see tools/qihse_admin_cli.c). The MACHINEAUTH handler
+ * refuses system-tenant and Operator principals, so this must be a tenant
+ * user. Idempotent across restarts: create returns the existing principal. */
+static qihse_user_t* machine_service_principal_create(uint32_t tenant_id,
+                                                      uint32_t user_id) {
+    unsigned char random_secret[32];
+    char one_time_password[sizeof(random_secret) * 2u + 1u];
+    static const char hex[] = "0123456789abcdef";
+    qihse_user_t* principal = NULL;
+
+    if (RAND_bytes(random_secret, (int)sizeof(random_secret)) != 1) goto done;
+    for (size_t i = 0; i < sizeof(random_secret); i++) {
+        one_time_password[i * 2u] = hex[random_secret[i] >> 4];
+        one_time_password[i * 2u + 1u] = hex[random_secret[i] & 0x0fu];
+    }
+    one_time_password[sizeof(one_time_password) - 1u] = '\0';
+    principal = qihse_auth_create_tenant_user(
+        qihse_auth_get_user(0u), tenant_id, user_id, QIHSE_ROLE_ANALYST,
+        UINT16_MAX, UINT16_MAX, one_time_password, false);
+
+done:
+    OPENSSL_cleanse(one_time_password, sizeof(one_time_password));
+    OPENSSL_cleanse(random_secret, sizeof(random_secret));
+    return principal;
+}
+
 static bool parse_u16(const char* s, uint16_t* out) {
     if (!s || !*s) return false;
     char* end = NULL;
@@ -1124,6 +1151,10 @@ int main(int argc, char** argv) {
     const char* operator_password = NULL;
     char* operator_password_arg = NULL;
     uint32_t replication_principal_id = 65535u;
+    uint32_t machine_principal_id = 0u;      /* 0 = no machine principal */
+    uint32_t machine_principal_tenant = 0u;
+    const char* admin_peer_node_id = NULL;
+    const char* admin_peer_dsa_pub = NULL;
     const char* data_dir = NULL;
     bool enable_scatter = false;
     size_t max_clients = 4096u;
@@ -1284,6 +1315,25 @@ int main(int argc, char** argv) {
             if (errno != 0 || !end || *end || v == 0u || v > 65535u)
                 return usage(argv[0]), 2;
             replication_principal_id = (uint32_t)v;
+        } else if (strcmp(a, "--machine-principal-id") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v == 0u || v > 65535u)
+                return usage(argv[0]), 2;
+            machine_principal_id = (uint32_t)v;
+        } else if (strcmp(a, "--machine-principal-tenant") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end)
+                return usage(argv[0]), 2;
+            machine_principal_tenant = (uint32_t)v;
+        } else if (strcmp(a, "--admin-peer-node-id") == 0 && i + 1 < argc) {
+            admin_peer_node_id = argv[++i];
+            if (!*admin_peer_node_id || strlen(admin_peer_node_id) > QIHSE_QKP_NODE_ID_LEN)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--admin-peer-dsa-pub") == 0 && i + 1 < argc) {
+            admin_peer_dsa_pub = argv[++i];
+            if (!*admin_peer_dsa_pub) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-transport") == 0 && i + 1 < argc) {
             replication_transport = argv[++i];
             if (strcmp(replication_transport, "i2p") != 0 &&
@@ -1465,6 +1515,16 @@ int main(int argc, char** argv) {
 
     const bool replication_configured = replication_source_host != NULL ||
         replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
+    const bool admin_peer_configured = admin_peer_node_id != NULL ||
+        admin_peer_dsa_pub != NULL;
+    if (admin_peer_node_id != NULL && admin_peer_dsa_pub == NULL) {
+        fprintf(stderr, "qihse-cluster-daemon: --admin-peer-node-id requires --admin-peer-dsa-pub\n");
+        return 2;
+    }
+    if (admin_peer_dsa_pub != NULL && admin_peer_node_id == NULL) {
+        fprintf(stderr, "qihse-cluster-daemon: --admin-peer-dsa-pub requires --admin-peer-node-id\n");
+        return 2;
+    }
     if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
         fprintf(stderr, "qihse-cluster-daemon: replication source host and port must be configured together\n");
         return 2;
@@ -1594,6 +1654,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (replication_configured) pqc_require = true;
+    if (admin_peer_configured) pqc_require = true;
     if (consensus_configured) {
         const char* consensus_error = consensus_options_error(
             &consensus_options, data_dir, pqc_node_id, pqc_require,
@@ -1648,6 +1709,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: could not provision replication service principal %u\n",
                 (unsigned)replication_principal_id);
         return 1;
+    }
+
+    if (machine_principal_id != 0u) {
+        if (machine_principal_tenant == 0u) {
+            fprintf(stderr, "qihse-cluster-daemon: --machine-principal-id requires a nonzero --machine-principal-tenant\n");
+            return 1;
+        }
+        if (!machine_service_principal_create(machine_principal_tenant,
+                                             machine_principal_id)) {
+            fprintf(stderr, "qihse-cluster-daemon: could not provision machine principal %u (tenant %u)\n",
+                    (unsigned)machine_principal_id, (unsigned)machine_principal_tenant);
+            return 1;
+        }
     }
 
     const bool auth_required = operator_password != NULL;
@@ -1742,6 +1816,8 @@ int main(int argc, char** argv) {
     }
     pqc.replication_peer_node_id = replication_peer_node_id;
     pqc.replication_peer_dsa_pub_path = replication_peer_dsa_pub;
+    pqc.admin_peer_node_id = admin_peer_node_id;
+    pqc.admin_peer_dsa_pub_path = admin_peer_dsa_pub;
     static char pqc_dsa_key[512], pqc_kem_key[512], pqc_kem_pub[512];
     const char* pqc_dir = pqc_identity_dir ? pqc_identity_dir : "/etc/qihse/keys";
     snprintf(pqc_dsa_key, sizeof(pqc_dsa_key), "%s/qihse_dsa_key.pem", pqc_dir);

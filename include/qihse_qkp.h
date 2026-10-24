@@ -144,6 +144,11 @@ typedef struct {
      * QKP signer. Receiver APPLY/CURSOR remain local in-process operations. */
     const char* replication_peer_node_id;
     const char* replication_peer_dsa_pub_path;
+    /* Optional pinned administrator identity: a trusted QKP peer with a
+     * matching node id + DSA pub maps to the system operator (full command
+     * scope) at accept time. */
+    const char* admin_peer_node_id;
+    const char* admin_peer_dsa_pub_path;
 } qihse_qkp_config_t;
 
 typedef enum {

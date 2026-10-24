@@ -342,7 +342,7 @@ endif
 # happens to be defined above, e.g. check-isa).
 .DEFAULT_GOAL := all
 
-all: check-isa liboqs oqs-provider lib server keygen federation-ca cluster-daemon machine-token backup-cli
+all: check-isa liboqs oqs-provider lib server keygen federation-ca cluster-daemon machine-token backup-cli admin-cli
 build: check-isa liboqs oqs-provider lib server lib-ctypes keygen cluster-daemon machine-token backup-cli
 
 build-native:
@@ -363,6 +363,10 @@ redis-server: lib
 backup-cli: lib
 	$(CC) $(CFLAGS) -o qihse-backup tools/qihse_backup_cli.c -L. -lqihse $(LDFLAGS)
 	@echo "qihse-backup build successful"
+
+admin-cli: lib
+	$(CC) $(CFLAGS) -o qihse-admin-cli tools/qihse_admin_cli.c -L. -lqihse $(LDFLAGS)
+	@echo "qihse-admin-cli build successful"
 
 test-backup-cli: lib
 	$(CC) $(CFLAGS) -o tests/test_backup_cli tests/test_backup_cli.c -L. -lqihse $(LDFLAGS)

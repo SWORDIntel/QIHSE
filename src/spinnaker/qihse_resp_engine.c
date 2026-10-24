@@ -118,7 +118,8 @@ typedef enum {
     QIHSE_RESP_AUTH_LOCAL_PRINCIPAL,
     QIHSE_RESP_AUTH_PEER_CLAIMS,
     QIHSE_RESP_AUTH_MACHINE_CLAIMS,
-    QIHSE_RESP_AUTH_QKP_REPLICATION
+    QIHSE_RESP_AUTH_QKP_REPLICATION,
+    QIHSE_RESP_AUTH_QKP_ADMIN
 } qihse_resp_auth_kind_t;
 
 typedef struct {
@@ -14882,6 +14883,9 @@ static bool qihse_resp_session_command_allowed(
         case QIHSE_RESP_AUTH_PEER_CLAIMS:
             return qihse_resp_command_is(request, "VECSEARCH") &&
                    qihse_resp_vecsearch_has_collection_tag(request);
+        case QIHSE_RESP_AUTH_QKP_ADMIN:
+            /* pinned administrator identity — full command scope */
+            return true;
         default:
             return true;
     }
@@ -15350,6 +15354,25 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
                 session.user = server->replication_service_principal;
                 session.user_id = qihse_user_get_id(session.user);
                 session.auth_kind = QIHSE_RESP_AUTH_QKP_REPLICATION;
+            }
+        }
+        /* Pinned administrator identity: a trusted QKP peer explicitly
+         * configured with --admin-peer-node-id/--admin-peer-dsa-pub maps to
+         * the system operator. Mirrors the replication pin; grants full
+         * command scope (QIHSE_RESP_AUTH_QKP_ADMIN). */
+        if (!session.user && server->pqc.admin_peer_node_id &&
+            server->pqc.admin_peer_dsa_pub_path &&
+            qihse_qkp_session_is_replication_peer(
+                qkp, server->pqc.admin_peer_node_id,
+                server->pqc.admin_peer_dsa_pub_path)) {
+            qihse_user_t* op = qihse_auth_get_user(0u);
+            bool op_active = false;
+            uint32_t op_tenant = QIHSE_TENANT_INVALID;
+            if (op) qihse_auth_user_active_and_tenant(op, &op_active, &op_tenant);
+            if (op_active && op_tenant == QIHSE_TENANT_SYSTEM) {
+                session.user = op;
+                session.user_id = 0u;
+                session.auth_kind = QIHSE_RESP_AUTH_QKP_ADMIN;
             }
         }
     }
