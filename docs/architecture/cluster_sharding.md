@@ -668,19 +668,15 @@ Selection is receiver-local and deterministic; with 2 nodes the surviving
 node always succeeds the dead one. Verified live: SIGKILL the lead, the
 successor owns 16,384/16,384 slots within the health window.
 
-## Data redundancy (phase 1: string KV, async)
+## Data redundancy
 
-`--redundancy-peer HOST:PORT` enables fire-and-forget duplication: every
-committed string-KV write (SET with TTL) and delete (DEL) is replayed to the
-peer with ASKING (accepted regardless of slot ownership — the peer stores a
-duplicate outside its own routing range). Reads never consult the duplicate
-until failover re-homes the slots, at which point the promoted successor
-already holds the data. Honest limits: writes in flight when a node dies are
-lost (async); hashes/lists/sets and blob/vector objects do not replicate in
-phase 1; a persistent replication link (rather than per-write connections) is
-the performance follow-up. Verified live: duplicated key survives SIGKILL of
-the lead and is served by the promoted successor. See
-`tests/cluster_failover_smoke.py`.
+The daemon refuses `--redundancy-peer`: its former fire-and-forget RESP replay
+did not use pinned QKP transport. Pinned QKP replica pull requires a read-only
+replica and therefore cannot currently supply a promotable cluster successor.
+Authenticated replication to a promotable successor remains an implementation
+gap. `tests/cluster_failover_smoke.py` verifies slot takeover and survival of
+an explicitly preseeded, unclassified key; it also asserts that the unsafe
+legacy option stays disabled. It does not verify live write duplication.
 
 ## 5-node lab status (2026-09-16)
 
