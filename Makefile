@@ -917,6 +917,7 @@ test: test-aimem-scope-index
 test: test-aimem-qh08 test-aimem-qh08-resp
 test: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test: test-wal-durability
+test: test-python-pg-sdk
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -1110,6 +1111,9 @@ test-cluster-rebalance: lib
 test-pg-wire-cluster: lib
 	$(CC) $(CFLAGS) -o tests/test_pg_wire_cluster tests/test_pg_wire_cluster.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_pg_wire_cluster
+
+test-python-pg-sdk:
+	PYTHONPATH=sdks/python python3 -m unittest -v test_qihse_pg_transactions
 
 test-keystone-qihse: lib
 	$(CC) $(CFLAGS) -o tests/test_keystone_qihse_integration tests/test_keystone_qihse_integration.c -L. -lqihse $(LDFLAGS)
