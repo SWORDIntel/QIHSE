@@ -86,6 +86,7 @@ lib/
 /qihse-cluster-daemon
 /qihse-redis-server
 /qihse-backup
+/qihse-admin-cli
 /qihse-codegraph
 /qihse-machine-token
 
