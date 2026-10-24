@@ -21,14 +21,17 @@ native builds, QKP-hardened access, replication, and tooling.
 - Docs updated across OPERATIONS / GETTING_STARTED / cluster_sharding /
   deployment / hardening-report.
 
-## Phase 1 — Operational closure (small, next)
+## Phase 1 — Operational closure ✅ (closed 2026-10-24)
 
-| # | Item | Notes |
+| # | Item | Result |
 |---|---|---|
-| 1.1 | Full deploy+restart cycle via `cluster_rolling_restart.sh` | Only `--verify-only` exercised after the QKP probe swap; run one complete rolling pass |
-| 1.2 | End-to-end replication proof | SET a key in a replicated namespace on the source (via admin CLI), confirm it appears on the replica within one 30s interval |
-| 1.3 | `qihse-backup` on hardened masters | Backup CLI still uses cleartext password AUTH — rejected on `pqc_require` masters; either port it to the QKP admin path or document local-only usage |
-| 1.4 | Replica self-reporting in `cluster nodes` | Replicas appear alongside masters in `CLUSTER NODES` (slot-less); confirm benign or exclude them from the topology view |
+| 1.1 | Full deploy+restart cycle via `cluster_rolling_restart.sh` | ✅ ran end-to-end: 3 nodes deployed, restarted, QKP-verified 3/3 |
+| 1.2 | End-to-end replication proof | ✅ SET `tool:phase1-probe` on node5 → t320 replica pulled `1 row(s) (ok)` → GET on the replica returned the exact value |
+| 1.3 | `qihse-backup` on hardened masters | ✅ 85.6 MB full backup + `verify` result `valid`; it is a local (non-RESP) tool and works on `pqc_require` masters — the node service must be stopped for a consistent snapshot |
+| 1.4 | Replica self-reporting in `cluster nodes` | ✅ replicas now carry unique `--bus-port`s (17201/17202 per host) and no longer share the master bus; `CLUSTER NODES` shows only the 3 masters |
+
+Also landed: replica units pin the admin identity and trust the admin pub, so
+`qihse-admin-cli` can verify replica contents (read-only).
 
 ## Phase 2 — Security & compliance (per repo invariants)
 
