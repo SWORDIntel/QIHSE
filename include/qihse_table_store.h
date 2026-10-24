@@ -128,7 +128,7 @@ size_t qihse_table_row_count(const qihse_table_t* table);
 void qihse_table_scan(const qihse_table_t* table,
                       qihse_table_row_cb cb, void* ctx);
 
-/* --- Optimistic single-table transactions ----------------------------- */
+/* --- Optimistic table transactions ------------------------------------ */
 
 /* Capture a deep transaction-local snapshot and the table generation.
  * Returns NULL on invalid input, generation exhaustion, or allocation
@@ -163,6 +163,15 @@ void qihse_table_txn_scan(const qihse_table_txn_t* txn,
  * a conflict leaves the live table unchanged.  Commit consumes txn on both
  * success and failure. */
 bool qihse_table_txn_commit(qihse_table_txn_t* txn);
+
+/* Atomically publish a non-empty group of distinct table transactions. All
+ * table generation fences are checked while every participating table write
+ * lock is held; either every shadow is published or none is. For a valid
+ * array, the function consumes each transaction on success and failure. The
+ * caller must not pass duplicate transaction pointers. This is an in-memory
+ * atomic publish only; it does not provide WAL durability or restart
+ * recovery. */
+bool qihse_table_txn_commit_group(qihse_table_txn_t** txns, size_t count);
 
 /* Discard the transaction-local snapshot. */
 void qihse_table_txn_rollback(qihse_table_txn_t* txn);

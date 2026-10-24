@@ -40,6 +40,16 @@ db.start_resp_proxy("0.0.0.0", 6379)
 db.start_pg_proxy("0.0.0.0", 5432)
 ```
 
+The `qihse_pg` client completes PostgreSQL startup authentication before it
+returns a connection, then reads each command through `ReadyForQuery` so server
+errors and transport failures reach the caller. Managed connections issue
+`BEGIN` before their first statement and only update transaction state after a
+successful command-complete/ready response. The current QIHSE PG wire server
+does not yet implement transaction commands, so these calls fail explicitly;
+use `autocommit=True` only when statement-at-a-time behavior is intended. The
+current server also rejects PostgreSQL SSL negotiation and asks for a cleartext
+password, so do not send credentials over an untrusted network.
+
 ## Security & Supernatural Auth Gates
 
 The SDK natively binds the Cell-Level clearance engine and God-Mode Operator protections. 

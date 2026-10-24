@@ -180,7 +180,7 @@ int main(void) {
     }
 
     qihse_resp_server_destroy(g_server);
-    qihse_fts_destroy(fts);
+    /* cfg.fts is owned by the server from create onward. */
     qihse_kv_store_destroy(store);
     printf("test_resp_hybrid: all hybrid FTS+vector server-path tests passed\n");
     return 0;

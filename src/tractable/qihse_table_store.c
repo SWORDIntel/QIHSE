@@ -25,6 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    qihse_table_txn_t* txn;
+    qihse_table_t* table;
+    qihse_col_value_t** old_rows;
+    size_t old_num_rows;
+} ts_group_item_t;
+
 /* -------------------------------------------------------------------------
  * Internal structures
  * ------------------------------------------------------------------------- */
@@ -598,30 +605,95 @@ void qihse_table_txn_scan(const qihse_table_txn_t* txn,
     }
 }
 
-bool qihse_table_txn_commit(qihse_table_txn_t* txn) {
-    if (!txn || !txn->table) return false;
-    qihse_table_t* table = txn->table;
-    pthread_rwlock_wrlock(&table->lock);
-    if (table->generation != txn->base_generation) {
-        pthread_rwlock_unlock(&table->lock);
-        ts_txn_destroy(txn);
+static int ts_group_item_cmp(const void* a, const void* b) {
+    const ts_group_item_t* ia = (const ts_group_item_t*)a;
+    const ts_group_item_t* ib = (const ts_group_item_t*)b;
+    uintptr_t pa = (uintptr_t)ia->table;
+    uintptr_t pb = (uintptr_t)ib->table;
+    return pa < pb ? -1 : pa > pb ? 1 : 0;
+}
+
+static void ts_group_destroy_unique(qihse_table_txn_t** txns, size_t count) {
+    if (!txns) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (!txns[i]) continue;
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j)
+            if (txns[j] == txns[i]) { seen = true; break; }
+        if (!seen) ts_txn_destroy(txns[i]);
+    }
+}
+
+bool qihse_table_txn_commit_group(qihse_table_txn_t** txns, size_t count) {
+    if (!txns || count == 0 || count > SIZE_MAX / sizeof(ts_group_item_t))
+        return false;
+    ts_group_item_t* items = (ts_group_item_t*)calloc(count, sizeof(*items));
+    if (!items) {
+        ts_group_destroy_unique(txns, count);
         return false;
     }
 
-    qihse_col_value_t** old_rows = table->rows;
-    size_t old_num_rows = table->num_rows;
-    table->rows = txn->shadow.rows;
-    table->num_rows = txn->shadow.num_rows;
-    table->cap_rows = txn->shadow.cap_rows;
-    table->num_tomb = txn->shadow.num_tomb;
-    table->generation++;
-    txn->shadow.rows = NULL;
-    txn->shadow.num_rows = 0;
-    pthread_rwlock_unlock(&table->lock);
+    bool valid = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!txns[i] || !txns[i]->table) { valid = false; break; }
+        items[i].txn = txns[i];
+        items[i].table = txns[i]->table;
+        for (size_t j = 0; j < i; ++j) {
+            if (txns[j] == txns[i] || items[j].table == items[i].table) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) break;
+    }
+    if (!valid) {
+        free(items);
+        ts_group_destroy_unique(txns, count);
+        return false;
+    }
 
-    ts_free_rows(old_rows, old_num_rows, table->num_cols);
-    free(txn);
+    qsort(items, count, sizeof(*items), ts_group_item_cmp);
+    for (size_t i = 0; i < count; ++i)
+        pthread_rwlock_wrlock(&items[i].table->lock);
+
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i].table->generation != items[i].txn->base_generation) {
+            for (size_t j = count; j > 0; --j)
+                pthread_rwlock_unlock(&items[j - 1].table->lock);
+            ts_group_destroy_unique(txns, count);
+            free(items);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        qihse_table_t* table = items[i].table;
+        qihse_table_txn_t* txn = items[i].txn;
+        items[i].old_rows = table->rows;
+        items[i].old_num_rows = table->num_rows;
+        table->rows = txn->shadow.rows;
+        table->num_rows = txn->shadow.num_rows;
+        table->cap_rows = txn->shadow.cap_rows;
+        table->num_tomb = txn->shadow.num_tomb;
+        table->generation++;
+        txn->shadow.rows = NULL;
+        txn->shadow.num_rows = 0;
+    }
+    for (size_t i = count; i > 0; --i)
+        pthread_rwlock_unlock(&items[i - 1].table->lock);
+
+    for (size_t i = 0; i < count; ++i) {
+        ts_free_rows(items[i].old_rows, items[i].old_num_rows,
+                     items[i].table->num_cols);
+        free(items[i].txn);
+    }
+    free(items);
     return true;
+}
+
+bool qihse_table_txn_commit(qihse_table_txn_t* txn) {
+    qihse_table_txn_t* one[1] = {txn};
+    return qihse_table_txn_commit_group(one, 1);
 }
 
 void qihse_table_txn_rollback(qihse_table_txn_t* txn) {

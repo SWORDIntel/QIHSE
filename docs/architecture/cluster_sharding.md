@@ -588,15 +588,16 @@ Nodes may join without a pre-shared topology: launch with `--join SEED_HOST:SEED
 
 ## Slot load shift (CLUSTER MOVESLOTS)
 
-`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` (system domain only) hands a
-slot range to another node: it transfers every locally-owned KV record in the
-range to the target over the MIGRATE wire flow (AUTH + ASKING + SET [PX]),
-deletes the local copies, flips ownership in the topology, and broadcasts the
-change on the cluster bus (`SLOT_UPDATE`), so every node's routing agrees.
-Ownership flips BEFORE the transfer (the target must accept the incoming
-SETs); a brief not-found window exists for not-yet-transferred keys — Redis
-style ASK-state handling is future work. Verified cross-machine by
-`tests/cluster_loadshift_smoke.py` (9/9).
+`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` is restricted to the system
+domain. The daemon does not configure the legacy RESP target credential while
+slot transfer lacks pinned QKP transport. For a range containing data, the
+handoff now refuses before changing ownership if target authentication is
+unavailable; an empty range can still be assigned to the target. The hermetic
+`tests/cluster_loadshift_smoke.py --self-spawn` verifies that refusal leaves
+the source keys and both nodes' slot views intact. Authenticated transfer of
+data to a new owner remains an implementation gap. The library's legacy
+AUTH + ASKING + SET [PX] path exists for explicit development fixtures and
+must not be used for classified production data without secured transport.
 
 ## Cluster brain (--brain)
 
@@ -668,19 +669,15 @@ Selection is receiver-local and deterministic; with 2 nodes the surviving
 node always succeeds the dead one. Verified live: SIGKILL the lead, the
 successor owns 16,384/16,384 slots within the health window.
 
-## Data redundancy (phase 1: string KV, async)
+## Data redundancy
 
-`--redundancy-peer HOST:PORT` enables fire-and-forget duplication: every
-committed string-KV write (SET with TTL) and delete (DEL) is replayed to the
-peer with ASKING (accepted regardless of slot ownership — the peer stores a
-duplicate outside its own routing range). Reads never consult the duplicate
-until failover re-homes the slots, at which point the promoted successor
-already holds the data. Honest limits: writes in flight when a node dies are
-lost (async); hashes/lists/sets and blob/vector objects do not replicate in
-phase 1; a persistent replication link (rather than per-write connections) is
-the performance follow-up. Verified live: duplicated key survives SIGKILL of
-the lead and is served by the promoted successor. See
-`tests/cluster_failover_smoke.py`.
+The daemon refuses `--redundancy-peer`: its former fire-and-forget RESP replay
+did not use pinned QKP transport. Pinned QKP replica pull requires a read-only
+replica and therefore cannot currently supply a promotable cluster successor.
+Authenticated replication to a promotable successor remains an implementation
+gap. `tests/cluster_failover_smoke.py` verifies slot takeover and survival of
+an explicitly preseeded, unclassified key; it also asserts that the unsafe
+legacy option stays disabled. It does not verify live write duplication.
 
 ## 5-node lab status (2026-09-16)
 

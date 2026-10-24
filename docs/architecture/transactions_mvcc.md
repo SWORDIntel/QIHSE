@@ -6,12 +6,14 @@
 > `tests/test_mvcc_delete.c` (run via `make test-mvcc-delete`). Two limits are
 > stated plainly rather than glossed over:
 >
-> 1. **The UWP SQL row-store path now uses this manager for one-table DML
+> 1. **The UWP SQL row-store path now uses this manager for bounded multi-table DML
 >    transactions.** INSERT, UPDATE and DELETE run against a private optimistic
->    table shadow; COMMIT publishes it behind a generation fence and ROLLBACK
->    discards it. Arbitrary cross-table transactions, SQL SELECT visibility,
->    savepoint data restoration, WAL durability and pgwire integration remain
->    outside this bounded slice.
+>    shadow per table; COMMIT publishes up to 16 table shadows atomically behind
+>    generation fences and ROLLBACK discards them. Autocommit UWP SQL SELECT
+>    now supports a bounded one-table projection/filter path behind READ ACLs;
+>    SELECT within a transaction, cross-model transactions, savepoint data
+>    restoration, WAL durability and pgwire integration remain outside this
+>    bounded slice.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >

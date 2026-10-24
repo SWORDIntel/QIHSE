@@ -48,6 +48,7 @@ typedef struct {
     char operator_password[QIHSE_STANDALONE_SECRET_MAX];
     char aimem_service_password[QIHSE_STANDALONE_SECRET_MAX];
     bool operator_set;
+    bool operator_from_argv;    /* --password: docs require it to MATCH the env */
     bool aimem_service_set;
 } standalone_credentials_t;
 
@@ -193,6 +194,7 @@ int main(int argc, char** argv) {
                 standalone_credentials_clear(&credentials);
                 return 2;
             }
+            credentials.operator_from_argv = true;
         }
         else if (strcmp(arg, "--embedder-onnx") == 0 && has_next) options.embedder_onnx = argv[++i];
         else if (strcmp(arg, "--artifact-blob-dir") == 0 && has_next) options.artifact_blob_dir = argv[++i];
@@ -279,6 +281,19 @@ int main(int argc, char** argv) {
     }
 
     setenv("QIHSE_DATA_DIR", data_dir, 1);
+    if (credentials.operator_set && credentials.operator_from_argv) {
+        /* docs/OPERATIONS.md: "--password ... must MATCH QIHSE_OPERATOR_PASSWORD
+         * when that env is set (mismatch = exit 2)". This used to be a silent
+         * argv-wins override, which quietly rotated the operator credential. */
+        const char* env_pw = getenv("QIHSE_OPERATOR_PASSWORD");
+        if (env_pw && *env_pw && strcmp(env_pw, credentials.operator_password) != 0) {
+            fprintf(stderr,
+                    "[qihse-redis-server] --password does not match QIHSE_OPERATOR_PASSWORD "
+                    "(refusing to rotate the operator credential; unset one of them)\n");
+            standalone_credentials_clear(&credentials);
+            return 2;
+        }
+    }
     if (credentials.operator_set) {
         const char* current = getenv("QIHSE_OPERATOR_PASSWORD");
         if (!current || strcmp(current, credentials.operator_password) != 0) {
@@ -387,7 +402,17 @@ int main(int argc, char** argv) {
 
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     if (!server) {
-        fprintf(stderr, "[qihse-redis-server] RESP server creation failed (auth gate or bind error)\n");
+        /* Report the actual rejection: the create() preconditions all set errno
+         * (EINVAL = bad sizing, EACCES = auth gate/staging, ENOENT = missing
+         * path), and "auth gate or bind error" alone sends you hunting. */
+        fprintf(stderr,
+                "[qihse-redis-server] RESP server creation failed: errno=%d (%s)"
+                " [auth_required=%d bind=%s port=%u max_clients=%zu max_request_bytes=%zu"
+                " aimem_service_user_id=%u]\n",
+                errno, strerror(errno), (int)config.auth_required,
+                config.bind_address ? config.bind_address : "(null)", config.port,
+                config.max_clients, config.max_request_bytes,
+                (unsigned)config.aimem_service_user_id);
         qihse_vector_db_destroy(forensic_vdb);
         qihse_blob_store_destroy(artifact_blobs);
         return 1;

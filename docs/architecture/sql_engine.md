@@ -244,10 +244,12 @@ the raw SQL text is never re-parsed for execution.
   DELETE change that shadow; COMMIT atomically swaps it into the live table if
   its generation is unchanged, while ROLLBACK or disconnect discards it. A
   concurrent live mutation makes COMMIT abort without overwriting that change.
-  This slice deliberately supports one table per transaction. SQL savepoint
-  commands and transactional DDL fail closed until their storage resources can
-  snapshot and restore those operations. Cross-table atomicity and SQL WAL
-  recovery remain open. A second identical DELETE reports `rows=0`
+  The row store can publish a bounded group of up to 16 table shadows
+  atomically, and UWP SQL enlists those shadows on demand. This is an
+  in-memory multi-table publish boundary; it does not include other models or
+  durable WAL recovery. SQL savepoint commands and transactional DDL fail
+  closed until their storage resources can snapshot and restore those
+  operations. A second identical DELETE reports `rows=0`
   (idempotent).
 - **Failure atomicity**: live and transaction-shadow UPDATE clone the current
   rows before applying assignments. Invalid values or allocation failure return
@@ -281,11 +283,16 @@ direct SCHEMA mutations on that connection are refused for the same reason.
 AUTH also refuses identity replacement while a transaction handle is active,
 so another principal cannot inherit and commit staged changes.
 
-SELECT is deliberately outside this mutation gate. The current plan executor
-does not materialize table-store rows, and the table store does not carry row
-classification or SCI metadata. A future SELECT implementation must add a
-typed principal to the scan boundary and enforce READ plus per-row labels
-before returning any stored value.
+The row-store SELECT slice supports one table, simple column projection (or
+`*`), the verified AND predicates supported by the DML row matcher, and
+LIMIT/OFFSET. It requires an active principal with table READ permission both
+at dispatch and immediately before scanning. The row store has no per-row
+classification or SCI metadata; these SQL rows are unclassified data under a
+table-level ACL. Joins, aggregates, ordering, CTEs, expression projections,
+and SELECT inside an open transaction fail closed rather than returning the
+optimizer's former empty placeholder as a successful result. Transactional
+read visibility and READ COMMITTED/REPEATABLE READ/SERIALIZABLE semantics for
+SQL SELECT remain open.
 
 ## 4. Cost-Based Optimizer
 
@@ -440,8 +447,9 @@ COMMIT, ROLLBACK and generation-conflict abort. Transactional INSERT defers the
 column-store analytic projection; the authoritative row commit succeeds
 independently of that asynchronous projection boundary.
 
-Not covered: real row-producing SELECT, pgwire transactions and prepared
-statements, savepoint data restoration (SQL savepoints currently refuse),
-multi-table atomicity, SQL WAL recovery, window functions, and
+Not covered: broader row-producing SELECT (joins, aggregates, ordering,
+expressions, CTEs), transactional SELECT visibility, pgwire transactions and
+prepared statements, savepoint data restoration (SQL savepoints currently
+refuse), cross-model atomicity, SQL WAL recovery, window functions, and
 `INSERT ... SELECT` execution.
 

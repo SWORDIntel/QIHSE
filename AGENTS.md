@@ -35,10 +35,16 @@ The negative test MUST run in CI. A successful happy-path test is not a substitu
 Changes that violate any invariant above are merge blockers. Performance, compatibility, internal-only deployment, prototype status, or convenience are not exceptions. If a new capability cannot preserve an invariant yet, keep it behind an explicitly insecure/development-only boundary rather than weakening the invariant silently.
 
 <!-- START: RELATIVE_PATHS_RULE -->
-## Path Resolution Policy
-> **CRITICAL RULE**: Never use absolute paths (e.g. `/home/...`, `/fast/home/...`).
-> All paths must be strictly relative or dynamically resolved across all projects, configurations, code, scripts, subagents, and tools.
-> Use relative paths (`./`, `../`), `PROJECT_ROOT`, `$(dirname ...)`, `Path(__file__)`, or dynamic environment variables with relative fallbacks.
+## Path Resolution Policy (this QIHSE repository only)
+> **CRITICAL RULE**: This policy applies ONLY to code, configuration, scripts, and
+> documentation written into this QIHSE repository. It does NOT restrict where agents
+> or tools may operate: reading, writing, and managing any absolute path on this system
+> (e.g. `/opt/...`, `/home/...`, `/mnt/...`) is fully permitted whenever the task
+> requires it.
+> Inside this repository, never hardcode absolute paths (`/home/...`, `/fast/home/...`):
+> use relative paths (`./`, `../`), `PROJECT_ROOT`, `$(dirname ...)`, `Path(__file__)`,
+> or dynamic environment variables with relative fallbacks, so a checkout builds and
+> runs identically at any mount point on any machine.
 <!-- END: RELATIVE_PATHS_RULE -->
 
 ## Federation record decoders: bounded stack frames

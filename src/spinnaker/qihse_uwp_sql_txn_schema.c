@@ -284,7 +284,7 @@ static qihse_column_type_t uwp_sql_type_to_col_type(qihse_sql_type_t t) {
 }
 
 /* Check if the AST has window functions in the SELECT list. */
-static bool uwp_has_window_functions(const qihse_sql_ast_t* ast) {
+static __attribute__((unused)) bool uwp_has_window_functions(const qihse_sql_ast_t* ast) {
     for (size_t i = 0; i < ast->num_select_items; i++) {
         if (ast->select_items[i].window != NULL) return true;
         if (ast->select_items[i].win_kind != QIHSE_WIN_NONE) return true;
@@ -294,7 +294,7 @@ static bool uwp_has_window_functions(const qihse_sql_ast_t* ast) {
 
 /* Check if the AST has subqueries (scalar subqueries in SELECT list or
  * subquery predicates in WHERE). */
-static bool uwp_has_subqueries(const qihse_sql_ast_t* ast) {
+static __attribute__((unused)) bool uwp_has_subqueries(const qihse_sql_ast_t* ast) {
     for (size_t i = 0; i < ast->num_select_items; i++) {
         if (ast->select_items[i].scalar_subquery != NULL) return true;
     }
@@ -305,7 +305,7 @@ static bool uwp_has_subqueries(const qihse_sql_ast_t* ast) {
 }
 
 /* Recursively check if a plan tree contains any SUBQUERY nodes. */
-static bool uwp_plan_has_subquery(const qihse_plan_node_t* plan) {
+static __attribute__((unused)) bool uwp_plan_has_subquery(const qihse_plan_node_t* plan) {
     if (!plan) return false;
     if (plan->type == QIHSE_PLAN_SUBQUERY) return true;
     if (uwp_plan_has_subquery(plan->left)) return true;
@@ -317,7 +317,7 @@ static bool uwp_plan_has_subquery(const qihse_plan_node_t* plan) {
  * recursive flag and may fail to populate with_clause entirely when the CTE
  * has a column list (e.g. "WITH RECURSIVE r(n) AS (...)"), so we always scan
  * the raw SQL as a fallback. */
-static bool uwp_has_recursive_cte(const qihse_sql_ast_t* ast) {
+static __attribute__((unused)) bool uwp_has_recursive_cte(const qihse_sql_ast_t* ast) {
     if (ast->with_clause) {
         for (size_t i = 0; i < ast->with_clause->num_ctes; i++) {
             if (ast->with_clause->ctes[i].recursive) return true;
@@ -605,6 +605,23 @@ static bool uwp_sql_statement_allowed(const qihse_sql_ast_t* ast,
     if (!ast || !user || !qihse_auth_user_is_active(user)) return false;
 
     switch (ast->stmt_type) {
+        case QIHSE_SQL_SELECT:
+            for (size_t i = 0; i < ast->num_from_tables; ++i) {
+                const char* name = ast->from_tables[i].table_name;
+                if (!name || !qihse_auth_can_access_object(
+                                 user, 0, (uint64_t)uwp_fnv1a(name),
+                                 QIHSE_ACL_READ))
+                    return false;
+            }
+            for (size_t i = 0; i < ast->num_joins; ++i) {
+                const char* name = ast->joins[i].table.table_name;
+                if (!name || !qihse_auth_can_access_object(
+                                 user, 0, (uint64_t)uwp_fnv1a(name),
+                                 QIHSE_ACL_READ))
+                    return false;
+            }
+            return true;
+
         case QIHSE_SQL_INSERT:
         case QIHSE_SQL_UPDATE:
         case QIHSE_SQL_DELETE:
@@ -866,19 +883,35 @@ static qihse_table_store_t* uwp_sql_row_store;
 static pthread_mutex_t uwp_sql_row_store_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define UWP_SQL_TXN_MAGIC 0x51535458u
+#define UWP_SQL_TXN_MAX_TABLES 16u
 typedef struct {
-    uint32_t magic;
     char* table_name;
     qihse_table_txn_t* table_txn;
+} uwp_sql_txn_table_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    size_t table_count;
+    uwp_sql_txn_table_entry_t tables[UWP_SQL_TXN_MAX_TABLES];
 } uwp_sql_txn_resource_t;
 
 static int uwp_sql_txn_commit(void* opaque) {
     uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
-    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return -1;
-    bool committed = qihse_table_txn_commit(resource->table_txn);
-    resource->table_txn = NULL;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC ||
+        resource->table_count == 0 ||
+        resource->table_count > UWP_SQL_TXN_MAX_TABLES)
+        return -1;
+    qihse_table_txn_t* txns[UWP_SQL_TXN_MAX_TABLES];
+    for (size_t i = 0; i < resource->table_count; ++i)
+        txns[i] = resource->tables[i].table_txn;
+    bool committed = qihse_table_txn_commit_group(txns,
+                                                   resource->table_count);
+    for (size_t i = 0; i < resource->table_count; ++i) {
+        resource->tables[i].table_txn = NULL;
+        free(resource->tables[i].table_name);
+        resource->tables[i].table_name = NULL;
+    }
     resource->magic = 0;
-    free(resource->table_name);
     free(resource);
     return committed ? 0 : -1;
 }
@@ -886,10 +919,13 @@ static int uwp_sql_txn_commit(void* opaque) {
 static void uwp_sql_txn_rollback(void* opaque) {
     uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
     if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return;
-    qihse_table_txn_rollback(resource->table_txn);
-    resource->table_txn = NULL;
+    for (size_t i = 0; i < resource->table_count; ++i) {
+        qihse_table_txn_rollback(resource->tables[i].table_txn);
+        resource->tables[i].table_txn = NULL;
+        free(resource->tables[i].table_name);
+        resource->tables[i].table_name = NULL;
+    }
     resource->magic = 0;
-    free(resource->table_name);
     free(resource);
 }
 
@@ -955,37 +991,48 @@ static qihse_table_t* uwp_sql_row_table(qihse_schema_registry_t* schema,
     return t;
 }
 
-/* Return the transaction-local table shadow for this statement.  The first
- * DML statement enlists one row table in the connection transaction.  This
- * bounded first slice refuses a second table; arbitrary cross-table commit
- * requires the durable coordinator described by W11.1. */
+/* Return the transaction-local table shadow for this statement. A bounded
+ * set of table shadows is published together by the row store. This remains
+ * an in-memory transaction resource: it does not add WAL recovery or durable
+ * cross-model coordination. */
 static qihse_table_txn_t* uwp_sql_txn_table(qihse_txn_t* txn,
                                            qihse_table_t* table,
                                            const char* table_name) {
     if (!txn || !table || !table_name) return NULL;
+    uwp_sql_txn_resource_t* resource =
+        (uwp_sql_txn_resource_t*)txn->resource_ctx;
     if (txn->resource_ctx) {
-        uwp_sql_txn_resource_t* resource =
-            (uwp_sql_txn_resource_t*)txn->resource_ctx;
-        if (resource->magic != UWP_SQL_TXN_MAGIC ||
-            strcmp(resource->table_name, table_name) != 0)
-            return NULL;
-        return resource->table_txn;
+        if (resource->magic != UWP_SQL_TXN_MAGIC) return NULL;
+        for (size_t i = 0; i < resource->table_count; ++i)
+            if (strcmp(resource->tables[i].table_name, table_name) == 0)
+                return resource->tables[i].table_txn;
+        if (resource->table_count >= UWP_SQL_TXN_MAX_TABLES) return NULL;
+    } else {
+        resource = calloc(1, sizeof(*resource));
+        if (!resource) return NULL;
+        resource->magic = UWP_SQL_TXN_MAGIC;
     }
 
-    uwp_sql_txn_resource_t* resource = calloc(1, sizeof(*resource));
-    if (!resource) return NULL;
-    resource->magic = UWP_SQL_TXN_MAGIC;
-    resource->table_name = strdup(table_name);
-    resource->table_txn = qihse_table_txn_begin(table);
-    if (!resource->table_name || !resource->table_txn ||
+    char* name_copy = strdup(table_name);
+    qihse_table_txn_t* table_txn = qihse_table_txn_begin(table);
+    if (!name_copy || !table_txn) {
+        free(name_copy);
+        qihse_table_txn_rollback(table_txn);
+        if (resource->table_count == 0) free(resource);
+        return NULL;
+    }
+    size_t entry = resource->table_count++;
+    resource->tables[entry].table_name = name_copy;
+    resource->tables[entry].table_txn = table_txn;
+    if (entry == 0 &&
         qihse_txn_attach_resource(txn, resource, uwp_sql_txn_commit,
                                   uwp_sql_txn_rollback) != 0) {
-        if (resource->table_txn) qihse_table_txn_rollback(resource->table_txn);
-        free(resource->table_name);
+        qihse_table_txn_rollback(table_txn);
+        free(name_copy);
         free(resource);
         return NULL;
     }
-    return resource->table_txn;
+    return table_txn;
 }
 
 /* Single-line DML reply, malloc'd; NULL on allocation failure. */
@@ -1045,6 +1092,19 @@ static bool uwp_dml_where_region(const qihse_sql_ast_t* ast,
     const char* end = uwp_sql_find_keyword(start, "RETURNING");
     if (end) end -= strlen("RETURNING");  /* find_keyword returns past the word */
     else     end = start + strlen(start);
+    /* SELECT's supported LIMIT follows its filter and is not part of the
+     * predicate. Keep DML strict: silently dropping an UPDATE/DELETE LIMIT
+     * would change which rows the caller asked to affect. */
+    if (ast->stmt_type == QIHSE_SQL_SELECT) {
+        const char* suffixes[] = { "LIMIT", "OFFSET" };
+        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+            const char* suffix = uwp_sql_find_keyword(start, suffixes[i]);
+            if (suffix) {
+                suffix -= strlen(suffixes[i]);
+                if (suffix < end) end = suffix;
+            }
+        }
+    }
     while (start < end && isspace((unsigned char)*start)) start++;
     while (end > start && isspace((unsigned char)end[-1])) end--;
     while (end > start && end[-1] == ';') {
@@ -1560,6 +1620,242 @@ char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast,
     return uwp_sql_execute_dml_on_table(ast, user, table, NULL);
 }
 
+typedef struct {
+    const qihse_sql_ast_t* ast;
+    const int* projection;
+    size_t projection_count;
+    const int* condition_columns;
+    uwp_text_buffer_t* response;
+    size_t matched;
+    size_t emitted;
+    int failed;
+} uwp_sql_select_scan_t;
+
+static bool uwp_sql_select_cell(uwp_text_buffer_t* out,
+                                const qihse_col_value_t* cell) {
+    char number[96];
+    const char* value = number;
+    switch (cell->type) {
+        case QIHSE_TS_INT32:
+            (void)snprintf(number, sizeof(number), "%d", cell->v.i32);
+            break;
+        case QIHSE_TS_INT64:
+            (void)snprintf(number, sizeof(number), "%lld",
+                           (long long)cell->v.i64);
+            break;
+        case QIHSE_TS_FLOAT:
+            (void)snprintf(number, sizeof(number), "%.9g",
+                           (double)cell->v.f32);
+            break;
+        case QIHSE_TS_STRING:
+            value = cell->v.str ? cell->v.str : "";
+            break;
+        default:
+            return false;
+    }
+    for (const unsigned char* p = (const unsigned char*)value; *p; ++p) {
+        if (*p == '\\' || *p == '\t' || *p == '\n' || *p == '\r') {
+            const char escaped[] = {
+                '\\', *p == '\\' ? '\\' :
+                       *p == '\t' ? 't' : *p == '\n' ? 'n' : 'r', '\0'
+            };
+            if (uwp_text_appendf(out, "%s", escaped) != 0) return false;
+        } else if (*p < 0x20 || *p == 0x7f) {
+            if (uwp_text_appendf(out, "\\x%02x", (unsigned)*p) != 0)
+                return false;
+        } else if (uwp_text_reserve(out, 1) != 0) {
+            return false;
+        } else {
+            out->data[out->len++] = (char)*p;
+            out->data[out->len] = '\0';
+        }
+    }
+    return true;
+}
+
+static bool uwp_sql_select_row(const qihse_col_value_t* values,
+                               size_t num_cols, void* opaque) {
+    uwp_sql_select_scan_t* scan = (uwp_sql_select_scan_t*)opaque;
+    const qihse_sql_ast_t* ast = scan->ast;
+    if (scan->failed || (ast->limit >= 0 && scan->emitted >= (size_t)ast->limit))
+        return false;
+    if (ast->num_where_conditions) {
+        uwp_dml_scan_t predicate = {
+            .conds = ast->where_conditions,
+            .col_idx = scan->condition_columns,
+            .num_conds = ast->num_where_conditions,
+            .matched = 0
+        };
+        if (!uwp_dml_pred(values, num_cols, &predicate)) return true;
+    }
+    if (scan->matched++ < (size_t)(ast->offset > 0 ? ast->offset : 0))
+        return true;
+
+    for (size_t i = 0; i < scan->projection_count; ++i) {
+        int column = scan->projection[i];
+        if (column < 0 || (size_t)column >= num_cols ||
+            !uwp_sql_select_cell(scan->response, &values[column])) {
+            scan->failed = 1;
+            return false;
+        }
+        if (i + 1 < scan->projection_count &&
+            uwp_text_appendf(scan->response, "\t") != 0) {
+            scan->failed = 1;
+            return false;
+        }
+    }
+    if (uwp_text_appendf(scan->response, "\n") != 0) {
+        scan->failed = 1;
+        return false;
+    }
+    scan->emitted++;
+    return ast->limit < 0 || scan->emitted < (size_t)ast->limit;
+}
+
+/* Execute the deliberately narrow row-store SELECT subset. Unsupported
+ * constructs fail as protocol errors rather than returning the optimizer's
+ * old empty placeholder stream as if it were a valid query result. */
+static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
+                                  const qihse_sql_ast_t* ast,
+                                  qihse_txn_t** current_txn,
+                                  qihse_user_t* user,
+                                  uwp_text_buffer_t* response) {
+    if (!ctx || !ctx->schema || !ast || !user || !response ||
+        ast->stmt_type != QIHSE_SQL_SELECT || ast->num_from_tables != 1 ||
+        ast->num_joins != 0 || ast->set_op != QIHSE_SET_NONE ||
+        ast->group_by || ast->num_order_items || ast->select_distinct ||
+        ast->num_select_items == 0 || (current_txn && *current_txn)) {
+        return -1;
+    }
+
+    const char* table_name = ast->from_tables[0].table_name;
+    if (!table_name || !qihse_auth_can_access_object(
+                           user, 0, (uint64_t)uwp_fnv1a(table_name),
+                           QIHSE_ACL_READ)) {
+        return -1;
+    }
+    qihse_table_t* table = uwp_sql_row_table(
+        (qihse_schema_registry_t*)ctx->schema, table_name);
+    if (!table) return -1;
+
+    size_t max_projection = qihse_table_num_cols(table);
+    int* projection = (int*)calloc(max_projection ? max_projection : 1,
+                                   sizeof(*projection));
+    int* condition_columns = ast->num_where_conditions
+        ? (int*)calloc(ast->num_where_conditions, sizeof(*condition_columns))
+        : NULL;
+    if (!projection || (ast->num_where_conditions && !condition_columns)) {
+        free(projection);
+        free(condition_columns);
+        return -1;
+    }
+
+    bool ok = true;
+    size_t projection_count = 0;
+    bool select_star = ast->num_select_items == 1 &&
+                       ast->select_items[0].expr &&
+                       strcmp(ast->select_items[0].expr, "*") == 0;
+    if (select_star) {
+        for (size_t i = 0; i < max_projection; ++i)
+            projection[projection_count++] = (int)i;
+    } else {
+        for (size_t i = 0; i < ast->num_select_items && ok; ++i) {
+            const char* expr = ast->select_items[i].expr;
+            if (!expr || ast->select_items[i].agg_kind != QIHSE_AGG_NONE ||
+                ast->select_items[i].scalar_subquery ||
+                ast->select_items[i].window ||
+                ast->select_items[i].win_kind != QIHSE_WIN_NONE) {
+                ok = false;
+                break;
+            }
+            const char* bare = strrchr(expr, '.');
+            if (bare) {
+                const char* qualifier = expr;
+                size_t qualifier_len = (size_t)(bare - expr);
+                const char* alias = ast->from_tables[0].alias;
+                if (!((strlen(table_name) == qualifier_len &&
+                       strncasecmp(table_name, qualifier, qualifier_len) == 0) ||
+                      (alias && strlen(alias) == qualifier_len &&
+                       strncasecmp(alias, qualifier, qualifier_len) == 0))) {
+                    ok = false;
+                    break;
+                }
+                expr = bare + 1;
+            }
+            int column = qihse_table_find_col(table, expr);
+            if (column < 0 || projection_count >= max_projection) {
+                ok = false;
+                break;
+            }
+            projection[projection_count++] = column;
+        }
+    }
+
+    const char* where_region = NULL;
+    size_t where_len = 0;
+    bool has_where = uwp_dml_where_region(ast, &where_region, &where_len);
+    (void)where_region;
+    (void)where_len;
+    if (ast->num_where_conditions == 0 && has_where) ok = false;
+    if (ast->num_where_conditions) {
+        const char* reason = NULL;
+        if (!uwp_dml_where_verifies(ast, &reason)) ok = false;
+        for (size_t i = 0; i < ast->num_where_conditions && ok; ++i) {
+            const qihse_sql_condition_t* condition = &ast->where_conditions[i];
+            if (condition->subq_kind ||
+                !uwp_dml_operator_supported(condition->operator)) {
+                ok = false;
+                break;
+            }
+            int column = uwp_dml_resolve_column(table,
+                                                condition->column_name);
+            if (column < 0) ok = false;
+            else condition_columns[i] = column;
+        }
+    }
+    if (!ok || projection_count == 0) {
+        free(projection);
+        free(condition_columns);
+        return -1;
+    }
+
+    for (size_t i = 0; i < projection_count; ++i) {
+        const char* name = NULL;
+        if (select_star || !ast->select_items[i].alias ||
+            ast->select_items[i].alias[0] == '\0') {
+            const qihse_col_def_t* def = qihse_table_col_def(
+                table, (size_t)projection[i]);
+            name = def ? def->name : NULL;
+        } else {
+            name = ast->select_items[i].alias;
+        }
+        if (!name || uwp_text_appendf(response, "%s%s",
+                                      i ? "\t" : "", name) != 0) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok && uwp_text_appendf(response, "\n") != 0) ok = false;
+
+    uwp_sql_select_scan_t scan = {
+        .ast = ast,
+        .projection = projection,
+        .projection_count = projection_count,
+        .condition_columns = condition_columns,
+        .response = response
+    };
+    if (ok && !(ast->limit == 0))
+        qihse_table_scan(table, uwp_sql_select_row, &scan);
+    if (scan.failed || response->failed) ok = false;
+    if (ok && uwp_text_appendf(response, "OK stmt_type=SELECT rows=%zu\n",
+                               scan.emitted) != 0)
+        ok = false;
+
+    free(projection);
+    free(condition_columns);
+    return ok ? 0 : -1;
+}
+
 /* -------------------------------------------------------------------------
  * Recursive CTE execution (simplified, text-based).
  *
@@ -1572,7 +1868,7 @@ char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast,
  * failure it degrades with an informative message. */
 #define UWP_RCTE_MAX_ITERS 1000
 
-static void uwp_execute_recursive_cte(qihse_uwp_context_t* ctx,
+static __attribute__((unused)) void uwp_execute_recursive_cte(qihse_uwp_context_t* ctx,
                                       const qihse_sql_ast_t* ast,
                                       uwp_text_buffer_t* response) {
     const char* sql = ast->raw_sql;
@@ -1879,7 +2175,7 @@ static void uwp_execute_recursive_cte(qihse_uwp_context_t* ctx,
  * input stream has no schema (the common case while the row-store pipeline is
  * still empty), we degrade gracefully. */
 #ifdef UWP_HAS_WINDOW_EXECUTOR
-static void uwp_execute_window(qihse_uwp_context_t* ctx,
+static __attribute__((unused)) void uwp_execute_window(qihse_uwp_context_t* ctx,
                                const qihse_sql_ast_t* ast,
                                uwp_text_buffer_t* response) {
     qihse_optimizer_t* opt =
@@ -2267,7 +2563,6 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
         uwp_reply_cb(write_fn, write_ctx, "ERR_PARSE\n");
         return UWP_STS_ERR_FAILED;
     }
-
     if (command_opcode == 0x02 && !uwp_sql_statement_allowed(ast, user)) {
         qihse_sql_ast_free(ast);
         free(ps_sql);
@@ -2281,81 +2576,20 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
         if (uwp_serialize_description(&response, ast) != 0) result = UWP_STS_ERR_FAILED;
     } else {
         result = uwp_sql_execute(ctx, ast, sql, current_txn, user);
-        if (result == UWP_STS_OK) {
-            if (ast->stmt_type == QIHSE_SQL_SELECT ||
-                ast->stmt_type == QIHSE_SQL_WITH) {
-                /* --- CTE (WITH clause) handling ---
-                 * The parser may fail to populate with_clause when the CTE
-                 * has a column list, so we detect CTEs via the statement type
-                 * and the raw SQL in addition to the structured with_clause. */
-                bool has_cte = (ast->with_clause && ast->with_clause->num_ctes > 0) ||
-                               ast->stmt_type == QIHSE_SQL_WITH ||
-                               (ast->raw_sql && strcasestr(ast->raw_sql, "WITH"));
-                if (has_cte && uwp_has_recursive_cte(ast)) {
-                    /* Recursive CTE: execute via the text-based recursive
-                     * evaluator.  Never crashes; degrades with a reason
-                     * on any parsing failure. */
-                    uwp_execute_recursive_cte(ctx, ast, &response);
-                } else if (has_cte) {
-                    /* Non-recursive CTE: the parser copies the inner
-                     * SELECT fields into the WITH AST, so we can attempt
-                     * to build and execute a plan directly.  CTE
-                     * materialisation is not yet wired, so queries that
-                     * reference CTE names as tables will produce empty
-                     * results rather than crashing. */
-                    if (uwp_execute_select_plan(ctx, ast, &response) == 0) {
-                        uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=SELECT (CTE materialisation not yet supported)\n");
-                    }
-                }
-                /* --- Window function handling --- */
-                else if (uwp_has_window_functions(ast)) {
-#ifdef UWP_HAS_WINDOW_EXECUTOR
-                    /* Window executor module present: attempt execution.  It
-                     * degrades gracefully when the input stream has no schema
-                     * (the common case while the row-store pipeline is empty). */
-                    uwp_execute_window(ctx, ast, &response);
-#else
-                    uwp_text_appendf(&response,
-                        "OK stmt_type=SELECT (window functions not yet supported)\n");
-#endif
-                }
-                /* --- Subquery handling --- */
-                else if (uwp_has_subqueries(ast)) {
-                    /* Build a plan and check whether the optimizer emitted
-                     * any SUBQUERY plan nodes.  If it did, execute them
-                     * recursively; otherwise degrade with an informative
-                     * message. */
-                    qihse_optimizer_t* opt =
-                        qihse_optimizer_create((qihse_schema_registry_t*)ctx->schema);
-                    qihse_plan_node_t* plan =
-                        opt ? qihse_optimizer_build_plan(opt, ast) : NULL;
-                    if (plan && uwp_plan_has_subquery(plan)) {
-                        if (uwp_execute_plan(plan, ctx, &response) == 0) {
-                            uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
-                        } else {
-                            uwp_text_appendf(&response,
-                                "OK stmt_type=SELECT (subquery execution not supported by optimizer)\n");
-                        }
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=SELECT (subquery execution not supported by optimizer)\n");
-                    }
-                    if (plan) qihse_plan_node_free(plan);
-                    if (opt) qihse_optimizer_destroy(opt);
-                }
-                /* --- Normal SELECT --- */
-                else {
-                    if (uwp_execute_select_plan(ctx, ast, &response) == 0) {
-                        uwp_text_appendf(&response, "OK stmt_type=SELECT\n");
-                    } else {
-                        uwp_text_appendf(&response,
-                            "OK stmt_type=SELECT (plan too complex, not executed)\n");
-                    }
-                }
-            } else if (ast->stmt_type == QIHSE_SQL_INSERT) {
+        if (result == UWP_STS_OK && ast->stmt_type == QIHSE_SQL_SELECT) {
+            if (uwp_sql_execute_select(ctx, ast, current_txn, user,
+                                       &response) != 0)
+                result = UWP_STS_ERR_FAILED;
+        } else if (result == UWP_STS_OK &&
+                   ast->stmt_type == QIHSE_SQL_WITH) {
+            /* CTE and recursive CTE execution are not wired to an
+             * authorization-aware row source. Refuse instead of reporting
+             * the old empty-plan placeholder as a successful result. */
+            result = UWP_STS_ERR_FAILED;
+        }
+        if (result == UWP_STS_OK && ast->stmt_type != QIHSE_SQL_SELECT &&
+            ast->stmt_type != QIHSE_SQL_WITH) {
+            if (ast->stmt_type == QIHSE_SQL_INSERT) {
                 /* --- INSERT: row store is authoritative; the column-store
                  * append is the analytic copy and needs no ctx gate --- */
                 if (!ctx->schema) {
@@ -2443,7 +2677,7 @@ uwp_sts_result_t uwp_dispatch_sql(qihse_uwp_context_t* ctx,
                 uwp_text_appendf(&response, "OK stmt_type=%s\n",
                                  qihse_sql_stmt_name(ast->stmt_type));
             }
-        } else {
+        } else if (result != UWP_STS_OK) {
             result = UWP_STS_ERR_FAILED;
         }
     }

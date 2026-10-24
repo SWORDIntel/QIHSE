@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Failover + redundancy drill: write on the lead, verify the duplicate on the
-peer (ASKING local read), SIGKILL the lead, then verify the most-uptime
-successor owns all slots AND the duplicated key survives.
+"""Cluster failover drill: seed a duplicate through authenticated RESP on the
+successor, SIGKILL the lead, then verify the successor owns all slots and the
+seeded key survives. The legacy plaintext redundancy flag must stay disabled.
 
 Destructive by design: it kills the daemons it launched and relaunches both
 nodes. Runs on a single host by default (two loopback daemon processes); for
@@ -140,11 +140,9 @@ def relaunch_cluster():
         subprocess.run(["ssh", "-o", "BatchMode=yes", SSH_TARGET,
                         "pkill -9 qihse-cluster-d"], capture_output=True)
     time.sleep(1)
-    _start_local(0, N0_HOST, PORT0, BUS0, "node0",
-                 ["--redundancy-peer", f"{N1_HOST}:{PORT1}"])
+    _start_local(0, N0_HOST, PORT0, BUS0, "node0", [])
     time.sleep(2)
-    join_extra = ["--join", f"{N0_HOST}:{BUS0}",
-                  "--redundancy-peer", f"{N0_HOST}:{PORT0}"]
+    join_extra = ["--join", f"{N0_HOST}:{BUS0}"]
     if SSH_TARGET:
         _start_remote(1, N1_HOST, PORT1, BUS1, "node1", join_extra)
         time.sleep(8)
@@ -173,25 +171,33 @@ def main():
     def check(name, cond, detail=""):
         results.append(cond); print(f"{'PASS' if cond else 'FAIL'}: {name} {detail}")
 
+    # The old fire-and-forget RESP replay is deliberately disabled: it would
+    # send the operator credential and data without pinned QKP transport.
+    rejected = subprocess.run(
+        [BIN, "--index", "0", "--bind", N0_HOST, "--port", str(PORT0),
+         "--bus-port", str(BUS0), "--operator-password", PW,
+         "--dir", os.path.join(DATA_DIR, "rejected"),
+         "--redundancy-peer", f"{N1_HOST}:{PORT1}"],
+        env=_node_env(), capture_output=True, text=True, timeout=10)
+    check("legacy plaintext redundancy rejected",
+          rejected.returncode == 2 and
+          "--redundancy-peer is unavailable" in rejected.stderr)
+
     n0 = C(N0); n0.cmd("AUTH", "GODMODE_OP", PW)
     t, r = n0.cmd("SET", "redundant:k1", "survives-lead-death")
     check("write on lead", (t, r) == ("+", "OK"), f"{t} {r}")
-    time.sleep(1)
 
-    # The redundancy replay is fire-and-forget: under CPU contention it
-    # lands seconds after the SET, so POLL for the duplicate rather than
-    # betting on a fixed sleep.
-    dup_ok = False
-    for _ in range(120):                  # up to 30 s (load-scaled)
-        n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
-        n1.cmd("ASKING")
-        t, r = n1.cmd("GET", "redundant:k1")
-        if (t, r) == ("$", "survives-lead-death"):
-            dup_ok = True
-            break
-        time.sleep(0.25)
-    check("duplicate present on successor (ASKING local read)",
-          dup_ok, f"{t} {r}")
+    # Seed an unclassified copy over the successor's authenticated RESP
+    # session. This proves failover and local duplicate survival without
+    # claiming the disabled live replication path worked.
+    n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
+    n1.cmd("ASKING")
+    seed_t, seed_r = n1.cmd("SET", "redundant:k1", "survives-lead-death")
+    n1.cmd("ASKING")
+    t, r = n1.cmd("GET", "redundant:k1")
+    check("seeded duplicate present on successor (ASKING local read)",
+          (seed_t, seed_r) == ("+", "OK") and
+          (t, r) == ("$", "survives-lead-death"), f"{t} {r}")
 
     lead = _daemons[0] if _daemons else None
     if lead is None or lead.poll() is not None:

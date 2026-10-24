@@ -1,26 +1,22 @@
-//! Client connection and configuration
-//!
-//! Audited for UWP wire-level safety: auth enforcement, error handling.
-//!
-//! NOTE: This SDK is currently a stub — the query methods do not yet speak
-//! the UWP wire protocol.  The AuthState tracking and UwpError types from
-//! the `error` module are wired in so that a future implementation can
-//! enforce auth-before-command and return proper errors.  All query
-//! methods currently return empty results.
+//! PostgreSQL wire client and small async API compatible with the SDK surface.
 
+use crate::error::{target, AuthState, UwpError};
+use crate::query::{Row, SimpleQueryMessage, SimpleQueryRow};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use bytes::BytesMut;
-use crate::query::{Row, RowIter};
-use crate::types::Type;
-use crate::error::{AuthState, UwpError, UwpFrame, target};
+use tokio_postgres::types::ToSql;
 
-/// No TLS connector
+/// Marker retained for callers that do not configure TLS.
+///
+/// The current QIHSE PostgreSQL listener does not offer TLS negotiation. The
+/// credentials and SQL traffic therefore use the listener's configured
+/// transport; use a protected network when connecting with this marker.
 pub struct NoTls;
 
-/// Connection configuration builder
+/// Connection configuration builder.
 pub struct Config {
     host: String,
     port: u16,
@@ -31,192 +27,318 @@ pub struct Config {
 
 impl Config {
     pub fn new() -> Self {
-        Config {
-            host: "localhost".to_string(),
+        Self {
+            host: "localhost".into(),
             port: 5432,
-            dbname: "test".to_string(),
-            user: "admin".to_string(),
+            dbname: "test".into(),
+            user: "admin".into(),
             password: String::new(),
         }
     }
-    
-    pub fn host(mut self, host: &str) -> Self { self.host = host.to_string(); self }
-    pub fn port(mut self, port: u16) -> Self { self.port = port; self }
-    pub fn dbname(mut self, dbname: &str) -> Self { self.dbname = dbname.to_string(); self }
-    pub fn user(mut self, user: &str) -> Self { self.user = user.to_string(); self }
-    pub fn password(mut self, password: &str) -> Self { self.password = password.to_string(); self }
-    
-    /// Connect to the database
+    pub fn host(mut self, host: &str) -> Self {
+        self.host = host.to_string();
+        self
+    }
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+    pub fn dbname(mut self, dbname: &str) -> Self {
+        self.dbname = dbname.to_string();
+        self
+    }
+    pub fn user(mut self, user: &str) -> Self {
+        self.user = user.to_string();
+        self
+    }
+    pub fn password(mut self, password: &str) -> Self {
+        self.password = password.to_string();
+        self
+    }
+
+    /// Connect and authenticate using the configured database principal.
+    ///
+    /// Authentication completes during the PostgreSQL startup handshake. A
+    /// returned client is considered authenticated only after that succeeds.
     pub async fn connect<T>(&self, _tls: T) -> io::Result<(Client, Connection)>
-    where T: Send + 'static
+    where
+        T: Send + 'static,
     {
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect(addr).await?;
-        let conn = Connection::new(stream);
-        let client = Client::new();
-        Ok((client, conn))
+        let mut pg = tokio_postgres::Config::new();
+        pg.host(&self.host)
+            .port(self.port)
+            .dbname(&self.dbname)
+            .user(&self.user)
+            .password(&self.password);
+        let (client, connection) = pg.connect(tokio_postgres::NoTls).await.map_err(pg_error)?;
+        let task: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> =
+            Box::pin(async move { connection.await.map_err(pg_error) });
+        let inner = Arc::new(Mutex::new(ClientInner {
+            client: Some(Arc::new(client)),
+            closed: false,
+            auth_state: AuthState::Authenticated,
+        }));
+        Ok((Client { inner }, Connection { task }))
     }
 }
 
 impl Default for Config {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Database client
+/// Database client. Calls are serialized on the underlying connection.
 pub struct Client {
     inner: Arc<Mutex<ClientInner>>,
 }
 
 struct ClientInner {
-    next_stmt_id: u32,
+    client: Option<Arc<tokio_postgres::Client>>,
     closed: bool,
     auth_state: AuthState,
 }
 
 impl Client {
+    /// Create a disconnected client. Use [`Config::connect`] for a usable one.
     pub fn new() -> Self {
-        Client {
+        Self {
             inner: Arc::new(Mutex::new(ClientInner {
-                next_stmt_id: 0,
+                client: None,
                 closed: false,
                 auth_state: AuthState::Unauthenticated,
             })),
         }
     }
 
-    /// Authenticate with the server using username/password.
-    /// Sets the internal auth state to Authenticated on success.
-    /// In the current stub this is a no-op that marks the client as
-    /// authenticated; a full implementation would send a UWP AUTH frame.
+    /// Authentication is performed at connect time with the configured user.
+    /// This method refuses to turn a disconnected client into an authenticated
+    /// one without a server handshake.
     pub async fn authenticate(&self, _username: &str, _password: &str) -> Result<(), UwpError> {
-        let mut inner = self.inner.lock().await;
-        inner.auth_state = AuthState::Authenticated;
-        Ok(())
+        let inner = self.inner.lock().await;
+        if inner.client.is_some() && inner.auth_state == AuthState::Authenticated {
+            Ok(())
+        } else {
+            Err(UwpError::Auth(
+                "connect with Config credentials before issuing SQL".into(),
+            ))
+        }
     }
 
-    /// Returns true if the client has authenticated.
     pub async fn is_authenticated(&self) -> bool {
+        self.inner.lock().await.auth_state == AuthState::Authenticated
+    }
+
+    async fn pg_client(&self) -> io::Result<Arc<tokio_postgres::Client>> {
         let inner = self.inner.lock().await;
-        inner.auth_state == AuthState::Authenticated
+        inner
+            .auth_state
+            .check(target::SQL)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        if inner.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "client is closed",
+            ));
+        }
+        inner
+            .client
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "client is not connected"))
     }
 
-    /// Check that the client is authenticated before issuing a command.
-    /// Returns UwpError::Auth if not authenticated.
-    async fn require_auth(&self) -> Result<(), UwpError> {
-        let inner = self.inner.lock().await;
-        inner.auth_state.check(target::KV) // any non-AUTH target
+    pub async fn simple_query(&self, query: &str) -> io::Result<Vec<SimpleQueryMessage>> {
+        self.pg_client()
+            .await?
+            .simple_query(query)
+            .await
+            .map(|messages| {
+                messages
+                    .into_iter()
+                    .filter_map(|m| match m {
+                        tokio_postgres::SimpleQueryMessage::Row(row) => Some({
+                            let values = (0..row.len())
+                                .map(|i| row.get(i).map(str::to_owned))
+                                .collect();
+                            SimpleQueryMessage::Row(SimpleQueryRow::new(values))
+                        }),
+                        tokio_postgres::SimpleQueryMessage::CommandComplete(n) => {
+                            Some(SimpleQueryMessage::CommandComplete(n))
+                        }
+                        tokio_postgres::SimpleQueryMessage::RowDescription(_) => None,
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .map_err(pg_error)
     }
 
-    /// Execute a simple query (no parameters)
-    pub async fn simple_query(&self, query: &str) -> io::Result<Vec<crate::SimpleQueryMessage>> {
-        // Auth gate: in a full implementation this would return
-        // Err(UwpError::Auth) before hitting the wire.
-        Ok(Vec::new())
+    pub async fn query(&self, query: &str, params: &[&(dyn ToSql + Sync)]) -> io::Result<Vec<Row>> {
+        self.pg_client()
+            .await?
+            .query(query, params)
+            .await
+            .map_err(pg_error)
     }
 
-    /// Execute a parameterized query and return rows
-    pub async fn query(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<Vec<Row>> {
-        Ok(Vec::new())
+    pub async fn execute(&self, query: &str, params: &[&(dyn ToSql + Sync)]) -> io::Result<u64> {
+        self.pg_client()
+            .await?
+            .execute(query, params)
+            .await
+            .map_err(pg_error)
     }
 
-    /// Execute a statement (INSERT/UPDATE/DELETE) and return rows affected
-    pub async fn execute(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<u64> {
-        Ok(0)
-    }
-
-    /// Execute multiple statements in a batch
     pub async fn batch_execute(&self, query: &str) -> io::Result<()> {
-        Ok(())
+        self.pg_client()
+            .await?
+            .batch_execute(query)
+            .await
+            .map_err(pg_error)
     }
 
-    /// Start a transaction
     pub async fn transaction(&self) -> io::Result<Transaction> {
-        Ok(Transaction::new(self.inner.clone()))
+        self.batch_execute("BEGIN").await?;
+        Ok(Transaction {
+            inner: self.inner.clone(),
+            done: false,
+        })
     }
 
-    /// Prepare a statement
     pub async fn prepare(&self, query: &str) -> io::Result<Statement> {
-        let mut inner = self.inner.lock().await;
-        let id = inner.next_stmt_id;
-        inner.next_stmt_id += 1;
-        Ok(Statement { id, query: query.to_string() })
+        let pg_statement = self
+            .pg_client()
+            .await?
+            .prepare(query)
+            .await
+            .map_err(pg_error)?;
+        Ok(Statement {
+            inner: pg_statement,
+        })
     }
 
     pub fn is_closed(&self) -> bool {
-        let inner = self.inner.try_lock();
-        match inner {
-            Ok(g) => g.closed,
-            Err(_) => false,
-        }
+        self.inner.try_lock().map(|g| g.closed).unwrap_or(false)
     }
 }
 
-/// Prepared statement
-pub struct Statement {
-    id: u32,
-    query: String,
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Transaction handle
+/// Prepared PostgreSQL statement.
+pub struct Statement {
+    inner: tokio_postgres::Statement,
+}
+impl Statement {
+    pub fn params(&self) -> &[tokio_postgres::types::Type] {
+        self.inner.params()
+    }
+    pub fn columns(&self) -> &[tokio_postgres::Column] {
+        self.inner.columns()
+    }
+}
+
+/// Transaction handle. Dropping an unfinished handle closes the client so a
+/// pooled connection cannot accidentally be reused with an open transaction.
 pub struct Transaction {
     inner: Arc<Mutex<ClientInner>>,
     done: bool,
 }
-
 impl Transaction {
-    fn new(inner: Arc<Mutex<ClientInner>>) -> Self {
-        Transaction { inner, done: false }
+    async fn client(&self) -> io::Result<Arc<tokio_postgres::Client>> {
+        let inner = self.inner.lock().await;
+        inner
+            .auth_state
+            .check(target::SQL)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        if inner.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "client is closed",
+            ));
+        }
+        inner
+            .client
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "client is not connected"))
     }
-    
-    pub async fn execute(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<u64> {
-        Ok(0)
+    pub async fn execute(&self, query: &str, params: &[&(dyn ToSql + Sync)]) -> io::Result<u64> {
+        let client = self.client().await?;
+        client.execute(query, params).await.map_err(pg_error)
     }
-    
-    pub async fn query(&self, query: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> io::Result<Vec<Row>> {
-        Ok(Vec::new())
+    pub async fn query(&self, query: &str, params: &[&(dyn ToSql + Sync)]) -> io::Result<Vec<Row>> {
+        let client = self.client().await?;
+        client.query(query, params).await.map_err(pg_error)
     }
-    
     pub async fn commit(mut self) -> io::Result<()> {
+        self.client()
+            .await?
+            .batch_execute("COMMIT")
+            .await
+            .map_err(pg_error)?;
         self.done = true;
         Ok(())
     }
-    
     pub async fn rollback(mut self) -> io::Result<()> {
+        self.client()
+            .await?
+            .batch_execute("ROLLBACK")
+            .await
+            .map_err(pg_error)?;
         self.done = true;
         Ok(())
     }
 }
-
 impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.done {
-            // Implicit rollback
+            if let Ok(mut inner) = self.inner.try_lock() {
+                inner.closed = true;
+                inner.client.take();
+            }
         }
     }
 }
 
-/// Connection future
+/// Future that drives socket input and PostgreSQL responses.
 pub struct Connection {
-    stream: TcpStream,
-    closed: bool,
+    task: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
 }
-
-impl Connection {
-    fn new(stream: TcpStream) -> Self {
-        Connection { stream, closed: false }
-    }
-}
-
 impl Future for Connection {
     type Output = io::Result<()>;
-    
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-        if self.closed {
-            return std::task::Poll::Ready(Ok(()));
-        }
-        // In a real implementation, poll the stream for incoming data
-        std::task::Poll::Pending
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.task.as_mut().poll(cx)
     }
 }
 
-use std::future::Future;
+fn pg_error(e: tokio_postgres::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disconnected_client_cannot_query_or_self_authenticate() {
+        let client = Client::new();
+        let err = client.query("SELECT 1", &[]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(client.authenticate("operator", "password").await.is_err());
+        assert!(!client.is_authenticated().await);
+    }
+
+    #[test]
+    fn config_has_postgres_defaults() {
+        let config = Config::default();
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.port, 5432);
+        assert_eq!(config.dbname, "test");
+    }
+}

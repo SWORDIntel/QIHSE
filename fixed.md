@@ -157,3 +157,220 @@ FTS.SEARCH "port scan"
 GET cve:record:CVE-2020-1472
 GET cve:record:CVE-2026-0001   # top range: readable from node0 and node1
 ```
+
+---
+
+# RESP compatibility fixes — 2026-10-23
+
+Applied to `/opt/QIHSE` (now the single source of truth; `Documents/QIHSE`
+is a symlink to it). Verified with a raw RESP probe suite (22 checks) and a
+Celery/broker-primitive suite (7 checks): **22/22 and 7/7** against the live
+AIMEM service on `127.0.0.1:6401`.
+
+## 1. `MULTI`/`EXEC` segfaulted and lost every queued write
+
+`EXEC` dispatched the queue **while `in_multi` was still true**, so each queued
+command was re-queued into the array being iterated: the `realloc` invalidated
+the iterator (SIGSEGV; second client saw EOF) and nothing executed. `EXEC` also
+replied `*1` and left the client in transaction state.
+Fix: detach the queue and clear the transaction **before** dispatch
+(`src/spinnaker/qihse_resp_engine.c`, `qihse_resp_handle_exec`).
+
+## 2. Queued commands held dangling `argv` pointers
+
+`memcpy(slot, request, sizeof(...))` copied the struct only; `argv[].data`
+points into the connection read buffer, which the next command reuses.
+Fix: deep-clone each queued request (`qihse_resp_request_clone`), free on
+EXEC/DISCARD/MULTI.
+
+## 3. Every collection member lost its last character
+
+`"__h__:KEY:FIELD"` builders allocated `5 + klen + 1 + mlen + 1`, but the family
+prefix is **six** characters (`__h__:`), so `snprintf` truncated one byte:
+`f1`→`f`, `m1`/`m2`→`m`. `HSET h f1 a f2 b` stored a single field, `SADD` one
+member, `ZADD` one score.
+Fix: one `qihse_resp_member_key()` helper sized from the literals.
+Known limitation (pre-existing key format): a KEY or MEMBER containing `:` is
+ambiguous; changing the format would orphan stored members.
+
+## 4. Reads were stubs returning nothing
+
+`HGETALL`/`HKEYS`/`HVALS`/`HLEN`/`SCARD`/`SMEMBERS`/`ZCARD`/`ZRANGE`/`ZRANGEBYSCORE`
+returned empty arrays or `0` (`hgetall` carried "Without iteration, return empty").
+Fix: implemented over `qihse_kv_foreach_prefix_user` under the session
+principal — the same authorization gate `GET` uses — with `WITHSCORES`, `LIMIT`,
+`-inf/+inf` and `(exclusive` bounds.
+
+## 5. `BLPOP`/`BRPOP`/`BRPOPLPUSH` did not exist
+
+`-ERR unknown command`; a Celery worker cannot consume a queue without them.
+Fix: implemented with a 20 ms poll bounded at 30 s (a forever-block would pin a
+session thread), plus the push side for `BRPOPLPUSH`.
+
+## 6. `DEL` leaked collection records
+
+A hash/set/zset key exists only as `__h__:k:*` records, so `DEL` answered `0` and
+the members survived. Fix: `DEL` also removes the list record and every h/s/z
+member record, counting keys as Redis does.
+
+## 7. Standalone servers enforced cluster rules
+
+`qihse_resp_route` rejected ordinary multi-key `DEL` with `CROSSSLOT` with no
+sharded topology. Fix: a single-node view executes locally; cluster rules still
+apply with ≥2 nodes.
+
+## 8. `--password` silently overrode `QIHSE_OPERATOR_PASSWORD`
+
+`docs/OPERATIONS.md` promises "mismatch = exit 2", but the argv value won
+silently and rotated the operator credential (`AUTH env` → WRONGPASS,
+`AUTH flag` → OK).
+Fix: `tools/qihse_redis_server.c` refuses the mismatch with exit 2 and a clear
+message; match / env-only paths unchanged.
+
+## 9. Binaries could load a stale `libqihse.so`
+
+`qihse-redis-server` resolved `libqihse.so` from `ld.so.cache`
+(`/rpool/data/db/qihse/lib`) instead of its freshly built sibling; the resulting
+header/ABI mismatch corrupted `qihse_resp_server_config_t` and every start
+failed with a generic "auth gate or bind error".
+Fix: link with `-Wl,-rpath,'$ORIGIN'` (DT_RUNPATH) — **and** keep the loader copy
+in sync, since a cache hit still wins for other consumers — plus the create()
+failure path now prints errno, auth state, bind, port and the limits.
+
+## 10. Operator credential held an unexpanded placeholder
+
+`~/.config/qihse-aimem/operator-password.cred` decrypted to the literal string
+`${QIHSE_AUTH_PASSWORD}`; the launcher assigns it verbatim, so the daemon's
+operator password was the placeholder and the real 48-character secret in
+`~/.config/qihse-aimem/env` was unused.
+Fix: re-encrypted the credential with the real secret (old cred kept as
+`.bak-*`), and `start-qihse-aimem` now pins `LD_LIBRARY_PATH` to its own
+directory so the engine next to the launcher is always the one loaded.
+
+## Verification commands
+
+    # engine build + probe suites (reply-level, no redis-cli required)
+    make redis-server && ./qihse-redis-server --require-auth ...
+    # live service (AIMEM, :6401)
+    systemd-creds decrypt --user --name=operator-password \
+      ~/.config/qihse-aimem/operator-password.cred - | ...
+    # documented password rule
+    QIHSE_OPERATOR_PASSWORD=… ./qihse-redis-server --require-auth --password other  # exit 2
+
+---
+
+# Suite remediation — 2026-10-23 (round 2)
+
+Full `make test-*` sweep (183 targets) after the RESP fixes. 10 more targets
+were failing; root causes fixed and committed (`bb8e49d`):
+
+| target | root cause | fix |
+|---|---|---|
+| test-codegraph | `json_bool` collided with json-c's typedef; `$(pkg-config)` was a make function (empty) not shell; header validator demanded 64-hex `head` but the format carries 40-hex SHA-1; auth init ran before the scratch `QIHSE_DATA_DIR` existed; scratch cleanup raced the audit signer (ENOENT -> chain-integrity abort) | rename helper; `$(shell pkg-config)`; accept 40/64-hex; init after scratch; `qihse_audit_flush()` before `nftw` cleanup |
+| test-direct-execution | rule forced `-mavx2 -mavx512* AMX` and SIGILL'd on non-supporting hosts | conditional CFLAGS + per-ISA `#ifdef` guards; absent ISA = SKIP, advertised ISA SIGILL = FAIL |
+| test-operator-mode | assertion predated the verifier-configured contract | assert current semantics (plain init = default; bootstrap clears) |
+| test-uwp-concurrency | audited UWP paths aborted without an audit writer | auth init + operator bootstrap (same as AF_XDP test) — see open defect below |
+| test-edge-persistence | stale `/tmp/qihse_edge_persistence_test.qdb` from a root run (EACCES); real gate: container HMAC key must be 0600 + owned by the service user | per-run pid path; `/etc/qihse` 0755, private keys 0600 john, public keys 0644 |
+| test-cluster-bus-bind | OpenSSL used without `-lcrypto` | link fix |
+| test-amx-only / avx512-direct / vnni-only / zen-epyc / all-isa | forced ISAs the host lacks | capability-gated SKIP (see §6a) |
+
+## Historical defects open before suite remediation round 3
+
+The diagnoses below describe the initial failures. They were subsequently
+resolved in the remediation section that follows; they are not current open
+defects.
+
+1. **fabric remote embed is impossible by construction.**
+   `qihse_ai_memory_store()` fails the claims-built remote context because
+   `qihse_auth_user_is_active()` resolves by **pointer identity** against the
+   local auth registry (`users[i] == presented`); a remote principal can never
+   be live on the executor, so the embed job always ends `embed-refused` /
+   `executor-reported-failure`. Needs a design decision: materialise remote
+   principals, or let the memory store take (live user, explicit classification)
+   separately.
+2. **gold battery: pg-wire-cluster workload hangs under the runner**
+   (`tests/gold/pack.v1.gold` line 241). The workload subprocess sits in wait
+   with no children; passes standalone (`make test-pg-wire-cluster`). Runner
+   cwd/env differences (the runner runs workloads from its own directory with
+   inherited `LD_LIBRARY_PATH`) are the suspect; needs the pack/runner env
+   pinned like the other workloads.
+3. **test-uwp-concurrency deadlocks** once the audit writer exists: 18 threads
+   in `futex_do_wait` — 16 workers + audit signer, consistent with bounded-queue
+   backpressure across the kv_lock/audit ordering. Previously it aborted at the
+   same path ("audit writer is not initialized"), so this failure predates the
+   auth-init fix; the fix merely exposed the deeper lock-ordering issue.
+   `test` (the aggregate) inherits these three.
+
+At that earlier checkpoint, 183 targets had three remaining failures. The
+round-3 remediation below records the fixes and later verification.
+
+---
+
+# Suite remediation — 2026-10-24 (round 3)
+
+Follow-up to the three defects above:
+
+1. **Fabric remote embed and index-build:** resolved. The executor now uses its
+   live system Operator handle for an unclassified AIMEM write after verifying
+   the signed zero-label token. The stored memory and projections retain the
+   token's 0/0 label. Index-build uses a live actor and a bounded-label KV
+   iterator that filters records before the callback. Nonzero token labels
+   remain refused. The fabric dispatch test covers forged handles and
+   low-clearance/high-data denial. `test-fabric-dispatch`, `test-ai-memory`, and
+   `test-ai-memory-embed` pass on the integrated branch.
+2. **Gold pg-wire-cluster:** the cwd/`LD_LIBRARY_PATH` hypothesis was not
+   reproduced. The protocol test assumed each `read()` returned a full frame
+   and had no socket deadline. It now uses complete framed reads/writes and
+   bounded socket and thread waits. `test-pg-wire-cluster` passes, and the
+   `pg-wire-shard` workload passed inside the full gold runner (8.21 s). The
+   earlier full-suite hang was not reproduced, so its exact cause remains
+   unproven.
+3. **UWP concurrency:** the observed long stall was 16 workers running
+   16,000 constant-time dummy PBKDF2 hashes for nonexistent usernames; the
+   audit signer was idle in the debugger. The test now authenticates a real
+   principal concurrently, exercises grants/denials and authenticated KV
+   reads/writes, and flushes audit. `test-uwp-concurrency` passes on the
+   integrated branch (16/16 authentications, 5,344 grants, 10,656 denials).
+
+The full gold battery was stopped by a 10-minute outer timeout after its
+`pg-wire-shard` PASS. It also reported a `cluster-failover-smoke` failure.
+Standalone reproduction showed both daemons exit before binding: the smoke
+passes `--redundancy-peer`, which the daemon explicitly rejects until duplicate
+writes use pinned QKP replication (`tools/qihse_cluster_daemon.c`). This is a
+separate unresolved feature/test-contract mismatch, not a pg runner hang.
+
+The gold smoke now asserts that the unsafe flag remains disabled, then checks
+slot takeover and survival of an authenticated, preseeded unclassified key.
+Its focused run passed 6/6. The gold pack expects that exact result. Pinned
+QKP replica pull still requires a read-only replica; live authenticated write
+duplication to a promotable successor remains unimplemented and is not claimed
+by this drill.
+
+---
+
+# Full-suite verification — 2026-10-24
+
+The first `make -k test` collection pass found three further failures. All
+were fixed without changing the authorization or transport policy:
+
+- `test-aimem-qh05-08` checked only the first two-row page of a three-row
+  as-of query. It now drains the snapshot pages and requires the original
+  version while excluding its later replacement.
+- `test-fts-persist-adapter` used a 2-second reply poll that timed out during
+  first `AUTH` under suite load. It now uses a 30-second total monotonic
+  deadline with a command-specific diagnostic.
+- The loadshift smoke exposed a real fail-open ordering bug: data-bearing
+  `MOVESLOTS` flipped ownership before discovering that target authentication
+  was unavailable, stranding source keys. Handoff now rejects incomplete
+  enumeration, missing credentials, and failed target connect/AUTH before an
+  ownership change. The gold smoke asserts explicit refusal, intact keys,
+  unchanged slot views, and no partial peer copy (6/6). Pinned-QKP
+  data-bearing slot transfer remains an open implementation gap.
+
+A clean `make -s test` rerun exited 0; gold reported 72/72 workloads passing
+across all 11 areas. The 48 `test-*` targets outside the aggregate and gold
+were also run individually and passed. This validated the 183 `test-*`
+targets wired at that point plus the aggregate. The Python PG SDK target added
+afterward is wired into future aggregate runs and passed independently (8/8).
+The Rust SDK unit suite also passes (2/2). Secure live replication and
+data-bearing slot-transfer gaps remain open.

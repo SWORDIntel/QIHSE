@@ -22,20 +22,35 @@ QIHSE_CFLAGS_EXTRA?=
 #
 # Cross-builds may override each flag explicitly on the make command line.
 #
-# R320/E5-2450 v2: AVX only – AVX2, FMA, AVX-512, VNNI, AMX all absent.
-# Sapphire Rapids+: all features available.
+# Legacy hosts (R320 / E5-24xx v2, Ivy Bridge) advertise AVX only; Broadwell+
+# adds AVX2+FMA; Skylake-SP+ adds AVX-512; Sapphire Rapids+ adds VNNI and AMX.
+# Only the groups the host fully advertises are compiled in.
 
 # ---- host feature helpers --------------------------------------------------
 HOST_CPU_FLAGS ?= $(shell awk -F: '/^flags/{sub(/^ /, "", $$2); print $$2; exit}' /proc/cpuinfo 2>/dev/null)
 cpu_has = $(if $(filter $(1),$(HOST_CPU_FLAGS)),1,0)
+# An ISA is enabled only when EVERY flag its codegen needs is advertised — the
+# rule AVX-512 already followed, now applied uniformly to all ISA groups, so a
+# host that has (say) avx2 but not fma never gets -mavx2 -mfma.
+cpu_has_all = $(if $(strip $(foreach f,$(1),$(if $(filter $(f),$(HOST_CPU_FLAGS)),,$(f)))),0,1)
+HOST_CPU_VENDOR ?= $(shell awk -F: '/^vendor_id/{sub(/^ /, "", $$2); print $$2; exit}' /proc/cpuinfo 2>/dev/null)
+# An ISA test may only run when the host advertises the ISA; otherwise print a
+# SKIP line and succeed, so the suite reflects host capability instead of
+# crashing with SIGILL on a machine that simply lacks the feature.
+define skip_if_disabled
+	@if [ "$(1)" != "1" ]; then echo "SKIP $(2): host CPU does not advertise the required ISA"; exit 0; fi
+endef
 
 # ---- per-ISA defaults (auto-detect unless already set in env/CLI) ----------
-QIHSE_ENABLE_AVX      ?= $(call cpu_has,avx)
-QIHSE_ENABLE_AVX2     ?= $(call cpu_has,avx2)
-QIHSE_ENABLE_AVX512   ?= $(if $(and $(filter avx512f,$(HOST_CPU_FLAGS)),$(filter avx512dq,$(HOST_CPU_FLAGS)),$(filter avx512bw,$(HOST_CPU_FLAGS)),$(filter avx512vl,$(HOST_CPU_FLAGS))),1,0)
-QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has,avx_vnni)
-QIHSE_ENABLE_AMX      ?= $(if $(and $(filter amx_tile,$(HOST_CPU_FLAGS)),$(filter amx_int8,$(HOST_CPU_FLAGS)),$(filter amx_bf16,$(HOST_CPU_FLAGS))),1,0)
-QIHSE_ENABLE_F16C     ?= $(call cpu_has,f16c)
+# Requirement groups mirror the exact flags each codegen path needs (see the
+# matching CFLAGS block): the build may only emit an ISA when the whole group is
+# present, and the runtime dispatcher re-checks the same features via CPUID.
+QIHSE_ENABLE_AVX      ?= $(call cpu_has_all,avx)
+QIHSE_ENABLE_AVX2     ?= $(call cpu_has_all,avx2 fma)
+QIHSE_ENABLE_AVX512   ?= $(call cpu_has_all,avx512f avx512dq avx512bw avx512vl fma)
+QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has_all,avx2 avx_vnni)
+QIHSE_ENABLE_AMX      ?= $(call cpu_has_all,amx_tile amx_int8 amx_bf16)
+QIHSE_ENABLE_F16C     ?= $(call cpu_has_all,avx f16c)
 QIHSE_ENABLE_AESNI    ?= $(call cpu_has,aes)
 QIHSE_ENABLE_PCLMUL   ?= $(call cpu_has,pclmulqdq)
 QIHSE_ENABLE_POPCNT   ?= $(call cpu_has,popcnt)
@@ -271,7 +286,8 @@ redis-cluster-node: lib
 
 redis-server: lib
 	$(CC) $(CFLAGS) -o qihse-redis-server tools/qihse_redis_server.c \
-	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
+	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime \
+	    -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,'$$ORIGIN/lib' $(LDFLAGS)
 	@echo "qihse-redis-server build successful"
 
 backup-cli: lib
@@ -453,8 +469,12 @@ test-graph-vector: lib
 	LD_LIBRARY_PATH=. ./tests/test_graph_vector
 
 test-zen-epyc-simd: lib
+ifeq ($(filter AMD,$(HOST_CPU_VENDOR)),AMD)
 	$(CC) $(CFLAGS) -o tests/test_zen_epyc_simd tests/test_zen_epyc_simd.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_zen_epyc_simd
+else
+	@echo "SKIP test-zen-epyc-simd: host CPU is not AMD Zen/EPYC"
+endif
 
 test-resp-hybrid: lib
 	$(CC) $(CFLAGS) -o tests/test_resp_hybrid tests/test_resp_hybrid.c -L. -lqihse $(LDFLAGS)
@@ -475,7 +495,7 @@ test-http-lifecycle:
 
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c -Wl,--gc-sections -pthread
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c -Wl,--gc-sections -pthread -lcrypto
 	./build/test_cluster_bus_bind
 
 test: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
@@ -896,6 +916,9 @@ test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-
 test: test-aimem-scope-index
 test: test-aimem-qh08 test-aimem-qh08-resp
 test: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
+test: test-wal-durability
+test: test-python-pg-sdk
+test: test-pg-wire-txn
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -922,6 +945,15 @@ tests/gold/workloads/%: tests/gold/workloads/%.c libqihse.so
 test-txn: lib
 	$(CC) $(CFLAGS) -o tests/test_txn tests/test_txn.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_txn
+
+# WAL durability error propagation uses a syscall shim to inject fdatasync
+# failures deterministically; this standalone test links the WAL implementation
+# directly so the shim cannot affect unrelated library users.
+test-wal-durability:
+	$(CC) $(CFLAGS) -Dfdatasync=qihse_test_fdatasync \
+	    -Dfsync=qihse_test_fsync -o tests/test_wal_durability \
+	    tests/test_wal_durability.c src/tractable/qihse_wal.c -pthread
+	./tests/test_wal_durability
 
 # MVCC delete semantics in both directions: a committed DELETE hides the row
 # whatever aborted writers preceded it, and it hides nothing a reader of an
@@ -1080,6 +1112,14 @@ test-cluster-rebalance: lib
 test-pg-wire-cluster: lib
 	$(CC) $(CFLAGS) -o tests/test_pg_wire_cluster tests/test_pg_wire_cluster.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_pg_wire_cluster
+
+.PHONY: test-pg-wire-txn
+test-pg-wire-txn: lib
+	$(CC) $(CFLAGS) -o tests/test_pg_wire_txn tests/test_pg_wire_txn.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_pg_wire_txn
+
+test-python-pg-sdk:
+	PYTHONPATH=sdks/python python3 -m unittest -v test_qihse_pg_transactions
 
 test-keystone-qihse: lib
 	$(CC) $(CFLAGS) -o tests/test_keystone_qihse_integration tests/test_keystone_qihse_integration.c -L. -lqihse $(LDFLAGS)
@@ -1271,23 +1311,35 @@ test-vnni-bench:
 	LD_LIBRARY_PATH=. ./tests/test_vnni_bench
 
 test-vnni-only:
+ifeq ($(QIHSE_ENABLE_AVX_VNNI),1)
 	$(CC) $(CFLAGS) -mavx2 -mfma -mavxvnni -o tests/test_vnni_only tests/test_vnni_only.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_vnni_only
+else
+	@echo "SKIP test-vnni-only (AVX-VNNI): host CPU does not advertise the required ISA"
+endif
 
 test-avx2-only:
 	$(CC) $(CFLAGS) -mavx2 -mfma -o tests/test_avx2_only tests/test_avx2_only.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_avx2_only
 
 test-avx512-direct:
+ifeq ($(QIHSE_ENABLE_AVX512),1)
 	$(CC) $(CFLAGS) -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -o tests/test_avx512_direct tests/test_avx512_direct.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_avx512_direct
+else
+	@echo "SKIP test-avx512-direct (AVX-512F): host CPU does not advertise the required ISA"
+endif
 
 test-amx-only:
+ifeq ($(QIHSE_ENABLE_AMX),1)
 	$(CC) $(CFLAGS) -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_amx_only tests/test_amx_only.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_amx_only
+else
+	@echo "SKIP test-amx-only (AMX): host CPU does not advertise the required ISA"
+endif
 
 test-direct-execution:
-	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512bw -mavx512vl -mfma -mamx-tile -mamx-int8 -mamx-bf16 -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o tests/test_direct_execution tests/test_direct_execution.c $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_direct_execution
 
 test-simple-exec:
@@ -1575,7 +1627,7 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 .PHONY: test-codegraph
 qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include \
-	  $< -o $@ -L. -lqihse $(pkg-config --cflags --libs json-c openssl) \
+	  $< -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl) \
 	  $(LDFLAGS) -Wl,-rpath,'$ORIGIN'
 
 test-codegraph: qihse-codegraph
@@ -1594,3 +1646,11 @@ include benchmarks/w12.mk
 
 # Standalone experimental W12.1 scalar reference, never linked by lib targets.
 include quantization/w12.mk
+
+# FTS.SAVE/FTS.LOAD adapter: durable per-node projection plus the mandatory
+# low-clearance/high-data negative (AGENTS.md invariant #3) and autoload.
+test-fts-persist-adapter: lib
+	$(CC) $(CFLAGS) -o tests/test_fts_persist_adapter tests/test_fts_persist_adapter.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_fts_persist_adapter
+
+test: test-fts-persist-adapter

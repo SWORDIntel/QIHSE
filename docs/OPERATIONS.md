@@ -50,7 +50,7 @@ command has not been exercised on a live daemon in this update.
 | Operator password | `QIHSE_OPERATOR_PASSWORD` env var, **minimum 12 chars**, read at auth init | redis-server, cluster-daemon, federation-ca, demo, controller SDKs |
 | Demo default | if `QIHSE_OPERATOR_PASSWORD` is unset, `./qihse demo` uses `qihse-demo-operator` | demo only, per-process (auth state is in-memory) |
 | RESP wire auth | `AUTH GODMODE_OP <password>` (or `AUTH <password>`); `PING` answers pre-auth | redis-server, cluster-daemon |
-| `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set (mismatch = exit 2) | `qihse-redis-server --require-auth` |
+| `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set — mismatch exits 2 (enforced in `tools/qihse_redis_server.c`: the server refuses rather than silently rotating the credential) | `qihse-redis-server --require-auth` |
 | Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk (decision record: [auth_persistence.md](architecture/auth_persistence.md)) | all tools |
 
 Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is
@@ -205,19 +205,18 @@ repl + transport + rejoin + CA + CRL + backup + consensus + incremental export,
 controller SDKs, AI memory, fabric, task, e2e, persistence, bytecode, document/
 column/FTS/time-series/event-stream stores, SQL completeness/DML/txn/MVCC/
 indexes/optimizer governance, Bolt, MongoDB wire + security, repl, metrics,
-parallel query) **plus** the two `GNUmakefile` overlay targets
-(`test-uwp-tls`, `test-uwp-secure-default`), and finishes with `test-gold`.
+parallel query) **plus** the two prerequisites added by `GNUmakefile`
+(`test-uwp-tls`, `test-uwp-secure-default`), and includes `test-gold`.
 
-Expected runtime: roughly 40–50 minutes on this development host (the
-aggregate is sequential and dominated by federation, fabric, and gold
-workloads; the gold suite alone is ≈4.5 minutes). Do not run two aggregates
-concurrently — several targets create/remove shared scratch state at the
+The 2026-10-24 sequential aggregate took about 39 minutes on this host;
+gold workloads accounted for 828.5 seconds, excluding build time. Do not run
+two aggregates concurrently — several targets create/remove shared scratch state at the
 repository root (`qihse_integrity.chain*`) and under `build/`.
 
 Note on ordering and failure: `make` runs the prerequisites of `test` in
-declaration order — the `Makefile` list first, then the two `GNUmakefile`
-overlay targets — and stops at the first failure. Because the aggregate ends
-with `test-gold`. As of the 2026-09-29 W7 wave the pack is green
+declaration order — the `Makefile` list first, then the two prerequisites
+added by `GNUmakefile` — and stops at the first failure. `test-gold` is not the final
+direct test in the current aggregate. In the 2026-10-24 run the pack was green
 (72/72 workloads, 11/11 areas FULL, zero recorded gaps — see
 [§2.4](#24-the-gold-validation-suite)), so a plain `make test` runs to the
 end; historical note: it was red for a stretch and `make -k test` remains
@@ -286,8 +285,9 @@ overlay-discovery, observability). The 2026-09-29 W7 wave added the consensus
 membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
 the browser negative-auth, QKP identity and feed-wire suites, and the
 self-spawning failover drill — the first workload that kills a REAL daemon
-peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive) —
-plus the hermetic discovery and loadshift drills (loopback --self-spawn),
+peer (SIGKILL, successor takes all 16384 slots, a preseeded key survives) —
+plus the hermetic discovery drill and loadshift refusal guard (loopback
+--self-spawn),
 the fusion recall/latency gate, non-vector index byte accounting, and
 backend busy-time accounting. Board: **72/72 pass, 11/11 areas FULL, zero
 recorded gaps**; the drills were hardened to pass reliably under CPU
@@ -304,11 +304,12 @@ Verdicts (see the header of `tests/gold/gold_runner.c`): `VERDICT: PASS`
 error, 2 non-green under strict. Adding a workload is a pack edit only — the
 Makefile extracts the `bin=` list from the pack.
 
-Verified on this branch (2026-09-29, under host load avg 80): `make
-test-gold` completes with **`VERDICT: PASS` — 72/72 workloads, 11/11 areas
-FULL, zero recorded gaps** (the drill workloads were hardened for exactly
-these conditions: by-condition readiness waits, leak-proof teardown, 900 s
-pack timeouts). On a quiet box the suite takes ≈4.5 minutes. Historical
+Verified again on 2026-10-24: the gold pack completed with **`VERDICT: PASS`
+— 72/72 workloads, 11/11 areas FULL, zero declared gaps**. Its workloads took
+828.5 seconds in total on this host, excluding build time. The failover drill
+tests survival of a preseeded value; the loadshift guard tests fail-closed
+refusal while secure data-bearing transfer is unavailable. See CT.1–CT.2 in
+`ROADMAP.md` for those open capabilities. Historical
 note for perspective: the pack was red at 59/60 for a stretch in the
 2026-09-26 round (a `controller-api` abort that `make test` alone never
 ran — exactly the kind of coverage the pack exists to catch); that defect
@@ -370,7 +371,8 @@ Verified behavior (2026-09-26):
 
 Key flags (from usage): `--node INDEX:HOST:PORT:BUS-PORT` (static topology,
 repeatable) or `--join HOST:BUS-PORT` (gossip discovery from a seed);
-`--slot-range[-of INDEX] FIRST-LAST`; `--redundancy-peer HOST:PORT`;
+`--slot-range[-of INDEX] FIRST-LAST`; `--redundancy-peer HOST:PORT`
+(rejected until pinned QKP write duplication is implemented);
 `--replicate GLOB` + `--replicate-interval S` (sovereign-local namespaces
 with anti-entropy pull; deletes are not propagated); `--max-clients N`;
 `--enable-scatter`; `--brain` / `--brain-act` and the `--brain-*` tuning
@@ -616,9 +618,13 @@ QIHSE_DATA_DIR=./build/cluster-smoke \
 python3 tests/cluster_failover_smoke.py
 ```
 
-Verified (2026-09-26): `failover drill: 5/5 checks passed` — writes on the
-lead, ASKING read on the successor, SIGKILL of the lead, slot takeover, and
-survival of the duplicated key. Environment knobs (all optional):
+Current drill: `failover drill: 6/6 checks passed` — rejects the disabled
+plaintext redundancy flag, writes on the lead, seeds and reads an
+unclassified duplicate on the successor through authenticated RESP, kills
+the lead, checks slot takeover, and checks survival of the seeded key. This
+does not claim live write duplication. Pinned QKP replica pull is tested
+separately and currently requires a read-only replica, so integrated
+replication to a promotable successor remains open. Environment knobs (all optional):
 `QIHSE_BIN` (default `./qihse-cluster-daemon`), `QIHSE_LIB_DIR` (default `.`),
 `QIHSE_DATA_DIR` (default `./build/cluster-smoke`), `QIHSE_NODE0_HOST` /
 `QIHSE_NODE1_HOST`, `QIHSE_NODE0_PORT` / `QIHSE_NODE1_PORT`,
@@ -629,7 +635,8 @@ survival of the duplicated key. Environment knobs (all optional):
 elsewhere):** `tests/cluster_smoke.py` (two-node routing + MOVED redirects),
 `tests/cluster_discover_smoke.py` (--join membership discovery; run after
 bringing up a seed node), `tests/cluster_loadshift_smoke.py`
-(`CLUSTER MOVESLOTS` ownership flip). All honor `QIHSE_NODE0_HOST` /
+(`CLUSTER MOVESLOTS` guard: data-bearing moves refuse before ownership changes
+until pinned QKP slot transfer is available). All honor `QIHSE_NODE0_HOST` /
 `QIHSE_NODE0_PORT` / `QIHSE_NODE1_HOST` / `QIHSE_NODE1_PORT` /
 `QIHSE_CLUSTER_PASSWORD`. *Not verified in this pass* (they require a running
 two-node cluster; only the failover drill is self-starting).

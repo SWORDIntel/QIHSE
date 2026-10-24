@@ -7,6 +7,9 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <time.h>
 #include "qihse_pg_wire.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_kv_store.h"
@@ -24,6 +27,44 @@ static void* server_worker(void* arg) {
     return NULL;
 }
 
+static void write_all(int fd, const void* data, size_t len) {
+    const uint8_t* p = data;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        assert(n > 0);
+        p += n;
+        len -= (size_t)n;
+    }
+}
+
+static void read_all(int fd, void* data, size_t len) {
+    uint8_t* p = data;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        assert(n > 0); /* EOF or receive timeout is a test failure. */
+        p += n;
+        len -= (size_t)n;
+    }
+}
+
+static void read_until_ready(int fd) {
+    for (;;) {
+        uint8_t tag;
+        uint32_t wire_len;
+        read_all(fd, &tag, 1);
+        read_all(fd, &wire_len, sizeof(wire_len));
+        uint32_t len = ntohl(wire_len);
+        assert(len >= 4 && len <= 1024 * 1024);
+        char* body = malloc(len - 4 ? len - 4 : 1);
+        assert(body);
+        read_all(fd, body, len - 4);
+        free(body);
+        if (tag == 'Z') return;
+    }
+}
+
 static void send_pg_msg(int fd, uint8_t tag, const char* body, size_t body_len) {
     uint32_t msg_len = (uint32_t)(4 + body_len);
     uint8_t header[5];
@@ -32,9 +73,9 @@ static void send_pg_msg(int fd, uint8_t tag, const char* body, size_t body_len) 
     header[2] = (uint8_t)((msg_len >> 16) & 0xff);
     header[3] = (uint8_t)((msg_len >> 8) & 0xff);
     header[4] = (uint8_t)(msg_len & 0xff);
-    write(fd, header, 5);
+    write_all(fd, header, 5);
     if (body_len > 0) {
-        write(fd, body, body_len);
+        write_all(fd, body, body_len);
     }
 }
 
@@ -52,6 +93,15 @@ static void test_pg_wire_handshake_and_queries() {
     int fds[2];
     int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     assert(rc == 0);
+    struct timeval io_timeout = { .tv_sec = 30 };
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
+    assert(setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
+    assert(setsockopt(fds[1], SOL_SOCKET, SO_SNDTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
 
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
     qihse_cluster_node_t node;
@@ -88,19 +138,20 @@ static void test_pg_wire_handshake_and_queries() {
 
     uint32_t pkt_len = htonl((uint32_t)(8 + ppos));
     uint32_t proto = htonl(196608);
-    write(fds[0], &pkt_len, 4);
-    write(fds[0], &proto, 4);
-    write(fds[0], startup_payload, ppos);
+    write_all(fds[0], &pkt_len, 4);
+    write_all(fds[0], &proto, 4);
+    write_all(fds[0], startup_payload, ppos);
 
     // Read AuthenticationCleartextPassword ('R', len=8, type=3)
     uint8_t tag = 0;
-    assert(read(fds[0], &tag, 1) == 1 && tag == 'R');
+    read_all(fds[0], &tag, 1);
+    assert(tag == 'R');
     uint32_t auth_len = 0;
-    assert(read(fds[0], &auth_len, 4) == 4);
+    read_all(fds[0], &auth_len, 4);
     auth_len = ntohl(auth_len);
     assert(auth_len == 8);
     uint32_t auth_type = 0;
-    assert(read(fds[0], &auth_type, 4) == 4);
+    read_all(fds[0], &auth_type, 4);
     auth_type = ntohl(auth_type);
     assert(auth_type == 3);
 
@@ -109,84 +160,45 @@ static void test_pg_wire_handshake_and_queries() {
     size_t pw_len = strlen(password) + 1;
     uint32_t pw_msg_len = htonl((uint32_t)(4 + pw_len));
     uint8_t pw_tag = 'p';
-    write(fds[0], &pw_tag, 1);
-    write(fds[0], &pw_msg_len, 4);
-    write(fds[0], password, pw_len);
+    write_all(fds[0], &pw_tag, 1);
+    write_all(fds[0], &pw_msg_len, 4);
+    write_all(fds[0], password, pw_len);
 
     // Read responses until ReadyForQuery ('Z')
-    tag = 0;
-    while (read(fds[0], &tag, 1) > 0) {
-        uint32_t len = 0;
-        assert(read(fds[0], &len, 4) == 4);
-        len = ntohl(len);
-        if (len > 4) {
-            char* buf = malloc(len - 4);
-            assert(read(fds[0], buf, len - 4) == (ssize_t)(len - 4));
-            free(buf);
-        }
-        if (tag == 'Z') break;
-    }
-    assert(tag == 'Z');
+    read_until_ready(fds[0]);
     printf("  -> Startup handshake OK (AuthOk + ParameterStatus + ReadyForQuery)\n");
 
     // 2. Query virtual system tables: SELECT * FROM pg_catalog.pg_tables
     const char* q1 = "SELECT * FROM pg_catalog.pg_tables\0";
     send_pg_msg(fds[0], 'Q', q1, strlen(q1) + 1);
 
-    while (read(fds[0], &tag, 1) > 0) {
-        uint32_t len = 0;
-        read(fds[0], &len, 4);
-        len = ntohl(len);
-        if (len > 4) {
-            char* buf = malloc(len - 4);
-            read(fds[0], buf, len - 4);
-            free(buf);
-        }
-        if (tag == 'Z') break;
-    }
+    read_until_ready(fds[0]);
     printf("  -> Virtual catalog tables discovery OK\n");
 
     // 3. Query cluster topology view: SELECT * FROM cluster_nodes
     const char* q2 = "SELECT * FROM cluster_nodes\0";
     send_pg_msg(fds[0], 'Q', q2, strlen(q2) + 1);
 
-    while (read(fds[0], &tag, 1) > 0) {
-        uint32_t len = 0;
-        read(fds[0], &len, 4);
-        len = ntohl(len);
-        if (len > 4) {
-            char* buf = malloc(len - 4);
-            read(fds[0], buf, len - 4);
-            free(buf);
-        }
-        if (tag == 'Z') break;
-    }
+    read_until_ready(fds[0]);
     printf("  -> Virtual cluster nodes introspection OK\n");
 
     // 4. Query sharded multi-model: SELECT * FROM {device_4096} WHERE vector_search(embedding, top_k=5)
     const char* q3 = "SELECT * FROM {device_4096} WHERE vector_search(embedding, top_k=5)\0";
     send_pg_msg(fds[0], 'Q', q3, strlen(q3) + 1);
 
-    while (read(fds[0], &tag, 1) > 0) {
-        uint32_t len = 0;
-        read(fds[0], &len, 4);
-        len = ntohl(len);
-        if (len > 4) {
-            char* buf = malloc(len - 4);
-            read(fds[0], buf, len - 4);
-            free(buf);
-        }
-        if (tag == 'Z') break;
-    }
+    read_until_ready(fds[0]);
     printf("  -> Sharded SQL query executed through distributed multi-model planner OK\n");
 
     // Terminate connection
     uint32_t term_len = htonl(4);
     uint8_t term_tag = 'X';
-    write(fds[0], &term_tag, 1);
-    write(fds[0], &term_len, 4);
+    write_all(fds[0], &term_tag, 1);
+    write_all(fds[0], &term_len, 4);
 
-    pthread_join(stid, NULL);
+    struct timespec join_deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &join_deadline) == 0);
+    join_deadline.tv_sec += 30;
+    assert(pthread_timedjoin_np(stid, NULL, &join_deadline) == 0);
     close(fds[0]);
 
     qihse_kv_store_destroy(kv);

@@ -1,20 +1,20 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-22
+**Status date:** 2026-10-24
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
-**Current program status (2026-10-22):** 134 items implemented, 2 partial, 12 planned deliverables (5 in W11 and 7 in the new W12 research/implementation lane), and 1 superseded conditional item. W0–W10 are closed (100% of their applicable scope complete). W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), [W11](#w11--general-database-application-platform-active-stretch-goal), and the independent [W12 TurboQuant plan](docs/plans/qihse_turboquant_vector_index_plan.md). W12.0 now has an initial source audit and synthetic FP32 kernel baseline; an experimental standalone W12.1 scalar reference is under validation, with no W12 gate complete.
+**Current program status (2026-10-24):** 135 items implemented, 2 partial, 13 planned deliverables (2 cluster-transport follow-ups, 4 in W11, and 7 in W12), and 1 superseded conditional item. The recorded W0–W10 checklist is closed, while authenticated replication to a promotable successor and secure data-bearing slot transfer remain open capabilities. W11 is active with its SQL transaction and interface foundation partially landed; W11.0's source-backed guarantee map and proposed acceptance budgets are complete. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. The initial Fabric embed, `pg-wire-cluster`, and UWP concurrency failures were resolved in suite remediation round 3. The latest aggregate `make -s test` run exited successfully; the gold battery passed 72/72 workloads across all 11 areas. Python PostgreSQL SDK coverage (8 tests), the context-backed PG wire transaction/authorization regression, and the existing Rust SDK tests (2/2) pass. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), [W11](#w11--general-database-application-platform-active-stretch-goal), and the independent [W12 TurboQuant plan](docs/plans/qihse_turboquant_vector_index_plan.md). W12 is a proposal, not a claim of implementation.
 
 ---
 
-## 1. Where we are now (reviewed 2026-10-21)
+## 1. Where we are now (reviewed 2026-10-24)
 
-The historical program is closed. W0–W9 are implemented, including the W8 I2P replica transport live SOCKS5 smoke test across stageb containers and W9 runtime-dispatched hardware acceleration on the R730xd, dual E5-2470 v2 host, and AMD Zen 4/Zen 2 hosts. Audit continuity and exact-prefix challenge gates are implemented but intentionally undeployed pending retained-log review and the required negative CI coverage. The verification gold suite is non-vacuous; remaining verification work is documentation.
+The historical W0–W10 checklist is closed. W0–W9 are implemented, including the W8 I2P replica transport live SOCKS5 smoke test across stageb containers and W9 runtime-dispatched hardware acceleration on the R730xd, dual E5-2470 v2 host, and AMD Zen 4/Zen 2 hosts. Audit continuity and exact-prefix challenge gates are implemented but intentionally undeployed pending retained-log review and the required negative CI coverage. The verification gold suite passed 72/72 workloads on the latest recorded `make -s test` run. Its cluster smokes verify fail-closed behavior; they do not implement the two cluster-transport follow-ups below.
 
-The W0–W10 implementation program is closed with **134 implemented and 1 superseded conditional item (100% of its applicable scope complete)**. Functionality and security defects in the existing workstreams are fixed, including NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need. W11 adds **7 stretch deliverables** for QIHSE's role as the general database foundation for commerce, inventories, fuzzing findings, agent memory, and other applications; W11.1 and W11.5 are now partial.
+The recorded W0–W10 checklist has **134 implemented and 1 superseded conditional item**. Functionality and security defects addressed in those workstreams include NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need. The open cluster-transport capabilities are tracked separately as CT.1–CT.2. W11 adds **7 stretch deliverables** for QIHSE's role as the general database foundation for commerce, inventories, fuzzing findings, agent memory, and other applications; W11.0 is complete, while W11.1 and W11.5 are partial.
 
 ### Remote Server Hardware Acceleration (Dell PowerEdge R730xd — Dual Xeon E5-2690 v4) (2026-10-17)
 
@@ -253,7 +253,7 @@ The database-replacement program (**Phases 1–9**) is complete and committed �
 | Secondary indexes (B+ tree, hash, composite, index-backed plans) | `[x]` |
 | Replication, read replicas, CDC, coordinated snapshots, backup/restore, PITR | `[x]` |
 | Wire protocols: RESP2/3, pgwire, MongoDB, Bolt/Cypher, HTTP/REST, ES-style, ClickHouse-style, InfluxDB-style | `[x]` |
-| Cluster: 16,384 slots, gossip, Raft failover, zero-downtime rebalancing, scatter-gather planner | `[x]` |
+| Cluster: 16,384 slots, gossip, failover, scatter-gather planner; secure data-bearing rebalancing remains open | `[~]` |
 | Ops: pooler, Prometheus metrics, OTel tracing, task queue/scheduler, backup | `[x]` |
 | Compatibility command surfaces for 8 target databases (Phase 9) | `[x]` |
 
@@ -535,7 +535,7 @@ Items 1–3 are in flight (see §1.2); items 4–5 build on federation primitive
 
 Whitepaper v1.1 §12 priorities, in its stated order:
 
-- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. **72 workloads, 11 areas, 11 FULL, zero recorded gaps — the W7 wave extended it, brought the real-peer failover drill into CI, and closed every remaining gap (see §W7).**
+- [x] **W5.3** Gold validation suite. Versioned pack, one `make test-gold`. Built so it cannot report a vacuous pass: exit 0 without a declared evidence line is a FAIL, known-bug probes need a mandatory ref and cannot launder their own breakage, known-fail needs the documented failure text. The W7 wave extended it to 72 workloads across 11 areas, including a real-peer failover drill. That drill checks takeover and survival of a preseeded key; it does not demonstrate live write duplication (see §W7).
 
 ### W6 — Operator browser: generalized DB browser + cluster/federation viewer
 
@@ -587,7 +587,14 @@ unblocks first:
 - [x] **Embedding-backed semantic recall** — landed in the parallel wave ("built this cycle"): BM25 | SEMANTIC | HYBRID with a provider interface and the honestly-named deterministic lexical `builtin-lexical-256` embedder; RRF fusion; every mode resolves candidates through the same authorization-aware read so an embedding cannot leak what the principal cannot see; vectors bound to their producing embedder
 - [x] **Automated config-drift healing** — the documented residual ("the open()-time member list is trusted as the fold baseline; editing it behind an existing record file's back is not detected") is closed: record creation pins a running FNV-1a digest of the baseline (members ∥ roles ∥ weights — role/weight drift from item 7 is caught too) as a `B` line right after the header; every open compares it and a drifted baseline FAILS CLOSED with a named diagnostic before any log replays over it; pre-W7 record files carry no B line and are tolerated unchanged; evidence: `make test-consensus` — new `test_baseline_drift` (same baseline reopens; role-drift and swapped-member drift both refused; sed-stripped pre-W7 file opens), full suite green, determinism hash stable across runs (ff322d346)
 - [x] **Brain federation-journal migration** — landed in the parallel wave as W3.4: observations and signed decisions on the federation journal, no action without a journaled pre-condition (byte-exact round-trip check), ML-DSA-87 over decisions, deterministic against the old library (see §W3)
-- [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with duplicated keys surviving; the discovery and loadshift drills were then made hermetic too (loopback --self-spawn), closing that remainder outright. Final board: **72/72 workloads pass, 11/11 areas FULL, zero recorded gaps** — the last gap (backend busy time) closed with `qihse_backend_busy_microseconds_total` (commit 812fa41), and the three multi-process drills were hardened to run reliably under CPU starvation (by-condition readiness waits, leak-proof teardown, 900 s pack timeouts; verified green at load average 80). Evidence: `make test-gold` — VERDICT: PASS, 0 failed, 0 stale, 0 known-bug
+- [x] **Gold validation suite — W7 surfaces landed, real-peer failover in CI** — the stale "all 8 PARTIAL" board was already 60/60 green across 11 areas; W7 adds 7 workloads (consensus membership incl. roles/joint/drift, snapshot transfer, ingest contract in distributed-failure; browser negative-auth, QKP identity, feed wire in security-regressions) and — closing the recorded multi-process gap — the self-spawning failover drill, which SIGKILLs a REAL loopback daemon peer and proves the successor takes all 16384 slots with a preseeded key surviving; the discovery drill and loadshift refusal guard were then made hermetic too (loopback --self-spawn). Final board: **72/72 workloads pass, 11/11 areas FULL, no gold-pack gaps recorded at that time** — the last gap (backend busy time) closed with `qihse_backend_busy_microseconds_total` (commit 812fa41), and the three multi-process drills were hardened to run reliably under CPU starvation (by-condition readiness waits, leak-proof teardown, 900 s pack timeouts; verified green at load average 80). Evidence: `make test-gold` — VERDICT: PASS, 0 failed, 0 stale, 0 known-bug
+
+Pinned QKP replica pull requires a read-only replica. Authenticated write duplication to a promotable cluster successor and pinned-QKP data-bearing slot transfer remain unimplemented; the failover and loadshift guards do not close those integration gaps.
+
+### CT — Secure cluster transport follow-ups (open)
+
+- [ ] **CT.1 — Replicate writes to a promotable successor:** replace the disabled cleartext `--redundancy-peer` path with authenticated, pinned QKP transport and a durable, replay-safe write stream. Preserve classification, SCI, tenant and principal boundaries at the receiving store. Demonstrate a write on the lead reaching the successor before promotion, then kill the lead and read the surviving value. Include low-clearance/high-data and forged-peer negatives, lost replies, restart, duplicate delivery and lag reporting. The current failover smoke verifies takeover of a preseeded value only.
+- [ ] **CT.2 — Secure data-bearing slot transfer:** replace legacy RESP credential replay with pinned QKP migration, explicit authenticated context on enumeration and target writes, and a recovery protocol that cannot strand keys or publish ownership before data is available. Test partial transfer, target failure, reconnect, rollback/reconciliation, classification/SCI denial and concurrent writes. The current `MOVESLOTS` guard refuses unavailable transfer before changing ownership and permits empty-range reassignment; it is not a live data-migration success test.
 
 ---
 
@@ -652,19 +659,19 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 
 **Existing substrate — reuse and verify:** the roadmap already records ACID transactions, MVCC, cross-engine coordination, indexes, CDC, backup/PITR, federation, and AIMEM history. Establish their actual coverage through public interfaces before extending them. W10's single-record CAS and per-row durable import do not establish arbitrary cross-record atomicity.
 
-**SQL foundation slice (2026-10-21):** SERIALIZABLE OCC now retains committed point-write summaries until every active serialization snapshot has advanced, so a concurrent writer cannot disappear after commit. Terminal commit/rollback races have one mutex-serialized winner. The mutable row store has failure-atomic updates and generation-fenced transaction shadows, and UWP SQL uses them for one-table INSERT/UPDATE/DELETE with private uncommitted state, COMMIT, ROLLBACK, disconnect rollback and conflict abort. DML revalidates the active principal and enforces WRITE ACLs; direct TXN commands revalidate revocation; connection AUTH cannot replace identity during a transaction; SQL and SCHEMA mutations require an active Operator, while schema metadata requires READ. Unsupported SQL savepoints, transaction-time DDL and local-resource PREPARE fail closed. This advances W11.1 and W11.5 but does not close either item: real authorized SELECT, savepoint data restoration, multi-table commit, SQL WAL/restart durability and pgwire transaction integration remain open.
+**SQL foundation slice (2026-10-21; multi-table extension and row-read slice 2026-10-24):** SERIALIZABLE OCC retains committed point-write summaries until every active serialization snapshot has advanced, so a concurrent writer cannot disappear after commit. Terminal commit/rollback races have one mutex-serialized winner. The mutable row store has failure-atomic updates and generation-fenced transaction shadows; grouped commit publishes up to 16 distinct table shadows atomically in memory, and UWP SQL enlists them for INSERT/UPDATE/DELETE with private uncommitted state, COMMIT, ROLLBACK, disconnect rollback and conflict abort. Autocommit SQL SELECT supports a bounded single-table projection/filter path behind table READ ACLs; joins, aggregates, ordering, expressions, CTEs, and SELECT inside transactions fail closed. DML revalidates active principals and enforces WRITE ACLs; SELECT enforces READ ACLs at dispatch and scan; direct TXN commands revalidate revocation; connection AUTH cannot replace identity during a transaction; SQL and SCHEMA mutations require an active Operator. Unsupported SQL savepoints, transaction-time DDL and local-resource PREPARE fail closed. The context-backed PG wire handler supports transaction controls and routes bounded SELECT/DML through the authenticated UWP context. Its public TCP listener accepts one client per caller-managed accept call; both the handler and listener have low-clearance denial and payload non-disclosure coverage. This SQL/PG surface serves a separate application integration and is not the persistence adapter for `i2p-telegram`. This advances W11.1 and W11.5 but does not close either item: transactional SELECT isolation, savepoint data restoration, cross-model commit, SQL WAL/restart durability and durable retries/idempotency remain open.
 
-- [ ] **W11.0 — Capability and guarantee map:** trace each supported model and public API to its transaction boundary, isolation level, durability acknowledgement, authorization enforcement, retry behavior, and recovery path. Record working evidence and unsupported combinations. Define representative workloads and numerical latency, throughput, resource, recovery-time, and recovery-point acceptance budgets before implementation measurements.
-- [~] **W11.1 — Consistent application transactions:** close demonstrated gaps in atomic updates across participating models and interfaces. One-table UWP SQL DML now has private transaction shadows, rollback, generation-fenced commit and retained committed-write OCC; cross-table/model atomicity, WAL recovery and pgwire integration remain. Prove that an order, stock reservation, and durable outbound event commit together, and that a fuzzing finding, reproducer reference, and provenance commit together. Test concurrency, constraint violations, retries, lost replies, crashes, and recovery without partial committed state or duplicate logical operations. External payment and message delivery remain explicit application workflows; a database transaction cannot atomically commit an external service. Document asynchronous search projections and their freshness separately from authoritative commits.
+- [x] **W11.0 — Capability and guarantee map:** trace supported models and public APIs to transaction boundaries, isolation, durability acknowledgement, authorization, retry, and recovery. Record working evidence and unsupported combinations; define representative workloads and proposed numerical latency, throughput, resource, recovery-time, and recovery-point budgets before measurement. See [the capability and guarantee map](docs/plans/qihse_application_capability_map.md). Budgets are targets, not measured results.
+- [~] **W11.1 — Consistent application transactions:** close demonstrated gaps in atomic updates across participating models and interfaces. UWP SQL DML now enlists up to 16 row-store tables and grouped commit validates all generations before publishing every shadow under the participating table locks; this is in-memory row-store atomicity. Autocommit single-table SELECT is now authorized at table READ ACLs, while transactional read visibility remains unsupported. A context-backed PG handler and caller-managed TCP listener provide transaction controls, disconnect rollback, and authenticated bounded SELECT/DML for a separate SQL consumer. `i2p-telegram` uses the native principal-bearing QIHSE adapter and ordered consensus bridge; its checkout requirement is tracked in its own server roadmap and is not satisfied by this SQL/PG slice. WAL append/flush/replay/checkpoint/rotation now report sync failures, but a failed append may already have written bytes and SQL row-store redo/recovery remains absent. Cross-model commit and SQL durable recovery remain. Prove that an order, stock reservation, and durable outbound event commit together, and that a fuzzing finding, reproducer reference, and provenance commit together. Test concurrency, constraint violations, retries, lost replies, crashes, and recovery without partial committed state or duplicate logical operations. External payment and message delivery remain explicit application workflows; a database transaction cannot atomically commit an external service. Document asynchronous search projections and their freshness separately from authoritative commits.
 - [ ] **W11.2 — Isolation between workloads:** enforce scoped CPU, memory, I/O, storage, and concurrency budgets with bounded queues and explicit backpressure. Run bulk finding ingestion and vector-index rebuilds alongside checkout, inventory updates, and memory retrieval; demonstrate the W11.0 latency and resource budgets under contention, including slow storage. Report hardware, dataset sizes, load, errors, throughput, and p50/p95/p99 latency.
 - [ ] **W11.3 — Safe online evolution:** expose progress, compatibility requirements, cancellation boundaries, and recovery for schema changes, index builds, record migrations, and rolling upgrades. Prove resumable interruption, mixed-version behavior, and safe cutover under concurrent application traffic. Specify reversibility per operation; validate restore or forward recovery where reversal is unavailable.
 - [ ] **W11.4 — Authorized history across models:** provide bounded historical reads and dependency traversal for supported models, with explicit retention, time/version meaning, and consistency boundaries. Demonstrate inventory state before an import and findings derived from a particular binary version. Reuse existing lineage facilities; enforce current tenant, clearance, SCI, and revocation policy on historical records, relations, counts, exports, and restored data.
-- [~] **W11.5 — Coherent developer and operator interfaces:** UWP SQL/TXN/SCHEMA now align active-principal checks, mutation ACLs, revocation behavior and unsupported transaction errors, with adapter-level negative coverage. Continue by aligning SDK transaction and retry behavior, typed errors, migration tooling, and query explanations with W11.0 guarantees. Extend Studio to inspect slow queries, resource budgets, permissions, replication, migration progress, and recovery state. Provide runnable examples for commerce, inventory, fuzzing, and memory consumers; CI must exercise their actual public APIs and negative authorization paths.
+- [~] **W11.5 — Coherent developer and operator interfaces:** UWP SQL/TXN/SCHEMA align active-principal checks, mutation ACLs, revocation behavior and unsupported transaction errors, with adapter-level negative coverage. The Rust SDK now has authenticated PostgreSQL startup and wire-backed query, execution, prepare, and transaction calls; it has unit coverage but still needs live QIHSE integration coverage. The Python PG adapter now authenticates at startup, consumes complete server responses, preserves state on failed transaction controls, and has eight focused protocol tests. The context-backed PG handler and caller-managed TCP listener now support authenticated transaction controls and bounded SELECT/DML, with low-clearance denial and no-payload-disclosure tests over both socketpair and TCP. The listener sends PostgreSQL cleartext-password auth and has no TLS; bind it to loopback or place it behind a trusted tunnel/proxy. The listener is for separate PostgreSQL clients; `i2p-telegram` uses its native principal-bearing QIHSE FFI and consensus bridge instead. The W11 inventory reservation example runs against public UWP SQL APIs and has a CI workflow, but demonstrates only in-memory row-store atomicity. Typed errors, migration tooling, query explanations, Studio coverage, live application integration, three additional application examples, and broader CI tests through those public APIs remain open.
 - [ ] **W11.6 — Combined workload and failure proof:** run all four representative workloads concurrently, interrupt and restart nodes, inject partitions and storage faults, rebuild indexes, and restore an authenticated backup into an isolated test deployment. Check recorded histories against declared consistency guarantees, stock/order invariants, finding/provenance integrity, tenant isolation, and the agreed performance/recovery budgets. Publish reproducible commands, seeds, workload definitions, hardware, results, and remaining limitations; a happy-path demonstration alone does not close this item.
 
 **Architecture constraints:** preserve local survivability and no global quorum gate on ordinary LOCAL writes. Declare which exclusive operations require ownership or coordination and fail those operations closed when unavailable. Application scheduling, payments, build execution, and cluster management remain outside QIHSE. All new access surfaces inherit §5 security gates.
 
-**Sequence:** W11.0 → W11.1–W11.5 according to demonstrated gaps and dependencies → W11.6. Build the combined workload harness early and extend it as capabilities land. Detailed designs and acceptance budgets belong in `docs/plans/` when this workstream enters implementation.
+**Sequence:** W11.0 → W11.1–W11.5 according to demonstrated gaps and dependencies → W11.6. Build the combined workload harness early and extend it as capabilities land. W11.0's baseline map and proposed budgets are in [the application capability map](docs/plans/qihse_application_capability_map.md); revise targets only with recorded measurement evidence.
 
 ---
 
@@ -692,7 +699,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 
 ## 4. Sequencing
 
-**Historical W0–W10 sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
+**Historical W0–W10 checklist sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Cluster transport follow-ups:** CT.1 and CT.2 require pinned QKP designs and may proceed independently of W11. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
 
 | Horizon | Work | Why now |
 |---|---|---|
@@ -702,6 +709,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 | **Later** | F6, then F7 | Supply-chain substrate needs journal + leases + trust; chaos/regression budgets gate the whole thing |
 | **Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
 | **QIHSE AIMEM lane (complete)** | QH-00 through QH-09 complete; QH-10 conditional gate not triggered | Durable scoped lifecycle, coordination, lineage, querying, maintenance, archives and assurance are integrated and tested |
+| **Cluster transport follow-ups** | CT.1–CT.2 planned | Pinned QKP write replication to a promotable successor and recoverable data-bearing slot migration |
 | **Active stretch program** | W11.0–W11.6; W11.1 and W11.5 partial | General database guarantees across application models, workload isolation, online evolution, history, developer tooling, and combined failure validation |
 | **Optional vector-index research lane** | W12.0 baseline and W12.1 isolated reference in progress; W12.2–W12.6 planned | Independent TurboQuant candidate index with authenticated pre-top-K filtering, FP32 rerank, benchmark-gated optional SIMD/Vulkan and reversible sidecars |
 
@@ -753,6 +761,71 @@ From the federation plan (§3, non-negotiable):
 10. Signing authority and build execution are external; QIHSE records provenance, it does not sign or execute.
 
 ---
+
+## 6a. ISA capability policy (measured 2026-10-23)
+
+Three places could decide "does this machine support AVX-512 / AVX2+FMA / VNNI /
+AMX", and each has a different job. The rule is: **code decides correctness,
+the Makefile decides what gets compiled, tests decide what to skip** — never the
+other way round.
+
+| layer | mechanism | measured cost | why there |
+|---|---|---|---|
+| runtime | `qihse_cpu_has_feature(&info, …)` over a CPUID-derived struct (`backends/cpu/qihse_cpu_detect.c`), consulted by the dispatcher before entering an ISA kernel | **7.7 ns/call** (10M calls) — ~10⁴–10⁵× cheaper than one vector kernel | a binary built on a rich host still runs correctly on a poorer one; this is the only place correctness can be guaranteed |
+| build | one requirement **group** per ISA in the Makefile via `cpu_has_all`; an ISA is compiled only when *every* flag its codegen needs is advertised | 5.6 ms once per `make` invocation (single `/proc/cpuinfo` parse, shared with `HOST_CPU_FLAGS`); zero per-target cost because the gate is parse-time `ifeq` | `-mavx2 -mfma` on a host without FMA produces code that cannot run; the flag set and the codegen must agree |
+| tests | per-ISA preflight: `ifeq ($(QIHSE_ENABLE_<ISA>),1)` around the recipe, else print `SKIP …` and succeed | **net −20 s per full suite run** on an AVX-only host (amx-only 5 s, avx512-direct 4 s, vnni-only 5 s, zen-epyc 5 s, all-isa 1 s were previously compiled, executed and killed by SIGILL) | a hardware capability the host lacks is not a test failure; SIGILL noise hides real regressions |
+
+Requirement groups (all ISAs use the same rule; AVX-512 was the only one that did
+before this change):
+
+    AVX      : avx
+    AVX2     : avx2 fma
+    AVX512   : avx512f avx512dq avx512bw avx512vl fma
+    AVX-VNNI : avx2 avx_vnni
+    AMX      : amx_tile amx_int8 amx_bf16
+    F16C     : avx f16c
+
+On an Ivy-Bridge host (AVX only) this resolves to `AVX=1 AVX2=0 AVX512=0 VNNI=0
+AMX=0 F16C=1` and the build emits exactly `-mavx` — detection and codegen agree.
+
+### The arithmetic (so the policy is checkable, not hand-waved)
+
+    overhead_per_call = C_check × c_check
+    overhead_ratio    = (C_check × c_check) / (C_check × c_check + W_kernel)
+
+* Measured on the Ivy-Bridge host (20M-iteration microbench, then a real
+  384-dim workload): the call itself (direct **or** function-pointer) costs
+  ≈ 7.6–8.0 ns and an **inline** capability guard on the hot path adds
+  **0.0–0.4 ns — pure noise** (a predicted branch on a cached flag is hidden by
+  out-of-order execution). The 7.7 ns figure is a full helper *function call*;
+  never call the helper per invocation — inline the flag.
+* Real 384-dim kernels (bge-small embedder dims, the deployed workload):
+  scalar ≈ 917 ns/call, AVX ≈ 133 ns/call, AVX-512-shaped ≈ 111 ns/call.
+  A 100-query × 1 000-candidate run (10⁵ calls) therefore takes ≈ 92.6 ms
+  scalar / 13.3 ms AVX / ≈10 ms AVX-512 — while the *entire* dispatch overhead
+  for that run (resolve-once) is ≈ 10 µs and guard-per-call ≈ 20 µs: **0.1%**.
+* Conclusion: dispatch strategy is a rounding error. The kernel width is the
+  entire game (AVX512 vs AVX saves ~5 ms/run, AVX vs scalar ~79 ms/run — 500×
+  more than the whole dispatch budget). Choose dispatch by engineering merit,
+  never by these numbers: resolve once per pathway (the distance-path pattern)
+  because it costs ~5 µs per process and makes cross-host binaries safe; keep
+  the Makefile groups because they save build time and binary size on native
+  builds; never guard inside the hot loop because it buys nothing the
+  resolve-once pattern does not already give.
+* **Skipped sets on a native build cost nothing at runtime**: "compile it
+  natively only" is the whole point — an ISA the host does not advertise is
+  eliminated by the build (`QIHSE_ENABLE_<ISA>=0` → no code, no guard, no
+  branch), so a host with many skipped sets pays *fewer* per-call checks, not
+  more. Skips only ever save: each one removes compile time, the old SIGILL
+  seconds in the suite, and the kernel's bytes from the binary.
+* AMX is the extreme case: the guard is ~8 ns; the AMX state it protects costs
+  ~0.1–1 µs to save/restore (`xrstor`/`xsave` of tile state). Guarding it is
+  three orders of magnitude cheaper than the thing being guarded.
+
+**Do not** move capability checks into the Makefile for correctness, and do not
+let a test fail because the CPU lacks an ISA it never advertised. When adding an
+ISA: add its flag group to `cpu_has_all`, add the runtime feature bit, and gate
+its test on the generated `QIHSE_ENABLE_*` switch.
 
 ## 7. Non-goals
 

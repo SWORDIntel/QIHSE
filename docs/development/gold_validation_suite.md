@@ -21,8 +21,9 @@ GOLD_STRICT=1 make test-gold   # known defects, stale expectations and gaps exit
 LD_LIBRARY_PATH=. ./tests/gold/gold_runner [--strict] <pack>   # run a pack directly
 ```
 
-`make test` runs `test-gold` as its last prerequisite (it adds roughly 80-90
-seconds to that aggregate). The default verdict is
+`make test` includes `test-gold` among its prerequisites. In the 2026-10-24
+run, the 72 workloads consumed 828.5 seconds in total, excluding build time;
+allow at least 15 minutes for the gold pack on this host. The default verdict is
 green when no workload failed, could not run, or timed out — known defects and
 recorded gaps are printed as caveats. `GOLD_STRICT=1` (or `--strict`) makes any
 non-green state fatal so a release gate cannot ignore them.
@@ -76,29 +77,30 @@ gap <id> area=<id> reason="<why this cannot be tested today>"
   reason is also written to stderr.
 * exit **2** — `--strict`/`GOLD_STRICT=1` and the verdict is not fully green.
 
-## Coverage of the areas named by W5.3
+## Current pack coverage
 
-The pack has grown from the eight areas W5.3 named to nine: `ai-fabric` was
-added after three shipped fabric features were found to be correct code
-resolving to nothing for three commits, and nothing reported it. The table
-below is the current state of the pack: 42 workloads, every one declared
-`expect=pass`, and 9 recorded gaps. The counts are read from
-`tests/gold/pack.v1.gold`; run `make test-gold` for the runtime verdict.
+The 2026-10-24 pack declares 72 `expect=pass` workloads in 11 areas and no
+`gap` entries. The clean aggregate run passed all 72. These are pack counts,
+not a claim that every planned QIHSE capability exists: the failover smoke
+uses a preseeded copy and the loadshift guard asserts refusal of an unavailable
+data-bearing transfer. [CT.1–CT.2](../../ROADMAP.md#ct--secure-cluster-transport-follow-ups-open)
+track those secure transport gaps.
 
-| Area | Workloads | Declared | What is not covered (recorded as `gap`) |
-|---|---|---|---|
-| ANN + rerank | 3 | 3 pass | — |
-| Relational | 6 | 6 pass | no end-to-end SQL-over-storage test: SQL INSERT does not yet populate the mutable row store that UPDATE/DELETE execute against |
-| Graph | 1 | 1 pass | `qihse_graph_vector.c` (graph+vector hybrid) has no test |
-| FTS + vector fusion | 2 | 2 pass | fusion is in-process only; no adapter/server path and no fused-ranking gate |
-| Persistence / recovery | 3 | 3 pass | — |
-| Protocol compatibility | 5 | 5 pass | RESP/HTTP/ES/ClickHouse/Influx end-to-end compatibility; no Bolt negative-authorization test (invariant 3) |
-| Distributed failure | 4 | 4 pass | scenarios are in-process simulation; no real multi-process peer kill |
-| Security regressions | 15 | 15 pass | 8 of the 16 `tests/security-regression.mk` targets are runnable but omitted to bound the default run |
-| AI fabric | 3 | 3 pass | no remote job dispatch; `inference` and `index-build` have no executor |
+| Area | Workloads |
+|---|---:|
+| ANN + rerank | 3 |
+| Relational | 7 |
+| Graph | 2 |
+| FTS + vector fusion | 4 |
+| Persistence / recovery | 3 |
+| Protocol compatibility | 7 |
+| Distributed failure | 10 |
+| Security regressions | 26 |
+| AI fabric | 5 |
+| Overlay discovery | 2 |
+| Observability | 3 |
 
-Every gap is also printed by the runner and counted in the verdict, so the
-suite cannot report an untested area as covered.
+Every declared gap is printed by the runner and counted in the verdict.
 
 ## Defects that were recorded and have since been fixed
 

@@ -36,11 +36,14 @@
 #include "qihse_sql_parser.h"
 #include "qihse_schema.h"
 #include "qihse_optimizer.h"
+#include "qihse_uwp_sql_txn_schema.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #ifndef _WIN32
@@ -70,6 +73,12 @@
 static SSL_CTX* global_pqc_ssl_ctx __attribute__((unused)) = NULL;
 static __thread SSL* current_ssl = NULL;
 
+typedef struct {
+    qihse_uwp_context_t* uwp;
+    qihse_txn_t* txn;
+    bool failed;
+} pg_transaction_session_t;
+
 /* Extract the IPv4 source address of the peer connected to fd, in host
  * byte order. Returns 0 if the address cannot be determined (in which
  * case the auth rate limiter falls back to its global singleton entry).
@@ -98,6 +107,13 @@ typedef struct {
     qihse_column_store_t* col;
     qihse_cluster_topology_t* topo;
 } pg_cluster_context_t;
+
+struct qihse_pg_wire_listener {
+    int fd;
+    uint16_t port;
+    qihse_uwp_context_t* uwp;
+    qihse_cluster_topology_t* topo;
+};
 
 /* Write exactly n bytes, retrying on EINTR / short writes. */
 static int pg_write_all(int fd, const void* buf, size_t n) {
@@ -253,9 +269,14 @@ static int pg_send_backend_key_data(int fd, int32_t pid, int32_t secret) {
     return rc;
 }
 
-static int pg_send_ready_for_query(int fd) {
-    uint8_t body[1] = {'I'};
+static int pg_send_ready_for_query_state(int fd, char status) {
+    if (status != 'I' && status != 'T' && status != 'E') return -1;
+    uint8_t body[1] = {(uint8_t)status};
     return pg_send_msg(fd, 'Z', body, 1);
+}
+
+static int pg_send_ready_for_query(int fd) {
+    return pg_send_ready_for_query_state(fd, 'I');
 }
 
 static int pg_send_row_description(int fd, const char** field_names, const int32_t* type_oids, int16_t ncols) {
@@ -337,7 +358,377 @@ static void str_rtrim_semi(char* s) {
     }
 }
 
-static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx, const char* raw_query, qihse_user_t* user) {
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+    bool failed;
+} pg_uwp_capture_t;
+
+#define PG_UWP_CAPTURE_MAX (1024u * 1024u)
+
+static ssize_t pg_uwp_capture_write(void* opaque, const void* data, size_t len) {
+    pg_uwp_capture_t* capture = (pg_uwp_capture_t*)opaque;
+    if (!capture || (!data && len) || len > PG_UWP_CAPTURE_MAX - capture->len) {
+        if (capture) capture->failed = true;
+        return -1;
+    }
+    size_t needed = capture->len + len + 1u;
+    if (needed > capture->cap) {
+        size_t cap = capture->cap ? capture->cap : 128u;
+        while (cap < needed) {
+            if (cap > PG_UWP_CAPTURE_MAX / 2u) {
+                cap = PG_UWP_CAPTURE_MAX + 1u;
+                break;
+            }
+            cap *= 2u;
+        }
+        char* next = (char*)realloc(capture->data, cap);
+        if (!next) {
+            capture->failed = true;
+            return -1;
+        }
+        capture->data = next;
+        capture->cap = cap;
+    }
+    if (len) memcpy(capture->data + capture->len, data, len);
+    capture->len += len;
+    capture->data[capture->len] = '\0';
+    return (ssize_t)len;
+}
+
+static char pg_txn_ready_status(const pg_transaction_session_t* session) {
+    if (!session || !session->txn) return 'I';
+    return session->failed ? 'E' : 'T';
+}
+
+static int pg_send_error_ready(int fd, pg_transaction_session_t* session,
+                               const char* state, const char* message,
+                               bool abort_transaction) {
+    if (abort_transaction && session && session->txn) session->failed = true;
+    if (pg_send_error(fd, "ERROR", state, message) < 0) return -1;
+    return pg_send_ready_for_query_state(fd, pg_txn_ready_status(session));
+}
+
+static bool pg_has_multiple_statements(const char* sql) {
+    bool single = false;
+    bool quoted = false;
+    for (const char* p = sql; *p; ++p) {
+        if (single) {
+            if (*p == '\'' && p[1] == '\'') { ++p; continue; }
+            if (*p == '\'') single = false;
+            continue;
+        }
+        if (quoted) {
+            if (*p == '"' && p[1] == '"') { ++p; continue; }
+            if (*p == '"') quoted = false;
+            continue;
+        }
+        if (*p == '\'') { single = true; continue; }
+        if (*p == '"') { quoted = true; continue; }
+        if (*p == ';') {
+            for (const char* tail = p + 1; *tail; ++tail)
+                if (!isspace((unsigned char)*tail) && *tail != ';') return true;
+        }
+    }
+    return false;
+}
+
+static uint8_t pg_txn_isolation(const char* sql) {
+    if (strcasestr(sql, "SERIALIZABLE")) return QIHSE_ISO_SERIALIZABLE;
+    if (strcasestr(sql, "REPEATABLE READ")) return QIHSE_ISO_REPEATABLE_READ;
+    return QIHSE_ISO_READ_COMMITTED;
+}
+
+static int pg_handle_txn_control(int fd, const char* sql,
+                                 const qihse_sql_ast_t* ast,
+                                 qihse_user_t* user,
+                                 pg_transaction_session_t* session) {
+    if (!session || !ast || !session->uwp) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "transaction commands require a configured shared SQL context",
+                                   false);
+    }
+    qihse_uwp_context_t* ctx = session->uwp;
+    qihse_txn_t** txn = &session->txn;
+    if (!ctx->txn_manager) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "transaction manager is not configured", false);
+    }
+    if (pg_has_multiple_statements(sql)) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "multiple statements in one query are unsupported",
+                                   session->txn != NULL);
+    }
+
+    uwp_sts_result_t status = UWP_STS_ERR_FAILED;
+    uint8_t isolation = pg_txn_isolation(sql);
+    if (ast->stmt_type == QIHSE_SQL_BEGIN) {
+        if (session->txn) {
+            return pg_send_error_ready(fd, session, "25001",
+                                       "a transaction is already in progress", true);
+        }
+        if (session->failed || (ast->util &&
+            (ast->util->flags & QIHSE_UTIL_READ_ONLY))) {
+            return pg_send_error_ready(fd, session, "0A000",
+                                       "failed or read-only transactions are unsupported", false);
+        }
+        status = uwp_dispatch_txn(ctx, 0x01, &isolation, 1, txn, user,
+                                  fd, NULL, NULL);
+        if (status != UWP_STS_OK || !session->txn) {
+            return pg_send_error_ready(fd, session, "25000",
+                                       "could not begin transaction", false);
+        }
+        session->failed = false;
+        if (pg_send_command_complete(fd, "BEGIN") < 0) return -1;
+        return pg_send_ready_for_query_state(fd, 'T');
+    }
+
+    if (!session->txn) {
+        return pg_send_error_ready(fd, session, "25P01",
+                                   "there is no transaction in progress", false);
+    }
+
+    if (ast->stmt_type == QIHSE_SQL_COMMIT) {
+        if (session->failed) {
+            /* PostgreSQL treats COMMIT in an aborted transaction as ROLLBACK. */
+            (void)qihse_txn_rollback((qihse_txn_manager_t*)ctx->txn_manager,
+                                     session->txn);
+            session->txn = NULL;
+            session->failed = false;
+            if (pg_send_command_complete(fd, "ROLLBACK") < 0) return -1;
+            return pg_send_ready_for_query_state(fd, 'I');
+        }
+        status = uwp_dispatch_txn(ctx, 0x02, NULL, 0, txn, user, fd, NULL, NULL);
+        if (status != UWP_STS_OK) {
+            if (!session->txn) session->failed = false;
+            else session->failed = true;
+            return pg_send_error_ready(fd, session, "40001", "transaction commit failed",
+                                       session->txn != NULL);
+        }
+        session->failed = false;
+        if (pg_send_command_complete(fd, "COMMIT") < 0) return -1;
+        return pg_send_ready_for_query_state(fd, 'I');
+    }
+
+    if (ast->stmt_type == QIHSE_SQL_ROLLBACK) {
+        /* Rollback is safe even after principal revocation: it only discards
+         * this connection's private transaction state. */
+        int rc = qihse_txn_rollback((qihse_txn_manager_t*)ctx->txn_manager,
+                                    session->txn);
+        if (rc != 0) {
+            return pg_send_error_ready(fd, session, "25000", "transaction rollback failed",
+                                       true);
+        }
+        session->txn = NULL;
+        session->failed = false;
+        if (pg_send_command_complete(fd, "ROLLBACK") < 0) return -1;
+        return pg_send_ready_for_query_state(fd, 'I');
+    }
+
+    return pg_send_error_ready(fd, session, "0A000", "unsupported transaction command", true);
+}
+
+static int pg_handle_sql_dml(int fd, const char* sql, qihse_user_t* user,
+                             pg_transaction_session_t* session,
+                             const qihse_sql_ast_t* ast) {
+    if (!session || !session->uwp || !session->uwp->sql_engine ||
+        !session->uwp->schema || !session->uwp->txn_manager) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "SQL row-store context is not configured",
+                                   session && session->txn);
+    }
+    if (pg_has_multiple_statements(sql)) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "multiple statements in one query are unsupported",
+                                   session->txn != NULL);
+    }
+    if (session->failed) {
+        return pg_send_error_ready(fd, session, "25P02",
+                                   "current transaction is aborted; rollback required",
+                                   false);
+    }
+
+    pg_uwp_capture_t capture = {0};
+    uwp_sts_result_t status = uwp_dispatch_sql(session->uwp, 0x02,
+        (const uint8_t*)sql, strlen(sql) + 1u, &session->txn, user, fd,
+        pg_uwp_capture_write, &capture);
+    if (status != UWP_STS_OK || capture.failed || !capture.data ||
+        strncmp(capture.data, "OK stmt_type=", 13) != 0) {
+        free(capture.data);
+        if (session->txn) session->failed = true;
+        return pg_send_error_ready(fd, session,
+            status == UWP_STS_ERR_PERM ? "42501" : "42000",
+            "QIHSE SQL statement failed or was refused",
+            session->txn != NULL);
+    }
+
+    const char* type = qihse_sql_stmt_name(ast->stmt_type);
+    const char* rows_text = strstr(capture.data, " rows=");
+    unsigned long long rows = 0;
+    if (rows_text) {
+        char* end = NULL;
+        rows = strtoull(rows_text + 6, &end, 10);
+        if (end == rows_text + 6 || (*end != '\n' && *end != '\0')) {
+            free(capture.data);
+            if (session->txn) session->failed = true;
+            return pg_send_error_ready(fd, session, "XX000",
+                                       "malformed SQL executor response",
+                                       session->txn != NULL);
+        }
+    } else {
+        free(capture.data);
+        if (session->txn) session->failed = true;
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "SQL executor omitted affected-row count",
+                                   session->txn != NULL);
+    }
+    free(capture.data);
+
+    char command[64];
+    if (ast->stmt_type == QIHSE_SQL_INSERT)
+        snprintf(command, sizeof(command), "INSERT 0 %llu", rows);
+    else if (ast->stmt_type == QIHSE_SQL_UPDATE)
+        snprintf(command, sizeof(command), "UPDATE %llu", rows);
+    else if (ast->stmt_type == QIHSE_SQL_DELETE)
+        snprintf(command, sizeof(command), "DELETE %llu", rows);
+    else
+        snprintf(command, sizeof(command), "%s %llu", type ? type : "UPDATE", rows);
+    if (pg_send_command_complete(fd, command) < 0) return -1;
+    return pg_send_ready_for_query_state(fd, pg_txn_ready_status(session));
+}
+
+static int pg_handle_sql_select(int fd, const char* sql, qihse_user_t* user,
+                                pg_transaction_session_t* session) {
+    if (!session || !session->uwp || !session->uwp->sql_engine ||
+        !session->uwp->schema || !session->uwp->txn_manager) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "SQL row-store context is not configured", false);
+    }
+    if (session->txn) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "transactional SELECT is unsupported", true);
+    }
+    if (pg_has_multiple_statements(sql)) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "multiple statements in one query are unsupported", false);
+    }
+
+    pg_uwp_capture_t capture = {0};
+    uwp_sts_result_t status = uwp_dispatch_sql(session->uwp, 0x02,
+        (const uint8_t*)sql, strlen(sql) + 1u, NULL, user, fd,
+        pg_uwp_capture_write, &capture);
+    if (status != UWP_STS_OK || capture.failed || !capture.data) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session,
+            status == UWP_STS_ERR_PERM ? "42501" : "42000",
+            "QIHSE SQL statement failed or was refused", false);
+    }
+
+    /* UWP's bounded row-store SELECT response is header + zero or more rows
+     * + an explicit count footer. Convert that text boundary into PostgreSQL
+     * RowDescription/DataRow messages only after validating the full shape. */
+    char* footer = strstr(capture.data, "\nOK stmt_type=SELECT rows=");
+    char* header_end = strchr(capture.data, '\n');
+    if (!footer || !header_end || footer < header_end) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "malformed SQL executor response", false);
+    }
+    char* count_end = NULL;
+    unsigned long long expected_rows = strtoull(
+        footer + sizeof("\nOK stmt_type=SELECT rows=") - 1u, &count_end, 10);
+    if (!count_end || count_end == footer + sizeof("\nOK stmt_type=SELECT rows=") - 1u ||
+        (*count_end != '\n' && *count_end != '\0') ||
+        (*count_end == '\n' && count_end[1] != '\0')) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "malformed SQL executor row count", false);
+    }
+
+    const size_t max_columns = 64u;
+    const char* names[64];
+    int32_t type_oids[64];
+    int16_t ncols = 0;
+    *header_end = '\0';
+    char* p = capture.data;
+    while (p <= header_end && ncols < (int16_t)max_columns) {
+        char* tab = strchr(p, '\t');
+        char* end = tab && tab < header_end ? tab : header_end;
+        names[ncols] = p;
+        type_oids[ncols] = 25; /* text */
+        ncols++;
+        if (end == header_end) break;
+        *end = '\0';
+        p = end + 1;
+    }
+    if (ncols == 0 || (p <= header_end && ncols == (int16_t)max_columns &&
+                       strchr(p, '\t') && strchr(p, '\t') < header_end)) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "54000",
+                                   "too many SELECT result columns", false);
+    }
+
+    size_t actual_rows = 0;
+    for (char* row = header_end + 1; row < footer;) {
+        char* end = strchr(row, '\n');
+        if (!end || end > footer) end = footer;
+        if (end == row) {
+            free(capture.data);
+            return pg_send_error_ready(fd, session, "XX000",
+                                       "malformed SQL executor row", false);
+        }
+        size_t fields = 1u;
+        for (char* q = row; q < end; ++q) if (*q == '\t') fields++;
+        if (fields != (size_t)ncols) {
+            free(capture.data);
+            return pg_send_error_ready(fd, session, "XX000",
+                                       "SQL executor row width mismatch", false);
+        }
+        actual_rows++;
+        row = end < footer ? end + 1 : footer;
+    }
+    if (actual_rows != (size_t)expected_rows) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "SQL executor row count mismatch", false);
+    }
+
+    if (pg_send_row_description(fd, names, type_oids, ncols) < 0) {
+        free(capture.data);
+        return -1;
+    }
+    for (char* row = header_end + 1; row < footer;) {
+        char* end = strchr(row, '\n');
+        if (!end || end > footer) end = footer;
+        if (end < footer) *end = '\0';
+        const char* values[64];
+        char* field = row;
+        for (int16_t i = 0; i < ncols; ++i) {
+            values[i] = field;
+            char* tab = i + 1 < ncols ? strchr(field, '\t') : NULL;
+            if (tab) {
+                *tab = '\0';
+                field = tab + 1;
+            }
+        }
+        if (pg_send_data_row(fd, values, ncols) < 0) {
+            free(capture.data);
+            return -1;
+        }
+        row = end < footer ? end + 1 : footer;
+    }
+
+    char command[64];
+    snprintf(command, sizeof(command), "SELECT %llu", expected_rows);
+    free(capture.data);
+    if (pg_send_command_complete(fd, command) < 0) return -1;
+    return pg_send_ready_for_query_state(fd, 'I');
+}
+
+static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx,
+                               const char* raw_query, qihse_user_t* user,
+                               pg_transaction_session_t* session) {
     char query[4096];
     if (!user) {
         if (pg_send_error(fd, "ERROR", "28000", "authentication required") < 0) return -1;
@@ -348,6 +739,36 @@ static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx, const char* ra
     memcpy(query, raw_query, qlen);
     query[qlen] = '\0';
     str_rtrim_semi(query);
+
+    qihse_sql_ast_t* parsed = qihse_parse_sql_to_ast(query);
+    if (parsed) {
+        int rc = 0;
+        if (parsed->stmt_type == QIHSE_SQL_BEGIN ||
+            parsed->stmt_type == QIHSE_SQL_COMMIT ||
+            parsed->stmt_type == QIHSE_SQL_ROLLBACK) {
+            rc = pg_handle_txn_control(fd, query, parsed, user, session);
+            qihse_sql_ast_free(parsed);
+            return rc;
+        }
+        if (parsed->stmt_type == QIHSE_SQL_INSERT ||
+            parsed->stmt_type == QIHSE_SQL_UPDATE ||
+            parsed->stmt_type == QIHSE_SQL_DELETE) {
+            rc = pg_handle_sql_dml(fd, query, user, session, parsed);
+            qihse_sql_ast_free(parsed);
+            return rc;
+        }
+        if (parsed->stmt_type == QIHSE_SQL_SELECT && session && session->uwp) {
+            rc = pg_handle_sql_select(fd, query, user, session);
+            qihse_sql_ast_free(parsed);
+            return rc;
+        }
+        qihse_sql_ast_free(parsed);
+    }
+    if (session && session->txn) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "only transactional INSERT/UPDATE/DELETE and transaction control are supported",
+                                   true);
+    }
 
     /* ---- SELECT version() ---- */
     if (str_iprefix(query, "SELECT version()") || str_iprefix(query, "select version()")) {
@@ -749,21 +1170,12 @@ static char* pg_substitute_params(const char* query, const char** params, int16_
     return result;
 }
 
-void qihse_pg_wire_handle_client_multi(
+static void pg_wire_handle_client_internal(
     int fd,
-    qihse_kv_store_t* store,
-    qihse_vector_db_t vdb,
-    qihse_tsdb_t* tsdb,
-    qihse_column_store_t* col,
-    qihse_cluster_topology_t* topo
+    pg_cluster_context_t ctx,
+    qihse_uwp_context_t* uwp
 ) {
-    pg_cluster_context_t ctx = {
-        .store = store,
-        .vdb = vdb,
-        .tsdb = tsdb,
-        .col = col,
-        .topo = topo
-    };
+    pg_transaction_session_t session = {.uwp = uwp, .txn = NULL, .failed = false};
 
     qihse_user_t* user = pg_send_auth_and_startup(fd);
     if (!user) {
@@ -808,7 +1220,7 @@ void qihse_pg_wire_handle_client_multi(
         switch (msg_type) {
             case 'Q': {
                 const char* query = body ? (const char*)body : "";
-                if (pg_handle_query_ctx(fd, &ctx, query, user) < 0) {
+                if (pg_handle_query_ctx(fd, &ctx, query, user, &session) < 0) {
                     free(body);
                     goto done;
                 }
@@ -889,7 +1301,7 @@ void qihse_pg_wire_handle_client_multi(
             /* ---- Execute (E): run the bound portal ---- */
             case 'E': {
                 if (last_portal_query[0]) {
-                    pg_handle_query_ctx(fd, &ctx, last_portal_query, user);
+                    pg_handle_query_ctx(fd, &ctx, last_portal_query, user, &session);
                     last_portal_query[0] = '\0';
                 } else {
                     pg_send_msg(fd, 'I', NULL, 0);  /* EmptyQueryResponse */
@@ -915,8 +1327,142 @@ void qihse_pg_wire_handle_client_multi(
     }
 
 done:
+    if (session.txn && uwp && uwp->txn_manager) {
+        (void)qihse_txn_rollback((qihse_txn_manager_t*)uwp->txn_manager,
+                                 session.txn);
+        session.txn = NULL;
+    }
     free(stmt_cache);
     close(fd);
+}
+
+void qihse_pg_wire_handle_client_multi(
+    int fd, qihse_kv_store_t* store, qihse_vector_db_t vdb,
+    qihse_tsdb_t* tsdb, qihse_column_store_t* col,
+    qihse_cluster_topology_t* topo) {
+    pg_cluster_context_t ctx = {.store = store, .vdb = vdb, .tsdb = tsdb,
+                                .col = col, .topo = topo};
+    pg_wire_handle_client_internal(fd, ctx, NULL);
+}
+
+void qihse_pg_wire_handle_client_uwp(int fd, qihse_uwp_context_t* uwp,
+                                     qihse_cluster_topology_t* topo) {
+    pg_cluster_context_t ctx = {
+        .store = uwp ? (qihse_kv_store_t*)uwp->kv : NULL,
+        .vdb = uwp ? (qihse_vector_db_t)uwp->vdb : (qihse_vector_db_t)0,
+        .tsdb = uwp ? (qihse_tsdb_t*)uwp->tsdb : NULL,
+        .col = uwp ? uwp->col : NULL,
+        .topo = topo
+    };
+    pg_wire_handle_client_internal(fd, ctx, uwp);
+}
+
+qihse_pg_wire_listener_t* qihse_pg_wire_listener_open_uwp(
+    qihse_uwp_context_t* uwp, qihse_cluster_topology_t* topo,
+    const char* bind_address, uint16_t port) {
+    if (!uwp || !uwp->sql_engine || !uwp->schema || !uwp->txn_manager) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (!bind_address || bind_address[0] == '\0') bind_address = "127.0.0.1";
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    int reuse = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0 ||
+        bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 16) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*)&addr, &addr_len) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+    qihse_pg_wire_listener_t* listener =
+        (qihse_pg_wire_listener_t*)calloc(1, sizeof(*listener));
+    if (!listener) {
+        close(fd);
+        return NULL;
+    }
+    listener->fd = fd;
+    listener->port = ntohs(addr.sin_port);
+    listener->uwp = uwp;
+    listener->topo = topo;
+    return listener;
+}
+
+uint16_t qihse_pg_wire_listener_port(const qihse_pg_wire_listener_t* listener) {
+    return listener ? listener->port : 0;
+}
+
+int qihse_pg_wire_listener_accept_once(qihse_pg_wire_listener_t* listener,
+                                       int timeout_ms) {
+    if (!listener || listener->fd < 0 || timeout_ms < -1) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifndef _WIN32
+    struct pollfd pfd = {.fd = listener->fd, .events = POLLIN, .revents = 0};
+    int ready;
+    do { ready = poll(&pfd, 1, timeout_ms); } while (ready < 0 && errno == EINTR);
+    if (ready == 0) return 0;
+    if (ready < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return -1;
+#else
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(listener->fd, &readfds);
+    struct timeval timeout;
+    struct timeval* timeout_ptr = NULL;
+    if (timeout_ms >= 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        timeout_ptr = &timeout;
+    }
+    int ready = select(0, &readfds, NULL, NULL, timeout_ptr);
+    if (ready == 0) return 0;
+    if (ready < 0) return -1;
+#endif
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    int client_fd = (int)accept(listener->fd, (struct sockaddr*)&peer, &peer_len);
+    if (client_fd < 0) return -1;
+
+    struct timeval io_timeout = {.tv_sec = 30, .tv_usec = 0};
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &io_timeout, sizeof(io_timeout));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &io_timeout, sizeof(io_timeout));
+    pg_wire_handle_client_internal(client_fd,
+        (pg_cluster_context_t){
+            .store = (qihse_kv_store_t*)listener->uwp->kv,
+            .vdb = (qihse_vector_db_t)listener->uwp->vdb,
+            .tsdb = listener->uwp->tsdb,
+            .col = listener->uwp->col,
+            .topo = listener->topo
+        }, listener->uwp);
+    return 1;
+}
+
+void qihse_pg_wire_listener_close(qihse_pg_wire_listener_t* listener) {
+    if (!listener) return;
+    if (listener->fd >= 0) close(listener->fd);
+    free(listener);
 }
 
 void qihse_pg_wire_handle_client(int client_fd, void* vdb) {

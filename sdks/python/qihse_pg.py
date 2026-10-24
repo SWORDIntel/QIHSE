@@ -4,9 +4,7 @@ Provides a psycopg2-compatible API that connects to QIHSE's PostgreSQL wire prot
 """
 import socket
 import struct
-import hashlib
 import datetime
-import json as json_module
 from collections import namedtuple
 
 # Protocol constants
@@ -76,6 +74,7 @@ class connection:
         self._closed = False
         self._sock = None
         self._in_transaction = False
+        self._last_result = {"rows": [], "description": [], "command_tag": None}
         self._connect()
     
     def _connect(self):
@@ -84,22 +83,90 @@ class connection:
             self._sock.settimeout(10)
             self._sock.connect((self.host, self.port))
             self._send_startup()
-        except (socket.error, ConnectionRefusedError, OSError) as e:
-            # Allow creation even if server isn't running (for testing)
+        except (socket.error, OSError, Error):
+            self._discard_socket()
+            raise
+
+    def _discard_socket(self):
+        sock, self._sock = self._sock, None
+        if sock is not None:
             try:
-                self._sock.close()
-            except:
+                sock.close()
+            except OSError:
                 pass
-            self._sock = None
+
+    @staticmethod
+    def _read_exact(sock, size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise OperationalError("PostgreSQL server closed the connection mid-frame")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _read_message(self):
+        if not self._sock:
+            raise OperationalError("PostgreSQL connection is not open")
+        try:
+            tag = self._read_exact(self._sock, 1)
+            length = struct.unpack("!I", self._read_exact(self._sock, 4))[0]
+            if length < 4 or length > 16 * 1024 * 1024:
+                raise OperationalError("invalid PostgreSQL message length")
+            return tag, self._read_exact(self._sock, length - 4)
+        except (OSError, socket.timeout) as exc:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL transport failed: %s" % exc) from exc
     
     def _send_startup(self):
         if not self._sock:
-            return
+            raise OperationalError("PostgreSQL connection is not open")
         # Build StartupMessage
         params = f"user\x00{self.user}\x00database\x00{self.dbname}\x00\x00"
         msg = struct.pack("!I", PROTOCOL_VERSION) + params.encode()
         length = struct.pack("!I", 4 + len(msg))
-        self._sock.sendall(length + msg)
+        try:
+            self._sock.sendall(length + msg)
+            authenticated = False
+            while True:
+                tag, body = self._read_message()
+                if tag == b'R':
+                    if len(body) != 4:
+                        raise OperationalError("malformed PostgreSQL authentication response")
+                    auth_method = struct.unpack("!I", body)[0]
+                    if auth_method == 3:  # AuthenticationCleartextPassword
+                        password = self.password.encode("utf-8") + b"\x00"
+                        self._send_message(b'p', password)
+                    elif auth_method == 0:  # AuthenticationOk
+                        authenticated = True
+                    else:
+                        raise OperationalError(
+                            "unsupported PostgreSQL authentication method %d" % auth_method)
+                elif tag == b'E':
+                    fields = self._parse_error_fields(body)
+                    raise self._server_error(fields)
+                elif tag == b'Z':
+                    if len(body) != 1 or body[0:1] != b'I' or not authenticated:
+                        raise OperationalError("PostgreSQL startup did not complete authentication")
+                    return
+                elif tag in (b'S', b'K', b'N'):
+                    continue
+                else:
+                    raise OperationalError("unexpected PostgreSQL startup message %r" % tag)
+        except (OSError, socket.timeout) as exc:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL startup transport failed: %s" % exc) from exc
+
+    def _send_message(self, tag, body):
+        if not self._sock:
+            raise OperationalError("PostgreSQL connection is not open")
+        try:
+            self._sock.sendall(tag + struct.pack("!I", 4 + len(body)) + body)
+        except (OSError, socket.timeout) as exc:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL transport failed: %s" % exc) from exc
     
     def cursor(self, cursor_factory=None):
         if self._closed:
@@ -107,32 +174,159 @@ class connection:
         return cursor(self, cursor_factory)
     
     def commit(self):
-        if self._sock and not self.autocommit:
+        if not self.autocommit and self._in_transaction:
             self._execute_simple("COMMIT")
-        self._in_transaction = False
     
     def rollback(self):
-        if self._sock and not self.autocommit:
+        if not self.autocommit and self._in_transaction:
             self._execute_simple("ROLLBACK")
-        self._in_transaction = False
+
+    def begin(self):
+        if self.autocommit:
+            raise ProgrammingError("cannot begin a managed transaction in autocommit mode")
+        if self._in_transaction:
+            raise ProgrammingError("a transaction is already active")
+        self._execute_simple("BEGIN")
     
     def _execute_simple(self, query):
         if not self._sock:
-            return None
+            raise OperationalError("PostgreSQL connection is not open")
         msg = query.encode() + b'\x00'
         length = struct.pack("!I", 4 + len(msg))
-        self._sock.sendall(QUERY.encode() + length + msg)
+        self._send_message(QUERY.encode(), msg)
+        rows = []
+        description = []
+        command_tag = None
+        error = None
+        ready_status = None
+        try:
+            while True:
+                tag, body = self._read_message()
+                if tag == b'T':
+                    description = self._parse_row_description(body)
+                elif tag == b'D':
+                    rows.append(self._parse_data_row(body))
+                elif tag == b'C':
+                    command_tag = self._cstring(body)
+                elif tag == b'E':
+                    error = self._parse_error_fields(body)
+                elif tag == b'Z':
+                    if len(body) != 1 or body[0:1] not in (b'I', b'T', b'E'):
+                        raise OperationalError("malformed ReadyForQuery response")
+                    ready_status = body[0:1]
+                    break
+                elif tag in (b'N', b'A', b'S', b'K', b'I'):
+                    continue
+                else:
+                    raise OperationalError("unexpected PostgreSQL query response %r" % tag)
+        except OperationalError:
+            self._discard_socket()
+            raise
+        except (OSError, socket.timeout) as exc:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL transport failed: %s" % exc) from exc
+
+        if ready_status is None:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL query ended without ReadyForQuery")
+        if error is not None:
+            raise self._server_error(error)
+
+        verb = query.lstrip().split(None, 1)[0].rstrip(";").upper() if query.strip() else ""
+        tag_verb = (command_tag or "").split(None, 1)[0].upper()
+        if verb in ("BEGIN", "START") and tag_verb == "BEGIN" and ready_status == b'T':
+            self._in_transaction = True
+        elif verb in ("COMMIT", "ROLLBACK", "END") and ready_status == b'I' and tag_verb in ("COMMIT", "ROLLBACK"):
+            self._in_transaction = False
+
+        self._last_result = {
+            "rows": rows,
+            "description": description,
+            "command_tag": command_tag,
+        }
+        return self._last_result
+
+    @staticmethod
+    def _cstring(body, offset=0):
+        end = body.find(b"\x00", offset)
+        if end < 0:
+            raise OperationalError("malformed PostgreSQL C string")
+        return body[offset:end].decode("utf-8", "replace")
+
+    @classmethod
+    def _parse_error_fields(cls, body):
+        fields = {}
+        offset = 0
+        while offset < len(body) and body[offset] != 0:
+            code = chr(body[offset])
+            offset += 1
+            end = body.find(b"\x00", offset)
+            if end < 0:
+                raise OperationalError("malformed PostgreSQL ErrorResponse")
+            fields[code] = body[offset:end].decode("utf-8", "replace")
+            offset = end + 1
+        return fields
+
+    @staticmethod
+    def _server_error(fields):
+        message = fields.get('M', "PostgreSQL server rejected the request")
+        code = fields.get('C', "")
+        error_type = ProgrammingError if code.startswith("42") else OperationalError
+        return error_type("%s%s" % ((code + ": ") if code else "", message))
+
+    @classmethod
+    def _parse_row_description(cls, body):
+        if len(body) < 2:
+            raise OperationalError("malformed PostgreSQL RowDescription")
+        count = struct.unpack_from("!H", body, 0)[0]
+        offset = 2
+        result = []
+        for _ in range(count):
+            end = body.find(b"\x00", offset)
+            if end < 0:
+                raise OperationalError("malformed PostgreSQL RowDescription field name")
+            name = cls._cstring(body, offset)
+            offset = end + 1
+            if offset + 18 > len(body):
+                raise OperationalError("truncated PostgreSQL RowDescription field")
+            table_oid, column_no, type_oid, type_size, type_modifier, fmt = struct.unpack_from(
+                "!IhIhih", body, offset)
+            offset += 18
+            result.append((name, type_oid, None, type_size, None, None, None))
+        if offset != len(body):
+            raise OperationalError("trailing bytes in PostgreSQL RowDescription")
+        return result
+
+    @staticmethod
+    def _parse_data_row(body):
+        if len(body) < 2:
+            raise OperationalError("malformed PostgreSQL DataRow")
+        count = struct.unpack_from("!H", body, 0)[0]
+        offset = 2
+        row = []
+        for _ in range(count):
+            if offset + 4 > len(body):
+                raise OperationalError("truncated PostgreSQL DataRow length")
+            size = struct.unpack_from("!i", body, offset)[0]
+            offset += 4
+            if size == -1:
+                row.append(None)
+            elif size < -1 or offset + size > len(body):
+                raise OperationalError("invalid PostgreSQL DataRow value length")
+            else:
+                row.append(body[offset:offset + size].decode("utf-8", "replace"))
+                offset += size
+        if offset != len(body):
+            raise OperationalError("trailing bytes in PostgreSQL DataRow")
+        return tuple(row)
     
     def close(self):
         if self._sock:
             try:
-                msg = b'\x00'
-                length = struct.pack("!I", 4)
-                self._sock.sendall(TERMINATE.encode() + length + msg)
-                self._sock.close()
-            except:
+                self._send_message(TERMINATE.encode(), b'')
+            except (OperationalError, OSError):
                 pass
-        self._sock = None
+        self._discard_socket()
         self._closed = True
     
     @property
@@ -143,11 +337,13 @@ class connection:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            self.rollback()
-        else:
-            self.commit()
-        self.close()
+        try:
+            if exc_type is not None:
+                self.rollback()
+            else:
+                self.commit()
+        finally:
+            self.close()
         return False
 
 
@@ -185,10 +381,22 @@ class cursor:
                         query = query[:pos] + val + query[pos+2:]
                         idx += 1
         if self.connection._sock:
+            command = query.lstrip().split(None, 1)[0].rstrip(";").upper() if query.strip() else ""
+            if (not self.connection.autocommit and
+                    not self.connection._in_transaction and
+                    command not in ("BEGIN", "START", "COMMIT", "ROLLBACK", "END")):
+                self.connection.begin()
             self.connection._execute_simple(query)
-            self._results = self._fetch_results()
+            result = self.connection._last_result
+            self._results = list(result["rows"])
+            self._description = list(result["description"])
+            tag = result["command_tag"] or ""
+            try:
+                self._rowcount = int(tag.rsplit(" ", 1)[1])
+            except (ValueError, IndexError):
+                self._rowcount = -1
         else:
-            self._results = []
+            raise OperationalError("PostgreSQL connection is not open")
         return self
     
     def executemany(self, query, param_list):
@@ -227,9 +435,7 @@ class cursor:
         return results
     
     def _fetch_results(self):
-        # In a real implementation, parse PG wire protocol responses
-        # For now, return empty results
-        return []
+        return list(self.connection._last_result["rows"])
     
     @property
     def description(self):

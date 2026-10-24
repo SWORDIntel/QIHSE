@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Slot load-shift smoke: seed keys across both slot ranges on node 0, then
-CLUSTER MOVESLOTS 8192-16383 -> node 1. Verifies: data transfer (keys moved,
-source copies deleted), ownership flip + bus propagation (both nodes agree),
-routing (seed MOVED-redirects, new writes land on the node 1).
+"""Slot load-shift smoke: seed keys on node 0 and attempt
+CLUSTER MOVESLOTS 8192-16383 -> node 1.
 
 Two modes:
-  default      Prereq: dynamic cluster up (see tests/cluster_discover_smoke.py);
-               endpoints default to the t420/T320 lab pair.
-  --self-spawn Hermetic (gold/CI): spawn BOTH nodes on loopback (seed owns
-               the full ring, joiner discovers via --join), run the checks,
-               tear everything down.
+  default      Legacy transfer drill against an explicitly configured lab
+               cluster (see tests/cluster_discover_smoke.py).
+  --self-spawn Hermetic gold/CI guard: the daemon has no secure slot-transfer
+               transport yet, so verify MOVESLOTS refuses before changing
+               ownership or losing source data.
 Run twice-safe: previous leftovers are re-collected by the next MOVESLOTS.
 """
 import os, socket, subprocess, sys, time
@@ -185,6 +183,34 @@ def main():
 
     check("pre-move: high keys served by seed",
           all(n0.cmd("GET", k) == ("$", f"val-{k}") for k in high))
+
+    if _SELF_SPAWN:
+        t, r = n0.cmd("CLUSTER", "MOVESLOTS", "8192-16383", N1_EP)
+        check("unavailable migration refused before ownership flip",
+              t == "-" and "target authentication unavailable" in r, r)
+        n0.fresh(); n0.cmd("AUTH", "GODMODE_OP", PW)
+        n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
+        check("seed retains every high key",
+              all(n0.cmd("GET", k) == ("$", f"val-{k}") for k in high))
+        peer_values = []
+        for k in high:
+            n1.cmd("ASKING")
+            peer_values.append(n1.cmd("GET", k))
+        check("peer received no partial copy",
+              all(value == ("$", None) for value in peer_values))
+        write = n0.cmd("SET", high[0], "after-refusal")
+        check("subsequent write remains on seed",
+              write == ("+", "OK") and
+              n0.cmd("GET", high[0]) == ("$", "after-refusal"))
+        t, seed_nodes = n0.cmd("CLUSTER", "NODES")
+        t, peer_nodes = n1.cmd("CLUSTER", "NODES")
+        check("both nodes retain seed ownership",
+              all(any(N0_EP in line and "0-16383" in line
+                      for line in view.splitlines())
+                  for view in (seed_nodes, peer_nodes)))
+        print(f"\nload-shift guard: {sum(results)}/{len(results)} checks passed")
+        _teardown_hermetic()
+        return 0 if all(results) else 1
 
     t, r = n0.cmd("CLUSTER", "MOVESLOTS", "8192-16383", N1_EP)
     moved = int(r.split()[0]) if t == "$" and "keys moved" in r else -1

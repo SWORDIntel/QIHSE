@@ -6,6 +6,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include "qihse_auth.h"
 #include <net/ethernet.h>
 #include "qihse_af_xdp.h"
 #include "qihse_kv_store.h"
@@ -135,6 +136,16 @@ int main() {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/test_af_xdp_resp_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+    /* The KV ingress path is audited: without an initialised auth/audit writer
+     * the library aborts fail-closed ("audit writer is not initialized"). */
+    if (!qihse_auth_init()) {
+        fprintf(stderr, "af_xdp_resp: auth init failed\n");
+        return 1;
+    }
+    if (!qihse_auth_bootstrap_operator("AfXdpRespSystem123!")) {
+        fprintf(stderr, "af_xdp_resp: operator bootstrap failed\n");
+        return 1;
+    }
 }
     printf("====================================================\n");
     printf("  QIHSE eBPF / AF_XDP Kernel-Bypass Ingress Tests   \n");

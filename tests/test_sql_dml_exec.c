@@ -531,6 +531,18 @@ static void test_statement_authorization(qihse_uwp_context_t* ctx,
                    &reply) == UWP_STS_OK);
     expect_reply(&reply, "OK stmt_type=CREATE");
 
+    assert(run_sql(ctx, operator_user,
+                   "INSERT INTO t_stmt_auth VALUES (9, 'SQL-PROTECTED-MARKER-71e3', 99)",
+                   &reply) == UWP_STS_OK);
+    assert(run_sql(ctx, low,
+                   "SELECT name FROM t_stmt_auth WHERE id = 9", &reply) ==
+           UWP_STS_ERR_PERM);
+    expect_reply(&reply, "ERR_PERM");
+    expect_reply_absent(&reply, protected_marker);
+    assert(run_sql(ctx, operator_user,
+                   "DELETE FROM t_stmt_auth WHERE id = 9", &reply) ==
+           UWP_STS_OK);
+
     /* A live low principal cannot mutate the table or execute DDL before an
      * explicit table WRITE grant.  Denials are protocol errors and never echo
      * the protected value. */
@@ -571,6 +583,16 @@ static void test_statement_authorization(qihse_uwp_context_t* ctx,
                                          "t_stmt_auth");
     assert(table != NULL);
     expect_row(table, 1, "allowed", 10);
+
+    assert(run_sql(ctx, low, "SELECT name FROM t_stmt_auth WHERE id = 1",
+                   &reply) == UWP_STS_ERR_PERM);
+    expect_reply_absent(&reply, "allowed");
+    assert(qihse_auth_grant_object(operator_user, low, 0,
+                                   table_resource_id("t_stmt_auth"),
+                                   QIHSE_ACL_READ | QIHSE_ACL_WRITE));
+    assert(run_sql(ctx, low, "SELECT name FROM t_stmt_auth WHERE id = 1",
+                   &reply) == UWP_STS_OK);
+    expect_reply(&reply, "name\nallowed\nOK stmt_type=SELECT rows=1");
 
     assert(run_sql(ctx, low, "UPDATE t_stmt_auth SET n = 11 WHERE id = 1", &reply) ==
            UWP_STS_OK);
@@ -665,6 +687,15 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
     expect_reply(&out, "rows=1");
     expect_row(table, 3, "carol", 0);
 
+    assert(run_sql(ctx, user,
+                   "SELECT id, name, n FROM t_ins WHERE id = 1 LIMIT 1",
+                   &out) == UWP_STS_OK);
+    expect_reply(&out, "id\tname\tn\n1\talice\t9\nOK stmt_type=SELECT rows=1");
+    assert(run_sql(ctx, user,
+                   "SELECT id, name FROM t_ins WHERE id >= 1 OFFSET 1",
+                   &out) == UWP_STS_OK);
+    expect_reply(&out, "id\tname\n3\tcarol\nOK stmt_type=SELECT rows=1");
+
     printf("PASS insert: rows land in the mutable row store and are "
            "UPDATE/DELETE-able end to end\n");
 }
@@ -680,9 +711,17 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql(ctx, user,
                    "INSERT INTO t_txn_dml VALUES (1, 'base', 10)",
                    &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "CREATE TABLE t_txn_dml_peer (id INT, name TEXT, n INT)",
+                   &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "INSERT INTO t_txn_dml_peer VALUES (1, 'peer', 100)",
+                   &out) == UWP_STS_OK);
     qihse_table_t* table = qihse_table_store_find_table(
         qihse_uwp_sql_table_store(), "t_txn_dml");
-    assert(table != NULL);
+    qihse_table_t* peer = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "t_txn_dml_peer");
+    assert(table != NULL && peer != NULL);
 
     assert(run_sql_txn(ctx, user, "BEGIN SERIALIZABLE", &txn, &out) == UWP_STS_OK);
     assert(txn != NULL);
@@ -699,9 +738,15 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql_txn(ctx, user,
                        "UPDATE t_txn_dml SET n = 30 WHERE id = 1",
                        &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "UPDATE t_txn_dml_peer SET n = 130 WHERE id = 1",
+                       &txn, &out) == UWP_STS_OK);
+    expect_row(table, 1, "base", 10);
+    expect_row(peer, 1, "peer", 100);
     assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
     assert(txn == NULL);
     expect_row(table, 1, "base", 30);
+    expect_row(peer, 1, "peer", 130);
 
     assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(ctx, user,
@@ -730,6 +775,7 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_ERR_FAILED);
     assert(txn == NULL);
     expect_row(table, 1, "base", 70);
+    expect_row(peer, 1, "peer", 130);
 
     /* SQL savepoints and transactional DDL are refused until the row/schema
      * resources can snapshot and restore those operations. */
@@ -742,8 +788,8 @@ static void test_transactional_dml_commit_rollback(
                                   "t_txn_ddl") == NULL);
     assert(run_sql_txn(ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
 
-    printf("PASS sql transactions: private DML shadows commit, rollback, and "
-           "abort on concurrent live mutation\n");
+    printf("PASS sql transactions: private multi-table DML shadows commit "
+           "together, rollback, and abort on concurrent live mutation\n");
 }
 
 static void test_txn_revocation_and_schema_authorization(

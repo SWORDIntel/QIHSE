@@ -3,17 +3,9 @@
 //! Compatible with tokio-postgres, pymongo, mongoc, requests, clickhouse-driver,
 //! elasticsearch-py, prometheus-client, and opentelemetry APIs.
 //!
-//! Audited for UWP wire-level safety: error handling, auth enforcement,
-//! frame reassembly, version validation.
-//!
-//! Audit findings:
-//! - The SDK was a stub: all query methods returned empty results without
-//!   any wire interaction.  No UWP protocol, auth, or error handling existed.
-//! - Added `error` module with UwpError enum, UwpHeader/UwpFrame structs,
-//!   and AuthState for auth-gate enforcement.
-//! - The client methods remain stubs (they do not yet speak UWP over the
-//!   wire), but the type infrastructure is in place for a future
-//!   implementation.  See the `error` module for the full protocol types.
+//! SQL calls use PostgreSQL wire protocol and authenticate through the
+//! configured username/password during connection startup. UWP frame types
+//! remain available independently for UWP protocol consumers.
 
 pub mod error;
 pub mod client;

@@ -28,6 +28,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "qihse_kv_store.h"
+#include "../core/qihse_audit.h"
+#include "qihse_auth.h"
 #include "qihse_graph_store.h"
 
 #define CG_MAX_LINE 262144u
@@ -81,7 +83,7 @@ static void json_text(struct json_object *obj, const char *key, const char *valu
 static void json_int(struct json_object *obj, const char *key, int64_t value) {
     json_object_object_add(obj, key, json_object_new_int64(value));
 }
-static void json_bool(struct json_object *obj, const char *key, bool value) {
+static void json_bool_field(struct json_object *obj, const char *key, bool value) {
     json_object_object_add(obj, key, json_object_new_boolean(value));
 }
 static void print_json(struct json_object *obj) {
@@ -100,6 +102,18 @@ static bool hex64(const char *v) {
               (v[i] >= 'a' && v[i] <= 'f'))) return false;
     return true;
 }
+/* Git commit ids: SHA-1 (40 hex) on classic repos, SHA-256 (64 hex) on new
+ * ones. The freshness gate compares against `git rev-parse HEAD` byte-for-byte,
+ * so both lengths are legitimate in the header. */
+static bool hex_head(const char *v) {
+    size_t len;
+    if (!v || ((len = strlen(v)) != 40 && len != 64)) return false;
+    for (size_t i = 0; i < len; ++i)
+        if (!((v[i] >= '0' && v[i] <= '9') ||
+              (v[i] >= 'a' && v[i] <= 'f'))) return false;
+    return true;
+}
+
 static bool safe_relative(const char *path) {
     if (!path || *path == '/' || *path == '~' || strchr(path, '\\')) return false;
     for (const char *p = path; *p;) {
@@ -173,6 +187,11 @@ static void graph_close(cg_state *st) {
     free(st->nodes); free(st->by_vertex);
     if (st->meta) json_object_put(st->meta);
     if (st->manifest) json_object_put(st->manifest);
+    /* The audit signer is a background thread writing into this scratch dir.
+     * Deleting the dir while a record (e.g. the failed-import event) is still
+     * in flight made the signer's append fail ENOENT, which the audit layer
+     * treats as a chain-integrity abort. Drain it before cleanup. */
+    qihse_audit_flush();
     if (st->scratch[0]) nftw(st->scratch, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
 static bool graph_open(cg_state *st, const char *repo) {
@@ -201,6 +220,13 @@ static bool graph_open(cg_state *st, const char *repo) {
      * never the host's production /opt/qihse-data. This process is single
      * purpose; QIHSE caches its data dir for the process lifetime. */
     if (setenv("QIHSE_DATA_DIR", st->scratch, 1) != 0) return false;
+    /* Audited KV paths fail closed (abort) without an initialized audit
+     * writer. Must run AFTER the scratch dir is in place: the audit subsystem
+     * resolves its directory once from QIHSE_DATA_DIR. */
+    if (!qihse_auth_init()) {
+        fprintf(stderr, "codegraph: auth init failed\n");
+        return false;
+    }
     st->kv = qihse_kv_store_create();
     if (!st->kv) return false;
     return true;
@@ -307,7 +333,7 @@ static int import_snapshot(cg_state *st, const char *input) {
             char *worktree = json_string(row, "worktree");
             if (strcmp(type, "h") || !format ||
                 strcmp(format, "qihse-codegraph-v1") ||
-                json_num(row, "version") != 1 || !hex64(head) || !hex64(worktree)) {
+                json_num(row, "version") != 1 || !hex_head(head) || !hex64(worktree)) {
                 problem = "invalid header/version"; ok = false;
             } else {
                 meta = json_object_get(row); header = true;
@@ -702,7 +728,7 @@ static struct json_object *summary(cg_state *st) {
     json_text(obj, "head", json_string(st->manifest, "head"));
     const char *reason = NULL;
     bool fresh = freshness(st, &reason);
-    json_bool(obj, "fresh", fresh);
+    json_bool_field(obj, "fresh", fresh);
     if (!fresh) json_text(obj, "stale_reason", reason);
     return obj;
 }
@@ -724,7 +750,7 @@ static struct json_object *record_node(cg_node *n, int hop, double risk,
     json_int(record, "line_start", n->line);
     if (!compact) json_int(record, "line_end", n->end_line);
     json_int(record, "hop", hop);
-    json_bool(record, "is_test", n->is_test);
+    json_bool_field(record, "is_test", n->is_test);
     if (!compact)
         json_object_object_add(record, "risk_hint",
                                json_object_new_double(risk));
@@ -939,7 +965,7 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     json_int(report, "seed_nodes", (int64_t)seeds);
     json_int(report, "shown_nodes", (int64_t)shown);
     json_int(report, "depth", depth);
-    json_bool(report, "truncated", truncated);
+    json_bool_field(report, "truncated", truncated);
     json_text(report, "risk_kind", "heuristic review priority; not vulnerability probability");
     json_object_object_add(report, "nodes", found);
     json_object_object_add(report, "affected_files", affected);
