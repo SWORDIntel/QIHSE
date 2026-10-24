@@ -51,6 +51,12 @@ declare -A HOST_IP=(
     [730xd]=192.168.1.90
     [t320]=192.168.1.250
 )
+declare -A LIB_DIR=(
+    [t420]=/opt/QIHSE/lib
+    [730xd]=/opt/QIHSE/lib
+    [t320]=/opt/qihse/lib
+)
+
 declare -A SSH_TARGET=(
     [t420]=local
     [730xd]=root@192.168.1.90
@@ -89,6 +95,7 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/etc/qihse/$envfile
+Environment=LD_LIBRARY_PATH=${LIB_DIR[$host]}
 ExecStart=${BIN_DIR[$host]}/qihse-cluster-daemon \\
   --bind ${HOST_IP[$host]} \\
   --port $port \\

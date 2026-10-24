@@ -616,7 +616,10 @@ static int mini_resp_connect_mode(mini_resp_t* c, const char* host, uint16_t por
         if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
         fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd >= 0) {
-            struct timeval tv = {5, 0};
+            /* Replication snapshot exports can scan a large source store
+             * between REPL.SNAPSHOT.BEGIN and the first READ; keep the
+             * socket alive well past the export (5s was too short). */
+            struct timeval tv = {60, 0};
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); fd = -1; }
