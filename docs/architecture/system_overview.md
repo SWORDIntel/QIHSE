@@ -102,11 +102,20 @@ The MVCC store (`src/tractable/qihse_mvcc.c`) implements per-row version chains:
 
 ### 3.3 Unified WAL
 
-The Write-Ahead Log (`src/tractable/qihse_wal.c`) provides durability across all engines:
+The Write-Ahead Log (`src/tractable/qihse_wal.c`) provides the record and sync
+primitives used by the transaction and MVCC paths. SQL's in-memory row store
+does not yet have redo/recovery integration, so the WAL alone does not make SQL
+row-store commits durable across restart.
 
 - **Record format**: LSN (8 bytes), txn_id (8 bytes), engine_id (1 byte), op_type (1 byte), key/value with lengths, CRC32 checksum
 - **Segment rotation**: Configurable segment size (default 64 MB), automatic rotation
-- **Durability modes**: none (no fsync), fdatasync per commit, group commit (batch fsync)
+- **Durability modes**: none (no fsync), fdatasync per append, group commit
+  (caller batches records and calls flush)
+- **Sync error handling**: append, flush, replay, checkpoint, and rotation report
+  sync failures. An append can have written bytes before a sync failure, so a
+  failed return means durability was not confirmed; it does not prove the
+  record is absent. Segment creation and checkpoint segment removal sync the
+  WAL directory in durable modes.
 - **Checkpoint**: Flush all engine state, record checkpoint LSN, truncate old WAL segments
 
 ### 3.4 Crash Recovery

@@ -9,9 +9,11 @@
 > 1. **The UWP SQL row-store path now uses this manager for bounded multi-table DML
 >    transactions.** INSERT, UPDATE and DELETE run against a private optimistic
 >    shadow per table; COMMIT publishes up to 16 table shadows atomically behind
->    generation fences and ROLLBACK discards them. Cross-model transactions,
->    SQL SELECT visibility, savepoint data restoration, WAL durability and
->    pgwire integration remain outside this bounded slice.
+>    generation fences and ROLLBACK discards them. Autocommit UWP SQL SELECT
+>    now supports a bounded one-table projection/filter path behind READ ACLs;
+>    SELECT within a transaction, cross-model transactions, savepoint data
+>    restoration, WAL durability and pgwire integration remain outside this
+>    bounded slice.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >

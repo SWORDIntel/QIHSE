@@ -531,6 +531,18 @@ static void test_statement_authorization(qihse_uwp_context_t* ctx,
                    &reply) == UWP_STS_OK);
     expect_reply(&reply, "OK stmt_type=CREATE");
 
+    assert(run_sql(ctx, operator_user,
+                   "INSERT INTO t_stmt_auth VALUES (9, 'SQL-PROTECTED-MARKER-71e3', 99)",
+                   &reply) == UWP_STS_OK);
+    assert(run_sql(ctx, low,
+                   "SELECT name FROM t_stmt_auth WHERE id = 9", &reply) ==
+           UWP_STS_ERR_PERM);
+    expect_reply(&reply, "ERR_PERM");
+    expect_reply_absent(&reply, protected_marker);
+    assert(run_sql(ctx, operator_user,
+                   "DELETE FROM t_stmt_auth WHERE id = 9", &reply) ==
+           UWP_STS_OK);
+
     /* A live low principal cannot mutate the table or execute DDL before an
      * explicit table WRITE grant.  Denials are protocol errors and never echo
      * the protected value. */
@@ -571,6 +583,16 @@ static void test_statement_authorization(qihse_uwp_context_t* ctx,
                                          "t_stmt_auth");
     assert(table != NULL);
     expect_row(table, 1, "allowed", 10);
+
+    assert(run_sql(ctx, low, "SELECT name FROM t_stmt_auth WHERE id = 1",
+                   &reply) == UWP_STS_ERR_PERM);
+    expect_reply_absent(&reply, "allowed");
+    assert(qihse_auth_grant_object(operator_user, low, 0,
+                                   table_resource_id("t_stmt_auth"),
+                                   QIHSE_ACL_READ | QIHSE_ACL_WRITE));
+    assert(run_sql(ctx, low, "SELECT name FROM t_stmt_auth WHERE id = 1",
+                   &reply) == UWP_STS_OK);
+    expect_reply(&reply, "name\nallowed\nOK stmt_type=SELECT rows=1");
 
     assert(run_sql(ctx, low, "UPDATE t_stmt_auth SET n = 11 WHERE id = 1", &reply) ==
            UWP_STS_OK);
@@ -664,6 +686,15 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
             "INSERT INTO t_ins (id, name) VALUES (3, 'carol')", &out);
     expect_reply(&out, "rows=1");
     expect_row(table, 3, "carol", 0);
+
+    assert(run_sql(ctx, user,
+                   "SELECT id, name, n FROM t_ins WHERE id = 1 LIMIT 1",
+                   &out) == UWP_STS_OK);
+    expect_reply(&out, "id\tname\tn\n1\talice\t9\nOK stmt_type=SELECT rows=1");
+    assert(run_sql(ctx, user,
+                   "SELECT id, name FROM t_ins WHERE id >= 1 OFFSET 1",
+                   &out) == UWP_STS_OK);
+    expect_reply(&out, "id\tname\n3\tcarol\nOK stmt_type=SELECT rows=1");
 
     printf("PASS insert: rows land in the mutable row store and are "
            "UPDATE/DELETE-able end to end\n");
