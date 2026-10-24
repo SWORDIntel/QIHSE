@@ -215,12 +215,46 @@ static void seg_path(char* buf, size_t bufsz, const char* dir, uint64_t idx) {
     }
 }
 
+static int sync_data_fd(int fd) {
+    int rc;
+    do { rc = fdatasync(fd); } while (rc != 0 && errno == EINTR);
+    return rc;
+}
+
+static int sync_directory(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int rc;
+    do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    int saved_errno = errno;
+    if (close(fd) != 0 && rc == 0) {
+        rc = -1;
+        saved_errno = errno;
+    }
+    errno = saved_errno;
+    return rc;
+}
+
 static int seg_open(qihse_wal_t* wal) {
     seg_path(wal->seg_path, sizeof(wal->seg_path),
              wal->directory, wal->seg_index);
+    bool created = false;
     wal->seg_fd = open(wal->seg_path,
-                       O_WRONLY | O_CREAT | O_APPEND, 0640);
+                       O_WRONLY | O_CREAT | O_EXCL | O_APPEND, 0640);
+    if (wal->seg_fd >= 0) {
+        created = true;
+    } else if (errno == EEXIST) {
+        wal->seg_fd = open(wal->seg_path, O_WRONLY | O_APPEND);
+    }
     if (wal->seg_fd < 0) return -1;
+    if (created && wal->durability != QIHSE_WAL_DURABILITY_NONE &&
+        sync_directory(wal->directory) != 0) {
+        int saved_errno = errno;
+        close(wal->seg_fd);
+        wal->seg_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
     /* Determine current offset */
     struct stat st;
     if (fstat(wal->seg_fd, &st) == 0) {
@@ -234,10 +268,11 @@ static int seg_open(qihse_wal_t* wal) {
 static int seg_rotate(qihse_wal_t* wal) {
     if (wal->seg_fd >= 0) {
         if (wal->durability != QIHSE_WAL_DURABILITY_NONE) {
-            fdatasync(wal->seg_fd);
+            if (sync_data_fd(wal->seg_fd) != 0) return -1;
         }
-        close(wal->seg_fd);
+        int old_fd = wal->seg_fd;
         wal->seg_fd = -1;
+        if (close(old_fd) != 0) return -1;
     }
     wal->seg_index++;
     wal->seg_offset = 0;
@@ -267,7 +302,11 @@ qihse_wal_t* qihse_wal_create(const char* directory,
     wal->seg_offset = 0;
 
     /* Create directory if it doesn't exist */
-    mkdir(directory, 0750);
+    if (mkdir(directory, 0750) != 0 && errno != EEXIST) {
+        pthread_mutex_destroy(&wal->lock);
+        free(wal);
+        return NULL;
+    }
 
     /* Find the highest segment index and continue from there */
     DIR* dir = opendir(directory);
@@ -304,7 +343,7 @@ void qihse_wal_destroy(qihse_wal_t* wal) {
     pthread_mutex_lock(&wal->lock);
     if (wal->seg_fd >= 0) {
         if (wal->durability != QIHSE_WAL_DURABILITY_NONE) {
-            fdatasync(wal->seg_fd);
+            (void)sync_data_fd(wal->seg_fd);
         }
         close(wal->seg_fd);
     }
@@ -395,7 +434,7 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
 
     /* Durability */
     if (wal->durability == QIHSE_WAL_DURABILITY_FDATASYNC) {
-        fdatasync(wal->seg_fd);
+        if (sync_data_fd(wal->seg_fd) != 0) goto fail;
     }
     /* GROUP_COMMIT: caller is responsible for calling qihse_wal_flush() */
 
@@ -441,11 +480,9 @@ uint64_t qihse_wal_append_checkpoint(qihse_wal_t* wal, uint64_t lsn) {
 int qihse_wal_flush(qihse_wal_t* wal) {
     if (!wal) return -1;
     pthread_mutex_lock(&wal->lock);
-    if (wal->seg_fd >= 0) {
-        fdatasync(wal->seg_fd);
-    }
+    int rc = wal->seg_fd >= 0 ? sync_data_fd(wal->seg_fd) : -1;
     pthread_mutex_unlock(&wal->lock);
-    return 0;
+    return rc;
 }
 
 /* ── Replay ─────────────────────────────────────────────────────────────── */
@@ -472,7 +509,13 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
 
     /* Flush current segment first */
     if (wal->seg_fd >= 0) {
-        fdatasync(wal->seg_fd);
+        if (sync_data_fd(wal->seg_fd) != 0) {
+            pthread_mutex_unlock(&wal->lock);
+            return -1;
+        }
+    } else {
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
     }
 
     /* Iterate over all segment files in order */
@@ -617,11 +660,16 @@ int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
 
     /* Flush current segment */
     if (wal->seg_fd >= 0) {
-        fdatasync(wal->seg_fd);
+        if (sync_data_fd(wal->seg_fd) != 0) {
+            pthread_mutex_unlock(&wal->lock);
+            return -1;
+        }
+    } else {
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
     }
 
-    /* Record the checkpoint LSN */
-    wal->last_checkpoint_lsn = checkpoint_lsn;
+    bool removed = false;
 
     /* Truncate old segments (those with max LSN < checkpoint_lsn).
      * For simplicity, we remove all segments except the current one.
@@ -640,12 +688,29 @@ int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
                         /* Path too long — skip this entry */
                         continue;
                     }
-                    unlink(path);
+                    if (unlink(path) != 0 && errno != ENOENT) {
+                        closedir(dir);
+                        pthread_mutex_unlock(&wal->lock);
+                        return -1;
+                    }
+                    removed = true;
                 }
             }
         }
         closedir(dir);
+    } else {
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
     }
+
+    if (removed && wal->durability != QIHSE_WAL_DURABILITY_NONE &&
+        sync_directory(wal->directory) != 0) {
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
+    }
+
+    /* Publish checkpoint state only after the selected durability work passed. */
+    wal->last_checkpoint_lsn = checkpoint_lsn;
 
     pthread_mutex_unlock(&wal->lock);
     return 0;
