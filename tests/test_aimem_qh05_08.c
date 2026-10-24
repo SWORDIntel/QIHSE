@@ -157,15 +157,23 @@ int main(void) {
     as_of.text = NULL;
     as_of.as_of_ingest_ms = first.valid_from_ingest_ms;
     snapshot = qihse_ai_memory_query_begin(server, reader, &as_of); assert(snapshot);
-    memset(page, 0, sizeof page);
-    size_t as_of_count = qihse_ai_memory_query_next(snapshot, reader, page, 2u);
-    assert(as_of_count >= 1u);
     bool saw_first = false;
-    for (size_t i = 0; i < as_of_count; i++)
-        if (strcmp(page[i].version.version_id, first.version_id) == 0)
-            saw_first = true;
-    assert(saw_first);
-    qihse_ai_memory_query_hits_free(page, as_of_count);
+    bool saw_replacement = false;
+    size_t as_of_count = 0u;
+    for (;;) {
+        memset(page, 0, sizeof page);
+        size_t n = qihse_ai_memory_query_next(snapshot, reader, page, 2u);
+        if (!n) break;
+        as_of_count += n;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(page[i].version.version_id, first.version_id) == 0)
+                saw_first = true;
+            if (strcmp(page[i].version.version_id, updated.version_id) == 0)
+                saw_replacement = true;
+        }
+        qihse_ai_memory_query_hits_free(page, n);
+    }
+    assert(as_of_count >= 1u && saw_first && !saw_replacement);
     qihse_ai_memory_query_end(snapshot);
 
     qihse_ai_memory_query_v1_t semantic = query;
