@@ -274,7 +274,11 @@ were failing; root causes fixed and committed (`bb8e49d`):
 | test-cluster-bus-bind | OpenSSL used without `-lcrypto` | link fix |
 | test-amx-only / avx512-direct / vnni-only / zen-epyc / all-isa | forced ISAs the host lacks | capability-gated SKIP (see §6a) |
 
-## Still open — pre-existing WIP defects (not test hygiene)
+## Historical defects open before suite remediation round 3
+
+The diagnoses below describe the initial failures. They were subsequently
+resolved in the remediation section that follows; they are not current open
+defects.
 
 1. **fabric remote embed is impossible by construction.**
    `qihse_ai_memory_store()` fails the claims-built remote context because
@@ -297,7 +301,8 @@ were failing; root causes fixed and committed (`bb8e49d`):
    auth-init fix; the fix merely exposed the deeper lock-ordering issue.
    `test` (the aggregate) inherits these three.
 
-Net: 183 targets, everything green except the three pre-existing WIP defects above.
+At that earlier checkpoint, 183 targets had three remaining failures. The
+round-3 remediation below records the fixes and later verification.
 
 ---
 
@@ -364,6 +369,8 @@ were fixed without changing the authorization or transport policy:
 
 A clean `make -s test` rerun exited 0; gold reported 72/72 workloads passing
 across all 11 areas. The 48 `test-*` targets outside the aggregate and gold
-were also run individually and passed. This validates all 183 defined
-`test-*` targets plus the aggregate, while the secure live replication and
-slot-transfer gaps above remain open.
+were also run individually and passed. This validated the 183 `test-*`
+targets wired at that point plus the aggregate. The Python PG SDK target added
+afterward is wired into future aggregate runs and passed independently (8/8).
+The Rust SDK unit suite also passes (2/2). Secure live replication and
+data-bearing slot-transfer gaps remain open.
