@@ -340,3 +340,30 @@ Its focused run passed 6/6. The gold pack expects that exact result. Pinned
 QKP replica pull still requires a read-only replica; live authenticated write
 duplication to a promotable successor remains unimplemented and is not claimed
 by this drill.
+
+---
+
+# Full-suite verification — 2026-10-24
+
+The first `make -k test` collection pass found three further failures. All
+were fixed without changing the authorization or transport policy:
+
+- `test-aimem-qh05-08` checked only the first two-row page of a three-row
+  as-of query. It now drains the snapshot pages and requires the original
+  version while excluding its later replacement.
+- `test-fts-persist-adapter` used a 2-second reply poll that timed out during
+  first `AUTH` under suite load. It now uses a 30-second total monotonic
+  deadline with a command-specific diagnostic.
+- The loadshift smoke exposed a real fail-open ordering bug: data-bearing
+  `MOVESLOTS` flipped ownership before discovering that target authentication
+  was unavailable, stranding source keys. Handoff now rejects incomplete
+  enumeration, missing credentials, and failed target connect/AUTH before an
+  ownership change. The gold smoke asserts explicit refusal, intact keys,
+  unchanged slot views, and no partial peer copy (6/6). Pinned-QKP
+  data-bearing slot transfer remains an open implementation gap.
+
+A clean `make -s test` rerun exited 0; gold reported 72/72 workloads passing
+across all 11 areas. The 48 `test-*` targets outside the aggregate and gold
+were also run individually and passed. This validates all 183 defined
+`test-*` targets plus the aggregate, while the secure live replication and
+slot-transfer gaps above remain open.
