@@ -15,7 +15,7 @@ For the project overview, start with the [root README](../README.md). For subsys
 
 ## 1. Check the toolchain
 
-QIHSE is a native C/C++ project targeting Linux. The build also integrates Python, OpenSSL, liburing, LuaJIT, eBPF/XDP, SQLite, and post-quantum cryptography components.
+QIHSE is a native C/C++ project targeting Linux. The build also integrates Python, OpenSSL, liburing, LuaJIT, eBPF/XDP, SQLite, nlohmann-json, and post-quantum cryptography components.
 
 Run the built-in environment check first:
 
