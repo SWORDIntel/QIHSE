@@ -36,14 +36,14 @@ set -euo pipefail
 # (pqc_require): cleartext redis-cli access is rejected; verification uses
 # the replica pull logs + systemd state instead.
 #
-# host | name | glob | source host | source port | peer node id | peer dsa pub | local RESP port | env file
+# host | name | glob | source host | source port | peer node id | peer dsa pub | local RESP port | env file | local bus port
 REPLICAS=(
-    "t420|keystone|keystone/*|192.168.1.250|7101|192.168.1.250|qihse_dsa_pub_t320.pem|7201|cluster-node0.env"
-    "t420|kp14|kp14/*|192.168.1.250|7101|192.168.1.250|qihse_dsa_pub_t320.pem|7202|cluster-node0.env"
-    "730xd|audit|audit/*|192.168.1.91|7100|192.168.1.91|qihse_dsa_pub_t420.pem|7201|cluster-node5.env"
-    "730xd|chain|chain:*|192.168.1.91|7100|192.168.1.91|qihse_dsa_pub_t420.pem|7202|cluster-node5.env"
-    "t320|tool|tool:*|192.168.1.90|7115|192.168.1.90|qihse_dsa_pub_730xd.pem|7201|cluster-node1.env"
-    "t320|sabot|sabot/*|192.168.1.90|7115|192.168.1.90|qihse_dsa_pub_730xd.pem|7202|cluster-node1.env"
+    "t420|keystone|keystone/*|192.168.1.250|7101|192.168.1.250|qihse_dsa_pub_t320.pem|7201|cluster-node0.env|17201"
+    "t420|kp14|kp14/*|192.168.1.250|7101|192.168.1.250|qihse_dsa_pub_t320.pem|7202|cluster-node0.env|17202"
+    "730xd|audit|audit/*|192.168.1.91|7100|192.168.1.91|qihse_dsa_pub_t420.pem|7201|cluster-node5.env|17201"
+    "730xd|chain|chain:*|192.168.1.91|7100|192.168.1.91|qihse_dsa_pub_t420.pem|7202|cluster-node5.env|17202"
+    "t320|tool|tool:*|192.168.1.90|7115|192.168.1.90|qihse_dsa_pub_730xd.pem|7201|cluster-node1.env|17201"
+    "t320|sabot|sabot/*|192.168.1.90|7115|192.168.1.90|qihse_dsa_pub_730xd.pem|7202|cluster-node1.env|17202"
 )
 
 declare -A HOST_IP=(
@@ -83,8 +83,8 @@ on_host() {
 
 replica_unit() { # spec -> unit file contents
     local spec="$1"
-    local host name glob src_host src_port peer_id peer_pub port envfile
-    IFS='|' read -r host name glob src_host src_port peer_id peer_pub port envfile <<<"$spec"
+    local host name glob src_host src_port peer_id peer_pub port envfile bus_port
+    IFS='|' read -r host name glob src_host src_port peer_id peer_pub port envfile bus_port <<<"$spec"
     cat <<EOF
 [Unit]
 Description=QIHSE read-only replica ($name: $glob <- $peer_id)
@@ -99,6 +99,7 @@ Environment=LD_LIBRARY_PATH=${LIB_DIR[$host]}
 ExecStart=${BIN_DIR[$host]}/qihse-cluster-daemon \\
   --bind ${HOST_IP[$host]} \\
   --port $port \\
+  --bus-port $bus_port \\
   --dir /opt/qihse-replica/$name \\
   --replica-read-only \\
   --replicate '$glob' \\
@@ -110,7 +111,10 @@ ExecStart=${BIN_DIR[$host]}/qihse-cluster-daemon \\
   --replication-peer-dsa-pub /etc/qihse/keys/$peer_pub \\
   --pqc-node-id replica-$host \\
   --pqc-identity-dir /etc/qihse/keys \\
-  --pqc-trusted-pub /etc/qihse/keys/$peer_pub
+  --pqc-trusted-pub /etc/qihse/keys/$peer_pub \\
+  --pqc-trusted-pub /etc/qihse/keys/qihse_dsa_pub_t420.pem \\
+  --admin-peer-node-id admin-t420 \\
+  --admin-peer-dsa-pub /etc/qihse/keys/qihse_dsa_pub_t420.pem
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
@@ -142,7 +146,7 @@ for spec in "${REPLICAS[@]}"; do
             else
                 printf '%s\n' "$unit_text" | ssh -o BatchMode=yes "${SSH_TARGET[$host]}" "cat > '/etc/systemd/system/$unit'" 2>/dev/null
             fi
-            on_host "$host" "systemctl daemon-reload && systemctl enable --now '$unit'"
+            on_host "$host" "systemctl daemon-reload && systemctl enable '$unit' && systemctl restart '$unit'"
             sleep 2
             on_host "$host" "systemctl is-active '$unit'" || true
             ;;
