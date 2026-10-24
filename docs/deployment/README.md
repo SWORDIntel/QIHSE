@@ -1,6 +1,20 @@
 # QIHSE Deployment Guide
 
-> **Status: partial — status unverified.** A deployment guide that predates the
+> **Current deployment methods (authoritative):**
+> - Build: `./scripts/build-native.sh --auto` per machine — auto-detects every
+>   SIMD ISA and `make all` runs the mandatory host-ISA verification.
+> - Cluster install: `scripts/install_qihse.sh` (provisions keys/config, systemd
+>   units, health checks).
+> - Rolling binary updates: `scripts/cluster_rolling_restart.sh` (deploy +
+>   restart one node at a time + verify).
+> - Replication: `scripts/cluster_replica_deploy.sh` (read-only QKP-pinned
+>   replica units, one namespace each).
+> - Operator access on hardened nodes: `qihse-admin-cli` (pinned QKP admin
+>   identity). See [OPERATIONS.md](../OPERATIONS.md) and
+>   [manual/deployment/README.md](../manual/deployment/README.md).
+>
+> **Status: partial — status unverified.** The sections below are a legacy
+deployment guide that predates the
 > federation and mTLS work; cluster and TLS guidance should be checked against
 > [architecture/federation_overview.md](../architecture/federation_overview.md)
 > and the [API reference](../API_REFERENCE.md).

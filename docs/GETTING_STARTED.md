@@ -117,6 +117,19 @@ The launcher can also start a test server or database-oriented CLI:
 ./qihse db --help
 ```
 
+Connect to a running node. Hardened nodes (`pqc_require`, i.e. any node
+with replication or admin pins configured) reject cleartext clients — use
+the QKP admin CLI with the pinned administrator identity:
+
+```bash
+qihse-admin-cli --host 127.0.0.1 --port 7100 \
+    --node-id admin-t420 \
+    --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem --ping
+```
+
+Non-hardened nodes accept redis-cli password AUTH (`REDISCLI_AUTH` from
+the operator environment file).
+
 ## 5. Python
 
 The repository contains native Python bindings and compatibility SDKs under [`sdks/python/`](../sdks/python/).

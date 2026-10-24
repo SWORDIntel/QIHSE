@@ -416,8 +416,62 @@ Replication data plane access requires cryptographic mutual authorization:
 - **Primary (Server)** pins the authorized replica via `--replication-peer-node-id <id>`
   and `--replication-peer-dsa-pub <path>`. When a client connects and requests
   `REPL.SNAPSHOT.BEGIN` or `REPL.DELTA`, the primary enforces `qihse_resp_repl_data_plane_allowed()`.
-  Connections lacking a matching ML-DSA fingerprint or operator clearance receive:
-  `-NOPERM REPL requires QKP1 from the pinned peer and an authenticated system operator`.
+  Connections lacking a matching ML-DSA fingerprint receive:
+  `-NOPERM REPL requires QKP1 from the pinned peer`.
+
+#### Deployed Replication Topology (the supported wiring)
+
+Replication runs as **dedicated read-only replica daemon instances**, one
+namespace each, because the puller requires `--replica-read-only` (a
+read-only store) and **exactly one** `--replicate` namespace:
+
+```
+node0 (t420)   --serves--> replica-730xd (audit/*, chain:*)
+node5 (730xd)  --serves--> replica-t320  (tool:*, sabot/*)
+node1 (t320)   --serves--> replica-t420  (keystone/*, kp14/*)
+```
+
+- Every master pins **one** peer identity (one replica host) with
+  `--replication-peer-node-id`/`--replication-peer-dsa-pub`; the replica
+  host runs one systemd unit (`qihse-replica-<ns>.service`) per namespace,
+  all sharing the host identity (`--pqc-node-id replica-<host>`).
+- Replica units set `Environment=LD_LIBRARY_PATH=<lib dir>` (the daemon
+  otherwise loads a stale system libqihse.so) and pull on a 60 s socket
+  timeout (large-store snapshot exports exceed the old 5 s limit).
+- The replication service principal (`--replication-principal-id`, default
+  65535) is a **non-Operator** principal provisioned automatically at
+  startup; the KV replica-plane (cursors, snapshot install, record apply)
+  accepts it via `qihse_kv_store_set_replication_principal_id()`.
+- Setting any replication pin makes the master **QKP-only for RESP**
+  (`pqc_require`): cleartext clients are rejected, including `redis-cli`.
+  Operator access then goes through the pinned admin identity — see the
+  next section.
+
+Deploy/verify with `scripts/cluster_replica_deploy.sh` (unit generation +
+`--status`/`--remove`).
+
+#### Operator Access on Hardened Masters (`qihse-admin-cli`)
+
+`pqc_require` masters reject password AUTH and MACHINEAUTH tokens are
+scoped to the agent namespace (`t:<tenant>/machine/<id>/*`), so operator
+access uses a **pinned administrator identity** — the same mutual-pin
+mechanism as replication, mapped to the system operator:
+
+```bash
+# master unit:
+--admin-peer-node-id admin-t420 --admin-peer-dsa-pub /etc/qihse/keys/qihse_dsa_pub_t420.pem
+
+# client (tools/qihse_admin_cli.c):
+qihse-admin-cli --host 192.168.1.90 --port 7115 \
+    --node-id admin-t420 \
+    --trusted-pub /etc/qihse/keys/qihse_dsa_pub_730xd.pem \
+    --cluster-nodes
+```
+
+The pinned identity maps to the system operator (`QIHSE_RESP_AUTH_QKP_ADMIN`,
+full command scope). Health probes in `cluster_rolling_restart.sh` and
+`install_qihse.sh` use this path, falling back to redis-cli password AUTH
+only for non-hardened deployments.
 
 #### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
 

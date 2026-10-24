@@ -522,6 +522,8 @@ LD_LIBRARY_PATH=. ./tests/qihse_cluster_bootstrap --benchmark --latency --base-p
 
 ### 14.3 Connect with redis-cli
 
+Non-hardened (cleartext-AUTH) nodes accept plain redis-cli:
+
 ```bash
 # Cluster-aware (follows MOVED)
 redis-cli -p 7000 -c SET foo bar
@@ -532,6 +534,17 @@ redis-cli -p 7000 CLUSTER INFO
 redis-cli -p 7000 CLUSTER NODES
 redis-cli -p 7000 CLUSTER SLOTS
 redis-cli -p 7000 CLUSTER KEYSLOT mykey
+```
+
+**Hardened nodes** (`pqc_require`, i.e. any node with replication or admin
+pins configured) reject cleartext clients. Use the QKP admin CLI with the
+pinned administrator identity instead:
+
+```bash
+qihse-admin-cli --host <node-ip> --port <port> \
+    --node-id admin-t420 \
+    --trusted-pub /etc/qihse/keys/qihse_dsa_pub_<node>.pem \
+    --command "CLUSTER NODES"
 ```
 
 ### 14.4 Run Unit Tests

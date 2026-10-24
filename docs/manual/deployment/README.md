@@ -135,11 +135,19 @@ sudo apt install -y intel-oneapi-basekit
 sudo apt install -y libopenvino-dev
 
 # Build QIHSE
+# Build on each machine natively: build-native.sh auto-detects every SIMD
+# ISA (AVX, F16C, AVX2, AVX-512, AVX-VNNI, AMX) and `make all` verifies
+# the ISA matrix against the host before compiling.
 git clone <repository-url>
-cd qihse-breakthroughalgo
-make all
+cd qihse
+./scripts/build-native.sh --auto   # = native build with mandatory ISA check
 sudo make install
 sudo ldconfig
+
+# Verify on a hardened node (QKP admin pin) or with redis-cli on
+# non-hardened nodes:
+qihse-admin-cli --host 127.0.0.1 --port 7100 --node-id admin-t420 \
+    --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem --ping
 ```
 
 ### Configuration for Production
