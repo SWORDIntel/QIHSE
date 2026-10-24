@@ -17,13 +17,13 @@ typedef struct qihse_resp_server qihse_resp_server_t;
 
 /* Slot-range handoff — the CLUSTER MOVESLOTS core.
  *
- * Streams every local KV record whose slot falls in [first,last] to the
- * target node over the MIGRATE wire flow (AUTH, ASKING, SET [PX]), deletes
- * the local copies, and flips ownership (local topology + bus broadcast).
- * Ownership flips BEFORE the transfer so the target accepts incoming writes;
- * a transfer that fails midway therefore leaves ownership at the target with
- * data still local. Callers detect that via *out_moved < *out_collected and
- * roll the ownership back (see qihse_cluster_set_range_owner).
+ * Enumerates with the live system principal and validates the target
+ * connection/authentication before changing ownership. Empty ranges may be
+ * reassigned without connecting. For a data-bearing range, ownership flips
+ * before the authenticated MIGRATE wire flow (ASKING, SET [PX]) so the target
+ * accepts incoming writes. A mid-transfer failure can still leave partial
+ * data on each node; callers detect this via *out_moved < *out_collected and
+ * must reconcile the records before restoring service.
  *
  * Runs as the system-domain principal. Returns 0 when the range moved
  * completely (or there was nothing to move), -1 on failure — err, when

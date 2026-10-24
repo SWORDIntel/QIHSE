@@ -315,7 +315,7 @@ workload cluster-discovery-smoke area=distributed-failure expect=pass timeout=90
     run="python3 tests/cluster_discover_smoke.py --self-spawn"
 
 workload cluster-loadshift-smoke area=distributed-failure expect=pass timeout=900 \
-    output="load-shift smoke: 9/9 checks passed" \
+    output="load-shift guard: 6/6 checks passed" \
     run="python3 tests/cluster_loadshift_smoke.py --self-spawn"
 
 # ----------------------------------------------------------------------------
