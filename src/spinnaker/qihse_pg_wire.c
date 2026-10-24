@@ -591,6 +591,134 @@ static int pg_handle_sql_dml(int fd, const char* sql, qihse_user_t* user,
     return pg_send_ready_for_query_state(fd, pg_txn_ready_status(session));
 }
 
+static int pg_handle_sql_select(int fd, const char* sql, qihse_user_t* user,
+                                pg_transaction_session_t* session) {
+    if (!session || !session->uwp || !session->uwp->sql_engine ||
+        !session->uwp->schema || !session->uwp->txn_manager) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "SQL row-store context is not configured", false);
+    }
+    if (session->txn) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "transactional SELECT is unsupported", true);
+    }
+    if (pg_has_multiple_statements(sql)) {
+        return pg_send_error_ready(fd, session, "0A000",
+                                   "multiple statements in one query are unsupported", false);
+    }
+
+    pg_uwp_capture_t capture = {0};
+    uwp_sts_result_t status = uwp_dispatch_sql(session->uwp, 0x02,
+        (const uint8_t*)sql, strlen(sql) + 1u, NULL, user, fd,
+        pg_uwp_capture_write, &capture);
+    if (status != UWP_STS_OK || capture.failed || !capture.data) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session,
+            status == UWP_STS_ERR_PERM ? "42501" : "42000",
+            "QIHSE SQL statement failed or was refused", false);
+    }
+
+    /* UWP's bounded row-store SELECT response is header + zero or more rows
+     * + an explicit count footer. Convert that text boundary into PostgreSQL
+     * RowDescription/DataRow messages only after validating the full shape. */
+    char* footer = strstr(capture.data, "\nOK stmt_type=SELECT rows=");
+    char* header_end = strchr(capture.data, '\n');
+    if (!footer || !header_end || footer < header_end) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "malformed SQL executor response", false);
+    }
+    char* count_end = NULL;
+    unsigned long long expected_rows = strtoull(
+        footer + sizeof("\nOK stmt_type=SELECT rows=") - 1u, &count_end, 10);
+    if (!count_end || count_end == footer + sizeof("\nOK stmt_type=SELECT rows=") - 1u ||
+        (*count_end != '\n' && *count_end != '\0') ||
+        (*count_end == '\n' && count_end[1] != '\0')) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "malformed SQL executor row count", false);
+    }
+
+    const size_t max_columns = 64u;
+    const char* names[64];
+    int32_t type_oids[64];
+    int16_t ncols = 0;
+    *header_end = '\0';
+    char* p = capture.data;
+    while (p <= header_end && ncols < (int16_t)max_columns) {
+        char* tab = strchr(p, '\t');
+        char* end = tab && tab < header_end ? tab : header_end;
+        names[ncols] = p;
+        type_oids[ncols] = 25; /* text */
+        ncols++;
+        if (end == header_end) break;
+        *end = '\0';
+        p = end + 1;
+    }
+    if (ncols == 0 || (p <= header_end && ncols == (int16_t)max_columns &&
+                       strchr(p, '\t') && strchr(p, '\t') < header_end)) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "54000",
+                                   "too many SELECT result columns", false);
+    }
+
+    size_t actual_rows = 0;
+    for (char* row = header_end + 1; row < footer;) {
+        char* end = strchr(row, '\n');
+        if (!end || end > footer) end = footer;
+        if (end == row) {
+            free(capture.data);
+            return pg_send_error_ready(fd, session, "XX000",
+                                       "malformed SQL executor row", false);
+        }
+        size_t fields = 1u;
+        for (char* q = row; q < end; ++q) if (*q == '\t') fields++;
+        if (fields != (size_t)ncols) {
+            free(capture.data);
+            return pg_send_error_ready(fd, session, "XX000",
+                                       "SQL executor row width mismatch", false);
+        }
+        actual_rows++;
+        row = end < footer ? end + 1 : footer;
+    }
+    if (actual_rows != (size_t)expected_rows) {
+        free(capture.data);
+        return pg_send_error_ready(fd, session, "XX000",
+                                   "SQL executor row count mismatch", false);
+    }
+
+    if (pg_send_row_description(fd, names, type_oids, ncols) < 0) {
+        free(capture.data);
+        return -1;
+    }
+    for (char* row = header_end + 1; row < footer;) {
+        char* end = strchr(row, '\n');
+        if (!end || end > footer) end = footer;
+        if (end < footer) *end = '\0';
+        const char* values[64];
+        char* field = row;
+        for (int16_t i = 0; i < ncols; ++i) {
+            values[i] = field;
+            char* tab = i + 1 < ncols ? strchr(field, '\t') : NULL;
+            if (tab) {
+                *tab = '\0';
+                field = tab + 1;
+            }
+        }
+        if (pg_send_data_row(fd, values, ncols) < 0) {
+            free(capture.data);
+            return -1;
+        }
+        row = end < footer ? end + 1 : footer;
+    }
+
+    char command[64];
+    snprintf(command, sizeof(command), "SELECT %llu", expected_rows);
+    free(capture.data);
+    if (pg_send_command_complete(fd, command) < 0) return -1;
+    return pg_send_ready_for_query_state(fd, 'I');
+}
+
 static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx,
                                const char* raw_query, qihse_user_t* user,
                                pg_transaction_session_t* session) {
@@ -619,6 +747,11 @@ static int pg_handle_query_ctx(int fd, pg_cluster_context_t* ctx,
             parsed->stmt_type == QIHSE_SQL_UPDATE ||
             parsed->stmt_type == QIHSE_SQL_DELETE) {
             rc = pg_handle_sql_dml(fd, query, user, session, parsed);
+            qihse_sql_ast_free(parsed);
+            return rc;
+        }
+        if (parsed->stmt_type == QIHSE_SQL_SELECT && session && session->uwp) {
+            rc = pg_handle_sql_select(fd, query, user, session);
             qihse_sql_ast_free(parsed);
             return rc;
         }

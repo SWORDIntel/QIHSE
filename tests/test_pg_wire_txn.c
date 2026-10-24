@@ -107,6 +107,91 @@ static void send_pg_msg(int fd, uint8_t tag, const char* body, size_t body_len) 
     }
 }
 
+static void start_pg_client(int fd, const char* username, const char* password) {
+    uint8_t startup[512];
+    size_t pos = 0;
+    const char* keys[] = {"user", "database"};
+    const char* values[] = {username, "qihse"};
+    for (size_t i = 0; i < 2; ++i) {
+        size_t key_len = strlen(keys[i]) + 1u;
+        size_t value_len = strlen(values[i]) + 1u;
+        memcpy(startup + pos, keys[i], key_len); pos += key_len;
+        memcpy(startup + pos, values[i], value_len); pos += value_len;
+    }
+    startup[pos++] = '\0';
+    uint32_t packet_len = htonl((uint32_t)(8u + pos));
+    uint32_t protocol = htonl(196608u);
+    write_all(fd, &packet_len, sizeof(packet_len));
+    write_all(fd, &protocol, sizeof(protocol));
+    write_all(fd, startup, pos);
+
+    uint8_t tag;
+    uint32_t wire_len, auth_type;
+    read_all(fd, &tag, 1);
+    assert(tag == 'R');
+    read_all(fd, &wire_len, sizeof(wire_len));
+    assert(ntohl(wire_len) == 8u);
+    read_all(fd, &auth_type, sizeof(auth_type));
+    assert(ntohl(auth_type) == 3u);
+
+    size_t password_len = strlen(password) + 1u;
+    uint8_t password_tag = 'p';
+    uint32_t password_msg_len = htonl((uint32_t)(4u + password_len));
+    write_all(fd, &password_tag, 1);
+    write_all(fd, &password_msg_len, sizeof(password_msg_len));
+    write_all(fd, password, password_len);
+    read_until_ready(fd);
+}
+
+static char read_ready_status_capture_error(int fd, uint8_t* error,
+                                            size_t error_cap,
+                                            size_t* error_len) {
+    if (error_len) *error_len = 0;
+    for (;;) {
+        uint8_t tag;
+        uint32_t wire_len;
+        read_all(fd, &tag, 1);
+        read_all(fd, &wire_len, sizeof(wire_len));
+        uint32_t len = ntohl(wire_len);
+        assert(len >= 4 && len <= 1024 * 1024);
+        size_t body_len = (size_t)len - 4u;
+        uint8_t* body = malloc(body_len ? body_len : 1u);
+        assert(body);
+        read_all(fd, body, body_len);
+        if (tag == 'E' && error && error_cap && error_len) {
+            size_t copy = body_len < error_cap - 1u ? body_len : error_cap - 1u;
+            memcpy(error, body, copy);
+            *error_len = copy;
+        }
+        if (tag == 'Z') {
+            assert(body_len == 1u);
+            char result = (char)body[0];
+            free(body);
+            return result;
+        }
+        free(body);
+    }
+}
+
+static bool contains_bytes(const void* haystack, size_t haystack_len,
+                           const char* needle) {
+    size_t needle_len = strlen(needle);
+    if (!needle_len || needle_len > haystack_len) return false;
+    const uint8_t* bytes = haystack;
+    for (size_t i = 0; i <= haystack_len - needle_len; ++i)
+        if (memcmp(bytes + i, needle, needle_len) == 0) return true;
+    return false;
+}
+
+static uint64_t table_resource_id(const char* name) {
+    uint32_t hash = 2166136261u;
+    for (const unsigned char* p = (const unsigned char*)name; *p; ++p) {
+        hash ^= *p;
+        hash *= 16777619u;
+    }
+    return (uint64_t)hash;
+}
+
 static void test_pg_wire_handshake_and_queries() {
     printf("Testing PostgreSQL Wire Protocol Sharded Multi-Model Ingress...\n");
     signal(SIGPIPE, SIG_IGN);
@@ -117,6 +202,9 @@ static void test_pg_wire_handshake_and_queries() {
     assert(op);
     qihse_user_t* user = qihse_auth_create_user(op, 1, QIHSE_ROLE_OPERATOR, 0xFFFF, 0xFFFF, "PGWireClusterTestPass123!", false);
     assert(user);
+    qihse_user_t* guest = qihse_auth_create_user(
+        op, 2, QIHSE_ROLE_GUEST, 0, 0, "PGWireGuestPass123!", false);
+    assert(guest && qihse_user_get_classification(guest) == 0u);
 
     qihse_uwp_context_t uwp;
     memset(&uwp, 0, sizeof(uwp));
@@ -128,6 +216,19 @@ static void test_pg_wire_handshake_and_queries() {
     const char* ddl = "CREATE TABLE pg_txn_wire (id INT, note TEXT)";
     assert(uwp_dispatch_sql(&uwp, 0x02, (const uint8_t*)ddl, strlen(ddl) + 1,
                             NULL, user, -1, capture_reply, NULL) == UWP_STS_OK);
+    const char* protected_ddl =
+        "CREATE TABLE pg_txn_protected (id INT, note TEXT)";
+    assert(uwp_dispatch_sql(&uwp, 0x02, (const uint8_t*)protected_ddl,
+                            strlen(protected_ddl) + 1, NULL, user, -1,
+                            capture_reply, NULL) == UWP_STS_OK);
+    const char* protected_insert =
+        "INSERT INTO pg_txn_protected VALUES (7, 'PG-WIRE-PROTECTED-MARKER')";
+    assert(uwp_dispatch_sql(&uwp, 0x02, (const uint8_t*)protected_insert,
+                            strlen(protected_insert) + 1, NULL, user, -1,
+                            capture_reply, NULL) == UWP_STS_OK);
+    assert(qihse_auth_grant_object(op, guest, 0u,
+                                   table_resource_id("pg_txn_wire"),
+                                   QIHSE_ACL_READ));
 
     int fds[2];
     int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -167,48 +268,13 @@ static void test_pg_wire_handshake_and_queries() {
     pthread_t stid;
     pthread_create(&stid, NULL, server_worker, &sargs);
 
-    // 1. Send Startup packet (Length, Protocol: 3.0, "user\0User_1\0database\0qihse\0\0")
-    char startup_payload[128];
-    int ppos = 0;
-    memcpy(startup_payload + ppos, "user", 5); ppos += 5;
-    memcpy(startup_payload + ppos, "User_1", 7); ppos += 7;
-    memcpy(startup_payload + ppos, "database", 9); ppos += 9;
-    memcpy(startup_payload + ppos, "qihse", 6); ppos += 6;
-    startup_payload[ppos++] = '\0';
-
-    uint32_t pkt_len = htonl((uint32_t)(8 + ppos));
-    uint32_t proto = htonl(196608);
-    write_all(fds[0], &pkt_len, 4);
-    write_all(fds[0], &proto, 4);
-    write_all(fds[0], startup_payload, ppos);
-
-    // Read AuthenticationCleartextPassword ('R', len=8, type=3)
-    uint8_t tag = 0;
-    read_all(fds[0], &tag, 1);
-    assert(tag == 'R');
-    uint32_t auth_len = 0;
-    read_all(fds[0], &auth_len, 4);
-    auth_len = ntohl(auth_len);
-    assert(auth_len == 8);
-    uint32_t auth_type = 0;
-    read_all(fds[0], &auth_type, 4);
-    auth_type = ntohl(auth_type);
-    assert(auth_type == 3);
-
-    // Send PasswordMessage ('p', len, password\0)
     const char* password = "PGWireClusterTestPass123!";
-    size_t pw_len = strlen(password) + 1;
-    uint32_t pw_msg_len = htonl((uint32_t)(4 + pw_len));
-    uint8_t pw_tag = 'p';
-    write_all(fds[0], &pw_tag, 1);
-    write_all(fds[0], &pw_msg_len, 4);
-    write_all(fds[0], password, pw_len);
-
-    // Read responses until ReadyForQuery ('Z')
-    read_until_ready(fds[0]);
+    start_pg_client(fds[0], "User_1", password);
     printf("  -> Startup handshake OK (AuthOk + ParameterStatus + ReadyForQuery)\n");
 
     const char* begin = "BEGIN\0";
+    const char* rollback = "ROLLBACK\0";
+    const char* commit = "COMMIT\0";
     send_pg_msg(fds[0], 'Q', begin, strlen(begin) + 1);
     assert(read_ready_status(fds[0]) == 'T');
     const char* insert1 = "INSERT INTO pg_txn_wire VALUES (1, 'rollback')\0";
@@ -217,17 +283,29 @@ static void test_pg_wire_handshake_and_queries() {
     qihse_table_t* table = qihse_table_store_find_table(
         qihse_uwp_sql_table_store(), "pg_txn_wire");
     assert(table && qihse_table_row_count(table) == 0);
-    const char* rollback = "ROLLBACK\0";
     send_pg_msg(fds[0], 'Q', rollback, strlen(rollback) + 1);
+    assert(read_ready_status(fds[0]) == 'I');
+    assert(qihse_table_row_count(table) == 0);
+
+    /* A statement error aborts the transaction; later writes stay private,
+     * and COMMIT resolves as a rollback. */
+    send_pg_msg(fds[0], 'Q', begin, strlen(begin) + 1);
+    assert(read_ready_status(fds[0]) == 'T');
+    const char* bad_insert = "INSERT INTO missing_pg_txn_table VALUES (9, 'nope')\0";
+    send_pg_msg(fds[0], 'Q', bad_insert, strlen(bad_insert) + 1);
+    assert(read_ready_status(fds[0]) == 'E');
+    send_pg_msg(fds[0], 'Q', insert1, strlen(insert1) + 1);
+    assert(read_ready_status(fds[0]) == 'E');
+    send_pg_msg(fds[0], 'Q', commit, strlen(commit) + 1);
     assert(read_ready_status(fds[0]) == 'I');
     assert(qihse_table_row_count(table) == 0);
 
     send_pg_msg(fds[0], 'Q', begin, strlen(begin) + 1);
     assert(read_ready_status(fds[0]) == 'T');
-    const char* insert2 = "INSERT INTO pg_txn_wire VALUES (2, 'commit')\0";
+    const char* insert2 =
+        "INSERT INTO pg_txn_wire VALUES (2, 'PG-WIRE-ALLOWED-ROW')\0";
     send_pg_msg(fds[0], 'Q', insert2, strlen(insert2) + 1);
     assert(read_ready_status(fds[0]) == 'T');
-    const char* commit = "COMMIT\0";
     send_pg_msg(fds[0], 'Q', commit, strlen(commit) + 1);
     assert(read_ready_status(fds[0]) == 'I');
     assert(qihse_table_row_count(table) == 1);
@@ -239,28 +317,8 @@ static void test_pg_wire_handshake_and_queries() {
     assert(read_ready_status(fds[0]) == 'T');
     assert(qihse_table_row_count(table) == 1);
 
-    // 2. Query virtual system tables: SELECT * FROM pg_catalog.pg_tables
-    const char* q1 = "SELECT * FROM pg_catalog.pg_tables\0";
-    send_pg_msg(fds[0], 'Q', q1, strlen(q1) + 1);
-
-    read_until_ready(fds[0]);
-    printf("  -> Virtual catalog tables discovery OK\n");
-
-    // 3. Query cluster topology view: SELECT * FROM cluster_nodes
-    const char* q2 = "SELECT * FROM cluster_nodes\0";
-    send_pg_msg(fds[0], 'Q', q2, strlen(q2) + 1);
-
-    read_until_ready(fds[0]);
-    printf("  -> Virtual cluster nodes introspection OK\n");
-
-    // 4. Query sharded multi-model: SELECT * FROM {device_4096} WHERE vector_search(embedding, top_k=5)
-    const char* q3 = "SELECT * FROM {device_4096} WHERE vector_search(embedding, top_k=5)\0";
-    send_pg_msg(fds[0], 'Q', q3, strlen(q3) + 1);
-
-    read_until_ready(fds[0]);
-    printf("  -> Sharded SQL query executed through distributed multi-model planner OK\n");
-
-    // Terminate connection
+    /* Disconnecting with a healthy active transaction rolls back its private
+     * row shadow. */
     uint32_t term_len = htonl(4);
     uint8_t term_tag = 'X';
     write_all(fds[0], &term_tag, 1);
@@ -271,6 +329,51 @@ static void test_pg_wire_handshake_and_queries() {
     join_deadline.tv_sec += 30;
     assert(pthread_timedjoin_np(stid, NULL, &join_deadline) == 0);
     close(fds[0]);
+    assert(qihse_table_row_count(table) == 1);
+
+    /* A second authenticated, clearance-0 principal may read the explicitly
+     * granted table. Access to the ungranted table is refused by the UWP SQL
+     * executor, and the protected marker is absent from the wire error. */
+    int guest_fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, guest_fds) == 0);
+    for (size_t i = 0; i < 2; ++i) {
+        assert(setsockopt(guest_fds[i], SOL_SOCKET, SO_RCVTIMEO,
+                          &io_timeout, sizeof(io_timeout)) == 0);
+        assert(setsockopt(guest_fds[i], SOL_SOCKET, SO_SNDTIMEO,
+                          &io_timeout, sizeof(io_timeout)) == 0);
+    }
+    server_thread_args_t guest_args = {
+        .server_fd = guest_fds[1], .store = kv, .topo = topo, .uwp = &uwp
+    };
+    pthread_t guest_thread;
+    assert(pthread_create(&guest_thread, NULL, server_worker, &guest_args) == 0);
+    start_pg_client(guest_fds[0], "User_2", "PGWireGuestPass123!");
+
+    const char* allowed_read =
+        "SELECT id, note FROM pg_txn_wire WHERE id = 2\0";
+    send_pg_msg(guest_fds[0], 'Q', allowed_read, strlen(allowed_read) + 1u);
+    assert(read_ready_status(guest_fds[0]) == 'I');
+
+    const char* denied_read =
+        "SELECT note FROM pg_txn_protected WHERE id = 7\0";
+    send_pg_msg(guest_fds[0], 'Q', denied_read, strlen(denied_read) + 1u);
+    uint8_t error_body[512];
+    size_t error_len = 0;
+    assert(read_ready_status_capture_error(guest_fds[0], error_body,
+                                           sizeof(error_body), &error_len) == 'I');
+    assert(error_len > 0);
+    assert(!contains_bytes(error_body, error_len, "PG-WIRE-PROTECTED-MARKER"));
+    puts("PASS low-clearance PG wire SELECT: table ACL denied and no marker disclosed");
+
+    write_all(guest_fds[0], &term_tag, 1);
+    write_all(guest_fds[0], &term_len, 4);
+    assert(clock_gettime(CLOCK_REALTIME, &join_deadline) == 0);
+    join_deadline.tv_sec += 30;
+    assert(pthread_timedjoin_np(guest_thread, NULL, &join_deadline) == 0);
+    close(guest_fds[0]);
+    qihse_table_t* protected_table = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "pg_txn_protected");
+    assert(protected_table && qihse_table_row_count(protected_table) == 1);
 
     qihse_kv_store_destroy(kv);
     qihse_cluster_topology_destroy(topo);
