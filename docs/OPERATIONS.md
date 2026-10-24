@@ -286,7 +286,7 @@ overlay-discovery, observability). The 2026-09-29 W7 wave added the consensus
 membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
 the browser negative-auth, QKP identity and feed-wire suites, and the
 self-spawning failover drill — the first workload that kills a REAL daemon
-peer (SIGKILL, successor takes all 16384 slots, duplicated keys survive) —
+peer (SIGKILL, successor takes all 16384 slots, a preseeded key survives) —
 plus the hermetic discovery and loadshift drills (loopback --self-spawn),
 the fusion recall/latency gate, non-vector index byte accounting, and
 backend busy-time accounting. Board: **72/72 pass, 11/11 areas FULL, zero
@@ -370,7 +370,8 @@ Verified behavior (2026-09-26):
 
 Key flags (from usage): `--node INDEX:HOST:PORT:BUS-PORT` (static topology,
 repeatable) or `--join HOST:BUS-PORT` (gossip discovery from a seed);
-`--slot-range[-of INDEX] FIRST-LAST`; `--redundancy-peer HOST:PORT`;
+`--slot-range[-of INDEX] FIRST-LAST`; `--redundancy-peer HOST:PORT`
+(rejected until pinned QKP write duplication is implemented);
 `--replicate GLOB` + `--replicate-interval S` (sovereign-local namespaces
 with anti-entropy pull; deletes are not propagated); `--max-clients N`;
 `--enable-scatter`; `--brain` / `--brain-act` and the `--brain-*` tuning
@@ -616,9 +617,13 @@ QIHSE_DATA_DIR=./build/cluster-smoke \
 python3 tests/cluster_failover_smoke.py
 ```
 
-Verified (2026-09-26): `failover drill: 5/5 checks passed` — writes on the
-lead, ASKING read on the successor, SIGKILL of the lead, slot takeover, and
-survival of the duplicated key. Environment knobs (all optional):
+Current drill: `failover drill: 6/6 checks passed` — rejects the disabled
+plaintext redundancy flag, writes on the lead, seeds and reads an
+unclassified duplicate on the successor through authenticated RESP, kills
+the lead, checks slot takeover, and checks survival of the seeded key. This
+does not claim live write duplication. Pinned QKP replica pull is tested
+separately and currently requires a read-only replica, so integrated
+replication to a promotable successor remains open. Environment knobs (all optional):
 `QIHSE_BIN` (default `./qihse-cluster-daemon`), `QIHSE_LIB_DIR` (default `.`),
 `QIHSE_DATA_DIR` (default `./build/cluster-smoke`), `QIHSE_NODE0_HOST` /
 `QIHSE_NODE1_HOST`, `QIHSE_NODE0_PORT` / `QIHSE_NODE1_PORT`,
