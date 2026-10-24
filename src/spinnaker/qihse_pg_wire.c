@@ -108,6 +108,13 @@ typedef struct {
     qihse_cluster_topology_t* topo;
 } pg_cluster_context_t;
 
+struct qihse_pg_wire_listener {
+    int fd;
+    uint16_t port;
+    qihse_uwp_context_t* uwp;
+    qihse_cluster_topology_t* topo;
+};
+
 /* Write exactly n bytes, retrying on EINTR / short writes. */
 static int pg_write_all(int fd, const void* buf, size_t n) {
     const uint8_t* p = (const uint8_t*)buf;
@@ -1348,6 +1355,114 @@ void qihse_pg_wire_handle_client_uwp(int fd, qihse_uwp_context_t* uwp,
         .topo = topo
     };
     pg_wire_handle_client_internal(fd, ctx, uwp);
+}
+
+qihse_pg_wire_listener_t* qihse_pg_wire_listener_open_uwp(
+    qihse_uwp_context_t* uwp, qihse_cluster_topology_t* topo,
+    const char* bind_address, uint16_t port) {
+    if (!uwp || !uwp->sql_engine || !uwp->schema || !uwp->txn_manager) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (!bind_address || bind_address[0] == '\0') bind_address = "127.0.0.1";
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    int reuse = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0 ||
+        bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 16) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*)&addr, &addr_len) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+    qihse_pg_wire_listener_t* listener =
+        (qihse_pg_wire_listener_t*)calloc(1, sizeof(*listener));
+    if (!listener) {
+        close(fd);
+        return NULL;
+    }
+    listener->fd = fd;
+    listener->port = ntohs(addr.sin_port);
+    listener->uwp = uwp;
+    listener->topo = topo;
+    return listener;
+}
+
+uint16_t qihse_pg_wire_listener_port(const qihse_pg_wire_listener_t* listener) {
+    return listener ? listener->port : 0;
+}
+
+int qihse_pg_wire_listener_accept_once(qihse_pg_wire_listener_t* listener,
+                                       int timeout_ms) {
+    if (!listener || listener->fd < 0 || timeout_ms < -1) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifndef _WIN32
+    struct pollfd pfd = {.fd = listener->fd, .events = POLLIN, .revents = 0};
+    int ready;
+    do { ready = poll(&pfd, 1, timeout_ms); } while (ready < 0 && errno == EINTR);
+    if (ready == 0) return 0;
+    if (ready < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return -1;
+#else
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(listener->fd, &readfds);
+    struct timeval timeout;
+    struct timeval* timeout_ptr = NULL;
+    if (timeout_ms >= 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        timeout_ptr = &timeout;
+    }
+    int ready = select(0, &readfds, NULL, NULL, timeout_ptr);
+    if (ready == 0) return 0;
+    if (ready < 0) return -1;
+#endif
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    int client_fd = (int)accept(listener->fd, (struct sockaddr*)&peer, &peer_len);
+    if (client_fd < 0) return -1;
+
+    struct timeval io_timeout = {.tv_sec = 30, .tv_usec = 0};
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &io_timeout, sizeof(io_timeout));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &io_timeout, sizeof(io_timeout));
+    pg_wire_handle_client_internal(client_fd,
+        (pg_cluster_context_t){
+            .store = (qihse_kv_store_t*)listener->uwp->kv,
+            .vdb = (qihse_vector_db_t)listener->uwp->vdb,
+            .tsdb = listener->uwp->tsdb,
+            .col = listener->uwp->col,
+            .topo = listener->topo
+        }, listener->uwp);
+    return 1;
+}
+
+void qihse_pg_wire_listener_close(qihse_pg_wire_listener_t* listener) {
+    if (!listener) return;
+    if (listener->fd >= 0) close(listener->fd);
+    free(listener);
 }
 
 void qihse_pg_wire_handle_client(int client_fd, void* vdb) {

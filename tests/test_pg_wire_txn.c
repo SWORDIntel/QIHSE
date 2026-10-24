@@ -24,6 +24,17 @@ typedef struct {
     qihse_uwp_context_t* uwp;
 } server_thread_args_t;
 
+typedef struct {
+    qihse_pg_wire_listener_t* listener;
+    int result;
+} listener_thread_args_t;
+
+static void* listener_once_worker(void* arg) {
+    listener_thread_args_t* a = (listener_thread_args_t*)arg;
+    a->result = qihse_pg_wire_listener_accept_once(a->listener, 10000);
+    return NULL;
+}
+
 static void* server_worker(void* arg) {
     server_thread_args_t* a = (server_thread_args_t*)arg;
     qihse_pg_wire_handle_client_uwp(a->server_fd, a->uwp, a->topo);
@@ -375,9 +386,95 @@ static void test_pg_wire_handshake_and_queries() {
         qihse_uwp_sql_table_store(), "pg_txn_protected");
     assert(protected_table && qihse_table_row_count(protected_table) == 1);
 
+    /* Exercise the public TCP listener rather than only the socketpair
+     * handler. It must retain the same authenticated transaction path. */
+    qihse_pg_wire_listener_t* listener = qihse_pg_wire_listener_open_uwp(
+        &uwp, topo, "127.0.0.1", 0);
+    assert(listener);
+    uint16_t listen_port = qihse_pg_wire_listener_port(listener);
+    assert(listen_port != 0);
+    listener_thread_args_t listener_args = {.listener = listener, .result = -9};
+    pthread_t listener_thread;
+    assert(pthread_create(&listener_thread, NULL, listener_once_worker,
+                          &listener_args) == 0);
+
+    int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(tcp_fd >= 0);
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(listen_port);
+    assert(inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) == 1);
+    assert(connect(tcp_fd, (struct sockaddr*)&server_addr,
+                   sizeof(server_addr)) == 0);
+    for (size_t i = 0; i < 2; ++i) {
+        assert(setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO,
+                          &io_timeout, sizeof(io_timeout)) == 0);
+        assert(setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO,
+                          &io_timeout, sizeof(io_timeout)) == 0);
+    }
+    start_pg_client(tcp_fd, "User_1", password);
+    send_pg_msg(tcp_fd, 'Q', begin, strlen(begin) + 1u);
+    assert(read_ready_status(tcp_fd) == 'T');
+    const char* listener_insert =
+        "INSERT INTO pg_txn_wire VALUES (3, 'tcp-listener-transaction')\0";
+    send_pg_msg(tcp_fd, 'Q', listener_insert, strlen(listener_insert) + 1u);
+    assert(read_ready_status(tcp_fd) == 'T');
+    send_pg_msg(tcp_fd, 'Q', commit, strlen(commit) + 1u);
+    assert(read_ready_status(tcp_fd) == 'I');
+    assert(qihse_table_row_count(table) == 2);
+    write_all(tcp_fd, &term_tag, 1);
+    write_all(tcp_fd, &term_len, 4);
+    close(tcp_fd);
+    assert(pthread_join(listener_thread, NULL) == 0);
+    assert(listener_args.result == 1);
+    qihse_pg_wire_listener_close(listener);
+    puts("PASS public TCP PG listener: authenticated transaction committed");
+
+    /* The public TCP listener must carry the same low-clearance READ denial
+     * as the embeddable handler and must never serialize the protected value. */
+    listener = qihse_pg_wire_listener_open_uwp(
+        &uwp, topo, "127.0.0.1", 0);
+    assert(listener);
+    listen_port = qihse_pg_wire_listener_port(listener);
+    assert(listen_port != 0);
+    listener_args = (listener_thread_args_t){.listener = listener, .result = -9};
+    assert(pthread_create(&listener_thread, NULL, listener_once_worker,
+                          &listener_args) == 0);
+
+    int guest_tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(guest_tcp_fd >= 0);
+    server_addr.sin_port = htons(listen_port);
+    assert(connect(guest_tcp_fd, (struct sockaddr*)&server_addr,
+                   sizeof(server_addr)) == 0);
+    assert(setsockopt(guest_tcp_fd, SOL_SOCKET, SO_RCVTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
+    assert(setsockopt(guest_tcp_fd, SOL_SOCKET, SO_SNDTIMEO,
+                      &io_timeout, sizeof(io_timeout)) == 0);
+    start_pg_client(guest_tcp_fd, "User_2", "PGWireGuestPass123!");
+    const char* listener_denied_read =
+        "SELECT note FROM pg_txn_protected WHERE id = 7\0";
+    send_pg_msg(guest_tcp_fd, 'Q', listener_denied_read,
+                strlen(listener_denied_read) + 1u);
+    uint8_t listener_error[512];
+    size_t listener_error_len = 0;
+    assert(read_ready_status_capture_error(guest_tcp_fd, listener_error,
+                                           sizeof(listener_error),
+                                           &listener_error_len) == 'I');
+    assert(listener_error_len > 0);
+    assert(!contains_bytes(listener_error, listener_error_len,
+                           "PG-WIRE-PROTECTED-MARKER"));
+    write_all(guest_tcp_fd, &term_tag, 1);
+    write_all(guest_tcp_fd, &term_len, 4);
+    close(guest_tcp_fd);
+    assert(pthread_join(listener_thread, NULL) == 0);
+    assert(listener_args.result == 1);
+    qihse_pg_wire_listener_close(listener);
+    puts("PASS public TCP PG listener: low-clearance read denied without disclosure");
+
+    assert(qihse_table_row_count(table) == 2);
     qihse_kv_store_destroy(kv);
     qihse_cluster_topology_destroy(topo);
-    assert(qihse_table_row_count(table) == 1);
     qihse_txn_manager_destroy((qihse_txn_manager_t*)uwp.txn_manager);
     qihse_schema_registry_destroy((qihse_schema_registry_t*)uwp.schema);
 }
