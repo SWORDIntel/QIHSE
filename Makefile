@@ -45,26 +45,91 @@ endef
 # Requirement groups mirror the exact flags each codegen path needs (see the
 # matching CFLAGS block): the build may only emit an ISA when the whole group is
 # present, and the runtime dispatcher re-checks the same features via CPUID.
-QIHSE_ENABLE_AVX      ?= $(call cpu_has_all,avx)
-QIHSE_ENABLE_AVX2     ?= $(call cpu_has_all,avx2 fma)
-QIHSE_ENABLE_AVX512   ?= $(call cpu_has_all,avx512f avx512dq avx512bw avx512vl fma)
-QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has_all,avx2 avx_vnni)
-QIHSE_ENABLE_AMX      ?= $(call cpu_has_all,amx_tile amx_int8 amx_bf16)
-QIHSE_ENABLE_F16C     ?= $(call cpu_has_all,avx f16c)
-QIHSE_ENABLE_AESNI    ?= $(call cpu_has,aes)
-QIHSE_ENABLE_PCLMUL   ?= $(call cpu_has,pclmulqdq)
-QIHSE_ENABLE_POPCNT   ?= $(call cpu_has,popcnt)
-QIHSE_ENABLE_RDRAND   ?= $(call cpu_has,rdrand)
-QIHSE_ENABLE_FSGSBASE ?= $(call cpu_has,fsgsbase)
-QIHSE_ENABLE_ERMS     ?= $(call cpu_has,erms)
-QIHSE_ENABLE_FMA      ?= $(call cpu_has,fma)
-QIHSE_ENABLE_BMI1     ?= $(call cpu_has,bmi1)
-QIHSE_ENABLE_BMI2     ?= $(call cpu_has,bmi2)
-QIHSE_ENABLE_MOVBE    ?= $(call cpu_has,movbe)
-QIHSE_ENABLE_RDSEED   ?= $(call cpu_has,rdseed)
-QIHSE_ENABLE_ADX      ?= $(call cpu_has,adx)
-QIHSE_ENABLE_RTM      ?= $(call cpu_has,rtm)
-QIHSE_ENABLE_ABM      ?= $(call cpu_has,abm)
+# Each group's required CPU flags are declared once (REQ_*) and shared by both
+# the auto-detect default and the mandatory verification below, so the two can
+# never drift apart.
+REQ_AVX      = avx
+REQ_F16C     = avx f16c
+REQ_AVX2     = avx2 fma
+REQ_AVX512   = avx512f avx512dq avx512bw avx512vl fma
+REQ_AVX_VNNI = avx2 avx_vnni
+REQ_AMX      = amx_tile amx_int8 amx_bf16
+REQ_AESNI    = aes
+REQ_PCLMUL   = pclmulqdq
+REQ_POPCNT   = popcnt
+REQ_RDRAND   = rdrand
+REQ_FSGSBASE = fsgsbase
+REQ_ERMS     = erms
+REQ_FMA      = fma
+REQ_BMI1     = bmi1
+REQ_BMI2     = bmi2
+REQ_MOVBE    = movbe
+REQ_RDSEED   = rdseed
+REQ_ADX      = adx
+REQ_RTM      = rtm
+REQ_ABM      = abm
+
+# Ordered list of every ISA group (used by check-isa and the verifier).
+ISA_GROUPS := AVX F16C AVX2 AVX512 AVX_VNNI AMX AESNI PCLMUL POPCNT RDRAND \
+              FSGSBASE ERMS FMA BMI1 BMI2 MOVBE RDSEED ADX RTM ABM
+
+QIHSE_ENABLE_AVX      ?= $(call cpu_has_all,$(REQ_AVX))
+QIHSE_ENABLE_F16C     ?= $(call cpu_has_all,$(REQ_F16C))
+QIHSE_ENABLE_AVX2     ?= $(call cpu_has_all,$(REQ_AVX2))
+QIHSE_ENABLE_AVX512   ?= $(call cpu_has_all,$(REQ_AVX512))
+QIHSE_ENABLE_AVX_VNNI ?= $(call cpu_has_all,$(REQ_AVX_VNNI))
+QIHSE_ENABLE_AMX      ?= $(call cpu_has_all,$(REQ_AMX))
+QIHSE_ENABLE_AESNI    ?= $(call cpu_has_all,$(REQ_AESNI))
+QIHSE_ENABLE_PCLMUL   ?= $(call cpu_has_all,$(REQ_PCLMUL))
+QIHSE_ENABLE_POPCNT   ?= $(call cpu_has_all,$(REQ_POPCNT))
+QIHSE_ENABLE_RDRAND   ?= $(call cpu_has_all,$(REQ_RDRAND))
+QIHSE_ENABLE_FSGSBASE ?= $(call cpu_has_all,$(REQ_FSGSBASE))
+QIHSE_ENABLE_ERMS     ?= $(call cpu_has_all,$(REQ_ERMS))
+QIHSE_ENABLE_FMA      ?= $(call cpu_has_all,$(REQ_FMA))
+QIHSE_ENABLE_BMI1     ?= $(call cpu_has_all,$(REQ_BMI1))
+QIHSE_ENABLE_BMI2     ?= $(call cpu_has_all,$(REQ_BMI2))
+QIHSE_ENABLE_MOVBE    ?= $(call cpu_has_all,$(REQ_MOVBE))
+QIHSE_ENABLE_RDSEED   ?= $(call cpu_has_all,$(REQ_RDSEED))
+QIHSE_ENABLE_ADX      ?= $(call cpu_has_all,$(REQ_ADX))
+QIHSE_ENABLE_RTM      ?= $(call cpu_has_all,$(REQ_RTM))
+QIHSE_ENABLE_ABM      ?= $(call cpu_has_all,$(REQ_ABM))
+
+# ---- mandatory ISA verification -------------------------------------------
+# Every enabled ISA must be advertised by the build host. This turns a
+# cross-build SIGILL risk (e.g. `make QIHSE_ENABLE_AVX2=1` on an Ivy Bridge
+# host, or deploying a binary built on a newer CPU onto an older node) into an
+# immediate hard error at parse time. Cross-builds that intentionally target a
+# different CPU set QIHSE_ISA_SKIP_HOST_CHECK=1.
+define isa_guard
+ifeq ($(QIHSE_ENABLE_$(1)),1)
+ifeq ($(call cpu_has_all,$(REQ_$(1))),0)
+$$(error ISA $(1) is enabled but the build host does not advertise the required flag(s): $(REQ_$(1)) — cross-build? set QIHSE_ISA_SKIP_HOST_CHECK=1)
+endif
+endif
+endef
+
+ifeq ($(QIHSE_ISA_SKIP_HOST_CHECK),1)
+$(info QIHSE ISA verification: skipped (QIHSE_ISA_SKIP_HOST_CHECK=1))
+else
+$(foreach g,$(ISA_GROUPS),$(eval $(call isa_guard,$(g))))
+endif
+
+# Export the resolved ISA matrix so the check-isa recipe (and external tools)
+# can report exactly what was compiled in.
+export QIHSE_ENABLE_AVX QIHSE_ENABLE_F16C QIHSE_ENABLE_AVX2 QIHSE_ENABLE_AVX512 \
+       QIHSE_ENABLE_AVX_VNNI QIHSE_ENABLE_AMX QIHSE_ENABLE_AESNI QIHSE_ENABLE_PCLMUL \
+       QIHSE_ENABLE_POPCNT QIHSE_ENABLE_RDRAND QIHSE_ENABLE_FSGSBASE QIHSE_ENABLE_ERMS \
+       QIHSE_ENABLE_FMA QIHSE_ENABLE_BMI1 QIHSE_ENABLE_BMI2 QIHSE_ENABLE_MOVBE \
+       QIHSE_ENABLE_RDSEED QIHSE_ENABLE_ADX QIHSE_ENABLE_RTM QIHSE_ENABLE_ABM
+
+.PHONY: check-isa
+check-isa:
+	@echo "== QIHSE ISA configuration (host vendor: $(HOST_CPU_VENDOR)) =="
+	@for n in $(ISA_GROUPS); do \
+		eval "v=\$$QIHSE_ENABLE_$$n"; \
+		printf '  %-10s = %s\n' "$$n" "$${v:-0}"; \
+	done
+	@echo "== (cross-builds: pass QIHSE_ISA_SKIP_HOST_CHECK=1) =="
 
 # ---------------------------------------------------------------------------
 # Security & Audit Configuration
@@ -263,6 +328,7 @@ endif
 # AMX: 2D tile matrix multiply (Sapphire Rapids+). Needs kernel tile-permission prctl.
 ifeq ($(QIHSE_ENABLE_AMX),1)
 CFLAGS += -mamx-tile -mamx-int8 -mamx-bf16 -DQIHSE_ENABLE_AMX=1
+SRCS += backends/cpu/qihse_cpu_amx.c
 endif
 
 # Note: core/qihse_plugin.c and algorithms/qihse_superposition.c etc are EXCLUDED 
@@ -272,8 +338,12 @@ endif
 .PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install install-host dev-setup docs redis-server redis-cluster-node cluster-daemon backup-cli test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli stress-session-delivery bench-cluster-crc test-object-acl test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec test-hnsw-anchor-seeding test-column-tsdb-anchor test-neural-fts-fusion test-af-xdp-keystone-ingest test-dist-planner-hardware bench-keystone-integrated test-uwp-regression test-uwp-metrics fuzz-uwp test-replica-security test-replica-qkp test-replica-crash test-w10-aimem
 .NOTPARALLEL: validate-reference-workflow
 
-all: liboqs oqs-provider lib server keygen federation-ca cluster-daemon machine-token backup-cli
-build: liboqs oqs-provider lib server lib-ctypes keygen cluster-daemon machine-token backup-cli
+# `make` with no target must build the full project (not the first target that
+# happens to be defined above, e.g. check-isa).
+.DEFAULT_GOAL := all
+
+all: check-isa liboqs oqs-provider lib server keygen federation-ca cluster-daemon machine-token backup-cli
+build: check-isa liboqs oqs-provider lib server lib-ctypes keygen cluster-daemon machine-token backup-cli
 
 build-native:
 	./scripts/build-native.sh
