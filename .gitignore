@@ -152,6 +152,15 @@ tools/qihse_i2p_test_cli
 tools/test_i2p_qkp_diag
 /studio/
 
+# AIMEM test runtime data dirs (WAL, sstable, integrity chain, audit log)
+/aimem_*/
+
+# compiled test fixture (source: tests/qihse_browser_fixture.c)
+/tests/qihse_browser_fixture
+
+# Serena agent tool state
+.serena/
+
 
 # W12 Python test source (not a generated test executable).
 !/tests/test_w12_fp32_baseline.py
