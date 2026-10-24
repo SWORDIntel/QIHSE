@@ -291,6 +291,7 @@ struct qihse_kv_store {
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
     bool replica_read_only;
+    uint32_t replication_principal_id; /* QKP replication service principal id */
     sst_meta_index_t* sst_meta;
     /* Store-global monotonic change sequence: the LAST sequence issued to an
      * authorized mutation (the high-water).  Advanced once per authorized
@@ -843,16 +844,26 @@ static bool replica_install_finish_recovery(qihse_kv_store_t* store, const char*
     return fsync_dir_path(dir);
 }
 
-static bool cursor_principal_ok(qihse_user_t* principal) {
-    return principal && qihse_auth_user_is_active(principal) &&
-           qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR;
+/* Replica-plane operations (cursors, snapshot install, record apply) may be
+ * performed by the Operator or by the dedicated replication service
+ * principal (registered via qihse_kv_store_set_replication_principal_id).
+ * The RESP engine deliberately maps the pinned QKP replication peer to a
+ * non-Operator principal, so these checks must not require OPERATOR. */
+static bool replica_principal_ok(qihse_kv_store_t* store, qihse_user_t* principal) {
+    if (!principal || !qihse_auth_user_is_active(principal)) return false;
+    if (qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR) return true;
+    return store && __atomic_load_n(&store->replication_principal_id,
+                                    __ATOMIC_ACQUIRE) != 0u &&
+           qihse_user_get_id(principal) ==
+               __atomic_load_n(&store->replication_principal_id,
+                               __ATOMIC_ACQUIRE);
 }
 
 bool qihse_kv_replica_cursor_get(qihse_kv_store_t* store, const char* peer_id,
                                 const char* namespace_id, qihse_user_t* principal,
                                 uint64_t* out_seq) {
     if (!store || !cursor_id_valid(peer_id) || !cursor_id_valid(namespace_id) ||
-        !cursor_principal_ok(principal) || !out_seq) return false;
+        !replica_principal_ok(store, principal) || !out_seq) return false;
     kv_replica_cursor_t* e = cursor_find(store, peer_id, namespace_id);
     *out_seq = e ? e->seq : 0u;
     return true;
@@ -862,7 +873,7 @@ bool qihse_kv_replica_cursor_advance(qihse_kv_store_t* store, const char* peer_i
                                     const char* namespace_id, uint64_t seq,
                                     qihse_user_t* principal) {
     if (!store || !cursor_id_valid(peer_id) || !cursor_id_valid(namespace_id) ||
-        !cursor_principal_ok(principal) || store->bulk_load_mode) return false;
+        !replica_principal_ok(store, principal) || store->bulk_load_mode) return false;
     kv_replica_cursor_t* e = cursor_find(store, peer_id, namespace_id);
     if (e && seq < e->seq) return false;
     if (e && seq == e->seq) {
@@ -1922,6 +1933,12 @@ bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store) {
     return true;
 }
 
+void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
+                                                 uint32_t principal_id) {
+    if (store) __atomic_store_n(&store->replication_principal_id, principal_id,
+                                __ATOMIC_RELEASE);
+}
+
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (!store) return;
     if (store->qdd_ctx) qihse_qdd_free(__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE));
@@ -2250,8 +2267,7 @@ bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
         strlen(record->key) > KV_MAX_KEY_LEN ||
         (record->tombstone ? (record->value != NULL || record->expire_time_ms != 0u) : record->value == NULL) ||
         (!record->tombstone && strlen(record->value) > KV_MAX_VALUE_LEN) ||
-        !qihse_auth_user_is_active(principal) ||
-        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR ||
+        !replica_principal_ok(store, principal) ||
         !qihse_auth_can_access(principal, record->classification, record->sci_compartment))
         return false;
 
@@ -3075,7 +3091,7 @@ bool qihse_kv_replica_snapshot_install(qihse_kv_store_t* store,
                                        uint64_t source_highwater) {
     if (!store || !filepath || !namespace_glob || !*namespace_glob ||
         !__atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
-        !cursor_principal_ok(principal) || !cursor_id_valid(peer_id) ||
+        !replica_principal_ok(store, principal) || !cursor_id_valid(peer_id) ||
         !cursor_id_valid(namespace_glob)) return false;
     bool installed = false;
     if (!qihse_kv_replica_snapshot_installed(store, peer_id, namespace_glob,

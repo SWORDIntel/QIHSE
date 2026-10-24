@@ -54,6 +54,8 @@ bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
 /* Permanently fence ordinary mutations for this process lifetime. Replica
  * records may still be applied through qihse_kv_apply_replica_record(). */
 bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store);
+void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
+                                                 uint32_t principal_id);
 
 /* Immutable, private snapshot artifact for a consistent replica bootstrap.
  * The caller must exclude writers while creating it and capture

@@ -1029,6 +1029,10 @@ static void* ae_main(void* argument) {
                 mini_resp_close(&source);
                 fprintf(stderr, "qihse-cluster-daemon: replica pull: %llu row(s) from pinned %s source (%s)\n",
                         (unsigned long long)total, ae->transport_name ? ae->transport_name : (ae->source_via_i2p ? "I2P" : "direct"), all_ok ? "ok" : "stopped on error");
+                if (!all_ok) {
+                    fprintf(stderr, "qihse-cluster-daemon: replica pull failure detail: last='%s' err='%s'\n",
+                            source.last, source.err);
+                }
             }
         }
 

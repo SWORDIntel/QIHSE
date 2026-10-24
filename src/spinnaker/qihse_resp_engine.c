@@ -15742,6 +15742,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->pqc = supplied->pqc;
     server->replication_service_principal =
         supplied->replication_service_principal;
+    if (server->replication_service_principal && server->store)
+        qihse_kv_store_set_replication_principal_id(
+            server->store, qihse_user_get_id(server->replication_service_principal));
     server->port = supplied->port;
     server->bus_port = supplied->bus_port;
     server->max_clients = supplied->max_clients;
