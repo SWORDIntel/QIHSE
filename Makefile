@@ -455,29 +455,31 @@ lib: liboqs oqs-provider $(LIB_TARGET)
 # liboqs — post-quantum cryptography library (submodule)
 # ---------------------------------------------------------------------------
 liboqs:
-	@if [ ! -f vendor/liboqs/CMakeLists.txt ]; then \
-		echo "Initializing liboqs submodule..."; \
-		git submodule update --init --recursive vendor/liboqs; \
-	fi
-	@if [ -f vendor/liboqs/CMakeLists.txt ] && [ ! -f vendor/liboqs/build/lib/liboqs.so ] && [ ! -f /usr/local/lib/liboqs.so ]; then \
+	@if [ -f /usr/local/lib/liboqs.so ] || [ -f vendor/liboqs/build/lib/liboqs.so ]; then \
+		echo "liboqs ready."; \
+	else \
+		if [ ! -f vendor/liboqs/CMakeLists.txt ]; then \
+			echo "Initializing liboqs submodule..."; \
+			git submodule update --init --recursive vendor/liboqs; \
+		fi; \
 		echo "Building liboqs..."; \
 		cd vendor/liboqs && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON .. 2>&1 && \
 		ninja 2>&1; (ninja install 2>&1 || true); \
 		echo "liboqs build successful"; \
-	elif [ -f /usr/local/lib/liboqs.so ] || [ -f vendor/liboqs/build/lib/liboqs.so ]; then \
-		echo "liboqs ready."; \
 	fi
 
 # ---------------------------------------------------------------------------
 # oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
 # ---------------------------------------------------------------------------
 oqs-provider: liboqs
-	@if [ ! -f vendor/oqs-provider/CMakeLists.txt ]; then \
-		echo "Initializing oqs-provider submodule..."; \
-		git submodule update --init --recursive vendor/oqs-provider; \
-	fi
-	@if [ -f vendor/oqs-provider/CMakeLists.txt ] && [ ! -f vendor/oqs-provider/build/lib/oqsprovider.so ] && [ ! -f /usr/local/lib/ossl-modules/oqsprovider.so ]; then \
+	@if [ -f /usr/local/lib/ossl-modules/oqsprovider.so ] || [ -f vendor/oqs-provider/build/lib/oqsprovider.so ]; then \
+		echo "oqs-provider ready."; \
+	else \
+		if [ ! -f vendor/oqs-provider/CMakeLists.txt ]; then \
+			echo "Initializing oqs-provider submodule..."; \
+			git submodule update --init --recursive vendor/oqs-provider; \
+		fi; \
 		echo "Building oqs-provider..."; \
 		cd vendor/oqs-provider && mkdir -p build && cd build && \
 		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -488,8 +490,6 @@ oqs-provider: liboqs
 			-Dliboqs_DIR=$(if $(wildcard /usr/local/lib/cmake/liboqs/liboqsConfig.cmake),/usr/local/lib/cmake/liboqs,$(CURDIR)/vendor/liboqs/build) .. 2>&1 && \
 		ninja 2>&1; (ninja install 2>&1 || true); \
 		echo "oqs-provider build successful"; \
-	elif [ -f vendor/oqs-provider/build/lib/oqsprovider.so ] || [ -f /usr/local/lib/ossl-modules/oqsprovider.so ]; then \
-		echo "oqs-provider ready."; \
 	fi
 
 CSRCS = $(filter %.c, $(SRCS))
