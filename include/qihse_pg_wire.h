@@ -8,6 +8,7 @@
 #include "qihse_timeseries.h"
 #include "qihse_column.h"
 #include "qihse_cluster_slot.h"
+#include "qihse_uwp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,17 @@ void qihse_pg_wire_handle_client_multi(
     qihse_column_store_t* col,
     qihse_cluster_topology_t* topo
 );
+
+/* Handle one accepted PostgreSQL connection with the caller's shared SQL
+ * schema and transaction manager. The context and all engine pointers remain
+ * caller-owned and must outlive the handler. The legacy multi-engine handler
+ * has no transaction manager and therefore refuses BEGIN/COMMIT/ROLLBACK.
+ * Transactional DML is routed through the authenticated UWP SQL executor;
+ * transactional SELECT and other unsupported transaction statements fail
+ * closed. */
+void qihse_pg_wire_handle_client_uwp(int client_fd,
+                                     qihse_uwp_context_t* uwp_context,
+                                     qihse_cluster_topology_t* topo);
 
 #ifdef __cplusplus
 }
