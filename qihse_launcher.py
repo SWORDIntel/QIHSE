@@ -17,6 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
 LIBQIHSE = ROOT / "libqihse.so"
+ADMIN_CLI = ROOT / "qihse-admin-cli"
+ADMIN_DEFAULT_NODE_ID = "admin-t420"
+ADMIN_DEFAULT_TRUSTED_PUB = "/etc/qihse/keys/qihse_dsa_pub.pem"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -141,6 +144,61 @@ def cmd_keygen(args: list[str]) -> int:
         return _run([str(keygen)] + args)
     print("[qihse] qihse_keygen binary not found after build", file=sys.stderr)
     return 1
+
+
+def cmd_admin(args: list[str]) -> int:
+    """Cluster admin operations via qihse-admin-cli (QKP admin identity)."""
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(
+            "Usage: ./qihse admin <ping|cluster-nodes> --host H --port P\n"
+            "       [--node-id ID] [--trusted-pub FILE] [--identity-dir DIR]\n"
+            "       [--command \"CMD ARG...\"]\n"
+            "\n"
+            "Cluster admin CLI (wraps qihse-admin-cli).\n"
+            "Defaults: --node-id admin-t420, --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem\n"
+        )
+        return 0
+    flag_map = {"ping": "--ping", "cluster-nodes": "--cluster-nodes",
+                "repl-status": "--repl-status"}
+    flag = flag_map.get(args[0])
+    if flag is None:
+        print(f"[qihse] ERROR: unknown admin subcommand: {args[0]}", file=sys.stderr)
+        return 1
+    argv = [flag] + args[1:]
+    if not any(a == "--node-id" for a in argv):
+        argv += ["--node-id", ADMIN_DEFAULT_NODE_ID]
+    if not any(a == "--trusted-pub" for a in argv):
+        argv += ["--trusted-pub", ADMIN_DEFAULT_TRUSTED_PUB]
+    if not ADMIN_CLI.exists():
+        print("[qihse] Building qihse-admin-cli ...")
+        rc = _run_make("admin-cli")
+        if rc != 0:
+            return rc
+    return _run([str(ADMIN_CLI)] + argv)
+
+
+def cmd_cluster(args: list[str]) -> int:
+    """Cluster operations via the ops scripts (rolling-restart | replicas)."""
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(
+            "Usage: ./qihse cluster <rolling-restart|replicas> [flags]\n"
+            "\n"
+            "  rolling-restart [--verify-only]      -> scripts/cluster_rolling_restart.sh\n"
+            "  replicas         [--status|--remove] -> scripts/cluster_replica_deploy.sh\n"
+        )
+        return 0
+    script_map = {"rolling-restart": "cluster_rolling_restart.sh",
+                  "replicas": "cluster_replica_deploy.sh"}
+    name = script_map.get(args[0])
+    if name is None:
+        print(f"[qihse] ERROR: unknown cluster subcommand: {args[0]}", file=sys.stderr)
+        return 1
+    script = SCRIPTS / name
+    if not script.exists():
+        print(f"[qihse] ERROR: {script} not found", file=sys.stderr)
+        return 1
+    os.chmod(script, 0o755)
+    return _run([str(script)] + args[1:])
 
 
 def _ensure_native_module() -> None:
@@ -309,6 +367,8 @@ COMMANDS = {
     "db":            cmd_db,
     "server":        cmd_server,
     "keygen":        cmd_keygen,
+    "admin":         cmd_admin,
+    "cluster":       cmd_cluster,
     "demo":          cmd_demo,
     "python":        cmd_python,
     "bootstrap":     cmd_bootstrap,
@@ -340,6 +400,8 @@ def _help() -> None:
         "  db             QIHSE vector DB CLI (e.g. ./qihse db create --dims 128 --path /tmp/db)\n"
         "  server         Build and run the test server\n"
         "  keygen         Build and run PQC key generator\n"
+        "  admin          Cluster admin CLI (ping, cluster-nodes, repl-status)\n"
+        "  cluster        Cluster ops (rolling-restart, replicas)\n"
         "  demo           Run Python SDK demo\n"
         "  python         Start Python REPL with qihse importable\n"
         "  bootstrap      Initialize workspace directories\n"
