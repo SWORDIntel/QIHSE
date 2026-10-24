@@ -35,11 +35,22 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 
 ## Phase 2 — Security & compliance (per repo invariants)
 
+> **Security review (2026-10-25):** all three QKP surfaces are SAFE — the
+> admin pin is a strict node-id `strcmp` + constant-time DSA-fingerprint
+> `CRYPTO_memcmp` (no TOFU/fallback); the replication principal is non-Operator
+> and reachable only via QKP (its password is random + wiped); MACHINEAUTH
+> refuses system-tenant/Operator principals and prevents clearance/SCI
+> elevation. **Documented caveat:** the replication principal is provisioned
+> UINT16_MAX clearance/SCI and the snapshot export filters by glob only, so a
+> *compromised* replication principal could exfiltrate the marked namespaces
+> — inherent to replication; treat the replication identity key as a
+> high-value secret.
+
 | # | Item | Notes |
 |---|---|---|
-| 2.1 | Negative authorization tests for the new surfaces | Invariant 3: low-clearance principal → admin commands denied; unpinned QKP identity → NOAUTH; MACHINEAUTH token → admin denied; REPL.* without the pinned peer → NOPERM. Must run in CI |
-| 2.2 | Admin-pin security review | Pinned identity → operator mapping, revocation/rotation flow (unit edit + rolling restart), log/audit of admin sessions |
-| 2.3 | Replication principal audit | Confirm the UINT16_MAX-clearance ANALYST replication principal never reaches operator-only commands (allowlist is REPL.* only) |
+| 2.1 | Negative authorization tests for the new surfaces | ✅ `tests/test_qkp_access_negative.c` (replication principal non-Operator, tenant machine principal, low-clearance/SCI denial, object ACL); wired into the CI `test` aggregate |
+| 2.2 | Admin-pin security review | ✅ reviewed safe; remaining: document the rotation flow (unit edit + rolling restart) |
+| 2.3 | Replication principal audit | ✅ reviewed; allowlist is REPL.* only; see caveat above |
 
 ## Phase 3 — Tooling & automation
 
