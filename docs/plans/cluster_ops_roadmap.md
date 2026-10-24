@@ -1,0 +1,64 @@
+# QIHSE Cluster Operations Roadmap
+
+Status: current as of the 2026-10-24 cluster hardening pass. Tracks the
+operational workstreams around the 3-node cluster (t420 / 730xd / t320):
+native builds, QKP-hardened access, replication, and tooling.
+
+## Phase 0 — Delivered (in main)
+
+- Native per-node builds: `build-native.sh --auto` detects every SIMD ISA;
+  `make all` runs the mandatory host-ISA verification; per-ISA kernels are
+  compile-time gated so a binary contains only its machine's ISA.
+- Rolling updates: `scripts/cluster_rolling_restart.sh` (deploy + restart
+  one node at a time + QKP health probes).
+- Replication: read-only QKP-pinned replica daemons (ring topology, one
+  namespace per instance) via `scripts/cluster_replica_deploy.sh`; fixed
+  the non-Operator replication principal vs KV-Operator-required
+  contradiction; replica units carry `LD_LIBRARY_PATH`; 60s pull timeout.
+- Admin access: `qihse-admin-cli` + pinned administrator identity
+  (`--admin-peer-node-id`/`--admin-peer-dsa-pub` → system operator).
+- MACHINEAUTH machine-principal bootstrap (agent-namespace scoped).
+- Docs updated across OPERATIONS / GETTING_STARTED / cluster_sharding /
+  deployment / hardening-report.
+
+## Phase 1 — Operational closure (small, next)
+
+| # | Item | Notes |
+|---|---|---|
+| 1.1 | Full deploy+restart cycle via `cluster_rolling_restart.sh` | Only `--verify-only` exercised after the QKP probe swap; run one complete rolling pass |
+| 1.2 | End-to-end replication proof | SET a key in a replicated namespace on the source (via admin CLI), confirm it appears on the replica within one 30s interval |
+| 1.3 | `qihse-backup` on hardened masters | Backup CLI still uses cleartext password AUTH — rejected on `pqc_require` masters; either port it to the QKP admin path or document local-only usage |
+| 1.4 | Replica self-reporting in `cluster nodes` | Replicas appear alongside masters in `CLUSTER NODES` (slot-less); confirm benign or exclude them from the topology view |
+
+## Phase 2 — Security & compliance (per repo invariants)
+
+| # | Item | Notes |
+|---|---|---|
+| 2.1 | Negative authorization tests for the new surfaces | Invariant 3: low-clearance principal → admin commands denied; unpinned QKP identity → NOAUTH; MACHINEAUTH token → admin denied; REPL.* without the pinned peer → NOPERM. Must run in CI |
+| 2.2 | Admin-pin security review | Pinned identity → operator mapping, revocation/rotation flow (unit edit + rolling restart), log/audit of admin sessions |
+| 2.3 | Replication principal audit | Confirm the UINT16_MAX-clearance ANALYST replication principal never reaches operator-only commands (allowlist is REPL.* only) |
+
+## Phase 3 — Tooling & automation
+
+| # | Item | Notes |
+|---|---|---|
+| 3.1 | `qihse` launcher wrappers | `qihse admin ping/cluster-nodes`, `qihse cluster status/rolling-restart/replicas` around the admin CLI + ops scripts |
+| 3.2 | Unify cluster scripts | Merge `cluster_rolling_restart.sh` + `cluster_replica_deploy.sh` into one coherent command set with `--status`/`--verify` modes |
+| 3.3 | CI integration coverage | Build + deploy a throwaway 3-node cluster in CI; run the replication and admin-path tests (2.1) against it |
+
+## Phase 4 — Cluster capability (unblocked by Phase 0)
+
+| # | Item | Notes |
+|---|---|---|
+| 4.1 | Slot migration / `--brain-act` | The daemon gates brain-act on pinned QKP replication — now satisfied; migration drills across the ring |
+| 4.2 | Failover & quorum drills | Kill a master, verify the remaining nodes serve and replicas stay consistent; document the recovery runbook |
+| 4.3 | Backup/restore strategy | Full-store backup via a QKP-capable path + restore drill into a replica store |
+| 4.4 | Watchdog & alerting | Prometheus-style metrics / journal-based alerts for pull failures (`replica pull ... stopped on error`) and daemon restarts |
+
+## Cross-cutting risks
+
+- Any unit change to a master (pins, principals) requires a rolling restart;
+  keep the `.bak-<timestamp>` rotation and the rolling script as the only
+  supported change path.
+- Hardened masters are QKP-only: every operator tool must go through
+  `qihse-admin-cli`; do not reintroduce cleartext AUTH.
