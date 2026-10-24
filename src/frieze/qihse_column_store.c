@@ -316,7 +316,20 @@ bool qihse_column_append_float32(qihse_column_store_t* store, const char* name, 
     return append_value(store, name, QIHSE_COL_TYPE_FLOAT32, &val, classification, sci_compartment);
 }
 
+#if defined(QIHSE_ENABLE_AVX512)
 __attribute__((target_clones("avx512f", "avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX2)
+__attribute__((target_clones("avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX)
+__attribute__((target_clones("avx", "default")))
+#else
+__attribute__((target_clones("default")))
+#endif
+#endif
+#endif
+
 int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* name, qihse_user_t* user) {
     qihse_column_node_t* col = get_column(store, name);
     if (!col || col->type != QIHSE_COL_TYPE_INT64) return 0;
@@ -358,7 +371,20 @@ int64_t qihse_column_sum_int64_user(qihse_column_store_t* store, const char* nam
     return sum;
 }
 
+#if defined(QIHSE_ENABLE_AVX512)
 __attribute__((target_clones("avx512f", "avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX2)
+__attribute__((target_clones("avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX)
+__attribute__((target_clones("avx", "default")))
+#else
+__attribute__((target_clones("default")))
+#endif
+#endif
+#endif
+
 float qihse_column_sum_float32_user(qihse_column_store_t* store, const char* name, qihse_user_t* user) {
     qihse_column_node_t* col = get_column(store, name);
     if (!col || col->type != QIHSE_COL_TYPE_FLOAT32) return 0.0f;

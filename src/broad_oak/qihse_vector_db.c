@@ -2298,6 +2298,7 @@ static float qihse_vdb_int8_dot_product_sse41(const int8_t* a, const int8_t* b, 
     return (float)total;
 }
 
+#if defined(QIHSE_ENABLE_AVX2) || defined(__AVX2__)
 __attribute__((target("avx2")))
 static float qihse_vdb_int8_dot_product_avx2(const int8_t* a, const int8_t* b, size_t len) {
     __m256i acc0 = _mm256_setzero_si256();
@@ -2356,7 +2357,9 @@ static float qihse_vdb_int8_dot_product_avx2(const int8_t* a, const int8_t* b, s
     }
     return (float)total;
 }
+#endif
 
+#if defined(QIHSE_ENABLE_AVX512) || defined(__AVX512F__)
 __attribute__((target("avx512vnni,avx512vl,avx512f,avx512bw")))
 static float qihse_vdb_int8_dot_product_avx512vnni(const int8_t* a, const int8_t* b, size_t len) {
     __m512i acc0 = _mm512_setzero_si512();
@@ -2432,16 +2435,21 @@ static float qihse_vdb_int8_dot_product_avx512vnni(const int8_t* a, const int8_t
     return (float)total;
 }
 #endif
+#endif
 
 static float qihse_vdb_int8_dot_product(const int8_t* a, const int8_t* b, size_t len) {
     pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
 #ifdef __x86_64__
+#if defined(QIHSE_ENABLE_AVX512) || defined(__AVX512F__)
     if (s_cpu_has_avx512vnni) {
         return qihse_vdb_int8_dot_product_avx512vnni(a, b, len);
     }
+#endif
+#if defined(QIHSE_ENABLE_AVX2) || defined(__AVX2__)
     if (s_cpu_has_avx2) {
         return qihse_vdb_int8_dot_product_avx2(a, b, len);
     }
+#endif
     return qihse_vdb_int8_dot_product_sse41(a, b, len);
 #else
     int64_t sum = 0;
@@ -2685,6 +2693,7 @@ static uint32_t qihse_vdb_hamming_distance_popcnt(const uint64_t* a, const uint6
     return (uint32_t)total;
 }
 
+#if defined(QIHSE_ENABLE_AVX512) || defined(__AVX512F__)
 __attribute__((target("avx512vpopcntdq,avx512vl,avx512f")))
 static uint32_t qihse_vdb_hamming_distance_avx512vpopcntdq(const uint64_t* a, const uint64_t* b, size_t words) {
     __m512i acc0 = _mm512_setzero_si512();
@@ -2732,6 +2741,7 @@ static uint32_t qihse_vdb_hamming_distance_avx512vpopcntdq(const uint64_t* a, co
     return (uint32_t)total;
 }
 #endif
+#endif
 
 static void qihse_vdb_binarize_vector_scalar(const float* vec, size_t dims, uint64_t* out_binary, size_t words_per_vec) {
     memset(out_binary, 0, words_per_vec * sizeof(uint64_t));
@@ -2765,9 +2775,11 @@ static inline uint32_t qihse_vdb_hamming_distance(const uint64_t* a, const uint6
     if (!a || !b) return UINT32_MAX;
     pthread_once(&s_vdb_cpu_init_once, s_vdb_cpu_detect_init);
 #ifdef __x86_64__
+#if defined(QIHSE_ENABLE_AVX512) || defined(__AVX512F__)
     if (s_cpu_has_avx512vpopcntdq) {
         return qihse_vdb_hamming_distance_avx512vpopcntdq(a, b, words);
     }
+#endif
     if (s_cpu_has_popcnt) {
         return qihse_vdb_hamming_distance_popcnt(a, b, words);
     }

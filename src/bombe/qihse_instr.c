@@ -155,6 +155,7 @@ int qihse_intel_avx512_vector_op(const double* a, const double* b, double* resul
 }
 
 #ifdef __x86_64__
+#if defined(QIHSE_ENABLE_AVX_VNNI) || defined(__AVXVNNI__)
 static __attribute__((target("avxvnni")))
 int qihse_intel_vnni_dot_product_impl(const int8_t* a, const int8_t* b, int32_t* result, size_t n) {
     // AVX-VNNI implementation using _mm256_dpbusd_epi32 (VPDPBUSD)
@@ -186,12 +187,15 @@ int qihse_intel_vnni_dot_product_impl(const int8_t* a, const int8_t* b, int32_t*
     return 0;
 }
 #endif
+#endif
 
 int qihse_intel_vnni_dot_product(const int8_t* a, const int8_t* b, int32_t* result, size_t n) {
 #ifdef __x86_64__
+#if defined(QIHSE_ENABLE_AVX_VNNI) || defined(__AVXVNNI__)
     if (g_hw_info.enabled_features & QIHSE_INTEL_HW_AVX_VNNI) {
         return qihse_intel_vnni_dot_product_impl(a, b, result, n);
     }
+#endif
 #endif
 
     // Fallback: Simple scalar implementation

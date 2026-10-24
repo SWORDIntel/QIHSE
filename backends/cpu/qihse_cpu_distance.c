@@ -428,6 +428,8 @@ float qihse_l2_sq_distance_f16c(const uint16_t *a, const uint16_t *b, size_t dim
 /* -------------------------------------------------------------------------- */
 #ifdef __x86_64__
 
+#if defined(QIHSE_ENABLE_AVX2) || defined(__AVX2__)
+
 __attribute__((target("avx2,fma")))
 float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
     __m256 acc0 = _mm256_setzero_ps();
@@ -709,6 +711,31 @@ float qihse_l2_sq_distance_f16c_fma(const uint16_t *a, const uint16_t *b, size_t
     return result;
 }
 
+#else /* !(QIHSE_ENABLE_AVX2 || __AVX2__) — scalar fallbacks */
+
+float qihse_distance_dot_avx2(const float* a, const float* b, size_t dims) {
+    return qihse_distance_dot_scalar(a, b, dims);
+}
+float qihse_distance_cosine_avx2(const float* a, const float* b, size_t dims) {
+    return qihse_distance_cosine_scalar(a, b, dims);
+}
+float qihse_cosine_distance_avx2(const float *a, const float *b, size_t dim, float norm_a, float norm_b) {
+    return qihse_cosine_distance_avx(a, b, dim, norm_a, norm_b);
+}
+float qihse_distance_euclidean_avx2(const float* a, const float* b, size_t dims) {
+    return qihse_distance_euclidean_scalar(a, b, dims);
+}
+float qihse_dot_product_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    return qihse_dot_product_f16c(a, b, dim);
+}
+float qihse_l2_sq_distance_f16c_fma(const uint16_t *a, const uint16_t *b, size_t dim) {
+    return qihse_l2_sq_distance_f16c(a, b, dim);
+}
+
+#endif /* QIHSE_ENABLE_AVX2 || __AVX2__ */
+
+#if defined(QIHSE_ENABLE_AVX512) || defined(__AVX512F__)
+
 /* -------------------------------------------------------------------------- */
 /* Horizontal sum helper for __m512 — AVX-512 reduce                          */
 /* -------------------------------------------------------------------------- */
@@ -822,6 +849,20 @@ float qihse_distance_euclidean_avx512(const float* a, const float* b, size_t dim
     }
     return sqrtf(result);
 }
+
+#else /* !(QIHSE_ENABLE_AVX512 || __AVX512F__) — scalar fallbacks */
+
+float qihse_distance_cosine_avx512(const float* a, const float* b, size_t dims) {
+    return qihse_distance_cosine_scalar(a, b, dims);
+}
+float qihse_distance_dot_avx512(const float* a, const float* b, size_t dims) {
+    return qihse_distance_dot_scalar(a, b, dims);
+}
+float qihse_distance_euclidean_avx512(const float* a, const float* b, size_t dims) {
+    return qihse_distance_euclidean_scalar(a, b, dims);
+}
+
+#endif /* QIHSE_ENABLE_AVX512 || __AVX512F__ */
 
 #else /* !__x86_64__ — portable fallbacks exported as symbols */
 

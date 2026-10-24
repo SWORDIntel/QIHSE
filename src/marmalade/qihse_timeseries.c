@@ -353,7 +353,20 @@ bool qihse_tsdb_insert(qihse_tsdb_t* tsdb, uint32_t series_id, uint64_t timestam
     return true;
 }
 
+#if defined(QIHSE_ENABLE_AVX512)
 __attribute__((target_clones("avx512f", "avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX2)
+__attribute__((target_clones("avx2", "avx", "default")))
+#else
+#if defined(QIHSE_ENABLE_AVX)
+__attribute__((target_clones("avx", "default")))
+#else
+__attribute__((target_clones("default")))
+#endif
+#endif
+#endif
+
 double qihse_tsdb_average_range_user(qihse_tsdb_t* tsdb, uint64_t start_ts, uint64_t end_ts, qihse_user_t* user) {
     if (!tsdb) return 0.0;
 

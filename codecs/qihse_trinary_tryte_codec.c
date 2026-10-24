@@ -435,6 +435,7 @@ static int32_t qihse_tryte_dot_product_ssse3(const uint8_t* lhs, const uint8_t* 
     return total;
 }
 
+#if defined(QIHSE_ENABLE_AVX2) || defined(__AVX2__)
 __attribute__((target("avx2")))
 static inline void qihse_unpack_32_trytes_avx2(
     __m256i T,
@@ -469,7 +470,9 @@ static inline void qihse_unpack_32_trytes_avx2(
     *out_t3 = _mm256_shuffle_epi8(lut_lo, high);
     *out_t4 = _mm256_shuffle_epi8(lut_hi, high);
 }
+#endif
 
+#if defined(QIHSE_ENABLE_AVX2) || defined(__AVX2__)
 __attribute__((target("avx2")))
 int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
     size_t i = 0;
@@ -532,6 +535,16 @@ int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, siz
     }
     return total;
 }
+#else
+
+/* qihse_tryte_dot_product_scalar is static and defined below */
+static int32_t qihse_tryte_dot_product_scalar(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes);
+
+int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes)
+{
+    return qihse_tryte_dot_product_scalar(lhs, rhs, row_bytes);
+}
+#endif
 #else
 int32_t qihse_tryte_dot_product_avx2(const uint8_t* lhs, const uint8_t* rhs, size_t row_bytes) {
     return qihse_tryte_dot_product_scalar(lhs, rhs, row_bytes);
