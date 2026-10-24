@@ -1,0 +1,39 @@
+name: W11 inventory reservation example
+
+on:
+  push:
+    paths:
+      - '.github/workflows/w11-inventory-example.yml'
+      - 'examples/w11_inventory/**'
+      - 'include/**'
+      - 'src/**'
+      - 'Makefile'
+      - 'vendor/liboqs'
+      - 'vendor/oqs-provider'
+  pull_request:
+    paths:
+      - '.github/workflows/w11-inventory-example.yml'
+      - 'examples/w11_inventory/**'
+      - 'include/**'
+      - 'src/**'
+      - 'Makefile'
+      - 'vendor/liboqs'
+      - 'vendor/oqs-provider'
+  workflow_dispatch:
+
+jobs:
+  inventory-reservation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install QIHSE build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev liburing-dev libpython3-dev libluajit-5.1-dev \
+            libbpf-dev libxdp-dev libsqlite3-dev zlib1g-dev
+      - name: Run inventory example and authorization negative test
+        run: ./examples/w11_inventory/run.sh
