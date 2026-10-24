@@ -634,7 +634,8 @@ replication to a promotable successor remains open. Environment knobs (all optio
 elsewhere):** `tests/cluster_smoke.py` (two-node routing + MOVED redirects),
 `tests/cluster_discover_smoke.py` (--join membership discovery; run after
 bringing up a seed node), `tests/cluster_loadshift_smoke.py`
-(`CLUSTER MOVESLOTS` ownership flip). All honor `QIHSE_NODE0_HOST` /
+(`CLUSTER MOVESLOTS` guard: data-bearing moves refuse before ownership changes
+until pinned QKP slot transfer is available). All honor `QIHSE_NODE0_HOST` /
 `QIHSE_NODE0_PORT` / `QIHSE_NODE1_HOST` / `QIHSE_NODE1_PORT` /
 `QIHSE_CLUSTER_PASSWORD`. *Not verified in this pass* (they require a running
 two-node cluster; only the failover drill is self-starting).

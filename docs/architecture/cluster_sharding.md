@@ -588,15 +588,16 @@ Nodes may join without a pre-shared topology: launch with `--join SEED_HOST:SEED
 
 ## Slot load shift (CLUSTER MOVESLOTS)
 
-`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` (system domain only) hands a
-slot range to another node: it transfers every locally-owned KV record in the
-range to the target over the MIGRATE wire flow (AUTH + ASKING + SET [PX]),
-deletes the local copies, flips ownership in the topology, and broadcasts the
-change on the cluster bus (`SLOT_UPDATE`), so every node's routing agrees.
-Ownership flips BEFORE the transfer (the target must accept the incoming
-SETs); a brief not-found window exists for not-yet-transferred keys — Redis
-style ASK-state handling is future work. Verified cross-machine by
-`tests/cluster_loadshift_smoke.py` (9/9).
+`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` is restricted to the system
+domain. The daemon does not configure the legacy RESP target credential while
+slot transfer lacks pinned QKP transport. For a range containing data, the
+handoff now refuses before changing ownership if target authentication is
+unavailable; an empty range can still be assigned to the target. The hermetic
+`tests/cluster_loadshift_smoke.py --self-spawn` verifies that refusal leaves
+the source keys and both nodes' slot views intact. Authenticated transfer of
+data to a new owner remains an implementation gap. The library's legacy
+AUTH + ASKING + SET [PX] path exists for explicit development fixtures and
+must not be used for classified production data without secured transport.
 
 ## Cluster brain (--brain)
 

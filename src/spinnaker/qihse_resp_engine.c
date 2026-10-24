@@ -11032,6 +11032,7 @@ typedef struct {
     size_t count;
     size_t cap;
     size_t skipped;
+    bool failed;
     uint16_t first, last;
 } moveslots_collector_t;
 
@@ -11042,11 +11043,17 @@ static bool moveslots_collect_cb(const char* key, const char* value, void* user_
     uint16_t slot = qihse_cluster_key_slot(key, len);
     if (slot < c->first || slot > c->last) return true;
     if (len > MOVESLOTS_KEY_MAX) { c->skipped++; return true; }
-    if (c->count >= MOVESLOTS_KEY_CAP) return false; /* stop collecting: cap reached */
+    if (c->count >= MOVESLOTS_KEY_CAP) {
+        c->failed = true;
+        return false;
+    }
     if (c->count == c->cap) {
         size_t next = c->cap ? c->cap * 2u : 256u;
         char (*grown)[MOVESLOTS_KEY_MAX + 1u] = realloc(c->keys, next * sizeof(*grown));
-        if (!grown) return false;
+        if (!grown) {
+            c->failed = true;
+            return false;
+        }
         c->keys = grown;
         c->cap = next;
     }
@@ -11193,28 +11200,40 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
     }
 
     /* Collect local keys whose slot falls in the range. */
-    moveslots_collector_t collector = { NULL, 0, 0, 0, first, last };
+    moveslots_collector_t collector = {
+        .first = first, .last = last
+    };
     pthread_rwlock_wrlock(&server->kv_lock);
-    qihse_kv_foreach_user(server->store, user, moveslots_collect_cb, &collector);
+    bool enumerated = qihse_kv_foreach_user(server->store, user,
+                                             moveslots_collect_cb, &collector);
     pthread_rwlock_unlock(&server->kv_lock);
     if (out_collected) *out_collected = collector.count;
-
-    /* Flip ownership FIRST (locally + bus broadcast): the target must accept
-     * SETs for the range during the transfer, and its clients route there.
-     * The source keeps reading its store directly (no routing), so in-flight
-     * keys stream over after the flip. Redis-style ASK-state windows are
-     * future work; a brief not-found window exists for not-yet-moved keys. */
-    if (!qihse_cluster_set_range_owner(server, first, last, target_index)) {
+    if (!enumerated || collector.failed || collector.skipped) {
         free(collector.keys);
-        if (err && err_cap) snprintf(err, err_cap, "ownership flip failed");
+        if (err && err_cap) snprintf(err, err_cap, "key enumeration incomplete");
         return -1;
     }
+
     if (collector.count == 0) {
         free(collector.keys);
-        return 0; /* nothing to move: the range still takes load on the target */
+        if (!qihse_cluster_set_range_owner(server, first, last, target_index)) {
+            if (err && err_cap) snprintf(err, err_cap, "ownership flip failed");
+            return -1;
+        }
+        return 0; /* no data to transfer: the range can take load on the target */
     }
 
-    /* Connect + authenticate to the target. */
+    /* The daemon leaves this credential unset until slot migration has a
+     * secure transport. Refuse before changing ownership: otherwise the
+     * target rejects ASKING/SET and the source's keys become unreachable. */
+    const char* password = server->cluster_migrate_password;
+    if (!password || !*password) {
+        free(collector.keys);
+        if (err && err_cap) snprintf(err, err_cap, "target authentication unavailable");
+        return -1;
+    }
+
+    /* Establish and authenticate the target before any topology mutation. */
     int target_fd = qihse_resp_connect_timeout(target.host, target.port, 5000);
     if (target_fd < 0) {
         free(collector.keys);
@@ -11222,21 +11241,31 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         return -1;
     }
     char remote_error[512] = {0};
-    const char* password = server->cluster_migrate_password;
-    if (password && *password) {
-        static const uint8_t auth_cmd[] = "AUTH";
-        static const uint8_t op_user[] = "GODMODE_OP";
-        qihse_resp_arg_t auth_args[3] = {
-            { auth_cmd, sizeof(auth_cmd) - 1u },
-            { (const uint8_t*)op_user, sizeof(op_user) - 1u },
-            { (const uint8_t*)password, strlen(password) }
-        };
-        if (!qihse_resp_fd_command(target_fd, 3u, auth_args, remote_error, sizeof(remote_error))) {
-            close_socket(target_fd);
-            free(collector.keys);
-            if (err && err_cap) snprintf(err, err_cap, "target authentication failed");
-            return -1;
-        }
+    static const uint8_t auth_cmd[] = "AUTH";
+    static const uint8_t op_user[] = "GODMODE_OP";
+    qihse_resp_arg_t auth_args[3] = {
+        { auth_cmd, sizeof(auth_cmd) - 1u },
+        { (const uint8_t*)op_user, sizeof(op_user) - 1u },
+        { (const uint8_t*)password, strlen(password) }
+    };
+    if (!qihse_resp_fd_command(target_fd, 3u, auth_args,
+                                remote_error, sizeof(remote_error))) {
+        close_socket(target_fd);
+        free(collector.keys);
+        if (err && err_cap) snprintf(err, err_cap, "target authentication failed");
+        return -1;
+    }
+
+    /* Flip ownership FIRST (locally + bus broadcast): the target must accept
+     * SETs for the range during the transfer, and its clients route there.
+     * The source keeps reading its store directly (no routing), so in-flight
+     * keys stream over after the flip. Redis-style ASK-state windows are
+     * future work; a brief not-found window exists for not-yet-moved keys. */
+    if (!qihse_cluster_set_range_owner(server, first, last, target_index)) {
+        close_socket(target_fd);
+        free(collector.keys);
+        if (err && err_cap) snprintf(err, err_cap, "ownership flip failed");
+        return -1;
     }
 
     static const uint8_t asking_cmd[] = "ASKING";
