@@ -1,20 +1,20 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-10-22
+**Status date:** 2026-10-24
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` not started · `[>]` superseded
 
-**Current program status (2026-10-22):** 134 items implemented, 2 partial, 12 planned deliverables (5 in W11 and 7 in the new W12 research/implementation lane), and 1 superseded conditional item. W0–W10 are closed (100% of their applicable scope complete). W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), [W11](#w11--general-database-application-platform-active-stretch-goal), and the independent [W12 TurboQuant plan](docs/plans/qihse_turboquant_vector_index_plan.md). W12 is a proposal, not a claim of implementation.
+**Current program status (2026-10-24):** 134 items implemented, 2 partial, 14 planned deliverables (2 cluster-transport follow-ups, 5 in W11, and 7 in W12), and 1 superseded conditional item. The recorded W0–W10 checklist is closed, while authenticated replication to a promotable successor and secure data-bearing slot transfer remain open capabilities. W11 is active with its SQL transaction and interface foundation partially landed. QH-10 did not meet its implementation gate because no cross-project inbox consumer was demonstrated. The final suite run passed `make test`, all 72 gold workloads, and the 48 standalone `test-*` targets outside that aggregate. See [W10](#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20), the [full QIHSE engine specification](QIHSE_ENGINE_ROADMAP.md), [W11](#w11--general-database-application-platform-active-stretch-goal), and the independent [W12 TurboQuant plan](docs/plans/qihse_turboquant_vector_index_plan.md). W12 is a proposal, not a claim of implementation.
 
 ---
 
-## 1. Where we are now (reviewed 2026-10-21)
+## 1. Where we are now (reviewed 2026-10-24)
 
-The historical program is closed. W0–W9 are implemented, including the W8 I2P replica transport live SOCKS5 smoke test across stageb containers and W9 runtime-dispatched hardware acceleration on the R730xd, dual E5-2470 v2 host, and AMD Zen 4/Zen 2 hosts. Audit continuity and exact-prefix challenge gates are implemented but intentionally undeployed pending retained-log review and the required negative CI coverage. The verification gold suite is non-vacuous; remaining verification work is documentation.
+The historical W0–W10 checklist is closed. W0–W9 are implemented, including the W8 I2P replica transport live SOCKS5 smoke test across stageb containers and W9 runtime-dispatched hardware acceleration on the R730xd, dual E5-2470 v2 host, and AMD Zen 4/Zen 2 hosts. Audit continuity and exact-prefix challenge gates are implemented but intentionally undeployed pending retained-log review and the required negative CI coverage. The verification gold suite is non-vacuous and passed 72/72 workloads on 2026-10-24. Its cluster smokes verify fail-closed behavior; they do not implement the two cluster-transport follow-ups below.
 
-The W0–W10 implementation program is closed with **134 implemented and 1 superseded conditional item (100% of its applicable scope complete)**. Functionality and security defects in the existing workstreams are fixed, including NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need. W11 adds **7 stretch deliverables** for QIHSE's role as the general database foundation for commerce, inventories, fuzzing findings, agent memory, and other applications; W11.1 and W11.5 are now partial.
+The recorded W0–W10 checklist has **134 implemented and 1 superseded conditional item**. Functionality and security defects addressed in those workstreams include NULL-context authorization, Bolt and Mongo wire compatibility, WAL replay, MVCC delete visibility, and SQL DML. QH-00 through QH-09 meet their documented acceptance gates; QH-10 remains available as a future design only if a concrete consumer demonstrates the need. The open cluster-transport capabilities are tracked separately as CT.1–CT.2. W11 adds **7 stretch deliverables** for QIHSE's role as the general database foundation for commerce, inventories, fuzzing findings, agent memory, and other applications; W11.1 and W11.5 are now partial.
 
 ### Remote Server Hardware Acceleration (Dell PowerEdge R730xd — Dual Xeon E5-2690 v4) (2026-10-17)
 
@@ -253,7 +253,7 @@ The database-replacement program (**Phases 1–9**) is complete and committed �
 | Secondary indexes (B+ tree, hash, composite, index-backed plans) | `[x]` |
 | Replication, read replicas, CDC, coordinated snapshots, backup/restore, PITR | `[x]` |
 | Wire protocols: RESP2/3, pgwire, MongoDB, Bolt/Cypher, HTTP/REST, ES-style, ClickHouse-style, InfluxDB-style | `[x]` |
-| Cluster: 16,384 slots, gossip, Raft failover, zero-downtime rebalancing, scatter-gather planner | `[x]` |
+| Cluster: 16,384 slots, gossip, failover, scatter-gather planner; secure data-bearing rebalancing remains open | `[~]` |
 | Ops: pooler, Prometheus metrics, OTel tracing, task queue/scheduler, backup | `[x]` |
 | Compatibility command surfaces for 8 target databases (Phase 9) | `[x]` |
 
@@ -591,6 +591,11 @@ unblocks first:
 
 Pinned QKP replica pull requires a read-only replica. Authenticated write duplication to a promotable cluster successor and pinned-QKP data-bearing slot transfer remain unimplemented; the failover and loadshift guards do not close those integration gaps.
 
+### CT — Secure cluster transport follow-ups (open)
+
+- [ ] **CT.1 — Replicate writes to a promotable successor:** replace the disabled cleartext `--redundancy-peer` path with authenticated, pinned QKP transport and a durable, replay-safe write stream. Preserve classification, SCI, tenant and principal boundaries at the receiving store. Demonstrate a write on the lead reaching the successor before promotion, then kill the lead and read the surviving value. Include low-clearance/high-data and forged-peer negatives, lost replies, restart, duplicate delivery and lag reporting. The current failover smoke verifies takeover of a preseeded value only.
+- [ ] **CT.2 — Secure data-bearing slot transfer:** replace legacy RESP credential replay with pinned QKP migration, explicit authenticated context on enumeration and target writes, and a recovery protocol that cannot strand keys or publish ownership before data is available. Test partial transfer, target failure, reconnect, rollback/reconciliation, classification/SCI denial and concurrent writes. The current `MOVESLOTS` guard refuses unavailable transfer before changing ownership and permits empty-range reassignment; it is not a live data-migration success test.
+
 ---
 
 ### W8 — KP14-SUITE analysis-output authority (planned)
@@ -692,7 +697,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 
 ## 4. Sequencing
 
-**Historical W0–W10 sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
+**Historical W0–W10 checklist sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Cluster transport follow-ups:** CT.1 and CT.2 require pinned QKP designs and may proceed independently of W11. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
 
 | Horizon | Work | Why now |
 |---|---|---|
@@ -702,6 +707,7 @@ Dedicated architecture plan and execution tracking live in [docs/plans/ZEN4_ZEN2
 | **Later** | F6, then F7 | Supply-chain substrate needs journal + leases + trust; chaos/regression budgets gate the whole thing |
 | **Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
 | **QIHSE AIMEM lane (complete)** | QH-00 through QH-09 complete; QH-10 conditional gate not triggered | Durable scoped lifecycle, coordination, lineage, querying, maintenance, archives and assurance are integrated and tested |
+| **Cluster transport follow-ups** | CT.1–CT.2 planned | Pinned QKP write replication to a promotable successor and recoverable data-bearing slot migration |
 | **Active stretch program** | W11.0–W11.6; W11.1 and W11.5 partial | General database guarantees across application models, workload isolation, online evolution, history, developer tooling, and combined failure validation |
 | **Optional vector-index research lane** | W12.0–W12.6; all planned | Independent TurboQuant candidate index with authenticated pre-top-K filtering, FP32 rerank, benchmark-gated optional SIMD/Vulkan and reversible sidecars |
 

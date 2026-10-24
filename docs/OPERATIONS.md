@@ -205,19 +205,18 @@ repl + transport + rejoin + CA + CRL + backup + consensus + incremental export,
 controller SDKs, AI memory, fabric, task, e2e, persistence, bytecode, document/
 column/FTS/time-series/event-stream stores, SQL completeness/DML/txn/MVCC/
 indexes/optimizer governance, Bolt, MongoDB wire + security, repl, metrics,
-parallel query) **plus** the two `GNUmakefile` overlay targets
-(`test-uwp-tls`, `test-uwp-secure-default`), and finishes with `test-gold`.
+parallel query) **plus** the two prerequisites added by `GNUmakefile`
+(`test-uwp-tls`, `test-uwp-secure-default`), and includes `test-gold`.
 
-Expected runtime: roughly 40–50 minutes on this development host (the
-aggregate is sequential and dominated by federation, fabric, and gold
-workloads; the gold suite alone is ≈4.5 minutes). Do not run two aggregates
-concurrently — several targets create/remove shared scratch state at the
+The 2026-10-24 sequential aggregate took about 39 minutes on this host;
+gold workloads accounted for 828.5 seconds, excluding build time. Do not run
+two aggregates concurrently — several targets create/remove shared scratch state at the
 repository root (`qihse_integrity.chain*`) and under `build/`.
 
 Note on ordering and failure: `make` runs the prerequisites of `test` in
-declaration order — the `Makefile` list first, then the two `GNUmakefile`
-overlay targets — and stops at the first failure. Because the aggregate ends
-with `test-gold`. As of the 2026-09-29 W7 wave the pack is green
+declaration order — the `Makefile` list first, then the two prerequisites
+added by `GNUmakefile` — and stops at the first failure. `test-gold` is not the final
+direct test in the current aggregate. In the 2026-10-24 run the pack was green
 (72/72 workloads, 11/11 areas FULL, zero recorded gaps — see
 [§2.4](#24-the-gold-validation-suite)), so a plain `make test` runs to the
 end; historical note: it was red for a stretch and `make -k test` remains
@@ -287,7 +286,8 @@ membership suite (roles/joint/drift), snapshot transfer, the ingest contract,
 the browser negative-auth, QKP identity and feed-wire suites, and the
 self-spawning failover drill — the first workload that kills a REAL daemon
 peer (SIGKILL, successor takes all 16384 slots, a preseeded key survives) —
-plus the hermetic discovery and loadshift drills (loopback --self-spawn),
+plus the hermetic discovery drill and loadshift refusal guard (loopback
+--self-spawn),
 the fusion recall/latency gate, non-vector index byte accounting, and
 backend busy-time accounting. Board: **72/72 pass, 11/11 areas FULL, zero
 recorded gaps**; the drills were hardened to pass reliably under CPU
@@ -304,11 +304,12 @@ Verdicts (see the header of `tests/gold/gold_runner.c`): `VERDICT: PASS`
 error, 2 non-green under strict. Adding a workload is a pack edit only — the
 Makefile extracts the `bin=` list from the pack.
 
-Verified on this branch (2026-09-29, under host load avg 80): `make
-test-gold` completes with **`VERDICT: PASS` — 72/72 workloads, 11/11 areas
-FULL, zero recorded gaps** (the drill workloads were hardened for exactly
-these conditions: by-condition readiness waits, leak-proof teardown, 900 s
-pack timeouts). On a quiet box the suite takes ≈4.5 minutes. Historical
+Verified again on 2026-10-24: the gold pack completed with **`VERDICT: PASS`
+— 72/72 workloads, 11/11 areas FULL, zero declared gaps**. Its workloads took
+828.5 seconds in total on this host, excluding build time. The failover drill
+tests survival of a preseeded value; the loadshift guard tests fail-closed
+refusal while secure data-bearing transfer is unavailable. See CT.1–CT.2 in
+`ROADMAP.md` for those open capabilities. Historical
 note for perspective: the pack was red at 59/60 for a stretch in the
 2026-09-26 round (a `controller-api` abort that `make test` alone never
 ran — exactly the kind of coverage the pack exists to catch); that defect
