@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "qihse_auth.h"
@@ -92,15 +93,29 @@ static void send_command(int fd, size_t argc, const char** argv) {
     }
 }
 
-static char* read_reply(int fd) {
+static char* read_reply(int fd, const char* command) {
     size_t cap = 8192;
     char* buffer = malloc(cap);
     assert(buffer != NULL);
     size_t len = 0;
+    struct timespec started;
+    assert(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
     for (;;) {
+        struct timespec now;
+        assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        int64_t elapsed_ms = (int64_t)(now.tv_sec - started.tv_sec) * 1000 +
+                             (now.tv_nsec - started.tv_nsec) / 1000000;
+        int remaining_ms = elapsed_ms < 30000 ? 30000 - (int)elapsed_ms : 0;
         struct pollfd pfd = { fd, POLLIN, 0 };
-        int ready = poll(&pfd, 1, 2000);
+        /* Password verification and FTS rebuild can exceed the former 2 s
+         * timeout under suite load. Bound the whole reply, not each read. */
+        int ready = poll(&pfd, 1, remaining_ms);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0)
+            fprintf(stderr, "FTS adapter: no reply to %s within 30 s "
+                    "(poll=%d, errno=%d)\n", command, ready, errno);
         assert(ready > 0);
+        assert(len < cap - 1);
         ssize_t received = read(fd, buffer + len, cap - len - 1);
         assert(received > 0);
         len += (size_t)received;
@@ -125,7 +140,7 @@ static void assert_single_reply(const char* reply) {
 
 static char* cmd(test_client_t* client, size_t argc, const char** argv) {
     send_command(client->fd, argc, argv);
-    return read_reply(client->fd);
+    return read_reply(client->fd, argv[0]);
 }
 
 static char* auth(test_client_t* client, const char* user, const char* password) {
@@ -165,7 +180,8 @@ static qihse_resp_server_t* make_server(qihse_kv_store_t* store, qihse_user_t* o
 }
 
 int main(void) {
-    char data_dir[] = "/tmp/qihse-fts-persist-XXXXXX";
+    assert(mkdir("build", 0700) == 0 || errno == EEXIST);
+    char data_dir[] = "build/qihse-fts-persist-XXXXXX";
     assert(mkdtemp(data_dir) != NULL);
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
