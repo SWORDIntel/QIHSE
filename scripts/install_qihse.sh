@@ -962,7 +962,43 @@ EOF
     echo "  [✓] Service '${SERVICE_NAME}' enabled to start on system boot (multi-user.target; runs regardless of logged-in user)."
 
     CONNECTED_COUNT=1
-    if [ "$DO_LAUNCH" -eq 1 ]; then
+    # Probe helpers: prefer the pinned QKP admin identity (qihse-admin-cli),
+# fall back to redis-cli password AUTH, then to systemd state.
+probe_ping() {
+    local ip="$1" port="$2" pw="$3" out
+    if command -v qihse-admin-cli >/dev/null 2>&1 &&
+       [ -f "/etc/qihse/keys/qihse_dsa_pub.pem" ] &&
+       [ -f "/etc/qihse/keys/qihse_dsa_key.pem" ]; then
+        out="$($SUDO qihse-admin-cli --host "$ip" --port "$port" \
+            --node-id "${ADMIN_NODE_ID:-admin-t420}" \
+            --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem --ping 2>/dev/null || true)"
+        [ "$out" = "PONG" ] && { printf 'PONG\n'; return 0; }
+    fi
+    if command -v redis-cli >/dev/null 2>&1; then
+        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -h "$ip" -p "$port" ping 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+probe_cluster_nodes() {
+    local ip="$1" port="$2" pw="$3" out
+    if command -v qihse-admin-cli >/dev/null 2>&1 &&
+       [ -f "/etc/qihse/keys/qihse_dsa_pub.pem" ] &&
+       [ -f "/etc/qihse/keys/qihse_dsa_key.pem" ]; then
+        out="$($SUDO qihse-admin-cli --host "$ip" --port "$port" \
+            --node-id "${ADMIN_NODE_ID:-admin-t420}" \
+            --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem --cluster-nodes 2>/dev/null || true)"
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    fi
+    if command -v redis-cli >/dev/null 2>&1; then
+        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -h "$ip" -p "$port" cluster nodes 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+if [ "$DO_LAUNCH" -eq 1 ]; then
         echo "  • Starting service '${SERVICE_NAME}'..."
         $SUDO systemctl restart "${SERVICE_NAME}"
 
@@ -971,11 +1007,9 @@ EOF
         HEALTHY=0
         for _ in $(seq 1 15); do
             sleep 1
-            if command -v redis-cli >/dev/null 2>&1; then
-                if REDISCLI_AUTH="${OPERATOR_PASSWORD}" redis-cli -h "${BIND_IP}" -p "${PORT}" ping 2>/dev/null | grep -q "PONG"; then
-                    HEALTHY=1
-                    break
-                fi
+            if probe_ping "${BIND_IP}" "${PORT}" "${OPERATOR_PASSWORD}" 2>/dev/null | grep -q "PONG"; then
+                HEALTHY=1
+                break
             elif systemctl is-active --quiet "${SERVICE_NAME}"; then
                 HEALTHY=1
                 break
@@ -996,11 +1030,9 @@ EOF
                     NOW="$(date +%s)"
                     ELAPSED=$((NOW - START_TIME))
 
-                    if command -v redis-cli >/dev/null 2>&1; then
-                        NODES_OUTPUT="$(REDISCLI_AUTH="${OPERATOR_PASSWORD}" redis-cli -h "${BIND_IP}" -p "${PORT}" cluster nodes 2>/dev/null || true)"
-                        if [ -n "$NODES_OUTPUT" ]; then
-                            CONNECTED_COUNT="$(echo "$NODES_OUTPUT" | grep -c ' connected' || echo 1)"
-                        fi
+                    NODES_OUTPUT="$(probe_cluster_nodes "${BIND_IP}" "${PORT}" "${OPERATOR_PASSWORD}" 2>/dev/null || true)"
+                    if [ -n "$NODES_OUTPUT" ]; then
+                        CONNECTED_COUNT="$(echo "$NODES_OUTPUT" | grep -c ' connected' || echo 1)"
                     fi
 
                     printf "\r    Cluster bus discovery: %d / %d nodes acknowledged (elapsed: %ds / %ds)..." "${CONNECTED_COUNT}" "${EXPECTED_NODES}" "${ELAPSED}" "${WAIT_TIMEOUT}"
@@ -1182,7 +1214,11 @@ if [ "${DERIVED_AUTOPASS:-0}" -eq 1 ]; then
     echo ""
 fi
 
-echo "Verify connection (do not place passwords in argv):"
+echo "Verify connection:"
+echo "  # hardened masters (QKP admin pin):"
+echo "  sudo qihse-admin-cli --host ${BIND_IP} --port ${PORT} --node-id admin-t420 \\"
+echo "      --trusted-pub /etc/qihse/keys/qihse_dsa_pub.pem --ping"
+echo "  # non-hardened fallback (password AUTH; do not place passwords in argv):"
 echo "  Load QIHSE_OPERATOR_PASSWORD from the root-owned /etc/qihse/cluster-node${NODE_INDEX}.env into REDISCLI_AUTH."
 echo "  redis-cli -h ${BIND_IP} -p ${PORT} ping"
 echo "  unset REDISCLI_AUTH"

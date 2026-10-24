@@ -11,7 +11,8 @@
 #   2. back up the currently deployed binaries (timestamped .bak)
 #   3. install the new libqihse.so + daemon/tool binaries
 #   4. systemctl restart the node service
-#   5. wait for RESP PING (operator-password AUTH from the node env file)
+#   5. wait for PING via the pinned QKP admin identity (qihse-admin-cli;
+#      redis-cli password AUTH is only a fallback for non-hardened nodes)
 #   6. wait for `cluster nodes` to report every peer connected
 # After all nodes: verify 3/3 from each side and wait one replication
 # interval so the 30s automatic sync has run.
@@ -21,17 +22,24 @@
 #   ./scripts/cluster_rolling_restart.sh --verify-only
 #   ./scripts/cluster_rolling_restart.sh --node node5 --node node1 --node node0
 #
+# The QKP health probes require the masters to pin this host's admin
+# identity: --admin-peer-node-id admin-t420 --admin-peer-dsa-pub <pub>.
 # Environment:
-#   QIHSE_OPERATOR_PASSWORD  fallback when a node env file is unreadable
+#   QIHSE_OPERATOR_PASSWORD  redis-cli fallback for non-hardened deployments
 
 set -euo pipefail
 
-# name | ssh target (local = this host) | systemd unit | bin dir | lib dir | build dir | RESP ip | RESP port
+# name | ssh target (local = this host) | systemd unit | bin dir | lib dir | build dir | RESP ip | RESP port | master dsa pub (for QKP pin)
 NODES=(
-    "node5|root@192.168.1.90|qihse-node5-host.service|/opt/QIHSE/bin|/opt/QIHSE/lib|/opt/QIHSE-src|192.168.1.90|7115"
-    "node1|root@192.168.1.95|qihse-node1.service|/opt/qihse/bin|/opt/qihse/lib|/opt/qihse-src|192.168.1.250|7101"
-    "node0|local|qihse-node0.service|/opt/QIHSE/bin|/opt/QIHSE/lib|/opt/QIHSE|192.168.1.91|7100"
+    "node5|root@192.168.1.90|qihse-node5-host.service|/opt/QIHSE/bin|/opt/QIHSE/lib|/opt/QIHSE-src|192.168.1.90|7115|qihse_dsa_pub_730xd.pem"
+    "node1|root@192.168.1.95|qihse-node1.service|/opt/qihse/bin|/opt/qihse/lib|/opt/qihse-src|192.168.1.250|7101|qihse_dsa_pub_t320.pem"
+    "node0|local|qihse-node0.service|/opt/QIHSE/bin|/opt/QIHSE/lib|/opt/QIHSE|192.168.1.91|7100|qihse_dsa_pub_t420.pem"
 )
+
+# Pinned admin identity this host presents to the masters (matches the
+# --admin-peer-node-id/--admin-peer-dsa-pub pins on each master unit).
+ADMIN_CLI=/opt/QIHSE/bin/qihse-admin-cli
+ADMIN_NODE_ID=admin-t420
 
 BINARIES=(qihse-cluster-daemon qihse_keygen qihse-federation-ca
           qihse-machine-token qihse-backup)
@@ -95,33 +103,53 @@ node_password() {
     printf '%s' "$pw"
 }
 
-# RESP probe against a node from here (daemon accepts AUTH'd remote clients).
-resp_probe() {
-    local ip="$1" port="$2" pw="$3" cmd="${4:-ping}"
-    # $cmd is intentionally unquoted: redis-cli needs each command word as a
-    # separate argument ("cluster nodes", not the single token "cluster nodes").
+# RESP probe against a node from here. Prefer the pinned QKP admin identity
+# (qihse-admin-cli) — the only path on pqc_require masters; fall back to
+# redis-cli password AUTH for non-hardened deployments.
+node_probe_ping() {
+    local ip="$1" port="$2" pub="$3" pw="$4" out
+    if [ -x "$ADMIN_CLI" ] && [ -f "/etc/qihse/keys/$pub" ]; then
+        out="$(sudo "$ADMIN_CLI" --host "$ip" --port "$port" --node-id "$ADMIN_NODE_ID" \
+            --trusted-pub "/etc/qihse/keys/$pub" --ping 2>/dev/null || true)"
+        [ "$out" = "PONG" ] && { printf 'PONG\n'; return; }
+    fi
     if [ -n "$pw" ]; then
-        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -h "$ip" -p "$port" $cmd 2>/dev/null
+        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -h "$ip" -p "$port" ping 2>/dev/null || true
     else
-        redis-cli -h "$ip" -p "$port" $cmd 2>/dev/null
+        redis-cli -h "$ip" -p "$port" ping 2>/dev/null || true
+    fi
+}
+
+node_probe_cluster() {
+    local ip="$1" port="$2" pub="$3" pw="$4" out
+    if [ -x "$ADMIN_CLI" ] && [ -f "/etc/qihse/keys/$pub" ]; then
+        out="$(sudo "$ADMIN_CLI" --host "$ip" --port "$port" --node-id "$ADMIN_NODE_ID" \
+            --trusted-pub "/etc/qihse/keys/$pub" --cluster-nodes 2>/dev/null || true)"
+        [ -n "$out" ] && { printf '%s\n' "$out"; return; }
+    fi
+    if [ -n "$pw" ]; then
+        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -h "$ip" -p "$port" cluster nodes 2>/dev/null || true
+    else
+        redis-cli -h "$ip" -p "$port" cluster nodes 2>/dev/null || true
     fi
 }
 
 verify_node() {
     local name="$1" spec="$2"
-    local target ip port pw out
+    local target ip port pw pub out
     target="$(node_field "$spec" 2)"
     ip="$(node_field "$spec" 7)"
     port="$(node_field "$spec" 8)"
+    pub="$(node_field "$spec" 9)"
     pw="$(node_password "$target" "$name")"
 
-    out="$(resp_probe "$ip" "$port" "$pw" ping || true)"
+    out="$(node_probe_ping "$ip" "$port" "$pub" "$pw")"
     if ! grep -qi pong <<<"$out"; then
         fail "$name: no PONG from $ip:$port (got '${out:-}')"
     fi
 
     local nodes_out
-    nodes_out="$(resp_probe "$ip" "$port" "$pw" "cluster nodes" 2>/dev/null || true)"
+    nodes_out="$(node_probe_cluster "$ip" "$port" "$pub" "$pw")"
     local connected
     connected="$(grep -c ' connected' <<<"$nodes_out" || true)"
     say "  $name: PONG ok; cluster reports ${connected}/${EXPECTED_NODES} nodes connected"
@@ -130,7 +158,7 @@ verify_node() {
 
 restart_node() {
     local name="$1" spec="$2"
-    local target unit bindir libdir builddir ip port
+    local target unit bindir libdir builddir ip port pub
     target="$(node_field "$spec" 2)"
     unit="$(node_field "$spec" 3)"
     bindir="$(node_field "$spec" 4)"
@@ -138,6 +166,7 @@ restart_node() {
     builddir="$(node_field "$spec" 6)"
     ip="$(node_field "$spec" 7)"
     port="$(node_field "$spec" 8)"
+    pub="$(node_field "$spec" 9)"
 
     step "$name — deploy and restart ($unit)"
 
@@ -170,7 +199,7 @@ restart_node() {
     local pw; pw="$(node_password "$target" "$name")"
     local i out
     for i in $(seq 1 "$PING_TIMEOUT"); do
-        out="$(resp_probe "$ip" "$port" "$pw" ping || true)"
+        out="$(node_probe_ping "$ip" "$port" "$pub" "$pw")"
         if grep -qi pong <<<"$out"; then break; fi
         sleep 1
     done
@@ -179,7 +208,7 @@ restart_node() {
     # 6. wait for full membership
     local nodes_out connected
     for i in $(seq 1 "$JOIN_TIMEOUT"); do
-        nodes_out="$(resp_probe "$ip" "$port" "$pw" "cluster nodes" 2>/dev/null || true)"
+        nodes_out="$(node_probe_cluster "$ip" "$port" "$pub" "$pw")"
         connected="$(grep -c ' connected' <<<"$nodes_out" || true)"
         if [ "${connected:-0}" -ge "$EXPECTED_NODES" ]; then break; fi
         sleep 1
@@ -189,7 +218,8 @@ restart_node() {
 }
 
 main() {
-    command -v redis-cli >/dev/null || fail "redis-cli is required for health checks"
+    { [ -x "$ADMIN_CLI" ] || command -v redis-cli >/dev/null; } \
+        || fail "qihse-admin-cli (or redis-cli) is required for health checks"
     local spec name target unit
     for spec in "${NODES[@]}"; do
         name="$(node_field "$spec" 1)"
