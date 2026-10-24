@@ -27,7 +27,8 @@
 typedef enum {
     QIHSE_BACKUP_CLI_NONE = 0,
     QIHSE_BACKUP_CLI_CREATE,
-    QIHSE_BACKUP_CLI_VERIFY
+    QIHSE_BACKUP_CLI_VERIFY,
+    QIHSE_BACKUP_CLI_RESTORE
 } qihse_backup_cli_command_t;
 
 typedef struct {
@@ -51,6 +52,7 @@ static void qihse_backup_cli_usage(FILE* stream, const char* program) {
             "Usage:\n"
             "  %s backup --data-dir DIR --output FILE [--password-file FILE]\n"
             "  %s verify --data-dir DIR --input FILE [--password-file FILE]\n"
+            "  %s restore --data-dir DIR --input FILE [--password-file FILE]\n"
             "\n"
             "Environment fallbacks:\n"
             "  QIHSE_DATA_DIR          store and authentication directory\n"
@@ -60,7 +62,7 @@ static void qihse_backup_cli_usage(FILE* stream, const char* program) {
             "The service using DIR must be stopped while creating a backup.\n"
             "Use --password-file or QIHSE_OPERATOR_PASSWORD; passwords are\n"
             "never accepted as command-line values or emitted in output.\n",
-            program, program);
+            program, program, program);
 }
 #endif
 
@@ -79,6 +81,8 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
         options->command = QIHSE_BACKUP_CLI_CREATE;
     } else if (strcmp(argv[1], "verify") == 0) {
         options->command = QIHSE_BACKUP_CLI_VERIFY;
+    } else if (strcmp(argv[1], "restore") == 0) {
+        options->command = QIHSE_BACKUP_CLI_RESTORE;
     } else {
         return false;
     }
@@ -93,7 +97,8 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->path = value;
         } else if (strcmp(argv[i], "--input") == 0 &&
-                   options->command == QIHSE_BACKUP_CLI_VERIFY) {
+                   (options->command == QIHSE_BACKUP_CLI_VERIFY ||
+                    options->command == QIHSE_BACKUP_CLI_RESTORE)) {
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->path = value;
         } else if (strcmp(argv[i], "--password-file") == 0) {
@@ -214,7 +219,9 @@ static int qihse_backup_cli_execute(const qihse_backup_cli_options_t* options,
                                     qihse_kv_store_t* store,
                                     qihse_user_t* principal, FILE* output) {
     const char* operation = options && options->command == QIHSE_BACKUP_CLI_VERIFY
-                                ? "verify" : "backup";
+                                ? "verify"
+                                : options && options->command == QIHSE_BACKUP_CLI_RESTORE
+                                ? "restore" : "backup";
     if (!options || !output || !qihse_backup_cli_operator_allowed(principal)) {
         if (output) qihse_backup_cli_emit_failure(output, operation,
                                                   "operator_required",
@@ -257,6 +264,20 @@ static int qihse_backup_cli_execute(const qihse_backup_cli_options_t* options,
         fputs("{\"ok\":true,\"operation\":\"verify\",\"path\":", output);
         qihse_backup_cli_json_string(output, options->path);
         fputs(",\"result\":\"valid\"}\n", output);
+        return QIHSE_BACKUP_CLI_OK;
+    }
+
+    if (options->command == QIHSE_BACKUP_CLI_RESTORE) {
+        int rc = store ? qihse_restore_user(store, principal, options->path)
+                       : QIHSE_BACKUP_EXPORT_ERR;
+        if (rc != QIHSE_BACKUP_EXPORT_OK) {
+            qihse_backup_cli_emit_failure(output, operation,
+                                          qihse_backup_cli_result_name(rc), rc);
+            return QIHSE_BACKUP_CLI_OPERATION_FAILED;
+        }
+        fputs("{\"ok\":true,\"operation\":\"restore\",\"path\":", output);
+        qihse_backup_cli_json_string(output, options->path);
+        fputs(",\"result\":\"restored\"}\n", output);
         return QIHSE_BACKUP_CLI_OK;
     }
 
@@ -314,7 +335,8 @@ int main(int argc, char** argv) {
     }
 
     qihse_kv_store_t* store = NULL;
-    if (options.command == QIHSE_BACKUP_CLI_CREATE) {
+    if (options.command == QIHSE_BACKUP_CLI_CREATE ||
+        options.command == QIHSE_BACKUP_CLI_RESTORE) {
         store = qihse_kv_store_create();
         if (!store) {
             qihse_backup_cli_emit_failure(stdout, "backup",

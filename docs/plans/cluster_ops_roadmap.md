@@ -60,14 +60,14 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 | 3.2 | Unify cluster scripts | Merge `cluster_rolling_restart.sh` + `cluster_replica_deploy.sh` into one coherent command set with `--status`/`--verify` modes |
 | 3.3 | CI integration coverage | Build + deploy a throwaway 3-node cluster in CI; run the replication and admin-path tests (2.1) against it |
 
-## Phase 4 — Cluster capability (unblocked by Phase 0)
+## Phase 4 — Cluster capability
 
 | # | Item | Notes |
 |---|---|---|
-| 4.1 | Slot migration / `--brain-act` | The daemon gates brain-act on pinned QKP replication — now satisfied; migration drills across the ring |
-| 4.2 | Failover & quorum drills | Kill a master, verify the remaining nodes serve and replicas stay consistent; document the recovery runbook |
-| 4.3 | Backup/restore strategy | Full-store backup via a QKP-capable path + restore drill into a replica store |
-| 4.4 | Watchdog & alerting | Prometheus-style metrics / journal-based alerts for pull failures (`replica pull ... stopped on error`) and daemon restarts |
+| 4.1 | Slot migration / `--brain-act` | ⚠️ NOT an ungate — the read-only replica pull is a different path than the data-bearing slot PUSH the gate names; ~90% of the brain/handoff machinery exists but the QKP transport swap + authenticated enumeration + strand-free recovery must be written. Full plan: `docs/plans/slot_migration_qkp_plan.md` |
+| 4.2 | Failover & quorum drills | ✅ drilled: stopped node5 → `master,fail`, node0+node1 kept serving → rejoined 3/3 |
+| 4.3 | Backup/restore strategy | ✅ `qihse-backup restore` implemented + verified round-trip (backup → restore → verify valid); runbook in `docs/plans/backup_restore_runbook.md` |
+| 4.4 | Watchdog & alerting | ✅ `scripts/cluster_watchdog.sh` (master PING + replica pull check) |
 
 ## Cross-cutting risks
 

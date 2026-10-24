@@ -49,11 +49,18 @@ Expect `{"ok":true,"operation":"verify","result":"valid"}`.
 
 ## Restore
 
-**Not yet implemented** — `qihse-backup` currently ships only `backup` and
-`verify`; there is no `restore` subcommand. Tracked as a follow-up (Phase 4.3
-of `docs/plans/cluster_ops_roadmap.md`). Until then a node's data is recovered
-by re-running the installer / re-pulling a replica from its pinned source,
-and the backups serve as offline full-store archives.
+```bash
+systemctl stop qihse-node0.service
+sudo env QIHSE_DATA_DIR=/opt/qihse-data/node0 \
+     QIHSE_BACKUP_PATH=/var/backups/qihse-node0-….bin \
+     QIHSE_OPERATOR_PASSWORD="…" \
+     ./qihse-backup restore
+systemctl start qihse-node0.service
+```
+
+Expect `{"ok":true,"operation":"restore","result":"restored"}`, then `verify`
+returns `valid`. Restore is a whole-store replace; it must run against a
+stopped node (same consistency rule as backup).
 
 ## Caveats
 
