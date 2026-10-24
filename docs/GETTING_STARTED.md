@@ -33,7 +33,8 @@ The launcher is the preferred entry point because it exposes the build, test, be
 
 ## 2. Build
 
-The normal build automatically selects supported CPU instruction paths from the host CPU.
+The normal build automatically selects supported CPU instruction paths from
+the host CPU and verifies them before compiling anything:
 
 ```bash
 ./qihse build
@@ -42,8 +43,31 @@ The normal build automatically selects supported CPU instruction paths from the 
 Equivalent Makefile workflow:
 
 ```bash
-make
+make           # runs the mandatory ISA check, then builds
+make check-isa # report the resolved ISA matrix only
 ```
+
+**Build on each machine natively.** Every per-ISA SIMD kernel (AVX2,
+AVX-512, AVX-VNNI, AMX, F16C) is compile-time gated behind the resolved
+build flags, so a binary contains only the instruction set of the machine it
+was built on. Deploying a binary built on a newer CPU to an older node can
+trap on instructions that node lacks, so build on the target machine with
+the native helper:
+
+```bash
+./qihse build-native   # = ./scripts/build-native.sh --auto
+```
+
+`build-native.sh --auto` detects all extended ISAs (AVX, F16C, AVX2, AVX-512
+F/DQ/BW/VL, AVX-VNNI, AMX), refuses to force an ISA the host does not
+advertise, and passes the resolved set to `make` together with
+`-march=native`.
+
+The build hard-fails at parse time if an enabled ISA is not advertised by
+the build host (e.g. `make QIHSE_ENABLE_AVX2=1` on an Ivy Bridge host).
+Cross-builds that intentionally target a different CPU may opt out with
+`QIHSE_ISA_SKIP_HOST_CHECK=1`. `./qihse isa-info` shows the
+runtime-detected execution paths.
 
 A full rebuild is no longer required after editing a header: object rules carry
 `-MMD -MP` and the generated `.d` files are included by the Makefile, so a
@@ -55,11 +79,14 @@ Useful alternatives:
 
 ```bash
 ./qihse build-ctypes
-./qihse build-native
 ./qihse build-tui
 ```
 
-QIHSE has scalar and older-ISA fallbacks; AVX2/AVX-512 are accelerators, not a requirement for the entire codebase. Build flags can also be overridden explicitly through the Makefile when testing a specific ISA path.
+QIHSE keeps scalar and older-ISA fallbacks: kernels whose ISA is disabled at
+compile time fall back to scalar (distance, dot-product, codecs) or to the
+next-lower clone (`target_clones`), and the runtime dispatcher still selects
+among what was compiled in. AVX2/AVX-512 are accelerators, not a requirement
+for the entire codebase.
 
 ## 3. Run tests
 
