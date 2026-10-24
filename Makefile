@@ -916,6 +916,7 @@ test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-
 test: test-aimem-scope-index
 test: test-aimem-qh08 test-aimem-qh08-resp
 test: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
+test: test-wal-durability
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -942,6 +943,15 @@ tests/gold/workloads/%: tests/gold/workloads/%.c libqihse.so
 test-txn: lib
 	$(CC) $(CFLAGS) -o tests/test_txn tests/test_txn.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_txn
+
+# WAL durability error propagation uses a syscall shim to inject fdatasync
+# failures deterministically; this standalone test links the WAL implementation
+# directly so the shim cannot affect unrelated library users.
+test-wal-durability:
+	$(CC) $(CFLAGS) -Dfdatasync=qihse_test_fdatasync \
+	    -Dfsync=qihse_test_fsync -o tests/test_wal_durability \
+	    tests/test_wal_durability.c src/tractable/qihse_wal.c -pthread
+	./tests/test_wal_durability
 
 # MVCC delete semantics in both directions: a committed DELETE hides the row
 # whatever aborted writers preceded it, and it hides nothing a reader of an
