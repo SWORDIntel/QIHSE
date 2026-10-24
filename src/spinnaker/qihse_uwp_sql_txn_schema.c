@@ -866,19 +866,35 @@ static qihse_table_store_t* uwp_sql_row_store;
 static pthread_mutex_t uwp_sql_row_store_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define UWP_SQL_TXN_MAGIC 0x51535458u
+#define UWP_SQL_TXN_MAX_TABLES 16u
 typedef struct {
-    uint32_t magic;
     char* table_name;
     qihse_table_txn_t* table_txn;
+} uwp_sql_txn_table_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    size_t table_count;
+    uwp_sql_txn_table_entry_t tables[UWP_SQL_TXN_MAX_TABLES];
 } uwp_sql_txn_resource_t;
 
 static int uwp_sql_txn_commit(void* opaque) {
     uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
-    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return -1;
-    bool committed = qihse_table_txn_commit(resource->table_txn);
-    resource->table_txn = NULL;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC ||
+        resource->table_count == 0 ||
+        resource->table_count > UWP_SQL_TXN_MAX_TABLES)
+        return -1;
+    qihse_table_txn_t* txns[UWP_SQL_TXN_MAX_TABLES];
+    for (size_t i = 0; i < resource->table_count; ++i)
+        txns[i] = resource->tables[i].table_txn;
+    bool committed = qihse_table_txn_commit_group(txns,
+                                                   resource->table_count);
+    for (size_t i = 0; i < resource->table_count; ++i) {
+        resource->tables[i].table_txn = NULL;
+        free(resource->tables[i].table_name);
+        resource->tables[i].table_name = NULL;
+    }
     resource->magic = 0;
-    free(resource->table_name);
     free(resource);
     return committed ? 0 : -1;
 }
@@ -886,10 +902,13 @@ static int uwp_sql_txn_commit(void* opaque) {
 static void uwp_sql_txn_rollback(void* opaque) {
     uwp_sql_txn_resource_t* resource = (uwp_sql_txn_resource_t*)opaque;
     if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return;
-    qihse_table_txn_rollback(resource->table_txn);
-    resource->table_txn = NULL;
+    for (size_t i = 0; i < resource->table_count; ++i) {
+        qihse_table_txn_rollback(resource->tables[i].table_txn);
+        resource->tables[i].table_txn = NULL;
+        free(resource->tables[i].table_name);
+        resource->tables[i].table_name = NULL;
+    }
     resource->magic = 0;
-    free(resource->table_name);
     free(resource);
 }
 
@@ -955,37 +974,48 @@ static qihse_table_t* uwp_sql_row_table(qihse_schema_registry_t* schema,
     return t;
 }
 
-/* Return the transaction-local table shadow for this statement.  The first
- * DML statement enlists one row table in the connection transaction.  This
- * bounded first slice refuses a second table; arbitrary cross-table commit
- * requires the durable coordinator described by W11.1. */
+/* Return the transaction-local table shadow for this statement. A bounded
+ * set of table shadows is published together by the row store. This remains
+ * an in-memory transaction resource: it does not add WAL recovery or durable
+ * cross-model coordination. */
 static qihse_table_txn_t* uwp_sql_txn_table(qihse_txn_t* txn,
                                            qihse_table_t* table,
                                            const char* table_name) {
     if (!txn || !table || !table_name) return NULL;
+    uwp_sql_txn_resource_t* resource =
+        (uwp_sql_txn_resource_t*)txn->resource_ctx;
     if (txn->resource_ctx) {
-        uwp_sql_txn_resource_t* resource =
-            (uwp_sql_txn_resource_t*)txn->resource_ctx;
-        if (resource->magic != UWP_SQL_TXN_MAGIC ||
-            strcmp(resource->table_name, table_name) != 0)
-            return NULL;
-        return resource->table_txn;
+        if (resource->magic != UWP_SQL_TXN_MAGIC) return NULL;
+        for (size_t i = 0; i < resource->table_count; ++i)
+            if (strcmp(resource->tables[i].table_name, table_name) == 0)
+                return resource->tables[i].table_txn;
+        if (resource->table_count >= UWP_SQL_TXN_MAX_TABLES) return NULL;
+    } else {
+        resource = calloc(1, sizeof(*resource));
+        if (!resource) return NULL;
+        resource->magic = UWP_SQL_TXN_MAGIC;
     }
 
-    uwp_sql_txn_resource_t* resource = calloc(1, sizeof(*resource));
-    if (!resource) return NULL;
-    resource->magic = UWP_SQL_TXN_MAGIC;
-    resource->table_name = strdup(table_name);
-    resource->table_txn = qihse_table_txn_begin(table);
-    if (!resource->table_name || !resource->table_txn ||
+    char* name_copy = strdup(table_name);
+    qihse_table_txn_t* table_txn = qihse_table_txn_begin(table);
+    if (!name_copy || !table_txn) {
+        free(name_copy);
+        qihse_table_txn_rollback(table_txn);
+        if (resource->table_count == 0) free(resource);
+        return NULL;
+    }
+    size_t entry = resource->table_count++;
+    resource->tables[entry].table_name = name_copy;
+    resource->tables[entry].table_txn = table_txn;
+    if (entry == 0 &&
         qihse_txn_attach_resource(txn, resource, uwp_sql_txn_commit,
                                   uwp_sql_txn_rollback) != 0) {
-        if (resource->table_txn) qihse_table_txn_rollback(resource->table_txn);
-        free(resource->table_name);
+        qihse_table_txn_rollback(table_txn);
+        free(name_copy);
         free(resource);
         return NULL;
     }
-    return resource->table_txn;
+    return table_txn;
 }
 
 /* Single-line DML reply, malloc'd; NULL on allocation failure. */

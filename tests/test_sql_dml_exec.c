@@ -680,9 +680,17 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql(ctx, user,
                    "INSERT INTO t_txn_dml VALUES (1, 'base', 10)",
                    &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "CREATE TABLE t_txn_dml_peer (id INT, name TEXT, n INT)",
+                   &out) == UWP_STS_OK);
+    assert(run_sql(ctx, user,
+                   "INSERT INTO t_txn_dml_peer VALUES (1, 'peer', 100)",
+                   &out) == UWP_STS_OK);
     qihse_table_t* table = qihse_table_store_find_table(
         qihse_uwp_sql_table_store(), "t_txn_dml");
-    assert(table != NULL);
+    qihse_table_t* peer = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "t_txn_dml_peer");
+    assert(table != NULL && peer != NULL);
 
     assert(run_sql_txn(ctx, user, "BEGIN SERIALIZABLE", &txn, &out) == UWP_STS_OK);
     assert(txn != NULL);
@@ -699,9 +707,15 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql_txn(ctx, user,
                        "UPDATE t_txn_dml SET n = 30 WHERE id = 1",
                        &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(ctx, user,
+                       "UPDATE t_txn_dml_peer SET n = 130 WHERE id = 1",
+                       &txn, &out) == UWP_STS_OK);
+    expect_row(table, 1, "base", 10);
+    expect_row(peer, 1, "peer", 100);
     assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
     assert(txn == NULL);
     expect_row(table, 1, "base", 30);
+    expect_row(peer, 1, "peer", 130);
 
     assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(ctx, user,
@@ -730,6 +744,7 @@ static void test_transactional_dml_commit_rollback(
     assert(run_sql_txn(ctx, user, "COMMIT", &txn, &out) == UWP_STS_ERR_FAILED);
     assert(txn == NULL);
     expect_row(table, 1, "base", 70);
+    expect_row(peer, 1, "peer", 130);
 
     /* SQL savepoints and transactional DDL are refused until the row/schema
      * resources can snapshot and restore those operations. */
@@ -742,8 +757,8 @@ static void test_transactional_dml_commit_rollback(
                                   "t_txn_ddl") == NULL);
     assert(run_sql_txn(ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
 
-    printf("PASS sql transactions: private DML shadows commit, rollback, and "
-           "abort on concurrent live mutation\n");
+    printf("PASS sql transactions: private multi-table DML shadows commit "
+           "together, rollback, and abort on concurrent live mutation\n");
 }
 
 static void test_txn_revocation_and_schema_authorization(

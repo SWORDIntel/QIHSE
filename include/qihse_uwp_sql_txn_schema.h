@@ -28,8 +28,10 @@ typedef enum {
  * in-tree store with in-place update and delete primitives, so parsed UPDATE
  * and DELETE statements execute against it.  The store is process-wide and
  * lazily created, matching the prepared-statement cache in the executor.
- * Explicit UWP transactions attach a private optimistic shadow for one table;
- * COMMIT publishes it through a generation fence and ROLLBACK discards it.
+ * Explicit UWP transactions attach private optimistic shadows for up to 16
+ * tables; COMMIT publishes them together under generation fences and ROLLBACK
+ * discards them. This is in-memory row-store atomicity, not durable WAL
+ * recovery or cross-model coordination.
  * ctx->sql_engine remains an opaque caller-owned pointer the executor never
  * dereferences. Tables must exist in the row store before UPDATE/DELETE.
  * ------------------------------------------------------------------------- */

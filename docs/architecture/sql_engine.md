@@ -244,10 +244,12 @@ the raw SQL text is never re-parsed for execution.
   DELETE change that shadow; COMMIT atomically swaps it into the live table if
   its generation is unchanged, while ROLLBACK or disconnect discards it. A
   concurrent live mutation makes COMMIT abort without overwriting that change.
-  This slice deliberately supports one table per transaction. SQL savepoint
-  commands and transactional DDL fail closed until their storage resources can
-  snapshot and restore those operations. Cross-table atomicity and SQL WAL
-  recovery remain open. A second identical DELETE reports `rows=0`
+  The row store can publish a bounded group of up to 16 table shadows
+  atomically, and UWP SQL enlists those shadows on demand. This is an
+  in-memory multi-table publish boundary; it does not include other models or
+  durable WAL recovery. SQL savepoint commands and transactional DDL fail
+  closed until their storage resources can snapshot and restore those
+  operations. A second identical DELETE reports `rows=0`
   (idempotent).
 - **Failure atomicity**: live and transaction-shadow UPDATE clone the current
   rows before applying assignments. Invalid values or allocation failure return
@@ -442,6 +444,6 @@ independently of that asynchronous projection boundary.
 
 Not covered: real row-producing SELECT, pgwire transactions and prepared
 statements, savepoint data restoration (SQL savepoints currently refuse),
-multi-table atomicity, SQL WAL recovery, window functions, and
+cross-model atomicity, SQL WAL recovery, window functions, and
 `INSERT ... SELECT` execution.
 
