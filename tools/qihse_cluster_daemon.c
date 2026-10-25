@@ -22,6 +22,8 @@
 #include "qihse_auth.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_ownership_journal.h"
+#include "qihse_cluster_reclaim.h"
 #include "qihse_cluster_brain.h"
 #include "qihse_overlay.h"
 #include "qihse_kv_store.h"
@@ -305,6 +307,20 @@ static bool parse_slot_range(const char* s, uint16_t* first, uint16_t* last) {
     memcpy(first_buf, s, n);
     first_buf[n] = '\0';
     return parse_u16(first_buf, first) && parse_u16(dash + 1, last) && *first <= *last;
+}
+
+/* Replay callback for the durable slot-ownership journal: resolve the owner
+ * by node id and adopt the range only if the journaled config_epoch is newer
+ * than what the local topology already knows (adopt-if-newer). */
+static void ownership_journal_replay_cb(const qihse_cluster_ownership_entry_t* e, void* ctx) {
+    qihse_cluster_topology_t* topology = (qihse_cluster_topology_t*)ctx;
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_topology_find_node(topology, e->owner_id, &owner);
+    if (owner == QIHSE_CLUSTER_NODE_NONE) return;
+    qihse_cluster_node_t node;
+    if (!qihse_cluster_topology_get_node(topology, owner, &node)) return;
+    if (e->config_epoch <= node.config_epoch) return;
+    qihse_cluster_topology_adopt_range(topology, e->start, e->end, owner, e->config_epoch);
 }
 
 static void usage(const char* argv0) {
@@ -1811,6 +1827,16 @@ int main(int argc, char** argv) {
         if (!qihse_cluster_topology_assign_range(topology, 0u, QIHSE_CLUSTER_SLOT_COUNT - 1u,
                                                  indexes[self_index]))
             return 1;
+    }
+
+    /* Replay the durable slot-ownership journal so a migration's ownership
+     * survives THIS node's restart (adopt-if-newer). The reclaim/GC pass is
+     * intentionally NOT run here yet: the journal is currently written only
+     * on the migrating source, so the target has not yet learned it gained
+     * the slot — reclaiming stale copies before both sides converge could
+     * leave a slot's only copy on a node that does not route it. */
+    if (data_dir && *data_dir) {
+        qihse_cluster_ownership_journal_replay(data_dir, ownership_journal_replay_cb, topology);
     }
 
     /* R4c QKP1: resolve identity/trust from --pqc-* flags.

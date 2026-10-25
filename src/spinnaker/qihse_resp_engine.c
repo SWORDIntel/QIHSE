@@ -5,6 +5,7 @@
 #include "qihse_cluster_numa.h"
 #include "qihse_ai_memory.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_ownership_journal.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
 #include "qihse_federation_mtls.h"
@@ -11377,6 +11378,20 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
                 snprintf(err, err_cap, "ownership flip failed");
         }
         return -1;
+    }
+    /* PERSIST the ownership delta so it survives restart (COPY → SWITCH →
+     * PERSIST). A crash between the flip and this append is data-safe: COPY
+     * semantics leave the source copy in place, so no key is ever present in
+     * zero places. */
+    {
+        qihse_cluster_node_t persisted_owner;
+        if (qihse_cluster_topology_get_node(server->topology, target_index, &persisted_owner)) {
+            const char* dir = getenv("QIHSE_DATA_DIR");
+            if (dir && *dir)
+                qihse_cluster_ownership_journal_append(dir, first, last,
+                                                       persisted_owner.id,
+                                                       persisted_owner.config_epoch);
+        }
     }
     /* Ownership flipped and durable. COPY-not-MOVE safety: keep the source
      * copy for now — it is reclaimed (GC) only after the ownership change is
