@@ -149,6 +149,11 @@ typedef struct {
      * scope) at accept time. */
     const char* admin_peer_node_id;
     const char* admin_peer_dsa_pub_path;
+    /* Optional pinned slot-migration identity: a trusted QKP peer with a
+     * matching node id + DSA pub that this node accepts data-bearing
+     * CLUSTER MOVESLOTS pushes from (ASKING/SET over the sealed channel). */
+    const char* migration_peer_node_id;
+    const char* migration_peer_dsa_pub_path;
 } qihse_qkp_config_t;
 
 typedef enum {

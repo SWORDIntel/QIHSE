@@ -119,7 +119,8 @@ typedef enum {
     QIHSE_RESP_AUTH_PEER_CLAIMS,
     QIHSE_RESP_AUTH_MACHINE_CLAIMS,
     QIHSE_RESP_AUTH_QKP_REPLICATION,
-    QIHSE_RESP_AUTH_QKP_ADMIN
+    QIHSE_RESP_AUTH_QKP_ADMIN,
+    QIHSE_RESP_AUTH_QKP_MIGRATION
 } qihse_resp_auth_kind_t;
 
 typedef struct {
@@ -14886,6 +14887,12 @@ static bool qihse_resp_session_command_allowed(
         case QIHSE_RESP_AUTH_QKP_ADMIN:
             /* pinned administrator identity — full command scope */
             return true;
+        case QIHSE_RESP_AUTH_QKP_MIGRATION:
+            /* pinned slot-migration identity — data-movement commands only */
+            return qihse_resp_command_is(request, "ASKING") ||
+                   qihse_resp_command_is(request, "SET") ||
+                   qihse_resp_command_is(request, "GET") ||
+                   qihse_resp_command_is(request, "DEL");
         default:
             return true;
     }
@@ -15373,6 +15380,25 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
                 session.user = op;
                 session.user_id = 0u;
                 session.auth_kind = QIHSE_RESP_AUTH_QKP_ADMIN;
+            }
+        }
+        /* Pinned slot-migration identity: a trusted QKP peer configured with
+         * --migration-peer-node-id/--migration-peer-dsa-pub that may push
+         * data-bearing CLUSTER MOVESLOTS transfers. Maps to the operator but
+         * with the data-movement-only allowlist (QIHSE_RESP_AUTH_QKP_MIGRATION). */
+        if (!session.user && server->pqc.migration_peer_node_id &&
+            server->pqc.migration_peer_dsa_pub_path &&
+            qihse_qkp_session_is_replication_peer(
+                qkp, server->pqc.migration_peer_node_id,
+                server->pqc.migration_peer_dsa_pub_path)) {
+            qihse_user_t* op = qihse_auth_get_user(0u);
+            bool op_active = false;
+            uint32_t op_tenant = QIHSE_TENANT_INVALID;
+            if (op) qihse_auth_user_active_and_tenant(op, &op_active, &op_tenant);
+            if (op_active && op_tenant == QIHSE_TENANT_SYSTEM) {
+                session.user = op;
+                session.user_id = 0u;
+                session.auth_kind = QIHSE_RESP_AUTH_QKP_MIGRATION;
             }
         }
     }
