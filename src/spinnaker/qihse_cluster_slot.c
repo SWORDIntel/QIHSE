@@ -112,7 +112,10 @@ bool qihse_cluster_topology_upsert_node(qihse_cluster_topology_t* topology, cons
     copy.host[QIHSE_CLUSTER_HOST_LEN] = '\0';
     if (copy.bus_port == 0 && copy.port <= UINT16_MAX - 10000u) copy.bus_port = (uint16_t)(copy.port + 10000u);
     if (copy.role == QIHSE_CLUSTER_NODE_PRIMARY) copy.primary_index = QIHSE_CLUSTER_NODE_NONE;
-    copy.config_epoch = qihse_cluster_next_epoch(topology);
+    /* config_epoch is an OWNERSHIP epoch, not a membership counter. Keep the
+     * caller's value (0 for a newly-discovered node, or the peer's epoch for a
+     * node learned over the bus) so per-owner comparisons stay consistent
+     * across nodes instead of drifting with each topology's local counter. */
     /* Derive the federation identity here rather than relying on a caller.
      * Every node gets one, including nodes discovered from an unauthenticated
      * MEET, so the durable stores are reachable for all of them — and the
@@ -238,7 +241,9 @@ bool qihse_cluster_topology_set_node_health(qihse_cluster_topology_t* topology, 
         return false;
     }
     topology->nodes[index].healthy = healthy;
-    topology->nodes[index].config_epoch = qihse_cluster_next_epoch(topology);
+    /* Health is not an ownership change: do not advance config_epoch here, or
+     * a node's epoch drifts with every heartbeat and the bus slot-update
+     * receiver rejects valid ownership as stale. */
     pthread_mutex_unlock(&topology->metadata_lock);
     return true;
 }
