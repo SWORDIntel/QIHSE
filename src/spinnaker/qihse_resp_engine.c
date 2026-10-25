@@ -11378,9 +11378,10 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         }
         return -1;
     }
-    for (size_t i = 0; i < collector.count; i++) {
-        qihse_kv_del_user(server->store, collector.keys[i], user);
-    }
+    /* Ownership flipped and durable. COPY-not-MOVE safety: keep the source
+     * copy for now — it is reclaimed (GC) only after the ownership change is
+     * durably journaled (see qihse_cluster_ownership_journal), so the data is
+     * never present in zero places across a restart. */
     pthread_rwlock_unlock(&server->kv_lock);
 
     qihse_qkp_session_free(qkp);
