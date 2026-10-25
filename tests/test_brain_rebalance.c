@@ -19,6 +19,8 @@
 #include "qihse_cluster_slot.h"
 #include "qihse_event_stream.h"
 #include "qihse_kv_store.h"
+#include "qihse_pqc_crypto.h"
+#include "qihse_qkp.h"
 #include "qihse_resp_wire.h"
 
 #include <arpa/inet.h>
@@ -49,6 +51,13 @@ typedef struct {
     pthread_t thread;
 } fake_peer_t;
 
+/* QKP1 target identity (the rebalance handoff is pinned-QKP, not cleartext). */
+static qihse_qkp_config_t g_target_qkp;
+static char g_source_pub[600];
+static char g_target_pub[600];
+static const char* g_source_trust[1];
+static const char* g_target_trust[1];
+
 static int peer_listen(uint16_t* port_out) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
@@ -67,39 +76,22 @@ static int peer_listen(uint16_t* port_out) {
     return fd;
 }
 
-static bool peer_read_command(int fd, char* buf, size_t* fill, char* cmd_out, size_t cap) {
-    for (;;) {
-        if (*fill > 0 && buf[0] == '*') {
-            char* nl = memchr(buf, '\n', *fill);
-            if (nl) {
-                int nargs = atoi(buf + 1);
-                size_t off = (size_t)(nl - buf) + 1u;
-                bool complete = nargs > 0;
-                for (int i = 0; i < nargs && complete; i++) {
-                    if (off >= *fill || buf[off] != '$') { complete = false; break; }
-                    char* nl2 = memchr(buf + off, '\n', *fill - off);
-                    if (!nl2) { complete = false; break; }
-                    int len = atoi(buf + off + 1);
-                    size_t data_off = (size_t)(nl2 - buf) + 1u;
-                    if (data_off + (size_t)len + 2u > *fill) { complete = false; break; }
-                    if (i == 0) {
-                        size_t c = (size_t)len < cap - 1u ? (size_t)len : cap - 1u;
-                        memcpy(cmd_out, buf + data_off, c);
-                        cmd_out[c] = '\0';
-                    }
-                    off = data_off + (size_t)len + 2u;
-                }
-                if (complete) {
-                    memmove(buf, buf + off, *fill - off);
-                    *fill -= off;
-                    return true;
-                }
-            }
-        }
-        ssize_t n = recv(fd, buf + *fill, 4096u - *fill, 0);
-        if (n <= 0) return false;
-        *fill += (size_t)n;
-    }
+/* Extract argv[0] from one complete RESP array-of-bulks (unsealed plaintext). */
+static bool peer_resp_first_arg(const char* buf, size_t len, char* out, size_t cap) {
+    if (len < 1 || buf[0] != '*') return false;
+    const char* nl = memchr(buf, '\n', len);
+    if (!nl) return false;
+    size_t off = (size_t)(nl - buf) + 1u;
+    if (off >= len || buf[off] != '$') return false;
+    const char* nl2 = memchr(buf + off, '\n', len - off);
+    if (!nl2) return false;
+    int arglen = atoi(buf + off + 1);
+    size_t data_off = (size_t)(nl2 - buf) + 1u;
+    if (arglen < 0 || data_off + (size_t)arglen + 2u > len) return false;
+    size_t c = (size_t)arglen < cap - 1u ? (size_t)arglen : cap - 1u;
+    memcpy(out, buf + data_off, c);
+    out[c] = '\0';
+    return true;
 }
 
 static void* peer_main(void* arg) {
@@ -112,13 +104,23 @@ static void* peer_main(void* arg) {
         if (select(p->listen_fd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
         int cfd = accept(p->listen_fd, NULL, NULL);
         if (cfd < 0) continue;
-        char buf[4096];
-        size_t fill = 0;
-        char cmd[64];
-        while (!p->stop && peer_read_command(cfd, buf, &fill, cmd, sizeof cmd)) {
-            if (strcmp(cmd, "SET") == 0) __atomic_add_fetch(&p->set_count, 1, __ATOMIC_RELAXED);
-            if (send(cfd, "+OK\r\n", 5, 0) <= 0) break;
+        qihse_qkp_session_t* qs = NULL;
+        if (qihse_qkp_server_negotiate(cfd, &g_target_qkp, &qs) != QIHSE_QKP_SECURE || !qs) {
+            close(cfd);
+            continue;
         }
+        uint8_t* frame = (uint8_t*)malloc(QIHSE_QKP_MAX_FRAME + 64u);
+        if (!frame) { qihse_qkp_session_free(qs); close(cfd); continue; }
+        char cmd[64];
+        while (!p->stop) {
+            ssize_t n = qihse_qkp_recv_sealed(qs, cfd, frame, QIHSE_QKP_MAX_FRAME + 64u);
+            if (n <= 0) break;
+            if (!peer_resp_first_arg((const char*)frame, (size_t)n, cmd, sizeof cmd)) break;
+            if (strcmp(cmd, "SET") == 0) __atomic_add_fetch(&p->set_count, 1, __ATOMIC_RELAXED);
+            if (!qihse_qkp_send_sealed(qs, cfd, "+OK\r\n", 5)) break;
+        }
+        free(frame);
+        qihse_qkp_session_free(qs);
         close(cfd);
     }
     return NULL;
@@ -197,6 +199,34 @@ int main(void) {
     assert(mkdir(dir_b, 0700) == 0);
     assert(mkdir(dir_c, 0700) == 0);
 
+    /* QKP identities for the pinned rebalance transport (source↔target). */
+    char src_keys[600], tgt_keys[600];
+    snprintf(src_keys, sizeof(src_keys), "%s/source", root);
+    snprintf(tgt_keys, sizeof(tgt_keys), "%s/target", root);
+    assert(mkdir(src_keys, 0700) == 0 && mkdir(tgt_keys, 0700) == 0);
+    setenv("QIHSE_FIPS_MODE", "disabled", 1);
+    assert(qihse_pqc_init_providers() >= 0);
+    assert(qihse_pqc_keygen(src_keys));
+    assert(qihse_pqc_keygen(tgt_keys));
+    snprintf(g_source_pub, sizeof(g_source_pub), "%s/qihse_dsa_pub.pem", src_keys);
+    snprintf(g_target_pub, sizeof(g_target_pub), "%s/qihse_dsa_pub.pem", tgt_keys);
+    g_source_trust[0] = g_target_pub;
+    g_target_trust[0] = g_source_pub;
+    memset(&g_target_qkp, 0, sizeof(g_target_qkp));
+    {
+        char path[700];
+        snprintf(path, sizeof(path), "%s/qihse_dsa_key.pem", tgt_keys);
+        g_target_qkp.dsa_key_path = strdup(path);
+        snprintf(path, sizeof(path), "%s/qihse_kem_key.pem", tgt_keys);
+        g_target_qkp.kem_key_path = strdup(path);
+        snprintf(path, sizeof(path), "%s/qihse_kem_pub.pem", tgt_keys);
+        g_target_qkp.kem_pub_path = strdup(path);
+        g_target_qkp.trusted_pubs = g_target_trust;
+        g_target_qkp.trusted_count = 1u;
+        g_target_qkp.node_id = "brain-reb-target";
+        g_target_qkp.require = true;
+    }
+
     assert(qihse_auth_init());
     qihse_user_t* system_user = qihse_auth_get_user(0);
     assert(system_user);
@@ -217,6 +247,19 @@ int main(void) {
     scfg.port = 0;
     scfg.store = store;
     scfg.cluster_migrate_password = "reb-test-password";
+    {
+        char path[700];
+        snprintf(path, sizeof(path), "%s/qihse_dsa_key.pem", src_keys);
+        scfg.pqc.dsa_key_path = strdup(path);
+        snprintf(path, sizeof(path), "%s/qihse_kem_key.pem", src_keys);
+        scfg.pqc.kem_key_path = strdup(path);
+        snprintf(path, sizeof(path), "%s/qihse_kem_pub.pem", src_keys);
+        scfg.pqc.kem_pub_path = strdup(path);
+        scfg.pqc.trusted_pubs = g_source_trust;
+        scfg.pqc.trusted_count = 1u;
+        scfg.pqc.node_id = local_id;
+        scfg.pqc.require = true;
+    }
     qihse_resp_server_t* server = qihse_resp_server_create(&scfg);
     assert(server);
     qihse_cluster_topology_t* topo = qihse_resp_server_topology(server);
