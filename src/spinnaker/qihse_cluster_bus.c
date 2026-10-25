@@ -1,4 +1,5 @@
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_ownership_journal.h"
 #include "qihse_endian.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -772,10 +773,6 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     if (payload_len < sizeof(qihse_cluster_bus_slot_update_t)) return;
     qihse_cluster_bus_slot_update_t upd;
     memcpy(&upd, payload, sizeof(upd));
-    uint64_t cur_epoch = qihse_cluster_topology_epoch(bus->topology);
-    if (upd.config_epoch > 0 && upd.config_epoch < cur_epoch) {
-        return; /* ignore updates with stale epoch to defeat replay attacks */
-    }
     /* Resolve the owner by node ID in the local topology */
     uint16_t local_owner = QIHSE_CLUSTER_NODE_NONE;
     if (upd.owner_id[0] != '\0') {
@@ -783,8 +780,29 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     }
     if (local_owner == QIHSE_CLUSTER_NODE_NONE) {
         qihse_cluster_topology_unassign_range(bus->topology, upd.start, upd.end);
-    } else {
-        qihse_cluster_topology_assign_range(bus->topology, upd.start, upd.end, local_owner);
+        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    /* Per-owner epoch: accept only if not stale for that owner (defeats
+     * replays without dropping a legitimate migration whose source epoch
+     * lags the receiver's drifted global epoch). */
+    qihse_cluster_node_t owner;
+    bool owner_known = qihse_cluster_topology_get_node(bus->topology, local_owner, &owner);
+    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
+        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+        return; /* stale */
+    }
+    bool changed = !owner_known || upd.config_epoch > owner.config_epoch;
+    qihse_cluster_topology_adopt_range(bus->topology, upd.start, upd.end,
+                                       local_owner, upd.config_epoch);
+    /* Persist a genuine ownership change on the receiving side too, so both
+     * ends of a migration record it and the GC can reclaim once converged.
+     * Idempotent re-announces (equal epoch) are NOT journaled. */
+    if (changed) {
+        const char* dir = getenv("QIHSE_DATA_DIR");
+        if (dir && *dir)
+            qihse_cluster_ownership_journal_append(dir, upd.start, upd.end,
+                                                   upd.owner_id, upd.config_epoch);
     }
     __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
 }
