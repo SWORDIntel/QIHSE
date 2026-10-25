@@ -76,3 +76,13 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
   supported change path.
 - Hardened masters are QKP-only: every operator tool must go through
   `qihse-admin-cli`; do not reintroduce cleartext AUTH.
+
+## Phase 5 — SDK & platform direction
+
+| # | Item | Notes |
+|---|---|---|
+| 5.1 | Freeze the C QKP admin ABI as the SDK contract | `qihse_qkp_admin_exec` / `qihse_qkp_admin_free` (`include/qihse_qkp.h`) are the single client surface; every language binding must go through them, never reimplement QKP/ML-KEM/ML-DSA or pin/trust logic |
+| 5.2 | Rust `qihse-sys` + safe operator client | **Recommended authoritative SDK/CLI language.** `bindgen` over `include/qihse_qkp.h` → typed, memory-safe FFI; one static binary (no interpreter/`LD_LIBRARY_PATH` on hardened masters). Additive only — the C core and its crypto stay the source of truth |
+| 5.3 | Keep Python as the scripting surface | `qihse_admin.py` (ctypes over the same ABI) stays for interactive ops; it must remain a thin wrapper, not the authoritative client |
+| 5.4 | Go stays infra-only (`linuxagent`) | cgo interop with liboqs/OpenSSL FIPS + ML-DSA key material is a poor fit for the crypto client; do not fold the operator SDK into Go |
+| 5.5 | Complete the sorted-set command surface | ✅ `ZRANK`/`ZREVRANK`/`ZPOPMAX`/`ZPOPMIN`/`ZCOUNT` implemented (`qihse_resp_engine.c`) over `qihse_resp_collect_zset` (they were nil/empty stubs); parity with `ZRANGE`/`ZCARD`/`ZINCRBY` |

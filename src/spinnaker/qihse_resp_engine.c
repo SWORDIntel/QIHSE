@@ -5425,7 +5425,29 @@ static bool qihse_resp_handle_zcard(qihse_resp_session_t* session, const qihse_r
 
 static bool qihse_resp_handle_zcount(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 4) return qihse_resp_wrong_arity(session, "zcount");
-    return qihse_resp_integer(session, 0);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    double min_score = 0.0, max_score = 0.0;
+    bool min_exclusive = false, max_exclusive = false;
+    if (!qihse_resp_parse_score_bound(&request->argv[2], &min_score, &min_exclusive) ||
+        !qihse_resp_parse_score_bound(&request->argv[3], &max_score, &max_exclusive))
+        return qihse_resp_error(session, "ERR min or max is not a float");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    free(key);
+    int64_t matched = 0;
+    if (ok) {
+        for (size_t i = 0; i < count; i++) {
+            double s = items[i].score;
+            bool above_min = min_exclusive ? (s > min_score) : (s >= min_score);
+            bool below_max = max_exclusive ? (s < max_score) : (s <= max_score);
+            if (above_min && below_max) matched++;
+        }
+    }
+    qihse_resp_zitems_free(items, count);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    return qihse_resp_integer(session, matched);
 }
 
 static bool qihse_resp_handle_zrange(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
@@ -5465,7 +5487,27 @@ static bool qihse_resp_handle_zrange(qihse_resp_session_t* session, const qihse_
 
 static bool qihse_resp_handle_zrank(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
     if (request->argc != 3) return qihse_resp_wrong_arity(session, rev ? "zrevrank" : "zrank");
-    return qihse_resp_null(session);
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    char* member = qihse_resp_arg_text(&request->argv[2]);
+    if (!key || !member) { free(key); free(member); return qihse_resp_error(session, "ERR invalid argument"); }
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    free(key);
+    int64_t rank = -1;
+    if (ok) {
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(items[i].member, member) == 0) {
+                rank = rev ? (int64_t)(count - 1u - i) : (int64_t)i;
+                break;
+            }
+        }
+    }
+    free(member);
+    qihse_resp_zitems_free(items, count);
+    if (!ok) return qihse_resp_error(session, "ERR out of memory");
+    if (rank < 0) return qihse_resp_null(session);
+    return qihse_resp_integer(session, rank);
 }
 
 static bool qihse_resp_handle_zincrby(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
@@ -5491,8 +5533,46 @@ static bool qihse_resp_handle_zincrby(qihse_resp_session_t* session, const qihse
 }
 
 static bool qihse_resp_handle_zpop(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool max) {
-    if (request->argc < 2) return qihse_resp_wrong_arity(session, max ? "zpopmax" : "zpopmin");
-    return qihse_resp_array(session, 0);
+    if (request->argc != 2 && request->argc != 3)
+        return qihse_resp_wrong_arity(session, max ? "zpopmax" : "zpopmin");
+    if (!session->server->store) return qihse_resp_error(session, "ERR store not configured");
+    int64_t pop_count = 1;
+    if (request->argc == 3) {
+        if (!qihse_resp_parse_i64_arg(&request->argv[2], &pop_count) || pop_count < 0)
+            return qihse_resp_error(session, "ERR value is not an integer or out of range");
+    }
+    char* key = qihse_resp_arg_text(&request->argv[1]);
+    if (!key) return qihse_resp_error(session, "ERR invalid key");
+    qihse_resp_zitem_t* items = NULL; size_t count = 0;
+    bool ok = qihse_resp_collect_zset(session, key, &items, &count);
+    if (!ok) { free(key); qihse_resp_zitems_free(items, count); return qihse_resp_error(session, "ERR out of memory"); }
+    size_t pop = (size_t)pop_count;
+    if (pop > count) pop = count;
+    bool emitted = qihse_resp_array(session, pop * 2u);
+    for (size_t n = 0; emitted && n < pop; n++) {
+        size_t index = max ? (count - 1u - n) : n;
+        emitted = qihse_resp_bulk_text(session, items[index].member);
+        if (emitted) {
+            char score[40];
+            snprintf(score, sizeof(score), "%.17g", items[index].score);
+            emitted = qihse_resp_bulk_text(session, score);
+        }
+    }
+    /* Delete only after the reply is fully framed so a partial write never
+     * drops data the client could not have observed. */
+    if (emitted) {
+        for (size_t n = 0; n < pop; n++) {
+            size_t index = max ? (count - 1u - n) : n;
+            char* zk = qihse_resp_zset_key(key, items[index].member);
+            if (zk) {
+                qihse_kv_del_user(session->server->store, zk, session->user);
+                free(zk);
+            }
+        }
+    }
+    free(key);
+    qihse_resp_zitems_free(items, count);
+    return emitted;
 }
 
 static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool rev) {
