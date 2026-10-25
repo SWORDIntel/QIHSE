@@ -111,3 +111,32 @@ next_run = client.schedule_next("daily_cleanup")
 print("Next scheduled run:", next_run)
 ```
 
+
+## Cluster administration (hardened masters)
+
+Hardened masters (`pqc_require` — any node with replication/migration/admin
+pins) reject cleartext RESP, so the protocol-emulation adapters above
+(`qihse_http`, `qihse_mongo`, …) cannot reach them. Use the administration
+SDK instead, which wraps the QKP admin CLI and the ops scripts:
+
+```python
+from qihse_admin import ClusterAdmin, ClusterOps
+
+ca = ClusterAdmin(admin_cli="/opt/QIHSE/bin/qihse-admin-cli",
+                  node_id="admin-t420",          # matches --admin-peer-node-id
+                  identity_dir="/etc/qihse/keys",
+                  sudo=True)                     # identity keys are root-only
+
+ca.ping("192.168.1.91", 7100, "qihse_dsa_pub_t420.pem")
+ca.cluster_nodes("192.168.1.91", 7100, "qihse_dsa_pub_t420.pem")
+ca.set("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "k", "v")
+ca.moveslots("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem",
+             4916, 4916, "192.168.1.91:7100")
+
+ops = ClusterOps()              # wraps scripts/cluster_*.sh
+ops.watchdog()
+ops.rolling_restart(verify_only=True)
+```
+
+See `docs/OPERATIONS.md` for the full operational model (replication,
+slot migration durability, backup/restore, rolling restart).
