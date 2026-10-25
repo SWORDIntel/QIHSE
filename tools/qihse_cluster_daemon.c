@@ -1830,17 +1830,13 @@ int main(int argc, char** argv) {
     }
 
     /* Replay the durable slot-ownership journal so a migration's ownership
-     * survives THIS node's restart (adopt-if-newer), then reclaim any local
-     * key whose slot has since moved to another node. The reclaim (a full
-     * store scan) runs only when the journal actually recorded a migration,
-     * so normal restarts pay no startup cost. */
+     * survives THIS node's restart (adopt-if-newer). The reclaim/GC pass is
+     * deliberately NOT invoked: qihse_kv_foreach_user reads every value, so a
+     * full-store scan blocks the store for minutes and is a net loss. The
+     * stale COPY left on the source is harmless (it routes the migrated slot
+     * away), so GC is deferred until a key-only iteration primitive exists. */
     if (data_dir && *data_dir) {
-        int replayed = qihse_cluster_ownership_journal_replay(data_dir,
-                                                              ownership_journal_replay_cb,
-                                                              topology);
-        if (replayed > 0 && indexes[self_index] != QIHSE_CLUSTER_NODE_NONE)
-            qihse_cluster_reclaim_foreign_slots(store, topology, indexes[self_index],
-                                                qihse_auth_get_user(0u));
+        qihse_cluster_ownership_journal_replay(data_dir, ownership_journal_replay_cb, topology);
     }
 
     /* R4c QKP1: resolve identity/trust from --pqc-* flags.
