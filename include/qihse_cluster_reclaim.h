@@ -19,6 +19,17 @@ size_t qihse_cluster_reclaim_foreign_slots(qihse_kv_store_t* store,
                                            uint16_t local_index,
                                            qihse_user_t* user);
 
+/* Bounded variant: collects at most `max_keys` foreign-slot keys (0 = 4096
+ * default), verifies each slot is still foreign and not in MIGRATING/IMPORTING
+ * state at deletion time, and deletes them. Sets `*out_has_more` to true if
+ * additional foreign keys remain. */
+size_t qihse_cluster_reclaim_foreign_slots_bounded(qihse_kv_store_t* store,
+                                                   const qihse_cluster_topology_t* topology,
+                                                   uint16_t local_index,
+                                                   qihse_user_t* user,
+                                                   size_t max_keys,
+                                                   bool* out_has_more);
+
 #ifdef __cplusplus
 }
 #endif

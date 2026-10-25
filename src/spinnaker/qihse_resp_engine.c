@@ -6,6 +6,7 @@
 #include "qihse_ai_memory.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ownership_journal.h"
+#include "qihse_cluster_reclaim.h"
 #include "qihse_cluster_ops.h"
 #include "qihse_federation.h"
 #include "qihse_federation_mtls.h"
@@ -11117,8 +11118,7 @@ typedef struct {
     uint16_t first, last;
 } moveslots_collector_t;
 
-static bool moveslots_collect_cb(const char* key, const char* value, void* user_data) {
-    (void)value;
+static bool moveslots_collect_cb(const char* key, void* user_data) {
     moveslots_collector_t* c = (moveslots_collector_t*)user_data;
     size_t len = strlen(key);
     uint16_t slot = qihse_cluster_key_slot(key, len);
@@ -11227,8 +11227,7 @@ static bool cluster_key_is_node_local(const char* key) {
     return false;
 }
 
-static bool cluster_range_probe_cb(const char* key, const char* value, void* user_data) {
-    (void)value;
+static bool cluster_range_probe_cb(const char* key, void* user_data) {
     cluster_range_probe_t* p = (cluster_range_probe_t*)user_data;
     /* Node-local bookkeeping is not shardable data and must not make a range
      * look locally owned. */
@@ -11250,7 +11249,7 @@ bool qihse_cluster_range_has_local_keys(qihse_resp_server_t* server, uint16_t fi
     if (!user) return false;
     cluster_range_probe_t probe = { first, last, 0, limit, false };
     pthread_rwlock_wrlock(&server->kv_lock);
-    qihse_kv_foreach_user(server->store, user, cluster_range_probe_cb, &probe);
+    qihse_kv_foreach_key_user(server->store, user, cluster_range_probe_cb, &probe);
     pthread_rwlock_unlock(&server->kv_lock);
     return probe.found;
 }
@@ -11285,8 +11284,8 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         .first = first, .last = last
     };
     pthread_rwlock_wrlock(&server->kv_lock);
-    bool enumerated = qihse_kv_foreach_user(server->store, user,
-                                             moveslots_collect_cb, &collector);
+    bool enumerated = qihse_kv_foreach_key_user(server->store, user,
+                                                 moveslots_collect_cb, &collector);
     pthread_rwlock_unlock(&server->kv_lock);
     if (out_collected) *out_collected = collector.count;
     if (!enumerated || collector.failed || collector.skipped) {
@@ -11480,6 +11479,37 @@ static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qih
     snprintf(summary, sizeof(summary), "%llu keys moved; slots %u-%u now owned by %.64s:%u",
              (unsigned long long)moved, first, last, target_spec, target_port);
     return qihse_resp_bulk_text(session, summary);
+}
+
+/* ---------------------------------------------------------------------------
+ * CLUSTER RECLAIM [limit]  (system domain operator only)
+ * Reclaims stale local KV records whose slot is owned by another node and in
+ * STABLE state, using the authenticated key-only iterator.
+ * ------------------------------------------------------------------------- */
+static bool qihse_resp_handle_reclaim(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
+    if (!session->user || qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR) {
+        return qihse_resp_error(session, "NOPERM RECLAIM is restricted to the system domain administrator");
+    }
+    if (request->argc != 2 && request->argc != 3) {
+        return qihse_resp_error(session, "ERR usage: CLUSTER RECLAIM [limit]");
+    }
+    size_t limit = 4096u;
+    if (request->argc == 3) {
+        uint64_t parsed = 0;
+        if (!qihse_resp_parse_u64_arg(&request->argv[2], &parsed) || parsed == 0 || parsed > 1000000u) {
+            return qihse_resp_error(session, "ERR invalid limit");
+        }
+        limit = (size_t)parsed;
+    }
+    uint16_t local_index = qihse_cluster_topology_local_node(session->server->topology);
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded(
+        session->server->store, session->server->topology,
+        local_index, session->user, limit, NULL);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    return qihse_resp_integer(session, (int64_t)deleted);
 }
 
 /* ---------------------------------------------------------------------------
@@ -15231,6 +15261,9 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER")) {
                 if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
                     return qihse_resp_handle_moveslots(session, request);
+                }
+                if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "RECLAIM")) {
+                    return qihse_resp_handle_reclaim(session, request);
                 }
                 qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
                                                          qihse_resp_cluster_owner_cb, session->server };

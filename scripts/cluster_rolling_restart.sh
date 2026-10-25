@@ -42,7 +42,7 @@ ADMIN_CLI=/opt/QIHSE/bin/qihse-admin-cli
 ADMIN_NODE_ID=admin-t420
 
 BINARIES=(qihse-cluster-daemon qihse_keygen qihse-federation-ca
-          qihse-machine-token qihse-backup)
+          qihse-machine-token qihse-backup qihse-admin-cli)
 EXPECTED_NODES=3
 PING_TIMEOUT=120
 JOIN_TIMEOUT=180

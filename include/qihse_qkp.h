@@ -201,6 +201,24 @@ bool qihse_qkp_client_session_is_replication_peer(const qihse_qkp_session_t* s,
                                                   const char* expected_node_id,
                                                   const char* expected_dsa_pub_path);
 
+/* Execute one administrative RESP command over a fresh QKP1 sealed session
+ * using the client identity in `identity_dir` and verifying the server against
+ * `trusted_pub_path`. Formats the RESP reply as human-readable text (matching
+ * qihse-admin-cli output) into a newly-allocated buffer `*out_text` (caller
+ * frees with qihse_qkp_admin_free).
+ * Returns 0 on success, 2 on bad config/keys, 3 on connect/handshake failure,
+ * or 5 on command send/reply failure. If `err_buf` is non-NULL, writes a
+ * short diagnostic message on failure. */
+int qihse_qkp_admin_exec(const char* host, uint16_t port,
+                         const char* node_id,
+                         const char* identity_dir,
+                         const char* trusted_pub_path,
+                         size_t argc, const char* const* argv,
+                         char** out_text,
+                         char* err_buf, size_t err_cap);
+
+void qihse_qkp_admin_free(void* p);
+
 #ifdef __cplusplus
 }
 #endif

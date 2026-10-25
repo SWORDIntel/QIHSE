@@ -2593,6 +2593,60 @@ bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
     return foreach_user_filtered(store, prefix, user, cb, NULL, user_data,
                                  false, 0u, 0u);
 }
+
+typedef struct {
+    qihse_user_t* user;
+    qihse_kv_key_iter_cb cb;
+    void* user_data;
+    uint64_t now;
+    bool stopped;
+} key_iter_ctx_t;
+
+static bool key_iter_mem_cb(const char* key, void* value, size_t value_size,
+                            void* user_data) {
+    (void)value_size;
+    key_iter_ctx_t* ctx = (key_iter_ctx_t*)user_data;
+    const kv_payload_t* p = (const kv_payload_t*)value;
+    if (!ctx || !key || !p || payload_is_dead(p, ctx->now) ||
+        !qihse_auth_can_access(ctx->user, p->classification,
+                               p->sci_compartment)) return true;
+    if (!ctx->cb(key, ctx->user_data)) {
+        ctx->stopped = true;
+        return false;
+    }
+    return true;
+}
+
+bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
+                               qihse_kv_key_iter_cb cb, void* user_data) {
+    if (!store || !store->trie || !user ||
+        !qihse_auth_user_is_active(user) || !cb) return false;
+    kv_store_rdlock(store);
+    /* The index is the only source for flushed-record ACLs. If degraded, fail
+     * closed instead of forcing a full value-materializing compaction. */
+    if (store->sstable_counter > 0 &&
+        (!store->sst_meta || store->sst_meta->degraded)) {
+        kv_store_unlock(store);
+        return false;
+    }
+    key_iter_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data,
+                           .now = current_time_ms(), .stopped = false };
+    qihse_trinary_trie_foreach(store->trie, key_iter_mem_cb, &ctx);
+    if (!ctx.stopped && store->sstable_counter > 0) {
+        const sst_meta_index_t* idx = store->sst_meta;
+        for (size_t i = 0; i < idx->cap; i++) {
+            const sst_meta_entry_t* e = &idx->slots[i];
+            if (!e->key || (e->flags & KV_FLAG_TOMBSTONE) != 0u ||
+                (e->expire_time_ms != 0u && e->expire_time_ms <= ctx.now) ||
+                qihse_trinary_trie_search(store->trie, e->key, NULL) != NULL ||
+                !qihse_auth_can_access(user, e->classification,
+                                       e->sci_compartment)) continue;
+            if (!cb(e->key, user_data)) break;
+        }
+    }
+    kv_store_unlock(store);
+    return true;
+}
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
     (void)qihse_kv_foreach_user(store, NULL, cb, user_data);
 }

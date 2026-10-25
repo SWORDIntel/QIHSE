@@ -117,7 +117,7 @@ print("Next scheduled run:", next_run)
 Hardened masters (`pqc_require` — any node with replication/migration/admin
 pins) reject cleartext RESP, so the protocol-emulation adapters above
 (`qihse_http`, `qihse_mongo`, …) cannot reach them. Use the administration
-SDK instead, which wraps the QKP admin CLI and the ops scripts:
+SDK instead. `ClusterAdmin` calls the in-process C QKP client (`qihse_qkp_admin_exec` in `libqihse.so` via ctypes) when available and falls back to `qihse-admin-cli` (e.g. when `sudo=True` is needed for root-only keys), plus exposes `execute()` and full cluster/admin helpers; `ClusterOps` wraps the ops scripts:
 
 ```python
 from qihse_admin import ClusterAdmin, ClusterOps
@@ -128,10 +128,14 @@ ca = ClusterAdmin(admin_cli="/opt/QIHSE/bin/qihse-admin-cli",
                   sudo=True)                     # identity keys are root-only
 
 ca.ping("192.168.1.91", 7100, "qihse_dsa_pub_t420.pem")
+# Unwrapped RESP commands are passed as separate arguments (including spaces).
+ca.execute("192.168.1.91", 7100, "qihse_dsa_pub_t420.pem",
+           "CONFIG", "GET", "cluster-announce-ip")
 ca.cluster_nodes("192.168.1.91", 7100, "qihse_dsa_pub_t420.pem")
 ca.set("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "k", "v")
 ca.moveslots("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem",
              4916, 4916, "192.168.1.91:7100")
+ca.reclaim("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem")
 
 ops = ClusterOps()              # wraps scripts/cluster_*.sh
 ops.watchdog()

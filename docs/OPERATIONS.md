@@ -486,13 +486,16 @@ The transfer is data-safe by construction:
    (`<data-dir>/slot-ownership.journal`) on *both* ends, so a restart replays
    it (adopt-if-newer by per-owner config epoch) instead of reverting to the
    static `--slot-range` map.
-4. **GC** — on the next startup the source reclaims keys whose slot has moved
-   away, but only when the journal recorded a migration, so normal restarts
-   pay no scan cost.
+4. **GC** — after the listener starts and topology is covered, any node that
+   replayed ownership journal entries reclaims stale foreign-slot copies in
+   bounded batches using `qihse_kv_foreach_key_user` (which checks clearance
+   and SST metadata without reading SST values). Operators can also trigger
+   bounded reclamation on demand via `CLUSTER RECLAIM [limit]`.
 
 The invariant: **a key is never present in zero places.** COPY guarantees
-reachability across any restart, and the journal makes the ownership (and the
-subsequent GC) correct rather than merely safe.
+reachability across any restart, the journal makes ownership durable, and
+bounded key-only GC reclaims stale source copies without blocking startup or
+materializing values.
 
 #### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
 

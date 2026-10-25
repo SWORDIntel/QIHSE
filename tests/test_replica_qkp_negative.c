@@ -334,7 +334,43 @@ int main(void) {
         assert(!strstr(reply, "protected-replica-payload"));
         free(reply);
     }
+
+    /* Native qihse_qkp_admin_exec negative test: unpinned identity must get
+     * NOAUTH with no classified payload disclosure, while pinned admin
+     * identity succeeds. */
+    {
+        const char* get_secret[] = {"GET", "vendor:7:secret"};
+        char* admin_out = NULL;
+        char admin_err[256] = {0};
+        int arc = qihse_qkp_admin_exec("127.0.0.1", qihse_resp_server_port(server),
+                                       "unpinned-admin", cli, server_pub,
+                                       2u, get_secret, &admin_out,
+                                       admin_err, sizeof(admin_err));
+        assert(arc == 0 && admin_out != NULL);
+        assert(strstr(admin_out, "NOAUTH") != NULL);
+        assert(strstr(admin_out, "protected-replica-payload") == NULL);
+        qihse_qkp_admin_free(admin_out);
+    }
     shutdown(fd, SHUT_RDWR); close(fd); qihse_qkp_session_free(session);
+    qihse_resp_server_stop(server); qihse_resp_server_destroy(server);
+
+    config.port = 0u;
+    config.pqc.admin_peer_node_id = "pinned-admin";
+    config.pqc.admin_peer_dsa_pub_path = strdup(client_pub);
+    server = qihse_resp_server_create(&config);
+    assert(server && qihse_resp_server_start(server));
+    {
+        const char* get_secret[] = {"GET", "vendor:7:secret"};
+        char* admin_out = NULL;
+        char admin_err[256] = {0};
+        int arc = qihse_qkp_admin_exec("127.0.0.1", qihse_resp_server_port(server),
+                                       "pinned-admin", cli, server_pub,
+                                       2u, get_secret, &admin_out,
+                                       admin_err, sizeof(admin_err));
+        assert(arc == 0 && admin_out != NULL);
+        assert(strstr(admin_out, "protected-replica-payload") != NULL);
+        qihse_qkp_admin_free(admin_out);
+    }
     qihse_resp_server_stop(server); qihse_resp_server_destroy(server);
     qihse_machine_auth_reset();
     qihse_kv_store_destroy(store);

@@ -1830,13 +1830,14 @@ int main(int argc, char** argv) {
     }
 
     /* Replay the durable slot-ownership journal so a migration's ownership
-     * survives THIS node's restart (adopt-if-newer). The reclaim/GC pass is
-     * deliberately NOT invoked: qihse_kv_foreach_user reads every value, so a
-     * full-store scan blocks the store for minutes and is a net loss. The
-     * stale COPY left on the source is harmless (it routes the migrated slot
-     * away), so GC is deferred until a key-only iteration primitive exists. */
+     * survives THIS node's restart (adopt-if-newer). Reclaim/GC is not run
+     * before listener bind: stale source copies are reclaimed in bounded
+     * batches via the key-only iterator after the listener is serving (and on
+     * demand via CLUSTER RECLAIM), so startup never blocks on a store scan. */
+    int replayed_journal_entries = 0;
     if (data_dir && *data_dir) {
-        qihse_cluster_ownership_journal_replay(data_dir, ownership_journal_replay_cb, topology);
+        replayed_journal_entries = qihse_cluster_ownership_journal_replay(
+            data_dir, ownership_journal_replay_cb, topology);
     }
 
     /* R4c QKP1: resolve identity/trust from --pqc-* flags.
@@ -2270,9 +2271,29 @@ int main(int argc, char** argv) {
      * which otherwise makes systemd wait for SIGKILL at TimeoutStopSec. */
     bool ok = qihse_resp_server_start(server);
     if (ok) {
+        bool gc_pending = replayed_journal_entries > 0;
+        size_t gc_ticks = 0u;
         struct timespec wait = {0, 100000000L};
         while (!g_stop) {
             if (nanosleep(&wait, &wait) == 0) wait = (struct timespec){0, 100000000L};
+            if (gc_pending && !g_stop) {
+                gc_ticks++;
+                if (gc_ticks >= 50u) { /* 5 s settle after listener bind */
+                    qihse_user_t* op = qihse_auth_get_user(0u);
+                    bool has_more = false;
+                    if (op && qihse_cluster_topology_is_covered(topology)) {
+                        size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded(
+                            store, topology, indexes[self_index], op, 256u, &has_more);
+                        if (deleted > 0u) {
+                            fprintf(stderr, "qihse-cluster-daemon: reclaimed %zu stale foreign-slot key(s)\n", deleted);
+                        }
+                        gc_pending = has_more && deleted > 0u;
+                    } else {
+                        gc_pending = false;
+                    }
+                    gc_ticks = 40u; /* 1 s between bounded batches if more remain */
+                }
+            }
         }
     }
     __atomic_store_n(&ae_stop, 1, __ATOMIC_RELEASE);

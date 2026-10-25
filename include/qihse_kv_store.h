@@ -178,6 +178,7 @@ void qihse_kv_bulk_load_begin(qihse_kv_store_t* store);
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store);
 
 typedef bool (*qihse_kv_iter_cb)(const char* key, const char* value, void* user_data);
+typedef bool (*qihse_kv_key_iter_cb)(const char* key, void* user_data);
 
 /* Authorization-aware enumeration. Returns false on compaction/storage failure. */
 bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
@@ -189,6 +190,10 @@ bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
 bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   void* user_data);
+/* Authorization-aware key-only iteration. Does not read SSTable values. The
+ * callback runs under the store read lock and must not mutate this store. */
+bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
+                               qihse_kv_key_iter_cb cb, void* user_data);
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data);
 
 /* Metadata-carrying enumeration.  The classification and SCI are read from
