@@ -1831,12 +1831,14 @@ int main(int argc, char** argv) {
 
     /* Replay the durable slot-ownership journal so a migration's ownership
      * survives THIS node's restart (adopt-if-newer), then reclaim any local
-     * key whose slot has since moved to another node. Both ends of a
-     * migration persist the journal, so the reclaim is safe: a slot's only
-     * copy is never on a node that does not route it. */
+     * key whose slot has since moved to another node. The reclaim (a full
+     * store scan) runs only when the journal actually recorded a migration,
+     * so normal restarts pay no startup cost. */
     if (data_dir && *data_dir) {
-        qihse_cluster_ownership_journal_replay(data_dir, ownership_journal_replay_cb, topology);
-        if (indexes[self_index] != QIHSE_CLUSTER_NODE_NONE)
+        int replayed = qihse_cluster_ownership_journal_replay(data_dir,
+                                                              ownership_journal_replay_cb,
+                                                              topology);
+        if (replayed > 0 && indexes[self_index] != QIHSE_CLUSTER_NODE_NONE)
             qihse_cluster_reclaim_foreign_slots(store, topology, indexes[self_index],
                                                 qihse_auth_get_user(0u));
     }
