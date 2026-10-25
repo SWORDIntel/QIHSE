@@ -145,6 +145,11 @@ ca.keys("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "sabot/*")
 ca.hset("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "h", "f", "v")
 ca.lrange("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "l", 0, -1)
 ca.zadd("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "z", {"m": 1.0})
+ca.zrank("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "z", "m")
+ca.zpopmax("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "z")
+
+# The full sorted-set surface (ZRANK/ZREVRANK/ZPOPMAX/ZPOPMIN/ZCOUNT) is now
+# implemented server-side (`qihse_resp_engine.c`) — previously nil/empty stubs.
 
 ops = ClusterOps()              # wraps scripts/cluster_*.sh
 ops.watchdog()
