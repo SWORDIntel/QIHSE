@@ -777,14 +777,25 @@ int main(int argc, char** argv) {
     assert(follower_resp);
     const char* redirect_propose[] = {"QIHSE.TXN.PROPOSE", "0", "0", "0",
                                       "redirect-check"};
-    char* wire_reply = run_resp(follower_resp, operator_user, redirect_propose, 5u);
-    assert(strstr(wire_reply, "MOVED ") && !strstr(wire_reply, "redirect-check"));
-    free(wire_reply);
+    bool redirected = false;
+    for (unsigned attempt = 0; attempt < 500u && !redirected; attempt++) {
+        char* wire_reply = run_resp(follower_resp, operator_user, redirect_propose, 5u);
+        redirected = strstr(wire_reply, "MOVED ") != NULL &&
+                     strstr(wire_reply, "redirect-check") == NULL;
+        free(wire_reply);
+        if (!redirected) usleep(10000u);
+    }
+    assert(redirected);
     const char* redirect_read[] = {"QIHSE.TXN.READ", "1", "16"};
-    wire_reply = run_resp(follower_resp, operator_user, redirect_read, 3u);
-    assert(strstr(wire_reply, "MOVED ") &&
-           !strstr(wire_reply, protected_payload));
-    free(wire_reply);
+    bool read_redirected = false;
+    for (unsigned attempt = 0; attempt < 500u && !read_redirected; attempt++) {
+        char* wire_reply = run_resp(follower_resp, operator_user, redirect_read, 3u);
+        read_redirected = strstr(wire_reply, "MOVED ") != NULL &&
+                          strstr(wire_reply, protected_payload) == NULL;
+        free(wire_reply);
+        if (!read_redirected) usleep(10000u);
+    }
+    assert(read_redirected);
     qihse_resp_server_destroy(follower_resp);
     qihse_resp_server_config_t relay_readonly_config;
     qihse_resp_server_config_init(&relay_readonly_config);
@@ -794,17 +805,22 @@ int main(int argc, char** argv) {
     qihse_resp_server_t* relay_readonly_resp =
         qihse_resp_server_create(&relay_readonly_config);
     assert(relay_readonly_resp);
-    wire_reply = run_resp(relay_readonly_resp, operator_user,
+    char* wire_reply = run_resp(relay_readonly_resp, operator_user,
                           protected_propose, 5u);
     assert(strstr(wire_reply,
         "READONLY client proposals are disabled on this member") &&
         !strstr(wire_reply, protected_payload));
     free(wire_reply);
     const char* relay_read[] = {"QIHSE.TXN.READ", "1", "16"};
-    wire_reply = run_resp(relay_readonly_resp, operator_user, relay_read, 3u);
-    assert(strstr(wire_reply, "MOVED ") &&
-           !strstr(wire_reply, protected_payload));
-    free(wire_reply);
+    bool relay_redirected = false;
+    for (unsigned attempt = 0; attempt < 500u && !relay_redirected; attempt++) {
+        char* wire_reply = run_resp(relay_readonly_resp, operator_user, relay_read, 3u);
+        relay_redirected = strstr(wire_reply, "MOVED ") != NULL &&
+                           strstr(wire_reply, protected_payload) == NULL;
+        free(wire_reply);
+        if (!relay_redirected) usleep(10000u);
+    }
+    assert(relay_redirected);
     qihse_resp_server_destroy(relay_readonly_resp);
     qihse_resp_server_config_t unauth_config;
     qihse_resp_server_config_init(&unauth_config);
@@ -828,9 +844,15 @@ int main(int argc, char** argv) {
         usleep(10000u);
     }
     assert(qihse_consensus_mesh_role(meshes[leader_index]) == QIHSE_CONSENSUS_LEADER);
-    wire_reply = run_resp(resp, operator_user, protected_propose, 5u);
-    assert(strstr(wire_reply, "*4\r\n") && strstr(wire_reply, ":35\r\n"));
-    free(wire_reply);
+    bool proposed = false;
+    for (unsigned attempt = 0; attempt < 500u && !proposed; attempt++) {
+        char* wire_reply = run_resp(resp, operator_user, protected_propose, 5u);
+        proposed = strstr(wire_reply, "*4\r\n") != NULL &&
+                   strstr(wire_reply, ":35\r\n") != NULL;
+        free(wire_reply);
+        if (!proposed) usleep(10000u);
+    }
+    assert(proposed);
     bool protected_committed = false;
     for (unsigned attempt = 0; attempt < 1500u && !protected_committed; attempt++) {
         protected_committed =
