@@ -64,7 +64,7 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 
 | # | Item | Notes |
 |---|---|---|
-| 4.1 | Slot migration / `--brain-act` | ⚠️ NOT an ungate; ~90% of the brain/handoff machinery exists. Done: target-side migration pin (`dd38f2c`), source-side QKP handoff replacing legacy AUTH (`309fab8`), durable-transfer-before-ownership reorder (`df68b36`). Remaining: migration topology wiring (single-pin direction), negative/partial-transfer tests, then lift the gate |
+| 4.1 | Slot migration / `--brain-act` | ✅ complete + live-verified. Full-mesh `--migration-peer` pins, QKP handoff (retired AUTH GODMODE_OP), durable-transfer-before-ownership, per-owner config-epoch fix (the epoch-drift bug found live: `1eb9e4d`), negative auth test, `--brain-act` gate lifted. Live MOVESLOTS moved 7 keys node5→node0 with ownership converging on both. Caveat: slot map is not persisted — migrations reset to the static `--slot-range` config on restart |
 | 4.2 | Failover & quorum drills | ✅ drilled: stopped node5 → `master,fail`, node0+node1 kept serving → rejoined 3/3 |
 | 4.3 | Backup/restore strategy | ✅ `qihse-backup restore` implemented + verified round-trip (backup → restore → verify valid); runbook in `docs/plans/backup_restore_runbook.md` |
 | 4.4 | Watchdog & alerting | ✅ `scripts/cluster_watchdog.sh` (master PING + replica pull check) |
