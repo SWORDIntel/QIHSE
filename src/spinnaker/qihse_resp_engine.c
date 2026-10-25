@@ -11301,18 +11301,10 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         return -1;
     }
 
-    /* Flip ownership FIRST (locally + bus broadcast): the target must accept
-     * SETs for the range during the transfer, and its clients route there.
-     * The source keeps reading its store directly (no routing), so in-flight
-     * keys stream over after the flip. Redis-style ASK-state windows are
-     * future work; a brief not-found window exists for not-yet-moved keys. */
-    if (!qihse_cluster_set_range_owner(server, first, last, target_index)) {
-        close_socket(target_fd);
-        free(collector.keys);
-        if (err && err_cap) snprintf(err, err_cap, "ownership flip failed");
-        return -1;
-    }
-
+    /* Transfer every key to the target FIRST, holding the write lock the
+     * whole time so no concurrent write can interleave. Ownership is
+     * published only after the target ACKs every key, so there is no window
+     * where a client routes to the target and finds a not-yet-moved key. */
     static const uint8_t asking_cmd[] = "ASKING";
     static const uint8_t set_cmd[] = "SET";
     static const uint8_t px_opt[] = "PX";
@@ -11321,7 +11313,7 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
     for (size_t i = 0; i < collector.count; i++) {
         char* key = collector.keys[i];
         char* value = qihse_kv_get_user(server->store, key, user);
-        if (!value) continue; /* vanished mid-migration */
+        if (!value) continue; /* cannot vanish under the write lock; defensive */
         int64_t ttl = qihse_kv_ttl_ms_user(server->store, key, user);
         qihse_resp_arg_t asking = { asking_cmd, sizeof(asking_cmd) - 1u };
         bool sent = qihse_resp_qkp_command(qkp, target_fd, 1u, &asking, remote_error, sizeof(remote_error));
@@ -11337,28 +11329,43 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
             set_args[set_argc++] = (qihse_resp_arg_t){ (const uint8_t*)ttl_buf, (size_t)n };
         }
         if (sent) sent = qihse_resp_qkp_command(qkp, target_fd, set_argc, set_args, remote_error, sizeof(remote_error));
-        if (sent) {
-            /* Transferred: drop the local copy (MIGRATE semantics, no COPY). */
-            qihse_kv_del_user(server->store, key, user);
-            moved++;
-        } else {
-            fprintf(stderr, "qihse-cluster: slot handoff key transfer failed: %s\n", remote_error);
-        }
         free(value);
-        if (!sent) break;
+        if (!sent) {
+            fprintf(stderr, "qihse-cluster: slot handoff key transfer failed: %s\n", remote_error);
+            break;
+        }
+        moved++;
+    }
+
+    /* All keys are durable on the target. Publish the new owner, then drop
+     * the stale local copies (no read can reach them once ownership moved). */
+    size_t collected = collector.count;
+    if (moved < collected ||
+        !qihse_cluster_set_range_owner(server, first, last, target_index)) {
+        /* Incomplete or flip failed: the source still owns the range; the
+         * target's transferred copies are unreachable and harmless. */
+        pthread_rwlock_unlock(&server->kv_lock);
+        qihse_qkp_session_free(qkp);
+        close_socket(target_fd);
+        free(collector.keys);
+        if (err && err_cap) {
+            if (moved < collected)
+                snprintf(err, err_cap, "transfer incomplete (%llu of %zu keys)",
+                         (unsigned long long)moved, collected);
+            else
+                snprintf(err, err_cap, "ownership flip failed");
+        }
+        return -1;
+    }
+    for (size_t i = 0; i < collector.count; i++) {
+        qihse_kv_del_user(server->store, collector.keys[i], user);
     }
     pthread_rwlock_unlock(&server->kv_lock);
+
     qihse_qkp_session_free(qkp);
     close_socket(target_fd);
     if (out_moved) *out_moved = moved;
-    size_t collected = collector.count;
     free(collector.keys);
-    if (moved < collected) {
-        if (err && err_cap)
-            snprintf(err, err_cap, "transfer incomplete (%llu of %zu keys)",
-                     (unsigned long long)moved, collected);
-        return -1;
-    }
     return 0;
 }
 
