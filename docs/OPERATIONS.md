@@ -473,6 +473,27 @@ full command scope). Health probes in `cluster_rolling_restart.sh` and
 `install_qihse.sh` use this path, falling back to redis-cli password AUTH
 only for non-hardened deployments.
 
+#### Slot Migration Durability (COPY → PERSIST → SWITCH → GC)
+
+`CLUSTER MOVESLOTS` (and the brain's `--brain-act` re-home) moves a
+data-bearing slot range between masters over the pinned-QKP transport
+(`--migration-peer <node-id> <dsa-pub>`, repeatable for full-mesh migration).
+The transfer is data-safe by construction:
+
+1. **COPY** — keys stream to the target; the source keeps its copy.
+2. **SWITCH** — ownership flips only after every key is ACKed by the target.
+3. **PERSIST** — the ownership delta is appended to a durable journal
+   (`<data-dir>/slot-ownership.journal`) on *both* ends, so a restart replays
+   it (adopt-if-newer by per-owner config epoch) instead of reverting to the
+   static `--slot-range` map.
+4. **GC** — on the next startup the source reclaims keys whose slot has moved
+   away, but only when the journal recorded a migration, so normal restarts
+   pay no scan cost.
+
+The invariant: **a key is never present in zero places.** COPY guarantees
+reachability across any restart, and the journal makes the ownership (and the
+subsequent GC) correct rather than merely safe.
+
 #### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
 
 To simplify secure certificate generation and daemon configuration, use
@@ -689,8 +710,9 @@ replication to a promotable successor remains open. Environment knobs (all optio
 elsewhere):** `tests/cluster_smoke.py` (two-node routing + MOVED redirects),
 `tests/cluster_discover_smoke.py` (--join membership discovery; run after
 bringing up a seed node), `tests/cluster_loadshift_smoke.py`
-(`CLUSTER MOVESLOTS` guard: data-bearing moves refuse before ownership changes
-until pinned QKP slot transfer is available). All honor `QIHSE_NODE0_HOST` /
+(`CLUSTER MOVESLOTS` moves a data-bearing range over pinned QKP — the legacy
+cleartext AUTH transfer was retired; see "Slot migration durability" below).
+All honor `QIHSE_NODE0_HOST` /
 `QIHSE_NODE0_PORT` / `QIHSE_NODE1_HOST` / `QIHSE_NODE1_PORT` /
 `QIHSE_CLUSTER_PASSWORD`. *Not verified in this pass* (they require a running
 two-node cluster; only the failover drill is self-starting).
