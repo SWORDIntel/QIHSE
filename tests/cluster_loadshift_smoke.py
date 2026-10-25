@@ -5,9 +5,9 @@ CLUSTER MOVESLOTS 8192-16383 -> node 1.
 Two modes:
   default      Legacy transfer drill against an explicitly configured lab
                cluster (see tests/cluster_discover_smoke.py).
-  --self-spawn Hermetic gold/CI guard: the daemon has no secure slot-transfer
-               transport yet, so verify MOVESLOTS refuses before changing
-               ownership or losing source data.
+  --self-spawn Hermetic gold/CI guard: the self-spawned daemons carry no
+               QKP slot-transfer identity, so verify MOVESLOTS refuses before
+               changing ownership or losing source data.
 Run twice-safe: previous leftovers are re-collected by the next MOVESLOTS.
 """
 import os, socket, subprocess, sys, time
@@ -187,7 +187,7 @@ def main():
     if _SELF_SPAWN:
         t, r = n0.cmd("CLUSTER", "MOVESLOTS", "8192-16383", N1_EP)
         check("unavailable migration refused before ownership flip",
-              t == "-" and "target authentication unavailable" in r, r)
+              t == "-" and "target QKP handshake failed" in r, r)
         n0.fresh(); n0.cmd("AUTH", "GODMODE_OP", PW)
         n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
         check("seed retains every high key",
