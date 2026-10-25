@@ -64,7 +64,7 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 
 | # | Item | Notes |
 |---|---|---|
-| 4.1 | Slot migration / `--brain-act` | ⚠️ NOT an ungate — the read-only replica pull is a different path than the data-bearing slot PUSH the gate names; ~90% of the brain/handoff machinery exists but the QKP transport swap + authenticated enumeration + strand-free recovery must be written. Full plan: `docs/plans/slot_migration_qkp_plan.md` |
+| 4.1 | Slot migration / `--brain-act` | ⚠️ NOT an ungate; ~90% of the brain/handoff machinery exists. Done: target-side migration pin (`dd38f2c`), source-side QKP handoff replacing legacy AUTH (`309fab8`), durable-transfer-before-ownership reorder (`df68b36`). Remaining: migration topology wiring (single-pin direction), negative/partial-transfer tests, then lift the gate |
 | 4.2 | Failover & quorum drills | ✅ drilled: stopped node5 → `master,fail`, node0+node1 kept serving → rejoined 3/3 |
 | 4.3 | Backup/restore strategy | ✅ `qihse-backup restore` implemented + verified round-trip (backup → restore → verify valid); runbook in `docs/plans/backup_restore_runbook.md` |
 | 4.4 | Watchdog & alerting | ✅ `scripts/cluster_watchdog.sh` (master PING + replica pull check) |
