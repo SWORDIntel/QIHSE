@@ -410,13 +410,15 @@ static void test_negative_authorization(void) {
                                      NULL) == QIHSE_CA_VERIFY_ERR_NOT_YET_VALID);
 
     /* Out-of-scope: a read-scoped certificate is not node-enroll authority,
-     * and a scopeless certificate is no authority at all. */
-    issue_test_cert(&ca, key, &node, 0, QIHSE_CA_PROVISION_DEFAULT_VALIDITY_S,
+     * and a scopeless certificate is no authority at all. Issue them with a
+     * negative offset so they are robustly already-valid at `now` even if a
+     * whole-second boundary was crossed since `now` was captured. */
+    issue_test_cert(&ca, key, &node, -120, QIHSE_CA_PROVISION_DEFAULT_VALIDITY_S,
                     QIHSE_SCOPE_FEDERATION_READ, pem, sizeof(pem));
     assert(qihse_ca_provision_verify(&ca, NULL, pem, now,
                                      QIHSE_SCOPE_NODE_ENROLL,
                                      NULL) == QIHSE_CA_VERIFY_ERR_SCOPE);
-    issue_test_cert(&ca, key, &node, 0, QIHSE_CA_PROVISION_DEFAULT_VALIDITY_S,
+    issue_test_cert(&ca, key, &node, -120, QIHSE_CA_PROVISION_DEFAULT_VALIDITY_S,
                     QIHSE_SCOPE_NONE, pem, sizeof(pem));
     assert(qihse_ca_provision_verify(&ca, NULL, pem, now,
                                      QIHSE_SCOPE_NODE_ENROLL,
