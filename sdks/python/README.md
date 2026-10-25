@@ -137,6 +137,15 @@ ca.moveslots("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem",
              4916, 4916, "192.168.1.91:7100")
 ca.reclaim("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem")
 
+# Key management — strings, generic keys, hashes, lists, sets, sorted sets,
+# bitmaps and HyperLogLog, all over the same pinned-QKP admin identity.
+ca.incr("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "counter")
+ca.expire("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "counter", 600)
+ca.keys("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "sabot/*")
+ca.hset("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "h", "f", "v")
+ca.lrange("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "l", 0, -1)
+ca.zadd("192.168.1.90", 7115, "qihse_dsa_pub_730xd.pem", "z", {"m": 1.0})
+
 ops = ClusterOps()              # wraps scripts/cluster_*.sh
 ops.watchdog()
 ops.rolling_restart(verify_only=True)

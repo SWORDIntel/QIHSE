@@ -883,48 +883,49 @@ static char* qkp_admin_encode_resp(size_t argc, const char* const* argv,
     return buf;
 }
 
-static bool qkp_admin_resp_complete(const char* p, size_t len, int depth) {
-    if (depth > 8 || len == 0u) return false;
+/* Recursively measure one complete RESP value at p[0..len). Returns the
+ * number of bytes consumed, or 0 if the buffer does not yet hold a complete
+ * value (or the value is malformed / nested too deeply). Handles simple,
+ * error, integer, bulk and nested-array replies, which is what SCAN/HGETALL
+ * and friends return. */
+static ssize_t qkp_admin_resp_measure(const char* p, size_t len, int depth) {
+    if (depth > 8 || len == 0u) return 0;
     char kind = p[0];
     if (kind == '+' || kind == '-' || kind == ':') {
         const char* eol = (const char*)memchr(p, '\r', len);
-        return eol && eol + 1u < p + len && eol[1] == '\n';
+        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
+        return (ssize_t)(eol + 2u - p);
     }
     if (kind == '$') {
         const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return false;
+        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
         long long blen = strtoll(p + 1, NULL, 10);
-        if (blen < 0) return true;
-        size_t body_start = (size_t)(eol + 2u - p);
-        return body_start + (size_t)blen + 2u <= len;
+        if (blen < 0) return (ssize_t)(eol + 2u - p); /* null bulk */
+        size_t body = (size_t)(eol + 2u - p);
+        size_t total = body + (size_t)blen + 2u;
+        if (total > len) return 0;
+        return (ssize_t)total;
     }
     if (kind == '*') {
         const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return false;
+        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
         long long count = strtoll(p + 1, NULL, 10);
-        if (count < 0) return true;
+        if (count < 0) return (ssize_t)(eol + 2u - p); /* null array */
         size_t off = (size_t)(eol + 2u - p);
         for (long long k = 0; k < count; k++) {
-            if (off >= len) return false;
-            const char* sub = p + off;
-            if (sub[0] == '$') {
-                const char* e2 = (const char*)memchr(sub, '\r', len - off);
-                if (!e2) return false;
-                long long blen2 = strtoll(sub + 1, NULL, 10);
-                off = (size_t)(e2 + 2u - p);
-                if (blen2 >= 0) off += (size_t)blen2 + 2u;
-                if (off > len) return false;
-            } else if (sub[0] == ':') {
-                const char* e2 = (const char*)memchr(sub, '\r', len - off);
-                if (!e2) return false;
-                off = (size_t)(e2 + 2u - p);
-            } else {
-                return false;
-            }
+            if (off >= len) return 0;
+            ssize_t sub = qkp_admin_resp_measure(p + off, len - off, depth + 1);
+            if (sub <= 0) return 0;
+            off += (size_t)sub;
         }
-        return true;
+        return (ssize_t)off;
     }
-    return false;
+    return 0;
+}
+
+static bool qkp_admin_resp_complete(const char* p, size_t len, int depth) {
+    ssize_t consumed = qkp_admin_resp_measure(p, len, depth);
+    return consumed > 0 && (size_t)consumed == len;
 }
 
 static ssize_t qkp_admin_recv_reply(qihse_qkp_session_t* s, int fd, char** out) {
@@ -981,19 +982,19 @@ static void qkp_format_resp(qkp_strbuf_t* sb, const char* p, size_t len, int dep
     }
     size_t i = 0u;
     while (i < len) {
-        char kind = p[i++];
+        char kind = p[i];
         if (kind == '+' || kind == '-' || kind == ':') {
-            size_t start = i;
-            while (i < len && p[i] != '\r') i++;
-            qkp_sb_append(sb, p + start, i - start);
+            size_t start = i + 1u;
+            size_t j = start;
+            while (j < len && p[j] != '\r') j++;
+            qkp_sb_append(sb, p + start, j - start);
             qkp_sb_append(sb, "\n", 1u);
-            if (i + 1u < len) i += 2u;
-            break;
+            i = (j + 2u <= len) ? j + 2u : len;
         } else if (kind == '$') {
-            size_t start = i;
-            while (i < len && p[i] != '\r') i++;
-            long long blen = strtoll(p + start, NULL, 10);
-            if (i + 1u < len) i += 2u;
+            size_t j = i + 1u;
+            while (j < len && p[j] != '\r') j++;
+            long long blen = strtoll(p + i + 1u, NULL, 10);
+            i = (j + 2u <= len) ? j + 2u : len;
             if (blen < 0) { qkp_sb_append(sb, "(nil)\n", 6u); continue; }
             if (i + (size_t)blen + 2u > len) {
                 qkp_sb_append(sb, "(truncated)\n", 12u);
@@ -1003,47 +1004,42 @@ static void qkp_format_resp(qkp_strbuf_t* sb, const char* p, size_t len, int dep
             qkp_sb_append(sb, "\n", 1u);
             i += (size_t)blen + 2u;
         } else if (kind == '*') {
-            size_t start = i;
-            while (i < len && p[i] != '\r') i++;
-            long long count = strtoll(p + start, NULL, 10);
-            if (i + 1u < len) i += 2u;
+            size_t j = i + 1u;
+            while (j < len && p[j] != '\r') j++;
+            long long count = strtoll(p + i + 1u, NULL, 10);
+            i = (j + 2u <= len) ? j + 2u : len;
             if (count < 0) { qkp_sb_append(sb, "(nil array)\n", 12u); continue; }
             for (long long k = 0; k < count; k++) {
                 if (i >= len) return;
-                char c = p[i++];
-                if (c == '$') {
-                    size_t s2 = i;
-                    while (i < len && p[i] != '\r') i++;
-                    long long blen2 = strtoll(p + s2, NULL, 10);
-                    if (i + 1u < len) i += 2u;
-                    if (blen2 < 0) { qkp_sb_append(sb, "(nil)", 5u); continue; }
-                    if (i + (size_t)blen2 + 2u > len) return;
-                    qkp_sb_append(sb, p + i, (size_t)blen2);
-                    i += (size_t)blen2 + 2u;
-                } else if (c == ':') {
-                    size_t s2 = i;
-                    while (i < len && p[i] != '\r') i++;
-                    qkp_sb_append(sb, p + s2, i - s2);
-                    if (i + 1u < len) i += 2u;
-                } else {
-                    i--;
-                    size_t sub = i;
-                    while (i < len) {
-                        if (p[i] == '\r' && i + 1u < len && p[i + 1u] == '\n') {
-                            i += 2u;
-                            break;
-                        }
-                        i++;
+                ssize_t sub = qkp_admin_resp_measure(p + i, len - i, depth + 1);
+                if (sub <= 0) { qkp_sb_append(sb, "(truncated)\n", 12u); return; }
+                char kind2 = p[i];
+                if (kind2 == '$') {
+                    size_t jj = i + 1u;
+                    while (jj < len && p[jj] != '\r') jj++;
+                    long long blen2 = strtoll(p + i + 1u, NULL, 10);
+                    size_t body = (jj + 2u <= len) ? jj + 2u : len;
+                    if (blen2 < 0) { qkp_sb_append(sb, "(nil)\n", 6u); }
+                    else {
+                        qkp_sb_append(sb, p + body, (size_t)blen2);
+                        qkp_sb_append(sb, "\n", 1u);
                     }
-                    qkp_format_resp(sb, p + sub, i - sub, depth + 1);
+                } else if (kind2 == ':' || kind2 == '+') {
+                    size_t jj = i + 1u;
+                    while (jj < len && p[jj] != '\r') jj++;
+                    qkp_sb_append(sb, p + i + 1u, jj - i - 1u);
+                    qkp_sb_append(sb, "\n", 1u);
+                } else {
+                    /* nested array: format it inline, one element per line */
+                    qkp_format_resp(sb, p + i, (size_t)sub, depth + 1);
                 }
+                i += (size_t)sub;
             }
-            break;
         } else {
             char unk[32];
             int n = snprintf(unk, sizeof(unk), "(unknown reply kind %c)\n", kind);
             if (n > 0) qkp_sb_append(sb, unk, (size_t)n);
-            break;
+            return;
         }
     }
 }
