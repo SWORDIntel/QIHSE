@@ -783,15 +783,15 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
         __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
         return;
     }
-    /* Per-owner epoch: accept only if not stale for that owner (defeats
-     * replays without dropping a legitimate migration whose source epoch
-     * lags the receiver's drifted global epoch). */
+    /* Per-owner epoch bookkeeping: the epoch is only used to decide whether
+     * a received change is genuinely new (for journaling), never to reject an
+     * update. config_epoch is derived from each node's LOCAL next_epoch()
+     * counter, so it is NOT comparable across nodes; rejecting on
+     * "upd.config_epoch < owner.config_epoch" silently dropped legitimate
+     * ownership and let followers diverge. Always adopt; the durable journal
+     * replay (adopt-if-newer) still orders ownership across restarts. */
     qihse_cluster_node_t owner;
     bool owner_known = qihse_cluster_topology_get_node(bus->topology, local_owner, &owner);
-    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
-        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
-        return; /* stale */
-    }
     bool changed = !owner_known || upd.config_epoch > owner.config_epoch;
     qihse_cluster_topology_adopt_range(bus->topology, upd.start, upd.end,
                                        local_owner, upd.config_epoch);
