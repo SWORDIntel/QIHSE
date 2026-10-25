@@ -110,6 +110,7 @@ node_probe_ping() {
     local ip="$1" port="$2" pub="$3" pw="$4" out
     if [ -x "$ADMIN_CLI" ] && [ -f "/etc/qihse/keys/$pub" ]; then
         out="$(sudo "$ADMIN_CLI" --host "$ip" --port "$port" --node-id "$ADMIN_NODE_ID" \
+            --identity-dir /etc/qihse/keys \
             --trusted-pub "/etc/qihse/keys/$pub" --ping 2>/dev/null || true)"
         [ "$out" = "PONG" ] && { printf 'PONG\n'; return; }
     fi
@@ -124,6 +125,7 @@ node_probe_cluster() {
     local ip="$1" port="$2" pub="$3" pw="$4" out
     if [ -x "$ADMIN_CLI" ] && [ -f "/etc/qihse/keys/$pub" ]; then
         out="$(sudo "$ADMIN_CLI" --host "$ip" --port "$port" --node-id "$ADMIN_NODE_ID" \
+            --identity-dir /etc/qihse/keys \
             --trusted-pub "/etc/qihse/keys/$pub" --cluster-nodes 2>/dev/null || true)"
         [ -n "$out" ] && { printf '%s\n' "$out"; return; }
     fi

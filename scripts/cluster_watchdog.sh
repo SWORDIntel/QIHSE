@@ -27,6 +27,7 @@ probe_ping() {
     local ip="$1" port="$2" pub="$3"
     [ -x "$ADMIN_CLI" ] || { echo "watchdog: $ADMIN_CLI not found" >&2; return 1; }
     sudo "$ADMIN_CLI" --host "$ip" --port "$port" --node-id "$ADMIN_NODE_ID" \
+        --identity-dir /etc/qihse/keys \
         --trusted-pub "/etc/qihse/keys/$pub" --ping 2>/dev/null
 }
 

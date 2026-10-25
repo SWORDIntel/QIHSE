@@ -1065,7 +1065,13 @@ int qihse_qkp_admin_exec(const char* host, uint16_t port,
     const char* id_dir = identity_dir;
     if (!id_dir || !*id_dir) {
         const char* env_dir = getenv("QIHSE_IDENTITY_DIR");
-        id_dir = (env_dir && *env_dir) ? env_dir : "keys";
+        if (env_dir && *env_dir) {
+            id_dir = env_dir;
+        } else if (access("keys/qihse_dsa_key.pem", R_OK) == 0) {
+            id_dir = "keys";
+        } else {
+            id_dir = "/etc/qihse/keys";
+        }
     }
     char dsa_key[512], kem_key[512], kem_pub[512];
     snprintf(dsa_key, sizeof(dsa_key), "%s/qihse_dsa_key.pem", id_dir);

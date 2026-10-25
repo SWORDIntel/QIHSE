@@ -91,7 +91,9 @@ class ClusterAdmin:
         self.admin_cli = admin_cli
         self.node_id = node_id
         self.identity_dir = identity_dir or os.environ.get(
-            "QIHSE_IDENTITY_DIR", "keys")
+            "QIHSE_IDENTITY_DIR",
+            "keys" if os.path.exists("keys/qihse_dsa_key.pem") else "/etc/qihse/keys"
+        )
         self.sudo = sudo
         self.prefer_native = prefer_native
         self._lib = _load_native_qkp_lib(lib_path) if prefer_native else None
