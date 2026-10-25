@@ -1155,8 +1155,9 @@ int main(int argc, char** argv) {
     uint32_t machine_principal_tenant = 0u;
     const char* admin_peer_node_id = NULL;
     const char* admin_peer_dsa_pub = NULL;
-    const char* migration_peer_node_id = NULL;
-    const char* migration_peer_dsa_pub = NULL;
+    const char* migration_peer_node_ids[16];
+    const char* migration_peer_dsa_pub_paths[16];
+    size_t migration_peer_count = 0u;
     const char* data_dir = NULL;
     bool enable_scatter = false;
     size_t max_clients = 4096u;
@@ -1336,13 +1337,15 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--admin-peer-dsa-pub") == 0 && i + 1 < argc) {
             admin_peer_dsa_pub = argv[++i];
             if (!*admin_peer_dsa_pub) return usage(argv[0]), 2;
-        } else if (strcmp(a, "--migration-peer-node-id") == 0 && i + 1 < argc) {
-            migration_peer_node_id = argv[++i];
-            if (!*migration_peer_node_id || strlen(migration_peer_node_id) > QIHSE_QKP_NODE_ID_LEN)
+        } else if (strcmp(a, "--migration-peer") == 0 && i + 2 < argc) {
+            if (migration_peer_count >= 16u) return usage(argv[0]), 2;
+            const char* nid = argv[++i];
+            const char* pub = argv[++i];
+            if (!*nid || strlen(nid) > QIHSE_QKP_NODE_ID_LEN || !*pub)
                 return usage(argv[0]), 2;
-        } else if (strcmp(a, "--migration-peer-dsa-pub") == 0 && i + 1 < argc) {
-            migration_peer_dsa_pub = argv[++i];
-            if (!*migration_peer_dsa_pub) return usage(argv[0]), 2;
+            migration_peer_node_ids[migration_peer_count] = nid;
+            migration_peer_dsa_pub_paths[migration_peer_count] = pub;
+            migration_peer_count++;
         } else if (strcmp(a, "--replication-transport") == 0 && i + 1 < argc) {
             replication_transport = argv[++i];
             if (strcmp(replication_transport, "i2p") != 0 &&
@@ -1517,8 +1520,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: --redundancy-peer is unavailable until duplicate writes use pinned QKP replication\n");
         return 2;
     }
-    if (brain_act) {
-        fprintf(stderr, "qihse-cluster-daemon: --brain-act is unavailable until slot migration uses pinned QKP replication\n");
+    if (brain_act && !pqc_identity_dir && access("/etc/qihse/keys/qihse_dsa_key.pem", R_OK) != 0) {
+        fprintf(stderr, "qihse-cluster-daemon: --brain-act needs a QKP identity (--pqc-identity-dir) for the pinned slot-migration handoff\n");
         return 2;
     }
 
@@ -1532,10 +1535,6 @@ int main(int argc, char** argv) {
     }
     if (admin_peer_dsa_pub != NULL && admin_peer_node_id == NULL) {
         fprintf(stderr, "qihse-cluster-daemon: --admin-peer-dsa-pub requires --admin-peer-node-id\n");
-        return 2;
-    }
-    if ((migration_peer_node_id == NULL) != (migration_peer_dsa_pub == NULL)) {
-        fprintf(stderr, "qihse-cluster-daemon: --migration-peer-node-id and --migration-peer-dsa-pub must be set together\n");
         return 2;
     }
     if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
@@ -1668,7 +1667,7 @@ int main(int argc, char** argv) {
     }
     if (replication_configured) pqc_require = true;
     if (admin_peer_configured) pqc_require = true;
-    if (migration_peer_node_id) pqc_require = true;
+    if (migration_peer_count > 0u) pqc_require = true;
     if (consensus_configured) {
         const char* consensus_error = consensus_options_error(
             &consensus_options, data_dir, pqc_node_id, pqc_require,
@@ -1832,8 +1831,9 @@ int main(int argc, char** argv) {
     pqc.replication_peer_dsa_pub_path = replication_peer_dsa_pub;
     pqc.admin_peer_node_id = admin_peer_node_id;
     pqc.admin_peer_dsa_pub_path = admin_peer_dsa_pub;
-    pqc.migration_peer_node_id = migration_peer_node_id;
-    pqc.migration_peer_dsa_pub_path = migration_peer_dsa_pub;
+    pqc.migration_peer_node_ids = migration_peer_node_ids;
+    pqc.migration_peer_dsa_pub_paths = migration_peer_dsa_pub_paths;
+    pqc.migration_peer_count = migration_peer_count;
     static char pqc_dsa_key[512], pqc_kem_key[512], pqc_kem_pub[512];
     const char* pqc_dir = pqc_identity_dir ? pqc_identity_dir : "/etc/qihse/keys";
     snprintf(pqc_dsa_key, sizeof(pqc_dsa_key), "%s/qihse_dsa_key.pem", pqc_dir);

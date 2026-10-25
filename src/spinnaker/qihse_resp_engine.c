@@ -911,6 +911,27 @@ static bool qihse_resp_command_is(const qihse_resp_request_t* request, const cha
     return request->argc > 0 && qihse_resp_arg_equal(&request->argv[0], command);
 }
 
+/* Testable migration allowlist: true iff `cmd` (cmd_len bytes, case-insensitive)
+ * is one of the data-movement commands a pinned slot-migration peer may run
+ * (ASKING/SET/GET/DEL). Everything else — including operator commands — is
+ * denied for the QIHSE_RESP_AUTH_QKP_MIGRATION session scope. */
+bool qihse_resp_migration_command_allowed(const char* cmd, size_t cmd_len) {
+    static const char* const cmds[] = { "ASKING", "SET", "GET", "DEL" };
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        size_t len = strlen(cmds[i]);
+        if (cmd_len != len) continue;
+        bool eq = true;
+        for (size_t k = 0; k < len; k++) {
+            if (toupper((unsigned char)cmd[k]) != toupper((unsigned char)cmds[i][k])) {
+                eq = false;
+                break;
+            }
+        }
+        if (eq) return true;
+    }
+    return false;
+}
+
 /* W2.5: KEYSTONE.FEED.<sub> — one command family, matched by prefix so the
  * dispatch allowlist for the index identity can be expressed in one place. */
 static bool qihse_resp_command_is_keystone_feed(const qihse_resp_request_t* request) {
@@ -14940,10 +14961,10 @@ static bool qihse_resp_session_command_allowed(
             return true;
         case QIHSE_RESP_AUTH_QKP_MIGRATION:
             /* pinned slot-migration identity — data-movement commands only */
-            return qihse_resp_command_is(request, "ASKING") ||
-                   qihse_resp_command_is(request, "SET") ||
-                   qihse_resp_command_is(request, "GET") ||
-                   qihse_resp_command_is(request, "DEL");
+            return request->argc > 0 &&
+                   qihse_resp_migration_command_allowed(
+                       (const char*)request->argv[0].data,
+                       request->argv[0].len);
         default:
             return true;
     }
@@ -15433,23 +15454,26 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
                 session.auth_kind = QIHSE_RESP_AUTH_QKP_ADMIN;
             }
         }
-        /* Pinned slot-migration identity: a trusted QKP peer configured with
-         * --migration-peer-node-id/--migration-peer-dsa-pub that may push
-         * data-bearing CLUSTER MOVESLOTS transfers. Maps to the operator but
-         * with the data-movement-only allowlist (QIHSE_RESP_AUTH_QKP_MIGRATION). */
-        if (!session.user && server->pqc.migration_peer_node_id &&
-            server->pqc.migration_peer_dsa_pub_path &&
-            qihse_qkp_session_is_replication_peer(
-                qkp, server->pqc.migration_peer_node_id,
-                server->pqc.migration_peer_dsa_pub_path)) {
-            qihse_user_t* op = qihse_auth_get_user(0u);
-            bool op_active = false;
-            uint32_t op_tenant = QIHSE_TENANT_INVALID;
-            if (op) qihse_auth_user_active_and_tenant(op, &op_active, &op_tenant);
-            if (op_active && op_tenant == QIHSE_TENANT_SYSTEM) {
-                session.user = op;
-                session.user_id = 0u;
-                session.auth_kind = QIHSE_RESP_AUTH_QKP_MIGRATION;
+        /* Pinned slot-migration identities: trusted QKP peers configured with
+         * --migration-peer that may push data-bearing CLUSTER MOVESLOTS
+         * transfers. Map a matching peer to the operator with the
+         * data-movement-only allowlist (QIHSE_RESP_AUTH_QKP_MIGRATION). */
+        if (!session.user && server->pqc.migration_peer_count > 0u) {
+            for (size_t mi = 0u; mi < server->pqc.migration_peer_count; mi++) {
+                if (qihse_qkp_session_is_replication_peer(
+                        qkp, server->pqc.migration_peer_node_ids[mi],
+                        server->pqc.migration_peer_dsa_pub_paths[mi])) {
+                    qihse_user_t* op = qihse_auth_get_user(0u);
+                    bool op_active = false;
+                    uint32_t op_tenant = QIHSE_TENANT_INVALID;
+                    if (op) qihse_auth_user_active_and_tenant(op, &op_active, &op_tenant);
+                    if (op_active && op_tenant == QIHSE_TENANT_SYSTEM) {
+                        session.user = op;
+                        session.user_id = 0u;
+                        session.auth_kind = QIHSE_RESP_AUTH_QKP_MIGRATION;
+                    }
+                    break;
+                }
             }
         }
     }

@@ -15,6 +15,10 @@ typedef struct {
     size_t len;
 } qihse_resp_arg_t;
 
+/* Data-movement allowlist for the pinned slot-migration session scope.
+ * True iff cmd (case-insensitive) is ASKING/SET/GET/DEL. */
+bool qihse_resp_migration_command_allowed(const char* cmd, size_t cmd_len);
+
 typedef bool (*qihse_resp_output_fn)(void* context, const void* data, size_t len);
 
 typedef struct {

@@ -418,6 +418,10 @@ test-qkp-access-negative: lib
 	$(CC) $(CFLAGS) -o tests/test_qkp_access_negative tests/test_qkp_access_negative.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_qkp_access_negative
 
+test-slot-migration-auth: lib
+	$(CC) $(CFLAGS) -o tests/test_slot_migration_auth tests/test_slot_migration_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_slot_migration_auth
+
 test-audit-rotation: lib
 	$(CC) $(CFLAGS) -o tests/test_audit_rotation tests/test_audit_rotation.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_audit_rotation
@@ -1658,7 +1662,7 @@ clean:
 	    tests/test_column_tsdb_anchor tests/test_object_acl \
 	    tests/test_auth_privilege_boundary tests/test_aggregate_hardened \
 	    tests/test_auth_verifier_cache tests/test_auth_volume_limit \
-	    tests/test_machine_auth tests/test_qkp_access_negative tests/test_audit_rotation \
+	    tests/test_machine_auth tests/test_qkp_access_negative tests/test_slot_migration_auth tests/test_audit_rotation \
 	    tests/test_uwp_regression tests/fuzz_uwp
 	@echo "Clean completed"
 
