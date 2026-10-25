@@ -3333,6 +3333,63 @@ static bool qihse_resp_fd_command(int fd, size_t argc, const qihse_resp_arg_t* a
     return false;
 }
 
+/* Sealed QKP variant of qihse_resp_fd_command: encodes the RESP request,
+ * sends it as a sealed frame, and reassembles the (possibly multi-frame)
+ * simple reply. Used for the data-bearing CLUSTER MOVESLOTS push so the
+ * target authenticates the peer via a pinned migration identity instead of
+ * the legacy cleartext AUTH. */
+static bool qihse_resp_qkp_command(qihse_qkp_session_t* session, int fd,
+                                   size_t argc, const qihse_resp_arg_t* argv,
+                                   char* error, size_t error_capacity) {
+    size_t cap = 64u;
+    for (size_t i = 0; i < argc; i++) cap += argv[i].len + 32u;
+    char* req = (char*)malloc(cap);
+    if (!req) return false;
+    size_t used = 0u;
+    used += (size_t)snprintf(req + used, cap - used, "*%zu\r\n", argc);
+    for (size_t i = 0; i < argc; i++) {
+        used += (size_t)snprintf(req + used, cap - used, "$%zu\r\n", argv[i].len);
+        if (argv[i].len) { memcpy(req + used, argv[i].data, argv[i].len); used += argv[i].len; }
+        memcpy(req + used, "\r\n", 2u); used += 2u;
+    }
+    bool ok = qihse_qkp_send_sealed(session, fd, req, used);
+    free(req);
+    if (!ok) { if (error && error_capacity) snprintf(error, error_capacity, "sealed send failed"); errno = EIO; return false; }
+
+    uint8_t* frame = (uint8_t*)malloc(QIHSE_QKP_MAX_FRAME + 64u);
+    if (!frame) return false;
+    char line[1024];
+    size_t got = 0u;
+    while (got + 1u < sizeof(line)) {
+        ssize_t n = qihse_qkp_recv_sealed(session, fd, frame, QIHSE_QKP_MAX_FRAME + 64u);
+        if (n <= 0) { free(frame); errno = EPROTO; return false; }
+        size_t room = sizeof(line) - 1u - got;
+        size_t copy = (size_t)n < room ? (size_t)n : room;
+        memcpy(line + got, frame, copy);
+        got += copy;
+        if (got >= 2u && line[got - 2u] == '\r' && line[got - 1u] == '\n') break;
+    }
+    free(frame);
+    if (got < 3u || line[got - 2u] != '\r' || line[got - 1u] != '\n') {
+        errno = EPROTO;
+        return false;
+    }
+    line[got - 2u] = '\0';
+    if (line[0] == '+') return true;
+    if (error && error_capacity > 0u) {
+        if (line[0] == '-') {
+            size_t copy_len = strlen(line + 1u);
+            if (copy_len >= error_capacity) copy_len = error_capacity - 1u;
+            memcpy(error, line + 1u, copy_len);
+            error[copy_len] = '\0';
+        } else {
+            snprintf(error, error_capacity, "target did not acknowledge command");
+        }
+    }
+    errno = EREMOTEIO;
+    return false;
+}
+
 static int qihse_resp_connect_timeout(const char* host, uint16_t port, int timeout_ms) {
     char service[16];
     snprintf(service, sizeof(service), "%u", port);
@@ -11225,17 +11282,10 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         return 0; /* no data to transfer: the range can take load on the target */
     }
 
-    /* The daemon leaves this credential unset until slot migration has a
-     * secure transport. Refuse before changing ownership: otherwise the
-     * target rejects ASKING/SET and the source's keys become unreachable. */
-    const char* password = server->cluster_migrate_password;
-    if (!password || !*password) {
-        free(collector.keys);
-        if (err && err_cap) snprintf(err, err_cap, "target authentication unavailable");
-        return -1;
-    }
-
-    /* Establish and authenticate the target before any topology mutation. */
+    /* Establish a pinned-QKP session to the target before any topology
+     * mutation. The target accepts only a peer whose identity matches its
+     * --migration-peer-node-id/--migration-peer-dsa-pub pin (the legacy
+     * cleartext AUTH credential is retired for the data-bearing path). */
     int target_fd = qihse_resp_connect_timeout(target.host, target.port, 5000);
     if (target_fd < 0) {
         free(collector.keys);
@@ -11243,18 +11293,11 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         return -1;
     }
     char remote_error[512] = {0};
-    static const uint8_t auth_cmd[] = "AUTH";
-    static const uint8_t op_user[] = "GODMODE_OP";
-    qihse_resp_arg_t auth_args[3] = {
-        { auth_cmd, sizeof(auth_cmd) - 1u },
-        { (const uint8_t*)op_user, sizeof(op_user) - 1u },
-        { (const uint8_t*)password, strlen(password) }
-    };
-    if (!qihse_resp_fd_command(target_fd, 3u, auth_args,
-                                remote_error, sizeof(remote_error))) {
+    qihse_qkp_session_t* qkp = NULL;
+    if (qihse_qkp_client_negotiate(target_fd, &server->pqc, &qkp) != QIHSE_QKP_SECURE || !qkp) {
         close_socket(target_fd);
         free(collector.keys);
-        if (err && err_cap) snprintf(err, err_cap, "target authentication failed");
+        if (err && err_cap) snprintf(err, err_cap, "target QKP handshake failed");
         return -1;
     }
 
@@ -11281,7 +11324,7 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         if (!value) continue; /* vanished mid-migration */
         int64_t ttl = qihse_kv_ttl_ms_user(server->store, key, user);
         qihse_resp_arg_t asking = { asking_cmd, sizeof(asking_cmd) - 1u };
-        bool sent = qihse_resp_fd_command(target_fd, 1u, &asking, remote_error, sizeof(remote_error));
+        bool sent = qihse_resp_qkp_command(qkp, target_fd, 1u, &asking, remote_error, sizeof(remote_error));
         qihse_resp_arg_t set_args[5];
         size_t set_argc = 0;
         set_args[set_argc++] = (qihse_resp_arg_t){ set_cmd, sizeof(set_cmd) - 1u };
@@ -11293,7 +11336,7 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
             set_args[set_argc++] = (qihse_resp_arg_t){ px_opt, sizeof(px_opt) - 1u };
             set_args[set_argc++] = (qihse_resp_arg_t){ (const uint8_t*)ttl_buf, (size_t)n };
         }
-        if (sent) sent = qihse_resp_fd_command(target_fd, set_argc, set_args, remote_error, sizeof(remote_error));
+        if (sent) sent = qihse_resp_qkp_command(qkp, target_fd, set_argc, set_args, remote_error, sizeof(remote_error));
         if (sent) {
             /* Transferred: drop the local copy (MIGRATE semantics, no COPY). */
             qihse_kv_del_user(server->store, key, user);
@@ -11305,6 +11348,7 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
         if (!sent) break;
     }
     pthread_rwlock_unlock(&server->kv_lock);
+    qihse_qkp_session_free(qkp);
     close_socket(target_fd);
     if (out_moved) *out_moved = moved;
     size_t collected = collector.count;
