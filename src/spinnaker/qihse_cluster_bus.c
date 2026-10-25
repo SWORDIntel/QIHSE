@@ -783,22 +783,19 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
         __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
         return;
     }
-    /* Per-owner epoch bookkeeping: the epoch is only used to decide whether
-     * a received change is genuinely new (for journaling), never to reject an
-     * update. config_epoch is derived from each node's LOCAL next_epoch()
-     * counter, so it is NOT comparable across nodes; rejecting on
-     * "upd.config_epoch < owner.config_epoch" silently dropped legitimate
-     * ownership and let followers diverge. Always adopt; the durable journal
-     * replay (adopt-if-newer) still orders ownership across restarts. */
-    qihse_cluster_node_t owner;
-    bool owner_known = qihse_cluster_topology_get_node(bus->topology, local_owner, &owner);
-    bool changed = !owner_known || upd.config_epoch > owner.config_epoch;
+    /* Journal only a genuine ownership change (this slot's owner moves to a
+     * different node). Static re-announcements keep the same owner but carry a
+     * drifting per-node epoch; journaling them accumulates conflicting records
+     * that replay into divergence. The per-node config_epoch is a LOCAL counter
+     * and must not drive durability decisions. */
+    uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_topology_get_slot(bus->topology, upd.start, &prior_owner, NULL, NULL);
+    bool owner_changed = prior_owner != local_owner;
     qihse_cluster_topology_adopt_range(bus->topology, upd.start, upd.end,
                                        local_owner, upd.config_epoch);
     /* Persist a genuine ownership change on the receiving side too, so both
-     * ends of a migration record it and the GC can reclaim once converged.
-     * Idempotent re-announces (equal epoch) are NOT journaled. */
-    if (changed) {
+     * ends of a migration record it and the GC can reclaim once converged. */
+    if (owner_changed) {
         const char* dir = getenv("QIHSE_DATA_DIR");
         if (dir && *dir)
             qihse_cluster_ownership_journal_append(dir, upd.start, upd.end,
