@@ -277,6 +277,40 @@ bool qihse_cluster_topology_assign_range(qihse_cluster_topology_t* topology, uin
     return true;
 }
 
+/* Adopt a slot range whose ownership was decided elsewhere (received slot
+ * update). Assigns the slots and adopts the peer's per-owner config epoch
+ * verbatim instead of bumping a new one, so the epoch converges rather than
+ * drifting upward on every hop. */
+bool qihse_cluster_topology_adopt_range(qihse_cluster_topology_t* topology,
+                                        uint16_t start, uint16_t end,
+                                        uint16_t owner_index, uint64_t config_epoch) {
+    if (!topology || !qihse_cluster_valid_slot_range(start, end)) {
+        errno = EINVAL;
+        return false;
+    }
+    pthread_mutex_lock(&topology->metadata_lock);
+    if (!qihse_cluster_valid_node_locked(topology, owner_index)) {
+        pthread_mutex_unlock(&topology->metadata_lock);
+        errno = ENOENT;
+        return false;
+    }
+    for (uint32_t slot = start; slot <= end; slot++) {
+        __atomic_store_n(&topology->slot_peer[slot], QIHSE_CLUSTER_NODE_NONE, __ATOMIC_RELAXED);
+        __atomic_store_n(&topology->slot_state[slot], QIHSE_CLUSTER_SLOT_STABLE, __ATOMIC_RELAXED);
+        __atomic_store_n(&topology->slot_to_node[slot], owner_index, __ATOMIC_RELEASE);
+    }
+    topology->nodes[owner_index].config_epoch = config_epoch;
+    uint64_t cur = __atomic_load_n(&topology->current_epoch, __ATOMIC_ACQUIRE);
+    while (cur < config_epoch &&
+           !__atomic_compare_exchange_n(&topology->current_epoch, &cur,
+                                        config_epoch, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* converge the global epoch upward */
+    }
+    pthread_mutex_unlock(&topology->metadata_lock);
+    return true;
+}
+
 bool qihse_cluster_topology_unassign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end) {
     if (!topology || !qihse_cluster_valid_slot_range(start, end)) {
         errno = EINVAL;

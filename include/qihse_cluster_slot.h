@@ -110,6 +110,7 @@ bool qihse_cluster_node_federation_uuid(const char* node_id, uint8_t out[16]);
 bool qihse_cluster_topology_remove_node(qihse_cluster_topology_t* topology, uint16_t index);
 bool qihse_cluster_topology_assign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end, uint16_t owner_index);
 bool qihse_cluster_topology_unassign_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end);
+bool qihse_cluster_topology_adopt_range(qihse_cluster_topology_t* topology, uint16_t start, uint16_t end, uint16_t owner_index, uint64_t config_epoch);
 bool qihse_cluster_topology_set_migrating(qihse_cluster_topology_t* topology, uint16_t slot, uint16_t source_index, uint16_t target_index);
 bool qihse_cluster_topology_set_importing(qihse_cluster_topology_t* topology, uint16_t slot, uint16_t source_index, uint16_t target_index);
 bool qihse_cluster_topology_set_stable(qihse_cluster_topology_t* topology, uint16_t slot, uint16_t owner_index);

@@ -658,7 +658,7 @@ static void qihse_bus_announce_local_slots(qihse_cluster_bus_t* bus, const char*
             upd.end = (uint16_t)(slot - 1u);
             upd.owner_index = bus->local_node_index;
             memcpy(upd.owner_id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
-            upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
+            upd.config_epoch = local.config_epoch;
             qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
                                    (uint32_t)sizeof(upd));
             memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
@@ -695,7 +695,7 @@ static void qihse_bus_announce_known_slots(qihse_cluster_bus_t* bus, const char*
                 upd.end = (uint16_t)end;
                 upd.owner_index = owner;
                 memcpy(upd.owner_id, owner_node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
-                upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
+                upd.config_epoch = owner_node.config_epoch;
                 qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
                                        (uint32_t)sizeof(upd));
                 memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
@@ -1493,7 +1493,7 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
     upd.end = end;
     upd.owner_index = owner_index;
     memcpy(upd.owner_id, owner.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
-    upd.config_epoch = qihse_cluster_topology_epoch(bus->topology);
+    upd.config_epoch = owner.config_epoch;
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
                                        (const uint8_t*)&upd, sizeof(upd));
 }
