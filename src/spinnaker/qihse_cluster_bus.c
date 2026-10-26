@@ -758,13 +758,22 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
      * already hold). This is what stops a slow/duplicated update from flapping
      * ownership. A node's OWN range is always authoritative; epoch 0 (static)
      * is never treated as stale. */
-    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
-        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
-        return;
-    }
     uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_topology_get_slot(bus->topology, upd.start, &prior_owner, NULL, NULL);
     bool owner_changed = prior_owner != local_owner;
+    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
+        if (owner_changed)
+            fprintf(stderr, "qihse-cluster-bus: REJECTED stale slot update %u-%u -> %.8s "
+                    "(epoch %llu < held %llu); keeping owner idx %u\n",
+                    upd.start, upd.end, upd.owner_id, (unsigned long long)upd.config_epoch,
+                    (unsigned long long)owner.config_epoch, (unsigned)prior_owner);
+        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    if (owner_changed)
+        fprintf(stderr, "qihse-cluster-bus: slot update %u-%u idx %u -> %.8s (epoch %llu)\n",
+                upd.start, upd.end, (unsigned)prior_owner, upd.owner_id,
+                (unsigned long long)upd.config_epoch);
     /* A range moving TO this node FROM another node while that node is not
      * healthy is a failover takeover decided elsewhere (the failover coordinator
      * on whichever node noticed the failure picks the successor, not
