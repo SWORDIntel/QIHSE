@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import unittest
 from unittest import mock
 
@@ -92,6 +93,82 @@ class AdminTests(unittest.TestCase):
             result = self.cli('--resp', '-x', 'ECHO', data=payload)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b'$' + str(len(payload)).encode() + b'\r\n' + payload + b'\r\n')
+
+    def test_cli_arg_files_binary_order_and_limits(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / 'build', prefix='admin-files-') as temp:
+            directory = Path(temp)
+            first = directory / 'first.bin'
+            second = directory / 'second.bin'
+            first.write_bytes(b'\x00\xff\r\n')
+            second.write_bytes(b'')
+            echo = self.cli('--resp', '--arg-file', str(first), 'ECHO')
+            self.assertEqual(echo.returncode, 0, echo.stderr)
+            self.assertEqual(echo.stdout, b'$4\r\n\x00\xff\r\n\r\n')
+            for args in (('--command', 'ECHO', '--arg-file', str(first)),
+                         ('--arg-file', str(first), '--command', 'ECHO')):
+                result = self.cli('--resp', *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, echo.stdout)
+            key = directory / 'key.bin'
+            key.write_bytes(b'admin-test:secret')
+            cases = (
+                (('--command', 'MGET', '--arg-file', str(key), '--arg', 'admin-test:missing',
+                  '--arg-file', str(second), '--arg', 'admin-test:secret'),
+                 ['CLASSIFIED-ADMIN-TEST', None, None, 'CLASSIFIED-ADMIN-TEST']),
+                (('--arg-file', str(key), '--arg', 'admin-test:missing',
+                  '--arg-file', str(second), 'MGET', 'admin-test:secret'),
+                 ['CLASSIFIED-ADMIN-TEST', None, None, 'CLASSIFIED-ADMIN-TEST']),
+            )
+            for args, expected in cases:
+                result = self.cli('--json', *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+            # Options precede positional CMD; tail arguments follow option arguments.
+            result = self.cli('--json', '--arg-file', str(second), 'MGET', 'admin-test:secret')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [None, 'CLASSIFIED-ADMIN-TEST'])
+            self.assertEqual(self.cli('--arg-file', str(first)).returncode, 2)
+            self.assertEqual(self.cli('--command', '', '--arg-file', str(first)).returncode, 2)
+            self.assertEqual(self.cli('--arg-file', str(first), '--ping').returncode, 2)
+            for args in (('--stdin',), ('--batch',), ('--interactive',), ('-x',)):
+                result = self.cli('--arg-file', str(first), *args, 'ECHO')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b'')
+            for path in (directory, directory / 'missing', directory / 'link', directory / 'pipe'):
+                if path.name == 'link':
+                    path.symlink_to(first)
+                if path.name == 'pipe':
+                    os.mkfifo(path)
+                result = self.cli('--port', '1', '--arg-file', str(path), 'ECHO')
+                self.assertEqual(result.returncode, 2, (path, result.stderr))
+                self.assertNotIn(first.read_bytes(), result.stderr)
+                self.assertEqual(result.stdout, b'')
+            huge = directory / 'huge.bin'
+            with huge.open('wb') as stream:
+                stream.truncate(64 * 1024 * 1024)
+            medium = directory / 'medium.bin'
+            with medium.open('wb') as stream:
+                stream.truncate(33 * 1024 * 1024)
+            for args in (('--arg-file', str(huge), 'ECHO'),
+                         ('--arg-file', str(first), '--arg-file', str(huge), 'ECHO'),
+                         ('--arg', 'x' * 100, '--arg-file', str(huge), 'ECHO'),
+                         ('--command', 'MGET', '--arg-file', str(medium),
+                          '--arg-file', str(medium))):
+                result = self.cli('--port', '1', *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b'')
+            result = self.cli('--json', '--command', 'MGET',
+                              *(['--arg-file', str(second)] * 255))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [None] * 255)
+            result = self.cli('--port', '1', '--command', 'ECHO',
+                              *(['--arg', 'x'] * 256))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, b'')
+            result = self.cli('--port', '1', '--command', 'ECHO',
+                              *(['--arg-file', str(second)] * 256))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, b'')
 
     def test_json_and_exact_error_classification(self):
         result = self.cli('--json', '--fail-on-error', 'ECHO', 'ERR ordinary data')

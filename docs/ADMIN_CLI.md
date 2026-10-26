@@ -38,6 +38,8 @@ The existing cluster/health shortcuts remain available.
 ./qihse-admin-cli --json CLUSTER SLOTS
 ./qihse-admin-cli --json USER LIST
 ./qihse-admin-cli --resp -x ECHO < payload.bin
+./qihse-admin-cli --resp --arg-file payload.bin ECHO
+./qihse-admin-cli --json -c 'MGET' --arg-file key1.bin --arg-file key2.bin
 ./qihse-admin-cli --stdin --json --fail-on-error < commands.txt
 ./qihse-admin-cli --interactive
 ```
@@ -49,12 +51,19 @@ Feature availability and argument syntax remain server-defined. A transport that
 accepts binary data does not imply every storage backend accepts binary keys or
 values: for example, the current string KV backend rejects NUL-containing keys.
 
-Options precede the positional command. Everything after the command, including
-strings beginning with `-`, is an argument. `--arg` appends exact text arguments;
-`-c`/`--command` parses quotes and escapes and can be followed by `--arg` values.
-`-x` appends stdin as the last argument **without stripping NUL, CR or LF**. This
-corrects the previous newline stripping; use `printf`, not `echo`, when a text
-value must not end in a newline.
+Options precede the positional command. The positional `CMD` (or tokens parsed
+from `-c`/`--command`) comes first; `--arg` and repeatable `--arg-file PATH`
+arguments follow in their option order, then any positional tail arguments.
+Everything after positional `CMD`, including strings beginning with `-`, is a
+literal argument, not an option. `--arg` appends exact text; `--arg-file` reads
+one regular file as one exact binary argument (empty files are valid, NUL and
+newlines are retained). It rejects symlinks, directories, pipes, short/changing
+reads and files too large for the framed 64-MiB request before opening QKP.
+Neither file data nor file paths are printed on read failure. `--arg-file` is
+one-shot only and requires an explicit `CMD` or `-c`: it cannot be combined
+with shortcuts, `-x`, `--stdin`/`--batch`, or `--interactive`/`--repl`.
+`-x` appends stdin as the last argument **without stripping NUL, CR or LF**;
+use `printf`, not `echo`, when a text value must not end in a newline.
 
 `--stdin` and `--interactive` reuse one QKP handshake and server session, allowing
 AUTH, CLIENT state and transaction sequences. Lines support single/double quotes,

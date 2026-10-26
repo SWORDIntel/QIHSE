@@ -2,12 +2,14 @@
  * authorization are unchanged; every mode uses the shared native admin API. */
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "qihse_qkp.h"
 
@@ -21,7 +23,10 @@ static const char* g_user;
 static const char* g_password_env;
 static const char* g_command;
 static const char* g_args[ADMIN_MAX_ARGS];
+static bool g_arg_files[ADMIN_MAX_ARGS];
 static size_t g_argc;
+static const char* g_positional_command;
+static bool g_shortcut, g_has_arg_file;
 static bool g_interactive, g_batch, g_stdin_value, g_strict;
 static bool g_json, g_resp;
 static unsigned g_timeout = 30000u;
@@ -43,6 +48,7 @@ static void usage(int code) {
         "  CMD [ARG ...]           Any server RESP2 command, arguments passed exactly\n"
         "  --command, -c TEXT      Quote-aware command (single/double quotes, escapes)\n"
         "  --arg ARG               Append an exact text argument, repeatable\n"
+        "  --arg-file PATH         Append one binary argument from a regular file\n"
         "  -x                      Append stdin bytes verbatim, including NUL/newlines\n"
         "  --stdin, --batch        Commands by line; one handshake, persistent state\n"
         "  --interactive, --repl   Persistent interactive shell (EXIT exits locally)\n"
@@ -81,6 +87,58 @@ static bool push_arg(const char* arg) {
     }
     g_args[g_argc++] = arg;
     return true;
+}
+
+static size_t decimal_digits(size_t value) {
+    size_t digits = 1u;
+    while (value >= 10u) { value /= 10u; digits++; }
+    return digits;
+}
+
+static bool account_arg(size_t* used, size_t length) {
+    size_t header = decimal_digits(length) + 5u; /* $length\r\n...\r\n */
+    if (header > QIHSE_QKP_ADMIN_MAX_BYTES - *used ||
+        length > QIHSE_QKP_ADMIN_MAX_BYTES - *used - header) return false;
+    *used += header + length;
+    return true;
+}
+
+static char* read_arg_file(const char* path, size_t* length, size_t remaining) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return NULL;
+    struct stat st;
+    char* buf = NULL;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uintmax_t)st.st_size > remaining) goto done;
+    *length = (size_t)st.st_size;
+    buf = malloc(*length ? *length : 1u);
+    if (!buf) goto done;
+    size_t got = 0u;
+    while (got < *length) {
+        ssize_t n = read(fd, buf + got, *length - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto fail;
+        got += (size_t)n;
+    }
+    /* Reject concurrent growth, including growth past the request bound. */
+    char extra;
+    ssize_t n;
+    do { n = read(fd, &extra, 1u); } while (n < 0 && errno == EINTR);
+    if (n != 0) goto fail;
+    struct stat end;
+    if (fstat(fd, &end) != 0 || end.st_size != st.st_size ||
+        end.st_dev != st.st_dev || end.st_ino != st.st_ino ||
+        end.st_mtim.tv_sec != st.st_mtim.tv_sec ||
+        end.st_mtim.tv_nsec != st.st_mtim.tv_nsec ||
+        end.st_ctim.tv_sec != st.st_ctim.tv_sec ||
+        end.st_ctim.tv_nsec != st.st_ctim.tv_nsec) goto fail;
+    goto done;
+fail:
+    free(buf);
+    buf = NULL;
+done:
+    close(fd);
+    return buf;
 }
 
 static bool parse_command_line(char* line, const char** argv, size_t* argc) {
@@ -194,27 +252,35 @@ int main(int argc, char** argv) {
             if (g_command) usage(2);
             g_command = VALUE();
         } else if (strcmp(a, "--arg") == 0) { if (!push_arg(VALUE())) return 2; }
+        else if (strcmp(a, "--arg-file") == 0) {
+            if (!push_arg(VALUE())) return 2;
+            g_arg_files[g_argc - 1u] = g_has_arg_file = true;
+        }
         else if (strcmp(a, "-x") == 0) g_stdin_value = true;
         else if (OPTION("--interactive", "--repl")) g_interactive = true;
         else if (OPTION("--stdin", "--batch")) g_batch = true;
         else if (strcmp(a, "--fail-on-error") == 0) g_strict = true;
         else if (strcmp(a, "--json") == 0) g_json = true;
         else if (strcmp(a, "--resp") == 0) g_resp = true;
-        else if (strcmp(a, "--ping") == 0) { if (!push_arg("PING")) return 2; }
-        else if (strcmp(a, "--dbsize") == 0) { if (!push_arg("DBSIZE")) return 2; }
-        else if (strcmp(a, "--save") == 0) { if (!push_arg("SAVE")) return 2; }
-        else if (strcmp(a, "--bgsave") == 0) { if (!push_arg("BGSAVE")) return 2; }
-        else if (strcmp(a, "--repl-status") == 0) { if (!push_arg("REPL.STATUS")) return 2; }
+        else if (strcmp(a, "--ping") == 0) { g_shortcut = true; if (!push_arg("PING")) return 2; }
+        else if (strcmp(a, "--dbsize") == 0) { g_shortcut = true; if (!push_arg("DBSIZE")) return 2; }
+        else if (strcmp(a, "--save") == 0) { g_shortcut = true; if (!push_arg("SAVE")) return 2; }
+        else if (strcmp(a, "--bgsave") == 0) { g_shortcut = true; if (!push_arg("BGSAVE")) return 2; }
+        else if (strcmp(a, "--repl-status") == 0) { g_shortcut = true; if (!push_arg("REPL.STATUS")) return 2; }
         else if (strcmp(a, "--info") == 0 || strcmp(a, "--cluster-reclaim") == 0) {
+            g_shortcut = true;
             if (strcmp(a, "--info") == 0) { if (!push_arg("INFO")) return 2; }
             else if (!push_arg("CLUSTER") || !push_arg("RECLAIM")) return 2;
             if (i + 1 < argc && argv[i + 1][0] != '-') { if (!push_arg(argv[++i])) return 2; }
         } else if (strcmp(a, "--cluster-keyslot") == 0) {
+            g_shortcut = true;
             if (!push_arg("CLUSTER") || !push_arg("KEYSLOT") || !push_arg(VALUE())) return 2;
         } else if (strcmp(a, "--cluster-info") == 0 || strcmp(a, "--cluster-nodes") == 0 ||
                    strcmp(a, "--cluster-slots") == 0 || strcmp(a, "--cluster-failover") == 0) {
+            g_shortcut = true;
             if (!push_arg("CLUSTER") || !push_arg(a + 10)) return 2;
         } else if (strcmp(a, "--cluster-moveslots") == 0) {
+            g_shortcut = true;
             if (!push_arg("CLUSTER") || !push_arg("MOVESLOTS")) return 2;
             static char range[64], target[280];
             if (i + 4 < argc && !strchr(argv[i + 1], '-') && !strchr(argv[i + 3], ':') && argv[i + 3][0] != '-') {
@@ -226,6 +292,8 @@ int main(int argc, char** argv) {
         } else {
             if (strcmp(a, "--") == 0) i++;
             else if (*a == '-') { fprintf(stderr, "unknown option: %s\n", a); usage(2); }
+            if (i < argc && !g_command && !g_shortcut && g_argc)
+                g_positional_command = argv[i++];
             for (; i < argc; i++) if (!push_arg(argv[i])) return 2;
             break;
         }
@@ -234,7 +302,9 @@ int main(int argc, char** argv) {
     }
     if (!g_host || !*g_host || !g_trusted_pub || !*g_trusted_pub || (g_json && g_resp) ||
         (g_interactive && g_batch) ||
-        ((g_interactive || g_batch) && (g_argc || g_command || g_stdin_value))) usage(2);
+        ((g_interactive || g_batch) && (g_argc || g_command || g_positional_command || g_stdin_value)) ||
+        (g_has_arg_file && (g_interactive || g_batch || g_stdin_value || g_shortcut ||
+                            (!g_command && !g_positional_command)))) usage(2);
     const char* password = NULL;
     if ((g_user && *g_user) || g_password_env) {
         if (!g_user || !*g_user) usage(2);
@@ -243,6 +313,8 @@ int main(int argc, char** argv) {
     }
     const char* cargv[ADMIN_MAX_ARGS];
     size_t lengths[ADMIN_MAX_ARGS], cargc = 0u;
+    bool file_args[ADMIN_MAX_ARGS] = {false};
+    char* file_values[ADMIN_MAX_ARGS] = {NULL};
     char* command_buf = NULL;
     char* stdin_value = NULL;
     if (g_command) {
@@ -253,14 +325,39 @@ int main(int argc, char** argv) {
         }
     }
     int rc = 2;
-    if (cargc + g_argc + (g_stdin_value ? 1u : 0u) > ADMIN_MAX_ARGS) goto done;
-    for (size_t i = 0; i < g_argc; i++) cargv[cargc++] = g_args[i];
+    if (g_has_arg_file && !cargc && !g_positional_command && !g_shortcut) {
+        fprintf(stderr, "argument files require a command\n");
+        goto done;
+    }
+    if (cargc + g_argc + (g_positional_command ? 1u : 0u) + (g_stdin_value ? 1u : 0u) > ADMIN_MAX_ARGS) {
+        fprintf(stderr, "too many arguments (max %u)\n", ADMIN_MAX_ARGS);
+        goto done;
+    }
+    if (g_positional_command) cargv[cargc++] = g_positional_command;
+    for (size_t i = 0; i < g_argc; i++) {
+        cargv[cargc] = g_args[i];
+        file_args[cargc++] = g_arg_files[i];
+    }
     if (!cargc && !g_batch && !g_interactive) cargv[cargc++] = "PING";
-    for (size_t i = 0; i < cargc; i++) lengths[i] = strlen(cargv[i]);
+    for (size_t i = 0; i < cargc; i++) lengths[i] = file_args[i] ? 0u : strlen(cargv[i]);
     if (g_stdin_value) {
         stdin_value = read_input(false, &lengths[cargc]);
         if (!stdin_value) { fprintf(stderr, "stdin read failed or exceeds 64 MiB\n"); goto done; }
         cargv[cargc++] = stdin_value;
+    }
+    size_t request_size = 1u + decimal_digits(cargc) + 2u;
+    size_t allocation_bound = 64u + 32u * cargc;
+    for (size_t i = 0; i < cargc; i++) {
+        if (file_args[i]) {
+            if (allocation_bound > QIHSE_QKP_ADMIN_MAX_BYTES) goto oversized;
+            file_values[i] = read_arg_file(cargv[i], &lengths[i],
+                QIHSE_QKP_ADMIN_MAX_BYTES - allocation_bound);
+            if (!file_values[i]) { fprintf(stderr, "argument file invalid, changed, or unreadable\n"); goto done; }
+            cargv[i] = file_values[i];
+        }
+        if (lengths[i] > QIHSE_QKP_ADMIN_MAX_BYTES - allocation_bound ||
+            !account_arg(&request_size, lengths[i])) goto oversized;
+        allocation_bound += lengths[i];
     }
     qihse_qkp_admin_client_t* client = NULL;
     char error[512] = {0};
@@ -298,7 +395,11 @@ int main(int argc, char** argv) {
     }
 close_client:
     qihse_qkp_admin_close(client);
+    goto done;
+oversized:
+    fprintf(stderr, "request exceeds 64 MiB\n");
 done:
+    for (size_t i = 0; i < ADMIN_MAX_ARGS; i++) free(file_values[i]);
     free(stdin_value);
     free(command_buf);
     return rc;
