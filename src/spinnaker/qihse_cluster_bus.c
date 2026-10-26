@@ -96,6 +96,8 @@ struct qihse_cluster_bus {
     uint32_t timeout_ms;
     qihse_cluster_bus_on_fail_cb on_fail;
     void* on_fail_user_data;
+    qihse_cluster_bus_on_takeover_cb on_takeover;
+    void* on_takeover_user_data;
     void (*on_group_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
                             const uint8_t* payload, size_t payload_len,
                             uint16_t sender_index, void* user_data);
@@ -763,6 +765,17 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_topology_get_slot(bus->topology, upd.start, &prior_owner, NULL, NULL);
     bool owner_changed = prior_owner != local_owner;
+    /* A range moving TO this node FROM another node while that node is not
+     * healthy is a failover takeover decided elsewhere (the failover coordinator
+     * on whichever node noticed the failure picks the successor, not
+     * necessarily us). We are the one who holds the debt, so tell the failover
+     * layer to ledger it for failback. */
+    if (owner_changed && local_owner == bus->local_node_index &&
+        prior_owner != QIHSE_CLUSTER_NODE_NONE && bus->on_takeover) {
+        qihse_cluster_node_t prior;
+        if (qihse_cluster_topology_get_node(bus->topology, prior_owner, &prior) && !prior.healthy)
+            bus->on_takeover(bus->topology, prior_owner, upd.start, upd.end, bus->on_takeover_user_data);
+    }
     qihse_cluster_topology_adopt_range(bus->topology, upd.start, upd.end,
                                        local_owner, upd.config_epoch);
     /* Persist a genuine ownership change on the receiving side too, so both
@@ -1518,6 +1531,14 @@ void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
     if (hl >= QIHSE_FEDERATION_ENDPOINT_HOST_LEN) return;
     memcpy(bus->dispatch_endpoint.host, host, hl + 1u);
     bus->dispatch_endpoint.port = port;
+}
+
+void qihse_cluster_bus_set_takeover_callback(qihse_cluster_bus_t* bus,
+                                            qihse_cluster_bus_on_takeover_cb cb,
+                                            void* user_data) {
+    if (!bus) return;
+    bus->on_takeover = cb;
+    bus->on_takeover_user_data = user_data;
 }
 
 void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,

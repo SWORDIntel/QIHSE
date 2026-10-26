@@ -16207,6 +16207,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             qihse_cluster_bus_set_fail_callback(server->bus,
                                                qihse_cluster_failover_on_fail_cb,
                                                server->failover);
+            qihse_cluster_bus_set_takeover_callback(server->bus,
+                                                   qihse_cluster_failover_on_takeover_cb,
+                                                   server->failover);
         }
     }
     /* Phase 3: create system guard throttling window if requested */

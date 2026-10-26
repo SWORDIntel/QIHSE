@@ -87,6 +87,13 @@ uint16_t qihse_cluster_failover_best_replica(const qihse_cluster_topology_t* top
 /* Get the number of failover events that have been processed. */
 uint64_t qihse_cluster_failover_events(const qihse_cluster_failover_t* fo);
 
+/* Bus takeover callback adapter: ledger a range another node's coordinator
+ * handed to THIS node, so it is failed back when the previous owner returns. */
+void qihse_cluster_failover_on_takeover_cb(qihse_cluster_topology_t* topology,
+                                           uint16_t previous_owner_index,
+                                           uint16_t start, uint16_t end,
+                                           void* user_data);
+
 /* Completed failbacks (a range handed back to its returned owner). */
 uint64_t qihse_cluster_failover_failbacks(const qihse_cluster_failover_t* fo);
 

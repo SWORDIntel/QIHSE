@@ -456,6 +456,66 @@ static void test_failback_respects_resplit_range(void) {
     printf("PASS failback hands back only the slots the successor still owns\n");
 }
 
+/* The failover coordinator that notices a failure may be on a DIFFERENT node
+ * from the one it picks as successor. The successor learns of the takeover only
+ * as a slot update over the bus, and it is the one that owes the range back. */
+static void test_failback_on_remote_takeover(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    qihse_cluster_node_t a, c;
+    make_node(&a, "remote-owner", "127.0.0.1", 7000, 17000, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&c, "remote-successor", "127.0.0.1", 7001, 17001, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t ia, ic;
+    assert(qihse_cluster_topology_upsert_node(topo, &a, &ia));
+    assert(qihse_cluster_topology_upsert_node(topo, &c, &ic));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, ia));
+    probe.topo = topo;
+
+    qihse_cluster_failover_config_t fcfg; memset(&fcfg, 0, sizeof(fcfg));
+    fcfg.topology = topo; fcfg.local_node_index = ic;
+    fcfg.failback_fn = fb_cb; fcfg.failback_user_data = &probe;
+    fcfg.failback_stable_ms = 150; fcfg.failback_poll_ms = 40;
+    qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&fcfg);
+    assert(fo);
+
+    qihse_cluster_bus_config_t bcfg; memset(&bcfg, 0, sizeof(bcfg));
+    bcfg.topology = topo; bcfg.local_node_index = ic; bcfg.bus_port = 0;
+    qihse_cluster_bus_t* bus = qihse_cluster_bus_create(&bcfg);
+    assert(bus);
+    qihse_cluster_bus_set_takeover_callback(bus, qihse_cluster_failover_on_takeover_cb, fo);
+
+    /* The owner is down, and ANOTHER node's coordinator announces that THIS node
+     * (the successor) now owns 0-99. */
+    qihse_cluster_topology_set_node_health(topo, ia, false);
+    qihse_cluster_node_t self;
+    assert(qihse_cluster_topology_get_node(topo, ic, &self));
+    qihse_cluster_bus_slot_update_t upd; memset(&upd, 0, sizeof(upd));
+    upd.start = 0; upd.end = 99; upd.owner_index = ic;
+    memcpy(upd.owner_id, self.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+    upd.config_epoch = 50;
+    uint8_t dg[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(upd)];
+    uint32_t magic = QIHSE_CLUSTER_BUS_MAGIC, type = QIHSE_BUS_MSG_SLOT_UPDATE,
+             sender = 99, plen = (uint32_t)sizeof(upd);
+    memcpy(dg, &magic, 4); memcpy(dg + 4, &type, 4); memcpy(dg + 8, &sender, 4); memcpy(dg + 12, &plen, 4);
+    memcpy(dg + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
+    assert(qihse_cluster_bus_inject(bus, dg, sizeof(dg), "127.0.0.1", 17000));
+
+    uint16_t o; qihse_cluster_slot_state_t st;
+    assert(qihse_cluster_topology_get_slot(topo, 50, &o, &st, NULL) && o == ic);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);   /* ledgered via the bus */
+
+    qihse_cluster_topology_set_node_health(topo, ia, true);
+    fb_wait_t w = { fo, &probe, topo, 50, ia, 1 };
+    assert(wait_for(fb_owner_is, &w, 3000));
+    assert(wait_for(fb_count_reached, &w, 3000));
+    assert(probe.last_target == ia && probe.last_first == 0 && probe.last_last == 99);
+
+    qihse_cluster_bus_destroy(bus);
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS successor ledgers and fails back a takeover decided by another node\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -473,6 +533,7 @@ int main(void) {
     test_failback_retries_after_failure();
     test_failback_skips_dedicated_replica();
     test_failback_respects_resplit_range();
+    test_failback_on_remote_takeover();
     printf("cluster failover tests passed\n");
     return 0;
 }

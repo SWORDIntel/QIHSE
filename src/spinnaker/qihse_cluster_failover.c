@@ -440,6 +440,16 @@ static void* fo_failback_main(void* arg) {
     return NULL;
 }
 
+void qihse_cluster_failover_on_takeover_cb(qihse_cluster_topology_t* topology,
+                                           uint16_t previous_owner_index,
+                                           uint16_t start, uint16_t end,
+                                           void* user_data) {
+    (void)topology;
+    qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)user_data;
+    if (!fo || !fo->failback_fn) return;
+    fo_ledger_record(fo, previous_owner_index, start, end);
+}
+
 uint64_t qihse_cluster_failover_failbacks(const qihse_cluster_failover_t* fo) {
     if (!fo) return 0u;
     qihse_cluster_failover_t* m = (qihse_cluster_failover_t*)fo;

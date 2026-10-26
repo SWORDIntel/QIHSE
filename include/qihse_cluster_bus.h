@@ -184,6 +184,15 @@ typedef void (*qihse_cluster_bus_on_fail_cb)(qihse_cluster_topology_t* topology,
                                              uint16_t failed_node_index,
                                              void* user_data);
 
+/* Fired on the receiving node when a slot update hands it a range that another
+ * (currently unhealthy) node owned: a failover takeover decided elsewhere. The
+ * receiver is the one that owes the range back, so the failover layer ledgers
+ * it for failback. Runs on the bus thread: must not block. */
+typedef void (*qihse_cluster_bus_on_takeover_cb)(qihse_cluster_topology_t* topology,
+                                                 uint16_t previous_owner_index,
+                                                 uint16_t start, uint16_t end,
+                                                 void* user_data);
+
 typedef struct {
     qihse_cluster_topology_t* topology;
     uint16_t local_node_index;
@@ -331,6 +340,10 @@ void qihse_cluster_bus_set_dispatch_endpoint(qihse_cluster_bus_t* bus,
 void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,
                                         qihse_cluster_bus_on_fail_cb on_fail,
                                         void* user_data);
+
+void qihse_cluster_bus_set_takeover_callback(qihse_cluster_bus_t* bus,
+                                            qihse_cluster_bus_on_takeover_cb cb,
+                                            void* user_data);
 
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
