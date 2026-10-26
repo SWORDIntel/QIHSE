@@ -1829,25 +1829,6 @@ int main(int argc, char** argv) {
             return 1;
     }
 
-    if (getenv("QIHSE_SLOT_DEBUG")) {
-        uint16_t owners[QIHSE_CLUSTER_SLOT_COUNT];
-        if (qihse_cluster_topology_slot_owner_snapshot(topology, owners,
-                                                       QIHSE_CLUSTER_SLOT_COUNT) == QIHSE_CLUSTER_SLOT_COUNT) {
-            uint32_t s = 0;
-            while (s < QIHSE_CLUSTER_SLOT_COUNT) {
-                uint16_t o = owners[s]; uint32_t e = s;
-                while (e + 1u < QIHSE_CLUSTER_SLOT_COUNT && owners[e + 1u] == o) e++;
-                if (o != QIHSE_CLUSTER_NODE_NONE) {
-                    qihse_cluster_node_t on;
-                    qihse_cluster_topology_get_node(topology, o, &on);
-                    fprintf(stderr, "[slot-debug] static %u-%u -> %.12s (idx %u)\n",
-                            (unsigned)s, (unsigned)e, on.id, (unsigned)o);
-                }
-                s = e + 1u;
-            }
-        }
-    }
-
     /* Replay the durable slot-ownership journal so a migration's ownership
      * survives THIS node's restart (adopt-if-newer). Reclaim/GC is not run
      * before listener bind: stale source copies are reclaimed in bounded

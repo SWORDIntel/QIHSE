@@ -741,10 +741,6 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     if (upd.owner_id[0] != '\0') {
         qihse_cluster_topology_find_node(bus->topology, upd.owner_id, &local_owner);
     }
-    if (getenv("QIHSE_BUS_DEBUG"))
-        fprintf(stderr, "[bus] recv %u-%u -> %.12s (epoch %llu) resolve=%u\n",
-                upd.start, upd.end, upd.owner_id,
-                (unsigned long long)upd.config_epoch, (unsigned)local_owner);
     if (local_owner == QIHSE_CLUSTER_NODE_NONE) {
         qihse_cluster_topology_unassign_range(bus->topology, upd.start, upd.end);
         __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
@@ -761,9 +757,6 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
      * ownership. A node's OWN range is always authoritative; epoch 0 (static)
      * is never treated as stale. */
     if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
-        if (getenv("QIHSE_BUS_DEBUG"))
-            fprintf(stderr, "[bus]   STALE (have epoch %llu)\n",
-                    (unsigned long long)owner.config_epoch);
         __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
         return;
     }
