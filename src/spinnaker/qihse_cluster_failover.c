@@ -195,6 +195,11 @@ static void fo_ledger_record(qihse_cluster_failover_t* fo, uint16_t failed,
         e->failed_index = failed;
         e->start = start;
         e->end = end;
+        fprintf(stderr, "qihse-cluster-failback: ledgered slots %u-%u taken over from node %u\n",
+                (unsigned)start, (unsigned)end, (unsigned)failed);
+    } else {
+        fprintf(stderr, "qihse-cluster-failback: ledger full, slots %u-%u from node %u will not be failed back\n",
+                (unsigned)start, (unsigned)end, (unsigned)failed);
     }
     pthread_mutex_unlock(&fo->ledger_lock);
 }
@@ -314,6 +319,9 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
     bool promoted = qihse_cluster_failover_promote(fo, failed_node_index, replica);
     if (promoted) {
         fo->failover_events++;
+        fprintf(stderr, "qihse-cluster-failover: node %u failed; node %u takes its slots%s\n",
+                (unsigned)failed_node_index, (unsigned)replica,
+                replica == fo->local_node_index ? " (this node)" : "");
     }
     pthread_mutex_unlock(&fo->lock);
     return promoted ? replica : QIHSE_CLUSTER_NODE_NONE;
