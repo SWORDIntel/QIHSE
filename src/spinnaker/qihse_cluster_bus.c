@@ -669,46 +669,6 @@ static void qihse_bus_announce_local_slots(qihse_cluster_bus_t* bus, const char*
     }
 }
 
-/* Re-announce our FULL KNOWN slot map (every owner, coalesced runs) to a
- * newcomer: membership gossip alone carries no slot map, so a joiner that
- * learned the cluster transitively would otherwise never learn who owns
- * what. Receivers resolve owners by node id (MEETs are delivered first). */
-static void qihse_bus_announce_known_slots(qihse_cluster_bus_t* bus, const char* host, uint16_t port) {
-    uint16_t* owners = malloc(QIHSE_CLUSTER_SLOT_COUNT * sizeof(uint16_t));
-    if (!owners) return;
-    if (qihse_cluster_topology_slot_owner_snapshot(bus->topology, owners,
-                                                   QIHSE_CLUSTER_SLOT_COUNT) != QIHSE_CLUSTER_SLOT_COUNT) {
-        free(owners);
-        return;
-    }
-    uint8_t datagram[QIHSE_BUS_MAX_DATAGRAM];
-    uint32_t slot = 0;
-    while (slot < QIHSE_CLUSTER_SLOT_COUNT) {
-        uint16_t owner = owners[slot];
-        uint32_t end = slot;
-        while (end + 1u < QIHSE_CLUSTER_SLOT_COUNT && owners[end + 1u] == owner) end++;
-        if (owner != QIHSE_CLUSTER_NODE_NONE) {
-            qihse_cluster_node_t owner_node;
-            if (qihse_cluster_topology_get_node(bus->topology, owner, &owner_node)) {
-                qihse_cluster_bus_slot_update_t upd;
-                memset(&upd, 0, sizeof(upd));
-                upd.start = (uint16_t)slot;
-                upd.end = (uint16_t)end;
-                upd.owner_index = owner;
-                memcpy(upd.owner_id, owner_node.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
-                upd.config_epoch = owner_node.config_epoch;
-                qihse_bus_build_header(datagram, QIHSE_BUS_MSG_SLOT_UPDATE, bus->local_node_index,
-                                       (uint32_t)sizeof(upd));
-                memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
-                qihse_bus_send_datagram(bus, host, port, datagram,
-                                        QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(upd));
-            }
-        }
-        slot = end + 1u;
-    }
-    free(owners);
-}
-
 /* MEET handling with dynamic discovery:
  *   1. upsert the newcomer (idempotent by node id),
  *   2. if the newcomer is NEW to us, introduce OURSELVES back to it (so a
@@ -725,9 +685,12 @@ static void qihse_bus_handle_meet(qihse_cluster_bus_t* bus, const uint8_t* paylo
     if (!qihse_cluster_topology_upsert_node(bus->topology, &node, &idx)) return;
     qihse_bus_touch_node(bus, idx);
     if (known) {
-        /* UDP is lossy and joiners repeat their MEETs: re-announce the full
-         * known slot map on every contact so knowledge self-heals. */
-        qihse_bus_announce_known_slots(bus, node.host, node.bus_port);
+        /* UDP is lossy and joiners repeat their MEETs: re-announce the ranges
+         * WE own so knowledge self-heals. Never re-announce other nodes' ranges
+         * here — that turns this node into a rumor relay and lets a wrong view
+         * (e.g. a stale "0-4549 -> node5") outlive the authoritative owner's
+         * correction forever. */
+        qihse_bus_announce_local_slots(bus, node.host, node.bus_port);
         return;
     }
 
@@ -735,9 +698,9 @@ static void qihse_bus_handle_meet(qihse_cluster_bus_t* bus, const uint8_t* paylo
     if (qihse_cluster_topology_get_node(bus->topology, bus->local_node_index, &local)) {
         /* Introduce ourselves to the newcomer, then re-announce the slot
          * ranges WE own so the joiner can route immediately (membership
-         * gossip alone carries no slot map). */
+         * gossip alone carries no slot map). The joiner learns the rest of the
+         * map from each member's own announcement as they MEET it. */
         qihse_bus_send_meet_node(bus, &local, node.host, node.bus_port);
-        qihse_bus_announce_known_slots(bus, node.host, node.bus_port);
         qihse_bus_announce_local_slots(bus, node.host, node.bus_port);
         /* Gossip the newcomer to our other peers. */
         qihse_cluster_node_t* peers = (qihse_cluster_node_t*)malloc(sizeof(qihse_cluster_node_t) * QIHSE_CLUSTER_MAX_NODES);
