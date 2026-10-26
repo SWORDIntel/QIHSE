@@ -1,12 +1,19 @@
 # QIHSE SQLite VFS — Native C Implementation Plan
 
-> **Status: partial.** The VFS itself is implemented
-> (`persistence/qihse_sqlite_vfs.c`, `persistence/qihse_vfs_page_cache.c`,
-> `persistence/qihse_vfs_wal.c`) and has a test target
-> (`tests/test_sqlite_vfs.c`, `make test-sqlite-vfs`), but this document is
-> written as a plan and mixes built and unbuilt items without distinguishing
-> them. Treat individual sections as `planned` unless the code above shows
-> otherwise.
+> **Status: partial.** SQLite WAL mode now uses a durable `-wal` byte file
+> with version-2 I/O methods. `xShmMap`, `xShmLock`, `xShmBarrier`, and
+> `xShmUnmap`, plus database locks, delegate to SQLite's POSIX `unix` VFS on
+> a second descriptor for the same main database path. SQLite therefore owns
+> its cross-handle and cross-process WAL-index bookkeeping and recovery.
+> SQLite `-wal` is **not** routed through Marmalade: the append-only event
+> stream cannot implement truncate, checkpoint reset, or repeated writes to
+> the same byte offset. The per-open KV page cache is disabled because it
+> cannot invalidate pages changed by other connections. `qihse_vfs_wal.c`
+> remains in the build but is not used for SQLite WAL files. The design
+> sections below describe the original plan, not the active implementation.
+> Existing installations with historical `-wal.d/wal` event streams need a
+> separate migration before being opened by this version; no automatic
+> conversion is implemented. The VFS requires SQLite's `unix` VFS.
 
 > **Scope**: A production-quality, generalized SQLite Virtual File System implemented in C99 using only existing QIHSE primitives. Once registered, any program that uses SQLite — whether through `sqlite3.h`, the Python `sqlite3` module, ORMs, or the `sqlite3` CLI — routes all storage through QIHSE automatically, with zero changes to SQL code.
 
@@ -453,7 +460,7 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 | Item | Status | Notes |
 |---|---|---|
 | **Binary KV values** | Deferred | KV API is currently string-valued; page bytes are hex-encoded. `qihse_kv_set_binary` should be added to Black Hole in a follow-on PR. |
-| **Shared-memory WAL (`-shm`)** | Deferred | Multi-process WAL sharing requires a POSIX `mmap` over the SHM file with lock bytes. Deferred until Phase 5 single-process WAL is proven. |
+| **Shared-memory WAL (`-shm`)** | Implemented (POSIX) | Delegated to SQLite's `unix` VFS for mmap and cross-handle/process locking; unavailable on platforms without that VFS. |
 | **Windows** | Partial | `qihse_platform.h` provides stubs; key-file path (`/etc/qihse/keys/`) needs a Windows equivalent. |
 | **`SQLITE_IOCAP_ATOMIC_4K`** | Deferred | Would let SQLite skip journals for 4K writes, but requires OS-level atomic sector write guarantees (ZFS / ext4). |
 | **KV compaction** | Deferred | LSM flush holds full key list in RAM; background compaction needed for databases > 8 MB. Deferred to Black Hole Phase 4. |

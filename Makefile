@@ -415,6 +415,21 @@ test-machine-auth: lib
 	$(CC) $(CFLAGS) -o tests/test_machine_auth tests/test_machine_auth.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_machine_auth
 
+.PHONY: test-admin-cli test-admin-protocol test-admin-protocol-sanitize
+test-admin-protocol: lib
+	$(CC) $(CFLAGS) -o tests/test_admin_protocol tests/test_admin_protocol.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_admin_protocol
+
+test-admin-protocol-sanitize: lib
+	$(CC) $(filter-out -O3,$(CFLAGS)) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o tests/test_admin_protocol_sanitize tests/test_admin_protocol.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_admin_protocol_sanitize
+
+test-admin-cli: admin-cli test-admin-protocol
+	$(CC) $(CFLAGS) -o tests/test_qkp_admin tests/test_qkp_admin.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_qkp_admin
+
+test: test-admin-cli
+
 test-qkp-access-negative: lib
 	$(CC) $(CFLAGS) -o tests/test_qkp_access_negative tests/test_qkp_access_negative.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_qkp_access_negative

@@ -1,613 +1,305 @@
-/* qihse-admin-cli — administration client for QKP-hardened QIHSE masters.
- *
- * The masters reject cleartext RESP (pqc_require) once replication pins are
- * configured, so plain redis-cli can no longer reach them. This tool is the
- * supported operator path:
- *
- *   1. TCP connect + QKP1 post-quantum handshake (sealed channel);
- *   2. verify the server against the configured QKP trust anchor; the server
- *      maps this client identity to operator scope only when its node id and
- *      signing public key match the configured admin-peer pin;
- *   3. send one or more RESP commands inside the sealed session.
- *
- * Usage:
- *   qihse-admin-cli --host 192.168.1.91 --port 7100 \
- *       --identity-dir /etc/qihse/keys \
- *       --trusted-pub /etc/qihse/keys/qihse_dsa_pub_t420.pem \
- *       --node-id admin-t420 SET mykey "hello world"
- *
- * Exit codes: 0 ok, 2 usage/config, 3 connect/handshake, 5 command.
- * The local signing key is a privileged credential and must remain protected.
- */
-
+/* QKP-only administration client. Server pin verification and principal
+ * authorization are unchanged; every mode uses the shared native admin API. */
 #include <ctype.h>
 #include <errno.h>
-#include <netdb.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
-
 #include "qihse_qkp.h"
 
 #define ADMIN_MAX_ARGS 256u
-#define ADMIN_LINE_CAP 16384u
-
-static const char* g_host = NULL;
+static const char* g_host;
 static uint16_t g_port = 7100;
-static const char* g_identity_dir = NULL;
-static const char* g_trusted_pub = NULL;
-static const char* g_node_id = NULL;
-static const char* g_command = NULL;
-static const char* g_command_args[ADMIN_MAX_ARGS];
-static size_t g_command_argc = 0u;
-static bool g_interactive = false;
-static bool g_stdin_batch = false;
-static bool g_read_stdin_val = false;
-static bool g_strict_err = false;
+static const char* g_identity_dir;
+static const char* g_trusted_pub;
+static const char* g_node_id;
+static const char* g_user;
+static const char* g_password_env;
+static const char* g_command;
+static const char* g_args[ADMIN_MAX_ARGS];
+static size_t g_argc;
+static bool g_interactive, g_batch, g_stdin_value, g_strict;
+static bool g_json, g_resp;
+static unsigned g_timeout = 30000u;
 
 static void usage(int code) {
-    FILE* out = (code == 0) ? stdout : stderr;
-    fprintf(out,
+    fprintf(code ? stderr : stdout,
         "usage: qihse-admin-cli [options] [CMD [ARG ...]]\n"
-        "\nConnection & QKP Identity:\n"
-        "  --host, -H HOST            Target master address ($QIHSE_HOST)\n"
-        "  --port, -p PORT            Target master port (default: 7100 or $QIHSE_PORT)\n"
-        "  --trusted-pub, -t FILE     Pinned server ML-DSA public key ($QIHSE_TRUSTED_PUB)\n"
-        "  --identity-dir, -i DIR     Client identity key dir ($QIHSE_IDENTITY_DIR, ./keys, /etc/qihse/keys)\n"
-        "  --node-id, -n ID           Client node identity (default: admin-cli or $QIHSE_NODE_ID)\n"
-        "\nExecution Modes:\n"
-        "  CMD [ARG ...]              Positional RESP command and arguments (redis-cli style)\n"
-        "  --arg ARG                  Append an exact argument (repeatable, binary/whitespace safe)\n"
-        "  --command, -c \"CMD ...\"    Execute quote-aware command string\n"
-        "  -x                         Read last command argument from stdin\n"
-        "  --stdin, --batch           Execute commands line-by-line from stdin over one QKP session\n"
-        "  --interactive, --repl      Interactive shell over a persistent QKP session\n"
-        "  --fail-on-error            Exit 5 if server returns a RESP error (-ERR / -NOAUTH / -MOVED)\n"
-        "\nCluster & Admin Shortcuts:\n"
-        "  --ping                     PING\n"
-        "  --cluster-info             CLUSTER INFO\n"
-        "  --cluster-nodes            CLUSTER NODES\n"
-        "  --cluster-slots            CLUSTER SLOTS\n"
-        "  --cluster-keyslot KEY      CLUSTER KEYSLOT <key>\n"
-        "  --cluster-reclaim [LIMIT]  CLUSTER RECLAIM [limit]\n"
-        "  --cluster-moveslots R H:P  CLUSTER MOVESLOTS <first-last> <host:port>\n"
-        "  --cluster-failover         CLUSTER FAILOVER\n"
-        "  --repl-status              REPL.STATUS\n"
-        "  --info [SECTION]           INFO [section]\n"
-        "  --dbsize                   DBSIZE\n"
-        "  --save / --bgsave          SAVE / BGSAVE\n"
-        "  --help, -h                 Show this help\n"
-        "\nThe master must pin this identity with:\n"
-        "  --admin-peer-node-id ID --admin-peer-dsa-pub FILE\n");
+        "Connection (QKP only; no cleartext fallback):\n"
+        "  --host, -H HOST          $QIHSE_HOST\n"
+        "  --port, -p PORT          $QIHSE_PORT (default 7100)\n"
+        "  --identity-dir, -i DIR   $QIHSE_IDENTITY_DIR; local keys or system keys\n"
+        "  --trusted-pub, -t FILE   $QIHSE_TRUSTED_PUB; required server pin\n"
+        "  --node-id, -n ID         $QIHSE_NODE_ID (default admin-cli)\n"
+        "  --timeout-ms MS         Connect/socket wait timeout (default 30000)\n"
+        "  --user USER             AUTH principal ($QIHSE_AUTH_USER)\n"
+        "  --password-env NAME     Read AUTH password from named environment variable\n"
+        "                          Default QIHSE_AUTH_PASSWORD when --user is set\n"
+        "Execution:\n"
+        "  CMD [ARG ...]           Any server RESP2 command, arguments passed exactly\n"
+        "  --command, -c TEXT      Quote-aware command (single/double quotes, escapes)\n"
+        "  --arg ARG               Append an exact text argument, repeatable\n"
+        "  -x                      Append stdin bytes verbatim, including NUL/newlines\n"
+        "  --stdin, --batch        Commands by line; one handshake, persistent state\n"
+        "  --interactive, --repl   Persistent interactive shell (EXIT exits locally)\n"
+        "  --json                  Nested JSON replies; strings use byte/Latin-1 mapping\n"
+        "  --resp                  Exact RESP2 reply bytes, no added separators\n"
+        "  --fail-on-error         Exit 5 on any RESP error, including nested errors\n"
+        "  --                      End option parsing\n"
+        "Shortcuts:\n"
+        "  --ping | --info [SECTION] | --dbsize | --save | --bgsave\n"
+        "  --cluster-info | --cluster-nodes | --cluster-slots | --cluster-failover\n"
+        "  --cluster-keyslot KEY | --cluster-reclaim [LIMIT] | --repl-status\n"
+        "  --cluster-moveslots FIRST-LAST HOST:PORT\n"
+        "  --help, -h\n"
+        "Use COMMAND / COMMAND DOCS for server capabilities. AIMEM, USER, vector,\n"
+        "graph, search and cluster commands need no client-specific aliases.\n"
+        "Synchronous RESP2 only: no pub/sub streaming or automatic MOVED retries.\n"
+        "Exit: 0 success, 2 usage/config, 3 connection/handshake, 5 command/I/O.\n");
     exit(code);
 }
 
+static unsigned parse_uint(const char* text, unsigned max) {
+    char* end = NULL;
+    errno = 0;
+    unsigned long n = strtoul(text, &end, 10);
+    if (!*text || !isdigit((unsigned char)*text) || errno || *end || !n || n > max) {
+        fprintf(stderr, "invalid numeric option: %s\n", text);
+        usage(2);
+    }
+    return (unsigned)n;
+}
+
 static bool push_arg(const char* arg) {
-    if (g_command_argc >= ADMIN_MAX_ARGS - 1u) {
-        fprintf(stderr, "qihse-admin-cli: too many arguments (max %u)\n",
-                (unsigned)(ADMIN_MAX_ARGS - 1u));
+    if (g_argc == ADMIN_MAX_ARGS) {
+        fprintf(stderr, "too many arguments (max %u)\n", ADMIN_MAX_ARGS);
         return false;
     }
-    g_command_args[g_command_argc++] = arg;
+    g_args[g_argc++] = arg;
     return true;
 }
 
-/* Quote-aware in-place tokenizer supporting 'single', "double", and \escapes. */
-static bool parse_command_line(char* line, const char** out_argv, size_t max_args,
-                               size_t* out_argc) {
-    size_t argc = 0u;
+static bool parse_command_line(char* line, const char** argv, size_t* argc) {
+    *argc = 0u;
     char* p = line;
     while (*p) {
-        while (*p && isspace((unsigned char)*p)) p++;
+        while (isspace((unsigned char)*p)) p++;
         if (!*p || *p == '#') break;
-        if (argc >= max_args - 1u) {
-            fprintf(stderr, "qihse-admin-cli: too many arguments (max %zu)\n",
-                    max_args - 1u);
-            return false;
-        }
+        if (*argc == ADMIN_MAX_ARGS) return false;
         char* dst = p;
-        char* start = dst;
+        argv[(*argc)++] = dst;
         char quote = 0;
         while (*p) {
-            if (quote) {
-                if (*p == quote) {
-                    quote = 0;
-                    p++;
-                } else if (*p == '\\' && quote == '"' && p[1]) {
-                    p++;
-                    switch (*p) {
-                        case 'n': *dst++ = '\n'; break;
-                        case 'r': *dst++ = '\r'; break;
-                        case 't': *dst++ = '\t'; break;
-                        default:  *dst++ = *p;   break;
-                    }
-                    p++;
-                } else {
-                    *dst++ = *p++;
-                }
-            } else {
-                if (isspace((unsigned char)*p)) {
-                    p++;
-                    break;
-                }
-                if (*p == '"' || *p == '\'') {
-                    quote = *p++;
-                } else if (*p == '\\' && p[1]) {
-                    p++;
-                    *dst++ = *p++;
-                } else {
-                    *dst++ = *p++;
-                }
-            }
+            if (quote && *p == quote) { quote = 0; p++; }
+            else if (!quote && (*p == '\'' || *p == '"')) quote = *p++;
+            else if (!quote && isspace((unsigned char)*p)) { p++; break; }
+            else if (*p == '\\' && quote != '\'') {
+                p++;
+                if (!*p) return false;
+                if (quote == '"' && *p == 'n') *dst++ = '\n';
+                else if (quote == '"' && *p == 'r') *dst++ = '\r';
+                else if (quote == '"' && *p == 't') *dst++ = '\t';
+                else *dst++ = *p;
+                p++;
+            } else *dst++ = *p++;
         }
-        if (quote != 0) {
-            fprintf(stderr, "qihse-admin-cli: unterminated quote (%c)\n", quote);
-            return false;
-        }
+        if (quote) return false;
         *dst = '\0';
-        out_argv[argc++] = start;
     }
-    *out_argc = argc;
     return true;
 }
 
-static char* read_all_stdin(size_t* out_len) {
-    size_t cap = 4096u, len = 0u;
-    char* buf = (char*)malloc(cap);
+/* A bounded reader avoids executing the second half of an oversized line. */
+static char* read_input(bool line, size_t* len) {
+    size_t cap = 4096u;
+    *len = 0u;
+    char* buf = malloc(cap);
     if (!buf) return NULL;
-    for (;;) {
-        if (len + 2048u > cap) {
+    int c;
+    while ((c = fgetc(stdin)) != EOF) {
+        if (*len == QIHSE_QKP_ADMIN_MAX_BYTES) { free(buf); return NULL; }
+        if (*len + 1u == cap) {
             size_t next = cap * 2u;
-            char* grown = (char*)realloc(buf, next);
+            char* grown = realloc(buf, next);
             if (!grown) { free(buf); return NULL; }
             buf = grown;
             cap = next;
         }
-        size_t n = fread(buf + len, 1u, cap - len - 1u, stdin);
-        len += n;
-        if (n == 0u) break;
+        buf[(*len)++] = (char)c;
+        if (line && c == '\n') break;
     }
-    if (len > 0u && buf[len - 1u] == '\n') {
-        len--;
-        if (len > 0u && buf[len - 1u] == '\r') len--;
-    }
-    buf[len] = '\0';
-    if (out_len) *out_len = len;
+    if (ferror(stdin)) { free(buf); return NULL; }
+    buf[*len] = '\0';
     return buf;
 }
 
-/* ── Persistent Session Support (for --interactive and --stdin) ─────────── */
-
-static int cli_tcp_connect(const char* host, uint16_t port,
-                           char* err_buf, size_t err_cap) {
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
-        if (err_buf && err_cap)
-            snprintf(err_buf, err_cap, "getaddrinfo(%s) failed", host);
-        return -1;
+static int execute(qihse_qkp_admin_client_t* client, size_t argc,
+                   const char* const* argv, const size_t* lengths, bool auth,
+                   bool* transport_error) {
+    char error[512] = {0};
+    char* reply = NULL;
+    size_t reply_len = 0u;
+    int rc = qihse_qkp_admin_command(client, argc, argv, lengths,
+                                    &reply, &reply_len, error, sizeof(error));
+    *transport_error = rc != 0;
+    if (rc) { fprintf(stderr, "%s\n", error); return rc; }
+    if (auth) {
+        bool ok = reply_len == 5u && memcmp(reply, "+OK\r\n", 5u) == 0;
+        qihse_qkp_admin_free(reply);
+        if (!ok) fprintf(stderr, "AUTH rejected; no commands executed\n");
+        return ok ? 0 : 5;
     }
-    int fd = -1;
-    for (struct addrinfo* p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+    char* output = NULL;
+    size_t output_len = 0u;
+    bool is_error = false;
+    rc = qihse_qkp_admin_format(reply, reply_len, g_json, &output, &output_len, &is_error);
+    if (!rc) {
+        const char* data = g_resp ? reply : output;
+        size_t len = g_resp ? reply_len : output_len;
+        if (fwrite(data, 1u, len, stdout) != len || fflush(stdout) == EOF) rc = 5;
     }
-    freeaddrinfo(res);
-    if (fd < 0 && err_buf && err_cap) {
-        snprintf(err_buf, err_cap, "connect(%s:%u) failed: %s",
-                 host, (unsigned)port, strerror(errno));
-    }
-    return fd;
-}
-
-static char* cli_encode_resp(size_t argc, const char* const* argv, size_t* out_len) {
-    size_t cap = 64u;
-    for (size_t i = 0; i < argc; i++) cap += 24u + strlen(argv[i]);
-    char* buf = (char*)malloc(cap);
-    if (!buf) return NULL;
-    size_t used = 0u;
-    used += (size_t)snprintf(buf + used, cap - used, "*%zu\r\n", argc);
-    for (size_t i = 0; i < argc; i++) {
-        size_t alen = strlen(argv[i]);
-        used += (size_t)snprintf(buf + used, cap - used, "$%zu\r\n", alen);
-        memcpy(buf + used, argv[i], alen);
-        used += alen;
-        memcpy(buf + used, "\r\n", 2u);
-        used += 2u;
-    }
-    *out_len = used;
-    return buf;
-}
-
-static ssize_t cli_resp_measure(const char* p, size_t len, int depth) {
-    if (depth > 8 || len == 0u) return 0;
-    char kind = p[0];
-    if (kind == '+' || kind == '-' || kind == ':') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        return (ssize_t)(eol + 2u - p);
-    }
-    if (kind == '$') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        long long blen = strtoll(p + 1, NULL, 10);
-        if (blen < 0) return (ssize_t)(eol + 2u - p);
-        size_t body = (size_t)(eol + 2u - p);
-        size_t total = body + (size_t)blen + 2u;
-        if (total > len) return 0;
-        return (ssize_t)total;
-    }
-    if (kind == '*') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        long long count = strtoll(p + 1, NULL, 10);
-        if (count < 0) return (ssize_t)(eol + 2u - p);
-        size_t off = (size_t)(eol + 2u - p);
-        for (long long k = 0; k < count; k++) {
-            if (off >= len) return 0;
-            ssize_t sub = cli_resp_measure(p + off, len - off, depth + 1);
-            if (sub <= 0) return 0;
-            off += (size_t)sub;
-        }
-        return (ssize_t)off;
-    }
-    return 0;
-}
-
-static void cli_print_resp(const char* p, size_t len, int depth, bool* out_is_err) {
-    if (depth > 6 || len == 0u) {
-        fputs("(unparseable)\n", stdout);
-        return;
-    }
-    size_t i = 0u;
-    while (i < len) {
-        char kind = p[i];
-        if (kind == '+' || kind == '-' || kind == ':') {
-            if (kind == '-' && depth == 0 && out_is_err) *out_is_err = true;
-            size_t start = i + 1u;
-            size_t j = start;
-            while (j < len && p[j] != '\r') j++;
-            fwrite(p + start, 1u, j - start, stdout);
-            fputc('\n', stdout);
-            i = (j + 2u <= len) ? j + 2u : len;
-        } else if (kind == '$') {
-            size_t j = i + 1u;
-            while (j < len && p[j] != '\r') j++;
-            long long blen = strtoll(p + i + 1u, NULL, 10);
-            i = (j + 2u <= len) ? j + 2u : len;
-            if (blen < 0) {
-                fputs("(nil)\n", stdout);
-                continue;
-            }
-            if (i + (size_t)blen + 2u > len) {
-                fputs("(truncated)\n", stdout);
-                return;
-            }
-            fwrite(p + i, 1u, (size_t)blen, stdout);
-            fputc('\n', stdout);
-            i += (size_t)blen + 2u;
-        } else if (kind == '*') {
-            size_t j = i + 1u;
-            while (j < len && p[j] != '\r') j++;
-            long long count = strtoll(p + i + 1u, NULL, 10);
-            i = (j + 2u <= len) ? j + 2u : len;
-            if (count < 0) {
-                fputs("(nil array)\n", stdout);
-                continue;
-            }
-            for (long long k = 0; k < count; k++) {
-                if (i >= len) return;
-                ssize_t sub = cli_resp_measure(p + i, len - i, depth + 1);
-                if (sub <= 0) {
-                    fputs("(truncated)\n", stdout);
-                    return;
-                }
-                cli_print_resp(p + i, (size_t)sub, depth + 1, NULL);
-                i += (size_t)sub;
-            }
-        } else {
-            printf("(unknown reply kind %c)\n", kind);
-            return;
-        }
-    }
-}
-
-static int run_persistent_session(const char* host, uint16_t port,
-                                  const char* node_id, const char* identity_dir,
-                                  const char* trusted_pub_path, bool interactive) {
-    const char* id_dir = identity_dir;
-    if (!id_dir || !*id_dir) {
-        const char* env_dir = getenv("QIHSE_IDENTITY_DIR");
-        if (env_dir && *env_dir) id_dir = env_dir;
-        else if (access("keys/qihse_dsa_key.pem", R_OK) == 0) id_dir = "keys";
-        else id_dir = "/etc/qihse/keys";
-    }
-    char dsa_key[512], kem_key[512], kem_pub[512];
-    snprintf(dsa_key, sizeof(dsa_key), "%s/qihse_dsa_key.pem", id_dir);
-    snprintf(kem_key, sizeof(kem_key), "%s/qihse_kem_key.pem", id_dir);
-    snprintf(kem_pub, sizeof(kem_pub), "%s/qihse_kem_pub.pem", id_dir);
-    if (access(dsa_key, R_OK) != 0 || access(kem_key, R_OK) != 0 ||
-        access(kem_pub, R_OK) != 0) {
-        fprintf(stderr, "identity keys missing/unreadable in %s\n", id_dir);
-        return 2;
-    }
-    if (access(trusted_pub_path, R_OK) != 0) {
-        fprintf(stderr, "trusted-pub unreadable: %s\n", trusted_pub_path);
-        return 2;
-    }
-
-    char err_buf[512] = {0};
-    int fd = cli_tcp_connect(host, port, err_buf, sizeof(err_buf));
-    if (fd < 0) {
-        fprintf(stderr, "%s\n", err_buf[0] ? err_buf : "connect failed");
-        return 3;
-    }
-
-    const char* anchors[1] = { trusted_pub_path };
-    qihse_qkp_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.dsa_key_path = dsa_key;
-    cfg.kem_key_path = kem_key;
-    cfg.kem_pub_path = kem_pub;
-    cfg.trusted_pubs = anchors;
-    cfg.trusted_count = 1u;
-    cfg.node_id = (node_id && *node_id) ? node_id : "admin-cli";
-    cfg.require = true;
-
-    qihse_qkp_session_t* session = NULL;
-    if (qihse_qkp_client_negotiate(fd, &cfg, &session) != QIHSE_QKP_SECURE || !session) {
-        fprintf(stderr, "QKP handshake failed (server identity/keys rejected)\n");
-        close(fd);
-        return 3;
-    }
-
-    char line[ADMIN_LINE_CAP];
-    int exit_rc = 0;
-    bool is_tty = isatty(STDIN_FILENO);
-    for (;;) {
-        if (interactive && is_tty) {
-            printf("qkp %s:%u> ", host, (unsigned)port);
-            fflush(stdout);
-        }
-        if (!fgets(line, sizeof(line), stdin)) break;
-
-        const char* cargv[ADMIN_MAX_ARGS];
-        size_t cargc = 0u;
-        if (!parse_command_line(line, cargv, ADMIN_MAX_ARGS, &cargc)) {
-            if (!interactive && g_strict_err) { exit_rc = 2; break; }
-            continue;
-        }
-        if (cargc == 0u) continue;
-        if (cargc == 1u && (strcasecmp(cargv[0], "QUIT") == 0 ||
-                            strcasecmp(cargv[0], "EXIT") == 0)) {
-            break;
-        }
-
-        size_t req_len = 0u;
-        char* req = cli_encode_resp(cargc, cargv, &req_len);
-        if (!req || !qihse_qkp_send_sealed(session, fd, req, req_len)) {
-            fprintf(stderr, "command send failed\n");
-            free(req);
-            exit_rc = 5;
-            break;
-        }
-        free(req);
-
-        size_t cap = 4096u, used = 0u;
-        char* rbuf = (char*)malloc(cap);
-        if (!rbuf) { exit_rc = 5; break; }
-        bool read_ok = true;
-        for (;;) {
-            uint8_t frame[QIHSE_QKP_MAX_FRAME + 64u];
-            ssize_t n = qihse_qkp_recv_sealed(session, fd, frame, sizeof(frame));
-            if (n <= 0) { read_ok = false; break; }
-            while (used + (size_t)n + 1u > cap) {
-                size_t next = cap * 2u;
-                char* grown = (char*)realloc(rbuf, next);
-                if (!grown) { read_ok = false; break; }
-                rbuf = grown;
-                cap = next;
-            }
-            if (!read_ok) break;
-            memcpy(rbuf + used, frame, (size_t)n);
-            used += (size_t)n;
-            rbuf[used] = '\0';
-            ssize_t measured = cli_resp_measure(rbuf, used, 0);
-            if (measured > 0 && (size_t)measured == used) break;
-        }
-        if (!read_ok || used == 0u) {
-            free(rbuf);
-            fprintf(stderr, "command reply read failed\n");
-            exit_rc = 5;
-            break;
-        }
-        bool is_err = false;
-        cli_print_resp(rbuf, used, 0, &is_err);
-        fflush(stdout);
-        free(rbuf);
-        if (is_err && g_strict_err) {
-            exit_rc = 5;
-            if (!interactive) break;
-        }
-    }
-
-    qihse_qkp_session_free(session);
-    close(fd);
-    return exit_rc;
+    qihse_qkp_admin_free(output);
+    qihse_qkp_admin_free(reply);
+    *transport_error = rc != 0;
+    return rc ? rc : (is_error && g_strict ? 5 : 0);
 }
 
 int main(int argc, char** argv) {
-    const char* env_host = getenv("QIHSE_HOST");
-    if (env_host && *env_host) g_host = env_host;
+    g_host = getenv("QIHSE_HOST");
+    g_trusted_pub = getenv("QIHSE_TRUSTED_PUB");
+    g_identity_dir = getenv("QIHSE_IDENTITY_DIR");
+    g_node_id = getenv("QIHSE_NODE_ID");
+    g_user = getenv("QIHSE_AUTH_USER");
     const char* env_port = getenv("QIHSE_PORT");
-    if (env_port && *env_port) g_port = (uint16_t)atoi(env_port);
-    const char* env_pub = getenv("QIHSE_TRUSTED_PUB");
-    if (env_pub && *env_pub) g_trusted_pub = env_pub;
-    const char* env_id = getenv("QIHSE_NODE_ID");
-    if (env_id && *env_id) g_node_id = env_id;
-    else g_node_id = "admin-cli";
-
+    if (env_port && *env_port) g_port = (uint16_t)parse_uint(env_port, 65535u);
+    if (!g_node_id || !*g_node_id) g_node_id = "admin-cli";
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
-        if (strcmp(a, "--") == 0) {
-            for (int j = i + 1; j < argc; j++) {
-                if (!push_arg(argv[j])) return 2;
-            }
-            break;
-        } else if ((strcmp(a, "--host") == 0 || strcmp(a, "-H") == 0) && i + 1 < argc) {
-            g_host = argv[++i];
-        } else if ((strcmp(a, "--port") == 0 || strcmp(a, "-p") == 0) && i + 1 < argc) {
-            long p = strtol(argv[++i], NULL, 10);
-            if (p <= 0 || p > 65535) usage(2);
-            g_port = (uint16_t)p;
-        } else if ((strcmp(a, "--identity-dir") == 0 || strcmp(a, "-i") == 0) && i + 1 < argc) {
-            g_identity_dir = argv[++i];
-        } else if ((strcmp(a, "--trusted-pub") == 0 || strcmp(a, "-t") == 0) && i + 1 < argc) {
-            g_trusted_pub = argv[++i];
-        } else if ((strcmp(a, "--node-id") == 0 || strcmp(a, "-n") == 0) && i + 1 < argc) {
-            g_node_id = argv[++i];
-        } else if ((strcmp(a, "--command") == 0 || strcmp(a, "-c") == 0) && i + 1 < argc) {
-            g_command = argv[++i];
-        } else if (strcmp(a, "--arg") == 0 && i + 1 < argc) {
-            if (!push_arg(argv[++i])) return 2;
-        } else if (strcmp(a, "-x") == 0) {
-            g_read_stdin_val = true;
-        } else if (strcmp(a, "--interactive") == 0 || strcmp(a, "--repl") == 0) {
-            g_interactive = true;
-        } else if (strcmp(a, "--stdin") == 0 || strcmp(a, "--batch") == 0) {
-            g_stdin_batch = true;
-        } else if (strcmp(a, "--fail-on-error") == 0) {
-            g_strict_err = true;
-        } else if (strcmp(a, "--ping") == 0) {
-            g_command = "PING";
-        } else if (strcmp(a, "--cluster-nodes") == 0) {
-            g_command = "CLUSTER NODES";
-        } else if (strcmp(a, "--cluster-info") == 0) {
-            g_command = "CLUSTER INFO";
-        } else if (strcmp(a, "--cluster-slots") == 0) {
-            g_command = "CLUSTER SLOTS";
-        } else if (strcmp(a, "--cluster-failover") == 0) {
-            g_command = "CLUSTER FAILOVER";
-        } else if (strcmp(a, "--cluster-keyslot") == 0 && i + 1 < argc) {
-            if (!push_arg("CLUSTER") || !push_arg("KEYSLOT") || !push_arg(argv[++i])) return 2;
-        } else if (strcmp(a, "--cluster-reclaim") == 0) {
-            if (!push_arg("CLUSTER") || !push_arg("RECLAIM")) return 2;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                if (!push_arg(argv[++i])) return 2;
-            }
-        } else if (strcmp(a, "--cluster-moveslots") == 0 && i + 2 < argc) {
-            static char ms_range[64], ms_target[280];
+#define OPTION(longopt, shortopt) (strcmp(a, longopt) == 0 || strcmp(a, shortopt) == 0)
+#define VALUE() ((i + 1 < argc) ? argv[++i] : (usage(2), (char*)NULL))
+        if (OPTION("--help", "-h")) usage(0);
+        else if (OPTION("--host", "-H")) g_host = VALUE();
+        else if (OPTION("--port", "-p")) g_port = (uint16_t)parse_uint(VALUE(), 65535u);
+        else if (OPTION("--identity-dir", "-i")) g_identity_dir = VALUE();
+        else if (OPTION("--trusted-pub", "-t")) g_trusted_pub = VALUE();
+        else if (OPTION("--node-id", "-n")) g_node_id = VALUE();
+        else if (strcmp(a, "--timeout-ms") == 0) g_timeout = parse_uint(VALUE(), INT_MAX);
+        else if (strcmp(a, "--user") == 0) g_user = VALUE();
+        else if (strcmp(a, "--password-env") == 0) g_password_env = VALUE();
+        else if (OPTION("--command", "-c")) {
+            if (g_command) usage(2);
+            g_command = VALUE();
+        } else if (strcmp(a, "--arg") == 0) { if (!push_arg(VALUE())) return 2; }
+        else if (strcmp(a, "-x") == 0) g_stdin_value = true;
+        else if (OPTION("--interactive", "--repl")) g_interactive = true;
+        else if (OPTION("--stdin", "--batch")) g_batch = true;
+        else if (strcmp(a, "--fail-on-error") == 0) g_strict = true;
+        else if (strcmp(a, "--json") == 0) g_json = true;
+        else if (strcmp(a, "--resp") == 0) g_resp = true;
+        else if (strcmp(a, "--ping") == 0) { if (!push_arg("PING")) return 2; }
+        else if (strcmp(a, "--dbsize") == 0) { if (!push_arg("DBSIZE")) return 2; }
+        else if (strcmp(a, "--save") == 0) { if (!push_arg("SAVE")) return 2; }
+        else if (strcmp(a, "--bgsave") == 0) { if (!push_arg("BGSAVE")) return 2; }
+        else if (strcmp(a, "--repl-status") == 0) { if (!push_arg("REPL.STATUS")) return 2; }
+        else if (strcmp(a, "--info") == 0 || strcmp(a, "--cluster-reclaim") == 0) {
+            if (strcmp(a, "--info") == 0) { if (!push_arg("INFO")) return 2; }
+            else if (!push_arg("CLUSTER") || !push_arg("RECLAIM")) return 2;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { if (!push_arg(argv[++i])) return 2; }
+        } else if (strcmp(a, "--cluster-keyslot") == 0) {
+            if (!push_arg("CLUSTER") || !push_arg("KEYSLOT") || !push_arg(VALUE())) return 2;
+        } else if (strcmp(a, "--cluster-info") == 0 || strcmp(a, "--cluster-nodes") == 0 ||
+                   strcmp(a, "--cluster-slots") == 0 || strcmp(a, "--cluster-failover") == 0) {
+            if (!push_arg("CLUSTER") || !push_arg(a + 10)) return 2;
+        } else if (strcmp(a, "--cluster-moveslots") == 0) {
             if (!push_arg("CLUSTER") || !push_arg("MOVESLOTS")) return 2;
-            if (i + 4 < argc && strchr(argv[i + 1], '-') == NULL &&
-                strchr(argv[i + 3], ':') == NULL && argv[i + 3][0] != '-') {
-                snprintf(ms_range, sizeof(ms_range), "%s-%s", argv[i + 1], argv[i + 2]);
-                snprintf(ms_target, sizeof(ms_target), "%s:%s", argv[i + 3], argv[i + 4]);
-                if (!push_arg(ms_range) || !push_arg(ms_target)) return 2;
+            static char range[64], target[280];
+            if (i + 4 < argc && !strchr(argv[i + 1], '-') && !strchr(argv[i + 3], ':') && argv[i + 3][0] != '-') {
+                if (snprintf(range, sizeof(range), "%s-%s", argv[i + 1], argv[i + 2]) >= (int)sizeof(range) ||
+                    snprintf(target, sizeof(target), "%s:%s", argv[i + 3], argv[i + 4]) >= (int)sizeof(target)) usage(2);
+                if (!push_arg(range) || !push_arg(target)) return 2;
                 i += 4;
-            } else {
-                if (!push_arg(argv[i + 1]) || !push_arg(argv[i + 2])) return 2;
-                i += 2;
-            }
-        } else if (strcmp(a, "--repl-status") == 0) {
-            g_command = "REPL.STATUS";
-        } else if (strcmp(a, "--info") == 0) {
-            if (!push_arg("INFO")) return 2;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                if (!push_arg(argv[++i])) return 2;
-            }
-        } else if (strcmp(a, "--dbsize") == 0) {
-            g_command = "DBSIZE";
-        } else if (strcmp(a, "--save") == 0) {
-            g_command = "SAVE";
-        } else if (strcmp(a, "--bgsave") == 0) {
-            g_command = "BGSAVE";
-        } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
-            usage(0);
-        } else if (a[0] == '-') {
-            fprintf(stderr, "qihse-admin-cli: unknown or incomplete option: %s\n", a);
-            usage(2);
+            } else if (!push_arg(VALUE()) || !push_arg(VALUE())) return 2;
         } else {
-            /* Positional command + arguments: consume the rest of argv directly */
-            for (int j = i; j < argc; j++) {
-                if (!push_arg(argv[j])) return 2;
-            }
+            if (strcmp(a, "--") == 0) i++;
+            else if (*a == '-') { fprintf(stderr, "unknown option: %s\n", a); usage(2); }
+            for (; i < argc; i++) if (!push_arg(argv[i])) return 2;
             break;
         }
+#undef VALUE
+#undef OPTION
     }
-
-    if (!g_host || !g_trusted_pub) usage(2);
-
-    if (g_interactive || g_stdin_batch) {
-        return run_persistent_session(g_host, g_port, g_node_id, g_identity_dir,
-                                      g_trusted_pub, g_interactive);
+    if (!g_host || !*g_host || !g_trusted_pub || !*g_trusted_pub || (g_json && g_resp) ||
+        (g_interactive && g_batch) ||
+        ((g_interactive || g_batch) && (g_argc || g_command || g_stdin_value))) usage(2);
+    const char* password = NULL;
+    if ((g_user && *g_user) || g_password_env) {
+        if (!g_user || !*g_user) usage(2);
+        password = getenv(g_password_env ? g_password_env : "QIHSE_AUTH_PASSWORD");
+        if (!password || !*password) { fprintf(stderr, "AUTH password environment variable missing/empty\n"); return 2; }
     }
-
-    char cmdbuf[ADMIN_LINE_CAP];
     const char* cargv[ADMIN_MAX_ARGS];
-    size_t cargc = 0u;
-    if (g_command_argc > 0u) {
-        for (size_t i = 0; i < g_command_argc; i++)
-            cargv[cargc++] = g_command_args[i];
-    } else {
-        const char* cmd_str = g_command ? g_command : "PING";
-        snprintf(cmdbuf, sizeof(cmdbuf), "%s", cmd_str);
-        if (!parse_command_line(cmdbuf, cargv, ADMIN_MAX_ARGS, &cargc)) {
-            return 2;
+    size_t lengths[ADMIN_MAX_ARGS], cargc = 0u;
+    char* command_buf = NULL;
+    char* stdin_value = NULL;
+    if (g_command) {
+        if (strlen(g_command) > QIHSE_QKP_ADMIN_MAX_BYTES) return 2;
+        command_buf = strdup(g_command);
+        if (!command_buf || !parse_command_line(command_buf, cargv, &cargc)) {
+            free(command_buf); fprintf(stderr, "invalid command line\n"); return 2;
         }
     }
-
-    char* stdin_val = NULL;
-    if (g_read_stdin_val) {
-        stdin_val = read_all_stdin(NULL);
-        if (!stdin_val) {
-            fprintf(stderr, "qihse-admin-cli: failed to read stdin for -x\n");
-            return 2;
+    int rc = 2;
+    if (cargc + g_argc + (g_stdin_value ? 1u : 0u) > ADMIN_MAX_ARGS) goto done;
+    for (size_t i = 0; i < g_argc; i++) cargv[cargc++] = g_args[i];
+    if (!cargc && !g_batch && !g_interactive) cargv[cargc++] = "PING";
+    for (size_t i = 0; i < cargc; i++) lengths[i] = strlen(cargv[i]);
+    if (g_stdin_value) {
+        stdin_value = read_input(false, &lengths[cargc]);
+        if (!stdin_value) { fprintf(stderr, "stdin read failed or exceeds 64 MiB\n"); goto done; }
+        cargv[cargc++] = stdin_value;
+    }
+    qihse_qkp_admin_client_t* client = NULL;
+    char error[512] = {0};
+    rc = qihse_qkp_admin_open(g_host, g_port, g_node_id, g_identity_dir, g_trusted_pub,
+                             g_timeout, &client, error, sizeof(error));
+    if (rc) { fprintf(stderr, "%s\n", error); goto done; }
+    bool fatal = false;
+    if (password) {
+        const char* auth[] = {"AUTH", g_user, password};
+        rc = execute(client, 3u, auth, NULL, true, &fatal);
+        if (rc) goto close_client;
+    }
+    if (!g_batch && !g_interactive) rc = execute(client, cargc, cargv, lengths, false, &fatal);
+    else for (;;) {
+        if (g_interactive && isatty(STDIN_FILENO)) {
+            fprintf(stderr, "qkp %s:%u> ", g_host, (unsigned)g_port);
+            fflush(stderr);
         }
-        if (cargc >= ADMIN_MAX_ARGS - 1u) {
-            fprintf(stderr, "qihse-admin-cli: too many arguments\n");
-            free(stdin_val);
-            return 2;
+        size_t len = 0u;
+        char* line = read_input(true, &len);
+        if (!line) { fprintf(stderr, "command input failed or exceeds 64 MiB\n"); rc = 2; break; }
+        if (!len) { free(line); break; }
+        if (memchr(line, '\0', len) || !parse_command_line(line, cargv, &cargc)) {
+            fprintf(stderr, "invalid command line\n"); free(line); rc = 2;
+            if (!g_interactive) break;
+            continue;
         }
-        cargv[cargc++] = stdin_val;
+        if (!cargc) { free(line); continue; }
+        if (cargc == 1u && strcasecmp(cargv[0], "EXIT") == 0) { free(line); break; }
+        bool quit = cargc == 1u && strcasecmp(cargv[0], "QUIT") == 0;
+        int result = execute(client, cargc, cargv, NULL, false, &fatal);
+        free(line);
+        if (result) rc = result;
+        if (fatal || quit || (result && !g_interactive)) break;
     }
-
-    if (cargc == 0u) cargv[cargc++] = "PING";
-
-    char* out_text = NULL;
-    char err_buf[512] = {0};
-    int rc = qihse_qkp_admin_exec(g_host, g_port, g_node_id, g_identity_dir,
-                                  g_trusted_pub, cargc, cargv, &out_text,
-                                  err_buf, sizeof(err_buf));
-    free(stdin_val);
-    if (rc != 0) {
-        fprintf(stderr, "%s\n", err_buf[0] ? err_buf : "admin command failed");
-        qihse_qkp_admin_free(out_text);
-        return rc;
-    }
-    if (out_text) {
-        fputs(out_text, stdout);
-        bool looks_err = (strncmp(out_text, "ERR ", 4) == 0 ||
-                          strncmp(out_text, "NOAUTH ", 7) == 0 ||
-                          strncmp(out_text, "NOPERM ", 7) == 0 ||
-                          strncmp(out_text, "MOVED ", 6) == 0 ||
-                          strncmp(out_text, "ASK ", 4) == 0 ||
-                          strncmp(out_text, "CLUSTERDOWN ", 12) == 0 ||
-                          strncmp(out_text, "WRONGTYPE ", 10) == 0);
-        qihse_qkp_admin_free(out_text);
-        if (g_strict_err && looks_err) return 5;
-    }
-    return 0;
+close_client:
+    qihse_qkp_admin_close(client);
+done:
+    free(stdin_value);
+    free(command_buf);
+    return rc;
 }

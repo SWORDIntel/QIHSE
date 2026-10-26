@@ -217,6 +217,29 @@ int qihse_qkp_admin_exec(const char* host, uint16_t port,
                          char** out_text,
                          char* err_buf, size_t err_cap);
 
+/* Persistent, synchronous RESP2 client. No automatic retries or redirects:
+ * a failed write may already have executed. One caller per client at a time.
+ * timeout_ms bounds connect and each socket I/O wait (not DNS resolution).
+ * Transport/protocol errors invalidate the client; close it after any such error.
+ * A RESP error is a valid reply (return 0); callers inspect its leading '-'. */
+#define QIHSE_QKP_ADMIN_MAX_BYTES (64u * 1024u * 1024u)
+typedef struct qihse_qkp_admin_client qihse_qkp_admin_client_t;
+int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
+                         const char* identity_dir, const char* trusted_pub_path,
+                         unsigned timeout_ms, qihse_qkp_admin_client_t** out,
+                         char* err_buf, size_t err_cap);
+int qihse_qkp_admin_command(qihse_qkp_admin_client_t* client, size_t argc,
+                            const char* const* argv, const size_t* lengths,
+                            char** reply, size_t* reply_len,
+                            char* err_buf, size_t err_cap);
+void qihse_qkp_admin_close(qihse_qkp_admin_client_t* client);
+
+/* Validate and format exactly one RESP2 reply. Text retains legacy presentation;
+ * JSON preserves arrays/null/errors (errors are {"error":...}). JSON strings
+ * map bytes to U+0000..U+00FF; encode parsed strings as Latin-1 to recover bytes.
+ * Returned buffers have an explicit length and an extra terminating NUL. */
+int qihse_qkp_admin_format(const char* reply, size_t reply_len, bool json,
+                           char** output, size_t* output_len, bool* is_error);
 void qihse_qkp_admin_free(void* p);
 
 #ifdef __cplusplus

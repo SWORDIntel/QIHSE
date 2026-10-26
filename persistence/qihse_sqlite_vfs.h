@@ -6,8 +6,8 @@
  *
  *   Durable I/O   : qihse_file_t  (persistence/qihse_file_posix.c)
  *   Page cache    : qihse_kv_store_t  (src/black_hole/qihse_kv_store.c)
- *   WAL frames    : qihse_event_stream_t  (src/marmalade/qihse_event_stream.c)
- *   File locking  : qihse_lock_t  (persistence/qihse_file_posix.c)
+ *   SQLite WAL    : durable -wal file (qihse_file_t)
+ *   WAL SHM/locks : SQLite's POSIX unix VFS on the same database path
  *   Encryption    : qihse_pqc_ctx_t  (persistence/qihse_pqc_crypto.c) [opt]
  *
  * Usage
@@ -28,9 +28,8 @@
  *
  * Thread-safety
  * -------------
- *   SQLite serialises all calls to a single database-file handle, so no
- *   internal mutex is required.  KV-store and event-stream handles are
- *   created per open file and never shared.
+ *   SQLite serialises calls to a single handle. The POSIX VFS coordinates
+ *   database and WAL shared-memory locks across handles and processes.
  *
  * Standards
  * ---------

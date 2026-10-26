@@ -135,6 +135,10 @@ static void usage(const char* program) {
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --dir PATH        persistence directory (default /var/lib/qihse or $QIHSE_DATA_DIR)\n"
             "  --require-auth    require AUTH per connection\n"
+            "  --pqc-require     require pinned QKP and --require-auth\n"
+            "  --pqc-identity-dir DIR  server KEM/DSA key directory\n"
+            "  --pqc-trusted-pub FILE  trusted service client DSA public key\n"
+            "  --pqc-node-id ID  signed server node identity\n"
             "  --password PASS   operator password (prefer QIHSE_OPERATOR_PASSWORD env; avoid argv exposure)\n"
             "                     AIMEM service password: QIHSE_AIMEM_SERVICE_PASSWORD\n"
             "                     stable service ID: QIHSE_AIMEM_SERVICE_USER_ID (default 65000)\n"
@@ -173,6 +177,12 @@ int main(int argc, char** argv) {
     options.port = 6379;
     options.bind = "127.0.0.1";
     options.aimem_service_user_id = UINT32_MAX;
+    const char* pqc_identity_dir = NULL;
+    const char* pqc_trusted_pub = NULL;
+    const char* pqc_node_id = NULL;
+    bool pqc_require = false;
+    char pqc_dsa[1024], pqc_kem[1024], pqc_kem_pub[1024];
+    const char* pqc_trusted[1];
     const char* data_dir = getenv("QIHSE_DATA_DIR");
     if (!data_dir) data_dir = "/var/lib/qihse";
 
@@ -187,6 +197,10 @@ int main(int argc, char** argv) {
         else if (strcmp(arg, "--channel-classif") == 0 && has_next) options.channel_classification = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--channel-sci") == 0 && has_next) options.channel_sci = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--require-auth") == 0) options.require_auth = true;
+        else if (strcmp(arg, "--pqc-require") == 0) pqc_require = true;
+        else if (strcmp(arg, "--pqc-identity-dir") == 0 && has_next) pqc_identity_dir = argv[++i];
+        else if (strcmp(arg, "--pqc-trusted-pub") == 0 && has_next) pqc_trusted_pub = argv[++i];
+        else if (strcmp(arg, "--pqc-node-id") == 0 && has_next) pqc_node_id = argv[++i];
         else if (strcmp(arg, "--password") == 0 && has_next) {
             if (!standalone_secret_take_argv(credentials.operator_password,
                     &credentials.operator_set, argv[++i])) {
@@ -207,6 +221,21 @@ int main(int argc, char** argv) {
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n", arg);
             usage(argv[0]);
+            standalone_credentials_clear(&credentials);
+            return 2;
+        }
+    }
+
+    if (pqc_require || pqc_identity_dir || pqc_trusted_pub || pqc_node_id) {
+        if (!pqc_require || !options.require_auth || !pqc_identity_dir || !*pqc_identity_dir ||
+            !pqc_trusted_pub || !*pqc_trusted_pub || !pqc_node_id || !*pqc_node_id ||
+            strlen(pqc_node_id) > QIHSE_QKP_NODE_ID_LEN ||
+            snprintf(pqc_dsa, sizeof(pqc_dsa), "%s/qihse_dsa_key.pem", pqc_identity_dir) >= (int)sizeof(pqc_dsa) ||
+            snprintf(pqc_kem, sizeof(pqc_kem), "%s/qihse_kem_key.pem", pqc_identity_dir) >= (int)sizeof(pqc_kem) ||
+            snprintf(pqc_kem_pub, sizeof(pqc_kem_pub), "%s/qihse_kem_pub.pem", pqc_identity_dir) >= (int)sizeof(pqc_kem_pub) ||
+            access(pqc_dsa, R_OK) || access(pqc_kem, R_OK) || access(pqc_kem_pub, R_OK) ||
+            access(pqc_trusted_pub, R_OK)) {
+            fprintf(stderr, "pinned QKP requires --require-auth, all --pqc-* options and readable keys\n");
             standalone_credentials_clear(&credentials);
             return 2;
         }
@@ -369,6 +398,17 @@ int main(int argc, char** argv) {
     config.advertise_address = options.bind;
     config.auth_required = options.require_auth;
     config.aimem_service_user_id = options.aimem_service_user_id;
+    if (pqc_require) {
+        pqc_trusted[0] = pqc_trusted_pub;
+        config.pqc.require = true;
+        config.pqc.dsa_key_path = pqc_dsa;
+        config.pqc.kem_key_path = pqc_kem;
+        config.pqc.kem_pub_path = pqc_kem_pub;
+        config.pqc.node_id = pqc_node_id;
+        config.pqc.trusted_pubs = pqc_trusted;
+        config.pqc.trusted_count = 1u;
+        /* Never map this pin to operator; AUTH AIMEM_SERVICE is required. */
+    }
     config.pubsub_log_directory = options.pubsub_dir;
     config.channel_classification = options.channel_classification;
     config.channel_sci = options.channel_sci;

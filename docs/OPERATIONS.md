@@ -452,7 +452,7 @@ Deploy/verify with `scripts/cluster_replica_deploy.sh` (unit generation +
 
 #### Operator Access on Hardened Masters (`qihse-admin-cli`)
 
-`pqc_require` masters reject password AUTH and MACHINEAUTH tokens are
+`pqc_require` masters reject cleartext connections; MACHINEAUTH tokens are
 scoped to the agent namespace (`t:<tenant>/machine/<id>/*`), so operator
 access uses a **pinned administrator identity** — the same mutual-pin
 mechanism as replication, mapped to the system operator:
@@ -472,6 +472,10 @@ The pinned identity maps to the system operator (`QIHSE_RESP_AUTH_QKP_ADMIN`,
 full command scope). Health probes in `cluster_rolling_restart.sh` and
 `install_qihse.sh` use this path, falling back to redis-cli password AUTH
 only for non-hardened deployments.
+
+See [Admin CLI and SDK](ADMIN_CLI.md) for persistent sessions, explicit user
+AUTH inside QKP, binary stdin, structured replies, and generic AIMEM/data/admin
+commands. These options never downgrade the transport or bypass user clearance.
 
 #### Slot Migration Durability (COPY → PERSIST → SWITCH → GC)
 

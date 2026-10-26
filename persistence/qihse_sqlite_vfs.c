@@ -31,7 +31,6 @@
 
 #include "qihse_sqlite_vfs.h"
 #include "qihse_vfs_page_cache.h"
-#include "qihse_vfs_wal.h"
 #include "qihse_file.h"
 #include "qihse_platform.h"
 
@@ -105,6 +104,10 @@ static int qihse_io_xCheckReservedLock(sqlite3_file*, int* pResOut);
 static int qihse_io_xFileControl(sqlite3_file*, int op, void* pArg);
 static int qihse_io_xSectorSize(sqlite3_file*);
 static int qihse_io_xDeviceCharacteristics(sqlite3_file*);
+static int qihse_io_xShmMap(sqlite3_file*, int, int, int, void volatile**);
+static int qihse_io_xShmLock(sqlite3_file*, int, int, int);
+static void qihse_io_xShmBarrier(sqlite3_file*);
+static int qihse_io_xShmUnmap(sqlite3_file*, int);
 
 /* ── Per-file handle ─────────────────────────────────────────────────────── */
 
@@ -115,7 +118,7 @@ typedef struct qihse_vfs_file {
     qihse_lock_t            lock_file;   /* fcntl advisory lock sidecar */
 
     qihse_vfs_page_cache_t* cache;       /* KV page cache (main DB only) */
-    qihse_vfs_wal_t*        wal;         /* Marmalade WAL (WAL file only) */
+    sqlite3_file*           shm_file;    /* POSIX VFS owns WAL shm and lock state */
 
     int                     open_flags;  /* Saved SQLITE_OPEN_* flags */
     int                     lock_level;  /* Current SQLite lock level */
@@ -129,13 +132,12 @@ typedef struct qihse_vfs_file {
 
     char                    path[QIHSE_VFS_MAX_PATH];
     char                    lock_path[QIHSE_VFS_MAX_PATH + 8]; /* path + ".qlock" */
-    char                    wal_dir[QIHSE_VFS_MAX_PATH + 4];   /* path + ".d"     */
 } qihse_vfs_file_t;
 
-/* ── I/O methods dispatch table (iVersion=1; WAL SHM added in iVersion=2) ── */
+/* ── I/O methods dispatch table ── */
 
 static const sqlite3_io_methods qihse_io_methods = {
-    .iVersion               = 1,
+    .iVersion               = 2,
     .xClose                 = qihse_io_xClose,
     .xRead                  = qihse_io_xRead,
     .xWrite                 = qihse_io_xWrite,
@@ -148,6 +150,10 @@ static const sqlite3_io_methods qihse_io_methods = {
     .xFileControl           = qihse_io_xFileControl,
     .xSectorSize            = qihse_io_xSectorSize,
     .xDeviceCharacteristics = qihse_io_xDeviceCharacteristics,
+    .xShmMap                = qihse_io_xShmMap,
+    .xShmLock               = qihse_io_xShmLock,
+    .xShmBarrier            = qihse_io_xShmBarrier,
+    .xShmUnmap              = qihse_io_xShmUnmap,
 };
 
 /* ── VFS descriptor ──────────────────────────────────────────────────────── */
@@ -240,17 +246,17 @@ static int qihse_io_xClose(sqlite3_file* pFile)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
 
+    int rc = SQLITE_OK;
+    if (f->shm_file) {
+        rc = f->shm_file->pMethods->xClose(f->shm_file);
+        sqlite3_free(f->shm_file);
+        f->shm_file = NULL;
+    }
     if (f->cache) {
         qihse_vfs_cache_flush(f->cache);
         qihse_vfs_cache_destroy(f->cache);
         f->cache = NULL;
     }
-    if (f->wal) {
-        qihse_vfs_wal_flush(f->wal);
-        qihse_vfs_wal_destroy(f->wal);
-        f->wal = NULL;
-    }
-
     qihse_lock_release(&f->lock_file);
     qihse_file_close(&f->data_file);
 
@@ -258,7 +264,8 @@ static int qihse_io_xClose(sqlite3_file* pFile)
     if (f->encrypt) qihse_pqc_destroy(&f->pqc);
 #endif
 
-    return SQLITE_OK;
+    if (f->open_flags & SQLITE_OPEN_DELETEONCLOSE) unlink(f->path);
+    return rc;
 }
 
 /* ── xRead ───────────────────────────────────────────────────────────────── */
@@ -271,19 +278,6 @@ static int qihse_io_xRead(sqlite3_file* pFile, void* buf,
 
     size_t          size = (size_t)iAmt;
     uint64_t        off  = (uint64_t)iOfst;
-
-    /* ── WAL file path ── */
-    if (f->is_wal) {
-        if (f->wal) {
-            bool ok = qihse_vfs_wal_read(f->wal, iOfst, (uint8_t*)buf, size);
-            if (!ok) {
-                memset(buf, 0, size);
-                return SQLITE_IOERR_SHORT_READ;
-            }
-            return SQLITE_OK;
-        }
-        /* Fall through to direct file read for WAL without Marmalade handle. */
-    }
 
     /* ── Main DB: try cache first ── */
     if (f->is_main_db && f->cache && f->cache->page_size > 0u) {
@@ -321,22 +315,15 @@ static int qihse_io_xRead(sqlite3_file* pFile, void* buf,
     } else
 #endif
     {
-        if (!qihse_file_pread_exact(&f->data_file, buf, size, off)) {
-            if (errno == ESPIPE || errno == EIO) {
-                memset(buf, 0, size);
-                return SQLITE_IOERR_SHORT_READ;
-            }
-            /*
-             * A short read at EOF (new file) should zero-fill and report
-             * SQLITE_IOERR_SHORT_READ so SQLite treats it as a fresh page.
-             */
-            uint64_t file_sz = 0u;
-            qihse_file_size(&f->data_file, &file_sz);
-            if (off >= file_sz) {
-                memset(buf, 0, size);
-                return SQLITE_IOERR_SHORT_READ;
-            }
-            return SQLITE_IOERR_READ;
+        size_t done = 0;
+        while (done < size) {
+            ssize_t n = pread(f->data_file.fd, (uint8_t*)buf + done,
+                              size - done, (off_t)(off + done));
+            if (n > 0) { done += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) return SQLITE_IOERR_READ;
+            memset((uint8_t*)buf + done, 0, size - done);
+            return SQLITE_IOERR_SHORT_READ;
         }
     }
 
@@ -359,14 +346,6 @@ static int qihse_io_xWrite(sqlite3_file* pFile, const void* buf,
 
     size_t   size = (size_t)iAmt;
     uint64_t off  = (uint64_t)iOfst;
-
-    /* ── WAL file: route through Marmalade ── */
-    if (f->is_wal && f->wal) {
-        if (!qihse_vfs_wal_append(f->wal, iOfst, (const uint8_t*)buf, size)) {
-            return SQLITE_IOERR_WRITE;
-        }
-        return SQLITE_OK;
-    }
 
     /* ── Main DB: detect page size from first write ── */
     if (f->is_main_db && f->cache && iOfst == 0 && f->cache->page_size == 0u) {
@@ -440,11 +419,6 @@ static int qihse_io_xSync(sqlite3_file* pFile, int flags)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
 
-    if (f->wal) {
-        if (!qihse_vfs_wal_flush(f->wal)) return SQLITE_IOERR_FSYNC;
-        return SQLITE_OK;
-    }
-
     if (f->cache) qihse_vfs_cache_flush(f->cache);
 
     int rc;
@@ -453,7 +427,20 @@ static int qihse_io_xSync(sqlite3_file* pFile, int flags)
     } else {
         do { rc = fsync(f->data_file.fd); } while (rc != 0 && errno == EINTR);
     }
-    return (rc == 0) ? SQLITE_OK : SQLITE_IOERR_FSYNC;
+    if (rc != 0) return SQLITE_IOERR_FSYNC;
+    if (f->is_wal) {
+        char dir[QIHSE_VFS_MAX_PATH];
+        memcpy(dir, f->path, strlen(f->path) + 1);
+        char* slash = strrchr(dir, '/');
+        if (slash) {
+            if (slash == dir) slash[1] = '\0';
+            else *slash = '\0';
+        } else {
+            strcpy(dir, ".");
+        }
+        if (!qihse_fsync_dir(dir)) return SQLITE_IOERR_FSYNC;
+    }
+    return SQLITE_OK;
 }
 
 /* ── xFileSize ───────────────────────────────────────────────────────────── */
@@ -461,11 +448,6 @@ static int qihse_io_xSync(sqlite3_file* pFile, int flags)
 static int qihse_io_xFileSize(sqlite3_file* pFile, sqlite3_int64* pSize)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
-
-    if (f->wal) {
-        *pSize = (sqlite3_int64)qihse_vfs_wal_size(f->wal);
-        return SQLITE_OK;
-    }
 
     if (f->cache && f->cache->file_size > 0u) {
         *pSize = (sqlite3_int64)f->cache->file_size;
@@ -487,6 +469,7 @@ static int qihse_io_xLock(sqlite3_file* pFile, int eLock)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
 
+    if (f->shm_file) return f->shm_file->pMethods->xLock(f->shm_file, eLock);
     if (eLock <= f->lock_level) return SQLITE_OK;
     if (f->lock_file.file.fd < 0) return SQLITE_IOERR_LOCK;
 
@@ -528,6 +511,7 @@ static int qihse_io_xUnlock(sqlite3_file* pFile, int eLock)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
 
+    if (f->shm_file) return f->shm_file->pMethods->xUnlock(f->shm_file, eLock);
     if (eLock >= f->lock_level) return SQLITE_OK;
     if (f->lock_file.file.fd < 0) return SQLITE_OK;
 
@@ -554,6 +538,8 @@ static int qihse_io_xUnlock(sqlite3_file* pFile, int eLock)
 static int qihse_io_xCheckReservedLock(sqlite3_file* pFile, int* pResOut)
 {
     qihse_vfs_file_t* f = (qihse_vfs_file_t*)pFile;
+    if (f->shm_file)
+        return f->shm_file->pMethods->xCheckReservedLock(f->shm_file, pResOut);
     *pResOut = 0;
 
     /* If we already hold reserved or higher, report as reserved. */
@@ -626,6 +612,33 @@ static int qihse_io_xDeviceCharacteristics(sqlite3_file* pFile)
     return SQLITE_IOCAP_SAFE_APPEND | SQLITE_IOCAP_SEQUENTIAL;
 }
 
+/* SQLite's unix VFS supplies process-aware shm mapping and locking.  Sharing
+ * only the main-db shm sidecar preserves its cross-handle lock bookkeeping. */
+static int qihse_io_xShmMap(sqlite3_file* p, int page, int size, int extend,
+                             void volatile** out)
+{
+    sqlite3_file* s = ((qihse_vfs_file_t*)p)->shm_file;
+    return s ? s->pMethods->xShmMap(s, page, size, extend, out) : SQLITE_IOERR_SHMMAP;
+}
+
+static int qihse_io_xShmLock(sqlite3_file* p, int offset, int count, int flags)
+{
+    sqlite3_file* s = ((qihse_vfs_file_t*)p)->shm_file;
+    return s ? s->pMethods->xShmLock(s, offset, count, flags) : SQLITE_IOERR_SHMLOCK;
+}
+
+static void qihse_io_xShmBarrier(sqlite3_file* p)
+{
+    sqlite3_file* s = ((qihse_vfs_file_t*)p)->shm_file;
+    if (s) s->pMethods->xShmBarrier(s);
+}
+
+static int qihse_io_xShmUnmap(sqlite3_file* p, int deleteFlag)
+{
+    sqlite3_file* s = ((qihse_vfs_file_t*)p)->shm_file;
+    return s ? s->pMethods->xShmUnmap(s, deleteFlag) : SQLITE_IOERR_SHMMAP;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * VFS-level methods
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -688,14 +701,14 @@ static int qihse_vfs_xOpen(sqlite3_vfs* pVfs,
         return SQLITE_CANTOPEN;
     }
 
-    /* ── Advisory lock sidecar ── */
-    if (!qihse_lock_acquire(&f->lock_file, f->lock_path)) {
-        /*
-         * qihse_lock_acquire uses F_SETLK (non-blocking).  If another process
-         * holds an exclusive lock, return SQLITE_BUSY not SQLITE_CANTOPEN.
-         */
+    /* Do not take an exclusive lock at open: SQLite acquires and releases
+     * database byte-range locks as transactions progress. */
+    /* The main DB uses unix locking; WAL bytes are guarded by its SHM locks.
+     * Neither file should require a writable legacy lock sidecar to open. */
+    if (!(flags & (SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_WAL)) &&
+        !qihse_file_open(&f->lock_file.file, f->lock_path,
+                         O_RDWR | O_CREAT | O_CLOEXEC, 0600)) {
         qihse_file_close(&f->data_file);
-        if (errno == EACCES || errno == EAGAIN) return SQLITE_BUSY;
         return SQLITE_CANTOPEN;
     }
 
@@ -705,14 +718,21 @@ static int qihse_vfs_xOpen(sqlite3_vfs* pVfs,
     f->is_wal      = (flags & SQLITE_OPEN_WAL) != 0;
 
     if (f->is_main_db) {
-        f->cache = qihse_vfs_cache_create();
-        if (!f->cache) {
-            qihse_lock_release(&f->lock_file);
-            qihse_file_close(&f->data_file);
-            return SQLITE_NOMEM;
+        /* Per-handle page caches are not coherent across connections and can
+         * return stale pages after a WAL checkpoint. Read the durable file. */
+        sqlite3_vfs* unix_vfs = sqlite3_vfs_find("unix");
+        if (!unix_vfs) goto wal_fail;
+        f->shm_file = sqlite3_malloc(unix_vfs->szOsFile);
+        if (!f->shm_file) goto wal_fail;
+        memset(f->shm_file, 0, unix_vfs->szOsFile);
+        int shm_flags = flags & (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE |
+                                  SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB);
+        if (unix_vfs->xOpen(unix_vfs, f->path, f->shm_file,
+                            shm_flags, NULL) != SQLITE_OK) {
+            sqlite3_free(f->shm_file);
+            f->shm_file = NULL;
+            goto wal_fail;
         }
-        /* Seed file_size from the actual on-disk size. */
-        qihse_file_size(&f->data_file, &f->cache->file_size);
 
 #ifdef QIHSE_VFS_ENCRYPT
         /*
@@ -752,27 +772,15 @@ static int qihse_vfs_xOpen(sqlite3_vfs* pVfs,
 #endif /* QIHSE_VFS_ENCRYPT */
     }
 
-    if (f->is_wal) {
-        /* Derive the Marmalade log directory from the WAL file path. */
-        if (!path_append(f->wal_dir, sizeof(f->wal_dir), f->path, ".d"))
-            goto wal_fail;
-
-        /* Ensure the directory exists. */
-        qihse_mkdir_p(f->wal_dir, 0700);
-
-        f->wal = qihse_vfs_wal_create(f->wal_dir);
-        if (!f->wal) {
-            wal_fail:
-            qihse_lock_release(&f->lock_file);
-            qihse_file_close(&f->data_file);
-            return SQLITE_CANTOPEN;
-        }
-    }
-
     f->base.pMethods = &qihse_io_methods;
     if (pOutFlags) *pOutFlags = flags;
-
     return SQLITE_OK;
+
+wal_fail:
+    qihse_file_close(&f->lock_file.file);
+    qihse_file_close(&f->data_file);
+    return SQLITE_CANTOPEN;
+
 }
 
 /* ── xDelete ─────────────────────────────────────────────────────────────── */

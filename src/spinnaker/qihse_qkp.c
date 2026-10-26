@@ -2,6 +2,10 @@
 #include "qihse_pqc_crypto.h"
 #include "qihse_endian.h"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
@@ -833,7 +837,13 @@ void qihse_qkp_admin_free(void* p) {
     free(p);
 }
 
-static int qkp_admin_tcp_connect(const char* host, uint16_t port,
+struct qihse_qkp_admin_client {
+    qihse_qkp_session_t* session;
+    int fd;
+    bool failed;
+};
+
+static int qkp_admin_tcp_connect(const char* host, uint16_t port, unsigned timeout_ms,
                                  char* err_buf, size_t err_cap) {
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
@@ -849,9 +859,25 @@ static int qkp_admin_tcp_connect(const char* host, uint16_t port,
     }
     int fd = -1;
     for (struct addrinfo* p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        fd = socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC, p->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        int flags = fcntl(fd, F_GETFL, 0);
+        bool ok = flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+        int rc = ok ? connect(fd, p->ai_addr, p->ai_addrlen) : -1;
+        if (ok && rc < 0 && errno == EINPROGRESS) {
+            struct pollfd pollfd = {fd, POLLOUT, 0};
+            int error = 0;
+            socklen_t error_len = sizeof(error);
+            rc = poll(&pollfd, 1, (int)timeout_ms);
+            ok = rc > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) == 0 && error == 0;
+            if (!ok) errno = error ? error : ETIMEDOUT;
+        } else {
+            ok = ok && rc == 0;
+        }
+        struct timeval tv = {(time_t)(timeout_ms / 1000u), (suseconds_t)(timeout_ms % 1000u) * 1000};
+        if (ok && fcntl(fd, F_SETFL, flags) == 0 &&
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -864,15 +890,22 @@ static int qkp_admin_tcp_connect(const char* host, uint16_t port,
 }
 
 static char* qkp_admin_encode_resp(size_t argc, const char* const* argv,
-                                   size_t* out_len) {
+                                   const size_t* lengths, size_t* out_len) {
+    if (!argc || argc > 65536u || !argv) return NULL;
     size_t cap = 64u;
-    for (size_t i = 0; i < argc; i++) cap += 16u + strlen(argv[i]);
+    for (size_t i = 0; i < argc; i++) {
+        if (!argv[i]) return NULL;
+        size_t n = lengths ? lengths[i] : strlen(argv[i]);
+        if (cap > QIHSE_QKP_ADMIN_MAX_BYTES - 32u ||
+            n > QIHSE_QKP_ADMIN_MAX_BYTES - cap - 32u) return NULL;
+        cap += 32u + n;
+    }
     char* buf = (char*)malloc(cap);
     if (!buf) return NULL;
     size_t used = 0u;
     used += (size_t)snprintf(buf + used, cap - used, "*%zu\r\n", argc);
     for (size_t i = 0; i < argc; i++) {
-        size_t alen = strlen(argv[i]);
+        size_t alen = lengths ? lengths[i] : strlen(argv[i]);
         used += (size_t)snprintf(buf + used, cap - used, "$%zu\r\n", alen);
         memcpy(buf + used, argv[i], alen);
         used += alen;
@@ -883,49 +916,46 @@ static char* qkp_admin_encode_resp(size_t argc, const char* const* argv,
     return buf;
 }
 
-/* Recursively measure one complete RESP value at p[0..len). Returns the
- * number of bytes consumed, or 0 if the buffer does not yet hold a complete
- * value (or the value is malformed / nested too deeply). Handles simple,
- * error, integer, bulk and nested-array replies, which is what SCAN/HGETALL
- * and friends return. */
+/* 0 = incomplete, -1 = invalid; never parse unbounded/NUL-terminated input. */
 static ssize_t qkp_admin_resp_measure(const char* p, size_t len, int depth) {
-    if (depth > 8 || len == 0u) return 0;
+    if (depth > 64) return -1;
+    if (!len) return 0;
     char kind = p[0];
-    if (kind == '+' || kind == '-' || kind == ':') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        return (ssize_t)(eol + 2u - p);
+    if (!strchr("+-:$*", kind) || !kind) return -1;
+    const char* eol = memchr(p, '\r', len);
+    size_t header = eol ? (size_t)(eol - p) : len;
+    if (memchr(p, '\n', header)) return -1;
+    if (!eol || header + 1u == len) return 0;
+    if (eol[1] != '\n') return -1;
+    size_t body = header + 2u;
+    if (kind == '+' || kind == '-') return (ssize_t)body;
+    bool negative = header > 1u && p[1] == '-';
+    size_t start = negative ? 2u : 1u;
+    if (start == header) return -1;
+    uint64_t value = 0u;
+    uint64_t max = kind == ':' ? (uint64_t)INT64_MAX + (negative ? 1u : 0u) : QIHSE_QKP_ADMIN_MAX_BYTES;
+    for (size_t i = start; i < header; i++) {
+        unsigned digit = (unsigned char)p[i] - (unsigned)'0';
+        if (digit > 9u || value > (max - digit) / 10u) return -1;
+        value = value * 10u + digit;
     }
+    if (kind == ':') return (ssize_t)body;
+    if (negative) return header == 3u && value == 1u ? (ssize_t)body : -1;
     if (kind == '$') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        long long blen = strtoll(p + 1, NULL, 10);
-        if (blen < 0) return (ssize_t)(eol + 2u - p); /* null bulk */
-        size_t body = (size_t)(eol + 2u - p);
-        size_t total = body + (size_t)blen + 2u;
+        if (body > QIHSE_QKP_ADMIN_MAX_BYTES - 2u ||
+            value > QIHSE_QKP_ADMIN_MAX_BYTES - body - 2u) return -1;
+        size_t total = body + (size_t)value + 2u;
         if (total > len) return 0;
-        return (ssize_t)total;
+        return p[total - 2u] == '\r' && p[total - 1u] == '\n' ? (ssize_t)total : -1;
     }
-    if (kind == '*') {
-        const char* eol = (const char*)memchr(p, '\r', len);
-        if (!eol || eol + 1u >= p + len || eol[1] != '\n') return 0;
-        long long count = strtoll(p + 1, NULL, 10);
-        if (count < 0) return (ssize_t)(eol + 2u - p); /* null array */
-        size_t off = (size_t)(eol + 2u - p);
-        for (long long k = 0; k < count; k++) {
-            if (off >= len) return 0;
-            ssize_t sub = qkp_admin_resp_measure(p + off, len - off, depth + 1);
-            if (sub <= 0) return 0;
-            off += (size_t)sub;
-        }
-        return (ssize_t)off;
+    if (value > QIHSE_QKP_ADMIN_MAX_BYTES / 3u) return -1;
+    size_t off = body;
+    for (uint64_t i = 0; i < value; i++) {
+        ssize_t sub = qkp_admin_resp_measure(p + off, len - off, depth + 1);
+        if (sub <= 0) return sub;
+        off += (size_t)sub;
     }
-    return 0;
-}
-
-static bool qkp_admin_resp_complete(const char* p, size_t len, int depth) {
-    ssize_t consumed = qkp_admin_resp_measure(p, len, depth);
-    return consumed > 0 && (size_t)consumed == len;
+    return (ssize_t)off;
 }
 
 static ssize_t qkp_admin_recv_reply(qihse_qkp_session_t* s, int fd, char** out) {
@@ -937,9 +967,12 @@ static ssize_t qkp_admin_recv_reply(qihse_qkp_session_t* s, int fd, char** out) 
         uint8_t* frame = (uint8_t*)malloc(QIHSE_QKP_MAX_FRAME + 64u);
         if (!frame) { free(buf); return -1; }
         ssize_t n = qihse_qkp_recv_sealed(s, fd, frame, QIHSE_QKP_MAX_FRAME + 64u);
-        if (n <= 0) { free(frame); free(buf); return -1; }
+        if (n <= 0 || (size_t)n > QIHSE_QKP_ADMIN_MAX_BYTES - used) {
+            free(frame); free(buf); return -1;
+        }
         while (used + (size_t)n + 1u > cap) {
-            size_t next = cap * 2u;
+            size_t next = cap > QIHSE_QKP_ADMIN_MAX_BYTES / 2u ?
+                QIHSE_QKP_ADMIN_MAX_BYTES + 1u : cap * 2u;
             char* grown = (char*)realloc(buf, next);
             if (!grown) { free(frame); free(buf); return -1; }
             buf = grown;
@@ -949,7 +982,12 @@ static ssize_t qkp_admin_recv_reply(qihse_qkp_session_t* s, int fd, char** out) 
         free(frame);
         used += (size_t)n;
         buf[used] = '\0';
-        if (qkp_admin_resp_complete(buf, used, 0)) break;
+        ssize_t measured = qkp_admin_resp_measure(buf, used, 0);
+        if (measured < 0 || (measured > 0 && (size_t)measured != used)) {
+            free(buf); return -1;
+        }
+        if (measured > 0) break;
+        if (used == QIHSE_QKP_ADMIN_MAX_BYTES) { free(buf); return -1; }
     }
     *out = buf;
     return (ssize_t)used;
@@ -959,14 +997,16 @@ typedef struct {
     char* data;
     size_t len;
     size_t cap;
+    bool failed;
 } qkp_strbuf_t;
 
 static void qkp_sb_append(qkp_strbuf_t* sb, const char* s, size_t n) {
+    if (sb->failed) return;
     if (sb->len + n + 1u > sb->cap) {
         size_t next = sb->cap ? sb->cap * 2u : 256u;
         while (next < sb->len + n + 1u) next *= 2u;
         char* grown = (char*)realloc(sb->data, next);
-        if (!grown) return;
+        if (!grown) { sb->failed = true; return; }
         sb->data = grown;
         sb->cap = next;
     }
@@ -976,7 +1016,7 @@ static void qkp_sb_append(qkp_strbuf_t* sb, const char* s, size_t n) {
 }
 
 static void qkp_format_resp(qkp_strbuf_t* sb, const char* p, size_t len, int depth) {
-    if (depth > 6 || len == 0u) {
+    if (depth > 64 || len == 0u) {
         qkp_sb_append(sb, "(unparseable)\n", 14u);
         return;
     }
@@ -1044,17 +1084,93 @@ static void qkp_format_resp(qkp_strbuf_t* sb, const char* p, size_t len, int dep
     }
 }
 
-int qihse_qkp_admin_exec(const char* host, uint16_t port,
-                         const char* node_id,
-                         const char* identity_dir,
-                         const char* trusted_pub_path,
-                         size_t argc, const char* const* argv,
-                         char** out_text,
+static void qkp_json_string(qkp_strbuf_t* sb, const char* p, size_t len) {
+    qkp_sb_append(sb, "\"", 1u);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c < 32u || c >= 127u || c == '"' || c == '\\') {
+            char escaped[7];
+            snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)c);
+            qkp_sb_append(sb, escaped, 6u);
+        } else qkp_sb_append(sb, p + i, 1u);
+    }
+    qkp_sb_append(sb, "\"", 1u);
+}
+
+/* Only called after validating the complete reply. */
+static void qkp_json_value(qkp_strbuf_t* sb, const char* p, size_t len, int depth,
+                            bool* is_error) {
+    const char* eol = memchr(p, '\r', len);
+    size_t body = (size_t)(eol - p) + 2u;
+    if (*p == '-' || *p == '+') {
+        if (*p == '-') { *is_error = true; qkp_sb_append(sb, "{\"error\":", 9u); }
+        qkp_json_string(sb, p + 1u, body - 3u);
+        if (*p == '-') qkp_sb_append(sb, "}", 1u);
+        return;
+    }
+    long long count = strtoll(p + 1u, NULL, 10);
+    if (*p == ':') {
+        char number[32];
+        int n = snprintf(number, sizeof(number), "%lld", count);
+        qkp_sb_append(sb, number, (size_t)n);
+    } else if (count < 0) qkp_sb_append(sb, "null", 4u);
+    else if (*p == '$') qkp_json_string(sb, p + body, (size_t)count);
+    else {
+        qkp_sb_append(sb, "[", 1u);
+        for (long long i = 0; i < count; i++) {
+            if (i) qkp_sb_append(sb, ",", 1u);
+            ssize_t n = qkp_admin_resp_measure(p + body, len - body, depth + 1);
+            qkp_json_value(sb, p + body, (size_t)n, depth + 1, is_error);
+            body += (size_t)n;
+        }
+        qkp_sb_append(sb, "]", 1u);
+    }
+}
+
+static bool qkp_resp_has_error(const char* p, size_t len, int depth) {
+    if (*p == '-') return true;
+    if (*p != '*') return false;
+    long long count = strtoll(p + 1u, NULL, 10);
+    size_t off = (size_t)((const char*)memchr(p, '\r', len) - p) + 2u;
+    for (long long i = 0; i < count; i++) {
+        ssize_t n = qkp_admin_resp_measure(p + off, len - off, depth + 1);
+        if (qkp_resp_has_error(p + off, (size_t)n, depth + 1)) return true;
+        off += (size_t)n;
+    }
+    return false;
+}
+
+int qihse_qkp_admin_format(const char* reply, size_t reply_len, bool json,
+                           char** output, size_t* output_len, bool* is_error) {
+    if (output) *output = NULL;
+    if (output_len) *output_len = 0u;
+    if (is_error) *is_error = false;
+    if (!reply || !reply_len || reply_len > QIHSE_QKP_ADMIN_MAX_BYTES ||
+        !output || !output_len ||
+        qkp_admin_resp_measure(reply, reply_len, 0) != (ssize_t)reply_len) return 5;
+    qkp_strbuf_t sb = {0};
+    bool error = qkp_resp_has_error(reply, reply_len, 0);
+    if (json) {
+        qkp_json_value(&sb, reply, reply_len, 0, &error);
+        qkp_sb_append(&sb, "\n", 1u);
+    } else qkp_format_resp(&sb, reply, reply_len, 0);
+    if (!sb.data) sb.data = strdup("");
+    if (sb.failed || !sb.data) { free(sb.data); return 5; }
+    *output = sb.data;
+    *output_len = sb.len;
+    if (is_error) *is_error = error;
+    return 0;
+}
+
+int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
+                         const char* identity_dir, const char* trusted_pub_path,
+                         unsigned timeout_ms, qihse_qkp_admin_client_t** out,
                          char* err_buf, size_t err_cap) {
-    if (out_text) *out_text = NULL;
+    if (out) *out = NULL;
     if (err_buf && err_cap) err_buf[0] = '\0';
     if (!host || !*host || !trusted_pub_path || !*trusted_pub_path ||
-        argc == 0u || !argv || !out_text) {
+        !port || !out || !timeout_ms || timeout_ms > INT_MAX ||
+        (node_id && strlen(node_id) > QIHSE_QKP_NODE_ID_LEN)) {
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "invalid arguments");
         return 2;
     }
@@ -1070,9 +1186,12 @@ int qihse_qkp_admin_exec(const char* host, uint16_t port,
         }
     }
     char dsa_key[512], kem_key[512], kem_pub[512];
-    snprintf(dsa_key, sizeof(dsa_key), "%s/qihse_dsa_key.pem", id_dir);
-    snprintf(kem_key, sizeof(kem_key), "%s/qihse_kem_key.pem", id_dir);
-    snprintf(kem_pub, sizeof(kem_pub), "%s/qihse_kem_pub.pem", id_dir);
+    if (snprintf(dsa_key, sizeof(dsa_key), "%s/qihse_dsa_key.pem", id_dir) >= (int)sizeof(dsa_key) ||
+        snprintf(kem_key, sizeof(kem_key), "%s/qihse_kem_key.pem", id_dir) >= (int)sizeof(kem_key) ||
+        snprintf(kem_pub, sizeof(kem_pub), "%s/qihse_kem_pub.pem", id_dir) >= (int)sizeof(kem_pub)) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "identity path too long");
+        return 2;
+    }
     if (access(dsa_key, R_OK) != 0 || access(kem_key, R_OK) != 0 ||
         access(kem_pub, R_OK) != 0) {
         if (err_buf && err_cap)
@@ -1084,7 +1203,7 @@ int qihse_qkp_admin_exec(const char* host, uint16_t port,
             snprintf(err_buf, err_cap, "trusted-pub unreadable: %s", trusted_pub_path);
         return 2;
     }
-    int fd = qkp_admin_tcp_connect(host, port, err_buf, err_cap);
+    int fd = qkp_admin_tcp_connect(host, port, timeout_ms, err_buf, err_cap);
     if (fd < 0) return 3;
 
     const char* anchors[1] = { trusted_pub_path };
@@ -1107,33 +1226,78 @@ int qihse_qkp_admin_exec(const char* host, uint16_t port,
         return 3;
     }
 
-    size_t clen = 0u;
-    char* creq = qkp_admin_encode_resp(argc, argv, &clen);
-    if (!creq || !qihse_qkp_send_sealed(session, fd, creq, clen)) {
-        if (err_buf && err_cap) snprintf(err_buf, err_cap, "command send failed");
-        free(creq);
+    qihse_qkp_admin_client_t* client = calloc(1u, sizeof(*client));
+    if (!client) {
         qihse_qkp_session_free(session);
         close(fd);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "out of memory");
         return 5;
     }
-    free(creq);
-
-    char* reply = NULL;
-    ssize_t n = qkp_admin_recv_reply(session, fd, &reply);
-    qihse_qkp_session_free(session);
-    close(fd);
-    if (n <= 0 || !reply) {
-        free(reply);
-        if (err_buf && err_cap) snprintf(err_buf, err_cap, "command reply read failed");
-        return 5;
-    }
-
-    qkp_strbuf_t sb = {0};
-    qkp_format_resp(&sb, reply, (size_t)n, 0);
-    free(reply);
-    if (!sb.data) {
-        sb.data = strdup("");
-    }
-    *out_text = sb.data;
+    client->session = session;
+    client->fd = fd;
+    *out = client;
     return 0;
+}
+
+void qihse_qkp_admin_close(qihse_qkp_admin_client_t* client) {
+    if (!client) return;
+    qihse_qkp_session_free(client->session);
+    close(client->fd);
+    free(client);
+}
+
+int qihse_qkp_admin_command(qihse_qkp_admin_client_t* client, size_t argc,
+                            const char* const* argv, const size_t* lengths,
+                            char** reply, size_t* reply_len,
+                            char* err_buf, size_t err_cap) {
+    if (reply) *reply = NULL;
+    if (reply_len) *reply_len = 0u;
+    if (err_buf && err_cap) err_buf[0] = '\0';
+    if (!client || client->failed || !reply || !reply_len) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "invalid or failed client");
+        return 2;
+    }
+    size_t request_len = 0u;
+    char* request = qkp_admin_encode_resp(argc, argv, lengths, &request_len);
+    if (!request) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "invalid/oversized command or allocation failure");
+        return 2;
+    }
+    bool sent = qihse_qkp_send_sealed(client->session, client->fd, request, request_len);
+    free(request);
+    ssize_t n = sent ? qkp_admin_recv_reply(client->session, client->fd, reply) : -1;
+    if (n <= 0) {
+        client->failed = true;
+        shutdown(client->fd, SHUT_RDWR);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "command %s failed (transport, timeout, or invalid RESP); not retried", sent ? "reply" : "send");
+        return 5;
+    }
+    *reply_len = (size_t)n;
+    return 0;
+}
+
+int qihse_qkp_admin_exec(const char* host, uint16_t port, const char* node_id,
+                         const char* identity_dir, const char* trusted_pub_path,
+                         size_t argc, const char* const* argv, char** out_text,
+                         char* err_buf, size_t err_cap) {
+    if (out_text) *out_text = NULL;
+    if (err_buf && err_cap) err_buf[0] = '\0';
+    if (!out_text || !argc || !argv) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "invalid arguments");
+        return 2;
+    }
+    qihse_qkp_admin_client_t* client = NULL;
+    int rc = qihse_qkp_admin_open(host, port, node_id, identity_dir, trusted_pub_path,
+                                 30000u, &client, err_buf, err_cap);
+    if (rc) return rc;
+    char* reply = NULL;
+    size_t reply_len = 0u, output_len = 0u;
+    rc = qihse_qkp_admin_command(client, argc, argv, NULL, &reply, &reply_len, err_buf, err_cap);
+    qihse_qkp_admin_close(client);
+    if (!rc) {
+        rc = qihse_qkp_admin_format(reply, reply_len, false, out_text, &output_len, NULL);
+        if (rc && err_buf && err_cap) snprintf(err_buf, err_cap, "reply formatting failed");
+    }
+    free(reply);
+    return rc;
 }

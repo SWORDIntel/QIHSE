@@ -24,6 +24,7 @@ Typical use:
 """
 
 import ctypes
+import json
 import os
 import subprocess
 from typing import List, Optional
@@ -126,9 +127,38 @@ class ClusterAdmin:
             raise ValueError("command must contain one or more string arguments")
         return self._run(host, port, trusted_pub, command[0], *command[1:])
 
+    def session(self, host: str, port: int, trusted_pub: str, *,
+                user: Optional[str] = None, password: Optional[str] = None,
+                timeout_ms: int = 30000):
+        """Open one pinned QKP session; optional AUTH selects a user principal.
+
+        Requires the current native library and readable identity keys. No sudo,
+        subprocess or legacy transport fallback can silently drop session state.
+        """
+        if not self.is_native:
+            raise QihseAdminError("persistent sessions require the native QKP library")
+        return QKPAdminSession(self._lib, host, port, self.node_id,
+                               self.identity_dir, self._pub_path(trusted_pub),
+                               user=user, password=password, timeout_ms=timeout_ms)
+
+    def execute_typed(self, host: str, port: int, trusted_pub: str, *command,
+                      user: Optional[str] = None, password: Optional[str] = None,
+                      timeout_ms: int = 30000):
+        """Return bytes/int/None/nested lists; raise on actual RESP errors.
+
+        Unlike legacy execute(), accepts binary arguments and preserves empty
+        strings, newlines, nulls and nested arrays. All server commands, including
+        AIMEM and capability discovery, use this same authenticated path.
+        """
+        with self.session(host, port, trusted_pub, user=user, password=password,
+                          timeout_ms=timeout_ms) as session:
+            return session.execute(*command)
+
     def _run_native(self, host: str, port: int, trusted_pub: str,
                     command: str, *args: str) -> str:
         full_args = (command,) + args
+        if any("\x00" in arg for arg in full_args):
+            raise ValueError("legacy text API cannot encode NUL; use execute_typed")
         c_argv = (ctypes.c_char_p * len(full_args))(
             *(a.encode("utf-8") for a in full_args)
         )
@@ -205,8 +235,12 @@ class ClusterAdmin:
             cmd.extend(("--arg", argument))
         if self.sudo:
             cmd = ["sudo"] + cmd
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=self._child_env())
+        # Legacy calls use the pinned identity, just like the native path;
+        # ambient CLI AUTH defaults must not silently select another principal.
+        env = (self._child_env() or os.environ).copy()
+        env.pop("QIHSE_AUTH_USER", None)
+        env.pop("QIHSE_AUTH_PASSWORD", None)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if proc.returncode != 0:
             raise QihseAdminError(
                 f"{command} failed (exit {proc.returncode})",
@@ -798,3 +832,122 @@ class ClusterOps:
 
     def watchdog(self) -> str:
         return self._run_script("cluster_watchdog.sh")
+
+
+class QKPAdminSession:
+    """Synchronous, single-caller QKP session. Use as a context manager.
+
+    No automatic replay, reconnect or MOVED/ASK following. AUTH is never replaced
+    with an operator identity when rejected. Raw replies are available for adapters
+    that need RESP framing rather than the typed execute() result.
+    """
+
+    def __init__(self, lib, host, port, node_id, identity_dir, trusted_pub, *,
+                 user=None, password=None, timeout_ms=30000):
+        self._lib = lib
+        self._client = ctypes.c_void_p()
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("port must be in 1..65535")
+        if not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 2147483647:
+            raise ValueError("timeout_ms must be in 1..2147483647")
+        if (user is None) != (password is None):
+            raise ValueError("user and password must be supplied together")
+        config = (host, node_id, identity_dir, trusted_pub)
+        if any(not isinstance(s, str) or not s or "\u0000" in s for s in config):
+            raise ValueError("connection arguments must be nonempty NUL-free strings")
+        try:
+            open_fn = lib.qihse_qkp_admin_open
+            command_fn = lib.qihse_qkp_admin_command
+            close_fn = lib.qihse_qkp_admin_close
+            format_fn = lib.qihse_qkp_admin_format
+        except AttributeError as exc:
+            raise QihseAdminError("native library lacks persistent admin API; rebuild libqihse") from exc
+        open_fn.argtypes = [ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
+                            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint,
+                            ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t]
+        open_fn.restype = ctypes.c_int
+        command_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                               ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t),
+                               ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+                               ctypes.c_char_p, ctypes.c_size_t]
+        command_fn.restype = ctypes.c_int
+        close_fn.argtypes = [ctypes.c_void_p]
+        close_fn.restype = None
+        format_fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_bool,
+                              ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+                              ctypes.POINTER(ctypes.c_bool)]
+        format_fn.restype = ctypes.c_int
+        error = ctypes.create_string_buffer(512)
+        rc = open_fn(host.encode(), port, node_id.encode(), identity_dir.encode(),
+                     trusted_pub.encode(), timeout_ms, ctypes.byref(self._client), error, len(error))
+        if rc:
+            raise QihseAdminError(error.value.decode("utf-8", "replace"), exit_code=rc)
+        if user is not None:
+            try:
+                if self.execute_resp("AUTH", user, password) != b"+OK\r\n":
+                    raise QihseAdminError("AUTH rejected", exit_code=5)
+            except BaseException:
+                self.close()
+                raise
+
+    def close(self):
+        if self._client.value:
+            self._lib.qihse_qkp_admin_close(self._client)
+            self._client = ctypes.c_void_p()
+
+    def __enter__(self):
+        if not self._client.value:
+            raise QihseAdminError("session is closed")
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def execute_resp(self, *command):
+        """Return exact RESP bytes, including error replies; str args use UTF-8."""
+        if not self._client.value:
+            raise QihseAdminError("session is closed")
+        if not command or any(not isinstance(a, (str, bytes)) for a in command):
+            raise ValueError("command requires str or bytes arguments")
+        args = tuple(a.encode("utf-8") if isinstance(a, str) else a for a in command)
+        argv = (ctypes.c_char_p * len(args))(*args)
+        lengths = (ctypes.c_size_t * len(args))(*(len(a) for a in args))
+        reply = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        error = ctypes.create_string_buffer(512)
+        rc = self._lib.qihse_qkp_admin_command(self._client, len(args), argv, lengths,
+                                              ctypes.byref(reply), ctypes.byref(size), error, len(error))
+        try:
+            if rc:
+                if rc == 5:
+                    self.close()
+                raise QihseAdminError(error.value.decode("utf-8", "replace"), exit_code=rc)
+            return ctypes.string_at(reply, size.value)
+        finally:
+            self._lib.qihse_qkp_admin_free(reply)
+
+    def execute(self, *command):
+        """Return bytes/int/None/list, raising on errors even inside arrays."""
+        reply = self.execute_resp(*command)
+        output = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        error = ctypes.c_bool()
+        rc = self._lib.qihse_qkp_admin_format(reply, len(reply), True,
+                                             ctypes.byref(output), ctypes.byref(size), ctypes.byref(error))
+        try:
+            if rc:
+                raise QihseAdminError("invalid RESP reply or formatting failure", exit_code=rc)
+            value = json.loads(ctypes.string_at(output, size.value))
+        finally:
+            self._lib.qihse_qkp_admin_free(output)
+
+        def convert(item):
+            if isinstance(item, dict):
+                raise QihseAdminError(item["error"], exit_code=5)
+            if isinstance(item, list):
+                return [convert(child) for child in item]
+            if isinstance(item, str):
+                return item.encode("latin-1")
+            return item
+
+        return convert(value)
