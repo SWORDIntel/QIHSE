@@ -477,6 +477,20 @@ See [Admin CLI and SDK](ADMIN_CLI.md) for persistent sessions, explicit user
 AUTH inside QKP, binary stdin, structured replies, and generic AIMEM/data/admin
 commands. These options never downgrade the transport or bypass user clearance.
 
+For a native rolling update, build with `./scripts/build-native.sh --auto`, then
+build the daemon and admin CLI targets in the same checkout. Verify the pinned
+commit and run `make test-admin-protocol test-sqlite-vfs` followed by the actual
+`./test-sqlite-vfs` executable. `make test-admin-cli` additionally needs the
+standalone server binary and ONNX development headers; a cluster-only build
+host may not have these, so run that isolated integration suite on a host with
+ONNX installed before the rollout. The native rolling script's node entries
+have fixed source/build paths. If a host has a source export without Git
+metadata, do not pull into it: create a separate checkout at the verified
+commit and deploy its native outputs with timestamped binary/library backups.
+Restart one non-seed node at a time; after each restart verify pinned QKP PING,
+3/3 cluster members and full 0–16383 coverage from `CLUSTER SLOTS` before
+advancing. Check replica units and retain the backups for rollback.
+
 #### Slot Migration Durability (COPY → PERSIST → SWITCH → GC)
 
 `CLUSTER MOVESLOTS` (and the brain's `--brain-act` re-home) moves a
