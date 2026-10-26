@@ -214,6 +214,7 @@ static void test_wal_reopen_and_concurrent_handles(void) {
 
 int main() {
     char qdd[] = "build/test_sqlite_vfs_XXXXXX";
+    TEST_ASSERT(mkdir("build", 0700) == 0 || errno == EEXIST);
     TEST_ASSERT(mkdtemp(qdd) != NULL);
     char data_dir[PATH_MAX];
     TEST_ASSERT(realpath(qdd, data_dir) != NULL);

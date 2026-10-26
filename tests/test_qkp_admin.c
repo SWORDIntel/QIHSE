@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <assert.h>
+#include <errno.h>
 #include <ftw.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@ static int remove_entry(const char* path, const struct stat* st, int kind, struc
 
 int main(void) {
     char root[] = "build/test_admin_XXXXXX";
+    assert(mkdir("build", 0700) == 0 || errno == EEXIST);
     assert(mkdtemp(root));
     char data[256], client[256], server_keys[256];
     snprintf(data, sizeof(data), "%s/data", root);
