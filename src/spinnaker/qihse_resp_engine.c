@@ -15925,6 +15925,15 @@ void qihse_resp_server_config_init(qihse_resp_server_config_t* config) {
     config->enable_uwp_bridge = true;
 }
 
+/* Failover failback hook: reuse the migration handoff (pinned QKP, durable
+ * transfer before ownership flips, journaled on both ends). */
+static int qihse_resp_failback_cb(void* user_data, uint16_t first, uint16_t last,
+                                  uint16_t target_index, char* err, size_t err_cap) {
+    uint64_t moved = 0, collected = 0;
+    return qihse_cluster_handoff_range((qihse_resp_server_t*)user_data, first, last,
+                                       target_index, &moved, &collected, err, err_cap);
+}
+
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
     if (!supplied || supplied->max_request_bytes < 64u || supplied->max_request_bytes > (size_t)INT_MAX || supplied->max_clients == 0) {
         errno = EINVAL;
@@ -16185,6 +16194,11 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         fo_cfg.bus = server->bus;
         fo_cfg.local_node_index = local;
         fo_cfg.single_coordinator = false;
+        /* A successor that took a returned owner's ranges hands them back over
+         * the same COPY -> PERSIST -> SWITCH path as CLUSTER MOVESLOTS, so the
+         * writes it accepted while serving them reach the owner. */
+        fo_cfg.failback_fn = qihse_resp_failback_cb;
+        fo_cfg.failback_user_data = server;
         server->failover = qihse_cluster_failover_create(&fo_cfg);
         server->owns_failover = server->failover != NULL;
         /* The coordinator retains this exact bus. Install the callback in

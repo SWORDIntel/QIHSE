@@ -2,6 +2,7 @@
 #include "qihse_cluster_bus.h"
 #include "qihse_platform.h"
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -16,6 +17,21 @@ static uint64_t fo_now_ms(void) {
 #include <pthread.h>
 #endif
 
+#define FO_FAILBACK_STABLE_MS_DEFAULT 3000u
+#define FO_FAILBACK_POLL_MS_DEFAULT 1000u
+#define FO_LEDGER_MAX 1024u
+
+/* One range this node took over through the sharded fallback and still owes
+ * back to its original owner. */
+typedef struct {
+    uint16_t failed_index;
+    uint16_t start, end;
+    uint32_t attempts;
+    uint64_t healthy_since_ms;   /* 0 = owner not currently healthy */
+    uint64_t next_attempt_ms;
+    bool done;
+} fo_ledger_entry_t;
+
 struct qihse_cluster_failover {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
@@ -24,7 +40,23 @@ struct qihse_cluster_failover {
     uint64_t failover_events;
     uint64_t last_attempt_ms;
     pthread_mutex_t lock;
+
+    /* Failback. ledger_lock is a LEAF lock (never held across a call out), so
+     * it cannot invert against `lock` or the bus lock. */
+    qihse_cluster_failback_fn failback_fn;
+    void* failback_user;
+    uint32_t stable_ms;
+    uint32_t poll_ms;
+    pthread_mutex_t ledger_lock;
+    fo_ledger_entry_t ledger[FO_LEDGER_MAX];
+    size_t ledger_count;
+    uint64_t failbacks;
+    pthread_t worker;
+    bool worker_started;
+    int stop;
 };
+
+static void* fo_failback_main(void* arg);
 
 qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_failover_config_t* config) {
     if (!config || !config->topology) return NULL;
@@ -34,15 +66,39 @@ qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_fail
     fo->bus = config->bus;
     fo->local_node_index = config->local_node_index;
     fo->single_coordinator = config->single_coordinator;
+    fo->failback_fn = config->failback_fn;
+    fo->failback_user = config->failback_user_data;
+    fo->stable_ms = config->failback_stable_ms ? config->failback_stable_ms
+                                               : FO_FAILBACK_STABLE_MS_DEFAULT;
+    fo->poll_ms = config->failback_poll_ms ? config->failback_poll_ms
+                                           : FO_FAILBACK_POLL_MS_DEFAULT;
     if (pthread_mutex_init(&fo->lock, NULL) != 0) {
         free(fo);
         return NULL;
+    }
+    if (pthread_mutex_init(&fo->ledger_lock, NULL) != 0) {
+        pthread_mutex_destroy(&fo->lock);
+        free(fo);
+        return NULL;
+    }
+    if (fo->failback_fn) {
+        if (pthread_create(&fo->worker, NULL, fo_failback_main, fo) == 0) {
+            fo->worker_started = true;
+        } else {
+            /* No worker means no failback; failover itself still works. */
+            fo->failback_fn = NULL;
+        }
     }
     return fo;
 }
 
 void qihse_cluster_failover_destroy(qihse_cluster_failover_t* fo) {
     if (!fo) return;
+    if (fo->worker_started) {
+        __atomic_store_n(&fo->stop, 1, __ATOMIC_RELEASE);
+        pthread_join(fo->worker, NULL);
+    }
+    pthread_mutex_destroy(&fo->ledger_lock);
     pthread_mutex_destroy(&fo->lock);
     free(fo);
 }
@@ -93,33 +149,54 @@ static uint16_t fo_find_coordinator(const qihse_cluster_topology_t* topology) {
     return coordinator;
 }
 
-/* Sharded-cluster fallback successor: the healthy primary with the LONGEST
- * CONTINUOUS PRESENCE, excluding the failed node. Same single-exit reasoning
- * as fo_find_coordinator. */
+/* Sharded-cluster fallback successor: the healthy PRIMARY with the smallest
+ * node ID, excluding the failed node.
+ *
+ * The choice must be IDENTICAL on every node that observes the failure, or each
+ * survivor nominates a different successor and they all claim the range at once.
+ * Node IDs are the only cluster-wide stable identity: topology indexes are
+ * assigned in each node's own upsert order, and uptime is each node's local
+ * observation. An earlier revision ranked by uptime and gave the LOCAL node an
+ * unbeatable score, so every survivor chose itself: during a rolling restart
+ * the survivors raced conflicting takeovers of the same range. Same
+ * single-exit reasoning as fo_find_coordinator. */
 static uint16_t fo_pick_fallback_successor(qihse_cluster_failover_t* fo,
                                            uint16_t failed_node_index, uint64_t now) {
+    (void)now;
     qihse_cluster_node_t* nodes = (qihse_cluster_node_t*)malloc(
         QIHSE_CLUSTER_MAX_NODES * sizeof(qihse_cluster_node_t));
     if (!nodes) return QIHSE_CLUSTER_NODE_NONE;
     size_t count = qihse_cluster_topology_nodes(fo->topology, nodes, QIHSE_CLUSTER_MAX_NODES);
-    uint64_t best_uptime = 0;
-    uint16_t best = QIHSE_CLUSTER_NODE_NONE;
+    size_t best = count; /* index into nodes[], count = none */
     for (size_t i = 0; i < count; i++) {
         if (nodes[i].index == failed_node_index) continue;
         if (nodes[i].role != QIHSE_CLUSTER_NODE_PRIMARY || !nodes[i].healthy) continue;
-        uint64_t first_seen = 0;
-        uint64_t uptime = 0;
-        if (fo->bus && qihse_cluster_bus_peer_first_seen(fo->bus, nodes[i].index, &first_seen) && first_seen > 0)
-            uptime = now > first_seen ? now - first_seen : 0;
-        /* Our own presence counts too (we are a live successor candidate) */
-        if (nodes[i].index == fo->local_node_index) uptime = UINT64_MAX / 2u;
-        if (uptime > best_uptime || (uptime == best_uptime && best == QIHSE_CLUSTER_NODE_NONE)) {
-            best_uptime = uptime;
-            best = nodes[i].index;
+        if (best == count || strcmp(nodes[i].id, nodes[best].id) < 0) best = i;
+    }
+    uint16_t chosen = best == count ? QIHSE_CLUSTER_NODE_NONE : nodes[best].index;
+    free(nodes);
+    return chosen;
+}
+
+/* Remember a range this node took over so it can be handed back. */
+static void fo_ledger_record(qihse_cluster_failover_t* fo, uint16_t failed,
+                             uint16_t start, uint16_t end) {
+    pthread_mutex_lock(&fo->ledger_lock);
+    for (size_t i = 0; i < fo->ledger_count; i++) {
+        fo_ledger_entry_t* e = &fo->ledger[i];
+        if (!e->done && e->failed_index == failed && e->start == start && e->end == end) {
+            pthread_mutex_unlock(&fo->ledger_lock);
+            return;
         }
     }
-    free(nodes);
-    return best;
+    if (fo->ledger_count < FO_LEDGER_MAX) {
+        fo_ledger_entry_t* e = &fo->ledger[fo->ledger_count++];
+        memset(e, 0, sizeof(*e));
+        e->failed_index = failed;
+        e->start = start;
+        e->end = end;
+    }
+    pthread_mutex_unlock(&fo->ledger_lock);
 }
 
 bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
@@ -135,6 +212,12 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
      * continuous presence. A failed/unhealthy successor is never chosen. */
     if (replica.role != QIHSE_CLUSTER_NODE_REPLICA && replica.role != QIHSE_CLUSTER_NODE_PRIMARY) return false;
     if (!replica.healthy) return false;
+
+    /* A successor that was ALREADY a primary is the sharded fallback (no
+     * replica held this data): that takeover is the one failback undoes. A
+     * dedicated replica promoted here carries the data and the old primary
+     * rejoins as its replica, so it is not ledgered. */
+    bool fallback_takeover = replica.role == QIHSE_CLUSTER_NODE_PRIMARY;
 
     /* Promote the successor to primary */
     replica.role = QIHSE_CLUSTER_NODE_PRIMARY;
@@ -153,6 +236,8 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
         if (ranges[i].owner_index == failed_primary_index) {
             qihse_cluster_topology_assign_range(fo->topology, ranges[i].start, ranges[i].end, replica_index);
             if (fo->bus) qihse_cluster_bus_broadcast_slot_update(fo->bus, ranges[i].start, ranges[i].end, replica_index);
+            if (fallback_takeover && fo->failback_fn && replica_index == fo->local_node_index)
+                fo_ledger_record(fo, failed_primary_index, ranges[i].start, ranges[i].end);
         }
     }
     free(ranges);
@@ -245,4 +330,124 @@ void qihse_cluster_failover_on_fail_cb(qihse_cluster_topology_t* topology,
 
 uint64_t qihse_cluster_failover_events(const qihse_cluster_failover_t* fo) {
     return fo ? __atomic_load_n(&fo->failover_events, __ATOMIC_ACQUIRE) : 0u;
+}
+
+/* ── failback ────────────────────────────────────────────────────────────── */
+
+static bool fo_slot_is_ours(const qihse_cluster_failover_t* fo, uint32_t slot) {
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_slot_state_t state = QIHSE_CLUSTER_SLOT_STABLE;
+    return qihse_cluster_topology_get_slot(fo->topology, (uint16_t)slot, &owner, &state, NULL) &&
+           owner == fo->local_node_index && state == QIHSE_CLUSTER_SLOT_STABLE;
+}
+
+/* One pass over the ledger: for every entry whose owner has been continuously
+ * healthy long enough, hand the slots we STILL own back to it. */
+static void fo_failback_pass(qihse_cluster_failover_t* fo) {
+    uint64_t now = fo_now_ms();
+    pthread_mutex_lock(&fo->ledger_lock);
+    size_t n = fo->ledger_count;
+    pthread_mutex_unlock(&fo->ledger_lock);
+
+    for (size_t i = 0; i < n && !__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE); i++) {
+        fo_ledger_entry_t e;
+        pthread_mutex_lock(&fo->ledger_lock);
+        e = fo->ledger[i];
+        pthread_mutex_unlock(&fo->ledger_lock);
+        if (e.done) continue;
+
+        qihse_cluster_node_t owner;
+        bool healthy = qihse_cluster_topology_get_node(fo->topology, e.failed_index, &owner) &&
+                       owner.healthy;
+        pthread_mutex_lock(&fo->ledger_lock);
+        /* Require CONTINUOUS health: a flapping node must not trigger a bulk
+         * transfer that its next blip would immediately invalidate. */
+        if (!healthy) fo->ledger[i].healthy_since_ms = 0;
+        else if (fo->ledger[i].healthy_since_ms == 0) fo->ledger[i].healthy_since_ms = now;
+        e = fo->ledger[i];
+        pthread_mutex_unlock(&fo->ledger_lock);
+        if (!healthy || now - e.healthy_since_ms < fo->stable_ms || now < e.next_attempt_ms)
+            continue;
+
+        /* Hand back only what we still own: the range may have been split or
+         * re-homed (operator, brain) since the takeover. */
+        bool any_ours = false, all_ok = true;
+        uint32_t s = e.start;
+        while (s <= e.end) {
+            if (!fo_slot_is_ours(fo, s)) { s++; continue; }
+            uint32_t r = s;
+            while (r + 1u <= e.end && fo_slot_is_ours(fo, r + 1u)) r++;
+            any_ours = true;
+            char err[256];
+            err[0] = '\0';
+            int rc = fo->failback_fn(fo->failback_user, (uint16_t)s, (uint16_t)r,
+                                     e.failed_index, err, sizeof(err));
+            if (rc == 0) {
+                fprintf(stderr, "qihse-cluster-failback: slots %u-%u handed back to node %u\n",
+                        (unsigned)s, (unsigned)r, (unsigned)e.failed_index);
+            } else {
+                all_ok = false;
+                fprintf(stderr, "qihse-cluster-failback: slots %u-%u to node %u failed: %s "
+                        "(will retry)\n", (unsigned)s, (unsigned)r, (unsigned)e.failed_index,
+                        err[0] ? err : "unspecified");
+            }
+            s = r + 1u;
+        }
+
+        pthread_mutex_lock(&fo->ledger_lock);
+        if (!any_ours || all_ok) {
+            fo->ledger[i].done = true;
+            if (any_ours) fo->failbacks++;
+        } else {
+            uint32_t attempts = ++fo->ledger[i].attempts;
+            uint32_t shift = attempts > 6u ? 6u : attempts;
+            fo->ledger[i].next_attempt_ms = fo_now_ms() + ((uint64_t)fo->poll_ms << shift);
+        }
+        pthread_mutex_unlock(&fo->ledger_lock);
+    }
+
+    /* Compact finished entries. Only this thread removes; record() only appends. */
+    pthread_mutex_lock(&fo->ledger_lock);
+    size_t w = 0;
+    for (size_t i = 0; i < fo->ledger_count; i++) {
+        if (fo->ledger[i].done) continue;
+        if (w != i) fo->ledger[w] = fo->ledger[i];
+        w++;
+    }
+    fo->ledger_count = w;
+    pthread_mutex_unlock(&fo->ledger_lock);
+}
+
+static void* fo_failback_main(void* arg) {
+    qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)arg;
+    while (!__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE)) {
+        fo_failback_pass(fo);
+        /* Sleep in short slices so destroy() never waits a full poll interval. */
+        for (uint32_t slept = 0; slept < fo->poll_ms &&
+                                 !__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE); slept += 20u) {
+            struct timespec ts = {0, 20L * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+uint64_t qihse_cluster_failover_failbacks(const qihse_cluster_failover_t* fo) {
+    if (!fo) return 0u;
+    qihse_cluster_failover_t* m = (qihse_cluster_failover_t*)fo;
+    pthread_mutex_lock(&m->ledger_lock);
+    uint64_t v = m->failbacks;
+    pthread_mutex_unlock(&m->ledger_lock);
+    return v;
+}
+
+size_t qihse_cluster_failover_pending_failbacks(const qihse_cluster_failover_t* fo) {
+    if (!fo) return 0u;
+    qihse_cluster_failover_t* m = (qihse_cluster_failover_t*)fo;
+    pthread_mutex_lock(&m->ledger_lock);
+    size_t pending = 0;
+    for (size_t i = 0; i < m->ledger_count; i++)
+        if (!m->ledger[i].done) pending++;
+    pthread_mutex_unlock(&m->ledger_lock);
+    return pending;
 }

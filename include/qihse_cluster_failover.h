@@ -25,6 +25,15 @@ extern "C" {
 
 typedef struct qihse_cluster_failover qihse_cluster_failover_t;
 
+/* Failback hook: hand slots [first,last] back to `target_index` (the original
+ * owner that has returned) INCLUDING the data written while the successor
+ * served them. Must be COPY -> PERSIST -> SWITCH (see
+ * qihse_cluster_handoff_range) and must NOT change ownership unless the data
+ * reached the target. Return 0 on success, non-zero (with `err` filled) to
+ * retry later. Runs on the coordinator's worker thread, never the bus thread. */
+typedef int (*qihse_cluster_failback_fn)(void* user_data, uint16_t first, uint16_t last,
+                                         uint16_t target_index, char* err, size_t err_cap);
+
 typedef struct {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
@@ -33,6 +42,16 @@ typedef struct {
      * mode).  If false, any node may promote replicas (distributed mode,
      * requires deterministic replica ordering to avoid split-brain). */
     bool single_coordinator;
+    /* Failback. When failback_fn is set, ranges this node takes over through the
+     * sharded fallback are ledgered and handed back once the original owner has
+     * been continuously healthy for failback_stable_ms (default 3000), polling
+     * every failback_poll_ms (default 1000); failures retry with exponential
+     * backoff. Dedicated-replica promotion is NOT failed back: the old primary
+     * rejoins as a replica there. */
+    qihse_cluster_failback_fn failback_fn;
+    void* failback_user_data;
+    uint32_t failback_stable_ms;
+    uint32_t failback_poll_ms;
 } qihse_cluster_failover_config_t;
 
 qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_failover_config_t* config);
@@ -67,6 +86,12 @@ uint16_t qihse_cluster_failover_best_replica(const qihse_cluster_topology_t* top
 
 /* Get the number of failover events that have been processed. */
 uint64_t qihse_cluster_failover_events(const qihse_cluster_failover_t* fo);
+
+/* Completed failbacks (a range handed back to its returned owner). */
+uint64_t qihse_cluster_failover_failbacks(const qihse_cluster_failover_t* fo);
+
+/* Ledgered ranges still awaiting failback. */
+size_t qihse_cluster_failover_pending_failbacks(const qihse_cluster_failover_t* fo);
 
 #ifdef __cplusplus
 }

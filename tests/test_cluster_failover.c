@@ -1,6 +1,7 @@
 /*
  * test_cluster_failover.c — Unit tests for the QIHSE cluster failover coordinator.
  */
+#include <unistd.h>
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_slot.h"
@@ -235,6 +236,226 @@ static void test_bus_failover_callback(void) {
     printf("PASS bus failover callback\n");
 }
 
+
+/* ── failback ────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    int calls;
+    int fail_remaining;      /* fail this many calls before succeeding */
+    uint16_t last_first, last_last, last_target;
+    qihse_cluster_topology_t* topo;   /* flip ownership on success, like handoff */
+} fb_probe_t;
+
+static int fb_cb(void* ud, uint16_t first, uint16_t last, uint16_t target, char* err, size_t cap) {
+    fb_probe_t* p = (fb_probe_t*)ud;
+    p->calls++;
+    if (p->fail_remaining > 0) {
+        p->fail_remaining--;
+        snprintf(err, cap, "simulated transfer failure");
+        return -1;                         /* ownership must NOT change */
+    }
+    p->last_first = first; p->last_last = last; p->last_target = target;
+    assert(qihse_cluster_topology_assign_range(p->topo, first, last, target));
+    return 0;
+}
+
+static void sleep_ms_fb(unsigned ms) { usleep(ms * 1000u); }
+
+static bool wait_for(int (*pred)(void*), void* arg, unsigned timeout_ms) {
+    for (unsigned t = 0; t < timeout_ms; t += 20) {
+        if (pred(arg)) return true;
+        sleep_ms_fb(20);
+    }
+    return pred(arg) != 0;
+}
+
+typedef struct { qihse_cluster_failover_t* fo; fb_probe_t* probe; qihse_cluster_topology_t* topo;
+                 uint16_t slot; uint16_t want_owner; uint64_t want_failbacks; } fb_wait_t;
+static int fb_owner_is(void* a) {
+    fb_wait_t* w = (fb_wait_t*)a;
+    uint16_t o; qihse_cluster_slot_state_t st;
+    return qihse_cluster_topology_get_slot(w->topo, w->slot, &o, &st, NULL) && o == w->want_owner;
+}
+static int fb_count_reached(void* a) {
+    fb_wait_t* w = (fb_wait_t*)a;
+    return qihse_cluster_failover_failbacks(w->fo) >= w->want_failbacks;
+}
+
+/* Three primaries. Node IDs decide the successor, not local indexes or uptime. */
+static void test_deterministic_successor(void) {
+    for (int perspective = 0; perspective < 3; perspective++) {
+        qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+        qihse_cluster_node_t n[3];
+        make_node(&n[0], "alpha", "10.0.1.1", 7000, 17000, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+        make_node(&n[1], "bravo", "10.0.1.2", 7001, 17001, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+        make_node(&n[2], "charlie", "10.0.1.3", 7002, 17002, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+        /* Different insertion order per node: indexes differ between "nodes". */
+        uint16_t idx[3];
+        for (int k = 0; k < 3; k++) assert(qihse_cluster_topology_upsert_node(topo, &n[(k + perspective) % 3], &idx[(k + perspective) % 3]));
+        for (int k = 0; k < 3; k++) assert(qihse_cluster_topology_assign_range(topo, (uint16_t)(k * 100), (uint16_t)(k * 100 + 99), idx[k]));
+
+        qihse_cluster_failover_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+        cfg.topology = topo; cfg.local_node_index = idx[perspective]; cfg.single_coordinator = false;
+        qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
+        assert(fo);
+        /* Fail node 0 ("alpha"): the successor must be the smaller node ID of the
+         * two survivors, whichever node is asking. */
+        qihse_cluster_node_t b, c;
+        assert(qihse_cluster_topology_get_node(topo, idx[1], &b));
+        assert(qihse_cluster_topology_get_node(topo, idx[2], &c));
+        uint16_t expect = strcmp(b.id, c.id) < 0 ? idx[1] : idx[2];
+        qihse_cluster_topology_set_node_health(topo, idx[0], false);
+        assert(qihse_cluster_failover_handle(fo, idx[0]) == expect);
+        qihse_cluster_failover_destroy(fo);
+        qihse_cluster_topology_destroy(topo);
+    }
+    printf("PASS deterministic fallback successor (same choice from every node)\n");
+}
+
+static void failback_fixture(qihse_cluster_topology_t** topo_out, qihse_cluster_failover_t** fo_out,
+                             fb_probe_t* probe, uint16_t* idx_failed, uint16_t* idx_succ,
+                             uint32_t stable_ms) {
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    qihse_cluster_node_t a, b;
+    make_node(&a, "owner-node", "10.0.2.1", 7000, 17000, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&b, "successor-node", "10.0.2.2", 7001, 17001, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t ia, ib;
+    assert(qihse_cluster_topology_upsert_node(topo, &a, &ia));
+    assert(qihse_cluster_topology_upsert_node(topo, &b, &ib));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, ia));
+    assert(qihse_cluster_topology_assign_range(topo, 100, 199, ib));
+    probe->topo = topo;
+    qihse_cluster_failover_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = topo; cfg.local_node_index = ib; cfg.single_coordinator = false;
+    cfg.failback_fn = fb_cb; cfg.failback_user_data = probe;
+    cfg.failback_stable_ms = stable_ms; cfg.failback_poll_ms = 40;
+    *fo_out = qihse_cluster_failover_create(&cfg);
+    assert(*fo_out);
+    *topo_out = topo; *idx_failed = ia; *idx_succ = ib;
+}
+
+static void test_failback_returns_range(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    qihse_cluster_topology_t* topo; qihse_cluster_failover_t* fo; uint16_t ia, ib;
+    failback_fixture(&topo, &fo, &probe, &ia, &ib, 200);
+
+    qihse_cluster_topology_set_node_health(topo, ia, false);
+    assert(qihse_cluster_failover_handle(fo, ia) == ib);          /* successor takes 0-99 */
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);
+    fb_wait_t w = { fo, &probe, topo, 50, ib, 0 };
+    assert(fb_owner_is(&w));
+
+    /* Owner still down: nothing may be handed back. */
+    sleep_ms_fb(500);
+    assert(probe.calls == 0);
+    assert(fb_owner_is(&w));
+
+    /* Owner returns: after the stability window the range is handed back. */
+    qihse_cluster_topology_set_node_health(topo, ia, true);
+    fb_wait_t back = { fo, &probe, topo, 50, ia, 1 };
+    assert(wait_for(fb_owner_is, &back, 3000));
+    assert(wait_for(fb_count_reached, &back, 3000));
+    assert(probe.last_first == 0 && probe.last_last == 99 && probe.last_target == ia);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);
+    /* The successor's OWN range is untouched. */
+    uint16_t o; qihse_cluster_slot_state_t st;
+    assert(qihse_cluster_topology_get_slot(topo, 150, &o, &st, NULL) && o == ib);
+
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS failback returns the range after the owner is stable\n");
+}
+
+static void test_failback_flap_damping(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    qihse_cluster_topology_t* topo; qihse_cluster_failover_t* fo; uint16_t ia, ib;
+    failback_fixture(&topo, &fo, &probe, &ia, &ib, 600);
+
+    qihse_cluster_topology_set_node_health(topo, ia, false);
+    assert(qihse_cluster_failover_handle(fo, ia) == ib);
+    /* Flap faster than the stability window: no transfer may start. */
+    for (int i = 0; i < 6; i++) {
+        qihse_cluster_topology_set_node_health(topo, ia, true);
+        sleep_ms_fb(250);
+        qihse_cluster_topology_set_node_health(topo, ia, false);
+        sleep_ms_fb(120);
+    }
+    assert(probe.calls == 0);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);
+
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS failback ignores a flapping owner (needs continuous health)\n");
+}
+
+static void test_failback_retries_after_failure(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    probe.fail_remaining = 2;
+    qihse_cluster_topology_t* topo; qihse_cluster_failover_t* fo; uint16_t ia, ib;
+    failback_fixture(&topo, &fo, &probe, &ia, &ib, 100);
+
+    qihse_cluster_topology_set_node_health(topo, ia, false);
+    assert(qihse_cluster_failover_handle(fo, ia) == ib);
+    qihse_cluster_topology_set_node_health(topo, ia, true);
+
+    fb_wait_t done = { fo, &probe, topo, 50, ia, 1 };
+    assert(wait_for(fb_count_reached, &done, 8000));
+    assert(probe.calls == 3);                       /* 2 failures + 1 success */
+    assert(fb_owner_is(&done));
+    /* While it was failing, the successor kept serving: ownership only ever
+     * flipped inside a SUCCESSFUL callback (fb_cb), never on failure. */
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS failback retries a failed transfer without losing ownership\n");
+}
+
+static void test_failback_skips_dedicated_replica(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    qihse_cluster_node_t p, r;
+    make_node(&p, "primary-x", "10.0.3.1", 7000, 17000, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&r, "replica-x", "10.0.3.2", 7001, 17001, QIHSE_CLUSTER_NODE_REPLICA, 0);
+    uint16_t ip, ir;
+    assert(qihse_cluster_topology_upsert_node(topo, &p, &ip));
+    assert(qihse_cluster_topology_upsert_node(topo, &r, &ir));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, ip));
+    probe.topo = topo;
+    qihse_cluster_failover_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = topo; cfg.local_node_index = ir; cfg.single_coordinator = false;
+    cfg.failback_fn = fb_cb; cfg.failback_user_data = &probe;
+    cfg.failback_stable_ms = 50; cfg.failback_poll_ms = 40;
+    qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
+    assert(fo);
+    qihse_cluster_topology_set_node_health(topo, ip, false);
+    assert(qihse_cluster_failover_handle(fo, ip) == ir);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);  /* replica had the data */
+    qihse_cluster_topology_set_node_health(topo, ip, true);
+    sleep_ms_fb(400);
+    assert(probe.calls == 0);
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS dedicated-replica promotion is not failed back\n");
+}
+
+static void test_failback_respects_resplit_range(void) {
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    qihse_cluster_topology_t* topo; qihse_cluster_failover_t* fo; uint16_t ia, ib;
+    failback_fixture(&topo, &fo, &probe, &ia, &ib, 100);
+    qihse_cluster_topology_set_node_health(topo, ia, false);
+    assert(qihse_cluster_failover_handle(fo, ia) == ib);          /* ib owns 0-99 */
+    /* An operator re-homes 40-59 elsewhere while the owner is down. */
+    assert(qihse_cluster_topology_assign_range(topo, 40, 59, ia));
+    qihse_cluster_topology_set_node_health(topo, ia, true);
+    fb_wait_t done = { fo, &probe, topo, 10, ia, 1 };
+    assert(wait_for(fb_count_reached, &done, 4000));
+    /* Only the slots still owned by the successor were handed back: two calls
+     * (0-39, 60-99), none covering 40-59. */
+    assert(probe.calls == 2);
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS failback hands back only the slots the successor still owns\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -246,6 +467,12 @@ int main(void) {
     test_replica_failure();
     test_best_replica_selection();
     test_bus_failover_callback();
+    test_deterministic_successor();
+    test_failback_returns_range();
+    test_failback_flap_damping();
+    test_failback_retries_after_failure();
+    test_failback_skips_dedicated_replica();
+    test_failback_respects_resplit_range();
     printf("cluster failover tests passed\n");
     return 0;
 }
