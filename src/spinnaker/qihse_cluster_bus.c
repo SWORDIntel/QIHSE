@@ -749,8 +749,17 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
     /* Journal only a genuine ownership change (this slot's owner moves to a
      * different node). Static re-announcements keep the same owner but carry a
      * drifting per-node epoch; journaling them accumulates conflicting records
-     * that replay into divergence. The per-node config_epoch is a LOCAL counter
-     * and must not drive durability decisions. */
+     * that replay into divergence. */
+    qihse_cluster_node_t owner;
+    bool owner_known = qihse_cluster_topology_get_node(bus->topology, local_owner, &owner);
+    /* Reject a stale re-announcement for the SAME owner (a lower epoch than we
+     * already hold). This is what stops a slow/duplicated update from flapping
+     * ownership. A node's OWN range is always authoritative; epoch 0 (static)
+     * is never treated as stale. */
+    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
+        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+        return;
+    }
     uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_topology_get_slot(bus->topology, upd.start, &prior_owner, NULL, NULL);
     bool owner_changed = prior_owner != local_owner;
