@@ -50,7 +50,7 @@ static bool run_cmd(qihse_resp_server_t* server, qihse_user_t* user,
     qihse_resp_arg_t args[3 + DIM + 2];
     assert(argc <= sizeof args / sizeof args[0]);
     for (size_t i = 0; i < argc; i++) {
-        args[i].data = (char*)argv[i];
+        args[i].data = (const uint8_t*)argv[i];
         args[i].len = strlen(argv[i]);
     }
     uint8_t* reply = NULL;

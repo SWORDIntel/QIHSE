@@ -667,20 +667,35 @@ seed issues correct MOVED redirects — including to the container node
 (physical client reachability of the container's segment is the lab's
 remaining limit; the redirect itself is correct).
 
-## Failover: most-uptime successor
+## Failover and failback
 
-When a primary is marked failed (5 s heartbeat timeout on the bus), the
-failover coordinator succeeds it:
-1. dedicated replicas first (existing rule: healthy replica of the failed
-   primary; tie-break by lowest index);
-2. otherwise — the sharded-cluster fallback — the healthy PRIMARY with the
-   longest continuous presence on the bus (`first_seen`, receiver-local
-   observation) inherits the failed node's slot ranges. Ownership changes are
-   broadcast (`SLOT_UPDATE` + `NODE_UPDATE`), so routing converges cluster-wide.
+When the bus marks a primary failed, the coordinator first selects a healthy
+dedicated replica of that primary (lowest node index breaks ties). If none is
+available, it selects the healthy primary with the lexicographically smallest
+stable node ID, excluding the failed node. This fallback is intentionally
+cluster-deterministic: topology indexes and `first_seen` uptime are local
+observations and cannot safely break ties across coordinators. Ownership
+updates propagate through `SLOT_UPDATE` and `NODE_UPDATE`; a node that receives
+a takeover update ledgers it when it is the new owner and observes the previous
+owner as unhealthy.
 
-Selection is receiver-local and deterministic; with 2 nodes the surviving
-node always succeeds the dead one. Verified live: SIGKILL the lead, the
-successor owns 16,384/16,384 slots within the health window.
+Failback is asynchronous and requires the original owner to remain continuously
+healthy for the configured stability interval (default 3 seconds; checked at
+the configured polling interval, default 1 second). The coordinator hands back
+only slots it still owns, in contiguous subranges, so a later resplit or
+operator/brain re-home is not undone. The handoff uses the configured failback
+callback; the RESP server callback reuses pinned-QKP migration and durable
+ownership journaling. Failed handoffs remain ledgered and are retried with
+bounded exponential backoff. A dedicated replica that already held the range
+is not treated as a temporary takeover. Ledger capacity is bounded; if full,
+a takeover is logged as not eligible for automatic failback.
+
+The coordinator logs takeover ledgering, failed/ successful handoffs and
+rejected stale ownership updates to stderr. These messages are operational
+evidence, not a durable failback ledger across process restarts. Unit coverage
+is in `tests/test_cluster_failover.c` (including flap damping, retry, resplit,
+and takeover observed by a different coordinator); run with
+`make test-cluster-failover`.
 
 ## Data redundancy
 

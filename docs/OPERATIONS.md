@@ -486,16 +486,31 @@ The transfer is data-safe by construction:
    (`<data-dir>/slot-ownership.journal`) on *both* ends, so a restart replays
    it (adopt-if-newer by per-owner config epoch) instead of reverting to the
    static `--slot-range` map.
-4. **GC** — after the listener starts and topology is covered, any node that
-   replayed ownership journal entries reclaims stale foreign-slot copies in
-   bounded batches using `qihse_kv_foreach_key_user` (which checks clearance
-   and SST metadata without reading SST values). Operators can also trigger
-   bounded reclamation on demand via `CLUSTER RECLAIM [limit]`.
+4. **GC** — stale source copies are reclaimed only *after* the listener is
+   serving, never before bind. A node that replayed at least one ownership
+   journal entry at startup waits a 5 s settle, then (once topology is
+   covered) deletes up to 256 foreign-slot keys per batch, one second apart,
+   using the authenticated key-only iterator `qihse_kv_foreach_key_user`
+   (payload headers in the memory trie plus the SST metadata index; no SST
+   value is read and no value is materialized). Operators can trigger
+   reclamation on demand with `CLUSTER RECLAIM [limit]` (default 4096,
+   maximum 1,000,000), which is restricted to the system-domain operator.
 
 The invariant: **a key is never present in zero places.** COPY guarantees
 reachability across any restart, the journal makes ownership durable, and
 bounded key-only GC reclaims stale source copies without blocking startup or
-materializing values.
+materializing values. Two consequences follow from that ordering being
+deliberate:
+
+- GC is *lazy and conditional*: a node with no replayed journal entry runs no
+  startup scan, and a key is deleted only when its slot is owned by another
+  node and is in `STABLE` state, re-checked immediately before the delete.
+  Stale copies can therefore survive indefinitely — that is the safe
+  direction, because they are unreachable through routing once ownership
+  moved.
+- Enumeration holds the store read lock for one batch. The batch is bounded,
+  so latency impact is bounded too, but on a very large keyspace prefer
+  `CLUSTER RECLAIM <small-limit>` off-peak over a single huge limit.
 
 #### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
 

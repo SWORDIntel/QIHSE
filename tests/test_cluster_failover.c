@@ -516,6 +516,44 @@ static void test_failback_on_remote_takeover(void) {
     printf("PASS successor ledgers and fails back a takeover decided by another node\n");
 }
 
+/* When a non-coordinator (or asymmetry-deferred cycle) sees on_fail first,
+ * last_attempt_ms must NOT be stamped until promotion is actually attempted;
+ * otherwise a subsequent cycle on the same coordinator (or after the current
+ * coordinator also fails) would be locked out for 30s. */
+static void test_non_coordinator_does_not_trip_cooldown(void) {
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    qihse_cluster_node_t n0, n1, n2;
+    make_node(&n0, "coord-0", "127.0.0.1", 7000, 17000, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&n1, "coord-1", "127.0.0.1", 7001, 17001, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&n2, "victim-2", "127.0.0.1", 7002, 17002, QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t i0, i1, i2;
+    assert(qihse_cluster_topology_upsert_node(topo, &n0, &i0));
+    assert(qihse_cluster_topology_upsert_node(topo, &n1, &i1));
+    assert(qihse_cluster_topology_upsert_node(topo, &n2, &i2));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, i2));
+
+    qihse_cluster_failover_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = topo;
+    cfg.local_node_index = i1;
+    cfg.single_coordinator = true;
+    qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
+    assert(fo);
+
+    /* Victim fails while i0 is still healthy (so i0 is coordinator, not i1). */
+    qihse_cluster_topology_set_node_health(topo, i2, false);
+    assert(qihse_cluster_failover_handle(fo, i2) == QIHSE_CLUSTER_NODE_NONE);
+
+    /* Now i0 also fails -> i1 becomes coordinator and must immediately promote
+     * without being blocked by the 30s cooldown. */
+    qihse_cluster_topology_set_node_health(topo, i0, false);
+    assert(qihse_cluster_failover_handle(fo, i2) == i1);
+
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS deferred/non-coordinator on_fail does not trip 30s cooldown\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -534,6 +572,7 @@ int main(void) {
     test_failback_skips_dedicated_replica();
     test_failback_respects_resplit_range();
     test_failback_on_remote_takeover();
+    test_non_coordinator_does_not_trip_cooldown();
     printf("cluster failover tests passed\n");
     return 0;
 }

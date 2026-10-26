@@ -213,8 +213,9 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
     qihse_cluster_node_t replica;
     if (!qihse_cluster_topology_get_node(fo->topology, replica_index, &replica)) return false;
     /* Valid successors: a dedicated REPLICA of the failed primary, or (the
-     * sharded-cluster fallback) another healthy PRIMARY with the most
-     * continuous presence. A failed/unhealthy successor is never chosen. */
+     * sharded-cluster fallback) another healthy PRIMARY with the smallest
+     * node ID (see fo_pick_fallback_successor). A failed/unhealthy successor
+     * is never chosen. */
     if (replica.role != QIHSE_CLUSTER_NODE_REPLICA && replica.role != QIHSE_CLUSTER_NODE_PRIMARY) return false;
     if (!replica.healthy) return false;
 
@@ -258,12 +259,14 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
     if (!fo || !fo->topology) return QIHSE_CLUSTER_NODE_NONE;
     pthread_mutex_lock(&fo->lock);
     /* cooldown: while a dead node REMAINS unhealthy the bus re-fires on_fail
-     * every cycle; promote is idempotent but the broadcasts are not free */
+     * every cycle; promote is idempotent but the broadcasts are not free.
+     * Stamp last_attempt_ms only after passing the coordinator and asymmetry
+     * evidence gates so a deferred check_health cycle is not locked out for
+     * 30s. */
     if (fo->last_attempt_ms && fo_now_ms() - fo->last_attempt_ms < 30000u) {
         pthread_mutex_unlock(&fo->lock);
         return QIHSE_CLUSTER_NODE_NONE;
     }
-    fo->last_attempt_ms = fo_now_ms();
 
     qihse_cluster_node_t failed;
     if (!qihse_cluster_topology_get_node(fo->topology, failed_node_index, &failed)) {
@@ -290,11 +293,8 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
     uint16_t replica = qihse_cluster_failover_best_replica(fo->topology, failed_node_index);
     if (replica == QIHSE_CLUSTER_NODE_NONE) {
         /* Sharded-cluster fallback: no dedicated replica exists, so the
-         * healthy node with the LONGEST CONTINUOUS PRESENCE (most uptime as
-         * observed on our bus) succeeds the failed primary and inherits its
-         * slot ranges. Its data must have been duplicated by the redundancy
-         * link; anything not duplicated is lost with the failed node — that
-         * is the documented cost of the phase-1 redundancy design. */
+         * healthy primary with the lexicographically smallest node ID
+         * succeeds the failed primary and inherits its slot ranges. */
         uint64_t now = fo_now_ms();
         /* Evidence gate: if ANY bus participant recently reported the failed
          * node healthy, this looks like an asymmetric link — defer so we
@@ -316,6 +316,7 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
         replica = best;
     }
 
+    fo->last_attempt_ms = fo_now_ms();
     bool promoted = qihse_cluster_failover_promote(fo, failed_node_index, replica);
     if (promoted) {
         fo->failover_events++;

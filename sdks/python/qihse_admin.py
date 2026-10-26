@@ -71,6 +71,10 @@ def _load_native_qkp_lib(lib_path: Optional[str] = None) -> Optional[ctypes.CDLL
             exec_fn.restype = ctypes.c_int
             free_fn.argtypes = [ctypes.c_void_p]
             free_fn.restype = None
+            # Remember where this build came from: the subprocess fallback must
+            # load the same library, not whatever an inherited LD_LIBRARY_PATH
+            # or ldconfig resolves first.
+            lib._qihse_lib_path = os.path.abspath(path)
             return lib
         except OSError:
             continue
@@ -158,6 +162,35 @@ class ClusterAdmin:
             if out_ptr.value:
                 self._lib.qihse_qkp_admin_free(out_ptr)
 
+    def _child_env(self) -> Optional[dict]:
+        """Environment for the CLI fallback: pin the in-tree library build.
+
+        The fallback must not silently load a different libqihse.so (an older
+        system install without the QKP admin symbols) just because
+        LD_LIBRARY_PATH or the loader cache resolves it first.
+        """
+        lib_dir = None
+        if self._lib is not None:
+            lib_path = getattr(self._lib, "_qihse_lib_path", None)
+            if lib_path:
+                lib_dir = os.path.dirname(lib_path)
+        if lib_dir is None:
+            # No in-process library: derive the build tree from the CLI path so
+            # a bin/qihse-admin-cli still resolves <root>/libqihse.so.
+            cli_dir = os.path.dirname(os.path.abspath(self.admin_cli))
+            # Prefer the build root over a bin/ that may hold a stale library
+            # copy, matching the CLI's own rpath order.
+            for candidate in (os.path.dirname(cli_dir), cli_dir):
+                if os.path.exists(os.path.join(candidate, "libqihse.so")):
+                    lib_dir = candidate
+                    break
+        if lib_dir is None or not os.path.isdir(lib_dir):
+            return None
+        env = os.environ.copy()
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+        return env
+
     def _run(self, host: str, port: int, trusted_pub: str,
              command: str, *args: str) -> str:
         if self._lib is not None and not self.sudo:
@@ -172,7 +205,8 @@ class ClusterAdmin:
             cmd.extend(("--arg", argument))
         if self.sudo:
             cmd = ["sudo"] + cmd
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=self._child_env())
         if proc.returncode != 0:
             raise QihseAdminError(
                 f"{command} failed (exit {proc.returncode})",

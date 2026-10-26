@@ -365,7 +365,8 @@ backup-cli: lib
 	@echo "qihse-backup build successful"
 
 admin-cli: lib
-	$(CC) $(CFLAGS) -o qihse-admin-cli tools/qihse_admin_cli.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -o qihse-admin-cli tools/qihse_admin_cli.c -L. -lqihse $(LDFLAGS) \
+	    -Wl,-rpath,'$$ORIGIN/..' -Wl,-rpath,'$$ORIGIN'
 	@echo "qihse-admin-cli build successful"
 
 test-backup-cli: lib
@@ -581,7 +582,7 @@ test-http-lifecycle:
 
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c -Wl,--gc-sections -pthread -lcrypto
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c -Wl,--gc-sections -pthread -lcrypto
 	./build/test_cluster_bus_bind
 
 test: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
