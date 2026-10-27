@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
 
@@ -139,9 +140,12 @@ int main(void) {
     }
 
     assert(qihse_aimem_onnx_embedder_install(dir));
+    assert(qihse_aimem_onnx_embedder_active());
     const char* name = qihse_aimem_onnx_embedder_name();
     assert(strncmp(name, "onnx:", 5) == 0);
     assert(strcmp(name, qihse_ai_memory_embedder_name()) == 0);
+    uint8_t model_digest[32], builtin_digest[32];
+    assert(qihse_ai_memory_embedder_fingerprint(model_digest));
 
     size_t dim = qihse_ai_memory_embedding_dim();
     assert(dim == 384u);
@@ -149,6 +153,18 @@ int main(void) {
     float cat[384], feline[384], revenue[384];
     assert(embed_text("The cat sat on the mat", cat, dim));
     assert(embed_text("A feline perched on the rug", feline, dim));
+    assert(embed_text("Quarterly revenue exceeded expectations", revenue, dim));
+
+    struct timespec clock_now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &clock_now) == 0);
+    uint64_t now_ns = (uint64_t)clock_now.tv_sec * UINT64_C(1000000000) +
+                      (uint64_t)clock_now.tv_nsec;
+    qihse_aimem_onnx_embedder_set_thread_deadline(now_ns - 1u);
+    assert(!embed_text("The cat sat on the mat", revenue, dim));
+    qihse_aimem_onnx_embedder_set_thread_deadline(now_ns + UINT64_C(5000000000));
+    assert(embed_text("The cat sat on the mat", revenue, dim));
+    qihse_aimem_onnx_embedder_set_thread_deadline(0u);
+    assert(cosine(cat, revenue, dim) > 0.999f);
     assert(embed_text("Quarterly revenue exceeded expectations", revenue, dim));
 
     /* unit norm */
@@ -181,9 +197,20 @@ int main(void) {
     assert(cos_related > 0.5f);
     assert(cos_related > cos_unrelated + 0.1f);
 
+    /* A failed replacement must not leave the previous ONNX provider pointing
+     * at the torn-down session or retain its model fingerprint. */
+    assert(!qihse_aimem_onnx_embedder_install("missing-qihse-aimem-model"));
+    assert(strcmp(qihse_aimem_onnx_embedder_name(), "") == 0);
+    assert(!qihse_aimem_onnx_embedder_active());
+    assert(strcmp(qihse_ai_memory_embedder_name(), "builtin-lexical-256") == 0);
+    assert(qihse_ai_memory_embedder_fingerprint(builtin_digest));
+    assert(memcmp(model_digest, builtin_digest, sizeof model_digest) != 0);
+
     /* NULL restore path: the built-in embedder comes back cleanly. */
     assert(qihse_ai_memory_set_embedder(NULL));
     assert(strcmp(qihse_ai_memory_embedder_name(), "builtin-lexical-256") == 0);
+    assert(qihse_ai_memory_embedder_fingerprint(builtin_digest));
+    assert(memcmp(model_digest, builtin_digest, sizeof model_digest) != 0);
 
     printf("ALL AIMEM ONNX EMBEDDER TESTS PASSED\n");
     return 0;

@@ -1,4 +1,5 @@
 /* QH-01 persistent scope-index and hierarchy restart regression. */
+#include "aimem_fixture_cleanup.h"
 #include "qihse_ai_memory.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static qihse_resp_server_t* make_server(qihse_kv_store_t* store) {
     qihse_resp_server_config_t cfg;
@@ -178,10 +180,38 @@ int main(void) {
     fprintf(stderr, "QH-01 scoped index load: 512 records across 8 projects; restart recall p50=%llu us p95=%llu us\n",
         (unsigned long long)latency[20], (unsigned long long)latency[37]);
 
+    /* A restore can reinstall an older document while retaining the high-water
+     * sequence. A persisted index built for the deleted state must not win. */
+    qihse_ai_memory_scope_t recovered = { "restore-rebaseline", "", "", "" };
+    char* recovered_id = store(server, owner, &recovered,
+        "restored canonical sentinel", "restore-sentinel");
+    char snapshot[512];
+    assert(snprintf(snapshot, sizeof snapshot, "%s/recovery.snap", data_root) < (int)sizeof snapshot);
+    assert(qihse_kv_save_user(store_handle, snapshot, op) == 0);
+    assert(qihse_ai_memory_forget_scoped(server, owner, recovered_id, &recovered));
+    qihse_ai_memory_hit_t recovered_hits[2] = {0};
+    assert(recall(server, owner, &recovered, "canonical sentinel", recovered_hits, 2u) == 0u);
+    uint64_t high_water = qihse_kv_change_seq(store_handle);
+    assert(qihse_kv_load_user(store_handle, snapshot, op) == 0);
+    assert(qihse_kv_change_seq(store_handle) == high_water);
+    assert(qihse_kv_sync_store(store_handle));
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store_handle);
     qihse_ai_memory_reset();
+    store_handle = qihse_kv_store_create();
+    assert(store_handle);
+    server = make_server(store_handle);
+    size_t recovered_n = recall(server, owner, &recovered,
+        "canonical sentinel", recovered_hits, 2u);
+    assert(recovered_n == 1u && strcmp(recovered_hits[0].id, recovered_id) == 0);
+    qihse_ai_memory_hits_free(recovered_hits, recovered_n);
+    qihse_resp_server_destroy(server);
+    qihse_kv_store_destroy(store_handle);
+    qihse_ai_memory_reset();
+    unlink(snapshot);
+    free(recovered_id);
     free(root_id); free(a1_id); free(a2_id); free(a3_id); free(b1_id); free(target_id);
+    aimem_fixture_cleanup(data_root);
     puts("PASS QH-01 persistent scoped index, live ranking visibility, hierarchy restart and load");
     return 0;
 }

@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/file.h>
 #include <sys/uio.h>
 #include <pthread.h>
 
@@ -44,6 +45,7 @@ struct qihse_wal {
     uint64_t               last_checkpoint_lsn;
     /* Current segment file */
     int                    seg_fd;
+    int                    dir_fd;       /* lifetime cross-process writer lock */
     uint64_t               seg_index;     /* current segment number */
     size_t                 seg_offset;    /* bytes written in current segment */
     char                   seg_path[PATH_MAX];
@@ -279,6 +281,20 @@ static int seg_rotate(qihse_wal_t* wal) {
     return seg_open(wal);
 }
 
+/* Scan the complete valid prefix before accepting a writer after restart.
+ * Reusing an LSN would make commit and checkpoint ordering ambiguous. */
+static bool wal_scan_lsn(const qihse_wal_record_t* record,
+                         const void* key, uint32_t key_len,
+                         const void* value, uint32_t value_len, void* ctx) {
+    (void)key;
+    (void)key_len;
+    (void)value;
+    (void)value_len;
+    uint64_t* maximum = ctx;
+    if (record->lsn > *maximum) *maximum = record->lsn;
+    return true;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
 qihse_wal_t* qihse_wal_create(const char* directory,
@@ -298,6 +314,7 @@ qihse_wal_t* qihse_wal_create(const char* directory,
     wal->next_lsn = QIHSE_WAL_INVALID_LSN + 1;  /* start at 1 */
     wal->last_checkpoint_lsn = 0;
     wal->seg_fd = -1;
+    wal->dir_fd = -1;
     wal->seg_index = 0;
     wal->seg_offset = 0;
 
@@ -308,9 +325,24 @@ qihse_wal_t* qihse_wal_create(const char* directory,
         return NULL;
     }
 
+    /* Reject another writer before scanning state or opening a segment. */
+    wal->dir_fd = open(directory, O_RDONLY | O_DIRECTORY);
+    if (wal->dir_fd < 0 || flock(wal->dir_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (wal->dir_fd >= 0) close(wal->dir_fd);
+        pthread_mutex_destroy(&wal->lock);
+        free(wal);
+        return NULL;
+    }
+
     /* Find the highest segment index and continue from there */
     DIR* dir = opendir(directory);
-    if (dir) {
+    if (!dir) {
+        close(wal->dir_fd);
+        pthread_mutex_destroy(&wal->lock);
+        free(wal);
+        return NULL;
+    }
+    {
         struct dirent* ent;
         uint64_t max_idx = 0;
         bool found = false;
@@ -330,11 +362,21 @@ qihse_wal_t* qihse_wal_create(const char* directory,
     }
 
     if (seg_open(wal) != 0) {
+        close(wal->dir_fd);
         pthread_mutex_destroy(&wal->lock);
         free(wal);
         return NULL;
     }
-
+    uint64_t maximum = 0;
+    if (qihse_wal_replay(wal, 0, wal_scan_lsn, &maximum) < 0 ||
+        maximum == UINT64_MAX) {
+        close(wal->seg_fd);
+        close(wal->dir_fd);
+        pthread_mutex_destroy(&wal->lock);
+        free(wal);
+        return NULL;
+    }
+    wal->next_lsn = maximum + 1;
     return wal;
 }
 
@@ -347,6 +389,7 @@ void qihse_wal_destroy(qihse_wal_t* wal) {
         }
         close(wal->seg_fd);
     }
+    if (wal->dir_fd >= 0) close(wal->dir_fd);
     pthread_mutex_unlock(&wal->lock);
     pthread_mutex_destroy(&wal->lock);
     free(wal);
@@ -530,14 +573,27 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
     int seg_count = 0;
     int seg_cap = 16;
     seg_indices = malloc(seg_cap * sizeof(uint64_t));
+    if (!seg_indices) {
+        closedir(dir);
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
+    }
 
     struct dirent* ent;
     while ((ent = readdir(dir)) != NULL) {
         uint64_t idx;
         if (sscanf(ent->d_name, "wal_%020lu.log", &idx) == 1) {
             if (seg_count >= seg_cap) {
-                seg_cap *= 2;
-                seg_indices = realloc(seg_indices, seg_cap * sizeof(uint64_t));
+                int new_cap = seg_cap * 2;
+                uint64_t* grown = realloc(seg_indices, new_cap * sizeof(uint64_t));
+                if (!grown) {
+                    closedir(dir);
+                    free(seg_indices);
+                    pthread_mutex_unlock(&wal->lock);
+                    return -1;
+                }
+                seg_indices = grown;
+                seg_cap = new_cap;
             }
             seg_indices[seg_count++] = idx;
         }
@@ -556,17 +612,43 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
     }
 
     /* Replay each segment */
+    uint64_t last_lsn = 0;
     for (int si = 0; si < seg_count; si++) {
         char path[PATH_MAX];
         seg_path(path, sizeof(path), wal->directory, seg_indices[si]);
 
         int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            free(seg_indices);
+            pthread_mutex_unlock(&wal->lock);
+            return -1;
+        }
 
+        struct stat segment_stat;
+        if (fstat(fd, &segment_stat) != 0) {
+            close(fd);
+            free(seg_indices);
+            pthread_mutex_unlock(&wal->lock);
+            return -1;
+        }
         for (;;) {
             qihse_wal_record_t rec;
             uint8_t hdr[QIHSE_WAL_RECORD_HEADER_SIZE];
-            if (!read_full(fd, hdr, QIHSE_WAL_RECORD_HEADER_SIZE)) break;
+            off_t position = lseek(fd, 0, SEEK_CUR);
+            if (position < 0 || position > segment_stat.st_size) {
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
+            }
+            if (position == segment_stat.st_size) break;
+            if (segment_stat.st_size - position < QIHSE_WAL_RECORD_HEADER_SIZE ||
+                !read_full(fd, hdr, QIHSE_WAL_RECORD_HEADER_SIZE)) {
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
+            }
 
             memcpy(&rec.lsn, hdr + 0, 8);
             memcpy(&rec.txn_id, hdr + 8, 8);
@@ -575,12 +657,21 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
             memcpy(&rec.key_length, hdr + 18, 4);
             memcpy(&rec.value_length, hdr + 22, 4);
             memcpy(&rec.checksum, hdr + 26, 4);
+            if (rec.lsn == 0 || rec.lsn <= last_lsn) {
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
+            }
+            last_lsn = rec.lsn;
 
             /* Validate key/value lengths */
             if (rec.key_length > QIHSE_WAL_MAX_KEY ||
                 rec.value_length > QIHSE_WAL_MAX_VALUE) {
-                /* Corrupt record — stop replay of this segment */
-                break;
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
             }
 
             /* Read key */
@@ -589,7 +680,10 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
                 key = malloc(rec.key_length);
                 if (!key || !read_full(fd, key, rec.key_length)) {
                     free(key);
-                    break;
+                    close(fd);
+                    free(seg_indices);
+                    pthread_mutex_unlock(&wal->lock);
+                    return -1;
                 }
             }
 
@@ -600,7 +694,10 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
                 if (!value || !read_full(fd, value, rec.value_length)) {
                     free(key);
                     free(value);
-                    break;
+                    close(fd);
+                    free(seg_indices);
+                    pthread_mutex_unlock(&wal->lock);
+                    return -1;
                 }
             }
 
@@ -620,10 +717,12 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
             }
 
             if (crc != rec.checksum) {
-                /* Corrupt record — stop replay */
                 free(key);
                 free(value);
-                break;
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
             }
 
             /* Skip records before start_lsn */

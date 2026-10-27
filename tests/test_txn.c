@@ -36,6 +36,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 /* Remove a mkdtemp() directory and the WAL segments inside it, so repeated
  * runs do not accumulate artefacts under build/. */
@@ -352,6 +353,17 @@ static void test_wal_append_replay(void) {
     assert(lsn_begin && lsn_ins && lsn_upd && lsn_commit);
     assert(lsn_begin < lsn_ins && lsn_ins < lsn_upd && lsn_upd < lsn_commit);
     assert(qihse_wal_current_lsn(wal) == lsn_commit + 1);
+    pid_t rival = fork();
+    assert(rival >= 0);
+    if (rival == 0) {
+        qihse_wal_t* duplicate = qihse_wal_create(
+            dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE);
+        if (duplicate) qihse_wal_destroy(duplicate);
+        _exit(duplicate ? 1 : 0);
+    }
+    int rival_status = 0;
+    assert(waitpid(rival, &rival_status, 0) == rival);
+    assert(WIFEXITED(rival_status) && WEXITSTATUS(rival_status) == 0);
 
     wal_scan_t scan;
     memset(&scan, 0, sizeof(scan));
@@ -370,28 +382,41 @@ static void test_wal_append_replay(void) {
     assert(qihse_wal_replay(wal, lsn_upd, wal_scan_cb, &tail) == 2);
     assert(tail.count == 2 && tail.last_lsn == lsn_commit);
 
-    /* A CRC mismatch stops replay instead of returning corrupt data.
-     * Corrupt the checksum field (offset 26 in the 30-byte record header) of
-     * the first record; replay must stop there and report nothing. */
+    /* A CRC mismatch must refuse writer startup rather than conceal a
+     * committed transaction by returning a successful empty replay. */
     qihse_wal_destroy(wal);
     char path[512];
     snprintf(path, sizeof(path), "%s/wal_%020lu.log", dir, 0UL);
-    FILE* f = fopen(path, "r+b");
+    FILE* f = fopen(path, "ab");
+    assert(f);
+    assert(fwrite("bad", 1, 3, f) == 3);
+    assert(fclose(f) == 0);
+    assert(qihse_wal_create(dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE) == NULL);
+    f = fopen(path, "r+b");
+    assert(f);
+    assert(fseek(f, -3, SEEK_END) == 0);
+    assert(ftruncate(fileno(f), ftell(f)) == 0);
+    assert(fclose(f) == 0);
+    f = fopen(path, "r+b");
     assert(f);
     assert(fseek(f, 26, SEEK_SET) == 0);
-    unsigned char bad = 0xFF;
+    int original = fgetc(f);
+    assert(original != EOF);
+    assert(fseek(f, 26, SEEK_SET) == 0);
+    unsigned char bad = (unsigned char)(original ^ 0xFF);
     assert(fwrite(&bad, 1, 1, f) == 1);
+    assert(fclose(f) == 0);
+    assert(qihse_wal_create(dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE) == NULL);
+    f = fopen(path, "r+b");
+    assert(f && fseek(f, 26, SEEK_SET) == 0);
+    unsigned char restored = (unsigned char)original;
+    assert(fwrite(&restored, 1, 1, f) == 1);
     assert(fclose(f) == 0);
 
     qihse_wal_t* reopened = qihse_wal_create(dir, 64 * 1024,
                                              QIHSE_WAL_DURABILITY_NONE);
     assert(reopened);
-    wal_scan_t corrupt;
-    memset(&corrupt, 0, sizeof(corrupt));
-    corrupt.lsn_monotonic = true;
-    int n = qihse_wal_replay(reopened, 0, wal_scan_cb, &corrupt);
-    assert(n == 0);
-    assert(corrupt.count == 0);
+    assert(qihse_wal_append_begin(reopened, 8) == lsn_commit + 1);
 
     /* Checkpoint bookkeeping. */
     assert(qihse_wal_checkpoint(reopened, lsn_commit) == 0);
@@ -403,6 +428,11 @@ static void test_wal_append_replay(void) {
 }
 
 /* ── 5. Crash recovery ──────────────────────────────────────────────────── */
+
+static int checkpoint_flush_fails(void* ctx) {
+    (void)ctx;
+    return -1;
+}
 
 static void test_crash_recovery(void) {
     char dir[] = "build/test_txn_rec_XXXXXX";
@@ -456,7 +486,9 @@ static void test_crash_recovery(void) {
     assert(next && next->id > 11);
     assert(qihse_txn_commit(mgr, next) == 0);
 
-    /* Checkpoint runs the flush callback and records an LSN. */
+    /* An unsuccessful engine flush must not advertise a checkpoint. */
+    assert(qihse_recovery_checkpoint(rec, checkpoint_flush_fails, NULL) == -1);
+    assert(qihse_wal_last_checkpoint(wal2) == 0);
     assert(qihse_recovery_checkpoint(rec, NULL, NULL) == 0);
     assert(qihse_wal_last_checkpoint(wal2) > 0);
 

@@ -35,6 +35,8 @@ typedef struct {
      * when that configuration field is present in the integration branch. */
     uint32_t aimem_service_user_id;
     const char* embedder_onnx;  /* NULL = built-in lexical embedder */
+    const char* aimem_keystone_library;
+    const char* aimem_projection_dir;
     const char* artifact_blob_dir;
     const char* artifact_staging_dir;
     const char* forensic_vdb_path;
@@ -151,7 +153,9 @@ static void usage(const char* program) {
             "  --artifact-staging-dir DIR  required private 0700 upload staging directory\n"
             "  --forensic-vdb PATH  isolated operator-only 1024-dimensional persistent index\n"
             "  --embedder-onnx DIR  install the ONNX embedding model in DIR as the AIMEM embedder\n"
-            "                      (env fallback QIHSE_AIMEM_EMBEDDER_ONNX; failure is fatal)\n",
+            "                      (env fallback QIHSE_AIMEM_EMBEDDER_ONNX; failure is fatal)\n"
+            "  --aimem-keystone-library PATH  opt-in exact KEYSTONE ABI library\n"
+            "  --aimem-projection-dir DIR   private 0700 durable projection directory\n",
             program);
 }
 
@@ -211,6 +215,8 @@ int main(int argc, char** argv) {
             credentials.operator_from_argv = true;
         }
         else if (strcmp(arg, "--embedder-onnx") == 0 && has_next) options.embedder_onnx = argv[++i];
+        else if (strcmp(arg, "--aimem-keystone-library") == 0 && has_next) options.aimem_keystone_library = argv[++i];
+        else if (strcmp(arg, "--aimem-projection-dir") == 0 && has_next) options.aimem_projection_dir = argv[++i];
         else if (strcmp(arg, "--artifact-blob-dir") == 0 && has_next) options.artifact_blob_dir = argv[++i];
         else if (strcmp(arg, "--artifact-staging-dir") == 0 && has_next) options.artifact_staging_dir = argv[++i];
         else if (strcmp(arg, "--forensic-vdb") == 0 && has_next) options.forensic_vdb_path = argv[++i];
@@ -300,6 +306,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!options.embedder_onnx) options.embedder_onnx = getenv("QIHSE_AIMEM_EMBEDDER_ONNX");
+    if ((options.aimem_keystone_library || options.aimem_projection_dir) &&
+        (!options.aimem_keystone_library || !options.aimem_projection_dir ||
+         !*options.aimem_keystone_library || !*options.aimem_projection_dir ||
+         !options.require_auth || !credentials.aimem_service_set ||
+         !options.embedder_onnx || !*options.embedder_onnx)) {
+        fprintf(stderr, "KEYSTONE projection requires both explicit paths, --require-auth, AIMEM service credentials, and ONNX model\n");
+        standalone_credentials_clear(&credentials);
+        return 2;
+    }
     if (options.embedder_onnx && *options.embedder_onnx &&
         !qihse_aimem_onnx_embedder_install(options.embedder_onnx)) {
         /* Fail closed: serving semantic recall on the lexical hash while an
@@ -455,6 +470,18 @@ int main(int argc, char** argv) {
                 (unsigned)config.aimem_service_user_id);
         qihse_vector_db_destroy(forensic_vdb);
         qihse_blob_store_destroy(artifact_blobs);
+        return 1;
+    }
+    if (options.aimem_keystone_library &&
+        !qihse_ai_memory_projection_enable(server,
+            qihse_auth_get_user(options.aimem_service_user_id),
+            options.aimem_keystone_library, options.aimem_projection_dir)) {
+        fprintf(stderr, "[qihse-redis-server] KEYSTONE AIMEM projection unavailable; refusing opt-in startup\n");
+        qihse_resp_server_destroy(server);
+        qihse_vector_db_destroy(vdb);
+        qihse_vector_db_destroy(forensic_vdb);
+        qihse_blob_store_destroy(artifact_blobs);
+        qihse_kv_store_destroy(store);
         return 1;
     }
     printf("[qihse-redis-server] RESP listening on %s:%u (auth %s, embedder %s)\n",

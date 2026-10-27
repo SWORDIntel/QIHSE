@@ -1,3 +1,4 @@
+#include "aimem_fixture_cleanup.h"
 #include "qihse_ai_memory.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
@@ -143,6 +144,7 @@ int main(void) {
 
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
+    aimem_fixture_cleanup(data_root);
     puts("PASS AIMEM legacy metadata inventory pagination and authorization");
     return 0;
 }

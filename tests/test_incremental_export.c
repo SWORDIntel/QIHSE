@@ -182,6 +182,13 @@ static parsed_rec_t* parse_records(const uint8_t* data, size_t len, size_t offse
 
 static void test_sequence_discipline(void) {
     assert(qihse_kv_change_seq(NULL) == 0u);
+    assert(qihse_kv_projection_epoch(NULL) == 0u);
+    assert(qihse_kv_projection_epoch(g_store) == 1u);
+    uint64_t marker_seq = 0u, marker_epoch = 0u;
+    assert(!qihse_kv_projection_marker(NULL, &marker_seq, &marker_epoch));
+    assert(!qihse_kv_projection_marker(g_store, NULL, &marker_epoch));
+    assert(qihse_kv_projection_marker(g_store, &marker_seq, &marker_epoch));
+    assert(marker_seq == qihse_kv_change_seq(g_store) && marker_epoch == 1u);
     uint64_t s0 = seq_now();
     assert(s0 == 0u); /* a fresh store in a fresh data dir */
 
@@ -426,6 +433,7 @@ static void test_persistence_round_trip(void) {
     qihse_audit_init();
     g_store = qihse_kv_store_create();
     assert(g_store);
+    assert(qihse_kv_projection_epoch(g_store) == 1u); /* not durable */
 
     /* The high-water did not regress: the flushed sequences were recovered
      * from the SSTable headers (exactly — the WAL was rotated empty at
@@ -475,7 +483,108 @@ static void test_persistence_round_trip(void) {
            "records survive replay re-stamped\n");
 }
 
-/* ── 6. Legacy record files decode with sequence 0 ────────────────────── */
+/* ── 6. Compaction/restore invalidate derived projection cursors ─────── */
+
+static void test_projection_epoch(void) {
+    /* A fully consumed delete becomes invisible to delta export after GC.
+     * SAVE creates small SSTables without relying on memtable-size tuning. */
+    put(g_op, "epoch:deleted", "old", 0, 0);
+    assert(qihse_kv_sync_store(g_store));
+    uint64_t cursor = seq_now();
+    del(g_op, "epoch:deleted");
+    assert(qihse_kv_sync_store(g_store));
+    uint64_t epoch = qihse_kv_projection_epoch(g_store);
+    for (unsigned i = 0; i < 16u; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "epoch:filler:%u", i);
+        put(g_op, key, "v", 0, 0);
+        assert(qihse_kv_sync_store(g_store));
+    }
+    assert(qihse_kv_projection_epoch(g_store) == epoch); /* flush is not GC */
+    qihse_kv_sweep_expired(g_store); /* >=16 SSTables: streaming compaction */
+    assert(qihse_kv_projection_epoch(g_store) == epoch + 1u);
+    qihse_kv_sweep_expired(g_store); /* one live file: no repeated compaction */
+    assert(qihse_kv_projection_epoch(g_store) == epoch + 1u);
+    qihse_kv_store_destroy(g_store);
+    g_store = qihse_kv_store_create();
+    assert(g_store && qihse_kv_projection_epoch(g_store) == 1u);
+    qihse_kv_sweep_expired(g_store); /* count recovered independently of id */
+    assert(qihse_kv_projection_epoch(g_store) == 1u);
+    qihse_kv_delta_record_t* recs = NULL;
+    size_t count = 0u;
+    uint64_t resume = 0u;
+    assert(qihse_kv_export_incremental_user(g_store, g_op, cursor,
+                                            &recs, &count, &resume) == 0);
+    assert(delta_find(recs, count, "epoch:deleted") == NULL);
+    qihse_kv_delta_records_free(recs, count);
+    assert(!qihse_kv_exists_user(g_store, "epoch:deleted", g_op));
+
+    /* Restoring older data changes the dataset without issuing a mutation.
+     * The saved revision is below the cursor, so delta cannot repair it. */
+    put(g_op, "epoch:restored", "snapshot", 0, 0);
+    char snapshot[576];
+    test_path(snapshot, sizeof(snapshot), "epoch.snap");
+    assert(qihse_kv_save_user(g_store, snapshot, g_op) == 0);
+    del(g_op, "epoch:restored");
+    cursor = seq_now();
+    epoch = qihse_kv_projection_epoch(g_store);
+    char missing[576];
+    test_path(missing, sizeof(missing), "epoch-missing.snap");
+    assert(qihse_kv_load_user(g_store, missing, g_op) != 0);
+    assert(qihse_kv_projection_epoch(g_store) == epoch);
+    assert(qihse_kv_load_user(g_store, snapshot, g_op) == 0);
+    assert(qihse_kv_projection_epoch(g_store) == epoch + 1u);
+    assert(seq_now() == cursor);
+    recs = NULL; count = 0u; resume = 0u;
+    assert(qihse_kv_export_incremental_user(g_store, g_op, cursor,
+                                            &recs, &count, &resume) == 0);
+    assert(count == 0u && recs == NULL && resume == cursor);
+    char* value = qihse_kv_get_user(g_store, "epoch:restored", g_op);
+    assert(value && strcmp(value, "snapshot") == 0);
+    free(value);
+    unlink(snapshot);
+    printf("PASS projection epoch: compaction GC and restore invalidate cursors without restamping\n");
+}
+
+static void test_bounded_oversize_fails_closed(void) {
+    char large[513];
+    memset(large, 'x', sizeof large - 1u);
+    large[sizeof large - 1u] = '\0';
+    uint64_t cursor = seq_now();
+    put(g_op, "limit:hidden", large, 3u, 0x2u);
+    qihse_kv_delta_record_t* rows = NULL;
+    size_t count = 0u;
+    uint64_t resume = 0u;
+    assert(qihse_kv_export_incremental_user_bounded(g_store, g_guest, "limit:*",
+        cursor, 4u, 256u, &rows, &count, &resume) == 0);
+    assert(rows == NULL && count == 0u && resume == cursor);
+    put(g_op, "limit:public", large, 0u, 0u);
+    rows = (qihse_kv_delta_record_t*)1;
+    count = 99u; resume = UINT64_MAX;
+    assert(qihse_kv_export_incremental_user_bounded(g_store, g_guest, "limit:*",
+        cursor, 4u, 256u, &rows, &count, &resume) == -1);
+    assert(rows == NULL && count == 0u && resume == 0u);
+    assert(qihse_kv_export_incremental_user_bounded(g_store, g_guest, "limit:*",
+        cursor, 4u, 2048u, &rows, &count, &resume) == 0);
+    assert(count == 1u && strcmp(rows[0].key, "limit:public") == 0);
+    qihse_kv_delta_records_free(rows, count);
+    put(g_op, "limit:second", "short", 0u, 0u);
+    bool complete = true;
+    rows = NULL; count = 0u; resume = 0u;
+    assert(qihse_kv_export_incremental_user_bounded_complete(g_store, g_guest,
+        "limit:*", cursor, 1u, 2048u, &rows, &count, &resume, &complete) == 0);
+    assert(count == 1u && !complete && strcmp(rows[0].key, "limit:public") == 0);
+    qihse_kv_delta_records_free(rows, count);
+    uint64_t first_resume = resume;
+    rows = NULL; count = 0u;
+    assert(qihse_kv_export_incremental_user_bounded_complete(g_store, g_guest,
+        "limit:*", first_resume, 1u, 2048u, &rows, &count, &resume, &complete) == 0);
+    assert(count == 1u && complete && strcmp(rows[0].key, "limit:second") == 0);
+    qihse_kv_delta_records_free(rows, count);
+    puts("PASS bounded delta: oversized visible record fails closed, truncation explicit");
+}
+
+/* ── 7. Legacy record files decode with sequence 0 ────────────────────── */
 
 static void test_legacy_format_decodes(void) {
     /* One file mixing both pre-sequence formats: a 6-field record (flags,
@@ -720,6 +829,8 @@ int main(void) {
     test_resume_behavior();
     test_low_clearance_no_leak();
     test_persistence_round_trip();
+    test_projection_epoch();
+    test_bounded_oversize_fails_closed();
     test_legacy_format_decodes();
     test_backup_incremental_wired();
 

@@ -1374,6 +1374,12 @@ qihse_pg_wire_listener_t* qihse_pg_wire_listener_open_uwp(
         errno = EINVAL;
         return NULL;
     }
+    /* AuthenticationCleartextPassword must not be exposed on an external
+     * interface until this listener has an enforced TLS handshake. */
+    if (addr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        errno = EACCES;
+        return NULL;
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;

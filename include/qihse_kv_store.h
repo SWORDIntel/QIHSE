@@ -262,6 +262,26 @@ bool qihse_kv_sync_store(qihse_kv_store_t* store);
  * advances on what the principal was allowed to see. */
 uint64_t qihse_kv_change_seq(qihse_kv_store_t* store);
 
+/* Store-local invalidation marker for derived projections. Starts at 1 on
+ * creation and advances after a successful restore or SSTable compaction.
+ * A changed marker requires a full authorized reconciliation: delta export
+ * may no longer contain removed keys. This is NOT persistent across store
+ * instances; always rebaseline on startup regardless of its value. Sample
+ * before and after a reconciliation/delta pass and discard work if changed.
+ * Like change_seq, this is a store progress metric, not a data read. */
+uint64_t qihse_kv_projection_epoch(qihse_kv_store_t* store);
+/* Random instance identity; never persisted or reused to authorize old projections. */
+uint64_t qihse_kv_instance_id(qihse_kv_store_t* store);
+
+/* Read both projection source markers under the store read lock. Unlike two
+ * independent atomic loads, this cannot observe a sequence issued by an
+ * in-flight writer before its trie mutation completes. Capture before and
+ * after an authorized full snapshot/delta pass; publish only if both pairs
+ * match. A caller still MUST rebaseline after restart (epoch is process-local)
+ * and recheck authorization and canonical content when serving candidates. */
+bool qihse_kv_projection_marker(qihse_kv_store_t* store,
+                                uint64_t* out_seq, uint64_t* out_epoch);
+
 /* One delta record: the principal-visible state of one key whose last
  * mutation carries a sequence above the caller's cursor.  A tombstone
  * carries the deletion (value is NULL, tombstone true) at the deleted
@@ -324,13 +344,25 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
                                      size_t* out_count, uint64_t* out_resume_seq);
 /* Bounded namespace form used by the replication wire handler. Retains only
  * the earliest records that fit both limits; temporary record storage is
- * bounded by max_bytes plus one candidate record. */
+ * bounded by max_bytes plus one candidate record. Returns -1 and zeroed
+ * outputs if any authorized matching record exceeds max_bytes (the caller
+ * must increase the bound or rebaseline, never advance past that record). */
 int qihse_kv_export_incremental_user_bounded(qihse_kv_store_t* store,
                                      qihse_user_t* user, const char* namespace_glob,
                                      uint64_t since_seq, size_t max_records,
                                      size_t max_bytes,
                                      qihse_kv_delta_record_t** out_records,
                                      size_t* out_count, uint64_t* out_resume_seq);
+/* Identical bounded export with a completeness signal for projection workers.
+ * out_complete is false on failure or if ANY authorized matching row did not
+ * fit either bound. A false value on success requires continuation with the
+ * returned principal-visible resume cursor; do not publish this as a fully
+ * reconciled source boundary. It is true even for a successful empty delta. */
+int qihse_kv_export_incremental_user_bounded_complete(qihse_kv_store_t* store,
+    qihse_user_t* user, const char* namespace_glob, uint64_t since_seq,
+    size_t max_records, size_t max_bytes,
+    qihse_kv_delta_record_t** out_records, size_t* out_count,
+    uint64_t* out_resume_seq, bool* out_complete);
 
 /* File form of the same delta: the store's text record stream (v4 headers,
  * sequences and tombstones included), written atomically like

@@ -8270,7 +8270,15 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (!query || !hits) { free(query); free(hits); return qihse_resp_error(session, "ERR out of memory"); }
         size_t found = qihse_ai_memory_recall_scoped(session->server, session->user,
             query, limit, mode, kind, &scope, hits, limit);
+        int recall_error = errno;
         free(query);
+        if (recall_error && mode != QIHSE_AIMEM_MODE_BM25) {
+            qihse_ai_memory_hits_free(hits, found);
+            free(hits);
+            return qihse_resp_error(session, recall_error == ETIMEDOUT
+                ? "ERR AIMEM semantic projection deadline exceeded"
+                : "ERR AIMEM semantic projection unavailable or stale");
+        }
         bool emitted = qihse_resp_array(session, found);
         for (size_t i = 0; emitted && i < found; i++)
             emitted = qihse_resp_aimem_emit_hit(session, &hits[i]);
@@ -16511,10 +16519,18 @@ void qihse_resp_server_stop(qihse_resp_server_t* server) {
     if (server->bus) qihse_cluster_bus_stop(server->bus);
 }
 
+void qihse_resp_server_aimem_read_lock(qihse_resp_server_t* server) {
+    if (server) pthread_rwlock_rdlock(&server->kv_lock);
+}
+void qihse_resp_server_aimem_read_unlock(qihse_resp_server_t* server) {
+    if (server) pthread_rwlock_unlock(&server->kv_lock);
+}
+
 void qihse_resp_server_destroy(qihse_resp_server_t* server) {
     if (!server) return;
     qihse_resp_server_stop(server);
     qihse_resp_aimem_query_cursors_clear_server(server);
+    qihse_ai_memory_projection_shutdown(server);
     if (server->owns_task_scheduler && server->task_scheduler) qihse_task_scheduler_destroy(server->task_scheduler);
     if (server->owns_task_workers && server->task_workers) qihse_task_worker_pool_destroy(server->task_workers);
     if (server->owns_task_queue && server->task_queue) qihse_task_queue_destroy(server->task_queue);

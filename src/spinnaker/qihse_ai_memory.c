@@ -23,6 +23,12 @@
 #include "qihse_fts.h"
 #include "qihse_kv_store.h"
 #include "qihse_audit.h"
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+#include "qihse_aimem_projection_store.h"
+#include "qihse_aimem_onnx_embedder.h"
+#include "keystone_aimem_vector.h"
+#include <dlfcn.h>
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -339,9 +345,13 @@ static qihse_ai_memory_embedder_t g_aimem_embedder = {
     AIMEM_BUILTIN_NAME, AIMEM_BUILTIN_DIM, aimem_builtin_embed, NULL
 };
 static char g_aimem_embedder_name[AIMEM_EMBEDDER_NAME_MAX + 1u] = AIMEM_BUILTIN_NAME;
+static uint8_t g_aimem_model_digest[32];
+static bool g_aimem_model_digest_set = false;
 
 bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider) {
     if (!provider) {
+        memset(g_aimem_model_digest, 0, sizeof g_aimem_model_digest);
+        g_aimem_model_digest_set = false;
         g_aimem_embedder.name = AIMEM_BUILTIN_NAME;
         g_aimem_embedder.dim = AIMEM_BUILTIN_DIM;
         g_aimem_embedder.embed = aimem_builtin_embed;
@@ -355,6 +365,8 @@ bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider) {
     if (!provider->embed || !provider->name || !*provider->name) return false;
     if (provider->dim == 0 || provider->dim > QIHSE_AIMEM_MAX_DIM) return false;
     if (strlen(provider->name) > AIMEM_EMBEDDER_NAME_MAX) return false;
+    memset(g_aimem_model_digest, 0, sizeof g_aimem_model_digest);
+    g_aimem_model_digest_set = false;
     g_aimem_embedder = *provider;
     /* Copy the name: the caller's string need not outlive this call, and the
      * name is persisted with every vector. */
@@ -366,6 +378,30 @@ bool qihse_ai_memory_set_embedder(const qihse_ai_memory_embedder_t* provider) {
 
 size_t qihse_ai_memory_embedding_dim(void) { return g_aimem_embedder.dim; }
 const char* qihse_ai_memory_embedder_name(void) { return g_aimem_embedder_name; }
+
+bool qihse_ai_memory_set_embedder_fingerprint(const uint8_t digest[32]) {
+    if (!digest || !g_aimem_embedder.embed ||
+        g_aimem_embedder.embed == aimem_builtin_embed) return false;
+    uint8_t nonzero = 0u;
+    for (size_t i = 0; i < sizeof g_aimem_model_digest; i++) nonzero |= digest[i];
+    if (!nonzero) return false;
+    memcpy(g_aimem_model_digest, digest, sizeof g_aimem_model_digest);
+    g_aimem_model_digest_set = true;
+    return true;
+}
+
+bool qihse_ai_memory_embedder_fingerprint(uint8_t out[32]) {
+    if (!out) return false;
+    if (g_aimem_embedder.embed == aimem_builtin_embed) {
+        static const char domain[] = "qihse:aimem:lexical-hash:v1:256";
+        unsigned int len = 0u;
+        return EVP_Digest(domain, sizeof domain - 1u, out, &len,
+                          EVP_sha256(), NULL) == 1 && len == 32u;
+    }
+    if (!g_aimem_model_digest_set) return false;
+    memcpy(out, g_aimem_model_digest, 32u);
+    return true;
+}
 
 bool qihse_ai_memory_embed_text(const char* text, float* out, size_t dim) {
     if (!text || !out || dim == 0u || dim != g_aimem_embedder.dim) return false;
@@ -1611,7 +1647,7 @@ size_t qihse_ai_memory_count(qihse_resp_server_t* server, qihse_user_t* user) {
 typedef struct { uint32_t reader_id; bool found; } aimem_grant_scan_t;
 
 static bool aimem_grant_scan_cb(const char* key, const char* value, void* opaque) {
-    aimem_grant_scan_t* scan = (aimem_grant_scan_t*)opaque;
+    aimem_grant_scan_t* scan = opaque;
     char suffix[32];
     snprintf(suffix, sizeof suffix, ":%u", scan->reader_id);
     size_t key_len = strlen(key), suffix_len = strlen(suffix);
@@ -1629,13 +1665,15 @@ static bool aimem_scope_owner_allowed(qihse_kv_store_t* store, qihse_user_t* use
     if (!store || !user || !qihse_auth_user_is_active(user) || !scope) return false;
     if (qihse_user_get_id(user) == owner_id ||
         qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR) return true;
-    char prefix[192];
-    int n = snprintf(prefix, sizeof prefix, "t:%u/aimem-grant:%s:",
-        (unsigned)qihse_user_get_tenant_id(user), scope->project);
-    if (n <= 0 || (size_t)n >= sizeof prefix) return false;
-    aimem_grant_scan_t scan = { qihse_user_get_id(user), false };
-    (void)qihse_kv_foreach_prefix_user(store, prefix, user, aimem_grant_scan_cb, &scan);
-    return scan.found;
+    char key[192];
+    int n = snprintf(key, sizeof key, "t:%u/aimem-grant:%s:%u:%u",
+        (unsigned)qihse_user_get_tenant_id(user), scope->project,
+        (unsigned)owner_id, (unsigned)qihse_user_get_id(user));
+    if (n <= 0 || (size_t)n >= sizeof key) return false;
+    char* grant = qihse_kv_get_user(store, key, user);
+    bool allowed = grant && strcmp(grant, "read:v1") == 0;
+    free(grant);
+    return allowed;
 }
 
 typedef struct {
@@ -1734,22 +1772,6 @@ typedef struct {
     qihse_fts_index_t* index;
     qihse_kv_store_t* store;
     qihse_user_t* user;
-    char key_prefix[32];
-    const qihse_ai_memory_scope_t* scope;
-    uint32_t kind;
-    bool lexical;
-    const float* query_vec;
-    size_t query_dim;
-    aimem_cand_t* vector;
-    size_t vector_cap;
-    size_t vector_count;
-    size_t added;
-} aimem_scoped_rebuild_t;
-
-typedef struct {
-    qihse_fts_index_t* index;
-    qihse_kv_store_t* store;
-    qihse_user_t* user;
     uint32_t tenant_id;
     const qihse_ai_memory_scope_t* scope;
     uint32_t kind;
@@ -1792,12 +1814,13 @@ static bool aimem_scope_index_paths(qihse_kv_store_t* store, qihse_user_t* user,
     return a > 0 && a < 4096 && b > 0 && b < 4096;
 }
 
-static bool aimem_scope_index_read_generation(const char* path, uint64_t* out) {
+static bool aimem_scope_index_read_generation(const char* path, uint64_t* out,
+                                               uint64_t instance, uint64_t epoch) {
     if (!path || !out) return false;
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return false;
     struct stat st;
-    char bytes[32];
+    char bytes[96];
     ssize_t n = -1;
     if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
         st.st_size < (off_t)sizeof bytes) n = read(fd, bytes, sizeof bytes);
@@ -1807,8 +1830,15 @@ static bool aimem_scope_index_read_generation(const char* path, uint64_t* out) {
     char* end = NULL;
     errno = 0;
     unsigned long long value = strtoull(bytes, &end, 10);
-    if (errno || end == bytes || (*end != '\n' && *end != '\0') ||
-        (end[0] == '\n' && end[1] != '\0')) return false;
+    if (errno || end == bytes || *end != ' ') return false;
+    char* start = end + 1;
+    unsigned long long saved_instance = strtoull(start, &end, 10);
+    if (errno || end == start || *end != ' ') return false;
+    start = end + 1;
+    unsigned long long saved_epoch = strtoull(start, &end, 10);
+    if (errno || end == start || (end[0] != '\n' && end[0] != '\0') ||
+        (end[0] == '\n' && end[1] != '\0') ||
+        saved_instance != instance || saved_epoch != epoch) return false;
     *out = (uint64_t)value;
     return true;
 }
@@ -1830,15 +1860,17 @@ static bool aimem_scope_index_sync_directory(const char* filepath) {
     return ok;
 }
 
-static bool aimem_scope_index_write_generation(const char* path, uint64_t seq) {
+static bool aimem_scope_index_write_generation(const char* path, uint64_t seq,
+                                                uint64_t instance, uint64_t epoch) {
     if (!path) return false;
     char tmp[4096];
     int n = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
     if (n <= 0 || (size_t)n >= sizeof tmp) return false;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return false;
-    char text[32];
-    int len = snprintf(text, sizeof text, "%llu\n", (unsigned long long)seq);
+    char text[96];
+    int len = snprintf(text, sizeof text, "%llu %llu %llu\n",
+        (unsigned long long)seq, (unsigned long long)instance, (unsigned long long)epoch);
     bool ok = len > 0 && (size_t)len < sizeof text &&
               write(fd, text, (size_t)len) == len && fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
@@ -1887,10 +1919,14 @@ static qihse_fts_index_t* aimem_scope_index_load_or_build(
     char index_path[4096], generation_path[4096];
     if (!aimem_scope_index_paths(store, caller, scope, kind, index_path,
                                  generation_path)) return NULL;
-    uint64_t before = qihse_kv_change_seq(store), stored = 0u;
-    if (aimem_scope_index_read_generation(generation_path, &stored) && stored == before) {
+    uint64_t before = 0u, epoch = 0u, stored = 0u;
+    uint64_t instance = qihse_kv_instance_id(store);
+    if (!instance || !qihse_kv_projection_marker(store, &before, &epoch)) return NULL;
+    if (aimem_scope_index_read_generation(generation_path, &stored, instance, epoch) && stored == before) {
         qihse_fts_index_t* loaded = qihse_fts_load(index_path, caller);
-        if (loaded && qihse_kv_change_seq(store) == before) return loaded;
+        uint64_t current = 0u, current_epoch = 0u;
+        if (loaded && qihse_kv_projection_marker(store, &current, &current_epoch) &&
+            current == before && current_epoch == epoch) return loaded;
         qihse_fts_destroy(loaded);
     }
 
@@ -1905,11 +1941,13 @@ static qihse_fts_index_t* aimem_scope_index_load_or_build(
              (unsigned)build.tenant_id);
     bool enumerated = qihse_kv_foreach_prefix_user(store, build.key_prefix,
         caller, aimem_scope_index_build_cb, &build);
-    uint64_t after = qihse_kv_change_seq(store);
-    if (!enumerated || build.failed || before != after ||
+    uint64_t after = 0u, after_epoch = 0u;
+    bool stable = qihse_kv_projection_marker(store, &after, &after_epoch) &&
+        before == after && epoch == after_epoch;
+    if (!enumerated || build.failed || !stable ||
         !qihse_fts_save(index, index_path, caller) ||
         !aimem_scope_index_sync_directory(index_path) ||
-        !aimem_scope_index_write_generation(generation_path, after)) {
+        !aimem_scope_index_write_generation(generation_path, after, instance, epoch)) {
         qihse_fts_destroy(index);
         return NULL;
     }
@@ -1938,63 +1976,480 @@ static bool aimem_scope_index_visible(uint64_t doc_id, uint16_t classification,
     return allowed;
 }
 
-static bool aimem_scoped_rebuild_cb(const char* key, const char* value,
-                                    void* user_data) {
-    aimem_scoped_rebuild_t* rb = (aimem_scoped_rebuild_t*)user_data;
-    size_t prefix_len = strlen(rb->key_prefix);
-    if (strncmp(key, rb->key_prefix, prefix_len) != 0) return true;
-    qihse_ai_memory_hit_t hit;
-    aimem_record_meta_t meta;
-    memset(&hit, 0, sizeof hit);
-    if (!aimem_parse_record_meta(value, &hit, &meta)) return true;
-    if (!meta.scope.project[0] ||
-        !aimem_scope_matches(&meta.scope, rb->scope) ||
-        !aimem_scope_owner_allowed(rb->store, rb->user, meta.owner_id, rb->scope) ||
-        !aimem_kind_ok(rb->kind, hit.kind)) {
-        free(hit.text);
-        return true;
-    }
-    qihse_uuid_t uuid;
-    bool parsed = qihse_uuid_parse(hit.id, &uuid);
-    uint64_t doc_id = parsed ? aimem_doc_id(&uuid) : 0u;
-    bool ok = parsed;
-    if (ok && rb->lexical) {
-        ok = qihse_fts_add_document_user(rb->index, doc_id, hit.text,
-                  strlen(hit.text), hit.classification, hit.sci_compartment,
-                  QIHSE_KEYSTONE_CLASS_UNKNOWN, rb->user);
-    }
-    if (ok && rb->query_vec && rb->query_dim && rb->vector_cap) {
-        float vec[QIHSE_AIMEM_MAX_DIM];
-        size_t dim = rb->query_dim;
-        if (g_aimem_embedder.embed(hit.text, vec, dim, g_aimem_embedder.ctx)) {
-            double dot = 0.0, qn = 0.0, vn = 0.0;
-            for (size_t i = 0; i < dim; i++) {
-                dot += (double)rb->query_vec[i] * (double)vec[i];
-                qn += (double)rb->query_vec[i] * (double)rb->query_vec[i];
-                vn += (double)vec[i] * (double)vec[i];
-            }
-            if (qn > 0.0 && vn > 0.0) {
-                double score = dot / (sqrt(qn) * sqrt(vn));
-                size_t slot = rb->vector_count;
-                if (slot >= rb->vector_cap) {
-                    slot = 0u;
-                    for (size_t i = 1u; i < rb->vector_count; i++)
-                        if (rb->vector[i].score < rb->vector[slot].score) slot = i;
-                    if (score <= rb->vector[slot].score) slot = SIZE_MAX;
-                } else {
-                    rb->vector_count++;
-                }
-                if (slot != SIZE_MAX) {
-                    rb->vector[slot].doc_id = doc_id;
-                    rb->vector[slot].score = score;
-                }
-            }
-        }
-    }
-    free(hit.text);
-    if (ok) rb->added++;
+/* KEYSTONE is an optional, explicitly loaded candidate engine. Canonical KV
+ * and the QIHSE project-grant gate remain authoritative. */
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+#define AIMEM_PROJECTION_ROWS QIHSE_AIMEM_PROJECTION_MAX_ROWS
+#define AIMEM_PROJECTION_NS 15000000000ull
+#define AIMEM_QUERY_NS 3000000000ull
+typedef struct {
+    void* library;
+    keystone_aimem_vector_index_t* (*create)(size_t, size_t, const uint8_t*);
+    keystone_aimem_vector_status_t (*add)(keystone_aimem_vector_index_t*, const keystone_aimem_vector_entry_t*, const float*);
+    keystone_aimem_vector_status_t (*seal)(keystone_aimem_vector_index_t*, uint64_t);
+    keystone_aimem_vector_status_t (*search)(const keystone_aimem_vector_index_t*, const keystone_aimem_vector_query_t*, const float*, keystone_aimem_vector_hit_t*, size_t, size_t*);
+    void (*destroy)(keystone_aimem_vector_index_t*);
+    qihse_resp_server_t* server;
+    qihse_user_t* principal;
+    qihse_aimem_projection_store_t* cache;
+    keystone_aimem_vector_index_t* index;
+    uint8_t model[32];
+    size_t dimension;
+    uint64_t source_seq, projection_epoch, checked_seq;
+    uint16_t clearance, sci;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    pthread_t worker;
+    bool stop, started, ready;
+} aimem_projection_t;
+static aimem_projection_t* g_projection;
+static pthread_mutex_t g_projection_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t aimem_mono_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0u;
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static bool aimem_digest(const char* raw, uint8_t out[32], char hex[65]) {
+    unsigned int n = 0u;
+    if (!raw || EVP_Digest(raw, strlen(raw), out, &n, EVP_sha256(), NULL) != 1 || n != 32u)
+        return false;
+    for (size_t i = 0u; i < 32u; i++) snprintf(hex + 2u*i, 3u, "%02x", out[i]);
     return true;
 }
+
+typedef struct { char keys[AIMEM_PROJECTION_ROWS][96]; size_t count; bool overflow; char prefix[48]; } aimem_projection_keys_t;
+static bool aimem_projection_key_cb(const char* key, void* opaque) {
+    aimem_projection_keys_t* k = opaque;
+    if (strncmp(key, k->prefix, strlen(k->prefix))) return true;
+    if (k->count == AIMEM_PROJECTION_ROWS || strlen(key) >= sizeof k->keys[0]) {
+        k->overflow = true; return false;
+    }
+    strcpy(k->keys[k->count++], key);
+    return true;
+}
+
+typedef struct { aimem_projection_t* projection; keystone_aimem_vector_index_t* candidate; } aimem_projection_visit_ctx_t;
+static bool aimem_projection_visit(void* opaque, const qihse_aimem_projection_row_t* row,
+        const float* vec, size_t dim) {
+    aimem_projection_visit_ctx_t* ctx = opaque;
+    aimem_projection_t* p = ctx->projection;
+    keystone_aimem_vector_entry_t e = {0};
+    qihse_uuid_t id;
+    if (dim != p->dimension || !qihse_uuid_parse(row->id, &id)) return false;
+    memcpy(e.uuid, id.bytes, 16u);
+    e.source_change_seq = row->source_seq;
+    for (size_t i = 0; i < 32u; i++) {
+        unsigned int byte;
+        if (sscanf(row->content_sha256 + i*2u, "%2x", &byte) != 1) return false;
+        e.content_sha256[i] = (uint8_t)byte;
+    }
+    e.tenant = row->tenant; e.owner = row->owner; e.kind = row->kind;
+    e.classification = row->classification; e.sci = row->sci_compartment;
+    memcpy(e.project, row->project, sizeof e.project);
+    memcpy(e.worktree, row->worktree, sizeof e.worktree);
+    memcpy(e.workstream, row->workstream, sizeof e.workstream);
+    memcpy(e.session, row->session, sizeof e.session);
+    return p->add(ctx->candidate, &e, vec) == KEYSTONE_AIMEM_VECTOR_OK;
+}
+
+static bool aimem_projection_rebuild(aimem_projection_t* p) {
+    qihse_kv_store_t* kv = qihse_resp_server_store(p->server);
+    uint64_t seq = 0u, epoch = 0u, end_seq = 0u, end_epoch = 0u;
+    if (!kv || !qihse_auth_user_is_active(p->principal) ||
+        !qihse_kv_projection_marker(kv, &seq, &epoch)) return false;
+    uint32_t tenant = qihse_user_get_tenant_id(p->principal);
+    uint16_t clearance = qihse_user_get_classification(p->principal);
+    uint16_t sci = qihse_user_get_sci(p->principal);
+    aimem_projection_keys_t* keys = calloc(1u, sizeof(*keys));
+    if (!keys) return false;
+    int n = snprintf(keys->prefix, sizeof keys->prefix, "t:%u/aimem:",
+                     (unsigned)qihse_user_get_tenant_id(p->principal));
+    qihse_resp_server_aimem_read_lock(p->server);
+    bool enumerated = n > 0 && (size_t)n < sizeof keys->prefix &&
+        qihse_kv_foreach_key_user(kv, p->principal, aimem_projection_key_cb, keys);
+    qihse_resp_server_aimem_read_unlock(p->server);
+    if (!enumerated || keys->overflow) {
+        free(keys); return false;
+    }
+    keystone_aimem_vector_index_t* candidate = p->create(p->dimension,
+        AIMEM_PROJECTION_ROWS, p->model);
+    if (!candidate || !qihse_aimem_projection_store_begin_generation(p->cache)) {
+        if (candidate) p->destroy(candidate);
+        free(keys); return false;
+    }
+    bool ok = true;
+    aimem_projection_visit_ctx_t visit = {p, candidate};
+    for (size_t i = 0u; ok && i < keys->count; i++) {
+        if (__atomic_load_n(&p->stop, __ATOMIC_ACQUIRE) || !qihse_auth_user_is_active(p->principal)) { ok = false; break; }
+        /* No RESP lock while embedding: only a short authorized canonical read. */
+        qihse_resp_server_aimem_read_lock(p->server);
+        char* raw = qihse_kv_get_user(kv, keys->keys[i], p->principal);
+        qihse_kv_record_meta_t m;
+        bool meta_ok = raw && qihse_kv_meta_user(kv, keys->keys[i], p->principal, &m);
+        qihse_resp_server_aimem_read_unlock(p->server);
+        if (!raw) { ok = false; break; } /* never publish a partial authorized scan */
+        aimem_record_meta_t record;
+        const char* text = NULL;
+        qihse_uuid_t id;
+        char canonical_key[96];
+        ok = meta_ok && aimem_parse_meta(raw, &record, &text);
+        if (ok && !record.scope.project[0]) { free(raw); continue; }
+        ok = ok && qihse_uuid_parse(record.id, &id) &&
+            aimem_scoped_key(canonical_key, sizeof canonical_key, p->principal, aimem_doc_id(&id)) &&
+            strcmp(canonical_key, keys->keys[i]) == 0 &&
+            m.classification == record.classification && m.sci_compartment == record.sci_compartment;
+        if (ok) {
+            uint8_t digest[32];
+            qihse_aimem_projection_row_t row = {0};
+            float vec[QIHSE_AIMEM_MAX_DIM];
+            ok = aimem_digest(raw, digest, row.content_sha256);
+            if (ok) {
+                memcpy(row.id, record.id, sizeof row.id);
+                row.source_seq = m.change_seq;
+                row.tenant = qihse_user_get_tenant_id(p->principal);
+                row.owner = record.owner_id; row.kind = record.kind;
+                row.classification = m.classification; row.sci_compartment = m.sci_compartment;
+                memcpy(row.project, record.scope.project, sizeof row.project);
+                memcpy(row.worktree, record.scope.worktree, sizeof row.worktree);
+                memcpy(row.workstream, record.scope.workstream, sizeof row.workstream);
+                memcpy(row.session, record.scope.session, sizeof row.session);
+                if (!qihse_aimem_projection_store_lookup(p->cache, row.id, row.content_sha256, vec)) {
+                    uint64_t deadline = aimem_mono_ns() + AIMEM_PROJECTION_NS;
+                    qihse_aimem_onnx_embedder_set_thread_deadline(deadline);
+                    ok = qihse_ai_memory_embed_text(text, vec, p->dimension);
+                    qihse_aimem_onnx_embedder_set_thread_deadline(0u);
+                }
+                for (size_t j = 0u; ok && j < p->dimension; j++) ok = isfinite(vec[j]);
+                if (ok) ok = qihse_aimem_projection_store_put(p->cache, &row, vec) &&
+                    aimem_projection_visit(&visit, &row, vec, p->dimension);
+            }
+        }
+        free(raw);
+    }
+    free(keys);
+    uint8_t current_model[32];
+    ok = ok && qihse_ai_memory_embedder_fingerprint(current_model) &&
+        memcmp(current_model, p->model, 32u) == 0 &&
+        qihse_ai_memory_embedding_dim() == p->dimension &&
+        qihse_aimem_onnx_embedder_active() &&
+        qihse_kv_projection_marker(kv, &end_seq, &end_epoch) &&
+        seq == end_seq && epoch == end_epoch &&
+        qihse_auth_user_is_active(p->principal) &&
+        tenant == qihse_user_get_tenant_id(p->principal) &&
+        clearance == qihse_user_get_classification(p->principal) &&
+        sci == qihse_user_get_sci(p->principal) &&
+        !__atomic_load_n(&p->stop, __ATOMIC_ACQUIRE);
+    if (ok) ok = p->seal(candidate, seq ? seq : 1u) == KEYSTONE_AIMEM_VECTOR_OK;
+    if (ok) ok = qihse_aimem_projection_store_commit_generation(p->cache, seq, epoch);
+    uint64_t publish_seq = 0u, publish_epoch = 0u;
+    bool committed = ok;
+    ok = ok && qihse_kv_projection_marker(kv, &publish_seq, &publish_epoch) &&
+        publish_seq == seq && publish_epoch == epoch &&
+        !__atomic_load_n(&p->stop, __ATOMIC_ACQUIRE);
+    if (ok) {
+        pthread_mutex_lock(&p->lock);
+        keystone_aimem_vector_index_t* old = p->index;
+        p->index = candidate; p->source_seq = seq; p->checked_seq = seq;
+        p->projection_epoch = epoch; p->ready = true;
+        p->clearance = qihse_user_get_classification(p->principal);
+        p->sci = qihse_user_get_sci(p->principal);
+        pthread_cond_broadcast(&p->wake);
+        pthread_mutex_unlock(&p->lock);
+        if (old) p->destroy(old);
+    } else {
+        if (!committed) qihse_aimem_projection_store_abort_generation(p->cache);
+        p->destroy(candidate);
+    }
+    return ok;
+}
+
+static void* aimem_projection_worker(void* opaque) {
+    aimem_projection_t* p = opaque;
+    qihse_kv_store_t* kv = qihse_resp_server_store(p->server);
+    while (!__atomic_load_n(&p->stop, __ATOMIC_ACQUIRE)) {
+        uint64_t seq = 0u, epoch = 0u;
+        if (qihse_kv_projection_marker(kv, &seq, &epoch)) {
+            pthread_mutex_lock(&p->lock);
+            bool identity_changed = p->clearance != qihse_user_get_classification(p->principal) ||
+                p->sci != qihse_user_get_sci(p->principal);
+            bool dirty = !p->ready || identity_changed ||
+                epoch != p->projection_epoch || seq != p->checked_seq;
+            uint64_t since = p->checked_seq;
+            pthread_mutex_unlock(&p->lock);
+            if (dirty && !identity_changed && since && epoch == p->projection_epoch) {
+                char glob[48];
+                int n = snprintf(glob, sizeof glob, "t:%u/aimem*",
+                                 (unsigned)qihse_user_get_tenant_id(p->principal));
+                bool complete = false, relevant = false, success = n > 0 && (size_t)n < sizeof glob;
+                uint64_t cursor = since;
+                /* A negative relevance check is valid only across the whole
+                 * authorized namespace and a stable atomic source marker. */
+                while (success && !complete && !relevant &&
+                       !__atomic_load_n(&p->stop, __ATOMIC_ACQUIRE)) {
+                    qihse_kv_delta_record_t* delta = NULL;
+                    size_t count = 0u; uint64_t resume = 0u;
+                    success = qihse_kv_export_incremental_user_bounded_complete(
+                        kv, p->principal, glob, cursor, AIMEM_PROJECTION_ROWS,
+                        8u*1024u*1024u, &delta, &count, &resume, &complete) == 0;
+                    relevant = count != 0u; /* grant changes also affect visibility */
+                    qihse_kv_delta_records_free(delta, count);
+                    if (success && !complete && resume <= cursor) success = false;
+                    cursor = resume;
+                }
+                uint64_t later_seq = 0u, later_epoch = 0u;
+                if (success && complete && !relevant &&
+                    qihse_kv_projection_marker(kv, &later_seq, &later_epoch) &&
+                    later_seq == seq && later_epoch == epoch) {
+                    pthread_mutex_lock(&p->lock);
+                    p->checked_seq = seq;
+                    pthread_cond_broadcast(&p->wake);
+                    pthread_mutex_unlock(&p->lock);
+                    dirty = false;
+                }
+            }
+            if (dirty) (void)aimem_projection_rebuild(p);
+        }
+        pthread_mutex_lock(&p->lock);
+        if (!p->stop) {
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_nsec += 500000000l;
+            if (until.tv_nsec >= 1000000000l) { until.tv_sec++; until.tv_nsec -= 1000000000l; }
+            (void)pthread_cond_timedwait(&p->wake, &p->lock, &until);
+        }
+        pthread_mutex_unlock(&p->lock);
+    }
+    return NULL;
+}
+
+bool qihse_ai_memory_projection_enable(qihse_resp_server_t* server,
+        qihse_user_t* principal, const char* library_path, const char* cache_directory) {
+    if (!server || !principal || !qihse_auth_user_is_active(principal) ||
+        !library_path || !*library_path || !cache_directory || !*cache_directory ||
+        !qihse_aimem_onnx_embedder_active() ||
+        qihse_user_get_tenant_id(principal) == QIHSE_TENANT_SYSTEM) return false;
+    aimem_projection_t* p = calloc(1u, sizeof(*p));
+    if (!p) return false;
+    p->server = server; p->principal = principal;
+    p->dimension = qihse_ai_memory_embedding_dim();
+    bool ok = p->dimension && p->dimension <= QIHSE_AIMEM_MAX_DIM &&
+        qihse_ai_memory_embedder_fingerprint(p->model);
+    if (ok) p->library = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
+    if (!p->library) ok = false;
+#define AIMEM_SYMBOL(name) do { *(void**)(&p->name) = dlsym(p->library, "keystone_aimem_vector_" #name); if (!p->name) ok = false; } while (0)
+    if (ok) {
+        uint32_t (*abi_version)(void) = NULL;
+        *(void**)(&abi_version) = dlsym(p->library, "keystone_aimem_vector_abi_version");
+        if (!abi_version || abi_version() != KEYSTONE_AIMEM_VECTOR_ABI_VERSION) ok = false;
+    }
+    if (ok) { AIMEM_SYMBOL(create); AIMEM_SYMBOL(add); AIMEM_SYMBOL(seal);
+              AIMEM_SYMBOL(search); AIMEM_SYMBOL(destroy); }
+#undef AIMEM_SYMBOL
+    char path[1024];
+    int n = snprintf(path, sizeof path, "%s/aimem-projection-%u-%u.qap", cache_directory,
+        (unsigned)qihse_user_get_tenant_id(principal), (unsigned)qihse_user_get_id(principal));
+    if (n <= 0 || (size_t)n >= sizeof path) ok = false;
+    if (ok) p->cache = qihse_aimem_projection_store_open(path,
+        qihse_user_get_tenant_id(principal), qihse_user_get_id(principal),
+        p->model, p->dimension);
+    if (!p->cache) ok = false;
+    if (ok) {
+        pthread_mutex_init(&p->lock, NULL);
+        pthread_cond_init(&p->wake, NULL);
+        pthread_mutex_lock(&g_projection_lock);
+        if (g_projection) ok = false;
+        else g_projection = p;
+        pthread_mutex_unlock(&g_projection_lock);
+        if (ok && pthread_create(&p->worker, NULL, aimem_projection_worker, p) == 0)
+            p->started = true;
+        else {
+            pthread_mutex_lock(&g_projection_lock);
+            if (g_projection == p) g_projection = NULL;
+            pthread_mutex_unlock(&g_projection_lock);
+            ok = false;
+        }
+        if (!ok) { pthread_cond_destroy(&p->wake); pthread_mutex_destroy(&p->lock); }
+    }
+    if (!ok) {
+        qihse_aimem_projection_store_close(p->cache);
+        if (p->library) dlclose(p->library);
+        free(p);
+    }
+    return ok;
+}
+
+bool qihse_ai_memory_projection_wait_ready(qihse_resp_server_t* server,
+        qihse_user_t* user, uint32_t timeout_ms) {
+    pthread_mutex_lock(&g_projection_lock);
+    aimem_projection_t* p = g_projection;
+    if (!p || p->server != server || p->principal != user) {
+        pthread_mutex_unlock(&g_projection_lock); return false;
+    }
+    pthread_mutex_lock(&p->lock);
+    pthread_mutex_unlock(&g_projection_lock);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000u;
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000l;
+    if (deadline.tv_nsec >= 1000000000l) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000l; }
+    bool ready = false;
+    while (!p->stop) {
+        uint64_t seq = 0u, epoch = 0u;
+        uint8_t model[32];
+        ready = p->ready && qihse_auth_user_is_active(user) &&
+            p->clearance == qihse_user_get_classification(user) &&
+            p->sci == qihse_user_get_sci(user) &&
+            qihse_aimem_onnx_embedder_active() &&
+            qihse_ai_memory_embedder_fingerprint(model) &&
+            memcmp(model, p->model, sizeof model) == 0 &&
+            qihse_kv_projection_marker(qihse_resp_server_store(server), &seq, &epoch) &&
+            epoch == p->projection_epoch && seq == p->checked_seq;
+        if (ready || pthread_cond_timedwait(&p->wake, &p->lock, &deadline) != 0) break;
+    }
+    pthread_mutex_unlock(&p->lock);
+    return ready;
+}
+
+void qihse_ai_memory_projection_shutdown(qihse_resp_server_t* server) {
+    pthread_mutex_lock(&g_projection_lock);
+    aimem_projection_t* p = g_projection;
+    if (!p || p->server != server) { pthread_mutex_unlock(&g_projection_lock); return; }
+    g_projection = NULL;
+    pthread_mutex_lock(&p->lock); __atomic_store_n(&p->stop, true, __ATOMIC_RELEASE);
+    pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock);
+    pthread_mutex_unlock(&g_projection_lock);
+    if (p->started) pthread_join(p->worker, NULL);
+    if (p->index) p->destroy(p->index);
+    qihse_aimem_projection_store_close(p->cache);
+    pthread_cond_destroy(&p->wake); pthread_mutex_destroy(&p->lock);
+    dlclose(p->library); free(p);
+}
+
+static int aimem_projection_live(aimem_projection_t* p, qihse_user_t* user,
+        const keystone_aimem_vector_entry_t* candidate,
+        const qihse_ai_memory_scope_t* scope) {
+    qihse_kv_store_t* kv = qihse_resp_server_store(p->server);
+    if (candidate->tenant != qihse_user_get_tenant_id(user) ||
+        candidate->tenant != qihse_user_get_tenant_id(p->principal)) return -1;
+    qihse_uuid_t id; memcpy(id.bytes, candidate->uuid, 16u);
+    char key[96], formatted[QIHSE_AIMEM_ID_LEN+1u];
+    if (!qihse_uuid_format(&id, formatted) ||
+        !aimem_scoped_key(key, sizeof key, user, aimem_doc_id(&id))) return -1;
+    qihse_resp_server_aimem_read_lock(p->server);
+    char* raw = qihse_kv_get_user(kv, key, user);
+    qihse_kv_record_meta_t m;
+    bool meta_ok = raw && qihse_kv_meta_user(kv, key, user, &m);
+    qihse_resp_server_aimem_read_unlock(p->server);
+    if (!meta_ok) { free(raw); return -1; }
+    aimem_record_meta_t meta; uint8_t digest[32]; char hex[65];
+    bool current = aimem_parse_meta(raw, &meta, NULL) &&
+        strcmp(meta.id, formatted) == 0 &&
+        aimem_digest(raw, digest, hex) &&
+        memcmp(digest, candidate->content_sha256, 32u) == 0 &&
+        m.change_seq == candidate->source_change_seq &&
+        m.classification == candidate->classification &&
+        m.sci_compartment == candidate->sci &&
+        meta.owner_id == candidate->owner && meta.kind == candidate->kind &&
+        meta.classification == m.classification && meta.sci_compartment == m.sci_compartment &&
+        strcmp(meta.scope.project, candidate->project) == 0 &&
+        strcmp(meta.scope.worktree, candidate->worktree) == 0 &&
+        strcmp(meta.scope.workstream, candidate->workstream) == 0 &&
+        strcmp(meta.scope.session, candidate->session) == 0;
+    free(raw);
+    if (!current) return -1;
+    return aimem_scope_matches(&meta.scope, scope) &&
+        aimem_scope_owner_allowed(kv, user, meta.owner_id, scope) ? 1 : 0;
+}
+
+typedef struct {
+    aimem_projection_t* p;
+    qihse_user_t* user;
+    const qihse_ai_memory_scope_t* scope;
+    uint64_t deadline;
+} aimem_visible_ctx_t;
+static int aimem_projection_visible(const keystone_aimem_vector_entry_t* entry, void* opaque) {
+    aimem_visible_ctx_t* v = opaque;
+    if (!aimem_mono_ns() || aimem_mono_ns() >= v->deadline) return -1;
+    if (!qihse_auth_user_is_active(v->user) ||
+        !qihse_auth_can_access(v->user, entry->classification, entry->sci)) return 0;
+    int visible = aimem_projection_live(v->p, v->user, entry, v->scope);
+    if (aimem_mono_ns() >= v->deadline) return -1;
+    return visible;
+}
+
+static bool aimem_projection_rank(qihse_resp_server_t* server, qihse_user_t* user,
+        const char* text, uint32_t kind, const qihse_ai_memory_scope_t* scope,
+        aimem_cand_t* vector, keystone_aimem_vector_hit_t* evidence, size_t* count,
+        uint64_t deadline) {
+    *count = 0u;
+    pthread_mutex_lock(&g_projection_lock);
+    aimem_projection_t* p = g_projection;
+    if (!p || p->server != server || p->principal != user) {
+        pthread_mutex_unlock(&g_projection_lock); errno = ENOTSUP; return false;
+    }
+    uint64_t seq = 0u, epoch = 0u;
+    qihse_kv_store_t* kv = qihse_resp_server_store(server);
+    uint8_t model[32];
+    pthread_mutex_lock(&p->lock);
+    bool ready = p->ready && p->index && qihse_auth_user_is_active(user) &&
+        qihse_kv_projection_marker(kv, &seq, &epoch) && epoch == p->projection_epoch &&
+        seq == p->checked_seq && p->source_seq <= seq &&
+        p->clearance == qihse_user_get_classification(user) && p->sci == qihse_user_get_sci(user) &&
+        qihse_ai_memory_embedder_fingerprint(model) && !memcmp(model, p->model, 32u) &&
+        qihse_ai_memory_embedding_dim() == p->dimension && qihse_aimem_onnx_embedder_active();
+    if (!ready) { pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock);
+        pthread_mutex_unlock(&g_projection_lock); errno = ESTALE; return false; }
+    float qvec[QIHSE_AIMEM_MAX_DIM];
+    qihse_aimem_onnx_embedder_set_thread_deadline(deadline);
+    bool ok = aimem_mono_ns() < deadline &&
+        qihse_ai_memory_embed_text(text, qvec, p->dimension);
+    qihse_aimem_onnx_embedder_set_thread_deadline(0u);
+    keystone_aimem_vector_query_t query = {0};
+    query.tenant = qihse_user_get_tenant_id(user); query.kind = kind;
+    query.max_classification = qihse_user_get_classification(user);
+    query.allowed_sci = qihse_user_get_sci(user);
+    memcpy(query.project, scope->project, sizeof query.project);
+    memcpy(query.worktree, scope->worktree, sizeof query.worktree);
+    memcpy(query.workstream, scope->workstream, sizeof query.workstream);
+    memcpy(query.session, scope->session, sizeof query.session);
+    memcpy(query.model_sha256, p->model, 32u);
+    query.required_watermark = p->source_seq ? p->source_seq : 1u;
+    query.deadline_ns = deadline;
+    aimem_visible_ctx_t visibility = {p, user, scope, deadline};
+    query.visible = aimem_projection_visible; query.visible_context = &visibility;
+    if (ok) ok = p->search(p->index, &query, qvec, evidence,
+                           AIMEM_CAND_MAX, count) == KEYSTONE_AIMEM_VECTOR_OK;
+    uint64_t end_seq, end_epoch;
+    ok = ok && qihse_kv_projection_marker(kv, &end_seq, &end_epoch) &&
+         end_seq == seq && end_epoch == epoch;
+    if (ok) for (size_t i = 0u; i < *count; i++) {
+        qihse_uuid_t id; memcpy(id.bytes, evidence[i].uuid, 16u);
+        vector[i].doc_id = aimem_doc_id(&id);
+        vector[i].score = evidence[i].cosine;
+    }
+    if (!ok) {
+        *count = 0u;
+        pthread_cond_signal(&p->wake);
+        errno = aimem_mono_ns() >= deadline ? ETIMEDOUT : ESTALE;
+    }
+    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_unlock(&g_projection_lock);
+    return ok;
+}
+#else
+bool qihse_ai_memory_projection_enable(qihse_resp_server_t* server,
+        qihse_user_t* principal, const char* library_path, const char* cache_directory) {
+    (void)server; (void)principal; (void)library_path; (void)cache_directory;
+    errno = ENOTSUP; return false;
+}
+void qihse_ai_memory_projection_shutdown(qihse_resp_server_t* server) { (void)server; }
+bool qihse_ai_memory_projection_wait_ready(qihse_resp_server_t* server,
+        qihse_user_t* principal, uint32_t timeout_ms) {
+    (void)server; (void)principal; (void)timeout_ms; return false;
+}
+#endif
 
 size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
                                      qihse_user_t* user, const char* query,
@@ -2003,28 +2458,41 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
                                      const qihse_ai_memory_scope_t* scope,
                                      qihse_ai_memory_hit_t* out,
                                      size_t out_cap) {
+    errno = 0;
     if (!server || !user || !qihse_auth_user_is_active(user) || !query ||
         !*query || !aimem_scope_valid(scope) || !out || out_cap == 0u ||
         (mode != QIHSE_AIMEM_MODE_BM25 && mode != QIHSE_AIMEM_MODE_SEMANTIC &&
-         mode != QIHSE_AIMEM_MODE_HYBRID) || !aimem_kind_valid(kind)) return 0u;
+         mode != QIHSE_AIMEM_MODE_HYBRID) || !aimem_kind_valid(kind)) {
+        errno = EINVAL; return 0u;
+    }
     size_t want = limit ? limit : 10u;
     if (want > out_cap) want = out_cap;
     if (want > AIMEM_CAND_MAX) want = AIMEM_CAND_MAX;
     qihse_kv_store_t* store = qihse_resp_server_store(server);
-    if (!store) return 0u;
+    if (!store) { if (mode != QIHSE_AIMEM_MODE_BM25) errno = ESTALE; return 0u; }
     aimem_cand_t vector[AIMEM_CAND_MAX];
-    float query_vec[QIHSE_AIMEM_MAX_DIM];
-    size_t query_dim = 0u;
-    bool want_vector = mode == QIHSE_AIMEM_MODE_SEMANTIC ||
-                       mode == QIHSE_AIMEM_MODE_HYBRID;
-    if (want_vector) {
-        query_dim = g_aimem_embedder.dim;
-        if (!query_dim || query_dim > QIHSE_AIMEM_MAX_DIM ||
-            !g_aimem_embedder.embed(query, query_vec, query_dim,
-                                    g_aimem_embedder.ctx)) {
-            return 0u;
-        }
+    bool want_vector = mode != QIHSE_AIMEM_MODE_BM25;
+    size_t vector_count = 0u;
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+    keystone_aimem_vector_hit_t evidence[AIMEM_CAND_MAX];
+    uint64_t query_seq = 0u, query_epoch = 0u;
+    uint8_t query_model[32] = {0};
+    uint32_t query_tenant = qihse_user_get_tenant_id(user);
+    uint32_t query_user_id = qihse_user_get_id(user);
+    uint32_t query_role = qihse_user_get_role(user);
+    uint16_t query_clearance = qihse_user_get_classification(user);
+    uint16_t query_sci = qihse_user_get_sci(user);
+    uint64_t query_deadline = want_vector ? aimem_mono_ns() + AIMEM_QUERY_NS : 0u;
+    if (want_vector && (!qihse_ai_memory_embedder_fingerprint(query_model) ||
+        !qihse_kv_projection_marker(store, &query_seq, &query_epoch) ||
+        !aimem_projection_rank(server, user, query, kind, scope,
+                               vector, evidence, &vector_count, query_deadline))) {
+        if (!errno) errno = ESTALE;
+        return 0u;
     }
+#else
+    if (want_vector) { errno = ENOTSUP; return 0u; }
+#endif
     qihse_fts_index_t* scoped_index = NULL;
     qihse_fts_result_t results[AIMEM_CAND_MAX];
     int found = 0;
@@ -2040,26 +2508,10 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
                 &visibility);
         }
         pthread_mutex_unlock(&g_aimem_scope_index_lock);
-    }
-    aimem_scoped_rebuild_t rb = {
-        .index = NULL, .store = store, .user = user, .scope = scope, .kind = kind,
-        .lexical = false,
-        .query_vec = want_vector ? query_vec : NULL,
-        .query_dim = want_vector ? query_dim : 0u,
-        .vector = want_vector ? vector : NULL,
-        .vector_cap = want_vector ? (want == AIMEM_CAND_MAX ? want : AIMEM_CAND_MAX) : 0u,
-        .vector_count = 0u, .added = 0u
-    };
-    snprintf(rb.key_prefix, sizeof rb.key_prefix, "t:%u/aimem:",
-             (unsigned)qihse_user_get_tenant_id(user));
-    if (want_vector)
-        (void)qihse_kv_foreach_prefix_user(store, rb.key_prefix, user,
-                                           aimem_scoped_rebuild_cb, &rb);
-    for (size_t i = 0; i + 1u < rb.vector_count; i++) {
-        for (size_t j = i + 1u; j < rb.vector_count; j++) {
-            if (vector[j].score > vector[i].score) {
-                aimem_cand_t tmp = vector[i]; vector[i] = vector[j]; vector[j] = tmp;
-            }
+        if (found < 0 || (want_vector && !scoped_index)) {
+            qihse_fts_destroy(scoped_index);
+            errno = EIO;
+            return 0u;
         }
     }
     struct { uint64_t doc_id; double score; } fused[AIMEM_FUSED_MAX];
@@ -2069,7 +2521,7 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
             fused[fused_count].doc_id = results[i].doc_id;
             fused[fused_count++].score = 1.0 / (AIMEM_RRF_K + (double)(i + 1));
         }
-        for (size_t i = 0; i < rb.vector_count && fused_count < AIMEM_FUSED_MAX; i++) {
+        for (size_t i = 0; i < vector_count && fused_count < AIMEM_FUSED_MAX; i++) {
             size_t j = 0u;
             for (; j < fused_count; j++) if (fused[j].doc_id == vector[i].doc_id) break;
             double contribution = 1.0 / (AIMEM_RRF_K + (double)(i + 1u));
@@ -2083,22 +2535,85 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
             }
     }
     size_t written = 0u;
-    size_t n_candidates = mode == QIHSE_AIMEM_MODE_SEMANTIC ? rb.vector_count :
+    size_t n_candidates = mode == QIHSE_AIMEM_MODE_SEMANTIC ? vector_count :
                           mode == QIHSE_AIMEM_MODE_HYBRID ? fused_count : (size_t)found;
     for (size_t i = 0; i < n_candidates && written < want; i++) {
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+        if (want_vector && aimem_mono_ns() >= query_deadline) {
+            qihse_ai_memory_hits_free(out, written);
+            memset(out, 0, written * sizeof *out);
+            qihse_fts_destroy(scoped_index);
+            errno = ETIMEDOUT;
+            return 0u;
+        }
+#endif
         /* FTS ids contain the document key prefix only; resolve the canonical
          * record and recheck its full scope and principal before disclosure. */
         char key[96];
         uint64_t candidate_id = mode == QIHSE_AIMEM_MODE_SEMANTIC ? vector[i].doc_id :
                                 mode == QIHSE_AIMEM_MODE_HYBRID ? fused[i].doc_id :
                                 results[i].doc_id;
-        if (!aimem_scoped_key(key, sizeof key, user, candidate_id)) continue;
+        if (!aimem_scoped_key(key, sizeof key, user, candidate_id)) {
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+            if (want_vector) {
+                qihse_ai_memory_hits_free(out, written);
+                memset(out, 0, written * sizeof *out);
+                qihse_fts_destroy(scoped_index);
+                errno = ESTALE;
+                return 0u;
+            }
+#endif
+            continue;
+        }
         char* raw = qihse_kv_get_user(store, key, user);
-        if (!raw) continue;
+        if (!raw) {
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+            bool vector_candidate = false;
+            for (size_t j = 0; j < vector_count; j++)
+                if (vector[j].doc_id == candidate_id) { vector_candidate = true; break; }
+            if (want_vector && vector_candidate) {
+                qihse_ai_memory_hits_free(out, written);
+                memset(out, 0, written * sizeof *out);
+                qihse_fts_destroy(scoped_index);
+                errno = aimem_mono_ns() >= query_deadline ? ETIMEDOUT : ESTALE;
+                return 0u;
+            }
+#endif
+            continue;
+        }
         qihse_ai_memory_hit_t hit;
         memset(&hit, 0, sizeof hit);
         aimem_record_meta_t meta;
         bool ok = aimem_parse_record_meta(raw, &hit, &meta);
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+        if (ok && want_vector) {
+            size_t match = 0u;
+            for (; match < vector_count; match++)
+                if (vector[match].doc_id == candidate_id) break;
+            if (match < vector_count) {
+                qihse_kv_record_meta_t live_meta;
+                uint8_t digest[32]; char hex[65];
+                qihse_uuid_t live_id;
+                ok = ok && qihse_kv_meta_user(store, key, user, &live_meta) &&
+                    qihse_uuid_parse(hit.id, &live_id) &&
+                    memcmp(live_id.bytes, evidence[match].uuid, 16u) == 0 &&
+                    aimem_digest(raw, digest, hex) &&
+                    memcmp(digest, evidence[match].content_sha256, 32u) == 0 &&
+                    live_meta.change_seq == evidence[match].source_change_seq &&
+                    live_meta.classification == meta.classification &&
+                    live_meta.sci_compartment == meta.sci_compartment;
+                if (!ok) {
+                    free(raw);
+                    free(hit.text);
+                    qihse_ai_memory_hits_free(out, written);
+                    memset(out, 0, written * sizeof *out);
+                    qihse_fts_destroy(scoped_index);
+                    errno = aimem_mono_ns() >= query_deadline ? ETIMEDOUT : ESTALE;
+                    return 0u;
+                }
+            } else if (mode == QIHSE_AIMEM_MODE_SEMANTIC) ok = false;
+        }
+#endif
         free(raw);
         qihse_uuid_t resolved_uuid;
         if (!ok || !meta.scope.project[0] ||
@@ -2115,6 +2630,31 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
         out[written++] = hit;
     }
     qihse_fts_destroy(scoped_index);
+#ifdef QIHSE_ENABLE_AIMEM_KEYSTONE
+    if (want_vector) {
+        uint64_t final_seq = 0u, final_epoch = 0u;
+        uint8_t final_model[32];
+        bool timed_out = aimem_mono_ns() >= query_deadline;
+        if (timed_out || !qihse_auth_user_is_active(user) ||
+            qihse_user_get_tenant_id(user) != query_tenant ||
+            qihse_user_get_id(user) != query_user_id ||
+            qihse_user_get_role(user) != query_role ||
+            qihse_user_get_classification(user) != query_clearance ||
+            qihse_user_get_sci(user) != query_sci ||
+            !qihse_ai_memory_embedder_fingerprint(final_model) ||
+            memcmp(query_model, final_model, sizeof query_model) != 0 ||
+            !qihse_aimem_onnx_embedder_active() ||
+            !qihse_kv_projection_marker(store, &final_seq, &final_epoch) ||
+            final_seq != query_seq || final_epoch != query_epoch ||
+            aimem_mono_ns() >= query_deadline) {
+            qihse_ai_memory_hits_free(out, written);
+            memset(out, 0, written * sizeof *out);
+            errno = aimem_mono_ns() >= query_deadline ? ETIMEDOUT : ESTALE;
+            return 0u;
+        }
+    }
+#endif
+    errno = 0;
     return written;
 }
 

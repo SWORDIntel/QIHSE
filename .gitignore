@@ -20,6 +20,7 @@ lib/
 /tests/test_*
 !/tests/*.c
 !/tests/test_admin_cli.py
+!/tests/test_aimem_projection_qkp.py
 /tests/bench_*
 /tests/test_aggregate_hardened
 /tests/test_auth_privilege_boundary

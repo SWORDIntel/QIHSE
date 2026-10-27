@@ -1,20 +1,53 @@
 # Scoped AIMEM hybrid indexing through KEYSTONE
 
-Status: in progress. KEYSTONE now has a sealed, filtered, dimension-aware
-candidate-only vector primitive with tests. No QIHSE ingestion, durable
-projection, rebaseline or production semantic/hybrid switch is implemented;
-existing explicit hybrid queries still perform per-query scoped embedding.
+Status: in progress. KEYSTONE has a sealed, filtered, dimension-aware
+candidate-only vector primitive with a versioned shared-library ABI gate.
+QIHSE can now bind the built-in embedder to a
+versioned fingerprint and the ONNX embedder to a hash of model, vocabulary and
+preprocessing; custom providers require an explicit fingerprint before they
+can participate in a projection. KV now exposes a store-local projection
+invalidation epoch advanced on successful restore and SSTable compaction;
+compaction's threshold uses live SSTable count rather than the next file ID
+so routine sweeps do not repeatedly invalidate an otherwise current index.
+The opt-in standalone build now has an asynchronous authorized full-pass
+reconciliation worker, protected versioned SQLite vector cache, and sealed
+KEYSTONE candidate generations. Restart always rebaselines against canonical KV;
+the persisted scoped BM25 generation is also invalid across KV-store instances
+and restore/compaction epochs. Explicit semantic/hybrid returns an unavailable
+error until a complete current generation exists. This remains off the live
+standalone service and production cluster. The 8,192 authorized-key limit fails
+the generation closed; the SQLite cache is capped at 128 MiB (with up to
+128 MiB of rollback-journal space during replacement). ONNX deadlines are
+cooperative and cannot bound arbitrary blocking lock acquisition. Full-scale
+latency, quality and recovery gates remain open. In an isolated 552-visible-row
+fixture using the real ONNX model, initial backfill took 17.4 s;
+20 indexed semantic requests measured p50 31.4 ms and p95 37.1 ms;
+a canonical rebaseline using cached vectors took 415 ms. The full default
+QIHSE `make test` suite and the opt-in real-ONNX fixture passed, as did a
+separate isolated pinned-QKP standalone-service test (AUTH/pin refusals,
+semantic hit, project isolation, delete reconciliation). The one-record
+pinned-QKP fixture measured 20 semantic RTTs at p50 24.0 ms/p95 27.0 ms;
+that is not a 552-row QKP measurement. A store-only ASan/UBSan test covered
+8,192 maximum-dimension cache rows. Four synthetic AIMEM fixtures now remove
+successful-run artifacts after closing their stores and audit writer; unrelated
+old test directories were removed without merging them into canonical data.
+The final canonical candidate read also fails closed on missing or mismatched
+vector evidence. These are not live-corpus indexed
+measurements or hard deadline guarantees. The current standalone service
+reported at least 557 scoped records in 7 nonempty projects among 56
+checked project names through authorized pinned QKP; the interface does not
+provide an exhaustive project inventory, so 557 is a lower bound.
 
 ## Evidence and boundaries
 
 - `src/spinnaker/qihse_ai_memory.c:683`: scoped writes skip the persisted-vector
   path (`if (!scope)`). Existing unscoped vector keys are not a scoped schema.
-- `src/spinnaker/qihse_ai_memory.c:1941`: scoped recall embeds matching documents
-  inside the KV enumeration callback. The query embeds once, then scans the
-  tenant prefix and rebuilds vector candidates on every request.
-- `src/spinnaker/qihse_ai_memory.c:1880`: lexical projections are principal/scope
-  specific and invalidated by the whole-store change sequence. They are loaded
-  per request, and unrelated KV writes can trigger rebuilds.
+- `src/spinnaker/qihse_ai_memory.c`: explicit opt-in semantic/hybrid embeds
+  only the query; the worker snapshots authorized keys and embeds missing or
+  changed canonical rows after releasing the enumeration lock.
+- Scoped BM25 persists a principal/scope-specific generation. Its on-disk
+  sequence alone was insufficient after restore/restart; generation loads now
+  require a fresh KV instance ID and matching process-local epoch.
 - `src/spinnaker/qihse_ai_memory.c:2088`: final canonical reads and authorization
   checks are essential; preserve them regardless of index implementation.
 - KEYSTONE's `include/keystone_workflow_index.h` supplies relevant patterns:
@@ -89,7 +122,7 @@ best-effort API could report degraded mode later; it is not needed for v1.
 
 ## Projection and persistence contract
 
-Proposed versioned entry (not an existing API): store/history identity, full
+Current protected projection row and remaining desired durability contract: full
 memory UUID, source revision/content digest, tenant, owner, four scope components,
 kind, classification, SCI, tombstone, model identity and normalized vector.
 
@@ -246,6 +279,13 @@ telemetry only), lock wait/hold time, index size, replay failures and query phas
 histograms. Avoid unbounded principal/scope labels and text/query logging.
 
 ## Rollout scope
+
+The default cluster build remains independent of KEYSTONE/ONNX, with BM25
+hooks unchanged. A local cluster-node binary update does not enable the opt-in
+projection and must not change the standalone pinned-QKP service. Its deadline,
+model-replacement concurrency, full-corpus sizing, recovery and shadow-comparison
+gates are still open; synthetic fixture results are not authorization to enable
+semantic/hybrid recall on the live service.
 
 Start with the standalone AIMEM service and its explicitly configured KEYSTONE
 addon. Do not redirect to the production cluster or roll this into all cluster

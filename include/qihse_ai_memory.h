@@ -140,6 +140,20 @@ typedef struct {
     char* text;   /* caller frees */
 } qihse_ai_memory_hit_t;
 
+/* Opt-in, standalone-only KEYSTONE candidate projection. Both paths are
+ * explicit configuration; disabled builds refuse semantic/hybrid scoped recall
+ * rather than silently returning an empty result or lexical fallback. */
+bool qihse_ai_memory_projection_enable(qihse_resp_server_t* server,
+    qihse_user_t* projection_principal, const char* library_path,
+    const char* cache_directory);
+void qihse_ai_memory_projection_shutdown(qihse_resp_server_t* server);
+/* Test/diagnostic synchronization only; startup never waits for backfill. */
+bool qihse_ai_memory_projection_wait_ready(qihse_resp_server_t* server,
+    qihse_user_t* principal, uint32_t timeout_ms);
+/* RESP serializes key-only enumeration under its KV read lock. */
+void qihse_resp_server_aimem_read_lock(qihse_resp_server_t* server);
+void qihse_resp_server_aimem_read_unlock(qihse_resp_server_t* server);
+
 /* ── Embeddings (ai_fabric.md §5, the embedding-backed recall item) ─────── */
 
 /* How recall ranks.
@@ -191,6 +205,14 @@ size_t qihse_ai_memory_embedding_dim(void);
 
 /* The active embedder's name, or "" when none is usable. */
 const char* qihse_ai_memory_embedder_name(void);
+
+/* A projection may compare vectors only with the exact same model and
+ * preprocessing. A custom provider must install its 32-byte artifact digest
+ * after set_embedder(); the built-in lexical embedder has a versioned digest.
+ * Changing providers clears any previously installed custom digest. This API
+ * is for index generation; it does not change legacy recall or stored vectors. */
+bool qihse_ai_memory_set_embedder_fingerprint(const uint8_t digest[32]);
+bool qihse_ai_memory_embedder_fingerprint(uint8_t out[32]);
 
 /* Run the active embedder on `text`, filling exactly `dim` floats.
  * Returns false when no provider is usable, `dim` does not match the

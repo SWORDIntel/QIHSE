@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -287,7 +288,8 @@ struct qihse_kv_store {
     FILE* wal_fd;
     size_t wal_unflushed_bytes;
     size_t mem_usage;
-    int sstable_counter;
+    int sstable_counter; /* next SSTable id, not the number of live files */
+    size_t sstable_live_count;
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
     bool replica_read_only;
@@ -302,6 +304,8 @@ struct qihse_kv_store {
      * regresses it; it is never reset.  Exposed through
      * qihse_kv_change_seq(). */
     uint64_t change_seq;
+    uint64_t projection_epoch; /* store-local; invalidates derived delta cursors */
+    uint64_t instance_id; /* fresh on every create, including after restart */
     struct kv_replica_cursor* replica_cursors;
     /* Read-side fd cache: keep a bounded set of SSTable fds open so a
      * point GET on flushed data does not pay open()+close() per request.
@@ -1147,6 +1151,7 @@ static bool flush_memtable_to_sstable(qihse_kv_store_t* store) {
     store->trie = replacement;
     store->mem_usage = 0u;
     store->sstable_counter++;
+    store->sstable_live_count++;
     qihse_trinary_trie_destroy(old);
     (void)rotate_wal_empty(store);
     return true;
@@ -1463,6 +1468,12 @@ static bool load_sstable_into_trie(const char* path, qihse_trinary_trie_t* dst,
     fclose(f); return ok;
 }
 
+static void kv_projection_epoch_advance(qihse_kv_store_t* store) {
+    /* Wrapping would make a stale generation indistinguishable from a fresh
+     * one. Fail closed rather than silently reusing a cursor. */
+    if (__atomic_add_fetch(&store->projection_epoch, 1u, __ATOMIC_RELEASE) == 0u) abort();
+}
+
 static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
     if (!store || !store->trie) return false;
     if (store->sstable_counter == 0) return true;
@@ -1493,8 +1504,10 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
         if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
     }
     store->sstable_counter = 0;
+    store->sstable_live_count = 0u;
     sst_meta_index_reset(store);
     sst_fd_cache_clear(store);
+    kv_projection_epoch_advance(store);
     return true;
 }
 
@@ -1651,15 +1664,18 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     sst_fd_cache_clear(store);
     if (wctx.written == 0u) {
         store->sstable_counter = 0;
+        store->sstable_live_count = 0u;
         sst_meta_index_reset(store); /* entries now point at deleted files — rebuild empty */
     } else {
         store->sstable_counter = new_id + 1;
+        store->sstable_live_count = 1u;
         sst_meta_index_reset(store);
         /* Re-index the merged file.  If the index is gone (OOM) lookups fall
          * back to the degraded full scan, which still finds sstable_<new_id>
          * because sstable_counter covers it. */
         if (store->sst_meta) sst_index_load_file(store, new_path, new_id);
     }
+    kv_projection_epoch_advance(store);
     return true;
 }
 
@@ -1878,8 +1894,18 @@ static void sst_index_load_file(qihse_kv_store_t* store, const char* path, int32
 qihse_kv_store_t* qihse_kv_store_create(void) {
     qihse_kv_store_t* store = (qihse_kv_store_t*)calloc(1u, sizeof(*store));
     if (!store) return NULL;
+    size_t random_bytes = 0u;
+    while (random_bytes < sizeof store->instance_id) {
+        ssize_t n = getrandom((char*)&store->instance_id + random_bytes,
+                              sizeof store->instance_id - random_bytes, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(store); return NULL; }
+        random_bytes += (size_t)n;
+    }
+    if (store->instance_id == 0u) { free(store); return NULL; }
     store->trie = qihse_trinary_trie_create();
     if (!store->trie) { free(store); return NULL; }
+    __atomic_store_n(&store->projection_epoch, 1u, __ATOMIC_RELAXED);
     /* Mark cache slots empty before ANY early destroy path can run —
      * a zeroed slot otherwise looks like fd 0 (stdin). */
     for (size_t i = 0; i < sizeof(store->sst_fds) / sizeof(store->sst_fds[0]); i++) {
@@ -1901,8 +1927,11 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
         while ((ent = readdir(d)) != NULL) {
             if (strncmp(ent->d_name, "sstable_", 8u) == 0) {
                 char* end = NULL; long id = strtol(ent->d_name + 8u, &end, 10);
-                if (end && strcmp(end, ".db") == 0 && id >= 0 && id < INT_MAX && id + 1 > store->sstable_counter)
-                    store->sstable_counter = (int)id + 1;
+                if (end && strcmp(end, ".db") == 0 && id >= 0 && id < INT_MAX) {
+                    store->sstable_live_count++;
+                    if (id + 1 > store->sstable_counter)
+                        store->sstable_counter = (int)id + 1;
+                }
             }
         }
         closedir(d);
@@ -2418,7 +2447,7 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
     for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
     free(ctx.keys);
     if (sst_meta_index_has_expired(store->sst_meta, now) ||
-        store->sstable_counter >= KV_SSTABLE_COMPACT_THRESHOLD) {
+        store->sstable_live_count >= KV_SSTABLE_COMPACT_THRESHOLD) {
         (void)compact_sstables_stream(store);
     }
     kv_store_unlock(store);
@@ -3080,8 +3109,10 @@ static int qihse_kv_load_user_internal(qihse_kv_store_t* store, const char* file
         if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
     }
     store->sstable_counter = 0;
+    store->sstable_live_count = 0u;
     sst_meta_index_reset(store);
     sst_fd_cache_clear(store);
+    kv_projection_epoch_advance(store);
     kv_store_unlock(store);
     return 0;
 }
@@ -3233,6 +3264,25 @@ uint64_t qihse_kv_change_seq(qihse_kv_store_t* store) {
     return __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED);
 }
 
+uint64_t qihse_kv_instance_id(qihse_kv_store_t* store) {
+    return store ? store->instance_id : 0u;
+}
+
+uint64_t qihse_kv_projection_epoch(qihse_kv_store_t* store) {
+    if (!store) return 0u;
+    return __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE);
+}
+
+bool qihse_kv_projection_marker(qihse_kv_store_t* store,
+                                uint64_t* out_seq, uint64_t* out_epoch) {
+    if (!store || !out_seq || !out_epoch) return false;
+    kv_store_rdlock(store);
+    *out_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+    *out_epoch = __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE);
+    kv_store_unlock(store);
+    return true;
+}
+
 void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count) {
     if (!records) return;
     for (size_t i = 0; i < count; i++) {
@@ -3254,6 +3304,7 @@ typedef struct {
     size_t max_records;
     size_t max_bytes;
     size_t bytes;
+    bool truncated;
     bool ok;
 } delta_collect_ctx_t;
 
@@ -3264,9 +3315,15 @@ static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const 
     size_t key_len = strlen(key);
     bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
     size_t value_len = tombstone ? 0u : strlen(val ? val : "");
+    if (key_len > SIZE_MAX - 160u || value_len > SIZE_MAX - key_len - 160u) {
+        ctx->ok = false;
+        return false;
+    }
     size_t cost = key_len + value_len + 160u;
     if (ctx->max_records != 0u) {
-        if (cost > ctx->max_bytes) return true;
+        /* A visible oversized row cannot be silently skipped: doing so
+         * would let a derived index advance past a missing mutation. */
+        if (cost > ctx->max_bytes) { ctx->ok = false; return false; }
         size_t largest = SIZE_MAX;
         for (size_t i = 0; i < ctx->count; i++) {
             if (largest == SIZE_MAX || ctx->recs[i].change_seq > ctx->recs[largest].change_seq ||
@@ -3277,9 +3334,10 @@ static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const 
             (p->change_seq == ctx->recs[largest].change_seq &&
              strcmp(key, ctx->recs[largest].key) < 0);
         if ((ctx->count >= ctx->max_records || ctx->bytes + cost > ctx->max_bytes) &&
-            !before_largest) return true;
+            !before_largest) { ctx->truncated = true; return true; }
         while (ctx->count > 0u &&
                (ctx->count >= ctx->max_records || ctx->bytes + cost > ctx->max_bytes)) {
+            ctx->truncated = true;
             largest = 0u;
             for (size_t i = 1u; i < ctx->count; i++)
                 if (ctx->recs[i].change_seq > ctx->recs[largest].change_seq ||
@@ -3372,7 +3430,9 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
                                      const char* glob, uint64_t since_seq,
                                      size_t max_records, size_t max_bytes,
                                      qihse_kv_delta_record_t** out_records,
-                                     size_t* out_count, uint64_t* out_resume_seq) {
+                                     size_t* out_count, uint64_t* out_resume_seq,
+                                     bool* out_complete) {
+    if (out_complete) *out_complete = false;
     if (out_records) *out_records = NULL;
     if (out_count) *out_count = 0u;
     if (out_resume_seq) *out_resume_seq = 0u;
@@ -3415,6 +3475,7 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
     *out_records = ctx.recs;
     *out_count = ctx.count;
     *out_resume_seq = ctx.resume;
+    if (out_complete) *out_complete = !ctx.truncated;
     return 0;
 }
 
@@ -3423,7 +3484,7 @@ int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user
                                      qihse_kv_delta_record_t** out_records,
                                      size_t* out_count, uint64_t* out_resume_seq) {
     return kv_export_incremental_common(store, user, NULL, since_seq, 0u, 0u,
-                                        out_records, out_count, out_resume_seq);
+                                        out_records, out_count, out_resume_seq, NULL);
 }
 
 int qihse_kv_export_incremental_user_bounded(qihse_kv_store_t* store,
@@ -3435,7 +3496,21 @@ int qihse_kv_export_incremental_user_bounded(qihse_kv_store_t* store,
     if (!namespace_glob || !*namespace_glob || max_records == 0u || max_bytes == 0u)
         return -1;
     return kv_export_incremental_common(store, user, namespace_glob, since_seq,
-        max_records, max_bytes, out_records, out_count, out_resume_seq);
+        max_records, max_bytes, out_records, out_count, out_resume_seq, NULL);
+}
+
+int qihse_kv_export_incremental_user_bounded_complete(qihse_kv_store_t* store,
+    qihse_user_t* user, const char* namespace_glob, uint64_t since_seq,
+    size_t max_records, size_t max_bytes,
+    qihse_kv_delta_record_t** out_records, size_t* out_count,
+    uint64_t* out_resume_seq, bool* out_complete) {
+    if (!out_complete || !namespace_glob || !*namespace_glob ||
+        max_records == 0u || max_bytes == 0u) {
+        if (out_complete) *out_complete = false;
+        return -1;
+    }
+    return kv_export_incremental_common(store, user, namespace_glob, since_seq,
+        max_records, max_bytes, out_records, out_count, out_resume_seq, out_complete);
 }
 
 /* File form of the delta: the same text record stream qihse_kv_save_user

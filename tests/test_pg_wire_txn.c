@@ -386,6 +386,14 @@ static void test_pg_wire_handshake_and_queries() {
         qihse_uwp_sql_table_store(), "pg_txn_protected");
     assert(protected_table && qihse_table_row_count(protected_table) == 1);
 
+    /* Cleartext password authentication must not bind beyond loopback. */
+    errno = 0;
+    assert(qihse_pg_wire_listener_open_uwp(&uwp, topo, "0.0.0.0", 0) == NULL);
+    assert(errno == EACCES);
+    errno = 0;
+    assert(qihse_pg_wire_listener_open_uwp(&uwp, topo, "192.0.2.1", 0) == NULL);
+    assert(errno == EACCES);
+
     /* Exercise the public TCP listener rather than only the socketpair
      * handler. It must retain the same authenticated transaction path. */
     qihse_pg_wire_listener_t* listener = qihse_pg_wire_listener_open_uwp(

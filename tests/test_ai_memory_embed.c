@@ -91,6 +91,9 @@ int main(void) {
     /* ── the built-in provider is honest about being lexical ───────────── */
     assert(strcmp(qihse_ai_memory_embedder_name(), "builtin-lexical-256") == 0);
     assert(qihse_ai_memory_embedding_dim() == 256u);
+    uint8_t builtin_digest[32], active_digest[32], custom_digest[32] = {0};
+    assert(qihse_ai_memory_embedder_fingerprint(builtin_digest));
+    assert(!qihse_ai_memory_set_embedder_fingerprint(builtin_digest));
     printf("PASS builtin provider: named for what it is, dim %zu\n",
            qihse_ai_memory_embedding_dim());
 
@@ -138,6 +141,17 @@ int main(void) {
     assert(qihse_ai_memory_set_embedder(&g_syn));
     assert(strcmp(qihse_ai_memory_embedder_name(), "test-synonym-8") == 0);
     assert(qihse_ai_memory_embedding_dim() == SYN_DIM);
+    assert(!qihse_ai_memory_embedder_fingerprint(active_digest));
+    assert(!qihse_ai_memory_set_embedder_fingerprint(custom_digest));
+    custom_digest[0] = 0x42u;
+    assert(qihse_ai_memory_set_embedder_fingerprint(custom_digest));
+    assert(qihse_ai_memory_embedder_fingerprint(active_digest));
+    assert(memcmp(active_digest, custom_digest, sizeof active_digest) == 0);
+    assert(qihse_ai_memory_set_embedder(NULL));
+    assert(qihse_ai_memory_embedder_fingerprint(active_digest));
+    assert(memcmp(active_digest, builtin_digest, sizeof active_digest) == 0);
+    assert(qihse_ai_memory_set_embedder(&g_syn));
+    assert(!qihse_ai_memory_embedder_fingerprint(active_digest));
 
     char id_beta[QIHSE_AIMEM_ID_LEN + 1u];
     char id_gamma[QIHSE_AIMEM_ID_LEN + 1u];

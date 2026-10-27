@@ -1,4 +1,5 @@
 /* Authenticated RESP surface for native QIHSE AI memory. */
+#include "aimem_fixture_cleanup.h"
 #include "qihse_ai_memory.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
@@ -39,7 +40,11 @@ static void expect_contains(qihse_user_t* user, size_t argc,
     char* text = calloc(len + 1u, 1u);
     assert(text);
     memcpy(text, reply, len);
-    if (!strstr(text, needle)) fprintf(stderr, "expected response containing [%s], got [%s]\n", needle, text);
+    if (!strstr(text, needle)) {
+        fprintf(stderr, "expected response containing [%s], got [%s]; command:", needle, text);
+        for (size_t i = 0; i < argc; i++) fprintf(stderr, " [%s]", argv[i]);
+        fputc('\n', stderr);
+    }
     assert(strstr(text, needle) != NULL);
     free(text);
     free(reply);
@@ -468,10 +473,10 @@ int main(void) {
     expect_contains(guest, 10u, scoped_recall, scoped_id);
     const char* scoped_semantic[] = { "AIMEM", "RECALL-SCOPED", "alpha scoped", "8",
         "semantic", "0", "project-alpha", "", "", "" };
-    expect_contains(guest, 10u, scoped_semantic, scoped_id);
+    expect_contains(guest, 10u, scoped_semantic, "ERR AIMEM semantic projection unavailable or stale");
     const char* scoped_hybrid[] = { "AIMEM", "RECALL-SCOPED", "alpha scoped", "8",
         "hybrid", "0", "project-alpha", "", "", "" };
-    expect_contains(guest, 10u, scoped_hybrid, scoped_id);
+    expect_contains(guest, 10u, scoped_hybrid, "ERR AIMEM semantic projection unavailable or stale");
     const char* wrong_recall[] = { "AIMEM", "RECALL-SCOPED", "alpha scoped", "8",
         "bm25", "0", "project-beta", "", "", "" };
     expect_contains(guest, 10u, wrong_recall, "*0\r\n");
@@ -546,7 +551,7 @@ int main(void) {
     const char* project_count[] = { "AIMEM", "COUNT-SCOPED", "project-alpha", "", "", "" };
     expect_contains(guest, 6u, project_count, ":2\r\n");
     const char* wrong_worktree_recall[] = { "AIMEM", "RECALL-SCOPED",
-        "checkout boundary", "8", "hybrid", "0", "project-alpha",
+        "checkout boundary", "8", "bm25", "0", "project-alpha",
         "checkout-b", "", "" };
     expect_contains(guest, 10u, wrong_worktree_recall, "*0\r\n");
 
@@ -864,6 +869,7 @@ int main(void) {
     free(process_handoff_id);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
+    aimem_fixture_cleanup(data_root);
     puts("PASS authenticated AIMEM RESP protocol and principal enforcement");
     return 0;
 }

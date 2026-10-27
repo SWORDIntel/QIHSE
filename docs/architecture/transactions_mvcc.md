@@ -12,8 +12,12 @@
 >    generation fences and ROLLBACK discards them. Autocommit UWP SQL SELECT
 >    now supports a bounded one-table projection/filter path behind READ ACLs;
 >    SELECT within a transaction, cross-model transactions, savepoint data
->    restoration, WAL durability and pgwire integration remain outside this
->    bounded slice.
+>    restoration and WAL durability remain outside this bounded slice. Pgwire
+>    delegates some SQL DML and SELECT to UWP, but this does not make the table
+>    store durable. Its public listener refuses non-loopback binds because it
+>    still rejects SSL negotiation and requests cleartext passwords. No SQL
+>    consumer should be redirected until TLS, durable SQL recovery, authorization,
+>    and application compatibility have been verified.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >
@@ -270,8 +274,14 @@ int qihse_mvcc_row_count(qihse_mvcc_store_t* store);
 
 The header is 30 bytes (`QIHSE_WAL_RECORD_HEADER_SIZE`) with the checksum at
 offset 26; the checksum covers the header fields, the key and the value. Replay
-recomputes it and stops at the first record that does not match, which
-`tests/test_txn.c` asserts by corrupting a checksum byte.
+recomputes it and fails closed on a mismatch or incomplete record; writer
+startup scans surviving segments for the next LSN and refuses a corrupt WAL.
+An exclusive directory lock prevents competing WAL writer handles across
+processes. A torn tail currently prevents writer startup rather than repairing
+and discarding the incomplete record. This WAL is not connected to UWP SQL
+commits; SQL schema/row atomic replay, fsynced commit acknowledgement, and
+cross-process SQL state publication remain outstanding. Do not interpret these
+WAL tests as evidence of durable SQL.
 
 ### WAL Operations
 
@@ -375,8 +385,9 @@ Checkpoint procedure:
 3. **SAVEPOINT and partial rollback**: savepoint stack and write-set trim for
    recorded keys; transactions with a local storage resource refuse savepoints
    until that resource supports data snapshots.
-4. **WAL append and replay**: LSN ordering, payload survival, `start_lsn`
-   filtering, and refusal to replay a record whose CRC does not match.
+4. **WAL append and replay**: LSN ordering (including restart), payload survival,
+   `start_lsn` filtering, rejection of competing writers and refusal to open a
+   truncated or checksum-corrupt WAL.
 5. **Crash recovery**: a committed transaction's insert is redone and visible; a
    transaction that never committed is registered aborted and its data stays
    invisible; transaction ids stay monotonic; checkpointing runs.

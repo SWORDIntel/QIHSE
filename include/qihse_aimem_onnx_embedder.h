@@ -20,18 +20,28 @@
 #define QIHSE_AIMEM_ONNX_EMBEDDER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Load the model under `model_dir` and install it as the active AI-memory
- * embedder. The provider name is "onnx:<basename(model_dir)>", so vectors
- * stay bound to the model that produced them. Returns false on any failure. */
+ * embedder. The provider name is descriptive; the SHA-256 fingerprint binds
+ * vectors to model artifacts and preprocessing. Returns false on any failure. */
 bool qihse_aimem_onnx_embedder_install(const char* model_dir);
 
 /* The installed provider name, or "" when the ONNX embedder is not active. */
 const char* qihse_aimem_onnx_embedder_name(void);
+
+/* True only while a fully installed ONNX provider is active. */
+bool qihse_aimem_onnx_embedder_active(void);
+
+/* Optional absolute CLOCK_MONOTONIC deadline for the calling thread's next
+ * embeddings. Set 0 to clear. ONNX Run is cooperatively terminated through
+ * its per-call RunOptions when this deadline passes. The caller must still
+ * enforce its own deadline across KV, ranking and materialization. */
+void qihse_aimem_onnx_embedder_set_thread_deadline(uint64_t monotonic_ns);
 
 #ifdef __cplusplus
 }

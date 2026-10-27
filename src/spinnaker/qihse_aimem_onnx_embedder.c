@@ -20,11 +20,18 @@
 #include <onnxruntime/onnxruntime_c_api.h>
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <openssl/evp.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 #define ONNX_EMBEDDER_MAX_SEQ 256u
 #define ONNX_EMBEDDER_MAX_PIECES_PER_WORD 100u
@@ -278,6 +285,48 @@ typedef struct {
 
 static onnx_embedder_t g_onnx;
 static bool g_onnx_installed = false;
+static _Thread_local uint64_t g_onnx_thread_deadline_ns;
+
+void qihse_aimem_onnx_embedder_set_thread_deadline(uint64_t monotonic_ns) {
+    g_onnx_thread_deadline_ns = monotonic_ns;
+}
+
+static uint64_t onnx_mono_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return UINT64_MAX;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+typedef struct {
+    const OrtApi* ort;
+    OrtRunOptions* options;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool stopped;
+    uint64_t deadline;
+} onnx_run_timer_t;
+
+static void* onnx_run_terminate_at_deadline(void* opaque) {
+    onnx_run_timer_t* timer = opaque;
+    struct timespec when = {(time_t)(timer->deadline / UINT64_C(1000000000)),
+                            (long)(timer->deadline % UINT64_C(1000000000))};
+    pthread_mutex_lock(&timer->lock);
+    while (!timer->stopped) {
+        int rc = pthread_cond_timedwait(&timer->cond, &timer->lock, &when);
+        if (rc == ETIMEDOUT) break;
+        if (rc != 0) break;
+    }
+    if (!timer->stopped) {
+        OrtStatus* status = timer->ort->RunOptionsSetTerminate(timer->options);
+        if (status) {
+            fprintf(stderr, "[qihse-aimem-onnx] could not terminate expired Run: %s\n",
+                    timer->ort->GetErrorMessage(status));
+            timer->ort->ReleaseStatus(status);
+        }
+    }
+    pthread_mutex_unlock(&timer->lock);
+    return NULL;
+}
 
 #define ORT_TRY(call)                                                     \
     do {                                                                  \
@@ -296,6 +345,8 @@ static bool onnx_embed(const char* text, float* out, size_t dim, void* ctx) {
     (void)ctx;
     if (!g_onnx_installed || dim != g_onnx.dim || !text || !out) return false;
     const OrtApi* ort = g_onnx.ort;
+    uint64_t deadline = g_onnx_thread_deadline_ns;
+    if (deadline && onnx_mono_ns() >= deadline) return false;
 
     int64_t ids[ONNX_EMBEDDER_MAX_SEQ];
     uint32_t seq = 0;
@@ -308,7 +359,14 @@ static bool onnx_embed(const char* text, float* out, size_t dim, void* ctx) {
     OrtValue* in_mask = NULL;
     OrtValue* in_type = NULL;
     OrtValue* out_tensor = NULL;
-    if (!mask || !type_ids) goto done;
+    OrtTensorTypeAndShapeInfo* info = NULL;
+    OrtTypeInfo* type_info = NULL;
+    float* data = NULL;
+    OrtRunOptions* run_options = NULL;
+    onnx_run_timer_t timer = {0};
+    pthread_t timer_thread;
+    bool timer_mutex = false, timer_cond = false, timer_started = false;
+    if (!mask || !type_ids || (deadline && onnx_mono_ns() >= deadline)) goto done;
     for (uint32_t i = 0; i < seq; i++) { mask[i] = 1; type_ids[i] = 0; }
 
     int64_t shape[2] = {1, (int64_t)seq};
@@ -322,11 +380,29 @@ static bool onnx_embed(const char* text, float* out, size_t dim, void* ctx) {
     const char* input_names[3] = {"input_ids", "attention_mask", "token_type_ids"};
     const char* output_names[1] = {"last_hidden_state"};
     const OrtValue* inputs[3] = {in_ids, in_mask, in_type};
-    ORT_TRY(ort->Run(g_onnx.session, NULL, input_names, inputs, 3, output_names, 1, &out_tensor));
+    if (deadline) {
+        if (onnx_mono_ns() >= deadline) goto done;
+        ORT_TRY(ort->CreateRunOptions(&run_options));
+        timer.ort = ort;
+        timer.options = run_options;
+        timer.deadline = deadline;
+        if (pthread_mutex_init(&timer.lock, NULL) != 0) goto done;
+        timer_mutex = true;
+        pthread_condattr_t attr;
+        if (pthread_condattr_init(&attr) != 0) goto done;
+        int attr_ok = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        if (attr_ok == 0 && pthread_cond_init(&timer.cond, &attr) == 0)
+            timer_cond = true;
+        pthread_condattr_destroy(&attr);
+        if (!timer_cond || pthread_create(&timer_thread, NULL,
+                                          onnx_run_terminate_at_deadline, &timer) != 0)
+            goto done;
+        timer_started = true;
+    }
+    ORT_TRY(ort->Run(g_onnx.session, run_options, input_names, inputs, 3,
+                     output_names, 1, &out_tensor));
+    if (deadline && onnx_mono_ns() >= deadline) goto done;
 
-    OrtTensorTypeAndShapeInfo* info = NULL;
-    OrtTypeInfo* type_info = NULL;
-    float* data = NULL;
     ORT_TRY(ort->GetTypeInfo(out_tensor, &type_info));
     ORT_TRY(ort->CastTypeInfoToTensorInfo(type_info, (const OrtTensorTypeAndShapeInfo**)&info));
     size_t element_count = 0;
@@ -357,6 +433,18 @@ static bool onnx_embed(const char* text, float* out, size_t dim, void* ctx) {
     ok = true;
 
 done:
+    if (timer_started) {
+        pthread_mutex_lock(&timer.lock);
+        timer.stopped = true;
+        pthread_cond_signal(&timer.cond);
+        pthread_mutex_unlock(&timer.lock);
+        pthread_join(timer_thread, NULL);
+    }
+    if (timer_cond) pthread_cond_destroy(&timer.cond);
+    if (timer_mutex) pthread_mutex_destroy(&timer.lock);
+    if (run_options) ort->ReleaseRunOptions(run_options);
+    if (deadline && onnx_mono_ns() >= deadline) ok = false;
+    if (!ok) memset(out, 0, dim * sizeof *out);
     if (type_info) ort->ReleaseTypeInfo(type_info);
     if (out_tensor) ort->ReleaseValue(out_tensor);
     if (in_ids) ort->ReleaseValue(in_ids);
@@ -383,15 +471,67 @@ static void onnx_teardown(void) {
 
 static bool onnx_embedder_provider(const char* text, float* out, size_t dim, void* ctx);
 
+static bool hash_artifact(EVP_MD_CTX* ctx, const char* path, const char* tag) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat before, after;
+    bool ok = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) &&
+              before.st_size > 0 && before.st_size <= (off_t)(1024u * 1024u * 1024u);
+    uint64_t size = ok ? (uint64_t)before.st_size : 0u;
+    uint8_t length[8];
+    for (size_t i = 0; i < sizeof length; i++) length[i] = (uint8_t)(size >> (8u * i));
+    ok = ok && EVP_DigestUpdate(ctx, tag, strlen(tag)) == 1 &&
+         EVP_DigestUpdate(ctx, length, sizeof length) == 1;
+    uint8_t bytes[64u * 1024u];
+    uint64_t remaining = size;
+    while (ok && remaining) {
+        size_t want = remaining < sizeof bytes ? (size_t)remaining : sizeof bytes;
+        ssize_t got = read(fd, bytes, want);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) { ok = false; break; }
+        ok = EVP_DigestUpdate(ctx, bytes, (size_t)got) == 1;
+        remaining -= (size_t)got;
+    }
+    uint8_t extra;
+    if (ok && (read(fd, &extra, 1u) != 0 || fstat(fd, &after) != 0 ||
+               after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+               after.st_size != before.st_size ||
+               after.st_mtim.tv_sec != before.st_mtim.tv_sec ||
+               after.st_mtim.tv_nsec != before.st_mtim.tv_nsec ||
+               after.st_ctim.tv_sec != before.st_ctim.tv_sec ||
+               after.st_ctim.tv_nsec != before.st_ctim.tv_nsec)) ok = false;
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+static bool onnx_model_fingerprint(const char* model_path, const char* vocab_path,
+                                    uint8_t out[32]) {
+    static const char domain[] = "qihse:aimem:onnx-wordpiece:ascii-cjk:v1:seq256:mean-l2";
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    unsigned int len = 0u;
+    bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+              EVP_DigestUpdate(ctx, domain, sizeof domain - 1u) == 1 &&
+              hash_artifact(ctx, model_path, "model.onnx") &&
+              hash_artifact(ctx, vocab_path, "vocab.txt") &&
+              EVP_DigestFinal_ex(ctx, out, &len) == 1 && len == 32u;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) memset(out, 0, 32u);
+    return ok;
+}
+
 bool qihse_aimem_onnx_embedder_install(const char* model_dir) {
     if (!model_dir || !*model_dir) return false;
-    if (g_onnx_installed) onnx_teardown();
+    if (g_onnx_installed) {
+        (void)qihse_ai_memory_set_embedder(NULL);
+        onnx_teardown();
+    }
     memset(&g_onnx, 0, sizeof g_onnx);
 
     const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     if (!ort) {
         fprintf(stderr, "[qihse-aimem-onnx] onnxruntime API %d unavailable\n", ORT_API_VERSION);
-        return false;
+        goto fail;
     }
     g_onnx.ort = ort;
 
@@ -399,17 +539,19 @@ bool qihse_aimem_onnx_embedder_install(const char* model_dir) {
     base = base ? base + 1 : model_dir;
     if (snprintf(g_onnx.name, sizeof g_onnx.name, "onnx:%s", base) >= (int)sizeof g_onnx.name) {
         fprintf(stderr, "[qihse-aimem-onnx] model dir name too long\n");
-        return false;
+        goto fail;
     }
     if (snprintf(g_onnx.model_path, sizeof g_onnx.model_path, "%s/model.onnx", model_dir) >= (int)sizeof g_onnx.model_path) {
         fprintf(stderr, "[qihse-aimem-onnx] model path too long\n");
-        return false;
+        goto fail;
     }
     char vocab_path[1024];
-    if (snprintf(vocab_path, sizeof vocab_path, "%s/vocab.txt", model_dir) >= (int)sizeof vocab_path) return false;
+    if (snprintf(vocab_path, sizeof vocab_path, "%s/vocab.txt", model_dir) >= (int)sizeof vocab_path) goto fail;
+    uint8_t before_digest[32];
+    if (!onnx_model_fingerprint(g_onnx.model_path, vocab_path, before_digest)) goto fail;
     if (!vocab_load(&g_onnx.vocab, vocab_path)) {
         fprintf(stderr, "[qihse-aimem-onnx] cannot load %s\n", vocab_path);
-        return false;
+        goto fail;
     }
 
     ORT_TRY(ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "qihse-aimem-onnx", &g_onnx.env));
@@ -485,7 +627,11 @@ bool qihse_aimem_onnx_embedder_install(const char* model_dir) {
     provider.dim = g_onnx.dim;
     provider.embed = onnx_embedder_provider;
     provider.ctx = NULL;
-    if (!qihse_ai_memory_set_embedder(&provider)) goto fail;
+    uint8_t model_digest[32];
+    if (!onnx_model_fingerprint(g_onnx.model_path, vocab_path, model_digest) ||
+        memcmp(before_digest, model_digest, sizeof model_digest) != 0 ||
+        !qihse_ai_memory_set_embedder(&provider) ||
+        !qihse_ai_memory_set_embedder_fingerprint(model_digest)) goto fail;
     g_onnx_installed = true;
     fprintf(stderr, "[qihse-aimem-onnx] installed %s (dim %zu, vocab %u, warm-up ok)\n",
             g_onnx.name, g_onnx.dim, g_onnx.vocab.vocab_count);
@@ -493,11 +639,17 @@ bool qihse_aimem_onnx_embedder_install(const char* model_dir) {
 
 fail:
     onnx_teardown();
+    (void)qihse_ai_memory_set_embedder(NULL);
     return false;
 }
 
 const char* qihse_aimem_onnx_embedder_name(void) {
     return g_onnx_installed ? g_onnx.name : "";
+}
+
+bool qihse_aimem_onnx_embedder_active(void) {
+    return g_onnx_installed && g_onnx.session != NULL && g_onnx.ort != NULL &&
+           strcmp(g_onnx.name, qihse_ai_memory_embedder_name()) == 0;
 }
 
 static bool onnx_embedder_provider(const char* text, float* out, size_t dim, void* ctx) {

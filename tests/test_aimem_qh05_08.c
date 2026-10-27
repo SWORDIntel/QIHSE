@@ -1,5 +1,6 @@
 /* Focused QH-05..08 native contracts: stable authorized paging, reversible
  * one-lineage maintenance, canonical projection, and redacted rebuild state. */
+#include "aimem_fixture_cleanup.h"
 #include "qihse_ai_memory.h"
 #include "qihse_auth.h"
 #include "qihse_audit.h"
@@ -520,6 +521,7 @@ int main(void) {
     qihse_ai_memory_maintenance_free(&high_plan);
     qihse_ai_memory_knowledge_free(&flagged);
     qihse_resp_server_destroy(server); qihse_kv_store_destroy(store);
+    aimem_fixture_cleanup(source_root);
     puts("PASS QH-05 stable query, QH-06 rollback, QH-07 round-trip, QH-08 redaction");
     return 0;
 }

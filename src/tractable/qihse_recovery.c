@@ -58,8 +58,9 @@ static int analysis_add_txn(qihse_rec_analysis_t* a, uint64_t txn_id) {
     if (idx >= 0) return idx;
     if (a->txn_count >= a->txn_capacity) {
         int new_cap = a->txn_capacity == 0 ? 64 : a->txn_capacity * 2;
-        a->txns = realloc(a->txns, new_cap * sizeof(qihse_rec_txn_status_t));
-        if (!a->txns) return -1;
+        void* grown = realloc(a->txns, new_cap * sizeof(qihse_rec_txn_status_t));
+        if (!grown) return -1;
+        a->txns = grown;
         a->txn_capacity = new_cap;
     }
     a->txns[a->txn_count].txn_id = txn_id;
@@ -74,10 +75,15 @@ static int analysis_add_record(qihse_rec_analysis_t* a,
 {
     if (a->record_count >= a->record_capacity) {
         int new_cap = a->record_capacity == 0 ? 128 : a->record_capacity * 2;
-        a->records = realloc(a->records, new_cap * sizeof(qihse_wal_record_t));
-        a->record_keys = realloc(a->record_keys, new_cap * sizeof(void*));
-        a->record_values = realloc(a->record_values, new_cap * sizeof(void*));
-        if (!a->records || !a->record_keys || !a->record_values) return -1;
+        void* grown = realloc(a->records, new_cap * sizeof(qihse_wal_record_t));
+        if (!grown) return -1;
+        a->records = grown;
+        grown = realloc(a->record_keys, new_cap * sizeof(void*));
+        if (!grown) return -1;
+        a->record_keys = grown;
+        grown = realloc(a->record_values, new_cap * sizeof(void*));
+        if (!grown) return -1;
+        a->record_values = grown;
         a->record_capacity = new_cap;
     }
 
@@ -87,7 +93,8 @@ static int analysis_add_record(qihse_rec_analysis_t* a,
     /* Copy key */
     if (key_len > 0) {
         a->record_keys[idx] = malloc(key_len);
-        if (a->record_keys[idx]) memcpy(a->record_keys[idx], key, key_len);
+        if (!a->record_keys[idx]) return -1;
+        memcpy(a->record_keys[idx], key, key_len);
     } else {
         a->record_keys[idx] = NULL;
     }
@@ -95,7 +102,12 @@ static int analysis_add_record(qihse_rec_analysis_t* a,
     /* Copy value */
     if (value_len > 0) {
         a->record_values[idx] = malloc(value_len);
-        if (a->record_values[idx]) memcpy(a->record_values[idx], value, value_len);
+        if (!a->record_values[idx]) {
+            free(a->record_keys[idx]);
+            a->record_keys[idx] = NULL;
+            return -1;
+        }
+        memcpy(a->record_values[idx], value, value_len);
     } else {
         a->record_values[idx] = NULL;
     }
@@ -108,6 +120,7 @@ static int analysis_add_record(qihse_rec_analysis_t* a,
 
 typedef struct qihse_rec_replay_ctx_s {
     qihse_rec_analysis_t* analysis;
+    bool failed;
 } qihse_rec_replay_ctx_t;
 
 static bool recovery_replay_cb(const qihse_wal_record_t* rec,
@@ -118,30 +131,38 @@ static bool recovery_replay_cb(const qihse_wal_record_t* rec,
     qihse_rec_replay_ctx_t* ctx = (qihse_rec_replay_ctx_t*)user_data;
     qihse_rec_analysis_t* a = ctx->analysis;
 
+    int rc = 0;
     switch (rec->op_type) {
     case QIHSE_WAL_OP_BEGIN:
-        analysis_add_txn(a, rec->txn_id);
+        rc = analysis_add_txn(a, rec->txn_id);
         break;
     case QIHSE_WAL_OP_COMMIT: {
         int idx = analysis_find_txn(a, rec->txn_id);
         if (idx >= 0) a->txns[idx].status = 1;  /* committed */
-        else { analysis_add_txn(a, rec->txn_id); a->txns[a->txn_count-1].status = 1; }
+        else {
+            idx = analysis_add_txn(a, rec->txn_id);
+            if (idx >= 0) a->txns[idx].status = 1;
+            else rc = -1;
+        }
         break;
     }
     case QIHSE_WAL_OP_ABORT: {
         int idx = analysis_find_txn(a, rec->txn_id);
         if (idx >= 0) a->txns[idx].status = 2;  /* aborted */
-        else { analysis_add_txn(a, rec->txn_id); a->txns[a->txn_count-1].status = 2; }
+        else {
+            idx = analysis_add_txn(a, rec->txn_id);
+            if (idx >= 0) a->txns[idx].status = 2;
+            else rc = -1;
+        }
         break;
     }
     case QIHSE_WAL_OP_INSERT:
     case QIHSE_WAL_OP_UPDATE:
     case QIHSE_WAL_OP_DELETE:
         /* Store the mutation for the redo phase */
-        if (rec->txn_id > 0) {
-            analysis_add_txn(a, rec->txn_id);
-        }
-        analysis_add_record(a, rec, key, key_len, value, value_len);
+        if (rec->txn_id > 0 && analysis_add_txn(a, rec->txn_id) < 0)
+            rc = -1;
+        if (rc == 0) rc = analysis_add_record(a, rec, key, key_len, value, value_len);
         break;
     case QIHSE_WAL_OP_CHECKPOINT:
         /* Skip checkpoint records during replay */
@@ -150,7 +171,8 @@ static bool recovery_replay_cb(const qihse_wal_record_t* rec,
         break;
     }
 
-    return true;  /* continue replay */
+    if (rc < 0) ctx->failed = true;
+    return !ctx->failed;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -221,7 +243,7 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
     uint64_t start_lsn = qihse_wal_last_checkpoint(rec->wal);
     int n_replayed = qihse_wal_replay(rec->wal, start_lsn,
                                       recovery_replay_cb, &ctx);
-    if (n_replayed < 0) {
+    if (n_replayed < 0 || ctx.failed) {
         free(analysis.txns);
         for (int i = 0; i < analysis.record_count; i++) {
             free(analysis.record_keys[i]);
@@ -317,16 +339,13 @@ int qihse_recovery_checkpoint(qihse_recovery_t* rec,
         if (rc != 0) return rc;
     }
 
-    /* 2. Flush WAL to disk */
-    qihse_wal_flush(rec->wal);
-
-    /* 3. Record checkpoint LSN and truncate old segments */
+    /* Never discard WAL unless both the engine state and checkpoint marker
+     * have crossed their durability fences. */
+    if (qihse_wal_flush(rec->wal) != 0) return -1;
     uint64_t lsn = qihse_wal_current_lsn(rec->wal);
-    qihse_wal_append_checkpoint(rec->wal, lsn);
-    qihse_wal_flush(rec->wal);
-    qihse_wal_checkpoint(rec->wal, lsn);
-
-    return 0;
+    if (qihse_wal_append_checkpoint(rec->wal, lsn) == 0 ||
+        qihse_wal_flush(rec->wal) != 0) return -1;
+    return qihse_wal_checkpoint(rec->wal, lsn);
 }
 
 /* ── Inspection ─────────────────────────────────────────────────────────── */

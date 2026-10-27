@@ -139,12 +139,26 @@ check-isa:
 QIHSE_AUDIT_WEBHOOK_URL?=
 
 CFLAGS=$(CFLAGS_BASE) $(QIHSE_CFLAGS_EXTRA)
+# Optional in-process scoped AIMEM candidate addon. Regular cluster builds
+# neither include KEYSTONE headers nor link against its library.
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+ifeq ($(strip $(QIHSE_AIMEM_KEYSTONE_INCLUDE)),)
+$(error QIHSE_AIMEM_KEYSTONE_INCLUDE must name the matching KEYSTONE include directory)
+endif
+CFLAGS += -DQIHSE_ENABLE_AIMEM_KEYSTONE=1 -I$(QIHSE_AIMEM_KEYSTONE_INCLUDE)
+endif
 ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
 LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
 TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+LDFLAGS += -lonnxruntime
+AIMEM_ONNX_EXEC_SOURCE :=
+else
+AIMEM_ONNX_EXEC_SOURCE := src/spinnaker/qihse_aimem_onnx_embedder.c
+endif
 VXUG_PDF_REPO?=$(CURDIR)/VXUG-Papers
 VXUG_PDF?=
 REFERENCE_WORKLOAD?=vxug-pdf-sample
@@ -173,7 +187,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
             src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
             src/spinnaker/qihse_crc16.c src/spinnaker/qihse_qkp.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c src/spinnaker/qihse_resp_pubsub.c src/spinnaker/qihse_cluster_bus.c src/spinnaker/qihse_cluster_failover.c src/spinnaker/qihse_cluster_scatter.c src/spinnaker/qihse_cluster_rebalance.c src/spinnaker/qihse_cluster_ownership_journal.c src/spinnaker/qihse_cluster_reclaim.c \
-            src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c src/spinnaker/qihse_ingest_guard.c src/spinnaker/qihse_bundle.c src/spinnaker/qihse_fabric_index.c src/federation/qihse_fabric_dispatch.c src/spinnaker/qihse_machine_auth.c \
+            src/spinnaker/qihse_aimem_projection_store.c src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c src/spinnaker/qihse_ingest_guard.c src/spinnaker/qihse_bundle.c src/spinnaker/qihse_fabric_index.c src/federation/qihse_fabric_dispatch.c src/spinnaker/qihse_machine_auth.c \
             src/black_hole/qihse_kv_store.c src/black_hole/qihse_blob.c src/black_hole/qihse_export.c src/black_hole/qihse_keystone.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c src/spinnaker/qihse_uwp_graph_index.c src/spinnaker/qihse_uwp_repl_pool.c src/spinnaker/qihse_uwp_sql_txn_schema.c src/spinnaker/qihse_uwp_tls.c src/spinnaker/qihse_uwp_metrics.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
             src/frieze/qihse_column_store.c src/frieze/qihse_btree.c src/frieze/qihse_hash_index.c src/frieze/qihse_index_manager.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
@@ -217,6 +231,9 @@ SRCS_BASE += src/federation/qihse_consensus_prefix_pair.c
 SRCS_BASE += src/federation/qihse_consensus_prefix_pair_nonce.c
 SRCS_BASE += src/federation/qihse_consensus_replay_verify.c
 SRCS_BASE += src/federation/qihse_consensus_rejoin_guard.c
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+SRCS_BASE += src/spinnaker/qihse_aimem_onnx_embedder.c
+endif
 
 SRCS=$(SRCS_BASE)
 
@@ -356,7 +373,7 @@ redis-cluster-node: lib
 
 redis-server: lib
 	$(CC) $(CFLAGS) -o qihse-redis-server tools/qihse_redis_server.c \
-	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime \
+	    $(AIMEM_ONNX_EXEC_SOURCE) -Iinclude -L. -lqihse -lonnxruntime \
 	    -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,'$$ORIGIN/lib' $(LDFLAGS)
 	@echo "qihse-redis-server build successful"
 
@@ -382,7 +399,7 @@ test-aimem-migration-cli:
 
 test-aimem-onnx-embedder: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_onnx_embedder tests/test_aimem_onnx_embedder.c \
-	    src/spinnaker/qihse_aimem_onnx_embedder.c -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
+	    $(AIMEM_ONNX_EXEC_SOURCE) -Iinclude -L. -lqihse -lonnxruntime $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_onnx_embedder
 
 # Session-delivery stress: N tenants, 1-5 MB up/down each, for a time budget.
@@ -547,6 +564,18 @@ OBJS = $(COBJS) $(CXXOBJS)
 	$(CXX) $(CXXFLAGS_BASE) -MMD -MP -c $< -o $@
 
 -include $(OBJS:.o=.d)
+
+# `make` does not otherwise notice a change in CFLAGS. Keep the two optional
+# AIMEM modes from reusing one another's qihse_ai_memory.o (and accidentally
+# leaving unresolved ONNX symbols in a default cluster build).
+AIMEM_BUILD_MODE := $(if $(filter 1,$(QIHSE_ENABLE_AIMEM_KEYSTONE)),enabled,disabled)
+AIMEM_MODE_STAMP := build/.aimem-mode-$(AIMEM_BUILD_MODE)
+AIMEM_OTHER_STAMP := build/.aimem-mode-$(if $(filter enabled,$(AIMEM_BUILD_MODE)),disabled,enabled)
+$(AIMEM_MODE_STAMP):
+	@mkdir -p build
+	@rm -f $(AIMEM_OTHER_STAMP)
+	@touch $@
+src/spinnaker/qihse_ai_memory.o: $(AIMEM_MODE_STAMP)
 
 $(LIB_TARGET): $(OBJS)
 	@echo "Building $(LIB_TARGET)..."
@@ -937,7 +966,31 @@ test-w10-aimem: test-ai-memory test-ai-memory-embed test-ai-memory-ext \
 		test-aimem-replay-recovery test-aimem-knowledge \
 		test-aimem-idem-migration test-aimem-scope-index test-aimem-qh05-08 \
 		test-aimem-qh08 test-aimem-qh08-resp test-backup-cli \
-		test-aimem-legacy-inventory test-aimem-migration-cli
+		test-aimem-legacy-inventory test-aimem-migration-cli test-aimem-projection-store
+
+.PHONY: test-aimem-keystone-projection
+test-aimem-keystone-projection: lib
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+	$(CC) $(CFLAGS) -o tests/test_aimem_keystone_projection tests/test_aimem_keystone_projection.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_keystone_projection
+else
+	@echo 'Set QIHSE_ENABLE_AIMEM_KEYSTONE=1 and QIHSE_AIMEM_KEYSTONE_INCLUDE to run this test' >&2
+	@false
+endif
+
+.PHONY: test-aimem-projection-qkp
+test-aimem-projection-qkp: redis-server
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+	PYTHONPATH=python LD_LIBRARY_PATH=. python3 tests/test_aimem_projection_qkp.py
+else
+	@echo 'Set QIHSE_ENABLE_AIMEM_KEYSTONE=1 and QIHSE_AIMEM_KEYSTONE_INCLUDE to run this test' >&2
+	@false
+endif
+
+.PHONY: test-aimem-projection-store
+test-aimem-projection-store:
+	$(CC) $(CFLAGS) -o tests/test_aimem_projection_store tests/test_aimem_projection_store.c src/spinnaker/qihse_aimem_projection_store.c -lsqlite3 -lcrypto -lm
+	./tests/test_aimem_projection_store
 
 .PHONY: test-aimem-scope-index
 test-aimem-scope-index: lib
