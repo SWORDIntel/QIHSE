@@ -8168,7 +8168,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             uint64_t change_seq = 0u;
             bool found = qihse_ai_memory_forget_with_seq(session->server,
                 session->user, id, &removed, &change_seq);
-            bool fenced = found && qihse_kv_sync_store(store);
+            bool fenced = found && change_seq != 0u && qihse_kv_sync_store(store);
             pthread_rwlock_unlock(&session->server->kv_lock);
             bool emitted = fenced && qihse_resp_aimem_emit_receipt(
                 session, "FORGET", id, change_seq);

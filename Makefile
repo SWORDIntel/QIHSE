@@ -403,6 +403,13 @@ test-kv-restore-durability: lib
 
 test-serial: test-kv-restore-durability
 
+.PHONY: test-kv-legacy-record-state
+test-kv-legacy-record-state: lib
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_kv_legacy_record_state tests/test_kv_legacy_record_state.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_legacy_record_state
+
+test-serial: test-kv-legacy-record-state
+
 .PHONY: test-auth-durable test-auth-archive test-auth-maintenance
 test-auth-durable: lib
 	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_auth_durable tests/test_auth_durable.c $(LDFLAGS)

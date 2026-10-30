@@ -151,8 +151,11 @@ bool qihse_kv_set_user_with_seq(qihse_kv_store_t* store, const char* key,
                                 uint64_t* out_change_seq);
 bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
                                 qihse_user_t* user, uint64_t* out_change_seq);
-/* Read the sequence only for an authorized live record or tombstone. Expired
- * live rows and misses are indistinguishable from denied rows. */
+/* Read state only for an authorized live record or retained tombstone.
+ * Success with sequence 0 means LEGACY_UNVERSIONED, not ordered mutation,
+ * version, or cursor evidence. Callers requiring such evidence must reject 0.
+ * Misses, expired live rows, denied rows and recovery-pending stores return
+ * false with any supplied outputs cleared. */
 bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
                               qihse_user_t* user, uint64_t* out_change_seq,
                               bool* out_tombstone);

@@ -2420,8 +2420,7 @@ bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
     kv_lookup_state_t state = logical_lookup(store, key, &r);
     bool tombstone = state == KV_LOOKUP_DEAD && (r.flags & KV_FLAG_TOMBSTONE) != 0u;
     bool ok = (state == KV_LOOKUP_LIVE || tombstone) &&
-              qihse_auth_can_access(user, r.classification, r.sci_compartment) &&
-              r.change_seq != 0u;
+              qihse_auth_can_access(user, r.classification, r.sci_compartment);
     if (ok) {
         *out_change_seq = r.change_seq;
         *out_tombstone = tombstone;

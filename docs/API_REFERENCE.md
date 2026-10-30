@@ -468,6 +468,14 @@ floor, including empty/older images, without changing upstream replica cursors.
 The installed image is an SST with an indexed, empty writable memtable; later
 mutations must not leave restored rows as RAM-only shadows during compaction.
 
+`qihse_kv_change_seq_user()` distinguishes an authorized retained tombstone from
+an absent key even when its legacy sequence is zero. Successful sequence zero
+means **legacy unversioned**, not an ordered mutation or cursor. Receipt and
+ordering consumers must reject zero. Missing, expired or authorization-denied
+records return false with supplied outputs cleared; existing public/anonymous
+read policy is unchanged. `make test-kv-legacy-record-state` covers legacy field
+formats, protected metadata denial and refusal to issue zero-sequence receipts.
+
 A publication or directory-fence I/O error is **not a rollback guarantee**:
 the intent may already be visible, or the new durable image may already be
 installed. The error does not identify which boundary was crossed. The handle
