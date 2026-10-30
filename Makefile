@@ -1912,3 +1912,10 @@ test-fts-persist-adapter: lib
 	LD_LIBRARY_PATH=. ./tests/test_fts_persist_adapter
 
 test-serial: test-fts-persist-adapter
+
+# Isolated real pinned-QKP shutdown durability and failure-exit regressions.
+.PHONY: test-cluster-daemon-shutdown
+test-cluster-daemon-shutdown: cluster-daemon
+	LD_LIBRARY_PATH=. python3 tests/test_cluster_daemon_shutdown.py
+
+test-serial: test-cluster-daemon-shutdown

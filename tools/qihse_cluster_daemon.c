@@ -335,7 +335,7 @@ static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 /* Shutdown is expected to finish in a few seconds; this is the point at which
  * it is declared wedged. Kept well under systemd's TimeoutStopUSec so a stuck
- * teardown yields a diagnostic and a clean exit instead of a SIGKILL. */
+ * teardown yields a diagnostic and a failed exit instead of a SIGKILL. */
 #define QIHSE_SHUTDOWN_GRACE_DEFAULT 60u
 
 static unsigned int shutdown_grace_seconds(void) {
@@ -403,7 +403,7 @@ static void* shutdown_watchdog(void* argument) {
         dump_live_threads(reason);
         fprintf(stderr, "qihse-cluster-daemon: exiting without completing teardown "
                         "(raise QIHSE_SHUTDOWN_GRACE above %u if this is a slow flush)\n", grace);
-        _exit(0);
+        _exit(EXIT_FAILURE);
     }
     return NULL;
 }
@@ -1360,7 +1360,7 @@ typedef struct {
 static void* join_main(void* argument) {
     join_ctx_t* j = (join_ctx_t*)argument;
     qihse_cluster_bus_t* bus = NULL;
-    for (int wait = 0; wait < 40 && !bus; wait++) { /* bus starts with the server */
+    for (int wait = 0; wait < 40 && !bus && !g_stop; wait++) { /* bus starts with the server */
         bus = qihse_resp_server_bus(j->server);
         if (bus && qihse_cluster_bus_fd(bus) < 0) bus = NULL; /* not started yet */
         struct timespec ts = {0, 250 * 1000 * 1000};
@@ -2525,6 +2525,10 @@ int main(int argc, char** argv) {
     static volatile sig_atomic_t ae_stop = 0;
     ae_ctx_t ae_ctx;
     bool ae_started = false;
+    bool ok = false;
+    pthread_t join_thread;
+    bool join_started = false;
+    join_ctx_t join_ctx = { server, {{0}}, seed_count };
     if (repl_interval > 0u && replication_source_host != NULL) {
         ae_ctx.server = server;
         ae_ctx.source_host = replication_source_host;
@@ -2539,25 +2543,21 @@ int main(int argc, char** argv) {
         ae_ctx.stop = &ae_stop;
         if (!ae_ctx.replica_principal || pthread_create(&ae_thread, NULL, ae_main, &ae_ctx) != 0) {
             fprintf(stderr, "qihse-cluster-daemon: replica pull thread failed to start (operator principal unavailable)\n");
-            qihse_resp_server_stop(server);
-            qihse_resp_server_destroy(server);
-            return 1;
+            goto shutdown;
         }
         ae_started = true;
     }
 
-    pthread_t join_thread;
-    join_ctx_t join_ctx = { server, {{0}}, seed_count };
     if (seed_count > 0) {
         for (size_t i = 0; i < seed_count; i++)
             snprintf(join_ctx.seeds[i], QIHSE_CLUSTER_HOST_LEN + 8u, "%s", seeds[i]);
-        if (pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0) pthread_detach(join_thread);
+        join_started = pthread_create(&join_thread, NULL, join_main, &join_ctx) == 0;
     }
     /* Run the listener in its managed accept thread so the daemon's signal
      * handler can drive an orderly stop. qihse_resp_server_run() owns its
      * blocking accept loop and does not observe this process's g_stop flag,
      * which otherwise makes systemd wait for SIGKILL at TimeoutStopSec. */
-    bool ok = qihse_resp_server_start(server);
+    ok = qihse_resp_server_start(server);
     if (ok) {
         bool gc_pending = replayed_journal_entries > 0;
         size_t gc_ticks = 0u;
@@ -2584,7 +2584,10 @@ int main(int argc, char** argv) {
             }
         }
     }
+shutdown:
+    g_stop = 1; /* Also arm the watchdog when listener/worker startup fails. */
     __atomic_store_n(&ae_stop, 1, __ATOMIC_RELEASE);
+    if (join_started) pthread_join(join_thread, NULL);
     if (ae_started) {
         /* ae_main can be inside a blocking pull from an unresponsive source;
          * never let that hold the whole process open. */
@@ -2601,6 +2604,7 @@ int main(int argc, char** argv) {
         }
     }
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
+    qihse_overlay_stop(); /* The bootstrap thread borrows the server's bus. */
     if (consensus_mesh) {
         qihse_consensus_mesh_stop(consensus_mesh);
         qihse_consensus_mesh_destroy(consensus_mesh);
@@ -2608,6 +2612,14 @@ int main(int argc, char** argv) {
     }
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
+    /* config.store is borrowed. Destroy drains server-owned writers (including
+     * BGSAVE); only then may the data owner fence and release the caller's KV.
+     * The void destructor cannot report flush errors, so check sync first. */
+    if (!qihse_kv_sync_store(store)) {
+        fprintf(stderr, "qihse-cluster-daemon: KV sync failed during shutdown; durability not confirmed\n");
+        ok = false;
+    }
+    qihse_kv_store_destroy(store);
     /* The server owns the index from create onward and frees whatever it
      * holds at destroy, including any index BUILD/LOAD replaced. */
     fprintf(stderr, "qihse-cluster-daemon: stopped\n");
