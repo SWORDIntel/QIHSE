@@ -1730,6 +1730,18 @@ int main(int argc, char** argv) {
             }
         }
     }
+    qihse_user_t* startup_operator = NULL;
+    if (operator_password) {
+        startup_operator = qihse_auth_authenticate_id(0u, operator_password);
+        if (!startup_operator || !qihse_auth_user_is_active(startup_operator) ||
+            qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR ||
+            qihse_user_get_tenant_id(startup_operator) != QIHSE_TENANT_SYSTEM) {
+            operator_credential_clear_environment();
+            operator_credential_release();
+            fprintf(stderr, "qihse-cluster-daemon: startup Operator authentication failed\n");
+            return 1;
+        }
+    }
     operator_credential_clear_environment();
 
     qihse_user_t* replication_service_principal = replication_configured
@@ -1771,7 +1783,8 @@ int main(int argc, char** argv) {
     operator_credential_release();
     operator_password = NULL;
 
-    qihse_kv_store_t* store = qihse_kv_store_create();
+    qihse_kv_store_t* store = startup_operator
+        ? qihse_kv_store_create_user(startup_operator) : qihse_kv_store_create();
     if (!store) {
         fprintf(stderr, "qihse-cluster-daemon: kv store create failed (data dir unusable?)\n");
         return 1;

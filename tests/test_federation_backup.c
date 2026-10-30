@@ -1303,6 +1303,16 @@ static void test_low_clearance_within_its_view(void) {
     assert(file_holds(guest_path, PUBLIC_ALPHA_VALUE));
 
     put(g_guest, "public:guest-drift", "guest-drift-value", 0, 0);
+    /* A partial public image cannot erase a live protected target row. */
+    put(g_op, SECRET_GAMMA_KEY, SECRET_GAMMA_VALUE, 4, 2);
+    memset(&desc, 0xAB, sizeof(desc));
+    assert(qihse_backup_restore_signed(g_store, g_guest, &m, guest_path, false,
+                                       &desc) != QIHSE_BACKUP_OK);
+    read_is(g_op, SECRET_GAMMA_KEY, SECRET_GAMMA_VALUE);
+    read_is(g_guest, "public:guest-drift", "guest-drift-value");
+    assert(!can_read(g_guest, SECRET_GAMMA_KEY));
+    assert(qihse_kv_del_user(g_store, SECRET_GAMMA_KEY, g_op));
+    /* Its authorized deletion leaves a protected tombstone, not live data. */
     memset(&desc, 0xAB, sizeof(desc));
     assert(qihse_backup_restore_signed(g_store, g_guest, &m, guest_path, false,
                                        &desc) == QIHSE_BACKUP_OK);

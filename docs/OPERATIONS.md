@@ -1,5 +1,12 @@
 # QIHSE Operations Manual
 
+**Restore recovery metadata:** Current KV restores publish an authorization-bound
+`QRIL2` intent (replica baselines use `QRIM2`) and preserve a separate durable
+sequence floor. Keep the entire directory, including `restore-highwater.bin`,
+image/intent and replica-cursor metadata, when preserving a failed or completed
+restore. Version-1 intents require a full-clearance/full-SCI recovery principal;
+never downgrade a pending directory or delete its intent to force it open.
+
 > **Status: mixed implementation and historical evidence.** Command execution
 > notes dated 2026-09-26 describe that earlier pass, not current verification.
 > Installation/recovery gates added here are source-reviewed requirements, not
@@ -745,9 +752,17 @@ query mode is HNSW (`QueryMode.GRAPH`) and searching an unbuilt graph raises
 ### 3.7 AIMEM backup and legacy-scope migration
 
 Build the authenticated whole-store backup utility with `make backup-cli`.
+This is a **KV data backup**, not full-cluster recovery: it does not provision
+or restore principals, ACL policy, external identity/key material, service units,
+filesystem ownership, or deployment configuration. Preserve and review those
+separately; KV records containing identifiers are not a substitute for that state.
 Stop the service that owns the data directory before creating a backup. Supply
 the Operator credential through `QIHSE_OPERATOR_PASSWORD` or a regular file
 readable only by its owner; the utility does not accept a password argument.
+The offline CLI initializes a local authentication verifier from the supplied
+credential. Successful local authentication is **not proof of authorization by
+the source daemon's credential database**. Likewise, the whole-store container's
+checksum detects corruption; it does not establish signed source provenance.
 
 ```bash
 QIHSE_DATA_DIR=./build/aimem-data \
@@ -758,6 +773,36 @@ QIHSE_DATA_DIR=./build/aimem-data \
 QIHSE_OPERATOR_PASSWORD="$AIMEM_OPERATOR_PASSWORD" \
     ./qihse-backup verify --input ./build/aimem-pre-migration.qbak
 ```
+
+**Restore result and recovery boundary.** Whole-store restore success means
+that the replacement KV image is durable across close and fresh-process reopen.
+Input validation, authorization and staging failures before recovery-intent
+publication leave the old durable dataset unchanged. A publication/fence I/O
+error is different: it may follow publication of the intent or replacement
+image, so nonzero does not necessarily mean rollback. Stop using the fenced
+handle and preserve the complete directory, including `replica-install.meta`,
+`replica-install.image` and any remaining staging files. Do not delete these
+files, overwrite the directory, or restart the live daemon to force progress.
+Destroy the handle and recover offline through
+`qihse_kv_store_create_user(active_principal)` with a principal authorized for
+the image. Context-free open refuses a pending intent. If recovery fails,
+retain the artifacts and diagnose the failure; never substitute an empty store.
+Verify the recovered state before returning it to service. This is the bounded
+whole-store KV contract, not an atomic transaction covering the federation
+signed container's separate WAL replay (see [API §2.3](API_REFERENCE.md#23-snapshot-backup--includeqihse_backuph)).
+
+**Validate only in a disposable clone.** Keep the original backup and a
+quiesced copy of the target's pre-restore directory unchanged. Select a new,
+private directory through `QIHSE_DATA_DIR`; never point validation at a running
+daemon's directory or reuse production ports, units, identity handles or keys.
+A checksum-only `verify` is not a restore drill. Restore the clone, close it,
+then reopen it in a fresh process and compare expected values, classification,
+SCI and record counts using an explicitly authenticated principal. Include a
+nonempty old target and refusal cases (corruption, truncation and insufficient
+clearance) to check that old data survives rejected input. Do not launch the
+production daemon to validate a clone: startup can replay ownership, lease and
+GC state. Keep validation offline and confined to the clone; promote neither
+its runtime metadata nor its filesystem ownership back into production.
 
 Legacy unscoped memories require a reviewed destination for every UUID. With
 the service running and legacy writes quiescent, a fully cleared system

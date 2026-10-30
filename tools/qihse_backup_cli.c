@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
     qihse_kv_store_t* store = NULL;
     if (options.command == QIHSE_BACKUP_CLI_CREATE ||
         options.command == QIHSE_BACKUP_CLI_RESTORE) {
-        store = qihse_kv_store_create();
+        store = qihse_kv_store_create_user(principal);
         if (!store) {
             qihse_backup_cli_emit_failure(stdout, "backup",
                                           "store_open_failed",

@@ -45,6 +45,19 @@ static uint64_t test_fnv_update(uint64_t hash, const void* data, size_t len) {
     return hash;
 }
 
+static uint64_t fixture_hash(const char* path) {
+    FILE* file = fopen(path, "rb");
+    assert(file != NULL);
+    uint64_t hash = 14695981039346656037ULL;
+    unsigned char bytes[512];
+    size_t n;
+    while ((n = fread(bytes, 1u, sizeof(bytes), file)) != 0u)
+        hash = test_fnv_update(hash, bytes, n);
+    assert(!ferror(file));
+    assert(fclose(file) == 0);
+    return hash;
+}
+
 static void write_private_fixture(const char* path, const void* bytes, size_t len) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     assert(fd >= 0);
@@ -97,11 +110,12 @@ int main(void) {
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("ReplicaSecurityPass1!"));
-    qihse_user_t* operator_user = qihse_auth_get_user(0u);
+    qihse_user_t* operator_user = qihse_auth_authenticate_id(0u, "ReplicaSecurityPass1!");
     assert(operator_user != NULL);
     qihse_user_t* low_user = qihse_auth_create_user(operator_user, 91u,
         QIHSE_ROLE_GUEST, 0u, 0u, "ReplicaGuestPass1!", false);
     assert(low_user != NULL);
+    assert(qihse_auth_authenticate_id(91u, "ReplicaGuestPass1!") == low_user);
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     assert(store != NULL);
@@ -212,6 +226,8 @@ int main(void) {
     assert(qihse_kv_replica_snapshot_create(store, low_user, "vendor:7:*",
                                             &snapshot) == -2);
     assert(snapshot == NULL);
+    assert(qihse_kv_set_user(store, "public:protected", "protected-image", 5u, 9u,
+                             operator_user));
     assert(qihse_kv_replica_snapshot_create(store, operator_user, "public:*",
                                             &snapshot) == 0);
     uint64_t size = qihse_kv_replica_snapshot_size(snapshot);
@@ -263,9 +279,26 @@ int main(void) {
     assert(qihse_kv_replica_cursor_get(store, "upstream", "vendor:7:*",
                                        operator_user, &cursor));
     assert(cursor == 100u);
-
+    qihse_kv_replica_record_t current_protected = {
+        .key = "public:row", .value = "current-protected-value", .change_seq = 101u,
+        .classification = 7u, .sci_compartment = 11u, .expire_time_ms = 0u,
+        .tombstone = false
+    };
+    assert(qihse_kv_apply_replica_record(store, &current_protected, operator_user));
+    assert(qihse_kv_sync_store(store));
     qihse_kv_store_destroy(store);
     create_pending_install_fixture(data_dir, bytes, read_size, snapshot_seq);
+    /* Incoming-image clearance is insufficient to replace a more restricted
+     * current row, even when the incoming row itself is unclassified. */
+    qihse_user_t* image_reader = qihse_auth_create_user(operator_user, 93u,
+        QIHSE_ROLE_ANALYST, 5u, 9u, "ImageReaderPass1!", false);
+    assert(image_reader != NULL);
+    assert(qihse_auth_authenticate_id(93u, "ImageReaderPass1!") == image_reader);
+    char current_wal[512];
+    snprintf(current_wal, sizeof(current_wal), "%s/wal.log", data_dir);
+    uint64_t current_wal_hash = fixture_hash(current_wal);
+    assert(qihse_kv_store_create_user(image_reader) == NULL);
+    assert(fixture_hash(current_wal) == current_wal_hash);
     /* Model process death during the install's SSTable/WAL replacement: the
      * durable intent and image exist, a candidate is left behind, multiple
      * old SSTables remain, and the WAL may contain pre-install bytes. Startup
@@ -279,7 +312,29 @@ int main(void) {
     write_private_fixture(stage_path, "old-sstable-one", 15u);
     snprintf(stage_path, sizeof(stage_path), "%s/wal.log", data_dir);
     write_private_fixture(stage_path, "old-wal-record", 14u);
-    store = qihse_kv_store_create();
+    uint64_t old_wal_hash = fixture_hash(stage_path);
+    char old_sstable[512];
+    snprintf(old_sstable, sizeof(old_sstable), "%s/sstable_0.db", data_dir);
+    uint64_t old_sstable_hash = fixture_hash(old_sstable);
+    assert(qihse_kv_store_create() == NULL);
+    assert(qihse_kv_store_create_user(NULL) == NULL);
+    assert(qihse_kv_store_create_user(low_user) == NULL);
+    qihse_user_t* revoked = qihse_auth_create_user(operator_user, 92u,
+        QIHSE_ROLE_ANALYST, 5u, 9u, "RevokedReplicaPass1!", false);
+    assert(revoked != NULL);
+    assert(qihse_auth_authenticate_id(92u, "RevokedReplicaPass1!") == revoked);
+    assert(qihse_auth_destroy_user(operator_user, 92u));
+    assert(qihse_kv_store_create_user(revoked) == NULL);
+    char pending_meta_path[512], pending_image_path[512];
+    snprintf(pending_meta_path, sizeof(pending_meta_path), "%s/replica-install.meta", data_dir);
+    snprintf(pending_image_path, sizeof(pending_image_path), "%s/replica-install.image", data_dir);
+    assert(access(pending_meta_path, F_OK) == 0);
+    assert(access(pending_image_path, F_OK) == 0);
+    assert(fixture_hash(pending_image_path) ==
+        test_fnv_update(14695981039346656037ULL, bytes, read_size));
+    assert(fixture_hash(current_wal) == old_wal_hash);
+    assert(fixture_hash(old_sstable) == old_sstable_hash);
+    store = qihse_kv_store_create_user(operator_user);
     assert(store != NULL);
     uint64_t persisted_ack = 0u;
     assert(qihse_kv_replica_cursor_get(store, "lagging-peer", "vendor:7:*",
@@ -291,9 +346,16 @@ int main(void) {
     char* recovered_public = qihse_kv_get_user(store, "public:row", operator_user);
     assert(recovered_public && strcmp(recovered_public, "public-value") == 0);
     free(recovered_public);
-    char pending_meta_path[512], pending_image_path[512];
-    snprintf(pending_meta_path, sizeof(pending_meta_path), "%s/replica-install.meta", data_dir);
-    snprintf(pending_image_path, sizeof(pending_image_path), "%s/replica-install.image", data_dir);
+    char* recovered_protected = qihse_kv_get_user(store, "public:protected", operator_user);
+    assert(recovered_protected && strcmp(recovered_protected, "protected-image") == 0);
+    free(recovered_protected);
+    qihse_kv_record_meta_t recovered_meta;
+    assert(qihse_kv_meta_user(store, "public:protected", operator_user, &recovered_meta));
+    assert(recovered_meta.classification == 5u && recovered_meta.sci_compartment == 9u);
+    assert(qihse_kv_get_user(store, "public:protected", low_user) == NULL);
+    assert(qihse_kv_replica_cursor_get(store, "snapshot-peer", "public:*",
+                                       operator_user, &cursor));
+    assert(cursor == snapshot_seq);
     assert(access(pending_meta_path, F_OK) != 0 && errno == ENOENT);
     assert(access(pending_image_path, F_OK) != 0 && errno == ENOENT);
     snprintf(stage_path, sizeof(stage_path), "%s/replica-install.candidate", data_dir);

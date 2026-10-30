@@ -7,10 +7,24 @@
 #include "qihse_trinary_trie.h"
 #include "qihse_auth.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Opaque handle for the QIHSE Key-Value Store. */
 typedef struct qihse_kv_store qihse_kv_store_t;
 typedef struct qihse_kv_replica_snapshot qihse_kv_replica_snapshot_t;
 
+/* Context-free open refuses an unfinished full-image publication. Recovery
+ * requires an active principal authorized for every record in the intent's
+ * image; no replacement data is published on an authorization refusal. */
+/* Authenticated whole-store open: requires a non-NULL active principal able
+ * to read every persisted SST/WAL record, including tombstones/expired rows.
+ * Authorization failure rejects the open, never filters data or repairs WAL.
+ * Pending-image recovery additionally requires this explicit principal. */
+qihse_kv_store_t* qihse_kv_store_create_user(qihse_user_t* user);
+/* Legacy internal bootstrap mode, deliberately separate from authenticated
+ * open. Does not authorize pending-image recovery; not a user-facing adapter. */
 qihse_kv_store_t* qihse_kv_store_create(void);
 void qihse_kv_store_destroy(qihse_kv_store_t* store);
 
@@ -372,5 +386,9 @@ int qihse_kv_export_incremental_user_bounded_complete(qihse_kv_store_t* store,
 int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath,
                              qihse_user_t* user, uint64_t since_seq,
                              uint64_t* out_resume_seq);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* QIHSE_KV_STORE_H */

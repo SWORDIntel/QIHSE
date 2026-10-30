@@ -385,10 +385,16 @@ whole-store argument gates, `tests/test_incremental_export.c`
 (`make test-incremental-export`) for the delta container. All three are part of
 the default `make test` list.
 
+These surfaces back up and restore **KV data**, not the principal database,
+ACL policy, external identity/key material, service units, filesystem ownership
+or a complete cluster deployment. Stored references to those resources do not
+provision them on restore.
+
 The federation backup surface takes a mandatory security context and propagates
 it to the KV layer on both export and import, so a principal that may not read a
-record may neither back it up nor restore it. A refused call leaves no container
-and no partial dataset behind.
+record may neither back it up nor restore it. Validation and authorization
+refusals occur before dataset publication; do not interpret every I/O or
+post-publication error as proof that the old durable state is unchanged.
 
 The container is the signed v3 form: `[ header 464 ][ signature ][ data ][ WAL ]`.
 The ML-DSA signature covers the whole fixed header, which carries the manifest
@@ -406,9 +412,12 @@ write with `QIHSE_BACKUP_ERR_SIGNER` — there is no unsigned fallback. Version
 1 (unsigned) and version 2 (signed, WAL-less) containers are retired: every
 entry point refuses them with `QIHSE_BACKUP_ERR_VERSION` rather than
 downgrading them, and no writer or reader for them remains in the tree. The
-WAL section's records carry classification and SCI, and replay is
-clearance-checked and all-or-nothing, so a WAL record above the restoring
-principal's clearance refuses the whole restore with nothing applied.
+WAL section's records carry classification and SCI. Structure and clearance
+are checked for the entire segment before snapshot publication, so a WAL
+record above the restoring principal's clearance refuses the whole restore
+with nothing applied. This preflight is not a transaction covering subsequent
+snapshot publication plus WAL replay: an I/O failure during replay can follow
+snapshot replacement and some applied records.
 
 | Function | Purpose | On failure |
 |---|---|---|
@@ -437,6 +446,53 @@ Whole-store and incremental export, `src/tractable/qihse_backup.c` —
 | `int qihse_backup_list_user(qihse_user_t* user, const char* dir, qihse_backup_info_t** out_backups, size_t* out_count)` | List containers in a directory. | `-1` |
 | `int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path)` | Verify a container's checksum. | `-1` argument, `-2` denied |
 | `void qihse_backup_info_free(qihse_backup_info_t* info)` | Release a listing entry. | n/a |
+
+**Bounded durable whole-store restore:** `qihse_restore_user()` delegates to
+`qihse_kv_load_user()`. Success (`0`) means the replacement KV image has been
+durably published and survives closing the store and reopening it in a fresh
+process, not merely that an in-memory trie was replaced. Validation,
+authorization and staging failures before intent publication leave the old
+durable dataset intact. The implementation stages an image and publishes a
+recovery intent before replacing SST/WAL state; the files retain the shared
+`replica-install.image` / `replica-install.meta` names even for a full restore.
+New `QRIL2` (restore) and `QRIM2` (replica) intents retain the classification/SCI
+bound of the replaced live data and every encoded incoming record. Previously
+authorized deletions and expiry are not live target rows, so their historical
+labels do not block a restore within the caller's current view. Recovery must
+satisfy the bound even when the incoming image is empty or public. Legacy
+version-1 intents remain readable, but require full-clearance/full-SCI recovery because they did
+not retain the replaced data's bound. Do not downgrade a directory with an
+unfinished intent. A separate durable high-water preserves the target's sequence
+floor, including empty/older images, without changing upstream replica cursors.
+The installed image is an SST with an indexed, empty writable memtable; later
+mutations must not leave restored rows as RAM-only shadows during compaction.
+
+A publication or directory-fence I/O error is **not a rollback guarantee**:
+the intent may already be visible, or the new durable image may already be
+installed. The error does not identify which boundary was crossed. The handle
+is fenced after an ambiguous publication failure; do not continue using it or
+retry writes. Preserve the complete directory and recovery files, destroy the
+handle, and reopen with `qihse_kv_store_create_user(active_principal)` so recovery
+can revalidate the image and retained authorization bound under that principal's
+clearance/SCI. Authenticated open rejects NULL/inactive users and validates
+ordinary SST/WAL reads too; denial does not truncate protected WAL records.
+Context-free
+`qihse_kv_store_create()` refuses a pending intent rather than replaying it
+without authorization. A failed recovery is an error, not an empty store;
+retain the artifacts for diagnosis and do not remove the intent to force an
+open. After successful recovery, verify the resulting image offline before
+resuming service. Re-baseline incremental consumers with a full export after
+restore: record change sequences are retained, not re-stamped, so an older
+restored image need not be newer than a consumer's cursor. The signed federation
+surface's additional WAL replay remains subject to the separate boundary above.
+
+The offline `qihse-backup` CLI initializes a local Operator verifier using the
+supplied credential. That authentication does not prove authorization against
+the source daemon's principal database. `qihse_backup_verify_user()` verifies
+whole-store checksum and caller-bound access, not a source signature or a
+successful close/reopen restore. Do not conflate it with the federation signed
+verification surface. Operational validation belongs in an isolated disposable
+clone, not a live daemon's data directory; see [Operations §3.7](OPERATIONS.md#37-aimem-backup-and-legacy-scope-migration).
 
 An earlier revision of this section called the tractable surface a stub that
 wrote an empty data section (`qihse_backup_full_user` carried a `TODO: iterate

@@ -4,6 +4,7 @@
 #include <qihse/qihse_sql_fts.h>
 #include <qihse/qihse_sql_row_index.h>
 #include <qihse/qihse_pg_wire.h>
+#include <qihse/qihse_kv_store.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,10 @@
 
 int main(int argc, char **argv)
 {
+    /* Retain the authenticated constructor symbol without opening any store. */
+    qihse_kv_store_t *(*volatile create_user)(qihse_user_t *) =
+        qihse_kv_store_create_user;
+    if (!create_user) return 8;
     char *vector = NULL;
     bool ok = qihse_sql_to_tsvector_english("running", &vector);
     if (argc == 2 && strcmp(argv[1], "missing-stemmer") == 0) {

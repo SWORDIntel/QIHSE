@@ -18,7 +18,7 @@
 #include "qihse_kv_store.h"
 
 #define OPERATOR_PASSWORD "CrashTestOperatorPass1!"
-#define SNAPSHOT_HIGHWATER 1u
+#define SNAPSHOT_HIGHWATER 2u
 
 static void make_dir(const char* path) { assert(mkdir(path, 0700) == 0); }
 
@@ -37,7 +37,7 @@ static void write_file(const char* path, const void* bytes, size_t len) {
 static qihse_user_t* bootstrap(void) {
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator(OPERATOR_PASSWORD));
-    qihse_user_t* op = qihse_auth_get_user(0u);
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, OPERATOR_PASSWORD);
     assert(op);
     return op;
 }
@@ -48,8 +48,9 @@ static void prepare_snapshot(const char* root) {
     assert(setenv("QIHSE_DATA_DIR", source, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
     qihse_user_t* op = bootstrap();
-    qihse_kv_store_t* store = qihse_kv_store_create(); assert(store);
+    qihse_kv_store_t* store = qihse_kv_store_create_user(op); assert(store);
     assert(qihse_kv_set_user(store, "public:crash-row", "recovered-value", 0u, 0u, op));
+    assert(qihse_kv_set_user(store, "public:protected", "classified-value", 5u, 9u, op));
     assert(qihse_kv_change_seq(store) == SNAPSHOT_HIGHWATER);
     qihse_kv_replica_snapshot_t* snapshot = NULL;
     assert(qihse_kv_replica_snapshot_create(store, op, "public:*", &snapshot) == 0);
@@ -71,7 +72,7 @@ static int child_main(const char* mode, const char* root, const char* point,
     qihse_user_t* op = bootstrap();
     if (strcmp(mode, "install") == 0) {
         assert(setenv("QIHSE_REPLICA_CRASH_AT", point, 1) == 0);
-        qihse_kv_store_t* store = qihse_kv_store_create(); assert(store);
+        qihse_kv_store_t* store = qihse_kv_store_create_user(op); assert(store);
         assert(qihse_kv_store_enable_replica_read_only(store));
         char snapshot[512]; snprintf(snapshot, sizeof(snapshot), "%s/snapshot.qkv", root);
         (void)qihse_kv_replica_snapshot_install(store, snapshot, op,
@@ -81,7 +82,14 @@ static int child_main(const char* mode, const char* root, const char* point,
     }
     assert(strcmp(mode, "recover") == 0);
     assert(unsetenv("QIHSE_REPLICA_CRASH_AT") == 0);
-    qihse_kv_store_t* store = qihse_kv_store_create(); assert(store);
+    char pending[512];
+    snprintf(pending, sizeof(pending), "%s/replica-install.meta", data_dir);
+    if (access(pending, F_OK) == 0) {
+        assert(qihse_kv_store_create() == NULL);
+        assert(qihse_kv_store_create_user(NULL) == NULL);
+        assert(access(pending, F_OK) == 0);
+    }
+    qihse_kv_store_t* store = qihse_kv_store_create_user(op); assert(store);
     bool installed = false;
     assert(qihse_kv_replica_snapshot_installed(store, "crash-peer", "public:*",
                                                 op, &installed));
@@ -99,6 +107,15 @@ static int child_main(const char* mode, const char* root, const char* point,
         char* value = qihse_kv_get_user(store, "public:crash-row", op);
         assert(value && strcmp(value, "recovered-value") == 0);
         free(value);
+        value = qihse_kv_get_user(store, "public:protected", op);
+        assert(value && strcmp(value, "classified-value") == 0);
+        free(value);
+        qihse_kv_record_meta_t record_meta;
+        assert(qihse_kv_meta_user(store, "public:protected", op, &record_meta));
+        assert(record_meta.classification == 5u && record_meta.sci_compartment == 9u);
+        qihse_user_t* low = qihse_auth_create_user(op, 92u, QIHSE_ROLE_GUEST,
+            0u, 0u, "CrashGuestPass1!", false);
+        assert(low && qihse_kv_get_user(store, "public:protected", low) == NULL);
         char meta[512]; snprintf(meta, sizeof(meta), "%s/replica-install.meta", data_dir);
         assert(access(meta, F_OK) != 0 && errno == ENOENT);
     }

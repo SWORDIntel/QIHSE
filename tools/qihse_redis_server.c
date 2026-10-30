@@ -392,12 +392,23 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    qihse_user_t* startup_operator = options.require_auth
+        ? qihse_auth_authenticate_id(0u, credentials.operator_password) : NULL;
+    if (options.require_auth && (!startup_operator ||
+        !qihse_auth_user_is_active(startup_operator) ||
+        qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(startup_operator) != QIHSE_TENANT_SYSTEM)) {
+        fprintf(stderr, "[qihse-redis-server] startup Operator authentication failed\n");
+        standalone_credentials_clear(&credentials);
+        return 2;
+    }
     /* Password verifiers and the optional service principal now own all state
      * required for AUTH. Remove environment and temporary plaintext copies
      * before initializing any long-lived store, server, or worker thread. */
     standalone_credentials_clear(&credentials);
 
-    qihse_kv_store_t* store = qihse_kv_store_create();
+    qihse_kv_store_t* store = startup_operator
+        ? qihse_kv_store_create_user(startup_operator) : qihse_kv_store_create();
     qihse_vector_db_t vdb = qihse_vector_db_create(QIHSE_VECTOR_DB_INMEMORY, NULL, NULL);
     if (!store || !vdb) {
         fprintf(stderr, "[qihse-redis-server] engine initialization failed\n");

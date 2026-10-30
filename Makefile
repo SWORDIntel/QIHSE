@@ -387,9 +387,19 @@ admin-cli: lib
 	    -Wl,-rpath,'$$ORIGIN/..' -Wl,-rpath,'$$ORIGIN'
 	@echo "qihse-admin-cli build successful"
 
-test-backup-cli: lib
+test-backup-cli: backup-cli
 	$(CC) $(CFLAGS) -o tests/test_backup_cli tests/test_backup_cli.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_backup_cli
+
+.PHONY: test-kv-restore-durability
+test-kv-restore-durability: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -DQIHSE_REPLICA_CRASH_TEST -Wl,--export-dynamic -o tests/test_kv_restore_durability tests/test_kv_restore_durability.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	@set -e; umask 077; work=$$(mktemp -d ./build/kv-restore-XXXXXX); \
+	  trap 'rm -rf -- "$$work"' EXIT HUP INT TERM; \
+	  QIHSE_KV_RESTORE_DURABILITY_DIR="$$work" LD_LIBRARY_PATH=. ./tests/test_kv_restore_durability
+
+test-serial: test-kv-restore-durability
 
 test-aimem-legacy-inventory: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_legacy_inventory tests/test_aimem_legacy_inventory.c -L. -lqihse $(LDFLAGS)

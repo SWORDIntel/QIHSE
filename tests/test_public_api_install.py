@@ -28,6 +28,7 @@ class PublicAPIInstall(unittest.TestCase):
             self.env.pop(key, None)
         self.env["LD_LIBRARY_PATH"] = str(ROOT) + os.pathsep + self.env.get("LD_LIBRARY_PATH", "")
         self.cc = shlex.split(os.environ.get("CC", "cc"))
+        self.cxx = shlex.split(os.environ.get("CXX", "c++"))
 
     def test_source_vector_header_with_minimal_include_path(self):
         with tempfile.TemporaryDirectory(prefix="qihse-source-header-") as directory:
@@ -57,7 +58,8 @@ class PublicAPIInstall(unittest.TestCase):
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
-                        "qihse_cluster_slot.h", "qihse_crc16.h"}
+                        "qihse_cluster_slot.h", "qihse_crc16.h",
+                        "qihse_kv_store.h"}
             installed = {header.name for header in (headers / "qihse").glob("*.h")}
             self.assertTrue(required <= installed, f"Missing headers: {required - installed}")
             # Compile roots separately: legacy qihse.h and SQL enums are distinct APIs.
@@ -79,6 +81,24 @@ class PublicAPIInstall(unittest.TestCase):
             dependencies = self.run_command(["ldd", str(consumer)], cwd=work, env=runtime)
             self.assertNotIn("not found", dependencies)
             self.assertIn(str(library / "libqihse.so"), dependencies)
+            # Keep the KV C++ root separate from legacy/SQL namespace conflicts.
+            cpp_source = work / "kv_consumer.cpp"
+            cpp_source.write_text(
+                '#include <qihse/qihse_kv_store.h>\n'
+                'int main() {\n'
+                '    qihse_kv_store_t *(*volatile create_user)(qihse_user_t *) =\n'
+                '        qihse_kv_store_create_user;\n'
+                '    return create_user ? 0 : 1;\n'
+                '}\n')
+            cpp_consumer = work / "kv_consumer"
+            self.run_command(self.cxx + ["-std=c++11", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+                             "-Werror", f"-I{headers}", str(cpp_source), f"-L{library}",
+                             f"-Wl,-rpath-link,{ROOT}", "-lqihse", "-o", str(cpp_consumer)],
+                             cwd=work)
+            self.run_command([str(cpp_consumer)], cwd=work, env=runtime)
+            cpp_dependencies = self.run_command(["ldd", str(cpp_consumer)], cwd=work, env=runtime)
+            self.assertNotIn("not found", cpp_dependencies)
+            self.assertIn(str(library / "libqihse.so"), cpp_dependencies)
             self.run_command(["bash", str(ROOT / "scripts/install_qihse.sh"),
                               "--check-dependencies"], cwd=work, env=runtime)
             # Shadow the SONAME: the real loader must reject the broken dependency.

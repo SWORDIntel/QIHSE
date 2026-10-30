@@ -25,7 +25,10 @@ extern "C" {
  * classification — so a principal that may not read a record may neither
  * export nor restore it, and the KV layer refuses the WHOLE export/import
  * rather than producing a quietly partial one (invariant 2).  Nothing is
- * written or applied when a call is refused.
+ * written or applied on validation or authorization refusal. I/O failure
+ * during publication must not be treated as proof of unchanged durable state.
+ * These are KV data containers, not principal/ACL, external identity/key,
+ * service-unit, filesystem-ownership or full-cluster recovery images.
  *
  * The container records the writing principal's clearance/SCI as an upper
  * bound on what it can hold (the KV layer refuses an export containing a
@@ -132,7 +135,15 @@ int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
  * load.  The container's checksum is verified over the bytes that are about
  * to be applied, and a container whose recorded clearance/SCI bound the
  * caller does not dominate, or that holds a record above the caller's
- * clearance/SCI, is refused with -2 and the live dataset untouched. */
+ * clearance/SCI, is refused with -2 and the live dataset untouched.
+ * Success means a durable KV image that survives close/reopen. Failures before
+ * recovery-intent publication preserve the old durable dataset. A publication
+ * or directory-fence I/O error (-1) can be ambiguous: do not assume rollback
+ * or keep using the fenced handle. Preserve the directory and recovery files,
+ * destroy the handle and reopen with qihse_kv_store_create_user() under an
+ * active principal authorized for the image; context-free open refuses a
+ * pending intent. See docs/OPERATIONS.md for disposable-clone validation.
+ * This is not principal/ACL/identity or full-cluster recovery. */
 int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path);
 
 /* List the containers in `dir` the caller may know about.  Refused whole
@@ -166,8 +177,8 @@ void qihse_backup_info_free(qihse_backup_info_t* info);
  *      argument error, never "back up everything".  Clearance and SCI are
  *      enforced by the KV layer on both export and import, so a principal
  *      that may not read a record may neither back it up nor restore it
- *      (invariant 2).  A refused call leaves no container and no partial
- *      dataset behind.
+ *      (invariant 2). Validation and authorization refusals precede dataset
+ *      publication; an I/O error after publication is not a rollback guarantee.
  *
  *   2. The manifest is the contract.  The writer refuses when the caller's
  *      authorized view is narrower than the object count the manifest

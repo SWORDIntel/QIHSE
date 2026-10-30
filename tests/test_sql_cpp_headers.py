@@ -8,11 +8,13 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-HEADERS = ("qihse_sql_fts.h", "qihse_sql_parser.h", "qihse_sql_row_index.h")
+HEADERS = ("qihse_sql_fts.h", "qihse_sql_parser.h", "qihse_sql_row_index.h",
+           "qihse_kv_store.h")
 SOURCE = r'''
 #include "qihse_sql_fts.h"
 #include "qihse_sql_parser.h"
 #include "qihse_sql_row_index.h"
+#include "qihse_kv_store.h"
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -36,6 +38,10 @@ struct alignment { char byte; qihse_sql_condition_t value; };
 struct legacy_alignment { char byte; struct legacy_condition value; };
 #define CHECK(member, old) assert(offsetof(qihse_sql_condition_t, member) == offsetof(struct legacy_condition, old)); printf("%zu ", offsetof(qihse_sql_condition_t, member))
 int main(void) {
+    /* Force C/C++ linkage without opening a default store or using a NULL user. */
+    qihse_kv_store_t *(*volatile create_user)(qihse_user_t *) =
+        qihse_kv_store_create_user;
+    if (!create_user) return 1;
     assert(sizeof(qihse_sql_condition_t) == sizeof(struct legacy_condition));
     assert(offsetof(struct alignment, value) == offsetof(struct legacy_alignment, value));
     printf("%zu %zu ", sizeof(qihse_sql_condition_t), offsetof(struct alignment, value));
